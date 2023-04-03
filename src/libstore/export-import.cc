@@ -16,7 +16,7 @@ void Store::exportPaths(const StorePathSet & paths, Sink & sink)
     //logger->incExpected(doneLabel, sorted.size());
 
     for (auto & path : sorted) {
-        //Activity act(*logger, lvlInfo, format("exporting path '%s'") % path);
+        //Activity act(*logger, lvlInfo, "exporting path '%s'", path);
         sink << 1;
         exportPath(path, sink);
         //logger->incProgress(doneLabel);
@@ -71,24 +71,24 @@ StorePaths Store::importPaths(Source & source, CheckSigsFlag checkSigs)
 
         auto path = parseStorePath(readString(source));
 
-        //Activity act(*logger, lvlInfo, format("importing path '%s'") % info.path);
+        //Activity act(*logger, lvlInfo, "importing path '%s'", info.path);
 
         auto references = worker_proto::read(*this, source, Phantom<StorePathSet> {});
         auto deriver = readString(source);
-        auto narHash = hashString(htSHA256, *saved.s);
+        auto narHash = hashString(htSHA256, saved.s);
 
         ValidPathInfo info { path, narHash };
         if (deriver != "")
             info.deriver = parseStorePath(deriver);
         info.references = references;
-        info.narSize = saved.s->size();
+        info.narSize = saved.s.size();
 
         // Ignore optional legacy signature.
         if (readInt(source) == 1)
             readString(source);
 
         // Can't use underlying source, which would have been exhausted
-        auto source = StringSource { *saved.s };
+        auto source = StringSource(saved.s);
         addToStore(info, source, NoRepair, checkSigs);
 
         res.push_back(info.path);

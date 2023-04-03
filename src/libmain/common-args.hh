@@ -1,4 +1,5 @@
 #pragma once
+///@file
 
 #include "args.hh"
 
@@ -6,13 +7,14 @@ namespace nix {
 
 //static constexpr auto commonArgsCategory = "Miscellaneous common options";
 static constexpr auto loggingCategory = "Logging-related options";
+static constexpr auto miscCategory = "Miscellaneous global options";
 
 class MixCommonArgs : public virtual Args
 {
     void initialFlagsProcessed() override;
 public:
-    string programName;
-    MixCommonArgs(const string & programName);
+    std::string programName;
+    MixCommonArgs(const std::string & programName);
 protected:
     virtual void pluginsInited() {}
 };

@@ -39,8 +39,7 @@ static void search(
         if (!match) continue;
         std::string ref(s.substr(i, refLength));
         if (hashes.erase(ref)) {
-            debug(format("found reference to '%1%' at offset '%2%'")
-                  % ref % i);
+            debug("found reference to '%1%' at offset '%2%'", ref, i);
             seen.insert(ref);
         }
         ++i;
@@ -67,8 +66,42 @@ void RefScanSink::operator () (std::string_view data)
 }
 
 
+PathRefScanSink::PathRefScanSink(StringSet && hashes, std::map<std::string, StorePath> && backMap)
+    : RefScanSink(std::move(hashes))
+    , backMap(std::move(backMap))
+{ }
+
+PathRefScanSink PathRefScanSink::fromPaths(const StorePathSet & refs)
+{
+    StringSet hashes;
+    std::map<std::string, StorePath> backMap;
+
+    for (auto & i : refs) {
+        std::string hashPart(i.hashPart());
+        auto inserted = backMap.emplace(hashPart, i).second;
+        assert(inserted);
+        hashes.insert(hashPart);
+    }
+
+    return PathRefScanSink(std::move(hashes), std::move(backMap));
+}
+
+StorePathSet PathRefScanSink::getResultPaths()
+{
+    /* Map the hashes found back to their store paths. */
+    StorePathSet found;
+    for (auto & i : getResult()) {
+        auto j = backMap.find(i);
+        assert(j != backMap.end());
+        found.insert(j->second);
+    }
+
+    return found;
+}
+
+
 std::pair<StorePathSet, HashResult> scanForReferences(
-    const string & path,
+    const std::string & path,
     const StorePathSet & refs)
 {
     HashSink hashSink { htSHA256 };
@@ -82,30 +115,13 @@ StorePathSet scanForReferences(
     const Path & path,
     const StorePathSet & refs)
 {
-    StringSet hashes;
-    std::map<std::string, StorePath> backMap;
-
-    for (auto & i : refs) {
-        std::string hashPart(i.hashPart());
-        auto inserted = backMap.emplace(hashPart, i).second;
-        assert(inserted);
-        hashes.insert(hashPart);
-    }
+    PathRefScanSink refsSink = PathRefScanSink::fromPaths(refs);
+    TeeSink sink { refsSink, toTee };
 
     /* Look for the hashes in the NAR dump of the path. */
-    RefScanSink refsSink(std::move(hashes));
-    TeeSink sink { refsSink, toTee };
     dumpPath(path, sink);
 
-    /* Map the hashes found back to their store paths. */
-    StorePathSet found;
-    for (auto & i : refsSink.getResult()) {
-        auto j = backMap.find(i);
-        assert(j != backMap.end());
-        found.insert(j->second);
-    }
-
-    return found;
+    return refsSink.getResultPaths();
 }
 
 
@@ -121,7 +137,7 @@ void RewritingSink::operator () (std::string_view data)
     s.append(data);
 
     size_t j = 0;
-    while ((j = s.find(from, j)) != string::npos) {
+    while ((j = s.find(from, j)) != std::string::npos) {
         matches.push_back(pos + j);
         s.replace(j, from.size(), to);
     }

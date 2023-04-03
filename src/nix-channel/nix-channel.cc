@@ -1,9 +1,11 @@
+#include "profiles.hh"
 #include "shared.hh"
 #include "globals.hh"
 #include "filetransfer.hh"
 #include "store-api.hh"
 #include "legacy.hh"
 #include "fetchers.hh"
+#include "util.hh"
 
 #include <fcntl.h>
 #include <regex>
@@ -11,7 +13,7 @@
 
 using namespace nix;
 
-typedef std::map<string,string> Channels;
+typedef std::map<std::string, std::string> Channels;
 
 static Channels channels;
 static Path channelsList;
@@ -22,11 +24,11 @@ static void readChannels()
     if (!pathExists(channelsList)) return;
     auto channelsFile = readFile(channelsList);
 
-    for (const auto & line : tokenizeString<std::vector<string>>(channelsFile, "\n")) {
+    for (const auto & line : tokenizeString<std::vector<std::string>>(channelsFile, "\n")) {
         chomp(line);
         if (std::regex_search(line, std::regex("^\\s*\\#")))
             continue;
-        auto split = tokenizeString<std::vector<string>>(line, " ");
+        auto split = tokenizeString<std::vector<std::string>>(line, " ");
         auto url = std::regex_replace(split[0], std::regex("/*$"), "");
         auto name = split.size() > 1 ? split[1] : std::string(baseNameOf(url));
         channels[name] = url;
@@ -44,7 +46,7 @@ static void writeChannels()
 }
 
 // Adds a channel.
-static void addChannel(const string & url, const string & name)
+static void addChannel(const std::string & url, const std::string & name)
 {
     if (!regex_search(url, std::regex("^(file|http|https)://")))
         throw Error("invalid channel URL '%1%'", url);
@@ -58,7 +60,7 @@ static void addChannel(const string & url, const string & name)
 static Path profile;
 
 // Remove a channel.
-static void removeChannel(const string & name)
+static void removeChannel(const std::string & name)
 {
     readChannels();
     channels.erase(name);
@@ -96,7 +98,7 @@ static void update(const StringSet & channelNames)
         std::smatch match;
         auto urlBase = std::string(baseNameOf(url));
         if (std::regex_search(urlBase, match, std::regex("(-\\d.*)$")))
-            cname = cname + (string) match[1];
+            cname = cname + match.str(1);
 
         std::string extraAttrs;
 
@@ -162,11 +164,12 @@ static int main_nix_channel(int argc, char ** argv)
     {
         // Figure out the name of the `.nix-channels' file to use
         auto home = getHome();
-        channelsList = home + "/.nix-channels";
-        nixDefExpr = home + "/.nix-defexpr";
+        channelsList = settings.useXDGBaseDirectories ? createNixStateDir() + "/channels" : home + "/.nix-channels";
+        nixDefExpr = settings.useXDGBaseDirectories ? createNixStateDir() + "/defexpr" : home + "/.nix-defexpr";
 
         // Figure out the name of the channels profile.
-        profile = fmt("%s/profiles/per-user/%s/channels", settings.nixStateDir, getUserName());
+        profile = profilesDir() +  "/channels";
+        createDirs(dirOf(profile));
 
         enum {
             cNone,
@@ -176,7 +179,7 @@ static int main_nix_channel(int argc, char ** argv)
             cUpdate,
             cRollback
         } cmd = cNone;
-        std::vector<string> args;
+        std::vector<std::string> args;
         parseCmdLine(argc, argv, [&](Strings::iterator & arg, const Strings::iterator & end) {
             if (*arg == "--help") {
                 showManPage("nix-channel");

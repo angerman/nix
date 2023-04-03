@@ -1,4 +1,5 @@
 #pragma once
+///@file
 
 #include "types.hh"
 #include "pathlocks.hh"
@@ -42,7 +43,7 @@ void deleteOldGenerations(const Path & profile, bool dryRun);
 
 void deleteGenerationsOlderThan(const Path & profile, time_t t, bool dryRun);
 
-void deleteGenerationsOlderThan(const Path & profile, const string & timeSpec, bool dryRun);
+void deleteGenerationsOlderThan(const Path & profile, std::string_view timeSpec, bool dryRun);
 
 void switchLink(Path link, Path target);
 
@@ -66,10 +67,34 @@ void lockProfile(PathLocks & lock, const Path & profile);
    generally cheap, since the build results are still in the Nix
    store.  Most of the time, only the user environment has to be
    rebuilt. */
-string optimisticLockProfile(const Path & profile);
+std::string optimisticLockProfile(const Path & profile);
 
-/* Resolve ~/.nix-profile. If ~/.nix-profile doesn't exist yet, create
-   it. */
+/**
+ * Create and return the path to a directory suitable for storing the user’s
+ * profiles.
+ */
+Path profilesDir();
+
+/**
+ * Return the path to the profile directory for root (but don't try creating it)
+ */
+Path rootProfilesDir();
+
+/**
+ * Create and return the path to the file used for storing the users's channels
+ */
+Path defaultChannelsDir();
+
+/**
+ * Return the path to the channel directory for root (but don't try creating it)
+ */
+Path rootChannelsDir();
+
+/**
+ * Resolve the default profile (~/.nix-profile by default,
+ * $XDG_STATE_HOME/nix/profile if XDG Base Directory Support is enabled),
+ * and create if doesn't exist
+ */
 Path getDefaultProfile();
 
 }

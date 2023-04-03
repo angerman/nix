@@ -15,6 +15,12 @@
   [`--keep` *name*]
   {{`--packages` | `-p`} {*packages* | *expressions*} … | [*path*]}
 
+# Disambiguation
+
+This man page describes the command `nix-shell`, which is distinct from `nix
+shell`. For documentation on the latter, run `nix shell --help` or see `man
+nix3-shell`.
+
 # Description
 
 The command `nix-shell` will build the dependencies of the specified
@@ -95,13 +101,16 @@ All options not listed here are passed to `nix-store
     When a `--pure` shell is started, keep the listed environment
     variables.
 
-The following common options are supported:
+{{#include ./opt-common.md}}
 
 # Environment variables
 
   - `NIX_BUILD_SHELL`\
     Shell used to start the interactive environment. Defaults to the
-    `bash` found in `PATH`.
+    `bash` found in `<nixpkgs>`, falling back to the `bash` found in
+    `PATH` if not found.
+
+{{#include ./env-common.md}}
 
 # Examples
 

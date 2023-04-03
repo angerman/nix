@@ -18,18 +18,18 @@ std::string formatProtocol(unsigned int proto)
     if (proto) {
         auto major = GET_PROTOCOL_MAJOR(proto) >> 8;
         auto minor = GET_PROTOCOL_MINOR(proto);
-        return (format("%1%.%2%") % major % minor).str();
+        return fmt("%1%.%2%", major, minor);
     }
     return "unknown";
 }
 
 bool checkPass(const std::string & msg) {
-    logger->log(ANSI_GREEN "[PASS] " ANSI_NORMAL + msg);
+    notice(ANSI_GREEN "[PASS] " ANSI_NORMAL + msg);
     return true;
 }
 
 bool checkFail(const std::string & msg) {
-    logger->log(ANSI_RED "[FAIL] " ANSI_NORMAL + msg);
+    notice(ANSI_RED "[FAIL] " ANSI_NORMAL + msg);
     return false;
 }
 

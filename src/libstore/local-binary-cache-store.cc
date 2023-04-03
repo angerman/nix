@@ -11,6 +11,13 @@ struct LocalBinaryCacheStoreConfig : virtual BinaryCacheStoreConfig
     using BinaryCacheStoreConfig::BinaryCacheStoreConfig;
 
     const std::string name() override { return "Local Binary Cache Store"; }
+
+    std::string doc() override
+    {
+        return
+          #include "local-binary-cache-store.md"
+          ;
+    }
 };
 
 class LocalBinaryCacheStore : public virtual LocalBinaryCacheStoreConfig, public virtual BinaryCacheStore
@@ -57,8 +64,7 @@ protected:
         AutoDelete del(tmp, false);
         StreamToSourceAdapter source(istream);
         writeFile(tmp, source);
-        if (rename(tmp.c_str(), path2.c_str()))
-            throw SysError("renaming '%1%' to '%2%'", tmp, path2);
+        renameFile(tmp, path2);
         del.cancel();
     }
 
@@ -69,6 +75,7 @@ protected:
         } catch (SysError & e) {
             if (e.errNo == ENOENT)
                 throw NoSuchBinaryCacheFile("file '%s' does not exist in binary cache", path);
+            throw;
         }
     }
 
@@ -96,6 +103,7 @@ void LocalBinaryCacheStore::init()
     createDirs(binaryCacheDir + "/" + realisationsPrefix);
     if (writeDebugInfo)
         createDirs(binaryCacheDir + "/debuginfo");
+    createDirs(binaryCacheDir + "/log");
     BinaryCacheStore::init();
 }
 
@@ -106,7 +114,7 @@ bool LocalBinaryCacheStore::fileExists(const std::string & path)
 
 std::set<std::string> LocalBinaryCacheStore::uriSchemes()
 {
-    if (getEnv("_NIX_FORCE_HTTP_BINARY_CACHE_STORE") == "1")
+    if (getEnv("_NIX_FORCE_HTTP") == "1")
         return {};
     else
         return {"file"};

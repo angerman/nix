@@ -1,7 +1,9 @@
+#include "ssh-store-config.hh"
 #include "archive.hh"
 #include "pool.hh"
 #include "remote-store.hh"
 #include "serve-protocol.hh"
+#include "build-result.hh"
 #include "store-api.hh"
 #include "path-with-outputs.hh"
 #include "worker-protocol.hh"
@@ -11,17 +13,24 @@
 
 namespace nix {
 
-struct LegacySSHStoreConfig : virtual StoreConfig
+struct LegacySSHStoreConfig : virtual CommonSSHStoreConfig
 {
-    using StoreConfig::StoreConfig;
-    const Setting<int> maxConnections{(StoreConfig*) this, 1, "max-connections", "maximum number of concurrent SSH connections"};
-    const Setting<Path> sshKey{(StoreConfig*) this, "", "ssh-key", "path to an SSH private key"};
-    const Setting<std::string> sshPublicHostKey{(StoreConfig*) this, "", "base64-ssh-public-host-key", "The public half of the host's SSH key"};
-    const Setting<bool> compress{(StoreConfig*) this, false, "compress", "whether to compress the connection"};
-    const Setting<Path> remoteProgram{(StoreConfig*) this, "nix-store", "remote-program", "path to the nix-store executable on the remote system"};
-    const Setting<std::string> remoteStore{(StoreConfig*) this, "", "remote-store", "URI of the store on the remote system"};
+    using CommonSSHStoreConfig::CommonSSHStoreConfig;
 
-    const std::string name() override { return "Legacy SSH Store"; }
+    const Setting<Path> remoteProgram{(StoreConfig*) this, "nix-store", "remote-program",
+        "Path to the `nix-store` executable on the remote machine."};
+
+    const Setting<int> maxConnections{(StoreConfig*) this, 1, "max-connections",
+        "Maximum number of concurrent SSH connections."};
+
+    const std::string name() override { return "SSH Store"; }
+
+    std::string doc() override
+    {
+        return
+          #include "legacy-ssh-store.md"
+          ;
+    }
 };
 
 struct LegacySSHStore : public virtual LegacySSHStoreConfig, public virtual Store
@@ -48,8 +57,9 @@ struct LegacySSHStore : public virtual LegacySSHStoreConfig, public virtual Stor
 
     static std::set<std::string> uriSchemes() { return {"ssh"}; }
 
-    LegacySSHStore(const string & scheme, const string & host, const Params & params)
+    LegacySSHStore(const std::string & scheme, const std::string & host, const Params & params)
         : StoreConfig(params)
+        , CommonSSHStoreConfig(params)
         , LegacySSHStoreConfig(params)
         , Store(params)
         , host(host)
@@ -94,7 +104,7 @@ struct LegacySSHStore : public virtual LegacySSHStoreConfig, public virtual Stor
                 conn->sshConn->in.close();
                 auto msg = conn->from.drain();
                 throw Error("'nix-store --serve' protocol mismatch from '%s', got '%s'",
-                    host, chomp(*saved.s + msg));
+                    host, chomp(saved.s + msg));
             }
             conn->remoteVersion = readInt(conn->from);
             if (GET_PROTOCOL_MAJOR(conn->remoteVersion) != 0x200)
@@ -107,7 +117,7 @@ struct LegacySSHStore : public virtual LegacySSHStoreConfig, public virtual Stor
         return conn;
     };
 
-    string getUri() override
+    std::string getUri() override
     {
         return *uriSchemes().begin() + "://" + host;
     }
@@ -133,7 +143,6 @@ struct LegacySSHStore : public virtual LegacySSHStoreConfig, public virtual Stor
             /* Hash will be set below. FIXME construct ValidPathInfo at end. */
             auto info = std::make_shared<ValidPathInfo>(path, Hash::dummy);
 
-            PathSet references;
             auto deriver = readString(conn->from);
             if (deriver != "")
                 info->deriver = parseStorePath(deriver);
@@ -225,13 +234,21 @@ struct LegacySSHStore : public virtual LegacySSHStoreConfig, public virtual Stor
     std::optional<StorePath> queryPathFromHashPart(const std::string & hashPart) override
     { unsupported("queryPathFromHashPart"); }
 
-    StorePath addToStore(const string & name, const Path & srcPath,
-        FileIngestionMethod method, HashType hashAlgo,
-        PathFilter & filter, RepairFlag repair, const StorePathSet & references) override
+    StorePath addToStore(
+        std::string_view name,
+        const Path & srcPath,
+        FileIngestionMethod method,
+        HashType hashAlgo,
+        PathFilter & filter,
+        RepairFlag repair,
+        const StorePathSet & references) override
     { unsupported("addToStore"); }
 
-    StorePath addTextToStore(const string & name, const string & s,
-        const StorePathSet & references, RepairFlag repair) override
+    StorePath addTextToStore(
+        std::string_view name,
+        std::string_view s,
+        const StorePathSet & references,
+        RepairFlag repair) override
     { unsupported("addTextToStore"); }
 
 private:
@@ -246,8 +263,8 @@ private:
                 << settings.maxLogSize;
         if (GET_PROTOCOL_MINOR(conn.remoteVersion) >= 3)
             conn.to
-                << settings.buildRepeat
-                << settings.enforceDeterminism;
+                << 0 // buildRepeat hasn't worked for ages anyway
+                << 0;
 
         if (GET_PROTOCOL_MINOR(conn.remoteVersion) >= 7) {
             conn.to << ((int) settings.keepFailed);
@@ -270,7 +287,12 @@ public:
 
         conn->to.flush();
 
-        BuildResult status;
+        BuildResult status {
+            .path = DerivedPath::Built {
+                .drvPath = drvPath,
+                .outputs = OutputsSpec::All { },
+            },
+        };
         status.status = (BuildResult::Status) readInt(conn->from);
         conn->from >> status.errorMsg;
 
@@ -308,7 +330,7 @@ public:
 
         conn->to.flush();
 
-        BuildResult result;
+        BuildResult result { .path = DerivedPath::Opaque { StorePath::dummy } };
         result.status = (BuildResult::Status) readInt(conn->from);
 
         if (!result.success()) {
