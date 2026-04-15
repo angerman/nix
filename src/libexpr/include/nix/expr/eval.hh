@@ -44,6 +44,8 @@ struct IFDEvent
     std::string status;
     /// Nix source position that triggered the IFD (may be empty)
     PosIdx pos;
+    /// Nix evaluation stack trace at the point of IFD (if available)
+    std::string stackTrace;
 };
 
 /**

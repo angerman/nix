@@ -131,6 +131,27 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
             posStr = oss.str();
         }
 
+        /* Capture a lightweight Nix evaluation stack trace from the
+           debugTraces list (populated in --debugger mode) or from
+           the current call stack if available. */
+        std::string stackStr;
+        if (!debugTraces.empty()) {
+            std::ostringstream oss;
+            int depth = 0;
+            for (auto & dt : debugTraces) {
+                if (depth >= 10) { oss << "  ... (truncated)\n"; break; }
+                auto p = dt.getPos(positions);
+                oss << "  #" << depth << " ";
+                if (p)
+                    oss << p;
+                else
+                    oss << "«unknown»";
+                oss << ": " << dt.hint.str() << "\n";
+                depth++;
+            }
+            stackStr = oss.str();
+        }
+
         for (auto & kr : results) {
             IFDEvent ev;
             ev.pos = triggerPos;
@@ -164,6 +185,7 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
             for (auto & [name, outPath] : kr.builtOutputs)
                 ev.outputPaths.push_back(store->printStorePath(outPath.outPath));
 
+            ev.stackTrace = stackStr;
             ifdEvents.push_back(ev);
 
             /* Emit a structured log line for each IFD result. */
@@ -171,6 +193,8 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
             printMsg(lvlInfo,
                 "IFD #%d: %s [%s] %dms at %s",
                 nrIFDs, ev.drvPath, ev.status, durationMs, posStr);
+            if (!stackStr.empty())
+                printMsg(lvlInfo, "  stack:\n%s", stackStr);
         }
 
         /* Re-throw the first error, matching the behaviour of buildPaths(). */

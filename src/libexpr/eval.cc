@@ -2981,6 +2981,8 @@ void EvalState::printStatistics()
                 obj["line"] = pos.line;
                 obj["column"] = pos.column;
             }
+            if (!ev.stackTrace.empty())
+                obj["stackTrace"] = ev.stackTrace;
             list.push_back(obj);
         }
     }
