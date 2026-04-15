@@ -2965,6 +2965,7 @@ void EvalState::printStatistics()
        even if the user didn't explicitly set NIX_SHOW_STATS -- the
        profiling setting is the opt-in gate instead. */
     topObj["nrIFDs"] = nrIFDs;
+    topObj["nrIFDsCached"] = nrIFDsCached;
     topObj["totalIFDTimeUs"] = totalIFDTime.count();
     if (!ifdEvents.empty()) {
         auto & list = topObj["ifdEvents"];

@@ -966,8 +966,18 @@ private:
      * is enabled.
      */
     unsigned long nrIFDs = 0;
+    unsigned long nrIFDsCached = 0;
     std::chrono::microseconds totalIFDTime{0};
     std::vector<IFDEvent> ifdEvents;
+
+    /**
+     * Cache of already-realised derivation outputs within this evaluation.
+     * Maps a derivation store path to the set of its resolved output paths.
+     * This avoids redundant buildPaths() round-trips when the nixpkgs module
+     * system (or similar fixpoint evaluators) triggers the same IFD multiple
+     * times during a single evaluation.
+     */
+    std::map<StorePath, StorePathSet> realisedDerivations;
 
     friend struct ExprOpUpdate;
     friend struct ExprOpConcatLists;

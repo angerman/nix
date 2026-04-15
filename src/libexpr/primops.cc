@@ -101,6 +101,59 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
             drvs.begin()->to_string(*store))
             .debugThrow();
 
+    /* Check if all requested derivation outputs have already been
+       realised during this evaluation.  If so, we can skip the
+       buildPaths() round-trip entirely and reuse cached results.
+       This is safe because buildPaths/resolveDerivedPath/allowClosure
+       are all idempotent — the only effect of a repeat call is wasted
+       time on the store daemon round-trip. */
+    {
+        bool allCached = true;
+        for (auto & d : drvs) {
+            auto basePath = d.drvPath->getBaseStorePath();
+            if (realisedDerivations.find(basePath) == realisedDerivations.end()) {
+                allCached = false;
+                break;
+            }
+        }
+        if (allCached) {
+            /* Reconstruct outputs and rewrites from cache. */
+            StorePathSet outputsToCopyAndAllow;
+            for (auto & d : drvs) {
+                auto basePath = d.drvPath->getBaseStorePath();
+                for (auto & outputPath : realisedDerivations[basePath]) {
+                    outputsToCopyAndAllow.insert(outputPath);
+                    if (maybePathsOut)
+                        maybePathsOut->emplace(outputPath);
+                    if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
+                        /* For CA derivations we still need the placeholder rewrites,
+                           but the common case doesn't use this path. */
+                        auto outputs = resolveDerivedPath(*buildStore, d, &*store);
+                        for (auto & [outputName, outputPath2] : outputs)
+                            res.insert_or_assign(
+                                DownstreamPlaceholder::fromSingleDerivedPathBuilt(
+                                    SingleDerivedPath::Built{
+                                        .drvPath = d.drvPath,
+                                        .output = outputName,
+                                    })
+                                    .render(),
+                                buildStore->printStorePath(outputPath2));
+                    }
+                }
+            }
+            if (isIFD)
+                for (auto & outputPath : outputsToCopyAndAllow)
+                    allowClosure(outputPath);
+
+            nrIFDsCached++;
+
+            if (isIFD && settings.profileImportFromDerivation)
+                printMsg(lvlInfo, "IFD (cached): %d derivation(s) skipped", drvs.size());
+
+            return res;
+        }
+    }
+
     /* Build/substitute the context. */
     std::vector<DerivedPath> buildReqs;
     buildReqs.reserve(drvs.size());
@@ -235,6 +288,16 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
         /* Allow access to the output closures of this derivation. */
         for (auto & outputPath : outputsToCopyAndAllow)
             allowClosure(outputPath);
+    }
+
+    /* Populate the realised-derivation cache so subsequent calls with
+       the same derivations can skip the buildPaths() round-trip. */
+    for (auto & drv : drvs) {
+        auto basePath = drv.drvPath->getBaseStorePath();
+        auto outputs = resolveDerivedPath(*buildStore, drv, &*store);
+        auto & cached = realisedDerivations[basePath];
+        for (auto & [outputName, outputPath] : outputs)
+            cached.insert(outputPath);
     }
 
     return res;
