@@ -958,6 +958,59 @@ private:
 
     void incrFunctionCall(ExprLambda * fun);
 
+    /**
+     * Per-function allocation cost, accumulated when `countCalls` is
+     * enabled.  Attributes bytes allocated *during* each function body's
+     * evaluation to the function's source position — analogous to how
+     * Instruments attributes CPU time to Swift/ObjC source lines.
+     *
+     * "self" = allocated directly in this function body (excluding callees).
+     * Implemented by snapshotting global allocation counters on entry/exit
+     * and subtracting child costs.
+     */
+    struct AllocCost {
+        long values = 0;
+        long attrsets = 0;
+        long attrsInAttrsets = 0;
+        long envs = 0;
+        long valuesInEnvs = 0;
+        long listElems = 0;
+
+        long totalBytes(size_t szValue, size_t szAttr, size_t szBindings,
+                        size_t szEnv, size_t szValuePtr) const {
+            return values * szValue
+                 + attrsets * szBindings + attrsInAttrsets * szAttr
+                 + envs * szEnv + valuesInEnvs * szValuePtr
+                 + listElems * szValuePtr;
+        }
+
+        AllocCost operator-(const AllocCost & o) const {
+            return {values - o.values, attrsets - o.attrsets,
+                    attrsInAttrsets - o.attrsInAttrsets, envs - o.envs,
+                    valuesInEnvs - o.valuesInEnvs, listElems - o.listElems};
+        }
+        AllocCost & operator+=(const AllocCost & o) {
+            values += o.values; attrsets += o.attrsets;
+            attrsInAttrsets += o.attrsInAttrsets; envs += o.envs;
+            valuesInEnvs += o.valuesInEnvs; listElems += o.listElems;
+            return *this;
+        }
+    };
+
+    AllocCost snapshotAllocCounters() const {
+        return {
+            static_cast<long>(nrValues),
+            static_cast<long>(nrAttrsets),
+            static_cast<long>(nrAttrsInAttrsets),
+            static_cast<long>(nrEnvs),
+            static_cast<long>(nrValuesInEnvs),
+            static_cast<long>(nrListElems),
+        };
+    }
+
+    typedef std::map<ExprLambda *, AllocCost> FunctionAllocs;
+    FunctionAllocs functionAllocs;
+
     typedef std::map<PosIdx, size_t> AttrSelects;
     AttrSelects attrSelects;
 

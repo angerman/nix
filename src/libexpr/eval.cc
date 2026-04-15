@@ -1569,7 +1569,10 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
             if (countCalls)
                 incrFunctionCall(&lambda);
 
-            /* Evaluate the body. */
+            /* Evaluate the body.  When countCalls is active, snapshot
+               allocation counters before and after so we can attribute
+               memory cost to each function's source location. */
+            auto allocBefore = countCalls ? snapshotAllocCounters() : AllocCost{};
             try {
                 auto dts = debugRepl
                                ? makeDebugTraceStacker(
@@ -1593,6 +1596,10 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                         addErrorTrace(e, pos, "from call site");
                 }
                 throw;
+            }
+            if (countCalls) {
+                auto delta = snapshotAllocCounters() - allocBefore;
+                functionAllocs[&lambda] += delta;
             }
 
             args = args.subspan(1);
@@ -2956,6 +2963,43 @@ void EvalState::printStatistics()
                     obj["column"] = pos.column;
                 }
                 obj["count"] = i.second;
+                list.push_back(obj);
+            }
+        }
+        /* Per-function allocation attribution (inclusive = self + callees).
+           Sorted by estimated total bytes descending so the top memory
+           consumers appear first. */
+        {
+            auto & list = topObj["functionAllocs"];
+            list = json::array();
+            std::vector<std::pair<ExprLambda *, AllocCost>> sorted(
+                functionAllocs.begin(), functionAllocs.end());
+            std::sort(sorted.begin(), sorted.end(),
+                [&](auto & a, auto & b) {
+                    return a.second.totalBytes(sizeof(Value), sizeof(Attr),
+                               sizeof(Bindings), sizeof(Env), sizeof(Value *))
+                         > b.second.totalBytes(sizeof(Value), sizeof(Attr),
+                               sizeof(Bindings), sizeof(Env), sizeof(Value *));
+                });
+            for (auto & [fun, alloc] : sorted) {
+                auto bytes = alloc.totalBytes(sizeof(Value), sizeof(Attr),
+                    sizeof(Bindings), sizeof(Env), sizeof(Value *));
+                if (bytes == 0) continue;
+                json obj = json::object();
+                if (fun->name)
+                    obj["name"] = (std::string_view) symbols[fun->name];
+                if (auto pos = positions[fun->pos]) {
+                    if (auto path = std::get_if<SourcePath>(&pos.origin))
+                        obj["file"] = path->to_string();
+                    obj["line"] = pos.line;
+                    obj["column"] = pos.column;
+                }
+                obj["bytes"] = bytes;
+                obj["values"] = alloc.values;
+                obj["attrsets"] = alloc.attrsets;
+                obj["attrsInAttrsets"] = alloc.attrsInAttrsets;
+                obj["envs"] = alloc.envs;
+                obj["listElems"] = alloc.listElems;
                 list.push_back(obj);
             }
         }
