@@ -1,3 +1,4 @@
+#include "nix/store/build-result.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/downstream-placeholder.hh"
 #include "nix/expr/eval-inline.hh"
@@ -23,6 +24,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <sstream>
 #include <regex>
@@ -50,12 +52,12 @@ std::string EvalState::realiseString(Value & s, StorePathSet * storePathsOutMayb
 {
     nix::NixStringContext stringContext;
     auto rawStr = coerceToString(pos, s, stringContext, "while realising a string").toOwned();
-    auto rewrites = realiseContext(stringContext, storePathsOutMaybe, isIFD);
+    auto rewrites = realiseContext(stringContext, storePathsOutMaybe, isIFD, pos);
 
     return nix::rewriteStrings(rawStr, rewrites);
 }
 
-StringMap EvalState::realiseContext(const NixStringContext & context, StorePathSet * maybePathsOut, bool isIFD)
+StringMap EvalState::realiseContext(const NixStringContext & context, StorePathSet * maybePathsOut, bool isIFD, PosIdx triggerPos)
 {
     std::vector<DerivedPath::Built> drvs;
     StringMap res;
@@ -104,7 +106,80 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
     buildReqs.reserve(drvs.size());
     for (auto & d : drvs)
         buildReqs.emplace_back(DerivedPath{d});
-    buildStore->buildPaths(buildReqs, bmNormal, store);
+
+    bool profiling = isIFD && settings.profileImportFromDerivation;
+
+    auto t0 = profiling
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+
+    if (profiling) {
+        /* Use buildPathsWithResults so we get per-derivation status. */
+        auto results = buildStore->buildPathsWithResults(buildReqs, bmNormal, store);
+
+        auto t1 = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+
+        nrIFDs++;
+        totalIFDTime += elapsed;
+
+        /* Format the trigger position for logging. */
+        std::string posStr = "«unknown»";
+        if (auto pos = positions[triggerPos]) {
+            std::ostringstream oss;
+            oss << pos;
+            posStr = oss.str();
+        }
+
+        for (auto & kr : results) {
+            IFDEvent ev;
+            ev.pos = triggerPos;
+            ev.duration = elapsed;
+
+            /* Classify the build status. */
+            switch (kr.status) {
+            case BuildResult::Built:                  ev.status = "built"; break;
+            case BuildResult::Substituted:            ev.status = "substituted"; break;
+            case BuildResult::AlreadyValid:           ev.status = "already-valid"; break;
+            case BuildResult::ResolvesToAlreadyValid:  ev.status = "resolves-to-already-valid"; break;
+            case BuildResult::PermanentFailure:       ev.status = "permanent-failure"; break;
+            case BuildResult::InputRejected:          ev.status = "input-rejected"; break;
+            case BuildResult::OutputRejected:         ev.status = "output-rejected"; break;
+            case BuildResult::TransientFailure:       ev.status = "transient-failure"; break;
+            case BuildResult::CachedFailure:          ev.status = "cached-failure"; break;
+            case BuildResult::TimedOut:               ev.status = "timed-out"; break;
+            case BuildResult::MiscFailure:            ev.status = "misc-failure"; break;
+            case BuildResult::DependencyFailed:       ev.status = "dependency-failed"; break;
+            case BuildResult::LogLimitExceeded:       ev.status = "log-limit-exceeded"; break;
+            case BuildResult::NotDeterministic:       ev.status = "not-deterministic"; break;
+            case BuildResult::NoSubstituters:         ev.status = "no-substituters"; break;
+            }
+
+            /* Extract the derivation path from the keyed result. */
+            if (auto * built = std::get_if<DerivedPath::Built>(&kr.path))
+                ev.drvPath = built->to_string(*store);
+            else if (auto * opaque = std::get_if<DerivedPath::Opaque>(&kr.path))
+                ev.drvPath = store->printStorePath(opaque->path);
+
+            for (auto & [name, outPath] : kr.builtOutputs)
+                ev.outputPaths.push_back(store->printStorePath(outPath.outPath));
+
+            ifdEvents.push_back(ev);
+
+            /* Emit a structured log line for each IFD result. */
+            auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+            printMsg(lvlInfo,
+                "IFD #%d: %s [%s] %dms at %s",
+                nrIFDs, ev.drvPath, ev.status, durationMs, posStr);
+        }
+
+        /* Re-throw the first error, matching the behaviour of buildPaths(). */
+        for (auto & kr : results)
+            if (!kr.success())
+                kr.rethrow();
+    } else {
+        buildStore->buildPaths(buildReqs, bmNormal, store);
+    }
 
     StorePathSet outputsToCopyAndAllow;
 
@@ -153,7 +228,7 @@ static SourcePath realisePath(
 
     try {
         if (!context.empty() && path.accessor == state.rootFS) {
-            auto rewrites = state.realiseContext(context);
+            auto rewrites = state.realiseContext(context, nullptr, true, pos);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
         }
         return resolveSymlinks ? path.resolveSymlinks(*resolveSymlinks) : path;
@@ -447,7 +522,7 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
                                   .toOwned());
     }
     try {
-        auto _ = state.realiseContext(context); // FIXME: Handle CA derivations
+        auto _ = state.realiseContext(context, nullptr, true, pos); // FIXME: Handle CA derivations
     } catch (InvalidPathError & e) {
         state.error<EvalError>("cannot execute '%1%', since path '%2%' is not valid", program, e.path)
             .atPos(pos)
@@ -1956,7 +2031,7 @@ static void prim_findFile(EvalState & state, const PosIdx pos, Value ** args, Va
                 .toOwned();
 
         try {
-            auto rewrites = state.realiseContext(context);
+            auto rewrites = state.realiseContext(context, nullptr, true, pos);
             path = rewriteStrings(path, rewrites);
         } catch (InvalidPathError & e) {
             state.error<EvalError>("cannot find '%1%', since path '%2%' is not valid", path, e.path)
@@ -2591,7 +2666,7 @@ static void addPath(
         if (path.accessor == state.rootFS && state.store->isInStore(path.path.abs())) {
             // FIXME: handle CA derivation outputs (where path needs to
             // be rewritten to the actual output).
-            auto rewrites = state.realiseContext(context);
+            auto rewrites = state.realiseContext(context, nullptr, true, pos);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
         }
 

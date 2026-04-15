@@ -19,11 +19,32 @@
 // For `NIX_USE_BOEHMGC`, and if that's set, `GC_THREADS`
 #include "nix/expr/config.hh"
 
+#include <chrono>
 #include <map>
 #include <optional>
 #include <functional>
 
 namespace nix {
+
+/**
+ * A single IFD profiling event, recorded when `profile-import-from-derivation`
+ * is enabled.  Captures what was built, how long it took, whether it was
+ * a fresh build or a substitution, and where in the Nix source the IFD
+ * was triggered.
+ */
+struct IFDEvent
+{
+    /// Derivation store path (e.g. /nix/store/...-foo.drv)
+    std::string drvPath;
+    /// Resolved output paths after the build
+    std::vector<std::string> outputPaths;
+    /// Wall-clock duration of the build/substitute
+    std::chrono::microseconds duration;
+    /// Human-readable status: "built", "substituted", "already-valid", "failed", ...
+    std::string status;
+    /// Nix source position that triggered the IFD (may be empty)
+    PosIdx pos;
+};
 
 /**
  * We put a limit on primop arity because it lets us use a fixed size array on
@@ -871,10 +892,12 @@ public:
      * Realise the given context
      * @param[in] context the context to realise
      * @param[out] maybePaths if not nullptr, all built or referenced store paths will be added to this set
+     * @param[in] isIFD whether this is an import-from-derivation
+     * @param[in] triggerPos the Nix source position that triggered the realisation (for IFD profiling)
      * @return a mapping from the placeholders used to construct the associated value to their final store path.
      */
     [[nodiscard]] StringMap
-    realiseContext(const NixStringContext & context, StorePathSet * maybePaths = nullptr, bool isIFD = true);
+    realiseContext(const NixStringContext & context, StorePathSet * maybePaths = nullptr, bool isIFD = true, PosIdx triggerPos = noPos);
 
     /**
      * Realise the given string with context, and return the string with outputs instead of downstream output
@@ -935,6 +958,14 @@ private:
 
     typedef std::map<PosIdx, size_t> AttrSelects;
     AttrSelects attrSelects;
+
+    /**
+     * IFD profiling data, populated when `profile-import-from-derivation`
+     * is enabled.
+     */
+    unsigned long nrIFDs = 0;
+    std::chrono::microseconds totalIFDTime{0};
+    std::vector<IFDEvent> ifdEvents;
 
     friend struct ExprOpUpdate;
     friend struct ExprOpConcatLists;

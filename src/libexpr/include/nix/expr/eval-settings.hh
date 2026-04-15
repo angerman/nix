@@ -174,6 +174,22 @@ struct EvalSettings : Config
           regardless of the state of the store.
         )"};
 
+    Setting<bool> profileImportFromDerivation{
+        this,
+        false,
+        "profile-import-from-derivation",
+        R"(
+          If set to `true`, Nix will emit structured profiling information for
+          every Import from Derivation (IFD) that occurs during evaluation.
+
+          Each IFD event logs the derivation path, output paths, wall-clock
+          build time, build status (built, substituted, or already valid),
+          and the Nix source position that triggered it.
+
+          A summary is included in the JSON statistics output when
+          `NIX_SHOW_STATS` is enabled.
+        )"};
+
     Setting<Strings> allowedUris{
         this,
         {},

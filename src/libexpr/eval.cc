@@ -2961,6 +2961,30 @@ void EvalState::printStatistics()
         }
     }
 
+    /* IFD profiling summary. Always included when IFDs were recorded,
+       even if the user didn't explicitly set NIX_SHOW_STATS -- the
+       profiling setting is the opt-in gate instead. */
+    topObj["nrIFDs"] = nrIFDs;
+    topObj["totalIFDTimeUs"] = totalIFDTime.count();
+    if (!ifdEvents.empty()) {
+        auto & list = topObj["ifdEvents"];
+        list = json::array();
+        for (auto & ev : ifdEvents) {
+            json obj = json::object();
+            obj["drvPath"] = ev.drvPath;
+            obj["status"] = ev.status;
+            obj["durationUs"] = ev.duration.count();
+            obj["outputs"] = ev.outputPaths;
+            if (auto pos = positions[ev.pos]) {
+                if (auto path = std::get_if<SourcePath>(&pos.origin))
+                    obj["file"] = path->to_string();
+                obj["line"] = pos.line;
+                obj["column"] = pos.column;
+            }
+            list.push_back(obj);
+        }
+    }
+
     if (getEnv("NIX_SHOW_SYMBOLS").value_or("0") != "0") {
         // XXX: overrides earlier assignment
         topObj["symbols"] = json::array();
