@@ -1141,10 +1141,13 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
     }
 
     if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
+        nrImportCacheHits++;
         forceValue(**v2, noPos);
         v = **v2;
         return;
     }
+
+    nrImportCacheMisses++;
 
     Value * vExpr;
     // FIXME: put ExprParseFile on the stack instead of the heap once
@@ -3318,6 +3321,10 @@ void EvalState::printStatistics()
             for (auto & [name, us] : sorted)
                 obj[name] = us;
         }
+
+        /* Import cache statistics. */
+        topObj["nrImportCacheHits"] = nrImportCacheHits.load();
+        topObj["nrImportCacheMisses"] = nrImportCacheMisses.load();
 
         /* Thunk statistics. */
         topObj["nrThunksForced"] = nrThunksForced.load();

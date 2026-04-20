@@ -1194,6 +1194,10 @@ public:
     };
     std::vector<PrimOpTimerFrame> primOpTimerStack;
 
+    /** Import cache statistics. */
+    Counter nrImportCacheHits;
+    Counter nrImportCacheMisses;
+
     /** Thunk forcing statistics. */
     Counter nrThunksForced;
     Counter nrThunkChains;       /**< A forced thunk that resolved to another thunk. */
