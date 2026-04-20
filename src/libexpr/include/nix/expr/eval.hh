@@ -24,12 +24,29 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 
+#include <chrono>
 #include <map>
 #include <optional>
 #include <functional>
 #include <span>
 
 namespace nix {
+
+/**
+ * A single IFD profiling event, recorded when `profile-import-from-derivation`
+ * is enabled.  Captures what was built, how long it took, whether it was
+ * a fresh build or a substitution, and where in the Nix source the IFD
+ * was triggered.
+ */
+struct IFDEvent
+{
+    std::string drvPath;
+    std::vector<std::string> outputPaths;
+    std::chrono::microseconds duration;
+    std::string status;
+    PosIdx pos;
+    std::string stackTrace;
+};
 
 /**
  * We put a limit on primop arity because it lets us use a fixed size array on
@@ -1031,7 +1048,7 @@ public:
      * @return a mapping from the placeholders used to construct the associated value to their final store path.
      */
     [[nodiscard]] StringMap
-    realiseContext(const NixStringContext & context, StorePathSet * maybePaths = nullptr, bool isIFD = true);
+    realiseContext(const NixStringContext & context, StorePathSet * maybePaths = nullptr, bool isIFD = true, PosIdx triggerPos = noPos);
 
     /**
      * Coerce `v` to a path and realise it, i.e. build anything in the value's string context using `realiseContext()`.
@@ -1093,9 +1110,97 @@ private:
 
     void incrFunctionCall(ExprLambda * fun);
 
+    /** Per-function allocation attribution (inclusive = self + callees). */
+    struct AllocCost {
+        long values = 0;
+        long attrsets = 0;
+        long attrsInAttrsets = 0;
+        long envs = 0;
+        long valuesInEnvs = 0;
+        long listElems = 0;
+
+        long totalBytes(size_t szValue, size_t szAttr, size_t szBindings,
+                        size_t szEnv, size_t szValuePtr) const {
+            return values * szValue
+                 + attrsets * szBindings + attrsInAttrsets * szAttr
+                 + envs * szEnv + valuesInEnvs * szValuePtr
+                 + listElems * szValuePtr;
+        }
+        AllocCost operator-(const AllocCost & o) const {
+            return {values - o.values, attrsets - o.attrsets,
+                    attrsInAttrsets - o.attrsInAttrsets, envs - o.envs,
+                    valuesInEnvs - o.valuesInEnvs, listElems - o.listElems};
+        }
+        AllocCost & operator+=(const AllocCost & o) {
+            values += o.values; attrsets += o.attrsets;
+            attrsInAttrsets += o.attrsInAttrsets; envs += o.envs;
+            valuesInEnvs += o.valuesInEnvs; listElems += o.listElems;
+            return *this;
+        }
+    };
+
+    AllocCost snapshotAllocCounters() const {
+        auto & s = mem.getStats();
+        return {
+            static_cast<long>(s.nrValues.load()),
+            static_cast<long>(s.nrAttrsets.load()),
+            static_cast<long>(s.nrAttrsInAttrsets.load()),
+            static_cast<long>(s.nrEnvs.load()),
+            static_cast<long>(s.nrValuesInEnvs.load()),
+            static_cast<long>(s.nrListElems.load()),
+        };
+    }
+
+    typedef boost::unordered_flat_map<ExprLambda *, AllocCost> FunctionAllocs;
+    FunctionAllocs functionAllocs;
+
     typedef boost::unordered_flat_map<PosIdx, size_t, std::hash<PosIdx>> AttrSelects;
     AttrSelects attrSelects;
 
+    /** IFD profiling data. */
+    unsigned long nrIFDs = 0;
+    unsigned long nrIFDsCached = 0;
+    std::chrono::microseconds totalIFDTime{0};
+    std::vector<IFDEvent> ifdEvents;
+
+    /** Cache of already-realised derivation outputs within this evaluation. */
+    std::map<StorePath, StorePathSet> realisedDerivations;
+
+public:
+    /* ── Evaluator transformation instrumentation (v2) ──────────────
+     *
+     * These counters help identify which evaluator optimizations would
+     * have the most impact.  All gated behind countCalls.
+     * Public because primop implementations in primops.cc access them.
+     */
+
+    /** Per-primop cumulative timing (microseconds). */
+    typedef boost::unordered_flat_map<std::string, uint64_t, StringViewHash, std::equal_to<>> PrimOpTimes;
+    PrimOpTimes primOpTimes;
+
+    /** Thunk forcing statistics. */
+    Counter nrThunksForced;
+    Counter nrThunkChains;       /**< A forced thunk that resolved to another thunk. */
+
+    /** List operation size tracking -- cumulative element counts. */
+    struct ListOpStats {
+        Counter mapInputElems;
+        Counter filterInputElems;
+        Counter filterOutputElems;
+        Counter concatMapInputLists;
+        Counter concatMapOutputElems;
+        Counter sortInputElems;
+    } listOpStats;
+
+    /** Attrset update (//) size distribution. */
+    struct UpdateSizeStats {
+        Counter nrLayered;       /**< Updates that used structural sharing. */
+        Counter nrCopied;        /**< Updates that fell back to full copy. */
+        Counter lhsElemsTotal;   /**< Sum of LHS sizes across all updates. */
+        Counter rhsElemsTotal;   /**< Sum of RHS sizes across all updates. */
+    } updateSizeStats;
+
+private:
     friend struct ExprOpUpdate;
     friend struct ExprOpConcatLists;
     friend struct ExprVar;

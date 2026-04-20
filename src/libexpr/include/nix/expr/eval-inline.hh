@@ -96,6 +96,7 @@ Env & EvalMemory::allocEnv(size_t size)
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
     if (v.isThunk()) {
+        nrThunksForced++;
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
@@ -109,7 +110,11 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForThunk(env, expr, v, pos);
             throw;
         }
+        /* Detect thunk chains: a forced thunk that resolved to another thunk. */
+        if (v.isThunk() || v.isApp())
+            nrThunkChains++;
     } else if (v.isApp()) {
+        nrThunksForced++;
         Value savedApp = v;
         try {
             callFunction(*v.app().left, *v.app().right, v, pos);
@@ -117,6 +122,8 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
+        if (v.isThunk() || v.isApp())
+            nrThunkChains++;
     } else if (v.isFailed()) {
         handleEvalFailed(v, pos);
     }

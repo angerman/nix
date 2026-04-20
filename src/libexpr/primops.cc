@@ -1,3 +1,4 @@
+#include "nix/store/build-result.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/downstream-placeholder.hh"
 #include "nix/expr/eval-inline.hh"
@@ -29,6 +30,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <sstream>
 #include <regex>
@@ -62,12 +64,12 @@ std::string EvalState::realiseString(Value & s, StorePathSet * storePathsOutMayb
 {
     nix::NixStringContext stringContext;
     auto rawStr = coerceToString(pos, s, stringContext, "while realising a string").toOwned();
-    auto rewrites = realiseContext(stringContext, storePathsOutMaybe, isIFD);
+    auto rewrites = realiseContext(stringContext, storePathsOutMaybe, isIFD, pos);
 
     return nix::rewriteStrings(rawStr, rewrites);
 }
 
-StringMap EvalState::realiseContext(const NixStringContext & context, StorePathSet * maybePathsOut, bool isIFD)
+StringMap EvalState::realiseContext(const NixStringContext & context, StorePathSet * maybePathsOut, bool isIFD, PosIdx triggerPos)
 {
     std::vector<DerivedPath::Built> drvs;
     StringMap res;
@@ -116,12 +118,145 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
             warn("built '%1%' during evaluation due to an import from derivation", drvs.begin()->to_string(*store));
     }
 
+    /* Check if all requested derivation outputs have already been
+       realised during this evaluation.  Skip the buildPaths() round-trip
+       if so — buildPaths/resolveDerivedPath/allowClosure are idempotent. */
+    {
+        bool allCached = true;
+        for (auto & d : drvs) {
+            auto basePath = d.drvPath->getBaseStorePath();
+            if (realisedDerivations.find(basePath) == realisedDerivations.end()) {
+                allCached = false;
+                break;
+            }
+        }
+        if (allCached) {
+            StorePathSet outputsToCopyAndAllow;
+            for (auto & d : drvs) {
+                auto basePath = d.drvPath->getBaseStorePath();
+                for (auto & outputPath : realisedDerivations[basePath]) {
+                    outputsToCopyAndAllow.insert(outputPath);
+                    if (maybePathsOut)
+                        maybePathsOut->emplace(outputPath);
+                    if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
+                        auto outputs = resolveDerivedPath(*buildStore, d, &*store);
+                        for (auto & [outputName, outputPath2] : outputs)
+                            res.insert_or_assign(
+                                DownstreamPlaceholder::fromSingleDerivedPathBuilt(
+                                    SingleDerivedPath::Built{
+                                        .drvPath = d.drvPath,
+                                        .output = outputName,
+                                    })
+                                    .render(),
+                                buildStore->printStorePath(outputPath2));
+                    }
+                }
+            }
+            if (isIFD)
+                for (auto & outputPath : outputsToCopyAndAllow)
+                    allowClosure(outputPath);
+            nrIFDsCached++;
+            if (isIFD && settings.profileImportFromDerivation)
+                printMsg(lvlInfo, "IFD (cached): %d derivation(s) skipped", drvs.size());
+            return res;
+        }
+    }
+
     /* Build/substitute the context. */
     std::vector<DerivedPath> buildReqs;
     buildReqs.reserve(drvs.size());
     for (auto & d : drvs)
         buildReqs.emplace_back(DerivedPath{d});
-    buildStore->buildPaths(buildReqs, bmNormal, store);
+
+    bool profiling = isIFD && settings.profileImportFromDerivation;
+
+    auto t0 = profiling
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+
+    if (profiling) {
+        auto results = buildStore->buildPathsWithResults(buildReqs, bmNormal, store);
+
+        auto t1 = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+
+        nrIFDs++;
+        totalIFDTime += elapsed;
+
+        std::string posStr = "«unknown»";
+        if (auto pos = positions[triggerPos]) {
+            std::ostringstream oss;
+            oss << pos;
+            posStr = oss.str();
+        }
+
+        std::string stackStr;
+        if (!debugTraces.empty()) {
+            std::ostringstream oss;
+            int depth = 0;
+            for (auto & dt : debugTraces) {
+                if (depth >= 10) { oss << "  ... (truncated)\n"; break; }
+                auto p = dt.getPos(positions);
+                oss << "  #" << depth << " ";
+                if (p) oss << p; else oss << "«unknown»";
+                oss << ": " << dt.hint.str() << "\n";
+                depth++;
+            }
+            stackStr = oss.str();
+        }
+
+        for (auto & kr : results) {
+            IFDEvent ev;
+            ev.pos = triggerPos;
+            ev.duration = elapsed;
+
+            if (auto * success = kr.tryGetSuccess()) {
+                switch (success->status) {
+                case BuildResult::Success::Built:                 ev.status = "built"; break;
+                case BuildResult::Success::Substituted:           ev.status = "substituted"; break;
+                case BuildResult::Success::AlreadyValid:          ev.status = "already-valid"; break;
+                case BuildResult::Success::ResolvesToAlreadyValid: ev.status = "resolves-to-already-valid"; break;
+                }
+                for (auto & [name, outPath] : success->builtOutputs)
+                    ev.outputPaths.push_back(store->printStorePath(outPath.outPath));
+            } else if (auto * failure = kr.tryGetFailure()) {
+                switch (failure->status) {
+                case BuildError::PermanentFailure:  ev.status = "permanent-failure"; break;
+                case BuildError::InputRejected:     ev.status = "input-rejected"; break;
+                case BuildError::OutputRejected:    ev.status = "output-rejected"; break;
+                case BuildError::TransientFailure:  ev.status = "transient-failure"; break;
+                case BuildError::CachedFailure:     ev.status = "cached-failure"; break;
+                case BuildError::TimedOut:           ev.status = "timed-out"; break;
+                case BuildError::MiscFailure:       ev.status = "misc-failure"; break;
+                case BuildError::DependencyFailed:  ev.status = "dependency-failed"; break;
+                case BuildError::LogLimitExceeded:  ev.status = "log-limit-exceeded"; break;
+                case BuildError::NotDeterministic:  ev.status = "not-deterministic"; break;
+                case BuildError::NoSubstituters:    ev.status = "no-substituters"; break;
+                case BuildError::HashMismatch:      ev.status = "hash-mismatch"; break;
+                }
+            }
+
+            if (auto * built = std::get_if<DerivedPath::Built>(&kr.path))
+                ev.drvPath = built->to_string(*store);
+            else if (auto * opaque = std::get_if<DerivedPath::Opaque>(&kr.path))
+                ev.drvPath = store->printStorePath(opaque->path);
+
+            ev.stackTrace = stackStr;
+            ifdEvents.push_back(ev);
+
+            auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+            printMsg(lvlInfo,
+                "IFD #%d: %s [%s] %dms at %s",
+                nrIFDs, ev.drvPath, ev.status, durationMs, posStr);
+            if (!stackStr.empty())
+                printMsg(lvlInfo, "  stack:\n%s", stackStr);
+        }
+
+        for (auto & kr : results)
+            kr.tryThrowBuildError();
+    } else {
+        buildStore->buildPaths(buildReqs, bmNormal, store);
+    }
 
     StorePathSet outputsToCopyAndAllow;
 
@@ -132,7 +267,6 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
             if (maybePathsOut)
                 maybePathsOut->emplace(outputPath);
 
-            /* Get all the output paths corresponding to the placeholders we had */
             if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
                 res.insert_or_assign(
                     DownstreamPlaceholder::fromSingleDerivedPathBuilt(
@@ -150,9 +284,17 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
         copyClosure(*buildStore, *store, outputsToCopyAndAllow);
 
     if (isIFD) {
-        /* Allow access to the output closures of this derivation. */
         for (auto & outputPath : outputsToCopyAndAllow)
             allowClosure(outputPath);
+    }
+
+    /* Populate the cache so subsequent calls skip buildPaths(). */
+    for (auto & drv : drvs) {
+        auto basePath = drv.drvPath->getBaseStorePath();
+        auto outputs = resolveDerivedPath(*buildStore, drv, &*store);
+        auto & cached = realisedDerivations[basePath];
+        for (auto & [outputName, outputPath] : outputs)
+            cached.insert(outputPath);
     }
 
     return res;
@@ -166,7 +308,7 @@ SourcePath EvalState::realisePath(const PosIdx pos, Value & v, std::optional<Sym
 
     try {
         if (!context.empty() && path.accessor == rootFS) {
-            auto rewrites = realiseContext(context);
+            auto rewrites = realiseContext(context, nullptr, true, pos);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
         }
         return resolveSymlinks ? path.resolveSymlinks(*resolveSymlinks) : path;
@@ -502,7 +644,7 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
                                   .toOwned());
     }
     try {
-        auto _ = state.realiseContext(context); // FIXME: Handle CA derivations
+        auto _ = state.realiseContext(context, nullptr, true, pos); // FIXME: Handle CA derivations
     } catch (InvalidPathError & e) {
         state.error<EvalError>("cannot execute '%1%', since store path '%2%' is not valid", program, e.path.to_string())
             .atPos(pos)
@@ -2152,7 +2294,7 @@ static void prim_findFile(EvalState & state, const PosIdx pos, Value ** args, Va
                 .toOwned();
 
         try {
-            auto rewrites = state.realiseContext(context);
+            auto rewrites = state.realiseContext(context, nullptr, true, pos);
             path = rewriteStrings(std::move(path), rewrites);
         } catch (InvalidPathError & e) {
             state.error<EvalError>("cannot find '%1%', since path '%2%' is not valid", path, e.path.to_string())
@@ -2816,7 +2958,7 @@ static void addPath(
         if (path.accessor == state.rootFS && state.store->isInStore(path.path.abs()) && !context.empty()) {
             // FIXME: handle CA derivation outputs (where path needs to
             // be rewritten to the actual output).
-            auto rewrites = state.realiseContext(context);
+            auto rewrites = state.realiseContext(context, nullptr, true, pos);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
             auto [storePath, subPath] = state.store->toStorePath(path.path.abs());
             try {
@@ -3800,6 +3942,8 @@ static void prim_map(EvalState & state, const PosIdx pos, Value ** args, Value &
         return;
     }
 
+    state.listOpStats.mapInputElems += args[1]->listSize();
+
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.map");
 
     auto list = state.buildList(args[1]->listSize());
@@ -3847,6 +3991,8 @@ static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Valu
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.filter");
 
     auto len = args[1]->listSize();
+    state.listOpStats.filterInputElems += len;
+
     SmallValueVector<nonRecursiveStackReservation> vs(len);
     size_t k = 0;
 
@@ -3860,6 +4006,8 @@ static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Valu
         else
             same = false;
     }
+
+    state.listOpStats.filterOutputElems += k;
 
     if (same)
         v = *args[1];
@@ -4140,6 +4288,7 @@ static void prim_sort(EvalState & state, const PosIdx pos, Value ** args, Value 
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.sort");
 
     auto len = args[1]->listSize();
+    state.listOpStats.sortInputElems += len;
     if (len == 0) {
         v = *args[1];
         return;
@@ -4388,6 +4537,8 @@ static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, V
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.concatMap");
     auto nrLists = args[1]->listSize();
 
+    state.listOpStats.concatMapInputLists += nrLists;
+
     // List of returned lists before concatenation. References to these Values must NOT be persisted.
     SmallTemporaryValueVector<conservativeStackReservation> lists(nrLists);
     size_t len = 0;
@@ -4401,6 +4552,8 @@ static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, V
             "while evaluating the return value of the function passed to builtins.concatMap");
         len += lists[n].listSize();
     }
+
+    state.listOpStats.concatMapOutputElems += len;
 
     auto list = state.buildList(len);
     auto out = list.elems;
