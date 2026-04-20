@@ -1174,9 +1174,25 @@ public:
      * Public because primop implementations in primops.cc access them.
      */
 
-    /** Per-primop cumulative timing (microseconds). */
+    /** Per-primop cumulative timing (microseconds).
+     *  `primOpTimes` is inclusive (includes Nix callbacks within the primop).
+     *  `primOpSelfTimes` is self-only (excludes time in nested primop calls).
+     *  The difference reveals whether cost is in the C++ primop or in
+     *  the Nix code it invokes. */
     typedef boost::unordered_flat_map<std::string, uint64_t, StringViewHash, std::equal_to<>> PrimOpTimes;
     PrimOpTimes primOpTimes;
+    PrimOpTimes primOpSelfTimes;
+
+    /** Stack of active primop timers for self-time accounting.
+     *  When a nested primop starts, the outer primop's elapsed time so far
+     *  is accumulated, and the nested primop gets its own timer.  On return,
+     *  the outer primop resumes. */
+    struct PrimOpTimerFrame {
+        std::string_view name;
+        std::chrono::steady_clock::time_point segmentStart;
+        uint64_t accumulatedSelfUs = 0;
+    };
+    std::vector<PrimOpTimerFrame> primOpTimerStack;
 
     /** Thunk forcing statistics. */
     Counter nrThunksForced;

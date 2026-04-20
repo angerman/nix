@@ -1682,19 +1682,50 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                 if (countCalls)
                     primOpCalls[fn->name]++;
 
-                auto primopT0 = countCalls
-                    ? std::chrono::steady_clock::now()
-                    : std::chrono::steady_clock::time_point{};
+                if (countCalls) {
+                    auto now = std::chrono::steady_clock::now();
+                    /* Pause outer primop's self-timer (if any). */
+                    if (!primOpTimerStack.empty()) {
+                        auto & outer = primOpTimerStack.back();
+                        outer.accumulatedSelfUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - outer.segmentStart).count();
+                    }
+                    primOpTimerStack.push_back({fn->name, now, 0});
+                }
                 try {
                     fn->impl(*this, vCur.determinePos(noPos), args.data(), vCur);
                 } catch (Error & e) {
                     if (fn->addTrace)
                         addErrorTrace(e, pos, "while calling the '%1%' builtin", fn->name);
+                    if (countCalls && !primOpTimerStack.empty()) {
+                        auto now = std::chrono::steady_clock::now();
+                        auto & frame = primOpTimerStack.back();
+                        auto selfUs = frame.accumulatedSelfUs +
+                            std::chrono::duration_cast<std::chrono::microseconds>(now - frame.segmentStart).count();
+                        primOpSelfTimes[std::string(frame.name)] += selfUs;
+                        auto inclusiveUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - primOpTimerStack.back().segmentStart).count() + frame.accumulatedSelfUs;
+                        primOpTimes[std::string(frame.name)] += inclusiveUs;
+                        primOpTimerStack.pop_back();
+                        if (!primOpTimerStack.empty())
+                            primOpTimerStack.back().segmentStart = now;
+                    }
                     throw;
                 }
-                if (countCalls)
+                if (countCalls) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto & frame = primOpTimerStack.back();
+                    auto selfUs = frame.accumulatedSelfUs +
+                        std::chrono::duration_cast<std::chrono::microseconds>(now - frame.segmentStart).count();
+                    primOpSelfTimes[std::string(frame.name)] += selfUs;
+                    /* Inclusive = wall time from initial push to now. */
                     primOpTimes[fn->name] += std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - primopT0).count();
+                        now - frame.segmentStart).count() + frame.accumulatedSelfUs;
+                    primOpTimerStack.pop_back();
+                    /* Resume outer primop's timer. */
+                    if (!primOpTimerStack.empty())
+                        primOpTimerStack.back().segmentStart = now;
+                }
 
                 args = args.subspan(argsLeft);
             }
@@ -1733,24 +1764,45 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                 if (countCalls)
                     primOpCalls[fn->name]++;
 
-                auto primopT0 = countCalls
-                    ? std::chrono::steady_clock::now()
-                    : std::chrono::steady_clock::time_point{};
+                if (countCalls) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (!primOpTimerStack.empty()) {
+                        auto & outer = primOpTimerStack.back();
+                        outer.accumulatedSelfUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - outer.segmentStart).count();
+                    }
+                    primOpTimerStack.push_back({fn->name, now, 0});
+                }
                 try {
-                    // TODO:
-                    // 1. Unify this and above code. Heavily redundant.
-                    // 2. Create a fake env (arg1, arg2, etc.) and a fake expr (arg1: arg2: etc: builtins.name arg1 arg2
-                    // etc)
-                    //    so the debugger allows to inspect the wrong parameters passed to the builtin.
                     fn->impl(*this, vCur.determinePos(noPos), vArgs, vCur);
                 } catch (Error & e) {
                     if (fn->addTrace)
                         addErrorTrace(e, pos, "while calling the '%1%' builtin", fn->name);
+                    if (countCalls && !primOpTimerStack.empty()) {
+                        auto now = std::chrono::steady_clock::now();
+                        auto & frame = primOpTimerStack.back();
+                        auto selfUs = frame.accumulatedSelfUs +
+                            std::chrono::duration_cast<std::chrono::microseconds>(now - frame.segmentStart).count();
+                        primOpSelfTimes[std::string(frame.name)] += selfUs;
+                        primOpTimes[std::string(frame.name)] += selfUs;
+                        primOpTimerStack.pop_back();
+                        if (!primOpTimerStack.empty())
+                            primOpTimerStack.back().segmentStart = now;
+                    }
                     throw;
                 }
-                if (countCalls)
+                if (countCalls) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto & frame = primOpTimerStack.back();
+                    auto selfUs = frame.accumulatedSelfUs +
+                        std::chrono::duration_cast<std::chrono::microseconds>(now - frame.segmentStart).count();
+                    primOpSelfTimes[std::string(frame.name)] += selfUs;
                     primOpTimes[fn->name] += std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - primopT0).count();
+                        now - frame.segmentStart).count() + frame.accumulatedSelfUs;
+                    primOpTimerStack.pop_back();
+                    if (!primOpTimerStack.empty())
+                        primOpTimerStack.back().segmentStart = now;
+                }
 
                 args = args.subspan(argsLeft);
             }
@@ -3243,12 +3295,24 @@ void EvalState::printStatistics()
 
     /* Evaluator transformation instrumentation. */
     if (countCalls) {
-        /* Per-primop timing. */
+        /* Per-primop timing (inclusive). */
         {
             auto & obj = topObj["primopTimes"];
             obj = json::object();
             std::vector<std::pair<std::string, uint64_t>> sorted(
                 primOpTimes.begin(), primOpTimes.end());
+            std::sort(sorted.begin(), sorted.end(),
+                [](auto & a, auto & b) { return a.second > b.second; });
+            for (auto & [name, us] : sorted)
+                obj[name] = us;
+        }
+
+        /* Per-primop self-time (excludes nested primop calls). */
+        {
+            auto & obj = topObj["primopSelfTimes"];
+            obj = json::object();
+            std::vector<std::pair<std::string, uint64_t>> sorted(
+                primOpSelfTimes.begin(), primOpSelfTimes.end());
             std::sort(sorted.begin(), sorted.end(),
                 [](auto & a, auto & b) { return a.second > b.second; });
             for (auto & [name, us] : sorted)
