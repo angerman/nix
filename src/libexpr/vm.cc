@@ -35,6 +35,19 @@ namespace nix::bytecode {
 // The step counter is global (across all vmExec invocations) so you can
 // pinpoint the exact moment something goes wrong in a long evaluation.
 
+/// Print VM statistics at process exit when NIX_VM_STATS=1.
+static void printVMStats(const VMState & vm) {
+    if (getEnv("NIX_VM_STATS").value_or("") != "1") return;
+    fprintf(stderr, "\n=== Bytecode VM Statistics ===\n");
+    fprintf(stderr, "  Instructions executed: %llu\n", (unsigned long long)vm.nrInstructions);
+    fprintf(stderr, "  OP_EVAL_EXPR fallbacks: %llu (%.1f%%)\n",
+        (unsigned long long)vm.nrEvalExprFallbacks,
+        vm.nrInstructions ? 100.0 * vm.nrEvalExprFallbacks / vm.nrInstructions : 0.0);
+    fprintf(stderr, "  Peak stack depth: %llu\n", (unsigned long long)vm.peakStackDepth);
+    fprintf(stderr, "  Peak frame depth: %llu\n", (unsigned long long)vm.peakFrameDepth);
+    fprintf(stderr, "================================\n");
+}
+
 struct TraceConfig {
     bool enabled = false;
     uint64_t from = 0;
@@ -173,6 +186,11 @@ static void traceInstruction(
 // ---------------------------------------------------------------------------
 // VMState
 // ---------------------------------------------------------------------------
+
+VMState::~VMState()
+{
+    printVMStats(*this);
+}
 
 VMState::VMState()
 {
@@ -366,6 +384,15 @@ void vmExec(
 
     for (;;) {
         Instruction instr = cu->code[ip++];
+
+        // Profiling: count instructions.
+        vm.nrInstructions++;
+        {
+            size_t sd = static_cast<size_t>(vm.sp - vm.stack);
+            if (sd > vm.peakStackDepth) vm.peakStackDepth = sd;
+            size_t fd = vm.frames.size();
+            if (fd > vm.peakFrameDepth) vm.peakFrameDepth = fd;
+        }
 
         // VM tracing: print instruction details if in the trace window.
         if (tcfg.enabled) [[unlikely]] {
@@ -1535,9 +1562,8 @@ op_eval_expr:
     {
         uint32_t exprIdx = decodeOperand(CUR_INSTR);
         Expr * expr = cu->exprPool[exprIdx];
+        vm.nrEvalExprFallbacks++;
 
-        // Evaluate the expression via the tree-walking interpreter,
-        // using the current bytecode env as context.
         auto * result = state.allocValue();
         expr->eval(state, *curEnv, *result);
 

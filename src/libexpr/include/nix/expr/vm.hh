@@ -58,7 +58,7 @@ struct VMState
     std::vector<CallFrame, traceable_allocator<CallFrame>> frames;
 
     VMState();
-    ~VMState() = default;
+    ~VMState();
 
     // -- Stack operations (inline for hot-path performance) --
 
@@ -93,6 +93,14 @@ struct VMState
 
     /// Number of Value* entries currently on the stack.
     size_t stackSize() const { return static_cast<size_t>(sp - stack); }
+
+    // -- Profiling counters --
+    uint64_t nrInstructions = 0;       ///< Total bytecoded instructions executed
+    uint64_t nrEvalExprFallbacks = 0;  ///< OP_EVAL_EXPR fallbacks to tree-walker
+    uint64_t nrForceOps = 0;           ///< OP_FORCE invocations
+    uint64_t nrCallOps = 0;            ///< OP_CALL + OP_CALL_1 invocations
+    uint64_t peakStackDepth = 0;       ///< Maximum stack depth observed
+    uint64_t peakFrameDepth = 0;       ///< Maximum call frame depth observed
 
 private:
     void grow();
