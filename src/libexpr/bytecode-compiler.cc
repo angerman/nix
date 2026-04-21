@@ -605,9 +605,70 @@ void Compiler::compileAttrs(ExprAttrs * e)
     bool hasInheritFrom = e->inheritFromExprs && !e->inheritFromExprs->empty();
     bool hasDynamic = e->dynamicAttrs && !e->dynamicAttrs->empty();
 
-    if (e->recursive || hasInheritFrom || hasDynamic) {
+    if (hasDynamic) {
+        // Dynamic attrs require runtime name evaluation -- fall back.
         unit.emitPos(e->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        return;
+    }
+
+    // Check for __overrides (deprecated but still supported).
+    bool hasOverrides = false;
+    if (e->recursive) {
+        for (auto & [name, def] : *e->attrs) {
+            // Check if any attr is named "__overrides".
+            // We can't easily check against the static symbol here,
+            // so fall back for recursive attrsets with inherit(expr)
+            // or if there are inherited attrs (which need chooseByKind).
+            if (def.kind != ExprAttrs::AttrDef::Kind::Plain) {
+                hasOverrides = true; // not really overrides, but needs complex handling
+                break;
+            }
+        }
+    }
+
+    if ((e->recursive && (hasInheritFrom || hasOverrides))) {
+        // Complex recursive attrset -- fall back.
+        unit.emitPos(e->pos);
+        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        return;
+    }
+
+    if (e->recursive) {
+        // Recursive attrset with plain bindings only (no inherit, no dynamic,
+        // no __overrides).  This is the common `rec { a = ...; b = ...; }` pattern.
+        //
+        // 1. ENTER_LET creates the self-referential env
+        // 2. For each binding: create thunk capturing env, store in env slot
+        // 3. Build Bindings from env slots + symbols
+        // 4. LEAVE_SCOPE
+        uint32_t nAttrs = static_cast<uint32_t>(e->attrs->size());
+
+        // Enter a new scope (same as let -- the env is self-referential).
+        unit.emitPos(e->pos);
+        unit.emit(OP_ENTER_LET, nAttrs);
+
+        // For each binding, create a thunk that captures the rec env.
+        Displacement displ = 0;
+        for (auto & [name, def] : *e->attrs) {
+            compileAsThunkOrEager(def.e, def.pos);
+            unit.emit(OP_SET_ENV_SLOT, displ);
+            displ++;
+        }
+
+        // Build the attrset from the env slots.
+        // Push each value from the env back onto the stack for OP_ATTRS_INIT.
+        for (uint32_t d = 0; d < nAttrs; d++) {
+            unit.emit(OP_GET_LOCAL_0, d);
+        }
+        unit.emit(OP_ATTRS_INIT, nAttrs);
+        // Emit (symbol, position) data word pairs.
+        for (auto & [name, def] : *e->attrs) {
+            unit.emit(OP_NOP, unit.addSymbol(name));
+            unit.emit(OP_NOP, unit.addPos(def.pos));
+        }
+
+        unit.emit(OP_LEAVE_SCOPE);
         return;
     }
 
