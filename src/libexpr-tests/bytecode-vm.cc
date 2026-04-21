@@ -262,8 +262,8 @@ TEST_F(BytecodeVMTest, vm_start_at_offset)
 TEST_F(BytecodeVMTest, vm_unhandled_opcode_throws)
 {
     bytecode::CompilationUnit unit;
-    // OP_ATTRS_UPDATE (0x13) is not yet implemented.
-    unit.emit(bytecode::OP_ATTRS_UPDATE);
+    // Use an opcode that will never be implemented (0xFE).
+    unit.code.push_back(bytecode::encode(0xFE, 0));
 
     ASSERT_THROW(evalBytecodeManual(unit, 0), Error);
 }

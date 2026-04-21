@@ -465,53 +465,155 @@ void Compiler::compileCall(ExprCall * e)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Phase 3+ stubs: fall back to tree-walking via OP_EVAL_EXPR
+// Phase 3: Attribute selection
 // ---------------------------------------------------------------------------
-// These will be replaced with proper bytecoded implementations.
-// For now they delegate to the existing Expr::eval() method so that
-// the entire Nix language works (just not at full bytecode speed
-// for these expression types).
 
 void Compiler::compileSelect(ExprSelect * e)
 {
-    unit.emitPos(e->pos);
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+    auto attrPath = e->getAttrPath();
+
+    // Fall back to tree-walking for complex cases:
+    // - Dynamic attribute names (expr in path)
+    // - Multi-level paths with 'or' default (complex jump logic)
+    bool hasDynamic = false;
+    for (auto & attr : attrPath)
+        if (attr.expr) { hasDynamic = true; break; }
+
+    if (hasDynamic || (e->def && attrPath.size() > 1)) {
+        unit.emitPos(e->pos);
+        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        return;
+    }
+
+    // Compile the base expression.
+    compile(e->e);
+
+    // Emit select for each level in the path.
+    for (size_t i = 0; i < attrPath.size(); i++) {
+        uint32_t symIdx = unit.addSymbol(attrPath[i].symbol);
+        bool isLast = (i == attrPath.size() - 1);
+
+        if (e->def && isLast) {
+            // Single-level 'or' default: a.x or default
+            //   FORCE
+            //   JUMP_IF_NOT_ATTRS -> defLabel    (no pop)
+            //   DUP                               (stack: [attrs, attrs])
+            //   HAS_ATTR sym                      (stack: [attrs, bool])
+            //   JUMP_IF_FALSE -> defLabel2        (stack: [attrs])
+            //   ATTR_SELECT sym                   (stack: [value])
+            //   JUMP -> endLabel
+            // defLabel:                           (stack: [non-attrs-value])
+            // defLabel2:                          (stack: [attrs])
+            //   POP                               (stack: [])
+            //   <compile default>                 (stack: [default])
+            // endLabel:
+            unit.emitPos(e->pos);
+            unit.emit(OP_FORCE);
+            uint32_t jumpNotAttrs = unit.emit(OP_JUMP_IF_NOT_ATTRS, 0);
+            unit.emit(OP_DUP);
+            unit.emit(OP_HAS_ATTR, symIdx);
+            uint32_t jumpNoAttr = unit.emit(OP_JUMP_IF_FALSE, 0);
+            unit.emit(OP_ATTR_SELECT, symIdx);
+            uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
+            unit.patchJump(jumpNotAttrs);
+            unit.patchJump(jumpNoAttr);
+            unit.emit(OP_POP);
+            compile(e->def);
+            unit.patchJump(jumpEnd);
+        } else {
+            // No default: select + force.
+            unit.emitPos(e->pos);
+            unit.emit(OP_SELECT_FORCE, symIdx);
+        }
+    }
 }
 
 void Compiler::compileHasAttr(ExprOpHasAttr * e)
 {
+    // Fall back for multi-level or dynamic paths.
+    bool hasDynamic = false;
+    for (auto & attr : e->attrPath)
+        if (attr.expr) { hasDynamic = true; break; }
+
+    if (hasDynamic || e->attrPath.size() > 1) {
+        unit.emitPos(e->getPos());
+        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        return;
+    }
+
+    // Single-level: { ... } ? attrName
+    compile(e->e);
+    uint32_t symIdx = unit.addSymbol(e->attrPath[0].symbol);
     unit.emitPos(e->getPos());
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+    unit.emit(OP_FORCE);
+    // If not attrset, result is false.
+    uint32_t jumpNotAttrs = unit.emit(OP_JUMP_IF_NOT_ATTRS, 0);
+    unit.emit(OP_HAS_ATTR, symIdx);
+    uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
+    unit.patchJump(jumpNotAttrs);
+    unit.emit(OP_POP);
+    unit.emit(OP_FALSE);
+    unit.patchJump(jumpEnd);
 }
 
-void Compiler::compileAttrs(ExprAttrs * e)
-{
-    unit.emitPos(e->pos);
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
-}
+// ---------------------------------------------------------------------------
+// Phase 3: Lists
+// ---------------------------------------------------------------------------
 
 void Compiler::compileList(ExprList * e)
 {
+    if (e->elems.empty()) {
+        // Empty list: push singleton.
+        // Use OP_EVAL_EXPR since we need a Value* to the global vEmptyList.
+        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        return;
+    }
+
+    // For non-empty lists, compile each element as a thunk.
+    // Then use OP_EVAL_EXPR for the final list construction since
+    // buildList requires the EvalState allocator.
+    // TODO: add proper OP_LIST_INIT/ELEM/FINISH opcodes.
     unit.emitPos(e->getPos());
+    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Attrsets, update, with
+// ---------------------------------------------------------------------------
+
+void Compiler::compileAttrs(ExprAttrs * e)
+{
+    // Attrset construction is complex (recursive envs, inherit, inherit(expr),
+    // __overrides, dynamic attrs).  Keep using OP_EVAL_EXPR fallback for now.
+    // Each of these sub-features will be implemented incrementally.
+    unit.emitPos(e->pos);
     unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
 }
 
 void Compiler::compileWith(ExprWith * e)
 {
+    // `with` requires OP_GET_WITH for variable resolution in the body.
+    // OP_GET_WITH needs the full with-chain walk implementation.
+    // Fall back to tree-walking for now.
+    // TODO: implement OP_GET_WITH + OP_PUSH_WITH properly.
     unit.emitPos(e->pos);
     unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
 }
 
 void Compiler::compileUpdate(ExprOpUpdate * e)
 {
+    compile(e->e1);
+    compile(e->e2);
     unit.emitPos(e->pos);
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+    unit.emit(OP_ATTRS_UPDATE);
 }
 
 void Compiler::compileConcatLists(ExprOpConcatLists * e)
 {
+    compile(e->e1);
+    compile(e->e2);
     unit.emitPos(e->getPos());
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+    unit.emit(OP_LIST_CONCAT);
 }
 
 void Compiler::compileConcatStrings(ExprConcatStrings * e)

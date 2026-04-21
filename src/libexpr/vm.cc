@@ -155,6 +155,15 @@ void vmExec(
         REGISTER_OP(OP_POP,     op_pop);
         REGISTER_OP(OP_DUP,     op_dup);
 
+        // Phase 3: select, attrs, lists, with
+        REGISTER_OP(OP_SELECT_FORCE,     op_select_force);
+        REGISTER_OP(OP_ATTR_SELECT,      op_attr_select);
+        REGISTER_OP(OP_HAS_ATTR,         op_has_attr);
+        REGISTER_OP(OP_ATTRS_UPDATE,     op_attrs_update);
+        REGISTER_OP(OP_LIST_CONCAT,      op_list_concat);
+        REGISTER_OP(OP_PUSH_WITH,        op_push_with);
+        REGISTER_OP(OP_JUMP_IF_NOT_ATTRS, op_jump_if_not_attrs);
+
         // Fallback
         REGISTER_OP(OP_EVAL_EXPR,    op_eval_expr);
 
@@ -793,7 +802,6 @@ op_make_thunk:
 #endif
     {
         uint32_t thunkIdx = decodeOperand(CUR_INSTR);
-        auto & desc = cu->thunks[thunkIdx];
 
         // Create an ExprBytecodeThunk in the BumpMemoryResource arena.
         // This is the bridge: forceValue() calls expr->eval() which
@@ -891,6 +899,158 @@ op_call:
         state.callFunction(*fun, std::span<Value *>(args, nArgs), *result, pos);
 
         vm.push(result);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 3: Attribute selection
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_select_force:
+#else
+    case OP_SELECT_FORCE:
+#endif
+    {
+        uint32_t symIdx = decodeOperand(CUR_INSTR);
+        Value * attrs = vm.top();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        Symbol name = cu->symbols[symIdx];
+        state.forceAttrs(*attrs, pos, "while selecting an attribute");
+        if (auto j = attrs->attrs()->get(name)) {
+            // TODO: state.nrLookups++ (private, needs friend decl)
+            state.forceValue(*j->value, pos);
+            // Replace top of stack with the selected value.
+            *(vm.sp - 1) = j->value;
+        } else {
+            state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
+                .atPos(pos).debugThrow();
+        }
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_attr_select:
+#else
+    case OP_ATTR_SELECT:
+#endif
+    {
+        uint32_t symIdx = decodeOperand(CUR_INSTR);
+        Value * attrs = vm.top();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        Symbol name = cu->symbols[symIdx];
+        state.forceAttrs(*attrs, pos, "while selecting an attribute");
+        if (auto j = attrs->attrs()->get(name)) {
+            // TODO: state.nrLookups++ (private, needs friend decl)
+            *(vm.sp - 1) = j->value;
+        } else {
+            state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
+                .atPos(pos).debugThrow();
+        }
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_has_attr:
+#else
+    case OP_HAS_ATTR:
+#endif
+    {
+        uint32_t symIdx = decodeOperand(CUR_INSTR);
+        Value * attrs = vm.top();
+        Symbol name = cu->symbols[symIdx];
+        // attrs is already forced (FORCE was emitted before HAS_ATTR).
+        auto * result = state.allocValue();
+        result->mkBool(attrs->type() == nAttrs && attrs->attrs()->get(name));
+        *(vm.sp - 1) = result;
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_jump_if_not_attrs:
+#else
+    case OP_JUMP_IF_NOT_ATTRS:
+#endif
+    {
+        int32_t offset = decodeSigned(CUR_INSTR);
+        Value * v = vm.top();
+        // v is already forced.
+        if (v->type() != nAttrs)
+            ip = static_cast<uint32_t>(static_cast<int32_t>(ip) + offset);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 3: Attrset update (//)
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_attrs_update:
+#else
+    case OP_ATTRS_UPDATE:
+#endif
+    {
+        Value * rhs = vm.pop();
+        Value * lhs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceAttrs(*lhs, pos, "in the left operand of the update (//) operator");
+        state.forceAttrs(*rhs, pos, "in the right operand of the update (//) operator");
+
+        auto * result = state.allocValue();
+
+        // Use the existing Bindings merge logic.
+        auto & bindings1 = *lhs->attrs();
+        auto & bindings2 = *rhs->attrs();
+
+        auto resultBindings = state.buildBindings(bindings1.size() + bindings2.size());
+        for (auto & attr : bindings1)
+            resultBindings.insert(attr);
+        for (auto & attr : bindings2)
+            resultBindings.insert(attr);
+        result->mkAttrs(resultBindings.alreadySorted());
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 3: List concatenation (++)
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_list_concat:
+#else
+    case OP_LIST_CONCAT:
+#endif
+    {
+        Value * rhs = vm.pop();
+        Value * lhs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        auto * result = state.allocValue();
+        Value * lists[2] = {lhs, rhs};
+        state.concatLists(*result, lists, pos, "while evaluating one of the elements to concatenate");
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 3: With scope
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_push_with:
+#else
+    case OP_PUSH_WITH:
+#endif
+    {
+        Value * attrsVal = vm.pop();
+        // Allocate a 1-slot env for the with-scope.
+        Env & env2 = state.mem.allocEnv(1);
+        env2.up = curEnv;
+        env2.values[0] = attrsVal;
+        curEnv = &env2;
         DISPATCH();
     }
 
