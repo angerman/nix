@@ -1087,7 +1087,10 @@ op_unhandled:
 #endif
     {
         uint8_t op = decodeOp(CUR_INSTR);
-        throw Error("bytecode VM: unhandled opcode 0x%02x at offset %d", op, ip - 1);
+        // Dump disassembly around the crash point for debugging.
+        std::string disasm = disassemble(*cu, &state);
+        throw Error("bytecode VM: unhandled opcode 0x%02x at offset %d\n\nDisassembly:\n%s",
+            op, ip - 1, disasm);
     }
 
 #ifndef NIX_VM_COMPUTED_GOTO
