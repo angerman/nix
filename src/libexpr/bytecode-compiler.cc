@@ -388,7 +388,7 @@ void Compiler::compileAsThunkOrEager(Expr * expr, PosIdx pos)
 
     // Register the thunk descriptor.
     uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
-    unit.thunks.push_back(ThunkDescriptor{thunkStart, pos});
+    unit.thunks.push_back(ThunkDescriptor{thunkStart, pos, expr});
 
     // Emit the thunk creation instruction.
     unit.emit(OP_MAKE_THUNK, thunkIdx);

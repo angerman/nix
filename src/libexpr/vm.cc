@@ -1085,16 +1085,16 @@ op_make_thunk:
 #endif
     {
         uint32_t thunkIdx = decodeOperand(CUR_INSTR);
+        auto & desc = cu->thunks[thunkIdx];
 
-        // Create an ExprBytecodeThunk in the BumpMemoryResource arena.
-        // This is the bridge: forceValue() calls expr->eval() which
-        // dispatches to vmExec.
-        auto * thunkExpr = state.mem.exprs.add<ExprBytecodeThunk>(
-            const_cast<CompilationUnit *>(cu), thunkIdx);
-
-        // Create the thunk Value: (currentEnv, thunkExpr).
+        // Use the ORIGINAL Expr* from the AST as the thunk expression.
+        // This preserves compatibility with Value::isTrivial() which
+        // checks the Expr type (ExprAttrs, ExprLambda, ExprList).
+        // When forceValue forces this thunk, it tree-walks the original
+        // expression -- this is correct and avoids the ExprBytecodeThunk
+        // compatibility issues with the flake machinery.
         auto * thunkVal = state.allocValue();
-        thunkVal->mkThunk(curEnv, thunkExpr);
+        thunkVal->mkThunk(curEnv, desc.sourceExpr);
 
         vm.push(thunkVal);
         DISPATCH();

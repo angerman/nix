@@ -235,6 +235,7 @@ struct ThunkDescriptor
 {
     uint32_t codeOffset; // Instruction index into CompilationUnit::code
     PosIdx   pos;        // Source position for error messages
+    Expr *   sourceExpr = nullptr; // Original AST expression (for isTrivial() compat)
 };
 
 /// Identifies a function body within a CompilationUnit.
