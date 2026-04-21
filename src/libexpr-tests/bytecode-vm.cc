@@ -17,6 +17,7 @@
 
 #include "nix/expr/tests/libexpr.hh"
 #include "nix/expr/bytecode.hh"
+#include "nix/expr/bytecode-compiler.hh"
 #include "nix/expr/bytecode-thunk.hh"
 #include "nix/expr/vm.hh"
 
@@ -50,6 +51,33 @@ protected:
         Value result;
         bytecode::vmExec(state, unit, offset, state.baseEnv, result);
         return result;
+    }
+
+    /// Evaluate an expression by compiling to bytecode and executing via VM.
+    /// parseExprFromString already calls bindVars, so the AST is ready
+    /// for compilation.
+    Value evalBytecode(const std::string & input)
+    {
+        Expr * e = state.parseExprFromString(input, state.rootPath(CanonPath::root));
+        assert(e);
+
+        auto * unit = bytecode::compile(state, e);
+
+        Value result;
+        bytecode::vmExec(state, *unit, 0, state.baseEnv, result);
+        state.forceValue(result, noPos);
+        return result;
+    }
+
+    /// Assert that tree-walking and bytecode produce identical results.
+    void assertDualMode(const std::string & expr)
+    {
+        Value treeResult = evalTreeWalk(expr);
+        Value bcResult = evalBytecode(expr);
+        ASSERT_TRUE(valuesEqual(treeResult, bcResult))
+            << "Semantic divergence for: " << expr
+            << "\n  tree-walk type: " << showType(treeResult)
+            << "\n  bytecode type:  " << showType(bcResult);
     }
 
     /// Compare two Values for deep equality.
@@ -335,23 +363,62 @@ TEST_F(BytecodeVMTest, compilation_unit_pos_table)
 
 
 // ===========================================================================
-// Dual-mode test template (for use once the compiler is implemented)
+// Dual-mode tests: tree-walker vs bytecode, must produce identical results
 // ===========================================================================
-// These are commented out until the bytecode compiler exists.
-// They will use:
-//
-//   void assertDualMode(const std::string & expr) {
-//       Value treeResult = evalTreeWalk(expr);
-//       Value bcResult = evalBytecode(expr);
-//       ASSERT_TRUE(valuesEqual(treeResult, bcResult))
-//           << "Semantic divergence for: " << expr;
-//   }
-//
-// Example:
-//   TEST_F(BytecodeVMTest, dual_1plus1) { assertDualMode("1 + 1"); }
-//   TEST_F(BytecodeVMTest, dual_let)    { assertDualMode("let x = 1; in x"); }
-//   TEST_F(BytecodeVMTest, dual_if)     { assertDualMode("if true then 1 else 2"); }
-//   TEST_F(BytecodeVMTest, dual_rec)    { assertDualMode("rec { a = b; b = 1; }.a"); }
+
+// -- Phase 1: Literals --
+TEST_F(BytecodeVMTest, dual_int)       { assertDualMode("42"); }
+TEST_F(BytecodeVMTest, dual_float)     { assertDualMode("3.14"); }
+TEST_F(BytecodeVMTest, dual_string)    { assertDualMode("\"hello\""); }
+TEST_F(BytecodeVMTest, dual_true)      { assertDualMode("true"); }
+TEST_F(BytecodeVMTest, dual_false)     { assertDualMode("false"); }
+TEST_F(BytecodeVMTest, dual_null)      { assertDualMode("null"); }
+
+// -- Phase 1: Arithmetic --
+TEST_F(BytecodeVMTest, dual_add_int)   { assertDualMode("1 + 2"); }
+TEST_F(BytecodeVMTest, dual_sub_int)   { assertDualMode("10 - 3"); }
+TEST_F(BytecodeVMTest, dual_mul_int)   { assertDualMode("6 * 7"); }
+TEST_F(BytecodeVMTest, dual_div_int)   { assertDualMode("10 / 3"); }
+TEST_F(BytecodeVMTest, dual_negate)    { assertDualMode("-5"); }
+TEST_F(BytecodeVMTest, dual_add_float) { assertDualMode("1.5 + 2.5"); }
+TEST_F(BytecodeVMTest, dual_mixed_add) { assertDualMode("1 + 2.0"); }
+
+// -- Phase 1: Comparison --
+TEST_F(BytecodeVMTest, dual_eq_true)   { assertDualMode("1 == 1"); }
+TEST_F(BytecodeVMTest, dual_eq_false)  { assertDualMode("1 == 2"); }
+TEST_F(BytecodeVMTest, dual_neq)       { assertDualMode("1 != 2"); }
+TEST_F(BytecodeVMTest, dual_lt_true)   { assertDualMode("1 < 2"); }
+TEST_F(BytecodeVMTest, dual_lt_false)  { assertDualMode("2 < 1"); }
+
+// -- Phase 1: Logic --
+TEST_F(BytecodeVMTest, dual_not)       { assertDualMode("!true"); }
+TEST_F(BytecodeVMTest, dual_and_tt)    { assertDualMode("true && true"); }
+TEST_F(BytecodeVMTest, dual_and_tf)    { assertDualMode("true && false"); }
+TEST_F(BytecodeVMTest, dual_and_ff)    { assertDualMode("false && false"); }
+TEST_F(BytecodeVMTest, dual_or_tt)     { assertDualMode("true || true"); }
+TEST_F(BytecodeVMTest, dual_or_ff)     { assertDualMode("false || false"); }
+TEST_F(BytecodeVMTest, dual_or_tf)     { assertDualMode("true || false"); }
+TEST_F(BytecodeVMTest, dual_impl_tt)   { assertDualMode("true -> true"); }
+TEST_F(BytecodeVMTest, dual_impl_ft)   { assertDualMode("false -> true"); }
+TEST_F(BytecodeVMTest, dual_impl_ff)   { assertDualMode("false -> false"); }
+
+// -- Phase 1: Control flow --
+TEST_F(BytecodeVMTest, dual_if_true)   { assertDualMode("if true then 1 else 2"); }
+TEST_F(BytecodeVMTest, dual_if_false)  { assertDualMode("if false then 1 else 2"); }
+TEST_F(BytecodeVMTest, dual_if_nested) { assertDualMode("if true then (if false then 1 else 2) else 3"); }
+TEST_F(BytecodeVMTest, dual_assert_true) { assertDualMode("assert true; 42"); }
+
+// -- Phase 2: Let-bindings --
+TEST_F(BytecodeVMTest, dual_let_simple) { assertDualMode("let x = 1; in x"); }
+TEST_F(BytecodeVMTest, dual_let_two)    { assertDualMode("let x = 1; y = 2; in x + y"); }
+TEST_F(BytecodeVMTest, dual_let_nested) { assertDualMode("let x = 1; in let y = 2; in x + y"); }
+TEST_F(BytecodeVMTest, dual_let_arith)  { assertDualMode("let x = 10; y = 3; in x - y * 2"); }
+
+// -- Phase 2: Lambdas and calls --
+TEST_F(BytecodeVMTest, dual_lambda_id)   { assertDualMode("let f = x: x; in f 42"); }
+TEST_F(BytecodeVMTest, dual_lambda_add)  { assertDualMode("let add = a: b: a + b; in add 1 2"); }
+TEST_F(BytecodeVMTest, dual_lambda_nest) { assertDualMode("let f = x: let y = x + 1; in y * 2; in f 5"); }
+TEST_F(BytecodeVMTest, dual_if_in_lambda) { assertDualMode("let f = x: if x then 1 else 0; in f true"); }
 
 
 } // namespace nix
