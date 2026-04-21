@@ -164,6 +164,13 @@ void vmExec(
         REGISTER_OP(OP_PUSH_WITH,        op_push_with);
         REGISTER_OP(OP_JUMP_IF_NOT_ATTRS, op_jump_if_not_attrs);
 
+        // Phase 3b: list build, attrs build, string concat
+        REGISTER_OP(OP_LIST_INIT,        op_list_init);
+        REGISTER_OP(OP_ATTRS_INIT,       op_attrs_init);
+        REGISTER_OP(OP_ATTR_INSERT,      op_attr_insert);
+        REGISTER_OP(OP_ATTRS_FINISH,     op_attrs_finish);
+        REGISTER_OP(OP_STR_CONCAT_INIT,  op_str_concat_init);
+
         // Fallback
         REGISTER_OP(OP_EVAL_EXPR,    op_eval_expr);
 
@@ -290,6 +297,7 @@ op_return:
 
         // Write the result into the caller's result slot.
         auto & frame = vm.frames.back();
+        bool wasThunkForce = frame.isThunkForce;
         *frame.resultSlot = *retVal;
 
         // Restore stack to frame entry point.
@@ -307,8 +315,13 @@ op_return:
         ip     = caller.ip;
         curEnv = caller.env;
 
-        // The caller expects the return value on the stack.
-        vm.push(retVal);
+        if (!wasThunkForce) {
+            // Normal call return: push the result for the caller.
+            vm.push(retVal);
+        }
+        // Thunk force return: the caller's TOS (the thunk Value*) has
+        // been updated in-place via resultSlot.  No push needed -- the
+        // caller's stack already has a pointer to the (now-forced) value.
         DISPATCH();
     }
 
@@ -388,6 +401,46 @@ op_force:
     {
         Value * v = vm.top();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Check if the value is a bytecoded thunk we can force inline
+        // (within this VM invocation) rather than recursing into vmExec.
+        // This avoids C-stack overflow from nested vmExec calls.
+        if (v->isThunk()) {
+            Env * thunkEnv = v->thunk().env;
+            Expr * thunkExpr = v->thunk().expr;
+
+            if (thunkEnv && dynamic_cast<ExprBytecodeThunk *>(thunkExpr)) {
+                auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                uint32_t thunkOffset = bcThunk->unit->thunks[bcThunk->thunkIdx].codeOffset;
+
+                // Mark as blackhole before evaluating.
+                v->mkBlackhole();
+
+                // Save current frame state.
+                vm.frames.back().ip = ip;
+                vm.frames.back().env = curEnv;
+
+                // Push a new call frame for the thunk body.
+                vm.frames.push_back(CallFrame{
+                    .unit = bcThunk->unit,
+                    .ip = thunkOffset,
+                    .env = thunkEnv,
+                    .stackBase = vm.sp,
+                    .resultSlot = v,  // Write result back into the thunk Value
+                    .callPos = pos,
+                    .isThunkForce = true,
+                });
+
+                // Switch to the thunk's code.
+                cu = bcThunk->unit;
+                ip = thunkOffset;
+                curEnv = thunkEnv;
+                DISPATCH();
+            }
+        }
+
+        // Fallback: use the standard forceValue path for non-bytecoded
+        // thunks, function applications, and non-thunks.
         state.forceValue(*v, pos);
         DISPATCH();
     }
@@ -1051,6 +1104,191 @@ op_push_with:
         env2.up = curEnv;
         env2.values[0] = attrsVal;
         curEnv = &env2;
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 3b: List construction
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_list_init:
+#else
+    case OP_LIST_INIT:
+#endif
+    {
+        uint32_t size = decodeOperand(CUR_INSTR);
+
+        if (size == 0) {
+            auto * result = state.allocValue();
+            result->mkList(state.mem.buildList(0));
+            vm.push(result);
+        } else {
+            auto list = state.mem.buildList(size);
+            // Pop values in reverse order (last pushed = last element).
+            for (uint32_t i = size; i > 0; --i)
+                list[i - 1] = vm.pop();
+            auto * result = state.allocValue();
+            result->mkList(list);
+            vm.push(result);
+        }
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 3b: Attrset construction
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_attrs_init:
+#else
+    case OP_ATTRS_INIT:
+#endif
+    {
+        uint32_t nAttrs = decodeOperand(CUR_INSTR);
+
+        auto bindings = state.buildBindings(nAttrs);
+
+        // Read nAttrs symbol indices from the following data words.
+        // Pop nAttrs values from the stack (in reverse, since last
+        // pushed = last attr in sorted order).
+        // We need to pair them: the data words are in forward order
+        // (matching the sorted attr iteration), and the stack has
+        // values in the same order (first pushed = first attr).
+        // So we collect values first, then pair.
+        Value * values[256]; // max attrs in one OP_ATTRS_INIT
+        assert(nAttrs <= 256);
+        for (uint32_t i = nAttrs; i > 0; --i)
+            values[i - 1] = vm.pop();
+
+        for (uint32_t i = 0; i < nAttrs; i++) {
+            // Read the symbol index from the next instruction word.
+            uint32_t symIdx = decodeOperand(cu->code[ip++]);
+            Symbol name = cu->symbols[symIdx];
+            bindings.insert(name, values[i]);
+        }
+
+        auto * result = state.allocValue();
+        result->mkAttrs(bindings.alreadySorted());
+        vm.push(result);
+        DISPATCH();
+    }
+
+    // OP_ATTR_INSERT and OP_ATTRS_FINISH are not needed with the
+    // compound OP_ATTRS_INIT approach -- left as unhandled.
+
+    // ==================================================================
+    // Phase 3b: String concatenation / addition
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_str_concat_init:
+#else
+    case OP_STR_CONCAT_INIT:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t nParts = operand & ((1u << 23) - 1);
+        bool forceString = (operand >> 23) & 1;
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Pop nParts values from the stack.
+        // The combining logic mirrors ExprConcatStrings::eval exactly.
+        NixStringContext context;
+        std::vector<BackedStringView> strings;
+        size_t sSize = 0;
+        NixInt n{0};
+        NixFloat nf = 0;
+
+        bool first = !forceString;
+        ValueType firstType = nString;
+
+        for (uint32_t i = 0; i < nParts; i++) {
+            // Values are on the stack in order: first part is deepest.
+            // We need to access them in order, so collect into an array first.
+        }
+
+        // Actually, let's collect them from the stack first.
+        Value * parts[64]; // max 64 parts should be plenty
+        assert(nParts <= 64);
+        for (uint32_t i = nParts; i > 0; --i)
+            parts[i - 1] = vm.pop();
+
+        for (uint32_t i = 0; i < nParts; i++) {
+            Value & vTmp = *parts[i];
+            state.forceValue(vTmp, pos);
+
+            if (first) {
+                firstType = vTmp.type();
+            }
+
+            if (firstType == nInt) {
+                if (vTmp.type() == nInt) {
+                    auto newN = n + vTmp.integer();
+                    if (auto checked = newN.valueChecked(); checked.has_value()) {
+                        n = NixInt(*checked);
+                    } else {
+                        state.error<EvalError>("integer overflow in adding %1% + %2%", n, vTmp.integer())
+                            .atPos(pos).debugThrow();
+                    }
+                } else if (vTmp.type() == nFloat) {
+                    firstType = nFloat;
+                    nf = n.value;
+                    nf += vTmp.fpoint();
+                } else {
+                    state.error<EvalError>("cannot add %1% to an integer", showType(vTmp))
+                        .atPos(pos).debugThrow();
+                }
+            } else if (firstType == nFloat) {
+                if (vTmp.type() == nInt) {
+                    nf += vTmp.integer().value;
+                } else if (vTmp.type() == nFloat) {
+                    nf += vTmp.fpoint();
+                } else {
+                    state.error<EvalError>("cannot add %1% to a float", showType(vTmp))
+                        .atPos(pos).debugThrow();
+                }
+            } else {
+                if (strings.empty())
+                    strings.reserve(nParts);
+                auto part = state.coerceToString(
+                    pos, vTmp, context,
+                    "while evaluating a path segment",
+                    false, firstType == nString, !first);
+                sSize += part->size();
+                strings.emplace_back(std::move(part));
+            }
+
+            first = false;
+        }
+
+        auto * result = state.allocValue();
+
+        if (firstType == nInt) {
+            result->mkInt(n);
+        } else if (firstType == nFloat) {
+            result->mkFloat(nf);
+        } else if (firstType == nPath) {
+            if (!context.empty())
+                state.error<EvalError>("a string that refers to a store path cannot be appended to a path")
+                    .atPos(pos).debugThrow();
+            std::string resultStr;
+            resultStr.reserve(sSize);
+            for (const auto & part : strings)
+                resultStr += *part;
+            result->mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
+        } else {
+            auto & resultStr = StringData::alloc(state.mem, sSize);
+            auto * tmp = resultStr.data();
+            for (const auto & part : strings) {
+                std::memcpy(tmp, part->data(), part->size());
+                tmp += part->size();
+            }
+            *tmp = '\0';
+            result->mkStringMove(resultStr, context, state.mem);
+        }
+
+        vm.push(result);
         DISPATCH();
     }
 

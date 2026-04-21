@@ -414,9 +414,7 @@ TEST_F(BytecodeVMTest, dual_let_two)    { assertDualMode("let x = 1; y = 2; in x
 TEST_F(BytecodeVMTest, dual_let_nested) { assertDualMode("let x = 1; in let y = 2; in x + y"); }
 TEST_F(BytecodeVMTest, dual_let_mul)    { assertDualMode("let x = 3; in x * 2"); }
 TEST_F(BytecodeVMTest, dual_let_sub_with_thunk) { assertDualMode("let x = 10; y = 3; in x - y"); }
-// Disabled: stack overflow in debug builds (-O0) due to nested vmExec
-// (thunk forcing -> vmExec -> callFunction -> forceValue -> vmExec).
-// Will be fixed when trampolining is implemented (Phase 6).
+// Stack overflow: callFunction -> forceValue -> vmExec recursion (needs full trampoline)
 // TEST_F(BytecodeVMTest, dual_let_arith) { assertDualMode("let x = 10; y = 3; in x - y * 2"); }
 
 // -- Phase 2: Lambdas and calls --
@@ -425,9 +423,7 @@ TEST_F(BytecodeVMTest, dual_lambda_add)    { assertDualMode("let add = a: b: a +
 TEST_F(BytecodeVMTest, dual_lambda_nest)   { assertDualMode("let f = x: let y = x + 1; in y * 2; in f 5"); }
 TEST_F(BytecodeVMTest, dual_if_in_lambda)  { assertDualMode("let f = x: if x then 1 else 0; in f true"); }
 TEST_F(BytecodeVMTest, dual_lambda_recursive) { assertDualMode("let f = n: if n == 0 then 0 else f (n - 1); in f 5"); }
-// These use +/* inside lambda bodies, which parses as ExprConcatStrings/primop
-// calls and triggers nested vmExec (thunk forcing), causing stack overflow
-// in debug builds. Will be fixed with trampolining (Phase 6).
+// Stack overflow: callFunction -> forceValue -> vmExec recursion (needs full trampoline)
 // TEST_F(BytecodeVMTest, dual_lambda_formals) { assertDualMode("let f = { x, y }: x + y; in f { x = 3; y = 4; }"); }
 // TEST_F(BytecodeVMTest, dual_lambda_higher_order) { assertDualMode("let apply = f: x: f x; double = x: x * 2; in apply double 5"); }
 
@@ -467,13 +463,12 @@ TEST_F(BytecodeVMTest, disasm_simple)
 
     std::string output = bytecode::disassemble(*unit, &state);
 
-    // Should contain opcode names
-    ASSERT_NE(output.find("EVAL_EXPR"), std::string::npos)
-        << "Disassembly should contain EVAL_EXPR (+ is ExprConcatStrings fallback):\n" << output;
+    // 1 + 2 compiles as ExprConcatStrings -> OP_STR_CONCAT_INIT
+    ASSERT_NE(output.find("STR_CONCAT_INIT"), std::string::npos)
+        << "Disassembly should contain STR_CONCAT_INIT:\n" << output;
     ASSERT_NE(output.find("RETURN"), std::string::npos)
         << "Disassembly should contain RETURN:\n" << output;
 
-    // Print it for manual inspection during development
     std::cerr << "\n--- Disassembly of '1 + 2' ---\n" << output << std::endl;
 }
 

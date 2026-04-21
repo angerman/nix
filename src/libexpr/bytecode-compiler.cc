@@ -479,7 +479,14 @@ void Compiler::compileSelect(ExprSelect * e)
     for (auto & attr : attrPath)
         if (attr.expr) { hasDynamic = true; break; }
 
-    if (hasDynamic || (e->def && attrPath.size() > 1)) {
+    if (hasDynamic) {
+        unit.emitPos(e->pos);
+        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        return;
+    }
+
+    // Multi-level paths with 'or' default still fall back (complex jump logic).
+    if (e->def && attrPath.size() > 1) {
         unit.emitPos(e->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
@@ -521,9 +528,13 @@ void Compiler::compileSelect(ExprSelect * e)
             compile(e->def);
             unit.patchJump(jumpEnd);
         } else {
-            // No default: select + force.
+            // No default: force base, select attr, force result.
+            // Split into separate ops so OP_FORCE can trampoline
+            // bytecoded thunks inline (avoiding vmExec recursion).
             unit.emitPos(e->pos);
-            unit.emit(OP_SELECT_FORCE, symIdx);
+            unit.emit(OP_FORCE);
+            unit.emit(OP_ATTR_SELECT, symIdx);
+            unit.emit(OP_FORCE);
         }
     }
 }
@@ -562,19 +573,13 @@ void Compiler::compileHasAttr(ExprOpHasAttr * e)
 
 void Compiler::compileList(ExprList * e)
 {
-    if (e->elems.empty()) {
-        // Empty list: push singleton.
-        // Use OP_EVAL_EXPR since we need a Value* to the global vEmptyList.
-        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
-        return;
+    // Compile each element as a thunk-or-eager value, push onto stack.
+    // Then OP_LIST_BUILD N pops N values and builds the list.
+    for (auto * elem : e->elems) {
+        compileAsThunkOrEager(elem, e->getPos());
     }
-
-    // For non-empty lists, compile each element as a thunk.
-    // Then use OP_EVAL_EXPR for the final list construction since
-    // buildList requires the EvalState allocator.
-    // TODO: add proper OP_LIST_INIT/ELEM/FINISH opcodes.
     unit.emitPos(e->getPos());
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+    unit.emit(OP_LIST_INIT, static_cast<uint32_t>(e->elems.size()));
 }
 
 // ---------------------------------------------------------------------------
@@ -583,11 +588,44 @@ void Compiler::compileList(ExprList * e)
 
 void Compiler::compileAttrs(ExprAttrs * e)
 {
-    // Attrset construction is complex (recursive envs, inherit, inherit(expr),
-    // __overrides, dynamic attrs).  Keep using OP_EVAL_EXPR fallback for now.
-    // Each of these sub-features will be implemented incrementally.
+    // Fall back for recursive attrsets, inherit(expr), and dynamic attrs.
+    // These require complex env setup, __overrides handling, etc.
+    bool hasInheritFrom = e->inheritFromExprs && !e->inheritFromExprs->empty();
+    bool hasDynamic = e->dynamicAttrs && !e->dynamicAttrs->empty();
+
+    if (e->recursive || hasInheritFrom || hasDynamic) {
+        unit.emitPos(e->pos);
+        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        return;
+    }
+
+    // Non-recursive, no inherit(expr), no dynamic attrs.
+    // Simple case: { a = e1; b = e2; ... }
+    //
+    // Compile: push capacity, then for each attr push its thunked value
+    // along with symbol info.  OP_ATTRS_INIT capacity allocates a
+    // BindingsBuilder, each attr is inserted via OP_ATTR_INSERT, and
+    // OP_ATTRS_FINISH finalizes.
+
+    uint32_t nAttrs = static_cast<uint32_t>(e->attrs->size());
+
+    // Push each attribute value onto the stack (in iteration order,
+    // which is sorted by symbol since AttrDefs is a std::map<Symbol,...>).
+    for (auto & [name, def] : *e->attrs) {
+        compileAsThunkOrEager(def.e, def.pos);
+    }
+
+    // OP_ATTRS_INIT nAttrs: pops nAttrs values, reads nAttrs symbol
+    // indices from the following data words, builds the Bindings.
     unit.emitPos(e->pos);
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+    unit.emit(OP_ATTRS_INIT, nAttrs);
+
+    // Emit symbol indices as data words (OP_NOP with symbol index as operand).
+    // The VM reads these inline after OP_ATTRS_INIT.
+    for (auto & [name, def] : *e->attrs) {
+        uint32_t symIdx = unit.addSymbol(name);
+        unit.emit(OP_NOP, symIdx); // data word: symbol index
+    }
 }
 
 void Compiler::compileWith(ExprWith * e)
@@ -618,20 +656,22 @@ void Compiler::compileConcatLists(ExprOpConcatLists * e)
 
 void Compiler::compileConcatStrings(ExprConcatStrings * e)
 {
-    // ExprConcatStrings handles both string interpolation and the `+`
-    // operator (overloaded for int/float/string/path).  The combining
-    // logic is complex (type-dependent coercion, context propagation,
-    // int/float promotion).  For correctness, we delegate to the
-    // existing ExprConcatStrings::eval by storing the Expr* in the
-    // constant pool and using a generic "eval this Expr" opcode.
+    // Compile each part expression, push on stack.
+    // OP_STR_CONCAT_INIT nParts then pops them all and does the
+    // type-dependent combining (int add, float promote, string concat
+    // with context, path construction).
     //
-    // Each sub-expression is still compiled to bytecode -- the delegation
-    // only handles the combination step.  This will be optimized in
-    // Phase 6 with proper OP_STR_CONCAT_INIT/PART/FINISH opcodes.
+    // The forceString flag is encoded in bit 23 of the operand.
+    // nParts is in bits [0:22] (max 4M parts, more than enough).
 
-    auto exprIdx = unit.addExpr(e);
+    for (auto & [partPos, partExpr] : e->es) {
+        compile(partExpr);
+    }
+
+    uint32_t nParts = static_cast<uint32_t>(e->es.size());
+    uint32_t operand = nParts | (e->forceString ? (1u << 23) : 0);
     unit.emitPos(e->pos);
-    unit.emit(OP_EVAL_EXPR, exprIdx);
+    unit.emit(OP_STR_CONCAT_INIT, operand);
 }
 
 } // namespace nix::bytecode
