@@ -295,8 +295,10 @@ void Compiler::compileAssert(ExprAssert * e)
 
 void Compiler::compilePos(ExprPos * e)
 {
+    // __curPos is rarely used. Store the PosIdx and let the VM
+    // construct the position attrset.
     unit.emitPos(e->getPos());
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+    unit.emit(OP_POS, unit.addPos(e->getPos()));
 }
 
 
@@ -497,10 +499,44 @@ void Compiler::compileSelect(ExprSelect * e)
         return;
     }
 
-    // Multi-level paths with 'or' default still fall back (complex jump logic).
+    // Multi-level 'or' default: a.b.c or default
+    // At each level, check if value is attrset and has the attr.
+    // If any level fails, jump to default.
     if (e->def && attrPath.size() > 1) {
-        unit.emitPos(e->pos);
-        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        compile(e->e);
+
+        // Collect jump targets that all jump to the default code.
+        std::vector<uint32_t> defaultJumps;
+
+        for (size_t i = 0; i < attrPath.size(); i++) {
+            uint32_t symIdx = unit.addSymbol(attrPath[i].symbol);
+            bool isLast = (i == attrPath.size() - 1);
+
+            unit.emitPos(e->pos);
+            unit.emit(OP_FORCE);
+            defaultJumps.push_back(unit.emit(OP_JUMP_IF_NOT_ATTRS, 0));
+            unit.emit(OP_DUP);
+            unit.emit(OP_HAS_ATTR, symIdx);
+            defaultJumps.push_back(unit.emit(OP_JUMP_IF_FALSE, 0));
+
+            if (!isLast) {
+                unit.emit(OP_ATTR_SELECT, symIdx);
+            } else {
+                // Last level: select the attr (success path)
+                unit.emit(OP_ATTR_SELECT, symIdx);
+            }
+        }
+
+        // Success: jump over the default
+        uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
+
+        // Default path: patch all jumps to here
+        for (auto j : defaultJumps)
+            unit.patchJump(j);
+        unit.emit(OP_POP); // discard the attrset/value that failed
+        compile(e->def);
+
+        unit.patchJump(jumpEnd);
         return;
     }
 
@@ -720,11 +756,10 @@ void Compiler::compileWith(ExprWith * e)
 
 void Compiler::compileUpdate(ExprOpUpdate * e)
 {
-    // The // operator's merge logic is complex (layered bindings,
-    // sorted merge with RHS-wins duplicate resolution, optimization
-    // heuristics).  Delegate to tree-walker for correctness.
+    compile(e->e1);
+    compile(e->e2);
     unit.emitPos(e->pos);
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+    unit.emit(OP_ATTRS_UPDATE);
 }
 
 void Compiler::compileConcatLists(ExprOpConcatLists * e)

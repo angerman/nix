@@ -326,6 +326,7 @@ void vmExec(
         REGISTER_OP(OP_ATTR_INSERT,      op_attr_insert);
         REGISTER_OP(OP_ATTRS_FINISH,     op_attrs_finish);
         REGISTER_OP(OP_STR_CONCAT_INIT,  op_str_concat_init);
+        REGISTER_OP(OP_POS,              op_pos);
 
         // Fallback
         REGISTER_OP(OP_EVAL_EXPR,    op_eval_expr);
@@ -1215,21 +1216,50 @@ op_attrs_update:
         state.forceAttrs(*lhs, pos, "in the left operand of the update (//) operator");
         state.forceAttrs(*rhs, pos, "in the right operand of the update (//) operator");
 
-        // NOTE: OP_ATTRS_UPDATE is currently not emitted by the compiler
-        // (compileUpdate uses OP_EVAL_EXPR fallback for correctness).
-        // If re-enabled, this must implement the full sorted-merge with
-        // RHS-wins duplicate resolution from ExprOpUpdate::eval.
-        // For now, keep a simple (incorrect) implementation as placeholder.
         auto * result = state.allocValue();
         auto & bindings1 = *lhs->attrs();
         auto & bindings2 = *rhs->attrs();
-        auto resultBindings = state.buildBindings(bindings1.size() + bindings2.size());
-        for (auto & attr : bindings1)
-            resultBindings.insert(attr);
-        for (auto & attr : bindings2)
-            resultBindings.insert(attr);
-        result->mkAttrs(resultBindings.alreadySorted());
 
+        // Short-circuit: if either side is empty, return the other.
+        if (bindings1.empty()) {
+            *result = *rhs;
+            vm.push(result);
+            DISPATCH();
+        }
+        if (bindings2.empty()) {
+            *result = *lhs;
+            vm.push(result);
+            DISPATCH();
+        }
+
+        // Sorted merge with RHS-wins duplicate resolution.
+        // Both Bindings are sorted by Symbol. Merge like merge-sort.
+        auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
+        auto i = bindings1.begin();
+        auto j = bindings2.begin();
+
+        while (i != bindings1.end() && j != bindings2.end()) {
+            if (i->name == j->name) {
+                attrs.insert(*j);  // RHS wins
+                ++i; ++j;
+            } else if (i->name < j->name) {
+                attrs.insert(*i);
+                ++i;
+            } else {
+                attrs.insert(*j);
+                ++j;
+            }
+        }
+        while (i != bindings1.end()) {
+            attrs.insert(*i);
+            ++i;
+        }
+        while (j != bindings2.end()) {
+            attrs.insert(*j);
+            ++j;
+        }
+
+        result->mkAttrs(attrs.alreadySorted());
         vm.push(result);
         DISPATCH();
     }
@@ -1471,6 +1501,24 @@ op_str_concat_init:
         if (parts != stackParts)
             delete[] parts;
 
+        vm.push(result);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // __curPos
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_pos:
+#else
+    case OP_POS:
+#endif
+    {
+        uint32_t posIdx = decodeOperand(CUR_INSTR);
+        PosIdx pos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
+        auto * result = state.allocValue();
+        state.mkPos(*result, pos);
         vm.push(result);
         DISPATCH();
     }

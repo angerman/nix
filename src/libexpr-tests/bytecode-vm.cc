@@ -845,4 +845,23 @@ TEST_F(BytecodeVMTest, edge_rec_inherit) {
 }
 
 
+// -- Multi-level or-default (now natively bytecoded) --
+TEST_F(BytecodeVMTest, multi_or_found) {
+    assertDualMode("{ a = { b = { c = 42; }; }; }.a.b.c or 0");
+}
+
+TEST_F(BytecodeVMTest, multi_or_missing_middle) {
+    assertDualMode("{ a = 1; }.a.b.c or 99");
+}
+
+TEST_F(BytecodeVMTest, multi_or_missing_first) {
+    assertDualMode("{ }.a.b or 77");
+}
+
+// -- Attrset update (now natively bytecoded with sorted merge) --
+TEST_F(BytecodeVMTest, update_rhs_wins) {
+    assertDualMode("({ a = 1; b = 2; } // { a = 10; c = 3; }).a");
+}
+
+
 } // namespace nix
