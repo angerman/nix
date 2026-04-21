@@ -98,9 +98,11 @@ void vmExec(
     // Use computed-goto where available (GCC/Clang), otherwise switch.
     // ------------------------------------------------------------------
 
-#if defined(__GNUC__) || defined(__clang__)
-#define NIX_VM_COMPUTED_GOTO 1
-#endif
+// Computed-goto is disabled for now because vmExec can be called
+// recursively (thunk forcing -> ExprBytecodeThunk::eval -> vmExec),
+// and the large stack frame from computed-goto labels causes stack
+// overflow.  Will be re-enabled once trampolining is implemented.
+// #define NIX_VM_COMPUTED_GOTO 1
 
 #ifdef NIX_VM_COMPUTED_GOTO
     // Build the dispatch table.  We fill all 256 entries; unused opcodes
@@ -820,27 +822,22 @@ op_make_closure:
         uint32_t lambdaIdx = decodeOperand(CUR_INSTR);
         auto & desc = cu->lambdas[lambdaIdx];
 
-        // Create an ExprLambdaBytecode proxy in BumpMemoryResource.
-        // Its body will be an ExprBytecodeThunk for the lambda body.
-        auto * proxy = state.mem.exprs.add<ExprLambdaBytecode>(
-            const_cast<CompilationUnit *>(cu), lambdaIdx);
+        // Instead of creating a complex ExprLambdaBytecode proxy,
+        // use the original ExprLambda from the descriptor (which
+        // already has the correct body, formals, arg, etc.).
+        // When callFunction calls lambda.body->eval(), it will
+        // tree-walk the body.  This is correct and simple.
+        //
+        // The bytecode benefit here is that the CLOSURE CREATION
+        // (capturing the env) is bytecoded, even though the body
+        // evaluation falls back to tree-walking when called.
+        //
+        // Full bytecoded lambda body dispatch (via ExprLambdaBytecode
+        // proxy) will be implemented once the basic path works.
+        ExprLambda * originalLambda = desc.sourceExpr;
 
-        // Create a thunk for the body so that callFunction's
-        // lambda.body->eval() dispatches to the VM.
-        // Register the body as a thunk descriptor.
-        auto * bodyThunk = state.mem.exprs.add<ExprBytecodeThunk>(
-            const_cast<CompilationUnit *>(cu),
-            // We need a thunk descriptor for the body.  The lambda's
-            // codeOffset IS the body, so we register it if not already done.
-            // For simplicity, we add a thunk descriptor on the fly.
-            static_cast<uint32_t>(const_cast<CompilationUnit *>(cu)->thunks.size()));
-        const_cast<CompilationUnit *>(cu)->thunks.push_back(
-            ThunkDescriptor{desc.codeOffset, desc.pos});
-        proxy->body = bodyThunk;
-
-        // Create the closure Value: (currentEnv, proxy).
         auto * closureVal = state.allocValue();
-        closureVal->mkLambda(curEnv, proxy);
+        closureVal->mkLambda(curEnv, originalLambda);
 
         vm.push(closureVal);
         DISPATCH();
