@@ -1333,10 +1333,12 @@ op_attrs_init:
             values[i - 1] = vm.pop();
 
         for (uint32_t i = 0; i < nAttrs; i++) {
-            // Read the symbol index from the next instruction word.
+            // Read the (symbol index, position index) pair from data words.
             uint32_t symIdx = decodeOperand(cu->code[ip++]);
+            uint32_t posIdx = decodeOperand(cu->code[ip++]);
             Symbol name = cu->symbols[symIdx];
-            bindings.insert(name, values[i]);
+            PosIdx attrPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
+            bindings.insert(name, values[i], attrPos);
         }
 
         auto * result = state.allocValue();

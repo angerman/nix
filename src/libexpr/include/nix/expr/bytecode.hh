@@ -291,6 +291,11 @@ struct CompilationUnit : gc
     // Indexed by OP_MAKE_CLOSURE operand.
     std::vector<LambdaDescriptor> lambdas;
 
+    // -- PosIdx pool --
+    // Source positions used by OP_ATTRS_INIT for attribute positions.
+    // Indexed by operand of data words following OP_ATTRS_INIT.
+    std::vector<PosIdx> posPool;
+
     // -- Expr fallback pool --
     // Expr* pointers for expressions that are not yet compiled to bytecode.
     // Indexed by OP_EVAL_EXPR operand.  The VM calls expr->eval() on these.
@@ -341,6 +346,14 @@ struct CompilationUnit : gc
     {
         uint32_t idx = static_cast<uint32_t>(constants.size());
         constants.push_back(v);
+        return idx;
+    }
+
+    /// Add a PosIdx to the pos pool, returning its index.
+    uint32_t addPos(PosIdx pos)
+    {
+        uint32_t idx = static_cast<uint32_t>(posPool.size());
+        posPool.push_back(pos);
         return idx;
     }
 

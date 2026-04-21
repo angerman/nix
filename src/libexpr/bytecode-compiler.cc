@@ -632,11 +632,13 @@ void Compiler::compileAttrs(ExprAttrs * e)
     unit.emitPos(e->pos);
     unit.emit(OP_ATTRS_INIT, nAttrs);
 
-    // Emit symbol indices as data words (OP_NOP with symbol index as operand).
+    // Emit (symbol index, position index) pairs as data words.
     // The VM reads these inline after OP_ATTRS_INIT.
     for (auto & [name, def] : *e->attrs) {
         uint32_t symIdx = unit.addSymbol(name);
+        uint32_t posIdx = unit.addPos(def.pos);
         unit.emit(OP_NOP, symIdx); // data word: symbol index
+        unit.emit(OP_NOP, posIdx); // data word: position index
     }
 }
 
