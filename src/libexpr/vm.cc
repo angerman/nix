@@ -1267,12 +1267,14 @@ op_attrs_update:
         state.forceAttrs(*lhs, pos, "in the left operand of the update (//) operator");
         state.forceAttrs(*rhs, pos, "in the right operand of the update (//) operator");
 
+        // NOTE: OP_ATTRS_UPDATE is currently not emitted by the compiler
+        // (compileUpdate uses OP_EVAL_EXPR fallback for correctness).
+        // If re-enabled, this must implement the full sorted-merge with
+        // RHS-wins duplicate resolution from ExprOpUpdate::eval.
+        // For now, keep a simple (incorrect) implementation as placeholder.
         auto * result = state.allocValue();
-
-        // Use the existing Bindings merge logic.
         auto & bindings1 = *lhs->attrs();
         auto & bindings2 = *rhs->attrs();
-
         auto resultBindings = state.buildBindings(bindings1.size() + bindings2.size());
         for (auto & attr : bindings1)
             resultBindings.insert(attr);
@@ -1430,14 +1432,12 @@ op_str_concat_init:
         bool first = !forceString;
         ValueType firstType = nString;
 
-        for (uint32_t i = 0; i < nParts; i++) {
-            // Values are on the stack in order: first part is deepest.
-            // We need to access them in order, so collect into an array first.
-        }
-
-        // Actually, let's collect them from the stack first.
-        Value * parts[64]; // max 64 parts should be plenty
-        assert(nParts <= 64);
+        // Collect parts from the stack.
+        constexpr uint32_t kStackPartsMax = 64;
+        Value * stackParts[kStackPartsMax];
+        Value ** parts = nParts <= kStackPartsMax
+            ? stackParts
+            : new Value*[nParts];
         for (uint32_t i = nParts; i > 0; --i)
             parts[i - 1] = vm.pop();
 
@@ -1514,6 +1514,9 @@ op_str_concat_init:
             *tmp = '\0';
             result->mkStringMove(resultStr, context, state.mem);
         }
+
+        if (parts != stackParts)
+            delete[] parts;
 
         vm.push(result);
         DISPATCH();

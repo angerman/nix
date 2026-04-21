@@ -367,10 +367,9 @@ void Compiler::compileAsThunkOrEager(Expr * expr, PosIdx pos)
     // GET_LOCAL + FORCE, which eagerly forces and breaks recursive
     // fixed-points (lib.makeExtensible, rec {}, etc.).
     if (auto * var = dynamic_cast<ExprVar *>(expr)) {
-        if (!var->fromWith) {
-            emitGetLocal(var);
-            return;
-        }
+        // Emit GET_LOCAL or GET_WITH (no forcing) for ALL variables.
+        emitGetLocal(var);
+        return;
     }
 
     // Lambda: compile to OP_MAKE_CLOSURE, no thunk needed (lambdas are values).
@@ -658,10 +657,11 @@ void Compiler::compileWith(ExprWith * e)
 
 void Compiler::compileUpdate(ExprOpUpdate * e)
 {
-    compile(e->e1);
-    compile(e->e2);
+    // The // operator's merge logic is complex (layered bindings,
+    // sorted merge with RHS-wins duplicate resolution, optimization
+    // heuristics).  Delegate to tree-walker for correctness.
     unit.emitPos(e->pos);
-    unit.emit(OP_ATTRS_UPDATE);
+    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
 }
 
 void Compiler::compileConcatLists(ExprOpConcatLists * e)
