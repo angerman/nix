@@ -157,6 +157,9 @@ endforeach
 sources = files(
   'attr-path.cc',
   'attr-set.cc',
+  'bytecode.cc',
+  'bytecode-thunk.cc',
+  'vm.cc',
   'diagnose.cc',
   'eval-cache.cc',
   'eval-error.cc',

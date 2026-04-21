@@ -10,6 +10,9 @@ config_pub_h = configure_file(
 headers = [ config_pub_h ] + files(
   'attr-path.hh',
   'attr-set.hh',
+  'bytecode.hh',
+  'bytecode-thunk.hh',
+  'vm.hh',
   'counter.hh',
   'diagnose.hh',
   'eval-cache.hh',

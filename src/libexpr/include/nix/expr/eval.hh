@@ -70,6 +70,10 @@ enum RepairFlag : bool;
 struct MemorySourceAccessor;
 struct MountedSourceAccessor;
 
+namespace bytecode {
+struct VMState;
+} // namespace bytecode
+
 namespace eval_cache {
 class EvalCache;
 }
@@ -384,6 +388,11 @@ public:
     PosTable positions;
 
     EvalMemory mem;
+
+    /// Bytecode VM state.  Lazily initialized on first bytecode execution.
+    /// Holds the value stack and call frame stack.  Declared as unique_ptr
+    /// to avoid pulling in vm.hh here.
+    std::unique_ptr<bytecode::VMState> vmState;
 
     /**
      * If set, force copying files to the Nix store even if they
