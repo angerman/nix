@@ -1019,6 +1019,7 @@ op_make_thunk:
 #endif
     {
         uint32_t thunkIdx = decodeOperand(CUR_INSTR);
+        assert(thunkIdx < cu->thunks.size() && "OP_MAKE_THUNK: thunk index out of bounds");
         auto & desc = cu->thunks[thunkIdx];
 
         // Use the ORIGINAL Expr* from the AST as the thunk expression.
@@ -1045,6 +1046,7 @@ op_make_closure:
 #endif
     {
         uint32_t lambdaIdx = decodeOperand(CUR_INSTR);
+        assert(lambdaIdx < cu->lambdas.size() && "OP_MAKE_CLOSURE: lambda index out of bounds");
         auto & desc = cu->lambdas[lambdaIdx];
 
         // Instead of creating a complex ExprLambdaBytecode proxy,
@@ -1334,8 +1336,11 @@ op_attrs_init:
 
         for (uint32_t i = 0; i < nAttrs; i++) {
             // Read the (symbol index, position index) pair from data words.
+            assert(ip < cu->code.size() && "OP_ATTRS_INIT: code buffer overrun (symbol)");
             uint32_t symIdx = decodeOperand(cu->code[ip++]);
+            assert(ip < cu->code.size() && "OP_ATTRS_INIT: code buffer overrun (position)");
             uint32_t posIdx = decodeOperand(cu->code[ip++]);
+            assert(symIdx < cu->symbols.size() && "OP_ATTRS_INIT: symbol index out of bounds");
             Symbol name = cu->symbols[symIdx];
             PosIdx attrPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
             bindings.insert(name, values[i], attrPos);
