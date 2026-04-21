@@ -230,30 +230,30 @@ void Compiler::compileImpl(ExprOpImpl * e)
 
 void Compiler::compileVar(ExprVar * e)
 {
+    // ExprVar::eval = lookupVar + forceValue.
+    // Emit GET_LOCAL (lazy lookup) then FORCE.
+    emitGetLocal(e);
+    unit.emit(OP_FORCE);
+}
+
+/// Emit just the variable lookup instruction without forcing.
+/// Used by compileVar (followed by FORCE) and by compileAsThunkOrEager
+/// for variable references (no FORCE, matching ExprVar::maybeThunk).
+void Compiler::emitGetLocal(ExprVar * e)
+{
     unit.emitPos(e->pos);
 
     if (e->fromWith) {
-        // Dynamic with-scope lookup. Store the ExprVar* in the expr pool
-        // so the VM handler can access the full with-chain metadata.
         uint32_t exprIdx = unit.addExpr(e);
         unit.emit(OP_GET_WITH, exprIdx);
         return;
     }
 
-    // Lexical variable: emit specialized opcode for common levels.
     switch (e->level) {
-        case 0:
-            unit.emit(OP_GET_LOCAL_0, e->displ);
-            break;
-        case 1:
-            unit.emit(OP_GET_LOCAL_1, e->displ);
-            break;
-        case 2:
-            unit.emit(OP_GET_LOCAL_2, e->displ);
-            break;
-        case 3:
-            unit.emit(OP_GET_LOCAL_3, e->displ);
-            break;
+        case 0: unit.emit(OP_GET_LOCAL_0, e->displ); break;
+        case 1: unit.emit(OP_GET_LOCAL_1, e->displ); break;
+        case 2: unit.emit(OP_GET_LOCAL_2, e->displ); break;
+        case 3: unit.emit(OP_GET_LOCAL_3, e->displ); break;
         default:
             unit.emit(OP_GET_LOCAL, packLevelDispl(
                 static_cast<uint8_t>(e->level), static_cast<uint16_t>(e->displ)));
@@ -351,12 +351,16 @@ void Compiler::compileAsThunkOrEager(Expr * expr, PosIdx pos)
         return;
     }
 
-    // Variable references: emit a load, which returns the Value* directly.
+    // Variable references: emit just the lookup (no forcing).
+    // This matches ExprVar::maybeThunk which returns the Value* directly.
     // The loaded value may itself be a thunk, but that's fine -- it will be
-    // forced on demand.
+    // forced on demand when the consumer needs it.
+    // IMPORTANT: do NOT call compile(expr) here -- that would emit
+    // GET_LOCAL + FORCE, which eagerly forces and breaks recursive
+    // fixed-points (lib.makeExtensible, rec {}, etc.).
     if (auto * var = dynamic_cast<ExprVar *>(expr)) {
         if (!var->fromWith) {
-            compile(expr);
+            emitGetLocal(var);
             return;
         }
     }

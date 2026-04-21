@@ -100,6 +100,9 @@ private:
     // -- Thunk-or-eager helper (mirrors Expr::maybeThunk) --
     void compileAsThunkOrEager(Expr * expr, PosIdx pos);
 
+    // -- Variable lookup without forcing (mirrors ExprVar::maybeThunk) --
+    void emitGetLocal(ExprVar * e);
+
     // -- Arithmetic binary op helper --
     void compileBinOp(Expr * e1, Expr * e2, Op op, PosIdx pos);
 };

@@ -507,12 +507,12 @@ op_get_local_0:
     case OP_GET_LOCAL_0:
 #endif
     {
+        // GET_LOCAL does NOT force -- it returns the raw Value* from the env.
+        // This matches ExprVar::maybeThunk semantics (no forcing).
+        // Forcing is done by OP_FORCE which the compiler emits after
+        // GET_LOCAL when the variable IS the expression result (ExprVar::eval).
         uint32_t displ = decodeOperand(CUR_INSTR);
-        Value * v = curEnv->values[displ];
-        // ExprVar::eval forces the value at lookup time.
-        PosIdx pos = cu->posForOffset(ip - 1);
-        state.forceValue(*v, pos);
-        vm.push(v);
+        vm.push(curEnv->values[displ]);
         DISPATCH();
     }
 
@@ -523,10 +523,7 @@ op_get_local_1:
 #endif
     {
         uint32_t displ = decodeOperand(CUR_INSTR);
-        Value * v = curEnv->up->values[displ];
-        PosIdx pos = cu->posForOffset(ip - 1);
-        state.forceValue(*v, pos);
-        vm.push(v);
+        vm.push(curEnv->up->values[displ]);
         DISPATCH();
     }
 
@@ -537,10 +534,7 @@ op_get_local_2:
 #endif
     {
         uint32_t displ = decodeOperand(CUR_INSTR);
-        Value * v = curEnv->up->up->values[displ];
-        PosIdx pos = cu->posForOffset(ip - 1);
-        state.forceValue(*v, pos);
-        vm.push(v);
+        vm.push(curEnv->up->up->values[displ]);
         DISPATCH();
     }
 
@@ -551,10 +545,7 @@ op_get_local_3:
 #endif
     {
         uint32_t displ = decodeOperand(CUR_INSTR);
-        Value * v = curEnv->up->up->up->values[displ];
-        PosIdx pos = cu->posForOffset(ip - 1);
-        state.forceValue(*v, pos);
-        vm.push(v);
+        vm.push(curEnv->up->up->up->values[displ]);
         DISPATCH();
     }
 
@@ -570,10 +561,7 @@ op_get_local:
         Env * e = curEnv;
         for (uint8_t l = level; l > 0; --l)
             e = e->up;
-        Value * v = e->values[displ];
-        PosIdx pos = cu->posForOffset(ip - 1);
-        state.forceValue(*v, pos);
-        vm.push(v);
+        vm.push(e->values[displ]);
         DISPATCH();
     }
 

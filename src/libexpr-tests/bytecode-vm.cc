@@ -520,4 +520,19 @@ TEST_F(BytecodeVMTest, regression_large_attrset) {
 }
 
 
+// Regression: recursive fixed-points (lib.makeExtensible pattern).
+// This tests the pattern from nixpkgs lib/default.nix that cardano-node triggers.
+// The tree-walker handles this via lazy thunks; the bytecode VM must too.
+TEST_F(BytecodeVMTest, regression_rec_fixpoint) {
+    // Simplified version of the lib.makeExtensible pattern
+    assertDualMode("let makeExtensible = f: let self = f self; in self; in (makeExtensible (self: { x = 1; y = self.x + 1; })).y");
+}
+
+TEST_F(BytecodeVMTest, regression_inherit_from_import) {
+    // Pattern from lib/default.nix: inherit (import ./file { inherit lib; }) name;
+    // Simplified: recursive let with inherit from a function call
+    assertDualMode("let lib = { id = x: x; }; f = lib: { ext = lib.id 42; }; result = (f { inherit (lib) id; }).ext; in result");
+}
+
+
 } // namespace nix
