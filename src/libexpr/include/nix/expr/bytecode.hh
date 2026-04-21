@@ -12,14 +12,17 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace nix {
 
 // Forward declarations for types used by pointer only.
+struct Expr;
 struct Formals;
 struct ExprLambda;
 struct SourcePath;
+class EvalState;
 
 } // namespace nix
 
@@ -364,5 +367,9 @@ struct CompilationUnit : gc
         positions.push_back({offset, pos});
     }
 };
+
+/// Disassemble a CompilationUnit into a human-readable string.
+/// If `state` is non-null, prints constant values and symbol names.
+std::string disassemble(const CompilationUnit & unit, const EvalState * state = nullptr);
 
 } // namespace nix::bytecode

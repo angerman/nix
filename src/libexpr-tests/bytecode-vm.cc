@@ -447,4 +447,43 @@ TEST_F(BytecodeVMTest, dual_with_shadow)   { assertDualMode("let x = 1; in with 
 TEST_F(BytecodeVMTest, dual_string_interp) { assertDualMode("let x = \"world\"; in \"hello ${x}\""); }
 
 
+// ===========================================================================
+// Disassembler tests (verify readable output, also useful for debugging)
+// ===========================================================================
+
+TEST_F(BytecodeVMTest, disasm_simple)
+{
+    Expr * e = state.parseExprFromString("1 + 2", state.rootPath(CanonPath::root));
+    auto * unit = bytecode::compile(state, e);
+
+    std::string output = bytecode::disassemble(*unit, &state);
+
+    // Should contain opcode names
+    ASSERT_NE(output.find("EVAL_EXPR"), std::string::npos)
+        << "Disassembly should contain EVAL_EXPR (+ is ExprConcatStrings fallback):\n" << output;
+    ASSERT_NE(output.find("RETURN"), std::string::npos)
+        << "Disassembly should contain RETURN:\n" << output;
+
+    // Print it for manual inspection during development
+    std::cerr << "\n--- Disassembly of '1 + 2' ---\n" << output << std::endl;
+}
+
+TEST_F(BytecodeVMTest, disasm_let_if)
+{
+    Expr * e = state.parseExprFromString(
+        "let x = 1; in if x == 1 then true else false",
+        state.rootPath(CanonPath::root));
+    auto * unit = bytecode::compile(state, e);
+
+    std::string output = bytecode::disassemble(*unit, &state);
+
+    ASSERT_NE(output.find("ENTER_LET"), std::string::npos);
+    ASSERT_NE(output.find("JUMP_IF_FALSE"), std::string::npos);
+    ASSERT_NE(output.find("LEAVE_SCOPE"), std::string::npos);
+
+    std::cerr << "\n--- Disassembly of 'let x = 1; in if x == 1 then true else false' ---\n"
+              << output << std::endl;
+}
+
+
 } // namespace nix

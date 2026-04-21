@@ -159,6 +159,7 @@ sources = files(
   'attr-set.cc',
   'bytecode.cc',
   'bytecode-compiler.cc',
+  'bytecode-disasm.cc',
   'bytecode-thunk.cc',
   'vm.cc',
   'diagnose.cc',
