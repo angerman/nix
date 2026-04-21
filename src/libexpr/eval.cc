@@ -1,5 +1,6 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/vm.hh"
+#include "nix/expr/bytecode-compiler.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/primops.hh"
@@ -1182,6 +1183,15 @@ void EvalState::resetFileCache()
 
 void EvalState::eval(Expr * e, Value & v)
 {
+    // When NIX_EVAL_BYTECODE=1 is set, compile to bytecode and execute
+    // via the VM instead of tree-walking.
+    static bool useBytecode = getEnv("NIX_EVAL_BYTECODE").value_or("") == "1";
+    if (useBytecode) {
+        auto * unit = bytecode::compile(*this, e);
+        bytecode::vmExec(*this, *unit, 0, baseEnv, v);
+        return;
+    }
+
     e->eval(*this, baseEnv, v);
 }
 
