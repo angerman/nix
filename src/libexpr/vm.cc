@@ -75,6 +75,10 @@ void vmExec(
 
     auto & vm = *state.vmState;
 
+    // Track the frame depth at entry so we know when OUR frames are
+    // exhausted (as opposed to frames from an outer vmExec invocation).
+    size_t entryFrameDepth = vm.frames.size();
+
     // Allocate a result slot that the OP_RETURN will write into.
     Value * resultSlot = &result;
 
@@ -304,8 +308,10 @@ op_return:
         vm.sp = frame.stackBase;
         vm.frames.pop_back();
 
-        if (vm.frames.empty()) {
-            // Outermost frame -- we're done.
+        if (vm.frames.size() <= entryFrameDepth) {
+            // All frames owned by THIS vmExec invocation are exhausted.
+            // Return to our caller (which may be another vmExec, or
+            // C++ code like forceValue or callFunction).
             return;
         }
 

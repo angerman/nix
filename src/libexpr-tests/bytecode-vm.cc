@@ -414,8 +414,7 @@ TEST_F(BytecodeVMTest, dual_let_two)    { assertDualMode("let x = 1; y = 2; in x
 TEST_F(BytecodeVMTest, dual_let_nested) { assertDualMode("let x = 1; in let y = 2; in x + y"); }
 TEST_F(BytecodeVMTest, dual_let_mul)    { assertDualMode("let x = 3; in x * 2"); }
 TEST_F(BytecodeVMTest, dual_let_sub_with_thunk) { assertDualMode("let x = 10; y = 3; in x - y"); }
-// Stack overflow: callFunction -> forceValue -> vmExec recursion (needs full trampoline)
-// TEST_F(BytecodeVMTest, dual_let_arith) { assertDualMode("let x = 10; y = 3; in x - y * 2"); }
+TEST_F(BytecodeVMTest, dual_let_arith)   { assertDualMode("let x = 10; y = 3; in x - y * 2"); }
 
 // -- Phase 2: Lambdas and calls --
 TEST_F(BytecodeVMTest, dual_lambda_id)     { assertDualMode("let f = x: x; in f 42"); }
@@ -423,9 +422,9 @@ TEST_F(BytecodeVMTest, dual_lambda_add)    { assertDualMode("let add = a: b: a +
 TEST_F(BytecodeVMTest, dual_lambda_nest)   { assertDualMode("let f = x: let y = x + 1; in y * 2; in f 5"); }
 TEST_F(BytecodeVMTest, dual_if_in_lambda)  { assertDualMode("let f = x: if x then 1 else 0; in f true"); }
 TEST_F(BytecodeVMTest, dual_lambda_recursive) { assertDualMode("let f = n: if n == 0 then 0 else f (n - 1); in f 5"); }
-// Stack overflow: callFunction -> forceValue -> vmExec recursion (needs full trampoline)
-// TEST_F(BytecodeVMTest, dual_lambda_formals) { assertDualMode("let f = { x, y }: x + y; in f { x = 3; y = 4; }"); }
-// TEST_F(BytecodeVMTest, dual_lambda_higher_order) { assertDualMode("let apply = f: x: f x; double = x: x * 2; in apply double 5"); }
+TEST_F(BytecodeVMTest, dual_lambda_formals) { assertDualMode("let f = { x, y }: x + y; in f { x = 3; y = 4; }"); }
+TEST_F(BytecodeVMTest, dual_lambda_higher_order) { assertDualMode("let apply = f: x: f x; double = x: x * 2; in apply double 5"); }
+TEST_F(BytecodeVMTest, dual_lambda_higher_order) { assertDualMode("let apply = f: x: f x; double = x: x * 2; in apply double 5"); }
 
 
 // -- Phase 3: Attrsets (via OP_EVAL_EXPR fallback) --
