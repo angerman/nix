@@ -1,11 +1,10 @@
 # Bytecode VM TODO List
 
 ## Current Status
-- 24 commits, 99/99 unit tests, ~5,700 LOC
+- 27 commits, 139 unit tests, ~6,000 LOC
+- 591/591 existing nix-expr-tests pass with NIX_EVAL_BYTECODE=1 (100%)
 - nixpkgs hello evaluates correctly
 - cardano-node (haskell.nix) evaluates correctly
-- 88/88 existing TrivialExpressionTests pass with bytecode
-- 195/196 ErrorTraceTest+PrimOpTest pass (1 known: unsafeGetAttrPos)
 
 ## Remaining OP_EVAL_EXPR Fallbacks
 
@@ -83,7 +82,7 @@ Replace with native bytecoded implementations for performance.
 ### From Review (23 issues)
 - [ ] Add bounds checks for thunk/lambda indices in debug builds (#17)
 - [ ] Add runtime stack underflow check (#18)
-- [ ] Store attribute positions in OP_ATTRS_INIT for unsafeGetAttrPos (#7)
+- [x] Store attribute positions in OP_ATTRS_INIT for unsafeGetAttrPos (#7)
 - [ ] Fix position tracking in inline thunk trampoline (#2)
 - [ ] Add RAII cleanup for heap-allocated arrays in exception paths (#14)
 
