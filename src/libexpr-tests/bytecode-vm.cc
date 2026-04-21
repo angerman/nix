@@ -545,4 +545,86 @@ TEST_F(BytecodeVMTest, regression_inherit_from_import) {
 }
 
 
+// ===========================================================================
+// Review-driven test coverage additions
+// ===========================================================================
+
+// Deep recursion (stack safety via trampolining)
+TEST_F(BytecodeVMTest, deep_recursion_100) {
+    assertDualMode("let f = n: if n == 0 then 0 else f (n - 1); in f 100");
+}
+
+// builtins.tryEval
+TEST_F(BytecodeVMTest, tryeval_success) {
+    assertDualMode("builtins.tryEval 42");
+}
+
+TEST_F(BytecodeVMTest, tryeval_failure) {
+    assertDualMode("builtins.tryEval (throw \"oops\")");
+}
+
+TEST_F(BytecodeVMTest, tryeval_assert_failure) {
+    assertDualMode("builtins.tryEval (assert false; 1)");
+}
+
+// Dynamic attributes (via OP_EVAL_EXPR fallback)
+TEST_F(BytecodeVMTest, dynamic_attrs) {
+    assertDualMode("let name = \"x\"; in { ${name} = 1; }.x");
+}
+
+// rec { } patterns (via OP_EVAL_EXPR fallback)
+TEST_F(BytecodeVMTest, rec_mutual) {
+    assertDualMode("rec { a = b + 1; b = 1; }.a");
+}
+
+TEST_F(BytecodeVMTest, rec_self_ref) {
+    assertDualMode("rec { x = 1; y = x; }.y");
+}
+
+// inherit patterns
+TEST_F(BytecodeVMTest, inherit_simple) {
+    assertDualMode("let x = 1; in { inherit x; }.x");
+}
+
+TEST_F(BytecodeVMTest, inherit_from) {
+    assertDualMode("let s = { x = 42; }; in { inherit (s) x; }.x");
+}
+
+// Nested closures capturing from multiple scopes
+TEST_F(BytecodeVMTest, nested_closures) {
+    assertDualMode("let a = 1; f = b: c: a + b + c; in f 2 3");
+}
+
+// with + let interaction
+TEST_F(BytecodeVMTest, with_let_nested) {
+    assertDualMode("let x = 1; in with { y = 2; }; let z = 3; in x + y + z");
+}
+
+// String context propagation (basic)
+TEST_F(BytecodeVMTest, string_concat_context) {
+    assertDualMode("\"hello\" + \" \" + \"world\"");
+}
+
+// or-default patterns
+TEST_F(BytecodeVMTest, select_or_found) {
+    assertDualMode("{ x = 42; }.x or 0");
+}
+
+TEST_F(BytecodeVMTest, select_or_missing) {
+    assertDualMode("{ }.x or 99");
+}
+
+TEST_F(BytecodeVMTest, select_or_not_attrs) {
+    assertDualMode("null.x or 42");
+}
+
+// Attrset merge (// operator)
+TEST_F(BytecodeVMTest, update_override) {
+    assertDualMode("{ a = 1; b = 2; } // { b = 3; c = 4; }");
+}
+
+TEST_F(BytecodeVMTest, update_empty) {
+    assertDualMode("{ } // { x = 1; }");
+}
+
 } // namespace nix
