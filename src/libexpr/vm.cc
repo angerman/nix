@@ -153,6 +153,9 @@ void vmExec(
         REGISTER_OP(OP_POP,     op_pop);
         REGISTER_OP(OP_DUP,     op_dup);
 
+        // Fallback
+        REGISTER_OP(OP_EVAL_EXPR,    op_eval_expr);
+
         // Phase 2: let-bindings, closures, calls, thunks
         REGISTER_OP(OP_ENTER_LET,    op_enter_let);
         REGISTER_OP(OP_LEAVE_SCOPE,  op_leave_scope);
@@ -889,6 +892,28 @@ op_call:
         // Delegate to callFunction with the full argument span.
         auto * result = state.allocValue();
         state.callFunction(*fun, std::span<Value *>(args, nArgs), *result, pos);
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Fallback: delegate to tree-walking Expr::eval()
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_eval_expr:
+#else
+    case OP_EVAL_EXPR:
+#endif
+    {
+        uint32_t exprIdx = decodeOperand(CUR_INSTR);
+        Expr * expr = cu->exprPool[exprIdx];
+
+        // Evaluate the expression via the tree-walking interpreter,
+        // using the current bytecode env as context.
+        auto * result = state.allocValue();
+        expr->eval(state, *curEnv, *result);
 
         vm.push(result);
         DISPATCH();

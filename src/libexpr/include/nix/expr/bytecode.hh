@@ -201,8 +201,11 @@ enum Op : uint8_t {
     OP_POP              = 0x3D, //                discard TOS
     OP_SWAP             = 0x3E, //                swap top two stack entries
 
+    // -- Fallback --
+    OP_EVAL_EXPR        = 0x3F, // [exprIdx:24]   fallback: eval exprPool[idx] in current env
+
     // -- Fused hot-path instructions --
-    OP_SELECT_FORCE     = 0x3F, // [symIdx:24]    select attr + force result
+    OP_SELECT_FORCE     = 0x40, // [symIdx:24]    select attr + force result
 };
 
 
@@ -284,6 +287,11 @@ struct CompilationUnit : gc
     // Indexed by OP_MAKE_CLOSURE operand.
     std::vector<LambdaDescriptor> lambdas;
 
+    // -- Expr fallback pool --
+    // Expr* pointers for expressions that are not yet compiled to bytecode.
+    // Indexed by OP_EVAL_EXPR operand.  The VM calls expr->eval() on these.
+    std::vector<Expr *> exprPool;
+
     // -- Position table (sparse, sorted by instrOffset) --
     std::vector<PosEntry> positions;
 
@@ -329,6 +337,15 @@ struct CompilationUnit : gc
     {
         uint32_t idx = static_cast<uint32_t>(constants.size());
         constants.push_back(v);
+        return idx;
+    }
+
+    /// Add an Expr* to the expr fallback pool, returning its index.
+    /// Used for expressions not yet compiled to bytecode (OP_EVAL_EXPR).
+    uint32_t addExpr(Expr * e)
+    {
+        uint32_t idx = static_cast<uint32_t>(exprPool.size());
+        exprPool.push_back(e);
         return idx;
     }
 
