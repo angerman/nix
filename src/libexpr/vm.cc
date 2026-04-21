@@ -246,7 +246,7 @@ void vmExec(
     // Frame-local aliases (updated when frames change).
     const CompilationUnit * cu = &unit;
     uint32_t ip   = startOffset;
-    [[maybe_unused]] Env * curEnv = &env;
+    Env * curEnv = &env;
 
     // ------------------------------------------------------------------
     // Dispatch loop.
@@ -410,13 +410,7 @@ op_true:
     case OP_TRUE:
 #endif
     {
-        // Push the global `true` singleton.
-        // We need a pointer to a Value that is `true`.
-        // EvalState has vTrue; we use state.vTrue here.
-        // TODO: use a global true Value* constant.
-        auto * v = state.allocValue();
-        v->mkBool(true);
-        vm.push(v);
+        vm.push(&Value::vTrue);
         DISPATCH();
     }
 
@@ -426,9 +420,7 @@ op_false:
     case OP_FALSE:
 #endif
     {
-        auto * v = state.allocValue();
-        v->mkBool(false);
-        vm.push(v);
+        vm.push(&Value::vFalse);
         DISPATCH();
     }
 
@@ -438,9 +430,7 @@ op_null:
     case OP_NULL:
 #endif
     {
-        auto * v = state.allocValue();
-        v->mkNull();
-        vm.push(v);
+        vm.push(&Value::vNull);
         DISPATCH();
     }
 
@@ -467,7 +457,6 @@ op_return:
 
         // Write the result into the caller's result slot.
         auto & frame = vm.frames.back();
-        bool wasThunkForce = frame.isThunkForce;
         *frame.resultSlot = *retVal;
 
         // Restore stack to frame entry point.
@@ -476,8 +465,6 @@ op_return:
 
         if (vm.frames.size() <= entryFrameDepth) {
             // All frames owned by THIS vmExec invocation are exhausted.
-            // Return to our caller (which may be another vmExec, or
-            // C++ code like forceValue or callFunction).
             return;
         }
 
@@ -487,13 +474,7 @@ op_return:
         ip     = caller.ip;
         curEnv = caller.env;
 
-        if (!wasThunkForce) {
-            // Normal call return: push the result for the caller.
-            vm.push(retVal);
-        }
-        // Thunk force return: the caller's TOS (the thunk Value*) has
-        // been updated in-place via resultSlot.  No push needed -- the
-        // caller's stack already has a pointer to the (now-forced) value.
+        vm.push(retVal);
         DISPATCH();
     }
 
@@ -619,46 +600,11 @@ op_force:
     {
         Value * v = vm.top();
         PosIdx pos = cu->posForOffset(ip - 1);
-
-        // Check if the value is a bytecoded thunk we can force inline
-        // (within this VM invocation) rather than recursing into vmExec.
-        // This avoids C-stack overflow from nested vmExec calls.
-        if (v->isThunk()) {
-            Env * thunkEnv = v->thunk().env;
-            Expr * thunkExpr = v->thunk().expr;
-
-            if (thunkEnv && dynamic_cast<ExprBytecodeThunk *>(thunkExpr)) {
-                auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
-                uint32_t thunkOffset = bcThunk->unit->thunks[bcThunk->thunkIdx].codeOffset;
-
-                // Mark as blackhole before evaluating.
-                v->mkBlackhole();
-
-                // Save current frame state.
-                vm.frames.back().ip = ip;
-                vm.frames.back().env = curEnv;
-
-                // Push a new call frame for the thunk body.
-                vm.frames.push_back(CallFrame{
-                    .unit = bcThunk->unit,
-                    .ip = thunkOffset,
-                    .env = thunkEnv,
-                    .stackBase = vm.sp,
-                    .resultSlot = v,  // Write result back into the thunk Value
-                    .callPos = pos,
-                    .isThunkForce = true,
-                });
-
-                // Switch to the thunk's code.
-                cu = bcThunk->unit;
-                ip = thunkOffset;
-                curEnv = thunkEnv;
-                DISPATCH();
-            }
-        }
-
-        // Fallback: use the standard forceValue path for non-bytecoded
-        // thunks, function applications, and non-thunks.
+        // All thunks use original Expr* (not ExprBytecodeThunk) for
+        // isTrivial() compatibility, so forcing always goes through
+        // the tree-walker's forceValue.  The entryFrameDepth mechanism
+        // in vmExec handles re-entrancy correctly if forceValue triggers
+        // a nested vmExec via ExprBytecodeThunk::eval.
         state.forceValue(*v, pos);
         DISPATCH();
     }

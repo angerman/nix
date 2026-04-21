@@ -627,4 +627,222 @@ TEST_F(BytecodeVMTest, update_empty) {
     assertDualMode("{ } // { x = 1; }");
 }
 
+
+// ===========================================================================
+// Edge-case dual-mode tests: advanced language features
+// ===========================================================================
+
+// -- Nested rec attrsets: rec bindings reference each other --
+TEST_F(BytecodeVMTest, edge_nested_rec_attrset) {
+    assertDualMode("rec { a = c + 1; c = 1; }.a");
+}
+
+// -- Functor protocol: __functor attribute makes attrset callable --
+TEST_F(BytecodeVMTest, edge_functor_protocol) {
+    assertDualMode("let f = { __functor = self: x: x + 1; }; in f 41");
+}
+
+// -- builtins.deepSeq: forces recursive evaluation of nested structure --
+TEST_F(BytecodeVMTest, edge_deep_seq) {
+    assertDualMode("builtins.deepSeq { a = 1; b = 2; } \"done\"");
+}
+
+// -- builtins.seq: forces evaluation of first arg, returns second --
+TEST_F(BytecodeVMTest, edge_seq) {
+    assertDualMode("builtins.seq (1 + 2) \"ok\"");
+}
+
+// -- Partial primop application: builtins.add is a 2-arg primop --
+TEST_F(BytecodeVMTest, edge_partial_primop) {
+    assertDualMode("let add = builtins.add; add1 = add 1; in add1 2");
+}
+
+// -- String comparison: lexicographic ordering --
+TEST_F(BytecodeVMTest, edge_string_comparison) {
+    assertDualMode("\"abc\" < \"abd\"");
+}
+
+// -- Nested with: inner and outer scopes both contribute bindings --
+TEST_F(BytecodeVMTest, edge_nested_with) {
+    assertDualMode("with { x = 1; }; with { y = 2; }; x + y");
+}
+
+// -- Let shadows with in nested context: let in body of with still wins --
+TEST_F(BytecodeVMTest, edge_let_shadows_with_nested) {
+    assertDualMode("with { x = 2; y = 20; }; let x = 1; in x + y");
+}
+
+// -- Recursive function with accumulator: tail-call-style recursion --
+TEST_F(BytecodeVMTest, edge_recursive_accumulator) {
+    assertDualMode(
+        "let sum = acc: n: if n == 0 then acc else sum (acc + n) (n - 1); in sum 0 100"
+    );
+}
+
+// -- Large list: genList with 1000 elements --
+TEST_F(BytecodeVMTest, edge_large_list) {
+    assertDualMode("builtins.length (builtins.genList (x: x) 1000)");
+}
+
+// -- Attrset from list: listToAttrs with name/value pairs --
+TEST_F(BytecodeVMTest, edge_list_to_attrs) {
+    assertDualMode(
+        "builtins.listToAttrs [ { name = \"x\"; value = 1; } { name = \"y\"; value = 2; } ]"
+    );
+}
+
+// -- String interpolation with multiple types via toString --
+TEST_F(BytecodeVMTest, edge_string_interp_multi_type) {
+    assertDualMode("\"${toString 42} and ${toString 3.14}\"");
+}
+
+// -- Comparison of attrsets: structural equality --
+TEST_F(BytecodeVMTest, edge_attrset_equality) {
+    assertDualMode("{ a = 1; } == { a = 1; }");
+}
+
+// -- Nested if with complex conditions: inner if produces the condition --
+TEST_F(BytecodeVMTest, edge_nested_if_condition) {
+    assertDualMode("if (if true then false else true) then 1 else 2");
+}
+
+// -- builtins.typeOf: returns type name as string --
+TEST_F(BytecodeVMTest, edge_typeof_int) {
+    assertDualMode("builtins.typeOf 42");
+}
+
+TEST_F(BytecodeVMTest, edge_typeof_string) {
+    assertDualMode("builtins.typeOf \"hello\"");
+}
+
+TEST_F(BytecodeVMTest, edge_typeof_bool) {
+    assertDualMode("builtins.typeOf true");
+}
+
+TEST_F(BytecodeVMTest, edge_typeof_null) {
+    assertDualMode("builtins.typeOf null");
+}
+
+TEST_F(BytecodeVMTest, edge_typeof_lambda) {
+    assertDualMode("builtins.typeOf (x: x)");
+}
+
+TEST_F(BytecodeVMTest, edge_typeof_attrs) {
+    assertDualMode("builtins.typeOf { }");
+}
+
+TEST_F(BytecodeVMTest, edge_typeof_list) {
+    assertDualMode("builtins.typeOf [ ]");
+}
+
+TEST_F(BytecodeVMTest, edge_typeof_float) {
+    assertDualMode("builtins.typeOf 1.0");
+}
+
+// -- builtins.attrNames: returns sorted list of attribute names --
+TEST_F(BytecodeVMTest, edge_attr_names_sorted) {
+    assertDualMode("builtins.attrNames { b = 1; a = 2; }");
+}
+
+TEST_F(BytecodeVMTest, edge_attr_names_empty) {
+    assertDualMode("builtins.attrNames { }");
+}
+
+// -- Empty string concatenation --
+TEST_F(BytecodeVMTest, edge_empty_string_concat) {
+    assertDualMode("\"\" + \"\" + \"\"");
+}
+
+// -- builtins.throw and tryEval: exception semantics across both paths --
+TEST_F(BytecodeVMTest, edge_throw_in_tryeval) {
+    assertDualMode("builtins.tryEval (throw \"boom\")");
+}
+
+TEST_F(BytecodeVMTest, edge_throw_caught_with_default) {
+    // tryEval returns { success = false; value = false; } on throw
+    assertDualMode("(builtins.tryEval (throw \"nope\")).success");
+}
+
+// -- Both paths must throw on builtins.throw --
+TEST_F(BytecodeVMTest, edge_throw_propagates) {
+    ASSERT_THROW(evalTreeWalk("throw \"oops\""), ThrownError);
+    ASSERT_THROW(evalBytecode("throw \"oops\""), ThrownError);
+}
+
+// -- Integer overflow via builtins.add: checked arithmetic --
+TEST_F(BytecodeVMTest, edge_integer_overflow_add) {
+    ASSERT_THROW(
+        evalTreeWalk("builtins.add 9223372036854775807 1"),
+        EvalError
+    );
+    ASSERT_THROW(
+        evalBytecode("builtins.add 9223372036854775807 1"),
+        EvalError
+    );
+}
+
+// -- Integer overflow via + operator in string concat context --
+TEST_F(BytecodeVMTest, edge_integer_overflow_plus) {
+    ASSERT_THROW(
+        evalTreeWalk("9223372036854775807 + 1"),
+        EvalError
+    );
+    ASSERT_THROW(
+        evalBytecode("9223372036854775807 + 1"),
+        EvalError
+    );
+}
+
+// -- Nested with shadowing: inner with overrides outer with --
+TEST_F(BytecodeVMTest, edge_nested_with_shadow) {
+    assertDualMode("with { x = 1; }; with { x = 2; }; x");
+}
+
+// -- with does not shadow function formals --
+TEST_F(BytecodeVMTest, edge_with_vs_formal) {
+    assertDualMode("let f = x: with { x = 99; }; x; in f 1");
+}
+
+// -- Deeply nested attrset select --
+TEST_F(BytecodeVMTest, edge_deep_nested_select) {
+    assertDualMode("{ a = { b = { c = { d = 42; }; }; }; }.a.b.c.d");
+}
+
+// -- map + filter composition --
+TEST_F(BytecodeVMTest, edge_map_filter) {
+    assertDualMode(
+        "builtins.filter (x: x > 3) (builtins.map (x: x * 2) [ 1 2 3 ])"
+    );
+}
+
+// -- builtins.foldl' (strict fold) --
+TEST_F(BytecodeVMTest, edge_foldl_strict) {
+    assertDualMode("builtins.foldl' (a: b: a + b) 0 [ 1 2 3 4 5 ]");
+}
+
+// -- Default function argument --
+TEST_F(BytecodeVMTest, edge_default_arg) {
+    assertDualMode("let f = { x ? 10 }: x; in f { }");
+}
+
+TEST_F(BytecodeVMTest, edge_default_arg_override) {
+    assertDualMode("let f = { x ? 10 }: x; in f { x = 42; }");
+}
+
+// -- Pattern match with @-pattern --
+TEST_F(BytecodeVMTest, edge_at_pattern) {
+    assertDualMode("let f = s@{ x, y }: s.x + s.y + x + y; in f { x = 1; y = 2; }");
+}
+
+// -- builtins.concatLists --
+TEST_F(BytecodeVMTest, edge_concat_lists) {
+    assertDualMode("builtins.concatLists [ [ 1 2 ] [ 3 ] [ 4 5 6 ] ]");
+}
+
+// -- Recursive attrset with inherit --
+TEST_F(BytecodeVMTest, edge_rec_inherit) {
+    assertDualMode("let x = 10; in rec { inherit x; y = x + 1; }.y");
+}
+
+
 } // namespace nix
