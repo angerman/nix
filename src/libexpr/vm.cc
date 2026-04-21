@@ -508,7 +508,11 @@ op_get_local_0:
 #endif
     {
         uint32_t displ = decodeOperand(CUR_INSTR);
-        vm.push(curEnv->values[displ]);
+        Value * v = curEnv->values[displ];
+        // ExprVar::eval forces the value at lookup time.
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+        vm.push(v);
         DISPATCH();
     }
 
@@ -519,7 +523,10 @@ op_get_local_1:
 #endif
     {
         uint32_t displ = decodeOperand(CUR_INSTR);
-        vm.push(curEnv->up->values[displ]);
+        Value * v = curEnv->up->values[displ];
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+        vm.push(v);
         DISPATCH();
     }
 
@@ -530,7 +537,10 @@ op_get_local_2:
 #endif
     {
         uint32_t displ = decodeOperand(CUR_INSTR);
-        vm.push(curEnv->up->up->values[displ]);
+        Value * v = curEnv->up->up->values[displ];
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+        vm.push(v);
         DISPATCH();
     }
 
@@ -541,7 +551,10 @@ op_get_local_3:
 #endif
     {
         uint32_t displ = decodeOperand(CUR_INSTR);
-        vm.push(curEnv->up->up->up->values[displ]);
+        Value * v = curEnv->up->up->up->values[displ];
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+        vm.push(v);
         DISPATCH();
     }
 
@@ -557,7 +570,10 @@ op_get_local:
         Env * e = curEnv;
         for (uint8_t l = level; l > 0; --l)
             e = e->up;
-        vm.push(e->values[displ]);
+        Value * v = e->values[displ];
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+        vm.push(v);
         DISPATCH();
     }
 
@@ -1370,8 +1386,13 @@ op_attrs_init:
         // (matching the sorted attr iteration), and the stack has
         // values in the same order (first pushed = first attr).
         // So we collect values first, then pair.
-        Value * values[256]; // max attrs in one OP_ATTRS_INIT
-        assert(nAttrs <= 256);
+        // Use heap allocation for large attrsets.
+        // Stack allocation for small ones (common case).
+        constexpr uint32_t kStackMax = 64;
+        Value * stackValues[kStackMax];
+        Value ** values = nAttrs <= kStackMax
+            ? stackValues
+            : new Value*[nAttrs];
         for (uint32_t i = nAttrs; i > 0; --i)
             values[i - 1] = vm.pop();
 
@@ -1384,6 +1405,10 @@ op_attrs_init:
 
         auto * result = state.allocValue();
         result->mkAttrs(bindings.alreadySorted());
+
+        if (values != stackValues)
+            delete[] values;
+
         vm.push(result);
         DISPATCH();
     }

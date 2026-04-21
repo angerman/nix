@@ -488,4 +488,36 @@ TEST_F(BytecodeVMTest, disasm_let_if)
 }
 
 
+// ===========================================================================
+// Regression tests for bugs found during development
+// ===========================================================================
+
+// Bug: OP_GET_LOCAL didn't force values at lookup time (unlike ExprVar::eval
+// which calls forceValue). This caused thunks to leak through function calls
+// where the caller expected a forced value.  The symptom was "attempt to call
+// something which is not a function but a thunk" when importing nixpkgs.
+TEST_F(BytecodeVMTest, regression_var_access_forces) {
+    // let x = expr; in x should return a forced value, not a thunk.
+    // This simulates the pattern in stdenv/generic/default.nix where
+    // `let stdenv = lib.makeOverridable(...); in stdenv` returns a thunk
+    // if variable access doesn't force.
+    assertDualMode("let x = { a = 1; }; in x");
+    assertDualMode("let f = x: x; g = f; in g 42");
+    // Nested: thunk chain through let bindings
+    assertDualMode("let x = 1 + 2; y = x; z = y; in z");
+}
+
+// Bug: OP_ATTRS_INIT with >256 attrs hit an assertion.  Nixpkgs has
+// large attrsets (all-packages.nix).  Fixed by heap-allocating for
+// large attrsets.
+TEST_F(BytecodeVMTest, regression_large_attrset) {
+    // Generate a 300-attribute attrset
+    std::string expr = "let s = {";
+    for (int i = 0; i < 300; i++)
+        expr += " a" + std::to_string(i) + " = " + std::to_string(i) + ";";
+    expr += " }; in s.a299";
+    assertDualMode(expr);
+}
+
+
 } // namespace nix
