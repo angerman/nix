@@ -97,6 +97,9 @@ private:
     void compileConcatStrings(ExprConcatStrings * e);
     void compilePos(ExprPos * e);
 
+    // -- Thunk-or-eager helper (mirrors Expr::maybeThunk) --
+    void compileAsThunkOrEager(Expr * expr, PosIdx pos);
+
     // -- Arithmetic binary op helper --
     void compileBinOp(Expr * e1, Expr * e2, Op op, PosIdx pos);
 };

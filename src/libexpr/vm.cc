@@ -9,7 +9,9 @@
 
 #include "nix/expr/vm.hh"
 #include "nix/expr/bytecode.hh"
+#include "nix/expr/bytecode-thunk.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/print.hh"
 
@@ -150,6 +152,15 @@ void vmExec(
         REGISTER_OP(OP_ASSERT,  op_assert);
         REGISTER_OP(OP_POP,     op_pop);
         REGISTER_OP(OP_DUP,     op_dup);
+
+        // Phase 2: let-bindings, closures, calls, thunks
+        REGISTER_OP(OP_ENTER_LET,    op_enter_let);
+        REGISTER_OP(OP_LEAVE_SCOPE,  op_leave_scope);
+        REGISTER_OP(OP_SET_ENV_SLOT, op_set_env_slot);
+        REGISTER_OP(OP_MAKE_THUNK,   op_make_thunk);
+        REGISTER_OP(OP_MAKE_CLOSURE, op_make_closure);
+        REGISTER_OP(OP_CALL,         op_call);
+        REGISTER_OP(OP_CALL_1,       op_call_1);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -721,6 +732,165 @@ op_dup:
 #endif
     {
         vm.push(vm.top());
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 2: Let-bindings and scope
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_enter_let:
+#else
+    case OP_ENTER_LET:
+#endif
+    {
+        uint32_t envSize = decodeOperand(CUR_INSTR);
+        Env & env2 = state.mem.allocEnv(envSize);
+        env2.up = curEnv;
+        curEnv = &env2;
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_leave_scope:
+#else
+    case OP_LEAVE_SCOPE:
+#endif
+    {
+        curEnv = curEnv->up;
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_set_env_slot:
+#else
+    case OP_SET_ENV_SLOT:
+#endif
+    {
+        uint32_t displ = decodeOperand(CUR_INSTR);
+        Value * v = vm.pop();
+        // Heap-persist if needed: the value must outlive the stack frame.
+        // Since our stack holds Value*, and the value is either from a
+        // constant pool or already GC-allocated, we can store it directly.
+        curEnv->values[displ] = v;
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 2: Thunks
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_make_thunk:
+#else
+    case OP_MAKE_THUNK:
+#endif
+    {
+        uint32_t thunkIdx = decodeOperand(CUR_INSTR);
+        auto & desc = cu->thunks[thunkIdx];
+
+        // Create an ExprBytecodeThunk in the BumpMemoryResource arena.
+        // This is the bridge: forceValue() calls expr->eval() which
+        // dispatches to vmExec.
+        auto * thunkExpr = state.mem.exprs.add<ExprBytecodeThunk>(
+            const_cast<CompilationUnit *>(cu), thunkIdx);
+
+        // Create the thunk Value: (currentEnv, thunkExpr).
+        auto * thunkVal = state.allocValue();
+        thunkVal->mkThunk(curEnv, thunkExpr);
+
+        vm.push(thunkVal);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 2: Closures
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_make_closure:
+#else
+    case OP_MAKE_CLOSURE:
+#endif
+    {
+        uint32_t lambdaIdx = decodeOperand(CUR_INSTR);
+        auto & desc = cu->lambdas[lambdaIdx];
+
+        // Create an ExprLambdaBytecode proxy in BumpMemoryResource.
+        // Its body will be an ExprBytecodeThunk for the lambda body.
+        auto * proxy = state.mem.exprs.add<ExprLambdaBytecode>(
+            const_cast<CompilationUnit *>(cu), lambdaIdx);
+
+        // Create a thunk for the body so that callFunction's
+        // lambda.body->eval() dispatches to the VM.
+        // Register the body as a thunk descriptor.
+        auto * bodyThunk = state.mem.exprs.add<ExprBytecodeThunk>(
+            const_cast<CompilationUnit *>(cu),
+            // We need a thunk descriptor for the body.  The lambda's
+            // codeOffset IS the body, so we register it if not already done.
+            // For simplicity, we add a thunk descriptor on the fly.
+            static_cast<uint32_t>(const_cast<CompilationUnit *>(cu)->thunks.size()));
+        const_cast<CompilationUnit *>(cu)->thunks.push_back(
+            ThunkDescriptor{desc.codeOffset, desc.pos});
+        proxy->body = bodyThunk;
+
+        // Create the closure Value: (currentEnv, proxy).
+        auto * closureVal = state.allocValue();
+        closureVal->mkLambda(curEnv, proxy);
+
+        vm.push(closureVal);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 2: Function calls
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_call_1:
+#else
+    case OP_CALL_1:
+#endif
+    {
+        Value * arg = vm.pop();
+        Value * fun = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Delegate to the existing callFunction which handles all
+        // calling conventions: lambdas, primops, partial application,
+        // functors, and profiling hooks.
+        auto * result = state.allocValue();
+        state.callFunction(*fun, *arg, *result, pos);
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_call:
+#else
+    case OP_CALL:
+#endif
+    {
+        uint32_t nArgs = decodeOperand(CUR_INSTR);
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Collect arguments from the stack into a fixed-size array.
+        // Max primop arity is 8; in practice Nix calls rarely exceed 3-4 args.
+        // Use a stack-allocated array to avoid std::vector (which has a
+        // non-trivial destructor that breaks computed-goto).
+        assert(nArgs <= 16);
+        Value * args[16];
+        for (uint32_t i = nArgs; i > 0; --i)
+            args[i - 1] = vm.pop();
+        Value * fun = vm.pop();
+
+        // Delegate to callFunction with the full argument span.
+        auto * result = state.allocValue();
+        state.callFunction(*fun, std::span<Value *>(args, nArgs), *result, pos);
+
+        vm.push(result);
         DISPATCH();
     }
 

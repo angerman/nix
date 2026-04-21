@@ -234,8 +234,8 @@ TEST_F(BytecodeVMTest, vm_start_at_offset)
 TEST_F(BytecodeVMTest, vm_unhandled_opcode_throws)
 {
     bytecode::CompilationUnit unit;
-    // OP_ADD (0x32) is not yet implemented in the skeleton VM.
-    unit.emit(bytecode::OP_ADD);
+    // OP_ATTRS_UPDATE (0x13) is not yet implemented.
+    unit.emit(bytecode::OP_ATTRS_UPDATE);
 
     ASSERT_THROW(evalBytecodeManual(unit, 0), Error);
 }

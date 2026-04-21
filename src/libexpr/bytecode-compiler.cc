@@ -302,9 +302,169 @@ void Compiler::compilePos(ExprPos * e)
 
 
 // ---------------------------------------------------------------------------
-// Stubs for Phase 2+ expression types
+// Phase 2: Let-bindings
 // ---------------------------------------------------------------------------
-// These will be implemented incrementally. For now they throw clear errors.
+
+void Compiler::compileLet(ExprLet * e)
+{
+    // let { a = e1; b = e2; } in body
+    //
+    // Compiled as:
+    //   OP_ENTER_LET envSize    -- allocate Env, enter scope
+    //   <for each binding>
+    //     <compile thunk or eager value>
+    //     OP_SET_ENV_SLOT displ  -- store in env slot
+    //   <compile body>
+    //   OP_LEAVE_SCOPE           -- restore previous env
+
+    uint32_t envSize = static_cast<uint32_t>(e->attrs->attrs->size());
+    unit.emitPos(e->attrs->pos);
+    unit.emit(OP_ENTER_LET, envSize);
+
+    // Compile each binding.  Let-bindings are mutually recursive (like rec),
+    // so all bindings are thunks that capture the new env.
+    Displacement displ = 0;
+    for (auto & [name, def] : *e->attrs->attrs) {
+        compileAsThunkOrEager(def.e, def.pos);
+        unit.emit(OP_SET_ENV_SLOT, displ);
+        displ++;
+    }
+
+    // Compile the body in the new scope.
+    compile(e->body);
+
+    unit.emit(OP_LEAVE_SCOPE);
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 2: Thunk-or-eager helper (mirrors maybeThunk)
+// ---------------------------------------------------------------------------
+
+void Compiler::compileAsThunkOrEager(Expr * expr, PosIdx pos)
+{
+    // Literals: compile directly, no thunk needed.
+    if (dynamic_cast<ExprInt *>(expr)
+        || dynamic_cast<ExprFloat *>(expr)
+        || dynamic_cast<ExprString *>(expr)
+        || dynamic_cast<ExprPath *>(expr)) {
+        compile(expr);
+        return;
+    }
+
+    // Variable references: emit a load, which returns the Value* directly.
+    // The loaded value may itself be a thunk, but that's fine -- it will be
+    // forced on demand.
+    if (auto * var = dynamic_cast<ExprVar *>(expr)) {
+        if (!var->fromWith) {
+            compile(expr);
+            return;
+        }
+    }
+
+    // Lambda: compile to OP_MAKE_CLOSURE, no thunk needed (lambdas are values).
+    if (dynamic_cast<ExprLambda *>(expr)) {
+        compile(expr);
+        return;
+    }
+
+    // General case: create a thunk.
+    // 1. Compile the thunk body into a separate region of the code buffer.
+    // 2. Jump over the thunk body at the definition site.
+    // 3. Record a ThunkDescriptor for this region.
+    // 4. Emit OP_MAKE_THUNK to create the thunk at runtime.
+
+    // Jump over the thunk body.
+    uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+
+    // Record the start of the thunk body.
+    uint32_t thunkStart = static_cast<uint32_t>(unit.code.size());
+
+    // Compile the thunk body (will be executed when forced).
+    compile(expr);
+    unit.emit(OP_RETURN);
+
+    // Patch the jump to skip over the thunk body.
+    unit.patchJump(jumpOver);
+
+    // Register the thunk descriptor.
+    uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+    unit.thunks.push_back(ThunkDescriptor{thunkStart, pos});
+
+    // Emit the thunk creation instruction.
+    unit.emit(OP_MAKE_THUNK, thunkIdx);
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 2: Lambda/closure compilation
+// ---------------------------------------------------------------------------
+
+void Compiler::compileLambda(ExprLambda * e)
+{
+    // Jump over the lambda body.
+    uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+
+    // Record the start of the lambda body.
+    uint32_t bodyStart = static_cast<uint32_t>(unit.code.size());
+
+    // Compile the lambda body.
+    compile(e->body);
+    unit.emit(OP_RETURN);
+
+    // Patch the jump.
+    unit.patchJump(jumpOver);
+
+    // Register the lambda descriptor.
+    uint32_t lambdaIdx = static_cast<uint32_t>(unit.lambdas.size());
+
+    auto formals = e->getFormals();
+    uint16_t envSize = (!e->arg ? 0 : 1)
+        + (formals ? static_cast<uint16_t>(formals->formals.size()) : 0);
+
+    unit.lambdas.push_back(LambdaDescriptor{
+        .codeOffset = bodyStart,
+        .pos = e->pos,
+        .name = e->name,
+        .arg = e->arg,
+        .formals = formals ? &*formals : nullptr,
+        .envSize = envSize,
+        .sourceExpr = e,
+    });
+
+    // Emit the closure creation instruction.
+    unit.emitPos(e->pos);
+    unit.emit(OP_MAKE_CLOSURE, lambdaIdx);
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 2: Function calls
+// ---------------------------------------------------------------------------
+
+void Compiler::compileCall(ExprCall * e)
+{
+    // Compile the function expression.
+    compile(e->fun);
+
+    // Compile each argument as a thunk (lazy, matching tree-walker semantics).
+    for (auto * arg : *e->args) {
+        compileAsThunkOrEager(arg, e->pos);
+    }
+
+    // Emit the call instruction.
+    unit.emitPos(e->pos);
+    uint32_t nArgs = static_cast<uint32_t>(e->args->size());
+    if (nArgs == 1)
+        unit.emit(OP_CALL_1);
+    else
+        unit.emit(OP_CALL, nArgs);
+}
+
+
+// ---------------------------------------------------------------------------
+// Stubs for Phase 3+ expression types
+// ---------------------------------------------------------------------------
 
 void Compiler::compileSelect(ExprSelect * e)
 {
@@ -324,21 +484,6 @@ void Compiler::compileAttrs(ExprAttrs * e)
 void Compiler::compileList(ExprList * e)
 {
     throw Error("bytecode compiler: ExprList not yet implemented");
-}
-
-void Compiler::compileLambda(ExprLambda * e)
-{
-    throw Error("bytecode compiler: ExprLambda not yet implemented");
-}
-
-void Compiler::compileCall(ExprCall * e)
-{
-    throw Error("bytecode compiler: ExprCall not yet implemented");
-}
-
-void Compiler::compileLet(ExprLet * e)
-{
-    throw Error("bytecode compiler: ExprLet not yet implemented");
 }
 
 void Compiler::compileWith(ExprWith * e)
