@@ -18,7 +18,7 @@
 namespace nix::bytecode {
 
 /// Return the mnemonic for an opcode.
-static const char * opName(uint8_t op)
+const char * opName(uint8_t op)
 {
     switch (op) {
         case OP_NOP:              return "NOP";

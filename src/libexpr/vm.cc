@@ -14,10 +14,161 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/print.hh"
+#include "nix/util/environment-variables.hh"
 
 #include <cassert>
 
 namespace nix::bytecode {
+
+// ---------------------------------------------------------------------------
+// VM Tracing
+// ---------------------------------------------------------------------------
+//
+// Controlled by environment variables:
+//   NIX_VM_TRACE=1          -- trace every instruction
+//   NIX_VM_TRACE_FROM=N     -- start tracing at step N (default 0)
+//   NIX_VM_TRACE_TO=N       -- stop tracing at step N (default UINT64_MAX)
+//
+// Each traced step shows:
+//   [step#] unit@offset opcode operands  ; source_file:line:col  | stack_depth
+//
+// The step counter is global (across all vmExec invocations) so you can
+// pinpoint the exact moment something goes wrong in a long evaluation.
+
+struct TraceConfig {
+    bool enabled = false;
+    uint64_t from = 0;
+    uint64_t to = UINT64_MAX;
+
+    TraceConfig() {
+        auto t = getEnv("NIX_VM_TRACE");
+        auto f = getEnv("NIX_VM_TRACE_FROM");
+        auto tt = getEnv("NIX_VM_TRACE_TO");
+        if (t.value_or("") == "1" || f || tt) {
+            enabled = true;
+            if (f) from = std::stoull(*f);
+            if (tt) to = std::stoull(*tt);
+        }
+    }
+};
+
+static TraceConfig & traceConfig() {
+    static TraceConfig cfg;
+    return cfg;
+}
+
+static uint64_t & globalStepCounter() {
+    static uint64_t counter = 0;
+    return counter;
+}
+
+/// Print one trace line for the current instruction.
+static void traceInstruction(
+    EvalState & state,
+    const CompilationUnit & cu,
+    uint32_t ip,
+    Instruction instr,
+    uint64_t step,
+    size_t stackDepth,
+    size_t frameDepth)
+{
+    uint8_t op = decodeOp(instr);
+    uint32_t operand = decodeOperand(instr);
+    PosIdx posIdx = cu.posForOffset(ip);
+    Pos pos = posIdx ? state.positions[posIdx] : Pos{};
+
+    // Format: [step] frames:N stack:N  ip  opcode operand  ; source:line:col
+    fprintf(stderr, "[%7llu] fr:%zu stk:%zu  %4u: %-18s",
+        (unsigned long long)step, frameDepth, stackDepth, ip, opName(op));
+
+    // Print operand details based on opcode type.
+    switch (op) {
+        case OP_CONST:
+            fprintf(stderr, " const=%u", operand);
+            if (operand < cu.constants.size() && cu.constants[operand]) {
+                auto * v = cu.constants[operand];
+                switch (v->type()) {
+                    case nInt:    fprintf(stderr, " (int %lld)", (long long)v->integer().value); break;
+                    case nFloat:  fprintf(stderr, " (float %g)", v->fpoint()); break;
+                    case nString: fprintf(stderr, " (str \"%.*s\")",
+                        (int)std::min((size_t)30, v->string_view().size()),
+                        v->string_view().data()); break;
+                    case nBool:   fprintf(stderr, " (%s)", v->boolean() ? "true" : "false"); break;
+                    case nNull: case nAttrs: case nList: case nFunction:
+                    case nExternal: case nPath: case nThunk: case nFailed:
+                        fprintf(stderr, " (%s)", showType(*v).c_str()); break;
+                }
+            }
+            break;
+        case OP_INT:
+            fprintf(stderr, " %u", operand);
+            break;
+        case OP_GET_LOCAL_0: case OP_GET_LOCAL_1:
+        case OP_GET_LOCAL_2: case OP_GET_LOCAL_3:
+            fprintf(stderr, " displ=%u", operand);
+            break;
+        case OP_GET_LOCAL:
+            fprintf(stderr, " level=%u displ=%u", unpackLevel(operand), unpackDispl(operand));
+            break;
+        case OP_GET_WITH:
+        case OP_EVAL_EXPR:
+            fprintf(stderr, " idx=%u", operand);
+            break;
+        case OP_ATTR_SELECT: case OP_HAS_ATTR:
+        case OP_SELECT_FORCE:
+            if (operand < cu.symbols.size())
+                fprintf(stderr, " sym=%s", state.symbols[cu.symbols[operand]].c_str());
+            break;
+        case OP_JUMP: case OP_JUMP_IF_FALSE:
+        case OP_JUMP_IF_TRUE: case OP_JUMP_IF_NOT_ATTRS:
+            fprintf(stderr, " %+d -> %u", decodeSigned(instr),
+                static_cast<uint32_t>(static_cast<int32_t>(ip) + 1 + decodeSigned(instr)));
+            break;
+        case OP_MAKE_THUNK:
+            if (operand < cu.thunks.size())
+                fprintf(stderr, " thunk=%u -> offset %u", operand, cu.thunks[operand].codeOffset);
+            break;
+        case OP_MAKE_CLOSURE:
+            if (operand < cu.lambdas.size())
+                fprintf(stderr, " lambda=%u -> offset %u", operand, cu.lambdas[operand].codeOffset);
+            break;
+        case OP_CALL: case OP_TAIL_CALL:
+            fprintf(stderr, " nArgs=%u", operand);
+            break;
+        case OP_ENTER_LET:
+            fprintf(stderr, " envSize=%u", operand);
+            break;
+        case OP_SET_ENV_SLOT: case OP_INHERIT_FROM_SET:
+            fprintf(stderr, " displ=%u", operand);
+            break;
+        case OP_ATTRS_INIT:
+            fprintf(stderr, " nAttrs=%u", operand);
+            break;
+        case OP_LIST_INIT:
+            fprintf(stderr, " size=%u", operand);
+            break;
+        case OP_STR_CONCAT_INIT:
+            fprintf(stderr, " nParts=%u forceStr=%u",
+                operand & ((1u<<23)-1), (operand >> 23) & 1);
+            break;
+        default:
+            if (operand) fprintf(stderr, " %u", operand);
+            break;
+    }
+
+    // Source position.
+    if (pos.line > 0) {
+        fprintf(stderr, "  ; ");
+        // Print just file:line:col, not the full Pos (which includes source).
+        auto * path = std::get_if<SourcePath>(&pos.origin);
+        if (path)
+            fprintf(stderr, "%s:%u:%u", path->to_string().c_str(), pos.line, pos.column);
+        else
+            fprintf(stderr, "«string»:%u:%u", pos.line, pos.column);
+    }
+
+    fprintf(stderr, "\n");
+}
 
 // ---------------------------------------------------------------------------
 // VMState
@@ -209,8 +360,22 @@ void vmExec(
 #define DISPATCH() continue
 #define CUR_INSTR (cu->code[ip - 1])
 
+    auto & tcfg = traceConfig();
+    auto & stepCounter = globalStepCounter();
+
     for (;;) {
         Instruction instr = cu->code[ip++];
+
+        // VM tracing: print instruction details if in the trace window.
+        if (tcfg.enabled) [[unlikely]] {
+            uint64_t step = stepCounter++;
+            if (step >= tcfg.from && step <= tcfg.to) {
+                traceInstruction(state, *cu, ip - 1, instr, step,
+                    static_cast<size_t>(vm.sp - vm.stack),
+                    vm.frames.size());
+            }
+        }
+
         switch (decodeOp(instr)) {
 
 #endif // NIX_VM_COMPUTED_GOTO

@@ -368,6 +368,9 @@ struct CompilationUnit : gc
     }
 };
 
+/// Return the mnemonic string for an opcode.
+const char * opName(uint8_t op);
+
 /// Disassemble a CompilationUnit into a human-readable string.
 /// If `state` is non-null, prints constant values and symbol names.
 std::string disassemble(const CompilationUnit & unit, const EvalState * state = nullptr);
