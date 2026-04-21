@@ -11,6 +11,7 @@ headers = [ config_pub_h ] + files(
   'attr-path.hh',
   'attr-set.hh',
   'bytecode.hh',
+  'bytecode-compiler.hh',
   'bytecode-thunk.hh',
   'vm.hh',
   'counter.hh',

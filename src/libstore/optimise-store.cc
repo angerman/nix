@@ -7,6 +7,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <regex>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>

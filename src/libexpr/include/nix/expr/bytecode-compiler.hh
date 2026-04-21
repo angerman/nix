@@ -1,0 +1,105 @@
+#pragma once
+/// @file
+/// Bytecode compiler: translates the Nix AST into a flat bytecode buffer.
+///
+/// The compiler performs a single post-order traversal of the AST after
+/// the existing bindVars() pass has resolved all variable references.
+///
+/// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
+/// SPDX-License-Identifier: Apache-2.0
+
+#include "nix/expr/bytecode.hh"
+
+namespace nix {
+
+struct Expr;
+struct ExprInt;
+struct ExprFloat;
+struct ExprString;
+struct ExprPath;
+struct ExprVar;
+struct ExprSelect;
+struct ExprOpHasAttr;
+struct ExprAttrs;
+struct ExprList;
+struct ExprLambda;
+struct ExprCall;
+struct ExprLet;
+struct ExprWith;
+struct ExprIf;
+struct ExprAssert;
+struct ExprOpNot;
+struct ExprOpEq;
+struct ExprOpNEq;
+struct ExprOpAnd;
+struct ExprOpOr;
+struct ExprOpImpl;
+struct ExprOpUpdate;
+struct ExprOpConcatLists;
+struct ExprConcatStrings;
+struct ExprPos;
+class EvalState;
+
+namespace bytecode {
+
+/// Compile a Nix expression (which must have already been through
+/// bindVars()) into a CompilationUnit.
+///
+/// The returned unit is GC-allocated and lives as long as any thunk
+/// or closure references it.
+CompilationUnit * compile(EvalState & state, Expr * expr);
+
+/// Compiler state.  One instance per compile() call.
+/// Not part of the public API -- exposed in the header only for testing.
+class Compiler
+{
+    EvalState & state;
+    CompilationUnit & unit;
+
+    /// Track whether we are in tail position (for future OP_TAIL_CALL).
+    /// Currently unused -- will be used when OP_TAIL_CALL is implemented.
+    [[maybe_unused]] bool inTailPosition = false;
+
+public:
+    Compiler(EvalState & state, CompilationUnit & unit)
+        : state(state)
+        , unit(unit)
+    {}
+
+    /// Compile an expression, leaving one Value* on the VM stack.
+    void compile(Expr * expr);
+
+private:
+    // -- Per-expression-type compilation methods --
+    void compileLiteral(ExprInt * e);
+    void compileLiteral(ExprFloat * e);
+    void compileLiteral(ExprString * e);
+    void compileLiteral(ExprPath * e);
+    void compileVar(ExprVar * e);
+    void compileSelect(ExprSelect * e);
+    void compileHasAttr(ExprOpHasAttr * e);
+    void compileAttrs(ExprAttrs * e);
+    void compileList(ExprList * e);
+    void compileLambda(ExprLambda * e);
+    void compileCall(ExprCall * e);
+    void compileLet(ExprLet * e);
+    void compileWith(ExprWith * e);
+    void compileIf(ExprIf * e);
+    void compileAssert(ExprAssert * e);
+    void compileNot(ExprOpNot * e);
+    void compileEq(ExprOpEq * e);
+    void compileNEq(ExprOpNEq * e);
+    void compileAnd(ExprOpAnd * e);
+    void compileOr(ExprOpOr * e);
+    void compileImpl(ExprOpImpl * e);
+    void compileUpdate(ExprOpUpdate * e);
+    void compileConcatLists(ExprOpConcatLists * e);
+    void compileConcatStrings(ExprConcatStrings * e);
+    void compilePos(ExprPos * e);
+
+    // -- Arithmetic binary op helper --
+    void compileBinOp(Expr * e1, Expr * e2, Op op, PosIdx pos);
+};
+
+} // namespace bytecode
+} // namespace nix

@@ -11,6 +11,7 @@
 #include "nix/expr/bytecode.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-error.hh"
+#include "nix/expr/print.hh"
 
 #include <cassert>
 
@@ -118,6 +119,7 @@ void vmExec(
 #define REGISTER_OP(op, label) \
         const_cast<const void *&>(dispatchTable[op]) = &&label
 
+        // Phase 0: infrastructure
         REGISTER_OP(OP_NOP,     op_nop);
         REGISTER_OP(OP_CONST,   op_const);
         REGISTER_OP(OP_TRUE,    op_true);
@@ -126,7 +128,28 @@ void vmExec(
         REGISTER_OP(OP_INT,     op_int);
         REGISTER_OP(OP_RETURN,  op_return);
 
-        // Phase 1+ opcodes will be registered here as they are implemented.
+        // Phase 1: variables, arithmetic, comparison, logic, control flow
+        REGISTER_OP(OP_GET_LOCAL_0, op_get_local_0);
+        REGISTER_OP(OP_GET_LOCAL_1, op_get_local_1);
+        REGISTER_OP(OP_GET_LOCAL_2, op_get_local_2);
+        REGISTER_OP(OP_GET_LOCAL_3, op_get_local_3);
+        REGISTER_OP(OP_GET_LOCAL,   op_get_local);
+        REGISTER_OP(OP_FORCE,       op_force);
+        REGISTER_OP(OP_JUMP,        op_jump);
+        REGISTER_OP(OP_JUMP_IF_FALSE, op_jump_if_false);
+        REGISTER_OP(OP_JUMP_IF_TRUE,  op_jump_if_true);
+        REGISTER_OP(OP_ADD,     op_add);
+        REGISTER_OP(OP_SUB,     op_sub);
+        REGISTER_OP(OP_MUL,     op_mul);
+        REGISTER_OP(OP_DIV,     op_div);
+        REGISTER_OP(OP_NEGATE,  op_negate);
+        REGISTER_OP(OP_EQ,      op_eq);
+        REGISTER_OP(OP_NEQ,     op_neq);
+        REGISTER_OP(OP_LESS_THAN, op_less_than);
+        REGISTER_OP(OP_NOT,     op_not);
+        REGISTER_OP(OP_ASSERT,  op_assert);
+        REGISTER_OP(OP_POP,     op_pop);
+        REGISTER_OP(OP_DUP,     op_dup);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -263,6 +286,447 @@ op_return:
         vm.push(retVal);
         DISPATCH();
     }
+
+    // ==================================================================
+    // Phase 1: Variables
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_local_0:
+#else
+    case OP_GET_LOCAL_0:
+#endif
+    {
+        uint32_t displ = decodeOperand(CUR_INSTR);
+        vm.push(curEnv->values[displ]);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_local_1:
+#else
+    case OP_GET_LOCAL_1:
+#endif
+    {
+        uint32_t displ = decodeOperand(CUR_INSTR);
+        vm.push(curEnv->up->values[displ]);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_local_2:
+#else
+    case OP_GET_LOCAL_2:
+#endif
+    {
+        uint32_t displ = decodeOperand(CUR_INSTR);
+        vm.push(curEnv->up->up->values[displ]);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_local_3:
+#else
+    case OP_GET_LOCAL_3:
+#endif
+    {
+        uint32_t displ = decodeOperand(CUR_INSTR);
+        vm.push(curEnv->up->up->up->values[displ]);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_local:
+#else
+    case OP_GET_LOCAL:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t level = unpackLevel(operand);
+        uint16_t displ = unpackDispl(operand);
+        Env * e = curEnv;
+        for (uint8_t l = level; l > 0; --l)
+            e = e->up;
+        vm.push(e->values[displ]);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 1: Force
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_force:
+#else
+    case OP_FORCE:
+#endif
+    {
+        Value * v = vm.top();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 1: Control flow
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_jump:
+#else
+    case OP_JUMP:
+#endif
+    {
+        int32_t offset = decodeSigned(CUR_INSTR);
+        ip = static_cast<uint32_t>(static_cast<int32_t>(ip) + offset);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_jump_if_false:
+#else
+    case OP_JUMP_IF_FALSE:
+#endif
+    {
+        int32_t offset = decodeSigned(CUR_INSTR);
+        Value * v = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+        if (v->type() != nBool)
+            state.error<TypeError>("expected a Boolean but found %1%: %2%",
+                showType(*v), ValuePrinter(state, *v, PrintOptions{}))
+                .atPos(pos).debugThrow();
+        if (!v->boolean())
+            ip = static_cast<uint32_t>(static_cast<int32_t>(ip) + offset);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_jump_if_true:
+#else
+    case OP_JUMP_IF_TRUE:
+#endif
+    {
+        int32_t offset = decodeSigned(CUR_INSTR);
+        Value * v = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+        if (v->type() != nBool)
+            state.error<TypeError>("expected a Boolean but found %1%: %2%",
+                showType(*v), ValuePrinter(state, *v, PrintOptions{}))
+                .atPos(pos).debugThrow();
+        if (v->boolean())
+            ip = static_cast<uint32_t>(static_cast<int32_t>(ip) + offset);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 1: Arithmetic
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_add:
+#else
+    case OP_ADD:
+#endif
+    {
+        Value * rhs = vm.pop();
+        Value * lhs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+
+        auto * result = state.allocValue();
+
+        if (lhs->type() == nFloat || rhs->type() == nFloat) {
+            NixFloat fl = lhs->type() == nFloat ? lhs->fpoint() : static_cast<NixFloat>(lhs->integer().value);
+            NixFloat fr = rhs->type() == nFloat ? rhs->fpoint() : static_cast<NixFloat>(rhs->integer().value);
+            result->mkFloat(fl + fr);
+        } else if (lhs->type() == nInt && rhs->type() == nInt) {
+            auto sum = lhs->integer() + rhs->integer();
+            if (auto v = sum.valueChecked())
+                result->mkInt(*v);
+            else
+                state.error<EvalError>("integer overflow in adding %1% + %2%",
+                    lhs->integer(), rhs->integer()).atPos(pos).debugThrow();
+        } else {
+            state.error<EvalError>("cannot add %1% to %2%",
+                showType(*lhs), showType(*rhs)).atPos(pos).debugThrow();
+        }
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_sub:
+#else
+    case OP_SUB:
+#endif
+    {
+        Value * rhs = vm.pop();
+        Value * lhs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+
+        auto * result = state.allocValue();
+
+        if (lhs->type() == nFloat || rhs->type() == nFloat) {
+            NixFloat fl = lhs->type() == nFloat ? lhs->fpoint() : static_cast<NixFloat>(lhs->integer().value);
+            NixFloat fr = rhs->type() == nFloat ? rhs->fpoint() : static_cast<NixFloat>(rhs->integer().value);
+            result->mkFloat(fl - fr);
+        } else if (lhs->type() == nInt && rhs->type() == nInt) {
+            auto diff = lhs->integer() - rhs->integer();
+            if (auto v = diff.valueChecked())
+                result->mkInt(*v);
+            else
+                state.error<EvalError>("integer overflow in subtraction %1% - %2%",
+                    lhs->integer(), rhs->integer()).atPos(pos).debugThrow();
+        } else {
+            state.error<EvalError>("cannot subtract %1% from %2%",
+                showType(*rhs), showType(*lhs)).atPos(pos).debugThrow();
+        }
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_mul:
+#else
+    case OP_MUL:
+#endif
+    {
+        Value * rhs = vm.pop();
+        Value * lhs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+
+        auto * result = state.allocValue();
+
+        if (lhs->type() == nFloat || rhs->type() == nFloat) {
+            NixFloat fl = lhs->type() == nFloat ? lhs->fpoint() : static_cast<NixFloat>(lhs->integer().value);
+            NixFloat fr = rhs->type() == nFloat ? rhs->fpoint() : static_cast<NixFloat>(rhs->integer().value);
+            result->mkFloat(fl * fr);
+        } else if (lhs->type() == nInt && rhs->type() == nInt) {
+            auto prod = lhs->integer() * rhs->integer();
+            if (auto v = prod.valueChecked())
+                result->mkInt(*v);
+            else
+                state.error<EvalError>("integer overflow in multiplication %1% * %2%",
+                    lhs->integer(), rhs->integer()).atPos(pos).debugThrow();
+        } else {
+            state.error<EvalError>("cannot multiply %1% and %2%",
+                showType(*lhs), showType(*rhs)).atPos(pos).debugThrow();
+        }
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_div:
+#else
+    case OP_DIV:
+#endif
+    {
+        Value * rhs = vm.pop();
+        Value * lhs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+
+        auto * result = state.allocValue();
+
+        if (lhs->type() == nInt && rhs->type() == nInt) {
+            if (rhs->integer().value == 0)
+                state.error<EvalError>("division by zero").atPos(pos).debugThrow();
+            auto quot = lhs->integer() / rhs->integer();
+            if (auto v = quot.valueChecked())
+                result->mkInt(*v);
+            else
+                state.error<EvalError>("integer overflow in division").atPos(pos).debugThrow();
+        } else {
+            NixFloat fl = lhs->type() == nFloat ? lhs->fpoint() : static_cast<NixFloat>(lhs->integer().value);
+            NixFloat fr = rhs->type() == nFloat ? rhs->fpoint() : static_cast<NixFloat>(rhs->integer().value);
+            if (fr == 0.0)
+                state.error<EvalError>("division by zero").atPos(pos).debugThrow();
+            result->mkFloat(fl / fr);
+        }
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_negate:
+#else
+    case OP_NEGATE:
+#endif
+    {
+        Value * v = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+
+        auto * result = state.allocValue();
+        if (v->type() == nInt) {
+            auto neg = NixInt(0) - v->integer();
+            if (auto val = neg.valueChecked())
+                result->mkInt(*val);
+            else
+                state.error<EvalError>("integer overflow in negation").atPos(pos).debugThrow();
+        } else if (v->type() == nFloat)
+            result->mkFloat(-v->fpoint());
+        else
+            state.error<EvalError>("cannot negate %1%", showType(*v)).atPos(pos).debugThrow();
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 1: Comparison and logic
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_eq:
+#else
+    case OP_EQ:
+#endif
+    {
+        Value * rhs = vm.pop();
+        Value * lhs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        auto * result = state.allocValue();
+        result->mkBool(state.eqValues(*lhs, *rhs, pos, "while comparing two values"));
+        vm.push(result);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_neq:
+#else
+    case OP_NEQ:
+#endif
+    {
+        Value * rhs = vm.pop();
+        Value * lhs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        auto * result = state.allocValue();
+        result->mkBool(!state.eqValues(*lhs, *rhs, pos, "while comparing two values"));
+        vm.push(result);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_less_than:
+#else
+    case OP_LESS_THAN:
+#endif
+    {
+        Value * rhs = vm.pop();
+        Value * lhs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+
+        bool cmpResult;
+        if (lhs->type() == nFloat && rhs->type() == nInt)
+            cmpResult = lhs->fpoint() < rhs->integer().value;
+        else if (lhs->type() == nInt && rhs->type() == nFloat)
+            cmpResult = lhs->integer().value < rhs->fpoint();
+        else if (lhs->type() != rhs->type())
+            state.error<EvalError>("cannot compare %1% with %2%",
+                showType(*lhs), showType(*rhs)).atPos(pos).debugThrow();
+        else if (lhs->type() == nInt)
+            cmpResult = lhs->integer() < rhs->integer();
+        else if (lhs->type() == nFloat)
+            cmpResult = lhs->fpoint() < rhs->fpoint();
+        else if (lhs->type() == nString)
+            cmpResult = lhs->string_view() < rhs->string_view();
+        else if (lhs->type() == nPath)
+            cmpResult = lhs->path() < rhs->path();
+        else
+            state.error<EvalError>("cannot compare %1% with %2%",
+                showType(*lhs), showType(*rhs)).atPos(pos).debugThrow();
+
+        auto * result = state.allocValue();
+        result->mkBool(cmpResult);
+        vm.push(result);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_not:
+#else
+    case OP_NOT:
+#endif
+    {
+        Value * v = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*v, pos);
+        if (v->type() != nBool)
+            state.error<TypeError>("expected a Boolean but found %1%: %2%",
+                showType(*v), ValuePrinter(state, *v, PrintOptions{}))
+                .atPos(pos).debugThrow();
+        auto * result = state.allocValue();
+        result->mkBool(!v->boolean());
+        vm.push(result);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 1: Assert
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_assert:
+#else
+    case OP_ASSERT:
+#endif
+    {
+        Value * cond = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*cond, pos);
+        if (cond->type() != nBool)
+            state.error<TypeError>("expected a Boolean but found %1%: %2%",
+                showType(*cond), ValuePrinter(state, *cond, PrintOptions{}))
+                .atPos(pos).debugThrow();
+        if (!cond->boolean())
+            state.error<AssertionError>("assertion '%1%' failed", "bytecoded assertion")
+                .atPos(pos).debugThrow();
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 1: Stack management
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_pop:
+#else
+    case OP_POP:
+#endif
+    {
+        vm.pop();
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_dup:
+#else
+    case OP_DUP:
+#endif
+    {
+        vm.push(vm.top());
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Unhandled opcode (must be last)
+    // ==================================================================
 
 #ifdef NIX_VM_COMPUTED_GOTO
 op_unhandled:
