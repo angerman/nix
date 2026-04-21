@@ -589,29 +589,53 @@ void Compiler::compileSelect(ExprSelect * e)
 
 void Compiler::compileHasAttr(ExprOpHasAttr * e)
 {
-    // Fall back for multi-level or dynamic paths.
+    // Fall back only for dynamic attr names.
     bool hasDynamic = false;
     for (auto & attr : e->attrPath)
         if (attr.expr) { hasDynamic = true; break; }
 
-    if (hasDynamic || e->attrPath.size() > 1) {
+    if (hasDynamic) {
         unit.emitPos(e->getPos());
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
     }
 
-    // Single-level: { ... } ? attrName
     compile(e->e);
-    uint32_t symIdx = unit.addSymbol(e->attrPath[0].symbol);
-    unit.emitPos(e->getPos());
-    unit.emit(OP_FORCE);
-    // If not attrset, result is false.
-    uint32_t jumpNotAttrs = unit.emit(OP_JUMP_IF_NOT_ATTRS, 0);
-    unit.emit(OP_HAS_ATTR, symIdx);
+
+    // For each level: FORCE, check if attrs, check if has attr.
+    // If any check fails -> false.
+    // After all levels -> true.
+    std::vector<uint32_t> falseJumps;
+
+    for (size_t i = 0; i < e->attrPath.size(); i++) {
+        uint32_t symIdx = unit.addSymbol(e->attrPath[i].symbol);
+        bool isLast = (i == e->attrPath.size() - 1);
+
+        unit.emitPos(e->getPos());
+        unit.emit(OP_FORCE);
+        falseJumps.push_back(unit.emit(OP_JUMP_IF_NOT_ATTRS, 0));
+
+        if (isLast) {
+            // Last level: just check if attr exists
+            unit.emit(OP_HAS_ATTR, symIdx);
+        } else {
+            // Intermediate level: check + select for next level
+            unit.emit(OP_DUP);
+            unit.emit(OP_HAS_ATTR, symIdx);
+            falseJumps.push_back(unit.emit(OP_JUMP_IF_FALSE, 0));
+            unit.emit(OP_ATTR_SELECT, symIdx);
+        }
+    }
+
+    // Success path continues here (result is bool from last HAS_ATTR).
     uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
-    unit.patchJump(jumpNotAttrs);
-    unit.emit(OP_POP);
+
+    // False path: all jumps land here.
+    for (auto j : falseJumps)
+        unit.patchJump(j);
+    unit.emit(OP_POP);  // discard whatever was on stack
     unit.emit(OP_FALSE);
+
     unit.patchJump(jumpEnd);
 }
 
