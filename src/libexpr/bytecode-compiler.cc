@@ -306,22 +306,31 @@ void Compiler::compilePos(ExprPos * e)
 
 void Compiler::compileLet(ExprLet * e)
 {
-    // let { a = e1; b = e2; } in body
-    //
-    // Compiled as:
-    //   OP_ENTER_LET envSize    -- allocate Env, enter scope
+    // Fall back to tree-walking for let-bindings with inherit(expr).
+    // These require a separate inheritEnv that our bytecoded path
+    // doesn't create. The ExprInheritFrom nodes have displacements
+    // into the inheritEnv, not the let env.
+    bool hasInheritFrom = e->attrs->inheritFromExprs
+        && !e->attrs->inheritFromExprs->empty();
+
+    if (hasInheritFrom) {
+        unit.emitPos(e->attrs->pos);
+        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        return;
+    }
+
+    // Simple let without inherit(expr):
+    //   OP_ENTER_LET envSize
     //   <for each binding>
     //     <compile thunk or eager value>
-    //     OP_SET_ENV_SLOT displ  -- store in env slot
+    //     OP_SET_ENV_SLOT displ
     //   <compile body>
-    //   OP_LEAVE_SCOPE           -- restore previous env
+    //   OP_LEAVE_SCOPE
 
     uint32_t envSize = static_cast<uint32_t>(e->attrs->attrs->size());
     unit.emitPos(e->attrs->pos);
     unit.emit(OP_ENTER_LET, envSize);
 
-    // Compile each binding.  Let-bindings are mutually recursive (like rec),
-    // so all bindings are thunks that capture the new env.
     Displacement displ = 0;
     for (auto & [name, def] : *e->attrs->attrs) {
         compileAsThunkOrEager(def.e, def.pos);
@@ -329,7 +338,6 @@ void Compiler::compileLet(ExprLet * e)
         displ++;
     }
 
-    // Compile the body in the new scope.
     compile(e->body);
 
     unit.emit(OP_LEAVE_SCOPE);

@@ -528,6 +528,16 @@ TEST_F(BytecodeVMTest, regression_rec_fixpoint) {
     assertDualMode("let makeExtensible = f: let self = f self; in self; in (makeExtensible (self: { x = 1; y = self.x + 1; })).y");
 }
 
+// Bug: compileLet didn't handle inherit(expr) bindings. These need a
+// separate inheritEnv (created by buildInheritFromEnv). The ExprInheritFrom
+// nodes have displacements into inheritEnv, but our bytecoded path used the
+// let env. This caused infinite recursion in lib/default.nix's
+// `inherit (import ./fixed-points.nix { inherit lib; }) makeExtensible`.
+// Fix: fall back to OP_EVAL_EXPR for let with inherit(expr).
+TEST_F(BytecodeVMTest, regression_inherit_from_makeExtensible) {
+    assertDualMode("let makeExtensible = f: let self = f self; in self; inherit (makeExtensible (self: { x = 1; })) x; in x");
+}
+
 TEST_F(BytecodeVMTest, regression_inherit_from_import) {
     // Pattern from lib/default.nix: inherit (import ./file { inherit lib; }) name;
     // Simplified: recursive let with inherit from a function call
