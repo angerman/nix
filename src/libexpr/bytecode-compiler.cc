@@ -233,9 +233,10 @@ void Compiler::compileVar(ExprVar * e)
     unit.emitPos(e->pos);
 
     if (e->fromWith) {
-        // Dynamic with-scope lookup.
-        uint32_t symIdx = unit.addSymbol(e->name);
-        unit.emit(OP_GET_WITH, symIdx);
+        // Dynamic with-scope lookup. Store the ExprVar* in the expr pool
+        // so the VM handler can access the full with-chain metadata.
+        uint32_t exprIdx = unit.addExpr(e);
+        unit.emit(OP_GET_WITH, exprIdx);
         return;
     }
 
@@ -630,12 +631,17 @@ void Compiler::compileAttrs(ExprAttrs * e)
 
 void Compiler::compileWith(ExprWith * e)
 {
-    // `with` requires OP_GET_WITH for variable resolution in the body.
-    // OP_GET_WITH needs the full with-chain walk implementation.
-    // Fall back to tree-walking for now.
-    // TODO: implement OP_GET_WITH + OP_PUSH_WITH properly.
+    // with attrs; body
+    //
+    // OP_PUSH_WITH creates a 1-slot env with the attrs thunk.
+    // Variables in the body that come from `with` scope use OP_GET_WITH
+    // which walks the env chain to find the with-env and looks up the
+    // attribute dynamically.
+    compileAsThunkOrEager(e->attrs, e->pos);
     unit.emitPos(e->pos);
-    unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+    unit.emit(OP_PUSH_WITH);
+    compile(e->body);
+    unit.emit(OP_LEAVE_SCOPE);
 }
 
 void Compiler::compileUpdate(ExprOpUpdate * e)

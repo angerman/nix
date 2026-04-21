@@ -160,6 +160,7 @@ void vmExec(
         REGISTER_OP(OP_DUP,     op_dup);
 
         // Phase 3: select, attrs, lists, with
+        REGISTER_OP(OP_GET_WITH,         op_get_with);
         REGISTER_OP(OP_SELECT_FORCE,     op_select_force);
         REGISTER_OP(OP_ATTR_SELECT,      op_attr_select);
         REGISTER_OP(OP_HAS_ATTR,         op_has_attr);
@@ -392,6 +393,48 @@ op_get_local:
         for (uint8_t l = level; l > 0; --l)
             e = e->up;
         vm.push(e->values[displ]);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 3+: With-scope variable lookup
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_with:
+#else
+    case OP_GET_WITH:
+#endif
+    {
+        // The operand is an index into the expr pool, pointing to the
+        // ExprVar that has fromWith, level, name, etc.
+        uint32_t exprIdx = decodeOperand(CUR_INSTR);
+        auto * var = static_cast<ExprVar *>(cu->exprPool[exprIdx]);
+
+        // Walk up the env chain to the first with-scope.
+        Env * e = curEnv;
+        for (auto l = var->level; l; --l)
+            e = e->up;
+
+        // Walk the with-chain looking for the variable.
+        auto * fromWith = var->fromWith;
+        while (true) {
+            PosIdx withPos = fromWith->pos;
+            state.forceAttrs(*e->values[0], withPos,
+                "while evaluating the first subexpression of a with expression");
+            if (auto j = e->values[0]->attrs()->get(var->name)) {
+                vm.push(j->value);
+                break;
+            }
+            if (!fromWith->parentWith)
+                state.error<UndefinedVarError>(
+                    "undefined variable '%1%'", state.symbols[var->name])
+                    .atPos(var->pos)
+                    .debugThrow();
+            for (size_t l = fromWith->prevWith; l; --l)
+                e = e->up;
+            fromWith = fromWith->parentWith;
+        }
         DISPATCH();
     }
 
