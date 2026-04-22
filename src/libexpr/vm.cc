@@ -477,14 +477,31 @@ void vmExec(
         tableInitialized = true;
     }
 
+    auto & tcfg = traceConfig();
+    auto & stepCounter = globalStepCounter();
+
+    // Profiling and tracing hook -- called before every instruction.
+    // Compiled as a single branch test (tcfg.enabled) for zero-cost
+    // when tracing is off.  Profiling counters are always incremented.
+#define VM_HOOK() do {                                         \
+        vm.nrInstructions++;                                   \
+        if (tcfg.enabled) [[unlikely]] {                       \
+            uint64_t step = stepCounter++;                     \
+            if (step >= tcfg.from && step <= tcfg.to)          \
+                traceInstruction(state, *cu, ip - 1,           \
+                    cu->code[ip - 1], step,                    \
+                    static_cast<size_t>(vm.sp - vm.stack),     \
+                    vm.frames.size());                         \
+        }                                                      \
+    } while (0)
+
     // Computed-goto dispatch macro.
 #define DISPATCH() do {                              \
         Instruction _instr = cu->code[ip++];         \
+        VM_HOOK();                                   \
         goto *dispatchTable[decodeOp(_instr)];       \
     } while (0)
 
-    // We need the current instruction available in each handler.
-    // Re-read it (the compiler will CSE this with the dispatch).
 #define CUR_INSTR (cu->code[ip - 1])
 
     DISPATCH();
@@ -500,16 +517,7 @@ void vmExec(
     for (;;) {
         Instruction instr = cu->code[ip++];
 
-        // Profiling: count instructions.
         vm.nrInstructions++;
-        {
-            size_t sd = static_cast<size_t>(vm.sp - vm.stack);
-            if (sd > vm.peakStackDepth) vm.peakStackDepth = sd;
-            size_t fd = vm.frames.size();
-            if (fd > vm.peakFrameDepth) vm.peakFrameDepth = fd;
-        }
-
-        // VM tracing: print instruction details if in the trace window.
         if (tcfg.enabled) [[unlikely]] {
             uint64_t step = stepCounter++;
             if (step >= tcfg.from && step <= tcfg.to) {
