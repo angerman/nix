@@ -1187,7 +1187,18 @@ void EvalState::eval(Expr * e, Value & v)
     // via the VM instead of tree-walking.
     static bool useBytecode = getEnv("NIX_EVAL_BYTECODE").value_or("") == "1";
     if (useBytecode) {
-        auto * unit = bytecode::compile(*this, e);
+        // Cache CompilationUnits keyed by Expr* to avoid recompilation.
+        // The Expr* is stable (lives in BumpMemoryResource for the
+        // entire evaluation lifetime of this EvalState).
+        auto it = bytecodeCache.find(e);
+        bytecode::CompilationUnit * unit;
+        if (it != bytecodeCache.end()) {
+            unit = it->second;
+        } else {
+            unit = bytecode::compile(*this, e);
+            bytecodeCache[e] = unit;
+        }
+
         bytecode::vmExec(*this, *unit, 0, baseEnv, v);
         return;
     }

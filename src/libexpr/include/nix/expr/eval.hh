@@ -28,6 +28,7 @@
 #include <map>
 #include <optional>
 #include <functional>
+#include <unordered_map>
 #include <span>
 
 namespace nix {
@@ -72,6 +73,7 @@ struct MountedSourceAccessor;
 
 namespace bytecode {
 struct VMState;
+struct CompilationUnit;
 } // namespace bytecode
 
 namespace eval_cache {
@@ -393,6 +395,10 @@ public:
     /// Holds the value stack and call frame stack.  Declared as unique_ptr
     /// to avoid pulling in vm.hh here.
     std::unique_ptr<bytecode::VMState> vmState;
+
+    /// Cache of compiled bytecode keyed by Expr*.
+    /// Avoids recompiling the same expression on repeated eval() calls.
+    std::unordered_map<Expr *, bytecode::CompilationUnit *> bytecodeCache;
 
     /**
      * If set, force copying files to the Nix store even if they

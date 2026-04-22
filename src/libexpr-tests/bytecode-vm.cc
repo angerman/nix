@@ -30,13 +30,15 @@ namespace nix {
 class BytecodeVMTest : public LibExprTest
 {
 protected:
-    /// Evaluate an expression via the tree-walking interpreter (baseline).
+    /// Evaluate an expression via the tree-walking interpreter (oracle).
+    /// Always uses tree-walking regardless of NIX_EVAL_BYTECODE setting.
     Value evalTreeWalk(const std::string & input)
     {
         Value v;
         Expr * e = state.parseExprFromString(input, state.rootPath(CanonPath::root));
         assert(e);
-        state.eval(e, v);
+        // Call the tree-walker directly, bypassing the bytecode path.
+        e->eval(state, state.baseEnv, v);
         state.forceValue(v, noPos);
         return v;
     }
