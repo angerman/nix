@@ -1,10 +1,20 @@
 # Bytecode VM TODO List
 
 ## Current Status
-- 27 commits, 139 unit tests, ~6,000 LOC
-- 591/591 existing nix-expr-tests pass with NIX_EVAL_BYTECODE=1 (100%)
+- 34 commits, 143 unit tests, ~6,200 LOC
+- 595/595 existing nix-expr-tests pass with NIX_EVAL_BYTECODE=1 (100%)
 - nixpkgs hello evaluates correctly
 - cardano-node (haskell.nix) evaluates correctly
+- 113 additional pattern comparisons: 0 mismatches
+- CompilationUnit caching implemented (per-EvalState Expr* -> Unit* map)
+- Tree-walker always available as ground-truth oracle
+
+## Performance Baseline (debug build -O0)
+- nixpkgs hello: bytecoded 14% slower (3.18s vs 2.78s CPU)
+  - Overhead from compilation of imported files
+  - Fib(30): identical (0.23s both paths)
+  - Expected to improve with -O2 and bytecoded thunk/lambda bodies
+- VM stats: ~10K instructions per eval, ~0% OP_EVAL_EXPR fallback
 
 ## Remaining OP_EVAL_EXPR Fallbacks
 
