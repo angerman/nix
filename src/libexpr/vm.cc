@@ -234,10 +234,10 @@ void VMState::grow()
 // destructors that break computed-goto dispatch)
 // ---------------------------------------------------------------------------
 
-/// Bind a single argument to a lambda, creating the environment.
-/// Returns the new Env if binding succeeds, or nullptr if the lambda
-/// is not bytecoded (caller should fall back to callFunction).
-/// This replicates callFunction's lambda argument binding logic.
+/// Create an env for a lambda call and store the raw argument.
+/// The lambda body's bytecoded prologue handles formal parameter
+/// matching (unpacking the attrset, checking required args, defaults).
+/// Returns nullptr if the lambda is not bytecoded.
 [[gnu::noinline]]
 static Env * vmBindLambdaArg(
     EvalState & state, Value & fun, Value * arg, PosIdx callPos)
@@ -246,98 +246,31 @@ static Env * vmBindLambdaArg(
 
     ExprLambda & lambda = *fun.lambda().fun;
 
-    // Check if this lambda has a bytecoded body registered in the
-    // side-table (from OP_MAKE_CLOSURE).
-    //
-    // DISABLED: The formals matching inside vmBindLambdaArg calls
-    // forceAttrs, which forces thunks, which enters vmExec, which
-    // may OP_CALL_1 trampoline again -- causing C-stack overflow
-    // for deep nixpkgs formal chains. The fix requires making
-    // argument binding happen as bytecoded instructions INSIDE
-    // the VM loop, not as a C++ helper called from OP_CALL_1.
-    //
-    // For now, fall through to callFunction for ALL lambda calls.
-    return nullptr;
-
+    // Check if this lambda has a bytecoded body.
     auto it = state.lambdaBodyCache.find(&lambda);
     if (it == state.lambdaBodyCache.end())
         return nullptr;
 
+    // Allocate env with the SAME layout as the tree-walker's callFunction.
+    // This ensures the body code's variable displacements (from bindVars)
+    // are correct.
+    auto formals = lambda.getFormals();
     auto size = (!lambda.arg ? 0 : 1)
-        + (lambda.getFormals() ? lambda.getFormals()->formals.size() : 0);
+        + (formals ? formals->formals.size() : 0);
+    if (!formals) size = 1; // simple lambda: 1 slot
     Env & env2 = state.mem.allocEnv(size);
     env2.up = fun.lambda().env;
 
-    Displacement displ = 0;
-
-    if (auto formals = lambda.getFormals()) {
-        try {
-            state.forceAttrs(*arg, lambda.pos,
-                "while evaluating the value passed for the lambda argument");
-        } catch (Error & e) {
-            if (callPos)
-                e.addTrace(state.positions[callPos], "from call site");
-            throw;
-        }
-
-        if (lambda.arg)
-            env2.values[displ++] = arg;
-
-        size_t attrsUsed = 0;
-        for (auto & i : formals->formals) {
-            auto j = arg->attrs()->get(i.name);
-            if (!j) {
-                if (!i.def) {
-                    state.error<TypeError>(
-                        "function '%1%' called without required argument '%2%'",
-                        (lambda.name ? std::string(state.symbols[lambda.name]) : "anonymous lambda"),
-                        state.symbols[i.name])
-                        .atPos(lambda.pos)
-                        .withTrace(callPos, "from call site")
-                        .withFrame(*fun.lambda().env, lambda)
-                        .debugThrow();
-                }
-                // Default arg: maybeThunk returns the value directly for
-                // trivial defaults (constants, vars), or a thunk with
-                // the original Expr* for complex ones. Complex defaults
-                // are rare; the small amount of tree-walking is acceptable.
-                env2.values[displ++] = i.def->maybeThunk(state, env2);
-            } else {
-                attrsUsed++;
-                env2.values[displ++] = j->value;
-            }
-        }
-
-        if (!formals->ellipsis && attrsUsed != arg->attrs()->size()) {
-            for (auto & i : *arg->attrs())
-                if (!formals->has(i.name)) {
-                    StringSet formalNames;
-                    for (auto & formal : formals->formals)
-                        formalNames.insert(std::string(state.symbols[formal.name]));
-                    auto suggestions = Suggestions::bestMatches(formalNames, state.symbols[i.name]);
-                    state.error<TypeError>(
-                        "function '%1%' called with unexpected argument '%2%'",
-                        (lambda.name ? std::string(state.symbols[lambda.name]) : "anonymous lambda"),
-                        state.symbols[i.name])
-                        .atPos(lambda.pos)
-                        .withTrace(callPos, "from call site")
-                        .withSuggestions(suggestions)
-                        .withFrame(*fun.lambda().env, lambda)
-                        .debugThrow();
-                }
-            // Should never reach here -- the loop above should have found
-            // an unexpected attr and thrown. If we get here, something is
-            // wrong with the formals checking logic.
-            state.error<TypeError>(
-                "bytecode VM: unreachable in formals check (attrsUsed=%d, argsSize=%d)",
-                attrsUsed, arg->attrs()->size())
-                .atPos(lambda.pos).debugThrow();
-        }
+    if (!formals) {
+        // Simple lambda (x: body): store arg in slot 0. Body can run immediately.
+        env2.values[0] = arg;
     } else {
-        env2.values[displ++] = arg;
+        // Formals lambda ({ x, y }: body): store @-pattern if present.
+        // The bytecoded prologue handles formal unpacking.
+        // We push the raw arg onto the VALUE STACK so the prologue can pop it.
+        if (lambda.arg)
+            env2.values[0] = arg; // @-pattern goes in slot 0
     }
-
-    // TODO: state.nrFunctionCalls++ (private, needs friend or public accessor)
 
     return &env2;
 }
@@ -722,6 +655,7 @@ op_return:
 
         // Write the result into the caller's result slot.
         auto & frame = vm.frames.back();
+        bool wasThunkForce = frame.isThunkForce;
         *frame.resultSlot = *retVal;
 
         // Restore stack to frame entry point.
@@ -729,7 +663,6 @@ op_return:
         vm.frames.pop_back();
 
         if (vm.frames.size() <= entryFrameDepth) {
-            // All frames owned by THIS vmExec invocation are exhausted.
             return;
         }
 
@@ -739,7 +672,12 @@ op_return:
         ip     = caller.ip;
         curEnv = caller.env;
 
-        vm.push(retVal);
+        if (!wasThunkForce) {
+            // Normal call return: push result for caller.
+            vm.push(retVal);
+        }
+        // Thunk force: the caller's TOS is the Value* that was forced
+        // in-place via resultSlot. No push needed.
         DISPATCH();
     }
 
@@ -865,11 +803,44 @@ op_force:
     {
         Value * v = vm.top();
         PosIdx pos = cu->posForOffset(ip - 1);
-        // All thunks use original Expr* (not ExprBytecodeThunk) for
-        // isTrivial() compatibility, so forcing always goes through
-        // the tree-walker's forceValue.  The entryFrameDepth mechanism
-        // in vmExec handles re-entrancy correctly if forceValue triggers
-        // a nested vmExec via ExprBytecodeThunk::eval.
+
+        // Inline trampoline for bytecoded thunks: force within the VM
+        // loop by pushing a CallFrame, avoiding C-stack growth.
+        if (v->isThunk()) {
+            Env * thunkEnv = v->thunk().env;
+            Expr * thunkExpr = v->thunk().expr;
+
+            if (thunkEnv && dynamic_cast<ExprBytecodeThunk *>(thunkExpr)) {
+                auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                uint32_t thunkOffset = bcThunk->unit->thunks[bcThunk->thunkIdx].codeOffset;
+
+                // Mark as blackhole before evaluating.
+                v->mkBlackhole();
+
+                // Save current frame state.
+                vm.frames.back().ip = ip;
+                vm.frames.back().env = curEnv;
+
+                // Push a new call frame for the thunk body.
+                vm.frames.push_back(CallFrame{
+                    .unit = bcThunk->unit,
+                    .ip = thunkOffset,
+                    .env = thunkEnv,
+                    .stackBase = vm.sp,
+                    .resultSlot = v,  // Write result back into the thunk Value
+                    .callPos = pos,
+                    .isThunkForce = true,  // OP_RETURN doesn't push result
+                });
+
+                // Switch to the thunk's code.
+                cu = bcThunk->unit;
+                ip = thunkOffset;
+                curEnv = thunkEnv;
+                DISPATCH();
+            }
+        }
+
+        // Fallback for non-bytecoded thunks, apps, non-thunks.
         state.forceValue(*v, pos);
         DISPATCH();
     }
@@ -1373,6 +1344,12 @@ op_call_1:
                 .resultSlot = result,
                 .callPos = pos,
             });
+
+            // For formals lambdas, push the raw arg onto the stack
+            // so the bytecoded prologue can pop it for unpacking.
+            if (fun->lambda().fun->getFormals()) {
+                vm.push(arg);
+            }
 
             // Switch to the body's code.
             cu = &bodyUnit;

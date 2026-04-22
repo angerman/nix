@@ -37,6 +37,7 @@ struct CallFrame
     Value ** stackBase;           ///< Base of this frame's portion of the value stack.
     Value * resultSlot;           ///< Where to write the return value (GC-allocated).
     PosIdx callPos;               ///< Source position of the call site (for stack traces).
+    bool isThunkForce = false;    ///< If true, OP_RETURN doesn't push result (thunk was updated in-place).
 };
 
 /// Initial capacity of the value stack (in Value* slots).
