@@ -246,8 +246,21 @@ static Env * vmBindLambdaArg(
 
     ExprLambda & lambda = *fun.lambda().fun;
 
-    // Check if the body is bytecoded (created by our VM's OP_MAKE_CLOSURE).
-    if (!dynamic_cast<ExprBytecodeThunk *>(lambda.body))
+    // Check if this lambda has a bytecoded body registered in the
+    // side-table (from OP_MAKE_CLOSURE).
+    //
+    // DISABLED: The formals matching inside vmBindLambdaArg calls
+    // forceAttrs, which forces thunks, which enters vmExec, which
+    // may OP_CALL_1 trampoline again -- causing C-stack overflow
+    // for deep nixpkgs formal chains. The fix requires making
+    // argument binding happen as bytecoded instructions INSIDE
+    // the VM loop, not as a C++ helper called from OP_CALL_1.
+    //
+    // For now, fall through to callFunction for ALL lambda calls.
+    return nullptr;
+
+    auto it = state.lambdaBodyCache.find(&lambda);
+    if (it == state.lambdaBodyCache.end())
         return nullptr;
 
     auto size = (!lambda.arg ? 0 : 1)
@@ -312,7 +325,13 @@ static Env * vmBindLambdaArg(
                         .withFrame(*fun.lambda().env, lambda)
                         .debugThrow();
                 }
-            unreachable();
+            // Should never reach here -- the loop above should have found
+            // an unexpected attr and thrown. If we get here, something is
+            // wrong with the formals checking logic.
+            state.error<TypeError>(
+                "bytecode VM: unreachable in formals check (attrsUsed=%d, argsSize=%d)",
+                attrsUsed, arg->attrs()->size())
+                .atPos(lambda.pos).debugThrow();
         }
     } else {
         env2.values[displ++] = arg;
@@ -1302,6 +1321,13 @@ op_make_closure:
         // handle the majority of forced evaluations.
         ExprLambda * originalLambda = desc.sourceExpr;
 
+        // Register this lambda's bytecoded body in the side-table,
+        // keyed by ExprLambda* (unique per parse, stable in BumpMemoryResource).
+        // The OP_CALL_1 trampoline checks this table to decide whether
+        // to bytecode the body or fall back to callFunction.
+        state.lambdaBodyCache[originalLambda] = {
+            const_cast<CompilationUnit *>(cu), desc.bodyThunkIdx};
+
         auto * closureVal = state.allocValue();
         closureVal->mkLambda(curEnv, originalLambda);
 
@@ -1328,9 +1354,10 @@ op_call_1:
         // This avoids going through callFunction and stays in the VM loop.
         if (Env * env2 = vmBindLambdaArg(state, *fun, arg, pos)) {
             vm.nrBytecodeCallTrampoline++;
-            auto * bcBody = static_cast<ExprBytecodeThunk *>(fun->lambda().fun->body);
-            auto & bodyUnit = *bcBody->unit;
-            uint32_t bodyOffset = bodyUnit.thunks[bcBody->thunkIdx].codeOffset;
+            // Look up the bytecoded body from the side-table.
+            auto & bodyInfo = state.lambdaBodyCache[fun->lambda().fun];
+            auto & bodyUnit = *bodyInfo.unit;
+            uint32_t bodyOffset = bodyUnit.thunks[bodyInfo.thunkIdx].codeOffset;
 
             // Save current frame state.
             vm.frames.back().ip = ip;

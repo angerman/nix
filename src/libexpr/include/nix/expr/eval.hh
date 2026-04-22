@@ -399,14 +399,14 @@ public:
     /// Cache of compiled bytecode keyed by Expr*.
     std::unordered_map<Expr *, bytecode::CompilationUnit *> bytecodeCache;
 
-    /// Mapping from ExprLambda body Expr* to bytecoded thunk info.
-    /// Used by OP_CALL_1 trampoline to dispatch lambda body evaluation
-    /// to the VM instead of tree-walking.
+    /// Mapping from ExprLambda* to bytecoded body info.
+    /// Registered by OP_MAKE_CLOSURE; looked up by OP_CALL_1 trampoline.
+    /// Key: the ExprLambda* stored in the closure (unique per parse).
     struct BytecodedBody {
         bytecode::CompilationUnit * unit;
         uint32_t thunkIdx;
     };
-    std::unordered_map<Expr *, BytecodedBody> lambdaBodyCache;
+    std::unordered_map<ExprLambda *, BytecodedBody> lambdaBodyCache;
 
     /// Bytecode phase timing counters (microseconds).
     uint64_t bytecodeCompileTimeUs = 0;
