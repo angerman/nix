@@ -101,6 +101,8 @@ struct VMState
     uint64_t nrCallOps = 0;            ///< OP_CALL + OP_CALL_1 invocations
     uint64_t peakStackDepth = 0;       ///< Maximum stack depth observed
     uint64_t peakFrameDepth = 0;       ///< Maximum call frame depth observed
+    uint64_t nrBytecodeThunkForces = 0; ///< Thunks forced via ExprBytecodeThunk → vmExec
+    uint64_t nrBytecodeCallTrampoline = 0; ///< Lambda calls via OP_CALL_1 trampoline
 
 private:
     void grow();

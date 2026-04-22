@@ -18,6 +18,9 @@ namespace nix {
 void ExprBytecodeThunk::eval(EvalState & state, Env & env, Value & v)
 {
     uint32_t offset = unit->thunks[thunkIdx].codeOffset;
+    // Track bytecoded thunk forcings for profiling.
+    if (state.vmState)
+        state.vmState->nrBytecodeThunkForces++;
     bytecode::vmExec(state, *unit, offset, env, v);
 }
 

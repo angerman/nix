@@ -43,6 +43,8 @@ static void printVMStats(const VMState & vm) {
     fprintf(stderr, "  OP_EVAL_EXPR fallbacks: %llu (%.1f%%)\n",
         (unsigned long long)vm.nrEvalExprFallbacks,
         vm.nrInstructions ? 100.0 * vm.nrEvalExprFallbacks / vm.nrInstructions : 0.0);
+    fprintf(stderr, "  Bytecoded thunk forces: %llu\n", (unsigned long long)vm.nrBytecodeThunkForces);
+    fprintf(stderr, "  Bytecoded call trampolines: %llu\n", (unsigned long long)vm.nrBytecodeCallTrampoline);
     fprintf(stderr, "  Peak stack depth: %llu\n", (unsigned long long)vm.peakStackDepth);
     fprintf(stderr, "  Peak frame depth: %llu\n", (unsigned long long)vm.peakFrameDepth);
     fprintf(stderr, "================================\n");
@@ -244,7 +246,7 @@ static Env * vmBindLambdaArg(
 
     ExprLambda & lambda = *fun.lambda().fun;
 
-    // Check if the body is bytecoded.
+    // Check if the body is bytecoded (created by our VM's OP_MAKE_CLOSURE).
     if (!dynamic_cast<ExprBytecodeThunk *>(lambda.body))
         return nullptr;
 
@@ -282,6 +284,10 @@ static Env * vmBindLambdaArg(
                         .withFrame(*fun.lambda().env, lambda)
                         .debugThrow();
                 }
+                // Default arg: maybeThunk returns the value directly for
+                // trivial defaults (constants, vars), or a thunk with
+                // the original Expr* for complex ones. Complex defaults
+                // are rare; the small amount of tree-walking is acceptable.
                 env2.values[displ++] = i.def->maybeThunk(state, env2);
             } else {
                 attrsUsed++;
@@ -1321,6 +1327,7 @@ op_call_1:
         // Try the fast path: bytecoded lambda with inline argument binding.
         // This avoids going through callFunction and stays in the VM loop.
         if (Env * env2 = vmBindLambdaArg(state, *fun, arg, pos)) {
+            vm.nrBytecodeCallTrampoline++;
             auto * bcBody = static_cast<ExprBytecodeThunk *>(fun->lambda().fun->body);
             auto & bodyUnit = *bcBody->unit;
             uint32_t bodyOffset = bodyUnit.thunks[bcBody->thunkIdx].codeOffset;
