@@ -1187,19 +1187,26 @@ void EvalState::eval(Expr * e, Value & v)
     // via the VM instead of tree-walking.
     static bool useBytecode = getEnv("NIX_EVAL_BYTECODE").value_or("") == "1";
     if (useBytecode) {
-        // Cache CompilationUnits keyed by Expr* to avoid recompilation.
-        // The Expr* is stable (lives in BumpMemoryResource for the
-        // entire evaluation lifetime of this EvalState).
         auto it = bytecodeCache.find(e);
         bytecode::CompilationUnit * unit;
         if (it != bytecodeCache.end()) {
             unit = it->second;
+            nrBytecodeCompileCacheHits++;
         } else {
+            nrBytecodeCompileCacheMisses++;
+            auto t0 = std::chrono::steady_clock::now();
             unit = bytecode::compile(*this, e);
+            auto t1 = std::chrono::steady_clock::now();
+            bytecodeCompileTimeUs += std::chrono::duration_cast<
+                std::chrono::microseconds>(t1 - t0).count();
             bytecodeCache[e] = unit;
         }
 
+        auto t0 = std::chrono::steady_clock::now();
         bytecode::vmExec(*this, *unit, 0, baseEnv, v);
+        auto t1 = std::chrono::steady_clock::now();
+        bytecodeExecTimeUs += std::chrono::duration_cast<
+            std::chrono::microseconds>(t1 - t0).count();
         return;
     }
 
@@ -3212,6 +3219,16 @@ void EvalState::printStatistics()
     topObj["nrLookups"] = nrLookups.load();
     topObj["nrPrimOpCalls"] = nrPrimOpCalls.load();
     topObj["nrFunctionCalls"] = nrFunctionCalls.load();
+
+    // Bytecode phase timings (only present when bytecode was used).
+    if (bytecodeCompileTimeUs > 0 || bytecodeExecTimeUs > 0) {
+        topObj["bytecode"] = {
+            {"compileTimeUs", bytecodeCompileTimeUs},
+            {"execTimeUs", bytecodeExecTimeUs},
+            {"compileCacheHits", nrBytecodeCompileCacheHits},
+            {"compileCacheMisses", nrBytecodeCompileCacheMisses},
+        };
+    }
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
         {"heapSize", heapSize},

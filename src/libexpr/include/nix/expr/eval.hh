@@ -397,8 +397,13 @@ public:
     std::unique_ptr<bytecode::VMState> vmState;
 
     /// Cache of compiled bytecode keyed by Expr*.
-    /// Avoids recompiling the same expression on repeated eval() calls.
     std::unordered_map<Expr *, bytecode::CompilationUnit *> bytecodeCache;
+
+    /// Bytecode phase timing counters (microseconds).
+    uint64_t bytecodeCompileTimeUs = 0;
+    uint64_t bytecodeExecTimeUs = 0;
+    uint64_t nrBytecodeCompileCacheHits = 0;
+    uint64_t nrBytecodeCompileCacheMisses = 0;
 
     /**
      * If set, force copying files to the Nix store even if they
