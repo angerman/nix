@@ -504,6 +504,8 @@ void vmExec(
 
 #define CUR_INSTR (cu->code[ip - 1])
 
+    try { // exception cleanup: restore frame/stack on throw
+
     DISPATCH();
 
 #else // switch-based fallback
@@ -513,6 +515,8 @@ void vmExec(
 
     auto & tcfg = traceConfig();
     auto & stepCounter = globalStepCounter();
+
+    try { // exception cleanup: restore frame/stack on throw
 
     for (;;) {
         Instruction instr = cu->code[ip++];
@@ -1171,16 +1175,15 @@ op_make_thunk:
     {
         uint32_t thunkIdx = decodeOperand(CUR_INSTR);
         assert(thunkIdx < cu->thunks.size() && "OP_MAKE_THUNK: thunk index out of bounds");
-        auto & desc = cu->thunks[thunkIdx];
 
-        // Use the ORIGINAL Expr* from the AST as the thunk expression.
-        // This preserves compatibility with Value::isTrivial() which
-        // checks the Expr type (ExprAttrs, ExprLambda, ExprList).
-        // When forceValue forces this thunk, it tree-walks the original
-        // expression -- this is correct and avoids the ExprBytecodeThunk
-        // compatibility issues with the flake machinery.
+        // Create an ExprBytecodeThunk that dispatches to the VM when forced.
+        // Value::isTrivial() has been updated to unwrap ExprBytecodeThunk
+        // and check the original sourceExpr type for flake compatibility.
+        auto * thunkExpr = state.mem.exprs.add<ExprBytecodeThunk>(
+            const_cast<CompilationUnit *>(cu), thunkIdx);
+
         auto * thunkVal = state.allocValue();
-        thunkVal->mkThunk(curEnv, desc.sourceExpr);
+        thunkVal->mkThunk(curEnv, thunkExpr);
 
         vm.push(thunkVal);
         DISPATCH();
@@ -1200,22 +1203,37 @@ op_make_closure:
         assert(lambdaIdx < cu->lambdas.size() && "OP_MAKE_CLOSURE: lambda index out of bounds");
         auto & desc = cu->lambdas[lambdaIdx];
 
-        // Instead of creating a complex ExprLambdaBytecode proxy,
-        // use the original ExprLambda from the descriptor (which
-        // already has the correct body, formals, arg, etc.).
-        // When callFunction calls lambda.body->eval(), it will
-        // tree-walk the body.  This is correct and simple.
+        // Create a shallow copy of the original ExprLambda in BumpMemoryResource,
+        // then replace its body with an ExprBytecodeThunk.  This preserves ALL
+        // fields (formals, name, arg, ellipsis, pos, docComment) while making
+        // callFunction() dispatch the body through the bytecoded VM.
         //
-        // The bytecode benefit here is that the CLOSURE CREATION
-        // (capturing the env) is bytecoded, even though the body
-        // evaluation falls back to tree-walking when called.
-        //
-        // Full bytecoded lambda body dispatch (via ExprLambdaBytecode
-        // proxy) will be implemented once the basic path works.
+        // We must copy (not modify) because the original ExprLambda is used
+        // by the tree-walker oracle and must remain unchanged.
         ExprLambda * originalLambda = desc.sourceExpr;
 
+        // Allocate a raw ExprLambda-sized block in BumpMemoryResource and
+        // memcpy the original into it.  This copies the vtable pointer too
+        // (making it a real ExprLambda), plus all formals fields.
+        auto & alloc = state.mem.exprs.alloc;
+        auto * lambdaCopy = static_cast<ExprLambda *>(
+            alloc.allocate_bytes(sizeof(ExprLambda), alignof(ExprLambda)));
+        std::memcpy(lambdaCopy, originalLambda, sizeof(ExprLambda));
+
+        // Create an ExprBytecodeThunk for the lambda body.
+        uint32_t bodyThunkIdx = static_cast<uint32_t>(
+            const_cast<CompilationUnit *>(cu)->thunks.size());
+        const_cast<CompilationUnit *>(cu)->thunks.push_back(
+            ThunkDescriptor{desc.codeOffset, desc.pos,
+                            originalLambda ? originalLambda->body : nullptr});
+        auto * bodyThunk = state.mem.exprs.add<ExprBytecodeThunk>(
+            const_cast<CompilationUnit *>(cu), bodyThunkIdx);
+
+        // Override body on the COPY (not the original).
+        lambdaCopy->body = bodyThunk;
+
         auto * closureVal = state.allocValue();
-        closureVal->mkLambda(curEnv, originalLambda);
+        closureVal->mkLambda(curEnv, lambdaCopy);
 
         vm.push(closureVal);
         DISPATCH();
@@ -1580,6 +1598,17 @@ op_unhandled:
         } // switch
     } // for(;;)
 #endif
+
+    } catch (...) {
+        // Exception thrown during VM execution (e.g., from forceValue,
+        // callFunction, or an OP_EVAL_EXPR fallback).  Clean up the
+        // frame and stack state so the caller sees a consistent VMState.
+        while (vm.frames.size() > entryFrameDepth) {
+            vm.sp = vm.frames.back().stackBase;
+            vm.frames.pop_back();
+        }
+        throw;
+    }
 }
 
 } // namespace nix::bytecode

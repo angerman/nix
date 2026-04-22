@@ -1,6 +1,8 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/vm.hh"
+#include "nix/expr/bytecode.hh"
 #include "nix/expr/bytecode-compiler.hh"
+#include "nix/expr/bytecode-thunk.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/primops.hh"
@@ -210,10 +212,22 @@ PosIdx Value::determinePos(const PosIdx pos) const
 
 bool Value::isTrivial() const
 {
-    return !isa<tApp, tPrimOpApp>()
-           && (!isa<tThunk>()
-               || (dynamic_cast<ExprAttrs *>(thunk().expr) && ((ExprAttrs *) thunk().expr)->dynamicAttrs->empty())
-               || dynamic_cast<ExprLambda *>(thunk().expr) || dynamic_cast<ExprList *>(thunk().expr));
+    if (isa<tApp, tPrimOpApp>())
+        return false;
+    if (!isa<tThunk>())
+        return true;
+
+    // Check the thunk's expression type.
+    auto * expr = thunk().expr;
+
+    // For bytecoded thunks, check the original expression type stored
+    // in the ThunkDescriptor.
+    if (auto * bcThunk = dynamic_cast<ExprBytecodeThunk *>(expr))
+        expr = bcThunk->unit->thunks[bcThunk->thunkIdx].sourceExpr;
+
+    return (dynamic_cast<ExprAttrs *>(expr) && ((ExprAttrs *) expr)->dynamicAttrs->empty())
+        || dynamic_cast<ExprLambda *>(expr)
+        || dynamic_cast<ExprList *>(expr);
 }
 
 static Symbol getName(const AttrName & name, EvalState & state, Env & env)

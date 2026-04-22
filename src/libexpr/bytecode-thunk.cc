@@ -42,24 +42,29 @@ ExprLambdaBytecode::ExprLambdaBytecode(
     : ExprLambda(
         unit->lambdas[lambdaIdx].pos,
         unit->lambdas[lambdaIdx].arg,
-        nullptr)  // body set below
+        nullptr)  // body set later by OP_MAKE_CLOSURE
     , unit(unit)
     , lambdaIdx(lambdaIdx)
 {
     auto & desc = unit->lambdas[lambdaIdx];
 
-    // Set name for profiling and error messages.
-    this->name = desc.name;
-
-    // The body pointer will be set to an ExprBytecodeThunk by the
-    // bytecode compiler, after this object is allocated.  We can't
-    // create the thunk here because it would require the BumpMemoryResource
-    // allocator which we don't have in this constructor.
-    //
-    // The compiler will do:
-    //   auto * proxy = exprs.add<ExprLambdaBytecode>(unit, lambdaIdx);
-    //   auto * bodyThunk = exprs.add<ExprBytecodeThunk>(unit, bodyThunkIdx);
-    //   proxy->body = bodyThunk;
+    // Copy ALL ExprLambda fields from the original so that callFunction()
+    // sees the correct formals, name, arg, ellipsis, etc.
+    // We do this by memcpy'ing the ExprLambda portion from the original,
+    // then overriding just the body pointer.
+    if (desc.sourceExpr) {
+        auto * orig = desc.sourceExpr;
+        // Copy the ExprLambda base: pos, name, arg, hasFormals, ellipsis,
+        // nFormals, formalsStart, body, docComment.
+        // The ExprLambda fields start right after the Expr base class.
+        std::memcpy(
+            static_cast<ExprLambda *>(this),
+            static_cast<ExprLambda *>(orig),
+            sizeof(ExprLambda));
+        // body will be overridden by OP_MAKE_CLOSURE after construction.
+    } else {
+        this->name = desc.name;
+    }
 }
 
 } // namespace nix
