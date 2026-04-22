@@ -232,6 +232,91 @@ void VMState::grow()
 // destructors that break computed-goto dispatch)
 // ---------------------------------------------------------------------------
 
+/// Bind a single argument to a lambda, creating the environment.
+/// Returns the new Env if binding succeeds, or nullptr if the lambda
+/// is not bytecoded (caller should fall back to callFunction).
+/// This replicates callFunction's lambda argument binding logic.
+[[gnu::noinline]]
+static Env * vmBindLambdaArg(
+    EvalState & state, Value & fun, Value * arg, PosIdx callPos)
+{
+    if (!fun.isLambda()) return nullptr;
+
+    ExprLambda & lambda = *fun.lambda().fun;
+
+    // Check if the body is bytecoded.
+    if (!dynamic_cast<ExprBytecodeThunk *>(lambda.body))
+        return nullptr;
+
+    auto size = (!lambda.arg ? 0 : 1)
+        + (lambda.getFormals() ? lambda.getFormals()->formals.size() : 0);
+    Env & env2 = state.mem.allocEnv(size);
+    env2.up = fun.lambda().env;
+
+    Displacement displ = 0;
+
+    if (auto formals = lambda.getFormals()) {
+        try {
+            state.forceAttrs(*arg, lambda.pos,
+                "while evaluating the value passed for the lambda argument");
+        } catch (Error & e) {
+            if (callPos)
+                e.addTrace(state.positions[callPos], "from call site");
+            throw;
+        }
+
+        if (lambda.arg)
+            env2.values[displ++] = arg;
+
+        size_t attrsUsed = 0;
+        for (auto & i : formals->formals) {
+            auto j = arg->attrs()->get(i.name);
+            if (!j) {
+                if (!i.def) {
+                    state.error<TypeError>(
+                        "function '%1%' called without required argument '%2%'",
+                        (lambda.name ? std::string(state.symbols[lambda.name]) : "anonymous lambda"),
+                        state.symbols[i.name])
+                        .atPos(lambda.pos)
+                        .withTrace(callPos, "from call site")
+                        .withFrame(*fun.lambda().env, lambda)
+                        .debugThrow();
+                }
+                env2.values[displ++] = i.def->maybeThunk(state, env2);
+            } else {
+                attrsUsed++;
+                env2.values[displ++] = j->value;
+            }
+        }
+
+        if (!formals->ellipsis && attrsUsed != arg->attrs()->size()) {
+            for (auto & i : *arg->attrs())
+                if (!formals->has(i.name)) {
+                    StringSet formalNames;
+                    for (auto & formal : formals->formals)
+                        formalNames.insert(std::string(state.symbols[formal.name]));
+                    auto suggestions = Suggestions::bestMatches(formalNames, state.symbols[i.name]);
+                    state.error<TypeError>(
+                        "function '%1%' called with unexpected argument '%2%'",
+                        (lambda.name ? std::string(state.symbols[lambda.name]) : "anonymous lambda"),
+                        state.symbols[i.name])
+                        .atPos(lambda.pos)
+                        .withTrace(callPos, "from call site")
+                        .withSuggestions(suggestions)
+                        .withFrame(*fun.lambda().env, lambda)
+                        .debugThrow();
+                }
+            unreachable();
+        }
+    } else {
+        env2.values[displ++] = arg;
+    }
+
+    // TODO: state.nrFunctionCalls++ (private, needs friend or public accessor)
+
+    return &env2;
+}
+
 /// Sorted merge of two attrsets with RHS-wins duplicate resolution.
 [[gnu::noinline]]
 static void vmAttrsUpdate(EvalState & state, Value & result, Value & lhs, Value & rhs)
@@ -1231,10 +1316,39 @@ op_call_1:
         Value * arg = vm.pop();
         Value * fun = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*fun, pos);
 
-        // Delegate to the existing callFunction which handles all
-        // calling conventions: lambdas, primops, partial application,
-        // functors, and profiling hooks.
+        // Try the fast path: bytecoded lambda with inline argument binding.
+        // This avoids going through callFunction and stays in the VM loop.
+        if (Env * env2 = vmBindLambdaArg(state, *fun, arg, pos)) {
+            auto * bcBody = static_cast<ExprBytecodeThunk *>(fun->lambda().fun->body);
+            auto & bodyUnit = *bcBody->unit;
+            uint32_t bodyOffset = bodyUnit.thunks[bcBody->thunkIdx].codeOffset;
+
+            // Save current frame state.
+            vm.frames.back().ip = ip;
+            vm.frames.back().env = curEnv;
+
+            // Push a new call frame for the lambda body.
+            auto * result = state.allocValue();
+            vm.frames.push_back(CallFrame{
+                .unit = &bodyUnit,
+                .ip = bodyOffset,
+                .env = env2,
+                .stackBase = vm.sp,
+                .resultSlot = result,
+                .callPos = pos,
+            });
+
+            // Switch to the body's code.
+            cu = &bodyUnit;
+            ip = bodyOffset;
+            curEnv = env2;
+
+            DISPATCH();
+        }
+
+        // Fallback: primops, functors, non-bytecoded lambdas.
         auto * result = state.allocValue();
         state.callFunction(*fun, *arg, *result, pos);
 
