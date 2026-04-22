@@ -228,6 +228,120 @@ void VMState::grow()
 
 
 // ---------------------------------------------------------------------------
+// Helpers for opcode handlers (extracted to avoid non-trivial local
+// destructors that break computed-goto dispatch)
+// ---------------------------------------------------------------------------
+
+/// Sorted merge of two attrsets with RHS-wins duplicate resolution.
+[[gnu::noinline]]
+static void vmAttrsUpdate(EvalState & state, Value & result, Value & lhs, Value & rhs)
+{
+    auto & bindings1 = *lhs.attrs();
+    auto & bindings2 = *rhs.attrs();
+
+    if (bindings1.empty()) { result = rhs; return; }
+    if (bindings2.empty()) { result = lhs; return; }
+
+    auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
+    auto i = bindings1.begin();
+    auto j = bindings2.begin();
+
+    while (i != bindings1.end() && j != bindings2.end()) {
+        if (i->name == j->name) {
+            attrs.insert(*j);
+            ++i; ++j;
+        } else if (i->name < j->name) {
+            attrs.insert(*i); ++i;
+        } else {
+            attrs.insert(*j); ++j;
+        }
+    }
+    while (i != bindings1.end()) { attrs.insert(*i); ++i; }
+    while (j != bindings2.end()) { attrs.insert(*j); ++j; }
+
+    result.mkAttrs(attrs.alreadySorted());
+}
+
+/// String concatenation handler (extracted for same reason).
+[[gnu::noinline]]
+static void vmStrConcat(
+    EvalState & state, VMState & vm, const CompilationUnit & cu,
+    uint32_t nParts, bool forceString, PosIdx pos, Value & result)
+{
+    NixStringContext context;
+    std::vector<BackedStringView> strings;
+    size_t sSize = 0;
+    NixInt n{0};
+    NixFloat nf = 0;
+    bool first = !forceString;
+    ValueType firstType = nString;
+
+    constexpr uint32_t kStackPartsMax = 64;
+    Value * stackParts[kStackPartsMax];
+    Value ** parts = nParts <= kStackPartsMax ? stackParts : new Value*[nParts];
+    for (uint32_t i = nParts; i > 0; --i)
+        parts[i - 1] = vm.pop();
+
+    for (uint32_t i = 0; i < nParts; i++) {
+        Value & vTmp = *parts[i];
+        state.forceValue(vTmp, pos);
+        if (first) firstType = vTmp.type();
+
+        if (firstType == nInt) {
+            if (vTmp.type() == nInt) {
+                auto newN = n + vTmp.integer();
+                if (auto checked = newN.valueChecked())
+                    n = NixInt(*checked);
+                else
+                    state.error<EvalError>("integer overflow in adding %1% + %2%", n, vTmp.integer())
+                        .atPos(pos).debugThrow();
+            } else if (vTmp.type() == nFloat) {
+                firstType = nFloat; nf = n.value; nf += vTmp.fpoint();
+            } else {
+                state.error<EvalError>("cannot add %1% to an integer", showType(vTmp))
+                    .atPos(pos).debugThrow();
+            }
+        } else if (firstType == nFloat) {
+            if (vTmp.type() == nInt) nf += vTmp.integer().value;
+            else if (vTmp.type() == nFloat) nf += vTmp.fpoint();
+            else state.error<EvalError>("cannot add %1% to a float", showType(vTmp))
+                .atPos(pos).debugThrow();
+        } else {
+            if (strings.empty()) strings.reserve(nParts);
+            auto part = state.coerceToString(pos, vTmp, context,
+                "while evaluating a path segment", false, firstType == nString, !first);
+            sSize += part->size();
+            strings.emplace_back(std::move(part));
+        }
+        first = false;
+    }
+
+    if (firstType == nInt) {
+        result.mkInt(n);
+    } else if (firstType == nFloat) {
+        result.mkFloat(nf);
+    } else if (firstType == nPath) {
+        if (!context.empty())
+            state.error<EvalError>("a string that refers to a store path cannot be appended to a path")
+                .atPos(pos).debugThrow();
+        std::string resultStr; resultStr.reserve(sSize);
+        for (const auto & part : strings) resultStr += *part;
+        result.mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
+    } else {
+        auto & resultStr = StringData::alloc(state.mem, sSize);
+        auto * tmp = resultStr.data();
+        for (const auto & part : strings) {
+            std::memcpy(tmp, part->data(), part->size());
+            tmp += part->size();
+        }
+        *tmp = '\0';
+        result.mkStringMove(resultStr, context, state.mem);
+    }
+
+    if (parts != stackParts) delete[] parts;
+}
+
+// ---------------------------------------------------------------------------
 // vmExec -- main dispatch loop
 // ---------------------------------------------------------------------------
 
@@ -271,11 +385,13 @@ void vmExec(
     // Use computed-goto where available (GCC/Clang), otherwise switch.
     // ------------------------------------------------------------------
 
-// Computed-goto is disabled for now because vmExec can be called
-// recursively (thunk forcing -> ExprBytecodeThunk::eval -> vmExec),
-// and the large stack frame from computed-goto labels causes stack
-// overflow.  Will be re-enabled once trampolining is implemented.
-// #define NIX_VM_COMPUTED_GOTO 1
+// Re-enabled: the inline thunk trampoline that caused stack overflow
+// has been removed. All thunk forcing goes through state.forceValue()
+// -> tree-walker. The entryFrameDepth mechanism handles vmExec
+// re-entrancy safely, with manageable stack frames.
+#if defined(__GNUC__) || defined(__clang__)
+#define NIX_VM_COMPUTED_GOTO 1
+#endif
 
 #ifdef NIX_VM_COMPUTED_GOTO
     // Build the dispatch table.  We fill all 256 entries; unused opcodes
@@ -341,8 +457,7 @@ void vmExec(
         // Phase 3b: list build, attrs build, string concat
         REGISTER_OP(OP_LIST_INIT,        op_list_init);
         REGISTER_OP(OP_ATTRS_INIT,       op_attrs_init);
-        REGISTER_OP(OP_ATTR_INSERT,      op_attr_insert);
-        REGISTER_OP(OP_ATTRS_FINISH,     op_attrs_finish);
+        // OP_ATTR_INSERT and OP_ATTRS_FINISH are unused (compound OP_ATTRS_INIT handles everything).
         REGISTER_OP(OP_STR_CONCAT_INIT,  op_str_concat_init);
         REGISTER_OP(OP_POS,              op_pos);
 
@@ -1244,49 +1359,9 @@ op_attrs_update:
         state.forceAttrs(*rhs, pos, "in the right operand of the update (//) operator");
 
         auto * result = state.allocValue();
-        auto & bindings1 = *lhs->attrs();
-        auto & bindings2 = *rhs->attrs();
-
-        // Short-circuit: if either side is empty, return the other.
-        if (bindings1.empty()) {
-            *result = *rhs;
-            vm.push(result);
-            DISPATCH();
-        }
-        if (bindings2.empty()) {
-            *result = *lhs;
-            vm.push(result);
-            DISPATCH();
-        }
-
-        // Sorted merge with RHS-wins duplicate resolution.
-        // Both Bindings are sorted by Symbol. Merge like merge-sort.
-        auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
-        auto i = bindings1.begin();
-        auto j = bindings2.begin();
-
-        while (i != bindings1.end() && j != bindings2.end()) {
-            if (i->name == j->name) {
-                attrs.insert(*j);  // RHS wins
-                ++i; ++j;
-            } else if (i->name < j->name) {
-                attrs.insert(*i);
-                ++i;
-            } else {
-                attrs.insert(*j);
-                ++j;
-            }
-        }
-        while (i != bindings1.end()) {
-            attrs.insert(*i);
-            ++i;
-        }
-        while (j != bindings2.end()) {
-            attrs.insert(*j);
-            ++j;
-        }
-
-        result->mkAttrs(attrs.alreadySorted());
+        // Delegate to a non-inline helper to avoid non-trivial local
+        // destructors that break computed-goto dispatch.
+        vmAttrsUpdate(state, *result, *lhs, *rhs);
         vm.push(result);
         DISPATCH();
     }
@@ -1431,103 +1506,8 @@ op_str_concat_init:
         bool forceString = (operand >> 23) & 1;
         PosIdx pos = cu->posForOffset(ip - 1);
 
-        // Pop nParts values from the stack.
-        // The combining logic mirrors ExprConcatStrings::eval exactly.
-        NixStringContext context;
-        std::vector<BackedStringView> strings;
-        size_t sSize = 0;
-        NixInt n{0};
-        NixFloat nf = 0;
-
-        bool first = !forceString;
-        ValueType firstType = nString;
-
-        // Collect parts from the stack.
-        constexpr uint32_t kStackPartsMax = 64;
-        Value * stackParts[kStackPartsMax];
-        Value ** parts = nParts <= kStackPartsMax
-            ? stackParts
-            : new Value*[nParts];
-        for (uint32_t i = nParts; i > 0; --i)
-            parts[i - 1] = vm.pop();
-
-        for (uint32_t i = 0; i < nParts; i++) {
-            Value & vTmp = *parts[i];
-            state.forceValue(vTmp, pos);
-
-            if (first) {
-                firstType = vTmp.type();
-            }
-
-            if (firstType == nInt) {
-                if (vTmp.type() == nInt) {
-                    auto newN = n + vTmp.integer();
-                    if (auto checked = newN.valueChecked(); checked.has_value()) {
-                        n = NixInt(*checked);
-                    } else {
-                        state.error<EvalError>("integer overflow in adding %1% + %2%", n, vTmp.integer())
-                            .atPos(pos).debugThrow();
-                    }
-                } else if (vTmp.type() == nFloat) {
-                    firstType = nFloat;
-                    nf = n.value;
-                    nf += vTmp.fpoint();
-                } else {
-                    state.error<EvalError>("cannot add %1% to an integer", showType(vTmp))
-                        .atPos(pos).debugThrow();
-                }
-            } else if (firstType == nFloat) {
-                if (vTmp.type() == nInt) {
-                    nf += vTmp.integer().value;
-                } else if (vTmp.type() == nFloat) {
-                    nf += vTmp.fpoint();
-                } else {
-                    state.error<EvalError>("cannot add %1% to a float", showType(vTmp))
-                        .atPos(pos).debugThrow();
-                }
-            } else {
-                if (strings.empty())
-                    strings.reserve(nParts);
-                auto part = state.coerceToString(
-                    pos, vTmp, context,
-                    "while evaluating a path segment",
-                    false, firstType == nString, !first);
-                sSize += part->size();
-                strings.emplace_back(std::move(part));
-            }
-
-            first = false;
-        }
-
         auto * result = state.allocValue();
-
-        if (firstType == nInt) {
-            result->mkInt(n);
-        } else if (firstType == nFloat) {
-            result->mkFloat(nf);
-        } else if (firstType == nPath) {
-            if (!context.empty())
-                state.error<EvalError>("a string that refers to a store path cannot be appended to a path")
-                    .atPos(pos).debugThrow();
-            std::string resultStr;
-            resultStr.reserve(sSize);
-            for (const auto & part : strings)
-                resultStr += *part;
-            result->mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
-        } else {
-            auto & resultStr = StringData::alloc(state.mem, sSize);
-            auto * tmp = resultStr.data();
-            for (const auto & part : strings) {
-                std::memcpy(tmp, part->data(), part->size());
-                tmp += part->size();
-            }
-            *tmp = '\0';
-            result->mkStringMove(resultStr, context, state.mem);
-        }
-
-        if (parts != stackParts)
-            delete[] parts;
-
+        vmStrConcat(state, vm, *cu, nParts, forceString, pos, *result);
         vm.push(result);
         DISPATCH();
     }
