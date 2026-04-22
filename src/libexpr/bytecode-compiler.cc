@@ -721,8 +721,10 @@ void Compiler::compileAttrs(ExprAttrs * e)
     bool hasInheritFrom = e->inheritFromExprs && !e->inheritFromExprs->empty();
     bool hasDynamic = e->dynamicAttrs && !e->dynamicAttrs->empty();
 
-    if (hasDynamic) {
-        // Dynamic attrs require runtime name evaluation -- fall back.
+    if (hasDynamic || hasInheritFrom) {
+        // Dynamic attrs require runtime name evaluation, and inherit(expr)
+        // requires a special inheritEnv with displacements that the bytecoded
+        // path doesn't create.  Fall back to tree-walker for both.
         unit.emitPos(e->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
