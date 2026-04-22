@@ -404,7 +404,8 @@ public:
     /// Key: the ExprLambda* stored in the closure (unique per parse).
     struct BytecodedBody {
         bytecode::CompilationUnit * unit;
-        uint32_t thunkIdx;
+        uint32_t thunkIdx;         ///< Body thunk (after prologue) for ExprBytecodeThunk
+        uint32_t prologueOffset;   ///< Code offset for formals-binding prologue (OP_CALL_1)
     };
     std::unordered_map<ExprLambda *, BytecodedBody> lambdaBodyCache;
 

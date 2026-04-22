@@ -259,8 +259,16 @@ struct LambdaDescriptor
 
     /// Index into CompilationUnit::thunks for the lambda body's
     /// ThunkDescriptor. Pre-allocated at compile time to avoid
-    /// runtime vector modifications.
+    /// runtime vector modifications.  Points to bodyStart (after
+    /// the formals-binding prologue), used by ExprBytecodeThunk
+    /// when callFunction dispatches via lambda.body->eval().
     uint32_t bodyThunkIdx = 0;
+
+    /// Code offset for the formals-binding prologue.
+    /// OP_CALL_1 trampoline jumps here so it runs the bytecoded
+    /// formal parameter unpacking before the body.  For simple
+    /// lambdas (no formals), prologueOffset == body code offset.
+    uint32_t prologueOffset = 0;
 };
 
 

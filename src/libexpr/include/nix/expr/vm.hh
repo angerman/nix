@@ -34,7 +34,7 @@ struct CallFrame
     const CompilationUnit * unit; ///< The compilation unit being executed.
     uint32_t ip;                  ///< Instruction pointer (index into unit->code).
     Env * env;                    ///< Current environment for this frame.
-    Value ** stackBase;           ///< Base of this frame's portion of the value stack.
+    size_t stackBaseOffset;       ///< Offset from stack base (survives stack reallocation).
     Value * resultSlot;           ///< Where to write the return value (GC-allocated).
     PosIdx callPos;               ///< Source position of the call site (for stack traces).
     bool isThunkForce = false;    ///< If true, OP_RETURN doesn't push result (thunk was updated in-place).

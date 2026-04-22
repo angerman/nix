@@ -217,11 +217,7 @@ void VMState::grow()
 
     std::memcpy(newStack, stack, used * sizeof(Value *));
 
-    // Fix up all CallFrame stackBase pointers to reference the new buffer.
-    ptrdiff_t delta = newStack - stack;
-    for (auto & frame : frames)
-        frame.stackBase += delta;
-
+    // stackBaseOffset in CallFrames is relative to `stack`, so no fixup needed.
     sp       = newStack + used;
     stack    = newStack;
     stackEnd = newStack + newCap;
@@ -413,7 +409,7 @@ void vmExec(
         .unit      = &unit,
         .ip        = startOffset,
         .env       = &env,
-        .stackBase = vm.sp,
+        .stackBaseOffset = vm.stackSize(),
         .resultSlot = resultSlot,
         .callPos   = unit.posForOffset(startOffset),
     });
@@ -653,13 +649,17 @@ op_return:
     {
         Value * retVal = vm.pop();
 
-        // Write the result into the caller's result slot.
+        // Save frame state before popping (pop invalidates references).
         auto & frame = vm.frames.back();
         bool wasThunkForce = frame.isThunkForce;
-        *frame.resultSlot = *retVal;
+        Value * resultSlot = frame.resultSlot;
+        size_t stackBase = frame.stackBaseOffset;
 
-        // Restore stack to frame entry point.
-        vm.sp = frame.stackBase;
+        // Write the result into the caller's result slot.
+        *resultSlot = *retVal;
+
+        // Restore stack to frame entry point (offset-based, survives stack realloc).
+        vm.sp = vm.stack + stackBase;
         vm.frames.pop_back();
 
         if (vm.frames.size() <= entryFrameDepth) {
@@ -673,11 +673,12 @@ op_return:
         curEnv = caller.env;
 
         if (!wasThunkForce) {
-            // Normal call return: push result for caller.
-            vm.push(retVal);
+            // Normal call return: push the resultSlot (an independent copy).
+            // We must NOT push retVal directly — it may alias an env slot.
+            // The caller's OP_CALL_1 allocated resultSlot as a fresh Value
+            // and we've copied the result into it above.
+            vm.push(resultSlot);
         }
-        // Thunk force: the caller's TOS is the Value* that was forced
-        // in-place via resultSlot. No push needed.
         DISPATCH();
     }
 
@@ -826,7 +827,7 @@ op_force:
                     .unit = bcThunk->unit,
                     .ip = thunkOffset,
                     .env = thunkEnv,
-                    .stackBase = vm.sp,
+                    .stackBaseOffset = vm.stackSize(),
                     .resultSlot = v,  // Write result back into the thunk Value
                     .callPos = pos,
                     .isThunkForce = true,  // OP_RETURN doesn't push result
@@ -1297,7 +1298,7 @@ op_make_closure:
         // The OP_CALL_1 trampoline checks this table to decide whether
         // to bytecode the body or fall back to callFunction.
         state.lambdaBodyCache[originalLambda] = {
-            const_cast<CompilationUnit *>(cu), desc.bodyThunkIdx};
+            const_cast<CompilationUnit *>(cu), desc.bodyThunkIdx, desc.prologueOffset};
 
         auto * closureVal = state.allocValue();
         closureVal->mkLambda(curEnv, originalLambda);
@@ -1325,10 +1326,20 @@ op_call_1:
         // This avoids going through callFunction and stays in the VM loop.
         if (Env * env2 = vmBindLambdaArg(state, *fun, arg, pos)) {
             vm.nrBytecodeCallTrampoline++;
-            // Look up the bytecoded body from the side-table.
+            // Look up the bytecoded body info from the side-table.
             auto & bodyInfo = state.lambdaBodyCache[fun->lambda().fun];
             auto & bodyUnit = *bodyInfo.unit;
-            uint32_t bodyOffset = bodyUnit.thunks[bodyInfo.thunkIdx].codeOffset;
+
+            // For formals lambdas, jump to the PROLOGUE (which unpacks
+            // the attrset arg into env slots, then falls through to
+            // the body).  For simple lambdas, prologue == body offset.
+            bool hasFormals = fun->lambda().fun->getFormals().has_value();
+            uint32_t startOffset = hasFormals
+                ? bodyInfo.prologueOffset
+                : bodyUnit.thunks[bodyInfo.thunkIdx].codeOffset;
+
+            assert(startOffset < bodyUnit.code.size()
+                && "OP_CALL_1: startOffset out of bounds");
 
             // Save current frame state.
             vm.frames.back().ip = ip;
@@ -1338,22 +1349,22 @@ op_call_1:
             auto * result = state.allocValue();
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
-                .ip = bodyOffset,
+                .ip = startOffset,
                 .env = env2,
-                .stackBase = vm.sp,
+                .stackBaseOffset = vm.stackSize(),
                 .resultSlot = result,
                 .callPos = pos,
             });
 
             // For formals lambdas, push the raw arg onto the stack
             // so the bytecoded prologue can pop it for unpacking.
-            if (fun->lambda().fun->getFormals()) {
+            if (hasFormals) {
                 vm.push(arg);
             }
 
-            // Switch to the body's code.
+            // Switch to the prologue/body code.
             cu = &bodyUnit;
-            ip = bodyOffset;
+            ip = startOffset;
             curEnv = env2;
 
             DISPATCH();
@@ -1708,7 +1719,7 @@ op_unhandled:
         // callFunction, or an OP_EVAL_EXPR fallback).  Clean up the
         // frame and stack state so the caller sees a consistent VMState.
         while (vm.frames.size() > entryFrameDepth) {
-            vm.sp = vm.frames.back().stackBase;
+            vm.sp = vm.stack + vm.frames.back().stackBaseOffset;
             vm.frames.pop_back();
         }
         throw;

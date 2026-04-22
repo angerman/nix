@@ -417,52 +417,38 @@ void Compiler::compileLambda(ExprLambda * e)
     // Jump over the lambda body.
     uint32_t jumpOver = unit.emit(OP_JUMP, 0);
 
-    // Record the start of the lambda body.
-    uint32_t bodyStart = static_cast<uint32_t>(unit.code.size());
+    // === Binding prologue (separate from body) ===
+    // The prologue is only executed by the OP_CALL_1 trampoline.
+    // callFunction skips it and jumps directly to bodyStart.
+    uint32_t prologueStart = static_cast<uint32_t>(unit.code.size());
 
-    // === Binding prologue ===
-    // The OP_CALL_1 trampoline stores the raw argument in env.values[0]
-    // and allocates the env. For formals lambdas, we need to unpack
-    // the attrset argument into the individual formal parameter slots.
     if (auto formals = e->getFormals()) {
-        // The raw argument attrset is on the value stack (pushed by OP_CALL_1).
-        // Pop it, force it, then unpack formals into env slots.
-        // Env layout matches the tree-walker:
-        //   @-pattern: slot 0 = whole attrset, slots 1..N = formals
-        //   No @:       slots 0..N-1 = formals
-
+        // The raw arg attrset is on the value stack (pushed by OP_CALL_1).
+        // Force it and unpack into env slots matching the tree-walker layout.
         unit.emitPos(e->pos);
-        // The arg is already on the stack from OP_CALL_1. Force it.
-        unit.emit(OP_FORCE);  // force the attrset (VM-internal, no C-stack growth)
+        unit.emit(OP_FORCE);
 
-        // If @-pattern, store the whole attrset in env slot 0.
-        // (Also store it so we can reference it for attr lookups below.)
         if (e->arg) {
-            unit.emit(OP_DUP);  // keep a copy on stack for unpacking
-            unit.emit(OP_SET_ENV_SLOT, 0);  // store @-pattern in slot 0
+            unit.emit(OP_DUP);
+            unit.emit(OP_SET_ENV_SLOT, 0);
         }
 
-        // For each formal, look up the attr or compile the default.
         Displacement displ = e->arg ? 1 : 0;
         for (auto & f : formals->formals) {
             uint32_t symIdx = unit.addSymbol(f.name);
 
             if (f.def) {
-                // Formal with default: check if attr exists, use default if not.
-                unit.emit(OP_DUP);  // dup the attrset on stack
+                unit.emit(OP_DUP);
                 unit.emit(OP_HAS_ATTR, symIdx);
                 uint32_t jumpDefault = unit.emit(OP_JUMP_IF_FALSE, 0);
-                // Attr exists: select it from the attrset (still on stack).
-                unit.emit(OP_DUP);  // dup attrset again for select
+                unit.emit(OP_DUP);
                 unit.emit(OP_ATTR_SELECT, symIdx);
                 uint32_t jumpDone = unit.emit(OP_JUMP, 0);
-                // Default path:
                 unit.patchJump(jumpDefault);
                 compileAsThunkOrEager(f.def, f.pos);
                 unit.patchJump(jumpDone);
             } else {
-                // Required formal: select from attrset.
-                unit.emit(OP_DUP);  // dup attrset for select
+                unit.emit(OP_DUP);
                 unit.emit(OP_ATTR_SELECT, symIdx);
             }
 
@@ -470,14 +456,16 @@ void Compiler::compileLambda(ExprLambda * e)
             displ++;
         }
 
-        // Pop the attrset from the stack (we're done unpacking).
-        unit.emit(OP_POP);
-
-        // TODO: check for unexpected attrs (if !ellipsis)
+        unit.emit(OP_POP); // discard attrset
     }
-    // Simple lambda: env.values[0] already has the arg (set by trampoline).
+    // For simple lambdas: no prologue needed (arg already in env slot 0).
+    // Prologue falls through to body.
 
     // === Body code ===
+    // bodyStart is where callFunction dispatches to (via ExprBytecodeThunk).
+    // The prologue falls through to here naturally.
+    uint32_t bodyStart = static_cast<uint32_t>(unit.code.size());
+
     compile(e->body);
     unit.emit(OP_RETURN);
 
@@ -512,6 +500,7 @@ void Compiler::compileLambda(ExprLambda * e)
         .envSize = envSize,
         .sourceExpr = e,
         .bodyThunkIdx = bodyThunkIdx,
+        .prologueOffset = prologueStart,
     });
 
     unit.emitPos(e->pos);
