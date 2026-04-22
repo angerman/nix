@@ -466,18 +466,16 @@ void Compiler::compileCall(ExprCall * e)
     // Compile the function expression.
     compile(e->fun);
 
-    // Compile each argument as a thunk (lazy, matching tree-walker semantics).
+    // Nix functions are always arity-1 (curried).  Multi-arg calls
+    // like `f x y z` are compiled as sequential OP_CALL_1 applications:
+    //   <f> <x> CALL_1 <y> CALL_1 <z> CALL_1
+    // This allows the VM's OP_CALL_1 trampoline to handle each step
+    // without C-stack growth (no callFunction recursion).
     for (auto * arg : *e->args) {
         compileAsThunkOrEager(arg, e->pos);
-    }
-
-    // Emit the call instruction.
-    unit.emitPos(e->pos);
-    uint32_t nArgs = static_cast<uint32_t>(e->args->size());
-    if (nArgs == 1)
+        unit.emitPos(e->pos);
         unit.emit(OP_CALL_1);
-    else
-        unit.emit(OP_CALL, nArgs);
+    }
 }
 
 
