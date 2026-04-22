@@ -434,6 +434,13 @@ void Compiler::compileLambda(ExprLambda * e)
     uint16_t envSize = (!e->arg ? 0 : 1)
         + (formals ? static_cast<uint16_t>(formals->formals.size()) : 0);
 
+    // Also pre-allocate a thunk descriptor for the lambda body.
+    // This is used by OP_MAKE_CLOSURE to create an ExprBytecodeThunk
+    // for the body. Pre-allocating at compile time avoids modifying
+    // the thunks vector at runtime (which would invalidate references).
+    uint32_t bodyThunkIdx = static_cast<uint32_t>(unit.thunks.size());
+    unit.thunks.push_back(ThunkDescriptor{bodyStart, e->pos, e->body});
+
     unit.lambdas.push_back(LambdaDescriptor{
         .codeOffset = bodyStart,
         .pos = e->pos,
@@ -442,9 +449,9 @@ void Compiler::compileLambda(ExprLambda * e)
         .formals = formals ? &*formals : nullptr,
         .envSize = envSize,
         .sourceExpr = e,
+        .bodyThunkIdx = bodyThunkIdx,
     });
 
-    // Emit the closure creation instruction.
     unit.emitPos(e->pos);
     unit.emit(OP_MAKE_CLOSURE, lambdaIdx);
 }

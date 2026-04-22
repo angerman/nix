@@ -1203,37 +1203,16 @@ op_make_closure:
         assert(lambdaIdx < cu->lambdas.size() && "OP_MAKE_CLOSURE: lambda index out of bounds");
         auto & desc = cu->lambdas[lambdaIdx];
 
-        // Create a shallow copy of the original ExprLambda in BumpMemoryResource,
-        // then replace its body with an ExprBytecodeThunk.  This preserves ALL
-        // fields (formals, name, arg, ellipsis, pos, docComment) while making
-        // callFunction() dispatch the body through the bytecoded VM.
-        //
-        // We must copy (not modify) because the original ExprLambda is used
-        // by the tree-walker oracle and must remain unchanged.
+        // Use the original ExprLambda for closures.
+        // Lambda bodies are still tree-walked when callFunction calls
+        // lambda.body->eval(). Bytecoding lambda bodies requires
+        // properly copying ExprLambda with its private formals fields,
+        // which is complex. The bytecoded THUNKS (via ExprBytecodeThunk)
+        // handle the majority of forced evaluations.
         ExprLambda * originalLambda = desc.sourceExpr;
 
-        // Allocate a raw ExprLambda-sized block in BumpMemoryResource and
-        // memcpy the original into it.  This copies the vtable pointer too
-        // (making it a real ExprLambda), plus all formals fields.
-        auto & alloc = state.mem.exprs.alloc;
-        auto * lambdaCopy = static_cast<ExprLambda *>(
-            alloc.allocate_bytes(sizeof(ExprLambda), alignof(ExprLambda)));
-        std::memcpy(lambdaCopy, originalLambda, sizeof(ExprLambda));
-
-        // Create an ExprBytecodeThunk for the lambda body.
-        uint32_t bodyThunkIdx = static_cast<uint32_t>(
-            const_cast<CompilationUnit *>(cu)->thunks.size());
-        const_cast<CompilationUnit *>(cu)->thunks.push_back(
-            ThunkDescriptor{desc.codeOffset, desc.pos,
-                            originalLambda ? originalLambda->body : nullptr});
-        auto * bodyThunk = state.mem.exprs.add<ExprBytecodeThunk>(
-            const_cast<CompilationUnit *>(cu), bodyThunkIdx);
-
-        // Override body on the COPY (not the original).
-        lambdaCopy->body = bodyThunk;
-
         auto * closureVal = state.allocValue();
-        closureVal->mkLambda(curEnv, lambdaCopy);
+        closureVal->mkLambda(curEnv, originalLambda);
 
         vm.push(closureVal);
         DISPATCH();

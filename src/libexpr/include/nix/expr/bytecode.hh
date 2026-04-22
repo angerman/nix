@@ -256,6 +256,11 @@ struct LambdaDescriptor
 
     /// Back-pointer to the source ExprLambda for profiling compatibility.
     ExprLambda * sourceExpr = nullptr;
+
+    /// Index into CompilationUnit::thunks for the lambda body's
+    /// ThunkDescriptor. Pre-allocated at compile time to avoid
+    /// runtime vector modifications.
+    uint32_t bodyThunkIdx = 0;
 };
 
 
