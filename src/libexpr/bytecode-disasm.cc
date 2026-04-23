@@ -84,6 +84,7 @@ const char * opName(uint8_t op)
         case OP_ATTR_SELECT_DYN: return "ATTR_SELECT_DYN";
         case OP_HAS_ATTR_DYN:   return "HAS_ATTR_DYN";
         case OP_ATTRS_DYN_INIT: return "ATTRS_DYN_INIT";
+        case OP_GET_LOCAL_0_FORCE: return "GET_LOCAL_0_FORCE";
         case OP_POS:              return "POS";
         case OP_DUP:              return "DUP";
         case OP_POP:              return "POP";

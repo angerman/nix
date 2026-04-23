@@ -203,6 +203,9 @@ enum Op : uint8_t {
     OP_HAS_ATTR_DYN     = 0x43, //                pop nameVal, peek attrs, push bool (dynamic has-attr)
     OP_ATTRS_DYN_INIT   = 0x44, // [nS:12|nD:12] build attrset with nS static + nD dynamic attrs
 
+    // -- Superinstructions (fused hot-path sequences) --
+    OP_GET_LOCAL_0_FORCE = 0x45, // [displ:24]   GET_LOCAL_0 + FORCE fused
+
     // -- Miscellaneous --
     OP_POS              = 0x3B, // [posIdx:24]    push __curPos attrset
     OP_DUP              = 0x3C, //                duplicate TOS

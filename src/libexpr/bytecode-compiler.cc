@@ -231,7 +231,13 @@ void Compiler::compileImpl(ExprOpImpl * e)
 void Compiler::compileVar(ExprVar * e)
 {
     // ExprVar::eval = lookupVar + forceValue.
-    // Emit GET_LOCAL (lazy lookup) then FORCE.
+    // Use fused superinstruction for the common level=0 case.
+    uint32_t effectiveLevel = e->level + levelOffset;
+    if (!e->fromWith && effectiveLevel == 0) {
+        unit.emitPos(e->pos);
+        unit.emit(OP_GET_LOCAL_0_FORCE, e->displ);
+        return;
+    }
     emitGetLocal(e);
     unit.emit(OP_FORCE);
 }

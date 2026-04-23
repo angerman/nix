@@ -122,6 +122,7 @@ static void traceInstruction(
             break;
         case OP_GET_LOCAL_0: case OP_GET_LOCAL_1:
         case OP_GET_LOCAL_2: case OP_GET_LOCAL_3:
+        case OP_GET_LOCAL_0_FORCE:
             fprintf(stderr, " displ=%u", operand);
             break;
         case OP_GET_LOCAL:
@@ -495,6 +496,7 @@ void vmExec(
         REGISTER_OP(OP_ATTR_SELECT_DYN,  op_attr_select_dyn);
         REGISTER_OP(OP_HAS_ATTR_DYN,    op_has_attr_dyn);
         REGISTER_OP(OP_ATTRS_DYN_INIT,  op_attrs_dyn_init);
+        REGISTER_OP(OP_GET_LOCAL_0_FORCE, op_get_local_0_force);
         REGISTER_OP(OP_HAS_ATTR,         op_has_attr);
         REGISTER_OP(OP_ATTRS_UPDATE,     op_attrs_update);
         REGISTER_OP(OP_LIST_CONCAT,      op_list_concat);
@@ -703,12 +705,55 @@ op_get_local_0:
     case OP_GET_LOCAL_0:
 #endif
     {
-        // GET_LOCAL does NOT force -- it returns the raw Value* from the env.
-        // This matches ExprVar::maybeThunk semantics (no forcing).
-        // Forcing is done by OP_FORCE which the compiler emits after
-        // GET_LOCAL when the variable IS the expression result (ExprVar::eval).
         uint32_t displ = decodeOperand(CUR_INSTR);
         vm.push(curEnv->values[displ]);
+        DISPATCH();
+    }
+
+    // Superinstruction: GET_LOCAL_0 + FORCE in one dispatch.
+    // This is the most common two-instruction sequence (compileVar
+    // emits GET_LOCAL_0 + FORCE for every variable access).
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_local_0_force:
+#else
+    case OP_GET_LOCAL_0_FORCE:
+#endif
+    {
+        uint32_t displ = decodeOperand(CUR_INSTR);
+        Value * v = curEnv->values[displ];
+        vm.push(v);
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Inline thunk trampoline (same as OP_FORCE).
+        if (v->isThunk()) {
+            Env * thunkEnv = v->thunk().env;
+            Expr * thunkExpr = v->thunk().expr;
+
+            if (thunkEnv && thunkExpr->isBytecodeThunk) {
+                auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                uint32_t thunkOffset = bcThunk->unit->thunks[bcThunk->thunkIdx].codeOffset;
+                v->mkBlackhole();
+                vm.frames.back().ip = ip;
+                vm.frames.back().env = curEnv;
+                vm.frames.push_back(CallFrame{
+                    .unit = bcThunk->unit,
+                    .ip = thunkOffset,
+                    .env = thunkEnv,
+                    .stackBaseOffset = vm.stackSize(),
+                    .resultSlot = v,
+                    .callPos = pos,
+                    .isThunkForce = true,
+                });
+                cu = bcThunk->unit;
+                ip = thunkOffset;
+                curEnv = thunkEnv;
+                DISPATCH();
+            }
+        }
+
+        // Fallback for non-bytecoded thunks, apps, non-thunks.
+        if (v->isThunk() || v->isApp()) vm.nrForceFallbacks++;
+        state.forceValue(*v, pos);
         DISPATCH();
     }
 
