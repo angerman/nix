@@ -1081,8 +1081,28 @@ op_eq:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+
+        // Fast path: scalar equality without entering eqValues.
+        bool eq;
+        if (lhs == rhs) {
+            eq = true;
+        } else if (lhs->type() == nInt && rhs->type() == nInt) {
+            eq = lhs->integer() == rhs->integer();
+        } else if (lhs->type() == nString && rhs->type() == nString) {
+            eq = lhs->string_view() == rhs->string_view();
+        } else if (lhs->type() == nBool && rhs->type() == nBool) {
+            eq = lhs->boolean() == rhs->boolean();
+        } else if (lhs->type() == nNull && rhs->type() == nNull) {
+            eq = true;
+        } else {
+            // Fall back to deep comparison for compound types.
+            eq = state.eqValues(*lhs, *rhs, pos, "while comparing two values");
+        }
+
         auto * result = state.allocValue();
-        result->mkBool(state.eqValues(*lhs, *rhs, pos, "while comparing two values"));
+        result->mkBool(eq);
         vm.push(result);
         DISPATCH();
     }
@@ -1096,8 +1116,27 @@ op_neq:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+
+        // Fast path: scalar inequality.
+        bool eq;
+        if (lhs == rhs) {
+            eq = true;
+        } else if (lhs->type() == nInt && rhs->type() == nInt) {
+            eq = lhs->integer() == rhs->integer();
+        } else if (lhs->type() == nString && rhs->type() == nString) {
+            eq = lhs->string_view() == rhs->string_view();
+        } else if (lhs->type() == nBool && rhs->type() == nBool) {
+            eq = lhs->boolean() == rhs->boolean();
+        } else if (lhs->type() == nNull && rhs->type() == nNull) {
+            eq = true;
+        } else {
+            eq = state.eqValues(*lhs, *rhs, pos, "while comparing two values");
+        }
+
         auto * result = state.allocValue();
-        result->mkBool(!state.eqValues(*lhs, *rhs, pos, "while comparing two values"));
+        result->mkBool(!eq);
         vm.push(result);
         DISPATCH();
     }
@@ -1574,10 +1613,24 @@ op_list_concat:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceList(*lhs, pos, "while evaluating the left operand of ++");
+        state.forceList(*rhs, pos, "while evaluating the right operand of ++");
+
+        auto lSize = lhs->listSize();
+        auto rSize = rhs->listSize();
 
         auto * result = state.allocValue();
-        Value * lists[2] = {lhs, rhs};
-        state.concatLists(*result, lists, pos, "while evaluating one of the elements to concatenate");
+        if (lSize == 0) { *result = *rhs; }
+        else if (rSize == 0) { *result = *lhs; }
+        else {
+            auto list = state.buildList(lSize + rSize);
+            auto * out = list.elems;
+            auto lView = lhs->listView();
+            auto rView = rhs->listView();
+            if (lSize) memcpy(out, lView.data(), lSize * sizeof(Value *));
+            if (rSize) memcpy(out + lSize, rView.data(), rSize * sizeof(Value *));
+            result->mkList(list);
+        }
 
         vm.push(result);
         DISPATCH();
