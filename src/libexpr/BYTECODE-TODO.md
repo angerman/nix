@@ -1,103 +1,72 @@
 # Bytecode VM TODO List
 
 ## Current Status
-- 34 commits, 143 unit tests, ~6,200 LOC
-- 595/595 existing nix-expr-tests pass with NIX_EVAL_BYTECODE=1 (100%)
-- nixpkgs hello evaluates correctly
+- 40+ commits, 143 unit tests, ~6,500 LOC
+- 595/595 existing nix-expr-tests pass (100%)
+- nixpkgs hello.name evaluates correctly with OP_CALL_1 trampoline + OP_FORCE trampoline
 - cardano-node (haskell.nix) evaluates correctly
-- 113 additional pattern comparisons: 0 mismatches
-- CompilationUnit caching implemented (per-EvalState Expr* -> Unit* map)
-- Tree-walker always available as ground-truth oracle
+- Non-recursive attrset inherit(expr) compiled natively (OP_INHERIT_FROM_INIT/SET)
+- Formals-binding prologue separated from body (prologueOffset in LambdaDescriptor)
+- Stack reallocation-safe (offset-based stackBase)
+- Result aliasing fixed (push resultSlot, not retVal)
 
-## Performance Baseline (debug build -O0)
-- nixpkgs hello: bytecoded 14% slower (3.18s vs 2.78s CPU)
-  - Overhead from compilation of imported files
-  - Fib(30): identical (0.23s both paths)
-  - Expected to improve with -O2 and bytecoded thunk/lambda bodies
-- VM stats: ~10K instructions per eval, ~0% OP_EVAL_EXPR fallback
+## Performance (debug build -O0)
+- nixpkgs hello: ~6% slower (3.21s vs 3.03s tree-walker)
+- VM stats: 46,582 instructions, 57 trampolined calls, 5,272 thunk forces
+- OP_EVAL_EXPR: 22 fallbacks (all `let inherit(expr)` patterns)
 
 ## Remaining OP_EVAL_EXPR Fallbacks
 
-These expression types fall back to the tree-walking evaluator.
-Replace with native bytecoded implementations for performance.
+### `let inherit(expr)` (22 hits in nixpkgs hello — ALL remaining fallbacks)
+- [ ] Implement flattened env or SET_ENV_SLOT_UP for let+inherit(expr)
+  - Challenge: inherit env is nested inside let env; SET_ENV_SLOT writes to
+    curEnv (inherit env) instead of the let env.
+  - Option A: Add OP_SET_ENV_SLOT_UP opcode that writes to curEnv->up
+  - Option B: Flatten inherit sources into extra let env slots (requires
+    adjusting ExprInheritFrom levels, complex because bindVars bound them
+    relative to a separate inherit env with up=newEnv)
+  - Option C: Push inherit env BEFORE let env (reversed order), then use
+    levelOffset. But this changes the env chain order vs bindVars.
 
-### High Priority (frequently used in nixpkgs)
-- [ ] ExprAttrs recursive (rec { })
-- [ ] ExprAttrs with inherit(expr)
-- [ ] ExprAttrs with dynamic attributes
-- [ ] ExprOpUpdate (//) -- needs correct sorted merge with RHS-wins
-- [ ] ExprLet with inherit(expr) -- needs inheritEnv support
+### Recursive attrsets with inherit or non-plain bindings (0 hits in hello)
+- [ ] `rec { inherit (expr) ...; }` — needs chooseByKind + inheritEnv
+- [ ] `rec { inherit x; }` — needs inherited binding support
+- [ ] `rec { __overrides = ...; }` — deprecated, low priority
 
-### Medium Priority
-- [ ] ExprSelect with dynamic attribute names
-- [ ] ExprSelect multi-level with 'or' default
-- [ ] ExprOpHasAttr multi-level or dynamic
+### Dynamic attribute names (0 hits in hello)
+- [ ] `{ ${name} = value; }` — runtime name evaluation
+- [ ] `a.${name}.c` in select — runtime name in attr path
+- [ ] `a ? ${name}` in hasAttr — runtime name in attr path
 
-### Low Priority
-- [ ] ExprPos (__curPos) -- rarely used
+## Inherent Tree-Walker Dependencies (cannot eliminate)
+- Primop calls (`state.callFunction` for C++ builtins)
+- `state.coerceToString` (calls `__toString` functor)
+- `state.eqValues` for compound types (recursive deep comparison)
+- App values (partial primop application → `callFunction`)
+- Functor calls (`__functor` attrset)
+- Store operations in coercion (copyPathToStore)
 
-## Profiling Infrastructure
+## Optimization Opportunities
 
-### CPU Profiling
-- [ ] Add elapsed time measurement around bytecoded vs tree-walked eval
-- [ ] Count bytecoded instructions executed vs OP_EVAL_EXPR fallbacks
-- [ ] Measure compilation time overhead
-- [ ] Compare nix eval time with/without NIX_EVAL_BYTECODE=1
-- [ ] Add per-opcode timing (which opcodes are hottest)
+### Quick Wins
+- [ ] Inline scalar equality in OP_EQ/OP_NEQ (int/string/bool compare without eqValues)
+- [ ] Inline concatLists in OP_LIST_CONCAT (force+memcpy, avoid EvalState call)
+- [ ] Direct primop dispatch in OP_CALL_1 (check isPrimOp, call fn->impl directly)
+- [ ] Fast-path string coercion in vmStrConcat (if already string, skip coerceToString)
+- [ ] Remove redundant forceValue in arithmetic/comparison opcodes (compiler should emit FORCE before)
 
-### Memory Profiling
-- [ ] Track CompilationUnit allocation sizes
-- [ ] Count thunks created by bytecoded vs tree-walked paths
-- [ ] Measure Value allocation rate in bytecoded vs tree-walked
-- [ ] Track VMState stack growth (peak stack depth, grows count)
-
-### Profiling Integration
-- [ ] Integrate with existing --show-stats infrastructure
-- [ ] Add bytecode-specific stats to the JSON output
-- [ ] Wire up nrLookups counter (currently TODO in VM)
-
-## Optimization Strategies
-
-### Phase 6a: Reduce OP_EVAL_EXPR Fallbacks
-- [ ] Implement native rec { } compilation
-- [ ] Implement native inherit(expr) env
-- [ ] Implement native ExprOpUpdate (sorted merge)
-- [ ] Implement native dynamic attributes
-
-### Phase 6b: VM Dispatch Optimization
-- [ ] Re-enable computed-goto dispatch (disabled due to stack overflow)
-      - Split vmExec into thin entry + large dispatch function
-      - Or use __attribute__((noinline)) for handler bodies
-- [ ] Add superinstructions: GET_LOCAL_0_FORCE, ATTR_SELECT_FORCE
-- [ ] Optimize OP_TRUE/OP_FALSE/OP_NULL to use singletons (issue #20)
-
-### Phase 6c: Compilation Optimization
-- [ ] Constant folding (1 + 2 -> 3 at compile time)
-- [ ] Dead code elimination (if true then A else B -> A)
-- [ ] Inline caching for attribute selection
+### Compiler Improvements
+- [ ] Constant folding (1 + 2 → 3 at compile time)
 - [ ] Tail call optimization (OP_TAIL_CALL)
+- [ ] Superinstructions (GET_LOCAL_0_FORCE, etc.)
 
-### Phase 6d: Memory Optimization
+### Memory Optimization
 - [ ] Reduce thunk allocation via strictness analysis
-- [ ] Stack-allocate intermediate Values where possible
 - [ ] Share CompilationUnits across identical file imports
 
-### Phase 6e: Advanced
-- [ ] Bytecoded lambda body execution (currently tree-walked via original ExprLambda*)
-- [ ] Bytecoded thunk body execution (currently tree-walked via original Expr*)
-- [ ] Full trampolining: bytecoded-to-bytecoded calls push CallFrame instead of recursing
-
 ## Code Quality
-
-### From Review (23 issues)
-- [ ] Add bounds checks for thunk/lambda indices in debug builds (#17)
-- [ ] Add runtime stack underflow check (#18)
-- [x] Store attribute positions in OP_ATTRS_INIT for unsafeGetAttrPos (#7)
-- [ ] Fix position tracking in inline thunk trampoline (#2)
-- [ ] Add RAII cleanup for heap-allocated arrays in exception paths (#14)
-
-### Testing
 - [ ] Run full nix functional test suite with NIX_EVAL_BYTECODE=1
-- [ ] Add property-based tests (rapidcheck) for bytecoded expressions
-- [ ] Add fuzzing for bytecoded evaluation
-- [ ] Performance regression tests (benchmarks)
+- [ ] Add property-based tests for bytecoded expressions
+- [ ] Performance regression benchmarks
+- [ ] Fix position tracking in inline thunk trampoline
+- [ ] Add RAII cleanup for heap-allocated arrays in exception paths
