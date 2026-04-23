@@ -18,6 +18,7 @@
 #include "nix/expr/tests/libexpr.hh"
 #include "nix/expr/bytecode.hh"
 #include "nix/expr/bytecode-compiler.hh"
+#include "nix/expr/ir.hh"
 #include "nix/expr/bytecode-thunk.hh"
 #include "nix/expr/vm.hh"
 
@@ -954,5 +955,55 @@ TEST_F(BytecodeVMTest, update_rhs_wins) {
     assertDualMode("({ a = 1; b = 2; } // { a = 10; c = 3; }).a");
 }
 
+
+// ===========================================================================
+// IR lowering smoke tests
+// ===========================================================================
+
+// Verify that the IR lowering doesn't crash for basic expressions.
+// These test the AST→IR pipeline, not the IR→bytecode emitter (which
+// is not yet implemented — the IR is currently a parallel data structure).
+
+TEST_F(BytecodeVMTest, ir_lower_literal) {
+    auto * e = state.parseExprFromString("42", state.rootPath(CanonPath::root));
+    e->bindVars(state, state.staticBaseEnv);
+    auto mod = ir::lower(state, e);
+    EXPECT_GE(mod.blocks.size(), 1u);
+    EXPECT_GE(mod.blocks[0].bindings.size(), 1u);
+}
+
+TEST_F(BytecodeVMTest, ir_lower_lambda) {
+    auto * e = state.parseExprFromString("x: x + 1", state.rootPath(CanonPath::root));
+    e->bindVars(state, state.staticBaseEnv);
+    auto mod = ir::lower(state, e);
+    EXPECT_GE(mod.blocks.size(), 1u);
+    // Should have at least an IRLambda binding.
+    bool hasLambda = false;
+    for (auto & b : mod.blocks[0].bindings)
+        if (std::holds_alternative<ir::IRLambda>(b.expr))
+            hasLambda = true;
+    EXPECT_TRUE(hasLambda);
+}
+
+TEST_F(BytecodeVMTest, ir_lower_let) {
+    auto * e = state.parseExprFromString("let x = 1; y = x + 2; in y", state.rootPath(CanonPath::root));
+    e->bindVars(state, state.staticBaseEnv);
+    auto mod = ir::lower(state, e);
+    EXPECT_GE(mod.blocks.size(), 1u);
+}
+
+TEST_F(BytecodeVMTest, ir_lower_attrset) {
+    auto * e = state.parseExprFromString("{ a = 1; b = 2; }", state.rootPath(CanonPath::root));
+    e->bindVars(state, state.staticBaseEnv);
+    auto mod = ir::lower(state, e);
+    EXPECT_GE(mod.blocks.size(), 1u);
+}
+
+TEST_F(BytecodeVMTest, ir_lower_inherit) {
+    auto * e = state.parseExprFromString("let x = 1; in { inherit x; }", state.rootPath(CanonPath::root));
+    e->bindVars(state, state.staticBaseEnv);
+    auto mod = ir::lower(state, e);
+    EXPECT_GE(mod.blocks.size(), 1u);
+}
 
 } // namespace nix
