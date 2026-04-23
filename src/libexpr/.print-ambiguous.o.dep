@@ -1,0 +1,101 @@
+src/libexpr/print-ambiguous.o: src/libexpr/print-ambiguous.cc config.h \
+  src/libexpr/print-ambiguous.hh src/libexpr/value.hh \
+  src/libexpr/symbol-table.hh src/libutil/types.hh src/libutil/ref.hh \
+  src/libutil/chunked-vector.hh src/libexpr/value/context.hh \
+  src/libutil/comparator.hh src/libstore/derived-path.hh \
+  src/libstore/path.hh src/libstore/outputs-spec.hh \
+  src/libutil/json-impls.hh src/libutil/variant-wrapper.hh \
+  src/libutil/config.hh src/libutil/experimental-features.hh \
+  src/libutil/error.hh src/libutil/suggestions.hh src/libutil/fmt.hh \
+  src/libutil/ansicolor.hh src/libutil/json-utils.hh \
+  src/libutil/input-accessor.hh src/libutil/source-accessor.hh \
+  src/libutil/canon-path.hh src/libutil/hash.hh src/libutil/serialise.hh \
+  src/libutil/util.hh src/libutil/logging.hh \
+  src/libutil/file-descriptor.hh src/libutil/file-system.hh \
+  src/libutil/repair-flag.hh src/libutil/source-path.hh \
+  src/libexpr/print-options.hh src/libexpr/print.hh src/libexpr/eval.hh \
+  src/libexpr/attr-set.hh src/libexpr/nixexpr.hh src/libutil/position.hh \
+  src/libexpr/search-path.hh src/libexpr/eval-inline.hh \
+  src/libutil/signals.hh
+
+config.h:
+
+src/libexpr/print-ambiguous.hh:
+
+src/libexpr/value.hh:
+
+src/libexpr/symbol-table.hh:
+
+src/libutil/types.hh:
+
+src/libutil/ref.hh:
+
+src/libutil/chunked-vector.hh:
+
+src/libexpr/value/context.hh:
+
+src/libutil/comparator.hh:
+
+src/libstore/derived-path.hh:
+
+src/libstore/path.hh:
+
+src/libstore/outputs-spec.hh:
+
+src/libutil/json-impls.hh:
+
+src/libutil/variant-wrapper.hh:
+
+src/libutil/config.hh:
+
+src/libutil/experimental-features.hh:
+
+src/libutil/error.hh:
+
+src/libutil/suggestions.hh:
+
+src/libutil/fmt.hh:
+
+src/libutil/ansicolor.hh:
+
+src/libutil/json-utils.hh:
+
+src/libutil/input-accessor.hh:
+
+src/libutil/source-accessor.hh:
+
+src/libutil/canon-path.hh:
+
+src/libutil/hash.hh:
+
+src/libutil/serialise.hh:
+
+src/libutil/util.hh:
+
+src/libutil/logging.hh:
+
+src/libutil/file-descriptor.hh:
+
+src/libutil/file-system.hh:
+
+src/libutil/repair-flag.hh:
+
+src/libutil/source-path.hh:
+
+src/libexpr/print-options.hh:
+
+src/libexpr/print.hh:
+
+src/libexpr/eval.hh:
+
+src/libexpr/attr-set.hh:
+
+src/libexpr/nixexpr.hh:
+
+src/libutil/position.hh:
+
+src/libexpr/search-path.hh:
+
+src/libexpr/eval-inline.hh:
+
+src/libutil/signals.hh:

@@ -185,7 +185,10 @@ static void traceInstruction(
             break;
         case OP_GET_STACK_SLOT:
         case OP_SET_STACK_SLOT:
+        case OP_COPY_TO_SLOT:
             fprintf(stderr, " slot=%u", operand);
+            break;
+        case OP_ALLOC_VALUE:
             break;
         default:
             if (operand) fprintf(stderr, " %u", operand);
@@ -549,6 +552,8 @@ void vmExec(
         REGISTER_OP(OP_MAKE_THUNK_V2,    op_make_thunk_v2);
         REGISTER_OP(OP_GET_STACK_SLOT,   op_get_stack_slot);
         REGISTER_OP(OP_SET_STACK_SLOT,   op_set_stack_slot);
+        REGISTER_OP(OP_ALLOC_VALUE,      op_alloc_value);
+        REGISTER_OP(OP_COPY_TO_SLOT,     op_copy_to_slot);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2329,6 +2334,43 @@ op_set_stack_slot:
             vm.push(&Value::vNull);
         }
         vm.stack[targetIdx] = v;
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Allocate a fresh Value* for recursive binding pre-allocation
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_alloc_value:
+#else
+    case OP_ALLOC_VALUE:
+#endif
+    {
+        // Allocate a fresh Value* via the GC-traced allocator.
+        // This is used to pre-allocate stack slot values for recursive
+        // let bindings so that thunks can capture a stable pointer.
+        vm.push(state.allocValue());
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Copy Value data into a pre-allocated stack slot
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_copy_to_slot:
+#else
+    case OP_COPY_TO_SLOT:
+#endif
+    {
+        uint32_t slot = decodeOperand(CUR_INSTR);
+        Value * src = vm.pop();
+        size_t base = vm.frames.back().stackBaseOffset;
+        Value * dst = vm.stack[base + slot];
+        // Copy the Value data in-place, preserving the destination pointer.
+        // Any upvalues that captured this Value* will see the updated data.
+        *dst = *src;
         DISPATCH();
     }
 

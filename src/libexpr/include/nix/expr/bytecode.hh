@@ -254,6 +254,23 @@ enum Op : uint8_t {
     /// Write a value into a stack slot.
     /// Pop TOS, store into stack[frameBase + slot].
     OP_SET_STACK_SLOT    = 0x4A, // [slot:24]       pop v, store to stack[base+slot]
+
+    // -- v2 recursive binding support --
+
+    /// Allocate a fresh Value* (via state.allocValue()) and push it.
+    /// Used to pre-allocate stack slot Value* objects for recursive
+    /// let bindings, so that thunks capturing forward references get
+    /// a stable pointer that will be updated in-place when the thunk
+    /// is later written.
+    OP_ALLOC_VALUE       = 0x4B, //                push allocValue()
+
+    /// Copy the contents of TOS into the Value* at a stack slot.
+    /// Pop the source Value*, memcpy its data into stack[base+slot].
+    /// Unlike OP_SET_STACK_SLOT which overwrites the pointer in the
+    /// slot, this copies the VALUE DATA into the existing pointer,
+    /// preserving the address for any captured upvalues that already
+    /// reference it.
+    OP_COPY_TO_SLOT      = 0x4C, // [slot:24]       pop src, copy *src into *stack[base+slot]
 };
 
 

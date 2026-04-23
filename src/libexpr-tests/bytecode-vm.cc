@@ -1237,11 +1237,92 @@ TEST_F(IREmitTest, ir_emit_map_manual) {
     assertIREmitMatch("let f = x: x + 1; in [ (f 1) (f 2) (f 3) ]");
 }
 
-// -- Recursive function --
+// -- Recursive function (self-referencing closure via forward-ref pre-alloc) --
 
-// Self-recursive function needs recursive let thunk self-reference (TODO).
-// TEST_F(IREmitTest, ir_emit_recursive_function) {
-//     assertIREmitMatch("let fac = n: if n == 0 then 1 else n * fac (n - 1); in fac 5");
+TEST_F(IREmitTest, ir_emit_recursive_function) {
+    assertIREmitMatch("let fac = n: if n == 0 then 1 else n * fac (n - 1); in fac 5");
+}
+
+TEST_F(IREmitTest, ir_emit_recursive_function_base_case) {
+    assertIREmitMatch("let fac = n: if n == 0 then 1 else n * fac (n - 1); in fac 0");
+}
+
+TEST_F(IREmitTest, ir_emit_recursive_count_down) {
+    assertIREmitMatch("let f = n: if n == 0 then 0 else f (n - 1); in f 10");
+}
+
+TEST_F(IREmitTest, ir_emit_mutual_recursion) {
+    // Mutual recursion via recursive let.
+    assertIREmitMatch(
+        "let even = n: if n == 0 then true else odd (n - 1);"
+        "    odd  = n: if n == 0 then false else even (n - 1);"
+        "in even 4"
+    );
+}
+
+TEST_F(IREmitTest, ir_emit_recursive_accumulator) {
+    assertIREmitMatch(
+        "let sum = acc: n: if n == 0 then acc else sum (acc + n) (n - 1); in sum 0 10"
+    );
+}
+
+// -- Formals lambdas ({ a, b }: ...) --
+
+TEST_F(IREmitTest, ir_emit_formals_simple) {
+    assertIREmitMatch("let f = { a, b }: a + b; in f { a = 3; b = 4; }");
+}
+
+TEST_F(IREmitTest, ir_emit_formals_default) {
+    assertIREmitMatch("let f = { x ? 10 }: x; in f { }");
+}
+
+TEST_F(IREmitTest, ir_emit_formals_default_override) {
+    assertIREmitMatch("let f = { x ? 10 }: x; in f { x = 42; }");
+}
+
+TEST_F(IREmitTest, ir_emit_formals_at_pattern) {
+    assertIREmitMatch("let f = s@{ x, y }: s.x + s.y + x + y; in f { x = 1; y = 2; }");
+}
+
+TEST_F(IREmitTest, ir_emit_formals_ellipsis) {
+    assertIREmitMatch("let f = { x, ... }: x; in f { x = 1; y = 2; z = 3; }");
+}
+
+// -- String interpolation --
+
+TEST_F(IREmitTest, ir_emit_string_interpolation) {
+    assertIREmitMatch("let x = \"world\"; in \"hello ${x}\"");
+}
+
+TEST_F(IREmitTest, ir_emit_string_interp_multi) {
+    assertIREmitMatch("let a = \"hello\"; b = \"world\"; in \"${a} ${b}\"");
+}
+
+TEST_F(IREmitTest, ir_emit_string_interp_int) {
+    assertIREmitMatch("\"${toString 42} items\"");
+}
+
+// -- With scopes --
+
+TEST_F(IREmitTest, ir_emit_with_simple) {
+    assertIREmitMatch("with { x = 42; }; x");
+}
+
+TEST_F(IREmitTest, ir_emit_with_shadow) {
+    assertIREmitMatch("let x = 1; in with { x = 2; }; x");
+}
+
+TEST_F(IREmitTest, ir_emit_with_nested) {
+    assertIREmitMatch("with { x = 1; }; with { y = 2; }; x + y");
+}
+
+// with + let interaction where with-lookup crosses a let scope boundary.
+// The v2 IR model uses stack slots for let bindings (not Env objects),
+// so the runtime env chain has fewer levels than the AST's StaticEnv
+// chain.  This causes with-lookup ExprVar levels to be wrong.
+// TODO: fix by adjusting with-lookup levels for the v2 model.
+// TEST_F(IREmitTest, ir_emit_with_let_interaction) {
+//     assertIREmitMatch("let x = 1; in with { y = 2; }; let z = 3; in x + y + z");
 // }
 
 // -- Select with or-default --

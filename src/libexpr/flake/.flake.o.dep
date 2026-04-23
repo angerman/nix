@@ -1,0 +1,153 @@
+src/libexpr/flake/flake.o: src/libexpr/flake/flake.cc config.h \
+  src/libutil/terminal.hh src/libutil/types.hh src/libutil/ref.hh \
+  src/libexpr/flake/flake.hh src/libexpr/flake/flakeref.hh \
+  src/libutil/hash.hh src/libutil/serialise.hh src/libutil/util.hh \
+  src/libutil/error.hh src/libutil/suggestions.hh \
+  src/libutil/comparator.hh src/libutil/fmt.hh src/libutil/ansicolor.hh \
+  src/libutil/logging.hh src/libutil/config.hh \
+  src/libutil/experimental-features.hh src/libutil/json-utils.hh \
+  src/libutil/file-descriptor.hh src/libutil/file-system.hh \
+  src/libfetchers/fetchers.hh src/libutil/canon-path.hh \
+  src/libfetchers/attrs.hh src/libutil/url.hh \
+  src/libstore/outputs-spec.hh src/libutil/json-impls.hh \
+  src/libutil/variant-wrapper.hh src/libexpr/flake/lockfile.hh \
+  src/libexpr/value.hh src/libexpr/symbol-table.hh \
+  src/libutil/chunked-vector.hh src/libexpr/value/context.hh \
+  src/libstore/derived-path.hh src/libstore/path.hh \
+  src/libutil/input-accessor.hh src/libutil/source-accessor.hh \
+  src/libutil/repair-flag.hh src/libutil/source-path.hh \
+  src/libexpr/print-options.hh src/libexpr/eval.hh \
+  src/libexpr/attr-set.hh src/libexpr/nixexpr.hh src/libutil/position.hh \
+  src/libexpr/search-path.hh src/libexpr/eval-inline.hh \
+  src/libexpr/eval-settings.hh src/libexpr/primops.hh \
+  src/libstore/store-api.hh src/libstore/content-address.hh \
+  src/libutil/file-content-address.hh src/libutil/fs-sink.hh \
+  src/libutil/lru-cache.hh src/libutil/sync.hh src/libstore/globals.hh \
+  src/libutil/environment-variables.hh src/libstore/path-info.hh \
+  src/libutil/signature/signer.hh src/libutil/signature/local-keys.hh \
+  src/libstore/store-dir-config.hh src/libutil/finally.hh \
+  src/libfetchers/fetch-settings.hh src/libexpr/value-to-json.hh
+
+config.h:
+
+src/libutil/terminal.hh:
+
+src/libutil/types.hh:
+
+src/libutil/ref.hh:
+
+src/libexpr/flake/flake.hh:
+
+src/libexpr/flake/flakeref.hh:
+
+src/libutil/hash.hh:
+
+src/libutil/serialise.hh:
+
+src/libutil/util.hh:
+
+src/libutil/error.hh:
+
+src/libutil/suggestions.hh:
+
+src/libutil/comparator.hh:
+
+src/libutil/fmt.hh:
+
+src/libutil/ansicolor.hh:
+
+src/libutil/logging.hh:
+
+src/libutil/config.hh:
+
+src/libutil/experimental-features.hh:
+
+src/libutil/json-utils.hh:
+
+src/libutil/file-descriptor.hh:
+
+src/libutil/file-system.hh:
+
+src/libfetchers/fetchers.hh:
+
+src/libutil/canon-path.hh:
+
+src/libfetchers/attrs.hh:
+
+src/libutil/url.hh:
+
+src/libstore/outputs-spec.hh:
+
+src/libutil/json-impls.hh:
+
+src/libutil/variant-wrapper.hh:
+
+src/libexpr/flake/lockfile.hh:
+
+src/libexpr/value.hh:
+
+src/libexpr/symbol-table.hh:
+
+src/libutil/chunked-vector.hh:
+
+src/libexpr/value/context.hh:
+
+src/libstore/derived-path.hh:
+
+src/libstore/path.hh:
+
+src/libutil/input-accessor.hh:
+
+src/libutil/source-accessor.hh:
+
+src/libutil/repair-flag.hh:
+
+src/libutil/source-path.hh:
+
+src/libexpr/print-options.hh:
+
+src/libexpr/eval.hh:
+
+src/libexpr/attr-set.hh:
+
+src/libexpr/nixexpr.hh:
+
+src/libutil/position.hh:
+
+src/libexpr/search-path.hh:
+
+src/libexpr/eval-inline.hh:
+
+src/libexpr/eval-settings.hh:
+
+src/libexpr/primops.hh:
+
+src/libstore/store-api.hh:
+
+src/libstore/content-address.hh:
+
+src/libutil/file-content-address.hh:
+
+src/libutil/fs-sink.hh:
+
+src/libutil/lru-cache.hh:
+
+src/libutil/sync.hh:
+
+src/libstore/globals.hh:
+
+src/libutil/environment-variables.hh:
+
+src/libstore/path-info.hh:
+
+src/libutil/signature/signer.hh:
+
+src/libutil/signature/local-keys.hh:
+
+src/libstore/store-dir-config.hh:
+
+src/libutil/finally.hh:
+
+src/libfetchers/fetch-settings.hh:
+
+src/libexpr/value-to-json.hh:

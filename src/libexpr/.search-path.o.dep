@@ -1,0 +1,13 @@
+src/libexpr/search-path.o: src/libexpr/search-path.cc config.h \
+  src/libexpr/search-path.hh src/libutil/types.hh src/libutil/ref.hh \
+  src/libutil/comparator.hh
+
+config.h:
+
+src/libexpr/search-path.hh:
+
+src/libutil/types.hh:
+
+src/libutil/ref.hh:
+
+src/libutil/comparator.hh:

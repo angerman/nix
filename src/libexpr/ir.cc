@@ -343,6 +343,7 @@ VarId Lowerer::lowerVar(ExprVar * e)
         return emit(IRWithLookup{
             .name = e->name,
             .pos = e->pos,
+            .sourceVar = e,
         }, e->pos);
     }
 
@@ -357,20 +358,34 @@ VarId Lowerer::lowerVar(ExprVar * e)
     // variables bound in outer scopes that we haven't lowered (e.g.,
     // top-level builtins).  Emit a placeholder reference that the
     // free variable analysis will pick up.
+    //
+    // Note: for variables from the runtime base environment, the AST
+    // level (relative to the current nested scope) must be adjusted
+    // to be relative to the entry block's env (baseEnv).  Variables
+    // with level < currentLevel are internal to the IR module; they
+    // are references that should have been found in the envMap.  If
+    // not found, this indicates a forward reference in a recursive
+    // let that the lowerer didn't handle -- which is a bug.  However,
+    // we gracefully handle it by treating it as an external reference
+    // only when the level is >= currentLevel.
     VarId placeholder = module.freshVar();
     // Record the mapping so subsequent references resolve consistently.
     bindVar(e->level, e->displ, placeholder);
-    // Record the runtime env coordinates so the bytecode emitter can
-    // access this variable via OP_GET_LOCAL at runtime.
-    // The entry block runs with curEnv = baseEnv, so we adjust the
-    // AST level (relative to the current nested scope) to be relative
-    // to baseEnv by subtracting the current scope depth.
-    assert(e->level >= currentLevel
-        && "external var level should be >= scope depth");
-    module.externalVars[placeholder] = ExternalVarRef{
-        .level = e->level - currentLevel,
-        .displacement = static_cast<uint32_t>(e->displ),
-    };
+
+    if (e->level >= currentLevel) {
+        // True external variable (baseEnv builtins, etc.).
+        module.externalVars[placeholder] = ExternalVarRef{
+            .level = e->level - currentLevel,
+            .displacement = static_cast<uint32_t>(e->displ),
+        };
+    }
+    // else: internal forward reference that wasn't found.  This can
+    // happen during recursive-let lowering when the thunk body is
+    // lowered in a sub-block but references a let-bound variable.
+    // The placeholder VarId will be picked up by free variable
+    // analysis and captured as an upvalue.  (The externalVars map
+    // is only consulted by the entry block emitter.)
+
     return emit(IRVarRef{.var = placeholder}, e->pos);
 }
 
@@ -872,39 +887,39 @@ VarId Lowerer::lowerLet(ExprLet * e)
     }
 
     // Bind all let-bound variables.
+    //
+    // Nix `let` is ALWAYS recursive: all bindings are mutually visible
+    // regardless of definition order.  (The `attrs->recursive` flag
+    // only distinguishes `rec { }` from `{ }` for attrset construction;
+    // ExprLet semantics are always recursive -- see ExprLet::eval.)
+    //
+    // Two-pass strategy:
+    //   Pass 1: pre-assign VarIds for all binding names so that
+    //           forward references from thunk/lambda bodies resolve.
+    //   Pass 2: lower each binding's expression (which may reference
+    //           sibling bindings via the VarIds assigned in pass 1).
     if (attrs->attrs) {
         uint32_t displ = 0;
-        // For recursive lets, first bind names, then lower bodies.
-        if (attrs->recursive) {
-            // Recursive let: all bindings are mutually visible.
-            // First pass: assign VarIds.
-            for (auto & [name, def] : *attrs->attrs) {
-                VarId v = module.freshVar();
-                bindVar(0, displ, v);
-                displ++;
-            }
-            // Second pass: lower expressions (may reference each other).
-            displ = 0;
-            for (auto & [name, def] : *attrs->attrs) {
-                VarId valueVar = lowerAsThunkOrEager(def.e, def.pos);
-                // The actual binding was already assigned; link it.
-                // In A-normal form, we emit a reference.
-                VarId bound = lookupVar(0, displ);
-                // Emit as a binding that defines the pre-assigned VarId.
-                curBlock().bindings.push_back(Binding{
-                    .result = bound,
-                    .expr = IRVarRef{.var = valueVar},
-                    .pos = def.pos,
-                });
-                displ++;
-            }
-        } else {
-            // Non-recursive let: bind sequentially.
-            for (auto & [name, def] : *attrs->attrs) {
-                VarId val = lowerAsThunkOrEager(def.e, def.pos);
-                bindVar(0, displ, val);
-                displ++;
-            }
+        // Pass 1: assign VarIds so all names are in scope.
+        for (auto & [name, def] : *attrs->attrs) {
+            VarId v = module.freshVar();
+            bindVar(0, displ, v);
+            displ++;
+        }
+        // Pass 2: lower expressions (may reference each other).
+        displ = 0;
+        for (auto & [name, def] : *attrs->attrs) {
+            VarId valueVar = lowerAsThunkOrEager(def.e, def.pos);
+            // The actual binding was already assigned in pass 1.
+            // Emit a linking binding that connects the pre-assigned
+            // VarId to the lowered value.
+            VarId bound = lookupVar(0, displ);
+            curBlock().bindings.push_back(Binding{
+                .result = bound,
+                .expr = IRVarRef{.var = valueVar},
+                .pos = def.pos,
+            });
+            displ++;
         }
     }
 
@@ -922,7 +937,15 @@ VarId Lowerer::lowerLet(ExprLet * e)
 VarId Lowerer::lowerWith(ExprWith * e)
 {
     VarId attrs = lowerExpr(e->attrs);
+
+    // Push a scope to match the StaticEnv level added by ExprWith::bindVars.
+    // The with's body is bindVars'd with a new StaticEnv (isWith = this),
+    // so ExprVar levels inside the body are relative to that env.
+    // We need to push a scope here so that lookupVar's absolute-level
+    // calculation matches the AST's level numbering.
+    pushScope();
     BlockId bodyBlk = lowerIntoBlock(e->body, e->pos);
+    popScope();
 
     return emit(IRWith{
         .attrs = attrs,

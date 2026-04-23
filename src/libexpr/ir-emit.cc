@@ -15,6 +15,7 @@
 
 #include <cassert>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -111,6 +112,16 @@ private:
     /// Push a variable's value onto the operand stack for capture.
     /// Used when emitting upvalue capture at a closure/thunk creation site.
     void emitCapture(ir::VarId var, PosIdx pos, BlockContext & ctx);
+
+    /// Emit a lambda body with a formals-binding prologue.
+    /// The prologue unpacks the attrset argument (pushed by OP_CALL_1 as
+    /// slot 0) into individual formal parameter slots.
+    /// Returns the code offset where the prologue begins.
+    uint32_t emitSubBlockWithFormals(
+        ir::BlockId blockId,
+        const ir::FreeVars & freeVars,
+        const ir::IRFormals & params,
+        BlockContext & parentCtx);
 };
 
 
@@ -177,9 +188,76 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
 {
     blockOffsets[block.id] = static_cast<uint32_t>(unit.code.size());
 
-    // Emit each binding.
+    // Pre-allocation pass for recursive bindings.
+    //
+    // In a recursive let, a thunk/lambda may capture a VarId that is
+    // defined by a LATER binding in the same block (forward reference).
+    // The upvalue capture (emitCapture) copies the Value* from the
+    // stack slot at creation time.  If the slot hasn't been allocated
+    // yet, emitVarRef would assert-fail.  Even if we pre-allocated the
+    // slot with a placeholder, the thunk would capture a different
+    // Value* than the one eventually written by OP_SET_STACK_SLOT.
+    //
+    // Solution: for every VarId that is both (a) defined by a binding
+    // in this block and (b) referenced as a free variable by an
+    // IRMkThunk or IRLambda in a preceding binding, we:
+    //   1. Pre-allocate a Value* with OP_ALLOC_VALUE.
+    //   2. Store it in the stack slot with OP_SET_STACK_SLOT.
+    //   3. When the actual binding is emitted, use OP_COPY_TO_SLOT
+    //      instead of OP_SET_STACK_SLOT, so the data is written into
+    //      the SAME Value* that upvalues already captured.
+    //
+    // This mirrors how v1's OP_ENTER_LET pre-allocates env slots.
+
+    // Collect the set of VarIds defined by bindings in this block.
+    std::unordered_set<ir::VarId> definedInBlock;
     for (const auto & binding : block.bindings) {
-        emitBinding(binding, ctx);
+        definedInBlock.insert(binding.result);
+    }
+
+    // Collect forward-referenced VarIds: any VarId that is in
+    // definedInBlock AND appears in the freeVars of an IRMkThunk or
+    // IRLambda in this block.
+    std::unordered_set<ir::VarId> forwardRefs;
+    for (const auto & binding : block.bindings) {
+        std::visit([&](const auto & e) {
+            using T = std::decay_t<decltype(e)>;
+            if constexpr (std::is_same_v<T, ir::IRMkThunk>
+                       || std::is_same_v<T, ir::IRLambda>) {
+                for (auto fv : e.freeVars.vars) {
+                    if (definedInBlock.count(fv))
+                        forwardRefs.insert(fv);
+                }
+            }
+        }, binding.expr);
+    }
+
+    // Pre-allocate stack slots for forward-referenced VarIds.
+    for (auto fv : forwardRefs) {
+        if (ctx.localSlots.find(fv) == ctx.localSlots.end()) {
+            uint32_t slot = ctx.allocSlot(fv);
+            unit.emit(OP_ALLOC_VALUE);
+            unit.emit(OP_SET_STACK_SLOT, slot);
+        }
+    }
+
+    // Emit each binding.  Bindings whose VarIds were pre-allocated
+    // use OP_COPY_TO_SLOT instead of OP_SET_STACK_SLOT.
+    for (const auto & binding : block.bindings) {
+        emitExpr(binding.expr, binding.pos, ctx);
+
+        if (forwardRefs.count(binding.result)) {
+            // This VarId was pre-allocated: copy the expression result
+            // into the existing Value* at the slot, preserving the
+            // pointer that upvalues may already reference.
+            auto it = ctx.localSlots.find(binding.result);
+            assert(it != ctx.localSlots.end());
+            unit.emit(OP_COPY_TO_SLOT, it->second);
+        } else {
+            // Normal binding: allocate a new slot.
+            uint32_t slot = ctx.allocSlot(binding.result);
+            unit.emit(OP_SET_STACK_SLOT, slot);
+        }
     }
 
     // Emit the terminal.
@@ -188,7 +266,7 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
 
 
 // ============================================================================
-// Binding emission
+// Binding emission (simple, for inline blocks with no forward references)
 // ============================================================================
 
 void IREmitter::emitBinding(const ir::Binding & binding, BlockContext & ctx)
@@ -258,15 +336,27 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
 
         // -- Lambda (closure creation) --
         else if constexpr (std::is_same_v<T, ir::IRLambda>) {
+            bool hasFormals = !e.params.formals.empty();
+
             // 1. Emit the lambda body as a sub-block.
-            uint32_t bodyOffset = emitSubBlock(e.bodyBlock, e.freeVars, ctx);
+            //    For formals lambdas, we emit a prologue that unpacks
+            //    the attrset argument into individual formal slots.
+            uint32_t bodyOffset;
+            uint16_t envSize;
+
+            if (hasFormals) {
+                bodyOffset = emitSubBlockWithFormals(
+                    e.bodyBlock, e.freeVars, e.params, ctx);
+                // envSize: 1 (raw arg) + number of formals + @-pattern.
+                envSize = 1 + static_cast<uint16_t>(e.params.formals.size());
+            } else {
+                bodyOffset = emitSubBlock(e.bodyBlock, e.freeVars, ctx);
+                auto & bodyBlock = module.blocks[e.bodyBlock];
+                envSize = static_cast<uint16_t>(bodyBlock.params.size());
+            }
 
             // 2. Register the lambda descriptor.
             uint32_t lambdaIdx = static_cast<uint32_t>(unit.lambdas.size());
-
-            // Compute env size from params (for v1 compatibility in callFunction).
-            auto & bodyBlock = module.blocks[e.bodyBlock];
-            uint16_t envSize = static_cast<uint16_t>(bodyBlock.params.size());
 
             // Create a body thunk descriptor (for ExprBytecodeThunk compat).
             uint32_t bodyThunkIdx = static_cast<uint32_t>(unit.thunks.size());
@@ -277,10 +367,6 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
             });
 
-            // v2 lambdas don't need Formals* for argument binding because
-            // the v2 calling convention uses the IR's parameter specification
-            // directly.  For now, set formals = nullptr.  Full formals support
-            // (for callFunction compat) is a follow-up task.
             Formals * formals = nullptr;
 
             unit.lambdas.push_back(LambdaDescriptor{
@@ -291,9 +377,9 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 .formals = formals,
                 .envSize = envSize,
                 .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
-                .sourceExpr = e.sourceExpr, // Original AST for callFunction compat
+                .sourceExpr = e.sourceExpr,
                 .bodyThunkIdx = bodyThunkIdx,
-                .prologueOffset = bodyOffset, // v2: no separate prologue
+                .prologueOffset = bodyOffset,
             });
 
             // 3. Push captured upvalues onto the operand stack.
@@ -304,7 +390,6 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             // 4. Emit OP_MAKE_CLOSURE_V2 with the upvalue count as data word.
             unit.emitPos(pos);
             unit.emit(OP_MAKE_CLOSURE_V2, lambdaIdx);
-            // Data word: number of upvalues to pop from the stack.
             unit.emit(OP_NOP, static_cast<uint32_t>(e.freeVars.size()));
         }
 
@@ -485,11 +570,11 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
 
         // -- With lookup --
         else if constexpr (std::is_same_v<T, ir::IRWithLookup>) {
-            // Fall back to OP_EVAL_EXPR for with-lookups since they need
-            // the dynamic with-chain walking from the tree-walker.
-            // Create a placeholder ExprVar to pass to the exprPool.
-            auto * var = state.mem.exprs.add<ExprVar>(e.pos, e.name);
-            uint32_t exprIdx = unit.addExpr(var);
+            // Use the original ExprVar from the AST, which has the
+            // correct fromWith chain, level, and name set by bindVars().
+            // OP_GET_WITH walks the with-chain using this information.
+            assert(e.sourceVar && "IRWithLookup must have a sourceVar");
+            uint32_t exprIdx = unit.addExpr(e.sourceVar);
             unit.emitPos(e.pos);
             unit.emit(OP_GET_WITH, exprIdx);
         }
@@ -759,6 +844,125 @@ BlockContext IREmitter::buildSubBlockContext(
     }
 
     return ctx;
+}
+
+
+// ============================================================================
+// Sub-block emission with formals prologue
+// ============================================================================
+
+uint32_t IREmitter::emitSubBlockWithFormals(
+    ir::BlockId blockId,
+    const ir::FreeVars & freeVars,
+    const ir::IRFormals & params,
+    BlockContext & parentCtx)
+{
+    const auto & block = module.blocks[blockId];
+
+    // Jump over the sub-block body in the parent's code stream.
+    uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+
+    uint32_t bodyOffset = static_cast<uint32_t>(unit.code.size());
+
+    // Build a custom BlockContext for formals lambdas.
+    //
+    // Stack layout:
+    //   slot 0: raw argument (the attrset pushed by OP_CALL_1)
+    //   slot 1..N: formal parameters (unpacked by prologue)
+    //   slot N+1..: upvalues are accessed via OP_GET_UPVALUE, not stack slots
+    //
+    // The IR body block has params = [@-pattern?, formal1, formal2, ...].
+    // We need to map each param VarId to the correct stack slot.
+
+    BlockContext subCtx;
+
+    // Free variables -> upvalue slots.
+    for (uint32_t i = 0; i < freeVars.vars.size(); ++i) {
+        subCtx.upvalueSlots[freeVars.vars[i]] = i;
+    }
+
+    // Slot 0: reserved for the raw attrset argument (pushed by caller).
+    uint32_t argSlot = subCtx.nextSlot++;
+
+    // Pre-allocate slots for all IR params.
+    // This ensures the formal slots exist in the stack frame BEFORE
+    // the prologue does any operand-stack operations (OP_DUP etc).
+    // Without pre-allocation, OP_SET_STACK_SLOT's auto-extend logic
+    // can collide with operand-stack entries.
+    for (auto p : block.params) {
+        uint32_t slot = subCtx.allocSlot(p);
+        unit.emit(OP_ALLOC_VALUE);
+        unit.emit(OP_SET_STACK_SLOT, slot);
+    }
+
+    // --- Emit the formals-binding prologue ---
+    //
+    // Read the raw attrset arg from slot 0 and force it.
+    // After this sequence, TOS = the forced attrset.
+    unit.emit(OP_GET_STACK_SLOT, argSlot);
+    unit.emit(OP_FORCE);
+
+    // If there's an @-pattern, copy the attrset into its slot.
+    if (params.arg) {
+        // The @-pattern is the first param.
+        unit.emit(OP_DUP);
+        auto it = subCtx.localSlots.find(block.params[0]);
+        assert(it != subCtx.localSlots.end());
+        unit.emit(OP_COPY_TO_SLOT, it->second);
+    }
+
+    // Unpack each formal from the attrset.
+    // The attrset remains on the operand stack (via DUP) for each select.
+    // OP_COPY_TO_SLOT writes into the pre-allocated Value* at the slot,
+    // not overwriting the operand stack pointer.
+    uint32_t formalParamStart = params.arg ? 1 : 0;
+
+    for (uint32_t i = 0; i < params.formals.size(); ++i) {
+        auto & formal = params.formals[i];
+        ir::VarId formalVarId = block.params[formalParamStart + i];
+
+        auto slotIt = subCtx.localSlots.find(formalVarId);
+        assert(slotIt != subCtx.localSlots.end());
+        uint32_t formalSlot = slotIt->second;
+
+        if (formal.defaultBody != ir::kInvalidBlock) {
+            // Formal with default: check if attr exists.
+            unit.emit(OP_DUP);
+            uint32_t symIdx = unit.addSymbol(formal.name);
+            unit.emit(OP_HAS_ATTR, symIdx);
+            uint32_t jumpToDefault = unit.emit(OP_JUMP_IF_FALSE, 0);
+
+            // Attr exists: select it and copy into the slot.
+            unit.emit(OP_DUP);
+            unit.emit(OP_ATTR_SELECT, symIdx);
+            unit.emit(OP_COPY_TO_SLOT, formalSlot);
+            uint32_t jumpPastDefault = unit.emit(OP_JUMP, 0);
+
+            // Attr missing: evaluate default.
+            unit.patchJump(jumpToDefault);
+            emitInlineBlock(formal.defaultBody, subCtx);
+            unit.emit(OP_COPY_TO_SLOT, formalSlot);
+
+            unit.patchJump(jumpPastDefault);
+        } else {
+            // Required formal: select and copy.
+            unit.emit(OP_DUP);
+            uint32_t symIdx = unit.addSymbol(formal.name);
+            unit.emit(OP_ATTR_SELECT, symIdx);
+            unit.emit(OP_COPY_TO_SLOT, formalSlot);
+        }
+    }
+
+    // Pop the attrset from the operand stack.
+    unit.emit(OP_POP);
+
+    // --- Emit the body block ---
+    emitBlock(block, subCtx);
+
+    // Patch the jump-over.
+    unit.patchJump(jumpOver);
+
+    return bodyOffset;
 }
 
 

@@ -96,6 +96,8 @@ const char * opName(uint8_t op)
         case OP_MAKE_THUNK_V2:    return "MAKE_THUNK_V2";
         case OP_GET_STACK_SLOT:   return "GET_STACK_SLOT";
         case OP_SET_STACK_SLOT:   return "SET_STACK_SLOT";
+        case OP_ALLOC_VALUE:      return "ALLOC_VALUE";
+        case OP_COPY_TO_SLOT:     return "COPY_TO_SLOT";
         default:                  return "???";
     }
 }
@@ -263,7 +265,11 @@ std::string disassemble(const CompilationUnit & unit, const EvalState * state)
 
             case OP_GET_STACK_SLOT:
             case OP_SET_STACK_SLOT:
+            case OP_COPY_TO_SLOT:
                 out << "slot=" << operand;
+                break;
+
+            case OP_ALLOC_VALUE:
                 break;
 
             default:

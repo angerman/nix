@@ -1,0 +1,167 @@
+src/libexpr/primops.o: src/libexpr/primops.cc config.h \
+  src/libutil/archive.hh src/libutil/types.hh src/libutil/ref.hh \
+  src/libutil/serialise.hh src/libutil/util.hh src/libutil/error.hh \
+  src/libutil/suggestions.hh src/libutil/comparator.hh \
+  src/libutil/fmt.hh src/libutil/ansicolor.hh src/libutil/logging.hh \
+  src/libutil/config.hh src/libutil/experimental-features.hh \
+  src/libutil/json-utils.hh src/libutil/file-descriptor.hh \
+  src/libutil/fs-sink.hh src/libutil/source-accessor.hh \
+  src/libutil/canon-path.hh src/libutil/hash.hh \
+  src/libutil/file-system.hh src/libstore/derivations.hh \
+  src/libstore/path.hh src/libstore/content-address.hh \
+  src/libutil/file-content-address.hh src/libutil/variant-wrapper.hh \
+  src/libutil/repair-flag.hh src/libstore/derived-path-map.hh \
+  src/libstore/derived-path.hh src/libstore/outputs-spec.hh \
+  src/libutil/json-impls.hh src/libutil/sync.hh \
+  src/libstore/downstream-placeholder.hh src/libexpr/eval-inline.hh \
+  src/libexpr/eval.hh src/libexpr/attr-set.hh src/libexpr/nixexpr.hh \
+  src/libexpr/value.hh src/libexpr/symbol-table.hh \
+  src/libutil/chunked-vector.hh src/libexpr/value/context.hh \
+  src/libutil/input-accessor.hh src/libutil/source-path.hh \
+  src/libexpr/print-options.hh src/libutil/position.hh \
+  src/libexpr/search-path.hh src/libexpr/eval-settings.hh \
+  src/libexpr/gc-small-vector.hh src/libstore/globals.hh \
+  src/libutil/environment-variables.hh src/libexpr/json-to-value.hh \
+  src/libstore/names.hh src/libstore/path-references.hh \
+  src/libutil/references.hh src/libstore/store-api.hh \
+  src/libutil/lru-cache.hh src/libstore/path-info.hh \
+  src/libutil/signature/signer.hh src/libutil/signature/local-keys.hh \
+  src/libstore/store-dir-config.hh src/libutil/processes.hh \
+  src/libexpr/value-to-json.hh src/libexpr/value-to-xml.hh \
+  src/libexpr/primops.hh src/libfetchers/fs-input-accessor.hh \
+  src/libfetchers/fetch-to-store.hh \
+  src/libexpr/imported-drv-to-derivation.nix.gen.hh
+
+config.h:
+
+src/libutil/archive.hh:
+
+src/libutil/types.hh:
+
+src/libutil/ref.hh:
+
+src/libutil/serialise.hh:
+
+src/libutil/util.hh:
+
+src/libutil/error.hh:
+
+src/libutil/suggestions.hh:
+
+src/libutil/comparator.hh:
+
+src/libutil/fmt.hh:
+
+src/libutil/ansicolor.hh:
+
+src/libutil/logging.hh:
+
+src/libutil/config.hh:
+
+src/libutil/experimental-features.hh:
+
+src/libutil/json-utils.hh:
+
+src/libutil/file-descriptor.hh:
+
+src/libutil/fs-sink.hh:
+
+src/libutil/source-accessor.hh:
+
+src/libutil/canon-path.hh:
+
+src/libutil/hash.hh:
+
+src/libutil/file-system.hh:
+
+src/libstore/derivations.hh:
+
+src/libstore/path.hh:
+
+src/libstore/content-address.hh:
+
+src/libutil/file-content-address.hh:
+
+src/libutil/variant-wrapper.hh:
+
+src/libutil/repair-flag.hh:
+
+src/libstore/derived-path-map.hh:
+
+src/libstore/derived-path.hh:
+
+src/libstore/outputs-spec.hh:
+
+src/libutil/json-impls.hh:
+
+src/libutil/sync.hh:
+
+src/libstore/downstream-placeholder.hh:
+
+src/libexpr/eval-inline.hh:
+
+src/libexpr/eval.hh:
+
+src/libexpr/attr-set.hh:
+
+src/libexpr/nixexpr.hh:
+
+src/libexpr/value.hh:
+
+src/libexpr/symbol-table.hh:
+
+src/libutil/chunked-vector.hh:
+
+src/libexpr/value/context.hh:
+
+src/libutil/input-accessor.hh:
+
+src/libutil/source-path.hh:
+
+src/libexpr/print-options.hh:
+
+src/libutil/position.hh:
+
+src/libexpr/search-path.hh:
+
+src/libexpr/eval-settings.hh:
+
+src/libexpr/gc-small-vector.hh:
+
+src/libstore/globals.hh:
+
+src/libutil/environment-variables.hh:
+
+src/libexpr/json-to-value.hh:
+
+src/libstore/names.hh:
+
+src/libstore/path-references.hh:
+
+src/libutil/references.hh:
+
+src/libstore/store-api.hh:
+
+src/libutil/lru-cache.hh:
+
+src/libstore/path-info.hh:
+
+src/libutil/signature/signer.hh:
+
+src/libutil/signature/local-keys.hh:
+
+src/libstore/store-dir-config.hh:
+
+src/libutil/processes.hh:
+
+src/libexpr/value-to-json.hh:
+
+src/libexpr/value-to-xml.hh:
+
+src/libexpr/primops.hh:
+
+src/libfetchers/fs-input-accessor.hh:
+
+src/libfetchers/fetch-to-store.hh:
+
+src/libexpr/imported-drv-to-derivation.nix.gen.hh:

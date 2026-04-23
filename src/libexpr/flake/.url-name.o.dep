@@ -1,0 +1,42 @@
+src/libexpr/flake/url-name.o: src/libexpr/flake/url-name.cc config.h \
+  src/libexpr/flake/url-name.hh src/libutil/url.hh src/libutil/error.hh \
+  src/libutil/suggestions.hh src/libutil/comparator.hh \
+  src/libutil/types.hh src/libutil/ref.hh src/libutil/fmt.hh \
+  src/libutil/ansicolor.hh src/libutil/url-parts.hh src/libutil/util.hh \
+  src/libutil/logging.hh src/libutil/config.hh \
+  src/libutil/experimental-features.hh src/libutil/json-utils.hh \
+  src/libutil/split.hh
+
+config.h:
+
+src/libexpr/flake/url-name.hh:
+
+src/libutil/url.hh:
+
+src/libutil/error.hh:
+
+src/libutil/suggestions.hh:
+
+src/libutil/comparator.hh:
+
+src/libutil/types.hh:
+
+src/libutil/ref.hh:
+
+src/libutil/fmt.hh:
+
+src/libutil/ansicolor.hh:
+
+src/libutil/url-parts.hh:
+
+src/libutil/util.hh:
+
+src/libutil/logging.hh:
+
+src/libutil/config.hh:
+
+src/libutil/experimental-features.hh:
+
+src/libutil/json-utils.hh:
+
+src/libutil/split.hh:

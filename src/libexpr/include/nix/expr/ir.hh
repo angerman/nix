@@ -40,6 +40,8 @@
 
 namespace nix {
 
+struct ExprVar;
+struct ExprLambda;
 struct PrimOp;
 struct Value;
 
@@ -345,6 +347,7 @@ struct IRWithLookup
 {
     Symbol name;                         ///< Attribute name to look up in with-scopes.
     PosIdx pos;                          ///< Position of the variable reference.
+    ExprVar * sourceVar = nullptr;       ///< Original AST ExprVar with fromWith chain (for OP_GET_WITH).
 };
 
 /// String interpolation / concatenation.
