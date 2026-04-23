@@ -39,11 +39,69 @@ closures that aren't in `lambdaBodyCache`.
 3. **App fast path in OP_FORCE**: Works but dead without eager registration
    (lambdas in App values aren't in cache). Infrastructure in place.
 
+### Findings (callFunction→vmExec investigation)
+
+**Confirmed:** env slot layout is identical between callFunction and
+bytecoded prologue. Both iterate `formals->formals` in sorted order
+with matching displacement assignment. `newEnv->sort()` is effectively
+a no-op since formals are pre-sorted by symbol name.
+
+**Root cause identified:** The issue is NOT env layout mismatch. The
+body code compiled for a lambda body contains OP_CALL_1 instructions
+for inner function calls (e.g., `flip = f: a: b: f b a`). When the
+body runs via vmExec, OP_CALL_1 trampolines inner bytecoded lambda
+calls through the VM path (vmBindLambdaArg + frame push) instead of
+through callFunction. This creates different env ALLOCATIONS with
+different pointer values.
+
+**Specific culprit lambda:** `flip` (`lib/trivial.nix:375:11`), which
+is `b: f b a`. When its body `f b a` is evaluated via vmExec, the
+OP_CALL_1 chain creates envs via vmBindLambdaArg. Any closures returned
+from `f b` capture these VM-allocated envs rather than callFunction-
+allocated envs. While env CONTENTS are identical, the different pointer
+identities propagate through the nixpkgs evaluation graph.
+
+**Cascade effect:** The vm-allocated envs produce closures that, when
+later forced as thunks in the nixpkgs `elaborate` function's
+self-referential `final = { ... }` attrset, evaluate through a
+different code path than the tree-walker would. This eventually causes
+`hasSharedLibraries` (which depends on `isDarwin` from `mapAttrs (n: v:
+v final.parsed) inspect.predicates`) to evaluate to `false` instead of
+`true`, making `optionalAttrs` omit the `sharedLibrary` attribute.
+
+**Reproduction:** In callFunction, after formals binding:
+```cpp
+auto bcIt = lambdaBodyCache.find(&lambda);
+if (bcIt != lambdaBodyCache.end()) {
+    auto & bc = bcIt->second;
+    auto & bodyUnit = *bc.unit;
+    uint32_t bodyOffset = bodyUnit.thunks[bc.thunkIdx].codeOffset;
+    bytecode::vmExec(*this, bodyUnit, bodyOffset, env2, vCur);
+} else {
+    lambda.body->eval(*this, env2, vCur);
+}
+```
+Fails with: `attribute 'sharedLibrary' missing` at default.nix:193.
+
+**Key insight:** The problem is that OP_CALL_1's trampoline and
+callFunction's C++ code create semantically equivalent but pointer-
+distinct envs. Something in the nixpkgs evaluation relies on env
+pointer identity — likely thunk memo tables or the file eval cache
+where thunk values are shared across multiple references. When a
+thunk is first forced via the VM path (creating vm-env closures) and
+the result is cached, subsequent accesses see the vm-env closures
+instead of the tree-walker-env closures. This difference propagates
+until a boolean predicate evaluates differently.
+
 ### Next step
-Debug the callFunction→vmExec env layout mismatch. The bodyThunkIdx
-code offset expects the env from ExprBytecodeThunk's eval context, not
-from callFunction's env2. Need to verify that callFunction's formals
-binding produces the same env slot layout as the bytecoded prologue.
+Investigate the thunk overwriting mechanism. When a Value is a thunk
+(`mkThunk`), forcing it overwrites the Value in place with the result.
+If the same thunk is forced twice — once via the tree-walker path and
+once via the vmExec path — the second forcing sees the already-forced
+value from the first path. The question is whether the VM's OP_FORCE
+handles already-forced values identically to the tree-walker's
+forceValue. Check if there's a race between concurrent thunk forces
+or if the env captured in closures affects thunk memoization.
 
 ## Completed Optimizations
 - [x] O(1) addSymbol hash map (compilation: 69ms → 38ms)
