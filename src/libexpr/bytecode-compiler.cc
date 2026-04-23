@@ -325,30 +325,78 @@ void Compiler::compileLet(ExprLet * e)
     bool hasInheritFrom = e->attrs->inheritFromExprs
         && !e->attrs->inheritFromExprs->empty();
 
-    // Fall back for let with inherit(expr) for now.
-    if (hasInheritFrom) {
-        unit.emitPos(e->attrs->pos);
-        unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
-        return;
-    }
+    // Flattened env for let with inherit(expr):
+    // Extra slots for inherit-from sources. ExprInheritFrom remapped.
+    // The desugaring approach: InheritedFrom bindings compile as
+    // thunks that evaluate `inheritFromExprs[D].attrName`.
+    uint32_t nAttrs = static_cast<uint32_t>(e->attrs->attrs->size());
+    uint32_t nInherit = hasInheritFrom
+        ? static_cast<uint32_t>(e->attrs->inheritFromExprs->size()) : 0;
 
-    uint32_t envSize = static_cast<uint32_t>(e->attrs->attrs->size());
     unit.emitPos(e->attrs->pos);
-    unit.emit(OP_ENTER_LET, envSize);
+    unit.emit(OP_ENTER_LET, nAttrs + nInherit);
+
+    // Populate inherit-from source slots (N..N+M-1) as thunks.
+    // Must be thunks because the let env may not be fully initialized
+    // (nix lets are recursive).
+    if (hasInheritFrom) {
+        inheritDisplOffset = nAttrs;
+        for (uint32_t i = 0; i < nInherit; i++) {
+            auto * fromExpr = (*e->attrs->inheritFromExprs)[i];
+            // Force thunk wrapping (bypass ExprVar eager fast path).
+            uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+            uint32_t thunkStart = static_cast<uint32_t>(unit.code.size());
+            compile(fromExpr);
+            unit.emit(OP_RETURN);
+            unit.patchJump(jumpOver);
+            uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+            unit.thunks.push_back(ThunkDescriptor{thunkStart, fromExpr->getPos(), fromExpr});
+            unit.emit(OP_MAKE_THUNK, thunkIdx);
+            unit.emit(OP_SET_ENV_SLOT, nAttrs + i);
+        }
+    }
 
     Displacement displ = 0;
     for (auto & [name, def] : *e->attrs->attrs) {
-        if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
-            levelOffset = 1;
+        if (hasInheritFrom
+            && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
+        {
+            // Desugar: compile as thunk for `inheritFromExprs[D].attrName`.
+            // The thunk captures letEnv.  ExprInheritFrom(displ=D) is remapped
+            // to the flattened slot via inheritDisplOffset, so the thunk body
+            // does GET_LOCAL_0(nAttrs+D) → the inherit-from source thunk.
+            auto * sel = dynamic_cast<ExprSelect *>(def.e);
+            auto * from = dynamic_cast<ExprInheritFrom *>(sel->e);
+            assert(sel && from);
 
-        compileAsThunkOrEager(def.e, def.pos);
+            uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+            uint32_t thunkStart = static_cast<uint32_t>(unit.code.size());
+            // Access the flattened inherit-from source slot.
+            uint32_t srcSlot = nAttrs + from->displ;
+            unit.emit(OP_GET_LOCAL_0, srcSlot);
+            unit.emit(OP_FORCE);
+            unit.emit(OP_ATTR_SELECT, unit.addSymbol(sel->getAttrPath()[0].symbol));
+            unit.emit(OP_RETURN);
+            unit.patchJump(jumpOver);
+            uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+            unit.thunks.push_back(ThunkDescriptor{thunkStart, def.pos, def.e});
+            unit.emit(OP_MAKE_THUNK, thunkIdx);
+        } else {
+            if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
+                levelOffset = 1;
 
-        if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
-            levelOffset = 0;
+            compileAsThunkOrEager(def.e, def.pos);
+
+            if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
+                levelOffset = 0;
+        }
 
         unit.emit(OP_SET_ENV_SLOT, displ);
         displ++;
     }
+
+    if (hasInheritFrom)
+        inheritDisplOffset = 0;
 
     compile(e->body);
 
@@ -831,52 +879,45 @@ void Compiler::compileAttrs(ExprAttrs * e)
     auto savedInheritOffset = inheritDisplOffset;
     auto savedLevelOffset = levelOffset;
 
-    // The non-rec attrset creates its OWN inherit env scope.
-    // The relationship between the inherit env and the bindings is
-    // independent of the enclosing scope's offset.  Reset to 0.
-    levelOffset = 0;
-
-    // Set up the inherit env if needed.
-    if (hasInheritFrom) {
-        uint32_t nInherit = static_cast<uint32_t>(e->inheritFromExprs->size());
-        unit.emitPos(e->pos);
-        unit.emit(OP_INHERIT_FROM_INIT, nInherit);
-
-        // Inherit-from expressions are bound in the outer scope.
-        // After OP_INHERIT_FROM_INIT, outer is at level+1.
-        levelOffset = 1;
-        for (uint32_t i = 0; i < nInherit; i++) {
-            auto * fromExpr = (*e->inheritFromExprs)[i];
-            compileAsThunkOrEager(fromExpr, fromExpr->getPos());
-            unit.emit(OP_INHERIT_FROM_SET, i);
-        }
-        levelOffset = 0;
-    }
-
-    // Push each attribute value onto the stack.
+    // Desugaring approach for inherit(expr) in non-rec attrsets:
+    // Instead of pushing an inherit env scope, desugar InheritedFrom
+    // bindings inline.  `inherit (src) x` → thunk that evaluates src.x.
+    // No extra scope, no levelOffset, no env chain complications.
+    //
+    // The inherit-from source expressions are compiled INSIDE each
+    // InheritedFrom thunk body.  Multiple inherited attrs from the same
+    // source will evaluate the source multiple times (but lazily via thunks,
+    // so the source is shared via the normal thunk caching in the tree-walker
+    // for the source expression itself).
     for (auto & [name, def] : *e->attrs) {
         if (hasInheritFrom
             && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
         {
-            // InheritedFrom: level=0 → inherit env. No offset.
-            compileAsThunkOrEager(def.e, def.pos);
-        } else if (hasInheritFrom) {
-            // Plain/Inherited: bound in the outer scope.
-            // The inherit env adds one extra level.
-            levelOffset = 1;
-            compileAsThunkOrEager(def.e, def.pos);
-            levelOffset = 0;
+            // Desugar: `inherit (src) x` → thunk for `src.x`
+            auto * sel = dynamic_cast<ExprSelect *>(def.e);
+            auto * from = dynamic_cast<ExprInheritFrom *>(sel->e);
+            assert(sel && from);
+
+            uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+            uint32_t thunkStart = static_cast<uint32_t>(unit.code.size());
+            // Compile the inherit-from source expression directly.
+            // The source was bound by bindVars in `env` (outer scope
+            // for non-rec attrsets).  curEnv IS the outer scope.
+            compile((*e->inheritFromExprs)[from->displ]);
+            unit.emit(OP_ATTR_SELECT, unit.addSymbol(sel->getAttrPath()[0].symbol));
+            unit.emit(OP_RETURN);
+            unit.patchJump(jumpOver);
+            uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+            unit.thunks.push_back(ThunkDescriptor{thunkStart, def.pos, def.e});
+            unit.emit(OP_MAKE_THUNK, thunkIdx);
         } else {
             compileAsThunkOrEager(def.e, def.pos);
         }
     }
 
-    // Restore and pop the inherit env if we pushed one.
+    // Restore compiler state (no scope to pop).
     levelOffset = savedLevelOffset;
     inheritDisplOffset = savedInheritOffset;
-    if (hasInheritFrom) {
-        unit.emit(OP_LEAVE_SCOPE);
-    }
 
     // OP_ATTRS_INIT nAttrs: pops nAttrs values, reads nAttrs symbol
     // indices from the following data words, builds the Bindings.
