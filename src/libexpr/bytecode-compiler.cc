@@ -677,8 +677,9 @@ void Compiler::compileSelect(ExprSelect * e)
             if (!isLast) {
                 unit.emit(OP_ATTR_SELECT, symIdx);
             } else {
-                // Last level: select the attr (success path)
+                // Last level: select + force (tree-walker always forces the result)
                 unit.emit(OP_ATTR_SELECT, symIdx);
+                unit.emit(OP_FORCE);
             }
         }
 

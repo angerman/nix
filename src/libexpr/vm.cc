@@ -1148,9 +1148,7 @@ op_eq:
             eq = state.eqValues(*lhs, *rhs, pos, "while comparing two values");
         }
 
-        auto * result = state.allocValue();
-        result->mkBool(eq);
-        vm.push(result);
+        vm.push(eq ? &Value::vTrue : &Value::vFalse);
         DISPATCH();
     }
 
@@ -1182,9 +1180,7 @@ op_neq:
             eq = state.eqValues(*lhs, *rhs, pos, "while comparing two values");
         }
 
-        auto * result = state.allocValue();
-        result->mkBool(!eq);
-        vm.push(result);
+        vm.push(eq ? &Value::vFalse : &Value::vTrue);
         DISPATCH();
     }
 
@@ -1220,9 +1216,7 @@ op_less_than:
             state.error<EvalError>("cannot compare %1% with %2%",
                 showType(*lhs), showType(*rhs)).atPos(pos).debugThrow();
 
-        auto * result = state.allocValue();
-        result->mkBool(cmpResult);
-        vm.push(result);
+        vm.push(cmpResult ? &Value::vTrue : &Value::vFalse);
         DISPATCH();
     }
 
@@ -1239,9 +1233,7 @@ op_not:
             state.error<TypeError>("expected a Boolean but found %1%: %2%",
                 showType(*v), ValuePrinter(state, *v, PrintOptions{}))
                 .atPos(pos).debugThrow();
-        auto * result = state.allocValue();
-        result->mkBool(!v->boolean());
-        vm.push(result);
+        vm.push(v->boolean() ? &Value::vFalse : &Value::vTrue);
         DISPATCH();
     }
 
@@ -1752,10 +1744,8 @@ op_has_attr:
         uint32_t symIdx = decodeOperand(CUR_INSTR);
         Value * attrs = vm.top();
         Symbol name = cu->symbols[symIdx];
-        // attrs is already forced (FORCE was emitted before HAS_ATTR).
-        auto * result = state.allocValue();
-        result->mkBool(attrs->type() == nAttrs && attrs->attrs()->get(name));
-        *(vm.sp - 1) = result;
+        bool has = attrs->type() == nAttrs && attrs->attrs()->get(name);
+        *(vm.sp - 1) = has ? &Value::vTrue : &Value::vFalse;
         DISPATCH();
     }
 
@@ -1773,9 +1763,8 @@ op_has_attr_dyn:
         state.forceStringNoCtx(*nameVal, pos,
             "while evaluating an attribute name");
         Symbol name = state.symbols.create(nameVal->string_view());
-        auto * result = state.allocValue();
-        result->mkBool(attrs->type() == nAttrs && attrs->attrs()->get(name));
-        *(vm.sp - 1) = result;
+        bool has = attrs->type() == nAttrs && attrs->attrs()->get(name);
+        *(vm.sp - 1) = has ? &Value::vTrue : &Value::vFalse;
         DISPATCH();
     }
 
