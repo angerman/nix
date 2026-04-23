@@ -830,42 +830,85 @@ void Compiler::compileAttrs(ExprAttrs * e)
         }
     }
 
-    if ((e->recursive && (hasInheritFrom || hasOverrides))) {
-        // Complex recursive attrset -- fall back.
+    if (e->recursive && hasOverrides && !hasInheritFrom) {
+        // __overrides is deprecated and very rare. Fall back.
         unit.emitPos(e->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
     }
 
     if (e->recursive) {
-        // Recursive attrset with plain bindings only (no inherit, no dynamic,
-        // no __overrides).  This is the common `rec { a = ...; b = ...; }` pattern.
+        // Recursive attrset: rec { a = ...; b = ...; inherit (src) c; ... }
         //
-        // 1. ENTER_LET creates the self-referential env
-        // 2. For each binding: create thunk capturing env, store in env slot
-        // 3. Build Bindings from env slots + symbols
-        // 4. LEAVE_SCOPE
+        // Same flattened env approach as compileLet:
+        //   slots 0..N-1 = bindings, slots N..N+M-1 = inherit-from sources.
+        // InheritedFrom bindings desugared as thunks accessing flattened slots.
+        // Inherited bindings (plain `inherit x;`) need levelOffset=+1.
         uint32_t nAttrs = static_cast<uint32_t>(e->attrs->size());
+        uint32_t nInherit = hasInheritFrom
+            ? static_cast<uint32_t>(e->inheritFromExprs->size()) : 0;
 
-        // Enter a new scope (same as let -- the env is self-referential).
         unit.emitPos(e->pos);
-        unit.emit(OP_ENTER_LET, nAttrs);
+        unit.emit(OP_ENTER_LET, nAttrs + nInherit);
 
-        // For each binding, create a thunk that captures the rec env.
+        // Populate inherit-from source slots as thunks (may reference
+        // uninitialized rec slots — must be lazy).
+        if (hasInheritFrom) {
+            inheritDisplOffset = nAttrs;
+            for (uint32_t i = 0; i < nInherit; i++) {
+                auto * fromExpr = (*e->inheritFromExprs)[i];
+                uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+                uint32_t thunkStart = static_cast<uint32_t>(unit.code.size());
+                compile(fromExpr);
+                unit.emit(OP_RETURN);
+                unit.patchJump(jumpOver);
+                uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                unit.thunks.push_back(ThunkDescriptor{thunkStart, fromExpr->getPos(), fromExpr});
+                unit.emit(OP_MAKE_THUNK, thunkIdx);
+                unit.emit(OP_SET_ENV_SLOT, nAttrs + i);
+            }
+        }
+
+        // Compile each binding.
         Displacement displ = 0;
         for (auto & [name, def] : *e->attrs) {
-            compileAsThunkOrEager(def.e, def.pos);
+            if (hasInheritFrom
+                && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
+            {
+                // Desugar: thunk for `src.attrName`
+                auto * sel = dynamic_cast<ExprSelect *>(def.e);
+                auto * from = dynamic_cast<ExprInheritFrom *>(sel->e);
+                assert(sel && from);
+
+                uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+                uint32_t thunkStart = static_cast<uint32_t>(unit.code.size());
+                unit.emit(OP_GET_LOCAL_0, nAttrs + from->displ);
+                unit.emit(OP_FORCE);
+                unit.emit(OP_SELECT_FORCE, unit.addSymbol(sel->getAttrPath()[0].symbol));
+                unit.emit(OP_RETURN);
+                unit.patchJump(jumpOver);
+                uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                unit.thunks.push_back(ThunkDescriptor{thunkStart, def.pos, def.e});
+                unit.emit(OP_MAKE_THUNK, thunkIdx);
+            } else {
+                if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
+                    levelOffset = 1;
+                compileAsThunkOrEager(def.e, def.pos);
+                if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
+                    levelOffset = 0;
+            }
             unit.emit(OP_SET_ENV_SLOT, displ);
             displ++;
         }
 
+        if (hasInheritFrom)
+            inheritDisplOffset = 0;
+
         // Build the attrset from the env slots.
-        // Push each value from the env back onto the stack for OP_ATTRS_INIT.
         for (uint32_t d = 0; d < nAttrs; d++) {
             unit.emit(OP_GET_LOCAL_0, d);
         }
         unit.emit(OP_ATTRS_INIT, nAttrs);
-        // Emit (symbol, position) data word pairs.
         for (auto & [name, def] : *e->attrs) {
             unit.emit(OP_NOP, unit.addSymbol(name));
             unit.emit(OP_NOP, unit.addPos(def.pos));
