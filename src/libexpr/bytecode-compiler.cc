@@ -326,32 +326,22 @@ void Compiler::compileLet(ExprLet * e)
         && !e->attrs->inheritFromExprs->empty();
 
     // Fall back for let with inherit(expr) — the flattened env approach
-    // needs more work to handle nixpkgs complexity.  The Inherited (plain
-    // `inherit x;`) fix is applied below for simple lets.
+    // has displacement mapping issues that need more investigation.
+    // TODO: fix the nAttrs displacement offset for ExprInheritFrom.
     if (hasInheritFrom) {
         unit.emitPos(e->attrs->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
     }
 
-    // Let-binding without inherit(expr):
-    //   OP_ENTER_LET envSize
-    //   <for each binding: compile + SET_ENV_SLOT>
-    //   <body>
-    //   OP_LEAVE_SCOPE
-    //
-    // Binding kinds after OP_ENTER_LET (curEnv = let env):
-    //   Plain:     bound in newEnv (let env). Level=0 → let env. No offset.
-    //   Inherited: bound in env (outer scope). Level=0 → outer env.
-    //              After OP_ENTER_LET, outer is at level=1. Need levelOffset=1.
-
+    // Let-binding without inherit(expr).
     uint32_t envSize = static_cast<uint32_t>(e->attrs->attrs->size());
     unit.emitPos(e->attrs->pos);
     unit.emit(OP_ENTER_LET, envSize);
 
     Displacement displ = 0;
     for (auto & [name, def] : *e->attrs->attrs) {
-        // Inherited bindings are bound in the outer scope.
+        // Inherited bindings (plain `inherit x;`) are bound in the outer scope.
         if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
             levelOffset = 1;
 
@@ -826,24 +816,25 @@ void Compiler::compileAttrs(ExprAttrs * e)
 
     uint32_t nAttrs = static_cast<uint32_t>(e->attrs->size());
 
+    // Save compiler state — nested expressions may modify these.
+    auto savedInheritOffset = inheritDisplOffset;
+    auto savedLevelOffset = levelOffset;
+
     // Set up the inherit env if needed.
     if (hasInheritFrom) {
         uint32_t nInherit = static_cast<uint32_t>(e->inheritFromExprs->size());
         unit.emitPos(e->pos);
         unit.emit(OP_INHERIT_FROM_INIT, nInherit);
 
-        // The inherit-from expressions were bound in the outer scope by
-        // bindInheritSources.  After OP_INHERIT_FROM_INIT, curEnv is the
-        // inherit env, so the outer scope is at level 1.  We need levelOffset=1
-        // when compiling these expressions so that level=0 references
-        // (to outer-scope variables) emit GET_LOCAL_1 instead of GET_LOCAL_0.
-        levelOffset = 1;
+        // Inherit-from expressions are bound in the outer scope.
+        // After OP_INHERIT_FROM_INIT, outer is at level+1.
+        levelOffset = savedLevelOffset + 1;
         for (uint32_t i = 0; i < nInherit; i++) {
             auto * fromExpr = (*e->inheritFromExprs)[i];
             compileAsThunkOrEager(fromExpr, fromExpr->getPos());
             unit.emit(OP_INHERIT_FROM_SET, i);
         }
-        levelOffset = 0;
+        levelOffset = savedLevelOffset;
     }
 
     // Push each attribute value onto the stack.
@@ -851,23 +842,23 @@ void Compiler::compileAttrs(ExprAttrs * e)
         if (hasInheritFrom
             && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
         {
-            // InheritedFrom: compile in the inherit env scope (curEnv).
-            // ExprInheritFrom has level=0, displ=D which resolves to
-            // curEnv->values[D] = the inherit-from source.  No offset needed.
+            // InheritedFrom: compiled in the inherit env scope.
+            // No offset needed — ExprInheritFrom level=0 → inherit env.
+            levelOffset = savedLevelOffset;
             compileAsThunkOrEager(def.e, def.pos);
         } else if (hasInheritFrom) {
-            // Plain/Inherited: these were bound in the outer scope.
-            // The inherit env adds one extra scope level.  Apply
-            // levelOffset=1 so GET_LOCAL skips the inherit env.
-            levelOffset = 1;
+            // Plain/Inherited: bound in the outer scope.
+            // The inherit env adds one extra level.
+            levelOffset = savedLevelOffset + 1;
             compileAsThunkOrEager(def.e, def.pos);
-            levelOffset = 0;
         } else {
             compileAsThunkOrEager(def.e, def.pos);
         }
     }
 
-    // Pop the inherit env if we pushed one.
+    // Restore and pop the inherit env if we pushed one.
+    levelOffset = savedLevelOffset;
+    inheritDisplOffset = savedInheritOffset;
     if (hasInheritFrom) {
         unit.emit(OP_LEAVE_SCOPE);
     }
