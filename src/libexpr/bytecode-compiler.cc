@@ -629,14 +629,15 @@ void Compiler::compileSelect(ExprSelect * e)
 {
     auto attrPath = e->getAttrPath();
 
-    // Fall back to tree-walking for complex cases:
-    // - Dynamic attribute names (expr in path)
-    // - Multi-level paths with 'or' default (complex jump logic)
+    // Dynamic attribute names with 'or' default + multi-level is complex.
+    // Fall back only for that case. Simple dynamic selects are handled natively.
     bool hasDynamic = false;
     for (auto & attr : attrPath)
         if (attr.expr) { hasDynamic = true; break; }
 
-    if (hasDynamic) {
+    // Dynamic names with 'or default' need HAS_ATTR_DYN for the fallback logic.
+    // Fall back for now — only 14 hits in nixpkgs hello, all in parse.nix.
+    if (hasDynamic && e->def) {
         unit.emitPos(e->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
@@ -688,8 +689,20 @@ void Compiler::compileSelect(ExprSelect * e)
 
     // Emit select for each level in the path.
     for (size_t i = 0; i < attrPath.size(); i++) {
-        uint32_t symIdx = unit.addSymbol(attrPath[i].symbol);
+        auto & attr = attrPath[i];
         bool isLast = (i == attrPath.size() - 1);
+
+        // Dynamic attribute name: compile name expr, then DYN select.
+        // (Dynamic + 'or default' was already caught above.)
+        if (attr.expr) {
+            unit.emitPos(e->pos);
+            unit.emit(OP_FORCE);
+            compile(attr.expr);
+            unit.emit(OP_ATTR_SELECT_DYN);
+            continue;
+        }
+
+        uint32_t symIdx = unit.addSymbol(attr.symbol);
 
         if (e->def && isLast) {
             // Single-level 'or' default: a.x or default

@@ -81,6 +81,7 @@ const char * opName(uint8_t op)
         case OP_INHERIT_FROM_INIT:return "INHERIT_FROM_INIT";
         case OP_INHERIT_FROM_SET: return "INHERIT_FROM_SET";
         case OP_SET_ENV_SLOT_UP:  return "SET_ENV_SLOT_UP";
+        case OP_ATTR_SELECT_DYN: return "ATTR_SELECT_DYN";
         case OP_POS:              return "POS";
         case OP_DUP:              return "DUP";
         case OP_POP:              return "POP";

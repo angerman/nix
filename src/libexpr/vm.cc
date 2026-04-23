@@ -489,6 +489,7 @@ void vmExec(
         REGISTER_OP(OP_GET_WITH,         op_get_with);
         REGISTER_OP(OP_SELECT_FORCE,     op_select_force);
         REGISTER_OP(OP_ATTR_SELECT,      op_attr_select);
+        REGISTER_OP(OP_ATTR_SELECT_DYN,  op_attr_select_dyn);
         REGISTER_OP(OP_HAS_ATTR,         op_has_attr);
         REGISTER_OP(OP_ATTRS_UPDATE,     op_attrs_update);
         REGISTER_OP(OP_LIST_CONCAT,      op_list_concat);
@@ -1466,7 +1467,66 @@ op_call_1:
             DISPATCH();
         }
 
-        // Fallback: primops, functors, non-bytecoded lambdas.
+        // ── Direct primop dispatch ──
+        // Avoids callFunction overhead (profiler hooks, call depth, loop).
+        if (fun->isPrimOp()) {
+            auto * fn = fun->primOp();
+            // state.nrPrimOpCalls is private; skip for now.
+            if (fn->arity == 1) {
+                // Saturated single-arg primop (head, length, typeOf, etc.)
+                auto * result = state.allocValue();
+                Value * argPtr = arg;
+                fn->impl(state, pos, &argPtr, *result);
+                vm.push(result);
+                DISPATCH();
+            } else {
+                // Unsaturated (arity > 1): create PrimOpApp.
+                auto * funCopy = state.allocValue();
+                *funCopy = *fun;
+                auto * result = state.allocValue();
+                result->mkPrimOpApp(funCopy, arg);
+                vm.push(result);
+                DISPATCH();
+            }
+        }
+
+        if (fun->isPrimOpApp()) {
+            // Walk the chain to find root PrimOp and count captured args.
+            size_t argsDone = 0;
+            Value * root = fun;
+            while (root->isPrimOpApp()) {
+                argsDone++;
+                root = root->primOpApp().left;
+            }
+            assert(root->isPrimOp());
+            auto * fn = root->primOp();
+            auto argsLeft = fn->arity - argsDone;
+
+            if (argsLeft == 1) {
+                // Saturated: collect all args and call.
+                // state.nrPrimOpCalls is private; skip for now.
+                Value * vArgs[maxPrimOpArity];
+                auto n = argsDone;
+                for (Value * v = fun; v->isPrimOpApp(); v = v->primOpApp().left)
+                    vArgs[--n] = v->primOpApp().right;
+                vArgs[argsDone] = arg;
+
+                auto * result = state.allocValue();
+                fn->impl(state, pos, vArgs, *result);
+                vm.push(result);
+                DISPATCH();
+            } else {
+                // Still unsaturated: extend the PrimOpApp chain.
+                auto * funCopy = state.allocValue();
+                *funCopy = *fun;
+                auto * result = state.allocValue();
+                result->mkPrimOpApp(funCopy, arg);
+                vm.push(result);
+                DISPATCH();
+            }
+        }
+
+        // Fallback: functors, non-bytecoded lambdas.
         vm.nrCallFallbacks++;
         auto * result = state.allocValue();
         state.callFunction(*fun, *arg, *result, pos);
@@ -1547,6 +1607,32 @@ op_attr_select:
             state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
                 .atPos(pos).debugThrow();
         }
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_attr_select_dyn:
+#else
+    case OP_ATTR_SELECT_DYN:
+#endif
+    {
+        // Dynamic attribute selection: pop nameVal, pop attrs.
+        // Coerce name to string, create Symbol, lookup in attrs.
+        Value * nameVal = vm.pop();
+        Value * attrs = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceStringNoCtx(*nameVal, pos,
+            "while evaluating an attribute name");
+        Symbol name = state.symbols.create(nameVal->string_view());
+        state.forceAttrs(*attrs, pos, "while selecting an attribute");
+        auto * result = state.allocValue();
+        if (auto j = attrs->attrs()->get(name)) {
+            *result = *j->value;
+        } else {
+            state.error<EvalError>("attribute '%1%' missing",
+                state.symbols[name]).atPos(pos).debugThrow();
+        }
+        vm.push(result);
         DISPATCH();
     }
 
