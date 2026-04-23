@@ -325,9 +325,10 @@ void Compiler::compileLet(ExprLet * e)
     bool hasInheritFrom = e->attrs->inheritFromExprs
         && !e->attrs->inheritFromExprs->empty();
 
-    // Fall back for let with inherit(expr) — the flattened env approach
-    // has displacement mapping issues that need more investigation.
-    // TODO: fix the nAttrs displacement offset for ExprInheritFrom.
+    // Fall back for let with inherit(expr).
+    // The OP_INHERIT_FROM_INIT approach works for simple cases but
+    // crashes on complex nixpkgs patterns due to thunk-env interaction
+    // with recursive let bindings.  Needs further investigation.
     if (hasInheritFrom) {
         unit.emitPos(e->attrs->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
@@ -407,6 +408,11 @@ void Compiler::compileAsThunkOrEager(Expr * expr, PosIdx pos)
     uint32_t thunkStart = static_cast<uint32_t>(unit.code.size());
 
     // Compile the thunk body (will be executed when forced).
+    // DO NOT reset levelOffset/inheritDisplOffset here!
+    // Thunks capture curEnv, so their variables need the same
+    // offsets to resolve through extra scope layers (e.g., the
+    // inherit-from env pushed by OP_INHERIT_FROM_INIT).
+    // Only lambda bodies reset offsets (they create fresh env chains).
     compile(expr);
     unit.emit(OP_RETURN);
 
@@ -480,7 +486,17 @@ void Compiler::compileLambda(ExprLambda * e)
     // The prologue falls through to here naturally.
     uint32_t bodyStart = static_cast<uint32_t>(unit.code.size());
 
-    compile(e->body);
+    // Reset offsets: the lambda body starts a fresh scope.
+    // All variables inside are relative to the lambda's env.
+    {
+        auto saveLO = levelOffset;
+        auto saveIDO = inheritDisplOffset;
+        levelOffset = 0;
+        inheritDisplOffset = 0;
+        compile(e->body);
+        levelOffset = saveLO;
+        inheritDisplOffset = saveIDO;
+    }
     unit.emit(OP_RETURN);
 
     // Patch the jump.

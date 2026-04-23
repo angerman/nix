@@ -197,6 +197,7 @@ enum Op : uint8_t {
     // -- Scope helpers --
     OP_INHERIT_FROM_INIT= 0x39, // [nExprs:24]    alloc inherit-from Env
     OP_INHERIT_FROM_SET = 0x3A, // [displ:24]     pop v, set in inheritEnv
+    OP_SET_ENV_SLOT_UP  = 0x41, // [displ:24]     pop v, store in curEnv->up->values[displ]
 
     // -- Miscellaneous --
     OP_POS              = 0x3B, // [posIdx:24]    push __curPos attrset

@@ -153,7 +153,7 @@ static void traceInstruction(
         case OP_ENTER_LET: case OP_INHERIT_FROM_INIT:
             fprintf(stderr, " envSize=%u", operand);
             break;
-        case OP_SET_ENV_SLOT: case OP_INHERIT_FROM_SET:
+        case OP_SET_ENV_SLOT: case OP_INHERIT_FROM_SET: case OP_SET_ENV_SLOT_UP:
             fprintf(stderr, " displ=%u", operand);
             break;
         case OP_ATTRS_INIT:
@@ -509,6 +509,7 @@ void vmExec(
         REGISTER_OP(OP_SET_ENV_SLOT, op_set_env_slot);
         REGISTER_OP(OP_INHERIT_FROM_INIT, op_inherit_from_init);
         REGISTER_OP(OP_INHERIT_FROM_SET,  op_inherit_from_set);
+        REGISTER_OP(OP_SET_ENV_SLOT_UP,   op_set_env_slot_up);
         REGISTER_OP(OP_MAKE_THUNK,   op_make_thunk);
         REGISTER_OP(OP_MAKE_CLOSURE, op_make_closure);
         REGISTER_OP(OP_CALL,         op_call);
@@ -1280,6 +1281,21 @@ op_inherit_from_set:
         uint32_t displ = decodeOperand(CUR_INSTR);
         Value * v = vm.pop();
         curEnv->values[displ] = v;
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_set_env_slot_up:
+#else
+    case OP_SET_ENV_SLOT_UP:
+#endif
+    {
+        // Store a value into the PARENT env (curEnv->up).
+        // Used by compileLet with inherit(expr): the inherit env is curEnv,
+        // and the let env is curEnv->up. Binding values go into the let env.
+        uint32_t displ = decodeOperand(CUR_INSTR);
+        Value * v = vm.pop();
+        curEnv->up->values[displ] = v;
         DISPATCH();
     }
 
