@@ -105,6 +105,9 @@ struct Expr
 
     static Counter nrExprs;
 
+    /// Set by ExprBytecodeThunk to avoid dynamic_cast in OP_FORCE hot path.
+    bool isBytecodeThunk = false;
+
     Expr()
     {
         nrExprs++;

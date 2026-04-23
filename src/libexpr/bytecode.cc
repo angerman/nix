@@ -11,12 +11,10 @@ namespace nix::bytecode {
 
 uint32_t CompilationUnit::addSymbol(Symbol sym)
 {
-    for (uint32_t i = 0; i < symbols.size(); ++i)
-        if (symbols[i] == sym)
-            return i;
-    uint32_t idx = static_cast<uint32_t>(symbols.size());
-    symbols.push_back(sym);
-    return idx;
+    auto [it, inserted] = symbolIndex.emplace(sym, static_cast<uint32_t>(symbols.size()));
+    if (inserted)
+        symbols.push_back(sym);
+    return it->second;
 }
 
 } // namespace nix::bytecode

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nix {
@@ -384,9 +385,12 @@ struct CompilationUnit : gc
     }
 
     /// Add a Symbol to the symbol pool, returning its index.
-    /// Deduplicates: returns existing index if already present.
+    /// Deduplicates via hash map (O(1) instead of linear scan).
     /// Defined in bytecode.cc (requires complete Symbol type).
     uint32_t addSymbol(Symbol sym);
+
+    /// Hash map for O(1) symbol deduplication in addSymbol.
+    std::unordered_map<Symbol, uint32_t> symbolIndex;
 
     /// Record a source position for the current instruction offset.
     /// Only emits if the position differs from the previous entry.

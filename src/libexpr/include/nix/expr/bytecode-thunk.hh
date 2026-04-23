@@ -35,7 +35,9 @@ struct ExprBytecodeThunk : Expr
     ExprBytecodeThunk(bytecode::CompilationUnit * unit, uint32_t thunkIdx)
         : unit(unit)
         , thunkIdx(thunkIdx)
-    {}
+    {
+        isBytecodeThunk = true;  // avoid dynamic_cast in OP_FORCE
+    }
 
     /// Dispatch to the bytecode VM.
     /// Declared here, defined in bytecode-thunk.cc (needs full EvalState).

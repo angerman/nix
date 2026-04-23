@@ -822,7 +822,7 @@ op_force:
             Env * thunkEnv = v->thunk().env;
             Expr * thunkExpr = v->thunk().expr;
 
-            if (thunkEnv && dynamic_cast<ExprBytecodeThunk *>(thunkExpr)) {
+            if (thunkEnv && thunkExpr->isBytecodeThunk) {
                 auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
                 uint32_t thunkOffset = bcThunk->unit->thunks[bcThunk->thunkIdx].codeOffset;
 
