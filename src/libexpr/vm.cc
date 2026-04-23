@@ -490,6 +490,7 @@ void vmExec(
         REGISTER_OP(OP_SELECT_FORCE,     op_select_force);
         REGISTER_OP(OP_ATTR_SELECT,      op_attr_select);
         REGISTER_OP(OP_ATTR_SELECT_DYN,  op_attr_select_dyn);
+        REGISTER_OP(OP_HAS_ATTR_DYN,    op_has_attr_dyn);
         REGISTER_OP(OP_HAS_ATTR,         op_has_attr);
         REGISTER_OP(OP_ATTRS_UPDATE,     op_attrs_update);
         REGISTER_OP(OP_LIST_CONCAT,      op_list_concat);
@@ -1646,6 +1647,26 @@ op_has_attr:
         Value * attrs = vm.top();
         Symbol name = cu->symbols[symIdx];
         // attrs is already forced (FORCE was emitted before HAS_ATTR).
+        auto * result = state.allocValue();
+        result->mkBool(attrs->type() == nAttrs && attrs->attrs()->get(name));
+        *(vm.sp - 1) = result;
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_has_attr_dyn:
+#else
+    case OP_HAS_ATTR_DYN:
+#endif
+    {
+        // Dynamic has-attr: pop nameVal, peek attrs, push bool.
+        // Stack: [..., attrs, nameVal] → [..., attrs, bool]
+        Value * nameVal = vm.pop();
+        Value * attrs = vm.top();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceStringNoCtx(*nameVal, pos,
+            "while evaluating an attribute name");
+        Symbol name = state.symbols.create(nameVal->string_view());
         auto * result = state.allocValue();
         result->mkBool(attrs->type() == nAttrs && attrs->attrs()->get(name));
         *(vm.sp - 1) = result;

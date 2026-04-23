@@ -635,8 +635,7 @@ void Compiler::compileSelect(ExprSelect * e)
     for (auto & attr : attrPath)
         if (attr.expr) { hasDynamic = true; break; }
 
-    // Dynamic names with 'or default' need HAS_ATTR_DYN for the fallback logic.
-    // Fall back for now — only 14 hits in nixpkgs hello, all in parse.nix.
+    // Fall back for dynamic+or-default to isolate correctness issue.
     if (hasDynamic && e->def) {
         unit.emitPos(e->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
@@ -692,13 +691,47 @@ void Compiler::compileSelect(ExprSelect * e)
         auto & attr = attrPath[i];
         bool isLast = (i == attrPath.size() - 1);
 
-        // Dynamic attribute name: compile name expr, then DYN select.
-        // (Dynamic + 'or default' was already caught above.)
+        // Dynamic attribute name.
         if (attr.expr) {
-            unit.emitPos(e->pos);
-            unit.emit(OP_FORCE);
-            compile(attr.expr);
-            unit.emit(OP_ATTR_SELECT_DYN);
+            if (e->def && isLast) {
+                // Dynamic single-level 'or' default: attrs."${name}" or default
+                //   <compile attrs>  FORCE
+                //   JUMP_IF_NOT_ATTRS -> defLabel
+                //   DUP
+                //   <compile name>  FORCE
+                //   HAS_ATTR_DYN               ; pops nameVal, replaces TOS with bool
+                //   JUMP_IF_FALSE -> defLabel2
+                //   <compile name>  FORCE       ; re-compile (cheap, usually a var)
+                //   ATTR_SELECT_DYN
+                //   JUMP -> endLabel
+                // defLabel/defLabel2:
+                //   POP
+                //   <compile default>
+                // endLabel:
+                unit.emitPos(e->pos);
+                unit.emit(OP_FORCE);
+                uint32_t jumpNotAttrs = unit.emit(OP_JUMP_IF_NOT_ATTRS, 0);
+                unit.emit(OP_DUP);
+                compile(attr.expr);
+                unit.emit(OP_FORCE);
+                unit.emit(OP_HAS_ATTR_DYN);
+                uint32_t jumpNoAttr = unit.emit(OP_JUMP_IF_FALSE, 0);
+                compile(attr.expr);
+                unit.emit(OP_FORCE);
+                unit.emit(OP_ATTR_SELECT_DYN);
+                uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
+                unit.patchJump(jumpNotAttrs);
+                unit.patchJump(jumpNoAttr);
+                unit.emit(OP_POP);
+                compile(e->def);
+                unit.patchJump(jumpEnd);
+            } else {
+                // Dynamic without default: compile name, then DYN select.
+                unit.emitPos(e->pos);
+                unit.emit(OP_FORCE);
+                compile(attr.expr);
+                unit.emit(OP_ATTR_SELECT_DYN);
+            }
             continue;
         }
 
