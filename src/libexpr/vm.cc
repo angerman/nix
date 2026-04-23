@@ -852,12 +852,45 @@ op_force:
             }
         }
 
-        // Fallback for non-bytecoded thunks, apps, non-thunks.
-        // The 70 App values and 23 non-bytecoded lambda calls are from
-        // primop internals (builtins.map, mapAttrs, genList create mkApp).
-        // Eagerly registering lambdas in lambdaBodyCache would eliminate
-        // these but breaks evaluation order for lazy fixed-points
-        // (makeExtensible in nixpkgs darwin stdenv).
+        // App fast path: primops create App(f, arg) values via mkApp.
+        // If f is a bytecoded lambda (in lambdaBodyCache), trampoline
+        // into the VM instead of tree-walking through forceValue.
+        // Safe now that forceValue marks App values as blackhole.
+        if (v->isApp()) {
+            Value * left = v->app().left;
+            Value * right = v->app().right;
+            state.forceValue(*left, pos);
+
+            if (Env * env2 = vmBindLambdaArg(state, *left, right, pos)) {
+                v->mkBlackhole();
+                vm.nrBytecodeCallTrampoline++;
+                auto & bodyInfo = state.lambdaBodyCache[left->lambda().fun];
+                auto & bodyUnit = *bodyInfo.unit;
+                bool hasFormals = left->lambda().fun->getFormals().has_value();
+                uint32_t startOffset = hasFormals
+                    ? bodyInfo.prologueOffset
+                    : bodyUnit.thunks[bodyInfo.thunkIdx].codeOffset;
+
+                vm.frames.back().ip = ip;
+                vm.frames.back().env = curEnv;
+                vm.frames.push_back(CallFrame{
+                    .unit = &bodyUnit,
+                    .ip = startOffset,
+                    .env = env2,
+                    .stackBaseOffset = vm.stackSize(),
+                    .resultSlot = v,  // update App in-place
+                    .callPos = pos,
+                    .isThunkForce = true,
+                });
+                if (hasFormals) vm.push(right);
+                cu = &bodyUnit;
+                ip = startOffset;
+                curEnv = env2;
+                DISPATCH();
+            }
+        }
+
+        // Fallback for non-bytecoded thunks, remaining apps, non-thunks.
         if (v->isThunk() || v->isApp()) vm.nrForceFallbacks++;
         state.forceValue(*v, pos);
         DISPATCH();

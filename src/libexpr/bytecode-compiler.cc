@@ -356,6 +356,10 @@ void Compiler::compileLet(ExprLet * e)
         }
     }
 
+    // Let bindings are recursive — level-0 vars may be forward refs.
+    auto savedInRecursive = inRecursiveScope;
+    inRecursiveScope = true;
+
     Displacement displ = 0;
     for (auto & [name, def] : *e->attrs->attrs) {
         if (hasInheritFrom
@@ -398,6 +402,8 @@ void Compiler::compileLet(ExprLet * e)
         displ++;
     }
 
+    inRecursiveScope = savedInRecursive;
+
     if (hasInheritFrom)
         inheritDisplOffset = 0;
 
@@ -436,11 +442,17 @@ void Compiler::compileAsThunkOrEager(Expr * expr, PosIdx pos)
     // (it's an enclosing scope that was set up before the current scope).
     // Direct GET_LOCAL is safe.
     if (auto * var = dynamic_cast<ExprVar *>(expr)) {
-        if (!var->fromWith && var->level == 0) {
-            // Level=0: potentially uninitialized (recursive let scope).
-            // Fall through to the general thunk path below.
+        // The effective level after offset adjustment determines whether
+        // the referenced env slot is guaranteed to be initialized.
+        uint32_t effectiveLevel = var->level + levelOffset;
+        if (!var->fromWith && effectiveLevel == 0 && inRecursiveScope) {
+            // Level=0 in a recursive scope (let/rec binding loop):
+            // the slot may be uninitialized (forward reference).
+            // Fall through to create a thunk, matching
+            // ExprVar::maybeThunk's null-slot fallback.
         } else {
-            // Level>0 or with-scope: already initialized. Direct lookup.
+            // Safe: level>0 (outer scope, already initialized),
+            // or level=0 but NOT in a recursive scope, or fromWith.
             emitGetLocal(var);
             return;
         }
@@ -975,7 +987,10 @@ void Compiler::compileAttrs(ExprAttrs * e)
             }
         }
 
-        // Compile each binding.
+        // Compile each binding (rec scope — level-0 may be forward refs).
+        auto savedInRecursive = inRecursiveScope;
+        inRecursiveScope = true;
+
         Displacement displ = 0;
         for (auto & [name, def] : *e->attrs) {
             if (hasInheritFrom
@@ -1006,6 +1021,8 @@ void Compiler::compileAttrs(ExprAttrs * e)
             unit.emit(OP_SET_ENV_SLOT, displ);
             displ++;
         }
+
+        inRecursiveScope = savedInRecursive;
 
         if (hasInheritFrom)
             inheritDisplOffset = 0;

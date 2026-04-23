@@ -67,6 +67,11 @@ class Compiler
     /// level before emitting the instruction.
     uint8_t levelOffset = 0;
 
+    /// True when compiling inside a recursive binding loop (let/rec
+    /// attrset).  Level-0 ExprVar references may be forward references
+    /// to uninitialized env slots and must be wrapped in thunks.
+    bool inRecursiveScope = false;
+
     /// Displacement offset for ExprInheritFrom nodes in the flattened
     /// let env approach.  When compiling `let inherit(expr) ...`, the
     /// let env is extended with extra slots for inherit-from sources.

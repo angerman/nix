@@ -115,10 +115,21 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             nrThunkChains++;
     } else if (v.isApp()) {
         nrThunksForced++;
+        // Extract left/right BEFORE marking blackhole (mkBlackhole
+        // overwrites the App storage).  Mark blackhole so re-entrant
+        // forcing of the same App value detects infinite recursion
+        // (previously, Apps had no re-entrancy protection — the VM's
+        // eager lambda registration exposed this via primop-created
+        // App values in makeExtensible chains).
+        Value * left = v.app().left;
+        Value * right = v.app().right;
         Value savedApp = v;
+        v.mkBlackhole();
         try {
-            callFunction(*v.app().left, *v.app().right, v, pos);
+            callFunction(*left, *right, v, pos);
         } catch (...) {
+            // Restore the App for error reporting, then handle.
+            v = savedApp;
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
