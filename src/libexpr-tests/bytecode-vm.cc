@@ -588,6 +588,31 @@ TEST_F(BytecodeVMTest, regression_inherit_select_force) {
                    "in let inherit (lib) map; in map (x: x * 2) [1 2 3]");
 }
 
+// Dynamic select with or-default: attr found.
+TEST_F(BytecodeVMTest, regression_dyn_select_or_found) {
+    assertDualMode("let m = { a = 1; b = 2; }; n = \"a\"; in m.\"${n}\" or 99");
+}
+
+// Dynamic select with or-default: attr missing → default.
+TEST_F(BytecodeVMTest, regression_dyn_select_or_missing) {
+    assertDualMode("let m = { a = 1; }; n = \"z\"; in m.\"${n}\" or 99");
+}
+
+// Dynamic select with or-default: base is not an attrset → default.
+TEST_F(BytecodeVMTest, regression_dyn_select_or_not_attrset) {
+    assertDualMode("let m = 42; n = \"a\"; in m.\"${n}\" or 99");
+}
+
+// Dynamic select with thunk values (thunk must be forced after select).
+TEST_F(BytecodeVMTest, regression_dyn_select_thunk_value) {
+    assertDualMode("let m = rec { x = 1 + 1; }; n = \"x\"; in m.\"${n}\" or 0");
+}
+
+// __functor call.
+TEST_F(BytecodeVMTest, regression_functor_call) {
+    assertDualMode("let f = { __functor = self: x: x + self.base; base = 10; }; in f 5");
+}
+
 // Multiple inherit-from sources in a let with forward references.
 TEST_F(BytecodeVMTest, regression_let_inherit_from_multi_source) {
     assertDualMode("let inherit ({ a = 1; }) a; inherit ({ b = 2; }) b; c = a + b; in c");

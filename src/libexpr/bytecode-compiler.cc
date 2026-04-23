@@ -635,8 +635,8 @@ void Compiler::compileSelect(ExprSelect * e)
     for (auto & attr : attrPath)
         if (attr.expr) { hasDynamic = true; break; }
 
-    // Fall back for dynamic+or-default to isolate correctness issue.
-    if (hasDynamic && e->def) {
+    // Dynamic + multi-level or-default is complex. Fall back.
+    if (hasDynamic && e->def && attrPath.size() > 1) {
         unit.emitPos(e->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
@@ -719,6 +719,7 @@ void Compiler::compileSelect(ExprSelect * e)
                 compile(attr.expr);
                 unit.emit(OP_FORCE);
                 unit.emit(OP_ATTR_SELECT_DYN);
+                unit.emit(OP_FORCE); // force result (tree-walker always does)
                 uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
                 unit.patchJump(jumpNotAttrs);
                 unit.patchJump(jumpNoAttr);
@@ -758,6 +759,7 @@ void Compiler::compileSelect(ExprSelect * e)
             unit.emit(OP_HAS_ATTR, symIdx);
             uint32_t jumpNoAttr = unit.emit(OP_JUMP_IF_FALSE, 0);
             unit.emit(OP_ATTR_SELECT, symIdx);
+            unit.emit(OP_FORCE); // force result (tree-walker always does)
             uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
             unit.patchJump(jumpNotAttrs);
             unit.patchJump(jumpNoAttr);

@@ -1527,7 +1527,70 @@ op_call_1:
             }
         }
 
-        // Fallback: functors, non-bytecoded lambdas.
+        // ── Functor dispatch (__functor attrset) ──
+        // { __functor = self: arg: body; } arg
+        // → (__functor self) arg (two sequential calls)
+        // Step 1 uses callFunction (the __functor value is arbitrary).
+        // Step 2 tries VM fast paths for the result.
+        if (fun->type() == nAttrs) {
+            if (auto * functorAttr = fun->attrs()->get(state.s.functor)) {
+                Value * self = state.allocValue();
+                *self = *fun;
+
+                // Step 1: __functor(self) → partial.
+                Value * partial = state.allocValue();
+                state.callFunction(*functorAttr->value, *self, *partial, functorAttr->pos);
+
+                // Step 2: partial(arg) — try VM fast paths.
+                state.forceValue(*partial, pos);
+
+                if (Env * env2 = vmBindLambdaArg(state, *partial, arg, pos)) {
+                    vm.nrBytecodeCallTrampoline++;
+                    auto & bodyInfo = state.lambdaBodyCache[partial->lambda().fun];
+                    auto & bodyUnit = *bodyInfo.unit;
+                    bool hasFormals = partial->lambda().fun->getFormals().has_value();
+                    uint32_t startOffset = hasFormals
+                        ? bodyInfo.prologueOffset
+                        : bodyUnit.thunks[bodyInfo.thunkIdx].codeOffset;
+
+                    vm.frames.back().ip = ip;
+                    vm.frames.back().env = curEnv;
+                    auto * result = state.allocValue();
+                    vm.frames.push_back(CallFrame{
+                        .unit = &bodyUnit,
+                        .ip = startOffset,
+                        .env = env2,
+                        .stackBaseOffset = vm.stackSize(),
+                        .resultSlot = result,
+                        .callPos = pos,
+                    });
+                    if (hasFormals) vm.push(arg);
+                    cu = &bodyUnit;
+                    ip = startOffset;
+                    curEnv = env2;
+                    DISPATCH();
+                }
+
+                if (partial->isPrimOp()) {
+                    auto * fn = partial->primOp();
+                    if (fn->arity == 1) {
+                        auto * result = state.allocValue();
+                        Value * argPtr = arg;
+                        fn->impl(state, pos, &argPtr, *result);
+                        vm.push(result);
+                        DISPATCH();
+                    }
+                }
+
+                // Fallback for step 2.
+                auto * result = state.allocValue();
+                state.callFunction(*partial, *arg, *result, pos);
+                vm.push(result);
+                DISPATCH();
+            }
+        }
+
+        // Fallback: non-bytecoded lambdas, exotic cases.
         vm.nrCallFallbacks++;
         auto * result = state.allocValue();
         state.callFunction(*fun, *arg, *result, pos);
@@ -1626,14 +1689,15 @@ op_attr_select_dyn:
             "while evaluating an attribute name");
         Symbol name = state.symbols.create(nameVal->string_view());
         state.forceAttrs(*attrs, pos, "while selecting an attribute");
-        auto * result = state.allocValue();
         if (auto j = attrs->attrs()->get(name)) {
-            *result = *j->value;
+            // Push the POINTER (not a copy) — same as OP_ATTR_SELECT.
+            // Thunk memoization requires pointer identity: forceValue
+            // updates the Value in-place, and all holders must see it.
+            vm.push(j->value);
         } else {
             state.error<EvalError>("attribute '%1%' missing",
                 state.symbols[name]).atPos(pos).debugThrow();
         }
-        vm.push(result);
         DISPATCH();
     }
 
