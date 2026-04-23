@@ -1,48 +1,48 @@
 # Bytecode VM TODO List
 
 ## Current Status
-- 60+ commits, 152 bytecode tests + 452 other tests = 604 total
-- All 604 tests pass
+- 70+ commits, 160 bytecode tests + 452 other = 612 total
+- ALL 612 tests pass
 - nixpkgs hello.name evaluates correctly
-- Desugared inherit(expr) for let, non-rec attrsets, AND rec attrsets
-- Forward reference fix for recursive let bindings (level=0 thunk wrapping)
-- SELECT_FORCE for desugared thunks (force after attribute selection)
-- Inline concatLists + scalar equality in VM
+- 0 OP_EVAL_EXPR fallbacks (all expressions compiled natively)
+- Execution is 2% FASTER than tree-walker at -O2
 
-## Performance (debug build -O0)
-- nixpkgs hello: ~20% overhead (3.75s vs 3.1s tree-walker)
-  - 558ms (15%) spent in bytecode compilation alone
-  - Bytecoded execution is FASTER than tree-walker after compilation
-- VM stats:
-  - 163,912 bytecoded instructions
-  - 13,597 bytecoded thunk forces
-  - 3,666 trampolined lambda calls
-  - 14,692 OP_CALL_1 tree-walker calls (primops)
-  - 71 OP_FORCE tree-walker calls
-  - 15 OP_EVAL_EXPR fallbacks
-  - 251 compilation units (all cold)
+## Performance at -O2 (final)
+| Metric | Tree-walker | Bytecode VM |
+|---|---|---|
+| Median time | 460ms | 490ms (+6.5%) |
+| Compilation | 0ms | 39ms |
+| Execution | 460ms | **451ms (-2%)** |
+| GC time | 5ms | 32ms (+6x) |
+| Total memory | 72.5MB | 84.6MB (+17%) |
+| Value allocs | 16.4MB | 17.2MB (+5%) |
 
-## Remaining 15 OP_EVAL_EXPR Fallbacks
+## Remaining Tree-Walker Fallbacks (inherent)
+- 70 OP_FORCE: App values from primops (builtins.map, mapAttrs, genList)
+- 23 OP_CALL_1: non-bytecoded lambdas from App forcing cascade
 
-### Dynamic ExprSelect (14 hits)
-`(attrset)."${expr}"` patterns in lib/systems/parse.nix.
-Requires runtime string-to-symbol conversion via `state.symbols.create()`.
-- [ ] Add OP_ATTR_SELECT_DYN that pops a string name + attrset, does dynamic lookup
+These cannot be eliminated with the current architecture: the VM's
+frame-based trampoline keeps all intermediate App blackholes active
+simultaneously, while the tree-walker resolves them sequentially via
+C-stack recursion. Eager lambda registration breaks makeExtensible's
+fixed-point evaluation in nixpkgs darwin stdenv.
 
-### Non-rec attrset with special bindings (1 hit)
-`{ description = "..." ... }` in modules — has non-plain bindings.
-- [ ] Investigate: likely an `inherit` binding without `(expr)`
+## Memory/GC Optimization (highest priority)
+- [ ] Reduce CompilationUnit memory (251 units × vectors)
+- [ ] Lazy compilation (compile on first force, not on import)
+- [ ] Share thunk descriptors across units
+- [ ] Pre-size vectors based on AST size estimates
+- [ ] Consider arena allocation for compilation artifacts
 
-## Inherent Tree-Walker Dependencies
-- Primop calls (14,692 OP_CALL_1 fallbacks — C++ builtins)
-- state.coerceToString (__toString functor)
-- state.eqValues for compound types (recursive)
-- App values (partial primop application)
-
-## Optimization Opportunities
-- [ ] Direct primop dispatch in OP_CALL_1 (avoid callFunction overhead)
-- [ ] OP_ATTR_SELECT_DYN for dynamic attribute names
-- [ ] Reduce level=0 thunk wrapping overhead (only wrap when forward ref is possible)
-- [ ] -O2 build to reduce compilation overhead
-- [ ] Compilation caching across evaluations
-- [ ] Constant folding, tail call optimization
+## Execution Optimizations
+- [x] O(1) addSymbol hash map (compilation: 69ms → 39ms)
+- [x] Eliminate dynamic_cast in OP_FORCE (bool flag)
+- [x] Singleton booleans (no allocation for bool results)
+- [x] Inline concatLists + scalar equality
+- [x] Direct primop dispatch + PrimOpApp handling
+- [x] __functor dispatch
+- [x] App blackhole protection in forceValue
+- [x] Selective level-0 thunk wrapping
+- [ ] Superinstruction: OP_GET_LOCAL_0_FORCE
+- [ ] Inline lambda body cache lookup (avoid hash map per call)
+- [ ] Persistent bytecode cache (serialize to disk)
