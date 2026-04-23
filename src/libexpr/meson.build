@@ -161,6 +161,7 @@ sources = files(
   'bytecode-compiler.cc',
   'bytecode-disasm.cc',
   'bytecode-thunk.cc',
+  'ir.cc',
   'vm.cc',
   'diagnose.cc',
   'eval-cache.cc',
