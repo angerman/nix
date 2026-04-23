@@ -856,10 +856,68 @@ void Compiler::compileAttrs(ExprAttrs * e)
     bool hasInheritFrom = e->inheritFromExprs && !e->inheritFromExprs->empty();
     bool hasDynamic = e->dynamicAttrs && !e->dynamicAttrs->empty();
 
-    if (hasDynamic) {
-        // Dynamic attrs require runtime name evaluation -- fall back.
+    if (hasDynamic && e->recursive) {
+        // Recursive + dynamic is very rare and complex. Fall back.
         unit.emitPos(e->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
+        return;
+    }
+
+    if (hasDynamic && !e->recursive) {
+        // Non-recursive attrset with dynamic attrs.
+        // Use OP_ATTRS_DYN_INIT: compile static attrs + dynamic name/value pairs.
+        uint32_t nStatic  = static_cast<uint32_t>(e->attrs->size());
+        uint32_t nDynamic = static_cast<uint32_t>(e->dynamicAttrs->size());
+
+        // Save/restore offsets for nesting.
+        auto savedLevelOffset = levelOffset;
+        auto savedInheritOffset = inheritDisplOffset;
+
+        // 1. Push static attr values (in sorted map order).
+        for (auto & [name, def] : *e->attrs) {
+            if (hasInheritFrom
+                && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
+            {
+                auto * sel = dynamic_cast<ExprSelect *>(def.e);
+                auto * from = dynamic_cast<ExprInheritFrom *>(sel->e);
+                assert(sel && from);
+                uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+                uint32_t thunkStart = static_cast<uint32_t>(unit.code.size());
+                compile((*e->inheritFromExprs)[from->displ]);
+                unit.emit(OP_SELECT_FORCE, unit.addSymbol(sel->getAttrPath()[0].symbol));
+                unit.emit(OP_RETURN);
+                unit.patchJump(jumpOver);
+                uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                unit.thunks.push_back(ThunkDescriptor{thunkStart, def.pos, def.e});
+                unit.emit(OP_MAKE_THUNK, thunkIdx);
+            } else {
+                compileAsThunkOrEager(def.e, def.pos);
+            }
+        }
+
+        // 2. Push dynamic name/value pairs.
+        for (auto & dyn : *e->dynamicAttrs) {
+            compile(dyn.nameExpr);
+            compileAsThunkOrEager(dyn.valueExpr, dyn.pos);
+        }
+
+        // 3. Emit OP_ATTRS_DYN_INIT with inline data words.
+        unit.emitPos(e->pos);
+        assert(nStatic < 4096 && nDynamic < 4096);
+        unit.emit(OP_ATTRS_DYN_INIT, (nStatic << 12) | nDynamic);
+
+        // Static attr data words (symbol, position pairs).
+        for (auto & [name, def] : *e->attrs) {
+            unit.emit(OP_NOP, unit.addSymbol(name));
+            unit.emit(OP_NOP, unit.addPos(def.pos));
+        }
+        // Dynamic attr data words (position only — name comes from stack).
+        for (auto & dyn : *e->dynamicAttrs) {
+            unit.emit(OP_NOP, unit.addPos(dyn.pos));
+        }
+
+        levelOffset = savedLevelOffset;
+        inheritDisplOffset = savedInheritOffset;
         return;
     }
 

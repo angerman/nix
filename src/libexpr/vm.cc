@@ -161,6 +161,9 @@ static void traceInstruction(
         case OP_ATTRS_INIT:
             fprintf(stderr, " nAttrs=%u", operand);
             break;
+        case OP_ATTRS_DYN_INIT:
+            fprintf(stderr, " nStatic=%u nDynamic=%u", operand >> 12, operand & 0xFFF);
+            break;
         case OP_LIST_INIT:
             fprintf(stderr, " size=%u", operand);
             break;
@@ -491,6 +494,7 @@ void vmExec(
         REGISTER_OP(OP_ATTR_SELECT,      op_attr_select);
         REGISTER_OP(OP_ATTR_SELECT_DYN,  op_attr_select_dyn);
         REGISTER_OP(OP_HAS_ATTR_DYN,    op_has_attr_dyn);
+        REGISTER_OP(OP_ATTRS_DYN_INIT,  op_attrs_dyn_init);
         REGISTER_OP(OP_HAS_ATTR,         op_has_attr);
         REGISTER_OP(OP_ATTRS_UPDATE,     op_attrs_update);
         REGISTER_OP(OP_LIST_CONCAT,      op_list_concat);
@@ -1906,6 +1910,81 @@ op_attrs_init:
 
         if (values != stackValues)
             delete[] values;
+
+        vm.push(result);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_attrs_dyn_init:
+#else
+    case OP_ATTRS_DYN_INIT:
+#endif
+    {
+        // Mixed static+dynamic attrset builder.
+        // Operand: [nStatic:12 | nDynamic:12]
+        // Stack: [static_vals...] [dyn_name, dyn_val] pairs...
+        // Data words: (symIdx, posIdx) pairs for static attrs,
+        //             then posIdx for each dynamic attr.
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t nStatic  = operand >> 12;
+        uint32_t nDynamic = operand & 0xFFF;
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Pop dynamic name+value pairs (reverse stack order).
+        constexpr uint32_t kMaxDyn = 32;
+        struct DynPair { Value * name; Value * val; };
+        DynPair dynStack[kMaxDyn];
+        DynPair * dynPairs = nDynamic <= kMaxDyn ? dynStack : new DynPair[nDynamic];
+        for (uint32_t i = nDynamic; i > 0; --i) {
+            dynPairs[i-1].val  = vm.pop();
+            dynPairs[i-1].name = vm.pop();
+        }
+
+        // Pop static values (reverse stack order).
+        constexpr uint32_t kMaxStatic = 64;
+        Value * staticStack[kMaxStatic];
+        Value ** staticVals = nStatic <= kMaxStatic ? staticStack : new Value*[nStatic];
+        for (uint32_t i = nStatic; i > 0; --i)
+            staticVals[i-1] = vm.pop();
+
+        // Build bindings with max capacity.
+        auto bindings = state.buildBindings(nStatic + nDynamic);
+
+        // Insert static attrs (already sorted from compiler).
+        for (uint32_t i = 0; i < nStatic; i++) {
+            uint32_t symIdx = decodeOperand(cu->code[ip++]);
+            uint32_t posIdx = decodeOperand(cu->code[ip++]);
+            Symbol name = cu->symbols[symIdx];
+            PosIdx attrPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
+            bindings.insert(name, staticVals[i], attrPos);
+        }
+
+        // Process dynamic attrs.
+        bool needsSort = false;
+        for (uint32_t i = 0; i < nDynamic; i++) {
+            uint32_t posIdx = decodeOperand(cu->code[ip++]);
+            PosIdx dynPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
+
+            state.forceValue(*dynPairs[i].name, dynPos);
+
+            // Null name → skip this attribute.
+            if (dynPairs[i].name->type() == nNull)
+                continue;
+
+            state.forceStringNoCtx(*dynPairs[i].name, dynPos,
+                "while evaluating the name of a dynamic attribute");
+            auto nameSym = state.symbols.create(dynPairs[i].name->string_view());
+
+            bindings.insert(nameSym, dynPairs[i].val, dynPos);
+            needsSort = true;
+        }
+
+        auto * result = state.allocValue();
+        result->mkAttrs(needsSort ? bindings.finish() : bindings.alreadySorted());
+
+        if (staticVals != staticStack) delete[] staticVals;
+        if (dynPairs != dynStack) delete[] dynPairs;
 
         vm.push(result);
         DISPATCH();

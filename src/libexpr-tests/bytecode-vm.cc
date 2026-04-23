@@ -613,6 +613,19 @@ TEST_F(BytecodeVMTest, regression_functor_call) {
     assertDualMode("let f = { __functor = self: x: x + self.base; base = 10; }; in f 5");
 }
 
+// Dynamic attributes: null name → skip, string name → insert.
+TEST_F(BytecodeVMTest, regression_dynamic_attrs_null_skip) {
+    assertDualMode("{ ${ null } = 1; a = 2; }.a");
+}
+
+TEST_F(BytecodeVMTest, regression_dynamic_attrs_string_name) {
+    assertDualMode("{ ${ \"x\" } = 1; a = 2; }.x");
+}
+
+TEST_F(BytecodeVMTest, regression_dynamic_attrs_conditional) {
+    assertDualMode("let b = false; in { ${ if b then \"x\" else null } = 1; a = 2; }.a");
+}
+
 // Multiple inherit-from sources in a let with forward references.
 TEST_F(BytecodeVMTest, regression_let_inherit_from_multi_source) {
     assertDualMode("let inherit ({ a = 1; }) a; inherit ({ b = 2; }) b; c = a + b; in c");

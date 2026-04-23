@@ -200,6 +200,7 @@ enum Op : uint8_t {
     OP_SET_ENV_SLOT_UP  = 0x41, // [displ:24]     pop v, store in curEnv->up->values[displ]
     OP_ATTR_SELECT_DYN  = 0x42, //                pop nameVal+attrs, select attr by string name
     OP_HAS_ATTR_DYN     = 0x43, //                pop nameVal, peek attrs, push bool (dynamic has-attr)
+    OP_ATTRS_DYN_INIT   = 0x44, // [nS:12|nD:12] build attrset with nS static + nD dynamic attrs
 
     // -- Miscellaneous --
     OP_POS              = 0x3B, // [posIdx:24]    push __curPos attrset
