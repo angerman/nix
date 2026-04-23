@@ -2118,6 +2118,11 @@ op_eval_expr:
         Expr * expr = cu->exprPool[exprIdx];
         vm.nrEvalExprFallbacks++;
         if (getEnv("NIX_VM_TRACE_FALLBACK").value_or("") == "1") {
+            fprintf(stderr, "[FALLBACK #%llu] %s cu=%p exprIdx=%u\n",
+                (unsigned long long)vm.nrEvalExprFallbacks,
+                typeid(*expr).name(), (void*)cu, exprIdx);
+        }
+        if (getEnv("NIX_VM_TRACE_FALLBACK").value_or("") == "1") {
             std::ostringstream oss;
             expr->show(state.symbols, oss);
             auto s = oss.str();

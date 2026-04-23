@@ -804,7 +804,8 @@ void Compiler::compileHasAttr(ExprOpHasAttr * e)
     for (auto & attr : e->attrPath)
         if (attr.expr) { hasDynamic = true; break; }
 
-    if (hasDynamic) {
+    // Fall back for multi-level dynamic hasAttr (rare).
+    if (hasDynamic && e->attrPath.size() > 1) {
         unit.emitPos(e->getPos());
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
@@ -818,18 +819,25 @@ void Compiler::compileHasAttr(ExprOpHasAttr * e)
     std::vector<uint32_t> falseJumps;
 
     for (size_t i = 0; i < e->attrPath.size(); i++) {
-        uint32_t symIdx = unit.addSymbol(e->attrPath[i].symbol);
+        auto & attr = e->attrPath[i];
         bool isLast = (i == e->attrPath.size() - 1);
 
         unit.emitPos(e->getPos());
         unit.emit(OP_FORCE);
         falseJumps.push_back(unit.emit(OP_JUMP_IF_NOT_ATTRS, 0));
 
-        if (isLast) {
-            // Last level: just check if attr exists
+        if (attr.expr) {
+            // Dynamic name: compile the name expr, use HAS_ATTR_DYN.
+            compile(attr.expr);
+            unit.emit(OP_FORCE);
+            unit.emit(OP_HAS_ATTR_DYN);
+        } else if (isLast) {
+            // Static last level: just check if attr exists.
+            uint32_t symIdx = unit.addSymbol(attr.symbol);
             unit.emit(OP_HAS_ATTR, symIdx);
         } else {
-            // Intermediate level: check + select for next level
+            // Static intermediate level: check + select for next level.
+            uint32_t symIdx = unit.addSymbol(attr.symbol);
             unit.emit(OP_DUP);
             unit.emit(OP_HAS_ATTR, symIdx);
             falseJumps.push_back(unit.emit(OP_JUMP_IF_FALSE, 0));
