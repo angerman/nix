@@ -853,6 +853,11 @@ op_force:
         }
 
         // Fallback for non-bytecoded thunks, apps, non-thunks.
+        // The 70 App values and 23 non-bytecoded lambda calls are from
+        // primop internals (builtins.map, mapAttrs, genList create mkApp).
+        // Eagerly registering lambdas in lambdaBodyCache would eliminate
+        // these but breaks evaluation order for lazy fixed-points
+        // (makeExtensible in nixpkgs darwin stdenv).
         if (v->isThunk() || v->isApp()) vm.nrForceFallbacks++;
         state.forceValue(*v, pos);
         DISPATCH();
