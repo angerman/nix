@@ -17,12 +17,59 @@ namespace nix::bytecode {
 // Top-level compile entry point
 // ---------------------------------------------------------------------------
 
+/// Post-compilation pass: eliminate trivial thunks.
+/// When a thunk body is a single instruction (literal, variable ref)
+/// followed by OP_RETURN, replace OP_MAKE_THUNK with that instruction
+/// directly, avoiding the thunk allocation at runtime.
+static void eliminateTrivialThunks(CompilationUnit & unit)
+{
+    for (uint32_t ti = 0; ti < unit.thunks.size(); ti++) {
+        auto & td = unit.thunks[ti];
+        uint32_t bodyStart = td.codeOffset;
+
+        // Check if body is exactly: <single-push-op> OP_RETURN
+        if (bodyStart + 1 >= unit.code.size()) continue;
+        uint8_t firstOp  = decodeOp(unit.code[bodyStart]);
+        uint8_t secondOp = decodeOp(unit.code[bodyStart + 1]);
+        if (secondOp != OP_RETURN) continue;
+
+        // Only inline trivial value producers.
+        bool trivial = false;
+        switch (firstOp) {
+            case OP_INT: case OP_TRUE: case OP_FALSE: case OP_NULL:
+            case OP_CONST:
+            case OP_GET_LOCAL_0: case OP_GET_LOCAL_1:
+            case OP_GET_LOCAL_2: case OP_GET_LOCAL_3:
+            case OP_GET_LOCAL:
+                trivial = true;
+                break;
+            default:
+                break;
+        }
+        if (!trivial) continue;
+
+        // Replace all OP_MAKE_THUNK(ti) with the trivial instruction.
+        Instruction replacement = unit.code[bodyStart];
+        for (uint32_t ip = 0; ip < unit.code.size(); ip++) {
+            if (decodeOp(unit.code[ip]) == OP_MAKE_THUNK
+                && decodeOperand(unit.code[ip]) == ti)
+            {
+                unit.code[ip] = replacement;
+            }
+        }
+    }
+}
+
 CompilationUnit * compile(EvalState & state, Expr * expr)
 {
     auto * unit = new (GC) CompilationUnit();
     Compiler compiler(state, *unit);
     compiler.compile(expr);
     unit->emit(OP_RETURN);
+
+    // Post-compilation optimization.
+    eliminateTrivialThunks(*unit);
+
     return unit;
 }
 
