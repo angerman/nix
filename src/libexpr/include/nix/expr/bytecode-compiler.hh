@@ -62,10 +62,17 @@ class Compiler
 
     /// Level offset applied to GET_LOCAL instructions.
     /// Used when the bytecoded env chain has an extra scope (e.g., the
-    /// inherit-from env) that bindVars didn't account for. When nonzero,
-    /// emitGetLocal adds this offset to the variable's level before
-    /// emitting the instruction.
+    /// inherit-from env in non-rec attrsets) that bindVars didn't account
+    /// for. When nonzero, emitGetLocal adds this offset to the variable's
+    /// level before emitting the instruction.
     uint8_t levelOffset = 0;
+
+    /// Displacement offset for ExprInheritFrom nodes in the flattened
+    /// let env approach.  When compiling `let inherit(expr) ...`, the
+    /// let env is extended with extra slots for inherit-from sources.
+    /// ExprInheritFrom with displ=D is remapped to displ=inheritDisplOffset+D.
+    /// Zero means no remapping (not inside a let with inherit(expr)).
+    uint32_t inheritDisplOffset = 0;
 
 public:
     Compiler(EvalState & state, CompilationUnit & unit)

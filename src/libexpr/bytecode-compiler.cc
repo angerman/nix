@@ -8,7 +8,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "nix/expr/bytecode-compiler.hh"
-#include "nix/expr/nixexpr.hh"
+#include "nix/expr/nixexpr.hh"  // includes ExprInheritFrom
 #include "nix/expr/eval.hh"
 
 namespace nix::bytecode {
@@ -249,18 +249,28 @@ void Compiler::emitGetLocal(ExprVar * e)
         return;
     }
 
-    // Apply level offset for extra scope layers (e.g., inherit-from env)
-    // that exist in the bytecoded env chain but weren't in bindVars' model.
+    // Apply level offset for extra scope layers (e.g., inherit-from env
+    // in non-rec attrsets) that exist in the bytecoded env chain but
+    // weren't in bindVars' model.
     uint32_t level = e->level + levelOffset;
+    uint32_t displ = e->displ;
+
+    // For the flattened let+inherit(expr) approach: ExprInheritFrom nodes
+    // have level=0, displ=D relative to a virtual inherit env.  In the
+    // flattened env, the inherit sources are at slots nAttrs..nAttrs+M-1
+    // of the SAME let env.  Remap the displacement.
+    if (inheritDisplOffset > 0 && dynamic_cast<ExprInheritFrom *>(e)) {
+        displ += inheritDisplOffset;
+    }
 
     switch (level) {
-        case 0: unit.emit(OP_GET_LOCAL_0, e->displ); break;
-        case 1: unit.emit(OP_GET_LOCAL_1, e->displ); break;
-        case 2: unit.emit(OP_GET_LOCAL_2, e->displ); break;
-        case 3: unit.emit(OP_GET_LOCAL_3, e->displ); break;
+        case 0: unit.emit(OP_GET_LOCAL_0, displ); break;
+        case 1: unit.emit(OP_GET_LOCAL_1, displ); break;
+        case 2: unit.emit(OP_GET_LOCAL_2, displ); break;
+        case 3: unit.emit(OP_GET_LOCAL_3, displ); break;
         default:
             unit.emit(OP_GET_LOCAL, packLevelDispl(
-                static_cast<uint8_t>(level), static_cast<uint16_t>(e->displ)));
+                static_cast<uint8_t>(level), static_cast<uint16_t>(displ)));
             break;
     }
 }
@@ -312,10 +322,12 @@ void Compiler::compilePos(ExprPos * e)
 
 void Compiler::compileLet(ExprLet * e)
 {
-    // Fall back to tree-walking for let-bindings with inherit(expr).
-    // The inherit env is nested inside the let env, but SET_ENV_SLOT
-    // writes to curEnv (inherit env) instead of the let env.
-    // Compiling this natively requires a SET_ENV_SLOT_UP opcode.
+    // Fall back for let-bindings with inherit(expr).
+    // The inherit env in let-bindings has up=newEnv (the let env),
+    // creating a complex two-env structure that can't be flattened
+    // without adjusting levels for all InheritedFrom binding expressions.
+    // The non-rec attrset case uses OP_INHERIT_FROM_INIT instead,
+    // which works because there's no persistent let env to write to.
     bool hasInheritFrom = e->attrs->inheritFromExprs
         && !e->attrs->inheritFromExprs->empty();
 
@@ -326,13 +338,6 @@ void Compiler::compileLet(ExprLet * e)
     }
 
     // Simple let without inherit(expr):
-    //   OP_ENTER_LET envSize
-    //   <for each binding>
-    //     <compile thunk or eager value>
-    //     OP_SET_ENV_SLOT displ
-    //   <compile body>
-    //   OP_LEAVE_SCOPE
-
     uint32_t envSize = static_cast<uint32_t>(e->attrs->attrs->size());
     unit.emitPos(e->attrs->pos);
     unit.emit(OP_ENTER_LET, envSize);
