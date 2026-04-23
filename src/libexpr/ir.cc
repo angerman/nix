@@ -790,6 +790,7 @@ VarId Lowerer::lowerLambda(ExprLambda * e)
         .bodyBlock = bodyBlk,
         .name = e->name,
         .pos = e->pos,
+        .sourceExpr = e,  // For callFunction compatibility.
     }, e->pos);
 }
 

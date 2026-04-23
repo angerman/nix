@@ -1168,6 +1168,69 @@ TEST_F(IREmitTest, ir_emit_let_arithmetic) {
     assertIREmitMatch("let x = 1; y = 2; in x + y");
 }
 
+// -- Lambda + application --
+
+TEST_F(IREmitTest, ir_emit_lambda_simple) {
+    assertIREmitMatch("(x: x + 1) 5");
+}
+
+// Lambda closure (upvalue capture) and nested lambdas need the v2
+// calling convention (frame.upvalues setup), which is Milestone 2.
+// TEST_F(IREmitTest, ir_emit_lambda_closure) {
+//     assertIREmitMatch("let a = 10; in (x: x + a) 5");
+// }
+// TEST_F(IREmitTest, ir_emit_lambda_nested) {
+//     assertIREmitMatch("let f = x: y: x + y; in f 3 4");
+// }
+
+// -- Thunks (lazy) --
+
+TEST_F(IREmitTest, ir_emit_let_thunk) {
+    assertIREmitMatch("let x = 1 + 2; in x");
+}
+
+// Recursive let needs v2 thunk forcing with upvalues (Milestone 2).
+// TEST_F(IREmitTest, ir_emit_recursive_let) {
+//     assertIREmitMatch("let a = 1; b = a + 1; in b");
+// }
+
+// -- String interpolation --
+
+TEST_F(IREmitTest, ir_emit_string_concat) {
+    assertIREmitMatch("\"hello\" + \" world\"");
+}
+
+// -- Attr select with force --
+
+TEST_F(IREmitTest, ir_emit_nested_select) {
+    assertIREmitMatch("{ a = { b = 42; }; }.a.b");
+}
+
+// -- Rec attrset --
+
+// Rec attrset needs v2 thunk upvalue handling (Milestone 2).
+// TEST_F(IREmitTest, ir_emit_rec_attrset) {
+//     assertIREmitMatch("rec { a = 1; b = a + 1; }");
+// }
+
+// -- Has attr --
+
+TEST_F(IREmitTest, ir_emit_has_attr) {
+    assertIREmitMatch("{ a = 1; } ? a");
+}
+
+// -- Update --
+
+TEST_F(IREmitTest, ir_emit_update) {
+    assertIREmitMatch("{ a = 1; } // { b = 2; }");
+}
+
+// -- List concat --
+
+TEST_F(IREmitTest, ir_emit_list_concat) {
+    assertIREmitMatch("[1 2] ++ [3 4]");
+}
+
 // -- Disassembly sanity check: ensure emitFromIR produces non-empty code --
 
 TEST_F(IREmitTest, ir_emit_produces_code) {

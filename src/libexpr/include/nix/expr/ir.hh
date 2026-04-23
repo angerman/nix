@@ -192,6 +192,7 @@ struct IRLambda
     BlockId bodyBlock;                   ///< Block containing the lambda body.
     Symbol name;                         ///< Optional lambda name (for profiling/errors).
     PosIdx pos;                          ///< Source position of the lambda.
+    ExprLambda * sourceExpr = nullptr;   ///< Original AST node (for callFunction compat).
 };
 
 /// Function application.  Both operands must be VarIds.

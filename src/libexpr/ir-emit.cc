@@ -291,7 +291,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 .formals = formals,
                 .envSize = envSize,
                 .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
-                .sourceExpr = nullptr, // v2 lambdas have no AST ExprLambda
+                .sourceExpr = e.sourceExpr, // Original AST for callFunction compat
                 .bodyThunkIdx = bodyThunkIdx,
                 .prologueOffset = bodyOffset, // v2: no separate prologue
             });

@@ -1546,6 +1546,26 @@ op_call_1:
 
             // Push a new call frame for the lambda body.
             auto * result = state.allocValue();
+
+            // For v2 closures (upvalue-based), extract the upvalue array
+            // from the closure's env.  v2 closures store the array as
+            // closureEnv.values[0] (see OP_MAKE_CLOSURE_V2).
+            Value ** frameUpvalues = nullptr;
+            auto & lambdaDesc = bodyUnit.lambdas[
+                bodyUnit.thunks[bodyInfo.thunkIdx].codeOffset == bodyInfo.prologueOffset
+                    ? 0 : 0]; // TODO: find correct lambda desc
+            // Check if this is a v2 closure by looking at the lambda descriptor's nUpvalues.
+            // Actually, simpler: check if fun->lambda().env->values[0] is a pointer.
+            // For v2 closures, env.values[0] is the upvalue array (cast from Value**).
+            // For v1 closures, env.values[0] is a normal Value*.
+            // Use a heuristic: if bodyInfo has nUpvalues > 0 in the thunk descriptor,
+            // it's v2.
+            auto & thunkDesc = bodyUnit.thunks[bodyInfo.thunkIdx];
+            if (thunkDesc.nUpvalues > 0 && fun->lambda().env) {
+                frameUpvalues = reinterpret_cast<Value **>(
+                    fun->lambda().env->values[0]);
+            }
+
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
                 .ip = startOffset,
@@ -1553,6 +1573,7 @@ op_call_1:
                 .stackBaseOffset = vm.stackSize(),
                 .resultSlot = result,
                 .callPos = pos,
+                .upvalues = frameUpvalues,
             });
 
             // For formals lambdas, push the raw arg onto the stack
