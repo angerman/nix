@@ -322,29 +322,44 @@ void Compiler::compilePos(ExprPos * e)
 
 void Compiler::compileLet(ExprLet * e)
 {
-    // Fall back for let-bindings with inherit(expr).
-    // The inherit env in let-bindings has up=newEnv (the let env),
-    // creating a complex two-env structure that can't be flattened
-    // without adjusting levels for all InheritedFrom binding expressions.
-    // The non-rec attrset case uses OP_INHERIT_FROM_INIT instead,
-    // which works because there's no persistent let env to write to.
     bool hasInheritFrom = e->attrs->inheritFromExprs
         && !e->attrs->inheritFromExprs->empty();
 
+    // Fall back for let with inherit(expr) — the flattened env approach
+    // needs more work to handle nixpkgs complexity.  The Inherited (plain
+    // `inherit x;`) fix is applied below for simple lets.
     if (hasInheritFrom) {
         unit.emitPos(e->attrs->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
     }
 
-    // Simple let without inherit(expr):
+    // Let-binding without inherit(expr):
+    //   OP_ENTER_LET envSize
+    //   <for each binding: compile + SET_ENV_SLOT>
+    //   <body>
+    //   OP_LEAVE_SCOPE
+    //
+    // Binding kinds after OP_ENTER_LET (curEnv = let env):
+    //   Plain:     bound in newEnv (let env). Level=0 → let env. No offset.
+    //   Inherited: bound in env (outer scope). Level=0 → outer env.
+    //              After OP_ENTER_LET, outer is at level=1. Need levelOffset=1.
+
     uint32_t envSize = static_cast<uint32_t>(e->attrs->attrs->size());
     unit.emitPos(e->attrs->pos);
     unit.emit(OP_ENTER_LET, envSize);
 
     Displacement displ = 0;
     for (auto & [name, def] : *e->attrs->attrs) {
+        // Inherited bindings are bound in the outer scope.
+        if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
+            levelOffset = 1;
+
         compileAsThunkOrEager(def.e, def.pos);
+
+        if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
+            levelOffset = 0;
+
         unit.emit(OP_SET_ENV_SLOT, displ);
         displ++;
     }

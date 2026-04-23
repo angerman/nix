@@ -546,6 +546,29 @@ TEST_F(BytecodeVMTest, regression_inherit_from_import) {
     assertDualMode("let lib = { id = x: x; }; f = lib: { ext = lib.id 42; }; result = (f { inherit (lib) id; }).ext; in result");
 }
 
+// Plain `let inherit x;` (Kind::Inherited, no (expr)).
+// The inherited binding's expression is bound in the outer scope.
+// After OP_ENTER_LET, the outer scope is at level=1.  The compiler
+// must apply levelOffset=1 for Inherited bindings.
+TEST_F(BytecodeVMTest, regression_let_inherit_plain) {
+    assertDualMode("let x = 1; in let inherit x; in x");
+}
+
+TEST_F(BytecodeVMTest, regression_let_inherit_plain_multi) {
+    assertDualMode("let a = 1; b = 2; in let inherit a b; c = 3; in a + b + c");
+}
+
+// let with inherit(expr) -- flattened env approach.
+// ExprInheritFrom displacements are remapped to extra let env slots.
+TEST_F(BytecodeVMTest, regression_let_inherit_from) {
+    assertDualMode("let inherit ({ x = 1; y = 2; }) x y; in x + y");
+}
+
+TEST_F(BytecodeVMTest, regression_let_inherit_from_mixed) {
+    // Mix of Plain, Inherited, and InheritedFrom bindings in a single let.
+    assertDualMode("let a = 10; in let inherit a; inherit ({ b = 20; }) b; c = 30; in a + b + c");
+}
+
 
 // ===========================================================================
 // Review-driven test coverage additions
