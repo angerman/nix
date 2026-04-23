@@ -1227,6 +1227,45 @@ TEST_F(IREmitTest, ir_emit_list_concat) {
     assertIREmitMatch("[1 2] ++ [3 4]");
 }
 
+// -- Higher-order functions --
+
+TEST_F(IREmitTest, ir_emit_higher_order) {
+    assertIREmitMatch("let apply = f: x: f x; double = x: x * 2; in apply double 21");
+}
+
+TEST_F(IREmitTest, ir_emit_map_manual) {
+    assertIREmitMatch("let f = x: x + 1; in [ (f 1) (f 2) (f 3) ]");
+}
+
+// -- Recursive function --
+
+// Self-recursive function needs recursive let thunk self-reference (TODO).
+// TEST_F(IREmitTest, ir_emit_recursive_function) {
+//     assertIREmitMatch("let fac = n: if n == 0 then 1 else n * fac (n - 1); in fac 5");
+// }
+
+// -- Select with or-default --
+
+TEST_F(IREmitTest, ir_emit_select_or_found) {
+    assertIREmitMatch("{ a = 42; }.a or 0");
+}
+
+TEST_F(IREmitTest, ir_emit_select_or_missing) {
+    assertIREmitMatch("{ a = 42; }.b or 0");
+}
+
+// -- Inherit --
+
+TEST_F(IREmitTest, ir_emit_inherit_plain) {
+    assertIREmitMatch("let x = 1; in { inherit x; }.x");
+}
+
+// -- Builtins --
+
+TEST_F(IREmitTest, ir_emit_builtins_add) {
+    assertIREmitMatch("builtins.add 1 2");
+}
+
 // -- Disassembly sanity check: ensure emitFromIR produces non-empty code --
 
 TEST_F(IREmitTest, ir_emit_produces_code) {
