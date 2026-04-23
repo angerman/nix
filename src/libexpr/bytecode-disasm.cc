@@ -91,6 +91,11 @@ const char * opName(uint8_t op)
         case OP_SWAP:             return "SWAP";
         case OP_EVAL_EXPR:        return "EVAL_EXPR";
         case OP_SELECT_FORCE:     return "SELECT_FORCE";
+        case OP_GET_UPVALUE:      return "GET_UPVALUE";
+        case OP_MAKE_CLOSURE_V2:  return "MAKE_CLOSURE_V2";
+        case OP_MAKE_THUNK_V2:    return "MAKE_THUNK_V2";
+        case OP_GET_STACK_SLOT:   return "GET_STACK_SLOT";
+        case OP_SET_STACK_SLOT:   return "SET_STACK_SLOT";
         default:                  return "???";
     }
 }
@@ -237,6 +242,28 @@ std::string disassemble(const CompilationUnit & unit, const EvalState * state)
 
             case OP_EVAL_EXPR:
                 out << "expr=" << operand;
+                break;
+
+            // VM v2 opcodes
+            case OP_GET_UPVALUE:
+                out << "idx=" << operand;
+                break;
+
+            case OP_MAKE_CLOSURE_V2:
+                out << "lambda=" << operand;
+                if (operand < unit.lambdas.size())
+                    out << "  ; -> offset " << unit.lambdas[operand].codeOffset;
+                break;
+
+            case OP_MAKE_THUNK_V2:
+                out << "thunk=" << operand;
+                if (operand < unit.thunks.size())
+                    out << "  ; -> offset " << unit.thunks[operand].codeOffset;
+                break;
+
+            case OP_GET_STACK_SLOT:
+            case OP_SET_STACK_SLOT:
+                out << "slot=" << operand;
                 break;
 
             default:

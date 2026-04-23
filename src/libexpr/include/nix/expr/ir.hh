@@ -573,6 +573,15 @@ struct IRBlock
 /// and a single entry block.  The entry block is always blocks[0].
 ///
 /// Analogous to bytecode::CompilationUnit but at the IR level.
+/// Env-chain coordinates for a variable from the enclosing runtime scope.
+/// Used by the bytecode emitter to access baseEnv variables that are
+/// referenced by the entry block but not defined in any IR block.
+struct ExternalVarRef
+{
+    uint32_t level;       ///< Environment chain depth.
+    uint32_t displacement; ///< Slot index within that env.
+};
+
 struct IRModule
 {
     /// All blocks in the module.  blocks[0] is the entry block.
@@ -582,6 +591,12 @@ struct IRModule
     /// Next available VarId.  Lowering increments this to allocate
     /// fresh variable names.
     VarId nextVar = 1;  // 0 is kInvalidVar.
+
+    /// Map from VarId to runtime env coordinates for variables that
+    /// originate from the enclosing scope (e.g., baseEnv builtins).
+    /// The bytecode emitter uses this to emit OP_GET_LOCAL instructions
+    /// for entry-block free variables that aren't defined in any IR block.
+    std::unordered_map<VarId, ExternalVarRef> externalVars;
 
     /// Allocate a fresh VarId.
     VarId freshVar() { return nextVar++; }

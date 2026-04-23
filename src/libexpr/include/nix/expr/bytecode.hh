@@ -217,6 +217,43 @@ enum Op : uint8_t {
 
     // -- Fused hot-path instructions --
     OP_SELECT_FORCE     = 0x40, // [symIdx:24]    select attr + force result
+
+    // -- VM v2: upvalue-based closures (IR emitter) --
+    //
+    // These opcodes implement flat, upvalue-based closure capture for the
+    // IR->bytecode path.  They coexist with the v1 env-chain opcodes above.
+    //
+    // Instead of walking a linked-list Env chain (v1), v2 closures store
+    // captured variables in a flat GC-traced Value** array.  The body code
+    // reads from this array via OP_GET_UPVALUE.  At the creation site, the
+    // parent pushes captured values and then emits OP_MAKE_CLOSURE_V2 or
+    // OP_MAKE_THUNK_V2 which pops them into the upvalue array.
+
+    /// Read an upvalue from the current closure/thunk's upvalue array.
+    /// Operand: upvalue index (0-based).
+    /// Stack effect: pushes upvalues[idx].
+    OP_GET_UPVALUE       = 0x46, // [idx:24]       push upvalues[idx]
+
+    /// Create a v2 closure.  Operand: lambdaIdx into unit.lambdas.
+    /// The preceding N data words (encoded as OP_NOP) give the upvalue
+    /// count.  The N Values to capture are on the stack (first pushed =
+    /// upvalue 0).  Pops N values, allocates a flat upvalue array, and
+    /// pushes the resulting closure Value.
+    OP_MAKE_CLOSURE_V2   = 0x47, // [lambdaIdx:24] pop N upvalues, push closure
+
+    /// Create a v2 thunk.  Operand: thunkIdx into unit.thunks.
+    /// Same capture convention as OP_MAKE_CLOSURE_V2.
+    OP_MAKE_THUNK_V2     = 0x48, // [thunkIdx:24]  pop N upvalues, push thunk
+
+    /// Read a stack slot (local variable) by absolute frame-relative index.
+    /// Used by the IR emitter where VarIds map to fixed stack positions.
+    /// Operand: slot index from frame base.
+    /// Stack effect: pushes stack[frameBase + slot].
+    OP_GET_STACK_SLOT    = 0x49, // [slot:24]       push stack[base+slot]
+
+    /// Write a value into a stack slot.
+    /// Pop TOS, store into stack[frameBase + slot].
+    OP_SET_STACK_SLOT    = 0x4A, // [slot:24]       pop v, store to stack[base+slot]
 };
 
 
@@ -244,6 +281,7 @@ struct ThunkDescriptor
     uint32_t codeOffset; // Instruction index into CompilationUnit::code
     PosIdx   pos;        // Source position for error messages
     Expr *   sourceExpr = nullptr; // Original AST expression (for isTrivial() compat)
+    uint16_t nUpvalues = 0; // Number of upvalues captured (v2 thunks)
 };
 
 /// Identifies a function body within a CompilationUnit.
@@ -259,8 +297,11 @@ struct LambdaDescriptor
     /// Points into BumpMemoryResource (shared with AST Formals).
     Formals * formals = nullptr;
 
-    /// Number of slots required in the Env for this lambda's body.
+    /// Number of slots required in the Env for this lambda's body (v1).
     uint16_t envSize = 0;
+
+    /// Number of upvalues captured by this closure (v2).
+    uint16_t nUpvalues = 0;
 
     /// Back-pointer to the source ExprLambda for profiling compatibility.
     ExprLambda * sourceExpr = nullptr;

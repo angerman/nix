@@ -33,11 +33,16 @@ struct CallFrame
 {
     const CompilationUnit * unit; ///< The compilation unit being executed.
     uint32_t ip;                  ///< Instruction pointer (index into unit->code).
-    Env * env;                    ///< Current environment for this frame.
+    Env * env;                    ///< Current environment for this frame (v1 env chain).
     size_t stackBaseOffset;       ///< Offset from stack base (survives stack reallocation).
     Value * resultSlot;           ///< Where to write the return value (GC-allocated).
     PosIdx callPos;               ///< Source position of the call site (for stack traces).
     bool isThunkForce = false;    ///< If true, OP_RETURN doesn't push result (thunk was updated in-place).
+
+    /// Upvalue array for v2 closures/thunks.  nullptr for v1 frames.
+    /// Points to a GC-allocated flat array of Value* pointers,
+    /// indexed by OP_GET_UPVALUE's operand.
+    Value ** upvalues = nullptr;
 };
 
 /// Initial capacity of the value stack (in Value* slots).

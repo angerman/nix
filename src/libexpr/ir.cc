@@ -352,6 +352,12 @@ VarId Lowerer::lowerVar(ExprVar * e)
     VarId placeholder = module.freshVar();
     // Record the mapping so subsequent references resolve consistently.
     bindVar(e->level, e->displ, placeholder);
+    // Record the runtime env coordinates so the bytecode emitter can
+    // access this variable via OP_GET_LOCAL at runtime.
+    module.externalVars[placeholder] = ExternalVarRef{
+        .level = e->level,
+        .displacement = static_cast<uint32_t>(e->displ),
+    };
     return emit(IRVarRef{.var = placeholder}, e->pos);
 }
 

@@ -13,6 +13,8 @@ headers = [ config_pub_h ] + files(
   'bytecode.hh',
   'bytecode-compiler.hh',
   'bytecode-thunk.hh',
+  'ir.hh',
+  'ir-emit.hh',
   'vm.hh',
   'counter.hh',
   'diagnose.hh',

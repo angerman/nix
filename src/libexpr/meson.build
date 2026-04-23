@@ -162,6 +162,7 @@ sources = files(
   'bytecode-disasm.cc',
   'bytecode-thunk.cc',
   'ir.cc',
+  'ir-emit.cc',
   'vm.cc',
   'diagnose.cc',
   'eval-cache.cc',

@@ -19,6 +19,7 @@
 #include "nix/expr/bytecode.hh"
 #include "nix/expr/bytecode-compiler.hh"
 #include "nix/expr/ir.hh"
+#include "nix/expr/ir-emit.hh"
 #include "nix/expr/bytecode-thunk.hh"
 #include "nix/expr/vm.hh"
 
@@ -1004,6 +1005,178 @@ TEST_F(BytecodeVMTest, ir_lower_inherit) {
     e->bindVars(state, state.staticBaseEnv);
     auto mod = ir::lower(state, e);
     EXPECT_GE(mod.blocks.size(), 1u);
+}
+
+
+// ===========================================================================
+// IR -> Bytecode emission (v2) smoke tests
+// ===========================================================================
+
+// These tests verify that the IR emitter produces valid bytecode from
+// an IRModule.  We compile AST -> IR -> bytecode, then execute via vmExec
+// and compare against the tree-walker.
+
+class IREmitTest : public BytecodeVMTest
+{
+protected:
+    /// Evaluate via the IR -> bytecode path (AST -> IR -> emit -> vmExec).
+    Value evalIREmit(const std::string & input)
+    {
+        Expr * e = state.parseExprFromString(input, state.rootPath(CanonPath::root));
+        assert(e);
+
+        // AST -> IR
+        auto mod = ir::lower(state, e);
+
+        // IR -> bytecode
+        auto * unit = bytecode::emitFromIR(state, mod);
+
+        // Execute
+        Value result;
+        bytecode::vmExec(state, *unit, 0, state.baseEnv, result);
+        state.forceValue(result, noPos);
+        return result;
+    }
+
+    /// Assert that tree-walk and IR-emit produce identical results.
+    void assertIREmitMatch(const std::string & expr)
+    {
+        Value treeResult = evalTreeWalk(expr);
+        Value irResult = evalIREmit(expr);
+        ASSERT_TRUE(valuesEqual(treeResult, irResult))
+            << "IR emit divergence for: " << expr
+            << "\n  tree-walk type: " << showType(treeResult)
+            << "\n  IR emit type:   " << showType(irResult);
+    }
+};
+
+// -- Literals --
+
+TEST_F(IREmitTest, ir_emit_int_literal) {
+    assertIREmitMatch("42");
+}
+
+TEST_F(IREmitTest, ir_emit_float_literal) {
+    assertIREmitMatch("3.14");
+}
+
+TEST_F(IREmitTest, ir_emit_string_literal) {
+    assertIREmitMatch("\"hello\"");
+}
+
+TEST_F(IREmitTest, ir_emit_bool_true) {
+    assertIREmitMatch("true");
+}
+
+TEST_F(IREmitTest, ir_emit_bool_false) {
+    assertIREmitMatch("false");
+}
+
+TEST_F(IREmitTest, ir_emit_null) {
+    assertIREmitMatch("null");
+}
+
+// -- Arithmetic --
+
+TEST_F(IREmitTest, ir_emit_add) {
+    assertIREmitMatch("1 + 2");
+}
+
+TEST_F(IREmitTest, ir_emit_sub) {
+    assertIREmitMatch("10 - 3");
+}
+
+TEST_F(IREmitTest, ir_emit_mul) {
+    assertIREmitMatch("4 * 5");
+}
+
+TEST_F(IREmitTest, ir_emit_negate) {
+    assertIREmitMatch("-(42)");
+}
+
+// -- Comparison --
+
+TEST_F(IREmitTest, ir_emit_less_than) {
+    assertIREmitMatch("1 < 2");
+}
+
+TEST_F(IREmitTest, ir_emit_eq) {
+    assertIREmitMatch("1 == 1");
+}
+
+TEST_F(IREmitTest, ir_emit_neq) {
+    assertIREmitMatch("1 != 2");
+}
+
+// -- Logic --
+
+TEST_F(IREmitTest, ir_emit_not) {
+    assertIREmitMatch("!true");
+}
+
+TEST_F(IREmitTest, ir_emit_and_short_circuit) {
+    assertIREmitMatch("false && true");
+}
+
+TEST_F(IREmitTest, ir_emit_or_short_circuit) {
+    assertIREmitMatch("true || false");
+}
+
+TEST_F(IREmitTest, ir_emit_impl) {
+    assertIREmitMatch("false -> true");
+}
+
+// -- If/then/else --
+
+TEST_F(IREmitTest, ir_emit_if_true) {
+    assertIREmitMatch("if true then 1 else 2");
+}
+
+TEST_F(IREmitTest, ir_emit_if_false) {
+    assertIREmitMatch("if false then 1 else 2");
+}
+
+// -- Attrsets --
+
+TEST_F(IREmitTest, ir_emit_attrset) {
+    assertIREmitMatch("{ a = 1; b = 2; }");
+}
+
+TEST_F(IREmitTest, ir_emit_attrset_select) {
+    assertIREmitMatch("{ a = 42; }.a");
+}
+
+// -- Lists --
+
+TEST_F(IREmitTest, ir_emit_list) {
+    assertIREmitMatch("[ 1 2 3 ]");
+}
+
+// -- Assert --
+
+TEST_F(IREmitTest, ir_emit_assert) {
+    assertIREmitMatch("assert true; 42");
+}
+
+// -- Let binding --
+
+TEST_F(IREmitTest, ir_emit_let_simple) {
+    assertIREmitMatch("let x = 1; in x");
+}
+
+TEST_F(IREmitTest, ir_emit_let_arithmetic) {
+    assertIREmitMatch("let x = 1; y = 2; in x + y");
+}
+
+// -- Disassembly sanity check: ensure emitFromIR produces non-empty code --
+
+TEST_F(IREmitTest, ir_emit_produces_code) {
+    auto * e = state.parseExprFromString("42", state.rootPath(CanonPath::root));
+    auto mod = ir::lower(state, e);
+    auto * unit = bytecode::emitFromIR(state, mod);
+    EXPECT_GT(unit->code.size(), 0u);
+    // Should end with OP_RETURN.
+    EXPECT_EQ(bytecode::decodeOp(unit->code.back()), bytecode::OP_RETURN);
 }
 
 } // namespace nix

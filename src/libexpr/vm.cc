@@ -172,6 +172,21 @@ static void traceInstruction(
             fprintf(stderr, " nParts=%u forceStr=%u",
                 operand & ((1u<<23)-1), (operand >> 23) & 1);
             break;
+        case OP_GET_UPVALUE:
+            fprintf(stderr, " idx=%u", operand);
+            break;
+        case OP_MAKE_CLOSURE_V2:
+            if (operand < cu.lambdas.size())
+                fprintf(stderr, " lambda=%u -> offset %u nUpvalues(next)", operand, cu.lambdas[operand].codeOffset);
+            break;
+        case OP_MAKE_THUNK_V2:
+            if (operand < cu.thunks.size())
+                fprintf(stderr, " thunk=%u -> offset %u nUpvalues(next)", operand, cu.thunks[operand].codeOffset);
+            break;
+        case OP_GET_STACK_SLOT:
+        case OP_SET_STACK_SLOT:
+            fprintf(stderr, " slot=%u", operand);
+            break;
         default:
             if (operand) fprintf(stderr, " %u", operand);
             break;
@@ -524,6 +539,13 @@ void vmExec(
         REGISTER_OP(OP_MAKE_CLOSURE, op_make_closure);
         REGISTER_OP(OP_CALL,         op_call);
         REGISTER_OP(OP_CALL_1,       op_call_1);
+
+        // VM v2: upvalue-based closures (IR emitter)
+        REGISTER_OP(OP_GET_UPVALUE,      op_get_upvalue);
+        REGISTER_OP(OP_MAKE_CLOSURE_V2,  op_make_closure_v2);
+        REGISTER_OP(OP_MAKE_THUNK_V2,    op_make_thunk_v2);
+        REGISTER_OP(OP_GET_STACK_SLOT,   op_get_stack_slot);
+        REGISTER_OP(OP_SET_STACK_SLOT,   op_set_stack_slot);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2135,6 +2157,166 @@ op_eval_expr:
         expr->eval(state, *curEnv, *result);
 
         vm.push(result);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Upvalue access
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_upvalue:
+#else
+    case OP_GET_UPVALUE:
+#endif
+    {
+        uint32_t idx = decodeOperand(CUR_INSTR);
+        Value ** upvalues = vm.frames.back().upvalues;
+        assert(upvalues && "OP_GET_UPVALUE: no upvalue array in current frame");
+        vm.push(upvalues[idx]);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Stack slot access (frame-relative)
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_stack_slot:
+#else
+    case OP_GET_STACK_SLOT:
+#endif
+    {
+        uint32_t slot = decodeOperand(CUR_INSTR);
+        size_t base = vm.frames.back().stackBaseOffset;
+        vm.push(vm.stack[base + slot]);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_set_stack_slot:
+#else
+    case OP_SET_STACK_SLOT:
+#endif
+    {
+        uint32_t slot = decodeOperand(CUR_INSTR);
+        Value * v = vm.pop();
+        size_t base = vm.frames.back().stackBaseOffset;
+        // Ensure the slot exists in the stack.  If needed, push nulls
+        // to extend up to the slot index.
+        size_t targetIdx = base + slot;
+        while (vm.stackSize() <= targetIdx) {
+            vm.push(&Value::vNull);
+        }
+        vm.stack[targetIdx] = v;
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Closure creation with upvalue capture
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_make_closure_v2:
+#else
+    case OP_MAKE_CLOSURE_V2:
+#endif
+    {
+        uint32_t lambdaIdx = decodeOperand(CUR_INSTR);
+        assert(lambdaIdx < cu->lambdas.size()
+            && "OP_MAKE_CLOSURE_V2: lambda index out of bounds");
+
+        // Read the upvalue count from the next data word.
+        uint32_t nUpvalues = decodeOperand(cu->code[ip++]);
+
+        // Allocate a flat GC-traced array for captured upvalues.
+        Value ** upvalues = nullptr;
+        if (nUpvalues > 0) {
+            upvalues = static_cast<Value **>(
+                GC_MALLOC(nUpvalues * sizeof(Value *)));
+            // Pop upvalues from the stack.
+            // They were pushed in forward order (upvalue 0 first),
+            // so pop in reverse to get the correct mapping.
+            for (uint32_t i = nUpvalues; i > 0; --i)
+                upvalues[i - 1] = vm.pop();
+        }
+
+        auto & desc = cu->lambdas[lambdaIdx];
+
+        // Register this lambda's bytecoded body in the side-table.
+        // v2 closures also need this for OP_CALL_1 trampoline dispatch.
+        if (desc.sourceExpr) {
+            state.lambdaBodyCache[desc.sourceExpr] = {
+                const_cast<CompilationUnit *>(cu),
+                desc.bodyThunkIdx,
+                desc.prologueOffset,
+            };
+        }
+
+        // Create the closure Value.
+        // For v2 closures, we store the upvalue array on a side-allocated
+        // 1-slot Env whose values[0] is a pointer to the upvalue array.
+        // The actual upvalue array is the GC-allocated flat array.
+        //
+        // We still need an Env to satisfy the Value::lambda().env field.
+        // The env is minimal (1 slot) and acts as a carrier for the upvalues.
+        Env & closureEnv = state.mem.allocEnv(1);
+        closureEnv.up = curEnv; // Parent env for with-chain walking.
+        // Store the upvalue array pointer in values[0].
+        // The OP_CALL_1 v2 path will extract it from here.
+        closureEnv.values[0] = reinterpret_cast<Value *>(upvalues);
+
+        // For v2, we need to create a lambda expression wrapper.
+        // Use ExprLambdaBytecode which stores the compilation unit + index.
+        auto * lambdaExpr = state.mem.exprs.add<ExprLambdaBytecode>(
+            const_cast<CompilationUnit *>(cu), lambdaIdx);
+
+        auto * closureVal = state.allocValue();
+        closureVal->mkLambda(&closureEnv, lambdaExpr);
+
+        vm.push(closureVal);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Thunk creation with upvalue capture
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_make_thunk_v2:
+#else
+    case OP_MAKE_THUNK_V2:
+#endif
+    {
+        uint32_t thunkIdx = decodeOperand(CUR_INSTR);
+        assert(thunkIdx < cu->thunks.size()
+            && "OP_MAKE_THUNK_V2: thunk index out of bounds");
+
+        // Read the upvalue count from the next data word.
+        uint32_t nUpvalues = decodeOperand(cu->code[ip++]);
+
+        // Allocate and populate the upvalue array.
+        Value ** upvalues = nullptr;
+        if (nUpvalues > 0) {
+            upvalues = static_cast<Value **>(
+                GC_MALLOC(nUpvalues * sizeof(Value *)));
+            for (uint32_t i = nUpvalues; i > 0; --i)
+                upvalues[i - 1] = vm.pop();
+        }
+
+        // Create ExprBytecodeThunk for the body.
+        auto * thunkExpr = state.mem.exprs.add<ExprBytecodeThunk>(
+            const_cast<CompilationUnit *>(cu), thunkIdx);
+
+        // Create a minimal Env to carry the upvalue array.
+        Env & thunkEnv = state.mem.allocEnv(1);
+        thunkEnv.up = curEnv;
+        thunkEnv.values[0] = reinterpret_cast<Value *>(upvalues);
+
+        auto * thunkVal = state.allocValue();
+        thunkVal->mkThunk(&thunkEnv, thunkExpr);
+
+        vm.push(thunkVal);
         DISPATCH();
     }
 
