@@ -17,11 +17,21 @@ namespace nix {
 
 void ExprBytecodeThunk::eval(EvalState & state, Env & env, Value & v)
 {
-    uint32_t offset = unit->thunks[thunkIdx].codeOffset;
+    auto & desc = unit->thunks[thunkIdx];
+    uint32_t offset = desc.codeOffset;
     // Track bytecoded thunk forcings for profiling.
     if (state.vmState)
         state.vmState->nrBytecodeThunkForces++;
-    bytecode::vmExec(state, *unit, offset, env, v);
+
+    // For v2 thunks (created by OP_MAKE_THUNK_V2), extract the upvalue
+    // array from the carrier env.  The carrier env's values[0] is a
+    // reinterpret_cast'd Value** pointer to the flat upvalue array.
+    Value ** upvalues = nullptr;
+    if (desc.nUpvalues > 0) {
+        upvalues = reinterpret_cast<Value **>(env.values[0]);
+    }
+
+    bytecode::vmExec(state, *unit, offset, env, v, upvalues);
 }
 
 void ExprBytecodeThunk::show(const SymbolTable & symbols, std::ostream & str) const
@@ -68,6 +78,10 @@ ExprLambdaBytecode::ExprLambdaBytecode(
     } else {
         this->name = desc.name;
     }
+
+    // Mark as bytecode proxy so OP_CALL_1 can detect v2 closures
+    // without dynamic_cast (hot-path optimization matching isBytecodeThunk).
+    isBytecodeProxy = true;
 }
 
 } // namespace nix

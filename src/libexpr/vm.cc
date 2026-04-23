@@ -410,7 +410,8 @@ void vmExec(
     const CompilationUnit & unit,
     uint32_t startOffset,
     Env & env,
-    Value & result)
+    Value & result,
+    Value ** upvalues)
 {
     // Ensure VMState is initialized.
     if (!state.vmState) [[unlikely]]
@@ -426,6 +427,7 @@ void vmExec(
     Value * resultSlot = &result;
 
     // Push the initial call frame.
+    // For v2 thunks/closures, the caller may pass an upvalue array.
     vm.frames.push_back(CallFrame{
         .unit      = &unit,
         .ip        = startOffset,
@@ -433,6 +435,7 @@ void vmExec(
         .stackBaseOffset = vm.stackSize(),
         .resultSlot = resultSlot,
         .callPos   = unit.posForOffset(startOffset),
+        .upvalues  = upvalues,
     });
 
     // Frame-local aliases (updated when frames change).
@@ -753,7 +756,16 @@ op_get_local_0_force:
 
             if (thunkEnv && thunkExpr->isBytecodeThunk) {
                 auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
-                uint32_t thunkOffset = bcThunk->unit->thunks[bcThunk->thunkIdx].codeOffset;
+                auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
+                uint32_t thunkOffset = thunkDesc.codeOffset;
+
+                // Extract v2 upvalues from carrier env if present.
+                Value ** frameUpvalues = nullptr;
+                if (thunkDesc.nUpvalues > 0) {
+                    frameUpvalues = reinterpret_cast<Value **>(
+                        thunkEnv->values[0]);
+                }
+
                 v->mkBlackhole();
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
@@ -765,6 +777,7 @@ op_get_local_0_force:
                     .resultSlot = v,
                     .callPos = pos,
                     .isThunkForce = true,
+                    .upvalues = frameUpvalues,
                 });
                 cu = bcThunk->unit;
                 ip = thunkOffset;
@@ -891,7 +904,16 @@ op_force:
 
             if (thunkEnv && thunkExpr->isBytecodeThunk) {
                 auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
-                uint32_t thunkOffset = bcThunk->unit->thunks[bcThunk->thunkIdx].codeOffset;
+                auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
+                uint32_t thunkOffset = thunkDesc.codeOffset;
+
+                // For v2 thunks (created by OP_MAKE_THUNK_V2), extract
+                // the upvalue array from the carrier env's values[0].
+                Value ** frameUpvalues = nullptr;
+                if (thunkDesc.nUpvalues > 0) {
+                    frameUpvalues = reinterpret_cast<Value **>(
+                        thunkEnv->values[0]);
+                }
 
                 // Mark as blackhole before evaluating.
                 v->mkBlackhole();
@@ -909,6 +931,7 @@ op_force:
                     .resultSlot = v,  // Write result back into the thunk Value
                     .callPos = pos,
                     .isThunkForce = true,  // OP_RETURN doesn't push result
+                    .upvalues = frameUpvalues,
                 });
 
                 // Switch to the thunk's code.
@@ -928,6 +951,44 @@ op_force:
             Value * right = v->app().right;
             state.forceValue(*left, pos);
 
+            // v2 App path: the function is a v2 closure (ExprLambdaBytecode).
+            if (left->isLambda() && left->lambda().fun->isBytecodeProxy) {
+                v->mkBlackhole();
+                vm.nrBytecodeCallTrampoline++;
+                auto * bcLambda = static_cast<ExprLambdaBytecode *>(
+                    left->lambda().fun);
+                auto & bodyUnit = *bcLambda->unit;
+                auto & desc = bodyUnit.lambdas[bcLambda->lambdaIdx];
+                auto & thunkDesc = bodyUnit.thunks[desc.bodyThunkIdx];
+                uint32_t startOffset = thunkDesc.codeOffset;
+
+                Value ** frameUpvalues = nullptr;
+                if (desc.nUpvalues > 0 && left->lambda().env) {
+                    frameUpvalues = reinterpret_cast<Value **>(
+                        left->lambda().env->values[0]);
+                }
+
+                vm.frames.back().ip = ip;
+                vm.frames.back().env = curEnv;
+                vm.frames.push_back(CallFrame{
+                    .unit = &bodyUnit,
+                    .ip = startOffset,
+                    .env = left->lambda().env,
+                    .stackBaseOffset = vm.stackSize(),
+                    .resultSlot = v,  // update App in-place
+                    .callPos = pos,
+                    .isThunkForce = true,
+                    .upvalues = frameUpvalues,
+                });
+                // Store arg as stack slot 0 (the parameter).
+                vm.push(right);
+                cu = &bodyUnit;
+                ip = startOffset;
+                curEnv = left->lambda().env;
+                DISPATCH();
+            }
+
+            // v1 App path: env-chain closures in lambdaBodyCache.
             if (Env * env2 = vmBindLambdaArg(state, *left, right, pos)) {
                 v->mkBlackhole();
                 vm.nrBytecodeCallTrampoline++;
@@ -1521,6 +1582,64 @@ op_call_1:
         PosIdx pos = cu->posForOffset(ip - 1);
         state.forceValue(*fun, pos);
 
+        // ── v2 fast path: upvalue-based closures ──
+        // v2 closures are created by OP_MAKE_CLOSURE_V2 and use
+        // ExprLambdaBytecode as the lambda expression.  They use a
+        // flat upvalue array instead of v1 Env chains.  Detect them
+        // via the isBytecodeProxy flag (avoids dynamic_cast).
+        if (fun->isLambda() && fun->lambda().fun->isBytecodeProxy) {
+            vm.nrBytecodeCallTrampoline++;
+            auto * bcLambda = static_cast<ExprLambdaBytecode *>(
+                fun->lambda().fun);
+            auto & bodyUnit = *bcLambda->unit;
+            auto & desc = bodyUnit.lambdas[bcLambda->lambdaIdx];
+            auto & thunkDesc = bodyUnit.thunks[desc.bodyThunkIdx];
+            uint32_t startOffset = thunkDesc.codeOffset;
+
+            assert(startOffset < bodyUnit.code.size()
+                && "OP_CALL_1 v2: startOffset out of bounds");
+
+            // Extract the upvalue array from the closure's carrier env.
+            // OP_MAKE_CLOSURE_V2 stores it as closureEnv.values[0].
+            Value ** frameUpvalues = nullptr;
+            if (desc.nUpvalues > 0 && fun->lambda().env) {
+                frameUpvalues = reinterpret_cast<Value **>(
+                    fun->lambda().env->values[0]);
+            }
+
+            // Save current frame state.
+            vm.frames.back().ip = ip;
+            vm.frames.back().env = curEnv;
+
+            auto * result = state.allocValue();
+
+            // Push the call frame.  The body code uses OP_GET_STACK_SLOT(0)
+            // to read the argument and OP_GET_UPVALUE(i) for captures.
+            // OP_SET_STACK_SLOT auto-extends the stack, so no pre-allocation
+            // of local slots is needed here.
+            vm.frames.push_back(CallFrame{
+                .unit = &bodyUnit,
+                .ip = startOffset,
+                .env = fun->lambda().env,  // for with-chain walking
+                .stackBaseOffset = vm.stackSize(),
+                .resultSlot = result,
+                .callPos = pos,
+                .upvalues = frameUpvalues,
+            });
+
+            // Store the argument as stack slot 0 (the parameter).
+            // The body's first parameter is always at slot 0.
+            vm.push(arg);
+
+            // Switch to the body code.
+            cu = &bodyUnit;
+            ip = startOffset;
+            curEnv = fun->lambda().env;
+
+            DISPATCH();
+        }
+
+        // ── v1 fast path: env-chain closures ──
         // Try the fast path: bytecoded lambda with inline argument binding.
         // This avoids going through callFunction and stays in the VM loop.
         if (Env * env2 = vmBindLambdaArg(state, *fun, arg, pos)) {
@@ -1547,25 +1666,6 @@ op_call_1:
             // Push a new call frame for the lambda body.
             auto * result = state.allocValue();
 
-            // For v2 closures (upvalue-based), extract the upvalue array
-            // from the closure's env.  v2 closures store the array as
-            // closureEnv.values[0] (see OP_MAKE_CLOSURE_V2).
-            Value ** frameUpvalues = nullptr;
-            auto & lambdaDesc = bodyUnit.lambdas[
-                bodyUnit.thunks[bodyInfo.thunkIdx].codeOffset == bodyInfo.prologueOffset
-                    ? 0 : 0]; // TODO: find correct lambda desc
-            // Check if this is a v2 closure by looking at the lambda descriptor's nUpvalues.
-            // Actually, simpler: check if fun->lambda().env->values[0] is a pointer.
-            // For v2 closures, env.values[0] is the upvalue array (cast from Value**).
-            // For v1 closures, env.values[0] is a normal Value*.
-            // Use a heuristic: if bodyInfo has nUpvalues > 0 in the thunk descriptor,
-            // it's v2.
-            auto & thunkDesc = bodyUnit.thunks[bodyInfo.thunkIdx];
-            if (thunkDesc.nUpvalues > 0 && fun->lambda().env) {
-                frameUpvalues = reinterpret_cast<Value **>(
-                    fun->lambda().env->values[0]);
-            }
-
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
                 .ip = startOffset,
@@ -1573,7 +1673,6 @@ op_call_1:
                 .stackBaseOffset = vm.stackSize(),
                 .resultSlot = result,
                 .callPos = pos,
-                .upvalues = frameUpvalues,
             });
 
             // For formals lambdas, push the raw arg onto the stack

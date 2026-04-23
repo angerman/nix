@@ -108,6 +108,10 @@ struct Expr
     /// Set by ExprBytecodeThunk to avoid dynamic_cast in OP_FORCE hot path.
     bool isBytecodeThunk = false;
 
+    /// Set by ExprLambdaBytecode to avoid dynamic_cast in OP_CALL_1 hot path.
+    /// When true, the ExprLambda* can be static_cast'd to ExprLambdaBytecode*.
+    bool isBytecodeProxy = false;
+
     Expr()
     {
         nrExprs++;

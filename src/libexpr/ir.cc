@@ -149,19 +149,27 @@ private:
         currentLevel--;
     }
 
+    /// Bind a variable at the given (relative level, displacement).
+    /// The relative level is converted to an absolute level using
+    /// currentLevel so that lookups from nested scopes resolve correctly.
+    /// Most callers use level=0 ("bind in current scope").
     void bindVar(uint32_t level, uint32_t displ, VarId var)
     {
-        auto key = packKey(level, displ);
+        uint32_t absLevel = currentLevel - level;
+        auto key = packKey(absLevel, displ);
         envMap[key] = var;
         if (!scopeStack.empty())
             scopeStack.back().push_back(key);
     }
 
-    /// Look up an AST variable by its (level, displacement) coordinates.
-    /// Returns kInvalidVar if not found (should not happen after bindVars).
+    /// Look up an AST variable by its (relative level, displacement).
+    /// The relative level from the ExprVar is converted to an absolute
+    /// level using currentLevel, matching the bindVar convention.
+    /// Returns kInvalidVar if not found (external variable).
     VarId lookupVar(uint32_t level, uint32_t displ) const
     {
-        auto it = envMap.find(packKey(level, displ));
+        uint32_t absLevel = currentLevel - level;
+        auto it = envMap.find(packKey(absLevel, displ));
         if (it != envMap.end())
             return it->second;
         return kInvalidVar;
@@ -354,8 +362,13 @@ VarId Lowerer::lowerVar(ExprVar * e)
     bindVar(e->level, e->displ, placeholder);
     // Record the runtime env coordinates so the bytecode emitter can
     // access this variable via OP_GET_LOCAL at runtime.
+    // The entry block runs with curEnv = baseEnv, so we adjust the
+    // AST level (relative to the current nested scope) to be relative
+    // to baseEnv by subtracting the current scope depth.
+    assert(e->level >= currentLevel
+        && "external var level should be >= scope depth");
     module.externalVars[placeholder] = ExternalVarRef{
-        .level = e->level,
+        .level = e->level - currentLevel,
         .displacement = static_cast<uint32_t>(e->displ),
     };
     return emit(IRVarRef{.var = placeholder}, e->pos);
@@ -600,25 +613,34 @@ VarId Lowerer::lowerAttrs(ExprAttrs * e)
         }
 
         // Now lower each attribute value.
+        // For each attribute, create a binding that links the pre-assigned
+        // VarId (used for forward references during lowering) to the
+        // lowered value.  This ensures the pre-assigned VarId gets a stack
+        // slot so thunks can capture it as an upvalue.
         if (e->attrs) {
             size_t i = 0;
             for (auto & [name, def] : *e->attrs) {
                 VarId valueVar;
                 if (def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom) {
-                    // inherit (src) x -> src.x
-                    // The ExprInheritFrom already set up to reference the
-                    // correct source.  Lower the expression normally.
                     valueVar = lowerAsThunkOrEager(def.e, def.pos);
                 } else if (def.kind == ExprAttrs::AttrDef::Kind::Inherited) {
-                    // inherit x -> x  (already bound in outer scope by bindVars)
                     valueVar = lowerExpr(def.e);
                 } else {
-                    // Plain: wrap in thunk for lazy evaluation within rec scope.
                     valueVar = lowerAsThunkOrEager(def.e, def.pos);
                 }
+
+                // Link the pre-assigned VarId to the lowered value so it
+                // has a defining binding (needed for free variable capture).
+                VarId av = attrVars[i].second;
+                curBlock().bindings.push_back(Binding{
+                    .result = av,
+                    .expr = IRVarRef{.var = valueVar},
+                    .pos = def.pos,
+                });
+
                 recEntries.push_back(IRRecAttrSet::Entry{
                     .name = name,
-                    .value = valueVar,
+                    .value = av,
                     .pos = def.pos,
                 });
                 i++;

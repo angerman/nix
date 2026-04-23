@@ -134,7 +134,8 @@ void vmExec(
     const CompilationUnit & unit,
     uint32_t startOffset,
     Env & env,
-    Value & result);
+    Value & result,
+    Value ** upvalues = nullptr);
 
 } // namespace bytecode
 } // namespace nix
