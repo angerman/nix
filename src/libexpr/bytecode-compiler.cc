@@ -375,7 +375,10 @@ void Compiler::compileLet(ExprLet * e)
             uint32_t srcSlot = nAttrs + from->displ;
             unit.emit(OP_GET_LOCAL_0, srcSlot);
             unit.emit(OP_FORCE);
-            unit.emit(OP_ATTR_SELECT, unit.addSymbol(sel->getAttrPath()[0].symbol));
+            // SELECT_FORCE selects the attr AND forces the result.
+            // Needed because the selected value may be a thunk from
+            // a tree-walker-evaluated rec { inherit(builtins) ...; }.
+            unit.emit(OP_SELECT_FORCE, unit.addSymbol(sel->getAttrPath()[0].symbol));
             unit.emit(OP_RETURN);
             unit.patchJump(jumpOver);
             uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
@@ -420,16 +423,27 @@ void Compiler::compileAsThunkOrEager(Expr * expr, PosIdx pos)
     }
 
     // Variable references: emit just the lookup (no forcing).
-    // This matches ExprVar::maybeThunk which returns the Value* directly.
-    // The loaded value may itself be a thunk, but that's fine -- it will be
-    // forced on demand when the consumer needs it.
-    // IMPORTANT: do NOT call compile(expr) here -- that would emit
-    // GET_LOCAL + FORCE, which eagerly forces and breaks recursive
-    // fixed-points (lib.makeExtensible, rec {}, etc.).
+    // This matches ExprVar::maybeThunk which returns the Value* directly
+    // WHEN the env slot is already initialized.
+    //
+    // For level=0 references (same scope), the slot may not be initialized
+    // yet (nix lets are recursive — forward references are valid).
+    // ExprVar::maybeThunk handles this by creating a thunk when the slot
+    // is null.  We must do the same: wrap level=0 variables in a thunk
+    // so the env slot is read lazily.
+    //
+    // For level>0 references, the target env is already fully initialized
+    // (it's an enclosing scope that was set up before the current scope).
+    // Direct GET_LOCAL is safe.
     if (auto * var = dynamic_cast<ExprVar *>(expr)) {
-        // Emit GET_LOCAL or GET_WITH (no forcing) for ALL variables.
-        emitGetLocal(var);
-        return;
+        if (!var->fromWith && var->level == 0) {
+            // Level=0: potentially uninitialized (recursive let scope).
+            // Fall through to the general thunk path below.
+        } else {
+            // Level>0 or with-scope: already initialized. Direct lookup.
+            emitGetLocal(var);
+            return;
+        }
     }
 
     // Lambda: compile to OP_MAKE_CLOSURE, no thunk needed (lambdas are values).
@@ -904,7 +918,8 @@ void Compiler::compileAttrs(ExprAttrs * e)
             // The source was bound by bindVars in `env` (outer scope
             // for non-rec attrsets).  curEnv IS the outer scope.
             compile((*e->inheritFromExprs)[from->displ]);
-            unit.emit(OP_ATTR_SELECT, unit.addSymbol(sel->getAttrPath()[0].symbol));
+            // SELECT_FORCE: select + force the result (it may be a thunk).
+            unit.emit(OP_SELECT_FORCE, unit.addSymbol(sel->getAttrPath()[0].symbol));
             unit.emit(OP_RETURN);
             unit.patchJump(jumpOver);
             uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());

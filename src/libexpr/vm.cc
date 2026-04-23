@@ -1796,6 +1796,15 @@ op_eval_expr:
         Expr * expr = cu->exprPool[exprIdx];
         vm.nrEvalExprFallbacks++;
 
+        if (getEnv("NIX_VM_TRACE_FALLBACK").value_or("") == "1") {
+            std::ostringstream oss;
+            expr->show(state.symbols, oss);
+            auto s = oss.str();
+            fprintf(stderr, "[EVAL_EXPR #%llu] %s: %.120s\n",
+                (unsigned long long)vm.nrEvalExprFallbacks,
+                typeid(*expr).name(), s.c_str());
+        }
+
         auto * result = state.allocValue();
         expr->eval(state, *curEnv, *result);
 

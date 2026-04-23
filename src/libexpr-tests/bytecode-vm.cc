@@ -570,6 +570,34 @@ TEST_F(BytecodeVMTest, regression_let_inherit_from_mixed) {
 }
 
 
+// Forward reference in recursive let: `a` references `b` which hasn't
+// been set yet.  ExprVar::maybeThunk creates a thunk; the bytecoded path
+// must do the same (not eagerly read the null slot).
+TEST_F(BytecodeVMTest, regression_let_forward_ref) {
+    assertDualMode("let a = b; b = 1; in a");
+}
+
+TEST_F(BytecodeVMTest, regression_let_forward_ref_chain) {
+    assertDualMode("let a = b; b = c; c = 42; in a");
+}
+
+// Inherit(expr) where the selected value is itself a thunk.
+// The desugared thunk body must force the selected value (SELECT_FORCE).
+TEST_F(BytecodeVMTest, regression_inherit_select_force) {
+    assertDualMode("let lib = rec { f = x: x + 1; inherit (builtins) map; }; "
+                   "in let inherit (lib) map; in map (x: x * 2) [1 2 3]");
+}
+
+// Multiple inherit-from sources in a let with forward references.
+TEST_F(BytecodeVMTest, regression_let_inherit_from_multi_source) {
+    assertDualMode("let inherit ({ a = 1; }) a; inherit ({ b = 2; }) b; c = a + b; in c");
+}
+
+// Non-rec attrset inherit(expr) with a lambda in a Plain binding.
+TEST_F(BytecodeVMTest, regression_attrset_inherit_with_lambda) {
+    assertDualMode("let lib = { id = x: x; }; in { inherit (lib) id; f = x: x + 1; }.f 10");
+}
+
 // ===========================================================================
 // Review-driven test coverage additions
 // ===========================================================================
