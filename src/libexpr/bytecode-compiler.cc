@@ -249,14 +249,18 @@ void Compiler::emitGetLocal(ExprVar * e)
         return;
     }
 
-    switch (e->level) {
+    // Apply level offset for extra scope layers (e.g., inherit-from env)
+    // that exist in the bytecoded env chain but weren't in bindVars' model.
+    uint32_t level = e->level + levelOffset;
+
+    switch (level) {
         case 0: unit.emit(OP_GET_LOCAL_0, e->displ); break;
         case 1: unit.emit(OP_GET_LOCAL_1, e->displ); break;
         case 2: unit.emit(OP_GET_LOCAL_2, e->displ); break;
         case 3: unit.emit(OP_GET_LOCAL_3, e->displ); break;
         default:
             unit.emit(OP_GET_LOCAL, packLevelDispl(
-                static_cast<uint8_t>(e->level), static_cast<uint16_t>(e->displ)));
+                static_cast<uint8_t>(level), static_cast<uint16_t>(e->displ)));
             break;
     }
 }
@@ -309,9 +313,9 @@ void Compiler::compilePos(ExprPos * e)
 void Compiler::compileLet(ExprLet * e)
 {
     // Fall back to tree-walking for let-bindings with inherit(expr).
-    // These require a separate inheritEnv that our bytecoded path
-    // doesn't create. The ExprInheritFrom nodes have displacements
-    // into the inheritEnv, not the let env.
+    // The inherit env is nested inside the let env, but SET_ENV_SLOT
+    // writes to curEnv (inherit env) instead of the let env.
+    // Compiling this natively requires a SET_ENV_SLOT_UP opcode.
     bool hasInheritFrom = e->attrs->inheritFromExprs
         && !e->attrs->inheritFromExprs->empty();
 
@@ -721,10 +725,8 @@ void Compiler::compileAttrs(ExprAttrs * e)
     bool hasInheritFrom = e->inheritFromExprs && !e->inheritFromExprs->empty();
     bool hasDynamic = e->dynamicAttrs && !e->dynamicAttrs->empty();
 
-    if (hasDynamic || hasInheritFrom) {
-        // Dynamic attrs require runtime name evaluation, and inherit(expr)
-        // requires a special inheritEnv with displacements that the bytecoded
-        // path doesn't create.  Fall back to tree-walker for both.
+    if (hasDynamic) {
+        // Dynamic attrs require runtime name evaluation -- fall back.
         unit.emitPos(e->pos);
         unit.emit(OP_EVAL_EXPR, unit.addExpr(e));
         return;
@@ -790,20 +792,64 @@ void Compiler::compileAttrs(ExprAttrs * e)
         return;
     }
 
-    // Non-recursive, no inherit(expr), no dynamic attrs.
-    // Simple case: { a = e1; b = e2; ... }
+    // Non-recursive attrset (possibly with inherit(expr)).
+    // For { a = e1; inherit (src) b c; ... }:
     //
-    // Compile: push capacity, then for each attr push its thunked value
-    // along with symbol info.  OP_ATTRS_INIT capacity allocates a
-    // BindingsBuilder, each attr is inserted via OP_ATTR_INSERT, and
-    // OP_ATTRS_FINISH finalizes.
+    // 1. If inherit(expr), emit OP_INHERIT_FROM_INIT to create the inherit
+    //    env as a new scope.  Populate it with the inherit-from expressions.
+    // 2. For each binding:
+    //    - InheritedFrom: compile normally (ExprInheritFrom level=0 → inherit env)
+    //    - Plain/Inherited: compile with levelOffset=1 to skip the inherit env
+    //      (bindVars bound these in the outer scope, level=0 for outer)
+    // 3. OP_LEAVE_SCOPE pops the inherit env if present.
+    // 4. OP_ATTRS_INIT builds the attrset.
 
     uint32_t nAttrs = static_cast<uint32_t>(e->attrs->size());
 
-    // Push each attribute value onto the stack (in iteration order,
-    // which is sorted by symbol since AttrDefs is a std::map<Symbol,...>).
+    // Set up the inherit env if needed.
+    if (hasInheritFrom) {
+        uint32_t nInherit = static_cast<uint32_t>(e->inheritFromExprs->size());
+        unit.emitPos(e->pos);
+        unit.emit(OP_INHERIT_FROM_INIT, nInherit);
+
+        // The inherit-from expressions were bound in the outer scope by
+        // bindInheritSources.  After OP_INHERIT_FROM_INIT, curEnv is the
+        // inherit env, so the outer scope is at level 1.  We need levelOffset=1
+        // when compiling these expressions so that level=0 references
+        // (to outer-scope variables) emit GET_LOCAL_1 instead of GET_LOCAL_0.
+        levelOffset = 1;
+        for (uint32_t i = 0; i < nInherit; i++) {
+            auto * fromExpr = (*e->inheritFromExprs)[i];
+            compileAsThunkOrEager(fromExpr, fromExpr->getPos());
+            unit.emit(OP_INHERIT_FROM_SET, i);
+        }
+        levelOffset = 0;
+    }
+
+    // Push each attribute value onto the stack.
     for (auto & [name, def] : *e->attrs) {
-        compileAsThunkOrEager(def.e, def.pos);
+        if (hasInheritFrom
+            && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
+        {
+            // InheritedFrom: compile in the inherit env scope (curEnv).
+            // ExprInheritFrom has level=0, displ=D which resolves to
+            // curEnv->values[D] = the inherit-from source.  No offset needed.
+            compileAsThunkOrEager(def.e, def.pos);
+        } else if (hasInheritFrom) {
+            // Plain/Inherited: these were bound in the outer scope.
+            // The inherit env adds one extra scope level.  Apply
+            // levelOffset=1 so GET_LOCAL skips the inherit env.
+            levelOffset = 1;
+            compileAsThunkOrEager(def.e, def.pos);
+            levelOffset = 0;
+        } else {
+            compileAsThunkOrEager(def.e, def.pos);
+        }
+    }
+
+    // Pop the inherit env if we pushed one.
+    if (hasInheritFrom) {
+        unit.emit(OP_LEAVE_SCOPE);
     }
 
     // OP_ATTRS_INIT nAttrs: pops nAttrs values, reads nAttrs symbol

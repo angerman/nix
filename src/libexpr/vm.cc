@@ -150,7 +150,7 @@ static void traceInstruction(
         case OP_CALL: case OP_TAIL_CALL:
             fprintf(stderr, " nArgs=%u", operand);
             break;
-        case OP_ENTER_LET:
+        case OP_ENTER_LET: case OP_INHERIT_FROM_INIT:
             fprintf(stderr, " envSize=%u", operand);
             break;
         case OP_SET_ENV_SLOT: case OP_INHERIT_FROM_SET:
@@ -507,6 +507,8 @@ void vmExec(
         REGISTER_OP(OP_ENTER_LET,    op_enter_let);
         REGISTER_OP(OP_LEAVE_SCOPE,  op_leave_scope);
         REGISTER_OP(OP_SET_ENV_SLOT, op_set_env_slot);
+        REGISTER_OP(OP_INHERIT_FROM_INIT, op_inherit_from_init);
+        REGISTER_OP(OP_INHERIT_FROM_SET,  op_inherit_from_set);
         REGISTER_OP(OP_MAKE_THUNK,   op_make_thunk);
         REGISTER_OP(OP_MAKE_CLOSURE, op_make_closure);
         REGISTER_OP(OP_CALL,         op_call);
@@ -1241,6 +1243,42 @@ op_set_env_slot:
         // Heap-persist if needed: the value must outlive the stack frame.
         // Since our stack holds Value*, and the value is either from a
         // constant pool or already GC-allocated, we can store it directly.
+        curEnv->values[displ] = v;
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Inherit-from env management
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_inherit_from_init:
+#else
+    case OP_INHERIT_FROM_INIT:
+#endif
+    {
+        // Allocate a separate inherit-from env for `inherit (expr) ...` bindings.
+        // This env is pushed as a scope (like OP_ENTER_LET) so that
+        // ExprInheritFrom (level=0, displ=N) resolves to its slots.
+        // The inherit-from expressions (stored via OP_INHERIT_FROM_SET) are
+        // thunked in the OUTER env (inheritEnv.up), matching the tree-walker.
+        uint32_t nExprs = decodeOperand(CUR_INSTR);
+        Env & ienv = state.mem.allocEnv(nExprs);
+        ienv.up = curEnv;
+        curEnv = &ienv;
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_inherit_from_set:
+#else
+    case OP_INHERIT_FROM_SET:
+#endif
+    {
+        // Store a value into the inherit-from env.
+        // The value was pushed by the preceding thunk/eager compilation.
+        uint32_t displ = decodeOperand(CUR_INSTR);
+        Value * v = vm.pop();
         curEnv->values[displ] = v;
         DISPATCH();
     }

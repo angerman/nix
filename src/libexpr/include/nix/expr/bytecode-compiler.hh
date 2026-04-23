@@ -60,6 +60,13 @@ class Compiler
     /// Currently unused -- will be used when OP_TAIL_CALL is implemented.
     [[maybe_unused]] bool inTailPosition = false;
 
+    /// Level offset applied to GET_LOCAL instructions.
+    /// Used when the bytecoded env chain has an extra scope (e.g., the
+    /// inherit-from env) that bindVars didn't account for. When nonzero,
+    /// emitGetLocal adds this offset to the variable's level before
+    /// emitting the instruction.
+    uint8_t levelOffset = 0;
+
 public:
     Compiler(EvalState & state, CompilationUnit & unit)
         : state(state)
