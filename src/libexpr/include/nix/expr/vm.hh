@@ -104,6 +104,8 @@ struct VMState
     uint64_t peakFrameDepth = 0;       ///< Maximum call frame depth observed
     uint64_t nrBytecodeThunkForces = 0; ///< Thunks forced via ExprBytecodeThunk → vmExec
     uint64_t nrBytecodeCallTrampoline = 0; ///< Lambda calls via OP_CALL_1 trampoline
+    uint64_t nrForceFallbacks = 0;    ///< OP_FORCE → state.forceValue (tree-walker)
+    uint64_t nrCallFallbacks = 0;     ///< OP_CALL_1 → state.callFunction (tree-walker)
 
 private:
     void grow();

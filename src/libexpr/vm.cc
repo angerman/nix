@@ -45,6 +45,8 @@ static void printVMStats(const VMState & vm) {
         vm.nrInstructions ? 100.0 * vm.nrEvalExprFallbacks / vm.nrInstructions : 0.0);
     fprintf(stderr, "  Bytecoded thunk forces: %llu\n", (unsigned long long)vm.nrBytecodeThunkForces);
     fprintf(stderr, "  Bytecoded call trampolines: %llu\n", (unsigned long long)vm.nrBytecodeCallTrampoline);
+    fprintf(stderr, "  OP_FORCE → tree-walker: %llu\n", (unsigned long long)vm.nrForceFallbacks);
+    fprintf(stderr, "  OP_CALL_1 → tree-walker: %llu\n", (unsigned long long)vm.nrCallFallbacks);
     fprintf(stderr, "  Peak stack depth: %llu\n", (unsigned long long)vm.peakStackDepth);
     fprintf(stderr, "  Peak frame depth: %llu\n", (unsigned long long)vm.peakFrameDepth);
     fprintf(stderr, "================================\n");
@@ -845,6 +847,7 @@ op_force:
         }
 
         // Fallback for non-bytecoded thunks, apps, non-thunks.
+        if (v->isThunk() || v->isApp()) vm.nrForceFallbacks++;
         state.forceValue(*v, pos);
         DISPATCH();
     }
@@ -1464,6 +1467,7 @@ op_call_1:
         }
 
         // Fallback: primops, functors, non-bytecoded lambdas.
+        vm.nrCallFallbacks++;
         auto * result = state.allocValue();
         state.callFunction(*fun, *arg, *result, pos);
 
