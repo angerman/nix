@@ -633,7 +633,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             emitVarRef(e.lhs, pos, ctx);
             unit.emitPos(pos);
             uint32_t jumpFalse = unit.emit(OP_JUMP_IF_FALSE, 0);
-            emitVarRef(e.rhs, pos, ctx);
+            emitInlineBlock(e.rhsBlock, ctx);
             uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
             unit.patchJump(jumpFalse);
             unit.emit(OP_FALSE);
@@ -645,7 +645,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             emitVarRef(e.lhs, pos, ctx);
             unit.emitPos(pos);
             uint32_t jumpTrue = unit.emit(OP_JUMP_IF_TRUE, 0);
-            emitVarRef(e.rhs, pos, ctx);
+            emitInlineBlock(e.rhsBlock, ctx);
             uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
             unit.patchJump(jumpTrue);
             unit.emit(OP_TRUE);
@@ -658,7 +658,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             unit.emitPos(pos);
             unit.emit(OP_NOT);
             uint32_t jumpTrue = unit.emit(OP_JUMP_IF_TRUE, 0);
-            emitVarRef(e.rhs, pos, ctx);
+            emitInlineBlock(e.rhsBlock, ctx);
             uint32_t jumpEnd = unit.emit(OP_JUMP, 0);
             unit.patchJump(jumpTrue);
             unit.emit(OP_TRUE);

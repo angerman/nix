@@ -272,13 +272,21 @@ VarId Lowerer::lowerExpr(Expr * expr)
     if (auto * e = dynamic_cast<ExprPath *>(expr))
         return lowerPath(e);
 
-    // Operators
-    if (auto * e = dynamic_cast<ExprOpAnd *>(expr))
-        return lowerBinOp(e->e1, e->e2, e->pos,
-            [](VarId l, VarId r) -> IRExpr { return IRAnd{l, r}; });
-    if (auto * e = dynamic_cast<ExprOpOr *>(expr))
-        return lowerBinOp(e->e1, e->e2, e->pos,
-            [](VarId l, VarId r) -> IRExpr { return IROr{l, r}; });
+    // Short-circuit operators: the rhs must be lowered into a separate
+    // block so it's only evaluated when the lhs permits.  In A-normal
+    // form, all bindings in the same block are executed sequentially,
+    // so lowering the rhs into the current block would eagerly evaluate
+    // it even when the short-circuit should skip it.
+    if (auto * e = dynamic_cast<ExprOpAnd *>(expr)) {
+        VarId lhs = lowerExpr(e->e1);
+        BlockId rhsBlk = lowerIntoBlock(e->e2, e->pos);
+        return emit(IRAnd{lhs, rhsBlk}, e->pos);
+    }
+    if (auto * e = dynamic_cast<ExprOpOr *>(expr)) {
+        VarId lhs = lowerExpr(e->e1);
+        BlockId rhsBlk = lowerIntoBlock(e->e2, e->pos);
+        return emit(IROr{lhs, rhsBlk}, e->pos);
+    }
     if (auto * e = dynamic_cast<ExprOpEq *>(expr))
         return lowerBinOp(e->e1, e->e2, e->pos,
             [](VarId l, VarId r) -> IRExpr { return IREq{l, r}; });
@@ -287,9 +295,11 @@ VarId Lowerer::lowerExpr(Expr * expr)
             [](VarId l, VarId r) -> IRExpr { return IRNEq{l, r}; });
     if (auto * e = dynamic_cast<ExprOpNot *>(expr))
         return lowerNot(e);
-    if (auto * e = dynamic_cast<ExprOpImpl *>(expr))
-        return lowerBinOp(e->e1, e->e2, e->pos,
-            [](VarId l, VarId r) -> IRExpr { return IRImpl{l, r}; });
+    if (auto * e = dynamic_cast<ExprOpImpl *>(expr)) {
+        VarId lhs = lowerExpr(e->e1);
+        BlockId rhsBlk = lowerIntoBlock(e->e2, e->pos);
+        return emit(IRImpl{lhs, rhsBlk}, e->pos);
+    }
     if (auto * e = dynamic_cast<ExprOpUpdate *>(expr))
         return lowerBinOp(e->e1, e->e2, e->pos,
             [](VarId l, VarId r) -> IRExpr { return IRUpdate{l, r}; });
@@ -633,7 +643,16 @@ VarId Lowerer::lowerHasAttr(ExprOpHasAttr * e)
             if (result == kInvalidVar) {
                 result = hasIt;
             } else {
-                result = emit(IRAnd{.lhs = result, .rhs = hasIt}, e->getPos());
+                // Wrap hasIt in a trivial block for IRAnd's rhs.
+                BlockId rhsBlk = module.freshBlock(e->getPos());
+                {
+                    auto saved = currentBlock;
+                    currentBlock = rhsBlk;
+                    VarId ref = emit(IRVarRef{.var = hasIt}, e->getPos());
+                    curBlock().terminal = TermReturn{.value = ref, .pos = e->getPos()};
+                    currentBlock = saved;
+                }
+                result = emit(IRAnd{.lhs = result, .rhsBlock = rhsBlk}, e->getPos());
             }
         }
     }
@@ -1435,13 +1454,17 @@ void collectRefs(const IRExpr & expr, FreeVars & refs)
                         || std::is_same_v<T, IREq>
                         || std::is_same_v<T, IRNEq>
                         || std::is_same_v<T, IRLess>
-                        || std::is_same_v<T, IRAnd>
-                        || std::is_same_v<T, IROr>
-                        || std::is_same_v<T, IRImpl>
                         || std::is_same_v<T, IRUpdate>
                         || std::is_same_v<T, IRConcatLists>) {
             refs.insert(e.lhs);
             refs.insert(e.rhs);
+        }
+        // Short-circuit operators: lhs is a VarId, rhs is a block.
+        else if constexpr (std::is_same_v<T, IRAnd>
+                        || std::is_same_v<T, IROr>
+                        || std::is_same_v<T, IRImpl>) {
+            refs.insert(e.lhs);
+            // rhsBlock's free vars are handled via subBlockFreeVars.
         }
         else if constexpr (std::is_same_v<T, IRNegate>) {
             refs.insert(e.operand);
@@ -1547,6 +1570,14 @@ FreeVars blockFreeVars(
                 if (it2 != subBlockFreeVars.end())
                     exprRefs.merge(it2->second);
             }
+            // Short-circuit operators: rhs is a block.
+            else if constexpr (std::is_same_v<T, IRAnd>
+                            || std::is_same_v<T, IROr>
+                            || std::is_same_v<T, IRImpl>) {
+                auto it = subBlockFreeVars.find(e.rhsBlock);
+                if (it != subBlockFreeVars.end())
+                    exprRefs.merge(it->second);
+            }
             else if constexpr (std::is_same_v<T, IRWith>) {
                 auto it = subBlockFreeVars.find(e.bodyBlock);
                 if (it != subBlockFreeVars.end())
@@ -1600,6 +1631,12 @@ void buildBlockDeps(
                     parentToChildren[block.id].push_back(e.elseBlock);
                     childToParent[e.thenBlock].push_back(block.id);
                     childToParent[e.elseBlock].push_back(block.id);
+                }
+                else if constexpr (std::is_same_v<T, IRAnd>
+                                || std::is_same_v<T, IROr>
+                                || std::is_same_v<T, IRImpl>) {
+                    parentToChildren[block.id].push_back(e.rhsBlock);
+                    childToParent[e.rhsBlock].push_back(block.id);
                 }
                 else if constexpr (std::is_same_v<T, IRWith>) {
                     parentToChildren[block.id].push_back(e.bodyBlock);

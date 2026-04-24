@@ -408,13 +408,16 @@ struct IRLess   { VarId lhs; VarId rhs; };
 /// Lowered to: if lhs then rhs else false.
 /// Represented explicitly so optimization passes can recognize the pattern
 /// and the bytecode emitter can use JUMP_IF_FALSE for short-circuit.
-struct IRAnd    { VarId lhs; VarId rhs; };
+/// Short-circuiting AND.  rhs is a separate block (only evaluated
+/// when lhs is true) to avoid eagerly executing side effects.
+struct IRAnd    { VarId lhs; BlockId rhsBlock; };
 
-/// Short-circuiting logical OR.
-struct IROr     { VarId lhs; VarId rhs; };
+/// Short-circuiting logical OR.  rhs in a separate block.
+struct IROr     { VarId lhs; BlockId rhsBlock; };
 
 /// Logical implication: `lhs -> rhs` == `!lhs || rhs`.
-struct IRImpl   { VarId lhs; VarId rhs; };
+/// rhs in a separate block.
+struct IRImpl   { VarId lhs; BlockId rhsBlock; };
 
 /// Attrset update (merge): `lhs // rhs`.
 struct IRUpdate { VarId lhs; VarId rhs; };
