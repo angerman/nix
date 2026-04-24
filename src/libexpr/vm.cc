@@ -1959,6 +1959,10 @@ op_has_attr:
         uint32_t symIdx = decodeOperand(CUR_INSTR);
         Value * attrs = vm.top();
         Symbol name = cu->symbols[symIdx];
+        // Force the value if it's still a thunk (belt-and-suspenders:
+        // the IR should emit OP_FORCE before OP_HAS_ATTR, but the
+        // tree-walker's ExprOpHasAttr::eval always forces).
+        state.forceValue(*attrs, cu->posForOffset(ip - 1));
         bool has = attrs->type() == nAttrs && attrs->attrs()->get(name);
         *(vm.sp - 1) = has ? &Value::vTrue : &Value::vFalse;
         DISPATCH();
@@ -1977,6 +1981,7 @@ op_has_attr_dyn:
         PosIdx pos = cu->posForOffset(ip - 1);
         state.forceStringNoCtx(*nameVal, pos,
             "while evaluating an attribute name");
+        state.forceValue(*attrs, pos);
         Symbol name = state.symbols.create(nameVal->string_view());
         bool has = attrs->type() == nAttrs && attrs->attrs()->get(name);
         *(vm.sp - 1) = has ? &Value::vTrue : &Value::vFalse;

@@ -1502,6 +1502,31 @@ TEST_F(IREmitTest, ir_emit_and_short_circuit_side_effect) {
     assertIREmitMatch("let args = { }; in args ? x && (let r = args.x; in r == 1)");
 }
 
+TEST_F(IREmitTest, ir_emit_has_attr_fixpoint) {
+    // has-attr on a fixpoint value must force the value first.
+    assertIREmitMatch("let fix = f: let x = f x; in x; fixed = fix (self: { extra = true; }); in fixed ? extra");
+}
+
+TEST_F(IREmitTest, ir_emit_select_or_fixpoint) {
+    // select-or on a fixpoint value.
+    assertIREmitMatch("let fix = f: let x = f x; in x; fixed = fix (self: { extra = true; }); in fixed.extra or 99");
+}
+
+TEST_F(IREmitTest, ir_emit_with_nested_lambda) {
+    // With-scope variable accessed from a nested lambda (v2 env chain fix).
+    assertIREmitMatch("let f = attrs: with attrs; let g = x: a + x; in g b; in f { a = 10; b = 5; }");
+}
+
+TEST_F(IREmitTest, ir_emit_with_double_nested) {
+    // Two levels of nesting inside with.
+    assertIREmitMatch("let f = attrs: with attrs; let g = x: let h = y: a + y; in h x; in g b; in f { a = 10; b = 5; }");
+}
+
+TEST_F(IREmitTest, ir_emit_fixpoint_overlay_passthru) {
+    // Fixpoint with overlay adding passthru — nixpkgs bootstrap pattern.
+    assertIREmitMatch("let fix = f: let x = f x; in x; base = { pkg = { name = \"test\"; }; }; overlay = self: super: { pkg = super.pkg // { passthru = true; }; }; fixed = fix (self: base // (overlay self base)); in fixed.pkg.passthru or false");
+}
+
 TEST_F(IREmitTest, ir_emit_assert_with_select_or) {
     // Assert condition with select-or must not clobber the body.
     assertIREmitMatch("let f = x: let final = { a = x; }; in assert builtins.length (final.a.b or []) == 0; final; in f { }");

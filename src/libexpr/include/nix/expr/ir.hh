@@ -364,6 +364,7 @@ struct IRWithLookup
     Symbol name;                         ///< Attribute name to look up in with-scopes.
     PosIdx pos;                          ///< Position of the variable reference.
     ExprVar * sourceVar = nullptr;       ///< Original AST ExprVar with fromWith chain (for OP_GET_WITH).
+    uint32_t v2Level = 0;               ///< Adjusted level for v2 env chain (accounts for missing let envs).
 };
 
 /// String interpolation / concatenation.

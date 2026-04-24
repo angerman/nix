@@ -614,11 +614,18 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
 
         // -- With lookup --
         else if constexpr (std::is_same_v<T, ir::IRWithLookup>) {
-            // Use the original ExprVar from the AST, which has the
-            // correct fromWith chain, level, and name set by bindVars().
-            // OP_GET_WITH walks the with-chain using this information.
+            // Create a patched ExprVar with the v2-adjusted level.
+            // The original ExprVar's level counts ALL scopes (lambda,
+            // let, with) but the v2 env chain only has carrier envs
+            // (skipped) and with/enter_let envs.  Using the original
+            // level would overshoot.
             assert(e.sourceVar && "IRWithLookup must have a sourceVar");
-            uint32_t exprIdx = unit.addExpr(e.sourceVar);
+            auto * patchedVar = state.mem.exprs.add<ExprVar>(
+                e.sourceVar->pos, e.sourceVar->name);
+            patchedVar->level = e.v2Level;
+            patchedVar->displ = e.sourceVar->displ;
+            patchedVar->fromWith = e.sourceVar->fromWith;
+            uint32_t exprIdx = unit.addExpr(patchedVar);
             unit.emitPos(e.pos);
             unit.emit(OP_GET_WITH, exprIdx);
         }

@@ -117,6 +117,12 @@ class Lowerer
     /// Current nesting level (how many scopes deep we are).
     uint32_t currentLevel = 0;
 
+    /// v2 env-chain depth: counts only scopes that create runtime envs
+    /// in the v2 VM (with scopes via OP_PUSH_WITH, rec attrsets via
+    /// OP_ENTER_LET).  Lambda and let scopes don't create envs in v2.
+    /// Used to compute the adjusted level for IRWithLookup.
+    uint32_t v2EnvDepth = 0;
+
     /// Extra level offset applied to ExprVar lookups.
     ///
     /// When lowering Inherited bindings in a let with inherit(expr), the
@@ -362,10 +368,30 @@ VarId Lowerer::lowerVar(ExprVar * e)
 {
     // Check if this is a with-scope variable (resolved dynamically).
     if (e->fromWith != nullptr) {
+        // Compute the v2 env-chain level for the with scope.
+        // In v2, the env chain only has carrier envs (skipped) and
+        // with/enter_let envs.  The v2Level is the number of WITH
+        // env steps from the current position to the target with scope.
+        // This equals v2EnvDepth now minus v2EnvDepth at the with scope.
+        //
+        // Count with scopes between current pos and the target:
+        // walk the fromWith chain, counting how many with scopes there
+        // are at the current level.  For the first with scope (no
+        // prevWith), v2Level = 0.  For each additional fromWith step,
+        // v2Level increments.
+        uint32_t v2Lvl = 0;
+        // The ExprVar::level gives the total scope distance.
+        // But in v2, we only care about the distance in with scopes.
+        // For the initial walk, we need v2Level = 0 to land on the
+        // nearest with env (after skipping carriers).  This is correct
+        // because the level walk skips carriers, and the only remaining
+        // envs are with/enter_let envs.  So v2Level = 0 means "current
+        // env after carrier skip" = nearest with env.
         return emit(IRWithLookup{
             .name = e->name,
             .pos = e->pos,
             .sourceVar = e,
+            .v2Level = v2Lvl,
         }, e->pos);
     }
 
@@ -1128,7 +1154,9 @@ VarId Lowerer::lowerWith(ExprWith * e)
     // We need to push a scope here so that lookupVar's absolute-level
     // calculation matches the AST's level numbering.
     pushScope();
+    v2EnvDepth++;  // with creates an env (OP_PUSH_WITH)
     BlockId bodyBlk = lowerIntoBlock(e->body, e->pos);
+    v2EnvDepth--;
     popScope();
 
     return emit(IRWith{
