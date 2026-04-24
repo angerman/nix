@@ -271,6 +271,9 @@ enum Op : uint8_t {
     /// preserving the address for any captured upvalues that already
     /// reference it.
     OP_COPY_TO_SLOT      = 0x4C, // [slot:24]       pop src, copy *src into *stack[base+slot]
+    OP_CELL_GET          = 0x4D, // [cell_uv:8|idx:16] push cell[idx] via upvalues[cell_uv]
+    OP_CELL_SET          = 0x4E, // [cell_slot:8|idx:16] pop val, cell[idx] = val (cell from stack[base+cell_slot])
+    OP_ALLOC_CELL        = 0x4F, // [size:24]           push GC_MALLOC'd Value*[size] (as reinterpret_cast'd Value*)
 };
 
 

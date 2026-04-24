@@ -38,6 +38,12 @@ struct BlockContext
     /// Only for variables captured from an enclosing scope.
     std::unordered_map<ir::VarId, uint32_t> upvalueSlots;
 
+    /// Map from VarId to a formals cell index.
+    /// For default thunk sub-blocks: sibling formal VarIds are resolved
+    /// via OP_CELL_GET instead of OP_GET_UPVALUE or OP_GET_STACK_SLOT.
+    std::unordered_map<ir::VarId, uint32_t> cellSlotMap;
+    uint32_t cellUpvalueIdx = 0;  ///< Upvalue index of the cell pointer.
+
     /// Next available stack slot in this frame.
     uint32_t nextSlot = 0;
 
@@ -785,6 +791,15 @@ void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
         return;
     }
 
+    // Check formals cell (sibling formal references in default thunks).
+    auto cellIt = ctx.cellSlotMap.find(var);
+    if (cellIt != ctx.cellSlotMap.end()) {
+        // Emit OP_CELL_GET: read cell[formalIdx] via upvalues[cellUvIdx].
+        uint32_t packed = (ctx.cellUpvalueIdx << 16) | cellIt->second;
+        unit.emit(OP_CELL_GET, packed);
+        return;
+    }
+
     // Check upvalue slots (captured from enclosing scope).
     auto upIt = ctx.upvalueSlots.find(var);
     if (upIt != ctx.upvalueSlots.end()) {
@@ -980,121 +995,175 @@ uint32_t IREmitter::emitSubBlockWithFormals(
     // Slot 0: reserved for the raw attrset argument (pushed by caller).
     uint32_t argSlot = subCtx.nextSlot++;
 
-    // Pre-allocate slots with OP_ALLOC_VALUE for stable pointers.
-    // Default thunks in pass 2 capture these pointers as upvalues.
-    // Pass 1 replaces present-formal slots with the original pointer
-    // (OP_SET_STACK_SLOT).  Pass 2 writes into the pre-allocated
-    // Value* for defaults (OP_COPY_TO_SLOT), preserving pointer
-    // stability for earlier captures.
+    // Allocate formal slots (no pre-allocation).
     for (auto p : block.params) {
-        uint32_t slot = subCtx.allocSlot(p);
-        unit.emit(OP_ALLOC_VALUE);
-        unit.emit(OP_SET_STACK_SLOT, slot);
+        subCtx.allocSlot(p);
+    }
+    // Extend stack frame with null placeholders.
+    for (uint32_t s = 1; s < subCtx.nextSlot; ++s) {
+        unit.emit(OP_NULL);
+        unit.emit(OP_SET_STACK_SLOT, s);
     }
 
-    // --- Emit the formals-binding prologue ---
+    // --- Formals cell ---
     //
-    // Two-pass approach to solve the tension between pointer sharing
-    // (for blackhole detection) and capture correctness (for defaults):
-    //
-    // Pass 1: Unpack ALL formals present in the argument attrset.
-    //   Uses OP_SET_STACK_SLOT to store the ORIGINAL Value* pointer
-    //   from the attrset.  This preserves pointer sharing so that
-    //   blackhole detection works for fixpoint self-references
-    //   (e.g., `self = lua` in callPackage).
-    //
-    // Pass 2: Create default thunks for MISSING formals.
-    //   Re-reads the attrset from argSlot (slot 0) and re-checks
-    //   HAS_ATTR for each formal with default.  Default thunks are
-    //   created here AFTER all present-formals have their correct
-    //   pointers, so thunk captures get up-to-date values.
-    //
+    // A shared GC-traced Value*[] array that default thunks read from
+    // at FORCE time (via OP_CELL_GET).  This provides late-binding:
+    // the cell is fully populated by the prologue before any thunk is
+    // forced.  Stack slots use SET_STACK_SLOT (pointer sharing for
+    // blackhole detection).  No COPY_TO_SLOT needed.
+
+    bool hasAnyDefault = false;
+    for (auto & f : params.formals)
+        if (f.defaultBody != ir::kInvalidBlock) { hasAnyDefault = true; break; }
+
+    uint32_t formalParamStart = params.arg ? 1 : 0;
+    uint32_t nFormals = static_cast<uint32_t>(params.formals.size());
+    uint32_t cellSlot = 0;
+
+    uint32_t cellSize = nFormals + (params.arg ? 1 : 0); // extra entry for @-pattern
+    if (hasAnyDefault) {
+        // Allocate the cell at RUNTIME (per-call, GC-traced).
+        cellSlot = subCtx.nextSlot++;
+        unit.emit(OP_ALLOC_CELL, cellSize);
+        unit.emit(OP_SET_STACK_SLOT, cellSlot);
+    }
+
     // Read and force the raw attrset argument.
     unit.emit(OP_GET_STACK_SLOT, argSlot);
     unit.emit(OP_FORCE);
 
-    // If there's an @-pattern, store the attrset pointer.
+    // @-pattern
     if (params.arg) {
         unit.emit(OP_DUP);
         auto it = subCtx.localSlots.find(block.params[0]);
         assert(it != subCtx.localSlots.end());
         unit.emit(OP_SET_STACK_SLOT, it->second);
+        // Write @-pattern into cell for late-binding.
+        if (hasAnyDefault) {
+            unit.emit(OP_GET_STACK_SLOT, it->second);
+            unit.emit(OP_CELL_SET, (cellSlot << 16) | nFormals); // @-pattern at cell[nFormals]
+        }
     }
 
-    uint32_t formalParamStart = params.arg ? 1 : 0;
+    // --- Single-pass formals prologue ---
+    //
+    // For each formal:
+    //   If present: SET_STACK_SLOT + CELL_SET (original pointer)
+    //   If default: create thunk, SET_STACK_SLOT + CELL_SET (thunk)
+    //
+    // Default thunks capture the CELL pointer as upvalue 0.
+    // Their bodies use OP_CELL_GET for sibling formal references.
+    // This gives late-binding: the cell is read at force time,
+    // after the entire prologue has completed.
 
-    // --- Pass 1: unpack present attrs ---
-    for (uint32_t i = 0; i < params.formals.size(); ++i) {
+    for (uint32_t i = 0; i < nFormals; ++i) {
         auto & formal = params.formals[i];
         ir::VarId formalVarId = block.params[formalParamStart + i];
         auto slotIt = subCtx.localSlots.find(formalVarId);
         assert(slotIt != subCtx.localSlots.end());
         uint32_t formalSlot = slotIt->second;
 
-        unit.emit(OP_DUP);
-        uint32_t symIdx = unit.addSymbol(formal.name);
-        unit.emit(OP_HAS_ATTR, symIdx);
-        uint32_t jumpMissing = unit.emit(OP_JUMP_IF_FALSE, 0);
+        if (formal.defaultBody != ir::kInvalidBlock) {
+            // Formal with default.
+            unit.emit(OP_DUP);
+            uint32_t symIdx = unit.addSymbol(formal.name);
+            unit.emit(OP_HAS_ATTR, symIdx);
+            uint32_t jumpToDefault = unit.emit(OP_JUMP_IF_FALSE, 0);
 
-        // Attr exists: store ORIGINAL pointer.
-        unit.emit(OP_DUP);
-        unit.emit(OP_ATTR_SELECT, symIdx);
-        unit.emit(OP_SET_STACK_SLOT, formalSlot);
+            // Attr exists: store original pointer.
+            unit.emit(OP_DUP);
+            unit.emit(OP_ATTR_SELECT, symIdx);
+            unit.emit(OP_SET_STACK_SLOT, formalSlot);
+            // Write into cell for late-binding.
+            unit.emit(OP_GET_STACK_SLOT, formalSlot);
+            unit.emit(OP_CELL_SET, (cellSlot << 16) | i);
+            uint32_t jumpPastDefault = unit.emit(OP_JUMP, 0);
 
-        unit.patchJump(jumpMissing);
-        // Missing: slot stays null — handled in pass 2.
-    }
+            // Attr missing: create default thunk.
+            unit.patchJump(jumpToDefault);
+            {
+                // Build sibling formal VarId → cell index mapping.
+                std::unordered_set<ir::VarId> siblingVarIds;
+                for (uint32_t j = 0; j < nFormals; ++j)
+                    siblingVarIds.insert(block.params[formalParamStart + j]);
+                if (params.arg)
+                    siblingVarIds.insert(block.params[0]);
 
-    // Pop the attrset from TOS.
-    unit.emit(OP_POP);
+                // Split free vars: sibling → cell, others → upvalues.
+                ir::FreeVars nonSiblingFreeVars;
+                for (auto fv : formal.defaultFreeVars.vars)
+                    if (!siblingVarIds.count(fv))
+                        nonSiblingFreeVars.insert(fv);
 
-    // --- Pass 2: create default thunks for missing formals ---
-    // The attrset is still accessible via argSlot (slot 0).
-    for (uint32_t i = 0; i < params.formals.size(); ++i) {
-        auto & formal = params.formals[i];
-        if (formal.defaultBody == ir::kInvalidBlock)
-            continue;
+                // Upvalue layout: [0]=cell, [1..N]=non-sibling free vars.
+                uint32_t totalUpvalues = 1 + static_cast<uint32_t>(nonSiblingFreeVars.size());
 
-        ir::VarId formalVarId = block.params[formalParamStart + i];
-        auto slotIt = subCtx.localSlots.find(formalVarId);
-        uint32_t formalSlot = slotIt->second;
+                // Build sub-block context for the default thunk.
+                const auto & defBlock = module.blocks[formal.defaultBody];
+                BlockContext thunkCtx;
+                // Cell-based references for sibling formals + @-pattern.
+                for (uint32_t j = 0; j < nFormals; ++j) {
+                    ir::VarId sib = block.params[formalParamStart + j];
+                    thunkCtx.cellSlotMap[sib] = j;
+                }
+                if (params.arg)
+                    thunkCtx.cellSlotMap[block.params[0]] = nFormals;
+                thunkCtx.cellUpvalueIdx = 0;
+                // Normal upvalues for non-sibling free vars.
+                uint32_t uvIdx = 1;
+                for (auto fv : nonSiblingFreeVars.vars)
+                    thunkCtx.upvalueSlots[fv] = uvIdx++;
+                // Params → local slots.
+                for (auto p : defBlock.params)
+                    thunkCtx.allocSlot(p);
 
-        // Re-check if the attr exists (cheap: attrset is already forced).
-        unit.emit(OP_GET_STACK_SLOT, argSlot);
-        uint32_t symIdx = unit.addSymbol(formal.name);
-        unit.emit(OP_HAS_ATTR, symIdx);
-        uint32_t jumpPresent = unit.emit(OP_JUMP_IF_TRUE, 0);
+                // Emit the sub-block body.
+                uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+                uint32_t bodyOffset = static_cast<uint32_t>(unit.code.size());
+                emitBlock(defBlock, thunkCtx);
+                unit.patchJump(jumpOver);
 
-        // Attr missing: create default thunk.
-        // All present-formals have been unpacked by pass 1, so
-        // thunk captures get correct original Value* pointers.
-        {
-            uint32_t bodyOffset = emitSubBlock(
-                formal.defaultBody, formal.defaultFreeVars, subCtx);
+                // Register thunk descriptor.
+                uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                unit.thunks.push_back(ThunkDescriptor{
+                    .codeOffset = bodyOffset,
+                    .pos = formal.pos,
+                    .sourceExpr = nullptr,
+                    .nUpvalues = static_cast<uint16_t>(totalUpvalues),
+                });
 
-            uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
-            unit.thunks.push_back(ThunkDescriptor{
-                .codeOffset = bodyOffset,
-                .pos = formal.pos,
-                .sourceExpr = nullptr,
-                .nUpvalues = static_cast<uint16_t>(formal.defaultFreeVars.size()),
-            });
+                // Push captures: cell first, then non-sibling free vars.
+                unit.emit(OP_GET_STACK_SLOT, cellSlot);
+                for (auto fv : nonSiblingFreeVars.vars)
+                    emitCapture(fv, formal.pos, subCtx);
 
-            for (auto freeVar : formal.defaultFreeVars.vars) {
-                emitCapture(freeVar, formal.pos, subCtx);
+                unit.emitPos(formal.pos);
+                unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
+                unit.emit(OP_NOP, totalUpvalues);
             }
+            // Store thunk and write into cell.
+            unit.emit(OP_DUP);
+            unit.emit(OP_SET_STACK_SLOT, formalSlot);
+            unit.emit(OP_CELL_SET, (cellSlot << 16) | i);
 
-            unit.emitPos(formal.pos);
-            unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
-            unit.emit(OP_NOP, static_cast<uint32_t>(formal.defaultFreeVars.size()));
-            // Write default thunk into pre-allocated Value*.
-            // COPY_TO_SLOT preserves the pre-allocated pointer, so
-            // earlier default thunks that captured it see the update.
-            unit.emit(OP_COPY_TO_SLOT, formalSlot);
+            unit.patchJump(jumpPastDefault);
+        } else {
+            // Required formal: select and store.
+            unit.emit(OP_DUP);
+            uint32_t symIdx = unit.addSymbol(formal.name);
+            unit.emit(OP_ATTR_SELECT, symIdx);
+            unit.emit(OP_SET_STACK_SLOT, formalSlot);
+            // Write into cell for late-binding by default thunks.
+            if (hasAnyDefault) {
+                unit.emit(OP_GET_STACK_SLOT, formalSlot);
+                unit.emit(OP_CELL_SET, (cellSlot << 16) | i);
+            }
         }
-
-        unit.patchJump(jumpPresent);
     }
+
+    // Pop the attrset.
+    unit.emit(OP_POP);
 
     // --- Emit the body block ---
     emitBlock(block, subCtx);

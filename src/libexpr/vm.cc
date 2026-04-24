@@ -190,6 +190,12 @@ static void traceInstruction(
             break;
         case OP_ALLOC_VALUE:
             break;
+        case OP_CELL_GET:
+            fprintf(stderr, " cell_uv=%u formal=%u", operand >> 16, operand & 0xFFFF);
+            break;
+        case OP_CELL_SET:
+            fprintf(stderr, " cell_slot=%u formal=%u", operand >> 16, operand & 0xFFFF);
+            break;
         default:
             if (operand) fprintf(stderr, " %u", operand);
             break;
@@ -569,6 +575,9 @@ void vmExec(
         REGISTER_OP(OP_SET_STACK_SLOT,   op_set_stack_slot);
         REGISTER_OP(OP_ALLOC_VALUE,      op_alloc_value);
         REGISTER_OP(OP_COPY_TO_SLOT,     op_copy_to_slot);
+        REGISTER_OP(OP_CELL_GET,         op_cell_get);
+        REGISTER_OP(OP_CELL_SET,         op_cell_set);
+        REGISTER_OP(OP_ALLOC_CELL,       op_alloc_cell);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2446,6 +2455,75 @@ op_copy_to_slot:
         // Copy the Value data in-place, preserving the destination pointer.
         // Any upvalues that captured this Value* will see the updated data.
         *dst = *src;
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Formals cell dereference
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_cell_get:
+#else
+    case OP_CELL_GET:
+#endif
+    {
+        // Operand packs (cell_upvalue_idx:8, formal_index:16).
+        // Reads cell[formal_index] where cell is a GC-traced Value*[]
+        // array stored as upvalues[cell_upvalue_idx] (reinterpret_cast).
+        uint32_t packed = decodeOperand(CUR_INSTR);
+        uint32_t cellUvIdx = packed >> 16;
+        uint32_t formalIdx = packed & 0xFFFF;
+        Value ** upvalues = vm.frames.back().upvalues;
+        assert(upvalues && "OP_CELL_GET: no upvalue array");
+        Value ** cell = reinterpret_cast<Value **>(upvalues[cellUvIdx]);
+        assert(cell && "OP_CELL_GET: NULL cell pointer");
+        vm.push(cell[formalIdx]);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Formals cell write
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_cell_set:
+#else
+    case OP_CELL_SET:
+#endif
+    {
+        // Operand packs (cell_stack_slot:8, formal_index:16).
+        // Pops a Value* from TOS and writes it into cell[formal_index].
+        // The cell pointer is read from stack[base + cell_stack_slot].
+        uint32_t packed = decodeOperand(CUR_INSTR);
+        uint32_t cellStackSlot = packed >> 16;
+        uint32_t formalIdx = packed & 0xFFFF;
+        size_t base = vm.frames.back().stackBaseOffset;
+        Value ** cell = reinterpret_cast<Value **>(vm.stack[base + cellStackSlot]);
+        Value * val = vm.pop();
+        cell[formalIdx] = val;
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Allocate formals cell
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_alloc_cell:
+#else
+    case OP_ALLOC_CELL:
+#endif
+    {
+        // Allocate a GC-traced Value*[] array of the given size.
+        // Initialize all entries to &Value::vNull.
+        // Push the array pointer (reinterpret_cast'd to Value*).
+        uint32_t size = decodeOperand(CUR_INSTR);
+        auto * cell = static_cast<Value **>(
+            GC_MALLOC(size * sizeof(Value *)));
+        for (uint32_t i = 0; i < size; ++i)
+            cell[i] = const_cast<Value *>(&Value::vNull);
+        vm.push(reinterpret_cast<Value *>(cell));
         DISPATCH();
     }
 
