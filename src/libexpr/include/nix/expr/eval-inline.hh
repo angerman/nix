@@ -95,62 +95,56 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    // Detect NULL Value* references (indicates stack corruption or
-    // uninitialized slot in the v2 VM).
-    if (&v == nullptr) [[unlikely]] {
-        fprintf(stderr, "FATAL: forceValue called with NULL Value*\n");
-        abort();
-    }
-    if (v.isThunk()) {
-        nrThunksForced++;
-        Env * env = v.thunk().env;
-        assert(env || v.isBlackhole());
-        Expr * expr = v.thunk().expr;
-        try {
+    // Iterative thunk/app resolution loop.  Uses a while loop instead of
+    // recursive forceValue calls to avoid C stack overflow from deep
+    // thunk chains (common in v2 IR with OP_COPY_TO_SLOT thunk copies).
+    for (;;) {
+        if (v.isThunk()) {
+            nrThunksForced++;
+            Env * env = v.thunk().env;
+            assert(env || v.isBlackhole());
+            Expr * expr = v.thunk().expr;
+            try {
+                v.mkBlackhole();
+                if (env) [[likely]]
+                    expr->eval(*this, *env, v);
+                else
+                    ExprBlackHole::throwInfiniteRecursionError(*this, v);
+            } catch (...) {
+                handleEvalExceptionForThunk(env, expr, v, pos);
+                throw;
+            }
+            // If result is still a thunk/app, loop to resolve the chain
+            // iteratively (no C stack growth from recursive forceValue).
+            if (v.isThunk() || v.isApp()) {
+                nrThunkChains++;
+                continue;
+            }
+            return;
+        }
+        if (v.isApp()) {
+            nrThunksForced++;
+            Value * left = v.app().left;
+            Value * right = v.app().right;
+            Value savedApp = v;
             v.mkBlackhole();
-            if (env) [[likely]]
-                expr->eval(*this, *env, v);
-            else
-                ExprBlackHole::throwInfiniteRecursionError(*this, v);
-        } catch (...) {
-            handleEvalExceptionForThunk(env, expr, v, pos);
-            throw;
+            try {
+                callFunction(*left, *right, v, pos);
+            } catch (...) {
+                v = savedApp;
+                handleEvalExceptionForApp(v, savedApp);
+                throw;
+            }
+            if (v.isThunk() || v.isApp()) {
+                nrThunkChains++;
+                continue;
+            }
+            return;
         }
-        /* Resolve thunk chains (bounded): a forced thunk may evaluate to
-           another thunk.  Resolve up to a small depth to handle common
-           v2 IR thunk chains without risking infinite recursion from
-           thunk copies (OP_COPY_TO_SLOT creates independent copies that
-           each re-evaluate from scratch). */
-        for (int chainDepth = 0; chainDepth < 16 && (v.isThunk() || v.isApp()); ++chainDepth) {
-            nrThunkChains++;
-            forceValue(v, pos);
+        if (v.isFailed()) {
+            handleEvalFailed(v, pos);
         }
-    } else if (v.isApp()) {
-        nrThunksForced++;
-        // Extract left/right BEFORE marking blackhole (mkBlackhole
-        // overwrites the App storage).  Mark blackhole so re-entrant
-        // forcing of the same App value detects infinite recursion
-        // (previously, Apps had no re-entrancy protection — the VM's
-        // eager lambda registration exposed this via primop-created
-        // App values in makeExtensible chains).
-        Value * left = v.app().left;
-        Value * right = v.app().right;
-        Value savedApp = v;
-        v.mkBlackhole();
-        try {
-            callFunction(*left, *right, v, pos);
-        } catch (...) {
-            // Restore the App for error reporting, then handle.
-            v = savedApp;
-            handleEvalExceptionForApp(v, savedApp);
-            throw;
-        }
-        for (int chainDepth = 0; chainDepth < 16 && (v.isThunk() || v.isApp()); ++chainDepth) {
-            nrThunkChains++;
-            forceValue(v, pos);
-        }
-    } else if (v.isFailed()) {
-        handleEvalFailed(v, pos);
+        return;
     }
 }
 
