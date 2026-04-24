@@ -116,10 +116,12 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForThunk(env, expr, v, pos);
             throw;
         }
-        /* Resolve thunk chains: a forced thunk may evaluate to another
-           thunk (e.g., a v2 IR variable reference that returned another
-           thunk without forcing it).  Loop until fully resolved. */
-        while (v.isThunk() || v.isApp()) {
+        /* Resolve thunk chains (bounded): a forced thunk may evaluate to
+           another thunk.  Resolve up to a small depth to handle common
+           v2 IR thunk chains without risking infinite recursion from
+           thunk copies (OP_COPY_TO_SLOT creates independent copies that
+           each re-evaluate from scratch). */
+        for (int chainDepth = 0; chainDepth < 16 && (v.isThunk() || v.isApp()); ++chainDepth) {
             nrThunkChains++;
             forceValue(v, pos);
         }
@@ -143,7 +145,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
-        while (v.isThunk() || v.isApp()) {
+        for (int chainDepth = 0; chainDepth < 16 && (v.isThunk() || v.isApp()); ++chainDepth) {
             nrThunkChains++;
             forceValue(v, pos);
         }

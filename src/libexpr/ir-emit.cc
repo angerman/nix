@@ -980,11 +980,12 @@ uint32_t IREmitter::emitSubBlockWithFormals(
     // Slot 0: reserved for the raw attrset argument (pushed by caller).
     uint32_t argSlot = subCtx.nextSlot++;
 
-    // Pre-allocate slots for all IR params.
-    // This ensures the formal slots exist in the stack frame BEFORE
-    // the prologue does any operand-stack operations (OP_DUP etc).
-    // Without pre-allocation, OP_SET_STACK_SLOT's auto-extend logic
-    // can collide with operand-stack entries.
+    // Pre-allocate slots with OP_ALLOC_VALUE for stable pointers.
+    // Default thunks in pass 2 capture these pointers as upvalues.
+    // Pass 1 replaces present-formal slots with the original pointer
+    // (OP_SET_STACK_SLOT).  Pass 2 writes into the pre-allocated
+    // Value* for defaults (OP_COPY_TO_SLOT), preserving pointer
+    // stability for earlier captures.
     for (auto p : block.params) {
         uint32_t slot = subCtx.allocSlot(p);
         unit.emit(OP_ALLOC_VALUE);
@@ -993,93 +994,107 @@ uint32_t IREmitter::emitSubBlockWithFormals(
 
     // --- Emit the formals-binding prologue ---
     //
-    // Read the raw attrset arg from slot 0 and force it.
-    // After this sequence, TOS = the forced attrset.
+    // Two-pass approach to solve the tension between pointer sharing
+    // (for blackhole detection) and capture correctness (for defaults):
+    //
+    // Pass 1: Unpack ALL formals present in the argument attrset.
+    //   Uses OP_SET_STACK_SLOT to store the ORIGINAL Value* pointer
+    //   from the attrset.  This preserves pointer sharing so that
+    //   blackhole detection works for fixpoint self-references
+    //   (e.g., `self = lua` in callPackage).
+    //
+    // Pass 2: Create default thunks for MISSING formals.
+    //   Re-reads the attrset from argSlot (slot 0) and re-checks
+    //   HAS_ATTR for each formal with default.  Default thunks are
+    //   created here AFTER all present-formals have their correct
+    //   pointers, so thunk captures get up-to-date values.
+    //
+    // Read and force the raw attrset argument.
     unit.emit(OP_GET_STACK_SLOT, argSlot);
     unit.emit(OP_FORCE);
 
-    // If there's an @-pattern, copy the attrset into its slot.
+    // If there's an @-pattern, store the attrset pointer.
     if (params.arg) {
-        // The @-pattern is the first param.
         unit.emit(OP_DUP);
         auto it = subCtx.localSlots.find(block.params[0]);
         assert(it != subCtx.localSlots.end());
-        unit.emit(OP_COPY_TO_SLOT, it->second);
+        unit.emit(OP_SET_STACK_SLOT, it->second);
     }
 
-    // Unpack each formal from the attrset.
-    // The attrset remains on the operand stack (via DUP) for each select.
-    // OP_COPY_TO_SLOT writes into the pre-allocated Value* at the slot,
-    // not overwriting the operand stack pointer.
     uint32_t formalParamStart = params.arg ? 1 : 0;
 
+    // --- Pass 1: unpack present attrs ---
     for (uint32_t i = 0; i < params.formals.size(); ++i) {
         auto & formal = params.formals[i];
         ir::VarId formalVarId = block.params[formalParamStart + i];
-
         auto slotIt = subCtx.localSlots.find(formalVarId);
         assert(slotIt != subCtx.localSlots.end());
         uint32_t formalSlot = slotIt->second;
 
-        if (formal.defaultBody != ir::kInvalidBlock) {
-            // Formal with default: check if attr exists.
-            unit.emit(OP_DUP);
-            uint32_t symIdx = unit.addSymbol(formal.name);
-            unit.emit(OP_HAS_ATTR, symIdx);
-            uint32_t jumpToDefault = unit.emit(OP_JUMP_IF_FALSE, 0);
+        unit.emit(OP_DUP);
+        uint32_t symIdx = unit.addSymbol(formal.name);
+        unit.emit(OP_HAS_ATTR, symIdx);
+        uint32_t jumpMissing = unit.emit(OP_JUMP_IF_FALSE, 0);
 
-            // Attr exists: select it and copy into the slot.
-            unit.emit(OP_DUP);
-            unit.emit(OP_ATTR_SELECT, symIdx);
-            unit.emit(OP_COPY_TO_SLOT, formalSlot);
-            uint32_t jumpPastDefault = unit.emit(OP_JUMP, 0);
+        // Attr exists: store ORIGINAL pointer.
+        unit.emit(OP_DUP);
+        unit.emit(OP_ATTR_SELECT, symIdx);
+        unit.emit(OP_SET_STACK_SLOT, formalSlot);
 
-            // Attr missing: create a thunk for the default value.
-            //
-            // Defaults must be thunks, not eagerly evaluated, because
-            // formals are sorted alphabetically by Symbol (which depends
-            // on interning order, not source order).  A default may
-            // reference a sibling formal that sorts later and hasn't
-            // been unpacked yet.  Wrapping defaults as thunks matches
-            // tree-walker semantics: the default is only forced when
-            // the formal is actually used, at which point all
-            // argument-provided formals have been unpacked.
-            unit.patchJump(jumpToDefault);
-            {
-                uint32_t bodyOffset = emitSubBlock(
-                    formal.defaultBody, formal.defaultFreeVars, subCtx);
-
-                uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
-                unit.thunks.push_back(ThunkDescriptor{
-                    .codeOffset = bodyOffset,
-                    .pos = formal.pos,
-                    .sourceExpr = nullptr,
-                    .nUpvalues = static_cast<uint16_t>(formal.defaultFreeVars.size()),
-                });
-
-                // Push captured upvalues.
-                for (auto freeVar : formal.defaultFreeVars.vars) {
-                    emitCapture(freeVar, formal.pos, subCtx);
-                }
-
-                unit.emitPos(formal.pos);
-                unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
-                unit.emit(OP_NOP, static_cast<uint32_t>(formal.defaultFreeVars.size()));
-            }
-            unit.emit(OP_COPY_TO_SLOT, formalSlot);
-
-            unit.patchJump(jumpPastDefault);
-        } else {
-            // Required formal: select and copy.
-            unit.emit(OP_DUP);
-            uint32_t symIdx = unit.addSymbol(formal.name);
-            unit.emit(OP_ATTR_SELECT, symIdx);
-            unit.emit(OP_COPY_TO_SLOT, formalSlot);
-        }
+        unit.patchJump(jumpMissing);
+        // Missing: slot stays null — handled in pass 2.
     }
 
-    // Pop the attrset from the operand stack.
+    // Pop the attrset from TOS.
     unit.emit(OP_POP);
+
+    // --- Pass 2: create default thunks for missing formals ---
+    // The attrset is still accessible via argSlot (slot 0).
+    for (uint32_t i = 0; i < params.formals.size(); ++i) {
+        auto & formal = params.formals[i];
+        if (formal.defaultBody == ir::kInvalidBlock)
+            continue;
+
+        ir::VarId formalVarId = block.params[formalParamStart + i];
+        auto slotIt = subCtx.localSlots.find(formalVarId);
+        uint32_t formalSlot = slotIt->second;
+
+        // Re-check if the attr exists (cheap: attrset is already forced).
+        unit.emit(OP_GET_STACK_SLOT, argSlot);
+        uint32_t symIdx = unit.addSymbol(formal.name);
+        unit.emit(OP_HAS_ATTR, symIdx);
+        uint32_t jumpPresent = unit.emit(OP_JUMP_IF_TRUE, 0);
+
+        // Attr missing: create default thunk.
+        // All present-formals have been unpacked by pass 1, so
+        // thunk captures get correct original Value* pointers.
+        {
+            uint32_t bodyOffset = emitSubBlock(
+                formal.defaultBody, formal.defaultFreeVars, subCtx);
+
+            uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+            unit.thunks.push_back(ThunkDescriptor{
+                .codeOffset = bodyOffset,
+                .pos = formal.pos,
+                .sourceExpr = nullptr,
+                .nUpvalues = static_cast<uint16_t>(formal.defaultFreeVars.size()),
+            });
+
+            for (auto freeVar : formal.defaultFreeVars.vars) {
+                emitCapture(freeVar, formal.pos, subCtx);
+            }
+
+            unit.emitPos(formal.pos);
+            unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
+            unit.emit(OP_NOP, static_cast<uint32_t>(formal.defaultFreeVars.size()));
+            // Write default thunk into pre-allocated Value*.
+            // COPY_TO_SLOT preserves the pre-allocated pointer, so
+            // earlier default thunks that captured it see the update.
+            unit.emit(OP_COPY_TO_SLOT, formalSlot);
+        }
+
+        unit.patchJump(jumpPresent);
+    }
 
     // --- Emit the body block ---
     emitBlock(block, subCtx);

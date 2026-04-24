@@ -1522,6 +1522,11 @@ TEST_F(IREmitTest, ir_emit_with_double_nested) {
     assertIREmitMatch("let f = attrs: with attrs; let g = x: let h = y: a + y; in h x; in g b; in f { a = 10; b = 5; }");
 }
 
+TEST_F(IREmitTest, ir_emit_fixpoint_self_reference) {
+    // Fixpoint self-reference via callPackage pattern — must not infinite-recurse.
+    assertIREmitMatch("let fix = f: let x = f x; in x; mkScope = fn: fix (self: fn self // { pkgs = self; }); lua = mkScope (self: { name = \"lua\"; luaPackages = self.pkgs; result = self.luaPackages.name; }); in lua.result");
+}
+
 TEST_F(IREmitTest, ir_emit_fixpoint_overlay_passthru) {
     // Fixpoint with overlay adding passthru — nixpkgs bootstrap pattern.
     assertIREmitMatch("let fix = f: let x = f x; in x; base = { pkg = { name = \"test\"; }; }; overlay = self: super: { pkg = super.pkg // { passthru = true; }; }; fixed = fix (self: base // (overlay self base)); in fixed.pkg.passthru or false");
