@@ -76,8 +76,21 @@ struct VMState
                 auto & f = frames.back();
                 if (f.unit && f.ip > 0) {
                     uint32_t instr = f.unit->code[f.ip - 1];
-                    fprintf(stderr, "VMState::push(NULL): opcode=0x%02x op=%u ip=%u\n",
-                        instr & 0xFF, instr >> 8, f.ip);
+                    fprintf(stderr, "VMState::push(NULL): opcode=0x%02x op=%u ip=%u "
+                        "nThunks=%zu nLambdas=%zu codeSize=%zu nFrames=%zu\n",
+                        instr & 0xFF, instr >> 8, f.ip,
+                        f.unit->thunks.size(), f.unit->lambdas.size(),
+                        f.unit->code.size(), frames.size());
+                    // Print the surrounding code context
+                    uint32_t start = (f.ip > 5) ? f.ip - 5 : 0;
+                    uint32_t end = std::min<uint32_t>(f.ip + 5, f.unit->code.size());
+                    fprintf(stderr, "  code[%u..%u]:", start, end);
+                    for (uint32_t i = start; i < end; i++) {
+                        uint32_t ins = f.unit->code[i];
+                        fprintf(stderr, " %s0x%02x/%u",
+                            (i == f.ip - 1) ? "*" : "", ins & 0xFF, ins >> 8);
+                    }
+                    fprintf(stderr, "\n");
                 }
             }
             abort();

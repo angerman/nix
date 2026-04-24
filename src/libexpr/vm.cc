@@ -792,9 +792,18 @@ op_get_local_0_force:
                         .atPos(pos).debugThrow();
                 }
 
+                // Frame depth guard: detect infinite thunk-copy recursion.
+                if (vm.frames.size() > 65536) [[unlikely]] {
+                    state.error<EvalError>("infinite recursion encountered")
+                        .atPos(pos).debugThrow();
+                }
+
                 v->mkBlackhole();
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
+                // Frame depth guard
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.push_back(CallFrame{
                     .unit = bcThunk->unit,
                     .ip = thunkOffset,
@@ -965,6 +974,9 @@ op_force:
                 vm.frames.back().env = curEnv;
 
                 // Push a new call frame for the thunk body.
+                // Frame depth guard
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.push_back(CallFrame{
                     .unit = bcThunk->unit,
                     .ip = thunkOffset,
@@ -1012,6 +1024,9 @@ op_force:
 
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
+                // Frame depth guard
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.push_back(CallFrame{
                     .unit = &bodyUnit,
                     .ip = startOffset,
@@ -1043,6 +1058,9 @@ op_force:
 
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
+                // Frame depth guard
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.push_back(CallFrame{
                     .unit = &bodyUnit,
                     .ip = startOffset,
@@ -1659,6 +1677,9 @@ op_call_1:
             // to read the argument and OP_GET_UPVALUE(i) for captures.
             // OP_SET_STACK_SLOT auto-extends the stack, so no pre-allocation
             // of local slots is needed here.
+                // Frame depth guard
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
                 .ip = startOffset,
@@ -1708,6 +1729,9 @@ op_call_1:
             // Push a new call frame for the lambda body.
             auto * result = state.allocValue();
 
+                // Frame depth guard
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
                 .ip = startOffset,
@@ -1819,6 +1843,9 @@ op_call_1:
                     vm.frames.back().ip = ip;
                     vm.frames.back().env = curEnv;
                     auto * result = state.allocValue();
+                // Frame depth guard
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                     vm.frames.push_back(CallFrame{
                         .unit = &bodyUnit,
                         .ip = startOffset,
