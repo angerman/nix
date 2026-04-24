@@ -540,17 +540,17 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
 VarId Lowerer::lowerHasAttr(ExprOpHasAttr * e)
 {
     VarId base = lowerExpr(e->e);
+    auto & attrPath = e->attrPath;
 
-    // Desugar multi-component has-attr: `a ? b.c.d`
-    // into: `(a ? b) && (a.b ? c) && (a.b.c ? d)`
-    //
-    // Each step: check has-attr, short-circuit to false if missing,
-    // select and continue if present.
-    VarId current = base;
-    VarId result = kInvalidVar;
-
-    for (size_t i = 0; i < e->attrPath.size(); ++i) {
-        auto & an = e->attrPath[i];
+    // Recursive helper for multi-component has-attr: `a ? b.c.d`
+    // Each step: check has-attr on current component.
+    //   - Last component: return the has-attr result.
+    //   - Intermediate: if has, select and recurse (in then-block);
+    //     if not, return false (in else-block).  The intermediate
+    //     select MUST be in the then-block to avoid accessing a
+    //     missing attribute.
+    auto lowerHasAttrRec = [&](auto & self, VarId current, size_t i) -> VarId {
+        auto & an = attrPath[i];
 
         VarId hasIt;
         if (an.expr) {
@@ -566,13 +566,18 @@ VarId Lowerer::lowerHasAttr(ExprOpHasAttr * e)
             }, e->getPos());
         }
 
-        if (i == e->attrPath.size() - 1) {
-            // Last component: the result is the has-attr check.
-            result = hasIt;
-        } else {
-            // Intermediate: AND with the next check.
-            // Select the current attr to use as base for the next check.
-            // Short-circuit: if !hasIt, result is false.
+        if (i == attrPath.size() - 1) {
+            return hasIt;
+        }
+
+        // Intermediate: if has, select and recurse in then-block.
+        BlockId thenBlk = module.freshBlock(e->getPos());
+        BlockId elseBlk = module.freshBlock(e->getPos());
+
+        // Then: select this component and recurse.
+        {
+            auto saved = currentBlock;
+            currentBlock = thenBlk;
             VarId selected;
             if (an.expr) {
                 VarId nameVar2 = lowerExpr(an.expr);
@@ -586,27 +591,28 @@ VarId Lowerer::lowerHasAttr(ExprOpHasAttr * e)
                     .name = an.symbol,
                 }, e->getPos());
             }
-            current = selected;
-
-            // Combine with AND (short-circuit false if missing).
-            if (result == kInvalidVar) {
-                result = hasIt;
-            } else {
-                // Wrap hasIt in a trivial block for IRAnd's rhs.
-                BlockId rhsBlk = module.freshBlock(e->getPos());
-                {
-                    auto saved = currentBlock;
-                    currentBlock = rhsBlk;
-                    VarId ref = emit(IRVarRef{.var = hasIt}, e->getPos());
-                    curBlock().terminal = TermReturn{.value = ref, .pos = e->getPos()};
-                    currentBlock = saved;
-                }
-                result = emit(IRAnd{.lhs = result, .rhsBlock = rhsBlk}, e->getPos());
-            }
+            VarId rest = self(self, selected, i + 1);
+            curBlock().terminal = TermReturn{.value = rest, .pos = e->getPos()};
+            currentBlock = saved;
         }
-    }
 
-    return result;
+        // Else: return false.
+        {
+            auto saved = currentBlock;
+            currentBlock = elseBlk;
+            VarId falseVal = emit(IRLitBool{.value = false}, e->getPos());
+            curBlock().terminal = TermReturn{.value = falseVal, .pos = e->getPos()};
+            currentBlock = saved;
+        }
+
+        return emit(IRIf{
+            .cond = hasIt,
+            .thenBlock = thenBlk,
+            .elseBlock = elseBlk,
+        }, e->getPos());
+    };
+
+    return lowerHasAttrRec(lowerHasAttrRec, base, 0);
 }
 
 

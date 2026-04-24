@@ -1470,6 +1470,58 @@ TEST_F(IREmitTest, ir_emit_builtins_add) {
     assertIREmitMatch("builtins.add 1 2");
 }
 
+// -- Regression tests for bugs found during nixpkgs evaluation --
+
+TEST_F(IREmitTest, ir_emit_multi_component_has_attr_missing) {
+    // Multi-component has-attr must short-circuit when the first
+    // component is missing, not try to select it.
+    assertIREmitMatch("let args = { }; in args ? rust.platform");
+}
+
+TEST_F(IREmitTest, ir_emit_multi_component_has_attr_present) {
+    assertIREmitMatch("let args = { rust = { platform = 1; }; }; in args ? rust.platform");
+}
+
+TEST_F(IREmitTest, ir_emit_multi_component_has_attr_partial) {
+    // First component present, second missing.
+    assertIREmitMatch("let args = { rust = { }; }; in args ? rust.platform");
+}
+
+TEST_F(IREmitTest, ir_emit_multi_component_select_or) {
+    // Multi-component select-or with missing intermediate.
+    assertIREmitMatch("let x = { }; in x.a.b or 42");
+}
+
+TEST_F(IREmitTest, ir_emit_select_or_throw_default) {
+    // Default with side effects must not execute when attr exists.
+    assertIREmitMatch("{ a = 1; }.a or (throw \"nope\")");
+}
+
+TEST_F(IREmitTest, ir_emit_and_short_circuit_side_effect) {
+    // The rhs of && must not be evaluated when lhs is false.
+    assertIREmitMatch("let args = { }; in args ? x && (let r = args.x; in r == 1)");
+}
+
+TEST_F(IREmitTest, ir_emit_assert_with_select_or) {
+    // Assert condition with select-or must not clobber the body.
+    assertIREmitMatch("let f = x: let final = { a = x; }; in assert builtins.length (final.a.b or []) == 0; final; in f { }");
+}
+
+TEST_F(IREmitTest, ir_emit_closure_called_from_primop) {
+    // v2 closure capturing outer variable, called by a primop (builtins.map).
+    assertIREmitMatch("let f = set: builtins.map (name: set) [\"a\"]; in f { x = 1; }");
+}
+
+TEST_F(IREmitTest, ir_emit_inherit_rec_forward_ref) {
+    // inherit (rec { ... }) with forward references between bindings.
+    assertIREmitMatch("let inherit (rec { a = b; b = 42; }) a b; in a");
+}
+
+TEST_F(IREmitTest, ir_emit_recursive_let_in_if_branch) {
+    // Self-recursive function in an if-branch (forward ref in inline block).
+    assertIREmitMatch("let f = n: if n <= 0 then 0 else let g = x: if x <= 0 then 0 else g (x - 1); in g n; in f 3");
+}
+
 // -- Disassembly sanity check: ensure emitFromIR produces non-empty code --
 
 TEST_F(IREmitTest, ir_emit_produces_code) {
