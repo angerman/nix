@@ -775,7 +775,7 @@ op_get_local_0_force:
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0) {
                     frameUpvalues = reinterpret_cast<Value **>(
-                        thunkEnv->values[0]);
+                        thunkEnv->values[1]);
                 }
 
                 v->mkBlackhole();
@@ -869,13 +869,26 @@ op_get_with:
         auto * var = static_cast<ExprVar *>(cu->exprPool[exprIdx]);
 
         // Walk up the env chain to the first with-scope.
+        // Skip v2 carrier envs (sentinel values[0] == &Value::vNull)
+        // as they don't correspond to scopes that bindVars() counted.
         Env * e = curEnv;
-        for (auto l = var->level; l; --l)
+        for (auto l = var->level; l; --l) {
             e = e->up;
+            while (e && e->values[0] == &Value::vNull)
+                e = e->up;
+        }
 
         // Walk the with-chain looking for the variable.
         auto * fromWith = var->fromWith;
         while (true) {
+            // Skip v2 carrier envs.  Carrier envs (from
+            // OP_MAKE_CLOSURE_V2 / OP_MAKE_THUNK_V2) have
+            // values[0] = &Value::vNull as a sentinel.  They are
+            // NOT with scopes and must be transparently skipped.
+            while (e && e->values[0] == &Value::vNull)
+                e = e->up;
+            assert(e && "OP_GET_WITH: ran off end of env chain");
+
             PosIdx withPos = fromWith->pos;
             state.forceAttrs(*e->values[0], withPos,
                 "while evaluating the first subexpression of a with expression");
@@ -888,8 +901,11 @@ op_get_with:
                     "undefined variable '%1%'", state.symbols[var->name])
                     .atPos(var->pos)
                     .debugThrow();
-            for (size_t l = fromWith->prevWith; l; --l)
+            for (size_t l = fromWith->prevWith; l; --l) {
                 e = e->up;
+                while (e && e->values[0] == &Value::vNull)
+                    e = e->up;
+            }
             fromWith = fromWith->parentWith;
         }
         DISPATCH();
@@ -920,11 +936,11 @@ op_force:
                 uint32_t thunkOffset = thunkDesc.codeOffset;
 
                 // For v2 thunks (created by OP_MAKE_THUNK_V2), extract
-                // the upvalue array from the carrier env's values[0].
+                // the upvalue array from the carrier env's values[1].
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0) {
                     frameUpvalues = reinterpret_cast<Value **>(
-                        thunkEnv->values[0]);
+                        thunkEnv->values[1]);
                 }
 
                 // Mark as blackhole before evaluating.
@@ -977,7 +993,7 @@ op_force:
                 Value ** frameUpvalues = nullptr;
                 if (desc.nUpvalues > 0 && left->lambda().env) {
                     frameUpvalues = reinterpret_cast<Value **>(
-                        left->lambda().env->values[0]);
+                        left->lambda().env->values[1]);
                 }
 
                 vm.frames.back().ip = ip;
@@ -1612,11 +1628,11 @@ op_call_1:
                 && "OP_CALL_1 v2: startOffset out of bounds");
 
             // Extract the upvalue array from the closure's carrier env.
-            // OP_MAKE_CLOSURE_V2 stores it as closureEnv.values[0].
+            // OP_MAKE_CLOSURE_V2 stores it as closureEnv.values[1].
             Value ** frameUpvalues = nullptr;
             if (desc.nUpvalues > 0 && fun->lambda().env) {
                 frameUpvalues = reinterpret_cast<Value **>(
-                    fun->lambda().env->values[0]);
+                    fun->lambda().env->values[1]);
             }
 
             // Save current frame state.
@@ -1632,7 +1648,7 @@ op_call_1:
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
                 .ip = startOffset,
-                .env = fun->lambda().env,  // for with-chain walking
+                .env = fun->lambda().env,
                 .stackBaseOffset = vm.stackSize(),
                 .resultSlot = result,
                 .callPos = pos,
@@ -2424,16 +2440,19 @@ op_make_closure_v2:
 
         // Create the closure Value.
         // For v2 closures, we store the upvalue array on a side-allocated
-        // 1-slot Env whose values[0] is a pointer to the upvalue array.
+        // 2-slot Env whose values[1] is a pointer to the upvalue array.
         // The actual upvalue array is the GC-allocated flat array.
         //
         // We still need an Env to satisfy the Value::lambda().env field.
-        // The env is minimal (1 slot) and acts as a carrier for the upvalues.
-        Env & closureEnv = state.mem.allocEnv(1);
+        // The env is minimal (2 slots) and acts as a carrier for the upvalues.
+        // values[0] is set to vNull so that OP_GET_WITH (which reads
+        // env.values[0]) sees a safe sentinel instead of a stale pointer.
+        Env & closureEnv = state.mem.allocEnv(2);
         closureEnv.up = curEnv; // Parent env for with-chain walking.
-        // Store the upvalue array pointer in values[0].
+        closureEnv.values[0] = const_cast<Value *>(&Value::vNull);
+        // Store the upvalue array pointer in values[1].
         // The OP_CALL_1 v2 path will extract it from here.
-        closureEnv.values[0] = reinterpret_cast<Value *>(upvalues);
+        closureEnv.values[1] = reinterpret_cast<Value *>(upvalues);
 
         // For v2, we need to create a lambda expression wrapper.
         // Use ExprLambdaBytecode which stores the compilation unit + index.
@@ -2477,10 +2496,14 @@ op_make_thunk_v2:
         auto * thunkExpr = state.mem.exprs.add<ExprBytecodeThunk>(
             const_cast<CompilationUnit *>(cu), thunkIdx);
 
-        // Create a minimal Env to carry the upvalue array.
-        Env & thunkEnv = state.mem.allocEnv(1);
+        // Create a carrier Env for the upvalue array.
+        // Allocate size=2: values[0] is a safe null Value (so
+        // OP_GET_WITH won't crash if the env is in a with-chain),
+        // values[1] holds the reinterpret_cast'd upvalue pointer.
+        Env & thunkEnv = state.mem.allocEnv(2);
         thunkEnv.up = curEnv;
-        thunkEnv.values[0] = reinterpret_cast<Value *>(upvalues);
+        thunkEnv.values[0] = &Value::vNull;
+        thunkEnv.values[1] = reinterpret_cast<Value *>(upvalues);
 
         auto * thunkVal = state.allocValue();
         thunkVal->mkThunk(&thunkEnv, thunkExpr);

@@ -95,6 +95,12 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
+    // Detect NULL Value* references (indicates stack corruption or
+    // uninitialized slot in the v2 VM).
+    if (&v == nullptr) [[unlikely]] {
+        fprintf(stderr, "FATAL: forceValue called with NULL Value*\n");
+        abort();
+    }
     if (v.isThunk()) {
         nrThunksForced++;
         Env * env = v.thunk().env;

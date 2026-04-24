@@ -1304,9 +1304,9 @@ IRModule lower(EvalState & state, Expr * expr)
 // Free variable analysis
 // ============================================================================
 
-namespace {
-
 /// Collect all VarIds referenced by an IRExpr (its operands).
+/// Used by both free variable analysis and the emitter's forward-reference
+/// detection.  Declared in ir.hh for cross-TU access.
 void collectRefs(const IRExpr & expr, FreeVars & refs)
 {
     std::visit([&](const auto & e) {
@@ -1437,6 +1437,8 @@ void collectRefs(const IRExpr & expr, FreeVars & refs)
         }
     }, expr);
 }
+
+namespace {
 
 /// Collect VarIds referenced by a terminal.
 void collectTerminalRefs(const Terminal & term, FreeVars & refs)

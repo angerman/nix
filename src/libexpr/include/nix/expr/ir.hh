@@ -643,6 +643,15 @@ struct IRModule
 
 
 // ============================================================================
+// IR utilities
+// ============================================================================
+
+/// Collect all VarIds directly referenced by an IRExpr (its operands).
+/// Used by free variable analysis and the emitter's forward-reference detection.
+void collectRefs(const IRExpr & expr, FreeVars & refs);
+
+
+// ============================================================================
 // AST -> IR lowering
 // ============================================================================
 

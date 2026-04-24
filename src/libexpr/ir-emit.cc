@@ -215,21 +215,42 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
         definedInBlock.insert(binding.result);
     }
 
-    // Collect forward-referenced VarIds: any VarId that is in
-    // definedInBlock AND appears in the freeVars of an IRMkThunk or
-    // IRLambda in this block.
+    // Collect forward-referenced VarIds: any VarId that is both (a) defined
+    // by a binding in this block and (b) referenced by an EARLIER binding.
+    //
+    // This covers:
+    //   - Lambda/Thunk freeVars that reference a later binding (recursive let)
+    //   - IRVarRef that references a later binding (rec attrsets where
+    //     `isl = isl_0_20` references `isl_0_20` defined later)
+    //   - IRRecAttrSet entries that reference later bindings
+    //
+    // For correctness, we scan all bindings' expressions for VarId refs
+    // to later-defined bindings.  This is a superset of the Lambda/Thunk
+    // freeVars check but handles all forward-reference patterns.
     std::unordered_set<ir::VarId> forwardRefs;
-    for (const auto & binding : block.bindings) {
-        std::visit([&](const auto & e) {
-            using T = std::decay_t<decltype(e)>;
-            if constexpr (std::is_same_v<T, ir::IRMkThunk>
-                       || std::is_same_v<T, ir::IRLambda>) {
-                for (auto fv : e.freeVars.vars) {
-                    if (definedInBlock.count(fv))
-                        forwardRefs.insert(fv);
+    {
+        std::unordered_set<ir::VarId> seenDefined;
+        for (const auto & binding : block.bindings) {
+            // Collect all VarIds this binding references.
+            ir::FreeVars exprRefs;
+            ir::collectRefs(binding.expr, exprRefs);
+            // Also check Lambda/Thunk freeVars (references from sub-blocks).
+            std::visit([&](const auto & e) {
+                using T = std::decay_t<decltype(e)>;
+                if constexpr (std::is_same_v<T, ir::IRMkThunk>
+                           || std::is_same_v<T, ir::IRLambda>) {
+                    for (auto fv : e.freeVars.vars)
+                        exprRefs.insert(fv);
                 }
+            }, binding.expr);
+            // Any ref to a VarId that is defined in this block but
+            // hasn't been seen yet is a forward reference.
+            for (auto v : exprRefs.vars) {
+                if (definedInBlock.count(v) && !seenDefined.count(v))
+                    forwardRefs.insert(v);
             }
-        }, binding.expr);
+            seenDefined.insert(binding.result);
+        }
     }
 
     // Pre-allocate stack slots for forward-referenced VarIds.
@@ -1088,18 +1109,27 @@ uint32_t IREmitter::emitInlineBlock(ir::BlockId blockId, BlockContext & ctx)
     for (const auto & binding : block.bindings)
         definedInBlock.insert(binding.result);
 
+    // Same forward-reference detection as emitBlock().
     std::unordered_set<ir::VarId> forwardRefs;
-    for (const auto & binding : block.bindings) {
-        std::visit([&](const auto & e) {
-            using T = std::decay_t<decltype(e)>;
-            if constexpr (std::is_same_v<T, ir::IRMkThunk>
-                       || std::is_same_v<T, ir::IRLambda>) {
-                for (auto fv : e.freeVars.vars) {
-                    if (definedInBlock.count(fv))
-                        forwardRefs.insert(fv);
+    {
+        std::unordered_set<ir::VarId> seenDefined;
+        for (const auto & binding : block.bindings) {
+            ir::FreeVars exprRefs;
+            ir::collectRefs(binding.expr, exprRefs);
+            std::visit([&](const auto & e) {
+                using T = std::decay_t<decltype(e)>;
+                if constexpr (std::is_same_v<T, ir::IRMkThunk>
+                           || std::is_same_v<T, ir::IRLambda>) {
+                    for (auto fv : e.freeVars.vars)
+                        exprRefs.insert(fv);
                 }
+            }, binding.expr);
+            for (auto v : exprRefs.vars) {
+                if (definedInBlock.count(v) && !seenDefined.count(v))
+                    forwardRefs.insert(v);
             }
-        }, binding.expr);
+            seenDefined.insert(binding.result);
+        }
     }
 
     for (auto fv : forwardRefs) {

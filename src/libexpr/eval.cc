@@ -1636,7 +1636,7 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 
             // v2 closures (created by OP_MAKE_CLOSURE_V2) use a flat
             // upvalue array instead of the standard env chain.  Their
-            // carrier env's values[0] is a reinterpret_cast'd Value**
+            // carrier env's values[1] is a reinterpret_cast'd Value**
             // pointer.  The tree-walker's env-chain body evaluation
             // would interpret this carrier env as a normal scope and
             // read garbage.  Intercept here: re-enter the VM for the
@@ -1651,11 +1651,9 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                 Value ** upvalues = nullptr;
                 if (desc.nUpvalues > 0 && vCur.lambda().env) {
                     upvalues = reinterpret_cast<Value **>(
-                        vCur.lambda().env->values[0]);
+                        vCur.lambda().env->values[1]);
                 }
 
-                // Use a separate result value — don't write into vCur
-                // directly, as vCur may be needed for multi-arg chains.
                 Value callResult;
                 bytecode::vmExec(*this, bodyUnit, startOffset,
                     vCur.lambda().env ? *vCur.lambda().env : baseEnv,
