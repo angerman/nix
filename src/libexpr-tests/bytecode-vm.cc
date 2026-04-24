@@ -1532,6 +1532,12 @@ TEST_F(IREmitTest, ir_emit_fixpoint_overlay_passthru) {
     assertIREmitMatch("let fix = f: let x = f x; in x; base = { pkg = { name = \"test\"; }; }; overlay = self: super: { pkg = super.pkg // { passthru = true; }; }; fixed = fix (self: base // (overlay self base)); in fixed.pkg.passthru or false");
 }
 
+TEST_F(IREmitTest, ir_emit_dfold_doubly_linked) {
+    // dfold pattern from old nixpkgs booter.nix — doubly-linked lazy list.
+    // Tests forward-ref thunk sharing (COPY_TO_SLOT must not create copies).
+    assertIREmitMatch("let dfold = op: lnul: rnul: list: let len = builtins.length list; go = pred: n: if n == len then rnul pred else let cur = op pred (builtins.elemAt list n) succ; succ = go cur (n + 1); in cur; lapp = lnul cur; cur = go lapp 0; in cur; result = dfold (prev: x: next: { val = x; }) (x: {}) (x: {}) [1 2 3]; in result.val");
+}
+
 TEST_F(IREmitTest, ir_emit_assert_with_select_or) {
     // Assert condition with select-or must not clobber the body.
     assertIREmitMatch("let f = x: let final = { a = x; }; in assert builtins.length (final.a.b or []) == 0; final; in f { }");
