@@ -38,11 +38,23 @@ struct BlockContext
     /// Only for variables captured from an enclosing scope.
     std::unordered_map<ir::VarId, uint32_t> upvalueSlots;
 
-    /// Map from VarId to a formals cell index.
-    /// For default thunk sub-blocks: sibling formal VarIds are resolved
-    /// via OP_CELL_GET instead of OP_GET_UPVALUE or OP_GET_STACK_SLOT.
-    std::unordered_map<ir::VarId, uint32_t> cellSlotMap;
-    uint32_t cellUpvalueIdx = 0;  ///< Upvalue index of the cell pointer.
+    /// Cell references for variables accessed via OP_CELL_GET.
+    /// In sub-block contexts, forward-ref vars from a parent block are
+    /// read through a shared GC-traced cell captured as an upvalue.
+    /// Supports multiple cell layers (parent + grandparent) via per-entry
+    /// upvalue indices.
+    struct CellRef {
+        uint32_t upvalueIdx;  ///< Upvalue index holding the cell pointer
+        uint32_t entryIdx;    ///< Entry index within the cell
+    };
+    std::unordered_map<ir::VarId, CellRef> cellRefs;
+
+    /// Current block's cell for forward references.
+    /// Set by emitBlock when the block has forward-referenced bindings.
+    /// IRMkThunk/IRLambda handlers read these to build cell-aware
+    /// sub-block contexts.  UINT32_MAX means no cell is active.
+    uint32_t blockCellSlot = UINT32_MAX;
+    std::unordered_map<ir::VarId, uint32_t> blockCellMap;
 
     /// Next available stack slot in this frame.
     uint32_t nextSlot = 0;
@@ -259,32 +271,66 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
         }
     }
 
-    // Pre-allocate stack slots for forward-referenced VarIds.
-    for (auto fv : forwardRefs) {
-        if (ctx.localSlots.find(fv) == ctx.localSlots.end()) {
-            uint32_t slot = ctx.allocSlot(fv);
-            unit.emit(OP_ALLOC_VALUE);
+    // Cell-based forward references.
+    //
+    // Cell-augmented forward references.
+    //
+    // Direct references within the same block need pointer sharing
+    // through a pre-allocated Value* (ALLOC_VALUE + COPY_TO_SLOT).
+    // Sub-blocks (thunks/lambdas) need late-binding through the cell
+    // (CELL_GET at force time).  We do BOTH:
+    //   - ALLOC_VALUE for the slot placeholder (pointer sharing)
+    //   - COPY_TO_SLOT to write INTO the pre-allocated Value*
+    //   - CELL_SET to update the cell entry for sub-block reads
+    //
+    // emitVarRef checks localSlots FIRST, so direct references in
+    // binding expressions use the local slot (not the cell).  The cell
+    // is only used in sub-block contexts where the VarId is NOT local.
+    uint32_t nFwd = static_cast<uint32_t>(forwardRefs.size());
+
+    if (nFwd > 0) {
+        // Allocate cell at runtime (per block entry).
+        ctx.blockCellSlot = ctx.nextSlot++;
+        unit.emit(OP_ALLOC_CELL, nFwd);
+        unit.emit(OP_SET_STACK_SLOT, ctx.blockCellSlot);
+
+        // Map forward-ref VarIds to cell indices + allocate local slots.
+        // Use ALLOC_VALUE (not OP_NULL) so direct references within the
+        // same block get a shared Value* — COPY_TO_SLOT writes INTO it.
+        uint32_t cellIdx = 0;
+        for (auto fv : forwardRefs) {
+            ctx.blockCellMap[fv] = cellIdx++;
+            if (ctx.localSlots.find(fv) == ctx.localSlots.end()) {
+                uint32_t slot = ctx.allocSlot(fv);
+                unit.emit(OP_ALLOC_VALUE);
+                unit.emit(OP_SET_STACK_SLOT, slot);
+            }
+        }
+    }
+
+    // Emit each binding.
+    for (const auto & binding : block.bindings) {
+        emitExpr(binding.expr, binding.pos, ctx);
+
+        if (nFwd > 0 && forwardRefs.count(binding.result)) {
+            // Forward-ref binding: COPY_TO_SLOT preserves pointer
+            // sharing for in-block refs.  CELL_SET updates the cell
+            // entry for sub-block late-binding via CELL_GET.
+            uint32_t slot = ctx.localSlots[binding.result];
+            unit.emit(OP_COPY_TO_SLOT, slot);
+            unit.emit(OP_GET_STACK_SLOT, slot);
+            unit.emit(OP_CELL_SET,
+                (ctx.blockCellSlot << 16) | ctx.blockCellMap[binding.result]);
+        } else {
+            uint32_t slot = ctx.allocSlot(binding.result);
             unit.emit(OP_SET_STACK_SLOT, slot);
         }
     }
 
-    // Emit each binding.  Bindings whose VarIds were pre-allocated
-    // use OP_COPY_TO_SLOT instead of OP_SET_STACK_SLOT.
-    for (const auto & binding : block.bindings) {
-        emitExpr(binding.expr, binding.pos, ctx);
-
-        if (forwardRefs.count(binding.result)) {
-            // This VarId was pre-allocated: copy the expression result
-            // into the existing Value* at the slot, preserving the
-            // pointer that upvalues may already reference.
-            auto it = ctx.localSlots.find(binding.result);
-            assert(it != ctx.localSlots.end());
-            unit.emit(OP_COPY_TO_SLOT, it->second);
-        } else {
-            // Normal binding: allocate a new slot.
-            uint32_t slot = ctx.allocSlot(binding.result);
-            unit.emit(OP_SET_STACK_SLOT, slot);
-        }
+    // Clear block cell state after bindings.
+    if (nFwd > 0) {
+        ctx.blockCellMap.clear();
+        ctx.blockCellSlot = UINT32_MAX;
     }
 
     // Emit the terminal.
@@ -365,59 +411,278 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
         else if constexpr (std::is_same_v<T, ir::IRLambda>) {
             bool hasFormals = !e.params.formals.empty();
 
-            // 1. Emit the lambda body as a sub-block.
-            //    For formals lambdas, we emit a prologue that unpacks
-            //    the attrset argument into individual formal slots.
-            uint32_t bodyOffset;
-            uint16_t envSize;
+            // Check if any free vars need cell capture.
+            bool needsCellCapture = false;
+            if (ctx.blockCellSlot != UINT32_MAX) {
+                for (auto fv : e.freeVars.vars) {
+                    if (ctx.blockCellMap.count(fv)) {
+                        needsCellCapture = true;
+                        break;
+                    }
+                }
+            }
 
-            if (hasFormals) {
-                bodyOffset = emitSubBlockWithFormals(
-                    e.bodyBlock, e.freeVars, e.params, ctx);
-                // envSize: 1 (raw arg) + number of formals + @-pattern.
-                envSize = 1 + static_cast<uint16_t>(e.params.formals.size());
+            if (needsCellCapture) {
+                // Split free vars: cell-based vs regular.
+                ir::FreeVars nonCellFreeVars;
+                std::vector<std::pair<ir::VarId, uint32_t>> cellFreeVars;
+                for (auto fv : e.freeVars.vars) {
+                    auto it = ctx.blockCellMap.find(fv);
+                    if (it != ctx.blockCellMap.end())
+                        cellFreeVars.push_back({fv, it->second});
+                    else
+                        nonCellFreeVars.insert(fv);
+                }
+
+                // Upvalue layout: [0]=cell, [1..N]=non-cell free vars.
+                uint32_t cellUvIdx = 0;
+                uint32_t nNonCell = static_cast<uint32_t>(nonCellFreeVars.size());
+                uint32_t totalUpvalues = 1 + nNonCell;
+
+                // Build cell-aware sub-block context.
+                const auto & bodyBlock = module.blocks[e.bodyBlock];
+                BlockContext subCtx;
+                for (auto & [varId, cellIdx] : cellFreeVars)
+                    subCtx.cellRefs[varId] = {cellUvIdx, cellIdx};
+                uint32_t uvIdx = 1;
+                for (auto fv : nonCellFreeVars.vars)
+                    subCtx.upvalueSlots[fv] = uvIdx++;
+
+                // Emit the lambda body.
+                uint32_t bodyOffset;
+                uint16_t envSize;
+
+                if (hasFormals) {
+                    // For formals lambdas, emit a prologue inline.
+                    // The sub-block context already has cell-aware upvalues;
+                    // emitSubBlockWithFormals will use it via the parent ctx.
+                    // We build the sub-block manually here.
+                    uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+                    bodyOffset = static_cast<uint32_t>(unit.code.size());
+
+                    // Slot 0: raw attrset argument.
+                    uint32_t argSlot = subCtx.nextSlot++;
+                    for (auto p : bodyBlock.params)
+                        subCtx.allocSlot(p);
+                    // Extend stack frame with null placeholders.
+                    for (uint32_t s = 1; s < subCtx.nextSlot; ++s) {
+                        unit.emit(OP_NULL);
+                        unit.emit(OP_SET_STACK_SLOT, s);
+                    }
+
+                    // Formals cell for default thunks (same as normal path).
+                    bool hasAnyDefault = false;
+                    for (auto & f : e.params.formals)
+                        if (f.defaultBody != ir::kInvalidBlock) { hasAnyDefault = true; break; }
+
+                    uint32_t formalParamStart = e.params.arg ? 1 : 0;
+                    uint32_t nFormals = static_cast<uint32_t>(e.params.formals.size());
+                    uint32_t formalsCellSlot = 0;
+                    uint32_t formalsCellSize = nFormals + (e.params.arg ? 1 : 0);
+                    if (hasAnyDefault) {
+                        formalsCellSlot = subCtx.nextSlot++;
+                        unit.emit(OP_ALLOC_CELL, formalsCellSize);
+                        unit.emit(OP_SET_STACK_SLOT, formalsCellSlot);
+                    }
+
+                    // Force the raw attrset argument.
+                    unit.emit(OP_GET_STACK_SLOT, argSlot);
+                    unit.emit(OP_FORCE);
+
+                    // @-pattern.
+                    if (e.params.arg) {
+                        unit.emit(OP_DUP);
+                        auto it2 = subCtx.localSlots.find(bodyBlock.params[0]);
+                        assert(it2 != subCtx.localSlots.end());
+                        unit.emit(OP_SET_STACK_SLOT, it2->second);
+                        if (hasAnyDefault) {
+                            unit.emit(OP_GET_STACK_SLOT, it2->second);
+                            unit.emit(OP_CELL_SET, (formalsCellSlot << 16) | nFormals);
+                        }
+                    }
+
+                    // Single-pass formals prologue.
+                    for (uint32_t i = 0; i < nFormals; ++i) {
+                        auto & formal = e.params.formals[i];
+                        ir::VarId formalVarId = bodyBlock.params[formalParamStart + i];
+                        auto slotIt = subCtx.localSlots.find(formalVarId);
+                        assert(slotIt != subCtx.localSlots.end());
+                        uint32_t formalSlot = slotIt->second;
+
+                        if (formal.defaultBody != ir::kInvalidBlock) {
+                            unit.emit(OP_DUP);
+                            uint32_t symIdx = unit.addSymbol(formal.name);
+                            unit.emit(OP_HAS_ATTR, symIdx);
+                            uint32_t jumpToDefault = unit.emit(OP_JUMP_IF_FALSE, 0);
+
+                            // Attr exists.
+                            unit.emit(OP_DUP);
+                            unit.emit(OP_ATTR_SELECT, symIdx);
+                            unit.emit(OP_SET_STACK_SLOT, formalSlot);
+                            unit.emit(OP_GET_STACK_SLOT, formalSlot);
+                            unit.emit(OP_CELL_SET, (formalsCellSlot << 16) | i);
+                            uint32_t jumpPastDefault = unit.emit(OP_JUMP, 0);
+
+                            // Attr missing: create default thunk.
+                            unit.patchJump(jumpToDefault);
+                            {
+                                std::unordered_set<ir::VarId> siblingVarIds;
+                                for (uint32_t j = 0; j < nFormals; ++j)
+                                    siblingVarIds.insert(bodyBlock.params[formalParamStart + j]);
+                                if (e.params.arg)
+                                    siblingVarIds.insert(bodyBlock.params[0]);
+
+                                ir::FreeVars nonSiblingFreeVars;
+                                for (auto fv : formal.defaultFreeVars.vars)
+                                    if (!siblingVarIds.count(fv))
+                                        nonSiblingFreeVars.insert(fv);
+
+                                uint32_t defTotalUpvalues = 1 + static_cast<uint32_t>(nonSiblingFreeVars.size());
+
+                                const auto & defBlock = module.blocks[formal.defaultBody];
+                                BlockContext thunkCtx;
+                                for (uint32_t j = 0; j < nFormals; ++j) {
+                                    ir::VarId sib = bodyBlock.params[formalParamStart + j];
+                                    thunkCtx.cellRefs[sib] = {0, j};
+                                }
+                                if (e.params.arg)
+                                    thunkCtx.cellRefs[bodyBlock.params[0]] = {0, nFormals};
+                                uint32_t defUvIdx = 1;
+                                for (auto fv : nonSiblingFreeVars.vars)
+                                    thunkCtx.upvalueSlots[fv] = defUvIdx++;
+                                for (auto p : defBlock.params)
+                                    thunkCtx.allocSlot(p);
+
+                                uint32_t defJumpOver = unit.emit(OP_JUMP, 0);
+                                uint32_t defBodyOffset = static_cast<uint32_t>(unit.code.size());
+                                emitBlock(defBlock, thunkCtx);
+                                unit.patchJump(defJumpOver);
+
+                                uint32_t defThunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                                unit.thunks.push_back(ThunkDescriptor{
+                                    .codeOffset = defBodyOffset,
+                                    .pos = formal.pos,
+                                    .sourceExpr = nullptr,
+                                    .nUpvalues = static_cast<uint16_t>(defTotalUpvalues),
+                                });
+
+                                unit.emit(OP_GET_STACK_SLOT, formalsCellSlot);
+                                for (auto fv : nonSiblingFreeVars.vars)
+                                    emitCapture(fv, formal.pos, subCtx);
+
+                                unit.emitPos(formal.pos);
+                                unit.emit(OP_MAKE_THUNK_V2, defThunkIdx);
+                                unit.emit(OP_NOP, defTotalUpvalues);
+                            }
+                            unit.emit(OP_DUP);
+                            unit.emit(OP_SET_STACK_SLOT, formalSlot);
+                            unit.emit(OP_CELL_SET, (formalsCellSlot << 16) | i);
+                            unit.patchJump(jumpPastDefault);
+                        } else {
+                            unit.emit(OP_DUP);
+                            uint32_t symIdx = unit.addSymbol(formal.name);
+                            unit.emit(OP_ATTR_SELECT, symIdx);
+                            unit.emit(OP_SET_STACK_SLOT, formalSlot);
+                            if (hasAnyDefault) {
+                                unit.emit(OP_GET_STACK_SLOT, formalSlot);
+                                unit.emit(OP_CELL_SET, (formalsCellSlot << 16) | i);
+                            }
+                        }
+                    }
+
+                    unit.emit(OP_POP);
+                    emitBlock(bodyBlock, subCtx);
+                    unit.patchJump(jumpOver);
+                    envSize = 1 + static_cast<uint16_t>(e.params.formals.size());
+                } else {
+                    // Simple lambda: emit sub-block with cell-aware context.
+                    for (auto p : bodyBlock.params)
+                        subCtx.allocSlot(p);
+
+                    uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+                    bodyOffset = static_cast<uint32_t>(unit.code.size());
+                    emitBlock(bodyBlock, subCtx);
+                    unit.patchJump(jumpOver);
+                    envSize = static_cast<uint16_t>(bodyBlock.params.size());
+                }
+
+                // Register lambda descriptor.
+                uint32_t lambdaIdx = static_cast<uint32_t>(unit.lambdas.size());
+                uint32_t bodyThunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                unit.thunks.push_back(ThunkDescriptor{
+                    .codeOffset = bodyOffset,
+                    .pos = e.pos,
+                    .sourceExpr = nullptr,
+                    .nUpvalues = static_cast<uint16_t>(totalUpvalues),
+                });
+
+                Formals * formals = nullptr;
+                unit.lambdas.push_back(LambdaDescriptor{
+                    .codeOffset = bodyOffset,
+                    .pos = e.pos,
+                    .name = e.name,
+                    .arg = e.params.arg,
+                    .formals = formals,
+                    .envSize = envSize,
+                    .nUpvalues = static_cast<uint16_t>(totalUpvalues),
+                    .sourceExpr = e.sourceExpr,
+                    .bodyThunkIdx = bodyThunkIdx,
+                    .prologueOffset = bodyOffset,
+                });
+
+                // Push captures: cell first, then non-cell free vars.
+                unit.emit(OP_GET_STACK_SLOT, ctx.blockCellSlot);
+                for (auto fv : nonCellFreeVars.vars)
+                    emitCapture(fv, pos, ctx);
+
+                unit.emitPos(pos);
+                unit.emit(OP_MAKE_CLOSURE_V2, lambdaIdx);
+                unit.emit(OP_NOP, totalUpvalues);
             } else {
-                bodyOffset = emitSubBlock(e.bodyBlock, e.freeVars, ctx);
-                auto & bodyBlock = module.blocks[e.bodyBlock];
-                envSize = static_cast<uint16_t>(bodyBlock.params.size());
+                // Normal path: no cell capture needed.
+                uint32_t bodyOffset;
+                uint16_t envSize;
+
+                if (hasFormals) {
+                    bodyOffset = emitSubBlockWithFormals(
+                        e.bodyBlock, e.freeVars, e.params, ctx);
+                    envSize = 1 + static_cast<uint16_t>(e.params.formals.size());
+                } else {
+                    bodyOffset = emitSubBlock(e.bodyBlock, e.freeVars, ctx);
+                    auto & bodyBlock = module.blocks[e.bodyBlock];
+                    envSize = static_cast<uint16_t>(bodyBlock.params.size());
+                }
+
+                uint32_t lambdaIdx = static_cast<uint32_t>(unit.lambdas.size());
+                uint32_t bodyThunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                unit.thunks.push_back(ThunkDescriptor{
+                    .codeOffset = bodyOffset,
+                    .pos = e.pos,
+                    .sourceExpr = nullptr,
+                    .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
+                });
+
+                Formals * formals = nullptr;
+                unit.lambdas.push_back(LambdaDescriptor{
+                    .codeOffset = bodyOffset,
+                    .pos = e.pos,
+                    .name = e.name,
+                    .arg = e.params.arg,
+                    .formals = formals,
+                    .envSize = envSize,
+                    .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
+                    .sourceExpr = e.sourceExpr,
+                    .bodyThunkIdx = bodyThunkIdx,
+                    .prologueOffset = bodyOffset,
+                });
+
+                for (auto freeVar : e.freeVars.vars)
+                    emitCapture(freeVar, pos, ctx);
+
+                unit.emitPos(pos);
+                unit.emit(OP_MAKE_CLOSURE_V2, lambdaIdx);
+                unit.emit(OP_NOP, static_cast<uint32_t>(e.freeVars.size()));
             }
-
-            // 2. Register the lambda descriptor.
-            uint32_t lambdaIdx = static_cast<uint32_t>(unit.lambdas.size());
-
-            // Create a body thunk descriptor (for ExprBytecodeThunk compat).
-            uint32_t bodyThunkIdx = static_cast<uint32_t>(unit.thunks.size());
-            unit.thunks.push_back(ThunkDescriptor{
-                .codeOffset = bodyOffset,
-                .pos = e.pos,
-                .sourceExpr = nullptr,
-                .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
-            });
-
-            Formals * formals = nullptr;
-
-            unit.lambdas.push_back(LambdaDescriptor{
-                .codeOffset = bodyOffset,
-                .pos = e.pos,
-                .name = e.name,
-                .arg = e.params.arg,
-                .formals = formals,
-                .envSize = envSize,
-                .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
-                .sourceExpr = e.sourceExpr,
-                .bodyThunkIdx = bodyThunkIdx,
-                .prologueOffset = bodyOffset,
-            });
-
-            // 3. Push captured upvalues onto the operand stack.
-            for (auto freeVar : e.freeVars.vars) {
-                emitCapture(freeVar, pos, ctx);
-            }
-
-            // 4. Emit OP_MAKE_CLOSURE_V2 with the upvalue count as data word.
-            unit.emitPos(pos);
-            unit.emit(OP_MAKE_CLOSURE_V2, lambdaIdx);
-            unit.emit(OP_NOP, static_cast<uint32_t>(e.freeVars.size()));
         }
 
         // -- Function application --
@@ -437,27 +702,88 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
 
         // -- Thunk creation --
         else if constexpr (std::is_same_v<T, ir::IRMkThunk>) {
-            // Emit the thunk body as a sub-block.
-            uint32_t bodyOffset = emitSubBlock(e.bodyBlock, e.freeVars, ctx);
-
-            // Register the thunk descriptor.
-            uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
-            unit.thunks.push_back(ThunkDescriptor{
-                .codeOffset = bodyOffset,
-                .pos = e.pos,
-                .sourceExpr = e.sourceExpr,
-                .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
-            });
-
-            // Push captured upvalues.
-            for (auto freeVar : e.freeVars.vars) {
-                emitCapture(freeVar, pos, ctx);
+            // Check if any free vars need cell capture from the
+            // enclosing block's forward-ref cell.
+            bool needsCellCapture = false;
+            if (ctx.blockCellSlot != UINT32_MAX) {
+                for (auto fv : e.freeVars.vars) {
+                    if (ctx.blockCellMap.count(fv)) {
+                        needsCellCapture = true;
+                        break;
+                    }
+                }
             }
 
-            // Emit OP_MAKE_THUNK_V2 + upvalue count data word.
-            unit.emitPos(pos);
-            unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
-            unit.emit(OP_NOP, static_cast<uint32_t>(e.freeVars.size()));
+            if (needsCellCapture) {
+                // Split free vars: cell-based vs regular.
+                ir::FreeVars nonCellFreeVars;
+                std::vector<std::pair<ir::VarId, uint32_t>> cellFreeVars;
+                for (auto fv : e.freeVars.vars) {
+                    auto it = ctx.blockCellMap.find(fv);
+                    if (it != ctx.blockCellMap.end())
+                        cellFreeVars.push_back({fv, it->second});
+                    else
+                        nonCellFreeVars.insert(fv);
+                }
+
+                // Upvalue layout: [0]=cell, [1..N]=non-cell free vars.
+                uint32_t cellUvIdx = 0;
+                uint32_t nNonCell = static_cast<uint32_t>(nonCellFreeVars.size());
+                uint32_t totalUpvalues = 1 + nNonCell;
+
+                // Build cell-aware sub-block context.
+                const auto & bodyBlock = module.blocks[e.bodyBlock];
+                BlockContext subCtx;
+                for (auto & [varId, cellIdx] : cellFreeVars)
+                    subCtx.cellRefs[varId] = {cellUvIdx, cellIdx};
+                uint32_t uvIdx = 1;
+                for (auto fv : nonCellFreeVars.vars)
+                    subCtx.upvalueSlots[fv] = uvIdx++;
+                for (auto p : bodyBlock.params)
+                    subCtx.allocSlot(p);
+
+                // Emit the sub-block body.
+                uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+                uint32_t bodyOffset = static_cast<uint32_t>(unit.code.size());
+                emitBlock(bodyBlock, subCtx);
+                unit.patchJump(jumpOver);
+
+                // Register thunk descriptor.
+                uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                unit.thunks.push_back(ThunkDescriptor{
+                    .codeOffset = bodyOffset,
+                    .pos = e.pos,
+                    .sourceExpr = e.sourceExpr,
+                    .nUpvalues = static_cast<uint16_t>(totalUpvalues),
+                });
+
+                // Push captures: cell first, then non-cell free vars.
+                unit.emit(OP_GET_STACK_SLOT, ctx.blockCellSlot);
+                for (auto fv : nonCellFreeVars.vars)
+                    emitCapture(fv, pos, ctx);
+
+                unit.emitPos(pos);
+                unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
+                unit.emit(OP_NOP, totalUpvalues);
+            } else {
+                // Normal path: no cell capture needed.
+                uint32_t bodyOffset = emitSubBlock(e.bodyBlock, e.freeVars, ctx);
+
+                uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                unit.thunks.push_back(ThunkDescriptor{
+                    .codeOffset = bodyOffset,
+                    .pos = e.pos,
+                    .sourceExpr = e.sourceExpr,
+                    .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
+                });
+
+                for (auto freeVar : e.freeVars.vars)
+                    emitCapture(freeVar, pos, ctx);
+
+                unit.emitPos(pos);
+                unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
+                unit.emit(OP_NOP, static_cast<uint32_t>(e.freeVars.size()));
+            }
         }
 
         // -- Attribute select --
@@ -791,11 +1117,12 @@ void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
         return;
     }
 
-    // Check formals cell (sibling formal references in default thunks).
-    auto cellIt = ctx.cellSlotMap.find(var);
-    if (cellIt != ctx.cellSlotMap.end()) {
-        // Emit OP_CELL_GET: read cell[formalIdx] via upvalues[cellUvIdx].
-        uint32_t packed = (ctx.cellUpvalueIdx << 16) | cellIt->second;
+    // Check cell references (forward-ref vars from parent blocks,
+    // or sibling formals in default thunks).
+    auto cellIt = ctx.cellRefs.find(var);
+    if (cellIt != ctx.cellRefs.end()) {
+        uint32_t packed = (cellIt->second.upvalueIdx << 16)
+                        | cellIt->second.entryIdx;
         unit.emit(OP_CELL_GET, packed);
         return;
     }
@@ -1105,11 +1432,10 @@ uint32_t IREmitter::emitSubBlockWithFormals(
                 // Cell-based references for sibling formals + @-pattern.
                 for (uint32_t j = 0; j < nFormals; ++j) {
                     ir::VarId sib = block.params[formalParamStart + j];
-                    thunkCtx.cellSlotMap[sib] = j;
+                    thunkCtx.cellRefs[sib] = {0, j};
                 }
                 if (params.arg)
-                    thunkCtx.cellSlotMap[block.params[0]] = nFormals;
-                thunkCtx.cellUpvalueIdx = 0;
+                    thunkCtx.cellRefs[block.params[0]] = {0, nFormals};
                 // Normal upvalues for non-sibling free vars.
                 uint32_t uvIdx = 1;
                 for (auto fv : nonSiblingFreeVars.vars)
@@ -1223,25 +1549,47 @@ uint32_t IREmitter::emitInlineBlock(ir::BlockId blockId, BlockContext & ctx)
         }
     }
 
-    for (auto fv : forwardRefs) {
-        if (ctx.localSlots.find(fv) == ctx.localSlots.end()) {
-            uint32_t slot = ctx.allocSlot(fv);
-            unit.emit(OP_ALLOC_VALUE);
-            unit.emit(OP_SET_STACK_SLOT, slot);
+    // Cell-based forward references (same approach as emitBlock).
+    // Since inline blocks share the parent's ctx, save/restore the
+    // parent's block cell state to avoid clobbering it.
+    uint32_t nFwd = static_cast<uint32_t>(forwardRefs.size());
+    uint32_t savedBlockCellSlot = ctx.blockCellSlot;
+    auto savedBlockCellMap = std::move(ctx.blockCellMap);
+    ctx.blockCellMap.clear();
+
+    if (nFwd > 0) {
+        ctx.blockCellSlot = ctx.nextSlot++;
+        unit.emit(OP_ALLOC_CELL, nFwd);
+        unit.emit(OP_SET_STACK_SLOT, ctx.blockCellSlot);
+
+        uint32_t cellIdx = 0;
+        for (auto fv : forwardRefs) {
+            ctx.blockCellMap[fv] = cellIdx++;
+            if (ctx.localSlots.find(fv) == ctx.localSlots.end()) {
+                uint32_t slot = ctx.allocSlot(fv);
+                unit.emit(OP_ALLOC_VALUE);
+                unit.emit(OP_SET_STACK_SLOT, slot);
+            }
         }
     }
 
     for (const auto & binding : block.bindings) {
         emitExpr(binding.expr, binding.pos, ctx);
-        if (forwardRefs.count(binding.result)) {
-            auto it = ctx.localSlots.find(binding.result);
-            assert(it != ctx.localSlots.end());
-            unit.emit(OP_COPY_TO_SLOT, it->second);
+        if (nFwd > 0 && forwardRefs.count(binding.result)) {
+            uint32_t slot = ctx.localSlots[binding.result];
+            unit.emit(OP_COPY_TO_SLOT, slot);
+            unit.emit(OP_GET_STACK_SLOT, slot);
+            unit.emit(OP_CELL_SET,
+                (ctx.blockCellSlot << 16) | ctx.blockCellMap[binding.result]);
         } else {
             uint32_t slot = ctx.allocSlot(binding.result);
             unit.emit(OP_SET_STACK_SLOT, slot);
         }
     }
+
+    // Restore parent's block cell state.
+    ctx.blockCellMap = std::move(savedBlockCellMap);
+    ctx.blockCellSlot = savedBlockCellSlot;
 
     // For inline blocks, the terminal should be TermReturn.
     // Instead of emitting OP_RETURN, just push the return value.
