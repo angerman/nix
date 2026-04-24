@@ -1937,7 +1937,6 @@ op_call_1:
         }
 
         if (fun->isPrimOpApp()) {
-            // Walk the chain to find root PrimOp and count captured args.
             size_t argsDone = 0;
             Value * root = fun;
             while (root->isPrimOpApp()) {
@@ -1949,8 +1948,6 @@ op_call_1:
             auto argsLeft = fn->arity - argsDone;
 
             if (argsLeft == 1) {
-                // Saturated: collect all args and call directly.
-                // Inline the common 2-arg case for performance.
                 if (fn->arity == 2) {
                     Value * vArgs[2] = {fun->primOpApp().right, arg};
                     auto * result = state.allocValue();
@@ -1961,7 +1958,6 @@ op_call_1:
                 }
                 DISPATCH();
             } else {
-                // Still unsaturated: extend the PrimOpApp chain.
                 auto * funCopy = state.allocValue();
                 *funCopy = *fun;
                 auto * result = state.allocValue();
