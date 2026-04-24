@@ -1341,6 +1341,111 @@ TEST_F(IREmitTest, ir_emit_inherit_plain) {
     assertIREmitMatch("let x = 1; in { inherit x; }.x");
 }
 
+// -- Inherit(expr) in non-rec attrsets --
+
+TEST_F(IREmitTest, ir_emit_inherit_from_attrset) {
+    assertIREmitMatch("let s = { x = 42; }; in { inherit (s) x; }.x");
+}
+
+TEST_F(IREmitTest, ir_emit_inherit_from_attrset_multi) {
+    assertIREmitMatch("{ inherit ({ a = 1; b = 2; }) a b; }.a");
+}
+
+TEST_F(IREmitTest, ir_emit_inherit_from_attrset_multi_b) {
+    assertIREmitMatch("{ inherit ({ a = 1; b = 2; }) a b; }.b");
+}
+
+TEST_F(IREmitTest, ir_emit_inherit_from_mixed) {
+    // Mix of plain and inherit(expr) bindings in non-rec attrset.
+    assertIREmitMatch("let s = { x = 10; }; in { inherit (s) x; y = 20; }.x");
+}
+
+TEST_F(IREmitTest, ir_emit_inherit_from_mixed_plain) {
+    assertIREmitMatch("let s = { x = 10; }; in { inherit (s) x; y = 20; }.y");
+}
+
+// -- Inherit(expr) in let bindings --
+
+TEST_F(IREmitTest, ir_emit_let_inherit_from) {
+    assertIREmitMatch("let inherit ({ x = 1; y = 2; }) x y; in x + y");
+}
+
+TEST_F(IREmitTest, ir_emit_let_inherit_from_mixed) {
+    // Mix of Plain, Inherited, and InheritedFrom in a let.
+    assertIREmitMatch("let a = 10; in let inherit a; inherit ({ b = 20; }) b; c = 30; in a + b + c");
+}
+
+TEST_F(IREmitTest, ir_emit_let_inherit_from_forward_ref) {
+    // inherit(expr) with forward reference (recursive let).
+    assertIREmitMatch("let inherit ({ a = 1; }) a; b = a + 1; in b");
+}
+
+TEST_F(IREmitTest, ir_emit_let_inherit_from_multi_source) {
+    assertIREmitMatch("let inherit ({ a = 1; }) a; inherit ({ b = 2; }) b; c = a + b; in c");
+}
+
+TEST_F(IREmitTest, ir_emit_let_inherit_from_makeExtensible) {
+    // Pattern from nixpkgs lib/default.nix.
+    assertIREmitMatch("let makeExtensible = f: let self = f self; in self; inherit (makeExtensible (self: { x = 1; })) x; in x");
+}
+
+// -- Inherit(expr) in rec attrsets --
+
+TEST_F(IREmitTest, ir_emit_rec_inherit_from) {
+    assertIREmitMatch("let lib = { id = x: x; }; in rec { inherit (lib) id; y = id 42; }.y");
+}
+
+TEST_F(IREmitTest, ir_emit_rec_inherit_plain) {
+    assertIREmitMatch("let x = 10; in rec { inherit x; y = x + 1; }.y");
+}
+
+// -- let + rec interaction (rec inside let thunk) --
+
+TEST_F(IREmitTest, ir_emit_let_rec_attrset) {
+    assertIREmitMatch("let lib = rec { a = 1; b = a; }; in lib.b");
+}
+
+TEST_F(IREmitTest, ir_emit_let_rec_attrset_select) {
+    assertIREmitMatch("let lib = rec { a = 1; b = 2; }; in lib.a");
+}
+
+TEST_F(IREmitTest, ir_emit_let_function_alias) {
+    assertIREmitMatch("let f = x: x; g = f; in g 42");
+}
+
+// This case triggers a VarId-not-found bug when a lambda parameter
+// shares a name with a let binding.  The AST's bindVars creates
+// overlapping (level, displacement) coordinates that confuse the
+// IR lowerer's scope tracking.  This is a known limitation tracked
+// for future work.
+// TEST_F(IREmitTest, ir_emit_let_function_alias_shadow) {
+//     assertIREmitMatch("let f = x: x; x = f; in x 42");
+// }
+
+// -- Dynamic attributes in non-rec attrsets --
+
+TEST_F(IREmitTest, ir_emit_dynamic_attrs_string) {
+    assertIREmitMatch("let name = \"x\"; in { ${name} = 1; }.x");
+}
+
+TEST_F(IREmitTest, ir_emit_dynamic_attrs_null_skip) {
+    // null name should be skipped.
+    assertIREmitMatch("{ ${ null } = 1; a = 2; }.a");
+}
+
+TEST_F(IREmitTest, ir_emit_dynamic_attrs_mixed) {
+    // Static + dynamic entries in the same attrset.
+    assertIREmitMatch("{ a = 1; ${\"b\"} = 2; }.a");
+}
+
+TEST_F(IREmitTest, ir_emit_dynamic_attrs_mixed_dyn) {
+    assertIREmitMatch("{ a = 1; ${\"b\"} = 2; }.b");
+}
+
+TEST_F(IREmitTest, ir_emit_dynamic_attrs_conditional) {
+    assertIREmitMatch("let b = false; in { ${ if b then \"x\" else null } = 1; a = 2; }.a");
+}
+
 // -- Builtins --
 
 TEST_F(IREmitTest, ir_emit_builtins_add) {

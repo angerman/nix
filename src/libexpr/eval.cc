@@ -3,6 +3,8 @@
 #include "nix/expr/bytecode.hh"
 #include "nix/expr/bytecode-compiler.hh"
 #include "nix/expr/bytecode-thunk.hh"
+#include "nix/expr/ir.hh"
+#include "nix/expr/ir-emit.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/primops.hh"
@@ -1197,8 +1199,37 @@ void EvalState::resetFileCache()
 
 void EvalState::eval(Expr * e, Value & v)
 {
+    // When NIX_VM_V2=1 is set, use the v2 IR pipeline:
+    //   AST -> IR (lower) -> bytecode (emitFromIR) -> vmExec.
+    // This is the new upvalue-based compilation path.
+    static bool useVMv2 = getEnv("NIX_VM_V2").value_or("") == "1";
+    if (useVMv2) {
+        auto it = bytecodeCache.find(e);
+        bytecode::CompilationUnit * unit;
+        if (it != bytecodeCache.end()) {
+            unit = it->second;
+            nrBytecodeCompileCacheHits++;
+        } else {
+            nrBytecodeCompileCacheMisses++;
+            auto t0 = std::chrono::steady_clock::now();
+            auto mod = ir::lower(*this, e);
+            unit = bytecode::emitFromIR(*this, mod);
+            auto t1 = std::chrono::steady_clock::now();
+            bytecodeCompileTimeUs += std::chrono::duration_cast<
+                std::chrono::microseconds>(t1 - t0).count();
+            bytecodeCache[e] = unit;
+        }
+
+        auto t0 = std::chrono::steady_clock::now();
+        bytecode::vmExec(*this, *unit, 0, baseEnv, v);
+        auto t1 = std::chrono::steady_clock::now();
+        bytecodeExecTimeUs += std::chrono::duration_cast<
+            std::chrono::microseconds>(t1 - t0).count();
+        return;
+    }
+
     // When NIX_EVAL_BYTECODE=1 is set, compile to bytecode and execute
-    // via the VM instead of tree-walking.
+    // via the v1 VM (env-chain based) instead of tree-walking.
     static bool useBytecode = getEnv("NIX_EVAL_BYTECODE").value_or("") == "1";
     if (useBytecode) {
         auto it = bytecodeCache.find(e);

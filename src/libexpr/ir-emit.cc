@@ -443,6 +443,19 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             unit.emit(OP_FORCE);
         }
 
+        // -- Dynamic attribute select --
+        else if constexpr (std::is_same_v<T, ir::IRAttrSelectDynamic>) {
+            // OP_ATTR_SELECT_DYN pops nameVal then attrs from the operand stack.
+            // Push order: attrs first, then nameVar.
+            emitVarRef(e.attrs, pos, ctx);
+            unit.emitPos(pos);
+            unit.emit(OP_FORCE);
+            emitVarRef(e.nameVar, pos, ctx);
+            unit.emit(OP_FORCE);
+            unit.emit(OP_ATTR_SELECT_DYN);
+            unit.emit(OP_FORCE);
+        }
+
         // -- Has-attr --
         else if constexpr (std::is_same_v<T, ir::IRHasAttr>) {
             emitVarRef(e.attrs, pos, ctx);
@@ -743,6 +756,13 @@ void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
 
     // The variable should always be found in one of the above maps.
     // If not, it's a bug in free variable analysis or slot allocation.
+    fprintf(stderr, "IREmitter::emitVarRef: VarId %u not found. Locals:", var);
+    for (auto & [v, s] : ctx.localSlots)
+        fprintf(stderr, " v%u=s%u", v, s);
+    fprintf(stderr, "  Upvalues:");
+    for (auto & [v, s] : ctx.upvalueSlots)
+        fprintf(stderr, " v%u=u%u", v, s);
+    fprintf(stderr, "  Pos: %s\n", state.positions[pos].c_str());
     assert(false && "IREmitter::emitVarRef: VarId not found in local or upvalue slots");
 }
 

@@ -229,6 +229,14 @@ struct IRAttrSelect
     Symbol name;
 };
 
+/// Select a dynamic attribute from an attrset: `attrs."${nameExpr}"`.
+/// The name is computed at runtime from a VarId that evaluates to a string.
+struct IRAttrSelectDynamic
+{
+    VarId attrs;
+    VarId nameVar;   ///< VarId that evaluates to the attribute name string.
+};
+
 /// Test whether an attrset has a given attribute: `attrs ? name`.
 struct IRHasAttr
 {
@@ -437,6 +445,7 @@ using IRExpr = std::variant<
     IRMkThunk,
     // Attribute operations
     IRAttrSelect,
+    IRAttrSelectDynamic,
     IRHasAttr,
     IRAttrSet,
     IRAttrSetDynamic,

@@ -117,6 +117,18 @@ class Lowerer
     /// Current nesting level (how many scopes deep we are).
     uint32_t currentLevel = 0;
 
+    /// Extra level offset applied to ExprVar lookups.
+    ///
+    /// When lowering Inherited bindings in a let with inherit(expr), the
+    /// AST binds the expression in the parent env (one level up from
+    /// the let scope).  But the lowerer is currently inside the let
+    /// scope (and possibly the extra inherit-from scope).  This offset
+    /// compensates: it's added to the ExprVar's level during lookup so
+    /// that the resolution matches the correct absolute level.
+    ///
+    /// Mirrors the v1 compiler's `levelOffset` field.
+    uint32_t levelOffset = 0;
+
 public:
     Lowerer(EvalState & state, IRModule & module)
         : state(state)
@@ -348,7 +360,9 @@ VarId Lowerer::lowerVar(ExprVar * e)
     }
 
     // Normal lexically-scoped variable.  Look up by (level, displacement).
-    VarId v = lookupVar(e->level, e->displ);
+    // Apply levelOffset for Inherited bindings (see lowerLet/lowerAttrs).
+    uint32_t level = e->level + levelOffset;
+    VarId v = lookupVar(level, e->displ);
     if (v != kInvalidVar) {
         // Return a reference to the existing binding.
         return emit(IRVarRef{.var = v}, e->pos);
@@ -370,12 +384,12 @@ VarId Lowerer::lowerVar(ExprVar * e)
     // only when the level is >= currentLevel.
     VarId placeholder = module.freshVar();
     // Record the mapping so subsequent references resolve consistently.
-    bindVar(e->level, e->displ, placeholder);
+    bindVar(level, e->displ, placeholder);
 
-    if (e->level >= currentLevel) {
+    if (level >= currentLevel) {
         // True external variable (baseEnv builtins, etc.).
         module.externalVars[placeholder] = ExternalVarRef{
-            .level = e->level - currentLevel,
+            .level = level - currentLevel,
             .displacement = static_cast<uint32_t>(e->displ),
         };
     }
@@ -400,25 +414,24 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
     auto attrPath = e->getAttrPath();
 
     if (e->def == nullptr) {
-        // Simple select chain: a.b.c
-        // Desugar into a chain of IRAttrSelect operations.
+        // Simple select chain: a.b.c or a."${name}".c
+        // Desugar into a chain of IRAttrSelect / IRAttrSelectDynamic operations.
         VarId current = base;
         for (auto & an : attrPath) {
             if (an.expr) {
                 // Dynamic attribute name: lower the name expression,
-                // then we need a dynamic select.  For now, emit as
-                // force + select (the name evaluates to a string).
-                // TODO: add IRAttrSelectDynamic if needed.
+                // emit a dynamic select.
                 VarId nameVar = lowerExpr(an.expr);
-                (void) nameVar;
-                // Fallback: chain of static selects only for now.
-                throw Error("IR lowering: dynamic attribute names in select not yet supported at %s",
-                    state.positions[e->pos]);
+                current = emit(IRAttrSelectDynamic{
+                    .attrs = current,
+                    .nameVar = nameVar,
+                }, e->pos);
+            } else {
+                current = emit(IRAttrSelect{
+                    .attrs = current,
+                    .name = an.symbol,
+                }, e->pos);
             }
-            current = emit(IRAttrSelect{
-                .attrs = current,
-                .name = an.symbol,
-            }, e->pos);
         }
         return current;
     }
@@ -504,7 +517,7 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
             // The remaining path components will be lowered in the
             // then block's continuation.
             {
-                auto saved = currentBlock;
+                (void) currentBlock;  // saved implicitly
                 currentBlock = thenBlk;
                 VarId selected = emit(IRAttrSelect{
                     .attrs = current,
@@ -596,14 +609,19 @@ VarId Lowerer::lowerHasAttr(ExprOpHasAttr * e)
 VarId Lowerer::lowerAttrs(ExprAttrs * e)
 {
     if (e->recursive) {
-        // Recursive attribute set: rec { a = e1; b = e2; }
+        // Recursive attribute set: rec { a = e1; b = e2; inherit (src) c; }
         //
         // Desugaring:
         //   1. Allocate a VarId for the self-reference.
         //   2. Lower each attribute value as a thunk that captures self.
-        //   3. Construct IRRecAttrSet with self-reference.
+        //   3. For InheritedFrom bindings, build thunks that evaluate
+        //      the source and select the attribute (same as for let).
+        //   4. Construct IRRecAttrSet with self-reference.
         VarId selfVar = module.freshVar();
         pushScope();
+
+        bool hasInheritFrom = e->inheritFromExprs
+            && !e->inheritFromExprs->empty();
 
         std::vector<IRRecAttrSet::Entry> recEntries;
 
@@ -620,13 +638,6 @@ VarId Lowerer::lowerAttrs(ExprAttrs * e)
             }
         }
 
-        // Lower inherit-from expressions if present.
-        if (e->inheritFromExprs) {
-            for (auto * fromExpr : *e->inheritFromExprs) {
-                lowerExpr(fromExpr);
-            }
-        }
-
         // Now lower each attribute value.
         // For each attribute, create a binding that links the pre-assigned
         // VarId (used for forward references during lowering) to the
@@ -636,10 +647,42 @@ VarId Lowerer::lowerAttrs(ExprAttrs * e)
             size_t i = 0;
             for (auto & [name, def] : *e->attrs) {
                 VarId valueVar;
-                if (def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom) {
-                    valueVar = lowerAsThunkOrEager(def.e, def.pos);
+                if (hasInheritFrom
+                    && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
+                {
+                    // Desugar: inherit (src) x -> thunk { force(src).x }
+                    auto * sel = dynamic_cast<ExprSelect *>(def.e);
+                    auto * from = dynamic_cast<ExprInheritFrom *>(sel->e);
+                    assert(sel && from && "InheritedFrom must be ExprSelect(ExprInheritFrom, ...)");
+
+                    Expr * srcExpr = (*e->inheritFromExprs)[from->displ];
+                    Symbol attrName = sel->getAttrPath()[0].symbol;
+
+                    BlockId bodyBlk = module.freshBlock(def.pos);
+                    auto savedBlock = currentBlock;
+                    currentBlock = bodyBlk;
+
+                    VarId srcVar = lowerExpr(srcExpr);
+                    VarId selResult = emit(IRAttrSelect{
+                        .attrs = srcVar,
+                        .name = attrName,
+                    }, def.pos);
+                    curBlock().terminal = TermReturn{.value = selResult, .pos = def.pos};
+
+                    currentBlock = savedBlock;
+
+                    valueVar = emit(IRMkThunk{
+                        .freeVars = {},   // Populated by computeFreeVars().
+                        .bodyBlock = bodyBlk,
+                        .pos = def.pos,
+                    }, def.pos);
                 } else if (def.kind == ExprAttrs::AttrDef::Kind::Inherited) {
+                    // Inherited bindings (plain `inherit x;`) are bound
+                    // in the parent env.  Apply levelOffset=1 so the
+                    // ExprVar lookup skips the rec scope.
+                    levelOffset = 1;
                     valueVar = lowerExpr(def.e);
+                    levelOffset = 0;
                 } else {
                     valueVar = lowerAsThunkOrEager(def.e, def.pos);
                 }
@@ -672,28 +715,61 @@ VarId Lowerer::lowerAttrs(ExprAttrs * e)
 
     // Non-recursive attribute set.
     bool hasDynamic = e->dynamicAttrs && !e->dynamicAttrs->empty();
+    bool hasInheritFrom = e->inheritFromExprs && !e->inheritFromExprs->empty();
+
+    // Helper: desugar an InheritedFrom binding.
+    //
+    // The AST represents `inherit (src) x` as:
+    //   AttrDef { kind=InheritedFrom, e=ExprSelect(ExprInheritFrom(displ), x) }
+    // where ExprInheritFrom(displ) indexes into inheritFromExprs.
+    //
+    // We desugar to a thunk whose body evaluates the source expression
+    // and selects the attribute:
+    //   IRMkThunk { body = force(src).x }
+    //
+    // This avoids the env-chain model that ExprInheritFrom relies on.
+    auto lowerInheritedFrom = [&](const ExprAttrs::AttrDef & def) -> VarId {
+        auto * sel = dynamic_cast<ExprSelect *>(def.e);
+        auto * from = dynamic_cast<ExprInheritFrom *>(sel->e);
+        assert(sel && from && "InheritedFrom binding must be ExprSelect(ExprInheritFrom, ...)");
+
+        // Get the source expression from inheritFromExprs.
+        Expr * srcExpr = (*e->inheritFromExprs)[from->displ];
+        Symbol attrName = sel->getAttrPath()[0].symbol;
+
+        // Build a thunk body: evaluate srcExpr, force, select attrName.
+        BlockId bodyBlk = module.freshBlock(def.pos);
+        auto savedBlock = currentBlock;
+        currentBlock = bodyBlk;
+
+        VarId srcVar = lowerExpr(srcExpr);
+        VarId result = emit(IRAttrSelect{
+            .attrs = srcVar,
+            .name = attrName,
+        }, def.pos);
+        curBlock().terminal = TermReturn{.value = result, .pos = def.pos};
+
+        currentBlock = savedBlock;
+
+        return emit(IRMkThunk{
+            .freeVars = {},   // Populated by computeFreeVars().
+            .bodyBlock = bodyBlk,
+            .pos = def.pos,
+        }, def.pos);
+    };
 
     if (!hasDynamic) {
         // Pure static attrset.
         IRAttrSet attrSet;
 
-        // Lower inherit-from expressions first.
-        if (e->inheritFromExprs) {
-            pushScope();
-            uint32_t inheritDispl = 0;
-            for (auto * fromExpr : *e->inheritFromExprs) {
-                VarId srcVar = lowerExpr(fromExpr);
-                bindVar(0, inheritDispl, srcVar);
-                inheritDispl++;
-            }
-        }
-
         if (e->attrs) {
             for (auto & [name, def] : *e->attrs) {
                 VarId val;
-                if (def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom) {
-                    // Desugar: inherit (src) x -> select src.x
-                    val = lowerAsThunkOrEager(def.e, def.pos);
+                if (hasInheritFrom
+                    && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
+                {
+                    // Desugar: inherit (src) x -> thunk { force(src).x }
+                    val = lowerInheritedFrom(def);
                 } else {
                     val = lowerAsThunkOrEager(def.e, def.pos);
                 }
@@ -705,10 +781,6 @@ VarId Lowerer::lowerAttrs(ExprAttrs * e)
             }
         }
 
-        if (e->inheritFromExprs) {
-            popScope();
-        }
-
         // Entries are already sorted by Symbol (pmr::map is ordered).
         return emit(std::move(attrSet), e->pos);
     }
@@ -718,7 +790,14 @@ VarId Lowerer::lowerAttrs(ExprAttrs * e)
 
     if (e->attrs) {
         for (auto & [name, def] : *e->attrs) {
-            VarId val = lowerAsThunkOrEager(def.e, def.pos);
+            VarId val;
+            if (hasInheritFrom
+                && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
+            {
+                val = lowerInheritedFrom(def);
+            } else {
+                val = lowerAsThunkOrEager(def.e, def.pos);
+            }
             dynSet.staticEntries.push_back(IRAttrSetDynamic::StaticEntry{
                 .name = name,
                 .value = val,
@@ -867,24 +946,23 @@ VarId Lowerer::lowerLet(ExprLet * e)
     // Desugaring:
     //   let a = e1; inherit (src) x; in body
     // ->
-    //   let _src = src in
     //   let a = e1 in
-    //   let x = _src.x in
+    //   let x = thunk { force(src).x } in
     //   body
+    //
+    // For InheritedFrom bindings, the AST gives us:
+    //   AttrDef { kind=InheritedFrom, e=ExprSelect(ExprInheritFrom(displ), x) }
+    // where ExprInheritFrom(displ) indexes into inheritFromExprs.
+    //
+    // We desugar to a thunk that directly evaluates the source
+    // expression and selects the attribute, avoiding the env-chain
+    // model that ExprInheritFrom relies on.
 
     pushScope();
 
     auto * attrs = e->attrs;
-
-    // Lower inherit-from expressions first.
-    if (attrs->inheritFromExprs) {
-        uint32_t inheritDispl = 0;
-        for (auto * fromExpr : *attrs->inheritFromExprs) {
-            VarId srcVar = lowerExpr(fromExpr);
-            bindVar(0, inheritDispl, srcVar);
-            inheritDispl++;
-        }
-    }
+    bool hasInheritFrom = attrs->inheritFromExprs
+        && !attrs->inheritFromExprs->empty();
 
     // Bind all let-bound variables.
     //
@@ -901,7 +979,7 @@ VarId Lowerer::lowerLet(ExprLet * e)
     if (attrs->attrs) {
         uint32_t displ = 0;
         // Pass 1: assign VarIds so all names are in scope.
-        for (auto & [name, def] : *attrs->attrs) {
+        for ([[maybe_unused]] auto & [name, def] : *attrs->attrs) {
             VarId v = module.freshVar();
             bindVar(0, displ, v);
             displ++;
@@ -909,7 +987,56 @@ VarId Lowerer::lowerLet(ExprLet * e)
         // Pass 2: lower expressions (may reference each other).
         displ = 0;
         for (auto & [name, def] : *attrs->attrs) {
-            VarId valueVar = lowerAsThunkOrEager(def.e, def.pos);
+            VarId valueVar;
+
+            if (hasInheritFrom
+                && def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom)
+            {
+                // Desugar: inherit (src) x -> thunk { force(src).x }
+                //
+                // Extract the source expression from inheritFromExprs
+                // and the attribute name from the ExprSelect wrapper.
+                auto * sel = dynamic_cast<ExprSelect *>(def.e);
+                auto * from = dynamic_cast<ExprInheritFrom *>(sel->e);
+                assert(sel && from && "InheritedFrom binding must be ExprSelect(ExprInheritFrom, ...)");
+
+                Expr * srcExpr = (*attrs->inheritFromExprs)[from->displ];
+                Symbol attrName = sel->getAttrPath()[0].symbol;
+
+                // Build a thunk body: evaluate srcExpr, force, select attrName.
+                // The thunk must be lazy because the let env may not be
+                // fully initialized (nix lets are recursive).
+                BlockId bodyBlk = module.freshBlock(def.pos);
+                auto savedBlock = currentBlock;
+                currentBlock = bodyBlk;
+
+                VarId srcVar = lowerExpr(srcExpr);
+                VarId selResult = emit(IRAttrSelect{
+                    .attrs = srcVar,
+                    .name = attrName,
+                }, def.pos);
+                curBlock().terminal = TermReturn{.value = selResult, .pos = def.pos};
+
+                currentBlock = savedBlock;
+
+                valueVar = emit(IRMkThunk{
+                    .freeVars = {},   // Populated by computeFreeVars().
+                    .bodyBlock = bodyBlk,
+                    .pos = def.pos,
+                }, def.pos);
+            } else {
+                // For Inherited bindings (plain `inherit x;`), the
+                // ExprVar was bound in the parent env (one level above
+                // the let scope).  Apply levelOffset=1 so that the
+                // var lookup skips the let scope to find the correct
+                // binding in the enclosing scope.
+                if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
+                    levelOffset = 1;
+                valueVar = lowerAsThunkOrEager(def.e, def.pos);
+                if (def.kind == ExprAttrs::AttrDef::Kind::Inherited)
+                    levelOffset = 0;
+            }
+
             // The actual binding was already assigned in pass 1.
             // Emit a linking binding that connects the pre-assigned
             // VarId to the lowered value.
@@ -1161,6 +1288,10 @@ void collectRefs(const IRExpr & expr, FreeVars & refs)
         else if constexpr (std::is_same_v<T, IRAttrSelect>) {
             refs.insert(e.attrs);
         }
+        else if constexpr (std::is_same_v<T, IRAttrSelectDynamic>) {
+            refs.insert(e.attrs);
+            refs.insert(e.nameVar);
+        }
         else if constexpr (std::is_same_v<T, IRHasAttr>) {
             refs.insert(e.attrs);
         }
@@ -1177,7 +1308,12 @@ void collectRefs(const IRExpr & expr, FreeVars & refs)
             }
         }
         else if constexpr (std::is_same_v<T, IRRecAttrSet>) {
-            refs.insert(e.selfVar);
+            // Note: selfVar is NOT a runtime variable reference.
+            // It's a conceptual marker for the self-referencing env
+            // created by OP_ENTER_LET.  The emitter handles it via
+            // OP_ENTER_LET, not via emitVarRef.  Including it in refs
+            // would incorrectly mark it as a free variable when the
+            // rec attrset is inside a thunk or lambda body.
             for (auto & entry : e.entries)
                 refs.insert(entry.value);
         }
