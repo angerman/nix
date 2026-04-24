@@ -971,10 +971,16 @@ VarId Lowerer::lowerCall(ExprCall * e)
 
     // Lower all arguments left-to-right, then emit sequential applications.
     // Nix functions are curried: `f a b` = `(f a) b`.
+    //
+    // Arguments are wrapped in thunks (via lowerAsThunkOrEager) to match
+    // the tree-walker's Expr::maybeThunk behavior: non-trivial arguments
+    // are lazy and only forced when the function body accesses them.
+    // Without this, `(x: 42) (throw "no")` would eagerly evaluate the
+    // throw instead of returning 42.
     VarId current = func;
     if (e->args) {
         for (auto * argExpr : *e->args) {
-            VarId arg = lowerExpr(argExpr);
+            VarId arg = lowerAsThunkOrEager(argExpr, e->pos);
             current = emit(IRApp{
                 .func = current,
                 .arg = arg,

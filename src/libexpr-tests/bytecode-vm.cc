@@ -1522,6 +1522,16 @@ TEST_F(IREmitTest, ir_emit_recursive_let_in_if_branch) {
     assertIREmitMatch("let f = n: if n <= 0 then 0 else let g = x: if x <= 0 then 0 else g (x - 1); in g n; in f 3");
 }
 
+TEST_F(IREmitTest, ir_emit_lazy_function_arg) {
+    // Function arguments must be lazy: unused args should not be evaluated.
+    assertIREmitMatch("(x: 42) (throw \"no\")");
+}
+
+TEST_F(IREmitTest, ir_emit_lazy_curried_arg) {
+    // Curried function: second arg unused should not throw.
+    assertIREmitMatch("let f = x: msg: x; in f 42 (throw \"no\")");
+}
+
 // -- Disassembly sanity check: ensure emitFromIR produces non-empty code --
 
 TEST_F(IREmitTest, ir_emit_produces_code) {
