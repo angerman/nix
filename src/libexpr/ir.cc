@@ -461,15 +461,14 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
     //
     // This chains of if-has-attr checks, one per path component.
 
-    // Note: the default expression is lowered inside each else branch
-    // (not eagerly here) because it may have side effects (e.g., throw)
-    // that should only execute when the attribute is actually missing.
-    VarId current = base;
-
-    for (size_t i = 0; i < attrPath.size(); ++i) {
+    // Recursive helper: lower a.path[i..n] or default
+    // Each step: if has(current, path[i]) then select + recurse else default.
+    // All lowering happens in the CURRENT block — each step creates an
+    // IRIf with inline then/else blocks.
+    auto lowerSelectOr = [&](auto & self, VarId current, size_t i) -> VarId {
         auto & an = attrPath[i];
 
-        // Emit: has-attr check (static or dynamic).
+        // Has-attr check (static or dynamic).
         VarId hasIt;
         if (an.expr) {
             VarId nameVar = lowerExpr(an.expr);
@@ -484,103 +483,53 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
             }, e->pos);
         }
 
-        if (i == attrPath.size() - 1) {
-            // Last component: if has, select; else default.
-            // Lower both branches into blocks.
-            BlockId thenBlk = module.freshBlock(e->pos);
-            BlockId elseBlk = module.freshBlock(e->pos);
+        BlockId thenBlk = module.freshBlock(e->pos);
+        BlockId elseBlk = module.freshBlock(e->pos);
 
-            // Then branch: select the attribute.
-            {
-                auto saved = currentBlock;
-                currentBlock = thenBlk;
-                VarId selected;
-                if (an.expr) {
-                    VarId nameVar2 = lowerExpr(an.expr);
-                    selected = emit(IRAttrSelectDynamic{
-                        .attrs = current,
-                        .nameVar = nameVar2,
-                    }, e->pos);
-                } else {
-                    selected = emit(IRAttrSelect{
-                        .attrs = current,
-                        .name = an.symbol,
-                    }, e->pos);
-                }
-                curBlock().terminal = TermReturn{.value = selected, .pos = e->pos};
-                currentBlock = saved;
+        // Then branch: select attribute, possibly recurse for more components.
+        {
+            auto saved = currentBlock;
+            currentBlock = thenBlk;
+            VarId selected;
+            if (an.expr) {
+                VarId nameVar2 = lowerExpr(an.expr);
+                selected = emit(IRAttrSelectDynamic{
+                    .attrs = current,
+                    .nameVar = nameVar2,
+                }, e->pos);
+            } else {
+                selected = emit(IRAttrSelect{
+                    .attrs = current,
+                    .name = an.symbol,
+                }, e->pos);
             }
-
-            // Else branch: evaluate and return default.
-            {
-                auto saved = currentBlock;
-                currentBlock = elseBlk;
-                VarId defResult = lowerExpr(e->def);
-                curBlock().terminal = TermReturn{.value = defResult, .pos = e->pos};
-                currentBlock = saved;
+            VarId result;
+            if (i == attrPath.size() - 1) {
+                result = selected;
+            } else {
+                result = self(self, selected, i + 1);
             }
-
-            return emit(IRIf{
-                .cond = hasIt,
-                .thenBlock = thenBlk,
-                .elseBlock = elseBlk,
-            }, e->pos);
-        } else {
-            // Intermediate component: if has, select and continue;
-            // else short-circuit to default.
-            BlockId thenBlk = module.freshBlock(e->pos);
-            BlockId elseBlk = module.freshBlock(e->pos);
-
-            // Else: evaluate and return default
-            {
-                auto saved = currentBlock;
-                currentBlock = elseBlk;
-                VarId defResult = lowerExpr(e->def);
-                curBlock().terminal = TermReturn{.value = defResult, .pos = e->pos};
-                currentBlock = saved;
-            }
-
-            // Then: select this component, continue in the then block.
-            // The remaining path components will be lowered in the
-            // then block's continuation.
-            {
-                (void) currentBlock;  // saved implicitly
-                currentBlock = thenBlk;
-                VarId selected;
-                if (an.expr) {
-                    VarId nameVar2 = lowerExpr(an.expr);
-                    selected = emit(IRAttrSelectDynamic{
-                        .attrs = current,
-                        .nameVar = nameVar2,
-                    }, e->pos);
-                } else {
-                    selected = emit(IRAttrSelect{
-                        .attrs = current,
-                        .name = an.symbol,
-                    }, e->pos);
-                }
-
-                // Continue lowering remaining path in this block.
-                current = selected;
-                // We recursively handle the rest inside this block.
-                // To avoid complex control flow, emit the if node and
-                // continue with `current` set to the if result.
-                // Actually, for intermediate nodes we need to thread
-                // through the then-block, so just continue the loop.
-                // The else block returns default; the then block
-                // continues to the next iteration.
-                // For proper A-normal form, we continue in the current
-                // (then) block.  The outer block gets the if result.
-                // This is a simplification -- a real implementation
-                // would need phi-nodes or block arguments.  For now,
-                // we continue in the then block and rely on the
-                // terminal being set at the final step.
-            }
+            curBlock().terminal = TermReturn{.value = result, .pos = e->pos};
+            currentBlock = saved;
         }
-    }
 
-    // Should not reach here.
-    return current;
+        // Else branch: return default (lowered lazily per branch).
+        {
+            auto saved = currentBlock;
+            currentBlock = elseBlk;
+            VarId defResult = lowerExpr(e->def);
+            curBlock().terminal = TermReturn{.value = defResult, .pos = e->pos};
+            currentBlock = saved;
+        }
+
+        return emit(IRIf{
+            .cond = hasIt,
+            .thenBlock = thenBlk,
+            .elseBlock = elseBlk,
+        }, e->pos);
+    };
+
+    return lowerSelectOr(lowerSelectOr, base, 0);
 }
 
 
