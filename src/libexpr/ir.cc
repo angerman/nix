@@ -451,7 +451,9 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
     //
     // This chains of if-has-attr checks, one per path component.
 
-    VarId defVal = lowerExpr(e->def);
+    // Note: the default expression is lowered inside each else branch
+    // (not eagerly here) because it may have side effects (e.g., throw)
+    // that should only execute when the attribute is actually missing.
     VarId current = base;
 
     for (size_t i = 0; i < attrPath.size(); ++i) {
@@ -499,12 +501,12 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
                 currentBlock = saved;
             }
 
-            // Else branch: return default.
+            // Else branch: evaluate and return default.
             {
                 auto saved = currentBlock;
                 currentBlock = elseBlk;
-                VarId defRef = emit(IRVarRef{.var = defVal}, e->pos);
-                curBlock().terminal = TermReturn{.value = defRef, .pos = e->pos};
+                VarId defResult = lowerExpr(e->def);
+                curBlock().terminal = TermReturn{.value = defResult, .pos = e->pos};
                 currentBlock = saved;
             }
 
@@ -519,12 +521,12 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
             BlockId thenBlk = module.freshBlock(e->pos);
             BlockId elseBlk = module.freshBlock(e->pos);
 
-            // Else: return default
+            // Else: evaluate and return default
             {
                 auto saved = currentBlock;
                 currentBlock = elseBlk;
-                VarId defRef = emit(IRVarRef{.var = defVal}, e->pos);
-                curBlock().terminal = TermReturn{.value = defRef, .pos = e->pos};
+                VarId defResult = lowerExpr(e->def);
+                curBlock().terminal = TermReturn{.value = defResult, .pos = e->pos};
                 currentBlock = saved;
             }
 
