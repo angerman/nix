@@ -921,18 +921,20 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             unit.patchJump(jumpEnd);
         }
 
-        // -- PrimOp call --
+        // -- PrimOp call (VM-native) --
         else if constexpr (std::is_same_v<T, ir::IRPrimOpCall>) {
-            // Push all args, then emit sequential CALL_1.
-            // Create the primop Value, then call it with each arg.
-            auto * primVal = state.allocValue();
-            primVal->mkPrimOp(const_cast<PrimOp *>(e.primOp));
-            unit.emit(OP_CONST, unit.addConstant(primVal));
+            // Push all arguments left-to-right.
             for (auto arg : e.args) {
                 emitVarRef(arg, pos, ctx);
-                unit.emitPos(e.pos);
-                unit.emit(OP_CALL_1);
             }
+            // Emit OP_CALL_PRIMOP: direct call to primop impl.
+            // No intermediate PrimOpApp values or callFunction overhead.
+            auto * primVal = state.allocValue();
+            primVal->mkPrimOp(const_cast<PrimOp *>(e.primOp));
+            uint16_t constIdx = static_cast<uint16_t>(unit.addConstant(primVal));
+            uint8_t arity = static_cast<uint8_t>(e.primOp->arity);
+            unit.emitPos(e.pos);
+            unit.emit(OP_CALL_PRIMOP, packArityConst(arity, constIdx));
         }
 
         // -- With scope --

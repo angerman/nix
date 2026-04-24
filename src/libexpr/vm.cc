@@ -196,6 +196,9 @@ static void traceInstruction(
         case OP_CELL_SET:
             fprintf(stderr, " cell_slot=%u formal=%u", operand >> 16, operand & 0xFFFF);
             break;
+        case OP_CALL_PRIMOP:
+            fprintf(stderr, " arity=%u constIdx=%u", operand >> 16, operand & 0xFFFF);
+            break;
         default:
             if (operand) fprintf(stderr, " %u", operand);
             break;
@@ -680,6 +683,7 @@ void vmExec(
         REGISTER_OP(OP_MAKE_CLOSURE, op_make_closure);
         REGISTER_OP(OP_CALL,         op_call);
         REGISTER_OP(OP_CALL_1,       op_call_1);
+        REGISTER_OP(OP_CALL_PRIMOP,  op_call_primop);
 
         // VM v2: upvalue-based closures (IR emitter)
         REGISTER_OP(OP_GET_UPVALUE,      op_get_upvalue);
@@ -1914,7 +1918,6 @@ op_call_1:
         // Avoids callFunction overhead (profiler hooks, call depth, loop).
         if (fun->isPrimOp()) {
             auto * fn = fun->primOp();
-            // state.nrPrimOpCalls is private; skip for now.
             if (fn->arity == 1) {
                 // Saturated single-arg primop (head, length, typeOf, etc.)
                 auto * result = state.allocValue();
@@ -1946,8 +1949,16 @@ op_call_1:
             auto argsLeft = fn->arity - argsDone;
 
             if (argsLeft == 1) {
-                // Saturated: delegate to noinline helper.
-                vmCallSaturatedPrimOp(state, vm, fn, fun, arg, argsDone, pos);
+                // Saturated: collect all args and call directly.
+                // Inline the common 2-arg case for performance.
+                if (fn->arity == 2) {
+                    Value * vArgs[2] = {fun->primOpApp().right, arg};
+                    auto * result = state.allocValue();
+                    fn->impl(state, pos, vArgs, *result);
+                    vm.push(result);
+                } else {
+                    vmCallSaturatedPrimOp(state, vm, fn, fun, arg, argsDone, pos);
+                }
                 DISPATCH();
             } else {
                 // Still unsaturated: extend the PrimOpApp chain.
@@ -2550,6 +2561,42 @@ op_alloc_cell:
         for (uint32_t i = 0; i < size; ++i)
             cell[i] = const_cast<Value *>(&Value::vNull);
         vm.push(reinterpret_cast<Value *>(cell));
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // VM v2: Direct saturated primop call
+    // ==================================================================
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_call_primop:
+#else
+    case OP_CALL_PRIMOP:
+#endif
+    {
+        // Operand packs (arity:8, constIdx:16).
+        // Calls the primop's impl function directly with all arguments.
+        // No intermediate PrimOpApp values, no callFunction dispatch.
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t arity = static_cast<uint8_t>(operand >> 16);
+        uint16_t constIdx = static_cast<uint16_t>(operand & 0xFFFF);
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        Value * primVal = cu->constants[constIdx];
+        assert(primVal->isPrimOp());
+        auto * fn = primVal->primOp();
+
+        // Collect arguments from the operand stack.
+        // Args were pushed left-to-right; pop in reverse to fill array.
+        Value * vArgs[maxPrimOpArity];
+        for (uint8_t i = arity; i > 0; --i)
+            vArgs[i - 1] = vm.pop();
+
+        // Allocate result and call the primop implementation directly.
+        auto * result = state.allocValue();
+        fn->impl(state, pos, vArgs, *result);
+
+        vm.push(result);
         DISPATCH();
     }
 

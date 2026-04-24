@@ -993,6 +993,76 @@ VarId Lowerer::lowerLambda(ExprLambda * e)
 
 VarId Lowerer::lowerCall(ExprCall * e)
 {
+    // --- Saturated primop detection ---
+    //
+    // If the callee resolves to a primop and all arguments are provided,
+    // emit IRPrimOpCall for a direct call via OP_CALL_PRIMOP.  This
+    // eliminates intermediate PrimOpApp values, callFunction dispatch,
+    // and reduces VM frame depth.
+    //
+    // Detects:
+    //   1. Direct baseEnv references: `__length xs` (rare in practice)
+    //   2. builtins.X calls: `builtins.genList f n` (common in nixpkgs)
+    if (e->args && !e->args->empty()) {
+        const PrimOp * detectedPrimOp = nullptr;
+
+        // Case 1: direct baseEnv primop (ExprVar with level >= currentLevel)
+        if (auto * funVar = dynamic_cast<ExprVar *>(e->fun)) {
+            if (funVar->fromWith == nullptr) {
+                uint32_t level = funVar->level + levelOffset;
+                if (level >= currentLevel) {
+                    uint32_t envLevel = level - currentLevel;
+                    if (envLevel == 0) {
+                        Value * callee = state.baseEnv.values[funVar->displ];
+                        if (callee && callee->isPrimOp())
+                            detectedPrimOp = callee->primOp();
+                    }
+                }
+            }
+        }
+
+        // Case 2: builtins.X (ExprSelect on the builtins variable)
+        if (!detectedPrimOp) {
+            if (auto * sel = dynamic_cast<ExprSelect *>(e->fun)) {
+                if (sel->getAttrPath().size() == 1 && !sel->def) {
+                    if (auto * selBase = dynamic_cast<ExprVar *>(sel->e)) {
+                        if (selBase->fromWith == nullptr) {
+                            uint32_t level = selBase->level + levelOffset;
+                            if (level >= currentLevel) {
+                                uint32_t envLevel = level - currentLevel;
+                                if (envLevel == 0) {
+                                    Value * base = state.baseEnv.values[selBase->displ];
+                                    if (base && base->type() == nAttrs) {
+                                        Symbol attrName = sel->getAttrPath()[0].symbol;
+                                        if (auto * attr = base->attrs()->get(attrName))
+                                            if (attr->value->isPrimOp())
+                                                detectedPrimOp = attr->value->primOp();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (detectedPrimOp
+            && detectedPrimOp->arity > 0
+            && e->args->size() == static_cast<size_t>(detectedPrimOp->arity))
+        {
+            std::vector<VarId> argVars;
+            argVars.reserve(detectedPrimOp->arity);
+            for (auto * argExpr : *e->args)
+                argVars.push_back(lowerAsThunkOrEager(argExpr, e->pos));
+            return emit(IRPrimOpCall{
+                .primOp = detectedPrimOp,
+                .args = std::move(argVars),
+                .pos = e->pos,
+            }, e->pos);
+        }
+    }
+
+    // --- Curried IRApp chain (default path) ---
     VarId func = lowerExpr(e->fun);
 
     // Lower all arguments left-to-right, then emit sequential applications.

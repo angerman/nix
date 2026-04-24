@@ -106,6 +106,13 @@ inline constexpr uint16_t unpackDispl(uint32_t operand) noexcept
     return static_cast<uint16_t>(operand & 0xFFFF);
 }
 
+/// Pack (arity:8, constIdx:16) for OP_CALL_PRIMOP.
+[[gnu::always_inline]]
+inline constexpr uint32_t packArityConst(uint8_t arity, uint16_t constIdx) noexcept
+{
+    return (static_cast<uint32_t>(arity) << 16) | constIdx;
+}
+
 
 // ---------------------------------------------------------------------------
 // Opcodes
@@ -274,6 +281,13 @@ enum Op : uint8_t {
     OP_CELL_GET          = 0x4D, // [cell_uv:8|idx:16] push cell[idx] via upvalues[cell_uv]
     OP_CELL_SET          = 0x4E, // [cell_slot:8|idx:16] pop val, cell[idx] = val (cell from stack[base+cell_slot])
     OP_ALLOC_CELL        = 0x4F, // [size:24]           push GC_MALLOC'd Value*[size] (as reinterpret_cast'd Value*)
+
+    /// Direct saturated primop call.
+    /// Operand encoding: arity:8 | constIdx:16
+    ///   - arity (high 8 bits):   number of arguments (1..8)
+    ///   - constIdx (low 16 bits): index into constants[] for the PrimOp Value*
+    /// Stack effect: pops `arity` Values, calls primOp->impl, pushes result.
+    OP_CALL_PRIMOP       = 0x50, // [arity:8|constIdx:16]  direct primop call
 };
 
 
