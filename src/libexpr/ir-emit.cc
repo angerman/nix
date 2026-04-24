@@ -687,17 +687,44 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
 
         // -- Function application --
         else if constexpr (std::is_same_v<T, ir::IRApp>) {
-            emitVarRef(e.func, pos, ctx);
-            emitVarRef(e.arg, pos, ctx);
-            unit.emitPos(pos);
-            unit.emit(OP_CALL_1);
+            // Superinstruction: SLOT_SLOT_CALL1 when both func and arg
+            // are locals with slot indices < 4096.
+            auto funcIt = ctx.localSlots.find(e.func);
+            auto argIt = ctx.localSlots.find(e.arg);
+            if (funcIt != ctx.localSlots.end()
+                && argIt != ctx.localSlots.end()
+                && funcIt->second < 4096
+                && argIt->second < 4096) {
+                unit.emitPos(pos);
+                unit.emit(OP_SLOT_SLOT_CALL1,
+                    (funcIt->second << 12) | argIt->second);
+            } else {
+                emitVarRef(e.func, pos, ctx);
+                emitVarRef(e.arg, pos, ctx);
+                unit.emitPos(pos);
+                unit.emit(OP_CALL_1);
+            }
         }
 
         // -- Force --
         else if constexpr (std::is_same_v<T, ir::IRForce>) {
-            emitVarRef(e.thunk, pos, ctx);
-            unit.emitPos(pos);
-            unit.emit(OP_FORCE);
+            // Superinstruction: GET_SLOT_FORCE or GET_UV_FORCE when the
+            // variable is a local slot or upvalue.
+            auto localIt = ctx.localSlots.find(e.thunk);
+            if (localIt != ctx.localSlots.end()) {
+                unit.emitPos(pos);
+                unit.emit(OP_GET_SLOT_FORCE, localIt->second);
+            } else {
+                auto uvIt = ctx.upvalueSlots.find(e.thunk);
+                if (uvIt != ctx.upvalueSlots.end()) {
+                    unit.emitPos(pos);
+                    unit.emit(OP_GET_UV_FORCE, uvIt->second);
+                } else {
+                    emitVarRef(e.thunk, pos, ctx);
+                    unit.emitPos(pos);
+                    unit.emit(OP_FORCE);
+                }
+            }
         }
 
         // -- Thunk creation --
@@ -1210,10 +1237,21 @@ void IREmitter::emitTerminal(const ir::Terminal & term, BlockContext & ctx)
 
         if constexpr (std::is_same_v<T, ir::TermReturn>) {
             if (t.value != ir::kInvalidVar) {
-                emitVarRef(t.value, t.pos, ctx);
+                // Superinstruction: GET_SLOT_RETURN skips push+pop,
+                // writes directly to resultSlot.
+                auto localIt = ctx.localSlots.find(t.value);
+                if (localIt != ctx.localSlots.end()) {
+                    unit.emitPos(t.pos);
+                    unit.emit(OP_GET_SLOT_RETURN, localIt->second);
+                } else {
+                    emitVarRef(t.value, t.pos, ctx);
+                    unit.emitPos(t.pos);
+                    unit.emit(OP_RETURN);
+                }
+            } else {
+                unit.emitPos(t.pos);
+                unit.emit(OP_RETURN);
             }
-            unit.emitPos(t.pos);
-            unit.emit(OP_RETURN);
         }
         else if constexpr (std::is_same_v<T, ir::TermTailCall>) {
             // For now, emit as a regular call + return.

@@ -288,6 +288,12 @@ enum Op : uint8_t {
     ///   - constIdx (low 16 bits): index into constants[] for the PrimOp Value*
     /// Stack effect: pops `arity` Values, calls primOp->impl, pushes result.
     OP_CALL_PRIMOP       = 0x50, // [arity:8|constIdx:16]  direct primop call
+
+    // -- Superinstructions (fused common patterns) --
+    OP_GET_SLOT_FORCE    = 0x51, // [slot:24]            GET_STACK_SLOT + FORCE
+    OP_GET_SLOT_RETURN   = 0x52, // [slot:24]            GET_STACK_SLOT + RETURN (direct to resultSlot)
+    OP_GET_UV_FORCE      = 0x53, // [idx:24]             GET_UPVALUE + FORCE
+    OP_SLOT_SLOT_CALL1   = 0x54, // [funcSlot:12|argSlot:12] GET_STACK_SLOT(f) + GET_STACK_SLOT(a) + CALL_1
 };
 
 

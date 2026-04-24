@@ -1575,8 +1575,11 @@ TEST_F(IREmitTest, ir_emit_produces_code) {
     auto mod = ir::lower(state, e);
     auto * unit = bytecode::emitFromIR(state, mod);
     EXPECT_GT(unit->code.size(), 0u);
-    // Should end with OP_RETURN.
-    EXPECT_EQ(bytecode::decodeOp(unit->code.back()), bytecode::OP_RETURN);
+    // Should end with a return instruction (OP_RETURN or the
+    // GET_SLOT_RETURN superinstruction).
+    auto lastOp = bytecode::decodeOp(unit->code.back());
+    EXPECT_TRUE(lastOp == bytecode::OP_RETURN
+             || lastOp == bytecode::OP_GET_SLOT_RETURN);
 }
 
 } // namespace nix

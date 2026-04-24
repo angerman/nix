@@ -199,6 +199,9 @@ static void traceInstruction(
         case OP_CALL_PRIMOP:
             fprintf(stderr, " arity=%u constIdx=%u", operand >> 16, operand & 0xFFFF);
             break;
+        case OP_SLOT_SLOT_CALL1:
+            fprintf(stderr, " func=%u arg=%u", operand >> 12, operand & 0xFFF);
+            break;
         default:
             if (operand) fprintf(stderr, " %u", operand);
             break;
@@ -696,6 +699,12 @@ void vmExec(
         REGISTER_OP(OP_CELL_GET,         op_cell_get);
         REGISTER_OP(OP_CELL_SET,         op_cell_set);
         REGISTER_OP(OP_ALLOC_CELL,       op_alloc_cell);
+
+        // Superinstructions (fused common patterns)
+        REGISTER_OP(OP_GET_SLOT_FORCE,   op_get_slot_force);
+        REGISTER_OP(OP_GET_SLOT_RETURN,  op_get_slot_return);
+        REGISTER_OP(OP_GET_UV_FORCE,     op_get_uv_force);
+        REGISTER_OP(OP_SLOT_SLOT_CALL1,  op_slot_slot_call1);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2594,6 +2603,136 @@ op_call_primop:
 
         vm.push(result);
         DISPATCH();
+    }
+
+    // ==================================================================
+    // Superinstructions: fused common instruction patterns
+    // ==================================================================
+
+    // S1: GET_STACK_SLOT + FORCE → single dispatch.
+    // Eliminates push+force round-trip for the most common pattern:
+    // reading a local variable and forcing it.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_slot_force:
+#else
+    case OP_GET_SLOT_FORCE:
+#endif
+    {
+        uint32_t slot = decodeOperand(CUR_INSTR);
+        size_t base = vm.frames.back().stackBaseOffset;
+        Value * v = vm.stack[base + slot];
+        vm.push(v);
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Inline force trampoline (same as OP_FORCE).
+        if (v->isThunk()) {
+            Env * thunkEnv = v->thunk().env;
+            Expr * thunkExpr = v->thunk().expr;
+            if (thunkEnv && thunkExpr->isBytecodeThunk) {
+                auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
+                uint32_t thunkOffset = thunkDesc.codeOffset;
+                Value ** frameUpvalues = nullptr;
+                if (thunkDesc.nUpvalues > 0)
+                    frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
+                v->mkBlackhole();
+                vm.frames.back().ip = ip;
+                vm.frames.back().env = curEnv;
+                vm.frames.push_back(CallFrame{
+                    .unit = bcThunk->unit, .ip = thunkOffset, .env = thunkEnv,
+                    .stackBaseOffset = vm.stackSize(), .resultSlot = v,
+                    .callPos = pos, .isThunkForce = true, .upvalues = frameUpvalues,
+                });
+                cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
+                DISPATCH();
+            }
+        }
+        // Fallback for non-bytecoded thunks/apps or already-forced values.
+        state.forceValue(*v, pos);
+        DISPATCH();
+    }
+
+    // S2: GET_STACK_SLOT + RETURN → single dispatch.
+    // Pushes the slot value then falls through to OP_RETURN,
+    // reusing the complex frame-pop logic exactly.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_slot_return:
+#else
+    case OP_GET_SLOT_RETURN:
+#endif
+    {
+        uint32_t slot = decodeOperand(CUR_INSTR);
+        size_t base = vm.frames.back().stackBaseOffset;
+        vm.push(vm.stack[base + slot]);
+        goto op_return;  // reuse OP_RETURN's frame-pop logic
+    }
+
+    // S3: GET_UPVALUE + FORCE → single dispatch.
+    // Same as S1 but for captured variables.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_uv_force:
+#else
+    case OP_GET_UV_FORCE:
+#endif
+    {
+        uint32_t idx = decodeOperand(CUR_INSTR);
+        Value ** upvalues = vm.frames.back().upvalues;
+        assert(upvalues && "OP_GET_UV_FORCE: no upvalue array");
+        Value * v = upvalues[idx];
+        vm.push(v);
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Inline force trampoline (same as OP_FORCE).
+        if (v->isThunk()) {
+            Env * thunkEnv = v->thunk().env;
+            Expr * thunkExpr = v->thunk().expr;
+            if (thunkEnv && thunkExpr->isBytecodeThunk) {
+                auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
+                uint32_t thunkOffset = thunkDesc.codeOffset;
+                Value ** frameUpvalues = nullptr;
+                if (thunkDesc.nUpvalues > 0)
+                    frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
+                v->mkBlackhole();
+                vm.frames.back().ip = ip;
+                vm.frames.back().env = curEnv;
+                vm.frames.push_back(CallFrame{
+                    .unit = bcThunk->unit, .ip = thunkOffset, .env = thunkEnv,
+                    .stackBaseOffset = vm.stackSize(), .resultSlot = v,
+                    .callPos = pos, .isThunkForce = true, .upvalues = frameUpvalues,
+                });
+                cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
+                DISPATCH();
+            }
+        }
+        state.forceValue(*v, pos);
+        DISPATCH();
+    }
+
+    // S4: GET_STACK_SLOT(func) + GET_STACK_SLOT(arg) + CALL_1 → single dispatch.
+    // Operand: funcSlot:12 | argSlot:12.  Loads both from local slots,
+    // then falls into the OP_CALL_1 handler.  Saves 2 dispatch cycles.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_slot_slot_call1:
+#else
+    case OP_SLOT_SLOT_CALL1:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t funcSlot = operand >> 12;
+        uint32_t argSlot = operand & 0xFFF;
+        size_t base = vm.frames.back().stackBaseOffset;
+        // Push fun and arg onto operand stack, then let OP_CALL_1 handle
+        // all the dispatch logic (v2 closures, v1 closures, primops, etc.)
+        // This saves 2 dispatches (the two GET_STACK_SLOT) while reusing
+        // the complex, well-tested CALL_1 handler.
+        vm.push(vm.stack[base + funcSlot]);
+        vm.push(vm.stack[base + argSlot]);
+        goto op_call_1;  // fall through to CALL_1 handler
     }
 
     // ==================================================================
