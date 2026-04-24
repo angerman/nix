@@ -414,7 +414,8 @@ void vmExec(
     uint32_t startOffset,
     Env & env,
     Value & result,
-    Value ** upvalues)
+    Value ** upvalues,
+    Value * arg)
 {
     // Ensure VMState is initialized.
     if (!state.vmState) [[unlikely]]
@@ -440,6 +441,12 @@ void vmExec(
         .callPos   = unit.posForOffset(startOffset),
         .upvalues  = upvalues,
     });
+
+    // If an argument was provided (e.g., from callFunction routing a
+    // v2 closure call), push it as stack slot 0 so the body can read
+    // it via OP_GET_STACK_SLOT(0).
+    if (arg)
+        vm.push(arg);
 
     // Frame-local aliases (updated when frames change).
     const CompilationUnit * cu = &unit;

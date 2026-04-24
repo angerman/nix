@@ -1078,8 +1078,48 @@ uint32_t IREmitter::emitInlineBlock(ir::BlockId blockId, BlockContext & ctx)
     // Their bindings get stack slots in the parent's frame.
     // Their terminal's return value is left on the operand stack
     // (instead of OP_RETURN, we just leave the result for the parent).
+    //
+    // Forward-reference pre-allocation: same logic as emitBlock().
+    // Inline blocks can contain let bindings with recursive functions
+    // (e.g., `if cond then ... else let f = a: ... f ...; in ...`).
+    // Without pre-allocation, the lambda tries to capture `f`'s VarId
+    // before it has been assigned a stack slot.
+    std::unordered_set<ir::VarId> definedInBlock;
+    for (const auto & binding : block.bindings)
+        definedInBlock.insert(binding.result);
+
+    std::unordered_set<ir::VarId> forwardRefs;
     for (const auto & binding : block.bindings) {
-        emitBinding(binding, ctx);
+        std::visit([&](const auto & e) {
+            using T = std::decay_t<decltype(e)>;
+            if constexpr (std::is_same_v<T, ir::IRMkThunk>
+                       || std::is_same_v<T, ir::IRLambda>) {
+                for (auto fv : e.freeVars.vars) {
+                    if (definedInBlock.count(fv))
+                        forwardRefs.insert(fv);
+                }
+            }
+        }, binding.expr);
+    }
+
+    for (auto fv : forwardRefs) {
+        if (ctx.localSlots.find(fv) == ctx.localSlots.end()) {
+            uint32_t slot = ctx.allocSlot(fv);
+            unit.emit(OP_ALLOC_VALUE);
+            unit.emit(OP_SET_STACK_SLOT, slot);
+        }
+    }
+
+    for (const auto & binding : block.bindings) {
+        emitExpr(binding.expr, binding.pos, ctx);
+        if (forwardRefs.count(binding.result)) {
+            auto it = ctx.localSlots.find(binding.result);
+            assert(it != ctx.localSlots.end());
+            unit.emit(OP_COPY_TO_SLOT, it->second);
+        } else {
+            uint32_t slot = ctx.allocSlot(binding.result);
+            unit.emit(OP_SET_STACK_SLOT, slot);
+        }
     }
 
     // For inline blocks, the terminal should be TermReturn.

@@ -135,7 +135,8 @@ void vmExec(
     uint32_t startOffset,
     Env & env,
     Value & result,
-    Value ** upvalues = nullptr);
+    Value ** upvalues = nullptr,
+    Value * arg = nullptr);
 
 } // namespace bytecode
 } // namespace nix
