@@ -843,6 +843,44 @@ op_return:
         vm.sp = vm.stack + stackBase;
         vm.frames.pop_back();
 
+        // Iterative thunk chain resolution for thunk-force returns.
+        // If the result is STILL a thunk (thunk chain), push a new
+        // trampoline frame at the SAME frame depth (the previous frame
+        // was just popped).  Each chain link runs as: push → body →
+        // OP_RETURN → pop → check → push next.  Frame depth stays at
+        // original + 1, matching the tree-walker's iterative forceValue.
+        if (wasThunkForce && (resultSlot->isThunk() || resultSlot->isApp())) {
+            if (resultSlot->isThunk()) {
+                Env * chainEnv = resultSlot->thunk().env;
+                Expr * chainExpr = resultSlot->thunk().expr;
+                if (chainEnv && chainExpr && chainExpr->isBytecodeThunk) {
+                    auto * bcThunk = static_cast<ExprBytecodeThunk *>(chainExpr);
+                    auto & td = bcThunk->unit->thunks[bcThunk->thunkIdx];
+                    Value ** uv = nullptr;
+                    if (td.nUpvalues > 0)
+                        uv = reinterpret_cast<Value **>(chainEnv->values[1]);
+
+                    resultSlot->mkBlackhole();
+                    vm.frames.push_back(CallFrame{
+                        .unit = bcThunk->unit,
+                        .ip = td.codeOffset,
+                        .env = chainEnv,
+                        .stackBaseOffset = vm.stackSize(),
+                        .resultSlot = resultSlot,
+                        .callPos = frame.callPos,
+                        .isThunkForce = true,
+                        .upvalues = uv,
+                    });
+                    cu = bcThunk->unit;
+                    ip = td.codeOffset;
+                    curEnv = chainEnv;
+                    DISPATCH();
+                }
+            }
+            // Non-bytecode thunk or App chain: delegate to forceValue.
+            state.forceValue(*resultSlot, frame.callPos);
+        }
+
         if (vm.frames.size() <= entryFrameDepth) {
             return;
         }
@@ -854,10 +892,6 @@ op_return:
         curEnv = caller.env;
 
         if (!wasThunkForce) {
-            // Normal call return: push the resultSlot (an independent copy).
-            // We must NOT push retVal directly — it may alias an env slot.
-            // The caller's OP_CALL_1 allocated resultSlot as a fresh Value
-            // and we've copied the result into it above.
             vm.push(resultSlot);
         }
         DISPATCH();
@@ -909,14 +943,12 @@ op_get_local_0_force:
                         thunkEnv->values[1]);
                 }
 
-                // Guard against infinite recursion from thunk copy chains.
-                if (vm.frames.size() > 16384) {
-                    state.error<EvalError>("infinite recursion encountered")
-                        .atPos(pos).debugThrow();
-                }
-
-                // Frame depth guard: detect infinite thunk-copy recursion.
-                if (vm.frames.size() > 524288) [[unlikely]] {
+                // Frame depth guard.
+                if (vm.frames.size() > 65536) [[unlikely]] {
+                    std::ostringstream oss;
+                    oss << state.positions[pos];
+                    fprintf(stderr, "Frame guard at %s (depth=%zu)\n",
+                        oss.str().c_str(), vm.frames.size());
                     state.error<EvalError>("infinite recursion encountered")
                         .atPos(pos).debugThrow();
                 }
@@ -925,7 +957,7 @@ op_get_local_0_force:
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
                 // Frame depth guard
-                if (vm.frames.size() > 524288) [[unlikely]]
+                if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.push_back(CallFrame{
                     .unit = bcThunk->unit,
@@ -1098,7 +1130,7 @@ op_force:
 
                 // Push a new call frame for the thunk body.
                 // Frame depth guard
-                if (vm.frames.size() > 524288) [[unlikely]]
+                if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.push_back(CallFrame{
                     .unit = bcThunk->unit,
@@ -1148,7 +1180,7 @@ op_force:
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
                 // Frame depth guard
-                if (vm.frames.size() > 524288) [[unlikely]]
+                if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.push_back(CallFrame{
                     .unit = &bodyUnit,
@@ -1182,7 +1214,7 @@ op_force:
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
                 // Frame depth guard
-                if (vm.frames.size() > 524288) [[unlikely]]
+                if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.push_back(CallFrame{
                     .unit = &bodyUnit,
@@ -1801,7 +1833,7 @@ op_call_1:
             // OP_SET_STACK_SLOT auto-extends the stack, so no pre-allocation
             // of local slots is needed here.
                 // Frame depth guard
-                if (vm.frames.size() > 524288) [[unlikely]]
+                if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
@@ -1853,7 +1885,7 @@ op_call_1:
             auto * result = state.allocValue();
 
                 // Frame depth guard
-                if (vm.frames.size() > 524288) [[unlikely]]
+                if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
@@ -1958,7 +1990,7 @@ op_call_1:
                     vm.frames.back().env = curEnv;
                     auto * result = state.allocValue();
                 // Frame depth guard
-                if (vm.frames.size() > 524288) [[unlikely]]
+                if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                     vm.frames.push_back(CallFrame{
                         .unit = &bodyUnit,
