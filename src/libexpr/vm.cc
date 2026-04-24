@@ -411,6 +411,120 @@ static void vmStrConcat(
 }
 
 // ---------------------------------------------------------------------------
+// Out-of-line helpers for opcodes with large stack-local arrays.
+// Extracting these prevents the compiler from allocating their arrays
+// in vmExec's frame, keeping vmExec's C stack footprint small (~100-200
+// bytes) for deep recursive re-entry chains.
+// ---------------------------------------------------------------------------
+
+/// OP_ATTRS_INIT: build a Bindings from N values on the VM stack.
+[[gnu::noinline]]
+static Value * vmAttrsInit(
+    EvalState & state, VMState & vm,
+    const CompilationUnit * cu, uint32_t & ip, uint32_t nAttrs)
+{
+    auto bindings = state.buildBindings(nAttrs);
+    constexpr uint32_t kStackMax = 64;
+    Value * stackValues[kStackMax];
+    Value ** values = nAttrs <= kStackMax
+        ? stackValues : new Value*[nAttrs];
+    for (uint32_t i = nAttrs; i > 0; --i)
+        values[i - 1] = vm.pop();
+    for (uint32_t i = 0; i < nAttrs; i++) {
+        uint32_t symIdx = decodeOperand(cu->code[ip++]);
+        uint32_t posIdx = decodeOperand(cu->code[ip++]);
+        Symbol name = cu->symbols[symIdx];
+        PosIdx attrPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
+        bindings.insert(name, values[i], attrPos);
+    }
+    auto * result = state.allocValue();
+    result->mkAttrs(bindings.alreadySorted());
+    if (values != stackValues) delete[] values;
+    return result;
+}
+
+/// OP_ATTRS_DYN_INIT: build a Bindings with static + dynamic attrs.
+[[gnu::noinline]]
+static Value * vmAttrsDynInit(
+    EvalState & state, VMState & vm,
+    const CompilationUnit * cu, uint32_t & ip,
+    uint32_t nStatic, uint32_t nDynamic)
+{
+    // Pop dynamic name/value pairs.
+    struct DynPair { Value * name; Value * val; };
+    constexpr uint32_t kMaxDyn = 32;
+    DynPair dynStack[kMaxDyn];
+    DynPair * dynPairs = nDynamic <= kMaxDyn ? dynStack : new DynPair[nDynamic];
+    for (uint32_t i = nDynamic; i > 0; --i) {
+        dynPairs[i-1].val  = vm.pop();
+        dynPairs[i-1].name = vm.pop();
+    }
+    // Pop static values.
+    constexpr uint32_t kMaxStatic = 64;
+    Value * staticStack[kMaxStatic];
+    Value ** staticVals = nStatic <= kMaxStatic ? staticStack : new Value*[nStatic];
+    for (uint32_t i = nStatic; i > 0; --i)
+        staticVals[i-1] = vm.pop();
+
+    auto bindings = state.buildBindings(nStatic + nDynamic);
+    for (uint32_t i = 0; i < nStatic; i++) {
+        uint32_t symIdx = decodeOperand(cu->code[ip++]);
+        uint32_t posIdx = decodeOperand(cu->code[ip++]);
+        Symbol name = cu->symbols[symIdx];
+        PosIdx attrPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
+        bindings.insert(name, staticVals[i], attrPos);
+    }
+    bool needsSort = false;
+    for (uint32_t i = 0; i < nDynamic; i++) {
+        uint32_t posIdx = decodeOperand(cu->code[ip++]);
+        PosIdx dynPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
+        state.forceValue(*dynPairs[i].name, dynPos);
+        if (dynPairs[i].name->type() == nNull) continue;
+        state.forceStringNoCtx(*dynPairs[i].name, dynPos,
+            "while evaluating the name of a dynamic attribute");
+        auto nameSym = state.symbols.create(dynPairs[i].name->string_view());
+        bindings.insert(nameSym, dynPairs[i].val, dynPos);
+        needsSort = true;
+    }
+    auto * result = state.allocValue();
+    result->mkAttrs(needsSort ? bindings.finish() : bindings.alreadySorted());
+    if (staticVals != staticStack) delete[] staticVals;
+    if (dynPairs != dynStack) delete[] dynPairs;
+    return result;
+}
+
+/// OP_CALL_1 saturated primop: collect args and call.
+[[gnu::noinline]]
+static void vmCallSaturatedPrimOp(
+    EvalState & state, VMState & vm, const PrimOp * fn,
+    Value * fun, Value * arg, uint32_t argsDone, PosIdx pos)
+{
+    Value * vArgs[maxPrimOpArity];
+    auto n = argsDone;
+    for (Value * v = fun; v->isPrimOpApp(); v = v->primOpApp().left)
+        vArgs[--n] = v->primOpApp().right;
+    vArgs[argsDone] = arg;
+    auto * result = state.allocValue();
+    const_cast<PrimOp *>(fn)->impl(state, pos, vArgs, *result);
+    vm.push(result);
+}
+
+/// OP_CALL multi-arg: collect args and call callFunction.
+[[gnu::noinline]]
+static void vmCallMultiArg(
+    EvalState & state, VMState & vm, uint32_t nArgs, PosIdx pos)
+{
+    assert(nArgs <= 16);
+    Value * args[16];
+    for (uint32_t i = nArgs; i > 0; --i)
+        args[i - 1] = vm.pop();
+    Value * fun = vm.pop();
+    auto * result = state.allocValue();
+    state.callFunction(*fun, std::span<Value *>(args, nArgs), *result, pos);
+    vm.push(result);
+}
+
+// ---------------------------------------------------------------------------
 // vmExec -- main dispatch loop
 // ---------------------------------------------------------------------------
 
@@ -1800,17 +1914,8 @@ op_call_1:
             auto argsLeft = fn->arity - argsDone;
 
             if (argsLeft == 1) {
-                // Saturated: collect all args and call.
-                // state.nrPrimOpCalls is private; skip for now.
-                Value * vArgs[maxPrimOpArity];
-                auto n = argsDone;
-                for (Value * v = fun; v->isPrimOpApp(); v = v->primOpApp().left)
-                    vArgs[--n] = v->primOpApp().right;
-                vArgs[argsDone] = arg;
-
-                auto * result = state.allocValue();
-                fn->impl(state, pos, vArgs, *result);
-                vm.push(result);
+                // Saturated: delegate to noinline helper.
+                vmCallSaturatedPrimOp(state, vm, fn, fun, arg, argsDone, pos);
                 DISPATCH();
             } else {
                 // Still unsaturated: extend the PrimOpApp chain.
@@ -1904,24 +2009,10 @@ op_call:
     case OP_CALL:
 #endif
     {
+        // Delegate to noinline helper (keeps 16-element array off vmExec's frame).
         uint32_t nArgs = decodeOperand(CUR_INSTR);
         PosIdx pos = cu->posForOffset(ip - 1);
-
-        // Collect arguments from the stack into a fixed-size array.
-        // Max primop arity is 8; in practice Nix calls rarely exceed 3-4 args.
-        // Use a stack-allocated array to avoid std::vector (which has a
-        // non-trivial destructor that breaks computed-goto).
-        assert(nArgs <= 16);
-        Value * args[16];
-        for (uint32_t i = nArgs; i > 0; --i)
-            args[i - 1] = vm.pop();
-        Value * fun = vm.pop();
-
-        // Delegate to callFunction with the full argument span.
-        auto * result = state.allocValue();
-        state.callFunction(*fun, std::span<Value *>(args, nArgs), *result, pos);
-
-        vm.push(result);
+        vmCallMultiArg(state, vm, nArgs, pos);
         DISPATCH();
     }
 
@@ -2171,44 +2262,8 @@ op_attrs_init:
     {
         uint32_t nAttrs = decodeOperand(CUR_INSTR);
 
-        auto bindings = state.buildBindings(nAttrs);
-
-        // Read nAttrs symbol indices from the following data words.
-        // Pop nAttrs values from the stack (in reverse, since last
-        // pushed = last attr in sorted order).
-        // We need to pair them: the data words are in forward order
-        // (matching the sorted attr iteration), and the stack has
-        // values in the same order (first pushed = first attr).
-        // So we collect values first, then pair.
-        // Use heap allocation for large attrsets.
-        // Stack allocation for small ones (common case).
-        constexpr uint32_t kStackMax = 64;
-        Value * stackValues[kStackMax];
-        Value ** values = nAttrs <= kStackMax
-            ? stackValues
-            : new Value*[nAttrs];
-        for (uint32_t i = nAttrs; i > 0; --i)
-            values[i - 1] = vm.pop();
-
-        for (uint32_t i = 0; i < nAttrs; i++) {
-            // Read the (symbol index, position index) pair from data words.
-            assert(ip < cu->code.size() && "OP_ATTRS_INIT: code buffer overrun (symbol)");
-            uint32_t symIdx = decodeOperand(cu->code[ip++]);
-            assert(ip < cu->code.size() && "OP_ATTRS_INIT: code buffer overrun (position)");
-            uint32_t posIdx = decodeOperand(cu->code[ip++]);
-            assert(symIdx < cu->symbols.size() && "OP_ATTRS_INIT: symbol index out of bounds");
-            Symbol name = cu->symbols[symIdx];
-            PosIdx attrPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
-            bindings.insert(name, values[i], attrPos);
-        }
-
-        auto * result = state.allocValue();
-        result->mkAttrs(bindings.alreadySorted());
-
-        if (values != stackValues)
-            delete[] values;
-
-        vm.push(result);
+        // Delegate to noinline helper (keeps large arrays off vmExec's frame).
+        vm.push(vmAttrsInit(state, vm, cu, ip, nAttrs));
         DISPATCH();
     }
 
@@ -2218,72 +2273,11 @@ op_attrs_dyn_init:
     case OP_ATTRS_DYN_INIT:
 #endif
     {
-        // Mixed static+dynamic attrset builder.
-        // Operand: [nStatic:12 | nDynamic:12]
-        // Stack: [static_vals...] [dyn_name, dyn_val] pairs...
-        // Data words: (symIdx, posIdx) pairs for static attrs,
-        //             then posIdx for each dynamic attr.
+        // Delegate to noinline helper (keeps large arrays off vmExec's frame).
         uint32_t operand = decodeOperand(CUR_INSTR);
         uint32_t nStatic  = operand >> 12;
         uint32_t nDynamic = operand & 0xFFF;
-        PosIdx pos = cu->posForOffset(ip - 1);
-
-        // Pop dynamic name+value pairs (reverse stack order).
-        constexpr uint32_t kMaxDyn = 32;
-        struct DynPair { Value * name; Value * val; };
-        DynPair dynStack[kMaxDyn];
-        DynPair * dynPairs = nDynamic <= kMaxDyn ? dynStack : new DynPair[nDynamic];
-        for (uint32_t i = nDynamic; i > 0; --i) {
-            dynPairs[i-1].val  = vm.pop();
-            dynPairs[i-1].name = vm.pop();
-        }
-
-        // Pop static values (reverse stack order).
-        constexpr uint32_t kMaxStatic = 64;
-        Value * staticStack[kMaxStatic];
-        Value ** staticVals = nStatic <= kMaxStatic ? staticStack : new Value*[nStatic];
-        for (uint32_t i = nStatic; i > 0; --i)
-            staticVals[i-1] = vm.pop();
-
-        // Build bindings with max capacity.
-        auto bindings = state.buildBindings(nStatic + nDynamic);
-
-        // Insert static attrs (already sorted from compiler).
-        for (uint32_t i = 0; i < nStatic; i++) {
-            uint32_t symIdx = decodeOperand(cu->code[ip++]);
-            uint32_t posIdx = decodeOperand(cu->code[ip++]);
-            Symbol name = cu->symbols[symIdx];
-            PosIdx attrPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
-            bindings.insert(name, staticVals[i], attrPos);
-        }
-
-        // Process dynamic attrs.
-        bool needsSort = false;
-        for (uint32_t i = 0; i < nDynamic; i++) {
-            uint32_t posIdx = decodeOperand(cu->code[ip++]);
-            PosIdx dynPos = posIdx < cu->posPool.size() ? cu->posPool[posIdx] : noPos;
-
-            state.forceValue(*dynPairs[i].name, dynPos);
-
-            // Null name → skip this attribute.
-            if (dynPairs[i].name->type() == nNull)
-                continue;
-
-            state.forceStringNoCtx(*dynPairs[i].name, dynPos,
-                "while evaluating the name of a dynamic attribute");
-            auto nameSym = state.symbols.create(dynPairs[i].name->string_view());
-
-            bindings.insert(nameSym, dynPairs[i].val, dynPos);
-            needsSort = true;
-        }
-
-        auto * result = state.allocValue();
-        result->mkAttrs(needsSort ? bindings.finish() : bindings.alreadySorted());
-
-        if (staticVals != staticStack) delete[] staticVals;
-        if (dynPairs != dynStack) delete[] dynPairs;
-
-        vm.push(result);
+        vm.push(vmAttrsDynInit(state, vm, cu, ip, nStatic, nDynamic));
         DISPATCH();
     }
 
