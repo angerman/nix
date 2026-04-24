@@ -427,6 +427,14 @@ void vmExec(
     // exhausted (as opposed to frames from an outer vmExec invocation).
     size_t entryFrameDepth = vm.frames.size();
 
+    // Recursion guard: detect runaway vmExec re-entry.
+    static thread_local uint32_t vmExecDepth = 0;
+    if (++vmExecDepth > 10000) {
+        fprintf(stderr, "FATAL: vmExec depth %u — infinite recursion\n", vmExecDepth);
+        abort();
+    }
+    struct DepthGuard { ~DepthGuard() { vmExecDepth--; } } depthGuard;
+
     // Allocate a result slot that the OP_RETURN will write into.
     Value * resultSlot = &result;
 
@@ -778,6 +786,12 @@ op_get_local_0_force:
                         thunkEnv->values[1]);
                 }
 
+                // Guard against infinite recursion from thunk copy chains.
+                if (vm.frames.size() > 16384) {
+                    state.error<EvalError>("infinite recursion encountered")
+                        .atPos(pos).debugThrow();
+                }
+
                 v->mkBlackhole();
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
@@ -869,23 +883,23 @@ op_get_with:
         auto * var = static_cast<ExprVar *>(cu->exprPool[exprIdx]);
 
         // Walk up the env chain to the first with-scope.
-        // Skip v2 carrier envs (sentinel values[0] == &Value::vNull)
-        // as they don't correspond to scopes that bindVars() counted.
+        // Skip non-with envs: v2 carrier envs (values[0] == &Value::vNull),
+        // tree-walker envs with NULL values[0], and any other env that
+        // doesn't have a valid with-scope attrs pointer.
+        auto isNonWithEnv = [](Env * env) {
+            return env && (!env->values[0] || env->values[0] == &Value::vNull);
+        };
         Env * e = curEnv;
         for (auto l = var->level; l; --l) {
             e = e->up;
-            while (e && e->values[0] == &Value::vNull)
+            while (isNonWithEnv(e))
                 e = e->up;
         }
 
         // Walk the with-chain looking for the variable.
         auto * fromWith = var->fromWith;
         while (true) {
-            // Skip v2 carrier envs.  Carrier envs (from
-            // OP_MAKE_CLOSURE_V2 / OP_MAKE_THUNK_V2) have
-            // values[0] = &Value::vNull as a sentinel.  They are
-            // NOT with scopes and must be transparently skipped.
-            while (e && e->values[0] == &Value::vNull)
+            while (isNonWithEnv(e))
                 e = e->up;
             assert(e && "OP_GET_WITH: ran off end of env chain");
 
@@ -903,7 +917,7 @@ op_get_with:
                     .debugThrow();
             for (size_t l = fromWith->prevWith; l; --l) {
                 e = e->up;
-                while (e && e->values[0] == &Value::vNull)
+                while (isNonWithEnv(e))
                     e = e->up;
             }
             fromWith = fromWith->parentWith;
@@ -2342,7 +2356,13 @@ op_get_stack_slot:
     {
         uint32_t slot = decodeOperand(CUR_INSTR);
         size_t base = vm.frames.back().stackBaseOffset;
-        vm.push(vm.stack[base + slot]);
+        Value * v = vm.stack[base + slot];
+        if (!v) [[unlikely]] {
+            fprintf(stderr, "FATAL: OP_GET_STACK_SLOT(%u) is NULL at base=%zu\n",
+                slot, base);
+            abort();
+        }
+        vm.push(v);
         DISPATCH();
     }
 
