@@ -465,6 +465,16 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             unit.emit(OP_HAS_ATTR, symIdx);
         }
 
+        // -- Has-attr (dynamic) --
+        else if constexpr (std::is_same_v<T, ir::IRHasAttrDynamic>) {
+            emitVarRef(e.attrs, pos, ctx);
+            unit.emitPos(pos);
+            unit.emit(OP_FORCE);
+            emitVarRef(e.nameVar, pos, ctx);
+            unit.emit(OP_FORCE);
+            unit.emit(OP_HAS_ATTR_DYN);
+        }
+
         // -- Static attribute set --
         else if constexpr (std::is_same_v<T, ir::IRAttrSet>) {
             // Push all attribute values, then OP_ATTRS_INIT.
@@ -754,15 +764,53 @@ void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
         return;
     }
 
+    // Check if this is an external variable (from baseEnv).
+    auto extIt = module.externalVars.find(var);
+    if (extIt != module.externalVars.end()) {
+        // External variable: load from the base env chain using v1 opcodes.
+        auto & ext = extIt->second;
+        uint32_t level = ext.level;
+        uint32_t displ = ext.displacement;
+        switch (level) {
+            case 0: unit.emit(OP_GET_LOCAL_0, displ); break;
+            case 1: unit.emit(OP_GET_LOCAL_1, displ); break;
+            case 2: unit.emit(OP_GET_LOCAL_2, displ); break;
+            case 3: unit.emit(OP_GET_LOCAL_3, displ); break;
+            default:
+                unit.emit(OP_GET_LOCAL, packLevelDispl(
+                    static_cast<uint8_t>(level), static_cast<uint16_t>(displ)));
+                break;
+        }
+        return;
+    }
+
     // The variable should always be found in one of the above maps.
     // If not, it's a bug in free variable analysis or slot allocation.
-    fprintf(stderr, "IREmitter::emitVarRef: VarId %u not found. Locals:", var);
-    for (auto & [v, s] : ctx.localSlots)
-        fprintf(stderr, " v%u=s%u", v, s);
-    fprintf(stderr, "  Upvalues:");
-    for (auto & [v, s] : ctx.upvalueSlots)
-        fprintf(stderr, " v%u=u%u", v, s);
-    fprintf(stderr, "  Pos: %s\n", state.positions[pos].c_str());
+    {
+        auto nameIt = module.varNames.find(var);
+        std::ostringstream oss;
+        oss << state.positions[pos];
+        fprintf(stderr, "IREmitter::emitVarRef: VarId %u", var);
+        if (nameIt != module.varNames.end())
+            fprintf(stderr, " (%s)", nameIt->second.c_str());
+        fprintf(stderr, " not found. Locals(%zu):", ctx.localSlots.size());
+        for (auto & [v, s] : ctx.localSlots) {
+            auto nit = module.varNames.find(v);
+            if (nit != module.varNames.end())
+                fprintf(stderr, " v%u(%s)=s%u", v, nit->second.c_str(), s);
+            else
+                fprintf(stderr, " v%u=s%u", v, s);
+        }
+        fprintf(stderr, "  Upvalues(%zu):", ctx.upvalueSlots.size());
+        for (auto & [v, s] : ctx.upvalueSlots) {
+            auto nit = module.varNames.find(v);
+            if (nit != module.varNames.end())
+                fprintf(stderr, " v%u(%s)=u%u", v, nit->second.c_str(), s);
+            else
+                fprintf(stderr, " v%u=u%u", v, s);
+        }
+        fprintf(stderr, "  Pos: %s\n", oss.str().c_str());
+    }
     assert(false && "IREmitter::emitVarRef: VarId not found in local or upvalue slots");
 }
 
@@ -958,9 +1006,38 @@ uint32_t IREmitter::emitSubBlockWithFormals(
             unit.emit(OP_COPY_TO_SLOT, formalSlot);
             uint32_t jumpPastDefault = unit.emit(OP_JUMP, 0);
 
-            // Attr missing: evaluate default.
+            // Attr missing: create a thunk for the default value.
+            //
+            // Defaults must be thunks, not eagerly evaluated, because
+            // formals are sorted alphabetically by Symbol (which depends
+            // on interning order, not source order).  A default may
+            // reference a sibling formal that sorts later and hasn't
+            // been unpacked yet.  Wrapping defaults as thunks matches
+            // tree-walker semantics: the default is only forced when
+            // the formal is actually used, at which point all
+            // argument-provided formals have been unpacked.
             unit.patchJump(jumpToDefault);
-            emitInlineBlock(formal.defaultBody, subCtx);
+            {
+                uint32_t bodyOffset = emitSubBlock(
+                    formal.defaultBody, formal.defaultFreeVars, subCtx);
+
+                uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
+                unit.thunks.push_back(ThunkDescriptor{
+                    .codeOffset = bodyOffset,
+                    .pos = formal.pos,
+                    .sourceExpr = nullptr,
+                    .nUpvalues = static_cast<uint16_t>(formal.defaultFreeVars.size()),
+                });
+
+                // Push captured upvalues.
+                for (auto freeVar : formal.defaultFreeVars.vars) {
+                    emitCapture(freeVar, formal.pos, subCtx);
+                }
+
+                unit.emitPos(formal.pos);
+                unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
+                unit.emit(OP_NOP, static_cast<uint32_t>(formal.defaultFreeVars.size()));
+            }
             unit.emit(OP_COPY_TO_SLOT, formalSlot);
 
             unit.patchJump(jumpPastDefault);

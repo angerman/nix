@@ -383,6 +383,7 @@ VarId Lowerer::lowerVar(ExprVar * e)
     // we gracefully handle it by treating it as an external reference
     // only when the level is >= currentLevel.
     VarId placeholder = module.freshVar();
+    module.varNames[placeholder] = state.symbols[e->name];
     // Record the mapping so subsequent references resolve consistently.
     bindVar(level, e->displ, placeholder);
 
@@ -455,16 +456,21 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
 
     for (size_t i = 0; i < attrPath.size(); ++i) {
         auto & an = attrPath[i];
-        if (an.expr) {
-            throw Error("IR lowering: dynamic attribute names in select-or not yet supported at %s",
-                state.positions[e->pos]);
-        }
 
-        // Emit: has-attr check
-        VarId hasIt = emit(IRHasAttr{
-            .attrs = current,
-            .name = an.symbol,
-        }, e->pos);
+        // Emit: has-attr check (static or dynamic).
+        VarId hasIt;
+        if (an.expr) {
+            VarId nameVar = lowerExpr(an.expr);
+            hasIt = emit(IRHasAttrDynamic{
+                .attrs = current,
+                .nameVar = nameVar,
+            }, e->pos);
+        } else {
+            hasIt = emit(IRHasAttr{
+                .attrs = current,
+                .name = an.symbol,
+            }, e->pos);
+        }
 
         if (i == attrPath.size() - 1) {
             // Last component: if has, select; else default.
@@ -476,10 +482,19 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
             {
                 auto saved = currentBlock;
                 currentBlock = thenBlk;
-                VarId selected = emit(IRAttrSelect{
-                    .attrs = current,
-                    .name = an.symbol,
-                }, e->pos);
+                VarId selected;
+                if (an.expr) {
+                    VarId nameVar2 = lowerExpr(an.expr);
+                    selected = emit(IRAttrSelectDynamic{
+                        .attrs = current,
+                        .nameVar = nameVar2,
+                    }, e->pos);
+                } else {
+                    selected = emit(IRAttrSelect{
+                        .attrs = current,
+                        .name = an.symbol,
+                    }, e->pos);
+                }
                 curBlock().terminal = TermReturn{.value = selected, .pos = e->pos};
                 currentBlock = saved;
             }
@@ -519,10 +534,19 @@ VarId Lowerer::lowerSelect(ExprSelect * e)
             {
                 (void) currentBlock;  // saved implicitly
                 currentBlock = thenBlk;
-                VarId selected = emit(IRAttrSelect{
-                    .attrs = current,
-                    .name = an.symbol,
-                }, e->pos);
+                VarId selected;
+                if (an.expr) {
+                    VarId nameVar2 = lowerExpr(an.expr);
+                    selected = emit(IRAttrSelectDynamic{
+                        .attrs = current,
+                        .nameVar = nameVar2,
+                    }, e->pos);
+                } else {
+                    selected = emit(IRAttrSelect{
+                        .attrs = current,
+                        .name = an.symbol,
+                    }, e->pos);
+                }
 
                 // Continue lowering remaining path in this block.
                 current = selected;
@@ -566,15 +590,20 @@ VarId Lowerer::lowerHasAttr(ExprOpHasAttr * e)
 
     for (size_t i = 0; i < e->attrPath.size(); ++i) {
         auto & an = e->attrPath[i];
-        if (an.expr) {
-            throw Error("IR lowering: dynamic attribute names in has-attr not yet supported at %s",
-                state.positions[e->getPos()]);
-        }
 
-        VarId hasIt = emit(IRHasAttr{
-            .attrs = current,
-            .name = an.symbol,
-        }, e->getPos());
+        VarId hasIt;
+        if (an.expr) {
+            VarId nameVar = lowerExpr(an.expr);
+            hasIt = emit(IRHasAttrDynamic{
+                .attrs = current,
+                .nameVar = nameVar,
+            }, e->getPos());
+        } else {
+            hasIt = emit(IRHasAttr{
+                .attrs = current,
+                .name = an.symbol,
+            }, e->getPos());
+        }
 
         if (i == e->attrPath.size() - 1) {
             // Last component: the result is the has-attr check.
@@ -583,10 +612,19 @@ VarId Lowerer::lowerHasAttr(ExprOpHasAttr * e)
             // Intermediate: AND with the next check.
             // Select the current attr to use as base for the next check.
             // Short-circuit: if !hasIt, result is false.
-            VarId selected = emit(IRAttrSelect{
-                .attrs = current,
-                .name = an.symbol,
-            }, e->getPos());
+            VarId selected;
+            if (an.expr) {
+                VarId nameVar2 = lowerExpr(an.expr);
+                selected = emit(IRAttrSelectDynamic{
+                    .attrs = current,
+                    .nameVar = nameVar2,
+                }, e->getPos());
+            } else {
+                selected = emit(IRAttrSelect{
+                    .attrs = current,
+                    .name = an.symbol,
+                }, e->getPos());
+            }
             current = selected;
 
             // Combine with AND (short-circuit false if missing).
@@ -632,6 +670,7 @@ VarId Lowerer::lowerAttrs(ExprAttrs * e)
             uint32_t displ = 0;
             for (auto & [name, def] : *e->attrs) {
                 VarId av = module.freshVar();
+                module.varNames[av] = "rec:" + state.symbols[name];
                 bindVar(0, displ, av);
                 attrVars.push_back({name, av});
                 displ++;
@@ -860,33 +899,68 @@ VarId Lowerer::lowerLambda(ExprLambda * e)
         // If there's a whole-argument binding (`x@{...}`), bind it.
         if (e->arg) {
             VarId argVar = module.freshVar();
+            module.varNames[argVar] = "@:" + state.symbols[e->arg];
             bindVar(0, displ, argVar);
             curBlock().params.push_back(argVar);
             displ++;
         }
 
+        // Two-pass approach for formals (mirrors lowerLet):
+        //   Pass 1: bind ALL formal VarIds so they're visible in the
+        //           envMap.  Default expressions may reference sibling
+        //           formals (e.g., `{ a, b ? a }: ...`), and the AST
+        //           sorts formals alphabetically, so a later formal
+        //           may be referenced by an earlier formal's default.
+        //   Pass 2: lower default expressions, which can now look up
+        //           any formal in the envMap.
+        std::vector<VarId> formalVarIds;
+        formalVarIds.reserve(formals->formals.size());
         for (auto & f : formals->formals) {
             VarId fVar = module.freshVar();
+            module.varNames[fVar] = "formal:" + state.symbols[f.name];
             bindVar(0, displ, fVar);
             curBlock().params.push_back(fVar);
+            formalVarIds.push_back(fVar);
+            displ++;
+        }
 
+        // Pass 2: lower default expressions now that all formals are bound.
+        //
+        // Default blocks are emitted as thunks (not inline), so the
+        // thunk body must fully evaluate the result.  In particular,
+        // if the default is a variable reference to a sibling formal,
+        // the reference must be forced (matching ExprVar::eval, which
+        // always forces).  Without this force, the thunk would return
+        // a raw thunk/value from the sibling's slot without resolving
+        // thunk chains.
+        for (size_t i = 0; i < formals->formals.size(); ++i) {
+            auto & f = formals->formals[i];
             BlockId defBlock = kInvalidBlock;
             if (f.def) {
-                // Lower default into a sub-block.
-                defBlock = lowerIntoBlock(f.def, f.pos);
-            }
+                BlockId blk = module.freshBlock(f.pos);
+                auto savedBlock = currentBlock;
+                currentBlock = blk;
 
+                VarId result = lowerExpr(f.def);
+                // Wrap the result in a force so the thunk body fully
+                // evaluates the default expression (resolves thunk chains).
+                VarId forced = emit(IRForce{.thunk = result}, f.pos);
+                curBlock().terminal = TermReturn{.value = forced, .pos = f.pos};
+
+                currentBlock = savedBlock;
+                defBlock = blk;
+            }
             params.formals.push_back(IRFormal{
                 .name = f.name,
                 .defaultBody = defBlock,
                 .pos = f.pos,
             });
-            displ++;
         }
     } else {
         // Simple lambda: `x: body`
         if (e->arg) {
             VarId argVar = module.freshVar();
+            module.varNames[argVar] = "arg:" + state.symbols[e->arg];
             bindVar(0, 0, argVar);
             curBlock().params.push_back(argVar);
         }
@@ -979,8 +1053,9 @@ VarId Lowerer::lowerLet(ExprLet * e)
     if (attrs->attrs) {
         uint32_t displ = 0;
         // Pass 1: assign VarIds so all names are in scope.
-        for ([[maybe_unused]] auto & [name, def] : *attrs->attrs) {
+        for (auto & [name, def] : *attrs->attrs) {
             VarId v = module.freshVar();
+            module.varNames[v] = "let:" + state.symbols[name];
             bindVar(0, displ, v);
             displ++;
         }
@@ -1295,6 +1370,10 @@ void collectRefs(const IRExpr & expr, FreeVars & refs)
         else if constexpr (std::is_same_v<T, IRHasAttr>) {
             refs.insert(e.attrs);
         }
+        else if constexpr (std::is_same_v<T, IRHasAttrDynamic>) {
+            refs.insert(e.attrs);
+            refs.insert(e.nameVar);
+        }
         else if constexpr (std::is_same_v<T, IRAttrSet>) {
             for (auto & entry : e.entries)
                 refs.insert(entry.value);
@@ -1400,7 +1479,8 @@ void collectTerminalRefs(const Terminal & term, FreeVars & refs)
 /// defined by any binding within it (and not in its params).
 FreeVars blockFreeVars(
     const IRBlock & block,
-    const std::unordered_map<BlockId, FreeVars> & subBlockFreeVars)
+    const std::unordered_map<BlockId, FreeVars> & subBlockFreeVars,
+    const std::vector<IRBlock> & allBlocks)
 {
     // Start with all VarIds defined by params.
     FreeVars defined;
@@ -1420,8 +1500,38 @@ FreeVars blockFreeVars(
         // the enclosing scope).
         std::visit([&](const auto & e) {
             using T = std::decay_t<decltype(e)>;
-            if constexpr (std::is_same_v<T, IRLambda>
-                       || std::is_same_v<T, IRMkThunk>) {
+            if constexpr (std::is_same_v<T, IRLambda>) {
+                auto it = subBlockFreeVars.find(e.bodyBlock);
+                if (it != subBlockFreeVars.end())
+                    exprRefs.merge(it->second);
+
+                // Default-value blocks execute inline in the lambda
+                // frame, but any external variables they reference
+                // must be available in the lambda's enclosing scope
+                // (so the enclosing thunk/lambda captures them).
+                //
+                // Subtract the lambda body's params + bindings first:
+                // references to sibling formals are lambda-internal
+                // and don't need to be captured by the enclosing scope.
+                FreeVars bodyDefined;
+                const auto & bodyBlock = allBlocks[e.bodyBlock];
+                for (auto p : bodyBlock.params)
+                    bodyDefined.insert(p);
+                for (auto & b : bodyBlock.bindings)
+                    bodyDefined.insert(b.result);
+
+                for (auto & f : e.params.formals) {
+                    if (f.defaultBody != kInvalidBlock) {
+                        auto dit = subBlockFreeVars.find(f.defaultBody);
+                        if (dit != subBlockFreeVars.end()) {
+                            FreeVars external = dit->second;
+                            external.subtract(bodyDefined);
+                            exprRefs.merge(external);
+                        }
+                    }
+                }
+            }
+            else if constexpr (std::is_same_v<T, IRMkThunk>) {
                 auto it = subBlockFreeVars.find(e.bodyBlock);
                 if (it != subBlockFreeVars.end())
                     exprRefs.merge(it->second);
@@ -1531,7 +1641,7 @@ void computeFreeVars(IRModule & module)
         queue.pop_back();
 
         auto & block = module.blocks[bid];
-        blockFrees[bid] = blockFreeVars(block, blockFrees);
+        blockFrees[bid] = blockFreeVars(block, blockFrees, module.blocks);
 
         // Notify parents.
         auto pit = childToParent.find(bid);
@@ -1544,6 +1654,12 @@ void computeFreeVars(IRModule & module)
     }
 
     // Write computed free vars back onto Lambda and MkThunk nodes.
+    //
+    // For lambdas with formals that have default-value blocks, we must
+    // also merge the default blocks' free vars into the lambda's freeVars.
+    // Default blocks execute inline in the lambda frame (via emitInlineBlock
+    // in emitSubBlockWithFormals), so any variable they reference must be
+    // available as an upvalue of the lambda closure.
     for (auto & block : module.blocks) {
         for (auto & binding : block.bindings) {
             std::visit([&](auto & e) {
@@ -1552,6 +1668,45 @@ void computeFreeVars(IRModule & module)
                     auto it = blockFrees.find(e.bodyBlock);
                     if (it != blockFrees.end())
                         e.freeVars = it->second;
+
+                    // Merge free vars from default-value blocks.
+                    //
+                    // Default blocks execute inline in the lambda frame
+                    // (via emitInlineBlock in emitSubBlockWithFormals).
+                    // Any variable they reference that isn't a param or
+                    // binding of the lambda body must be captured as an
+                    // upvalue of the lambda closure.
+                    //
+                    // However, references to other formals (e.g.,
+                    //   `{ a, b ? a }: ...`
+                    // where b's default references a) are lambda-body
+                    // params and must NOT be added to the lambda's
+                    // upvalue capture set.
+                    {
+                        auto & bodyBlock = module.blocks[e.bodyBlock];
+                        FreeVars bodyDefined;
+                        for (auto p : bodyBlock.params)
+                            bodyDefined.insert(p);
+                        for (auto & b : bodyBlock.bindings)
+                            bodyDefined.insert(b.result);
+
+                        for (auto & f : e.params.formals) {
+                            if (f.defaultBody != kInvalidBlock) {
+                                auto dit = blockFrees.find(f.defaultBody);
+                                if (dit != blockFrees.end()) {
+                                    // Store the default block's full free vars
+                                    // on the formal for thunk emission.
+                                    f.defaultFreeVars = dit->second;
+
+                                    // Take only the vars that are NOT
+                                    // defined by the lambda body itself.
+                                    FreeVars external = dit->second;
+                                    external.subtract(bodyDefined);
+                                    e.freeVars.merge(external);
+                                }
+                            }
+                        }
+                    }
                 }
                 else if constexpr (std::is_same_v<T, IRMkThunk>) {
                     auto it = blockFrees.find(e.bodyBlock);

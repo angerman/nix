@@ -110,9 +110,13 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForThunk(env, expr, v, pos);
             throw;
         }
-        /* Detect thunk chains: a forced thunk that resolved to another thunk. */
-        if (v.isThunk() || v.isApp())
+        /* Resolve thunk chains: a forced thunk may evaluate to another
+           thunk (e.g., a v2 IR variable reference that returned another
+           thunk without forcing it).  Loop until fully resolved. */
+        while (v.isThunk() || v.isApp()) {
             nrThunkChains++;
+            forceValue(v, pos);
+        }
     } else if (v.isApp()) {
         nrThunksForced++;
         // Extract left/right BEFORE marking blackhole (mkBlackhole
@@ -133,8 +137,10 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
-        if (v.isThunk() || v.isApp())
+        while (v.isThunk() || v.isApp()) {
             nrThunkChains++;
+            forceValue(v, pos);
+        }
     } else if (v.isFailed()) {
         handleEvalFailed(v, pos);
     }

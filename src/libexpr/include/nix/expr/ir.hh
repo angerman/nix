@@ -116,6 +116,7 @@ struct IRFormal
     Symbol name;                        ///< Parameter name.
     BlockId defaultBody = kInvalidBlock; ///< Block for default value, or kInvalidBlock if required.
     PosIdx pos;                         ///< Source position of this formal.
+    FreeVars defaultFreeVars;           ///< Free vars of the default block (populated by computeFreeVars).
 };
 
 /// Desugared lambda parameter specification.
@@ -242,6 +243,13 @@ struct IRHasAttr
 {
     VarId attrs;
     Symbol name;
+};
+
+/// Check whether an attribute exists using a dynamically-computed name.
+struct IRHasAttrDynamic
+{
+    VarId attrs;
+    VarId nameVar;   ///< VarId that evaluates to the attribute name string.
 };
 
 /// Construct a non-recursive attribute set from sorted (name, value) pairs.
@@ -447,6 +455,7 @@ using IRExpr = std::variant<
     IRAttrSelect,
     IRAttrSelectDynamic,
     IRHasAttr,
+    IRHasAttrDynamic,
     IRAttrSet,
     IRAttrSetDynamic,
     IRRecAttrSet,
@@ -610,6 +619,9 @@ struct IRModule
     /// The bytecode emitter uses this to emit OP_GET_LOCAL instructions
     /// for entry-block free variables that aren't defined in any IR block.
     std::unordered_map<VarId, ExternalVarRef> externalVars;
+
+    /// Debug: map from VarId to human-readable name (populated during lowering).
+    std::unordered_map<VarId, std::string> varNames;
 
     /// Allocate a fresh VarId.
     VarId freshVar() { return nextVar++; }

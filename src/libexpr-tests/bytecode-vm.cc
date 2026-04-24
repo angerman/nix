@@ -1288,6 +1288,24 @@ TEST_F(IREmitTest, ir_emit_formals_ellipsis) {
     assertIREmitMatch("let f = { x, ... }: x; in f { x = 1; y = 2; z = 3; }");
 }
 
+TEST_F(IREmitTest, ir_emit_formals_cross_reference_default) {
+    // A formal's default references a LATER formal (alphabetically sorted).
+    // This tests the two-pass binding approach in lowerLambda.
+    assertIREmitMatch("let f = { b ? a, a }: a + b; in f { a = 10; }");
+}
+
+TEST_F(IREmitTest, ir_emit_formals_cross_reference_default_select) {
+    // system's default references localSystem (a sibling formal).
+    // Mirrors nixpkgs impure.nix pattern.
+    assertIREmitMatch("let f = { localSystem ? { system = \"x86_64-linux\"; }, system ? localSystem.system }: system; in f { }");
+}
+
+TEST_F(IREmitTest, ir_emit_formals_cross_reference_outer_scope) {
+    // A formal's default references a let-bound variable from the outer scope
+    // AND a sibling formal.
+    assertIREmitMatch("let x = 5; f = { a ? x, b ? a + x }: a + b; in f { }");
+}
+
 // -- String interpolation --
 
 TEST_F(IREmitTest, ir_emit_string_interpolation) {
