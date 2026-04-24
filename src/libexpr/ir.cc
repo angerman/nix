@@ -1286,15 +1286,17 @@ BlockId Lowerer::lowerIntoBlock(Expr * expr, PosIdx pos)
 VarId Lowerer::lowerAsThunkOrEager(Expr * expr, PosIdx pos)
 {
     // Mirror the AST's maybeThunk() logic: trivial expressions (literals,
-    // variables) are lowered eagerly.  Non-trivial ones get wrapped in
-    // a thunk (IRMkThunk) for lazy evaluation.
+    // variables, lambdas) are lowered eagerly.  Non-trivial ones get
+    // wrapped in a thunk (IRMkThunk) for lazy evaluation.
     //
-    // Trivial: ExprInt, ExprFloat, ExprString, ExprPath, ExprVar (non-with).
+    // Trivial: ExprInt, ExprFloat, ExprString, ExprPath, ExprVar (non-with),
+    //          ExprLambda (lambdas are values, not computations).
 
     if (dynamic_cast<ExprInt *>(expr)
         || dynamic_cast<ExprFloat *>(expr)
         || dynamic_cast<ExprString *>(expr)
-        || dynamic_cast<ExprPath *>(expr))
+        || dynamic_cast<ExprPath *>(expr)
+        || dynamic_cast<ExprLambda *>(expr))
     {
         return lowerExpr(expr);
     }
@@ -1311,6 +1313,7 @@ VarId Lowerer::lowerAsThunkOrEager(Expr * expr, PosIdx pos)
         .freeVars = {},   // Populated by computeFreeVars().
         .bodyBlock = bodyBlk,
         .pos = pos,
+        .sourceExpr = expr,  // For isTrivial() compat (flake.cc checks).
     }, pos);
 }
 

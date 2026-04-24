@@ -221,6 +221,7 @@ struct IRMkThunk
     FreeVars freeVars;                   ///< Captured variables.
     BlockId bodyBlock;                   ///< Block containing the thunk body.
     PosIdx pos;                          ///< Source position (for error reporting).
+    Expr * sourceExpr = nullptr;         ///< Original AST expr (for isTrivial() compat).
 };
 
 /// Select a static attribute from an attrset: `attrs.name`.

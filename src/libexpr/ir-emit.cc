@@ -439,7 +439,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             unit.thunks.push_back(ThunkDescriptor{
                 .codeOffset = bodyOffset,
                 .pos = e.pos,
-                .sourceExpr = nullptr,
+                .sourceExpr = e.sourceExpr,
                 .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
             });
 
