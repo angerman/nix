@@ -618,7 +618,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             emitVarRef(e.cond, pos, ctx);
             unit.emitPos(pos);
             unit.emit(OP_ASSERT);
-            emitVarRef(e.body, pos, ctx);
+            emitInlineBlock(e.bodyBlock, ctx);
         }
 
         // -- Logical not --

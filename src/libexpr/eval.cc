@@ -1654,9 +1654,13 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                         vCur.lambda().env->values[0]);
                 }
 
+                // Use a separate result value — don't write into vCur
+                // directly, as vCur may be needed for multi-arg chains.
+                Value callResult;
                 bytecode::vmExec(*this, bodyUnit, startOffset,
                     vCur.lambda().env ? *vCur.lambda().env : baseEnv,
-                    vCur, upvalues, args[0]);
+                    callResult, upvalues, args[0]);
+                vCur = callResult;
 
                 args = args.subspan(1);
                 continue;

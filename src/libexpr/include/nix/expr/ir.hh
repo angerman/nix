@@ -379,10 +379,13 @@ struct IRConcatStrings
 
 /// Assertion: evaluate `cond`; if false, throw an error at `pos`.
 /// The result of the assertion expression is `body`.
+/// Assert: check condition, then evaluate body block.
+/// Body is a separate block to prevent condition-side inline blocks
+/// from interfering with body evaluation.
 struct IRAssert
 {
     VarId cond;
-    VarId body;
+    BlockId bodyBlock;
 };
 
 /// Boolean negation.

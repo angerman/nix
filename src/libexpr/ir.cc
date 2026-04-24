@@ -1202,11 +1202,22 @@ VarId Lowerer::lowerIf(ExprIf * e)
 
 VarId Lowerer::lowerAssert(ExprAssert * e)
 {
+    // The condition and body must be in SEPARATE evaluation contexts.
+    // If both are in the same block, the body's bindings are created
+    // eagerly alongside the condition's bindings.  Inline blocks
+    // emitted during condition evaluation (e.g., select-or branches)
+    // can allocate stack slots in the shared parent context.  When
+    // the body reads a variable (e.g., a recursive let binding), it
+    // may get a stale or wrong value because the condition's inline
+    // blocks shifted stack positions.
+    //
+    // Fix: lower the body into a separate inline block that's only
+    // emitted after OP_ASSERT passes.
     VarId cond = lowerExpr(e->cond);
-    VarId body = lowerExpr(e->body);
+    BlockId bodyBlk = lowerIntoBlock(e->body, e->pos);
     return emit(IRAssert{
         .cond = cond,
-        .body = body,
+        .bodyBlock = bodyBlk,
     }, e->pos);
 }
 
@@ -1441,7 +1452,7 @@ void collectRefs(const IRExpr & expr, FreeVars & refs)
         }
         else if constexpr (std::is_same_v<T, IRAssert>) {
             refs.insert(e.cond);
-            refs.insert(e.body);
+            // bodyBlock's free vars are handled via subBlockFreeVars.
         }
         else if constexpr (std::is_same_v<T, IRNot>) {
             refs.insert(e.operand);
@@ -1583,6 +1594,11 @@ FreeVars blockFreeVars(
                 if (it != subBlockFreeVars.end())
                     exprRefs.merge(it->second);
             }
+            else if constexpr (std::is_same_v<T, IRAssert>) {
+                auto it = subBlockFreeVars.find(e.bodyBlock);
+                if (it != subBlockFreeVars.end())
+                    exprRefs.merge(it->second);
+            }
         }, binding.expr);
 
         allRefs.merge(exprRefs);
@@ -1639,6 +1655,10 @@ void buildBlockDeps(
                     childToParent[e.rhsBlock].push_back(block.id);
                 }
                 else if constexpr (std::is_same_v<T, IRWith>) {
+                    parentToChildren[block.id].push_back(e.bodyBlock);
+                    childToParent[e.bodyBlock].push_back(block.id);
+                }
+                else if constexpr (std::is_same_v<T, IRAssert>) {
                     parentToChildren[block.id].push_back(e.bodyBlock);
                     childToParent[e.bodyBlock].push_back(block.id);
                 }
