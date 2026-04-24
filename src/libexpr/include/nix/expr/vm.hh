@@ -71,6 +71,17 @@ struct VMState
     [[gnu::always_inline]]
     void push(Value * v)
     {
+        if (!v) [[unlikely]] {
+            if (!frames.empty()) {
+                auto & f = frames.back();
+                if (f.unit && f.ip > 0) {
+                    uint32_t instr = f.unit->code[f.ip - 1];
+                    fprintf(stderr, "VMState::push(NULL): opcode=0x%02x op=%u ip=%u\n",
+                        instr & 0xFF, instr >> 8, f.ip);
+                }
+            }
+            abort();
+        }
         if (sp >= stackEnd) [[unlikely]]
             grow();
         *sp++ = v;
