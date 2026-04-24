@@ -29,6 +29,40 @@ namespace bytecode {
 /// The VM maintains an explicit stack of these to implement trampolining:
 /// bytecoded-to-bytecoded calls push a CallFrame and jump rather than
 /// recursing on the C stack.
+/// Tag for continuation frame types (VM-native primop loops).
+enum class ContKind : uint8_t {
+    None = 0,       ///< Normal bytecode frame (not a continuation).
+    Map,            ///< builtins.map: iterating over list elements.
+    Filter,         ///< builtins.filter: iterating + collecting matches.
+    AllAny,         ///< builtins.all / builtins.any: iterating + short-circuit.
+    FoldlStrict,    ///< builtins.foldl': accumulator fold.
+    Sort,           ///< builtins.sort: comparison-based sort.
+    MapAttrs,       ///< builtins.mapAttrs: iterating over attrset entries.
+    GenList,        ///< builtins.genList: generating list by index.
+};
+
+/// Continuation state for VM-native primop loops.
+/// When a primop calls a v2 closure in a loop, it pushes a continuation
+/// frame that tracks the loop progress.  After each closure call returns
+/// (OP_RETURN), the dispatch loop checks the parent frame for a
+/// continuation and advances the loop instead of returning to bytecode.
+struct ContState
+{
+    ContKind kind = ContKind::None;
+    uint32_t index = 0;      ///< Current iteration index.
+    uint32_t count = 0;      ///< Total elements.
+    Value * func = nullptr;   ///< The closure being applied.
+    Value * list = nullptr;   ///< The input list (or attrset).
+    Value ** results = nullptr; ///< GC-traced result array.
+    // For filter:
+    Value ** inputElems = nullptr; ///< Pointer to input list's elems.
+    uint32_t nResults = 0;   ///< Number of results collected.
+    // For foldl':
+    Value * accumulator = nullptr;
+    // For all/any:
+    bool isAll = true;
+};
+
 struct CallFrame
 {
     const CompilationUnit * unit; ///< The compilation unit being executed.
@@ -40,9 +74,10 @@ struct CallFrame
     bool isThunkForce = false;    ///< If true, OP_RETURN doesn't push result (thunk was updated in-place).
 
     /// Upvalue array for v2 closures/thunks.  nullptr for v1 frames.
-    /// Points to a GC-allocated flat array of Value* pointers,
-    /// indexed by OP_GET_UPVALUE's operand.
     Value ** upvalues = nullptr;
+
+    /// Continuation state for VM-native primop loops.
+    ContState cont;
 };
 
 /// Initial capacity of the value stack (in Value* slots).
