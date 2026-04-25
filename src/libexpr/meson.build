@@ -163,6 +163,7 @@ sources = files(
   'bytecode-thunk.cc',
   'ir.cc',
   'ir-emit.cc',
+  'ir-strictness.cc',
   'vm.cc',
   'diagnose.cc',
   'eval-cache.cc',

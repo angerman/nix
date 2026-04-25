@@ -695,4 +695,27 @@ IRModule lower(EvalState & state, Expr * expr);
 void computeFreeVars(IRModule & module);
 
 
+// ============================================================================
+// Strictness analysis & thunk elimination
+// ============================================================================
+
+/// Eliminate IRMkThunk wrappers whose result is statically known to be
+/// forced before the surrounding block ends.  Replaces the thunk with
+/// its inlined body expression when the body is a single trivial
+/// binding (literal, var ref, attribute select, primop call, etc.).
+///
+/// Must run AFTER computeFreeVars so the per-thunk freeVars list is
+/// available; recomputation is performed at the end of the pass since
+/// inlined bindings change which variables are referenced where.
+///
+/// Saves:
+///   - One Value allocation per eliminated thunk.
+///   - One MAKE_THUNK_V2 dispatch.
+///   - One thunk force dispatch (the consumer's IRForce now sees a
+///     direct value).
+///
+/// Returns the number of thunks eliminated.
+size_t runStrictnessPass(IRModule & module);
+
+
 } // namespace nix::ir

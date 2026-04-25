@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1408,6 +1409,16 @@ IRModule lower(EvalState & state, Expr * expr)
 
     // Compute free variable sets for all Lambda and MkThunk nodes.
     computeFreeVars(module);
+
+    // Optimization pass: eliminate IRMkThunk wrappers whose result is
+    // statically guaranteed to be forced (or whose body is trivially
+    // cheap to evaluate eagerly).  Opt-in via NIX_VM_STRICTNESS=1 — on
+    // simple nixpkgs#hello.name evaluation the pass's compile-time cost
+    // currently exceeds the runtime savings from eliminating ~15% of
+    // thunks.  Useful for workloads with heavy let-binding chains and
+    // worth keeping on hand for further development.
+    if (getenv("NIX_VM_STRICTNESS"))
+        runStrictnessPass(module);
 
     return module;
 }
