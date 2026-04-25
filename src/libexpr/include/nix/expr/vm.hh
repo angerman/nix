@@ -78,6 +78,15 @@ struct CallFrame
 
     /// Continuation state for VM-native primop loops.
     ContState cont;
+
+    /// Register-form call result destination.
+    /// When set (non-zero), OP_RETURN writes the retVal POINTER directly
+    /// to vm.stack[stackBaseOffset_of_parent + (resultStoreSlot - 1)]
+    /// instead of struct-copying to resultSlot and pushing onto operand
+    /// stack.  Used by OP_RCALL1_R for direct slot-to-slot calls.
+    /// Encoded as slot+1 so 0 = "use existing mechanism".
+    uint32_t resultStoreSlot = 0;
+    size_t resultStoreParentBase = 0;  ///< Parent frame's stackBaseOffset.
 };
 
 /// Initial capacity of the value stack (in Value* slots).

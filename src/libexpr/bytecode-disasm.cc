@@ -98,6 +98,27 @@ const char * opName(uint8_t op)
         case OP_SET_STACK_SLOT:   return "SET_STACK_SLOT";
         case OP_ALLOC_VALUE:      return "ALLOC_VALUE";
         case OP_COPY_TO_SLOT:     return "COPY_TO_SLOT";
+        case OP_GET_SLOT_FORCE:   return "GET_SLOT_FORCE";
+        case OP_GET_SLOT_RETURN:  return "GET_SLOT_RETURN";
+        case OP_GET_UV_FORCE:     return "GET_UV_FORCE";
+        case OP_SLOT_SLOT_CALL1:  return "SLOT_SLOT_CALL1";
+        case OP_ATTR_SELECT_CACHED:       return "ATTR_SELECT_CACHED";
+        case OP_ATTR_SELECT_FORCE_CACHED: return "ATTR_SELECT_FORCE_CACHED";
+        case OP_MOV_SLOTS:        return "MOV_SLOTS";
+        case OP_RFORCE_FROM:      return "RFORCE_FROM";
+        case OP_RGET_UV_TO:       return "RGET_UV_TO";
+        case OP_RUVF_TO:          return "RUVF_TO";
+        case OP_RADD_R:           return "RADD_R";
+        case OP_RSUB_R:           return "RSUB_R";
+        case OP_RMUL_R:           return "RMUL_R";
+        case OP_RLESS_R:          return "RLESS_R";
+        case OP_REQ_R:            return "REQ_R";
+        case OP_RATTR_SELF_R:     return "RATTR_SELF_R";
+        case OP_RCALL1_R:         return "RCALL1_R";
+        case OP_CALL_PRIMOP:      return "CALL_PRIMOP";
+        case OP_CELL_GET:         return "CELL_GET";
+        case OP_CELL_SET:         return "CELL_SET";
+        case OP_ALLOC_CELL:       return "ALLOC_CELL";
         default:                  return "???";
     }
 }

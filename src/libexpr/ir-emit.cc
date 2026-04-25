@@ -437,6 +437,37 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
                     }
                 }
             }
+
+            // -- Pattern: register-form function call (RCALL1_R) --
+            // For IRApp where both func and arg are local slots, emit
+            // OP_RCALL1_R + OP_SET_STACK_SLOT.  The handler's v2 fast path
+            // writes the result directly to dst slot and advances IP past
+            // the SET_STACK_SLOT (no operand-stack round trip).  The slow
+            // path delegates to OP_CALL_1 which pushes the result, and
+            // the SET_STACK_SLOT pops and stores normally.  This way the
+            // optimization is applied opportunistically without losing
+            // correctness for non-v2-closure callees (functors, primops,
+            // env-chain lambdas).
+            if (auto * app = std::get_if<ir::IRApp>(&binding.expr)) {
+                auto funcIt = ctx.localSlots.find(app->func);
+                auto argIt = ctx.localSlots.find(app->arg);
+                if (funcIt != ctx.localSlots.end()
+                    && argIt != ctx.localSlots.end()
+                    && funcIt->second <= 0xFF
+                    && argIt->second <= 0xFF) {
+                    uint32_t dstSlot = ctx.allocSlot(binding.result);
+                    if (dstSlot <= 0xFF) {
+                        unit.emitPos(binding.pos);
+                        unit.emit(OP_RCALL1_R, bytecode::packABC(
+                            static_cast<uint8_t>(dstSlot),
+                            static_cast<uint8_t>(funcIt->second),
+                            static_cast<uint8_t>(argIt->second)));
+                        // Slow path falls through to this; fast path skips it.
+                        unit.emit(OP_SET_STACK_SLOT, dstSlot);
+                        continue;
+                    }
+                }
+            }
         }
 
         emitExpr(binding.expr, binding.pos, ctx);

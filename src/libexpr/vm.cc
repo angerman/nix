@@ -777,6 +777,7 @@ void vmExec(
         REGISTER_OP(OP_RLESS_R, op_rless_r);
         REGISTER_OP(OP_REQ_R, op_req_r);
         REGISTER_OP(OP_RATTR_SELF_R, op_rattr_self_r);
+        REGISTER_OP(OP_RCALL1_R, op_rcall1_r);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -929,6 +930,8 @@ op_return:
         bool wasThunkForce = frame.isThunkForce;
         Value * resultSlot = frame.resultSlot;
         size_t stackBase = frame.stackBaseOffset;
+        uint32_t resultStoreSlot = frame.resultStoreSlot;
+        size_t resultStoreParentBase = frame.resultStoreParentBase;
 
         // Materialize tagged immediates before writing to resultSlot
         // (which is a real heap-allocated Value).
@@ -1021,7 +1024,14 @@ op_return:
             }
         }
 
-        if (!wasThunkForce) {
+        // Register-form caller (OP_RCALL1_R): write the resultSlot
+        // POINTER directly to the parent frame's stack slot, skipping
+        // the operand-stack push.  This preserves any in-place updates
+        // (mkBlackhole→value transitions) while delivering the result
+        // straight into the destination register.
+        if (resultStoreSlot > 0) {
+            vm.stack[resultStoreParentBase + (resultStoreSlot - 1)] = resultSlot;
+        } else if (!wasThunkForce) {
             vm.push(resultSlot);
         }
         DISPATCH();
@@ -3640,6 +3650,94 @@ op_req_r:
         else eq = state.eqValues(*lhs, *rhs, pos, "while comparing two values");
         vm.stack[base + dstSlot] = eq ? &Value::vTrue : &Value::vFalse;
         DISPATCH();
+    }
+
+    // OP_RCALL1_R: dst = call(*funcSlot, *argSlot).
+    // Encoding: [dst:8|funcSlot:8|argSlot:8].  Always emitted by ir-emit
+    // followed by OP_SET_STACK_SLOT(dstSlot).
+    //
+    // Fast path (v2 closure): set up call frame with resultStoreSlot, the
+    // body's OP_RETURN writes the result POINTER directly to the dst slot
+    // and skips the trailing SET_STACK_SLOT (parent.ip = ip + 1).
+    //
+    // Slow path: push fun and arg onto operand stack and fall through to
+    // op_call_1.  op_call_1's full dispatch (functor, primop, env-chain
+    // lambda) handles all callable kinds and pushes the final result onto
+    // the operand stack.  The trailing OP_SET_STACK_SLOT then pops and
+    // stores normally.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rcall1_r:
+#else
+    case OP_RCALL1_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t dstSlot = bytecode::unpackDst(operand);
+        uint8_t funcSlot = bytecode::unpackA(operand);
+        uint8_t argSlot = bytecode::unpackB(operand);
+        size_t base = vm.frames.back().stackBaseOffset;
+
+        Value * fun = vm.stack[base + funcSlot];
+        Value * arg = vm.stack[base + argSlot];
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        fun = materializeWord(state, fun);
+        if (fun->isThunk() || fun->isApp()) [[unlikely]]
+            state.forceValue(*fun, pos);
+
+        // ── Fast path: v2 closure ──
+        if (fun->isLambda() && fun->lambda().fun->isBytecodeProxy) {
+            arg = materializeWord(state, arg);
+            vm.nrBytecodeCallTrampoline++;
+            auto * bcLambda = static_cast<ExprLambdaBytecode *>(fun->lambda().fun);
+            auto & bodyUnit = *bcLambda->unit;
+            auto & desc = bodyUnit.lambdas[bcLambda->lambdaIdx];
+            auto & thunkDesc = bodyUnit.thunks[desc.bodyThunkIdx];
+            uint32_t startOffset = thunkDesc.codeOffset;
+            Value ** frameUpvalues = nullptr;
+            if (desc.nUpvalues > 0 && fun->lambda().env)
+                frameUpvalues = reinterpret_cast<Value **>(fun->lambda().env->values[1]);
+
+            // Pre-extend parent stack so dst slot exists when OP_RETURN
+            // writes into it.
+            size_t needed = base + dstSlot + 1;
+            while (vm.stackSize() < needed)
+                vm.push(const_cast<Value *>(&Value::vNull));
+
+            // Save parent frame; advance IP past the trailing
+            // OP_SET_STACK_SLOT (already-handled by resultStoreSlot).
+            vm.frames.back().ip = ip + 1;
+            vm.frames.back().env = curEnv;
+            if (vm.frames.size() > 65536) [[unlikely]]
+                state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
+
+            CallFrame newFrame{};
+            newFrame.unit = &bodyUnit;
+            newFrame.ip = startOffset;
+            newFrame.env = fun->lambda().env;
+            newFrame.stackBaseOffset = vm.stackSize();
+            newFrame.resultSlot = state.allocValue();
+            newFrame.callPos = pos;
+            newFrame.upvalues = frameUpvalues;
+            newFrame.resultStoreSlot = static_cast<uint32_t>(dstSlot) + 1;
+            newFrame.resultStoreParentBase = base;
+            vm.frames.push_back(newFrame);
+
+            vm.push(arg);
+            cu = &bodyUnit;
+            ip = startOffset;
+            curEnv = fun->lambda().env;
+            DISPATCH();
+        }
+
+        // ── Slow path: delegate to op_call_1 ──
+        // Push fun and arg onto the operand stack and let op_call_1
+        // perform the full dispatch (primop, primopApp, functor,
+        // env-chain lambda).  The trailing OP_SET_STACK_SLOT(dstSlot)
+        // emitted by ir-emit will pop the result and store it.
+        vm.push(fun);
+        vm.push(arg);
+        goto op_call_1;
     }
 
     // OP_RATTR_SELF_R: dst = (*attrs).<attr>, then force.
