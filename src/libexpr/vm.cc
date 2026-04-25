@@ -736,6 +736,9 @@ void vmExec(
         REGISTER_OP(OP_ATTR_SELECT_CACHED, op_attr_select_cached);
         REGISTER_OP(OP_ATTR_SELECT_FORCE_CACHED, op_attr_select_force_cached);
         REGISTER_OP(OP_MOV_SLOTS, op_mov_slots);
+        REGISTER_OP(OP_RFORCE_FROM, op_rforce_from);
+        REGISTER_OP(OP_RGET_UV_TO, op_rget_uv_to);
+        REGISTER_OP(OP_RUVF_TO, op_ruvf_to);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -3000,6 +3003,175 @@ op_mov_slots:
         while (vm.stackSize() < needed)
             vm.push(const_cast<Value *>(&Value::vNull));
         vm.stack[base + dstSlot] = vm.stack[base + srcSlot];
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 1: Register-form ops (read src/uv, write to dst slot)
+    // No operand stack round-trip — direct slot-to-slot.
+    // Encoding: [dst:8|src:16]
+    // ==================================================================
+
+    // OP_RFORCE_FROM: force value at slot src, write to slot dst.
+    // Replaces: GET_SLOT_FORCE + SET_STACK_SLOT (2 → 1 dispatch).
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rforce_from:
+#else
+    case OP_RFORCE_FROM:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot = operand >> 16;
+        uint32_t srcSlot = operand & 0xFFFF;
+        size_t base = vm.frames.back().stackBaseOffset;
+        Value * v = vm.stack[base + srcSlot];
+
+        // Auto-extend stack if dstSlot beyond current end.
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+
+        // Fast path: already forced.
+        if (!v->isThunk() && !v->isApp()) [[likely]] {
+            vm.stack[base + dstSlot] = v;
+            DISPATCH();
+        }
+
+        // Need to force.  Push the value, force it (via OP_FORCE inline
+        // trampoline path), then store to dst.  We can't trivially
+        // trampoline here because the result needs to land in a slot,
+        // not on the operand stack.  Use forceValue for now (fallback
+        // tree-walker path).  Future optimization: inline trampoline
+        // with resultSlot pointing at vm.stack[base + dstSlot].
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Inline bytecoded thunk trampoline with resultSlot = the dest slot.
+        if (v->isThunk()) {
+            Env * thunkEnv = v->thunk().env;
+            Expr * thunkExpr = v->thunk().expr;
+            if (thunkEnv && thunkExpr->isBytecodeThunk) {
+                auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
+                uint32_t thunkOffset = thunkDesc.codeOffset;
+                Value ** frameUpvalues = nullptr;
+                if (thunkDesc.nUpvalues > 0)
+                    frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
+
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
+
+                v->mkBlackhole();
+                vm.frames.back().ip = ip;
+                vm.frames.back().env = curEnv;
+                // Use v as resultSlot — same as OP_FORCE.  After the
+                // thunk is forced in-place, also write to the dst slot.
+                // For simplicity, just point resultSlot at v; the dst
+                // slot will be updated in the subsequent dispatch via
+                // RFORCE_FROM_RESUME (or we accept the cost of one extra
+                // copy on next access).
+                //
+                // Actually simpler: write v's pointer to dst BEFORE
+                // forcing.  After the force, both src and dst slots
+                // point to the same forced Value.
+                vm.stack[base + dstSlot] = v;
+                vm.frames.push_back(CallFrame{
+                    .unit = bcThunk->unit, .ip = thunkOffset, .env = thunkEnv,
+                    .stackBaseOffset = vm.stackSize(), .resultSlot = v,
+                    .callPos = pos, .isThunkForce = true, .upvalues = frameUpvalues,
+                });
+                cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
+                DISPATCH();
+            }
+        }
+
+        // Fallback: tree-walker forceValue, then store.
+        state.forceValue(*v, pos);
+        vm.stack[base + dstSlot] = v;
+        DISPATCH();
+    }
+
+    // OP_RGET_UV_TO: read upvalue at idx, write to slot dst.
+    // Replaces: GET_UPVALUE + SET_STACK_SLOT.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rget_uv_to:
+#else
+    case OP_RGET_UV_TO:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot = operand >> 16;
+        uint32_t uvIdx = operand & 0xFFFF;
+        Value ** upvalues = vm.frames.back().upvalues;
+        assert(upvalues && "OP_RGET_UV_TO: no upvalue array");
+        size_t base = vm.frames.back().stackBaseOffset;
+        // Auto-extend stack.
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = upvalues[uvIdx];
+        DISPATCH();
+    }
+
+    // OP_RUVF_TO: read upvalue at idx, force it, write to slot dst.
+    // Replaces: GET_UV_FORCE + SET_STACK_SLOT.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_ruvf_to:
+#else
+    case OP_RUVF_TO:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot = operand >> 16;
+        uint32_t uvIdx = operand & 0xFFFF;
+        Value ** upvalues = vm.frames.back().upvalues;
+        assert(upvalues && "OP_RUVF_TO: no upvalue array");
+        size_t base = vm.frames.back().stackBaseOffset;
+        Value * v = upvalues[uvIdx];
+
+        // Auto-extend stack.
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+
+        // Fast path: already forced.
+        if (!v->isThunk() && !v->isApp()) [[likely]] {
+            vm.stack[base + dstSlot] = v;
+            DISPATCH();
+        }
+
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Inline thunk trampoline (same pattern as RFORCE_FROM).
+        if (v->isThunk()) {
+            Env * thunkEnv = v->thunk().env;
+            Expr * thunkExpr = v->thunk().expr;
+            if (thunkEnv && thunkExpr->isBytecodeThunk) {
+                auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
+                uint32_t thunkOffset = thunkDesc.codeOffset;
+                Value ** frameUpvalues = nullptr;
+                if (thunkDesc.nUpvalues > 0)
+                    frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
+
+                if (vm.frames.size() > 65536) [[unlikely]]
+                    state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
+
+                v->mkBlackhole();
+                vm.frames.back().ip = ip;
+                vm.frames.back().env = curEnv;
+                vm.stack[base + dstSlot] = v;
+                vm.frames.push_back(CallFrame{
+                    .unit = bcThunk->unit, .ip = thunkOffset, .env = thunkEnv,
+                    .stackBaseOffset = vm.stackSize(), .resultSlot = v,
+                    .callPos = pos, .isThunkForce = true, .upvalues = frameUpvalues,
+                });
+                cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
+                DISPATCH();
+            }
+        }
+
+        state.forceValue(*v, pos);
+        vm.stack[base + dstSlot] = v;
         DISPATCH();
     }
 

@@ -330,10 +330,11 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
 
     // Emit each binding.
     for (const auto & binding : block.bindings) {
-        // Mini register-based optimization: detect the simple alias
-        // pattern `let a = b; ...` where b is a local slot.  Emit
-        // OP_MOV_SLOTS instead of GET_STACK_SLOT + SET_STACK_SLOT.
+        // Phase 1 register-form optimization.
+        // Detect patterns where we can write the result DIRECTLY to a
+        // slot without going through the operand stack.
         if (!(nFwd > 0 && forwardRefs.count(binding.result))) {
+            // -- Pattern: alias `let a = b;` (slot-to-slot copy) --
             if (auto * varRef = std::get_if<ir::IRVarRef>(&binding.expr)) {
                 auto srcIt = ctx.localSlots.find(varRef->var);
                 if (srcIt != ctx.localSlots.end()
@@ -342,6 +343,43 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
                     if (dstSlot < 4096) {
                         unit.emit(OP_MOV_SLOTS,
                             (srcIt->second << 12) | dstSlot);
+                        continue;
+                    }
+                }
+                // -- Pattern: read upvalue into slot --
+                auto uvIt = ctx.upvalueSlots.find(varRef->var);
+                if (uvIt != ctx.upvalueSlots.end()
+                    && uvIt->second <= 0xFFFF) {
+                    uint32_t dstSlot = ctx.allocSlot(binding.result);
+                    if (dstSlot <= 0xFF) {
+                        unit.emit(OP_RGET_UV_TO,
+                            (dstSlot << 16) | uvIt->second);
+                        continue;
+                    }
+                }
+            }
+
+            // -- Pattern: force a local or upvalue, store result --
+            if (auto * forceExpr = std::get_if<ir::IRForce>(&binding.expr)) {
+                auto srcIt = ctx.localSlots.find(forceExpr->thunk);
+                if (srcIt != ctx.localSlots.end()
+                    && srcIt->second <= 0xFFFF) {
+                    uint32_t dstSlot = ctx.allocSlot(binding.result);
+                    if (dstSlot <= 0xFF) {
+                        unit.emitPos(binding.pos);
+                        unit.emit(OP_RFORCE_FROM,
+                            (dstSlot << 16) | srcIt->second);
+                        continue;
+                    }
+                }
+                auto uvIt = ctx.upvalueSlots.find(forceExpr->thunk);
+                if (uvIt != ctx.upvalueSlots.end()
+                    && uvIt->second <= 0xFFFF) {
+                    uint32_t dstSlot = ctx.allocSlot(binding.result);
+                    if (dstSlot <= 0xFF) {
+                        unit.emitPos(binding.pos);
+                        unit.emit(OP_RUVF_TO,
+                            (dstSlot << 16) | uvIt->second);
                         continue;
                     }
                 }

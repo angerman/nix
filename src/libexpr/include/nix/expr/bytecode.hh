@@ -311,6 +311,29 @@ enum Op : uint8_t {
     /// + SET_STACK_SLOT(dst) in one dispatch.  Saves the operand stack
     /// round-trip for simple alias bindings (`let a = b; in ...`).
     OP_MOV_SLOTS = 0x57, // [srcSlot:12|dstSlot:12]
+
+    // -- Phase 1: Register-form ops --
+    //
+    // Per the agent research: the v2 VM is already register-architectured
+    // at the memory model level — slots are registers, the IR is SSA.
+    // The 52% push/pop overhead comes from using the operand stack as
+    // a bus to deliver operands to opcodes.  Register-form ops read
+    // from a source slot and write to a destination slot directly,
+    // bypassing the operand stack entirely.
+    //
+    // Encoding: [dst:8|src:16] — dst slot up to 256, src slot/idx up to 65536
+
+    /// Force value at slot src, write result to slot dst.
+    /// Replaces GET_SLOT_FORCE + SET_STACK_SLOT (2 dispatches → 1).
+    OP_RFORCE_FROM = 0x58, // [dst:8|src:16]
+
+    /// Read upvalue at idx, write to slot dst.
+    /// Replaces GET_UPVALUE + SET_STACK_SLOT (2 dispatches → 1).
+    OP_RGET_UV_TO = 0x59, // [dst:8|uvIdx:16]
+
+    /// Read upvalue at idx, force it, write result to slot dst.
+    /// Replaces GET_UV_FORCE + SET_STACK_SLOT (2 dispatches → 1).
+    OP_RUVF_TO = 0x5A, // [dst:8|uvIdx:16]
 };
 
 
