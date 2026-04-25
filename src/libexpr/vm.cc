@@ -919,6 +919,38 @@ op_return:
         ip     = caller.ip;
         curEnv = caller.env;
 
+        // ── VM-native primop continuations ──
+        // Check if the caller has an active continuation (e.g., from
+        // builtins.map).  If so, store the just-returned result and
+        // either advance to the next iteration or finalize the result.
+        if (caller.cont.kind != ContKind::None) [[unlikely]] {
+            auto & cont = caller.cont;
+            if (cont.kind == ContKind::Map) {
+                // Store this iteration's result.
+                Value * elemResult = state.allocValue();
+                *elemResult = *resultSlot;
+                cont.results[cont.index] = elemResult;
+                cont.index++;
+
+                if (cont.index < cont.count) {
+                    // More elements: trigger next call f(list[index]).
+                    vm.push(cont.func);
+                    vm.push(cont.inputElems[cont.index]);
+                    goto op_call_1;
+                }
+
+                // Done: build the final list Value.
+                auto * listVal = state.allocValue();
+                auto listBuilder = state.buildList(cont.count);
+                for (uint32_t i = 0; i < cont.count; i++)
+                    listBuilder[i] = cont.results[i];
+                listVal->mkList(listBuilder);
+                cont.kind = ContKind::None;
+                vm.push(listVal);
+                DISPATCH();
+            }
+        }
+
         if (!wasThunkForce) {
             vm.push(resultSlot);
         }
@@ -1981,6 +2013,55 @@ op_call_1:
             auto argsLeft = fn->arity - argsDone;
 
             if (argsLeft == 1) {
+                // ── VM-native continuation for builtins.map ──
+                // Detect the saturating call to map with both args ready.
+                // Instead of calling prim_map (which creates lazy App
+                // thunks → frame depth issues), set up a Map continuation
+                // and apply f to each element within the current vmExec.
+                if (fn->arity == 2 && fn->name == "map") {
+                    Value * f = fun->primOpApp().right;
+                    state.forceList(*arg, pos, "while evaluating the second argument of builtins.map");
+                    auto listView = arg->listView();
+                    auto listSize = listView.size();
+
+                    if (listSize == 0) {
+                        // Empty list → empty result list.
+                        auto * result = state.allocValue();
+                        result->mkList(state.buildList(0));
+                        vm.push(result);
+                        DISPATCH();
+                    }
+
+                    // Copy listElems into a Value** array (we need to
+                    // index by integer for the continuation).
+                    auto * inputCopy = static_cast<Value **>(
+                        GC_MALLOC(listSize * sizeof(Value *)));
+                    for (size_t i = 0; i < listSize; i++)
+                        inputCopy[i] = listView[i];
+
+                    // Set up Map continuation in the current frame.
+                    auto * results = static_cast<Value **>(
+                        GC_MALLOC(listSize * sizeof(Value *)));
+                    auto & frame = vm.frames.back();
+                    frame.cont.kind = ContKind::Map;
+                    frame.cont.index = 0;
+                    frame.cont.count = static_cast<uint32_t>(listSize);
+                    frame.cont.func = f;
+                    frame.cont.results = results;
+                    frame.cont.inputElems = inputCopy;
+
+                    // Trigger the first call: f(list[0]).
+                    vm.push(f);
+                    vm.push(inputCopy[0]);
+                    goto op_call_1;
+                }
+
+                // genList continuation deferred — eager genList breaks
+                // lazy fixpoint patterns in stage.nix (old nixpkgs).
+                // Need a thunk-creating variant that trampolines within
+                // the existing vmExec to fix the frame depth issue
+                // without changing lazy semantics.
+
                 if (fn->arity == 2) {
                     Value * vArgs[2] = {fun->primOpApp().right, arg};
                     auto * result = state.allocValue();
