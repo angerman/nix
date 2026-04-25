@@ -152,6 +152,17 @@ CompilationUnit * emitFromIR(EvalState & state, const ir::IRModule & module)
     auto * unit = new (GC) CompilationUnit();
     IREmitter emitter(state, *unit, module);
     emitter.emit();
+
+    // Pre-allocate ExprBytecodeThunk objects for all thunk descriptors.
+    // This moves the allocation from OP_MAKE_THUNK_V2 runtime (681K+
+    // allocations per nixpkgs eval) to compile time (one per descriptor).
+    for (auto & desc : unit->thunks) {
+        if (!desc.cachedExpr) {
+            desc.cachedExpr = state.mem.exprs.add<ExprBytecodeThunk>(
+                unit, static_cast<uint32_t>(&desc - unit->thunks.data()));
+        }
+    }
+
     return unit;
 }
 

@@ -714,24 +714,32 @@ void vmExec(
     auto & stepCounter = globalStepCounter();
 
     // Profiling and tracing hook -- called before every instruction.
-    // Compiled as a single branch test (tcfg.enabled) for zero-cost
-    // when tracing is off.  Profiling counters are always incremented.
+    // When tracing is disabled (the common case), this is just a counter
+    // increment with ZERO branches.  The branch on tcfg.enabled is
+    // hoisted out of the dispatch loop entirely.
+    bool tracingEnabled = tcfg.enabled;
 #define VM_HOOK() do {                                         \
         vm.nrInstructions++;                                   \
-        if (tcfg.enabled) [[unlikely]] {                       \
-            uint64_t step = stepCounter++;                     \
-            if (step >= tcfg.from && step <= tcfg.to)          \
-                traceInstruction(state, *cu, ip - 1,           \
-                    cu->code[ip - 1], step,                    \
-                    static_cast<size_t>(vm.sp - vm.stack),     \
-                    vm.frames.size());                         \
-        }                                                      \
+    } while (0)
+#define VM_HOOK_TRACE() do {                                   \
+        vm.nrInstructions++;                                   \
+        uint64_t step = stepCounter++;                         \
+        if (step >= tcfg.from && step <= tcfg.to)              \
+            traceInstruction(state, *cu, ip - 1,               \
+                cu->code[ip - 1], step,                        \
+                static_cast<size_t>(vm.sp - vm.stack),         \
+                vm.frames.size());                             \
     } while (0)
 
     // Computed-goto dispatch macro.
+    // When tracing is enabled, use the trace-aware hook.
+    // When disabled, just increment the counter (zero branches).
 #define DISPATCH() do {                              \
         Instruction _instr = cu->code[ip++];         \
-        VM_HOOK();                                   \
+        if (tracingEnabled) [[unlikely]]             \
+            VM_HOOK_TRACE();                         \
+        else                                         \
+            VM_HOOK();                               \
         goto *dispatchTable[decodeOp(_instr)];       \
     } while (0)
 
@@ -748,6 +756,7 @@ void vmExec(
 
     auto & tcfg = traceConfig();
     auto & stepCounter = globalStepCounter();
+    bool tracingEnabled = tcfg.enabled;
 
     try { // exception cleanup: restore frame/stack on throw
 
@@ -755,7 +764,7 @@ void vmExec(
         Instruction instr = cu->code[ip++];
 
         vm.nrInstructions++;
-        if (tcfg.enabled) [[unlikely]] {
+        if (tracingEnabled) [[unlikely]] {
             uint64_t step = stepCounter++;
             if (step >= tcfg.from && step <= tcfg.to) {
                 traceInstruction(state, *cu, ip - 1, instr, step,
@@ -2830,14 +2839,18 @@ op_make_thunk_v2:
                 upvalues[i - 1] = vm.pop();
         }
 
-        // Create ExprBytecodeThunk for the body.
-        auto * thunkExpr = state.mem.exprs.add<ExprBytecodeThunk>(
-            const_cast<CompilationUnit *>(cu), thunkIdx);
+        // Use the pre-allocated ExprBytecodeThunk from compilation.
+        // This avoids 681K+ runtime Expr allocations per nixpkgs eval.
+        auto & desc = cu->thunks[thunkIdx];
+        Expr * thunkExpr = desc.cachedExpr;
+        if (!thunkExpr) [[unlikely]] {
+            // Fallback for thunks without pre-cached expr (shouldn't happen
+            // for v2 thunks, but defensive for v1 compat).
+            thunkExpr = state.mem.exprs.add<ExprBytecodeThunk>(
+                const_cast<CompilationUnit *>(cu), thunkIdx);
+        }
 
         // Create a carrier Env for the upvalue array.
-        // Allocate size=2: values[0] is a safe null Value (so
-        // OP_GET_WITH won't crash if the env is in a with-chain),
-        // values[1] holds the reinterpret_cast'd upvalue pointer.
         Env & thunkEnv = state.mem.allocEnv(2);
         thunkEnv.up = curEnv;
         thunkEnv.values[0] = &Value::vNull;
