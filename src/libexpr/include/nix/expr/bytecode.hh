@@ -363,6 +363,11 @@ struct LambdaDescriptor
     /// formal parameter unpacking before the body.  For simple
     /// lambdas (no formals), prologueOffset == body code offset.
     uint32_t prologueOffset = 0;
+
+    /// Pre-allocated ExprLambdaBytecode for this descriptor.
+    /// Created once during compilation, reused by every
+    /// OP_MAKE_CLOSURE_V2 execution.
+    Expr * cachedExpr = nullptr;
 };
 
 

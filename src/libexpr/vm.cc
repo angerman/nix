@@ -946,6 +946,9 @@ op_get_local_0_force:
         uint32_t displ = decodeOperand(CUR_INSTR);
         Value * v = curEnv->values[displ];
         vm.push(v);
+        // Fast path: already forced (most common case).
+        if (!v->isThunk() && !v->isApp()) [[likely]]
+            DISPATCH();
         PosIdx pos = cu->posForOffset(ip - 1);
 
         // Inline thunk trampoline (same as OP_FORCE).
@@ -1122,6 +1125,12 @@ op_force:
 #endif
     {
         Value * v = vm.top();
+
+        // Fast path: value is already forced (most common case).
+        // Skip all branch checks for ints, strings, attrsets, lists, etc.
+        if (!v->isThunk() && !v->isApp()) [[likely]]
+            DISPATCH();
+
         PosIdx pos = cu->posForOffset(ip - 1);
 
         // Inline trampoline for bytecoded thunks: force within the VM
@@ -2631,6 +2640,9 @@ op_get_slot_force:
         size_t base = vm.frames.back().stackBaseOffset;
         Value * v = vm.stack[base + slot];
         vm.push(v);
+        // Fast path: already forced.
+        if (!v->isThunk() && !v->isApp()) [[likely]]
+            DISPATCH();
         PosIdx pos = cu->posForOffset(ip - 1);
 
         // Inline force trampoline (same as OP_FORCE).
@@ -2691,6 +2703,9 @@ op_get_uv_force:
         assert(upvalues && "OP_GET_UV_FORCE: no upvalue array");
         Value * v = upvalues[idx];
         vm.push(v);
+        // Fast path: already forced.
+        if (!v->isThunk() && !v->isApp()) [[likely]]
+            DISPATCH();
         PosIdx pos = cu->posForOffset(ip - 1);
 
         // Inline force trampoline (same as OP_FORCE).
@@ -2801,13 +2816,15 @@ op_make_closure_v2:
         // The OP_CALL_1 v2 path will extract it from here.
         closureEnv.values[1] = reinterpret_cast<Value *>(upvalues);
 
-        // For v2, we need to create a lambda expression wrapper.
-        // Use ExprLambdaBytecode which stores the compilation unit + index.
-        auto * lambdaExpr = state.mem.exprs.add<ExprLambdaBytecode>(
-            const_cast<CompilationUnit *>(cu), lambdaIdx);
+        // Use the pre-allocated ExprLambdaBytecode from compilation.
+        Expr * lambdaExpr = desc.cachedExpr;
+        if (!lambdaExpr) [[unlikely]] {
+            lambdaExpr = state.mem.exprs.add<ExprLambdaBytecode>(
+                const_cast<CompilationUnit *>(cu), lambdaIdx);
+        }
 
         auto * closureVal = state.allocValue();
-        closureVal->mkLambda(&closureEnv, lambdaExpr);
+        closureVal->mkLambda(&closureEnv, static_cast<ExprLambda *>(lambdaExpr));
 
         vm.push(closureVal);
         DISPATCH();

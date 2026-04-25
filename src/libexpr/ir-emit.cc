@@ -163,6 +163,15 @@ CompilationUnit * emitFromIR(EvalState & state, const ir::IRModule & module)
         }
     }
 
+    // Pre-allocate ExprLambdaBytecode objects for all lambda descriptors.
+    // Same pattern: saves 160K+ runtime Expr allocations per nixpkgs eval.
+    for (auto & desc : unit->lambdas) {
+        if (!desc.cachedExpr) {
+            desc.cachedExpr = state.mem.exprs.add<ExprLambdaBytecode>(
+                unit, static_cast<uint32_t>(&desc - unit->lambdas.data()));
+        }
+    }
+
     return unit;
 }
 
