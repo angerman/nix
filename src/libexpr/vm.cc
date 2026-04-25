@@ -35,6 +35,26 @@ namespace nix::bytecode {
 // The step counter is global (across all vmExec invocations) so you can
 // pinpoint the exact moment something goes wrong in a long evaluation.
 
+/// Small integer cache (NaN-boxing approximation).
+///
+/// Pre-allocated Value objects for ints 0..kSmallIntCacheSize-1.
+/// OP_INT pushes from this cache for small immediates instead of
+/// calling state.allocValue().  Eliminates ~100-300K Value allocations
+/// per nixpkgs evaluation.
+///
+/// Inspired by CPython's small int cache and Lua's NaN-boxing.
+/// Since Nix Values are immutable once typed, sharing a static cache
+/// is safe.  Multiple EvalStates and threads can read the same cache.
+static constexpr uint32_t kSmallIntCacheSize = 256;
+static Value smallIntCache[kSmallIntCacheSize];
+static std::once_flag smallIntCacheInitFlag;
+
+static void initSmallIntCache() {
+    for (uint32_t i = 0; i < kSmallIntCacheSize; i++) {
+        smallIntCache[i].mkInt(static_cast<NixInt::Inner>(i));
+    }
+}
+
 /// Print VM statistics at process exit when NIX_VM_STATS=1.
 static void printVMStats(const VMState & vm) {
     if (getEnv("NIX_VM_STATS").value_or("") != "1") return;
@@ -552,6 +572,9 @@ void vmExec(
     if (!state.vmState) [[unlikely]]
         state.vmState = std::make_unique<VMState>();
 
+    // Lazy-init the small integer cache (one-time, thread-safe).
+    std::call_once(smallIntCacheInitFlag, initSmallIntCache);
+
     auto & vm = *state.vmState;
 
     // Track the frame depth at entry so we know when OUR frames are
@@ -845,6 +868,11 @@ op_int:
 #endif
     {
         uint32_t imm = decodeOperand(CUR_INSTR);
+        // Small int cache fast path — avoid allocValue for common ints.
+        if (imm < kSmallIntCacheSize) [[likely]] {
+            vm.push(&smallIntCache[imm]);
+            DISPATCH();
+        }
         auto * v = state.allocValue();
         v->mkInt(static_cast<NixInt::Inner>(imm));
         vm.push(v);
