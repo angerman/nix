@@ -771,6 +771,11 @@ void vmExec(
         REGISTER_OP(OP_RFORCE_FROM, op_rforce_from);
         REGISTER_OP(OP_RGET_UV_TO, op_rget_uv_to);
         REGISTER_OP(OP_RUVF_TO, op_ruvf_to);
+        REGISTER_OP(OP_RADD_R, op_radd_r);
+        REGISTER_OP(OP_RSUB_R, op_rsub_r);
+        REGISTER_OP(OP_RMUL_R, op_rmul_r);
+        REGISTER_OP(OP_RLESS_R, op_rless_r);
+        REGISTER_OP(OP_REQ_R, op_req_r);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -3376,6 +3381,263 @@ op_ruvf_to:
 
         state.forceValue(*v, pos);
         vm.stack[base + dstSlot] = v;
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // Phase 2: Three-address register-form arithmetic and comparison.
+    // Encoding: [dst:8|a:8|b:8].  Read from slots, write to slot.
+    // No operand stack push/pop.
+    // ==================================================================
+
+    // dst = *lhs + *rhs, with tagged-int fast path.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_radd_r:
+#else
+    case OP_RADD_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t dstSlot = bytecode::unpackDst(operand);
+        uint8_t lhsSlot = bytecode::unpackA(operand);
+        uint8_t rhsSlot = bytecode::unpackB(operand);
+        size_t base = vm.frames.back().stackBaseOffset;
+        // Auto-extend stack for dst.
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+        Value * lhs = vm.stack[base + lhsSlot];
+        Value * rhs = vm.stack[base + rhsSlot];
+
+        // Tagged-int fast path.
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            int64_t a = nanbox::decodeInt(lhs);
+            int64_t b = nanbox::decodeInt(rhs);
+            int64_t sum;
+            if (!__builtin_add_overflow(a, b, &sum)
+                && nanbox::intFitsTagged(sum)) {
+                vm.stack[base + dstSlot] = nanbox::encodeInt(sum);
+                DISPATCH();
+            }
+        }
+
+        PosIdx pos = cu->posForOffset(ip - 1);
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+        auto * result = state.allocValue();
+        if (lhs->type() == nFloat || rhs->type() == nFloat) {
+            NixFloat fl = lhs->type() == nFloat ? lhs->fpoint() : static_cast<NixFloat>(lhs->integer().value);
+            NixFloat fr = rhs->type() == nFloat ? rhs->fpoint() : static_cast<NixFloat>(rhs->integer().value);
+            result->mkFloat(fl + fr);
+        } else if (lhs->type() == nInt && rhs->type() == nInt) {
+            auto sum = lhs->integer() + rhs->integer();
+            if (auto v = sum.valueChecked()) result->mkInt(*v);
+            else state.error<EvalError>("integer overflow").atPos(pos).debugThrow();
+        } else {
+            state.error<EvalError>("cannot add %1% to %2%",
+                showType(*lhs), showType(*rhs)).atPos(pos).debugThrow();
+        }
+        vm.stack[base + dstSlot] = result;
+        DISPATCH();
+    }
+
+    // dst = *lhs - *rhs
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rsub_r:
+#else
+    case OP_RSUB_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t dstSlot = bytecode::unpackDst(operand);
+        uint8_t lhsSlot = bytecode::unpackA(operand);
+        uint8_t rhsSlot = bytecode::unpackB(operand);
+        size_t base = vm.frames.back().stackBaseOffset;
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+        Value * lhs = vm.stack[base + lhsSlot];
+        Value * rhs = vm.stack[base + rhsSlot];
+
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            int64_t a = nanbox::decodeInt(lhs);
+            int64_t b = nanbox::decodeInt(rhs);
+            int64_t diff;
+            if (!__builtin_sub_overflow(a, b, &diff)
+                && nanbox::intFitsTagged(diff)) {
+                vm.stack[base + dstSlot] = nanbox::encodeInt(diff);
+                DISPATCH();
+            }
+        }
+
+        PosIdx pos = cu->posForOffset(ip - 1);
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+        auto * result = state.allocValue();
+        if (lhs->type() == nFloat || rhs->type() == nFloat) {
+            NixFloat fl = lhs->type() == nFloat ? lhs->fpoint() : static_cast<NixFloat>(lhs->integer().value);
+            NixFloat fr = rhs->type() == nFloat ? rhs->fpoint() : static_cast<NixFloat>(rhs->integer().value);
+            result->mkFloat(fl - fr);
+        } else if (lhs->type() == nInt && rhs->type() == nInt) {
+            auto diff = lhs->integer() - rhs->integer();
+            if (auto v = diff.valueChecked()) result->mkInt(*v);
+            else state.error<EvalError>("integer overflow").atPos(pos).debugThrow();
+        } else {
+            state.error<EvalError>("cannot subtract %1% from %2%",
+                showType(*rhs), showType(*lhs)).atPos(pos).debugThrow();
+        }
+        vm.stack[base + dstSlot] = result;
+        DISPATCH();
+    }
+
+    // dst = *lhs * *rhs
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rmul_r:
+#else
+    case OP_RMUL_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t dstSlot = bytecode::unpackDst(operand);
+        uint8_t lhsSlot = bytecode::unpackA(operand);
+        uint8_t rhsSlot = bytecode::unpackB(operand);
+        size_t base = vm.frames.back().stackBaseOffset;
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+        Value * lhs = vm.stack[base + lhsSlot];
+        Value * rhs = vm.stack[base + rhsSlot];
+
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            int64_t a = nanbox::decodeInt(lhs);
+            int64_t b = nanbox::decodeInt(rhs);
+            int64_t prod;
+            if (!__builtin_mul_overflow(a, b, &prod)
+                && nanbox::intFitsTagged(prod)) {
+                vm.stack[base + dstSlot] = nanbox::encodeInt(prod);
+                DISPATCH();
+            }
+        }
+
+        PosIdx pos = cu->posForOffset(ip - 1);
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+        auto * result = state.allocValue();
+        if (lhs->type() == nFloat || rhs->type() == nFloat) {
+            NixFloat fl = lhs->type() == nFloat ? lhs->fpoint() : static_cast<NixFloat>(lhs->integer().value);
+            NixFloat fr = rhs->type() == nFloat ? rhs->fpoint() : static_cast<NixFloat>(rhs->integer().value);
+            result->mkFloat(fl * fr);
+        } else if (lhs->type() == nInt && rhs->type() == nInt) {
+            auto prod = lhs->integer() * rhs->integer();
+            if (auto v = prod.valueChecked()) result->mkInt(*v);
+            else state.error<EvalError>("integer overflow").atPos(pos).debugThrow();
+        } else {
+            state.error<EvalError>("cannot multiply %1% and %2%",
+                showType(*lhs), showType(*rhs)).atPos(pos).debugThrow();
+        }
+        vm.stack[base + dstSlot] = result;
+        DISPATCH();
+    }
+
+    // dst = *lhs < *rhs
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rless_r:
+#else
+    case OP_RLESS_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t dstSlot = bytecode::unpackDst(operand);
+        uint8_t lhsSlot = bytecode::unpackA(operand);
+        uint8_t rhsSlot = bytecode::unpackB(operand);
+        size_t base = vm.frames.back().stackBaseOffset;
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+        Value * lhs = vm.stack[base + lhsSlot];
+        Value * rhs = vm.stack[base + rhsSlot];
+
+        // Tagged-int fast path.
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            bool lt = nanbox::decodeInt(lhs) < nanbox::decodeInt(rhs);
+            vm.stack[base + dstSlot] = lt ? &Value::vTrue : &Value::vFalse;
+            DISPATCH();
+        }
+
+        PosIdx pos = cu->posForOffset(ip - 1);
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+        bool cmpResult;
+        if (lhs->type() == nFloat && rhs->type() == nInt)
+            cmpResult = lhs->fpoint() < rhs->integer().value;
+        else if (lhs->type() == nInt && rhs->type() == nFloat)
+            cmpResult = lhs->integer().value < rhs->fpoint();
+        else if (lhs->type() != rhs->type())
+            state.error<EvalError>("cannot compare %1% with %2%",
+                showType(*lhs), showType(*rhs)).atPos(pos).debugThrow();
+        else if (lhs->type() == nInt) cmpResult = lhs->integer() < rhs->integer();
+        else if (lhs->type() == nFloat) cmpResult = lhs->fpoint() < rhs->fpoint();
+        else if (lhs->type() == nString) cmpResult = lhs->string_view() < rhs->string_view();
+        else if (lhs->type() == nPath) cmpResult = lhs->path() < rhs->path();
+        else state.error<EvalError>("cannot compare %1% with %2%",
+            showType(*lhs), showType(*rhs)).atPos(pos).debugThrow();
+        vm.stack[base + dstSlot] = cmpResult ? &Value::vTrue : &Value::vFalse;
+        DISPATCH();
+    }
+
+    // dst = *lhs == *rhs
+#ifdef NIX_VM_COMPUTED_GOTO
+op_req_r:
+#else
+    case OP_REQ_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t dstSlot = bytecode::unpackDst(operand);
+        uint8_t lhsSlot = bytecode::unpackA(operand);
+        uint8_t rhsSlot = bytecode::unpackB(operand);
+        size_t base = vm.frames.back().stackBaseOffset;
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+        Value * lhs = vm.stack[base + lhsSlot];
+        Value * rhs = vm.stack[base + rhsSlot];
+
+        // Tagged-int fast path.
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            bool eq = nanbox::decodeInt(lhs) == nanbox::decodeInt(rhs);
+            vm.stack[base + dstSlot] = eq ? &Value::vTrue : &Value::vFalse;
+            DISPATCH();
+        }
+        if (lhs == rhs) {
+            vm.stack[base + dstSlot] = &Value::vTrue;
+            DISPATCH();
+        }
+
+        PosIdx pos = cu->posForOffset(ip - 1);
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
+        state.forceValue(*lhs, pos);
+        state.forceValue(*rhs, pos);
+        bool eq;
+        if (lhs == rhs) eq = true;
+        else if (lhs->type() == nInt && rhs->type() == nInt)
+            eq = lhs->integer() == rhs->integer();
+        else if (lhs->type() == nString && rhs->type() == nString)
+            eq = lhs->string_view() == rhs->string_view();
+        else if (lhs->type() == nBool && rhs->type() == nBool)
+            eq = lhs->boolean() == rhs->boolean();
+        else if (lhs->type() == nNull && rhs->type() == nNull) eq = true;
+        else eq = state.eqValues(*lhs, *rhs, pos, "while comparing two values");
+        vm.stack[base + dstSlot] = eq ? &Value::vTrue : &Value::vFalse;
         DISPATCH();
     }
 

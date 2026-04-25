@@ -384,6 +384,37 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
                     }
                 }
             }
+
+            // -- Pattern: register-form arithmetic/comparison --
+            // For binary ops where both operands are local slots <256,
+            // emit register-form op directly to dst slot.
+            #define TRY_REGISTER_BINOP(IR_TYPE, OPCODE) \
+                if (auto * binOp = std::get_if<ir::IR_TYPE>(&binding.expr)) { \
+                    auto lhsIt = ctx.localSlots.find(binOp->lhs); \
+                    auto rhsIt = ctx.localSlots.find(binOp->rhs); \
+                    if (lhsIt != ctx.localSlots.end() \
+                        && rhsIt != ctx.localSlots.end() \
+                        && lhsIt->second <= 0xFF \
+                        && rhsIt->second <= 0xFF) { \
+                        uint32_t dstSlot = ctx.allocSlot(binding.result); \
+                        if (dstSlot <= 0xFF) { \
+                            unit.emitPos(binding.pos); \
+                            unit.emit(OPCODE, bytecode::packABC( \
+                                static_cast<uint8_t>(dstSlot), \
+                                static_cast<uint8_t>(lhsIt->second), \
+                                static_cast<uint8_t>(rhsIt->second))); \
+                            continue; \
+                        } \
+                    } \
+                }
+
+            TRY_REGISTER_BINOP(IRAdd,  OP_RADD_R)
+            TRY_REGISTER_BINOP(IRSub,  OP_RSUB_R)
+            TRY_REGISTER_BINOP(IRMul,  OP_RMUL_R)
+            TRY_REGISTER_BINOP(IRLess, OP_RLESS_R)
+            TRY_REGISTER_BINOP(IREq,   OP_REQ_R)
+
+            #undef TRY_REGISTER_BINOP
         }
 
         emitExpr(binding.expr, binding.pos, ctx);

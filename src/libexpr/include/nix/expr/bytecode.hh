@@ -113,6 +113,36 @@ inline constexpr uint32_t packArityConst(uint8_t arity, uint16_t constIdx) noexc
     return (static_cast<uint32_t>(arity) << 16) | constIdx;
 }
 
+/// Pack three 8-bit fields (dst, a, b) for register-based ops.
+[[gnu::always_inline]]
+inline constexpr uint32_t packABC(uint8_t dst, uint8_t a, uint8_t b) noexcept
+{
+    return (static_cast<uint32_t>(dst) << 16)
+         | (static_cast<uint32_t>(a) << 8)
+         | static_cast<uint32_t>(b);
+}
+
+/// Unpack 8-bit dst (high 8 bits of operand).
+[[gnu::always_inline]]
+inline constexpr uint8_t unpackDst(uint32_t operand) noexcept
+{
+    return static_cast<uint8_t>((operand >> 16) & 0xFF);
+}
+
+/// Unpack 8-bit a (middle 8 bits).
+[[gnu::always_inline]]
+inline constexpr uint8_t unpackA(uint32_t operand) noexcept
+{
+    return static_cast<uint8_t>((operand >> 8) & 0xFF);
+}
+
+/// Unpack 8-bit b (low 8 bits).
+[[gnu::always_inline]]
+inline constexpr uint8_t unpackB(uint32_t operand) noexcept
+{
+    return static_cast<uint8_t>(operand & 0xFF);
+}
+
 
 // ---------------------------------------------------------------------------
 // Opcodes
@@ -334,6 +364,37 @@ enum Op : uint8_t {
     /// Read upvalue at idx, force it, write result to slot dst.
     /// Replaces GET_UV_FORCE + SET_STACK_SLOT (2 dispatches → 1).
     OP_RUVF_TO = 0x5A, // [dst:8|uvIdx:16]
+
+    // -- Phase 2: Three-address register ops --
+    //
+    // Encoding: [dst:8|a:8|b:8] — three 8-bit slot operands packed into
+    // the 24-bit operand.  Limits: 256 slots per frame (sufficient for
+    // virtually all Nix functions; the largest lambda body in nixpkgs
+    // has ~80 IR vars).
+    //
+    // Replaces stack-based patterns:
+    //   GET a; GET b; OP; SET dst   →   ROP dst, a, b   (4 → 1 dispatch)
+
+    /// dst = call(*a, *b).  Direct slot-to-slot function application.
+    OP_RCALL1_R = 0x5B, // [dst:8|funcSlot:8|argSlot:8]
+
+    /// dst = *a + *b (integer add, with tagged-int fast path).
+    OP_RADD_R   = 0x5C, // [dst:8|lhs:8|rhs:8]
+    /// dst = *a - *b
+    OP_RSUB_R   = 0x5D,
+    /// dst = *a * *b
+    OP_RMUL_R   = 0x5E,
+    /// dst = *a < *b (boolean result)
+    OP_RLESS_R  = 0x5F,
+    /// dst = *a == *b
+    OP_REQ_R    = 0x60,
+
+    /// Cached attr select + force, slot-to-slot.
+    /// Operand format: [dst:8|attrsSlot:8|cacheIdxLow:8] +
+    /// data word [cacheIdxHigh:24] for full 32-bit cache index.
+    /// Simpler: [dst:8|attrsSlot:8|cacheIdxLow:8] with cacheIdx limited to 256.
+    /// Falls back to two-instruction form if cacheIdx exceeds 256.
+    OP_RATTR_SELF_R = 0x61, // [dst:8|attrsSlot:8|cacheIdxLow:8]
 };
 
 
