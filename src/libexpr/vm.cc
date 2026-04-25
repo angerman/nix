@@ -49,6 +49,11 @@ static void printVMStats(const VMState & vm) {
     fprintf(stderr, "  OP_CALL_1 → tree-walker: %llu\n", (unsigned long long)vm.nrCallFallbacks);
     fprintf(stderr, "  Peak stack depth: %llu\n", (unsigned long long)vm.peakStackDepth);
     fprintf(stderr, "  Peak frame depth: %llu\n", (unsigned long long)vm.peakFrameDepth);
+    uint64_t totalAttr = vm.nrAttrCacheHits + vm.nrAttrCacheMisses;
+    fprintf(stderr, "  AttrCache hits: %llu, misses: %llu (hit rate: %.1f%%)\n",
+        (unsigned long long)vm.nrAttrCacheHits,
+        (unsigned long long)vm.nrAttrCacheMisses,
+        totalAttr ? 100.0 * vm.nrAttrCacheHits / totalAttr : 0.0);
     fprintf(stderr, "================================\n");
 }
 
@@ -705,6 +710,7 @@ void vmExec(
         REGISTER_OP(OP_GET_SLOT_RETURN,  op_get_slot_return);
         REGISTER_OP(OP_GET_UV_FORCE,     op_get_uv_force);
         REGISTER_OP(OP_SLOT_SLOT_CALL1,  op_slot_slot_call1);
+        REGISTER_OP(OP_ATTR_SELECT_CACHED, op_attr_select_cached);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2121,10 +2127,63 @@ op_attr_select:
         Symbol name = cu->symbols[symIdx];
         state.forceAttrs(*attrs, pos, "while selecting an attribute");
         if (auto j = attrs->attrs()->get(name)) {
-            // TODO: state.nrLookups++ (private, needs friend decl)
             *(vm.sp - 1) = j->value;
         } else {
             state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
+                .atPos(pos).debugThrow();
+        }
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_attr_select_cached:
+#else
+    case OP_ATTR_SELECT_CACHED:
+#endif
+    {
+        // 4-way polymorphic inline cache for attribute select.
+        // Each call site has 4 (Bindings*, Value*) slots.  On hit, skip
+        // the binary search entirely.  On miss, evict round-robin.
+        uint32_t cacheIdx = decodeOperand(CUR_INSTR);
+        AttrCache & cache = cu->attrCaches[cacheIdx];
+        Value * attrs = vm.top();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceAttrs(*attrs, pos, "while selecting an attribute");
+        const Bindings * b = attrs->attrs();
+
+        // Fast path: linear scan over 4 cache entries.
+        // Unrolled for predictable branch behavior.
+        if (cache.bindings[0] == b) [[likely]] {
+            vm.nrAttrCacheHits++;
+            *(vm.sp - 1) = cache.values[0];
+            DISPATCH();
+        }
+        if (cache.bindings[1] == b) {
+            vm.nrAttrCacheHits++;
+            *(vm.sp - 1) = cache.values[1];
+            DISPATCH();
+        }
+        if (cache.bindings[2] == b) {
+            vm.nrAttrCacheHits++;
+            *(vm.sp - 1) = cache.values[2];
+            DISPATCH();
+        }
+        if (cache.bindings[3] == b) {
+            vm.nrAttrCacheHits++;
+            *(vm.sp - 1) = cache.values[3];
+            DISPATCH();
+        }
+
+        // Slow path: cache miss — binary search and evict round-robin.
+        vm.nrAttrCacheMisses++;
+        if (auto j = b->get(cache.name)) {
+            uint8_t evict = cache.nextEvict;
+            cache.bindings[evict] = b;
+            cache.values[evict] = j->value;
+            cache.nextEvict = (evict + 1) & 3;
+            *(vm.sp - 1) = j->value;
+        } else {
+            state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
                 .atPos(pos).debugThrow();
         }
         DISPATCH();

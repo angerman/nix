@@ -535,9 +535,9 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                             unit.emit(OP_HAS_ATTR, symIdx);
                             uint32_t jumpToDefault = unit.emit(OP_JUMP_IF_FALSE, 0);
 
-                            // Attr exists.
+                            // Attr exists — use cached attr lookup.
                             unit.emit(OP_DUP);
-                            unit.emit(OP_ATTR_SELECT, symIdx);
+                            unit.emit(OP_ATTR_SELECT_CACHED, unit.addAttrCache(formal.name));
                             unit.emit(OP_SET_STACK_SLOT, formalSlot);
                             unit.emit(OP_GET_STACK_SLOT, formalSlot);
                             unit.emit(OP_CELL_SET, (formalsCellSlot << 16) | i);
@@ -600,8 +600,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                             unit.patchJump(jumpPastDefault);
                         } else {
                             unit.emit(OP_DUP);
-                            uint32_t symIdx = unit.addSymbol(formal.name);
-                            unit.emit(OP_ATTR_SELECT, symIdx);
+                            unit.emit(OP_ATTR_SELECT_CACHED, unit.addAttrCache(formal.name));
                             unit.emit(OP_SET_STACK_SLOT, formalSlot);
                             if (hasAnyDefault) {
                                 unit.emit(OP_GET_STACK_SLOT, formalSlot);
@@ -838,8 +837,9 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             emitVarRef(e.attrs, pos, ctx);
             unit.emitPos(pos);
             unit.emit(OP_FORCE);
-            uint32_t symIdx = unit.addSymbol(e.name);
-            unit.emit(OP_ATTR_SELECT, symIdx);
+            // Inline cache: each call site gets its own cache slot.
+            uint32_t cacheIdx = unit.addAttrCache(e.name);
+            unit.emit(OP_ATTR_SELECT_CACHED, cacheIdx);
             unit.emit(OP_FORCE);
         }
 
@@ -1458,9 +1458,9 @@ uint32_t IREmitter::emitSubBlockWithFormals(
             unit.emit(OP_HAS_ATTR, symIdx);
             uint32_t jumpToDefault = unit.emit(OP_JUMP_IF_FALSE, 0);
 
-            // Attr exists: store original pointer.
+            // Attr exists: store original pointer (cached select).
             unit.emit(OP_DUP);
-            unit.emit(OP_ATTR_SELECT, symIdx);
+            unit.emit(OP_ATTR_SELECT_CACHED, unit.addAttrCache(formal.name));
             unit.emit(OP_SET_STACK_SLOT, formalSlot);
             // Write into cell for late-binding.
             unit.emit(OP_GET_STACK_SLOT, formalSlot);
@@ -1535,10 +1535,9 @@ uint32_t IREmitter::emitSubBlockWithFormals(
 
             unit.patchJump(jumpPastDefault);
         } else {
-            // Required formal: select and store.
+            // Required formal: select and store (cached).
             unit.emit(OP_DUP);
-            uint32_t symIdx = unit.addSymbol(formal.name);
-            unit.emit(OP_ATTR_SELECT, symIdx);
+            unit.emit(OP_ATTR_SELECT_CACHED, unit.addAttrCache(formal.name));
             unit.emit(OP_SET_STACK_SLOT, formalSlot);
             // Write into cell for late-binding by default thunks.
             if (hasAnyDefault) {

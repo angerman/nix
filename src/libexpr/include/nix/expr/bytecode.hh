@@ -294,6 +294,12 @@ enum Op : uint8_t {
     OP_GET_SLOT_RETURN   = 0x52, // [slot:24]            GET_STACK_SLOT + RETURN (direct to resultSlot)
     OP_GET_UV_FORCE      = 0x53, // [idx:24]             GET_UPVALUE + FORCE
     OP_SLOT_SLOT_CALL1   = 0x54, // [funcSlot:12|argSlot:12] GET_STACK_SLOT(f) + GET_STACK_SLOT(a) + CALL_1
+
+    /// Inline-cached attribute select.
+    /// Operand: index into CompilationUnit::attrCaches.
+    /// On a cache hit (same Bindings* as last execution), the binary
+    /// search over Bindings is skipped — direct cached load.
+    OP_ATTR_SELECT_CACHED = 0x55, // [cacheIdx:24]  cached attr select
 };
 
 
@@ -371,6 +377,25 @@ struct LambdaDescriptor
 };
 
 
+/// 4-way polymorphic inline cache for OP_ATTR_SELECT_CACHED.
+///
+/// Each call site stores up to 4 (Bindings*, Value*) pairs.  On lookup,
+/// linearly scan the 4 slots; on miss, evict the oldest entry (round-robin).
+///
+/// Nix attribute access is more polymorphic than monomorphic interpreters
+/// like Luau — `map (p: p.meta) packages` sees many different Bindings*
+/// at the same call site.  A 4-way PIC catches bimorphic and small
+/// polymorphic patterns common in nixpkgs.
+struct AttrCache
+{
+    Symbol name;
+    static constexpr int kEntries = 4;
+    const Bindings * bindings[kEntries] = {nullptr, nullptr, nullptr, nullptr};
+    Value * values[kEntries] = {nullptr, nullptr, nullptr, nullptr};
+    uint8_t nextEvict = 0;  ///< Round-robin index for eviction.
+};
+
+
 // ---------------------------------------------------------------------------
 // CompilationUnit
 // ---------------------------------------------------------------------------
@@ -415,6 +440,11 @@ struct CompilationUnit : gc
 
     // -- Position table (sparse, sorted by instrOffset) --
     std::vector<PosEntry> positions;
+
+    // -- Inline caches for OP_ATTR_SELECT / OP_SELECT_FORCE / OP_HAS_ATTR --
+    // One slot per call site, indexed by the operand of the instruction.
+    // mutable because the VM updates these at runtime on cache miss.
+    mutable std::vector<AttrCache> attrCaches;
 
     // -- Source path for cache keying and error messages --
     // May be nullptr for string-evaluated expressions.
@@ -482,6 +512,17 @@ struct CompilationUnit : gc
     /// Deduplicates via hash map (O(1) instead of linear scan).
     /// Defined in bytecode.cc (requires complete Symbol type).
     uint32_t addSymbol(Symbol sym);
+
+    /// Allocate an inline cache slot for an attribute access.
+    /// Each OP_ATTR_SELECT_CACHED call site gets its own 4-way PIC slot.
+    uint32_t addAttrCache(Symbol name)
+    {
+        uint32_t idx = static_cast<uint32_t>(attrCaches.size());
+        AttrCache c;
+        c.name = name;
+        attrCaches.push_back(c);
+        return idx;
+    }
 
     /// Hash map for O(1) symbol deduplication in addSymbol.
     std::unordered_map<Symbol, uint32_t> symbolIndex;
