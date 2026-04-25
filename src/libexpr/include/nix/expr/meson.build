@@ -30,6 +30,7 @@ headers = [ config_pub_h ] + files(
   'gc-small-vector.hh',
   'get-drvs.hh',
   'json-to-value.hh',
+  'nix-word.hh',
   'nixexpr.hh',
   'parser-state.hh',
   'primops.hh',

@@ -13,6 +13,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-error.hh"
+#include "nix/expr/nix-word.hh"
 #include "nix/expr/print.hh"
 #include "nix/util/environment-variables.hh"
 
@@ -34,6 +35,26 @@ namespace nix::bytecode {
 //
 // The step counter is global (across all vmExec invocations) so you can
 // pinpoint the exact moment something goes wrong in a long evaluation.
+
+/// Materialize a tagged immediate into a heap-allocated Value.
+/// If `w` is already a real pointer (low bit clear), returns it unchanged.
+/// If `w` is a tagged immediate, allocates a Value and decodes the tag.
+[[gnu::always_inline]]
+static inline Value * materializeWord(EvalState & state, Value * w)
+{
+    if (!nanbox::isTagged(w)) [[likely]]
+        return w;
+    Value * v = state.allocValue();
+    if (nanbox::isTaggedInt(w))
+        v->mkInt(static_cast<NixInt::Inner>(nanbox::decodeInt(w)));
+    else if (nanbox::isTaggedBool(w))
+        v->mkBool(nanbox::decodeBool(w));
+    else if (nanbox::isTaggedNull(w))
+        v->mkNull();
+    else
+        abort();  // unreachable: unknown tag
+    return v;
+}
 
 /// Small integer cache (NaN-boxing approximation).
 ///
@@ -379,8 +400,10 @@ static void vmStrConcat(
     constexpr uint32_t kStackPartsMax = 64;
     Value * stackParts[kStackPartsMax];
     Value ** parts = nParts <= kStackPartsMax ? stackParts : new Value*[nParts];
-    for (uint32_t i = nParts; i > 0; --i)
-        parts[i - 1] = vm.pop();
+    for (uint32_t i = nParts; i > 0; --i) {
+        Value * v = vm.pop();
+        parts[i - 1] = materializeWord(state, v);
+    }
 
     for (uint32_t i = 0; i < nParts; i++) {
         Value & vTmp = *parts[i];
@@ -459,8 +482,10 @@ static Value * vmAttrsInit(
     Value * stackValues[kStackMax];
     Value ** values = nAttrs <= kStackMax
         ? stackValues : new Value*[nAttrs];
-    for (uint32_t i = nAttrs; i > 0; --i)
-        values[i - 1] = vm.pop();
+    for (uint32_t i = nAttrs; i > 0; --i) {
+        Value * v = vm.pop();
+        values[i - 1] = materializeWord(state, v);
+    }
     for (uint32_t i = 0; i < nAttrs; i++) {
         uint32_t symIdx = decodeOperand(cu->code[ip++]);
         uint32_t posIdx = decodeOperand(cu->code[ip++]);
@@ -487,15 +512,19 @@ static Value * vmAttrsDynInit(
     DynPair dynStack[kMaxDyn];
     DynPair * dynPairs = nDynamic <= kMaxDyn ? dynStack : new DynPair[nDynamic];
     for (uint32_t i = nDynamic; i > 0; --i) {
-        dynPairs[i-1].val  = vm.pop();
-        dynPairs[i-1].name = vm.pop();
+        Value * val = vm.pop();
+        Value * name = vm.pop();
+        dynPairs[i-1].val  = materializeWord(state, val);
+        dynPairs[i-1].name = materializeWord(state, name);
     }
     // Pop static values.
     constexpr uint32_t kMaxStatic = 64;
     Value * staticStack[kMaxStatic];
     Value ** staticVals = nStatic <= kMaxStatic ? staticStack : new Value*[nStatic];
-    for (uint32_t i = nStatic; i > 0; --i)
-        staticVals[i-1] = vm.pop();
+    for (uint32_t i = nStatic; i > 0; --i) {
+        Value * v = vm.pop();
+        staticVals[i-1] = materializeWord(state, v);
+    }
 
     auto bindings = state.buildBindings(nStatic + nDynamic);
     for (uint32_t i = 0; i < nStatic; i++) {
@@ -547,9 +576,12 @@ static void vmCallMultiArg(
 {
     assert(nArgs <= 16);
     Value * args[16];
-    for (uint32_t i = nArgs; i > 0; --i)
-        args[i - 1] = vm.pop();
+    for (uint32_t i = nArgs; i > 0; --i) {
+        Value * v = vm.pop();
+        args[i - 1] = materializeWord(state, v);
+    }
     Value * fun = vm.pop();
+    fun = materializeWord(state, fun);
     auto * result = state.allocValue();
     state.callFunction(*fun, std::span<Value *>(args, nArgs), *result, pos);
     vm.push(result);
@@ -872,14 +904,9 @@ op_int:
 #endif
     {
         uint32_t imm = decodeOperand(CUR_INSTR);
-        // Small int cache fast path — avoid allocValue for common ints.
-        if (imm < kSmallIntCacheSize) [[likely]] {
-            vm.push(&smallIntCache[imm]);
-            DISPATCH();
-        }
-        auto * v = state.allocValue();
-        v->mkInt(static_cast<NixInt::Inner>(imm));
-        vm.push(v);
+        // 24-bit immediates always fit in 60-bit tagged int (positive).
+        // No allocation, no cache lookup — just encode directly.
+        vm.push(nanbox::encodeInt(static_cast<int64_t>(imm)));
         DISPATCH();
     }
 
@@ -896,6 +923,10 @@ op_return:
         bool wasThunkForce = frame.isThunkForce;
         Value * resultSlot = frame.resultSlot;
         size_t stackBase = frame.stackBaseOffset;
+
+        // Materialize tagged immediates before writing to resultSlot
+        // (which is a real heap-allocated Value).
+        retVal = materializeWord(state, retVal);
 
         // Write the result into the caller's result slot.
         *resultSlot = *retVal;
@@ -1017,7 +1048,9 @@ op_get_local_0_force:
         uint32_t displ = decodeOperand(CUR_INSTR);
         Value * v = curEnv->values[displ];
         vm.push(v);
-        // Fast path: already forced (most common case).
+        // Fast path: tagged scalars or already-forced values.
+        if (nanbox::isTagged(v)) [[likely]]
+            DISPATCH();
         if (!v->isThunk() && !v->isApp()) [[likely]]
             DISPATCH();
         PosIdx pos = cu->posForOffset(ip - 1);
@@ -1197,6 +1230,10 @@ op_force:
     {
         Value * v = vm.top();
 
+        // Fast path: tagged scalars (int/bool/null) are always forced.
+        if (nanbox::isTagged(v)) [[likely]]
+            DISPATCH();
+
         // Fast path: value is already forced (most common case).
         // Skip all branch checks for ints, strings, attrsets, lists, etc.
         if (!v->isThunk() && !v->isApp()) [[likely]]
@@ -1364,7 +1401,16 @@ op_jump_if_false:
     {
         int32_t offset = decodeSigned(CUR_INSTR);
         Value * v = vm.pop();
+
+        // Tagged bool fast path.
+        if (nanbox::isTaggedBool(v)) [[likely]] {
+            if (!nanbox::decodeBool(v))
+                ip = static_cast<uint32_t>(static_cast<int32_t>(ip) + offset);
+            DISPATCH();
+        }
+
         PosIdx pos = cu->posForOffset(ip - 1);
+        v = materializeWord(state, v);
         state.forceValue(*v, pos);
         if (v->type() != nBool)
             state.error<TypeError>("expected a Boolean but found %1%: %2%",
@@ -1383,7 +1429,16 @@ op_jump_if_true:
     {
         int32_t offset = decodeSigned(CUR_INSTR);
         Value * v = vm.pop();
+
+        // Tagged bool fast path.
+        if (nanbox::isTaggedBool(v)) [[likely]] {
+            if (nanbox::decodeBool(v))
+                ip = static_cast<uint32_t>(static_cast<int32_t>(ip) + offset);
+            DISPATCH();
+        }
+
         PosIdx pos = cu->posForOffset(ip - 1);
+        v = materializeWord(state, v);
         state.forceValue(*v, pos);
         if (v->type() != nBool)
             state.error<TypeError>("expected a Boolean but found %1%: %2%",
@@ -1407,6 +1462,24 @@ op_add:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged-int + tagged-int fast path — no allocation, no force.
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            int64_t a = nanbox::decodeInt(lhs);
+            int64_t b = nanbox::decodeInt(rhs);
+            int64_t sum;
+            if (!__builtin_add_overflow(a, b, &sum)
+                && nanbox::intFitsTagged(sum)) {
+                vm.push(nanbox::encodeInt(sum));
+                DISPATCH();
+            }
+            // Overflow or doesn't fit in 60 bits — fall through to heap.
+        }
+
+        // Materialize tagged operands so the rest of the code can treat
+        // them as real Value*s.
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
         state.forceValue(*lhs, pos);
         state.forceValue(*rhs, pos);
 
@@ -1441,6 +1514,21 @@ op_sub:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged-int fast path.
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            int64_t a = nanbox::decodeInt(lhs);
+            int64_t b = nanbox::decodeInt(rhs);
+            int64_t diff;
+            if (!__builtin_sub_overflow(a, b, &diff)
+                && nanbox::intFitsTagged(diff)) {
+                vm.push(nanbox::encodeInt(diff));
+                DISPATCH();
+            }
+        }
+
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
         state.forceValue(*lhs, pos);
         state.forceValue(*rhs, pos);
 
@@ -1475,6 +1563,21 @@ op_mul:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged-int fast path.
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            int64_t a = nanbox::decodeInt(lhs);
+            int64_t b = nanbox::decodeInt(rhs);
+            int64_t prod;
+            if (!__builtin_mul_overflow(a, b, &prod)
+                && nanbox::intFitsTagged(prod)) {
+                vm.push(nanbox::encodeInt(prod));
+                DISPATCH();
+            }
+        }
+
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
         state.forceValue(*lhs, pos);
         state.forceValue(*rhs, pos);
 
@@ -1509,6 +1612,25 @@ op_div:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged-int fast path (integer division).
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            int64_t b = nanbox::decodeInt(rhs);
+            if (b != 0) {
+                int64_t a = nanbox::decodeInt(lhs);
+                // Watch for INT_MIN / -1 overflow.
+                if (!(a == INT64_MIN && b == -1)) {
+                    int64_t q = a / b;
+                    if (nanbox::intFitsTagged(q)) {
+                        vm.push(nanbox::encodeInt(q));
+                        DISPATCH();
+                    }
+                }
+            }
+        }
+
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
         state.forceValue(*lhs, pos);
         state.forceValue(*rhs, pos);
 
@@ -1542,6 +1664,20 @@ op_negate:
     {
         Value * v = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged-int fast path.
+        if (nanbox::isTaggedInt(v)) [[likely]] {
+            int64_t a = nanbox::decodeInt(v);
+            if (a != INT64_MIN) {
+                int64_t neg = -a;
+                if (nanbox::intFitsTagged(neg)) {
+                    vm.push(nanbox::encodeInt(neg));
+                    DISPATCH();
+                }
+            }
+        }
+
+        v = materializeWord(state, v);
         state.forceValue(*v, pos);
 
         auto * result = state.allocValue();
@@ -1573,6 +1709,23 @@ op_eq:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged scalar fast paths.
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            bool eq = nanbox::decodeInt(lhs) == nanbox::decodeInt(rhs);
+            vm.push(eq ? &Value::vTrue : &Value::vFalse);
+            DISPATCH();
+        }
+        if (nanbox::isTagged(lhs) || nanbox::isTagged(rhs)) {
+            // Mixed: pointer equality (cheap) or materialize for full check.
+            if (lhs == rhs) {
+                vm.push(&Value::vTrue);
+                DISPATCH();
+            }
+            lhs = materializeWord(state, lhs);
+            rhs = materializeWord(state, rhs);
+        }
+
         state.forceValue(*lhs, pos);
         state.forceValue(*rhs, pos);
 
@@ -1606,6 +1759,18 @@ op_neq:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged scalar fast paths.
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            bool neq = nanbox::decodeInt(lhs) != nanbox::decodeInt(rhs);
+            vm.push(neq ? &Value::vTrue : &Value::vFalse);
+            DISPATCH();
+        }
+        if (nanbox::isTagged(lhs) || nanbox::isTagged(rhs)) {
+            lhs = materializeWord(state, lhs);
+            rhs = materializeWord(state, rhs);
+        }
+
         state.forceValue(*lhs, pos);
         state.forceValue(*rhs, pos);
 
@@ -1638,6 +1803,16 @@ op_less_than:
         Value * rhs = vm.pop();
         Value * lhs = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged-int fast path.
+        if (nanbox::isTaggedInt(lhs) && nanbox::isTaggedInt(rhs)) [[likely]] {
+            bool lt = nanbox::decodeInt(lhs) < nanbox::decodeInt(rhs);
+            vm.push(lt ? &Value::vTrue : &Value::vFalse);
+            DISPATCH();
+        }
+
+        lhs = materializeWord(state, lhs);
+        rhs = materializeWord(state, rhs);
         state.forceValue(*lhs, pos);
         state.forceValue(*rhs, pos);
 
@@ -1673,6 +1848,14 @@ op_not:
     {
         Value * v = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged bool fast path.
+        if (nanbox::isTaggedBool(v)) [[likely]] {
+            vm.push(nanbox::decodeBool(v) ? &Value::vFalse : &Value::vTrue);
+            DISPATCH();
+        }
+
+        v = materializeWord(state, v);
         state.forceValue(*v, pos);
         if (v->type() != nBool)
             state.error<TypeError>("expected a Boolean but found %1%: %2%",
@@ -1694,6 +1877,16 @@ op_assert:
     {
         Value * cond = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Tagged bool fast path.
+        if (nanbox::isTaggedBool(cond)) [[likely]] {
+            if (!nanbox::decodeBool(cond))
+                state.error<AssertionError>("assertion '%1%' failed", "bytecoded assertion")
+                    .atPos(pos).debugThrow();
+            DISPATCH();
+        }
+
+        cond = materializeWord(state, cond);
         state.forceValue(*cond, pos);
         if (cond->type() != nBool)
             state.error<TypeError>("expected a Boolean but found %1%: %2%",
@@ -1764,9 +1957,8 @@ op_set_env_slot:
     {
         uint32_t displ = decodeOperand(CUR_INSTR);
         Value * v = vm.pop();
-        // Heap-persist if needed: the value must outlive the stack frame.
-        // Since our stack holds Value*, and the value is either from a
-        // constant pool or already GC-allocated, we can store it directly.
+        // Materialize before storing in heap env.
+        v = materializeWord(state, v);
         curEnv->values[displ] = v;
         DISPATCH();
     }
@@ -1803,6 +1995,7 @@ op_inherit_from_set:
         // The value was pushed by the preceding thunk/eager compilation.
         uint32_t displ = decodeOperand(CUR_INSTR);
         Value * v = vm.pop();
+        v = materializeWord(state, v);
         curEnv->values[displ] = v;
         DISPATCH();
     }
@@ -1818,6 +2011,7 @@ op_set_env_slot_up:
         // and the let env is curEnv->up. Binding values go into the let env.
         uint32_t displ = decodeOperand(CUR_INSTR);
         Value * v = vm.pop();
+        v = materializeWord(state, v);
         curEnv->up->values[displ] = v;
         DISPATCH();
     }
@@ -1897,6 +2091,10 @@ op_call_1:
         Value * arg = vm.pop();
         Value * fun = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
+        // Materialize tagged immediates — fun and arg need to be real
+        // Values for callFunction / forceValue / closure dispatch.
+        fun = materializeWord(state, fun);
+        arg = materializeWord(state, arg);
         state.forceValue(*fun, pos);
 
         // ── v2 fast path: upvalue-based closures ──
@@ -2533,8 +2731,10 @@ op_list_init:
         } else {
             auto list = state.mem.buildList(size);
             // Pop values in reverse order (last pushed = last element).
-            for (uint32_t i = size; i > 0; --i)
-                list[i - 1] = vm.pop();
+            for (uint32_t i = size; i > 0; --i) {
+                Value * v = vm.pop();
+                list[i - 1] = materializeWord(state, v);
+            }
             auto * result = state.allocValue();
             result->mkList(list);
             vm.push(result);
@@ -2696,9 +2896,11 @@ op_set_stack_slot:
     {
         uint32_t slot = decodeOperand(CUR_INSTR);
         Value * v = vm.pop();
+        // Materialize tagged immediate before storing to slot.
+        // This ensures slots always contain real Value* pointers,
+        // simplifying readers throughout the VM.
+        v = materializeWord(state, v);
         size_t base = vm.frames.back().stackBaseOffset;
-        // Ensure the slot exists in the stack.  If needed, push nulls
-        // to extend up to the slot index.
         size_t targetIdx = base + slot;
         while (vm.stackSize() <= targetIdx) {
             vm.push(&Value::vNull);
@@ -2866,7 +3068,9 @@ op_get_slot_force:
         size_t base = vm.frames.back().stackBaseOffset;
         Value * v = vm.stack[base + slot];
         vm.push(v);
-        // Fast path: already forced.
+        // Fast path: tagged scalar or already-forced.
+        if (nanbox::isTagged(v)) [[likely]]
+            DISPATCH();
         if (!v->isThunk() && !v->isApp()) [[likely]]
             DISPATCH();
         PosIdx pos = cu->posForOffset(ip - 1);
