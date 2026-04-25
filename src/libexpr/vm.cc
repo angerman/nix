@@ -776,6 +776,7 @@ void vmExec(
         REGISTER_OP(OP_RMUL_R, op_rmul_r);
         REGISTER_OP(OP_RLESS_R, op_rless_r);
         REGISTER_OP(OP_REQ_R, op_req_r);
+        REGISTER_OP(OP_RATTR_SELF_R, op_rattr_self_r);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -3638,6 +3639,82 @@ op_req_r:
         else if (lhs->type() == nNull && rhs->type() == nNull) eq = true;
         else eq = state.eqValues(*lhs, *rhs, pos, "while comparing two values");
         vm.stack[base + dstSlot] = eq ? &Value::vTrue : &Value::vFalse;
+        DISPATCH();
+    }
+
+    // OP_RATTR_SELF_R: dst = (*attrs).<attr>, then force.
+    // Operand: [dst:8|attrsSlot:8|cacheIdxLow:8].  Limited to cache
+    // indices < 256.  For larger indices, fall back to stack form.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rattr_self_r:
+#else
+    case OP_RATTR_SELF_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t dstSlot = bytecode::unpackDst(operand);
+        uint8_t attrsSlot = bytecode::unpackA(operand);
+        uint8_t cacheIdx = bytecode::unpackB(operand);
+        size_t base = vm.frames.back().stackBaseOffset;
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+
+        AttrCache & cache = cu->attrCaches[cacheIdx];
+        Value * attrs = vm.stack[base + attrsSlot];
+        PosIdx pos = cu->posForOffset(ip - 1);
+
+        // Force attrs if needed.
+        if (!nanbox::isTagged(attrs)
+            && (attrs->isThunk() || attrs->isApp())) {
+            state.forceValue(*attrs, pos);
+            // Re-read since forceValue may have updated.
+            attrs = vm.stack[base + attrsSlot];
+        }
+
+        if (nanbox::isTagged(attrs)) {
+            attrs = materializeWord(state, attrs);
+        }
+        if (attrs->type() != nAttrs)
+            state.error<EvalError>("expected an attrset").atPos(pos).debugThrow();
+
+        const Bindings * b = attrs->attrs();
+
+        // 4-way PIC scan.
+        Value * selected = nullptr;
+        if (cache.bindings[0] == b) [[likely]] {
+            vm.nrAttrCacheHits++;
+            selected = cache.values[0];
+        } else if (cache.bindings[1] == b) {
+            vm.nrAttrCacheHits++;
+            selected = cache.values[1];
+        } else if (cache.bindings[2] == b) {
+            vm.nrAttrCacheHits++;
+            selected = cache.values[2];
+        } else if (cache.bindings[3] == b) {
+            vm.nrAttrCacheHits++;
+            selected = cache.values[3];
+        } else {
+            vm.nrAttrCacheMisses++;
+            if (auto j = b->get(cache.name)) {
+                uint8_t evict = cache.nextEvict;
+                cache.bindings[evict] = b;
+                cache.values[evict] = j->value;
+                cache.nextEvict = (evict + 1) & 3;
+                selected = j->value;
+            } else {
+                state.error<EvalError>("attribute '%1%' missing",
+                    state.symbols[cache.name]).atPos(pos).debugThrow();
+            }
+        }
+
+        // Force the selected value if it's a thunk.
+        if (!nanbox::isTagged(selected)
+            && (selected->isThunk() || selected->isApp())) {
+            state.forceValue(*selected, pos);
+        }
+
+        vm.stack[base + dstSlot] = selected;
         DISPATCH();
     }
 

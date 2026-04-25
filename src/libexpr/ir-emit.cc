@@ -415,6 +415,28 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
             TRY_REGISTER_BINOP(IREq,   OP_REQ_R)
 
             #undef TRY_REGISTER_BINOP
+
+            // -- Pattern: register-form attr select (cached) --
+            // For IRAttrSelect where attrs is a local slot, emit
+            // OP_RATTR_SELF_R to write directly to dst slot.
+            if (auto * sel = std::get_if<ir::IRAttrSelect>(&binding.expr)) {
+                auto attrsIt = ctx.localSlots.find(sel->attrs);
+                if (attrsIt != ctx.localSlots.end()
+                    && attrsIt->second <= 0xFF) {
+                    uint32_t cacheIdx = unit.addAttrCache(sel->name);
+                    if (cacheIdx <= 0xFF) {
+                        uint32_t dstSlot = ctx.allocSlot(binding.result);
+                        if (dstSlot <= 0xFF) {
+                            unit.emitPos(binding.pos);
+                            unit.emit(OP_RATTR_SELF_R, bytecode::packABC(
+                                static_cast<uint8_t>(dstSlot),
+                                static_cast<uint8_t>(attrsIt->second),
+                                static_cast<uint8_t>(cacheIdx)));
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         emitExpr(binding.expr, binding.pos, ctx);
