@@ -711,6 +711,7 @@ void vmExec(
         REGISTER_OP(OP_GET_UV_FORCE,     op_get_uv_force);
         REGISTER_OP(OP_SLOT_SLOT_CALL1,  op_slot_slot_call1);
         REGISTER_OP(OP_ATTR_SELECT_CACHED, op_attr_select_cached);
+        REGISTER_OP(OP_ATTR_SELECT_FORCE_CACHED, op_attr_select_force_cached);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2267,6 +2268,59 @@ op_attr_select_cached:
             state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
                 .atPos(pos).debugThrow();
         }
+        DISPATCH();
+    }
+
+    // Fused: cached attr select + force.  Same as OP_ATTR_SELECT_CACHED
+    // followed by OP_FORCE, but in a single dispatch.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_attr_select_force_cached:
+#else
+    case OP_ATTR_SELECT_FORCE_CACHED:
+#endif
+    {
+        uint32_t cacheIdx = decodeOperand(CUR_INSTR);
+        AttrCache & cache = cu->attrCaches[cacheIdx];
+        Value * attrs = vm.top();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceAttrs(*attrs, pos, "while selecting an attribute");
+        const Bindings * b = attrs->attrs();
+
+        Value * selected = nullptr;
+
+        // Fast path: 4-way PIC scan.
+        if (cache.bindings[0] == b) [[likely]] {
+            vm.nrAttrCacheHits++;
+            selected = cache.values[0];
+        } else if (cache.bindings[1] == b) {
+            vm.nrAttrCacheHits++;
+            selected = cache.values[1];
+        } else if (cache.bindings[2] == b) {
+            vm.nrAttrCacheHits++;
+            selected = cache.values[2];
+        } else if (cache.bindings[3] == b) {
+            vm.nrAttrCacheHits++;
+            selected = cache.values[3];
+        } else {
+            vm.nrAttrCacheMisses++;
+            if (auto j = b->get(cache.name)) {
+                uint8_t evict = cache.nextEvict;
+                cache.bindings[evict] = b;
+                cache.values[evict] = j->value;
+                cache.nextEvict = (evict + 1) & 3;
+                selected = j->value;
+            } else {
+                state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
+                    .atPos(pos).debugThrow();
+            }
+        }
+
+        // Replace top of stack and force the result inline.
+        *(vm.sp - 1) = selected;
+        if (!selected->isThunk() && !selected->isApp()) [[likely]]
+            DISPATCH();
+        // Slow path: force the value.
+        state.forceValue(*selected, pos);
         DISPATCH();
     }
 

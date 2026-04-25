@@ -300,6 +300,11 @@ enum Op : uint8_t {
     /// On a cache hit (same Bindings* as last execution), the binary
     /// search over Bindings is skipped — direct cached load.
     OP_ATTR_SELECT_CACHED = 0x55, // [cacheIdx:24]  cached attr select
+
+    /// Fused cached attr select + force.  The most common attribute
+    /// access pattern (e.g., `pkg.meta.description`) is select-then-force.
+    /// One dispatch instead of two.
+    OP_ATTR_SELECT_FORCE_CACHED = 0x56, // [cacheIdx:24]
 };
 
 
