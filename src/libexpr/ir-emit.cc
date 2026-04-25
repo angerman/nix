@@ -330,6 +330,24 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
 
     // Emit each binding.
     for (const auto & binding : block.bindings) {
+        // Mini register-based optimization: detect the simple alias
+        // pattern `let a = b; ...` where b is a local slot.  Emit
+        // OP_MOV_SLOTS instead of GET_STACK_SLOT + SET_STACK_SLOT.
+        if (!(nFwd > 0 && forwardRefs.count(binding.result))) {
+            if (auto * varRef = std::get_if<ir::IRVarRef>(&binding.expr)) {
+                auto srcIt = ctx.localSlots.find(varRef->var);
+                if (srcIt != ctx.localSlots.end()
+                    && srcIt->second < 4096) {
+                    uint32_t dstSlot = ctx.allocSlot(binding.result);
+                    if (dstSlot < 4096) {
+                        unit.emit(OP_MOV_SLOTS,
+                            (srcIt->second << 12) | dstSlot);
+                        continue;
+                    }
+                }
+            }
+        }
+
         emitExpr(binding.expr, binding.pos, ctx);
 
         if (nFwd > 0 && forwardRefs.count(binding.result)) {

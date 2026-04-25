@@ -305,6 +305,12 @@ enum Op : uint8_t {
     /// access pattern (e.g., `pkg.meta.description`) is select-then-force.
     /// One dispatch instead of two.
     OP_ATTR_SELECT_FORCE_CACHED = 0x56, // [cacheIdx:24]
+
+    /// Slot-to-slot copy (mini register-based op).
+    /// Operand: [srcSlot:12|dstSlot:12].  Equivalent to GET_STACK_SLOT(src)
+    /// + SET_STACK_SLOT(dst) in one dispatch.  Saves the operand stack
+    /// round-trip for simple alias bindings (`let a = b; in ...`).
+    OP_MOV_SLOTS = 0x57, // [srcSlot:12|dstSlot:12]
 };
 
 

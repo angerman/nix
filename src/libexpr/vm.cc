@@ -735,6 +735,7 @@ void vmExec(
         REGISTER_OP(OP_SLOT_SLOT_CALL1,  op_slot_slot_call1);
         REGISTER_OP(OP_ATTR_SELECT_CACHED, op_attr_select_cached);
         REGISTER_OP(OP_ATTR_SELECT_FORCE_CACHED, op_attr_select_force_cached);
+        REGISTER_OP(OP_MOV_SLOTS, op_mov_slots);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2979,6 +2980,27 @@ op_slot_slot_call1:
         vm.push(vm.stack[base + funcSlot]);
         vm.push(vm.stack[base + argSlot]);
         goto op_call_1;  // fall through to CALL_1 handler
+    }
+
+    // Slot-to-slot copy (mini register-based op).
+    // Equivalent to GET_STACK_SLOT(src) + SET_STACK_SLOT(dst) in one
+    // dispatch.  Skips the operand stack round-trip entirely.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_mov_slots:
+#else
+    case OP_MOV_SLOTS:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t srcSlot = operand >> 12;
+        uint32_t dstSlot = operand & 0xFFF;
+        size_t base = vm.frames.back().stackBaseOffset;
+        // Auto-extend stack if dstSlot is beyond current end.
+        size_t needed = base + dstSlot + 1;
+        while (vm.stackSize() < needed)
+            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = vm.stack[base + srcSlot];
+        DISPATCH();
     }
 
     // ==================================================================
