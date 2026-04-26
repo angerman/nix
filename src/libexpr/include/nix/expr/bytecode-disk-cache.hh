@@ -49,6 +49,20 @@ public:
     /// std::nullopt on miss or schema mismatch.  Updates last_used.
     std::optional<std::string> lookup(const CacheKey & key);
 
+    /// M8: zero-copy variant of lookup.  Invokes `consume(blob)` while
+    /// the SQLite blob's memory is still live (no std::string copy
+    /// out).  Returns true if the key was found and the consumer was
+    /// invoked, false on miss or failure.  The consumer must finish
+    /// using `blob` before returning — the SQLite statement is reset
+    /// when the consumer returns.
+    ///
+    /// Lock is held for the duration of `consume`.  Concurrent lookups
+    /// from other threads will block until consume returns, so keep
+    /// the consumer fast (typical use: deserializeCU).
+    bool lookupView(
+        const CacheKey & key,
+        const std::function<void(std::string_view)> & consume);
+
     /// Insert a CU blob.  No-op on key collision (caller's previous
     /// blob wins).  No-op on internal failure.
     void insert(const CacheKey & key, std::string_view blob,

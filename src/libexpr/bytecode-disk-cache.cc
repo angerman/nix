@@ -154,6 +154,49 @@ public:
         }
     }
 
+    /// M8: zero-copy lookup — invoke consumer with the SQLite blob view
+    /// while the lock is still held.  Saves the std::string copy in the
+    /// hot warm-cache path.
+    bool lookupView(
+        const CacheKey & key,
+        const std::function<void(std::string_view)> & consume)
+    {
+        if (failed) { misses++; return false; }
+        try {
+            auto state(_state->lock());
+            sqlite3_stmt * raw = static_cast<sqlite3_stmt *>(state->lookup);
+            sqlite3_reset(raw);
+            sqlite3_bind_blob(raw, 1, key.hash.hash, key.hash.hashSize,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_int64(raw, 2, kBytecodeSerializeSchemaVersion);
+            int rc = sqlite3_step(raw);
+            if (rc != SQLITE_ROW) {
+                misses++;
+                return false;
+            }
+            const void * data = sqlite3_column_blob(raw, 0);
+            int len = sqlite3_column_bytes(raw, 0);
+            std::string_view blob(
+                static_cast<const char *>(data),
+                static_cast<size_t>(len));
+            consume(blob);
+            // Best-effort LRU bump.
+            try {
+                state->updateLastUsed.use()(
+                    key.hash.hash, key.hash.hashSize).exec();
+            } catch (...) {
+                ignoreExceptionExceptInterrupt();
+            }
+            hits++;
+            return true;
+        } catch (...) {
+            ignoreExceptionExceptInterrupt();
+            failed = true;
+            misses++;
+            return false;
+        }
+    }
+
     void insert(const CacheKey & key, std::string_view blob, std::string_view src)
     {
         if (failed) return;
@@ -230,6 +273,13 @@ BytecodeDiskCache::~BytecodeDiskCache() = default;
 std::optional<std::string> BytecodeDiskCache::lookup(const CacheKey & key)
 {
     return impl->lookup(key);
+}
+
+bool BytecodeDiskCache::lookupView(
+    const CacheKey & key,
+    const std::function<void(std::string_view)> & consume)
+{
+    return impl->lookupView(key, consume);
 }
 
 void BytecodeDiskCache::insert(const CacheKey & key, std::string_view blob,

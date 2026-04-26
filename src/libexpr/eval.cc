@@ -1237,24 +1237,34 @@ void EvalState::eval(Expr * e, Value & v)
                             if (!bytecodeDiskCache)
                                 bytecodeDiskCache =
                                     std::make_unique<bytecode::BytecodeDiskCache>();
-                            if (auto blob = bytecodeDiskCache->lookup(key)) {
-                                try {
-                                    unit = bytecode::deserializeCU(*blob, *this);
-                                    nrBytecodeDiskCacheHits++;
-                                    bytecodeCache[e] = unit;
-                                    auto tx0 = std::chrono::steady_clock::now();
-                                    bytecode::vmExec(*this, *unit, 0, baseEnv, v);
-                                    auto tx1 = std::chrono::steady_clock::now();
-                                    bytecodeExecTimeUs += std::chrono::duration_cast<
-                                        std::chrono::microseconds>(tx1 - tx0).count();
-                                    return;
-                                } catch (bytecode::SerializationError &) {
-                                    // Corrupt entry; fall through to recompile.
-                                    nrBytecodeDiskCacheCorrupt++;
-                                }
-                            } else {
+                            // M8: zero-copy lookup via consumer callback.
+                            // Skips a std::string copy of the SQLite blob;
+                            // deserializer reads directly from the locked
+                            // statement's blob view.
+                            bool corruptOrMissed = false;
+                            bool found = bytecodeDiskCache->lookupView(key,
+                                [&](std::string_view blob) {
+                                    try {
+                                        unit = bytecode::deserializeCU(blob, *this);
+                                    } catch (bytecode::SerializationError &) {
+                                        nrBytecodeDiskCacheCorrupt++;
+                                        unit = nullptr;
+                                        corruptOrMissed = true;
+                                    }
+                                });
+                            if (found && unit) {
+                                nrBytecodeDiskCacheHits++;
+                                bytecodeCache[e] = unit;
+                                auto tx0 = std::chrono::steady_clock::now();
+                                bytecode::vmExec(*this, *unit, 0, baseEnv, v);
+                                auto tx1 = std::chrono::steady_clock::now();
+                                bytecodeExecTimeUs += std::chrono::duration_cast<
+                                    std::chrono::microseconds>(tx1 - tx0).count();
+                                return;
+                            } else if (!found) {
                                 nrBytecodeDiskCacheMisses++;
                             }
+                            // Corrupt entry: fall through to recompile.
                         }
                     }
                 }
