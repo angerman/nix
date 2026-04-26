@@ -2760,12 +2760,19 @@ op_attr_select_cached:
         uint32_t cacheIdx = decodeOperand(CUR_INSTR);
         AttrCache & cache = cu->attrCaches[cacheIdx];
         Value * attrs = vm.top();
-        PosIdx pos = cu->posForOffset(ip - 1);
         if (nanbox::isTagged(attrs)) [[unlikely]] {
             attrs = materializeWord(state, attrs);
             *(vm.sp - 1) = attrs;
         }
-        state.forceAttrs(*attrs, pos, "while selecting an attribute");
+        // Fast path: if attrs is already a forced attrset, skip
+        // forceAttrs (avoids the virtual call + posForOffset for the
+        // common case where the value was already evaluated).
+        if (attrs->isThunk() || attrs->isApp()) [[unlikely]]
+            state.forceAttrs(*attrs, cu->posForOffset(ip - 1),
+                "while selecting an attribute");
+        else if (attrs->type() != nAttrs) [[unlikely]]
+            state.forceAttrs(*attrs, cu->posForOffset(ip - 1),
+                "while selecting an attribute");
         const Bindings * b = attrs->attrs();
 
         if (cache.entries[0].bindings == b) [[likely]] {
@@ -2794,7 +2801,7 @@ op_attr_select_cached:
             *(vm.sp - 1) = j->value;
         } else {
             state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
-                .atPos(pos).debugThrow();
+                .atPos(cu->posForOffset(ip - 1)).debugThrow();
         }
         DISPATCH();
     }
@@ -2810,12 +2817,17 @@ op_attr_select_force_cached:
         uint32_t cacheIdx = decodeOperand(CUR_INSTR);
         AttrCache & cache = cu->attrCaches[cacheIdx];
         Value * attrs = vm.top();
-        PosIdx pos = cu->posForOffset(ip - 1);
         if (nanbox::isTagged(attrs)) [[unlikely]] {
             attrs = materializeWord(state, attrs);
             *(vm.sp - 1) = attrs;
         }
-        state.forceAttrs(*attrs, pos, "while selecting an attribute");
+        // Skip forceAttrs for the common case where attrs is already
+        // a forced attrset.  Saves the virtual call + posForOffset
+        // binary search in the hot path.
+        if (attrs->isThunk() || attrs->isApp()
+            || attrs->type() != nAttrs) [[unlikely]]
+            state.forceAttrs(*attrs, cu->posForOffset(ip - 1),
+                "while selecting an attribute");
         const Bindings * b = attrs->attrs();
 
         Value * selected = nullptr;
@@ -2845,7 +2857,7 @@ op_attr_select_force_cached:
                     selected = j->value;
                 } else {
                     state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
-                        .atPos(pos).debugThrow();
+                        .atPos(cu->posForOffset(ip - 1)).debugThrow();
                 }
             }
         }
@@ -2855,7 +2867,7 @@ op_attr_select_force_cached:
         if (!selected->isThunk() && !selected->isApp()) [[likely]]
             DISPATCH();
         // Slow path: force the value.
-        state.forceValue(*selected, pos);
+        state.forceValue(*selected, cu->posForOffset(ip - 1));
         DISPATCH();
     }
 
