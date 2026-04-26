@@ -20,6 +20,8 @@
 #include <variant>
 #include <vector>
 
+#include <boost/unordered/unordered_flat_set.hpp>
+
 namespace nix::bytecode {
 
 // Per-call emit-phase timing observer.  Filled in when non-null.
@@ -357,7 +359,7 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
     // This mirrors how v1's OP_ENTER_LET pre-allocates env slots.
 
     // Collect the set of VarIds defined by bindings in this block.
-    std::unordered_set<ir::VarId> definedInBlock;
+    boost::unordered_flat_set<ir::VarId> definedInBlock;
     for (const auto & binding : block.bindings) {
         definedInBlock.insert(binding.result);
     }
@@ -382,9 +384,9 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
     // collectRefs() per binding.  Merging cuts the per-binding work
     // in half (B2).
     ctx.blockUseCounts.clear();
-    std::unordered_set<ir::VarId> forwardRefs;
+    boost::unordered_flat_set<ir::VarId> forwardRefs;
     {
-        std::unordered_set<ir::VarId> seenDefined;
+        boost::unordered_flat_set<ir::VarId> seenDefined;
         ir::FreeVars directRefs;
         for (const auto & binding : block.bindings) {
             directRefs.vars.clear();
@@ -1035,7 +1037,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                             // Attr missing: create default thunk.
                             unit.patchJump(jumpToDefault);
                             {
-                                std::unordered_set<ir::VarId> siblingVarIds;
+                                boost::unordered_flat_set<ir::VarId> siblingVarIds;
                                 for (uint32_t j = 0; j < nFormals; ++j)
                                     siblingVarIds.insert(bodyBlock.params[formalParamStart + j]);
                                 if (e.params.arg)
@@ -2275,7 +2277,7 @@ uint32_t IREmitter::emitFormalsBodyOnly(
             unit.patchJump(jumpToDefault);
             {
                 // Build sibling formal VarId → cell index mapping.
-                std::unordered_set<ir::VarId> siblingVarIds;
+                boost::unordered_flat_set<ir::VarId> siblingVarIds;
                 for (uint32_t j = 0; j < nFormals; ++j)
                     siblingVarIds.insert(block.params[formalParamStart + j]);
                 if (params.arg)
@@ -2390,14 +2392,14 @@ uint32_t IREmitter::emitInlineBlock(ir::BlockId blockId, BlockContext & ctx)
     // (e.g., `if cond then ... else let f = a: ... f ...; in ...`).
     // Without pre-allocation, the lambda tries to capture `f`'s VarId
     // before it has been assigned a stack slot.
-    std::unordered_set<ir::VarId> definedInBlock;
+    boost::unordered_flat_set<ir::VarId> definedInBlock;
     for (const auto & binding : block.bindings)
         definedInBlock.insert(binding.result);
 
     // Same forward-reference detection as emitBlock().
-    std::unordered_set<ir::VarId> forwardRefs;
+    boost::unordered_flat_set<ir::VarId> forwardRefs;
     {
-        std::unordered_set<ir::VarId> seenDefined;
+        boost::unordered_flat_set<ir::VarId> seenDefined;
         for (const auto & binding : block.bindings) {
             ir::FreeVars exprRefs;
             ir::collectRefs(binding.expr, exprRefs);
