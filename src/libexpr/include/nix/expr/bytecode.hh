@@ -488,19 +488,24 @@ struct LambdaDescriptor
 };
 
 
-/// 4-way polymorphic inline cache for OP_ATTR_SELECT_CACHED.
+/// 8-way polymorphic inline cache for OP_ATTR_SELECT_CACHED.
 ///
-/// Each call site stores up to 4 (Bindings*, Value*) pairs.  On lookup,
-/// linearly scan the 4 slots; on miss, evict the oldest entry (round-robin).
+/// Each call site stores up to 8 (Bindings*, Value*) pairs.  On lookup,
+/// linearly scan the slots; on miss, evict the oldest entry (round-robin).
 ///
 /// Nix attribute access is more polymorphic than monomorphic interpreters
 /// like Luau — `map (p: p.meta) packages` sees many different Bindings*
-/// at the same call site.  A 4-way PIC catches bimorphic and small
-/// polymorphic patterns common in nixpkgs.
+/// at the same call site.  Profiling against nixpkgs#hello.name showed
+/// the previous 4-way PIC running at 33.9% hit rate (essentially noise),
+/// suggesting the hot polymorphic sites had degree > 4.  Doubling to
+/// 8-way nearly doubles per-site memory (32B → 128B) but catches the
+/// real-world polymorphism without falling back to Bindings::get()
+/// binary search on every lookup.
 struct AttrCache
 {
     Symbol name;
-    static constexpr int kEntries = 4;
+    static constexpr int kEntries = 8;
+    static constexpr int kEvictMask = kEntries - 1;
 
     /// Interleaved (bindings, value) pairs to maximize cache-line locality
     /// — the hit path touches both fields in lockstep.  The hit branch

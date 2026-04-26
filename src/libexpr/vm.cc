@@ -2801,7 +2801,7 @@ op_attr_select_cached:
         if (auto j = b->get(cache.name)) {
             uint8_t evict = cache.nextEvict;
             cache.entries[evict] = {b, j->value};
-            cache.nextEvict = (evict + 1) & 3;
+            cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
             *(vm.sp - 1) = j->value;
         } else {
             state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
@@ -2857,7 +2857,7 @@ op_attr_select_force_cached:
                 if (auto j = b->get(cache.name)) {
                     uint8_t evict = cache.nextEvict;
                     cache.entries[evict] = {b, j->value};
-                    cache.nextEvict = (evict + 1) & 3;
+                    cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
                     selected = j->value;
                 } else {
                     state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
@@ -4174,7 +4174,7 @@ op_rattr_self_r:
                 if (auto j = b->get(cache.name)) {
                     uint8_t evict = cache.nextEvict;
                     cache.entries[evict] = {b, j->value};
-                    cache.nextEvict = (evict + 1) & 3;
+                    cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
                     selected = j->value;
                 } else {
                     state.error<EvalError>("attribute '%1%' missing",
