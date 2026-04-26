@@ -413,6 +413,14 @@ static Env * vmBindLambdaArg(
 }
 
 /// Sorted merge of two attrsets with RHS-wins duplicate resolution.
+///
+/// M2b: when LHS is non-empty, RHS is small, and LHS's layer chain is not
+/// already at maxLayers, build a layered Bindings (RHS as top layer over
+/// LHS) instead of materialising a flat copy.  Mirrors the tree-walker's
+/// optimisation in ExprOpUpdate::eval (eval.cc:~2261).  All callers of
+/// (*b)[N] in vm.cc are already guarded with !b->isLayered() and the
+/// libexpr-c API collapses layers before raw access, so layered results
+/// are safe to propagate.
 [[gnu::noinline]]
 static void vmAttrsUpdate(EvalState & state, Value & result, Value & lhs, Value & rhs)
 {
@@ -421,6 +429,22 @@ static void vmAttrsUpdate(EvalState & state, Value & result, Value & lhs, Value 
 
     if (bindings1.empty()) { result = rhs; return; }
     if (bindings2.empty()) { result = lhs; return; }
+
+    /* Layer when the RHS is small enough that copying it on top of an
+       already-allocated LHS Bindings is cheaper than materialising the
+       union as a fresh flat Bindings.  Use the same setting the tree-
+       walker honours, so behaviour is identical across both paths. */
+    const bool shouldLayer =
+        !bindings1.isLayerListFull()
+        && bindings2.size() <= state.settings.bindingsUpdateLayerRhsSizeThreshold;
+
+    if (shouldLayer) {
+        auto attrs = state.buildBindings(bindings2.size());
+        attrs.layerOnTopOf(bindings1);
+        std::ranges::copy(bindings2, std::back_inserter(attrs));
+        result.mkAttrs(attrs.alreadySorted());
+        return;
+    }
 
     auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
     auto i = bindings1.begin();
