@@ -391,6 +391,12 @@ struct Lowerer
     /// correctly (the bodies don't run until the let scope is fully
     /// built — by then all siblings are populated as captured upvalues).
     ///
+    /// Inherit handling: nix's bindVars binds the inherit'd ExprVar in
+    /// the PARENT env (without the new let scope), so we must lower
+    /// inherit bindings' RHS BEFORE pushing the new scope.  Plain
+    /// bindings are bound in the NEW env (so they see siblings) and are
+    /// lowered AFTER the scope is pushed.
+    ///
     /// Mutual references on EAGER values (`let x = y+1; y = x+1; in ...`)
     /// would still produce wrong results because the bindings are
     /// emitted in iteration order; full lazy let-rec requires thunked
@@ -400,30 +406,44 @@ struct Lowerer
         if (e->attrs->inheritFromExprs && !e->attrs->inheritFromExprs->empty())
             unsupported("let with inherit (from)");
 
-        // Pre-allocate VarIds (and populate the new scope) so that any
-        // expression we lower below sees the full sibling set.
-        size_t scopeIdx = scopes.size();
-        scopes.emplace_back();
-
+        // Pre-allocate VarIds (no scope pushed yet — inherit lowering
+        // below depends on the parent env still being on top).
+        Scope newScope;
         std::vector<ir::VarId> preallocVars;
         preallocVars.reserve(e->attrs->attrs->size());
         for (auto & kv : *e->attrs->attrs) {
             const auto & sym = kv.first;
             const auto & def = kv.second;
-            if (def.kind != nix::ExprAttrs::AttrDef::Kind::Plain)
-                unsupported("let with inherited binding");
+            if (def.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom)
+                unsupported("let with inherit (from)");
             ir::VarId v = m.freshVar();
             preallocVars.push_back(v);
-            scopes[scopeIdx].byDispl.push_back(v);
-            scopes[scopeIdx].byName.emplace(std::string(symbols[sym]), v);
+            newScope.byDispl.push_back(v);
+            newScope.byName.emplace(std::string(symbols[sym]), v);
         }
 
-        // Now lower each binding's RHS and tie its result to the
-        // pre-allocated VarId.
+        // Pass 1: lower Inherited bindings (parent env still active).
         size_t idx = 0;
         for (auto & kv : *e->attrs->attrs) {
-            ir::VarId rhs = lowerExpr(kv.second.e);
-            m.blocks[blockStack.back()].bindings.push_back({preallocVars[idx], ir::VarRef{rhs}});
+            if (kv.second.kind == nix::ExprAttrs::AttrDef::Kind::Inherited) {
+                ir::VarId rhs = lowerExpr(kv.second.e);
+                m.blocks[blockStack.back()].bindings.push_back(
+                    {preallocVars[idx], ir::VarRef{rhs}});
+            }
+            ++idx;
+        }
+
+        // Push the new let scope; Plain bindings see siblings.
+        scopes.push_back(std::move(newScope));
+
+        // Pass 2: lower Plain bindings.
+        idx = 0;
+        for (auto & kv : *e->attrs->attrs) {
+            if (kv.second.kind == nix::ExprAttrs::AttrDef::Kind::Plain) {
+                ir::VarId rhs = lowerExpr(kv.second.e);
+                m.blocks[blockStack.back()].bindings.push_back(
+                    {preallocVars[idx], ir::VarRef{rhs}});
+            }
             ++idx;
         }
 
@@ -455,8 +475,9 @@ struct Lowerer
         for (auto & kv : *e->attrs) {
             const auto & sym = kv.first;
             const auto & def = kv.second;
-            if (def.kind != nix::ExprAttrs::AttrDef::Kind::Plain)
-                unsupported("attrset with inherited binding");
+            if (def.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom)
+                unsupported("attrset with inherit (from)");
+            // Plain or Inherited: both store a def.e that produces the value.
             ir::VarId vv = lowerExpr(def.e);
             entries.push_back({internSym(sym), vv});
         }
