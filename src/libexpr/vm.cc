@@ -56,26 +56,6 @@ static inline Value * materializeWord(EvalState & state, Value * w)
     return v;
 }
 
-/// Small integer cache (NaN-boxing approximation).
-///
-/// Pre-allocated Value objects for ints 0..kSmallIntCacheSize-1.
-/// OP_INT pushes from this cache for small immediates instead of
-/// calling state.allocValue().  Eliminates ~100-300K Value allocations
-/// per nixpkgs evaluation.
-///
-/// Inspired by CPython's small int cache and Lua's NaN-boxing.
-/// Since Nix Values are immutable once typed, sharing a static cache
-/// is safe.  Multiple EvalStates and threads can read the same cache.
-static constexpr uint32_t kSmallIntCacheSize = 256;
-static Value smallIntCache[kSmallIntCacheSize];
-static std::once_flag smallIntCacheInitFlag;
-
-static void initSmallIntCache() {
-    for (uint32_t i = 0; i < kSmallIntCacheSize; i++) {
-        smallIntCache[i].mkInt(static_cast<NixInt::Inner>(i));
-    }
-}
-
 /// Print VM statistics at process exit when NIX_VM_STATS=1.
 static void printVMStats(const VMState & vm) {
     if (getEnv("NIX_VM_STATS").value_or("") != "1") return;
@@ -646,9 +626,6 @@ void vmExec(
     if (!state.vmState) [[unlikely]]
         state.vmState = std::make_unique<VMState>();
 
-    // Lazy-init the small integer cache (one-time, thread-safe).
-    std::call_once(smallIntCacheInitFlag, initSmallIntCache);
-
     auto & vm = *state.vmState;
 
     // Track the frame depth at entry so we know when OUR frames are
@@ -993,11 +970,16 @@ op_return:
         }
 
         // Materialize tagged immediates before writing to resultSlot
-        // (which is a real heap-allocated Value).
+        // (which is a real heap-allocated Value) or storing into a
+        // register-form parent slot.
         retVal = materializeWord(state, retVal);
 
-        // Write the result into the caller's result slot.
-        *resultSlot = *retVal;
+        // Write the result into the caller's result slot.  When
+        // resultSlot is nullptr (set by OP_RCALL1_R's fast path which
+        // skips the per-call Value alloc), the result is delivered
+        // directly via resultStoreSlot below — no copy needed.
+        if (resultSlot)
+            *resultSlot = *retVal;
 
         // Restore stack to frame entry point (offset-based, survives stack realloc).
         vm.sp = vm.stack + stackBase;
@@ -1094,15 +1076,16 @@ op_return:
             }
         }
 
-        // Register-form caller (OP_RCALL1_R): write the resultSlot
-        // POINTER directly to the parent frame's stack slot, skipping
-        // the operand-stack push.  This preserves any in-place updates
-        // (mkBlackhole→value transitions) while delivering the result
-        // straight into the destination register.
+        // Register-form caller (OP_RCALL1_R): write the result POINTER
+        // directly to the parent frame's stack slot, skipping the
+        // operand-stack push.  When resultSlot is nullptr, the fast
+        // path didn't pre-allocate — deliver retVal directly (saves
+        // one Value allocation per fast-path call).
         if (resultStoreSlot > 0) {
-            vm.stack[resultStoreParentBase + (resultStoreSlot - 1)] = resultSlot;
+            vm.stack[resultStoreParentBase + (resultStoreSlot - 1)] =
+                resultSlot ? resultSlot : retVal;
         } else if (!wasThunkForce) {
-            vm.push(resultSlot);
+            vm.push(resultSlot ? resultSlot : retVal);
         }
         DISPATCH();
     }
@@ -3287,8 +3270,7 @@ op_mov_slots:
         size_t base = vm.frames.back().stackBaseOffset;
         // Auto-extend stack if dstSlot is beyond current end.
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         vm.stack[base + dstSlot] = vm.stack[base + srcSlot];
         DISPATCH();
     }
@@ -3315,8 +3297,7 @@ op_rforce_from:
 
         // Auto-extend stack if dstSlot beyond current end.
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
 
         // Fast path: already forced.
         if (!v->isThunk() && !v->isApp()) [[likely]] {
@@ -3393,8 +3374,7 @@ op_rget_uv_to:
         size_t base = vm.frames.back().stackBaseOffset;
         // Auto-extend stack.
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         vm.stack[base + dstSlot] = upvalues[uvIdx];
         DISPATCH();
     }
@@ -3417,8 +3397,7 @@ op_ruvf_to:
 
         // Auto-extend stack.
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
 
         // Fast path: already forced.
         if (!v->isThunk() && !v->isApp()) [[likely]] {
@@ -3482,8 +3461,7 @@ op_radd_r:
         size_t base = vm.frames.back().stackBaseOffset;
         // Auto-extend stack for dst.
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         Value * lhs = vm.stack[base + lhsSlot];
         Value * rhs = vm.stack[base + rhsSlot];
 
@@ -3534,8 +3512,7 @@ op_rsub_r:
         uint8_t rhsSlot = bytecode::unpackB(operand);
         size_t base = vm.frames.back().stackBaseOffset;
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         Value * lhs = vm.stack[base + lhsSlot];
         Value * rhs = vm.stack[base + rhsSlot];
 
@@ -3585,8 +3562,7 @@ op_rmul_r:
         uint8_t rhsSlot = bytecode::unpackB(operand);
         size_t base = vm.frames.back().stackBaseOffset;
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         Value * lhs = vm.stack[base + lhsSlot];
         Value * rhs = vm.stack[base + rhsSlot];
 
@@ -3636,8 +3612,7 @@ op_rless_r:
         uint8_t rhsSlot = bytecode::unpackB(operand);
         size_t base = vm.frames.back().stackBaseOffset;
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         Value * lhs = vm.stack[base + lhsSlot];
         Value * rhs = vm.stack[base + rhsSlot];
 
@@ -3684,8 +3659,7 @@ op_req_r:
         uint8_t rhsSlot = bytecode::unpackB(operand);
         size_t base = vm.frames.back().stackBaseOffset;
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         Value * lhs = vm.stack[base + lhsSlot];
         Value * rhs = vm.stack[base + rhsSlot];
 
@@ -3768,8 +3742,7 @@ op_rcall1_r:
             // Pre-extend parent stack so dst slot exists when OP_RETURN
             // writes into it.
             size_t needed = base + dstSlot + 1;
-            while (vm.stackSize() < needed)
-                vm.push(const_cast<Value *>(&Value::vNull));
+            vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
 
             // Save parent frame; advance IP past the trailing
             // OP_SET_STACK_SLOT (already-handled by resultStoreSlot).
@@ -3783,7 +3756,10 @@ op_rcall1_r:
             newFrame.ip = startOffset;
             newFrame.env = fun->lambda().env;
             newFrame.stackBaseOffset = vm.stackSize();
-            newFrame.resultSlot = state.allocValue();
+            // Skip allocValue: when resultStoreSlot is set, OP_RETURN
+            // delivers retVal pointer directly to the parent's slot.
+            // Saves one Value alloc per fast-path call.
+            newFrame.resultSlot = nullptr;
             newFrame.callPos = pos;
             newFrame.upvalues = frameUpvalues;
             newFrame.resultStoreSlot = static_cast<uint32_t>(dstSlot) + 1;
@@ -3822,8 +3798,7 @@ op_rattr_self_r:
         uint8_t cacheIdx = bytecode::unpackB(operand);
         size_t base = vm.frames.back().stackBaseOffset;
         size_t needed = base + dstSlot + 1;
-        while (vm.stackSize() < needed)
-            vm.push(const_cast<Value *>(&Value::vNull));
+        vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
 
         AttrCache & cache = cu->attrCaches[cacheIdx];
         Value * attrs = vm.stack[base + attrsSlot];

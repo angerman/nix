@@ -60,8 +60,17 @@ struct BlockContext
     uint32_t nextSlot = 0;
 
     /// Allocate a fresh stack slot for a VarId.
+    /// If the var already has a slot in this context (e.g., pre-allocated
+    /// for a forward ref or set by an earlier strictness-spliced binding),
+    /// return the existing slot rather than burning a new one.  Without
+    /// this guard, the second allocation would overwrite the entry,
+    /// leaving the original slot dangling and bumping nextSlot for no
+    /// reason.
     uint32_t allocSlot(ir::VarId var)
     {
+        auto it = localSlots.find(var);
+        if (it != localSlots.end())
+            return it->second;
         uint32_t slot = nextSlot++;
         localSlots[var] = slot;
         return slot;
@@ -185,6 +194,15 @@ void IREmitter::emit()
     // The entry block (block 0) is the top-level expression.
     // It has no upvalues and no params (it's the program entry point).
     const auto & entryBlock = module.entryBlock();
+
+    // Reserve roughly enough code capacity to avoid mid-emission
+    // vector reallocation.  Empirically the bytecode is ~5-8 instructions
+    // per IR binding; round up generously.  A wrong guess just costs a
+    // single realloc at the end.
+    size_t totalBindings = 0;
+    for (const auto & blk : module.blocks)
+        totalBindings += blk.bindings.size();
+    unit.code.reserve(totalBindings * 8 + 64);
 
     BlockContext ctx;
 
@@ -976,11 +994,12 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
         else if constexpr (std::is_same_v<T, ir::IRAttrSelect>) {
             emitVarRef(e.attrs, pos, ctx);
             unit.emitPos(pos);
-            unit.emit(OP_FORCE);
-            // Inline cache: each call site gets its own cache slot.
+            // Skip the leading OP_FORCE: OP_ATTR_SELECT_CACHED's
+            // handler does forceAttrs internally.  Use the fused
+            // OP_ATTR_SELECT_FORCE_CACHED for the trailing force —
+            // saves one dispatch per attr select (very hot in nixpkgs).
             uint32_t cacheIdx = unit.addAttrCache(e.name);
-            unit.emit(OP_ATTR_SELECT_CACHED, cacheIdx);
-            unit.emit(OP_FORCE);
+            unit.emit(OP_ATTR_SELECT_FORCE_CACHED, cacheIdx);
         }
 
         // -- Dynamic attribute select --

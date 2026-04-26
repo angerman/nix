@@ -168,6 +168,22 @@ struct VMState
     /// Number of Value* entries currently on the stack.
     size_t stackSize() const { return static_cast<size_t>(sp - stack); }
 
+    /// Ensure `sp - stack >= needed`, padding with vNull placeholders.
+    /// Replaces hand-rolled `while (stackSize() < needed) push(vNull)`
+    /// loops scattered through the opcode handlers — grows once via
+    /// grow() rather than O(needed-stackSize) bounds checks.
+    [[gnu::always_inline]]
+    void ensureCapacity(size_t needed, Value * fill)
+    {
+        if (needed <= stackSize()) [[likely]]
+            return;
+        size_t want = stack + needed - sp;
+        while (sp + want > stackEnd) [[unlikely]]
+            grow();
+        for (size_t i = 0; i < want; i++)
+            *sp++ = fill;
+    }
+
     // -- Profiling counters --
     uint64_t nrInstructions = 0;       ///< Total bytecoded instructions executed
     uint64_t nrEvalExprFallbacks = 0;  ///< OP_EVAL_EXPR fallbacks to tree-walker
