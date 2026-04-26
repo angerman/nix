@@ -401,8 +401,11 @@ VarId Lowerer::lowerVar(ExprVar * e)
     uint32_t level = e->level + levelOffset;
     VarId v = lookupVar(level, e->displ);
     if (v != kInvalidVar) {
-        // Return a reference to the existing binding.
-        return emit(IRVarRef{.var = v}, e->pos);
+        // Return the binding's VarId directly.  Wrapping in an
+        // IRVarRef here would create a fresh binding that emits as
+        // OP_MOV_SLOTS (slot-to-slot copy) at runtime — pointless
+        // since the consumer expression can reference `v` directly.
+        return v;
     }
 
     // Fallback: variable not found in our env map.  This can happen for

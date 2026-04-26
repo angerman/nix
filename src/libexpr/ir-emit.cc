@@ -352,17 +352,19 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
         // Detect patterns where we can write the result DIRECTLY to a
         // slot without going through the operand stack.
         if (!(nFwd > 0 && forwardRefs.count(binding.result))) {
-            // -- Pattern: alias `let a = b;` (slot-to-slot copy) --
+            // -- Pattern: alias `let a = b;` (no runtime work) --
+            // Most lowerLet bindings end with `bound = IRVarRef(value)`
+            // (the "linking binding").  We can fold these at emit time
+            // by aliasing in the slot map — no opcode required.  The
+            // consumer of `bound` is then satisfied by reading the same
+            // slot as `value`.  Preserves cell-update semantics: the
+            // forward-ref branch above is taken first for any binding
+            // whose result is in `forwardRefs`.
             if (auto * varRef = std::get_if<ir::IRVarRef>(&binding.expr)) {
                 auto srcIt = ctx.localSlots.find(varRef->var);
-                if (srcIt != ctx.localSlots.end()
-                    && srcIt->second < 4096) {
-                    uint32_t dstSlot = ctx.allocSlot(binding.result);
-                    if (dstSlot < 4096) {
-                        unit.emit(OP_MOV_SLOTS,
-                            (srcIt->second << 12) | dstSlot);
-                        continue;
-                    }
+                if (srcIt != ctx.localSlots.end()) {
+                    ctx.localSlots[binding.result] = srcIt->second;
+                    continue;
                 }
                 // -- Pattern: read upvalue into slot --
                 auto uvIt = ctx.upvalueSlots.find(varRef->var);
