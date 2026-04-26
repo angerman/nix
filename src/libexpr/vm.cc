@@ -4135,20 +4135,23 @@ op_make_closure_v2:
         }
 
         // Create the closure Value.
-        // For v2 closures, we store the upvalue array on a side-allocated
-        // 2-slot Env whose values[1] is a pointer to the upvalue array.
-        // The actual upvalue array is the GC-allocated flat array.
+        // For v2 closures with upvalues, we store the upvalue array on
+        // a side-allocated 2-slot Env whose values[1] is a pointer to
+        // the upvalue array.  values[0] is vNull so OP_GET_WITH (which
+        // reads env.values[0]) sees a safe sentinel.
         //
-        // We still need an Env to satisfy the Value::lambda().env field.
-        // The env is minimal (2 slots) and acts as a carrier for the upvalues.
-        // values[0] is set to vNull so that OP_GET_WITH (which reads
-        // env.values[0]) sees a safe sentinel instead of a stale pointer.
-        Env & closureEnv = state.mem.allocEnv(2);
+        // For closures with NO upvalues (very common — every nullary
+        // helper), allocate a 1-slot Env instead.  The size-1 path
+        // hits the thread-local Env free-pool (eval-inline.hh:70-86)
+        // — much faster than the generic allocBytes path used for size-2.
+        Env & closureEnv = state.mem.allocEnv(nUpvalues > 0 ? 2 : 1);
         closureEnv.up = curEnv; // Parent env for with-chain walking.
         closureEnv.values[0] = const_cast<Value *>(&Value::vNull);
-        // Store the upvalue array pointer in values[1].
-        // The OP_CALL_1 v2 path will extract it from here.
-        closureEnv.values[1] = reinterpret_cast<Value *>(upvalues);
+        if (nUpvalues > 0) {
+            // Store the upvalue array pointer in values[1].
+            // The OP_CALL_1 v2 path will extract it from here.
+            closureEnv.values[1] = reinterpret_cast<Value *>(upvalues);
+        }
 
         // Use the pre-allocated ExprLambdaBytecode from compilation.
         Expr * lambdaExpr = desc.cachedExpr;
@@ -4202,10 +4205,13 @@ op_make_thunk_v2:
         }
 
         // Create a carrier Env for the upvalue array.
-        Env & thunkEnv = state.mem.allocEnv(2);
+        // For thunks with no upvalues (very common — let-bound trivial
+        // exprs), allocate a 1-slot Env to hit the size-1 fast pool.
+        Env & thunkEnv = state.mem.allocEnv(nUpvalues > 0 ? 2 : 1);
         thunkEnv.up = curEnv;
         thunkEnv.values[0] = &Value::vNull;
-        thunkEnv.values[1] = reinterpret_cast<Value *>(upvalues);
+        if (nUpvalues > 0)
+            thunkEnv.values[1] = reinterpret_cast<Value *>(upvalues);
 
         auto * thunkVal = state.allocValue();
         thunkVal->mkThunk(&thunkEnv, thunkExpr);
