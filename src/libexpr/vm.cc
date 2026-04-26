@@ -2597,6 +2597,10 @@ op_attr_select_cached:
         AttrCache & cache = cu->attrCaches[cacheIdx];
         Value * attrs = vm.top();
         PosIdx pos = cu->posForOffset(ip - 1);
+        if (nanbox::isTagged(attrs)) [[unlikely]] {
+            attrs = materializeWord(state, attrs);
+            *(vm.sp - 1) = attrs;
+        }
         state.forceAttrs(*attrs, pos, "while selecting an attribute");
         const Bindings * b = attrs->attrs();
 
@@ -2643,6 +2647,10 @@ op_attr_select_force_cached:
         AttrCache & cache = cu->attrCaches[cacheIdx];
         Value * attrs = vm.top();
         PosIdx pos = cu->posForOffset(ip - 1);
+        if (nanbox::isTagged(attrs)) [[unlikely]] {
+            attrs = materializeWord(state, attrs);
+            *(vm.sp - 1) = attrs;
+        }
         state.forceAttrs(*attrs, pos, "while selecting an attribute");
         const Bindings * b = attrs->attrs();
 
@@ -2695,8 +2703,8 @@ op_attr_select_dyn:
     {
         // Dynamic attribute selection: pop nameVal, pop attrs.
         // Coerce name to string, create Symbol, lookup in attrs.
-        Value * nameVal = vm.pop();
-        Value * attrs = vm.pop();
+        Value * nameVal = materializeWord(state, vm.pop());
+        Value * attrs = materializeWord(state, vm.pop());
         PosIdx pos = cu->posForOffset(ip - 1);
         state.forceStringNoCtx(*nameVal, pos,
             "while evaluating an attribute name");
@@ -2723,6 +2731,10 @@ op_has_attr:
         uint32_t symIdx = decodeOperand(CUR_INSTR);
         Value * attrs = vm.top();
         Symbol name = cu->symbols[symIdx];
+        if (nanbox::isTagged(attrs)) [[unlikely]] {
+            attrs = materializeWord(state, attrs);
+            *(vm.sp - 1) = attrs;
+        }
         // Force the value if it's still a thunk (belt-and-suspenders:
         // the IR should emit OP_FORCE before OP_HAS_ATTR, but the
         // tree-walker's ExprOpHasAttr::eval always forces).
@@ -2740,8 +2752,12 @@ op_has_attr_dyn:
     {
         // Dynamic has-attr: pop nameVal, peek attrs, push bool.
         // Stack: [..., attrs, nameVal] → [..., attrs, bool]
-        Value * nameVal = vm.pop();
+        Value * nameVal = materializeWord(state, vm.pop());
         Value * attrs = vm.top();
+        if (nanbox::isTagged(attrs)) [[unlikely]] {
+            attrs = materializeWord(state, attrs);
+            *(vm.sp - 1) = attrs;
+        }
         PosIdx pos = cu->posForOffset(ip - 1);
         state.forceStringNoCtx(*nameVal, pos,
             "while evaluating an attribute name");
@@ -2776,8 +2792,8 @@ op_attrs_update:
     case OP_ATTRS_UPDATE:
 #endif
     {
-        Value * rhs = vm.pop();
-        Value * lhs = vm.pop();
+        Value * rhs = materializeWord(state, vm.pop());
+        Value * lhs = materializeWord(state, vm.pop());
         PosIdx pos = cu->posForOffset(ip - 1);
         state.forceAttrs(*lhs, pos, "in the left operand of the update (//) operator");
         state.forceAttrs(*rhs, pos, "in the right operand of the update (//) operator");
@@ -2800,8 +2816,8 @@ op_list_concat:
     case OP_LIST_CONCAT:
 #endif
     {
-        Value * rhs = vm.pop();
-        Value * lhs = vm.pop();
+        Value * rhs = materializeWord(state, vm.pop());
+        Value * lhs = materializeWord(state, vm.pop());
         PosIdx pos = cu->posForOffset(ip - 1);
         state.forceList(*lhs, pos, "while evaluating the left operand of ++");
         state.forceList(*rhs, pos, "while evaluating the right operand of ++");
@@ -2836,7 +2852,7 @@ op_push_with:
     case OP_PUSH_WITH:
 #endif
     {
-        Value * attrsVal = vm.pop();
+        Value * attrsVal = materializeWord(state, vm.pop());
         // Allocate a 1-slot env for the with-scope.
         Env & env2 = state.mem.allocEnv(1);
         env2.up = curEnv;
@@ -3172,9 +3188,10 @@ op_call_primop:
 
         // Collect arguments from the operand stack.
         // Args were pushed left-to-right; pop in reverse to fill array.
+        // Materialize tagged immediates so primops can deref the Value*.
         Value * vArgs[maxPrimOpArity];
         for (uint8_t i = arity; i > 0; --i)
-            vArgs[i - 1] = vm.pop();
+            vArgs[i - 1] = materializeWord(state, vm.pop());
 
         // Allocate result and call the primop implementation directly.
         auto * result = state.allocValue();
@@ -3953,8 +3970,11 @@ op_make_closure_v2:
             // Pop upvalues from the stack.
             // They were pushed in forward order (upvalue 0 first),
             // so pop in reverse to get the correct mapping.
+            // Materialize tagged immediates so the captured array is
+            // a proper Value** (downstream OP_GET_UPVALUE / OP_RUVF_TO
+            // dereference these pointers).
             for (uint32_t i = nUpvalues; i > 0; --i)
-                upvalues[i - 1] = vm.pop();
+                upvalues[i - 1] = materializeWord(state, vm.pop());
         }
 
         auto & desc = cu->lambdas[lambdaIdx];
