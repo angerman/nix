@@ -14,12 +14,16 @@
 #include "nix/expr/nixexpr.hh"
 
 #include <cassert>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
 
 namespace nix::bytecode {
+
+// Per-call emit-phase timing observer.  Filled in when non-null.
+thread_local EmitPhaseTiming * emitPhaseTiming = nullptr;
 
 // ============================================================================
 // Emitter state
@@ -163,9 +167,18 @@ private:
 
 CompilationUnit * emitFromIR(EvalState & state, const ir::IRModule & module)
 {
+    using Clock = std::chrono::steady_clock;
+    auto micros = [](auto a, auto b) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+    };
+
     auto * unit = new (GC) CompilationUnit();
     IREmitter emitter(state, *unit, module);
+
+    auto t0 = Clock::now();
     emitter.emit();
+    auto t1 = Clock::now();
 
     // Pre-allocate ExprBytecodeThunk objects for all thunk descriptors.
     // This moves the allocation from OP_MAKE_THUNK_V2 runtime (681K+
@@ -176,6 +189,7 @@ CompilationUnit * emitFromIR(EvalState & state, const ir::IRModule & module)
                 unit, static_cast<uint32_t>(&desc - unit->thunks.data()));
         }
     }
+    auto t2 = Clock::now();
 
     // Pre-allocate ExprLambdaBytecode objects for all lambda descriptors.
     // Same pattern: saves 160K+ runtime Expr allocations per nixpkgs eval.
@@ -184,6 +198,16 @@ CompilationUnit * emitFromIR(EvalState & state, const ir::IRModule & module)
             desc.cachedExpr = state.mem.exprs.add<ExprLambdaBytecode>(
                 unit, static_cast<uint32_t>(&desc - unit->lambdas.data()));
         }
+    }
+    auto t3 = Clock::now();
+
+    if (emitPhaseTiming) {
+        emitPhaseTiming->emitCoreUs        += micros(t0, t1);
+        emitPhaseTiming->preallocThunksUs  += micros(t1, t2);
+        emitPhaseTiming->preallocLambdasUs += micros(t2, t3);
+        emitPhaseTiming->numInstructions      += unit->code.size();
+        emitPhaseTiming->numThunkDescriptors  += unit->thunks.size();
+        emitPhaseTiming->numLambdaDescriptors += unit->lambdas.size();
     }
 
     return unit;
@@ -200,14 +224,28 @@ void IREmitter::emit()
     // It has no upvalues and no params (it's the program entry point).
     const auto & entryBlock = module.entryBlock();
 
-    // Reserve roughly enough code capacity to avoid mid-emission
-    // vector reallocation.  Empirically the bytecode is ~5-8 instructions
-    // per IR binding; round up generously.  A wrong guess just costs a
-    // single realloc at the end.
+    // Reserve roughly enough capacity in every CU vector to avoid
+    // mid-emission reallocation.  Empirically the bytecode is ~5-8
+    // instructions per IR binding; round up generously.  A wrong guess
+    // just costs a single realloc at the end.  These vectors all grew
+    // unreserved before, contributing to the 24% compile-time share.
     size_t totalBindings = 0;
+    size_t totalThunks = 0, totalLambdas = 0;
     for (const auto & blk : module.blocks)
         totalBindings += blk.bindings.size();
+    for (const auto & blk : module.blocks) {
+        for (const auto & b : blk.bindings) {
+            if (std::holds_alternative<ir::IRMkThunk>(b.expr)) totalThunks++;
+            if (std::holds_alternative<ir::IRLambda>(b.expr)) totalLambdas++;
+        }
+    }
     unit.code.reserve(totalBindings * 8 + 64);
+    unit.thunks.reserve(totalThunks + 16);
+    unit.lambdas.reserve(totalLambdas + 16);
+    unit.constants.reserve(totalBindings + 32);
+    unit.exprPool.reserve(totalBindings / 4 + 16);
+    unit.positions.reserve(totalBindings * 2 + 32);
+    unit.posPool.reserve(totalBindings + 16);
 
     BlockContext ctx;
 
