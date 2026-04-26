@@ -20,6 +20,7 @@ subproject('libexpr')
 subproject('libflake')
 subproject('libmain')
 subproject('libcmd')
+subproject('libexpr-v3')
 
 # Executables
 subproject('nix')

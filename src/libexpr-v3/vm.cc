@@ -63,6 +63,16 @@ inline bool valueEqual(const Value & a, const Value & b)
     case Tag::Null:   return true;
     case Tag::String: return std::string_view(a.payload.str) == std::string_view(b.payload.str);
     case Tag::Path:   return std::string_view(a.payload.path) == std::string_view(b.payload.path);
+    case Tag::Uninitialized:
+    case Tag::Attrs:
+    case Tag::List:
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
     default:          return a.payload.raw == b.payload.raw;
     }
 }
@@ -97,6 +107,16 @@ inline std::string coerceToString(const Value & v, bool forceString)
     case Tag::Float:  return std::to_string(v.payload.f);
     case Tag::Bool:   return v.payload.i == 1 ? "1" : "";
     case Tag::Null:   return "";
+    case Tag::Uninitialized:
+    case Tag::Attrs:
+    case Tag::List:
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
     default:
         throw std::runtime_error("v3 STR_CONCAT: cannot coerce value of this type to string");
     }
@@ -659,9 +679,34 @@ Value run(const CompilationUnit & rootCu)
             bool forceStr = (operand & 1u) != 0;
             std::vector<Value> parts(n);
             for (uint32_t i = n; i > 0; --i) parts[i - 1] = pop(vm);
+
+            // nix `+` semantics: if forceString=false and the first operand
+            // is numeric (Int/Float), perform arithmetic addition; otherwise
+            // do string concatenation.  forceString=true (e.g. "${foo}")
+            // always coerces to string.
+            if (!forceStr && n > 0 && (parts[0].isInt() || parts[0].isFloat())) {
+                bool allInt = true;
+                for (auto & p : parts) if (!p.isInt()) { allInt = false; break; }
+                Value r;
+                if (allInt) {
+                    int64_t sum = 0;
+                    for (auto & p : parts) sum += p.payload.i;
+                    r.mkInt(sum);
+                } else {
+                    double sum = 0.0;
+                    for (auto & p : parts) {
+                        if (p.isInt())   sum += static_cast<double>(p.payload.i);
+                        else if (p.isFloat()) sum += p.payload.f;
+                        else throw std::runtime_error("v3 OP_STR_CONCAT: mixed numeric and non-numeric");
+                    }
+                    r.mkFloat(sum);
+                }
+                push(vm, r);
+                break;
+            }
+
             std::string out;
             for (auto & p : parts) out.append(coerceToString(p, forceStr));
-            // Store the result in a heap-allocated buffer (stub: malloc).
             char * buf = static_cast<char *>(std::malloc(out.size() + 1));
             std::memcpy(buf, out.data(), out.size());
             buf[out.size()] = '\0';
@@ -696,6 +741,19 @@ Value run(const CompilationUnit & rootCu)
             Value out;
             po->fn(stateRef, args, out);
             push(vm, out);
+            break;
+        }
+
+        case OP_ATTRS_REC_SET: {
+            uint32_t i = operand;
+            Value v = pop(vm);
+            // Peek at the rec bindings (top of stack now) and write into entry i.
+            Value & recAttrs = top(vm);
+            if (!recAttrs.isAttrs())
+                throw std::runtime_error("v3 OP_ATTRS_REC_SET: top is not an attrset");
+            if (!recAttrs.payload.bindings || i >= recAttrs.payload.bindings->size)
+                throw std::runtime_error("v3 OP_ATTRS_REC_SET: index out of range");
+            recAttrs.payload.bindings->entries[i].value = v;
             break;
         }
 

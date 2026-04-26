@@ -64,6 +64,16 @@ inline std::string toStr(const Value & v)
     case Tag::Float:  return std::to_string(v.payload.f);
     case Tag::Bool:   return v.payload.i == 1 ? "1" : "";
     case Tag::Null:   return "";
+    case Tag::Uninitialized:
+    case Tag::Attrs:
+    case Tag::List:
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
     default:          throw std::runtime_error("v3 toString: cannot stringify this type");
     }
 }
@@ -191,6 +201,10 @@ void primTypeOf(EvalState &, Value * args, Value & out)
     case Tag::PrimOp:
     case Tag::PrimOpApp: t = "lambda"; break;
     case Tag::Thunk:  t = "thunk"; break;
+    case Tag::Uninitialized:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
     default:          t = "unknown";
     }
     out = mkStringValueOwned(t);
@@ -245,6 +259,20 @@ void primThrow(EvalState &, Value * args, Value &)
     throw std::runtime_error(std::string("v3 throw: ") + args[0].payload.str);
 }
 
+void primLessThan(EvalState &, Value * args, Value & out)
+{
+    const Value & a = args[0]; const Value & b = args[1];
+    bool r;
+    if      (a.isInt() && b.isInt())     r = a.payload.i < b.payload.i;
+    else if (a.isFloat() && b.isFloat()) r = a.payload.f < b.payload.f;
+    else if (a.isInt() && b.isFloat())   r = static_cast<double>(a.payload.i) < b.payload.f;
+    else if (a.isFloat() && b.isInt())   r = a.payload.f < static_cast<double>(b.payload.i);
+    else if (a.isString() && b.isString())
+        r = std::string_view(a.payload.str) < std::string_view(b.payload.str);
+    else typeError("lessThan", "comparable types");
+    out = r ? Value::vTrue : Value::vFalse;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -291,6 +319,15 @@ void registerBuiltinPrimOps()
         registerPrimOp({"mul",          2, primMul});
         registerPrimOp({"div",          2, primDiv});
         registerPrimOp({"throw",        1, primThrow});
+        registerPrimOp({"lessThan",     2, primLessThan});
+
+        // Internal aliases used by the parser: `a * b` lowers to a Call of
+        // `__mul`; same for __sub / __add / __div / __lessThan.
+        registerPrimOp({"__add",        2, primAdd});
+        registerPrimOp({"__sub",        2, primSub});
+        registerPrimOp({"__mul",        2, primMul});
+        registerPrimOp({"__div",        2, primDiv});
+        registerPrimOp({"__lessThan",   2, primLessThan});
     });
 }
 
