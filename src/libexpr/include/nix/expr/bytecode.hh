@@ -395,6 +395,15 @@ enum Op : uint8_t {
     /// Simpler: [dst:8|attrsSlot:8|cacheIdxLow:8] with cacheIdx limited to 256.
     /// Falls back to two-instruction form if cacheIdx exceeds 256.
     OP_RATTR_SELF_R = 0x61, // [dst:8|attrsSlot:8|cacheIdxLow:8]
+
+    /// Tail-call: pop fun + arg, replace the CURRENT call frame's
+    /// unit/ip/env/upvalues with the callee's body, push arg as slot 0.
+    /// Caller's resultSlot / resultStoreSlot are preserved so OP_RETURN
+    /// in the callee delivers to the original consumer.  Only works
+    /// when fun is a v2 bytecode-proxy lambda; otherwise the emitter
+    /// keeps the OP_CALL_1 + OP_RETURN sequence (no tail call).
+    /// No operand.
+    OP_TAIL_CALL_1 = 0x62,
 };
 
 

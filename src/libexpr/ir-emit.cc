@@ -1435,12 +1435,14 @@ void IREmitter::emitTerminal(const ir::Terminal & term, BlockContext & ctx)
             }
         }
         else if constexpr (std::is_same_v<T, ir::TermTailCall>) {
-            // For now, emit as a regular call + return.
-            // True tail call optimization can be added later.
+            // Emit OP_TAIL_CALL_1: handler reuses the current frame
+            // when the callee is a v2 bytecode-proxy lambda; otherwise
+            // falls back to op_call_1 which uses the trailing
+            // OP_RETURN to deliver the result.
             emitVarRef(t.func, t.pos, ctx);
             emitVarRef(t.arg, t.pos, ctx);
             unit.emitPos(t.pos);
-            unit.emit(OP_CALL_1);
+            unit.emit(OP_TAIL_CALL_1);
             unit.emit(OP_RETURN);
         }
         else if constexpr (std::is_same_v<T, ir::TermBranch>) {

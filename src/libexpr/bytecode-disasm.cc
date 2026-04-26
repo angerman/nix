@@ -115,6 +115,7 @@ const char * opName(uint8_t op)
         case OP_REQ_R:            return "REQ_R";
         case OP_RATTR_SELF_R:     return "RATTR_SELF_R";
         case OP_RCALL1_R:         return "RCALL1_R";
+        case OP_TAIL_CALL_1:      return "TAIL_CALL_1";
         case OP_CALL_PRIMOP:      return "CALL_PRIMOP";
         case OP_CELL_GET:         return "CELL_GET";
         case OP_CELL_SET:         return "CELL_SET";

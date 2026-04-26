@@ -1410,6 +1410,28 @@ IRModule lower(EvalState & state, Expr * expr)
         .pos = expr->getPos(),
     };
 
+    // Tail-call detection: for each block, if the terminal is
+    // `TermReturn(v)` and `v` is the result of the LAST binding which
+    // is an IRApp, rewrite the terminal to `TermTailCall(func, arg)`
+    // and drop the IRApp binding (the tail-call opcode reads its own
+    // operands).  Skip the entry block so the top-level result is
+    // delivered to the consumer of vmExec normally.
+    for (size_t i = 1; i < module.blocks.size(); i++) {
+        auto & block = module.blocks[i];
+        if (block.bindings.empty()) continue;
+        auto * ret = std::get_if<TermReturn>(&block.terminal);
+        if (!ret) continue;
+        auto & lastBinding = block.bindings.back();
+        if (lastBinding.result != ret->value) continue;
+        auto * app = std::get_if<IRApp>(&lastBinding.expr);
+        if (!app) continue;
+        // Rewrite.
+        VarId f = app->func, a = app->arg;
+        PosIdx pos = lastBinding.pos;
+        block.bindings.pop_back();
+        block.terminal = TermTailCall{.func = f, .arg = a, .pos = pos};
+    }
+
     // Compute free variable sets for all Lambda and MkThunk nodes.
     computeFreeVars(module);
 

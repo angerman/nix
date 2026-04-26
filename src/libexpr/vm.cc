@@ -797,6 +797,7 @@ void vmExec(
         REGISTER_OP(OP_REQ_R, op_req_r);
         REGISTER_OP(OP_RATTR_SELF_R, op_rattr_self_r);
         REGISTER_OP(OP_RCALL1_R, op_rcall1_r);
+        REGISTER_OP(OP_TAIL_CALL_1, op_tail_call_1);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2467,6 +2468,72 @@ op_call:
         PosIdx pos = cu->posForOffset(ip - 1);
         vmCallMultiArg(state, vm, nArgs, pos);
         DISPATCH();
+    }
+
+    // OP_TAIL_CALL_1: pop arg + fun, replace the CURRENT call frame
+    // with the callee's body in place (no frames.push_back).  The
+    // caller's resultSlot / resultStoreSlot survive so OP_RETURN
+    // delivers the eventual result to the original consumer.  This
+    // converts linear recursion (foldr, imap1, recursiveUpdate) from
+    // stacking N frames to running in O(1) frame depth.
+    //
+    // Only fires when fun is a v2 bytecode-proxy lambda.  Anything
+    // else (primop, primopApp, attrset functor, env-chain v1 lambda)
+    // falls through to op_call_1 followed by op_return — same
+    // behavior as before, just two dispatches instead of one.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_tail_call_1:
+#else
+    case OP_TAIL_CALL_1:
+#endif
+    {
+        Value * arg = vm.pop();
+        Value * fun = vm.pop();
+        PosIdx pos = cu->posForOffset(ip - 1);
+        fun = materializeWord(state, fun);
+        arg = materializeWord(state, arg);
+        if (fun->isThunk() || fun->isApp()) [[unlikely]]
+            state.forceValue(*fun, pos);
+
+        if (fun->isLambda() && fun->lambda().fun->isBytecodeProxy) {
+            vm.nrBytecodeCallTrampoline++;
+            auto * bcLambda = static_cast<ExprLambdaBytecode *>(
+                fun->lambda().fun);
+            auto & bodyUnit = *bcLambda->unit;
+            auto & desc = bodyUnit.lambdas[bcLambda->lambdaIdx];
+            auto & thunkDesc = bodyUnit.thunks[desc.bodyThunkIdx];
+            uint32_t startOffset = thunkDesc.codeOffset;
+            Value ** frameUpvalues = nullptr;
+            if (desc.nUpvalues > 0 && fun->lambda().env)
+                frameUpvalues = reinterpret_cast<Value **>(
+                    fun->lambda().env->values[1]);
+
+            // Replace the current frame in place.  Truncate stack to
+            // the caller's stackBaseOffset, then push arg as slot 0.
+            auto & frame = vm.frames.back();
+            vm.sp = vm.stack + frame.stackBaseOffset;
+            frame.unit = &bodyUnit;
+            frame.ip = startOffset;
+            frame.env = fun->lambda().env;
+            frame.upvalues = frameUpvalues;
+            // Preserve: resultSlot, resultStoreSlot,
+            // resultStoreParentBase, callPos, isThunkForce, contIdx —
+            // these belong to the caller's caller, not us.
+
+            vm.push(arg);
+            cu = &bodyUnit;
+            ip = startOffset;
+            curEnv = fun->lambda().env;
+            DISPATCH();
+        }
+
+        // Slow path: not a v2 closure.  Fall back to a regular call
+        // followed by return.  Push fun and arg back, jump to op_call_1
+        // — the next dispatch lands on the OP_RETURN that ir-emit
+        // emits after every tail call.
+        vm.push(fun);
+        vm.push(arg);
+        goto op_call_1;
     }
 
     // ==================================================================
