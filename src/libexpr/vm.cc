@@ -2520,8 +2520,9 @@ op_attr_select_cached:
 #endif
     {
         // 4-way polymorphic inline cache for attribute select.
-        // Each call site has 4 (Bindings*, Value*) slots.  On hit, skip
-        // the binary search entirely.  On miss, evict round-robin.
+        // Hit promotes the matched entry to slot 0 (LRU-on-hit) so the
+        // dominant Bindings* is always the first compare.  Miss inserts
+        // at nextEvict; entries beyond slot 0 are FIFO.
         uint32_t cacheIdx = decodeOperand(CUR_INSTR);
         AttrCache & cache = cu->attrCaches[cacheIdx];
         Value * attrs = vm.top();
@@ -2529,35 +2530,28 @@ op_attr_select_cached:
         state.forceAttrs(*attrs, pos, "while selecting an attribute");
         const Bindings * b = attrs->attrs();
 
-        // Fast path: linear scan over 4 cache entries.
-        // Unrolled for predictable branch behavior.
-        if (cache.bindings[0] == b) [[likely]] {
+        if (cache.entries[0].bindings == b) [[likely]] {
             vm.nrAttrCacheHits++;
-            *(vm.sp - 1) = cache.values[0];
+            *(vm.sp - 1) = cache.entries[0].value;
             DISPATCH();
         }
-        if (cache.bindings[1] == b) {
-            vm.nrAttrCacheHits++;
-            *(vm.sp - 1) = cache.values[1];
-            DISPATCH();
-        }
-        if (cache.bindings[2] == b) {
-            vm.nrAttrCacheHits++;
-            *(vm.sp - 1) = cache.values[2];
-            DISPATCH();
-        }
-        if (cache.bindings[3] == b) {
-            vm.nrAttrCacheHits++;
-            *(vm.sp - 1) = cache.values[3];
-            DISPATCH();
+        for (int i = 1; i < AttrCache::kEntries; i++) {
+            if (cache.entries[i].bindings == b) {
+                vm.nrAttrCacheHits++;
+                Value * v = cache.entries[i].value;
+                // Promote to slot 0.
+                cache.entries[i] = cache.entries[0];
+                cache.entries[0] = {b, v};
+                *(vm.sp - 1) = v;
+                DISPATCH();
+            }
         }
 
-        // Slow path: cache miss — binary search and evict round-robin.
+        // Slow path: cache miss.
         vm.nrAttrCacheMisses++;
         if (auto j = b->get(cache.name)) {
             uint8_t evict = cache.nextEvict;
-            cache.bindings[evict] = b;
-            cache.values[evict] = j->value;
+            cache.entries[evict] = {b, j->value};
             cache.nextEvict = (evict + 1) & 3;
             *(vm.sp - 1) = j->value;
         } else {
@@ -2584,30 +2578,33 @@ op_attr_select_force_cached:
 
         Value * selected = nullptr;
 
-        // Fast path: 4-way PIC scan.
-        if (cache.bindings[0] == b) [[likely]] {
+        if (cache.entries[0].bindings == b) [[likely]] {
             vm.nrAttrCacheHits++;
-            selected = cache.values[0];
-        } else if (cache.bindings[1] == b) {
-            vm.nrAttrCacheHits++;
-            selected = cache.values[1];
-        } else if (cache.bindings[2] == b) {
-            vm.nrAttrCacheHits++;
-            selected = cache.values[2];
-        } else if (cache.bindings[3] == b) {
-            vm.nrAttrCacheHits++;
-            selected = cache.values[3];
+            selected = cache.entries[0].value;
         } else {
-            vm.nrAttrCacheMisses++;
-            if (auto j = b->get(cache.name)) {
-                uint8_t evict = cache.nextEvict;
-                cache.bindings[evict] = b;
-                cache.values[evict] = j->value;
-                cache.nextEvict = (evict + 1) & 3;
-                selected = j->value;
-            } else {
-                state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
-                    .atPos(pos).debugThrow();
+            bool hit = false;
+            for (int i = 1; i < AttrCache::kEntries; i++) {
+                if (cache.entries[i].bindings == b) {
+                    vm.nrAttrCacheHits++;
+                    Value * v = cache.entries[i].value;
+                    cache.entries[i] = cache.entries[0];
+                    cache.entries[0] = {b, v};
+                    selected = v;
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) {
+                vm.nrAttrCacheMisses++;
+                if (auto j = b->get(cache.name)) {
+                    uint8_t evict = cache.nextEvict;
+                    cache.entries[evict] = {b, j->value};
+                    cache.nextEvict = (evict + 1) & 3;
+                    selected = j->value;
+                } else {
+                    state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
+                        .atPos(pos).debugThrow();
+                }
             }
         }
 
@@ -3820,31 +3817,34 @@ op_rattr_self_r:
 
         const Bindings * b = attrs->attrs();
 
-        // 4-way PIC scan.
         Value * selected = nullptr;
-        if (cache.bindings[0] == b) [[likely]] {
+        if (cache.entries[0].bindings == b) [[likely]] {
             vm.nrAttrCacheHits++;
-            selected = cache.values[0];
-        } else if (cache.bindings[1] == b) {
-            vm.nrAttrCacheHits++;
-            selected = cache.values[1];
-        } else if (cache.bindings[2] == b) {
-            vm.nrAttrCacheHits++;
-            selected = cache.values[2];
-        } else if (cache.bindings[3] == b) {
-            vm.nrAttrCacheHits++;
-            selected = cache.values[3];
+            selected = cache.entries[0].value;
         } else {
-            vm.nrAttrCacheMisses++;
-            if (auto j = b->get(cache.name)) {
-                uint8_t evict = cache.nextEvict;
-                cache.bindings[evict] = b;
-                cache.values[evict] = j->value;
-                cache.nextEvict = (evict + 1) & 3;
-                selected = j->value;
-            } else {
-                state.error<EvalError>("attribute '%1%' missing",
-                    state.symbols[cache.name]).atPos(pos).debugThrow();
+            bool hit = false;
+            for (int i = 1; i < AttrCache::kEntries; i++) {
+                if (cache.entries[i].bindings == b) {
+                    vm.nrAttrCacheHits++;
+                    Value * v = cache.entries[i].value;
+                    cache.entries[i] = cache.entries[0];
+                    cache.entries[0] = {b, v};
+                    selected = v;
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) {
+                vm.nrAttrCacheMisses++;
+                if (auto j = b->get(cache.name)) {
+                    uint8_t evict = cache.nextEvict;
+                    cache.entries[evict] = {b, j->value};
+                    cache.nextEvict = (evict + 1) & 3;
+                    selected = j->value;
+                } else {
+                    state.error<EvalError>("attribute '%1%' missing",
+                        state.symbols[cache.name]).atPos(pos).debugThrow();
+                }
             }
         }
 

@@ -485,9 +485,18 @@ struct AttrCache
 {
     Symbol name;
     static constexpr int kEntries = 4;
-    const Bindings * bindings[kEntries] = {nullptr, nullptr, nullptr, nullptr};
-    Value * values[kEntries] = {nullptr, nullptr, nullptr, nullptr};
-    uint8_t nextEvict = 0;  ///< Round-robin index for eviction.
+
+    /// Interleaved (bindings, value) pairs to maximize cache-line locality
+    /// — the hit path touches both fields in lockstep.  The hit branch
+    /// promotes the matched entry to slot 0 (LRU-on-hit), so the most
+    /// recently used Bindings* is always the first compare.
+    struct Entry
+    {
+        const Bindings * bindings = nullptr;
+        Value * value = nullptr;
+    };
+    Entry entries[kEntries];
+    uint8_t nextEvict = 0;  ///< Insertion index for cold misses.
 };
 
 
