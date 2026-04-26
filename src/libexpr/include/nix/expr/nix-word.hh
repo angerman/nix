@@ -84,6 +84,9 @@ inline bool isTagged(NixWord w) noexcept
 }
 
 /// True if w is an untagged Value* pointer (low bit 0).
+/// Currently unused — kept for symmetry with isTagged().  Most callers
+/// invert isTagged() inline (`!isTagged(w)`) since the [[likely]]
+/// annotation propagates better through that path.
 [[gnu::always_inline]]
 inline bool isPointer(NixWord w) noexcept
 {
@@ -95,14 +98,6 @@ inline bool isPointer(NixWord w) noexcept
 inline bool isTaggedInt(NixWord w) noexcept
 {
     return (reinterpret_cast<uintptr_t>(w) & kTagMask) == kTagInt;
-}
-
-/// True if w is any tagged scalar (currently only tagged ints).
-/// These values are "already forced" — no thunk to evaluate.
-[[gnu::always_inline]]
-inline bool isTaggedScalar(NixWord w) noexcept
-{
-    return isTagged(w);
 }
 
 // ---- Encode ----

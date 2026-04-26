@@ -2717,7 +2717,6 @@ op_select_force:
         Symbol name = cu->symbols[symIdx];
         state.forceAttrs(*attrs, pos, "while selecting an attribute");
         if (auto j = attrs->attrs()->get(name)) {
-            // TODO: state.nrLookups++ (private, needs friend decl)
             state.forceValue(*j->value, pos);
             // Replace top of stack with the selected value.
             *(vm.sp - 1) = j->value;
