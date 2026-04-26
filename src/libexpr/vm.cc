@@ -842,6 +842,10 @@ void vmExec(
         REGISTER_OP(OP_TAIL_CALL_1, op_tail_call_1);
         REGISTER_OP(OP_RLIT_INT, op_rlit_int);
         REGISTER_OP(OP_RCONST, op_rconst);
+        REGISTER_OP(OP_RUPDATE_R, op_rupdate_r);
+        REGISTER_OP(OP_RCONCATLIST_R, op_rconcatlist_r);
+        REGISTER_OP(OP_RNOT_R, op_rnot_r);
+        REGISTER_OP(OP_RNEG_R, op_rneg_r);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -4240,6 +4244,127 @@ op_rconst:
         size_t base = stackBase;
         vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
         vm.stack[base + dstSlot] = cu->constants[constIdx];
+        DISPATCH();
+    }
+
+    // OP_RUPDATE_R: dst = (slot lhs) // (slot rhs).
+    // Encoding: [dst:8 | lhs:8 | rhs:8].
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rupdate_r:
+#else
+    case OP_RUPDATE_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t dstSlot = bytecode::unpackDst(operand);
+        uint8_t lhsSlot = bytecode::unpackA(operand);
+        uint8_t rhsSlot = bytecode::unpackB(operand);
+        size_t base = stackBase;
+        Value * lhs = materializeWord(state, vm.stack[base + lhsSlot]);
+        Value * rhs = materializeWord(state, vm.stack[base + rhsSlot]);
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceAttrs(*lhs, pos, "in the left operand of the update (//) operator");
+        state.forceAttrs(*rhs, pos, "in the right operand of the update (//) operator");
+        auto * result = state.allocValue();
+        vmAttrsUpdate(state, *result, *lhs, *rhs);
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = result;
+        DISPATCH();
+    }
+
+    // OP_RCONCATLIST_R: dst = (slot lhs) ++ (slot rhs).
+    // Encoding: [dst:8 | lhs:8 | rhs:8].
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rconcatlist_r:
+#else
+    case OP_RCONCATLIST_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint8_t dstSlot = bytecode::unpackDst(operand);
+        uint8_t lhsSlot = bytecode::unpackA(operand);
+        uint8_t rhsSlot = bytecode::unpackB(operand);
+        size_t base = stackBase;
+        Value * lhs = materializeWord(state, vm.stack[base + lhsSlot]);
+        Value * rhs = materializeWord(state, vm.stack[base + rhsSlot]);
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceList(*lhs, pos, "while evaluating the left operand of ++");
+        state.forceList(*rhs, pos, "while evaluating the right operand of ++");
+        auto lSize = lhs->listSize();
+        auto rSize = rhs->listSize();
+        auto * result = state.allocValue();
+        if (lSize == 0) { *result = *rhs; }
+        else if (rSize == 0) { *result = *lhs; }
+        else {
+            auto list = state.buildList(lSize + rSize);
+            auto * out = list.elems;
+            auto lView = lhs->listView();
+            auto rView = rhs->listView();
+            memcpy(out, lView.data(), lSize * sizeof(Value *));
+            memcpy(out + lSize, rView.data(), rSize * sizeof(Value *));
+            result->mkList(list);
+        }
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = result;
+        DISPATCH();
+    }
+
+    // OP_RNOT_R: dst = !(slot src).
+    // Encoding: [dst:8 | srcSlot:16].
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rnot_r:
+#else
+    case OP_RNOT_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot = operand >> 16;
+        uint32_t srcSlot = operand & 0xFFFF;
+        size_t base = stackBase;
+        Value * src = materializeWord(state, vm.stack[base + srcSlot]);
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*src, pos);
+        if (src->type() != nBool)
+            state.error<TypeError>("expected a Boolean but found %1%: %2%",
+                showType(*src), ValuePrinter(state, *src, PrintOptions{}))
+                .atPos(pos).debugThrow();
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = src->boolean()
+            ? &Value::vFalse : &Value::vTrue;
+        DISPATCH();
+    }
+
+    // OP_RNEG_R: dst = -(slot src).  Numeric negation, both int and
+    // float.  Encoding: [dst:8 | srcSlot:16].
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rneg_r:
+#else
+    case OP_RNEG_R:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot = operand >> 16;
+        uint32_t srcSlot = operand & 0xFFFF;
+        size_t base = stackBase;
+        Value * src = materializeWord(state, vm.stack[base + srcSlot]);
+        PosIdx pos = cu->posForOffset(ip - 1);
+        state.forceValue(*src, pos);
+        auto * result = state.allocValue();
+        if (src->type() == nInt) {
+            auto neg = NixInt(0) - src->integer();
+            if (auto val = neg.valueChecked())
+                result->mkInt(*val);
+            else
+                state.error<EvalError>("integer overflow in negation")
+                    .atPos(pos).debugThrow();
+        } else if (src->type() == nFloat) {
+            result->mkFloat(-src->fpoint());
+        } else {
+            state.error<EvalError>("cannot negate %1%", showType(*src))
+                .atPos(pos).debugThrow();
+        }
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = result;
         DISPATCH();
     }
 

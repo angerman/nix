@@ -427,6 +427,22 @@ enum Op : uint8_t {
     /// Falls back to OP_CONST + OP_SET_STACK_SLOT for dst > 255 or
     /// constIdx > 0xFFFF.
     OP_RCONST = 0x64,
+
+    /// Attrset update: dst = lhs // rhs.
+    /// Encoding: [dst:8 | lhs:8 | rhs:8].
+    OP_RUPDATE_R = 0x65,
+
+    /// List concatenation: dst = lhs ++ rhs.
+    /// Encoding: [dst:8 | lhs:8 | rhs:8].
+    OP_RCONCATLIST_R = 0x66,
+
+    /// Boolean negation: dst = !src.
+    /// Encoding: [dst:8 | srcSlot:16].
+    OP_RNOT_R = 0x67,
+
+    /// Numeric negation: dst = -src.
+    /// Encoding: [dst:8 | srcSlot:16].
+    OP_RNEG_R = 0x68,
 };
 
 

@@ -592,8 +592,32 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
             TRY_REGISTER_BINOP(IRMul,  OP_RMUL_R)
             TRY_REGISTER_BINOP(IRLess, OP_RLESS_R)
             TRY_REGISTER_BINOP(IREq,   OP_REQ_R)
+            // B4-impl: more register-form binops.
+            TRY_REGISTER_BINOP(IRUpdate,      OP_RUPDATE_R)
+            TRY_REGISTER_BINOP(IRConcatLists, OP_RCONCATLIST_R)
 
             #undef TRY_REGISTER_BINOP
+
+            // B4-impl: register-form unary ops (RNOT_R, RNEG_R).
+            // Encoding: [dst:8|srcSlot:16].  Source must be a local
+            // slot (upvalue/cell sources fall through to operand-stack).
+            #define TRY_REGISTER_UNOP(IR_TYPE, OPCODE) \
+                if (auto * un = std::get_if<ir::IR_TYPE>(&binding.expr)) { \
+                    auto srcIt = ctx.localSlots.find(un->operand); \
+                    if (srcIt != ctx.localSlots.end() \
+                        && srcIt->second <= 0xFFFF) { \
+                        uint32_t dstSlot = ctx.allocSlot(binding.result); \
+                        if (dstSlot <= 0xFF) { \
+                            unit.emitPos(binding.pos); \
+                            unit.emit(OPCODE, \
+                                (dstSlot << 16) | srcIt->second); \
+                            continue; \
+                        } \
+                    } \
+                }
+            TRY_REGISTER_UNOP(IRNot,    OP_RNOT_R)
+            TRY_REGISTER_UNOP(IRNegate, OP_RNEG_R)
+            #undef TRY_REGISTER_UNOP
 
             // -- Pattern: register-form attr select (cached) --
             // For IRAttrSelect where attrs is a local slot, emit
