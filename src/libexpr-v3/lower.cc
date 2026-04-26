@@ -160,6 +160,7 @@ struct Lowerer
         case nix::Expr::Kind::Int:    return lowerInt(static_cast<nix::ExprInt *>(e));
         case nix::Expr::Kind::Float:  return lowerFloat(static_cast<nix::ExprFloat *>(e));
         case nix::Expr::Kind::String: return lowerString(static_cast<nix::ExprString *>(e));
+        case nix::Expr::Kind::Path:   return lowerPath(static_cast<nix::ExprPath *>(e));
         case nix::Expr::Kind::Var:    return lowerVar(static_cast<nix::ExprVar *>(e));
         case nix::Expr::Kind::If:     return lowerIf(static_cast<nix::ExprIf *>(e));
         case nix::Expr::Kind::Lambda: return lowerLambda(static_cast<nix::ExprLambda *>(e));
@@ -181,7 +182,6 @@ struct Lowerer
         case nix::Expr::Kind::OpNot:  return lowerNot(static_cast<nix::ExprOpNot *>(e));
         case nix::Expr::Kind::ConcatStrings: return lowerConcatStrings(static_cast<nix::ExprConcatStrings *>(e));
         case nix::Expr::Kind::Unknown:
-        case nix::Expr::Kind::Path:
         case nix::Expr::Kind::InheritFrom:
         case nix::Expr::Kind::Pos:
         case nix::Expr::Kind::BlackHole:
@@ -208,6 +208,14 @@ struct Lowerer
         static std::deque<std::string> stringPool;
         stringPool.emplace_back(e->v.string_view());
         return addBinding(ir::LitString{stringPool.back()});
+    }
+    ir::VarId lowerPath(nix::ExprPath * e)
+    {
+        static std::deque<std::string> pathPool;
+        pathPool.emplace_back(e->v.pathStrView());
+        // accessor lifetime: tied to ExprPath::accessor, anchored in the
+        // AST arena.
+        return addBinding(ir::LitPath{pathPool.back(), nullptr});
     }
     ir::VarId lowerVar(nix::ExprVar * e)
     {
@@ -455,13 +463,34 @@ struct Lowerer
         return addBinding(ir::AttrSet{std::move(entries)});
     }
 
-    /// `expr.attr` — a chain of static attribute selects.  Default values
-    /// (`expr.attr or default`) are supported by emitting an If on HasAttr.
+    /// `expr.attr` — a chain of static attribute selects.
+    /// `expr.attr or default` is supported for single-element paths; the
+    /// default is used when the attribute is absent.  Multi-element
+    /// paths with default would require short-circuiting the chain when
+    /// any HasAttr fails — deferred (still supported without default).
     ir::VarId lowerSelect(nix::ExprSelect * e)
     {
-        if (e->def) unsupported("select with default expression (or)");
         ir::VarId v = lowerExpr(e->e);
-        for (auto & an : e->getAttrPath()) {
+        auto path = e->getAttrPath();
+
+        if (e->def && path.size() == 1 && !path[0].expr) {
+            ir::SymbolId nm = internSym(path[0].symbol);
+            ir::VarId hasIt = addBinding(ir::HasAttr{v, nm});
+            auto thenB = m.freshBlock();
+            auto elseB = m.freshBlock();
+            blockStack.push_back(thenB);
+            ir::VarId got = addBinding(ir::AttrSelect{v, nm});
+            setReturn(got);
+            blockStack.pop_back();
+            blockStack.push_back(elseB);
+            ir::VarId defv = lowerExpr(e->def);
+            setReturn(defv);
+            blockStack.pop_back();
+            return addBinding(ir::If{hasIt, thenB, elseB});
+        }
+        if (e->def) unsupported("multi-element select with default");
+
+        for (auto & an : path) {
             if (an.expr) unsupported("dynamic attribute name in select");
             v = addBinding(ir::AttrSelect{v, internSym(an.symbol)});
         }
