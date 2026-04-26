@@ -521,6 +521,18 @@ struct Binding
     VarId result;    ///< The variable this binding defines.
     IRExpr expr;     ///< The operation that computes the value.
     PosIdx pos;      ///< Source position for error messages.
+
+    /// M5: direct references in `expr` (NOT including sub-block free
+    /// vars).  Populated by computeFreeVars/blockFreeVars (ir.cc) so
+    /// the bytecode emitter's forward-ref + use-count pre-pass
+    /// (ir-emit.cc:emitBlock) can reuse them instead of running
+    /// collectRefs() a second time over the same expression.  ~10-15ms
+    /// saving on nixpkgs-scale CUs (260K+ bindings) at the cost of
+    /// ~14MB extra IR memory while compiling — both temporary, freed
+    /// when the IRModule is dropped (or kept under NIX_VM_V2_LAZY_EMIT
+    /// for re-entry).  Mutable so blockFreeVars can write through a
+    /// `const IRBlock &`.
+    mutable FreeVars directRefs;
 };
 
 

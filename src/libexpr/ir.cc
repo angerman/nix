@@ -1719,6 +1719,14 @@ FreeVars blockFreeVars(
         FreeVars exprRefs;
         collectRefs(binding.expr, exprRefs);
 
+        // M5: cache the direct refs onto the binding for the bytecode
+        // emitter's pre-pass to reuse.  We snapshot BEFORE the sub-block
+        // merge below so the cached version is exactly what
+        // collectRefs() would return — the emit pre-pass wants direct
+        // refs only (sub-block free vars are inspected separately via
+        // e.freeVars on the IRMkThunk/IRLambda variant).
+        binding.directRefs = exprRefs;
+
         // For Lambda and MkThunk, add the sub-block's free vars
         // (these are the variables the closure/thunk needs from
         // the enclosing scope).

@@ -387,10 +387,18 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
     boost::unordered_flat_set<ir::VarId> forwardRefs;
     {
         boost::unordered_flat_set<ir::VarId> seenDefined;
-        ir::FreeVars directRefs;
         for (const auto & binding : block.bindings) {
-            directRefs.vars.clear();
-            collectRefs(binding.expr, directRefs);
+            // M5: use the cached direct-refs from blockFreeVars instead
+            // of re-running collectRefs.  Falls back to a fresh walk if
+            // the cache is empty (defensive — disk-cache or
+            // alternative compile paths may not populate it).
+            const ir::FreeVars * directRefsPtr = &binding.directRefs;
+            ir::FreeVars fallback;
+            if (binding.directRefs.vars.empty()) {
+                collectRefs(binding.expr, fallback);
+                directRefsPtr = &fallback;
+            }
+            const ir::FreeVars & directRefs = *directRefsPtr;
 
             // Use counts: count direct refs only.  Sub-block captures
             // are not eligible for the peephole, so they are excluded.
@@ -2399,13 +2407,23 @@ uint32_t IREmitter::emitInlineBlock(ir::BlockId blockId, BlockContext & ctx)
     for (const auto & binding : block.bindings)
         definedInBlock.insert(binding.result);
 
-    // Same forward-reference detection as emitBlock().
+    // Same forward-reference detection as emitBlock().  M5: prefer the
+    // cached binding.directRefs from blockFreeVars; fall back to a
+    // collectRefs walk if the cache is empty.
     boost::unordered_flat_set<ir::VarId> forwardRefs;
     {
         boost::unordered_flat_set<ir::VarId> seenDefined;
         for (const auto & binding : block.bindings) {
-            ir::FreeVars exprRefs;
-            ir::collectRefs(binding.expr, exprRefs);
+            ir::FreeVars fallback;
+            const ir::FreeVars * directRefsPtr = &binding.directRefs;
+            if (binding.directRefs.vars.empty()) {
+                ir::collectRefs(binding.expr, fallback);
+                directRefsPtr = &fallback;
+            }
+            // We need exprRefs = directRefs ∪ sub-block freeVars.
+            // Build it cheaply by copying directRefs and inserting
+            // sub-block vars in place.
+            ir::FreeVars exprRefs = *directRefsPtr;
             std::visit([&](const auto & e) {
                 using T = std::decay_t<decltype(e)>;
                 if constexpr (std::is_same_v<T, ir::IRMkThunk>
