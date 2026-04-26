@@ -295,84 +295,90 @@ private:
 
 VarId Lowerer::lowerExpr(Expr * expr)
 {
-    // Dispatch by dynamic type, same order as the bytecode compiler
-    // (most common first).
-
-    if (auto * e = dynamic_cast<ExprVar *>(expr))
-        return lowerVar(e);
-    if (auto * e = dynamic_cast<ExprSelect *>(expr))
-        return lowerSelect(e);
-    if (auto * e = dynamic_cast<ExprCall *>(expr))
-        return lowerCall(e);
-    if (auto * e = dynamic_cast<ExprAttrs *>(expr))
-        return lowerAttrs(e);
-    if (auto * e = dynamic_cast<ExprLet *>(expr))
-        return lowerLet(e);
-    if (auto * e = dynamic_cast<ExprIf *>(expr))
-        return lowerIf(e);
-    if (auto * e = dynamic_cast<ExprLambda *>(expr))
-        return lowerLambda(e);
-    if (auto * e = dynamic_cast<ExprList *>(expr))
-        return lowerList(e);
-
-    // Literals
-    if (auto * e = dynamic_cast<ExprInt *>(expr))
-        return lowerInt(e);
-    if (auto * e = dynamic_cast<ExprFloat *>(expr))
-        return lowerFloat(e);
-    if (auto * e = dynamic_cast<ExprString *>(expr))
-        return lowerString(e);
-    if (auto * e = dynamic_cast<ExprPath *>(expr))
-        return lowerPath(e);
-
-    // Short-circuit operators: the rhs must be lowered into a separate
-    // block so it's only evaluated when the lhs permits.  In A-normal
-    // form, all bindings in the same block are executed sequentially,
-    // so lowering the rhs into the current block would eagerly evaluate
-    // it even when the short-circuit should skip it.
-    if (auto * e = dynamic_cast<ExprOpAnd *>(expr)) {
-        VarId lhs = lowerExpr(e->e1);
-        BlockId rhsBlk = lowerIntoBlock(e->e2, e->pos);
-        return emit(IRAnd{lhs, rhsBlk}, e->pos);
+    // Dispatch via the Expr::Kind discriminator (set by each subclass'
+    // constructor).  Replaces a chain of ~22 dynamic_cast attempts with
+    // a single switch — the kind byte is loaded once and the compiler
+    // can build a jump table.
+    switch (expr->exprKind) {
+        case Expr::Kind::Var:
+        case Expr::Kind::InheritFrom:
+            return lowerVar(static_cast<ExprVar *>(expr));
+        case Expr::Kind::Select:
+            return lowerSelect(static_cast<ExprSelect *>(expr));
+        case Expr::Kind::Call:
+            return lowerCall(static_cast<ExprCall *>(expr));
+        case Expr::Kind::Attrs:
+            return lowerAttrs(static_cast<ExprAttrs *>(expr));
+        case Expr::Kind::Let:
+            return lowerLet(static_cast<ExprLet *>(expr));
+        case Expr::Kind::If:
+            return lowerIf(static_cast<ExprIf *>(expr));
+        case Expr::Kind::Lambda:
+            return lowerLambda(static_cast<ExprLambda *>(expr));
+        case Expr::Kind::List:
+            return lowerList(static_cast<ExprList *>(expr));
+        case Expr::Kind::Int:
+            return lowerInt(static_cast<ExprInt *>(expr));
+        case Expr::Kind::Float:
+            return lowerFloat(static_cast<ExprFloat *>(expr));
+        case Expr::Kind::String:
+            return lowerString(static_cast<ExprString *>(expr));
+        case Expr::Kind::Path:
+            return lowerPath(static_cast<ExprPath *>(expr));
+        case Expr::Kind::OpAnd: {
+            auto * e = static_cast<ExprOpAnd *>(expr);
+            VarId lhs = lowerExpr(e->e1);
+            BlockId rhsBlk = lowerIntoBlock(e->e2, e->pos);
+            return emit(IRAnd{lhs, rhsBlk}, e->pos);
+        }
+        case Expr::Kind::OpOr: {
+            auto * e = static_cast<ExprOpOr *>(expr);
+            VarId lhs = lowerExpr(e->e1);
+            BlockId rhsBlk = lowerIntoBlock(e->e2, e->pos);
+            return emit(IROr{lhs, rhsBlk}, e->pos);
+        }
+        case Expr::Kind::OpEq: {
+            auto * e = static_cast<ExprOpEq *>(expr);
+            return lowerBinOp(e->e1, e->e2, e->pos,
+                [](VarId l, VarId r) -> IRExpr { return IREq{l, r}; });
+        }
+        case Expr::Kind::OpNEq: {
+            auto * e = static_cast<ExprOpNEq *>(expr);
+            return lowerBinOp(e->e1, e->e2, e->pos,
+                [](VarId l, VarId r) -> IRExpr { return IRNEq{l, r}; });
+        }
+        case Expr::Kind::OpNot:
+            return lowerNot(static_cast<ExprOpNot *>(expr));
+        case Expr::Kind::OpImpl: {
+            auto * e = static_cast<ExprOpImpl *>(expr);
+            VarId lhs = lowerExpr(e->e1);
+            BlockId rhsBlk = lowerIntoBlock(e->e2, e->pos);
+            return emit(IRImpl{lhs, rhsBlk}, e->pos);
+        }
+        case Expr::Kind::OpUpdate: {
+            auto * e = static_cast<ExprOpUpdate *>(expr);
+            return lowerBinOp(e->e1, e->e2, e->pos,
+                [](VarId l, VarId r) -> IRExpr { return IRUpdate{l, r}; });
+        }
+        case Expr::Kind::OpConcatLists: {
+            auto * e = static_cast<ExprOpConcatLists *>(expr);
+            return lowerBinOp(e->e1, e->e2, e->pos,
+                [](VarId l, VarId r) -> IRExpr { return IRConcatLists{l, r}; });
+        }
+        case Expr::Kind::OpHasAttr:
+            return lowerHasAttr(static_cast<ExprOpHasAttr *>(expr));
+        case Expr::Kind::ConcatStrings:
+            return lowerConcatStrings(static_cast<ExprConcatStrings *>(expr));
+        case Expr::Kind::With:
+            return lowerWith(static_cast<ExprWith *>(expr));
+        case Expr::Kind::Assert:
+            return lowerAssert(static_cast<ExprAssert *>(expr));
+        case Expr::Kind::Pos:
+            return lowerPos(static_cast<ExprPos *>(expr));
+        case Expr::Kind::BlackHole:
+        case Expr::Kind::Unknown:
+            break;
     }
-    if (auto * e = dynamic_cast<ExprOpOr *>(expr)) {
-        VarId lhs = lowerExpr(e->e1);
-        BlockId rhsBlk = lowerIntoBlock(e->e2, e->pos);
-        return emit(IROr{lhs, rhsBlk}, e->pos);
-    }
-    if (auto * e = dynamic_cast<ExprOpEq *>(expr))
-        return lowerBinOp(e->e1, e->e2, e->pos,
-            [](VarId l, VarId r) -> IRExpr { return IREq{l, r}; });
-    if (auto * e = dynamic_cast<ExprOpNEq *>(expr))
-        return lowerBinOp(e->e1, e->e2, e->pos,
-            [](VarId l, VarId r) -> IRExpr { return IRNEq{l, r}; });
-    if (auto * e = dynamic_cast<ExprOpNot *>(expr))
-        return lowerNot(e);
-    if (auto * e = dynamic_cast<ExprOpImpl *>(expr)) {
-        VarId lhs = lowerExpr(e->e1);
-        BlockId rhsBlk = lowerIntoBlock(e->e2, e->pos);
-        return emit(IRImpl{lhs, rhsBlk}, e->pos);
-    }
-    if (auto * e = dynamic_cast<ExprOpUpdate *>(expr))
-        return lowerBinOp(e->e1, e->e2, e->pos,
-            [](VarId l, VarId r) -> IRExpr { return IRUpdate{l, r}; });
-    if (auto * e = dynamic_cast<ExprOpConcatLists *>(expr))
-        return lowerBinOp(e->e1, e->e2, e->pos,
-            [](VarId l, VarId r) -> IRExpr { return IRConcatLists{l, r}; });
-    if (auto * e = dynamic_cast<ExprOpHasAttr *>(expr))
-        return lowerHasAttr(e);
-
-    // String interpolation
-    if (auto * e = dynamic_cast<ExprConcatStrings *>(expr))
-        return lowerConcatStrings(e);
-
-    // Remaining
-    if (auto * e = dynamic_cast<ExprWith *>(expr))
-        return lowerWith(e);
-    if (auto * e = dynamic_cast<ExprAssert *>(expr))
-        return lowerAssert(e);
-    if (auto * e = dynamic_cast<ExprPos *>(expr))
-        return lowerPos(e);
 
     throw Error("IR lowering: unhandled expression type at %s",
         state.positions[expr->getPos()]);

@@ -103,6 +103,41 @@ struct Expr
         Symbol sub, lessThan, mul, div, or_, findFile, nixPath, body;
     };
 
+    /// Discriminator for fast IR lowering dispatch — replaces a chain of
+    /// dynamic_cast calls in ir::Lowerer::lowerExpr with a single switch.
+    /// Each subclass sets exprKind in its constructor (or via ExprKindBase).
+    enum class Kind : uint8_t {
+        Unknown = 0,
+        Int,
+        Float,
+        String,
+        Path,
+        Var,
+        InheritFrom,
+        Select,
+        OpHasAttr,
+        Attrs,
+        List,
+        Lambda,
+        Call,
+        Let,
+        With,
+        If,
+        Assert,
+        OpNot,
+        OpUpdate,
+        ConcatStrings,
+        Pos,
+        BlackHole,
+        OpEq,
+        OpNEq,
+        OpAnd,
+        OpOr,
+        OpImpl,
+        OpConcatLists,
+    };
+    Kind exprKind = Kind::Unknown;
+
     static Counter nrExprs;
 
     /// Set by ExprBytecodeThunk to avoid dynamic_cast in OP_FORCE hot path.
@@ -113,6 +148,10 @@ struct Expr
     bool isBytecodeProxy = false;
 
     Expr()
+    {
+        nrExprs++;
+    }
+    explicit Expr(Kind k) : exprKind(k)
     {
         nrExprs++;
     }
@@ -161,12 +200,12 @@ struct ExprInt : Expr
 {
     Value v;
 
-    ExprInt(NixInt n)
+    ExprInt(NixInt n) : Expr(Kind::Int)
     {
         v.mkInt(n);
     };
 
-    ExprInt(NixInt::Inner n)
+    ExprInt(NixInt::Inner n) : Expr(Kind::Int)
     {
         v.mkInt(n);
     };
@@ -179,7 +218,7 @@ struct ExprFloat : Expr
 {
     Value v;
 
-    ExprFloat(NixFloat nf)
+    ExprFloat(NixFloat nf) : Expr(Kind::Float)
     {
         v.mkFloat(nf);
     };
@@ -196,12 +235,12 @@ struct ExprString : Expr
      * This is only for strings already allocated in our polymorphic allocator,
      * or that live at least that long (e.g. c++ string literals)
      */
-    ExprString(const StringData & s)
+    ExprString(const StringData & s) : Expr(Kind::String)
     {
         v.mkStringNoCopy(s);
     };
 
-    ExprString(std::pmr::polymorphic_allocator<char> & alloc, std::string_view sv)
+    ExprString(std::pmr::polymorphic_allocator<char> & alloc, std::string_view sv) : Expr(Kind::String)
     {
         if (sv.size() == 0) {
             v.mkStringNoCopy(""_sds);
@@ -220,7 +259,8 @@ struct ExprPath : Expr
     Value v;
 
     ExprPath(std::pmr::polymorphic_allocator<char> & alloc, ref<SourceAccessor> accessor, std::string_view sv)
-        : accessor(accessor)
+        : Expr(Kind::Path)
+        , accessor(accessor)
     {
         v.mkPath(&*accessor, StringData::make(*alloc.resource(), sv));
     }
@@ -254,10 +294,15 @@ struct ExprVar : Expr
     Displacement displ = 0;
 
     ExprVar(Symbol name)
-        : name(name) {};
+        : Expr(Kind::Var), name(name) {};
     ExprVar(const PosIdx & pos, Symbol name)
-        : pos(pos)
+        : Expr(Kind::Var)
+        , pos(pos)
         , name(name) {};
+    /// Subclass-friendly constructor — used by ExprInheritFrom which
+    /// inherits from ExprVar but has its own Kind.
+    explicit ExprVar(Kind k, Symbol name)
+        : Expr(k), name(name) {};
     Value * maybeThunk(EvalState & state, Env & env) override;
 
     PosIdx getPos() const override
@@ -276,8 +321,9 @@ struct ExprVar : Expr
 struct ExprInheritFrom : ExprVar
 {
     ExprInheritFrom(PosIdx pos, Displacement displ)
-        : ExprVar(pos, {})
+        : ExprVar(Kind::InheritFrom, {})
     {
+        this->pos = pos;
         this->level = 0;
         this->displ = displ;
         this->fromWith = nullptr;
@@ -299,7 +345,8 @@ struct ExprSelect : Expr
         Expr * e,
         std::span<const AttrName> attrPath,
         Expr * def)
-        : pos(pos)
+        : Expr(Kind::Select)
+        , pos(pos)
         , nAttrPath(attrPath.size())
         , e(e)
         , def(def)
@@ -309,7 +356,8 @@ struct ExprSelect : Expr
     };
 
     ExprSelect(std::pmr::polymorphic_allocator<char> & alloc, const PosIdx & pos, Expr * e, Symbol name)
-        : pos(pos)
+        : Expr(Kind::Select)
+        , pos(pos)
         , nAttrPath(1)
         , e(e)
         , def(0)
@@ -348,7 +396,8 @@ struct ExprOpHasAttr : Expr
     std::span<AttrName> attrPath;
 
     ExprOpHasAttr(std::pmr::polymorphic_allocator<char> & alloc, Expr * e, std::span<AttrName> attrPath)
-        : e(e)
+        : Expr(Kind::OpHasAttr)
+        , e(e)
         , attrPath({alloc.allocate_object<AttrName>(attrPath.size()), attrPath.size()})
     {
         std::ranges::copy(attrPath, this->attrPath.begin());
@@ -427,12 +476,14 @@ struct ExprAttrs : Expr
      */
     std::optional<DynamicAttrDefs> dynamicAttrs;
     ExprAttrs(const PosIdx & pos)
-        : recursive(false)
+        : Expr(Kind::Attrs)
+        , recursive(false)
         , pos(pos)
         , attrs(AttrDefs{})
         , dynamicAttrs(DynamicAttrDefs{}) {};
     ExprAttrs()
-        : recursive(false)
+        : Expr(Kind::Attrs)
+        , recursive(false)
         , attrs(AttrDefs{})
         , dynamicAttrs(DynamicAttrDefs{}) {};
 
@@ -454,7 +505,8 @@ struct ExprList : Expr
     std::span<Expr *> elems;
 
     ExprList(std::pmr::polymorphic_allocator<char> & alloc, std::span<Expr *> exprs)
-        : elems({alloc.allocate_object<Expr *>(exprs.size()), exprs.size()})
+        : Expr(Kind::List)
+        , elems({alloc.allocate_object<Expr *>(exprs.size()), exprs.size()})
     {
         std::ranges::copy(exprs, elems.begin());
     };
@@ -550,7 +602,8 @@ public:
         Symbol arg,
         const FormalsBuilder & formals,
         Expr * body)
-        : pos(pos)
+        : Expr(Kind::Lambda)
+        , pos(pos)
         , arg(arg)
         , hasFormals(true)
         , ellipsis(formals.ellipsis)
@@ -570,7 +623,8 @@ public:
     };
 
     ExprLambda(PosIdx pos, Symbol arg, Expr * body)
-        : pos(pos)
+        : Expr(Kind::Lambda)
+        , pos(pos)
         , arg(arg)
         , hasFormals(false)
         , ellipsis(false)
@@ -609,7 +663,8 @@ struct ExprCall : Expr
     std::optional<PosIdx> cursedOrEndPos; // used during parsing to warn about https://github.com/NixOS/nix/issues/11118
 
     ExprCall(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args)
-        : fun(fun)
+        : Expr(Kind::Call)
+        , fun(fun)
         , args(args)
         , pos(pos)
         , cursedOrEndPos({})
@@ -617,7 +672,8 @@ struct ExprCall : Expr
     }
 
     ExprCall(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args, PosIdx && cursedOrEndPos)
-        : fun(fun)
+        : Expr(Kind::Call)
+        , fun(fun)
         , args(args)
         , pos(pos)
         , cursedOrEndPos(cursedOrEndPos)
@@ -640,7 +696,8 @@ struct ExprLet : Expr
     ExprAttrs * attrs;
     Expr * body;
     ExprLet(ExprAttrs * attrs, Expr * body)
-        : attrs(attrs)
+        : Expr(Kind::Let)
+        , attrs(attrs)
         , body(body) {};
     COMMON_METHODS
 };
@@ -652,7 +709,8 @@ struct ExprWith : Expr
     Expr *attrs, *body;
     ExprWith * parentWith;
     ExprWith(const PosIdx & pos, Expr * attrs, Expr * body)
-        : pos(pos)
+        : Expr(Kind::With)
+        , pos(pos)
         , attrs(attrs)
         , body(body) {};
 
@@ -669,7 +727,8 @@ struct ExprIf : Expr
     PosIdx pos;
     Expr *cond, *then, *else_;
     ExprIf(const PosIdx & pos, Expr * cond, Expr * then, Expr * else_)
-        : pos(pos)
+        : Expr(Kind::If)
+        , pos(pos)
         , cond(cond)
         , then(then)
         , else_(else_) {};
@@ -687,7 +746,8 @@ struct ExprAssert : Expr
     PosIdx pos;
     Expr *cond, *body;
     ExprAssert(const PosIdx & pos, Expr * cond, Expr * body)
-        : pos(pos)
+        : Expr(Kind::Assert)
+        , pos(pos)
         , cond(cond)
         , body(body) {};
 
@@ -703,7 +763,7 @@ struct ExprOpNot : Expr
 {
     Expr * e;
     ExprOpNot(Expr * e)
-        : e(e) {};
+        : Expr(Kind::OpNot), e(e) {};
 
     PosIdx getPos() const override
     {
@@ -713,14 +773,16 @@ struct ExprOpNot : Expr
     COMMON_METHODS
 };
 
-#define MakeBinOpMembers(name, s)                                                        \
+#define MakeBinOpMembers(name, kind, s)                                                  \
     PosIdx pos;                                                                          \
     Expr *e1, *e2;                                                                       \
     name(Expr * e1, Expr * e2)                                                           \
-        : e1(e1)                                                                         \
+        : Expr(kind)                                                                     \
+        , e1(e1)                                                                         \
         , e2(e2){};                                                                      \
     name(const PosIdx & pos, Expr * e1, Expr * e2)                                       \
-        : pos(pos)                                                                       \
+        : Expr(kind)                                                                     \
+        , pos(pos)                                                                       \
         , e1(e1)                                                                         \
         , e2(e2){};                                                                      \
     void show(const SymbolTable & symbols, std::ostream & str) const override            \
@@ -742,18 +804,18 @@ struct ExprOpNot : Expr
         return pos;                                                                      \
     }
 
-#define MakeBinOp(name, s)        \
-    struct name : Expr            \
-    {                             \
-        MakeBinOpMembers(name, s) \
+#define MakeBinOp(name, kind, s)        \
+    struct name : Expr                  \
+    {                                   \
+        MakeBinOpMembers(name, kind, s) \
     }
 
-MakeBinOp(ExprOpEq, "==");
-MakeBinOp(ExprOpNEq, "!=");
-MakeBinOp(ExprOpAnd, "&&");
-MakeBinOp(ExprOpOr, "||");
-MakeBinOp(ExprOpImpl, "->");
-MakeBinOp(ExprOpConcatLists, "++");
+MakeBinOp(ExprOpEq, Kind::OpEq, "==");
+MakeBinOp(ExprOpNEq, Kind::OpNEq, "!=");
+MakeBinOp(ExprOpAnd, Kind::OpAnd, "&&");
+MakeBinOp(ExprOpOr, Kind::OpOr, "||");
+MakeBinOp(ExprOpImpl, Kind::OpImpl, "->");
+MakeBinOp(ExprOpConcatLists, Kind::OpConcatLists, "++");
 
 struct ExprOpUpdate : Expr
 {
@@ -763,7 +825,7 @@ private:
     void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q);
 
 public:
-    MakeBinOpMembers(ExprOpUpdate, "//");
+    MakeBinOpMembers(ExprOpUpdate, Kind::OpUpdate, "//");
     virtual void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, std::string_view errorCtx) override;
 };
 
@@ -778,7 +840,8 @@ struct ExprConcatStrings : Expr
         const PosIdx & pos,
         bool forceString,
         std::span<std::pair<PosIdx, Expr *>> es)
-        : pos(pos)
+        : Expr(Kind::ConcatStrings)
+        , pos(pos)
         , forceString(forceString)
         , es({alloc.allocate_object<std::pair<PosIdx, Expr *>>(es.size()), es.size()})
     {
@@ -790,7 +853,8 @@ struct ExprConcatStrings : Expr
         const PosIdx & pos,
         bool forceString,
         std::initializer_list<std::pair<PosIdx, Expr *>> es)
-        : pos(pos)
+        : Expr(Kind::ConcatStrings)
+        , pos(pos)
         , forceString(forceString)
         , es({alloc.allocate_object<std::pair<PosIdx, Expr *>>(es.size()), es.size()})
     {
@@ -809,7 +873,7 @@ struct ExprPos : Expr
 {
     PosIdx pos;
     ExprPos(const PosIdx & pos)
-        : pos(pos) {};
+        : Expr(Kind::Pos), pos(pos) {};
 
     PosIdx getPos() const override
     {
@@ -822,6 +886,8 @@ struct ExprPos : Expr
 /* only used to mark thunks as black holes. */
 struct ExprBlackHole : Expr
 {
+    ExprBlackHole() : Expr(Kind::BlackHole) {}
+
     void show(const SymbolTable & symbols, std::ostream & str) const override {}
 
     void eval(EvalState & state, Env & env, Value & v) override;
