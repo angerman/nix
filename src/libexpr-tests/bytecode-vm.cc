@@ -1665,3 +1665,76 @@ TEST_F(IRSerializeTest, magic_mismatch_throws) {
 }
 
 } // namespace nix
+
+#include "nix/expr/bytecode-disk-cache.hh"
+#include <filesystem>
+#include <random>
+
+namespace nix {
+
+class IRDiskCacheTest : public IREmitTest
+{
+protected:
+    std::filesystem::path tempDb()
+    {
+        auto p = std::filesystem::temp_directory_path() /
+            ("bytecode-cache-test-" + std::to_string(::getpid()) + "-"
+             + std::to_string(std::random_device{}()) + ".sqlite");
+        return p;
+    }
+};
+
+TEST_F(IRDiskCacheTest, roundtrip_through_disk) {
+    auto path = tempDb();
+    bytecode::CacheKey key{Hash{HashAlgorithm::SHA256}};
+    // Construct a non-empty hash by hashing a known string.
+    key.hash = hashString(HashAlgorithm::SHA256, "test-key");
+
+    {
+        bytecode::BytecodeDiskCache cache(path);
+        EXPECT_FALSE(cache.lookup(key).has_value());
+
+        auto * e = state.parseExprFromString("let x = 7; in x * 6", state.rootPath(CanonPath::root));
+        auto mod = ir::lower(state, e);
+        auto * unit = bytecode::emitFromIR(state, mod);
+        auto blob = bytecode::serializeCU(*unit, state);
+        cache.insert(key, blob, "/dev/null");
+
+        EXPECT_EQ(cache.nrInserts(), 1u);
+        EXPECT_EQ(cache.nrMisses(), 1u);
+    }
+    {
+        bytecode::BytecodeDiskCache cache(path);
+        auto blob = cache.lookup(key);
+        ASSERT_TRUE(blob.has_value());
+        EXPECT_EQ(cache.nrHits(), 1u);
+
+        auto * rt = bytecode::deserializeCU(*blob, state);
+        Value result;
+        bytecode::vmExec(state, *rt, 0, state.baseEnv, result);
+        state.forceValue(result, noPos);
+        EXPECT_EQ(result.type(), nInt);
+        EXPECT_EQ(result.integer().value, 42);
+    }
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(path.string() + "-journal");
+    std::filesystem::remove(path.string() + "-shm");
+    std::filesystem::remove(path.string() + "-wal");
+}
+
+TEST_F(IRDiskCacheTest, lookup_miss_returns_nullopt) {
+    auto path = tempDb();
+    bytecode::BytecodeDiskCache cache(path);
+    bytecode::CacheKey absent{Hash{HashAlgorithm::SHA256}};
+    absent.hash = hashString(HashAlgorithm::SHA256, "no-such-key");
+    EXPECT_FALSE(cache.lookup(absent).has_value());
+    EXPECT_EQ(cache.nrMisses(), 1u);
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(path.string() + "-journal");
+    std::filesystem::remove(path.string() + "-shm");
+    std::filesystem::remove(path.string() + "-wal");
+}
+
+} // namespace nix

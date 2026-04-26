@@ -95,6 +95,13 @@ cpuid = dependency('libcpuid', 'cpuid', required : false)
 configdata_priv.set('HAVE_LIBCPUID', cpuid.found().to_int())
 deps_private += cpuid
 
+# bytecode-disk-cache.cc uses sqlite3 directly for BLOB column reads
+# (the libnixstore SQLiteStmt::Use API exposes only TEXT/INT/blob-bind
+# but no blob-fetch helper).  Direct sqlite3 usage requires the
+# library on this target's link line.
+sqlite = dependency('sqlite3', 'sqlite', version : '>=3.6.19')
+deps_private += sqlite
+
 config_priv_h = configure_file(
   configuration : configdata_priv,
   output : 'expr-config-private.hh',
@@ -160,6 +167,7 @@ sources = files(
   'bytecode.cc',
   'bytecode-compiler.cc',
   'bytecode-disasm.cc',
+  'bytecode-disk-cache.cc',
   'bytecode-serialize.cc',
   'bytecode-thunk.cc',
   'ir.cc',

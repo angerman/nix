@@ -12,6 +12,7 @@ headers = [ config_pub_h ] + files(
   'attr-set.hh',
   'bytecode.hh',
   'bytecode-compiler.hh',
+  'bytecode-disk-cache.hh',
   'bytecode-serialize.hh',
   'bytecode-thunk.hh',
   'ir.hh',
