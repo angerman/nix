@@ -1721,10 +1721,36 @@ void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
     // between bindings) invalidates the elision opportunity.
     ctx.lastBoundVar = ir::kInvalidVar;
 
+    // B5 fusion peephole: if the immediately-preceding emit was an
+    // OP_GET_STACK_SLOT (or OP_GET_UPVALUE) and the operand fits in
+    // 12 bits AND the new emit also fits, replace the pair with the
+    // dual-form superinstruction OP_GET_SLOT2 (or OP_GET_UV2).
+    auto fuseIfDualSlot = [&](uint32_t newSlot) -> bool {
+        if (newSlot > 0xFFF) return false;
+        if (unit.code.empty()) return false;
+        uint32_t lastIdx = unit.code.size() - 1;
+        if (decodeOp(unit.code[lastIdx]) != OP_GET_STACK_SLOT) return false;
+        uint32_t prevSlot = decodeOperand(unit.code[lastIdx]);
+        if (prevSlot > 0xFFF) return false;
+        unit.code[lastIdx] = encode(OP_GET_SLOT2, (prevSlot << 12) | newSlot);
+        return true;
+    };
+    auto fuseIfDualUv = [&](uint32_t newUv) -> bool {
+        if (newUv > 0xFFF) return false;
+        if (unit.code.empty()) return false;
+        uint32_t lastIdx = unit.code.size() - 1;
+        if (decodeOp(unit.code[lastIdx]) != OP_GET_UPVALUE) return false;
+        uint32_t prevUv = decodeOperand(unit.code[lastIdx]);
+        if (prevUv > 0xFFF) return false;
+        unit.code[lastIdx] = encode(OP_GET_UV2, (prevUv << 12) | newUv);
+        return true;
+    };
+
     // Check local slots first (defined in this block).
     auto localIt = ctx.localSlots.find(var);
     if (localIt != ctx.localSlots.end()) {
-        unit.emit(OP_GET_STACK_SLOT, localIt->second);
+        if (!fuseIfDualSlot(localIt->second))
+            unit.emit(OP_GET_STACK_SLOT, localIt->second);
         return;
     }
 
@@ -1741,7 +1767,8 @@ void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
     // Check upvalue slots (captured from enclosing scope).
     auto upIt = ctx.upvalueSlots.find(var);
     if (upIt != ctx.upvalueSlots.end()) {
-        unit.emit(OP_GET_UPVALUE, upIt->second);
+        if (!fuseIfDualUv(upIt->second))
+            unit.emit(OP_GET_UPVALUE, upIt->second);
         return;
     }
 

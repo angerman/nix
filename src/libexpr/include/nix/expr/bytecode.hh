@@ -467,6 +467,19 @@ enum Op : uint8_t {
     /// Like OP_LIST_INIT but writes result to slot dst.
     /// Encoding: [dst:8 | nElems:24].
     OP_RLIST_INIT = 0x6C,
+
+    /// B5 superinstruction: fuse OP_GET_UPVALUE + OP_GET_UPVALUE.
+    /// Pushes upvalues[uv1], then upvalues[uv2].
+    /// Encoding: [uv1:12 | uv2:12].
+    /// Profile (B5 agent on nixpkgs#hello.name): ~7.5% of dispatches
+    /// — the largest unfused pair after the existing S-series.
+    OP_GET_UV2 = 0x6D,
+
+    /// B5 superinstruction: fuse OP_GET_STACK_SLOT + OP_GET_STACK_SLOT.
+    /// Pushes stack[base+slot1], then stack[base+slot2].
+    /// Encoding: [slot1:12 | slot2:12].
+    /// Profile (B5 agent on nixpkgs#hello.name): ~6.3% of dispatches.
+    OP_GET_SLOT2 = 0x6E,
 };
 
 

@@ -850,6 +850,8 @@ void vmExec(
         REGISTER_OP(OP_RMAKE_CLOSURE_V2, op_rmake_closure_v2);
         REGISTER_OP(OP_RATTRS_INIT, op_rattrs_init);
         REGISTER_OP(OP_RLIST_INIT, op_rlist_init);
+        REGISTER_OP(OP_GET_UV2, op_get_uv2);
+        REGISTER_OP(OP_GET_SLOT2, op_get_slot2);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2835,6 +2837,39 @@ op_attr_select_cached:
             cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
             *(vm.sp - 1) = j->value;
         } else {
+            const char * dbg = getenv("NIX_VM_DEBUG_ATTRSEL");
+            if (dbg && *dbg) {
+                std::string posStr;
+                {
+                    auto p = cu->posForOffset(ip - 1);
+                    if (p != noPos) {
+                        std::ostringstream oss;
+                        oss << state.positions[p];
+                        posStr = oss.str();
+                    } else posStr = "(no pos)";
+                }
+                fprintf(stderr,
+                    "OP_ATTR_SELECT_CACHED miss in cu=%p pos=%s\n"
+                    "  looking for '%s' (cacheIdx=%u, name.id=%u)\n"
+                    "  CU symbols (%zu total):",
+                    (void*)cu, posStr.c_str(),
+                    state.symbols[cache.name].c_str(),
+                    cacheIdx, cache.name.getId(), cu->symbols.size());
+                for (uint32_t i = 0; i < std::min<uint32_t>(16, cu->symbols.size()); i++) {
+                    fprintf(stderr, " [%u]='%s' id=%u",
+                        i, state.symbols[cu->symbols[i]].c_str(),
+                        cu->symbols[i].getId());
+                }
+                fprintf(stderr, "\n  attrs has: ");
+                int n = 0;
+                for (auto & a : *attrs->attrs()) {
+                    if (n++ > 12) { fprintf(stderr, "..."); break; }
+                    fprintf(stderr, " %s(id=%u)",
+                        state.symbols[a.name].c_str(), a.name.getId());
+                }
+                fprintf(stderr, "\n  cu->code size=%zu, ip-1=%u, num attrCaches=%zu\n",
+                    cu->code.size(), ip - 1, cu->attrCaches.size());
+            }
             state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
                 .atPos(cu->posForOffset(ip - 1)).debugThrow();
         }
@@ -3226,6 +3261,25 @@ op_get_upvalue:
         DISPATCH();
     }
 
+    // B5 superinstruction: dual GET_UPVALUE (~7.5% of dispatches per
+    // profiler).  Encoding: [uv1:12 | uv2:12].  Pushes upvalues[uv1]
+    // then upvalues[uv2] in one dispatch.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_uv2:
+#else
+    case OP_GET_UV2:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t uv1 = operand >> 12;
+        uint32_t uv2 = operand & 0xFFF;
+        Value ** upvalues = vm.frames.back().upvalues;
+        assert(upvalues && "OP_GET_UV2: no upvalue array in current frame");
+        vm.push(upvalues[uv1]);
+        vm.push(upvalues[uv2]);
+        DISPATCH();
+    }
+
     // ==================================================================
     // VM v2: Stack slot access (frame-relative)
     // ==================================================================
@@ -3245,6 +3299,23 @@ op_get_stack_slot:
             abort();
         }
         vm.push(v);
+        DISPATCH();
+    }
+
+    // B5 superinstruction: dual GET_STACK_SLOT (~6.3% of dispatches).
+    // Encoding: [slot1:12 | slot2:12].
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_slot2:
+#else
+    case OP_GET_SLOT2:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t s1 = operand >> 12;
+        uint32_t s2 = operand & 0xFFF;
+        size_t base = stackBase;
+        vm.push(vm.stack[base + s1]);
+        vm.push(vm.stack[base + s2]);
         DISPATCH();
     }
 
