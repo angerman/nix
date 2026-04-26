@@ -458,6 +458,106 @@ static int testPrimOpHeadTail()
     return 0;
 }
 
+// Fibonacci via self-application (avoids needing let-rec).
+//   fibImpl = self: n: if n < 2 then n else self self (n-1) + self self (n-2)
+//   fib = fibImpl fibImpl
+//   fib 10 = 55
+//
+// IR layout:
+//   function 0 (top):
+//     fibImpl = Lambda funcIdx=1
+//     fib = App fibImpl fibImpl
+//     ten = LitInt 10
+//     r = App fib ten
+//     return r
+//
+//   function 1 (fibImpl): param self; body returns Lambda funcIdx=2 with self captured
+//     return (Lambda funcIdx=2, freeVars=[self])
+//
+//   function 2 (the body): param n; freeVars = [self];
+//     if n < 2 then n else (self self) (n-1) + (self self) (n-2)
+static int testFibonacciSelfApp()
+{
+    auto m = ir::makeModule();
+
+    // Allocate FuncIds + Blocks up front so block references stay valid.
+    auto fibImplFid = addFunction(m); // 1
+    auto bodyFid    = addFunction(m); // 2
+    auto topEntry   = m.freshBlock();
+    auto fibImplEntry = m.freshBlock();
+    auto bodyEntry  = m.freshBlock();
+    auto thenB      = m.freshBlock();
+    auto elseB      = m.freshBlock();
+
+    funcOf(m, 0).entryBlock = topEntry;
+    funcOf(m, fibImplFid).entryBlock = fibImplEntry;
+    funcOf(m, bodyFid).entryBlock = bodyEntry;
+
+    auto symSelf = m.internSymbol("self");
+    auto symN    = m.internSymbol("n");
+
+    // function 1 (fibImpl): param self -> returns Lambda(bodyFid, freeVars=[self]).
+    auto selfParam = m.freshVar();
+    {
+        auto & f = funcOf(m, fibImplFid);
+        f.argName = symSelf;
+        f.paramVar = selfParam;
+        f.name = "fibImpl";
+        // The body returns Lambda(bodyFid) capturing selfParam.
+        auto lam = addBinding(m, fibImplEntry,
+                              ir::Lambda{ bodyFid, /*freeVars*/ {selfParam} });
+        setReturn(m, fibImplEntry, lam);
+    }
+
+    // function 2 (body): param n; free var = self (the one passed to fibImpl).
+    auto nParam = m.freshVar();
+    {
+        auto & f = funcOf(m, bodyFid);
+        f.argName = symN;
+        f.paramVar = nParam;
+        f.name = "fib_body";
+
+        auto two   = addBinding(m, bodyEntry, ir::LitInt{2});
+        auto cond  = addBinding(m, bodyEntry, ir::Less{nParam, two});
+        auto res   = addBinding(m, bodyEntry, ir::If{cond, thenB, elseB});
+        setReturn(m, bodyEntry, res);
+
+        // then: return n
+        setReturn(m, thenB, nParam);
+
+        // else: (self self) (n-1) + (self self) (n-2)
+        auto one  = addBinding(m, elseB, ir::LitInt{1});
+        auto two2 = addBinding(m, elseB, ir::LitInt{2});
+        auto nm1  = addBinding(m, elseB, ir::Sub{nParam, one});
+        auto nm2  = addBinding(m, elseB, ir::Sub{nParam, two2});
+        // Build "fib = self self" twice (could share but keep simple).
+        auto fibA = addBinding(m, elseB, ir::App{selfParam, selfParam});
+        auto callA = addBinding(m, elseB, ir::App{fibA, nm1});
+        auto fibB = addBinding(m, elseB, ir::App{selfParam, selfParam});
+        auto callB = addBinding(m, elseB, ir::App{fibB, nm2});
+        auto sum = addBinding(m, elseB, ir::Add{callA, callB});
+        setReturn(m, elseB, sum);
+    }
+
+    // function 0 (top): build fibImpl, apply to itself, then to 10.
+    auto fibImplVar = addBinding(m, topEntry, ir::Lambda{ fibImplFid, /*freeVars*/ {} });
+    auto fibVar     = addBinding(m, topEntry, ir::App{fibImplVar, fibImplVar});
+    auto ten        = addBinding(m, topEntry, ir::LitInt{10});
+    auto r          = addBinding(m, topEntry, ir::App{fibVar, ten});
+    setReturn(m, topEntry, r);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value res = run(cu);
+    if (!res.isInt() || res.payload.i != 55) {
+        std::fprintf(stderr, "testFibonacciSelfApp: expected 55, got tag=%d val=%lld\n",
+            (int)res.tag(), (long long)res.payload.i);
+        return 1;
+    }
+    std::fprintf(stderr, "testFibonacciSelfApp: OK (fib 10 = 55)\n");
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -475,6 +575,7 @@ int main()
     rc |= testShortCircuit();
     rc |= testPrimOpLength();
     rc |= testPrimOpHeadTail();
+    rc |= testFibonacciSelfApp();
 
     auto & st = allocStats();
     std::fprintf(stderr,

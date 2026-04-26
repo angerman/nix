@@ -95,7 +95,10 @@ enum Op : uint8_t
     // --- Attrsets -------------------------------------------------------
     OP_ATTRS_INIT     = 0x70,  // [n:24]   pop n values; data: n SymbolIds; build sorted attrset
     OP_ATTRS_INIT_DYN = 0x71,  // [nStatic:16, nDyn:8] then static syms then values then dyn name+value pairs
-    OP_ATTRS_REC_INIT = 0x72,  // [n:24]   recursive — entries see each other (build via thunks)
+    OP_ATTRS_REC_INIT = 0x72,  // [n:24]   data: n SymbolIds — allocate placeholder Bindings,
+                                //          push it on op stack with placeholders; entries are filled in by
+                                //          subsequent OP_ATTRS_REC_SET ops
+    OP_ATTRS_REC_SET  = 0x78,  // [i:24]   pop top (the entry value), peek bindings, write into entries[i].value
     OP_ATTRS_SELECT   = 0x73,  // [sym:24] pop attrs, push attrs[sym]
     OP_ATTRS_SELECT_DYN = 0x74, // pop name, pop attrs, push attrs[name]
     OP_ATTRS_HAS      = 0x75,  // [sym:24] pop attrs, push bool
