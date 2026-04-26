@@ -10,6 +10,21 @@
 #include "nix/expr/vm.hh"
 #include "nix/expr/eval.hh"
 
+#include <chrono>
+
+namespace nix::bytecode {
+
+/// EX2: thread-local execution-time accumulator.  Counts only the
+/// OUTERMOST vmExec entry (depth 0) so nested thunk-force invocations
+/// don't double-count.  EvalState::bytecodeExecTimeUs counts only the
+/// top-level eval entry, which misses inner thunk forces; this counts
+/// every entry that wasn't already inside a vmExec frame.
+thread_local uint64_t innerExecTimeUs = 0;
+thread_local uint64_t innerExecCalls = 0;
+thread_local uint32_t innerExecDepth = 0;
+
+} // namespace nix::bytecode
+
 namespace nix {
 
 // ---------------------------------------------------------------------------
@@ -30,6 +45,7 @@ void ExprBytecodeThunk::eval(EvalState & state, Env & env, Value & v)
     if (desc.nUpvalues > 0)
         upvalues = &env.values[1];
 
+    bytecode::innerExecCalls++;
     bytecode::vmExec(state, *unit, offset, env, v, upvalues);
 }
 

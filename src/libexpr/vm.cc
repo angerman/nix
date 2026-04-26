@@ -19,6 +19,8 @@
 #include "nix/util/environment-variables.hh"
 
 #include <cassert>
+#include <algorithm>
+#include <utility>
 
 namespace nix::bytecode {
 
@@ -107,6 +109,11 @@ static void printVMStats(const VMState & vm) {
         (unsigned long long)nanboxMaterializeHits,
         nanboxMaterializeCalls
             ? 100.0 * nanboxMaterializeHits / nanboxMaterializeCalls : 0.0);
+    extern thread_local uint64_t innerExecTimeUs;
+    extern thread_local uint64_t innerExecCalls;
+    fprintf(stderr, "  inner vmExec (thunk-force): %llu calls, %llu us total\n",
+        (unsigned long long)innerExecCalls,
+        (unsigned long long)innerExecTimeUs);
     fprintf(stderr, "  OP_FORCE → tree-walker: %llu\n", (unsigned long long)vm.nrForceFallbacks);
     fprintf(stderr, "  OP_CALL_1 → tree-walker: %llu\n", (unsigned long long)vm.nrCallFallbacks);
     fprintf(stderr, "  Peak stack depth: %llu\n", (unsigned long long)vm.peakStackDepth);
@@ -116,6 +123,29 @@ static void printVMStats(const VMState & vm) {
         (unsigned long long)vm.nrAttrCacheHits,
         (unsigned long long)vm.nrAttrCacheMisses,
         totalAttr ? 100.0 * vm.nrAttrCacheHits / totalAttr : 0.0);
+
+    // Per-opcode frequency histogram (top 30).
+    // Sorted by descending count; opcodes with zero hits are omitted.
+    uint64_t totalCounted = 0;
+    for (int i = 0; i < 256; i++) totalCounted += vm.opcodeCounts[i];
+    fprintf(stderr, "\n  --- Opcode dispatch counts (top 30 of executed) ---\n");
+    fprintf(stderr, "  Total dispatched: %llu\n", (unsigned long long)totalCounted);
+    // Build (opcode, count) pairs, sort, print top 30.
+    std::pair<uint8_t, uint64_t> hist[256];
+    for (int i = 0; i < 256; i++)
+        hist[i] = {static_cast<uint8_t>(i), vm.opcodeCounts[i]};
+    std::sort(hist, hist + 256, [](const auto & a, const auto & b) {
+        return a.second > b.second;
+    });
+    int rank = 0;
+    for (int i = 0; i < 256 && rank < 30; i++) {
+        if (hist[i].second == 0) break;
+        rank++;
+        double pct = totalCounted ? 100.0 * hist[i].second / totalCounted : 0.0;
+        fprintf(stderr, "  %2d. 0x%02x %-26s %12llu (%5.2f%%)\n",
+            rank, hist[i].first, opName(hist[i].first),
+            (unsigned long long)hist[i].second, pct);
+    }
     fprintf(stderr, "================================\n");
 }
 
@@ -922,13 +952,21 @@ void vmExec(
     // Computed-goto dispatch macro.
     // When tracing is enabled, use the trace-aware hook.
     // When disabled, just increment the counter (zero branches).
+    //
+    // We also bump a per-opcode dispatch counter (vm.opcodeCounts[op]++)
+    // unconditionally.  This is one indexed store per dispatch; the cache
+    // line for the 256-entry array stays hot, so the cost is well under
+    // the existing dispatch overhead.  Used by printVMStats to report
+    // a frequency histogram of the executed opcodes.
 #define DISPATCH() do {                              \
         Instruction _instr = cu->code[ip++];         \
         if (tracingEnabled) [[unlikely]]             \
             VM_HOOK_TRACE();                         \
         else                                         \
             VM_HOOK();                               \
-        goto *dispatchTable[decodeOp(_instr)];       \
+        uint8_t _op = decodeOp(_instr);              \
+        vm.opcodeCounts[_op]++;                      \
+        goto *dispatchTable[_op];                    \
     } while (0)
 
 #define CUR_INSTR (cu->code[ip - 1])
@@ -961,7 +999,11 @@ void vmExec(
             }
         }
 
-        switch (decodeOp(instr)) {
+        // Per-opcode frequency counter (mirrors the computed-goto path).
+        uint8_t _op_sw = decodeOp(instr);
+        vm.opcodeCounts[_op_sw]++;
+
+        switch (_op_sw) {
 
 #endif // NIX_VM_COMPUTED_GOTO
 

@@ -236,6 +236,12 @@ struct VMState
     uint64_t nrForceFallbacks = 0;    ///< OP_FORCE → state.forceValue (tree-walker)
     uint64_t nrCallFallbacks = 0;     ///< OP_CALL_1 → state.callFunction (tree-walker)
 
+    /// Per-opcode dispatch counter.  Indexed by decoded 8-bit opcode.
+    /// Incremented unconditionally inside DISPATCH() — one indexed
+    /// store per dispatch, well below the dispatch cost itself.
+    /// Reported by printVMStats (NIX_VM_STATS=1).
+    uint64_t opcodeCounts[256] = {};
+
 private:
     void grow();
 };
