@@ -77,6 +77,14 @@ static inline void pushThunkFrame(VMState & vm,
 static uint64_t nanboxMaterializeHits = 0;
 static uint64_t nanboxMaterializeCalls = 0;
 
+/// EXi: file-scope flag, initialised once at process start (function-
+/// local-static would have a thread-safe-init guard on every vmExec
+/// entry, costing ~17 ns × 286K thunk forces ≈ 5 ms on hello.name).
+/// Linkage is `extern` so the dispatch loop can read it from both
+/// computed-goto and switch-based paths without re-declaring.
+const bool vmStatsEnabled =
+    getEnv("NIX_VM_STATS").value_or("") == "1";
+
 /// Materialize a tagged immediate into a heap-allocated Value.
 /// If `w` is already a real pointer (low bit clear), returns it unchanged.
 /// If `w` is a tagged immediate, allocates a Value and decodes the tag.
@@ -930,14 +938,16 @@ void vmExec(
 
     auto & tcfg = traceConfig();
     auto & stepCounter = globalStepCounter();
-
-    // Profiling and tracing hook -- called before every instruction.
-    // When tracing is disabled (the common case), this is just a counter
-    // increment with ZERO branches.  The branch on tcfg.enabled is
-    // hoisted out of the dispatch loop entirely.
+    // EXi: gate per-dispatch stat counters behind a flag set once at
+    // process startup.  Without this gate, vm.nrInstructions++ and
+    // vm.opcodeCounts[op]++ fire ~8.7M times per nixpkgs#hello.name
+    // eval (~17M memory stores) even when no one is looking.  See
+    // file-scope vmStatsEnabled definition below.
+    extern const bool vmStatsEnabled;
     bool tracingEnabled = tcfg.enabled;
 #define VM_HOOK() do {                                         \
-        vm.nrInstructions++;                                   \
+        if (vmStatsEnabled) [[unlikely]]                       \
+            vm.nrInstructions++;                               \
     } while (0)
 #define VM_HOOK_TRACE() do {                                   \
         vm.nrInstructions++;                                   \
@@ -954,10 +964,7 @@ void vmExec(
     // When disabled, just increment the counter (zero branches).
     //
     // We also bump a per-opcode dispatch counter (vm.opcodeCounts[op]++)
-    // unconditionally.  This is one indexed store per dispatch; the cache
-    // line for the 256-entry array stays hot, so the cost is well under
-    // the existing dispatch overhead.  Used by printVMStats to report
-    // a frequency histogram of the executed opcodes.
+    // when stats are enabled.  When disabled, no memory traffic.
 #define DISPATCH() do {                              \
         Instruction _instr = cu->code[ip++];         \
         if (tracingEnabled) [[unlikely]]             \
@@ -965,7 +972,8 @@ void vmExec(
         else                                         \
             VM_HOOK();                               \
         uint8_t _op = decodeOp(_instr);              \
-        vm.opcodeCounts[_op]++;                      \
+        if (vmStatsEnabled) [[unlikely]]             \
+            vm.opcodeCounts[_op]++;                  \
         goto *dispatchTable[_op];                    \
     } while (0)
 
@@ -982,6 +990,7 @@ void vmExec(
 
     auto & tcfg = traceConfig();
     auto & stepCounter = globalStepCounter();
+    extern const bool vmStatsEnabled;
     bool tracingEnabled = tcfg.enabled;
 
     try { // exception cleanup: restore frame/stack on throw
@@ -989,7 +998,8 @@ void vmExec(
     for (;;) {
         Instruction instr = cu->code[ip++];
 
-        vm.nrInstructions++;
+        if (vmStatsEnabled) [[unlikely]]
+            vm.nrInstructions++;
         if (tracingEnabled) [[unlikely]] {
             uint64_t step = stepCounter++;
             if (step >= tcfg.from && step <= tcfg.to) {
@@ -999,9 +1009,10 @@ void vmExec(
             }
         }
 
-        // Per-opcode frequency counter (mirrors the computed-goto path).
+        // Per-opcode frequency counter (gated; mirrors computed-goto path).
         uint8_t _op_sw = decodeOp(instr);
-        vm.opcodeCounts[_op_sw]++;
+        if (vmStatsEnabled) [[unlikely]]
+            vm.opcodeCounts[_op_sw]++;
 
         switch (_op_sw) {
 
