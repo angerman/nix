@@ -670,4 +670,42 @@ const char * opName(uint8_t op);
 /// If `state` is non-null, prints constant values and symbol names.
 std::string disassemble(const CompilationUnit & unit, const EvalState * state = nullptr);
 
+/// Reasons why a CompilationUnit cannot be safely serialized to disk.
+/// Used by the persistent CompilationUnit cache (Phase 3.2) to skip
+/// uncacheable units rather than corrupting the cache.
+enum class UncacheableReason : uint8_t {
+    Cacheable = 0,
+    /// The unit references AST Expr* via OP_EVAL_EXPR.  Tree-walker
+    /// fallbacks for IR coverage gaps make this CU process-bound.
+    HasExprPool,
+    /// The constant pool contains a non-leaf Value (attrset, list,
+    /// lambda, thunk, app, external).  These hold nested heap pointers
+    /// that can't be re-materialized from a binary blob.
+    NonLeafConstant,
+    /// A LambdaDescriptor has formals (pattern-match parameter list).
+    /// Formals point into the AST BumpMemoryResource and would require
+    /// deep-copy serialization.  Skip until that lands.
+    HasFormalsLambda,
+    /// The descriptor's sourceExpr is non-null AND the unit isn't
+    /// going through Phase 3.1 lite's lazy pattern.  Cached CUs from
+    /// another process don't have valid AST pointers; downstream
+    /// lambdaBodyCache lookups would miss harmlessly, but flag for
+    /// hygiene during the schema bring-up.
+    UnsupportedFeature,
+};
+
+/// Returns Cacheable if the unit can be safely serialized, otherwise
+/// the first reason encountered.  Designed to short-circuit on the
+/// most common rejection (HasExprPool).
+UncacheableReason cacheabilityCheck(const CompilationUnit & unit);
+
+inline bool isCacheable(const CompilationUnit & unit)
+{
+    return cacheabilityCheck(unit) == UncacheableReason::Cacheable;
+}
+
+/// Human-readable name for the rejection reason; used in stats and
+/// optional debug logging when a CU is skipped.
+const char * uncacheableReasonName(UncacheableReason r);
+
 } // namespace nix::bytecode
