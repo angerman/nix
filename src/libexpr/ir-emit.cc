@@ -317,23 +317,61 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
         definedInBlock.insert(binding.result);
     }
 
-    // Compute per-VarId use count within this block.  Used by the ANF
-    // de-materialization peephole in emitVarRef: a binding whose result
-    // is referenced exactly ONCE inside this block can have its
-    // SET_STACK_SLOT/GET_STACK_SLOT round-trip elided when the GET
-    // immediately follows the SET (the value is already on the operand
-    // stack from the producer's emitExpr).
+    // Single fused pass: per-VarId use counts (for the ANF peephole)
+    // AND forward-reference detection (for cell-based late binding).
+    //
+    // Use counts: a binding whose result is referenced exactly ONCE
+    // inside this block can have its SET_STACK_SLOT/GET_STACK_SLOT
+    // round-trip elided when the GET immediately follows the SET (the
+    // value is already on the operand stack from the producer).  Use
+    // counts only consider DIRECT refs from binding expressions, NOT
+    // sub-block captures (those go through emitCapture, which doesn't
+    // benefit from the peephole).
+    //
+    // Forward refs: any VarId defined in this block but referenced by
+    // an EARLIER binding's expression OR by an IRMkThunk/IRLambda's
+    // freeVars set.  Triggers cell-based late binding (ALLOC_CELL +
+    // CELL_GET on read; COPY_TO_SLOT + CELL_SET on write).
+    //
+    // Previously these were two separate passes that each called
+    // collectRefs() per binding.  Merging cuts the per-binding work
+    // in half (B2).
     ctx.blockUseCounts.clear();
+    std::unordered_set<ir::VarId> forwardRefs;
     {
-        ir::FreeVars refs;
+        std::unordered_set<ir::VarId> seenDefined;
+        ir::FreeVars directRefs;
         for (const auto & binding : block.bindings) {
-            refs.vars.clear();
-            collectRefs(binding.expr, refs);
-            for (auto v : refs.vars)
+            directRefs.vars.clear();
+            collectRefs(binding.expr, directRefs);
+
+            // Use counts: count direct refs only.  Sub-block captures
+            // are not eligible for the peephole, so they are excluded.
+            for (auto v : directRefs.vars)
                 if (definedInBlock.count(v))
                     ctx.blockUseCounts[v]++;
+
+            // For forward-ref detection we also need IRMkThunk /
+            // IRLambda freeVars (a sub-block can forward-ref a later
+            // binding).  Iterate them in-place rather than building a
+            // merged FreeVars copy.
+            for (auto v : directRefs.vars)
+                if (definedInBlock.count(v) && !seenDefined.count(v))
+                    forwardRefs.insert(v);
+            std::visit([&](const auto & e) {
+                using T = std::decay_t<decltype(e)>;
+                if constexpr (std::is_same_v<T, ir::IRMkThunk>
+                           || std::is_same_v<T, ir::IRLambda>) {
+                    for (auto fv : e.freeVars.vars)
+                        if (definedInBlock.count(fv) && !seenDefined.count(fv))
+                            forwardRefs.insert(fv);
+                }
+            }, binding.expr);
+
+            seenDefined.insert(binding.result);
         }
-        // Terminal references.
+        // Terminal references contribute to use counts only — terminals
+        // never forward-ref (they execute after all bindings).
         std::visit([&](const auto & t) {
             using T = std::decay_t<decltype(t)>;
             if constexpr (std::is_same_v<T, ir::TermReturn>) {
@@ -349,44 +387,6 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
                     ctx.blockUseCounts[t.cond]++;
             }
         }, block.terminal);
-    }
-
-    // Collect forward-referenced VarIds: any VarId that is both (a) defined
-    // by a binding in this block and (b) referenced by an EARLIER binding.
-    //
-    // This covers:
-    //   - Lambda/Thunk freeVars that reference a later binding (recursive let)
-    //   - IRVarRef that references a later binding (rec attrsets where
-    //     `isl = isl_0_20` references `isl_0_20` defined later)
-    //   - IRRecAttrSet entries that reference later bindings
-    //
-    // For correctness, we scan all bindings' expressions for VarId refs
-    // to later-defined bindings.  This is a superset of the Lambda/Thunk
-    // freeVars check but handles all forward-reference patterns.
-    std::unordered_set<ir::VarId> forwardRefs;
-    {
-        std::unordered_set<ir::VarId> seenDefined;
-        for (const auto & binding : block.bindings) {
-            // Collect all VarIds this binding references.
-            ir::FreeVars exprRefs;
-            ir::collectRefs(binding.expr, exprRefs);
-            // Also check Lambda/Thunk freeVars (references from sub-blocks).
-            std::visit([&](const auto & e) {
-                using T = std::decay_t<decltype(e)>;
-                if constexpr (std::is_same_v<T, ir::IRMkThunk>
-                           || std::is_same_v<T, ir::IRLambda>) {
-                    for (auto fv : e.freeVars.vars)
-                        exprRefs.insert(fv);
-                }
-            }, binding.expr);
-            // Any ref to a VarId that is defined in this block but
-            // hasn't been seen yet is a forward reference.
-            for (auto v : exprRefs.vars) {
-                if (definedInBlock.count(v) && !seenDefined.count(v))
-                    forwardRefs.insert(v);
-            }
-            seenDefined.insert(binding.result);
-        }
     }
 
     // Cell-based forward references.
