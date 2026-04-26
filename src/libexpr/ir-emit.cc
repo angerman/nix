@@ -1743,6 +1743,29 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
 
         // -- PrimOp call (VM-native) --
         else if constexpr (std::is_same_v<T, ir::IRPrimOpCall>) {
+            // RES3: detect arity-1 type-check primops and emit a
+            // dedicated opcode that skips fn->impl + arg materialise +
+            // result alloc.  Saves ~3us/dispatch × 30K-50K calls per
+            // type predicate on nixpkgs-scale evals.
+            if (e.args.size() == 1) {
+                const auto & name = e.primOp->name;
+                Op typeOp = OP_NOP;
+                if      (name == "__isAttrs"    || name == "isAttrs")    typeOp = OP_IS_ATTRS;
+                else if (name == "__isString"   || name == "isString")   typeOp = OP_IS_STRING;
+                else if (name == "__isList"     || name == "isList")     typeOp = OP_IS_LIST;
+                else if (name == "__isNull"     || name == "isNull")     typeOp = OP_IS_NULL;
+                else if (name == "__isFunction" || name == "isFunction") typeOp = OP_IS_FUNCTION;
+                else if (name == "__isInt"      || name == "isInt")      typeOp = OP_IS_INT;
+                else if (name == "__isBool"     || name == "isBool")     typeOp = OP_IS_BOOL;
+                else if (name == "__isFloat"    || name == "isFloat")    typeOp = OP_IS_FLOAT;
+                else if (name == "__isPath"     || name == "isPath")     typeOp = OP_IS_PATH;
+                if (typeOp != OP_NOP) {
+                    emitVarRef(e.args[0], pos, ctx);
+                    unit.emitPos(e.pos);
+                    unit.emit(typeOp);
+                    return;
+                }
+            }
             // Push all arguments left-to-right.
             for (auto arg : e.args) {
                 emitVarRef(arg, pos, ctx);

@@ -1118,6 +1118,15 @@ void vmExec(
         REGISTER_OP(OP_GET_SLOT2, op_get_slot2);
         REGISTER_OP(OP_GET_UV_SLOT, op_get_uv_slot);
         REGISTER_OP(OP_GET_SLOT_UV, op_get_slot_uv);
+        REGISTER_OP(OP_IS_ATTRS,    op_is_attrs);
+        REGISTER_OP(OP_IS_STRING,   op_is_string);
+        REGISTER_OP(OP_IS_LIST,     op_is_list);
+        REGISTER_OP(OP_IS_NULL,     op_is_null);
+        REGISTER_OP(OP_IS_FUNCTION, op_is_function);
+        REGISTER_OP(OP_IS_INT,      op_is_int);
+        REGISTER_OP(OP_IS_BOOL,     op_is_bool);
+        REGISTER_OP(OP_IS_FLOAT,    op_is_float);
+        REGISTER_OP(OP_IS_PATH,     op_is_path);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -3634,6 +3643,185 @@ op_get_slot_uv:
         Value ** upvalues = vm.frames.back().upvalues;
         assert(upvalues && "OP_GET_SLOT_UV: no upvalue array");
         vm.push(upvalues[uv]);
+        DISPATCH();
+    }
+
+    // RES3: inline type-check opcodes.  Each pops one operand, forces
+    // it (lazy), type-checks, pushes the bool singleton.  Replaces the
+    // OP_CALL_PRIMOP path for builtins.isAttrs / isString / etc.
+    // Saves ~3 us/dispatch (allocValue + arg materialise + impl-call
+    // indirection) per per-primop instrumentation findings.
+    //
+    // Tagged immediates: in this VM only ints are tagged.  isInt
+    // returns true; all other isX return false without unboxing.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_is_attrs:
+#else
+    case OP_IS_ATTRS:
+#endif
+    {
+        Value * v = vm.pop();
+        bool result;
+        if (nanbox::isTagged(v)) [[unlikely]] {
+            result = false;
+        } else {
+            if (v->isThunkOrApp()) [[unlikely]]
+                state.forceValue(*v, cu->posForOffset(ip - 1));
+            result = v->type() == nAttrs;
+        }
+        vm.push(result ? &Value::vTrue : &Value::vFalse);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_is_string:
+#else
+    case OP_IS_STRING:
+#endif
+    {
+        Value * v = vm.pop();
+        bool result;
+        if (nanbox::isTagged(v)) [[unlikely]] {
+            result = false;
+        } else {
+            if (v->isThunkOrApp()) [[unlikely]]
+                state.forceValue(*v, cu->posForOffset(ip - 1));
+            result = v->type() == nString;
+        }
+        vm.push(result ? &Value::vTrue : &Value::vFalse);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_is_list:
+#else
+    case OP_IS_LIST:
+#endif
+    {
+        Value * v = vm.pop();
+        bool result;
+        if (nanbox::isTagged(v)) [[unlikely]] {
+            result = false;
+        } else {
+            if (v->isThunkOrApp()) [[unlikely]]
+                state.forceValue(*v, cu->posForOffset(ip - 1));
+            result = v->type() == nList;
+        }
+        vm.push(result ? &Value::vTrue : &Value::vFalse);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_is_null:
+#else
+    case OP_IS_NULL:
+#endif
+    {
+        Value * v = vm.pop();
+        bool result;
+        if (nanbox::isTagged(v)) [[unlikely]] {
+            result = false;
+        } else {
+            if (v->isThunkOrApp()) [[unlikely]]
+                state.forceValue(*v, cu->posForOffset(ip - 1));
+            result = v->type() == nNull;
+        }
+        vm.push(result ? &Value::vTrue : &Value::vFalse);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_is_function:
+#else
+    case OP_IS_FUNCTION:
+#endif
+    {
+        Value * v = vm.pop();
+        bool result;
+        if (nanbox::isTagged(v)) [[unlikely]] {
+            result = false;
+        } else {
+            if (v->isThunkOrApp()) [[unlikely]]
+                state.forceValue(*v, cu->posForOffset(ip - 1));
+            result = v->type() == nFunction;
+        }
+        vm.push(result ? &Value::vTrue : &Value::vFalse);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_is_int:
+#else
+    case OP_IS_INT:
+#endif
+    {
+        Value * v = vm.pop();
+        bool result;
+        if (nanbox::isTagged(v)) [[likely]] {
+            result = true; // tagged immediate is always int
+        } else {
+            if (v->isThunkOrApp()) [[unlikely]]
+                state.forceValue(*v, cu->posForOffset(ip - 1));
+            result = v->type() == nInt;
+        }
+        vm.push(result ? &Value::vTrue : &Value::vFalse);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_is_bool:
+#else
+    case OP_IS_BOOL:
+#endif
+    {
+        Value * v = vm.pop();
+        bool result;
+        if (nanbox::isTagged(v)) [[unlikely]] {
+            result = false;
+        } else {
+            if (v->isThunkOrApp()) [[unlikely]]
+                state.forceValue(*v, cu->posForOffset(ip - 1));
+            result = v->type() == nBool;
+        }
+        vm.push(result ? &Value::vTrue : &Value::vFalse);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_is_float:
+#else
+    case OP_IS_FLOAT:
+#endif
+    {
+        Value * v = vm.pop();
+        bool result;
+        if (nanbox::isTagged(v)) [[unlikely]] {
+            result = false;
+        } else {
+            if (v->isThunkOrApp()) [[unlikely]]
+                state.forceValue(*v, cu->posForOffset(ip - 1));
+            result = v->type() == nFloat;
+        }
+        vm.push(result ? &Value::vTrue : &Value::vFalse);
+        DISPATCH();
+    }
+
+#ifdef NIX_VM_COMPUTED_GOTO
+op_is_path:
+#else
+    case OP_IS_PATH:
+#endif
+    {
+        Value * v = vm.pop();
+        bool result;
+        if (nanbox::isTagged(v)) [[unlikely]] {
+            result = false;
+        } else {
+            if (v->isThunkOrApp()) [[unlikely]]
+                state.forceValue(*v, cu->posForOffset(ip - 1));
+            result = v->type() == nPath;
+        }
+        vm.push(result ? &Value::vTrue : &Value::vFalse);
         DISPATCH();
     }
 

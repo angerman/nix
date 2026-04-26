@@ -492,6 +492,25 @@ enum Op : uint8_t {
     /// Pushes stack[base+slot], then upvalues[uv].
     /// Encoding: [slot:12 | uv:12].
     OP_GET_SLOT_UV = 0x70,
+
+    // ----------------------------------------------------------------
+    // RES3: inline type-check opcodes.  Replace
+    //   OP_CALL_PRIMOP(builtins.isAttrs, 1)
+    // (which goes through fn->impl + arg materialisation + result alloc)
+    // with a single dispatch that pops the operand, forces it, type-
+    // checks, and pushes the bool singleton.  ~3 us/call dispatch
+    // saving × tens of thousands of calls = ~100 ms wall-clock.
+    //
+    // All take no operand; pop one Value*, push vTrue/vFalse.
+    OP_IS_ATTRS    = 0x71,
+    OP_IS_STRING   = 0x72,
+    OP_IS_LIST     = 0x73,
+    OP_IS_NULL     = 0x74,
+    OP_IS_FUNCTION = 0x75,
+    OP_IS_INT      = 0x76,
+    OP_IS_BOOL     = 0x77,
+    OP_IS_FLOAT    = 0x78,
+    OP_IS_PATH     = 0x79,
 };
 
 
