@@ -36,6 +36,30 @@ namespace nix::bytecode {
 // The step counter is global (across all vmExec invocations) so you can
 // pinpoint the exact moment something goes wrong in a long evaluation.
 
+/// Push a thunk-force CallFrame and mkBlackhole the value being forced.
+/// Captures origExpr/origEnv so vmExec's catch block can revert the
+/// blackhole to mkFailed if the body throws.
+[[gnu::always_inline]]
+static inline void pushThunkFrame(VMState & vm,
+    const CompilationUnit * unit, uint32_t ip, Env * env,
+    Value * v, PosIdx pos, Value ** upvalues,
+    Expr * origExpr)
+{
+    v->mkBlackhole();
+    CallFrame f{};
+    f.unit = unit;
+    f.ip = ip;
+    f.env = env;
+    f.stackBaseOffset = vm.stackSize();
+    f.resultSlot = v;
+    f.callPos = pos;
+    f.isThunkForce = true;
+    f.upvalues = upvalues;
+    f.origExpr = origExpr;
+    f.origEnv = env;
+    vm.frames.push_back(f);
+}
+
 /// Materialize a tagged immediate into a heap-allocated Value.
 /// If `w` is already a real pointer (low bit clear), returns it unchanged.
 /// If `w` is a tagged immediate, allocates a Value and decodes the tag.
@@ -1010,16 +1034,18 @@ op_return:
                             .atPos(callPos).debugThrow();
 
                     resultSlot->mkBlackhole();
-                    vm.frames.push_back(CallFrame{
-                        .unit = bcThunk->unit,
-                        .ip = td.codeOffset,
-                        .env = chainEnv,
-                        .stackBaseOffset = vm.stackSize(),
-                        .resultSlot = resultSlot,
-                        .callPos = callPos,
-                        .isThunkForce = true,
-                        .upvalues = uv,
-                    });
+                    CallFrame chainFrame{};
+                    chainFrame.unit = bcThunk->unit;
+                    chainFrame.ip = td.codeOffset;
+                    chainFrame.env = chainEnv;
+                    chainFrame.stackBaseOffset = vm.stackSize();
+                    chainFrame.resultSlot = resultSlot;
+                    chainFrame.callPos = callPos;
+                    chainFrame.isThunkForce = true;
+                    chainFrame.upvalues = uv;
+                    chainFrame.origExpr = chainExpr;
+                    chainFrame.origEnv = chainEnv;
+                    vm.frames.push_back(chainFrame);
                     cu = bcThunk->unit;
                     ip = td.codeOffset;
                     curEnv = chainEnv;
@@ -1152,22 +1178,13 @@ op_get_local_0_force:
                         .atPos(pos).debugThrow();
                 }
 
-                v->mkBlackhole();
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
                 // Frame depth guard
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
-                vm.frames.push_back(CallFrame{
-                    .unit = bcThunk->unit,
-                    .ip = thunkOffset,
-                    .env = thunkEnv,
-                    .stackBaseOffset = vm.stackSize(),
-                    .resultSlot = v,
-                    .callPos = pos,
-                    .isThunkForce = true,
-                    .upvalues = frameUpvalues,
-                });
+                pushThunkFrame(vm, bcThunk->unit, thunkOffset,
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
                 cu = bcThunk->unit;
                 ip = thunkOffset;
                 curEnv = thunkEnv;
@@ -1330,9 +1347,6 @@ op_force:
                         thunkEnv->values[1]);
                 }
 
-                // Mark as blackhole before evaluating.
-                v->mkBlackhole();
-
                 // Save current frame state.
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
@@ -1341,16 +1355,8 @@ op_force:
                 // Frame depth guard
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
-                vm.frames.push_back(CallFrame{
-                    .unit = bcThunk->unit,
-                    .ip = thunkOffset,
-                    .env = thunkEnv,
-                    .stackBaseOffset = vm.stackSize(),
-                    .resultSlot = v,  // Write result back into the thunk Value
-                    .callPos = pos,
-                    .isThunkForce = true,  // OP_RETURN doesn't push result
-                    .upvalues = frameUpvalues,
-                });
+                pushThunkFrame(vm, bcThunk->unit, thunkOffset,
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
 
                 // Switch to the thunk's code.
                 cu = bcThunk->unit;
@@ -1371,7 +1377,6 @@ op_force:
 
             // v2 App path: the function is a v2 closure (ExprLambdaBytecode).
             if (left->isLambda() && left->lambda().fun->isBytecodeProxy) {
-                v->mkBlackhole();
                 vm.nrBytecodeCallTrampoline++;
                 auto * bcLambda = static_cast<ExprLambdaBytecode *>(
                     left->lambda().fun);
@@ -1391,16 +1396,9 @@ op_force:
                 // Frame depth guard
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
-                vm.frames.push_back(CallFrame{
-                    .unit = &bodyUnit,
-                    .ip = startOffset,
-                    .env = left->lambda().env,
-                    .stackBaseOffset = vm.stackSize(),
-                    .resultSlot = v,  // update App in-place
-                    .callPos = pos,
-                    .isThunkForce = true,
-                    .upvalues = frameUpvalues,
-                });
+                pushThunkFrame(vm, &bodyUnit, startOffset,
+                    left->lambda().env, v, pos, frameUpvalues,
+                    /*origExpr=*/nullptr); // App, not Thunk; recovery N/A
                 // Store arg as stack slot 0 (the parameter).
                 vm.push(right);
                 cu = &bodyUnit;
@@ -1411,7 +1409,6 @@ op_force:
 
             // v1 App path: env-chain closures in lambdaBodyCache.
             if (Env * env2 = vmBindLambdaArg(state, *left, right, pos)) {
-                v->mkBlackhole();
                 vm.nrBytecodeCallTrampoline++;
                 auto & bodyInfo = state.lambdaBodyCache[left->lambda().fun];
                 auto & bodyUnit = *bodyInfo.unit;
@@ -1425,15 +1422,8 @@ op_force:
                 // Frame depth guard
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
-                vm.frames.push_back(CallFrame{
-                    .unit = &bodyUnit,
-                    .ip = startOffset,
-                    .env = env2,
-                    .stackBaseOffset = vm.stackSize(),
-                    .resultSlot = v,  // update App in-place
-                    .callPos = pos,
-                    .isThunkForce = true,
-                });
+                pushThunkFrame(vm, &bodyUnit, startOffset, env2,
+                    v, pos, /*upvalues=*/nullptr, /*origExpr=*/nullptr);
                 if (hasFormals) vm.push(right);
                 cu = &bodyUnit;
                 ip = startOffset;
@@ -3238,14 +3228,10 @@ op_get_slot_force:
                     frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
-                v->mkBlackhole();
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
-                vm.frames.push_back(CallFrame{
-                    .unit = bcThunk->unit, .ip = thunkOffset, .env = thunkEnv,
-                    .stackBaseOffset = vm.stackSize(), .resultSlot = v,
-                    .callPos = pos, .isThunkForce = true, .upvalues = frameUpvalues,
-                });
+                pushThunkFrame(vm, bcThunk->unit, thunkOffset,
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
                 DISPATCH();
             }
@@ -3301,14 +3287,10 @@ op_get_uv_force:
                     frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
-                v->mkBlackhole();
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
-                vm.frames.push_back(CallFrame{
-                    .unit = bcThunk->unit, .ip = thunkOffset, .env = thunkEnv,
-                    .stackBaseOffset = vm.stackSize(), .resultSlot = v,
-                    .callPos = pos, .isThunkForce = true, .upvalues = frameUpvalues,
-                });
+                pushThunkFrame(vm, bcThunk->unit, thunkOffset,
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
                 DISPATCH();
             }
@@ -3412,25 +3394,14 @@ op_rforce_from:
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
 
-                v->mkBlackhole();
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
-                // Use v as resultSlot — same as OP_FORCE.  After the
-                // thunk is forced in-place, also write to the dst slot.
-                // For simplicity, just point resultSlot at v; the dst
-                // slot will be updated in the subsequent dispatch via
-                // RFORCE_FROM_RESUME (or we accept the cost of one extra
-                // copy on next access).
-                //
-                // Actually simpler: write v's pointer to dst BEFORE
-                // forcing.  After the force, both src and dst slots
-                // point to the same forced Value.
+                // Write v's pointer to dst before forcing.  After the
+                // force, both src and dst slots point to the same
+                // forced Value.
                 vm.stack[base + dstSlot] = v;
-                vm.frames.push_back(CallFrame{
-                    .unit = bcThunk->unit, .ip = thunkOffset, .env = thunkEnv,
-                    .stackBaseOffset = vm.stackSize(), .resultSlot = v,
-                    .callPos = pos, .isThunkForce = true, .upvalues = frameUpvalues,
-                });
+                pushThunkFrame(vm, bcThunk->unit, thunkOffset,
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
                 DISPATCH();
             }
@@ -3506,15 +3477,11 @@ op_ruvf_to:
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
 
-                v->mkBlackhole();
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
                 vm.stack[base + dstSlot] = v;
-                vm.frames.push_back(CallFrame{
-                    .unit = bcThunk->unit, .ip = thunkOffset, .env = thunkEnv,
-                    .stackBaseOffset = vm.stackSize(), .resultSlot = v,
-                    .callPos = pos, .isThunkForce = true, .upvalues = frameUpvalues,
-                });
+                pushThunkFrame(vm, bcThunk->unit, thunkOffset,
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
                 DISPATCH();
             }
@@ -4095,8 +4062,25 @@ op_unhandled:
         // Exception thrown during VM execution (e.g., from forceValue,
         // callFunction, or an OP_EVAL_EXPR fallback).  Clean up the
         // frame and stack state so the caller sees a consistent VMState.
+        //
+        // Critical: revert any mkBlackhole'd thunks back to a recoverable
+        // state via state.handleEvalExceptionForThunk.  Without this, the
+        // tree-walker's tryEval and similar mechanisms break — every
+        // future force of the same Value would throw "infinite recursion
+        // encountered" because the blackhole tag persists.  The tree
+        // walker uses RAII Finally to do this; the bytecode VM walks the
+        // popped frames here in the catch block.
         while (vm.frames.size() > entryFrameDepth) {
-            vm.sp = vm.stack + vm.frames.back().stackBaseOffset;
+            auto & frame = vm.frames.back();
+            if (frame.isThunkForce && frame.resultSlot
+                && frame.resultSlot->isBlackhole()
+                && frame.origExpr)
+            {
+                state.handleEvalExceptionForThunk(
+                    frame.origEnv, frame.origExpr,
+                    *frame.resultSlot, frame.callPos);
+            }
+            vm.sp = vm.stack + frame.stackBaseOffset;
             vm.frames.pop_back();
         }
         throw;

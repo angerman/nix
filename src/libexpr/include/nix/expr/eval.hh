@@ -706,8 +706,13 @@ private:
      * Internal support function for forceValue
      *
      * This code is factored out so that it's not in the heavily inlined hot path.
+     *
+     * Public so the bytecode VM can revert blackhole'd thunks on
+     * exception unwind (see vm.cc's catch block in vmExec).
      */
+public:
     void handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, const PosIdx pos);
+private:
 
     /**
      * Internal support function for forceValue

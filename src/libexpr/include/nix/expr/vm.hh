@@ -83,6 +83,18 @@ struct CallFrame
     /// would otherwise carry ~72 bytes of dead ContState.
     uint32_t contIdx = 0;
 
+    /// For thunk-force frames (isThunkForce=true): a snapshot of the
+    /// original Expr* + Env* used to construct the thunk being forced,
+    /// before mkBlackhole was applied.  Used by vmExec's catch block
+    /// to revert the blackhole via state.handleEvalExceptionForThunk:
+    /// without this, an exception thrown inside the thunk body leaves
+    /// the Value permanently mkBlackholed, turning every future force
+    /// of the same Value into "infinite recursion encountered".  The
+    /// tree-walker uses RAII Finally to do this; we use the catch-walk
+    /// since the bytecode VM is a long-running dispatch loop.
+    Expr * origExpr = nullptr;
+    Env * origEnv = nullptr;
+
     /// Register-form call result destination.
     /// When set (non-zero), OP_RETURN writes the retVal POINTER directly
     /// to vm.stack[stackBaseOffset_of_parent + (resultStoreSlot - 1)]
