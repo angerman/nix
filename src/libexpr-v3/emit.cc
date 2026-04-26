@@ -27,6 +27,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nix::v3 {
 
@@ -349,6 +350,50 @@ struct Emitter
 
     // Function emit ---------------------------------------------------------
 
+    /// Recursively walk all bindings reachable from `bid` (within the
+    /// same function — sub-blocks for if-branches, with-bodies, etc.)
+    /// and assign each binding's VarId a frame slot.  This pre-pass
+    /// allows references to forward bindings (e.g., let-rec in lambdas)
+    /// to resolve at emit time without needing two-pass slot resolution
+    /// later.
+    void preassignSlotsInBlock(FuncCtx & fc, ir::BlockId bid,
+                               std::unordered_set<ir::BlockId> & visited)
+    {
+        if (!visited.insert(bid).second) return;
+        const ir::Block & b = m.blocks[bid];
+        for (auto pv : b.params) {
+            auto _slot = getOrAssignSlot(fc, pv); (void)_slot;
+        }
+        for (auto & bd : b.bindings) {
+            (void)getOrAssignSlot(fc, bd.var);
+            std::vector<ir::BlockId> subs;
+            std::visit([&](auto const & e) {
+                using T = std::decay_t<decltype(e)>;
+                if constexpr (std::is_same_v<T, ir::If>) {
+                    subs.push_back(e.thenBlock); subs.push_back(e.elseBlock);
+                } else if constexpr (std::is_same_v<T, ir::With>  ||
+                                     std::is_same_v<T, ir::Assert>) {
+                    subs.push_back(e.bodyBlock);
+                } else if constexpr (std::is_same_v<T, ir::And> ||
+                                     std::is_same_v<T, ir::Or>  ||
+                                     std::is_same_v<T, ir::Impl>) {
+                    subs.push_back(e.rhsBlock);
+                }
+            }, bd.expr);
+            for (auto sb : subs) preassignSlotsInBlock(fc, sb, visited);
+        }
+    }
+
+    uint16_t getOrAssignSlot(FuncCtx & fc, ir::VarId v)
+    {
+        auto it = fc.slot.find(v);
+        if (it != fc.slot.end()) return it->second;
+        uint16_t s = fc.nextSlot++;
+        fc.slot[v] = s;
+        if (s + 1 > fc.nLocals) fc.nLocals = s + 1;
+        return s;
+    }
+
     void emitFunction(ir::FuncId fid)
     {
         const ir::Function & f = m.functions[fid];
@@ -364,6 +409,13 @@ struct Emitter
         // Upvalue order = freeVars.
         for (uint16_t i = 0; i < f.freeVars.size(); ++i)
             fc.upvalue[f.freeVars[i]] = i;
+        // Pre-assign slots for every VarId reachable from the entry
+        // block (including in sub-blocks: if-branches, with bodies, etc.)
+        // so forward references resolve at emit time.
+        if (f.entryBlock != ir::kInvalidBlock) {
+            std::unordered_set<ir::BlockId> visited;
+            preassignSlotsInBlock(fc, f.entryBlock, visited);
+        }
 
         ctx = &fc;
         uint32_t codeStart = static_cast<uint32_t>(unit.code.size());
@@ -391,17 +443,6 @@ struct Emitter
 
         if (fid == 0)
             unit.entryOffset = codeStart;
-    }
-
-    // Helper: ctx-aware getOrAssignSlot (used during prologue).
-    uint16_t getOrAssignSlot(FuncCtx & fc, ir::VarId v)
-    {
-        auto it = fc.slot.find(v);
-        if (it != fc.slot.end()) return it->second;
-        uint16_t s = fc.nextSlot++;
-        fc.slot[v] = s;
-        if (s + 1 > fc.nLocals) fc.nLocals = s + 1;
-        return s;
     }
 
     void emitAll()

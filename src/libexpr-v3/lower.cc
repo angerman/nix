@@ -378,28 +378,45 @@ struct Lowerer
         IRNode op{a, b};
         return addBinding(op);
     }
-    /// `let`: linear lowering — each binding is evaluated strictly in
-    /// iteration order (which matches the displ order assigned by
-    /// bindVars).  Forward references to siblings will fail at lower time
-    /// because the sibling's VarId hasn't been added to the scope yet.
-    /// Full mutual recursion requires thunked bindings; deferred.
+    /// `let`: pre-allocates a VarId for every binding before lowering any
+    /// of them, so mutual references inside lambda/thunk bodies resolve
+    /// correctly (the bodies don't run until the let scope is fully
+    /// built — by then all siblings are populated as captured upvalues).
+    ///
+    /// Mutual references on EAGER values (`let x = y+1; y = x+1; in ...`)
+    /// would still produce wrong results because the bindings are
+    /// emitted in iteration order; full lazy let-rec requires thunked
+    /// bindings + an env carrier.  Deferred.
     ir::VarId lowerLet(nix::ExprLet * e)
     {
         if (e->attrs->inheritFromExprs && !e->attrs->inheritFromExprs->empty())
             unsupported("let with inherit (from)");
 
+        // Pre-allocate VarIds (and populate the new scope) so that any
+        // expression we lower below sees the full sibling set.
         size_t scopeIdx = scopes.size();
         scopes.emplace_back();
 
+        std::vector<ir::VarId> preallocVars;
+        preallocVars.reserve(e->attrs->attrs->size());
         for (auto & kv : *e->attrs->attrs) {
             const auto & sym = kv.first;
             const auto & def = kv.second;
             if (def.kind != nix::ExprAttrs::AttrDef::Kind::Plain)
                 unsupported("let with inherited binding");
-            ir::VarId v = lowerExpr(def.e);
-            // displ matches iteration order over the sorted std::pmr::map
+            ir::VarId v = m.freshVar();
+            preallocVars.push_back(v);
             scopes[scopeIdx].byDispl.push_back(v);
             scopes[scopeIdx].byName.emplace(std::string(symbols[sym]), v);
+        }
+
+        // Now lower each binding's RHS and tie its result to the
+        // pre-allocated VarId.
+        size_t idx = 0;
+        for (auto & kv : *e->attrs->attrs) {
+            ir::VarId rhs = lowerExpr(kv.second.e);
+            m.blocks[blockStack.back()].bindings.push_back({preallocVars[idx], ir::VarRef{rhs}});
+            ++idx;
         }
 
         ir::VarId rv = lowerExpr(e->body);
