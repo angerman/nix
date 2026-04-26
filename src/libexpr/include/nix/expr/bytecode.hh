@@ -639,9 +639,14 @@ struct CompilationUnit : gc
     uint32_t addSymbol(Symbol sym);
 
     /// Allocate an inline cache slot for an attribute access.
-    /// Each OP_ATTR_SELECT_CACHED call site gets its own 4-way PIC slot.
+    /// Each OP_ATTR_SELECT_CACHED call site gets its own 8-way PIC slot.
+    /// Also registers the symbol in the symbol pool so that disk-cache
+    /// serialization can recover the AttrCache by symbol-pool index.
     uint32_t addAttrCache(Symbol name)
     {
+        // Force-register the symbol in the pool so symbolIndex is
+        // complete for serialization (Phase 3.2 disk cache).
+        addSymbol(name);
         uint32_t idx = static_cast<uint32_t>(attrCaches.size());
         AttrCache c;
         c.name = name;

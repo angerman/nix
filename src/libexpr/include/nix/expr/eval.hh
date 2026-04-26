@@ -74,6 +74,7 @@ struct MountedSourceAccessor;
 namespace bytecode {
 struct VMState;
 struct CompilationUnit;
+class BytecodeDiskCache;
 } // namespace bytecode
 
 namespace eval_cache {
@@ -414,6 +415,15 @@ public:
     uint64_t bytecodeExecTimeUs = 0;
     uint64_t nrBytecodeCompileCacheHits = 0;
     uint64_t nrBytecodeCompileCacheMisses = 0;
+
+    /// Persistent (disk) bytecode cache (Phase 3.2-7).
+    /// Constructed lazily on first cache-miss when NIX_BYTECODE_DISK_CACHE=1.
+    std::unique_ptr<bytecode::BytecodeDiskCache> bytecodeDiskCache;
+    uint64_t nrBytecodeDiskCacheHits = 0;
+    uint64_t nrBytecodeDiskCacheMisses = 0;
+    uint64_t nrBytecodeDiskCacheInserts = 0;
+    uint64_t nrBytecodeDiskCacheSkipped = 0;
+    uint64_t nrBytecodeDiskCacheCorrupt = 0;
 
     /// Detailed per-phase compile-time breakdown (microseconds).
     /// Populated when NIX_VM_V2=1 and NIX_VM_COMPILE_PROFILE=1.

@@ -2,6 +2,8 @@
 #include "nix/expr/vm.hh"
 #include "nix/expr/bytecode.hh"
 #include "nix/expr/bytecode-compiler.hh"
+#include "nix/expr/bytecode-disk-cache.hh"
+#include "nix/expr/bytecode-serialize.hh"
 #include "nix/expr/bytecode-thunk.hh"
 #include "nix/expr/ir.hh"
 #include "nix/expr/ir-emit.hh"
@@ -1204,6 +1206,7 @@ void EvalState::eval(Expr * e, Value & v)
     // This is the new upvalue-based compilation path.
     static bool useVMv2 = getEnv("NIX_VM_V2").value_or("") == "1";
     static bool profileCompile = getEnv("NIX_VM_COMPILE_PROFILE").value_or("") == "1";
+    static bool useDiskCache = getEnv("NIX_BYTECODE_DISK_CACHE").value_or("") == "1";
     if (useVMv2) {
         auto it = bytecodeCache.find(e);
         bytecode::CompilationUnit * unit;
@@ -1212,6 +1215,50 @@ void EvalState::eval(Expr * e, Value & v)
             nrBytecodeCompileCacheHits++;
         } else {
             nrBytecodeCompileCacheMisses++;
+
+            // Phase 3.2-7: try disk cache before recompiling.
+            //
+            // Cache key derives from the SourcePath of the Expr's
+            // origin file.  Only AST nodes parsed from real files are
+            // cacheable; string-evaluated expressions (parseExprFromString)
+            // pass nullptr for sourcePath.  We extract the SourcePath
+            // via Pos::Origin lookup on the Expr's first PosIdx.
+            std::optional<bytecode::CacheKey> diskKey;
+            if (useDiskCache) {
+                PosIdx exprPos = e->getPos();
+                if (exprPos != noPos) {
+                    auto origin = positions.originOf(exprPos);
+                    if (auto * sp = std::get_if<SourcePath>(&origin)) {
+                        auto key = bytecode::computeCacheKey(*sp);
+                        if (!key.empty()) {
+                            diskKey = key;
+                            // Lazily construct the disk cache once per
+                            // EvalState (open the SQLite db).
+                            if (!bytecodeDiskCache)
+                                bytecodeDiskCache =
+                                    std::make_unique<bytecode::BytecodeDiskCache>();
+                            if (auto blob = bytecodeDiskCache->lookup(key)) {
+                                try {
+                                    unit = bytecode::deserializeCU(*blob, *this);
+                                    nrBytecodeDiskCacheHits++;
+                                    bytecodeCache[e] = unit;
+                                    auto tx0 = std::chrono::steady_clock::now();
+                                    bytecode::vmExec(*this, *unit, 0, baseEnv, v);
+                                    auto tx1 = std::chrono::steady_clock::now();
+                                    bytecodeExecTimeUs += std::chrono::duration_cast<
+                                        std::chrono::microseconds>(tx1 - tx0).count();
+                                    return;
+                                } catch (bytecode::SerializationError &) {
+                                    // Corrupt entry; fall through to recompile.
+                                    nrBytecodeDiskCacheCorrupt++;
+                                }
+                            } else {
+                                nrBytecodeDiskCacheMisses++;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Optional fine-grained per-phase profiling.  When enabled,
             // wraps lower() and emitFromIR() with thread-local observers
@@ -1251,6 +1298,28 @@ void EvalState::eval(Expr * e, Value & v)
                 (void)tEmit0; // currently unused; kept for future split
             }
             bytecodeCache[e] = unit;
+
+            // Phase 3.2-7: store in disk cache on miss.  Only if a key
+            // was derived AND the unit is cacheable.
+            if (diskKey && bytecode::isCacheable(*unit)) {
+                try {
+                    auto blob = bytecode::serializeCU(*unit, *this);
+                    PosIdx exprPos = e->getPos();
+                    std::string srcPath;
+                    if (exprPos != noPos) {
+                        auto origin = positions.originOf(exprPos);
+                        if (auto * sp = std::get_if<SourcePath>(&origin))
+                            srcPath = sp->path.abs();
+                    }
+                    bytecodeDiskCache->insert(*diskKey, blob, srcPath);
+                    nrBytecodeDiskCacheInserts++;
+                } catch (bytecode::SerializationError &) {
+                    // Skip caching for this unit; proceed normally.
+                    nrBytecodeDiskCacheSkipped++;
+                }
+            } else if (diskKey) {
+                nrBytecodeDiskCacheSkipped++;
+            }
         }
 
         auto t0 = std::chrono::steady_clock::now();
