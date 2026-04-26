@@ -596,52 +596,64 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
         else if constexpr (std::is_same_v<T, ir::IRLambda>) {
             bool hasFormals = !e.params.formals.empty();
 
-            // Check if any free vars need cell capture.
-            //
-            // KNOWN LIMITATION: only handles ONE level of forward-ref
-            // cell capture.  If a sub-block needs to capture a
-            // grandparent's forward-ref (which is in this block's
-            // cellRefs but not blockCellMap), the inner sub-block
-            // will end up reading the cell's CURRENT entry value
-            // through OP_CELL_GET in emitVarRef and pushing that
-            // snapshot as its upvalue — late-binding through the
-            // cell is broken across two thunk/lambda layers.  In
-            // practice this only matters for deeply nested rec lets
-            // with cross-thunk forward refs; the common patterns are
-            // covered by the single-level case below.
-            bool needsCellCapture = false;
-            if (ctx.blockCellSlot != UINT32_MAX) {
-                for (auto fv : e.freeVars.vars) {
-                    if (ctx.blockCellMap.count(fv)) {
-                        needsCellCapture = true;
-                        break;
+            // Determine cell-capture sources per free variable (mirrors
+            // IRMkThunk path; see the comment there).  Handles forward
+            // refs from BOTH the parent block's blockCellMap (own cell)
+            // and the parent's cellRefs (inherited from grandparent +).
+            struct InnerCellSrc {
+                bool fromOwnSlot;
+                uint32_t parentRef;
+                uint32_t innerUvIdx;
+            };
+            std::vector<InnerCellSrc> innerCells;
+            auto findOrAddCell = [&](bool fromSlot, uint32_t ref,
+                                     uint32_t & nextUv) -> uint32_t {
+                for (auto & c : innerCells) {
+                    if (c.fromOwnSlot == fromSlot && c.parentRef == ref)
+                        return c.innerUvIdx;
+                }
+                uint32_t uv = nextUv++;
+                innerCells.push_back({fromSlot, ref, uv});
+                return uv;
+            };
+
+            ir::FreeVars nonCellFreeVars;
+            std::vector<std::tuple<ir::VarId, uint32_t, uint32_t>>
+                cellFreeVars;
+            uint32_t nextInnerUv = 0;
+            for (auto fv : e.freeVars.vars) {
+                if (ctx.blockCellSlot != UINT32_MAX) {
+                    auto cmIt = ctx.blockCellMap.find(fv);
+                    if (cmIt != ctx.blockCellMap.end()) {
+                        uint32_t uv = findOrAddCell(true, ctx.blockCellSlot,
+                            nextInnerUv);
+                        cellFreeVars.emplace_back(fv, uv, cmIt->second);
+                        continue;
                     }
                 }
+                auto crIt = ctx.cellRefs.find(fv);
+                if (crIt != ctx.cellRefs.end()) {
+                    uint32_t uv = findOrAddCell(false,
+                        crIt->second.upvalueIdx, nextInnerUv);
+                    cellFreeVars.emplace_back(fv, uv,
+                        crIt->second.entryIdx);
+                    continue;
+                }
+                nonCellFreeVars.insert(fv);
             }
 
-            if (needsCellCapture) {
-                // Split free vars: cell-based vs regular.
-                ir::FreeVars nonCellFreeVars;
-                std::vector<std::pair<ir::VarId, uint32_t>> cellFreeVars;
-                for (auto fv : e.freeVars.vars) {
-                    auto it = ctx.blockCellMap.find(fv);
-                    if (it != ctx.blockCellMap.end())
-                        cellFreeVars.push_back({fv, it->second});
-                    else
-                        nonCellFreeVars.insert(fv);
-                }
+            bool needsCellCapture = !innerCells.empty();
 
-                // Upvalue layout: [0]=cell, [1..N]=non-cell free vars.
-                uint32_t cellUvIdx = 0;
+            if (needsCellCapture) {
                 uint32_t nNonCell = static_cast<uint32_t>(nonCellFreeVars.size());
-                uint32_t totalUpvalues = 1 + nNonCell;
+                uint32_t totalUpvalues = nextInnerUv + nNonCell;
 
                 // Build cell-aware sub-block context.
                 const auto & bodyBlock = module.blocks[e.bodyBlock];
                 BlockContext subCtx;
-                for (auto & [varId, cellIdx] : cellFreeVars)
-                    subCtx.cellRefs[varId] = {cellUvIdx, cellIdx};
-                uint32_t uvIdx = 1;
+                for (auto & [varId, innerUv, entryIdx] : cellFreeVars)
+                    subCtx.cellRefs[varId] = {innerUv, entryIdx};
+                uint32_t uvIdx = nextInnerUv;
                 for (auto fv : nonCellFreeVars.vars)
                     subCtx.upvalueSlots[fv] = uvIdx++;
 
@@ -826,8 +838,14 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                     .prologueOffset = bodyOffset,
                 });
 
-                // Push captures: cell first, then non-cell free vars.
-                unit.emit(OP_GET_STACK_SLOT, ctx.blockCellSlot);
+                // Push captures: cells first (in innerUvIdx order),
+                // then non-cell free vars.
+                for (auto & c : innerCells) {
+                    if (c.fromOwnSlot)
+                        unit.emit(OP_GET_STACK_SLOT, c.parentRef);
+                    else
+                        unit.emit(OP_GET_UPVALUE, c.parentRef);
+                }
                 for (auto fv : nonCellFreeVars.vars)
                     emitCapture(fv, pos, ctx);
 
@@ -926,41 +944,78 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
 
         // -- Thunk creation --
         else if constexpr (std::is_same_v<T, ir::IRMkThunk>) {
-            // Check if any free vars need cell capture from the
-            // enclosing block's forward-ref cell.
-            bool needsCellCapture = false;
-            if (ctx.blockCellSlot != UINT32_MAX) {
-                for (auto fv : e.freeVars.vars) {
-                    if (ctx.blockCellMap.count(fv)) {
-                        needsCellCapture = true;
-                        break;
+            // Determine cell-capture sources per free variable:
+            //   - parent's blockCellMap → capture parent's own cell
+            //     (accessible at ctx.blockCellSlot).
+            //   - parent's cellRefs → capture an inherited cell
+            //     (accessible at ctx.cellRefs[fv].upvalueIdx).
+            // The inner sub-block needs all relevant cells captured into
+            // its own upvalue array, plus cellRefs entries that point
+            // through those new upvalue slots.  This handles forward
+            // refs that must remain late-binding across multiple
+            // thunk/lambda nesting levels.
+            //
+            // For each unique cell source (own slot OR parent upvalue),
+            // we capture once and assign one upvalue index to the inner
+            // sub-block.  Multiple free vars sharing the same source
+            // cell share the same upvalue index.
+            struct InnerCellSrc {
+                bool fromOwnSlot;     // true: parent owns cell at slot
+                uint32_t parentRef;   // slot or upvalue idx
+                uint32_t innerUvIdx;  // assigned upvalue idx in inner thunk
+            };
+            // Key: (fromOwnSlot, parentRef) — same cell shared across vars.
+            std::vector<InnerCellSrc> innerCells;
+            auto findOrAddCell = [&](bool fromSlot, uint32_t ref,
+                                     uint32_t & nextUv) -> uint32_t {
+                for (auto & c : innerCells) {
+                    if (c.fromOwnSlot == fromSlot && c.parentRef == ref)
+                        return c.innerUvIdx;
+                }
+                uint32_t uv = nextUv++;
+                innerCells.push_back({fromSlot, ref, uv});
+                return uv;
+            };
+
+            // Classify free vars; collect (varId, innerUvIdx, entryIdx)
+            // for each cell-resident; rest go to nonCellFreeVars.
+            ir::FreeVars nonCellFreeVars;
+            std::vector<std::tuple<ir::VarId, uint32_t, uint32_t>>
+                cellFreeVars;
+            uint32_t nextInnerUv = 0;
+            for (auto fv : e.freeVars.vars) {
+                if (ctx.blockCellSlot != UINT32_MAX) {
+                    auto cmIt = ctx.blockCellMap.find(fv);
+                    if (cmIt != ctx.blockCellMap.end()) {
+                        uint32_t uv = findOrAddCell(true, ctx.blockCellSlot,
+                            nextInnerUv);
+                        cellFreeVars.emplace_back(fv, uv, cmIt->second);
+                        continue;
                     }
                 }
+                auto crIt = ctx.cellRefs.find(fv);
+                if (crIt != ctx.cellRefs.end()) {
+                    uint32_t uv = findOrAddCell(false,
+                        crIt->second.upvalueIdx, nextInnerUv);
+                    cellFreeVars.emplace_back(fv, uv,
+                        crIt->second.entryIdx);
+                    continue;
+                }
+                nonCellFreeVars.insert(fv);
             }
 
-            if (needsCellCapture) {
-                // Split free vars: cell-based vs regular.
-                ir::FreeVars nonCellFreeVars;
-                std::vector<std::pair<ir::VarId, uint32_t>> cellFreeVars;
-                for (auto fv : e.freeVars.vars) {
-                    auto it = ctx.blockCellMap.find(fv);
-                    if (it != ctx.blockCellMap.end())
-                        cellFreeVars.push_back({fv, it->second});
-                    else
-                        nonCellFreeVars.insert(fv);
-                }
+            bool needsCellCapture = !innerCells.empty();
 
-                // Upvalue layout: [0]=cell, [1..N]=non-cell free vars.
-                uint32_t cellUvIdx = 0;
+            if (needsCellCapture) {
                 uint32_t nNonCell = static_cast<uint32_t>(nonCellFreeVars.size());
-                uint32_t totalUpvalues = 1 + nNonCell;
+                uint32_t totalUpvalues = nextInnerUv + nNonCell;
 
                 // Build cell-aware sub-block context.
                 const auto & bodyBlock = module.blocks[e.bodyBlock];
                 BlockContext subCtx;
-                for (auto & [varId, cellIdx] : cellFreeVars)
-                    subCtx.cellRefs[varId] = {cellUvIdx, cellIdx};
-                uint32_t uvIdx = 1;
+                for (auto & [varId, innerUv, entryIdx] : cellFreeVars)
+                    subCtx.cellRefs[varId] = {innerUv, entryIdx};
+                uint32_t uvIdx = nextInnerUv;
                 for (auto fv : nonCellFreeVars.vars)
                     subCtx.upvalueSlots[fv] = uvIdx++;
                 for (auto p : bodyBlock.params)
@@ -981,8 +1036,14 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                     .nUpvalues = static_cast<uint16_t>(totalUpvalues),
                 });
 
-                // Push captures: cell first, then non-cell free vars.
-                unit.emit(OP_GET_STACK_SLOT, ctx.blockCellSlot);
+                // Push captures: cells first (in innerUvIdx order),
+                // then non-cell free vars.
+                for (auto & c : innerCells) {
+                    if (c.fromOwnSlot)
+                        unit.emit(OP_GET_STACK_SLOT, c.parentRef);
+                    else
+                        unit.emit(OP_GET_UPVALUE, c.parentRef);
+                }
                 for (auto fv : nonCellFreeVars.vars)
                     emitCapture(fv, pos, ctx);
 
@@ -1337,6 +1398,13 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
 // Variable reference emission
 // ============================================================================
 
+// Up to 4 hash lookups per var reference is theoretically expensive, but
+// the dominant case (localSlots) hits on the first lookup so the
+// fall-through is rarely exercised.  A consolidated single-map design
+// (VarBinding variant keyed by VarId) was considered; the projected
+// win is <1% of compile time given the localSlots-first hit pattern.
+// Keeping the four-map layout for readability; revisit if profiling
+// shows emitVarRef in the hot path.
 void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
 {
     // Check local slots first (defined in this block).
