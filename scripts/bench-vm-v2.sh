@@ -90,14 +90,9 @@ bench_cold() {
 bench_cold "compile+insert" "$NIX" "${EVAL_ARGS[@]}"
 
 echo "[v2 + disk cache (warm, all runs share one cache)]"
-echo "  NOTE: warm-cache hits currently fail on complex multi-file"
-echo "        evaluations due to a known bug (#159).  Smoke-test only."
 # Prime the cache once.
 env NIX_VM_V2=1 NIX_BYTECODE_DISK_CACHE=1 NIX_BYTECODE_CACHE_DIR="$TMPCACHE" \
     "$NIX" "${EVAL_ARGS[@]}" "$EXPR" >/dev/null 2>&1 || true
-# Allow failure here so the script doesn't abort the bench.
-set +e
 bench "lookup+deserialize" \
     env NIX_VM_V2=1 NIX_BYTECODE_DISK_CACHE=1 NIX_BYTECODE_CACHE_DIR="$TMPCACHE" \
-    "$NIX" "${EVAL_ARGS[@]}" || true
-set -e
+    "$NIX" "${EVAL_ARGS[@]}"
