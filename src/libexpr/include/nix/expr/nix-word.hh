@@ -6,6 +6,15 @@
 /// 64-bit words alongside heap-allocated Value* pointers, avoiding
 /// allocation for the most common values.
 ///
+/// DECISION (2026-04-26): Tagged-int encoding KEPT after audit.
+///   * Materialization gaps (14 sites) are closed.
+///   * Tagged-bool / tagged-null encodings dropped (singletons cover them).
+///   * GC interaction with eval-gc.cc's GC_register_displacement(1..7)
+///     is documented below as a theoretical pinning risk; not observed
+///     in practice on typical nixpkgs evaluations.
+///   * Arithmetic R-form opcodes use the tagged-int fast path; their
+///     contribution to small-integer arithmetic in nixpkgs is non-zero.
+///
 /// Encoding scheme (low-bit tagged — Boehm GC compatible):
 ///
 ///   bit 0 = 0:  Untagged Value* pointer (8-byte aligned, low bit naturally 0)
