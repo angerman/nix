@@ -669,6 +669,29 @@ void collectRefs(const IRExpr & expr, FreeVars & refs);
 /// passes or direct bytecode emission.
 IRModule lower(EvalState & state, Expr * expr);
 
+/// Per-phase timing breakdown filled in by lower() when
+/// lowerPhaseTiming is non-null.  Microsecond resolution.
+/// Used by the NIX_VM_COMPILE_PROFILE diagnostic.
+struct LowerPhaseTiming
+{
+    uint64_t lowerCoreUs = 0;     ///< AST traversal + IR construction
+    uint64_t freeVarsUs = 0;      ///< computeFreeVars()
+    uint64_t strictnessUs = 0;    ///< runStrictnessPass() (only if enabled)
+    uint64_t freeVarsRecomputeUs = 0; ///< Re-run after strictness pass
+
+    /// Aggregated work units, useful for normalising the timings.
+    uint64_t numBlocks = 0;
+    uint64_t numBindings = 0;
+    uint64_t numVarIds = 0;
+    uint64_t numThunks = 0;       ///< IRMkThunk bindings
+    uint64_t numLambdas = 0;      ///< IRLambda bindings
+};
+
+/// Optional per-call observer.  When non-null, lower() populates the
+/// referenced struct with a phase-by-phase microsecond breakdown.
+/// Pass nullptr to disable.
+extern thread_local LowerPhaseTiming * lowerPhaseTiming;
+
 
 // ============================================================================
 // Free variable analysis (post-lowering fixup)
@@ -693,29 +716,6 @@ IRModule lower(EvalState & state, Expr * expr);
 ///   VarIds not defined in that block, plus the free vars of any
 ///   sub-blocks (transitively).
 void computeFreeVars(IRModule & module);
-
-
-// ============================================================================
-// Strictness analysis & thunk elimination
-// ============================================================================
-
-/// Eliminate IRMkThunk wrappers whose result is statically known to be
-/// forced before the surrounding block ends.  Replaces the thunk with
-/// its inlined body expression when the body is a single trivial
-/// binding (literal, var ref, attribute select, primop call, etc.).
-///
-/// Must run AFTER computeFreeVars so the per-thunk freeVars list is
-/// available; recomputation is performed at the end of the pass since
-/// inlined bindings change which variables are referenced where.
-///
-/// Saves:
-///   - One Value allocation per eliminated thunk.
-///   - One MAKE_THUNK_V2 dispatch.
-///   - One thunk force dispatch (the consumer's IRForce now sees a
-///     direct value).
-///
-/// Returns the number of thunks eliminated.
-size_t runStrictnessPass(IRModule & module);
 
 
 } // namespace nix::ir

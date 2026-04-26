@@ -15,11 +15,19 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 
 namespace nix::ir {
+
+// Per-call phase-timing observer.  When non-null, lower() fills it in
+// with microsecond timings.  Always nullptr unless the eval driver
+// installs a sink (NIX_VM_COMPILE_PROFILE).  Thread-local so concurrent
+// evals don't trample each other.
+thread_local LowerPhaseTiming * lowerPhaseTiming = nullptr;
 
 // ============================================================================
 // FreeVars operations
@@ -1432,11 +1440,19 @@ VarId Lowerer::lowerAsThunkOrEager(Expr * expr, PosIdx pos)
 
 IRModule lower(EvalState & state, Expr * expr)
 {
+    using Clock = std::chrono::steady_clock;
+    auto micros = [](auto a, auto b) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+    };
+
     IRModule module;
 
     // Create the entry block (index 0).
     module.freshBlock(expr->getPos());
 
+    // Phase 1: AST traversal + IR construction.
+    auto t0 = Clock::now();
     Lowerer lowerer(state, module);
     VarId result = lowerer.lowerExpr(expr);
     module.entryBlock().terminal = TermReturn{
@@ -1465,23 +1481,38 @@ IRModule lower(EvalState & state, Expr * expr)
         block.bindings.pop_back();
         block.terminal = TermTailCall{.func = f, .arg = a, .pos = pos};
     }
+    auto t1 = Clock::now();
 
-    // Compute free variable sets for all Lambda and MkThunk nodes.
+    // Phase 2: free variable analysis (initial).
     computeFreeVars(module);
+    auto t2 = Clock::now();
 
-    // Optimization pass: eliminate IRMkThunk wrappers whose result is
-    // statically guaranteed to be forced (or whose body is trivially
-    // cheap to evaluate eagerly).  Opt-in via NIX_VM_STRICTNESS=1.
-    //
-    // KNOWN UNSOUND for the trivial-body bypass: inlining IRForce /
-    // IRPrimOpCall / IRAttrSelect when not statically demanded changes
-    // observable behavior of `tryEval`, `or default`, `builtins.trace`,
-    // and missing-attr fallbacks.  Also marks TermReturn strict in
-    // lambda bodies that legitimately return un-forced thunks.  Do not
-    // enable in production until the pass is redesigned (preferably as
-    // emitter-side slot fusion rather than IR rewriting).
-    if (getenv("NIX_VM_STRICTNESS"))
-        runStrictnessPass(module);
+    // Strictness pass deleted: it was opt-in, documented unsound for
+    // IRForce/IRPrimOpCall/IRAttrSelect inlining, and blocked on a
+    // sound demand-analysis design.  Use-count-based emit-time
+    // inlining (planned ANF de-materialization) covers the actual
+    // win we wanted.
+    uint64_t strictUs = 0, fvRecomputeUs = 0;
+
+    if (lowerPhaseTiming) {
+        lowerPhaseTiming->lowerCoreUs += micros(t0, t1);
+        lowerPhaseTiming->freeVarsUs += micros(t1, t2);
+        lowerPhaseTiming->strictnessUs += strictUs;
+        lowerPhaseTiming->freeVarsRecomputeUs += fvRecomputeUs;
+
+        // Cumulative work-unit counters for normalisation.
+        lowerPhaseTiming->numBlocks += module.blocks.size();
+        lowerPhaseTiming->numVarIds += module.nextVar;
+        for (auto & blk : module.blocks) {
+            lowerPhaseTiming->numBindings += blk.bindings.size();
+            for (auto & b : blk.bindings) {
+                if (std::holds_alternative<IRMkThunk>(b.expr))
+                    lowerPhaseTiming->numThunks++;
+                else if (std::holds_alternative<IRLambda>(b.expr))
+                    lowerPhaseTiming->numLambdas++;
+            }
+        }
+    }
 
     return module;
 }
