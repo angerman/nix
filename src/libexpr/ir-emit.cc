@@ -488,28 +488,31 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
         // Detect patterns where we can write the result DIRECTLY to a
         // slot without going through the operand stack.
         if (!(nFwd > 0 && forwardRefs.count(binding.result))) {
-            // -- B4-impl: literal int -> slot (OP_RLIT_INT) --
-            // Encoding allows imm <= 0xFFFF and dst <= 0xFF.  Falls
-            // through to the operand-stack path otherwise.
-            if (auto * litInt = std::get_if<ir::IRLitInt>(&binding.expr)) {
-                if (litInt->value >= 0 && litInt->value <= 0xFFFF) {
-                    uint32_t dstSlot = ctx.allocSlot(binding.result);
-                    if (dstSlot <= 0xFF) {
-                        unit.emit(OP_RLIT_INT,
-                            (dstSlot << 16) | static_cast<uint32_t>(litInt->value));
-                        continue;
-                    }
-                }
-            }
+            // -- M3b: literal int -> slot via OP_RCONST.
+            // Pre-allocate the Value once at compile time and store the
+            // pointer in the constants pool, then emit OP_RCONST.  Saves
+            // one allocValue per OP_RLIT_INT *execution* (was ~26K on
+            // nixpkgs#hello.name) at the cost of one allocValue per
+            // distinct literal *site* at compile time (constant — does
+            // not scale with eval depth).  Disk cache amortises the
+            // compile-time alloc on warm runs.
+            //
+            // We could instead encode a tagged immediate directly into
+            // the slot, but that violates the "slots hold real Value*"
+            // contract that several readers (OP_COPY_TO_SLOT at
+            // vm.cc:3443, primop arg materialisation) still depend on.
+            // Pre-allocation keeps that invariant intact.
 
-            // -- B4-impl: literal float/string/path -> slot (OP_RCONST) --
-            // Same allocation as the operand-stack path, just stored
-            // directly to slot.  Encoding: [dst:8|constIdx:16].
+            // -- B4-impl: literal int/float/string/path -> slot via
+            // OP_RCONST.  Encoding: [dst:8|constIdx:16].
             // Fall back to the operand-stack path if dst/constIdx
             // exceed encoding limits.
             {
                 Value * constVal = nullptr;
-                if (auto * litF = std::get_if<ir::IRLitFloat>(&binding.expr)) {
+                if (auto * litI = std::get_if<ir::IRLitInt>(&binding.expr)) {
+                    constVal = state.allocValue();
+                    constVal->mkInt(static_cast<NixInt::Inner>(litI->value));
+                } else if (auto * litF = std::get_if<ir::IRLitFloat>(&binding.expr)) {
                     constVal = state.allocValue();
                     constVal->mkFloat(litF->value);
                 } else if (auto * litS = std::get_if<ir::IRLitString>(&binding.expr)) {

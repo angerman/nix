@@ -3730,6 +3730,14 @@ op_rforce_from:
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
 
+        // Fast path: tagged immediate (small int / bool / null).  Always
+        // already forced — copy as-is.  Mirrors OP_GET_SLOT_FORCE's
+        // tagged-tolerance at line ~3571.
+        if (nanbox::isTagged(v)) [[likely]] {
+            vm.stack[base + dstSlot] = v;
+            DISPATCH();
+        }
+
         // Fast path: already forced.
         if (!v->isThunkOrApp()) [[likely]] {
             vm.stack[base + dstSlot] = v;
@@ -3821,6 +3829,12 @@ op_ruvf_to:
         // Auto-extend stack.
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
+
+        // Fast path: tagged immediate — always already forced.
+        if (nanbox::isTagged(v)) [[likely]] {
+            vm.stack[base + dstSlot] = v;
+            DISPATCH();
+        }
 
         // Fast path: already forced.
         if (!v->isThunkOrApp()) [[likely]] {
@@ -4389,16 +4403,20 @@ op_rattr_self_r:
     // B4-impl: register-form literal/constant emission
     // ==================================================================
 
-    // OP_RLIT_INT: write small int constant directly to slot.
-    // Encoding: [dst:8 | imm:16].  Both are unsigned in the encoding
-    // bits; ir-emit only emits this for non-negative imm <= 0xFFFF.
+    // OP_RLIT_INT: write small int constant directly to slot as a
+    // tagged immediate.  Encoding: [dst:8 | imm:16].  Both are unsigned;
+    // ir-emit only emits this for non-negative imm <= 0xFFFF, all of
+    // which fit in a 60-bit tagged int (matches OP_INT, vm.cc:~1018).
     //
-    // Slots must contain real Value* pointers (downstream readers
-    // assume that — see OP_GET_STACK_SLOT / register-form opcodes
-    // which dereference slot[N] without materializing).  We allocate
-    // a fresh Value here rather than nan-box-tag the slot.  Cost: 1
-    // allocValue per RLIT_INT.  Still cheaper than the OP_INT +
-    // SET_STACK_SLOT pair (which also materializes).
+    // M3a: slots may contain tagged words.  Verified slot-readers that
+    // dereference v->isThunkOrApp() (OP_RFORCE_FROM, OP_RUVF_TO,
+    // OP_GET_SLOT_FORCE, OP_GET_UV_FORCE) all check nanbox::isTagged
+    // first.  Arithmetic register-form ops (OP_RADD_R etc.) already
+    // store tagged ints into slots via nanbox::encodeInt at vm.cc:~3897,
+    // so the tagged-slot pattern is established.
+    //
+    // M3b: zero allocations per execution (was 1 allocValue + mkInt).
+    // The largest single Value-allocation source on nixpkgs#hello.name.
 #ifdef NIX_VM_COMPUTED_GOTO
 op_rlit_int:
 #else
