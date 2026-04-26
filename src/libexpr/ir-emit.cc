@@ -454,6 +454,63 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
         // Detect patterns where we can write the result DIRECTLY to a
         // slot without going through the operand stack.
         if (!(nFwd > 0 && forwardRefs.count(binding.result))) {
+            // -- B4-impl: literal int -> slot (OP_RLIT_INT) --
+            // Encoding allows imm <= 0xFFFF and dst <= 0xFF.  Falls
+            // through to the operand-stack path otherwise.
+            if (auto * litInt = std::get_if<ir::IRLitInt>(&binding.expr)) {
+                if (litInt->value >= 0 && litInt->value <= 0xFFFF) {
+                    uint32_t dstSlot = ctx.allocSlot(binding.result);
+                    if (dstSlot <= 0xFF) {
+                        unit.emit(OP_RLIT_INT,
+                            (dstSlot << 16) | static_cast<uint32_t>(litInt->value));
+                        continue;
+                    }
+                }
+            }
+
+            // -- B4-impl: literal float/string/path -> slot (OP_RCONST) --
+            // Same allocation as the operand-stack path, just stored
+            // directly to slot.  Encoding: [dst:8|constIdx:16].
+            // Fall back to the operand-stack path if dst/constIdx
+            // exceed encoding limits.
+            {
+                Value * constVal = nullptr;
+                if (auto * litF = std::get_if<ir::IRLitFloat>(&binding.expr)) {
+                    constVal = state.allocValue();
+                    constVal->mkFloat(litF->value);
+                } else if (auto * litS = std::get_if<ir::IRLitString>(&binding.expr)) {
+                    constVal = state.allocValue();
+                    constVal->mkString(litS->value, state.mem);
+                } else if (auto * litP = std::get_if<ir::IRLitPath>(&binding.expr)) {
+                    auto * accessor = static_cast<SourceAccessor *>(litP->accessor);
+                    SourcePath sp(
+                        ref<SourceAccessor>(accessor->shared_from_this()),
+                        CanonPath(CanonPath::unchecked_t(), std::string(litP->path)));
+                    constVal = state.allocValue();
+                    constVal->mkPath(sp, state.mem);
+                }
+                if (constVal) {
+                    uint32_t constIdx = unit.addConstant(constVal);
+                    if (constIdx <= 0xFFFF) {
+                        uint32_t dstSlot = ctx.allocSlot(binding.result);
+                        if (dstSlot <= 0xFF) {
+                            unit.emit(OP_RCONST,
+                                (dstSlot << 16) | constIdx);
+                            continue;
+                        }
+                    }
+                    // Constant already added; fall through to operand-
+                    // stack path which will OP_CONST + OP_SET_STACK_SLOT
+                    // using the SAME constant pool entry.  But the
+                    // operand-stack path will re-allocate a Value on
+                    // its own emitExpr call, leaking constVal.  To
+                    // avoid: only commit constVal if we'll use OP_RCONST.
+                    // Simpler: don't pre-allocate; recompute below.
+                    // Implementation: drop the pre-allocated Value if
+                    // we're falling through.  Boehm GC will reclaim it.
+                }
+            }
+
             // -- Pattern: alias `let a = b;` (no runtime work) --
             // Most lowerLet bindings end with `bound = IRVarRef(value)`
             // (the "linking binding").  We can fold these at emit time

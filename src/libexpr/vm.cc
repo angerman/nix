@@ -840,6 +840,8 @@ void vmExec(
         REGISTER_OP(OP_RATTR_SELF_R, op_rattr_self_r);
         REGISTER_OP(OP_RCALL1_R, op_rcall1_r);
         REGISTER_OP(OP_TAIL_CALL_1, op_tail_call_1);
+        REGISTER_OP(OP_RLIT_INT, op_rlit_int);
+        REGISTER_OP(OP_RCONST, op_rconst);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -4190,6 +4192,54 @@ op_rattr_self_r:
         }
 
         vm.stack[base + dstSlot] = selected;
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // B4-impl: register-form literal/constant emission
+    // ==================================================================
+
+    // OP_RLIT_INT: write small int constant directly to slot.
+    // Encoding: [dst:8 | imm:16].  Both are unsigned in the encoding
+    // bits; ir-emit only emits this for non-negative imm <= 0xFFFF.
+    //
+    // Slots must contain real Value* pointers (downstream readers
+    // assume that — see OP_GET_STACK_SLOT / register-form opcodes
+    // which dereference slot[N] without materializing).  We allocate
+    // a fresh Value here rather than nan-box-tag the slot.  Cost: 1
+    // allocValue per RLIT_INT.  Still cheaper than the OP_INT +
+    // SET_STACK_SLOT pair (which also materializes).
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rlit_int:
+#else
+    case OP_RLIT_INT:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot = operand >> 16;
+        uint32_t imm     = operand & 0xFFFF;
+        size_t base = stackBase;
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        Value * v = state.allocValue();
+        v->mkInt(static_cast<NixInt::Inner>(imm));
+        vm.stack[base + dstSlot] = v;
+        DISPATCH();
+    }
+
+    // OP_RCONST: write a constants-pool entry directly to slot.
+    // Encoding: [dst:8 | constIdx:16].
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rconst:
+#else
+    case OP_RCONST:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot  = operand >> 16;
+        uint32_t constIdx = operand & 0xFFFF;
+        size_t base = stackBase;
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = cu->constants[constIdx];
         DISPATCH();
     }
 

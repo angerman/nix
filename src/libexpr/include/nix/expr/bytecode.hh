@@ -409,6 +409,24 @@ enum Op : uint8_t {
     /// keeps the OP_CALL_1 + OP_RETURN sequence (no tail call).
     /// No operand.
     OP_TAIL_CALL_1 = 0x62,
+
+    // ---- B4-impl: generalized register-form opcodes ----
+    // See doc/manual/source/contributing/v2-register-form-design.md
+    // for the full design.  Each writes its result directly to a
+    // stack slot, skipping the operand-stack round-trip and the
+    // trailing OP_SET_STACK_SLOT.
+
+    /// Write a small int constant directly to a slot.
+    /// Encoding: [dstSlot:8 | imm:16]
+    /// Falls back to OP_INT + OP_SET_STACK_SLOT for dst > 255 or
+    /// imm > 0xFFFF (OP_INT supports 24-bit immediates).
+    OP_RLIT_INT = 0x63,
+
+    /// Push a constant from the constants pool directly to a slot.
+    /// Encoding: [dstSlot:8 | constIdx:16]
+    /// Falls back to OP_CONST + OP_SET_STACK_SLOT for dst > 255 or
+    /// constIdx > 0xFFFF.
+    OP_RCONST = 0x64,
 };
 
 
