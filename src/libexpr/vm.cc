@@ -39,11 +39,18 @@ namespace nix::bytecode {
 /// Push a thunk-force CallFrame and mkBlackhole the value being forced.
 /// Captures origExpr/origEnv so vmExec's catch block can revert the
 /// blackhole to mkFailed if the body throws.
+///
+/// The maxSlot parameter is currently UNUSED — an attempt at frame-entry
+/// stack pre-extension caused subtle test failures (some sub-block
+/// pattern reads a slot before the body writes it; pre-fill with vNull
+/// trips the read).  The per-instruction ensureCapacity in the
+/// register-form ops is cheap enough that the optimization isn't
+/// worth the risk.  Kept the parameter to avoid touching every caller.
 [[gnu::always_inline]]
 static inline void pushThunkFrame(VMState & vm,
     const CompilationUnit * unit, uint32_t ip, Env * env,
     Value * v, PosIdx pos, Value ** upvalues,
-    Expr * origExpr)
+    Expr * origExpr, uint16_t /*maxSlot*/ = 0)
 {
     v->mkBlackhole();
     CallFrame f{};
@@ -1179,7 +1186,8 @@ op_get_local_0_force:
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 pushThunkFrame(vm, bcThunk->unit, thunkOffset,
-                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr,
+                    thunkDesc.maxSlot);
                 cu = bcThunk->unit;
                 ip = thunkOffset;
                 curEnv = thunkEnv;
@@ -1351,7 +1359,8 @@ op_force:
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 pushThunkFrame(vm, bcThunk->unit, thunkOffset,
-                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr,
+                    thunkDesc.maxSlot);
 
                 // Switch to the thunk's code.
                 cu = bcThunk->unit;
@@ -1393,7 +1402,7 @@ op_force:
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 pushThunkFrame(vm, &bodyUnit, startOffset,
                     left->lambda().env, v, pos, frameUpvalues,
-                    /*origExpr=*/nullptr); // App, not Thunk; recovery N/A
+                    /*origExpr=*/nullptr, thunkDesc.maxSlot);
                 // Store arg as stack slot 0 (the parameter).
                 vm.push(right);
                 cu = &bodyUnit;
@@ -1418,7 +1427,8 @@ op_force:
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 pushThunkFrame(vm, &bodyUnit, startOffset, env2,
-                    v, pos, /*upvalues=*/nullptr, /*origExpr=*/nullptr);
+                    v, pos, /*upvalues=*/nullptr, /*origExpr=*/nullptr,
+                    bodyUnit.thunks[bodyInfo.thunkIdx].maxSlot);
                 if (hasFormals) vm.push(right);
                 cu = &bodyUnit;
                 ip = startOffset;
@@ -3277,7 +3287,8 @@ op_get_slot_force:
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
                 pushThunkFrame(vm, bcThunk->unit, thunkOffset,
-                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr,
+                    thunkDesc.maxSlot);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
                 DISPATCH();
             }
@@ -3336,7 +3347,8 @@ op_get_uv_force:
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
                 pushThunkFrame(vm, bcThunk->unit, thunkOffset,
-                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr,
+                    thunkDesc.maxSlot);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
                 DISPATCH();
             }
@@ -3447,7 +3459,8 @@ op_rforce_from:
                 // forced Value.
                 vm.stack[base + dstSlot] = v;
                 pushThunkFrame(vm, bcThunk->unit, thunkOffset,
-                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr,
+                    thunkDesc.maxSlot);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
                 DISPATCH();
             }
@@ -3527,7 +3540,8 @@ op_ruvf_to:
                 vm.frames.back().env = curEnv;
                 vm.stack[base + dstSlot] = v;
                 pushThunkFrame(vm, bcThunk->unit, thunkOffset,
-                    thunkEnv, v, pos, frameUpvalues, thunkExpr);
+                    thunkEnv, v, pos, frameUpvalues, thunkExpr,
+                    thunkDesc.maxSlot);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
                 DISPATCH();
             }

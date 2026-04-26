@@ -88,6 +88,11 @@ class IREmitter
     /// Used to patch forward jumps.
     std::unordered_map<ir::BlockId, uint32_t> blockOffsets;
 
+    /// Maximum slot used by the most recently emitted sub-block.
+    /// Set by emitSubBlock / emitSubBlockWithFormals; consumed by the
+    /// IRMkThunk / IRLambda emitter to populate ThunkDescriptor.maxSlot.
+    uint16_t lastSubBlockMaxSlot = 0;
+
 public:
     IREmitter(EvalState & state, CompilationUnit & unit, const ir::IRModule & module)
         : state(state)
@@ -851,6 +856,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                     .pos = e.pos,
                     .sourceExpr = nullptr,
                     .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
+                    .maxSlot = lastSubBlockMaxSlot,
                 });
 
                 Formals * formals = nullptr;
@@ -993,6 +999,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                     .pos = e.pos,
                     .sourceExpr = e.sourceExpr,
                     .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
+                    .maxSlot = lastSubBlockMaxSlot,
                 });
 
                 for (auto freeVar : e.freeVars.vars)
@@ -1492,6 +1499,11 @@ uint32_t IREmitter::emitSubBlock(
     BlockContext subCtx = buildSubBlockContext(block, freeVars);
 
     emitBlock(block, subCtx);
+
+    // Record the max slot reached so the caller can populate
+    // ThunkDescriptor.maxSlot for frame-entry stack pre-extension.
+    lastSubBlockMaxSlot = static_cast<uint16_t>(
+        subCtx.nextSlot > 0xFFFF ? 0xFFFF : subCtx.nextSlot);
 
     // Patch the jump-over.
     unit.patchJump(jumpOver);

@@ -432,6 +432,13 @@ struct ThunkDescriptor
     Expr *   sourceExpr = nullptr; // Original AST expression (for isTrivial() compat)
     uint16_t nUpvalues = 0; // Number of upvalues captured (v2 thunks)
 
+    /// Maximum stack-slot index used by this thunk's body.  Filled in
+    /// at emit time (max nextSlot reached during sub-block emission).
+    /// Frame-push paths use this for a single VMState::ensureCapacity
+    /// call instead of growing the stack one slot at a time across
+    /// the register-form opcode handlers.
+    uint16_t maxSlot = 0;
+
     /// Pre-allocated ExprBytecodeThunk for this descriptor.
     /// Created once during compilation (emitFromIR), reused by every
     /// OP_MAKE_THUNK_V2 execution.  Eliminates 681K+ runtime Expr
