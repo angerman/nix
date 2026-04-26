@@ -3213,9 +3213,9 @@ op_list_init:
         uint32_t size = decodeOperand(CUR_INSTR);
 
         if (size == 0) {
-            auto * result = state.allocValue();
-            result->mkList(state.mem.buildList(0));
-            vm.push(result);
+            // EXii: empty-list singleton — matches tree-walker
+            // ExprList::maybeThunk fast path at eval.cc:~1587.
+            vm.push(const_cast<Value *>(&Value::vEmptyList));
         } else {
             auto list = state.mem.buildList(size);
             // Pop values in reverse order (last pushed = last element).
@@ -4924,13 +4924,26 @@ op_rlist_init:
         uint32_t operand = decodeOperand(CUR_INSTR);
         uint32_t dstSlot = operand >> 16;
         uint32_t nElems  = operand & 0xFFFF;
+        size_t base = stackBase;
+
+        if (nElems == 0) {
+            // EXii: empty-list singleton — see OP_LIST_INIT.  Pop is
+            // unnecessary (no args were pushed for an empty list).
+            vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+            vm.stack[base + dstSlot] = const_cast<Value *>(&Value::vEmptyList);
+            DISPATCH();
+        }
+
+        // Pops MUST run before ensureCapacity grows the stack — growing
+        // would interpose vNull placeholders between sp and the dstSlot
+        // and the subsequent pops would read those placeholders instead
+        // of the just-pushed args.
         auto list = state.buildList(nElems);
         for (uint32_t i = nElems; i > 0; --i) {
             list[i - 1] = materializeWord(state, vm.pop());
         }
         auto * result = state.allocValue();
         result->mkList(list);
-        size_t base = stackBase;
         vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
         vm.stack[base + dstSlot] = result;
         DISPATCH();
