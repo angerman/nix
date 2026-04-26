@@ -1667,13 +1667,11 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 
             ExprLambda & lambda(*vCur.lambda().fun);
 
-            // v2 closures (created by OP_MAKE_CLOSURE_V2) use a flat
-            // upvalue array instead of the standard env chain.  Their
-            // carrier env's values[1] is a reinterpret_cast'd Value**
-            // pointer.  The tree-walker's env-chain body evaluation
-            // would interpret this carrier env as a normal scope and
-            // read garbage.  Intercept here: re-enter the VM for the
-            // v2 closure's body evaluation.
+            // v2 closures (created by OP_MAKE_CLOSURE_V2) store upvalues
+            // INLINE in env.values[1..1+nUpvalues].  The tree-walker's
+            // env-chain body evaluation would interpret this carrier env
+            // as a normal scope and read garbage.  Intercept here:
+            // re-enter the VM for the v2 closure's body evaluation.
             if (lambda.isBytecodeProxy) {
                 auto * bcLambda = static_cast<ExprLambdaBytecode *>(&lambda);
                 auto & bodyUnit = *bcLambda->unit;
@@ -1682,10 +1680,8 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                 uint32_t startOffset = thunkDesc.codeOffset;
 
                 Value ** upvalues = nullptr;
-                if (desc.nUpvalues > 0 && vCur.lambda().env) {
-                    upvalues = reinterpret_cast<Value **>(
-                        vCur.lambda().env->values[1]);
-                }
+                if (desc.nUpvalues > 0 && vCur.lambda().env)
+                    upvalues = &vCur.lambda().env->values[1];
 
                 Value callResult;
                 bytecode::vmExec(*this, bodyUnit, startOffset,

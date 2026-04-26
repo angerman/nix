@@ -1037,7 +1037,7 @@ op_return:
                     auto & td = bcThunk->unit->thunks[bcThunk->thunkIdx];
                     Value ** uv = nullptr;
                     if (td.nUpvalues > 0)
-                        uv = reinterpret_cast<Value **>(chainEnv->values[1]);
+                        uv = &chainEnv->values[1];
 
                     // Frame-depth guard: chain hops can recurse unbounded
                     // for pathological aliases like `let a=b; b=c; ...`.
@@ -1182,10 +1182,8 @@ op_get_local_0_force:
 
                 // Extract v2 upvalues from carrier env if present.
                 Value ** frameUpvalues = nullptr;
-                if (thunkDesc.nUpvalues > 0) {
-                    frameUpvalues = reinterpret_cast<Value **>(
-                        thunkEnv->values[1]);
-                }
+                if (thunkDesc.nUpvalues > 0)
+                    frameUpvalues = &thunkEnv->values[1];
 
                 // Frame depth guard.
                 if (vm.frames.size() > 65536) [[unlikely]] {
@@ -1359,13 +1357,10 @@ op_force:
                 auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
                 uint32_t thunkOffset = thunkDesc.codeOffset;
 
-                // For v2 thunks (created by OP_MAKE_THUNK_V2), extract
-                // the upvalue array from the carrier env's values[1].
+                // v2 thunks store upvalues inline starting at env.values[1].
                 Value ** frameUpvalues = nullptr;
-                if (thunkDesc.nUpvalues > 0) {
-                    frameUpvalues = reinterpret_cast<Value **>(
-                        thunkEnv->values[1]);
-                }
+                if (thunkDesc.nUpvalues > 0)
+                    frameUpvalues = &thunkEnv->values[1];
 
                 // Save current frame state.
                 vm.frames.back().ip = ip;
@@ -1407,10 +1402,8 @@ op_force:
                 uint32_t startOffset = thunkDesc.codeOffset;
 
                 Value ** frameUpvalues = nullptr;
-                if (desc.nUpvalues > 0 && left->lambda().env) {
-                    frameUpvalues = reinterpret_cast<Value **>(
-                        left->lambda().env->values[1]);
-                }
+                if (desc.nUpvalues > 0 && left->lambda().env)
+                    frameUpvalues = &left->lambda().env->values[1];
 
                 vm.frames.back().ip = ip;
                 vm.frames.back().env = curEnv;
@@ -2168,13 +2161,10 @@ op_call_1:
             assert(startOffset < bodyUnit.code.size()
                 && "OP_CALL_1 v2: startOffset out of bounds");
 
-            // Extract the upvalue array from the closure's carrier env.
-            // OP_MAKE_CLOSURE_V2 stores it as closureEnv.values[1].
+            // v2 closures store upvalues inline starting at env.values[1].
             Value ** frameUpvalues = nullptr;
-            if (desc.nUpvalues > 0 && fun->lambda().env) {
-                frameUpvalues = reinterpret_cast<Value **>(
-                    fun->lambda().env->values[1]);
-            }
+            if (desc.nUpvalues > 0 && fun->lambda().env)
+                frameUpvalues = &fun->lambda().env->values[1];
 
             // Save current frame state.
             vm.frames.back().ip = ip;
@@ -2670,8 +2660,7 @@ op_tail_call_1:
             uint32_t startOffset = thunkDesc.codeOffset;
             Value ** frameUpvalues = nullptr;
             if (desc.nUpvalues > 0 && fun->lambda().env)
-                frameUpvalues = reinterpret_cast<Value **>(
-                    fun->lambda().env->values[1]);
+                frameUpvalues = &fun->lambda().env->values[1];
 
             // Replace the current frame in place.  Truncate stack to
             // the caller's stackBaseOffset, then push arg as slot 0.
@@ -3411,7 +3400,7 @@ op_get_slot_force:
                 uint32_t thunkOffset = thunkDesc.codeOffset;
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0)
-                    frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
+                    frameUpvalues = &thunkEnv->values[1];
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.back().ip = ip;
@@ -3471,7 +3460,7 @@ op_get_uv_force:
                 uint32_t thunkOffset = thunkDesc.codeOffset;
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0)
-                    frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
+                    frameUpvalues = &thunkEnv->values[1];
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
                 vm.frames.back().ip = ip;
@@ -3577,7 +3566,7 @@ op_rforce_from:
                 uint32_t thunkOffset = thunkDesc.codeOffset;
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0)
-                    frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
+                    frameUpvalues = &thunkEnv->values[1];
 
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
@@ -3661,7 +3650,7 @@ op_ruvf_to:
                 uint32_t thunkOffset = thunkDesc.codeOffset;
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0)
-                    frameUpvalues = reinterpret_cast<Value **>(thunkEnv->values[1]);
+                    frameUpvalues = &thunkEnv->values[1];
 
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
@@ -3978,7 +3967,7 @@ op_rcall1_r:
             uint32_t startOffset = thunkDesc.codeOffset;
             Value ** frameUpvalues = nullptr;
             if (desc.nUpvalues > 0 && fun->lambda().env)
-                frameUpvalues = reinterpret_cast<Value **>(fun->lambda().env->values[1]);
+                frameUpvalues = &fun->lambda().env->values[1];
 
             // Pre-extend parent stack so dst slot exists when OP_RETURN
             // writes into it.
@@ -4119,21 +4108,6 @@ op_make_closure_v2:
         // Read the upvalue count from the next data word.
         uint32_t nUpvalues = decodeOperand(cu->code[ip++]);
 
-        // Allocate a flat GC-traced array for captured upvalues.
-        Value ** upvalues = nullptr;
-        if (nUpvalues > 0) {
-            upvalues = static_cast<Value **>(
-                GC_MALLOC(nUpvalues * sizeof(Value *)));
-            // Pop upvalues from the stack.
-            // They were pushed in forward order (upvalue 0 first),
-            // so pop in reverse to get the correct mapping.
-            // Materialize tagged immediates so the captured array is
-            // a proper Value** (downstream OP_GET_UPVALUE / OP_RUVF_TO
-            // dereference these pointers).
-            for (uint32_t i = nUpvalues; i > 0; --i)
-                upvalues[i - 1] = materializeWord(state, vm.pop());
-        }
-
         auto & desc = cu->lambdas[lambdaIdx];
 
         // Register this lambda's bytecoded body in the side-table.
@@ -4147,22 +4121,28 @@ op_make_closure_v2:
         }
 
         // Create the closure Value.
-        // For v2 closures with upvalues, we store the upvalue array on
-        // a side-allocated 2-slot Env whose values[1] is a pointer to
-        // the upvalue array.  values[0] is vNull so OP_GET_WITH (which
-        // reads env.values[0]) sees a safe sentinel.
+        // For v2 closures, allocate a single Env(1 + nUpvalues) and store
+        // upvalues INLINE in values[1..1+nUpvalues].  values[0] is vNull
+        // so OP_GET_WITH (which reads env.values[0]) sees a safe
+        // sentinel.  Readers in callFunction / fast-paths set
+        // frame.upvalues = &env->values[1] so OP_GET_UPVALUE(idx)'s
+        // offsets stay unchanged.
         //
         // For closures with NO upvalues (very common — every nullary
-        // helper), allocate a 1-slot Env instead.  The size-1 path
-        // hits the thread-local Env free-pool (eval-inline.hh:70-86)
-        // — much faster than the generic allocBytes path used for size-2.
-        Env & closureEnv = state.mem.allocEnv(nUpvalues > 0 ? 2 : 1);
+        // helper), allocate a 1-slot Env, which hits the thread-local
+        // size-1 fast pool (eval-inline.hh:70-86).
+        Env & closureEnv = state.mem.allocEnv(1 + nUpvalues);
         closureEnv.up = curEnv; // Parent env for with-chain walking.
         closureEnv.values[0] = const_cast<Value *>(&Value::vNull);
         if (nUpvalues > 0) {
-            // Store the upvalue array pointer in values[1].
-            // The OP_CALL_1 v2 path will extract it from here.
-            closureEnv.values[1] = reinterpret_cast<Value *>(upvalues);
+            // Pop upvalues from the stack into values[1..1+nUpvalues].
+            // They were pushed in forward order (upvalue 0 first),
+            // so pop in reverse to get the correct mapping.
+            // Materialize tagged immediates so the captured slots are
+            // proper Value* pointers — OP_GET_UPVALUE / OP_RUVF_TO read
+            // these directly without re-materialization.
+            for (uint32_t i = nUpvalues; i > 0; --i)
+                closureEnv.values[i] = materializeWord(state, vm.pop());
         }
 
         // Use the pre-allocated ExprLambdaBytecode from compilation.
@@ -4196,15 +4176,6 @@ op_make_thunk_v2:
         // Read the upvalue count from the next data word.
         uint32_t nUpvalues = decodeOperand(cu->code[ip++]);
 
-        // Allocate and populate the upvalue array.
-        Value ** upvalues = nullptr;
-        if (nUpvalues > 0) {
-            upvalues = static_cast<Value **>(
-                GC_MALLOC(nUpvalues * sizeof(Value *)));
-            for (uint32_t i = nUpvalues; i > 0; --i)
-                upvalues[i - 1] = vm.pop();
-        }
-
         // Use the pre-allocated ExprBytecodeThunk from compilation.
         // This avoids 681K+ runtime Expr allocations per nixpkgs eval.
         auto & desc = cu->thunks[thunkIdx];
@@ -4216,14 +4187,15 @@ op_make_thunk_v2:
                 const_cast<CompilationUnit *>(cu), thunkIdx);
         }
 
-        // Create a carrier Env for the upvalue array.
-        // For thunks with no upvalues (very common — let-bound trivial
-        // exprs), allocate a 1-slot Env to hit the size-1 fast pool.
-        Env & thunkEnv = state.mem.allocEnv(nUpvalues > 0 ? 2 : 1);
+        // Allocate Env(1 + nUpvalues) and store upvalues INLINE in
+        // values[1..1+nUpvalues] — eliminates the separate GC_MALLOC.
+        // For thunks with no upvalues, allocEnv(1) hits the size-1
+        // fast pool (Phase 1.2a).
+        Env & thunkEnv = state.mem.allocEnv(1 + nUpvalues);
         thunkEnv.up = curEnv;
         thunkEnv.values[0] = &Value::vNull;
-        if (nUpvalues > 0)
-            thunkEnv.values[1] = reinterpret_cast<Value *>(upvalues);
+        for (uint32_t i = nUpvalues; i > 0; --i)
+            thunkEnv.values[i] = vm.pop();
 
         auto * thunkVal = state.allocValue();
         thunkVal->mkThunk(&thunkEnv, thunkExpr);

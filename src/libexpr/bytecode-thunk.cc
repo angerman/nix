@@ -23,13 +23,10 @@ void ExprBytecodeThunk::eval(EvalState & state, Env & env, Value & v)
     if (state.vmState)
         state.vmState->nrBytecodeThunkForces++;
 
-    // For v2 thunks (created by OP_MAKE_THUNK_V2), extract the upvalue
-    // array from the carrier env.  The carrier env's values[1] is a
-    // reinterpret_cast'd Value** pointer to the flat upvalue array.
+    // v2 thunks store upvalues inline starting at env.values[1].
     Value ** upvalues = nullptr;
-    if (desc.nUpvalues > 0) {
-        upvalues = reinterpret_cast<Value **>(env.values[1]);
-    }
+    if (desc.nUpvalues > 0)
+        upvalues = &env.values[1];
 
     bytecode::vmExec(state, *unit, offset, env, v, upvalues);
 }
