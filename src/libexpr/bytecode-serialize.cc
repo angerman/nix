@@ -23,6 +23,7 @@
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/nixexpr.hh"
+#include "nix/util/hash.hh"
 
 #include <cstring>
 #include <vector>
@@ -460,6 +461,73 @@ CompilationUnit * deserializeCU(std::string_view blob, EvalState & state)
         throw SerializationError("bytecode-serialize: trailing bytes");
 
     return unit;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.2-5: Cache key derivation
+// ---------------------------------------------------------------------------
+
+CacheKey computeCacheKey(const SourcePath & sp, uint32_t optimizationFlags)
+{
+    CacheKey key{Hash(HashAlgorithm::SHA256)};
+
+    // Try to extract a stable fingerprint from the source.  We need a
+    // physical path + stat info to construct a key tied to file
+    // identity.  If the source isn't a regular file (e.g. an
+    // in-memory accessor), return the empty key — the caller will
+    // skip caching.
+    std::string canonical;
+    try {
+        canonical = sp.path.abs();
+    } catch (...) {
+        return key;
+    }
+
+    // stat for mtime/size/dev/ino; non-existent files are uncacheable.
+    std::optional<SourceAccessor::Stat> st;
+    try {
+        st = sp.maybeLstat();
+    } catch (...) {
+        return key;
+    }
+    if (!st) return key;
+    if (st->type != SourceAccessor::Type::tRegular) return key;
+
+    // Build the fingerprint string: schema + flags + path + size + (mtime if present).
+    // We deliberately omit dev/ino (they vary across mount points and
+    // remote systems) and rely on (path, size, mtime) for invalidation.
+    std::string fingerprint;
+    fingerprint.reserve(canonical.size() + 64);
+    fingerprint.append("nix-bcv1\0", 9);
+    {
+        uint32_t v = kBytecodeSerializeSchemaVersion;
+        fingerprint.append(reinterpret_cast<const char *>(&v), sizeof(v));
+    }
+    {
+        uint32_t v = optimizationFlags;
+        fingerprint.append(reinterpret_cast<const char *>(&v), sizeof(v));
+    }
+    fingerprint.append(canonical);
+    fingerprint.push_back('\0');
+    {
+        uint64_t sz = static_cast<uint64_t>(st->fileSize.value_or(0));
+        fingerprint.append(reinterpret_cast<const char *>(&sz), sizeof(sz));
+    }
+    // mtime via std::filesystem (SourceAccessor::Stat doesn't carry it).
+    // For non-physical-fs accessors this will throw; we already know
+    // the source IS physical (canonical path resolved + lstat above).
+    try {
+        namespace fs = std::filesystem;
+        auto t = fs::last_write_time(canonical);
+        uint64_t mt = static_cast<uint64_t>(t.time_since_epoch().count());
+        fingerprint.append(reinterpret_cast<const char *>(&mt), sizeof(mt));
+    } catch (...) {
+        // mtime unavailable; the (path, size) pair still gives a
+        // weaker key.  Don't refuse caching.
+    }
+
+    key.hash = hashString(HashAlgorithm::SHA256, fingerprint);
+    return key;
 }
 
 } // namespace nix::bytecode

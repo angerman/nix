@@ -21,6 +21,8 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "nix/expr/bytecode.hh"
+#include "nix/util/hash.hh"
+#include "nix/util/source-path.hh"
 
 #include <string>
 #include <string_view>
@@ -63,5 +65,41 @@ std::string serializeCU(const CompilationUnit & unit, const EvalState & state);
 /// Throws SerializationError on magic/version mismatch or truncation.
 /// Throws SerializationError on Symbol/PosIdx relocation failure.
 CompilationUnit * deserializeCU(std::string_view blob, EvalState & state);
+
+// ---------------------------------------------------------------------------
+// Phase 3.2-5: Cache key derivation
+//
+// A cache key is a SHA-256 over:
+//   "nix-bcv1\0"                 (schema discriminator)
+//   schemaVersion (u32)
+//   optimizationFlags (u32)      (currently 0; reserved for emit options)
+//   sourceFingerprint
+//
+// The sourceFingerprint depends on the source kind:
+//   - SourcePath (regular file): SHA-256 of (canonical path, mtime,
+//     size, device, inode).  Editing the file invalidates the entry
+//     for FREE because mtime/size shift.
+//   - Stdin / String origins: not cacheable (return empty key).
+//
+// The cache only operates at file granularity.  Imports are tracked
+// independently — each imported file gets its own key, and editing
+// one file does NOT invalidate transitively cached importers (the
+// transitively-cached CU still references symbols by name and
+// re-resolves them at eval time, so it stays correct against the
+// new content).
+// ---------------------------------------------------------------------------
+
+/// 32-byte cache key.  Empty Hash() means "uncacheable source".
+struct CacheKey
+{
+    Hash hash;
+    bool empty() const { return hash == Hash(HashAlgorithm::SHA256); }
+};
+
+/// Compute a cache key for a SourcePath (or other Pos::Origin).  An
+/// empty CacheKey means the source isn't cacheable in this scheme
+/// (e.g. parsed from a string, stdin, or virtual filesystem entry).
+CacheKey computeCacheKey(const SourcePath & sp,
+                          uint32_t optimizationFlags = 0);
 
 } // namespace nix::bytecode
