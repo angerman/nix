@@ -4746,14 +4746,24 @@ op_rmake_thunk_v2:
             const_cast<bytecode::ThunkDescriptor &>(desc).cachedExpr = thunkExpr;
         }
 
-        Env & thunkEnv = state.mem.allocEnv(1 + nUpvalues);
-        thunkEnv.up = curEnv;
-        thunkEnv.values[0] = &Value::vNull;
-        for (uint32_t i = nUpvalues; i > 0; --i)
-            thunkEnv.values[i] = vm.pop();
+        // M4d: nullary fast path — see OP_MAKE_THUNK_V2.
+        Env * thunkEnvPtr;
+        if (nUpvalues == 0
+            && curEnv
+            && (curEnv->values[0] == nullptr
+                || curEnv->values[0] == &Value::vNull)) {
+            thunkEnvPtr = curEnv;
+        } else {
+            Env & thunkEnv = state.mem.allocEnv(1 + nUpvalues);
+            thunkEnv.up = curEnv;
+            thunkEnv.values[0] = &Value::vNull;
+            for (uint32_t i = nUpvalues; i > 0; --i)
+                thunkEnv.values[i] = vm.pop();
+            thunkEnvPtr = &thunkEnv;
+        }
 
         auto * thunkVal = state.allocValue();
-        thunkVal->mkThunk(&thunkEnv, thunkExpr);
+        thunkVal->mkThunk(thunkEnvPtr, thunkExpr);
 
         size_t base = stackBase;
         vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
@@ -4784,12 +4794,22 @@ op_rmake_closure_v2:
             };
         }
 
-        Env & closureEnv = state.mem.allocEnv(1 + nUpvalues);
-        closureEnv.up = curEnv;
-        closureEnv.values[0] = const_cast<Value *>(&Value::vNull);
-        if (nUpvalues > 0) {
-            for (uint32_t i = nUpvalues; i > 0; --i)
-                closureEnv.values[i] = materializeWord(state, vm.pop());
+        // M4d: nullary fast path — see OP_MAKE_CLOSURE_V2.
+        Env * closureEnvPtr;
+        if (nUpvalues == 0
+            && curEnv
+            && (curEnv->values[0] == nullptr
+                || curEnv->values[0] == &Value::vNull)) {
+            closureEnvPtr = curEnv;
+        } else {
+            Env & closureEnv = state.mem.allocEnv(1 + nUpvalues);
+            closureEnv.up = curEnv;
+            closureEnv.values[0] = const_cast<Value *>(&Value::vNull);
+            if (nUpvalues > 0) {
+                for (uint32_t i = nUpvalues; i > 0; --i)
+                    closureEnv.values[i] = materializeWord(state, vm.pop());
+            }
+            closureEnvPtr = &closureEnv;
         }
 
         Expr * lambdaExpr = desc.cachedExpr;
@@ -4800,7 +4820,7 @@ op_rmake_closure_v2:
         }
 
         auto * closureVal = state.allocValue();
-        closureVal->mkLambda(&closureEnv, static_cast<ExprLambda *>(lambdaExpr));
+        closureVal->mkLambda(closureEnvPtr, static_cast<ExprLambda *>(lambdaExpr));
 
         size_t base = stackBase;
         vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
