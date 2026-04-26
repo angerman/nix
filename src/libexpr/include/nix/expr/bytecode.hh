@@ -511,6 +511,24 @@ struct PosEntry
 // Thunk and Lambda descriptors
 // ---------------------------------------------------------------------------
 
+/// Phase 3.1f-5: Snapshot of compile-time state needed to lazily
+/// realize a deferred thunk/lambda body.  Allocated on the descriptor
+/// when state == Pending; freed (set to nullptr) once the body
+/// has been emitted and state transitions to Compiled.
+///
+/// Conservatively limited to the simple non-cell-capture case for
+/// now — sites with parent.blockCellMap or parent.cellRefs interaction
+/// keep the eager path until Phase 3.1f-7 lands the cell snapshot.
+struct DeferredEmitState
+{
+    /// IR block id whose body to emit when realized.
+    uint32_t bodyBlockId = 0;
+    /// Free variables in the original sorted order; used to rebuild
+    /// the sub-block's upvalueSlots map (varId → upvalueIdx) at
+    /// emit time.  Stored by-value for self-containment.
+    std::vector<uint32_t> freeVarsSorted;
+};
+
 /// Identifies a lazy sub-expression (thunk body) within a CompilationUnit.
 struct ThunkDescriptor
 {
@@ -525,8 +543,7 @@ struct ThunkDescriptor
     /// `Pending`:  codeOffset has not yet been emitted; the first
     /// force should call lazyEmitThunkBody(state, cu, thunkIdx) which
     /// reads from the descriptor's saved DeferredEmitState (Phase
-    /// 3.1f-5).  No behavior change yet — emit always sets Compiled
-    /// at the end of emitFromIR.
+    /// 3.1f-5).
     enum class State : uint8_t { Compiled = 0, Pending = 1 };
     State    state = State::Compiled;
 
@@ -534,6 +551,14 @@ struct ThunkDescriptor
     /// body the deferred emit should re-enter.  Unused while state ==
     /// Compiled.
     uint32_t bodyBlockId = 0;
+
+    /// Phase 3.1f-5: Captured emit-time state for the body.  Non-null
+    /// iff state == Pending.  Cleared (reset to nullptr) on transition
+    /// to Compiled.  Shared (rather than unique) so ThunkDescriptor
+    /// stays trivially copyable for the existing many push_back call
+    /// sites — overhead is tiny since this is only allocated when
+    /// lazy emission is enabled.
+    std::shared_ptr<DeferredEmitState> deferredState;
 
     /// Maximum stack-slot index used by this thunk's body.  Filled in
     /// at emit time (max nextSlot reached during sub-block emission).
@@ -561,6 +586,23 @@ struct LambdaDescriptor
     /// argument (x: ...) rather than a pattern ({ a, b, ... }: ...).
     /// Points into BumpMemoryResource (shared with AST Formals).
     Formals * formals = nullptr;
+
+    /// True if the source lambda took a formals pattern ({ x, y, ... }: ...).
+    /// We can't simply use `formals != nullptr` because the bytecode
+    /// emitter inlines the formals prologue and never populates the
+    /// pointer above (the AST Formals* would not survive disk-cache
+    /// round-trips since it lives in the AST BumpMemoryResource).
+    /// This flag IS serialized — disk-cache load consults it via
+    /// ExprLambdaBytecode's constructor to set ExprLambda::hasFormals,
+    /// without which `builtins.functionArgs` returns `{}` for cached
+    /// formals lambdas (issue #159 root cause).
+    bool sourceHasFormals = false;
+    bool sourceFormalsEllipsis = false;
+    /// Each entry is (Symbol-pool index, has-default flag).  Ordered
+    /// to match the AST's sorted-by-name + sorted-by-pos formals so
+    /// `Formals::has` and `intersectAttrs` remain O(log n) via binary
+    /// search.  Empty when `sourceHasFormals == false`.
+    std::vector<std::pair<uint32_t, bool>> sourceFormals;
 
     /// Number of slots required in the Env for this lambda's body (v1).
     uint16_t envSize = 0;
