@@ -267,6 +267,62 @@ void primThrow(EvalState &, Value * args, Value &)
     throw std::runtime_error(std::string("v3 throw: ") + args[0].payload.str);
 }
 
+void primConcatLists(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isList()) typeError("concatLists", "list of lists");
+    uint32_t total = 0;
+    auto & outer = args[0];
+    for (uint32_t i = 0; i < outer.payload.list->size; ++i) {
+        const Value & el = outer.payload.list->elems[i];
+        if (!el.isList()) typeError("concatLists", "list of lists");
+        total += el.payload.list ? el.payload.list->size : 0;
+    }
+    ListVec * result = Alloc::allocList(total);
+    allocStats().listsAllocated++;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < outer.payload.list->size; ++i) {
+        const Value & el = outer.payload.list->elems[i];
+        if (!el.payload.list) continue;
+        for (uint32_t j = 0; j < el.payload.list->size; ++j)
+            result->elems[k++] = el.payload.list->elems[j];
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = result;
+}
+
+void primConcatStringsSep(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("concatStringsSep", "separator string");
+    if (!args[1].isList())   typeError("concatStringsSep", "list of strings");
+    std::string sep(args[0].payload.str);
+    std::string result;
+    auto * list = args[1].payload.list;
+    for (uint32_t i = 0; list && i < list->size; ++i) {
+        if (i > 0) result += sep;
+        const Value & el = list->elems[i];
+        if (!el.isString()) typeError("concatStringsSep", "list of strings");
+        result += el.payload.str;
+    }
+    out = mkStringValueOwned(result);
+}
+
+void primSubstring(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isInt() || !args[1].isInt() || !args[2].isString())
+        typeError("substring", "(int, int, string)");
+    int64_t start = args[0].payload.i;
+    int64_t len = args[1].payload.i;
+    std::string_view src(args[2].payload.str);
+    if (start < 0) start = 0;
+    if (static_cast<size_t>(start) >= src.size()) {
+        out = mkStringValueOwned("");
+        return;
+    }
+    size_t available = src.size() - start;
+    size_t actualLen = (len < 0) ? available : std::min(static_cast<size_t>(len), available);
+    out = mkStringValueOwned(std::string(src.substr(start, actualLen)));
+}
+
 void primLessThan(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
@@ -336,6 +392,9 @@ void registerBuiltinPrimOps()
         registerPrimOp({"__mul",        2, primMul});
         registerPrimOp({"__div",        2, primDiv});
         registerPrimOp({"__lessThan",   2, primLessThan});
+        registerPrimOp({"concatLists",        1, primConcatLists});
+        registerPrimOp({"concatStringsSep",   2, primConcatStringsSep});
+        registerPrimOp({"substring",          3, primSubstring});
     });
 }
 
