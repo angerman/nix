@@ -168,6 +168,40 @@ private:
         currentLevel--;
     }
 
+    /// RAII guard for save/restore of `currentBlock`.  Constructor saves
+    /// the current value; destructor restores it.  Use this anywhere a
+    /// helper switches to a sub-block and would otherwise leave the
+    /// state corrupt on exception.
+    struct BlockGuard
+    {
+        Lowerer & l;
+        BlockId saved;
+        BlockGuard(Lowerer & l) : l(l), saved(l.currentBlock) {}
+        ~BlockGuard() { l.currentBlock = saved; }
+    };
+
+    /// RAII guard for the levelOffset adjustment used by Inherited
+    /// bindings (lowerLet / lowerAttrs).  Constructor sets the offset;
+    /// destructor restores the old value.
+    struct LevelOffsetGuard
+    {
+        Lowerer & l;
+        uint32_t saved;
+        LevelOffsetGuard(Lowerer & l, uint32_t v) : l(l), saved(l.levelOffset)
+        {
+            l.levelOffset = v;
+        }
+        ~LevelOffsetGuard() { l.levelOffset = saved; }
+    };
+
+    /// RAII guard for pushScope / popScope.
+    struct ScopeGuard
+    {
+        Lowerer & l;
+        ScopeGuard(Lowerer & l) : l(l) { l.pushScope(); }
+        ~ScopeGuard() { l.popScope(); }
+    };
+
     /// Bind a variable at the given (relative level, displacement).
     /// The relative level is converted to an absolute level using
     /// currentLevel so that lookups from nested scopes resolve correctly.
