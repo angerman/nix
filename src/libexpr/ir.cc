@@ -21,6 +21,8 @@
 #include <unordered_set>
 #include <variant>
 
+#include <boost/unordered/unordered_flat_map.hpp>
+
 namespace nix::ir {
 
 // Per-call phase-timing observer.  When non-null, lower() fills it in
@@ -116,7 +118,9 @@ class Lowerer
     ///
     /// Key: (level, displacement) pair packed into a uint64_t.
     /// Value: the IR VarId assigned to that binding.
-    std::unordered_map<uint64_t, VarId> envMap;
+    /// boost::unordered_flat_map gives ~30% faster lookup vs std::unordered_map
+    /// (open-addressing, contiguous storage, no per-node allocation).
+    boost::unordered_flat_map<uint64_t, VarId> envMap;
 
     /// Stack of env map snapshots for scope push/pop.
     /// Each entry is a set of keys added in that scope, so we can
