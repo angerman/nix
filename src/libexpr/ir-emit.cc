@@ -147,6 +147,16 @@ private:
         const ir::FreeVars & freeVars,
         BlockContext & parentCtx);
 
+    /// Phase 3.1f-4: Emit JUST the body of a sub-block (no jump-over,
+    /// no parent-flow management).  The caller is responsible for
+    /// either wrapping it with OP_JUMP (eager path, used by
+    /// emitSubBlock) or appending it to the end of unit.code (lazy
+    /// emit path, used at first force).  Returns the code offset
+    /// where the body begins.  Also updates lastSubBlockMaxSlot.
+    uint32_t emitBlockOnly(
+        ir::BlockId blockId,
+        const ir::FreeVars & freeVars);
+
     /// Emit an inline block (for if-branches, with bodies, etc).
     /// These share the parent frame's stack slots; no upvalue capture.
     /// Returns the code offset where the block begins.
@@ -1900,10 +1910,20 @@ uint32_t IREmitter::emitSubBlock(
     const ir::FreeVars & freeVars,
     BlockContext & parentCtx)
 {
-    const auto & block = module.blocks[blockId];
-
-    // Jump over the sub-block body in the parent's code stream.
+    // Eager path: wrap the body emission with a jump-over so the
+    // body sits inline in the parent's code stream but isn't
+    // executed when control reaches it from above.
     uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+    uint32_t bodyOffset = emitBlockOnly(blockId, freeVars);
+    unit.patchJump(jumpOver);
+    return bodyOffset;
+}
+
+uint32_t IREmitter::emitBlockOnly(
+    ir::BlockId blockId,
+    const ir::FreeVars & freeVars)
+{
+    const auto & block = module.blocks[blockId];
 
     uint32_t bodyOffset = static_cast<uint32_t>(unit.code.size());
 
@@ -1917,9 +1937,6 @@ uint32_t IREmitter::emitSubBlock(
     // ThunkDescriptor.maxSlot for frame-entry stack pre-extension.
     lastSubBlockMaxSlot = static_cast<uint16_t>(
         subCtx.nextSlot > 0xFFFF ? 0xFFFF : subCtx.nextSlot);
-
-    // Patch the jump-over.
-    unit.patchJump(jumpOver);
 
     return bodyOffset;
 }
