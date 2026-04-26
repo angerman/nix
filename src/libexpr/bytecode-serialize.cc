@@ -337,10 +337,20 @@ std::string serializeCU(const CompilationUnit & unit, const EvalState & state)
         // Symbols name/arg as pool indices (or sentinel UINT32_MAX
         // if empty).  Caller has already added all referenced symbols
         // via addSymbol; we serialize their pool indices.
+        //
+        // If a non-empty Symbol is missing from the index, that's a
+        // compile-time bug — emit-time forgot to register the symbol.
+        // Throwing here surfaces it immediately rather than silently
+        // writing UINT32_MAX (which becomes an empty Symbol on load
+        // and produces "attribute X missing" later).
         auto symIdxOrSentinel = [&](Symbol s) -> uint32_t {
             if (!s) return UINT32_MAX;
             auto it = unit.symbolIndex.find(s);
-            if (it == unit.symbolIndex.end()) return UINT32_MAX;
+            if (it == unit.symbolIndex.end())
+                throw SerializationError(
+                    "bytecode-serialize: LambdaDescriptor symbol '"
+                    + std::string(state.symbols[s])
+                    + "' not in unit.symbolIndex (forgot addSymbol at emit time?)");
             return it->second;
         };
         w.putU32(symIdxOrSentinel(ld.name));
@@ -352,11 +362,19 @@ std::string serializeCU(const CompilationUnit & unit, const EvalState & state)
     }
 
     // AttrCaches: only the symbol pool index is stable; PIC entries
-    // are populated at runtime.
+    // are populated at runtime.  Same hardening as LambdaDescriptor:
+    // a missing symbol means the emitter forgot to addSymbol (a
+    // compile-time bug).  addAttrCache itself calls addSymbol, so
+    // this should always succeed.
     w.putU32(static_cast<uint32_t>(unit.attrCaches.size()));
     for (auto & ac : unit.attrCaches) {
         auto it = unit.symbolIndex.find(ac.name);
-        w.putU32(it != unit.symbolIndex.end() ? it->second : UINT32_MAX);
+        if (it == unit.symbolIndex.end())
+            throw SerializationError(
+                "bytecode-serialize: AttrCache.name '"
+                + std::string(state.symbols[ac.name])
+                + "' not in unit.symbolIndex");
+        w.putU32(it->second);
     }
 
     // Phase 3.2-3a: positions table.  Each PosIdx in unit.positions

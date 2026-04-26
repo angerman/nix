@@ -1007,6 +1007,13 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 });
 
                 Formals * formals = nullptr;
+                // Register name/arg in the symbol pool for disk-cache
+                // round-trip (Phase 3.2).  Without this the serializer
+                // can't recover the descriptor's symbol references on
+                // load and emits Symbol{} (id 0) instead.  Bug found
+                // by debug agent for issue #159.
+                if (e.name) unit.addSymbol(e.name);
+                if (e.params.arg) unit.addSymbol(e.params.arg);
                 unit.lambdas.push_back(LambdaDescriptor{
                     .codeOffset = bodyOffset,
                     .pos = e.pos,
@@ -1060,6 +1067,11 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 });
 
                 Formals * formals = nullptr;
+                // Register name/arg in the symbol pool — same fix as
+                // the cell-capture path above.  Required for disk-cache
+                // round-trip.
+                if (e.name) unit.addSymbol(e.name);
+                if (e.params.arg) unit.addSymbol(e.params.arg);
                 unit.lambdas.push_back(LambdaDescriptor{
                     .codeOffset = bodyOffset,
                     .pos = e.pos,
