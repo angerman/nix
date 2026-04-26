@@ -4245,10 +4245,15 @@ op_make_closure_v2:
         }
 
         // Use the pre-allocated ExprLambdaBytecode from compilation.
+        // Lazy ExprLambdaBytecode allocation (Phase 3.1 lite): emit no
+        // longer pre-allocates, so the first OP_MAKE_CLOSURE_V2 for this
+        // descriptor allocates and caches.  Subsequent creations reuse
+        // the cached pointer.
         Expr * lambdaExpr = desc.cachedExpr;
         if (!lambdaExpr) [[unlikely]] {
             lambdaExpr = state.mem.exprs.add<ExprLambdaBytecode>(
                 const_cast<CompilationUnit *>(cu), lambdaIdx);
+            const_cast<bytecode::LambdaDescriptor &>(desc).cachedExpr = lambdaExpr;
         }
 
         auto * closureVal = state.allocValue();
@@ -4275,15 +4280,18 @@ op_make_thunk_v2:
         // Read the upvalue count from the next data word.
         uint32_t nUpvalues = decodeOperand(cu->code[ip++]);
 
-        // Use the pre-allocated ExprBytecodeThunk from compilation.
-        // This avoids 681K+ runtime Expr allocations per nixpkgs eval.
+        // Lazy ExprBytecodeThunk allocation (Phase 3.1 lite): emit no
+        // longer pre-allocates, so the first OP_MAKE_THUNK_V2 for this
+        // descriptor allocates and caches.  Cached pointer is reused on
+        // subsequent thunk creations from the same descriptor.  Saves
+        // descriptor-count allocations at compile time, deferring them
+        // to the first force.
         auto & desc = cu->thunks[thunkIdx];
         Expr * thunkExpr = desc.cachedExpr;
         if (!thunkExpr) [[unlikely]] {
-            // Fallback for thunks without pre-cached expr (shouldn't happen
-            // for v2 thunks, but defensive for v1 compat).
             thunkExpr = state.mem.exprs.add<ExprBytecodeThunk>(
                 const_cast<CompilationUnit *>(cu), thunkIdx);
+            const_cast<bytecode::ThunkDescriptor &>(desc).cachedExpr = thunkExpr;
         }
 
         // Allocate Env(1 + nUpvalues) and store upvalues INLINE in

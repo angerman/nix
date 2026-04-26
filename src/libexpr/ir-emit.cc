@@ -193,31 +193,21 @@ CompilationUnit * emitFromIR(EvalState & state, const ir::IRModule & module)
     emitter.emit();
     auto t1 = Clock::now();
 
-    // Pre-allocate ExprBytecodeThunk objects for all thunk descriptors.
-    // This moves the allocation from OP_MAKE_THUNK_V2 runtime (681K+
-    // allocations per nixpkgs eval) to compile time (one per descriptor).
-    for (auto & desc : unit->thunks) {
-        if (!desc.cachedExpr) {
-            desc.cachedExpr = state.mem.exprs.add<ExprBytecodeThunk>(
-                unit, static_cast<uint32_t>(&desc - unit->thunks.data()));
-        }
-    }
-    auto t2 = Clock::now();
-
-    // Pre-allocate ExprLambdaBytecode objects for all lambda descriptors.
-    // Same pattern: saves 160K+ runtime Expr allocations per nixpkgs eval.
-    for (auto & desc : unit->lambdas) {
-        if (!desc.cachedExpr) {
-            desc.cachedExpr = state.mem.exprs.add<ExprLambdaBytecode>(
-                unit, static_cast<uint32_t>(&desc - unit->lambdas.data()));
-        }
-    }
-    auto t3 = Clock::now();
+    // Phase 3.1 lite: cachedExpr is now allocated lazily by
+    // OP_MAKE_THUNK_V2 / OP_MAKE_CLOSURE_V2 on first thunk/closure
+    // creation.  The opcode handlers store the result back into the
+    // descriptor so subsequent creations reuse the cached pointer.
+    //
+    // Skipping the eager pre-allocation here saves N allocations at
+    // compile time for descriptors that get instantiated at runtime
+    // anyway, and entirely skips the work for descriptors whose code
+    // path is never taken.  Net total allocations are the same on a
+    // full-coverage workload but the cost shifts off the cold-start
+    // critical path, where it overlaps with subsequent evaluation
+    // work rather than blocking it.
 
     if (emitPhaseTiming) {
         emitPhaseTiming->emitCoreUs        += micros(t0, t1);
-        emitPhaseTiming->preallocThunksUs  += micros(t1, t2);
-        emitPhaseTiming->preallocLambdasUs += micros(t2, t3);
         emitPhaseTiming->numInstructions      += unit->code.size();
         emitPhaseTiming->numThunkDescriptors  += unit->thunks.size();
         emitPhaseTiming->numLambdaDescriptors += unit->lambdas.size();
