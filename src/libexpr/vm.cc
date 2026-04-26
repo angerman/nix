@@ -698,9 +698,15 @@ void vmExec(
         vm.push(arg);
 
     // Frame-local aliases (updated when frames change).
+    // stackBase is hoisted from vm.frames.back().stackBaseOffset so that
+    // hot opcodes (GET_STACK_SLOT, SET_STACK_SLOT, register-form ops)
+    // can index off a register-cached local instead of paying for a
+    // vector-back access on every read.  Must be refreshed at every
+    // frame transition (push, pop, in-place replace).
     const CompilationUnit * cu = &unit;
     uint32_t ip   = startOffset;
     Env * curEnv = &env;
+    size_t stackBase = vm.frames.back().stackBaseOffset;
 
     // ------------------------------------------------------------------
     // Dispatch loop.
@@ -992,7 +998,7 @@ op_return:
         // (the bytes survive in practice but only by coincidence).
         bool wasThunkForce;
         Value * resultSlot;
-        size_t stackBase;
+        size_t outgoingBase;
         uint32_t resultStoreSlot;
         size_t resultStoreParentBase;
         PosIdx callPos;
@@ -1000,7 +1006,7 @@ op_return:
             auto & frame = vm.frames.back();
             wasThunkForce = frame.isThunkForce;
             resultSlot = frame.resultSlot;
-            stackBase = frame.stackBaseOffset;
+            outgoingBase = frame.stackBaseOffset;
             resultStoreSlot = frame.resultStoreSlot;
             resultStoreParentBase = frame.resultStoreParentBase;
             callPos = frame.callPos;
@@ -1019,7 +1025,7 @@ op_return:
             *resultSlot = *retVal;
 
         // Restore stack to frame entry point (offset-based, survives stack realloc).
-        vm.sp = vm.stack + stackBase;
+        vm.sp = vm.stack + outgoingBase;
         vm.frames.pop_back();
 
         // Iterative thunk chain resolution for thunk-force returns.
@@ -1057,6 +1063,7 @@ op_return:
                     chainFrame.upvalues = uv;
                     chainFrame.origExpr = chainExpr;
                     chainFrame.origEnv = chainEnv;
+                    stackBase = chainFrame.stackBaseOffset;
                     vm.frames.push_back(chainFrame);
                     cu = bcThunk->unit;
                     ip = td.codeOffset;
@@ -1084,6 +1091,7 @@ op_return:
         cu     = caller.unit;
         ip     = caller.ip;
         curEnv = caller.env;
+        stackBase = caller.stackBaseOffset;
 
         // ── VM-native primop continuations ──
         // Caller frame may carry a 1-based contIdx into vm.contStack
@@ -1206,6 +1214,7 @@ op_get_local_0_force:
                 cu = bcThunk->unit;
                 ip = thunkOffset;
                 curEnv = thunkEnv;
+                stackBase = vm.frames.back().stackBaseOffset;
                 DISPATCH();
             }
         }
@@ -1378,6 +1387,7 @@ op_force:
                 cu = bcThunk->unit;
                 ip = thunkOffset;
                 curEnv = thunkEnv;
+                stackBase = vm.frames.back().stackBaseOffset;
                 DISPATCH();
             }
         }
@@ -1413,6 +1423,7 @@ op_force:
                 pushThunkFrame(vm, &bodyUnit, startOffset,
                     left->lambda().env, v, pos, frameUpvalues,
                     /*origExpr=*/nullptr, thunkDesc.maxSlot);
+                stackBase = vm.frames.back().stackBaseOffset;
                 // Store arg as stack slot 0 (the parameter).
                 vm.push(right);
                 cu = &bodyUnit;
@@ -1439,6 +1450,7 @@ op_force:
                 pushThunkFrame(vm, &bodyUnit, startOffset, env2,
                     v, pos, /*upvalues=*/nullptr, /*origExpr=*/nullptr,
                     bodyUnit.thunks[bodyInfo.thunkIdx].maxSlot);
+                stackBase = vm.frames.back().stackBaseOffset;
                 if (hasFormals) vm.push(right);
                 cu = &bodyUnit;
                 ip = startOffset;
@@ -2179,11 +2191,12 @@ op_call_1:
                 // Frame depth guard
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
+            stackBase = vm.stackSize();
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
                 .ip = startOffset,
                 .env = fun->lambda().env,
-                .stackBaseOffset = vm.stackSize(),
+                .stackBaseOffset = stackBase,
                 .resultSlot = result,
                 .callPos = pos,
                 .upvalues = frameUpvalues,
@@ -2231,11 +2244,12 @@ op_call_1:
                 // Frame depth guard
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
+            stackBase = vm.stackSize();
             vm.frames.push_back(CallFrame{
                 .unit = &bodyUnit,
                 .ip = startOffset,
                 .env = env2,
-                .stackBaseOffset = vm.stackSize(),
+                .stackBaseOffset = stackBase,
                 .resultSlot = result,
                 .callPos = pos,
             });
@@ -2569,11 +2583,12 @@ op_call_1:
                 // Frame depth guard
                 if (vm.frames.size() > 65536) [[unlikely]]
                     state.error<EvalError>("infinite recursion encountered").atPos(pos).debugThrow();
+                    stackBase = vm.stackSize();
                     vm.frames.push_back(CallFrame{
                         .unit = &bodyUnit,
                         .ip = startOffset,
                         .env = env2,
-                        .stackBaseOffset = vm.stackSize(),
+                        .stackBaseOffset = stackBase,
                         .resultSlot = result,
                         .callPos = pos,
                     });
@@ -3191,7 +3206,7 @@ op_get_stack_slot:
 #endif
     {
         uint32_t slot = decodeOperand(CUR_INSTR);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         Value * v = vm.stack[base + slot];
         if (!v) [[unlikely]] {
             fprintf(stderr, "FATAL: OP_GET_STACK_SLOT(%u) is NULL at base=%zu\n",
@@ -3214,7 +3229,7 @@ op_set_stack_slot:
         // This ensures slots always contain real Value* pointers,
         // simplifying readers throughout the VM.
         v = materializeWord(state, v);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         size_t targetIdx = base + slot;
         while (vm.stackSize() <= targetIdx) {
             vm.push(&Value::vNull);
@@ -3252,7 +3267,7 @@ op_copy_to_slot:
     {
         uint32_t slot = decodeOperand(CUR_INSTR);
         Value * src = vm.pop();
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         Value * dst = vm.stack[base + slot];
         // Copy the Value data in-place, preserving the destination pointer.
         // Any upvalues that captured this Value* will see the updated data.
@@ -3300,7 +3315,7 @@ op_cell_set:
         uint32_t packed = decodeOperand(CUR_INSTR);
         uint32_t cellStackSlot = packed >> 16;
         uint32_t formalIdx = packed & 0xFFFF;
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         Value ** cell = reinterpret_cast<Value **>(vm.stack[base + cellStackSlot]);
         Value * val = vm.pop();
         cell[formalIdx] = val;
@@ -3380,7 +3395,7 @@ op_get_slot_force:
 #endif
     {
         uint32_t slot = decodeOperand(CUR_INSTR);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         Value * v = vm.stack[base + slot];
         vm.push(v);
         // Fast path: tagged scalar or already-forced.
@@ -3409,6 +3424,7 @@ op_get_slot_force:
                     thunkEnv, v, pos, frameUpvalues, thunkExpr,
                     thunkDesc.maxSlot);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
+                stackBase = vm.frames.back().stackBaseOffset;
                 DISPATCH();
             }
         }
@@ -3427,7 +3443,7 @@ op_get_slot_return:
 #endif
     {
         uint32_t slot = decodeOperand(CUR_INSTR);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         vm.push(vm.stack[base + slot]);
         goto op_return;  // reuse OP_RETURN's frame-pop logic
     }
@@ -3469,6 +3485,7 @@ op_get_uv_force:
                     thunkEnv, v, pos, frameUpvalues, thunkExpr,
                     thunkDesc.maxSlot);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
+                stackBase = vm.frames.back().stackBaseOffset;
                 DISPATCH();
             }
         }
@@ -3488,7 +3505,7 @@ op_slot_slot_call1:
         uint32_t operand = decodeOperand(CUR_INSTR);
         uint32_t funcSlot = operand >> 12;
         uint32_t argSlot = operand & 0xFFF;
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         // Push fun and arg onto operand stack, then let OP_CALL_1 handle
         // all the dispatch logic (v2 closures, v1 closures, primops, etc.)
         // This saves 2 dispatches (the two GET_STACK_SLOT) while reusing
@@ -3510,7 +3527,7 @@ op_mov_slots:
         uint32_t operand = decodeOperand(CUR_INSTR);
         uint32_t srcSlot = operand >> 12;
         uint32_t dstSlot = operand & 0xFFF;
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         // Auto-extend stack if dstSlot is beyond current end.
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
@@ -3535,7 +3552,7 @@ op_rforce_from:
         uint32_t operand = decodeOperand(CUR_INSTR);
         uint32_t dstSlot = operand >> 16;
         uint32_t srcSlot = operand & 0xFFFF;
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         Value * v = vm.stack[base + srcSlot];
 
         // Auto-extend stack if dstSlot beyond current end.
@@ -3581,6 +3598,7 @@ op_rforce_from:
                     thunkEnv, v, pos, frameUpvalues, thunkExpr,
                     thunkDesc.maxSlot);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
+                stackBase = vm.frames.back().stackBaseOffset;
                 DISPATCH();
             }
         }
@@ -3604,7 +3622,7 @@ op_rget_uv_to:
         uint32_t uvIdx = operand & 0xFFFF;
         Value ** upvalues = vm.frames.back().upvalues;
         assert(upvalues && "OP_RGET_UV_TO: no upvalue array");
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         // Auto-extend stack.
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
@@ -3625,7 +3643,7 @@ op_ruvf_to:
         uint32_t uvIdx = operand & 0xFFFF;
         Value ** upvalues = vm.frames.back().upvalues;
         assert(upvalues && "OP_RUVF_TO: no upvalue array");
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         Value * v = upvalues[uvIdx];
 
         // Auto-extend stack.
@@ -3662,6 +3680,7 @@ op_ruvf_to:
                     thunkEnv, v, pos, frameUpvalues, thunkExpr,
                     thunkDesc.maxSlot);
                 cu = bcThunk->unit; ip = thunkOffset; curEnv = thunkEnv;
+                stackBase = vm.frames.back().stackBaseOffset;
                 DISPATCH();
             }
         }
@@ -3688,7 +3707,7 @@ op_radd_r:
         uint8_t dstSlot = bytecode::unpackDst(operand);
         uint8_t lhsSlot = bytecode::unpackA(operand);
         uint8_t rhsSlot = bytecode::unpackB(operand);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         // Auto-extend stack for dst.
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
@@ -3740,7 +3759,7 @@ op_rsub_r:
         uint8_t dstSlot = bytecode::unpackDst(operand);
         uint8_t lhsSlot = bytecode::unpackA(operand);
         uint8_t rhsSlot = bytecode::unpackB(operand);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         Value * lhs = vm.stack[base + lhsSlot];
@@ -3790,7 +3809,7 @@ op_rmul_r:
         uint8_t dstSlot = bytecode::unpackDst(operand);
         uint8_t lhsSlot = bytecode::unpackA(operand);
         uint8_t rhsSlot = bytecode::unpackB(operand);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         Value * lhs = vm.stack[base + lhsSlot];
@@ -3840,7 +3859,7 @@ op_rless_r:
         uint8_t dstSlot = bytecode::unpackDst(operand);
         uint8_t lhsSlot = bytecode::unpackA(operand);
         uint8_t rhsSlot = bytecode::unpackB(operand);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         Value * lhs = vm.stack[base + lhsSlot];
@@ -3887,7 +3906,7 @@ op_req_r:
         uint8_t dstSlot = bytecode::unpackDst(operand);
         uint8_t lhsSlot = bytecode::unpackA(operand);
         uint8_t rhsSlot = bytecode::unpackB(operand);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
         Value * lhs = vm.stack[base + lhsSlot];
@@ -3946,7 +3965,7 @@ op_rcall1_r:
         uint8_t dstSlot = bytecode::unpackDst(operand);
         uint8_t funcSlot = bytecode::unpackA(operand);
         uint8_t argSlot = bytecode::unpackB(operand);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
 
         Value * fun = vm.stack[base + funcSlot];
         Value * arg = vm.stack[base + argSlot];
@@ -3985,7 +4004,8 @@ op_rcall1_r:
             newFrame.unit = &bodyUnit;
             newFrame.ip = startOffset;
             newFrame.env = fun->lambda().env;
-            newFrame.stackBaseOffset = vm.stackSize();
+            stackBase = vm.stackSize();
+            newFrame.stackBaseOffset = stackBase;
             // Skip allocValue: when resultStoreSlot is set, OP_RETURN
             // delivers retVal pointer directly to the parent's slot.
             // Saves one Value alloc per fast-path call.
@@ -4026,7 +4046,7 @@ op_rattr_self_r:
         uint8_t dstSlot = bytecode::unpackDst(operand);
         uint8_t attrsSlot = bytecode::unpackA(operand);
         uint8_t cacheIdx = bytecode::unpackB(operand);
-        size_t base = vm.frames.back().stackBaseOffset;
+        size_t base = stackBase;
         size_t needed = base + dstSlot + 1;
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
 
