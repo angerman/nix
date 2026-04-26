@@ -248,6 +248,48 @@ static void traceInstruction(
         case OP_SLOT_SLOT_CALL1:
             fprintf(stderr, " func=%u arg=%u", operand >> 12, operand & 0xFFF);
             break;
+        case OP_GET_SLOT_FORCE:
+        case OP_GET_SLOT_RETURN:
+        case OP_GET_UV_FORCE:
+            fprintf(stderr, " idx=%u", operand);
+            break;
+        case OP_MOV_SLOTS:
+            fprintf(stderr, " src=%u dst=%u", operand >> 12, operand & 0xFFF);
+            break;
+        case OP_RFORCE_FROM:
+        case OP_RGET_UV_TO:
+        case OP_RUVF_TO:
+            fprintf(stderr, " dst=%u src=%u", operand >> 16, operand & 0xFFFF);
+            break;
+        case OP_RADD_R:
+        case OP_RSUB_R:
+        case OP_RMUL_R:
+        case OP_RLESS_R:
+        case OP_REQ_R:
+            fprintf(stderr, " dst=%u lhs=%u rhs=%u",
+                bytecode::unpackDst(operand),
+                bytecode::unpackA(operand),
+                bytecode::unpackB(operand));
+            break;
+        case OP_RATTR_SELF_R:
+            fprintf(stderr, " dst=%u attrs=%u cacheIdx=%u",
+                bytecode::unpackDst(operand),
+                bytecode::unpackA(operand),
+                bytecode::unpackB(operand));
+            break;
+        case OP_RCALL1_R:
+            fprintf(stderr, " dst=%u func=%u arg=%u",
+                bytecode::unpackDst(operand),
+                bytecode::unpackA(operand),
+                bytecode::unpackB(operand));
+            break;
+        case OP_ATTR_SELECT_CACHED:
+        case OP_ATTR_SELECT_FORCE_CACHED:
+            fprintf(stderr, " cacheIdx=%u", operand);
+            break;
+        case OP_ALLOC_CELL:
+            fprintf(stderr, " size=%u", operand);
+            break;
         default:
             if (operand) fprintf(stderr, " %u", operand);
             break;
@@ -860,6 +902,10 @@ op_nop:
     case OP_NOP:
 #endif
     {
+        // OP_NOP is normally a data word for OP_MAKE_*_V2 / OP_ATTRS_INIT
+        // (consumed via `cu->code[ip++]` in those handlers).  In rare
+        // cases (e.g. unit tests) it appears as a real instruction at
+        // a code offset; treat it as a true no-op.
         DISPATCH();
     }
 
@@ -925,13 +971,26 @@ op_return:
     {
         Value * retVal = vm.pop();
 
-        // Save frame state before popping (pop invalidates references).
-        auto & frame = vm.frames.back();
-        bool wasThunkForce = frame.isThunkForce;
-        Value * resultSlot = frame.resultSlot;
-        size_t stackBase = frame.stackBaseOffset;
-        uint32_t resultStoreSlot = frame.resultStoreSlot;
-        size_t resultStoreParentBase = frame.resultStoreParentBase;
+        // Snapshot frame fields BEFORE pop_back / push_back below — both
+        // can invalidate the reference (push_back may reallocate the
+        // frames vector storage; pop_back leaves frame past-the-end).
+        // Reading `frame.callPos` after pop_back is UB in standard C++
+        // (the bytes survive in practice but only by coincidence).
+        bool wasThunkForce;
+        Value * resultSlot;
+        size_t stackBase;
+        uint32_t resultStoreSlot;
+        size_t resultStoreParentBase;
+        PosIdx callPos;
+        {
+            auto & frame = vm.frames.back();
+            wasThunkForce = frame.isThunkForce;
+            resultSlot = frame.resultSlot;
+            stackBase = frame.stackBaseOffset;
+            resultStoreSlot = frame.resultStoreSlot;
+            resultStoreParentBase = frame.resultStoreParentBase;
+            callPos = frame.callPos;
+        }
 
         // Materialize tagged immediates before writing to resultSlot
         // (which is a real heap-allocated Value).
@@ -961,6 +1020,12 @@ op_return:
                     if (td.nUpvalues > 0)
                         uv = reinterpret_cast<Value **>(chainEnv->values[1]);
 
+                    // Frame-depth guard: chain hops can recurse unbounded
+                    // for pathological aliases like `let a=b; b=c; ...`.
+                    if (vm.frames.size() > 65536) [[unlikely]]
+                        state.error<EvalError>("infinite recursion encountered")
+                            .atPos(callPos).debugThrow();
+
                     resultSlot->mkBlackhole();
                     vm.frames.push_back(CallFrame{
                         .unit = bcThunk->unit,
@@ -968,7 +1033,7 @@ op_return:
                         .env = chainEnv,
                         .stackBaseOffset = vm.stackSize(),
                         .resultSlot = resultSlot,
-                        .callPos = frame.callPos,
+                        .callPos = callPos,
                         .isThunkForce = true,
                         .upvalues = uv,
                     });
@@ -979,7 +1044,7 @@ op_return:
                 }
             }
             // Non-bytecode thunk or App chain: delegate to forceValue.
-            state.forceValue(*resultSlot, frame.callPos);
+            state.forceValue(*resultSlot, callPos);
         }
 
         if (vm.frames.size() <= entryFrameDepth) {
@@ -1008,7 +1073,7 @@ op_return:
                 if (cont.index < cont.count) {
                     // More elements: trigger next call f(list[index]).
                     vm.push(cont.func);
-                    vm.push(cont.inputElems[cont.index]);
+                    vm.push(cont.list->listView()[cont.index]);
                     goto op_call_1;
                 }
 
@@ -1018,7 +1083,12 @@ op_return:
                 for (uint32_t i = 0; i < cont.count; i++)
                     listBuilder[i] = cont.results[i];
                 listVal->mkList(listBuilder);
+                // Clear cont state for hygiene (no stale GC roots).
                 cont.kind = ContKind::None;
+                cont.func = nullptr;
+                cont.list = nullptr;
+                cont.results = nullptr;
+                cont.inputElems = nullptr;
                 vm.push(listVal);
                 DISPATCH();
             }
@@ -2261,11 +2331,15 @@ op_call_1:
 
             if (argsLeft == 1) {
                 // ── VM-native continuation for builtins.map ──
-                // Detect the saturating call to map with both args ready.
-                // Instead of calling prim_map (which creates lazy App
-                // thunks → frame depth issues), set up a Map continuation
-                // and apply f to each element within the current vmExec.
-                if (fn->arity == 2 && fn->name == "map") {
+                // DISABLED by default: eager evaluation of map elements
+                // breaks `take 1 (map throw xs)` and similar lazy-take
+                // patterns common in nixpkgs' module system.  The proper
+                // fix is a thunk-creating continuation that defers each
+                // f(list[i]) until the consumer forces it.  Until then,
+                // gate behind NIX_VM_NATIVE_MAP=1 for benchmarking.
+                static const bool nativeMap =
+                    getenv("NIX_VM_NATIVE_MAP") != nullptr;
+                if (nativeMap && fn->arity == 2 && fn->name == "map") {
                     Value * f = fun->primOpApp().right;
                     state.forceList(*arg, pos, "while evaluating the second argument of builtins.map");
                     auto listView = arg->listView();
@@ -2279,14 +2353,7 @@ op_call_1:
                         DISPATCH();
                     }
 
-                    // Copy listElems into a Value** array (we need to
-                    // index by integer for the continuation).
-                    auto * inputCopy = static_cast<Value **>(
-                        GC_MALLOC(listSize * sizeof(Value *)));
-                    for (size_t i = 0; i < listSize; i++)
-                        inputCopy[i] = listView[i];
-
-                    // Set up Map continuation in the current frame.
+                    // Index listView[i] directly — no need to copy.
                     auto * results = static_cast<Value **>(
                         GC_MALLOC(listSize * sizeof(Value *)));
                     auto & frame = vm.frames.back();
@@ -2295,11 +2362,11 @@ op_call_1:
                     frame.cont.count = static_cast<uint32_t>(listSize);
                     frame.cont.func = f;
                     frame.cont.results = results;
-                    frame.cont.inputElems = inputCopy;
+                    frame.cont.list = arg;
 
                     // Trigger the first call: f(list[0]).
                     vm.push(f);
-                    vm.push(inputCopy[0]);
+                    vm.push(listView[0]);
                     goto op_call_1;
                 }
 

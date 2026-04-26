@@ -1660,6 +1660,16 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                     callResult, upvalues, args[0]);
                 vCur = callResult;
 
+                // The bytecode VM's OP_RETURN does NOT force its return
+                // value (lazy by default); the tree-walker's lambda body
+                // eval DOES force via ExprVar::eval / ExprSelect::eval /
+                // etc.  callFunction's outer loop dispatches on vCur's
+                // type — a still-thunked vCur trips the "not a function"
+                // error a few iterations later (the recent RCALL1_R bug).
+                // Force here to match the tree-walker contract.
+                if (args.size() > 0)
+                    forceValue(vCur, pos);
+
                 args = args.subspan(1);
                 continue;
             }
@@ -1927,6 +1937,11 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                 e.addTrace(positions[pos], "while calling a functor (an attribute set with a '__functor' attribute)");
                 throw;
             }
+            // Force the result so the next iteration of the loop can
+            // dispatch on its type.  The recursive callFunction may have
+            // taken the bytecoded v2 path which doesn't force its return.
+            if (args.size() > 1)
+                forceValue(vCur, pos);
             args = args.subspan(1);
         }
 

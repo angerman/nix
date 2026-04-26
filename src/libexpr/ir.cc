@@ -1412,11 +1412,15 @@ IRModule lower(EvalState & state, Expr * expr)
 
     // Optimization pass: eliminate IRMkThunk wrappers whose result is
     // statically guaranteed to be forced (or whose body is trivially
-    // cheap to evaluate eagerly).  Opt-in via NIX_VM_STRICTNESS=1 — on
-    // simple nixpkgs#hello.name evaluation the pass's compile-time cost
-    // currently exceeds the runtime savings from eliminating ~15% of
-    // thunks.  Useful for workloads with heavy let-binding chains and
-    // worth keeping on hand for further development.
+    // cheap to evaluate eagerly).  Opt-in via NIX_VM_STRICTNESS=1.
+    //
+    // KNOWN UNSOUND for the trivial-body bypass: inlining IRForce /
+    // IRPrimOpCall / IRAttrSelect when not statically demanded changes
+    // observable behavior of `tryEval`, `or default`, `builtins.trace`,
+    // and missing-attr fallbacks.  Also marks TermReturn strict in
+    // lambda bodies that legitimately return un-forced thunks.  Do not
+    // enable in production until the pass is redesigned (preferably as
+    // emitter-side slot fusion rather than IR rewriting).
     if (getenv("NIX_VM_STRICTNESS"))
         runStrictnessPass(module);
 
