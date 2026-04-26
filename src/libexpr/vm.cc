@@ -3231,9 +3231,12 @@ op_set_stack_slot:
         v = materializeWord(state, v);
         size_t base = stackBase;
         size_t targetIdx = base + slot;
-        while (vm.stackSize() <= targetIdx) {
-            vm.push(&Value::vNull);
-        }
+        // Bulk-grow the stack instead of per-element push() loop:
+        // ensureCapacity() runs grow() at most once and fills the gap
+        // with vNull in a tight loop, vs. the previous N separate
+        // bound-check+push iterations.  Identified as a hot
+        // SET_STACK_SLOT cost by the bottleneck profiler (B1).
+        vm.ensureCapacity(targetIdx + 1, const_cast<Value *>(&Value::vNull));
         vm.stack[targetIdx] = v;
         DISPATCH();
     }
