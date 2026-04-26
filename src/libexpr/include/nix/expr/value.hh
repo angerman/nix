@@ -1220,6 +1220,17 @@ public:
         return isa<tApp>();
     }
 
+    /// Combined type test for "thunk-like" values that the bytecode
+    /// VM forces.  Relies on tApp (=11) and tThunk (=12) being
+    /// adjacent in InternalType and uses unsigned underflow so a single
+    /// `(t - tApp) <= 1` test covers both.  Profiles MUCH better than
+    /// `isThunk() || isApp()` on the OP_FORCE hot path because the
+    /// compiler doesn't always CSE the two getInternalType() loads.
+    inline bool isThunkOrApp() const noexcept
+    {
+        return (static_cast<uint8_t>(getInternalType()) - tApp) <= 1u;
+    }
+
     inline bool isBlackhole() const;
 
     // type() == nFunction

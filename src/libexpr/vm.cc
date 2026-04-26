@@ -1034,7 +1034,7 @@ op_return:
         // was just popped).  Each chain link runs as: push → body →
         // OP_RETURN → pop → check → push next.  Frame depth stays at
         // original + 1, matching the tree-walker's iterative forceValue.
-        if (wasThunkForce && (resultSlot->isThunk() || resultSlot->isApp())) {
+        if (wasThunkForce && (resultSlot->isThunkOrApp())) {
             if (resultSlot->isThunk()) {
                 Env * chainEnv = resultSlot->thunk().env;
                 Expr * chainExpr = resultSlot->thunk().expr;
@@ -1174,7 +1174,7 @@ op_get_local_0_force:
         // Fast path: tagged scalars or already-forced values.
         if (nanbox::isTagged(v)) [[likely]]
             DISPATCH();
-        if (!v->isThunk() && !v->isApp()) [[likely]]
+        if (!v->isThunkOrApp()) [[likely]]
             DISPATCH();
         PosIdx pos = cu->posForOffset(ip - 1);
 
@@ -1220,7 +1220,7 @@ op_get_local_0_force:
         }
 
         // Fallback for non-bytecoded thunks, apps, non-thunks.
-        if (v->isThunk() || v->isApp()) vm.nrForceFallbacks++;
+        if (v->isThunkOrApp()) vm.nrForceFallbacks++;
         state.forceValue(*v, pos);
         DISPATCH();
     }
@@ -1350,7 +1350,7 @@ op_force:
 
         // Fast path: value is already forced (most common case).
         // Skip all branch checks for ints, strings, attrsets, lists, etc.
-        if (!v->isThunk() && !v->isApp()) [[likely]]
+        if (!v->isThunkOrApp()) [[likely]]
             DISPATCH();
 
         PosIdx pos = cu->posForOffset(ip - 1);
@@ -1460,7 +1460,7 @@ op_force:
         }
 
         // Fallback for non-bytecoded thunks, remaining apps, non-thunks.
-        if (v->isThunk() || v->isApp()) vm.nrForceFallbacks++;
+        if (v->isThunkOrApp()) vm.nrForceFallbacks++;
         state.forceValue(*v, pos);
         DISPATCH();
     }
@@ -2662,7 +2662,7 @@ op_tail_call_1:
         PosIdx pos = cu->posForOffset(ip - 1);
         fun = materializeWord(state, fun);
         arg = materializeWord(state, arg);
-        if (fun->isThunk() || fun->isApp()) [[unlikely]]
+        if (fun->isThunkOrApp()) [[unlikely]]
             state.forceValue(*fun, pos);
 
         if (fun->isLambda() && fun->lambda().fun->isBytecodeProxy) {
@@ -2771,7 +2771,7 @@ op_attr_select_cached:
         // Fast path: if attrs is already a forced attrset, skip
         // forceAttrs (avoids the virtual call + posForOffset for the
         // common case where the value was already evaluated).
-        if (attrs->isThunk() || attrs->isApp()) [[unlikely]]
+        if (attrs->isThunkOrApp()) [[unlikely]]
             state.forceAttrs(*attrs, cu->posForOffset(ip - 1),
                 "while selecting an attribute");
         else if (attrs->type() != nAttrs) [[unlikely]]
@@ -2828,7 +2828,7 @@ op_attr_select_force_cached:
         // Skip forceAttrs for the common case where attrs is already
         // a forced attrset.  Saves the virtual call + posForOffset
         // binary search in the hot path.
-        if (attrs->isThunk() || attrs->isApp()
+        if (attrs->isThunkOrApp()
             || attrs->type() != nAttrs) [[unlikely]]
             state.forceAttrs(*attrs, cu->posForOffset(ip - 1),
                 "while selecting an attribute");
@@ -2868,7 +2868,7 @@ op_attr_select_force_cached:
 
         // Replace top of stack and force the result inline.
         *(vm.sp - 1) = selected;
-        if (!selected->isThunk() && !selected->isApp()) [[likely]]
+        if (!selected->isThunkOrApp()) [[likely]]
             DISPATCH();
         // Slow path: force the value.
         state.forceValue(*selected, cu->posForOffset(ip - 1));
@@ -3401,7 +3401,7 @@ op_get_slot_force:
         // Fast path: tagged scalar or already-forced.
         if (nanbox::isTagged(v)) [[likely]]
             DISPATCH();
-        if (!v->isThunk() && !v->isApp()) [[likely]]
+        if (!v->isThunkOrApp()) [[likely]]
             DISPATCH();
         PosIdx pos = cu->posForOffset(ip - 1);
 
@@ -3462,7 +3462,7 @@ op_get_uv_force:
         Value * v = upvalues[idx];
         vm.push(v);
         // Fast path: already forced.
-        if (!v->isThunk() && !v->isApp()) [[likely]]
+        if (!v->isThunkOrApp()) [[likely]]
             DISPATCH();
         PosIdx pos = cu->posForOffset(ip - 1);
 
@@ -3560,7 +3560,7 @@ op_rforce_from:
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
 
         // Fast path: already forced.
-        if (!v->isThunk() && !v->isApp()) [[likely]] {
+        if (!v->isThunkOrApp()) [[likely]] {
             vm.stack[base + dstSlot] = v;
             DISPATCH();
         }
@@ -3651,7 +3651,7 @@ op_ruvf_to:
         vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
 
         // Fast path: already forced.
-        if (!v->isThunk() && !v->isApp()) [[likely]] {
+        if (!v->isThunkOrApp()) [[likely]] {
             vm.stack[base + dstSlot] = v;
             DISPATCH();
         }
@@ -3972,7 +3972,7 @@ op_rcall1_r:
         PosIdx pos = cu->posForOffset(ip - 1);
 
         fun = materializeWord(state, fun);
-        if (fun->isThunk() || fun->isApp()) [[unlikely]]
+        if (fun->isThunkOrApp()) [[unlikely]]
             state.forceValue(*fun, pos);
 
         // ── Fast path: v2 closure ──
@@ -4135,7 +4135,7 @@ op_rattr_self_r:
 
         // Force attrs if needed.
         if (!nanbox::isTagged(attrs)
-            && (attrs->isThunk() || attrs->isApp())) {
+            && (attrs->isThunkOrApp())) {
             state.forceValue(*attrs, pos);
             // Re-read since forceValue may have updated.
             attrs = vm.stack[base + attrsSlot];
@@ -4182,7 +4182,7 @@ op_rattr_self_r:
 
         // Force the selected value if it's a thunk.
         if (!nanbox::isTagged(selected)
-            && (selected->isThunk() || selected->isApp())) {
+            && (selected->isThunkOrApp())) {
             state.forceValue(*selected, pos);
         }
 
