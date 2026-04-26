@@ -19,6 +19,7 @@
 
 namespace nix::ir {
 struct IRModule;
+struct IRFormals;
 }
 
 namespace nix {
@@ -511,14 +512,17 @@ struct PosEntry
 // Thunk and Lambda descriptors
 // ---------------------------------------------------------------------------
 
-/// Phase 3.1f-5: Snapshot of compile-time state needed to lazily
+/// Phase 3.1f-5/7: Snapshot of compile-time state needed to lazily
 /// realize a deferred thunk/lambda body.  Allocated on the descriptor
 /// when state == Pending; freed (set to nullptr) once the body
 /// has been emitted and state transitions to Compiled.
 ///
-/// Conservatively limited to the simple non-cell-capture case for
-/// now — sites with parent.blockCellMap or parent.cellRefs interaction
-/// keep the eager path until Phase 3.1f-7 lands the cell snapshot.
+/// Two encoding modes:
+///  - Simple (Phase 3.1f-6): cellFreeVars empty; freeVarsSorted holds
+///    the upvalue list.  upvalueSlots[fv[i]] = i.
+///  - Cell-capture (Phase 3.1f-7): cellFreeVars non-empty.  The body's
+///    BlockContext receives both cellRefs (from cellFreeVars) and
+///    upvalueSlots (from nonCellFreeVars starting at nextInnerUv).
 struct DeferredEmitState
 {
     /// IR block id whose body to emit when realized.
@@ -526,7 +530,30 @@ struct DeferredEmitState
     /// Free variables in the original sorted order; used to rebuild
     /// the sub-block's upvalueSlots map (varId → upvalueIdx) at
     /// emit time.  Stored by-value for self-containment.
+    /// (Used by the simple path AND as the second-half upvalue
+    /// assignment for the cell-capture path's non-cell free vars.)
     std::vector<uint32_t> freeVarsSorted;
+
+    /// Cell-capture mode (Phase 3.1f-7).  Empty for the simple path.
+    /// Each entry maps a parent-cell-resident varId to its inner upvalue
+    /// index and entry index within the captured cell.
+    struct CellRefSnap {
+        uint32_t varId;
+        uint32_t innerUv;
+        uint32_t entryIdx;
+    };
+    std::vector<CellRefSnap> cellFreeVars;
+
+    /// Cell-capture mode (Phase 3.1f-7).  Starting upvalue index for
+    /// the non-cell free vars; cell captures occupy [0, nextInnerUv).
+    uint32_t nextInnerUv = 0;
+
+    /// Formals-lambda mode (Phase 3.1f-9).  Non-null iff this descriptor
+    /// holds a deferred lambda body that needs the formals prologue
+    /// emitted when realized.  Points into the pinned IRModule (3.1f-1)
+    /// — valid for the lifetime of the CompilationUnit.  Cleared once
+    /// the prologue has been emitted (state → Compiled).
+    const ir::IRFormals * formals = nullptr;
 };
 
 /// Identifies a lazy sub-expression (thunk body) within a CompilationUnit.

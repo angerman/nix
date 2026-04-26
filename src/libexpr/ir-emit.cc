@@ -105,12 +105,13 @@ class IREmitter
     /// Used to patch forward jumps.
     std::unordered_map<ir::BlockId, uint32_t> blockOffsets;
 
+public:
     /// Maximum slot used by the most recently emitted sub-block.
     /// Set by emitSubBlock / emitSubBlockWithFormals; consumed by the
     /// IRMkThunk / IRLambda emitter to populate ThunkDescriptor.maxSlot.
+    /// Also read by lazyEmitThunkBody (Phase 3.1f-6).
     uint16_t lastSubBlockMaxSlot = 0;
 
-public:
     IREmitter(EvalState & state, CompilationUnit & unit, const ir::IRModule & module)
         : state(state)
         , unit(unit)
@@ -119,6 +120,29 @@ public:
 
     /// Emit the entire module.  Entry block is block 0.
     void emit();
+
+    /// Phase 3.1f-4: Emit JUST the body of a sub-block (no jump-over,
+    /// no parent-flow management).  Public so the lazy-emit path
+    /// (Phase 3.1f-6) can call it from a fresh emitter at first force.
+    /// See the private declaration below for parameters.
+    uint32_t emitBlockOnly(
+        ir::BlockId blockId,
+        const ir::FreeVars & freeVars);
+
+    /// Phase 3.1f-7: public wrapper around emitBlock for the cell-capture
+    /// lazy-emit path.  The caller is responsible for constructing a
+    /// suitable BlockContext (cellRefs + upvalueSlots populated).
+    void emitBlockPublic(const ir::IRBlock & block, BlockContext & ctx)
+    {
+        emitBlock(block, ctx);
+    }
+
+    /// Phase 3.1f-9: public wrapper around emitFormalsBodyOnly for the
+    /// formals-lambda lazy-emit path.  Defined out-of-line below.
+    uint32_t emitFormalsBodyPublic(
+        ir::BlockId blockId,
+        const ir::FreeVars & freeVars,
+        const ir::IRFormals & params);
 
 private:
     /// Emit a single block's bindings + terminal.
@@ -147,16 +171,6 @@ private:
         const ir::FreeVars & freeVars,
         BlockContext & parentCtx);
 
-    /// Phase 3.1f-4: Emit JUST the body of a sub-block (no jump-over,
-    /// no parent-flow management).  The caller is responsible for
-    /// either wrapping it with OP_JUMP (eager path, used by
-    /// emitSubBlock) or appending it to the end of unit.code (lazy
-    /// emit path, used at first force).  Returns the code offset
-    /// where the body begins.  Also updates lastSubBlockMaxSlot.
-    uint32_t emitBlockOnly(
-        ir::BlockId blockId,
-        const ir::FreeVars & freeVars);
-
     /// Emit an inline block (for if-branches, with bodies, etc).
     /// These share the parent frame's stack slots; no upvalue capture.
     /// Returns the code offset where the block begins.
@@ -181,6 +195,14 @@ private:
         const ir::FreeVars & freeVars,
         const ir::IRFormals & params,
         BlockContext & parentCtx);
+
+    /// Phase 3.1f-9: emit the formals prologue + body at the END of
+    /// unit.code (no jump-over wrapping).  Used by both the eager
+    /// path (via emitSubBlockWithFormals) and the lazy-emit path.
+    uint32_t emitFormalsBodyOnly(
+        ir::BlockId blockId,
+        const ir::FreeVars & freeVars,
+        const ir::IRFormals & params);
 };
 
 
@@ -1161,26 +1183,72 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 // Normal path: no cell capture needed.
                 uint32_t bodyOffset;
                 uint16_t envSize;
+                uint16_t bodyMaxSlot = 0;
 
-                if (hasFormals) {
+                // Phase 3.1f-8: defer non-formals lambda bodies when
+                // NIX_VM_V2_LAZY_EMIT=1 and the CU's IRModule is pinned.
+                // Formals lambdas keep the eager path until 3.1f-9
+                // because their inline prologue is order-sensitive.
+                static const bool lazyEmitLambda =
+                    ::getenv("NIX_VM_V2_LAZY_EMIT") != nullptr
+                    && std::string(::getenv("NIX_VM_V2_LAZY_EMIT")) == "1";
+                bool deferThis = lazyEmitLambda
+                    && unit.irModule
+                    && !hasFormals;
+
+                // Phase 3.1f-9: also defer formals-lambda bodies.
+                bool deferFormals = lazyEmitLambda
+                    && unit.irModule
+                    && hasFormals;
+
+                if (hasFormals && !deferFormals) {
                     bodyOffset = emitSubBlockWithFormals(
                         e.bodyBlock, e.freeVars, e.params, ctx);
                     envSize = 1 + static_cast<uint16_t>(e.params.formals.size());
-                } else {
+                    bodyMaxSlot = lastSubBlockMaxSlot;
+                } else if (hasFormals /* && deferFormals */) {
+                    // Pending formals lambda.  envSize covers the raw
+                    // attrset slot + each formal, mirroring the eager
+                    // path's allocation.
+                    bodyOffset = 0;
+                    envSize = 1 + static_cast<uint16_t>(e.params.formals.size());
+                } else if (!deferThis) {
                     bodyOffset = emitSubBlock(e.bodyBlock, e.freeVars, ctx);
+                    auto & bodyBlock = module.blocks[e.bodyBlock];
+                    envSize = static_cast<uint16_t>(bodyBlock.params.size());
+                    bodyMaxSlot = lastSubBlockMaxSlot;
+                } else {
+                    // Pending: codeOffset placeholder, envSize derivable
+                    // from the IR block's param count.
+                    bodyOffset = 0;
                     auto & bodyBlock = module.blocks[e.bodyBlock];
                     envSize = static_cast<uint16_t>(bodyBlock.params.size());
                 }
 
                 uint32_t lambdaIdx = static_cast<uint32_t>(unit.lambdas.size());
                 uint32_t bodyThunkIdx = static_cast<uint32_t>(unit.thunks.size());
-                unit.thunks.push_back(ThunkDescriptor{
+                ThunkDescriptor td{
                     .codeOffset = bodyOffset,
                     .pos = e.pos,
                     .sourceExpr = nullptr,
                     .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
-                    .maxSlot = lastSubBlockMaxSlot,
-                });
+                    .maxSlot = bodyMaxSlot,
+                };
+                if (deferThis || deferFormals) {
+                    td.state = ThunkDescriptor::State::Pending;
+                    td.bodyBlockId = e.bodyBlock;
+                    td.deferredState = std::make_shared<DeferredEmitState>();
+                    td.deferredState->bodyBlockId = e.bodyBlock;
+                    td.deferredState->freeVarsSorted.assign(
+                        e.freeVars.vars.begin(), e.freeVars.vars.end());
+                    if (deferFormals) {
+                        // Phase 3.1f-9: snapshot formals pointer.
+                        // The IRModule is pinned, so &e.params is
+                        // stable for the CU's lifetime.
+                        td.deferredState->formals = &e.params;
+                    }
+                }
+                unit.thunks.push_back(std::move(td));
 
                 Formals * formals = nullptr;
                 // Register name/arg in the symbol pool — same fix as
@@ -1336,34 +1404,72 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 uint32_t nNonCell = static_cast<uint32_t>(nonCellFreeVars.size());
                 uint32_t totalUpvalues = nextInnerUv + nNonCell;
 
-                // Build cell-aware sub-block context.
-                const auto & bodyBlock = module.blocks[e.bodyBlock];
-                BlockContext subCtx;
-                for (auto & [varId, innerUv, entryIdx] : cellFreeVars)
-                    subCtx.cellRefs[varId] = {innerUv, entryIdx};
-                uint32_t uvIdx = nextInnerUv;
-                for (auto fv : nonCellFreeVars.vars)
-                    subCtx.upvalueSlots[fv] = uvIdx++;
-                for (auto p : bodyBlock.params)
-                    subCtx.allocSlot(p);
+                // Phase 3.1f-7: gate the cell-capture path on the same
+                // lazy-emit flag as the simple path.  When deferred, we
+                // skip the body emit AND the surrounding jump-over, and
+                // record a DeferredEmitState rich enough to rebuild the
+                // cell-aware BlockContext at first force.
+                static const bool lazyEmitCells =
+                    ::getenv("NIX_VM_V2_LAZY_EMIT") != nullptr
+                    && std::string(::getenv("NIX_VM_V2_LAZY_EMIT")) == "1";
+                bool deferThis = lazyEmitCells && unit.irModule;
 
-                // Emit the sub-block body.
-                uint32_t jumpOver = unit.emit(OP_JUMP, 0);
-                uint32_t bodyOffset = static_cast<uint32_t>(unit.code.size());
-                emitBlock(bodyBlock, subCtx);
-                unit.patchJump(jumpOver);
+                uint32_t bodyOffset = 0;
+                uint16_t maxSlot = 0;
+
+                if (!deferThis) {
+                    // Build cell-aware sub-block context.
+                    const auto & bodyBlock = module.blocks[e.bodyBlock];
+                    BlockContext subCtx;
+                    for (auto & [varId, innerUv, entryIdx] : cellFreeVars)
+                        subCtx.cellRefs[varId] = {innerUv, entryIdx};
+                    uint32_t uvIdx = nextInnerUv;
+                    for (auto fv : nonCellFreeVars.vars)
+                        subCtx.upvalueSlots[fv] = uvIdx++;
+                    for (auto p : bodyBlock.params)
+                        subCtx.allocSlot(p);
+
+                    // Emit the sub-block body.
+                    uint32_t jumpOver = unit.emit(OP_JUMP, 0);
+                    bodyOffset = static_cast<uint32_t>(unit.code.size());
+                    emitBlock(bodyBlock, subCtx);
+                    unit.patchJump(jumpOver);
+                    maxSlot = static_cast<uint16_t>(
+                        subCtx.nextSlot > 0xFFFF ? 0xFFFF : subCtx.nextSlot);
+                }
 
                 // Register thunk descriptor.
                 uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
-                unit.thunks.push_back(ThunkDescriptor{
+                ThunkDescriptor td{
                     .codeOffset = bodyOffset,
                     .pos = e.pos,
                     .sourceExpr = e.sourceExpr,
                     .nUpvalues = static_cast<uint16_t>(totalUpvalues),
-                });
+                    .maxSlot = maxSlot,
+                };
+                if (deferThis) {
+                    td.state = ThunkDescriptor::State::Pending;
+                    td.bodyBlockId = e.bodyBlock;
+                    td.deferredState = std::make_shared<DeferredEmitState>();
+                    td.deferredState->bodyBlockId = e.bodyBlock;
+                    // Cell-capture snapshot.
+                    td.deferredState->cellFreeVars.reserve(cellFreeVars.size());
+                    for (auto & [varId, innerUv, entryIdx] : cellFreeVars) {
+                        td.deferredState->cellFreeVars.push_back(
+                            {static_cast<uint32_t>(varId),
+                             innerUv, entryIdx});
+                    }
+                    td.deferredState->nextInnerUv = nextInnerUv;
+                    td.deferredState->freeVarsSorted.assign(
+                        nonCellFreeVars.vars.begin(),
+                        nonCellFreeVars.vars.end());
+                }
+                unit.thunks.push_back(std::move(td));
 
                 // Push captures: cells first (in innerUvIdx order),
-                // then non-cell free vars.
+                // then non-cell free vars.  These run in the parent
+                // body and must be emitted eagerly regardless of
+                // whether the inner body is deferred.
                 for (auto & c : innerCells) {
                     if (c.fromOwnSlot)
                         unit.emit(OP_GET_STACK_SLOT, c.parentRef);
@@ -1378,16 +1484,40 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 unit.emit(OP_NOP, totalUpvalues);
             } else {
                 // Normal path: no cell capture needed.
-                uint32_t bodyOffset = emitSubBlock(e.bodyBlock, e.freeVars, ctx);
+                //
+                // Phase 3.1f-6: when NIX_VM_V2_LAZY_EMIT=1 and the
+                // CU's IRModule is pinned, register a Pending
+                // descriptor and skip body emission.  The body will
+                // be emitted at first force via lazyEmitThunkBody.
+                static const bool lazyEmit =
+                    ::getenv("NIX_VM_V2_LAZY_EMIT") != nullptr
+                    && std::string(::getenv("NIX_VM_V2_LAZY_EMIT")) == "1";
+                bool deferThis = lazyEmit && unit.irModule;
+
+                uint32_t bodyOffset = 0;
+                uint16_t maxSlot = 0;
+                if (!deferThis) {
+                    bodyOffset = emitSubBlock(e.bodyBlock, e.freeVars, ctx);
+                    maxSlot = lastSubBlockMaxSlot;
+                }
 
                 uint32_t thunkIdx = static_cast<uint32_t>(unit.thunks.size());
-                unit.thunks.push_back(ThunkDescriptor{
+                ThunkDescriptor td{
                     .codeOffset = bodyOffset,
                     .pos = e.pos,
                     .sourceExpr = e.sourceExpr,
                     .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
-                    .maxSlot = lastSubBlockMaxSlot,
-                });
+                    .maxSlot = maxSlot,
+                };
+                if (deferThis) {
+                    td.state = ThunkDescriptor::State::Pending;
+                    td.bodyBlockId = e.bodyBlock;
+                    td.deferredState = std::make_shared<DeferredEmitState>();
+                    td.deferredState->bodyBlockId = e.bodyBlock;
+                    td.deferredState->freeVarsSorted.assign(
+                        e.freeVars.vars.begin(), e.freeVars.vars.end());
+                }
+                unit.thunks.push_back(std::move(td));
 
                 for (auto freeVar : e.freeVars.vars)
                     emitCapture(freeVar, pos, ctx);
@@ -2008,11 +2138,32 @@ uint32_t IREmitter::emitSubBlockWithFormals(
     const ir::IRFormals & params,
     BlockContext & parentCtx)
 {
-    const auto & block = module.blocks[blockId];
-
     // Jump over the sub-block body in the parent's code stream.
     uint32_t jumpOver = unit.emit(OP_JUMP, 0);
 
+    // Delegate the actual body emission to the no-jump-wrapper helper.
+    uint32_t bodyOffset = emitFormalsBodyOnly(blockId, freeVars, params);
+
+    // Patch the jump-over.
+    unit.patchJump(jumpOver);
+
+    return bodyOffset;
+}
+
+uint32_t IREmitter::emitFormalsBodyPublic(
+    ir::BlockId blockId,
+    const ir::FreeVars & freeVars,
+    const ir::IRFormals & params)
+{
+    return emitFormalsBodyOnly(blockId, freeVars, params);
+}
+
+uint32_t IREmitter::emitFormalsBodyOnly(
+    ir::BlockId blockId,
+    const ir::FreeVars & freeVars,
+    const ir::IRFormals & params)
+{
+    const auto & block = module.blocks[blockId];
     uint32_t bodyOffset = static_cast<uint32_t>(unit.code.size());
 
     // Build a custom BlockContext for formals lambdas.
@@ -2206,9 +2357,14 @@ uint32_t IREmitter::emitSubBlockWithFormals(
     // --- Emit the body block ---
     emitBlock(block, subCtx);
 
-    // Patch the jump-over.
-    unit.patchJump(jumpOver);
+    // Mirror emitSubBlock's contract so the IRLambda emitter can
+    // populate ThunkDescriptor.maxSlot correctly when it consults
+    // lastSubBlockMaxSlot after this call.
+    lastSubBlockMaxSlot = static_cast<uint16_t>(
+        subCtx.nextSlot > 0xFFFF ? 0xFFFF : subCtx.nextSlot);
 
+    // Caller (emitSubBlockWithFormals) handles the jump-over patch.
+    // For the lazy-emit path this is a tail emission with no wrapper.
     return bodyOffset;
 }
 
@@ -2335,5 +2491,85 @@ uint32_t IREmitter::emitInlineBlock(ir::BlockId blockId, BlockContext & ctx)
     return offset;
 }
 
+// =====================================================================
+// Phase 3.1f-6: Lazy emission of deferred thunk bodies
+// =====================================================================
+
+void lazyEmitThunkBody(
+    EvalState & state, CompilationUnit & unit, uint32_t thunkIdx)
+{
+    auto & desc = unit.thunks[thunkIdx];
+    if (desc.state == ThunkDescriptor::State::Compiled) [[likely]]
+        return;
+    if (!desc.deferredState)
+        throw Error(
+            "lazyEmitThunkBody: descriptor in Pending state but "
+            "deferredState is null (compile-emit path bug)");
+    if (!unit.irModule)
+        throw Error(
+            "lazyEmitThunkBody: descriptor in Pending state but "
+            "unit.irModule was not retained (Phase 3.1f-1 not active)");
+
+    auto * deferred = desc.deferredState.get();
+
+    // Construct a fresh emitter targeting the existing CU.  The CU's
+    // unit.code grows by appending the body's instructions to the
+    // end — distinct from the eager path's "wrap-with-jump-over"
+    // approach.
+    IREmitter emitter(state, unit, *unit.irModule);
+
+    uint32_t bodyOffset;
+    uint16_t maxSlot;
+
+    if (deferred->formals) {
+        // Phase 3.1f-9: formals-lambda body — re-run the prologue+body
+        // via emitFormalsBodyOnly.  No jump-over wrapping needed since
+        // we are appending at the end of unit.code.
+        ir::FreeVars freeVars;
+        freeVars.vars.assign(
+            deferred->freeVarsSorted.begin(),
+            deferred->freeVarsSorted.end());
+        bodyOffset = emitter.emitFormalsBodyPublic(
+            deferred->bodyBlockId, freeVars, *deferred->formals);
+        // emitFormalsBodyOnly drives subCtx internally; record the
+        // max slot via the public mirror, which the helper updates.
+        maxSlot = emitter.lastSubBlockMaxSlot;
+    } else if (deferred->cellFreeVars.empty()) {
+        // Simple case (Phase 3.1f-6): all free vars become upvalues
+        // at index i = position-in-list.
+        ir::FreeVars freeVars;
+        freeVars.vars.assign(
+            deferred->freeVarsSorted.begin(),
+            deferred->freeVarsSorted.end());
+        bodyOffset = emitter.emitBlockOnly(deferred->bodyBlockId, freeVars);
+        maxSlot = emitter.lastSubBlockMaxSlot;
+    } else {
+        // Cell-capture case (Phase 3.1f-7): rebuild the cell-aware
+        // BlockContext from the saved snapshot, then emit the body
+        // directly via emitBlock (no jump-over wrapping needed since
+        // we are appending at the end of unit.code).
+        const auto & bodyBlock = unit.irModule->blocks[deferred->bodyBlockId];
+        BlockContext subCtx;
+        for (auto & cr : deferred->cellFreeVars) {
+            subCtx.cellRefs[ir::VarId(cr.varId)] =
+                {cr.innerUv, cr.entryIdx};
+        }
+        uint32_t uvIdx = deferred->nextInnerUv;
+        for (auto fv : deferred->freeVarsSorted)
+            subCtx.upvalueSlots[ir::VarId(fv)] = uvIdx++;
+        for (auto p : bodyBlock.params)
+            subCtx.allocSlot(p);
+
+        bodyOffset = static_cast<uint32_t>(unit.code.size());
+        emitter.emitBlockPublic(bodyBlock, subCtx);
+        maxSlot = static_cast<uint16_t>(
+            subCtx.nextSlot > 0xFFFF ? 0xFFFF : subCtx.nextSlot);
+    }
+
+    desc.codeOffset = bodyOffset;
+    desc.maxSlot = maxSlot;
+    desc.state = ThunkDescriptor::State::Compiled;
+    desc.deferredState.reset();
+}
 
 } // namespace nix::bytecode

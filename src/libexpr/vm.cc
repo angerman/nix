@@ -10,6 +10,7 @@
 #include "nix/expr/vm.hh"
 #include "nix/expr/bytecode.hh"
 #include "nix/expr/bytecode-thunk.hh"
+#include "nix/expr/ir-emit.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-error.hh"
@@ -1199,8 +1200,9 @@ op_get_local_0_force:
 
             if (thunkEnv && thunkExpr->isBytecodeThunk) {
                 auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                uint32_t thunkOffset = bytecode::realizeThunkCodeOffset(
+                    state, *bcThunk->unit, bcThunk->thunkIdx);
                 auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
-                uint32_t thunkOffset = thunkDesc.codeOffset;
 
                 // Extract v2 upvalues from carrier env if present.
                 Value ** frameUpvalues = nullptr;
@@ -1377,8 +1379,9 @@ op_force:
 
             if (thunkEnv && thunkExpr->isBytecodeThunk) {
                 auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                uint32_t thunkOffset = bytecode::realizeThunkCodeOffset(
+                    state, *bcThunk->unit, bcThunk->thunkIdx);
                 auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
-                uint32_t thunkOffset = thunkDesc.codeOffset;
 
                 // v2 thunks store upvalues inline starting at env.values[1].
                 Value ** frameUpvalues = nullptr;
@@ -1422,8 +1425,9 @@ op_force:
                     left->lambda().fun);
                 auto & bodyUnit = *bcLambda->unit;
                 auto & desc = bodyUnit.lambdas[bcLambda->lambdaIdx];
+                uint32_t startOffset = bytecode::realizeThunkCodeOffset(
+                    state, bodyUnit, desc.bodyThunkIdx);
                 auto & thunkDesc = bodyUnit.thunks[desc.bodyThunkIdx];
-                uint32_t startOffset = thunkDesc.codeOffset;
 
                 Value ** frameUpvalues = nullptr;
                 if (desc.nUpvalues > 0 && left->lambda().env)
@@ -2181,8 +2185,8 @@ op_call_1:
                 fun->lambda().fun);
             auto & bodyUnit = *bcLambda->unit;
             auto & desc = bodyUnit.lambdas[bcLambda->lambdaIdx];
-            auto & thunkDesc = bodyUnit.thunks[desc.bodyThunkIdx];
-            uint32_t startOffset = thunkDesc.codeOffset;
+            uint32_t startOffset = bytecode::realizeThunkCodeOffset(
+                state, bodyUnit, desc.bodyThunkIdx);
 
             assert(startOffset < bodyUnit.code.size()
                 && "OP_CALL_1 v2: startOffset out of bounds");
@@ -2685,8 +2689,8 @@ op_tail_call_1:
                 fun->lambda().fun);
             auto & bodyUnit = *bcLambda->unit;
             auto & desc = bodyUnit.lambdas[bcLambda->lambdaIdx];
-            auto & thunkDesc = bodyUnit.thunks[desc.bodyThunkIdx];
-            uint32_t startOffset = thunkDesc.codeOffset;
+            uint32_t startOffset = bytecode::realizeThunkCodeOffset(
+                state, bodyUnit, desc.bodyThunkIdx);
             Value ** frameUpvalues = nullptr;
             if (desc.nUpvalues > 0 && fun->lambda().env)
                 frameUpvalues = &fun->lambda().env->values[1];
@@ -3502,8 +3506,9 @@ op_get_slot_force:
             Expr * thunkExpr = v->thunk().expr;
             if (thunkEnv && thunkExpr->isBytecodeThunk) {
                 auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                uint32_t thunkOffset = bytecode::realizeThunkCodeOffset(
+                    state, *bcThunk->unit, bcThunk->thunkIdx);
                 auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
-                uint32_t thunkOffset = thunkDesc.codeOffset;
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0)
                     frameUpvalues = &thunkEnv->values[1];
@@ -3563,8 +3568,9 @@ op_get_uv_force:
             Expr * thunkExpr = v->thunk().expr;
             if (thunkEnv && thunkExpr->isBytecodeThunk) {
                 auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                uint32_t thunkOffset = bytecode::realizeThunkCodeOffset(
+                    state, *bcThunk->unit, bcThunk->thunkIdx);
                 auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
-                uint32_t thunkOffset = thunkDesc.codeOffset;
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0)
                     frameUpvalues = &thunkEnv->values[1];
@@ -3670,8 +3676,9 @@ op_rforce_from:
             Expr * thunkExpr = v->thunk().expr;
             if (thunkEnv && thunkExpr->isBytecodeThunk) {
                 auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                uint32_t thunkOffset = bytecode::realizeThunkCodeOffset(
+                    state, *bcThunk->unit, bcThunk->thunkIdx);
                 auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
-                uint32_t thunkOffset = thunkDesc.codeOffset;
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0)
                     frameUpvalues = &thunkEnv->values[1];
@@ -3755,8 +3762,9 @@ op_ruvf_to:
             Expr * thunkExpr = v->thunk().expr;
             if (thunkEnv && thunkExpr->isBytecodeThunk) {
                 auto * bcThunk = static_cast<ExprBytecodeThunk *>(thunkExpr);
+                uint32_t thunkOffset = bytecode::realizeThunkCodeOffset(
+                    state, *bcThunk->unit, bcThunk->thunkIdx);
                 auto & thunkDesc = bcThunk->unit->thunks[bcThunk->thunkIdx];
-                uint32_t thunkOffset = thunkDesc.codeOffset;
                 Value ** frameUpvalues = nullptr;
                 if (thunkDesc.nUpvalues > 0)
                     frameUpvalues = &thunkEnv->values[1];
@@ -4073,8 +4081,8 @@ op_rcall1_r:
             auto * bcLambda = static_cast<ExprLambdaBytecode *>(fun->lambda().fun);
             auto & bodyUnit = *bcLambda->unit;
             auto & desc = bodyUnit.lambdas[bcLambda->lambdaIdx];
-            auto & thunkDesc = bodyUnit.thunks[desc.bodyThunkIdx];
-            uint32_t startOffset = thunkDesc.codeOffset;
+            uint32_t startOffset = bytecode::realizeThunkCodeOffset(
+                state, bodyUnit, desc.bodyThunkIdx);
             Value ** frameUpvalues = nullptr;
             if (desc.nUpvalues > 0 && fun->lambda().env)
                 frameUpvalues = &fun->lambda().env->values[1];

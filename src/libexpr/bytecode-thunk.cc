@@ -6,6 +6,7 @@
 
 #include "nix/expr/bytecode-thunk.hh"
 #include "nix/expr/bytecode.hh"
+#include "nix/expr/ir-emit.hh"
 #include "nix/expr/vm.hh"
 #include "nix/expr/eval.hh"
 
@@ -17,8 +18,9 @@ namespace nix {
 
 void ExprBytecodeThunk::eval(EvalState & state, Env & env, Value & v)
 {
+    // Phase 3.1f-6: realize the body if it was emitted as Pending.
+    uint32_t offset = bytecode::realizeThunkCodeOffset(state, *unit, thunkIdx);
     auto & desc = unit->thunks[thunkIdx];
-    uint32_t offset = desc.codeOffset;
     // Track bytecoded thunk forcings for profiling.
     if (state.vmState)
         state.vmState->nrBytecodeThunkForces++;

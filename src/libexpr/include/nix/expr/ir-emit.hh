@@ -69,5 +69,29 @@ struct EmitPhaseTiming
 
 extern thread_local EmitPhaseTiming * emitPhaseTiming;
 
+/// Phase 3.1f-6: lazily emit a thunk body that was registered as
+/// Pending at compile time.  Mutates `unit.code` (appends the body),
+/// updates `unit.thunks[thunkIdx].codeOffset`, and flips state to
+/// Compiled.  Idempotent on already-Compiled descriptors.
+///
+/// The CU's pinned IRModule (Phase 3.1f-1) must be non-null and
+/// the descriptor's `deferredState` must be set.  Otherwise this
+/// throws.
+void lazyEmitThunkBody(
+    EvalState & state, CompilationUnit & unit, uint32_t thunkIdx);
+
+/// Phase 3.1f-6: helper that returns the code offset of a thunk
+/// body, lazy-emitting it first if state == Pending.  Use this
+/// in vm.cc instead of accessing `desc.codeOffset` directly.
+[[gnu::always_inline]]
+inline uint32_t realizeThunkCodeOffset(
+    EvalState & state, CompilationUnit & unit, uint32_t thunkIdx)
+{
+    auto & desc = unit.thunks[thunkIdx];
+    if (desc.state != ThunkDescriptor::State::Compiled) [[unlikely]]
+        lazyEmitThunkBody(state, unit, thunkIdx);
+    return desc.codeOffset;
+}
+
 } // namespace bytecode
 } // namespace nix
