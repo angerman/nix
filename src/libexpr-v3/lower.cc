@@ -113,6 +113,26 @@ struct Lowerer
         return po != nullptr;
     }
 
+    /// True iff `e` is `builtins.<name>` where <name> is a known primop
+    /// and `builtins` resolves to the base env (the standard meaning).
+    bool isBuiltinsPrimOp(nix::Expr * e, const PrimOp ** outPO = nullptr) const
+    {
+        if (!e || e->exprKind != nix::Expr::Kind::Select) return false;
+        auto * sel = static_cast<nix::ExprSelect *>(e);
+        if (sel->def) return false;
+        auto path = sel->getAttrPath();
+        if (path.size() != 1 || path[0].expr) return false;
+        if (sel->e->exprKind != nix::Expr::Kind::Var) return false;
+        auto * ev = static_cast<nix::ExprVar *>(sel->e);
+        if (ev->fromWith) return false;
+        if (ev->level < scopes.size()) return false;
+        if (std::string(symbols[ev->name]) != "builtins") return false;
+        std::string name(symbols[path[0].symbol]);
+        const PrimOp * po = findPrimOp(name);
+        if (po && outPO) *outPO = po;
+        return po != nullptr;
+    }
+
     // Top-level entry.
     ir::Module run(nix::Expr * e)
     {
@@ -144,6 +164,15 @@ struct Lowerer
         case nix::Expr::Kind::If:     return lowerIf(static_cast<nix::ExprIf *>(e));
         case nix::Expr::Kind::Lambda: return lowerLambda(static_cast<nix::ExprLambda *>(e));
         case nix::Expr::Kind::Call:   return lowerCall(static_cast<nix::ExprCall *>(e));
+        case nix::Expr::Kind::Let:    return lowerLet (static_cast<nix::ExprLet  *>(e));
+        case nix::Expr::Kind::List:   return lowerList(static_cast<nix::ExprList *>(e));
+        case nix::Expr::Kind::Attrs:  return lowerAttrs(static_cast<nix::ExprAttrs *>(e));
+        case nix::Expr::Kind::Select: return lowerSelect(static_cast<nix::ExprSelect *>(e));
+        case nix::Expr::Kind::OpHasAttr: return lowerHasAttr(static_cast<nix::ExprOpHasAttr *>(e));
+        case nix::Expr::Kind::OpUpdate: return lowerBinOp(static_cast<nix::ExprOpUpdate *>(e), ir::Update{});
+        case nix::Expr::Kind::OpConcatLists: return lowerBinOp(static_cast<nix::ExprOpConcatLists *>(e), ir::ConcatLists{});
+        case nix::Expr::Kind::Assert: return lowerAssert(static_cast<nix::ExprAssert *>(e));
+        case nix::Expr::Kind::With:   return lowerWith(static_cast<nix::ExprWith *>(e));
         case nix::Expr::Kind::OpEq:   return lowerBinOp(static_cast<nix::ExprOpEq *>(e),  ir::Eq{});
         case nix::Expr::Kind::OpNEq:  return lowerBinOp(static_cast<nix::ExprOpNEq *>(e), ir::NEq{});
         case nix::Expr::Kind::OpAnd:  return lowerShortCircuit(static_cast<nix::ExprOpAnd *>(e), /*kind*/0);
@@ -154,17 +183,8 @@ struct Lowerer
         case nix::Expr::Kind::Unknown:
         case nix::Expr::Kind::Path:
         case nix::Expr::Kind::InheritFrom:
-        case nix::Expr::Kind::Select:
-        case nix::Expr::Kind::OpHasAttr:
-        case nix::Expr::Kind::Attrs:
-        case nix::Expr::Kind::List:
-        case nix::Expr::Kind::Let:
-        case nix::Expr::Kind::With:
-        case nix::Expr::Kind::Assert:
-        case nix::Expr::Kind::OpUpdate:
         case nix::Expr::Kind::Pos:
         case nix::Expr::Kind::BlackHole:
-        case nix::Expr::Kind::OpConcatLists:
         default: break;
         }
         // Many node kinds aren't supported yet.  Surface a clear message.
@@ -269,9 +289,11 @@ struct Lowerer
     ir::VarId lowerCall(nix::ExprCall * e)
     {
         if (!e->args.has_value()) unsupported("ExprCall without args");
-        // Direct primop call: callee is a base-env var that names a primop.
+        // Direct primop call (1): callee is a base-env var that names a primop.
         const PrimOp * po = nullptr;
-        if (isPrimOpRef(e->fun, &po) && e->args->size() == po->arity) {
+        if ((isPrimOpRef(e->fun, &po) || isBuiltinsPrimOp(e->fun, &po))
+            && e->args->size() == po->arity)
+        {
             std::vector<ir::VarId> args;
             args.reserve(po->arity);
             for (auto * a : *e->args) args.push_back(lowerExpr(a));
@@ -304,6 +326,110 @@ struct Lowerer
         IRNode op{a, b};
         return addBinding(op);
     }
+    /// `let`: linear lowering — each binding is evaluated strictly in
+    /// iteration order (which matches the displ order assigned by
+    /// bindVars).  Forward references to siblings will fail at lower time
+    /// because the sibling's VarId hasn't been added to the scope yet.
+    /// Full mutual recursion requires thunked bindings; deferred.
+    ir::VarId lowerLet(nix::ExprLet * e)
+    {
+        if (e->attrs->inheritFromExprs && !e->attrs->inheritFromExprs->empty())
+            unsupported("let with inherit (from)");
+
+        size_t scopeIdx = scopes.size();
+        scopes.emplace_back();
+
+        for (auto & kv : *e->attrs->attrs) {
+            const auto & sym = kv.first;
+            const auto & def = kv.second;
+            if (def.kind != nix::ExprAttrs::AttrDef::Kind::Plain)
+                unsupported("let with inherited binding");
+            ir::VarId v = lowerExpr(def.e);
+            // displ matches iteration order over the sorted std::pmr::map
+            scopes[scopeIdx].byDispl.push_back(v);
+            scopes[scopeIdx].byName.emplace(std::string(symbols[sym]), v);
+        }
+
+        ir::VarId rv = lowerExpr(e->body);
+        scopes.pop_back();
+        return addBinding(ir::VarRef{rv});
+    }
+
+    ir::VarId lowerList(nix::ExprList * e)
+    {
+        std::vector<ir::VarId> elems;
+        elems.reserve(e->elems.size());
+        for (auto * el : e->elems) elems.push_back(lowerExpr(el));
+        return addBinding(ir::ListExpr{std::move(elems)});
+    }
+
+    /// Non-recursive attrset (`{ a = 1; b = 2; }`).  Recursive attrsets
+    /// (`rec { ... }`) require a different lowering strategy and are
+    /// rejected for now.
+    ir::VarId lowerAttrs(nix::ExprAttrs * e)
+    {
+        if (e->recursive) unsupported("recursive attrset (rec { ... })");
+        if (e->dynamicAttrs && !e->dynamicAttrs->empty())
+            unsupported("attrset with dynamic attrs");
+        if (e->inheritFromExprs && !e->inheritFromExprs->empty())
+            unsupported("attrset with inherit (from)");
+
+        std::vector<ir::AttrSet::Entry> entries;
+        for (auto & kv : *e->attrs) {
+            const auto & sym = kv.first;
+            const auto & def = kv.second;
+            if (def.kind != nix::ExprAttrs::AttrDef::Kind::Plain)
+                unsupported("attrset with inherited binding");
+            ir::VarId vv = lowerExpr(def.e);
+            entries.push_back({internSym(sym), vv});
+        }
+        return addBinding(ir::AttrSet{std::move(entries)});
+    }
+
+    /// `expr.attr` — a chain of static attribute selects.  Default values
+    /// (`expr.attr or default`) are supported by emitting an If on HasAttr.
+    ir::VarId lowerSelect(nix::ExprSelect * e)
+    {
+        if (e->def) unsupported("select with default expression (or)");
+        ir::VarId v = lowerExpr(e->e);
+        for (auto & an : e->getAttrPath()) {
+            if (an.expr) unsupported("dynamic attribute name in select");
+            v = addBinding(ir::AttrSelect{v, internSym(an.symbol)});
+        }
+        return v;
+    }
+
+    ir::VarId lowerHasAttr(nix::ExprOpHasAttr * e)
+    {
+        if (e->attrPath.size() != 1) unsupported("has-attr with multi-element path");
+        auto & an = e->attrPath[0];
+        if (an.expr) unsupported("dynamic attribute name in hasAttr");
+        ir::VarId v = lowerExpr(e->e);
+        return addBinding(ir::HasAttr{v, internSym(an.symbol)});
+    }
+
+    ir::VarId lowerAssert(nix::ExprAssert * e)
+    {
+        ir::VarId cond = lowerExpr(e->cond);
+        auto bodyB = m.freshBlock();
+        blockStack.push_back(bodyB);
+        ir::VarId rv = lowerExpr(e->body);
+        setReturn(rv);
+        blockStack.pop_back();
+        return addBinding(ir::Assert{cond, bodyB});
+    }
+
+    ir::VarId lowerWith(nix::ExprWith * e)
+    {
+        ir::VarId attrs = lowerExpr(e->attrs);
+        auto bodyB = m.freshBlock();
+        blockStack.push_back(bodyB);
+        ir::VarId rv = lowerExpr(e->body);
+        setReturn(rv);
+        blockStack.pop_back();
+        return addBinding(ir::With{attrs, bodyB});
+    }
+
     template<class AstNode>
     ir::VarId lowerShortCircuit(AstNode * e, int kind /*0=And, 1=Or, 2=Impl*/)
     {

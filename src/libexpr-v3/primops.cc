@@ -231,6 +231,8 @@ void primSub(EvalState &, Value * args, Value & out)
     const Value & a = args[0]; const Value & b = args[1];
     if (a.isInt() && b.isInt())          out.mkInt(a.payload.i - b.payload.i);
     else if (a.isFloat() && b.isFloat()) out.mkFloat(a.payload.f - b.payload.f);
+    else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.payload.i) - b.payload.f);
+    else if (a.isFloat() && b.isInt())   out.mkFloat(a.payload.f - static_cast<double>(b.payload.i));
     else typeError("sub", "numeric");
 }
 
@@ -239,6 +241,8 @@ void primMul(EvalState &, Value * args, Value & out)
     const Value & a = args[0]; const Value & b = args[1];
     if (a.isInt() && b.isInt())          out.mkInt(a.payload.i * b.payload.i);
     else if (a.isFloat() && b.isFloat()) out.mkFloat(a.payload.f * b.payload.f);
+    else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.payload.i) * b.payload.f);
+    else if (a.isFloat() && b.isInt())   out.mkFloat(a.payload.f * static_cast<double>(b.payload.i));
     else typeError("mul", "numeric");
 }
 
@@ -250,6 +254,10 @@ void primDiv(EvalState &, Value * args, Value & out)
         out.mkInt(a.payload.i / b.payload.i);
     } else if (a.isFloat() && b.isFloat()) {
         out.mkFloat(a.payload.f / b.payload.f);
+    } else if (a.isInt() && b.isFloat()) {
+        out.mkFloat(static_cast<double>(a.payload.i) / b.payload.f);
+    } else if (a.isFloat() && b.isInt()) {
+        out.mkFloat(a.payload.f / static_cast<double>(b.payload.i));
     } else typeError("div", "numeric");
 }
 
