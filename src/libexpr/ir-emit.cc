@@ -63,6 +63,19 @@ struct BlockContext
     /// Next available stack slot in this frame.
     uint32_t nextSlot = 0;
 
+    /// Per-VarId use count within the current block (collected at the
+    /// start of each emitBlock; cleared after).  Used by the ANF
+    /// de-materialization peephole.
+    boost::unordered_flat_map<ir::VarId, uint32_t> blockUseCounts;
+
+    /// VarId whose result was just stored via OP_SET_STACK_SLOT (the
+    /// most recent binding that took the operand-stack-then-store
+    /// path).  kInvalidVar means the last emit was something else.
+    /// emitVarRef inspects this together with blockUseCounts to decide
+    /// whether the SET_STACK_SLOT/GET_STACK_SLOT round-trip can be
+    /// elided.
+    ir::VarId lastBoundVar = ir::kInvalidVar;
+
     /// Allocate a fresh stack slot for a VarId.
     /// If the var already has a slot in this context (e.g., pre-allocated
     /// for a forward ref or set by an earlier strictness-spliced binding),
@@ -314,6 +327,40 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
         definedInBlock.insert(binding.result);
     }
 
+    // Compute per-VarId use count within this block.  Used by the ANF
+    // de-materialization peephole in emitVarRef: a binding whose result
+    // is referenced exactly ONCE inside this block can have its
+    // SET_STACK_SLOT/GET_STACK_SLOT round-trip elided when the GET
+    // immediately follows the SET (the value is already on the operand
+    // stack from the producer's emitExpr).
+    ctx.blockUseCounts.clear();
+    {
+        ir::FreeVars refs;
+        for (const auto & binding : block.bindings) {
+            refs.vars.clear();
+            collectRefs(binding.expr, refs);
+            for (auto v : refs.vars)
+                if (definedInBlock.count(v))
+                    ctx.blockUseCounts[v]++;
+        }
+        // Terminal references.
+        std::visit([&](const auto & t) {
+            using T = std::decay_t<decltype(t)>;
+            if constexpr (std::is_same_v<T, ir::TermReturn>) {
+                if (definedInBlock.count(t.value))
+                    ctx.blockUseCounts[t.value]++;
+            } else if constexpr (std::is_same_v<T, ir::TermTailCall>) {
+                if (definedInBlock.count(t.func))
+                    ctx.blockUseCounts[t.func]++;
+                if (definedInBlock.count(t.arg))
+                    ctx.blockUseCounts[t.arg]++;
+            } else if constexpr (std::is_same_v<T, ir::TermBranch>) {
+                if (definedInBlock.count(t.cond))
+                    ctx.blockUseCounts[t.cond]++;
+            }
+        }, block.terminal);
+    }
+
     // Collect forward-referenced VarIds: any VarId that is both (a) defined
     // by a binding in this block and (b) referenced by an EARLIER binding.
     //
@@ -391,6 +438,15 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
 
     // Emit each binding.
     for (const auto & binding : block.bindings) {
+        // Reset the ANF peephole tracker at the start of every iteration.
+        // ALL register-form fast paths below `continue;` past the
+        // operand-stack flow without touching lastBoundVar; if we relied
+        // on the reset before emitExpr, a prior binding's lastBoundVar
+        // could persist through a register-form binding and then trip
+        // emitVarRef's assertion (it would expect unit.code.back() to be
+        // SET_STACK_SLOT, but the register-form binding overwrote that).
+        ctx.lastBoundVar = ir::kInvalidVar;
+
         // Phase 1 register-form optimization.
         // Detect patterns where we can write the result DIRECTLY to a
         // slot without going through the operand stack.
@@ -547,6 +603,10 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
         } else {
             uint32_t slot = ctx.allocSlot(binding.result);
             unit.emit(OP_SET_STACK_SLOT, slot);
+            // Mark this as a candidate for ANF de-materialization:
+            // if the next emitVarRef is for this VarId AND useCount
+            // is 1, both ops can be elided.
+            ctx.lastBoundVar = binding.result;
         }
     }
 
@@ -1445,6 +1505,40 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
 // shows emitVarRef in the hot path.
 void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
 {
+    // ANF de-materialization peephole.  If the IMMEDIATELY-PRECEDING
+    // emit was a binding's SET_STACK_SLOT for THIS exact VarId AND
+    // the VarId has a single use in this block, both the SET and the
+    // GET are redundant — the value is still on the operand stack
+    // from the producer's emitExpr, and no later reader will need
+    // the slot.
+    //
+    // Tracking via ctx.lastBoundVar (not just the last opcode) is
+    // critical: the IRVarRef alias optimization in the binding loop
+    // can re-map slots, so a SET_STACK_SLOT may belong to a different
+    // logical binding than the one we're now reading.  lastBoundVar
+    // is set by the binding loop only when SET_STACK_SLOT was emitted
+    // FOR THIS BINDING.
+    if (var != ir::kInvalidVar
+        && var == ctx.lastBoundVar)
+    {
+        auto ucIt = ctx.blockUseCounts.find(var);
+        if (ucIt != ctx.blockUseCounts.end()
+            && ucIt->second == 1)
+        {
+            ctx.lastBoundVar = ir::kInvalidVar;
+            // Pop the SET_STACK_SLOT; the value stays on the operand
+            // stack for this consumer to use directly.
+            assert(!unit.code.empty()
+                && decodeOp(unit.code.back()) == OP_SET_STACK_SLOT);
+            unit.code.pop_back();
+            ucIt->second = 0;
+            return;
+        }
+    }
+    // Reset the tracker — anything emitVarRef does (or anything
+    // between bindings) invalidates the elision opportunity.
+    ctx.lastBoundVar = ir::kInvalidVar;
+
     // Check local slots first (defined in this block).
     auto localIt = ctx.localSlots.find(var);
     if (localIt != ctx.localSlots.end()) {

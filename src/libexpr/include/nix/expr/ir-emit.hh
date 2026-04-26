@@ -54,5 +54,20 @@ namespace bytecode {
 /// dispatch loop -- v2 opcodes are handled alongside v1 opcodes.
 CompilationUnit * emitFromIR(EvalState & state, const ir::IRModule & module);
 
+/// Per-call emit-phase timings (microseconds), used by the
+/// NIX_VM_COMPILE_PROFILE diagnostic.
+struct EmitPhaseTiming
+{
+    uint64_t emitCoreUs = 0;          ///< IREmitter::emit (whole module emission)
+    uint64_t preallocThunksUs = 0;    ///< ExprBytecodeThunk pre-allocation
+    uint64_t preallocLambdasUs = 0;   ///< ExprLambdaBytecode pre-allocation
+
+    uint64_t numInstructions = 0;     ///< Final unit.code.size()
+    uint64_t numThunkDescriptors = 0;
+    uint64_t numLambdaDescriptors = 0;
+};
+
+extern thread_local EmitPhaseTiming * emitPhaseTiming;
+
 } // namespace bytecode
 } // namespace nix

@@ -415,6 +415,23 @@ public:
     uint64_t nrBytecodeCompileCacheHits = 0;
     uint64_t nrBytecodeCompileCacheMisses = 0;
 
+    /// Detailed per-phase compile-time breakdown (microseconds).
+    /// Populated when NIX_VM_V2=1 and NIX_VM_COMPILE_PROFILE=1.
+    uint64_t compileLowerUs = 0;
+    uint64_t compileFreeVarsUs = 0;
+    uint64_t compileStrictnessUs = 0;
+    uint64_t compileEmitUs = 0;
+    uint64_t compilePreallocUs = 0;
+
+    /// Cumulative work-unit counters across all compilations.
+    uint64_t cuTotalBlocks = 0;
+    uint64_t cuTotalBindings = 0;
+    uint64_t cuTotalVarIds = 0;
+    uint64_t cuTotalThunks = 0;
+    uint64_t cuTotalLambdas = 0;
+    uint64_t cuTotalSymbols = 0;
+    uint64_t cuTotalInstructions = 0;
+
     /**
      * If set, force copying files to the Nix store even if they
      * already exist there.

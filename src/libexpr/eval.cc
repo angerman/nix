@@ -1203,6 +1203,7 @@ void EvalState::eval(Expr * e, Value & v)
     //   AST -> IR (lower) -> bytecode (emitFromIR) -> vmExec.
     // This is the new upvalue-based compilation path.
     static bool useVMv2 = getEnv("NIX_VM_V2").value_or("") == "1";
+    static bool profileCompile = getEnv("NIX_VM_COMPILE_PROFILE").value_or("") == "1";
     if (useVMv2) {
         auto it = bytecodeCache.find(e);
         bytecode::CompilationUnit * unit;
@@ -1211,12 +1212,44 @@ void EvalState::eval(Expr * e, Value & v)
             nrBytecodeCompileCacheHits++;
         } else {
             nrBytecodeCompileCacheMisses++;
+
+            // Optional fine-grained per-phase profiling.  When enabled,
+            // wraps lower() and emitFromIR() with thread-local observers
+            // that record core/freevars/strictness/emit/prealloc timings
+            // separately.  Adds <1us bookkeeping overhead per call.
+            ir::LowerPhaseTiming lpt;
+            bytecode::EmitPhaseTiming ept;
+            ir::LowerPhaseTiming * prevL = ir::lowerPhaseTiming;
+            bytecode::EmitPhaseTiming * prevE = bytecode::emitPhaseTiming;
+            if (profileCompile) {
+                ir::lowerPhaseTiming = &lpt;
+                bytecode::emitPhaseTiming = &ept;
+            }
+
             auto t0 = std::chrono::steady_clock::now();
             auto mod = ir::lower(*this, e);
+            auto tEmit0 = std::chrono::steady_clock::now();
             unit = bytecode::emitFromIR(*this, mod);
             auto t1 = std::chrono::steady_clock::now();
             bytecodeCompileTimeUs += std::chrono::duration_cast<
                 std::chrono::microseconds>(t1 - t0).count();
+
+            if (profileCompile) {
+                ir::lowerPhaseTiming = prevL;
+                bytecode::emitPhaseTiming = prevE;
+                compileLowerUs       += lpt.lowerCoreUs;
+                compileFreeVarsUs    += lpt.freeVarsUs + lpt.freeVarsRecomputeUs;
+                compileStrictnessUs  += lpt.strictnessUs;
+                compileEmitUs        += ept.emitCoreUs;
+                compilePreallocUs    += ept.preallocThunksUs + ept.preallocLambdasUs;
+                cuTotalBlocks        += lpt.numBlocks;
+                cuTotalBindings      += lpt.numBindings;
+                cuTotalVarIds        += lpt.numVarIds;
+                cuTotalThunks        += lpt.numThunks;
+                cuTotalLambdas       += lpt.numLambdas;
+                cuTotalInstructions  += ept.numInstructions;
+                (void)tEmit0; // currently unused; kept for future split
+            }
             bytecodeCache[e] = unit;
         }
 
@@ -3318,6 +3351,26 @@ void EvalState::printStatistics()
             {"compileCacheHits", nrBytecodeCompileCacheHits},
             {"compileCacheMisses", nrBytecodeCompileCacheMisses},
         };
+
+        // Detailed per-phase compile-time breakdown (NIX_VM_COMPILE_PROFILE=1).
+        if (compileLowerUs + compileFreeVarsUs + compileEmitUs > 0) {
+            topObj["bytecode"]["compilePhases"] = {
+                {"lowerCoreUs",   compileLowerUs},
+                {"freeVarsUs",    compileFreeVarsUs},
+                {"strictnessUs",  compileStrictnessUs},
+                {"emitUs",        compileEmitUs},
+                {"preallocUs",    compilePreallocUs},
+            };
+            topObj["bytecode"]["compileWorkUnits"] = {
+                {"blocks",       cuTotalBlocks},
+                {"bindings",     cuTotalBindings},
+                {"varIds",       cuTotalVarIds},
+                {"thunks",       cuTotalThunks},
+                {"lambdas",      cuTotalLambdas},
+                {"symbols",      symbols.size()},
+                {"instructions", cuTotalInstructions},
+            };
+        }
     }
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
