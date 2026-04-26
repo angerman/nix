@@ -1,90 +1,315 @@
 #pragma once
 /// @file
-/// v3 IR — minimal SSA for the bring-up subset (literals, arithmetic, let,
-/// var, lambda, app).
+/// v3 IR — block-based A-normal-form representation of Nix programs.
 ///
-/// This is INTENTIONALLY tiny.  The full v3 design (doc/v3-design/v3-design.md)
-/// covers attrset, list, conditional, with, recursive let, formals, primops,
-/// etc.  Each is added incrementally; the bring-up subset's job is to
-/// validate the architecture.
-///
-/// Single-block-only for now — no CFG, no phi.  When conditionals land, we
-/// add IRBlock + IRBranch.
+/// Design (mirrors v2 ir.hh; deliberate so the v2 → v3 IR mapping is easy):
+///   - FLAT.  No nested expression trees; every compound sub-expression is
+///     bound to a VarId in a Block's `bindings` vector.
+///   - BLOCK.  Unit of control flow.  Each Block has a sequence of bindings
+///     and exactly one Terminal (Return / Branch).  if-branches, lambda
+///     bodies, thunk bodies, and short-circuit RHS are all separate Blocks.
+///   - MODULE.  Owns all Blocks and Functions.  Block IDs / Function IDs are
+///     indices into the module's vectors.
+///   - SYMBOL.  IR-local SymbolId: uint32 index into Module::symbolTable.
+///     Cheap to compare; lowered to an external symbol table at emit time.
+///   - DESUGARED.  inherit, with, let, rec, or-default, string interpolation,
+///     and assert are lowered to primitive IR operations during AST → IR.
+///   - LAZINESS EXPLICIT.  Use MkThunk to introduce a deferred computation;
+///     use Force when a strict context demands a value.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
-#include <string>
-#include <memory>
+#include <unordered_map>
 
 namespace nix::v3::ir {
 
-/// SSA value identifier.  Index into the enclosing function's `bindings`
-/// vector — a `Binding` defines exactly one VarId.
+// ---------------------------------------------------------------------------
+// Identifiers
+// ---------------------------------------------------------------------------
+
+/// A variable in the IR (defined by exactly one Binding).  Within one Block
+/// VarIds are linear; across the Module they are unique.
 using VarId = uint32_t;
 constexpr VarId kInvalid = 0;
 
+/// Index into Module::blocks.  Blocks own bindings + a Terminal.
+using BlockId = uint32_t;
+constexpr BlockId kInvalidBlock = 0;
+
+/// Index into Module::functions.  Functions own a body Block + parameter
+/// metadata (used by Lambda / MkThunk to point at the callable code).
+using FuncId = uint32_t;
+constexpr FuncId kInvalidFunc = 0xFFFFFFFFu;
+
+/// Index into Module::symbolTable.  Used for attribute names, formals,
+/// with-lookup names, etc.  Comparison is O(1) (integer compare).
+using SymbolId = uint32_t;
+constexpr SymbolId kInvalidSymbol = 0;
+
 // ---------------------------------------------------------------------------
-// IR expression variants — each computes one Value from previous bindings.
+// IR expression variants
 // ---------------------------------------------------------------------------
 
+// --- Literals ---
 struct LitInt    { int64_t value; };
-struct VarRef    { VarId   var;   };
-/// Literal lambda: when emitted, allocates a Closure with the captured
-/// upvalues from `freeVars`.  `body` is a separate IRFunction.
-struct Lambda    { std::vector<VarId> freeVars; uint32_t funcIdx; };
-struct App       { VarId fun; VarId arg; };
-struct Add       { VarId lhs; VarId rhs; };
-struct Sub       { VarId lhs; VarId rhs; };
-struct Mul       { VarId lhs; VarId rhs; };
+struct LitFloat  { double  value; };
+struct LitBool   { bool    value; };
+struct LitNull   {};
+/// String literal.  `value` is borrowed from a long-lived buffer (the AST
+/// arena, or a Module-owned string pool).  Lifetime must outlive the IR.
+struct LitString { std::string_view value; };
+struct LitPath   { std::string_view path; void * accessor; };
 
-/// IRExpr — the RHS of a binding.
-using Expr = std::variant<LitInt, VarRef, Lambda, App, Add, Sub, Mul>;
+// --- Var reference ---
+/// References a previously-defined VarId in the enclosing function/block scope.
+struct VarRef    { VarId var; };
 
-/// One SSA binding inside an IRFunction's body.
-struct Binding
-{
-    VarId      var;          // result name
-    Expr       expr;
-    uint32_t   useCount = 0;  // populated by analysis (DCE / strictness)
+/// Reference to a free variable resolved against a `with` scope at runtime.
+/// `depth` = how many enclosing with-scopes to skip before lookup (0 = innermost).
+struct WithLookup {
+    SymbolId name;
+    uint32_t depth;
 };
 
-// ---------------------------------------------------------------------------
-// IRFunction — one lambda or one top-level expression.
-// ---------------------------------------------------------------------------
+// --- Lambdas, application, thunks ---
 
-struct Function
-{
-    /// Bindings in evaluation order.  `var` field of each = its definition.
-    std::vector<Binding> bindings;
-    /// VarId returned from the function body.
-    VarId returnVar = kInvalid;
-    /// VarId for the parameter (single-arg lambdas only for now).  Top-level
-    /// has no parameter (param == kInvalid).
-    VarId param = kInvalid;
-    /// Free vars referenced in this function's bindings, sorted ascending.
-    /// Populated by computeFreeVars.  These become the closure's upvalues.
+/// Lambda formal parameter (in `{ a ? def, b, ... }: body`).
+struct Formal {
+    SymbolId name;
+    /// Default-value block (kInvalidBlock if formal is required).  Free vars
+    /// of the default are part of the enclosing closure's upvalues.
+    BlockId  defaultBlock = kInvalidBlock;
+};
+
+/// Construct a closure value.  At runtime, captures the free variables
+/// (in `freeVars` order) into a Closure object and tags the result.
+struct Lambda {
+    FuncId             funcIdx;
+    /// Free vars of the body, in the order the body expects to read them
+    /// via OP_GET_UPVALUE.  Populated by computeFreeVars before emit.
     std::vector<VarId> freeVars;
-    /// Optional name (for diagnostics).
-    std::string name;
+};
+
+/// Strict (single-arg) function application.  In v3, OP_CALL takes one arg;
+/// curried application is achieved by chaining App nodes.
+struct App   { VarId fun; VarId arg; };
+
+/// Force evaluation of a thunk in a strict context.  No-op on already-WHNF
+/// values.
+struct Force { VarId thunk; };
+
+/// Construct a deferred computation.  When forced, runs the body block in
+/// the captured environment.
+struct MkThunk {
+    FuncId             funcIdx;
+    std::vector<VarId> freeVars;
+};
+
+// --- Attribute sets ---
+
+struct AttrSelect    { VarId attrs; SymbolId name; };
+struct AttrSelectDyn { VarId attrs; VarId nameVar; };
+struct HasAttr       { VarId attrs; SymbolId name; };
+struct HasAttrDyn    { VarId attrs; VarId nameVar; };
+
+/// Construct a non-recursive attrset from sorted (name, value) pairs.
+struct AttrSet {
+    struct Entry { SymbolId name; VarId value; };
+    std::vector<Entry> entries; // sorted ascending by SymbolId
+};
+
+/// Attrset with one or more dynamic-name attributes.
+struct AttrSetDyn {
+    struct StaticEntry  { SymbolId name; VarId value; };
+    struct DynamicEntry { VarId nameVar; VarId value; };
+    std::vector<StaticEntry>  statics;
+    std::vector<DynamicEntry> dynamics;
+};
+
+/// Recursive attrset (`rec { ... }`).  Each entry's value can reference
+/// any sibling via the synthetic `selfVar` (lowering rewrites such refs
+/// to AttrSelect on selfVar).
+struct RecAttrSet {
+    VarId selfVar;
+    struct Entry { SymbolId name; VarId value; };
+    std::vector<Entry> entries;
+};
+
+// --- Lists ---
+
+struct ListExpr    { std::vector<VarId> elems; };
+struct ConcatLists { VarId lhs; VarId rhs; };
+
+// --- Control flow / scoping ---
+
+/// Conditional.  `cond` is forced; `thenBlock` or `elseBlock` runs, and its
+/// return value becomes the value of this binding's slot.
+struct If    { VarId cond; BlockId thenBlock; BlockId elseBlock; };
+
+/// `with attrs; body`.  Pushes `attrs` onto the runtime with-stack, runs
+/// `bodyBlock`, then pops.  Inside the body, WithLookup resolves names.
+struct With  { VarId attrs; BlockId bodyBlock; };
+
+/// `assert cond; body`.  Forces `cond`; if false, raises an error; otherwise
+/// runs `bodyBlock` and yields its return value.
+struct Assert { VarId cond; BlockId bodyBlock; };
+
+// --- String interpolation / coercion ---
+
+struct ConcatStrings { std::vector<VarId> parts; bool forceString; };
+
+// --- Boolean / comparison / arithmetic ---
+
+struct Not    { VarId operand; };
+struct Negate { VarId operand; };
+
+struct Add  { VarId lhs; VarId rhs; };
+struct Sub  { VarId lhs; VarId rhs; };
+struct Mul  { VarId lhs; VarId rhs; };
+struct Div  { VarId lhs; VarId rhs; };
+
+struct Eq   { VarId lhs; VarId rhs; };
+struct NEq  { VarId lhs; VarId rhs; };
+struct Less { VarId lhs; VarId rhs; };
+
+/// Short-circuit logical operators.  `rhsBlock` is only run when needed.
+struct And  { VarId lhs; BlockId rhsBlock; };
+struct Or   { VarId lhs; BlockId rhsBlock; };
+struct Impl { VarId lhs; BlockId rhsBlock; };
+
+/// Attrset update: lhs // rhs.
+struct Update { VarId lhs; VarId rhs; };
+
+/// `__curPos` — position attrset of the call site.
+struct PosExpr {};
+
+// ---------------------------------------------------------------------------
+// IRExpr sum
+// ---------------------------------------------------------------------------
+
+using Expr = std::variant<
+    LitInt, LitFloat, LitBool, LitNull, LitString, LitPath,
+    VarRef, WithLookup,
+    Lambda, App, Force, MkThunk,
+    AttrSelect, AttrSelectDyn, HasAttr, HasAttrDyn, AttrSet, AttrSetDyn, RecAttrSet,
+    ListExpr, ConcatLists,
+    If, With, Assert,
+    ConcatStrings,
+    Not, Negate, Add, Sub, Mul, Div, Eq, NEq, Less,
+    And, Or, Impl,
+    Update,
+    PosExpr
+>;
+
+// ---------------------------------------------------------------------------
+// Binding / Terminal / Block
+// ---------------------------------------------------------------------------
+
+struct Binding {
+    VarId var;
+    Expr  expr;
+};
+
+/// Final operation of a Block.
+
+/// Yield `value` as the Block's result.
+struct TermReturn { VarId value; };
+
+using Terminal = std::variant<TermReturn>;
+
+/// A linear sequence of bindings + a terminal.  Owned by Module::blocks.
+struct Block {
+    /// Parameters: VarIds defined "by entry" — for a function body Block,
+    /// this is the parameter Var (or the fresh slots for matched formals);
+    /// for a thunk body, empty.
+    std::vector<VarId>   params;
+    std::vector<Binding> bindings;
+    Terminal             terminal{TermReturn{kInvalid}};
 };
 
 // ---------------------------------------------------------------------------
-// IRModule — the top-level function plus any nested lambdas.
+// Function descriptor (logical lambda / thunk)
 // ---------------------------------------------------------------------------
 
-struct Module
-{
-    /// functions[0] = top-level entry; functions[1..] = inner lambdas
-    /// referenced by IRLambda::funcIdx.
+struct Function {
+    /// Identifier for the entry Block that is run when this function is
+    /// applied / forced.
+    BlockId  entryBlock = kInvalidBlock;
+    /// Optional argument name (for `x: body`).  kInvalidSymbol if no arg
+    /// or formals-only.
+    SymbolId argName    = kInvalidSymbol;
+    /// `arg` VarId in the body's scope (if argName is set).
+    VarId    paramVar   = kInvalid;
+
+    /// Formals (`{ a ? def, b }: body`).  Empty if no formals.
+    std::vector<Formal> formals;
+    bool                hasFormals = false;
+    bool                ellipsis   = false;
+
+    /// Free vars referenced by the body block (and recursively by any
+    /// sub-blocks / nested functions reachable from the body), in the
+    /// order they appear as upvalues at runtime.  Populated by
+    /// computeFreeVars before emit.
+    std::vector<VarId>  freeVars;
+
+    /// Optional name for diagnostics (e.g. lambda or attribute name).
+    std::string         name;
+};
+
+// ---------------------------------------------------------------------------
+// Module
+// ---------------------------------------------------------------------------
+
+struct Module {
+    /// All blocks; blocks[0] is unused (kInvalidBlock sentinel).
+    std::vector<Block> blocks;
+    /// All functions; functions[0] is the top-level entry.
     std::vector<Function> functions;
+
+    /// Symbol table — interned strings indexed by SymbolId.
+    /// symbols[0] is kInvalidSymbol (empty string).
+    std::vector<std::string> symbols;
+    /// Reverse map for interning.
+    std::unordered_map<std::string, SymbolId> symbolIndex;
+
+    VarId   nextVar   = 1;
+    BlockId nextBlock = 1;
+
+    /// Allocate a fresh VarId.
+    VarId freshVar() { return nextVar++; }
+
+    /// Create a new empty Block.  Returns its BlockId.
+    BlockId freshBlock();
+
+    /// Intern a symbol.  Returns SymbolId; same input -> same id.
+    SymbolId internSymbol(std::string_view s);
+
+    /// Convenience: get a symbol's textual name.
+    std::string_view symbolName(SymbolId id) const;
 };
 
-/// Compute free variables for every function.  Must be called after the
-/// AST→IR lowering before emit.
+inline Module makeModule()
+{
+    Module m;
+    // Reserve slot 0 for the kInvalid sentinels.
+    m.blocks.emplace_back();          // blocks[0] = unused
+    m.functions.emplace_back();       // functions[0] = top-level (filled later)
+    m.symbols.emplace_back("");       // symbols[0]  = empty / invalid
+    return m;
+}
+
+// ---------------------------------------------------------------------------
+// Free-vars analysis
+// ---------------------------------------------------------------------------
+
+/// Compute Function::freeVars and Lambda/MkThunk::freeVars for every function
+/// in the module.  Must be run after lowering and before emit.
 void computeFreeVars(Module & m);
 
 } // namespace nix::v3::ir

@@ -1,13 +1,21 @@
 #pragma once
 /// @file
-/// v3 bytecode — minimal opcode set for the bring-up subset.
+/// v3 bytecode — opcodes + CompilationUnit.
 ///
-/// Encoding: a single 32-bit Instruction.  Top 8 bits = opcode; low 24 bits
-/// = operand (or two packed 12-bit operands; opcode-specific).  Multi-word
-/// instructions (e.g. CALL with N args) follow with extra data words.
+/// Encoding: a single 32-bit Instruction.  Top 8 bits = opcode; low 24 bits =
+/// operand (or 16+8 packed; opcode-specific).  Multi-word instructions
+/// (e.g. CALL with N args, MAKE_CLOSURE with nUpvalues, JUMP with offset)
+/// follow with extra 32-bit data words.
 ///
-/// Designed to be expanded as we cover more of Nix.  The bring-up subset
-/// uses ~10 opcodes; full Nix coverage will add ~40 more.
+/// Per-frame stack model:
+///   [params...]         provided by caller
+///   [locals...]         allocated up-front from LambdaDescriptor::nLocals
+///   [operand stack]     grows after locals; ephemeral
+/// All slot indices in opcodes (OP_GET_LOCAL etc.) are FRAME-RELATIVE —
+/// indexing into the locals array starting at stackBaseOffset.
+///
+/// JUMPS use absolute code offsets (not deltas) for easier debugging; the
+/// emitter patches them at the second pass.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
@@ -16,6 +24,7 @@
 #include "v3/closure.hh"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace nix::v3 {
@@ -26,22 +35,84 @@ enum Op : uint8_t
 {
     OP_NOP            = 0x00,
 
-    // Bring-up subset.
-    OP_LIT_INT        = 0x01,  // [imm:24]   push tagged int (24-bit signed)
-    OP_LIT_INT_BIG    = 0x02,  // [const:24] push int from constants pool
-    OP_GET_LOCAL      = 0x03,  // [slot:24]  push frame.locals[slot]
-    OP_GET_UPVALUE    = 0x04,  // [idx:24]   push closure->upvalues[idx]
-    OP_SET_LOCAL      = 0x05,  // [slot:24]  pop into frame.locals[slot]
+    // --- Literals -------------------------------------------------------
+    OP_LIT_INT        = 0x01,  // [imm:24]   small signed int
+    OP_LIT_INT_BIG    = 0x02,  // [const:24] from intConstants
+    OP_LIT_FLOAT      = 0x03,  // [const:24] from floatConstants
+    OP_LIT_STR        = 0x04,  // [const:24] from stringConstants
+    OP_LIT_PATH       = 0x05,  // [const:24] from stringConstants (with accessor table)
+    OP_LIT_TRUE       = 0x06,
+    OP_LIT_FALSE      = 0x07,
+    OP_LIT_NULL       = 0x08,
 
-    OP_ADD            = 0x10,
-    OP_SUB            = 0x11,
-    OP_MUL            = 0x12,
+    // --- Locals / upvalues ----------------------------------------------
+    OP_GET_LOCAL      = 0x10,  // [slot:24]
+    OP_SET_LOCAL      = 0x11,  // [slot:24]   pop into slot
+    OP_GET_UPVALUE    = 0x12,  // [idx:24]    push closure->upvalues[idx]
+    OP_DUP            = 0x13,
+    OP_POP            = 0x14,
+    OP_SWAP           = 0x15,
 
-    OP_MAKE_CLOSURE   = 0x20,  // [funcIdx:24]; nUpvalues data word follows; pops nUpvalues from stack
-    OP_CALL           = 0x21,  // pop arg, pop fun, push result (single-arg call)
-    OP_RETURN         = 0x22,  // pop result, return to caller
+    // --- Arithmetic ------------------------------------------------------
+    OP_ADD            = 0x20,
+    OP_SUB            = 0x21,
+    OP_MUL            = 0x22,
+    OP_DIV            = 0x23,
+    OP_NEGATE         = 0x24,
 
-    OP_HALT           = 0xFF,  // top-level "stop dispatch loop"
+    // --- Comparison -----------------------------------------------------
+    OP_EQ             = 0x30,
+    OP_NEQ            = 0x31,
+    OP_LESS           = 0x32,
+
+    // --- Boolean / control ----------------------------------------------
+    OP_NOT            = 0x40,
+    /// Short-circuit AND: if top is false, jump (leaving false on stack);
+    /// otherwise pop and continue (the rhs's value will be the result).
+    OP_AND_BRANCH     = 0x41,  // [target:24] — jump-if-false-keep
+    OP_OR_BRANCH      = 0x42,  // [target:24] — jump-if-true-keep
+    /// Implication: if top is false, jump (push true and leave on stack);
+    /// otherwise pop and continue.
+    OP_IMPL_BRANCH    = 0x43,  // [target:24]
+
+    OP_JUMP           = 0x44,  // [target:24]
+    OP_BRANCH_FALSE   = 0x45,  // [target:24]   pop, jump if false
+    OP_BRANCH_TRUE    = 0x46,  // [target:24]   pop, jump if true
+
+    // --- Closures / calls / thunks --------------------------------------
+    OP_MAKE_CLOSURE   = 0x50,  // [funcIdx:24]; data: nUpvalues; pops nUpvalues
+    OP_MAKE_THUNK     = 0x51,  // [funcIdx:24]; data: nUpvalues; pops nUpvalues
+    OP_CALL           = 0x52,  // single-arg call: pop arg, pop fun, push result
+    OP_RETURN         = 0x53,  // pop result, return to caller
+    OP_FORCE          = 0x54,  // pop, force (run if thunk), push WHNF value
+
+    // --- Lists ----------------------------------------------------------
+    OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list
+    OP_LIST_CONCAT    = 0x61,  // pop b, pop a, push a ++ b
+
+    // --- Attrsets -------------------------------------------------------
+    OP_ATTRS_INIT     = 0x70,  // [n:24]   pop n values; data: n SymbolIds; build sorted attrset
+    OP_ATTRS_INIT_DYN = 0x71,  // [nStatic:16, nDyn:8] then static syms then values then dyn name+value pairs
+    OP_ATTRS_REC_INIT = 0x72,  // [n:24]   recursive — entries see each other (build via thunks)
+    OP_ATTRS_SELECT   = 0x73,  // [sym:24] pop attrs, push attrs[sym]
+    OP_ATTRS_SELECT_DYN = 0x74, // pop name, pop attrs, push attrs[name]
+    OP_ATTRS_HAS      = 0x75,  // [sym:24] pop attrs, push bool
+    OP_ATTRS_HAS_DYN  = 0x76,
+    OP_ATTRS_UPDATE   = 0x77,
+
+    // --- With -----------------------------------------------------------
+    OP_WITH_PUSH      = 0x80,  // pop attrset, push it on with-stack
+    OP_WITH_POP       = 0x81,
+    OP_WITH_LOOKUP    = 0x82,  // [sym:24]; data: depth (0=innermost)
+
+    // --- Strings --------------------------------------------------------
+    OP_STR_CONCAT     = 0x90,  // [n:24] forceString stored in low bit of n; pops n parts
+
+    // --- Assert / pos ---------------------------------------------------
+    OP_ASSERT         = 0xA0,  // pop bool; raise if false
+    OP_POS            = 0xA1,  // [posIdx:24]  push pos attrset
+
+    OP_HALT           = 0xFF,
 };
 
 constexpr inline Op decodeOp(Instruction i) noexcept
@@ -57,7 +128,7 @@ constexpr inline uint32_t decodeOperand(Instruction i) noexcept
 constexpr inline int32_t decodeSignedOperand(Instruction i) noexcept
 {
     int32_t op = static_cast<int32_t>(i & 0x00FFFFFF);
-    if (op & 0x00800000) op |= 0xFF000000; // sign extend from 24-bit
+    if (op & 0x00800000) op |= 0xFF000000;
     return op;
 }
 
@@ -75,14 +146,18 @@ struct CompilationUnit
     /// Flat instruction stream.
     std::vector<Instruction> code;
 
-    /// Constants pool (large ints, future strings).
-    std::vector<int64_t> intConstants;
+    /// Constants pools.
+    std::vector<int64_t>     intConstants;
+    std::vector<double>      floatConstants;
+    std::vector<std::string> stringConstants;
 
-    /// Lambda descriptors, indexed by IRLambda::funcIdx.
+    /// Per-symbol-id (v3 IR SymbolId space) → string.  Mirrors the IR
+    /// symbol table for runtime use (with-lookup, attr-name display).
+    std::vector<std::string> symbolTable;
+
+    /// Lambda descriptors, indexed by IR FuncId.  function 0 = top-level.
     std::vector<LambdaDescriptor> lambdas;
-
-    /// Per-lambda starting offset within `code`.  Same length as `lambdas`.
-    std::vector<uint32_t> lambdaCodeOffsets;
+    std::vector<uint32_t>          lambdaCodeOffsets;
 
     /// Top-level entry offset.
     uint32_t entryOffset = 0;

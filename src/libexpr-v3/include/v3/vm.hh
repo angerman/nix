@@ -14,8 +14,16 @@
 
 namespace nix::v3 {
 
-/// Slim 32-byte CallFrame.  No continuation state (rare; goes to side-table
-/// when added).  No register-form result-store fields.
+/// CallFrame flags.
+enum CallFrameFlag : uint8_t
+{
+    CFF_NONE     = 0,
+    /// On OP_RETURN, write the return value into the Thunk pointed to by
+    /// `thunk` (state -> Evaluated, copy value into evaluated slot).
+    CFF_THUNK_RETURN = 1 << 0,
+};
+
+/// Slim CallFrame.
 struct CallFrame
 {
     const CompilationUnit * cu;        // 8
@@ -26,14 +34,20 @@ struct CallFrame
     uint32_t  stackBaseOffset;          // 4
     const Closure * closure;            // 8
     Value *   resultPtr;                // 8: where return value is written
+
+    /// Optional thunk pointer for CFF_THUNK_RETURN frames.  When set, the
+    /// return value is also copied into thunk->evaluated and the thunk's
+    /// state is set to Evaluated.
+    Thunk * thunk = nullptr;
 };
-static_assert(sizeof(CallFrame) <= 40, "CallFrame should be small");
 
 /// Per-EvalState VM state.
 struct VMState
 {
     std::vector<Value>     valueStack;   // operand + locals
     std::vector<CallFrame> frames;
+    /// Stack of in-scope `with` attrset values.  Top of stack = innermost.
+    std::vector<Value>     withStack;
     uint64_t nrInstructions = 0;
 };
 

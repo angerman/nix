@@ -1,8 +1,17 @@
 /// @file
-/// v3 bring-up smoke test.
+/// v3 bring-up smoke tests.  Hand-builds the IR for several small
+/// programs and checks that the v3 pipeline produces the expected
+/// values.
 ///
-/// Hand-build the IR for `let f = x: x + 1; in f 41` and assert that
-/// running it through the v3 pipeline yields 42.
+/// Each test:
+///   1. Constructs an ir::Module via makeModule() (reserves slot 0).
+///   2. Sets up Function descriptors and Blocks.
+///   3. Runs computeFreeVars + compile + run.
+///   4. Asserts the resulting Value.
+///
+/// The helpers below take BlockId / FuncId rather than Block& / Function&
+/// so that subsequent freshBlock / functions.emplace_back calls cannot
+/// invalidate the references held by callers.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
@@ -17,22 +26,45 @@
 
 using namespace nix::v3;
 
+// ---------------------------------------------------------------------------
+// Helpers — work via BlockId / FuncId, so vector reallocations are safe.
+// ---------------------------------------------------------------------------
+
+static ir::Function & funcOf(ir::Module & m, ir::FuncId fid) { return m.functions[fid]; }
+
+static void setReturn(ir::Module & m, ir::BlockId bid, ir::VarId v)
+{
+    m.blocks[bid].terminal = ir::TermReturn{v};
+}
+
+static ir::VarId addBinding(ir::Module & m, ir::BlockId bid, ir::Expr e)
+{
+    auto v = m.freshVar();
+    m.blocks[bid].bindings.push_back({v, std::move(e)});
+    return v;
+}
+
+static ir::FuncId addFunction(ir::Module & m)
+{
+    m.functions.emplace_back();
+    return static_cast<ir::FuncId>(m.functions.size() - 1);
+}
+
+// ---------------------------------------------------------------------------
+
 static int testLitInt()
 {
-    // Top-level: just `42`.
-    ir::Module m;
-    ir::Function top;
-    top.name = "top";
-    top.bindings.push_back({1, ir::LitInt{42}});
-    top.returnVar = 1;
-    m.functions.push_back(std::move(top));
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto v = addBinding(m, entry, ir::LitInt{42});
+    setReturn(m, entry, v);
 
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
     if (!r.isInt() || r.payload.i != 42) {
-        std::fprintf(stderr, "testLitInt: expected 42, got tag=%d val=%lld\n",
-            (int)r.tag(), (long long)r.payload.i);
+        std::fprintf(stderr, "testLitInt: expected 42, got tag=%d\n", (int)r.tag());
         return 1;
     }
     std::fprintf(stderr, "testLitInt: OK (42)\n");
@@ -41,63 +73,51 @@ static int testLitInt()
 
 static int testAdd()
 {
-    // Top-level: `1 + 2`.
-    ir::Module m;
-    ir::Function top;
-    top.name = "top";
-    top.bindings.push_back({1, ir::LitInt{1}});
-    top.bindings.push_back({2, ir::LitInt{2}});
-    top.bindings.push_back({3, ir::Add{1, 2}});
-    top.returnVar = 3;
-    m.functions.push_back(std::move(top));
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitInt{1});
+    auto b = addBinding(m, entry, ir::LitInt{2});
+    auto c = addBinding(m, entry, ir::Add{a, b});
+    setReturn(m, entry, c);
 
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
     if (!r.isInt() || r.payload.i != 3) {
-        std::fprintf(stderr, "testAdd: expected 3, got tag=%d val=%lld\n",
-            (int)r.tag(), (long long)r.payload.i);
+        std::fprintf(stderr, "testAdd: expected 3, got tag=%d\n", (int)r.tag());
         return 1;
     }
     std::fprintf(stderr, "testAdd: OK (1+2=3)\n");
     return 0;
 }
 
+// `(x: x + 1) 41` → 42
 static int testLambdaCall()
 {
-    // Equivalent to `let f = x: x + 1; in f 41` → 42.
-    //
-    //   Module:
-    //     functions[0] = top:
-    //       v1 = Lambda { freeVars=[], funcIdx=1 }   -- f
-    //       v2 = LitInt 41                           -- 41
-    //       v3 = App { fun=v1, arg=v2 }              -- f 41
-    //       return v3
-    //     functions[1] = inner:
-    //       param = 100                              -- x (any unique VarId)
-    //       v101 = LitInt 1
-    //       v102 = Add { lhs=100, rhs=101 }
-    //       return v102
+    auto m = ir::makeModule();
 
-    ir::Module m;
+    auto innerFid = addFunction(m);
+    auto innerEntry = m.freshBlock();
+    auto innerArgName = m.internSymbol("x");
+    auto innerParam = m.freshVar();
+    {
+        auto & f = funcOf(m, innerFid);
+        f.entryBlock = innerEntry;
+        f.argName = innerArgName;
+        f.paramVar = innerParam;
+        f.name = "f";
+        auto v1 = addBinding(m, innerEntry, ir::LitInt{1});
+        auto v2 = addBinding(m, innerEntry, ir::Add{innerParam, v1});
+        setReturn(m, innerEntry, v2);
+    }
 
-    // functions[0] (top)
-    ir::Function top;
-    top.name = "top";
-    top.bindings.push_back({1, ir::Lambda{ /*freeVars*/{}, /*funcIdx*/1 }});
-    top.bindings.push_back({2, ir::LitInt{41}});
-    top.bindings.push_back({3, ir::App{1, 2}});
-    top.returnVar = 3;
-    m.functions.push_back(std::move(top));
-
-    // functions[1] (inner)
-    ir::Function inner;
-    inner.name = "f";
-    inner.param = 100;
-    inner.bindings.push_back({101, ir::LitInt{1}});
-    inner.bindings.push_back({102, ir::Add{100, 101}});
-    inner.returnVar = 102;
-    m.functions.push_back(std::move(inner));
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+    auto fv = addBinding(m, topEntry, ir::Lambda{ innerFid, /*freeVars*/ {} });
+    auto av = addBinding(m, topEntry, ir::LitInt{41});
+    auto rv = addBinding(m, topEntry, ir::App{fv, av});
+    setReturn(m, topEntry, rv);
 
     ir::computeFreeVars(m);
     auto cu = compile(m);
@@ -111,42 +131,35 @@ static int testLambdaCall()
     return 0;
 }
 
+// `let n = 10; f = x: x + n; in f 32` → 42
 static int testClosureCapture()
 {
-    // Equivalent to `let n = 10; f = x: x + n; in f 32` → 42.
-    //
-    //   Module:
-    //     functions[0] = top:
-    //       v1 = LitInt 10                           -- n
-    //       v2 = Lambda { freeVars=[v1], funcIdx=1 } -- f (captures n)
-    //       v3 = LitInt 32                           -- 32
-    //       v4 = App { v2, v3 }
-    //       return v4
-    //     functions[1] = inner:
-    //       param = 100                              -- x
-    //       freeVars in IR will contain v1 (n)
-    //       body: v101 = Add(100, v1); return v101
-    //
-    //   Inside the inner function, references to v1 are upvalues
-    //   (free vars).  computeFreeVars + emit translate to OP_GET_UPVALUE.
+    auto m = ir::makeModule();
 
-    ir::Module m;
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
 
-    ir::Function top;
-    top.name = "top";
-    top.bindings.push_back({1, ir::LitInt{10}});
-    top.bindings.push_back({2, ir::Lambda{ /*freeVars*/{}, /*funcIdx*/1 }});
-    top.bindings.push_back({3, ir::LitInt{32}});
-    top.bindings.push_back({4, ir::App{2, 3}});
-    top.returnVar = 4;
-    m.functions.push_back(std::move(top));
+    // Bind n in the top scope first; the inner function captures it.
+    auto n = addBinding(m, topEntry, ir::LitInt{10});
 
-    ir::Function inner;
-    inner.name = "f";
-    inner.param = 100;
-    inner.bindings.push_back({101, ir::Add{100, 1}}); // refers to outer v1
-    inner.returnVar = 101;
-    m.functions.push_back(std::move(inner));
+    auto innerFid = addFunction(m);
+    auto innerEntry = m.freshBlock();
+    auto argName = m.internSymbol("x");
+    auto innerParam = m.freshVar();
+    {
+        auto & f = funcOf(m, innerFid);
+        f.entryBlock = innerEntry;
+        f.argName = argName;
+        f.paramVar = innerParam;
+        f.name = "f";
+        auto added = addBinding(m, innerEntry, ir::Add{innerParam, n});
+        setReturn(m, innerEntry, added);
+    }
+
+    auto fv = addBinding(m, topEntry, ir::Lambda{ innerFid, /*freeVars*/ {} });
+    auto av = addBinding(m, topEntry, ir::LitInt{32});
+    auto rv = addBinding(m, topEntry, ir::App{fv, av});
+    setReturn(m, topEntry, rv);
 
     ir::computeFreeVars(m);
     auto cu = compile(m);
@@ -160,6 +173,230 @@ static int testClosureCapture()
     return 0;
 }
 
+// `if 1 < 2 then 100 else 200` → 100
+static int testIf()
+{
+    auto m = ir::makeModule();
+    auto entry  = m.freshBlock();
+    auto thenB  = m.freshBlock();
+    auto elseB  = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto a = addBinding(m, entry, ir::LitInt{1});
+    auto b = addBinding(m, entry, ir::LitInt{2});
+    auto cond = addBinding(m, entry, ir::Less{a, b});
+    auto result = addBinding(m, entry, ir::If{cond, thenB, elseB});
+    setReturn(m, entry, result);
+
+    auto t1 = addBinding(m, thenB, ir::LitInt{100});
+    setReturn(m, thenB, t1);
+
+    auto e1 = addBinding(m, elseB, ir::LitInt{200});
+    setReturn(m, elseB, e1);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isInt() || r.payload.i != 100) {
+        std::fprintf(stderr, "testIf: expected 100, got tag=%d val=%lld\n",
+            (int)r.tag(), (long long)r.payload.i);
+        return 1;
+    }
+    std::fprintf(stderr, "testIf: OK (if 1<2 then 100 else 200 = 100)\n");
+    return 0;
+}
+
+// `[1 2 3] ++ [4 5]` → list of 5
+static int testListConcat()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto i1 = addBinding(m, entry, ir::LitInt{1});
+    auto i2 = addBinding(m, entry, ir::LitInt{2});
+    auto i3 = addBinding(m, entry, ir::LitInt{3});
+    auto i4 = addBinding(m, entry, ir::LitInt{4});
+    auto i5 = addBinding(m, entry, ir::LitInt{5});
+    auto l1 = addBinding(m, entry, ir::ListExpr{ {i1, i2, i3} });
+    auto l2 = addBinding(m, entry, ir::ListExpr{ {i4, i5} });
+    auto cc = addBinding(m, entry, ir::ConcatLists{l1, l2});
+    setReturn(m, entry, cc);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isList() || r.payload.list->size != 5) {
+        std::fprintf(stderr, "testListConcat: expected list of 5, got tag=%d\n", (int)r.tag());
+        return 1;
+    }
+    for (uint32_t i = 0; i < 5; ++i) {
+        Value & el = r.payload.list->elems[i];
+        if (!el.isInt() || el.payload.i != i + 1) {
+            std::fprintf(stderr, "testListConcat: elem[%u] expected %u, got %lld\n",
+                i, i + 1, (long long)el.payload.i);
+            return 1;
+        }
+    }
+    std::fprintf(stderr, "testListConcat: OK ([1 2 3] ++ [4 5] = [1 2 3 4 5])\n");
+    return 0;
+}
+
+// `{ a = 1; b = 2; }.a` → 1
+static int testAttrSelect()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto va = addBinding(m, entry, ir::LitInt{1});
+    auto vb = addBinding(m, entry, ir::LitInt{2});
+    auto sa = m.internSymbol("a");
+    auto sb = m.internSymbol("b");
+    auto attrs = addBinding(m, entry, ir::AttrSet{ { {sa, va}, {sb, vb} } });
+    auto sel = addBinding(m, entry, ir::AttrSelect{attrs, sa});
+    setReturn(m, entry, sel);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isInt() || r.payload.i != 1) {
+        std::fprintf(stderr, "testAttrSelect: expected 1, got tag=%d\n", (int)r.tag());
+        return 1;
+    }
+    std::fprintf(stderr, "testAttrSelect: OK ({ a=1; b=2; }.a = 1)\n");
+    return 0;
+}
+
+// `({a=1;}//{b=2;}).b` -> 2
+static int testAttrUpdate()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto sa = m.internSymbol("a");
+    auto sb = m.internSymbol("b");
+    auto va = addBinding(m, entry, ir::LitInt{1});
+    auto vb = addBinding(m, entry, ir::LitInt{2});
+    auto a1 = addBinding(m, entry, ir::AttrSet{ { {sa, va} } });
+    auto a2 = addBinding(m, entry, ir::AttrSet{ { {sb, vb} } });
+    auto u  = addBinding(m, entry, ir::Update{a1, a2});
+    auto sel= addBinding(m, entry, ir::AttrSelect{u, sb});
+    setReturn(m, entry, sel);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isInt() || r.payload.i != 2) {
+        std::fprintf(stderr, "testAttrUpdate: expected 2, got tag=%d\n", (int)r.tag());
+        return 1;
+    }
+    std::fprintf(stderr, "testAttrUpdate: OK (({a=1;}//{b=2;}).b = 2)\n");
+    return 0;
+}
+
+// `with { x = 7; y = 11; }; x + y` → 18
+static int testWith()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    auto bodyB = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto sx = m.internSymbol("x");
+    auto sy = m.internSymbol("y");
+
+    auto v7 = addBinding(m, entry, ir::LitInt{7});
+    auto v11 = addBinding(m, entry, ir::LitInt{11});
+    auto attrs = addBinding(m, entry, ir::AttrSet{ { {sx, v7}, {sy, v11} } });
+    auto wResult = addBinding(m, entry, ir::With{attrs, bodyB});
+    setReturn(m, entry, wResult);
+
+    auto wx = addBinding(m, bodyB, ir::WithLookup{sx, 0});
+    auto wy = addBinding(m, bodyB, ir::WithLookup{sy, 0});
+    auto sum = addBinding(m, bodyB, ir::Add{wx, wy});
+    setReturn(m, bodyB, sum);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isInt() || r.payload.i != 18) {
+        std::fprintf(stderr, "testWith: expected 18, got tag=%d val=%lld\n",
+            (int)r.tag(), (long long)r.payload.i);
+        return 1;
+    }
+    std::fprintf(stderr, "testWith: OK (with {x=7;y=11;}; x+y = 18)\n");
+    return 0;
+}
+
+// `force(thunk{10}) + 5` → 15
+static int testThunkForce()
+{
+    auto m = ir::makeModule();
+
+    auto innerFid = addFunction(m);
+    auto innerEntry = m.freshBlock();
+    {
+        auto & f = funcOf(m, innerFid);
+        f.entryBlock = innerEntry;
+        f.name = "thunk_body";
+        auto v = addBinding(m, innerEntry, ir::LitInt{10});
+        setReturn(m, innerEntry, v);
+    }
+
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto thunk = addBinding(m, entry, ir::MkThunk{ innerFid, /*freeVars*/ {} });
+    auto forced = addBinding(m, entry, ir::Force{thunk});
+    auto five = addBinding(m, entry, ir::LitInt{5});
+    auto sum = addBinding(m, entry, ir::Add{forced, five});
+    setReturn(m, entry, sum);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isInt() || r.payload.i != 15) {
+        std::fprintf(stderr, "testThunkForce: expected 15, got tag=%d val=%lld\n",
+            (int)r.tag(), (long long)r.payload.i);
+        return 1;
+    }
+    std::fprintf(stderr, "testThunkForce: OK (force(thunk{10}) + 5 = 15)\n");
+    return 0;
+}
+
+// `(true && false) || true` → true
+static int testShortCircuit()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    auto andRhs = m.freshBlock();
+    auto orRhs = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto vt = addBinding(m, entry, ir::LitBool{true});
+
+    auto vfalse = addBinding(m, andRhs, ir::LitBool{false});
+    setReturn(m, andRhs, vfalse);
+    auto andResult = addBinding(m, entry, ir::And{vt, andRhs});
+
+    auto vt2 = addBinding(m, orRhs, ir::LitBool{true});
+    setReturn(m, orRhs, vt2);
+    auto orResult = addBinding(m, entry, ir::Or{andResult, orRhs});
+    setReturn(m, entry, orResult);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isBool() || r.payload.i != 1) {
+        std::fprintf(stderr, "testShortCircuit: expected true, got tag=%d val=%lld\n",
+            (int)r.tag(), (long long)r.payload.i);
+        return 1;
+    }
+    std::fprintf(stderr, "testShortCircuit: OK ((true && false) || true = true)\n");
+    return 0;
+}
+
 int main()
 {
     int rc = 0;
@@ -167,17 +404,25 @@ int main()
     rc |= testAdd();
     rc |= testLambdaCall();
     rc |= testClosureCapture();
+    rc |= testIf();
+    rc |= testListConcat();
+    rc |= testAttrSelect();
+    rc |= testAttrUpdate();
+    rc |= testWith();
+    rc |= testThunkForce();
+    rc |= testShortCircuit();
 
-    std::fprintf(stderr, "\nv3 alloc stats: values=%llu closures=%llu thunks=%llu envs=%llu\n",
-        (unsigned long long)allocStats().valuesAllocated,
-        (unsigned long long)allocStats().closuresAllocated,
-        (unsigned long long)allocStats().thunksAllocated,
-        (unsigned long long)allocStats().envsAllocated);
+    auto & st = allocStats();
+    std::fprintf(stderr,
+        "\nv3 alloc stats: closures=%llu thunks=%llu lists=%llu attrsets=%llu\n",
+        (unsigned long long)st.closuresAllocated,
+        (unsigned long long)st.thunksAllocated,
+        (unsigned long long)st.listsAllocated,
+        (unsigned long long)st.attrsetsAllocated);
 
-    if (rc == 0) {
+    if (rc == 0)
         std::fprintf(stderr, "\nALL v3 SMOKE TESTS PASSED\n");
-    } else {
+    else
         std::fprintf(stderr, "\nSOME v3 TESTS FAILED\n");
-    }
     return rc;
 }

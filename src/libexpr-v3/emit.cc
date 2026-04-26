@@ -1,12 +1,20 @@
 /// @file
-/// v3 IR → bytecode emit (subset).
+/// v3 IR → bytecode emit.
 ///
-/// Single-block code only.  Each binding gets a slot index in the function's
-/// frame; the binding's RHS code computes a value into that slot.  TermReturn
-/// (here, f.returnVar) emits OP_RETURN at the end.
+/// Per Function:
+///   - allocate stack slots for param + every reachable binding (lazily,
+///     on first reference)
+///   - emit the entry Block; emit any sub-Blocks (if branches, &&/||/->
+///     rhs, with/assert bodies) in-line at their reference site
+///   - terminate with OP_HALT (top-level) or OP_RETURN
 ///
-/// Free vars become OP_GET_UPVALUE; the param becomes slot 0.  Locals start
-/// at slot 1 (or 0 if no param).
+/// Slot allocation is per-Function: a VarId resolves to a frame slot if it
+/// is defined within the Function, or an upvalue index if it is a free
+/// variable captured by the enclosing closure.
+///
+/// Each Block's TermReturn leaves the result Value on the operand stack.
+/// The parent context (e.g., the surrounding If binding) consumes that
+/// stack-top value, typically via OP_SET_LOCAL.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
@@ -16,8 +24,8 @@
 #include "v3/vm.hh"
 
 #include <cassert>
-#include <unordered_map>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace nix::v3 {
 
@@ -25,117 +33,371 @@ namespace {
 
 struct Emitter
 {
-    const ir::Module & module;
+    const ir::Module & m;
     CompilationUnit unit;
 
-    Emitter(const ir::Module & m) : module(m) {}
-
-    /// Emit a function (top-level or inner).  Returns the code offset where
-    /// the function's body starts.
-    uint32_t emitFunction(uint32_t funcIdx)
+    struct FuncCtx
     {
-        const auto & f = module.functions[funcIdx];
-
-        uint32_t codeStart = static_cast<uint32_t>(unit.code.size());
-
-        // Slot allocation: param at 0, then bindings in order.
-        std::unordered_map<ir::VarId, uint16_t> slots;
+        ir::FuncId                          fid;
+        std::unordered_map<ir::VarId, uint16_t> slot;
+        std::unordered_map<ir::VarId, uint16_t> upvalue;
         uint16_t nextSlot = 0;
-        if (f.param != ir::kInvalid)
-            slots[f.param] = nextSlot++;
-        for (auto & b : f.bindings)
-            slots[b.var] = nextSlot++;
+        uint16_t nLocals  = 0;
+    };
+    FuncCtx * ctx = nullptr;
 
-        // Upvalue idx = position in f.freeVars.
-        std::unordered_map<ir::VarId, uint16_t> upvalueIdx;
-        for (uint16_t i = 0; i < f.freeVars.size(); ++i)
-            upvalueIdx[f.freeVars[i]] = i;
+    Emitter(const ir::Module & mod) : m(mod) {}
 
-        auto emitVarRef = [&](ir::VarId v) {
-            auto sit = slots.find(v);
-            if (sit != slots.end()) {
-                unit.code.push_back(encode(OP_GET_LOCAL, sit->second));
-                return;
-            }
-            auto uit = upvalueIdx.find(v);
-            if (uit != upvalueIdx.end()) {
-                unit.code.push_back(encode(OP_GET_UPVALUE, uit->second));
-                return;
-            }
-            throw std::runtime_error("emit: unbound VarId " + std::to_string(v));
-        };
+    // Helpers ---------------------------------------------------------------
 
-        // Emit each binding.
-        for (auto & b : f.bindings) {
-            std::visit([&](const auto & e) {
-                using T = std::decay_t<decltype(e)>;
-                if constexpr (std::is_same_v<T, ir::LitInt>) {
-                    if (e.value >= -(1 << 23) && e.value < (1 << 23)) {
-                        unit.code.push_back(encode(OP_LIT_INT, static_cast<uint32_t>(e.value) & 0x00FFFFFF));
-                    } else {
-                        uint32_t idx = static_cast<uint32_t>(unit.intConstants.size());
-                        unit.intConstants.push_back(e.value);
-                        unit.code.push_back(encode(OP_LIT_INT_BIG, idx));
-                    }
-                } else if constexpr (std::is_same_v<T, ir::VarRef>) {
-                    emitVarRef(e.var);
-                } else if constexpr (std::is_same_v<T, ir::Lambda>) {
-                    // Push captures (in freeVars order — the inner function
-                    // expects them in that order via OP_GET_UPVALUE).
-                    for (auto fv : e.freeVars) emitVarRef(fv);
-                    // OP_MAKE_CLOSURE [funcIdx]; data word = nUpvalues
-                    unit.code.push_back(encode(OP_MAKE_CLOSURE, e.funcIdx));
-                    unit.code.push_back(static_cast<uint32_t>(e.freeVars.size()));
-                } else if constexpr (std::is_same_v<T, ir::App>) {
-                    emitVarRef(e.fun);
-                    emitVarRef(e.arg);
-                    unit.code.push_back(encode(OP_CALL));
-                } else if constexpr (std::is_same_v<T, ir::Add>) {
-                    emitVarRef(e.lhs); emitVarRef(e.rhs);
-                    unit.code.push_back(encode(OP_ADD));
-                } else if constexpr (std::is_same_v<T, ir::Sub>) {
-                    emitVarRef(e.lhs); emitVarRef(e.rhs);
-                    unit.code.push_back(encode(OP_SUB));
-                } else if constexpr (std::is_same_v<T, ir::Mul>) {
-                    emitVarRef(e.lhs); emitVarRef(e.rhs);
-                    unit.code.push_back(encode(OP_MUL));
-                }
-            }, b.expr);
-            unit.code.push_back(encode(OP_SET_LOCAL, slots[b.var]));
+    uint16_t getOrAssignSlot(ir::VarId v)
+    {
+        auto it = ctx->slot.find(v);
+        if (it != ctx->slot.end()) return it->second;
+        uint16_t s = ctx->nextSlot++;
+        ctx->slot[v] = s;
+        if (s + 1 > ctx->nLocals) ctx->nLocals = s + 1;
+        return s;
+    }
+
+    void emitVarRef(ir::VarId v)
+    {
+        if (auto it = ctx->slot.find(v); it != ctx->slot.end()) {
+            unit.code.push_back(encode(OP_GET_LOCAL, it->second));
+            return;
+        }
+        if (auto uit = ctx->upvalue.find(v); uit != ctx->upvalue.end()) {
+            unit.code.push_back(encode(OP_GET_UPVALUE, uit->second));
+            return;
+        }
+        throw std::runtime_error("v3 emit: unbound VarId " + std::to_string(v));
+    }
+
+    uint32_t addIntConst(int64_t n)
+    {
+        unit.intConstants.push_back(n);
+        return static_cast<uint32_t>(unit.intConstants.size() - 1);
+    }
+    uint32_t addFloatConst(double d)
+    {
+        unit.floatConstants.push_back(d);
+        return static_cast<uint32_t>(unit.floatConstants.size() - 1);
+    }
+    uint32_t addStringConst(std::string_view s)
+    {
+        unit.stringConstants.emplace_back(s);
+        return static_cast<uint32_t>(unit.stringConstants.size() - 1);
+    }
+
+    // Patch helpers ---------------------------------------------------------
+
+    /// Emit a placeholder jump and return the index of the operand word
+    /// (so the caller can patch in the absolute target later).
+    uint32_t emitJumpPlaceholder(Op op)
+    {
+        unit.code.push_back(encode(op, 0));
+        return static_cast<uint32_t>(unit.code.size() - 1);
+    }
+
+    void patchJump(uint32_t at, uint32_t target)
+    {
+        // Preserve the opcode byte; replace the 24-bit operand.
+        Instruction prev = unit.code[at];
+        unit.code[at] = (prev & 0xFF000000u) | (target & 0x00FFFFFFu);
+    }
+
+    // Block emit ------------------------------------------------------------
+
+    /// Emit a Block in-line within the current function.  After emission,
+    /// the Block's TermReturn value is on top of the operand stack.
+    void emitBlock(ir::BlockId bid)
+    {
+        const ir::Block & b = m.blocks[bid];
+
+        // Params have already been bound by the caller (e.g., function
+        // prologue assigned param-VarId -> slot 0).
+        for (auto & bd : b.bindings) {
+            emitExpr(bd.expr);
+            uint16_t slot = getOrAssignSlot(bd.var);
+            unit.code.push_back(encode(OP_SET_LOCAL, slot));
         }
 
-        // Return.
-        if (f.returnVar != ir::kInvalid)
-            emitVarRef(f.returnVar);
-        // Top-level emits OP_HALT instead of OP_RETURN.
-        unit.code.push_back(encode(funcIdx == 0 ? OP_HALT : OP_RETURN));
+        // Terminal: TermReturn for now (only variant supported).
+        const auto & ret = std::get<ir::TermReturn>(b.terminal);
+        if (ret.value != ir::kInvalid)
+            emitVarRef(ret.value);
+        else
+            unit.code.push_back(encode(OP_LIT_NULL));
+    }
 
-        // Register descriptor.
-        if (unit.lambdas.size() <= funcIdx) unit.lambdas.resize(funcIdx + 1);
-        if (unit.lambdaCodeOffsets.size() <= funcIdx) unit.lambdaCodeOffsets.resize(funcIdx + 1);
-        unit.lambdas[funcIdx] = LambdaDescriptor{
-            .codeOffset = codeStart,
+    // Expr emit -------------------------------------------------------------
+
+    void emitExpr(const ir::Expr & expr)
+    {
+        std::visit([&](auto const & e) { emitOne(e); }, expr);
+    }
+
+    // -- Literals
+    void emitOne(const ir::LitInt & e)
+    {
+        if (e.value >= -(1 << 23) && e.value < (1 << 23)) {
+            unit.code.push_back(encode(OP_LIT_INT, static_cast<uint32_t>(e.value) & 0x00FFFFFF));
+        } else {
+            unit.code.push_back(encode(OP_LIT_INT_BIG, addIntConst(e.value)));
+        }
+    }
+    void emitOne(const ir::LitFloat & e)
+    {
+        unit.code.push_back(encode(OP_LIT_FLOAT, addFloatConst(e.value)));
+    }
+    void emitOne(const ir::LitBool & e)
+    {
+        unit.code.push_back(encode(e.value ? OP_LIT_TRUE : OP_LIT_FALSE));
+    }
+    void emitOne(const ir::LitNull &) { unit.code.push_back(encode(OP_LIT_NULL)); }
+    void emitOne(const ir::LitString & e)
+    {
+        unit.code.push_back(encode(OP_LIT_STR, addStringConst(e.value)));
+    }
+    void emitOne(const ir::LitPath & e)
+    {
+        // For now: store path string in stringConstants; accessor table TBD.
+        unit.code.push_back(encode(OP_LIT_PATH, addStringConst(e.path)));
+    }
+    void emitOne(const ir::PosExpr &)
+    {
+        unit.code.push_back(encode(OP_POS));
+    }
+
+    // -- Variable / scoping
+    void emitOne(const ir::VarRef & e) { emitVarRef(e.var); }
+    void emitOne(const ir::WithLookup & e)
+    {
+        unit.code.push_back(encode(OP_WITH_LOOKUP, e.name));
+        unit.code.push_back(static_cast<uint32_t>(e.depth));
+    }
+
+    // -- Functions
+    void emitOne(const ir::Lambda & e)
+    {
+        for (auto fv : e.freeVars) emitVarRef(fv);
+        unit.code.push_back(encode(OP_MAKE_CLOSURE, e.funcIdx));
+        unit.code.push_back(static_cast<uint32_t>(e.freeVars.size()));
+    }
+    void emitOne(const ir::MkThunk & e)
+    {
+        for (auto fv : e.freeVars) emitVarRef(fv);
+        unit.code.push_back(encode(OP_MAKE_THUNK, e.funcIdx));
+        unit.code.push_back(static_cast<uint32_t>(e.freeVars.size()));
+    }
+    void emitOne(const ir::App & e)
+    {
+        emitVarRef(e.fun); emitVarRef(e.arg);
+        unit.code.push_back(encode(OP_CALL));
+    }
+    void emitOne(const ir::Force & e)
+    {
+        emitVarRef(e.thunk);
+        unit.code.push_back(encode(OP_FORCE));
+    }
+
+    // -- Arithmetic / comparison / logical
+    void emitOne(const ir::Add & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_ADD)); }
+    void emitOne(const ir::Sub & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_SUB)); }
+    void emitOne(const ir::Mul & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_MUL)); }
+    void emitOne(const ir::Div & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_DIV)); }
+    void emitOne(const ir::Negate& e){ emitVarRef(e.operand); unit.code.push_back(encode(OP_NEGATE)); }
+    void emitOne(const ir::Eq  & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_EQ));  }
+    void emitOne(const ir::NEq & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_NEQ)); }
+    void emitOne(const ir::Less& e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_LESS));}
+    void emitOne(const ir::Not & e)  { emitVarRef(e.operand); unit.code.push_back(encode(OP_NOT)); }
+
+    // -- Short-circuit
+    void emitOne(const ir::And & e)
+    {
+        emitVarRef(e.lhs);
+        uint32_t at = emitJumpPlaceholder(OP_AND_BRANCH);
+        emitBlock(e.rhsBlock);
+        patchJump(at, static_cast<uint32_t>(unit.code.size()));
+    }
+    void emitOne(const ir::Or & e)
+    {
+        emitVarRef(e.lhs);
+        uint32_t at = emitJumpPlaceholder(OP_OR_BRANCH);
+        emitBlock(e.rhsBlock);
+        patchJump(at, static_cast<uint32_t>(unit.code.size()));
+    }
+    void emitOne(const ir::Impl & e)
+    {
+        emitVarRef(e.lhs);
+        uint32_t at = emitJumpPlaceholder(OP_IMPL_BRANCH);
+        emitBlock(e.rhsBlock);
+        patchJump(at, static_cast<uint32_t>(unit.code.size()));
+    }
+
+    // -- If
+    void emitOne(const ir::If & e)
+    {
+        emitVarRef(e.cond);
+        uint32_t bf = emitJumpPlaceholder(OP_BRANCH_FALSE);
+        emitBlock(e.thenBlock);
+        uint32_t je = emitJumpPlaceholder(OP_JUMP);
+        patchJump(bf, static_cast<uint32_t>(unit.code.size()));
+        emitBlock(e.elseBlock);
+        patchJump(je, static_cast<uint32_t>(unit.code.size()));
+    }
+
+    // -- Lists / strings
+    void emitOne(const ir::ListExpr & e)
+    {
+        for (auto v : e.elems) emitVarRef(v);
+        unit.code.push_back(encode(OP_LIST_INIT, static_cast<uint32_t>(e.elems.size())));
+    }
+    void emitOne(const ir::ConcatLists & e)
+    {
+        emitVarRef(e.lhs); emitVarRef(e.rhs);
+        unit.code.push_back(encode(OP_LIST_CONCAT));
+    }
+    void emitOne(const ir::ConcatStrings & e)
+    {
+        for (auto v : e.parts) emitVarRef(v);
+        // pack forceString as the LSB of the count operand
+        uint32_t opnd = (static_cast<uint32_t>(e.parts.size()) << 1) | (e.forceString ? 1u : 0u);
+        unit.code.push_back(encode(OP_STR_CONCAT, opnd));
+    }
+
+    // -- Attrsets
+    void emitOne(const ir::AttrSet & e)
+    {
+        for (auto & en : e.entries) emitVarRef(en.value);
+        unit.code.push_back(encode(OP_ATTRS_INIT, static_cast<uint32_t>(e.entries.size())));
+        for (auto & en : e.entries) unit.code.push_back(en.name);
+    }
+    void emitOne(const ir::AttrSetDyn & e)
+    {
+        // Emit static values in order, then dynamic name+value pairs.
+        for (auto & en : e.statics)  emitVarRef(en.value);
+        for (auto & en : e.dynamics) { emitVarRef(en.nameVar); emitVarRef(en.value); }
+        uint32_t packed = (static_cast<uint32_t>(e.statics.size()) << 12)
+                        | (static_cast<uint32_t>(e.dynamics.size()) & 0xFFFu);
+        unit.code.push_back(encode(OP_ATTRS_INIT_DYN, packed));
+        for (auto & en : e.statics) unit.code.push_back(en.name);
+    }
+    void emitOne(const ir::RecAttrSet & e)
+    {
+        // For now treat as non-rec; real rec lowering is done by the
+        // AST→IR pass (it emits MkThunk wrappers + a synthetic selfVar).
+        for (auto & en : e.entries) emitVarRef(en.value);
+        unit.code.push_back(encode(OP_ATTRS_REC_INIT, static_cast<uint32_t>(e.entries.size())));
+        for (auto & en : e.entries) unit.code.push_back(en.name);
+    }
+    void emitOne(const ir::AttrSelect & e)
+    {
+        emitVarRef(e.attrs);
+        unit.code.push_back(encode(OP_ATTRS_SELECT, e.name));
+    }
+    void emitOne(const ir::AttrSelectDyn & e)
+    {
+        emitVarRef(e.attrs); emitVarRef(e.nameVar);
+        unit.code.push_back(encode(OP_ATTRS_SELECT_DYN));
+    }
+    void emitOne(const ir::HasAttr & e)
+    {
+        emitVarRef(e.attrs);
+        unit.code.push_back(encode(OP_ATTRS_HAS, e.name));
+    }
+    void emitOne(const ir::HasAttrDyn & e)
+    {
+        emitVarRef(e.attrs); emitVarRef(e.nameVar);
+        unit.code.push_back(encode(OP_ATTRS_HAS_DYN));
+    }
+    void emitOne(const ir::Update & e)
+    {
+        emitVarRef(e.lhs); emitVarRef(e.rhs);
+        unit.code.push_back(encode(OP_ATTRS_UPDATE));
+    }
+
+    // -- With / assert
+    void emitOne(const ir::With & e)
+    {
+        emitVarRef(e.attrs);
+        unit.code.push_back(encode(OP_WITH_PUSH));
+        emitBlock(e.bodyBlock);
+        unit.code.push_back(encode(OP_WITH_POP));
+    }
+    void emitOne(const ir::Assert & e)
+    {
+        emitVarRef(e.cond);
+        unit.code.push_back(encode(OP_ASSERT));
+        emitBlock(e.bodyBlock);
+    }
+
+    // Function emit ---------------------------------------------------------
+
+    void emitFunction(ir::FuncId fid)
+    {
+        const ir::Function & f = m.functions[fid];
+
+        FuncCtx fc;
+        fc.fid = fid;
+        // Param goes in slot 0 if present.
+        if (f.argName != ir::kInvalidSymbol && f.paramVar != ir::kInvalid)
+            (void)getOrAssignSlot(fc, f.paramVar);
+        // Upvalue order = freeVars.
+        for (uint16_t i = 0; i < f.freeVars.size(); ++i)
+            fc.upvalue[f.freeVars[i]] = i;
+
+        ctx = &fc;
+        uint32_t codeStart = static_cast<uint32_t>(unit.code.size());
+
+        if (f.entryBlock != ir::kInvalidBlock)
+            emitBlock(f.entryBlock);
+        else
+            unit.code.push_back(encode(OP_LIT_NULL));
+
+        unit.code.push_back(encode(fid == 0 ? OP_HALT : OP_RETURN));
+
+        if (unit.lambdas.size() <= fid)         unit.lambdas.resize(fid + 1);
+        if (unit.lambdaCodeOffsets.size() <= fid) unit.lambdaCodeOffsets.resize(fid + 1);
+        unit.lambdas[fid] = LambdaDescriptor{
+            .codeOffset     = codeStart,
             .prologueOffset = codeStart,
-            .nUpvalues = static_cast<uint16_t>(f.freeVars.size()),
-            .nLocals   = nextSlot,
-            .arity     = static_cast<uint8_t>(f.param != ir::kInvalid ? 1 : 0),
-            .hasFormals = 0,
+            .nUpvalues      = static_cast<uint16_t>(f.freeVars.size()),
+            .nLocals        = fc.nLocals,
+            .arity          = static_cast<uint8_t>(f.argName != ir::kInvalidSymbol ? 1 : (f.hasFormals ? 1 : 0)),
+            .hasFormals     = static_cast<uint8_t>(f.hasFormals ? 1 : 0),
         };
-        unit.lambdaCodeOffsets[funcIdx] = codeStart;
+        unit.lambdaCodeOffsets[fid] = codeStart;
 
-        return codeStart;
+        ctx = nullptr;
+
+        if (fid == 0)
+            unit.entryOffset = codeStart;
+    }
+
+    // Helper: ctx-aware getOrAssignSlot (used during prologue).
+    uint16_t getOrAssignSlot(FuncCtx & fc, ir::VarId v)
+    {
+        auto it = fc.slot.find(v);
+        if (it != fc.slot.end()) return it->second;
+        uint16_t s = fc.nextSlot++;
+        fc.slot[v] = s;
+        if (s + 1 > fc.nLocals) fc.nLocals = s + 1;
+        return s;
     }
 
     void emitAll()
     {
-        // Emit functions in order; each function's code is contiguous in
-        // unit.code starting at lambdaCodeOffsets[funcIdx].  The top-level
-        // (funcIdx 0) is emitted last so its OP_HALT is at the end of the
-        // stream — but we want functions 1.. emitted FIRST so they're
-        // available when the top-level is run.  Two passes:
-        for (uint32_t i = 1; i < module.functions.size(); ++i)
+        // Mirror the IR symbol table into the CompilationUnit so the VM
+        // can use SymbolId at runtime without round-tripping to strings.
+        unit.symbolTable = m.symbols;
+
+        // Emit inner functions first so their descriptors and code are
+        // available before the top-level (which references them via
+        // OP_MAKE_CLOSURE / OP_MAKE_THUNK).  Top-level is functions[0].
+        for (ir::FuncId i = 1; i < m.functions.size(); ++i)
             emitFunction(i);
-        unit.entryOffset = emitFunction(0);
+        emitFunction(0);
     }
 };
 
