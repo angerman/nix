@@ -443,6 +443,30 @@ enum Op : uint8_t {
     /// Numeric negation: dst = -src.
     /// Encoding: [dst:8 | srcSlot:16].
     OP_RNEG_R = 0x68,
+
+    /// Register-form variable-arity opcodes (B4-impl batch 3).
+    /// Operands (upvalues, attrset values, list elements) are
+    /// pushed onto the operand stack via emitVarRef calls before
+    /// the constructor opcode.  The constructor pops them from the
+    /// stack, builds the result, and writes it directly to dst slot.
+    /// Encoding: [dst:8 | constructorIdx:24] for ones that need a
+    /// pool index, or [dst:8 | count:24] for raw counts.
+
+    /// Like OP_MAKE_THUNK_V2 but writes result to slot dst.
+    /// Encoding: [dst:8 | thunkIdx:24] + data word [nUpvalues:24].
+    OP_RMAKE_THUNK_V2 = 0x69,
+
+    /// Like OP_MAKE_CLOSURE_V2 but writes result to slot dst.
+    /// Encoding: [dst:8 | lambdaIdx:24] + data word [nUpvalues:24].
+    OP_RMAKE_CLOSURE_V2 = 0x6A,
+
+    /// Like OP_ATTRS_INIT but writes result to slot dst.
+    /// Encoding: [dst:8 | nAttrs:24] + nAttrs (sym, pos) data words.
+    OP_RATTRS_INIT = 0x6B,
+
+    /// Like OP_LIST_INIT but writes result to slot dst.
+    /// Encoding: [dst:8 | nElems:24].
+    OP_RLIST_INIT = 0x6C,
 };
 
 

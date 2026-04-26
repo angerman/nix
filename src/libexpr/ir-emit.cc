@@ -686,11 +686,97 @@ void IREmitter::emitBlock(const ir::IRBlock & block, BlockContext & ctx)
                 (ctx.blockCellSlot << 16) | ctx.blockCellMap[binding.result]);
         } else {
             uint32_t slot = ctx.allocSlot(binding.result);
-            unit.emit(OP_SET_STACK_SLOT, slot);
-            // Mark this as a candidate for ANF de-materialization:
-            // if the next emitVarRef is for this VarId AND useCount
-            // is 1, both ops can be elided.
-            ctx.lastBoundVar = binding.result;
+
+            // B4-impl batch 3 peephole: fuse MAKE_THUNK_V2 +
+            // OP_SET_STACK_SLOT into OP_RMAKE_THUNK_V2 (and likewise
+            // for MAKE_CLOSURE_V2, ATTRS_INIT, LIST_INIT).  The
+            // pattern is the LAST emitted opcode for those expression
+            // types, so a one-step lookback on unit.code is enough.
+            // Encoding requires slot ≤ 0xFF and the inner index ≤ 0xFFFF.
+            //
+            // Per the B5 profiler: MAKE_THUNK_V2 + SET_STACK_SLOT is
+            // ~6.0% of all dispatches, MAKE_CLOSURE_V2 + SET_STACK_SLOT
+            // is ~1.5%.  Both are addressed here.
+            bool peepholed = false;
+            if (slot <= 0xFF && !unit.code.empty()) {
+                // OP_MAKE_THUNK_V2 / OP_MAKE_CLOSURE_V2 emit two
+                // words: the opcode and an OP_NOP for nUpvalues.
+                // Lookback target = unit.code.size() - 2.
+                if (unit.code.size() >= 2) {
+                    uint32_t opcodeIdx = unit.code.size() - 2;
+                    uint8_t op = decodeOp(unit.code[opcodeIdx]);
+                    uint32_t innerIdx = decodeOperand(unit.code[opcodeIdx]);
+                    if (innerIdx <= 0xFFFF) {
+                        if (op == OP_MAKE_THUNK_V2) {
+                            unit.code[opcodeIdx] = encode(
+                                OP_RMAKE_THUNK_V2,
+                                (slot << 16) | innerIdx);
+                            peepholed = true;
+                        } else if (op == OP_MAKE_CLOSURE_V2) {
+                            unit.code[opcodeIdx] = encode(
+                                OP_RMAKE_CLOSURE_V2,
+                                (slot << 16) | innerIdx);
+                            peepholed = true;
+                        }
+                    }
+                }
+                // OP_LIST_INIT is a single opcode word (no follow-on
+                // data words like ATTRS_INIT).  Lookback target =
+                // unit.code.size() - 1.
+                if (!peepholed) {
+                    uint32_t opcodeIdx = unit.code.size() - 1;
+                    uint8_t op = decodeOp(unit.code[opcodeIdx]);
+                    uint32_t nElems = decodeOperand(unit.code[opcodeIdx]);
+                    if (op == OP_LIST_INIT && nElems <= 0xFFFF) {
+                        unit.code[opcodeIdx] = encode(
+                            OP_RLIST_INIT,
+                            (slot << 16) | nElems);
+                        peepholed = true;
+                    }
+                }
+                // OP_ATTRS_INIT is followed by 2*nAttrs OP_NOP data
+                // words.  Lookback target = unit.code.size() - 1 - 2*nAttrs.
+                // Decode nAttrs from the suspected OP_ATTRS_INIT word.
+                if (!peepholed && unit.code.size() >= 1) {
+                    uint32_t lastIdx = unit.code.size() - 1;
+                    // Walk back for OP_NOP data words; if we find an
+                    // OP_ATTRS_INIT before any non-NOP, we can fuse.
+                    // The data word count must equal 2*nAttrs.
+                    size_t back = 0;
+                    while (back < lastIdx) {
+                        uint8_t op = decodeOp(unit.code[lastIdx - back]);
+                        if (op != OP_NOP) break;
+                        back++;
+                    }
+                    if (back > 0 && back <= lastIdx) {
+                        uint32_t opcodeIdx = lastIdx - back;
+                        uint8_t op = decodeOp(unit.code[opcodeIdx]);
+                        if (op == OP_ATTRS_INIT) {
+                            uint32_t nAttrs = decodeOperand(unit.code[opcodeIdx]);
+                            if (nAttrs <= 0xFFFF && back == 2 * nAttrs) {
+                                unit.code[opcodeIdx] = encode(
+                                    OP_RATTRS_INIT,
+                                    (slot << 16) | nAttrs);
+                                peepholed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!peepholed) {
+                unit.emit(OP_SET_STACK_SLOT, slot);
+                // Mark this as a candidate for ANF de-materialization:
+                // if the next emitVarRef is for this VarId AND useCount
+                // is 1, both ops can be elided.
+                ctx.lastBoundVar = binding.result;
+            } else {
+                // Reset the ANF tracker — the peephole already
+                // delivered the value to the slot, so the next
+                // emitVarRef should NOT pop a SET_STACK_SLOT (there
+                // isn't one).
+                ctx.lastBoundVar = ir::kInvalidVar;
+            }
         }
     }
 

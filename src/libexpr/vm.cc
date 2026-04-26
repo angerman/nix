@@ -846,6 +846,10 @@ void vmExec(
         REGISTER_OP(OP_RCONCATLIST_R, op_rconcatlist_r);
         REGISTER_OP(OP_RNOT_R, op_rnot_r);
         REGISTER_OP(OP_RNEG_R, op_rneg_r);
+        REGISTER_OP(OP_RMAKE_THUNK_V2, op_rmake_thunk_v2);
+        REGISTER_OP(OP_RMAKE_CLOSURE_V2, op_rmake_closure_v2);
+        REGISTER_OP(OP_RATTRS_INIT, op_rattrs_init);
+        REGISTER_OP(OP_RLIST_INIT, op_rlist_init);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2751,6 +2755,27 @@ op_attr_select:
         if (auto j = attrs->attrs()->get(name)) {
             *(vm.sp - 1) = j->value;
         } else {
+            // DEBUG: dump symbol pool around the missing symbol so we can see
+            // if the symbol pool got shifted across deserialization.
+            const char * dbg = getenv("NIX_VM_DEBUG_ATTRSEL");
+            if (dbg && *dbg) {
+                fprintf(stderr,
+                    "OP_ATTR_SELECT miss: looking for '%s' (sym=%u/%u)\n"
+                    "  CU symbols (first 16):",
+                    state.symbols[name].c_str(),
+                    symIdx, (unsigned)cu->symbols.size());
+                for (uint32_t i = 0; i < std::min<uint32_t>(16, cu->symbols.size()); i++) {
+                    fprintf(stderr, " [%u]='%s'",
+                        i, state.symbols[cu->symbols[i]].c_str());
+                }
+                fprintf(stderr, "\n  attrs has: ");
+                int n = 0;
+                for (auto & a : *attrs->attrs()) {
+                    if (n++ > 12) { fprintf(stderr, "..."); break; }
+                    fprintf(stderr, " %s", state.symbols[a.name].c_str());
+                }
+                fprintf(stderr, "\n");
+            }
             state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
                 .atPos(pos).debugThrow();
         }
@@ -4486,6 +4511,137 @@ op_make_thunk_v2:
         thunkVal->mkThunk(&thunkEnv, thunkExpr);
 
         vm.push(thunkVal);
+        DISPATCH();
+    }
+
+    // ==================================================================
+    // B4-impl batch 3: register-form variable-arity ops
+    // Same semantics as OP_MAKE_THUNK_V2 / OP_MAKE_CLOSURE_V2 /
+    // OP_ATTRS_INIT / OP_LIST_INIT but writing the result directly
+    // to a stack slot instead of pushing onto the operand stack.
+    // ==================================================================
+
+    // OP_RMAKE_THUNK_V2: dst = makeThunk(thunkIdx, popped upvalues)
+    // Encoding: [dst:8 | thunkIdx:16] + data word [nUpvalues:24]
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rmake_thunk_v2:
+#else
+    case OP_RMAKE_THUNK_V2:
+#endif
+    {
+        uint32_t operand   = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot   = operand >> 16;
+        uint32_t thunkIdx  = operand & 0xFFFF;
+        uint32_t nUpvalues = decodeOperand(cu->code[ip++]);
+
+        auto & desc = cu->thunks[thunkIdx];
+        Expr * thunkExpr = desc.cachedExpr;
+        if (!thunkExpr) [[unlikely]] {
+            thunkExpr = state.mem.exprs.add<ExprBytecodeThunk>(
+                const_cast<CompilationUnit *>(cu), thunkIdx);
+            const_cast<bytecode::ThunkDescriptor &>(desc).cachedExpr = thunkExpr;
+        }
+
+        Env & thunkEnv = state.mem.allocEnv(1 + nUpvalues);
+        thunkEnv.up = curEnv;
+        thunkEnv.values[0] = &Value::vNull;
+        for (uint32_t i = nUpvalues; i > 0; --i)
+            thunkEnv.values[i] = vm.pop();
+
+        auto * thunkVal = state.allocValue();
+        thunkVal->mkThunk(&thunkEnv, thunkExpr);
+
+        size_t base = stackBase;
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = thunkVal;
+        DISPATCH();
+    }
+
+    // OP_RMAKE_CLOSURE_V2: dst = makeClosure(lambdaIdx, popped upvalues)
+    // Encoding: [dst:8 | lambdaIdx:16] + data word [nUpvalues:24]
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rmake_closure_v2:
+#else
+    case OP_RMAKE_CLOSURE_V2:
+#endif
+    {
+        uint32_t operand   = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot   = operand >> 16;
+        uint32_t lambdaIdx = operand & 0xFFFF;
+        uint32_t nUpvalues = decodeOperand(cu->code[ip++]);
+
+        auto & desc = cu->lambdas[lambdaIdx];
+
+        if (desc.sourceExpr) {
+            state.lambdaBodyCache[desc.sourceExpr] = {
+                const_cast<CompilationUnit *>(cu),
+                desc.bodyThunkIdx,
+                desc.prologueOffset,
+            };
+        }
+
+        Env & closureEnv = state.mem.allocEnv(1 + nUpvalues);
+        closureEnv.up = curEnv;
+        closureEnv.values[0] = const_cast<Value *>(&Value::vNull);
+        if (nUpvalues > 0) {
+            for (uint32_t i = nUpvalues; i > 0; --i)
+                closureEnv.values[i] = materializeWord(state, vm.pop());
+        }
+
+        Expr * lambdaExpr = desc.cachedExpr;
+        if (!lambdaExpr) [[unlikely]] {
+            lambdaExpr = state.mem.exprs.add<ExprLambdaBytecode>(
+                const_cast<CompilationUnit *>(cu), lambdaIdx);
+            const_cast<bytecode::LambdaDescriptor &>(desc).cachedExpr = lambdaExpr;
+        }
+
+        auto * closureVal = state.allocValue();
+        closureVal->mkLambda(&closureEnv, static_cast<ExprLambda *>(lambdaExpr));
+
+        size_t base = stackBase;
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = closureVal;
+        DISPATCH();
+    }
+
+    // OP_RATTRS_INIT: dst = build attrset from popped values + data words
+    // Encoding: [dst:8 | nAttrs:16] + nAttrs data words [sym, pos] pairs.
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rattrs_init:
+#else
+    case OP_RATTRS_INIT:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot = operand >> 16;
+        uint32_t nAttrs  = operand & 0xFFFF;
+        Value * result = vmAttrsInit(state, vm, cu, ip, nAttrs);
+        size_t base = stackBase;
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = result;
+        DISPATCH();
+    }
+
+    // OP_RLIST_INIT: dst = build list from popped values
+    // Encoding: [dst:8 | nElems:16].
+#ifdef NIX_VM_COMPUTED_GOTO
+op_rlist_init:
+#else
+    case OP_RLIST_INIT:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t dstSlot = operand >> 16;
+        uint32_t nElems  = operand & 0xFFFF;
+        auto list = state.buildList(nElems);
+        for (uint32_t i = nElems; i > 0; --i) {
+            list[i - 1] = materializeWord(state, vm.pop());
+        }
+        auto * result = state.allocValue();
+        result->mkList(list);
+        size_t base = stackBase;
+        vm.ensureCapacity(base + dstSlot + 1, const_cast<Value *>(&Value::vNull));
+        vm.stack[base + dstSlot] = result;
         DISPATCH();
     }
 
