@@ -15,6 +15,20 @@
 ///   * Arithmetic R-form opcodes use the tagged-int fast path; their
 ///     contribution to small-integer arithmetic in nixpkgs is non-zero.
 ///
+/// FINDING (2026-04-26, M9 validation): "full" NaN-boxing throughout
+/// would NOT deliver the predicted 8-15% wall-clock improvement.
+/// Instrumentation on nixpkgs#hello.name (4.75M materializeWord calls):
+///   * 4,747,253 calls received an already-real Value* (no allocation).
+///   * 3,061 calls actually allocated (0.06% hit rate).
+///   * Total time spent inside materializeWord ≤ 5 ms (~0.7% wall).
+/// Conclusion: the existing fast-path tagged handlers (OP_INT, OP_FORCE,
+/// OP_GET_SLOT_FORCE, OP_RFORCE_FROM, OP_RUVF_TO, OP_RADD_R/SUB/MUL/etc.,
+/// OP_RLIT_INT → OP_RCONST per M3b) have already captured nearly all
+/// available wins.  Further generalisation (tagged values inside
+/// Bindings, env.values, primop arg spans, libexpr-c) would require
+/// API-breaking changes for ≤5 ms of measured benefit.  M9 closed
+/// without further work.
+///
 /// Encoding scheme (low-bit tagged — Boehm GC compatible):
 ///
 ///   bit 0 = 0:  Untagged Value* pointer (8-byte aligned, low bit naturally 0)

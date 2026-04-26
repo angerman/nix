@@ -68,16 +68,25 @@ static inline void pushThunkFrame(VMState & vm,
     vm.frames.push_back(f);
 }
 
+/// M9 instrumentation: counts how often materializeWord actually
+/// allocates (= encountered a tagged immediate that needed boxing).
+/// Reported by printVMStats when NIX_VM_STATS=1.  Always-on; dead-code-
+/// eliminated when the counter isn't read.
+static uint64_t nanboxMaterializeHits = 0;
+static uint64_t nanboxMaterializeCalls = 0;
+
 /// Materialize a tagged immediate into a heap-allocated Value.
 /// If `w` is already a real pointer (low bit clear), returns it unchanged.
 /// If `w` is a tagged immediate, allocates a Value and decodes the tag.
 [[gnu::always_inline]]
 static inline Value * materializeWord(EvalState & state, Value * w)
 {
+    nanboxMaterializeCalls++;
     if (!nanbox::isTagged(w)) [[likely]]
         return w;
     // Only tagged ints exist; bool/null are static singletons.
     assert(nanbox::isTaggedInt(w));
+    nanboxMaterializeHits++;
     Value * v = state.allocValue();
     v->mkInt(static_cast<NixInt::Inner>(nanbox::decodeInt(w)));
     return v;
@@ -93,6 +102,11 @@ static void printVMStats(const VMState & vm) {
         vm.nrInstructions ? 100.0 * vm.nrEvalExprFallbacks / vm.nrInstructions : 0.0);
     fprintf(stderr, "  Bytecoded thunk forces: %llu\n", (unsigned long long)vm.nrBytecodeThunkForces);
     fprintf(stderr, "  Bytecoded call trampolines: %llu\n", (unsigned long long)vm.nrBytecodeCallTrampoline);
+    fprintf(stderr, "  materializeWord: %llu calls, %llu allocations (%.1f%% tagged-hit rate)\n",
+        (unsigned long long)nanboxMaterializeCalls,
+        (unsigned long long)nanboxMaterializeHits,
+        nanboxMaterializeCalls
+            ? 100.0 * nanboxMaterializeHits / nanboxMaterializeCalls : 0.0);
     fprintf(stderr, "  OP_FORCE → tree-walker: %llu\n", (unsigned long long)vm.nrForceFallbacks);
     fprintf(stderr, "  OP_CALL_1 → tree-walker: %llu\n", (unsigned long long)vm.nrCallFallbacks);
     fprintf(stderr, "  Peak stack depth: %llu\n", (unsigned long long)vm.peakStackDepth);
