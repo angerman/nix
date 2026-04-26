@@ -4692,18 +4692,27 @@ op_make_thunk_v2:
             const_cast<bytecode::ThunkDescriptor &>(desc).cachedExpr = thunkExpr;
         }
 
-        // Allocate Env(1 + nUpvalues) and store upvalues INLINE in
-        // values[1..1+nUpvalues] — eliminates the separate GC_MALLOC.
-        // For thunks with no upvalues, allocEnv(1) hits the size-1
-        // fast pool (Phase 1.2a).
-        Env & thunkEnv = state.mem.allocEnv(1 + nUpvalues);
-        thunkEnv.up = curEnv;
-        thunkEnv.values[0] = &Value::vNull;
-        for (uint32_t i = nUpvalues; i > 0; --i)
-            thunkEnv.values[i] = vm.pop();
+        // M4c: nullary fast path — see OP_MAKE_CLOSURE_V2 for rationale.
+        // When nUpvalues == 0 and curEnv isn't itself a with-env, share
+        // curEnv directly and skip the allocEnv.  The largest single env-
+        // alloc source on nixpkgs#hello.name (380K of 843K total).
+        Env * thunkEnvPtr;
+        if (nUpvalues == 0
+            && curEnv
+            && (curEnv->values[0] == nullptr
+                || curEnv->values[0] == &Value::vNull)) {
+            thunkEnvPtr = curEnv;
+        } else {
+            Env & thunkEnv = state.mem.allocEnv(1 + nUpvalues);
+            thunkEnv.up = curEnv;
+            thunkEnv.values[0] = &Value::vNull;
+            for (uint32_t i = nUpvalues; i > 0; --i)
+                thunkEnv.values[i] = vm.pop();
+            thunkEnvPtr = &thunkEnv;
+        }
 
         auto * thunkVal = state.allocValue();
-        thunkVal->mkThunk(&thunkEnv, thunkExpr);
+        thunkVal->mkThunk(thunkEnvPtr, thunkExpr);
 
         vm.push(thunkVal);
         DISPATCH();
