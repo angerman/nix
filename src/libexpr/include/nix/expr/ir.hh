@@ -33,6 +33,8 @@
 #include "nix/expr/symbol-table.hh"
 #include "nix/util/pos-idx.hh"
 
+#include <boost/container/small_vector.hpp>
+
 #include <cstdint>
 #include <string>
 #include <variant>
@@ -82,7 +84,10 @@ static constexpr BlockId kInvalidBlock = 0;
 ///   (b) the bytecode emitter can assign deterministic upvalue slots.
 struct FreeVars
 {
-    std::vector<VarId> vars;  ///< Sorted, no duplicates.
+    /// Use small_vector to keep tiny FreeVars sets (the common case —
+    /// most bindings reference 0-8 free variables) inline without
+    /// heap allocation.  Set ops still treat this as a sorted list.
+    boost::container::small_vector<VarId, 8> vars;  ///< Sorted, no duplicates.
 
     bool empty() const noexcept { return vars.empty(); }
     size_t size() const noexcept { return vars.size(); }

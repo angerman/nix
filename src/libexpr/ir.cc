@@ -44,8 +44,15 @@ void FreeVars::insert(VarId v)
 
 void FreeVars::merge(const FreeVars & other)
 {
+    // Common-case shortcuts — avoid the std::set_union machinery when
+    // one side is empty or trivially absorbed.
+    if (other.vars.empty()) return;
+    if (vars.empty()) {
+        vars = other.vars;
+        return;
+    }
     // Standard sorted merge (set union).
-    std::vector<VarId> merged;
+    decltype(vars) merged;
     merged.reserve(vars.size() + other.vars.size());
     std::set_union(
         vars.begin(), vars.end(),
@@ -63,7 +70,9 @@ void FreeVars::erase(VarId v)
 
 void FreeVars::subtract(const FreeVars & bound)
 {
-    std::vector<VarId> result;
+    if (bound.vars.empty()) return;
+    if (vars.empty()) return;
+    decltype(vars) result;
     result.reserve(vars.size());
     std::set_difference(
         vars.begin(), vars.end(),
