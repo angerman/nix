@@ -76,8 +76,12 @@ struct CallFrame
     /// Upvalue array for v2 closures/thunks.  nullptr for v1 frames.
     Value ** upvalues = nullptr;
 
-    /// Continuation state for VM-native primop loops.
-    ContState cont;
+    /// Continuation slot index into VMState::contStack, encoded as (idx+1).
+    /// 0 means no active continuation (the common case).  Lazy
+    /// allocation keeps CallFrame compact: continuations are rare
+    /// (only set by VM-native primop dispatch) but every call frame
+    /// would otherwise carry ~72 bytes of dead ContState.
+    uint32_t contIdx = 0;
 
     /// Register-form call result destination.
     /// When set (non-zero), OP_RETURN writes the retVal POINTER directly
@@ -106,6 +110,28 @@ struct VMState
     /// Call frame stack.
     /// Uses traceable_allocator so GC sees Env*/Value* pointers in frames.
     std::vector<CallFrame, traceable_allocator<CallFrame>> frames;
+
+    /// Continuation side-stack.  Only the rare frames that participate
+    /// in VM-native primop loops (Map, Filter, FoldlStrict, etc.)
+    /// allocate an entry here; CallFrame::contIdx indexes into this
+    /// vector (1-based; 0 = no continuation).  Reusing a slot when a
+    /// continuation finalizes is a future optimization.
+    std::vector<ContState, traceable_allocator<ContState>> contStack;
+
+    /// Allocate a fresh continuation slot and return its 1-based index
+    /// (suitable for storing in CallFrame::contIdx).
+    uint32_t allocCont()
+    {
+        contStack.emplace_back();
+        return static_cast<uint32_t>(contStack.size());
+    }
+
+    /// Resolve a CallFrame::contIdx to the underlying ContState.
+    /// Caller is responsible for verifying contIdx > 0.
+    ContState & cont(uint32_t contIdx)
+    {
+        return contStack[contIdx - 1];
+    }
 
     VMState();
     ~VMState();

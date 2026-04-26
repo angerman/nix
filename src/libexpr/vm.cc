@@ -1040,11 +1040,10 @@ op_return:
         curEnv = caller.env;
 
         // ── VM-native primop continuations ──
-        // Check if the caller has an active continuation (e.g., from
-        // builtins.map).  If so, store the just-returned result and
-        // either advance to the next iteration or finalize the result.
-        if (caller.cont.kind != ContKind::None) [[unlikely]] {
-            auto & cont = caller.cont;
+        // Caller frame may carry a 1-based contIdx into vm.contStack
+        // when participating in a VM-native primop loop.
+        if (caller.contIdx != 0) [[unlikely]] {
+            auto & cont = vm.cont(caller.contIdx);
             if (cont.kind == ContKind::Map) {
                 // Store this iteration's result.
                 Value * elemResult = state.allocValue();
@@ -1071,6 +1070,7 @@ op_return:
                 cont.list = nullptr;
                 cont.results = nullptr;
                 cont.inputElems = nullptr;
+                caller.contIdx = 0;
                 vm.push(listVal);
                 DISPATCH();
             }
@@ -2340,12 +2340,15 @@ op_call_1:
                     auto * results = static_cast<Value **>(
                         GC_MALLOC(listSize * sizeof(Value *)));
                     auto & frame = vm.frames.back();
-                    frame.cont.kind = ContKind::Map;
-                    frame.cont.index = 0;
-                    frame.cont.count = static_cast<uint32_t>(listSize);
-                    frame.cont.func = f;
-                    frame.cont.results = results;
-                    frame.cont.list = arg;
+                    if (frame.contIdx == 0)
+                        frame.contIdx = vm.allocCont();
+                    auto & cont = vm.cont(frame.contIdx);
+                    cont.kind = ContKind::Map;
+                    cont.index = 0;
+                    cont.count = static_cast<uint32_t>(listSize);
+                    cont.func = f;
+                    cont.results = results;
+                    cont.list = arg;
 
                     // Trigger the first call: f(list[0]).
                     vm.push(f);
