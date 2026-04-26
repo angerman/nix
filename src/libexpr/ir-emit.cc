@@ -1496,6 +1496,68 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
                 unit.emit(OP_NOP, totalUpvalues);
             } else {
+                // M6: trivial-thunk elision.  When the body block is a
+                // single binding whose expression is a literal and the
+                // terminal is just a return of that literal, the thunk
+                // wrapper is observable-equivalent to the literal Value
+                // itself (forceValue on an already-forced primitive is
+                // a no-op).  Skip the thunk creation entirely; pre-
+                // allocate the Value at compile time and push OP_CONST.
+                //
+                // Eligibility: no params, exactly one binding, that
+                // binding's expr is a literal IR variant, terminal is
+                // TermReturn(thatBinding), and freeVars is empty (a
+                // literal has no refs).  Cell-capture path above is
+                // gated on innerCells non-empty, so the elision only
+                // fires here in the cell-free branch.
+                const auto & bodyBlock = module.blocks[e.bodyBlock];
+                bool elidedTrivial = false;
+                if (e.freeVars.size() == 0
+                    && bodyBlock.params.empty()
+                    && bodyBlock.bindings.size() == 1
+                    && std::holds_alternative<ir::TermReturn>(bodyBlock.terminal)) {
+                    auto & onlyBinding = bodyBlock.bindings[0];
+                    auto & term = std::get<ir::TermReturn>(bodyBlock.terminal);
+                    if (term.value == onlyBinding.result) {
+                        Value * litVal = nullptr;
+                        std::visit([&](const auto & be) {
+                            using B = std::decay_t<decltype(be)>;
+                            if constexpr (std::is_same_v<B, ir::IRLitInt>) {
+                                litVal = state.allocValue();
+                                litVal->mkInt(static_cast<NixInt::Inner>(be.value));
+                            } else if constexpr (std::is_same_v<B, ir::IRLitFloat>) {
+                                litVal = state.allocValue();
+                                litVal->mkFloat(be.value);
+                            } else if constexpr (std::is_same_v<B, ir::IRLitString>) {
+                                litVal = state.allocValue();
+                                litVal->mkString(be.value, state.mem);
+                            } else if constexpr (std::is_same_v<B, ir::IRLitBool>) {
+                                litVal = const_cast<Value *>(
+                                    be.value ? &Value::vTrue : &Value::vFalse);
+                            } else if constexpr (std::is_same_v<B, ir::IRLitNull>) {
+                                litVal = const_cast<Value *>(&Value::vNull);
+                            } else if constexpr (std::is_same_v<B, ir::IRLitPath>) {
+                                auto * accessor = static_cast<SourceAccessor *>(be.accessor);
+                                SourcePath sp(
+                                    ref<SourceAccessor>(accessor->shared_from_this()),
+                                    CanonPath(CanonPath::unchecked_t(),
+                                        std::string(be.path)));
+                                litVal = state.allocValue();
+                                litVal->mkPath(sp, state.mem);
+                            }
+                        }, onlyBinding.expr);
+                        if (litVal) {
+                            uint32_t constIdx = unit.addConstant(litVal);
+                            unit.emitPos(pos);
+                            unit.emit(OP_CONST, constIdx);
+                            elidedTrivial = true;
+                        }
+                    }
+                }
+
+                if (elidedTrivial) {
+                    // Done — nothing more to emit for this IRMkThunk.
+                } else {
                 // Normal path: no cell capture needed.
                 //
                 // Phase 3.1f-6: when NIX_VM_V2_LAZY_EMIT=1 and the
@@ -1538,6 +1600,7 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 unit.emitPos(pos);
                 unit.emit(OP_MAKE_THUNK_V2, thunkIdx);
                 unit.emit(OP_NOP, static_cast<uint32_t>(e.freeVars.size()));
+                }
             }
         }
 
