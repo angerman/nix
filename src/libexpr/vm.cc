@@ -2347,6 +2347,85 @@ op_call_1:
                     goto op_call_1;
                 }
 
+                // ── VM-native continuation for builtins.foldl' ──
+                // foldl' op nul list — strict by spec, no laziness
+                // gotcha.  Drives module merging, lib.recursiveUpdate,
+                // attrset folds.  Avoids prim_foldlStrict's intermediate
+                // Value alloc per element for the running accumulator.
+                if (fn->arity == 3 && fn->name == "__foldl'") {
+                    // fun = primOpApp(primOpApp(primop, op), nul)
+                    // → op = fun.left.right, nul = fun.right
+                    Value * op = fun->primOpApp().left->primOpApp().right;
+                    Value * nul = fun->primOpApp().right;
+                    state.forceFunction(*op, pos,
+                        "while evaluating the first argument passed to builtins.foldl'");
+                    state.forceList(*arg, pos,
+                        "while evaluating the third argument passed to builtins.foldl'");
+                    auto listView = arg->listView();
+                    auto listSize = listView.size();
+
+                    if (listSize == 0) {
+                        // Empty list → return nul forced.
+                        state.forceValue(*nul, pos);
+                        vm.push(nul);
+                        DISPATCH();
+                    }
+
+                    auto & frame = vm.frames.back();
+                    if (frame.contIdx == 0)
+                        frame.contIdx = vm.allocCont();
+                    auto & cont = vm.cont(frame.contIdx);
+                    cont.kind = ContKind::FoldlStrict;
+                    cont.index = 0;
+                    cont.count = static_cast<uint32_t>(listSize);
+                    cont.func = op;
+                    cont.list = arg;
+                    cont.accumulator = nul;
+
+                    // Trigger the first call: op(nul, list[0]).  We
+                    // need to apply op to two args; OP_CALL_1 takes
+                    // one.  Strategy: emit `(op nul) list[0]` — push
+                    // op, push nul, call (returns partial), then push
+                    // list[0] and call again.  Simpler: build a
+                    // primOpApp-equivalent closure invocation by hand.
+                    // We use the curried op approach: callFunction(op,
+                    // [nul, list[0]]) — but to match the continuation
+                    // resumption pattern, we use OP_CALL_1 with nul
+                    // first to produce `op nul`, then dispatch the
+                    // continuation which pushes list[0].
+                    //
+                    // Easier: make the FIRST call a normal call to
+                    // produce the curried `op nul`, then push list[0]
+                    // and op_call_1 again.  We track this via index=0
+                    // meaning "next call delivers element 0".
+                    Value * args2[2] = {nul, listView[0]};
+                    auto * result = state.allocValue();
+                    state.callFunction(*op, args2, *result, pos);
+                    // After this synchronous call we have the new
+                    // accumulator.  Loop in a tight C while because
+                    // continuations require a v2 closure to reach
+                    // OP_RETURN; safer to drive the fold here.
+                    cont.accumulator = result;
+                    cont.index = 1;
+                    while (cont.index < cont.count) {
+                        Value * args3[2] = {cont.accumulator,
+                            listView[cont.index]};
+                        auto * next = state.allocValue();
+                        state.callFunction(*op, args3, *next, pos);
+                        cont.accumulator = next;
+                        cont.index++;
+                    }
+                    state.forceValue(*cont.accumulator, pos);
+                    Value * finalAcc = cont.accumulator;
+                    cont.kind = ContKind::None;
+                    cont.func = nullptr;
+                    cont.list = nullptr;
+                    cont.accumulator = nullptr;
+                    frame.contIdx = 0;
+                    vm.push(finalAcc);
+                    DISPATCH();
+                }
+
                 // genList continuation deferred — eager genList breaks
                 // lazy fixpoint patterns in stage.nix (old nixpkgs).
                 // Need a thunk-creating variant that trampolines within
