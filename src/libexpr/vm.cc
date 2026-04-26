@@ -20,7 +20,9 @@
 
 #include <cassert>
 #include <algorithm>
+#include <chrono>
 #include <utility>
+#include <vector>
 
 namespace nix::bytecode {
 
@@ -76,6 +78,190 @@ static inline void pushThunkFrame(VMState & vm,
 /// eliminated when the counter isn't read.
 static uint64_t nanboxMaterializeHits = 0;
 static uint64_t nanboxMaterializeCalls = 0;
+
+// ---------------------------------------------------------------------------
+// Per-primop profiling (NIX_PRIMOP_PROFILE=1)
+// ---------------------------------------------------------------------------
+//
+// When the env var NIX_PRIMOP_PROFILE=1 is set, every fn->impl() call is
+// wrapped with a steady_clock measurement and accumulated by primop name.
+// At process exit (VMState destructor), the top-30 primops by total time
+// are printed to stderr.
+//
+// Implementation notes:
+//   * Keyed by `const char *` (PrimOp::name.c_str()) — names are static
+//     strings owned by RegisterPrimOp registrations, so their lifetime
+//     spans the process.  Identity-based keying is faster than std::string.
+//   * We use a flat std::vector<Entry> and linear-scan it.  The total
+//     number of distinct primops is bounded (~150) so this beats hash map
+//     lookup overhead for the hot path.
+//   * The flag is read once at init; the dispatch checks a single bool.
+
+struct PrimOpProfileEntry {
+    const char * name;        ///< PrimOp::name.c_str() identity-compared.
+    uint64_t calls = 0;
+    uint64_t inclusiveNs = 0;
+    uint64_t selfNs = 0;       ///< Inclusive minus child primop time.
+};
+
+/// Linear-scan table.  Allocated lazily on first profiled call.
+static std::vector<PrimOpProfileEntry> primOpProfileTable;
+
+/// Stack frame for tracking self-time.  When a child primop is invoked,
+/// we pause the parent's timer (accumulating elapsed since segmentStart
+/// into accumulatedSelfNs), then resume on child return.  Pattern lifted
+/// from EvalState::primOpTimerStack in eval.cc but kept VM-local.
+struct PrimOpProfileFrame {
+    const char * name;
+    std::chrono::steady_clock::time_point startTime;     // for inclusive
+    std::chrono::steady_clock::time_point segmentStart;  // for self
+    uint64_t accumulatedSelfNs = 0;
+};
+static std::vector<PrimOpProfileFrame> primOpProfileStack;
+
+/// True when NIX_PRIMOP_PROFILE=1.  Read once at init, hot-path branch
+/// is well-predicted.
+const bool primOpProfileEnabled =
+    getEnv("NIX_PRIMOP_PROFILE").value_or("") == "1";
+
+/// Find or insert a profile entry by primop name pointer identity.
+[[gnu::always_inline]]
+static inline PrimOpProfileEntry * primOpProfileFind(const char * name)
+{
+    for (auto & e : primOpProfileTable)
+        if (e.name == name)
+            return &e;
+    primOpProfileTable.push_back({name, 0, 0, 0});
+    return &primOpProfileTable.back();
+}
+
+/// Wrap a primop impl call.  When profiling is disabled, the compiler
+/// inlines and DCEs the timing — single dynamic branch.
+///
+/// Tracks both inclusive time (wall-clock from entry to exit) and self
+/// time (inclusive minus child primop time).  The exclusive view tells
+/// us where work actually happens; the inclusive view tells us which
+/// top-level primops are slow when forcing values.
+[[gnu::always_inline]]
+static inline void primOpCallProfiled(
+    const PrimOp * fn, EvalState & state, PosIdx pos,
+    Value ** args, Value & result)
+{
+    if (!primOpProfileEnabled) [[likely]] {
+        const_cast<PrimOp *>(fn)->impl(state, pos, args, result);
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    // Pause parent's self-timer.
+    if (!primOpProfileStack.empty()) {
+        auto & parent = primOpProfileStack.back();
+        parent.accumulatedSelfNs +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now - parent.segmentStart).count();
+    }
+    primOpProfileStack.push_back({fn->name.c_str(), now, now, 0});
+
+    // Capture frame index — pushing onto the stack inside the impl call
+    // (e.g., recursive primops) will not invalidate it because we use
+    // size_t indexing not pointer references.
+    size_t myIdx = primOpProfileStack.size() - 1;
+
+    try {
+        const_cast<PrimOp *>(fn)->impl(state, pos, args, result);
+    } catch (...) {
+        // Pop our frame, resume parent on rethrow.
+        auto t = std::chrono::steady_clock::now();
+        auto & f = primOpProfileStack[myIdx];
+        uint64_t selfNs = f.accumulatedSelfNs +
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t - f.segmentStart).count();
+        uint64_t inclusiveNs =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t - f.startTime).count();
+        auto * e = primOpProfileFind(f.name);
+        e->calls++;
+        e->inclusiveNs += inclusiveNs;
+        e->selfNs += selfNs;
+        primOpProfileStack.pop_back();
+        if (!primOpProfileStack.empty())
+            primOpProfileStack.back().segmentStart = t;
+        throw;
+    }
+
+    auto t = std::chrono::steady_clock::now();
+    auto & f = primOpProfileStack[myIdx];
+    uint64_t selfNs = f.accumulatedSelfNs +
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            t - f.segmentStart).count();
+    uint64_t inclusiveNs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            t - f.startTime).count();
+    auto * e = primOpProfileFind(f.name);
+    e->calls++;
+    e->inclusiveNs += inclusiveNs;
+    e->selfNs += selfNs;
+    primOpProfileStack.pop_back();
+    // Resume parent's segment timer.
+    if (!primOpProfileStack.empty())
+        primOpProfileStack.back().segmentStart = t;
+}
+
+/// Print the per-primop profile.  Called from printVMStats so it always
+/// fires alongside NIX_VM_STATS, but it's gated on NIX_PRIMOP_PROFILE.
+static void printPrimOpProfile()
+{
+    if (!primOpProfileEnabled) return;
+    fprintf(stderr, "\n=== Per-primop profile (NIX_PRIMOP_PROFILE=1) ===\n");
+    if (primOpProfileTable.empty()) {
+        fprintf(stderr, "  (no primop calls observed)\n");
+        return;
+    }
+
+    auto printSorted = [](const char * label,
+                          uint64_t PrimOpProfileEntry::* member,
+                          int n)
+    {
+        std::vector<PrimOpProfileEntry> sorted(primOpProfileTable.begin(),
+                                                primOpProfileTable.end());
+        std::sort(sorted.begin(), sorted.end(),
+            [member](const PrimOpProfileEntry & a, const PrimOpProfileEntry & b) {
+                return a.*member > b.*member;
+            });
+        uint64_t grandTotal = 0;
+        uint64_t grandCalls = 0;
+        for (auto & e : sorted) {
+            grandTotal += e.*member;
+            grandCalls += e.calls;
+        }
+        fprintf(stderr,
+            "\n  --- %s (top %d) ---\n", label, n);
+        fprintf(stderr,
+            "  Total: %llu calls, %.3f ms across %zu distinct primops\n",
+            (unsigned long long)grandCalls,
+            grandTotal / 1.0e6, sorted.size());
+        fprintf(stderr,
+            "  %4s %-32s %12s %14s %12s %8s\n",
+            "rank", "name", "calls", "total_us", "us/call", "%total");
+        int nn = std::min<int>(n, (int)sorted.size());
+        for (int i = 0; i < nn; i++) {
+            auto & e = sorted[i];
+            uint64_t v = e.*member;
+            double totalUs = v / 1.0e3;
+            double perCallUs = e.calls ? (v / 1.0e3) / e.calls : 0.0;
+            double pct = grandTotal ? 100.0 * v / grandTotal : 0.0;
+            fprintf(stderr,
+                "  %4d %-32s %12llu %14.2f %12.3f %7.2f%%\n",
+                i + 1, e.name,
+                (unsigned long long)e.calls,
+                totalUs, perCallUs, pct);
+        }
+    };
+
+    printSorted("By INCLUSIVE time", &PrimOpProfileEntry::inclusiveNs, 30);
+    printSorted("By SELF (exclusive) time", &PrimOpProfileEntry::selfNs, 30);
+    fprintf(stderr, "\n===============================================\n");
+}
 
 /// EXi: file-scope flag, initialised once at process start (function-
 /// local-static would have a thread-safe-init guard on every vmExec
@@ -375,6 +561,7 @@ static void traceInstruction(
 VMState::~VMState()
 {
     printVMStats(*this);
+    printPrimOpProfile();
 }
 
 VMState::VMState()
@@ -700,7 +887,7 @@ static void vmCallSaturatedPrimOp(
         vArgs[--n] = v->primOpApp().right;
     vArgs[argsDone] = arg;
     auto * result = state.allocValue();
-    const_cast<PrimOp *>(fn)->impl(state, pos, vArgs, *result);
+    primOpCallProfiled(fn, state, pos, vArgs, *result);
     vm.push(result);
 }
 
@@ -2385,7 +2572,7 @@ op_call_1:
                 // Saturated single-arg primop (head, length, typeOf, etc.)
                 auto * result = state.allocValue();
                 Value * argPtr = arg;
-                fn->impl(state, pos, &argPtr, *result);
+                primOpCallProfiled(fn, state, pos, &argPtr, *result);
                 vm.push(result);
                 DISPATCH();
             } else {
@@ -2644,7 +2831,7 @@ op_call_1:
                 if (fn->arity == 2) {
                     Value * vArgs[2] = {fun->primOpApp().right, arg};
                     auto * result = state.allocValue();
-                    fn->impl(state, pos, vArgs, *result);
+                    primOpCallProfiled(fn, state, pos, vArgs, *result);
                     vm.push(result);
                 } else {
                     vmCallSaturatedPrimOp(state, vm, fn, fun, arg, argsDone, pos);
@@ -2713,7 +2900,7 @@ op_call_1:
                     if (fn->arity == 1) {
                         auto * result = state.allocValue();
                         Value * argPtr = arg;
-                        fn->impl(state, pos, &argPtr, *result);
+                        primOpCallProfiled(fn, state, pos, &argPtr, *result);
                         vm.push(result);
                         DISPATCH();
                     }
@@ -3611,7 +3798,7 @@ op_call_primop:
 
         // Allocate result and call the primop implementation directly.
         auto * result = state.allocValue();
-        fn->impl(state, pos, vArgs, *result);
+        primOpCallProfiled(fn, state, pos, vArgs, *result);
 
         vm.push(result);
         DISPATCH();
@@ -4293,7 +4480,7 @@ op_rcall1_r:
                 vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
                 auto * result = state.allocValue();
                 Value * argPtr = arg;
-                fn->impl(state, pos, &argPtr, *result);
+                primOpCallProfiled(fn, state, pos, &argPtr, *result);
                 vm.stack[base + dstSlot] = result;
                 ip++;  // skip trailing OP_SET_STACK_SLOT
                 DISPATCH();
@@ -4337,7 +4524,7 @@ op_rcall1_r:
                 size_t needed = base + dstSlot + 1;
                 vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
                 auto * result = state.allocValue();
-                const_cast<PrimOp *>(fn)->impl(state, pos, vArgs, *result);
+                primOpCallProfiled(fn, state, pos, vArgs, *result);
                 vm.stack[base + dstSlot] = result;
                 ip++;
                 DISPATCH();
