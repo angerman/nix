@@ -690,6 +690,22 @@ struct AttrCache
     };
     Entry entries[kEntries];
     uint8_t nextEvict = 0;  ///< Insertion index for cold misses.
+
+    /// B6: type-shape fallback.  Many call sites (e.g. `pkg.meta.desc`)
+    /// see a stream of structurally identical but pointer-distinct
+    /// Bindings.  When the 8-way identity cache misses, this single-slot
+    /// shape entry lets us skip the binary search by verifying:
+    ///   - the attrset has the same first symbol (cheap shape proxy)
+    ///   - the attrset has the same size (single-layer only)
+    ///   - the attr at the cached offset has the cache's name
+    /// The third check defends against false-positive shape matches.
+    struct ShapeEntry
+    {
+        Symbol firstSym{};      ///< attrs[0].name, used as a shape proxy.
+        uint32_t size = 0;      ///< numAttrs (single-layer only).
+        uint32_t offset = 0;    ///< Offset within attrs[] of the cached attr.
+    };
+    ShapeEntry shape;
 };
 
 

@@ -2814,12 +2814,39 @@ op_attr_select_cached:
             }
         }
 
+        // B6: type-shape fallback before binary search.  For non-layered
+        // Bindings whose first symbol and size match the cached shape,
+        // probe the cached offset directly and verify name equality.
+        if (cache.shape.size != 0
+            && !b->isLayered()
+            && b->size() == cache.shape.size
+            && (*b)[0].name == cache.shape.firstSym
+            && cache.shape.offset < cache.shape.size
+            && (*b)[cache.shape.offset].name == cache.name) {
+            vm.nrAttrCacheHits++;
+            Value * v = (*b)[cache.shape.offset].value;
+            // Insert into identity cache so the next pointer-equal
+            // lookup hits the fast path immediately.
+            uint8_t evict = cache.nextEvict;
+            cache.entries[evict] = {b, v};
+            cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
+            *(vm.sp - 1) = v;
+            DISPATCH();
+        }
+
         // Slow path: cache miss.
         vm.nrAttrCacheMisses++;
         if (auto j = b->get(cache.name)) {
             uint8_t evict = cache.nextEvict;
             cache.entries[evict] = {b, j->value};
             cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
+            // Update the shape entry too — non-layered Bindings only,
+            // since the offset semantics rely on a single-layer FAM.
+            if (!b->isLayered()) {
+                cache.shape.firstSym = (*b)[0].name;
+                cache.shape.size = b->size();
+                cache.shape.offset = static_cast<uint32_t>(j - &(*b)[0]);
+            }
             *(vm.sp - 1) = j->value;
         } else {
             state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
@@ -2870,12 +2897,35 @@ op_attr_select_force_cached:
                     break;
                 }
             }
+            if (!hit
+                && cache.shape.size != 0
+                && !b->isLayered()
+                && b->size() == cache.shape.size
+                && (*b)[0].name == cache.shape.firstSym
+                && cache.shape.offset < cache.shape.size
+                && (*b)[cache.shape.offset].name == cache.name) {
+                // B6: type-shape fallback hit — see OP_ATTR_SELECT_CACHED
+                // for the rationale.
+                vm.nrAttrCacheHits++;
+                Value * v = (*b)[cache.shape.offset].value;
+                uint8_t evict = cache.nextEvict;
+                cache.entries[evict] = {b, v};
+                cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
+                selected = v;
+                hit = true;
+            }
             if (!hit) {
                 vm.nrAttrCacheMisses++;
                 if (auto j = b->get(cache.name)) {
                     uint8_t evict = cache.nextEvict;
                     cache.entries[evict] = {b, j->value};
                     cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
+                    if (!b->isLayered()) {
+                        cache.shape.firstSym = (*b)[0].name;
+                        cache.shape.size = b->size();
+                        cache.shape.offset =
+                            static_cast<uint32_t>(j - &(*b)[0]);
+                    }
                     selected = j->value;
                 } else {
                     state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
@@ -4265,12 +4315,34 @@ op_rattr_self_r:
                     break;
                 }
             }
+            if (!hit
+                && cache.shape.size != 0
+                && !b->isLayered()
+                && b->size() == cache.shape.size
+                && (*b)[0].name == cache.shape.firstSym
+                && cache.shape.offset < cache.shape.size
+                && (*b)[cache.shape.offset].name == cache.name) {
+                // B6: type-shape fallback hit.
+                vm.nrAttrCacheHits++;
+                Value * v = (*b)[cache.shape.offset].value;
+                uint8_t evict = cache.nextEvict;
+                cache.entries[evict] = {b, v};
+                cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
+                selected = v;
+                hit = true;
+            }
             if (!hit) {
                 vm.nrAttrCacheMisses++;
                 if (auto j = b->get(cache.name)) {
                     uint8_t evict = cache.nextEvict;
                     cache.entries[evict] = {b, j->value};
                     cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
+                    if (!b->isLayered()) {
+                        cache.shape.firstSym = (*b)[0].name;
+                        cache.shape.size = b->size();
+                        cache.shape.offset =
+                            static_cast<uint32_t>(j - &(*b)[0]);
+                    }
                     selected = j->value;
                 } else {
                     state.error<EvalError>("attribute '%1%' missing",
