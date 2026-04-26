@@ -351,6 +351,16 @@ void VMState::grow()
     sp       = newStack + used;
     stack    = newStack;
     stackEnd = newStack + newCap;
+
+    // grow() only fires when sp passes the previous stackEnd, so this
+    // is also a convenient sample point for peakStackDepth and
+    // peakFrameDepth.  Misses peaks that don't trigger a stack grow
+    // (we'd need to instrument every push() / push_back()), but
+    // captures enough for stat purposes.
+    if (used > peakStackDepth)
+        peakStackDepth = used;
+    if (frames.size() > peakFrameDepth)
+        peakFrameDepth = frames.size();
     // Old buffer is GC-managed; it will be collected when unreferenced.
 }
 
@@ -1059,6 +1069,13 @@ op_return:
         }
 
         if (vm.frames.size() <= entryFrameDepth) {
+            // Final sample for stats (misses interim peaks but captures
+            // total stack/frame extent before unwind).
+            size_t curStack = vm.stackSize();
+            if (curStack > vm.peakStackDepth)
+                vm.peakStackDepth = curStack;
+            if (vm.frames.size() > vm.peakFrameDepth)
+                vm.peakFrameDepth = vm.frames.size();
             return;
         }
 
@@ -2400,6 +2417,108 @@ op_call_1:
                     cont.accumulator = nullptr;
                     frame.contIdx = 0;
                     vm.push(finalAcc);
+                    DISPATCH();
+                }
+
+                // ── VM-native continuation for builtins.filter ──
+                // filter pred list — semantically equivalent to scan
+                // through list, applying pred, collecting elements
+                // where pred returns true.  Predicate result is
+                // BOOL — strict — and the elements themselves are
+                // not transformed, so the resulting list preserves
+                // identity of element thunks.  Safe to drive eagerly.
+                if (fn->arity == 2 && fn->name == "filter") {
+                    Value * pred = fun->primOpApp().right;
+                    state.forceFunction(*pred, pos,
+                        "while evaluating the first argument passed to builtins.filter");
+                    state.forceList(*arg, pos,
+                        "while evaluating the second argument passed to builtins.filter");
+                    auto listView = arg->listView();
+                    auto listSize = listView.size();
+
+                    if (listSize == 0) {
+                        auto * result = state.allocValue();
+                        result->mkList(state.buildList(0));
+                        vm.push(result);
+                        DISPATCH();
+                    }
+
+                    // Synchronous filter loop.  For each element, call
+                    // pred(elem); if true, keep the original element.
+                    auto * matched = static_cast<Value **>(
+                        GC_MALLOC(listSize * sizeof(Value *)));
+                    size_t nMatched = 0;
+                    bool anyMissed = false;
+                    for (size_t i = 0; i < listSize; i++) {
+                        Value * elem = listView[i];
+                        auto * predResult = state.allocValue();
+                        Value * predArgs[1] = {elem};
+                        state.callFunction(*pred, predArgs, *predResult, pos);
+                        state.forceValue(*predResult, pos);
+                        if (predResult->type() != nBool)
+                            state.error<TypeError>(
+                                "expected a Boolean but found %1%: %2%",
+                                showType(*predResult),
+                                ValuePrinter(state, *predResult, PrintOptions{}))
+                                .atPos(pos).debugThrow();
+                        if (predResult->boolean()) {
+                            matched[nMatched++] = elem;
+                        } else {
+                            anyMissed = true;
+                        }
+                    }
+
+                    auto * result = state.allocValue();
+                    if (!anyMissed) {
+                        // Optimization: pred kept everything — return
+                        // the input list unchanged, preserving thunks.
+                        *result = *arg;
+                    } else {
+                        auto listBuilder = state.buildList(nMatched);
+                        for (size_t i = 0; i < nMatched; i++)
+                            listBuilder[i] = matched[i];
+                        result->mkList(listBuilder);
+                    }
+                    vm.push(result);
+                    DISPATCH();
+                }
+
+                // ── VM-native continuations for builtins.all / any ──
+                // Strict, short-circuiting: stop at first counter-
+                // example.  Like filter, drives the predicate inline.
+                if (fn->arity == 2
+                    && (fn->name == "all" || fn->name == "any"))
+                {
+                    bool isAll = (fn->name == "all");
+                    Value * pred = fun->primOpApp().right;
+                    state.forceFunction(*pred, pos,
+                        isAll
+                            ? "while evaluating the first argument passed to builtins.all"
+                            : "while evaluating the first argument passed to builtins.any");
+                    state.forceList(*arg, pos,
+                        isAll
+                            ? "while evaluating the second argument passed to builtins.all"
+                            : "while evaluating the second argument passed to builtins.any");
+                    auto listView = arg->listView();
+                    auto listSize = listView.size();
+
+                    bool result = isAll;  // all-of-empty=true, any-of-empty=false
+                    for (size_t i = 0; i < listSize; i++) {
+                        auto * predResult = state.allocValue();
+                        Value * predArgs[1] = {listView[i]};
+                        state.callFunction(*pred, predArgs, *predResult, pos);
+                        state.forceValue(*predResult, pos);
+                        if (predResult->type() != nBool)
+                            state.error<TypeError>(
+                                "expected a Boolean but found %1%: %2%",
+                                showType(*predResult),
+                                ValuePrinter(state, *predResult, PrintOptions{}))
+                                .atPos(pos).debugThrow();
+                        bool b = predResult->boolean();
+                        if (isAll && !b) { result = false; break; }
+                        if (!isAll && b) { result = true; break; }
+                    }
+                    vm.push(result ? &Value::vTrue : &Value::vFalse);
                     DISPATCH();
                 }
 
