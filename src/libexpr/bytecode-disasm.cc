@@ -120,6 +120,20 @@ const char * opName(uint8_t op)
         case OP_CELL_GET:         return "CELL_GET";
         case OP_CELL_SET:         return "CELL_SET";
         case OP_ALLOC_CELL:       return "ALLOC_CELL";
+        case OP_RLIT_INT:         return "RLIT_INT";
+        case OP_RCONST:           return "RCONST";
+        case OP_RUPDATE_R:        return "RUPDATE_R";
+        case OP_RCONCATLIST_R:    return "RCONCATLIST_R";
+        case OP_RNOT_R:           return "RNOT_R";
+        case OP_RNEG_R:           return "RNEG_R";
+        case OP_RMAKE_THUNK_V2:   return "RMAKE_THUNK_V2";
+        case OP_RMAKE_CLOSURE_V2: return "RMAKE_CLOSURE_V2";
+        case OP_RATTRS_INIT:      return "RATTRS_INIT";
+        case OP_RLIST_INIT:       return "RLIST_INIT";
+        case OP_GET_UV2:          return "GET_UV2";
+        case OP_GET_SLOT2:        return "GET_SLOT2";
+        case OP_GET_UV_SLOT:      return "GET_UV_SLOT";
+        case OP_GET_SLOT_UV:      return "GET_SLOT_UV";
         default:                  return "???";
     }
 }
