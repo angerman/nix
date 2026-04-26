@@ -160,6 +160,7 @@ sources = files(
   'bytecode.cc',
   'bytecode-compiler.cc',
   'bytecode-disasm.cc',
+  'bytecode-serialize.cc',
   'bytecode-thunk.cc',
   'ir.cc',
   'ir-emit.cc',

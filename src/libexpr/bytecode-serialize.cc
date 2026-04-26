@@ -1,0 +1,465 @@
+/// @file
+/// CompilationUnit serialization (Phase 3.2-2).
+///
+/// Hand-rolled binary format with a magic prefix + schema version.
+/// All process-bound references (Symbol IDs, PosIdx values, AST Expr*,
+/// Boehm-allocated Value*) are normalized to either content (strings,
+/// leaf payloads) or DROPPED entirely.
+///
+/// First-pass scope: code buffer, symbols-as-strings, leaf constants,
+/// thunk/lambda descriptors (sans formals, sans sourceExpr, sans
+/// cachedExpr), attrCache symbol-index list (PIC entries zeroed on
+/// load).  Positions are dropped for now — error messages from cached
+/// CUs degrade to line 0:0 but evaluation is correct.  Position
+/// relocation is Phase 3.2-3.
+///
+/// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
+///   Input Output Group.
+/// SPDX-License-Identifier: Apache-2.0
+
+#include "nix/expr/bytecode-serialize.hh"
+#include "nix/expr/eval.hh"
+#include "nix/expr/eval-inline.hh"
+#include "nix/expr/symbol-table.hh"
+#include "nix/expr/value.hh"
+#include "nix/expr/nixexpr.hh"
+
+#include <cstring>
+#include <vector>
+
+namespace nix::bytecode {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Constant-payload kind tags.  Independent of InternalType so the
+// schema can survive InternalType reorderings.
+// ---------------------------------------------------------------------------
+enum class ConstKind : uint8_t {
+    Int     = 1,
+    BoolFalse = 2,
+    BoolTrue  = 3,
+    Null    = 4,
+    Float   = 5,
+    String  = 6,  // string with no context
+    StringWithContext = 7,
+    Path    = 8,
+    PrimOpByName = 9,
+    Failed  = 10, // sentinel, no payload
+};
+
+// ---------------------------------------------------------------------------
+// Writer — pure append, no seeking.
+// ---------------------------------------------------------------------------
+struct Writer
+{
+    std::string buf;
+
+    void put(const void * src, size_t n)
+    {
+        buf.append(static_cast<const char *>(src), n);
+    }
+
+    template<typename T>
+    void putPod(const T & v)
+    {
+        static_assert(std::is_trivially_copyable_v<T>);
+        put(&v, sizeof(T));
+    }
+
+    void putU8(uint8_t v) { putPod(v); }
+    void putU32(uint32_t v) { putPod(v); }
+    void putU64(uint64_t v) { putPod(v); }
+
+    void putString(std::string_view s)
+    {
+        putU32(static_cast<uint32_t>(s.size()));
+        put(s.data(), s.size());
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Reader — bounds-checked sequential read.
+// ---------------------------------------------------------------------------
+struct Reader
+{
+    const char * cur;
+    const char * end;
+
+    Reader(std::string_view sv)
+        : cur(sv.data()), end(sv.data() + sv.size()) {}
+
+    void need(size_t n) const
+    {
+        if (cur + n > end)
+            throw SerializationError("bytecode-serialize: truncated input");
+    }
+
+    void get(void * dst, size_t n)
+    {
+        need(n);
+        std::memcpy(dst, cur, n);
+        cur += n;
+    }
+
+    template<typename T>
+    T getPod()
+    {
+        static_assert(std::is_trivially_copyable_v<T>);
+        T out;
+        get(&out, sizeof(T));
+        return out;
+    }
+
+    uint8_t  getU8() { return getPod<uint8_t>(); }
+    uint32_t getU32() { return getPod<uint32_t>(); }
+    uint64_t getU64() { return getPod<uint64_t>(); }
+
+    std::string_view getString()
+    {
+        uint32_t len = getU32();
+        need(len);
+        std::string_view sv(cur, len);
+        cur += len;
+        return sv;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Constant serialization — leaf types only.  Caller has already verified
+// cacheabilityCheck(unit) != NonLeafConstant, so these branches cover
+// every valid input.
+// ---------------------------------------------------------------------------
+void writeConstant(Writer & w, const Value * v)
+{
+    if (!v) {
+        // Defensive: empty slot in constants pool.  Encode as Null.
+        w.putU8(static_cast<uint8_t>(ConstKind::Null));
+        return;
+    }
+    switch (v->type()) {
+        case nInt:
+            w.putU8(static_cast<uint8_t>(ConstKind::Int));
+            w.putU64(static_cast<uint64_t>(v->integer().value));
+            break;
+        case nBool:
+            w.putU8(v->boolean()
+                ? static_cast<uint8_t>(ConstKind::BoolTrue)
+                : static_cast<uint8_t>(ConstKind::BoolFalse));
+            break;
+        case nNull:
+            w.putU8(static_cast<uint8_t>(ConstKind::Null));
+            break;
+        case nFloat: {
+            w.putU8(static_cast<uint8_t>(ConstKind::Float));
+            double d = v->fpoint();
+            w.putPod(d);
+            break;
+        }
+        case nString: {
+            // Strings may carry a context.  Encode the bytes; if there
+            // is a context, encode it as a list of context strings.
+            const Value::StringWithContext::Context * ctx = v->context();
+            if (ctx && ctx->size() > 0) {
+                w.putU8(static_cast<uint8_t>(ConstKind::StringWithContext));
+                w.putString(v->string_view());
+                w.putU32(static_cast<uint32_t>(ctx->size()));
+                for (auto * sd : *ctx)
+                    w.putString(sd->view());
+            } else {
+                w.putU8(static_cast<uint8_t>(ConstKind::String));
+                w.putString(v->string_view());
+            }
+            break;
+        }
+        case nPath: {
+            w.putU8(static_cast<uint8_t>(ConstKind::Path));
+            // Encode the canonical path string.  The accessor is
+            // re-resolved on load against the loading EvalState's rootFS.
+            auto sp = v->path();
+            w.putString(sp.path.abs());
+            break;
+        }
+        case nFunction:
+            // Only PrimOps reach here (cacheabilityCheck rejected
+            // lambdas).  Serialize by name; resolve on load.
+            w.putU8(static_cast<uint8_t>(ConstKind::PrimOpByName));
+            w.putString(v->primOp()->name);
+            break;
+        case nFailed:
+            w.putU8(static_cast<uint8_t>(ConstKind::Failed));
+            break;
+        case nThunk:
+        case nAttrs:
+        case nList:
+        case nExternal:
+            // cacheabilityCheck should have rejected these.  Defensive abort.
+            throw SerializationError("bytecode-serialize: non-leaf constant slipped past cacheability check");
+    }
+}
+
+Value * readConstant(Reader & r, EvalState & state)
+{
+    auto kind = static_cast<ConstKind>(r.getU8());
+    auto * v = state.allocValue();
+    switch (kind) {
+        case ConstKind::Int: {
+            int64_t n = static_cast<int64_t>(r.getU64());
+            v->mkInt(static_cast<NixInt::Inner>(n));
+            return v;
+        }
+        case ConstKind::BoolFalse:
+            v->mkBool(false);
+            return v;
+        case ConstKind::BoolTrue:
+            v->mkBool(true);
+            return v;
+        case ConstKind::Null:
+            v->mkNull();
+            return v;
+        case ConstKind::Float: {
+            double d = r.getPod<double>();
+            v->mkFloat(d);
+            return v;
+        }
+        case ConstKind::String: {
+            auto sv = r.getString();
+            v->mkString(sv, state.mem);
+            return v;
+        }
+        case ConstKind::StringWithContext: {
+            auto sv = r.getString();
+            uint32_t nCtx = r.getU32();
+            // Build a context: array of c-string pointers terminated by null.
+            // For simplicity, re-allocate each context entry into the eval
+            // memory and assemble.
+            std::vector<std::string> ctxStrings;
+            ctxStrings.reserve(nCtx);
+            for (uint32_t i = 0; i < nCtx; i++)
+                ctxStrings.emplace_back(r.getString());
+            // mkString with context: build a NixStringContext and convert.
+            NixStringContext nsc;
+            for (auto & s : ctxStrings)
+                nsc.insert(NixStringContextElem::parse(s));
+            v->mkString(sv, nsc, state.mem);
+            return v;
+        }
+        case ConstKind::Path: {
+            auto pathStr = r.getString();
+            // Re-resolve through the loading state's rootFS.
+            SourcePath sp(state.rootFS,
+                          CanonPath(CanonPath::unchecked_t(), std::string(pathStr)));
+            v->mkPath(sp, state.mem);
+            return v;
+        }
+        case ConstKind::PrimOpByName: {
+            auto name = r.getString();
+            // Try internalPrimOps first (covers __ops with the prefix
+            // stripped), then fall back to the public `builtins`
+            // attrset for regular primops like `mul` / `sub` / etc.
+            auto it = state.internalPrimOps.find(std::string(name));
+            if (it != state.internalPrimOps.end()) {
+                *v = *it->second;
+                return v;
+            }
+            try {
+                Value & b = state.getBuiltin(std::string(name));
+                *v = b;
+                return v;
+            } catch (...) {
+                throw SerializationError(
+                    "bytecode-serialize: cached primop '" + std::string(name)
+                    + "' not resolvable in this EvalState");
+            }
+        }
+        case ConstKind::Failed:
+            // Should never appear in a fresh CU; defensive Null.
+            v->mkNull();
+            return v;
+    }
+    throw SerializationError("bytecode-serialize: unknown constant kind");
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Public entry points.
+// ---------------------------------------------------------------------------
+
+std::string serializeCU(const CompilationUnit & unit, const EvalState & state)
+{
+    auto reason = cacheabilityCheck(unit);
+    if (reason != UncacheableReason::Cacheable)
+        throw SerializationError(
+            std::string("bytecode-serialize: refuse to serialize uncacheable CU (")
+            + uncacheableReasonName(reason) + ")");
+
+    Writer w;
+    // Magic + schema version + reserved flags word.
+    w.put(kBytecodeMagic, sizeof(kBytecodeMagic));
+    w.putU32(kBytecodeSerializeSchemaVersion);
+    w.putU32(0);  // flags reserved
+
+    // Code buffer: just the raw uint32_t stream.
+    w.putU32(static_cast<uint32_t>(unit.code.size()));
+    if (!unit.code.empty())
+        w.put(unit.code.data(), unit.code.size() * sizeof(Instruction));
+
+    // Symbols as strings.
+    w.putU32(static_cast<uint32_t>(unit.symbols.size()));
+    for (auto & sym : unit.symbols) {
+        std::string_view name = state.symbols[sym];
+        w.putString(name);
+    }
+
+    // Constants.
+    w.putU32(static_cast<uint32_t>(unit.constants.size()));
+    for (auto * v : unit.constants)
+        writeConstant(w, v);
+
+    // Thunk descriptors.
+    w.putU32(static_cast<uint32_t>(unit.thunks.size()));
+    for (auto & td : unit.thunks) {
+        w.putU32(td.codeOffset);
+        // Drop pos for now (Phase 3.2-3 will add origin+offset).
+        w.putU32(static_cast<uint32_t>(td.nUpvalues));
+        w.putU32(static_cast<uint32_t>(td.maxSlot));
+        // sourceExpr, cachedExpr dropped — re-allocate lazily on load.
+    }
+
+    // Lambda descriptors.
+    w.putU32(static_cast<uint32_t>(unit.lambdas.size()));
+    for (auto & ld : unit.lambdas) {
+        w.putU32(ld.codeOffset);
+        w.putU32(ld.prologueOffset);
+        w.putU32(ld.bodyThunkIdx);
+        // Symbols name/arg as pool indices (or sentinel UINT32_MAX
+        // if empty).  Caller has already added all referenced symbols
+        // via addSymbol; we serialize their pool indices.
+        auto symIdxOrSentinel = [&](Symbol s) -> uint32_t {
+            if (!s) return UINT32_MAX;
+            auto it = unit.symbolIndex.find(s);
+            if (it == unit.symbolIndex.end()) return UINT32_MAX;
+            return it->second;
+        };
+        w.putU32(symIdxOrSentinel(ld.name));
+        w.putU32(symIdxOrSentinel(ld.arg));
+        w.putU32(static_cast<uint32_t>(ld.envSize));
+        w.putU32(static_cast<uint32_t>(ld.nUpvalues));
+        // cacheabilityCheck rejected lambdas with formals; assert null.
+        assert(ld.formals == nullptr);
+    }
+
+    // AttrCaches: only the symbol pool index is stable; PIC entries
+    // are populated at runtime.
+    w.putU32(static_cast<uint32_t>(unit.attrCaches.size()));
+    for (auto & ac : unit.attrCaches) {
+        auto it = unit.symbolIndex.find(ac.name);
+        w.putU32(it != unit.symbolIndex.end() ? it->second : UINT32_MAX);
+    }
+
+    // Positions: drop for now.  Reserve a u32 length for forward
+    // compatibility (always 0 in v1).
+    w.putU32(0);
+
+    return std::move(w.buf);
+}
+
+CompilationUnit * deserializeCU(std::string_view blob, EvalState & state)
+{
+    Reader r(blob);
+
+    // Magic + version.
+    char magic[8];
+    r.get(magic, sizeof(magic));
+    if (std::memcmp(magic, kBytecodeMagic, sizeof(magic)) != 0)
+        throw SerializationError("bytecode-serialize: magic mismatch");
+    uint32_t version = r.getU32();
+    if (version != kBytecodeSerializeSchemaVersion)
+        throw SerializationError("bytecode-serialize: schema version mismatch");
+    (void) r.getU32();  // flags reserved
+
+    auto * unit = new (GC) CompilationUnit();
+
+    // Code.
+    uint32_t codeLen = r.getU32();
+    unit->code.resize(codeLen);
+    if (codeLen > 0)
+        r.get(unit->code.data(), codeLen * sizeof(Instruction));
+
+    // Symbols: re-intern strings.
+    uint32_t nSymbols = r.getU32();
+    unit->symbols.reserve(nSymbols);
+    for (uint32_t i = 0; i < nSymbols; i++) {
+        auto name = r.getString();
+        Symbol sym = state.symbols.create(name);
+        unit->symbols.push_back(sym);
+        unit->symbolIndex.emplace(sym, i);
+    }
+
+    // Constants.
+    uint32_t nConstants = r.getU32();
+    unit->constants.reserve(nConstants);
+    for (uint32_t i = 0; i < nConstants; i++)
+        unit->constants.push_back(readConstant(r, state));
+
+    // Thunks.
+    uint32_t nThunks = r.getU32();
+    unit->thunks.reserve(nThunks);
+    for (uint32_t i = 0; i < nThunks; i++) {
+        ThunkDescriptor td;
+        td.codeOffset = r.getU32();
+        td.nUpvalues  = static_cast<uint16_t>(r.getU32());
+        td.maxSlot    = static_cast<uint16_t>(r.getU32());
+        td.pos        = noPos;          // dropped
+        td.sourceExpr = nullptr;        // dropped
+        td.cachedExpr = nullptr;        // lazy
+        unit->thunks.push_back(td);
+    }
+
+    // Lambdas.
+    uint32_t nLambdas = r.getU32();
+    unit->lambdas.reserve(nLambdas);
+    for (uint32_t i = 0; i < nLambdas; i++) {
+        LambdaDescriptor ld;
+        ld.codeOffset     = r.getU32();
+        ld.prologueOffset = r.getU32();
+        ld.bodyThunkIdx   = r.getU32();
+        uint32_t nameIdx  = r.getU32();
+        uint32_t argIdx   = r.getU32();
+        ld.name = (nameIdx == UINT32_MAX) ? Symbol{} : unit->symbols.at(nameIdx);
+        ld.arg  = (argIdx  == UINT32_MAX) ? Symbol{} : unit->symbols.at(argIdx);
+        ld.envSize    = static_cast<uint16_t>(r.getU32());
+        ld.nUpvalues  = static_cast<uint16_t>(r.getU32());
+        ld.formals    = nullptr;
+        ld.sourceExpr = nullptr;
+        ld.cachedExpr = nullptr;
+        ld.pos        = noPos;
+        unit->lambdas.push_back(ld);
+    }
+
+    // AttrCaches: rebuild with fresh PIC entries.
+    uint32_t nAttrCaches = r.getU32();
+    unit->attrCaches.reserve(nAttrCaches);
+    for (uint32_t i = 0; i < nAttrCaches; i++) {
+        AttrCache ac;
+        uint32_t symIdx = r.getU32();
+        if (symIdx != UINT32_MAX)
+            ac.name = unit->symbols.at(symIdx);
+        // ac.entries already zero-initialized.
+        unit->attrCaches.push_back(ac);
+    }
+
+    // Positions: skipped in v1.  Always 0 entries.
+    uint32_t nPositions = r.getU32();
+    if (nPositions != 0)
+        throw SerializationError(
+            "bytecode-serialize: positions table not yet supported");
+
+    if (r.cur != r.end)
+        throw SerializationError("bytecode-serialize: trailing bytes");
+
+    return unit;
+}
+
+} // namespace nix::bytecode

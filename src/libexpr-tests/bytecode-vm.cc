@@ -1583,3 +1583,85 @@ TEST_F(IREmitTest, ir_emit_produces_code) {
 }
 
 } // namespace nix
+
+#include "nix/expr/bytecode-serialize.hh"
+
+namespace nix {
+
+// Round-trip a CompilationUnit through serialize/deserialize and
+// confirm the resulting unit yields the same eval result.
+class IRSerializeTest : public IREmitTest {};
+
+TEST_F(IRSerializeTest, roundtrip_int_literal) {
+    auto * e = state.parseExprFromString("42", state.rootPath(CanonPath::root));
+    auto mod = ir::lower(state, e);
+    auto * unit = bytecode::emitFromIR(state, mod);
+
+    EXPECT_TRUE(bytecode::isCacheable(*unit));
+
+    auto blob = bytecode::serializeCU(*unit, state);
+    EXPECT_GT(blob.size(), 16u);  // at least magic + version + flags + something
+    auto * roundTripped = bytecode::deserializeCU(blob, state);
+    EXPECT_EQ(roundTripped->code.size(), unit->code.size());
+    EXPECT_EQ(roundTripped->constants.size(), unit->constants.size());
+    EXPECT_EQ(roundTripped->thunks.size(), unit->thunks.size());
+    EXPECT_EQ(roundTripped->lambdas.size(), unit->lambdas.size());
+
+    Value result;
+    bytecode::vmExec(state, *roundTripped, 0, state.baseEnv, result);
+    state.forceValue(result, noPos);
+    EXPECT_EQ(result.type(), nInt);
+    EXPECT_EQ(result.integer().value, 42);
+}
+
+TEST_F(IRSerializeTest, roundtrip_arithmetic) {
+    auto * e = state.parseExprFromString("1 + 2 * 3", state.rootPath(CanonPath::root));
+    auto mod = ir::lower(state, e);
+    auto * unit = bytecode::emitFromIR(state, mod);
+    auto blob = bytecode::serializeCU(*unit, state);
+    auto * rt = bytecode::deserializeCU(blob, state);
+
+    Value result;
+    bytecode::vmExec(state, *rt, 0, state.baseEnv, result);
+    state.forceValue(result, noPos);
+    EXPECT_EQ(result.type(), nInt);
+    EXPECT_EQ(result.integer().value, 7);
+}
+
+TEST_F(IRSerializeTest, roundtrip_let_binding) {
+    auto * e = state.parseExprFromString("let x = 10; in x + 5", state.rootPath(CanonPath::root));
+    auto mod = ir::lower(state, e);
+    auto * unit = bytecode::emitFromIR(state, mod);
+    auto blob = bytecode::serializeCU(*unit, state);
+    auto * rt = bytecode::deserializeCU(blob, state);
+
+    Value result;
+    bytecode::vmExec(state, *rt, 0, state.baseEnv, result);
+    state.forceValue(result, noPos);
+    EXPECT_EQ(result.type(), nInt);
+    EXPECT_EQ(result.integer().value, 15);
+}
+
+TEST_F(IRSerializeTest, roundtrip_string_literal) {
+    auto * e = state.parseExprFromString("\"hello\"", state.rootPath(CanonPath::root));
+    auto mod = ir::lower(state, e);
+    auto * unit = bytecode::emitFromIR(state, mod);
+    auto blob = bytecode::serializeCU(*unit, state);
+    auto * rt = bytecode::deserializeCU(blob, state);
+
+    Value result;
+    bytecode::vmExec(state, *rt, 0, state.baseEnv, result);
+    state.forceValue(result, noPos);
+    EXPECT_EQ(result.type(), nString);
+    EXPECT_EQ(result.string_view(), "hello");
+}
+
+TEST_F(IRSerializeTest, magic_mismatch_throws) {
+    std::string badBlob = "BADMAGIC";
+    badBlob.resize(64, 0);
+    EXPECT_THROW(
+        bytecode::deserializeCU(badBlob, state),
+        bytecode::SerializationError);
+}
+
+} // namespace nix
