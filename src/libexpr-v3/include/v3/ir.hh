@@ -27,6 +27,10 @@
 #include <vector>
 #include <unordered_map>
 
+namespace nix::v3 {
+struct PrimOp;
+}
+
 namespace nix::v3::ir {
 
 // ---------------------------------------------------------------------------
@@ -189,6 +193,14 @@ struct Update { VarId lhs; VarId rhs; };
 /// `__curPos` — position attrset of the call site.
 struct PosExpr {};
 
+/// Direct primop call.  All arguments must be available; the primop's
+/// arity must match args.size().  Faster than going through OP_CALL since
+/// no Closure / PrimOpApp allocation is needed.
+struct PrimOpCall {
+    const v3::PrimOp * primop;
+    std::vector<VarId> args;
+};
+
 // ---------------------------------------------------------------------------
 // IRExpr sum
 // ---------------------------------------------------------------------------
@@ -204,7 +216,8 @@ using Expr = std::variant<
     Not, Negate, Add, Sub, Mul, Div, Eq, NEq, Less,
     And, Or, Impl,
     Update,
-    PosExpr
+    PosExpr,
+    PrimOpCall
 >;
 
 // ---------------------------------------------------------------------------

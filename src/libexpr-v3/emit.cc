@@ -21,6 +21,7 @@
 
 #include "v3/bytecode.hh"
 #include "v3/ir.hh"
+#include "v3/primop.hh"
 #include "v3/vm.hh"
 
 #include <cassert>
@@ -315,6 +316,20 @@ struct Emitter
     {
         emitVarRef(e.lhs); emitVarRef(e.rhs);
         unit.code.push_back(encode(OP_ATTRS_UPDATE));
+    }
+
+    // -- Primop direct call
+    void emitOne(const ir::PrimOpCall & e)
+    {
+        for (auto v : e.args) emitVarRef(v);
+        // Register the primop in the CU's table.  Reuse if already there.
+        uint32_t poIdx = static_cast<uint32_t>(unit.primops.size());
+        for (uint32_t i = 0; i < unit.primops.size(); ++i)
+            if (unit.primops[i] == e.primop) { poIdx = i; goto have; }
+        unit.primops.push_back(e.primop);
+    have:
+        unit.code.push_back(encode(OP_CALL_PRIMOP, static_cast<uint32_t>(e.args.size())));
+        unit.code.push_back(poIdx);
     }
 
     // -- With / assert

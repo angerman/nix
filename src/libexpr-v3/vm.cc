@@ -19,6 +19,7 @@
 
 #include "v3/vm.hh"
 #include "v3/alloc.hh"
+#include "v3/primop.hh"
 
 #include <algorithm>
 #include <cassert>
@@ -677,6 +678,24 @@ Value run(const CompilationUnit & rootCu)
             Bindings * b = Alloc::allocBindings(0);
             Value v; v.tag_payload = static_cast<uint64_t>(Tag::Attrs); v.payload.bindings = b;
             push(vm, v);
+            break;
+        }
+
+        case OP_CALL_PRIMOP: {
+            uint32_t nArgs = operand;
+            uint32_t poIdx = cu->code[ip++];
+            const PrimOp * po = cu->primops[poIdx];
+            // The primop fn signature takes a Value* args buffer.  For the
+            // bring-up, allocate a small inline array up to arity 8.
+            Value args[8];
+            if (nArgs > 8) throw std::runtime_error("v3 OP_CALL_PRIMOP: arity > 8 not supported");
+            for (uint32_t i = nArgs; i > 0; --i) args[i - 1] = pop(vm);
+            // EvalState is a placeholder right now; static instance is
+            // fine for the bring-up primops which don't read any fields.
+            static EvalState stateRef;
+            Value out;
+            po->fn(stateRef, args, out);
+            push(vm, out);
             break;
         }
 

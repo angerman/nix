@@ -31,7 +31,7 @@ namespace nix::v3 {
 using SymbolId = uint32_t;
 constexpr SymbolId kInvalidSymbol = 0;
 
-class EvalState;
+struct EvalState;
 
 // ---------------------------------------------------------------------------
 // ListVec — flat array of Values with a length prefix.

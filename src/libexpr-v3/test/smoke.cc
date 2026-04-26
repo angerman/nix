@@ -19,6 +19,7 @@
 #include "v3/ir.hh"
 #include "v3/vm.hh"
 #include "v3/alloc.hh"
+#include "v3/primop.hh"
 
 #include <cassert>
 #include <cstdio>
@@ -397,8 +398,69 @@ static int testShortCircuit()
     return 0;
 }
 
+// `builtins.length [10 20 30]` -> 3
+static int testPrimOpLength()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto a = addBinding(m, entry, ir::LitInt{10});
+    auto b = addBinding(m, entry, ir::LitInt{20});
+    auto c = addBinding(m, entry, ir::LitInt{30});
+    auto lst = addBinding(m, entry, ir::ListExpr{ {a, b, c} });
+
+    const PrimOp * po = findPrimOp("length");
+    if (!po) { std::fprintf(stderr, "testPrimOpLength: missing 'length' primop\n"); return 1; }
+    auto r = addBinding(m, entry, ir::PrimOpCall{po, {lst}});
+    setReturn(m, entry, r);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value res = run(cu);
+    if (!res.isInt() || res.payload.i != 3) {
+        std::fprintf(stderr, "testPrimOpLength: expected 3, got tag=%d val=%lld\n",
+            (int)res.tag(), (long long)res.payload.i);
+        return 1;
+    }
+    std::fprintf(stderr, "testPrimOpLength: OK (length [10 20 30] = 3)\n");
+    return 0;
+}
+
+// `builtins.head (builtins.tail [10 20 30])` -> 20
+static int testPrimOpHeadTail()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto a = addBinding(m, entry, ir::LitInt{10});
+    auto b = addBinding(m, entry, ir::LitInt{20});
+    auto c = addBinding(m, entry, ir::LitInt{30});
+    auto lst = addBinding(m, entry, ir::ListExpr{ {a, b, c} });
+
+    auto tailOp = findPrimOp("tail");
+    auto headOp = findPrimOp("head");
+    if (!tailOp || !headOp) { std::fprintf(stderr, "testPrimOpHeadTail: missing primops\n"); return 1; }
+    auto t = addBinding(m, entry, ir::PrimOpCall{tailOp, {lst}});
+    auto h = addBinding(m, entry, ir::PrimOpCall{headOp, {t}});
+    setReturn(m, entry, h);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value res = run(cu);
+    if (!res.isInt() || res.payload.i != 20) {
+        std::fprintf(stderr, "testPrimOpHeadTail: expected 20, got tag=%d val=%lld\n",
+            (int)res.tag(), (long long)res.payload.i);
+        return 1;
+    }
+    std::fprintf(stderr, "testPrimOpHeadTail: OK (head (tail [10 20 30]) = 20)\n");
+    return 0;
+}
+
 int main()
 {
+    registerBuiltinPrimOps();
     int rc = 0;
     rc |= testLitInt();
     rc |= testAdd();
@@ -411,6 +473,8 @@ int main()
     rc |= testWith();
     rc |= testThunkForce();
     rc |= testShortCircuit();
+    rc |= testPrimOpLength();
+    rc |= testPrimOpHeadTail();
 
     auto & st = allocStats();
     std::fprintf(stderr,

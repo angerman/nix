@@ -114,6 +114,8 @@ void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
             refs.insert(e.cond);
         } else if constexpr (std::is_same_v<T, ConcatStrings>) {
             for (auto v : e.parts) refs.insert(v);
+        } else if constexpr (std::is_same_v<T, PrimOpCall>) {
+            for (auto v : e.args) refs.insert(v);
         } else if constexpr (std::is_same_v<T, Not> ||
                              std::is_same_v<T, Negate>) {
             refs.insert(e.operand);

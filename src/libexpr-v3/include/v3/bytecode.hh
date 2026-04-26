@@ -29,6 +29,8 @@
 
 namespace nix::v3 {
 
+struct PrimOp;
+
 using Instruction = uint32_t;
 
 enum Op : uint8_t
@@ -112,6 +114,11 @@ enum Op : uint8_t
     OP_ASSERT         = 0xA0,  // pop bool; raise if false
     OP_POS            = 0xA1,  // [posIdx:24]  push pos attrset
 
+    /// Direct primop call.  [nArgs:24]; data: primop-table index.
+    /// Pops nArgs from stack (in argument order: arg0, arg1, ...) and
+    /// pushes the primop's result.
+    OP_CALL_PRIMOP    = 0xB0,
+
     OP_HALT           = 0xFF,
 };
 
@@ -158,6 +165,9 @@ struct CompilationUnit
     /// Lambda descriptors, indexed by IR FuncId.  function 0 = top-level.
     std::vector<LambdaDescriptor> lambdas;
     std::vector<uint32_t>          lambdaCodeOffsets;
+
+    /// Primops referenced by OP_CALL_PRIMOP, indexed by primop-table index.
+    std::vector<const PrimOp *> primops;
 
     /// Top-level entry offset.
     uint32_t entryOffset = 0;
