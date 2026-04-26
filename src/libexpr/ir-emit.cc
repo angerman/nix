@@ -242,7 +242,20 @@ void IREmitter::emit()
             if (std::holds_alternative<ir::IRLambda>(b.expr)) totalLambdas++;
         }
     }
-    unit.code.reserve(totalBindings * 8 + 64);
+    // Phase 3.1f-3: When lazy emit is enabled (NIX_VM_V2_LAZY_EMIT=1),
+    // unit.code grows incrementally as deferred bodies are realized.
+    // The dispatch loop re-reads cu->code[ip] every iteration, so a
+    // realloc-during-execute is safe semantically — but we'd still
+    // pay the copy.  Reserve generously upfront so the typical
+    // never-grow case is hit.  Extra cost: ~megabyte of unused
+    // virtual address space per CU; the OS doesn't fault until
+    // touched.
+    const char * lazyEmitEnv = ::getenv("NIX_VM_V2_LAZY_EMIT");
+    bool lazyEmit = lazyEmitEnv && std::string(lazyEmitEnv) == "1";
+    size_t codeReserve = lazyEmit
+        ? (totalBindings * 32 + 4096)   // generous for lazy growth
+        : (totalBindings * 8 + 64);
+    unit.code.reserve(codeReserve);
     unit.thunks.reserve(totalThunks + 16);
     unit.lambdas.reserve(totalLambdas + 16);
     unit.constants.reserve(totalBindings + 32);

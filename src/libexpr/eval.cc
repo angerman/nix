@@ -1281,6 +1281,17 @@ void EvalState::eval(Expr * e, Value & v)
             bytecodeCompileTimeUs += std::chrono::duration_cast<
                 std::chrono::microseconds>(t1 - t0).count();
 
+            // Phase 3.1f-1: Pin the IRModule to the CU when lazy
+            // body emission is enabled.  Without this the module is
+            // dropped at end-of-eval() and deferred bodies have
+            // nothing to re-emit from.  Default off — opt-in via
+            // NIX_VM_V2_LAZY_EMIT=1.
+            static bool lazyEmit =
+                getEnv("NIX_VM_V2_LAZY_EMIT").value_or("") == "1";
+            if (lazyEmit) {
+                unit->irModule = std::make_unique<ir::IRModule>(std::move(mod));
+            }
+
             if (profileCompile) {
                 ir::lowerPhaseTiming = prevL;
                 bytecode::emitPhaseTiming = prevE;

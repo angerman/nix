@@ -8,8 +8,12 @@
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/nixexpr.hh"
+#include "nix/expr/ir.hh"
 
 namespace nix::bytecode {
+
+CompilationUnit::CompilationUnit() = default;
+CompilationUnit::~CompilationUnit() = default;
 
 uint32_t CompilationUnit::addSymbol(Symbol sym)
 {

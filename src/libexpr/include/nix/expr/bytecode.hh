@@ -12,9 +12,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+namespace nix::ir {
+struct IRModule;
+}
 
 namespace nix {
 
@@ -432,6 +437,22 @@ struct ThunkDescriptor
     Expr *   sourceExpr = nullptr; // Original AST expression (for isTrivial() compat)
     uint16_t nUpvalues = 0; // Number of upvalues captured (v2 thunks)
 
+    /// Phase 3.1f-2: Compilation state for the thunk body.
+    /// `Compiled`: codeOffset is valid and the body bytecode is in
+    /// unit.code at that offset.
+    /// `Pending`:  codeOffset has not yet been emitted; the first
+    /// force should call lazyEmitThunkBody(state, cu, thunkIdx) which
+    /// reads from the descriptor's saved DeferredEmitState (Phase
+    /// 3.1f-5).  No behavior change yet — emit always sets Compiled
+    /// at the end of emitFromIR.
+    enum class State : uint8_t { Compiled = 0, Pending = 1 };
+    State    state = State::Compiled;
+
+    /// Phase 3.1f-2: For Pending descriptors, the IR block id whose
+    /// body the deferred emit should re-enter.  Unused while state ==
+    /// Compiled.
+    uint32_t bodyBlockId = 0;
+
     /// Maximum stack-slot index used by this thunk's body.  Filled in
     /// at emit time (max nextSlot reached during sub-block emission).
     /// Frame-push paths use this for a single VMState::ensureCapacity
@@ -532,6 +553,12 @@ struct AttrCache
 /// GC-allocated so Boehm traces all Value* pointers in the constants pool.
 struct CompilationUnit : gc
 {
+    /// Constructor and destructor are out-of-line so unique_ptr<IRModule>
+    /// (incomplete type in this header) compiles cleanly.  Defined in
+    /// bytecode.cc.
+    CompilationUnit();
+    ~CompilationUnit();
+
     // -- Bytecode --
     // Flat array of 32-bit instructions.
     std::vector<Instruction, traceable_allocator<Instruction>> code;
@@ -574,6 +601,14 @@ struct CompilationUnit : gc
     // -- Source path for cache keying and error messages --
     // May be nullptr for string-evaluated expressions.
     const SourcePath * sourcePath = nullptr;
+
+    // -- Phase 3.1f-1: Pinned IRModule for lazy body emission --
+    // When non-null, retains the IR alongside the compiled bytecode
+    // so deferred thunk/lambda body emission can re-enter the
+    // emitter on first force.  Allocated as a unique_ptr; freed when
+    // the CU is GC-finalized.  Memory cost: ~2-3x bytecode size per
+    // unit, paid only when the deferred-emit feature is enabled.
+    std::unique_ptr<ir::IRModule> irModule;
 
     /// Look up the source position for a given instruction offset.
     /// Uses binary search over the sparse position table.
