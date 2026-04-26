@@ -68,15 +68,10 @@ static inline Value * materializeWord(EvalState & state, Value * w)
 {
     if (!nanbox::isTagged(w)) [[likely]]
         return w;
+    // Only tagged ints exist; bool/null are static singletons.
+    assert(nanbox::isTaggedInt(w));
     Value * v = state.allocValue();
-    if (nanbox::isTaggedInt(w))
-        v->mkInt(static_cast<NixInt::Inner>(nanbox::decodeInt(w)));
-    else if (nanbox::isTaggedBool(w))
-        v->mkBool(nanbox::decodeBool(w));
-    else if (nanbox::isTaggedNull(w))
-        v->mkNull();
-    else
-        abort();  // unreachable: unknown tag
+    v->mkInt(static_cast<NixInt::Inner>(nanbox::decodeInt(w)));
     return v;
 }
 
@@ -1462,13 +1457,6 @@ op_jump_if_false:
         int32_t offset = decodeSigned(CUR_INSTR);
         Value * v = vm.pop();
 
-        // Tagged bool fast path.
-        if (nanbox::isTaggedBool(v)) [[likely]] {
-            if (!nanbox::decodeBool(v))
-                ip = static_cast<uint32_t>(static_cast<int32_t>(ip) + offset);
-            DISPATCH();
-        }
-
         PosIdx pos = cu->posForOffset(ip - 1);
         v = materializeWord(state, v);
         state.forceValue(*v, pos);
@@ -1489,13 +1477,6 @@ op_jump_if_true:
     {
         int32_t offset = decodeSigned(CUR_INSTR);
         Value * v = vm.pop();
-
-        // Tagged bool fast path.
-        if (nanbox::isTaggedBool(v)) [[likely]] {
-            if (nanbox::decodeBool(v))
-                ip = static_cast<uint32_t>(static_cast<int32_t>(ip) + offset);
-            DISPATCH();
-        }
 
         PosIdx pos = cu->posForOffset(ip - 1);
         v = materializeWord(state, v);
@@ -1909,12 +1890,6 @@ op_not:
         Value * v = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
 
-        // Tagged bool fast path.
-        if (nanbox::isTaggedBool(v)) [[likely]] {
-            vm.push(nanbox::decodeBool(v) ? &Value::vFalse : &Value::vTrue);
-            DISPATCH();
-        }
-
         v = materializeWord(state, v);
         state.forceValue(*v, pos);
         if (v->type() != nBool)
@@ -1937,14 +1912,6 @@ op_assert:
     {
         Value * cond = vm.pop();
         PosIdx pos = cu->posForOffset(ip - 1);
-
-        // Tagged bool fast path.
-        if (nanbox::isTaggedBool(cond)) [[likely]] {
-            if (!nanbox::decodeBool(cond))
-                state.error<AssertionError>("assertion '%1%' failed", "bytecoded assertion")
-                    .atPos(pos).debugThrow();
-            DISPATCH();
-        }
 
         cond = materializeWord(state, cond);
         state.forceValue(*cond, pos);

@@ -13,9 +13,15 @@
 ///
 ///   bit 0 = 1:  Tagged immediate value
 ///     bits 1-2 = 00  →  60-bit signed int (shifted left 3, low bits are 001)
-///     bits 1-2 = 01  →  bool (bit 3 = value)
-///     bits 1-2 = 10  →  null (specific value 0b101)
+///     bits 1-2 = 01  →  reserved (was: bool — replaced by static singletons)
+///     bits 1-2 = 10  →  reserved (was: null — replaced by static singleton)
 ///     bits 1-2 = 11  →  reserved
+///
+/// Note: tagged bool and tagged null encodings were removed because the
+/// VM uses static singletons (&Value::vTrue/vFalse/vNull) for these.
+/// The tags would only have helped if arithmetic produced tagged bools
+/// directly to be consumed inline by JUMP_IF_*, but the actual code
+/// paths produce singletons instead.
 ///
 /// Choice: bit 0 = 1 means "immediate", because heap pointers from
 /// GC_MALLOC are always 8-byte aligned (bit 0..2 all zero).  This way
@@ -45,9 +51,8 @@ using NixWord = ::nix::Value *;
 constexpr uintptr_t kTagMask        = 0b111;
 constexpr uintptr_t kTagPointer     = 0b000;  // bit 0 = 0
 constexpr uintptr_t kTagInt         = 0b001;  // bits 0-2 = 001
-constexpr uintptr_t kTagBool        = 0b011;  // bits 0-2 = 011
-constexpr uintptr_t kTagNull        = 0b101;  // bits 0-2 = 101 (singleton)
-// 0b111 reserved for future tags
+// 0b011, 0b101, 0b111 reserved — tagged bool/null were removed since
+// the VM uses static singletons (&Value::vTrue/vFalse/vNull).
 
 /// True if w is a tagged immediate (any low-bit-1 value).
 [[gnu::always_inline]]
@@ -70,21 +75,7 @@ inline bool isTaggedInt(NixWord w) noexcept
     return (reinterpret_cast<uintptr_t>(w) & kTagMask) == kTagInt;
 }
 
-/// True if w is a tagged bool.
-[[gnu::always_inline]]
-inline bool isTaggedBool(NixWord w) noexcept
-{
-    return (reinterpret_cast<uintptr_t>(w) & kTagMask) == kTagBool;
-}
-
-/// True if w is the tagged null singleton.
-[[gnu::always_inline]]
-inline bool isTaggedNull(NixWord w) noexcept
-{
-    return reinterpret_cast<uintptr_t>(w) == kTagNull;
-}
-
-/// True if w is any tagged scalar (int, bool, null).
+/// True if w is any tagged scalar (currently only tagged ints).
 /// These values are "already forced" — no thunk to evaluate.
 [[gnu::always_inline]]
 inline bool isTaggedScalar(NixWord w) noexcept
@@ -116,22 +107,6 @@ inline bool intFitsTagged(int64_t n) noexcept
     return n >= kMin && n <= kMax;
 }
 
-/// Encode a bool as a tagged immediate.
-[[gnu::always_inline]]
-inline NixWord encodeBool(bool b) noexcept
-{
-    // bit 3 holds the bool value, bits 0-2 = 011.
-    uintptr_t bits = (static_cast<uintptr_t>(b ? 1 : 0) << 3) | kTagBool;
-    return reinterpret_cast<NixWord>(bits);
-}
-
-/// Encode null as the tagged null singleton.
-[[gnu::always_inline]]
-inline NixWord encodeNull() noexcept
-{
-    return reinterpret_cast<NixWord>(kTagNull);
-}
-
 // ---- Decode ----
 
 /// Decode a tagged int back to int64_t.
@@ -142,14 +117,6 @@ inline int64_t decodeInt(NixWord w) noexcept
     // Arithmetic right shift to sign-extend (cast through intptr_t).
     return static_cast<int64_t>(
         static_cast<intptr_t>(reinterpret_cast<uintptr_t>(w)) >> 3);
-}
-
-/// Decode a tagged bool.
-/// Caller must verify isTaggedBool(w) first.
-[[gnu::always_inline]]
-inline bool decodeBool(NixWord w) noexcept
-{
-    return ((reinterpret_cast<uintptr_t>(w) >> 3) & 1) != 0;
 }
 
 } // namespace nix::nanbox
