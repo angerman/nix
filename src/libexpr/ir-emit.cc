@@ -1725,31 +1725,35 @@ void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
     // OP_GET_STACK_SLOT (or OP_GET_UPVALUE) and the operand fits in
     // 12 bits AND the new emit also fits, replace the pair with the
     // dual-form superinstruction OP_GET_SLOT2 (or OP_GET_UV2).
-    auto fuseIfDualSlot = [&](uint32_t newSlot) -> bool {
-        if (newSlot > 0xFFF) return false;
+    // Tries to fuse a NEW emit (slot or upvalue) with the previous
+    // emit if the latter was a single-form get.  Covers the four
+    // pairings: SLOT+SLOT, UV+UV, UV+SLOT, SLOT+UV.
+    auto fusePair = [&](bool newIsSlot, uint32_t newOperand) -> bool {
+        if (newOperand > 0xFFF) return false;
         if (unit.code.empty()) return false;
         uint32_t lastIdx = unit.code.size() - 1;
-        if (decodeOp(unit.code[lastIdx]) != OP_GET_STACK_SLOT) return false;
-        uint32_t prevSlot = decodeOperand(unit.code[lastIdx]);
-        if (prevSlot > 0xFFF) return false;
-        unit.code[lastIdx] = encode(OP_GET_SLOT2, (prevSlot << 12) | newSlot);
-        return true;
-    };
-    auto fuseIfDualUv = [&](uint32_t newUv) -> bool {
-        if (newUv > 0xFFF) return false;
-        if (unit.code.empty()) return false;
-        uint32_t lastIdx = unit.code.size() - 1;
-        if (decodeOp(unit.code[lastIdx]) != OP_GET_UPVALUE) return false;
-        uint32_t prevUv = decodeOperand(unit.code[lastIdx]);
-        if (prevUv > 0xFFF) return false;
-        unit.code[lastIdx] = encode(OP_GET_UV2, (prevUv << 12) | newUv);
+        uint8_t prevOp = decodeOp(unit.code[lastIdx]);
+        uint32_t prevOperand = decodeOperand(unit.code[lastIdx]);
+        if (prevOperand > 0xFFF) return false;
+        uint8_t fusedOp;
+        if (prevOp == OP_GET_STACK_SLOT && newIsSlot)
+            fusedOp = OP_GET_SLOT2;
+        else if (prevOp == OP_GET_UPVALUE && !newIsSlot)
+            fusedOp = OP_GET_UV2;
+        else if (prevOp == OP_GET_UPVALUE && newIsSlot)
+            fusedOp = OP_GET_UV_SLOT;
+        else if (prevOp == OP_GET_STACK_SLOT && !newIsSlot)
+            fusedOp = OP_GET_SLOT_UV;
+        else
+            return false;
+        unit.code[lastIdx] = encode(fusedOp, (prevOperand << 12) | newOperand);
         return true;
     };
 
     // Check local slots first (defined in this block).
     auto localIt = ctx.localSlots.find(var);
     if (localIt != ctx.localSlots.end()) {
-        if (!fuseIfDualSlot(localIt->second))
+        if (!fusePair(true, localIt->second))
             unit.emit(OP_GET_STACK_SLOT, localIt->second);
         return;
     }
@@ -1767,7 +1771,7 @@ void IREmitter::emitVarRef(ir::VarId var, PosIdx pos, BlockContext & ctx)
     // Check upvalue slots (captured from enclosing scope).
     auto upIt = ctx.upvalueSlots.find(var);
     if (upIt != ctx.upvalueSlots.end()) {
-        if (!fuseIfDualUv(upIt->second))
+        if (!fusePair(false, upIt->second))
             unit.emit(OP_GET_UPVALUE, upIt->second);
         return;
     }

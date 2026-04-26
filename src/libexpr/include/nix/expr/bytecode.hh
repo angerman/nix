@@ -480,6 +480,17 @@ enum Op : uint8_t {
     /// Encoding: [slot1:12 | slot2:12].
     /// Profile (B5 agent on nixpkgs#hello.name): ~6.3% of dispatches.
     OP_GET_SLOT2 = 0x6E,
+
+    /// B5 superinstruction: fuse OP_GET_UPVALUE + OP_GET_STACK_SLOT.
+    /// Pushes upvalues[uv], then stack[base+slot].
+    /// Encoding: [uv:12 | slot:12].
+    /// Profile: ~3.9% of dispatches (pair #7).
+    OP_GET_UV_SLOT = 0x6F,
+
+    /// B5 superinstruction: fuse OP_GET_STACK_SLOT + OP_GET_UPVALUE.
+    /// Pushes stack[base+slot], then upvalues[uv].
+    /// Encoding: [slot:12 | uv:12].
+    OP_GET_SLOT_UV = 0x70,
 };
 
 

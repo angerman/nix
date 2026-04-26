@@ -852,6 +852,8 @@ void vmExec(
         REGISTER_OP(OP_RLIST_INIT, op_rlist_init);
         REGISTER_OP(OP_GET_UV2, op_get_uv2);
         REGISTER_OP(OP_GET_SLOT2, op_get_slot2);
+        REGISTER_OP(OP_GET_UV_SLOT, op_get_uv_slot);
+        REGISTER_OP(OP_GET_SLOT_UV, op_get_slot_uv);
 
 #undef REGISTER_OP
         tableInitialized = true;
@@ -2851,10 +2853,15 @@ op_attr_select_cached:
                 fprintf(stderr,
                     "OP_ATTR_SELECT_CACHED miss in cu=%p pos=%s\n"
                     "  looking for '%s' (cacheIdx=%u, name.id=%u)\n"
+                    "  attrs val=%p type=%d Bindings*=%p size=%zu\n"
                     "  CU symbols (%zu total):",
                     (void*)cu, posStr.c_str(),
                     state.symbols[cache.name].c_str(),
-                    cacheIdx, cache.name.getId(), cu->symbols.size());
+                    cacheIdx, cache.name.getId(),
+                    (void*)attrs, (int)attrs->type(),
+                    (const void*)attrs->attrs(),
+                    attrs->attrs() ? attrs->attrs()->size() : (size_t)0,
+                    cu->symbols.size());
                 for (uint32_t i = 0; i < std::min<uint32_t>(16, cu->symbols.size()); i++) {
                     fprintf(stderr, " [%u]='%s' id=%u",
                         i, state.symbols[cu->symbols[i]].c_str(),
@@ -2869,6 +2876,22 @@ op_attr_select_cached:
                 }
                 fprintf(stderr, "\n  cu->code size=%zu, ip-1=%u, num attrCaches=%zu\n",
                     cu->code.size(), ip - 1, cu->attrCaches.size());
+                fprintf(stderr, "  preceding 16 instructions:");
+                uint32_t startBack = ip > 17 ? ip - 17 : 0;
+                for (uint32_t k = startBack; k < ip; ++k) {
+                    uint32_t insn = cu->code[k];
+                    uint8_t opc = insn >> 24;
+                    uint32_t opd = insn & 0xFFFFFF;
+                    fprintf(stderr, "\n    [%u]op=0x%02x(%s) operand=0x%x",
+                        k, opc, opName(opc), opd);
+                }
+                fprintf(stderr, "\n  frame trace (last 6):\n");
+                size_t fStart = vm.frames.size() > 6 ? vm.frames.size() - 6 : 0;
+                for (size_t fi = fStart; fi < vm.frames.size(); fi++) {
+                    auto & f = vm.frames[fi];
+                    fprintf(stderr, "    frame[%zu] cu=%p ip=%u stackBase=%zu\n",
+                        fi, (void*)f.unit, f.ip, f.stackBaseOffset);
+                }
             }
             state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
                 .atPos(cu->posForOffset(ip - 1)).debugThrow();
@@ -3316,6 +3339,44 @@ op_get_slot2:
         size_t base = stackBase;
         vm.push(vm.stack[base + s1]);
         vm.push(vm.stack[base + s2]);
+        DISPATCH();
+    }
+
+    // B5 superinstruction: GET_UPVALUE + GET_STACK_SLOT (~3.9%).
+    // Encoding: [uv:12 | slot:12].
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_uv_slot:
+#else
+    case OP_GET_UV_SLOT:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t uv   = operand >> 12;
+        uint32_t slot = operand & 0xFFF;
+        Value ** upvalues = vm.frames.back().upvalues;
+        assert(upvalues && "OP_GET_UV_SLOT: no upvalue array");
+        vm.push(upvalues[uv]);
+        size_t base = stackBase;
+        vm.push(vm.stack[base + slot]);
+        DISPATCH();
+    }
+
+    // B5 superinstruction: GET_STACK_SLOT + GET_UPVALUE.
+    // Encoding: [slot:12 | uv:12].
+#ifdef NIX_VM_COMPUTED_GOTO
+op_get_slot_uv:
+#else
+    case OP_GET_SLOT_UV:
+#endif
+    {
+        uint32_t operand = decodeOperand(CUR_INSTR);
+        uint32_t slot = operand >> 12;
+        uint32_t uv   = operand & 0xFFF;
+        size_t base = stackBase;
+        vm.push(vm.stack[base + slot]);
+        Value ** upvalues = vm.frames.back().upvalues;
+        assert(upvalues && "OP_GET_SLOT_UV: no upvalue array");
+        vm.push(upvalues[uv]);
         DISPATCH();
     }
 
