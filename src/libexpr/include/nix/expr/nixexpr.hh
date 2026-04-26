@@ -592,6 +592,25 @@ public:
             return std::nullopt;
     }
 
+    /// Used ONLY by ExprLambdaBytecode when reconstructing a lambda
+    /// from a disk-loaded CompilationUnit (the AST sourceExpr is gone).
+    /// Allocates a contiguous Formal[] from `formalsBuf`, copies in the
+    /// (name, def) pairs, and flips hasFormals=true so getFormals()
+    /// returns the right shape.  `defSentinel` distinguishes formals
+    /// with vs without defaults — we use a non-null sentinel since
+    /// only `builtins.functionArgs` reads it (as a bool), and the
+    /// VM's bytecode prologue handles default-thunk binding directly.
+    void setBytecodeFormals(
+        bool ellipsis_,
+        Formal * formals_,
+        uint16_t n_)
+    {
+        hasFormals  = true;
+        ellipsis    = ellipsis_;
+        nFormals    = n_;
+        formalsStart = formals_;
+    }
+
     Expr * body;
     DocComment docComment;
 

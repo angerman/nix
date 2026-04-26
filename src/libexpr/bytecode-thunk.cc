@@ -73,7 +73,42 @@ ExprLambdaBytecode::ExprLambdaBytecode(
             sizeof(ExprLambda));
         // body will be overridden by OP_MAKE_CLOSURE after construction.
     } else {
+        // Disk-cache load path: no AST.  Reconstruct just enough of the
+        // ExprLambda public surface so `getFormals()`, `builtins.functionArgs`,
+        // and `intersectAttrs` answer correctly.  The bytecode prologue
+        // already binds formals at runtime; this is purely for runtime
+        // introspection (issue #159 root cause: without setting hasFormals
+        // here, functionArgs returned `{}` for cached formals lambdas,
+        // causing callPackage to invoke them with `{}` and the prologue
+        // then failed with `attribute 'X' missing`).
         this->name = desc.name;
+        if (desc.sourceHasFormals) {
+            // Allocate a Formal[] for the ExprLambda's formalsStart pointer.
+            // GC-allocated since the lambda may outlive the CompilationUnit
+            // in some flows; trivial Formal layout makes this safe under
+            // Boehm.  `def` is set to a non-null sentinel for formals that
+            // had a default in the source — this is the bit `functionArgs`
+            // and `callPackageWith` care about.  The actual default value
+            // is bound by the bytecoded prologue, never via `def->maybeThunk`.
+            uint16_t n = static_cast<uint16_t>(desc.sourceFormals.size());
+            // Allocated via Boehm GC so it survives until the proxy
+            // ExprLambdaBytecode itself is reclaimed.  The CompilationUnit
+            // is GC-traced; we don't need a separate ownership story.
+            auto * arr = new (GC) Formal[n];
+            // Sentinel non-null Expr* for "has default".  Cast a function
+            // pointer through reinterpret_cast to a clearly-bogus address
+            // — any non-null value works since the only reader is
+            // `state.getBool(formal.def)` (bool conversion).
+            static char defSentinel = 0;
+            for (uint16_t i = 0; i < n; ++i) {
+                auto sIdx = desc.sourceFormals[i].first;
+                bool hasDef = desc.sourceFormals[i].second;
+                arr[i].pos  = noPos;
+                arr[i].name = unit->symbols.at(sIdx);
+                arr[i].def  = hasDef ? reinterpret_cast<Expr *>(&defSentinel) : nullptr;
+            }
+            setBytecodeFormals(desc.sourceFormalsEllipsis, arr, n);
+        }
     }
 
     // Mark as bytecode proxy so OP_CALL_1 can detect v2 closures

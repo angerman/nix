@@ -37,7 +37,7 @@ namespace nix::bytecode {
 /// Bumped whenever the on-disk schema changes (opcode encoding,
 /// descriptor field layout, constant payload format, etc.).  A
 /// mismatched version on load is an immediate failure — no migration.
-constexpr uint32_t kBytecodeSerializeSchemaVersion = 1;
+constexpr uint32_t kBytecodeSerializeSchemaVersion = 2;
 
 /// Magic prefix for cached CU blobs.  8 bytes including the schema
 /// discriminator so format mismatches are detected up-front.

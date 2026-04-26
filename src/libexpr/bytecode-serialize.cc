@@ -359,6 +359,23 @@ std::string serializeCU(const CompilationUnit & unit, const EvalState & state)
         w.putU32(static_cast<uint32_t>(ld.nUpvalues));
         // cacheabilityCheck rejected lambdas with formals; assert null.
         assert(ld.formals == nullptr);
+
+        // Phase 3.2-2b (issue #159 fix): persist the formals signature.
+        // Without this, `builtins.functionArgs` returns `{}` for cached
+        // formals lambdas, which makes `lib.callPackageWith` invoke
+        // them with `{}` and the prologue then fails with "attribute X
+        // missing".  We serialize ONLY (name, hasDefault) per formal —
+        // sufficient for functionArgs / intersectAttrs; the bytecode
+        // prologue handles the actual default-thunk binding at runtime.
+        w.putU8(ld.sourceHasFormals ? 1 : 0);
+        if (ld.sourceHasFormals) {
+            w.putU8(ld.sourceFormalsEllipsis ? 1 : 0);
+            w.putU32(static_cast<uint32_t>(ld.sourceFormals.size()));
+            for (auto & [symIdx, hasDef] : ld.sourceFormals) {
+                w.putU32(symIdx);
+                w.putU8(hasDef ? 1 : 0);
+            }
+        }
     }
 
     // AttrCaches: only the symbol pool index is stable; PIC entries
@@ -509,6 +526,21 @@ CompilationUnit * deserializeCU(std::string_view blob, EvalState & state)
         ld.sourceExpr = nullptr;
         ld.cachedExpr = nullptr;
         ld.pos        = noPos;
+
+        // Phase 3.2-2b: formals signature.  See serializer note for
+        // rationale (issue #159).  Reads (name, hasDefault) per formal
+        // so `getFormals()` / `functionArgs` answer correctly.
+        ld.sourceHasFormals = (r.getU8() != 0);
+        if (ld.sourceHasFormals) {
+            ld.sourceFormalsEllipsis = (r.getU8() != 0);
+            uint32_t nFormals = r.getU32();
+            ld.sourceFormals.reserve(nFormals);
+            for (uint32_t k = 0; k < nFormals; ++k) {
+                uint32_t symIdx = r.getU32();
+                bool hasDef = (r.getU8() != 0);
+                ld.sourceFormals.emplace_back(symIdx, hasDef);
+            }
+        }
         unit->lambdas.push_back(ld);
     }
 

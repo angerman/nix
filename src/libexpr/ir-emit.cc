@@ -1110,12 +1110,32 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 // by debug agent for issue #159.
                 if (e.name) unit.addSymbol(e.name);
                 if (e.params.arg) unit.addSymbol(e.params.arg);
+
+                // Capture formals signature for disk-cache survival of
+                // `builtins.functionArgs` (issue #159 follow-up).  The
+                // bytecode prologue handles formals during execution,
+                // but the AST Formals* dies at end-of-process; we record
+                // (name, hasDefault, ellipsis) so a disk-loaded CU can
+                // still answer functionArgs / intersectAttrs queries.
+                bool srcHasFormals = !e.params.formals.empty();
+                std::vector<std::pair<uint32_t, bool>> srcFormals;
+                if (srcHasFormals) {
+                    srcFormals.reserve(e.params.formals.size());
+                    for (auto & f : e.params.formals) {
+                        uint32_t symIdx = unit.addSymbol(f.name);
+                        srcFormals.emplace_back(symIdx,
+                            f.defaultBody != ir::kInvalidBlock);
+                    }
+                }
                 unit.lambdas.push_back(LambdaDescriptor{
                     .codeOffset = bodyOffset,
                     .pos = e.pos,
                     .name = e.name,
                     .arg = e.params.arg,
                     .formals = formals,
+                    .sourceHasFormals = srcHasFormals,
+                    .sourceFormalsEllipsis = e.params.ellipsis,
+                    .sourceFormals = std::move(srcFormals),
                     .envSize = envSize,
                     .nUpvalues = static_cast<uint16_t>(totalUpvalues),
                     .sourceExpr = e.sourceExpr,
@@ -1168,12 +1188,28 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
                 // round-trip.
                 if (e.name) unit.addSymbol(e.name);
                 if (e.params.arg) unit.addSymbol(e.params.arg);
+
+                // Capture formals signature (see cell-capture branch
+                // for rationale).
+                bool srcHasFormals = !e.params.formals.empty();
+                std::vector<std::pair<uint32_t, bool>> srcFormals;
+                if (srcHasFormals) {
+                    srcFormals.reserve(e.params.formals.size());
+                    for (auto & f : e.params.formals) {
+                        uint32_t symIdx = unit.addSymbol(f.name);
+                        srcFormals.emplace_back(symIdx,
+                            f.defaultBody != ir::kInvalidBlock);
+                    }
+                }
                 unit.lambdas.push_back(LambdaDescriptor{
                     .codeOffset = bodyOffset,
                     .pos = e.pos,
                     .name = e.name,
                     .arg = e.params.arg,
                     .formals = formals,
+                    .sourceHasFormals = srcHasFormals,
+                    .sourceFormalsEllipsis = e.params.ellipsis,
+                    .sourceFormals = std::move(srcFormals),
                     .envSize = envSize,
                     .nUpvalues = static_cast<uint16_t>(e.freeVars.size()),
                     .sourceExpr = e.sourceExpr,

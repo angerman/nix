@@ -2759,27 +2759,6 @@ op_attr_select:
         if (auto j = attrs->attrs()->get(name)) {
             *(vm.sp - 1) = j->value;
         } else {
-            // DEBUG: dump symbol pool around the missing symbol so we can see
-            // if the symbol pool got shifted across deserialization.
-            const char * dbg = getenv("NIX_VM_DEBUG_ATTRSEL");
-            if (dbg && *dbg) {
-                fprintf(stderr,
-                    "OP_ATTR_SELECT miss: looking for '%s' (sym=%u/%u)\n"
-                    "  CU symbols (first 16):",
-                    state.symbols[name].c_str(),
-                    symIdx, (unsigned)cu->symbols.size());
-                for (uint32_t i = 0; i < std::min<uint32_t>(16, cu->symbols.size()); i++) {
-                    fprintf(stderr, " [%u]='%s'",
-                        i, state.symbols[cu->symbols[i]].c_str());
-                }
-                fprintf(stderr, "\n  attrs has: ");
-                int n = 0;
-                for (auto & a : *attrs->attrs()) {
-                    if (n++ > 12) { fprintf(stderr, "..."); break; }
-                    fprintf(stderr, " %s", state.symbols[a.name].c_str());
-                }
-                fprintf(stderr, "\n");
-            }
             state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
                 .atPos(pos).debugThrow();
         }
@@ -2839,60 +2818,6 @@ op_attr_select_cached:
             cache.nextEvict = (evict + 1) & AttrCache::kEvictMask;
             *(vm.sp - 1) = j->value;
         } else {
-            const char * dbg = getenv("NIX_VM_DEBUG_ATTRSEL");
-            if (dbg && *dbg) {
-                std::string posStr;
-                {
-                    auto p = cu->posForOffset(ip - 1);
-                    if (p != noPos) {
-                        std::ostringstream oss;
-                        oss << state.positions[p];
-                        posStr = oss.str();
-                    } else posStr = "(no pos)";
-                }
-                fprintf(stderr,
-                    "OP_ATTR_SELECT_CACHED miss in cu=%p pos=%s\n"
-                    "  looking for '%s' (cacheIdx=%u, name.id=%u)\n"
-                    "  attrs val=%p type=%d Bindings*=%p size=%zu\n"
-                    "  CU symbols (%zu total):",
-                    (void*)cu, posStr.c_str(),
-                    state.symbols[cache.name].c_str(),
-                    cacheIdx, cache.name.getId(),
-                    (void*)attrs, (int)attrs->type(),
-                    (const void*)attrs->attrs(),
-                    attrs->attrs() ? attrs->attrs()->size() : (size_t)0,
-                    cu->symbols.size());
-                for (uint32_t i = 0; i < std::min<uint32_t>(16, cu->symbols.size()); i++) {
-                    fprintf(stderr, " [%u]='%s' id=%u",
-                        i, state.symbols[cu->symbols[i]].c_str(),
-                        cu->symbols[i].getId());
-                }
-                fprintf(stderr, "\n  attrs has: ");
-                int n = 0;
-                for (auto & a : *attrs->attrs()) {
-                    if (n++ > 12) { fprintf(stderr, "..."); break; }
-                    fprintf(stderr, " %s(id=%u)",
-                        state.symbols[a.name].c_str(), a.name.getId());
-                }
-                fprintf(stderr, "\n  cu->code size=%zu, ip-1=%u, num attrCaches=%zu\n",
-                    cu->code.size(), ip - 1, cu->attrCaches.size());
-                fprintf(stderr, "  preceding 16 instructions:");
-                uint32_t startBack = ip > 17 ? ip - 17 : 0;
-                for (uint32_t k = startBack; k < ip; ++k) {
-                    uint32_t insn = cu->code[k];
-                    uint8_t opc = insn >> 24;
-                    uint32_t opd = insn & 0xFFFFFF;
-                    fprintf(stderr, "\n    [%u]op=0x%02x(%s) operand=0x%x",
-                        k, opc, opName(opc), opd);
-                }
-                fprintf(stderr, "\n  frame trace (last 6):\n");
-                size_t fStart = vm.frames.size() > 6 ? vm.frames.size() - 6 : 0;
-                for (size_t fi = fStart; fi < vm.frames.size(); fi++) {
-                    auto & f = vm.frames[fi];
-                    fprintf(stderr, "    frame[%zu] cu=%p ip=%u stackBase=%zu\n",
-                        fi, (void*)f.unit, f.ip, f.stackBaseOffset);
-                }
-            }
             state.error<EvalError>("attribute '%1%' missing", state.symbols[cache.name])
                 .atPos(cu->posForOffset(ip - 1)).debugThrow();
         }
