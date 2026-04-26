@@ -53,10 +53,22 @@ public:
     std::atomic<uint64_t> hits{0};
     std::atomic<uint64_t> misses{0};
     std::atomic<uint64_t> inserts{0};
+    std::atomic<uint64_t> evictionCallCount{0};
+
+    uint64_t evictInterval = 1000;
+    uint64_t cacheLimitBytes = 1ull * 1024 * 1024 * 1024; // 1 GiB
 
     explicit DiskCacheImpl(std::optional<std::filesystem::path> dbPath)
         : _state(std::make_unique<Sync<State>>())
     {
+        if (auto interval = ::getenv("NIX_BYTECODE_CACHE_EVICT_INTERVAL")) {
+            try { evictInterval = std::stoull(interval); }
+            catch (...) {}
+        }
+        if (auto limit = ::getenv("NIX_BYTECODE_CACHE_LIMIT")) {
+            try { cacheLimitBytes = std::stoull(limit); }
+            catch (...) {}
+        }
         try {
             // NIX_BYTECODE_CACHE_DIR overrides for benchmarks/tests
             // without disturbing the broader XDG_CACHE_HOME setup
@@ -229,6 +241,14 @@ void BytecodeDiskCache::insert(const CacheKey & key, std::string_view blob,
 uint64_t BytecodeDiskCache::evictTo(uint64_t targetBytes)
 {
     return impl->evictTo(targetBytes);
+}
+
+uint64_t BytecodeDiskCache::maybeEvict()
+{
+    auto count = ++impl->evictionCallCount;
+    if (count % impl->evictInterval != 0)
+        return 0;
+    return impl->evictTo(impl->cacheLimitBytes);
 }
 
 uint64_t BytecodeDiskCache::totalSize() const

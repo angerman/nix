@@ -54,6 +54,14 @@ public:
     void insert(const CacheKey & key, std::string_view blob,
                 std::string_view srcPath);
 
+    /// Suggest an LRU eviction: every Nth call (N read from
+    /// NIX_BYTECODE_CACHE_EVICT_INTERVAL, default 1000) checks
+    /// total size against limitBytes (default 1 GiB, override via
+    /// NIX_BYTECODE_CACHE_LIMIT) and evicts oldest-last_used.
+    /// Returns bytes evicted on this call (0 if not the Nth call
+    /// or if under limit).
+    uint64_t maybeEvict();
+
     /// Delete cached entries to bring DB size below `targetBytes`.
     /// LRU order (oldest last_used first).  Returns bytes removed.
     uint64_t evictTo(uint64_t targetBytes);

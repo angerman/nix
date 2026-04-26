@@ -1324,6 +1324,10 @@ void EvalState::eval(Expr * e, Value & v)
                     }
                     bytecodeDiskCache->insert(*diskKey, blob, srcPath);
                     nrBytecodeDiskCacheInserts++;
+                    // Periodic LRU sweep — cheap (counter-only on
+                    // most calls; full sweep at NIX_BYTECODE_CACHE_-
+                    // EVICT_INTERVAL = 1000 default).
+                    bytecodeDiskCache->maybeEvict();
                 } catch (bytecode::SerializationError &) {
                     // Skip caching for this unit; proceed normally.
                     nrBytecodeDiskCacheSkipped++;
