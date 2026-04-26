@@ -592,6 +592,18 @@ void IREmitter::emitExpr(const ir::IRExpr & expr, PosIdx pos, BlockContext & ctx
             bool hasFormals = !e.params.formals.empty();
 
             // Check if any free vars need cell capture.
+            //
+            // KNOWN LIMITATION: only handles ONE level of forward-ref
+            // cell capture.  If a sub-block needs to capture a
+            // grandparent's forward-ref (which is in this block's
+            // cellRefs but not blockCellMap), the inner sub-block
+            // will end up reading the cell's CURRENT entry value
+            // through OP_CELL_GET in emitVarRef and pushing that
+            // snapshot as its upvalue — late-binding through the
+            // cell is broken across two thunk/lambda layers.  In
+            // practice this only matters for deeply nested rec lets
+            // with cross-thunk forward refs; the common patterns are
+            // covered by the single-level case below.
             bool needsCellCapture = false;
             if (ctx.blockCellSlot != UINT32_MAX) {
                 for (auto fv : e.freeVars.vars) {

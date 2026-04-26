@@ -23,6 +23,19 @@
 /// directly to be consumed inline by JUMP_IF_*, but the actual code
 /// paths produce singletons instead.
 ///
+/// THEORETICAL GC INTERACTION: eval-gc.cc registers Boehm displacements
+/// 1..7 for v1 ValueStorage's bit-packed pointer-niche tags.  A stack
+/// word holding tagged_int_word = real_int << 3 | 0b001 looks to Boehm
+/// like (real_int << 3) + 1 — a misaligned pointer that, with
+/// displacement 1 registered, may be treated as pointing into a real
+/// heap block at (real_int << 3).  In practice the tagged-int value
+/// rarely lands inside the GC heap range so pinning is not observed,
+/// but for hardened correctness consider:
+///   (a) using a tag that sets a non-canonical high bit (e.g., bit 63),
+///   (b) gating displacement registration when nanbox is in use, or
+///   (c) dropping the tagged-int encoding entirely if its measured
+///       benefit is below the surface-area cost (see roadmap).
+///
 /// Choice: bit 0 = 1 means "immediate", because heap pointers from
 /// GC_MALLOC are always 8-byte aligned (bit 0..2 all zero).  This way
 /// Boehm's conservative scanner never mistakes a tagged immediate for
