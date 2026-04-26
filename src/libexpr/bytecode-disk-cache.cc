@@ -58,8 +58,19 @@ public:
         : _state(std::make_unique<Sync<State>>())
     {
         try {
-            auto path = dbPath.value_or(
-                std::filesystem::path(getCacheDir()) / "bytecode-cache-v1.sqlite");
+            // NIX_BYTECODE_CACHE_DIR overrides for benchmarks/tests
+            // without disturbing the broader XDG_CACHE_HOME setup
+            // (flake cache, eval-cache, fetcher cache all live there).
+            std::filesystem::path path;
+            if (dbPath) {
+                path = *dbPath;
+            } else if (auto envOverride = ::getenv("NIX_BYTECODE_CACHE_DIR")) {
+                path = std::filesystem::path(envOverride) /
+                    "bytecode-cache-v1.sqlite";
+            } else {
+                path = std::filesystem::path(getCacheDir()) /
+                    "bytecode-cache-v1.sqlite";
+            }
             createDirs(path.parent_path());
 
             auto state(_state->lock());
