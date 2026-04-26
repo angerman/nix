@@ -4023,6 +4023,85 @@ op_rcall1_r:
             DISPATCH();
         }
 
+        // ── Primop fast path: write result directly to dst slot ──
+        // For saturated primops, dispatch into the impl directly and
+        // store the result into the dst stack slot, then skip past the
+        // trailing OP_SET_STACK_SLOT.  Avoids the push/pop dance and
+        // op_call_1's full dispatch table.  Continuation-bearing
+        // primops (foldl', filter, all/any) are NOT handled here —
+        // they require op_call_1's contIdx machinery, so we fall
+        // through to the slow path for those.
+        if (fun->isPrimOp()) {
+            auto * fn = fun->primOp();
+            if (fn->arity == 1) {
+                arg = materializeWord(state, arg);
+                size_t needed = base + dstSlot + 1;
+                vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
+                auto * result = state.allocValue();
+                Value * argPtr = arg;
+                fn->impl(state, pos, &argPtr, *result);
+                vm.stack[base + dstSlot] = result;
+                ip++;  // skip trailing OP_SET_STACK_SLOT
+                DISPATCH();
+            }
+            // Unsaturated 1-of-N primop: build PrimOpApp directly into slot.
+            if (fn->arity > 1) {
+                arg = materializeWord(state, arg);
+                size_t needed = base + dstSlot + 1;
+                vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
+                auto * funCopy = state.allocValue();
+                *funCopy = *fun;
+                auto * result = state.allocValue();
+                result->mkPrimOpApp(funCopy, arg);
+                vm.stack[base + dstSlot] = result;
+                ip++;
+                DISPATCH();
+            }
+        }
+        if (fun->isPrimOpApp()) {
+            size_t argsDone = 0;
+            Value * root = fun;
+            while (root->isPrimOpApp()) {
+                argsDone++;
+                root = root->primOpApp().left;
+            }
+            assert(root->isPrimOp());
+            auto * fn = root->primOp();
+            auto argsLeft = fn->arity - argsDone;
+            // Skip continuation-bearing primops; let op_call_1 handle them.
+            bool isContPrimOp = (fn->arity == 2
+                && (fn->name == "filter" || fn->name == "all"
+                    || fn->name == "any" || fn->name == "map"))
+                || (fn->arity == 3 && fn->name == "__foldl'");
+            if (argsLeft == 1 && !isContPrimOp) {
+                arg = materializeWord(state, arg);
+                Value * vArgs[16];
+                auto n = argsDone;
+                for (Value * v = fun; v->isPrimOpApp(); v = v->primOpApp().left)
+                    vArgs[--n] = v->primOpApp().right;
+                vArgs[argsDone] = arg;
+                size_t needed = base + dstSlot + 1;
+                vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
+                auto * result = state.allocValue();
+                const_cast<PrimOp *>(fn)->impl(state, pos, vArgs, *result);
+                vm.stack[base + dstSlot] = result;
+                ip++;
+                DISPATCH();
+            }
+            if (argsLeft > 1) {
+                arg = materializeWord(state, arg);
+                size_t needed = base + dstSlot + 1;
+                vm.ensureCapacity(needed, const_cast<Value *>(&Value::vNull));
+                auto * funCopy = state.allocValue();
+                *funCopy = *fun;
+                auto * result = state.allocValue();
+                result->mkPrimOpApp(funCopy, arg);
+                vm.stack[base + dstSlot] = result;
+                ip++;
+                DISPATCH();
+            }
+        }
+
         // ── Slow path: delegate to op_call_1 ──
         // Push fun and arg onto the operand stack and let op_call_1
         // perform the full dispatch (primop, primopApp, functor,
