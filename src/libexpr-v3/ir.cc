@@ -197,7 +197,11 @@ void computeFreeVars(Module & m)
         if (f.entryBlock == kInvalidBlock) return {};
         std::unordered_set<VarId> refs;
         collectBlockRefs(m, f.entryBlock, refs);
-        if (f.argName != kInvalidSymbol && f.paramVar != kInvalid)
+        // The function's param VarId is bound at call time (not a normal
+        // local binding), so it should not appear as a free variable —
+        // even for `{a, b}: ...` formals where there's no `@arg` name.
+        if (f.paramVar != kInvalid &&
+            (f.argName != kInvalidSymbol || f.hasFormals))
             refs.erase(f.paramVar);
         std::vector<VarId> fv(refs.begin(), refs.end());
         std::sort(fv.begin(), fv.end());

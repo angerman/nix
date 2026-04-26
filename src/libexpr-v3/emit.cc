@@ -355,8 +355,11 @@ struct Emitter
 
         FuncCtx fc;
         fc.fid = fid;
-        // Param goes in slot 0 if present.
-        if (f.argName != ir::kInvalidSymbol && f.paramVar != ir::kInvalid)
+        // Param goes in slot 0 if present.  For `{a, b}: ...` formals
+        // without an @arg name, the param VarId still represents the
+        // attrset arg passed at call time.
+        if (f.paramVar != ir::kInvalid &&
+            (f.argName != ir::kInvalidSymbol || f.hasFormals))
             (void)getOrAssignSlot(fc, f.paramVar);
         // Upvalue order = freeVars.
         for (uint16_t i = 0; i < f.freeVars.size(); ++i)

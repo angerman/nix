@@ -254,35 +254,87 @@ struct Lowerer
     }
     ir::VarId lowerLambda(nix::ExprLambda * e)
     {
-        if (e->getFormals().has_value())
-            unsupported("ExprLambda with formals");
-
         m.functions.emplace_back();
         ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
         auto entry = m.freshBlock();
 
         ir::VarId param = m.freshVar();
-        auto sym = internSym(e->arg);
-        std::string argName(symbols[e->arg]);
-
         m.functions[fid].entryBlock = entry;
-        m.functions[fid].argName    = sym;
         m.functions[fid].paramVar   = param;
-        m.functions[fid].name       = argName;
+        m.functions[fid].name       = e->arg ? std::string(symbols[e->arg]) : "<formals>";
 
         Scope inner;
-        inner.byDispl.push_back(param);
-        inner.byName.emplace(argName, param);
-        scopes.push_back(std::move(inner));
-        funcStack.push_back(fid);
-        blockStack.push_back(entry);
 
-        ir::VarId rv = lowerExpr(e->body);
-        setReturn(rv);
+        if (auto formals = e->getFormals()) {
+            // Param is the attrset.  Formals get extracted from it.
+            m.functions[fid].argName    = e->arg ? internSym(e->arg) : ir::kInvalidSymbol;
+            m.functions[fid].hasFormals = true;
 
-        blockStack.pop_back();
-        funcStack.pop_back();
-        scopes.pop_back();
+            funcStack.push_back(fid);
+            blockStack.push_back(entry);
+
+            // Order in newEnv before sort: arg (if any), then formals in
+            // declaration order; displ assigned 0..N.  We mirror that.
+            if (e->arg) {
+                inner.byDispl.push_back(param);
+                inner.byName.emplace(std::string(symbols[e->arg]), param);
+            }
+            for (auto & f : formals->formals) {
+                ir::VarId v;
+                ir::SymbolId nm = internSym(f.name);
+                if (f.def) {
+                    // if (param ? f.name) then param.f.name else default
+                    ir::VarId hasIt = addBinding(ir::HasAttr{param, nm});
+                    auto thenB = m.freshBlock();
+                    auto elseB = m.freshBlock();
+                    blockStack.push_back(thenB);
+                    ir::VarId got = addBinding(ir::AttrSelect{param, nm});
+                    setReturn(got);
+                    blockStack.pop_back();
+                    blockStack.push_back(elseB);
+                    // Default expressions are evaluated in the new env (formals scope),
+                    // so we evaluate them after the scope is set up below.
+                    // For now, lower them with the partial scope (best-effort).
+                    scopes.push_back(inner);
+                    ir::VarId defv = lowerExpr(f.def);
+                    setReturn(defv);
+                    scopes.pop_back();
+                    blockStack.pop_back();
+                    v = addBinding(ir::If{hasIt, thenB, elseB});
+                } else {
+                    v = addBinding(ir::AttrSelect{param, nm});
+                }
+                inner.byDispl.push_back(v);
+                inner.byName.emplace(std::string(symbols[f.name]), v);
+            }
+
+            scopes.push_back(std::move(inner));
+
+            ir::VarId rv = lowerExpr(e->body);
+            setReturn(rv);
+
+            scopes.pop_back();
+            blockStack.pop_back();
+            funcStack.pop_back();
+        } else {
+            // Plain `x: body` — no formals.
+            m.functions[fid].argName    = internSym(e->arg);
+            std::string argName(symbols[e->arg]);
+
+            inner.byDispl.push_back(param);
+            inner.byName.emplace(argName, param);
+
+            scopes.push_back(std::move(inner));
+            funcStack.push_back(fid);
+            blockStack.push_back(entry);
+
+            ir::VarId rv = lowerExpr(e->body);
+            setReturn(rv);
+
+            blockStack.pop_back();
+            funcStack.pop_back();
+            scopes.pop_back();
+        }
 
         return addBinding(ir::Lambda{ fid, /*freeVars*/ {} });
     }
