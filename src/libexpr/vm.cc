@@ -4602,28 +4602,44 @@ op_make_closure_v2:
         }
 
         // Create the closure Value.
-        // For v2 closures, allocate a single Env(1 + nUpvalues) and store
-        // upvalues INLINE in values[1..1+nUpvalues].  values[0] is vNull
-        // so OP_GET_WITH (which reads env.values[0]) sees a safe
-        // sentinel.  Readers in callFunction / fast-paths set
-        // frame.upvalues = &env->values[1] so OP_GET_UPVALUE(idx)'s
-        // offsets stay unchanged.
         //
-        // For closures with NO upvalues (very common — every nullary
-        // helper), allocate a 1-slot Env, which hits the thread-local
-        // size-1 fast pool (eval-inline.hh:70-86).
-        Env & closureEnv = state.mem.allocEnv(1 + nUpvalues);
-        closureEnv.up = curEnv; // Parent env for with-chain walking.
-        closureEnv.values[0] = const_cast<Value *>(&Value::vNull);
-        if (nUpvalues > 0) {
-            // Pop upvalues from the stack into values[1..1+nUpvalues].
-            // They were pushed in forward order (upvalue 0 first),
-            // so pop in reverse to get the correct mapping.
-            // Materialize tagged immediates so the captured slots are
-            // proper Value* pointers — OP_GET_UPVALUE / OP_RUVF_TO read
-            // these directly without re-materialization.
-            for (uint32_t i = nUpvalues; i > 0; --i)
-                closureEnv.values[i] = materializeWord(state, vm.pop());
+        // M4b: nullary fast path.  When nUpvalues == 0 the carrier Env
+        // would carry no information of its own — values[0] is the
+        // vNull "skip-me" sentinel that OP_GET_WITH ignores anyway, and
+        // values[1..] is empty.  In that case we can share curEnv
+        // directly (matching the tree-walker's `mkLambda(&env, this)`
+        // at eval.cc:1717) and skip the allocEnv entirely.
+        //
+        // Safety: nUpvalues == 0 implies the body has no free vars
+        // (computeFreeVars in ir.cc populates IRMkThunk/IRLambda
+        // freeVars from blockFreeVars; nUpvalues equals freeVars.size).
+        // No free vars means no externalVar references means the body
+        // emits no OP_GET_LOCAL_* — the env-chain depth is irrelevant.
+        // OP_GET_WITH walks dynamically by skipping non-with envs, so
+        // the carrier's absence doesn't change the result UNLESS curEnv
+        // itself is a with-env: then var->level=1 from the body would
+        // resolve to a different with-scope (caller's parent's vs.
+        // caller's own).  Detect with-env at runtime via values[0] and
+        // fall back to allocation in that case.
+        //
+        // Otherwise the regular path: allocate Env(1 + nUpvalues), set
+        // values[0] = vNull, store upvalues inline in values[1..].
+        Env * closureEnvPtr;
+        if (nUpvalues == 0
+            && curEnv
+            && (curEnv->values[0] == nullptr
+                || curEnv->values[0] == &Value::vNull)) {
+            // Share parent env — no allocation.
+            closureEnvPtr = curEnv;
+        } else {
+            Env & closureEnv = state.mem.allocEnv(1 + nUpvalues);
+            closureEnv.up = curEnv;
+            closureEnv.values[0] = const_cast<Value *>(&Value::vNull);
+            if (nUpvalues > 0) {
+                for (uint32_t i = nUpvalues; i > 0; --i)
+                    closureEnv.values[i] = materializeWord(state, vm.pop());
+            }
+            closureEnvPtr = &closureEnv;
         }
 
         // Use the pre-allocated ExprLambdaBytecode from compilation.
@@ -4639,7 +4655,7 @@ op_make_closure_v2:
         }
 
         auto * closureVal = state.allocValue();
-        closureVal->mkLambda(&closureEnv, static_cast<ExprLambda *>(lambdaExpr));
+        closureVal->mkLambda(closureEnvPtr, static_cast<ExprLambda *>(lambdaExpr));
 
         vm.push(closureVal);
         DISPATCH();
