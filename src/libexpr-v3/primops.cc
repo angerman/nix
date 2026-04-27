@@ -1090,6 +1090,23 @@ void primGetContext(EvalState &, Value *, Value & out)
     out.payload.bindings = b;
 }
 
+/// builtins.appendContext s ctx -- normally adds `ctx` (an attrset of
+/// store-path → {path/outputs/allOutputs}) to `s`'s context.  v3
+/// strings are context-less, so this is identity on the string.
+void primAppendContext(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("appendContext", "(string, attrset)");
+    out = args[0];
+}
+
+/// builtins.addDrvOutputDependencies: tags a context with all-outputs
+/// dependency.  Identity for context-less v3 strings.
+void primAddDrvOutputDependencies(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("addDrvOutputDependencies", "string");
+    out = args[0];
+}
+
 /// builtins.unsafeDiscardOutputDependency: same identity treatment.
 void primUnsafeDiscardOutputDependency(EvalState &, Value * args, Value & out)
 {
@@ -1759,6 +1776,11 @@ static std::vector<Value> & v3BridgeClosures()
 
 /// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
 /// thunks via tree-walker's evaluator before reading the type.
+/// Per-call cycle table prevents infinite recursion on self-referential
+/// attrsets (e.g. tree-walker's derivation result has `drvAttrs` that
+/// refers back).
+static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
+                            std::unordered_map<const void *, Value> & seen);
 static Value treeWalkerToV3(EvalState & state, nix::Value & nv);
 
 /// Tree-walker primop body: invoked when tree-walker fully applies
@@ -1783,12 +1805,14 @@ static void primV3CallBridge2(nix::EvalState & ns, const nix::PosIdx pos,
     extern thread_local nix::EvalState * tlNixEvalState;
     if (!tlNixEvalState) tlNixEvalState = &ns;
 
-    // Need a v3 VMState to invoke callClosure.  Use the tlsEvalState's
-    // vm if available; otherwise construct a fresh one for this call.
-    static thread_local VMState * tlsVm = nullptr;
-    VMState localVm;
-    if (!tlsVm) tlsVm = &localVm;
-    v3state.vm = tlsVm;
+    // Need a v3 VMState to invoke callClosure.  Use a thread-local
+    // dedicated to bridge calls so its lifetime spans the program;
+    // multiple bridge invocations reuse the same state.
+    static thread_local VMState bridgeVm;
+    bridgeVm.valueStack.reserve(64 * 1024);
+    bridgeVm.frames.reserve(4096);
+    bridgeVm.withStack.reserve(64);
+    v3state.vm = &bridgeVm;
 
     // For each tree-walker arg (after handle), convert to v3, then
     // walk the curry: callClosure(fn, arg1) → fn1; callClosure(fn1, arg2)
@@ -1919,7 +1943,8 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v)
 
 /// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
 /// thunks via tree-walker's evaluator before reading the type.
-static Value treeWalkerToV3(EvalState & state, nix::Value & nv)
+static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
+                            std::unordered_map<const void *, Value> & seen)
 {
     auto & ns = *state.nixEvalState;
     ns.forceValue(nv, nix::noPos);
@@ -1944,40 +1969,52 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv)
         return out;
     }
     case nix::nList: {
+        const void * key = &nv;
+        if (auto it = seen.find(key); it != seen.end()) return it->second;
         size_t n = nv.listSize();
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(n));
         allocStats().listsAllocated++;
-        auto view = nv.listView();
-        for (size_t i = 0; i < n; ++i)
-            lv->elems[i] = treeWalkerToV3(state, *view[i]);
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = lv;
+        seen[key] = out; // store before recursing
+        auto view = nv.listView();
+        for (size_t i = 0; i < n; ++i)
+            lv->elems[i] = treeWalkerToV3(state, *view[i], seen);
         return out;
     }
     case nix::nAttrs: {
         const auto * a = nv.attrs();
+        const void * key = a; // Bindings pointer is stable & unique
+        if (auto it = seen.find(key); it != seen.end()) return it->second;
+        Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(a->size()));
+        allocStats().attrsetsAllocated++;
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        seen[key] = out;
         std::vector<std::pair<SymbolId, Value>> entries;
         entries.reserve(a->size());
         for (auto & it : *a) {
             SymbolId sid = vmIntern(state, std::string(ns.symbols[it.name]));
-            entries.emplace_back(sid, treeWalkerToV3(state, *it.value));
+            entries.emplace_back(sid, treeWalkerToV3(state, *it.value, seen));
         }
         std::sort(entries.begin(), entries.end(),
             [](auto & x, auto & y) { return x.first < y.first; });
-        Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-        allocStats().attrsetsAllocated++;
         for (size_t i = 0; i < entries.size(); ++i) {
             b->entries[i].name  = entries[i].first;
             b->entries[i].value = entries[i].second;
         }
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
         return out;
     }
     default:
         out.mkNull();
         return out;
     }
+}
+
+static Value treeWalkerToV3(EvalState & state, nix::Value & nv)
+{
+    std::unordered_map<const void *, Value> seen;
+    return treeWalkerToV3(state, nv, seen);
 }
 
 /// Construct a "fake" derivation attrset.  Real `derivation` interfaces
@@ -2146,9 +2183,35 @@ void primDerivation(EvalState & state, Value * args, Value & out)
     SymbolId sFirstOut = vmIntern(state, firstOut);
     const Value * outPath = strictB->lookup(sFirstOut);
 
+    // For multi-output derivations, also expose `drv.<output>` as a
+    // mini-derivation-like attrset carrying that output's outPath.
+    // This is the structure tree-walker's `derivation` builds via
+    // listToAttrs over `outputsList`, and is what
+    // `eval-okay-context-introspection`'s `drv.foo.outPath` reads.
+    auto buildOutputAttrset = [&](const std::string & oName,
+                                  const Value & oOutPath) -> Value {
+        std::vector<std::pair<SymbolId, Value>> oEntries;
+        if (drvPathV) oEntries.emplace_back(sDrvPath, *drvPathV);
+        oEntries.emplace_back(sOutPath,  oOutPath);
+        oEntries.emplace_back(sType,     mkStringValueOwned("derivation"));
+        oEntries.emplace_back(sOutName,  mkStringValueOwned(oName));
+        std::sort(oEntries.begin(), oEntries.end(),
+            [](auto & a, auto & b) { return a.first < b.first; });
+        Bindings * ob = Alloc::allocBindings(static_cast<uint32_t>(oEntries.size()));
+        allocStats().attrsetsAllocated++;
+        for (size_t i = 0; i < oEntries.size(); ++i) {
+            ob->entries[i].name  = oEntries[i].first;
+            ob->entries[i].value = oEntries[i].second;
+        }
+        Value v;
+        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        v.payload.bindings = ob;
+        return v;
+    };
+
     // Result: drvAttrs // { outPath; drvPath; type = "derivation"; outputName; drvAttrs = drvAttrs; }
     std::vector<std::pair<SymbolId, Value>> entries;
-    entries.reserve(src->size + 5);
+    entries.reserve(src->size + 5 + outputs.size());
     for (uint32_t i = 0; i < src->size; ++i)
         entries.emplace_back(src->entries[i].name, src->entries[i].value);
     if (outPath)  entries.emplace_back(sOutPath, *outPath);
@@ -2156,6 +2219,12 @@ void primDerivation(EvalState & state, Value * args, Value & out)
     entries.emplace_back(sType,    mkStringValueOwned("derivation"));
     entries.emplace_back(sOutName, mkStringValueOwned(firstOut));
     entries.emplace_back(sDrvAttrs, args[0]);
+    // Per-output sub-derivations.
+    for (auto & oName : outputs) {
+        SymbolId sO = vmIntern(state, oName);
+        if (auto * oP = strictB->lookup(sO))
+            entries.emplace_back(sO, buildOutputAttrset(oName, *oP));
+    }
     std::sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
     std::vector<std::pair<SymbolId, Value>> dedup;
@@ -3091,6 +3160,8 @@ void registerBuiltinPrimOps()
         registerPrimOp({"hasContext",         1, primHasContext});
         registerPrimOp({"getContext",         1, primGetContext});
         registerPrimOp({"unsafeDiscardOutputDependency",   1, primUnsafeDiscardOutputDependency});
+        registerPrimOp({"appendContext",      2, primAppendContext});
+        registerPrimOp({"addDrvOutputDependencies",  1, primAddDrvOutputDependencies});
         registerPrimOp({"tryEval",            1, primTryEval});
         registerPrimOp({"baseNameOf",         1, primBaseNameOf});
         registerPrimOp({"dirOf",              1, primDirOf});
