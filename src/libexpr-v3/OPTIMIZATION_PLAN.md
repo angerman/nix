@@ -181,3 +181,69 @@ Phase 1 / CO-1 + CO-2.  Hooking `forceValue` is mechanically small
 will tell us within a day whether v3 can actually move the CPU bar on
 nixpkgs.  Only after measuring Phase 1's impact should we commit time to
 the bigger items.
+
+## 2026-04-27 diagnosis update
+
+While exploring CO-1/CO-4 (counter-based validation), discovered the
+"v3 is at parity with tree-walker" claim was based on output equality
+rather than evidence the hook was firing.  Concrete findings:
+
+1. **libnixexprv3 was being silently dropped by the linker.**  macOS
+   `-dead_strip_dylibs` removes shared libs with no direct symbol
+   reference from the binary.  The static initializer that sets
+   `EvalState::v3EvalHook = &v3EvalEntry` was the only consumer, and the
+   linker can't see static-init code as "used".  Result: v3EvalHook
+   stayed `nullptr` and every `EvalState::eval` fell through to
+   tree-walker.
+
+2. **An explicit installer fixed the linking** (added
+   `nix::v3::installEvalHook()` called from `nix::mainWrapped`).  After
+   this, the hook IS called.  But: `nix-instantiate --eval --strict
+   --expr '1'` SEGFAULTS with v3.
+
+3. **The Expr that nix-instantiate hands to EvalState::eval is wrapped.**
+   Even for `--expr '1'`, the parsed AST is wrapped (via getAutoArgs
+   bindings + autoCallFunction's lambda machinery) and v3's
+   `lowerNixExpr` produces 273 instructions across 13 lambda functions.
+   `run()` returns `Tag::Closure` because the top-level entry function
+   *constructs* a closure that needs to be called with autoargs — it
+   doesn't evaluate to the literal value directly.
+
+4. **v3ToTreeWalker has a bug bridging the resulting closure.**  The
+   crash is inside the bridge converter when handling `Tag::Closure` at
+   nix-instantiate's call shape.
+
+The implication: **the cutover is more broken than measured tests
+showed**, because tree-walker producing the right answer for
+`NIX_USE_V3=1` was a false positive.  All the `nix-instantiate`-based
+"cutover" tests were running tree-walker, not v3.
+
+Concrete state (rolled back to known-good):
+
+- The installer + main.cc reference are removed (the linker drops the
+  v3 lib again, hook stays null, tree-walker handles everything).
+- 142/142 standalone v3-eval tests still pass — v3 itself is correct
+  on direct inputs.
+- 142/142 "cutover" tests still pass — but they're really tree-walker
+  tests, not v3-cutover tests.
+
+Phase 1 is **not** "1–2 weeks".  Realistic estimate for actually
+shipping the cutover:
+
+- CO-1 (link the lib): trivial, but the **installer + main.cc edit
+  must be re-applied** once v3 can actually run nix-instantiate's
+  wrapped Exprs.
+- CO-2 (hook forceValue): blocked on CO-3.
+- CO-3 (handle wrapped Exprs / autoargs / autoCallFunction): the
+  real work.  v3 needs to either: (a) handle the autoargs lambda
+  pattern in lowerNixExpr, (b) recognise that the top-level returns
+  a Closure that should be auto-applied, or (c) the v3ToTreeWalker
+  bridge needs to package the v3 closure into a Tag::Lambda nix::Value
+  that tree-walker's `autoCallFunction` can invoke.  Bug fix in the
+  bridge plus a test case is the minimum.
+- CO-4 (counters): trivial, already drafted.
+- CO-5 (re-profile): can only run after CO-3 lands.
+
+Best estimate: **3–5 weeks of focused work** on CO-3 alone, given that
+shaking out wrapped-Expr edge cases tends to surface a long tail of
+subtle issues (autoargs, recursive scope, closure-of-thunk shapes).

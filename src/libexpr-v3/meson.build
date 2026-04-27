@@ -78,6 +78,7 @@ install_headers(
     'include/v3/alloc.hh',
     'include/v3/bytecode.hh',
     'include/v3/closure.hh',
+    'include/v3/install.hh',
     'include/v3/ir.hh',
     'include/v3/lower.hh',
     'include/v3/primop.hh',

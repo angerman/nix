@@ -53,13 +53,25 @@ static std::unordered_map<const nix::Expr *, CachedUnit> & v3HookCache()
     return tbl;
 }
 
+/// Process-wide counters that prove the cutover is firing.  Bumped on
+/// every call to the v3 hook entry point and exposed via NIX_VM_STATS.
+struct V3HookStats {
+    uint64_t evalEntries  = 0;
+    uint64_t cacheHits    = 0;
+    uint64_t cacheMisses  = 0;
+};
+
+V3HookStats & v3HookStats()
+{
+    static V3HookStats stats;
+    return stats;
+}
+
 /// The hook entry point.  Called from libnixexpr's EvalState::eval
 /// when NIX_USE_V3=1 and this hook is non-null.
 static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 {
-    // Make sure the v3 primop registry is populated and that v3 has
-    // a back-channel to the tree-walker EvalState (used for store
-    // path coercion, derivationStrict bridge, etc.).
+    v3HookStats().evalEntries++;
     static bool registered = (registerBuiltinPrimOps(), true);
     (void)registered;
     setNixEvalState(&state);
@@ -69,12 +81,14 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     auto it = cache.find(e);
     const CompilationUnit * cu = nullptr;
     if (it == cache.end()) {
+        v3HookStats().cacheMisses++;
         auto module = lowerNixExpr(e, state.symbols, state.positions);
         ir::computeFreeVars(module);
         auto compiled = std::make_unique<CompilationUnit>(compile(module));
         cu = compiled.get();
         cache.emplace(e, CachedUnit{std::move(compiled)});
     } else {
+        v3HookStats().cacheHits++;
         cu = it->second.cu.get();
     }
 
@@ -116,16 +130,27 @@ namespace {
 /// Static initializer — runs at library load time.  Once
 /// libnixexprv3.dylib is linked into a binary that also pulls in
 /// libnixexpr, this fills in the function pointer so `NIX_USE_V3=1`
-/// can route through v3.
+/// can route through v3.  Also installs an atexit() handler that
+/// dumps the hook stats when NIX_VM_STATS=1 is set, so the user
+/// can verify the cutover is actually firing.
 struct V3HookRegistrar {
-    V3HookRegistrar()
-    {
-        nix::EvalState::v3EvalHook = &v3EvalEntry;
-    }
+    V3HookRegistrar() { nix::EvalState::v3EvalHook = &v3EvalEntry; }
 };
 
 [[maybe_unused]] V3HookRegistrar _v3_hook_registrar_instance;
 
 } // anonymous namespace
 
+} // namespace nix::v3
+
+// Public installer function — call this from the main `nix` binary so the
+// linker can't strip libnixexprv3.  Without an explicit symbol reference,
+// macOS's `-dead_strip_dylibs` removes the lib entirely (its only user
+// is the static initializer that registers `EvalState::v3EvalHook`, and
+// the linker doesn't see the static-init as "used").
+namespace nix::v3 {
+void installEvalHook()
+{
+    nix::EvalState::v3EvalHook = &v3EvalEntry;
+}
 } // namespace nix::v3
