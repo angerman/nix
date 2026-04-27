@@ -1798,18 +1798,37 @@ void primTryEval(EvalState & state, Value * args, Value & out)
     out.payload.bindings = b;
 }
 
-void primLessThan(EvalState &, Value * args, Value & out)
+/// Forward-declared so primLessThan can recurse through list elements.
+static bool valueLessHelper(VMState & vm, const Value & a, const Value & b);
+
+void primLessThan(EvalState & state, Value * args, Value & out)
 {
-    const Value & a = args[0]; const Value & b = args[1];
-    bool r;
-    if      (a.isInt() && b.isInt())     r = a.payload.i < b.payload.i;
-    else if (a.isFloat() && b.isFloat()) r = a.payload.f < b.payload.f;
-    else if (a.isInt() && b.isFloat())   r = static_cast<double>(a.payload.i) < b.payload.f;
-    else if (a.isFloat() && b.isInt())   r = a.payload.f < static_cast<double>(b.payload.i);
-    else if (a.isString() && b.isString())
-        r = std::string_view(a.payload.str) < std::string_view(b.payload.str);
-    else typeError("lessThan", "comparable types");
+    bool r = valueLessHelper(*state.vm, args[0], args[1]);
     out = r ? Value::vTrue : Value::vFalse;
+}
+
+static bool valueLessHelper(VMState & vm, const Value & a, const Value & b)
+{
+    if      (a.isInt() && b.isInt())     return a.payload.i < b.payload.i;
+    else if (a.isFloat() && b.isFloat()) return a.payload.f < b.payload.f;
+    else if (a.isInt() && b.isFloat())   return static_cast<double>(a.payload.i) < b.payload.f;
+    else if (a.isFloat() && b.isInt())   return a.payload.f < static_cast<double>(b.payload.i);
+    else if (a.isString() && b.isString())
+        return std::string_view(a.payload.str) < std::string_view(b.payload.str);
+    else if (a.isList() && b.isList()) {
+        // Lexicographic compare; force lazy elements as we go.
+        uint32_t na = a.payload.list ? a.payload.list->size : 0;
+        uint32_t nb = b.payload.list ? b.payload.list->size : 0;
+        uint32_t n = std::min(na, nb);
+        for (uint32_t i = 0; i < n; ++i) {
+            Value ai = forceValue(vm, a.payload.list->elems[i]);
+            Value bi = forceValue(vm, b.payload.list->elems[i]);
+            if (valueLessHelper(vm, ai, bi)) return true;
+            if (valueLessHelper(vm, bi, ai)) return false;
+        }
+        return na < nb;
+    }
+    typeError("lessThan", "comparable types");
 }
 
 } // namespace

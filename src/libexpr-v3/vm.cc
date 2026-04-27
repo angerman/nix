@@ -108,6 +108,19 @@ inline bool valueLess(const Value & a, const Value & b)
     if (a.isFloat() && b.isInt())   return a.payload.f < static_cast<double>(b.payload.i);
     if (a.isString() && b.isString())
         return std::string_view(a.payload.str) < std::string_view(b.payload.str);
+    if (a.isList() && b.isList()) {
+        // Lexicographic compare; matches tree-walker.
+        uint32_t na = a.payload.list ? a.payload.list->size : 0;
+        uint32_t nb = b.payload.list ? b.payload.list->size : 0;
+        uint32_t n = std::min(na, nb);
+        for (uint32_t i = 0; i < n; ++i) {
+            const Value & ai = a.payload.list->elems[i];
+            const Value & bi = b.payload.list->elems[i];
+            if (valueLess(ai, bi)) return true;
+            if (valueLess(bi, ai)) return false;
+        }
+        return na < nb;
+    }
     throw std::runtime_error("v3 OP_LESS: unsupported operand types");
 }
 
@@ -807,14 +820,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_SELECT: {
             Value attrs = pop(vm);
-            if (!attrs.isAttrs()) {
-                std::fprintf(stderr,
-                    "DBG ATTRS_SELECT: tag=%d sym=%u(%s) ip=%u\n",
-                    (int)attrs.tag(), operand,
-                    operand < ir::globalSymbolTable().size() ? ir::globalSymbolTable()[operand].c_str() : "?", ip);
-                std::fflush(stderr);
+            if (!attrs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: not an attrset");
-            }
             const Value * found = attrs.payload.bindings->lookup(operand);
             if (!found)
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: attribute not found");
@@ -1077,18 +1084,52 @@ Value forceValue(VMState & vm, Value v)
 
 Value callClosure(VMState & vm, Value fun, Value arg)
 {
-    // Single-arg primop fast path (no VM re-entry).
-    if (fun.isPrimOp()) {
-        const PrimOp * po = fun.payload.primop;
-        if (po->arity == 1) {
-            Value buf[1] = {arg};
-            EvalState state; state.vm = &vm; state.nixEvalState = getNixEvalState();
-            Value out;
-            po->fn(state, buf, out);
-            return out;
+    // PrimOp / PrimOpApp: build a partial application or invoke once
+    // we have all the args.  Mirrors the OP_CALL primop branch.
+    if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
+        Value cur = fun;
+        size_t depth = 0;
+        while (cur.tag() == Tag::PrimOpApp) { ++depth; cur = cur.payload.pair->left; }
+        if (!cur.isPrimOp())
+            throw std::runtime_error("v3 callClosure: PrimOpApp chain doesn't terminate in a PrimOp");
+        const PrimOp * po = cur.payload.primop;
+        size_t totalArgs = depth + 1;
+        if (totalArgs < po->arity) {
+            ValuePair * vp = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+            vp->left = fun;
+            vp->right = arg;
+            Value v;
+            v.tag_payload = static_cast<uint64_t>(Tag::PrimOpApp);
+            v.payload.pair = vp;
+            return v;
         }
-        throw std::runtime_error("v3 callClosure: multi-arg primop callbacks not supported yet");
+        if (totalArgs > po->arity)
+            throw std::runtime_error("v3 callClosure: too many args for primop");
+        Value buf[8];
+        if (po->arity > 8) throw std::runtime_error("v3 callClosure: primop arity > 8");
+        buf[totalArgs - 1] = arg;
+        Value chain = fun;
+        for (size_t i = totalArgs - 1; i > 0; --i) {
+            buf[i - 1] = chain.payload.pair->right;
+            chain = chain.payload.pair->left;
+        }
+        for (uint32_t i = 0; i < po->arity; ++i) buf[i] = forceValue(vm, buf[i]);
+        EvalState state; state.vm = &vm; state.nixEvalState = getNixEvalState();
+        Value out;
+        po->fn(state, buf, out);
+        return out;
     }
+
+    // Attrset with __functor: apply functor self arg.
+    if (fun.isAttrs() && fun.payload.bindings) {
+        static const SymbolId functorId = ir::globalInternSymbol("__functor");
+        if (auto * fn = fun.payload.bindings->lookup(functorId)) {
+            Value forced = forceValue(vm, *fn);
+            Value firstStep = callClosure(vm, forced, fun);
+            return callClosure(vm, firstStep, arg);
+        }
+    }
+
     if (!fun.isClosure())
         throw std::runtime_error("v3 callClosure: not callable");
 
