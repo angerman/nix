@@ -819,6 +819,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // bytecode op without C++ recursion.
                 if (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Suspended) {
                     Thunk * next = retVal.payload.thunk;
+                    // Same call-depth guard — chained let-rec recursion
+                    // (`let x = y; y = x; in x`) re-enters the next thunk
+                    // here without going through OP_CALL or OP_FORCE.
+                    if (__builtin_expect(vm.frames.size() >= 5000, 0))
+                        throw std::runtime_error("v3 OP_RETURN: stack overflow; call depth exceeded 5000");
                     const LambdaDescriptor * desc =
                         reinterpret_cast<const LambdaDescriptor *>(next->suspended.desc);
                     Closure * fakeClo = Alloc::allocClosure(next->nUpvalues);
@@ -929,6 +934,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
             ListVec * thunkWiths = t->suspended.capturedWiths;
             const CompilationUnit * thunkCu = t->suspended.cu ? t->suspended.cu : cu;
+
+            // Same call-depth guard as OP_CALL — catches blackhole-style
+            // recursion that doesn't go through OP_CALL (e.g. `let x = x;
+            // in x`, where every reference to x re-enters via OP_FORCE).
+            if (__builtin_expect(vm.frames.size() >= 5000, 0))
+                throw std::runtime_error("v3 OP_FORCE: stack overflow; call depth exceeded 5000");
+
             t->state = ThunkState::Blackhole;
 
             vm.frames.back().ip = ip;
