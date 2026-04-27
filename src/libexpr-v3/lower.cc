@@ -334,8 +334,12 @@ struct Lowerer
             return addBinding(ir::AttrSet{std::move(entries)});
         }
         if (auto * po = findPrimOp(name)) {
-            // Bare reference: emit a Tag::PrimOp value.  The runtime
-            // can apply args via OP_CALL, store it in attrsets, etc.
+            // Arity-0 primops behave as constants — invoke immediately
+            // so e.g. `__nixPath`, `__currentSystem` yield their value.
+            if (po->arity == 0)
+                return addBinding(ir::PrimOpCall{po, {}});
+            // Higher-arity bare reference: emit a Tag::PrimOp value
+            // that callers can apply args to.
             return addBinding(ir::LitPrimOp{po});
         }
         throw std::runtime_error("v3 lower: unbound variable '" + name + "'");

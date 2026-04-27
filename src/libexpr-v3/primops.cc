@@ -984,6 +984,88 @@ void primUnsafeDiscardOutputDependency(EvalState &, Value * args, Value & out)
     out = args[0];
 }
 
+/// builtins.__nixPath : list of `{prefix, path}` attrsets.  Reads the
+/// host EvalState's LookupPath.  Used implicitly by `<x>` syntax.
+void primNixPath(EvalState & state, Value *, Value & out)
+{
+    if (!state.nixEvalState) {
+        ListVec * empty = Alloc::allocList(0);
+        out.tag_payload = static_cast<uint64_t>(Tag::List);
+        out.payload.list = empty;
+        return;
+    }
+    auto lookupPath = state.nixEvalState->getLookupPath();
+    auto & lp = lookupPath.elements;
+    ListVec * lv = Alloc::allocList(static_cast<uint32_t>(lp.size()));
+    allocStats().listsAllocated++;
+    SymbolId sPath   = vmIntern(state, "path");
+    SymbolId sPrefix = vmIntern(state, "prefix");
+    size_t i = 0;
+    for (auto & el : lp) {
+        Bindings * b = Alloc::allocBindings(2);
+        SymbolId nA = sPath, nB = sPrefix;
+        Value vA = mkStringValueOwned(el.path.s);
+        Value vB = mkStringValueOwned(el.prefix.s);
+        if (nA < nB) {
+            b->entries[0] = {nA, vA};
+            b->entries[1] = {nB, vB};
+        } else {
+            b->entries[0] = {nB, vB};
+            b->entries[1] = {nA, vA};
+        }
+        Value v;
+        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        v.payload.bindings = b;
+        lv->elems[i++] = v;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = lv;
+}
+
+/// builtins.__findFile : list-of-{prefix, path} → name → resolved path.
+/// Looks up `name` in the search path entries and returns the matching
+/// SourcePath.  Throws if no entry matches.
+void primFindFile(EvalState & state, Value * args, Value & out)
+{
+    if (!state.nixEvalState)
+        throw std::runtime_error("v3 primop findFile: no nix EvalState wired");
+    if (!args[0].isList()) typeError("findFile", "list of {path, prefix}");
+    if (!args[1].isString()) typeError("findFile", "string");
+
+    // Build a LookupPath from the v3 list.  Each element is an attrset
+    // with `path` (string-or-path) and `prefix` (string).
+    nix::LookupPath lp;
+    auto * lst = args[0].payload.list;
+    if (lst) {
+        SymbolId sPath   = vmIntern(state, "path");
+        SymbolId sPrefix = vmIntern(state, "prefix");
+        for (uint32_t i = 0; i < lst->size; ++i) {
+            Value el = forceValue(*state.vm, lst->elems[i]);
+            if (!el.isAttrs() || !el.payload.bindings) continue;
+            const Value * pV = el.payload.bindings->lookup(sPath);
+            const Value * prV = el.payload.bindings->lookup(sPrefix);
+            std::string p, prefix;
+            if (pV) {
+                Value f = forceValue(*state.vm, *pV);
+                if (f.isString()) p = f.payload.str;
+                else if (f.isPath()) p = f.payload.path;
+            }
+            if (prV) {
+                Value f = forceValue(*state.vm, *prV);
+                if (f.isString()) prefix = f.payload.str;
+            }
+            if (p.empty()) continue;
+            lp.elements.push_back({nix::LookupPath::Prefix{prefix},
+                                   nix::LookupPath::Path{p}});
+        }
+    }
+    auto sp = state.nixEvalState->findFile(lp, args[1].payload.str);
+    char * buf = static_cast<char *>(std::malloc(sp.path.abs().size() + 1));
+    std::strcpy(buf, sp.path.abs().c_str());
+    out.tag_payload = static_cast<uint64_t>(Tag::Path);
+    out.payload.path = buf;
+}
+
 /// builtins.zipAttrsWith fn list-of-attrsets:
 ///   merge a list of attrsets, applying `fn name [values]` to combine
 ///   per-name lists.  Order in the value list mirrors source order.
@@ -2050,6 +2132,10 @@ void registerBuiltinPrimOps()
         // `derivation { name = ...; ... }` get a synthetic result
         // attrset rather than 'unbound variable derivation'.
         registerPrimOp({"derivation",         1, primDerivationStrict});
+        registerPrimOp({"findFile",           2, primFindFile});
+        registerPrimOp({"__findFile",         2, primFindFile});
+        registerPrimOp({"nixPath",            0, primNixPath});
+        registerPrimOp({"__nixPath",          0, primNixPath});
     });
 }
 
