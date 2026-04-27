@@ -467,7 +467,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (!v.isThunk()) { push(vm, v); break; }
             Thunk * t = v.payload.thunk;
             if (t->state == ThunkState::Evaluated) { push(vm, t->evaluated); break; }
-            if (t->state == ThunkState::Blackhole) throw std::runtime_error("v3 OP_FORCE: infinite recursion");
+            if (t->state == ThunkState::Blackhole) throw std::runtime_error("v3 OP_FORCE: infinite recursion (blackhole)");
             // Suspended: blackhole and run.
             // We treat suspended.desc as a LambdaDescriptor* (see OP_MAKE_THUNK).
             const LambdaDescriptor * desc = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
