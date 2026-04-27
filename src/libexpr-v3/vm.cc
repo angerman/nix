@@ -511,9 +511,42 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
 
         // --- Comparison ---
-        case OP_EQ:  { Value b = pop(vm), a = pop(vm); Value r; r = valueEqual(vm, a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break; }
-        case OP_NEQ: { Value b = pop(vm), a = pop(vm); Value r; r = valueEqual(vm, a, b) ? Value::vFalse : Value::vTrue; push(vm, r); break; }
-        case OP_LESS:{ Value b = pop(vm), a = pop(vm); Value r; r = valueLess(a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break; }
+        // Inline fast-path for the int-int case (common: `n == 0`,
+        // `n < 2` etc.).  In-place mutate the deeper slot to the bool
+        // result and pop the top — no helper call, no Value temporaries.
+        case OP_EQ:  {
+            Value & top1 = vm.valueStack.back();
+            Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+            if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
+                bool eq = top0.payload.i == top1.payload.i;
+                vm.valueStack.pop_back();
+                vm.valueStack.back() = eq ? Value::vTrue : Value::vFalse;
+                break;
+            }
+            Value b = pop(vm), a = pop(vm); Value r; r = valueEqual(vm, a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break;
+        }
+        case OP_NEQ: {
+            Value & top1 = vm.valueStack.back();
+            Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+            if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
+                bool ne = top0.payload.i != top1.payload.i;
+                vm.valueStack.pop_back();
+                vm.valueStack.back() = ne ? Value::vTrue : Value::vFalse;
+                break;
+            }
+            Value b = pop(vm), a = pop(vm); Value r; r = valueEqual(vm, a, b) ? Value::vFalse : Value::vTrue; push(vm, r); break;
+        }
+        case OP_LESS:{
+            Value & top1 = vm.valueStack.back();
+            Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+            if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
+                bool lt = top0.payload.i < top1.payload.i;
+                vm.valueStack.pop_back();
+                vm.valueStack.back() = lt ? Value::vTrue : Value::vFalse;
+                break;
+            }
+            Value b = pop(vm), a = pop(vm); Value r; r = valueLess(a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break;
+        }
 
         // --- Boolean / branches ---
         // All boolean opcodes force their operand: a function arg may be
