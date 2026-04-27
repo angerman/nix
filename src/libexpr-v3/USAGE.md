@@ -171,14 +171,28 @@ the call site.  `unsafeGetAttrPos` and `functionArgs`-derived
 positions both work via the per-attr position side-table populated
 by OP_ATTRS_INIT[_DYN] / OP_ATTRS_REC_INIT.
 
-Performance: v3 is now at parity with the tree-walker on compute-bound
-benchmarks, and significantly faster on attrset-heavy workloads.
+Performance: v3 is at parity with the tree-walker on compute-bound
+benchmarks and on real-world nixpkgs evaluation, and significantly
+faster on attrset-heavy workloads.
 
-  fib30:  tree-walker 0.37s user, v3 0.37s user  (matched)
+  fib30:  tree-walker 0.37s user, v3 0.35s user  (slightly faster
+                                                    after TCO + slot elision)
   fib32:  tree-walker 0.93s user, v3 0.94s user  (~1% gap)
   fib34:  tree-walker 2.41s user, v3 2.42s user  (~0.5% gap)
   attrs10k (10000 // merges + foldl' over attrNames):
           tree-walker 0.34s user, v3 0.10s user  (3.4× faster)
+  haskellPackages attrNames length:
+          tree-walker 0.44s user, v3 0.44s user  (matched)
+  pkgs.stdenv attrNames length:
+          tree-walker 0.24s user, v3 0.23s user  (matched)
+  pkgs.hello.meta.description:
+          tree-walker 0.23s user, v3 0.23s user  (matched)
+
+Tail-call optimization: 100,000 recursive tail calls
+(`let f = n: if n == 100000 then n else f (n + 1); in f 0`) now
+runs in O(1) frame stack space.  Bounded against true infinite
+recursion (`(x: x x) (x: x x)`) by a 10⁷ tail-call iteration
+counter that resets on any non-tail call/return.
 
 Recent perf wins (in-VM hot path):
   - OP_FORCE peek-fast-path: skip pop+push when top is already WHNF.
