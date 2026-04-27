@@ -456,6 +456,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     chain = chain.payload.pair->left;
                 }
                 vm.frames.back().ip = ip;
+                // PrimOpApp accumulates args lazily — primops expect
+                // WHNF, so force each here before invoking.  Mirrors
+                // the eager-force lowerCall does for the
+                // direct-primop-call path.
+                for (uint32_t i = 0; i < po->arity; ++i)
+                    buf[i] = forceValue(vm, buf[i]);
                 EvalState state; state.vm = &vm;
                 Value out;
                 po->fn(state, buf, out);

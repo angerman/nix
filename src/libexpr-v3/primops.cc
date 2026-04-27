@@ -1807,6 +1807,11 @@ const PrimOp * findPrimOp(std::string_view name)
     return it == registry().end() ? nullptr : &it->second;
 }
 
+const std::unordered_map<std::string, PrimOp> & allRegisteredPrimOps()
+{
+    return registry();
+}
+
 void setNixEvalState(nix::EvalState * st) { tlNixEvalState = st; }
 nix::EvalState * getNixEvalState() { return tlNixEvalState; }
 

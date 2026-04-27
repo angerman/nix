@@ -28,6 +28,7 @@
 #include "nix/expr/symbol-table.hh"
 
 #include <deque>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -272,10 +273,23 @@ struct Lowerer
         if (name == "true")  return addBinding(ir::LitBool{true});
         if (name == "false") return addBinding(ir::LitBool{false});
         if (name == "null")  return addBinding(ir::LitNull{});
-        if (findPrimOp(name)) {
-            throw std::runtime_error(
-                "v3 lower: bare primop reference '" + name +
-                "' (only direct calls supported in bring-up)");
+        if (name == "builtins") {
+            // Construct the builtins attrset on demand: an attrset
+            // mapping every registered primop's name to its
+            // LitPrimOp value.  Lets `with builtins; <body>` and
+            // bare `builtins.attrNames` (where `builtins` is rebound
+            // by `inherit (builtins) ...`) work uniformly.
+            std::vector<ir::AttrSet::Entry> entries;
+            for (auto & [poName, po] : allRegisteredPrimOps()) {
+                ir::VarId v = addBinding(ir::LitPrimOp{&po});
+                entries.push_back({m.internSymbol(poName), v});
+            }
+            return addBinding(ir::AttrSet{std::move(entries)});
+        }
+        if (auto * po = findPrimOp(name)) {
+            // Bare reference: emit a Tag::PrimOp value.  The runtime
+            // can apply args via OP_CALL, store it in attrsets, etc.
+            return addBinding(ir::LitPrimOp{po});
         }
         throw std::runtime_error("v3 lower: unbound variable '" + name + "'");
     }
@@ -471,12 +485,13 @@ struct Lowerer
             return result;
         }
         // Generic application via OP_CALL.  Force the callee (must be
-        // a closure / primop / PrimOpApp).  Leave each argument lazy
-        // — function bodies that require their args evaluated will
-        // force at use sites.
+        // a closure / primop / PrimOpApp).  Each argument must be
+        // delivered as-is (Nix is lazy in arguments) — we wrap any
+        // non-trivial expression in a thunk so that side-effects /
+        // errors only fire if the callee actually forces the arg.
         ir::VarId f = forceVal(lowerExpr(e->fun));
         for (auto * a : *e->args) {
-            ir::VarId av = lowerExpr(a);
+            ir::VarId av = thunkifyForAttr(a);
             f = addBinding(ir::App{f, av});
             // After this App, the result might be a closure (curried)
             // or the applied value.  Force before the next App so the
@@ -867,11 +882,44 @@ struct Lowerer
 
     ir::VarId lowerHasAttr(nix::ExprOpHasAttr * e)
     {
-        if (e->attrPath.size() != 1) unsupported("has-attr with multi-element path");
-        auto & an = e->attrPath[0];
-        if (an.expr) unsupported("dynamic attribute name in hasAttr");
-        ir::VarId v = forceVal(lowerExpr(e->e));
-        return addBinding(ir::HasAttr{v, internSym(an.symbol)});
+        // `attrs ? a.b.c` is true iff each successive lookup hits an
+        // existing attrset entry along the path.  Lower as a chain of
+        // HasAttr followed by AttrSelect: at each step, if the current
+        // attr exists go on, else short-circuit to false.
+        ir::VarId attrs = forceVal(lowerExpr(e->e));
+        ir::VarId result = ir::kInvalid;
+        // Build the chain bottom-up.  We model it inline here using
+        // nested If blocks: `if hasAttr(attrs, p0) then if has(attrs.p0, p1) ... else false else false`.
+        std::function<ir::VarId(ir::VarId, size_t)> step =
+            [&](ir::VarId cur, size_t idx) -> ir::VarId {
+                const auto & an = e->attrPath[idx];
+                bool dyn = an.expr != nullptr;
+                ir::VarId nameVar = ir::kInvalid;
+                if (dyn) nameVar = forceVal(lowerExpr(an.expr));
+                ir::SymbolId nm = dyn ? 0 : internSym(an.symbol);
+
+                ir::VarId hasIt = dyn
+                    ? addBinding(ir::HasAttrDyn{cur, nameVar})
+                    : addBinding(ir::HasAttr{cur, nm});
+                if (idx + 1 == e->attrPath.size()) return hasIt;
+
+                auto thenB = m.freshBlock();
+                auto elseB = m.freshBlock();
+                blockStack.push_back(thenB);
+                ir::VarId got = dyn
+                    ? addBinding(ir::AttrSelectDyn{cur, nameVar})
+                    : addBinding(ir::AttrSelect{cur, nm});
+                got = forceVal(got);
+                ir::VarId rest = step(got, idx + 1);
+                setReturn(rest);
+                blockStack.pop_back();
+                blockStack.push_back(elseB);
+                setReturn(addBinding(ir::LitBool{false}));
+                blockStack.pop_back();
+                return addBinding(ir::If{hasIt, thenB, elseB});
+            };
+        result = step(attrs, 0);
+        return result;
     }
 
     ir::VarId lowerAssert(nix::ExprAssert * e)

@@ -39,6 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -178,13 +179,6 @@ int main(int argc, char ** argv)
     }
 
     if (expr.empty() && path.empty()) { usage(argv[0]); return 2; }
-    if (!path.empty()) {
-        try { expr = slurp(path); }
-        catch (const std::exception & ex) {
-            std::fprintf(stderr, "v3-eval: %s\n", ex.what());
-            return 1;
-        }
-    }
 
     try {
         nix::initNix();
@@ -198,7 +192,23 @@ int main(int argc, char ** argv)
 
         nix::EvalState state(nix::LookupPath{}, store, fetchSettings, evalSettings, nullptr);
 
-        nix::Expr * e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath::root));
+        nix::Expr * e;
+        if (!path.empty() && path != "-") {
+            // Use parseExprFromFile so relative imports inside the file
+            // resolve against the file's own directory, matching
+            // tree-walker behaviour.
+            std::filesystem::path abs = std::filesystem::absolute(path);
+            e = state.parseExprFromFile(nix::SourcePath(state.rootFS, nix::CanonPath(abs.string())));
+        } else {
+            if (path == "-") {
+                try { expr = slurp(path); }
+                catch (const std::exception & ex) {
+                    std::fprintf(stderr, "v3-eval: %s\n", ex.what());
+                    return 1;
+                }
+            }
+            e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath::root));
+        }
         e->bindVars(state, state.staticBaseEnv);
 
         nix::v3::registerBuiltinPrimOps();

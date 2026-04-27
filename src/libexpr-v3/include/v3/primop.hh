@@ -20,7 +20,9 @@
 #include "v3/value.hh"
 
 #include <cstdint>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace nix::v3 {
@@ -81,6 +83,10 @@ struct PrimOp
 
 /// Look up a primop by name.  Returns nullptr if not registered.
 const PrimOp * findPrimOp(std::string_view name);
+
+/// All registered primops keyed by name.  Used by the lowerer to
+/// materialize the `builtins` attrset on demand.
+const std::unordered_map<std::string, PrimOp> & allRegisteredPrimOps();
 
 /// Register a primop (or replace an existing one — last write wins).
 void registerPrimOp(const PrimOp & op);
