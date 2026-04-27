@@ -866,6 +866,74 @@ void primDeepSeq(EvalState & state, Value * args, Value & out)
     out = args[1];
 }
 
+/// builtins.unsafeGetAttrPos: tree-walker tracks AST positions; v3
+/// doesn't yet, so return null (mirrors a missing pos).
+void primUnsafeGetAttrPos(EvalState &, Value *, Value & out) { out.mkNull(); }
+
+/// builtins.toPath path-or-string -> path; bring-up uses identity.
+void primToPath(EvalState &, Value * args, Value & out)
+{
+    if (args[0].isPath())   { out = args[0]; return; }
+    if (args[0].isString()) {
+        char * buf = static_cast<char *>(std::malloc(std::strlen(args[0].payload.str) + 1));
+        std::strcpy(buf, args[0].payload.str);
+        out.tag_payload = static_cast<uint64_t>(Tag::Path);
+        out.payload.path = buf;
+        return;
+    }
+    typeError("toPath", "string or path");
+}
+
+/// builtins.splitVersion "1.2.3-alpha" -> ["1" "2" "3" "alpha"].
+/// Splits on '.' and '-'; consecutive separators produce empty strings
+/// (matching tree-walker behaviour).
+void primSplitVersion(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("splitVersion", "string");
+    std::string_view s(args[0].payload.str);
+    std::vector<std::string> parts;
+    std::string cur;
+    auto emit = [&]() {
+        if (!cur.empty()) parts.push_back(std::move(cur));
+        cur.clear();
+    };
+    for (char c : s) {
+        if (c == '.' || c == '-') emit();
+        else cur.push_back(c);
+    }
+    emit();
+    ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
+    allocStats().listsAllocated++;
+    for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = mkStringValueOwned(parts[i]);
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = lv;
+}
+
+/// String-context primops.  v3 doesn't track string contexts yet, so
+/// these are stubs that match the no-context case behaviour:
+///   unsafeDiscardStringContext s  ->  s
+///   hasContext s                  ->  false
+///   getContext s                  ->  {} (empty attrset)
+void primUnsafeDiscardStringContext(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("unsafeDiscardStringContext", "string");
+    out = args[0];
+}
+void primHasContext(EvalState &, Value *, Value & out) { out = Value::vFalse; }
+void primGetContext(EvalState &, Value *, Value & out)
+{
+    Bindings * b = Alloc::allocBindings(0);
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
+/// builtins.unsafeDiscardOutputDependency: same identity treatment.
+void primUnsafeDiscardOutputDependency(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("unsafeDiscardOutputDependency", "string");
+    out = args[0];
+}
+
 /// builtins.zipAttrsWith fn list-of-attrsets:
 ///   merge a list of attrsets, applying `fn name [values]` to combine
 ///   per-name lists.  Order in the value list mirrors source order.
@@ -1813,6 +1881,13 @@ void registerBuiltinPrimOps()
         registerPrimOp({"trace",              2, primTrace});
         registerPrimOp({"traceVerbose",       2, primTraceVerbose});
         registerPrimOp({"zipAttrsWith",       2, primZipAttrsWith});
+        registerPrimOp({"unsafeGetAttrPos",   2, primUnsafeGetAttrPos});
+        registerPrimOp({"toPath",             1, primToPath});
+        registerPrimOp({"splitVersion",       1, primSplitVersion});
+        registerPrimOp({"unsafeDiscardStringContext",      1, primUnsafeDiscardStringContext});
+        registerPrimOp({"hasContext",         1, primHasContext});
+        registerPrimOp({"getContext",         1, primGetContext});
+        registerPrimOp({"unsafeDiscardOutputDependency",   1, primUnsafeDiscardOutputDependency});
         registerPrimOp({"tryEval",            1, primTryEval});
         registerPrimOp({"baseNameOf",         1, primBaseNameOf});
         registerPrimOp({"dirOf",              1, primDirOf});
