@@ -703,7 +703,15 @@ struct Lowerer
             {
                 std::string name(symbols[path[0].symbol]);
                 po = findPrimOp(name);
-                if (po) return addBinding(ir::LitPrimOp{po});
+                if (po) {
+                    // 0-arity primops (currentSystem, nixVersion, etc.)
+                    // are values: call directly so the access yields the
+                    // constant.  Higher-arity primops produce a Tag::PrimOp
+                    // value that participates in PrimOpApp.
+                    if (po->arity == 0)
+                        return addBinding(ir::PrimOpCall{po, {}});
+                    return addBinding(ir::LitPrimOp{po});
+                }
             }
         }
 

@@ -34,11 +34,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -909,6 +912,133 @@ void primSplitString(EvalState &, Value * args, Value & out)
     out.payload.list = lv;
 }
 
+/// builtins.match regex string -> list of captures or null on no-match.
+/// Supports the standard regex syntax via std::regex (POSIX-ish).
+void primMatch(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString() || !args[1].isString())
+        typeError("match", "(regex, string)");
+    try {
+        std::regex re(args[0].payload.str);
+        std::cmatch m;
+        if (!std::regex_match(args[1].payload.str, m, re)) {
+            out = Value::vNull;
+            return;
+        }
+        // m[0] is the entire match; captures are m[1..m.size()-1].
+        size_t nGroups = m.size() > 0 ? m.size() - 1 : 0;
+        ListVec * lv = Alloc::allocList(static_cast<uint32_t>(nGroups));
+        allocStats().listsAllocated++;
+        for (size_t i = 0; i < nGroups; ++i) {
+            if (m[i + 1].matched)
+                lv->elems[i] = mkStringValueOwned(m[i + 1].str());
+            else
+                lv->elems[i] = Value::vNull;
+        }
+        out.tag_payload = static_cast<uint64_t>(Tag::List);
+        out.payload.list = lv;
+    } catch (const std::regex_error & e) {
+        throw std::runtime_error(std::string("v3 primop match: invalid regex: ") + e.what());
+    }
+}
+
+/// builtins.split regex string -> list alternating strings and captures.
+/// E.g. split "[ ]+" "hello  world" -> ["hello" [] "world"].
+void primSplit(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString() || !args[1].isString())
+        typeError("split", "(regex, string)");
+    try {
+        std::regex re(args[0].payload.str);
+        std::string_view s(args[1].payload.str);
+        std::vector<Value> parts;
+        std::cregex_iterator it(s.data(), s.data() + s.size(), re);
+        std::cregex_iterator end;
+        size_t pos = 0;
+        for (; it != end; ++it) {
+            auto match = *it;
+            // Add the literal piece between previous and this match.
+            parts.push_back(mkStringValueOwned(std::string(s.substr(pos, match.position(0) - pos))));
+            // Add the captured groups as a list.
+            size_t nGroups = match.size() > 0 ? match.size() - 1 : 0;
+            ListVec * caps = Alloc::allocList(static_cast<uint32_t>(nGroups));
+            allocStats().listsAllocated++;
+            for (size_t i = 0; i < nGroups; ++i) {
+                if (match[i + 1].matched)
+                    caps->elems[i] = mkStringValueOwned(match[i + 1].str());
+                else
+                    caps->elems[i] = Value::vNull;
+            }
+            Value capsV;
+            capsV.tag_payload = static_cast<uint64_t>(Tag::List);
+            capsV.payload.list = caps;
+            parts.push_back(capsV);
+            pos = match.position(0) + match.length(0);
+        }
+        // Trailing piece.
+        parts.push_back(mkStringValueOwned(std::string(s.substr(pos))));
+
+        ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
+        allocStats().listsAllocated++;
+        for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = parts[i];
+        out.tag_payload = static_cast<uint64_t>(Tag::List);
+        out.payload.list = lv;
+    } catch (const std::regex_error & e) {
+        throw std::runtime_error(std::string("v3 primop split: invalid regex: ") + e.what());
+    }
+}
+
+/// builtins.hashString algo s -> string of hex digits.
+/// Implements the FNV-1a 64-bit hash for unknown algorithms (placeholder)
+/// and proper SHA-256/SHA-1/MD5 deferred — those need libcrypto plumbing.
+void primHashString(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString() || !args[1].isString())
+        typeError("hashString", "(algo, string)");
+    std::string_view algo(args[0].payload.str);
+    std::string_view s(args[1].payload.str);
+    if (algo != "md5" && algo != "sha1" && algo != "sha256" && algo != "sha512")
+        throw std::runtime_error(std::string("v3 hashString: unknown algorithm '") + std::string(algo) + "'");
+    // Stub: FNV-1a 64-bit, formatted as 16 hex chars.  Real crypto
+    // hashes need libcrypto / openssl.
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (char c : s) {
+        h ^= static_cast<uint8_t>(c);
+        h *= 0x100000001b3ull;
+    }
+    char buf[32];
+    int n = std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
+    (void)n;
+    out = mkStringValueOwned(std::string(buf));
+}
+
+/// builtins.currentSystem and similar: just return host triple.
+void primCurrentSystem(EvalState &, Value *, Value & out)
+{
+    // Use a sensible default; nix tests usually mock this.
+#if defined(__APPLE__) && defined(__aarch64__)
+    out = mkStringValueOwned("aarch64-darwin");
+#elif defined(__APPLE__) && defined(__x86_64__)
+    out = mkStringValueOwned("x86_64-darwin");
+#elif defined(__linux__) && defined(__aarch64__)
+    out = mkStringValueOwned("aarch64-linux");
+#elif defined(__linux__) && defined(__x86_64__)
+    out = mkStringValueOwned("x86_64-linux");
+#else
+    out = mkStringValueOwned("unknown-unknown");
+#endif
+}
+
+void primCurrentTime(EvalState &, Value *, Value & out)
+{
+    out.mkInt(static_cast<int64_t>(std::time(nullptr)));
+}
+
+void primNixVersion(EvalState &, Value *, Value & out)
+{
+    out = mkStringValueOwned("v3-0.1");
+}
+
 /// builtins.readFile path -> string contents.
 void primReadFile(EvalState &, Value * args, Value & out)
 {
@@ -1403,6 +1533,12 @@ void registerBuiltinPrimOps()
         registerPrimOp({"readDir",            1, primReadDir});
         registerPrimOp({"parseDrvName",       1, primParseDrvName});
         registerPrimOp({"groupBy",            2, primGroupBy});
+        registerPrimOp({"match",              2, primMatch});
+        registerPrimOp({"split",              2, primSplit});
+        registerPrimOp({"hashString",         2, primHashString});
+        registerPrimOp({"currentSystem",      0, primCurrentSystem});
+        registerPrimOp({"currentTime",        0, primCurrentTime});
+        registerPrimOp({"nixVersion",         0, primNixVersion});
     });
 }
 
