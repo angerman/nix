@@ -712,15 +712,32 @@ struct Lowerer
     {
         bool hasDyn = e->dynamicAttrs && !e->dynamicAttrs->empty();
 
-        if (e->recursive && hasDyn)
-            unsupported("recursive attrset with dynamic attrs");
-
         if (e->recursive) {
-            return lowerLetRec(
+            // Build the rec part, capturing its rec scope so dynamic
+            // name + value expressions can be lowered while siblings
+            // are visible (rec-references in dyn values, plus level
+            // numbering for outer-scope vars in dyn names).
+            Scope recScopeOut;
+            ir::VarId recV = lowerLetRecCapture(
                 e->attrs.value(),
                 e->inheritFromExprs ? e->inheritFromExprs.get() : nullptr,
                 /*isRec=*/true,
-                /*hasBody=*/false, /*body=*/nullptr);
+                /*hasBody=*/false, /*body=*/nullptr,
+                &recScopeOut);
+            if (!hasDyn) return recV;
+
+            scopes.push_back(recScopeOut);
+            ir::AttrSetDyn dyn;
+            dyn.dynamics.reserve(e->dynamicAttrs->size());
+            for (auto & da : *e->dynamicAttrs) {
+                ir::VarId nameV = forceVal(lowerExpr(da.nameExpr));
+                ir::VarId valV  = thunkifyForAttr(da.valueExpr);
+                dyn.dynamics.push_back({nameV, valV});
+            }
+            scopes.pop_back();
+            ir::VarId dynV = addBinding(std::move(dyn));
+            // Merge: dyn entries override matching rec entries.
+            return addBinding(ir::Update{forceVal(recV), forceVal(dynV)});
         }
 
         // Non-rec attrset.  All entries (Plain / Inherited / InheritedFrom)
@@ -789,6 +806,18 @@ struct Lowerer
                           std::pmr::vector<nix::Expr *> * inheritFromExprs,
                           bool isRec,
                           bool hasBody, nix::Expr * body)
+    {
+        return lowerLetRecCapture(attrDefs, inheritFromExprs, isRec, hasBody, body, nullptr);
+    }
+
+    /// Like lowerLetRec but also writes the constructed rec Scope to
+    /// `*outRecScope` so callers (lowerAttrs for `rec + dyn`) can
+    /// re-push it when lowering follow-up expressions.
+    ir::VarId lowerLetRecCapture(nix::ExprAttrs::AttrDefs & attrDefs,
+                                 std::pmr::vector<nix::Expr *> * inheritFromExprs,
+                                 bool isRec,
+                                 bool hasBody, nix::Expr * body,
+                                 Scope * outRecScope)
     {
         ir::VarId recVar = m.freshVar();
 
@@ -868,6 +897,8 @@ struct Lowerer
         }
         m.blocks[blockStack.back()].bindings.push_back(
             {recVar, std::move(letRec)});
+
+        if (outRecScope) *outRecScope = recScope;
 
         if (!hasBody) {
             return addBinding(ir::VarRef{recVar});
