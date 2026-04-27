@@ -22,6 +22,10 @@
 #include "v3/primop.hh"
 #include "v3/ir.hh"
 
+#include "nix/expr/eval.hh"
+#include "nix/store/store-api.hh"
+#include "nix/util/canon-path.hh"
+
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
@@ -172,11 +176,34 @@ inline bool isTrueValue(const Value & v)
 /// Bring-up subset: int / float / bool / string / path / null.  Lists,
 /// attrsets, and lambdas trigger an error here for now (the AST → IR pass
 /// is responsible for inserting `toString` primop calls where needed).
+///
+/// In interpolation context (`forceString = true`) we route Path values
+/// through tree-walker's `copyPathToStore` (DryRun under
+/// settings.readOnlyMode = true) so `${./foo}` produces the proper
+/// `/nix/store/<32-hash>-name` representation, not the absolute file
+/// path.  Required by tests like `eval-okay-context` that count on the
+/// store-path prefix length.
 inline std::string coerceToString(const Value & v, bool forceString)
 {
     switch (v.tag()) {
     case Tag::String: return std::string(v.payload.str);
-    case Tag::Path:   return std::string(v.payload.path);
+    case Tag::Path: {
+        std::string p(v.payload.path ? v.payload.path : "");
+        if (forceString) {
+            if (auto * ns = getNixEvalState()) {
+                try {
+                    nix::NixStringContext ctx;
+                    nix::SourcePath sp(ns->rootFS, nix::CanonPath(p));
+                    auto storePath = ns->copyPathToStore(ctx, sp);
+                    return ns->store->printStorePath(storePath);
+                } catch (...) {
+                    // Path doesn't exist or can't be copied — fall through
+                    // to absolute path representation.
+                }
+            }
+        }
+        return p;
+    }
     case Tag::Int:    return std::to_string(v.payload.i);
     case Tag::Float:  return std::to_string(v.payload.f);
     case Tag::Bool:   return v.payload.i == 1 ? "1" : "";
