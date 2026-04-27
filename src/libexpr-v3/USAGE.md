@@ -190,9 +190,8 @@ The official `tests/functional/lang/eval-okay-*.nix` lang suite:
     bash src/libexpr-v3/test/run-lang-tests.sh
 
 The official `tests/functional/lang/eval-fail-*.nix` lang suite:
-**100 / 109 raise the expected error** (+2 hangs on symmetric circular
-formal defaults — known v3 limits).  Remaining 7 silent passes split
-into:
+**102 / 109 raise the expected error**, zero crashes.  The 7 remaining
+silent passes are intentional divergences:
 
 - 4 require tree-walker-specific lint flags
   (`--lint-absolute-path-literals fatal` etc.): abs-path-fatal,
