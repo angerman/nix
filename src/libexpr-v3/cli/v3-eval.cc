@@ -233,9 +233,9 @@ int main(int argc, char ** argv)
             // top-level frame with the CU, then forceDeep.
             nix::v3::VMState vm;
             vm.frames.push_back(nix::v3::CallFrame{
-                .cu = &cu, .ip = cu.entryOffset, .resultSlot = 0,
-                .flags = 0, ._pad0 = 0, .stackBaseOffset = 0,
-                .closure = nullptr, .resultPtr = nullptr, .thunk = nullptr,
+                .cu = &cu, .closure = nullptr, .thunk = nullptr,
+                .ip = cu.entryOffset, .stackBaseOffset = 0,
+                .withStackBase = 0, .flags = 0,
             });
             r = forceDeep(vm, r);
         }

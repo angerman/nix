@@ -534,15 +534,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             vm.frames.emplace_back();
             CallFrame & nf = vm.frames.back();
             nf.cu              = calleeCu;
-            nf.ip              = desc->codeOffset;
-            nf.resultSlot      = 0;
-            nf.flags           = 0;
-            nf._pad0           = 0;
-            nf.stackBaseOffset = static_cast<uint32_t>(newBase);
             nf.closure         = callee;
-            nf.resultPtr       = nullptr;
             nf.thunk           = nullptr;
+            nf.ip              = desc->codeOffset;
+            nf.stackBaseOffset = static_cast<uint32_t>(newBase);
             nf.withStackBase   = newWithBase;
+            nf.flags           = 0;
             pushCapturedWiths(vm, callee->capturedWiths);
 
             ip = desc->codeOffset;
@@ -600,15 +597,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
                     vm.frames.push_back(CallFrame{
                         .cu = thunkCu,
-                        .ip = desc->codeOffset,
-                        .resultSlot = 0,
-                        .flags = CFF_THUNK_RETURN,
-                        ._pad0 = 0,
-                        .stackBaseOffset = static_cast<uint32_t>(newBase),
                         .closure = fakeClo,
-                        .resultPtr = nullptr,
                         .thunk = next,
+                        .ip = desc->codeOffset,
+                        .stackBaseOffset = static_cast<uint32_t>(newBase),
                         .withStackBase = newWithBase,
+                        .flags = CFF_THUNK_RETURN,
                     });
                     pushCapturedWiths(vm, next->suspended.capturedWiths);
                     ip = desc->codeOffset;
@@ -694,15 +688,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
             vm.frames.push_back(CallFrame{
                 .cu = thunkCu,
-                .ip = desc->codeOffset,
-                .resultSlot = 0,
-                .flags = CFF_THUNK_RETURN,
-                ._pad0 = 0,
-                .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .closure = fakeClo,
-                .resultPtr = nullptr,
                 .thunk = t,
+                .ip = desc->codeOffset,
+                .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .withStackBase = newWithBase,
+                .flags = CFF_THUNK_RETURN,
             });
             pushCapturedWiths(vm, thunkWiths);
             cu = thunkCu;
@@ -1060,14 +1051,12 @@ Value run(const CompilationUnit & rootCu)
 
     vm.frames.push_back(CallFrame{
         .cu = &rootCu,
-        .ip = rootCu.entryOffset,
-        .resultSlot = 0,
-        .flags = 0,
-        ._pad0 = 0,
-        .stackBaseOffset = 0,
         .closure = nullptr,
-        .resultPtr = nullptr,
         .thunk = nullptr,
+        .ip = rootCu.entryOffset,
+        .stackBaseOffset = 0,
+        .withStackBase = 0,
+        .flags = 0,
     });
 
     if (!rootCu.lambdas.empty())
@@ -1120,15 +1109,12 @@ Value forceValue(VMState & vm, Value v)
 
         vm.frames.push_back(CallFrame{
             .cu = thunkCu,
-            .ip = desc->codeOffset,
-            .resultSlot = 0,
-            .flags = CFF_THUNK_RETURN,
-            ._pad0 = 0,
-            .stackBaseOffset = static_cast<uint32_t>(newBase),
             .closure = fakeClo,
-            .resultPtr = nullptr,
             .thunk = t,
+            .ip = desc->codeOffset,
+            .stackBaseOffset = static_cast<uint32_t>(newBase),
             .withStackBase = newWithBase,
+            .flags = CFF_THUNK_RETURN,
         });
         pushCapturedWiths(vm, thunkWiths);
 
@@ -1203,15 +1189,12 @@ Value callClosure(VMState & vm, Value fun, Value arg)
 
     vm.frames.push_back(CallFrame{
         .cu = cu,
-        .ip = desc->codeOffset,
-        .resultSlot = 0,
-        .flags = 0,
-        ._pad0 = 0,
-        .stackBaseOffset = static_cast<uint32_t>(newBase),
         .closure = callee,
-        .resultPtr = nullptr,
         .thunk = nullptr,
+        .ip = desc->codeOffset,
+        .stackBaseOffset = static_cast<uint32_t>(newBase),
         .withStackBase = newWithBase,
+        .flags = 0,
     });
     pushCapturedWiths(vm, callee->capturedWiths);
 

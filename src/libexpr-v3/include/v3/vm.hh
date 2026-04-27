@@ -23,29 +23,26 @@ enum CallFrameFlag : uint8_t
     CFF_THUNK_RETURN = 1 << 0,
 };
 
-/// Slim CallFrame.
+/// Slim CallFrame — 40 bytes, 2 fit in a 64B cache line minus 24B.
+/// resultSlot/resultPtr were never read on return paths and are gone;
+/// the return value is pushed onto valueStack and consumed by the caller.
 struct CallFrame
 {
     const CompilationUnit * cu;        // 8
-    uint32_t  ip;                       // 4
-    uint16_t  resultSlot;               // 2: relative to caller's stackBase
-    uint8_t   flags;                    // 1
-    uint8_t   _pad0;                    // 1
-    uint32_t  stackBaseOffset;          // 4
     const Closure * closure;            // 8
-    Value *   resultPtr;                // 8: where return value is written
-
     /// Optional thunk pointer for CFF_THUNK_RETURN frames.  When set, the
     /// return value is also copied into thunk->evaluated and the thunk's
     /// state is set to Evaluated.
-    Thunk * thunk = nullptr;
-
+    Thunk *   thunk;                    // 8
+    uint32_t  ip;                       // 4
+    uint32_t  stackBaseOffset;          // 4
     /// Floor on `vm.withStack` index for this frame: OP_WITH_LOOKUP only
     /// searches from `vm.withStack.size()` down to `withStackBase`, so a
     /// callee can't see its caller's `with`s.  At call entry we set this
     /// to the caller's `vm.withStack.size()` and then push the closure's
     /// captured snapshot.  At OP_RETURN we truncate to this base.
-    uint32_t withStackBase = 0;
+    uint32_t  withStackBase;            // 4
+    uint32_t  flags;                    // 4 (widened from u8 for clean 40-byte layout)
 };
 
 /// Per-EvalState VM state.
