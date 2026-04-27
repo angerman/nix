@@ -1237,6 +1237,87 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
     out.payload.bindings = b;
 }
 
+void primReadFileType(EvalState &, Value * args, Value & out)
+{
+    std::string path;
+    if (args[0].isString()) path = args[0].payload.str;
+    else if (args[0].isPath()) path = args[0].payload.path;
+    else typeError("readFileType", "string or path");
+    std::error_code ec;
+    auto status = std::filesystem::symlink_status(path, ec);
+    if (ec) throw std::runtime_error("v3 readFileType: " + ec.message());
+    const char * t;
+    if      (std::filesystem::is_symlink(status))   t = "symlink";
+    else if (std::filesystem::is_directory(status)) t = "directory";
+    else if (std::filesystem::is_regular_file(status)) t = "regular";
+    else                                            t = "unknown";
+    out = mkStringValueOwned(t);
+}
+
+void primAddErrorContext(EvalState &, Value * args, Value & out)
+{
+    // Stub: nix's tree-walker pre-pends a context message to error
+    // messages from the second arg.  v3 doesn't track context yet —
+    // just return the second argument (the wrapped value).  The first
+    // arg (the prefix string) is currently ignored.
+    (void)args;
+    out = args[1];
+}
+
+/// Construct a "fake" derivation attrset.  Real `derivation` interfaces
+/// with the store; we accept the input attrset and tag it with a
+/// synthetic `outPath` so code that just reads outPath works.  Useful
+/// for testing nix expressions that build up drv attrsets without
+/// actually realizing them.
+void primDerivationStrict(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isAttrs() || !args[0].payload.bindings)
+        typeError("derivationStrict", "attrset");
+    SymbolId sName = vmIntern(state, "name");
+    SymbolId sType = vmIntern(state, "type");
+    SymbolId sOutPath = vmIntern(state, "outPath");
+    SymbolId sDrvPath = vmIntern(state, "drvPath");
+
+    auto * src = args[0].payload.bindings;
+    const Value * nameV = src->lookup(sName);
+    if (!nameV || !nameV->isString())
+        typeError("derivationStrict", "attrset with `name` string");
+    std::string name(nameV->payload.str);
+
+    // Synthesize a fake out path / drv path.  Real nix would interact
+    // with the store — that requires libstore plumbing we haven't
+    // wired through to v3 yet (Phase F).
+    std::string outPath = "/v3-fake-store/" + name + "-out";
+    std::string drvPath = "/v3-fake-store/" + name + ".drv";
+
+    // Build result = { ...input attrs..., outPath, drvPath, type = "derivation"; }
+    // Simple approach: copy the input bindings + add 3 entries.
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(src->size + 3);
+    for (uint32_t i = 0; i < src->size; ++i)
+        entries.emplace_back(src->entries[i].name, src->entries[i].value);
+    entries.emplace_back(sOutPath, mkStringValueOwned(outPath));
+    entries.emplace_back(sDrvPath, mkStringValueOwned(drvPath));
+    entries.emplace_back(sType,    mkStringValueOwned("derivation"));
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
+    // Dedup (last-write-wins).
+    std::vector<std::pair<SymbolId, Value>> dedup;
+    dedup.reserve(entries.size());
+    for (auto & p : entries) {
+        if (!dedup.empty() && dedup.back().first == p.first) dedup.back() = p;
+        else dedup.push_back(p);
+    }
+    Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(dedup.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < dedup.size(); ++i) {
+        b->entries[i].name  = dedup[i].first;
+        b->entries[i].value = dedup[i].second;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
 /// builtins.import path -- read the file at `path`, parse, lower, run.
 /// Returns the resulting v3 Value.  Requires state.nixEvalState to be
 /// set (the host EvalState providing parser + symbol table).
@@ -1631,6 +1712,9 @@ void registerBuiltinPrimOps()
         registerPrimOp({"genericClosure",     1, primGenericClosure});
         registerPrimOp({"hashFile",           2, primHashFile});
         registerPrimOp({"convertHash",        1, primConvertHash});
+        registerPrimOp({"readFileType",       1, primReadFileType});
+        registerPrimOp({"addErrorContext",    2, primAddErrorContext});
+        registerPrimOp({"derivationStrict",   1, primDerivationStrict});
     });
 }
 
