@@ -343,6 +343,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value r;
             if (lhs.isInt() && rhs.isInt())          r.mkInt(lhs.payload.i * rhs.payload.i);
             else if (lhs.isFloat() && rhs.isFloat()) r.mkFloat(lhs.payload.f * rhs.payload.f);
+            else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) * rhs.payload.f);
+            else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f * static_cast<double>(rhs.payload.i));
             else throw std::runtime_error("v3 OP_MUL: unsupported types");
             push(vm, r);
             break;
@@ -355,6 +357,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 r.mkInt(lhs.payload.i / rhs.payload.i);
             } else if (lhs.isFloat() && rhs.isFloat()) {
                 r.mkFloat(lhs.payload.f / rhs.payload.f);
+            } else if (lhs.isInt() && rhs.isFloat()) {
+                r.mkFloat(static_cast<double>(lhs.payload.i) / rhs.payload.f);
+            } else if (lhs.isFloat() && rhs.isInt()) {
+                r.mkFloat(lhs.payload.f / static_cast<double>(rhs.payload.i));
             } else throw std::runtime_error("v3 OP_DIV: unsupported types");
             push(vm, r);
             break;
