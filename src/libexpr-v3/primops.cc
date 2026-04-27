@@ -31,6 +31,7 @@
 #include "nix/util/hash.hh"
 
 #include <nlohmann/json.hpp>
+#include <toml.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -1701,6 +1702,81 @@ void primImport(EvalState & state, Value * args, Value & out)
     cache.results.emplace(path, out);
 }
 
+/// Convert a toml::value (toml11) into a v3 Value recursively.
+static Value tomlToValue(EvalState & state, const toml::value & t)
+{
+    Value v;
+    switch (t.type()) {
+    case toml::value_t::table: {
+        auto & tab = t.as_table();
+        std::vector<std::pair<SymbolId, Value>> entries;
+        entries.reserve(tab.size());
+        for (auto & elem : tab)
+            entries.emplace_back(vmIntern(state, elem.first), tomlToValue(state, elem.second));
+        std::sort(entries.begin(), entries.end(),
+            [](auto & a, auto & b) { return a.first < b.first; });
+        Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+        allocStats().attrsetsAllocated++;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            b->entries[i].name  = entries[i].first;
+            b->entries[i].value = entries[i].second;
+        }
+        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        v.payload.bindings = b;
+        return v;
+    }
+    case toml::value_t::array: {
+        auto & arr = t.as_array();
+        ListVec * lv = Alloc::allocList(static_cast<uint32_t>(arr.size()));
+        allocStats().listsAllocated++;
+        for (size_t i = 0; i < arr.size(); ++i)
+            lv->elems[i] = tomlToValue(state, arr[i]);
+        v.tag_payload = static_cast<uint64_t>(Tag::List);
+        v.payload.list = lv;
+        return v;
+    }
+    case toml::value_t::boolean: v = t.as_boolean() ? Value::vTrue : Value::vFalse; return v;
+    case toml::value_t::integer:  v.mkInt(t.as_integer()); return v;
+    case toml::value_t::floating: v.mkFloat(t.as_floating()); return v;
+    case toml::value_t::string:   v = mkStringValueOwned(t.as_string()); return v;
+    case toml::value_t::local_datetime:
+    case toml::value_t::offset_datetime:
+    case toml::value_t::local_date:
+    case toml::value_t::local_time: {
+        // Render the datetime via toml11's stream operator and tag it.
+        std::ostringstream s;
+        s << t;
+        std::string str = s.str();
+        SymbolId sType = vmIntern(state, "_type");
+        SymbolId sVal  = vmIntern(state, "value");
+        Bindings * b = Alloc::allocBindings(2);
+        allocStats().attrsetsAllocated++;
+        Value typeV = mkStringValueOwned("timestamp");
+        Value valV  = mkStringValueOwned(str);
+        if (sType < sVal) { b->entries[0]={sType,typeV}; b->entries[1]={sVal,valV}; }
+        else              { b->entries[0]={sVal,valV};  b->entries[1]={sType,typeV}; }
+        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        v.payload.bindings = b;
+        return v;
+    }
+    case toml::value_t::empty: v.mkNull(); return v;
+    }
+    v.mkNull();
+    return v;
+}
+
+/// builtins.fromTOML s -- parse a TOML document into a v3 attrset.
+void primFromTOML(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("fromTOML", "string");
+    std::istringstream stream{std::string(args[0].payload.str)};
+    try {
+        out = tomlToValue(state, toml::parse(stream, "fromTOML"));
+    } catch (std::exception & e) {
+        throw std::runtime_error(std::string("v3 primop fromTOML: ") + e.what());
+    }
+}
+
 /// builtins.path { path; name?; filter?; recursive?; sha256?; }:
 /// add a path to the (fake) v3 store.  Real Nix would copy the path
 /// (with `filter` applied) and verify against `sha256`; v3 returns
@@ -2191,6 +2267,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"__nixPath",          0, primNixPath});
         registerPrimOp({"scopedImport",       2, primScopedImport});
         registerPrimOp({"path",               1, primPath});
+        registerPrimOp({"fromTOML",           1, primFromTOML});
     });
 }
 

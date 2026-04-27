@@ -27,6 +27,11 @@ deps_private_maybe_subproject = [
 deps_public_maybe_subproject = []
 subdir('nix-meson-build-support/subprojects')
 
+# TOML parser used by builtins.fromTOML — tree-walker depends on it
+# the same way.
+toml11 = dependency('toml11', version : '>=3.7.0', method : 'cmake', modules : ['toml11::toml11'])
+deps_other += toml11
+
 subdir('nix-meson-build-support/export-all-symbols')
 subdir('nix-meson-build-support/windows-version')
 
