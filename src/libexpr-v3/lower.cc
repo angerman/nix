@@ -330,6 +330,11 @@ struct Lowerer
             funcStack.push_back(fid);
             blockStack.push_back(entry);
 
+            // The caller may pass a thunk; HasAttr/AttrSelect both
+            // require WHNF.  Force once at the top of the body and use
+            // the forced VarId for all formals lookups.
+            ir::VarId paramForced = forceVal(param);
+
             // Order in newEnv before sort: arg (if any), then formals in
             // declaration order; displ assigned 0..N.  We mirror that.
             if (e->arg) {
@@ -341,11 +346,11 @@ struct Lowerer
                 ir::SymbolId nm = internSym(f.name);
                 if (f.def) {
                     // if (param ? f.name) then param.f.name else default
-                    ir::VarId hasIt = addBinding(ir::HasAttr{param, nm});
+                    ir::VarId hasIt = addBinding(ir::HasAttr{paramForced, nm});
                     auto thenB = m.freshBlock();
                     auto elseB = m.freshBlock();
                     blockStack.push_back(thenB);
-                    ir::VarId got = addBinding(ir::AttrSelect{param, nm});
+                    ir::VarId got = addBinding(ir::AttrSelect{paramForced, nm});
                     setReturn(got);
                     blockStack.pop_back();
                     blockStack.push_back(elseB);
@@ -359,7 +364,7 @@ struct Lowerer
                     blockStack.pop_back();
                     v = addBinding(ir::If{hasIt, thenB, elseB});
                 } else {
-                    v = addBinding(ir::AttrSelect{param, nm});
+                    v = addBinding(ir::AttrSelect{paramForced, nm});
                 }
                 inner.byDispl.push_back(v);
                 inner.byName.emplace(std::string(symbols[f.name]), v);
