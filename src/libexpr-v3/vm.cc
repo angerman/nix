@@ -529,18 +529,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             vm.valueStack[newBase + 0] = arg;
 
             uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
-            vm.frames.push_back(CallFrame{
-                .cu = calleeCu,
-                .ip = desc->codeOffset,
-                .resultSlot = 0,
-                .flags = 0,
-                ._pad0 = 0,
-                .stackBaseOffset = static_cast<uint32_t>(newBase),
-                .closure = callee,
-                .resultPtr = nullptr,
-                .thunk = nullptr,
-                .withStackBase = newWithBase,
-            });
+            // Direct field-by-field setup avoids constructing a temp
+            // CallFrame and then move-copying it into the vector.
+            vm.frames.emplace_back();
+            CallFrame & nf = vm.frames.back();
+            nf.cu              = calleeCu;
+            nf.ip              = desc->codeOffset;
+            nf.resultSlot      = 0;
+            nf.flags           = 0;
+            nf._pad0           = 0;
+            nf.stackBaseOffset = static_cast<uint32_t>(newBase);
+            nf.closure         = callee;
+            nf.resultPtr       = nullptr;
+            nf.thunk           = nullptr;
+            nf.withStackBase   = newWithBase;
             pushCapturedWiths(vm, callee->capturedWiths);
 
             ip = desc->codeOffset;
@@ -551,15 +553,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_RETURN: {
             Value retVal = pop(vm);
-            CallFrame fr = vm.frames.back();
-            vm.valueStack.resize(fr.stackBaseOffset);
-            // Restore caller's with-stack: anything pushed during this
-            // frame (the captured snapshot + any local OP_WITH_PUSHes
-            // that weren't paired with OP_WITH_POPs by OP_RETURN time)
-            // is dropped.
-            vm.withStack.resize(fr.withStackBase);
+            // Capture only the fields we need across the pop_back —
+            // copying the whole CallFrame is the per-recursion-call
+            // hot path on fib/ack benchmarks.
+            const CallFrame & frRef = vm.frames.back();
+            const uint32_t fStackBase    = frRef.stackBaseOffset;
+            const uint32_t fWithBase     = frRef.withStackBase;
+            const uint8_t  fFlags        = frRef.flags;
+            Thunk *        fThunk        = frRef.thunk;
+            vm.valueStack.resize(fStackBase);
+            vm.withStack.resize(fWithBase);
             vm.frames.pop_back();
-            if (fr.flags & CFF_THUNK_RETURN) {
+            CallFrame fr;  // referenced by name later — only thunk + flags matter.
+            fr.flags = fFlags;
+            fr.thunk = fThunk;
+            if (fFlags & CFF_THUNK_RETURN) {
                 // Chase Evaluated chains so the thunk caches the
                 // ultimate WHNF and not an intermediate thunk.
                 while (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Evaluated)
@@ -891,7 +899,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_STR_CONCAT: {
             uint32_t n = operand >> 1;
             bool forceStr = (operand & 1u) != 0;
-            std::vector<Value> parts(n);
+            // Hot path on every Nix-level `a + b` (which the parser
+            // lowers to ConcatStrings).  Avoid allocating a heap
+            // vector for the common 2-part case — most ConcatStrings
+            // expressions are exactly two operands.
+            constexpr uint32_t kSmall = 8;
+            Value small[kSmall];
+            std::vector<Value> overflow;
+            Value * parts = small;
+            if (n > kSmall) {
+                overflow.resize(n);
+                parts = overflow.data();
+            }
             for (uint32_t i = n; i > 0; --i) parts[i - 1] = pop(vm);
 
             // nix `+` semantics: if forceString=false and the first operand
@@ -900,15 +919,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // always coerces to string.
             if (!forceStr && n > 0 && (parts[0].isInt() || parts[0].isFloat())) {
                 bool allInt = true;
-                for (auto & p : parts) if (!p.isInt()) { allInt = false; break; }
+                for (uint32_t i = 0; i < n; ++i) if (!parts[i].isInt()) { allInt = false; break; }
                 Value r;
                 if (allInt) {
                     int64_t sum = 0;
-                    for (auto & p : parts) sum += p.payload.i;
+                    for (uint32_t i = 0; i < n; ++i) sum += parts[i].payload.i;
                     r.mkInt(sum);
                 } else {
                     double sum = 0.0;
-                    for (auto & p : parts) {
+                    for (uint32_t i = 0; i < n; ++i) {
+                        const Value & p = parts[i];
                         if (p.isInt())   sum += static_cast<double>(p.payload.i);
                         else if (p.isFloat()) sum += p.payload.f;
                         else throw std::runtime_error("v3 OP_STR_CONCAT: mixed numeric and non-numeric");
@@ -920,7 +940,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
 
             std::string out;
-            for (auto & p : parts) {
+            for (uint32_t i = 0; i < n; ++i) {
+                const Value & p = parts[i];
                 // Attrset coercion: __toString self  or  outPath.
                 // Matches tree-walker's coerceToString behaviour for
                 // attrsets (used to interpolate derivation values).
@@ -1029,9 +1050,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 Value run(const CompilationUnit & rootCu)
 {
     VMState vm;
-    vm.valueStack.reserve(1024);
-    vm.frames.reserve(64);
-    vm.withStack.reserve(16);
+    // Generous initial reservations: deep-recursive workloads (fib,
+    // ackermann, large fold chains) churn the value/frame stacks
+    // many times.  Avoiding reallocation through the hot path is a
+    // measurable win.
+    vm.valueStack.reserve(64 * 1024);
+    vm.frames.reserve(4096);
+    vm.withStack.reserve(64);
 
     vm.frames.push_back(CallFrame{
         .cu = &rootCu,

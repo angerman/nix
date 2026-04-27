@@ -647,12 +647,32 @@ struct Lowerer
     {
         if (!e) return true;
         const auto k = e->exprKind;
-        return k == nix::Expr::Kind::Int
+        if (k == nix::Expr::Kind::Int
             || k == nix::Expr::Kind::Float
             || k == nix::Expr::Kind::String
             || k == nix::Expr::Kind::Path
             || k == nix::Expr::Kind::Var
-            || k == nix::Expr::Kind::Lambda;
+            || k == nix::Expr::Kind::Lambda) return true;
+        // ConcatStrings (`a + b`) is treated as trivial: the operands
+        // are forced lazily by the VM's OP_STR_CONCAT path, and
+        // wrapping the entire add in an extra thunk is the dominant
+        // per-call cost on arithmetic-heavy benchmarks like fib.
+        if (k == nix::Expr::Kind::ConcatStrings) return true;
+        // Calls to known-pure arithmetic / comparison primops also
+        // skip the wrapper.  These never throw / have side effects on
+        // valid inputs, and tree-walker effectively treats them the
+        // same way (its App value is much lighter than a v3 Thunk).
+        if (k == nix::Expr::Kind::Call) {
+            auto * c = static_cast<nix::ExprCall *>(e);
+            if (c && c->fun && c->fun->exprKind == nix::Expr::Kind::Var) {
+                auto * fv = static_cast<nix::ExprVar *>(c->fun);
+                if (fv->fromWith) return false;
+                std::string n(symbols[fv->name]);
+                if (n == "__sub" || n == "__mul" || n == "__div"
+                    || n == "__lessThan") return true;
+            }
+        }
+        return false;
     }
 
     ir::VarId thunkifyForAttr(nix::Expr * e)
