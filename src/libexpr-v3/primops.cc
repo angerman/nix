@@ -32,11 +32,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -906,6 +909,115 @@ void primSplitString(EvalState &, Value * args, Value & out)
     out.payload.list = lv;
 }
 
+/// builtins.readFile path -> string contents.
+void primReadFile(EvalState &, Value * args, Value & out)
+{
+    std::string path;
+    if (args[0].isString()) path = args[0].payload.str;
+    else if (args[0].isPath()) path = args[0].payload.path;
+    else typeError("readFile", "string or path");
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("v3 primop readFile: cannot open " + path);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    out = mkStringValueOwned(ss.str());
+}
+
+/// builtins.readDir path -> attrset of name -> "regular"|"directory"|"symlink"|"unknown".
+void primReadDir(EvalState & state, Value * args, Value & out)
+{
+    std::string path;
+    if (args[0].isString()) path = args[0].payload.str;
+    else if (args[0].isPath()) path = args[0].payload.path;
+    else typeError("readDir", "string or path");
+    std::vector<std::pair<SymbolId, Value>> entries;
+    for (auto & ent : std::filesystem::directory_iterator(path)) {
+        std::string name = ent.path().filename().string();
+        const char * type =
+            ent.is_directory()  ? "directory" :
+            ent.is_symlink()    ? "symlink" :
+            ent.is_regular_file() ? "regular" :
+                                  "unknown";
+        SymbolId k = vmIntern(state, name);
+        entries.emplace_back(k, mkStringValueOwned(type));
+    }
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
+    Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        b->entries[i].name  = entries[i].first;
+        b->entries[i].value = entries[i].second;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
+/// builtins.parseDrvName "name-1.2.3" -> { name = "name"; version = "1.2.3"; }
+void primParseDrvName(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("parseDrvName", "string");
+    std::string s(args[0].payload.str);
+    // Split at the first '-' followed by a digit.
+    size_t cut = std::string::npos;
+    for (size_t i = 0; i + 1 < s.size(); ++i) {
+        if (s[i] == '-' && std::isdigit(static_cast<unsigned char>(s[i + 1]))) {
+            cut = i; break;
+        }
+    }
+    std::string name, version;
+    if (cut == std::string::npos) { name = s; version = ""; }
+    else { name = s.substr(0, cut); version = s.substr(cut + 1); }
+
+    SymbolId sName    = vmIntern(state, "name");
+    SymbolId sVersion = vmIntern(state, "version");
+    Bindings * b = Alloc::allocBindings(2);
+    allocStats().attrsetsAllocated++;
+    Value vn = mkStringValueOwned(name);
+    Value vv = mkStringValueOwned(version);
+    if (sName < sVersion) { b->entries[0] = {sName, vn}; b->entries[1] = {sVersion, vv}; }
+    else                  { b->entries[0] = {sVersion, vv}; b->entries[1] = {sName, vn}; }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
+/// builtins.groupBy keyFn list -> { key = [items with that key]; }
+void primGroupBy(EvalState & state, Value * args, Value & out)
+{
+    if (!args[1].isList()) typeError("groupBy", "list");
+    auto * src = args[1].payload.list;
+    Value keyFn = args[0];
+    std::unordered_map<std::string, std::vector<Value>> groups;
+    if (src) {
+        for (uint32_t i = 0; i < src->size; ++i) {
+            Value k = callClosure(*state.vm, keyFn, src->elems[i]);
+            if (!k.isString()) typeError("groupBy", "key fn returning string");
+            groups[std::string(k.payload.str)].push_back(src->elems[i]);
+        }
+    }
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(groups.size());
+    for (auto & [name, items] : groups) {
+        ListVec * lv = Alloc::allocList(static_cast<uint32_t>(items.size()));
+        allocStats().listsAllocated++;
+        for (size_t i = 0; i < items.size(); ++i) lv->elems[i] = items[i];
+        Value lstV;
+        lstV.tag_payload = static_cast<uint64_t>(Tag::List);
+        lstV.payload.list = lv;
+        entries.emplace_back(vmIntern(state, name), lstV);
+    }
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
+    Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        b->entries[i].name  = entries[i].first;
+        b->entries[i].value = entries[i].second;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
 /// builtins.import path -- read the file at `path`, parse, lower, run.
 /// Returns the resulting v3 Value.  Requires state.nixEvalState to be
 /// set (the host EvalState providing parser + symbol table).
@@ -1287,6 +1399,10 @@ void registerBuiltinPrimOps()
         registerPrimOp({"toJSON",             1, primToJSON});
         registerPrimOp({"functionArgs",       1, primFunctionArgs});
         registerPrimOp({"import",             1, primImport});
+        registerPrimOp({"readFile",           1, primReadFile});
+        registerPrimOp({"readDir",            1, primReadDir});
+        registerPrimOp({"parseDrvName",       1, primParseDrvName});
+        registerPrimOp({"groupBy",            2, primGroupBy});
     });
 }
 
