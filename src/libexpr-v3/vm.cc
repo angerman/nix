@@ -765,6 +765,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_FORCE: {
+            // Fast path: peek at the top of the stack.  The vast majority
+            // of OP_FORCE calls hit values already in WHNF (Int / Bool /
+            // String / Attrs / List / Closure / Path / Null / Float /
+            // PrimOp / PrimOpApp).  Skip the pop+push for those.
+            {
+                Value & topRef = vm.valueStack.back();
+                Tag t = topRef.tag();
+                if (t != Tag::Thunk && t != Tag::App) break;
+            }
             Value v = pop(vm);
             // Chase Evaluated chains and resolve Tag::App deferred
             // calls (used by mapAttrs et al. for lazy entries).
