@@ -2778,8 +2778,14 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
         auto & tab = t.as_table();
         std::vector<std::pair<SymbolId, Value>> entries;
         entries.reserve(tab.size());
-        for (auto & elem : tab)
+        for (auto & elem : tab) {
+            // Reject NUL-bearing keys: tree-walker does, and the v3
+            // bytecode-level Bindings::Entry can't represent them
+            // safely (names are NUL-terminated SymbolId-keyed).
+            if (elem.first.find('\0') != std::string::npos)
+                throw std::runtime_error("v3 fromTOML: attribute name contains null byte");
             entries.emplace_back(vmIntern(state, elem.first), tomlToValue(state, elem.second));
+        }
         std::sort(entries.begin(), entries.end(),
             [](auto & a, auto & b) { return a.first < b.first; });
         Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
@@ -2805,7 +2811,12 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
     case toml::value_t::boolean: v = t.as_boolean() ? Value::vTrue : Value::vFalse; return v;
     case toml::value_t::integer:  v.mkInt(t.as_integer()); return v;
     case toml::value_t::floating: v.mkFloat(t.as_floating()); return v;
-    case toml::value_t::string:   v = mkStringValueOwned(t.as_string()); return v;
+    case toml::value_t::string: {
+        const auto & s = t.as_string();
+        if (s.find('\0') != std::string::npos)
+            throw std::runtime_error("v3 fromTOML: string contains null byte");
+        v = mkStringValueOwned(s); return v;
+    }
     case toml::value_t::local_datetime:
     case toml::value_t::offset_datetime:
     case toml::value_t::local_date:
@@ -3064,13 +3075,26 @@ Value jsonToValue(EvalState & state, const nlohmann::json & j)
     if (j.is_null())     { out.mkNull(); return out; }
     if (j.is_boolean())  { out = j.get<bool>() ? Value::vTrue : Value::vFalse; return out; }
     if (j.is_number_integer()) {
+        // Reject values that don't fit in int64_t — nlohmann distinguishes
+        // signed vs unsigned numbers, so a JSON literal larger than
+        // INT64_MAX comes back as is_number_unsigned() && is_number_integer().
+        if (j.is_number_unsigned()) {
+            uint64_t u = j.get<uint64_t>();
+            if (u > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+                throw std::runtime_error("v3 fromJSON: integer value out of range");
+        }
         out.mkInt(j.get<int64_t>()); return out;
     }
     if (j.is_number_float()) {
         out.mkFloat(j.get<double>()); return out;
     }
     if (j.is_string()) {
-        out = mkStringValueOwned(j.get<std::string>()); return out;
+        // Reject embedded NULs — Nix strings are NUL-terminated C strings
+        // at the bytecode level, and tree-walker rejects them too.
+        std::string s = j.get<std::string>();
+        if (s.find('\0') != std::string::npos)
+            throw std::runtime_error("v3 fromJSON: string contains null byte");
+        out = mkStringValueOwned(std::move(s)); return out;
     }
     if (j.is_array()) {
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(j.size()));
@@ -3084,7 +3108,10 @@ Value jsonToValue(EvalState & state, const nlohmann::json & j)
         std::vector<std::pair<SymbolId, Value>> entries;
         entries.reserve(j.size());
         for (auto it = j.begin(); it != j.end(); ++it) {
-            SymbolId k = vmIntern(state, it.key());
+            const std::string & key = it.key();
+            if (key.find('\0') != std::string::npos)
+                throw std::runtime_error("v3 fromJSON: attribute name contains null byte");
+            SymbolId k = vmIntern(state, key);
             entries.emplace_back(k, jsonToValue(state, it.value()));
         }
         std::sort(entries.begin(), entries.end(),
