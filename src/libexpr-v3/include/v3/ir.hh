@@ -89,6 +89,10 @@ struct Formal {
     /// Default-value block (kInvalidBlock if formal is required).  Free vars
     /// of the default are part of the enclosing closure's upvalues.
     BlockId  defaultBlock = kInvalidBlock;
+    /// AST position handle for the formal name; 0 = unknown.  Recorded
+    /// in the per-attr side-table when `builtins.functionArgs` builds
+    /// its result attrset, so `unsafeGetAttrPos` works.
+    uint32_t pos = 0;
 };
 
 /// Construct a closure value.  At runtime, captures the free variables

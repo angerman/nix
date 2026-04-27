@@ -52,6 +52,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "nix/util/memory-source-accessor.hh"
+
 namespace nix::v3 {
 
 namespace {
@@ -1952,7 +1954,20 @@ void primImport(EvalState & state, Value * args, Value & out)
     }
 
     auto & ns = *state.nixEvalState;
-    nix::Expr * e = ns.parseExprFromFile(nix::SourcePath(ns.rootFS, nix::CanonPath(path)));
+    // Default: look up on rootFS (the real filesystem under restricted
+    // mode rules + the augmented store accessor).  Falls back to the
+    // corepkgsFS for `nix/...` lookups (e.g. `<nix/fetchurl.nix>`)
+    // which tree-walker special-cases in EvalState::findFile.
+    nix::SourcePath sp(ns.rootFS, nix::CanonPath(path));
+    if (!sp.pathExists()) {
+        // Strip leading slash and try corepkgsFS.
+        std::string corepkgsPath = path;
+        if (!corepkgsPath.empty() && corepkgsPath.front() == '/')
+            corepkgsPath = corepkgsPath.substr(1);
+        nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(), nix::CanonPath(corepkgsPath));
+        if (cp.pathExists()) sp = cp;
+    }
+    nix::Expr * e = ns.parseExprFromFile(sp);
     e->bindVars(ns, ns.staticBaseEnv);
 
     auto module = lowerNixExpr(e, ns.symbols, ns.positions);
@@ -2220,9 +2235,43 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
     case toml::value_t::offset_datetime:
     case toml::value_t::local_date:
     case toml::value_t::local_time: {
+        // Normalize the format before serializing so we get the same
+        // canonical RFC3339 spelling tree-walker emits: upper-case `T`
+        // delimiter, mandatory seconds, subsecond precision rounded up
+        // to the next multiple of 3 (or 0 if no fractional component).
+        // Mirrors libexpr/primops/fromTOML.cc's normalizeDatetimeFormat.
+        auto normalizeSubsecond = [](const toml::local_time & lt) -> size_t {
+            if (lt.millisecond != 0 || lt.microsecond != 0 || lt.nanosecond != 0) {
+                if (lt.microsecond != 0 || lt.nanosecond != 0) {
+                    if (lt.nanosecond != 0) return 9;
+                    return 6;
+                }
+                return 3;
+            }
+            return 0;
+        };
+        toml::value tw = t;
+        if (tw.is_local_datetime()) {
+            tw.as_local_datetime_fmt() = {
+                .delimiter = toml::datetime_delimiter_kind::upper_T,
+                .has_seconds = true,
+                .subsecond_precision = normalizeSubsecond(tw.as_local_datetime().time),
+            };
+        } else if (tw.is_offset_datetime()) {
+            tw.as_offset_datetime_fmt() = {
+                .delimiter = toml::datetime_delimiter_kind::upper_T,
+                .has_seconds = true,
+                .subsecond_precision = normalizeSubsecond(tw.as_offset_datetime().time),
+            };
+        } else if (tw.is_local_time()) {
+            tw.as_local_time_fmt() = {
+                .has_seconds = true,
+                .subsecond_precision = normalizeSubsecond(tw.as_local_time()),
+            };
+        }
         // Render the datetime via toml11's stream operator and tag it.
         std::ostringstream s;
-        s << t;
+        s << tw;
         std::string str = s.str();
         SymbolId sType = vmIntern(state, "_type");
         SymbolId sVal  = vmIntern(state, "value");
@@ -2322,20 +2371,22 @@ void primFunctionArgs(EvalState &, Value * args, Value & out)
             out.payload.bindings = b;
             return;
         }
-        // Build sorted entries.
-        std::vector<std::pair<SymbolId, Value>> entries;
+        // Build sorted entries; carry pos handle so we can populate
+        // the per-attr side-table below for `unsafeGetAttrPos`.
+        std::vector<std::tuple<SymbolId, Value, uint32_t>> entries;
         entries.reserve(desc->formals.size());
         for (auto & f : desc->formals) {
-            Value bv = f.second ? Value::vTrue : Value::vFalse;
-            entries.emplace_back(f.first, bv);
+            Value bv = f.hasDefault ? Value::vTrue : Value::vFalse;
+            entries.emplace_back(f.name, bv, f.pos);
         }
         std::sort(entries.begin(), entries.end(),
-            [](auto & a, auto & b) { return a.first < b.first; });
+            [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
         Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
         allocStats().attrsetsAllocated++;
         for (size_t i = 0; i < entries.size(); ++i) {
-            b->entries[i].name  = entries[i].first;
-            b->entries[i].value = entries[i].second;
+            b->entries[i].name  = std::get<0>(entries[i]);
+            b->entries[i].value = std::get<1>(entries[i]);
+            recordAttrPos(b, std::get<0>(entries[i]), std::get<2>(entries[i]));
         }
         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         out.payload.bindings = b;

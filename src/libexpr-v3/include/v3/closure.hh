@@ -129,12 +129,17 @@ struct LambdaDescriptor
     uint8_t  arity;         // 1 for simple `x: ...`; >1 for currying (later)
     uint8_t  hasFormals;    // 0 = simple arg, 1 = formals attrset
 
-    /// Formal parameters (`{a, b ? def}: body`).  Each entry is the
-    /// SymbolId of the formal name plus a flag indicating whether it
-    /// has a default value.  Used by `builtins.functionArgs` to
-    /// introspect the function's parameter list.  Empty for simple
-    /// `x: ...` lambdas.
-    std::vector<std::pair<uint32_t, bool>> formals;
+    /// Formal parameters (`{a, b ? def}: body`).  Each entry is
+    /// (name SymbolId, hasDefault, posHandle).  posHandle is an index
+    /// into the global posSnapshotPool; 0 means unknown.  Used by
+    /// `builtins.functionArgs` (the bool drives the result value, the
+    /// pos feeds the per-attr side-table so `unsafeGetAttrPos` works).
+    struct Formal {
+        uint32_t name;
+        bool     hasDefault;
+        uint32_t pos;
+    };
+    std::vector<Formal> formals;
 };
 
 struct ThunkDescriptor

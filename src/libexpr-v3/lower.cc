@@ -414,6 +414,7 @@ struct Lowerer
                 // We don't yet propagate default-block IDs through;
                 // for functionArgs we only need the has-default flag.
                 ifm.defaultBlock = fm.def ? 1u : ir::kInvalidBlock;
+                ifm.pos = posIdxToHandle(fm.pos);
                 m.functions[fid].formals.push_back(ifm);
             }
 
