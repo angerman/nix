@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -509,6 +510,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value r;
             if (lhs.isInt() && rhs.isInt()) {
                 if (rhs.payload.i == 0) throw std::runtime_error("v3 OP_DIV: division by zero");
+                // INT64_MIN / -1 wraps around (mathematical result is
+                // INT64_MAX + 1).  Match tree-walker by raising.
+                if (lhs.payload.i == std::numeric_limits<int64_t>::min() && rhs.payload.i == -1)
+                    throw std::runtime_error("v3 OP_DIV: integer overflow");
                 r.mkInt(lhs.payload.i / rhs.payload.i);
             } else if (lhs.isFloat() && rhs.isFloat()) {
                 r.mkFloat(lhs.payload.f / rhs.payload.f);
