@@ -200,6 +200,20 @@ struct Emitter
     }
     void emitOne(const ir::Force & e)
     {
+        // Fuse `Force(VarRef)` into a single superinstruction: every
+        // variable reference in the AST→IR lowering goes through this
+        // path, so this is the most common bytecode pair (~25-40% of
+        // instructions on benchmarks like fib).
+        if (auto it = ctx->slot.find(e.thunk); it != ctx->slot.end()) {
+            unit.code.push_back(encode(OP_GET_LOCAL_FORCE, it->second));
+            return;
+        }
+        if (auto uit = ctx->upvalue.find(e.thunk); uit != ctx->upvalue.end()) {
+            unit.code.push_back(encode(OP_GET_UPVALUE_FORCE, uit->second));
+            return;
+        }
+        // Fallback: var was neither slot nor upvalue (shouldn't happen
+        // for a well-formed module; emitVarRef will throw).
         emitVarRef(e.thunk);
         unit.code.push_back(encode(OP_FORCE));
     }

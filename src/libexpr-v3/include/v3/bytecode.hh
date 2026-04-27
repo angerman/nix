@@ -88,6 +88,12 @@ enum Op : uint8_t
     OP_CALL           = 0x52,  // single-arg call: pop arg, pop fun, push result
     OP_RETURN         = 0x53,  // pop result, return to caller
     OP_FORCE          = 0x54,  // pop, force (run if thunk), push WHNF value
+    /// Superinstructions: fuse OP_GET_LOCAL/OP_GET_UPVALUE with OP_FORCE.
+    /// Saves a dispatch + push+force on the hot pattern emitted by
+    /// every IR `Force(VarRef)` — i.e., almost every variable reference
+    /// in the current AST→IR lowering.
+    OP_GET_LOCAL_FORCE   = 0x55,  // [slot:24]
+    OP_GET_UPVALUE_FORCE = 0x56,  // [idx:24]
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

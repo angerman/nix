@@ -393,6 +393,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, vm.valueStack[stackBase + operand]);
             break;
         }
+        case OP_GET_LOCAL_FORCE: {
+            // Superinstruction: GET_LOCAL + FORCE.  Push the slot value
+            // and apply the FORCE fast path inline.
+            const Value & v = vm.valueStack[stackBase + operand];
+            Tag t = v.tag();
+            if (__builtin_expect(t != Tag::Thunk && t != Tag::App, 1)) {
+                push(vm, v);
+                break;
+            }
+            push(vm, v);
+            goto op_force_slow;
+        }
         case OP_SET_LOCAL: {
             // SET keeps an auto-grow loop because some lower paths
             // (notably tryEval / inherit-from temp slots) write to a
@@ -418,6 +430,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 throw std::runtime_error("v3 OP_GET_UPVALUE: index out of range");
             push(vm, closure->upvalues[operand]);
             break;
+        }
+        case OP_GET_UPVALUE_FORCE: {
+            if (!closure)
+                throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: no closure context");
+            const Value & v = closure->upvalues[operand];
+            Tag t = v.tag();
+            if (__builtin_expect(t != Tag::Thunk && t != Tag::App, 1)) {
+                push(vm, v);
+                break;
+            }
+            push(vm, v);
+            goto op_force_slow;
         }
         case OP_DUP:  push(vm, top(vm)); break;
         case OP_POP:  vm.valueStack.pop_back(); break;
@@ -781,6 +805,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 Tag t = topRef.tag();
                 if (t != Tag::Thunk && t != Tag::App) break;
             }
+            // Slow path: shared with OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE
+            // which push the value first and then jump here.
+            op_force_slow:
             Value v = pop(vm);
             // Chase Evaluated chains and resolve Tag::App deferred
             // calls (used by mapAttrs et al. for lazy entries).
