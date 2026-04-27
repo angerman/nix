@@ -1288,15 +1288,25 @@ void primAddDrvOutputDependencies(EvalState & state, Value * args, Value & out)
     if (!args[0].isString())
         typeError("addDrvOutputDependencies", "string");
     auto existing = lookupStringContext(args[0].payload.str);
+    // Tree-walker requires exactly one context entry which must be a
+    // single .drv path (Opaque or DrvDeep).  v3 must mirror that.
+    if (existing.empty())
+        throw std::runtime_error("v3 addDrvOutputDependencies: empty string context");
+    if (existing.size() > 1)
+        throw std::runtime_error("v3 addDrvOutputDependencies: string context has multiple entries");
+    const auto & e = *existing.begin();
+    if (!std::holds_alternative<nix::NixStringContextElem::Opaque>(e.raw) &&
+        !std::holds_alternative<nix::NixStringContextElem::DrvDeep>(e.raw))
+        throw std::runtime_error("v3 addDrvOutputDependencies: context entry is not a single drv path");
     nix::NixStringContext ctx;
-    for (auto & e : existing) {
-        if (auto * o = std::get_if<nix::NixStringContextElem::Opaque>(&e.raw)) {
-            ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{.drvPath = o->path}});
-        } else if (std::holds_alternative<nix::NixStringContextElem::DrvDeep>(e.raw)) {
-            ctx.insert(e);
-        } else {
-            ctx.insert(e);
-        }
+    if (auto * o = std::get_if<nix::NixStringContextElem::Opaque>(&e.raw)) {
+        // Opaque entries are also rejected if they don't end in .drv —
+        // tree-walker requires the path be a derivation.
+        if (!o->path.name().ends_with(".drv"))
+            throw std::runtime_error("v3 addDrvOutputDependencies: context entry is not a derivation path");
+        ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{.drvPath = o->path}});
+    } else {
+        ctx.insert(e);
     }
     out = cloneString(args[0].payload.str);
     if (!ctx.empty()) setStringContext(out.payload.str, ctx);
