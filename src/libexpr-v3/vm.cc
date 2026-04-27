@@ -222,11 +222,33 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
 /// Look up `name` in the with-stack, walking from top (innermost) outward.
 /// Bounded below by the current frame's `withStackBase`: a closure must
 /// not see its caller's `with` scopes.  `depth` is currently unused.
+///
+/// Each with-stack entry is forced lazily on first access — this is the
+/// "delayed-with" rule.  `with pkgs; ...` inside a recursive group that
+/// also defines pkgs would blackhole if we forced eagerly at
+/// OP_WITH_PUSH; instead we keep the thunk on the stack and only force
+/// when an unbound name actually triggers a lookup.  The forced value
+/// is written back so subsequent lookups skip the force.
 inline Value withLookup(VMState & vm, SymbolId name, uint32_t /*depth*/)
 {
     size_t base = vm.frames.empty() ? 0 : vm.frames.back().withStackBase;
     for (size_t i = vm.withStack.size(); i-- > base; ) {
-        const Value & w = vm.withStack[i];
+        Value & w = vm.withStack[i];
+        if (w.isThunk() || w.tag() == Tag::App) {
+            try {
+                w = forceValue(vm, w);
+            } catch (const std::exception & ex) {
+                // Blackhole here is the delayed-with corner case: the
+                // with-stack entry references something that's still
+                // being forced from a deeper frame.  Skip it so outer
+                // scopes still get a chance to define `name`.  Real
+                // errors propagate as usual.
+                std::string what(ex.what());
+                if (what.find("blackhole") != std::string::npos)
+                    continue;
+                throw;
+            }
+        }
         if (!w.isAttrs()) continue;
         if (auto * v = w.payload.bindings->lookup(name))
             return *v;

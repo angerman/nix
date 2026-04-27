@@ -677,8 +677,17 @@ struct Lowerer
             || k == nix::Expr::Kind::Float
             || k == nix::Expr::Kind::String
             || k == nix::Expr::Kind::Path
-            || k == nix::Expr::Kind::Var
             || k == nix::Expr::Kind::Lambda) return true;
+        // ExprVar is mostly trivial — but a `fromWith` reference
+        // performs a runtime OP_WITH_LOOKUP that forces the with-stack
+        // entries.  Inside `with pkgs; { a = b; }` where pkgs is part
+        // of the same letRec, eagerly forcing the with entry would
+        // blackhole.  Wrap fromWith vars in thunks so the lookup
+        // happens lazily at access time.
+        if (k == nix::Expr::Kind::Var) {
+            auto * v = static_cast<nix::ExprVar *>(e);
+            return !v->fromWith;
+        }
         // ConcatStrings (`a + b`) is treated as trivial: the operands
         // are forced lazily by the VM's OP_STR_CONCAT path, and
         // wrapping the entire add in an extra thunk is the dominant
@@ -1157,7 +1166,12 @@ struct Lowerer
         // The attrs expression is evaluated OUTSIDE the with's scope —
         // do this before pushing the placeholder so its var lookups use
         // the surrounding level numbering.
-        ir::VarId attrs = forceVal(lowerExpr(e->attrs));
+        //
+        // Do NOT eagerly force the attrs here: tree-walker delays
+        // forcing until OP_WITH_LOOKUP first needs to scan the entry,
+        // which is required for `with pkgs; ...` to work inside the
+        // recursive group that defines pkgs (otherwise we'd blackhole).
+        ir::VarId attrs = lowerExpr(e->attrs);
         auto bodyB = m.freshBlock();
         blockStack.push_back(bodyB);
         // Push an empty placeholder scope: nix's bindVars counts the

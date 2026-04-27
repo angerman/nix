@@ -1954,20 +1954,26 @@ void primImport(EvalState & state, Value * args, Value & out)
     }
 
     auto & ns = *state.nixEvalState;
-    // Default: look up on rootFS (the real filesystem under restricted
-    // mode rules + the augmented store accessor).  Falls back to the
-    // corepkgsFS for `nix/...` lookups (e.g. `<nix/fetchurl.nix>`)
-    // which tree-walker special-cases in EvalState::findFile.
-    nix::SourcePath sp(ns.rootFS, nix::CanonPath(path));
-    if (!sp.pathExists()) {
-        // Strip leading slash and try corepkgsFS.
+    // Default: rootFS (the real filesystem under restricted-mode rules
+    // + the augmented store accessor).  Use `resolveExprPath` to
+    // follow symlink chains and append `default.nix` when the path is
+    // a directory (matches tree-walker's import semantics).  If the
+    // path isn't on the real FS (e.g. the `<nix/fetchurl.nix>`
+    // corepkgs entry) we fall back to corepkgsFS.
+    nix::Expr * e = nullptr;
+    try {
+        nix::SourcePath sp(ns.rootFS, nix::CanonPath(path));
+        sp = nix::resolveExprPath(sp);
+        e = ns.parseExprFromFile(sp);
+    } catch (...) {
         std::string corepkgsPath = path;
         if (!corepkgsPath.empty() && corepkgsPath.front() == '/')
             corepkgsPath = corepkgsPath.substr(1);
-        nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(), nix::CanonPath(corepkgsPath));
-        if (cp.pathExists()) sp = cp;
+        nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(),
+                           nix::CanonPath(corepkgsPath));
+        if (!cp.pathExists()) throw;
+        e = ns.parseExprFromFile(cp);
     }
-    nix::Expr * e = ns.parseExprFromFile(sp);
     e->bindVars(ns, ns.staticBaseEnv);
 
     auto module = lowerNixExpr(e, ns.symbols, ns.positions);
