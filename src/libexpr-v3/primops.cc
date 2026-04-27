@@ -972,9 +972,46 @@ void primDeepSeq(EvalState & state, Value * args, Value & out)
     out = args[1];
 }
 
-/// builtins.unsafeGetAttrPos: tree-walker tracks AST positions; v3
-/// doesn't yet, so return null (mirrors a missing pos).
-void primUnsafeGetAttrPos(EvalState &, Value *, Value & out) { out.mkNull(); }
+/// builtins.unsafeGetAttrPos NAME ATTRS — return a `{file, line, column}`
+/// attrset for the AST position of NAME's definition, or null if no
+/// such position is known.  Backed by the per-attr position side-table
+/// (see alloc.hh) which is populated by OP_ATTRS_INIT[_DYN] /
+/// OP_ATTRS_REC_INIT during compilation.  The pool value is itself
+/// just a snapshot — the actual nix::PosTable lookup happened during
+/// lowering and the result is held in the global posSnapshotPool.
+void primUnsafeGetAttrPos(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isString())
+        typeError("unsafeGetAttrPos", "(string, attrset)");
+    if (!args[1].isAttrs() || !args[1].payload.bindings) {
+        out.mkNull();
+        return;
+    }
+    SymbolId nameId = ir::globalInternSymbol(args[0].payload.str);
+    uint32_t handle = lookupAttrPos(args[1].payload.bindings, nameId);
+    const PosSnapshot * snap = resolvePosSnapshot(handle);
+    if (!snap) { out.mkNull(); return; }
+    SymbolId sFile   = vmIntern(state, "file");
+    SymbolId sLine   = vmIntern(state, "line");
+    SymbolId sColumn = vmIntern(state, "column");
+    Bindings * b = Alloc::allocBindings(3);
+    allocStats().attrsetsAllocated++;
+    std::vector<std::pair<SymbolId, Value>> entries(3);
+    Value vFile = mkStringValueOwned(snap->file);
+    Value vLine; vLine.mkInt(snap->line);
+    Value vCol;  vCol.mkInt(snap->column);
+    entries[0] = {sFile,   vFile};
+    entries[1] = {sLine,   vLine};
+    entries[2] = {sColumn, vCol};
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
+    for (size_t i = 0; i < entries.size(); ++i) {
+        b->entries[i].name  = entries[i].first;
+        b->entries[i].value = entries[i].second;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
 
 /// builtins.toPath path-or-string -> path; bring-up uses identity.
 /// Also accepts attrsets with `__toString` or `outPath` (the standard

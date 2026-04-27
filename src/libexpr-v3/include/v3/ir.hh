@@ -123,15 +123,17 @@ struct HasAttr       { VarId attrs; SymbolId name; };
 struct HasAttrDyn    { VarId attrs; VarId nameVar; };
 
 /// Construct a non-recursive attrset from sorted (name, value) pairs.
+/// `pos` is the AST PosIdx for the attribute *name* token (or 0 = none),
+/// used by `builtins.unsafeGetAttrPos`.
 struct AttrSet {
-    struct Entry { SymbolId name; VarId value; };
+    struct Entry { SymbolId name; VarId value; uint32_t pos = 0; };
     std::vector<Entry> entries; // sorted ascending by SymbolId
 };
 
 /// Attrset with one or more dynamic-name attributes.
 struct AttrSetDyn {
-    struct StaticEntry  { SymbolId name; VarId value; };
-    struct DynamicEntry { VarId nameVar; VarId value; };
+    struct StaticEntry  { SymbolId name; VarId value; uint32_t pos = 0; };
+    struct DynamicEntry { VarId nameVar; VarId value; uint32_t pos = 0; };
     std::vector<StaticEntry>  statics;
     std::vector<DynamicEntry> dynamics;
 };
@@ -141,7 +143,7 @@ struct AttrSetDyn {
 /// to AttrSelect on selfVar).
 struct RecAttrSet {
     VarId selfVar;
-    struct Entry { SymbolId name; VarId value; };
+    struct Entry { SymbolId name; VarId value; uint32_t pos = 0; };
     std::vector<Entry> entries;
 };
 
@@ -224,6 +226,7 @@ struct LetRec {
     struct Entry {
         SymbolId            name;
         FuncId              thunkBody;     // body Function, evaluated on Force
+        uint32_t            pos = 0;       // AST PosIdx for the attr name
         /// VarIds the thunk body needs from the surrounding scope, NOT
         /// counting the rec attrset (which is implicitly upvalue 0).
         /// Populated by computeFreeVars.

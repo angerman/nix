@@ -23,6 +23,7 @@
 #include "v3/lower.hh"
 #include "v3/ir.hh"
 #include "v3/primop.hh"
+#include "v3/alloc.hh"
 
 #include "nix/expr/nixexpr.hh"
 #include "nix/expr/symbol-table.hh"
@@ -275,6 +276,30 @@ struct Lowerer
         static std::deque<std::string> pool;
         pool.emplace_back(s);
         return pool.back();
+    }
+
+    /// Resolve a parser PosIdx into a handle into the global pos-snapshot
+    /// pool.  Returns 0 when there's no PosTable wired or the PosIdx is
+    /// missing — that handle uniformly means "no position info known".
+    /// The handle is what we store on each ir::AttrSet::Entry so the VM
+    /// can populate the per-attr position side-table consulted by
+    /// `builtins.unsafeGetAttrPos`.
+    uint32_t posIdxToHandle(nix::PosIdx posIdx)
+    {
+        if (!positions || !posIdx) return 0;
+        auto pos = (*positions)[posIdx];
+        std::string file;
+        if (auto * s = std::get_if<nix::SourcePath>(&pos.origin))
+            file = s->path.abs();
+        else if (std::holds_alternative<nix::Pos::Stdin>(pos.origin))
+            file = "<stdin>";
+        else if (std::holds_alternative<nix::Pos::String>(pos.origin))
+            file = "<string>";
+        else
+            file = "<unknown>";
+        return recordPosSnapshot({std::move(file),
+                                   static_cast<uint32_t>(pos.line),
+                                   static_cast<uint32_t>(pos.column)});
     }
 
     ir::VarId lowerInt(nix::ExprInt * e)
@@ -831,7 +856,8 @@ struct Lowerer
                 // attrset is built.  Skips trivial expressions (literal
                 // / var ref) that need no thunk for correctness.
                 ir::VarId vv = thunkifyForAttr(kv.second.e);
-                dyn.statics.push_back({internSym(kv.first), vv});
+                dyn.statics.push_back({internSym(kv.first), vv,
+                                        posIdxToHandle(kv.second.pos)});
             }
             dyn.dynamics.reserve(e->dynamicAttrs->size());
             for (auto & da : *e->dynamicAttrs) {
@@ -839,7 +865,7 @@ struct Lowerer
                 // strict context, force.
                 ir::VarId nameV = forceVal(lowerExpr(da.nameExpr));
                 ir::VarId valV  = lowerExpr(da.valueExpr);
-                dyn.dynamics.push_back({nameV, valV});
+                dyn.dynamics.push_back({nameV, valV, posIdxToHandle(da.pos)});
             }
             if (pushedInheritFrom) inheritFromStack.pop_back();
             return addBinding(std::move(dyn));
@@ -851,7 +877,7 @@ struct Lowerer
             const auto & def = kv.second;
             // Lazy entries — see comment on the dyn branch above.
             ir::VarId vv = thunkifyForAttr(def.e);
-            entries.push_back({internSym(sym), vv});
+            entries.push_back({internSym(sym), vv, posIdxToHandle(def.pos)});
         }
         if (pushedInheritFrom) inheritFromStack.pop_back();
         return addBinding(ir::AttrSet{std::move(entries)});
@@ -898,6 +924,7 @@ struct Lowerer
             nix::Expr * defE;
             ir::FuncId funcIdx;
             ir::BlockId entryBlock;
+            uint32_t    posHandle;
         };
         std::vector<Pending> pending;
         pending.reserve(attrDefs.size());
@@ -908,7 +935,8 @@ struct Lowerer
             auto eb = m.freshBlock();
             m.functions[fid].entryBlock = eb;
             m.functions[fid].name = std::string(symbols[kv.first]);
-            pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb});
+            pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb,
+                                posIdxToHandle(kv.second.pos)});
         }
 
         Scope recScope;
@@ -964,6 +992,7 @@ struct Lowerer
             ir::LetRec::Entry en;
             en.name = internSym(p.sym);
             en.thunkBody = p.funcIdx;
+            en.pos = p.posHandle;
             letRec.entries.push_back(std::move(en));
         }
         m.blocks[blockStack.back()].bindings.push_back(

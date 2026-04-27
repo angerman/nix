@@ -167,4 +167,92 @@ inline AllocStats & allocStats()
     return stats;
 }
 
+// ---------------------------------------------------------------------------
+// Per-attr position side-table.
+//
+// Tree-walker stores a PosIdx alongside every Bindings::Entry; v3 keeps
+// the Entry slim (24 bytes) and uses this side-table instead.  The key
+// `(bindings, name)` is uniquely defined: each Bindings sees exactly one
+// PosIdx per name.  The side-table is populated by OP_ATTRS_INIT[_DYN] /
+// OP_ATTRS_REC_INIT and looked up by `builtins.unsafeGetAttrPos`.
+// Lifetime tracking is best-effort: we never explicitly free entries
+// since Bindings live for the duration of the eval anyway.
+// ---------------------------------------------------------------------------
+
+struct PosKey
+{
+    const Bindings * bindings;
+    SymbolId         name;
+    bool operator==(const PosKey & o) const noexcept
+    { return bindings == o.bindings && name == o.name; }
+};
+
+struct PosKeyHash
+{
+    size_t operator()(const PosKey & k) const noexcept
+    {
+        return std::hash<const Bindings *>{}(k.bindings) ^
+               (std::hash<SymbolId>{}(k.name) << 1);
+    }
+};
+
+} // namespace nix::v3
+
+#include <unordered_map>
+
+namespace nix::v3 {
+
+inline std::unordered_map<PosKey, uint32_t, PosKeyHash> & attrPosTable()
+{
+    static std::unordered_map<PosKey, uint32_t, PosKeyHash> tbl;
+    return tbl;
+}
+
+inline void recordAttrPos(const Bindings * b, SymbolId name, uint32_t pos)
+{
+    if (pos == 0) return;
+    attrPosTable()[{b, name}] = pos;
+}
+
+inline uint32_t lookupAttrPos(const Bindings * b, SymbolId name)
+{
+    auto & tbl = attrPosTable();
+    auto it = tbl.find({b, name});
+    return it == tbl.end() ? 0 : it->second;
+}
+
+// Resolved AST source position: file path string, line, and column.
+// The lowerer fills this snapshot pool from the EvalState's PosTable
+// during compilation; runtime stores 1-based indices into this pool
+// in the per-attr position side-table.  Pool slot 0 is reserved as
+// "no position" so a 0 handle uniformly means "unknown".
+struct PosSnapshot
+{
+    std::string file;
+    uint32_t    line;
+    uint32_t    column;
+};
+
+inline std::vector<PosSnapshot> & posSnapshotPool()
+{
+    static std::vector<PosSnapshot> pool = { PosSnapshot{} }; // index 0 = none
+    return pool;
+}
+
+/// Push a snapshot into the pool and return its 1-based handle (0 = none).
+inline uint32_t recordPosSnapshot(PosSnapshot s)
+{
+    auto & p = posSnapshotPool();
+    p.push_back(std::move(s));
+    return static_cast<uint32_t>(p.size() - 1);
+}
+
+inline const PosSnapshot * resolvePosSnapshot(uint32_t handle)
+{
+    if (handle == 0) return nullptr;
+    auto & p = posSnapshotPool();
+    if (handle >= p.size()) return nullptr;
+    return &p[handle];
+}
+
 } // namespace nix::v3

@@ -792,23 +792,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // --- Attrsets ---
         case OP_ATTRS_INIT: {
             uint32_t n = operand;
-            // Read n SymbolIds inline (each is a 32-bit code word).
+            // Each entry is a (SymbolId, PosIdx) pair inlined as 2 code
+            // words.  PosIdx feeds the per-attr position side-table that
+            // backs `builtins.unsafeGetAttrPos`.
             std::vector<SymbolId> names(n);
-            for (uint32_t i = 0; i < n; ++i) names[i] = static_cast<SymbolId>(cu->code[ip + i]);
-            ip += n;
+            std::vector<uint32_t> poses(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                names[i] = static_cast<SymbolId>(cu->code[ip + 2 * i]);
+                poses[i] = cu->code[ip + 2 * i + 1];
+            }
+            ip += 2 * n;
             // Pop n values (in reverse order).
             std::vector<Value> values(n);
             for (uint32_t i = n; i > 0; --i) values[i - 1] = pop(vm);
-            // Build sorted entries.
-            std::vector<std::pair<SymbolId, Value>> entries(n);
-            for (uint32_t i = 0; i < n; ++i) entries[i] = {names[i], values[i]};
+            // Build sorted entries; carry pos alongside.
+            std::vector<std::tuple<SymbolId, Value, uint32_t>> entries(n);
+            for (uint32_t i = 0; i < n; ++i)
+                entries[i] = {names[i], values[i], poses[i]};
             std::sort(entries.begin(), entries.end(),
-                      [](auto & a, auto & b) { return a.first < b.first; });
+                      [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
             Bindings * b = Alloc::allocBindings(n);
             allocStats().attrsetsAllocated++;
             for (uint32_t i = 0; i < n; ++i) {
-                b->entries[i].name = entries[i].first;
-                b->entries[i].value = entries[i].second;
+                b->entries[i].name  = std::get<0>(entries[i]);
+                b->entries[i].value = std::get<1>(entries[i]);
+                recordAttrPos(b, std::get<0>(entries[i]), std::get<2>(entries[i]));
             }
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -825,16 +833,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             for (uint32_t i = totalDynVals; i > 0; --i) dynPairs[i - 1] = pop(vm);
             std::vector<Value> staticVals(nStatic);
             for (uint32_t i = nStatic; i > 0; --i) staticVals[i - 1] = pop(vm);
-            // Static SymbolIds inline.
+            // Inline layout: nStatic*(name, pos) pairs followed by nDyn
+            // pos words for the dynamic entries.
             std::vector<SymbolId> staticNames(nStatic);
-            for (uint32_t i = 0; i < nStatic; ++i)
-                staticNames[i] = static_cast<SymbolId>(cu->code[ip + i]);
-            ip += nStatic;
+            std::vector<uint32_t> staticPoses(nStatic);
+            for (uint32_t i = 0; i < nStatic; ++i) {
+                staticNames[i] = static_cast<SymbolId>(cu->code[ip + 2 * i]);
+                staticPoses[i] = cu->code[ip + 2 * i + 1];
+            }
+            ip += 2 * nStatic;
+            std::vector<uint32_t> dynPoses(nDyn);
+            for (uint32_t i = 0; i < nDyn; ++i)
+                dynPoses[i] = cu->code[ip + i];
+            ip += nDyn;
 
-            std::vector<std::pair<SymbolId, Value>> entries;
+            std::vector<std::tuple<SymbolId, Value, uint32_t>> entries;
             entries.reserve(nStatic + nDyn);
             for (uint32_t i = 0; i < nStatic; ++i)
-                entries.emplace_back(staticNames[i], staticVals[i]);
+                entries.emplace_back(staticNames[i], staticVals[i], staticPoses[i]);
             for (uint32_t i = 0; i < nDyn; ++i) {
                 Value & nameV = dynPairs[i * 2];
                 Value & valV  = dynPairs[i * 2 + 1];
@@ -847,15 +863,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // Use the global symbol table — IDs from any CU stay
                 // consistent so attrset lookups across CUs work.
                 SymbolId id = ir::globalInternSymbol(nameV.payload.str);
-                entries.emplace_back(id, valV);
+                entries.emplace_back(id, valV, dynPoses[i]);
             }
             std::sort(entries.begin(), entries.end(),
-                      [](auto & a, auto & b) { return a.first < b.first; });
+                      [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
             Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
             allocStats().attrsetsAllocated++;
             for (size_t i = 0; i < entries.size(); ++i) {
-                b->entries[i].name = entries[i].first;
-                b->entries[i].value = entries[i].second;
+                b->entries[i].name  = std::get<0>(entries[i]);
+                b->entries[i].value = std::get<1>(entries[i]);
+                recordAttrPos(b, std::get<0>(entries[i]), std::get<2>(entries[i]));
             }
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -868,15 +885,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // are written later by OP_ATTRS_REC_SET[slot].  Names come
             // pre-sorted from emit (LetRec emit sorts entries by
             // SymbolId before writing the data words and rewrites the
-            // REC_SET operand to the sorted slot).
+            // REC_SET operand to the sorted slot).  Each entry is
+            // (SymbolId, PosIdx) — the PosIdx feeds the per-attr
+            // position side-table.
             uint32_t n = operand;
             Bindings * b = Alloc::allocBindings(n);
             allocStats().attrsetsAllocated++;
             for (uint32_t i = 0; i < n; ++i) {
-                b->entries[i].name = static_cast<SymbolId>(cu->code[ip + i]);
+                SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
+                uint32_t ps = cu->code[ip + 2 * i + 1];
+                b->entries[i].name = nm;
                 b->entries[i].value.mkNull();
+                recordAttrPos(b, nm, ps);
             }
-            ip += n;
+            ip += 2 * n;
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;

@@ -270,11 +270,20 @@ struct Emitter
     }
 
     // -- Attrsets
+    //
+    // Static-attr layout in bytecode: after OP_ATTRS_INIT[n] we emit
+    // 2*n words — `name, pos, name, pos, ...` so the VM can populate
+    // both the Bindings and the per-attr position side-table.  Older
+    // call sites that read just SymbolIds need to bump their `ip` by
+    // 2*n instead of n.
     void emitOne(const ir::AttrSet & e)
     {
         for (auto & en : e.entries) emitVarRef(en.value);
         unit.code.push_back(encode(OP_ATTRS_INIT, static_cast<uint32_t>(e.entries.size())));
-        for (auto & en : e.entries) unit.code.push_back(en.name);
+        for (auto & en : e.entries) {
+            unit.code.push_back(en.name);
+            unit.code.push_back(en.pos);
+        }
     }
     void emitOne(const ir::AttrSetDyn & e)
     {
@@ -284,7 +293,13 @@ struct Emitter
         uint32_t packed = (static_cast<uint32_t>(e.statics.size()) << 12)
                         | (static_cast<uint32_t>(e.dynamics.size()) & 0xFFFu);
         unit.code.push_back(encode(OP_ATTRS_INIT_DYN, packed));
-        for (auto & en : e.statics) unit.code.push_back(en.name);
+        for (auto & en : e.statics) {
+            unit.code.push_back(en.name);
+            unit.code.push_back(en.pos);
+        }
+        // Dynamic-name positions follow the static block, one per
+        // dynamic entry (positions for static names then dyn names).
+        for (auto & en : e.dynamics) unit.code.push_back(en.pos);
     }
     void emitOne(const ir::RecAttrSet & e)
     {
@@ -292,7 +307,10 @@ struct Emitter
         // AST→IR pass (it emits MkThunk wrappers + a synthetic selfVar).
         for (auto & en : e.entries) emitVarRef(en.value);
         unit.code.push_back(encode(OP_ATTRS_REC_INIT, static_cast<uint32_t>(e.entries.size())));
-        for (auto & en : e.entries) unit.code.push_back(en.name);
+        for (auto & en : e.entries) {
+            unit.code.push_back(en.name);
+            unit.code.push_back(en.pos);
+        }
         // Honor __overrides for rec attrsets too.
         unit.code.push_back(encode(OP_APPLY_OVERRIDES));
     }
@@ -340,11 +358,13 @@ struct Emitter
         for (uint32_t slot = 0; slot < n; ++slot)
             entryToSlot[sortedOrder[slot]] = slot;
 
-        // 1. OP_ATTRS_REC_INIT[n] + n sorted SymbolIds: push placeholder
-        //    rec Bindings on operand stack.
+        // 1. OP_ATTRS_REC_INIT[n] + n sorted (SymbolId, PosIdx) pairs:
+        //    push placeholder rec Bindings on operand stack.
         unit.code.push_back(encode(OP_ATTRS_REC_INIT, n));
-        for (uint32_t slot = 0; slot < n; ++slot)
+        for (uint32_t slot = 0; slot < n; ++slot) {
             unit.code.push_back(e.entries[sortedOrder[slot]].name);
+            unit.code.push_back(e.entries[sortedOrder[slot]].pos);
+        }
 
         // 2. Spill the rec_attrs (currently on top of the operand
         //    stack) into a frame slot so each entry's thunk-body
