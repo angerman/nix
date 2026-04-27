@@ -348,12 +348,15 @@ void primThrow(EvalState &, Value * args, Value &)
     throw std::runtime_error(std::string("v3 throw: ") + args[0].payload.str);
 }
 
-void primConcatLists(EvalState &, Value * args, Value & out)
+void primConcatLists(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isList()) typeError("concatLists", "list of lists");
     uint32_t total = 0;
     auto & outer = args[0];
+    // Force each outer element (each should be a list); they're lazy
+    // by default now.
     for (uint32_t i = 0; i < outer.payload.list->size; ++i) {
+        outer.payload.list->elems[i] = forceValue(*state.vm, outer.payload.list->elems[i]);
         const Value & el = outer.payload.list->elems[i];
         if (!el.isList()) typeError("concatLists", "list of lists");
         total += el.payload.list ? el.payload.list->size : 0;
@@ -371,7 +374,7 @@ void primConcatLists(EvalState &, Value * args, Value & out)
     out.payload.list = result;
 }
 
-void primConcatStringsSep(EvalState &, Value * args, Value & out)
+void primConcatStringsSep(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("concatStringsSep", "separator string");
     if (!args[1].isList())   typeError("concatStringsSep", "list of strings");
@@ -380,7 +383,7 @@ void primConcatStringsSep(EvalState &, Value * args, Value & out)
     auto * list = args[1].payload.list;
     for (uint32_t i = 0; list && i < list->size; ++i) {
         if (i > 0) result += sep;
-        const Value & el = list->elems[i];
+        Value el = forceValue(*state.vm, list->elems[i]);
         if (!el.isString()) typeError("concatStringsSep", "list of strings");
         result += el.payload.str;
     }
@@ -802,7 +805,7 @@ void primCatAttrs(EvalState & state, Value * args, Value & out)
     out.payload.list = result;
 }
 
-void primReplaceStrings(EvalState &, Value * args, Value & out)
+void primReplaceStrings(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isList() || !args[1].isList() || !args[2].isString())
         typeError("replaceStrings", "(list, list, string)");
@@ -810,6 +813,15 @@ void primReplaceStrings(EvalState &, Value * args, Value & out)
     auto * tos   = args[1].payload.list;
     if (!froms || !tos || froms->size != tos->size)
         throw std::runtime_error("v3 primop replaceStrings: lists must have equal length");
+    // Force `from` elements upfront — every iteration of the outer
+    // loop reads them, and they're lazy by default.  `to` elements
+    // are forced lazily inside the match branch (matches tree-walker;
+    // unused replacements never fire).
+    for (uint32_t j = 0; j < froms->size; ++j) {
+        froms->elems[j] = forceValue(*state.vm, froms->elems[j]);
+        if (!froms->elems[j].isString())
+            typeError("replaceStrings", "list of strings");
+    }
     std::string s(args[2].payload.str);
     std::string result;
     size_t i = 0;
@@ -817,12 +829,12 @@ void primReplaceStrings(EvalState &, Value * args, Value & out)
         bool matched = false;
         for (uint32_t j = 0; j < froms->size; ++j) {
             const Value & f = froms->elems[j];
-            const Value & t = tos->elems[j];
-            if (!f.isString() || !t.isString())
-                typeError("replaceStrings", "list of strings");
             std::string_view fv(f.payload.str);
             if (fv.empty()) continue;
             if (s.compare(i, fv.size(), fv) == 0) {
+                Value t = forceValue(*state.vm, tos->elems[j]);
+                if (!t.isString())
+                    typeError("replaceStrings", "list of strings");
                 result.append(t.payload.str);
                 i += fv.size();
                 matched = true;

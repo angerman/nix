@@ -523,10 +523,23 @@ struct Lowerer
                 }
             }
 
-            // tryEval needs its arg evaluated lazily (the whole point is
-            // to catch errors raised during forcing).  Wrap the arg in a
-            // MkThunk that defers its evaluation until tryEval forces it.
+            // Per-primop laziness rules: which positional arg indices
+            // should be passed as thunks (or left lazy without forcing)
+            // instead of force-evaluated up-front.
+            //
+            //  - `tryEval x` — x is the whole point of the primop; wrap
+            //    in a thunk so an error during forcing is caught.
+            //  - `foldl' op nul list` — `nul` is not strict; tree-walker
+            //    documents that explicitly.  Pass it lazy so a `throw`
+            //    that the operator never demands doesn't fire.
+            //  - `seq a b` / `deepSeq a b` — `b` is returned untouched;
+            //    only `a` gets forced.
             const bool isTryEval = name == "tryEval";
+            auto isLazyArg = [&](uint32_t idx) -> bool {
+                if (name == "foldl'") return idx == 1;     // nul
+                if (name == "seq" || name == "deepSeq") return idx == 1;
+                return false;
+            };
 
             std::vector<ir::VarId> args;
             args.reserve(po->arity);
@@ -534,6 +547,11 @@ struct Lowerer
             for (uint32_t i = 0; i < po->arity; ++i, ++it) {
                 if (isTryEval) {
                     args.push_back(thunkify(*it));
+                } else if (isLazyArg(i)) {
+                    // Lazy: lower without forcing, and wrap non-trivial
+                    // expressions in a thunk so the primop sees a
+                    // proper lazy value (callers may pass `throw` etc).
+                    args.push_back(thunkifyForAttr(*it));
                 } else {
                     args.push_back(forceVal(lowerExpr(*it)));
                 }
@@ -676,7 +694,11 @@ struct Lowerer
     {
         std::vector<ir::VarId> elems;
         elems.reserve(e->elems.size());
-        for (auto * el : e->elems) elems.push_back(lowerExpr(el));
+        // Lazy list elements — wrap non-trivial element exprs in
+        // thunks so building a list doesn't fire side-effects in
+        // unused entries (matches tree-walker; e.g. `head [42 (throw
+        // "x")]` returns 42 without firing the throw).
+        for (auto * el : e->elems) elems.push_back(thunkifyForAttr(el));
         return addBinding(ir::ListExpr{std::move(elems)});
     }
 
