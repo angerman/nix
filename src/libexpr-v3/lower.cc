@@ -26,6 +26,7 @@
 
 #include "nix/expr/nixexpr.hh"
 #include "nix/expr/symbol-table.hh"
+#include "nix/util/position.hh"
 
 #include <deque>
 #include <functional>
@@ -70,6 +71,7 @@ struct Lowerer
 {
     ir::Module m = ir::makeModule();
     const nix::SymbolTable & symbols;
+    const nix::PosTable * positions = nullptr;
 
     /// Stack of scopes, innermost at the back.
     std::vector<Scope> scopes;
@@ -88,6 +90,8 @@ struct Lowerer
     std::vector<std::pmr::vector<nix::Expr *> *> inheritFromStack;
 
     explicit Lowerer(const nix::SymbolTable & st) : symbols(st) {}
+    Lowerer(const nix::SymbolTable & st, const nix::PosTable & pt)
+        : symbols(st), positions(&pt) {}
 
     ir::SymbolId internSym(nix::Symbol s)
     {
@@ -221,13 +225,56 @@ struct Lowerer
         case nix::Expr::Kind::OpNot:  return lowerNot(static_cast<nix::ExprOpNot *>(e));
         case nix::Expr::Kind::ConcatStrings: return lowerConcatStrings(static_cast<nix::ExprConcatStrings *>(e));
         case nix::Expr::Kind::InheritFrom: return lowerInheritFrom(static_cast<nix::ExprInheritFrom *>(e));
+        case nix::Expr::Kind::Pos:    return lowerPos(static_cast<nix::ExprPos *>(e));
         case nix::Expr::Kind::Unknown:
-        case nix::Expr::Kind::Pos:
         case nix::Expr::Kind::BlackHole:
         default: break;
         }
         // Many node kinds aren't supported yet.  Surface a clear message.
         unsupported(("Kind " + std::to_string(static_cast<int>(e->exprKind))).c_str());
+    }
+
+    /// Build an attrset value `{ file = STR; line = N; column = N; }`
+    /// for `__curPos` and other position-aware primops.
+    ir::VarId lowerPosAttrs(nix::PosIdx posIdx)
+    {
+        if (!positions || !posIdx) {
+            // No PosTable wired or no position info — emit `null`.
+            return addBinding(ir::LitNull{});
+        }
+        auto pos = (*positions)[posIdx];
+        std::string file;
+        if (auto * s = std::get_if<nix::SourcePath>(&pos.origin)) {
+            file = s->path.abs();
+        } else if (std::holds_alternative<nix::Pos::Stdin>(pos.origin)) {
+            file = "<stdin>";
+        } else if (std::holds_alternative<nix::Pos::String>(pos.origin)) {
+            file = "<string>";
+        } else {
+            file = "<unknown>";
+        }
+        ir::VarId fileV   = addBinding(ir::LitString{interpStr(file)});
+        ir::VarId lineV   = addBinding(ir::LitInt{static_cast<int64_t>(pos.line)});
+        ir::VarId columnV = addBinding(ir::LitInt{static_cast<int64_t>(pos.column)});
+        std::vector<ir::AttrSet::Entry> entries;
+        entries.push_back({m.internSymbol("file"),   fileV});
+        entries.push_back({m.internSymbol("line"),   lineV});
+        entries.push_back({m.internSymbol("column"), columnV});
+        return addBinding(ir::AttrSet{std::move(entries)});
+    }
+
+    ir::VarId lowerPos(nix::ExprPos * e)
+    {
+        return lowerPosAttrs(e->pos);
+    }
+
+    /// Stable string pool for runtime-derived strings (positions, etc.).
+    /// Mirrors lowerString's stringPool (deque never invalidates pointers).
+    std::string_view interpStr(const std::string & s)
+    {
+        static std::deque<std::string> pool;
+        pool.emplace_back(s);
+        return pool.back();
     }
 
     ir::VarId lowerInt(nix::ExprInt * e)
@@ -1094,6 +1141,12 @@ struct Lowerer
 ir::Module lowerNixExpr(nix::Expr * e, const nix::SymbolTable & symbols)
 {
     Lowerer L(symbols);
+    return L.run(e);
+}
+
+ir::Module lowerNixExpr(nix::Expr * e, const nix::SymbolTable & symbols, const nix::PosTable & positions)
+{
+    Lowerer L(symbols, positions);
     return L.run(e);
 }
 

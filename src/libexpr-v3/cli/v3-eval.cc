@@ -214,7 +214,7 @@ int main(int argc, char ** argv)
         nix::v3::registerBuiltinPrimOps();
         nix::v3::setNixEvalState(&state);
 
-        auto m = nix::v3::lowerNixExpr(e, state.symbols);
+        auto m = nix::v3::lowerNixExpr(e, state.symbols, state.positions);
         nix::v3::ir::computeFreeVars(m);
         auto cu = nix::v3::compile(m);
         Value r = nix::v3::run(cu);

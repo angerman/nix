@@ -16,6 +16,7 @@
 namespace nix {
 struct Expr;
 class SymbolTable;
+class PosTable;
 }
 
 namespace nix::v3 {
@@ -23,5 +24,9 @@ namespace nix::v3 {
 /// Lower a top-level Nix expression into a fresh v3 IR module.  The
 /// returned module's functions[0] is the entry function.
 ir::Module lowerNixExpr(nix::Expr * e, const nix::SymbolTable & symbols);
+
+/// Variant that takes a PosTable so __curPos / position-aware
+/// constructs can resolve PosIdx into actual file/line/column attrs.
+ir::Module lowerNixExpr(nix::Expr * e, const nix::SymbolTable & symbols, const nix::PosTable & positions);
 
 } // namespace nix::v3

@@ -1609,7 +1609,7 @@ void primImport(EvalState & state, Value * args, Value & out)
     nix::Expr * e = ns.parseExprFromFile(nix::SourcePath(ns.rootFS, nix::CanonPath(path)));
     e->bindVars(ns, ns.staticBaseEnv);
 
-    auto module = lowerNixExpr(e, ns.symbols);
+    auto module = lowerNixExpr(e, ns.symbols, ns.positions);
     nix::v3::ir::computeFreeVars(module);
     cache.cus.push_back(compile(module));
     // Each imported file is its own CompilationUnit; we re-enter the
