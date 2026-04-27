@@ -79,6 +79,13 @@ struct Lowerer
     /// Block we're currently appending bindings into.
     std::vector<ir::BlockId> blockStack;
 
+    /// Stack of inheritFromExprs for the enclosing ExprAttrs / ExprLet
+    /// constructs that have any.  ExprInheritFrom resolves its displ
+    /// against the topmost entry — they never nest in practice (the
+    /// parser only synthesizes them inside an ExprAttrs/ExprLet that
+    /// owns the inheritFromExprs vector), so a simple stack suffices.
+    std::vector<std::pmr::vector<nix::Expr *> *> inheritFromStack;
+
     explicit Lowerer(const nix::SymbolTable & st) : symbols(st) {}
 
     ir::SymbolId internSym(nix::Symbol s)
@@ -206,8 +213,8 @@ struct Lowerer
         case nix::Expr::Kind::OpImpl: return lowerShortCircuit(static_cast<nix::ExprOpImpl*>(e), /*kind*/2);
         case nix::Expr::Kind::OpNot:  return lowerNot(static_cast<nix::ExprOpNot *>(e));
         case nix::Expr::Kind::ConcatStrings: return lowerConcatStrings(static_cast<nix::ExprConcatStrings *>(e));
+        case nix::Expr::Kind::InheritFrom: return lowerInheritFrom(static_cast<nix::ExprInheritFrom *>(e));
         case nix::Expr::Kind::Unknown:
-        case nix::Expr::Kind::InheritFrom:
         case nix::Expr::Kind::Pos:
         case nix::Expr::Kind::BlackHole:
         default: break;
@@ -396,6 +403,23 @@ struct Lowerer
     {
         return addBinding(ir::Not{lowerExpr(e->e)});
     }
+
+    /// ExprInheritFrom — synthesized by the parser to represent the
+    /// `from` part of `inherit (from) name1 name2 ...`.  Each AttrDef
+    /// emitted by such a clause has its def.e set to ExprSelect(this,
+    /// name).  The `displ` field is an index into the enclosing
+    /// ExprAttrs/ExprLet's inheritFromExprs vector — we look it up via
+    /// inheritFromStack which the lowerer maintains while traversing
+    /// ExprAttrs / ExprLet nodes.
+    ir::VarId lowerInheritFrom(nix::ExprInheritFrom * e)
+    {
+        if (inheritFromStack.empty())
+            unsupported("ExprInheritFrom outside of an inheritFromExprs scope");
+        auto * fromExprs = inheritFromStack.back();
+        if (!fromExprs || e->displ >= fromExprs->size())
+            unsupported("ExprInheritFrom: displ out of range");
+        return lowerExpr((*fromExprs)[e->displ]);
+    }
     ir::VarId lowerConcatStrings(nix::ExprConcatStrings * e)
     {
         std::vector<ir::VarId> parts;
@@ -452,16 +476,24 @@ struct Lowerer
         if (e->dynamicAttrs && !e->dynamicAttrs->empty())
             unsupported("attrset with dynamic attrs");
 
-        bool hasInheritFrom = e->inheritFromExprs && !e->inheritFromExprs->empty();
-
-        if (e->recursive || hasInheritFrom) {
+        if (e->recursive) {
             return lowerLetRec(
                 e->attrs.value(),
-                hasInheritFrom ? e->inheritFromExprs.get() : nullptr,
-                /*isRec=*/e->recursive,
+                e->inheritFromExprs ? e->inheritFromExprs.get() : nullptr,
+                /*isRec=*/true,
                 /*hasBody=*/false, /*body=*/nullptr);
         }
 
+        // Non-rec attrset.  All entries (Plain / Inherited / InheritedFrom)
+        // are lowered eagerly in the parent scope — there is no rec env.
+        // InheritedFrom AttrDefs have def.e = ExprSelect(ExprInheritFrom,
+        // name); lowerExpr handles ExprInheritFrom by looking up the
+        // current inheritFromStack.
+        bool pushedInheritFrom = false;
+        if (e->inheritFromExprs) {
+            inheritFromStack.push_back(e->inheritFromExprs.get());
+            pushedInheritFrom = true;
+        }
         std::vector<ir::AttrSet::Entry> entries;
         for (auto & kv : *e->attrs) {
             const auto & sym = kv.first;
@@ -469,6 +501,7 @@ struct Lowerer
             ir::VarId vv = lowerExpr(def.e);
             entries.push_back({internSym(sym), vv});
         }
+        if (pushedInheritFrom) inheritFromStack.pop_back();
         return addBinding(ir::AttrSet{std::move(entries)});
     }
 
@@ -523,48 +556,42 @@ struct Lowerer
             recScope.byName.emplace(std::string(symbols[p.sym]), ir::kInvalid);
         }
 
+        // Push the inheritFromExprs onto the stack so any ExprInheritFrom
+        // encountered while lowering def.e resolves correctly.
+        bool pushedInheritFrom = false;
+        if (inheritFromExprs) {
+            inheritFromStack.push_back(inheritFromExprs);
+            pushedInheritFrom = true;
+        }
+
         for (auto & p : pending) {
             funcStack.push_back(p.funcIdx);
             blockStack.push_back(p.entryBlock);
             switch (p.kind) {
-            case nix::ExprAttrs::AttrDef::Kind::Plain: {
-                scopes.push_back(recScope);
+            case nix::ExprAttrs::AttrDef::Kind::Plain:
+            case nix::ExprAttrs::AttrDef::Kind::InheritedFrom: {
+                // Plain: bound in newEnv (rec scope).
+                // InheritedFrom: def.e = ExprSelect(ExprInheritFrom,
+                // name); the from-expr is bound in newEnv (rec) when
+                // isRec=true, else in env.
+                if (isRec) scopes.push_back(recScope);
                 ir::VarId rv = lowerExpr(p.defE);
                 setReturn(rv);
-                scopes.pop_back();
+                if (isRec) scopes.pop_back();
                 break;
             }
             case nix::ExprAttrs::AttrDef::Kind::Inherited: {
+                // def.e = ExprVar bound in env (parent), no rec push.
                 ir::VarId rv = lowerExpr(p.defE);
                 setReturn(rv);
-                break;
-            }
-            case nix::ExprAttrs::AttrDef::Kind::InheritedFrom: {
-                if (!inheritFromExprs)
-                    unsupported("InheritedFrom without inheritFromExprs");
-                auto * eif = static_cast<nix::ExprInheritFrom *>(p.defE);
-                uint32_t fromIdx = eif->displ;
-                if (fromIdx >= inheritFromExprs->size())
-                    unsupported("InheritedFrom: displ out of range");
-                nix::Expr * fromE = (*inheritFromExprs)[fromIdx];
-                // For ExprLet and `rec { }` (isRec=true), the from-expr
-                // was bindVars'd in newEnv (the rec scope) — push the
-                // rec scope so its level/displ resolve correctly.  For
-                // non-rec attrsets the from-expr is bound in env
-                // (parent), so we lower it with only the surrounding
-                // scopes visible.
-                if (isRec) scopes.push_back(recScope);
-                ir::VarId from = lowerExpr(fromE);
-                if (isRec) scopes.pop_back();
-                ir::VarId selV = addBinding(ir::AttrSelect{from, internSym(p.sym)});
-                ir::VarId forced = addBinding(ir::Force{selV});
-                setReturn(forced);
                 break;
             }
             }
             blockStack.pop_back();
             funcStack.pop_back();
         }
+
+        if (pushedInheritFrom) inheritFromStack.pop_back();
 
         ir::LetRec letRec;
         letRec.recVar = recVar;
