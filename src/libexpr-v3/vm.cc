@@ -726,6 +726,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // cu when the closure was made before cu-tracking landed.
             const CompilationUnit * calleeCu = callee->cu ? callee->cu : cu;
 
+            // Formals validation: when a lambda has formals and no
+            // ellipsis, every key in the param attrset must match a
+            // declared formal name.  Tree-walker raises with the offending
+            // attribute name; we mirror that message format.
+            if (desc->hasFormals && !desc->ellipsis) {
+                Value forcedArg = forceValue(vm, arg);
+                if (forcedArg.isAttrs() && forcedArg.payload.bindings) {
+                    const Bindings * b = forcedArg.payload.bindings;
+                    for (uint32_t i = 0; i < b->size; ++i) {
+                        SymbolId name = b->entries[i].name;
+                        bool found = false;
+                        for (auto & f : desc->formals)
+                            if (f.name == name) { found = true; break; }
+                        if (!found) {
+                            const auto & tbl = ir::globalSymbolTable();
+                            std::string nm = (name < tbl.size()) ? tbl[name] : "?";
+                            throw std::runtime_error("v3 OP_CALL: function "
+                                "called with unexpected argument '" + nm + "'");
+                        }
+                    }
+                }
+                arg = forcedArg;
+            }
+
             vm.frames.back().ip = ip;
 
             size_t newBase = vm.valueStack.size();

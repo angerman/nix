@@ -128,6 +128,7 @@ struct LambdaDescriptor
     uint16_t nLocals;       // stack slots needed in the body's frame
     uint8_t  arity;         // 1 for simple `x: ...`; >1 for currying (later)
     uint8_t  hasFormals;    // 0 = simple arg, 1 = formals attrset
+    uint8_t  ellipsis;      // formals with `...` accept extra args; otherwise reject
 
     /// Formal parameters (`{a, b ? def}: body`).  Each entry is
     /// (name SymbolId, hasDefault, posHandle).  posHandle is an index

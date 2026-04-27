@@ -543,6 +543,7 @@ struct Emitter
             .nLocals        = fc.nLocals,
             .arity          = static_cast<uint8_t>(f.argName != ir::kInvalidSymbol ? 1 : (f.hasFormals ? 1 : 0)),
             .hasFormals     = static_cast<uint8_t>(f.hasFormals ? 1 : 0),
+            .ellipsis       = static_cast<uint8_t>(f.ellipsis ? 1 : 0),
             .formals        = {},
         };
         if (f.hasFormals) {
