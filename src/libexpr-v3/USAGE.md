@@ -73,26 +73,68 @@ Attrsets / lists / select:
   - `attrs ? a` (single-element hasAttr)
   - List literals; `++` concat
 
-Primops (registered in v3's own registry):
+Primops (81 registered in v3's own registry):
 
-  - `length`, `head`, `tail`, `elemAt`
-  - `attrNames`, `attrValues`
-  - `isAttrs`/`isList`/`isFunction`/`isString`/`isInt`/`isBool`/
-    `isNull`/`isFloat`/`isPath`
-  - `toString`, `typeOf`, `stringLength`
-  - `add`, `sub`, `mul`, `div`, `lessThan`, `throw`
-  - `concatLists`, `concatStringsSep`, `substring`
-  - `map`, `filter`, `foldl'`, `genList`, `all`, `any`
-    (these re-enter the VM via `callClosure` to invoke their function
-    arg on each element)
-  - All accessible as `__name` (parser uses these for `*`, `-`, etc.)
-    AND `builtins.name`.
+Lists / collections:
+  length, head, tail, elemAt, concatLists, concatMap, partition, sort,
+  map, filter, foldl', genList, all, any, elem, splitString,
+  concatStringsSep
+
+Attrsets:
+  attrNames, attrValues, getAttr, hasAttr, removeAttrs, intersectAttrs,
+  mapAttrs, listToAttrs, catAttrs, groupBy, genericClosure,
+  functionArgs
+
+Type predicates / coercion:
+  isAttrs, isList, isFunction, isString, isInt, isBool, isNull,
+  isFloat, isPath, typeOf, toString, stringLength, parseInt
+
+Arithmetic / numeric:
+  add, sub, mul, div, lessThan, bitAnd, bitOr, bitXor, floor, ceil,
+  compareVersions, parseDrvName
+
+Strings:
+  substring, replaceStrings, match, split, hashString (FNV stub)
+
+I/O / files:
+  readFile, readDir, pathExists, baseNameOf, dirOf, import
+
+JSON:
+  toJSON, fromJSON
+
+Evaluation control:
+  throw, abort, seq, deepSeq, tryEval
+
+System info (0-arity):
+  currentSystem, currentTime, nixVersion, getEnv
+
+Internals (parser desugaring):
+  __add, __sub, __mul, __div, __lessThan
 
 The lowerer detects `builtins.<name>` and `__<name>` patterns at the
 ExprCall callee site and emits a direct `OP_CALL_PRIMOP` (no Closure
-allocation, no PrimOpApp).
+allocation, no PrimOpApp).  `builtins.<name>` for arity-0 primops is
+auto-invoked at access time; for higher arity it produces a
+Tag::PrimOp value that participates in PrimOpApp partial application.
 
 ## Known limitations
+
+Deferred primops (~13 remaining vs tree-walker):
+  - Store / derivation: derivation, derivationStrict, exec, filterSource,
+    importNative, outputOf, path, toFile, fetchurl, fetchTarball
+  - Real crypto hashes: hashString currently uses an FNV-1a 64-bit stub;
+    md5/sha1/sha256/sha512 need libcrypto wiring
+  - findFile (NIX_PATH lookup)
+  - addErrorContext (mostly internal)
+  - hashFile, convertHash, readFileType
+
+Coercion in interpolation: only int/float/bool/null/string/path can
+appear in `"${...}"`; attrset-with-`__toString` and lists need
+explicit conversion.
+
+Performance: v3 is roughly on par with the tree-walker (within ~10%)
+for compute-bound benchmarks.  Bigger wins are queued (computed-goto
+dispatch, Bindings polymorphism, NaN-boxing, etc).
 
 
 
