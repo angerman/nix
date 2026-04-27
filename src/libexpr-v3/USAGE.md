@@ -187,6 +187,9 @@ faster on attrset-heavy workloads.
           tree-walker 0.24s user, v3 0.23s user  (matched)
   pkgs.hello.meta.description:
           tree-walker 0.23s user, v3 0.23s user  (matched)
+  cardano-node flake evaluation (warm cache):
+          tree-walker 0.43s user / 3.65s real,
+                v3 0.43s user / 3.61s real  (matched)
 
 Tail-call optimization: 100,000 recursive tail calls
 (`let f = n: if n == 100000 then n else f (n + 1); in f 0`) now
