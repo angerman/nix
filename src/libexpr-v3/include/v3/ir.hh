@@ -312,17 +312,22 @@ struct Function {
 // Module
 // ---------------------------------------------------------------------------
 
+/// Global v3 symbol table — shared across all Modules / CompilationUnits
+/// in a process so that SymbolIds are stable across imports.  Lazily
+/// populated by Module::internSymbol via globalInternSymbol().
+const std::vector<std::string> & globalSymbolTable();
+SymbolId globalInternSymbol(std::string_view s);
+
 struct Module {
     /// All blocks; blocks[0] is unused (kInvalidBlock sentinel).
     std::vector<Block> blocks;
     /// All functions; functions[0] is the top-level entry.
     std::vector<Function> functions;
 
-    /// Symbol table — interned strings indexed by SymbolId.
-    /// symbols[0] is kInvalidSymbol (empty string).
+    /// Local view into the global symbol table; kept for diagnostics.
+    /// internSymbol returns ids from the global table directly so they
+    /// remain stable across imports/CUs.
     std::vector<std::string> symbols;
-    /// Reverse map for interning.
-    std::unordered_map<std::string, SymbolId> symbolIndex;
 
     VarId   nextVar   = 1;
     BlockId nextBlock = 1;

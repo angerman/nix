@@ -519,7 +519,9 @@ struct Emitter
     {
         // Mirror the IR symbol table into the CompilationUnit so the VM
         // can use SymbolId at runtime without round-tripping to strings.
-        unit.symbolTable = m.symbols;
+        // Copy the global symbol table so SymbolIds in this CU map to
+        // the same names that any other CU in the process uses.
+        unit.symbolTable = ir::globalSymbolTable();
 
         // Emit inner functions first so their descriptors and code are
         // available before the top-level (which references them via

@@ -27,16 +27,34 @@ namespace nix::v3 {
 
 struct VMState;
 
-/// Placeholder EvalState — the bring-up primops don't need any of its
-/// fields, but we want a stable type for the function-pointer signature.
+/// Forward decl for the (optional) nix-side EvalState pointer used by
+/// `builtins.import` and similar primops that need to load+parse files.
+} // namespace nix::v3
+namespace nix { class EvalState; }
+namespace nix::v3 {
+
+/// Placeholder EvalState — most primops don't need any of its fields,
+/// but we want a stable type for the function-pointer signature.
 ///
 /// `vm` is set by the dispatch loop just before invoking a primop, and
-/// can be used by callback primops (map, filter, foldl', genList) to
+/// is used by callback primops (map, filter, foldl', genList) to
 /// re-enter the VM via callClosure().
+///
+/// `nixEvalState` is set by the integrating CLI (v3-eval) when v3 is
+/// running on top of the nix parser; primops like `import` use it to
+/// parse files / run bindVars on the host evaluator's symbol table.
+/// Null when v3 runs standalone.
 struct EvalState
 {
     VMState * vm = nullptr;
+    nix::EvalState * nixEvalState = nullptr;
 };
+
+/// Set the thread-local nix::EvalState that primop dispatch will inject
+/// into the v3 EvalState passed to each primop fn.  v3-eval calls this
+/// once at startup.
+void setNixEvalState(nix::EvalState * st);
+nix::EvalState * getNixEvalState();
 
 /// Apply a closure (or single-arg primop) to one argument and return
 /// the result, by re-entering the VM dispatch loop on the same VMState.

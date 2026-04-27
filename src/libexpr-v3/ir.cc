@@ -36,21 +36,61 @@ BlockId Module::freshBlock()
     return id;
 }
 
+// ---------------------------------------------------------------------------
+// Global symbol table (process-wide).  internSymbol always goes through
+// it so SymbolIds are consistent across imports / multiple CUs.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct GlobalSymTab
+{
+    std::vector<std::string> table;
+    std::unordered_map<std::string, SymbolId> index;
+    GlobalSymTab() {
+        // Reserve slot 0 for the kInvalidSymbol sentinel (empty string).
+        table.emplace_back("");
+        index.emplace("", 0u);
+    }
+};
+
+GlobalSymTab & gst()
+{
+    static GlobalSymTab t;
+    return t;
+}
+
+} // namespace
+
+const std::vector<std::string> & globalSymbolTable() { return gst().table; }
+
+SymbolId globalInternSymbol(std::string_view s)
+{
+    auto & t = gst();
+    auto it = t.index.find(std::string(s));
+    if (it != t.index.end()) return it->second;
+    SymbolId id = static_cast<SymbolId>(t.table.size());
+    t.table.emplace_back(s);
+    t.index.emplace(t.table.back(), id);
+    return id;
+}
+
 SymbolId Module::internSymbol(std::string_view s)
 {
-    auto it = symbolIndex.find(std::string(s));
-    if (it != symbolIndex.end())
-        return it->second;
-    SymbolId id = static_cast<SymbolId>(symbols.size());
-    symbols.emplace_back(s);
-    symbolIndex.emplace(symbols.back(), id);
+    SymbolId id = globalInternSymbol(s);
+    // Mirror into the per-module symbols vector for diagnostics.  Grow
+    // sparsely.
+    if (symbols.size() <= id) symbols.resize(id + 1);
+    if (symbols[id].empty() && !s.empty()) symbols[id] = std::string(s);
     return id;
 }
 
 std::string_view Module::symbolName(SymbolId id) const
 {
-    if (id >= symbols.size()) return "";
-    return symbols[id];
+    if (id < symbols.size() && !symbols[id].empty()) return symbols[id];
+    auto & g = globalSymbolTable();
+    if (id < g.size()) return g[id];
+    return "";
 }
 
 // ---------------------------------------------------------------------------

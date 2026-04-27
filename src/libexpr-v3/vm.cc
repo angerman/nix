@@ -779,9 +779,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // into the VM via callClosure().
             vm.frames.back().ip = ip;
             // Wire the EvalState to this VM so callback primops can
-            // re-enter the dispatcher.
+            // re-enter the dispatcher; also propagate the (optional)
+            // nix EvalState so primops like `import` can parse files.
             EvalState state;
             state.vm = &vm;
+            state.nixEvalState = getNixEvalState();
             Value out;
             po->fn(state, args, out);
             push(vm, out);
@@ -889,7 +891,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         const PrimOp * po = fun.payload.primop;
         if (po->arity == 1) {
             Value buf[1] = {arg};
-            EvalState state; state.vm = &vm;
+            EvalState state; state.vm = &vm; state.nixEvalState = getNixEvalState();
             Value out;
             po->fn(state, buf, out);
             return out;

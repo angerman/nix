@@ -22,7 +22,12 @@
 
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/lower.hh"
 #include "v3/vm.hh"
+
+#include "nix/expr/eval.hh"
+#include "nix/expr/eval-settings.hh"
+#include "nix/util/canon-path.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -46,6 +51,8 @@ std::unordered_map<std::string, PrimOp> & registry()
     static std::unordered_map<std::string, PrimOp> r;
     return r;
 }
+
+thread_local nix::EvalState * tlNixEvalState = nullptr;
 
 std::mutex & registryMutex()
 {
@@ -899,6 +906,30 @@ void primSplitString(EvalState &, Value * args, Value & out)
     out.payload.list = lv;
 }
 
+/// builtins.import path -- read the file at `path`, parse, lower, run.
+/// Returns the resulting v3 Value.  Requires state.nixEvalState to be
+/// set (the host EvalState providing parser + symbol table).
+void primImport(EvalState & state, Value * args, Value & out)
+{
+    if (!state.nixEvalState)
+        throw std::runtime_error("v3 primop import: no nix EvalState wired (run via v3-eval)");
+    std::string path;
+    if (args[0].isString()) path = args[0].payload.str;
+    else if (args[0].isPath()) path = args[0].payload.path;
+    else typeError("import", "string or path");
+
+    auto & ns = *state.nixEvalState;
+    nix::Expr * e = ns.parseExprFromFile(nix::SourcePath(ns.rootFS, nix::CanonPath(path)));
+    e->bindVars(ns, ns.staticBaseEnv);
+
+    auto module = lowerNixExpr(e, ns.symbols);
+    nix::v3::ir::computeFreeVars(module);
+    auto cu = compile(module);
+    // Each imported file is its own CompilationUnit; we re-enter the
+    // VM to run it with its own top-level frame.
+    out = run(cu);
+}
+
 /// builtins.functionArgs lam → { name = false; ... } where the bool
 /// indicates whether the formal has a default value.  For simple
 /// lambdas (no formals) returns an empty attrset.
@@ -1169,6 +1200,9 @@ const PrimOp * findPrimOp(std::string_view name)
     return it == registry().end() ? nullptr : &it->second;
 }
 
+void setNixEvalState(nix::EvalState * st) { tlNixEvalState = st; }
+nix::EvalState * getNixEvalState() { return tlNixEvalState; }
+
 void registerPrimOp(const PrimOp & op)
 {
     std::lock_guard<std::mutex> g(registryMutex());
@@ -1252,6 +1286,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"fromJSON",           1, primFromJSON});
         registerPrimOp({"toJSON",             1, primToJSON});
         registerPrimOp({"functionArgs",       1, primFunctionArgs});
+        registerPrimOp({"import",             1, primImport});
     });
 }
 

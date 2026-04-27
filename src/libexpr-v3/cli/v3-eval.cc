@@ -80,6 +80,7 @@ int main(int argc, char ** argv)
         e->bindVars(state, state.staticBaseEnv);
 
         nix::v3::registerBuiltinPrimOps();
+        nix::v3::setNixEvalState(&state);
         auto m = nix::v3::lowerNixExpr(e, state.symbols);
         nix::v3::ir::computeFreeVars(m);
         auto cu = nix::v3::compile(m);
