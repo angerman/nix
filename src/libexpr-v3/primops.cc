@@ -722,6 +722,105 @@ void primElem(EvalState &, Value * args, Value & out)
     out = found ? Value::vTrue : Value::vFalse;
 }
 
+void primGetAttr(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("getAttr", "string");
+    if (!args[1].isAttrs())  typeError("getAttr", "attrset");
+    SymbolId k = vmIntern(state, args[0].payload.str);
+    auto * b = args[1].payload.bindings;
+    if (!b) throw std::runtime_error("v3 primop getAttr: attribute not found");
+    const Value * v = b->lookup(k);
+    if (!v) throw std::runtime_error("v3 primop getAttr: attribute not found");
+    out = *v;
+}
+
+void primHasAttr(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("hasAttr", "string");
+    if (!args[1].isAttrs())  typeError("hasAttr", "attrset");
+    SymbolId k = vmIntern(state, args[0].payload.str);
+    auto * b = args[1].payload.bindings;
+    out = (b && b->has(k)) ? Value::vTrue : Value::vFalse;
+}
+
+void primCatAttrs(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("catAttrs", "string");
+    if (!args[1].isList())   typeError("catAttrs", "list");
+    SymbolId k = vmIntern(state, args[0].payload.str);
+    auto * lst = args[1].payload.list;
+    std::vector<Value> kept;
+    if (lst) {
+        for (uint32_t i = 0; i < lst->size; ++i) {
+            const Value & el = lst->elems[i];
+            if (!el.isAttrs() || !el.payload.bindings) continue;
+            const Value * v = el.payload.bindings->lookup(k);
+            if (v) kept.push_back(*v);
+        }
+    }
+    ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
+    allocStats().listsAllocated++;
+    for (size_t i = 0; i < kept.size(); ++i) result->elems[i] = kept[i];
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = result;
+}
+
+void primReplaceStrings(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isList() || !args[1].isList() || !args[2].isString())
+        typeError("replaceStrings", "(list, list, string)");
+    auto * froms = args[0].payload.list;
+    auto * tos   = args[1].payload.list;
+    if (!froms || !tos || froms->size != tos->size)
+        throw std::runtime_error("v3 primop replaceStrings: lists must have equal length");
+    std::string s(args[2].payload.str);
+    std::string result;
+    size_t i = 0;
+    while (i < s.size()) {
+        bool matched = false;
+        for (uint32_t j = 0; j < froms->size; ++j) {
+            const Value & f = froms->elems[j];
+            const Value & t = tos->elems[j];
+            if (!f.isString() || !t.isString())
+                typeError("replaceStrings", "list of strings");
+            std::string_view fv(f.payload.str);
+            if (fv.empty()) continue;
+            if (s.compare(i, fv.size(), fv) == 0) {
+                result.append(t.payload.str);
+                i += fv.size();
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) { result.push_back(s[i]); ++i; }
+    }
+    out = mkStringValueOwned(result);
+}
+
+void primAbort(EvalState &, Value * args, Value &)
+{
+    if (!args[0].isString()) typeError("abort", "string");
+    throw std::runtime_error(std::string("v3 abort: ") + args[0].payload.str);
+}
+
+void primSeq(EvalState &, Value * args, Value & out)
+{
+    // seq: forces first arg, returns second.  Force already happened in
+    // the caller's strict context (Force inserted by lowerExpr); we
+    // just return args[1] here.  (For lazy semantics this would matter
+    // more, but our v3 currently uses strict eval almost everywhere.)
+    (void)args;
+    out = args[1];
+}
+
+void primDeepSeq(EvalState &, Value * args, Value & out)
+{
+    // Same as seq for now (full deep traversal would touch every
+    // thunk in the structure).
+    (void)args;
+    out = args[1];
+}
+
 void primLessThan(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
@@ -810,6 +909,13 @@ void registerBuiltinPrimOps()
         registerPrimOp({"intersectAttrs",     2, primIntersectAttrs});
         registerPrimOp({"mapAttrs",           2, primMapAttrs});
         registerPrimOp({"elem",               2, primElem});
+        registerPrimOp({"getAttr",            2, primGetAttr});
+        registerPrimOp({"hasAttr",            2, primHasAttr});
+        registerPrimOp({"catAttrs",           2, primCatAttrs});
+        registerPrimOp({"replaceStrings",     3, primReplaceStrings});
+        registerPrimOp({"abort",              1, primAbort});
+        registerPrimOp({"seq",                2, primSeq});
+        registerPrimOp({"deepSeq",            2, primDeepSeq});
     });
 }
 
