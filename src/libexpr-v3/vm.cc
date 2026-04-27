@@ -398,10 +398,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // (notably tryEval / inherit-from temp slots) write to a
             // slot that wasn't reserved by the function's nLocals
             // count — see eval-okay-tryeval-failed-thunk-reeval.
-            Value v = pop(vm);
-            while (stackBase + operand >= vm.valueStack.size())
-                vm.valueStack.push_back(Value{});
-            vm.valueStack[stackBase + operand] = v;
+            // Fast path: slot is already in range — just pop+store, no grow.
+            const size_t idx = stackBase + operand;
+            if (__builtin_expect(idx < vm.valueStack.size() - 1, 1)) {
+                vm.valueStack[idx] = vm.valueStack.back();
+                vm.valueStack.pop_back();
+            } else {
+                Value v = pop(vm);
+                while (idx >= vm.valueStack.size())
+                    vm.valueStack.push_back(Value{});
+                vm.valueStack[idx] = v;
+            }
             break;
         }
         case OP_GET_UPVALUE: {
