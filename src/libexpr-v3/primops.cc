@@ -912,6 +912,62 @@ void primSplitString(EvalState &, Value * args, Value & out)
     out.payload.list = lv;
 }
 
+/// builtins.genericClosure { startSet, operator } -- BFS closure of
+/// startSet under operator.  Items are deduplicated by their "key" attr.
+void primGenericClosure(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isAttrs() || !args[0].payload.bindings)
+        typeError("genericClosure", "attrset");
+    SymbolId sStart = vmIntern(state, "startSet");
+    SymbolId sOp    = vmIntern(state, "operator");
+    SymbolId sKey   = vmIntern(state, "key");
+    const Value * startV = args[0].payload.bindings->lookup(sStart);
+    const Value * opV    = args[0].payload.bindings->lookup(sOp);
+    if (!startV || !opV)
+        typeError("genericClosure", "{ startSet, operator }");
+    if (!startV->isList()) typeError("genericClosure", "startSet must be a list");
+
+    // Process queue: BFS.  workQueue is the items to process; result is
+    // accumulated as we go.  seen[key.toString()] = true.
+    std::vector<Value> result;
+    std::vector<Value> work;
+    if (startV->payload.list) {
+        for (uint32_t i = 0; i < startV->payload.list->size; ++i)
+            work.push_back(startV->payload.list->elems[i]);
+    }
+    std::unordered_set<std::string> seen;
+
+    auto keyOf = [&](Value & it) -> std::string {
+        if (!it.isAttrs() || !it.payload.bindings)
+            throw std::runtime_error("v3 primop genericClosure: items must be attrsets with a 'key' attr");
+        const Value * k = it.payload.bindings->lookup(sKey);
+        if (!k) throw std::runtime_error("v3 primop genericClosure: item missing 'key' attr");
+        if (k->isString()) return std::string(k->payload.str);
+        if (k->isInt())    return std::to_string(k->payload.i);
+        throw std::runtime_error("v3 primop genericClosure: 'key' must be string or int");
+    };
+
+    while (!work.empty()) {
+        Value it = work.back(); work.pop_back();
+        std::string key = keyOf(it);
+        if (!seen.insert(key).second) continue;
+        result.push_back(it);
+        Value next = callClosure(*state.vm, *opV, it);
+        if (!next.isList())
+            throw std::runtime_error("v3 primop genericClosure: operator must return a list");
+        if (next.payload.list) {
+            for (uint32_t i = 0; i < next.payload.list->size; ++i)
+                work.push_back(next.payload.list->elems[i]);
+        }
+    }
+
+    ListVec * lv = Alloc::allocList(static_cast<uint32_t>(result.size()));
+    allocStats().listsAllocated++;
+    for (size_t i = 0; i < result.size(); ++i) lv->elems[i] = result[i];
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = lv;
+}
+
 /// builtins.match regex string -> list of captures or null on no-match.
 /// Supports the standard regex syntax via std::regex (POSIX-ish).
 void primMatch(EvalState &, Value * args, Value & out)
@@ -1539,6 +1595,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"currentSystem",      0, primCurrentSystem});
         registerPrimOp({"currentTime",        0, primCurrentTime});
         registerPrimOp({"nixVersion",         0, primNixVersion});
+        registerPrimOp({"genericClosure",     1, primGenericClosure});
     });
 }
 
