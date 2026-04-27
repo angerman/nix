@@ -151,11 +151,17 @@ computed-goto dispatch, Bindings polymorphism, etc).
 ## Test status
 
 The official `tests/functional/lang/eval-okay-*.nix` lang suite:
-**105 / 143 passing** (73%).  Remaining failures are concentrated in:
-  - 5 tests using `derivation` / store primops
-  - 3 tests using rec attrsets with dynamic attrs
-  - 2 tests using mutually-circular formal defaults / scope edge cases
-  - Tests using missing primops (scopedImport, __findFile, __curPos)
+**116 / 143 passing** (81%).  Remaining failures are concentrated in:
+  - flake / store primops not yet wired (parseFlakeRef,
+    flakeRefToString, builtins.path with `path = ./.`, fromTOML,
+    toxml/toxml2)
+  - rec attrsets with dynamic attr names (3 tests)
+  - position tracking primops (`__curPos`, `unsafeGetAttrPos`)
+  - scopedImport, __findFile, NIX_PATH lookup (`<x>` syntax)
+  - tests that need a real `derivation` definition (delayed-with,
+    eq-derivations, context*) — v3 aliases `derivation` to
+    `derivationStrict` as a stub
+  - `--xml` output format (eval-okay-xml, eval-okay-autoargs)
 
 The 77-case v3-vs-tree-walker regression suite at
 `src/libexpr-v3/test/run-v3-tests.sh` is fully passing
