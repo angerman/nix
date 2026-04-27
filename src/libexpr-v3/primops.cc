@@ -22,6 +22,7 @@
 
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/vm.hh"
 
 #include <algorithm>
 #include <cstring>
@@ -323,6 +324,116 @@ void primSubstring(EvalState &, Value * args, Value & out)
     out = mkStringValueOwned(std::string(src.substr(start, actualLen)));
 }
 
+void primMap(EvalState & state, Value * args, Value & out)
+{
+    if (!args[1].isList()) typeError("map", "list");
+    auto * src = args[1].payload.list;
+    if (!src || src->size == 0) {
+        out.tag_payload = static_cast<uint64_t>(Tag::List);
+        out.payload.list = Alloc::allocList(0);
+        allocStats().listsAllocated++;
+        return;
+    }
+    Value fun = args[0];
+    ListVec * result = Alloc::allocList(src->size);
+    allocStats().listsAllocated++;
+    for (uint32_t i = 0; i < src->size; ++i) {
+        result->elems[i] = callClosure(*state.vm, fun, src->elems[i]);
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = result;
+}
+
+void primFilter(EvalState & state, Value * args, Value & out)
+{
+    if (!args[1].isList()) typeError("filter", "list");
+    auto * src = args[1].payload.list;
+    if (!src || src->size == 0) {
+        out.tag_payload = static_cast<uint64_t>(Tag::List);
+        out.payload.list = Alloc::allocList(0);
+        allocStats().listsAllocated++;
+        return;
+    }
+    Value pred = args[0];
+    std::vector<Value> kept;
+    kept.reserve(src->size);
+    for (uint32_t i = 0; i < src->size; ++i) {
+        Value r = callClosure(*state.vm, pred, src->elems[i]);
+        if (!r.isBool()) typeError("filter", "predicate returning bool");
+        if (r.payload.i == 1) kept.push_back(src->elems[i]);
+    }
+    ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
+    allocStats().listsAllocated++;
+    for (size_t i = 0; i < kept.size(); ++i) result->elems[i] = kept[i];
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = result;
+}
+
+void primFoldl(EvalState & state, Value * args, Value & out)
+{
+    // foldl' op nul list  —  strict left fold
+    if (!args[2].isList()) typeError("foldl'", "list");
+    Value op = args[0];
+    Value acc = args[1];
+    auto * src = args[2].payload.list;
+    if (src) {
+        for (uint32_t i = 0; i < src->size; ++i) {
+            // Curried: op acc elem
+            Value step1 = callClosure(*state.vm, op, acc);
+            acc = callClosure(*state.vm, step1, src->elems[i]);
+        }
+    }
+    out = acc;
+}
+
+void primGenList(EvalState & state, Value * args, Value & out)
+{
+    if (!args[1].isInt()) typeError("genList", "int length");
+    int64_t n = args[1].payload.i;
+    if (n < 0) throw std::runtime_error("v3 primop genList: negative length");
+    Value gen = args[0];
+    ListVec * result = Alloc::allocList(static_cast<uint32_t>(n));
+    allocStats().listsAllocated++;
+    for (int64_t i = 0; i < n; ++i) {
+        Value idx; idx.mkInt(i);
+        result->elems[i] = callClosure(*state.vm, gen, idx);
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = result;
+}
+
+void primAll(EvalState & state, Value * args, Value & out)
+{
+    if (!args[1].isList()) typeError("all", "list");
+    auto * src = args[1].payload.list;
+    Value pred = args[0];
+    bool all = true;
+    if (src) {
+        for (uint32_t i = 0; i < src->size; ++i) {
+            Value r = callClosure(*state.vm, pred, src->elems[i]);
+            if (!r.isBool()) typeError("all", "bool from predicate");
+            if (r.payload.i == 0) { all = false; break; }
+        }
+    }
+    out = all ? Value::vTrue : Value::vFalse;
+}
+
+void primAny(EvalState & state, Value * args, Value & out)
+{
+    if (!args[1].isList()) typeError("any", "list");
+    auto * src = args[1].payload.list;
+    Value pred = args[0];
+    bool any = false;
+    if (src) {
+        for (uint32_t i = 0; i < src->size; ++i) {
+            Value r = callClosure(*state.vm, pred, src->elems[i]);
+            if (!r.isBool()) typeError("any", "bool from predicate");
+            if (r.payload.i == 1) { any = true; break; }
+        }
+    }
+    out = any ? Value::vTrue : Value::vFalse;
+}
+
 void primLessThan(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
@@ -395,6 +506,13 @@ void registerBuiltinPrimOps()
         registerPrimOp({"concatLists",        1, primConcatLists});
         registerPrimOp({"concatStringsSep",   2, primConcatStringsSep});
         registerPrimOp({"substring",          3, primSubstring});
+        // Higher-order callback primops (re-enter the VM via callClosure).
+        registerPrimOp({"map",                2, primMap});
+        registerPrimOp({"filter",             2, primFilter});
+        registerPrimOp({"foldl'",             3, primFoldl});
+        registerPrimOp({"genList",            2, primGenList});
+        registerPrimOp({"all",                2, primAll});
+        registerPrimOp({"any",                2, primAny});
     });
 }
 

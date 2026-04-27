@@ -25,14 +25,23 @@
 
 namespace nix::v3 {
 
+struct VMState;
+
 /// Placeholder EvalState — the bring-up primops don't need any of its
 /// fields, but we want a stable type for the function-pointer signature.
-/// As we add primops that need a symbol table, file loader, etc., this
-/// fills out.
+///
+/// `vm` is set by the dispatch loop just before invoking a primop, and
+/// can be used by callback primops (map, filter, foldl', genList) to
+/// re-enter the VM via callClosure().
 struct EvalState
 {
-    // Reserved for: symbol table, store, fetcher, etc.
+    VMState * vm = nullptr;
 };
+
+/// Apply a closure (or single-arg primop) to one argument and return
+/// the result, by re-entering the VM dispatch loop on the same VMState.
+/// Used by callback primops.  Throws if `fun` is not callable.
+Value callClosure(VMState & vm, Value fun, Value arg);
 
 /// Function pointer signature.  The primop is given a span of forced
 /// argument Values (the dispatcher arranges forcing) and writes its

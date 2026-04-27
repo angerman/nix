@@ -168,32 +168,20 @@ inline Value withLookup(VMState & vm, SymbolId name, uint32_t depth)
 // Dispatch
 // ---------------------------------------------------------------------------
 
-Value run(const CompilationUnit & rootCu)
+namespace {
+
+/// Run the dispatch loop on `vm` until either:
+///   - OP_HALT is reached (top-level exit), or
+///   - The frame stack is popped down to `exitDepth` (used by inner
+///     re-entries from callback primops to return to the caller).
+/// Returns the final value (whatever was on the operand stack at exit).
+Value dispatchLoop(VMState & vm, size_t exitDepth)
 {
-    VMState vm;
-    vm.valueStack.reserve(1024);
-    vm.frames.reserve(64);
-    vm.withStack.reserve(16);
-
-    const CompilationUnit * cu = &rootCu;
-    uint32_t ip = cu->entryOffset;
-    const Closure * closure = nullptr;
-    size_t stackBase = 0;
-
-    vm.frames.push_back(CallFrame{
-        .cu = cu,
-        .ip = ip,
-        .resultSlot = 0,
-        .flags = 0,
-        ._pad0 = 0,
-        .stackBaseOffset = 0,
-        .closure = nullptr,
-        .resultPtr = nullptr,
-        .thunk = nullptr,
-    });
-
-    if (!cu->lambdas.empty())
-        vm.valueStack.resize(cu->lambdas[0].nLocals);
+    const CallFrame & topFrame = vm.frames.back();
+    const CompilationUnit * cu = topFrame.cu;
+    uint32_t ip = topFrame.ip;
+    const Closure * closure = topFrame.closure;
+    size_t stackBase = topFrame.stackBaseOffset;
 
     Value finalResult{};
     finalResult.mkNull();
@@ -416,6 +404,13 @@ Value run(const CompilationUnit & rootCu)
             if (fr.flags & CFF_THUNK_RETURN) {
                 fr.thunk->state = ThunkState::Evaluated;
                 fr.thunk->evaluated = retVal;
+            }
+            // Inner-loop exit: when called from a primop callback, exit
+            // back to the C++ caller with the return value.
+            if (vm.frames.size() == exitDepth) {
+                finalResult = retVal;
+                running = false;
+                break;
             }
             const auto & caller = vm.frames.back();
             cu = caller.cu;
@@ -730,16 +725,18 @@ Value run(const CompilationUnit & rootCu)
             uint32_t nArgs = operand;
             uint32_t poIdx = cu->code[ip++];
             const PrimOp * po = cu->primops[poIdx];
-            // The primop fn signature takes a Value* args buffer.  For the
-            // bring-up, allocate a small inline array up to arity 8.
             Value args[8];
             if (nArgs > 8) throw std::runtime_error("v3 OP_CALL_PRIMOP: arity > 8 not supported");
             for (uint32_t i = nArgs; i > 0; --i) args[i - 1] = pop(vm);
-            // EvalState is a placeholder right now; static instance is
-            // fine for the bring-up primops which don't read any fields.
-            static EvalState stateRef;
+            // Save current frame state in case the primop calls back
+            // into the VM via callClosure().
+            vm.frames.back().ip = ip;
+            // Wire the EvalState to this VM so callback primops can
+            // re-enter the dispatcher.
+            EvalState state;
+            state.vm = &vm;
             Value out;
-            po->fn(stateRef, args, out);
+            po->fn(state, args, out);
             push(vm, out);
             break;
         }
@@ -771,6 +768,79 @@ Value run(const CompilationUnit & rootCu)
     }
 
     return finalResult;
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+Value run(const CompilationUnit & rootCu)
+{
+    VMState vm;
+    vm.valueStack.reserve(1024);
+    vm.frames.reserve(64);
+    vm.withStack.reserve(16);
+
+    vm.frames.push_back(CallFrame{
+        .cu = &rootCu,
+        .ip = rootCu.entryOffset,
+        .resultSlot = 0,
+        .flags = 0,
+        ._pad0 = 0,
+        .stackBaseOffset = 0,
+        .closure = nullptr,
+        .resultPtr = nullptr,
+        .thunk = nullptr,
+    });
+
+    if (!rootCu.lambdas.empty())
+        vm.valueStack.resize(rootCu.lambdas[0].nLocals);
+
+    return dispatchLoop(vm, /*exitDepth=*/0);
+}
+
+Value callClosure(VMState & vm, Value fun, Value arg)
+{
+    // Single-arg primop fast path (no VM re-entry).
+    if (fun.isPrimOp()) {
+        const PrimOp * po = fun.payload.primop;
+        if (po->arity == 1) {
+            Value buf[1] = {arg};
+            EvalState state; state.vm = &vm;
+            Value out;
+            po->fn(state, buf, out);
+            return out;
+        }
+        throw std::runtime_error("v3 callClosure: multi-arg primop callbacks not supported yet");
+    }
+    if (!fun.isClosure())
+        throw std::runtime_error("v3 callClosure: not callable");
+
+    const Closure * callee = fun.payload.closure;
+    const LambdaDescriptor * desc = callee->desc;
+    const CompilationUnit * cu = vm.frames.back().cu;
+
+    // Push a CALL frame for the callee — mirrors OP_CALL.
+    size_t exitDepth = vm.frames.size();
+    size_t newBase = vm.valueStack.size();
+    vm.valueStack.resize(newBase + desc->nLocals);
+    vm.valueStack[newBase + 0] = arg;
+
+    vm.frames.push_back(CallFrame{
+        .cu = cu,
+        .ip = desc->codeOffset,
+        .resultSlot = 0,
+        .flags = 0,
+        ._pad0 = 0,
+        .stackBaseOffset = static_cast<uint32_t>(newBase),
+        .closure = callee,
+        .resultPtr = nullptr,
+        .thunk = nullptr,
+    });
+
+    return dispatchLoop(vm, exitDepth);
 }
 
 } // namespace nix::v3
