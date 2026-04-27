@@ -726,9 +726,18 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     for (uint32_t i = 0; i < src->size; ++i) {
         SymbolId sym = src->entries[i].name;
         Value nameStr = mkStringValueOwned(std::string(vmSymName(state, sym)));
-        // mapAttrs is curried: fn name value → result.
-        Value step1 = callClosure(*state.vm, fn, nameStr);
-        Value step2 = callClosure(*state.vm, step1, src->entries[i].value);
+        // Build a Tag::App chain that, when forced, applies
+        // `fn name value`.  This keeps mapAttrs lazy: `mapAttrs throw
+        // attrs` only fires the throw on the entries actually demanded
+        // by callers, matching tree-walker.
+        ValuePair * pp1 = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        pp1->left  = fn;
+        pp1->right = nameStr;
+        Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
+        ValuePair * pp2 = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        pp2->left  = step1;
+        pp2->right = src->entries[i].value;
+        Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
         result->entries[i].name  = sym;
         result->entries[i].value = step2;
     }
@@ -843,18 +852,27 @@ void primSeq(EvalState &, Value * args, Value & out)
 
 /// Recursively force every thunk reachable from `v`, propagating any
 /// error.  Lists/attrsets are traversed; functions are not entered.
-static Value forceDeepRec(VMState & vm, Value v)
+/// Tracks visited containers to break cycles like `let as = {y = as;}; in as`.
+static Value forceDeepRec(VMState & vm, Value v, std::unordered_set<const void *> & seen)
 {
     v = forceValue(vm, v);
     if (v.isList() && v.payload.list) {
+        if (!seen.insert(v.payload.list).second) return v;
         for (uint32_t i = 0; i < v.payload.list->size; ++i)
-            v.payload.list->elems[i] = forceDeepRec(vm, v.payload.list->elems[i]);
+            v.payload.list->elems[i] = forceDeepRec(vm, v.payload.list->elems[i], seen);
     } else if (v.isAttrs() && v.payload.bindings) {
+        if (!seen.insert(v.payload.bindings).second) return v;
         for (uint32_t i = 0; i < v.payload.bindings->size; ++i)
             v.payload.bindings->entries[i].value =
-                forceDeepRec(vm, v.payload.bindings->entries[i].value);
+                forceDeepRec(vm, v.payload.bindings->entries[i].value, seen);
     }
     return v;
+}
+
+static Value forceDeepRec(VMState & vm, Value v)
+{
+    std::unordered_set<const void *> seen;
+    return forceDeepRec(vm, v, seen);
 }
 
 void primDeepSeq(EvalState & state, Value * args, Value & out)

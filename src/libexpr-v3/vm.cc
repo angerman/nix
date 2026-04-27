@@ -615,9 +615,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_FORCE: {
             Value v = pop(vm);
+            // Chase Evaluated chains and resolve Tag::App deferred
+            // calls (used by mapAttrs et al. for lazy entries).
+            while (true) {
+                if (v.tag() == Tag::App) {
+                    Value left = v.payload.pair->left;
+                    Value right = v.payload.pair->right;
+                    vm.frames.back().ip = ip;
+                    // left may itself need forcing (App spines).
+                    left = forceValue(vm, left);
+                    v = callClosure(vm, left, right);
+                    continue;
+                }
+                if (!v.isThunk()) break;
+                if (v.payload.thunk->state == ThunkState::Evaluated) {
+                    v = v.payload.thunk->evaluated;
+                    continue;
+                }
+                break;
+            }
             if (!v.isThunk()) { push(vm, v); break; }
             Thunk * t = v.payload.thunk;
-            if (t->state == ThunkState::Evaluated) { push(vm, t->evaluated); break; }
             if (t->state == ThunkState::Blackhole) throw std::runtime_error("v3 OP_FORCE: infinite recursion (blackhole)");
             // Suspended: blackhole and run.
             // We treat suspended.desc as a LambdaDescriptor* (see OP_MAKE_THUNK).
@@ -789,8 +807,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_SELECT: {
             Value attrs = pop(vm);
-            if (!attrs.isAttrs())
+            if (!attrs.isAttrs()) {
+                std::fprintf(stderr,
+                    "DBG ATTRS_SELECT: tag=%d sym=%u(%s) ip=%u\n",
+                    (int)attrs.tag(), operand,
+                    operand < ir::globalSymbolTable().size() ? ir::globalSymbolTable()[operand].c_str() : "?", ip);
+                std::fflush(stderr);
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: not an attrset");
+            }
             const Value * found = attrs.payload.bindings->lookup(operand);
             if (!found)
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: attribute not found");
@@ -995,7 +1019,20 @@ Value forceValue(VMState & vm, Value v)
     // Loop until WHNF: a thunk's body might itself yield a thunk
     // (e.g., `let inherit outer; in outer` returns the outer thunk),
     // and we want to chase the chain until we land on a real value.
-    while (v.isThunk()) {
+    while (true) {
+        // Tag::App is a deferred application — force it by actually
+        // applying.  Used by primops like mapAttrs that build lazy
+        // entries: each entry is `App(fn, arg)` and we materialize on
+        // demand.  `left` may itself be an App / Thunk (e.g. mapAttrs
+        // builds App(App(fn, name), value)) — force the spine first.
+        if (v.tag() == Tag::App) {
+            Value left  = v.payload.pair->left;
+            Value right = v.payload.pair->right;
+            left = forceValue(vm, left);
+            v = callClosure(vm, left, right);
+            continue;
+        }
+        if (!v.isThunk()) break;
         Thunk * t = v.payload.thunk;
         if (t->state == ThunkState::Evaluated) { v = t->evaluated; continue; }
         if (t->state == ThunkState::Blackhole)
