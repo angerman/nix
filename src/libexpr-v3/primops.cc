@@ -203,30 +203,22 @@ void primElemAt(EvalState &, Value * args, Value & out)
     out = lst.payload.list->elems[idx.payload.i];
 }
 
-void primAttrNames(EvalState & state, Value * args, Value & out)
+void primAttrNames(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0];
     if (!a.isAttrs() || !a.payload.bindings) typeError("attrNames", "attrset");
     uint32_t n = a.payload.bindings->size;
     ListVec * lv = Alloc::allocList(n);
     allocStats().listsAllocated++;
-    // Look up each SymbolId in the CompilationUnit's symbolTable to get
-    // the actual name string.
-    const std::vector<std::string> * symTab = nullptr;
-    if (state.vm && !state.vm->frames.empty())
-        symTab = &state.vm->frames.back().cu->symbolTable;
+    auto & symTab = ir::globalSymbolTable();
     for (uint32_t i = 0; i < n; ++i) {
-        Value v;
         SymbolId sid = a.payload.bindings->entries[i].name;
-        if (symTab && sid < symTab->size())
-            v = mkStringValueOwned((*symTab)[sid]);
-        else
-            v = mkStringValueOwned(std::to_string(sid));
+        Value v = mkStringValueOwned(sid < symTab.size() ? symTab[sid] : std::to_string(sid));
         lv->elems[i] = v;
     }
-    // attrset entries are already sorted by SymbolId (Bindings invariant).
-    // Sort the resulting list of strings lexicographically to match
-    // builtins.attrNames semantics.
+    // Sort lexicographically by name — matches tree-walker semantics
+    // and decouples output order from the global symbol-table
+    // insertion order.
     std::sort(lv->elems, lv->elems + n,
         [](const Value & x, const Value & y) {
             return std::string_view(x.payload.str) < std::string_view(y.payload.str);
@@ -240,9 +232,20 @@ void primAttrValues(EvalState &, Value * args, Value & out)
     const Value & a = args[0];
     if (!a.isAttrs() || !a.payload.bindings) typeError("attrValues", "attrset");
     uint32_t n = a.payload.bindings->size;
+    // Build (name, value) pairs, sort by name, then drop the name.
+    auto & symTab = ir::globalSymbolTable();
+    std::vector<std::pair<std::string_view, Value>> pairs;
+    pairs.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        SymbolId sid = a.payload.bindings->entries[i].name;
+        std::string_view nm = sid < symTab.size() ? std::string_view(symTab[sid]) : std::string_view("");
+        pairs.emplace_back(nm, a.payload.bindings->entries[i].value);
+    }
+    std::sort(pairs.begin(), pairs.end(),
+        [](const auto & x, const auto & y) { return x.first < y.first; });
     ListVec * lv = Alloc::allocList(n);
     allocStats().listsAllocated++;
-    for (uint32_t i = 0; i < n; ++i) lv->elems[i] = a.payload.bindings->entries[i].value;
+    for (uint32_t i = 0; i < n; ++i) lv->elems[i] = pairs[i].second;
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = lv;
 }
@@ -576,20 +579,10 @@ void primPartition(EvalState & state, Value * args, Value & out)
     Value rightV = mkList(right_);
     Value wrongV = mkList(wrong_);
 
-    // Build attrset { right = rightV; wrong = wrongV; }.  We need access
-    // to the symbol table to intern "right" / "wrong"; use the runtime
-    // CU's table since attrset SymbolIds resolve through it.
-    if (!state.vm || state.vm->frames.empty())
-        throw std::runtime_error("v3 primop partition: missing VM context");
-    auto & st = const_cast<std::vector<std::string> &>(state.vm->frames.back().cu->symbolTable);
-    auto intern = [&](std::string_view s) -> SymbolId {
-        for (size_t i = 0; i < st.size(); ++i)
-            if (st[i] == s) return static_cast<SymbolId>(i);
-        st.emplace_back(s);
-        return static_cast<SymbolId>(st.size() - 1);
-    };
-    SymbolId sRight = intern("right");
-    SymbolId sWrong = intern("wrong");
+    // Intern via the global table so the resulting attrset's SymbolIds
+    // match what other CUs and the JSON printer use.
+    SymbolId sRight = ir::globalInternSymbol("right");
+    SymbolId sWrong = ir::globalInternSymbol("wrong");
 
     Bindings * b = Alloc::allocBindings(2);
     allocStats().attrsetsAllocated++;
@@ -871,6 +864,56 @@ void primDeepSeq(EvalState & state, Value * args, Value & out)
     // ensure errors in lazy structure are surfaced before returning.
     forceDeepRec(*state.vm, args[0]);
     out = args[1];
+}
+
+/// builtins.zipAttrsWith fn list-of-attrsets:
+///   merge a list of attrsets, applying `fn name [values]` to combine
+///   per-name lists.  Order in the value list mirrors source order.
+void primZipAttrsWith(EvalState & state, Value * args, Value & out)
+{
+    Value fn = args[0];
+    if (!args[1].isList()) typeError("zipAttrsWith", "list of attrsets");
+    auto * lst = args[1].payload.list;
+    // Group by symbol id, preserving the value order seen in `lst`.
+    std::unordered_map<SymbolId, std::vector<Value>> byName;
+    if (lst) {
+        for (uint32_t i = 0; i < lst->size; ++i) {
+            Value attrs = forceValue(*state.vm, lst->elems[i]);
+            if (!attrs.isAttrs() || !attrs.payload.bindings) continue;
+            for (uint32_t j = 0; j < attrs.payload.bindings->size; ++j) {
+                auto & en = attrs.payload.bindings->entries[j];
+                byName[en.name].push_back(en.value);
+            }
+        }
+    }
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(byName.size());
+    for (auto & [sid, vs] : byName) {
+        // Build the value list, then call fn name list.
+        ListVec * vl = Alloc::allocList(static_cast<uint32_t>(vs.size()));
+        allocStats().listsAllocated++;
+        for (size_t i = 0; i < vs.size(); ++i) vl->elems[i] = vs[i];
+        Value lv;
+        lv.tag_payload = static_cast<uint64_t>(Tag::List);
+        lv.payload.list = vl;
+        // Call fn with name (string) then values (list).
+        auto & symTab = ir::globalSymbolTable();
+        std::string nm = sid < symTab.size() ? symTab[sid] : std::to_string(sid);
+        Value nameV = mkStringValueOwned(nm);
+        Value step1 = callClosure(*state.vm, fn, nameV);
+        Value combined = callClosure(*state.vm, step1, lv);
+        entries.emplace_back(sid, combined);
+    }
+    std::sort(entries.begin(), entries.end(),
+        [](const auto & a, const auto & b) { return a.first < b.first; });
+    Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        b->entries[i].name = entries[i].first;
+        b->entries[i].value = entries[i].second;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
 }
 
 /// builtins.trace msg val: print msg to stderr, return val unchanged.
@@ -1475,7 +1518,6 @@ void primFunctionArgs(EvalState &, Value * args, Value & out)
 /// nlohmann::json -> v3 Value (recursive).
 Value jsonToValue(EvalState & state, const nlohmann::json & j)
 {
-    using json = nlohmann::json;
     Value out;
     if (j.is_null())     { out.mkNull(); return out; }
     if (j.is_boolean())  { out = j.get<bool>() ? Value::vTrue : Value::vFalse; return out; }
@@ -1770,6 +1812,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"deepSeq",            2, primDeepSeq});
         registerPrimOp({"trace",              2, primTrace});
         registerPrimOp({"traceVerbose",       2, primTraceVerbose});
+        registerPrimOp({"zipAttrsWith",       2, primZipAttrsWith});
         registerPrimOp({"tryEval",            1, primTryEval});
         registerPrimOp({"baseNameOf",         1, primBaseNameOf});
         registerPrimOp({"dirOf",              1, primDirOf});
