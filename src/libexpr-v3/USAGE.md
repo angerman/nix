@@ -222,6 +222,17 @@ Run via:
 The 77-case v3-vs-tree-walker regression suite at
 `src/libexpr-v3/test/run-v3-tests.sh`: 76/77 passing (1 display-only).
 
+End-to-end cutover validation via the regular `nix-instantiate` CLI
+with `NIX_USE_V3=1` set — exercises the libnixexpr → libnixexprv3
+hook + result-conversion shim:
+
+    bash src/libexpr-v3/test/run-cutover-tests.sh
+
+**142 / 142 passing** (all upstream eval-okay tests, including
+those with `.flags` files like `--lint-absolute-path-literals`,
+`--extra-experimental-features parse-toml-timestamps`, and
+`-I` lookup-path entries).
+
 ## Recent feature additions
 
 `builtins` as a standalone value: produces an attrset of all
