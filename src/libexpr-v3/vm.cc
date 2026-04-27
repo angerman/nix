@@ -1153,6 +1153,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_STR_CONCAT: {
             uint32_t n = operand >> 1;
             bool forceStr = (operand & 1u) != 0;
+            // Ultra-fast path: 2 ints with no forceStr — covers every
+            // arithmetic `a + b` over ints, which is the dominant case
+            // on compute-bound benchmarks like fib.  Skip the small[]
+            // setup, the loop, and the per-part type checks.
+            if (!forceStr && n == 2) {
+                Value & top1 = vm.valueStack.back();
+                Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+                if (top0.isInt() && top1.isInt()) {
+                    int64_t sum = top0.payload.i + top1.payload.i;
+                    vm.valueStack.pop_back();
+                    vm.valueStack.back().mkInt(sum);
+                    break;
+                }
+            }
             // Hot path on every Nix-level `a + b` (which the parser
             // lowers to ConcatStrings).  Avoid allocating a heap
             // vector for the common 2-part case — most ConcatStrings
