@@ -694,6 +694,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // direct-primop-call path.
                 for (uint32_t i = 0; i < po->arity; ++i)
                     buf[i] = forceValue(vm, buf[i]);
+                bumpPrimOpCallCount(po);
                 EvalState state; state.vm = &vm;
                 Value out;
                 po->fn(state, buf, out);
@@ -1558,6 +1559,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             uint32_t nArgs = operand;
             uint32_t poIdx = cu->code[ip++];
             const PrimOp * po = cu->primops[poIdx];
+            // Profiling counter (gated on NIX_VM_STATS at process exit).
+            // The bump is unconditional — the primop dispatch already
+            // does substantially more work, so the cost is invisible.
+            bumpPrimOpCallCount(po);
             Value args[8];
             if (nArgs > 8) throw std::runtime_error("v3 OP_CALL_PRIMOP: arity > 8 not supported");
             for (uint32_t i = nArgs; i > 0; --i) args[i - 1] = pop(vm);

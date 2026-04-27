@@ -20,6 +20,7 @@
 #include "v3/value.hh"
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -94,5 +95,15 @@ void registerPrimOp(const PrimOp & op);
 /// Register the bring-up subset of primops (length, head, tail, ...).
 /// Idempotent; call during EvalState init.
 void registerBuiltinPrimOps();
+
+/// Per-primop call counter.  Bumped on every OP_CALL_PRIMOP.  Used
+/// for profiling — invaluable for working out which primops are hot
+/// on a real-world workload (nixpkgs, cardano-node) vs the synthetic
+/// fib/attrs benchmarks.  Keyed by primop name to survive across
+/// process invocations and to avoid threading an index everywhere.
+/// Print via `dumpPrimOpStats()` (called automatically under
+/// NIX_VM_STATS=1 from v3-eval / the cutover hook).
+void bumpPrimOpCallCount(const PrimOp * po);
+void dumpPrimOpStats(std::FILE * out);
 
 } // namespace nix::v3

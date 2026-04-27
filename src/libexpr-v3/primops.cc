@@ -3434,6 +3434,51 @@ const std::unordered_map<std::string, PrimOp> & allRegisteredPrimOps()
 void setNixEvalState(nix::EvalState * st) { tlNixEvalState = st; }
 nix::EvalState * getNixEvalState() { return tlNixEvalState; }
 
+// Per-primop call counters keyed by primop name (string_view backed by
+// the registered PrimOp::name).  Aggregates across the whole process —
+// invaluable for confirming which primops are hot on real workloads
+// (nixpkgs / cardano-node / NixOS modules) rather than on synthetic
+// fib/attrs benchmarks.
+namespace {
+struct PrimOpCounter {
+    std::unordered_map<std::string, uint64_t> counts;
+    std::mutex                                mtx;
+};
+PrimOpCounter & primOpCounter()
+{
+    static PrimOpCounter c;
+    return c;
+}
+} // anonymous namespace
+
+void bumpPrimOpCallCount(const PrimOp * po)
+{
+    if (!po) return;
+    auto & c = primOpCounter();
+    std::lock_guard<std::mutex> g(c.mtx);
+    c.counts[std::string(po->name)]++;
+}
+
+void dumpPrimOpStats(std::FILE * out)
+{
+    auto & c = primOpCounter();
+    std::lock_guard<std::mutex> g(c.mtx);
+    if (c.counts.empty()) return;
+    // Sort by descending count — the top of the list is what we
+    // actually care about when reasoning about bridge cost / native
+    // candidates.
+    std::vector<std::pair<std::string, uint64_t>> rows(
+        c.counts.begin(), c.counts.end());
+    std::sort(rows.begin(), rows.end(),
+        [](const auto & a, const auto & b) { return a.second > b.second; });
+    std::fprintf(out, "v3 primop call counts (top 30 of %zu):\n",
+                 rows.size());
+    for (size_t i = 0; i < rows.size() && i < 30; ++i)
+        std::fprintf(out, "  %8llu  %s\n",
+                     (unsigned long long)rows[i].second,
+                     rows[i].first.c_str());
+}
+
 // Forward to the anonymous-namespace shim (initialised at static-init
 // time).  Public — callable from v3_hook.cc.
 namespace { extern nix::Value * (*v3ToTreeWalkerShim)(nix::EvalState &, Value); }

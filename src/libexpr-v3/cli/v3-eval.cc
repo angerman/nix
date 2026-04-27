@@ -527,7 +527,10 @@ int main(int argc, char ** argv)
         // and a superset of every per-CU table, so it always covers
         // attribute names from imported CUs that the top-level CU's
         // (frozen-at-compile-time) snapshot wouldn't see.
-        return printValue(r, jsonOut, nix::v3::ir::globalSymbolTable());
+        int rc = printValue(r, jsonOut, nix::v3::ir::globalSymbolTable());
+        if (std::getenv("NIX_VM_STATS"))
+            nix::v3::dumpPrimOpStats(stderr);
+        return rc;
     } catch (const std::exception & ex) {
         std::fprintf(stderr, "v3-eval error: %s\n", ex.what());
         return 1;
