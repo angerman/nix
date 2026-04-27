@@ -95,7 +95,9 @@ static nlohmann::json toJsonValue(const Value & v,
     case Tag::Closure:
     case Tag::PrimOp:
     case Tag::PrimOpApp:
-        return json("<function>");
+        // Match tree-walker semantics — refuse to serialize a
+        // function instead of silently producing a sentinel.
+        throw std::runtime_error("cannot convert a function to JSON");
     case Tag::Thunk:
         return json("<thunk>");
     case Tag::Uninitialized:
