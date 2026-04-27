@@ -159,10 +159,21 @@ the call site.  `unsafeGetAttrPos` and `functionArgs`-derived
 positions both work via the per-attr position side-table populated
 by OP_ATTRS_INIT[_DYN] / OP_ATTRS_REC_INIT.
 
-Performance: v3 is within ~15% of the tree-walker on compute-bound
-benchmarks (fib30: tree-walker ~0.40s user, v3 ~0.46s user).  Bigger
-wins are queued (NaN-boxing, computed-goto dispatch, Bindings
-polymorphism, OP_ATTRS_SELECT inline cache).
+Performance: v3 is within ~3% of the tree-walker on compute-bound
+benchmarks (fib30: tree-walker ~0.37s user, v3 ~0.38s user;
+fib32: tree-walker ~0.93s user, v3 ~0.96s user).
+
+Recent perf wins (in-VM hot path):
+  - OP_FORCE peek-fast-path: skip pop+push when top is already WHNF.
+  - OP_SET_LOCAL fast-path: skip the grow loop when slot is in range.
+  - Superinstructions OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE: fuse
+    the var-load+force pair (the most common bytecode pair).
+  - OP_STR_CONCAT 2-int fast-path: every `a + b` over ints sums
+    in-place on the operand stack without allocating.
+
+Still queued for the larger wins: NaN-boxing, computed-goto dispatch,
+Bindings polymorphism, OP_ATTRS_SELECT inline cache (already done for
+the simple case).
 
 ## Test status
 
