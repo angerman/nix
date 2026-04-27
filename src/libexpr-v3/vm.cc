@@ -808,6 +808,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // ultimate WHNF and not an intermediate thunk.
                 while (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Evaluated)
                     retVal = retVal.payload.thunk->evaluated;
+                // Self-reference detection: `let x = x; in x` makes the
+                // thunk's body return the thunk itself (the chase above
+                // can't catch this since we hit a Blackhole-state thunk
+                // which isn't ThunkState::Evaluated until we're about
+                // to assign).  Storing self into evaluated would make
+                // subsequent forceValue calls spin forever in the
+                // chase loop above.  Match tree-walker by raising.
+                if (retVal.isThunk() && retVal.payload.thunk == fr.thunk)
+                    throw std::runtime_error("v3 OP_RETURN: infinite recursion (thunk evaluates to itself)");
                 fr.thunk->state = ThunkState::Evaluated;
                 fr.thunk->evaluated = retVal;
 
@@ -1541,6 +1550,12 @@ Value forceValue(VMState & vm, Value v)
     // (e.g., `let inherit outer; in outer` returns the outer thunk),
     // and we want to chase the chain until we land on a real value.
     while (true) {
+        // Same call-depth guard — `let x = x; in x` lands here in
+        // a C++ recursion via dispatchLoop → forceValue → dispatchLoop
+        // and never grows through the bytecode-level OP_CALL/OP_FORCE
+        // guards.  Match those guards.
+        if (__builtin_expect(vm.frames.size() >= 5000, 0))
+            throw std::runtime_error("v3 forceValue: stack overflow; call depth exceeded 5000");
         // Tag::App is a deferred application — force it by actually
         // applying.  Used by primops like mapAttrs that build lazy
         // entries: each entry is `App(fn, arg)` and we materialize on
