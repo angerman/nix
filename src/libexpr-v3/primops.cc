@@ -1408,7 +1408,8 @@ void primHashFile(EvalState &, Value * args, Value & out)
 
 void primConvertHash(EvalState & state, Value * args, Value & out)
 {
-    // builtins.convertHash { hash; hashAlgo; toHashFormat; } -> string
+    // builtins.convertHash { hash; hashAlgo?; toHashFormat; } -> string
+    // hashAlgo is optional when hash is in `algo:body` or SRI form.
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("convertHash", "attrset");
     SymbolId sHash = vmIntern(state, "hash");
@@ -1417,14 +1418,13 @@ void primConvertHash(EvalState & state, Value * args, Value & out)
     const Value * vhRaw = args[0].payload.bindings->lookup(sHash);
     const Value * vaRaw = args[0].payload.bindings->lookup(sAlgo);
     const Value * vfRaw = args[0].payload.bindings->lookup(sFmt);
-    if (!vhRaw || !vaRaw || !vfRaw)
-        typeError("convertHash", "{ hash; hashAlgo; toHashFormat; }");
+    if (!vhRaw || !vfRaw)
+        typeError("convertHash", "{ hash; hashAlgo?; toHashFormat; }");
     Value vh = forceValue(*state.vm, *vhRaw);
-    Value va = forceValue(*state.vm, *vaRaw);
     Value vf = forceValue(*state.vm, *vfRaw);
-    if (!vh.isString() || !va.isString() || !vf.isString())
-        typeError("convertHash", "{ hash; hashAlgo; toHashFormat; }");
-    auto algo = parseHashAlgo(va.payload.str);
+    if (!vh.isString() || !vf.isString())
+        typeError("convertHash", "{ hash; hashAlgo?; toHashFormat; }");
+
     nix::HashFormat fmt;
     std::string_view fs(vf.payload.str);
     if (fs == "base16")        fmt = nix::HashFormat::Base16;
@@ -1433,7 +1433,17 @@ void primConvertHash(EvalState & state, Value * args, Value & out)
     else if (fs == "base64")   fmt = nix::HashFormat::Base64;
     else if (fs == "sri")      fmt = nix::HashFormat::SRI;
     else throw std::runtime_error("v3 convertHash: unknown format '" + std::string(fs) + "'");
-    auto parsed = nix::Hash::parseAny(vh.payload.str, algo);
+
+    nix::Hash parsed{nix::HashAlgorithm::SHA256}; // dummy default
+    if (vaRaw) {
+        Value va = forceValue(*state.vm, *vaRaw);
+        if (!va.isString())
+            typeError("convertHash", "{ hash; hashAlgo?; toHashFormat; }");
+        parsed = nix::Hash::parseAny(vh.payload.str, parseHashAlgo(va.payload.str));
+    } else {
+        // No hashAlgo — infer from `algo:body` or SRI prefix.
+        parsed = nix::Hash::parseAny(vh.payload.str, std::nullopt);
+    }
     out = mkStringValueOwned(parsed.to_string(fmt, false));
 }
 
