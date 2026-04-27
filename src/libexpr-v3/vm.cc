@@ -647,6 +647,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_CALL: {
+            op_call_dispatch:
+            // A non-tail call resets the tail-iteration counter — any
+            // subsequent runaway recursion is bounded against the
+            // 5000-frame stack guard, not the tail-call counter.
+            vm.tailCallCount = 0;
             Value arg = pop(vm), fun = pop(vm);
 
             // PrimOp / PrimOpApp partial application.
@@ -787,7 +792,96 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             stackBase = newBase;
             break;
         }
+        case OP_TAIL_CALL: {
+            // Tail call: same semantics as OP_CALL but reuses the
+            // current frame — no frame push.  Lets long recursive
+            // chains run in O(1) frame stack space.
+            //
+            // Tail-iteration guard: catch infinite tail recursion
+            // (`(x: x x) (x: x x)`) which the frame-stack limit
+            // can't see because we don't grow the stack.  Tree-walker
+            // catches it via C-stack overflow.  We bound at 10^7
+            // iterations between frame-stack changes; ~99% headroom
+            // over any real-world deep tail recursion.
+            constexpr size_t kMaxTailCalls = 10'000'000;
+            if (__builtin_expect(++vm.tailCallCount >= kMaxTailCalls, 0)) {
+                vm.tailCallCount = 0;
+                throw std::runtime_error("v3 OP_TAIL_CALL: tail-call iteration limit exceeded "
+                                          + std::to_string(kMaxTailCalls)
+                                          + " (likely infinite recursion)");
+            }
+
+            // Falls back to OP_CALL behaviour for non-closure callees
+            // (primops, __functor, partial application) since those
+            // need the full OP_CALL machinery.  We jump back into the
+            // OP_CALL case via goto.
+            Value arg = pop(vm), fun = pop(vm);
+            if (!fun.isClosure()) {
+                // Push back and replay through OP_CALL.
+                push(vm, fun);
+                push(vm, arg);
+                goto op_call_dispatch;
+            }
+            const Closure * tcCallee = fun.payload.closure;
+            const LambdaDescriptor * tcDesc = tcCallee->desc;
+            const CompilationUnit * tcCalleeCu = tcCallee->cu ? tcCallee->cu : cu;
+
+            // Same formals validation OP_CALL does.
+            if (tcDesc->hasFormals && !tcDesc->ellipsis) {
+                Value forcedArg = forceValue(vm, arg);
+                if (forcedArg.isAttrs() && forcedArg.payload.bindings) {
+                    const Bindings * b = forcedArg.payload.bindings;
+                    for (uint32_t i = 0; i < b->size; ++i) {
+                        SymbolId name = b->entries[i].name;
+                        bool found = false;
+                        for (auto & f : tcDesc->formals)
+                            if (f.name == name) { found = true; break; }
+                        if (!found) {
+                            const auto & tbl = ir::globalSymbolTable();
+                            std::string nm = (name < tbl.size()) ? tbl[name] : "?";
+                            throw std::runtime_error("v3 OP_TAIL_CALL: function "
+                                "called with unexpected argument '" + nm + "'");
+                        }
+                    }
+                }
+                arg = forcedArg;
+            }
+
+            // Reuse the current frame: shrink valueStack down to our
+            // stackBase, then resize for the callee's locals.  The
+            // outer-frame's stackBaseOffset and CallFrame stay put;
+            // we just retarget cu/closure/ip and overwrite locals.
+            vm.valueStack.resize(stackBase + tcDesc->nLocals);
+            vm.valueStack[stackBase + 0] = arg;
+
+            // Update the existing frame in place (don't push a new one).
+            CallFrame & cur = vm.frames.back();
+            cur.cu = tcCalleeCu;
+            cur.closure = tcCallee;
+            // thunk stays whatever it was — if we're inside a thunk
+            // re-entry frame, the thunk should still be set when
+            // we eventually OP_RETURN.
+            cur.ip = tcDesc->codeOffset;
+            // stackBaseOffset and withStackBase are unchanged: we
+            // reuse the same operand-stack window and keep any
+            // captured-with entries the outer frame already pushed.
+
+            // Push the callee's captured-withs on top of whatever
+            // the outer frame had — they get popped together at
+            // OP_RETURN since withStackBase is the outer's floor.
+            pushCapturedWiths(vm, tcCallee->capturedWiths);
+
+            ip = tcDesc->codeOffset;
+            cu = tcCalleeCu;
+            closure = tcCallee;
+            // stackBase unchanged.
+            break;
+        }
         case OP_RETURN: {
+            // Reset the tail-call counter — once we return out of a
+            // tail-recursive burst, subsequent tail calls in a
+            // different chain start fresh.
+            vm.tailCallCount = 0;
             Value retVal = pop(vm);
             // Capture only the fields we need across the pop_back —
             // copying the whole CallFrame is the per-recursion-call

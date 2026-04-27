@@ -94,6 +94,12 @@ enum Op : uint8_t
     /// in the current AST→IR lowering.
     OP_GET_LOCAL_FORCE   = 0x55,  // [slot:24]
     OP_GET_UPVALUE_FORCE = 0x56,  // [idx:24]
+    /// Tail call: like OP_CALL, but reuses the current frame instead
+    /// of pushing a new one.  Emitted at function tail position when
+    /// the last instruction before OP_RETURN was OP_CALL — the
+    /// callee's eventual OP_RETURN pops the (modified) current frame
+    /// so the result lands at our caller.
+    OP_TAIL_CALL      = 0x57,
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

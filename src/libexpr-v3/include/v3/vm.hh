@@ -53,6 +53,12 @@ struct VMState
     /// Stack of in-scope `with` attrset values.  Top of stack = innermost.
     std::vector<Value>     withStack;
     uint64_t nrInstructions = 0;
+    /// OP_TAIL_CALL iteration counter — bumped on every tail call
+    /// and reset whenever the frame stack grows or shrinks via
+    /// non-tail OP_CALL / OP_RETURN.  Used to detect infinite tail
+    /// recursion (`let f = x: f x; in f 1`) which v3's TCO would
+    /// otherwise let run forever in O(1) frame space.
+    uint64_t tailCallCount = 0;
 };
 
 /// Bytecode IR → CompilationUnit pipeline.

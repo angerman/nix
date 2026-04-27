@@ -116,20 +116,43 @@ struct Emitter
     void emitBlock(ir::BlockId bid)
     {
         const ir::Block & b = m.blocks[bid];
+        const auto & ret = std::get<ir::TermReturn>(b.terminal);
+
+        // Optimisation: when the very last binding's VarId is the
+        // block's TermReturn value, the binding's expression result
+        // is already on top of the operand stack right after we
+        // emit it.  Emit the trailing SET_LOCAL only if a slot was
+        // previously assigned (someone else might reference this
+        // var), but skip the SET+GET round-trip and leave the value
+        // on the stack — the function-tail OP_CALL→OP_TAIL_CALL
+        // peephole then has a chance to fire.
+        const size_t nBd = b.bindings.size();
+        bool tailLast = nBd > 0 && b.bindings.back().var == ret.value;
 
         // Params have already been bound by the caller (e.g., function
         // prologue assigned param-VarId -> slot 0).
-        for (auto & bd : b.bindings) {
+        for (size_t i = 0; i < nBd; ++i) {
+            auto & bd = b.bindings[i];
             emitExpr(bd.expr);
+            // For the tail binding (last binding == term value), the
+            // emitted bytecode already left the value on the operand
+            // stack.  Skip the SET + trailing GET round-trip — slots
+            // are pre-assigned by preassignSlotsInBlock but only
+            // referenced when something explicitly emits OP_GET_LOCAL
+            // for them; nothing in this block does.  Other blocks
+            // can't reach this var (it's bound only here).
+            bool isTail = tailLast && (i + 1 == nBd);
+            if (isTail) continue;
             uint16_t slot = getOrAssignSlot(bd.var);
             unit.code.push_back(encode(OP_SET_LOCAL, slot));
         }
 
-        // Terminal: TermReturn for now (only variant supported).
-        const auto & ret = std::get<ir::TermReturn>(b.terminal);
-        if (ret.value != ir::kInvalid)
+        // Terminal: TermReturn.  If we elided the SET for the tail
+        // binding, the value is already on top — skip the trailing
+        // emitVarRef.
+        if (ret.value != ir::kInvalid && !tailLast)
             emitVarRef(ret.value);
-        else
+        else if (ret.value == ir::kInvalid)
             unit.code.push_back(encode(OP_LIT_NULL));
     }
 
@@ -532,6 +555,16 @@ struct Emitter
         else
             unit.code.push_back(encode(OP_LIT_NULL));
 
+        // Tail-call peephole: for non-top-level functions, if the
+        // last emitted instruction is OP_CALL, the result of that
+        // call IS this function's return value — rewrite to
+        // OP_TAIL_CALL.  Keep the OP_RETURN that follows: a
+        // sibling thenBlock might JUMP past the OP_TAIL_CALL to
+        // the trailing OP_RETURN, and OP_TAIL_CALL itself never
+        // returns to that OP_RETURN (it replaces the frame).
+        if (fid != 0 && !unit.code.empty() && decodeOp(unit.code.back()) == OP_CALL) {
+            unit.code.back() = encode(OP_TAIL_CALL);
+        }
         unit.code.push_back(encode(fid == 0 ? OP_HALT : OP_RETURN));
 
         if (unit.lambdas.size() <= fid)         unit.lambdas.resize(fid + 1);
