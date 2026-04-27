@@ -25,11 +25,13 @@
 #include "v3/vm.hh"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nix::v3 {
 
@@ -54,6 +56,34 @@ std::mutex & registryMutex()
 [[noreturn]] inline void typeError(std::string_view op, std::string_view expected)
 {
     throw std::runtime_error("v3 primop " + std::string(op) + ": expected " + std::string(expected));
+}
+
+inline bool valueEqual(const Value & a, const Value & b)
+{
+    if (a.tag() != b.tag()) {
+        if (a.isInt() && b.isFloat()) return static_cast<double>(a.payload.i) == b.payload.f;
+        if (a.isFloat() && b.isInt()) return a.payload.f == static_cast<double>(b.payload.i);
+        return false;
+    }
+    switch (a.tag()) {
+    case Tag::Int:    return a.payload.i == b.payload.i;
+    case Tag::Float:  return a.payload.f == b.payload.f;
+    case Tag::Bool:   return a.payload.i == b.payload.i;
+    case Tag::Null:   return true;
+    case Tag::String: return std::string_view(a.payload.str) == std::string_view(b.payload.str);
+    case Tag::Path:   return std::string_view(a.payload.path) == std::string_view(b.payload.path);
+    case Tag::Uninitialized:
+    case Tag::Attrs:
+    case Tag::List:
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
+    default:          return a.payload.raw == b.payload.raw;
+    }
 }
 
 inline std::string toStr(const Value & v)
@@ -537,6 +567,161 @@ void primPartition(EvalState & state, Value * args, Value & out)
     out.payload.bindings = b;
 }
 
+/// Helper: intern a string into the running CU's symbolTable.
+inline SymbolId vmIntern(EvalState & state, std::string_view s)
+{
+    if (!state.vm || state.vm->frames.empty())
+        throw std::runtime_error("vmIntern: missing VM context");
+    auto & st = const_cast<std::vector<std::string> &>(
+        state.vm->frames.back().cu->symbolTable);
+    for (size_t i = 0; i < st.size(); ++i)
+        if (st[i] == s) return static_cast<SymbolId>(i);
+    st.emplace_back(s);
+    return static_cast<SymbolId>(st.size() - 1);
+}
+
+inline std::string_view vmSymName(EvalState & state, SymbolId id)
+{
+    if (!state.vm || state.vm->frames.empty()) return "";
+    auto & st = state.vm->frames.back().cu->symbolTable;
+    return id < st.size() ? std::string_view(st[id]) : std::string_view("");
+}
+
+/// listToAttrs: takes a list of `{ name = "..."; value = ...; }` and
+/// builds an attrset.
+void primListToAttrs(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isList()) typeError("listToAttrs", "list");
+    auto * src = args[0].payload.list;
+    if (!src || src->size == 0) {
+        Bindings * b = Alloc::allocBindings(0);
+        allocStats().attrsetsAllocated++;
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        return;
+    }
+    SymbolId nameSym  = vmIntern(state, "name");
+    SymbolId valueSym = vmIntern(state, "value");
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(src->size);
+    for (uint32_t i = 0; i < src->size; ++i) {
+        const Value & el = src->elems[i];
+        if (!el.isAttrs() || !el.payload.bindings)
+            typeError("listToAttrs", "list of attrsets");
+        const Value * nv = el.payload.bindings->lookup(nameSym);
+        const Value * vv = el.payload.bindings->lookup(valueSym);
+        if (!nv || !vv || !nv->isString())
+            typeError("listToAttrs", "{ name = string; value = ...; }");
+        SymbolId k = vmIntern(state, nv->payload.str);
+        entries.emplace_back(k, *vv);
+    }
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
+    // De-duplicate (last-write-wins for nix listToAttrs).
+    std::vector<std::pair<SymbolId, Value>> dedup;
+    dedup.reserve(entries.size());
+    for (auto & p : entries) {
+        if (!dedup.empty() && dedup.back().first == p.first)
+            dedup.back() = p;
+        else
+            dedup.push_back(p);
+    }
+    Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(dedup.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < dedup.size(); ++i) {
+        b->entries[i].name  = dedup[i].first;
+        b->entries[i].value = dedup[i].second;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
+void primRemoveAttrs(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isAttrs()) typeError("removeAttrs", "attrset");
+    if (!args[1].isList())  typeError("removeAttrs", "list of strings");
+    auto * src = args[0].payload.bindings;
+    auto * names = args[1].payload.list;
+    if (!src || !names || names->size == 0) { out = args[0]; return; }
+    std::unordered_set<SymbolId> toRemove;
+    for (uint32_t i = 0; i < names->size; ++i) {
+        const Value & el = names->elems[i];
+        if (!el.isString()) typeError("removeAttrs", "list of strings");
+        toRemove.insert(vmIntern(state, el.payload.str));
+    }
+    Bindings * result = Alloc::allocBindings(src->size);
+    allocStats().attrsetsAllocated++;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < src->size; ++i) {
+        if (toRemove.count(src->entries[i].name) == 0) {
+            result->entries[k++] = src->entries[i];
+        }
+    }
+    result->size = k;
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = result;
+}
+
+void primIntersectAttrs(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isAttrs() || !args[1].isAttrs())
+        typeError("intersectAttrs", "two attrsets");
+    auto * keep = args[0].payload.bindings;
+    auto * src  = args[1].payload.bindings;
+    if (!keep || !src) {
+        Bindings * b = Alloc::allocBindings(0);
+        allocStats().attrsetsAllocated++;
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        return;
+    }
+    Bindings * result = Alloc::allocBindings(src->size);
+    allocStats().attrsetsAllocated++;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < src->size; ++i) {
+        if (keep->lookup(src->entries[i].name))
+            result->entries[k++] = src->entries[i];
+    }
+    result->size = k;
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = result;
+}
+
+void primMapAttrs(EvalState & state, Value * args, Value & out)
+{
+    Value fn = args[0];
+    if (!args[1].isAttrs()) typeError("mapAttrs", "attrset");
+    auto * src = args[1].payload.bindings;
+    if (!src) { out = args[1]; return; }
+    Bindings * result = Alloc::allocBindings(src->size);
+    allocStats().attrsetsAllocated++;
+    for (uint32_t i = 0; i < src->size; ++i) {
+        SymbolId sym = src->entries[i].name;
+        Value nameStr = mkStringValueOwned(std::string(vmSymName(state, sym)));
+        // mapAttrs is curried: fn name value → result.
+        Value step1 = callClosure(*state.vm, fn, nameStr);
+        Value step2 = callClosure(*state.vm, step1, src->entries[i].value);
+        result->entries[i].name  = sym;
+        result->entries[i].value = step2;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = result;
+}
+
+void primElem(EvalState &, Value * args, Value & out)
+{
+    if (!args[1].isList()) typeError("elem", "list");
+    auto * src = args[1].payload.list;
+    const Value & x = args[0];
+    bool found = false;
+    if (src) {
+        for (uint32_t i = 0; i < src->size; ++i) {
+            if (valueEqual(x, src->elems[i])) { found = true; break; }
+        }
+    }
+    out = found ? Value::vTrue : Value::vFalse;
+}
+
 void primLessThan(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
@@ -620,6 +805,11 @@ void registerBuiltinPrimOps()
         registerPrimOp({"partition",          2, primPartition});
         registerPrimOp({"getEnv",             1, primGetEnv});
         registerPrimOp({"compareVersions",    2, primCompareVersions});
+        registerPrimOp({"listToAttrs",        1, primListToAttrs});
+        registerPrimOp({"removeAttrs",        2, primRemoveAttrs});
+        registerPrimOp({"intersectAttrs",     2, primIntersectAttrs});
+        registerPrimOp({"mapAttrs",           2, primMapAttrs});
+        registerPrimOp({"elem",               2, primElem});
     });
 }
 
