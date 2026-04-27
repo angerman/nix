@@ -24,6 +24,7 @@
 #include "v3/primop.hh"
 #include "v3/vm.hh"
 
+#include <algorithm>
 #include <cassert>
 #include <stdexcept>
 #include <unordered_map>
@@ -322,13 +323,29 @@ struct Emitter
     // -- Recursive let / rec attrset
     void emitOne(const ir::LetRec & e)
     {
-        // 1. OP_ATTRS_REC_INIT[n] + n SymbolIds: push placeholder rec
-        //    Bindings on operand stack.
-        unit.code.push_back(encode(OP_ATTRS_REC_INIT, static_cast<uint32_t>(e.entries.size())));
-        for (auto & en : e.entries) unit.code.push_back(en.name);
+        // Sort entries by SymbolId so the resulting Bindings are valid
+        // (Bindings::lookup uses binary search on the sorted array).
+        // Each REC_SET's operand becomes the entry's slot in the
+        // sorted Bindings.
+        const uint32_t n = static_cast<uint32_t>(e.entries.size());
+        std::vector<uint32_t> sortedOrder(n);
+        for (uint32_t i = 0; i < n; ++i) sortedOrder[i] = i;
+        std::sort(sortedOrder.begin(), sortedOrder.end(),
+            [&](uint32_t a, uint32_t b) {
+                return e.entries[a].name < e.entries[b].name;
+            });
+        std::vector<uint32_t> entryToSlot(n);
+        for (uint32_t slot = 0; slot < n; ++slot)
+            entryToSlot[sortedOrder[slot]] = slot;
 
-        // 2. For each entry, build a Thunk capturing whatever upvalues
-        //    its body needs.
+        // 1. OP_ATTRS_REC_INIT[n] + n sorted SymbolIds: push placeholder
+        //    rec Bindings on operand stack.
+        unit.code.push_back(encode(OP_ATTRS_REC_INIT, n));
+        for (uint32_t slot = 0; slot < n; ++slot)
+            unit.code.push_back(e.entries[sortedOrder[slot]].name);
+
+        // 2. For each IR entry, build a Thunk capturing whatever
+        //    upvalues its body needs and write it into the sorted slot.
         //
         //    Each thunk body's freeVars list (sorted by VarId,
         //    populated by computeFreeVars) IS the upvalue layout: the
@@ -342,7 +359,7 @@ struct Emitter
         //    emitVarRef (which would look for a slot/upvalue in the
         //    enclosing function — the rec attrs is on top of the op
         //    stack, not in any slot).
-        for (uint32_t i = 0; i < e.entries.size(); ++i) {
+        for (uint32_t i = 0; i < n; ++i) {
             auto & en = e.entries[i];
             const auto & ff = m.functions[en.thunkBody].freeVars;
             for (auto fv : ff) {
@@ -354,7 +371,7 @@ struct Emitter
             }
             unit.code.push_back(encode(OP_MAKE_THUNK, en.thunkBody));
             unit.code.push_back(static_cast<uint32_t>(ff.size()));
-            unit.code.push_back(encode(OP_ATTRS_REC_SET, i));
+            unit.code.push_back(encode(OP_ATTRS_REC_SET, entryToSlot[i]));
         }
         // After all SETs, rec attrs is on top of the operand stack —
         // becomes the value of the LetRec binding.

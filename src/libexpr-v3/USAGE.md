@@ -94,26 +94,6 @@ allocation, no PrimOpApp).
 
 ## Known limitations
 
-Specific crash to investigate (SIGTRAP, exit 133): chains of three or
-more thunked let-bindings where each calls a primop with a closure
-callback that touches a sibling let-rec binding.  Reproducer:
-
-```
-let
-  fold    = f: nul: list: builtins.foldl' f nul list;
-  sum     = fold (a: b: a + b) 0;
-  myPred  = n: true;
-  evens   = builtins.filter myPred [];          # uses sibling myPred
-  squared = builtins.map (x: x) evens;          # uses sibling evens
-  total   = sum squared;                         # uses sum + squared
-in total
-```
-
-Workarounds: collapse intermediate bindings inline, or write the
-full pipeline directly in the `in <body>` slot.  The crash does not
-reproduce when the same expressions are inlined or when only two
-bindings (filter-then-sum, or filter-then-map) participate.
-
 
 
 Partial application of multi-arg primops:

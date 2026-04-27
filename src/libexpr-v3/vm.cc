@@ -621,27 +621,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_ATTRS_REC_INIT: {
-            // For now: same as non-rec.  Real recursion is achieved by the
-            // AST → IR pass wrapping each entry's value in MkThunk that
-            // captures the (yet-to-be-built) self-attrset; that requires
-            // either fix-up on the thunk or a different lowering strategy
-            // (see v2's IRRecAttrSet).  Stub: emit a non-rec attrset.
+            // Allocate a Bindings(n) with placeholder values; values
+            // are written later by OP_ATTRS_REC_SET[slot].  Names come
+            // pre-sorted from emit (LetRec emit sorts entries by
+            // SymbolId before writing the data words and rewrites the
+            // REC_SET operand to the sorted slot).
             uint32_t n = operand;
-            std::vector<SymbolId> names(n);
-            for (uint32_t i = 0; i < n; ++i) names[i] = static_cast<SymbolId>(cu->code[ip + i]);
-            ip += n;
-            std::vector<Value> values(n);
-            for (uint32_t i = n; i > 0; --i) values[i - 1] = pop(vm);
-            std::vector<std::pair<SymbolId, Value>> entries(n);
-            for (uint32_t i = 0; i < n; ++i) entries[i] = {names[i], values[i]};
-            std::sort(entries.begin(), entries.end(),
-                      [](auto & a, auto & b) { return a.first < b.first; });
             Bindings * b = Alloc::allocBindings(n);
             allocStats().attrsetsAllocated++;
             for (uint32_t i = 0; i < n; ++i) {
-                b->entries[i].name = entries[i].first;
-                b->entries[i].value = entries[i].second;
+                b->entries[i].name = static_cast<SymbolId>(cu->code[ip + i]);
+                b->entries[i].value.mkNull();
             }
+            ip += n;
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
