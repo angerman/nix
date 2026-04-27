@@ -750,6 +750,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 arg = forcedArg;
             }
 
+            // Max call-depth check — guards `(x: x x) (x: x x)` and
+            // similar non-thunk-mediated infinite recursion.  Tree-walker
+            // defaults to 5000; we match that.  Cheap O(1) check.
+            constexpr size_t kMaxCallDepth = 5000;
+            if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
+                throw std::runtime_error("v3 OP_CALL: stack overflow; call depth exceeded "
+                                          + std::to_string(kMaxCallDepth));
+
             vm.frames.back().ip = ip;
 
             size_t newBase = vm.valueStack.size();
