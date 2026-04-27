@@ -452,10 +452,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
 
         // --- Arithmetic ---
+        // Int operations check for overflow via __builtin_*_overflow:
+        // tree-walker raises an integer-overflow error, and v3 should
+        // match.  Float operations have no such check (NaN/Inf semantics
+        // mirror IEEE-754, same as tree-walker).
         case OP_ADD: {
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
-            if (lhs.isInt() && rhs.isInt())          r.mkInt(lhs.payload.i + rhs.payload.i);
+            if (lhs.isInt() && rhs.isInt()) {
+                int64_t sum;
+                if (__builtin_add_overflow(lhs.payload.i, rhs.payload.i, &sum))
+                    throw std::runtime_error("v3 OP_ADD: integer overflow");
+                r.mkInt(sum);
+            }
             else if (lhs.isFloat() && rhs.isFloat()) r.mkFloat(lhs.payload.f + rhs.payload.f);
             else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) + rhs.payload.f);
             else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f + static_cast<double>(rhs.payload.i));
@@ -466,7 +475,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_SUB: {
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
-            if (lhs.isInt() && rhs.isInt())          r.mkInt(lhs.payload.i - rhs.payload.i);
+            if (lhs.isInt() && rhs.isInt()) {
+                int64_t diff;
+                if (__builtin_sub_overflow(lhs.payload.i, rhs.payload.i, &diff))
+                    throw std::runtime_error("v3 OP_SUB: integer overflow");
+                r.mkInt(diff);
+            }
             else if (lhs.isFloat() && rhs.isFloat()) r.mkFloat(lhs.payload.f - rhs.payload.f);
             else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) - rhs.payload.f);
             else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f - static_cast<double>(rhs.payload.i));
@@ -477,7 +491,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_MUL: {
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
-            if (lhs.isInt() && rhs.isInt())          r.mkInt(lhs.payload.i * rhs.payload.i);
+            if (lhs.isInt() && rhs.isInt()) {
+                int64_t prod;
+                if (__builtin_mul_overflow(lhs.payload.i, rhs.payload.i, &prod))
+                    throw std::runtime_error("v3 OP_MUL: integer overflow");
+                r.mkInt(prod);
+            }
             else if (lhs.isFloat() && rhs.isFloat()) r.mkFloat(lhs.payload.f * rhs.payload.f);
             else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) * rhs.payload.f);
             else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f * static_cast<double>(rhs.payload.i));
@@ -1189,12 +1208,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Ultra-fast path: 2 ints with no forceStr — covers every
             // arithmetic `a + b` over ints, which is the dominant case
             // on compute-bound benchmarks like fib.  Skip the small[]
-            // setup, the loop, and the per-part type checks.
+            // setup, the loop, and the per-part type checks.  Match
+            // tree-walker by raising on overflow.
             if (!forceStr && n == 2) {
                 Value & top1 = vm.valueStack.back();
                 Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
                 if (top0.isInt() && top1.isInt()) {
-                    int64_t sum = top0.payload.i + top1.payload.i;
+                    int64_t sum;
+                    if (__builtin_add_overflow(top0.payload.i, top1.payload.i, &sum))
+                        throw std::runtime_error("v3 OP_STR_CONCAT: integer overflow");
                     vm.valueStack.pop_back();
                     vm.valueStack.back().mkInt(sum);
                     break;
@@ -1224,7 +1246,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 Value r;
                 if (allInt) {
                     int64_t sum = 0;
-                    for (uint32_t i = 0; i < n; ++i) sum += parts[i].payload.i;
+                    for (uint32_t i = 0; i < n; ++i) {
+                        if (__builtin_add_overflow(sum, parts[i].payload.i, &sum))
+                            throw std::runtime_error("v3 OP_STR_CONCAT: integer overflow");
+                    }
                     r.mkInt(sum);
                 } else {
                     double sum = 0.0;
