@@ -998,6 +998,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 entries[i] = {names[i], values[i], poses[i]};
             std::sort(entries.begin(), entries.end(),
                       [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
+            // After sort, duplicate names are adjacent — match
+            // tree-walker by raising on dup-static-attr.
+            for (uint32_t i = 1; i < n; ++i) {
+                if (std::get<0>(entries[i]) == std::get<0>(entries[i - 1])) {
+                    const auto & tbl = ir::globalSymbolTable();
+                    SymbolId nm = std::get<0>(entries[i]);
+                    std::string s = (nm < tbl.size()) ? tbl[nm] : "?";
+                    throw std::runtime_error("v3 OP_ATTRS_INIT: attribute '" + s +
+                                              "' already defined");
+                }
+            }
             Bindings * b = Alloc::allocBindings(n);
             allocStats().attrsetsAllocated++;
             for (uint32_t i = 0; i < n; ++i) {
@@ -1054,6 +1065,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             std::sort(entries.begin(), entries.end(),
                       [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
+            // Dup-attr detection: after sort, duplicates are adjacent.
+            for (size_t i = 1; i < entries.size(); ++i) {
+                if (std::get<0>(entries[i]) == std::get<0>(entries[i - 1])) {
+                    const auto & tbl = ir::globalSymbolTable();
+                    SymbolId nm = std::get<0>(entries[i]);
+                    std::string s = (nm < tbl.size()) ? tbl[nm] : "?";
+                    throw std::runtime_error("v3 OP_ATTRS_INIT_DYN: attribute '" + s +
+                                              "' already defined");
+                }
+            }
             Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
             allocStats().attrsetsAllocated++;
             for (size_t i = 0; i < entries.size(); ++i) {
