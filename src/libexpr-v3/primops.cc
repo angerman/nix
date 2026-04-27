@@ -899,6 +899,51 @@ void primSplitString(EvalState &, Value * args, Value & out)
     out.payload.list = lv;
 }
 
+/// builtins.functionArgs lam → { name = false; ... } where the bool
+/// indicates whether the formal has a default value.  For simple
+/// lambdas (no formals) returns an empty attrset.
+void primFunctionArgs(EvalState &, Value * args, Value & out)
+{
+    Value v = args[0];
+    if (v.tag() == Tag::Closure && v.payload.closure && v.payload.closure->desc) {
+        const LambdaDescriptor * desc = v.payload.closure->desc;
+        if (!desc->hasFormals) {
+            Bindings * b = Alloc::allocBindings(0);
+            allocStats().attrsetsAllocated++;
+            out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+            out.payload.bindings = b;
+            return;
+        }
+        // Build sorted entries.
+        std::vector<std::pair<SymbolId, Value>> entries;
+        entries.reserve(desc->formals.size());
+        for (auto & f : desc->formals) {
+            Value bv = f.second ? Value::vTrue : Value::vFalse;
+            entries.emplace_back(f.first, bv);
+        }
+        std::sort(entries.begin(), entries.end(),
+            [](auto & a, auto & b) { return a.first < b.first; });
+        Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+        allocStats().attrsetsAllocated++;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            b->entries[i].name  = entries[i].first;
+            b->entries[i].value = entries[i].second;
+        }
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        return;
+    }
+    if (v.tag() == Tag::PrimOp || v.tag() == Tag::PrimOpApp) {
+        // PrimOps don't have introspectable formals; return empty.
+        Bindings * b = Alloc::allocBindings(0);
+        allocStats().attrsetsAllocated++;
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        return;
+    }
+    typeError("functionArgs", "lambda");
+}
+
 /// nlohmann::json -> v3 Value (recursive).
 Value jsonToValue(EvalState & state, const nlohmann::json & j)
 {
@@ -1206,6 +1251,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"parseInt",           1, primParseInt});
         registerPrimOp({"fromJSON",           1, primFromJSON});
         registerPrimOp({"toJSON",             1, primToJSON});
+        registerPrimOp({"functionArgs",       1, primFunctionArgs});
     });
 }
 

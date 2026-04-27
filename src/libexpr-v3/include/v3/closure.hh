@@ -28,6 +28,8 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <utility>
+#include <vector>
 
 namespace nix::v3 {
 
@@ -112,7 +114,13 @@ struct LambdaDescriptor
     uint16_t nLocals;       // stack slots needed in the body's frame
     uint8_t  arity;         // 1 for simple `x: ...`; >1 for currying (later)
     uint8_t  hasFormals;    // 0 = simple arg, 1 = formals attrset
-    // Future: formals signature, default-arg blocks, etc.
+
+    /// Formal parameters (`{a, b ? def}: body`).  Each entry is the
+    /// SymbolId of the formal name plus a flag indicating whether it
+    /// has a default value.  Used by `builtins.functionArgs` to
+    /// introspect the function's parameter list.  Empty for simple
+    /// `x: ...` lambdas.
+    std::vector<std::pair<uint32_t, bool>> formals;
 };
 
 struct ThunkDescriptor

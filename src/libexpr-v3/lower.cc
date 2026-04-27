@@ -309,6 +309,17 @@ struct Lowerer
             // Param is the attrset.  Formals get extracted from it.
             m.functions[fid].argName    = e->arg ? internSym(e->arg) : ir::kInvalidSymbol;
             m.functions[fid].hasFormals = true;
+            m.functions[fid].ellipsis   = formals->ellipsis;
+            // Record formals for builtins.functionArgs introspection.
+            m.functions[fid].formals.reserve(formals->formals.size());
+            for (auto & fm : formals->formals) {
+                ir::Formal ifm;
+                ifm.name = internSym(fm.name);
+                // We don't yet propagate default-block IDs through;
+                // for functionArgs we only need the has-default flag.
+                ifm.defaultBlock = fm.def ? 1u : ir::kInvalidBlock;
+                m.functions[fid].formals.push_back(ifm);
+            }
 
             funcStack.push_back(fid);
             blockStack.push_back(entry);

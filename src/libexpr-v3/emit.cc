@@ -499,7 +499,14 @@ struct Emitter
             .nLocals        = fc.nLocals,
             .arity          = static_cast<uint8_t>(f.argName != ir::kInvalidSymbol ? 1 : (f.hasFormals ? 1 : 0)),
             .hasFormals     = static_cast<uint8_t>(f.hasFormals ? 1 : 0),
+            .formals        = {},
         };
+        if (f.hasFormals) {
+            auto & desc = unit.lambdas[fid];
+            desc.formals.reserve(f.formals.size());
+            for (auto & fm : f.formals)
+                desc.formals.emplace_back(fm.name, fm.defaultBlock != ir::kInvalidBlock);
+        }
         unit.lambdaCodeOffsets[fid] = codeStart;
 
         ctx = nullptr;
