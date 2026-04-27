@@ -1074,6 +1074,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // --- Lists ---
         case OP_LIST_INIT: {
             uint32_t n = operand;
+            // Empty list: skip the alloc, push the singleton.  Common
+            // for default formals (`xs ? []`) and branch results.
+            if (n == 0) {
+                push(vm, Value::vEmptyList);
+                break;
+            }
             ListVec * l = Alloc::allocList(n);
             allocStats().listsAllocated++;
             for (uint32_t i = n; i > 0; --i) l->elems[i - 1] = pop(vm);
@@ -1103,6 +1109,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // --- Attrsets ---
         case OP_ATTRS_INIT: {
             uint32_t n = operand;
+            // Empty attrset: skip the alloc entirely, push the singleton.
+            // Real-world Nix code creates many empty attrsets (default
+            // formal `... ? {}`, branch results etc.) — not allocating
+            // them is cheap and reduces GC pressure.
+            if (n == 0) {
+                push(vm, Value::vEmptyAttrs);
+                break;
+            }
             // Each entry is a (SymbolId, PosIdx) pair inlined as 2 code
             // words.  PosIdx feeds the per-attr position side-table that
             // backs `builtins.unsafeGetAttrPos`.

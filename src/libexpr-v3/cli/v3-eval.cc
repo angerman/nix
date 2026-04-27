@@ -207,7 +207,12 @@ static void printNixValue(std::ostream & out, const Value & v,
         return;
     }
     case Tag::Attrs: {
-        if (v.payload.bindings && !seen.insert(v.payload.bindings).second) {
+        // Empty attrsets share the global singleton — tracking them in
+        // `seen` would (incorrectly) print `«repeated»` for every
+        // sibling empty attrset.  Only deduplicate non-empty attrsets,
+        // which is where shared-Bindings cycles actually matter.
+        if (v.payload.bindings && v.payload.bindings->size > 0 &&
+            !seen.insert(v.payload.bindings).second) {
             out << "«repeated»"; return;
         }
         out << "{ ";
