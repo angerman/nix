@@ -1381,7 +1381,9 @@ void primMatch(EvalState &, Value * args, Value & out)
     if (!args[0].isString() || !args[1].isString())
         typeError("match", "(regex, string)");
     try {
-        std::regex re(args[0].payload.str);
+        // Match tree-walker: POSIX extended regex (`.` matches newline,
+        // POSIX bracket classes like [[:alnum:]] work).
+        std::regex re(args[0].payload.str, std::regex::extended);
         std::cmatch m;
         if (!std::regex_match(args[1].payload.str, m, re)) {
             out = Value::vNull;
@@ -1411,7 +1413,7 @@ void primSplit(EvalState &, Value * args, Value & out)
     if (!args[0].isString() || !args[1].isString())
         typeError("split", "(regex, string)");
     try {
-        std::regex re(args[0].payload.str);
+        std::regex re(args[0].payload.str, std::regex::extended);
         std::string_view s(args[1].payload.str);
         std::vector<Value> parts;
         std::cregex_iterator it(s.data(), s.data() + s.size(), re);
