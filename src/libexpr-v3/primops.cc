@@ -901,15 +901,33 @@ void primDeepSeq(EvalState & state, Value * args, Value & out)
 void primUnsafeGetAttrPos(EvalState &, Value *, Value & out) { out.mkNull(); }
 
 /// builtins.toPath path-or-string -> path; bring-up uses identity.
-void primToPath(EvalState &, Value * args, Value & out)
+/// Also accepts attrsets with `__toString` or `outPath` (the standard
+/// Nix coercion path).
+void primToPath(EvalState & state, Value * args, Value & out)
 {
-    if (args[0].isPath())   { out = args[0]; return; }
-    if (args[0].isString()) {
-        char * buf = static_cast<char *>(std::malloc(std::strlen(args[0].payload.str) + 1));
-        std::strcpy(buf, args[0].payload.str);
+    auto fromString = [&](const char * s) {
+        char * buf = static_cast<char *>(std::malloc(std::strlen(s) + 1));
+        std::strcpy(buf, s);
         out.tag_payload = static_cast<uint64_t>(Tag::Path);
         out.payload.path = buf;
-        return;
+    };
+    Value v = forceValue(*state.vm, args[0]);
+    if (v.isPath())   { out = v; return; }
+    if (v.isString()) { fromString(v.payload.str); return; }
+    if (v.isAttrs() && v.payload.bindings) {
+        static const SymbolId tsId  = ir::globalInternSymbol("__toString");
+        static const SymbolId outId = ir::globalInternSymbol("outPath");
+        if (auto * fn = v.payload.bindings->lookup(tsId)) {
+            Value forced = forceValue(*state.vm, *fn);
+            Value s = callClosure(*state.vm, forced, v);
+            s = forceValue(*state.vm, s);
+            if (s.isString()) { fromString(s.payload.str); return; }
+        }
+        if (auto * op = v.payload.bindings->lookup(outId)) {
+            Value forced = forceValue(*state.vm, *op);
+            if (forced.isString()) { fromString(forced.payload.str); return; }
+            if (forced.isPath())   { out = forced; return; }
+        }
     }
     typeError("toPath", "string or path");
 }
@@ -1292,10 +1310,14 @@ void primHashString(EvalState &, Value * args, Value & out)
 
 void primHashFile(EvalState &, Value * args, Value & out)
 {
-    if (!args[0].isString() || !args[1].isString())
+    if (!args[0].isString())
         typeError("hashFile", "(algo, path)");
+    std::string path;
+    if (args[1].isString())     path = args[1].payload.str;
+    else if (args[1].isPath())  path = args[1].payload.path;
+    else typeError("hashFile", "(algo, path)");
     auto algo = parseHashAlgo(args[0].payload.str);
-    auto h = nix::hashFile(algo, args[1].payload.str);
+    auto h = nix::hashFile(algo, path);
     out = mkStringValueOwned(h.to_string(nix::HashFormat::Base16, false));
 }
 
