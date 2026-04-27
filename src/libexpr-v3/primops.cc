@@ -2349,17 +2349,75 @@ void primPath(EvalState & state, Value * args, Value & out)
 }
 
 /// builtins.scopedImport scope path -- like import, but extends the
-/// base env with `scope`'s entries while evaluating the file.  v3
-/// doesn't have the same kind of overridable base env tree-walker
-/// uses, so for simple cases we just route through primImport (the
-/// scope is ignored for now).  This is enough for tests that use
-/// scopedImport for library wrappers without overriding builtins.
+/// base env with `scope`'s entries while evaluating the file.
+///
+/// Strategy: build a synthetic AST `λ __scope__: with __scope__; <body>`
+/// where the body is parsed against a custom staticEnv that has the
+/// scope's keys at the front (so they shadow the base-env primops on
+/// lookup, e.g. `import` in scope wins over the builtin `import`).
+/// parseExprFromString runs bindVars in one pass; the resulting v3
+/// closure is then applied to the scope value.
 void primScopedImport(EvalState & state, Value * args, Value & out)
 {
-    // args[0] is the scope (an attrset), args[1] is the path.
-    // For now we ignore scope and route through import.
-    Value importArg = args[1];
-    primImport(state, &importArg, out);
+    if (!state.nixEvalState)
+        throw std::runtime_error("v3 primop scopedImport: no nix EvalState wired");
+    Value scope = forceValue(*state.vm, args[0]);
+    if (!scope.isAttrs() || !scope.payload.bindings)
+        typeError("scopedImport", "(attrset, path)");
+    std::string path;
+    if (args[1].isString()) path = args[1].payload.str;
+    else if (args[1].isPath()) path = args[1].payload.path;
+    else typeError("scopedImport", "(attrset, path)");
+
+    auto & ns = *state.nixEvalState;
+
+    // Resolve path through symlinks + maybe append default.nix.
+    nix::SourcePath sp(ns.rootFS, nix::CanonPath(path));
+    sp = nix::resolveExprPath(sp);
+
+    // Read file source and synthesize a wrapper that re-binds every
+    // scope attribute as a let binding so it shadows the base-env
+    // primops (otherwise `import` etc. would resolve to the builtin
+    // before our `with __scope__;` got a chance).  This mirrors
+    // tree-walker's scopedImport which adds the scope to a staticEnv
+    // *above* staticBaseEnv.
+    std::string src = sp.resolveSymlinks().readFile();
+    std::string wrapped;
+    wrapped += "__scope__: let ";
+    auto * sb = scope.payload.bindings;
+    auto & symTab = ir::globalSymbolTable();
+    for (uint32_t i = 0; i < sb->size; ++i) {
+        SymbolId sid = sb->entries[i].name;
+        std::string n = sid < symTab.size() ? symTab[sid] : "";
+        if (n.empty()) continue;
+        // Quote names that can't be plain identifiers.  Conservative:
+        // allow [a-zA-Z_][a-zA-Z0-9_'-]*.
+        bool plain = !n.empty() &&
+            ((n[0] >= 'a' && n[0] <= 'z') || (n[0] >= 'A' && n[0] <= 'Z') || n[0] == '_');
+        for (size_t k = 1; plain && k < n.size(); ++k) {
+            char c = n[k];
+            plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                 || (c >= '0' && c <= '9') || c == '_' || c == '\'' || c == '-';
+        }
+        // Skip reserved keywords.
+        if (n == "if" || n == "then" || n == "else" || n == "assert"
+            || n == "with" || n == "let" || n == "in" || n == "rec"
+            || n == "inherit" || n == "or") continue;
+        if (!plain) continue;
+        wrapped += n + " = __scope__." + n + "; ";
+    }
+    wrapped += "in (\n" + src + "\n)";
+
+    nix::Expr * wrapper = ns.parseExprFromString(wrapped, sp.parent());
+
+    auto module = lowerNixExpr(wrapper, ns.symbols, ns.positions);
+    nix::v3::ir::computeFreeVars(module);
+    auto & cache = importCache();
+    cache.cus.push_back(compile(module));
+    Value fn = run(cache.cus.back());
+
+    // Apply the lambda to the scope value.
+    out = callClosure(*state.vm, fn, scope);
 }
 
 /// builtins.functionArgs lam → { name = false; ... } where the bool
