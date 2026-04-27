@@ -427,9 +427,10 @@ struct Lowerer
     /// the function's normal upvalue mechanism.
     ir::VarId lowerLet(nix::ExprLet * e)
     {
-        if (e->attrs->inheritFromExprs && !e->attrs->inheritFromExprs->empty())
-            unsupported("let with inherit (from)");
-        return lowerLetRec(e->attrs->attrs.value(), /*hasBody=*/true, e->body);
+        return lowerLetRec(
+            e->attrs->attrs.value(),
+            e->attrs->inheritFromExprs ? e->attrs->inheritFromExprs.get() : nullptr,
+            /*isRec=*/true, /*hasBody=*/true, e->body);
     }
 
     ir::VarId lowerList(nix::ExprList * e)
@@ -450,33 +451,46 @@ struct Lowerer
     {
         if (e->dynamicAttrs && !e->dynamicAttrs->empty())
             unsupported("attrset with dynamic attrs");
-        if (e->inheritFromExprs && !e->inheritFromExprs->empty())
-            unsupported("attrset with inherit (from)");
 
-        if (e->recursive) {
-            // Build a LetRec that ends with the rec attrset as the binding
-            // value (no body, unlike ExprLet).
-            return lowerLetRec(e->attrs.value(), /*hasBody=*/false, /*body=*/nullptr);
+        bool hasInheritFrom = e->inheritFromExprs && !e->inheritFromExprs->empty();
+
+        if (e->recursive || hasInheritFrom) {
+            return lowerLetRec(
+                e->attrs.value(),
+                hasInheritFrom ? e->inheritFromExprs.get() : nullptr,
+                /*isRec=*/e->recursive,
+                /*hasBody=*/false, /*body=*/nullptr);
         }
 
         std::vector<ir::AttrSet::Entry> entries;
         for (auto & kv : *e->attrs) {
             const auto & sym = kv.first;
             const auto & def = kv.second;
-            if (def.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom)
-                unsupported("attrset with inherit (from)");
             ir::VarId vv = lowerExpr(def.e);
             entries.push_back({internSym(sym), vv});
         }
         return addBinding(ir::AttrSet{std::move(entries)});
     }
 
-    /// Shared between ExprLet and `rec { ... }`: build the rec attrset
-    /// via LetRec, optionally lower a body in the rec scope.
+    /// Shared between ExprLet and ExprAttrs (both rec and non-rec when
+    /// non-rec needs the env-carrier path for InheritedFrom).
+    ///
+    /// `isRec` tracks whether the new env should be visible while
+    /// lowering inherit-from source expressions:
+    ///   - ExprLet and rec attrsets: from-exprs are bound in newEnv,
+    ///     so we push the rec scope before lowering.
+    ///   - non-rec attrsets: from-exprs are bound in env (parent), so
+    ///     we lower them with the surrounding scope only.
+    ///
+    /// `inheritFromExprs` is the ExprAttrs's `inherit (from) ...`
+    /// sources (or nullptr / empty if none).  InheritedFrom bindings'
+    /// def.e is an ExprInheritFrom whose displ indexes into this list.
     ///
     /// Returns the body's VarId when hasBody=true, otherwise the rec
     /// attrset's VarId.
     ir::VarId lowerLetRec(nix::ExprAttrs::AttrDefs & attrDefs,
+                          std::pmr::vector<nix::Expr *> * inheritFromExprs,
+                          bool isRec,
                           bool hasBody, nix::Expr * body)
     {
         ir::VarId recVar = m.freshVar();
@@ -492,8 +506,6 @@ struct Lowerer
         pending.reserve(attrDefs.size());
 
         for (auto & kv : attrDefs) {
-            if (kv.second.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom)
-                unsupported("rec/let with inherit (from)");
             m.functions.emplace_back();
             ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
             auto eb = m.freshBlock();
@@ -514,12 +526,42 @@ struct Lowerer
         for (auto & p : pending) {
             funcStack.push_back(p.funcIdx);
             blockStack.push_back(p.entryBlock);
-            if (p.kind == nix::ExprAttrs::AttrDef::Kind::Plain)
+            switch (p.kind) {
+            case nix::ExprAttrs::AttrDef::Kind::Plain: {
                 scopes.push_back(recScope);
-            ir::VarId rv = lowerExpr(p.defE);
-            setReturn(rv);
-            if (p.kind == nix::ExprAttrs::AttrDef::Kind::Plain)
+                ir::VarId rv = lowerExpr(p.defE);
+                setReturn(rv);
                 scopes.pop_back();
+                break;
+            }
+            case nix::ExprAttrs::AttrDef::Kind::Inherited: {
+                ir::VarId rv = lowerExpr(p.defE);
+                setReturn(rv);
+                break;
+            }
+            case nix::ExprAttrs::AttrDef::Kind::InheritedFrom: {
+                if (!inheritFromExprs)
+                    unsupported("InheritedFrom without inheritFromExprs");
+                auto * eif = static_cast<nix::ExprInheritFrom *>(p.defE);
+                uint32_t fromIdx = eif->displ;
+                if (fromIdx >= inheritFromExprs->size())
+                    unsupported("InheritedFrom: displ out of range");
+                nix::Expr * fromE = (*inheritFromExprs)[fromIdx];
+                // For ExprLet and `rec { }` (isRec=true), the from-expr
+                // was bindVars'd in newEnv (the rec scope) — push the
+                // rec scope so its level/displ resolve correctly.  For
+                // non-rec attrsets the from-expr is bound in env
+                // (parent), so we lower it with only the surrounding
+                // scopes visible.
+                if (isRec) scopes.push_back(recScope);
+                ir::VarId from = lowerExpr(fromE);
+                if (isRec) scopes.pop_back();
+                ir::VarId selV = addBinding(ir::AttrSelect{from, internSym(p.sym)});
+                ir::VarId forced = addBinding(ir::Force{selV});
+                setReturn(forced);
+                break;
+            }
+            }
             blockStack.pop_back();
             funcStack.pop_back();
         }
