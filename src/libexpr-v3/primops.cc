@@ -604,23 +604,17 @@ void primPartition(EvalState & state, Value * args, Value & out)
     out.payload.bindings = b;
 }
 
-/// Helper: intern a string into the running CU's symbolTable.
-inline SymbolId vmIntern(EvalState & state, std::string_view s)
+/// Helper: intern a string into the global symbol table so the
+/// resulting SymbolId is usable across CUs (matches what lower.cc
+/// emits in OP_ATTRS_INIT and what attrset bindings store).
+inline SymbolId vmIntern(EvalState & /*state*/, std::string_view s)
 {
-    if (!state.vm || state.vm->frames.empty())
-        throw std::runtime_error("vmIntern: missing VM context");
-    auto & st = const_cast<std::vector<std::string> &>(
-        state.vm->frames.back().cu->symbolTable);
-    for (size_t i = 0; i < st.size(); ++i)
-        if (st[i] == s) return static_cast<SymbolId>(i);
-    st.emplace_back(s);
-    return static_cast<SymbolId>(st.size() - 1);
+    return ir::globalInternSymbol(s);
 }
 
-inline std::string_view vmSymName(EvalState & state, SymbolId id)
+inline std::string_view vmSymName(EvalState & /*state*/, SymbolId id)
 {
-    if (!state.vm || state.vm->frames.empty()) return "";
-    auto & st = state.vm->frames.back().cu->symbolTable;
+    auto & st = ir::globalSymbolTable();
     return id < st.size() ? std::string_view(st[id]) : std::string_view("");
 }
 
@@ -854,12 +848,46 @@ void primSeq(EvalState &, Value * args, Value & out)
     out = args[1];
 }
 
-void primDeepSeq(EvalState &, Value * args, Value & out)
+/// Recursively force every thunk reachable from `v`, propagating any
+/// error.  Lists/attrsets are traversed; functions are not entered.
+static Value forceDeepRec(VMState & vm, Value v)
 {
-    // Same as seq for now (full deep traversal would touch every
-    // thunk in the structure).
-    (void)args;
+    v = forceValue(vm, v);
+    if (v.isList() && v.payload.list) {
+        for (uint32_t i = 0; i < v.payload.list->size; ++i)
+            v.payload.list->elems[i] = forceDeepRec(vm, v.payload.list->elems[i]);
+    } else if (v.isAttrs() && v.payload.bindings) {
+        for (uint32_t i = 0; i < v.payload.bindings->size; ++i)
+            v.payload.bindings->entries[i].value =
+                forceDeepRec(vm, v.payload.bindings->entries[i].value);
+    }
+    return v;
+}
+
+void primDeepSeq(EvalState & state, Value * args, Value & out)
+{
+    // Force `args[0]` deeply, throwing on any contained error, then
+    // return `args[1]`.  Matches tree-walker semantics — used to
+    // ensure errors in lazy structure are surfaced before returning.
+    forceDeepRec(*state.vm, args[0]);
     out = args[1];
+}
+
+/// builtins.trace msg val: print msg to stderr, return val unchanged.
+void primTrace(EvalState &, Value * args, Value & out)
+{
+    if (args[0].isString())
+        std::fprintf(stderr, "trace: %s\n", args[0].payload.str);
+    else
+        std::fprintf(stderr, "trace: <non-string>\n");
+    out = args[1];
+}
+
+/// builtins.traceVerbose: same as trace but only when --trace-verbose;
+/// for v3 we treat it as plain trace (no flag plumbing yet).
+void primTraceVerbose(EvalState & state, Value * args, Value & out)
+{
+    primTrace(state, args, out);
 }
 
 void primBaseNameOf(EvalState &, Value * args, Value & out)
@@ -1740,6 +1768,8 @@ void registerBuiltinPrimOps()
         registerPrimOp({"abort",              1, primAbort});
         registerPrimOp({"seq",                2, primSeq});
         registerPrimOp({"deepSeq",            2, primDeepSeq});
+        registerPrimOp({"trace",              2, primTrace});
+        registerPrimOp({"traceVerbose",       2, primTraceVerbose});
         registerPrimOp({"tryEval",            1, primTryEval});
         registerPrimOp({"baseNameOf",         1, primBaseNameOf});
         registerPrimOp({"dirOf",              1, primDirOf});
