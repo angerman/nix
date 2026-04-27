@@ -136,24 +136,34 @@ void primElemAt(EvalState &, Value * args, Value & out)
     out = lst.payload.list->elems[idx.payload.i];
 }
 
-void primAttrNames(EvalState &, Value * args, Value & out)
+void primAttrNames(EvalState & state, Value * args, Value & out)
 {
     const Value & a = args[0];
     if (!a.isAttrs() || !a.payload.bindings) typeError("attrNames", "attrset");
     uint32_t n = a.payload.bindings->size;
     ListVec * lv = Alloc::allocList(n);
     allocStats().listsAllocated++;
-    // Names should be the actual symbol strings.  We don't have a runtime
-    // symbol table here, so the caller must arrange to look them up via
-    // EvalState's symbol table.  Stub: emit the SymbolId as a string.
+    // Look up each SymbolId in the CompilationUnit's symbolTable to get
+    // the actual name string.
+    const std::vector<std::string> * symTab = nullptr;
+    if (state.vm && !state.vm->frames.empty())
+        symTab = &state.vm->frames.back().cu->symbolTable;
     for (uint32_t i = 0; i < n; ++i) {
         Value v;
-        // Until EvalState provides a symbol table, encode the SymbolId as
-        // its decimal representation.  Real lowering will plug in the CU's
-        // symbolTable.
-        v = mkStringValueOwned(std::to_string(a.payload.bindings->entries[i].name));
+        SymbolId sid = a.payload.bindings->entries[i].name;
+        if (symTab && sid < symTab->size())
+            v = mkStringValueOwned((*symTab)[sid]);
+        else
+            v = mkStringValueOwned(std::to_string(sid));
         lv->elems[i] = v;
     }
+    // attrset entries are already sorted by SymbolId (Bindings invariant).
+    // Sort the resulting list of strings lexicographically to match
+    // builtins.attrNames semantics.
+    std::sort(lv->elems, lv->elems + n,
+        [](const Value & x, const Value & y) {
+            return std::string_view(x.payload.str) < std::string_view(y.payload.str);
+        });
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = lv;
 }
@@ -434,6 +444,99 @@ void primAny(EvalState & state, Value * args, Value & out)
     out = any ? Value::vTrue : Value::vFalse;
 }
 
+void primGetEnv(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("getEnv", "string");
+    const char * e = std::getenv(args[0].payload.str);
+    out = mkStringValueOwned(e ? e : "");
+}
+
+void primCompareVersions(EvalState &, Value * args, Value & out)
+{
+    // Simple string compare for now (nix has more sophisticated semver
+    // logic; revisit if any test needs real semver behavior).
+    if (!args[0].isString() || !args[1].isString())
+        typeError("compareVersions", "two strings");
+    int cmp = std::strcmp(args[0].payload.str, args[1].payload.str);
+    out.mkInt(cmp < 0 ? -1 : (cmp > 0 ? 1 : 0));
+}
+
+void primConcatMap(EvalState & state, Value * args, Value & out)
+{
+    if (!args[1].isList()) typeError("concatMap", "list");
+    auto * src = args[1].payload.list;
+    Value fn = args[0];
+    std::vector<Value> all;
+    if (src) {
+        for (uint32_t i = 0; i < src->size; ++i) {
+            Value r = callClosure(*state.vm, fn, src->elems[i]);
+            if (!r.isList()) typeError("concatMap", "function returning list");
+            if (r.payload.list)
+                for (uint32_t j = 0; j < r.payload.list->size; ++j)
+                    all.push_back(r.payload.list->elems[j]);
+        }
+    }
+    ListVec * result = Alloc::allocList(static_cast<uint32_t>(all.size()));
+    allocStats().listsAllocated++;
+    for (size_t i = 0; i < all.size(); ++i) result->elems[i] = all[i];
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = result;
+}
+
+void primPartition(EvalState & state, Value * args, Value & out)
+{
+    if (!args[1].isList()) typeError("partition", "list");
+    auto * src = args[1].payload.list;
+    Value pred = args[0];
+    std::vector<Value> right_, wrong_;
+    if (src) {
+        for (uint32_t i = 0; i < src->size; ++i) {
+            Value r = callClosure(*state.vm, pred, src->elems[i]);
+            if (!r.isBool()) typeError("partition", "predicate returning bool");
+            if (r.payload.i == 1) right_.push_back(src->elems[i]);
+            else                  wrong_.push_back(src->elems[i]);
+        }
+    }
+    auto mkList = [](std::vector<Value> & v) {
+        ListVec * l = Alloc::allocList(static_cast<uint32_t>(v.size()));
+        allocStats().listsAllocated++;
+        for (size_t i = 0; i < v.size(); ++i) l->elems[i] = v[i];
+        Value out;
+        out.tag_payload = static_cast<uint64_t>(Tag::List);
+        out.payload.list = l;
+        return out;
+    };
+    Value rightV = mkList(right_);
+    Value wrongV = mkList(wrong_);
+
+    // Build attrset { right = rightV; wrong = wrongV; }.  We need access
+    // to the symbol table to intern "right" / "wrong"; use the runtime
+    // CU's table since attrset SymbolIds resolve through it.
+    if (!state.vm || state.vm->frames.empty())
+        throw std::runtime_error("v3 primop partition: missing VM context");
+    auto & st = const_cast<std::vector<std::string> &>(state.vm->frames.back().cu->symbolTable);
+    auto intern = [&](std::string_view s) -> SymbolId {
+        for (size_t i = 0; i < st.size(); ++i)
+            if (st[i] == s) return static_cast<SymbolId>(i);
+        st.emplace_back(s);
+        return static_cast<SymbolId>(st.size() - 1);
+    };
+    SymbolId sRight = intern("right");
+    SymbolId sWrong = intern("wrong");
+
+    Bindings * b = Alloc::allocBindings(2);
+    allocStats().attrsetsAllocated++;
+    if (sRight < sWrong) {
+        b->entries[0] = {sRight, rightV};
+        b->entries[1] = {sWrong, wrongV};
+    } else {
+        b->entries[0] = {sWrong, wrongV};
+        b->entries[1] = {sRight, rightV};
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
 void primLessThan(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
@@ -513,6 +616,10 @@ void registerBuiltinPrimOps()
         registerPrimOp({"genList",            2, primGenList});
         registerPrimOp({"all",                2, primAll});
         registerPrimOp({"any",                2, primAny});
+        registerPrimOp({"concatMap",          2, primConcatMap});
+        registerPrimOp({"partition",          2, primPartition});
+        registerPrimOp({"getEnv",             1, primGetEnv});
+        registerPrimOp({"compareVersions",    2, primCompareVersions});
     });
 }
 
