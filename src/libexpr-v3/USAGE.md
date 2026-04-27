@@ -120,69 +120,63 @@ Tag::PrimOp value that participates in PrimOpApp partial application.
 ## Known limitations
 
 Store / derivation primops (need real Nix store integration):
-  - derivation now wraps derivationStrict and synthesizes
-    /v3-fake-store/<hash>-<name>(.drv) paths — good enough for tests
-    that string-compare drvPath/outPath, not for actual builds.
+  - derivation wraps derivationStrict and synthesizes
+    /v3-fake-store/<16-hex-hash>-<name>(.drv) paths — good enough for
+    tests that string-compare drvPath/outPath, not for actual builds.
   - exec, filterSource, importNative, outputOf — not implemented.
   - path, toFile, fetchurl, fetchTarball — not store-backed.
-  - findFile / __findFile (NIX_PATH lookup) — works for filesystem
-    paths but not for `<nix/...>` corepkgs entries.
+  - findFile / __findFile (NIX_PATH + corepkgs `<nix/...>` lookup) —
+    works.
   - String-context primops are no-context stubs:
     unsafeDiscardStringContext, hasContext, getContext,
-    unsafeDiscardOutputDependency
+    unsafeDiscardOutputDependency.  Path interpolation `${./file}`
+    yields the absolute path string rather than a content-addressed
+    `/nix/store/<hash>-name`.
 
-Lazy evaluation gaps:
+Lazy evaluation:
   - Mutually-circular formal defaults like `{ a ? b, b ? a }: ...`
     when only one side is provided.  Tree-walker uses per-default
     thunks; v3 currently reads sibling slots eagerly.  Forward refs
     (`b ? a + 1`) and backward refs (`a ? b - 1`) work fine.
-  - Delayed `with`: tree-walker only forces `pkgs` in `with pkgs; ...`
-    when an unbound name is referenced inside the body.  v3 forces
-    `pkgs` eagerly at OP_WITH_PUSH, which blackholes when used in the
-    same recursive group that defines `pkgs` (`delayed-with` test).
+  - Delayed `with` works: with-stack entries are pushed unforced and
+    forced lazily on lookup.  Blackholes that bubble out from a
+    deeper force are skipped so outer scopes still get a chance.
 
-Coercion in interpolation: only int/float/bool/null/string/path can
-appear in `"${...}"`; attrset-with-`__toString` and lists need
-explicit conversion.
+Coercion in interpolation: int/float/bool/null/string/path/attrset-
+with-__toString-or-outPath are supported; lists still need explicit
+conversion.
 
 Position tracking: `__curPos` materializes {file, line, column} for
-the call site, but `unsafeGetAttrPos` always returns null (v3 doesn't
-keep per-attribute positions through compilation yet).
+the call site.  `unsafeGetAttrPos` and `functionArgs`-derived
+positions both work via the per-attr position side-table populated
+by OP_ATTRS_INIT[_DYN] / OP_ATTRS_REC_INIT.
 
-Performance: v3 is roughly on par with the tree-walker on
-compute-bound benchmarks (fib30: tree-walker ~0.40s user, v3 ~0.46s
-user — within ~15%).  Bigger wins are queued (NaN-boxing,
-computed-goto dispatch, Bindings polymorphism, OP_ATTRS_SELECT
-inline cache).
+Performance: v3 is within ~15% of the tree-walker on compute-bound
+benchmarks (fib30: tree-walker ~0.40s user, v3 ~0.46s user).  Bigger
+wins are queued (NaN-boxing, computed-goto dispatch, Bindings
+polymorphism, OP_ATTRS_SELECT inline cache).
 
 ## Test status
 
 The official `tests/functional/lang/eval-okay-*.nix` lang suite:
-**129 / 142 passing** (one test is `.exp-disabled` upstream).  Run via:
+**137 / 142 passing** (one test is `.exp-disabled` upstream).  Run via:
 
     bash src/libexpr-v3/test/run-lang-tests.sh
 
-Remaining 13 failures are all in features that need substantial work:
-  - per-attr position tracking (`unsafeGetAttrPos` / `__curPos` /
-    `inherit-attr-pos`) — needs a side-table threaded through
-    OP_ATTRS_INIT (3 tests)
-  - string contexts (`unsafeDiscardStringContext`, `getContext`,
-    `addErrorContext`) — context primops are no-context stubs
-    (`context`, `context-introspection`)
-  - delayed-`with` semantics: tree-walker only forces a `with` value
-    when an undefined name is first referenced, so `with pkgs; { }`
-    inside `pkgs_` works.  v3's eager `OP_WITH_PUSH` blackholes.
-    (`delayed-with`, `delayed-with-inherit`)
-  - real Nix-store integration — `derivation`, `path`, store-aware
-    `findFile` (corepkgs `<nix/...>`), and absolute `outPath` hashes
-    (`derivation-legacy`, `path`, `search-path`)
-  - toml11 v4 datetime normalization (uppercase T, padded subseconds)
-    — needs `normalizeDatetimeFormat` (`fromTOML-timestamps`)
-  - `scopedImport` scope: currently routes through `import` but
-    drops the scope-override (`import` test)
-  - symlink-aware path resolution: `import foo/sym/file.nix` should
-    resolve `..` against the symlink parent, not the target parent
-    (`symlink-resolution`)
+Remaining 5 failures all need real Nix store integration or its
+context-tracking machinery:
+  - **string contexts** (`context`, `context-introspection`) — tree-
+    walker tracks store-path origins on Tag::String values and turns
+    `${./file}` into `/nix/store/<hash>-name`.  v3's strings are
+    plain bytes and `${./file}` interpolates the absolute path.
+  - **derivation outPath / drvPath hashes** (`derivation-legacy`,
+    `path`) — tree-walker produces real `/nix/store/<32-char-hash>-name`
+    paths via the Nix store.  v3 produces a fake
+    `/v3-fake-store/<16-char-hash>-name`.
+  - **scopedImport scope override** (`import`) — tree-walker rebuilds
+    the imported file's staticEnv with the scope's names.  v3's
+    primScopedImport currently routes through plain `import` and
+    drops the scope.
 
 The 77-case v3-vs-tree-walker regression suite at
 `src/libexpr-v3/test/run-v3-tests.sh` is fully passing.
