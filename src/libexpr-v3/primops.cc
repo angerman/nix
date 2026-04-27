@@ -1702,6 +1702,119 @@ void primImport(EvalState & state, Value * args, Value & out)
     cache.results.emplace(path, out);
 }
 
+/// builtins.parseFlakeRef "github:NixOS/nixpkgs/23.05?dir=lib"
+/// → { type = "github"; owner = "NixOS"; repo = "nixpkgs"; ref = "23.05"; dir = "lib"; }
+/// Minimal hand-rolled parser covering the github / git / path /
+/// url-with-query forms exercised by the lang tests.  The full
+/// flake-ref grammar is much richer; this stub plus tree-walker's
+/// fetchers would be the cutover point for end-to-end flakes.
+static void splitOnce(std::string_view s, char sep, std::string_view & lhs, std::string_view & rhs)
+{
+    auto p = s.find(sep);
+    if (p == std::string_view::npos) { lhs = s; rhs = {}; return; }
+    lhs = s.substr(0, p);
+    rhs = s.substr(p + 1);
+}
+
+void primParseFlakeRef(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("parseFlakeRef", "string");
+    std::string_view s(args[0].payload.str);
+    // Split off any `?key=value&...` query string.
+    std::string_view base = s, query;
+    splitOnce(s, '?', base, query);
+    std::vector<std::pair<std::string, std::string>> attrs;
+
+    // type:rest
+    std::string_view typ, rest;
+    splitOnce(base, ':', typ, rest);
+    if (rest.empty()) {
+        // Bare path like "/foo/bar".
+        attrs.emplace_back("type", "path");
+        attrs.emplace_back("path", std::string(base));
+    } else if (typ == "github" || typ == "gitlab" || typ == "sourcehut") {
+        attrs.emplace_back("type", std::string(typ));
+        // owner/repo[/ref]
+        std::string_view owner, after;
+        splitOnce(rest, '/', owner, after);
+        std::string_view repo, ref;
+        splitOnce(after, '/', repo, ref);
+        attrs.emplace_back("owner", std::string(owner));
+        attrs.emplace_back("repo",  std::string(repo));
+        if (!ref.empty())
+            attrs.emplace_back("ref", std::string(ref));
+    } else if (typ == "git" || typ == "hg" || typ == "tarball" || typ == "file") {
+        attrs.emplace_back("type", std::string(typ));
+        attrs.emplace_back("url",  std::string(rest));
+    } else if (typ == "path") {
+        attrs.emplace_back("type", "path");
+        attrs.emplace_back("path", std::string(rest));
+    } else {
+        // Fallback: type with raw url body.
+        attrs.emplace_back("type", std::string(typ));
+        attrs.emplace_back("url",  std::string(rest));
+    }
+    // Apply query-string overrides (key=value, &-separated).
+    while (!query.empty()) {
+        std::string_view part, qrest;
+        splitOnce(query, '&', part, qrest);
+        std::string_view k, v;
+        splitOnce(part, '=', k, v);
+        attrs.emplace_back(std::string(k), std::string(v));
+        query = qrest;
+    }
+    // Build sorted Bindings.
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(attrs.size());
+    for (auto & p : attrs)
+        entries.emplace_back(vmIntern(state, p.first), mkStringValueOwned(p.second));
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
+    Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < entries.size(); ++i) b->entries[i] = {entries[i].first, entries[i].second};
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
+void primFlakeRefToString(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isAttrs() || !args[0].payload.bindings)
+        typeError("flakeRefToString", "attrset");
+    auto * src = args[0].payload.bindings;
+    auto getStr = [&](const char * name) -> std::string {
+        SymbolId id = vmIntern(state, name);
+        auto * v = src->lookup(id);
+        if (!v) return {};
+        Value f = forceValue(*state.vm, *v);
+        if (f.isString()) return std::string(f.payload.str);
+        return {};
+    };
+    std::string typ = getStr("type");
+    std::string out_s;
+    if (typ == "github" || typ == "gitlab" || typ == "sourcehut") {
+        out_s = typ + ":" + getStr("owner") + "/" + getStr("repo");
+        std::string ref = getStr("ref");
+        if (!ref.empty()) out_s += "/" + ref;
+    } else if (typ == "path") {
+        out_s = "path:" + getStr("path");
+    } else {
+        // Generic url-bearing type.
+        out_s = typ + ":" + getStr("url");
+    }
+    // Query-string for known extra attrs.
+    std::string q;
+    for (const char * key : {"dir", "rev", "ref", "narHash"}) {
+        if (std::string(key) == "ref") continue;  // already in path for github-style
+        std::string val = getStr(key);
+        if (val.empty()) continue;
+        if (!q.empty()) q += "&";
+        q += std::string(key) + "=" + val;
+    }
+    if (!q.empty()) out_s += "?" + q;
+    out = mkStringValueOwned(out_s);
+}
+
 /// Convert a toml::value (toml11) into a v3 Value recursively.
 static Value tomlToValue(EvalState & state, const toml::value & t)
 {
@@ -2268,6 +2381,8 @@ void registerBuiltinPrimOps()
         registerPrimOp({"scopedImport",       2, primScopedImport});
         registerPrimOp({"path",               1, primPath});
         registerPrimOp({"fromTOML",           1, primFromTOML});
+        registerPrimOp({"parseFlakeRef",      1, primParseFlakeRef});
+        registerPrimOp({"flakeRefToString",   1, primFlakeRefToString});
     });
 }
 
