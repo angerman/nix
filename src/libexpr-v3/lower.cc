@@ -403,10 +403,42 @@ struct Lowerer
         if ((isPrimOpRef(e->fun, &po) || isBuiltinsPrimOp(e->fun, &po))
             && e->args->size() == po->arity)
         {
+            const std::string_view name(po->name);
+
+            // Fast path: arithmetic / comparison primops (`a * b`,
+            // `a < b`, ... lower as ExprCall(__mul, a, b) etc.).  Emit
+            // direct VM ops instead of OP_CALL_PRIMOP.  Saves the
+            // primop-call dispatch + the per-arg OP_FORCE — those VM
+            // ops force inline.
+            if (po->arity == 2) {
+                auto eachArg = [&]() {
+                    auto it = e->args->begin();
+                    ir::VarId a = forceVal(lowerExpr(*it));
+                    ++it;
+                    ir::VarId b = forceVal(lowerExpr(*it));
+                    return std::pair{a, b};
+                };
+                if (name == "__sub" || name == "sub") {
+                    auto [a, b] = eachArg();
+                    return addBinding(ir::Sub{a, b});
+                }
+                if (name == "__mul" || name == "mul") {
+                    auto [a, b] = eachArg();
+                    return addBinding(ir::Mul{a, b});
+                }
+                if (name == "__div" || name == "div") {
+                    auto [a, b] = eachArg();
+                    return addBinding(ir::Div{a, b});
+                }
+                if (name == "__lessThan" || name == "lessThan") {
+                    auto [a, b] = eachArg();
+                    return addBinding(ir::Less{a, b});
+                }
+            }
+
             // tryEval needs its arg evaluated lazily (the whole point is
             // to catch errors raised during forcing).  Wrap the arg in a
             // MkThunk that defers its evaluation until tryEval forces it.
-            const std::string_view name(po->name);
             const bool isTryEval = name == "tryEval";
 
             std::vector<ir::VarId> args;
@@ -440,6 +472,31 @@ struct Lowerer
                 f = forceVal(f);
         }
         return f;
+    }
+
+    /// Decide whether an attrset/list element expression needs a thunk
+    /// wrapper: trivial nodes (literals, plain var refs, lambdas)
+    /// carry no risk of failing or doing observable work, so skip the
+    /// wrapping cost.  Anything non-trivial (calls, selects, arith,
+    /// attrsets-of-attrsets) gets thunkified so that building the
+    /// outer attrset doesn't eagerly force its contents — this is what
+    /// gives Nix attrsets their lazy-by-attribute semantics.
+    bool isTrivialForLazy(nix::Expr * e) const
+    {
+        if (!e) return true;
+        const auto k = e->exprKind;
+        return k == nix::Expr::Kind::Int
+            || k == nix::Expr::Kind::Float
+            || k == nix::Expr::Kind::String
+            || k == nix::Expr::Kind::Path
+            || k == nix::Expr::Kind::Var
+            || k == nix::Expr::Kind::Lambda;
+    }
+
+    ir::VarId thunkifyForAttr(nix::Expr * e)
+    {
+        if (isTrivialForLazy(e)) return lowerExpr(e);
+        return thunkify(e);
     }
 
     /// Lower an Expr into a separate thunk-body Function and emit a
@@ -566,7 +623,11 @@ struct Lowerer
             ir::AttrSetDyn dyn;
             dyn.statics.reserve(e->attrs->size());
             for (auto & kv : *e->attrs) {
-                ir::VarId vv = lowerExpr(kv.second.e);
+                // Lazy attrset values: wrap each entry in a thunk so
+                // sibling attrs aren't eagerly evaluated when the
+                // attrset is built.  Skips trivial expressions (literal
+                // / var ref) that need no thunk for correctness.
+                ir::VarId vv = thunkifyForAttr(kv.second.e);
                 dyn.statics.push_back({internSym(kv.first), vv});
             }
             dyn.dynamics.reserve(e->dynamicAttrs->size());
@@ -585,7 +646,8 @@ struct Lowerer
         for (auto & kv : *e->attrs) {
             const auto & sym = kv.first;
             const auto & def = kv.second;
-            ir::VarId vv = lowerExpr(def.e);
+            // Lazy entries — see comment on the dyn branch above.
+            ir::VarId vv = thunkifyForAttr(def.e);
             entries.push_back({internSym(sym), vv});
         }
         if (pushedInheritFrom) inheritFromStack.pop_back();
@@ -748,21 +810,30 @@ struct Lowerer
                               size_t pathIdx)
     {
         if (pathIdx == path.size()) return attrs;
-        if (path[pathIdx].expr)
-            unsupported("dynamic attribute name in select");
-        ir::SymbolId nm = internSym(path[pathIdx].symbol);
-
+        const auto & step = path[pathIdx];
         // attrs must be in WHNF for AttrSelect/HasAttr to work.  Force
         // it once at each chain step.
         attrs = forceVal(attrs);
 
+        // Static name: regular AttrSelect / HasAttr.  Dynamic name
+        // (`attrs.${expr}`): evaluate expr to a string at runtime and
+        // use OP_ATTRS_SELECT_DYN / OP_ATTRS_HAS_DYN.
+        const bool dyn = step.expr != nullptr;
+        ir::SymbolId nm = dyn ? 0 : internSym(step.symbol);
+        ir::VarId nameVar = ir::kInvalid;
+        if (dyn) nameVar = forceVal(lowerExpr(step.expr));
+
         if (defaultExpr) {
-            ir::VarId hasIt = addBinding(ir::HasAttr{attrs, nm});
+            ir::VarId hasIt = dyn
+                ? addBinding(ir::HasAttrDyn{attrs, nameVar})
+                : addBinding(ir::HasAttr{attrs, nm});
             auto thenB = m.freshBlock();
             auto elseB = m.freshBlock();
 
             blockStack.push_back(thenB);
-            ir::VarId got = addBinding(ir::AttrSelect{attrs, nm});
+            ir::VarId got = dyn
+                ? addBinding(ir::AttrSelectDyn{attrs, nameVar})
+                : addBinding(ir::AttrSelect{attrs, nm});
             ir::VarId rest = emitSelectChain(got, path, defaultExpr, pathIdx + 1);
             setReturn(rest);
             blockStack.pop_back();
@@ -775,7 +846,9 @@ struct Lowerer
             return addBinding(ir::If{hasIt, thenB, elseB});
         }
 
-        ir::VarId v = addBinding(ir::AttrSelect{attrs, nm});
+        ir::VarId v = dyn
+            ? addBinding(ir::AttrSelectDyn{attrs, nameVar})
+            : addBinding(ir::AttrSelect{attrs, nm});
         return emitSelectChain(v, path, nullptr, pathIdx + 1);
     }
 

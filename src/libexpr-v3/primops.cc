@@ -641,15 +641,19 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
     std::vector<std::pair<SymbolId, Value>> entries;
     entries.reserve(src->size);
     for (uint32_t i = 0; i < src->size; ++i) {
-        const Value & el = src->elems[i];
+        Value el = forceValue(*state.vm, src->elems[i]);
         if (!el.isAttrs() || !el.payload.bindings)
             typeError("listToAttrs", "list of attrsets");
-        const Value * nv = el.payload.bindings->lookup(nameSym);
-        const Value * vv = el.payload.bindings->lookup(valueSym);
-        if (!nv || !vv || !nv->isString())
+        const Value * nvRaw = el.payload.bindings->lookup(nameSym);
+        const Value * vvRaw = el.payload.bindings->lookup(valueSym);
+        if (!nvRaw || !vvRaw)
             typeError("listToAttrs", "{ name = string; value = ...; }");
-        SymbolId k = vmIntern(state, nv->payload.str);
-        entries.emplace_back(k, *vv);
+        Value nv = forceValue(*state.vm, *nvRaw);
+        if (!nv.isString())
+            typeError("listToAttrs", "{ name = string; value = ...; }");
+        SymbolId k = vmIntern(state, nv.payload.str);
+        // value stays lazy on purpose
+        entries.emplace_back(k, *vvRaw);
     }
     std::sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
@@ -788,7 +792,7 @@ void primCatAttrs(EvalState & state, Value * args, Value & out)
     std::vector<Value> kept;
     if (lst) {
         for (uint32_t i = 0; i < lst->size; ++i) {
-            const Value & el = lst->elems[i];
+            Value el = forceValue(*state.vm, lst->elems[i]);
             if (!el.isAttrs() || !el.payload.bindings) continue;
             const Value * v = el.payload.bindings->lookup(k);
             if (v) kept.push_back(*v);
@@ -940,29 +944,34 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
     SymbolId sStart = vmIntern(state, "startSet");
     SymbolId sOp    = vmIntern(state, "operator");
     SymbolId sKey   = vmIntern(state, "key");
-    const Value * startV = args[0].payload.bindings->lookup(sStart);
-    const Value * opV    = args[0].payload.bindings->lookup(sOp);
-    if (!startV || !opV)
+    const Value * startVRaw = args[0].payload.bindings->lookup(sStart);
+    const Value * opVRaw    = args[0].payload.bindings->lookup(sOp);
+    if (!startVRaw || !opVRaw)
         typeError("genericClosure", "{ startSet, operator }");
-    if (!startV->isList()) typeError("genericClosure", "startSet must be a list");
+    // Attrset entries are lazy thunks; force before structural use.
+    Value startV = forceValue(*state.vm, *startVRaw);
+    Value opV    = forceValue(*state.vm, *opVRaw);
+    if (!startV.isList()) typeError("genericClosure", "startSet must be a list");
 
     // Process queue: BFS.  workQueue is the items to process; result is
     // accumulated as we go.  seen[key.toString()] = true.
     std::vector<Value> result;
     std::vector<Value> work;
-    if (startV->payload.list) {
-        for (uint32_t i = 0; i < startV->payload.list->size; ++i)
-            work.push_back(startV->payload.list->elems[i]);
+    if (startV.payload.list) {
+        for (uint32_t i = 0; i < startV.payload.list->size; ++i)
+            work.push_back(startV.payload.list->elems[i]);
     }
     std::unordered_set<std::string> seen;
 
     auto keyOf = [&](Value & it) -> std::string {
+        it = forceValue(*state.vm, it);
         if (!it.isAttrs() || !it.payload.bindings)
             throw std::runtime_error("v3 primop genericClosure: items must be attrsets with a 'key' attr");
-        const Value * k = it.payload.bindings->lookup(sKey);
-        if (!k) throw std::runtime_error("v3 primop genericClosure: item missing 'key' attr");
-        if (k->isString()) return std::string(k->payload.str);
-        if (k->isInt())    return std::to_string(k->payload.i);
+        const Value * kRaw = it.payload.bindings->lookup(sKey);
+        if (!kRaw) throw std::runtime_error("v3 primop genericClosure: item missing 'key' attr");
+        Value k = forceValue(*state.vm, *kRaw);
+        if (k.isString()) return std::string(k.payload.str);
+        if (k.isInt())    return std::to_string(k.payload.i);
         throw std::runtime_error("v3 primop genericClosure: 'key' must be string or int");
     };
 
@@ -971,7 +980,7 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
         std::string key = keyOf(it);
         if (!seen.insert(key).second) continue;
         result.push_back(it);
-        Value next = callClosure(*state.vm, *opV, it);
+        Value next = callClosure(*state.vm, opV, it);
         if (!next.isList())
             throw std::runtime_error("v3 primop genericClosure: operator must return a list");
         if (next.payload.list) {
@@ -1102,20 +1111,25 @@ void primConvertHash(EvalState & state, Value * args, Value & out)
     SymbolId sHash = vmIntern(state, "hash");
     SymbolId sAlgo = vmIntern(state, "hashAlgo");
     SymbolId sFmt  = vmIntern(state, "toHashFormat");
-    const Value * vh = args[0].payload.bindings->lookup(sHash);
-    const Value * va = args[0].payload.bindings->lookup(sAlgo);
-    const Value * vf = args[0].payload.bindings->lookup(sFmt);
-    if (!vh || !va || !vf || !vh->isString() || !va->isString() || !vf->isString())
+    const Value * vhRaw = args[0].payload.bindings->lookup(sHash);
+    const Value * vaRaw = args[0].payload.bindings->lookup(sAlgo);
+    const Value * vfRaw = args[0].payload.bindings->lookup(sFmt);
+    if (!vhRaw || !vaRaw || !vfRaw)
         typeError("convertHash", "{ hash; hashAlgo; toHashFormat; }");
-    auto algo = parseHashAlgo(va->payload.str);
+    Value vh = forceValue(*state.vm, *vhRaw);
+    Value va = forceValue(*state.vm, *vaRaw);
+    Value vf = forceValue(*state.vm, *vfRaw);
+    if (!vh.isString() || !va.isString() || !vf.isString())
+        typeError("convertHash", "{ hash; hashAlgo; toHashFormat; }");
+    auto algo = parseHashAlgo(va.payload.str);
     nix::HashFormat fmt;
-    std::string_view fs(vf->payload.str);
+    std::string_view fs(vf.payload.str);
     if (fs == "base16")    fmt = nix::HashFormat::Base16;
     else if (fs == "nix32") fmt = nix::HashFormat::Nix32;
     else if (fs == "base64") fmt = nix::HashFormat::Base64;
     else if (fs == "sri")    fmt = nix::HashFormat::SRI;
     else throw std::runtime_error("v3 convertHash: unknown format '" + std::string(fs) + "'");
-    auto parsed = nix::Hash::parseAny(vh->payload.str, algo);
+    auto parsed = nix::Hash::parseAny(vh.payload.str, algo);
     out = mkStringValueOwned(parsed.to_string(fmt, false));
 }
 
