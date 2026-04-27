@@ -190,11 +190,21 @@ The official `tests/functional/lang/eval-okay-*.nix` lang suite:
     bash src/libexpr-v3/test/run-lang-tests.sh
 
 The official `tests/functional/lang/eval-fail-*.nix` lang suite:
-**93 / 109 raise the expected error** (+3 hangs on symmetric circular
-formal defaults / known limits).  Remaining 13 silent-pass tests are
-mostly path-validation flag-driven (abs-path-fatal, home-path-fatal,
-short-path-literal, url-literal) and a handful of derivation /
-genericClosure / set-override edge cases.  Run via:
+**100 / 109 raise the expected error** (+2 hangs on symmetric circular
+formal defaults — known v3 limits).  Remaining 7 silent passes split
+into:
+
+- 4 require tree-walker-specific lint flags
+  (`--lint-absolute-path-literals fatal` etc.): abs-path-fatal,
+  home-path-fatal, short-path-literal, url-literal.  These test
+  tree-walker features v3 does not implement.
+- 2 expect a stack-overflow trap on deep recursion: toJSON-stack-overflow,
+  derivation-structuredAttrs-stack-overflow.  v3's iterative toJSON
+  succeeds where tree-walker overflows — divergence is by design.
+- 1 expects rejection of bare TOML datetime values (fromTOML-timestamps);
+  v3 normalizes them like the experimental tree-walker setting does.
+
+Run via:
 
     bash src/libexpr-v3/test/run-fail-tests.sh
 
