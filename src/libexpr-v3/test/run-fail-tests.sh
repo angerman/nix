@@ -59,8 +59,11 @@ for f in lang/eval-fail-${pattern}.nix; do
   # `set +m` prevents bash from printing "Killed: 9" status messages
   # for the SIGKILL the timeout sends.
   set +m
-  out=$(timeout -s KILL 1 "$V3" --file "$f" 2>&1 | tr -d '\000' || true)
-  { timeout -s KILL 1 "$V3" --file "$f" >/dev/null 2>&1; } 2>/dev/null
+  # Match upstream lang.sh: eval-fail tests run with `--eval --strict
+  # --show-trace`.  Strict deep-forces every attrset value so
+  # readDir/throw/etc are reached.
+  out=$(timeout -s KILL 1 "$V3" --strict --file "$f" 2>&1 | tr -d '\000' || true)
+  { timeout -s KILL 1 "$V3" --strict --file "$f" >/dev/null 2>&1; } 2>/dev/null
   ec=$?
 
   if [[ $ec -eq 0 ]]; then
