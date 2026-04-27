@@ -119,19 +119,26 @@ Tag::PrimOp value that participates in PrimOpApp partial application.
 
 ## Known limitations
 
-Store / derivation primops (need real Nix store integration):
-  - derivation wraps derivationStrict and synthesizes
-    /v3-fake-store/<16-hex-hash>-<name>(.drv) paths — good enough for
-    tests that string-compare drvPath/outPath, not for actual builds.
-  - exec, filterSource, importNative, outputOf — not implemented.
-  - path, toFile, fetchurl, fetchTarball — not store-backed.
-  - findFile / __findFile (NIX_PATH + corepkgs `<nix/...>` lookup) —
-    works.
-  - String-context primops are no-context stubs:
+Store / derivation primops:
+  - derivationStrict / builtins.path: bridged to tree-walker under
+    settings.readOnlyMode = true, so they produce deterministic
+    `/nix/store/<32-char-hash>-name` paths.  The bridge fails for
+    inputs containing a v3 closure (e.g. `builtins.path { filter = ...; }`)
+    and falls back to a fake `/v3-fake-store/<16-hex-hash>-name`.
+  - scopedImport: works (synthesises `__scope__: let foo = __scope__.foo;
+    bar = __scope__.bar; ... in (<imported file>)` to shadow base-env
+    primops the same way tree-walker stacks a new StaticEnv).
+  - findFile / __findFile (NIX_PATH + corepkgs `<nix/...>` lookup): works.
+  - Path interpolation `${./file}` produces the proper
+    `/nix/store/<32-hash>-name` form via tree-walker's copyPathToStore.
+  - exec, filterSource, importNative, outputOf, toFile, fetchurl,
+    fetchTarball — not implemented.
+  - String-context primops are still no-context stubs:
     unsafeDiscardStringContext, hasContext, getContext,
-    unsafeDiscardOutputDependency.  Path interpolation `${./file}`
-    yields the absolute path string rather than a content-addressed
-    `/nix/store/<hash>-name`.
+    unsafeDiscardOutputDependency, addDrvOutputDependencies,
+    appendContext.  v3 Tag::String doesn't track context yet, so
+    `getContext "${./file}"` returns `{}` instead of `{"/nix/store/...":
+    {path=true;};}`.
 
 Lazy evaluation:
   - Mutually-circular formal defaults like `{ a ? b, b ? a }: ...`
@@ -159,24 +166,25 @@ polymorphism, OP_ATTRS_SELECT inline cache).
 ## Test status
 
 The official `tests/functional/lang/eval-okay-*.nix` lang suite:
-**137 / 142 passing** (one test is `.exp-disabled` upstream).  Run via:
+**140 / 142 passing** (one test is `.exp-disabled` upstream).  Run via:
 
     bash src/libexpr-v3/test/run-lang-tests.sh
 
-Remaining 5 failures all need real Nix store integration or its
-context-tracking machinery:
-  - **string contexts** (`context`, `context-introspection`) — tree-
-    walker tracks store-path origins on Tag::String values and turns
-    `${./file}` into `/nix/store/<hash>-name`.  v3's strings are
-    plain bytes and `${./file}` interpolates the absolute path.
-  - **derivation outPath / drvPath hashes** (`derivation-legacy`,
-    `path`) — tree-walker produces real `/nix/store/<32-char-hash>-name`
-    paths via the Nix store.  v3 produces a fake
-    `/v3-fake-store/<16-char-hash>-name`.
-  - **scopedImport scope override** (`import`) — tree-walker rebuilds
-    the imported file's staticEnv with the scope's names.  v3's
-    primScopedImport currently routes through plain `import` and
-    drops the scope.
+Remaining 2 failures need v3-side machinery beyond the existing
+tree-walker bridge:
+  - **string-context introspection** (`context-introspection`) —
+    tree-walker tags each Tag::String with a `NixStringContext` set
+    of (store-path, output) entries.  v3 strings are plain bytes,
+    so `getContext`, `addDrvOutputDependencies`, etc. don't have a
+    context to read or rewrite.  Implementing this needs a side-
+    table keyed by string-payload-pointer or a dedicated string-
+    with-context value variant.
+  - **`builtins.path` with a v3 closure as `filter`** (`path`) —
+    the bridge to tree-walker's `builtins.path` covers the data
+    cases (returns proper `/nix/store/<32-hash>-name`), but the
+    filter argument is a v3 closure.  v3-to-tree-walker conversion
+    drops it as `null`, which tree-walker rejects.  Other arms of
+    the same test (no filter) pass.
 
 The 77-case v3-vs-tree-walker regression suite at
 `src/libexpr-v3/test/run-v3-tests.sh` is fully passing.
