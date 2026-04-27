@@ -90,9 +90,27 @@ inline bool valueEqual(const Value & a, const Value & b)
     case Tag::Null:   return true;
     case Tag::String: return std::string_view(a.payload.str) == std::string_view(b.payload.str);
     case Tag::Path:   return std::string_view(a.payload.path) == std::string_view(b.payload.path);
+    case Tag::List: {
+        auto * la = a.payload.list; auto * lb = b.payload.list;
+        if (la == lb) return true;
+        uint32_t na = la ? la->size : 0; uint32_t nb = lb ? lb->size : 0;
+        if (na != nb) return false;
+        for (uint32_t i = 0; i < na; ++i)
+            if (!valueEqual(la->elems[i], lb->elems[i])) return false;
+        return true;
+    }
+    case Tag::Attrs: {
+        auto * aa = a.payload.bindings; auto * bb = b.payload.bindings;
+        if (aa == bb) return true;
+        uint32_t na = aa ? aa->size : 0; uint32_t nb = bb ? bb->size : 0;
+        if (na != nb) return false;
+        for (uint32_t i = 0; i < na; ++i) {
+            if (aa->entries[i].name != bb->entries[i].name) return false;
+            if (!valueEqual(aa->entries[i].value, bb->entries[i].value)) return false;
+        }
+        return true;
+    }
     case Tag::Uninitialized:
-    case Tag::Attrs:
-    case Tag::List:
     case Tag::Closure:
     case Tag::Thunk:
     case Tag::PrimOp:
