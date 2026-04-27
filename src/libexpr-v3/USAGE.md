@@ -191,6 +191,14 @@ faster on attrset-heavy workloads.
           tree-walker 0.43s user / 3.65s real,
                 v3 0.43s user / 3.61s real  (matched)
 
+Real-package instantiation through `nix-instantiate --dry-run`
+(produces a /nix/store/...drv path).  v3 produces byte-identical
+drvPaths to tree-walker and is consistently a few % faster:
+
+  hello: tree-walker 0.28s user, v3 0.26s user (~7% faster)
+  vim:   tree-walker 0.28s user, v3 0.27s user (~3% faster)
+  git:   tree-walker 0.39s user, v3 0.37s user (~5% faster)
+
 Tail-call optimization: 100,000 recursive tail calls
 (`let f = n: if n == 100000 then n else f (n + 1); in f 0`) now
 runs in O(1) frame stack space.  Bounded against true infinite
