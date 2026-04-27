@@ -308,9 +308,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     finalResult.mkNull();
 
     bool running = true;
+    // Gate the per-instruction counter behind an env var: it adds a
+    // memory write to every instruction and is only useful for
+    // profiling.  Overhead on fib32 was ~3% on first-run timings.
+    static const bool kCountInstructions = std::getenv("NIX_VM_STATS") != nullptr;
     while (running) {
         Instruction instr = cu->code[ip++];
-        vm.nrInstructions++;
+        if (kCountInstructions) vm.nrInstructions++;
         Op op = decodeOp(instr);
         uint32_t operand = decodeOperand(instr);
 
