@@ -189,8 +189,17 @@ The official `tests/functional/lang/eval-okay-*.nix` lang suite:
 
     bash src/libexpr-v3/test/run-lang-tests.sh
 
+The official `tests/functional/lang/eval-fail-*.nix` lang suite:
+**93 / 109 raise the expected error** (+3 hangs on symmetric circular
+formal defaults / known limits).  Remaining 13 silent-pass tests are
+mostly path-validation flag-driven (abs-path-fatal, home-path-fatal,
+short-path-literal, url-literal) and a handful of derivation /
+genericClosure / set-override edge cases.  Run via:
+
+    bash src/libexpr-v3/test/run-fail-tests.sh
+
 The 77-case v3-vs-tree-walker regression suite at
-`src/libexpr-v3/test/run-v3-tests.sh` is fully passing.
+`src/libexpr-v3/test/run-v3-tests.sh`: 76/77 passing (1 display-only).
 
 ## Recent feature additions
 
