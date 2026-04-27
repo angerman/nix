@@ -384,17 +384,28 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_LESS:{ Value b = pop(vm), a = pop(vm); Value r; r = valueLess(a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break; }
 
         // --- Boolean / branches ---
-        case OP_NOT: { Value v = pop(vm); push(vm, isTrueValue(v) ? Value::vFalse : Value::vTrue); break; }
+        // All boolean opcodes force their operand: a function arg may be
+        // a thunk whose evaluated value is the bool we need to branch on.
+        // Without a force, `arg || y` would peek the thunk, fail the
+        // isBool check, and incorrectly fall through into the rhs block.
+        case OP_NOT: {
+            Value v = pop(vm);
+            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
+            push(vm, isTrueValue(v) ? Value::vFalse : Value::vTrue);
+            break;
+        }
 
         case OP_AND_BRANCH: {
             // peek; if false -> jump (keep false); if true -> pop and fall through
-            const Value & v = top(vm);
+            Value & v = vm.valueStack.back();
+            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 0) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
         }
         case OP_OR_BRANCH: {
-            const Value & v = top(vm);
+            Value & v = vm.valueStack.back();
+            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 1) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
@@ -402,13 +413,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_IMPL_BRANCH: {
             // If lhs false -> result is true; jump.  If lhs true -> pop, fall through.
             Value v = pop(vm);
+            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 0) { push(vm, Value::vTrue); ip = operand; }
             break;
         }
 
         case OP_JUMP: ip = operand; break;
-        case OP_BRANCH_FALSE: { Value v = pop(vm); if (v.isBool() && v.payload.i == 0) ip = operand; break; }
-        case OP_BRANCH_TRUE:  { Value v = pop(vm); if (v.isBool() && v.payload.i == 1) ip = operand; break; }
+        case OP_BRANCH_FALSE: {
+            Value v = pop(vm);
+            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
+            if (v.isBool() && v.payload.i == 0) ip = operand;
+            break;
+        }
+        case OP_BRANCH_TRUE:  {
+            Value v = pop(vm);
+            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
+            if (v.isBool() && v.payload.i == 1) ip = operand;
+            break;
+        }
 
         // --- Closure / call / thunk ---
         case OP_MAKE_CLOSURE: {
@@ -953,10 +975,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 out.append(coerceToString(p, forceStr));
             }
+            // Path + string semantics: when the first operand is a Path
+            // and we're in plain `+` mode (not interpolation), the result
+            // is a Path, not a String.  Required by tests like
+            // `builtins.dirOf /foo/bar + ""` whose expected output is
+            // `/foo` (path), not `"/foo"` (string).
+            bool resultIsPath = !forceStr && n > 0 && parts[0].isPath();
             char * buf = static_cast<char *>(std::malloc(out.size() + 1));
             std::memcpy(buf, out.data(), out.size());
             buf[out.size()] = '\0';
-            Value v; v.mkString(buf); push(vm, v);
+            Value v;
+            if (resultIsPath) {
+                v.tag_payload = static_cast<uint64_t>(Tag::Path);
+                v.payload.path = buf;
+            } else {
+                v.mkString(buf);
+            }
+            push(vm, v);
             break;
         }
         case OP_ASSERT: {

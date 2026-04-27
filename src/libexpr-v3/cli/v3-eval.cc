@@ -42,9 +42,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 using nix::v3::Value;
 using nix::v3::Tag;
@@ -110,6 +114,106 @@ static nlohmann::json toJsonValue(const Value & v,
     }
 }
 
+/// Print a string literal in Nix's source-code form: backslash-escape
+/// `"`, `\`, control whitespace, and `${` (which would otherwise start
+/// an interpolation).
+static void printLiteralString(std::ostream & out, std::string_view s)
+{
+    out << '"';
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '"' || c == '\\') { out << '\\' << c; }
+        else if (c == '\n')        { out << "\\n"; }
+        else if (c == '\r')        { out << "\\r"; }
+        else if (c == '\t')        { out << "\\t"; }
+        else if (c == '$' && i + 1 < s.size() && s[i + 1] == '{') { out << "\\$"; }
+        else                       { out << c; }
+    }
+    out << '"';
+}
+
+/// Identifier rules used by Nix's pretty-printer for attrset keys: bare
+/// identifiers stay bare, anything that would parse oddly gets quoted.
+static const std::set<std::string> kNixReservedKeywords = {
+    "if", "then", "else", "assert", "with", "let", "in", "rec", "inherit",
+};
+
+static void printAttrName(std::ostream & out, std::string_view s)
+{
+    if (s.empty() || kNixReservedKeywords.count(std::string(s))) {
+        printLiteralString(out, s);
+        return;
+    }
+    char c = s[0];
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    for (size_t i = 1; ok && i < s.size(); ++i) {
+        char d = s[i];
+        ok = (d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') ||
+             (d >= '0' && d <= '9') || d == '_' || d == '\'' || d == '-';
+    }
+    if (ok) out << s;
+    else    printLiteralString(out, s);
+}
+
+/// Pretty-print a v3 Value in the same surface form as nix-instantiate
+/// --eval --strict.  Used by the lang regression suite — output must
+/// match the existing .exp golden files byte-for-byte.
+static void printNixValue(std::ostream & out, const Value & v,
+                          const std::vector<std::string> & symTab)
+{
+    switch (v.tag()) {
+    case Tag::Int:    out << (long long)v.payload.i; return;
+    case Tag::Float:  out << v.payload.f; return;
+    case Tag::Bool:   out << (v.payload.i == 1 ? "true" : "false"); return;
+    case Tag::Null:   out << "null"; return;
+    case Tag::String: printLiteralString(out, v.payload.str ? std::string_view(v.payload.str) : std::string_view()); return;
+    case Tag::Path:   out << (v.payload.path ? v.payload.path : ""); return;
+    case Tag::List: {
+        out << "[ ";
+        if (v.payload.list)
+            for (uint32_t i = 0; i < v.payload.list->size; ++i) {
+                printNixValue(out, v.payload.list->elems[i], symTab);
+                out << ' ';
+            }
+        out << "]";
+        return;
+    }
+    case Tag::Attrs: {
+        out << "{ ";
+        if (v.payload.bindings) {
+            // Sort by symbol name for deterministic order matching tw output.
+            std::vector<std::pair<std::string, const Value *>> items;
+            items.reserve(v.payload.bindings->size);
+            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
+                auto & en = v.payload.bindings->entries[i];
+                std::string key = (en.name < symTab.size())
+                    ? symTab[en.name] : std::to_string(en.name);
+                items.emplace_back(std::move(key), &en.value);
+            }
+            std::sort(items.begin(), items.end(),
+                      [](auto & a, auto & b) { return a.first < b.first; });
+            for (auto & [name, val] : items) {
+                printAttrName(out, name);
+                out << " = ";
+                printNixValue(out, *val, symTab);
+                out << "; ";
+            }
+        }
+        out << "}";
+        return;
+    }
+    case Tag::Closure: out << "<LAMBDA>"; return;
+    case Tag::PrimOp:  out << "<PRIMOP>"; return;
+    case Tag::PrimOpApp:out << "<PRIMOP-APP>"; return;
+    case Tag::Thunk:    out << "<thunk>"; return;
+    case Tag::App:      out << "<APP>"; return;
+    case Tag::Blackhole:out << "<BLACKHOLE>"; return;
+    case Tag::External: out << "<EXTERNAL>"; return;
+    case Tag::Uninitialized:
+    default:            out << "<value tag=" << (int)v.tag() << ">"; return;
+    }
+}
+
 static int printValue(const Value & r, bool jsonOut,
                       const std::vector<std::string> & symTab)
 {
@@ -117,27 +221,9 @@ static int printValue(const Value & r, bool jsonOut,
         std::cout << toJsonValue(r, symTab).dump() << "\n";
         return 0;
     }
-    switch (r.tag()) {
-    case Tag::Int:    std::printf("%lld\n", (long long)r.payload.i); return 0;
-    case Tag::Float:  std::printf("%g\n", r.payload.f); return 0;
-    case Tag::Bool:   std::printf("%s\n", r.payload.i == 1 ? "true" : "false"); return 0;
-    case Tag::Null:   std::printf("null\n"); return 0;
-    case Tag::String: std::printf("\"%s\"\n", r.payload.str); return 0;
-    case Tag::Path:   std::printf("path \"%s\"\n", r.payload.path); return 0;
-    case Tag::List:   std::printf("<list of %u>\n",
-                          r.payload.list ? r.payload.list->size : 0); return 0;
-    case Tag::Attrs:  std::printf("<attrs of %u>\n",
-                          r.payload.bindings ? r.payload.bindings->size : 0); return 0;
-    case Tag::Closure:std::printf("<closure>\n"); return 0;
-    case Tag::Thunk:  std::printf("<thunk>\n"); return 0;
-    case Tag::Uninitialized:
-    case Tag::PrimOp:
-    case Tag::PrimOpApp:
-    case Tag::App:
-    case Tag::Blackhole:
-    case Tag::External:
-    default:          std::printf("<value tag=%d>\n", (int)r.tag()); return 0;
-    }
+    printNixValue(std::cout, r, symTab);
+    std::cout << "\n";
+    return 0;
 }
 
 static std::string slurp(const std::string & path)

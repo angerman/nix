@@ -44,6 +44,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -527,14 +528,68 @@ void primGetEnv(EvalState &, Value * args, Value & out)
     out = mkStringValueOwned(e ? e : "");
 }
 
+// Component-wise version comparison: matches Nix's libstore compareVersions.
+// Splits each version into components (digit runs and non-digit runs) and
+// compares pair-wise using Nix's specific ordering ("pre" < anything,
+// shorter < longer when next is digits, etc.).  Required by the versions
+// lang test which exercises pre-release ordering.
+namespace {
+
+std::string_view nextComponent(std::string_view::const_iterator & p,
+                                std::string_view::const_iterator end)
+{
+    while (p != end && (*p == '.' || *p == '-')) ++p;
+    if (p == end) return {};
+    auto s = p;
+    if (std::isdigit(static_cast<unsigned char>(*p)))
+        while (p != end && std::isdigit(static_cast<unsigned char>(*p))) ++p;
+    else
+        while (p != end &&
+               !std::isdigit(static_cast<unsigned char>(*p)) &&
+               *p != '.' && *p != '-')
+            ++p;
+    return {&*s, size_t(p - s)};
+}
+
+bool componentsLT(std::string_view c1, std::string_view c2)
+{
+    // string -> int parse helper (returns nullopt on non-numeric).
+    auto toInt = [](std::string_view sv) -> std::optional<long> {
+        if (sv.empty()) return std::nullopt;
+        char * end = nullptr;
+        std::string s(sv);
+        long v = std::strtol(s.c_str(), &end, 10);
+        if (end != s.c_str() + s.size()) return std::nullopt;
+        return v;
+    };
+    auto n1 = toInt(c1);
+    auto n2 = toInt(c2);
+    if (n1 && n2)                  return *n1 < *n2;
+    if (c1.empty() && n2)          return true;
+    if (c1 == "pre" && c2 != "pre") return true;
+    if (c2 == "pre")                return false;
+    if (n2)                        return true;   // assume `2.3a' < `2.3.1'
+    if (n1)                        return false;
+    return c1 < c2;
+}
+
+} // anonymous namespace
+
 void primCompareVersions(EvalState &, Value * args, Value & out)
 {
-    // Simple string compare for now (nix has more sophisticated semver
-    // logic; revisit if any test needs real semver behavior).
     if (!args[0].isString() || !args[1].isString())
         typeError("compareVersions", "two strings");
-    int cmp = std::strcmp(args[0].payload.str, args[1].payload.str);
-    out.mkInt(cmp < 0 ? -1 : (cmp > 0 ? 1 : 0));
+    std::string_view v1(args[0].payload.str);
+    std::string_view v2(args[1].payload.str);
+    auto p1 = v1.begin();
+    auto p2 = v2.begin();
+    while (p1 != v1.end() || p2 != v2.end()) {
+        auto c1 = nextComponent(p1, v1.end());
+        auto c2 = nextComponent(p2, v2.end());
+        if (componentsLT(c1, c2))     { out.mkInt(-1); return; }
+        if (componentsLT(c2, c1))     { out.mkInt( 1); return; }
+    }
+    out.mkInt(0);
 }
 
 void primConcatMap(EvalState & state, Value * args, Value & out)
@@ -1519,14 +1574,20 @@ void primReadDir(EvalState & state, Value * args, Value & out)
 }
 
 /// builtins.parseDrvName "name-1.2.3" -> { name = "name"; version = "1.2.3"; }
+///
+/// Matches Nix's `DrvName` constructor: split at the first '-' that is
+/// *not* followed by a letter.  This places a literal trailing '-' in
+/// the version (e.g. "name-that-ends-with-dash--1.0" parses as
+/// {name="name-that-ends-with-dash"; version="-1.0"}) — required by the
+/// derivation-name lang test.
 void primParseDrvName(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("parseDrvName", "string");
     std::string s(args[0].payload.str);
-    // Split at the first '-' followed by a digit.
     size_t cut = std::string::npos;
     for (size_t i = 0; i + 1 < s.size(); ++i) {
-        if (s[i] == '-' && std::isdigit(static_cast<unsigned char>(s[i + 1]))) {
+        unsigned char nxt = static_cast<unsigned char>(s[i + 1]);
+        if (s[i] == '-' && !std::isalpha(nxt)) {
             cut = i; break;
         }
     }
