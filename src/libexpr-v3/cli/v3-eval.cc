@@ -53,18 +53,32 @@
 using nix::v3::Value;
 using nix::v3::Tag;
 
-/// Recursively force a v3 Value to its full normal form.
-static Value forceDeep(nix::v3::VMState & vm, Value v)
+/// Recursively force a v3 Value to its full normal form.  Tracks
+/// already-visited list/attrset pointers so cyclic values like
+/// `let x = [x]; in x` don't infinite-recurse.
+static Value forceDeep(nix::v3::VMState & vm, Value v,
+                       std::set<const void *> & seen)
 {
     v = nix::v3::forceValue(vm, v);
-    if (v.isList() && v.payload.list)
-        for (uint32_t i = 0; i < v.payload.list->size; ++i)
-            v.payload.list->elems[i] = forceDeep(vm, v.payload.list->elems[i]);
-    else if (v.isAttrs() && v.payload.bindings)
-        for (uint32_t i = 0; i < v.payload.bindings->size; ++i)
-            v.payload.bindings->entries[i].value =
-                forceDeep(vm, v.payload.bindings->entries[i].value);
+    if (v.isList() && v.payload.list && v.payload.list->size > 0) {
+        if (seen.insert(v.payload.list).second) {
+            for (uint32_t i = 0; i < v.payload.list->size; ++i)
+                v.payload.list->elems[i] = forceDeep(vm, v.payload.list->elems[i], seen);
+        }
+    } else if (v.isAttrs() && v.payload.bindings) {
+        if (seen.insert(v.payload.bindings).second) {
+            for (uint32_t i = 0; i < v.payload.bindings->size; ++i)
+                v.payload.bindings->entries[i].value =
+                    forceDeep(vm, v.payload.bindings->entries[i].value, seen);
+        }
+    }
     return v;
+}
+
+static Value forceDeep(nix::v3::VMState & vm, Value v)
+{
+    std::set<const void *> seen;
+    return forceDeep(vm, v, seen);
 }
 
 /// v3 Value → JSON.  Forces thunks; rejects functions/external.
@@ -172,12 +186,15 @@ static void printNixValue(std::ostream & out, const Value & v,
     case Tag::String: printLiteralString(out, v.payload.str ? std::string_view(v.payload.str) : std::string_view()); return;
     case Tag::Path:   out << (v.payload.path ? v.payload.path : ""); return;
     case Tag::List: {
-        // Match tree-walker: only non-empty lists are tracked in `seen`.
-        // Two distinct empty-list literals shouldn't fight over which
-        // gets to print as `«repeated»`, but a non-empty list re-visited
-        // through the value tree is a true cycle that we want to break.
+        // Match tree-walker exactly: lists track by the address of the
+        // *Value wrapper* (`&v`), so two slots that share a ListVec but
+        // sit in distinct Value cells print independently.  Attrsets
+        // track by Bindings* (`v.attrs()`), so two attrset values that
+        // share the same Bindings (e.g. one from `__overrides` and one
+        // from the rec body) collapse to «repeated» on the second
+        // visit.  Empty lists are never tracked.
         if (v.payload.list && v.payload.list->size > 0 &&
-            !seen.insert(v.payload.list).second) {
+            !seen.insert(&v).second) {
             out << "«repeated»"; return;
         }
         out << "[ ";
