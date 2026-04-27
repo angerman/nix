@@ -227,7 +227,7 @@ The official `tests/functional/lang/eval-okay-*.nix` lang suite:
     bash src/libexpr-v3/test/run-lang-tests.sh
 
 The official `tests/functional/lang/eval-fail-*.nix` lang suite:
-**102 / 109 raise the expected error**, zero crashes.  The 7 remaining
+**103 / 109 raise the expected error**, zero crashes.  The 6 remaining
 silent passes are intentional divergences:
 
 - 4 require tree-walker-specific lint flags
@@ -237,8 +237,6 @@ silent passes are intentional divergences:
 - 2 expect a stack-overflow trap on deep recursion: toJSON-stack-overflow,
   derivation-structuredAttrs-stack-overflow.  v3's iterative toJSON
   succeeds where tree-walker overflows — divergence is by design.
-- 1 expects rejection of bare TOML datetime values (fromTOML-timestamps);
-  v3 normalizes them like the experimental tree-walker setting does.
 
 Run via:
 
