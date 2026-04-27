@@ -1344,10 +1344,11 @@ void primConvertHash(EvalState & state, Value * args, Value & out)
     auto algo = parseHashAlgo(va.payload.str);
     nix::HashFormat fmt;
     std::string_view fs(vf.payload.str);
-    if (fs == "base16")    fmt = nix::HashFormat::Base16;
-    else if (fs == "nix32") fmt = nix::HashFormat::Nix32;
-    else if (fs == "base64") fmt = nix::HashFormat::Base64;
-    else if (fs == "sri")    fmt = nix::HashFormat::SRI;
+    if (fs == "base16")        fmt = nix::HashFormat::Base16;
+    else if (fs == "nix32")    fmt = nix::HashFormat::Nix32;
+    else if (fs == "base32")   fmt = nix::HashFormat::Nix32;  // alias
+    else if (fs == "base64")   fmt = nix::HashFormat::Base64;
+    else if (fs == "sri")      fmt = nix::HashFormat::SRI;
     else throw std::runtime_error("v3 convertHash: unknown format '" + std::string(fs) + "'");
     auto parsed = nix::Hash::parseAny(vh.payload.str, algo);
     out = mkStringValueOwned(parsed.to_string(fmt, false));
