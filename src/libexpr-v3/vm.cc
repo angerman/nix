@@ -883,6 +883,54 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, v);
             break;
         }
+        case OP_APPLY_OVERRIDES: {
+            // Peek the attrset on top of stack.  If it has __overrides,
+            // force it and merge each (name, value) into the rec attrs:
+            //   - Names already present are overwritten in place (so
+            //     OP_ATTRS_SELECT inside the rec body sees the new value).
+            //   - New names cause a Bindings grow + re-sort so the result
+            //     attrset visible to the outer scope contains them.
+            //   This matches tree-walker semantics.
+            Value & top = vm.valueStack.back();
+            if (!top.isAttrs() || !top.payload.bindings) break;
+            static const SymbolId ovId = ir::globalInternSymbol("__overrides");
+            const Value * ovRaw = top.payload.bindings->lookup(ovId);
+            if (!ovRaw) break;
+            Value ov = forceValue(vm, *ovRaw);
+            if (!ov.isAttrs() || !ov.payload.bindings) break;
+            auto * dst = top.payload.bindings;
+            const auto * src = ov.payload.bindings;
+            // First pass: overwrite existing entries; collect names to add.
+            std::vector<std::pair<SymbolId, Value>> toAdd;
+            for (uint32_t i = 0; i < src->size; ++i) {
+                SymbolId k = src->entries[i].name;
+                const Value * existing = dst->lookup(k);
+                if (existing) {
+                    // Mutate in place via const_cast — `lookup` returns a
+                    // pointer to the actual storage and we own this Bindings.
+                    const_cast<Value &>(*existing) = src->entries[i].value;
+                } else {
+                    toAdd.emplace_back(k, src->entries[i].value);
+                }
+            }
+            if (!toAdd.empty()) {
+                Bindings * grown = Alloc::allocBindings(dst->size + toAdd.size());
+                allocStats().attrsetsAllocated++;
+                std::vector<std::pair<SymbolId, Value>> all;
+                all.reserve(dst->size + toAdd.size());
+                for (uint32_t i = 0; i < dst->size; ++i)
+                    all.emplace_back(dst->entries[i].name, dst->entries[i].value);
+                for (auto & e : toAdd) all.push_back(e);
+                std::sort(all.begin(), all.end(),
+                    [](auto & a, auto & b) { return a.first < b.first; });
+                for (size_t i = 0; i < all.size(); ++i) {
+                    grown->entries[i].name  = all[i].first;
+                    grown->entries[i].value = all[i].second;
+                }
+                top.payload.bindings = grown;
+            }
+            break;
+        }
         case OP_ATTRS_SELECT: {
             Value attrs = pop(vm);
             if (!attrs.isAttrs())

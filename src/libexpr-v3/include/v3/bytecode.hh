@@ -104,6 +104,12 @@ enum Op : uint8_t
     OP_ATTRS_HAS      = 0x75,  // [sym:24] pop attrs, push bool
     OP_ATTRS_HAS_DYN  = 0x76,
     OP_ATTRS_UPDATE   = 0x77,
+    /// __overrides: if the attrset on top of the operand stack contains
+    /// a `__overrides` attribute, force it (must be an attrset) and for
+    /// each (name, value) in it replace the corresponding entry in the
+    /// rec attrset.  No-op if `__overrides` is absent.  Result: the
+    /// possibly-updated attrset stays on top of the stack.
+    OP_APPLY_OVERRIDES = 0x79,
 
     // --- With -----------------------------------------------------------
     OP_WITH_PUSH      = 0x80,  // pop attrset, push it on with-stack

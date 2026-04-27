@@ -157,9 +157,12 @@ static void printAttrName(std::ostream & out, std::string_view s)
 
 /// Pretty-print a v3 Value in the same surface form as nix-instantiate
 /// --eval --strict.  Used by the lang regression suite — output must
-/// match the existing .exp golden files byte-for-byte.
+/// match the existing .exp golden files byte-for-byte.  `seen` tracks
+/// already-printed list/attrset pointers so cyclic structures (e.g.
+/// `let x = [x]; in x`) print as `«repeated»` instead of looping.
 static void printNixValue(std::ostream & out, const Value & v,
-                          const std::vector<std::string> & symTab)
+                          const std::vector<std::string> & symTab,
+                          std::set<const void *> & seen)
 {
     switch (v.tag()) {
     case Tag::Int:    out << (long long)v.payload.i; return;
@@ -169,16 +172,27 @@ static void printNixValue(std::ostream & out, const Value & v,
     case Tag::String: printLiteralString(out, v.payload.str ? std::string_view(v.payload.str) : std::string_view()); return;
     case Tag::Path:   out << (v.payload.path ? v.payload.path : ""); return;
     case Tag::List: {
+        // Match tree-walker: only non-empty lists are tracked in `seen`.
+        // Two distinct empty-list literals shouldn't fight over which
+        // gets to print as `«repeated»`, but a non-empty list re-visited
+        // through the value tree is a true cycle that we want to break.
+        if (v.payload.list && v.payload.list->size > 0 &&
+            !seen.insert(v.payload.list).second) {
+            out << "«repeated»"; return;
+        }
         out << "[ ";
         if (v.payload.list)
             for (uint32_t i = 0; i < v.payload.list->size; ++i) {
-                printNixValue(out, v.payload.list->elems[i], symTab);
+                printNixValue(out, v.payload.list->elems[i], symTab, seen);
                 out << ' ';
             }
         out << "]";
         return;
     }
     case Tag::Attrs: {
+        if (v.payload.bindings && !seen.insert(v.payload.bindings).second) {
+            out << "«repeated»"; return;
+        }
         out << "{ ";
         if (v.payload.bindings) {
             // Sort by symbol name for deterministic order matching tw output.
@@ -195,7 +209,7 @@ static void printNixValue(std::ostream & out, const Value & v,
             for (auto & [name, val] : items) {
                 printAttrName(out, name);
                 out << " = ";
-                printNixValue(out, *val, symTab);
+                printNixValue(out, *val, symTab, seen);
                 out << "; ";
             }
         }
@@ -212,6 +226,13 @@ static void printNixValue(std::ostream & out, const Value & v,
     case Tag::Uninitialized:
     default:            out << "<value tag=" << (int)v.tag() << ">"; return;
     }
+}
+
+static void printNixValue(std::ostream & out, const Value & v,
+                          const std::vector<std::string> & symTab)
+{
+    std::set<const void *> seen;
+    printNixValue(out, v, symTab, seen);
 }
 
 static int printValue(const Value & r, bool jsonOut,

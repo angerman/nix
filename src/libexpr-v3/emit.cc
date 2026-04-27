@@ -293,6 +293,8 @@ struct Emitter
         for (auto & en : e.entries) emitVarRef(en.value);
         unit.code.push_back(encode(OP_ATTRS_REC_INIT, static_cast<uint32_t>(e.entries.size())));
         for (auto & en : e.entries) unit.code.push_back(en.name);
+        // Honor __overrides for rec attrsets too.
+        unit.code.push_back(encode(OP_APPLY_OVERRIDES));
     }
     void emitOne(const ir::AttrSelect & e)
     {
@@ -370,6 +372,10 @@ struct Emitter
             unit.code.push_back(static_cast<uint32_t>(ff.size()));
             unit.code.push_back(encode(OP_ATTRS_REC_SET, entryToSlot[i]));
         }
+        // After all SETs, apply __overrides if the rec contains it —
+        // rewrites the matching entries' thunk values so subsequent
+        // OP_ATTRS_SELECT inside the rec body sees the overridden value.
+        unit.code.push_back(encode(OP_APPLY_OVERRIDES));
         // After all SETs, rec attrs is on top of the operand stack —
         // becomes the value of the LetRec binding.
     }

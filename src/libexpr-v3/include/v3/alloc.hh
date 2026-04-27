@@ -53,6 +53,13 @@ struct ListVec
 // motivates it.
 // ---------------------------------------------------------------------------
 
+/// 32-bit AST position handle.  Mirrors `nix::PosIdx`'s underlying
+/// representation — we re-export it as a plain uint32_t to avoid
+/// pulling the libexpr header into the v3 inner core.  0 means "no
+/// position info known".
+using PosIdx32 = uint32_t;
+constexpr PosIdx32 kNoPos = 0;
+
 struct Bindings
 {
     struct Entry { SymbolId name; Value value; };
