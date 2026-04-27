@@ -1617,6 +1617,12 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
     }
     std::unordered_set<std::string> seen;
 
+    // Track the first-seen key type — tree-walker rejects mixing
+    // string vs int keys across the closure.  We prefix the key
+    // string with its tag to keep distinct types from colliding,
+    // and explicitly raise if a later item presents a different tag.
+    Tag firstKeyTag = Tag::Uninitialized;
+
     auto keyOf = [&](Value & it) -> std::string {
         it = forceValue(*state.vm, it);
         if (!it.isAttrs() || !it.payload.bindings)
@@ -1624,9 +1630,18 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
         const Value * kRaw = it.payload.bindings->lookup(sKey);
         if (!kRaw) throw std::runtime_error("v3 primop genericClosure: item missing 'key' attr");
         Value k = forceValue(*state.vm, *kRaw);
-        if (k.isString()) return std::string(k.payload.str);
-        if (k.isInt())    return std::to_string(k.payload.i);
-        throw std::runtime_error("v3 primop genericClosure: 'key' must be string or int");
+        Tag t = k.tag();
+        if (t != Tag::String && t != Tag::Int && t != Tag::Float &&
+            t != Tag::Path && t != Tag::Bool)
+            throw std::runtime_error("v3 primop genericClosure: 'key' must be string / int / float / path / bool");
+        if (firstKeyTag == Tag::Uninitialized) firstKeyTag = t;
+        else if (firstKeyTag != t)
+            throw std::runtime_error("v3 primop genericClosure: cannot compare keys of incompatible types");
+        if (t == Tag::String) return std::string(k.payload.str);
+        if (t == Tag::Int)    return std::to_string(k.payload.i);
+        if (t == Tag::Float)  return std::to_string(k.payload.f);
+        if (t == Tag::Path)   return std::string(k.payload.path ? k.payload.path : "");
+        return k.payload.i ? "true" : "false";
     };
 
     while (!work.empty()) {
