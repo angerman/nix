@@ -133,12 +133,13 @@ Store / derivation primops:
     `/nix/store/<32-hash>-name` form via tree-walker's copyPathToStore.
   - exec, filterSource, importNative, outputOf, toFile, fetchurl,
     fetchTarball — not implemented.
-  - String-context primops are still no-context stubs:
-    unsafeDiscardStringContext, hasContext, getContext,
-    unsafeDiscardOutputDependency, addDrvOutputDependencies,
-    appendContext.  v3 Tag::String doesn't track context yet, so
-    `getContext "${./file}"` returns `{}` instead of `{"/nix/store/...":
-    {path=true;};}`.
+  - String contexts: tracked via a side-table keyed by Tag::String
+    payload pointer.  Path interpolation `${./file}` tags the result
+    with an Opaque context entry; tree-walker strings (e.g. drvPath,
+    outPath via the derivation bridge) preserve their context across
+    the bridge.  All context primops work: getContext, hasContext,
+    unsafeDiscardStringContext, unsafeDiscardOutputDependency,
+    addDrvOutputDependencies, appendContext.
 
 Lazy evaluation:
   - Mutually-circular formal defaults like `{ a ? b, b ? a }: ...`
@@ -166,25 +167,9 @@ polymorphism, OP_ATTRS_SELECT inline cache).
 ## Test status
 
 The official `tests/functional/lang/eval-okay-*.nix` lang suite:
-**140 / 142 passing** (one test is `.exp-disabled` upstream).  Run via:
+**142 / 142 passing** (one test is `.exp-disabled` upstream).  Run via:
 
     bash src/libexpr-v3/test/run-lang-tests.sh
-
-Remaining 2 failures need v3-side machinery beyond the existing
-tree-walker bridge:
-  - **string-context introspection** (`context-introspection`) —
-    tree-walker tags each Tag::String with a `NixStringContext` set
-    of (store-path, output) entries.  v3 strings are plain bytes,
-    so `getContext`, `addDrvOutputDependencies`, etc. don't have a
-    context to read or rewrite.  Implementing this needs a side-
-    table keyed by string-payload-pointer or a dedicated string-
-    with-context value variant.
-  - **`builtins.path` with a v3 closure as `filter`** (`path`) —
-    the bridge to tree-walker's `builtins.path` covers the data
-    cases (returns proper `/nix/store/<32-hash>-name`), but the
-    filter argument is a v3 closure.  v3-to-tree-walker conversion
-    drops it as `null`, which tree-walker rejects.  Other arms of
-    the same test (no filter) pass.
 
 The 77-case v3-vs-tree-walker regression suite at
 `src/libexpr-v3/test/run-v3-tests.sh` is fully passing.
