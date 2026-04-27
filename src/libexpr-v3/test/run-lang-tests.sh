@@ -23,6 +23,10 @@ fi
 pattern="${V3_LANG_PATTERN:-*}"
 verbose="${V3_LANG_VERBOSE:-0}"
 
+# Some lang tests rely on environment variables being preset (e.g.
+# TEST_VAR for eval-okay-getenv.nix).  Mirror tests/functional/lang.sh.
+export TEST_VAR=foo
+
 pass=0
 fail=0
 errors=0
@@ -45,11 +49,14 @@ for f in "$LANG_DIR"/eval-okay-${pattern}.nix; do
   fi
 
   # Run v3-eval.  Use --strict so we get fully-evaluated results, matching
-  # what nix-instantiate --eval --strict would produce.
-  v3_out=$("$V3" --file "$f" --strict 2>&1) || {
+  # what nix-instantiate --eval --strict would produce.  Discard stderr —
+  # the lang test goldens compare against stdout only (warnings have a
+  # separate .err.exp file).
+  v3_out=$("$V3" --file "$f" --strict 2>/dev/null) || {
+    err_msg=$("$V3" --file "$f" --strict 2>&1 >/dev/null | head -c 200)
     errors=$((errors + 1))
-    errored_cases+=("$name: $v3_out")
-    [[ "$verbose" -eq 1 ]] && echo "ERROR  $name: $v3_out"
+    errored_cases+=("$name: $err_msg")
+    [[ "$verbose" -eq 1 ]] && echo "ERROR  $name: $err_msg"
     continue
   }
 

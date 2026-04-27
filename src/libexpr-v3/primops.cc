@@ -704,16 +704,18 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
         // value stays lazy on purpose
         entries.emplace_back(k, *vvRaw);
     }
-    std::sort(entries.begin(), entries.end(),
+    // listToAttrs in Nix is *first-wins* on duplicate keys (matches the
+    // tree-walker's behaviour and what `eval-okay-listtoattrs` exercises).
+    // Stable-sort preserves insertion order within a key so the first
+    // encounter survives the dedupe pass below.
+    std::stable_sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
-    // De-duplicate (last-write-wins for nix listToAttrs).
     std::vector<std::pair<SymbolId, Value>> dedup;
     dedup.reserve(entries.size());
     for (auto & p : entries) {
         if (!dedup.empty() && dedup.back().first == p.first)
-            dedup.back() = p;
-        else
-            dedup.push_back(p);
+            continue; // keep the first occurrence
+        dedup.push_back(p);
     }
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(dedup.size()));
     allocStats().attrsetsAllocated++;
@@ -880,27 +882,37 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
         if (!froms->elems[j].isString())
             typeError("replaceStrings", "list of strings");
     }
+    // Match Nix's tree-walker behaviour for replaceStrings:
+    //  - At each position, scan `from` left-to-right, take first match.
+    //  - An empty `from` matches the empty string at every position
+    //    (including end-of-string), inserting `to` between each character
+    //    (and at the start and end).  E.g. `replaceStrings [""] ["X"] "abc"`
+    //    yields `"XaXbXcX"`.
     std::string s(args[2].payload.str);
     std::string result;
     size_t i = 0;
-    while (i < s.size()) {
-        bool matched = false;
+    auto tryReplaceAt = [&](size_t pos) -> int {
         for (uint32_t j = 0; j < froms->size; ++j) {
-            const Value & f = froms->elems[j];
-            std::string_view fv(f.payload.str);
-            if (fv.empty()) continue;
-            if (s.compare(i, fv.size(), fv) == 0) {
-                Value t = forceValue(*state.vm, tos->elems[j]);
-                if (!t.isString())
-                    typeError("replaceStrings", "list of strings");
-                result.append(t.payload.str);
-                i += fv.size();
-                matched = true;
-                break;
-            }
+            std::string_view fv(froms->elems[j].payload.str);
+            bool match = fv.empty()
+                ? true
+                : (pos + fv.size() <= s.size() && s.compare(pos, fv.size(), fv) == 0);
+            if (!match) continue;
+            Value t = forceValue(*state.vm, tos->elems[j]);
+            if (!t.isString()) typeError("replaceStrings", "list of strings");
+            result.append(t.payload.str);
+            return static_cast<int>(fv.size());
         }
-        if (!matched) { result.push_back(s[i]); ++i; }
+        return -1;
+    };
+    while (i < s.size()) {
+        int adv = tryReplaceAt(i);
+        if (adv < 0)      { result.push_back(s[i]); ++i; }
+        else if (adv == 0){ result.push_back(s[i]); ++i; } // empty match: copy 1 char + replacement
+        else              { i += adv; }
     }
+    // Final empty-match at end-of-string (handles `["" ...]` -> trailing X).
+    tryReplaceAt(s.size());
     out = mkStringValueOwned(result);
 }
 
@@ -1254,7 +1266,12 @@ void primPathExists(EvalState &, Value * args, Value & out)
     if (args[0].isString()) s = args[0].payload.str;
     else if (args[0].isPath()) s = args[0].payload.path;
     else typeError("pathExists", "string or path");
-    out = std::filesystem::exists(s) ? Value::vTrue : Value::vFalse;
+    // Match tree-walker semantics: a broken symlink still "exists" for
+    // pathExists' purposes (matches `lstat` rather than `stat`).
+    std::error_code ec;
+    auto stat = std::filesystem::symlink_status(s, ec);
+    out = (!ec && stat.type() != std::filesystem::file_type::not_found)
+        ? Value::vTrue : Value::vFalse;
 }
 
 void primSplitString(EvalState &, Value * args, Value & out)

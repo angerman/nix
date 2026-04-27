@@ -26,6 +26,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 
@@ -977,10 +978,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             // Path + string semantics: when the first operand is a Path
             // and we're in plain `+` mode (not interpolation), the result
-            // is a Path, not a String.  Required by tests like
-            // `builtins.dirOf /foo/bar + ""` whose expected output is
-            // `/foo` (path), not `"/foo"` (string).
+            // is a Path (lexically normalized), not a String.  Required
+            // by `dirOf p + ""` and by string-test concat patterns like
+            // `/foo/bar + "/../xyzzy/."` which must collapse to /foo/xyzzy.
             bool resultIsPath = !forceStr && n > 0 && parts[0].isPath();
+            if (resultIsPath) {
+                std::string normalized =
+                    std::filesystem::path(out).lexically_normal().string();
+                // lexically_normal leaves a trailing "/." for inputs
+                // like "/a/b/." — strip it so output matches Nix.
+                while (normalized.size() > 1 && normalized.back() == '/')
+                    normalized.pop_back();
+                out = std::move(normalized);
+            }
             char * buf = static_cast<char *>(std::malloc(out.size() + 1));
             std::memcpy(buf, out.data(), out.size());
             buf[out.size()] = '\0';

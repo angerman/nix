@@ -293,7 +293,11 @@ int main(int argc, char ** argv)
                     return 1;
                 }
             }
-            e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath::root));
+            // Anchor relative paths inside the expression to the current
+            // working directory (matching `nix-instantiate --eval --expr`
+            // behaviour).  Without this, `./foo` lowers to `/foo`.
+            std::string cwd = std::filesystem::current_path().string();
+            e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath(cwd)));
         }
         e->bindVars(state, state.staticBaseEnv);
 
