@@ -23,6 +23,7 @@
 #include "v3/vm.hh"
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/ir.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-gc.hh"
@@ -227,7 +228,11 @@ int main(int argc, char ** argv)
             r = forceDeep(vm, r);
         }
 
-        return printValue(r, jsonOut, cu.symbolTable);
+        // Use the global symbol table for printing — it's append-only
+        // and a superset of every per-CU table, so it always covers
+        // attribute names from imported CUs that the top-level CU's
+        // (frozen-at-compile-time) snapshot wouldn't see.
+        return printValue(r, jsonOut, nix::v3::ir::globalSymbolTable());
     } catch (const std::exception & ex) {
         std::fprintf(stderr, "v3-eval error: %s\n", ex.what());
         return 1;

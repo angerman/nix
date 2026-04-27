@@ -20,6 +20,7 @@
 #include "v3/vm.hh"
 #include "v3/alloc.hh"
 #include "v3/primop.hh"
+#include "v3/ir.hh"
 
 #include <algorithm>
 #include <cassert>
@@ -467,15 +468,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Nix protocol.  Push (functor, attrset, arg) and re-enter
             // OP_CALL twice to match the curried call sequence.
             if (fun.isAttrs()) {
-                static SymbolId functorId = static_cast<SymbolId>(-1);
-                if (functorId == static_cast<SymbolId>(-1)) {
-                    for (size_t s = 0; s < cu->symbolTable.size(); ++s)
-                        if (cu->symbolTable[s] == "__functor") {
-                            functorId = static_cast<SymbolId>(s);
-                            break;
-                        }
-                }
-                if (functorId == static_cast<SymbolId>(-1) || !fun.payload.bindings)
+                static const SymbolId functorId = ir::globalInternSymbol("__functor");
+                if (!fun.payload.bindings)
                     throw std::runtime_error("v3 OP_CALL: callee is an attrset without __functor");
                 const Value * fn = fun.payload.bindings->lookup(functorId);
                 if (!fn)
@@ -748,17 +742,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // The CompilationUnit owns the symbolTable; we look up or
                 // append.  This is correct but slow; an interner side-table
                 // can speed it up.
-                std::string nm(nameV.payload.str);
-                SymbolId id = kInvalidSymbol;
-                for (size_t s = 0; s < cu->symbolTable.size(); ++s)
-                    if (cu->symbolTable[s] == nm) { id = static_cast<SymbolId>(s); break; }
-                if (id == kInvalidSymbol) {
-                    // Add to a thread-local extension table?  For bring-up,
-                    // mutate cu's symbolTable.  cu is const here; cast away.
-                    auto & st = const_cast<std::vector<std::string> &>(cu->symbolTable);
-                    id = static_cast<SymbolId>(st.size());
-                    st.push_back(nm);
-                }
+                // Use the global symbol table — IDs from any CU stay
+                // consistent so attrset lookups across CUs work.
+                SymbolId id = ir::globalInternSymbol(nameV.payload.str);
                 entries.emplace_back(id, valV);
             }
             std::sort(entries.begin(), entries.end(),
@@ -809,13 +795,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value name = pop(vm), attrs = pop(vm);
             if (!name.isString() || !attrs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_SELECT_DYN: type error");
-            std::string_view nm(name.payload.str);
-            // Look up the symbol id; if not present, attribute is absent.
-            SymbolId id = kInvalidSymbol;
-            for (size_t s = 0; s < cu->symbolTable.size(); ++s)
-                if (cu->symbolTable[s] == nm) { id = static_cast<SymbolId>(s); break; }
-            if (id == kInvalidSymbol)
-                throw std::runtime_error("v3 OP_ATTRS_SELECT_DYN: attribute not found");
+            // Intern via the global table so the SymbolId matches the
+            // ones the attrset's bindings were built with.
+            SymbolId id = ir::globalInternSymbol(name.payload.str);
             const Value * found = attrs.payload.bindings->lookup(id);
             if (!found)
                 throw std::runtime_error("v3 OP_ATTRS_SELECT_DYN: attribute not found");
@@ -831,11 +813,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_ATTRS_HAS_DYN: {
             Value name = pop(vm), attrs = pop(vm);
             if (!name.isString() || !attrs.isAttrs()) { push(vm, Value::vFalse); break; }
-            std::string_view nm(name.payload.str);
-            SymbolId id = kInvalidSymbol;
-            for (size_t s = 0; s < cu->symbolTable.size(); ++s)
-                if (cu->symbolTable[s] == nm) { id = static_cast<SymbolId>(s); break; }
-            push(vm, (id != kInvalidSymbol && attrs.payload.bindings->has(id))
+            SymbolId id = ir::globalInternSymbol(name.payload.str);
+            push(vm, attrs.payload.bindings->has(id)
                 ? Value::vTrue : Value::vFalse);
             break;
         }
