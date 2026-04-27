@@ -446,8 +446,11 @@ void primSubstring(EvalState &, Value * args, Value & out)
         typeError("substring", "(int, int, string)");
     int64_t start = args[0].payload.i;
     int64_t len = args[1].payload.i;
+    // Match tree-walker: negative start is rejected; negative len is
+    // a "to end" sentinel.
+    if (start < 0)
+        throw std::runtime_error("v3 substring: negative start position");
     std::string_view src(args[2].payload.str);
-    if (start < 0) start = 0;
     if (static_cast<size_t>(start) >= src.size()) {
         out = mkStringValueOwned("");
         return;
@@ -2061,17 +2064,40 @@ static void primV3CallBridge2(nix::EvalState & ns, const nix::PosIdx pos,
 /// to tree-walker's real derivation hasher.  Functions are converted as
 /// nullptr (caller must handle / not pass them in).  Lazy thunks are
 /// forced first.
-static nix::Value * v3ToTreeWalker(EvalState & state, Value v)
+static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
+                                    std::unordered_map<const void *, nix::Value *> & seen)
 {
     auto & ns = *state.nixEvalState;
     v = forceValue(*state.vm, v);
+    // Cycle protection: if we've already started converting this
+    // ListVec / Bindings, return the in-progress nix::Value.  Required
+    // for `let x = [x]; in x` or recursive attrsets the v3 result
+    // returns intact.
+    const void * cycleKey = nullptr;
+    if (v.tag() == Tag::List) cycleKey = v.payload.list;
+    else if (v.tag() == Tag::Attrs) cycleKey = v.payload.bindings;
+    if (cycleKey) {
+        if (auto it = seen.find(cycleKey); it != seen.end()) return it->second;
+    }
     nix::Value * out = ns.allocValue();
+    if (cycleKey) seen[cycleKey] = out;
     switch (v.tag()) {
     case Tag::Int:    out->mkInt(v.payload.i); break;
     case Tag::Float:  out->mkFloat(v.payload.f); break;
     case Tag::Bool:   out->mkBool(v.payload.i == 1); break;
     case Tag::Null:   out->mkNull(); break;
-    case Tag::String: out->mkString(v.payload.str ? v.payload.str : "", ns.mem); break;
+    case Tag::String:
+        // Preserve any context the v3 string carries via the
+        // side-table.  We re-encode through nix's NixStringContext
+        // and use mkString(str, context, mem) — that's the only mk*
+        // overload that takes a NixStringContext directly.
+        if (auto * raw = lookupStringContextEntries(v.payload.str ? v.payload.str : "")) {
+            nix::NixStringContext ctx = decodeStringContext(*raw);
+            out->mkString(v.payload.str ? v.payload.str : "", ctx, ns.mem);
+        } else {
+            out->mkString(v.payload.str ? v.payload.str : "", ns.mem);
+        }
+        break;
     case Tag::Path: {
         nix::SourcePath sp(ns.rootFS, nix::CanonPath(v.payload.path ? v.payload.path : ""));
         out->mkPath(sp, ns.mem);
@@ -2082,7 +2108,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v)
         uint32_t n = lv ? lv->size : 0;
         auto lb = ns.buildList(n);
         for (uint32_t i = 0; i < n; ++i)
-            *(lb[i] = ns.allocValue()) = *v3ToTreeWalker(state, lv->elems[i]);
+            lb[i] = v3ToTreeWalker(state, lv->elems[i], seen);
         out->mkList(lb);
         break;
     }
@@ -2093,7 +2119,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v)
         if (b) for (uint32_t i = 0; i < b->size; ++i) {
             SymbolId sid = b->entries[i].name;
             std::string n = sid < symTab.size() ? symTab[sid] : "";
-            bb.insert(ns.symbols.create(n), v3ToTreeWalker(state, b->entries[i].value));
+            bb.insert(ns.symbols.create(n), v3ToTreeWalker(state, b->entries[i].value, seen));
         }
         out->mkAttrs(bb);
         break;
@@ -2143,6 +2169,12 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v)
         break;
     }
     return out;
+}
+
+static nix::Value * v3ToTreeWalker(EvalState & state, Value v)
+{
+    std::unordered_map<const void *, nix::Value *> seen;
+    return v3ToTreeWalker(state, v, seen);
 }
 
 /// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
