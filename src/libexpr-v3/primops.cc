@@ -25,6 +25,7 @@
 #include "v3/vm.hh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -896,6 +897,72 @@ void primSplitString(EvalState &, Value * args, Value & out)
     out.payload.list = lv;
 }
 
+/// builtins.sort: sort a list using a comparator.  cmp(a, b) is true if
+/// a should come before b.
+void primSort(EvalState & state, Value * args, Value & out)
+{
+    if (!args[1].isList()) typeError("sort", "list");
+    auto * src = args[1].payload.list;
+    Value cmp = args[0];
+    if (!src || src->size <= 1) { out = args[1]; return; }
+    ListVec * result = Alloc::allocList(src->size);
+    allocStats().listsAllocated++;
+    for (uint32_t i = 0; i < src->size; ++i) result->elems[i] = src->elems[i];
+    std::sort(result->elems, result->elems + src->size,
+        [&](const Value & a, const Value & b) {
+            Value step1 = callClosure(*state.vm, cmp, a);
+            Value r = callClosure(*state.vm, step1, b);
+            if (!r.isBool()) typeError("sort", "comparator returning bool");
+            return r.payload.i == 1;
+        });
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = result;
+}
+
+/// builtins.bitAnd / bitOr / bitXor on int.
+void primBitAnd(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isInt() || !args[1].isInt()) typeError("bitAnd", "two ints");
+    out.mkInt(args[0].payload.i & args[1].payload.i);
+}
+void primBitOr(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isInt() || !args[1].isInt()) typeError("bitOr", "two ints");
+    out.mkInt(args[0].payload.i | args[1].payload.i);
+}
+void primBitXor(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isInt() || !args[1].isInt()) typeError("bitXor", "two ints");
+    out.mkInt(args[0].payload.i ^ args[1].payload.i);
+}
+
+/// floor / ceil for floats.
+void primFloor(EvalState &, Value * args, Value & out)
+{
+    if (args[0].isInt())   { out = args[0]; return; }
+    if (!args[0].isFloat()) typeError("floor", "float or int");
+    out.mkInt(static_cast<int64_t>(std::floor(args[0].payload.f)));
+}
+void primCeil(EvalState &, Value * args, Value & out)
+{
+    if (args[0].isInt())   { out = args[0]; return; }
+    if (!args[0].isFloat()) typeError("ceil", "float or int");
+    out.mkInt(static_cast<int64_t>(std::ceil(args[0].payload.f)));
+}
+
+/// stringLength has a 1-arg version; stringToInt would be nice but
+/// nix has only specific primops.  Add fromString-ish helpers:
+void primParseInt(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("parseInt", "string");
+    try {
+        int64_t v = std::stoll(args[0].payload.str);
+        out.mkInt(v);
+    } catch (...) {
+        throw std::runtime_error("v3 parseInt: invalid integer");
+    }
+}
+
 /// tryEval: forces the argument; returns
 ///   { success = true;  value = result;       } on success,
 ///   { success = false; value = false;        } on caught exception.
@@ -1024,6 +1091,13 @@ void registerBuiltinPrimOps()
         registerPrimOp({"dirOf",              1, primDirOf});
         registerPrimOp({"pathExists",         1, primPathExists});
         registerPrimOp({"splitString",        2, primSplitString});
+        registerPrimOp({"sort",               2, primSort});
+        registerPrimOp({"bitAnd",             2, primBitAnd});
+        registerPrimOp({"bitOr",              2, primBitOr});
+        registerPrimOp({"bitXor",             2, primBitXor});
+        registerPrimOp({"floor",              1, primFloor});
+        registerPrimOp({"ceil",               1, primCeil});
+        registerPrimOp({"parseInt",           1, primParseInt});
     });
 }
 
