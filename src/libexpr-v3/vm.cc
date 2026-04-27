@@ -192,22 +192,15 @@ inline std::string coerceToString(const Value & v, bool forceString)
         std::string p(v.payload.path ? v.payload.path : "");
         if (forceString) {
             if (auto * ns = getNixEvalState()) {
-                try {
-                    nix::NixStringContext ctx;
-                    nix::SourcePath sp(ns->rootFS, nix::CanonPath(p));
-                    auto storePath = ns->copyPathToStore(ctx, sp);
-                    auto result = ns->store->printStorePath(storePath);
-                    // Note for the caller: this string carries an
-                    // Opaque context entry for `storePath`.  We have
-                    // no way to attach it from here (forceString is
-                    // a value-coerce — the caller composes the final
-                    // string).  OP_STR_CONCAT records contexts on
-                    // its result via the per-part path scan below.
-                    return result;
-                } catch (...) {
-                    // Path doesn't exist or can't be copied — fall through
-                    // to absolute path representation.
-                }
+                // Let copyPathToStore exceptions propagate — tree-walker
+                // raises on missing paths during interpolation, and v3
+                // should match.  Note for the caller: this string carries
+                // an Opaque context entry for `storePath`; the caller is
+                // responsible for recording it (see OP_STR_CONCAT below).
+                nix::NixStringContext ctx;
+                nix::SourcePath sp(ns->rootFS, nix::CanonPath(p));
+                auto storePath = ns->copyPathToStore(ctx, sp);
+                return ns->store->printStorePath(storePath);
             }
         }
         return p;
@@ -1319,14 +1312,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // context entry.  Encoded form is the StorePath's
                     // basename (`<hash>-<name>`) — what
                     // NixStringContextElem::to_string()/parse roundtrip.
+                    // Exceptions propagate: tree-walker raises on missing
+                    // paths during interpolation, so v3 must too.
                     if (auto * ns = getNixEvalState()) {
-                        try {
-                            nix::NixStringContext tmp;
-                            nix::SourcePath sp(ns->rootFS,
-                                                nix::CanonPath(p.payload.path ? p.payload.path : ""));
-                            auto storePath = ns->copyPathToStore(tmp, sp);
-                            ctxAccum.push_back(std::string(storePath.to_string()));
-                        } catch (...) { /* not on store — no context */ }
+                        nix::NixStringContext tmp;
+                        nix::SourcePath sp(ns->rootFS,
+                                            nix::CanonPath(p.payload.path ? p.payload.path : ""));
+                        auto storePath = ns->copyPathToStore(tmp, sp);
+                        ctxAccum.push_back(std::string(storePath.to_string()));
                     }
                 }
                 out.append(coerceToString(p, forceStr));
