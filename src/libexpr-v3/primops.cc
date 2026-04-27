@@ -27,6 +27,7 @@
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/value/context.hh"
 #include "nix/util/canon-path.hh"
 #include "nix/util/hash.hh"
 
@@ -53,6 +54,8 @@
 #include <unordered_set>
 
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/store/store-api.hh"
+#include "nix/store/derived-path.hh"
 
 namespace nix::v3 {
 
@@ -65,6 +68,41 @@ std::unordered_map<std::string, PrimOp> & registry()
 }
 
 thread_local nix::EvalState * tlNixEvalState = nullptr;
+
+// String-context side-table is in alloc.hh — entries are encoded
+// strings (`<path>` Opaque, `=<drvPath>` DrvDeep, `!<output>!<drvPath>`
+// Built).  Helpers below convert to/from nix::NixStringContext.
+
+static nix::NixStringContext decodeStringContext(const std::vector<std::string> & entries)
+{
+    nix::NixStringContext out;
+    for (auto & e : entries) {
+        try { out.insert(nix::NixStringContextElem::parse(e)); }
+        catch (...) { /* skip un-parseable entries */ }
+    }
+    return out;
+}
+
+static std::vector<std::string> encodeStringContext(const nix::NixStringContext & ctx)
+{
+    std::vector<std::string> out;
+    out.reserve(ctx.size());
+    for (auto & e : ctx) out.push_back(e.to_string());
+    return out;
+}
+
+static const nix::NixStringContext lookupStringContext(const char * buf)
+{
+    if (auto * raw = lookupStringContextEntries(buf))
+        return decodeStringContext(*raw);
+    return {};
+}
+
+static void setStringContext(const char * buf, const nix::NixStringContext & ctx)
+{
+    if (ctx.empty()) return;
+    setStringContextEntries(buf, encodeStringContext(ctx));
+}
 
 std::mutex & registryMutex()
 {
@@ -1072,46 +1110,212 @@ void primSplitVersion(EvalState &, Value * args, Value & out)
     out.payload.list = lv;
 }
 
-/// String-context primops.  v3 doesn't track string contexts yet, so
-/// these are stubs that match the no-context case behaviour:
-///   unsafeDiscardStringContext s  ->  s
-///   hasContext s                  ->  false
-///   getContext s                  ->  {} (empty attrset)
+/// Helper: clone a v3 string with the same contents but a fresh
+/// payload buffer (so context tagging is per-string-value).
+static Value cloneString(const char * s)
+{
+    return mkStringValueOwned(std::string(s ? s : ""));
+}
+
 void primUnsafeDiscardStringContext(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("unsafeDiscardStringContext", "string");
-    out = args[0];
+    // Allocate a fresh string buffer with no context entry.
+    out = cloneString(args[0].payload.str);
 }
-void primHasContext(EvalState &, Value *, Value & out) { out = Value::vFalse; }
-void primGetContext(EvalState &, Value *, Value & out)
+
+void primHasContext(EvalState &, Value * args, Value & out)
 {
-    Bindings * b = Alloc::allocBindings(0);
+    if (!args[0].isString()) typeError("hasContext", "string");
+    out = lookupStringContextEntries(args[0].payload.str)
+        ? Value::vTrue : Value::vFalse;
+}
+
+void primGetContext(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("getContext", "string");
+    auto * raw = lookupStringContextEntries(args[0].payload.str);
+    if (!raw) {
+        Bindings * b = Alloc::allocBindings(0);
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        return;
+    }
+    auto ctx = decodeStringContext(*raw);
+    // Group entries by store-path string; per group, collect:
+    //   path        — present (i.e. an Opaque element matched).
+    //   outputs     — list of output names (Built elements).
+    //   allOutputs  — true if a DrvDeep matched.
+    SymbolId sPath       = vmIntern(state, "path");
+    SymbolId sOutputs    = vmIntern(state, "outputs");
+    SymbolId sAllOutputs = vmIntern(state, "allOutputs");
+    if (!state.nixEvalState) {
+        Bindings * b = Alloc::allocBindings(0);
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        return;
+    }
+    auto & ns = *state.nixEvalState;
+    struct Group { bool isPath = false; std::vector<std::string> outputs; bool allOutputs = false; };
+    std::map<std::string, Group> groups;
+    for (auto & e : ctx) {
+        if (auto * o = std::get_if<nix::NixStringContextElem::Opaque>(&e.raw)) {
+            groups[ns.store->printStorePath(o->path)].isPath = true;
+        } else if (auto * d = std::get_if<nix::NixStringContextElem::DrvDeep>(&e.raw)) {
+            groups[ns.store->printStorePath(d->drvPath)].allOutputs = true;
+        } else if (auto * b = std::get_if<nix::NixStringContextElem::Built>(&e.raw)) {
+            // Built carries a DrvPath (single drv) plus an output name.
+            std::string drvPath;
+            if (auto * dp = std::get_if<nix::SingleDerivedPath::Opaque>(&(*b->drvPath).raw()))
+                drvPath = ns.store->printStorePath(dp->path);
+            if (!drvPath.empty())
+                groups[drvPath].outputs.push_back(b->output);
+        }
+    }
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(groups.size());
+    for (auto & [path, g] : groups) {
+        std::vector<std::pair<SymbolId, Value>> subEntries;
+        if (g.isPath) subEntries.emplace_back(sPath, Value::vTrue);
+        if (g.allOutputs) subEntries.emplace_back(sAllOutputs, Value::vTrue);
+        if (!g.outputs.empty()) {
+            std::sort(g.outputs.begin(), g.outputs.end());
+            ListVec * lv = Alloc::allocList(static_cast<uint32_t>(g.outputs.size()));
+            allocStats().listsAllocated++;
+            for (size_t i = 0; i < g.outputs.size(); ++i)
+                lv->elems[i] = mkStringValueOwned(g.outputs[i]);
+            Value lvVal;
+            lvVal.tag_payload = static_cast<uint64_t>(Tag::List);
+            lvVal.payload.list = lv;
+            subEntries.emplace_back(sOutputs, lvVal);
+        }
+        std::sort(subEntries.begin(), subEntries.end(),
+            [](auto & a, auto & b) { return a.first < b.first; });
+        Bindings * sb = Alloc::allocBindings(static_cast<uint32_t>(subEntries.size()));
+        allocStats().attrsetsAllocated++;
+        for (size_t i = 0; i < subEntries.size(); ++i) {
+            sb->entries[i].name  = subEntries[i].first;
+            sb->entries[i].value = subEntries[i].second;
+        }
+        Value subVal;
+        subVal.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        subVal.payload.bindings = sb;
+        entries.emplace_back(vmIntern(state, path), subVal);
+    }
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
+    Bindings * bb = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        bb->entries[i].name  = entries[i].first;
+        bb->entries[i].value = entries[i].second;
+    }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.payload.bindings = bb;
 }
 
-/// builtins.appendContext s ctx -- normally adds `ctx` (an attrset of
-/// store-path → {path/outputs/allOutputs}) to `s`'s context.  v3
-/// strings are context-less, so this is identity on the string.
-void primAppendContext(EvalState &, Value * args, Value & out)
+/// builtins.appendContext s ctx — add `ctx`'s entries to `s`'s context.
+/// `ctx` is an attrset of `store-path -> { path; outputs; allOutputs; }`.
+void primAppendContext(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isString()) typeError("appendContext", "(string, attrset)");
-    out = args[0];
+    if (!args[0].isString())
+        typeError("appendContext", "(string, attrset)");
+    Value ctxV = forceValue(*state.vm, args[1]);
+    if (!ctxV.isAttrs() || !ctxV.payload.bindings)
+        typeError("appendContext", "second arg attrset");
+    // Start with the existing context.
+    auto & symTab = ir::globalSymbolTable();
+    auto existing = lookupStringContext(args[0].payload.str);
+    nix::NixStringContext ctx = existing;
+    auto * ctxB = ctxV.payload.bindings;
+    if (!state.nixEvalState) {
+        out = cloneString(args[0].payload.str);
+        return;
+    }
+    auto & ns = *state.nixEvalState;
+    SymbolId sPath       = vmIntern(state, "path");
+    SymbolId sOutputs    = vmIntern(state, "outputs");
+    SymbolId sAllOutputs = vmIntern(state, "allOutputs");
+    for (uint32_t i = 0; i < ctxB->size; ++i) {
+        SymbolId k = ctxB->entries[i].name;
+        std::string pathStr(k < symTab.size() ? symTab[k] : "");
+        Value sub = forceValue(*state.vm, ctxB->entries[i].value);
+        if (!sub.isAttrs() || !sub.payload.bindings) continue;
+        nix::StorePath storePath = ns.store->parseStorePath(pathStr);
+        if (auto * pp = sub.payload.bindings->lookup(sPath)) {
+            Value pv = forceValue(*state.vm, *pp);
+            if (pv.isBool() && pv.payload.i == 1)
+                ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = storePath}});
+        }
+        if (auto * ao = sub.payload.bindings->lookup(sAllOutputs)) {
+            Value av = forceValue(*state.vm, *ao);
+            if (av.isBool() && av.payload.i == 1)
+                ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{.drvPath = storePath}});
+        }
+        if (auto * outsRaw = sub.payload.bindings->lookup(sOutputs)) {
+            Value ov = forceValue(*state.vm, *outsRaw);
+            if (ov.isList() && ov.payload.list) {
+                for (uint32_t j = 0; j < ov.payload.list->size; ++j) {
+                    Value e = forceValue(*state.vm, ov.payload.list->elems[j]);
+                    if (!e.isString()) continue;
+                    nix::SingleDerivedPath dp{nix::SingleDerivedPath::Opaque{.path = storePath}};
+                    nix::ref<nix::SingleDerivedPath> drvRef =
+                        nix::make_ref<nix::SingleDerivedPath>(dp);
+                    ctx.insert(nix::NixStringContextElem{
+                        nix::NixStringContextElem::Built{
+                            .drvPath = drvRef, .output = e.payload.str}});
+                }
+            }
+        }
+    }
+    out = cloneString(args[0].payload.str);
+    if (!ctx.empty())
+        setStringContext(out.payload.str, ctx);
 }
 
-/// builtins.addDrvOutputDependencies: tags a context with all-outputs
-/// dependency.  Identity for context-less v3 strings.
-void primAddDrvOutputDependencies(EvalState &, Value * args, Value & out)
+/// builtins.addDrvOutputDependencies — turn each Opaque entry in the
+/// string's context into a DrvDeep entry.  No-op for non-Opaque
+/// entries.  Idempotent.  Uses the same cloneString pattern so we
+/// don't mutate the original buffer's table entry.
+void primAddDrvOutputDependencies(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isString()) typeError("addDrvOutputDependencies", "string");
-    out = args[0];
+    if (!args[0].isString())
+        typeError("addDrvOutputDependencies", "string");
+    auto existing = lookupStringContext(args[0].payload.str);
+    nix::NixStringContext ctx;
+    for (auto & e : existing) {
+        if (auto * o = std::get_if<nix::NixStringContextElem::Opaque>(&e.raw)) {
+            ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{.drvPath = o->path}});
+        } else if (std::holds_alternative<nix::NixStringContextElem::DrvDeep>(e.raw)) {
+            ctx.insert(e);
+        } else {
+            ctx.insert(e);
+        }
+    }
+    out = cloneString(args[0].payload.str);
+    if (!ctx.empty()) setStringContext(out.payload.str, ctx);
+    (void)state;
 }
 
-/// builtins.unsafeDiscardOutputDependency: same identity treatment.
-void primUnsafeDiscardOutputDependency(EvalState &, Value * args, Value & out)
+/// builtins.unsafeDiscardOutputDependency — turn DrvDeep entries
+/// (`=<drvPath>`) into Opaque entries (`<drvPath>`).  Other entries
+/// pass through.
+void primUnsafeDiscardOutputDependency(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isString()) typeError("unsafeDiscardOutputDependency", "string");
-    out = args[0];
+    if (!args[0].isString())
+        typeError("unsafeDiscardOutputDependency", "string");
+    auto existing = lookupStringContext(args[0].payload.str);
+    nix::NixStringContext ctx;
+    for (auto & e : existing) {
+        if (auto * d = std::get_if<nix::NixStringContextElem::DrvDeep>(&e.raw)) {
+            ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = d->drvPath}});
+        } else {
+            ctx.insert(e);
+        }
+    }
+    out = cloneString(args[0].payload.str);
+    if (!ctx.empty()) setStringContext(out.payload.str, ctx);
+    (void)state;
 }
 
 /// builtins.__nixPath : list of `{prefix, path}` attrsets.  Reads the
@@ -1959,7 +2163,16 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
     case nix::nExternal:
     case nix::nFailed:
         out.mkNull(); return out;
-    case nix::nString: out = mkStringValueOwned(std::string(nv.string_view())); return out;
+    case nix::nString: {
+        out = mkStringValueOwned(std::string(nv.string_view()));
+        if (auto * ctx = nv.context()) {
+            std::vector<std::string> entries;
+            for (auto & e : *ctx) entries.push_back(std::string((*e).c_str()));
+            if (!entries.empty())
+                setStringContextEntries(out.payload.str, std::move(entries));
+        }
+        return out;
+    }
     case nix::nPath: {
         out.tag_payload = static_cast<uint64_t>(Tag::Path);
         std::string p(nv.pathStrView());

@@ -255,4 +255,38 @@ inline const PosSnapshot * resolvePosSnapshot(uint32_t handle)
     return &p[handle];
 }
 
+// ---------------------------------------------------------------------------
+// String-context side-table.
+//
+// v3 Tag::String values are plain `const char *` payloads — context
+// info is kept in a separate map keyed by that pointer.  Entries use
+// the tree-walker-style encoding: `<path>` (Opaque), `=<drvPath>`
+// (DrvDeep), `!<output>!<drvPath>` (Built).
+//
+// Both the VM (when path-coercion produces a store-path string) and
+// the primops (`getContext`, `appendContext`, `unsafeDiscard*`) read
+// and write this table.  Putting it here in alloc.hh keeps vm.cc
+// independent of the nix:: NixStringContext type.
+// ---------------------------------------------------------------------------
+
+inline std::unordered_map<const char *, std::vector<std::string>> & stringContextSideTable()
+{
+    static std::unordered_map<const char *, std::vector<std::string>> tbl;
+    return tbl;
+}
+
+inline void setStringContextEntries(const char * buf, std::vector<std::string> entries)
+{
+    if (entries.empty()) return;
+    stringContextSideTable()[buf] = std::move(entries);
+}
+
+inline const std::vector<std::string> * lookupStringContextEntries(const char * buf)
+{
+    if (!buf) return nullptr;
+    auto & tbl = stringContextSideTable();
+    auto it = tbl.find(buf);
+    return it == tbl.end() ? nullptr : &it->second;
+}
+
 } // namespace nix::v3

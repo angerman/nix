@@ -195,7 +195,14 @@ inline std::string coerceToString(const Value & v, bool forceString)
                     nix::NixStringContext ctx;
                     nix::SourcePath sp(ns->rootFS, nix::CanonPath(p));
                     auto storePath = ns->copyPathToStore(ctx, sp);
-                    return ns->store->printStorePath(storePath);
+                    auto result = ns->store->printStorePath(storePath);
+                    // Note for the caller: this string carries an
+                    // Opaque context entry for `storePath`.  We have
+                    // no way to attach it from here (forceString is
+                    // a value-coerce — the caller composes the final
+                    // string).  OP_STR_CONCAT records contexts on
+                    // its result via the per-part path scan below.
+                    return result;
                 } catch (...) {
                     // Path doesn't exist or can't be copied — fall through
                     // to absolute path representation.
@@ -1144,6 +1151,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
 
             std::string out;
+            // Accumulate string contexts from all parts.  Path parts
+            // produce a fresh Opaque entry (the store path of the
+            // copied content); String parts inherit any context their
+            // payload buffer was tagged with.  Attrset parts coerce
+            // via __toString/outPath like before — we treat the
+            // resulting string identically.
+            std::vector<std::string> ctxAccum;
+            auto addCtx = [&](const std::vector<std::string> * v) {
+                if (!v) return;
+                for (auto & s : *v) ctxAccum.push_back(s);
+            };
             for (uint32_t i = 0; i < n; ++i) {
                 const Value & p = parts[i];
                 // Attrset coercion: __toString self  or  outPath.
@@ -1156,12 +1174,39 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         Value forced = forceValue(vm, *fn);
                         Value s = callClosure(vm, forced, p);
                         s = forceValue(vm, s);
-                        if (s.isString()) { out.append(s.payload.str); continue; }
+                        if (s.isString()) {
+                            out.append(s.payload.str);
+                            addCtx(lookupStringContextEntries(s.payload.str));
+                            continue;
+                        }
                     }
                     if (auto * op = p.payload.bindings->lookup(outId)) {
                         Value forced = forceValue(vm, *op);
-                        if (forced.isString()) { out.append(forced.payload.str); continue; }
+                        if (forced.isString()) {
+                            out.append(forced.payload.str);
+                            addCtx(lookupStringContextEntries(forced.payload.str));
+                            continue;
+                        }
                         if (forced.isPath())   { out.append(forced.payload.path); continue; }
+                    }
+                }
+                if (p.isString())
+                    addCtx(lookupStringContextEntries(p.payload.str));
+                if (p.isPath() && forceStr) {
+                    // coerceToString will copy this path to the store and
+                    // produce its `/nix/store/...` representation; tag the
+                    // resulting string with that store path as an Opaque
+                    // context entry.  Encoded form is the StorePath's
+                    // basename (`<hash>-<name>`) — what
+                    // NixStringContextElem::to_string()/parse roundtrip.
+                    if (auto * ns = getNixEvalState()) {
+                        try {
+                            nix::NixStringContext tmp;
+                            nix::SourcePath sp(ns->rootFS,
+                                                nix::CanonPath(p.payload.path ? p.payload.path : ""));
+                            auto storePath = ns->copyPathToStore(tmp, sp);
+                            ctxAccum.push_back(std::string(storePath.to_string()));
+                        } catch (...) { /* not on store — no context */ }
                     }
                 }
                 out.append(coerceToString(p, forceStr));
@@ -1190,6 +1235,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 v.payload.path = buf;
             } else {
                 v.mkString(buf);
+                // De-duplicate context entries (a sorted-unique pass) and
+                // record on the new buffer.  Empty input → no entry left.
+                if (!ctxAccum.empty()) {
+                    std::sort(ctxAccum.begin(), ctxAccum.end());
+                    ctxAccum.erase(std::unique(ctxAccum.begin(), ctxAccum.end()),
+                                   ctxAccum.end());
+                    setStringContextEntries(buf, std::move(ctxAccum));
+                }
             }
             push(vm, v);
             break;
