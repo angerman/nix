@@ -611,17 +611,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             vm.valueStack[newBase + 0] = arg;
 
             uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
-            // Direct field-by-field setup avoids constructing a temp
-            // CallFrame and then move-copying it into the vector.
-            vm.frames.emplace_back();
-            CallFrame & nf = vm.frames.back();
-            nf.cu              = calleeCu;
-            nf.closure         = callee;
-            nf.thunk           = nullptr;
-            nf.ip              = desc->codeOffset;
-            nf.stackBaseOffset = static_cast<uint32_t>(newBase);
-            nf.withStackBase   = newWithBase;
-            nf.flags           = 0;
+            // Push the new frame in a single move-construct: lets the
+            // compiler initialize the trailing 40 bytes inline at the
+            // back of the vector rather than emplace_back + 7 separate
+            // field stores.  Frames are pre-reserved so push_back never
+            // reallocates on the hot path.
+            vm.frames.push_back(CallFrame{
+                .cu = calleeCu,
+                .closure = callee,
+                .thunk = nullptr,
+                .ip = desc->codeOffset,
+                .stackBaseOffset = static_cast<uint32_t>(newBase),
+                .withStackBase = newWithBase,
+                .flags = 0,
+            });
             pushCapturedWiths(vm, callee->capturedWiths);
 
             ip = desc->codeOffset;
