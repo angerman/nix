@@ -42,16 +42,27 @@ namespace {
     throw std::runtime_error(std::string("v3 lower: unsupported AST node — ") + what);
 }
 
-/// One frame on the scope stack — a per-Function map of Symbol → VarId.
-/// A static-env "level" walks from this frame toward the back of the stack;
-/// "displ" is the position within the frame.  We mirror nix's bindVars
-/// convention: the closest enclosing env is level=0.
+/// One frame on the scope stack.  A static-env "level" walks from this
+/// frame toward the back of the stack; "displ" is the position within
+/// the frame.  We mirror nix's bindVars convention: closest enclosing
+/// env is level=0.
+///
+/// Two flavors:
+///   - Regular scope: byDispl[displ] is a VarId (params, lambda
+///     argName, simple let bindings).
+///   - Rec scope: recAttrsVar is a VarId holding the rec attrset, and
+///     recAttrsNames[displ] is the SymbolId for that displ.  When a
+///     binding lookup hits a rec slot (byDispl[displ] == kInvalid),
+///     resolve via AttrSelect(recAttrsVar, recAttrsNames[displ]) +
+///     Force.  Used for `let ... in body` (let-rec) so mutual
+///     references work.
 struct Scope
 {
-    /// Vars in declaration order; index = displacement.
     std::vector<ir::VarId> byDispl;
-    /// Optional name lookup (rare).
     std::unordered_map<std::string, ir::VarId> byName;
+
+    ir::VarId recAttrsVar = ir::kInvalid;
+    std::vector<ir::SymbolId> recAttrsNames;
 };
 
 struct Lowerer
@@ -88,15 +99,29 @@ struct Lowerer
         m.blocks[blockStack.back()].terminal = ir::TermReturn{v};
     }
 
-    /// Returns the resolved VarId, or kInvalid if the variable lives in the
-    /// base env (i.e., is a primop).  Caller should fall back to primop
-    /// lookup by symbol name in the kInvalid case.
+    /// Resolve a (level, displ) pair to an IR VarId.  Returns kInvalid if
+    /// the variable lives in the base env (i.e., is a primop) — caller
+    /// should fall back to primop lookup by symbol name.
+    ///
+    /// For rec scopes, this emits AttrSelect+Force on the rec attrset
+    /// and returns the forced value's VarId.
     ir::VarId resolveVar(uint32_t level, uint32_t displ)
     {
         if (level >= scopes.size()) return ir::kInvalid;
-        const Scope & s = scopes[scopes.size() - 1 - level];
-        if (displ >= s.byDispl.size()) return ir::kInvalid;
-        return s.byDispl[displ];
+        size_t scopeIdx = scopes.size() - 1 - level;
+        if (displ < scopes[scopeIdx].byDispl.size() &&
+            scopes[scopeIdx].byDispl[displ] != ir::kInvalid)
+            return scopes[scopeIdx].byDispl[displ];
+        // Rec slot.
+        if (scopes[scopeIdx].recAttrsVar != ir::kInvalid &&
+            displ < scopes[scopeIdx].recAttrsNames.size())
+        {
+            ir::VarId rec = scopes[scopeIdx].recAttrsVar;
+            ir::SymbolId nm = scopes[scopeIdx].recAttrsNames[displ];
+            ir::VarId sel = addBinding(ir::AttrSelect{rec, nm});
+            return addBinding(ir::Force{sel});
+        }
+        return ir::kInvalid;
     }
 
     /// True iff `e` is an ExprVar whose level resolves outside any user
@@ -386,67 +411,94 @@ struct Lowerer
         IRNode op{a, b};
         return addBinding(op);
     }
-    /// `let`: pre-allocates a VarId for every binding before lowering any
-    /// of them, so mutual references inside lambda/thunk bodies resolve
-    /// correctly (the bodies don't run until the let scope is fully
-    /// built — by then all siblings are populated as captured upvalues).
+    /// `let`: full mutual-recursion via the env-carrier pattern.
     ///
-    /// Inherit handling: nix's bindVars binds the inherit'd ExprVar in
-    /// the PARENT env (without the new let scope), so we must lower
-    /// inherit bindings' RHS BEFORE pushing the new scope.  Plain
-    /// bindings are bound in the NEW env (so they see siblings) and are
-    /// lowered AFTER the scope is pushed.
+    /// Each binding becomes a Thunk inside a rec attrset.  References
+    /// from sibling thunk bodies and the let body resolve to
+    /// `AttrSelect(__rec, name) + Force` on the rec attrset.  Mutual
+    /// recursion works because the rec attrset is allocated up-front
+    /// and patched after the thunks are built (each thunk captures the
+    /// same Bindings pointer, which is fully populated by the time any
+    /// thunk's body runs).
     ///
-    /// Mutual references on EAGER values (`let x = y+1; y = x+1; in ...`)
-    /// would still produce wrong results because the bindings are
-    /// emitted in iteration order; full lazy let-rec requires thunked
-    /// bindings + an env carrier.  Deferred.
+    /// Inherits are bound in the parent env (per nix's bindVars).  We
+    /// route them through the same rec attrset by lowering each
+    /// inherit's RHS as a thunk body that references its outer var via
+    /// the function's normal upvalue mechanism.
     ir::VarId lowerLet(nix::ExprLet * e)
     {
         if (e->attrs->inheritFromExprs && !e->attrs->inheritFromExprs->empty())
             unsupported("let with inherit (from)");
 
-        // Pre-allocate VarIds (no scope pushed yet — inherit lowering
-        // below depends on the parent env still being on top).
-        Scope newScope;
-        std::vector<ir::VarId> preallocVars;
-        preallocVars.reserve(e->attrs->attrs->size());
+        // Pre-allocate the rec attrset's VarId.
+        ir::VarId recVar = m.freshVar();
+
+        struct Pending {
+            nix::Symbol sym;
+            nix::ExprAttrs::AttrDef::Kind kind;
+            nix::Expr * defE;
+            ir::FuncId funcIdx;
+            ir::BlockId entryBlock;
+        };
+        std::vector<Pending> pending;
+        pending.reserve(e->attrs->attrs->size());
+
+        // Pass 1: allocate FuncId + entryBlock for each binding.
         for (auto & kv : *e->attrs->attrs) {
-            const auto & sym = kv.first;
-            const auto & def = kv.second;
-            if (def.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom)
+            if (kv.second.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom)
                 unsupported("let with inherit (from)");
-            ir::VarId v = m.freshVar();
-            preallocVars.push_back(v);
-            newScope.byDispl.push_back(v);
-            newScope.byName.emplace(std::string(symbols[sym]), v);
+            m.functions.emplace_back();
+            ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+            auto eb = m.freshBlock();
+            m.functions[fid].entryBlock = eb;
+            m.functions[fid].name = std::string(symbols[kv.first]);
+            pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb});
         }
 
-        // Pass 1: lower Inherited bindings (parent env still active).
-        size_t idx = 0;
-        for (auto & kv : *e->attrs->attrs) {
-            if (kv.second.kind == nix::ExprAttrs::AttrDef::Kind::Inherited) {
-                ir::VarId rhs = lowerExpr(kv.second.e);
-                m.blocks[blockStack.back()].bindings.push_back(
-                    {preallocVars[idx], ir::VarRef{rhs}});
-            }
-            ++idx;
+        // Build the rec scope (one entry per binding, all rec slots).
+        Scope recScope;
+        recScope.recAttrsVar = recVar;
+        recScope.recAttrsNames.reserve(pending.size());
+        for (auto & p : pending) {
+            ir::SymbolId nm = internSym(p.sym);
+            recScope.recAttrsNames.push_back(nm);
+            // byDispl[displ] = kInvalid means "use rec mechanism".
+            recScope.byDispl.push_back(ir::kInvalid);
+            recScope.byName.emplace(std::string(symbols[p.sym]), ir::kInvalid);
         }
 
-        // Push the new let scope; Plain bindings see siblings.
-        scopes.push_back(std::move(newScope));
-
-        // Pass 2: lower Plain bindings.
-        idx = 0;
-        for (auto & kv : *e->attrs->attrs) {
-            if (kv.second.kind == nix::ExprAttrs::AttrDef::Kind::Plain) {
-                ir::VarId rhs = lowerExpr(kv.second.e);
-                m.blocks[blockStack.back()].bindings.push_back(
-                    {preallocVars[idx], ir::VarRef{rhs}});
-            }
-            ++idx;
+        // Pass 2: lower each thunk body.
+        for (auto & p : pending) {
+            funcStack.push_back(p.funcIdx);
+            blockStack.push_back(p.entryBlock);
+            // Inherit's def.e was bound in the parent env; Plain's was
+            // bound in the new (rec) env.  Push rec scope only for Plain.
+            if (p.kind == nix::ExprAttrs::AttrDef::Kind::Plain)
+                scopes.push_back(recScope);
+            ir::VarId rv = lowerExpr(p.defE);
+            setReturn(rv);
+            if (p.kind == nix::ExprAttrs::AttrDef::Kind::Plain)
+                scopes.pop_back();
+            blockStack.pop_back();
+            funcStack.pop_back();
         }
 
+        // Build LetRec IR and emit it under the prealloc'd recVar.
+        ir::LetRec letRec;
+        letRec.recVar = recVar;
+        letRec.entries.reserve(pending.size());
+        for (auto & p : pending) {
+            ir::LetRec::Entry en;
+            en.name = internSym(p.sym);
+            en.thunkBody = p.funcIdx;
+            // outerUpvalues populated by computeFreeVars later.
+            letRec.entries.push_back(std::move(en));
+        }
+        m.blocks[blockStack.back()].bindings.push_back(
+            {recVar, std::move(letRec)});
+
+        // Lower body in the rec scope.
+        scopes.push_back(std::move(recScope));
         ir::VarId rv = lowerExpr(e->body);
         scopes.pop_back();
         return addBinding(ir::VarRef{rv});

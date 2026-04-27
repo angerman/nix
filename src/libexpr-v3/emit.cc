@@ -319,6 +319,47 @@ struct Emitter
         unit.code.push_back(encode(OP_ATTRS_UPDATE));
     }
 
+    // -- Recursive let / rec attrset
+    void emitOne(const ir::LetRec & e)
+    {
+        // 1. OP_ATTRS_REC_INIT[n] + n SymbolIds: push placeholder rec
+        //    Bindings on operand stack.
+        unit.code.push_back(encode(OP_ATTRS_REC_INIT, static_cast<uint32_t>(e.entries.size())));
+        for (auto & en : e.entries) unit.code.push_back(en.name);
+
+        // 2. For each entry, build a Thunk capturing whatever upvalues
+        //    its body needs.
+        //
+        //    Each thunk body's freeVars list (sorted by VarId,
+        //    populated by computeFreeVars) IS the upvalue layout: the
+        //    body references upvalues[i] = freeVars[i].  We push them
+        //    in that order so OP_MAKE_THUNK pops in reverse and
+        //    upvalues[i] ends up correct.
+        //
+        //    Special case: when freeVars contains the rec attrset
+        //    VarId (Plain entries that reference siblings via the rec
+        //    scope), we DUP from the operand stack instead of
+        //    emitVarRef (which would look for a slot/upvalue in the
+        //    enclosing function — the rec attrs is on top of the op
+        //    stack, not in any slot).
+        for (uint32_t i = 0; i < e.entries.size(); ++i) {
+            auto & en = e.entries[i];
+            const auto & ff = m.functions[en.thunkBody].freeVars;
+            for (auto fv : ff) {
+                if (fv == e.recVar) {
+                    unit.code.push_back(encode(OP_DUP));
+                } else {
+                    emitVarRef(fv);
+                }
+            }
+            unit.code.push_back(encode(OP_MAKE_THUNK, en.thunkBody));
+            unit.code.push_back(static_cast<uint32_t>(ff.size()));
+            unit.code.push_back(encode(OP_ATTRS_REC_SET, i));
+        }
+        // After all SETs, rec attrs is on top of the operand stack —
+        // becomes the value of the LetRec binding.
+    }
+
     // -- Primop direct call
     void emitOne(const ir::PrimOpCall & e)
     {

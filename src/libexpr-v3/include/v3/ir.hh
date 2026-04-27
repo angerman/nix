@@ -201,6 +201,30 @@ struct PrimOpCall {
     std::vector<VarId> args;
 };
 
+/// Recursive let / rec attrset built via the env-carrier pattern:
+/// allocate a Bindings(n) with placeholder values, allocate one Thunk per
+/// entry capturing the Bindings as its first upvalue, then patch the
+/// Bindings.  References to siblings inside thunk bodies (and in the
+/// surrounding `let ... in body`) traverse `AttrSelect + Force` on the
+/// rec attrset.
+struct LetRec {
+    /// The VarId this binding produces (= the rec attrset value).
+    /// Stored here so emit can reference it without the Binding context
+    /// and so computeFreeVars can subtract it from each thunk body's
+    /// freeVars to get `outerUpvalues`.  Set by the lowerer.
+    VarId recVar = kInvalid;
+
+    struct Entry {
+        SymbolId            name;
+        FuncId              thunkBody;     // body Function, evaluated on Force
+        /// VarIds the thunk body needs from the surrounding scope, NOT
+        /// counting the rec attrset (which is implicitly upvalue 0).
+        /// Populated by computeFreeVars.
+        std::vector<VarId>  outerUpvalues;
+    };
+    std::vector<Entry> entries;
+};
+
 // ---------------------------------------------------------------------------
 // IRExpr sum
 // ---------------------------------------------------------------------------
@@ -217,7 +241,8 @@ using Expr = std::variant<
     And, Or, Impl,
     Update,
     PosExpr,
-    PrimOpCall
+    PrimOpCall,
+    LetRec
 >;
 
 // ---------------------------------------------------------------------------

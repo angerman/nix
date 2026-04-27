@@ -116,6 +116,12 @@ void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
             for (auto v : e.parts) refs.insert(v);
         } else if constexpr (std::is_same_v<T, PrimOpCall>) {
             for (auto v : e.args) refs.insert(v);
+        } else if constexpr (std::is_same_v<T, LetRec>) {
+            // The thunk-body Functions reference each thunk's outer
+            // captures.  These VarIds are needed at MAKE_THUNK time so
+            // they appear in the binding's direct refs.
+            for (auto & en : e.entries)
+                for (auto v : en.outerUpvalues) refs.insert(v);
         } else if constexpr (std::is_same_v<T, Not> ||
                              std::is_same_v<T, Negate>) {
             refs.insert(e.operand);
@@ -222,7 +228,10 @@ void computeFreeVars(Module & m)
         }
 
         // Propagate to Lambda/MkThunk binding freeVars (used as upvalue
-        // capture order at MAKE_CLOSURE / MAKE_THUNK time).
+        // capture order at MAKE_CLOSURE / MAKE_THUNK time).  LetRec
+        // entries get their outerUpvalues set to each thunk body's
+        // freeVars minus the rec-self VarId (which is supplied as the
+        // implicit first upvalue at MAKE_THUNK time).
         for (auto & blk : m.blocks) {
             for (auto & bd : blk.bindings) {
                 std::visit([&](auto & e) {
@@ -233,6 +242,19 @@ void computeFreeVars(Module & m)
                             const auto & ff = m.functions[e.funcIdx].freeVars;
                             if (e.freeVars != ff) {
                                 e.freeVars = ff;
+                                changed = true;
+                            }
+                        }
+                    } else if constexpr (std::is_same_v<T, LetRec>) {
+                        for (auto & en : e.entries) {
+                            if (en.thunkBody >= m.functions.size()) continue;
+                            const auto & ff = m.functions[en.thunkBody].freeVars;
+                            std::vector<VarId> outers;
+                            outers.reserve(ff.size());
+                            for (auto v : ff)
+                                if (v != e.recVar) outers.push_back(v);
+                            if (en.outerUpvalues != outers) {
+                                en.outerUpvalues = std::move(outers);
                                 changed = true;
                             }
                         }
