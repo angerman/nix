@@ -404,9 +404,12 @@ struct Lowerer
     {
         if (!e->args.has_value()) unsupported("ExprCall without args");
         // Direct primop call (1): callee is a base-env var that names a primop.
+        // Handle both exact-arity and extra-args (`(import path) attrSet`
+        // parses as one ExprCall with two args; we emit the primop call
+        // for the first `arity` args, then App-chain the remainder).
         const PrimOp * po = nullptr;
         if ((isPrimOpRef(e->fun, &po) || isBuiltinsPrimOp(e->fun, &po))
-            && e->args->size() == po->arity)
+            && e->args->size() >= po->arity)
         {
             const std::string_view name(po->name);
 
@@ -448,19 +451,24 @@ struct Lowerer
 
             std::vector<ir::VarId> args;
             args.reserve(po->arity);
-            for (auto * a : *e->args) {
+            auto it = e->args->begin();
+            for (uint32_t i = 0; i < po->arity; ++i, ++it) {
                 if (isTryEval) {
-                    args.push_back(thunkify(a));
+                    args.push_back(thunkify(*it));
                 } else {
-                    // Most v3 primops expect WHNF args (they read
-                    // .payload.i/.f/etc directly without forcing).  Force
-                    // here so a primop never sees a thunk.  Higher-order
-                    // primops still receive closures intact since
-                    // forcing a closure is a no-op.
-                    args.push_back(forceVal(lowerExpr(a)));
+                    args.push_back(forceVal(lowerExpr(*it)));
                 }
             }
-            return addBinding(ir::PrimOpCall{po, std::move(args)});
+            ir::VarId result = addBinding(ir::PrimOpCall{po, std::move(args)});
+            // Any extra args become an App-chain on the primop's result
+            // (`(import path) attrs` shape).  We force between Apps so
+            // each step calls a real callable.
+            for (; it != e->args->end(); ++it) {
+                result = forceVal(result);
+                ir::VarId av = lowerExpr(*it);
+                result = addBinding(ir::App{result, av});
+            }
+            return result;
         }
         // Generic application via OP_CALL.  Force the callee (must be
         // a closure / primop / PrimOpApp).  Leave each argument lazy

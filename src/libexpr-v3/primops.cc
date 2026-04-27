@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -1350,6 +1351,22 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     out.payload.bindings = b;
 }
 
+/// Cache of compiled-and-evaluated imported files.  Closures returned
+/// by `import` reference their CompilationUnit's bytecode and constant
+/// pools by raw pointer — those must outlive the closure, so we keep
+/// the CUs (and the eval result) here for the lifetime of the process.
+/// Keyed by absolute path so repeated imports are idempotent.
+struct ImportCache
+{
+    std::deque<CompilationUnit> cus;       // stable addresses (deque doesn't reallocate)
+    std::unordered_map<std::string, Value> results;
+};
+inline ImportCache & importCache()
+{
+    static ImportCache c;
+    return c;
+}
+
 /// builtins.import path -- read the file at `path`, parse, lower, run.
 /// Returns the resulting v3 Value.  Requires state.nixEvalState to be
 /// set (the host EvalState providing parser + symbol table).
@@ -1362,16 +1379,24 @@ void primImport(EvalState & state, Value * args, Value & out)
     else if (args[0].isPath()) path = args[0].payload.path;
     else typeError("import", "string or path");
 
+    auto & cache = importCache();
+    if (auto it = cache.results.find(path); it != cache.results.end()) {
+        out = it->second;
+        return;
+    }
+
     auto & ns = *state.nixEvalState;
     nix::Expr * e = ns.parseExprFromFile(nix::SourcePath(ns.rootFS, nix::CanonPath(path)));
     e->bindVars(ns, ns.staticBaseEnv);
 
     auto module = lowerNixExpr(e, ns.symbols);
     nix::v3::ir::computeFreeVars(module);
-    auto cu = compile(module);
+    cache.cus.push_back(compile(module));
     // Each imported file is its own CompilationUnit; we re-enter the
-    // VM to run it with its own top-level frame.
-    out = run(cu);
+    // VM to run it with its own top-level frame.  Keep the CU alive
+    // (it's borrowed by closures returned from the eval).
+    out = run(cache.cus.back());
+    cache.results.emplace(path, out);
 }
 
 /// builtins.functionArgs lam → { name = false; ... } where the bool

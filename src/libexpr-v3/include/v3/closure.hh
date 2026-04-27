@@ -56,9 +56,16 @@ struct Env
 // Closure
 // ---------------------------------------------------------------------------
 
+struct CompilationUnit;
+
 struct Closure
 {
     const LambdaDescriptor * desc;        // shared blueprint
+    /// CompilationUnit owning desc + the bytecode it points into.
+    /// Required for cross-CU calls (e.g., closures returned by
+    /// `builtins.import` from another file).  When null, the dispatch
+    /// loop uses the caller's CU — fine for intra-CU calls.
+    const CompilationUnit *  cu;
     /// Snapshot of the `with`-stack visible at MAKE_CLOSURE.  null when
     /// no enclosing `with` is in scope at definition time.  When the
     /// closure is invoked, the dispatcher re-pushes these onto the
@@ -93,6 +100,8 @@ struct Thunk
             const ThunkDescriptor * desc;
             /// Same semantics as Closure::capturedWiths.
             ListVec * capturedWiths;
+            /// Same semantics as Closure::cu.
+            const CompilationUnit * cu;
         } suspended;
         // ThunkState::Evaluated — the cached value.
         Value evaluated;

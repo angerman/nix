@@ -96,6 +96,7 @@ struct Alloc
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
         c->capturedWiths = nullptr;
+        c->cu = nullptr;
         return c;
     }
 
@@ -108,6 +109,7 @@ struct Alloc
         t->state = ThunkState::Suspended;
         t->nUpvalues = nUpvalues;
         t->suspended.capturedWiths = nullptr;
+        t->suspended.cu = nullptr;
         return t;
     }
 

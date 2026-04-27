@@ -393,6 +393,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Closure * c = Alloc::allocClosure(nUp);
             allocStats().closuresAllocated++;
             c->desc = &cu->lambdas[funcIdx];
+            c->cu   = cu;
             c->nUpvalues = nUp;
             c->capturedWiths = snapshotCurrentWiths(vm);
             for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
@@ -409,6 +410,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Reuse the LambdaDescriptor pointer through suspended.desc.
             t->suspended.desc = reinterpret_cast<const ThunkDescriptor *>(&cu->lambdas[funcIdx]);
             t->suspended.capturedWiths = snapshotCurrentWiths(vm);
+            t->suspended.cu = cu;
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Thunk);
@@ -491,6 +493,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 throw std::runtime_error("v3 OP_CALL: callee is not a closure");
             const Closure * callee = fun.payload.closure;
             const LambdaDescriptor * desc = callee->desc;
+            // Closures from imported files own their own CompilationUnit;
+            // when callee->cu differs, switch the dispatch loop to the
+            // callee's bytecode/constant pools.  Falls back to the caller's
+            // cu when the closure was made before cu-tracking landed.
+            const CompilationUnit * calleeCu = callee->cu ? callee->cu : cu;
 
             vm.frames.back().ip = ip;
 
@@ -500,7 +507,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
             uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
             vm.frames.push_back(CallFrame{
-                .cu = cu,
+                .cu = calleeCu,
                 .ip = desc->codeOffset,
                 .resultSlot = 0,
                 .flags = 0,
@@ -514,6 +521,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             pushCapturedWiths(vm, callee->capturedWiths);
 
             ip = desc->codeOffset;
+            cu  = calleeCu;
             closure = callee;
             stackBase = newBase;
             break;
@@ -550,15 +558,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     fakeClo->desc = desc;
                     fakeClo->nUpvalues = next->nUpvalues;
                     fakeClo->capturedWiths = next->suspended.capturedWiths;
+                    fakeClo->cu = next->suspended.cu;
                     for (uint16_t i = 0; i < next->nUpvalues; ++i)
                         fakeClo->upvalues[i] = next->tail[i];
                     next->state = ThunkState::Blackhole;
+                    const CompilationUnit * thunkCu = next->suspended.cu ? next->suspended.cu : cu;
 
                     size_t newBase = vm.valueStack.size();
                     vm.valueStack.resize(newBase + desc->nLocals);
                     uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
                     vm.frames.push_back(CallFrame{
-                        .cu = cu,
+                        .cu = thunkCu,
                         .ip = desc->codeOffset,
                         .resultSlot = 0,
                         .flags = CFF_THUNK_RETURN,
@@ -571,6 +581,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     });
                     pushCapturedWiths(vm, next->suspended.capturedWiths);
                     ip = desc->codeOffset;
+                    cu = thunkCu;
                     closure = fakeClo;
                     stackBase = newBase;
                     // Also write the deeper resolution back to the
@@ -619,9 +630,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             fakeClo->desc = desc;
             fakeClo->nUpvalues = t->nUpvalues;
             fakeClo->capturedWiths = t->suspended.capturedWiths;
+            fakeClo->cu = t->suspended.cu;
             for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
 
             ListVec * thunkWiths = t->suspended.capturedWiths;
+            const CompilationUnit * thunkCu = t->suspended.cu ? t->suspended.cu : cu;
             t->state = ThunkState::Blackhole;
 
             vm.frames.back().ip = ip;
@@ -631,7 +644,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
 
             vm.frames.push_back(CallFrame{
-                .cu = cu,
+                .cu = thunkCu,
                 .ip = desc->codeOffset,
                 .resultSlot = 0,
                 .flags = CFF_THUNK_RETURN,
@@ -643,6 +656,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 .withStackBase = newWithBase,
             });
             pushCapturedWiths(vm, thunkWiths);
+            cu = thunkCu;
 
             ip = desc->codeOffset;
             closure = fakeClo;
@@ -1007,8 +1021,12 @@ Value forceValue(VMState & vm, Value v)
         fakeClo->desc = desc;
         fakeClo->nUpvalues = t->nUpvalues;
         fakeClo->capturedWiths = t->suspended.capturedWiths;
+        fakeClo->cu = t->suspended.cu;
         for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
         ListVec * thunkWiths = t->suspended.capturedWiths;
+        const CompilationUnit * thunkCu = t->suspended.cu
+            ? t->suspended.cu
+            : vm.frames.back().cu;
         t->state = ThunkState::Blackhole;
 
         size_t exitDepth = vm.frames.size();
@@ -1017,7 +1035,7 @@ Value forceValue(VMState & vm, Value v)
         uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
 
         vm.frames.push_back(CallFrame{
-            .cu = vm.frames.back().cu,
+            .cu = thunkCu,
             .ip = desc->codeOffset,
             .resultSlot = 0,
             .flags = CFF_THUNK_RETURN,
@@ -1054,7 +1072,9 @@ Value callClosure(VMState & vm, Value fun, Value arg)
 
     const Closure * callee = fun.payload.closure;
     const LambdaDescriptor * desc = callee->desc;
-    const CompilationUnit * cu = vm.frames.back().cu;
+    // Cross-CU calls (e.g., calling a closure returned from
+    // builtins.import): use the closure's own CU when available.
+    const CompilationUnit * cu = callee->cu ? callee->cu : vm.frames.back().cu;
 
     // Push a CALL frame for the callee — mirrors OP_CALL.
     size_t exitDepth = vm.frames.size();
