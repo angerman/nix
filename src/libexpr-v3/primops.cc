@@ -1748,6 +1748,127 @@ void primAddErrorContext(EvalState &, Value * args, Value & out)
 /// `commonAttrs` = drvAttrs // listToAttrs(outputs) // { all; drvAttrs; }.
 void primDerivation(EvalState & state, Value * args, Value & out);
 
+/// Recursively convert a v3 Value to a tree-walker nix::Value, allocated
+/// in the EvalState's GC arena.  Used by primDerivationStrict to bridge
+/// to tree-walker's real derivation hasher.  Functions are converted as
+/// nullptr (caller must handle / not pass them in).  Lazy thunks are
+/// forced first.
+static nix::Value * v3ToTreeWalker(EvalState & state, Value v)
+{
+    auto & ns = *state.nixEvalState;
+    v = forceValue(*state.vm, v);
+    nix::Value * out = ns.allocValue();
+    switch (v.tag()) {
+    case Tag::Int:    out->mkInt(v.payload.i); break;
+    case Tag::Float:  out->mkFloat(v.payload.f); break;
+    case Tag::Bool:   out->mkBool(v.payload.i == 1); break;
+    case Tag::Null:   out->mkNull(); break;
+    case Tag::String: out->mkString(v.payload.str ? v.payload.str : "", ns.mem); break;
+    case Tag::Path: {
+        nix::SourcePath sp(ns.rootFS, nix::CanonPath(v.payload.path ? v.payload.path : ""));
+        out->mkPath(sp, ns.mem);
+        break;
+    }
+    case Tag::List: {
+        auto * lv = v.payload.list;
+        uint32_t n = lv ? lv->size : 0;
+        auto lb = ns.buildList(n);
+        for (uint32_t i = 0; i < n; ++i)
+            *(lb[i] = ns.allocValue()) = *v3ToTreeWalker(state, lv->elems[i]);
+        out->mkList(lb);
+        break;
+    }
+    case Tag::Attrs: {
+        auto * b = v.payload.bindings;
+        auto bb = ns.buildBindings(b ? b->size : 0);
+        auto & symTab = ir::globalSymbolTable();
+        if (b) for (uint32_t i = 0; i < b->size; ++i) {
+            SymbolId sid = b->entries[i].name;
+            std::string n = sid < symTab.size() ? symTab[sid] : "";
+            bb.insert(ns.symbols.create(n), v3ToTreeWalker(state, b->entries[i].value));
+        }
+        out->mkAttrs(bb);
+        break;
+    }
+    case Tag::Uninitialized:
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
+    default:
+        // Functions / external / etc. — can't easily round-trip.  Use null.
+        out->mkNull();
+        break;
+    }
+    return out;
+}
+
+/// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
+/// thunks via tree-walker's evaluator before reading the type.
+static Value treeWalkerToV3(EvalState & state, nix::Value & nv)
+{
+    auto & ns = *state.nixEvalState;
+    ns.forceValue(nv, nix::noPos);
+    Value out;
+    switch (nv.type()) {
+    case nix::nInt:    out.mkInt(nv.integer().value); return out;
+    case nix::nFloat:  out.mkFloat(nv.fpoint()); return out;
+    case nix::nBool:   out = nv.boolean() ? Value::vTrue : Value::vFalse; return out;
+    case nix::nNull:   out.mkNull(); return out;
+    case nix::nThunk:
+    case nix::nFunction:
+    case nix::nExternal:
+    case nix::nFailed:
+        out.mkNull(); return out;
+    case nix::nString: out = mkStringValueOwned(std::string(nv.string_view())); return out;
+    case nix::nPath: {
+        out.tag_payload = static_cast<uint64_t>(Tag::Path);
+        std::string p(nv.pathStrView());
+        char * buf = static_cast<char *>(std::malloc(p.size() + 1));
+        std::memcpy(buf, p.data(), p.size()); buf[p.size()] = '\0';
+        out.payload.path = buf;
+        return out;
+    }
+    case nix::nList: {
+        size_t n = nv.listSize();
+        ListVec * lv = Alloc::allocList(static_cast<uint32_t>(n));
+        allocStats().listsAllocated++;
+        auto view = nv.listView();
+        for (size_t i = 0; i < n; ++i)
+            lv->elems[i] = treeWalkerToV3(state, *view[i]);
+        out.tag_payload = static_cast<uint64_t>(Tag::List);
+        out.payload.list = lv;
+        return out;
+    }
+    case nix::nAttrs: {
+        const auto * a = nv.attrs();
+        std::vector<std::pair<SymbolId, Value>> entries;
+        entries.reserve(a->size());
+        for (auto & it : *a) {
+            SymbolId sid = vmIntern(state, std::string(ns.symbols[it.name]));
+            entries.emplace_back(sid, treeWalkerToV3(state, *it.value));
+        }
+        std::sort(entries.begin(), entries.end(),
+            [](auto & x, auto & y) { return x.first < y.first; });
+        Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+        allocStats().attrsetsAllocated++;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            b->entries[i].name  = entries[i].first;
+            b->entries[i].value = entries[i].second;
+        }
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        return out;
+    }
+    default:
+        out.mkNull();
+        return out;
+    }
+}
+
 /// Construct a "fake" derivation attrset.  Real `derivation` interfaces
 /// with the store; we accept the input attrset and tag it with a
 /// synthetic `outPath` so code that just reads outPath works.  Useful
@@ -1755,6 +1876,29 @@ void primDerivation(EvalState & state, Value * args, Value & out);
 /// actually realizing them.
 void primDerivationStrict(EvalState & state, Value * args, Value & out)
 {
+    // If a tree-walker EvalState is wired, delegate to its real
+    // `builtins.derivationStrict` so we get content-addressed
+    // /nix/store paths.  Falls back to the v3 fake-store path on any
+    // bridge failure (e.g. converting a closure value).
+    if (state.nixEvalState && args[0].isAttrs() && args[0].payload.bindings) {
+        try {
+            auto & ns = *state.nixEvalState;
+            nix::Value * nargs = v3ToTreeWalker(state, args[0]);
+            nix::Value & blt = ns.getBuiltins();
+            ns.forceAttrs(blt, nix::noPos, "v3 scopedImport bridge");
+            auto * dsAttr = blt.attrs()->get(ns.symbols.create("derivationStrict"));
+            if (dsAttr && dsAttr->value) {
+                nix::Value result;
+                ns.callFunction(*dsAttr->value, *nargs, result, nix::noPos);
+                out = treeWalkerToV3(state, result);
+                return;
+            }
+        } catch (const std::exception & e) {
+            if (std::getenv("V3_DRV_DEBUG"))
+                std::fprintf(stderr, "v3 derivationStrict bridge fell back: %s\n", e.what());
+            // fall through to fake-store path
+        }
+    }
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("derivationStrict", "attrset");
     SymbolId sName    = vmIntern(state, "name");
@@ -2318,6 +2462,28 @@ void primPath(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("path", "attrset");
+    // Bridge to tree-walker's `builtins.path` so we get a proper
+    // content-addressed `/nix/store/<32-char-hash>-name` result.
+    // (settings.readOnlyMode means the store path is *computed* from
+    // the file's NAR hash, not actually written.)
+    if (state.nixEvalState) {
+        try {
+            auto & ns = *state.nixEvalState;
+            nix::Value * nargs = v3ToTreeWalker(state, args[0]);
+            nix::Value & blt = ns.getBuiltins();
+            ns.forceAttrs(blt, nix::noPos, "v3 builtins.path bridge");
+            auto * pAttr = blt.attrs()->get(ns.symbols.create("path"));
+            if (pAttr && pAttr->value) {
+                nix::Value result;
+                ns.callFunction(*pAttr->value, *nargs, result, nix::noPos);
+                out = treeWalkerToV3(state, result);
+                return;
+            }
+        } catch (const std::exception & e) {
+            if (std::getenv("V3_DRV_DEBUG"))
+                std::fprintf(stderr, "v3 builtins.path bridge fell back: %s\n", e.what());
+        }
+    }
     SymbolId sPath = vmIntern(state, "path");
     SymbolId sName = vmIntern(state, "name");
     auto * src = args[0].payload.bindings;
@@ -2339,8 +2505,7 @@ void primPath(EvalState & state, Value * args, Value & out)
         name = pos == std::string::npos ? p : p.substr(pos + 1);
         if (name.empty()) name = "source";
     }
-    // Synthesize a path like the real store would.  Tests that just
-    // read the result string don't usually care about the exact form.
+    // Fallback: fake store path.
     std::string outPath = "/v3-fake-store/" + name;
     char * buf = static_cast<char *>(std::malloc(outPath.size() + 1));
     std::strcpy(buf, outPath.c_str());

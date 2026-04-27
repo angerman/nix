@@ -345,6 +345,12 @@ int main(int argc, char ** argv)
         nix::initNix();
         nix::initGC();
 
+        // Read-only mode: makes derivationStrict + builtins.path
+        // compute store paths *locally* (via the Nix derivation hash
+        // protocol) instead of writing to a real store.  We need this
+        // for tests that expect concrete /nix/store/<hash>-name paths
+        // from purely-evaluated derivations.
+        nix::settings.readOnlyMode = true;
         auto store = nix::openStore("dummy://");
         nix::fetchers::Settings fetchSettings{};
         bool readOnlyMode = true;
