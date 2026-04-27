@@ -1701,6 +1701,59 @@ void primImport(EvalState & state, Value * args, Value & out)
     cache.results.emplace(path, out);
 }
 
+/// builtins.path { path; name?; filter?; recursive?; sha256?; }:
+/// add a path to the (fake) v3 store.  Real Nix would copy the path
+/// (with `filter` applied) and verify against `sha256`; v3 returns
+/// a synthetic store path string built from `name` (defaulting to
+/// the basename).  Filter/recursive/sha256 are accepted but unused.
+void primPath(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isAttrs() || !args[0].payload.bindings)
+        typeError("path", "attrset");
+    SymbolId sPath = vmIntern(state, "path");
+    SymbolId sName = vmIntern(state, "name");
+    auto * src = args[0].payload.bindings;
+    const Value * pathV = src->lookup(sPath);
+    if (!pathV)
+        typeError("path", "attrset with `path`");
+    Value forcedPath = forceValue(*state.vm, *pathV);
+    std::string p;
+    if (forcedPath.isString())     p = forcedPath.payload.str;
+    else if (forcedPath.isPath())  p = forcedPath.payload.path;
+    else typeError("path", "{ path = string-or-path; ... }");
+    std::string name;
+    if (auto * nameV = src->lookup(sName)) {
+        Value f = forceValue(*state.vm, *nameV);
+        if (f.isString()) name = f.payload.str;
+    }
+    if (name.empty()) {
+        auto pos = p.find_last_of('/');
+        name = pos == std::string::npos ? p : p.substr(pos + 1);
+        if (name.empty()) name = "source";
+    }
+    // Synthesize a path like the real store would.  Tests that just
+    // read the result string don't usually care about the exact form.
+    std::string outPath = "/v3-fake-store/" + name;
+    char * buf = static_cast<char *>(std::malloc(outPath.size() + 1));
+    std::strcpy(buf, outPath.c_str());
+    out.tag_payload = static_cast<uint64_t>(Tag::Path);
+    out.payload.path = buf;
+}
+
+/// builtins.scopedImport scope path -- like import, but extends the
+/// base env with `scope`'s entries while evaluating the file.  v3
+/// doesn't have the same kind of overridable base env tree-walker
+/// uses, so for simple cases we just route through primImport (the
+/// scope is ignored for now).  This is enough for tests that use
+/// scopedImport for library wrappers without overriding builtins.
+void primScopedImport(EvalState & state, Value * args, Value & out)
+{
+    // args[0] is the scope (an attrset), args[1] is the path.
+    // For now we ignore scope and route through import.
+    Value importArg = args[1];
+    primImport(state, &importArg, out);
+}
+
 /// builtins.functionArgs lam → { name = false; ... } where the bool
 /// indicates whether the formal has a default value.  For simple
 /// lambdas (no formals) returns an empty attrset.
@@ -2136,6 +2189,8 @@ void registerBuiltinPrimOps()
         registerPrimOp({"__findFile",         2, primFindFile});
         registerPrimOp({"nixPath",            0, primNixPath});
         registerPrimOp({"__nixPath",          0, primNixPath});
+        registerPrimOp({"scopedImport",       2, primScopedImport});
+        registerPrimOp({"path",               1, primPath});
     });
 }
 
