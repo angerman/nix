@@ -546,42 +546,52 @@ struct Lowerer
         return addBinding(ir::VarRef{rv});
     }
 
-    /// `expr.attr` — a chain of static attribute selects, each with an
-    /// implicit Force (matching nix's auto-forcing semantics).  Without
-    /// the Force, `rec { x = 1; }.x` would return a thunk Value.
-    ///
-    /// `expr.attr or default` is supported (single-element); the
-    /// default is used when the attribute is absent.  Multi-element
-    /// with default needs to short-circuit on any missing attr — TBD.
+    /// `expr.attr.path or default` — chain of static attribute selects,
+    /// each followed by an implicit Force (auto-forcing nix semantics).
+    /// With a default, ANY missing attr in the chain short-circuits to
+    /// the default.  We build nested if-then-else: at each level, if
+    /// the current attr exists, recurse into the rest of the path; else
+    /// return the default.
     ir::VarId lowerSelect(nix::ExprSelect * e)
     {
         ir::VarId v = lowerExpr(e->e);
         auto path = e->getAttrPath();
+        return emitSelectChain(v, path, e->def, 0);
+    }
 
-        if (e->def && path.size() == 1 && !path[0].expr) {
-            ir::SymbolId nm = internSym(path[0].symbol);
-            ir::VarId hasIt = addBinding(ir::HasAttr{v, nm});
+    ir::VarId emitSelectChain(ir::VarId attrs,
+                              std::span<const nix::AttrName> path,
+                              nix::Expr * defaultExpr,
+                              size_t pathIdx)
+    {
+        if (pathIdx == path.size()) return attrs;
+        if (path[pathIdx].expr)
+            unsupported("dynamic attribute name in select");
+        ir::SymbolId nm = internSym(path[pathIdx].symbol);
+
+        if (defaultExpr) {
+            ir::VarId hasIt = addBinding(ir::HasAttr{attrs, nm});
             auto thenB = m.freshBlock();
             auto elseB = m.freshBlock();
+
             blockStack.push_back(thenB);
-            ir::VarId got = addBinding(ir::AttrSelect{v, nm});
+            ir::VarId got = addBinding(ir::AttrSelect{attrs, nm});
             ir::VarId forced = addBinding(ir::Force{got});
-            setReturn(forced);
+            ir::VarId rest = emitSelectChain(forced, path, defaultExpr, pathIdx + 1);
+            setReturn(rest);
             blockStack.pop_back();
+
             blockStack.push_back(elseB);
-            ir::VarId defv = lowerExpr(e->def);
+            ir::VarId defv = lowerExpr(defaultExpr);
             setReturn(defv);
             blockStack.pop_back();
+
             return addBinding(ir::If{hasIt, thenB, elseB});
         }
-        if (e->def) unsupported("multi-element select with default");
 
-        for (auto & an : path) {
-            if (an.expr) unsupported("dynamic attribute name in select");
-            v = addBinding(ir::AttrSelect{v, internSym(an.symbol)});
-            v = addBinding(ir::Force{v});
-        }
-        return v;
+        ir::VarId v = addBinding(ir::AttrSelect{attrs, nm});
+        v = addBinding(ir::Force{v});
+        return emitSelectChain(v, path, nullptr, pathIdx + 1);
     }
 
     ir::VarId lowerHasAttr(nix::ExprOpHasAttr * e)
