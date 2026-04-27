@@ -247,3 +247,61 @@ shipping the cutover:
 Best estimate: **3–5 weeks of focused work** on CO-3 alone, given that
 shaking out wrapped-Expr edge cases tends to surface a long tail of
 subtle issues (autoargs, recursive scope, closure-of-thunk shapes).
+
+## 2026-04-28 update — cutover is now actually firing
+
+Three small but coordinated fixes brought the cutover from "silently
+no-op" to "running and producing correct results on simple shapes":
+
+1. **Linker keep-alive.**  `installEvalHook()` is now called from
+   `nix::mainWrapped` (`src/nix/main.cc`) — provides the explicit
+   symbol reference that prevents `-dead_strip_dylibs` from removing
+   libnixexprv3.
+
+2. **Safe try/catch fallback.**  The hook now wraps lower / compile /
+   run / bridge in try/catch with `e->eval(state, state.baseEnv, v)`
+   fallback to tree-walker.  v3 can't make things worse than
+   tree-walker — failures degrade gracefully.
+
+3. **Bridge VMState fix.**  `v3ToTreeWalkerShim` was creating an
+   `EvalState` with `vm == nullptr`; the bridge then dereferenced
+   it on the very first `forceValue` call.  Now the shim provides a
+   thread-local `bridgeShimVm` (same pattern as
+   `primV3CallBridge2`).  This was the SIGSEGV.
+
+4. **1-arg closure bridge.**  Added `__v3_call_bridge_1` (arity 2:
+   handle + 1 user arg).  Every Nix lambda is unary at the AST level,
+   so partial-applying the bridge to the handle and calling once with
+   the user arg matches `autoCallFunction` / `ExprCall::eval`'s call
+   shape.  The legacy 2-arg bridge stays for the
+   `builtins.path { filter = path: type: ...; }` case.
+
+What works now:
+- `NIX_USE_V3=1 nix-instantiate --eval --strict --expr '<simple>'`
+  produces the same answer as tree-walker for ints, strings, lists,
+  attrsets, simple let / lambda / function calls.
+- `NIX_USE_V3=1 nix eval --json --expr 'fib 30'` runs through v3 in
+  ~0.36s user (vs tree-walker's 0.37s) — *slightly faster* through
+  the cutover than tree-walker direct.
+- `NIX_USE_V3=1 nix-instantiate ... '(import <nixpkgs> {}).hello.name'`
+  returns `"hello-2.12.3"` correctly.
+
+What's broken (the new perf regression):
+- Wall-clock for nixpkgs `hello.name` via cutover: 0.63s user vs
+  tree-walker's 0.23s.  The cause: v3's `lowerNixExpr` produces
+  ~273 instructions across 13 lambdas for the wrapped expression,
+  v3 returns Tag::Closure, falls back to tree-walker — both passes
+  pay full cost.
+- 142/142 lang via v3-eval, 142/142 lang via cutover, 76/77 smoke,
+  103/109 eval-fail; all green; **fib30 cutover slightly faster than
+  tree-walker**.
+
+Remaining CO-3 work for full Phase 1 (much smaller now):
+- Investigate why a simple `ExprSelect` produces 273 inst / 13 lambdas
+  during lowerNixExpr — likely the lower is bringing in the StaticEnv
+  builtins on every entry.  Likely fix: lower the user expression
+  without the entire builtin context, or cache the builtin lower
+  module separately.
+- Add a heuristic to skip v3 when the lowered Module's entry function
+  is going to return Tag::Closure (avoids the wasted-work fallback
+  path).
