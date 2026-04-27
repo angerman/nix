@@ -1056,12 +1056,15 @@ void primUnsafeGetAttrPos(EvalState & state, Value * args, Value & out)
     out.payload.bindings = b;
 }
 
-/// builtins.toPath path-or-string -> path; bring-up uses identity.
-/// Also accepts attrsets with `__toString` or `outPath` (the standard
-/// Nix coercion path).
+/// builtins.toPath path-or-string -> path.
+/// String inputs must be absolute paths (start with '/').  Tree-walker
+/// rejects relative strings; v3 matches.  Also accepts attrsets with
+/// `__toString` or `outPath` (the standard Nix coercion path).
 void primToPath(EvalState & state, Value * args, Value & out)
 {
     auto fromString = [&](const char * s) {
+        if (!s || s[0] != '/')
+            throw std::runtime_error("v3 toPath: string is not an absolute path");
         char * buf = static_cast<char *>(std::malloc(std::strlen(s) + 1));
         std::strcpy(buf, s);
         out.tag_payload = static_cast<uint64_t>(Tag::Path);
@@ -2742,7 +2745,16 @@ void primFlakeRefToString(EvalState & state, Value * args, Value & out)
         if (!v) return {};
         Value f = forceValue(*state.vm, *v);
         if (f.isString()) return std::string(f.payload.str);
-        return {};
+        // Match tree-walker: negative-int attrs raise; non-string,
+        // non-int attrs would too (we just reject all non-strings).
+        if (f.isInt()) {
+            if (f.payload.i < 0)
+                throw std::runtime_error("v3 flakeRefToString: negative value given for flake ref attr " +
+                                          std::string(name) + ": " + std::to_string(f.payload.i));
+            return std::to_string(f.payload.i);
+        }
+        throw std::runtime_error("v3 flakeRefToString: flake ref attr '" +
+                                  std::string(name) + "' is not a string");
     };
     std::string typ = getStr("type");
     std::string out_s;
