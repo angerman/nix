@@ -1702,6 +1702,107 @@ void primImport(EvalState & state, Value * args, Value & out)
     cache.results.emplace(path, out);
 }
 
+/// XML escape: `<>&"` and unprintable chars become entities.
+static std::string xmlEscape(std::string_view s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '&': out += "&amp;"; break;
+        case '"': out += "&quot;"; break;
+        default:  out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
+/// Recursive XML serializer mirroring tree-walker's printValueAsXML
+/// (no source-location tracking — v3 doesn't carry that yet anyway).
+static void valueToXml(EvalState & state, std::string & out, Value v, int indent)
+{
+    auto pad = [&](int n) { for (int i = 0; i < n; ++i) out += "  "; };
+    v = forceValue(*state.vm, v);
+    pad(indent);
+    switch (v.tag()) {
+    case Tag::String:
+        out += "<string value=\""; out += xmlEscape(v.payload.str); out += "\" />\n";
+        return;
+    case Tag::Int:
+        out += "<int value=\""; out += std::to_string(v.payload.i); out += "\" />\n";
+        return;
+    case Tag::Float:
+        out += "<float value=\""; out += std::to_string(v.payload.f); out += "\" />\n";
+        return;
+    case Tag::Bool:
+        out += "<bool value=\""; out += v.payload.i == 1 ? "true" : "false"; out += "\" />\n";
+        return;
+    case Tag::Null:
+        out += "<null />\n";
+        return;
+    case Tag::Path:
+        out += "<path value=\""; out += xmlEscape(v.payload.path); out += "\" />\n";
+        return;
+    case Tag::List:
+        out += "<list>\n";
+        if (v.payload.list)
+            for (uint32_t i = 0; i < v.payload.list->size; ++i)
+                valueToXml(state, out, v.payload.list->elems[i], indent + 1);
+        pad(indent);
+        out += "</list>\n";
+        return;
+    case Tag::Attrs: {
+        out += "<attrs>\n";
+        if (v.payload.bindings) {
+            // Sort by name for stable output.
+            auto & symTab = ir::globalSymbolTable();
+            std::vector<std::pair<std::string_view, Value>> entries;
+            entries.reserve(v.payload.bindings->size);
+            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
+                SymbolId sid = v.payload.bindings->entries[i].name;
+                std::string_view nm = sid < symTab.size() ? std::string_view(symTab[sid]) : std::string_view("");
+                entries.emplace_back(nm, v.payload.bindings->entries[i].value);
+            }
+            std::sort(entries.begin(), entries.end(),
+                [](auto & a, auto & b) { return a.first < b.first; });
+            for (auto & [nm, val] : entries) {
+                pad(indent + 1);
+                out += "<attr name=\""; out += xmlEscape(nm); out += "\">\n";
+                valueToXml(state, out, val, indent + 2);
+                pad(indent + 1);
+                out += "</attr>\n";
+            }
+        }
+        pad(indent);
+        out += "</attrs>\n";
+        return;
+    }
+    case Tag::Closure:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+        out += "<function />\n";
+        return;
+    case Tag::Uninitialized:
+    case Tag::Thunk:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
+    default:
+        out += "<unevaluated />\n";
+        return;
+    }
+}
+
+void primToXML(EvalState & state, Value * args, Value & out)
+{
+    std::string s = "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n";
+    valueToXml(state, s, args[0], 1);
+    s += "</expr>\n";
+    out = mkStringValueOwned(s);
+}
+
 /// builtins.parseFlakeRef "github:NixOS/nixpkgs/23.05?dir=lib"
 /// → { type = "github"; owner = "NixOS"; repo = "nixpkgs"; ref = "23.05"; dir = "lib"; }
 /// Minimal hand-rolled parser covering the github / git / path /
@@ -2383,6 +2484,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"fromTOML",           1, primFromTOML});
         registerPrimOp({"parseFlakeRef",      1, primParseFlakeRef});
         registerPrimOp({"flakeRefToString",   1, primFlakeRefToString});
+        registerPrimOp({"toXML",              1, primToXML});
     });
 }
 
