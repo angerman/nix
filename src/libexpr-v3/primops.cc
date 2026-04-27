@@ -29,6 +29,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/value/context.hh"
 #include "nix/util/canon-path.hh"
+#include "nix/util/experimental-features.hh"
 #include "nix/util/hash.hh"
 
 #include <nlohmann/json.hpp>
@@ -2894,6 +2895,12 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
     case toml::value_t::offset_datetime:
     case toml::value_t::local_date:
     case toml::value_t::local_time: {
+        // Match tree-walker: bare TOML datetime values are only
+        // accepted when the `parse-toml-timestamps` experimental
+        // feature is enabled.  Without it, raise — this matches the
+        // upstream eval-fail-fromTOML-timestamps test.
+        if (!nix::experimentalFeatureSettings.isEnabled(nix::Xp::ParseTomlTimestamps))
+            throw std::runtime_error("v3 fromTOML: Dates and times are not supported");
         // Normalize the format before serializing so we get the same
         // canonical RFC3339 spelling tree-walker emits: upper-case `T`
         // delimiter, mandatory seconds, subsecond precision rounded up

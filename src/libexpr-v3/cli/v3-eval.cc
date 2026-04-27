@@ -300,6 +300,10 @@ int main(int argc, char ** argv)
     std::vector<std::pair<std::string, std::string>> autoArgsStr;
     // -A path.path.path: select an attrset member from the result.
     std::string attrPath;
+    // Experimental-feature flags collected from CLI; applied AFTER
+    // initNix() so the Config-system setter has a chance to take.
+    std::vector<std::string> extraExperimentalFeatures;
+    std::string              experimentalFeaturesOverride;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view a(argv[i]);
@@ -332,6 +336,13 @@ int main(int argc, char ** argv)
                  a == "--no-show-trace") {
             // ignore
         }
+        else if (a == "--extra-experimental-features" && i + 1 < argc) {
+            // Apply *after* initNix() — see below.
+            extraExperimentalFeatures.emplace_back(argv[++i]);
+        }
+        else if (a == "--experimental-features" && i + 1 < argc) {
+            experimentalFeaturesOverride = argv[++i];
+        }
         else if (!a.empty() && a[0] == '-') {
             // Unknown flag — quietly ignore so test runners can pass
             // nix-instantiate flags without v3-eval refusing them.
@@ -344,6 +355,16 @@ int main(int argc, char ** argv)
     try {
         nix::initNix();
         nix::initGC();
+
+        // Apply experimental-feature flags collected from the CLI.
+        // Has to happen *after* initNix so the Config setter takes
+        // effect against the loaded nix.conf state.
+        if (!experimentalFeaturesOverride.empty())
+            nix::experimentalFeatureSettings.set(
+                "experimental-features", experimentalFeaturesOverride);
+        for (auto & v : extraExperimentalFeatures)
+            nix::experimentalFeatureSettings.set(
+                "extra-experimental-features", v);
 
         // Read-only mode: makes derivationStrict + builtins.path
         // compute store paths *locally* (via the Nix derivation hash
