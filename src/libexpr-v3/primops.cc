@@ -28,6 +28,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/util/canon-path.hh"
+#include "nix/util/hash.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -1044,28 +1045,60 @@ void primSplit(EvalState &, Value * args, Value & out)
     }
 }
 
-/// builtins.hashString algo s -> string of hex digits.
-/// Implements the FNV-1a 64-bit hash for unknown algorithms (placeholder)
-/// and proper SHA-256/SHA-1/MD5 deferred — those need libcrypto plumbing.
+/// Map nix algo string -> HashAlgorithm enum.
+inline nix::HashAlgorithm parseHashAlgo(std::string_view a)
+{
+    if (a == "md5")    return nix::HashAlgorithm::MD5;
+    if (a == "sha1")   return nix::HashAlgorithm::SHA1;
+    if (a == "sha256") return nix::HashAlgorithm::SHA256;
+    if (a == "sha512") return nix::HashAlgorithm::SHA512;
+    if (a == "blake3") return nix::HashAlgorithm::BLAKE3;
+    throw std::runtime_error("v3: unknown hash algorithm '" + std::string(a) + "'");
+}
+
+/// builtins.hashString algo s -> hex string of the digest.  Backed by
+/// nix::hashString (libutil) which uses libcrypto.
 void primHashString(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isString() || !args[1].isString())
         typeError("hashString", "(algo, string)");
-    std::string_view algo(args[0].payload.str);
-    std::string_view s(args[1].payload.str);
-    if (algo != "md5" && algo != "sha1" && algo != "sha256" && algo != "sha512")
-        throw std::runtime_error(std::string("v3 hashString: unknown algorithm '") + std::string(algo) + "'");
-    // Stub: FNV-1a 64-bit, formatted as 16 hex chars.  Real crypto
-    // hashes need libcrypto / openssl.
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (char c : s) {
-        h ^= static_cast<uint8_t>(c);
-        h *= 0x100000001b3ull;
-    }
-    char buf[32];
-    int n = std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
-    (void)n;
-    out = mkStringValueOwned(std::string(buf));
+    auto algo = parseHashAlgo(args[0].payload.str);
+    auto h = nix::hashString(algo, args[1].payload.str);
+    out = mkStringValueOwned(h.to_string(nix::HashFormat::Base16, false));
+}
+
+void primHashFile(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString() || !args[1].isString())
+        typeError("hashFile", "(algo, path)");
+    auto algo = parseHashAlgo(args[0].payload.str);
+    auto h = nix::hashFile(algo, args[1].payload.str);
+    out = mkStringValueOwned(h.to_string(nix::HashFormat::Base16, false));
+}
+
+void primConvertHash(EvalState & state, Value * args, Value & out)
+{
+    // builtins.convertHash { hash; hashAlgo; toHashFormat; } -> string
+    if (!args[0].isAttrs() || !args[0].payload.bindings)
+        typeError("convertHash", "attrset");
+    SymbolId sHash = vmIntern(state, "hash");
+    SymbolId sAlgo = vmIntern(state, "hashAlgo");
+    SymbolId sFmt  = vmIntern(state, "toHashFormat");
+    const Value * vh = args[0].payload.bindings->lookup(sHash);
+    const Value * va = args[0].payload.bindings->lookup(sAlgo);
+    const Value * vf = args[0].payload.bindings->lookup(sFmt);
+    if (!vh || !va || !vf || !vh->isString() || !va->isString() || !vf->isString())
+        typeError("convertHash", "{ hash; hashAlgo; toHashFormat; }");
+    auto algo = parseHashAlgo(va->payload.str);
+    nix::HashFormat fmt;
+    std::string_view fs(vf->payload.str);
+    if (fs == "base16")    fmt = nix::HashFormat::Base16;
+    else if (fs == "nix32") fmt = nix::HashFormat::Nix32;
+    else if (fs == "base64") fmt = nix::HashFormat::Base64;
+    else if (fs == "sri")    fmt = nix::HashFormat::SRI;
+    else throw std::runtime_error("v3 convertHash: unknown format '" + std::string(fs) + "'");
+    auto parsed = nix::Hash::parseAny(vh->payload.str, algo);
+    out = mkStringValueOwned(parsed.to_string(fmt, false));
 }
 
 /// builtins.currentSystem and similar: just return host triple.
@@ -1596,6 +1629,8 @@ void registerBuiltinPrimOps()
         registerPrimOp({"currentTime",        0, primCurrentTime});
         registerPrimOp({"nixVersion",         0, primNixVersion});
         registerPrimOp({"genericClosure",     1, primGenericClosure});
+        registerPrimOp({"hashFile",           2, primHashFile});
+        registerPrimOp({"convertHash",        1, primConvertHash});
     });
 }
 
