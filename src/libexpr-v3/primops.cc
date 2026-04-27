@@ -1033,12 +1033,21 @@ void primTraceVerbose(EvalState & state, Value * args, Value & out)
 
 void primBaseNameOf(EvalState &, Value * args, Value & out)
 {
-    std::string s;
+    // Mirrors tree-walker's legacyBaseNameOf: at most ONE trailing
+    // slash is stripped, so `baseNameOf "a/"` is "a" but
+    // `baseNameOf "a//"` is "" (a 10-year-old quirk that
+    // `eval-okay-baseNameOf.nix` pins down).
+    std::string_view s;
     if (args[0].isString()) s = args[0].payload.str;
     else if (args[0].isPath()) s = args[0].payload.path;
     else typeError("baseNameOf", "string or path");
-    auto pos = s.find_last_of('/');
-    out = mkStringValueOwned(pos == std::string::npos ? s : s.substr(pos + 1));
+    if (s.empty()) { out = mkStringValueOwned(""); return; }
+    size_t last = s.size() - 1;
+    if (s[last] == '/' && last > 0) last -= 1;
+    size_t pos = s.rfind('/', last);
+    if (pos == std::string_view::npos) pos = 0;
+    else pos += 1;
+    out = mkStringValueOwned(std::string(s.substr(pos, last - pos + 1)));
 }
 
 void primDirOf(EvalState &, Value * args, Value & out)
@@ -1659,9 +1668,12 @@ Value jsonToValue(EvalState & state, const nlohmann::json & j)
 }
 
 /// v3 Value -> nlohmann::json.
-nlohmann::json valueToJson(EvalState & state, const Value & v)
+nlohmann::json valueToJson(EvalState & state, const Value & vRaw)
 {
     using json = nlohmann::json;
+    // Force first — App / Thunk reach this primop unchanged when
+    // wrapped in attrsets/lists.
+    Value v = forceValue(*state.vm, vRaw);
     switch (v.tag()) {
     case Tag::Null:   return json(nullptr);
     case Tag::Bool:   return json(v.payload.i == 1);
@@ -1677,6 +1689,25 @@ nlohmann::json valueToJson(EvalState & state, const Value & v)
         return arr;
     }
     case Tag::Attrs: {
+        // `__toString self` overrides JSON serialization — call it
+        // and use the resulting string.  Standard Nix coercion.
+        if (v.payload.bindings) {
+            static const SymbolId tsId = ir::globalInternSymbol("__toString");
+            if (auto * fn = v.payload.bindings->lookup(tsId)) {
+                Value forced = forceValue(*state.vm, *fn);
+                Value s = callClosure(*state.vm, forced, v);
+                s = forceValue(*state.vm, s);
+                if (s.isString()) return json(std::string(s.payload.str));
+            }
+            // `outPath` (a derivation-like value) — serialize as the
+            // path string.
+            static const SymbolId outId = ir::globalInternSymbol("outPath");
+            if (auto * op = v.payload.bindings->lookup(outId)) {
+                Value forced = forceValue(*state.vm, *op);
+                if (forced.isString()) return json(std::string(forced.payload.str));
+                if (forced.isPath())   return json(std::string(forced.payload.path));
+            }
+        }
         json obj = json::object();
         if (v.payload.bindings) {
             for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
@@ -1687,14 +1718,11 @@ nlohmann::json valueToJson(EvalState & state, const Value & v)
         }
         return obj;
     }
-    case Tag::Thunk: {
-        Value forced = forceValue(*state.vm, v);
-        return valueToJson(state, forced);
-    }
     case Tag::Uninitialized:
     case Tag::Closure:
     case Tag::PrimOp:
     case Tag::PrimOpApp:
+    case Tag::Thunk:
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
