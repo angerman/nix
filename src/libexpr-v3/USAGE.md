@@ -159,9 +159,12 @@ the call site.  `unsafeGetAttrPos` and `functionArgs`-derived
 positions both work via the per-attr position side-table populated
 by OP_ATTRS_INIT[_DYN] / OP_ATTRS_REC_INIT.
 
-Performance: v3 is within ~3% of the tree-walker on compute-bound
-benchmarks (fib30: tree-walker ~0.37s user, v3 ~0.38s user;
-fib32: tree-walker ~0.93s user, v3 ~0.96s user).
+Performance: v3 is now at parity with the tree-walker on compute-bound
+benchmarks.
+
+  fib30:  tree-walker 0.37s user, v3 0.37s user  (matched)
+  fib32:  tree-walker 0.93s user, v3 0.94s user  (~1% gap)
+  fib34:  tree-walker 2.41s user, v3 2.42s user  (~0.5% gap)
 
 Recent perf wins (in-VM hot path):
   - OP_FORCE peek-fast-path: skip pop+push when top is already WHNF.
@@ -170,6 +173,8 @@ Recent perf wins (in-VM hot path):
     the var-load+force pair (the most common bytecode pair).
   - OP_STR_CONCAT 2-int fast-path: every `a + b` over ints sums
     in-place on the operand stack without allocating.
+  - OP_EQ / OP_NEQ / OP_LESS int-int fast paths: every numeric
+    predicate inlines the comparison without a helper call.
 
 Still queued for the larger wins: NaN-boxing, computed-goto dispatch,
 Bindings polymorphism, OP_ATTRS_SELECT inline cache (already done for
