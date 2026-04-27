@@ -473,8 +473,10 @@ struct Lowerer
     /// the rec attrset value.
     ir::VarId lowerAttrs(nix::ExprAttrs * e)
     {
-        if (e->dynamicAttrs && !e->dynamicAttrs->empty())
-            unsupported("attrset with dynamic attrs");
+        bool hasDyn = e->dynamicAttrs && !e->dynamicAttrs->empty();
+
+        if (e->recursive && hasDyn)
+            unsupported("recursive attrset with dynamic attrs");
 
         if (e->recursive) {
             return lowerLetRec(
@@ -494,6 +496,24 @@ struct Lowerer
             inheritFromStack.push_back(e->inheritFromExprs.get());
             pushedInheritFrom = true;
         }
+
+        if (hasDyn) {
+            ir::AttrSetDyn dyn;
+            dyn.statics.reserve(e->attrs->size());
+            for (auto & kv : *e->attrs) {
+                ir::VarId vv = lowerExpr(kv.second.e);
+                dyn.statics.push_back({internSym(kv.first), vv});
+            }
+            dyn.dynamics.reserve(e->dynamicAttrs->size());
+            for (auto & da : *e->dynamicAttrs) {
+                ir::VarId nameV = lowerExpr(da.nameExpr);
+                ir::VarId valV  = lowerExpr(da.valueExpr);
+                dyn.dynamics.push_back({nameV, valV});
+            }
+            if (pushedInheritFrom) inheritFromStack.pop_back();
+            return addBinding(std::move(dyn));
+        }
+
         std::vector<ir::AttrSet::Entry> entries;
         for (auto & kv : *e->attrs) {
             const auto & sym = kv.first;
