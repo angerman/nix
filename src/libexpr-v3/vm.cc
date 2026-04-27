@@ -779,12 +779,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             for (uint32_t i = 0; i < nDyn; ++i) {
                 Value & nameV = dynPairs[i * 2];
                 Value & valV  = dynPairs[i * 2 + 1];
+                // null-named dynamic attrs are silently dropped — Nix
+                // semantics so things like `{ ${if cond then "k" else null}
+                // = v; }` work as a conditional add.
+                if (nameV.isNull()) continue;
                 if (!nameV.isString())
                     throw std::runtime_error("v3 OP_ATTRS_INIT_DYN: dynamic name must be a string");
-                // For now: do an O(n) intern by checking the symbolTable.
-                // The CompilationUnit owns the symbolTable; we look up or
-                // append.  This is correct but slow; an interner side-table
-                // can speed it up.
                 // Use the global symbol table — IDs from any CU stay
                 // consistent so attrset lookups across CUs work.
                 SymbolId id = ir::globalInternSymbol(nameV.payload.str);

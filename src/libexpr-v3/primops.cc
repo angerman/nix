@@ -1015,12 +1015,29 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
 }
 
 /// builtins.trace msg val: print msg to stderr, return val unchanged.
-void primTrace(EvalState &, Value * args, Value & out)
+// Forward decl — defined later in this TU.
+nlohmann::json valueToJson(EvalState & state, const Value & v);
+
+void primTrace(EvalState & state, Value * args, Value & out)
 {
-    if (args[0].isString())
-        std::fprintf(stderr, "trace: %s\n", args[0].payload.str);
-    else
-        std::fprintf(stderr, "trace: <non-string>\n");
+    // tree-walker stringifies via printValueAsJSON-ish; we approximate:
+    // strings print as-is, ints/bools/null/path render via toStr,
+    // and complex values render as a short JSON dump.
+    Value v = args[0];
+    if (v.isString())   std::fprintf(stderr, "trace: %s\n", v.payload.str);
+    else if (v.isInt()) std::fprintf(stderr, "trace: %lld\n", (long long)v.payload.i);
+    else if (v.isFloat()) std::fprintf(stderr, "trace: %g\n", v.payload.f);
+    else if (v.isBool()) std::fprintf(stderr, "trace: %s\n", v.payload.i == 1 ? "true" : "false");
+    else if (v.isNull()) std::fprintf(stderr, "trace: null\n");
+    else if (v.isPath()) std::fprintf(stderr, "trace: %s\n", v.payload.path);
+    else {
+        try {
+            auto j = valueToJson(state, v);
+            std::fprintf(stderr, "trace: %s\n", j.dump().c_str());
+        } catch (...) {
+            std::fprintf(stderr, "trace: <complex value>\n");
+        }
+    }
     out = args[1];
 }
 
@@ -2002,6 +2019,12 @@ void registerBuiltinPrimOps()
         registerPrimOp({"readFileType",       1, primReadFileType});
         registerPrimOp({"addErrorContext",    2, primAddErrorContext});
         registerPrimOp({"derivationStrict",   1, primDerivationStrict});
+        // `derivation` is normally a Nix-side wrapper loaded from
+        // corepkgs/derivation.nix.  v3 doesn't load that; alias to
+        // derivationStrict so simple tests that just call
+        // `derivation { name = ...; ... }` get a synthetic result
+        // attrset rather than 'unbound variable derivation'.
+        registerPrimOp({"derivation",         1, primDerivationStrict});
     });
 }
 
