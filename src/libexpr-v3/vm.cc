@@ -1147,7 +1147,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             const Value * ovRaw = top.payload.bindings->lookup(ovId);
             if (!ovRaw) break;
             Value ov = forceValue(vm, *ovRaw);
-            if (!ov.isAttrs() || !ov.payload.bindings) break;
+            // Tree-walker raises if __overrides is present but not an
+            // attrset; v3 silently ignored.
+            if (!ov.isAttrs())
+                throw std::runtime_error("v3 OP_APPLY_OVERRIDES: __overrides must be an attrset");
+            if (!ov.payload.bindings) break;
             auto * dst = top.payload.bindings;
             const auto * src = ov.payload.bindings;
             // First pass: overwrite existing entries; collect names to add.

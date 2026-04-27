@@ -2335,6 +2335,26 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
         typeError("derivationStrict", "attrset with `name` string");
     std::string name(nameV.payload.str);
 
+    // Tree-walker rejects derivation names containing characters
+    // that aren't allowed in a Nix store path: only [A-Za-z0-9+\-._?=]
+    // are permitted, and the name must not start with `.`.
+    auto isValidNameChar = [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+               (c >= '0' && c <= '9') ||
+               c == '+' || c == '-' || c == '.' || c == '_' ||
+               c == '?' || c == '=';
+    };
+    if (name.empty())
+        throw std::runtime_error("v3 derivationStrict: derivation name is empty");
+    if (name[0] == '.')
+        throw std::runtime_error("v3 derivationStrict: derivation name '" + name +
+                                  "' must not start with '.'");
+    for (char c : name) {
+        if (!isValidNameChar(c))
+            throw std::runtime_error("v3 derivationStrict: invalid character '" +
+                                      std::string(1, c) + "' in derivation name '" + name + "'");
+    }
+
     // Read outputs (default ["out"]).  derivationStrict's result is
     // an attrset { drvPath; <output1>; <output2>; ... } with one
     // path per declared output.
