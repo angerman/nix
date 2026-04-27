@@ -344,40 +344,74 @@ struct Lowerer
             funcStack.push_back(fid);
             blockStack.push_back(entry);
 
-            // The caller may pass a thunk; HasAttr/AttrSelect both
-            // require WHNF.  Force once at the top of the body and use
-            // the forced VarId for all formals lookups.
-            ir::VarId paramForced = forceVal(param);
+            // Route formal-extraction through a synthetic LetRec so each
+            // formal becomes a thunk that captures the formals scope.
+            // This makes default expressions lazy — references to other
+            // formals from a default body resolve via the rec attrset
+            // (AttrSelect + Force on the sibling thunk), so mutually
+            // recursive defaults like `{ a ? b, b ? a }` work the same
+            // way they do in tree-walker: only the formals actually
+            // demanded by the body get forced; provided values short the
+            // default branch entirely.
 
-            // Pre-pass: reserve a VarId for each formal so that
-            // mutually-recursive defaults like `{ x ? y, y ? x }`
-            // see all siblings when their default expressions are
-            // lowered.  Order matches Nix's bindVars: e->arg (if any)
-            // first, then formals sorted by name (matches the iteration
-            // order over `formals->formals`).
-            if (e->arg) {
-                inner.byDispl.push_back(param);
-                inner.byName.emplace(std::string(symbols[e->arg]), param);
-            }
-            std::vector<ir::VarId> formalVars;
-            formalVars.reserve(formals->formals.size());
+            // Reserve sym + var for each formal.
+            const size_t nF = formals->formals.size();
+            std::vector<ir::SymbolId> formalSyms;
+            std::vector<ir::FuncId>   thunkFids;
+            std::vector<ir::BlockId>  thunkEntries;
+            formalSyms.reserve(nF); thunkFids.reserve(nF); thunkEntries.reserve(nF);
             for (auto & f : formals->formals) {
-                ir::VarId fv = m.freshVar();
-                formalVars.push_back(fv);
-                inner.byDispl.push_back(fv);
-                inner.byName.emplace(std::string(symbols[f.name]), fv);
+                formalSyms.push_back(internSym(f.name));
+                m.functions.emplace_back();
+                ir::FuncId tfid = static_cast<ir::FuncId>(m.functions.size() - 1);
+                auto teb = m.freshBlock();
+                m.functions[tfid].entryBlock = teb;
+                m.functions[tfid].name = std::string(symbols[f.name]);
+                thunkFids.push_back(tfid);
+                thunkEntries.push_back(teb);
             }
 
-            // Push the fully-populated scope before lowering anything
-            // that might reference formals (defaults + body).
-            scopes.push_back(inner);
+            ir::VarId formalsRec = m.freshVar();
 
-            for (size_t i = 0; i < formals->formals.size(); ++i) {
+            // Build a single scope holding both @arg (if any) at
+            // displ 0 plus the formals as rec slots starting at the
+            // appropriate offset.  Nix's bindVars assigns @arg displ
+            // 0 and formals displ 1..N, so the rec scope's
+            // recAttrsNames vector is padded with a sentinel for the
+            // @arg slot so AttrSelect lookups land on the right
+            // formal name.
+            Scope recScope;
+            recScope.recAttrsVar = formalsRec;
+            if (e->arg) {
+                recScope.byDispl.push_back(param);
+                recScope.byName.emplace(std::string(symbols[e->arg]), param);
+                recScope.recAttrsNames.push_back(ir::kInvalidSymbol);  // pad slot 0
+            }
+            for (size_t i = 0; i < nF; ++i) {
+                recScope.byDispl.push_back(ir::kInvalid);
+                recScope.byName.emplace(std::string(symbols[formals->formals[i].name]), ir::kInvalid);
+                recScope.recAttrsNames.push_back(formalSyms[i]);
+            }
+
+            // Lower each thunk body: `if hasAttr(param, X) then param.X
+            // else <default>` (or pure AttrSelect when no default).
+            // The thunk body sees the recScope so default expressions
+            // can reference sibling formals via AttrSelect on the rec
+            // attrset (those AttrSelects yield sibling thunks; force
+            // them to materialize the value).
+            for (size_t i = 0; i < nF; ++i) {
                 auto & f = formals->formals[i];
-                ir::SymbolId nm = internSym(f.name);
-                ir::Expr expr;
+                ir::SymbolId nm = formalSyms[i];
+
+                funcStack.push_back(thunkFids[i]);
+                blockStack.push_back(thunkEntries[i]);
+                scopes.push_back(recScope);
+
+                ir::VarId paramRef   = addBinding(ir::VarRef{param});
+                ir::VarId paramForced = forceVal(paramRef);
+
+                ir::VarId rv;
                 if (f.def) {
-                    // if (param ? f.name) then param.f.name else default
                     ir::VarId hasIt = addBinding(ir::HasAttr{paramForced, nm});
                     auto thenB = m.freshBlock();
                     auto elseB = m.freshBlock();
@@ -389,19 +423,38 @@ struct Lowerer
                     ir::VarId defv = lowerExpr(f.def);
                     setReturn(defv);
                     blockStack.pop_back();
-                    expr = ir::If{hasIt, thenB, elseB};
+                    rv = addBinding(ir::If{hasIt, thenB, elseB});
                 } else {
-                    expr = ir::AttrSelect{paramForced, nm};
+                    rv = addBinding(ir::AttrSelect{paramForced, nm});
                 }
-                // Bind into the pre-reserved VarId so sibling references
-                // resolve to this exact var.
-                m.blocks[blockStack.back()].bindings.push_back({formalVars[i], std::move(expr)});
+                setReturn(rv);
+
+                scopes.pop_back();
+                blockStack.pop_back();
+                funcStack.pop_back();
             }
 
+            // Now build the LetRec binding inside the lambda body.  Each
+            // entry's thunkBody is the function we just lowered.
+            ir::LetRec letRec;
+            letRec.recVar = formalsRec;
+            letRec.entries.reserve(nF);
+            for (size_t i = 0; i < nF; ++i) {
+                ir::LetRec::Entry en;
+                en.name = formalSyms[i];
+                en.thunkBody = thunkFids[i];
+                letRec.entries.push_back(std::move(en));
+            }
+            m.blocks[blockStack.back()].bindings.push_back({formalsRec, std::move(letRec)});
+
+            // Lower the body with the rec scope so formal references
+            // resolve via the rec attrset (and @arg, if any, via
+            // recScope.byDispl[0]).
+            scopes.push_back(recScope);
             ir::VarId rv = lowerExpr(e->body);
             setReturn(rv);
-
             scopes.pop_back();
+
             blockStack.pop_back();
             funcStack.pop_back();
         } else {
