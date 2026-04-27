@@ -298,6 +298,8 @@ int main(int argc, char ** argv)
     // autoargs lang test.
     std::vector<std::pair<std::string, std::string>> autoArgs;
     std::vector<std::pair<std::string, std::string>> autoArgsStr;
+    // -A path.path.path: select an attrset member from the result.
+    std::string attrPath;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view a(argv[i]);
@@ -308,6 +310,8 @@ int main(int argc, char ** argv)
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else if (a == "-I" && i + 1 < argc)
             extraSearchPath.emplace_back(argv[++i]);
+        else if (a == "-A" && i + 1 < argc)
+            attrPath = argv[++i];
         else if (a == "--arg" && i + 2 < argc) {
             std::string n = argv[++i]; std::string v = argv[++i];
             autoArgs.emplace_back(std::move(n), std::move(v));
@@ -397,6 +401,79 @@ int main(int argc, char ** argv)
         nix::v3::ir::computeFreeVars(m);
         auto cu = nix::v3::compile(m);
         Value r = nix::v3::run(cu);
+
+        // If --arg/--argstr were given, the file's top-level expression
+        // is expected to be a function (typically with formal args).
+        // Compile each arg expression in its own CU, run it, then call
+        // the top-level function with a single attrset containing all
+        // the autoargs.  This mirrors `nix-instantiate --arg`.
+        if (!autoArgs.empty() || !autoArgsStr.empty()) {
+            nix::v3::VMState vmA;
+            vmA.frames.push_back(nix::v3::CallFrame{
+                .cu = &cu, .closure = nullptr, .thunk = nullptr,
+                .ip = cu.entryOffset, .stackBaseOffset = 0,
+                .withStackBase = 0, .flags = 0,
+            });
+            // Build the args attrset.
+            std::vector<std::pair<nix::v3::SymbolId, Value>> argEntries;
+            auto cwdSrc = state.rootPath(nix::CanonPath(std::filesystem::current_path().string()));
+            for (auto & [n, v] : autoArgs) {
+                nix::Expr * ae = state.parseExprFromString(v, cwdSrc);
+                ae->bindVars(state, state.staticBaseEnv);
+                auto am = nix::v3::lowerNixExpr(ae, state.symbols, state.positions);
+                nix::v3::ir::computeFreeVars(am);
+                auto * acu = new nix::v3::CompilationUnit(nix::v3::compile(am));
+                Value av = nix::v3::run(*acu);
+                argEntries.emplace_back(nix::v3::ir::globalInternSymbol(n), av);
+            }
+            for (auto & [n, v] : autoArgsStr) {
+                Value sv;
+                char * buf = static_cast<char *>(std::malloc(v.size() + 1));
+                std::memcpy(buf, v.data(), v.size()); buf[v.size()] = '\0';
+                sv.mkString(buf);
+                argEntries.emplace_back(nix::v3::ir::globalInternSymbol(n), sv);
+            }
+            std::sort(argEntries.begin(), argEntries.end(),
+                      [](auto & a, auto & b) { return a.first < b.first; });
+            auto * argsB = nix::v3::Alloc::allocBindings(static_cast<uint32_t>(argEntries.size()));
+            for (size_t i = 0; i < argEntries.size(); ++i) {
+                argsB->entries[i].name  = argEntries[i].first;
+                argsB->entries[i].value = argEntries[i].second;
+            }
+            Value argsVal;
+            argsVal.tag_payload = static_cast<uint64_t>(nix::v3::Tag::Attrs);
+            argsVal.payload.bindings = argsB;
+            r = nix::v3::forceValue(vmA, r);
+            r = nix::v3::callClosure(vmA, r, argsVal);
+        }
+
+        // -A path.path: descend into the result attrset.
+        if (!attrPath.empty()) {
+            nix::v3::VMState vmS;
+            vmS.frames.push_back(nix::v3::CallFrame{
+                .cu = &cu, .closure = nullptr, .thunk = nullptr,
+                .ip = cu.entryOffset, .stackBaseOffset = 0,
+                .withStackBase = 0, .flags = 0,
+            });
+            r = nix::v3::forceValue(vmS, r);
+            std::string segment;
+            for (size_t i = 0; i <= attrPath.size(); ++i) {
+                if (i == attrPath.size() || attrPath[i] == '.') {
+                    if (!segment.empty()) {
+                        if (!r.isAttrs() || !r.payload.bindings)
+                            throw std::runtime_error("v3-eval -A: not an attrset");
+                        nix::v3::SymbolId sid = nix::v3::ir::globalInternSymbol(segment);
+                        const Value * found = r.payload.bindings->lookup(sid);
+                        if (!found)
+                            throw std::runtime_error("v3-eval -A: attribute '" + segment + "' not found");
+                        r = nix::v3::forceValue(vmS, *found);
+                        segment.clear();
+                    }
+                } else {
+                    segment.push_back(attrPath[i]);
+                }
+            }
+        }
 
         // For --strict and --json modes we need to force any thunks
         // remaining inside lists/attrsets so the output is concrete.
