@@ -916,7 +916,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
 
             std::string out;
-            for (auto & p : parts) out.append(coerceToString(p, forceStr));
+            for (auto & p : parts) {
+                // Attrset coercion: __toString self  or  outPath.
+                // Matches tree-walker's coerceToString behaviour for
+                // attrsets (used to interpolate derivation values).
+                if (p.isAttrs() && p.payload.bindings) {
+                    static const SymbolId tsId  = ir::globalInternSymbol("__toString");
+                    static const SymbolId outId = ir::globalInternSymbol("outPath");
+                    if (auto * fn = p.payload.bindings->lookup(tsId)) {
+                        Value forced = forceValue(vm, *fn);
+                        Value s = callClosure(vm, forced, p);
+                        s = forceValue(vm, s);
+                        if (s.isString()) { out.append(s.payload.str); continue; }
+                    }
+                    if (auto * op = p.payload.bindings->lookup(outId)) {
+                        Value forced = forceValue(vm, *op);
+                        if (forced.isString()) { out.append(forced.payload.str); continue; }
+                        if (forced.isPath())   { out.append(forced.payload.path); continue; }
+                    }
+                }
+                out.append(coerceToString(p, forceStr));
+            }
             char * buf = static_cast<char *>(std::malloc(out.size() + 1));
             std::memcpy(buf, out.data(), out.size());
             buf[out.size()] = '\0';
