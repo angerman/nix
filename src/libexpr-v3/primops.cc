@@ -2205,6 +2205,22 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v)
     return v3ToTreeWalker(state, v, seen);
 }
 
+// Public-shim function pointer.  Filled in by an init thunk below;
+// read by the namespace-scope `v3ToTreeWalkerPublic` defined after
+// the anonymous namespace closes.  Avoids exposing the internals
+// of v3ToTreeWalker (which references several other anon-ns
+// helpers) to external translation units.
+nix::Value * (*v3ToTreeWalkerShim)(nix::EvalState &, Value) = nullptr;
+struct V3ToTreeWalkerShimInit {
+    V3ToTreeWalkerShimInit() {
+        v3ToTreeWalkerShim = +[](nix::EvalState & ns, Value v) -> nix::Value * {
+            EvalState st; st.nixEvalState = &ns;
+            return v3ToTreeWalker(st, v);
+        };
+    }
+};
+[[maybe_unused]] V3ToTreeWalkerShimInit _v3_shim_init;
+
 /// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
 /// thunks via tree-walker's evaluator before reading the type.
 static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
@@ -3410,6 +3426,14 @@ const std::unordered_map<std::string, PrimOp> & allRegisteredPrimOps()
 
 void setNixEvalState(nix::EvalState * st) { tlNixEvalState = st; }
 nix::EvalState * getNixEvalState() { return tlNixEvalState; }
+
+// Forward to the anonymous-namespace shim (initialised at static-init
+// time).  Public — callable from v3_hook.cc.
+namespace { extern nix::Value * (*v3ToTreeWalkerShim)(nix::EvalState &, Value); }
+nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v)
+{
+    return v3ToTreeWalkerShim ? v3ToTreeWalkerShim(nixState, v) : nullptr;
+}
 
 void registerPrimOp(const PrimOp & op)
 {

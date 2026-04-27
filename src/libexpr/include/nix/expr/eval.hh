@@ -712,6 +712,18 @@ public:
     void eval(Expr * e, Value & v);
 
     /**
+     * Optional v3 evaluator hook.  When the v3 bytecode VM library is
+     * linked into the binary it sets this pointer via a static
+     * initializer.  At runtime, EvalState::eval consults `NIX_USE_V3=1`
+     * and dispatches to v3 via this hook when set.  Keeping it as a
+     * raw function pointer avoids a circular library dependency between
+     * libnixexpr and libnixexprv3 (the v3 lib already depends on
+     * libnixexpr for the AST/Symbol types).
+     */
+    using V3EvalHook = void (*)(EvalState &, Expr *, Value &);
+    static V3EvalHook v3EvalHook;
+
+    /**
      * Evaluation the expression, then verify that it has the expected
      * type.
      */

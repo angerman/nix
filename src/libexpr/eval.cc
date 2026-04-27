@@ -1199,8 +1199,21 @@ void EvalState::resetFileCache()
     positions.clear();
 }
 
+EvalState::V3EvalHook EvalState::v3EvalHook = nullptr;
+
 void EvalState::eval(Expr * e, Value & v)
 {
+    // V3 cutover: when NIX_USE_V3=1 is set AND the v3 library is
+    // linked in (so its static initializer has filled in the hook),
+    // route the entire evaluation through v3's bytecode VM.  The
+    // hook is responsible for running v3 and storing its result back
+    // into the tree-walker `Value` we hand it.
+    static bool useV3 = getEnv("NIX_USE_V3").value_or("") == "1";
+    if (useV3 && v3EvalHook) {
+        v3EvalHook(*this, e, v);
+        return;
+    }
+
     // When NIX_VM_V2=1 is set, use the v2 IR pipeline:
     //   AST -> IR (lower) -> bytecode (emitFromIR) -> vmExec.
     // This is the new upvalue-based compilation path.

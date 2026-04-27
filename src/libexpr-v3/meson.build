@@ -46,6 +46,7 @@ lib_sources = files(
   'vm.cc',
   'primops.cc',
   'lower.cc',
+  'v3_hook.cc',
 )
 
 this_library = library(
@@ -54,6 +55,21 @@ this_library = library(
   dependencies : deps_public + deps_private + deps_other,
   include_directories : include_dirs,
   install : true,
+  prelink : true,  # For the static-init that registers v3EvalHook.
+)
+
+# Expose as a meson dependency so the main `nix` binary can link
+# against us.  The cutover hook in v3_hook.cc relies on its static
+# initializer firing — that requires the binary to actually pull in
+# this library.
+meson.override_dependency(
+  'nix-expr-v3',
+  declare_dependency(
+    include_directories : include_dirs,
+    link_with : this_library,
+    compile_args : [ '-std=c++23' ],
+    dependencies : deps_public + deps_private + deps_other,
+  ),
 )
 
 # Headers (publicly installed for downstream consumers).
