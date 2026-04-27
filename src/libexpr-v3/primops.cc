@@ -115,11 +115,17 @@ inline bool valueEqual(VMState & vm, Value a, Value b)
         }
         return true;
     }
-    case Tag::Uninitialized:
+    // Functions are never equal in Nix at the top level (`f == f` is
+    // false).  This helper is used from primops (filter/elem/etc.) which
+    // perform direct comparison — closures never compare equal here.
+    // The vm.cc valueEqual has a separate code path for list/attr
+    // recursion that allows pointer-identity for closures.
     case Tag::Closure:
-    case Tag::Thunk:
     case Tag::PrimOp:
     case Tag::PrimOpApp:
+        return false;
+    case Tag::Uninitialized:
+    case Tag::Thunk:
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
@@ -1570,11 +1576,14 @@ void primReadDir(EvalState & state, Value * args, Value & out)
     std::vector<std::pair<SymbolId, Value>> entries;
     for (auto & ent : std::filesystem::directory_iterator(path)) {
         std::string name = ent.path().filename().string();
+        // is_symlink must be checked first: is_directory()/is_regular_file()
+        // follow symlinks, which would mis-report a `ldir -> dir` entry as
+        // "directory" instead of "symlink" (matches tree-walker's lstat).
         const char * type =
-            ent.is_directory()  ? "directory" :
-            ent.is_symlink()    ? "symlink" :
-            ent.is_regular_file() ? "regular" :
-                                  "unknown";
+            ent.is_symlink()      ? "symlink"   :
+            ent.is_directory()    ? "directory" :
+            ent.is_regular_file() ? "regular"   :
+                                    "unknown";
         SymbolId k = vmIntern(state, name);
         entries.emplace_back(k, mkStringValueOwned(type));
     }

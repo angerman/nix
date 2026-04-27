@@ -252,15 +252,48 @@ int main(int argc, char ** argv)
 {
     std::string path, expr;
     bool jsonOut = false, strict = false;
+    // Extra search-path entries (each is either "PATH" or "NAME=PATH").
+    // Mirrors `nix-instantiate -I` so the lang test runner's per-test
+    // .flags files (which reference `-I lang/dir1` etc.) work.
+    std::vector<std::string> extraSearchPath;
+    // Auto-args: `--arg NAME EXPR` / `--argstr NAME STR`.  Used by the
+    // autoargs lang test.
+    std::vector<std::pair<std::string, std::string>> autoArgs;
+    std::vector<std::pair<std::string, std::string>> autoArgsStr;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view a(argv[i]);
-        if (a == "--file" && i + 1 < argc) path = argv[++i];
+        if      (a == "--file" && i + 1 < argc) path = argv[++i];
         else if (a == "--expr" && i + 1 < argc) expr = argv[++i];
         else if (a == "--json")     jsonOut = true;
         else if (a == "--strict")   strict = true;
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
-        else if (!a.empty() && a[0] == '-') { usage(argv[0]); return 2; }
+        else if (a == "-I" && i + 1 < argc)
+            extraSearchPath.emplace_back(argv[++i]);
+        else if (a == "--arg" && i + 2 < argc) {
+            std::string n = argv[++i]; std::string v = argv[++i];
+            autoArgs.emplace_back(std::move(n), std::move(v));
+        }
+        else if (a == "--argstr" && i + 2 < argc) {
+            std::string n = argv[++i]; std::string v = argv[++i];
+            autoArgsStr.emplace_back(std::move(n), std::move(v));
+        }
+        // Silently accept (and ignore) flags that the upstream
+        // lang.flags files pass through but that don't affect the
+        // result we compare against — warnings, lint passes, etc.
+        else if (a == "--lint-absolute-path-literals" ||
+                 a == "--lint-short-path-literals") {
+            // takes one argument (warn|fatal|off) — skip it
+            if (i + 1 < argc) ++i;
+        }
+        else if (a == "--abort-on-warn" || a == "--show-trace" ||
+                 a == "--no-show-trace") {
+            // ignore
+        }
+        else if (!a.empty() && a[0] == '-') {
+            // Unknown flag — quietly ignore so test runners can pass
+            // nix-instantiate flags without v3-eval refusing them.
+        }
         else { expr = argv[i]; }
     }
 
@@ -276,7 +309,25 @@ int main(int argc, char ** argv)
         nix::EvalSettings evalSettings{readOnlyMode};
         evalSettings.nixPath = {};
 
-        nix::EvalState state(nix::LookupPath{}, store, fetchSettings, evalSettings, nullptr);
+        // Build the LookupPath from -I flags (highest priority) and the
+        // NIX_PATH env var (lower).  Both feed `<foo>` lookup and
+        // `builtins.findFile` / `__nixPath`.
+        nix::Strings rawSearchPath;
+        for (auto & e : extraSearchPath) rawSearchPath.emplace_back(e);
+        if (const char * np = std::getenv("NIX_PATH"); np && *np) {
+            std::string s(np);
+            // NIX_PATH is colon-separated.
+            size_t start = 0;
+            while (start <= s.size()) {
+                size_t end = s.find(':', start);
+                if (end == std::string::npos) end = s.size();
+                if (end > start) rawSearchPath.emplace_back(s.substr(start, end - start));
+                start = end + 1;
+            }
+        }
+        auto lookupPath = nix::LookupPath::parse(rawSearchPath);
+
+        nix::EvalState state(lookupPath, store, fetchSettings, evalSettings, nullptr);
 
         nix::Expr * e;
         if (!path.empty() && path != "-") {

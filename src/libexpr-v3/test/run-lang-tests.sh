@@ -23,9 +23,12 @@ fi
 pattern="${V3_LANG_PATTERN:-*}"
 verbose="${V3_LANG_VERBOSE:-0}"
 
-# Some lang tests rely on environment variables being preset (e.g.
-# TEST_VAR for eval-okay-getenv.nix).  Mirror tests/functional/lang.sh.
+# Mirror tests/functional/lang.sh — the upstream runner sets these env
+# vars and rewrites `$(pwd)` to `/pwd` in test output before diffing.
 export TEST_VAR=foo
+export HOME=/fake-home
+export NIX_PATH="$LANG_DIR/dir3:$LANG_DIR/dir4"
+PWD_REWRITE="$(pwd)"
 
 pass=0
 fail=0
@@ -48,12 +51,30 @@ for f in "$LANG_DIR"/eval-okay-${pattern}.nix; do
     continue
   fi
 
+  # Upstream marks tests as disabled by adding `.exp-disabled` next to
+  # the .nix file (e.g. eval-okay-tail-call-1).  Honor that.
+  if [[ -e "$LANG_DIR/$name.exp-disabled" ]]; then
+    total=$((total - 1))
+    continue
+  fi
+
+  # Read per-test flags (.flags file alongside .nix), if any.
+  flags=()
+  if [[ -e "$LANG_DIR/$name.flags" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      # shellcheck disable=SC2206
+      flags+=($line)
+    done < "$LANG_DIR/$name.flags"
+  fi
+
   # Run v3-eval.  Use --strict so we get fully-evaluated results, matching
   # what nix-instantiate --eval --strict would produce.  Discard stderr —
   # the lang test goldens compare against stdout only (warnings have a
-  # separate .err.exp file).
-  v3_out=$("$V3" --file "$f" --strict 2>/dev/null) || {
-    err_msg=$("$V3" --file "$f" --strict 2>&1 >/dev/null | head -c 200)
+  # separate .err.exp file).  Substitute $(pwd) -> /pwd in output to
+  # match upstream test runner.
+  v3_out=$("$V3" "${flags[@]}" --file "$f" --strict 2>/dev/null | sed "s!$PWD_REWRITE!/pwd!g") || {
+    err_msg=$("$V3" "${flags[@]}" --file "$f" --strict 2>&1 >/dev/null | head -c 200)
     errors=$((errors + 1))
     errored_cases+=("$name: $err_msg")
     [[ "$verbose" -eq 1 ]] && echo "ERROR  $name: $err_msg"

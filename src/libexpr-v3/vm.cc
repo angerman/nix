@@ -53,7 +53,16 @@ inline void push(VMState & vm, Value v)
 
 /// Equality with WHNF forcing — handles lazy list/attr entries.
 /// Recurses on List / Attrs after forcing each element.
-inline bool valueEqual(VMState & vm, Value a, Value b)
+///
+/// `insideContainer` is true when called recursively from list/attr
+/// comparison: in that case Nix's "value identity optimization" allows
+/// two closures to compare equal if they share the same underlying
+/// Closure pointer (matches tree-walker's `if (&v1 == &v2) return true`
+/// short-circuit when sibling list/attr entries point to the same
+/// in-memory Value).  Top-level `f == f` always returns false because
+/// the OP_EQ stack-pop holds two distinct Value structs even when their
+/// payload pointer is identical.
+inline bool valueEqual(VMState & vm, Value a, Value b, bool insideContainer = false)
 {
     a = forceValue(vm, a);
     b = forceValue(vm, b);
@@ -77,7 +86,7 @@ inline bool valueEqual(VMState & vm, Value a, Value b)
         uint32_t nb = lb ? lb->size : 0;
         if (na != nb) return false;
         for (uint32_t i = 0; i < na; ++i)
-            if (!valueEqual(vm, la->elems[i], lb->elems[i])) return false;
+            if (!valueEqual(vm, la->elems[i], lb->elems[i], /*insideContainer=*/true)) return false;
         return true;
     }
     case Tag::Attrs: {
@@ -89,15 +98,20 @@ inline bool valueEqual(VMState & vm, Value a, Value b)
         if (na != nb) return false;
         for (uint32_t i = 0; i < na; ++i) {
             if (aa->entries[i].name != bb->entries[i].name) return false;
-            if (!valueEqual(vm, aa->entries[i].value, bb->entries[i].value)) return false;
+            if (!valueEqual(vm, aa->entries[i].value, bb->entries[i].value, /*insideContainer=*/true)) return false;
         }
         return true;
     }
-    case Tag::Uninitialized:
     case Tag::Closure:
-    case Tag::Thunk:
     case Tag::PrimOp:
     case Tag::PrimOpApp:
+        // Direct comparison: never equal.  Inside a container: equal iff
+        // the underlying pointer matches (matches Nix's value-identity
+        // optimization for sibling list/attrset entries).
+        if (!insideContainer) return false;
+        return a.payload.closure == b.payload.closure;
+    case Tag::Uninitialized:
+    case Tag::Thunk:
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
