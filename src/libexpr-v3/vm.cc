@@ -848,6 +848,40 @@ Value run(const CompilationUnit & rootCu)
     return dispatchLoop(vm, /*exitDepth=*/0);
 }
 
+Value forceValue(VMState & vm, Value v)
+{
+    if (!v.isThunk()) return v;
+    Thunk * t = v.payload.thunk;
+    if (t->state == ThunkState::Evaluated) return t->evaluated;
+    if (t->state == ThunkState::Blackhole)
+        throw std::runtime_error("v3 forceValue: infinite recursion (blackhole)");
+
+    const LambdaDescriptor * desc = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+    Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
+    fakeClo->desc = desc;
+    fakeClo->nUpvalues = t->nUpvalues;
+    for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
+    t->state = ThunkState::Blackhole;
+
+    size_t exitDepth = vm.frames.size();
+    size_t newBase = vm.valueStack.size();
+    vm.valueStack.resize(newBase + desc->nLocals);
+
+    vm.frames.push_back(CallFrame{
+        .cu = vm.frames.back().cu,
+        .ip = desc->codeOffset,
+        .resultSlot = 0,
+        .flags = CFF_THUNK_RETURN,
+        ._pad0 = 0,
+        .stackBaseOffset = static_cast<uint32_t>(newBase),
+        .closure = fakeClo,
+        .resultPtr = nullptr,
+        .thunk = t,
+    });
+
+    return dispatchLoop(vm, exitDepth);
+}
+
 Value callClosure(VMState & vm, Value fun, Value arg)
 {
     // Single-arg primop fast path (no VM re-entry).

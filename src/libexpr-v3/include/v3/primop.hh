@@ -43,6 +43,11 @@ struct EvalState
 /// Used by callback primops.  Throws if `fun` is not callable.
 Value callClosure(VMState & vm, Value fun, Value arg);
 
+/// Force a thunk to WHNF.  Pass-through for non-thunk values.  Re-enters
+/// the dispatch loop on the same VMState (used by primops like tryEval
+/// that need to force from C++).
+Value forceValue(VMState & vm, Value v);
+
 /// Function pointer signature.  The primop is given a span of forced
 /// argument Values (the dispatcher arranges forcing) and writes its
 /// result into `out`.

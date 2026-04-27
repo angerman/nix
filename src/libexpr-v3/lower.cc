@@ -386,9 +386,20 @@ struct Lowerer
         if ((isPrimOpRef(e->fun, &po) || isBuiltinsPrimOp(e->fun, &po))
             && e->args->size() == po->arity)
         {
+            // tryEval needs its arg evaluated lazily (the whole point is
+            // to catch errors raised during forcing).  Wrap the arg in a
+            // MkThunk that defers its evaluation until tryEval forces it.
+            const bool isTryEval = std::string_view(po->name) == "tryEval";
+
             std::vector<ir::VarId> args;
             args.reserve(po->arity);
-            for (auto * a : *e->args) args.push_back(lowerExpr(a));
+            for (auto * a : *e->args) {
+                if (isTryEval) {
+                    args.push_back(thunkify(a));
+                } else {
+                    args.push_back(lowerExpr(a));
+                }
+            }
             return addBinding(ir::PrimOpCall{po, std::move(args)});
         }
         // Generic application via OP_CALL.
@@ -398,6 +409,28 @@ struct Lowerer
             f = addBinding(ir::App{f, av});
         }
         return f;
+    }
+
+    /// Lower an Expr into a separate thunk-body Function and emit a
+    /// MkThunk binding that, when forced, evaluates the expression in
+    /// the captured-upvalues context.  Used to defer evaluation for
+    /// primops with lazy argument semantics (e.g., tryEval).
+    ir::VarId thunkify(nix::Expr * e)
+    {
+        m.functions.emplace_back();
+        ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+        auto entry = m.freshBlock();
+        m.functions[fid].entryBlock = entry;
+        m.functions[fid].name = "<thunk>";
+
+        funcStack.push_back(fid);
+        blockStack.push_back(entry);
+        ir::VarId rv = lowerExpr(e);
+        setReturn(rv);
+        blockStack.pop_back();
+        funcStack.pop_back();
+
+        return addBinding(ir::MkThunk{fid, /*freeVars*/ {}});
     }
     ir::VarId lowerNot(nix::ExprOpNot * e)
     {

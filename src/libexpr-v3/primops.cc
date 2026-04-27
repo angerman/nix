@@ -821,6 +821,34 @@ void primDeepSeq(EvalState &, Value * args, Value & out)
     out = args[1];
 }
 
+/// tryEval: forces the argument; returns
+///   { success = true;  value = result;       } on success,
+///   { success = false; value = false;        } on caught exception.
+void primTryEval(EvalState & state, Value * args, Value & out)
+{
+    SymbolId sSuccess = vmIntern(state, "success");
+    SymbolId sValue   = vmIntern(state, "value");
+    Value successV, valueV;
+    try {
+        valueV = forceValue(*state.vm, args[0]);
+        successV = Value::vTrue;
+    } catch (const std::exception &) {
+        successV = Value::vFalse;
+        valueV = Value::vFalse;
+    }
+    Bindings * b = Alloc::allocBindings(2);
+    allocStats().attrsetsAllocated++;
+    if (sSuccess < sValue) {
+        b->entries[0] = {sSuccess, successV};
+        b->entries[1] = {sValue, valueV};
+    } else {
+        b->entries[0] = {sValue, valueV};
+        b->entries[1] = {sSuccess, successV};
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
 void primLessThan(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
@@ -916,6 +944,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"abort",              1, primAbort});
         registerPrimOp({"seq",                2, primSeq});
         registerPrimOp({"deepSeq",            2, primDeepSeq});
+        registerPrimOp({"tryEval",            1, primTryEval});
     });
 }
 
