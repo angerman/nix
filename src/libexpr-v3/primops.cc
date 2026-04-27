@@ -1330,10 +1330,11 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
     Value opV    = forceValue(*state.vm, *opVRaw);
     if (!startV.isList()) typeError("genericClosure", "startSet must be a list");
 
-    // Process queue: BFS.  workQueue is the items to process; result is
-    // accumulated as we go.  seen[key.toString()] = true.
+    // Tree-walker uses a FIFO queue.  Order matters because the lang
+    // tests dedupe on first-encountered, so BFS vs DFS produces a
+    // different surviving item per key.
     std::vector<Value> result;
-    std::vector<Value> work;
+    std::deque<Value> work;
     if (startV.payload.list) {
         for (uint32_t i = 0; i < startV.payload.list->size; ++i)
             work.push_back(startV.payload.list->elems[i]);
@@ -1353,7 +1354,7 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
     };
 
     while (!work.empty()) {
-        Value it = work.back(); work.pop_back();
+        Value it = work.front(); work.pop_front();
         std::string key = keyOf(it);
         if (!seen.insert(key).second) continue;
         result.push_back(it);
@@ -1746,12 +1747,51 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     // Synthesize fake store paths.  Real nix interacts with the store;
     // v3 just produces stable identifiers good enough for tests that
     // string-interpolate / string-compare drvPath / outPath values.
+    //
+    // Hash a few stringy attrs (system, builder, outputHash, args) into
+    // the fake path so two derivations differing only in builder don't
+    // collide — required by `eval-okay-eq-derivations`.
+    auto attrToString = [&](const Value * v) -> std::string {
+        if (!v) return "";
+        Value f = forceValue(*state.vm, *v);
+        if (f.isString()) return f.payload.str;
+        if (f.isPath())   return f.payload.path;
+        if (f.isInt())    return std::to_string(f.payload.i);
+        if (f.isBool())   return f.payload.i == 1 ? "1" : "";
+        if (f.isList() && f.payload.list) {
+            std::string s;
+            for (uint32_t i = 0; i < f.payload.list->size; ++i) {
+                Value el = forceValue(*state.vm, f.payload.list->elems[i]);
+                if (el.isString()) s += el.payload.str;
+                else if (el.isPath()) s += el.payload.path;
+                s += ',';
+            }
+            return s;
+        }
+        return "";
+    };
+    std::string sysStr     = attrToString(src->lookup(vmIntern(state, "system")));
+    std::string builderStr = attrToString(src->lookup(vmIntern(state, "builder")));
+    std::string argsStr    = attrToString(src->lookup(vmIntern(state, "args")));
+    std::string ohStr      = attrToString(src->lookup(vmIntern(state, "outputHash")));
+    // Cheap FNV-1a hash — collision probability is plenty for tests and
+    // we don't need cryptographic security for fake store paths.
+    auto fnv = [](std::string_view s) {
+        uint64_t h = 1469598103934665603ULL;
+        for (char c : s) { h ^= (unsigned char)c; h *= 1099511628211ULL; }
+        return h;
+    };
+    char hashBuf[17];
+    std::snprintf(hashBuf, sizeof hashBuf, "%016llx",
+                  (unsigned long long)fnv(name + "|" + sysStr + "|" + builderStr + "|" + argsStr + "|" + ohStr));
+    std::string hashTag(hashBuf, 16);
+
     std::vector<std::pair<SymbolId, Value>> entries;
     entries.reserve(outputs.size() + 1);
-    entries.emplace_back(sDrvPath, mkStringValueOwned("/v3-fake-store/" + name + ".drv"));
+    entries.emplace_back(sDrvPath, mkStringValueOwned("/v3-fake-store/" + hashTag + "-" + name + ".drv"));
     for (auto & o : outputs) {
         SymbolId sO = vmIntern(state, o);
-        std::string p = "/v3-fake-store/" + name + (o == "out" ? "" : "-" + o);
+        std::string p = "/v3-fake-store/" + hashTag + "-" + name + (o == "out" ? "" : "-" + o);
         entries.emplace_back(sO, mkStringValueOwned(p));
     }
     std::sort(entries.begin(), entries.end(),

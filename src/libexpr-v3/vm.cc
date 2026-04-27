@@ -93,6 +93,25 @@ inline bool valueEqual(VMState & vm, Value a, Value b, bool insideContainer = fa
         auto * aa = a.payload.bindings;
         auto * bb = b.payload.bindings;
         if (aa == bb) return true;
+        // Special-case derivations: if both attrsets are derivations
+        // (have `type = "derivation"`), compare their `outPath` fields
+        // and ignore the rest.  Matches tree-walker semantics — required
+        // by `eval-okay-eq-derivations` (where `drv // { dummy = 1; }`
+        // still compares equal to the bare `drv`).
+        static const SymbolId tyId = ir::globalInternSymbol("type");
+        static const SymbolId opId = ir::globalInternSymbol("outPath");
+        auto isDrv = [&](const Bindings * b) {
+            if (!b) return false;
+            const Value * t = b->lookup(tyId);
+            if (!t) return false;
+            Value tf = forceValue(vm, *t);
+            return tf.isString() && std::string_view(tf.payload.str) == "derivation";
+        };
+        if (isDrv(aa) && isDrv(bb)) {
+            const Value * pa = aa->lookup(opId);
+            const Value * pb = bb->lookup(opId);
+            if (pa && pb) return valueEqual(vm, *pa, *pb, /*insideContainer=*/true);
+        }
         uint32_t na = aa ? aa->size : 0;
         uint32_t nb = bb ? bb->size : 0;
         if (na != nb) return false;

@@ -23,12 +23,16 @@ fi
 pattern="${V3_LANG_PATTERN:-*}"
 verbose="${V3_LANG_VERBOSE:-0}"
 
-# Mirror tests/functional/lang.sh — the upstream runner sets these env
-# vars and rewrites `$(pwd)` to `/pwd` in test output before diffing.
+# Mirror tests/functional/lang.sh — the upstream runner runs with cwd =
+# tests/functional/, sets these env vars, and rewrites `$(pwd)` to
+# `/pwd` in test output before diffing.
+TESTS_FUNCTIONAL="$ROOT/tests/functional"
+cd "$TESTS_FUNCTIONAL"
+PWD_REWRITE="$(pwd)"
+
 export TEST_VAR=foo
 export HOME=/fake-home
-export NIX_PATH="$LANG_DIR/dir3:$LANG_DIR/dir4"
-PWD_REWRITE="$(pwd)"
+export NIX_PATH="lang/dir3:lang/dir4"
 
 pass=0
 fail=0
@@ -41,7 +45,7 @@ errored_cases=()
 declare -A KNOWN_SKIP
 # Currently no tests are skipped — failures show what to fix next.
 
-for f in "$LANG_DIR"/eval-okay-${pattern}.nix; do
+for f in lang/eval-okay-${pattern}.nix; do
   [[ -e "$f" ]] || continue
   name=$(basename "$f" .nix)
   total=$((total + 1))
@@ -53,19 +57,19 @@ for f in "$LANG_DIR"/eval-okay-${pattern}.nix; do
 
   # Upstream marks tests as disabled by adding `.exp-disabled` next to
   # the .nix file (e.g. eval-okay-tail-call-1).  Honor that.
-  if [[ -e "$LANG_DIR/$name.exp-disabled" ]]; then
+  if [[ -e "lang/$name.exp-disabled" ]]; then
     total=$((total - 1))
     continue
   fi
 
   # Read per-test flags (.flags file alongside .nix), if any.
   flags=()
-  if [[ -e "$LANG_DIR/$name.flags" ]]; then
+  if [[ -e "lang/$name.flags" ]]; then
     while IFS= read -r line; do
       [[ -z "$line" || "$line" == \#* ]] && continue
       # shellcheck disable=SC2206
       flags+=($line)
-    done < "$LANG_DIR/$name.flags"
+    done < "lang/$name.flags"
   fi
 
   # Run v3-eval.  Use --strict so we get fully-evaluated results, matching
@@ -82,7 +86,7 @@ for f in "$LANG_DIR"/eval-okay-${pattern}.nix; do
   }
 
   # Compare with .exp if present, otherwise with tree-walker.
-  exp_file="$LANG_DIR/$name.exp"
+  exp_file="lang/$name.exp"
   if [[ -f "$exp_file" ]]; then
     expected=$(cat "$exp_file")
   else
