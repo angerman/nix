@@ -349,15 +349,33 @@ struct Lowerer
             // the forced VarId for all formals lookups.
             ir::VarId paramForced = forceVal(param);
 
-            // Order in newEnv before sort: arg (if any), then formals in
-            // declaration order; displ assigned 0..N.  We mirror that.
+            // Pre-pass: reserve a VarId for each formal so that
+            // mutually-recursive defaults like `{ x ? y, y ? x }`
+            // see all siblings when their default expressions are
+            // lowered.  Order matches Nix's bindVars: e->arg (if any)
+            // first, then formals sorted by name (matches the iteration
+            // order over `formals->formals`).
             if (e->arg) {
                 inner.byDispl.push_back(param);
                 inner.byName.emplace(std::string(symbols[e->arg]), param);
             }
+            std::vector<ir::VarId> formalVars;
+            formalVars.reserve(formals->formals.size());
             for (auto & f : formals->formals) {
-                ir::VarId v;
+                ir::VarId fv = m.freshVar();
+                formalVars.push_back(fv);
+                inner.byDispl.push_back(fv);
+                inner.byName.emplace(std::string(symbols[f.name]), fv);
+            }
+
+            // Push the fully-populated scope before lowering anything
+            // that might reference formals (defaults + body).
+            scopes.push_back(inner);
+
+            for (size_t i = 0; i < formals->formals.size(); ++i) {
+                auto & f = formals->formals[i];
                 ir::SymbolId nm = internSym(f.name);
+                ir::Expr expr;
                 if (f.def) {
                     // if (param ? f.name) then param.f.name else default
                     ir::VarId hasIt = addBinding(ir::HasAttr{paramForced, nm});
@@ -368,23 +386,17 @@ struct Lowerer
                     setReturn(got);
                     blockStack.pop_back();
                     blockStack.push_back(elseB);
-                    // Default expressions are evaluated in the new env (formals scope),
-                    // so we evaluate them after the scope is set up below.
-                    // For now, lower them with the partial scope (best-effort).
-                    scopes.push_back(inner);
                     ir::VarId defv = lowerExpr(f.def);
                     setReturn(defv);
-                    scopes.pop_back();
                     blockStack.pop_back();
-                    v = addBinding(ir::If{hasIt, thenB, elseB});
+                    expr = ir::If{hasIt, thenB, elseB};
                 } else {
-                    v = addBinding(ir::AttrSelect{paramForced, nm});
+                    expr = ir::AttrSelect{paramForced, nm};
                 }
-                inner.byDispl.push_back(v);
-                inner.byName.emplace(std::string(symbols[f.name]), v);
+                // Bind into the pre-reserved VarId so sibling references
+                // resolve to this exact var.
+                m.blocks[blockStack.back()].bindings.push_back({formalVars[i], std::move(expr)});
             }
-
-            scopes.push_back(std::move(inner));
 
             ir::VarId rv = lowerExpr(e->body);
             setReturn(rv);
