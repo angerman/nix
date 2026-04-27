@@ -160,11 +160,13 @@ positions both work via the per-attr position side-table populated
 by OP_ATTRS_INIT[_DYN] / OP_ATTRS_REC_INIT.
 
 Performance: v3 is now at parity with the tree-walker on compute-bound
-benchmarks.
+benchmarks, and significantly faster on attrset-heavy workloads.
 
   fib30:  tree-walker 0.37s user, v3 0.37s user  (matched)
   fib32:  tree-walker 0.93s user, v3 0.94s user  (~1% gap)
   fib34:  tree-walker 2.41s user, v3 2.42s user  (~0.5% gap)
+  attrs10k (10000 // merges + foldl' over attrNames):
+          tree-walker 0.34s user, v3 0.10s user  (3.4× faster)
 
 Recent perf wins (in-VM hot path):
   - OP_FORCE peek-fast-path: skip pop+push when top is already WHNF.
