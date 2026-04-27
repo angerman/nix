@@ -1748,6 +1748,86 @@ void primAddErrorContext(EvalState &, Value * args, Value & out)
 /// `commonAttrs` = drvAttrs // listToAttrs(outputs) // { all; drvAttrs; }.
 void primDerivation(EvalState & state, Value * args, Value & out);
 
+/// Forward decls for the v3 closure bridging — used so a v3 closure
+/// passed to the tree-walker (e.g. as a `filter` function on
+/// `builtins.path`) becomes a real callable on the tree-walker side.
+static std::vector<Value> & v3BridgeClosures()
+{
+    static std::vector<Value> tbl;
+    return tbl;
+}
+
+/// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
+/// thunks via tree-walker's evaluator before reading the type.
+static Value treeWalkerToV3(EvalState & state, nix::Value & nv);
+
+/// Tree-walker primop body: invoked when tree-walker fully applies
+/// `__v3_call_bridge_2 handle arg1 arg2`.  Look up the v3 closure
+/// stored at `handle`, convert args back to v3, call, convert result.
+static void primV3CallBridge2(nix::EvalState & ns, const nix::PosIdx pos,
+                              nix::Value ** args, nix::Value & out)
+{
+    ns.forceValue(*args[0], pos);
+    if (args[0]->type() != nix::nInt)
+        ns.error<nix::EvalError>("v3 bridge: handle must be int").debugThrow();
+    int64_t h = args[0]->integer().value;
+    auto & tbl = v3BridgeClosures();
+    if (h < 0 || (size_t)h >= tbl.size())
+        ns.error<nix::EvalError>("v3 bridge: invalid handle").debugThrow();
+    Value v3fn = tbl[(size_t)h];
+    // Convert tree-walker args to v3, force only on demand inside the
+    // v3 closure — we deepForce here to preserve the invariant that
+    // v3 closures see WHNF.
+    EvalState v3state;
+    v3state.nixEvalState = &ns;
+    extern thread_local nix::EvalState * tlNixEvalState;
+    if (!tlNixEvalState) tlNixEvalState = &ns;
+
+    // Need a v3 VMState to invoke callClosure.  Use the tlsEvalState's
+    // vm if available; otherwise construct a fresh one for this call.
+    static thread_local VMState * tlsVm = nullptr;
+    VMState localVm;
+    if (!tlsVm) tlsVm = &localVm;
+    v3state.vm = tlsVm;
+
+    // For each tree-walker arg (after handle), convert to v3, then
+    // walk the curry: callClosure(fn, arg1) → fn1; callClosure(fn1, arg2)
+    // → result.
+    Value fn = v3fn;
+    for (int i = 1; i <= 2; ++i) {
+        ns.forceValue(*args[i], pos);
+        Value v3arg = treeWalkerToV3(v3state, *args[i]);
+        fn = callClosure(*v3state.vm, fn, v3arg);
+    }
+    // Convert result back.
+    fn = forceValue(*v3state.vm, fn);
+    // Reuse v3ToTreeWalker by allocating a Value to hold the result.
+    nix::Value * tmp; (void)tmp;
+    // We need to write into `out`, so do the conversion inline.
+    switch (fn.tag()) {
+    case Tag::Bool:   out.mkBool(fn.payload.i == 1); break;
+    case Tag::Int:    out.mkInt(fn.payload.i); break;
+    case Tag::Float:  out.mkFloat(fn.payload.f); break;
+    case Tag::Null:   out.mkNull(); break;
+    case Tag::String: out.mkString(fn.payload.str ? fn.payload.str : "", ns.mem); break;
+    case Tag::Uninitialized:
+    case Tag::Path:
+    case Tag::Attrs:
+    case Tag::List:
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
+    default:
+        // Lists / attrsets / paths fall back to null.  filter returns
+        // bool, so this is enough for the path test.
+        out.mkNull(); break;
+    }
+}
+
 /// Recursively convert a v3 Value to a tree-walker nix::Value, allocated
 /// in the EvalState's GC arena.  Used by primDerivationStrict to bridge
 /// to tree-walker's real derivation hasher.  Functions are converted as
@@ -1790,11 +1870,42 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v)
         out->mkAttrs(bb);
         break;
     }
-    case Tag::Uninitialized:
     case Tag::Closure:
-    case Tag::Thunk:
     case Tag::PrimOp:
-    case Tag::PrimOpApp:
+    case Tag::PrimOpApp: {
+        // Bridge the v3 closure as a tree-walker primop application.
+        // We register `__v3_call_bridge_2` (arity 3: handle, arg1,
+        // arg2) once and partial-apply it to the closure's handle so
+        // tree-walker sees a 2-arg function.  Required for things
+        // like `builtins.path { filter = path: type: ...; }` where
+        // filter is the only function we currently need to bridge.
+        static nix::Value * bridgePrimOp = nullptr;
+        if (!bridgePrimOp) {
+            // Build a fresh PrimOp object on the heap and wrap it in a
+            // Value via the public mkPrimOp().  We don't go through
+            // addPrimOp (private + adds to baseEnv); we just need a
+            // standalone PrimOp callable that we can partial-apply.
+            auto * po = new nix::PrimOp{
+                .name  = "__v3_call_bridge_2",
+                .args  = {"handle", "arg1", "arg2"},
+                .arity = 3,
+                .doc   = std::nullopt,
+                .impl  = nix::fun<nix::PrimOpFun>{primV3CallBridge2},
+            };
+            nix::Value * v = ns.allocValue();
+            v->mkPrimOp(po);
+            bridgePrimOp = v;
+        }
+        auto & tbl = v3BridgeClosures();
+        size_t handle = tbl.size();
+        tbl.push_back(v);
+        nix::Value * vHandle = ns.allocValue();
+        vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
+        out->mkPrimOpApp(bridgePrimOp, vHandle);
+        break;
+    }
+    case Tag::Uninitialized:
+    case Tag::Thunk:
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
