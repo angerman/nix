@@ -199,6 +199,12 @@ drvPaths to tree-walker and is consistently a few % faster:
   vim:   tree-walker 0.28s user, v3 0.27s user (~3% faster)
   git:   tree-walker 0.39s user, v3 0.37s user (~5% faster)
 
+Heavy nixpkgs scan — filter+count all 25 070 top-level package
+attrsets (`builtins.length (builtins.filter (n: builtins.isAttrs
+(tryEval pkgs.${n}).value) (attrNames pkgs))`).  Both produce 25070:
+  tree-walker: 9.06s user / 10.68s real
+  v3:          8.95s user /  7.78s real  (~1% less CPU, ~27% less wall)
+
 Tail-call optimization: 100,000 recursive tail calls
 (`let f = n: if n == 100000 then n else f (n + 1); in f 0`) now
 runs in O(1) frame stack space.  Bounded against true infinite
