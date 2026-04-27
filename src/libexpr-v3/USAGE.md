@@ -31,6 +31,18 @@ Exits with status 0 on success; prints the resulting value on stdout.
 On unsupported AST shapes or runtime errors, prints `v3-eval error: …`
 on stderr and exits 1.
 
+## NIX_USE_V3 cutover
+
+Setting `NIX_USE_V3=1` routes the regular `nix` CLI's evaluator
+through v3:
+
+    NIX_USE_V3=1 ./build/src/nix/nix eval --expr '1 + 2'    # 3
+    NIX_USE_V3=1 ./build/src/nix/nix eval --expr 'fib 30 ...'
+
+The hook is installed by a static initializer in libnixexprv3 — the
+main `nix` binary now links against v3, but libnixexpr itself does
+not (no circular link dep).
+
 ## What the lowerer supports
 
 Literals: `Int`, `Float`, `Bool`, `Null`, `String`, `Path`.
