@@ -201,6 +201,13 @@ struct PrimOpCall {
     std::vector<VarId> args;
 };
 
+/// Push a Tag::PrimOp value (for partial application or first-class use
+/// of primops).  Used when a primop is referenced as a value rather than
+/// the callee of a sufficiently-applied call site.
+struct LitPrimOp {
+    const v3::PrimOp * primop;
+};
+
 /// Recursive let / rec attrset built via the env-carrier pattern:
 /// allocate a Bindings(n) with placeholder values, allocate one Thunk per
 /// entry capturing the Bindings as its first upvalue, then patch the
@@ -242,6 +249,7 @@ using Expr = std::variant<
     Update,
     PosExpr,
     PrimOpCall,
+    LitPrimOp,
     LetRec
 >;
 

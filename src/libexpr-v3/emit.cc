@@ -361,17 +361,22 @@ struct Emitter
     }
 
     // -- Primop direct call
+    uint32_t internPrimOp(const PrimOp * po)
+    {
+        for (uint32_t i = 0; i < unit.primops.size(); ++i)
+            if (unit.primops[i] == po) return i;
+        unit.primops.push_back(po);
+        return static_cast<uint32_t>(unit.primops.size() - 1);
+    }
     void emitOne(const ir::PrimOpCall & e)
     {
         for (auto v : e.args) emitVarRef(v);
-        // Register the primop in the CU's table.  Reuse if already there.
-        uint32_t poIdx = static_cast<uint32_t>(unit.primops.size());
-        for (uint32_t i = 0; i < unit.primops.size(); ++i)
-            if (unit.primops[i] == e.primop) { poIdx = i; goto have; }
-        unit.primops.push_back(e.primop);
-    have:
         unit.code.push_back(encode(OP_CALL_PRIMOP, static_cast<uint32_t>(e.args.size())));
-        unit.code.push_back(poIdx);
+        unit.code.push_back(internPrimOp(e.primop));
+    }
+    void emitOne(const ir::LitPrimOp & e)
+    {
+        unit.code.push_back(encode(OP_LIT_PRIMOP, internPrimOp(e.primop)));
     }
 
     // -- With / assert

@@ -121,6 +121,8 @@ enum Op : uint8_t
     /// Pops nArgs from stack (in argument order: arg0, arg1, ...) and
     /// pushes the primop's result.
     OP_CALL_PRIMOP    = 0xB0,
+    /// Push a Tag::PrimOp value pointing to cu->primops[idx].
+    OP_LIT_PRIMOP     = 0xB1,
 
     OP_HALT           = 0xFF,
 };

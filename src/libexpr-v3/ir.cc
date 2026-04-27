@@ -116,6 +116,8 @@ void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
             for (auto v : e.parts) refs.insert(v);
         } else if constexpr (std::is_same_v<T, PrimOpCall>) {
             for (auto v : e.args) refs.insert(v);
+        } else if constexpr (std::is_same_v<T, LitPrimOp>) {
+            (void)e;
         } else if constexpr (std::is_same_v<T, LetRec>) {
             // The thunk-body Functions reference each thunk's outer
             // captures.  These VarIds are needed at MAKE_THUNK time so

@@ -366,6 +366,48 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_CALL: {
             Value arg = pop(vm), fun = pop(vm);
+
+            // PrimOp / PrimOpApp partial application.
+            if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
+                // Walk the PrimOpApp chain to find the root PrimOp and
+                // collect the previously-applied args.
+                Value cur = fun;
+                size_t depth = 0;
+                while (cur.tag() == Tag::PrimOpApp) { ++depth; cur = cur.payload.pair->left; }
+                if (!cur.isPrimOp())
+                    throw std::runtime_error("v3 OP_CALL: PrimOpApp chain doesn't terminate in a PrimOp");
+                const PrimOp * po = cur.payload.primop;
+                size_t totalArgs = depth + 1;
+                if (totalArgs < po->arity) {
+                    // Build a new PrimOpApp wrapping (fun, arg).
+                    ValuePair * vp = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+                    vp->left = fun;
+                    vp->right = arg;
+                    Value v;
+                    v.tag_payload = static_cast<uint64_t>(Tag::PrimOpApp);
+                    v.payload.pair = vp;
+                    push(vm, v);
+                    break;
+                }
+                if (totalArgs > po->arity)
+                    throw std::runtime_error("v3 OP_CALL: too many args for primop");
+                // Collect args in [arg_0, arg_1, ..., arg_{N-1}, arg] order.
+                Value buf[8];
+                if (po->arity > 8) throw std::runtime_error("v3 OP_CALL: primop arity > 8");
+                buf[totalArgs - 1] = arg;
+                Value chain = fun;
+                for (size_t i = totalArgs - 1; i > 0; --i) {
+                    buf[i - 1] = chain.payload.pair->right;
+                    chain = chain.payload.pair->left;
+                }
+                vm.frames.back().ip = ip;
+                EvalState state; state.vm = &vm;
+                Value out;
+                po->fn(state, buf, out);
+                push(vm, out);
+                break;
+            }
+
             if (!fun.isClosure())
                 throw std::runtime_error("v3 OP_CALL: callee is not a closure");
             const Closure * callee = fun.payload.closure;
@@ -717,6 +759,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Stub: emit an empty attrset.
             Bindings * b = Alloc::allocBindings(0);
             Value v; v.tag_payload = static_cast<uint64_t>(Tag::Attrs); v.payload.bindings = b;
+            push(vm, v);
+            break;
+        }
+
+        case OP_LIT_PRIMOP: {
+            const PrimOp * po = cu->primops[operand];
+            Value v;
+            v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
+            v.payload.primop = po;
             push(vm, v);
             break;
         }

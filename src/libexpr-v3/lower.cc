@@ -621,10 +621,29 @@ struct Lowerer
     /// the default.  We build nested if-then-else: at each level, if
     /// the current attr exists, recurse into the rest of the path; else
     /// return the default.
+    ///
+    /// Special case: `builtins.<name>` where <name> is a known primop
+    /// emits OP_LIT_PRIMOP directly (a Tag::PrimOp value).  This allows
+    /// partial application like `builtins.foldl' f nul` and use of
+    /// primops as first-class values (e.g., `map builtins.toString xs`).
     ir::VarId lowerSelect(nix::ExprSelect * e)
     {
-        ir::VarId v = lowerExpr(e->e);
         auto path = e->getAttrPath();
+        const PrimOp * po = nullptr;
+        if (!e->def && path.size() == 1 && !path[0].expr
+            && e->e->exprKind == nix::Expr::Kind::Var)
+        {
+            auto * ev = static_cast<nix::ExprVar *>(e->e);
+            if (!ev->fromWith && ev->level >= scopes.size()
+                && std::string(symbols[ev->name]) == "builtins")
+            {
+                std::string name(symbols[path[0].symbol]);
+                po = findPrimOp(name);
+                if (po) return addBinding(ir::LitPrimOp{po});
+            }
+        }
+
+        ir::VarId v = lowerExpr(e->e);
         return emitSelectChain(v, path, e->def, 0);
     }
 
