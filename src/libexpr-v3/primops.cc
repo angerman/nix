@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -821,6 +822,80 @@ void primDeepSeq(EvalState &, Value * args, Value & out)
     out = args[1];
 }
 
+void primBaseNameOf(EvalState &, Value * args, Value & out)
+{
+    std::string s;
+    if (args[0].isString()) s = args[0].payload.str;
+    else if (args[0].isPath()) s = args[0].payload.path;
+    else typeError("baseNameOf", "string or path");
+    auto pos = s.find_last_of('/');
+    out = mkStringValueOwned(pos == std::string::npos ? s : s.substr(pos + 1));
+}
+
+void primDirOf(EvalState &, Value * args, Value & out)
+{
+    std::string s;
+    bool isPathV = false;
+    if (args[0].isString()) s = args[0].payload.str;
+    else if (args[0].isPath()) { s = args[0].payload.path; isPathV = true; }
+    else typeError("dirOf", "string or path");
+    auto pos = s.find_last_of('/');
+    std::string dir = (pos == std::string::npos) ? "." :
+                      (pos == 0) ? "/" : s.substr(0, pos);
+    if (isPathV) {
+        Value v;
+        // Allocate a long-lived string for the path payload.
+        char * buf = static_cast<char *>(std::malloc(dir.size() + 1));
+        std::memcpy(buf, dir.data(), dir.size()); buf[dir.size()] = '\0';
+        v.tag_payload = static_cast<uint64_t>(Tag::Path);
+        v.payload.path = buf;
+        out = v;
+    } else {
+        out = mkStringValueOwned(dir);
+    }
+}
+
+void primPathExists(EvalState &, Value * args, Value & out)
+{
+    std::string s;
+    if (args[0].isString()) s = args[0].payload.str;
+    else if (args[0].isPath()) s = args[0].payload.path;
+    else typeError("pathExists", "string or path");
+    out = std::filesystem::exists(s) ? Value::vTrue : Value::vFalse;
+}
+
+void primSplitString(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString() || !args[1].isString())
+        typeError("splitString", "(separator, string)");
+    std::string_view sep(args[0].payload.str);
+    std::string_view s(args[1].payload.str);
+    std::vector<Value> parts;
+    if (sep.empty()) {
+        // Empty separator: split into per-character strings.
+        for (char c : s) {
+            std::string single(1, c);
+            parts.push_back(mkStringValueOwned(single));
+        }
+    } else {
+        size_t pos = 0;
+        while (pos <= s.size()) {
+            size_t next = s.find(sep, pos);
+            if (next == std::string_view::npos) {
+                parts.push_back(mkStringValueOwned(std::string(s.substr(pos))));
+                break;
+            }
+            parts.push_back(mkStringValueOwned(std::string(s.substr(pos, next - pos))));
+            pos = next + sep.size();
+        }
+    }
+    ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
+    allocStats().listsAllocated++;
+    for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = parts[i];
+    out.tag_payload = static_cast<uint64_t>(Tag::List);
+    out.payload.list = lv;
+}
+
 /// tryEval: forces the argument; returns
 ///   { success = true;  value = result;       } on success,
 ///   { success = false; value = false;        } on caught exception.
@@ -945,6 +1020,10 @@ void registerBuiltinPrimOps()
         registerPrimOp({"seq",                2, primSeq});
         registerPrimOp({"deepSeq",            2, primDeepSeq});
         registerPrimOp({"tryEval",            1, primTryEval});
+        registerPrimOp({"baseNameOf",         1, primBaseNameOf});
+        registerPrimOp({"dirOf",              1, primDirOf});
+        registerPrimOp({"pathExists",         1, primPathExists});
+        registerPrimOp({"splitString",        2, primSplitString});
     });
 }
 
