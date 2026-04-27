@@ -24,6 +24,8 @@
 #include "v3/alloc.hh"
 #include "v3/vm.hh"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -897,6 +899,110 @@ void primSplitString(EvalState &, Value * args, Value & out)
     out.payload.list = lv;
 }
 
+/// nlohmann::json -> v3 Value (recursive).
+Value jsonToValue(EvalState & state, const nlohmann::json & j)
+{
+    using json = nlohmann::json;
+    Value out;
+    if (j.is_null())     { out.mkNull(); return out; }
+    if (j.is_boolean())  { out = j.get<bool>() ? Value::vTrue : Value::vFalse; return out; }
+    if (j.is_number_integer()) {
+        out.mkInt(j.get<int64_t>()); return out;
+    }
+    if (j.is_number_float()) {
+        out.mkFloat(j.get<double>()); return out;
+    }
+    if (j.is_string()) {
+        out = mkStringValueOwned(j.get<std::string>()); return out;
+    }
+    if (j.is_array()) {
+        ListVec * lv = Alloc::allocList(static_cast<uint32_t>(j.size()));
+        allocStats().listsAllocated++;
+        for (size_t i = 0; i < j.size(); ++i) lv->elems[i] = jsonToValue(state, j[i]);
+        out.tag_payload = static_cast<uint64_t>(Tag::List);
+        out.payload.list = lv;
+        return out;
+    }
+    if (j.is_object()) {
+        std::vector<std::pair<SymbolId, Value>> entries;
+        entries.reserve(j.size());
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            SymbolId k = vmIntern(state, it.key());
+            entries.emplace_back(k, jsonToValue(state, it.value()));
+        }
+        std::sort(entries.begin(), entries.end(),
+            [](auto & a, auto & b) { return a.first < b.first; });
+        Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+        allocStats().attrsetsAllocated++;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            b->entries[i].name = entries[i].first;
+            b->entries[i].value = entries[i].second;
+        }
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        return out;
+    }
+    throw std::runtime_error("v3 jsonToValue: unsupported JSON type");
+}
+
+/// v3 Value -> nlohmann::json.
+nlohmann::json valueToJson(EvalState & state, const Value & v)
+{
+    using json = nlohmann::json;
+    switch (v.tag()) {
+    case Tag::Null:   return json(nullptr);
+    case Tag::Bool:   return json(v.payload.i == 1);
+    case Tag::Int:    return json(v.payload.i);
+    case Tag::Float:  return json(v.payload.f);
+    case Tag::String: return json(std::string(v.payload.str));
+    case Tag::Path:   return json(std::string(v.payload.path));
+    case Tag::List: {
+        json arr = json::array();
+        if (v.payload.list)
+            for (uint32_t i = 0; i < v.payload.list->size; ++i)
+                arr.push_back(valueToJson(state, v.payload.list->elems[i]));
+        return arr;
+    }
+    case Tag::Attrs: {
+        json obj = json::object();
+        if (v.payload.bindings) {
+            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
+                auto & en = v.payload.bindings->entries[i];
+                std::string_view k = vmSymName(state, en.name);
+                obj[std::string(k)] = valueToJson(state, en.value);
+            }
+        }
+        return obj;
+    }
+    case Tag::Thunk: {
+        Value forced = forceValue(*state.vm, v);
+        return valueToJson(state, forced);
+    }
+    case Tag::Uninitialized:
+    case Tag::Closure:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
+    default:
+        throw std::runtime_error("v3 toJSON: unsupported value type");
+    }
+}
+
+void primFromJSON(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("fromJSON", "string");
+    auto j = nlohmann::json::parse(std::string(args[0].payload.str), nullptr, /*allow_exceptions=*/true);
+    out = jsonToValue(state, j);
+}
+
+void primToJSON(EvalState & state, Value * args, Value & out)
+{
+    auto j = valueToJson(state, args[0]);
+    out = mkStringValueOwned(j.dump());
+}
+
 /// builtins.sort: sort a list using a comparator.  cmp(a, b) is true if
 /// a should come before b.
 void primSort(EvalState & state, Value * args, Value & out)
@@ -1098,6 +1204,8 @@ void registerBuiltinPrimOps()
         registerPrimOp({"floor",              1, primFloor});
         registerPrimOp({"ceil",               1, primCeil});
         registerPrimOp({"parseInt",           1, primParseInt});
+        registerPrimOp({"fromJSON",           1, primFromJSON});
+        registerPrimOp({"toJSON",             1, primToJSON});
     });
 }
 
