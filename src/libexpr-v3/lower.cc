@@ -429,79 +429,7 @@ struct Lowerer
     {
         if (e->attrs->inheritFromExprs && !e->attrs->inheritFromExprs->empty())
             unsupported("let with inherit (from)");
-
-        // Pre-allocate the rec attrset's VarId.
-        ir::VarId recVar = m.freshVar();
-
-        struct Pending {
-            nix::Symbol sym;
-            nix::ExprAttrs::AttrDef::Kind kind;
-            nix::Expr * defE;
-            ir::FuncId funcIdx;
-            ir::BlockId entryBlock;
-        };
-        std::vector<Pending> pending;
-        pending.reserve(e->attrs->attrs->size());
-
-        // Pass 1: allocate FuncId + entryBlock for each binding.
-        for (auto & kv : *e->attrs->attrs) {
-            if (kv.second.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom)
-                unsupported("let with inherit (from)");
-            m.functions.emplace_back();
-            ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
-            auto eb = m.freshBlock();
-            m.functions[fid].entryBlock = eb;
-            m.functions[fid].name = std::string(symbols[kv.first]);
-            pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb});
-        }
-
-        // Build the rec scope (one entry per binding, all rec slots).
-        Scope recScope;
-        recScope.recAttrsVar = recVar;
-        recScope.recAttrsNames.reserve(pending.size());
-        for (auto & p : pending) {
-            ir::SymbolId nm = internSym(p.sym);
-            recScope.recAttrsNames.push_back(nm);
-            // byDispl[displ] = kInvalid means "use rec mechanism".
-            recScope.byDispl.push_back(ir::kInvalid);
-            recScope.byName.emplace(std::string(symbols[p.sym]), ir::kInvalid);
-        }
-
-        // Pass 2: lower each thunk body.
-        for (auto & p : pending) {
-            funcStack.push_back(p.funcIdx);
-            blockStack.push_back(p.entryBlock);
-            // Inherit's def.e was bound in the parent env; Plain's was
-            // bound in the new (rec) env.  Push rec scope only for Plain.
-            if (p.kind == nix::ExprAttrs::AttrDef::Kind::Plain)
-                scopes.push_back(recScope);
-            ir::VarId rv = lowerExpr(p.defE);
-            setReturn(rv);
-            if (p.kind == nix::ExprAttrs::AttrDef::Kind::Plain)
-                scopes.pop_back();
-            blockStack.pop_back();
-            funcStack.pop_back();
-        }
-
-        // Build LetRec IR and emit it under the prealloc'd recVar.
-        ir::LetRec letRec;
-        letRec.recVar = recVar;
-        letRec.entries.reserve(pending.size());
-        for (auto & p : pending) {
-            ir::LetRec::Entry en;
-            en.name = internSym(p.sym);
-            en.thunkBody = p.funcIdx;
-            // outerUpvalues populated by computeFreeVars later.
-            letRec.entries.push_back(std::move(en));
-        }
-        m.blocks[blockStack.back()].bindings.push_back(
-            {recVar, std::move(letRec)});
-
-        // Lower body in the rec scope.
-        scopes.push_back(std::move(recScope));
-        ir::VarId rv = lowerExpr(e->body);
-        scopes.pop_back();
-        return addBinding(ir::VarRef{rv});
+        return lowerLetRec(e->attrs->attrs.value(), /*hasBody=*/true, e->body);
     }
 
     ir::VarId lowerList(nix::ExprList * e)
@@ -512,16 +440,24 @@ struct Lowerer
         return addBinding(ir::ListExpr{std::move(elems)});
     }
 
-    /// Non-recursive attrset (`{ a = 1; b = 2; }`).  Recursive attrsets
-    /// (`rec { ... }`) require a different lowering strategy and are
-    /// rejected for now.
+    /// `{ a = 1; b = 2; }` — non-recursive: each value is evaluated
+    /// eagerly with the surrounding scope.
+    ///
+    /// `rec { a = 1; b = a + 1; }` — recursive: routed through the
+    /// same env-carrier path as `let` (lowerLetOrRec).  The result is
+    /// the rec attrset value.
     ir::VarId lowerAttrs(nix::ExprAttrs * e)
     {
-        if (e->recursive) unsupported("recursive attrset (rec { ... })");
         if (e->dynamicAttrs && !e->dynamicAttrs->empty())
             unsupported("attrset with dynamic attrs");
         if (e->inheritFromExprs && !e->inheritFromExprs->empty())
             unsupported("attrset with inherit (from)");
+
+        if (e->recursive) {
+            // Build a LetRec that ends with the rec attrset as the binding
+            // value (no body, unlike ExprLet).
+            return lowerLetRec(e->attrs.value(), /*hasBody=*/false, /*body=*/nullptr);
+        }
 
         std::vector<ir::AttrSet::Entry> entries;
         for (auto & kv : *e->attrs) {
@@ -529,18 +465,94 @@ struct Lowerer
             const auto & def = kv.second;
             if (def.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom)
                 unsupported("attrset with inherit (from)");
-            // Plain or Inherited: both store a def.e that produces the value.
             ir::VarId vv = lowerExpr(def.e);
             entries.push_back({internSym(sym), vv});
         }
         return addBinding(ir::AttrSet{std::move(entries)});
     }
 
-    /// `expr.attr` — a chain of static attribute selects.
-    /// `expr.attr or default` is supported for single-element paths; the
+    /// Shared between ExprLet and `rec { ... }`: build the rec attrset
+    /// via LetRec, optionally lower a body in the rec scope.
+    ///
+    /// Returns the body's VarId when hasBody=true, otherwise the rec
+    /// attrset's VarId.
+    ir::VarId lowerLetRec(nix::ExprAttrs::AttrDefs & attrDefs,
+                          bool hasBody, nix::Expr * body)
+    {
+        ir::VarId recVar = m.freshVar();
+
+        struct Pending {
+            nix::Symbol sym;
+            nix::ExprAttrs::AttrDef::Kind kind;
+            nix::Expr * defE;
+            ir::FuncId funcIdx;
+            ir::BlockId entryBlock;
+        };
+        std::vector<Pending> pending;
+        pending.reserve(attrDefs.size());
+
+        for (auto & kv : attrDefs) {
+            if (kv.second.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom)
+                unsupported("rec/let with inherit (from)");
+            m.functions.emplace_back();
+            ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+            auto eb = m.freshBlock();
+            m.functions[fid].entryBlock = eb;
+            m.functions[fid].name = std::string(symbols[kv.first]);
+            pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb});
+        }
+
+        Scope recScope;
+        recScope.recAttrsVar = recVar;
+        recScope.recAttrsNames.reserve(pending.size());
+        for (auto & p : pending) {
+            recScope.recAttrsNames.push_back(internSym(p.sym));
+            recScope.byDispl.push_back(ir::kInvalid);
+            recScope.byName.emplace(std::string(symbols[p.sym]), ir::kInvalid);
+        }
+
+        for (auto & p : pending) {
+            funcStack.push_back(p.funcIdx);
+            blockStack.push_back(p.entryBlock);
+            if (p.kind == nix::ExprAttrs::AttrDef::Kind::Plain)
+                scopes.push_back(recScope);
+            ir::VarId rv = lowerExpr(p.defE);
+            setReturn(rv);
+            if (p.kind == nix::ExprAttrs::AttrDef::Kind::Plain)
+                scopes.pop_back();
+            blockStack.pop_back();
+            funcStack.pop_back();
+        }
+
+        ir::LetRec letRec;
+        letRec.recVar = recVar;
+        letRec.entries.reserve(pending.size());
+        for (auto & p : pending) {
+            ir::LetRec::Entry en;
+            en.name = internSym(p.sym);
+            en.thunkBody = p.funcIdx;
+            letRec.entries.push_back(std::move(en));
+        }
+        m.blocks[blockStack.back()].bindings.push_back(
+            {recVar, std::move(letRec)});
+
+        if (!hasBody) {
+            return addBinding(ir::VarRef{recVar});
+        }
+
+        scopes.push_back(std::move(recScope));
+        ir::VarId rv = lowerExpr(body);
+        scopes.pop_back();
+        return addBinding(ir::VarRef{rv});
+    }
+
+    /// `expr.attr` — a chain of static attribute selects, each with an
+    /// implicit Force (matching nix's auto-forcing semantics).  Without
+    /// the Force, `rec { x = 1; }.x` would return a thunk Value.
+    ///
+    /// `expr.attr or default` is supported (single-element); the
     /// default is used when the attribute is absent.  Multi-element
-    /// paths with default would require short-circuiting the chain when
-    /// any HasAttr fails — deferred (still supported without default).
+    /// with default needs to short-circuit on any missing attr — TBD.
     ir::VarId lowerSelect(nix::ExprSelect * e)
     {
         ir::VarId v = lowerExpr(e->e);
@@ -553,7 +565,8 @@ struct Lowerer
             auto elseB = m.freshBlock();
             blockStack.push_back(thenB);
             ir::VarId got = addBinding(ir::AttrSelect{v, nm});
-            setReturn(got);
+            ir::VarId forced = addBinding(ir::Force{got});
+            setReturn(forced);
             blockStack.pop_back();
             blockStack.push_back(elseB);
             ir::VarId defv = lowerExpr(e->def);
@@ -566,6 +579,7 @@ struct Lowerer
         for (auto & an : path) {
             if (an.expr) unsupported("dynamic attribute name in select");
             v = addBinding(ir::AttrSelect{v, internSym(an.symbol)});
+            v = addBinding(ir::Force{v});
         }
         return v;
     }
