@@ -205,6 +205,12 @@ attrsets (`builtins.length (builtins.filter (n: builtins.isAttrs
   tree-walker: 9.06s user / 10.68s real
   v3:          8.95s user /  7.78s real  (~1% less CPU, ~27% less wall)
 
+NixOS module evaluation — full sample config with grub / firewall /
+ssh / nginx / postgresql / users / packages.  Both produce 59
+systemd services:
+  tree-walker: 0.59s user / 0.73s real
+  v3:          0.59s user / 0.75s real  (matched)
+
 Tail-call optimization: 100,000 recursive tail calls
 (`let f = n: if n == 100000 then n else f (n + 1); in f 0`) now
 runs in O(1) frame stack space.  Bounded against true infinite
