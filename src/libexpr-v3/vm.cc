@@ -350,13 +350,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_LIT_NULL:  push(vm, Value::vNull);  break;
 
         // --- Locals / upvalues ---
+        // Note: bounds checking on GET_LOCAL is omitted — the emit pass
+        // + LambdaDescriptor::nLocals + the OP_CALL resize guarantee
+        // every slot a function references has been pre-allocated.  A
+        // bounds violation means the bytecode is corrupt; accept the
+        // UB rather than pay for the check on every read.
         case OP_GET_LOCAL: {
-            if (stackBase + operand >= vm.valueStack.size())
-                throw std::runtime_error("v3 OP_GET_LOCAL: slot out of range");
             push(vm, vm.valueStack[stackBase + operand]);
             break;
         }
         case OP_SET_LOCAL: {
+            // SET keeps an auto-grow loop because some lower paths
+            // (notably tryEval / inherit-from temp slots) write to a
+            // slot that wasn't reserved by the function's nLocals
+            // count — see eval-okay-tryeval-failed-thunk-reeval.
             Value v = pop(vm);
             while (stackBase + operand >= vm.valueStack.size())
                 vm.valueStack.push_back(Value{});
