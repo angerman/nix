@@ -71,28 +71,52 @@ V3HookStats & v3HookStats()
 /// when NIX_USE_V3=1 and this hook is non-null.
 static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 {
-    v3HookStats().evalEntries++;
+    auto & st = v3HookStats();
+    st.evalEntries++;
+    bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
+    if (diag) std::fprintf(stderr, "v3 hook[%llu]: enter e=%p\n",
+                           (unsigned long long)st.evalEntries, (void*)e);
     static bool registered = (registerBuiltinPrimOps(), true);
     (void)registered;
     setNixEvalState(&state);
 
-    // Cache the compiled CU per Expr.
     auto & cache = v3HookCache();
     auto it = cache.find(e);
     const CompilationUnit * cu = nullptr;
     if (it == cache.end()) {
-        v3HookStats().cacheMisses++;
-        auto module = lowerNixExpr(e, state.symbols, state.positions);
-        ir::computeFreeVars(module);
-        auto compiled = std::make_unique<CompilationUnit>(compile(module));
-        cu = compiled.get();
-        cache.emplace(e, CachedUnit{std::move(compiled)});
+        st.cacheMisses++;
+        try {
+            auto module = lowerNixExpr(e, state.symbols, state.positions);
+            ir::computeFreeVars(module);
+            auto compiled = std::make_unique<CompilationUnit>(compile(module));
+            cu = compiled.get();
+            cache.emplace(e, CachedUnit{std::move(compiled)});
+        } catch (const std::exception & ex) {
+            if (diag) std::fprintf(stderr, "v3 hook: lower/compile threw: %s\n", ex.what());
+            // Fall back to tree-walker by calling e->eval directly.
+            // This lets us bail out cleanly when v3 hits something it
+            // can't lower (e.g. unsupported AST shape) without crashing.
+            // Tree-walker handles the rest of the evaluation.
+            e->eval(state, state.baseEnv, v);
+            return;
+        }
     } else {
-        v3HookStats().cacheHits++;
+        st.cacheHits++;
         cu = it->second.cu.get();
     }
 
-    Value r = run(*cu);
+    if (diag) std::fprintf(stderr, "v3 hook: about to run cu (%zu insts, %zu lambdas)\n",
+                           cu->code.size(), cu->lambdas.size());
+    Value r;
+    try {
+        r = run(*cu);
+    } catch (const std::exception & ex) {
+        if (diag) std::fprintf(stderr, "v3 hook: run threw: %s\n", ex.what());
+        // v3 evaluation failure — fall back to tree-walker.
+        e->eval(state, state.baseEnv, v);
+        return;
+    }
+    if (diag) std::fprintf(stderr, "v3 hook: ran, tag=%d\n", (int)r.tag());
 
     // Convert the v3 result back to a tree-walker nix::Value in
     // the caller-provided slot.  v3ToTreeWalker GC-allocates a
@@ -104,22 +128,40 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     case Tag::Float:  v.mkFloat(r.payload.f);     return;
     case Tag::Null:   v.mkNull();                 return;
     case Tag::String: v.mkString(r.payload.str ? r.payload.str : "", state.mem); return;
-    case Tag::Uninitialized:
-    case Tag::Path:
-    case Tag::Attrs:
-    case Tag::List:
     case Tag::Closure:
     case Tag::Thunk:
     case Tag::PrimOp:
     case Tag::PrimOpApp:
     case Tag::App:
     case Tag::Blackhole:
+    case Tag::Uninitialized:
     case Tag::External: {
-        // Lists / attrsets / paths / closures — delegate to the
-        // recursive bridge converter, then copy its Value into the
-        // caller's slot.
-        nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
-        if (tmp) v = *tmp; else v.mkNull();
+        // Functions / thunks can't be cleanly handed back to the
+        // tree-walker via the current bridge: v3ToTreeWalker for
+        // closures uses a hardcoded-arity primop that doesn't match
+        // the calling convention `autoCallFunction` expects.  Until
+        // CO-3 fixes the bridge, fall back to tree-walker for these.
+        if (diag) std::fprintf(stderr,
+            "v3 hook: result tag=%d, falling back to tree-walker\n",
+            (int)r.tag());
+        e->eval(state, state.baseEnv, v);
+        return;
+    }
+    case Tag::Path:
+    case Tag::Attrs:
+    case Tag::List: {
+        // Paths / attrsets / lists recursively convert via
+        // v3ToTreeWalker.  Failures are tree-walker fallback.  Note
+        // the bridge is known to crash on closures embedded inside
+        // these structures — treat any throw as a signal to fall
+        // back, and pre-emptively fall back if the bridge returns null.
+        try {
+            nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
+            if (tmp) { v = *tmp; return; }
+        } catch (const std::exception & ex) {
+            if (diag) std::fprintf(stderr, "v3 hook: bridge threw: %s\n", ex.what());
+        }
+        e->eval(state, state.baseEnv, v);
         return;
     }
     }

@@ -1,5 +1,6 @@
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/fetchers/fetch-settings.hh"
+#include "v3/install.hh"
 #include "nix/util/args/root.hh"
 #include "nix/util/current-process.hh"
 #include "nix/cmd/command.hh"
@@ -368,6 +369,11 @@ static auto rCmdHelpStores = registerCommand<CmdHelpStores>("help-stores");
 void mainWrapped(int argc, char ** argv)
 {
     savedArgv = argv;
+
+    // Install the v3 evaluator hook (no-op unless NIX_USE_V3=1).
+    // The function reference also keeps the linker from
+    // `-dead_strip_dylibs`-ing libnixexprv3 entirely.
+    nix::v3::installEvalHook();
 
     registerCrashHandler();
 

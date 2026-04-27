@@ -2215,7 +2215,19 @@ nix::Value * (*v3ToTreeWalkerShim)(nix::EvalState &, Value) = nullptr;
 struct V3ToTreeWalkerShimInit {
     V3ToTreeWalkerShimInit() {
         v3ToTreeWalkerShim = +[](nix::EvalState & ns, Value v) -> nix::Value * {
-            EvalState st; st.nixEvalState = &ns;
+            // v3ToTreeWalker calls forceValue(*state.vm, ...) on its
+            // input, so we MUST provide a VMState — otherwise the
+            // bridge dereferences a null pointer and SEGVs.  Use a
+            // thread-local VMState dedicated to bridge calls so its
+            // lifetime spans the program; multiple bridge invocations
+            // reuse the same state.  Same pattern as primV3CallBridge2.
+            static thread_local VMState bridgeShimVm;
+            bridgeShimVm.valueStack.reserve(64 * 1024);
+            bridgeShimVm.frames.reserve(4096);
+            bridgeShimVm.withStack.reserve(64);
+            EvalState st;
+            st.nixEvalState = &ns;
+            st.vm           = &bridgeShimVm;
             return v3ToTreeWalker(st, v);
         };
     }
