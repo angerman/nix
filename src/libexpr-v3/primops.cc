@@ -2019,6 +2019,69 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
                             std::unordered_map<const void *, Value> & seen);
 static Value treeWalkerToV3(EvalState & state, nix::Value & nv);
 
+// Forward declaration so primV3CallBridge1 can use it.
+static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
+
+/// 1-arg variant of the v3-closure bridge.  Used by v3ToTreeWalker
+/// for the common case (every Nix lambda is unary at the AST level;
+/// `f x y` is `(f x) y` — two separate 1-arg calls).  Looks up the
+/// v3 closure stored at `handle`, converts the single arg, calls,
+/// converts result.
+static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
+                              nix::Value ** args, nix::Value & out)
+{
+    ns.forceValue(*args[0], pos);
+    if (args[0]->type() != nix::nInt)
+        ns.error<nix::EvalError>("v3 bridge1: handle must be int").debugThrow();
+    int64_t h = args[0]->integer().value;
+    auto & tbl = v3BridgeClosures();
+    if (h < 0 || (size_t)h >= tbl.size())
+        ns.error<nix::EvalError>("v3 bridge1: invalid handle").debugThrow();
+    Value v3fn = tbl[(size_t)h];
+
+    EvalState v3state;
+    v3state.nixEvalState = &ns;
+    extern thread_local nix::EvalState * tlNixEvalState;
+    if (!tlNixEvalState) tlNixEvalState = &ns;
+
+    static thread_local VMState bridgeVm1;
+    bridgeVm1.valueStack.reserve(64 * 1024);
+    bridgeVm1.frames.reserve(4096);
+    bridgeVm1.withStack.reserve(64);
+    v3state.vm = &bridgeVm1;
+
+    ns.forceValue(*args[1], pos);
+    Value v3arg = treeWalkerToV3(v3state, *args[1]);
+    Value fn = callClosure(*v3state.vm, v3fn, v3arg);
+    fn = forceValue(*v3state.vm, fn);
+
+    // Convert the v3 result back to tree-walker.  Use the full
+    // recursive bridge so attrsets / lists / nested closures
+    // round-trip correctly.
+    switch (fn.tag()) {
+    case Tag::Bool:   out.mkBool(fn.payload.i == 1); break;
+    case Tag::Int:    out.mkInt(fn.payload.i); break;
+    case Tag::Float:  out.mkFloat(fn.payload.f); break;
+    case Tag::Null:   out.mkNull(); break;
+    case Tag::String: out.mkString(fn.payload.str ? fn.payload.str : "", ns.mem); break;
+    case Tag::Uninitialized:
+    case Tag::Path:
+    case Tag::Attrs:
+    case Tag::List:
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External: {
+        nix::Value * tmp = v3ToTreeWalker(v3state, fn);
+        if (tmp) out = *tmp; else out.mkNull();
+        break;
+    }
+    }
+}
+
 /// Tree-walker primop body: invoked when tree-walker fully applies
 /// `__v3_call_bridge_2 handle arg1 arg2`.  Look up the v3 closure
 /// stored at `handle`, convert args back to v3, call, convert result.
@@ -2157,34 +2220,30 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
     case Tag::PrimOp:
     case Tag::PrimOpApp: {
         // Bridge the v3 closure as a tree-walker primop application.
-        // We register `__v3_call_bridge_2` (arity 3: handle, arg1,
-        // arg2) once and partial-apply it to the closure's handle so
-        // tree-walker sees a 2-arg function.  Required for things
-        // like `builtins.path { filter = path: type: ...; }` where
-        // filter is the only function we currently need to bridge.
-        static nix::Value * bridgePrimOp = nullptr;
-        if (!bridgePrimOp) {
-            // Build a fresh PrimOp object on the heap and wrap it in a
-            // Value via the public mkPrimOp().  We don't go through
-            // addPrimOp (private + adds to baseEnv); we just need a
-            // standalone PrimOp callable that we can partial-apply.
+        // We register `__v3_call_bridge_1` (arity 2: handle, arg) so
+        // partial-application on the handle gives tree-walker a 1-arg
+        // function — the calling convention that autoCallFunction +
+        // ExprCall::eval expect.  The 2-arg variant is kept for the
+        // legacy `builtins.path { filter = path: type: ...; }` shape.
+        static nix::Value * bridgePrimOp1 = nullptr;
+        if (!bridgePrimOp1) {
             auto * po = new nix::PrimOp{
-                .name  = "__v3_call_bridge_2",
-                .args  = {"handle", "arg1", "arg2"},
-                .arity = 3,
+                .name  = "__v3_call_bridge_1",
+                .args  = {"handle", "arg"},
+                .arity = 2,
                 .doc   = std::nullopt,
-                .impl  = nix::fun<nix::PrimOpFun>{primV3CallBridge2},
+                .impl  = nix::fun<nix::PrimOpFun>{primV3CallBridge1},
             };
             nix::Value * v = ns.allocValue();
             v->mkPrimOp(po);
-            bridgePrimOp = v;
+            bridgePrimOp1 = v;
         }
         auto & tbl = v3BridgeClosures();
         size_t handle = tbl.size();
         tbl.push_back(v);
         nix::Value * vHandle = ns.allocValue();
         vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
-        out->mkPrimOpApp(bridgePrimOp, vHandle);
+        out->mkPrimOpApp(bridgePrimOp1, vHandle);
         break;
     }
     case Tag::Uninitialized:
