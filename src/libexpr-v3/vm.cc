@@ -50,8 +50,12 @@ inline void push(VMState & vm, Value v)
     vm.valueStack.push_back(v);
 }
 
-inline bool valueEqual(const Value & a, const Value & b)
+/// Equality with WHNF forcing — handles lazy list/attr entries.
+/// Recurses on List / Attrs after forcing each element.
+inline bool valueEqual(VMState & vm, Value a, Value b)
 {
+    a = forceValue(vm, a);
+    b = forceValue(vm, b);
     if (a.tag() != b.tag()) {
         if (a.isInt() && b.isFloat()) return static_cast<double>(a.payload.i) == b.payload.f;
         if (a.isFloat() && b.isInt()) return a.payload.f == static_cast<double>(b.payload.i);
@@ -72,7 +76,7 @@ inline bool valueEqual(const Value & a, const Value & b)
         uint32_t nb = lb ? lb->size : 0;
         if (na != nb) return false;
         for (uint32_t i = 0; i < na; ++i)
-            if (!valueEqual(la->elems[i], lb->elems[i])) return false;
+            if (!valueEqual(vm, la->elems[i], lb->elems[i])) return false;
         return true;
     }
     case Tag::Attrs: {
@@ -84,7 +88,7 @@ inline bool valueEqual(const Value & a, const Value & b)
         if (na != nb) return false;
         for (uint32_t i = 0; i < na; ++i) {
             if (aa->entries[i].name != bb->entries[i].name) return false;
-            if (!valueEqual(aa->entries[i].value, bb->entries[i].value)) return false;
+            if (!valueEqual(vm, aa->entries[i].value, bb->entries[i].value)) return false;
         }
         return true;
     }
@@ -375,8 +379,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
 
         // --- Comparison ---
-        case OP_EQ:  { Value b = pop(vm), a = pop(vm); Value r; r = valueEqual(a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break; }
-        case OP_NEQ: { Value b = pop(vm), a = pop(vm); Value r; r = valueEqual(a, b) ? Value::vFalse : Value::vTrue; push(vm, r); break; }
+        case OP_EQ:  { Value b = pop(vm), a = pop(vm); Value r; r = valueEqual(vm, a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break; }
+        case OP_NEQ: { Value b = pop(vm), a = pop(vm); Value r; r = valueEqual(vm, a, b) ? Value::vFalse : Value::vTrue; push(vm, r); break; }
         case OP_LESS:{ Value b = pop(vm), a = pop(vm); Value r; r = valueLess(a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break; }
 
         // --- Boolean / branches ---

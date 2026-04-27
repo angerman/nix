@@ -77,8 +77,10 @@ std::mutex & registryMutex()
     throw std::runtime_error("v3 primop " + std::string(op) + ": expected " + std::string(expected));
 }
 
-inline bool valueEqual(const Value & a, const Value & b)
+inline bool valueEqual(VMState & vm, Value a, Value b)
 {
+    a = forceValue(vm, a);
+    b = forceValue(vm, b);
     if (a.tag() != b.tag()) {
         if (a.isInt() && b.isFloat()) return static_cast<double>(a.payload.i) == b.payload.f;
         if (a.isFloat() && b.isInt()) return a.payload.f == static_cast<double>(b.payload.i);
@@ -97,7 +99,7 @@ inline bool valueEqual(const Value & a, const Value & b)
         uint32_t na = la ? la->size : 0; uint32_t nb = lb ? lb->size : 0;
         if (na != nb) return false;
         for (uint32_t i = 0; i < na; ++i)
-            if (!valueEqual(la->elems[i], lb->elems[i])) return false;
+            if (!valueEqual(vm, la->elems[i], lb->elems[i])) return false;
         return true;
     }
     case Tag::Attrs: {
@@ -107,7 +109,7 @@ inline bool valueEqual(const Value & a, const Value & b)
         if (na != nb) return false;
         for (uint32_t i = 0; i < na; ++i) {
             if (aa->entries[i].name != bb->entries[i].name) return false;
-            if (!valueEqual(aa->entries[i].value, bb->entries[i].value)) return false;
+            if (!valueEqual(vm, aa->entries[i].value, bb->entries[i].value)) return false;
         }
         return true;
     }
@@ -748,15 +750,15 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     out.payload.bindings = result;
 }
 
-void primElem(EvalState &, Value * args, Value & out)
+void primElem(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("elem", "list");
     auto * src = args[1].payload.list;
-    const Value & x = args[0];
+    Value x = args[0];
     bool found = false;
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
-            if (valueEqual(x, src->elems[i])) { found = true; break; }
+            if (valueEqual(*state.vm, x, src->elems[i])) { found = true; break; }
         }
     }
     out = found ? Value::vTrue : Value::vFalse;
