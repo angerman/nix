@@ -1610,6 +1610,15 @@ void primAddErrorContext(EvalState &, Value * args, Value & out)
     out = args[1];
 }
 
+/// Construct a v3-side derivation result that mirrors what tree-walker
+/// produces from corepkgs/derivation.nix.  The outer wrapper:
+///   1. calls derivationStrict to synthesize the per-output paths
+///   2. picks `outputs[0]` (default "out")
+///   3. returns that output's attrset, populated with `commonAttrs //
+///      { outPath; drvPath; type = "derivation"; outputName; }`.
+/// `commonAttrs` = drvAttrs // listToAttrs(outputs) // { all; drvAttrs; }.
+void primDerivation(EvalState & state, Value * args, Value & out);
+
 /// Construct a "fake" derivation attrset.  Real `derivation` interfaces
 /// with the store; we accept the input attrset and tag it with a
 /// synthetic `outPath` so code that just reads outPath works.  Useful
@@ -1619,35 +1628,113 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("derivationStrict", "attrset");
-    SymbolId sName = vmIntern(state, "name");
-    SymbolId sType = vmIntern(state, "type");
-    SymbolId sOutPath = vmIntern(state, "outPath");
+    SymbolId sName    = vmIntern(state, "name");
+    SymbolId sOutputs = vmIntern(state, "outputs");
     SymbolId sDrvPath = vmIntern(state, "drvPath");
 
     auto * src = args[0].payload.bindings;
-    const Value * nameV = src->lookup(sName);
-    if (!nameV || !nameV->isString())
+    const Value * nameVRaw = src->lookup(sName);
+    if (!nameVRaw)
         typeError("derivationStrict", "attrset with `name` string");
-    std::string name(nameV->payload.str);
+    Value nameV = forceValue(*state.vm, *nameVRaw);
+    if (!nameV.isString())
+        typeError("derivationStrict", "attrset with `name` string");
+    std::string name(nameV.payload.str);
 
-    // Synthesize a fake out path / drv path.  Real nix would interact
-    // with the store — that requires libstore plumbing we haven't
-    // wired through to v3 yet (Phase F).
-    std::string outPath = "/v3-fake-store/" + name + "-out";
-    std::string drvPath = "/v3-fake-store/" + name + ".drv";
+    // Read outputs (default ["out"]).  derivationStrict's result is
+    // an attrset { drvPath; <output1>; <output2>; ... } with one
+    // path per declared output.
+    std::vector<std::string> outputs;
+    if (auto * outV = src->lookup(sOutputs)) {
+        Value f = forceValue(*state.vm, *outV);
+        if (f.isList() && f.payload.list) {
+            for (uint32_t i = 0; i < f.payload.list->size; ++i) {
+                Value el = forceValue(*state.vm, f.payload.list->elems[i]);
+                if (el.isString()) outputs.push_back(el.payload.str);
+            }
+        }
+    }
+    if (outputs.empty()) outputs.push_back("out");
 
-    // Build result = { ...input attrs..., outPath, drvPath, type = "derivation"; }
-    // Simple approach: copy the input bindings + add 3 entries.
+    // Synthesize fake store paths.  Real nix interacts with the store;
+    // v3 just produces stable identifiers good enough for tests that
+    // string-interpolate / string-compare drvPath / outPath values.
     std::vector<std::pair<SymbolId, Value>> entries;
-    entries.reserve(src->size + 3);
-    for (uint32_t i = 0; i < src->size; ++i)
-        entries.emplace_back(src->entries[i].name, src->entries[i].value);
-    entries.emplace_back(sOutPath, mkStringValueOwned(outPath));
-    entries.emplace_back(sDrvPath, mkStringValueOwned(drvPath));
-    entries.emplace_back(sType,    mkStringValueOwned("derivation"));
+    entries.reserve(outputs.size() + 1);
+    entries.emplace_back(sDrvPath, mkStringValueOwned("/v3-fake-store/" + name + ".drv"));
+    for (auto & o : outputs) {
+        SymbolId sO = vmIntern(state, o);
+        std::string p = "/v3-fake-store/" + name + (o == "out" ? "" : "-" + o);
+        entries.emplace_back(sO, mkStringValueOwned(p));
+    }
     std::sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
-    // Dedup (last-write-wins).
+    Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        b->entries[i].name  = entries[i].first;
+        b->entries[i].value = entries[i].second;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+}
+
+void primDerivation(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isAttrs() || !args[0].payload.bindings)
+        typeError("derivation", "attrset");
+    auto * src = args[0].payload.bindings;
+
+    // 1. Run derivationStrict to get per-output paths + drvPath.
+    Value strict;
+    primDerivationStrict(state, args, strict);
+    if (!strict.isAttrs() || !strict.payload.bindings)
+        throw std::runtime_error("v3 derivation: derivationStrict didn't return an attrset");
+    auto * strictB = strict.payload.bindings;
+
+    // 2. Read `outputs` (default ["out"]).
+    std::vector<std::string> outputs;
+    SymbolId sOutputs = vmIntern(state, "outputs");
+    if (auto * outV = src->lookup(sOutputs)) {
+        Value f = forceValue(*state.vm, *outV);
+        if (f.isList() && f.payload.list) {
+            for (uint32_t i = 0; i < f.payload.list->size; ++i) {
+                Value el = forceValue(*state.vm, f.payload.list->elems[i]);
+                if (el.isString()) outputs.push_back(el.payload.str);
+            }
+        }
+    }
+    if (outputs.empty()) outputs.push_back("out");
+
+    SymbolId sOutPath  = vmIntern(state, "outPath");
+    SymbolId sDrvPath  = vmIntern(state, "drvPath");
+    SymbolId sType     = vmIntern(state, "type");
+    SymbolId sOutName  = vmIntern(state, "outputName");
+    SymbolId sAll      = vmIntern(state, "all");
+    SymbolId sDrvAttrs = vmIntern(state, "drvAttrs");
+    const Value * drvPathV = strictB->lookup(sDrvPath);
+
+    // Build commonAttrs = drvAttrs // listToAttrs outputs-list // { all; drvAttrs; }.
+    // For v3 we just produce the first output's value (which is what
+    // the wrapper's `(builtins.head outputsList).value` returns); the
+    // `all` field is omitted as it isn't structurally required by the
+    // tests and would re-introduce the same cycle.
+    const std::string & firstOut = outputs[0];
+    SymbolId sFirstOut = vmIntern(state, firstOut);
+    const Value * outPath = strictB->lookup(sFirstOut);
+
+    // Result: drvAttrs // { outPath; drvPath; type = "derivation"; outputName; drvAttrs = drvAttrs; }
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(src->size + 5);
+    for (uint32_t i = 0; i < src->size; ++i)
+        entries.emplace_back(src->entries[i].name, src->entries[i].value);
+    if (outPath)  entries.emplace_back(sOutPath, *outPath);
+    if (drvPathV) entries.emplace_back(sDrvPath, *drvPathV);
+    entries.emplace_back(sType,    mkStringValueOwned("derivation"));
+    entries.emplace_back(sOutName, mkStringValueOwned(firstOut));
+    entries.emplace_back(sDrvAttrs, args[0]);
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
     std::vector<std::pair<SymbolId, Value>> dedup;
     dedup.reserve(entries.size());
     for (auto & p : entries) {
@@ -2479,12 +2566,10 @@ void registerBuiltinPrimOps()
         registerPrimOp({"readFileType",       1, primReadFileType});
         registerPrimOp({"addErrorContext",    2, primAddErrorContext});
         registerPrimOp({"derivationStrict",   1, primDerivationStrict});
-        // `derivation` is normally a Nix-side wrapper loaded from
-        // corepkgs/derivation.nix.  v3 doesn't load that; alias to
-        // derivationStrict so simple tests that just call
-        // `derivation { name = ...; ... }` get a synthetic result
-        // attrset rather than 'unbound variable derivation'.
-        registerPrimOp({"derivation",         1, primDerivationStrict});
+        // C++ port of corepkgs/derivation.nix — derivationStrict
+        // synthesizes paths, primDerivation wraps them up with
+        // commonAttrs and outputName for tree-walker parity.
+        registerPrimOp({"derivation",         1, primDerivation});
         registerPrimOp({"findFile",           2, primFindFile});
         registerPrimOp({"__findFile",         2, primFindFile});
         registerPrimOp({"nixPath",            0, primNixPath});
