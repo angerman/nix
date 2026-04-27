@@ -95,7 +95,7 @@ struct Alloc
         auto * c = static_cast<Closure *>(std::malloc(bytes));
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
-        c->withEnv = nullptr;
+        c->capturedWiths = nullptr;
         return c;
     }
 
@@ -107,6 +107,7 @@ struct Alloc
         auto * t = static_cast<Thunk *>(std::malloc(bytes));
         t->state = ThunkState::Suspended;
         t->nUpvalues = nUpvalues;
+        t->suspended.capturedWiths = nullptr;
         return t;
     }
 

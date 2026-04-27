@@ -110,8 +110,11 @@ struct Lowerer
     /// the variable lives in the base env (i.e., is a primop) — caller
     /// should fall back to primop lookup by symbol name.
     ///
-    /// For rec scopes, this emits AttrSelect+Force on the rec attrset
-    /// and returns the forced value's VarId.
+    /// For rec scopes, returns AttrSelect on the rec attrset WITHOUT
+    /// forcing.  Callers in strict contexts (arithmetic, comparison,
+    /// AttrSelect of `.x`, etc.) wrap the result in Force themselves.
+    /// Lazy contexts (function call arguments) leave the value as a
+    /// thunk so patterns like `fix = f: let x = f x; in x;` work.
     ir::VarId resolveVar(uint32_t level, uint32_t displ)
     {
         if (level >= scopes.size()) return ir::kInvalid;
@@ -125,11 +128,14 @@ struct Lowerer
         {
             ir::VarId rec = scopes[scopeIdx].recAttrsVar;
             ir::SymbolId nm = scopes[scopeIdx].recAttrsNames[displ];
-            ir::VarId sel = addBinding(ir::AttrSelect{rec, nm});
-            return addBinding(ir::Force{sel});
+            return addBinding(ir::AttrSelect{rec, nm});
         }
         return ir::kInvalid;
     }
+
+    /// Wrap a VarId in a Force if it might not be in WHNF.  Cheap:
+    /// Force on a non-thunk is a no-op at runtime.
+    ir::VarId forceVal(ir::VarId v) { return addBinding(ir::Force{v}); }
 
     /// True iff `e` is an ExprVar whose level resolves outside any user
     /// scope — i.e., it's a base-env primop reference.
@@ -178,7 +184,7 @@ struct Lowerer
         // outside any user scope" — i.e., scopes.empty() means we should
         // look up the symbol as a primop, not as a user binding.
 
-        ir::VarId rv = lowerExpr(e);
+        ir::VarId rv = forceVal(lowerExpr(e));
         setReturn(rv);
         return std::move(m);
     }
@@ -275,7 +281,7 @@ struct Lowerer
     }
     ir::VarId lowerIf(nix::ExprIf * e)
     {
-        ir::VarId cond = lowerExpr(e->cond);
+        ir::VarId cond = forceVal(lowerExpr(e->cond));
 
         auto thenB = m.freshBlock();
         auto elseB = m.freshBlock();
@@ -400,7 +406,8 @@ struct Lowerer
             // tryEval needs its arg evaluated lazily (the whole point is
             // to catch errors raised during forcing).  Wrap the arg in a
             // MkThunk that defers its evaluation until tryEval forces it.
-            const bool isTryEval = std::string_view(po->name) == "tryEval";
+            const std::string_view name(po->name);
+            const bool isTryEval = name == "tryEval";
 
             std::vector<ir::VarId> args;
             args.reserve(po->arity);
@@ -408,16 +415,29 @@ struct Lowerer
                 if (isTryEval) {
                     args.push_back(thunkify(a));
                 } else {
-                    args.push_back(lowerExpr(a));
+                    // Most v3 primops expect WHNF args (they read
+                    // .payload.i/.f/etc directly without forcing).  Force
+                    // here so a primop never sees a thunk.  Higher-order
+                    // primops still receive closures intact since
+                    // forcing a closure is a no-op.
+                    args.push_back(forceVal(lowerExpr(a)));
                 }
             }
             return addBinding(ir::PrimOpCall{po, std::move(args)});
         }
-        // Generic application via OP_CALL.
-        ir::VarId f = lowerExpr(e->fun);
+        // Generic application via OP_CALL.  Force the callee (must be
+        // a closure / primop / PrimOpApp).  Leave each argument lazy
+        // — function bodies that require their args evaluated will
+        // force at use sites.
+        ir::VarId f = forceVal(lowerExpr(e->fun));
         for (auto * a : *e->args) {
             ir::VarId av = lowerExpr(a);
             f = addBinding(ir::App{f, av});
+            // After this App, the result might be a closure (curried)
+            // or the applied value.  Force before the next App so the
+            // chain calls a real closure each step.
+            if (a != e->args->back())
+                f = forceVal(f);
         }
         return f;
     }
@@ -445,7 +465,7 @@ struct Lowerer
     }
     ir::VarId lowerNot(nix::ExprOpNot * e)
     {
-        return addBinding(ir::Not{lowerExpr(e->e)});
+        return addBinding(ir::Not{forceVal(lowerExpr(e->e))});
     }
 
     /// ExprInheritFrom — synthesized by the parser to represent the
@@ -468,14 +488,15 @@ struct Lowerer
     {
         std::vector<ir::VarId> parts;
         parts.reserve(e->es.size());
-        for (auto & p : e->es) parts.push_back(lowerExpr(p.second));
+        for (auto & p : e->es) parts.push_back(forceVal(lowerExpr(p.second)));
         return addBinding(ir::ConcatStrings{std::move(parts), e->forceString});
     }
     template<class AstNode, class IRNode>
     ir::VarId lowerBinOp(AstNode * e, IRNode)
     {
-        ir::VarId a = lowerExpr(e->e1);
-        ir::VarId b = lowerExpr(e->e2);
+        // Strict binary op: force both operands so the VM ops see WHNF.
+        ir::VarId a = forceVal(lowerExpr(e->e1));
+        ir::VarId b = forceVal(lowerExpr(e->e2));
         IRNode op{a, b};
         return addBinding(op);
     }
@@ -550,7 +571,9 @@ struct Lowerer
             }
             dyn.dynamics.reserve(e->dynamicAttrs->size());
             for (auto & da : *e->dynamicAttrs) {
-                ir::VarId nameV = lowerExpr(da.nameExpr);
+                // Dynamic-name expression must evaluate to a string —
+                // strict context, force.
+                ir::VarId nameV = forceVal(lowerExpr(da.nameExpr));
                 ir::VarId valV  = lowerExpr(da.valueExpr);
                 dyn.dynamics.push_back({nameV, valV});
             }
@@ -729,6 +752,10 @@ struct Lowerer
             unsupported("dynamic attribute name in select");
         ir::SymbolId nm = internSym(path[pathIdx].symbol);
 
+        // attrs must be in WHNF for AttrSelect/HasAttr to work.  Force
+        // it once at each chain step.
+        attrs = forceVal(attrs);
+
         if (defaultExpr) {
             ir::VarId hasIt = addBinding(ir::HasAttr{attrs, nm});
             auto thenB = m.freshBlock();
@@ -736,8 +763,7 @@ struct Lowerer
 
             blockStack.push_back(thenB);
             ir::VarId got = addBinding(ir::AttrSelect{attrs, nm});
-            ir::VarId forced = addBinding(ir::Force{got});
-            ir::VarId rest = emitSelectChain(forced, path, defaultExpr, pathIdx + 1);
+            ir::VarId rest = emitSelectChain(got, path, defaultExpr, pathIdx + 1);
             setReturn(rest);
             blockStack.pop_back();
 
@@ -750,7 +776,6 @@ struct Lowerer
         }
 
         ir::VarId v = addBinding(ir::AttrSelect{attrs, nm});
-        v = addBinding(ir::Force{v});
         return emitSelectChain(v, path, nullptr, pathIdx + 1);
     }
 
@@ -759,13 +784,13 @@ struct Lowerer
         if (e->attrPath.size() != 1) unsupported("has-attr with multi-element path");
         auto & an = e->attrPath[0];
         if (an.expr) unsupported("dynamic attribute name in hasAttr");
-        ir::VarId v = lowerExpr(e->e);
+        ir::VarId v = forceVal(lowerExpr(e->e));
         return addBinding(ir::HasAttr{v, internSym(an.symbol)});
     }
 
     ir::VarId lowerAssert(nix::ExprAssert * e)
     {
-        ir::VarId cond = lowerExpr(e->cond);
+        ir::VarId cond = forceVal(lowerExpr(e->cond));
         auto bodyB = m.freshBlock();
         blockStack.push_back(bodyB);
         ir::VarId rv = lowerExpr(e->body);
@@ -776,10 +801,19 @@ struct Lowerer
 
     ir::VarId lowerWith(nix::ExprWith * e)
     {
-        ir::VarId attrs = lowerExpr(e->attrs);
+        // The attrs expression is evaluated OUTSIDE the with's scope —
+        // do this before pushing the placeholder so its var lookups use
+        // the surrounding level numbering.
+        ir::VarId attrs = forceVal(lowerExpr(e->attrs));
         auto bodyB = m.freshBlock();
         blockStack.push_back(bodyB);
+        // Push an empty placeholder scope: nix's bindVars counts the
+        // with's env as a level when resolving ExprVar in the body, so
+        // v3's `scopes` stack must match that depth or resolveVar's
+        // (level, displ) lookup falls off the end.
+        scopes.emplace_back();
         ir::VarId rv = lowerExpr(e->body);
+        scopes.pop_back();
         setReturn(rv);
         blockStack.pop_back();
         return addBinding(ir::With{attrs, bodyB});

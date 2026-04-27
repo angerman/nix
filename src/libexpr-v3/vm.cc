@@ -168,20 +168,45 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
 }
 
 /// Look up `name` in the with-stack, walking from top (innermost) outward.
-/// Returns the Value (or throws if not found).  `depth` skips that many
-/// innermost entries (currently unused — the static analysis hint isn't
-/// trusted yet).
-inline Value withLookup(VMState & vm, SymbolId name, uint32_t depth)
+/// Bounded below by the current frame's `withStackBase`: a closure must
+/// not see its caller's `with` scopes.  `depth` is currently unused.
+inline Value withLookup(VMState & vm, SymbolId name, uint32_t /*depth*/)
 {
-    if (depth >= vm.withStack.size())
-        throw std::runtime_error("v3 OP_WITH_LOOKUP: depth exceeds with-stack size");
-    for (size_t i = vm.withStack.size(); i-- > depth; ) {
+    size_t base = vm.frames.empty() ? 0 : vm.frames.back().withStackBase;
+    for (size_t i = vm.withStack.size(); i-- > base; ) {
         const Value & w = vm.withStack[i];
         if (!w.isAttrs()) continue;
         if (auto * v = w.payload.bindings->lookup(name))
             return *v;
     }
     throw std::runtime_error("v3 OP_WITH_LOOKUP: name not found in with-scope");
+}
+
+/// Snapshot the current frame's visible with-stack (entries from
+/// `withStackBase` to top) into a fresh ListVec.  Returns nullptr when
+/// no withs are currently in scope (cheap fast-path for the common case
+/// of no enclosing `with`).
+inline ListVec * snapshotCurrentWiths(VMState & vm)
+{
+    size_t base = vm.frames.empty() ? 0 : vm.frames.back().withStackBase;
+    size_t top  = vm.withStack.size();
+    if (top <= base) return nullptr;
+    uint32_t n = static_cast<uint32_t>(top - base);
+    ListVec * out = Alloc::allocList(n);
+    for (uint32_t i = 0; i < n; ++i)
+        out->elems[i] = vm.withStack[base + i];
+    return out;
+}
+
+/// Push a closure/thunk's captured with-stack onto vm.withStack so it
+/// becomes visible to the body's OP_WITH_LOOKUPs.  The caller must have
+/// already set the new frame's withStackBase to vm.withStack.size()
+/// BEFORE calling this so the floor is correct.
+inline void pushCapturedWiths(VMState & vm, ListVec * capturedWiths)
+{
+    if (!capturedWiths) return;
+    for (uint32_t i = 0; i < capturedWiths->size; ++i)
+        vm.withStack.push_back(capturedWiths->elems[i]);
 }
 
 } // namespace
@@ -369,6 +394,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             allocStats().closuresAllocated++;
             c->desc = &cu->lambdas[funcIdx];
             c->nUpvalues = nUp;
+            c->capturedWiths = snapshotCurrentWiths(vm);
             for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
             Value v; v.mkClosure(c); push(vm, v);
             break;
@@ -382,7 +408,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
             t->suspended.desc = reinterpret_cast<const ThunkDescriptor *>(&cu->lambdas[funcIdx]);
-            t->suspended.withEnv = nullptr;
+            t->suspended.capturedWiths = snapshotCurrentWiths(vm);
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Thunk);
@@ -434,6 +460,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 break;
             }
 
+            // __functor: applying an attrset that has a `__functor`
+            // attribute calls `__functor self arg` per the standard
+            // Nix protocol.  Push (functor, attrset, arg) and re-enter
+            // OP_CALL twice to match the curried call sequence.
+            if (fun.isAttrs()) {
+                static SymbolId functorId = static_cast<SymbolId>(-1);
+                if (functorId == static_cast<SymbolId>(-1)) {
+                    for (size_t s = 0; s < cu->symbolTable.size(); ++s)
+                        if (cu->symbolTable[s] == "__functor") {
+                            functorId = static_cast<SymbolId>(s);
+                            break;
+                        }
+                }
+                if (functorId == static_cast<SymbolId>(-1) || !fun.payload.bindings)
+                    throw std::runtime_error("v3 OP_CALL: callee is an attrset without __functor");
+                const Value * fn = fun.payload.bindings->lookup(functorId);
+                if (!fn)
+                    throw std::runtime_error("v3 OP_CALL: callee is an attrset without __functor");
+                Value forced = forceValue(vm, *fn);
+                // First apply functor to self (= the attrset).
+                Value firstStep = callClosure(vm, forced, fun);
+                // Then apply that result to the original arg.
+                Value out = callClosure(vm, firstStep, arg);
+                push(vm, out);
+                break;
+            }
+
             if (!fun.isClosure())
                 throw std::runtime_error("v3 OP_CALL: callee is not a closure");
             const Closure * callee = fun.payload.closure;
@@ -445,6 +498,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             vm.valueStack.resize(newBase + desc->nLocals);
             vm.valueStack[newBase + 0] = arg;
 
+            uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
             vm.frames.push_back(CallFrame{
                 .cu = cu,
                 .ip = desc->codeOffset,
@@ -455,7 +509,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 .closure = callee,
                 .resultPtr = nullptr,
                 .thunk = nullptr,
+                .withStackBase = newWithBase,
             });
+            pushCapturedWiths(vm, callee->capturedWiths);
 
             ip = desc->codeOffset;
             closure = callee;
@@ -464,17 +520,75 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_RETURN: {
             Value retVal = pop(vm);
-            // Pop callee's locals.
             CallFrame fr = vm.frames.back();
             vm.valueStack.resize(fr.stackBaseOffset);
+            // Restore caller's with-stack: anything pushed during this
+            // frame (the captured snapshot + any local OP_WITH_PUSHes
+            // that weren't paired with OP_WITH_POPs by OP_RETURN time)
+            // is dropped.
+            vm.withStack.resize(fr.withStackBase);
             vm.frames.pop_back();
-            // If this was a thunk-return frame, write the result back into the thunk.
             if (fr.flags & CFF_THUNK_RETURN) {
+                // Chase Evaluated chains so the thunk caches the
+                // ultimate WHNF and not an intermediate thunk.
+                while (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Evaluated)
+                    retVal = retVal.payload.thunk->evaluated;
                 fr.thunk->state = ThunkState::Evaluated;
                 fr.thunk->evaluated = retVal;
+
+                // If the body returned a Suspended thunk (e.g., the
+                // common pattern where an `inherit` binding's body is
+                // just AttrSelect on the parent's rec attrs), force
+                // that next by setting up another thunk-return frame.
+                // This implements transitive force for the OP_FORCE
+                // bytecode op without C++ recursion.
+                if (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Suspended) {
+                    Thunk * next = retVal.payload.thunk;
+                    const LambdaDescriptor * desc =
+                        reinterpret_cast<const LambdaDescriptor *>(next->suspended.desc);
+                    Closure * fakeClo = Alloc::allocClosure(next->nUpvalues);
+                    fakeClo->desc = desc;
+                    fakeClo->nUpvalues = next->nUpvalues;
+                    fakeClo->capturedWiths = next->suspended.capturedWiths;
+                    for (uint16_t i = 0; i < next->nUpvalues; ++i)
+                        fakeClo->upvalues[i] = next->tail[i];
+                    next->state = ThunkState::Blackhole;
+
+                    size_t newBase = vm.valueStack.size();
+                    vm.valueStack.resize(newBase + desc->nLocals);
+                    uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+                    vm.frames.push_back(CallFrame{
+                        .cu = cu,
+                        .ip = desc->codeOffset,
+                        .resultSlot = 0,
+                        .flags = CFF_THUNK_RETURN,
+                        ._pad0 = 0,
+                        .stackBaseOffset = static_cast<uint32_t>(newBase),
+                        .closure = fakeClo,
+                        .resultPtr = nullptr,
+                        .thunk = next,
+                        .withStackBase = newWithBase,
+                    });
+                    pushCapturedWiths(vm, next->suspended.capturedWiths);
+                    ip = desc->codeOffset;
+                    closure = fakeClo;
+                    stackBase = newBase;
+                    // Also write the deeper resolution back to the
+                    // outer thunk we just popped: when the next thunk
+                    // resolves, it'll re-loop and update the original.
+                    // Actually we already set fr.thunk->evaluated to
+                    // retVal (which is the next thunk).  When next
+                    // resolves and the chase loop runs above, it'll
+                    // walk back through fr.thunk.  But fr.thunk is no
+                    // longer in `next->...` — so we need a chain of
+                    // references.  Simpler: leave fr.thunk pointing at
+                    // retVal; when next becomes Evaluated, the next
+                    // chase step (in any subsequent OP_RETURN's loop or
+                    // forceValue helper) follows from fr.thunk → next →
+                    // its eval.
+                    break;
+                }
             }
-            // Inner-loop exit: when called from a primop callback, exit
-            // back to the C++ caller with the return value.
             if (vm.frames.size() == exitDepth) {
                 finalResult = retVal;
                 running = false;
@@ -504,14 +618,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
             fakeClo->desc = desc;
             fakeClo->nUpvalues = t->nUpvalues;
+            fakeClo->capturedWiths = t->suspended.capturedWiths;
             for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
 
+            ListVec * thunkWiths = t->suspended.capturedWiths;
             t->state = ThunkState::Blackhole;
 
             vm.frames.back().ip = ip;
 
             size_t newBase = vm.valueStack.size();
             vm.valueStack.resize(newBase + desc->nLocals);
+            uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
 
             vm.frames.push_back(CallFrame{
                 .cu = cu,
@@ -523,7 +640,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 .closure = fakeClo,
                 .resultPtr = nullptr,
                 .thunk = t,
+                .withStackBase = newWithBase,
             });
+            pushCapturedWiths(vm, thunkWiths);
 
             ip = desc->codeOffset;
             closure = fakeClo;
@@ -874,36 +993,46 @@ Value run(const CompilationUnit & rootCu)
 
 Value forceValue(VMState & vm, Value v)
 {
-    if (!v.isThunk()) return v;
-    Thunk * t = v.payload.thunk;
-    if (t->state == ThunkState::Evaluated) return t->evaluated;
-    if (t->state == ThunkState::Blackhole)
-        throw std::runtime_error("v3 forceValue: infinite recursion (blackhole)");
+    // Loop until WHNF: a thunk's body might itself yield a thunk
+    // (e.g., `let inherit outer; in outer` returns the outer thunk),
+    // and we want to chase the chain until we land on a real value.
+    while (v.isThunk()) {
+        Thunk * t = v.payload.thunk;
+        if (t->state == ThunkState::Evaluated) { v = t->evaluated; continue; }
+        if (t->state == ThunkState::Blackhole)
+            throw std::runtime_error("v3 forceValue: infinite recursion (blackhole)");
 
-    const LambdaDescriptor * desc = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
-    Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
-    fakeClo->desc = desc;
-    fakeClo->nUpvalues = t->nUpvalues;
-    for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
-    t->state = ThunkState::Blackhole;
+        const LambdaDescriptor * desc = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+        Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
+        fakeClo->desc = desc;
+        fakeClo->nUpvalues = t->nUpvalues;
+        fakeClo->capturedWiths = t->suspended.capturedWiths;
+        for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
+        ListVec * thunkWiths = t->suspended.capturedWiths;
+        t->state = ThunkState::Blackhole;
 
-    size_t exitDepth = vm.frames.size();
-    size_t newBase = vm.valueStack.size();
-    vm.valueStack.resize(newBase + desc->nLocals);
+        size_t exitDepth = vm.frames.size();
+        size_t newBase = vm.valueStack.size();
+        vm.valueStack.resize(newBase + desc->nLocals);
+        uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
 
-    vm.frames.push_back(CallFrame{
-        .cu = vm.frames.back().cu,
-        .ip = desc->codeOffset,
-        .resultSlot = 0,
-        .flags = CFF_THUNK_RETURN,
-        ._pad0 = 0,
-        .stackBaseOffset = static_cast<uint32_t>(newBase),
-        .closure = fakeClo,
-        .resultPtr = nullptr,
-        .thunk = t,
-    });
+        vm.frames.push_back(CallFrame{
+            .cu = vm.frames.back().cu,
+            .ip = desc->codeOffset,
+            .resultSlot = 0,
+            .flags = CFF_THUNK_RETURN,
+            ._pad0 = 0,
+            .stackBaseOffset = static_cast<uint32_t>(newBase),
+            .closure = fakeClo,
+            .resultPtr = nullptr,
+            .thunk = t,
+            .withStackBase = newWithBase,
+        });
+        pushCapturedWiths(vm, thunkWiths);
 
-    return dispatchLoop(vm, exitDepth);
+        v = dispatchLoop(vm, exitDepth);
+    }
+    return v;
 }
 
 Value callClosure(VMState & vm, Value fun, Value arg)
@@ -932,6 +1061,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     size_t newBase = vm.valueStack.size();
     vm.valueStack.resize(newBase + desc->nLocals);
     vm.valueStack[newBase + 0] = arg;
+    uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
 
     vm.frames.push_back(CallFrame{
         .cu = cu,
@@ -943,7 +1073,9 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         .closure = callee,
         .resultPtr = nullptr,
         .thunk = nullptr,
+        .withStackBase = newWithBase,
     });
+    pushCapturedWiths(vm, callee->capturedWiths);
 
     return dispatchLoop(vm, exitDepth);
 }

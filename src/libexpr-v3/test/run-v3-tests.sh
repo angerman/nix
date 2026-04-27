@@ -117,6 +117,60 @@ TESTS=(
 
   # Dynamic attrs
   'let n = "key"; in { ${n} = 42; }.key'
+
+  # Mutual recursion in rec attrset
+  'rec { even = n: if n == 0 then true else odd (n - 1); odd = n: if n == 0 then false else even (n - 1); result = even 10; }.result'
+
+  # fix combinator (recursion via knot tying)
+  'let fix = f: let x = f x; in x; in (fix (self: n: if n == 0 then 1 else n * self (n - 1))) 6'
+
+  # Forward reference in rec attrset
+  'rec { x = y; y = 99; }.x'
+
+  # Nested rec
+  'rec { x = 1; y = rec { a = x + 1; b = a + 1; }; }.y.b'
+
+  # Cross-rec attr selection
+  'rec { a = { p = b.q; }; b = { q = 7; }; }.a.p'
+
+  # Deep let nesting
+  'let a = let b = let c = 1 + 2; in c * 2; in b + 1; in a'
+
+  # Higher-order with mutual recursion through closure capture
+  'let foldList = f: init: xs: if builtins.length xs == 0 then init else f (builtins.head xs) (foldList f init (builtins.tail xs)); in foldList (a: b: a + b) 0 [1 2 3 4 5]'
+
+  # genericClosure
+  '(builtins.genericClosure { startSet = [{key = 1;}]; operator = e: if e.key < 5 then [{key = e.key + 1;}] else []; })'
+
+  # mapAttrs / attrValues / attrNames
+  'builtins.attrNames (builtins.mapAttrs (k: v: v + 1) { a = 1; b = 2; c = 3; })'
+  'builtins.attrValues { c = 3; a = 1; b = 2; }'
+
+  # listToAttrs
+  '(builtins.listToAttrs [{name="x";value=1;} {name="y";value=2;}]).y'
+
+  # zipAttrsWith  / removeAttrs
+  'builtins.removeAttrs { a = 1; b = 2; c = 3; } ["b"]'
+
+  # functionArgs / isFunction
+  'builtins.isFunction (x: x)'
+
+  # split / match / replaceStrings edge cases
+  'builtins.match "([a-z]+)([0-9]+)" "abc123"'
+  'builtins.split "[0-9]+" "ab12cd34ef"'
+
+  # length-of-string on deeply concatenated
+  'builtins.stringLength (builtins.concatStringsSep "-" (builtins.genList (i: builtins.toString i) 10))'
+
+  # tryEval with division
+  '(builtins.tryEval (1 / 0)).success'
+
+  # Boolean primops
+  'builtins.all (x: x > 0) [1 2 3]'
+  'builtins.any (x: x > 5) [1 2 3]'
+
+  # Nested with
+  'let s1 = { x = 1; }; s2 = { y = 2; }; in with s1; with s2; x + y'
 )
 
 pass=0

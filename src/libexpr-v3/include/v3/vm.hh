@@ -39,6 +39,13 @@ struct CallFrame
     /// return value is also copied into thunk->evaluated and the thunk's
     /// state is set to Evaluated.
     Thunk * thunk = nullptr;
+
+    /// Floor on `vm.withStack` index for this frame: OP_WITH_LOOKUP only
+    /// searches from `vm.withStack.size()` down to `withStackBase`, so a
+    /// callee can't see its caller's `with`s.  At call entry we set this
+    /// to the caller's `vm.withStack.size()` and then push the closure's
+    /// captured snapshot.  At OP_RETURN we truncate to this base.
+    uint32_t withStackBase = 0;
 };
 
 /// Per-EvalState VM state.

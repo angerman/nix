@@ -58,8 +58,12 @@ struct Env
 
 struct Closure
 {
-    const LambdaDescriptor * desc;  // shared blueprint
-    Env *                    withEnv; // null if not created inside a with
+    const LambdaDescriptor * desc;        // shared blueprint
+    /// Snapshot of the `with`-stack visible at MAKE_CLOSURE.  null when
+    /// no enclosing `with` is in scope at definition time.  When the
+    /// closure is invoked, the dispatcher re-pushes these onto the
+    /// runtime with-stack so OP_WITH_LOOKUP inside the body finds them.
+    ListVec *                capturedWiths;
     uint16_t                 nUpvalues;
     uint16_t                 _pad;
     Value                    upvalues[]; // FAM
@@ -87,7 +91,8 @@ struct Thunk
         // ThunkState::Suspended
         struct {
             const ThunkDescriptor * desc;
-            Env * withEnv;
+            /// Same semantics as Closure::capturedWiths.
+            ListVec * capturedWiths;
         } suspended;
         // ThunkState::Evaluated — the cached value.
         Value evaluated;

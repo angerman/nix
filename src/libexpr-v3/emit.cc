@@ -344,31 +344,28 @@ struct Emitter
         for (uint32_t slot = 0; slot < n; ++slot)
             unit.code.push_back(e.entries[sortedOrder[slot]].name);
 
-        // 2. For each IR entry, build a Thunk capturing whatever
+        // 2. Spill the rec_attrs (currently on top of the operand
+        //    stack) into a frame slot so each entry's thunk-body
+        //    upvalue list can reference it via plain emitVarRef.  We
+        //    can't rely on OP_DUP-in-loop because freeVars is sorted
+        //    by VarId — recVar may not be the last one pushed before
+        //    OP_MAKE_THUNK, so a DUP at that point would copy the
+        //    wrong value.
+        uint16_t recSlot = getOrAssignSlot(e.recVar);
+        unit.code.push_back(encode(OP_DUP));
+        unit.code.push_back(encode(OP_SET_LOCAL, recSlot));
+
+        // 3. For each IR entry, build a Thunk capturing whatever
         //    upvalues its body needs and write it into the sorted slot.
-        //
         //    Each thunk body's freeVars list (sorted by VarId,
         //    populated by computeFreeVars) IS the upvalue layout: the
         //    body references upvalues[i] = freeVars[i].  We push them
         //    in that order so OP_MAKE_THUNK pops in reverse and
         //    upvalues[i] ends up correct.
-        //
-        //    Special case: when freeVars contains the rec attrset
-        //    VarId (Plain entries that reference siblings via the rec
-        //    scope), we DUP from the operand stack instead of
-        //    emitVarRef (which would look for a slot/upvalue in the
-        //    enclosing function — the rec attrs is on top of the op
-        //    stack, not in any slot).
         for (uint32_t i = 0; i < n; ++i) {
             auto & en = e.entries[i];
             const auto & ff = m.functions[en.thunkBody].freeVars;
-            for (auto fv : ff) {
-                if (fv == e.recVar) {
-                    unit.code.push_back(encode(OP_DUP));
-                } else {
-                    emitVarRef(fv);
-                }
-            }
+            for (auto fv : ff) emitVarRef(fv);
             unit.code.push_back(encode(OP_MAKE_THUNK, en.thunkBody));
             unit.code.push_back(static_cast<uint32_t>(ff.size()));
             unit.code.push_back(encode(OP_ATTRS_REC_SET, entryToSlot[i]));
