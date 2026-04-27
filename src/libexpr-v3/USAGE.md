@@ -119,48 +119,84 @@ Tag::PrimOp value that participates in PrimOpApp partial application.
 
 ## Known limitations
 
-Deferred primops (~13 remaining vs tree-walker):
-  - Store / derivation: derivation, derivationStrict, exec, filterSource,
-    importNative, outputOf, path, toFile, fetchurl, fetchTarball
-  - Real crypto hashes: hashString currently uses an FNV-1a 64-bit stub;
-    md5/sha1/sha256/sha512 need libcrypto wiring
-  - findFile (NIX_PATH lookup)
-  - addErrorContext (mostly internal)
-  - hashFile, convertHash, readFileType
+Store / derivation primops (need real Nix store integration):
+  - derivation, derivationStrict (stub returns input attrs as-is)
+  - exec, filterSource, importNative, outputOf
+  - path, toFile, fetchurl, fetchTarball
+  - findFile / __findFile (NIX_PATH lookup)
+  - scopedImport
+  - String-context primops are no-context stubs:
+    unsafeDiscardStringContext, hasContext, getContext,
+    unsafeDiscardOutputDependency
+
+Lazy evaluation gaps:
+  - Mutually-circular formal defaults like `{ a ? b, b ? a }: ...`
+    when only one side is provided.  Tree-walker uses per-default
+    thunks; v3 currently reads sibling slots eagerly.  Forward refs
+    (`b ? a + 1`) and backward refs (`a ? b - 1`) work fine.
+  - `rec { ${dyn} = ...; }` — recursive attrset with dynamic attr
+    names lowers to "unsupported AST node".
 
 Coercion in interpolation: only int/float/bool/null/string/path can
 appear in `"${...}"`; attrset-with-`__toString` and lists need
 explicit conversion.
 
-Performance: v3 is roughly on par with the tree-walker (within ~10%)
-for compute-bound benchmarks.  Bigger wins are queued (computed-goto
-dispatch, Bindings polymorphism, NaN-boxing, etc).
+Position tracking: `__curPos`, `unsafeGetAttrPos`, builtins.unsafeGetAttrPos
+return null since v3 doesn't track parser positions yet.
 
+Performance: v3 is roughly on par with the tree-walker (within ~30%)
+on compute-bound benchmarks.  Bigger wins are queued (NaN-boxing,
+computed-goto dispatch, Bindings polymorphism, etc).
 
+## Test status
 
-Partial application of multi-arg primops:
-  ```
-  builtins.foldl' (a: b: a + b) 0
-  ```
-  fails because v3 doesn't yet build PrimOpApp values for partially
-  applied primops.  Workaround: add a wrapper lambda
-  (`xs: builtins.foldl' (a: b: a + b) 0 xs`).
+The official `tests/functional/lang/eval-okay-*.nix` lang suite:
+**105 / 143 passing** (73%).  Remaining failures are concentrated in:
+  - 5 tests using `derivation` / store primops
+  - 3 tests using rec attrsets with dynamic attrs
+  - 2 tests using mutually-circular formal defaults / scope edge cases
+  - Tests using missing primops (scopedImport, __findFile, __curPos)
 
-`builtins` as a standalone value: rejected.  Only `builtins.foo` is
-recognized at the lowerer.
+The 77-case v3-vs-tree-walker regression suite at
+`src/libexpr-v3/test/run-v3-tests.sh` is fully passing
+(byte-identical output for 67, display-only diff for 10).
 
-Dynamic attrs (`{ ${name} = value; }`): rejected at lowering.
+## Recent feature additions
 
-Path SourceAccessor: parsed and stored as string; the accessor
-pointer is null (file system operations on paths not yet wired).
+`builtins` as a standalone value: produces an attrset of all
+registered primops on demand (used by `with builtins; …` and
+`inherit (builtins) substring;`).
 
-Coercion in interpolation: only int/float/bool/null/string/path can
-appear in `"${...}"`; attrsets and lists need an explicit
-`builtins.toString` call (or attrs may have `__toString`, not yet
-supported).
+Cross-CU calls: closures returned from `builtins.import` now carry
+their own CompilationUnit so cross-file `(import lib.nix) attrs`
+patterns work.  primImport caches CUs in a process-global ImportCache
+so the bytecode they own outlives any closure that points into it.
 
-Nix's full primop set: ~150 primops; v3 has 26.  Adding more is
-mostly mechanical (register the function on v3::Value).
+Lazy attrset values: every non-trivial attribute value is wrapped in
+a thunk at lowering time, so building `{a = 1; b = throw "x";}`
+doesn't fire the throw until `b` is forced.  Trivial values
+(literals, var refs, lambdas) skip the wrapper.
+
+Lazy function args: non-primop calls thunkify their non-trivial
+arguments so `f (throw "x")` only throws when `f` actually demands
+the value.
+
+Dynamic attr names in nested select: `attrs.${k}.deeper` works.
+Dynamic attrs (`{ ${name} = value; }`) work as the top-level
+attrset; rec + dynamic combination is still rejected.
+
+Mutually-recursive lambda formals (one-direction): `{a, b ? a + 1}`,
+`{a ? b - 1, b ? 10}` and `{a ? 1, b ? a}` all lower correctly.
+Symmetric circular defaults `{a ? b, b ? a}` still fail eagerly.
+
+App / lazy-callback primops: `mapAttrs` builds Tag::App entries that
+defer the `fn name value` call until the entry is forced — matches
+tree-walker laziness, fixes `intersectAttrs` against
+`mapAttrs throw alphabet`.
+
+Multi-arg primop callbacks via callClosure: builds PrimOpApp on
+under-application and walks a PrimOpApp chain to invoke once the
+arity is reached.  Fixes `sort builtins.lessThan list-of-lists`.
 
 ## Tested examples
 
