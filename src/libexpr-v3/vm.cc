@@ -226,7 +226,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
         // --- Locals / upvalues ---
         case OP_GET_LOCAL: {
-            assert(stackBase + operand < vm.valueStack.size());
+            if (stackBase + operand >= vm.valueStack.size())
+                throw std::runtime_error("v3 OP_GET_LOCAL: slot out of range");
             push(vm, vm.valueStack[stackBase + operand]);
             break;
         }
@@ -238,7 +239,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_GET_UPVALUE: {
-            assert(closure && operand < closure->nUpvalues);
+            if (!closure)
+                throw std::runtime_error("v3 OP_GET_UPVALUE: no closure context");
+            if (operand >= closure->nUpvalues)
+                throw std::runtime_error("v3 OP_GET_UPVALUE: index out of range");
             push(vm, closure->upvalues[operand]);
             break;
         }
