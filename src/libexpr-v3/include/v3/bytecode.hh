@@ -30,6 +30,7 @@
 namespace nix::v3 {
 
 struct PrimOp;
+struct Bindings;
 
 using Instruction = uint32_t;
 
@@ -179,6 +180,17 @@ struct CompilationUnit
 
     /// Primops referenced by OP_CALL_PRIMOP, indexed by primop-table index.
     std::vector<const PrimOp *> primops;
+
+    /// Inline cache slots for OP_ATTRS_SELECT.  Each OP_ATTRS_SELECT
+    /// reserves an index here; the entry caches the most recently
+    /// observed (Bindings*, slot-in-Bindings) pair so a repeat
+    /// access skips the binary search.  Mutated at runtime; sized at
+    /// compile time so slot indices are stable.
+    struct AttrSelectIC {
+        const Bindings * lastBindings = nullptr;
+        uint32_t lastSlot = 0;
+    };
+    mutable std::vector<AttrSelectIC> attrSelectCache;
 
     /// Top-level entry offset.
     uint32_t entryOffset = 0;

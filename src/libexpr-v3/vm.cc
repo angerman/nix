@@ -986,10 +986,34 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value attrs = pop(vm);
             if (!attrs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: not an attrset");
-            const Value * found = attrs.payload.bindings->lookup(operand);
-            if (!found)
-                throw std::runtime_error("v3 OP_ATTRS_SELECT: attribute not found");
-            push(vm, *found);
+            uint32_t icIdx = cu->code[ip++];
+            auto & ic = cu->attrSelectCache[icIdx];
+            const auto * b = attrs.payload.bindings;
+            // Inline-cache fast path: if the same Bindings* is hit
+            // again, skip the binary search and read entries[lastSlot]
+            // directly.  Cache miss falls back to lookup() and updates
+            // the slot.
+            if (ic.lastBindings == b
+                && ic.lastSlot < b->size
+                && b->entries[ic.lastSlot].name == static_cast<SymbolId>(operand))
+            {
+                push(vm, b->entries[ic.lastSlot].value);
+            } else {
+                // Manual binary search inlined to also recover the
+                // matched slot index, so we can update the cache.
+                uint32_t lo = 0, hi = b->size;
+                while (lo < hi) {
+                    uint32_t mid = (lo + hi) >> 1;
+                    SymbolId midName = b->entries[mid].name;
+                    if (midName == static_cast<SymbolId>(operand)) { lo = mid; break; }
+                    if (midName < static_cast<SymbolId>(operand)) lo = mid + 1; else hi = mid;
+                }
+                if (lo >= b->size || b->entries[lo].name != static_cast<SymbolId>(operand))
+                    throw std::runtime_error("v3 OP_ATTRS_SELECT: attribute not found");
+                ic.lastBindings = b;
+                ic.lastSlot     = lo;
+                push(vm, b->entries[lo].value);
+            }
             break;
         }
         case OP_ATTRS_SELECT_DYN: {

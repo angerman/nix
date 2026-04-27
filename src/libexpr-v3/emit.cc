@@ -318,6 +318,13 @@ struct Emitter
     {
         emitVarRef(e.attrs);
         unit.code.push_back(encode(OP_ATTRS_SELECT, e.name));
+        // Reserve an inline-cache slot.  At runtime the VM will write
+        // the most recently seen (Bindings*, slot) tuple here so a
+        // repeat access on the same attrset shape skips the binary
+        // search.  Slot index is stored as the next code word.
+        uint32_t icIdx = static_cast<uint32_t>(unit.attrSelectCache.size());
+        unit.attrSelectCache.emplace_back();
+        unit.code.push_back(icIdx);
     }
     void emitOne(const ir::AttrSelectDyn & e)
     {
