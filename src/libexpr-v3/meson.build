@@ -122,3 +122,23 @@ test(
   'v3-smoke',
   v3_smoke,
 )
+
+# BR-3.0 pre-flight: validate the libnixstore Derivation APIs we'll
+# build BR-3 on top of produce a drvPath matching tree-walker's for a
+# known-good input.
+v3_drv_preflight = executable(
+  'v3-drv-preflight',
+  'test/drv-preflight.cc',
+  dependencies : deps_public + deps_private + deps_other + [
+    declare_dependency(
+      link_with : this_library,
+      include_directories : include_dirs,
+    ),
+  ],
+  install : false,
+)
+
+test(
+  'v3-drv-preflight',
+  v3_drv_preflight,
+)
