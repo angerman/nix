@@ -39,9 +39,46 @@ through v3:
     NIX_USE_V3=1 ./build/src/nix/nix eval --expr '1 + 2'    # 3
     NIX_USE_V3=1 ./build/src/nix/nix eval --expr 'fib 30 ...'
 
-The hook is installed by a static initializer in libnixexprv3 — the
-main `nix` binary now links against v3, but libnixexpr itself does
-not (no circular link dep).
+The hook is wired in via an explicit `nix::v3::installEvalHook()`
+call from `nix::mainWrapped`.  This serves two purposes: it
+populates the function pointer that `EvalState::eval` consults, and
+it provides a strong symbol reference so macOS's
+`-dead_strip_dylibs` can't remove libnixexprv3 from the binary.
+
+Real-world behaviour today (single-invocation runs):
+
+  - **fib30**: v3 cutover at 0.36s user, slightly faster than
+    tree-walker's 0.37s.
+  - **`(import <nixpkgs> {}).hello.name`**: v3 cutover at 0.29s user,
+    tree-walker at 0.24s.  v3 is ~20% slower on this real-world
+    workload.
+
+What's happening:
+
+  - The v3 hook fires per-file-imported (via tree-walker's
+    `evalFile` calling `state.eval`).  On hello.name, that's ~21
+    distinct file-level Exprs going through v3 (`Let`, `Attrs`,
+    `Select`).  Each lower+compile+run pays ~2.4 ms.
+  - Most other Expr kinds (Lambda, Int, Float, String, Path, Var,
+    Pos) short-circuit through to tree-walker because v3's overhead
+    exceeds the benefit on these.
+  - The per-Expr* cache currently never hits within a single
+    invocation — each `state.eval` call from tree-walker arrives
+    with a unique Expr*.  Sub-Expr forces go through tree-walker's
+    `forceValue` → `expr->eval` directly, bypassing the cache.
+
+Set `NIX_VM_STATS=1` to see hook invocation counts:
+
+    NIX_VM_STATS=1 NIX_USE_V3=1 nix-instantiate --eval --strict --expr '...'
+
+Output ends with `v3 hook stats: evalEntries=N cacheHits=H cacheMisses=M`.
+
+The remaining wins live in CO-2 / CO-3 from
+`OPTIMIZATION_PLAN.md`: hooking `forceValue` to consult the v3
+cache for sub-Expr forces and pre-populating the cache for sub-Exprs
+at lower time.  This is genuinely the 3-5 week piece of work and
+would route most of nixpkgs evaluation through v3 instead of just
+the file-toplevels.
 
 ## What the lowerer supports
 
