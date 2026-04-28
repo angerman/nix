@@ -919,17 +919,28 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                         if (!srcV) return skipReturn(3);
                         upvalues.push_back(treeWalkerToV3Public(state, *srcV));
                     } else {
-                        // RecBuild materialisation deliberately not
-                        // wired up: an earlier attempt at
-                        // synthesising the Bindings* from env
-                        // values triggered a stack overflow on the
-                        // 3-drv nixpkgs probe (exit=139).  Root
-                        // cause is still being narrowed; the
-                        // structural pieces (recVarOrigins +
-                        // populateSubExprCacheLocal RecBuild
-                        // branch) are in place so a smaller fix can
-                        // bolt onto them.  For now, fall back like
-                        // the pre-WC-2-followup behaviour.
+                        // RecBuild materialisation tried twice now:
+                        //
+                        // 1. (pre-WC-9.2) eager bridge of every rec
+                        //    entry → SIGSEGV on 3-drv probe via
+                        //    tree-walker's ExprOpUpdate recursion.
+                        //
+                        // 2. (post-WC-9.2 iterative // walk) same
+                        //    eager bridge → still SIGSEGV.  WC-9.2
+                        //    flattens // chains but mkDerivation has
+                        //    other deep recursion sources
+                        //    (call/let/select chains) that the
+                        //    eager bridge of *every* rec entry's
+                        //    body still triggers.
+                        //
+                        // The principled fix is Option 1 in the
+                        // plan: lazy bridge — Bindings* entries are
+                        // bridge-thunks that only force on access.
+                        // Requires a new v3 Value tag (or a special
+                        // Thunk state) that re-enters tree-walker
+                        // for a single value when v3 OP_FORCE
+                        // hits it.  Substantial v3 VM change;
+                        // deferred to its own session.
                         return skipReturn(1);
                     }
                 }
