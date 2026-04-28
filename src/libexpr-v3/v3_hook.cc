@@ -320,6 +320,15 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     }
                     if (!ok) entry.upvalueSources.clear();
                 }
+                // Mark the AST node so `EvalState::forceValue` knows
+                // to invoke the hook for it; non-marked Exprs short-
+                // circuit the inline check on the force hot path.
+                // Casting away const because nix::Expr's flag fields
+                // are intentionally mutable signposts for the various
+                // bytecode integrations (v2 already does this for
+                // `isBytecodeThunk` / `isBytecodeProxy`).
+                const_cast<nix::Expr *>(static_cast<const nix::Expr *>(sef.astExpr))
+                    ->isV3CacheCandidate = true;
                 subCache.emplace(static_cast<const nix::Expr *>(sef.astExpr),
                     std::move(entry));
             }

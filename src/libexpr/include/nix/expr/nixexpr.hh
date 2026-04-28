@@ -147,6 +147,13 @@ struct Expr
     /// When true, the ExprLambda* can be static_cast'd to ExprLambdaBytecode*.
     bool isBytecodeProxy = false;
 
+    /// Set by libnixexprv3 when this Expr* has been registered in v3's
+    /// sub-Expr cache (CO-3).  Lets `EvalState::forceValue` skip the
+    /// hash-map lookup entirely when false — the vast majority of
+    /// thunked Exprs are not in v3's cache, so this flag turns 218k
+    /// cache misses on hello.name into 218k branch-predictable noops.
+    bool isV3CacheCandidate = false;
+
     Expr()
     {
         nrExprs++;
