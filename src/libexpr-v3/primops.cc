@@ -2510,6 +2510,64 @@ static const DrvStrictSymbols & drvStrictSymbols()
     return s;
 }
 
+// BR-3.4: lexicographic attr iteration helper.  Returns a vector of
+// indices into `b->entries` sorted by name STRING, not SymbolId.
+//
+// Why this matters: v3 Bindings store entries sorted by SymbolId
+// (interning order at parse time), but tree-walker's
+// `attrs->lexicographicOrder(state.symbols)` sorts by the resolved
+// name string.  Tree-walker's derivationStrict iterates in that
+// order, and the resulting drv-hash depends on the order of
+// `drv.env` insertions — so to match drvPath byte-for-byte we MUST
+// iterate by name string.
+//
+// This is the single biggest correctness landmine in the whole port:
+// if the order diverges by one swap, every dependent /nix/store path
+// changes silently.
+static std::vector<uint32_t> lexicographicAttrOrder(const Bindings * b)
+{
+    std::vector<uint32_t> order;
+    if (!b) return order;
+    order.reserve(b->size);
+    for (uint32_t i = 0; i < b->size; ++i) order.push_back(i);
+    const auto & symTab = ir::globalSymbolTable();
+    auto nameOf = [&](uint32_t i) -> std::string_view {
+        SymbolId s = b->entries[i].name;
+        return s < symTab.size() ? std::string_view(symTab[s])
+                                  : std::string_view{};
+    };
+    std::sort(order.begin(), order.end(),
+        [&](uint32_t a, uint32_t bIdx) {
+            return nameOf(a) < nameOf(bIdx);
+        });
+    return order;
+}
+
+// BR-3.3: detect-fall-back predicate.  Returns true when args[0]'s
+// shape is suitable for the upcoming Phase A native path (deferred-
+// output, no fixed-output, no content-addressed/impure, no
+// structured-attrs).  Cheap: attribute presence checks via the
+// pre-interned SymbolIds; no value forcing.
+//
+// False is the SAFE default — any "complex" attr present routes the
+// call back through the existing tree-walker bridge.  False positives
+// (saying "complex" when it isn't) cost a bridge round-trip; false
+// negatives (saying "simple" when it isn't) would silently produce
+// wrong drvs, so we prefer the conservative side.
+//
+// Phase B/C/D will lift these gates as native support for each lands.
+static bool isSimpleDerivationAttrs(const Bindings * b)
+{
+    if (!b) return false;
+    const auto & sym = drvStrictSymbols();
+    // Any of these attrs present → complex shape → bridge.
+    if (b->lookup(sym.outputHash))       return false;
+    if (b->lookup(sym.structuredAttrs))  return false;
+    if (b->lookup(sym.contentAddressed)) return false;
+    if (b->lookup(sym.impure))           return false;
+    return true;
+}
+
 /// Construct a "fake" derivation attrset.  Real `derivation` interfaces
 /// with the store; we accept the input attrset and tag it with a
 /// synthetic `outPath` so code that just reads outPath works.  Useful
