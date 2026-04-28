@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <atomic>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -2385,8 +2386,35 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 
 void ExprOpUpdate::eval(EvalState & state, Env & env, Value & v)
 {
+    // WC-9.0: count // chain entry-points + chain depths.  Reported
+    // via NIX_VM_STATS=1.  Cheap (two atomic increments).
+    static std::atomic<uint64_t> opUpdateEntries{0};
+    static std::atomic<uint64_t> opUpdateChainOperands{0};
+    static std::atomic<uint64_t> opUpdateMaxChainSeen{0};
+    static bool atexitInstalled = []{
+        std::atexit([]{
+            if (std::getenv("NIX_VM_STATS")) {
+                std::fprintf(stderr,
+                    "tw OpUpdate: entries=%llu chainOperands=%llu maxChain=%llu\n",
+                    (unsigned long long)opUpdateEntries.load(),
+                    (unsigned long long)opUpdateChainOperands.load(),
+                    (unsigned long long)opUpdateMaxChainSeen.load());
+            }
+        });
+        return true;
+    }();
+    (void)atexitInstalled;
+    opUpdateEntries.fetch_add(1, std::memory_order_relaxed);
+
     UpdateQueue q;
     evalForUpdate(state, env, q);
+    opUpdateChainOperands.fetch_add(q.size(), std::memory_order_relaxed);
+    {
+        uint64_t prev = opUpdateMaxChainSeen.load(std::memory_order_relaxed);
+        while (q.size() > prev
+            && !opUpdateMaxChainSeen.compare_exchange_weak(
+                prev, q.size(), std::memory_order_relaxed)) ;
+    }
 
     Value vTmp;
     vTmp.mkAttrs(&Bindings::emptyBindings);
@@ -2408,10 +2436,35 @@ void Expr::evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, std::str
 
 void ExprOpUpdate::evalForUpdate(EvalState & state, Env & env, UpdateQueue & q)
 {
-    /* Output rightmost attrset first to the merge queue as the one
-       with the most priority. */
+    /* WC-9.2 — iterative left-spine walk.  The previous
+       implementation recursed on `e1` for every nested
+       ExprOpUpdate, which on real nixpkgs code (mkDerivation
+       overlay chains, max chain seen so far = 12 deep, 35k+
+       entries on a 3-drv probe) accumulated to thousands of
+       C-stack frames.  Combined with the v3 cutover's per-call
+       overhead it pushed the 8 MB pthread stack past its guard
+       on a 3-drv `nix-instantiate` and SIGSEGV'd.  The walk
+       below collapses every left-nested `(... // a) // b` chain
+       into a single loop, leaving only the queueing of the
+       individual operands as recursive eval calls.
+
+       Output rightmost attrset first to the merge queue as the
+       one with the most priority — same ordering invariant as
+       the old recursive walk produced. */
     e2->evalForUpdate(state, env, q, "in the right operand of the update (//) operator");
-    e1->evalForUpdate(state, env, q, "in the left operand of the update (//) operator");
+    Expr * cur = e1;
+    while (true) {
+        if (cur && cur->exprKind == Kind::OpUpdate) {
+            auto * upd = static_cast<ExprOpUpdate *>(cur);
+            upd->e2->evalForUpdate(state, env, q,
+                "in the right operand of the update (//) operator");
+            cur = upd->e1;
+        } else {
+            cur->evalForUpdate(state, env, q,
+                "in the left operand of the update (//) operator");
+            break;
+        }
+    }
 }
 
 void ExprOpUpdate::evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, std::string_view errorCtx)
