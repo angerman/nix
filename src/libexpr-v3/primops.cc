@@ -3044,13 +3044,50 @@ static void primDerivationStrictNative(
         throw std::runtime_error(
             "v3 BR-3 native: required attribute `system` missing");
 
-    // ---- BR-3.6 (NixStringContext → inputDrvs/inputSrcs) goes here ----
+    // ---- BR-3.6: process accumulated NixStringContext into
+    // drv.inputSrcs / drv.inputDrvs.  Mirrors derivationStrictInternal
+    // (eval.cc:1849).  Variant dispatch:
+    //
+    //   - DrvDeep{drvPath}    : add the entire FS closure of drvPath as
+    //                           sources; for each derivation in the
+    //                           closure, also pull in its full output
+    //                           name set as an inputDrv.
+    //   - Built{drvPath, out} : insert `out` into inputDrvs[drvPath].
+    //   - Opaque{path}        : insert `path` into inputSrcs.
+    //
+    // The context comes from coerceToString calls that flowed
+    // through derivation strings (`outPath`, `drvPath`) and path
+    // values (copyPathToStore).
+    for (auto & c : context) {
+        std::visit(
+            nix::overloaded{
+                [&](const nix::NixStringContextElem::DrvDeep & d) {
+                    nix::StorePathSet refs;
+                    ns.store->computeFSClosure(d.drvPath, refs);
+                    for (auto & j : refs) {
+                        drv.inputSrcs.insert(j);
+                        if (j.isDerivation()) {
+                            drv.inputDrvs.map[j].value =
+                                ns.store->readDerivation(j).outputNames();
+                        }
+                    }
+                },
+                [&](const nix::NixStringContextElem::Built & b) {
+                    drv.inputDrvs.ensureSlot(*b.drvPath).value.insert(b.output);
+                },
+                [&](const nix::NixStringContextElem::Opaque & o) {
+                    drv.inputSrcs.insert(o.path);
+                },
+            },
+            c.raw);
+    }
+
     // ---- BR-3.7 (deferred outputs + writeDerivation) goes here ----
     // For now: throw to fall back to bridge.  Full semantics preserved.
-    (void)ns;
+    (void)declaredOutputs;
     throw std::runtime_error(
-        "v3 BR-3 native: scaffold complete but write/finish path "
-        "not yet implemented (BR-3.6 / BR-3.7 pending)");
+        "v3 BR-3 native: context processed but write/finish path "
+        "not yet implemented (BR-3.7 pending)");
 }
 
 void primDerivation(EvalState & state, Value * args, Value & out)
