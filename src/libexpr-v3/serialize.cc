@@ -7,6 +7,7 @@
 
 #include "v3/serialize.hh"
 #include "v3/primop.hh"
+#include "v3/ir.hh"
 
 #include <cstring>
 
@@ -72,6 +73,77 @@ bool isCacheable(const CompilationUnit & /*cu*/)
     // (resolve-by-name and zero-on-load respectively).
     return true;
 }
+
+namespace {
+
+/// Walk the bytecode of `cu` and rewrite every SymbolId operand
+/// (in OP_WITH_LOOKUP / OP_ATTRS_SELECT / OP_ATTRS_HAS) and every
+/// trailing-data SymbolId (in OP_ATTRS_INIT / OP_ATTRS_INIT_DYN /
+/// OP_ATTRS_REC_INIT) using the supplied remap table.
+///
+/// `remap[oldId] = newGlobalId`.  For ids beyond `remap.size()`
+/// (shouldn't happen if cu.symbolTable was the source of truth at
+/// serialize time), leave the id unchanged — best-effort.
+///
+/// Bytecode opcode-data layouts come from emit.cc:
+///   OP_ATTRS_INIT      [n:24]            data: 2n words (name, pos) pairs
+///   OP_ATTRS_INIT_DYN  [(nStat<<12)|nDyn] data: 2*nStatic (name,pos) +
+///                                              nDyn pos words
+///   OP_ATTRS_REC_INIT  [n:24]            data: 2n (name, pos) pairs
+///   OP_ATTRS_SELECT    [sym:24]          data: 1 IC-index word
+///   OP_ATTRS_HAS       [sym:24]          (no follow-up)
+///   OP_WITH_LOOKUP     [sym:24]
+void remapSymbolsInBytecode(CompilationUnit & cu,
+                              const std::vector<uint32_t> & remap)
+{
+    auto remapId = [&](uint32_t id) -> uint32_t {
+        return id < remap.size() ? remap[id] : id;
+    };
+    auto & code = cu.code;
+    for (size_t ip = 0; ip < code.size(); ) {
+        uint32_t & word = code[ip];
+        Op op = decodeOp(word);
+        uint32_t operand = decodeOperand(word);
+        ip++;
+
+        // Patch SymbolId operands in-place + walk trailing data
+        // words.  See bytecode.hh + emit.cc for opcode layouts.
+        if (op == OP_WITH_LOOKUP || op == OP_ATTRS_HAS) {
+            word = encode(op, remapId(operand));
+        } else if (op == OP_ATTRS_SELECT) {
+            word = encode(op, remapId(operand));
+            ip++;  // 1 IC-index follow-up word
+        } else if (op == OP_ATTRS_INIT) {
+            uint32_t n = operand;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (ip < code.size()) code[ip] = remapId(code[ip]);  // name
+                ip += 2;  // skip pos as well
+            }
+        } else if (op == OP_ATTRS_INIT_DYN) {
+            uint32_t nStatic = (operand >> 12) & 0xFFFu;
+            uint32_t nDyn    =  operand        & 0xFFFu;
+            for (uint32_t i = 0; i < nStatic; ++i) {
+                if (ip < code.size()) code[ip] = remapId(code[ip]);
+                ip += 2;
+            }
+            ip += nDyn;
+        } else if (op == OP_ATTRS_REC_INIT) {
+            uint32_t n = operand;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (ip < code.size()) code[ip] = remapId(code[ip]);
+                ip += 2;
+            }
+        } else if (op == OP_CALL_PRIMOP) {
+            ip++;  // primop-index follow-up
+        } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
+            ip++;  // nUpvalues follow-up
+        }
+        // All other opcodes either have no trailing data or no
+        // SymbolIds in their data; leave ip alone.
+    }
+}
+
+} // namespace
 
 std::string serializeCU(const CompilationUnit & cu)
 {
@@ -276,6 +348,26 @@ CompilationUnit deserializeCU(std::string_view blob)
     if (r.pos != blob.size())
         throw SerializationError(
             "v3 deserialize: trailing bytes after end-of-stream");
+
+    // SymbolId remapping.  At serialize time, cu.symbolTable was a
+    // snapshot of the global table (cu.symbolTable[i] == name of
+    // global SymbolId i).  At deserialize, the global table may
+    // have a different layout — we re-resolve every name through
+    // globalInternSymbol() and walk the bytecode + lambdas to
+    // rewrite stale SymbolIds.
+    std::vector<uint32_t> remap;
+    remap.reserve(cu.symbolTable.size());
+    for (auto & name : cu.symbolTable) {
+        remap.push_back(name.empty()
+            ? uint32_t{0}  // sentinel for ""
+            : ir::globalInternSymbol(name));
+    }
+    remapSymbolsInBytecode(cu, remap);
+    for (auto & l : cu.lambdas) {
+        for (auto & f : l.formals) {
+            if (f.name < remap.size()) f.name = remap[f.name];
+        }
+    }
 
     return cu;
 }
