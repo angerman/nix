@@ -90,13 +90,6 @@ struct Lowerer
     /// owns the inheritFromExprs vector), so a simple stack suffices.
     std::vector<std::pmr::vector<nix::Expr *> *> inheritFromStack;
 
-    /// VarId of the synthesized `builtins` attrset, populated lazily on
-    /// the first base-env `builtins` reference.  All subsequent refs in
-    /// the same lower call alias this VarId via VarRef.  Saves
-    /// re-constructing N LitPrimOp bindings + the AttrSet's entries
-    /// vector on every occurrence of the symbol.
-    ir::VarId cachedBuiltinsVar = ir::kInvalid;
-
     /// nix::Symbol -> ir::SymbolId interning cache (per Lowerer).
     /// Avoids the std::string allocation + global-table hashmap lookup
     /// on every lowerVar/lowerAttrs/etc. access to a repeat symbol.
@@ -397,20 +390,21 @@ struct Lowerer
             // bare `builtins.attrNames` (where `builtins` is rebound
             // by `inherit (builtins) ...`) work uniformly.
             //
-            // Cache the IR construction at the Lowerer level — within
-            // a single lowerNixExpr call, multiple `builtins` refs
-            // (common in nixpkgs code) share the same VarId.  Saves
-            // re-emitting hundreds of LitPrimOp bindings + the AttrSet
-            // entries vector on every reference.
-            if (cachedBuiltinsVar != ir::kInvalid)
-                return addBinding(ir::VarRef{cachedBuiltinsVar});
+            // We deliberately do NOT cache the resulting VarId across
+            // function boundaries: a VarId is local to the function
+            // whose block produced it, so reusing it in another
+            // function would make function 0 (or any non-defining
+            // function) reference a free var defined inside a thunk,
+            // causing emit to produce OP_GET_UPVALUE at the top
+            // level — where there is no closure context, and the VM
+            // throws.  Per-call (per-occurrence) construction is
+            // correct and the IR-builder cost is small.
             std::vector<ir::AttrSet::Entry> entries;
             for (auto & [poName, po] : allRegisteredPrimOps()) {
                 ir::VarId v = addBinding(ir::LitPrimOp{&po});
                 entries.push_back({m.internSymbol(poName), v});
             }
-            cachedBuiltinsVar = addBinding(ir::AttrSet{std::move(entries)});
-            return cachedBuiltinsVar;
+            return addBinding(ir::AttrSet{std::move(entries)});
         }
         if (auto * po = findPrimOp(name)) {
             // Arity-0 primops behave as constants — invoke immediately
