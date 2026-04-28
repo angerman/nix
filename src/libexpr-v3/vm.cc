@@ -37,6 +37,11 @@
 
 namespace nix::v3 {
 
+// WC-10: forward declaration at namespace scope so the `extern` use sites
+// inside the anonymous namespaces below resolve to nix::v3::forceBridgeThunk
+// (defined in primops.cc) rather than to a phantom anonymous-namespace symbol.
+Value forceBridgeThunk(Thunk * t);
+
 namespace {
 
 [[gnu::always_inline]]
@@ -1022,6 +1027,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (!v.isThunk()) { push(vm, v); break; }
             Thunk * t = v.payload.thunk;
             if (t->state == ThunkState::Blackhole) throw std::runtime_error("v3 OP_FORCE: infinite recursion (blackhole)");
+            // WC-10: Bridge thunk — call into tree-walker for the
+            // single nix::Value*, then bridge the already-forced
+            // result.  Defined in primops.cc so vm.cc stays free of
+            // nix:: includes.
+            if (t->state == ThunkState::Bridge) {
+                Value resolved = forceBridgeThunk(t);
+                t->state = ThunkState::Evaluated;
+                t->evaluated = resolved;
+                push(vm, resolved);
+                break;
+            }
             // Suspended: blackhole and run.
             // We treat suspended.desc as a LambdaDescriptor* (see OP_MAKE_THUNK).
             const LambdaDescriptor * desc = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
@@ -1823,6 +1839,12 @@ Value forceValue(VMState & vm, Value v)
         if (t->state == ThunkState::Evaluated) { v = t->evaluated; continue; }
         if (t->state == ThunkState::Blackhole)
             throw std::runtime_error("v3 forceValue: infinite recursion (blackhole)");
+        if (t->state == ThunkState::Bridge) {
+            v = forceBridgeThunk(t);
+            t->state = ThunkState::Evaluated;
+            t->evaluated = v;
+            continue;
+        }
 
         const LambdaDescriptor * desc = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
         Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);

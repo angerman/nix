@@ -225,6 +225,24 @@ struct Alloc
         return t;
     }
 
+    /// WC-10: Allocate a Bridge thunk that, when OP_FORCE'd, calls
+    /// back into tree-walker for the given nix::Value*.  Used by
+    /// the rec-attrset materialisation: each entry of the
+    /// synthesised Bindings* is one of these thunks, so only
+    /// entries the v3 thunk body actually accesses pay the bridge
+    /// cost.  `src` is a `nix::Value *` (cast to void* here so
+    /// alloc.hh stays decoupled from nix:: types).
+    static Thunk * allocBridgeThunk(void * src) noexcept
+    {
+        // No upvalues / no FAM tail.
+        const size_t bytes = sizeof(Thunk);
+        auto * t = static_cast<Thunk *>(threadArena().alloc(bytes));
+        t->state = ThunkState::Bridge;
+        t->nUpvalues = 0;
+        t->bridgeSrc = src;
+        return t;
+    }
+
     static Env * allocEnv(uint16_t nValues) noexcept
     {
         const size_t bytes = sizeof(Env) + sizeof(Value) * nValues;

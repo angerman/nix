@@ -1482,6 +1482,85 @@ pieces (`recVarOrigins`, `populateSubExprCacheLocal` RecBuild
 branch, `UpvalueSource` variant) and the iterative // walk
 (WC-9.2) are in place as the foundation.
 
+## 2026-04-28 — WC-10: lazy bridge thunks for rec-attrset materialisation (LANDED)
+
+Implements Option 1 from the WC-9 trade-off analysis.  All structural
+pieces from WC-9 (recVarOrigins, populateSubExprCacheLocal RecBuild
+branch, UpvalueSource variant) and the iterative // walk (WC-9.2) are
+the foundation; WC-10 closes out Phase WC's original goal: actually
+materialise rec-attrset upvalues in v3 closures without SIGSEGV.
+
+### What changed
+
+1. `closure.hh`: added `ThunkState::Bridge = 4` plus a `void * bridgeSrc`
+   field in the Thunk union.  `void *` (not `nix::Value *`) keeps
+   `closure.hh` free of the `nix::` include, matching v3's clean-room
+   discipline.
+2. `alloc.hh`: new `Alloc::allocBridgeThunk(void * src)` factory —
+   one bump-pointer alloc; no FAM (Bridge thunks have nUpvalues == 0).
+3. `vm.cc`: `OP_FORCE` and the `forceValue` helper now detect
+   `ThunkState::Bridge` and call `forceBridgeThunk(t)` (forward-declared
+   at `nix::v3` namespace scope so the use sites inside the anonymous
+   namespaces resolve correctly).  After bridging, the thunk is
+   memoized to `Evaluated` so subsequent forces are O(1).
+4. `primops.cc`: `forceBridgeThunk(Thunk *)` reads the stashed
+   `nix::Value *`, demands tree-walker has wired its `tlNixEvalState`,
+   and bridges the result via `treeWalkerToV3Public`.  Errors out if
+   either invariant is violated (defensive — these should hold in all
+   cutover paths).
+5. `v3_hook.cc`: the RecBuild materialisation branch (previously
+   either deferred via `skipReturn` or eagerly bridged with stack
+   blowup) now allocates one Bridge thunk per rec entry, sorts them
+   into a `Bindings*`, and pushes that as the v3 upvalue.  Each thunk
+   carries a `nix::Value *` to the corresponding rec entry; only
+   entries the v3 thunk body actually reads pay the bridge cost.
+
+### Why eager bridging SIGSEGV'd, why lazy doesn't
+
+Eager bridging called `forceValue` on every rec entry up-front.  In
+real nixpkgs that means stepping into mkDerivation's overlay chain
+(observed depth ~12, ~35k bridge passes per 3-drv probe), which
+saturated the 8 MB pthread stack the cutover thread runs on.
+
+Lazy bridging defers the per-entry forceValue until v3 actually
+selects-and-forces that entry.  Typical v3 thunk bodies touch 1–2
+attrs of an N-entry rec block, so depth contribution drops from
+O(chain × N) to O(chain × actual-accesses).  Combined with WC-9.2
+(iterative // walk eliminates `evalForUpdate`'s recursion budget),
+3-drv probes complete cleanly.
+
+### Validation
+
+- v3 smoke tests: 16/16 pass.
+- v3 lang tests: 142/142 pass.
+- v3 cutover lang tests: 142/142 pass.
+- drv-parity (BR-3): 25/25 byte-equal.
+- 3-drv nixpkgs probe (`pkgs.{hello,git,vim}.drvPath`):
+  - tree-walker baseline: succeeds, returns 3 .drv paths.
+  - v3 cutover (NIX_USE_V3=1): succeeds, byte-equal output.
+  - Pre-WC-10: SIGSEGV (exit 139) on the same input.
+
+### Linker note
+
+Initial build hit `Undefined symbols: nix::v3::(anonymous
+namespace)::forceBridgeThunk(...)`.  Cause: the `extern Value
+forceBridgeThunk(Thunk *);` declarations sat inside vm.cc's anonymous
+namespaces, which gives the symbol internal linkage scoped to the
+anonymous namespace.  Fix: a single forward declaration at `nix::v3`
+namespace scope (above the anonymous namespaces) so both call sites
+resolve to the externally-defined symbol in primops.cc.
+
+### Phase WC closes
+
+WC-10 closes the originally stated Phase WC goal — widen the cutover
+so the v3 path actually executes the body of every entry — by
+eliminating the last structural blocker (rec-attrset env
+reconstruction).  The deferred WC-8 (parse-time pre-lowering)
+contingency is no longer required for the rec-attrset use case.
+WC-9 (Option 3, iterative // walk) ships as a complementary
+correctness-and-stack-depth improvement that was a prerequisite
+for WC-10 to land cleanly on real nixpkgs traces.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,

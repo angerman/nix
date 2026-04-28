@@ -4767,6 +4767,25 @@ Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv)
     return treeWalkerToV3(st, nv);
 }
 
+/// WC-10: bridge-thunk forcer.  Called from vm.cc OP_FORCE /
+/// forceValue when a Thunk has state == Bridge.  Looks up the
+/// thread-local nix EvalState (set by setNixEvalState() at hook
+/// entry), reads the stashed `nix::Value *` from the thunk,
+/// forces it on the tree-walker side, and bridges the result via
+/// treeWalkerToV3Public.  Throws if no nix EvalState is wired —
+/// the bridge thunk needs tree-walker context to make sense.
+Value forceBridgeThunk(Thunk * t)
+{
+    if (!t || t->state != ThunkState::Bridge || !t->bridgeSrc)
+        throw std::runtime_error(
+            "v3 forceBridgeThunk: thunk has no bridge source");
+    if (!tlNixEvalState)
+        throw std::runtime_error(
+            "v3 forceBridgeThunk: no tree-walker EvalState wired");
+    auto * srcV = static_cast<nix::Value *>(t->bridgeSrc);
+    return treeWalkerToV3Public(*tlNixEvalState, *srcV);
+}
+
 void registerPrimOp(const PrimOp & op)
 {
     std::lock_guard<std::mutex> g(registryMutex());

@@ -919,29 +919,54 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                         if (!srcV) return skipReturn(3);
                         upvalues.push_back(treeWalkerToV3Public(state, *srcV));
                     } else {
-                        // RecBuild materialisation tried twice now:
+                        // WC-10 (Option 1): build a v3 Bindings*
+                        // whose entries are Bridge thunks that only
+                        // force on access.  Each thunk holds a
+                        // `nix::Value *` to the corresponding rec
+                        // entry; OP_FORCE on the thunk re-enters
+                        // tree-walker for that single value via
+                        // forceBridgeThunk (defined in primops.cc).
                         //
-                        // 1. (pre-WC-9.2) eager bridge of every rec
-                        //    entry → SIGSEGV on 3-drv probe via
-                        //    tree-walker's ExprOpUpdate recursion.
-                        //
-                        // 2. (post-WC-9.2 iterative // walk) same
-                        //    eager bridge → still SIGSEGV.  WC-9.2
-                        //    flattens // chains but mkDerivation has
-                        //    other deep recursion sources
-                        //    (call/let/select chains) that the
-                        //    eager bridge of *every* rec entry's
-                        //    body still triggers.
-                        //
-                        // The principled fix is Option 1 in the
-                        // plan: lazy bridge — Bindings* entries are
-                        // bridge-thunks that only force on access.
-                        // Requires a new v3 Value tag (or a special
-                        // Thunk state) that re-enters tree-walker
-                        // for a single value when v3 OP_FORCE
-                        // hits it.  Substantial v3 VM change;
-                        // deferred to its own session.
-                        return skipReturn(1);
+                        // This replaces the previous eager-bridge
+                        // attempts that SIGSEGV'd because forcing
+                        // every rec entry up front triggered tree-
+                        // walker's deep mkDerivation recursion
+                        // chains.  Lazy bridging means only entries
+                        // the v3 thunk's body actually accesses pay
+                        // the bridge cost — typically 1–2 of N.
+                        const auto & names = src.names;
+                        if (names.empty()) return skipReturn(1);
+                        std::vector<std::pair<SymbolId, Value>> pairs;
+                        pairs.reserve(names.size());
+                        for (uint32_t i = 0; i < names.size(); ++i) {
+                            nix::Value * srcV = cur->values[i];
+                            if (!srcV) return skipReturn(3);
+                            // Allocate a Bridge thunk per entry —
+                            // no eager forceValue, no eager bridge.
+                            Thunk * bridge = Alloc::allocBridgeThunk(
+                                static_cast<void *>(srcV));
+                            allocStats().thunksAllocated++;
+                            Value entry;
+                            entry.tag_payload =
+                                static_cast<uint64_t>(Tag::Thunk);
+                            entry.payload.thunk = bridge;
+                            pairs.emplace_back(names[i], entry);
+                        }
+                        std::sort(pairs.begin(), pairs.end(),
+                            [](auto & a, auto & b) {
+                                return a.first < b.first;
+                            });
+                        Bindings * b = Alloc::allocBindings(
+                            static_cast<uint32_t>(pairs.size()));
+                        allocStats().attrsetsAllocated++;
+                        for (size_t i = 0; i < pairs.size(); ++i) {
+                            b->entries[i].name  = pairs[i].first;
+                            b->entries[i].value = pairs[i].second;
+                        }
+                        Value v;
+                        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                        v.payload.bindings = b;
+                        upvalues.push_back(v);
                     }
                 }
             } catch (const std::exception &) {

@@ -85,6 +85,14 @@ enum class ThunkState : uint8_t {
     Blackhole = 1,
     Evaluated = 2,
     Native    = 3,
+    /// WC-10 (Option 1): a thunk that, when forced, calls back into
+    /// tree-walker for a single nix::Value*, then bridges the
+    /// already-forced result to a v3 Value via treeWalkerToV3.
+    /// Used by the rec-attrset materialisation path: instead of
+    /// eagerly bridging every rec entry's body up-front, we
+    /// allocate a Bridge thunk per entry — only entries the v3
+    /// thunk's body actually accesses pay the bridge cost.
+    Bridge    = 4,
 };
 
 struct Thunk
@@ -110,6 +118,11 @@ struct Thunk
             const PrimOp * fn;
             // args follow as FAM
         } native;
+        // ThunkState::Bridge — pointer to a tree-walker nix::Value
+        // that the OP_FORCE handler will forceValue + bridge on
+        // access.  Stored as `void *` so closure.hh stays free of
+        // nix:: includes; cast to nix::Value * at the use site.
+        void * bridgeSrc;
     };
 
     // FAM: upvalues[nUpvalues] for Suspended; args[fn->arity] for Native.
