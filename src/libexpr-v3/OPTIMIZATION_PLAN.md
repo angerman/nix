@@ -1350,6 +1350,77 @@ Suggested follow-ups before WC-8:
     correctly correlated.
   - Re-enable WC-6's closure bridge once the above are in place.
 
+### The rec-attrset env reconstruction (the actual headline blocker)
+
+Diagnostic (`V3_DEBUG_ORIGINS=1`, commit `35265e086`) on
+`[hello git vim].drvPath` shows the cache-population skips break
+down as ~90% "fv in recVarSet" and ~10% "no varOrigins entry".
+Both root in the same gap: v3 represents rec-attrset
+self-references as a single VarId (the rec Bindings*); tree-walker
+spreads the same bindings across multiple env cells at
+displacement 0..N-1.  Phase B's `(level, displ)` model can't
+bridge the two — at force time the v3 thunk wants a single
+`Bindings*` upvalue but tree-walker's env has the names
+distributed.
+
+The needed extension:
+
+  1. **Lower.** When `resolveVar` hits a rec slot
+     (`lower.cc:162`), ALSO record `(currentFunc, recVar) →
+     (level, names_list)` into a new `Module::recVarOrigins`.
+     The level is the depth from `currentFunc`'s locals to the
+     rec scope — same as `(level, displ)` but with `names`
+     replacing a single `displ`.
+
+  2. **populateSubExprCacheLocal.** When `fv` is in `recVarSet`,
+     look it up in `recVarOrigins`.  If found, push a
+     `RecBuild{level, names}` upvalueSource (a new variant
+     alongside the existing `Direct{level, displ}`).  No more
+     blanket skip.
+
+  3. **v3ForceHook Phase B.** When materialising upvalues, for a
+     `RecBuild` source: walk `env.up` `level` times, then for
+     each name in `names` read `env.values[displ]` (where displ
+     is the name's position).  Allocate a v3 `Bindings*` with
+     those (sym, value) pairs and pass it as the upvalue.
+
+  4. **Sub-cases that still need handling:**
+       - `inherit (e) x;` — synthesised inheritFrom var.  The
+         freeVar references a v3 thunk-internal that doesn't
+         exist in tree-walker's env shape; needs a separate
+         "inherit-from origin" record, similar to `RecBuild`.
+       - `with` blocks — the with-stack ID isn't an env cell
+         either.  Either snapshot from tree-walker's `with`
+         frames or fall back.
+
+  5. **Cost.** Building a fresh `Bindings*` per force is
+     non-trivial (one alloc + N entry writes).  For deeply-
+     thunked rec attrsets this could compound.  Profile after
+     landing; the alternative is a value-cache keyed on
+     (env-pointer, recVar).
+
+This is a multi-day design + implementation pass.  The diagnostic
+is in place to drive it precisely, and Phase WC's other pieces
+(WC-2/3/4 infrastructure, WC-5 throw-path cleanup) are the
+foundation it builds on.
+
+### State of the deferred WC-8 contingency
+
+Parse-time pre-lowering (replace each parsed Expr with a thin
+`ExprBytecodeThunk`-style wrapper that runs through v3 directly)
+remains the documented escalation path.  It would side-step the
+hand-off-mark issue (no fall-back to tree-walker mid-flight), but
+exposes any latent v3 correctness gap on real nixpkgs eval.
+Warrants its own dedicated session with the parity harness +
+lang/cutover suites + a focused nixpkgs subset as gate.
+
+Recommended order:
+  1. Land the rec-attrset env reconstruction (Phase B variant).
+  2. Re-measure with WC-7 acceptance criteria.
+  3. If still short, extend WC-5 to success path + re-enable WC-6.
+  4. Re-measure.
+  5. Only then consider WC-8.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
