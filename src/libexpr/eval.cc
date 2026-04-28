@@ -1224,10 +1224,16 @@ void EvalState::eval(Expr * e, Value & v)
             k != Expr::Kind::Float  && k != Expr::Kind::String &&
             k != Expr::Kind::Path   && k != Expr::Kind::Var &&
             k != Expr::Kind::Pos    && k != Expr::Kind::Attrs &&
-            k != Expr::Kind::List) {
+            k != Expr::Kind::List   && k != Expr::Kind::Select) {
             v3EvalHook(*this, e, v);
             return;
         }
+        // Trivial shape (literals/Var/Lambda/Pos/Attrs/List) or
+        // Select — top-level Select is typically the user expression
+        // (`pkgs.foo.bar`); tree-walker handles selects directly,
+        // and v3's lower of the chain triggers a known blackhole on
+        // import cascades.  Better to defer to tree-walker than to
+        // lower+throw+fall-back.
         // Trivial shape — fall through to tree-walker dispatch
         // below.  Order is preserved: v3 takes precedence over the
         // remaining v2/disk-cache paths only for non-trivial shapes,
