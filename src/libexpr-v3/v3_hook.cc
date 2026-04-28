@@ -22,9 +22,12 @@
 #include "v3/value.hh"
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/serialize.hh"
+#include "v3/disk_cache.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/nixexpr.hh"
+#include "nix/util/source-path.hh"
 
 #include <chrono>
 #include <memory>
@@ -270,6 +273,54 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         st.cacheMisses++;
         if (diag) std::fprintf(stderr, "v3 hook: cache miss kind=%d\n",
                                e ? (int)e->exprKind : -1);
+
+        // VM-4: try the disk cache before lower+compile.  Cache key
+        // is SHA-256 of the source file content; only files reachable
+        // via Pos::Origin's SourcePath are eligible.  Gated on
+        // NIX_V3_DISK_CACHE=1 — disabled by default.
+        //
+        // CAVEAT: many Expr node kinds (ExprLet, ExprAttrs, etc.) don't
+        // override getPos and return noPos by default — the position
+        // info is on individual sub-tokens, not the top-level node.
+        // For those, the disk-cache key calculation produces an empty
+        // origin and we fall through to fresh lower+compile.  Future
+        // work: track the source file path explicitly when v3's
+        // primImport / tree-walker's evalFile parses the file.
+        static const bool diskCacheEnabled =
+            std::getenv("NIX_V3_DISK_CACHE") != nullptr;
+        std::string srcContent;
+        disk_cache::CacheKey diskKey{};
+        if (diskCacheEnabled && e) {
+            try {
+                auto pos = state.positions[e->getPos()];
+                if (auto * sp = std::get_if<nix::SourcePath>(&pos.origin)) {
+                    srcContent = sp->readFile();
+                    diskKey = disk_cache::computeKeyForString(srcContent);
+                }
+            } catch (...) {
+                // Best-effort — any read failure means no disk lookup.
+            }
+        }
+        if (!diskKey.empty()) {
+            if (auto blob = disk_cache::lookup(diskKey)) {
+                try {
+                    auto compiled = std::make_unique<CompilationUnit>(
+                        serialize::deserializeCU(*blob));
+                    cu = compiled.get();
+                    cache.emplace(e, CachedUnit{std::move(compiled)});
+                    if (diag) std::fprintf(stderr,
+                        "v3 hook: disk-cache HIT key=%s\n",
+                        diskKey.hex().substr(0, 16).c_str());
+                    goto cu_ready;
+                } catch (const std::exception & ex) {
+                    if (diag) std::fprintf(stderr,
+                        "v3 hook: disk-cache deserialize threw: %s\n",
+                        ex.what());
+                    // Fall through to fresh lower+compile.
+                }
+            }
+        }
+
         try {
             auto t0 = timingEnabled ? clock::now() : clock::time_point{};
             auto module = lowerNixExpr(e, state.symbols, state.positions);
@@ -399,6 +450,23 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     std::move(entry));
             }
             cache.emplace(e, CachedUnit{std::move(compiled)});
+
+            // VM-4: write the freshly-compiled CU to disk cache for
+            // reuse on subsequent invocations of this same source.
+            // Best-effort — failures (full disk, etc.) silently
+            // increment insertFailures.
+            if (!diskKey.empty() && serialize::isCacheable(*cu)) {
+                try {
+                    std::string blob = serialize::serializeCU(*cu);
+                    disk_cache::insert(diskKey, blob);
+                    if (diag) std::fprintf(stderr,
+                        "v3 hook: disk-cache INSERT key=%s blob=%zu bytes\n",
+                        diskKey.hex().substr(0, 16).c_str(), blob.size());
+                } catch (const std::exception & ex) {
+                    if (diag) std::fprintf(stderr,
+                        "v3 hook: disk-cache serialize threw: %s\n", ex.what());
+                }
+            }
         } catch (const std::exception & ex) {
             if (diag) std::fprintf(stderr, "v3 hook: lower/compile threw: %s\n", ex.what());
             // Fall back to tree-walker by calling e->eval directly.
@@ -408,6 +476,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             e->eval(state, state.baseEnv, v);
             return;
         }
+        cu_ready:;
     } else {
         st.cacheHits++;
         cu = it->second.cu.get();
