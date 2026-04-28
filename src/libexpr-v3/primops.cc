@@ -61,6 +61,8 @@
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
 
+#include "nix/fetchers/fetch-to-store.hh"
+
 #include <boost/unordered/concurrent_flat_map.hpp>
 
 namespace nix::v3 {
@@ -3979,15 +3981,51 @@ void primFromTOML(EvalState & state, Value * args, Value & out)
     }
 }
 
+// BR-4: native builtins.path.  Mirrors prim_path / addPath
+// (libexpr/primops.cc:3083 / :2944) for the no-filter case.
+//
+// Skips the v3->tw bridge encode + tw->v3 decode round-trip; calls
+// fetchToStore directly against state.nixEvalState->store.  Filter
+// closures are tricky to drive from native (they would re-enter
+// v3's VM on every directory entry); when present we fall back to
+// the bridge, which already invokes them via the
+// __v3_call_bridge_2 PrimOpApp shim (primV3CallBridge2 above).
+//
+// Throws on any unsupported shape; caller's primPath catches and
+// falls through to the existing bridge.
+static void primPathNative(EvalState & state, Value * args, Value & out);
+
 /// builtins.path { path; name?; filter?; recursive?; sha256?; }:
-/// add a path to the (fake) v3 store.  Real Nix would copy the path
-/// (with `filter` applied) and verify against `sha256`; v3 returns
-/// a synthetic store path string built from `name` (defaulting to
-/// the basename).  Filter/recursive/sha256 are accepted but unused.
+/// add a path to the v3 store and return its store-path string with
+/// Opaque NixStringContext.  Mirrors tree-walker's prim_path.
+///
+/// Native fast path (BR-4) handles the no-filter case in one call
+/// to fetchToStore; falls back to the bridge when a `filter`
+/// closure is supplied (the closure would have to re-enter the v3
+/// VM on every fs entry — left to a follow-up).
 void primPath(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("path", "attrset");
+    // BR-4 native fast path.
+    static const bool nativeDisabled =
+        std::getenv("V3_PATH_NO_NATIVE") != nullptr;
+    if (!nativeDisabled && state.nixEvalState) {
+        // Filter present → bail to bridge (closure re-entry not yet
+        // wired from this code path).
+        SymbolId sFilter = ir::globalInternSymbol("filter");
+        if (!args[0].payload.bindings->lookup(sFilter)) {
+            try {
+                primPathNative(state, args, out);
+                return;
+            } catch (const std::exception & e) {
+                if (std::getenv("V3_DRV_DEBUG"))
+                    std::fprintf(stderr,
+                        "v3 builtins.path native fell back: %s\n", e.what());
+                // fall through.
+            }
+        }
+    }
     // Bridge to tree-walker's `builtins.path` so we get a proper
     // content-addressed `/nix/store/<32-char-hash>-name` result.
     // (settings.readOnlyMode means the store path is *computed* from
@@ -4037,6 +4075,127 @@ void primPath(EvalState & state, Value * args, Value & out)
     std::strcpy(buf, outPath.c_str());
     out.tag_payload = static_cast<uint64_t>(Tag::Path);
     out.payload.path = buf;
+}
+
+// BR-4 native builtins.path body (gated on filter being absent —
+// see primPath).
+static void primPathNative(EvalState & state, Value * args, Value & out)
+{
+    auto & ns = *state.nixEvalState;
+    auto * src = args[0].payload.bindings;
+
+    // Use SymbolIds.  The names here are not in drvStrictSymbols
+    // because builtins.path uses different attr names (path, name,
+    // filter, recursive, sha256).
+    static const SymbolId sPath      = ir::globalInternSymbol("path");
+    static const SymbolId sName      = ir::globalInternSymbol("name");
+    static const SymbolId sRecursive = ir::globalInternSymbol("recursive");
+    static const SymbolId sSha256    = ir::globalInternSymbol("sha256");
+
+    // Read `path` (required).  Accept Tag::Path or Tag::String.
+    const Value * pathRaw = src->lookup(sPath);
+    if (!pathRaw)
+        throw std::runtime_error(
+            "v3 BR-4 native: missing required `path` attribute");
+    Value pathV = forceValue(*state.vm, *pathRaw);
+    std::string pathStr;
+    if (pathV.isPath()) {
+        pathStr = pathV.payload.path ? pathV.payload.path : "";
+    } else if (pathV.isString()) {
+        pathStr = pathV.payload.str ? pathV.payload.str : "";
+    } else {
+        throw std::runtime_error(
+            "v3 BR-4 native: `path` is not a path or string");
+    }
+    nix::SourcePath path(ns.rootFS, nix::CanonPath(pathStr));
+
+    // Read `name` (optional, defaults to basename).
+    std::string name;
+    if (auto * nameV = src->lookup(sName)) {
+        Value f = forceValue(*state.vm, *nameV);
+        if (!f.isString())
+            throw std::runtime_error(
+                "v3 BR-4 native: `name` is not a string");
+        name = f.payload.str ? f.payload.str : "";
+    }
+    if (name.empty()) {
+        name = path.baseName();
+    }
+
+    // Read `recursive` (optional, default true → NixArchive).
+    nix::ContentAddressMethod method = nix::ContentAddressMethod::Raw::NixArchive;
+    if (auto * rV = src->lookup(sRecursive)) {
+        Value f = forceValue(*state.vm, *rV);
+        if (!f.isBool())
+            throw std::runtime_error(
+                "v3 BR-4 native: `recursive` is not a bool");
+        method = (f.payload.i == 1)
+            ? nix::ContentAddressMethod::Raw::NixArchive
+            : nix::ContentAddressMethod::Raw::Flat;
+    }
+
+    // Read `sha256` (optional).  Tree-walker uses this for verification
+    // post-fetch — if mismatched, errors.
+    std::optional<nix::Hash> expectedHash;
+    if (auto * shaV = src->lookup(sSha256)) {
+        Value f = forceValue(*state.vm, *shaV);
+        if (!f.isString())
+            throw std::runtime_error(
+                "v3 BR-4 native: `sha256` is not a string");
+        expectedHash = nix::newHashAllowEmpty(
+            f.payload.str ? f.payload.str : "", nix::HashAlgorithm::SHA256);
+    }
+
+    // Compute the expected store path (when sha256 is provided) and
+    // skip the actual fetch if the path already exists in the store.
+    // Mirrors addPath's expectedStorePath optimisation.
+    if (expectedHash) {
+        nix::StorePath expected = ns.store->makeFixedOutputPathFromCA(
+            name,
+            nix::ContentAddressWithReferences::fromParts(
+                method, *expectedHash, {}));
+        if (ns.store->isValidPath(expected)) {
+            std::string outPath = ns.store->printStorePath(expected);
+            Value v3Out = mkStringValueOwned(outPath);
+            nix::NixStringContext outCtx;
+            outCtx.insert(nix::NixStringContextElem{
+                nix::NixStringContextElem::Opaque{.path = expected}});
+            setStringContext(v3Out.payload.str, outCtx);
+            out = v3Out;
+            return;
+        }
+    }
+
+    // Fetch (DryRun under readOnlyMode just computes the path).  No
+    // filter: the gate above bailed when one was present.
+    nix::StorePath dst = nix::fetchToStore(
+        ns.fetchSettings,
+        *ns.store,
+        path.resolveSymlinks(),
+        nix::settings.readOnlyMode ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
+        name,
+        method,
+        nullptr,
+        ns.repair);
+
+    if (expectedHash) {
+        nix::StorePath expected = ns.store->makeFixedOutputPathFromCA(
+            name,
+            nix::ContentAddressWithReferences::fromParts(
+                method, *expectedHash, {}));
+        if (expected != dst)
+            throw std::runtime_error(
+                "v3 BR-4 native: store path mismatch in path added "
+                "from '" + pathStr + "'");
+    }
+
+    std::string outPath = ns.store->printStorePath(dst);
+    Value v3Out = mkStringValueOwned(outPath);
+    nix::NixStringContext outCtx;
+    outCtx.insert(nix::NixStringContextElem{
+        nix::NixStringContextElem::Opaque{.path = dst}});
+    setStringContext(v3Out.payload.str, outCtx);
+    out = v3Out;
 }
 
 /// builtins.scopedImport scope path -- like import, but extends the

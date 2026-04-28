@@ -106,6 +106,21 @@ TESTS=(
 
   # 21. __structuredAttrs with nested attrset value.
   "structured-nested:(derivation { name = \"sc\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; __structuredAttrs = true; outputChecks = { out = { allowedReferences = [ \"x\" ]; }; }; }).drvPath"
+
+  # --- BR-4: builtins.path native ---
+
+  # 22. Plain builtins.path with explicit name.
+  "path-plain:(builtins.path { name = \"test-readme\"; path = ./README.md; })"
+
+  # 23. builtins.path with default name (basename).
+  "path-default-name:(builtins.path { path = ./README.md; })"
+
+  # 24. builtins.path with recursive=false (Flat hash).
+  "path-flat:(builtins.path { name = \"flat\"; path = ./README.md; recursive = false; })"
+
+  # 25. Path used inside a derivation's builder env (drvPath
+  # depends on the path's NAR hash being correctly inserted).
+  "drv-with-path:(derivation { name = \"with-path\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; src = builtins.path { name = \"src\"; path = ./README.md; }; }).drvPath"
 )
 
 # Phase C tests need the experimental features enabled.
