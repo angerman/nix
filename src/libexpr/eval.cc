@@ -1200,6 +1200,7 @@ void EvalState::resetFileCache()
 }
 
 EvalState::V3EvalHook EvalState::v3EvalHook = nullptr;
+EvalState::V3ForceHook EvalState::v3ForceHook = nullptr;
 
 void EvalState::eval(Expr * e, Value & v)
 {

@@ -106,8 +106,20 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             Expr * expr = v.thunk().expr;
             try {
                 v.mkBlackhole();
-                if (env) [[likely]]
-                    expr->eval(*this, *env, v);
+                if (env) [[likely]] {
+                    // V3 sub-Expr cutover: when NIX_USE_V3_FORCE=1 is
+                    // set, libnixexprv3 installs v3ForceHook; until
+                    // CO-3 (sub-Expr cache pre-population) lands the
+                    // hook will mostly miss but tracks counters.  When
+                    // the hook is null (default) the branch is
+                    // predicted-not-taken and folds into a direct
+                    // expr->eval call.
+                    if (__builtin_expect(v3ForceHook != nullptr, 0)
+                        && v3ForceHook(*this, expr, *env, v))
+                        ; // handled by v3
+                    else
+                        expr->eval(*this, *env, v);
+                }
                 else
                     ExprBlackHole::throwInfiniteRecursionError(*this, v);
             } catch (...) {

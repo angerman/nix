@@ -61,6 +61,19 @@ struct V3HookStats {
     uint64_t cacheHits    = 0;
     uint64_t cacheMisses  = 0;
 
+    // CO-2 sub-Expr cutover at forceValue.  Tracks how often the
+    // forceValue hook fires + hits the cache.  Without sub-Expr cache
+    // pre-population (CO-3), hits will mostly be 0 — but the Force
+    // counter still reveals how much of the eval path goes through
+    // sub-Expr forces vs. top-level evals.
+    uint64_t forceEntries = 0;
+    uint64_t forceHits    = 0;
+    uint64_t forceMisses  = 0;
+    /// `force` skipped because the cache entry needed upvalues we
+    /// don't yet know how to translate from tree-walker's env.
+    /// Phase B (env translation) will reduce this to zero.
+    uint64_t forceSkippedNeedsUpvalues = 0;
+
     // Per-phase total time (nanoseconds) — only populated when
     // V3_TIMING=1.  Lets us see whether lower, compile, run, or
     // bridge dominates the cutover overhead per file-toplevel Expr.
@@ -136,6 +149,12 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     (unsigned long long)s.evalEntries,
                     (unsigned long long)s.cacheHits,
                     (unsigned long long)s.cacheMisses);
+                std::fprintf(stderr,
+                    "v3 force stats: forceEntries=%llu forceHits=%llu forceMisses=%llu skippedNeedsUpvalues=%llu\n",
+                    (unsigned long long)s.forceEntries,
+                    (unsigned long long)s.forceHits,
+                    (unsigned long long)s.forceMisses,
+                    (unsigned long long)s.forceSkippedNeedsUpvalues);
                 if (std::getenv("V3_TIMING"))
                     std::fprintf(stderr,
                         "v3 hook timing (ms): lower=%.3f compile=%.3f run=%.3f bridge=%.3f\n",
@@ -308,6 +327,108 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     }
 }
 
+/// CO-2 phase A — forceValue cutover.  Hooked from
+/// EvalState::forceValue (eval-inline.hh) before the expr->eval
+/// dispatch.  Returns true if v3 handled the eval; false to fall
+/// through.
+///
+/// Phase A scope: only handle cache-hit Expr*s whose entry function
+/// (functions[0]) has no freeVars — i.e., self-contained
+/// CompilationUnits whose top-level needs no env from tree-walker.
+/// In practice, this is the same set the top-level evalHook caches:
+/// each imported file is its own CU, and its functions[0] should be
+/// closed (every binding is local or comes from primops).
+///
+/// Phase B (CO-2 phase B / task #278) extends this to env-requiring
+/// entries by walking tree-walker's `env` to materialise the v3
+/// upvalues array at hook time.  Until that lands, freeVars-bearing
+/// entries are signalled via forceSkippedNeedsUpvalues.
+static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
+                          nix::Env & /*env*/, nix::Value & v)
+{
+    // Gating: NIX_USE_V3 enables the eval hook (file-toplevel
+    // cutover); the forceValue hook is additionally gated on
+    // NIX_USE_V3_FORCE=1.  Without sub-Expr cache pre-population
+    // (CO-3 / task #279) every force call here misses and adds
+    // ~75 ns of overhead — for hello.name that's 218k calls = ~16 ms.
+    // Until CO-3 lands the hook is opt-in; after CO-3 we'll flip
+    // the default and remove the separate env var.
+    static const bool useV3Force = []{
+        const char * a = std::getenv("NIX_USE_V3");
+        const char * b = std::getenv("NIX_USE_V3_FORCE");
+        return a && std::string_view(a) == "1"
+            && b && std::string_view(b) == "1";
+    }();
+    if (!useV3Force) return false;
+
+    auto & st = v3HookStats();
+    st.forceEntries++;
+
+    auto & cache = v3HookCache();
+    auto it = cache.find(e);
+    if (it == cache.end()) {
+        st.forceMisses++;
+        return false;  // No cached CU — fall through to expr->eval.
+    }
+
+    const CompilationUnit * cu = it->second.cu.get();
+    // Phase A guard: only handle self-contained entries.  The top-
+    // level function's freeVars must be empty — otherwise we'd need
+    // to translate env to upvalues, which is Phase B (task #278).
+    if (!cu->lambdas.empty() && cu->lambdas[0].nUpvalues != 0) {
+        st.forceSkippedNeedsUpvalues++;
+        return false;
+    }
+
+    setNixEvalState(&state);
+    bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
+    if (diag) std::fprintf(stderr,
+        "v3 force hook: CU hit, running %zu insts / %zu lambdas\n",
+        cu->code.size(), cu->lambdas.size());
+
+    Value r;
+    try {
+        r = run(*cu);
+    } catch (const std::exception & ex) {
+        if (diag) std::fprintf(stderr, "v3 force hook: run threw: %s\n", ex.what());
+        return false;  // Fall back: tree-walker handles the rest.
+    }
+
+    // Bridge result back to tree-walker Value.  Mirror the eval hook's
+    // logic — same bridge, same fallback rules.
+    switch (r.tag()) {
+    case Tag::Bool:   v.mkBool(r.payload.i == 1); st.forceHits++; return true;
+    case Tag::Int:    v.mkInt(r.payload.i);       st.forceHits++; return true;
+    case Tag::Float:  v.mkFloat(r.payload.f);     st.forceHits++; return true;
+    case Tag::Null:   v.mkNull();                 st.forceHits++; return true;
+    case Tag::String:
+        v.mkString(r.payload.str ? r.payload.str : "", state.mem);
+        st.forceHits++;
+        return true;
+    case Tag::Path:
+    case Tag::Attrs:
+    case Tag::List: {
+        try {
+            nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
+            if (tmp) { v = *tmp; st.forceHits++; return true; }
+        } catch (const std::exception &) {
+            // bridge fail — fall through
+        }
+        return false;
+    }
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::Uninitialized:
+    case Tag::External:
+    default:
+        return false;
+    }
+}
+
 namespace {
 
 /// Static initializer — runs at library load time.  Once
@@ -317,7 +438,18 @@ namespace {
 /// dumps the hook stats when NIX_VM_STATS=1 is set, so the user
 /// can verify the cutover is actually firing.
 struct V3HookRegistrar {
-    V3HookRegistrar() { nix::EvalState::v3EvalHook = &v3EvalEntry; }
+    V3HookRegistrar() {
+        nix::EvalState::v3EvalHook = &v3EvalEntry;
+        // The forceValue hook is opt-in via NIX_USE_V3_FORCE=1; left
+        // null by default so eval-inline.hh's branch-predictor folds
+        // the v3 check away entirely on workloads that don't need it.
+        // Until CO-3 (sub-Expr cache pre-population) lands the hook
+        // costs more than it saves on real-world workloads.
+        if (const char * v = std::getenv("NIX_USE_V3_FORCE");
+            v && std::string_view(v) == "1") {
+            nix::EvalState::v3ForceHook = &v3ForceEntry;
+        }
+    }
 };
 
 [[maybe_unused]] V3HookRegistrar _v3_hook_registrar_instance;
@@ -335,5 +467,9 @@ namespace nix::v3 {
 void installEvalHook()
 {
     nix::EvalState::v3EvalHook = &v3EvalEntry;
+    if (const char * v = std::getenv("NIX_USE_V3_FORCE");
+        v && std::string_view(v) == "1") {
+        nix::EvalState::v3ForceHook = &v3ForceEntry;
+    }
 }
 } // namespace nix::v3

@@ -724,6 +724,22 @@ public:
     static V3EvalHook v3EvalHook;
 
     /**
+     * forceValue cutover hook.  Called from EvalState::forceValue (in
+     * eval-inline.hh) BEFORE the expr->eval() dispatch, when a thunk
+     * is being forced with an associated Expr*.
+     *
+     * Returns true if v3 handled the evaluation (and filled `v`); false
+     * to fall through to the standard expr->eval(...) path.
+     *
+     * This is the entry point for sub-Expr cutover (CO-2/CO-3): the
+     * hook can consult v3's per-Expr* cache and, on a hit, run the
+     * pre-compiled bytecode against a v3 closure built from `env`'s
+     * current values.  Misses fall through cleanly.
+     */
+    using V3ForceHook = bool (*)(EvalState &, Expr *, Env &, Value &);
+    static V3ForceHook v3ForceHook;
+
+    /**
      * Evaluation the expression, then verify that it has the expected
      * type.
      */
