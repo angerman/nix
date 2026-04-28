@@ -629,6 +629,52 @@ real-world workloads.  Future refinements can either:
   - BR-3 (native derivationStrict) for nixpkgs-wide eval wins
     (estimated ~250ms saved on 25k-package scan).
 
+## 2026-04-29 — VM-4 bytecode disk cache (foundation)
+
+Six commits land the foundation for VM-4 (the bytecode disk cache
+mirrored from v2):
+
+  - `ae8c8327a` — `serialize.{hh,cc}`: round-trip a CompilationUnit
+    through bytes + magic + schema-version'd format.
+  - `535c81c9b` — file-based disk cache (`$XDG_CACHE_HOME/nix/v3-bc-v1/`)
+    with SHA-256 keying, atomic writes via temp+rename, stats.
+  - `3add873e2` — hook the disk cache into v3HookCache populate
+    (LIMITED COVERAGE: most Expr nodes don't override getPos and
+    return noPos, so the source-path lookup fails and we
+    fall through to fresh lower+compile).
+  - `85768be29` — `remapSymbolsInBytecode`: at deserialize, re-
+    resolve `cu.symbolTable` names through `globalInternSymbol()`
+    and rewrite SymbolIds in OP_ATTRS_SELECT / OP_ATTRS_HAS /
+    OP_WITH_LOOKUP operands and OP_ATTRS_INIT[_DYN]/REC_INIT data
+    words.  Also remaps LambdaDescriptor formal names.
+
+What works:
+  - Round-trip in memory (testSerializeRoundTrip).
+  - Round-trip on disk (testDiskCacheRoundTrip).
+  - `import <nixpkgs/lib>` via v3-eval direct, run twice, returns
+    consistent 494 (the second run hits the disk cache).
+
+What's still broken:
+  - With NIX_V3_DISK_CACHE=1 in the lang test runner, ~9 of 142
+    tests fail with "OP_ATTRS_SELECT: attribute not found" or
+    return wrong shapes (e.g. `<LAMBDA>` where a string is
+    expected).
+  - The integration in primImport was reverted because of these
+    test failures.
+
+Likely root cause: rec-attrset construction at runtime uses
+SymbolIds in OP_ATTRS_REC_INIT bytecode + OP_ATTRS_REC_SET; my
+walker handles OP_ATTRS_REC_INIT but possibly misses something
+in the rec-set path.  Also possible: the IC slot index follow-up
+words after OP_ATTRS_SELECT can be confused with attr values
+in some unusual layouts.  Not yet root-caused.
+
+For now, the disk cache is opt-in via NIX_V3_DISK_CACHE=1 but
+plumbed only at the v3 eval hook (limited coverage).  Future work:
+  - Trace the test failures to the exact mismatched bytecode.
+  - Add more remap walker test coverage (multi-CU sequences).
+  - Then land the primImport integration.
+
 ## 2026-04-29 — v3 robustness wins over tree-walker
 
 Spot-checked the 6 "silent-pass" eval-fail tests.  Most are
