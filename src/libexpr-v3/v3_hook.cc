@@ -75,6 +75,12 @@ struct SubExprCacheEntry {
     /// or more freeVars couldn't be traced back to a direct env
     /// reference (synthesized rec-attrset access, etc.).
     std::vector<std::pair<uint32_t, uint32_t>> upvalueSources;
+    /// Phase B blacklist: set to true once a Phase B run for this
+    /// entry threw at runtime.  Subsequent forces skip the entry
+    /// instead of paying the lower+upvalue+run cost just to throw
+    /// again — same Expr* + same env shape gives the same result.
+    /// Reset only on cache rebuild (which doesn't happen mid-run).
+    bool                    phaseBFailed = false;
 };
 
 static std::unordered_map<const nix::Expr *, SubExprCacheEntry> & v3SubExprCache()
@@ -452,7 +458,13 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     auto & subCache = v3SubExprCache();
     auto sit = subCache.find(e);
     if (sit != subCache.end()) {
-        const auto & ent = sit->second;
+        auto & ent = sit->second;
+        if (ent.phaseBFailed) {
+            // We tried Phase B for this entry before and it threw.
+            // Same Expr* / same env shape => same outcome.  Skip.
+            st.forceSkippedNeedsUpvalues++;
+            return false;
+        }
         if (ent.nUpvalues != 0) {
             if (ent.upvalueSources.empty()) {
                 // Phase B can't handle this entry (synthesized rec/
@@ -524,6 +536,14 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
         }
     } catch (const std::exception & ex) {
         if (diag) std::fprintf(stderr, "v3 force hook: run threw: %s\n", ex.what());
+        // Phase B blacklist: same Expr* will arrive with the same env
+        // shape on subsequent forces; retrying would just throw again.
+        // Mark the entry as "Phase B failed" so we skip the whole
+        // chain (cache lookup + env walk + run) next time.
+        if (!upvalues.empty()) {
+            auto sit2 = v3SubExprCache().find(e);
+            if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailed = true;
+        }
         return false;  // Fall back: tree-walker handles the rest.
     }
 
