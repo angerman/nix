@@ -776,12 +776,19 @@ struct Lowerer
         m.functions[fid].entryBlock = entry;
         m.functions[fid].name = "<thunk>";
 
-        // CO-3: record (Expr* -> FuncId) so the post-compile pass can
-        // wire this thunk into the forceValue cutover cache.  Tree-
-        // walker's forceValue gets called with `expr->thunk().expr`
-        // (= `e` here); a cache hit lets v3 run the thunk body
-        // directly instead of falling through to expr->eval.
-        m.subExprFuncs.push_back({static_cast<const void *>(e), fid});
+        // CO-3: record (Expr* -> FuncId) for the post-compile pass to
+        // wire this thunk into the forceValue cutover cache — but only
+        // when the thunk lives at top-level (= function 0).  Inside a
+        // nested function (lambda body, another thunk), the same AST
+        // Expr* can be reached from multiple call sites with different
+        // tree-walker env shapes.  Our cache key is Expr* alone, so
+        // nested thunks would conflate distinct env shapes — Phase B
+        // would then materialize upvalues from one shape but the
+        // function expects another, causing OP_ATTRS_SELECT throws.
+        // Restrict caching to the unambiguous top-level case for now.
+        bool atTopLevel = funcStack.empty() || funcStack.back() == 0;
+        if (atTopLevel)
+            m.subExprFuncs.push_back({static_cast<const void *>(e), fid});
 
         funcStack.push_back(fid);
         blockStack.push_back(entry);
@@ -1000,6 +1007,7 @@ struct Lowerer
         std::vector<Pending> pending;
         pending.reserve(attrDefs.size());
 
+        bool atTopLevel = funcStack.empty() || funcStack.back() == 0;
         for (auto & kv : attrDefs) {
             m.functions.emplace_back();
             ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
@@ -1007,10 +1015,9 @@ struct Lowerer
             m.functions[fid].entryBlock = eb;
             m.functions[fid].name = std::string(symbols[kv.first]);
             // CO-3: register the LetRec / rec-attrset binding's def
-            // expression with the thunk's function.  Tree-walker stores
-            // these as `let { x = E; }` thunks whose `expr` field is E
-            // — a cache lookup at force time hits this entry.
-            if (kv.second.e)
+            // expression with the thunk's function — only at top
+            // level.  See thunkify() for the rationale.
+            if (atTopLevel && kv.second.e)
                 m.subExprFuncs.push_back({static_cast<const void *>(kv.second.e), fid});
             pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb,
                                 posIdxToHandle(kv.second.pos)});
