@@ -1211,8 +1211,27 @@ void EvalState::eval(Expr * e, Value & v)
     // into the tree-walker `Value` we hand it.
     static bool useV3 = getEnv("NIX_USE_V3").value_or("") == "1";
     if (useV3 && v3EvalHook) {
-        v3EvalHook(*this, e, v);
-        return;
+        // Inline short-circuit for AST shapes where v3's lower+
+        // compile cost is net-negative versus tree-walker's direct
+        // dispatch (literals, Var, Lambda, Pos, Attrs, List).  v3's
+        // own hook applies the same filter internally — moving it
+        // here saves the function-call into the hook for the ~95%
+        // of top-level evals that are these trivial shapes.  At
+        // 254 evals × ~15-20us each on hello.name, this is the
+        // dominant residual cutover overhead.
+        auto k = e->exprKind;
+        if (k != Expr::Kind::Lambda && k != Expr::Kind::Int &&
+            k != Expr::Kind::Float  && k != Expr::Kind::String &&
+            k != Expr::Kind::Path   && k != Expr::Kind::Var &&
+            k != Expr::Kind::Pos    && k != Expr::Kind::Attrs &&
+            k != Expr::Kind::List) {
+            v3EvalHook(*this, e, v);
+            return;
+        }
+        // Trivial shape — fall through to tree-walker dispatch
+        // below.  Order is preserved: v3 takes precedence over the
+        // remaining v2/disk-cache paths only for non-trivial shapes,
+        // and for trivial shapes tree-walker handles them directly.
     }
 
     // When NIX_VM_V2=1 is set, use the v2 IR pipeline:
