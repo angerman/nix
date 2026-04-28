@@ -2224,15 +2224,34 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         auto * b = v.payload.bindings;
         auto bb = ns.buildBindings(b ? b->size : 0);
         auto & symTab = ir::globalSymbolTable();
+        // Per-thread (v3 SymbolId -> nix::Symbol) cache.  The v3 global
+        // symbol table is append-only and tree-walker symbols are
+        // stable for the EvalState's lifetime, so once we've resolved
+        // a v3 SymbolId once it stays valid.  Saves the heterogeneous
+        // hash lookup + string compare on every attr conversion.
+        // Invalidation: bound to nixEvalState; if it changes we drop
+        // the cache (matches the cachedDrvStrict pattern below).
+        static thread_local std::vector<nix::Symbol> v3SymCache;
+        static thread_local nix::EvalState * v3SymCacheFor = nullptr;
+        if (v3SymCacheFor != &ns) {
+            v3SymCacheFor = &ns;
+            v3SymCache.clear();
+        }
         if (b) for (uint32_t i = 0; i < b->size; ++i) {
             SymbolId sid = b->entries[i].name;
-            // Pass the table-owned std::string as a string_view; the
-            // tree-walker SymbolTable uses heterogeneous lookup so this
-            // avoids a per-attribute std::string copy on bridge.
-            std::string_view n = sid < symTab.size()
-                ? std::string_view(symTab[sid])
-                : std::string_view{};
-            bb.insert(ns.symbols.create(n), v3ToTreeWalker(state, b->entries[i].value, seen));
+            nix::Symbol resolved;
+            if (sid < v3SymCache.size() && v3SymCache[sid]) {
+                resolved = v3SymCache[sid];
+            } else {
+                std::string_view n = sid < symTab.size()
+                    ? std::string_view(symTab[sid])
+                    : std::string_view{};
+                resolved = ns.symbols.create(n);
+                if (sid >= v3SymCache.size())
+                    v3SymCache.resize(sid + 1);
+                v3SymCache[sid] = resolved;
+            }
+            bb.insert(resolved, v3ToTreeWalker(state, b->entries[i].value, seen));
         }
         out->mkAttrs(bb);
         break;
@@ -2373,10 +2392,31 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         out.payload.bindings = b;
         seen[key] = out;
+        // Mirror of the v3->tw symbol cache: avoid the std::string copy
+        // (symbols[it.name] is owned by the symbol table, fine as a
+        // string_view) and skip the global table hash on cache hits.
+        // Keyed by nix::Symbol's underlying integer id so we can use a
+        // flat vector.
+        static thread_local std::vector<SymbolId> twSymCache;
+        static thread_local nix::EvalState * twSymCacheFor = nullptr;
+        if (twSymCacheFor != &ns) {
+            twSymCacheFor = &ns;
+            twSymCache.clear();
+        }
         std::vector<std::pair<SymbolId, Value>> entries;
         entries.reserve(a->size());
         for (auto & it : *a) {
-            SymbolId sid = vmIntern(state, std::string(ns.symbols[it.name]));
+            uint32_t key = it.name.getId();
+            SymbolId sid;
+            if (key < twSymCache.size() && twSymCache[key] != 0) {
+                sid = twSymCache[key];
+            } else {
+                std::string_view name(ns.symbols[it.name]);
+                sid = vmIntern(state, name);
+                if (key >= twSymCache.size())
+                    twSymCache.resize(key + 1, 0);
+                twSymCache[key] = sid;
+            }
             entries.emplace_back(sid, treeWalkerToV3(state, *it.value, seen));
         }
         std::sort(entries.begin(), entries.end(),
