@@ -309,6 +309,32 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 e->eval(state, state.baseEnv, v);
                 return;
             }
+            // IR-level closure-result predicate: inspect functions[0]'s
+            // entry block.  If the terminal's value is defined by an
+            // ir::Lambda binding, the run result will be Tag::Closure
+            // that the bridge can't currently hand back.  Skip the
+            // run+bridge cycle directly.  Catches the small (e.g.
+            // 4-function) `Let { x = ...; in lambda }` patterns the
+            // size-based threshold above misses.
+            auto willProduceClosure = [&]() -> bool {
+                if (module.functions.empty()) return false;
+                auto & f0 = module.functions[0];
+                if (f0.entryBlock == ir::kInvalidBlock) return false;
+                auto & blk = module.blocks[f0.entryBlock];
+                auto * ret = std::get_if<ir::TermReturn>(&blk.terminal);
+                if (!ret || ret->value == ir::kInvalid) return false;
+                for (auto & bd : blk.bindings) {
+                    if (bd.var != ret->value) continue;
+                    return std::holds_alternative<ir::Lambda>(bd.expr);
+                }
+                return false;
+            };
+            if (willProduceClosure()) {
+                if (diag) std::fprintf(stderr,
+                    "v3 hook: skip — IR predicts closure result\n");
+                e->eval(state, state.baseEnv, v);
+                return;
+            }
             auto compiled = std::make_unique<CompilationUnit>(compile(module));
             auto t2 = timingEnabled ? clock::now() : clock::time_point{};
             if (timingEnabled) {
