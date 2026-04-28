@@ -2699,28 +2699,29 @@ static std::vector<uint32_t> lexicographicAttrOrder(const Bindings * b)
     return order;
 }
 
-// BR-3.3 + 3.10: detect-fall-back predicate.  Returns true when
-// args[0]'s shape is one the native path can handle — currently:
+// BR-3.3 + 3.10 + 3.11: detect-fall-back predicate.  Returns true
+// when args[0]'s shape is one the native path can handle:
 //   - Phase A: deferred-output simple case (no special attrs).
-//   - Phase B (BR-3.10): fixed-output (outputHash present) — handled
-//     via a separate code branch inside primDerivationStrictNative.
+//   - Phase B (BR-3.10): fixed-output (outputHash present).
+//   - Phase C (BR-3.11): content-addressed (__contentAddressed)
+//     or impure (__impure) — both routed through CAFloating /
+//     Impure DerivationOutputs.
 //
 // False is the SAFE default — any unsupported "complex" attr present
 // routes back through the bridge.  False positives cost a bridge
 // round-trip; false negatives silently produce wrong drvs, so the
 // conservative side wins.
 //
-// Phase C/D will lift the contentAddressed / impure / structuredAttrs
-// gates as native support lands.
+// Phase D will lift the structuredAttrs gate as JSON serialization
+// lands.
 static bool isSimpleDerivationAttrs(const Bindings * b)
 {
     if (!b) return false;
     const auto & sym = drvStrictSymbols();
-    // outputHash is allowed (Phase B handles it).
-    // The rest still gate to the bridge.
+    // outputHash, __contentAddressed, __impure are allowed (Phases
+    // B and C handle them).  __structuredAttrs still gates to the
+    // bridge (Phase D).
     if (b->lookup(sym.structuredAttrs))  return false;
-    if (b->lookup(sym.contentAddressed)) return false;
-    if (b->lookup(sym.impure))           return false;
     return true;
 }
 
@@ -2978,6 +2979,30 @@ static void primDerivationStrictNative(
     drv.name = drvName;
     nix::NixStringContext context;
 
+    // ---- Phase C (BR-3.11): pre-read flag attrs.  These control
+    // the iteration / output-shape decisions and must NOT end up in
+    // drv.env (tree-walker filters them via the default-case switch
+    // at eval.cc:1696).
+    bool ignoreNulls    = false;
+    bool contentAddressed = false;
+    bool isImpure        = false;
+
+    auto readFlagBool = [&](SymbolId sid) -> bool {
+        const Value * v = src->lookup(sid);
+        if (!v) return false;
+        Value f = forceValue(*state.vm, *v);
+        if (!f.isBool()) return false;
+        return f.payload.i == 1;
+    };
+    ignoreNulls       = readFlagBool(sym.ignoreNulls);
+    contentAddressed  = readFlagBool(sym.contentAddressed);
+    isImpure          = readFlagBool(sym.impure);
+
+    if (contentAddressed && isImpure)
+        throw std::runtime_error(
+            "v3 BR-3 native: derivation cannot be both "
+            "content-addressed and impure");
+
     // ---- iterate attrs in lex order (BR-3.4) ----
     auto order = lexicographicAttrOrder(src);
     const auto & symTab = ir::globalSymbolTable();
@@ -2999,6 +3024,20 @@ static void primDerivationStrictNative(
             ? std::string_view(symTab[sid])
             : std::string_view{};
         Value & attrV = src->entries[idx].value;
+
+        // Skip flag attrs — they're meta, not env vars.  Mirrors
+        // tree-walker's switch-case branches that don't fall through
+        // to the default env-emit path (eval.cc:1696).
+        if (sid == sym.ignoreNulls)       continue;
+        if (sid == sym.contentAddressed)  continue;
+        if (sid == sym.impure)            continue;
+
+        // __ignoreNulls=true: skip null-valued attrs entirely
+        // (eval.cc:1690).  Other types fall through to coerce.
+        if (ignoreNulls) {
+            Value forced = forceValue(*state.vm, attrV);
+            if (forced.tag() == Tag::Null) continue;
+        }
 
         // `args` is special: forced as a list-of-strings.
         if (sid == sym.args) {
@@ -3120,13 +3159,52 @@ static void primDerivationStrictNative(
             c.raw);
     }
 
+    // ---- BR-3.11 (Phase C): content-addressed / impure branch.
+    // Mirrors derivationStrictInternal (eval.cc:1921).  Both
+    // shapes share the same "for each declared output, set env to
+    // hashPlaceholder + slot CAFloating-or-Impure" pattern; the
+    // only difference is the DerivationOutput variant.
+    //
+    // outputHashAlgo defaults to SHA256, ingestion method defaults
+    // to NixArchive (recursive) for these CA derivations.
+    if (contentAddressed || isImpure) {
+        nix::HashAlgorithm ha = nix::HashAlgorithm::SHA256;
+        if (outputHashAlgoStr) {
+            if (auto parsed = nix::parseHashAlgoOpt(*outputHashAlgoStr))
+                ha = *parsed;
+        }
+        nix::ContentAddressMethod method =
+            nix::ContentAddressMethod::Raw::NixArchive;
+        if (outputHashModeStr) {
+            if (*outputHashModeStr == "recursive")
+                method = nix::ContentAddressMethod::Raw::NixArchive;
+            else
+                method = nix::ContentAddressMethod::parse(*outputHashModeStr);
+        }
+        for (auto & o : declaredOutputs) {
+            drv.env[o] = nix::hashPlaceholder(o);
+            if (isImpure) {
+                drv.outputs.insert_or_assign(o,
+                    nix::DerivationOutput{nix::DerivationOutput::Impure{
+                        .method   = method,
+                        .hashAlgo = ha,
+                    }});
+            } else {
+                drv.outputs.insert_or_assign(o,
+                    nix::DerivationOutput{nix::DerivationOutput::CAFloating{
+                        .method   = method,
+                        .hashAlgo = ha,
+                    }});
+            }
+        }
+    }
     // ---- BR-3.10 (Phase B): fixed-output branch.  If outputHash
     // is present, build a CAFixed output instead of the deferred
     // path.  Mirrors derivationStrictInternal (eval.cc:1895).
     //
     // Fixed-output derivations require exactly ["out"] as outputs
     // — multi-output fixed isn't supported by libnixstore.
-    if (outputHashStr) {
+    else if (outputHashStr) {
         if (declaredOutputs.size() != 1 || declaredOutputs[0] != "out") {
             throw std::runtime_error(
                 "v3 BR-3 native: multiple outputs are not supported in "

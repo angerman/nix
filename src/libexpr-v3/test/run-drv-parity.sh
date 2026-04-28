@@ -79,7 +79,26 @@ TESTS=(
 
   # 14. Default-method fixed-output (no outputHashMode → defaults to flat).
   "fixed-default:(derivation { name = \"defaulted\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"0jqkajk1c0pjabwx6dknh6sjs61b7llbifs6yiyzy7lks5njgxw0\"; outputHashAlgo = \"sha256\"; }).drvPath"
+
+  # --- Phase C: contentAddressed / impure / __ignoreNulls (BR-3.11) ---
+
+  # 15. __ignoreNulls=true: null attrs filtered from env.
+  "ignore-nulls-true:(derivation { name = \"ign\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; OPT = null; SET = \"v\"; __ignoreNulls = true; }).drvPath"
+
+  # 16. __ignoreNulls=true with multiple null attrs (filter cascades).
+  "ignore-nulls-multi:(derivation { name = \"mul\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; A = null; B = null; C = \"keep\"; __ignoreNulls = true; }).drvPath"
+
+  # 17. __contentAddressed=true (CA derivation, deferred floating outputs).
+  # Requires the ca-derivations experimental feature.
+  "ca-flat:(derivation { name = \"ca\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; __contentAddressed = true; outputHashAlgo = \"sha256\"; outputHashMode = \"recursive\"; }).drvPath"
+
+  # 18. __impure=true (impure derivation).
+  # Requires the impure-derivations experimental feature.
+  "impure:(derivation { name = \"imp\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; __impure = true; outputHashAlgo = \"sha256\"; outputHashMode = \"recursive\"; }).drvPath"
 )
+
+# Phase C tests need the experimental features enabled.
+export NIX_CONFIG="experimental-features = ca-derivations impure-derivations"
 
 pass=0
 fail=0
