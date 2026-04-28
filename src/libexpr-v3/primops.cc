@@ -2722,6 +2722,25 @@ static bool isSimpleDerivationAttrs(const Bindings * b)
     return true;
 }
 
+// BR-3.5 — Phase A native derivationStrict: builds nix::Derivation
+// directly from a v3 attrset, skipping the v3↔tree-walker bridge.
+// Throws std::runtime_error on any unsupported shape; the caller
+// catches and falls back to the bridge.
+//
+// Phase A coverage: deferred-output simple case only (no
+// outputHash, no __structuredAttrs, no __contentAddressed, no
+// __impure — gated by isSimpleDerivationAttrs).  Phases B–D
+// extend this incrementally.
+//
+// Currently builds drv.{name,builder,platform,args,env,outputs}
+// then THROWS "not yet implemented" before the libnixstore write.
+// BR-3.6 (NixStringContext → inputDrvs / inputSrcs) and BR-3.7
+// (fillInOutputPaths + writeDerivation + result attrset) finish
+// the path.  Until then the throw triggers the bridge fall-back,
+// so semantics are unchanged.
+static void primDerivationStrictNative(
+    EvalState & state, Value * args, Value & out);
+
 /// Construct a "fake" derivation attrset.  Real `derivation` interfaces
 /// with the store; we accept the input attrset and tag it with a
 /// synthetic `outPath` so code that just reads outPath works.  Useful
@@ -2729,6 +2748,24 @@ static bool isSimpleDerivationAttrs(const Bindings * b)
 /// actually realizing them.
 void primDerivationStrict(EvalState & state, Value * args, Value & out)
 {
+    // BR-3.5: Phase A native fast path.  Attempted ONLY if the
+    // input shape passes isSimpleDerivationAttrs (cheap presence
+    // check — no value forcing).  Anything that throws falls
+    // through to the existing bridge with no semantics change.
+    if (state.nixEvalState && args[0].isAttrs() && args[0].payload.bindings
+        && isSimpleDerivationAttrs(args[0].payload.bindings))
+    {
+        try {
+            primDerivationStrictNative(state, args, out);
+            return;
+        } catch (const std::exception & e) {
+            if (std::getenv("V3_DRV_DEBUG"))
+                std::fprintf(stderr,
+                    "v3 derivationStrict native fell back: %s\n", e.what());
+            // fall through to the bridge below.
+        }
+    }
+
     // If a tree-walker EvalState is wired, delegate to its real
     // `builtins.derivationStrict` so we get content-addressed
     // /nix/store paths.  Falls back to the v3 fake-store path on any
@@ -2876,6 +2913,144 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
+}
+
+// BR-3.5: Phase A native attr-loop.  Reads args[0] (a v3 Bindings*
+// known-simple per isSimpleDerivationAttrs) and populates a
+// nix::Derivation: name, builder, platform, args, env, outputs.
+//
+// Iteration order: lexicographic by name STRING (BR-3.4) — required
+// for drv-hash parity with tree-walker.
+//
+// Throws on any unsupported shape; the caller's primDerivationStrict
+// catches the throw and falls through to the existing bridge.
+//
+// Currently stops short of writeDerivation — that's BR-3.7.  This
+// commit demonstrates the iteration logic; the bridge fall-back
+// keeps semantics identical.
+static void primDerivationStrictNative(
+    EvalState & state, Value * args, Value & /*out*/)
+{
+    auto & ns = *state.nixEvalState;
+    auto * src = args[0].payload.bindings;
+    const auto & sym = drvStrictSymbols();
+
+    // ---- name ----
+    const Value * nameVRaw = src->lookup(sym.name);
+    if (!nameVRaw)
+        throw std::runtime_error(
+            "v3 BR-3 native: derivation missing required `name` attr");
+    Value nameV = forceValue(*state.vm, *nameVRaw);
+    if (!nameV.isString())
+        throw std::runtime_error(
+            "v3 BR-3 native: `name` attr is not a string");
+    std::string drvName(nameV.payload.str ? nameV.payload.str : "");
+    // libstore validates the name shape — throws on bad chars / empty
+    // / leading dot / etc.  Same validation tree-walker does.
+    nix::checkName(drvName);
+
+    // ---- prepare empty drv + accumulator context ----
+    nix::Derivation drv;
+    drv.name = drvName;
+    nix::NixStringContext context;
+
+    // ---- iterate attrs in lex order (BR-3.4) ----
+    auto order = lexicographicAttrOrder(src);
+    const auto & symTab = ir::globalSymbolTable();
+
+    // Track which outputs were declared.  Default ["out"] if no
+    // `outputs` attr is present (mirrors derivationStrictInternal:1640).
+    std::vector<std::string> declaredOutputs;
+
+    for (uint32_t idx : order) {
+        SymbolId sid = src->entries[idx].name;
+        std::string_view key = sid < symTab.size()
+            ? std::string_view(symTab[sid])
+            : std::string_view{};
+        Value & attrV = src->entries[idx].value;
+
+        // `args` is special: forced as a list-of-strings.
+        if (sid == sym.args) {
+            Value listV = forceValue(*state.vm, attrV);
+            if (!listV.isList())
+                throw std::runtime_error(
+                    "v3 BR-3 native: `args` attr is not a list");
+            if (listV.payload.list) {
+                for (uint32_t i = 0; i < listV.payload.list->size; ++i) {
+                    Value el = forceValue(*state.vm, listV.payload.list->elems[i]);
+                    drv.args.push_back(v3CoerceToString(
+                        state, el, context,
+                        "while evaluating an element of `args`"));
+                }
+            }
+            continue;
+        }
+
+        // `outputs` is special: forced as a list-of-strings, then
+        // remembered for the per-output env vars + DerivationOutput
+        // setup.  The env entry for `outputs` itself is the
+        // space-joined list (matches tree-walker via coerceToString
+        // on coerceMore=true list of strings).
+        if (sid == sym.outputs) {
+            Value listV = forceValue(*state.vm, attrV);
+            if (!listV.isList())
+                throw std::runtime_error(
+                    "v3 BR-3 native: `outputs` attr is not a list");
+            std::string joined;
+            if (listV.payload.list) {
+                for (uint32_t i = 0; i < listV.payload.list->size; ++i) {
+                    Value el = forceValue(*state.vm, listV.payload.list->elems[i]);
+                    if (!el.isString())
+                        throw std::runtime_error(
+                            "v3 BR-3 native: `outputs` element is not a string");
+                    std::string s(el.payload.str ? el.payload.str : "");
+                    if (s.empty())
+                        throw std::runtime_error(
+                            "v3 BR-3 native: empty output name");
+                    if (s == "drvPath")
+                        throw std::runtime_error(
+                            "v3 BR-3 native: invalid output name 'drvPath'");
+                    declaredOutputs.push_back(s);
+                    if (!joined.empty()) joined += ' ';
+                    joined += s;
+                }
+            }
+            drv.env.emplace(std::string(key), std::move(joined));
+            continue;
+        }
+
+        // All other attrs: coerceToString → drv.env[key] = s.
+        // Special-case builder + system to also fill the dedicated
+        // drv.builder / drv.platform fields.
+        std::string s = v3CoerceToString(
+            state, attrV, context,
+            "while evaluating a derivation attribute");
+        if (sid == sym.builder)
+            drv.builder = s;
+        else if (sid == sym.system)
+            drv.platform = s;
+        // emplace gives us "first occurrence wins"; but since attrs
+        // are unique by symbol within a Bindings, this is fine.
+        drv.env.emplace(std::string(key), std::move(s));
+    }
+
+    if (declaredOutputs.empty())
+        declaredOutputs.push_back("out");
+
+    if (drv.builder.empty())
+        throw std::runtime_error(
+            "v3 BR-3 native: required attribute `builder` missing");
+    if (drv.platform.empty())
+        throw std::runtime_error(
+            "v3 BR-3 native: required attribute `system` missing");
+
+    // ---- BR-3.6 (NixStringContext → inputDrvs/inputSrcs) goes here ----
+    // ---- BR-3.7 (deferred outputs + writeDerivation) goes here ----
+    // For now: throw to fall back to bridge.  Full semantics preserved.
+    (void)ns;
+    throw std::runtime_error(
+        "v3 BR-3 native: scaffold complete but write/finish path "
+        "not yet implemented (BR-3.6 / BR-3.7 pending)");
 }
 
 void primDerivation(EvalState & state, Value * args, Value & out)
