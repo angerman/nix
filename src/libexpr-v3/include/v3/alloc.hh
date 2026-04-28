@@ -86,6 +86,33 @@ struct Bindings
 };
 
 // ---------------------------------------------------------------------------
+// Allocation counters (defined before Alloc so allocBindings can record
+// the size histogram inline).
+// ---------------------------------------------------------------------------
+
+struct AllocStats
+{
+    uint64_t valuesAllocated   = 0;
+    uint64_t closuresAllocated = 0;
+    uint64_t thunksAllocated   = 0;
+    uint64_t envsAllocated     = 0;
+    uint64_t listsAllocated    = 0;
+    uint64_t attrsetsAllocated = 0;
+
+    /// Bindings allocation histogram by size.  Buckets:
+    /// [0]=0, [1]=1, [2]=2, [3]=3-4, [4]=5-8, [5]=9-16, [6]=17-32,
+    /// [7]=33-64, [8]=65-128, [9]=129+.  Used to size-tune the
+    /// VM-2 polymorphic Bindings (Empty/Single/Small/Sorted) plan.
+    uint64_t attrsetSizeBuckets[10] = {0,0,0,0,0,0,0,0,0,0};
+};
+
+inline AllocStats & allocStats()
+{
+    static AllocStats stats;
+    return stats;
+}
+
+// ---------------------------------------------------------------------------
 // Allocator surface
 // ---------------------------------------------------------------------------
 
@@ -143,29 +170,22 @@ struct Alloc
         const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * n;
         auto * b = static_cast<Bindings *>(std::malloc(bytes));
         b->size = n;
+        // Track size distribution for VM-2 sizing decisions.  Cheap
+        // (one branch + one increment) — runs once per attrset.
+        auto & buckets = allocStats().attrsetSizeBuckets;
+        if      (n == 0)        buckets[0]++;
+        else if (n == 1)        buckets[1]++;
+        else if (n == 2)        buckets[2]++;
+        else if (n <= 4)        buckets[3]++;
+        else if (n <= 8)        buckets[4]++;
+        else if (n <= 16)       buckets[5]++;
+        else if (n <= 32)       buckets[6]++;
+        else if (n <= 64)       buckets[7]++;
+        else if (n <= 128)      buckets[8]++;
+        else                    buckets[9]++;
         return b;
     }
 };
-
-// ---------------------------------------------------------------------------
-// Allocation counters
-// ---------------------------------------------------------------------------
-
-struct AllocStats
-{
-    uint64_t valuesAllocated   = 0;
-    uint64_t closuresAllocated = 0;
-    uint64_t thunksAllocated   = 0;
-    uint64_t envsAllocated     = 0;
-    uint64_t listsAllocated    = 0;
-    uint64_t attrsetsAllocated = 0;
-};
-
-inline AllocStats & allocStats()
-{
-    static AllocStats stats;
-    return stats;
-}
 
 // ---------------------------------------------------------------------------
 // Per-attr position side-table.

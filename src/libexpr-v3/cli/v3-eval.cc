@@ -543,6 +543,25 @@ int main(int argc, char ** argv)
                 (unsigned long long)a.listsAllocated,
                 (unsigned long long)a.attrsetsAllocated,
                 (unsigned long long)a.envsAllocated);
+            // Bindings size histogram — informs VM-2 polymorphic
+            // Bindings sizing.  Buckets:
+            //  0=empty, 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-128, 129+.
+            static const char * const labels[10] = {
+                "0", "1", "2", "3-4", "5-8", "9-16",
+                "17-32", "33-64", "65-128", "129+"
+            };
+            uint64_t total = 0;
+            for (auto v : a.attrsetSizeBuckets) total += v;
+            std::fprintf(stderr, "v3 attrset size histogram (total=%llu):\n",
+                (unsigned long long)total);
+            for (size_t i = 0; i < 10; ++i) {
+                if (a.attrsetSizeBuckets[i] == 0) continue;
+                double pct = total ? 100.0 * a.attrsetSizeBuckets[i] / total
+                                   : 0.0;
+                std::fprintf(stderr, "  size %-7s %10llu (%5.1f%%)\n",
+                    labels[i],
+                    (unsigned long long)a.attrsetSizeBuckets[i], pct);
+            }
         }
         return rc;
     } catch (const std::exception & ex) {
