@@ -390,3 +390,54 @@ world workloads — by amortizing lower+compile across many forces
 of the same Expr, v3 could win double-digit % once it owns the
 sub-Expr force loop.  But the cutover itself is no longer a
 regression.
+
+## 2026-04-28 evening — CO-2 phase A + CO-3 wired
+
+Two pieces landed that put the sub-Expr cutover infrastructure in
+place:
+
+  - **CO-2 phase A** (commit 0841b28dc): `EvalState::v3ForceHook`
+    function pointer + its inline call site at the head of
+    `EvalState::forceValue` (eval-inline.hh).  Hooked behind the
+    NIX_USE_V3_FORCE=1 env var; default-off so workloads that
+    don't opt in pay no cost (the static initializer doesn't even
+    install the hook).
+
+  - **CO-3** (commit 971ee55ce): the lowerer now records every
+    per-thunk Function's (AST Expr* -> IR FuncId) in the new
+    `Module::subExprFuncs` field.  After compile, v3_hook.cc walks
+    these and emplaces (Expr* -> {CompilationUnit, FuncId,
+    nUpvalues}) into v3SubExprCache.  When v3ForceHook fires and
+    the Expr* hits the sub-cache with nUpvalues == 0, the closed
+    thunk runs via the new `runFunction(cu, funcIdx)` VM entry
+    point.
+
+Counters from `NIX_USE_V3_FORCE=1 NIX_VM_STATS=1
+nix eval (import <nixpkgs> {}).hello.name`:
+
+    v3 force stats: forceEntries=213919 forceHits=14
+                    forceMisses=213411 skippedNeedsUpvalues=493
+
+So 14 sub-Expr forces actually run via v3 instead of dispatching
+to expr->eval — proving the wiring works.  A further 493 hits
+were skipped because the function captures upvalues we can't yet
+translate from tree-walker's env.
+
+Wall-clock impact (NIX_USE_V3_FORCE=1 vs eval-hook only, hello.name):
+0.27s -> 0.29s (~8% slower).  The 213k hash-map lookups dominate
+without Phase B.
+
+**Remaining: CO-2 phase B (env → upvalue translation).**  The
+lower would need to record, per per-thunk Function, a per-freeVar
+(level, displ) source array — so the force hook can walk tree-
+walker's `env` to materialise the upvalues array at force time.
+
+The complication: not every freeVar is a direct (level, displ)
+reference.  Some come from synthesized rec-attrset accesses
+(`addBinding(AttrSelect{recVar, name})`), `with`-lookups, or
+inheritFrom paths.  For those, we'd need to either reconstruct the
+rec attrset from tree-walker's env at force time, or drop the
+function from the cache.
+
+Phase B is genuinely the bigger lift (multi-day work + careful
+correctness checks).  CO-2 phase A + CO-3 are the foundation.
