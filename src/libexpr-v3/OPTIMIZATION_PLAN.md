@@ -1561,22 +1561,38 @@ WC-9 (Option 3, iterative // walk) ships as a complementary
 correctness-and-stack-depth improvement that was a prerequisite
 for WC-10 to land cleanly on real nixpkgs traces.
 
-## 2026-04-28 — WC-11: precompile + populate sub-Expr cache on fallback (LANDED)
+## 2026-04-28 — WC-11: precompile + populate sub-Expr cache on fallback (LANDED, perf claims later corrected)
 
-### Headline measurement (post-WC-11, with NIX_USE_V3_FORCE=1)
+### CORRECTED measurement table (2026-04-28 evening)
 
-| workload    | tw     | v3 default | v3+fhook | fhook/tw |
-|-------------|--------|------------|----------|----------|
-| fib35       | 3.93 s | 3.77 s     | 3.76 s   | 0.96x    |
-| hello-name  | 0.35 s | 0.36 s     | 0.15 s   | **0.43x** |
-| git-name    | 0.36 s | 0.36 s     | 0.15 s   | **0.42x** |
-| attr-pkgs   | 0.36 s | 0.37 s     | 0.15 s   | **0.42x** |
-| attr-hask   | 0.62 s | 0.63 s     | 0.15 s   | **0.24x** |
-| drv3        | 0.43 s | 0.44 s     | 3.92 s   | 9.12x †  |
+The initial WC-11 bench ran `/usr/bin/time` without checking exit
+codes; "0.15 s" times for `v3+fhook` on nixpkgs workloads turned
+out to be FAIL-FAST times where the eval threw "infinite recursion
+encountered" early.  Reran with explicit success/fail tracking:
 
-† drv3 SIGSEGVs with the force hook on — bridge-thunk + force-hook
-interaction stack-overflows on derivationStrict workloads.  The force
-hook stays opt-in (`NIX_USE_V3_FORCE=1`) until that's root-caused.
+| workload    | tw     | v3 default | v3 + NIX_USE_V3_FORCE=1 |
+|-------------|--------|------------|--------------------------|
+| fib35       | 3.87 s | 3.66 s     | 3.64 s ✓                 |
+| hello-name  | 0.35 s | 0.35 s     | **FAIL** (infinite rec)  |
+| git-name    | 0.35 s | 0.35 s     | **FAIL** (infinite rec)  |
+| attr-pkgs   | 0.35 s | 0.36 s     | **FAIL** (infinite rec)  |
+| attr-hask   | 0.62 s | 0.63 s     | **FAIL** (infinite rec)  |
+| drv3        | 0.43 s | 0.43 s     | **FAIL** (infinite rec)  |
+
+So with WC-11 active and the force hook on, **every real-world
+nixpkgs workload fails with "infinite recursion encountered"** —
+not just drv3.  WC-11's precompile vastly expanded the Expr* set
+v3 owns, exposing the same bridge ordering issue WC-12 documents
+on a much broader set of workloads.
+
+Default v3 (no force hook) stays at strict parity with tree-walker
+and produces correct results on every workload — see WC-11
+follow-up commit `31c3cf0bc` which gates the precompile on
+`v3ForceHook != nullptr` so default mode pays no cost.
+
+Pure compute (fib35) is the only workload where v3 still wins
+(~6% faster) — that's the eval-hook taking over the file-toplevel
+let with no cross-VM bridges in the hot loop.
 
 ### Tree-walker reliance: before vs after
 
