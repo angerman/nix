@@ -441,3 +441,67 @@ function from the cache.
 
 Phase B is genuinely the bigger lift (multi-day work + careful
 correctness checks).  CO-2 phase A + CO-3 are the foundation.
+
+## 2026-04-28 late-evening — CO-2 phase B (partial) wired
+
+Phase B's env → upvalue translation now lands as a partial
+implementation:
+
+  - **Commit 1c8d59c2f** — the lowerer records, per
+    `(funcId, varId)` pair, the (level, displ) used to resolve any
+    direct-byDispl ExprVar reference.  Synthesized resolutions
+    (rec-attrset, inheritFrom, with-lookup) are NOT recorded.
+
+  - The post-compile pass builds a per-FuncId `upvalueSources`
+    array — for each freeVar in the function's `freeVars` list,
+    look up its (level, displ) origin.  If any freeVar lacks an
+    origin, leave `upvalueSources` empty so the force hook skips.
+
+  - **Commit e0a8b0114** — record every recVar VarId in
+    `Module::recVarIds` and skip Phase B for any per-thunk
+    function whose freeVars include one.  Avoids 100s of
+    OP_ATTRS_SELECT throws from rec-scope mismatches.
+
+  - **Commit a4496653e** — blacklist cache entries that throw
+    once: same Expr* + same env shape produces the same result, so
+    skip subsequent visits.
+
+  - **VM addition** (vm.cc): `runFunctionWithUpvalues(cu, funcIdx,
+    upvalues, n)` synthesizes a Closure with caller-provided
+    upvalues + runs the function.  Used by the force hook for
+    Phase B hits.
+
+  - **Bridge addition** (primops.cc): `treeWalkerToV3Public`
+    converts a tree-walker `nix::Value` to a v3 `Value`.
+
+Counter movement on hello.name:
+
+    v3 force stats: forceEntries=216414 forceHits=14
+                    forceMisses=215852 skippedNeedsUpvalues=354
+
+The 354 (was 493 with Phase A only) — Phase B unblocked 139
+entries that used to hit the "needs upvalues" bail-out.  Of those
+139, ~14 successfully run; the rest still throw at runtime
+(OP_ATTRS_SELECT errors) and fall back to tree-walker via the
+catch path.  Tests still pass.
+
+Wall-clock unchanged (~0.30s with NIX_USE_V3_FORCE=1 on
+hello.name; the regression is dominated by the 216k cache lookups,
+not the lookup hit/miss outcome).
+
+**For full perf benefit, the next steps are:**
+
+  - Investigate why Phase B's lambda-paramVar refs (`(level=1,
+    displ=0)` recordings) sometimes resolve to `nNull` in
+    tree-walker's env at force time.  Pattern was localized to
+    nixpkgs/lib's `makeExtensible'` shape.
+
+  - Faster Expr* lookup — a Bloom filter or pointer flag baked
+    into nix::Expr would shave 50ns/lookup × 216k lookups = ~11ms
+    per hello.name.
+
+  - Or: keep CO-2 force hook opt-in until v3 owns more of the
+    file-level lower (so more sub-Exprs are in the cache).
+
+The bones of the architecture are now in place; refinement is the
+remaining work.
