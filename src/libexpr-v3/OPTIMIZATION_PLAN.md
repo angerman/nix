@@ -1074,6 +1074,188 @@ Wider cutover scope (the upstream item from the headline analysis)
 remains the prerequisite for BR-* gains to materialise on
 nixpkgs-wide evals.
 
+## 2026-04-30 — Phase WC: widen the cutover scope (step-by-step plan)
+
+### Headline finding revisited
+
+Hard data from `pkgs.hello.drvPath` under `NIX_USE_V3=1
+NIX_USE_V3_FORCE=1`:
+
+  v3 hook stats:  evalEntries=9   cacheHits=0   cacheMisses=5
+  v3 force stats: forceEntries=2  forceHits=1   forceMisses=0
+                  skippedNeedsUpvalues=0
+  v3 drv stats:   native=0        fallback=0
+
+And on `[hello git vim].drvPath`:
+
+  v3 force stats: forceEntries=5  forceHits=1   forceMisses=0
+                  skippedNeedsUpvalues=3
+  v3 drv stats:   native=0        fallback=0
+
+Reading:
+  - v3 evaluates 9 top-level Exprs per nixpkgs eval (the import,
+    parts of the file body) — that's it.  Everything else runs
+    through tree-walker.
+  - When v3's force hook DID find a cached entry for an inner
+    thunk (`forceHits=1`), the win is invisible against the
+    thousands of thunks tree-walker was forcing in parallel.
+  - Three forces hit the cache but couldn't translate the
+    call-site env into v3 upvalues (`skippedNeedsUpvalues=3`).
+    That's CO-3's "function-0-only" restriction biting.
+  - v3's native derivationStrict (BR-3) NEVER fires (native=0)
+    because every `derivation { ... }` call comes from imported
+    tree-walker stdenv code, not from a v3-evaluated expression.
+
+### Goal
+
+Make v3 own enough of the eval that:
+  - `forceEntries` on a 3-derivation scan goes from ~5 to >>1000.
+  - `skippedNeedsUpvalues` ratio is small (<20% of force entries).
+  - 25k-pkg `nix-instantiate` profile shows v3's `dispatchLoop` /
+    `OP_FORCE` / `OP_GET_LOCAL_FORCE` in the top-N hottest
+    functions.
+  - BR-3 native derivationStrict counter goes from `native=0` to
+    `native > 1000` on a real nixpkgs scan.
+
+### Why this is hard
+
+The fundamental challenge: tree-walker uses a chained `Env*`
+(parent pointer + flat values array) to represent nested scopes.
+v3 uses Closures with a flat `upvalues[]`.  To bridge the two
+when tree-walker is forcing a thunk that v3 has compiled:
+
+  1. Look up the (Expr* → FuncId, freeVars) tuple in v3's cache.
+  2. For each freeVar, walk tree-walker's `Env*` chain
+     by `(level, displacement)` to find the value.
+  3. Build a v3 `Closure` from those values; jump into bytecode.
+
+Phase B partially does this but is restricted to top-level (function
+0) thunks.  Real nixpkgs eval reaches inner thunks through
+`mkDerivation` / `lib.makeScope` / overlay machinery — none of which
+match the function-0 restriction.
+
+### Subtasks
+
+- **WC-0 — diagnostic instrumentation.**  Per-Expr-kind force
+  counters; per-Expr "shape mismatch" log so we see WHICH thunks
+  the force hook can't translate.  Currently we only have global
+  totals — won't be enough to drive WC-2.  Output: a flamegraph-
+  style breakdown of where time goes in `pkgs.hello.drvPath`,
+  segmented by tree-walker vs v3 vs bridge.
+
+- **WC-1 — root-cause the 3 file-toplevel fall-backs.**  v3
+  lowers 3 outer Lets in nixpkgs eval (~3 ms total) but throws at
+  runtime: 2 with `OP_FORCE: infinite recursion (blackhole)`, 1
+  returning `Tag::Closure` the bridge can't hand back.  Identify
+  the exact Exprs.  Categorize the cause for each.  This drives
+  WC-5 / WC-6.
+
+- **WC-2 — extend sub-Expr cache to non-top-level thunks
+  (THE headline item).**  Lift CO-3's function-0-only
+  restriction.  Two implementation options:
+    1. **Per-call-site cache** — key the cache on
+       `(Expr*, callSite)` instead of just `Expr*`.  Tree-walker
+       doesn't pass call-site info to `forceValue`, so this needs
+       a side-table populated at thunk creation time.  Invasive.
+    2. **Env-shape-canonical lowering** — each Expr* lowers to
+       exactly one FuncId with one freeVars layout.  Force hook
+       walks tree-walker env via the recorded `(level, displ)`
+       pairs to materialise upvalues.  Phase B already does this
+       for the function-0 case; extending it requires verifying
+       (or making) each Expr* canonically-lowered.  This is the
+       cleaner end state.
+  Pick (2).  Ship in increments: first lift the restriction for
+  thunks whose freeVars are all `(level=0, displ)` (i.e. captured
+  from the immediate enclosing function); then `(level<=1)`; then
+  arbitrary.  Each increment widens coverage with bounded risk.
+
+- **WC-3 — extend v3 eval hook to non-`eval(Expr*, Value&)`
+  call sites.**  `evalAttrs`, `evalBool`, `evalForUpdate`,
+  `forceList`, `forceFunction` etc. dispatch directly to
+  `expr->eval` bypassing the hook.  Patch these (or insert the
+  hook check inside `expr->eval`'s prelude).  Mostly mechanical;
+  measurable impact on `forceEntries` count.
+
+- **WC-4 — pre-populate sub-Expr cache during `primImport`.**
+  When v3 imports a file, walk the lowered Module and emit cache
+  entries for EVERY thunk (not just function-0).  WC-2 makes
+  these entries useful; WC-4 ensures they actually exist for the
+  Exprs nixpkgs evaluates.
+
+- **WC-5 — fix v3's eager blackhole detector.**  v3 throws on 2
+  patterns that tree-walker handles.  Likely cause: tree-walker's
+  cycle detector marks individual thunks `Black` only while
+  they're being forced; v3 may mark a Bindings* `Black` while
+  any of its entries is being forced (whole-attrset granularity).
+  Confirm via WC-1's investigation, then either narrow the
+  detector or add the specific patterns to a known-safe list.
+
+- **WC-6 — bridge a v3 Closure as a tree-walker Lambda.**
+  When v3's eval returns Tag::Closure, the current bridge falls
+  back because v3 closures don't fit Tag::Lambda's `(env, expr)`
+  shape.  Either:
+    1. Wrap the v3 closure in a tree-walker PrimOpApp using the
+       existing `__v3_call_bridge_1` shim (already used for
+       cross-bridge calls — extend it to handle "use this as
+       a function").
+    2. Synthesize a tree-walker Lambda whose body is a primop
+       wrapper that re-enters v3.
+  Option 1 is more incremental; do that first.
+
+- **WC-7 — measure end-to-end.**  After WC-2..6 land, re-probe
+  hello.drvPath and the 3-pkg / 25k-pkg scans.  Confirm:
+    - `forceEntries` on 3-pkg goes from ~5 to >>1000.
+    - `skippedNeedsUpvalues` ratio drops below 20%.
+    - 25k-pkg profile shows v3's `dispatchLoop` in top-N.
+    - BR-3 native counter shows `native > 1000` on the scan.
+    - All 142 lang + 142 cutover + 25/25 drv-parity tests pass.
+    - Wall-clock not regressed (within ±5%).
+
+- **WC-8 — (deferred contingency) parse-time pre-lowering.**
+  If WC-7 acceptance criteria still aren't met, replace each
+  parsed Expr with an `ExprBytecodeThunk`-style wrapper that
+  runs through v3 directly at force time.  Big architectural
+  shift; only if the surgical approach (WC-2..6) bottoms out.
+
+### Dependencies
+
+```
+WC-0 ──┬──▶ WC-1 ──┬──▶ WC-5
+       │           └──▶ WC-6
+       └──▶ WC-2 ──▶ WC-4 ──▶ WC-7
+       └──▶ WC-3 ─────────▶ WC-7
+                              │
+                              └──▶ WC-8 (only if WC-7 fails)
+```
+
+### Risks called out
+
+  1. **WC-2 scope creep.**  "Lift the function-0 restriction"
+     might surface a long tail of edge cases (rec-attrset
+     freeVars, dynamic with-scope, blackhole interactions
+     between v3 thunks and tree-walker thunks of the same
+     binding).  Increment-by-increment shipping is the
+     mitigation.
+
+  2. **WC-5 risk of silent correctness regression.**  Loosening
+     the blackhole detector could allow infinite recursion
+     through.  The drv-parity harness (BR-3.8) plus the lang
+     test suite catch obvious cases; subtle ones (e.g. a recursive
+     attrset's value that tree-walker memoises but v3 re-enters)
+     might not.  Mitigate with a focused test: deliberately
+     construct cycles that should still be detected.
+
+  3. **WC-6 v3-closure-as-tree-walker-Lambda might leak v3
+     state.**  The Lambda would need to keep the v3 CompilationUnit
+     alive, which today is bound to a per-EvalState lifetime.
+     Mitigate with a registry of "live v3 CUs" referenced by
+     bridge values.
+
+  4. **Acceptance criteria might be unreachable with surgical
+     fixes alone.**  If WC-2..6 land cleanly but the headline
+     metrics still show v3 < 50% of CPU, WC-8 is the escalation
+     path.  Acknowledged up front.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
