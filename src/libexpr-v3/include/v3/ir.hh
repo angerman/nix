@@ -365,6 +365,18 @@ struct VarOrigin {
     uint32_t displ;
 };
 
+/// WC-2-followup: rec-attrset self-reference origin.  v3 carries
+/// the rec attrset as a single VarId; tree-walker spreads its
+/// bindings across env cells at displacement 0..N-1.  The force
+/// hook materialises a Bindings* from the env range at force time
+/// using the recorded (level, names) pair.
+struct RecVarOrigin {
+    FuncId                func;
+    VarId                 recVar;
+    uint32_t              level;
+    std::vector<SymbolId> names;
+};
+
 struct Module {
     /// All blocks; blocks[0] is unused (kInvalidBlock sentinel).
     std::vector<Block> blocks;
@@ -396,6 +408,12 @@ struct Module {
     /// (a future Phase B refinement) we skip per-thunk functions whose
     /// freeVars intersect this set.
     std::vector<VarId> recVarIds;
+
+    /// WC-2-followup companion to recVarIds.  For each (function,
+    /// recVar) pair where the recVar appears as a freeVar, records
+    /// the level + names so the force hook can synthesise a v3
+    /// Bindings* from tree-walker's env range.
+    std::vector<RecVarOrigin> recVarOrigins;
 
     VarId   nextVar   = 1;
     BlockId nextBlock = 1;

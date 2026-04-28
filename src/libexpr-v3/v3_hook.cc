@@ -82,23 +82,33 @@ static void v3RegisterExprEntry(const nix::Expr * e, const nix::SourcePath & p)
 /// is forcing a thunk whose underlying Expr* matches one v3 has
 /// already lowered + compiled, we run that FuncId in v3 instead of
 /// dispatching to expr->eval.
+/// CO-2 phase B + WC-2-followup: for each upvalue (in freeVars
+/// order) describe how to materialise its value from tree-walker's
+/// env at force time.
+///
+///   - kind == Direct: walk env up `level` times, read values[displ].
+///   - kind == RecBuild: walk env up `level` times, then synthesise
+///     a v3 Bindings* whose entries are (names[i],
+///     env.values[i]) for i in 0..names.size()-1.  This bridges
+///     v3's "rec attrset is one VarId" representation to
+///     tree-walker's "each rec binding is its own env cell".
+struct UpvalueSource {
+    enum class Kind : uint8_t { Direct, RecBuild };
+    Kind                  kind  = Kind::Direct;
+    uint32_t              level = 0;
+    uint32_t              displ = 0;        // valid when kind=Direct
+    std::vector<SymbolId> names;             // valid when kind=RecBuild
+};
+
 struct SubExprCacheEntry {
     const CompilationUnit * cu;
     ir::FuncId              funcIdx;
-    /// Cached number of upvalues the function expects.  Phase A only
-    /// handles 0; Phase B (task #278) translates env -> upvalues.
     uint16_t                nUpvalues;
-    /// CO-2 phase B: for each upvalue (in `freeVars` order), the
-    /// (level, displ) into the tree-walker `Env` that supplies its
-    /// value.  Empty when nUpvalues == 0 (Phase A path) OR when one
-    /// or more freeVars couldn't be traced back to a direct env
-    /// reference (synthesized rec-attrset access, etc.).
-    std::vector<std::pair<uint32_t, uint32_t>> upvalueSources;
-    /// Phase B blacklist: set to true once a Phase B run for this
-    /// entry threw at runtime.  Subsequent forces skip the entry
-    /// instead of paying the lower+upvalue+run cost just to throw
-    /// again — same Expr* + same env shape gives the same result.
-    /// Reset only on cache rebuild (which doesn't happen mid-run).
+    /// For each upvalue (in freeVars order) — see UpvalueSource doc.
+    /// Empty when nUpvalues == 0 OR when one or more freeVars
+    /// can't be expressed in either supported shape.
+    std::vector<UpvalueSource> upvalueSources;
+    /// Phase B blacklist — throws cause future forces to skip.
     bool                    phaseBFailed = false;
 };
 
@@ -121,6 +131,13 @@ static void populateSubExprCacheLocal(
         uint64_t key = (static_cast<uint64_t>(vo.func) << 32) | vo.var;
         originLookup.emplace(key, std::make_pair(vo.level, vo.displ));
     }
+    // WC-2-followup: per-(func, recVar) shape lookup.  First entry
+    // wins (duplicates are identical info).
+    std::unordered_map<uint64_t, const ir::RecVarOrigin *> recOriginLookup;
+    for (auto & rvo : module.recVarOrigins) {
+        uint64_t key = (static_cast<uint64_t>(rvo.func) << 32) | rvo.recVar;
+        recOriginLookup.emplace(key, &rvo);
+    }
     std::unordered_set<ir::VarId> recVarSet(
         module.recVarIds.begin(), module.recVarIds.end());
     auto & subCache = v3SubExprCache();
@@ -135,13 +152,23 @@ static void populateSubExprCacheLocal(
             bool ok = true;
             entry.upvalueSources.reserve(fvs.size());
             for (auto fv : fvs) {
-                if (recVarSet.count(fv)) {
-                    if (diagOrigins) std::fprintf(stderr,
-                        "v3 origins: func=%u skip — fv=%u in recVarSet\n",
-                        sef.funcIdx, fv);
-                    ok = false; break;
-                }
                 uint64_t key = (static_cast<uint64_t>(sef.funcIdx) << 32) | fv;
+                if (recVarSet.count(fv)) {
+                    auto rit = recOriginLookup.find(key);
+                    if (rit == recOriginLookup.end()) {
+                        if (diagOrigins) std::fprintf(stderr,
+                            "v3 origins: func=%u skip — fv=%u in recVarSet "
+                            "but no recVarOrigins entry\n",
+                            sef.funcIdx, fv);
+                        ok = false; break;
+                    }
+                    UpvalueSource src;
+                    src.kind  = UpvalueSource::Kind::RecBuild;
+                    src.level = rit->second->level;
+                    src.names = rit->second->names;
+                    entry.upvalueSources.push_back(std::move(src));
+                    continue;
+                }
                 auto oit = originLookup.find(key);
                 if (oit == originLookup.end()) {
                     if (diagOrigins) std::fprintf(stderr,
@@ -149,7 +176,11 @@ static void populateSubExprCacheLocal(
                         sef.funcIdx, fv);
                     ok = false; break;
                 }
-                entry.upvalueSources.push_back(oit->second);
+                UpvalueSource src;
+                src.kind  = UpvalueSource::Kind::Direct;
+                src.level = oit->second.first;
+                src.displ = oit->second.second;
+                entry.upvalueSources.push_back(std::move(src));
             }
             if (!ok) entry.upvalueSources.clear();
         }
@@ -811,6 +842,24 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     }();
     if (!useV3Force) return false;
 
+    // WC-2-followup re-entrancy guard.  The RecBuild materialisation
+    // path bridges tree-walker values via treeWalkerToV3Public, which
+    // calls forceValue, which can re-invoke the hook on a nested
+    // thunk that ALSO needs RecBuild.  Without a re-entrancy guard
+    // this ladders down the C stack until it overflows (saw a
+    // SIGSEGV in nix-instantiate when a 3-drv probe's mkDerivation
+    // chain hit nested rec-attrset materialisations).  Set a thread-
+    // local "in hook" depth counter; bail out (return false) when
+    // we're already inside the hook on this thread.  The outer hook
+    // call can finish synchronously without help from inner ones.
+    static thread_local int s_hookDepth = 0;
+    if (s_hookDepth > 0) return false;
+    struct DepthGuard {
+        int & d;
+        DepthGuard(int & d_) : d(d_) { ++d; }
+        ~DepthGuard() { --d; }
+    } _guard{s_hookDepth};
+
     auto & st = v3HookStats();
     st.forceEntries++;
     // WC-0: per-Expr::Kind breakdown.  Cheap (one bounded-array
@@ -854,26 +903,35 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                 // with/inheritFrom upvalues).  Skip.
                 return skipReturn(1);
             }
-            // CO-2 phase B: walk tree-walker's env per upvalueSource
-            // to materialise the v3 upvalues array.
+            // CO-2 phase B + WC-2-followup: walk tree-walker's env
+            // per upvalueSource to materialise the v3 upvalues array.
             try {
                 upvalues.reserve(ent.nUpvalues);
-                for (auto [level, displ] : ent.upvalueSources) {
+                for (auto & src : ent.upvalueSources) {
                     nix::Env * cur = &env;
-                    for (uint32_t i = 0; i < level; ++i) {
-                        if (!cur || !cur->up) {
-                            return skipReturn(2);
-                        }
+                    for (uint32_t i = 0; i < src.level; ++i) {
+                        if (!cur || !cur->up) return skipReturn(2);
                         cur = cur->up;
                     }
-                    if (!cur) {
-                        return skipReturn(2);
+                    if (!cur) return skipReturn(2);
+                    if (src.kind == UpvalueSource::Kind::Direct) {
+                        nix::Value * srcV = cur->values[src.displ];
+                        if (!srcV) return skipReturn(3);
+                        upvalues.push_back(treeWalkerToV3Public(state, *srcV));
+                    } else {
+                        // RecBuild materialisation deliberately not
+                        // wired up: an earlier attempt at
+                        // synthesising the Bindings* from env
+                        // values triggered a stack overflow on the
+                        // 3-drv nixpkgs probe (exit=139).  Root
+                        // cause is still being narrowed; the
+                        // structural pieces (recVarOrigins +
+                        // populateSubExprCacheLocal RecBuild
+                        // branch) are in place so a smaller fix can
+                        // bolt onto them.  For now, fall back like
+                        // the pre-WC-2-followup behaviour.
+                        return skipReturn(1);
                     }
-                    nix::Value * srcV = cur->values[displ];
-                    if (!srcV) {
-                        return skipReturn(3);
-                    }
-                    upvalues.push_back(treeWalkerToV3Public(state, *srcV));
                 }
             } catch (const std::exception &) {
                 return skipReturn(4);

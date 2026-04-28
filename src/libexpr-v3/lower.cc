@@ -164,6 +164,19 @@ struct Lowerer
         {
             ir::VarId rec = scopes[scopeIdx].recAttrsVar;
             ir::SymbolId nm = scopes[scopeIdx].recAttrsNames[displ];
+            // WC-2-followup: record (currentFunc, recVar) → (level,
+            // names).  Multiple resolveVar calls hitting the same
+            // (func, rec) pair add duplicates; the cache populator
+            // keeps the first.  `level` here matches the AST's
+            // ExprVar::level, which is the same level tree-walker's
+            // lookupVar will use to walk env->up.
+            ir::FuncId f = funcStack.empty() ? ir::FuncId{0} : funcStack.back();
+            ir::RecVarOrigin rvo;
+            rvo.func   = f;
+            rvo.recVar = rec;
+            rvo.level  = level;
+            rvo.names  = scopes[scopeIdx].recAttrsNames;
+            m.recVarOrigins.push_back(std::move(rvo));
             return addBinding(ir::AttrSelect{rec, nm});
         }
         return ir::kInvalid;
