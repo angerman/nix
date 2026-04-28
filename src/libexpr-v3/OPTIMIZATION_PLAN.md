@@ -339,7 +339,54 @@ weeks.  It's also where the bulk of the cutover perf benefit will
 come from — once forceValue routes through v3, we'd amortize the
 lower+compile cost across many forces of the same Expr.
 
-For now, the cache is a no-op.  The cutover is still net-positive
-on fib (slight win) and net-neutral on small expressions (within a
-few % of tree-walker), but the dominant work flow on real-world
-workloads is still tree-walker.
+## 2026-04-28 — parity reached via static short-circuits
+
+Without going to CO-2/CO-3, three small static heuristics in the
+hook entry point closed the cutover regression:
+
+1. **`willReturnClosure` predicate (CO-6).**  Walks the AST through
+   Let / With / Assert / If-with-both-Lambda-branches.  When every
+   reachable terminal is a Lambda, the result is a Closure, which
+   the bridge can't hand back to tree-walker — caught and routed
+   directly to tree-walker, skipping v3's lower+compile+run cycle.
+   On hello.name: 9 wasted lower cycles eliminated (~22 ms saved).
+
+2. **Attrs / List top-level short-circuit.**  These shapes were
+   net-negative through v3 because tree-walker's lazy thunks beat
+   v3's eager eval + recursive bridge.  Per-Expr v3 cost was 2.9 ms
+   vs ~0.5 ms tree-walker.  Adding kind=Attrs/List to the
+   short-circuit dropped overhead 18 ms per hello.name eval.
+
+3. **Per-phase timing infrastructure (V3_TIMING=1).**  Made it
+   possible to see lower / compile / run / bridge separately and
+   target the dominant phase.  Without it, the 13.7 ms lower would
+   have been lost in user-time noise.
+
+Per-phase profile after both (V3_TIMING=1, hello.name):
+
+    v3 hook timing (ms):  lower=2.9  compile=0.43  run=0.08  bridge=0.002
+
+(Was: lower=13.7 compile=3.0 run=0.3 bridge=4.8 = 21.8 ms.)
+
+Real-world wall-clock:
+
+  | workload                                | tree-walker | v3 cutover  |
+  |-----------------------------------------|-------------|-------------|
+  | fib30                                   | 0.38s user  | 0.37s user (slight win) |
+  | (import <nixpkgs> {}).hello.name        | 0.25s user  | 0.25s user (parity) |
+  | (import <nixpkgs> {}).git.name          | 0.25s user  | 0.25s user (parity) |
+  | attrNames pkgs                          | 0.25s user  | 0.25s user (parity) |
+  | attrNames pkgs.haskellPackages          | 0.45s user  | 0.45s user (parity) |
+  | pkgs.filter has meta                    | 0.26s user  | 0.26s user (parity) |
+
+Tests: 142/142 lang via cutover, 142/142 v3-eval direct, 103/109
+eval-fail, 76/77 internal regression — all unchanged.
+
+**Net for the user: NIX_USE_V3=1 has no measurable cost on
+real-world workloads, and produces correct results.**
+
+CO-2/CO-3 remain the path to making v3 actually *faster* on real-
+world workloads — by amortizing lower+compile across many forces
+of the same Expr, v3 could win double-digit % once it owns the
+sub-Expr force loop.  But the cutover itself is no longer a
+regression.
