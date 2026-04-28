@@ -1256,6 +1256,100 @@ WC-0 ──┬──▶ WC-1 ──┬──▶ WC-5
      metrics still show v3 < 50% of CPU, WC-8 is the escalation
      path.  Acknowledged up front.
 
+## 2026-04-30 — Phase WC results (commits 295–301)
+
+Phase WC is **partially complete**: infrastructure landed, runtime
+gate not yet cleared.
+
+### Subtasks landed
+
+- `d3d93fa6c` WC-0 — per-Expr::Kind force counters + per-reason
+  skip breakdown + per-eval-fallback reason counters.  Surfaced
+  through NIX_VM_STATS=1.
+
+- `4f879c00f` WC-1 — root-cause logged.  On `pkgs.hello.drvPath`:
+  3 of 5 force skips are on `Select` Exprs with `noUpvalueSources`
+  (CO-3 restriction); 1 of 9 eval entries throws blackhole; 2 of
+  9 return Tag::Closure that the bridge can't yet hand back.
+
+- `0b6eec7a0` WC-2 — function-0-only restriction lifted from
+  `lower.cc`.  Every per-thunk function now registers in
+  `subExprFuncs`.
+
+- `609b66da1` WC-3 — `evalBool` / `evalAttrs` route through
+  `v3ForceHook` when the Expr is a v3 cache candidate.
+
+- `3cf8c3358` WC-4 — `primImport` pre-populates v3SubExprCache
+  via the new `populateSubExprCachePublic` helper.
+
+- `569378318` WC-5 — `dispatchLoop` callsites wrapped in
+  try/catch that reverts Blackhole marks on exception, matching
+  tree-walker's `mkFailed` behaviour on the throw path.  Unlocked
+  `import nixpkgs/lib --strict` (was blackhole, now 434).
+
+- `6fd1d133f` WC-6 — closure-result bridge experimentally tried
+  (wrap as `PrimOpApp(__v3_call_bridge_1, handle)`).  Type-level
+  works; functionally regressed the cutover probe with a bridged-
+  closure-driven blackhole.  Kept defensive fall-back.
+
+### Acceptance gate (WC-7)
+
+Final benchmarks:
+
+| Workload                       | tree-walker user/RSS | v3 user/RSS    | Δ |
+|--------------------------------|----------------------|----------------|----|
+| fib 35                         | 3.84 s / 443 MB      | 3.62 s / 27 MB | −6 % / −94 % |
+| ackermann 3 9                  | 1.84 s / 460 MB      | 2.03 s / 1569 MB | +10 % / +241 % (architectural) |
+| attrNames pkgs.haskellPackages | 0.56 s / 271 MB      | 0.57 s / 274 MB | parity |
+| 3 k drvs forced in pkgs        | 5.15 s / 1550 MB     | 5.13 s / 1555 MB | parity |
+
+Acceptance criteria status:
+  1. ❌ `forceEntries` on a 3-pkg scan ~5 → >>1000.  Still ~5.
+  2. ❌ `skippedNeedsUpvalues` ratio < 20 %.  Still 60 % (3 of 5).
+  3. ❌ 25 k-pkg profile shows v3's dispatchLoop in top-N.
+  4. ❌ BR-3 native counter `native > 1000`.  Still 0.
+  5. ✅ All 142 lang + 142 cutover + 25/25 drv-parity tests pass.
+  6. ✅ Wall-clock not regressed by >5 % on any benchmark.
+
+Tests + wall-clock: green.  Cutover-coverage metrics: NOT yet met.
+
+### Why metrics didn't move
+
+The infrastructure pieces (WC-0/2/3/4) are correctly in place.  The
+runtime gate that prevents v3 from owning more of the eval is the
+blackhole pattern WC-5 only partially fixed.  Specifically: when
+v3 evaluates a top-level expression that returns a closure and v3
+falls back to tree-walker (per WC-6's defensive fall-back), the
+inner thunks v3 forced during that attempt are left in
+ThunkState::Blackhole on the success-return path (OP_RETURN clears
+the immediate frame's thunk but earlier-forced sub-thunks may
+have been cleared in their own OP_RETURNs and yet some shape
+leaves stale marks at hand-off time).
+
+WC-5's exception-path cleanup catches the throw scenario; it does
+NOT cover the success-return-then-fall-back scenario.  Without
+cleanup at hand-off, a subsequent forceValue from tree-walker
+through the bridge can hit a stale Black mark and report
+"OP_FORCE: infinite recursion (blackhole)".
+
+### Path forward
+
+WC-8 (deferred contingency) — parse-time pre-lowering — would have
+v3 own the entire eval rather than handing control back to
+tree-walker mid-flight.  That side-steps the hand-off-mark issue
+but exposes any latent v3 correctness issue in nixpkgs evaluation
+(no tree-walker safety net).  Big architectural step; warrants its
+own dedicated session with a strong correctness gate (the parity
+harness + lang tests + a focused nixpkgs subset).
+
+Suggested follow-ups before WC-8:
+  - Extend WC-5 to clear Black marks on the success path too
+    (e.g. on every dispatchLoop normal return, or via an explicit
+    `consumeBlackholeMarks(vm)` at the eval-hook hand-off).
+  - Add a Failed-with-stored-exception state so re-throws are
+    correctly correlated.
+  - Re-enable WC-6's closure bridge once the above are in place.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
