@@ -1653,6 +1653,85 @@ separate gaps:
    materialise; targeted improvements there would convert skips
    into hits.
 
+## 2026-04-28 — WC-12: drv3 force-hook recursion analysis (DEFERRED)
+
+The drv3 SIGSEGV / "infinite recursion" with `NIX_USE_V3_FORCE=1` is
+deeper than expected.  This entry documents what was tried so the
+next attempt has a starting point.
+
+### Reproducer
+
+`nix-instantiate --eval --strict --expr '(import <nixpkgs>{}).hello.drvPath'`
+with `NIX_USE_V3=1 NIX_USE_V3_FORCE=1`.  Without `NIX_USE_V3_FORCE` it
+returns the correct drv path; with it, throws "infinite recursion
+encountered" on a tree-walker stack inside callPackage's
+`intersectAttrs ... // ...` chain.
+
+### Root cause sketch
+
+WC-11 vastly expanded the set of `Expr*`s that v3 owns.  When
+v3 force hook fires deep inside an evaluation, two things happen:
+
+1. **Eager upvalue materialisation via `treeWalkerToV3Public`.**
+   Each Direct-source upvalue calls `forceValue` on `cur->values[d]`
+   right away.  Tree-walker's natural lazy semantics would defer
+   that force.  In workloads where the upvalue's force transitively
+   requires the outer-frame thunk (currently Black-marked), this
+   forces a tree-walker pseudo-cycle that tree-walker's natural
+   order would never expose.
+
+2. **v3's bytecode forces values via primops bridging back.**
+   `OP_CALL` of a primop like `attrNames` calls `v3ToTreeWalker`
+   on the primop arg, then calls the tree-walker primop, then
+   bridges the result.  The intermediate forces also follow v3's
+   demand pattern, not tree-walker's.
+
+### Things tried
+
+- `if (srcV->isBlackhole()) return skipReturn(2)` before eager
+  Direct-upvalue bridge — didn't help, because the cycle isn't on
+  the *immediate* upvalue: it surfaces deeper, when v3's bytecode
+  forces something downstream of the upvalue.
+- Skip Exprs whose upvalueSources contain RecBuild — didn't help
+  either; Direct-only Exprs also recurse on this workload.
+- Lazy Bridge thunks for Direct upvalues — fixed the recursion
+  but introduced a SIGSEGV (likely Bridge-thunk lifetime / GC
+  unsafety: `bridgeSrc` is a raw `nix::Value *` not visible to
+  Boehm GC; if the holding Env becomes unreachable during a v3
+  primop allocation that triggers GC, the pointer dangles).
+- `if (nv.isBlackhole()) throw` in `treeWalkerToV3` — didn't
+  catch the cycle (the source isn't yet Black at the moment
+  forceValue is called from there; Black is set inside force).
+
+### Diagnostic counters added (kept)
+
+- `forceHookDirectUpvalues` — # of Direct upvalue materialisations.
+- `forceHookRecBuildUpvalues` — # of RecBuild upvalue materialisations.
+- `forceHookHitsDirectOnly` / `forceHookHitsWithRecBuild` — split of
+  successful hits by whether any RecBuild upvalue was needed.
+- Printed under NIX_VM_STATS.  hello-name baseline:
+  `direct=10 recBuild=6 hitsDirect=2 hitsWithRec=2`.
+
+### Path forward (sketch)
+
+The fundamental constraint is: **v3 must force values in
+tree-walker's natural lazy order**, not its own demand order.
+Two architectural directions:
+
+1. **Lazy Bridge with proper GC roots.**  Register the v3 arena
+   memory (or just the Bridge-thunk storage) as a Boehm GC root
+   so `bridgeSrc` keeps the underlying nix::Value reachable.
+   Lazy upvalue bridging is then safe.  ~1-2 days of work.
+2. **Tree-walker depth-aware gating.**  Add a thread-local "in
+   primop" flag.  When v3 force hook is called from inside a
+   tree-walker primop bridge (i.e. v3 itself indirectly invoked
+   tree-walker), bypass v3 unconditionally.  Less elegant but
+   tractable.
+
+For now: force-hook stays opt-in via `NIX_USE_V3_FORCE=1` for
+benchmarking simple workloads.  Default behaviour stays at
+parity with tree-walker on every workload.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,

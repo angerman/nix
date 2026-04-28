@@ -250,6 +250,15 @@ struct V3HookStats {
     uint64_t compileNs = 0;
     uint64_t runNs     = 0;
     uint64_t bridgeNs  = 0;
+
+    // WC-12: per-upvalue-source-kind counters for force-hook entries
+    // that proceed past upvalue materialisation.  Lets us decide
+    // whether RecBuild is the primary driver of wins (or losses) and
+    // whether selectively gating it avoids cross-VM cycles.
+    uint64_t forceHookDirectUpvalues   = 0;
+    uint64_t forceHookRecBuildUpvalues = 0;
+    uint64_t forceHookHitsDirectOnly   = 0;
+    uint64_t forceHookHitsWithRecBuild = 0;
 };
 
 V3HookStats & v3HookStats()
@@ -487,6 +496,13 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                         s.compileNs / 1e6,
                         s.runNs     / 1e6,
                         s.bridgeNs  / 1e6);
+                if (s.forceHookDirectUpvalues || s.forceHookRecBuildUpvalues)
+                    std::fprintf(stderr,
+                        "v3 force upvalues: direct=%llu recBuild=%llu hitsDirect=%llu hitsWithRec=%llu\n",
+                        (unsigned long long)s.forceHookDirectUpvalues,
+                        (unsigned long long)s.forceHookRecBuildUpvalues,
+                        (unsigned long long)s.forceHookHitsDirectOnly,
+                        (unsigned long long)s.forceHookHitsWithRecBuild);
             });
         }
         return true;
@@ -971,6 +987,7 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     const CompilationUnit * cu      = nullptr;
     ir::FuncId              funcIdx = 0;
     std::vector<Value>      upvalues;
+    bool sawRecBuild = false;
     auto & subCache = v3SubExprCache();
     auto sit = subCache.find(e);
     if (sit != subCache.end()) {
@@ -998,10 +1015,13 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                     }
                     if (!cur) return skipReturn(2);
                     if (src.kind == UpvalueSource::Kind::Direct) {
+                        st.forceHookDirectUpvalues++;
                         nix::Value * srcV = cur->values[src.displ];
                         if (!srcV) return skipReturn(3);
                         upvalues.push_back(treeWalkerToV3Public(state, *srcV));
                     } else {
+                        st.forceHookRecBuildUpvalues++;
+                        sawRecBuild = true;
                         // WC-10 (Option 1): build a v3 Bindings*
                         // whose entries are Bridge thunks that only
                         // force on access.  Each thunk holds a
@@ -1107,20 +1127,22 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     // Bridge result back to tree-walker Value.  Mirror the eval hook's
     // logic — same bridge, same fallback rules.
     switch (r.tag()) {
-    case Tag::Bool:   v.mkBool(r.payload.i == 1); st.forceHits++; st.forceHitsByKind[kindIdx]++; return true;
-    case Tag::Int:    v.mkInt(r.payload.i);       st.forceHits++; st.forceHitsByKind[kindIdx]++; return true;
-    case Tag::Float:  v.mkFloat(r.payload.f);     st.forceHits++; st.forceHitsByKind[kindIdx]++; return true;
-    case Tag::Null:   v.mkNull();                 st.forceHits++; st.forceHitsByKind[kindIdx]++; return true;
+    case Tag::Bool:   v.mkBool(r.payload.i == 1); st.forceHits++; st.forceHitsByKind[kindIdx]++; if (sawRecBuild) st.forceHookHitsWithRecBuild++; else st.forceHookHitsDirectOnly++; return true;
+    case Tag::Int:    v.mkInt(r.payload.i);       st.forceHits++; st.forceHitsByKind[kindIdx]++; if (sawRecBuild) st.forceHookHitsWithRecBuild++; else st.forceHookHitsDirectOnly++; return true;
+    case Tag::Float:  v.mkFloat(r.payload.f);     st.forceHits++; st.forceHitsByKind[kindIdx]++; if (sawRecBuild) st.forceHookHitsWithRecBuild++; else st.forceHookHitsDirectOnly++; return true;
+    case Tag::Null:   v.mkNull();                 st.forceHits++; st.forceHitsByKind[kindIdx]++; if (sawRecBuild) st.forceHookHitsWithRecBuild++; else st.forceHookHitsDirectOnly++; return true;
     case Tag::String:
         v.mkString(r.payload.str ? r.payload.str : "", state.mem);
         st.forceHits++; st.forceHitsByKind[kindIdx]++;
+        if (sawRecBuild) st.forceHookHitsWithRecBuild++;
+        else st.forceHookHitsDirectOnly++;
         return true;
     case Tag::Path:
     case Tag::Attrs:
     case Tag::List: {
         try {
             nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
-            if (tmp) { v = *tmp; st.forceHits++; st.forceHitsByKind[kindIdx]++; return true; }
+            if (tmp) { v = *tmp; st.forceHits++; st.forceHitsByKind[kindIdx]++; if (sawRecBuild) st.forceHookHitsWithRecBuild++; else st.forceHookHitsDirectOnly++; return true; }
         } catch (const std::exception &) {
             // bridge fail — fall through
         }
