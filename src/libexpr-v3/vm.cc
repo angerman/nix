@@ -1661,6 +1661,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 // Public entry points
 // ---------------------------------------------------------------------------
 
+// WC-5: clear Black marks on any thunk frames currently in the VM.
+// Used as the exception-recovery hook around dispatchLoop calls.
+// Tree-walker's mkFailed stores the exception and re-throws; we
+// take the cheaper-but-still-correct path of reverting Black to
+// Suspended so the next force re-runs (idempotent throws then
+// re-throw the same error).
+static void clearBlackMarksOnException(VMState & vm, size_t exitDepth)
+{
+    for (size_t i = vm.frames.size(); i > exitDepth; --i) {
+        auto & fr = vm.frames[i - 1];
+        if ((fr.flags & CFF_THUNK_RETURN) && fr.thunk
+            && fr.thunk->state == ThunkState::Blackhole) {
+            fr.thunk->state = ThunkState::Suspended;
+        }
+    }
+}
+
 Value run(const CompilationUnit & rootCu)
 {
     VMState vm;
@@ -1685,7 +1702,12 @@ Value run(const CompilationUnit & rootCu)
     if (!rootCu.lambdas.empty())
         vm.valueStack.resize(rootCu.lambdas[0].nLocals);
 
-    return dispatchLoop(vm, /*exitDepth=*/0);
+    try {
+        return dispatchLoop(vm, /*exitDepth=*/0);
+    } catch (...) {
+        clearBlackMarksOnException(vm, 0);
+        throw;
+    }
 }
 
 /// CO-3: run an arbitrary FuncId in `cu` as if it were a thunk body.
@@ -1717,7 +1739,12 @@ Value runFunction(const CompilationUnit & cu, uint32_t funcIdx)
 
     vm.valueStack.resize(desc.nLocals);
 
-    return dispatchLoop(vm, /*exitDepth=*/0);
+    try {
+        return dispatchLoop(vm, /*exitDepth=*/0);
+    } catch (...) {
+        clearBlackMarksOnException(vm, 0);
+        throw;
+    }
 }
 
 /// CO-2 phase B: run a per-thunk Function with caller-provided
@@ -1759,7 +1786,12 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
 
     vm.valueStack.resize(desc.nLocals);
 
-    return dispatchLoop(vm, /*exitDepth=*/0);
+    try {
+        return dispatchLoop(vm, /*exitDepth=*/0);
+    } catch (...) {
+        clearBlackMarksOnException(vm, 0);
+        throw;
+    }
 }
 
 Value forceValue(VMState & vm, Value v)
@@ -1821,7 +1853,35 @@ Value forceValue(VMState & vm, Value v)
         });
         pushCapturedWiths(vm, thunkWiths);
 
-        v = dispatchLoop(vm, exitDepth);
+        // WC-5: if dispatchLoop throws, every thunk frame we'd unwind
+        // is currently marked Blackhole.  Without cleanup, a later
+        // force of the same thunk (e.g. when tree-walker takes over
+        // and accesses the same lib attr) would hit the stale mark
+        // and report "infinite recursion (blackhole)" — masking the
+        // real error.  Tree-walker's mkFailed stores the exception
+        // and re-throws on subsequent forces (eval-inline.hh:125);
+        // the bare-minimum equivalent here is to revert each frame's
+        // thunk back to Suspended so the next force re-runs.
+        //
+        // We don't store the exception (would need a Failed state
+        // and re-throw machinery), so the next force simply re-runs
+        // the body — slow but correct, and idempotent throws will
+        // re-throw the same error consistently.
+        try {
+            v = dispatchLoop(vm, exitDepth);
+        } catch (...) {
+            for (size_t i = vm.frames.size(); i > exitDepth; --i) {
+                auto & fr = vm.frames[i - 1];
+                if ((fr.flags & CFF_THUNK_RETURN) && fr.thunk
+                    && fr.thunk->state == ThunkState::Blackhole) {
+                    fr.thunk->state = ThunkState::Suspended;
+                }
+            }
+            // Also clear the outer Black mark we set just above.
+            if (t->state == ThunkState::Blackhole)
+                t->state = ThunkState::Suspended;
+            throw;
+        }
     }
     return v;
 }
@@ -1901,7 +1961,12 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     });
     pushCapturedWiths(vm, callee->capturedWiths);
 
-    return dispatchLoop(vm, exitDepth);
+    try {
+        return dispatchLoop(vm, exitDepth);
+    } catch (...) {
+        clearBlackMarksOnException(vm, exitDepth);
+        throw;
+    }
 }
 
 } // namespace nix::v3
