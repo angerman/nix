@@ -384,27 +384,13 @@ struct Lowerer
         if (name == "false") return addBinding(ir::LitBool{false});
         if (name == "null")  return addBinding(ir::LitNull{});
         if (name == "builtins") {
-            // Construct the builtins attrset on demand: an attrset
-            // mapping every registered primop's name to its
-            // LitPrimOp value.  Lets `with builtins; <body>` and
-            // bare `builtins.attrNames` (where `builtins` is rebound
-            // by `inherit (builtins) ...`) work uniformly.
-            //
-            // We deliberately do NOT cache the resulting VarId across
-            // function boundaries: a VarId is local to the function
-            // whose block produced it, so reusing it in another
-            // function would make function 0 (or any non-defining
-            // function) reference a free var defined inside a thunk,
-            // causing emit to produce OP_GET_UPVALUE at the top
-            // level — where there is no closure context, and the VM
-            // throws.  Per-call (per-occurrence) construction is
-            // correct and the IR-builder cost is small.
-            std::vector<ir::AttrSet::Entry> entries;
-            for (auto & [poName, po] : allRegisteredPrimOps()) {
-                ir::VarId v = addBinding(ir::LitPrimOp{&po});
-                entries.push_back({m.internSymbol(poName), v});
-            }
-            return addBinding(ir::AttrSet{std::move(entries)});
+            // Emit a LitBuiltins opcode — the VM lazily materialises a
+            // single process-wide `vBuiltins` attrset containing every
+            // registered primop and reuses it on every reference.
+            // Saves the per-occurrence cost of building N LitPrimOp +
+            // AttrSet IR bindings, and avoids the cross-function
+            // VarId-reuse trap that an IR-level cache would hit.
+            return addBinding(ir::LitBuiltins{});
         }
         if (auto * po = findPrimOp(name)) {
             // Arity-0 primops behave as constants — invoke immediately

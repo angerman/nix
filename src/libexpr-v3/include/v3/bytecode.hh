@@ -142,6 +142,10 @@ enum Op : uint8_t
     OP_CALL_PRIMOP    = 0xB0,
     /// Push a Tag::PrimOp value pointing to cu->primops[idx].
     OP_LIT_PRIMOP     = 0xB1,
+    /// Push the singleton `vBuiltins` Tag::Attrs value containing every
+    /// registered primop.  Lazily materialised on first execution and
+    /// reused across every reference for the lifetime of the process.
+    OP_LIT_BUILTINS   = 0xB2,
 
     OP_HALT           = 0xFF,
 };

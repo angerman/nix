@@ -1569,6 +1569,37 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
 
+        case OP_LIT_BUILTINS: {
+            // Lazy singleton: build the `builtins` attrset on first
+            // execution, reuse it for every subsequent reference.
+            // Same shape every time (every registered primop), so
+            // sharing is safe.  Static lifetime — never freed.
+            static Value vBuiltins = []{
+                const auto & reg = allRegisteredPrimOps();
+                Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(reg.size()));
+                uint32_t i = 0;
+                for (auto & [poName, po] : reg) {
+                    Value v;
+                    v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
+                    v.payload.primop = &po;
+                    SymbolId sid = ir::globalInternSymbol(poName);
+                    b->entries[i] = { sid, v };
+                    ++i;
+                }
+                // Bindings expects entries to be sorted by SymbolId for
+                // O(log n) lookup via binary search.  std::sort is fine
+                // here — runs once at process startup.
+                std::sort(&b->entries[0], &b->entries[b->size],
+                    [](const auto & a, const auto & b){ return a.name < b.name; });
+                Value v;
+                v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                v.payload.bindings = b;
+                return v;
+            }();
+            push(vm, vBuiltins);
+            break;
+        }
+
         case OP_CALL_PRIMOP: {
             uint32_t nArgs = operand;
             uint32_t poIdx = cu->code[ip++];

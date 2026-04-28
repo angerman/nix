@@ -462,6 +462,10 @@ struct Emitter
     {
         unit.code.push_back(encode(OP_LIT_PRIMOP, internPrimOp(e.primop)));
     }
+    void emitOne(const ir::LitBuiltins &)
+    {
+        unit.code.push_back(encode(OP_LIT_BUILTINS));
+    }
 
     // -- With / assert
     void emitOne(const ir::With & e)

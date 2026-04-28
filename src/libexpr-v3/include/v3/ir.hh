@@ -214,6 +214,13 @@ struct LitPrimOp {
     const v3::PrimOp * primop;
 };
 
+/// Push the singleton `builtins` attrset.  The VM lazily materialises one
+/// process-wide Tag::Attrs Value containing every registered primop, then
+/// reuses it for every emit.  Saves the lower phase from constructing N
+/// LitPrimOp + AttrSet bindings on every occurrence of the bare
+/// `builtins` symbol.  No VarId refs — pushes a constant.
+struct LitBuiltins {};
+
 /// Recursive let / rec attrset built via the env-carrier pattern:
 /// allocate a Bindings(n) with placeholder values, allocate one Thunk per
 /// entry capturing the Bindings as its first upvalue, then patch the
@@ -257,6 +264,7 @@ using Expr = std::variant<
     PosExpr,
     PrimOpCall,
     LitPrimOp,
+    LitBuiltins,
     LetRec
 >;
 
