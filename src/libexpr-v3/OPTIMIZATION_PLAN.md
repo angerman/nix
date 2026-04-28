@@ -969,6 +969,49 @@ Triggered when `__structuredAttrs=true`.
   - The bridge fall-back path stays exercised by complex drvs
     (Phase B/C/D shapes) until those phases land.
 
+### Phase A LANDED (2026-04-30, commits 281–290)
+
+Phase A is functionally complete.  Native derivationStrict shipping:
+
+  - `eb261116d` BR-3.0 — pre-flight libnixstore harness, drvPath
+    byte-equal vs tree-walker on a hard-coded test input.
+  - `857f81358` BR-3.1 — pre-interned attr SymbolIds.
+  - `7887da528` BR-3.3 + 3.4 — fall-back predicate + lex-order
+    iterator.
+  - `785386c80` BR-3.2 — v3 coerceToString with NixStringContext.
+  - `19e72dbd0` BR-3.5 — Phase A scaffold + main attr loop.
+  - `bed468e0c` BR-3.6 — NixStringContext → inputDrvs / inputSrcs.
+  - `9e2bc9966` BR-3.7 — fillInOutputPaths + writeDerivation +
+    drvHashes + result attrset.
+  - `e96bdde66` BR-3.8 — drvPath parity harness (10 simple-shape
+    derivations, 10/10 pass).
+
+A/B benchmark on 5000 self-contained nixpkgs-shape derivations
+(`derivation { name; system; builder; args; +20 env vars; ... }`):
+
+| flavour                                    | user CPU |
+|--------------------------------------------|----------|
+| tree-walker                                | 0.030 s  |
+| v3 cutover + BR-3 native (default)         | 0.110 s  |
+| v3 cutover + bridge (V3_DRV_NO_NATIVE=1)   | 0.130 s  |
+
+Native saves ~4 µs / drv vs bridge.  The 80 ms gap to tree-walker
+remaining is v3 cutover overhead in lower+compile+VM dispatch on
+the surrounding genList / map — orthogonal to BR-3.
+
+V3_DRV_STATS=1 confirms native fires on every call when v3 owns
+the eval.  In current cutover mode on real nixpkgs scans (where
+`derivation { ... }` is invoked from imported tree-walker library
+code), the native path doesn't fire because the call goes through
+tree-walker's primop directly, not v3's.  This matches the
+plan's headline finding (#1) that wider cutover scope is the
+upstream prerequisite for the BR-* phases to fully land.
+
+Phases B/C/D still pending (fixed-output, contentAddressed/impure,
+__structuredAttrs respectively) — each will incrementally widen
+the `isSimpleDerivationAttrs` gate, with the parity harness
+(BR-3.8) extended for each shape.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,

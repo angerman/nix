@@ -2724,6 +2724,25 @@ static bool isSimpleDerivationAttrs(const Bindings * b)
     return true;
 }
 
+// BR-3.9: native-vs-fallback counters.  Reported on process exit
+// when V3_DRV_STATS=1 is set; useful to confirm the native path
+// is actually firing on real workloads.
+static uint64_t & drvNativeHits()      { static uint64_t v = 0; return v; }
+static uint64_t & drvNativeFallbacks() { static uint64_t v = 0; return v; }
+
+namespace {
+struct DrvStatsAtExit {
+    ~DrvStatsAtExit() {
+        if (std::getenv("V3_DRV_STATS"))
+            std::fprintf(stderr,
+                "v3 drv final stats: native=%llu fallback=%llu\n",
+                (unsigned long long)drvNativeHits(),
+                (unsigned long long)drvNativeFallbacks());
+    }
+};
+DrvStatsAtExit _drvStatsAtExit;
+}  // namespace
+
 // BR-3.5 — Phase A native derivationStrict: builds nix::Derivation
 // directly from a v3 attrset, skipping the v3↔tree-walker bridge.
 // Throws std::runtime_error on any unsupported shape; the caller
@@ -2752,13 +2771,18 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     // input shape passes isSimpleDerivationAttrs (cheap presence
     // check — no value forcing).  Anything that throws falls
     // through to the existing bridge with no semantics change.
-    if (state.nixEvalState && args[0].isAttrs() && args[0].payload.bindings
+    static const bool nativeDisabled =
+        std::getenv("V3_DRV_NO_NATIVE") != nullptr;
+    if (!nativeDisabled
+        && state.nixEvalState && args[0].isAttrs() && args[0].payload.bindings
         && isSimpleDerivationAttrs(args[0].payload.bindings))
     {
         try {
             primDerivationStrictNative(state, args, out);
+            ++drvNativeHits();
             return;
         } catch (const std::exception & e) {
+            ++drvNativeFallbacks();
             if (std::getenv("V3_DRV_DEBUG"))
                 std::fprintf(stderr,
                     "v3 derivationStrict native fell back: %s\n", e.what());
