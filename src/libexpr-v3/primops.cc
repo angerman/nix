@@ -2510,6 +2510,160 @@ static const DrvStrictSymbols & drvStrictSymbols()
     return s;
 }
 
+// BR-3.2: v3 coerceToString with NixStringContext.
+//
+// Mirrors EvalState::coerceToString (eval.cc:2840) for the subset
+// of cases the BR-3 native derivationStrict needs:
+//   - copyToStore = true   (paths get fetched into the store and
+//                            an Opaque context entry is added)
+//   - canonicalizePath = true
+//   - coerceMore = true    (bool/int/float/null/list also coerce)
+//
+// Caller threads in a `nix::NixStringContext &` accumulator: every
+// string with side-table context contributes its entries; every
+// path-coerce inserts an Opaque entry.  The accumulated context is
+// what derivationStrict turns into drv.inputDrvs / drv.inputSrcs.
+//
+// Throws std::runtime_error on values that can't be coerced
+// (closures without `__toString`, primops, etc.).  The Phase A
+// scaffold catches these and falls back to the bridge.
+//
+// `errorCtx` is currently unused — Phase E (BR-3.13) will wire it
+// into nicer Nix-style traces.  Keeping the parameter so the
+// signature won't churn when error parity lands.
+static std::string v3CoerceToString(
+    EvalState & state,
+    Value & v,
+    nix::NixStringContext & context,
+    std::string_view /*errorCtx*/);
+
+// Helper: for an attrset that has `__toString` (a 1-arg function
+// applied to the attrset itself producing a string), call it and
+// coerce the result.  Returns std::nullopt if no __toString.
+//
+// For Phase A we only support the case where __toString is a v3
+// closure or a tree-walker function reachable via the bridge's
+// PrimOpApp encoding.  Anything more exotic throws and is caught
+// by the scaffold's fall-back.
+static std::optional<std::string> v3TryAttrsToString(
+    EvalState & state,
+    Value & v,
+    nix::NixStringContext & context,
+    std::string_view errorCtx)
+{
+    const auto & sym = drvStrictSymbols();
+    if (!v.isAttrs() || !v.payload.bindings) return std::nullopt;
+    const Value * tsRaw = v.payload.bindings->lookup(sym.toString);
+    if (!tsRaw) return std::nullopt;
+    Value tsFn = forceValue(*state.vm, *tsRaw);
+    // Phase A scope: don't try to call __toString at all — every
+    // case I've audited in nixpkgs has it as a closure that pulls
+    // in the full eval state, and bridging into v3 from this
+    // context isn't yet wired.  Fall back.  (BR-3.13 / Phase E
+    // can expand this once the path is hot enough to matter.)
+    (void)tsFn;
+    throw std::runtime_error(
+        "v3 BR-3 coerceToString: __toString fall-back path "
+        "not yet implemented; bridging");
+}
+
+static std::string v3CoerceToString(
+    EvalState & state,
+    Value & v,
+    nix::NixStringContext & context,
+    std::string_view errorCtx)
+{
+    v = forceValue(*state.vm, v);
+
+    if (v.isString()) {
+        // Forward any side-table context from the v3 string into the
+        // accumulator.  Strings without context (most string
+        // literals) skip the lookup entirely.
+        const char * buf = v.payload.str ? v.payload.str : "";
+        if (auto * raw = lookupStringContextEntries(buf)) {
+            for (auto & e : *raw) {
+                try { context.insert(nix::NixStringContextElem::parse(e)); }
+                catch (...) { /* skip un-parseable */ }
+            }
+        }
+        return std::string(buf);
+    }
+
+    if (v.isPath()) {
+        if (!state.nixEvalState) {
+            throw std::runtime_error(
+                "v3 BR-3 coerceToString: path coerce requires nixEvalState");
+        }
+        auto & ns = *state.nixEvalState;
+        nix::SourcePath sp(ns.rootFS,
+            nix::CanonPath(v.payload.path ? v.payload.path : ""));
+        // copyPathToStore inserts the Opaque context entry on `context`
+        // for us (eval.cc:2961).
+        nix::StorePath dst = ns.copyPathToStore(context, sp);
+        return ns.store->printStorePath(dst);
+    }
+
+    if (v.isAttrs()) {
+        const auto & sym = drvStrictSymbols();
+        // Try __toString first.  If absent, fall through to outPath.
+        if (v.payload.bindings && v.payload.bindings->lookup(sym.toString)) {
+            if (auto s = v3TryAttrsToString(state, v, context, errorCtx))
+                return std::move(*s);
+        }
+        // outPath fallback — common case for derivations and any
+        // attrset that string-coerces to its primary output.
+        if (v.payload.bindings) {
+            if (auto * outV = v.payload.bindings->lookup(sym.outPath)) {
+                Value forced = forceValue(*state.vm, *outV);
+                return v3CoerceToString(state, forced, context, errorCtx);
+            }
+        }
+        throw std::runtime_error(
+            "v3 BR-3 coerceToString: attrset has neither "
+            "__toString nor outPath");
+    }
+
+    // coerceMore = true cases (matching tree-walker's behaviour for
+    // derivationStrict's per-attr coerce):
+    if (v.isBool()) {
+        return v.payload.i == 1 ? std::string("1") : std::string("");
+    }
+    if (v.isInt()) {
+        return std::to_string(v.payload.i);
+    }
+    if (v.tag() == Tag::Float) {
+        // Match tree-walker's std::to_string(double).
+        return std::to_string(v.payload.f);
+    }
+    if (v.tag() == Tag::Null) {
+        return std::string("");
+    }
+    if (v.isList()) {
+        std::string out;
+        auto * lv = v.payload.list;
+        if (!lv) return out;
+        for (uint32_t i = 0; i < lv->size; ++i) {
+            Value el = forceValue(*state.vm, lv->elems[i]);
+            // Match tree-walker's "no separator before / after empty
+            // sublist" quirk (eval.cc:2924).  Compute element text
+            // first; only emit a separator if both this element and
+            // the next non-final element are non-empty-list-shaped.
+            out += v3CoerceToString(state, el, context, errorCtx);
+            if (i + 1 < lv->size) {
+                bool elIsEmptyList = el.isList()
+                    && (!el.payload.list || el.payload.list->size == 0);
+                if (!elIsEmptyList) out += ' ';
+            }
+        }
+        return out;
+    }
+
+    // Closures / primops / thunks (already forced above) / external —
+    // can't coerce.  Throws into the scaffold's fall-back.
+    throw std::runtime_error(
+        "v3 BR-3 coerceToString: cannot coerce value of unsupported tag");
+}
+
 // BR-3.4: lexicographic attr iteration helper.  Returns a vector of
 // indices into `b->entries` sorted by name STRING, not SymbolId.
 //
