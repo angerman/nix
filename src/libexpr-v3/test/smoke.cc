@@ -20,6 +20,7 @@
 #include "v3/vm.hh"
 #include "v3/alloc.hh"
 #include "v3/primop.hh"
+#include "v3/serialize.hh"
 
 #include <cassert>
 #include <cstdio>
@@ -558,6 +559,65 @@ static int testFibonacciSelfApp()
     return 0;
 }
 
+/// Round-trip a CompilationUnit through serialize/deserialize and
+/// confirm the deserialized version produces the same result.
+/// Mirrors testFibonacciSelfApp's setup but runs through the
+/// serializer in the middle.  Validates VM-4 (bytecode disk cache)
+/// at the in-memory layer.
+static int testSerializeRoundTrip()
+{
+    // Reuse the simplest IR shape: `let n = 10; f = x: x + n; in f 32`
+    // → 42 (same as testClosureCapture).
+    auto m = ir::makeModule();
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+    auto n = addBinding(m, topEntry, ir::LitInt{10});
+    auto innerFid = addFunction(m);
+    auto innerEntry = m.freshBlock();
+    auto argName = m.internSymbol("x");
+    auto innerParam = m.freshVar();
+    {
+        auto & f = funcOf(m, innerFid);
+        f.entryBlock = innerEntry;
+        f.argName = argName;
+        f.paramVar = innerParam;
+        f.name = "f";
+        auto added = addBinding(m, innerEntry, ir::Add{innerParam, n});
+        setReturn(m, innerEntry, added);
+    }
+    auto fv = addBinding(m, topEntry, ir::Lambda{ innerFid, /*freeVars*/ {} });
+    auto av = addBinding(m, topEntry, ir::LitInt{32});
+    auto rv = addBinding(m, topEntry, ir::App{fv, av});
+    setReturn(m, topEntry, rv);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+
+    // Serialize + deserialize — fresh CU should compute the same
+    // result as the original.
+    std::string blob = serialize::serializeCU(cu);
+    if (blob.size() < sizeof(serialize::kMagic)) {
+        std::fprintf(stderr,
+            "testSerializeRoundTrip: serialized blob too small (%zu bytes)\n",
+            blob.size());
+        return 1;
+    }
+    auto cu2 = serialize::deserializeCU(blob);
+
+    Value r = run(cu2);
+    if (!r.isInt() || r.payload.i != 42) {
+        std::fprintf(stderr,
+            "testSerializeRoundTrip: expected 42, got tag=%d val=%lld\n",
+            (int)r.tag(), (long long)r.payload.i);
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testSerializeRoundTrip: OK (let n=10; f=x:x+n; in f 32 = 42, "
+        "blob=%zu bytes)\n",
+        blob.size());
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -576,6 +636,7 @@ int main()
     rc |= testPrimOpLength();
     rc |= testPrimOpHeadTail();
     rc |= testFibonacciSelfApp();
+    rc |= testSerializeRoundTrip();
 
     auto & st = allocStats();
     std::fprintf(stderr,

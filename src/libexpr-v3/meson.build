@@ -46,6 +46,7 @@ lib_sources = files(
   'vm.cc',
   'primops.cc',
   'lower.cc',
+  'serialize.cc',
   'v3_hook.cc',
 )
 
@@ -82,6 +83,7 @@ install_headers(
     'include/v3/ir.hh',
     'include/v3/lower.hh',
     'include/v3/primop.hh',
+    'include/v3/serialize.hh',
     'include/v3/value.hh',
     'include/v3/vm.hh',
   ),
