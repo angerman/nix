@@ -1748,6 +1748,36 @@ For now: force-hook stays opt-in via `NIX_USE_V3_FORCE=1` for
 benchmarking simple workloads.  Default behaviour stays at
 parity with tree-walker on every workload.
 
+## 2026-04-28 — WC-13: register v3 arena as Boehm GC root (LANDED)
+
+Foundation work for the eventual WC-12 fix.  Each 1 MB arena block
+allocated via `Arena::refill()` now calls `GC_add_roots(blk, end)`
+(under `#if NIX_USE_BOEHMGC`), so any raw `nix::Value *` stored
+inside a Bridge thunk's `bridgeSrc` field is visible to Boehm's
+mark phase and the underlying tree-walker value stays alive for
+as long as the v3 arena holds the reference.
+
+Without this, a SIGSEGV is reproducible: when v3 arena holds a
+`nix::Value *` and Boehm GC fires (during a v3 primop that does
+GC-managed allocation), the value can be reclaimed mid-bytecode-
+execution.
+
+### What WC-13 does NOT fix
+
+Re-enabling lazy-Direct upvalue bridging (Bridge thunks for tree-
+walker values) on top of WC-13 still SIGSEGVs on drv3 — but the
+new failure is a stack-depth crash, not a GC use-after-free.  The
+`lldb bt 30` shows ~30 deep frames in tree-walker's
+`ExprOpUpdate::eval` / `ExprLet::eval` chain hit when the v3
+force hook adds cross-VM bridges to an already-deep evaluation.
+Solving that requires a different kind of fix (e.g. running v3
+force hook on a larger stack, or making tree-walker's evalForUpdate
+iterative analogously to v3's WC-9.2).
+
+WC-13 stands alone as correct infrastructure.  Default v3 mode
+remains at strict parity with tree-walker; force hook stays
+opt-in until WC-12's stack-depth resolution lands.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,

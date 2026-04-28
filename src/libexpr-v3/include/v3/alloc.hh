@@ -26,6 +26,19 @@
 #include <vector>
 #include <new>
 
+// WC-13: optionally register arena blocks as Boehm GC roots so any
+// raw `nix::Value *` (or other GC-managed pointer) stored inside a
+// Bridge thunk's bridgeSrc field keeps the underlying object alive.
+// Without this, the v3 arena is invisible to Boehm's mark phase and
+// values pointed to only from there are reclaimed mid-evaluation.
+//
+// Pulled in only when NIX_USE_BOEHMGC is defined; otherwise the
+// arena uses plain malloc and there's no GC to integrate with.
+#include "nix/expr/config.hh"
+#if NIX_USE_BOEHMGC
+#  include <gc/gc.h>
+#endif
+
 namespace nix::v3 {
 
 using SymbolId = uint32_t;
@@ -181,6 +194,16 @@ private:
         cur = blk;
         end = blk + kBlockSize;
         totalBytes += kBlockSize;
+#if NIX_USE_BOEHMGC
+        // WC-13: tell Boehm to scan this block for pointers to GC
+        // memory.  Bridge thunks store raw `nix::Value *`; without
+        // this they become invisible to the collector and the values
+        // they point to may be reclaimed mid-evaluation.
+        // GC_add_roots is idempotent over overlapping regions and
+        // safe to call concurrently — the underlying mutex is held
+        // for a short string of pointer arithmetic.
+        GC_add_roots(blk, blk + kBlockSize);
+#endif
     }
 };
 
