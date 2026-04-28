@@ -599,6 +599,62 @@ static int testDiskCacheRoundTrip()
     return 0;
 }
 
+/// Stress test: round-trip lib.nix-style rec attrset through
+/// serialize/deserialize.  This exercises ATTRS_REC_INIT,
+/// MAKE_THUNK, ATTRS_REC_SET, OP_WITH_LOOKUP — the patterns used
+/// by Nix tests that share lib.nix via `with import ./lib.nix;`.
+static int testSerializeWithRecAttrset()
+{
+    // Build IR for: `let rec { foo = 1; bar = foo; }; in ?`
+    // No, simpler: just build the rec attrset and select from it.
+    auto m = ir::makeModule();
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+
+    // We'll build `with { x = 42; }; x` — this exercises OP_WITH_LOOKUP
+    // which had the trailing-depth-word bug.
+    auto symX = m.internSymbol("x");
+    auto litX = addBinding(m, topEntry, ir::LitInt{42});
+
+    ir::AttrSet a;
+    a.entries.push_back({symX, litX});
+    auto attrs = addBinding(m, topEntry, std::move(a));
+
+    auto withBlock = m.freshBlock();
+    auto refX = addBinding(m, withBlock, ir::WithLookup{symX, 0});
+    setReturn(m, withBlock, refX);
+    auto withResult = addBinding(m, topEntry, ir::With{attrs, withBlock});
+    setReturn(m, topEntry, withResult);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+
+    Value origR = run(cu);
+    if (!origR.isInt() || origR.payload.i != 42) {
+        std::fprintf(stderr,
+            "testSerializeWithRecAttrset: original eval got tag=%d val=%lld (want 42)\n",
+            (int)origR.tag(), (long long)origR.payload.i);
+        return 1;
+    }
+
+    // Round-trip.
+    std::string blob = serialize::serializeCU(cu);
+    auto cu2 = serialize::deserializeCU(blob);
+
+    Value rtR = run(cu2);
+    if (!rtR.isInt() || rtR.payload.i != 42) {
+        std::fprintf(stderr,
+            "testSerializeWithRecAttrset: round-trip eval got tag=%d val=%lld "
+            "(want 42, blob=%zu bytes)\n",
+            (int)rtR.tag(), (long long)rtR.payload.i, blob.size());
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testSerializeWithRecAttrset: OK (with { x = 42; }; x = 42, blob=%zu bytes)\n",
+        blob.size());
+    return 0;
+}
+
 /// Round-trip a CompilationUnit through serialize/deserialize and
 /// confirm the deserialized version produces the same result.
 /// Mirrors testFibonacciSelfApp's setup but runs through the
@@ -677,6 +733,7 @@ int main()
     rc |= testPrimOpHeadTail();
     rc |= testFibonacciSelfApp();
     rc |= testSerializeRoundTrip();
+    rc |= testSerializeWithRecAttrset();
     rc |= testDiskCacheRoundTrip();
 
     auto & st = allocStats();

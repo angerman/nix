@@ -58,6 +58,8 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/derived-path.hh"
 #include "nix/store/globals.hh"
+#include "v3/serialize.hh"
+#include "v3/disk_cache.hh"
 
 namespace nix::v3 {
 
@@ -2700,9 +2702,45 @@ void primImport(EvalState & state, Value * args, Value & out)
     }
     e->bindVars(ns, ns.staticBaseEnv);
 
+    // VM-4: try the disk cache before lower+compile.  primImport is
+    // the ideal integration point — direct access to source path
+    // and content; serialized CUs round-trip through the SymbolId
+    // remap in serialize::deserializeCU.
+    static const bool diskCacheEnabled =
+        std::getenv("NIX_V3_DISK_CACHE") != nullptr;
+    disk_cache::CacheKey diskKey{};
+    if (diskCacheEnabled) {
+        try {
+            nix::SourcePath sp(ns.rootFS, nix::CanonPath(path));
+            sp = nix::resolveExprPath(sp);
+            std::string content = sp.readFile();
+            if (!content.empty())
+                diskKey = disk_cache::computeKeyForString(content);
+        } catch (...) { /* best-effort */ }
+    }
+    if (!diskKey.empty()) {
+        if (auto blob = disk_cache::lookup(diskKey)) {
+            try {
+                cache.cus.push_back(serialize::deserializeCU(*blob));
+                out = run(cache.cus.back());
+                cache.results.emplace(path, out);
+                return;
+            } catch (const std::exception &) {
+                cache.cus.pop_back();
+                // Fall through to fresh lower+compile.
+            }
+        }
+    }
+
     auto module = lowerNixExpr(e, ns.symbols, ns.positions);
     nix::v3::ir::computeFreeVars(module);
     cache.cus.push_back(compile(module));
+    if (!diskKey.empty() && serialize::isCacheable(cache.cus.back())) {
+        try {
+            std::string blob = serialize::serializeCU(cache.cus.back());
+            disk_cache::insert(diskKey, blob);
+        } catch (...) { /* best-effort */ }
+    }
     // Each imported file is its own CompilationUnit; we re-enter the
     // VM to run it with its own top-level frame.  Keep the CU alive
     // (it's borrowed by closures returned from the eval).

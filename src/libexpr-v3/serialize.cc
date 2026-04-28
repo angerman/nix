@@ -9,6 +9,9 @@
 #include "v3/primop.hh"
 #include "v3/ir.hh"
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace nix::v3::serialize {
@@ -100,6 +103,25 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
         return id < remap.size() ? remap[id] : id;
     };
     auto & code = cu.code;
+
+    // OP_ATTRS_REC_INIT requires its trailing (name, pos) pairs to
+    // be sorted by SymbolId — runtime fills b->entries[i] in that
+    // order and Bindings::lookup binary-searches.  After remap the
+    // names may no longer be in sorted order, so we re-sort the
+    // trailing data and build a (oldSlot -> newSlot) permutation.
+    // OP_ATTRS_REC_SET[slot] operands that follow within the same
+    // emit must be patched accordingly.  See emit.cc::emitOne(LetRec).
+    //
+    // Active permutations are tracked in a small stack (always at
+    // most one in flight per emit, but the stack lets us survive
+    // nested LetRecs that don't actually emit between init+set —
+    // belt-and-braces).
+    struct PendingRec {
+        std::vector<uint32_t> oldToNew;  // [oldSlot] -> newSlot
+        uint32_t setsRemaining;
+    };
+    std::vector<PendingRec> pending;
+
     for (size_t ip = 0; ip < code.size(); ) {
         uint32_t & word = code[ip];
         Op op = decodeOp(word);
@@ -108,12 +130,17 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
 
         // Patch SymbolId operands in-place + walk trailing data
         // words.  See bytecode.hh + emit.cc for opcode layouts.
-        if (op == OP_WITH_LOOKUP || op == OP_ATTRS_HAS) {
+        if (op == OP_ATTRS_HAS) {
             word = encode(op, remapId(operand));
+        } else if (op == OP_WITH_LOOKUP) {
+            word = encode(op, remapId(operand));
+            ip++;  // 1 trailing word: depth (not a SymbolId)
         } else if (op == OP_ATTRS_SELECT) {
             word = encode(op, remapId(operand));
             ip++;  // 1 IC-index follow-up word
         } else if (op == OP_ATTRS_INIT) {
+            // Names get remapped; runtime sorts on the fly so order
+            // doesn't matter.
             uint32_t n = operand;
             for (uint32_t i = 0; i < n; ++i) {
                 if (ip < code.size()) code[ip] = remapId(code[ip]);  // name
@@ -128,11 +155,49 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
             }
             ip += nDyn;
         } else if (op == OP_ATTRS_REC_INIT) {
+            // Remap names + remember their old positions so we can
+            // re-sort and propagate the permutation to the matching
+            // OP_ATTRS_REC_SETs.
             uint32_t n = operand;
+            std::vector<std::pair<uint32_t, uint32_t>> namePos(n);  // (newName, pos)
             for (uint32_t i = 0; i < n; ++i) {
-                if (ip < code.size()) code[ip] = remapId(code[ip]);
-                ip += 2;
+                if (ip + 2 * i + 1 < code.size()) {
+                    namePos[i].first  = remapId(code[ip + 2 * i]);
+                    namePos[i].second = code[ip + 2 * i + 1];
+                }
             }
+            // Sort by new name; build oldSlot -> newSlot permutation.
+            std::vector<uint32_t> sortedIdx(n);
+            for (uint32_t i = 0; i < n; ++i) sortedIdx[i] = i;
+            std::sort(sortedIdx.begin(), sortedIdx.end(),
+                [&](uint32_t a, uint32_t b) {
+                    return namePos[a].first < namePos[b].first;
+                });
+            std::vector<uint32_t> oldToNew(n);
+            for (uint32_t newSlot = 0; newSlot < n; ++newSlot)
+                oldToNew[sortedIdx[newSlot]] = newSlot;
+            // Write back trailing data in sorted (new) order.
+            for (uint32_t newSlot = 0; newSlot < n; ++newSlot) {
+                uint32_t oldSlot = sortedIdx[newSlot];
+                if (ip + 2 * newSlot + 1 < code.size()) {
+                    code[ip + 2 * newSlot]     = namePos[oldSlot].first;
+                    code[ip + 2 * newSlot + 1] = namePos[oldSlot].second;
+                }
+            }
+            ip += 2 * n;
+            // Queue the slot permutation for the n upcoming
+            // OP_ATTRS_REC_SETs in this emit.
+            pending.push_back({std::move(oldToNew), n});
+        } else if (op == OP_ATTRS_REC_SET) {
+            if (!pending.empty() && pending.back().setsRemaining > 0) {
+                auto & p = pending.back();
+                uint32_t oldSlot = operand;
+                uint32_t newSlot = (oldSlot < p.oldToNew.size())
+                    ? p.oldToNew[oldSlot] : oldSlot;
+                word = encode(OP_ATTRS_REC_SET, newSlot);
+                if (--p.setsRemaining == 0) pending.pop_back();
+            }
+            // No trailing data.
         } else if (op == OP_CALL_PRIMOP) {
             ip++;  // primop-index follow-up
         } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
@@ -368,6 +433,10 @@ CompilationUnit deserializeCU(std::string_view blob)
             if (f.name < remap.size()) f.name = remap[f.name];
         }
     }
+    // Now overwrite cu.symbolTable with the global table so that
+    // any code that later looks up cu.symbolTable[id] (e.g. error
+    // messages) sees the correct names for the remapped IDs.
+    cu.symbolTable = ir::globalSymbolTable();
 
     return cu;
 }
