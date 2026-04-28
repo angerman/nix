@@ -65,6 +65,20 @@ TESTS=(
 
   # 10. Long name with all the legal chars.
   "complex-name:(derivation { name = \"my-pkg.0+1?test_v=2-final\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).drvPath"
+
+  # --- Phase B: fixed-output derivations (BR-3.10) ---
+
+  # 11. fetchurl-shaped flat-mode fixed-output drv.
+  "fixed-flat:(derivation { name = \"fetched\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"0jqkajk1c0pjabwx6dknh6sjs61b7llbifs6yiyzy7lks5njgxw0\"; outputHashAlgo = \"sha256\"; outputHashMode = \"flat\"; }).drvPath"
+
+  # 12. tarball-shaped recursive-mode fixed-output drv (64-hex sha256).
+  "fixed-recursive:(derivation { name = \"tarball\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef\"; outputHashAlgo = \"sha256\"; outputHashMode = \"recursive\"; }).drvPath"
+
+  # 13. nar-mode (newer name for recursive) fixed-output drv.
+  "fixed-nar:(derivation { name = \"narred\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\"; outputHashAlgo = \"sha256\"; outputHashMode = \"nar\"; }).drvPath"
+
+  # 14. Default-method fixed-output (no outputHashMode → defaults to flat).
+  "fixed-default:(derivation { name = \"defaulted\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"0jqkajk1c0pjabwx6dknh6sjs61b7llbifs6yiyzy7lks5njgxw0\"; outputHashAlgo = \"sha256\"; }).drvPath"
 )
 
 pass=0

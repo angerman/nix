@@ -2699,25 +2699,25 @@ static std::vector<uint32_t> lexicographicAttrOrder(const Bindings * b)
     return order;
 }
 
-// BR-3.3: detect-fall-back predicate.  Returns true when args[0]'s
-// shape is suitable for the upcoming Phase A native path (deferred-
-// output, no fixed-output, no content-addressed/impure, no
-// structured-attrs).  Cheap: attribute presence checks via the
-// pre-interned SymbolIds; no value forcing.
+// BR-3.3 + 3.10: detect-fall-back predicate.  Returns true when
+// args[0]'s shape is one the native path can handle — currently:
+//   - Phase A: deferred-output simple case (no special attrs).
+//   - Phase B (BR-3.10): fixed-output (outputHash present) — handled
+//     via a separate code branch inside primDerivationStrictNative.
 //
-// False is the SAFE default — any "complex" attr present routes the
-// call back through the existing tree-walker bridge.  False positives
-// (saying "complex" when it isn't) cost a bridge round-trip; false
-// negatives (saying "simple" when it isn't) would silently produce
-// wrong drvs, so we prefer the conservative side.
+// False is the SAFE default — any unsupported "complex" attr present
+// routes back through the bridge.  False positives cost a bridge
+// round-trip; false negatives silently produce wrong drvs, so the
+// conservative side wins.
 //
-// Phase B/C/D will lift these gates as native support for each lands.
+// Phase C/D will lift the contentAddressed / impure / structuredAttrs
+// gates as native support lands.
 static bool isSimpleDerivationAttrs(const Bindings * b)
 {
     if (!b) return false;
     const auto & sym = drvStrictSymbols();
-    // Any of these attrs present → complex shape → bridge.
-    if (b->lookup(sym.outputHash))       return false;
+    // outputHash is allowed (Phase B handles it).
+    // The rest still gate to the bridge.
     if (b->lookup(sym.structuredAttrs))  return false;
     if (b->lookup(sym.contentAddressed)) return false;
     if (b->lookup(sym.impure))           return false;
@@ -2986,6 +2986,13 @@ static void primDerivationStrictNative(
     // `outputs` attr is present (mirrors derivationStrictInternal:1640).
     std::vector<std::string> declaredOutputs;
 
+    // Phase B (BR-3.10): fixed-output trigger fields.  Populated
+    // during the attr loop if outputHash / outputHashAlgo /
+    // outputHashMode are present.
+    std::optional<std::string> outputHashStr;
+    std::optional<std::string> outputHashAlgoStr;
+    std::optional<std::string> outputHashModeStr;
+
     for (uint32_t idx : order) {
         SymbolId sid = src->entries[idx].name;
         std::string_view key = sid < symTab.size()
@@ -3045,7 +3052,8 @@ static void primDerivationStrictNative(
 
         // All other attrs: coerceToString → drv.env[key] = s.
         // Special-case builder + system to also fill the dedicated
-        // drv.builder / drv.platform fields.
+        // drv.builder / drv.platform fields.  Fixed-output triggers
+        // (outputHash*) are remembered for the post-loop branch.
         std::string s = v3CoerceToString(
             state, attrV, context,
             "while evaluating a derivation attribute");
@@ -3053,6 +3061,12 @@ static void primDerivationStrictNative(
             drv.builder = s;
         else if (sid == sym.system)
             drv.platform = s;
+        else if (sid == sym.outputHash)
+            outputHashStr = s;
+        else if (sid == sym.outputHashAlgo)
+            outputHashAlgoStr = s;
+        else if (sid == sym.outputHashMode)
+            outputHashModeStr = s;
         // emplace gives us "first occurrence wins"; but since attrs
         // are unique by symbol within a Bindings, this is fine.
         drv.env.emplace(std::string(key), std::move(s));
@@ -3106,19 +3120,60 @@ static void primDerivationStrictNative(
             c.raw);
     }
 
-    // ---- BR-3.7: deferred-output setup + writeDerivation +
-    // hashDerivationModulo cache + v3 result attrset.
+    // ---- BR-3.10 (Phase B): fixed-output branch.  If outputHash
+    // is present, build a CAFixed output instead of the deferred
+    // path.  Mirrors derivationStrictInternal (eval.cc:1895).
+    //
+    // Fixed-output derivations require exactly ["out"] as outputs
+    // — multi-output fixed isn't supported by libnixstore.
+    if (outputHashStr) {
+        if (declaredOutputs.size() != 1 || declaredOutputs[0] != "out") {
+            throw std::runtime_error(
+                "v3 BR-3 native: multiple outputs are not supported in "
+                "fixed-output derivations");
+        }
+        std::optional<nix::HashAlgorithm> ha;
+        if (outputHashAlgoStr)
+            ha = nix::parseHashAlgoOpt(*outputHashAlgoStr);
+        nix::Hash h = nix::newHashAllowEmpty(*outputHashStr, ha);
 
-    // For deferred outputs, set env[output]="" pre-fill and slot
-    // each output as Deferred{}.  fillInOutputPaths overwrites the
-    // env entries with the computed paths once the input-addressed
-    // hash is known.  Mirrors derivationStrictInternal:1947–1959.
-    for (auto & o : declaredOutputs) {
-        drv.env[o] = "";
-        drv.outputs.insert_or_assign(
-            o, nix::DerivationOutput{nix::DerivationOutput::Deferred{}});
+        // outputHashMode parsing — back-compat: "recursive" maps to
+        // "nar" (NixArchive); otherwise feed through
+        // ContentAddressMethod::parse.  Default is Flat.
+        nix::ContentAddressMethod method = nix::ContentAddressMethod::Raw::Flat;
+        if (outputHashModeStr) {
+            if (*outputHashModeStr == "recursive")
+                method = nix::ContentAddressMethod::Raw::NixArchive;
+            else
+                method = nix::ContentAddressMethod::parse(*outputHashModeStr);
+        }
+
+        nix::DerivationOutput::CAFixed dof{
+            .ca = nix::ContentAddress{
+                .method = std::move(method),
+                .hash   = std::move(h),
+            },
+        };
+        drv.env["out"] = ns.store->printStorePath(
+            dof.path(*ns.store, drv.name, "out"));
+        drv.outputs.insert_or_assign("out", std::move(dof));
     }
-    drv.fillInOutputPaths(*ns.store);
+    // ---- BR-3.7: deferred-output setup + writeDerivation +
+    // hashDerivationModulo cache + v3 result attrset (the regular
+    // case for derivations without outputHash).
+    else {
+        // For deferred outputs, set env[output]="" pre-fill and slot
+        // each output as Deferred{}.  fillInOutputPaths overwrites
+        // the env entries with the computed paths once the input-
+        // addressed hash is known.  Mirrors
+        // derivationStrictInternal:1947–1959.
+        for (auto & o : declaredOutputs) {
+            drv.env[o] = "";
+            drv.outputs.insert_or_assign(
+                o, nix::DerivationOutput{nix::DerivationOutput::Deferred{}});
+        }
+        drv.fillInOutputPaths(*ns.store);
+    }
 
     // Materialise the drv: in readOnlyMode (the v3-eval default;
     // also typical for `nix-instantiate --eval`) compute the path
