@@ -777,18 +777,33 @@ struct Lowerer
         m.functions[fid].name = "<thunk>";
 
         // CO-3: record (Expr* -> FuncId) for the post-compile pass to
-        // wire this thunk into the forceValue cutover cache — but only
-        // when the thunk lives at top-level (= function 0).  Inside a
-        // nested function (lambda body, another thunk), the same AST
-        // Expr* can be reached from multiple call sites with different
-        // tree-walker env shapes.  Our cache key is Expr* alone, so
-        // nested thunks would conflate distinct env shapes — Phase B
-        // would then materialize upvalues from one shape but the
-        // function expects another, causing OP_ATTRS_SELECT throws.
-        // Restrict caching to the unambiguous top-level case for now.
-        bool atTopLevel = funcStack.empty() || funcStack.back() == 0;
-        if (atTopLevel)
-            m.subExprFuncs.push_back({static_cast<const void *>(e), fid});
+        // WC-2: register every per-thunk function in the cutover
+        // cache, not just top-level ones.
+        //
+        // The earlier restriction (atTopLevel-only) was a safety
+        // measure against the worry that "the same AST Expr* can be
+        // reached from multiple call sites with different tree-walker
+        // env shapes".  Closer reading shows Nix is purely lexical:
+        // each AST Expr has ONE lexical scope, and a thunk's
+        // freeVars (with their (level, displ) origins) describe THAT
+        // scope's relation to the surrounding context.  Tree-walker
+        // constructs envs lexically, so when it forces the thunk the
+        // env-walking pattern from (level, displ) finds the right
+        // values regardless of which dynamic call-site reached the
+        // body.
+        //
+        // The remaining safety nets in v3_hook.cc still apply:
+        //   - recVarSet excludes thunks whose freeVars include a
+        //     rec-attrset VarId (those don't live in a single env
+        //     cell).
+        //   - upvalueSources.empty() causes Phase B to skip.
+        //   - phaseBFailed remembers throws on a per-Expr basis.
+        //
+        // If a nested thunk turns out to misbehave at force time,
+        // Phase B will catch the throw and mark phaseBFailed,
+        // routing the same Expr through tree-walker on subsequent
+        // forces — bounded blast radius.
+        m.subExprFuncs.push_back({static_cast<const void *>(e), fid});
 
         funcStack.push_back(fid);
         blockStack.push_back(entry);
