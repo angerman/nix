@@ -79,13 +79,31 @@ adds per-phase timing (lower / compile / run / bridge):
 
     NIX_VM_STATS=1 V3_TIMING=1 NIX_USE_V3=1 nix eval --json --expr '...'
 
-The remaining wins for cases where v3 *should* dominate (fib-style
-recursive compute) live in CO-2 / CO-3 from `OPTIMIZATION_PLAN.md`:
-hooking `forceValue` to consult the v3 cache for sub-Expr forces
-and pre-populating the cache for sub-Exprs at lower time.  This is
-the 3-5 week piece of work; once it lands, v3 would amortize
-lower+compile across many forces of the same Expr instead of
-re-doing the work per file-toplevel.
+## CO-2 / CO-3: forceValue cutover (opt-in)
+
+Set `NIX_USE_V3_FORCE=1` (in addition to `NIX_USE_V3=1`) to enable
+the forceValue cutover hook.  When the lowered+compiled v3 module
+recorded an Expr* match for a given thunk-body, force-time
+dispatch to that v3 function instead of tree-walker's expr->eval.
+
+Stats with the force hook on:
+
+    v3 force stats: forceEntries=N forceHits=H forceMisses=M skippedNeedsUpvalues=S
+
+What the counters mean:
+  - `forceEntries`: every forceValue call where the Expr* lookup
+    fired; dominated by sub-Expr forces.
+  - `forceHits`: cache hit + actually ran in v3.
+  - `forceMisses`: cache miss; fell through to expr->eval.
+  - `skippedNeedsUpvalues`: cache hit, but the function needs
+    upvalues we can't yet translate from tree-walker's env.
+    Phase B (task #278) unblocks these.
+
+Currently the force hook is a small *regression* on real-world
+workloads (~8% slower on hello.name) because the per-call hash-map
+lookup outweighs the few hits that don't need upvalues.  Phase B
+lifts the upvalue restriction, at which point most thunks can
+flow through v3 and the trade-off should reverse.
 
 ## What the lowerer supports
 
