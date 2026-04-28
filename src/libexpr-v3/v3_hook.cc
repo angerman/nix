@@ -124,6 +124,7 @@ static void populateSubExprCacheLocal(
     std::unordered_set<ir::VarId> recVarSet(
         module.recVarIds.begin(), module.recVarIds.end());
     auto & subCache = v3SubExprCache();
+    static const bool diagOrigins = std::getenv("V3_DEBUG_ORIGINS") != nullptr;
     for (auto & sef : module.subExprFuncs) {
         if (sef.funcIdx >= cu->lambdas.size()) continue;
         if (sef.funcIdx >= module.functions.size()) continue;
@@ -134,10 +135,20 @@ static void populateSubExprCacheLocal(
             bool ok = true;
             entry.upvalueSources.reserve(fvs.size());
             for (auto fv : fvs) {
-                if (recVarSet.count(fv)) { ok = false; break; }
+                if (recVarSet.count(fv)) {
+                    if (diagOrigins) std::fprintf(stderr,
+                        "v3 origins: func=%u skip — fv=%u in recVarSet\n",
+                        sef.funcIdx, fv);
+                    ok = false; break;
+                }
                 uint64_t key = (static_cast<uint64_t>(sef.funcIdx) << 32) | fv;
                 auto oit = originLookup.find(key);
-                if (oit == originLookup.end()) { ok = false; break; }
+                if (oit == originLookup.end()) {
+                    if (diagOrigins) std::fprintf(stderr,
+                        "v3 origins: func=%u skip — fv=%u has no varOrigins entry\n",
+                        sef.funcIdx, fv);
+                    ok = false; break;
+                }
                 entry.upvalueSources.push_back(oit->second);
             }
             if (!ok) entry.upvalueSources.clear();
