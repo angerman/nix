@@ -1429,7 +1429,17 @@ inline bool EvalState::evalBool(Env & env, Expr * e, const PosIdx pos, std::stri
 {
     try {
         Value v;
-        e->eval(*this, env, v);
+        // WC-3: route through v3ForceHook when available — same env-
+        // aware dispatch the forceValue cutover uses.  If v3 has this
+        // Expr cached and can materialise upvalues from `env`, it
+        // produces the result; otherwise we fall through to the
+        // tree-walker dispatch below.
+        if (v3ForceHook && e && e->isV3CacheCandidate
+            && v3ForceHook(*this, e, env, v)) {
+            // hook filled `v`.
+        } else {
+            e->eval(*this, env, v);
+        }
         if (v.type() != nBool)
             error<TypeError>(
                 "expected a Boolean but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
@@ -1446,7 +1456,13 @@ inline bool EvalState::evalBool(Env & env, Expr * e, const PosIdx pos, std::stri
 inline void EvalState::evalAttrs(Env & env, Expr * e, Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     try {
-        e->eval(*this, env, v);
+        // WC-3: same routing as evalBool.
+        if (v3ForceHook && e && e->isV3CacheCandidate
+            && v3ForceHook(*this, e, env, v)) {
+            // hook filled `v`.
+        } else {
+            e->eval(*this, env, v);
+        }
         if (v.type() != nAttrs)
             error<TypeError>(
                 "expected a set but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
