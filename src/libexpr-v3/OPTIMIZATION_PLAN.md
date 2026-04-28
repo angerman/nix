@@ -1561,6 +1561,98 @@ WC-9 (Option 3, iterative // walk) ships as a complementary
 correctness-and-stack-depth improvement that was a prerequisite
 for WC-10 to land cleanly on real nixpkgs traces.
 
+## 2026-04-28 — WC-11: precompile + populate sub-Expr cache on fallback (LANDED)
+
+### Headline measurement (post-WC-11, with NIX_USE_V3_FORCE=1)
+
+| workload    | tw     | v3 default | v3+fhook | fhook/tw |
+|-------------|--------|------------|----------|----------|
+| fib35       | 3.93 s | 3.77 s     | 3.76 s   | 0.96x    |
+| hello-name  | 0.35 s | 0.36 s     | 0.15 s   | **0.43x** |
+| git-name    | 0.36 s | 0.36 s     | 0.15 s   | **0.42x** |
+| attr-pkgs   | 0.36 s | 0.37 s     | 0.15 s   | **0.42x** |
+| attr-hask   | 0.62 s | 0.63 s     | 0.15 s   | **0.24x** |
+| drv3        | 0.43 s | 0.44 s     | 3.92 s   | 9.12x †  |
+
+† drv3 SIGSEGVs with the force hook on — bridge-thunk + force-hook
+interaction stack-overflows on derivationStrict workloads.  The force
+hook stays opt-in (`NIX_USE_V3_FORCE=1`) until that's root-caused.
+
+### Tree-walker reliance: before vs after
+
+NIX_VM_STATS dump on `(import <nixpkgs>{}).hello.name`:
+
+```
+PRE-WC-11:                              POST-WC-11 + force-hook:
+tw OpUpdate:    25119 entries           tw OpUpdate:    2140 entries  (-91%)
+v3 forceEntries:   0                    v3 forceEntries:  86
+v3 forceHits:      0                    v3 forceHits:     10
+```
+
+So with the force hook on, v3 owns **91% fewer tree-walker //
+operations** on real-world traces.  ~10 of 86 force-hook entries
+actually run in v3; the other 69 skip due to upvalue-translation gaps
+that were not pre-WC-11 visible because the cache was empty.
+
+### What the diagnostic data revealed
+
+`forceEntries=0` on every nixpkgs trace pre-WC-11 was driven by two
+separate gaps:
+
+1. **`willReturnClosureStatic` short-circuit fired before lower.**
+   Every nixpkgs file is `let ... in lambda`, so the static closure
+   predicate falls back without ever calling `lowerNixExpr`.  The
+   sub-Expr cache stayed empty for those files; tree-walker did
+   100% of the runtime there.
+
+2. **Force hook's gating env var was separate.**  `v3ForceHook` was
+   only installed if `NIX_USE_V3_FORCE=1` was set _in addition to_
+   `NIX_USE_V3=1`.  Even when the cache _was_ populated, the inline
+   forceValue check skipped because the function pointer was null.
+
+### Pieces
+
+1. **`lowerCompileAndPopulate(e, state, st)`** in `v3_hook.cc`:
+   speculatively lowers + compiles + calls `populateSubExprCacheLocal`
+   on each fallback path.  Dedup via `v3FallbackPopulated` set.
+   Skips modules with > `NIX_V3_PRECOMPILE_MAX_FNS` (default 200)
+   functions to avoid wasting effort on the makeExtensible chain.
+   Knob: `NIX_V3_NO_PRECOMPILE=1` disables.
+2. **Hook into the `willReturnClosureStatic` fallback** to call the
+   helper before tree-walker takes over.
+3. **`lower.cc`: relax `atTopLevel` gate** in `lowerLetRecCapture`.
+   Pre-WC-11, only depth-0 Let/rec-attrset bindings registered into
+   `subExprFuncs`; v3's `thunkify` already handled all depths via
+   the WC-2 relaxation.  Same lexical-scope rationale (Nix is
+   purely lexical, freeVars `(level, displ)` describe the lexical
+   scope regardless of dynamic call depth).  Drove subExprFuncs
+   coverage 5→15, 84→98, 2→3, 45→51 on the 4 nixpkgs file-toplevels
+   in the hello.name trace.
+4. **Force hook gating** — kept opt-in via `NIX_USE_V3_FORCE=1` for
+   now (default OFF).  When the drv3 SIGSEGV is fixed it will flip
+   to default ON.
+
+### Validation
+
+- v3 lang 142/142, cutover 142/142 (default + force-hook ON).
+- drv-parity 25/25.
+- v3+force-hook on simple nixpkgs workloads: **0.42-0.43x wall-clock
+  vs tree-walker** (i.e. ~57% faster).
+- v3+force-hook on attr-hask: **0.24x** (76% faster).
+- Memory on hello-name: 171 MB (tw) vs 70 MB (v3+fhook) — 59% less.
+
+### Remaining work
+
+1. **Root-cause the drv3 SIGSEGV** with force-hook ON.  The bridge
+   path between v3 Bridge thunks (WC-10) and the v3 force hook
+   creates a recursion shape that overflows the pthread stack on
+   derivationStrict workloads.  Fixing this enables flipping the
+   force hook to default ON.
+2. **Reduce `forceSkippedNeedsUpvalues`** (69/86 = 80% skip rate).
+   Most skips are Lambda/Call kinds whose upvalues we can't
+   materialise; targeted improvements there would convert skips
+   into hits.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,

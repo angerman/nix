@@ -1035,17 +1035,21 @@ struct Lowerer
         std::vector<Pending> pending;
         pending.reserve(attrDefs.size());
 
-        bool atTopLevel = funcStack.empty() || funcStack.back() == 0;
         for (auto & kv : attrDefs) {
             m.functions.emplace_back();
             ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
             auto eb = m.freshBlock();
             m.functions[fid].entryBlock = eb;
             m.functions[fid].name = std::string(symbols[kv.first]);
-            // CO-3: register the LetRec / rec-attrset binding's def
-            // expression with the thunk's function — only at top
-            // level.  See thunkify() for the rationale.
-            if (atTopLevel && kv.second.e)
+            // CO-3 + WC-11: register every Let/Attrs binding's def
+            // expression, not just top-level ones.  Same rationale
+            // as `thunkify` (above): Nix is purely lexical, so
+            // freeVars (level, displ) origins describe the lexical
+            // scope regardless of dynamic call-site depth.  Without
+            // this, real-world workloads only register depth-0
+            // bindings, leaving the bulk of forced thunks with no
+            // v3 candidate flag and forceEntries=0.
+            if (kv.second.e)
                 m.subExprFuncs.push_back({static_cast<const void *>(kv.second.e), fid});
             pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb,
                                 posIdxToHandle(kv.second.pos)});

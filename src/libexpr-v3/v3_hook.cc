@@ -297,6 +297,85 @@ static bool willReturnClosure(const nix::Expr * e)
     return false;
 }
 
+/// WC-11: tracks Expr*s for which we've already speculatively
+/// lowered+compiled+populated the sub-Expr cache on a fallback path.
+/// Without this, every re-entry into the eval hook for the same
+/// short-circuited Expr would re-pay the lower+compile cost.
+static std::unordered_set<const nix::Expr *> & v3FallbackPopulated()
+{
+    static std::unordered_set<const nix::Expr *> s;
+    return s;
+}
+
+/// WC-11: lower + compile + populateSubExprCacheLocal for `e` and
+/// stash the CU in v3HookCache so future entries find it cached.
+/// Returns true if populate succeeded; false if lower or compile
+/// threw (in which case we just fall back without caching).
+///
+/// Why this exists: pre-WC-11, fallback paths (willReturnClosure /
+/// sizeHeuristicSkip / IR-level closure prediction) called
+/// `e->eval(...)` directly without populating v3SubExprCache.  On
+/// real-world workloads the file-toplevel always falls back through
+/// willReturnClosureStatic (nixpkgs files are `let ... in lambda`),
+/// so v3SubExprCache stays empty and the v3 force hook never fires
+/// — `forceEntries=0` across every nixpkgs trace.  By populating
+/// the sub-Expr cache here, every per-thunk function in the file
+/// becomes a v3 force candidate, even though the file's toplevel
+/// result is delegated to tree-walker.
+///
+/// Trade-off: speculatively pays the lower+compile cost (~3-15 ms
+/// per file in nixpkgs).  Worth it if the resulting force traffic
+/// benefits more than the precompile cost.  Gated on
+/// NIX_V3_NO_PRECOMPILE to A/B-test; default is ON.
+static bool lowerCompileAndPopulate(
+    nix::Expr * e, nix::EvalState & state, V3HookStats & st)
+{
+    static const bool disabled = std::getenv("NIX_V3_NO_PRECOMPILE") != nullptr;
+    if (disabled) return false;
+    if (!e) return false;
+    auto & populatedSet = v3FallbackPopulated();
+    if (populatedSet.count(e)) return true;
+    auto & cache = v3HookCache();
+    if (cache.find(e) != cache.end()) {
+        populatedSet.insert(e);
+        return true;
+    }
+    static const bool timingEnabled = std::getenv("V3_TIMING") != nullptr;
+    using clock = std::chrono::steady_clock;
+    try {
+        auto t0 = timingEnabled ? clock::now() : clock::time_point{};
+        auto module = lowerNixExpr(e, state.symbols, state.positions);
+        ir::computeFreeVars(module);
+        auto t1 = timingEnabled ? clock::now() : clock::time_point{};
+        // Skip precompile of huge modules (e.g. nixpkgs/lib's 504-lambda
+        // makeExtensible chain): the populated entries throw at force
+        // time, so the lower+compile cost is wasted.
+        static const size_t kMaxFunctions = []{
+            if (const char * v = std::getenv("NIX_V3_PRECOMPILE_MAX_FNS"))
+                return (size_t)std::atoi(v);
+            return (size_t)200;
+        }();
+        if (module.functions.size() > kMaxFunctions) {
+            populatedSet.insert(e);
+            return false;
+        }
+        auto compiled = std::make_unique<CompilationUnit>(compile(module));
+        auto t2 = timingEnabled ? clock::now() : clock::time_point{};
+        if (timingEnabled) {
+            st.lowerNs   += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+            st.compileNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        }
+        const CompilationUnit * cu = compiled.get();
+        populateSubExprCacheLocal(module, cu);
+        cache.emplace(e, CachedUnit{std::move(compiled)});
+        populatedSet.insert(e);
+        return true;
+    } catch (...) {
+        populatedSet.insert(e);
+        return false;
+    }
+}
+
 /// The hook entry point.  Called from libnixexpr's EvalState::eval
 /// when NIX_USE_V3=1 and this hook is non-null.
 static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
@@ -464,6 +543,13 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             if (diag) std::fprintf(stderr,
                 "v3 hook: static closure result predicted, kind=%d\n", (int)k);
             st.evalFallbackReason[5]++;
+            // WC-11: even though we can't run-and-bridge this Expr,
+            // we can populate v3SubExprCache so per-thunk-body
+            // functions inside become v3 force candidates.  Without
+            // this, real-world workloads see forceEntries=0 because
+            // every nixpkgs file is `let ... in lambda` and short-
+            // circuits here before lower runs.
+            (void)lowerCompileAndPopulate(e, state, st);
             e->eval(state, state.baseEnv, v);
             return;
         }
@@ -827,13 +913,10 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                           nix::Env & env, nix::Value & v)
 {
-    // Gating: NIX_USE_V3 enables the eval hook (file-toplevel
-    // cutover); the forceValue hook is additionally gated on
-    // NIX_USE_V3_FORCE=1.  Without sub-Expr cache pre-population
-    // (CO-3 / task #279) every force call here misses and adds
-    // ~75 ns of overhead — for hello.name that's 218k calls = ~16 ms.
-    // Until CO-3 lands the hook is opt-in; after CO-3 we'll flip
-    // the default and remove the separate env var.
+    // Opt-in via NIX_USE_V3_FORCE=1.  Default off pending root-cause
+    // of the drv3 SIGSEGV (see V3HookRegistrar comment).  When ON
+    // and combined with WC-11 precompile, simple nixpkgs workloads
+    // see a ~57% wall-clock improvement.
     static const bool useV3Force = []{
         const char * a = std::getenv("NIX_USE_V3");
         const char * b = std::getenv("NIX_USE_V3_FORCE");
@@ -1071,11 +1154,15 @@ struct V3HookRegistrar {
         // insert per parsed file) and only matters when the disk
         // cache is enabled.
         nix::EvalState::v3RegisterExprHook = &v3RegisterExprEntry;
-        // The forceValue hook is opt-in via NIX_USE_V3_FORCE=1; left
-        // null by default so eval-inline.hh's branch-predictor folds
-        // the v3 check away entirely on workloads that don't need it.
-        // Until CO-3 (sub-Expr cache pre-population) lands the hook
-        // costs more than it saves on real-world workloads.
+        // WC-11: forceValue hook stays opt-in via NIX_USE_V3_FORCE=1
+        // for now.  Per-thunk overhead is one branch on
+        // isV3CacheCandidate (false for ~99.9% of forced thunks),
+        // and on simple workloads (hello-name, attr-pkgs) it yields
+        // a ~57% wall-clock win.  But it currently SIGSEGVs on
+        // derivationStrict-heavy workloads (drv3 — pkgs.{hello,git,vim}.drvPath)
+        // because the force hook + WC-10 Bridge thunks interact in a
+        // way that overflows the stack across the v3<->tree-walker
+        // boundary.  Until that is root-caused, default OFF.
         if (const char * v = std::getenv("NIX_USE_V3_FORCE");
             v && std::string_view(v) == "1") {
             nix::EvalState::v3ForceHook = &v3ForceEntry;
@@ -1111,6 +1198,8 @@ void installEvalHook()
 {
     nix::EvalState::v3EvalHook = &v3EvalEntry;
     nix::EvalState::v3RegisterExprHook = &v3RegisterExprEntry;
+    // WC-11: force hook stays opt-in via NIX_USE_V3_FORCE=1 until
+    // the derivationStrict SIGSEGV interaction is root-caused.
     if (const char * v = std::getenv("NIX_USE_V3_FORCE");
         v && std::string_view(v) == "1") {
         nix::EvalState::v3ForceHook = &v3ForceEntry;
