@@ -67,6 +67,45 @@ V3HookStats & v3HookStats()
     return stats;
 }
 
+/// Statically detect whether evaluating `e` will produce a closure
+/// (Lambda result) — without actually running it.  Used to skip v3
+/// for shapes where v3's lower+compile+run would be wasted work
+/// because the result must fall back to tree-walker anyway (closures
+/// can't currently be cleanly bridged out of v3 — see Tag::Closure
+/// case in the result switch below).
+///
+/// Recurses through trivially structural wrappers (let/with/assert/
+/// if-with-both-branches-closure).  Conservative: returns false on
+/// shapes whose result depends on runtime values we can't see at
+/// compile time.  False positives are wrong (would skip v3 for an
+/// expression that v3 could handle); false negatives only cost
+/// efficiency.  We err strictly on the side of false negatives.
+static bool willReturnClosure(const nix::Expr * e)
+{
+    if (!e) return false;
+    auto k = e->exprKind;
+    if (k == nix::Expr::Kind::Lambda)
+        return true;
+    if (k == nix::Expr::Kind::Let)
+        return willReturnClosure(static_cast<const nix::ExprLet *>(e)->body);
+    if (k == nix::Expr::Kind::With)
+        return willReturnClosure(static_cast<const nix::ExprWith *>(e)->body);
+    if (k == nix::Expr::Kind::Assert)
+        return willReturnClosure(static_cast<const nix::ExprAssert *>(e)->body);
+    if (k == nix::Expr::Kind::If) {
+        // Both branches must produce a closure.  Otherwise we don't
+        // know at compile time which arm is taken.
+        auto * ei = static_cast<const nix::ExprIf *>(e);
+        return willReturnClosure(ei->then) && willReturnClosure(ei->else_);
+    }
+    // Var (could resolve to anything), Call (depends on body of
+    // callee), Select (depends on attrset shape), Op* (numeric/
+    // string), literals (not closures), Attrs (an attrset, not a
+    // closure), List (a list).  None of these are statically known
+    // to be closures.
+    return false;
+}
+
 /// The hook entry point.  Called from libnixexpr's EvalState::eval
 /// when NIX_USE_V3=1 and this hook is non-null.
 static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
@@ -113,6 +152,16 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             k == nix::Expr::Kind::Var    ||
             k == nix::Expr::Kind::Pos) {
             if (diag) std::fprintf(stderr, "v3 hook: short-circuit kind=%d\n", (int)k);
+            e->eval(state, state.baseEnv, v);
+            return;
+        }
+        // Static closure-result predicate.  v3 can't currently
+        // bridge a Closure result back to tree-walker without falling
+        // back anyway (see Tag::Closure case below); detecting this
+        // up front saves the wasted lower+compile+run cycle.
+        if (willReturnClosure(e)) {
+            if (diag) std::fprintf(stderr,
+                "v3 hook: static closure result predicted, kind=%d\n", (int)k);
             e->eval(state, state.baseEnv, v);
             return;
         }
