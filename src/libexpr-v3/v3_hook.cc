@@ -26,6 +26,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/nixexpr.hh"
 
+#include <chrono>
 #include <memory>
 #include <unordered_map>
 
@@ -59,6 +60,14 @@ struct V3HookStats {
     uint64_t evalEntries  = 0;
     uint64_t cacheHits    = 0;
     uint64_t cacheMisses  = 0;
+
+    // Per-phase total time (nanoseconds) — only populated when
+    // V3_TIMING=1.  Lets us see whether lower, compile, run, or
+    // bridge dominates the cutover overhead per file-toplevel Expr.
+    uint64_t lowerNs   = 0;
+    uint64_t compileNs = 0;
+    uint64_t runNs     = 0;
+    uint64_t bridgeNs  = 0;
 };
 
 V3HookStats & v3HookStats()
@@ -119,7 +128,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     // read since they don't have non-trivial destructors.  Use
     // v3-eval directly for primop-level profiling.
     static bool atexitDone = []{
-        if (std::getenv("NIX_VM_STATS")) {
+        if (std::getenv("NIX_VM_STATS") || std::getenv("V3_TIMING")) {
             std::atexit([]{
                 auto & s = v3HookStats();
                 std::fprintf(stderr,
@@ -127,6 +136,13 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     (unsigned long long)s.evalEntries,
                     (unsigned long long)s.cacheHits,
                     (unsigned long long)s.cacheMisses);
+                if (std::getenv("V3_TIMING"))
+                    std::fprintf(stderr,
+                        "v3 hook timing (ms): lower=%.3f compile=%.3f run=%.3f bridge=%.3f\n",
+                        s.lowerNs   / 1e6,
+                        s.compileNs / 1e6,
+                        s.runNs     / 1e6,
+                        s.bridgeNs  / 1e6);
             });
         }
         return true;
@@ -171,6 +187,9 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     (void)registered;
     setNixEvalState(&state);
 
+    static const bool timingEnabled = std::getenv("V3_TIMING") != nullptr;
+    using clock = std::chrono::steady_clock;
+
     auto & cache = v3HookCache();
     auto it = cache.find(e);
     const CompilationUnit * cu = nullptr;
@@ -179,9 +198,16 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         if (diag) std::fprintf(stderr, "v3 hook: cache miss kind=%d\n",
                                e ? (int)e->exprKind : -1);
         try {
+            auto t0 = timingEnabled ? clock::now() : clock::time_point{};
             auto module = lowerNixExpr(e, state.symbols, state.positions);
             ir::computeFreeVars(module);
+            auto t1 = timingEnabled ? clock::now() : clock::time_point{};
             auto compiled = std::make_unique<CompilationUnit>(compile(module));
+            auto t2 = timingEnabled ? clock::now() : clock::time_point{};
+            if (timingEnabled) {
+                st.lowerNs   += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                st.compileNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+            }
             cu = compiled.get();
             cache.emplace(e, CachedUnit{std::move(compiled)});
         } catch (const std::exception & ex) {
@@ -202,7 +228,11 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                            cu->code.size(), cu->lambdas.size());
     Value r;
     try {
+        auto t0 = timingEnabled ? clock::now() : clock::time_point{};
         r = run(*cu);
+        auto t1 = timingEnabled ? clock::now() : clock::time_point{};
+        if (timingEnabled)
+            st.runNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     } catch (const std::exception & ex) {
         if (diag) std::fprintf(stderr, "v3 hook: run threw: %s\n", ex.what());
         // v3 evaluation failure — fall back to tree-walker.
@@ -249,7 +279,12 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         // these structures — treat any throw as a signal to fall
         // back, and pre-emptively fall back if the bridge returns null.
         try {
+            auto t0 = timingEnabled ? clock::now() : clock::time_point{};
             nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
+            if (timingEnabled) {
+                auto t1 = clock::now();
+                st.bridgeNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+            }
             if (tmp) { v = *tmp; return; }
         } catch (const std::exception & ex) {
             if (diag) std::fprintf(stderr, "v3 hook: bridge threw: %s\n", ex.what());
