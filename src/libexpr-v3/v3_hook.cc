@@ -275,6 +275,40 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             auto module = lowerNixExpr(e, state.symbols, state.positions);
             ir::computeFreeVars(module);
             auto t1 = timingEnabled ? clock::now() : clock::time_point{};
+            // Heuristic: very large modules (typically nixpkgs/lib's
+            // 504-lambda makeExtensible chain) tend to either throw
+            // OP_FORCE: blackhole at runtime or return Tag::Closure —
+            // both cause fall-back to tree-walker which then re-
+            // evaluates the same file.  Skip the run+throw cycle by
+            // bailing out before compile.  Threshold tuned to leave
+            // hello.name's smaller successful cases (≤74 lambdas)
+            // working while skipping the massive lib top-level.
+            if (diag) std::fprintf(stderr,
+                "v3 hook: lowered module has %zu functions, %zu blocks\n",
+                module.functions.size(), module.blocks.size());
+            // Heuristic: empirically, lowered modules with many
+            // functions (= many lambdas / per-thunk units) tend to
+            // either throw OP_FORCE blackhole at run time or return
+            // Tag::Closure — both cause fall-back to tree-walker
+            // which then re-evaluates the same file.  Skip the run+
+            // throw cycle for these.  Threshold of 50 chosen
+            // empirically: hello.name's successful 11/19-function
+            // cases keep working; the 74/504-function blackhole/
+            // closure cases skip directly to tree-walker.  Tunable
+            // via NIX_V3_SKIP_THRESHOLD env var for experimentation.
+            static const size_t kSkipThresholdFunctions = []{
+                if (const char * v = std::getenv("NIX_V3_SKIP_THRESHOLD"))
+                    return (size_t)std::atoi(v);
+                return (size_t)50;
+            }();
+            if (module.functions.size() > kSkipThresholdFunctions) {
+                if (diag) std::fprintf(stderr,
+                    "v3 hook: skip lower-result (%zu functions > %zu) — "
+                    "likely fall-back at run time\n",
+                    module.functions.size(), kSkipThresholdFunctions);
+                e->eval(state, state.baseEnv, v);
+                return;
+            }
             auto compiled = std::make_unique<CompilationUnit>(compile(module));
             auto t2 = timingEnabled ? clock::now() : clock::time_point{};
             if (timingEnabled) {
