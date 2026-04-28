@@ -76,6 +76,20 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
     if (diag) std::fprintf(stderr, "v3 hook[%llu]: enter e=%p\n",
                            (unsigned long long)st.evalEntries, (void*)e);
+
+    // Fast path: if the Expr is a top-level Lambda, v3 would lower
+    // it to a closure-returning entry and we'd fall back to
+    // tree-walker anyway after wasting the lower+run cycle.  The
+    // tree-walker handles ExprLambda::eval cheaply (just allocates a
+    // Value with the function pointer) — short-circuit straight to
+    // it.  Same logic for primops/applies — anything whose eval is
+    // already cheap in tree-walker doesn't benefit from v3.
+    if (e && e->exprKind == nix::Expr::Kind::Lambda) {
+        if (diag) std::fprintf(stderr, "v3 hook: ExprLambda — skip v3\n");
+        e->eval(state, state.baseEnv, v);
+        return;
+    }
+
     static bool registered = (registerBuiltinPrimOps(), true);
     (void)registered;
     setNixEvalState(&state);
