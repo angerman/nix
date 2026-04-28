@@ -2775,9 +2775,25 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
             return;
         } catch (const std::exception & e) {
             ++drvNativeFallbacks();
-            if (std::getenv("V3_DRV_DEBUG"))
+            // BR-3.13: when V3_DRV_DEBUG is set, surface the
+            // derivation's name (when readable) along with the
+            // throw — makes "why did the native path bail on this
+            // drv?" diagnosable without re-running with extra
+            // instrumentation.  When the error is a real
+            // user-facing one (missing builder etc.), the bridge
+            // re-throws with proper Nix-style traces; we still
+            // see this debug line first.
+            if (std::getenv("V3_DRV_DEBUG")) {
+                std::string drvName = "<unknown>";
+                const auto & syms = drvStrictSymbols();
+                if (auto * nv = args[0].payload.bindings->lookup(syms.name)) {
+                    if (nv->isString() && nv->payload.str)
+                        drvName = nv->payload.str;
+                }
                 std::fprintf(stderr,
-                    "v3 derivationStrict native fell back: %s\n", e.what());
+                    "v3 derivationStrict native fell back on `%s`: %s\n",
+                    drvName.c_str(), e.what());
+            }
             // fall through to the bridge below.
         }
     }

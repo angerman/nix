@@ -1012,6 +1012,32 @@ __structuredAttrs respectively) — each will incrementally widen
 the `isSimpleDerivationAttrs` gate, with the parity harness
 (BR-3.8) extended for each shape.
 
+### Phases B–E LANDED (2026-04-30, commits 291–294)
+
+  - `4f50f3b47` BR-3.10 — Phase B: fixed-output (outputHash).
+    +4 parity cases (flat, recursive, nar, default-method).
+  - `c01b70b72` BR-3.11 — Phase C: __contentAddressed / __impure
+    + __ignoreNulls.  +4 parity cases.
+  - `456913bd1` BR-3.12 — Phase D: __structuredAttrs (JSON).
+    +3 parity cases (minimal, mixed-type, nested).  Adds new
+    helper `valueToJsonWithContext` that mirrors `valueToJson`
+    but threads a `NixStringContext` accumulator (so paths /
+    string-with-context round-trip into the drv's
+    inputDrvs/inputSrcs correctly).
+  - BR-3.13 (Phase E) — surface `<drv-name>` in the
+    V3_DRV_DEBUG fall-back log line.  Tree-walker-style nix::Error
+    traces deliberately not adopted: when the native path fails
+    we fall back to the bridge, which re-throws with proper Nix
+    error machinery — so user-visible error messages already
+    match.
+
+Final parity harness: **21/21** (10 simple + 4 fixed-output +
+4 CA/impure/ignoreNulls + 3 structuredAttrs).
+`isSimpleDerivationAttrs` is now effectively unconditional;
+the bridge fall-back is reserved for genuinely unsupported
+shapes (e.g. closures in places we don't yet handle), which
+appear to be empty in the current parity battery.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
