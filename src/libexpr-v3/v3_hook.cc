@@ -149,6 +149,17 @@ struct V3HookStats {
     static constexpr size_t kSkipReasonCap = 8;
     uint64_t forceSkipReason[kSkipReasonCap] = {};
 
+    // WC-1: per-eval-fallback reason for the top-level eval hook.
+    //   [0] runThrew              (v3 lower/compile/run threw)
+    //   [1] resultClosureLikeTag  (Closure/Thunk/PrimOp/etc.)
+    //   [2] bridgeReturnedNull    (v3ToTreeWalker → null)
+    //   [3] bridgeThrew           (v3ToTreeWalker threw)
+    //   [4] shortCircuitKindEarly (Lambda/Int/Float/.../Attrs/List)
+    //   [5] willReturnClosure     (static-detector short-circuit)
+    //   [6] sizeHeuristicSkip     (modules.functions > kSkipThreshold)
+    static constexpr size_t kEvalFallbackCap = 8;
+    uint64_t evalFallbackReason[kEvalFallbackCap] = {};
+
     // Per-phase total time (nanoseconds) — only populated when
     // V3_TIMING=1.  Lets us see whether lower, compile, run, or
     // bridge dominates the cutover overhead per file-toplevel Expr.
@@ -285,6 +296,28 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                         reasonNames[i],
                         (unsigned long long)s.forceSkipReason[i]);
                 }
+                // WC-1: top-level eval fallback reasons.
+                static const char * evalReasonNames[V3HookStats::kEvalFallbackCap] = {
+                    "runThrew",
+                    "resultClosureLikeTag",
+                    "bridgeReturnedNull",
+                    "bridgeThrew",
+                    "shortCircuitKindEarly",
+                    "willReturnClosureStatic",
+                    "sizeHeuristicSkip",
+                    "(unused)",
+                };
+                bool anyEvalReason = false;
+                for (size_t i = 0; i < V3HookStats::kEvalFallbackCap; ++i) {
+                    if (s.evalFallbackReason[i] == 0) continue;
+                    if (!anyEvalReason) {
+                        std::fprintf(stderr, "v3 eval fallback reasons:\n");
+                        anyEvalReason = true;
+                    }
+                    std::fprintf(stderr, "  %-26s %llu\n",
+                        evalReasonNames[i],
+                        (unsigned long long)s.evalFallbackReason[i]);
+                }
                 if (std::getenv("V3_TIMING"))
                     std::fprintf(stderr,
                         "v3 hook timing (ms): lower=%.3f compile=%.3f run=%.3f bridge=%.3f\n",
@@ -336,6 +369,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             k == nix::Expr::Kind::Attrs  ||
             k == nix::Expr::Kind::List) {
             if (diag) std::fprintf(stderr, "v3 hook: short-circuit kind=%d\n", (int)k);
+            st.evalFallbackReason[4]++;
             e->eval(state, state.baseEnv, v);
             return;
         }
@@ -346,6 +380,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         if (willReturnClosure(e)) {
             if (diag) std::fprintf(stderr,
                 "v3 hook: static closure result predicted, kind=%d\n", (int)k);
+            st.evalFallbackReason[5]++;
             e->eval(state, state.baseEnv, v);
             return;
         }
@@ -476,6 +511,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     "v3 hook: skip lower-result (%zu functions > %zu) — "
                     "likely fall-back at run time\n",
                     module.functions.size(), kSkipThresholdFunctions);
+                st.evalFallbackReason[6]++;
                 e->eval(state, state.baseEnv, v);
                 return;
             }
@@ -502,6 +538,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             if (willProduceClosure()) {
                 if (diag) std::fprintf(stderr,
                     "v3 hook: skip — IR predicts closure result\n");
+                st.evalFallbackReason[5]++;
                 e->eval(state, state.baseEnv, v);
                 return;
             }
@@ -612,6 +649,29 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             st.runNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     } catch (const std::exception & ex) {
         if (diag) std::fprintf(stderr, "v3 hook: run threw: %s\n", ex.what());
+        st.evalFallbackReason[0]++;
+        // WC-1: log the throwing Expr's source position once per
+        // unique Expr*, so the user can identify which file-toplevel
+        // expression v3 chokes on.  Only when V3_DEBUG_HOOK is set.
+        if (diag && e) {
+            static std::unordered_set<const nix::Expr *> reported;
+            if (reported.insert(e).second) {
+                auto pos = state.positions[e->getPos()];
+                std::fprintf(stderr,
+                    "v3 hook: WC-1 fall-back (run threw) — kind=%d "
+                    "what=\"%s\" pos=%s\n",
+                    (int)e->exprKind, ex.what(),
+                    std::visit(nix::overloaded{
+                        [&](const nix::SourcePath & sp) -> std::string {
+                            return sp.path.abs() + ":" +
+                                   std::to_string(pos.line);
+                        },
+                        [](const auto &) -> std::string {
+                            return "<no-source>";
+                        },
+                    }, pos.origin).c_str());
+            }
+        }
         // v3 evaluation failure — fall back to tree-walker.
         e->eval(state, state.baseEnv, v);
         return;
@@ -644,6 +704,28 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         if (diag) std::fprintf(stderr,
             "v3 hook: result tag=%d, falling back to tree-walker\n",
             (int)r.tag());
+        st.evalFallbackReason[1]++;
+        // WC-1: same logging as the throw path — identify each
+        // unique Expr that returns a closure-like result.
+        if (diag && e) {
+            static std::unordered_set<const nix::Expr *> reported;
+            if (reported.insert(e).second) {
+                auto pos = state.positions[e->getPos()];
+                std::fprintf(stderr,
+                    "v3 hook: WC-1 fall-back (closure-like result tag=%d) "
+                    "kind=%d pos=%s\n",
+                    (int)r.tag(), (int)e->exprKind,
+                    std::visit(nix::overloaded{
+                        [&](const nix::SourcePath & sp) -> std::string {
+                            return sp.path.abs() + ":" +
+                                   std::to_string(pos.line);
+                        },
+                        [](const auto &) -> std::string {
+                            return "<no-source>";
+                        },
+                    }, pos.origin).c_str());
+            }
+        }
         e->eval(state, state.baseEnv, v);
         return;
     }
@@ -663,8 +745,10 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 st.bridgeNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
             }
             if (tmp) { v = *tmp; return; }
+            st.evalFallbackReason[2]++;
         } catch (const std::exception & ex) {
             if (diag) std::fprintf(stderr, "v3 hook: bridge threw: %s\n", ex.what());
+            st.evalFallbackReason[3]++;
         }
         e->eval(state, state.baseEnv, v);
         return;
