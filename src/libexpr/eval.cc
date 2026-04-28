@@ -1201,6 +1201,7 @@ void EvalState::resetFileCache()
 
 EvalState::V3EvalHook EvalState::v3EvalHook = nullptr;
 EvalState::V3ForceHook EvalState::v3ForceHook = nullptr;
+EvalState::V3RegisterExprHook EvalState::v3RegisterExprHook = nullptr;
 
 void EvalState::eval(Expr * e, Value & v)
 {
@@ -3706,7 +3707,12 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_p
     auto buffer = path.resolveSymlinks().readFile();
     // readFile hopefully have left some extra space for terminators
     buffer.append("\0\0", 2);
-    return parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);
+    Expr * e = parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);
+    // Tell v3 (if linked) which file this top-level Expr came from
+    // so its disk-cache lookup can key on file content even when
+    // the top-level Expr's getPos() returns noPos.
+    if (v3RegisterExprHook) v3RegisterExprHook(e, path);
+    return e;
 }
 
 Expr * EvalState::parseExprFromString(

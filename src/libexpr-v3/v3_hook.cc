@@ -59,6 +59,22 @@ static std::unordered_map<const nix::Expr *, CachedUnit> & v3HookCache()
     return tbl;
 }
 
+/// VM-4 ext: parse-time side table populated by `EvalState::v3RegisterExprHook`.
+/// Maps a top-level parsed Expr* to the SourcePath the parser was given.
+/// Used as a fallback when the Expr's getPos() returns noPos (very common
+/// for ExprLet / ExprAttrs which don't override getPos).
+static std::unordered_map<const nix::Expr *, nix::SourcePath> & v3ExprPaths()
+{
+    static std::unordered_map<const nix::Expr *, nix::SourcePath> tbl;
+    return tbl;
+}
+
+static void v3RegisterExprEntry(const nix::Expr * e, const nix::SourcePath & p)
+{
+    if (!e) return;
+    v3ExprPaths().emplace(e, p);
+}
+
 /// CO-3: sub-Expr cache.  Each entry maps a tree-walker AST Expr*
 /// (one of the per-thunk-body Exprs the lowerer recorded in
 /// `Module::subExprFuncs`) to (CompilationUnit, FuncId).  The
@@ -275,30 +291,57 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                                e ? (int)e->exprKind : -1);
 
         // VM-4: try the disk cache before lower+compile.  Cache key
-        // is SHA-256 of the source file content; only files reachable
-        // via Pos::Origin's SourcePath are eligible.  Gated on
+        // is SHA-256 of the source file content.  Gated on
         // NIX_V3_DISK_CACHE=1 — disabled by default.
         //
-        // CAVEAT: many Expr node kinds (ExprLet, ExprAttrs, etc.) don't
-        // override getPos and return noPos by default — the position
-        // info is on individual sub-tokens, not the top-level node.
-        // For those, the disk-cache key calculation produces an empty
-        // origin and we fall through to fresh lower+compile.  Future
-        // work: track the source file path explicitly when v3's
-        // primImport / tree-walker's evalFile parses the file.
+        // Source-path resolution order:
+        //   1. v3ExprPaths side table — populated by the parse-time
+        //      hook (V3RegisterExprHook in eval.cc).  Authoritative
+        //      for top-level Expr*s parsed from a file via
+        //      parseExprFromFile.  Hits even when the Expr's
+        //      getPos() returns noPos (the common case for ExprLet
+        //      / ExprAttrs).
+        //   2. e->getPos() with a SourcePath origin — fallback for
+        //      Exprs not registered (e.g. parseExprFromString).
         static const bool diskCacheEnabled =
             std::getenv("NIX_V3_DISK_CACHE") != nullptr;
         std::string srcContent;
         disk_cache::CacheKey diskKey{};
         if (diskCacheEnabled && e) {
             try {
-                auto pos = state.positions[e->getPos()];
-                if (auto * sp = std::get_if<nix::SourcePath>(&pos.origin)) {
-                    srcContent = sp->readFile();
+                auto & paths = v3ExprPaths();
+                auto pit = paths.find(e);
+                if (pit != paths.end()) {
+                    // Match parseExprFromFile's symlink behaviour
+                    // (eval.cc:3706 uses .resolveSymlinks()) — without
+                    // this, paths that pass through e.g. /tmp on macOS
+                    // (which is a symlink to /private/tmp) throw.
+                    srcContent = pit->second.resolveSymlinks().readFile();
                     diskKey = disk_cache::computeKeyForString(srcContent);
+                    if (diag) std::fprintf(stderr,
+                        "v3 hook: disk-cache key from side-table path=%s\n",
+                        pit->second.path.abs().c_str());
+                } else {
+                    auto pos = state.positions[e->getPos()];
+                    if (auto * sp = std::get_if<nix::SourcePath>(&pos.origin)) {
+                        srcContent = sp->resolveSymlinks().readFile();
+                        diskKey = disk_cache::computeKeyForString(srcContent);
+                        if (diag) std::fprintf(stderr,
+                            "v3 hook: disk-cache key from getPos path=%s\n",
+                            sp->path.abs().c_str());
+                    } else if (diag) {
+                        std::fprintf(stderr,
+                            "v3 hook: no SourcePath for e=%p (kind=%d)\n",
+                            (const void*)e, e ? (int)e->exprKind : -1);
+                    }
                 }
-            } catch (...) {
+            } catch (const std::exception & ex) {
+                if (diag) std::fprintf(stderr,
+                    "v3 hook: disk-cache key calc threw: %s\n", ex.what());
                 // Best-effort — any read failure means no disk lookup.
+            } catch (...) {
+                if (diag) std::fprintf(stderr,
+                    "v3 hook: disk-cache key calc threw (unknown)\n");
             }
         }
         if (!diskKey.empty()) {
@@ -739,6 +782,10 @@ namespace {
 struct V3HookRegistrar {
     V3HookRegistrar() {
         nix::EvalState::v3EvalHook = &v3EvalEntry;
+        // The parse-time hook is always installed: cheap (one map
+        // insert per parsed file) and only matters when the disk
+        // cache is enabled.
+        nix::EvalState::v3RegisterExprHook = &v3RegisterExprEntry;
         // The forceValue hook is opt-in via NIX_USE_V3_FORCE=1; left
         // null by default so eval-inline.hh's branch-predictor folds
         // the v3 check away entirely on workloads that don't need it.
@@ -766,6 +813,7 @@ namespace nix::v3 {
 void installEvalHook()
 {
     nix::EvalState::v3EvalHook = &v3EvalEntry;
+    nix::EvalState::v3RegisterExprHook = &v3RegisterExprEntry;
     if (const char * v = std::getenv("NIX_USE_V3_FORCE");
         v && std::string_view(v) == "1") {
         nix::EvalState::v3ForceHook = &v3ForceEntry;

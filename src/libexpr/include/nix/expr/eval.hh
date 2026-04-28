@@ -740,6 +740,18 @@ public:
     static V3ForceHook v3ForceHook;
 
     /**
+     * Parse-time registration hook.  Fired from `parseExprFromFile` /
+     * `parseExprFromString` after a top-level Expr has been parsed,
+     * with the SourcePath the parser used as Pos::Origin.  v3 stashes
+     * (Expr*, SourcePath) so its disk-cache lookup can hit even when
+     * the top-level Expr's `getPos()` returns `noPos` (the common
+     * case for ExprLet / ExprAttrs).  Optional — a null hook is a
+     * no-op.
+     */
+    using V3RegisterExprHook = void (*)(const Expr *, const SourcePath &);
+    static V3RegisterExprHook v3RegisterExprHook;
+
+    /**
      * Evaluation the expression, then verify that it has the expected
      * type.
      */
