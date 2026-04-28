@@ -2439,6 +2439,77 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv)
     return treeWalkerToV3(state, nv, seen);
 }
 
+// BR-3.1: pre-interned v3 SymbolIds for the attribute names that
+// derivationStrict examines on every call.  Mirror's tree-walker's
+// `EvalState::s` (eval.hh:247).  Lazy-initialised on first reference so
+// the global symbol table has had a chance to come up; thread-safe via
+// static-init (Magic Statics).  Read via `drvStrictSymbols()`.
+struct DrvStrictSymbols {
+    // Required / common.
+    SymbolId name;
+    SymbolId system;
+    SymbolId builder;
+    SymbolId args;
+    SymbolId outputs;
+    // Output hash / fixed-output triggers.
+    SymbolId outputHash;
+    SymbolId outputHashAlgo;
+    SymbolId outputHashMode;
+    // Phase-B/C/D triggers (we detect these at fall-back time).
+    SymbolId structuredAttrs;     // __structuredAttrs
+    SymbolId contentAddressed;    // __contentAddressed
+    SymbolId impure;              // __impure
+    SymbolId ignoreNulls;         // __ignoreNulls
+    SymbolId json;                // __json (legacy)
+    // Disallowed-with-structuredAttrs (warnings only; we still need to
+    // recognise them).
+    SymbolId allowedReferences;
+    SymbolId allowedRequisites;
+    SymbolId disallowedReferences;
+    SymbolId disallowedRequisites;
+    SymbolId maxSize;
+    SymbolId maxClosureSize;
+    // Result-attrset names (built up at the tail of the native path).
+    SymbolId outPath;
+    SymbolId drvPath;
+    SymbolId type;
+    // coerceToString helpers — these come from inside the IR's
+    // `__toString` / `outPath` fall-back path.
+    SymbolId toString;            // __toString
+    SymbolId functor;             // __functor
+};
+
+static const DrvStrictSymbols & drvStrictSymbols()
+{
+    static const DrvStrictSymbols s = {
+        .name                = ir::globalInternSymbol("name"),
+        .system              = ir::globalInternSymbol("system"),
+        .builder             = ir::globalInternSymbol("builder"),
+        .args                = ir::globalInternSymbol("args"),
+        .outputs             = ir::globalInternSymbol("outputs"),
+        .outputHash          = ir::globalInternSymbol("outputHash"),
+        .outputHashAlgo      = ir::globalInternSymbol("outputHashAlgo"),
+        .outputHashMode      = ir::globalInternSymbol("outputHashMode"),
+        .structuredAttrs     = ir::globalInternSymbol("__structuredAttrs"),
+        .contentAddressed    = ir::globalInternSymbol("__contentAddressed"),
+        .impure              = ir::globalInternSymbol("__impure"),
+        .ignoreNulls         = ir::globalInternSymbol("__ignoreNulls"),
+        .json                = ir::globalInternSymbol("__json"),
+        .allowedReferences   = ir::globalInternSymbol("allowedReferences"),
+        .allowedRequisites   = ir::globalInternSymbol("allowedRequisites"),
+        .disallowedReferences  = ir::globalInternSymbol("disallowedReferences"),
+        .disallowedRequisites  = ir::globalInternSymbol("disallowedRequisites"),
+        .maxSize             = ir::globalInternSymbol("maxSize"),
+        .maxClosureSize      = ir::globalInternSymbol("maxClosureSize"),
+        .outPath             = ir::globalInternSymbol("outPath"),
+        .drvPath             = ir::globalInternSymbol("drvPath"),
+        .type                = ir::globalInternSymbol("type"),
+        .toString            = ir::globalInternSymbol("__toString"),
+        .functor             = ir::globalInternSymbol("__functor"),
+    };
+    return s;
+}
+
 /// Construct a "fake" derivation attrset.  Real `derivation` interfaces
 /// with the store; we accept the input attrset and tag it with a
 /// synthetic `outPath` so code that just reads outPath works.  Useful
@@ -2487,12 +2558,10 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     }
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("derivationStrict", "attrset");
-    SymbolId sName    = vmIntern(state, "name");
-    SymbolId sOutputs = vmIntern(state, "outputs");
-    SymbolId sDrvPath = vmIntern(state, "drvPath");
+    const auto & sym = drvStrictSymbols();
 
     auto * src = args[0].payload.bindings;
-    const Value * nameVRaw = src->lookup(sName);
+    const Value * nameVRaw = src->lookup(sym.name);
     if (!nameVRaw)
         typeError("derivationStrict", "attrset with `name` string");
     Value nameV = forceValue(*state.vm, *nameVRaw);
@@ -2524,7 +2593,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     // an attrset { drvPath; <output1>; <output2>; ... } with one
     // path per declared output.
     std::vector<std::string> outputs;
-    if (auto * outV = src->lookup(sOutputs)) {
+    if (auto * outV = src->lookup(sym.outputs)) {
         Value f = forceValue(*state.vm, *outV);
         if (f.isList() && f.payload.list) {
             for (uint32_t i = 0; i < f.payload.list->size; ++i) {
@@ -2561,10 +2630,10 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
         }
         return "";
     };
-    std::string sysStr     = attrToString(src->lookup(vmIntern(state, "system")));
-    std::string builderStr = attrToString(src->lookup(vmIntern(state, "builder")));
-    std::string argsStr    = attrToString(src->lookup(vmIntern(state, "args")));
-    std::string ohStr      = attrToString(src->lookup(vmIntern(state, "outputHash")));
+    std::string sysStr     = attrToString(src->lookup(sym.system));
+    std::string builderStr = attrToString(src->lookup(sym.builder));
+    std::string argsStr    = attrToString(src->lookup(sym.args));
+    std::string ohStr      = attrToString(src->lookup(sym.outputHash));
     // Cheap FNV-1a hash — collision probability is plenty for tests and
     // we don't need cryptographic security for fake store paths.
     auto fnv = [](std::string_view s) {
@@ -2579,7 +2648,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
 
     std::vector<std::pair<SymbolId, Value>> entries;
     entries.reserve(outputs.size() + 1);
-    entries.emplace_back(sDrvPath, mkStringValueOwned("/v3-fake-store/" + hashTag + "-" + name + ".drv"));
+    entries.emplace_back(sym.drvPath, mkStringValueOwned("/v3-fake-store/" + hashTag + "-" + name + ".drv"));
     for (auto & o : outputs) {
         SymbolId sO = vmIntern(state, o);
         std::string p = "/v3-fake-store/" + hashTag + "-" + name + (o == "out" ? "" : "-" + o);
