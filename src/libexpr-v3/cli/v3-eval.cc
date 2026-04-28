@@ -533,8 +533,17 @@ int main(int argc, char ** argv)
         // attribute names from imported CUs that the top-level CU's
         // (frozen-at-compile-time) snapshot wouldn't see.
         int rc = printValue(r, jsonOut, nix::v3::ir::globalSymbolTable());
-        if (std::getenv("NIX_VM_STATS"))
+        if (std::getenv("NIX_VM_STATS")) {
             nix::v3::dumpPrimOpStats(stderr);
+            auto & a = nix::v3::allocStats();
+            std::fprintf(stderr,
+                "v3 alloc stats: closures=%llu thunks=%llu lists=%llu attrsets=%llu envs=%llu\n",
+                (unsigned long long)a.closuresAllocated,
+                (unsigned long long)a.thunksAllocated,
+                (unsigned long long)a.listsAllocated,
+                (unsigned long long)a.attrsetsAllocated,
+                (unsigned long long)a.envsAllocated);
+        }
         return rc;
     } catch (const std::exception & ex) {
         std::fprintf(stderr, "v3-eval error: %s\n", ex.what());
