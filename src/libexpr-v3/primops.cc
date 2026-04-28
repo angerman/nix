@@ -2210,7 +2210,12 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         auto & symTab = ir::globalSymbolTable();
         if (b) for (uint32_t i = 0; i < b->size; ++i) {
             SymbolId sid = b->entries[i].name;
-            std::string n = sid < symTab.size() ? symTab[sid] : "";
+            // Pass the table-owned std::string as a string_view; the
+            // tree-walker SymbolTable uses heterogeneous lookup so this
+            // avoids a per-attribute std::string copy on bridge.
+            std::string_view n = sid < symTab.size()
+                ? std::string_view(symTab[sid])
+                : std::string_view{};
             bb.insert(ns.symbols.create(n), v3ToTreeWalker(state, b->entries[i].value, seen));
         }
         out->mkAttrs(bb);

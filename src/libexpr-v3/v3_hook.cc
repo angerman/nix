@@ -166,7 +166,20 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             k == nix::Expr::Kind::String ||
             k == nix::Expr::Kind::Path   ||
             k == nix::Expr::Kind::Var    ||
-            k == nix::Expr::Kind::Pos) {
+            k == nix::Expr::Kind::Pos    ||
+            // Top-level Attrs / List: tree-walker constructs these
+            // with lazy thunks and is materially faster than v3's
+            // lower+compile+run+bridge cycle, which forces every
+            // attribute eagerly to produce a v3 attrset that is
+            // then converted back via the recursive bridge.  We
+            // observed 6 Attrs misses contributing ~3ms of bridge
+            // work each on hello.name — net negative versus
+            // tree-walker.  v3 lower also still serializes its
+            // upvalue references in some shapes that throw at
+            // runtime ("OP_GET_UPVALUE: no closure context"), which
+            // are pure waste.  Skip these.
+            k == nix::Expr::Kind::Attrs  ||
+            k == nix::Expr::Kind::List) {
             if (diag) std::fprintf(stderr, "v3 hook: short-circuit kind=%d\n", (int)k);
             e->eval(state, state.baseEnv, v);
             return;
