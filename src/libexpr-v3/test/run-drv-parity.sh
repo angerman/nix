@@ -95,6 +95,17 @@ TESTS=(
   # 18. __impure=true (impure derivation).
   # Requires the impure-derivations experimental feature.
   "impure:(derivation { name = \"imp\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; __impure = true; outputHashAlgo = \"sha256\"; outputHashMode = \"recursive\"; }).drvPath"
+
+  # --- Phase D: __structuredAttrs (BR-3.12) ---
+
+  # 19. Minimal __structuredAttrs derivation.
+  "structured-min:(derivation { name = \"sa\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; __structuredAttrs = true; }).drvPath"
+
+  # 20. __structuredAttrs with mixed-type attrs (string, int, bool, list).
+  "structured-mixed:(derivation { name = \"sb\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; __structuredAttrs = true; CFLAGS = \"-O2\"; jobs = 4; verbose = true; deps = [ \"a\" \"b\" \"c\" ]; }).drvPath"
+
+  # 21. __structuredAttrs with nested attrset value.
+  "structured-nested:(derivation { name = \"sc\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; __structuredAttrs = true; outputChecks = { out = { allowedReferences = [ \"x\" ]; }; }; }).drvPath"
 )
 
 # Phase C tests need the experimental features enabled.

@@ -1482,6 +1482,8 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
 /// builtins.trace msg val: print msg to stderr, return val unchanged.
 // Forward decl — defined later in this TU.
 nlohmann::json valueToJson(EvalState & state, const Value & v);
+nlohmann::json valueToJsonWithContext(
+    EvalState & state, const Value & v, nix::NixStringContext & context);
 
 void primTrace(EvalState & state, Value * args, Value & out)
 {
@@ -2699,30 +2701,19 @@ static std::vector<uint32_t> lexicographicAttrOrder(const Bindings * b)
     return order;
 }
 
-// BR-3.3 + 3.10 + 3.11: detect-fall-back predicate.  Returns true
-// when args[0]'s shape is one the native path can handle:
-//   - Phase A: deferred-output simple case (no special attrs).
-//   - Phase B (BR-3.10): fixed-output (outputHash present).
-//   - Phase C (BR-3.11): content-addressed (__contentAddressed)
-//     or impure (__impure) — both routed through CAFloating /
-//     Impure DerivationOutputs.
+// BR-3.3 + 3.10 + 3.11 + 3.12: detect-fall-back predicate.
+// Returns true when args[0]'s shape is one the native path can
+// handle:
+//   - Phase A: deferred-output simple case.
+//   - Phase B (BR-3.10): fixed-output.
+//   - Phase C (BR-3.11): content-addressed / impure.
+//   - Phase D (BR-3.12): __structuredAttrs (JSON-attr derivations).
 //
-// False is the SAFE default — any unsupported "complex" attr present
-// routes back through the bridge.  False positives cost a bridge
-// round-trip; false negatives silently produce wrong drvs, so the
-// conservative side wins.
-//
-// Phase D will lift the structuredAttrs gate as JSON serialization
-// lands.
+// All currently-known shapes are now in scope.  This function
+// exists primarily to early-exit cheaply on non-attrset args.
 static bool isSimpleDerivationAttrs(const Bindings * b)
 {
-    if (!b) return false;
-    const auto & sym = drvStrictSymbols();
-    // outputHash, __contentAddressed, __impure are allowed (Phases
-    // B and C handle them).  __structuredAttrs still gates to the
-    // bridge (Phase D).
-    if (b->lookup(sym.structuredAttrs))  return false;
-    return true;
+    return b != nullptr;
 }
 
 // BR-3.9: native-vs-fallback counters.  Reported on process exit
@@ -2979,13 +2970,14 @@ static void primDerivationStrictNative(
     drv.name = drvName;
     nix::NixStringContext context;
 
-    // ---- Phase C (BR-3.11): pre-read flag attrs.  These control
-    // the iteration / output-shape decisions and must NOT end up in
-    // drv.env (tree-walker filters them via the default-case switch
-    // at eval.cc:1696).
-    bool ignoreNulls    = false;
-    bool contentAddressed = false;
-    bool isImpure        = false;
+    // ---- Phase C (BR-3.11) + Phase D (BR-3.12): pre-read flag
+    // attrs.  These control the iteration / output-shape decisions
+    // and must NOT end up in drv.env (tree-walker filters them via
+    // the default-case switch at eval.cc:1696).
+    bool ignoreNulls       = false;
+    bool contentAddressed  = false;
+    bool isImpure          = false;
+    bool useStructuredAttrs = false;
 
     auto readFlagBool = [&](SymbolId sid) -> bool {
         const Value * v = src->lookup(sid);
@@ -2994,14 +2986,20 @@ static void primDerivationStrictNative(
         if (!f.isBool()) return false;
         return f.payload.i == 1;
     };
-    ignoreNulls       = readFlagBool(sym.ignoreNulls);
-    contentAddressed  = readFlagBool(sym.contentAddressed);
-    isImpure          = readFlagBool(sym.impure);
+    ignoreNulls         = readFlagBool(sym.ignoreNulls);
+    contentAddressed    = readFlagBool(sym.contentAddressed);
+    isImpure            = readFlagBool(sym.impure);
+    useStructuredAttrs  = readFlagBool(sym.structuredAttrs);
 
     if (contentAddressed && isImpure)
         throw std::runtime_error(
             "v3 BR-3 native: derivation cannot be both "
             "content-addressed and impure");
+
+    // BR-3.12 — structuredAttrs JSON object.  When the flag is set
+    // we accumulate every attr's JSON encoding here instead of
+    // (or rather, in addition to) populating drv.env via coerce.
+    nlohmann::json structuredJson = nlohmann::json::object();
 
     // ---- iterate attrs in lex order (BR-3.4) ----
     auto order = lexicographicAttrOrder(src);
@@ -3031,12 +3029,73 @@ static void primDerivationStrictNative(
         if (sid == sym.ignoreNulls)       continue;
         if (sid == sym.contentAddressed)  continue;
         if (sid == sym.impure)            continue;
+        if (sid == sym.structuredAttrs)   continue;
 
         // __ignoreNulls=true: skip null-valued attrs entirely
         // (eval.cc:1690).  Other types fall through to coerce.
         if (ignoreNulls) {
             Value forced = forceValue(*state.vm, attrV);
             if (forced.tag() == Tag::Null) continue;
+        }
+
+        // BR-3.12: under __structuredAttrs the env-emit path is
+        // bypassed in favour of JSON-encoding into structuredJson.
+        // builder/system/outputs/outputHash* still get extracted to
+        // dedicated drv fields below — those use coerceToString,
+        // which matches tree-walker's forceString[NoCtx] semantics
+        // for the typical (string-typed) cases this path sees.
+        if (useStructuredAttrs) {
+            std::string keyStr(key);
+            structuredJson[keyStr] = valueToJsonWithContext(
+                state, attrV, context);
+            // Special-case fields still need to populate drv.* so
+            // libnixstore can write the .drv correctly.
+            if (sid == sym.args) {
+                Value listV = forceValue(*state.vm, attrV);
+                if (!listV.isList())
+                    throw std::runtime_error(
+                        "v3 BR-3 native: `args` attr is not a list");
+                if (listV.payload.list) {
+                    for (uint32_t i = 0; i < listV.payload.list->size; ++i) {
+                        Value el = forceValue(*state.vm, listV.payload.list->elems[i]);
+                        drv.args.push_back(v3CoerceToString(
+                            state, el, context,
+                            "while evaluating an element of `args`"));
+                    }
+                }
+                continue;
+            }
+            if (sid == sym.outputs) {
+                Value listV = forceValue(*state.vm, attrV);
+                if (!listV.isList())
+                    throw std::runtime_error(
+                        "v3 BR-3 native: `outputs` attr is not a list");
+                if (listV.payload.list) {
+                    for (uint32_t i = 0; i < listV.payload.list->size; ++i) {
+                        Value el = forceValue(*state.vm, listV.payload.list->elems[i]);
+                        if (!el.isString())
+                            throw std::runtime_error(
+                                "v3 BR-3 native: `outputs` element is not a string");
+                        std::string s(el.payload.str ? el.payload.str : "");
+                        if (s.empty() || s == "drvPath")
+                            throw std::runtime_error(
+                                "v3 BR-3 native: invalid output name");
+                        declaredOutputs.push_back(s);
+                    }
+                }
+                continue;
+            }
+            // builder/system/outputHash* still extracted out to drv.
+            std::string s = v3CoerceToString(
+                state, attrV, context,
+                "while evaluating a derivation attribute");
+            if (sid == sym.builder)             drv.builder = s;
+            else if (sid == sym.system)         drv.platform = s;
+            else if (sid == sym.outputHash)     outputHashStr = s;
+            else if (sid == sym.outputHashAlgo) outputHashAlgoStr = s;
+            else if (sid == sym.outputHashMode) outputHashModeStr = s;
+            // No drv.env emit under structuredAttrs.
+            continue;
         }
 
         // `args` is special: forced as a list-of-strings.
@@ -3113,6 +3172,18 @@ static void primDerivationStrictNative(
 
     if (declaredOutputs.empty())
         declaredOutputs.push_back("out");
+
+    // BR-3.12: stash the JSON-encoded structuredAttrs into the drv.
+    // The store ATerm format includes structuredAttrs (when present)
+    // separately from drv.env, so this is what makes the resulting
+    // drvPath byte-equal to tree-walker's structuredAttrs derivation.
+    if (useStructuredAttrs) {
+        nix::StructuredAttrs sa;
+        // sa.structuredAttrs is nlohmann::json::object_t (a map).
+        // structuredJson is a nlohmann::json with object type — extract.
+        sa.structuredAttrs = structuredJson.get<nlohmann::json::object_t>();
+        drv.structuredAttrs = std::move(sa);
+    }
 
     if (drv.builder.empty())
         throw std::runtime_error(
@@ -4207,6 +4278,89 @@ void primToJSON(EvalState & state, Value * args, Value & out)
 {
     auto j = valueToJson(state, args[0]);
     out = mkStringValueOwned(j.dump());
+}
+
+// BR-3.12: context-tracking JSON serialization.  Mirrors
+// valueToJson but threads a NixStringContext accumulator: every
+// string with side-table context contributes its entries; every
+// path coerce inserts an Opaque (via copyPathToStore).  Used by
+// the native derivationStrict path under __structuredAttrs.
+nlohmann::json valueToJsonWithContext(
+    EvalState & state, const Value & vRaw, nix::NixStringContext & context)
+{
+    using json = nlohmann::json;
+    Value v = forceValue(*state.vm, vRaw);
+    switch (v.tag()) {
+    case Tag::Null:   return json(nullptr);
+    case Tag::Bool:   return json(v.payload.i == 1);
+    case Tag::Int:    return json(v.payload.i);
+    case Tag::Float:  return json(v.payload.f);
+    case Tag::String: {
+        const char * buf = v.payload.str ? v.payload.str : "";
+        if (auto * raw = lookupStringContextEntries(buf)) {
+            for (auto & e : *raw) {
+                try { context.insert(nix::NixStringContextElem::parse(e)); }
+                catch (...) { /* skip un-parseable */ }
+            }
+        }
+        return json(std::string(buf));
+    }
+    case Tag::Path: {
+        if (!state.nixEvalState)
+            throw std::runtime_error(
+                "v3 BR-3 valueToJsonWithContext: path requires nixEvalState");
+        auto & ns = *state.nixEvalState;
+        nix::SourcePath sp(ns.rootFS,
+            nix::CanonPath(v.payload.path ? v.payload.path : ""));
+        nix::StorePath dst = ns.copyPathToStore(context, sp);
+        return json(ns.store->printStorePath(dst));
+    }
+    case Tag::List: {
+        json arr = json::array();
+        if (v.payload.list)
+            for (uint32_t i = 0; i < v.payload.list->size; ++i)
+                arr.push_back(valueToJsonWithContext(
+                    state, v.payload.list->elems[i], context));
+        return arr;
+    }
+    case Tag::Attrs: {
+        // __toString self overrides JSON serialization (matches Nix
+        // coercion rules) — but Phase A defers __toString.  For
+        // Phase D we accept that and fall through to outPath instead;
+        // structuredAttrs derivations very rarely use __toString.
+        if (v.payload.bindings) {
+            const auto & sym = drvStrictSymbols();
+            // outPath fallback for derivations.
+            if (auto * op = v.payload.bindings->lookup(sym.outPath)) {
+                Value forced = forceValue(*state.vm, *op);
+                if (forced.isString() || forced.isPath()) {
+                    return valueToJsonWithContext(state, forced, context);
+                }
+            }
+        }
+        json obj = json::object();
+        if (v.payload.bindings) {
+            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
+                auto & en = v.payload.bindings->entries[i];
+                std::string_view k = vmSymName(state, en.name);
+                obj[std::string(k)] = valueToJsonWithContext(
+                    state, en.value, context);
+            }
+        }
+        return obj;
+    }
+    case Tag::Uninitialized:
+    case Tag::Closure:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::Thunk:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
+    default:
+        throw std::runtime_error(
+            "v3 BR-3 valueToJsonWithContext: unsupported value type");
+    }
 }
 
 /// builtins.sort: sort a list using a comparator.  cmp(a, b) is true if
