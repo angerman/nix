@@ -1038,6 +1038,42 @@ the bridge fall-back is reserved for genuinely unsupported
 shapes (e.g. closures in places we don't yet handle), which
 appear to be empty in the current parity battery.
 
+## 2026-04-30 — BR-4 native builtins.path
+
+Mirrors `prim_path` / `addPath` (libexpr/primops.cc:3083 / :2944)
+for the no-filter case (commit `5362f6d5e`).  Skips the bridge
+encode + decode round-trip; calls `fetchToStore` directly against
+`state.nixEvalState->store`.
+
+Filter case (closure applied per-fs-entry) still routes through
+the bridge — the closure would have to re-enter v3's VM mid-fetch,
+which isn't yet wired.
+
+`V3_PATH_NO_NATIVE=1` knob for A/B testing.
+
+Parity harness extended with 4 BR-4 cases (plain / default-name /
+recursive=false / path-inside-derivation): **25/25** total.
+
+## 2026-04-30 — final perf snapshot (BR-3 + BR-4 landed)
+
+3-run averages, user CPU + RSS:
+
+| Workload                          | tree-walker       | v3 cutover        | Δ |
+|-----------------------------------|-------------------|-------------------|---|
+| fib 35                            | 3.87 s / 443 MB   | 3.64 s / **27 MB** | −6 % CPU, **−94 % RSS** |
+| ackermann 3 9                     | 1.87 s / 460 MB   | 2.03 s / 1569 MB  | +9 % CPU, +241 % RSS (architectural) |
+| attrNames pkgs.haskellPackages    | 0.57 s / 271 MB   | 0.57 s / 274 MB   | parity |
+| count 3k drvs in pkgs             | 5.16 s / 1550 MB  | 5.18 s / 1554 MB  | parity |
+| 5 000 fat drvs (v3 owns the eval) | 0.030 s           | 0.110 s (+native) / 0.130 s (bridge) | +13 % vs bridge → native |
+
+Reading: BR-3+4 native paths save ~13 % when v3 actually drives the
+derivationStrict / builtins.path call.  On real nixpkgs scans the
+call comes from imported tree-walker stdenv code, so v3's primop
+isn't on the hot path — wall-clock parity, not a regression.
+Wider cutover scope (the upstream item from the headline analysis)
+remains the prerequisite for BR-* gains to materialise on
+nixpkgs-wide evals.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
