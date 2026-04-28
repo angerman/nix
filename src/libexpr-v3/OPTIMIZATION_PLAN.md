@@ -1421,6 +1421,67 @@ Recommended order:
   4. Re-measure.
   5. Only then consider WC-8.
 
+## 2026-04-30 — WC-9: iterative ExprOpUpdate walk + materialisation deferral
+
+WC-9 implemented Option 3 from the trade-off analysis: short-circuit
+tree-walker's recursion at the // chain root.
+
+### What landed
+
+- `7cc013bc5` WC-9.2 — `ExprOpUpdate::evalForUpdate` rewrites the
+  recursive left-spine walk into a `while (cur.kind == OpUpdate)`
+  loop.  Same queue ordering preserved (rightmost first).
+- `7cc013bc5` WC-9.0 — instrumentation: `NIX_VM_STATS=1` now prints
+  `tw OpUpdate: entries=N chainOperands=N maxChain=N`.
+
+Probe data on a 3-drv `[hello git vim].drvPath` cutover eval:
+
+  tw OpUpdate: entries=35785 chainOperands=113535 maxChain=12
+
+Reading: 35 k // entries fire per nixpkgs eval, average chain
+~3.2 operands, max chain depth 12.  Pre-WC-9.2 each chain
+contributed N C-stack frames in `evalForUpdate`; post-WC-9.2 each
+contributes 1.  ~11×35,785 = ~390 k frames eliminated cumulatively
+across the eval (most aren't simultaneously on the stack but the
+peak-stack reduction is real on the deep mkDerivation chains).
+
+### What didn't land
+
+- `f4c0f14a4` WC-9.5 — re-attempted the rec-attrset
+  materialisation on top of WC-9.2.  Still SIGSEGV.  WC-9.2
+  reduced // depth, but `mkDerivation` has other deep-recursion
+  sources (call / let / select chains) that the eager rec-entry
+  bridge still walks past the 8 MB stack guard.
+
+### Conclusion + path forward
+
+WC-9.2 is a standalone correctness + clarity improvement (recursive
+walk → iterative loop) that ships independently of the rec-attrset
+work.  But Option 3 alone isn't sufficient to enable the
+materialisation; the principled fix is **Option 1 (lazy bridge
+thunks)** from the trade-off analysis:
+
+  Build a v3 `Bindings*` whose entries are bridge-thunks that only
+  force on access (e.g. via a new `Tag::BridgeThunk` or a
+  `ThunkState::Bridge` reusing the existing `Thunk` machinery).
+  When v3's bytecode does `OP_ATTRS_SELECT` followed by `OP_FORCE`,
+  the bridge-thunk re-enters tree-walker for that single value.
+  Eager bridging is replaced by lazy demand-driven bridging, which
+  bounds stack depth at the actual access pattern of the v3 thunk
+  body (typically 1–2 entries, not all N).
+
+Required v3 VM changes for Option 1:
+  - New tag (or reused Thunk state) for "bridge-thunk".
+  - `OP_FORCE` learns to detect the new shape and call into the
+    bridge.
+  - Materialisation in `v3ForceHook` allocates these thunks
+    instead of bridging eagerly.
+
+Substantial scope; warrants its own session.  All structural
+pieces (`recVarOrigins`, `populateSubExprCacheLocal` RecBuild
+branch, `UpvalueSource` variant) and the iterative // walk
+(WC-9.2) are in place as the foundation.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
