@@ -61,6 +61,8 @@
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
 
+#include <boost/unordered/concurrent_flat_map.hpp>
+
 namespace nix::v3 {
 
 namespace {
@@ -2732,12 +2734,10 @@ static bool isSimpleDerivationAttrs(const Bindings * b)
 // __impure — gated by isSimpleDerivationAttrs).  Phases B–D
 // extend this incrementally.
 //
-// Currently builds drv.{name,builder,platform,args,env,outputs}
-// then THROWS "not yet implemented" before the libnixstore write.
-// BR-3.6 (NixStringContext → inputDrvs / inputSrcs) and BR-3.7
-// (fillInOutputPaths + writeDerivation + result attrset) finish
-// the path.  Until then the throw triggers the bridge fall-back,
-// so semantics are unchanged.
+// Builds drv.{name,builder,platform,args,env,outputs} from a v3
+// attrset, processes the accumulated NixStringContext into
+// drv.inputDrvs / drv.inputSrcs (BR-3.6), then writes the
+// derivation (BR-3.7) and constructs the v3 result attrset.
 static void primDerivationStrictNative(
     EvalState & state, Value * args, Value & out);
 
@@ -2929,7 +2929,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
 // commit demonstrates the iteration logic; the bridge fall-back
 // keeps semantics identical.
 static void primDerivationStrictNative(
-    EvalState & state, Value * args, Value & /*out*/)
+    EvalState & state, Value * args, Value & out)
 {
     auto & ns = *state.nixEvalState;
     auto * src = args[0].payload.bindings;
@@ -3082,12 +3082,101 @@ static void primDerivationStrictNative(
             c.raw);
     }
 
-    // ---- BR-3.7 (deferred outputs + writeDerivation) goes here ----
-    // For now: throw to fall back to bridge.  Full semantics preserved.
-    (void)declaredOutputs;
-    throw std::runtime_error(
-        "v3 BR-3 native: context processed but write/finish path "
-        "not yet implemented (BR-3.7 pending)");
+    // ---- BR-3.7: deferred-output setup + writeDerivation +
+    // hashDerivationModulo cache + v3 result attrset.
+
+    // For deferred outputs, set env[output]="" pre-fill and slot
+    // each output as Deferred{}.  fillInOutputPaths overwrites the
+    // env entries with the computed paths once the input-addressed
+    // hash is known.  Mirrors derivationStrictInternal:1947–1959.
+    for (auto & o : declaredOutputs) {
+        drv.env[o] = "";
+        drv.outputs.insert_or_assign(
+            o, nix::DerivationOutput{nix::DerivationOutput::Deferred{}});
+    }
+    drv.fillInOutputPaths(*ns.store);
+
+    // Materialise the drv: in readOnlyMode (the v3-eval default;
+    // also typical for `nix-instantiate --eval`) compute the path
+    // without writing.  Otherwise actually write to the store.
+    nix::StorePath drvPath = nix::settings.readOnlyMode
+        ? nix::computeStorePath(*ns.store, drv)
+        : ns.store->writeDerivation(drv, ns.repair);
+    std::string drvPathS = ns.store->printStorePath(drvPath);
+
+    // Cache the hash modulo so downstream derivations (which see
+    // this drv's outputs in their context) can resolve it without
+    // re-reading from the store.  Mirrors eval.cc:1976.
+    {
+        auto h = nix::hashDerivationModulo(*ns.store, drv, false);
+        nix::drvHashes.insert_or_assign(drvPath, std::move(h));
+    }
+
+    // Build the v3 result attrset: { drvPath; <output1>; <output2>; ... }
+    // Sorted by SymbolId (Bindings invariant).  Each string carries
+    // the appropriate NixStringContext via the v3 side-table:
+    //   - drvPath value gets a DrvDeep entry (so downstream uses
+    //     pull in the full closure)
+    //   - per-output values get a Built{drvPath, outputName} entry
+    //     (mirrors EvalState::mkOutputString → eval.cc:1029)
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(1 + drv.outputs.size());
+
+    // drvPath entry.
+    {
+        Value v3DrvPath = mkStringValueOwned(drvPathS);
+        nix::NixStringContext drvCtx;
+        drvCtx.insert(
+            nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{
+                .drvPath = drvPath}});
+        setStringContext(v3DrvPath.payload.str, drvCtx);
+        entries.emplace_back(sym.drvPath, v3DrvPath);
+    }
+
+    // Per-output entries.  drv.outputs is a std::map keyed by
+    // output name; we look up each declared output in turn so the
+    // ordering follows declaredOutputs (which followed the user's
+    // `outputs` list — but final v3 attrset is sorted by SymbolId
+    // anyway via the std::sort below, so order here is fluid).
+    for (auto & [outName, outDef] : drv.outputs) {
+        SymbolId outSid = ir::globalInternSymbol(outName);
+        // outDef.path(...) returns the concrete StorePath for this
+        // output.  For Deferred outputs (post-fillInOutputPaths)
+        // this is the input-addressed path.
+        std::optional<nix::StorePath> optStaticOutputPath =
+            outDef.path(*ns.store, drv.name, outName);
+        if (!optStaticOutputPath) {
+            // Should not happen for the simple deferred case.  Fall
+            // back to bridge if it does.
+            throw std::runtime_error(
+                "v3 BR-3 native: output '" + outName +
+                "' has no static path after fillInOutputPaths");
+        }
+        std::string outPathS = ns.store->printStorePath(*optStaticOutputPath);
+
+        Value v3OutPath = mkStringValueOwned(outPathS);
+        nix::NixStringContext outCtx;
+        outCtx.insert(nix::NixStringContextElem{
+            nix::NixStringContextElem::Built{
+                .drvPath = nix::makeConstantStorePathRef(drvPath),
+                .output  = outName,
+            }});
+        setStringContext(v3OutPath.payload.str, outCtx);
+        entries.emplace_back(outSid, v3OutPath);
+    }
+
+    // Sort by SymbolId for the Bindings invariant + binary search.
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
+
+    Bindings * resultB = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        resultB->entries[i].name  = entries[i].first;
+        resultB->entries[i].value = entries[i].second;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = resultB;
 }
 
 void primDerivation(EvalState & state, Value * args, Value & out)
