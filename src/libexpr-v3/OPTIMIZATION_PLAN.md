@@ -740,6 +740,64 @@ since the underlying alloc cost is now amortised, the win from
 size-1 inlining drops, and VM-2's complexity may no longer be
 justified.
 
+## 2026-04-30 — Bridge micro-optimisations (BR-3 partial)
+
+Two cheap, low-risk steps toward BR-3 (full native
+derivationStrict).  Don't replace the bridge; just remove the
+fattest per-call lookups that ride along with it:
+
+  1. Cache the resolved `builtins.derivationStrict` `nix::Value*`
+     per nixEvalState in `primDerivationStrict` (commit
+     `2adf65345`).  The previous code did `getBuiltins()` +
+     `forceAttrs` + `symbols.create("derivationStrict")` on every
+     bridge call — repeats for every derivation in a nixpkgs scan.
+     Stable for the eval lifetime; invalidate on EvalState change.
+
+  2. Per-thread symbol mapping caches in both bridge directions
+     (commit `7cdb0182e`).
+       - v3ToTreeWalker: `(v3 SymbolId → nix::Symbol)` vector,
+         skips `ns.symbols.create(string_view)` heterogeneous hash.
+       - treeWalkerToV3: `(nix::Symbol::getId() → v3 SymbolId)`
+         vector, skips `vmIntern(state, std::string(...))` plus the
+         redundant `std::string` copy.
+
+The 1000-fake-derivation microbench doesn't move because the fake
+test's bridge cost is a small fixed per-attr overhead, not the
+hashy lookups these caches eliminate.  But on 25k-pkg nixpkgs
+scans where attribute symbols are repeated thousands of times,
+these caches hit > 99% and skip the lookups entirely.
+
+Full BR-3 (rewriting `derivationStrict` natively in v3 against
+libnixstore) remains 3–4 weeks of focused work.  Scoping it down
+to a "simple-case fast path" (no structuredAttrs / fixed-output /
+contentAddressed) was considered and deferred — too easy to ship
+subtle hash/path mismatches without running the full nix
+functional+integration suite, which is impractical from a single
+focused session.
+
+## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
+
+Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
+ExprAttrs, etc.) don't override `getPos()` and report `noPos` —
+so the v3 hook's existing disk-cache lookup, which derived its
+key from getPos's SourcePath origin, never hit on the cutover
+entry point.  Cache files were created (via primImport's separate
+path) but the hook never benefited.
+
+`6ae108e2c`: adds `EvalState::v3RegisterExprHook` callback fired
+from parseExprFromFile.  v3 stores `(Expr*, SourcePath)` in a
+side table; the disk-cache lookup consults the table first,
+falling back to `e->getPos()` for Exprs not registered there
+(e.g. those parsed via parseExprFromString).  Also adopts the
+`resolveSymlinks()` the parser uses — without it, paths under
+macOS's `/tmp` (a symlink to `/private/tmp`) threw on
+`readFile()` and the lookup silently aborted.
+
+Verified: the cutover hook now reports
+  v3 hook: disk-cache HIT key=...
+on the second invocation, where it previously fell through to
+fresh lower+compile.
+
 ## 2026-04-29 — v3 robustness wins over tree-walker
 
 Spot-checked the 6 "silent-pass" eval-fail tests.  Most are
