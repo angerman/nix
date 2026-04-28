@@ -342,6 +342,12 @@ static bool lowerCompileAndPopulate(
     static const bool disabled = std::getenv("NIX_V3_NO_PRECOMPILE") != nullptr;
     if (disabled) return false;
     if (!e) return false;
+    // WC-11 follow-up: if the force hook is OFF, the populated cache
+    // is never consulted, so the lower+compile cost is pure waste.
+    // Skip precompile to keep default-mode perf at parity with
+    // tree-walker.  When the force hook is enabled (NIX_USE_V3_FORCE),
+    // precompile is what makes the 57-76% wins possible.
+    if (nix::EvalState::v3ForceHook == nullptr) return false;
     auto & populatedSet = v3FallbackPopulated();
     if (populatedSet.count(e)) return true;
     auto & cache = v3HookCache();
