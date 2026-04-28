@@ -128,6 +128,27 @@ struct V3HookStats {
     /// Phase B (env translation) will reduce this to zero.
     uint64_t forceSkippedNeedsUpvalues = 0;
 
+    // WC-0: per-Expr::Kind force breakdown.  Indexed by static_cast
+    // of the Expr's `exprKind` enum.  Lets us see WHICH kinds drive
+    // forceMisses (no v3 cache entry) and forceSkippedNeedsUpvalues
+    // (cache entry exists but we can't materialise upvalues).
+    // Capped at 32 — Expr::Kind currently tops out around 28.
+    static constexpr size_t kKindCap = 32;
+    uint64_t forceEntriesByKind[kKindCap]   = {};
+    uint64_t forceMissesByKind[kKindCap]    = {};
+    uint64_t forceSkippedByKind[kKindCap]   = {};
+    uint64_t forceHitsByKind[kKindCap]      = {};
+
+    // WC-0: per-skip-reason breakdown for forceSkippedNeedsUpvalues.
+    //   [0] phaseBFailed (previous force on same Expr* threw)
+    //   [1] noUpvalueSources (synthesised rec/with/inheritFrom)
+    //   [2] envWalkLevelTooDeep (env chain shorter than (level,displ))
+    //   [3] envValueNull (env slot was null)
+    //   [4] tw->v3 conversion threw
+    //   [5] top-level cache CU needs upvalues we don't have
+    static constexpr size_t kSkipReasonCap = 8;
+    uint64_t forceSkipReason[kSkipReasonCap] = {};
+
     // Per-phase total time (nanoseconds) — only populated when
     // V3_TIMING=1.  Lets us see whether lower, compile, run, or
     // bridge dominates the cutover overhead per file-toplevel Expr.
@@ -209,6 +230,61 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     (unsigned long long)s.forceHits,
                     (unsigned long long)s.forceMisses,
                     (unsigned long long)s.forceSkippedNeedsUpvalues);
+                // WC-0: per-Expr::Kind breakdown for force calls.
+                // Only print kinds with non-zero counts (most are 0).
+                // Names mirror Expr::Kind ordering in nixexpr.hh:108.
+                static const char * kindNames[] = {
+                    "Unknown","Int","Float","String","Path","Var",
+                    "InheritFrom","Select","OpHasAttr","Attrs","List",
+                    "Lambda","Call","Let","With","If","Assert",
+                    "OpNot","OpUpdate","ConcatStrings","Pos","BlackHole",
+                    "OpEq","OpNEq","OpAnd","OpOr","OpImpl","OpConcatLists"
+                };
+                bool anyKind = false;
+                for (size_t i = 0; i < V3HookStats::kKindCap; ++i) {
+                    if (s.forceEntriesByKind[i]
+                        || s.forceHitsByKind[i]
+                        || s.forceMissesByKind[i]
+                        || s.forceSkippedByKind[i]) {
+                        if (!anyKind) {
+                            std::fprintf(stderr,
+                                "v3 force by Expr::Kind:\n");
+                            anyKind = true;
+                        }
+                        const char * nm = (i < std::size(kindNames))
+                            ? kindNames[i] : "?";
+                        std::fprintf(stderr,
+                            "  %-14s entries=%llu hits=%llu miss=%llu skipNeedsUp=%llu\n",
+                            nm,
+                            (unsigned long long)s.forceEntriesByKind[i],
+                            (unsigned long long)s.forceHitsByKind[i],
+                            (unsigned long long)s.forceMissesByKind[i],
+                            (unsigned long long)s.forceSkippedByKind[i]);
+                    }
+                }
+                // WC-0: skip-reason breakdown.  Lets WC-2 see WHICH
+                // upvalue-translation failure modes dominate.
+                static const char * reasonNames[V3HookStats::kSkipReasonCap] = {
+                    "phaseBFailedPreviously",
+                    "noUpvalueSources",
+                    "envWalkLevelTooDeep",
+                    "envValueNull",
+                    "twToV3ConversionThrew",
+                    "topLevelCUNeedsUpvalues",
+                    "(unused)",
+                    "(unused)",
+                };
+                bool anyReason = false;
+                for (size_t i = 0; i < V3HookStats::kSkipReasonCap; ++i) {
+                    if (s.forceSkipReason[i] == 0) continue;
+                    if (!anyReason) {
+                        std::fprintf(stderr, "v3 force skip reasons:\n");
+                        anyReason = true;
+                    }
+                    std::fprintf(stderr, "  %-26s %llu\n",
+                        reasonNames[i],
+                        (unsigned long long)s.forceSkipReason[i]);
+                }
                 if (std::getenv("V3_TIMING"))
                     std::fprintf(stderr,
                         "v3 hook timing (ms): lower=%.3f compile=%.3f run=%.3f bridge=%.3f\n",
@@ -632,6 +708,22 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
 
     auto & st = v3HookStats();
     st.forceEntries++;
+    // WC-0: per-Expr::Kind breakdown.  Cheap (one bounded-array
+    // increment) and lets WC-1 / WC-2 see WHICH Expr kinds dominate
+    // the cache misses + needs-upvalues skips.
+    auto kindIdx = [&]() -> size_t {
+        if (!e) return 0;
+        size_t k = static_cast<size_t>(e->exprKind);
+        return k < V3HookStats::kKindCap ? k : 0;
+    }();
+    st.forceEntriesByKind[kindIdx]++;
+    auto skipReturn = [&](size_t reasonIdx) {
+        st.forceSkippedNeedsUpvalues++;
+        st.forceSkippedByKind[kindIdx]++;
+        if (reasonIdx < V3HookStats::kSkipReasonCap)
+            st.forceSkipReason[reasonIdx]++;
+        return false;
+    };
 
     // CO-3 sub-Expr cache (per-thunk-body Functions recorded by the
     // lowerer).  Hits on the bulk of force traffic — every let
@@ -649,15 +741,13 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
         if (ent.phaseBFailed) {
             // We tried Phase B for this entry before and it threw.
             // Same Expr* / same env shape => same outcome.  Skip.
-            st.forceSkippedNeedsUpvalues++;
-            return false;
+            return skipReturn(0);
         }
         if (ent.nUpvalues != 0) {
             if (ent.upvalueSources.empty()) {
                 // Phase B can't handle this entry (synthesized rec/
                 // with/inheritFrom upvalues).  Skip.
-                st.forceSkippedNeedsUpvalues++;
-                return false;
+                return skipReturn(1);
             }
             // CO-2 phase B: walk tree-walker's env per upvalueSource
             // to materialise the v3 upvalues array.
@@ -667,25 +757,21 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                     nix::Env * cur = &env;
                     for (uint32_t i = 0; i < level; ++i) {
                         if (!cur || !cur->up) {
-                            st.forceSkippedNeedsUpvalues++;
-                            return false;
+                            return skipReturn(2);
                         }
                         cur = cur->up;
                     }
                     if (!cur) {
-                        st.forceSkippedNeedsUpvalues++;
-                        return false;
+                        return skipReturn(2);
                     }
                     nix::Value * srcV = cur->values[displ];
                     if (!srcV) {
-                        st.forceSkippedNeedsUpvalues++;
-                        return false;
+                        return skipReturn(3);
                     }
                     upvalues.push_back(treeWalkerToV3Public(state, *srcV));
                 }
             } catch (const std::exception &) {
-                st.forceSkippedNeedsUpvalues++;
-                return false;
+                return skipReturn(4);
             }
         }
         cu      = ent.cu;
@@ -695,12 +781,12 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
         auto it = cache.find(e);
         if (it == cache.end()) {
             st.forceMisses++;
+            st.forceMissesByKind[kindIdx]++;
             return false;  // No cached CU — fall through to expr->eval.
         }
         cu = it->second.cu.get();
         if (!cu->lambdas.empty() && cu->lambdas[0].nUpvalues != 0) {
-            st.forceSkippedNeedsUpvalues++;
-            return false;
+            return skipReturn(5);
         }
         funcIdx = 0;
     }
@@ -739,20 +825,20 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     // Bridge result back to tree-walker Value.  Mirror the eval hook's
     // logic — same bridge, same fallback rules.
     switch (r.tag()) {
-    case Tag::Bool:   v.mkBool(r.payload.i == 1); st.forceHits++; return true;
-    case Tag::Int:    v.mkInt(r.payload.i);       st.forceHits++; return true;
-    case Tag::Float:  v.mkFloat(r.payload.f);     st.forceHits++; return true;
-    case Tag::Null:   v.mkNull();                 st.forceHits++; return true;
+    case Tag::Bool:   v.mkBool(r.payload.i == 1); st.forceHits++; st.forceHitsByKind[kindIdx]++; return true;
+    case Tag::Int:    v.mkInt(r.payload.i);       st.forceHits++; st.forceHitsByKind[kindIdx]++; return true;
+    case Tag::Float:  v.mkFloat(r.payload.f);     st.forceHits++; st.forceHitsByKind[kindIdx]++; return true;
+    case Tag::Null:   v.mkNull();                 st.forceHits++; st.forceHitsByKind[kindIdx]++; return true;
     case Tag::String:
         v.mkString(r.payload.str ? r.payload.str : "", state.mem);
-        st.forceHits++;
+        st.forceHits++; st.forceHitsByKind[kindIdx]++;
         return true;
     case Tag::Path:
     case Tag::Attrs:
     case Tag::List: {
         try {
             nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
-            if (tmp) { v = *tmp; st.forceHits++; return true; }
+            if (tmp) { v = *tmp; st.forceHits++; st.forceHitsByKind[kindIdx]++; return true; }
         } catch (const std::exception &) {
             // bridge fail — fall through
         }
