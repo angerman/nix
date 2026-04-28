@@ -2414,12 +2414,28 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
         try {
             auto & ns = *state.nixEvalState;
             nix::Value * nargs = v3ToTreeWalker(state, args[0]);
-            nix::Value & blt = ns.getBuiltins();
-            ns.forceAttrs(blt, nix::noPos, "v3 scopedImport bridge");
-            auto * dsAttr = blt.attrs()->get(ns.symbols.create("derivationStrict"));
-            if (dsAttr && dsAttr->value) {
+            // Cache the derivationStrict primop pointer per-EvalState
+            // — it's looked up by name on every call otherwise (one
+            // forceAttrs + one symbol-table lookup per derivation,
+            // which on a 25k-pkg nixpkgs scan is meaningful).
+            //
+            // Threading: nixEvalState pointer is stable for the
+            // lifetime of the eval; the static vBuiltins is process-
+            // wide because there is at most one tree-walker EvalState
+            // attached to the v3 runtime at any time.
+            static thread_local nix::Value * cachedDrvStrict = nullptr;
+            static thread_local nix::EvalState * cachedFor = nullptr;
+            if (cachedFor != &ns) {
+                cachedFor = &ns;
+                cachedDrvStrict = nullptr;
+                nix::Value & blt = ns.getBuiltins();
+                ns.forceAttrs(blt, nix::noPos, "v3 derivationStrict bridge");
+                auto * dsAttr = blt.attrs()->get(ns.symbols.create("derivationStrict"));
+                if (dsAttr && dsAttr->value) cachedDrvStrict = dsAttr->value;
+            }
+            if (cachedDrvStrict) {
                 nix::Value result;
-                ns.callFunction(*dsAttr->value, *nargs, result, nix::noPos);
+                ns.callFunction(*cachedDrvStrict, *nargs, result, nix::noPos);
                 out = treeWalkerToV3(state, result);
                 return;
             }
