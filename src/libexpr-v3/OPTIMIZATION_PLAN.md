@@ -305,3 +305,41 @@ Remaining CO-3 work for full Phase 1 (much smaller now):
 - Add a heuristic to skip v3 when the lowered Module's entry function
   is going to return Tag::Closure (avoids the wasted-work fallback
   path).
+
+## 2026-04-28 — cache observation: hits are always 0
+
+Instrumenting the cutover (`NIX_VM_STATS=1 nix-instantiate --eval ...`)
+shows that the per-Expr `v3HookCache()` never hits.  Concrete numbers
+across three workloads:
+
+  `let xs = [1 2 3]; in [xs xs xs]` → 2 entries / 0 hits / 1 miss
+  `let f = n: ...; in f 5`          → 2 entries / 0 hits / 1 miss
+  haskellPackages attrNames count   → 267 entries / 0 hits / 21 misses
+
+This makes sense:
+
+- Each top-level `state.eval(e, v)` call comes with a unique Expr*.
+  Repetition happens INSIDE the AST (sub-Exprs share parents), not
+  at the top-level eval.
+- v3's hook only fires for top-level evals; sub-Expr forces go
+  through tree-walker's `forceValue` → `expr->eval` directly,
+  which bypasses the cache.
+
+So the cache is correctly populated but rarely consulted.  To
+actually get cache hits, we need CO-2/CO-3:
+
+- CO-2: hook `forceValue` (or each `Expr::eval` virtual) to consult
+  `v3CacheLookup(Expr*)` before tree-walking.
+- CO-3: pre-populate the cache for sub-Exprs at lower time, so the
+  forceValue lookup finds an entry-offset for any reachable Expr*
+  (not just the top-level one).
+
+This is the "real" Phase 1 work the original plan flagged as 3-5
+weeks.  It's also where the bulk of the cutover perf benefit will
+come from — once forceValue routes through v3, we'd amortize the
+lower+compile cost across many forces of the same Expr.
+
+For now, the cache is a no-op.  The cutover is still net-positive
+on fib (slight win) and net-neutral on small expressions (within a
+few % of tree-walker), but the dominant work flow on real-world
+workloads is still tree-walker.
