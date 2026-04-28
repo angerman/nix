@@ -388,6 +388,15 @@ struct Module {
     /// dedupes by keeping only one per (VarId).
     std::vector<VarOrigin> varOrigins;
 
+    /// CO-2 phase B: VarIds the lowerer allocated as v3-internal "rec
+    /// attrset" values (recVar of every let-rec / rec attrset).  These
+    /// are NOT representable as a single tree-walker env cell — to
+    /// reconstruct them at force time we'd have to walk every binding
+    /// in the rec scope and assemble a Bindings*.  Until that lands
+    /// (a future Phase B refinement) we skip per-thunk functions whose
+    /// freeVars intersect this set.
+    std::vector<VarId> recVarIds;
+
     VarId   nextVar   = 1;
     BlockId nextBlock = 1;
 

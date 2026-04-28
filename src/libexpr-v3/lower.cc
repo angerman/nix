@@ -982,6 +982,12 @@ struct Lowerer
                                  Scope * outRecScope)
     {
         ir::VarId recVar = m.freshVar();
+        // CO-2 phase B: record this as a rec-attrset VarId so the
+        // force-hook post-pass can detect when a per-thunk function's
+        // freeVars include a rec-attrset (which we can't materialise
+        // from tree-walker's env in one cell read) and skip the
+        // entry's Phase B path before paying the lookup cost.
+        m.recVarIds.push_back(recVar);
 
         struct Pending {
             nix::Symbol sym;

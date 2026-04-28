@@ -29,6 +29,7 @@
 #include <chrono>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nix::v3 {
 
@@ -284,6 +285,11 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 uint64_t key = (static_cast<uint64_t>(vo.func) << 32) | vo.var;
                 originLookup.emplace(key, std::make_pair(vo.level, vo.displ));
             }
+            // CO-2 phase B: rec-attrset VarIds we can't translate
+            // from a single env cell — used to skip Phase B for any
+            // per-thunk whose freeVars include one.
+            std::unordered_set<ir::VarId> recVarSet(
+                module.recVarIds.begin(), module.recVarIds.end());
             auto & subCache = v3SubExprCache();
             for (auto & sef : module.subExprFuncs) {
                 if (sef.funcIdx >= cu->lambdas.size()) continue;
@@ -292,14 +298,15 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     cu->lambdas[sef.funcIdx].nUpvalues, {}};
                 if (entry.nUpvalues > 0) {
                     // Try to resolve every freeVar's origin; if any
-                    // freeVar lacks a direct (level, displ) source
-                    // (synthesized rec-attrset, with-lookup, etc.),
-                    // leave upvalueSources empty so the force hook
-                    // falls back to skippedNeedsUpvalues.
+                    // freeVar is a rec-attrset VarId (can't be carried
+                    // in a single env cell) or lacks a direct (level,
+                    // displ) source, leave upvalueSources empty so the
+                    // force hook skips the entry.
                     auto & fvs = module.functions[sef.funcIdx].freeVars;
                     bool ok = true;
                     entry.upvalueSources.reserve(fvs.size());
                     for (auto fv : fvs) {
+                        if (recVarSet.count(fv)) { ok = false; break; }
                         uint64_t key = (static_cast<uint64_t>(sef.funcIdx) << 32) | fv;
                         auto oit = originLookup.find(key);
                         if (oit == originLookup.end()) { ok = false; break; }
