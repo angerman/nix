@@ -505,3 +505,46 @@ not the lookup hit/miss outcome).
 
 The bones of the architecture are now in place; refinement is the
 remaining work.
+
+## 2026-04-28 night — force hook now perf-neutral
+
+Closed the force-hook regression entirely:
+
+  - **Commit 871a7734c** — top-level-only caching.  Restricted CO-3
+    cache to thunkifies whose enclosing function is function 0.
+    Eliminates the env-shape conflation where the same Expr* is
+    reached from multiple lambda call sites with different envs.
+    forceHits dropped 14 -> 1, but the 184 OP_ATTRS_SELECT throws
+    that wasted v3 work + tree-walker fallback are gone.
+
+  - **Commit c1e2d123d** — per-Expr `isV3CacheCandidate` flag bit
+    on `nix::Expr`.  `EvalState::forceValue`'s inline check now
+    short-circuits on `!expr->isV3CacheCandidate` BEFORE invoking
+    the function pointer.  forceEntries dropped 218,000 -> 5 on
+    hello.name.
+
+  - **Commit aa98fddf6** — inline kind filter in `EvalState::eval`.
+    Trivial Expr kinds (literals, Var, Lambda, Pos, Attrs, List)
+    bypass the v3 hook entirely.  evalEntries dropped 254 -> 15.
+
+  - **Commit 5c481fb38** — cached `getenv("V3_DEBUG_HOOK")` at
+    first call.  getenv() in a hot loop isn't free on libc++.
+
+Wall-clock state on `(import <nixpkgs> {}).hello.name`:
+
+  | mode                       | user time |
+  |----------------------------|-----------|
+  | tree-walker                | 0.25 s    |
+  | NIX_USE_V3=1               | 0.27 s    |
+  | NIX_USE_V3=1 + V3_FORCE=1  | 0.27 s — parity with eval-only |
+
+The opt-in force hook is now correctness-preserving AND
+performance-neutral — future Phase B refinements can layer in
+without re-introducing a regression.
+
+The residual ~25 ms gap vs tree-walker is dominated by 3 file-
+toplevel Lets that v3 lowers and runs but falls back from at
+runtime (2 "infinite recursion (blackhole)" + 1 Tag::Closure
+result).  Tree-walker re-evaluates the same files after fallback,
+so we pay both costs.  Future work: fix v3's over-eager cycle
+detector or detect these cases at lower-time and skip.
