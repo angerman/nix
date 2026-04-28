@@ -108,6 +108,47 @@ static std::unordered_map<const nix::Expr *, SubExprCacheEntry> & v3SubExprCache
     return tbl;
 }
 
+/// Populate `v3SubExprCache` from a freshly lowered + compiled module.
+/// Used by the eval hook (after lower+compile via the cutover) and by
+/// primImport (WC-4) so that imported files contribute their per-thunk
+/// functions too.  Idempotent: if an Expr* is already cached, the
+/// existing entry wins (`emplace` semantics).
+static void populateSubExprCacheLocal(
+    const ir::Module & module, const CompilationUnit * cu)
+{
+    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> originLookup;
+    for (auto & vo : module.varOrigins) {
+        uint64_t key = (static_cast<uint64_t>(vo.func) << 32) | vo.var;
+        originLookup.emplace(key, std::make_pair(vo.level, vo.displ));
+    }
+    std::unordered_set<ir::VarId> recVarSet(
+        module.recVarIds.begin(), module.recVarIds.end());
+    auto & subCache = v3SubExprCache();
+    for (auto & sef : module.subExprFuncs) {
+        if (sef.funcIdx >= cu->lambdas.size()) continue;
+        if (sef.funcIdx >= module.functions.size()) continue;
+        SubExprCacheEntry entry{cu, sef.funcIdx,
+            cu->lambdas[sef.funcIdx].nUpvalues, {}};
+        if (entry.nUpvalues > 0) {
+            auto & fvs = module.functions[sef.funcIdx].freeVars;
+            bool ok = true;
+            entry.upvalueSources.reserve(fvs.size());
+            for (auto fv : fvs) {
+                if (recVarSet.count(fv)) { ok = false; break; }
+                uint64_t key = (static_cast<uint64_t>(sef.funcIdx) << 32) | fv;
+                auto oit = originLookup.find(key);
+                if (oit == originLookup.end()) { ok = false; break; }
+                entry.upvalueSources.push_back(oit->second);
+            }
+            if (!ok) entry.upvalueSources.clear();
+        }
+        const_cast<nix::Expr *>(static_cast<const nix::Expr *>(sef.astExpr))
+            ->isV3CacheCandidate = true;
+        subCache.emplace(static_cast<const nix::Expr *>(sef.astExpr),
+            std::move(entry));
+    }
+}
+
 /// Process-wide counters that prove the cutover is firing.  Bumped on
 /// every call to the v3 hook entry point and exposed via NIX_VM_STATS.
 struct V3HookStats {
@@ -559,52 +600,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             // from the lower's recorded varOrigins; this lets us
             // populate per-function upvalueSources arrays so the
             // force hook can walk tree-walker's env at force time.
-            std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> originLookup;
-            for (auto & vo : module.varOrigins) {
-                uint64_t key = (static_cast<uint64_t>(vo.func) << 32) | vo.var;
-                originLookup.emplace(key, std::make_pair(vo.level, vo.displ));
-            }
-            // CO-2 phase B: rec-attrset VarIds we can't translate
-            // from a single env cell — used to skip Phase B for any
-            // per-thunk whose freeVars include one.
-            std::unordered_set<ir::VarId> recVarSet(
-                module.recVarIds.begin(), module.recVarIds.end());
-            auto & subCache = v3SubExprCache();
-            for (auto & sef : module.subExprFuncs) {
-                if (sef.funcIdx >= cu->lambdas.size()) continue;
-                if (sef.funcIdx >= module.functions.size()) continue;
-                SubExprCacheEntry entry{cu, sef.funcIdx,
-                    cu->lambdas[sef.funcIdx].nUpvalues, {}};
-                if (entry.nUpvalues > 0) {
-                    // Try to resolve every freeVar's origin; if any
-                    // freeVar is a rec-attrset VarId (can't be carried
-                    // in a single env cell) or lacks a direct (level,
-                    // displ) source, leave upvalueSources empty so the
-                    // force hook skips the entry.
-                    auto & fvs = module.functions[sef.funcIdx].freeVars;
-                    bool ok = true;
-                    entry.upvalueSources.reserve(fvs.size());
-                    for (auto fv : fvs) {
-                        if (recVarSet.count(fv)) { ok = false; break; }
-                        uint64_t key = (static_cast<uint64_t>(sef.funcIdx) << 32) | fv;
-                        auto oit = originLookup.find(key);
-                        if (oit == originLookup.end()) { ok = false; break; }
-                        entry.upvalueSources.push_back(oit->second);
-                    }
-                    if (!ok) entry.upvalueSources.clear();
-                }
-                // Mark the AST node so `EvalState::forceValue` knows
-                // to invoke the hook for it; non-marked Exprs short-
-                // circuit the inline check on the force hot path.
-                // Casting away const because nix::Expr's flag fields
-                // are intentionally mutable signposts for the various
-                // bytecode integrations (v2 already does this for
-                // `isBytecodeThunk` / `isBytecodeProxy`).
-                const_cast<nix::Expr *>(static_cast<const nix::Expr *>(sef.astExpr))
-                    ->isV3CacheCandidate = true;
-                subCache.emplace(static_cast<const nix::Expr *>(sef.astExpr),
-                    std::move(entry));
-            }
+            populateSubExprCacheLocal(module, cu);
             cache.emplace(e, CachedUnit{std::move(compiled)});
 
             // VM-4: write the freshly-compiled CU to disk cache for
@@ -980,6 +976,18 @@ struct V3HookRegistrar {
 // is the static initializer that registers `EvalState::v3EvalHook`, and
 // the linker doesn't see the static-init as "used").
 namespace nix::v3 {
+
+/// WC-4: public wrapper so primImport (in primops.cc) can pre-
+/// populate the sub-Expr cache after its own lower+compile.
+/// Without this, imported files are evaluated via v3 but their
+/// per-thunk functions never make it into v3SubExprCache, so any
+/// subsequent forceValue from tree-walker side falls through.
+void populateSubExprCachePublic(
+    const ir::Module & module, const CompilationUnit * cu)
+{
+    populateSubExprCacheLocal(module, cu);
+}
+
 void installEvalHook()
 {
     nix::EvalState::v3EvalHook = &v3EvalEntry;

@@ -60,12 +60,18 @@
 #include "nix/store/globals.hh"
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
+#include "v3/ir.hh"
+#include "v3/bytecode.hh"
 
 #include "nix/fetchers/fetch-to-store.hh"
 
 #include <boost/unordered/concurrent_flat_map.hpp>
 
 namespace nix::v3 {
+
+// WC-4: defined in v3_hook.cc.
+void populateSubExprCachePublic(
+    const ir::Module & module, const CompilationUnit * cu);
 
 namespace {
 
@@ -3625,6 +3631,12 @@ void primImport(EvalState & state, Value * args, Value & out)
             disk_cache::insert(diskKey, blob);
         } catch (...) { /* best-effort */ }
     }
+    // WC-4: pre-populate the sub-Expr cache so subsequent forces
+    // (from either v3 or tree-walker via the v3ForceHook) hit on
+    // imported files' inner thunks.  Without this the WC-2 lift of
+    // the function-0-only restriction has nothing to bite on for
+    // files that are imported (the bulk of nixpkgs).
+    populateSubExprCachePublic(module, &cache.cus.back());
     // Each imported file is its own CompilationUnit; we re-enter the
     // VM to run it with its own top-level frame.  Keep the CU alive
     // (it's borrowed by closures returned from the eval).
