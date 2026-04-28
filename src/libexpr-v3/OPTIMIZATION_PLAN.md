@@ -595,9 +595,20 @@ shared-env zero-alloc-per-eval) baked into v3's design.
 
 Tested fixes that didn't help:
   - Thread-local bump arena: ackermann unchanged (malloc was not
-    the bottleneck — it's the per-closure setup cost).
+    the bottleneck — it's the per-closure setup cost + memory
+    write bandwidth).
   - GC_MALLOC instead of malloc: REGRESSED to 3.17 s (Boehm GC's
     mark/sweep overhead dominates at this allocation density).
+
+Memory measurement (max RSS, ackermann 3 9):
+  - tree-walker: 482 MB peak
+  - v3:        1,652 MB peak (~3.4x higher)
+
+The 1.2 GB delta is the 11M leaked closures + 5.5M thunks.  v3's
+closure header is 32 bytes + FAM upvalues; tree-walker's
+`mkLambda(env*, expr*)` is just two stored pointers in a Value.
+v3's heap also never frees these allocations (no GC, no per-eval
+arena reset), so long-running processes will leak.
 
 Closing the gap would require either:
   - A "ref to enclosing closure's upvalues" mode for closures
