@@ -775,6 +775,200 @@ subtle hash/path mismatches without running the full nix
 functional+integration suite, which is impractical from a single
 focused session.
 
+## 2026-04-30 — BR-3 native derivationStrict: step-by-step plan
+
+The bridge in `primDerivationStrict` round-trips every derivation
+through tree-walker: `v3ToTreeWalker(args[0])` → `callFunction
+(builtins.derivationStrict)` → `treeWalkerToV3(result)`.  Per-drv
+cost is ~16–22 µs (per the headline analysis above); on a 25k-pkg
+nixpkgs scan this is the dominant remaining v3 leak.
+
+BR-3 replaces the bridge with a native v3 implementation that
+constructs `nix::Derivation` directly against libnixstore.  Doing
+this naively is risky: any byte-level deviation in env
+serialization, attr ordering, or NixStringContext propagation
+changes the derivation hash, which changes /nix/store paths
+across the whole graph and silently breaks builds.
+
+The plan below splits BR-3 into a Phase A (simple deferred-output
+path; ~99% of nixpkgs derivations) followed by separate phases
+for fixed-output, content-addressed, and structured-attr
+derivations.  The bridge stays in place as a safety net: if the
+detect-fall-back predicate flags a feature we don't yet handle,
+or if any step throws, control falls through to the existing
+bridge.
+
+### Critical correctness concerns
+
+  1. **Lexicographic attr ordering.**  Tree-walker iterates via
+     `attrs->lexicographicOrder(state.symbols)` — sorted by name
+     STRING.  v3 attrsets are sorted by SymbolId, which is the
+     interning order, NOT alphabetical.  To match tree-walker's
+     drv-hash byte-for-byte, every iteration over attrs in the
+     native path MUST sort by name string first.  This is the
+     single biggest correctness landmine.
+
+  2. **NixStringContext propagation.**  Strings carry context
+     entries (DrvDeep, Built, Opaque) that become inputDrvs /
+     inputSrcs.  `coerceToString` is the channel through which
+     context flows; missing one entry = missing build dependency
+     = broken graph.  v3 already side-tables string contexts; the
+     coerceToString port must funnel them into the local
+     `NixStringContext` accumulator.
+
+  3. **coerceToString edge cases.**  Path → store-copy handling,
+     attrs-with-`__toString`, attrs-with-`outPath` fallback, list
+     separator with the empty-list special case, external values.
+     Each one is small but wrong-by-default.
+
+  4. **Hash determinism.**  `hashDerivationModulo` must produce
+     the exact same Hash that tree-walker did, or every dependent
+     drv mishashes.  The whole point of Phase A's gating is that
+     we ONLY run the native path when the input shape is one
+     we've fully understood; complex shapes still go through the
+     bridge.
+
+### Phase A — deferred-output simple case (the bulk)
+
+The 99% case: `mkDerivation { name; system; builder; args; ENV;
+... }` with no `__structuredAttrs`, no `outputHash*`, no
+`__contentAddressed`, no `__impure`.  Tree-walker's path here is
+roughly: build `nix::Derivation` with `DerivationOutput::Deferred`
+slots, call `drv.fillInOutputPaths(*store)` to assign concrete
+paths, then `store->writeDerivation(drv, repair)`.
+
+Subtasks (each independently committable + testable):
+
+- **BR-3.0 — Pre-flight: standalone libnixstore harness.**
+  Before touching v3, write a small C++ test that constructs a
+  hard-coded `nix::Derivation` via libnixstore and asserts the
+  resulting drvPath matches a known-good reference produced by
+  `nix-instantiate`.  Validates we can drive the APIs in
+  isolation; surfaces ABI / link / readOnlyMode mismatches
+  before they're tangled up in the v3 native path.
+
+- **BR-3.1 — Pre-intern attr SymbolIds.**  At module init time,
+  intern v3 SymbolIds for `name`, `system`, `builder`, `args`,
+  `outputs`, `outputHash`, `outputHashAlgo`, `outputHashMode`,
+  `__structuredAttrs`, `__contentAddressed`, `__impure`,
+  `__ignoreNulls`, etc.  Avoids per-call hash lookups against
+  the global symbol table.
+
+- **BR-3.2 — v3 `coerceToString` with NixStringContext.**  Port
+  `EvalState::coerceToString` (eval.cc:2840) to operate on v3
+  Values: handle string (forward context from side-table), path
+  (with optional copyToStore), bool/int/float/null with
+  coerceMore, list (recurse + space separator + empty-list
+  special case), attrs (tryAttrsToString via `__toString`, then
+  outPath fallback), external.  This is the heaviest subtask
+  (~200 LOC) and the most dangerous: every edge case is a
+  potential drv-hash mismatch.
+
+- **BR-3.3 — Detect-fall-back predicate.**  Cheap
+  attr-name-presence check: if `outputHash`, `__structuredAttrs`,
+  `__contentAddressed`, or `__impure` is in the bindings, return
+  false (fall back to bridge).  No forcing — trust that if the
+  attr exists, the derivation is non-trivial enough to bridge.
+  False positives (saying "complex" when it isn't) are correct;
+  false negatives (saying "simple" when it isn't) would silently
+  produce wrong drvs.
+
+- **BR-3.4 — Lexicographic attr iterator.**  Helper that takes a
+  v3 `Bindings*` and yields `(name_string, value)` pairs in
+  string-sorted order.  Sort once into a small vector at the top
+  of `derivationStrictInternal`; downstream just iterates.
+
+- **BR-3.5 — Phase A scaffold + main attr-loop.**  Wire the
+  pieces together: try detect-fall-back → if simple, enter
+  native; otherwise bridge.  Inside native: parse name + run
+  libstore's `checkName`, iterate attrs in lex order, branch by
+  attr name (special-case `args` as list-of-strings, else
+  coerceToString → drv.env[key], with builder/system/outputs
+  side effects).  Catches at the boundary: any throw falls back
+  to the bridge.
+
+- **BR-3.6 — NixStringContext → inputDrvs / inputSrcs.**  Walk
+  the accumulated context, dispatch by variant: DrvDeep →
+  computeFSClosure + insert all paths (with derivations'
+  outputs); Built → ensureSlot + insert output; Opaque → insert
+  path.  Mirrors eval.cc:1849.
+
+- **BR-3.7 — writeDerivation + drvHashes + result attrset.**
+  Validate `drv.builder != ""` and `drv.platform != ""`.
+  `drv.fillInOutputPaths(*store)` for deferred outputs.  Call
+  `store->writeDerivation(drv, repair)` (or `computeStorePath`
+  in readOnlyMode).  Cache `hashDerivationModulo` result into
+  the global drvHashes map.  Build a v3 result `Bindings` with
+  `drvPath` + per-output paths, recording each output's
+  NixStringContext (`Built{drvPath, outputName}`) into the v3
+  string-context side-table.
+
+- **BR-3.8 — Byte-equal drvPath validation harness.**
+  Functional test that, for a battery of representative
+  derivations (hello, git, vim, ghc, plus a few simple
+  hand-crafted ones), runs both paths and asserts:
+    1. drvPath strings match exactly
+    2. Each output path matches exactly
+    3. The set of inputSrcs / inputDrvs matches
+  Run as `bash src/libexpr-v3/test/run-drv-parity.sh` (new).
+  This is the gate before flipping the default to native.
+
+- **BR-3.9 — Real-world benchmark + plan doc update.**  Re-run
+  the heavy-scan workload (3k forced drvs) with native enabled,
+  document delta in user CPU + RSS.  Expected: ~5–10% user CPU
+  drop on the heavy scan.  Update OPTIMIZATION_PLAN.md.
+
+### Phase B — fixed-output derivations
+
+Triggered when `outputHash` is present.  Adds:
+
+- **BR-3.10 — Fixed-output support.**  Parse `outputHash`,
+  `outputHashAlgo`, `outputHashMode`.  Build
+  `DerivationOutput::CAFixed` with the parsed
+  `ContentAddress{method, hash}`.  Validate `outputs.size() == 1
+  && outputs[0] == "out"`.  Re-run the validation harness with
+  fetchurl-style fixed-output drvs.
+
+### Phase C — contentAddressed / impure derivations
+
+Triggered when `__contentAddressed=true` or `__impure=true`.
+
+- **BR-3.11 — CA / impure support.**  Build
+  `DerivationOutput::CAFloating` (or `Impure`) with the right
+  hashAlgo + ingestionMethod.  Set `drv.env[output] =
+  hashPlaceholder(output)` for each output.  Reject the
+  CA+impure combination.
+
+### Phase D — structured attrs
+
+Triggered when `__structuredAttrs=true`.
+
+- **BR-3.12 — Structured-attrs JSON support.**  Port
+  `printValueAsJSON` to operate on v3 Values (or stage through
+  the existing v3 toJSON primop).  Build
+  `drv.structuredAttrs.structuredAttrs[key] = json`.  Replicate
+  the warnings about disallowed legacy attrs (allowedReferences
+  etc.).
+
+### Phase E — error message + trace parity (cleanup)
+
+- **BR-3.13 — Error/trace parity.**  Replace the current
+  `runtime_error("v3 derivationStrict: …")` throws with
+  Nix-style errors that include source positions and frame
+  traces.  Cosmetic but matters for user-facing error messages
+  on derivations with bad attrs.
+
+### Acceptance criteria
+
+  - All 142 lang + 142 cutover tests pass throughout.
+  - The drvPath-parity harness from BR-3.8 stays green for
+    every derivation it covers.
+  - On the 3k-drv heavy-scan workload, native CPU is at most
+    tree-walker's; on the 25k-pkg scan, native shows a
+    measurable user-CPU drop versus today's bridged baseline.
+  - The bridge fall-back path stays exercised by complex drvs
+    (Phase B/C/D shapes) until those phases land.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
