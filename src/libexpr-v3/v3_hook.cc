@@ -54,6 +54,27 @@ static std::unordered_map<const nix::Expr *, CachedUnit> & v3HookCache()
     return tbl;
 }
 
+/// CO-3: sub-Expr cache.  Each entry maps a tree-walker AST Expr*
+/// (one of the per-thunk-body Exprs the lowerer recorded in
+/// `Module::subExprFuncs`) to (CompilationUnit, FuncId).  The
+/// forceValue hook consults this on every force; when tree-walker
+/// is forcing a thunk whose underlying Expr* matches one v3 has
+/// already lowered + compiled, we run that FuncId in v3 instead of
+/// dispatching to expr->eval.
+struct SubExprCacheEntry {
+    const CompilationUnit * cu;
+    ir::FuncId              funcIdx;
+    /// Cached number of upvalues the function expects.  Phase A only
+    /// handles 0; Phase B (task #278) translates env -> upvalues.
+    uint16_t                nUpvalues;
+};
+
+static std::unordered_map<const nix::Expr *, SubExprCacheEntry> & v3SubExprCache()
+{
+    static std::unordered_map<const nix::Expr *, SubExprCacheEntry> tbl;
+    return tbl;
+}
+
 /// Process-wide counters that prove the cutover is firing.  Bumped on
 /// every call to the v3 hook entry point and exposed via NIX_VM_STATS.
 struct V3HookStats {
@@ -241,6 +262,17 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 st.compileNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
             }
             cu = compiled.get();
+            // CO-3: populate the sub-Expr cache from the lower's
+            // recorded (Expr* -> FuncId) pairs.  Each thunk-body
+            // function becomes a force-time entry point; nUpvalues
+            // is captured here so Phase A's upvalue-free fast path
+            // can decide cheaply whether to take the cutover.
+            auto & subCache = v3SubExprCache();
+            for (auto & sef : module.subExprFuncs) {
+                if (sef.funcIdx >= cu->lambdas.size()) continue;
+                subCache.emplace(static_cast<const nix::Expr *>(sef.astExpr),
+                    SubExprCacheEntry{cu, sef.funcIdx, cu->lambdas[sef.funcIdx].nUpvalues});
+            }
             cache.emplace(e, CachedUnit{std::move(compiled)});
         } catch (const std::exception & ex) {
             if (diag) std::fprintf(stderr, "v3 hook: lower/compile threw: %s\n", ex.what());
@@ -364,31 +396,49 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     auto & st = v3HookStats();
     st.forceEntries++;
 
-    auto & cache = v3HookCache();
-    auto it = cache.find(e);
-    if (it == cache.end()) {
-        st.forceMisses++;
-        return false;  // No cached CU — fall through to expr->eval.
-    }
-
-    const CompilationUnit * cu = it->second.cu.get();
-    // Phase A guard: only handle self-contained entries.  The top-
-    // level function's freeVars must be empty — otherwise we'd need
-    // to translate env to upvalues, which is Phase B (task #278).
-    if (!cu->lambdas.empty() && cu->lambdas[0].nUpvalues != 0) {
-        st.forceSkippedNeedsUpvalues++;
-        return false;
+    // CO-3 sub-Expr cache (per-thunk-body Functions recorded by the
+    // lowerer).  Hits on the bulk of force traffic — every let
+    // binding, every lazy attrset value, every list element wrapped
+    // in a thunk goes through here.  Top-level CU lookups (the
+    // original cache) are far rarer at force time and live in the
+    // separate v3HookCache.
+    const CompilationUnit * cu      = nullptr;
+    ir::FuncId              funcIdx = 0;
+    auto & subCache = v3SubExprCache();
+    auto sit = subCache.find(e);
+    if (sit != subCache.end()) {
+        if (sit->second.nUpvalues != 0) {
+            // Phase B (task #278): build upvalues from env at force
+            // time.  Until that lands, skip non-closed thunks.
+            st.forceSkippedNeedsUpvalues++;
+            return false;
+        }
+        cu      = sit->second.cu;
+        funcIdx = sit->second.funcIdx;
+    } else {
+        auto & cache = v3HookCache();
+        auto it = cache.find(e);
+        if (it == cache.end()) {
+            st.forceMisses++;
+            return false;  // No cached CU — fall through to expr->eval.
+        }
+        cu = it->second.cu.get();
+        if (!cu->lambdas.empty() && cu->lambdas[0].nUpvalues != 0) {
+            st.forceSkippedNeedsUpvalues++;
+            return false;
+        }
+        funcIdx = 0;
     }
 
     setNixEvalState(&state);
     bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
     if (diag) std::fprintf(stderr,
-        "v3 force hook: CU hit, running %zu insts / %zu lambdas\n",
-        cu->code.size(), cu->lambdas.size());
+        "v3 force hook: CU hit fid=%u, running %zu insts / %zu lambdas\n",
+        funcIdx, cu->code.size(), cu->lambdas.size());
 
     Value r;
     try {
-        r = run(*cu);
+        r = (funcIdx == 0) ? run(*cu) : runFunction(*cu, funcIdx);
     } catch (const std::exception & ex) {
         if (diag) std::fprintf(stderr, "v3 force hook: run threw: %s\n", ex.what());
         return false;  // Fall back: tree-walker handles the rest.

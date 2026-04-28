@@ -333,6 +333,19 @@ struct Function {
 const std::vector<std::string> & globalSymbolTable();
 SymbolId globalInternSymbol(std::string_view s);
 
+/// Sub-Expr -> (FuncId) entry recorded by the lowerer.  The lower
+/// pre-creates a per-thunk Function for every nontrivial Expr that
+/// would be wrapped in a thunk (let bindings, lazy attrset values,
+/// etc.).  We expose the (AST Expr* -> FuncId) mapping here so the
+/// post-compile pass can populate a runtime force-hook cache —
+/// when tree-walker calls forceValue with that Expr*, v3 can
+/// resolve it back to a CompilationUnit + FuncId and run the
+/// pre-compiled code directly.
+struct SubExprEntry {
+    const void * astExpr;     // nix::Expr* — opaque here to avoid the include
+    FuncId       funcIdx;
+};
+
 struct Module {
     /// All blocks; blocks[0] is unused (kInvalidBlock sentinel).
     std::vector<Block> blocks;
@@ -343,6 +356,12 @@ struct Module {
     /// internSymbol returns ids from the global table directly so they
     /// remain stable across imports/CUs.
     std::vector<std::string> symbols;
+
+    /// Per-thunk function provenance recorded by the lowerer.  Each
+    /// entry is `(AST Expr*, IR FuncId)` for a thunk-body function.
+    /// Consumed by the post-compile cache populator (CO-3) to wire
+    /// up the forceValue cutover.
+    std::vector<SubExprEntry> subExprFuncs;
 
     VarId   nextVar   = 1;
     BlockId nextBlock = 1;

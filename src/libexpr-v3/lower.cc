@@ -762,6 +762,13 @@ struct Lowerer
         m.functions[fid].entryBlock = entry;
         m.functions[fid].name = "<thunk>";
 
+        // CO-3: record (Expr* -> FuncId) so the post-compile pass can
+        // wire this thunk into the forceValue cutover cache.  Tree-
+        // walker's forceValue gets called with `expr->thunk().expr`
+        // (= `e` here); a cache hit lets v3 run the thunk body
+        // directly instead of falling through to expr->eval.
+        m.subExprFuncs.push_back({static_cast<const void *>(e), fid});
+
         funcStack.push_back(fid);
         blockStack.push_back(entry);
         ir::VarId rv = lowerExpr(e);
@@ -979,6 +986,12 @@ struct Lowerer
             auto eb = m.freshBlock();
             m.functions[fid].entryBlock = eb;
             m.functions[fid].name = std::string(symbols[kv.first]);
+            // CO-3: register the LetRec / rec-attrset binding's def
+            // expression with the thunk's function.  Tree-walker stores
+            // these as `let { x = E; }` thunks whose `expr` field is E
+            // — a cache lookup at force time hits this entry.
+            if (kv.second.e)
+                m.subExprFuncs.push_back({static_cast<const void *>(kv.second.e), fid});
             pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb,
                                 posIdxToHandle(kv.second.pos)});
         }

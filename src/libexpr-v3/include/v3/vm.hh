@@ -68,4 +68,13 @@ CompilationUnit compile(const ir::Module & m);
 /// Run the top-level CU's entry until OP_HALT, returning the final value.
 Value run(const CompilationUnit & cu);
 
+/// Run a specific FuncId in `cu` as if it were a thunk body — no
+/// arguments pushed, the function's nLocals worth of slots reserved,
+/// and the dispatch loop runs until that function's OP_RETURN/OP_HALT.
+/// Used by the CO-3 force-hook entry path: tree-walker forces a thunk
+/// whose Expr* matches a known per-thunk FuncId; we run that FuncId.
+/// Phase A only — funcIdx must reference a function with no upvalues
+/// (nUpvalues == 0).  Phase B will accept an upvalues array.
+Value runFunction(const CompilationUnit & cu, uint32_t funcIdx);
+
 } // namespace nix::v3

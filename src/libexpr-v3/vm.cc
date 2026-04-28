@@ -1688,6 +1688,38 @@ Value run(const CompilationUnit & rootCu)
     return dispatchLoop(vm, /*exitDepth=*/0);
 }
 
+/// CO-3: run an arbitrary FuncId in `cu` as if it were a thunk body.
+/// No upvalues, no args.  Used by the forceValue cutover hook for
+/// per-thunk-body Functions whose `nUpvalues == 0` — i.e., closed
+/// thunks the lowerer recorded in `Module::subExprFuncs`.
+Value runFunction(const CompilationUnit & cu, uint32_t funcIdx)
+{
+    if (funcIdx >= cu.lambdas.size())
+        throw std::runtime_error("v3 runFunction: funcIdx out of range");
+    const auto & desc = cu.lambdas[funcIdx];
+    if (desc.nUpvalues != 0)
+        throw std::runtime_error("v3 runFunction: function expects upvalues; Phase B not yet implemented");
+
+    VMState vm;
+    vm.valueStack.reserve(64 * 1024);
+    vm.frames.reserve(4096);
+    vm.withStack.reserve(64);
+
+    vm.frames.push_back(CallFrame{
+        .cu = &cu,
+        .closure = nullptr,
+        .thunk = nullptr,
+        .ip = desc.codeOffset,
+        .stackBaseOffset = 0,
+        .withStackBase = 0,
+        .flags = 0,
+    });
+
+    vm.valueStack.resize(desc.nLocals);
+
+    return dispatchLoop(vm, /*exitDepth=*/0);
+}
+
 Value forceValue(VMState & vm, Value v)
 {
     // Loop until WHNF: a thunk's body might itself yield a thunk
