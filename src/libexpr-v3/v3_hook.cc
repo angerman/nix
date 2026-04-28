@@ -685,18 +685,32 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     case Tag::Null:   v.mkNull();                 return;
     case Tag::String: v.mkString(r.payload.str ? r.payload.str : "", state.mem); return;
     case Tag::Closure:
-    case Tag::Thunk:
     case Tag::PrimOp:
-    case Tag::PrimOpApp:
+    case Tag::PrimOpApp: {
+        // WC-6: an experimental bridge that wrapped Closure results
+        // as a tree-walker PrimOpApp(__v3_call_bridge_1, handle)
+        // worked at type-level but caused a regression on real
+        // nixpkgs probes — v3 thunks left in Black state between
+        // hook entries cascaded into "OP_FORCE: infinite recursion
+        // (blackhole)" once the bridge re-entered v3 to apply the
+        // closure.  Until WC-5's cleanup is extended to cover the
+        // success path (not just exception path), it's safer to
+        // fall back to tree-walker.  Same code as Tag::Thunk etc.
+        if (diag) std::fprintf(stderr,
+            "v3 hook: closure-shape result tag=%d, falling back\n",
+            (int)r.tag());
+        st.evalFallbackReason[1]++;
+        e->eval(state, state.baseEnv, v);
+        return;
+    }
+    case Tag::Thunk:
     case Tag::App:
     case Tag::Blackhole:
     case Tag::Uninitialized:
     case Tag::External: {
-        // Functions / thunks can't be cleanly handed back to the
-        // tree-walker via the current bridge: v3ToTreeWalker for
-        // closures uses a hardcoded-arity primop that doesn't match
-        // the calling convention `autoCallFunction` expects.  Until
-        // CO-3 fixes the bridge, fall back to tree-walker for these.
+        // Thunks/apps shouldn't escape v3 in normal flow (we force
+        // the result at run() exit) — these are pathology cases.
+        // Fall back; not worth bridging.
         if (diag) std::fprintf(stderr,
             "v3 hook: result tag=%d, falling back to tree-walker\n",
             (int)r.tag());
