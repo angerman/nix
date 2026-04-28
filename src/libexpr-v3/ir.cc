@@ -43,10 +43,27 @@ BlockId Module::freshBlock()
 
 namespace {
 
+/// Heterogeneous-lookup hash + equal so we can find a string_view in
+/// a `unordered_map<std::string, ...>` without allocating an
+/// intermediate std::string per lookup — important on the symbol
+/// intern fast path which is hit hundreds of times per lower call.
+struct StringHash
+{
+    using is_transparent = void;
+    size_t operator()(std::string_view sv) const noexcept { return std::hash<std::string_view>{}(sv); }
+    size_t operator()(const std::string & s) const noexcept { return std::hash<std::string_view>{}(s); }
+    size_t operator()(const char * s) const noexcept { return std::hash<std::string_view>{}(s); }
+};
+struct StringEq
+{
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
+};
+
 struct GlobalSymTab
 {
     std::vector<std::string> table;
-    std::unordered_map<std::string, SymbolId> index;
+    std::unordered_map<std::string, SymbolId, StringHash, StringEq> index;
     GlobalSymTab() {
         // Reserve slot 0 for the kInvalidSymbol sentinel (empty string).
         table.emplace_back("");
@@ -67,7 +84,10 @@ const std::vector<std::string> & globalSymbolTable() { return gst().table; }
 SymbolId globalInternSymbol(std::string_view s)
 {
     auto & t = gst();
-    auto it = t.index.find(std::string(s));
+    // Heterogeneous lookup avoids the std::string(s) allocation on
+    // every probe.  Only on a miss do we materialise the string for
+    // the table + index entries.
+    auto it = t.index.find(s);
     if (it != t.index.end()) return it->second;
     SymbolId id = static_cast<SymbolId>(t.table.size());
     t.table.emplace_back(s);

@@ -90,14 +90,37 @@ struct Lowerer
     /// owns the inheritFromExprs vector), so a simple stack suffices.
     std::vector<std::pmr::vector<nix::Expr *> *> inheritFromStack;
 
+    /// VarId of the synthesized `builtins` attrset, populated lazily on
+    /// the first base-env `builtins` reference.  All subsequent refs in
+    /// the same lower call alias this VarId via VarRef.  Saves
+    /// re-constructing N LitPrimOp bindings + the AttrSet's entries
+    /// vector on every occurrence of the symbol.
+    ir::VarId cachedBuiltinsVar = ir::kInvalid;
+
+    /// nix::Symbol -> ir::SymbolId interning cache (per Lowerer).
+    /// Avoids the std::string allocation + global-table hashmap lookup
+    /// on every lowerVar/lowerAttrs/etc. access to a repeat symbol.
+    /// nix::Symbol is just a uint32_t, so the std::unordered_map keyed
+    /// on its int id is cheap.
+    std::unordered_map<uint32_t, ir::SymbolId> symbolCache;
+
     explicit Lowerer(const nix::SymbolTable & st) : symbols(st) {}
     Lowerer(const nix::SymbolTable & st, const nix::PosTable & pt)
         : symbols(st), positions(&pt) {}
 
     ir::SymbolId internSym(nix::Symbol s)
     {
+        // Per-Lowerer cache keyed on nix::Symbol's uint32 id — repeats
+        // within one lower call are common (every attrset references the
+        // same field names) and the global-table fallback below allocates
+        // a std::string we don't need on hits.
+        uint32_t sid = s.getId();
+        auto it = symbolCache.find(sid);
+        if (it != symbolCache.end()) return it->second;
         std::string_view sv = symbols[s];
-        return m.internSymbol(std::string(sv));
+        ir::SymbolId id = m.internSymbol(sv);
+        symbolCache.emplace(sid, id);
+        return id;
     }
 
     ir::VarId addBinding(ir::Expr e)
@@ -284,19 +307,41 @@ struct Lowerer
     /// The handle is what we store on each ir::AttrSet::Entry so the VM
     /// can populate the per-attr position side-table consulted by
     /// `builtins.unsafeGetAttrPos`.
+    ///
+    /// We don't cache by PosIdx — measurement showed the parser
+    /// assigns a distinct PosIdx to every attribute, so the cache
+    /// almost never hits and the hash overhead regresses lower time
+    /// by ~10%.  The bigger win lives in caching the file-origin
+    /// std::string across attrs from the same source (below).
+    ///
+    /// Cache the std::string for the most-recently-seen origin.
+    /// Within an attrset, all attrs share one origin variant +
+    /// SourcePath, so the file string is identical for hundreds of
+    /// consecutive calls.  A 1-entry MRU cache catches this.
+    nix::Pos::Origin lastOrigin;
+    std::string      lastOriginFile;
+    bool             haveLastOrigin = false;
+
     uint32_t posIdxToHandle(nix::PosIdx posIdx)
     {
         if (!positions || !posIdx) return 0;
         auto pos = (*positions)[posIdx];
         std::string file;
-        if (auto * s = std::get_if<nix::SourcePath>(&pos.origin))
-            file = s->path.abs();
-        else if (std::holds_alternative<nix::Pos::Stdin>(pos.origin))
-            file = "<stdin>";
-        else if (std::holds_alternative<nix::Pos::String>(pos.origin))
-            file = "<string>";
-        else
-            file = "<unknown>";
+        if (haveLastOrigin && pos.origin == lastOrigin) {
+            file = lastOriginFile;
+        } else {
+            if (auto * s = std::get_if<nix::SourcePath>(&pos.origin))
+                file = s->path.abs();
+            else if (std::holds_alternative<nix::Pos::Stdin>(pos.origin))
+                file = "<stdin>";
+            else if (std::holds_alternative<nix::Pos::String>(pos.origin))
+                file = "<string>";
+            else
+                file = "<unknown>";
+            lastOrigin = pos.origin;
+            lastOriginFile = file;
+            haveLastOrigin = true;
+        }
         return recordPosSnapshot({std::move(file),
                                    static_cast<uint32_t>(pos.line),
                                    static_cast<uint32_t>(pos.column)});
@@ -351,12 +396,21 @@ struct Lowerer
             // LitPrimOp value.  Lets `with builtins; <body>` and
             // bare `builtins.attrNames` (where `builtins` is rebound
             // by `inherit (builtins) ...`) work uniformly.
+            //
+            // Cache the IR construction at the Lowerer level — within
+            // a single lowerNixExpr call, multiple `builtins` refs
+            // (common in nixpkgs code) share the same VarId.  Saves
+            // re-emitting hundreds of LitPrimOp bindings + the AttrSet
+            // entries vector on every reference.
+            if (cachedBuiltinsVar != ir::kInvalid)
+                return addBinding(ir::VarRef{cachedBuiltinsVar});
             std::vector<ir::AttrSet::Entry> entries;
             for (auto & [poName, po] : allRegisteredPrimOps()) {
                 ir::VarId v = addBinding(ir::LitPrimOp{&po});
                 entries.push_back({m.internSymbol(poName), v});
             }
-            return addBinding(ir::AttrSet{std::move(entries)});
+            cachedBuiltinsVar = addBinding(ir::AttrSet{std::move(entries)});
+            return cachedBuiltinsVar;
         }
         if (auto * po = findPrimOp(name)) {
             // Arity-0 primops behave as constants — invoke immediately
