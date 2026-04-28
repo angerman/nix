@@ -73,21 +73,49 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 {
     auto & st = v3HookStats();
     st.evalEntries++;
+    // Register a stats-dump atexit handler on first entry.  We
+    // intentionally do NOT call dumpPrimOpStats() here (its
+    // static-mutex hits a destruction-order crash on libc++ exit
+    // path); the simple POD counters in V3HookStats are safe to
+    // read since they don't have non-trivial destructors.  Use
+    // v3-eval directly for primop-level profiling.
+    static bool atexitDone = []{
+        if (std::getenv("NIX_VM_STATS")) {
+            std::atexit([]{
+                auto & s = v3HookStats();
+                std::fprintf(stderr,
+                    "v3 hook stats: evalEntries=%llu cacheHits=%llu cacheMisses=%llu\n",
+                    (unsigned long long)s.evalEntries,
+                    (unsigned long long)s.cacheHits,
+                    (unsigned long long)s.cacheMisses);
+            });
+        }
+        return true;
+    }();
+    (void)atexitDone;
     bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
     if (diag) std::fprintf(stderr, "v3 hook[%llu]: enter e=%p\n",
                            (unsigned long long)st.evalEntries, (void*)e);
 
-    // Fast path: if the Expr is a top-level Lambda, v3 would lower
-    // it to a closure-returning entry and we'd fall back to
-    // tree-walker anyway after wasting the lower+run cycle.  The
-    // tree-walker handles ExprLambda::eval cheaply (just allocates a
-    // Value with the function pointer) — short-circuit straight to
-    // it.  Same logic for primops/applies — anything whose eval is
-    // already cheap in tree-walker doesn't benefit from v3.
-    if (e && e->exprKind == nix::Expr::Kind::Lambda) {
-        if (diag) std::fprintf(stderr, "v3 hook: ExprLambda — skip v3\n");
-        e->eval(state, state.baseEnv, v);
-        return;
+    // Fast paths: shape-based short-circuits.  v3's lower+compile+run
+    // cycle pays a ~1ms+ overhead per Expr, which dominates the
+    // benefit on tiny / trivial Exprs.  For these, tree-walker's
+    // direct evaluation is materially cheaper.  Profiling shows that
+    // a `(import <nixpkgs> {}).hello.name` evaluation calls EvalState::eval
+    // 254 times — short-circuiting the cheap ones halves overhead.
+    if (e) {
+        auto k = e->exprKind;
+        if (k == nix::Expr::Kind::Lambda ||
+            k == nix::Expr::Kind::Int    ||
+            k == nix::Expr::Kind::Float  ||
+            k == nix::Expr::Kind::String ||
+            k == nix::Expr::Kind::Path   ||
+            k == nix::Expr::Kind::Var    ||
+            k == nix::Expr::Kind::Pos) {
+            if (diag) std::fprintf(stderr, "v3 hook: short-circuit kind=%d\n", (int)k);
+            e->eval(state, state.baseEnv, v);
+            return;
+        }
     }
 
     static bool registered = (registerBuiltinPrimOps(), true);
@@ -99,6 +127,8 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     const CompilationUnit * cu = nullptr;
     if (it == cache.end()) {
         st.cacheMisses++;
+        if (diag) std::fprintf(stderr, "v3 hook: cache miss kind=%d\n",
+                               e ? (int)e->exprKind : -1);
         try {
             auto module = lowerNixExpr(e, state.symbols, state.positions);
             ir::computeFreeVars(module);
