@@ -675,6 +675,39 @@ plumbed only at the v3 eval hook (limited coverage).  Future work:
   - Add more remap walker test coverage (multi-CU sequences).
   - Then land the primImport integration.
 
+## 2026-04-30 — VM-4 cross-process disk cache fix
+
+Two bugs blocked cross-process cache hits.  Both fixed in
+`ac8a11ca9`; all 142 lang tests now pass with NIX_V3_DISK_CACHE=1
+both cold and warm.
+
+  1. The bytecode walker treated OP_WITH_LOOKUP as a
+     no-trailing-data opcode, but it has a 1-word `depth` follow-up.
+     The walker's ip cursor drifted by 1 after each OP_WITH_LOOKUP,
+     misparsing later opcodes as SymbolIds and silently corrupting
+     them.
+
+  2. OP_ATTRS_REC_INIT requires its (name, pos) trailing pairs to
+     be sorted by SymbolId — runtime fills b->entries[i] in that
+     order and Bindings::lookup binary-searches.  After remap, the
+     names were no longer in sorted order, so subsequent `with
+     <attrset>; <name>` lookups (concat, head, etc. in lib.nix)
+     binary-searched against an unsorted array and missed.
+
+     Fix: at deserialize time, after remap, re-sort the trailing
+     data and propagate an oldSlot→newSlot permutation to the
+     matching OP_ATTRS_REC_SET operands that follow within the
+     same emit.  Tracked via a small stack to handle nested
+     LetRecs.
+
+Also overwrites cu.symbolTable with the global symbol table after
+remap (so error messages and debug paths see the correct names),
+and hooks the disk cache into primImport (the natural integration
+point — direct access to source path + content).
+
+VM-4 status: **functionally complete and correctness-verified.**
+Repeat-invocation wins now end-to-end.
+
 ## 2026-04-29 — v3 robustness wins over tree-walker
 
 Spot-checked the 6 "silent-pass" eval-fail tests.  Most are
