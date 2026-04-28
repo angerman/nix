@@ -143,7 +143,21 @@ struct Lowerer
         size_t scopeIdx = scopes.size() - 1 - level;
         if (displ < scopes[scopeIdx].byDispl.size() &&
             scopes[scopeIdx].byDispl[displ] != ir::kInvalid)
-            return scopes[scopeIdx].byDispl[displ];
+        {
+            ir::VarId v = scopes[scopeIdx].byDispl[displ];
+            // CO-2 phase B: record (func, VarId -> level/displ) so the
+            // force hook can walk tree-walker's env to populate
+            // upvalues at force time.  Direct byDispl resolution only
+            // — synthesized VarIds (rec-attrset, inheritFrom,
+            // with-lookup) are intentionally skipped; Phase B only
+            // handles direct refs.  The level/displ are recorded
+            // relative to the CURRENT function's scope-stack — the
+            // function we're emitting bytecode into right now, which
+            // is what `funcStack.back()` points at.
+            ir::FuncId f = funcStack.empty() ? ir::FuncId{0} : funcStack.back();
+            m.varOrigins.push_back({f, v, level, displ});
+            return v;
+        }
         // Rec slot.
         if (scopes[scopeIdx].recAttrsVar != ir::kInvalid &&
             displ < scopes[scopeIdx].recAttrsNames.size())

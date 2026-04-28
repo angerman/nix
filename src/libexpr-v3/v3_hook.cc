@@ -36,6 +36,7 @@ namespace nix::v3 {
 // `Public` wrapper takes a nix::EvalState directly so we don't need
 // to construct a v3 EvalState here.
 nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
+Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
 
 // We don't expose treeWalkerToV3 here — the AST already carries
 // nix::Expr nodes, not nix::Value, so we lower the Expr directly.
@@ -67,6 +68,12 @@ struct SubExprCacheEntry {
     /// Cached number of upvalues the function expects.  Phase A only
     /// handles 0; Phase B (task #278) translates env -> upvalues.
     uint16_t                nUpvalues;
+    /// CO-2 phase B: for each upvalue (in `freeVars` order), the
+    /// (level, displ) into the tree-walker `Env` that supplies its
+    /// value.  Empty when nUpvalues == 0 (Phase A path) OR when one
+    /// or more freeVars couldn't be traced back to a direct env
+    /// reference (synthesized rec-attrset access, etc.).
+    std::vector<std::pair<uint32_t, uint32_t>> upvalueSources;
 };
 
 static std::unordered_map<const nix::Expr *, SubExprCacheEntry> & v3SubExprCache()
@@ -267,11 +274,41 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             // function becomes a force-time entry point; nUpvalues
             // is captured here so Phase A's upvalue-free fast path
             // can decide cheaply whether to take the cutover.
+            //
+            // CO-2 phase B: build per-(funcId, varId) origin lookup
+            // from the lower's recorded varOrigins; this lets us
+            // populate per-function upvalueSources arrays so the
+            // force hook can walk tree-walker's env at force time.
+            std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> originLookup;
+            for (auto & vo : module.varOrigins) {
+                uint64_t key = (static_cast<uint64_t>(vo.func) << 32) | vo.var;
+                originLookup.emplace(key, std::make_pair(vo.level, vo.displ));
+            }
             auto & subCache = v3SubExprCache();
             for (auto & sef : module.subExprFuncs) {
                 if (sef.funcIdx >= cu->lambdas.size()) continue;
+                if (sef.funcIdx >= module.functions.size()) continue;
+                SubExprCacheEntry entry{cu, sef.funcIdx,
+                    cu->lambdas[sef.funcIdx].nUpvalues, {}};
+                if (entry.nUpvalues > 0) {
+                    // Try to resolve every freeVar's origin; if any
+                    // freeVar lacks a direct (level, displ) source
+                    // (synthesized rec-attrset, with-lookup, etc.),
+                    // leave upvalueSources empty so the force hook
+                    // falls back to skippedNeedsUpvalues.
+                    auto & fvs = module.functions[sef.funcIdx].freeVars;
+                    bool ok = true;
+                    entry.upvalueSources.reserve(fvs.size());
+                    for (auto fv : fvs) {
+                        uint64_t key = (static_cast<uint64_t>(sef.funcIdx) << 32) | fv;
+                        auto oit = originLookup.find(key);
+                        if (oit == originLookup.end()) { ok = false; break; }
+                        entry.upvalueSources.push_back(oit->second);
+                    }
+                    if (!ok) entry.upvalueSources.clear();
+                }
                 subCache.emplace(static_cast<const nix::Expr *>(sef.astExpr),
-                    SubExprCacheEntry{cu, sef.funcIdx, cu->lambdas[sef.funcIdx].nUpvalues});
+                    std::move(entry));
             }
             cache.emplace(e, CachedUnit{std::move(compiled)});
         } catch (const std::exception & ex) {
@@ -376,7 +413,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 /// upvalues array at hook time.  Until that lands, freeVars-bearing
 /// entries are signalled via forceSkippedNeedsUpvalues.
 static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
-                          nix::Env & /*env*/, nix::Value & v)
+                          nix::Env & env, nix::Value & v)
 {
     // Gating: NIX_USE_V3 enables the eval hook (file-toplevel
     // cutover); the forceValue hook is additionally gated on
@@ -404,17 +441,49 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     // separate v3HookCache.
     const CompilationUnit * cu      = nullptr;
     ir::FuncId              funcIdx = 0;
+    std::vector<Value>      upvalues;
     auto & subCache = v3SubExprCache();
     auto sit = subCache.find(e);
     if (sit != subCache.end()) {
-        if (sit->second.nUpvalues != 0) {
-            // Phase B (task #278): build upvalues from env at force
-            // time.  Until that lands, skip non-closed thunks.
-            st.forceSkippedNeedsUpvalues++;
-            return false;
+        const auto & ent = sit->second;
+        if (ent.nUpvalues != 0) {
+            if (ent.upvalueSources.empty()) {
+                // Phase B can't handle this entry (synthesized rec/
+                // with/inheritFrom upvalues).  Skip.
+                st.forceSkippedNeedsUpvalues++;
+                return false;
+            }
+            // CO-2 phase B: walk tree-walker's env per upvalueSource
+            // to materialise the v3 upvalues array.
+            try {
+                upvalues.reserve(ent.nUpvalues);
+                for (auto [level, displ] : ent.upvalueSources) {
+                    nix::Env * cur = &env;
+                    for (uint32_t i = 0; i < level; ++i) {
+                        if (!cur || !cur->up) {
+                            st.forceSkippedNeedsUpvalues++;
+                            return false;
+                        }
+                        cur = cur->up;
+                    }
+                    if (!cur) {
+                        st.forceSkippedNeedsUpvalues++;
+                        return false;
+                    }
+                    nix::Value * srcV = cur->values[displ];
+                    if (!srcV) {
+                        st.forceSkippedNeedsUpvalues++;
+                        return false;
+                    }
+                    upvalues.push_back(treeWalkerToV3Public(state, *srcV));
+                }
+            } catch (const std::exception &) {
+                st.forceSkippedNeedsUpvalues++;
+                return false;
+            }
         }
-        cu      = sit->second.cu;
-        funcIdx = sit->second.funcIdx;
+        cu      = ent.cu;
+        funcIdx = ent.funcIdx;
     } else {
         auto & cache = v3HookCache();
         auto it = cache.find(e);
@@ -433,12 +502,19 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     setNixEvalState(&state);
     bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
     if (diag) std::fprintf(stderr,
-        "v3 force hook: CU hit fid=%u, running %zu insts / %zu lambdas\n",
-        funcIdx, cu->code.size(), cu->lambdas.size());
+        "v3 force hook: CU hit fid=%u nUp=%zu, running %zu insts / %zu lambdas\n",
+        funcIdx, upvalues.size(), cu->code.size(), cu->lambdas.size());
 
     Value r;
     try {
-        r = (funcIdx == 0) ? run(*cu) : runFunction(*cu, funcIdx);
+        if (!upvalues.empty()) {
+            r = runFunctionWithUpvalues(*cu, funcIdx,
+                upvalues.data(), static_cast<uint32_t>(upvalues.size()));
+        } else if (funcIdx == 0) {
+            r = run(*cu);
+        } else {
+            r = runFunction(*cu, funcIdx);
+        }
     } catch (const std::exception & ex) {
         if (diag) std::fprintf(stderr, "v3 force hook: run threw: %s\n", ex.what());
         return false;  // Fall back: tree-walker handles the rest.

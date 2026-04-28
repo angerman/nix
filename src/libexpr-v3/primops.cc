@@ -3577,6 +3577,22 @@ nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v)
     return v3ToTreeWalkerShim ? v3ToTreeWalkerShim(nixState, v) : nullptr;
 }
 
+/// Public bridge entry point for the tree-walker -> v3 direction.
+/// Used by the CO-2 phase B force hook to convert env values to
+/// v3 upvalues.  Forces nv to WHNF in tree-walker, then walks the
+/// resulting type tree to produce a v3 Value.
+Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv)
+{
+    static thread_local VMState bridgeShimVm;
+    bridgeShimVm.valueStack.reserve(64 * 1024);
+    bridgeShimVm.frames.reserve(4096);
+    bridgeShimVm.withStack.reserve(64);
+    EvalState st;
+    st.nixEvalState = &nixState;
+    st.vm           = &bridgeShimVm;
+    return treeWalkerToV3(st, nv);
+}
+
 void registerPrimOp(const PrimOp & op)
 {
     std::lock_guard<std::mutex> g(registryMutex());

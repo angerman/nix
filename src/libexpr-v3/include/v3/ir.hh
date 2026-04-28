@@ -346,6 +346,25 @@ struct SubExprEntry {
     FuncId       funcIdx;
 };
 
+/// CO-2 phase B: per-VarId origin recorded at lower time when an
+/// ExprVar resolves to an outer-scope binding via the direct
+/// `byDispl` path.  Used at force time to reconstruct upvalues
+/// from tree-walker's `Env`: walk env up `level` parents and read
+/// `values[displ]`.  Synthesized VarIds (rec-attrset access,
+/// inheritFrom, with-lookup) are NOT recorded — Phase B skips
+/// functions whose freeVars include unrecorded VarIds.
+///
+/// `level` and `displ` are relative to the SCOPE of the function
+/// they were recorded in (`func`).  The same VarId referenced from
+/// different functions may have different (level, displ) values,
+/// so we key by (func, var) rather than var alone.
+struct VarOrigin {
+    FuncId   func;
+    VarId    var;
+    uint32_t level;
+    uint32_t displ;
+};
+
 struct Module {
     /// All blocks; blocks[0] is unused (kInvalidBlock sentinel).
     std::vector<Block> blocks;
@@ -362,6 +381,12 @@ struct Module {
     /// Consumed by the post-compile cache populator (CO-3) to wire
     /// up the forceValue cutover.
     std::vector<SubExprEntry> subExprFuncs;
+
+    /// CO-2 phase B: origin map populated by `resolveVar` whenever an
+    /// ExprVar takes the direct (byDispl) path.  Multiple references
+    /// to the same VarId may produce duplicate entries; the post-pass
+    /// dedupes by keeping only one per (VarId).
+    std::vector<VarOrigin> varOrigins;
 
     VarId   nextVar   = 1;
     BlockId nextBlock = 1;

@@ -1698,7 +1698,7 @@ Value runFunction(const CompilationUnit & cu, uint32_t funcIdx)
         throw std::runtime_error("v3 runFunction: funcIdx out of range");
     const auto & desc = cu.lambdas[funcIdx];
     if (desc.nUpvalues != 0)
-        throw std::runtime_error("v3 runFunction: function expects upvalues; Phase B not yet implemented");
+        throw std::runtime_error("v3 runFunction: function expects upvalues; use runFunctionWithUpvalues");
 
     VMState vm;
     vm.valueStack.reserve(64 * 1024);
@@ -1708,6 +1708,48 @@ Value runFunction(const CompilationUnit & cu, uint32_t funcIdx)
     vm.frames.push_back(CallFrame{
         .cu = &cu,
         .closure = nullptr,
+        .thunk = nullptr,
+        .ip = desc.codeOffset,
+        .stackBaseOffset = 0,
+        .withStackBase = 0,
+        .flags = 0,
+    });
+
+    vm.valueStack.resize(desc.nLocals);
+
+    return dispatchLoop(vm, /*exitDepth=*/0);
+}
+
+/// CO-2 phase B: run a per-thunk Function with caller-provided
+/// upvalues.  The forceValue cutover walks tree-walker's Env to
+/// collect upvalue values, then calls here.  We synthesize a
+/// Closure on the heap (allocated via Boehm GC; lives as long as
+/// the call's frame), point the frame's closure to it, and run.
+Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
+                               const Value * upvalues, uint32_t nUpvalues)
+{
+    if (funcIdx >= cu.lambdas.size())
+        throw std::runtime_error("v3 runFunctionWithUpvalues: funcIdx out of range");
+    const auto & desc = cu.lambdas[funcIdx];
+    if (desc.nUpvalues != nUpvalues)
+        throw std::runtime_error("v3 runFunctionWithUpvalues: nUpvalues mismatch");
+
+    Closure * fakeClo = Alloc::allocClosure(nUpvalues);
+    fakeClo->desc = &desc;
+    fakeClo->cu   = &cu;
+    fakeClo->capturedWiths = nullptr;
+    fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
+    for (uint32_t i = 0; i < nUpvalues; ++i)
+        fakeClo->upvalues[i] = upvalues[i];
+
+    VMState vm;
+    vm.valueStack.reserve(64 * 1024);
+    vm.frames.reserve(4096);
+    vm.withStack.reserve(64);
+
+    vm.frames.push_back(CallFrame{
+        .cu = &cu,
+        .closure = fakeClo,
         .thunk = nullptr,
         .ip = desc.codeOffset,
         .stackBaseOffset = 0,
