@@ -47,38 +47,45 @@ it provides a strong symbol reference so macOS's
 
 Real-world behaviour today (single-invocation runs):
 
-  - **fib30**: v3 cutover at 0.36s user, slightly faster than
-    tree-walker's 0.37s.
-  - **`(import <nixpkgs> {}).hello.name`**: v3 cutover at 0.29s user,
-    tree-walker at 0.24s.  v3 is ~20% slower on this real-world
-    workload.
+  - **fib30**: v3 cutover at 0.37s user, slight win over
+    tree-walker's 0.38s.
+  - **`(import <nixpkgs> {}).hello.name`**: v3 cutover at 0.25s user,
+    tree-walker at 0.25s — **parity**.
+  - **`attrNames pkgs.haskellPackages` count**: v3 0.45s vs
+    tree-walker 0.45s — parity.
 
-What's happening:
+How parity was reached:
 
-  - The v3 hook fires per-file-imported (via tree-walker's
-    `evalFile` calling `state.eval`).  On hello.name, that's ~21
-    distinct file-level Exprs going through v3 (`Let`, `Attrs`,
-    `Select`).  Each lower+compile+run pays ~2.4 ms.
-  - Most other Expr kinds (Lambda, Int, Float, String, Path, Var,
-    Pos) short-circuit through to tree-walker because v3's overhead
-    exceeds the benefit on these.
-  - The per-Expr* cache currently never hits within a single
-    invocation — each `state.eval` call from tree-walker arrives
-    with a unique Expr*.  Sub-Expr forces go through tree-walker's
-    `forceValue` → `expr->eval` directly, bypassing the cache.
+  - **Static short-circuits** route Expr kinds where v3's
+    lower+compile+run cycle is net-negative versus tree-walker
+    directly to tree-walker.  Currently short-circuited:
+      * Literals (Int / Float / String / Path / Bool-singleton)
+      * Var, Pos
+      * Lambda (would return Closure → bridge can't hand back)
+      * Attrs, List (file-toplevel; tree-walker constructs lazy
+        thunks faster than v3's eager eval + recursive bridge)
+  - **`willReturnClosure` predicate** walks the AST through Let /
+    With / Assert / If-with-both-Lambda-branches and short-circuits
+    when the result is statically a closure.
 
-Set `NIX_VM_STATS=1` to see hook invocation counts:
+Per-phase profile (V3_TIMING=1, hello.name):
 
-    NIX_VM_STATS=1 NIX_USE_V3=1 nix-instantiate --eval --strict --expr '...'
+    v3 hook timing (ms):  lower=2.9  compile=0.43  run=0.08  bridge=0.002
 
-Output ends with `v3 hook stats: evalEntries=N cacheHits=H cacheMisses=M`.
+(Was 21.8 ms total before the short-circuits landed.)
 
-The remaining wins live in CO-2 / CO-3 from
-`OPTIMIZATION_PLAN.md`: hooking `forceValue` to consult the v3
-cache for sub-Expr forces and pre-populating the cache for sub-Exprs
-at lower time.  This is genuinely the 3-5 week piece of work and
-would route most of nixpkgs evaluation through v3 instead of just
-the file-toplevels.
+Set `NIX_VM_STATS=1` to see hook invocation counts; `V3_TIMING=1`
+adds per-phase timing (lower / compile / run / bridge):
+
+    NIX_VM_STATS=1 V3_TIMING=1 NIX_USE_V3=1 nix eval --json --expr '...'
+
+The remaining wins for cases where v3 *should* dominate (fib-style
+recursive compute) live in CO-2 / CO-3 from `OPTIMIZATION_PLAN.md`:
+hooking `forceValue` to consult the v3 cache for sub-Expr forces
+and pre-populating the cache for sub-Exprs at lower time.  This is
+the 3-5 week piece of work; once it lands, v3 would amortize
+lower+compile across many forces of the same Expr instead of
+re-doing the work per file-toplevel.
 
 ## What the lowerer supports
 
