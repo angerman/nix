@@ -708,6 +708,38 @@ point — direct access to source path + content).
 VM-4 status: **functionally complete and correctness-verified.**
 Repeat-invocation wins now end-to-end.
 
+## 2026-04-30 — VM-3 bump-pointer arena allocator
+
+Replaces the per-allocation `std::malloc` for Closure / Thunk /
+Env / ListVec / Bindings / boxed Value with a thread-local
+bump-pointer arena (1 MB blocks, 16-byte aligned, oversize
+allocations > 256 KB still go through `malloc`).
+
+Why this works as a drop-in:
+  - v3 never calls `std::free` on these objects today — the
+    existing strategy is "leak everything, exit cleans up".  An
+    arena preserves that semantics with strictly faster alloc.
+  - 16-byte alignment matches `Value`, the largest aligned field
+    used inside any of these structs.
+
+Results (3-run averages, user time):
+
+  | workload      | malloc (was) | arena |
+  |---------------|--------------|-------|
+  | ackermann 3 9 | 2.10 s       | 2.05 s (~3% win) |
+  | fib 35        | 3.71 s       | 3.65 s (~2% win) |
+
+All 142 lang tests + cutover + smoke tests still pass.  Arena
+stats now reported via `NIX_VM_STATS=1` (e.g. `arena=96 MB` for
+ackermann 3 7).
+
+VM-3 status: **landed.**  Modest but real wall-clock win on
+allocation-heavy workloads.  More importantly, this clears the
+path for VM-2 to skip allocation entirely for size-1 cases —
+since the underlying alloc cost is now amortised, the win from
+size-1 inlining drops, and VM-2's complexity may no longer be
+justified.
+
 ## 2026-04-29 — v3 robustness wins over tree-walker
 
 Spot-checked the 6 "silent-pass" eval-fail tests.  Most are

@@ -537,12 +537,13 @@ int main(int argc, char ** argv)
             nix::v3::dumpPrimOpStats(stderr);
             auto & a = nix::v3::allocStats();
             std::fprintf(stderr,
-                "v3 alloc stats: closures=%llu thunks=%llu lists=%llu attrsets=%llu envs=%llu\n",
+                "v3 alloc stats: closures=%llu thunks=%llu lists=%llu attrsets=%llu envs=%llu arena=%llu MB\n",
                 (unsigned long long)a.closuresAllocated,
                 (unsigned long long)a.thunksAllocated,
                 (unsigned long long)a.listsAllocated,
                 (unsigned long long)a.attrsetsAllocated,
-                (unsigned long long)a.envsAllocated);
+                (unsigned long long)a.envsAllocated,
+                (unsigned long long)(nix::v3::threadArena().bytesAllocated() >> 20));
             // Bindings size histogram — informs VM-2 polymorphic
             // Bindings sizing.  Buckets:
             //  0=empty, 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-128, 129+.

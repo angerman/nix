@@ -113,6 +113,84 @@ inline AllocStats & allocStats()
 }
 
 // ---------------------------------------------------------------------------
+// VM-3: bump-pointer arena allocator.
+//
+// All v3 runtime allocations (Bindings, Closure, Thunk, Env, ListVec,
+// boxed Value) live for the entire process — `std::free` is never
+// called on them — so per-allocation `malloc` is wasted work.  An
+// 8 MB bump-pointer block, refilled on exhaustion, replaces it:
+//   - amortised cost per allocation: 1 add + 1 compare + 1 store
+//     (vs `malloc`'s lock + free-list walk + size class branch)
+//   - tighter spatial locality: consecutive allocations end up
+//     adjacent in memory
+//   - oversized requests (> 1 MB) fall through to `malloc` so we
+//     don't waste a fresh block on a single huge object
+//
+// Alignment: every allocation is 16-byte aligned (matches the
+// largest field used inside the v3 runtime — `Value` is 16 B).
+//
+// Lifetime: the arena is per-thread (v3 is single-threaded) and
+// blocks are released only at thread/process exit; we deliberately
+// do NOT free individual objects.  This matches the existing
+// `malloc`-and-leak strategy.
+// ---------------------------------------------------------------------------
+
+class Arena
+{
+public:
+    /// 1 MB blocks: large enough that a single block holds many
+    /// thousands of typical allocations, small enough that a
+    /// long-running eval doesn't hold onto huge unused tails.
+    static constexpr size_t kBlockSize = 1 << 20;
+    /// Direct-`malloc` cutoff.  Anything bigger gets its own
+    /// allocation rather than pinning down the rest of a fresh
+    /// block.
+    static constexpr size_t kHugeCutoff = kBlockSize / 4;
+
+    void * alloc(size_t bytes) noexcept
+    {
+        // 16-byte align the request.
+        bytes = (bytes + 15) & ~size_t{15};
+        if (bytes > kHugeCutoff) {
+            // Oversized: fall back to malloc (still leaks at exit;
+            // we don't track the pointer for now).
+            return std::malloc(bytes);
+        }
+        if (cur + bytes > end) refill();
+        void * p = cur;
+        cur += bytes;
+        return p;
+    }
+
+    /// Total bytes pinned by all blocks the arena has ever
+    /// allocated.  Cheap to read; useful for the alloc-stats dump.
+    size_t bytesAllocated() const noexcept { return totalBytes; }
+
+private:
+    char *  cur        = nullptr;
+    char *  end        = nullptr;
+    /// Owning blocks; never freed in normal operation (they live
+    /// for the lifetime of the thread).
+    std::vector<char *> blocks;
+    size_t  totalBytes = 0;
+
+    void refill() noexcept
+    {
+        char * blk = static_cast<char *>(std::malloc(kBlockSize));
+        blocks.push_back(blk);
+        cur = blk;
+        end = blk + kBlockSize;
+        totalBytes += kBlockSize;
+    }
+};
+
+inline Arena & threadArena() noexcept
+{
+    thread_local Arena a;
+    return a;
+}
+
+// ---------------------------------------------------------------------------
 // Allocator surface
 // ---------------------------------------------------------------------------
 
@@ -120,13 +198,13 @@ struct Alloc
 {
     static Value * allocValue() noexcept
     {
-        return static_cast<Value *>(std::malloc(sizeof(Value)));
+        return static_cast<Value *>(threadArena().alloc(sizeof(Value)));
     }
 
     static Closure * allocClosure(uint16_t nUpvalues) noexcept
     {
         const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
-        auto * c = static_cast<Closure *>(std::malloc(bytes));
+        auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
         c->capturedWiths = nullptr;
@@ -139,7 +217,7 @@ struct Alloc
     static Thunk * allocThunkSuspended(uint16_t nUpvalues) noexcept
     {
         const size_t bytes = sizeof(Thunk) + sizeof(Value) * nUpvalues;
-        auto * t = static_cast<Thunk *>(std::malloc(bytes));
+        auto * t = static_cast<Thunk *>(threadArena().alloc(bytes));
         t->state = ThunkState::Suspended;
         t->nUpvalues = nUpvalues;
         t->suspended.capturedWiths = nullptr;
@@ -150,7 +228,7 @@ struct Alloc
     static Env * allocEnv(uint16_t nValues) noexcept
     {
         const size_t bytes = sizeof(Env) + sizeof(Value) * nValues;
-        auto * e = static_cast<Env *>(std::malloc(bytes));
+        auto * e = static_cast<Env *>(threadArena().alloc(bytes));
         e->parent = nullptr;
         e->isWithEnv = false;
         e->nValues = nValues;
@@ -160,7 +238,7 @@ struct Alloc
     static ListVec * allocList(uint32_t n) noexcept
     {
         const size_t bytes = sizeof(ListVec) + sizeof(Value) * n;
-        auto * l = static_cast<ListVec *>(std::malloc(bytes));
+        auto * l = static_cast<ListVec *>(threadArena().alloc(bytes));
         l->size = n;
         return l;
     }
@@ -168,7 +246,7 @@ struct Alloc
     static Bindings * allocBindings(uint32_t n) noexcept
     {
         const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * n;
-        auto * b = static_cast<Bindings *>(std::malloc(bytes));
+        auto * b = static_cast<Bindings *>(threadArena().alloc(bytes));
         b->size = n;
         // Track size distribution for VM-2 sizing decisions.  Cheap
         // (one branch + one increment) — runs once per attrset.
