@@ -47,6 +47,7 @@ lib_sources = files(
   'primops.cc',
   'lower.cc',
   'serialize.cc',
+  'disk_cache.cc',
   'v3_hook.cc',
 )
 
@@ -81,6 +82,7 @@ install_headers(
     'include/v3/closure.hh',
     'include/v3/install.hh',
     'include/v3/ir.hh',
+    'include/v3/disk_cache.hh',
     'include/v3/lower.hh',
     'include/v3/primop.hh',
     'include/v3/serialize.hh',
