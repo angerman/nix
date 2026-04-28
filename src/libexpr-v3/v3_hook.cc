@@ -202,7 +202,13 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         return true;
     }();
     (void)atexitDone;
-    bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
+    // Cache the V3_DEBUG_HOOK env var lookup at first call: getenv()
+    // is not free on all libc implementations (involves a string
+    // compare against the env table per call).  At ~70 us per call
+    // on macOS, the per-call cost would be ~18 ms across the 255
+    // hook entries hello.name triggers — same magnitude as the
+    // residual cutover regression.  Convert to a static.
+    static const bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
     if (diag) std::fprintf(stderr, "v3 hook[%llu]: enter e=%p\n",
                            (unsigned long long)st.evalEntries, (void*)e);
 
@@ -528,7 +534,9 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     }
 
     setNixEvalState(&state);
-    bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
+    // Cache the V3_DEBUG_HOOK env lookup — getenv() in a hot loop is
+    // expensive on some libcs.
+    static const bool diag = std::getenv("V3_DEBUG_HOOK") != nullptr;
     if (diag) std::fprintf(stderr,
         "v3 force hook: CU hit fid=%u nUp=%zu, running %zu insts / %zu lambdas\n",
         funcIdx, upvalues.size(), cu->code.size(), cu->lambdas.size());
