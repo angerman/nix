@@ -57,6 +57,7 @@
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/derived-path.hh"
+#include "nix/store/globals.hh"
 
 namespace nix::v3 {
 
@@ -496,6 +497,8 @@ void primFilter(EvalState & state, Value * args, Value & out)
     kept.reserve(src->size);
     for (uint32_t i = 0; i < src->size; ++i) {
         Value r = callClosure(*state.vm, pred, src->elems[i]);
+        // Predicate result may be a thunk / app — force to WHNF.
+        r = forceValue(*state.vm, r);
         if (!r.isBool()) typeError("filter", "predicate returning bool");
         if (r.payload.i == 1) kept.push_back(src->elems[i]);
     }
@@ -548,6 +551,7 @@ void primAll(EvalState & state, Value * args, Value & out)
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
             Value r = callClosure(*state.vm, pred, src->elems[i]);
+            r = forceValue(*state.vm, r);
             if (!r.isBool()) typeError("all", "bool from predicate");
             if (r.payload.i == 0) { all = false; break; }
         }
@@ -564,6 +568,7 @@ void primAny(EvalState & state, Value * args, Value & out)
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
             Value r = callClosure(*state.vm, pred, src->elems[i]);
+            r = forceValue(*state.vm, r);
             if (!r.isBool()) typeError("any", "bool from predicate");
             if (r.payload.i == 1) { any = true; break; }
         }
@@ -673,6 +678,9 @@ void primPartition(EvalState & state, Value * args, Value & out)
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
             Value r = callClosure(*state.vm, pred, src->elems[i]);
+            // The predicate may return a thunk / app / closure-eval-
+            // pending value — force it to WHNF before the bool check.
+            r = forceValue(*state.vm, r);
             if (!r.isBool()) typeError("partition", "predicate returning bool");
             if (r.payload.i == 1) right_.push_back(src->elems[i]);
             else                  wrong_.push_back(src->elems[i]);
@@ -1844,7 +1852,13 @@ void primCurrentTime(EvalState &, Value *, Value & out)
 
 void primNixVersion(EvalState &, Value *, Value & out)
 {
-    out = mkStringValueOwned("v3-0.1");
+    // Match tree-walker's nixVersion (PACKAGE_VERSION).  nixpkgs/lib/
+    // minfeatures.nix uses `compareVersions "2.18" builtins.nixVersion`
+    // to decide whether to abort, so we need to surface the same
+    // version string the tree-walker would.  Returning "v3-0.1"
+    // (the previous v3 marker) caused nixpkgs to claim Nix 2.35 was
+    // too old.
+    out = mkStringValueOwned(nix::nixVersion.c_str());
 }
 
 /// builtins.readFile path -> string contents.
