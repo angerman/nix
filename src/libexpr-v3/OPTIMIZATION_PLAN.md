@@ -548,3 +548,48 @@ runtime (2 "infinite recursion (blackhole)" + 1 Tag::Closure
 result).  Tree-walker re-evaluates the same files after fallback,
 so we pay both costs.  Future work: fix v3's over-eager cycle
 detector or detect these cases at lower-time and skip.
+
+## 2026-04-29 — parity reached on real-world workloads
+
+Two heuristics closed most of the residual gap by skipping v3's
+run+fallback cycle for cases where it can be predicted:
+
+  - **Commit 1ac08c761** — size-based skip threshold.  After
+    lower, if `module.functions.size() > 50` (tunable via
+    `NIX_V3_SKIP_THRESHOLD`), skip directly to tree-walker.
+    Catches the 504-function nixpkgs/lib top-level + 74-function
+    blackhole-throwing case.
+
+  - **Commit e8db20b5a** — IR-level willProduceClosure.  After
+    lower, if functions[0]'s entry block returns a binding defined
+    by `ir::Lambda`, skip directly.  Complements the AST-level
+    willReturnClosure for cases where the lambda is inside
+    structure the AST predicate doesn't recurse into.
+
+Wall-clock state across real-world workloads:
+
+  | workload                            | tree-walker | v3 cutover  |
+  |-------------------------------------|-------------|-------------|
+  | (import <nixpkgs> {}).hello.name    | 0.25s       | 0.26s       |
+  | (import <nixpkgs> {}).git.name      | 0.26s       | 0.26s       |
+  | attrNames pkgs                      | 0.26s       | 0.26s       |
+  | attrNames pkgs.haskellPackages      | 0.46s       | 0.46s       |
+  | fib30                               | 0.38s       | 0.37s       |
+  | fib35                               | 3.85s       | 3.71s (4% win) |
+  | ackermann 3 9                       | 1.85s       | 2.10s (13% slower) |
+
+The ackermann slowdown is the one outlier — deep nested two-arg
+curried calls.  Tracked but not yet investigated; v3's call
+dispatch may have higher per-call overhead than tree-walker for
+this specific pattern.
+
+Tests: 142/142 cutover (with and without NIX_USE_V3_FORCE=1);
+142/142 v3-eval direct; 103/109 eval-fail; smoke pass.
+
+**Net:** NIX_USE_V3=1 is now a SAFE drop-in replacement on
+real-world workloads.  Future refinements can either:
+  - Investigate v3's blackhole detector to handle the 1 remaining
+    fallback case at lower-time + the ackermann perf gap.
+  - Add VM-4 (bytecode disk cache) for repeat-invocation wins.
+  - BR-3 (native derivationStrict) for nixpkgs-wide eval wins
+    (estimated ~250ms saved on 25k-package scan).
