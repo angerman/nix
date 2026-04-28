@@ -578,10 +578,34 @@ Wall-clock state across real-world workloads:
   | fib35                               | 3.85s       | 3.71s (4% win) |
   | ackermann 3 9                       | 1.85s       | 2.10s (13% slower) |
 
-The ackermann slowdown is the one outlier — deep nested two-arg
-curried calls.  Tracked but not yet investigated; v3's call
-dispatch may have higher per-call overhead than tree-walker for
-this specific pattern.
+The ackermann slowdown is the one outlier.  Investigation:
+
+  - v3 alloc stats: closures=11M, thunks=5.5M for ackermann 3 9.
+  - fib35 alloc stats: closures=1, thunks=1.
+  - Curried `m: n: body` patterns allocate 2 closures per logical
+    call: one for `ack m` partial app, one for the inner
+    `ack (m-1)` in the body's third case.
+
+Root cause: v3's closure model copies upvalues (`Closure { desc,
+cu, capturedWiths, upvalues[] }`) on every MAKE_CLOSURE.
+Tree-walker's `mkLambda(&env, this)` just stores a pointer to the
+existing env — zero allocation per lambda evaluation.  This is a
+fundamental architectural tradeoff (flat-upvalue cache locality vs
+shared-env zero-alloc-per-eval) baked into v3's design.
+
+Tested fixes that didn't help:
+  - Thread-local bump arena: ackermann unchanged (malloc was not
+    the bottleneck — it's the per-closure setup cost).
+  - GC_MALLOC instead of malloc: REGRESSED to 3.17 s (Boehm GC's
+    mark/sweep overhead dominates at this allocation density).
+
+Closing the gap would require either:
+  - A "ref to enclosing closure's upvalues" mode for closures
+    that don't escape (escape analysis at lower time).
+  - Switching to env-carrier-style closures (re-use existing
+    envs as upvalue source).
+
+Both are architectural-level changes; tracked as future work.
 
 Tests: 142/142 cutover (with and without NIX_USE_V3_FORCE=1);
 142/142 v3-eval direct; 103/109 eval-fail; smoke pass.
