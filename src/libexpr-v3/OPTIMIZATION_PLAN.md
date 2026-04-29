@@ -2231,6 +2231,60 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-29 — WC-24 BR-style native-primop audit (mostly already done)
+
+After WC-23 confirmed the force hook can't easily land, audited the
+BR-style direction (the BR-3 / BR-4 pattern: native v3 implementation
+of hot tree-walker primops).
+
+Per-primop call counts on attr-hask (`NIX_COUNT_CALLS=1`):
+
+```
+  rank  calls    primop          v3-native?  avg-work    bridge-helps?
+   1    52167  elemAt           YES         1 index     NO (bridge ≫ work)
+   2    30495  map              YES         N closure   NO (closure dominates)
+   3    29509  length           YES         1 read      NO
+   4    24671  elem             YES         N equality  NO
+   5    22694  genList          YES         N closure   NO
+   6    18349  isAttrs          YES         1 typecheck NO
+   7     9519  attrNames        YES         sorted iter MAYBE (tiny)
+   8     9441  concatMap        YES         N closure   NO
+   9     7928  filter           YES         N closure   NO
+  10     7747  concatLists      YES         list iter   NO
+  11     7659  foldl'           YES         N closure   NO
+  12     7317  removeAttrs      YES         filter      MAYBE (tiny)
+  13     6418  listToAttrs      YES         N inserts   MAYBE
+  ...
+  14     1933  derivationStrict YES (BR-3)  heavy IO    DONE
+  15     1409  import           YES (WC-4)  heavy parse DONE
+  16       41  builtins.path    YES (BR-4)  NAR hash    DONE
+```
+
+Every hot primop already has a native v3 implementation in
+src/libexpr-v3/primops.cc.  Calling them from tree-walker via a
+bridge would NOT win on any of the un-DONE rows because:
+
+  - **Light primops** (elemAt, length, isAttrs at 18-52 k calls
+    each): tree-walker's existing impl is one machine
+    instruction; converting nix::Value → v3 Value → run → convert
+    back is ≫ that.  Net loss.
+  - **Closure-dominated primops** (map, filter, foldl', concatMap,
+    genList — top of the list): the wall-clock cost is N tree-
+    walker `callFunction` invocations.  v3's native version still
+    has to call the same closure, either by bridging back to tree-
+    walker (no win) or by keeping the closure in v3 representation
+    (only possible with the broken force hook).
+  - **Iteration-dominated primops** (concatLists, attrNames,
+    foldl'): no v3 algorithmic advantage; v3 and tree-walker do
+    the same C++ work on the same value-graph shapes.
+
+**Conclusion**: BR-style work has no meaningful low-hanging fruit
+beyond what already shipped (BR-3, BR-4, WC-4).  v3 stays at parity
+with tree-walker on real workloads; the architectural cap is the
+force hook (WC-14.7, blocked on the eval-order divergence pinned
+by WC-23) or a fundamentally different bridge model where v3 owns
+the value graph.
+
 ## 2026-04-29 — WC-23 force-hook InfiniteRecursionError verification
 
 Two parallel research agents disagreed on whether the cycle was
