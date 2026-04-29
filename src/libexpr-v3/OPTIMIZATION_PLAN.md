@@ -2231,6 +2231,77 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-29 — Eval-order divergence design analysis (3-agent + critical review)
+
+### Why does v3 still bridge to tree-walker at all?
+
+It doesn't NEED to.  v3 has 110 native primops, its own bytecode VM,
+its own value graph, its own SymbolId interner, its own arena
+allocator (WC-13 GC-rooted).  The hook architecture was a pragmatic
+incremental decision — it minimised the LOC needed to get v3
+running.  The cost is structural: two evaluators sharing a value
+graph create eval-order ambiguity that no hook-level fix has
+fully eliminated (every WC-* problem since WC-6 is a bridge
+problem, not a v3 problem).
+
+### Three agents, three angles
+
+  - **Agent A (lazy upvalues)** — defer treeWalkerToV3 force in the
+    force hook; resolve at OP_GET_UPVALUE time.  Self-skeptical
+    conclusion: the v3 body WILL force the upvalue at OP_UPDATE
+    regardless; the cycle is in the value-graph at a specific
+    frame-stack shape, not at a specific time.  Lazy upvalues
+    postpone but probably don't eliminate.  Recommends a 4-hour
+    experimental gate (V3_DEFER_UPVALUE=1) to falsify before
+    investing.
+  - **Agent B (v3 owns the world)** — invert ownership.  v3 becomes
+    the entry dispatcher; tree-walker becomes a fallback service.
+    Maps every bridge boundary B1-B12.  Argues this deletes
+    ~2000 LOC of bridge code AND the entire WC-12..23 class of
+    bugs.  Sequence: B2 (auto-args, 1d) → B12 (port primops, 1w
+    optimistic / 2-3w realistic) → B1 (parser linkage, 3d) →
+    B5-9 deletion (1w).  Realistic total 6-10 weeks.
+  - **Agent C (tree-walker re-entrance detection)** — argues
+    AGAINST its own brief.  At the eval-inline layer, we've lost
+    the information distinguishing "v3 induced premature force"
+    from `let x = x; in x`.  Any TLS-stack discriminator masks
+    real cycles whenever v3 is on the stack.  Recommends instead
+    a 5-line upstream fix in v3_hook.cc:1090 — bail when an
+    upvalue source is a self/sibling rec-binding.
+
+### Critical review
+
+A and C converge on the same upstream fix in different framings:
+"don't eagerly force upvalues that tree-walker would defer".  B's
+inversion is the principled long-term answer.  A's experiment is
+the cheapest decisive test (4 hours).  C's footnote is a 5-line
+near-term unblocker worth trying.
+
+### Plan: cheap-first, then big-bet
+
+Run WC-25 (V3_DEFER_UPVALUE) and WC-26 (rec-binding bail-out)
+first.  Each is bounded to ≤1 day.  If either resolves WC-23,
+ship and stop.  If both fail, WC-23 is genuinely structural and
+we commit to WC-27/28/29/30 (the inversion).
+
+Realistic timelines:
+
+| phase | task    | scope                                      | days |
+|-------|---------|--------------------------------------------|------|
+| 1     | WC-25   | V3_DEFER_UPVALUE Bridge-thunk experiment   | 0.5  |
+| 1     | WC-26   | self/sibling rec-binding bail-out          | 1    |
+| 2a    | WC-27   | native auto-args (kills WC-21 fallback)    | 1-2  |
+| 2b    | WC-28   | port 13 missing primops (fetch* dominant)  | 10-15|
+| 2c    | WC-29   | extract parser/bindVars from libnixexpr    | 3    |
+| 2d    | WC-30   | invert eval entry point, delete bridge     | 5-10 |
+
+If Phase 1 succeeds: 1.5 days work, ship.
+
+If Phase 1 fails: 22-32 days for full inversion, but eliminates
+the entire WC-12..23 cycle class permanently.  (Note: this is
+~5× the 6-day Agent B estimate — fetch primops + EvalState
+ownership inversion are non-trivial.  Be honest in planning.)
+
 ## 2026-04-29 — WC-24 BR-style native-primop audit (mostly already done)
 
 After WC-23 confirmed the force hook can't easily land, audited the
