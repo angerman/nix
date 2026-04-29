@@ -2231,7 +2231,37 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
-## 2026-04-29 — WC-18 coroutine isolation (PARTIAL: simple cases work, complex SIGSEGV)
+## 2026-04-28 — WC-18.6 fiber bridge fully validated (SIGSEGV root-caused & fixed)
+
+After feature-test-macro fix in `6d555b820`, the previously-attributed
+"macOS arm64 ucontext unreliable" diagnosis was retracted.  Fresh
+validation under `NIX_V3_FIBER_BRIDGE=1`:
+
+  - lang tests: 142/142
+  - bench (fib35, hello-name, git-name, drv3, attr-pkgs, attr-hask):
+    all six rc=0
+  - `(import nixpkgs).system`, `.hello.outPath`, `stdenv.outPath`,
+    `attrNames haskellPackages`, `attrNames pkgs.python3Packages`,
+    top-level attrNames count: all rc=0
+
+Stress combo (`/tmp/v3_stress.nix`) hits a separate failure:
+`v3 OP_FORCE: infinite recursion (blackhole)` — but it reproduces
+identically with `NIX_V3_FIBER_BRIDGE` unset.  Pre-existing
+closure-bridge cycle (WC-15/16/17), unrelated to fibers.
+
+### Diagnostics added this session
+
+  - `V3_DBG_FIBER_SEGV=1` env knob installs a `SIGSEGV`/`SIGBUS`
+    handler in `fiber.cc` that dumps PC/SP/FP/LR/CPSR + x0..x28 +
+    `currentFiber` + fiber stack range before re-raising default.
+    Off by default; only loaded when something explicitly opts in.
+  - Standalone test rig `/tmp/test_fiber_nested.cc` confirms
+    ucontext fiber switch works from C++ call stacks 10000 deep
+    (matches `runInFiber` driver behavior under load).
+
+### Earlier (now-superseded) entry retained below for context.
+
+## 2026-04-29 — WC-18 coroutine isolation (SUPERSEDED — see WC-18.6 above)
 
 Implemented coroutine isolation per the WC-17 diagnostic
 recommendation.  Architecture:

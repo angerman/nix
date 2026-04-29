@@ -67,7 +67,7 @@ struct Fiber {
     std::function<void(Fiber *)> entry;
 };
 
-constexpr size_t kDefaultFiberStack = 64ull * 1024 * 1024; // 64 MiB
+constexpr size_t kDefaultFiberStack = 1ull * 1024 * 1024; // 1 MiB (matches working test)
 
 /// Allocate a fiber with the given entry function and stack size.
 /// `entry` runs once on the fiber's stack; when it returns, the

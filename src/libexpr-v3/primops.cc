@@ -2095,19 +2095,18 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     // WC-18.3: run the v3 closure body in a fiber.  treeWalkerToV3
     // and forceBridgeThunk yield to the driver for tree-walker forces,
     // so the v3 dispatcher's call depth is bounded by the fiber's
-    // 64 MB stack rather than the caller's pthread stack.
+    // own stack rather than the caller's pthread stack.
     // Gated via NIX_V3_FIBER_BRIDGE=1 — opt-in until validated.
     // ALSO: avoid nested fibers — when we're already in a fiber
     // (re-entrant bridge call from inside v3 evaluation), fall back
-    // to direct call.  Nesting ucontext fibers on macOS arm64 has
-    // proven unreliable.
+    // to direct call to keep the driver protocol simple.
     static const bool useFiber =
         std::getenv("NIX_V3_FIBER_BRIDGE") != nullptr;
     Value fn;
     if (useFiber && activeFiberDriverDepth == 0) {
         fn = runInFiber(ns, [&](Mailbox * /*mb*/) -> Value {
             // Each fiber gets its own VMState (isolation on top of
-            // stack isolation).  Allocated on the fiber's 16MB stack.
+            // stack isolation).  Allocated on the fiber's stack.
             VMState fiberVm;
             fiberVm.valueStack.reserve(64 * 1024);
             fiberVm.frames.reserve(4096);
