@@ -837,17 +837,39 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     case Tag::Closure:
     case Tag::PrimOp:
     case Tag::PrimOpApp: {
-        // WC-6: an experimental bridge that wrapped Closure results
-        // as a tree-walker PrimOpApp(__v3_call_bridge_1, handle)
-        // worked at type-level but caused a regression on real
-        // nixpkgs probes — v3 thunks left in Black state between
-        // hook entries cascaded into "OP_FORCE: infinite recursion
-        // (blackhole)" once the bridge re-entered v3 to apply the
-        // closure.  Until WC-5's cleanup is extended to cover the
-        // success path (not just exception path), it's safer to
-        // fall back to tree-walker.  Same code as Tag::Thunk etc.
+        // WC-14: re-enable WC-6's closure bridge.  Previously rolled
+        // back due to Black-state cascades, but with WC-13 (GC roots
+        // for v3 arena) and WC-14.6 (bounded depth yield) the
+        // mechanics are safer.  v3ToTreeWalker wraps the closure as
+        // a tree-walker PrimOpApp(__v3_call_bridge_1, handle); when
+        // tree-walker calls it, primV3CallBridge1 dispatches back
+        // into v3.  Gate via NIX_V3_BRIDGE_CLOSURE=1 to opt-in for
+        // benchmarking; default OFF until the regression is verified
+        // gone.
+        static const bool bridgeEnabled =
+            std::getenv("NIX_V3_BRIDGE_CLOSURE") != nullptr;
+        if (!bridgeEnabled) {
+            if (diag) std::fprintf(stderr,
+                "v3 hook: closure-shape result tag=%d, falling back\n",
+                (int)r.tag());
+            st.evalFallbackReason[1]++;
+            e->eval(state, state.baseEnv, v);
+            return;
+        }
+        try {
+            nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
+            if (tmp) {
+                v = *tmp;
+                if (diag) std::fprintf(stderr,
+                    "v3 hook: bridged closure result tag=%d\n",
+                    (int)r.tag());
+                return;
+            }
+        } catch (const std::exception &) {
+            // bridge fail — fall through to tree-walker
+        }
         if (diag) std::fprintf(stderr,
-            "v3 hook: closure-shape result tag=%d, falling back\n",
+            "v3 hook: closure bridge failed tag=%d, falling back\n",
             (int)r.tag());
         st.evalFallbackReason[1]++;
         e->eval(state, state.baseEnv, v);

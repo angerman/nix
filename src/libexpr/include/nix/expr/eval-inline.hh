@@ -95,29 +95,9 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    // WC-14.6 bounded-depth yield: when we're inside a v3 hook
-    // (active depth > 0), bump the in-hook forceValue depth and
-    // throw V3DepthYield if we've recursed deeper than the
-    // configured threshold.  v3 catches it and falls back to
-    // tree-walker for the offending Expr.  Cost outside the hook
-    // is one branch on a thread-local read.
-    struct V3DepthGuard {
-        bool active;
-        V3DepthGuard() : active(EvalState::v3HookActiveDepth > 0) {
-            if (active) ++EvalState::v3HookForceDepth;
-        }
-        ~V3DepthGuard() {
-            if (active) --EvalState::v3HookForceDepth;
-        }
-    };
-    V3DepthGuard _depthGuard;
-    if (_depthGuard.active &&
-        EvalState::v3HookForceDepth > EvalState::v3HookMaxForceDepth) {
-        error<V3DepthYield>(
-            "v3 hook force depth %1% exceeded threshold %2%",
-            EvalState::v3HookForceDepth, EvalState::v3HookMaxForceDepth)
-            .debugThrow();
-    }
+    // WC-14.6: depth-yield is checked in the v3 bridge points
+    // (treeWalkerToV3, forceBridgeThunk) rather than here, so the
+    // tree-walker hot path stays free of thread_local overhead.
     // Iterative thunk/app resolution loop.  Uses a while loop instead of
     // recursive forceValue calls to avoid C stack overflow from deep
     // thunk chains (common in v2 IR with OP_COPY_TO_SLOT thunk copies).

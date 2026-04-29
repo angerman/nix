@@ -2351,6 +2351,23 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
                             std::unordered_map<const void *, Value> & seen)
 {
     auto & ns = *state.nixEvalState;
+    // WC-14.6: bounded-depth yield at the v3↔tree-walker boundary.
+    // Each treeWalkerToV3 call is a transition between engines that
+    // can grow the C stack via tree-walker's recursive forceValue.
+    // Bumping depth here (and checking the threshold) bounds the
+    // accumulated growth without paying the cost on every internal
+    // forceValue call.
+    if (++nix::EvalState::v3HookForceDepth >
+        nix::EvalState::v3HookMaxForceDepth) {
+        --nix::EvalState::v3HookForceDepth;
+        ns.error<nix::V3DepthYield>(
+            "v3 bridge depth %1% exceeded threshold %2%",
+            nix::EvalState::v3HookForceDepth,
+            nix::EvalState::v3HookMaxForceDepth).debugThrow();
+    }
+    struct DepthDec {
+        ~DepthDec() { --nix::EvalState::v3HookForceDepth; }
+    } _dec;
     ns.forceValue(nv, nix::noPos);
     Value out;
     switch (nv.type()) {
