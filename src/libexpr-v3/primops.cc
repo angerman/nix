@@ -58,7 +58,10 @@
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/derived-path.hh"
+#include "nix/store/derivations.hh"  // hashPlaceholder
 #include "nix/store/globals.hh"
+#include "nix/store/content-address.hh"  // ContentAddressMethod
+#include "nix/util/serialise.hh"  // StringSource
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
 #include "v3/ir.hh"
@@ -5195,6 +5198,143 @@ Value forceBridgeThunk(Thunk * t)
     return treeWalkerToV3Public(*tlNixEvalState, *srcV);
 }
 
+// ---------------------------------------------------------------------------
+// WC-28a: small missing primops (placeholder, __warn, break, __outputOf,
+//   __storePath, __toFile).  All previously fell back to tree-walker.
+//   Native v3 implementations bring v3 closer to "owns the world" (Agent B
+//   B12).  Each implementation mirrors tree-walker semantics — see
+//   src/libexpr/primops.cc for the canonical references.
+// ---------------------------------------------------------------------------
+
+/// builtins.placeholder "out" → output-placeholder string.  Tree-walker:
+/// src/libexpr/primops.cc:2008 (prim_placeholder).  Pure function — no
+/// state interaction beyond the EvalState's mem allocator.
+void primPlaceholder(EvalState & state, Value * args, Value & out)
+{
+    (void)state;
+    if (!args[0].isString()) typeError("placeholder", "string");
+    auto ph = nix::hashPlaceholder(std::string_view(args[0].payload.str));
+    out = mkStringValueOwned(std::move(ph));
+}
+
+/// builtins.__warn "msg" v → print msg to stderr, return v.  Tree-walker:
+/// src/libexpr/primops.cc:1451 (prim_warn).  v3 simplifies: emits the
+/// "warning:" prefix, returns args[1] unchanged.  Doesn't honour
+/// abort-on-warn settings (parity-relevant for that subset of users).
+void primWarn(EvalState &, Value * args, Value & out)
+{
+    if (!args[0].isString()) typeError("warn", "string");
+    std::fprintf(stderr, "warning: %s\n", args[0].payload.str);
+    out = args[1];
+}
+
+/// builtins.break v → debug-mode breakpoint, returns v.  Tree-walker:
+/// src/libexpr/primops.cc:1101 (primop_break).  v3 has no debugger
+/// support (canDebug() always false), so this is a pass-through.
+void primBreak(EvalState &, Value * args, Value & out)
+{
+    out = args[0];
+}
+
+/// builtins.__storePath path → ensure path is in the store, return as
+/// string with context.  Tree-walker: src/libexpr/primops.cc:2070
+/// (prim_storePath).  Requires tree-walker store (state.nixEvalState).
+void primStorePath(EvalState & state, Value * args, Value & out)
+{
+    if (!state.nixEvalState)
+        throw std::runtime_error("v3 storePath: no tree-walker state available");
+    auto * ns = state.nixEvalState;
+    Value v = args[0];
+    if (v.isPath()) {
+        // ok
+    } else if (v.isString()) {
+        // ok
+    } else {
+        typeError("storePath", "path or string");
+    }
+    std::string pathStr = v.isPath() ? std::string(v.payload.path)
+                                      : std::string(v.payload.str);
+    nix::CanonPath path(pathStr);
+    if (!ns->store->isStorePath(path.abs()))
+        path = nix::CanonPath(nix::canonPath(path.abs(), true).string());
+    if (!ns->store->isInStore(path.abs()))
+        throw std::runtime_error("v3 storePath: path '" + path.abs() +
+                                  "' is not in the Nix store");
+    auto path2 = ns->store->toStorePath(path.abs()).first;
+    if (!nix::settings.readOnlyMode)
+        ns->store->ensurePath(path2);
+    nix::NixStringContext context;
+    context.insert(nix::NixStringContextElem::Opaque{.path = path2});
+    nix::Value tw;
+    tw.mkString(path.abs(), context, ns->mem);
+    Value result = treeWalkerToV3Public(*ns, tw);
+    out = result;
+}
+
+/// builtins.__toFile name s → write s to store, return path.
+/// Tree-walker: src/libexpr/primops.cc:2801 (prim_toFile).
+void primToFile(EvalState & state, Value * args, Value & out)
+{
+    if (!state.nixEvalState)
+        throw std::runtime_error("v3 toFile: no tree-walker state available");
+    auto * ns = state.nixEvalState;
+    if (!args[0].isString()) typeError("toFile", "string name");
+    if (!args[1].isString()) typeError("toFile", "string contents");
+    std::string name(args[0].payload.str);
+    std::string contents(args[1].payload.str);
+    // For string context tracking: v3 strings can carry context too
+    // (see contextStorage in primops.cc).  For toFile, refs come from
+    // the contents' context — which on the v3 side may be empty if the
+    // string was literal.  Future work: thread v3 context through.
+    nix::StorePathSet refs;
+    auto storePath = nix::settings.readOnlyMode
+        ? ns->store->makeFixedOutputPathFromCA(
+            name,
+            nix::TextInfo{
+                .hash = nix::hashString(nix::HashAlgorithm::SHA256, contents),
+                .references = std::move(refs),
+            })
+        : ({
+            nix::StringSource s{contents};
+            ns->store->addToStoreFromDump(
+                s, name,
+                nix::FileSerialisationMethod::Flat,
+                nix::ContentAddressMethod::Raw::Text,
+                nix::HashAlgorithm::SHA256, refs, ns->repair);
+        });
+    nix::Value tw;
+    ns->allowAndSetStorePathString(storePath, tw);
+    Value result = treeWalkerToV3Public(*ns, tw);
+    out = result;
+}
+
+/// builtins.__outputOf drvRef outputName → input placeholder for that
+/// derivation's named output.  Tree-walker: src/libexpr/primops.cc:2589
+/// (prim_outputOf).  Used for chained derivation outputs.
+void primOutputOf(EvalState & state, Value * args, Value & out)
+{
+    if (!state.nixEvalState)
+        throw std::runtime_error("v3 outputOf: no tree-walker state available");
+    auto * ns = state.nixEvalState;
+    // Convert args[0] (drvRef) and args[1] (outputName) to tree-walker
+    // values, delegate to tree-walker's coerceToSingleDerivedPath +
+    // mkSingleDerivedPathString, bridge the result back.
+    nix::Value tw0; tw0.mkString(args[0].isString() ? args[0].payload.str : "", ns->mem);
+    if (!args[1].isString()) typeError("outputOf", "string output name");
+    nix::SingleDerivedPath drvPath = ns->coerceToSingleDerivedPath(
+        nix::noPos, tw0,
+        "while evaluating the first argument to builtins.outputOf");
+    std::string outputName(args[1].payload.str);
+    nix::Value tw;
+    ns->mkSingleDerivedPathString(
+        nix::SingleDerivedPath::Built{
+            .drvPath = nix::make_ref<nix::SingleDerivedPath>(drvPath),
+            .output = outputName,
+        },
+        tw);
+    out = treeWalkerToV3Public(*ns, tw);
+}
+
 void registerPrimOp(const PrimOp & op)
 {
     std::lock_guard<std::mutex> g(registryMutex());
@@ -5321,6 +5461,13 @@ void registerBuiltinPrimOps()
         registerPrimOp({"parseFlakeRef",      1, primParseFlakeRef});
         registerPrimOp({"flakeRefToString",   1, primFlakeRefToString});
         registerPrimOp({"toXML",              1, primToXML});
+        // WC-28a: small previously-missing primops.
+        registerPrimOp({"placeholder",        1, primPlaceholder});
+        registerPrimOp({"__warn",             2, primWarn});
+        registerPrimOp({"break",              1, primBreak});
+        registerPrimOp({"__storePath",        1, primStorePath});
+        registerPrimOp({"__toFile",           2, primToFile});
+        registerPrimOp({"__outputOf",         2, primOutputOf});
     });
 }
 
