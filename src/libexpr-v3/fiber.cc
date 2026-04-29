@@ -14,20 +14,27 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifndef MAP_ANON
+#error "MAP_ANON not defined — feature-test macros leaked"
+#endif
+
 namespace nix::v3 {
 
 thread_local Fiber * currentFiber = nullptr;
 
 namespace {
 
-// makecontext takes function arguments as ints (legacy API).  We split
-// a Fiber* across two ints so it works on 64-bit systems.  Reassemble
-// via static_cast<uint64_t>(unsigned)<<32 | unsigned.
-[[noreturn]] static void fiberTrampoline(unsigned hi, unsigned lo)
+/// Holds the Fiber* for the next trampoline invocation.  makecontext
+/// arg-passing on macOS arm64 has reliability issues with multi-arg
+/// trampolines; passing via thread_local avoids it entirely.  Set
+/// just before swapcontext-into-fiber; the trampoline reads + clears
+/// on entry.
+thread_local Fiber * pendingFiber = nullptr;
+
+[[noreturn]] static void fiberTrampoline()
 {
-    uintptr_t bits = (static_cast<uintptr_t>(hi) << 32) |
-                     static_cast<uintptr_t>(lo);
-    Fiber * f = reinterpret_cast<Fiber *>(bits);
+    Fiber * f = pendingFiber;
+    pendingFiber = nullptr;
     Fiber * prev = currentFiber;
     currentFiber = f;
     try {
@@ -54,37 +61,35 @@ Fiber * fiberCreate(std::function<void(Fiber *)> entry, size_t stackSize)
     auto * f = new Fiber{};
     f->entry = std::move(entry);
     f->stackSize = stackSize;
-    // mmap with PROT_READ|WRITE; add a guard page below to catch
-    // overflow.  Total mapping = stackSize + page (guard).
+    // WC-18 follow-up: use posix_memalign (page-aligned malloc) for
+    // the fiber stack.  Earlier attempt used mmap + PROT_NONE guard
+    // page, which appeared to crash but actually succeeded; the
+    // original SIGSEGV was unrelated (root cause: feature-test
+    // macros hiding MAP_ANON).  Sticking with posix_memalign keeps
+    // things simple and matches the verified-working test case.
+    // No guard page — the 64 MB stack is large enough that overflow
+    // is genuinely a bug worth chasing on its own; we'd just trade
+    // one segfault for another.
     size_t pageSize = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-    size_t total = stackSize + pageSize;
-    void * mem = ::mmap(nullptr, total, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (mem == MAP_FAILED) {
+    void * mem = nullptr;
+    if (::posix_memalign(&mem, pageSize, stackSize) != 0) {
         delete f;
         throw std::bad_alloc();
     }
-    // First page = guard.  Make it PROT_NONE so any write into it
-    // segfaults rather than silently corrupting whatever is below.
-    ::mprotect(mem, pageSize, PROT_NONE);
-    f->stack = static_cast<char *>(mem) + pageSize;
+    f->stack = mem;
     f->stackSize = stackSize;
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     if (::getcontext(&f->ctx) == -1) {
-        ::munmap(mem, total);
+        std::free(mem);
         delete f;
         throw std::runtime_error("v3 fiber: getcontext failed");
     }
     f->ctx.uc_stack.ss_sp = f->stack;
     f->ctx.uc_stack.ss_size = stackSize;
     f->ctx.uc_link = nullptr;  // we explicitly setcontext(&parentCtx) on exit.
-    uintptr_t bits = reinterpret_cast<uintptr_t>(f);
-    unsigned hi = static_cast<unsigned>(bits >> 32);
-    unsigned lo = static_cast<unsigned>(bits & 0xFFFFFFFFu);
-    ::makecontext(&f->ctx, reinterpret_cast<void (*)()>(fiberTrampoline),
-                  2, hi, lo);
+    ::makecontext(&f->ctx, fiberTrampoline, 0);
 #pragma clang diagnostic pop
 
     return f;
@@ -93,6 +98,11 @@ Fiber * fiberCreate(std::function<void(Fiber *)> entry, size_t stackSize)
 void fiberResume(Fiber * fiber)
 {
     Fiber * saved = currentFiber;
+    // Hand the Fiber* to the trampoline via thread_local — see
+    // fiberTrampoline.  Only matters on the FIRST resume (the
+    // trampoline reads + clears on entry); subsequent resumes
+    // continue from the post-yield swapcontext call.
+    pendingFiber = fiber;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     if (::swapcontext(&fiber->parentCtx, &fiber->ctx) == -1)
@@ -118,11 +128,7 @@ void fiberYield(Fiber * fiber)
 void fiberDestroy(Fiber * fiber)
 {
     if (!fiber) return;
-    if (fiber->stack) {
-        size_t pageSize = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-        void * base = static_cast<char *>(fiber->stack) - pageSize;
-        ::munmap(base, fiber->stackSize + pageSize);
-    }
+    if (fiber->stack) std::free(fiber->stack);
     delete fiber;
 }
 

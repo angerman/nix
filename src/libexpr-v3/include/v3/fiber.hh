@@ -31,10 +31,20 @@
 #include <exception>
 #include <functional>
 
-// macOS arm64: ucontext_t is deprecated but still works.  Suppress
-// the warnings around the include + use sites.
+// macOS arm64: ucontext.h is gated behind _XOPEN_SOURCE.  But
+// _XOPEN_SOURCE alone hides Darwin extensions (e.g. MAP_ANON which
+// fiber.cc's mmap'd-stack allocator needs).  Apple's solution:
+// define BOTH so ucontext is exposed AND Darwin extensions stay
+// visible.  The original WC-18 attempt set only _XOPEN_SOURCE,
+// which broke MAP_ANON, made mmap return invalid memory, and
+// caused the "macOS arm64 ucontext is unreliable" misdiagnosis.
 #if defined(__APPLE__)
-#  define _XOPEN_SOURCE 600
+#  ifndef _XOPEN_SOURCE
+#    define _XOPEN_SOURCE 600
+#  endif
+#  ifndef _DARWIN_C_SOURCE
+#    define _DARWIN_C_SOURCE 1
+#  endif
 #endif
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
