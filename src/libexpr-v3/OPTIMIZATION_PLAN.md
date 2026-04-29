@@ -2231,6 +2231,61 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-29 — Phase 2 progress (WC-27, WC-28 — DONE)
+
+### WC-27 (B2 native auto-args): NO-OP, already implemented
+
+Inspection showed v3 already handles formal-default substitution
+natively via lower.cc's synthesized rec-attrset thunks (each formal
+becomes `if HasAttr(param, X) then param.X else default`).  The
+"auto-args" Agent B referenced is `autoCallFunction` (top-level CLI
+--arg/--argstr substitution), which is a tree-walker entry-point
+concern, not a v3 limitation.  Marked done.
+
+### WC-28 (port 13 missing primops): COMPLETE
+
+Phase 2b shipped in two waves:
+
+  **WC-28a** — 6 simple primops (placeholder, __warn, break,
+  __storePath, __toFile, __outputOf).  Pure logic + thin store
+  bridges where needed.  Direct v3-eval invocations confirmed.
+
+  **WC-28b/c** — 7 heavy primops (fetchurl, fetchTarball, fetchTree,
+  fetchGit, fetchMercurial, fetchClosure, filterSource).  All
+  delegate to tree-walker `builtins.<name>` via the BR-4 / primPath
+  bridge pattern.  Generic helper `bridgeBuiltin<Arity>(name, ...)`
+  factors the boilerplate.
+
+v3 now has **complete primop coverage** (124 native primops).
+Validation: lang 142/142, cutover 142/142, drv-parity 25/25
+across all flag combinations.
+
+### WC-29 (parser/bindVars extraction): DEFERRED
+
+After analysis, NOT on the critical path for WC-30.  Inversion
+flips the eval-driver, not the parser-service.  v3 can keep using
+tree-walker's parseExprFromFile + bindVars indefinitely.
+
+### Force hook default-flip: still NOT viable
+
+Best-of-7 / best-of-5 bench shows force-hook ON regresses real
+workloads 3-6% on some samples, parity on others — bench noise
+exceeds the signal we'd be looking for.  Without a structural perf
+win (WC-30 inversion or WC-31 Bridge-thunk amortisation), can't
+flip default safely.
+
+### Remaining Phase 2
+
+  - **WC-30** (invert eval entry, ~5-10 days) — the structural
+    win.  Eliminates the bidirectional bridge.  Requires careful
+    surgery in nix-instantiate's main entry, EvalState::v3EvalHook
+    semantics, and the AST-shape fallback.
+  - **WC-31** (replace Bridge thunks with direct nix::Value*,
+    ~2 days, uncertain payoff) — a tactical optimization that
+    might amortise force-hook overhead enough to flip default-on.
+    Worth trying once profiling pinpoints Bridge-thunk allocation
+    as a real cost.
+
 ## 2026-04-29 — WC-25 + WC-26 results (Phase 1 cheap experiments — DONE)
 
 ### WC-25: V3_DEFER_UPVALUE Bridge-thunk gate (Agent A's experiment)
