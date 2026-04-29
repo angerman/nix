@@ -993,12 +993,14 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                           nix::Env & env, nix::Value & v)
 {
-    // WC-25: force hook is correct under WC-25's lazy-upvalue scheme
-    // (Direct path uses Bridge thunks; WC-23 cycle resolved).  But
-    // best-of-3 bench shows +2..+6% regression on real workloads from
-    // per-thunk hook overhead.  Stays opt-in via NIX_USE_V3_FORCE=1
-    // until that overhead is reduced (future work: lower hook
-    // entry cost, fewer needsUpvalues skips).
+    // WC-25 + WC-26: force hook is now CORRECT (WC-23 cycle resolved
+    // by lazy upvalue Bridge thunks; WC-26's isV3CacheCandidate
+    // permanent-skip flag dropped forceEntries 421→140 on attr-hask).
+    // Best-of-7 bench still shows +3..+6% regression on real
+    // workloads — Bridge-thunk allocations + per-force overhead
+    // exceeds v3's actual ownership benefit.  Stays opt-in via
+    // NIX_USE_V3_FORCE=1 until WC-27 (native auto-args) and friends
+    // increase v3's ownership share enough to amortise the cost.
     static const bool useV3Force = []{
         const char * a = std::getenv("NIX_USE_V3");
         const char * b = std::getenv("NIX_USE_V3_FORCE");
@@ -1052,6 +1054,15 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
             st.forceSkipReason[reasonIdx]++;
         return false;
     };
+    // WC-26: when the Expr's failure mode is structural (the Expr
+    // will permanently fail this hook regardless of env), clear
+    // isV3CacheCandidate so future forces skip the hook entirely
+    // at the eval-inline.hh:119 check.  Saves the per-force
+    // hashmap lookup + DepthGuard ctor cost on the hot path.
+    auto skipPermanently = [&](size_t reasonIdx) {
+        if (e) const_cast<nix::Expr *>(e)->isV3CacheCandidate = false;
+        return skipReturn(reasonIdx);
+    };
 
     // CO-3 sub-Expr cache (per-thunk-body Functions recorded by the
     // lowerer).  Hits on the bulk of force traffic — every let
@@ -1068,15 +1079,16 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     if (sit != subCache.end()) {
         auto & ent = sit->second;
         if (ent.phaseBFailed) {
-            // We tried Phase B for this entry before and it threw.
-            // Same Expr* / same env shape => same outcome.  Skip.
-            return skipReturn(0);
+            // WC-26: structural failure — clear the candidate flag so
+            // future forces of this Expr skip the hook at the eval-
+            // inline.hh:119 short-circuit check.
+            return skipPermanently(0);
         }
         if (ent.nUpvalues != 0) {
             if (ent.upvalueSources.empty()) {
-                // Phase B can't handle this entry (synthesized rec/
-                // with/inheritFrom upvalues).  Skip.
-                return skipReturn(1);
+                // WC-26: synthesized rec/with/inheritFrom upvalues —
+                // permanent skip, clear the candidate flag.
+                return skipPermanently(1);
             }
             // CO-2 phase B + WC-2-followup: walk tree-walker's env
             // per upvalueSource to materialise the v3 upvalues array.
@@ -1286,9 +1298,10 @@ struct V3HookRegistrar {
         // because the force hook + WC-10 Bridge thunks interact in a
         // way that overflows the stack across the v3<->tree-walker
         // boundary.  Until that is root-caused, default OFF.
-        // WC-25: force hook is now correct (WC-23 unblocked) but keeps
-        // a +2..+6% per-thunk overhead.  Stays opt-in via
-        // NIX_USE_V3_FORCE=1 until overhead is reduced.
+        // WC-25 + WC-26: force hook now correct but stays opt-in via
+        // NIX_USE_V3_FORCE=1 — flipping default-on regresses real
+        // workloads 3-6% (Bridge-thunk allocation overhead exceeds
+        // v3's ownership benefit until WC-27+ widen ownership).
         if (const char * v = std::getenv("NIX_USE_V3_FORCE");
             v && std::string_view(v) == "1") {
             nix::EvalState::v3ForceHook = &v3ForceEntry;
@@ -1324,9 +1337,9 @@ void installEvalHook()
 {
     nix::EvalState::v3EvalHook = &v3EvalEntry;
     nix::EvalState::v3RegisterExprHook = &v3RegisterExprEntry;
-    // WC-25: force hook now correct (WC-23 cycle unblocked by lazy
-    // upvalue Bridge thunks) but stays opt-in via NIX_USE_V3_FORCE=1
-    // — flipping default-on regresses real workloads by 2-6%.
+    // WC-25 + WC-26: force hook now correct but stays opt-in via
+    // NIX_USE_V3_FORCE=1 (3-6% regression on real workloads when
+    // default-on; future WC-27+ should amortise).
     if (const char * v = std::getenv("NIX_USE_V3_FORCE");
         v && std::string_view(v) == "1") {
         nix::EvalState::v3ForceHook = &v3ForceEntry;
