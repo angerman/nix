@@ -1850,6 +1850,94 @@ WC-13 (Boehm GC roots) is the lifetime prerequisite already in
 place.  WC-14.0 is the only blocker for WC-14.1; the others form
 a roughly linear dependency chain.
 
+## 2026-04-29 — WC-14 implementation status (LANDED + DEFERRED split)
+
+### LANDED in this session
+
+  - **WC-14.0** profile baseline: 224k primops, top 30 cover 95.9%;
+    most hot primops already native in v3.
+  - **WC-14.1** `V3CallFunctionHook` typedef + EvalState slot.
+  - **WC-14.2** dispatch point inserted in `EvalState::callFunction`
+    before isLambda; null hook → identical to before.
+  - **WC-14.6** bounded-depth yield, refactored:
+      - `V3DepthYield` Error subclass added.
+      - `EvalState::v3HookForceDepth` thread_local + tunable
+        threshold (`NIX_V3_MAX_FORCE_DEPTH`, default 256).
+      - **Critical:** the depth check lives at the bridge boundary
+        (`treeWalkerToV3` / `forceBridgeThunk`), NOT in the
+        tree-walker `forceValue` hot path.  An earlier version
+        with the check in forceValue cost 28% wall-clock on fib35
+        (thread_local read on every thunk force).  Moving it to
+        the bridge boundary keeps non-hook tree-walker eval
+        free of overhead.
+      - v3's `v3ForceEntry` catch widened to blacklist on **every**
+        throw (not just upvalue-bearing entries), so cycles don't
+        re-fire on every force.
+  - **WC-14.6 side effect:** drv3 + `NIX_USE_V3_FORCE=1` now
+    completes successfully (was: "infinite recursion encountered").
+    The cross-VM ordering cycle hits the depth threshold and
+    falls back via phaseBFailed.
+
+### Honest measurement (best-of-3, post-WC-14)
+
+  | workload    | tw     | v3 default | v3 + NIX_USE_V3_FORCE=1 |
+  |-------------|--------|------------|--------------------------|
+  | fib35       | 4.06 s | 3.72 s     | 3.68 s ✓ (-9%)           |
+  | hello-name  | 0.35 s | 0.36 s     | **FAIL** (cycle)         |
+  | git-name    | 0.35 s | 0.36 s     | **FAIL** (cycle)         |
+  | drv3        | 0.43 s | 0.43 s     | 0.45 s ✓ (+5% acceptable)|
+  | attr-pkgs   | 0.35 s | 0.36 s     | **FAIL** (cycle)         |
+  | attr-hask   | 0.62 s | 0.63 s     | **FAIL** (cycle)         |
+
+drv3 going green is real progress: depth-yield catches the
+specific cycle pattern derivationStrict triggers.  hello-name &
+friends still fail with "infinite recursion encountered" because
+the cycle is **logical** (tree-walker's blackhole detector firing
+on a value-graph cycle exposed by v3's eval order), not depth-
+driven.  Lowering the threshold to 16 / 32 / 64 / 128 doesn't
+change the failure — the cycle fires before threshold is hit.
+
+### DEFERRED tasks (still on the v3 board)
+
+  - **WC-14.3** v3 closure tagging (depends on WC-14.5).
+  - **WC-14.4** v3 callFunction hook implementation (depends on
+    WC-14.5; the existing PrimOpApp(__v3_call_bridge_1, handle)
+    bridge already does the v3-dispatcher handoff, so a separate
+    hook implementation may be unnecessary once WC-14.5 lands).
+  - **WC-14.5** WC-5 success-path Black-mark cleanup.  This is
+    the actual blocker.  Reproducer: `NIX_V3_BRIDGE_CLOSURE=1`
+    re-enables WC-6 closure bridge → throws "v3 OP_FORCE:
+    infinite recursion (blackhole)" on the FIRST closure
+    invocation.  Bisection: file's first run completes
+    successfully (closure result, tag=9), but a let-binding
+    thunk captured in the closure's upvalues is left Black
+    between the file's run and the closure's invocation.  Needs
+    thunk-state logging at OP_MAKE_THUNK / OP_MAKE_CLOSURE /
+    OP_RETURN to identify the leak.
+  - **WC-14.7** flip force-hook default ON (depends on
+    WC-14.3/4/5).
+  - **WC-14.8** target hot bridge primops.  Investigation showed
+    most hot primops already use v3-internal forceValue (no
+    bridge); the bridge cost only appears with force-hook on
+    when v3 evaluates expressions whose upvalues come from
+    tree-walker.  The right fix is reducing force-hook ordering
+    cycles (WC-14.5 / a follow-up), not primop-by-primop tweaks.
+
+### Architectural learnings
+
+  - The TLS/thread_local cost on the hot path is NOT free on
+    macOS arm64 — `__tls_get_addr` is ~10 cycles; multiplied by
+    millions of forceValue calls, it dominates.  Always check
+    bridges at coarse boundaries, not fine-grained primops.
+  - Depth-yield catches stack-overflow cycles but NOT logical
+    ordering cycles.  The two failure modes need different
+    fixes.
+  - The closure-bridge Black-mark issue (WC-14.5) is the single
+    biggest remaining blocker.  Once fixed, file-toplevel
+    Closures stay in v3 instead of triggering tree-walker
+    re-evaluation, eliminating a large fraction of the eval-hook
+    fallbacks.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
