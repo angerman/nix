@@ -5335,6 +5335,54 @@ void primOutputOf(EvalState & state, Value * args, Value & out)
     out = treeWalkerToV3Public(*ns, tw);
 }
 
+// ---------------------------------------------------------------------------
+// WC-28b: fetch primops.  Each delegates to the corresponding tree-walker
+// primop in `builtins` (since libnixfetchers integration is heavy and not
+// worth duplicating for primops that are inherently store/network bound).
+// Same bridge pattern as BR-4's `primPath` fall-through (primops.cc:4457).
+// ---------------------------------------------------------------------------
+
+/// Generic bridge: convert v3 args to tree-walker, look up
+/// `builtins.<name>` (or the same with `__` prefix), call it,
+/// bridge the result back.
+template <int Arity>
+static void bridgeBuiltin(const char * name, EvalState & state,
+                          Value * args, Value & out)
+{
+    if (!state.nixEvalState)
+        throw std::runtime_error(std::string("v3 ") + name +
+            ": no tree-walker state available");
+    auto & ns = *state.nixEvalState;
+    nix::Value * nargs[Arity];
+    for (int i = 0; i < Arity; ++i) nargs[i] = v3ToTreeWalker(state, args[i]);
+    nix::Value & blt = ns.getBuiltins();
+    ns.forceAttrs(blt, nix::noPos, "v3 fetch primop bridge");
+    auto * pAttr = blt.attrs()->get(ns.symbols.create(name));
+    if (!pAttr || !pAttr->value) {
+        // Try __-prefixed alias (some fetch primops use that).
+        std::string alt = std::string("__") + name;
+        pAttr = blt.attrs()->get(ns.symbols.create(alt));
+        if (!pAttr || !pAttr->value)
+            throw std::runtime_error(std::string("v3 ") + name +
+                ": tree-walker builtins.<name> not found");
+    }
+    nix::Value cur = *pAttr->value;
+    for (int i = 0; i < Arity; ++i) {
+        nix::Value next;
+        ns.callFunction(cur, *nargs[i], next, nix::noPos);
+        cur = next;
+    }
+    out = treeWalkerToV3(state, cur);
+}
+
+void primFetchurl    (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchurl",    s, a, o); }
+void primFetchTarball(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchTarball", s, a, o); }
+void primFetchTree   (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchTree",   s, a, o); }
+void primFetchGit    (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchGit",    s, a, o); }
+void primFetchMercurial(EvalState & s, Value * a, Value & o){ bridgeBuiltin<1>("fetchMercurial", s, a, o); }
+void primFetchClosure(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchClosure", s, a, o); }
+void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("filterSource", s, a, o); }
+
 void registerPrimOp(const PrimOp & op)
 {
     std::lock_guard<std::mutex> g(registryMutex());
@@ -5468,6 +5516,17 @@ void registerBuiltinPrimOps()
         registerPrimOp({"__storePath",        1, primStorePath});
         registerPrimOp({"__toFile",           2, primToFile});
         registerPrimOp({"__outputOf",         2, primOutputOf});
+        // WC-28b: fetch primops (delegate to tree-walker builtins.X).
+        registerPrimOp({"__fetchurl",         1, primFetchurl});
+        registerPrimOp({"fetchurl",           1, primFetchurl});
+        registerPrimOp({"fetchTarball",       1, primFetchTarball});
+        registerPrimOp({"fetchTree",          1, primFetchTree});
+        registerPrimOp({"fetchGit",           1, primFetchGit});
+        registerPrimOp({"fetchMercurial",     1, primFetchMercurial});
+        registerPrimOp({"fetchClosure",       1, primFetchClosure});
+        // WC-28c: filterSource (delegate too).
+        registerPrimOp({"filterSource",       2, primFilterSource});
+        registerPrimOp({"__filterSource",     2, primFilterSource});
     });
 }
 
