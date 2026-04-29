@@ -2018,6 +2018,66 @@ gated behind `NIX_V3_BRIDGE_CLOSURE=1` (off by default).
     place during investigation; reverted to keep production
     builds clean.
 
+## 2026-04-29 — WC-15 lazy bridge primops + defensive cleanup (LANDED)
+
+### What landed
+
+  - **Lazy attr-set bridge** (primops.cc): each non-trivial v3
+    Tag::Attrs becomes a tree-walker Bindings where each value is
+    `App(PrimOpApp(__v3_force_attr, handle), nameStr)`.  Forcing the
+    App invokes a primop that looks up the v3 attrset by handle,
+    finds the attr by name, bridges that single value (recursively
+    lazy).  Threshold: bSize > 4 → lazy; else eager (lower allocation
+    overhead).  Knob: NIX_V3_NO_LAZY_BRIDGE=1 forces eager.
+  - **Lazy list-element bridge**: same pattern with
+    `__v3_force_list_elem(handle, idx)`.
+  - **Defensive Black cleanup** (vm.cc run/runFunction/
+    runFunctionWithUpvalues): on the SUCCESS path, call
+    `clearBlackMarksOnException(vm, 0)` symmetrically with the
+    exception path.  Eliminates a class of stale-Black bugs from
+    incomplete sub-evals or interleaved VMStates.
+
+### Validation
+
+  - cutover lang 142/142, drv-parity 25/25, smoke 16/16.
+  - Bench shows parity vs eager bridge across all workloads.
+  - Smaller `import nixpkgs/lib).version`, fix-point patterns,
+    medium-size attrsets all bridge correctly.
+
+### What's still NOT fixed
+
+`(import nixpkgs).hello.name` with `NIX_V3_BRIDGE_CLOSURE=1` still
+fails.  After significant investigation, the cycle is NOT in:
+
+  - The bridge layer (lazy bridge defers everything correctly)
+  - Stale Black marks (defensive cleanup on success path didn't help)
+  - GC lifetime (WC-13 covered that)
+
+The cycle is **in v3's bytecode evaluation of the lambda body
+itself**.  v3 evaluates the closure body in a force order that
+touches a value-graph cycle tree-walker's natural lazy evaluation
+order avoids.  Tree-walker without v3 hook handles the same code
+because its evaluation order is different.
+
+Key suspect: OP_RETURN's transitive-force chain at vm.cc:929-979.
+When T1's body returns a Suspended thunk T2, v3 IMMEDIATELY pushes
+another CFF_THUNK_RETURN frame to force T2.  Tree-walker's
+equivalent chase happens differently — T1 is updated to point to
+T2, then forceValue's outer iterative loop chases T2.  Subtle
+ordering difference, both are "transitive" but with different
+intermediate states visible to user code.
+
+Fixing this would require either:
+  1. Re-engineering v3's bytecode emit to NOT eagerly chase
+     transitive thunks (let the caller force on demand).
+  2. Re-engineering tree-walker's force semantics in primV3CallBridge1
+     to provide tree-walker-shaped lazy chase.
+  3. Running the closure body on a separate thread/coroutine where
+     v3's stack/order isn't exposed to tree-walker re-entries.
+
+All multi-day efforts.  Closure bridge stays gated behind
+NIX_V3_BRIDGE_CLOSURE=1 (off by default) for now.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
