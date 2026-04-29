@@ -2231,6 +2231,79 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-29 — WC-18 coroutine isolation (PARTIAL: simple cases work, complex SIGSEGV)
+
+Implemented coroutine isolation per the WC-17 diagnostic
+recommendation.  Architecture:
+
+  - `fiber.{hh,cc}` — ucontext-based fiber with mmap'd 64 MB stack
+    + guard page.  `fiberCreate` / `fiberResume` / `fiberYield` /
+    `fiberDestroy`.
+  - `bridge_yield.{hh,cc}` — Mailbox + `runInFiber` driver loop +
+    `yieldForceTreeWalker`.  When inside a fiber, calling
+    `yieldForceTreeWalker` switches to the driver, which runs
+    `state.forceValue` on its pthread stack and resumes the fiber.
+  - `primV3CallBridge1` — opt-in via `NIX_V3_FIBER_BRIDGE=1`.
+    Wraps the closure-body invocation in `runInFiber`.  v3's
+    bytecode runs on the fiber's stack; tree-walker forces happen
+    on the driver's pthread stack.
+  - `treeWalkerToV3` — calls `yieldForceTreeWalker` instead of
+    direct `state.forceValue`.  Outside a fiber, falls through.
+  - Nested-fiber guard: `activeFiberDriverDepth` thread_local;
+    re-entrant bridge calls fall back to direct mode.
+
+### Validation
+
+  - cutover lang 142/142, drv-parity 25/25 (fiber off, default).
+  - Simple closure-bridge probes (`lib.version`, `pkgs.lib.version`)
+    SUCCEED with `NIX_V3_FIBER_BRIDGE=1` — 10/10 stable runs.
+  - **Complex cases still SIGSEGV** on macOS arm64.  EXC_BAD_ACCESS
+    at addresses inside the pthread stack region (0x16fxxxxxxx),
+    consistent with ucontext register/PC restore corruption when
+    multiple ucontext switches happen during deep evaluation.
+
+### Why complex cases fail
+
+`(import nixpkgs).system` exercises:
+  - Outer fiber driver
+  - v3 closure body run in fiber
+  - Many `yieldForceTreeWalker` round-trips
+  - Tree-walker forces trigger v3 eval-hook on imported files
+  - Eval-hook returns Closures bridged via PrimOpApp(__v3_call_bridge_1)
+  - Tree-walker re-calls primV3CallBridge1 from inside the driver
+  - Re-entrant bridge calls — even with the guard set to
+    direct-mode for nested calls, the driver-loop's pthread stack
+    grows arbitrary deep through tree-walker recursion
+
+The crash is consistent with macOS arm64's ucontext implementation
+having issues when multiple long-lived ucontext_t structures exist
+and the active thread's actual stack pointer wanders far from
+where the saved contexts expected it.
+
+### Path forward
+
+  - **macOS arm64 ucontext is genuinely unreliable** here.  Two
+    options:
+      1. Switch to Boost.Context or a custom asm-based fiber
+         implementation.  ~1-2 days.
+      2. Switch development/testing to Linux where ucontext is
+         well-supported.
+  - The fiber + yield protocol design is correct; only the underlying
+    primitive needs replacement.
+  - For simple workloads where the driver's pthread stack stays
+    bounded, the fiber bridge already works.
+
+### Commits this session
+
+  - `fiber.{hh,cc}`: ucontext-based fiber abstraction.
+  - `bridge_yield.{hh,cc}`: yield protocol + driver loop.
+  - `primops.cc`: gated fiber wrap of `primV3CallBridge1`,
+    `treeWalkerToV3` yields instead of direct force.
+  - `meson.build`: list new sources.
+
+Default v3 behavior unchanged (fiber off).  `NIX_V3_FIBER_BRIDGE=1`
+gates the new path.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,

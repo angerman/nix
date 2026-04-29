@@ -24,6 +24,7 @@
 #include "v3/alloc.hh"
 #include "v3/lower.hh"
 #include "v3/vm.hh"
+#include "v3/bridge_yield.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
@@ -2087,21 +2088,49 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         ns.error<nix::EvalError>("v3 bridge1: invalid handle").debugThrow();
     Value v3fn = tbl[(size_t)h];
 
-    EvalState v3state;
-    v3state.nixEvalState = &ns;
     extern thread_local nix::EvalState * tlNixEvalState;
     if (!tlNixEvalState) tlNixEvalState = &ns;
-
-    static thread_local VMState bridgeVm1;
-    bridgeVm1.valueStack.reserve(64 * 1024);
-    bridgeVm1.frames.reserve(4096);
-    bridgeVm1.withStack.reserve(64);
-    v3state.vm = &bridgeVm1;
-
     ns.forceValue(*args[1], pos);
-    Value v3arg = treeWalkerToV3(v3state, *args[1]);
-    Value fn = callClosure(*v3state.vm, v3fn, v3arg);
-    fn = forceValue(*v3state.vm, fn);
+
+    // WC-18.3: run the v3 closure body in a fiber.  treeWalkerToV3
+    // and forceBridgeThunk yield to the driver for tree-walker forces,
+    // so the v3 dispatcher's call depth is bounded by the fiber's
+    // 64 MB stack rather than the caller's pthread stack.
+    // Gated via NIX_V3_FIBER_BRIDGE=1 — opt-in until validated.
+    // ALSO: avoid nested fibers — when we're already in a fiber
+    // (re-entrant bridge call from inside v3 evaluation), fall back
+    // to direct call.  Nesting ucontext fibers on macOS arm64 has
+    // proven unreliable.
+    static const bool useFiber =
+        std::getenv("NIX_V3_FIBER_BRIDGE") != nullptr;
+    Value fn;
+    if (useFiber && activeFiberDriverDepth == 0) {
+        fn = runInFiber(ns, [&](Mailbox * /*mb*/) -> Value {
+            // Each fiber gets its own VMState (isolation on top of
+            // stack isolation).  Allocated on the fiber's 16MB stack.
+            VMState fiberVm;
+            fiberVm.valueStack.reserve(64 * 1024);
+            fiberVm.frames.reserve(4096);
+            fiberVm.withStack.reserve(64);
+            EvalState fs;
+            fs.nixEvalState = &ns;
+            fs.vm = &fiberVm;
+            Value v3arg = treeWalkerToV3(fs, *args[1]);
+            Value r = callClosure(*fs.vm, v3fn, v3arg);
+            return forceValue(*fs.vm, r);
+        });
+    } else {
+        EvalState v3state;
+        v3state.nixEvalState = &ns;
+        static thread_local VMState bridgeVm1;
+        bridgeVm1.valueStack.reserve(64 * 1024);
+        bridgeVm1.frames.reserve(4096);
+        bridgeVm1.withStack.reserve(64);
+        v3state.vm = &bridgeVm1;
+        Value v3arg = treeWalkerToV3(v3state, *args[1]);
+        fn = callClosure(*v3state.vm, v3fn, v3arg);
+        fn = forceValue(*v3state.vm, fn);
+    }
 
     // Convert the v3 result back to tree-walker.  Use the full
     // recursive bridge so attrsets / lists / nested closures
@@ -2123,7 +2152,18 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External: {
-        nix::Value * tmp = v3ToTreeWalker(v3state, fn);
+        // Build a temporary EvalState for the v3-side bridge.  The
+        // VMState here is purely for the recursive structural walk;
+        // it doesn't run bytecode (treeWalkerToV3 inverse direction
+        // is non-bytecode).
+        EvalState bridgeState;
+        bridgeState.nixEvalState = &ns;
+        static thread_local VMState resultBridgeVm;
+        resultBridgeVm.valueStack.reserve(64 * 1024);
+        resultBridgeVm.frames.reserve(4096);
+        resultBridgeVm.withStack.reserve(64);
+        bridgeState.vm = &resultBridgeVm;
+        nix::Value * tmp = v3ToTreeWalker(bridgeState, fn);
         if (tmp) out = *tmp; else out.mkNull();
         break;
     }
@@ -2557,11 +2597,6 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
 {
     auto & ns = *state.nixEvalState;
     // WC-14.6: bounded-depth yield at the v3↔tree-walker boundary.
-    // Each treeWalkerToV3 call is a transition between engines that
-    // can grow the C stack via tree-walker's recursive forceValue.
-    // Bumping depth here (and checking the threshold) bounds the
-    // accumulated growth without paying the cost on every internal
-    // forceValue call.
     if (++nix::EvalState::v3HookForceDepth >
         nix::EvalState::v3HookMaxForceDepth) {
         --nix::EvalState::v3HookForceDepth;
@@ -2573,7 +2608,12 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
     struct DepthDec {
         ~DepthDec() { --nix::EvalState::v3HookForceDepth; }
     } _dec;
-    ns.forceValue(nv, nix::noPos);
+    // WC-18.4: when running inside a fiber, yield to the driver so
+    // the recursive tree-walker forceValue runs on the driver's
+    // pthread stack rather than the fiber's 16 MB stack — keeps
+    // fiber stacks bounded.  Outside a fiber, falls through to a
+    // direct call.
+    yieldForceTreeWalker(ns, nv);
     Value out;
     switch (nv.type()) {
     case nix::nInt:    out.mkInt(nv.integer().value); return out;

@@ -48,6 +48,8 @@ lib_sources = files(
   'lower.cc',
   'serialize.cc',
   'disk_cache.cc',
+  'fiber.cc',
+  'bridge_yield.cc',
   'v3_hook.cc',
 )
 
