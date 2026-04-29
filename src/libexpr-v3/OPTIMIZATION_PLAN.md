@@ -1778,6 +1778,78 @@ WC-13 stands alone as correct infrastructure.  Default v3 mode
 remains at strict parity with tree-walker; force hook stays
 opt-in until WC-12's stack-depth resolution lands.
 
+## 2026-04-29 — WC-14: callFunction-hook + bounded depth yield (planned)
+
+After three parallel research agents reviewed the bridge / dispatcher
+architecture, the path to flip the force hook safely on by default is:
+
+### Hard-data baseline (nix-instantiate hello-name, NIX_COUNT_CALLS=1)
+
+  - 394k function calls, 898k thunks created, 430k forced.
+  - 224k primop calls; **top 30 primops cover 95.9%** of all
+    primop traffic.  Top 10:
+        elemAt 36k, map 21k, length 20k, elem 17k, isAttrs 17k,
+        genList 16k, attrNames 8k, isString 8k, concatMap 7k, all 6k.
+  - Of those: **~95% are already native in v3**.  Only `all`/`filter`/
+    `concatLists`/`listToAttrs`/`removeAttrs`/`genericClosure`
+    (~25k calls combined, ~11% of primop traffic) actually need to
+    bridge — they force tree-walker thunks supplied as args.
+
+### Synthesis of the three agents
+
+  - **v3-as-outer-dispatcher** is not feasible incrementally.  Tree-
+    walker's `forceValue` is recursive C++ inside `Expr::eval`,
+    which we can't rewrite inside this scope.  But individual
+    Expr::eval methods (Call/Let/Select) ARE structurally non-
+    recursive after WC-9.2, so the only deeply-recursive offender
+    is the `forceValue ↔ Expr::eval` bounce.
+
+  - **callFunction hook** is the right surgical fix.  Mirrors the
+    existing `v3ForceHook` pattern; precedent exists in eval.cc:1826
+    where v2's `ExprLambdaBytecode` proxy already does this dance.
+    File-toplevels in nixpkgs are `let ... in lambda` — today the
+    Closure result falls back to tree-walker, which then recurses
+    into the body via `callFunction`.  A `v3CallFunctionHook` lets
+    v3 own that body's evaluation on its own frame stack.
+
+  - **WC-6 Blackhole regression** was caused by stale Black marks
+    on the success path (WC-5 only cleared on exception path).
+    Must fix before re-enabling closure round-trips.
+
+  - **Bounded depth yield** (Agent 2's hybrid option) caps C-stack
+    growth for the residual tree-walker recursion that the hook
+    can't eliminate.  Throw `V3DepthYield` at depth > N inside
+    forceValue when it was invoked from a v3 hook; v3 catches and
+    falls back gracefully via phaseBFailed.
+
+### Implementation breakdown (tasks #315-#323)
+
+  - **WC-14.0** Profile drv3 force-hook depth + per-primop
+    bridge-out counts to size the work.
+  - **WC-14.1** Add `V3CallFunctionHook` typedef + EvalState
+    member (mirrors v3ForceHook).
+  - **WC-14.2** Insert hook check in `EvalState::callFunction`
+    before the isLambda block.
+  - **WC-14.3** Tag v3-produced closures crossing into tree-walker
+    with a sentinel env so the hook can recognize them.
+  - **WC-14.4** Implement v3CallFunctionEntry that pushes a v3
+    frame and runs the closure body in v3 dispatcher.
+  - **WC-14.5** Fix WC-5 to clear stale Black marks on the
+    success path too — the WC-6 regression's root cause.
+  - **WC-14.6** Bounded-depth yield in forceValue when invoked
+    from a v3 hook.  Cap C-stack growth at a tunable threshold
+    (256 to start).
+  - **WC-14.7** Flip force-hook default ON; validate full bench
+    sweep.  Acceptance: every workload passes; fib-style wins
+    preserved; nixpkgs workloads at parity or better.
+  - **WC-14.8** Eliminate bridge-out in the top-3 hot primops
+    (`all`/`filter`/`concatLists`) by ensuring internal thunks
+    they create are v3-side, not tree-walker-side.
+
+WC-13 (Boehm GC roots) is the lifetime prerequisite already in
+place.  WC-14.0 is the only blocker for WC-14.1; the others form
+a roughly linear dependency chain.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
