@@ -993,10 +993,12 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                           nix::Env & env, nix::Value & v)
 {
-    // Opt-in via NIX_USE_V3_FORCE=1.  Default off pending root-cause
-    // of the drv3 SIGSEGV (see V3HookRegistrar comment).  When ON
-    // and combined with WC-11 precompile, simple nixpkgs workloads
-    // see a ~57% wall-clock improvement.
+    // WC-25: force hook is correct under WC-25's lazy-upvalue scheme
+    // (Direct path uses Bridge thunks; WC-23 cycle resolved).  But
+    // best-of-3 bench shows +2..+6% regression on real workloads from
+    // per-thunk hook overhead.  Stays opt-in via NIX_USE_V3_FORCE=1
+    // until that overhead is reduced (future work: lower hook
+    // entry cost, fewer needsUpvalues skips).
     static const bool useV3Force = []{
         const char * a = std::getenv("NIX_USE_V3");
         const char * b = std::getenv("NIX_USE_V3_FORCE");
@@ -1091,15 +1093,18 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                         st.forceHookDirectUpvalues++;
                         nix::Value * srcV = cur->values[src.displ];
                         if (!srcV) return skipReturn(3);
-                        // WC-25 experiment: when V3_DEFER_UPVALUE=1, allocate
-                        // a Bridge thunk instead of forcing the upvalue eagerly.
-                        // OP_FORCE on the slot will re-enter tree-walker for
-                        // a single value via forceBridgeThunk (primops.cc).
-                        // Goal: defer the force long enough for tree-walker's
-                        // natural eval order to clear the WC-23 args cycle.
-                        static const bool deferUpvalues =
-                            std::getenv("V3_DEFER_UPVALUE") != nullptr;
-                        if (deferUpvalues) {
+                        // WC-25: defer the force.  Eagerly forcing the
+                        // tree-walker upvalue at hook entry triggered the
+                        // WC-23 args cycle in callPackageWith — v3's force
+                        // schedule diverged from tree-walker's lazy
+                        // semantics.  Allocate a Bridge thunk holding
+                        // nix::Value*; OP_FORCE on the slot resolves on
+                        // demand via forceBridgeThunk (primops.cc).
+                        // Mirrors the RecBuild path below.  Opt out via
+                        // V3_NO_DEFER_UPVALUE=1 for A/B testing.
+                        static const bool noDeferUpvalues =
+                            std::getenv("V3_NO_DEFER_UPVALUE") != nullptr;
+                        if (!noDeferUpvalues) {
                             Thunk * bridge = Alloc::allocBridgeThunk(
                                 static_cast<void *>(srcV));
                             allocStats().thunksAllocated++;
@@ -1281,6 +1286,9 @@ struct V3HookRegistrar {
         // because the force hook + WC-10 Bridge thunks interact in a
         // way that overflows the stack across the v3<->tree-walker
         // boundary.  Until that is root-caused, default OFF.
+        // WC-25: force hook is now correct (WC-23 unblocked) but keeps
+        // a +2..+6% per-thunk overhead.  Stays opt-in via
+        // NIX_USE_V3_FORCE=1 until overhead is reduced.
         if (const char * v = std::getenv("NIX_USE_V3_FORCE");
             v && std::string_view(v) == "1") {
             nix::EvalState::v3ForceHook = &v3ForceEntry;
@@ -1316,8 +1324,9 @@ void installEvalHook()
 {
     nix::EvalState::v3EvalHook = &v3EvalEntry;
     nix::EvalState::v3RegisterExprHook = &v3RegisterExprEntry;
-    // WC-11: force hook stays opt-in via NIX_USE_V3_FORCE=1 until
-    // the derivationStrict SIGSEGV interaction is root-caused.
+    // WC-25: force hook now correct (WC-23 cycle unblocked by lazy
+    // upvalue Bridge thunks) but stays opt-in via NIX_USE_V3_FORCE=1
+    // — flipping default-on regresses real workloads by 2-6%.
     if (const char * v = std::getenv("NIX_USE_V3_FORCE");
         v && std::string_view(v) == "1") {
         nix::EvalState::v3ForceHook = &v3ForceEntry;
