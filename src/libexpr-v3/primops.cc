@@ -2038,6 +2038,26 @@ static std::vector<Value> & v3BridgeClosures()
     return tbl;
 }
 
+/// WC-14.5 lazy attr bridge: stores v3 Tag::Attrs Values keyed by
+/// integer handle.  When tree-walker forces a particular attr's
+/// value (which we bridged as a deferred App primop call), the
+/// __v3_force_attr primop looks up the original v3 attrset and
+/// bridges the single requested attr's value.  Avoids the eager-
+/// recursion cycle that nixpkgs's lib.makeExtensible self-references
+/// trigger on the full attrset structural traversal.
+static std::vector<Value> & v3BridgeAttrs()
+{
+    static std::vector<Value> tbl;
+    return tbl;
+}
+
+/// Same idea for lists — each element bridged lazily on force.
+static std::vector<Value> & v3BridgeLists()
+{
+    static std::vector<Value> tbl;
+    return tbl;
+}
+
 /// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
 /// thunks via tree-walker's evaluator before reading the type.
 /// Per-call cycle table prevents infinite recursion on self-referential
@@ -2179,6 +2199,92 @@ static void primV3CallBridge2(nix::EvalState & ns, const nix::PosIdx pos,
     }
 }
 
+/// WC-15: lazy attr-set bridge primop.  Args: handle (Int), name (String).
+/// Looks up the v3 Tag::Attrs Value at handle, finds the attr by name,
+/// bridges that single value to tree-walker via v3ToTreeWalker (which
+/// for nested Attrs/Lists will itself be lazy, so cycles are bounded).
+static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
+                             nix::Value ** args, nix::Value & out)
+{
+    ns.forceValue(*args[0], pos);
+    if (args[0]->type() != nix::nInt)
+        ns.error<nix::EvalError>("v3 forceAttr: handle must be int").debugThrow();
+    int64_t h = args[0]->integer().value;
+    auto & tbl = v3BridgeAttrs();
+    if (h < 0 || (size_t)h >= tbl.size())
+        ns.error<nix::EvalError>("v3 forceAttr: invalid handle").debugThrow();
+    Value v3attrs = tbl[(size_t)h];
+    if (v3attrs.tag() != Tag::Attrs || !v3attrs.payload.bindings)
+        ns.error<nix::EvalError>("v3 forceAttr: handle does not point to an Attrs").debugThrow();
+
+    ns.forceValue(*args[1], pos);
+    if (args[1]->type() != nix::nString)
+        ns.error<nix::EvalError>("v3 forceAttr: name must be string").debugThrow();
+    std::string_view name(args[1]->string_view());
+
+    // v3 Bindings are sorted by SymbolId.  We have a string name —
+    // resolve through v3's symbol table.
+    SymbolId sid = ir::globalInternSymbol(std::string(name));
+    const Bindings * b = v3attrs.payload.bindings;
+    const Value * found = b->lookup(sid);
+    if (!found)
+        ns.error<nix::EvalError>(
+            "v3 forceAttr: attr '%1%' not found in bridged attrset",
+            std::string(name)).debugThrow();
+
+    // Bridge this single value.  Set up an EvalState + thread_local
+    // shim VMState (mirrors the closure-bridge primop pattern).
+    extern thread_local nix::EvalState * tlNixEvalState;
+    if (!tlNixEvalState) tlNixEvalState = &ns;
+    EvalState v3state;
+    v3state.nixEvalState = &ns;
+    static thread_local VMState bridgeVmAttr;
+    bridgeVmAttr.valueStack.reserve(64 * 1024);
+    bridgeVmAttr.frames.reserve(4096);
+    bridgeVmAttr.withStack.reserve(64);
+    v3state.vm = &bridgeVmAttr;
+
+    nix::Value * tmp = v3ToTreeWalker(v3state, *found);
+    if (tmp) out = *tmp; else out.mkNull();
+}
+
+/// WC-15: lazy list-element bridge.  Args: handle (Int), index (Int).
+static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
+                                 nix::Value ** args, nix::Value & out)
+{
+    ns.forceValue(*args[0], pos);
+    if (args[0]->type() != nix::nInt)
+        ns.error<nix::EvalError>("v3 forceListElem: handle must be int").debugThrow();
+    int64_t h = args[0]->integer().value;
+    auto & tbl = v3BridgeLists();
+    if (h < 0 || (size_t)h >= tbl.size())
+        ns.error<nix::EvalError>("v3 forceListElem: invalid handle").debugThrow();
+    Value v3list = tbl[(size_t)h];
+    if (v3list.tag() != Tag::List || !v3list.payload.list)
+        ns.error<nix::EvalError>("v3 forceListElem: handle does not point to a List").debugThrow();
+
+    ns.forceValue(*args[1], pos);
+    if (args[1]->type() != nix::nInt)
+        ns.error<nix::EvalError>("v3 forceListElem: index must be int").debugThrow();
+    int64_t idx = args[1]->integer().value;
+    const ListVec * l = v3list.payload.list;
+    if (idx < 0 || (uint32_t)idx >= l->size)
+        ns.error<nix::EvalError>("v3 forceListElem: index out of range").debugThrow();
+
+    extern thread_local nix::EvalState * tlNixEvalState;
+    if (!tlNixEvalState) tlNixEvalState = &ns;
+    EvalState v3state;
+    v3state.nixEvalState = &ns;
+    static thread_local VMState bridgeVmList;
+    bridgeVmList.valueStack.reserve(64 * 1024);
+    bridgeVmList.frames.reserve(4096);
+    bridgeVmList.withStack.reserve(64);
+    v3state.vm = &bridgeVmList;
+
+    nix::Value * tmp = v3ToTreeWalker(v3state, l->elems[(uint32_t)idx]);
+    if (tmp) out = *tmp; else out.mkNull();
+}
+
 /// Recursively convert a v3 Value to a tree-walker nix::Value, allocated
 /// in the EvalState's GC arena.  Used by primDerivationStrict to bridge
 /// to tree-walker's real derivation hasher.  Functions are converted as
@@ -2224,12 +2330,56 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         break;
     }
     case Tag::List: {
+        // WC-15 lazy bridge: defer per-element conversion via App
+        // primop calls, so nixpkgs's huge / self-referential lists
+        // don't trigger eager-recursion cycles.  Gated by
+        // NIX_V3_NO_LAZY_BRIDGE for A/B testing and fallback.
         auto * lv = v.payload.list;
         uint32_t n = lv ? lv->size : 0;
-        auto lb = ns.buildList(n);
-        for (uint32_t i = 0; i < n; ++i)
-            lb[i] = v3ToTreeWalker(state, lv->elems[i], seen);
-        out->mkList(lb);
+        static const bool noLazy =
+            std::getenv("NIX_V3_NO_LAZY_BRIDGE") != nullptr;
+        if (noLazy || n <= 4) {
+            auto lb = ns.buildList(n);
+            for (uint32_t i = 0; i < n; ++i)
+                lb[i] = v3ToTreeWalker(state, lv->elems[i], seen);
+            out->mkList(lb);
+        } else {
+            // Register the v3 list value so the lazy primop can
+            // fetch elements by index.  Identity-stable across
+            // primop calls — lookup cost is O(1).
+            static nix::Value * lazyListPrim = nullptr;
+            if (!lazyListPrim) {
+                auto * po = new nix::PrimOp{
+                    .name  = "__v3_force_list_elem",
+                    .args  = {"handle", "idx"},
+                    .arity = 2,
+                    .doc   = std::nullopt,
+                    .impl  = nix::fun<nix::PrimOpFun>{primV3ForceListElem},
+                };
+                nix::Value * pv = ns.allocValue();
+                pv->mkPrimOp(po);
+                lazyListPrim = pv;
+            }
+            auto & tbl = v3BridgeLists();
+            size_t handle = tbl.size();
+            tbl.push_back(v);
+            nix::Value * vHandle = ns.allocValue();
+            vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
+            // PrimOpApp(__v3_force_list_elem, handle) is a 1-arg-of-2
+            // partial application; combining with idx (App) makes it
+            // fully applied.  Tree-walker forces App by callFunction.
+            nix::Value * vPartial = ns.allocValue();
+            vPartial->mkPrimOpApp(lazyListPrim, vHandle);
+            auto lb = ns.buildList(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                nix::Value * vIdx = ns.allocValue();
+                vIdx->mkInt(static_cast<nix::NixInt::Inner>(i));
+                nix::Value * vApp = ns.allocValue();
+                vApp->mkApp(vPartial, vIdx);
+                lb[i] = vApp;
+            }
+            out->mkList(lb);
+        }
         break;
     }
     case Tag::Attrs: {
@@ -2249,21 +2399,76 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             v3SymCacheFor = &ns;
             v3SymCache.clear();
         }
-        if (b) for (uint32_t i = 0; i < b->size; ++i) {
-            SymbolId sid = b->entries[i].name;
-            nix::Symbol resolved;
-            if (sid < v3SymCache.size() && v3SymCache[sid]) {
-                resolved = v3SymCache[sid];
-            } else {
+        // WC-15 lazy bridge: for non-trivial attrsets, defer per-attr
+        // conversion via App primop calls so nixpkgs's huge self-
+        // referential pkgs structure doesn't trigger eager-recursion
+        // cycles.  Small attrsets stay eager (lower overhead).
+        static const bool noLazy =
+            std::getenv("NIX_V3_NO_LAZY_BRIDGE") != nullptr;
+        size_t bSize = b ? b->size : 0;
+        if (noLazy || bSize <= 4) {
+            if (b) for (uint32_t i = 0; i < b->size; ++i) {
+                SymbolId sid = b->entries[i].name;
+                nix::Symbol resolved;
+                if (sid < v3SymCache.size() && v3SymCache[sid]) {
+                    resolved = v3SymCache[sid];
+                } else {
+                    std::string_view n = sid < symTab.size()
+                        ? std::string_view(symTab[sid])
+                        : std::string_view{};
+                    resolved = ns.symbols.create(n);
+                    if (sid >= v3SymCache.size())
+                        v3SymCache.resize(sid + 1);
+                    v3SymCache[sid] = resolved;
+                }
+                bb.insert(resolved, v3ToTreeWalker(state, b->entries[i].value, seen));
+            }
+        } else {
+            // Register the original v3 attrset for later lookup.
+            static nix::Value * lazyAttrPrim = nullptr;
+            if (!lazyAttrPrim) {
+                auto * po = new nix::PrimOp{
+                    .name  = "__v3_force_attr",
+                    .args  = {"handle", "name"},
+                    .arity = 2,
+                    .doc   = std::nullopt,
+                    .impl  = nix::fun<nix::PrimOpFun>{primV3ForceAttr},
+                };
+                nix::Value * pv = ns.allocValue();
+                pv->mkPrimOp(po);
+                lazyAttrPrim = pv;
+            }
+            auto & tbl = v3BridgeAttrs();
+            size_t handle = tbl.size();
+            tbl.push_back(v);
+            nix::Value * vHandle = ns.allocValue();
+            vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
+            nix::Value * vPartial = ns.allocValue();
+            vPartial->mkPrimOpApp(lazyAttrPrim, vHandle);
+            for (uint32_t i = 0; i < b->size; ++i) {
+                SymbolId sid = b->entries[i].name;
+                nix::Symbol resolved;
+                if (sid < v3SymCache.size() && v3SymCache[sid]) {
+                    resolved = v3SymCache[sid];
+                } else {
+                    std::string_view n = sid < symTab.size()
+                        ? std::string_view(symTab[sid])
+                        : std::string_view{};
+                    resolved = ns.symbols.create(n);
+                    if (sid >= v3SymCache.size())
+                        v3SymCache.resize(sid + 1);
+                    v3SymCache[sid] = resolved;
+                }
+                // Each attr value: App(PrimOpApp(__v3_force_attr, handle), nameStr).
                 std::string_view n = sid < symTab.size()
                     ? std::string_view(symTab[sid])
                     : std::string_view{};
-                resolved = ns.symbols.create(n);
-                if (sid >= v3SymCache.size())
-                    v3SymCache.resize(sid + 1);
-                v3SymCache[sid] = resolved;
+                nix::Value * vName = ns.allocValue();
+                vName->mkString(n, ns.mem);
+                nix::Value * vApp = ns.allocValue();
+                vApp->mkApp(vPartial, vName);
+                bb.insert(resolved, vApp);
             }
-            bb.insert(resolved, v3ToTreeWalker(state, b->entries[i].value, seen));
         }
         out->mkAttrs(bb);
         break;
