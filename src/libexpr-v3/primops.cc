@@ -2041,9 +2041,16 @@ void primDerivation(EvalState & state, Value * args, Value & out);
 /// Forward decls for the v3 closure bridging — used so a v3 closure
 /// passed to the tree-walker (e.g. as a `filter` function on
 /// `builtins.path`) becomes a real callable on the tree-walker side.
-static std::vector<Value> & v3BridgeClosures()
+/// WC-19+: closure bridge mirrors attr/list bridges — also stores
+/// a fallback Expr so primV3CallBridge1/2 can re-run the outer
+/// Expr through tree-walker on a v3-only blackhole.
+struct BridgeClosureEntry {
+    Value v3Value;
+    nix::Expr * fallbackExpr = nullptr;
+};
+static std::vector<BridgeClosureEntry> & v3BridgeClosures()
 {
-    static std::vector<Value> tbl;
+    static std::vector<BridgeClosureEntry> tbl;
     return tbl;
 }
 
@@ -2109,7 +2116,8 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 bridge1: invalid handle").debugThrow();
-    Value v3fn = tbl[(size_t)h];
+    Value v3fn = tbl[(size_t)h].v3Value;
+    nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
 
     extern thread_local nix::EvalState * tlNixEvalState;
     if (!tlNixEvalState) tlNixEvalState = &ns;
@@ -2125,70 +2133,103 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     // to direct call to keep the driver protocol simple.
     static const bool useFiber =
         std::getenv("NIX_V3_FIBER_BRIDGE") != nullptr;
+
+    // WC-19+: wrap the v3 evaluation in try/catch so a v3-only
+    // blackhole on closure-body forces falls back to tree-walker
+    // (re-running fallbackExpr to obtain a tree-walker function,
+    // then calling it with args[1]).  Same safety net WC-19 added
+    // for primV3ForceAttr / primV3ForceListElem.  Only blackhole-
+    // shaped runtime_errors trigger fallback — other failures (e.g.
+    // wrong arg / type errors) are real bugs we don't want to mask.
+    auto isBlackhole = [](const std::exception & ex) {
+        const char * w = ex.what();
+        if (!w) return false;
+        return std::strstr(w, "infinite recursion (blackhole)") != nullptr
+            || std::strstr(w, "v3 forceValue: infinite recursion") != nullptr;
+    };
+    auto fallbackToTreeWalker = [&](const std::exception & ex) {
+        if (!fallbackExpr || !isBlackhole(ex)) throw std::runtime_error(ex.what());
+        static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
+        if (dbg) std::fprintf(stderr,
+            "v3 bridge1: v3 path blackholed: %s — re-running fallback Expr "
+            "via tree-walker\n", ex.what());
+        nix::Value tw;
+        fallbackExpr->eval(ns, ns.baseEnv, tw);
+        ns.forceValue(tw, pos);
+        // tw should be a function; call it with args[1].
+        ns.callFunction(tw, *args[1], out, pos);
+    };
+
     Value fn;
-    if (useFiber && activeFiberDriverDepth == 0) {
-        fn = runInFiber(ns, [&](Mailbox * /*mb*/) -> Value {
-            // Each fiber gets its own VMState (isolation on top of
-            // stack isolation).  Allocated on the fiber's stack.
-            VMState fiberVm;
-            fiberVm.valueStack.reserve(64 * 1024);
-            fiberVm.frames.reserve(4096);
-            fiberVm.withStack.reserve(64);
-            EvalState fs;
-            fs.nixEvalState = &ns;
-            fs.vm = &fiberVm;
-            Value v3arg = treeWalkerToV3(fs, *args[1]);
-            Value r = callClosure(*fs.vm, v3fn, v3arg);
-            return forceValue(*fs.vm, r);
-        });
-    } else {
-        EvalState v3state;
-        v3state.nixEvalState = &ns;
-        static thread_local VMState bridgeVm1;
-        bridgeVm1.valueStack.reserve(64 * 1024);
-        bridgeVm1.frames.reserve(4096);
-        bridgeVm1.withStack.reserve(64);
-        v3state.vm = &bridgeVm1;
-        Value v3arg = treeWalkerToV3(v3state, *args[1]);
-        fn = callClosure(*v3state.vm, v3fn, v3arg);
-        fn = forceValue(*v3state.vm, fn);
+    try {
+        if (useFiber && activeFiberDriverDepth == 0) {
+            fn = runInFiber(ns, [&](Mailbox * /*mb*/) -> Value {
+                // Each fiber gets its own VMState (isolation on top of
+                // stack isolation).  Allocated on the fiber's stack.
+                VMState fiberVm;
+                fiberVm.valueStack.reserve(64 * 1024);
+                fiberVm.frames.reserve(4096);
+                fiberVm.withStack.reserve(64);
+                EvalState fs;
+                fs.nixEvalState = &ns;
+                fs.vm = &fiberVm;
+                Value v3arg = treeWalkerToV3(fs, *args[1]);
+                Value r = callClosure(*fs.vm, v3fn, v3arg);
+                return forceValue(*fs.vm, r);
+            });
+        } else {
+            EvalState v3state;
+            v3state.nixEvalState = &ns;
+            static thread_local VMState bridgeVm1;
+            bridgeVm1.valueStack.reserve(64 * 1024);
+            bridgeVm1.frames.reserve(4096);
+            bridgeVm1.withStack.reserve(64);
+            v3state.vm = &bridgeVm1;
+            Value v3arg = treeWalkerToV3(v3state, *args[1]);
+            fn = callClosure(*v3state.vm, v3fn, v3arg);
+            fn = forceValue(*v3state.vm, fn);
+        }
+    } catch (const std::exception & ex) {
+        fallbackToTreeWalker(ex);
+        return;
     }
 
     // Convert the v3 result back to tree-walker.  Use the full
     // recursive bridge so attrsets / lists / nested closures
     // round-trip correctly.
-    switch (fn.tag()) {
-    case Tag::Bool:   out.mkBool(fn.payload.i == 1); break;
-    case Tag::Int:    out.mkInt(fn.payload.i); break;
-    case Tag::Float:  out.mkFloat(fn.payload.f); break;
-    case Tag::Null:   out.mkNull(); break;
-    case Tag::String: out.mkString(fn.payload.str ? fn.payload.str : "", ns.mem); break;
-    case Tag::Uninitialized:
-    case Tag::Path:
-    case Tag::Attrs:
-    case Tag::List:
-    case Tag::Closure:
-    case Tag::Thunk:
-    case Tag::PrimOp:
-    case Tag::PrimOpApp:
-    case Tag::App:
-    case Tag::Blackhole:
-    case Tag::External: {
-        // Build a temporary EvalState for the v3-side bridge.  The
-        // VMState here is purely for the recursive structural walk;
-        // it doesn't run bytecode (treeWalkerToV3 inverse direction
-        // is non-bytecode).
-        EvalState bridgeState;
-        bridgeState.nixEvalState = &ns;
-        static thread_local VMState resultBridgeVm;
-        resultBridgeVm.valueStack.reserve(64 * 1024);
-        resultBridgeVm.frames.reserve(4096);
-        resultBridgeVm.withStack.reserve(64);
-        bridgeState.vm = &resultBridgeVm;
-        nix::Value * tmp = v3ToTreeWalker(bridgeState, fn);
-        if (tmp) out = *tmp; else out.mkNull();
-        break;
-    }
+    try {
+        switch (fn.tag()) {
+        case Tag::Bool:   out.mkBool(fn.payload.i == 1); break;
+        case Tag::Int:    out.mkInt(fn.payload.i); break;
+        case Tag::Float:  out.mkFloat(fn.payload.f); break;
+        case Tag::Null:   out.mkNull(); break;
+        case Tag::String: out.mkString(fn.payload.str ? fn.payload.str : "", ns.mem); break;
+        case Tag::Uninitialized:
+        case Tag::Path:
+        case Tag::Attrs:
+        case Tag::List:
+        case Tag::Closure:
+        case Tag::Thunk:
+        case Tag::PrimOp:
+        case Tag::PrimOpApp:
+        case Tag::App:
+        case Tag::Blackhole:
+        case Tag::External: {
+            EvalState bridgeState;
+            bridgeState.nixEvalState = &ns;
+            static thread_local VMState resultBridgeVm;
+            resultBridgeVm.valueStack.reserve(64 * 1024);
+            resultBridgeVm.frames.reserve(4096);
+            resultBridgeVm.withStack.reserve(64);
+            bridgeState.vm = &resultBridgeVm;
+            nix::Value * tmp = v3ToTreeWalker(bridgeState, fn);
+            if (tmp) out = *tmp; else out.mkNull();
+            break;
+        }
+        }
+    } catch (const std::exception & ex) {
+        fallbackToTreeWalker(ex);
+        return;
     }
 }
 
@@ -2205,7 +2246,11 @@ static void primV3CallBridge2(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 bridge: invalid handle").debugThrow();
-    Value v3fn = tbl[(size_t)h];
+    Value v3fn = tbl[(size_t)h].v3Value;
+    // Note: primV3CallBridge2 (legacy 2-arg form) doesn't currently
+    // implement the WC-19+ tree-walker fallback.  In practice it's
+    // only used for the `builtins.path { filter = path: type: ...; }`
+    // shape; the 1-arg variant has the safety net.
     // Convert tree-walker args to v3, force only on demand inside the
     // v3 closure — we deepForce here to preserve the invariant that
     // v3 closures see WHNF.
@@ -2311,17 +2356,25 @@ static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
     // tree-walker would resolve.  The eager-bridge path catches these
     // in v3_hook.cc's Tag::Attrs try/catch and falls back to tree-
     // walker on the outer Expr.  The lazy path was missing that
-    // safety net — reproduce it here.
+    // safety net — reproduce it here.  Only catch blackhole-shaped
+    // errors so genuine bugs (type errors, missing args, ...)
+    // surface instead of being masked.
+    auto isBlackholeAttr = [](const std::exception & ex) {
+        const char * w = ex.what();
+        if (!w) return false;
+        return std::strstr(w, "infinite recursion (blackhole)") != nullptr
+            || std::strstr(w, "v3 forceValue: infinite recursion") != nullptr;
+    };
     nix::Symbol resolvedName = ns.symbols.create(name);
     try {
         nix::Value * tmp = v3ToTreeWalker(v3state, *found);
         if (tmp) out = *tmp; else out.mkNull();
         return;
     } catch (const std::exception & ex) {
-        if (!fallbackExpr) throw;
+        if (!fallbackExpr || !isBlackholeAttr(ex)) throw;
         static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
         if (dbg) std::fprintf(stderr,
-            "v3 forceAttr: bridge threw: %s — re-running outer Expr "
+            "v3 forceAttr: bridge blackholed: %s — re-running outer Expr "
             "via tree-walker for attr '%s'\n",
             ex.what(), std::string(name).c_str());
         nix::Value tw;
@@ -2374,16 +2427,22 @@ static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
     bridgeVmList.withStack.reserve(64);
     v3state.vm = &bridgeVmList;
 
-    // WC-19: same safety net as primV3ForceAttr.
+    // WC-19: same safety net as primV3ForceAttr.  Only blackholes.
+    auto isBlackholeList = [](const std::exception & ex) {
+        const char * w = ex.what();
+        if (!w) return false;
+        return std::strstr(w, "infinite recursion (blackhole)") != nullptr
+            || std::strstr(w, "v3 forceValue: infinite recursion") != nullptr;
+    };
     try {
         nix::Value * tmp = v3ToTreeWalker(v3state, l->elems[(uint32_t)idx]);
         if (tmp) out = *tmp; else out.mkNull();
         return;
     } catch (const std::exception & ex) {
-        if (!fallbackExpr) throw;
+        if (!fallbackExpr || !isBlackholeList(ex)) throw;
         static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
         if (dbg) std::fprintf(stderr,
-            "v3 forceListElem: bridge threw: %s — re-running outer Expr "
+            "v3 forceListElem: bridge blackholed: %s — re-running outer Expr "
             "via tree-walker for index %lld\n",
             ex.what(), (long long)idx);
         nix::Value tw;
@@ -2613,7 +2672,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         }
         auto & tbl = v3BridgeClosures();
         size_t handle = tbl.size();
-        tbl.push_back(v);
+        tbl.push_back({v, tlBridgeFallbackExpr});
         nix::Value * vHandle = ns.allocValue();
         vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
         out->mkPrimOpApp(bridgePrimOp1, vHandle);

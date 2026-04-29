@@ -856,8 +856,15 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             e->eval(state, state.baseEnv, v);
             return;
         }
+        // WC-20: capture outer Expr so primV3CallBridge1's lazy
+        // safety net can fall back to tree-walker on a deferred
+        // v3-only blackhole inside the closure body.
+        extern thread_local nix::Expr * tlBridgeFallbackExpr;  // primops.cc
+        nix::Expr * savedFallback = tlBridgeFallbackExpr;
+        tlBridgeFallbackExpr = const_cast<nix::Expr *>(e);
         try {
             nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
+            tlBridgeFallbackExpr = savedFallback;
             if (tmp) {
                 v = *tmp;
                 if (diag) std::fprintf(stderr,
@@ -866,6 +873,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 return;
             }
         } catch (const std::exception &) {
+            tlBridgeFallbackExpr = savedFallback;
             // bridge fail — fall through to tree-walker
         }
         if (diag) std::fprintf(stderr,
