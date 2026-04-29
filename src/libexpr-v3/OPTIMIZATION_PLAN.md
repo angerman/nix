@@ -2231,6 +2231,68 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-29 — WC-23 force-hook InfiniteRecursionError verification
+
+Two parallel research agents disagreed on whether the cycle was
+**synchronous** (inside the v3 force hook's own forceValue
+callback) or **post-return** (after the hook returns, in tree-
+walker's continuing eval).  The 5-minute verification:
+
+  1. Add diagnostic prints on the `try`/`catch` boundary of
+     v3_hook.cc:1187 — both the existing "run threw" and a new
+     "ran ok, tag=N" on success.
+  2. Run the failing repro with `V3_DEBUG_HOOK=1`.
+
+Result on `(import nixpkgs).hello.name`:
+
+```
+v3 force hook entries: 17
+  ran ok (returned to caller): 15
+  run threw (caught in v3): 2  (callee-not-closure, search-path miss)
+  run threw NON-std-exception: 0
+LAST ENTRY before user-visible error:
+  v3 force hook: CU hit fid=18 nUp=0, running 3394 insts
+  v3 force hook: ran ok, tag=9        ← Closure
+error: infinite recursion encountered ← from tree-walker, post-return
+```
+
+**Conclusion**: every InfiniteRecursionError that reaches the user
+is thrown AFTER the v3 force hook returned.  The synchronous-
+re-entrance hypothesis (Agent 1) was wrong.  The cycle is
+post-return, in tree-walker's continuing eval — confirmed.
+
+`fid=18` returns Tag::Closure, the force hook hits the
+`case Tag::Closure: return false` branch (line 1228-1237), and
+tree-walker calls `expr->eval` next.  The v3 run completed
+successfully, but during its execution v3's eager upvalue
+materialisation forced a tree-walker `args` thunk that, in tree-
+walker's natural eval order, would have been forced lazily inside
+the lambda body **after** the outer `intersectAttrs ... // args`
+operation.  Eval-order divergence — the WC-12/16/17 finding,
+finally pinned to a specific Expr* class.
+
+### Implication for fix design
+
+  - A v3-side catch in primV3CallBridge1 / primV3ForceAttr (the
+    WC-19/20 pattern) **cannot help here** — by the time the
+    error fires, v3 has already returned true.
+  - A v3-side mark-and-yield in tree-walker's force loop
+    (Agent 1's recommendation (c)) **cannot help either** — there
+    is no synchronous re-entrance to detect.  The cycle is in
+    a future force frame from a future eval call.
+  - The remaining options are either (a) prevent v3's eager
+    upvalue materialisation from forcing thunks tree-walker would
+    keep lazy, or (b) restrict the force-hook to Expr kinds
+    proven not to trigger this divergence (callPackageWith,
+    intersectAttrs, and `//`-operand thunks are demonstrated
+    triggers).  Both are multi-day efforts.
+
+Per Agent 2's profiling, force-hook off keeps v3 at ~0.1 % of
+wall-clock on real workloads.  The next-best independent
+direction is BR-style native primops (the BR-3 / BR-4 pattern
+extended to `map` / `filter` / `attrNames` / `elemAt`), which
+ship value without depending on the force-hook.
+
 ## 2026-04-29 — WC-20 blackhole-only fallback + closure-bridge fallback infra
 
 Tightening WC-19 + extending the safety net to the closure bridge.

@@ -1193,7 +1193,13 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
         auto sit2 = v3SubExprCache().find(e);
         if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailed = true;
         return false;  // Fall back: tree-walker handles the rest.
+    } catch (...) {
+        if (diag) std::fprintf(stderr, "v3 force hook: run threw NON-std-exception (likely BaseError-only)\n");
+        auto sit2 = v3SubExprCache().find(e);
+        if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailed = true;
+        return false;
     }
+    if (diag) std::fprintf(stderr, "v3 force hook: ran ok, tag=%d\n", (int)r.tag());
 
     // Bridge result back to tree-walker Value.  Mirror the eval hook's
     // logic — same bridge, same fallback rules.
