@@ -2250,15 +2250,38 @@ Closure bridge gained the same infra:
   - v3_hook.cc's `case Tag::Closure / PrimOp / PrimOpApp` block sets
     `tlBridgeFallbackExpr` so the closure handle inherits the Expr.
 
-### What's still deferred under BRIDGE_CLOSURE
+### BRIDGE_CLOSURE status — WC-21 fixed both blockers
 
-`NIX_V3_BRIDGE_CLOSURE=1` is **still default-OFF**.  Turning it on
-surfaces a separate v3 issue: even after the WC-20 fallback recovers
-from the first blackhole, a downstream v3 hook entry produces a
-closure that, when later called, throws `v3 OP_ATTRS_SELECT:
-attribute not found`.  This isn't a blackhole — it's a real v3↔
-tree-walker semantic divergence (closure args have different attr
-shape).  Diagnosing this is its own task (WC-21, deferred).
+`NIX_V3_BRIDGE_CLOSURE=1` now **passes** all sweeps.  Both blockers
+shared a single root cause: bridging v3 closures with formal-attrset
+patterns (`{a, b ? def}: ...`) as `PrimOpApp(__v3_call_bridge_1,
+handle)` strips the formals, so tree-walker's `autoCallFunction`
+won't fire (it only runs for `nLambda` values).  The call arrived
+without auto-args, and v3's body threw `OP_ATTRS_SELECT` for the
+missing formals.  The "SIGSEGV under FIBER_BRIDGE" was the same
+attr-shape mismatch resolving differently inside a fiber stack
+frame (the unhandleable signal context bypassed the SEGV handler).
+
+Fix: in v3_hook.cc's Tag::Closure case **and** in v3ToTreeWalker's
+Tag::Closure case, check `desc->hasFormals` before bridging.  If
+true, fall back to tree-walker eval (so `autoCallFunction` fires
+properly).  Only bare `x: ...` lambdas go through the bridge.
+
+Validation:
+  - lang tests: 142/142
+  - cutover lang tests: 142/142 (BRIDGE_CLOSURE=1)
+  - drv-parity: 25/25 (BRIDGE_CLOSURE=1)
+  - bench (fib35, hello-name, drv3, attr-pkgs, attr-hask): 5/5 rc=0
+    under both `BRIDGE_CLOSURE=1` alone and `BRIDGE_CLOSURE +
+    FIBER_BRIDGE=1`.
+  - Full WC-18.6 stress combo: rc=0 under all flag combinations.
+
+Diagnostic: `V3_DBG_ATTRS_SELECT=1` in vm.cc dumps the requested
+SymbolId / name and the present-attrset names on a select miss —
+makes any future closure-bridge attr-shape divergence trivial to
+root-cause.
+
+Both still default-OFF (need a perf bench to justify on cost).
 
 ### Validation (default flags only)
 

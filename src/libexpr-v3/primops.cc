@@ -2651,6 +2651,18 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
     case Tag::Closure:
     case Tag::PrimOp:
     case Tag::PrimOpApp: {
+        // WC-21: closures with formal-attrset patterns (`{a, b ? def}: ...`)
+        // can't be safely bridged as PrimOpApp(__v3_call_bridge_1, handle):
+        // tree-walker's autoCallFunction only fires for nLambda values,
+        // not primops, so the call arrives without auto-args and v3's
+        // body throws OP_ATTRS_SELECT for missing formals.  Signal bridge
+        // failure (return null) so the caller falls back to tree-walker.
+        if (v.tag() == Tag::Closure
+            && v.payload.closure
+            && v.payload.closure->desc
+            && v.payload.closure->desc->hasFormals) {
+            return nullptr;
+        }
         // Bridge the v3 closure as a tree-walker primop application.
         // We register `__v3_call_bridge_1` (arity 2: handle, arg) so
         // partial-application on the handle gives tree-walker a 1-arg
@@ -2666,9 +2678,9 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 .doc   = std::nullopt,
                 .impl  = nix::fun<nix::PrimOpFun>{primV3CallBridge1},
             };
-            nix::Value * v = ns.allocValue();
-            v->mkPrimOp(po);
-            bridgePrimOp1 = v;
+            nix::Value * vp = ns.allocValue();
+            vp->mkPrimOp(po);
+            bridgePrimOp1 = vp;
         }
         auto & tbl = v3BridgeClosures();
         size_t handle = tbl.size();

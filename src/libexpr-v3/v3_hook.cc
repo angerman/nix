@@ -856,6 +856,25 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             e->eval(state, state.baseEnv, v);
             return;
         }
+        // WC-21: if the v3 closure expects formals (e.g. `{a, b ? def}: ...`),
+        // bridging it as `PrimOpApp(__v3_call_bridge_1, handle)` strips the
+        // formals — tree-walker's autoCallFunction won't fire for a primop,
+        // so the call arrives with the raw arg and v3's body throws
+        // OP_ATTRS_SELECT for the missing formals.  Fall back to tree-walker
+        // for these; only bridge plain `x: ...` lambdas.
+        if (r.tag() == Tag::Closure
+            && r.payload.closure
+            && r.payload.closure->desc
+            && r.payload.closure->desc->hasFormals)
+        {
+            if (diag) std::fprintf(stderr,
+                "v3 hook: closure has formals (%zu) — falling back to "
+                "tree-walker so auto-args work\n",
+                r.payload.closure->desc->formals.size());
+            st.evalFallbackReason[1]++;
+            e->eval(state, state.baseEnv, v);
+            return;
+        }
         // WC-20: capture outer Expr so primV3CallBridge1's lazy
         // safety net can fall back to tree-walker on a deferred
         // v3-only blackhole inside the closure body.

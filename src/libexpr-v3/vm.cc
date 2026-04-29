@@ -1380,8 +1380,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (midName == static_cast<SymbolId>(operand)) { lo = mid; break; }
                     if (midName < static_cast<SymbolId>(operand)) lo = mid + 1; else hi = mid;
                 }
-                if (lo >= b->size || b->entries[lo].name != static_cast<SymbolId>(operand))
+                if (lo >= b->size || b->entries[lo].name != static_cast<SymbolId>(operand)) {
+                    // WC-21 diagnostic: dump requested attr + present
+                    // attr names to help root-cause closure-bridge
+                    // attr-shape divergences.  Off by default.
+                    static const bool dbg = std::getenv("V3_DBG_ATTRS_SELECT") != nullptr;
+                    if (dbg) {
+                        auto & symTab = ir::globalSymbolTable();
+                        SymbolId want = static_cast<SymbolId>(operand);
+                        std::fprintf(stderr,
+                            "v3 OP_ATTRS_SELECT miss: want sid=%u name=\"%s\" "
+                            "bindings=%p size=%u present=[",
+                            (unsigned)want,
+                            want < symTab.size() ? symTab[want].c_str() : "?",
+                            (void*)b, (unsigned)b->size);
+                        for (uint32_t i = 0; i < b->size && i < 20; ++i) {
+                            SymbolId nm = b->entries[i].name;
+                            std::fprintf(stderr, "%s%s",
+                                i ? "," : "",
+                                nm < symTab.size() ? symTab[nm].c_str() : "?");
+                        }
+                        if (b->size > 20) std::fprintf(stderr, ",...");
+                        std::fprintf(stderr, "]\n");
+                    }
                     throw std::runtime_error("v3 OP_ATTRS_SELECT: attribute not found");
+                }
                 ic.lastBindings = b;
                 ic.lastSlot     = lo;
                 push(vm, b->entries[lo].value);
