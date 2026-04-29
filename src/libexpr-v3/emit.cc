@@ -582,6 +582,7 @@ struct Emitter
             .hasFormals     = static_cast<uint8_t>(f.hasFormals ? 1 : 0),
             .ellipsis       = static_cast<uint8_t>(f.ellipsis ? 1 : 0),
             .formals        = {},
+            .name           = f.name,
         };
         if (f.hasFormals) {
             auto & desc = unit.lambdas[fid];

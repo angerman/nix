@@ -2153,6 +2153,84 @@ to coroutines, with cleaner semantic match to tree-walker.
 If Option 4 turns out to leak other ordering differences (other
 ExprXxx kinds), then coroutines (Option 3) become the fallback.
 
+## 2026-04-29 — WC-17 diagnostics: named-frame cycle dump (LANDED, fix DEFERRED)
+
+Built lightweight cycle-diagnostic infrastructure:
+
+  - **LambdaDescriptor.name**: new field copied from ir::Function::name
+    by emit().  Lets `OP_FORCE` blackhole detection map frame
+    pointers back to source-level rec-attrset attr names.
+  - **V3_DBG_OPCYCLE** env-gate: when set, dumps the v3 frame stack
+    with function names, code offsets, nUpvalues, nLocals, and per-
+    frame ip values at the moment the cycle fires.
+
+### Diagnostic output on the failing case
+
+`(import nixpkgs).system` with `NIX_USE_V3=1 NIX_V3_BRIDGE_CLOSURE=1`:
+
+  ```
+  v3 OP_FORCE Black thunk=0x8639027f0 frames=5 callerIp=627
+    frame[4]: release  code=[615..)  nUp=1 nLocals=6   flags=1 ip=622
+    frame[3]: <thunk>  code=[4028..) nUp=1 nLocals=5   flags=1 ip=218
+    frame[2]: <thunk>  code=[3916..) nUp=1 nLocals=5   flags=1 ip=3925
+    frame[1]: checked  code=[443..)  nUp=2 nLocals=44  flags=1 ip=450
+    frame[0]: args     code=[0..)    nUp=0 nLocals=12  flags=0 ip=153
+  ```
+
+  - frame[4] `release` = lib/trivial.nix:365 `release = lib.strings.fileContents ./.version`
+  - frame[1] `checked` = lib/modules.nix:301 `checked = builtins.seq checkUnmatched`
+  - frame[0] `args`    = nixpkgs/default.nix's outer lambda body
+
+The cycle thunk is at frame[3], anonymous (likely a `thunkify`-
+generated thunk for a lazy primop arg or attr value).  Its IP=218
+is far smaller than its codeOffset=4028 — meaning IP is **not**
+within frame[3]'s own function.  The frames are running in a
+DIFFERENT CompilationUnit than their declared closure descriptor.
+
+### Diagnostic finding
+
+The frame.cu and frame.closure->desc reference DIFFERENT
+CompilationUnits.  v3's lower creates per-attr Functions in the
+parent CU; primV3CallBridge1 / cross-CU lookups switch CUs when
+calling into v3-imported functions (e.g., `lib.strings.fileContents`
+is defined in a different file, so its CU is different from the
+caller's).  When release's body calls fileContents, dispatch
+crosses CU boundaries.  The ip relative to its own desc is then
+meaningless — it's inside another CU's code region.
+
+This explains why simple lib-only probes work (single CU, no
+boundary issues) but full nixpkgs fails (cross-CU calls into
+imported lib utilities).
+
+### Fix scoping (final)
+
+The actual fix requires either:
+
+  1. **Bytecode disassembler** to identify the specific OP at the
+     CU boundary that creates the cycle.  Likely an OP_GET_LOCAL_FORCE
+     or OP_FORCE emitted in cross-CU resume code that should have
+     been deferred.  ~1-2 days work for the disassembler alone.
+  2. **Re-engineer cross-CU calling** to defer forces consistent
+     with tree-walker's lazy semantics.  Substantial refactor.
+  3. **Coroutine isolation** (Option 3) — sidesteps the issue by
+     decoupling v3's eval order from tree-walker's stack and
+     letting v3 complete its bytecode in isolation.
+
+After two diagnostic passes, the recommendation is back to
+**Option 3 (coroutine isolation)**.  The cross-CU eval order is
+the actual divergence point; matching tree-walker's lazy semantics
+across CU boundaries is harder than it first appeared.  Coroutines
+sidestep the problem cleanly.
+
+### What's landed
+
+  - `LambdaDescriptor.name` field
+  - `V3_DBG_OPCYCLE` diagnostic env var
+  - Documentation of the actual cross-CU eval-order divergence
+
+WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
+in favor of Option 3 implementation.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,

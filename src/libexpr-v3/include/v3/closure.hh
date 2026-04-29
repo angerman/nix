@@ -154,6 +154,11 @@ struct LambdaDescriptor
         uint32_t pos;
     };
     std::vector<Formal> formals;
+    /// WC-17.1 diagnostic name (lambda or rec-attrset attr name).
+    /// Mirrors ir::Function::name; populated by compile().  Used by
+    /// V3_DBG_OPCYCLE / disassembler dumps to map LambdaDescriptor
+    /// pointers back to the original AST scope.
+    std::string name;
 };
 
 struct ThunkDescriptor

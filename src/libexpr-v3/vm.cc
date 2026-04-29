@@ -1026,7 +1026,42 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             if (!v.isThunk()) { push(vm, v); break; }
             Thunk * t = v.payload.thunk;
-            if (t->state == ThunkState::Blackhole) throw std::runtime_error("v3 OP_FORCE: infinite recursion (blackhole)");
+            if (t->state == ThunkState::Blackhole) {
+                // WC-17.1 diagnostic: dump the v3 frame stack with
+                // function names + IP deltas when V3_DBG_OPCYCLE=1.
+                // The `name` field on LambdaDescriptor (populated by
+                // emit() from ir::Function::name) lets us correlate
+                // cycle frames back to source-level rec-attrset attr
+                // names — invaluable for diagnosing the closure-bridge
+                // cycle without a full bytecode disassembler.
+                static const bool s_dbg = std::getenv("V3_DBG_OPCYCLE") != nullptr;
+                if (s_dbg) {
+                    auto frameInfo = [&](Thunk * th, const Closure * cl, uint32_t fip) -> std::string {
+                        const LambdaDescriptor * desc = nullptr;
+                        if (th) desc = reinterpret_cast<const LambdaDescriptor *>(th->suspended.desc);
+                        else if (cl) desc = cl->desc;
+                        if (!desc) return "<closure-body>";
+                        char buf[256];
+                        std::snprintf(buf, sizeof buf,
+                            "%s code=[%u..) nUp=%u nLocals=%u",
+                            !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                            desc->codeOffset, desc->nUpvalues, desc->nLocals);
+                        return buf;
+                    };
+                    std::fprintf(stderr,
+                        "v3 OP_FORCE Black thunk=%p frames=%zu callerIp=%u\n",
+                        (void*)t, vm.frames.size(), ip - 1);
+                    size_t lim = vm.frames.size();
+                    for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                        const auto & fr = vm.frames[i - 1];
+                        std::fprintf(stderr,
+                            "  frame[%zu]: %s flags=%u ip=%u thunk=%p\n",
+                            i - 1, frameInfo(fr.thunk, fr.closure, fr.ip).c_str(),
+                            (unsigned)fr.flags, fr.ip, (void*)fr.thunk);
+                    }
+                }
+                throw std::runtime_error("v3 OP_FORCE: infinite recursion (blackhole)");
+            }
             // WC-10: Bridge thunk — call into tree-walker for the
             // single nix::Value*, then bridge the already-forced
             // result.  Defined in primops.cc so vm.cc stays free of
