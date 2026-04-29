@@ -2231,6 +2231,50 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-29 — WC-19 lazy-bridge blackhole fall-back
+
+Bisecting under `NIX_V3_FIBER_BRIDGE=1` after WC-18.6 surfaced a
+deterministic blackhole at exactly 5+ entries in any v3-bridged
+result attrset that touches `pkgs.X` (independent of fiber bridge,
+shape, or specific derivation):
+
+  - { a=1; b=2; c=3; e=pkgs.hello.outPath; }            → OK
+  - { a=1; b=2; c=3; d=4; e=pkgs.hello.outPath; }       → blackhole
+  - 5+ same `pkgs.hello.outPath` entries                → blackhole
+  - 4 different derivation outputs                      → OK
+
+Root cause: WC-15's lazy bridge fires for `bSize > 4` and registers
+deferred `__v3_force_attr(handle, name)` primops.  When tree-walker
+later forces a deferred attr, primV3ForceAttr re-enters v3 and
+forces v3 thunks reachable from the original v3 attrset.  That
+deeper force can hit a v3-only eval-order cycle (the `release` /
+`checked` thunks we've been chasing since WC-16) — the cycle tree-
+walker would resolve, but v3 sees as a blackhole.  The eager bridge
+already had a try/catch in v3_hook.cc's `case Tag::Attrs:` that
+caught such throws and re-ran the outer Expr through tree-walker;
+the lazy bridge was missing that safety net.
+
+### Fix
+
+1. Bridge tables now carry `(v3 Value, nix::Expr * fallbackExpr)`
+   per entry instead of just the Value.
+2. New TLS pointer `nix::v3::tlBridgeFallbackExpr` set by
+   v3_hook.cc just before invoking `v3ToTreeWalkerPublic`; lazy-
+   bridge registration captures it.
+3. `primV3ForceAttr` and `primV3ForceListElem` wrap the bridge
+   call in try/catch.  On any std::exception, if a fallback Expr
+   was recorded they re-run it through `nix::Expr::eval` and look
+   up the requested attr/index in the result.  Otherwise re-throw.
+
+### Validation
+
+  - lang tests: 142/142
+  - cutover lang tests: 142/142
+  - drv-parity: 25/25
+  - bench (fib35, hello-name, drv3, attr-pkgs, attr-hask): 5/5 rc=0
+  - WC-19 reproducer (5 attrs / 5+ entries): now succeeds with both
+    `NIX_V3_FIBER_BRIDGE=1` and default v3.
+
 ## 2026-04-28 — WC-18.6 fiber bridge fully validated (SIGSEGV root-caused & fixed)
 
 After feature-test-macro fix in `6d555b820`, the previously-attributed

@@ -74,6 +74,14 @@ namespace nix::v3 {
 void populateSubExprCachePublic(
     const ir::Module & module, const CompilationUnit * cu);
 
+/// WC-19: TLS pointer to the outer Expr the v3 hook is currently
+/// processing.  v3_hook.cc sets this before calling v3ToTreeWalker;
+/// the lazy-bridge registration captures it so primV3ForceAttr /
+/// primV3ForceListElem can fall back to tree-walker on a deferred
+/// blackhole (eval-order divergence v3 sees but tree-walker resolves).
+/// External linkage so v3_hook.cc can extern-reference it.
+thread_local nix::Expr * tlBridgeFallbackExpr = nullptr;
+
 namespace {
 
 std::unordered_map<std::string, PrimOp> & registry()
@@ -2046,16 +2054,31 @@ static std::vector<Value> & v3BridgeClosures()
 /// bridges the single requested attr's value.  Avoids the eager-
 /// recursion cycle that nixpkgs's lib.makeExtensible self-references
 /// trigger on the full attrset structural traversal.
-static std::vector<Value> & v3BridgeAttrs()
+///
+/// WC-19: also stores a fallback `nix::Expr *`.  When v3's blackhole
+/// detector trips during the deferred force (an eval-order cycle
+/// v3 sees but tree-walker would resolve), primV3ForceAttr re-runs
+/// the recorded outer Expr through tree-walker and looks up the
+/// requested attr in the result.  TLS-set by the v3 hook just
+/// before invoking v3ToTreeWalkerPublic.
+struct BridgeAttrEntry {
+    Value v3Value;
+    nix::Expr * fallbackExpr = nullptr;
+};
+struct BridgeListEntry {
+    Value v3Value;
+    nix::Expr * fallbackExpr = nullptr;
+};
+static std::vector<BridgeAttrEntry> & v3BridgeAttrs()
 {
-    static std::vector<Value> tbl;
+    static std::vector<BridgeAttrEntry> tbl;
     return tbl;
 }
 
 /// Same idea for lists — each element bridged lazily on force.
-static std::vector<Value> & v3BridgeLists()
+static std::vector<BridgeListEntry> & v3BridgeLists()
 {
-    static std::vector<Value> tbl;
+    static std::vector<BridgeListEntry> tbl;
     return tbl;
 }
 
@@ -2252,7 +2275,8 @@ static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeAttrs();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 forceAttr: invalid handle").debugThrow();
-    Value v3attrs = tbl[(size_t)h];
+    Value v3attrs = tbl[(size_t)h].v3Value;
+    nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
     if (v3attrs.tag() != Tag::Attrs || !v3attrs.payload.bindings)
         ns.error<nix::EvalError>("v3 forceAttr: handle does not point to an Attrs").debugThrow();
 
@@ -2283,8 +2307,37 @@ static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
     bridgeVmAttr.withStack.reserve(64);
     v3state.vm = &bridgeVmAttr;
 
-    nix::Value * tmp = v3ToTreeWalker(v3state, *found);
-    if (tmp) out = *tmp; else out.mkNull();
+    // WC-19: deferred forces can hit eval-order cycles v3 sees but
+    // tree-walker would resolve.  The eager-bridge path catches these
+    // in v3_hook.cc's Tag::Attrs try/catch and falls back to tree-
+    // walker on the outer Expr.  The lazy path was missing that
+    // safety net — reproduce it here.
+    nix::Symbol resolvedName = ns.symbols.create(name);
+    try {
+        nix::Value * tmp = v3ToTreeWalker(v3state, *found);
+        if (tmp) out = *tmp; else out.mkNull();
+        return;
+    } catch (const std::exception & ex) {
+        if (!fallbackExpr) throw;
+        static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
+        if (dbg) std::fprintf(stderr,
+            "v3 forceAttr: bridge threw: %s — re-running outer Expr "
+            "via tree-walker for attr '%s'\n",
+            ex.what(), std::string(name).c_str());
+        nix::Value tw;
+        fallbackExpr->eval(ns, ns.baseEnv, tw);
+        ns.forceValue(tw, pos);
+        if (tw.type() != nix::nAttrs)
+            ns.error<nix::EvalError>(
+                "v3 forceAttr: tree-walker fallback returned non-attrs").debugThrow();
+        auto * a = tw.attrs()->get(resolvedName);
+        if (!a)
+            ns.error<nix::EvalError>(
+                "v3 forceAttr: tree-walker fallback missing attr '%1%'",
+                std::string(name)).debugThrow();
+        ns.forceValue(*a->value, pos);
+        out = *a->value;
+    }
 }
 
 /// WC-15: lazy list-element bridge.  Args: handle (Int), index (Int).
@@ -2298,7 +2351,8 @@ static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeLists();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 forceListElem: invalid handle").debugThrow();
-    Value v3list = tbl[(size_t)h];
+    Value v3list = tbl[(size_t)h].v3Value;
+    nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
     if (v3list.tag() != Tag::List || !v3list.payload.list)
         ns.error<nix::EvalError>("v3 forceListElem: handle does not point to a List").debugThrow();
 
@@ -2320,8 +2374,31 @@ static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
     bridgeVmList.withStack.reserve(64);
     v3state.vm = &bridgeVmList;
 
-    nix::Value * tmp = v3ToTreeWalker(v3state, l->elems[(uint32_t)idx]);
-    if (tmp) out = *tmp; else out.mkNull();
+    // WC-19: same safety net as primV3ForceAttr.
+    try {
+        nix::Value * tmp = v3ToTreeWalker(v3state, l->elems[(uint32_t)idx]);
+        if (tmp) out = *tmp; else out.mkNull();
+        return;
+    } catch (const std::exception & ex) {
+        if (!fallbackExpr) throw;
+        static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
+        if (dbg) std::fprintf(stderr,
+            "v3 forceListElem: bridge threw: %s — re-running outer Expr "
+            "via tree-walker for index %lld\n",
+            ex.what(), (long long)idx);
+        nix::Value tw;
+        fallbackExpr->eval(ns, ns.baseEnv, tw);
+        ns.forceValue(tw, pos);
+        if (tw.type() != nix::nList)
+            ns.error<nix::EvalError>(
+                "v3 forceListElem: tree-walker fallback returned non-list").debugThrow();
+        if (idx < 0 || (size_t)idx >= tw.listSize())
+            ns.error<nix::EvalError>(
+                "v3 forceListElem: tree-walker fallback list too short").debugThrow();
+        nix::Value * elem = tw.listView()[(size_t)idx];
+        ns.forceValue(*elem, pos);
+        out = *elem;
+    }
 }
 
 /// Recursively convert a v3 Value to a tree-walker nix::Value, allocated
@@ -2401,7 +2478,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             }
             auto & tbl = v3BridgeLists();
             size_t handle = tbl.size();
-            tbl.push_back(v);
+            tbl.push_back({v, tlBridgeFallbackExpr});
             nix::Value * vHandle = ns.allocValue();
             vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
             // PrimOpApp(__v3_force_list_elem, handle) is a 1-arg-of-2
@@ -2479,7 +2556,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             }
             auto & tbl = v3BridgeAttrs();
             size_t handle = tbl.size();
-            tbl.push_back(v);
+            tbl.push_back({v, tlBridgeFallbackExpr});
             nix::Value * vHandle = ns.allocValue();
             vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
             nix::Value * vPartial = ns.allocValue();
