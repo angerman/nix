@@ -1091,7 +1091,26 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                         st.forceHookDirectUpvalues++;
                         nix::Value * srcV = cur->values[src.displ];
                         if (!srcV) return skipReturn(3);
-                        upvalues.push_back(treeWalkerToV3Public(state, *srcV));
+                        // WC-25 experiment: when V3_DEFER_UPVALUE=1, allocate
+                        // a Bridge thunk instead of forcing the upvalue eagerly.
+                        // OP_FORCE on the slot will re-enter tree-walker for
+                        // a single value via forceBridgeThunk (primops.cc).
+                        // Goal: defer the force long enough for tree-walker's
+                        // natural eval order to clear the WC-23 args cycle.
+                        static const bool deferUpvalues =
+                            std::getenv("V3_DEFER_UPVALUE") != nullptr;
+                        if (deferUpvalues) {
+                            Thunk * bridge = Alloc::allocBridgeThunk(
+                                static_cast<void *>(srcV));
+                            allocStats().thunksAllocated++;
+                            Value entry;
+                            entry.tag_payload =
+                                static_cast<uint64_t>(Tag::Thunk);
+                            entry.payload.thunk = bridge;
+                            upvalues.push_back(entry);
+                        } else {
+                            upvalues.push_back(treeWalkerToV3Public(state, *srcV));
+                        }
                     } else {
                         st.forceHookRecBuildUpvalues++;
                         sawRecBuild = true;
