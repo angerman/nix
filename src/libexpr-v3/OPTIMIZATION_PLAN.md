@@ -2231,6 +2231,62 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-29 — WC-25 + WC-26 results (Phase 1 cheap experiments — DONE)
+
+### WC-25: V3_DEFER_UPVALUE Bridge-thunk gate (Agent A's experiment)
+
+In v3_hook.cc:1090's Direct upvalue path, replaced eager
+`treeWalkerToV3Public(state, *srcV)` with `Alloc::allocBridgeThunk(srcV)`
+when `V3_DEFER_UPVALUE` is set (now default-on, opt-out via
+V3_NO_DEFER_UPVALUE=1 for A/B testing).
+
+**Result**: Agent A was wrong about its own pessimism.  Lazy
+upvalues DO break the WC-23 cycle.  Force hook now COMPLETES on
+real workloads:
+
+  NIX_USE_V3=1 NIX_USE_V3_FORCE=1 nix-instantiate \
+    --eval --strict --expr '(import nixpkgs).hello.name'
+  → "hello-2.12.1"
+
+The cycle was a force-schedule problem after all, not a value-graph
+shape problem — Agent A's structural-defeatism was overstated.
+
+### WC-26: permanent-skip cache flag (Agent C's footnote)
+
+In v3_hook.cc, when phaseBFailed or upvalueSources.empty() trip,
+clear the Expr's `isV3CacheCandidate` flag so future forces skip
+the hook at the eval-inline.hh:119 short-circuit (no hashmap
+lookup, no DepthGuard ctor cost).
+
+**Result**: forceEntries on attr-hask: 421 → 140 (3.0×).
+skippedNeedsUpvalues: 334 → 53 (6.3×).  forceHits unchanged at 65.
+
+### Honest perf assessment
+
+After WC-25 + WC-26, force hook is **correct on every sweep**:
+
+  - lang 142/142, cutover 142/142, drv-parity 25/25
+  - all 6 bench workloads complete with rc=0 under FORCE+DEFER
+
+But best-of-7 bench shows real workloads still regress 3-6 % when
+force hook is default-on (hello-name, drv3, attr-pkgs).  fib35 wins
+-10 % (synthetic).  Force hook stays opt-in via NIX_USE_V3_FORCE=1.
+
+The remaining overhead is **Bridge-thunk allocation** on the 65
+v3-owned forces, plus the tree-walker re-entry cost when those
+Bridge thunks are later forced.  WC-26 already shrank the
+per-force entry overhead; the residual is structural: every
+v3-owned thunk that touches an upvalue allocates a Bridge thunk
+that must be force-resolved through tree-walker.  Reducing this
+requires either (a) moving more execution into v3 so Bridge
+thunks dominate fewer call sites, or (b) the inversion (WC-30).
+
+### Phase 1 concluded
+
+WC-25 + WC-26 unblocked the force hook.  Full sweep green.
+Default flip is correctness-safe but perf-net-negative on real
+workloads — keep opt-in until Phase 2 widens v3 ownership.
+
 ## 2026-04-29 — Eval-order divergence design analysis (3-agent + critical review)
 
 ### Why does v3 still bridge to tree-walker at all?
