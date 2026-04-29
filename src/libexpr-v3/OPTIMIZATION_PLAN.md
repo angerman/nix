@@ -2078,6 +2078,81 @@ Fixing this would require either:
 All multi-day efforts.  Closure bridge stays gated behind
 NIX_V3_BRIDGE_CLOSURE=1 (off by default) for now.
 
+## 2026-04-29 — WC-16 diagnosis: closure-bridge cycle is ordering-induced (DONE)
+
+Per the user's request, ran the cheap diagnostic before paying for
+coroutine isolation.
+
+### Methodology
+
+Instrumented `OP_FORCE`'s blackhole detector to dump the v3 frame
+stack at the moment the cycle fires.  Reproducer:
+`(import nixpkgs).system` with `NIX_USE_V3=1 NIX_V3_BRIDGE_CLOSURE=1`.
+
+### Frame stack at the cycle
+
+  ```
+  v3 OP_FORCE Black thunk=0xad19027f0 frames=5 callerIp=627
+    frame[4]: thunk=0xad190eab0 flags=1 ip=622   (CFF_THUNK_RETURN)
+    frame[3]: thunk=0xad19027f0 flags=1 ip=218   (CFF_THUNK_RETURN, the cycle thunk)
+    frame[2]: thunk=0xad1902670 flags=1 ip=3925
+    frame[1]: thunk=0xad1901320 flags=1 ip=450
+    frame[0]: thunk=0x0         flags=0 ip=153   (closure body)
+  ```
+
+The frames form a linear chain T₁ → T₂ → T₃ → T₄ → cycle-back-to-T₃.
+**Genuine cycle in the data graph.**  tree-walker's stats on the same
+input show `nrThunks=896830` with no cycle — but `nrAvoided=515033`
+hints at why: tree-walker's `ExprAttrs::eval` uses `maybeThunk` for
+attr values (eval.cc:1546-1554), deferring forces that v3 emits
+eagerly via `OP_GET_LOCAL_FORCE`.
+
+### Smoking gun
+
+`tree-walker's ExprAttrs::eval` for `rec` attrsets (eval.cc:1525-1582)
+allocates `env2` with size for attrs, then for each attr stores a
+**bare thunk pointer** in `env2.values[displ]` *and* in the resulting
+Bindings.  The same Value* is shared.  When one attr's body forces a
+sibling attr through env2, it gets the *same Value* the bindings
+return — and forcing that mutates the shared storage in place.
+Tree-walker's lazy attr graph means cycles between attrs only fire
+when actually demanded, and the in-place rewriting unifies the
+"thunk being forced" with "thunk visible through env2".
+
+v3's `lowerLetRecCapture` allocates a Function per attr and emits
+`OP_GET_LOCAL_FORCE` / `OP_GET_UPVALUE_FORCE` at sibling references.
+Each force is a real bytecode-level FORCE, marking the thunk Black
+during body execution.  Mutual sibling references that work in
+tree-walker's env-graph trip v3's blackhole detector.
+
+### Fix scoping
+
+  - **Option 1 (re-engineer OP_RETURN transitive force)** — already
+    tested empirically; breaks correctness (`OP_CALL: callee is not
+    a closure` errors).
+  - **Option 2 (re-engineer primV3CallBridge1)** — bridge-layer
+    change can't help; cycle is upstream in v3's lambda body eval.
+  - **Option 3 (coroutine isolation)** — sidesteps the issue by
+    decoupling v3's eval order from tree-walker's stack.  Real.
+  - **Option 4 (re-engineer v3's rec-attrset lowering)** — match
+    tree-walker's env-graph pattern (single Value* shared between
+    env and Bindings, rather than per-attr Functions).  Substantial
+    refactor of `lowerLetRecCapture` + `OP_ATTRS_REC_INIT/SET`
+    semantics, but architecturally cleaner than coroutines for
+    this specific cycle class.
+
+### Recommendation update
+
+Original recommendation was coroutines (Option 3).  After diagnostic:
+**Option 4 is now preferred** — matching tree-walker's rec-attrset
+env-graph eliminates the cycle source rather than working around it,
+and the change is contained to v3's `lowerLetRecCapture` (no
+cross-VM coroutine machinery).  Estimated 3-4 days, similar effort
+to coroutines, with cleaner semantic match to tree-walker.
+
+If Option 4 turns out to leak other ordering differences (other
+ExprXxx kinds), then coroutines (Option 3) become the fallback.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
