@@ -1904,6 +1904,20 @@ Value forceValue(VMState & vm, Value v)
                 t->state = ThunkState::Suspended;
             throw;
         }
+        // WC-14.5 success-path defensive cleanup: if the outer thunk
+        // somehow remains Black after a successful dispatchLoop
+        // (theoretical impossibility per the invariant, but observed
+        // in cross-VMState bridge scenarios where another VMState's
+        // frames interleave with this one), revert it to Suspended
+        // so subsequent forces re-run idempotently rather than
+        // throwing "infinite recursion (blackhole)" on a stale mark.
+        if (t->state == ThunkState::Blackhole) {
+            static const bool s_dbg = std::getenv("V3_DBG_BLACK") != nullptr;
+            if (s_dbg) std::fprintf(stderr,
+                "v3 forceValue: SUCCESS-path Black leak; reverting "
+                "thunk=%p Suspended\n", (void*)t);
+            t->state = ThunkState::Suspended;
+        }
     }
     return v;
 }

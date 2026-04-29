@@ -1938,6 +1938,86 @@ change the failure — the cycle fires before threshold is hit.
     re-evaluation, eliminating a large fraction of the eval-hook
     fallbacks.
 
+## 2026-04-29 — WC-14.5 root-cause: eager v3↔tree-walker attr bridge (DEFERRED again, properly understood)
+
+Previous WC-14.5 framing ("success-path Black-mark cleanup") was
+WRONG.  Three research agents + direct instrumentation revealed
+the actual root cause.
+
+### Concrete trace evidence
+
+`NIX_USE_V3=1 NIX_V3_BRIDGE_CLOSURE=1` reproducer with
+`V3_DBG_BLACK=1` instrumentation showed thunk `0x7bd901320`:
+- SET Black at frames=1 (entered force)
+- NEVER reaches OP_RETURN to set Evaluated
+- Eventually cleared by `clearBlackMarksOnException` after the
+  test fails
+
+Other thunks (B, C nested under A) DO get Evaluated.  A's body
+just never completes.  A is in `bridgeVm1`'s frame stack
+(primV3CallBridge1's per-thread VMState); meanwhile work
+proceeds in `bridgeShimVm` (treeWalkerToV3Public's per-thread
+VMState).  The interleaving is real — multiple VMStates share
+the arena (Thunks live forever) but maintain independent frame
+stacks.
+
+### Actual root cause: eager bridge of large attrsets
+
+When v3's closure body evaluates and returns `Tag::Attrs`,
+`v3ToTreeWalker` (primops.cc:2271-) recurses structurally over
+every attr, calling `treeWalkerToV3` on each value.  In nixpkgs,
+the result is a 50k-attr `pkgs` set, and many entries are self-
+referential through `lib.makeExtensible` overlays.  Recursive
+bridging:
+  1. Forces every attr eagerly (vs. tree-walker's lazy access).
+  2. Hits self-referential cycles (every overlay `self` ref).
+  3. Some thunks get Black-marked deep inside the recursion.
+  4. Concurrent VMStates (bridgeVm1 + bridgeShimVm) interleave
+     on the shared Thunk pool, exposing stale Black marks.
+  5. The user-facing error is "v3 OP_FORCE: infinite recursion
+     (blackhole)" — but the underlying issue is the eager bridge.
+
+### Mitigations attempted (all insufficient)
+
+  - WC-14.6 bounded-depth yield: helps drv3, doesn't help here
+    (the cycle is logical, fires before depth threshold).
+  - Success-path defensive cleanup in `forceValue` helper:
+    KEPT (safety net) but doesn't fix the root cause.  When v3
+    is bridging via `v3ToTreeWalker` recursion (NOT the
+    `forceValue` helper), this cleanup never fires.
+
+### What an actual fix would look like
+
+  1. **Lazy attr-set bridge.**  Instead of `v3ToTreeWalker`
+     recursing into every entry, build a tree-walker `Attrs`
+     where each value is a lazy thunk wrapping a v3 handle +
+     attr name.  Forcing a tree-walker thunk would materialize
+     just that one attr.  Requires a new tree-walker primop
+     `__v3_attr_select(handle, name)` that performs v3-side
+     attr selection + value bridging on demand.
+  2. **Lazy list-element bridge.**  Same pattern for lists.
+  3. **GC-safe bridge handles.**  Each bridge handle is a
+     shared_ptr-like object that keeps the v3 attrset alive
+     across tree-walker GC cycles.
+
+This is a multi-day refactor of the `v3ToTreeWalker` machinery
++ a new family of v3 bridge primops.  Out of scope for this
+session.  Force-hook stays opt-in for now; closure-bridge stays
+gated behind `NIX_V3_BRIDGE_CLOSURE=1` (off by default).
+
+### What WAS landed in this session for WC-14.5
+
+  - Defensive success-path cleanup in `forceValue` helper
+    (vm.cc:1907-1920): if `t->state == Blackhole` after
+    successful dispatchLoop, revert to Suspended.  Per the
+    invariant, OP_RETURN should have set it Evaluated; this is
+    a safety net for the cross-VMState interleaving scenario
+    documented above.  Doesn't fix the broader cycle — but
+    prevents a class of subsequent failures.
+  - Diagnostic infrastructure (`V3_DBG_BLACK=1` env var) in
+    place during investigation; reverted to keep production
+    builds clean.
+
 ## 2026-04-30 — VM-4 cutover hook coverage (parse-time path side table)
 
 Most top-level Exprs returned by `parseExprFromFile` (ExprLet,
