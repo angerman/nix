@@ -2231,6 +2231,43 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-29 — WC-20 blackhole-only fallback + closure-bridge fallback infra
+
+Tightening WC-19 + extending the safety net to the closure bridge.
+
+WC-19's `catch (...)` was too broad — any `std::exception` triggered
+fallback, including type errors and missing-argument errors that
+should surface as real bugs.  Tightened to only blackhole-shaped
+runtime_errors (`infinite recursion (blackhole)` /
+`v3 forceValue: infinite recursion`).
+
+Closure bridge gained the same infra:
+  - `v3BridgeClosures()` now stores (Value, Expr*) pairs.
+  - `primV3CallBridge1` wraps both the v3 evaluation and the result-
+    bridge in try/catch.  On blackhole, re-runs the captured outer
+    Expr through tree-walker and `callFunction`s the result with
+    args[1].
+  - v3_hook.cc's `case Tag::Closure / PrimOp / PrimOpApp` block sets
+    `tlBridgeFallbackExpr` so the closure handle inherits the Expr.
+
+### What's still deferred under BRIDGE_CLOSURE
+
+`NIX_V3_BRIDGE_CLOSURE=1` is **still default-OFF**.  Turning it on
+surfaces a separate v3 issue: even after the WC-20 fallback recovers
+from the first blackhole, a downstream v3 hook entry produces a
+closure that, when later called, throws `v3 OP_ATTRS_SELECT:
+attribute not found`.  This isn't a blackhole — it's a real v3↔
+tree-walker semantic divergence (closure args have different attr
+shape).  Diagnosing this is its own task (WC-21, deferred).
+
+### Validation (default flags only)
+
+  - lang tests: 142/142
+  - cutover lang tests: 142/142
+  - drv-parity: 25/25
+  - WC-19 reproducer + WC-18.6 stress combo: rc=0 with both
+    NIX_V3_FIBER_BRIDGE=1 and default v3.
+
 ## 2026-04-29 — WC-19 lazy-bridge blackhole fall-back
 
 Bisecting under `NIX_V3_FIBER_BRIDGE=1` after WC-18.6 surfaced a
