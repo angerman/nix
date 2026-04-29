@@ -961,8 +961,17 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     if (s_hookDepth > 0) return false;
     struct DepthGuard {
         int & d;
-        DepthGuard(int & d_) : d(d_) { ++d; }
-        ~DepthGuard() { --d; }
+        DepthGuard(int & d_) : d(d_) {
+            ++d;
+            // WC-14.6: also bump the cross-VM active-depth counter so
+            // forceValue can detect "we're inside a v3 hook" and yield
+            // before C-stack growth becomes catastrophic.
+            ++nix::EvalState::v3HookActiveDepth;
+        }
+        ~DepthGuard() {
+            --d;
+            --nix::EvalState::v3HookActiveDepth;
+        }
     } _guard{s_hookDepth};
 
     auto & st = v3HookStats();
@@ -1119,14 +1128,12 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
         }
     } catch (const std::exception & ex) {
         if (diag) std::fprintf(stderr, "v3 force hook: run threw: %s\n", ex.what());
-        // Phase B blacklist: same Expr* will arrive with the same env
-        // shape on subsequent forces; retrying would just throw again.
-        // Mark the entry as "Phase B failed" so we skip the whole
-        // chain (cache lookup + env walk + run) next time.
-        if (!upvalues.empty()) {
-            auto sit2 = v3SubExprCache().find(e);
-            if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailed = true;
-        }
+        // WC-14.6: blacklist on ALL throws (not just upvalue-bearing
+        // entries).  Cycles, V3DepthYield, infinite-recursion etc.
+        // are deterministic per-Expr at this env shape — retrying
+        // just throws again.
+        auto sit2 = v3SubExprCache().find(e);
+        if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailed = true;
         return false;  // Fall back: tree-walker handles the rest.
     }
 

@@ -752,6 +752,42 @@ public:
     static V3RegisterExprHook v3RegisterExprHook;
 
     /**
+     * WC-14: callFunction cutover hook.  Called from
+     * EvalState::callFunction BEFORE tree-walker's own isLambda /
+     * isPrimOp dispatch, when `fun` is a Lambda whose env pointer
+     * matches v3's sentinel (i.e., the Lambda was produced by v3 and
+     * crossed back to tree-walker via the bridge).  Lets v3 own the
+     * body's evaluation on its own dispatcher frame stack instead of
+     * recursing through tree-walker's C++ Expr::eval — the
+     * mechanism by which we eliminate cross-VM stack growth.
+     *
+     * Returns true if v3 handled the call (and filled `vRes`); false
+     * to fall through to the standard tree-walker dispatch.
+     */
+    using V3CallFunctionHook = bool (*)(EvalState &, Value & fun,
+                                        std::span<Value *> args,
+                                        Value & vRes, const PosIdx pos);
+    static V3CallFunctionHook v3CallFunctionHook;
+
+    /**
+     * WC-14.6 bounded-depth yield: when a v3 hook (force or
+     * callFunction) is on the call stack, the v3 entry bumps
+     * `v3HookActiveDepth` and forceValue tracks its own recursion
+     * via `v3HookForceDepth`.  If the latter exceeds
+     * `v3HookMaxForceDepth` while we're inside a hook, forceValue
+     * throws `V3DepthYield` (a recoverable Error subclass).  v3's
+     * hook entry catches it, marks phaseBFailed, and falls back to
+     * tree-walker.
+     *
+     * This caps C-stack growth caused by tree-walker recursion that
+     * runs inside a v3 hook (the WC-12 root cause), without a full
+     * tree-walker rewrite.
+     */
+    static thread_local int v3HookActiveDepth;
+    static thread_local int v3HookForceDepth;
+    static int v3HookMaxForceDepth; // tunable via NIX_V3_MAX_FORCE_DEPTH
+
+    /**
      * Evaluation the expression, then verify that it has the expected
      * type.
      */

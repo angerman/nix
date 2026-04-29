@@ -55,6 +55,11 @@ MakeError(TypeError, EvalError);
 MakeError(UndefinedVarError, EvalError);
 MakeError(MissingArgumentError, EvalError);
 MakeError(InfiniteRecursionError, EvalError);
+/// WC-14.6: thrown by forceValue when invoked inside a v3 hook and
+/// the C-stack-frame depth exceeds NIX_V3_MAX_FORCE_DEPTH.  Caught
+/// by v3 hook entries (v3ForceEntry / v3CallFunctionEntry) which
+/// fall back to tree-walker.  Should never escape to the user.
+MakeError(V3DepthYield, EvalBaseError);
 
 /**
  * Resource exhaustion error when evaluation exceeds max-call-depth.
