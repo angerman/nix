@@ -1719,7 +1719,15 @@ Value run(const CompilationUnit & rootCu)
         vm.valueStack.resize(rootCu.lambdas[0].nLocals);
 
     try {
-        return dispatchLoop(vm, /*exitDepth=*/0);
+        Value r = dispatchLoop(vm, /*exitDepth=*/0);
+        // WC-15 defensive: even on success, residual Black marks
+        // can persist on the frame stack from incomplete sub-evals
+        // that were intentionally orphaned (e.g., transitive thunk
+        // chains where intermediate frames don't reach OP_RETURN).
+        // Reset them so subsequent forces of the same Thunk don't
+        // see a stale Black mark.
+        clearBlackMarksOnException(vm, 0);
+        return r;
     } catch (...) {
         clearBlackMarksOnException(vm, 0);
         throw;
@@ -1756,7 +1764,15 @@ Value runFunction(const CompilationUnit & cu, uint32_t funcIdx)
     vm.valueStack.resize(desc.nLocals);
 
     try {
-        return dispatchLoop(vm, /*exitDepth=*/0);
+        Value r = dispatchLoop(vm, /*exitDepth=*/0);
+        // WC-15 defensive: even on success, residual Black marks
+        // can persist on the frame stack from incomplete sub-evals
+        // that were intentionally orphaned (e.g., transitive thunk
+        // chains where intermediate frames don't reach OP_RETURN).
+        // Reset them so subsequent forces of the same Thunk don't
+        // see a stale Black mark.
+        clearBlackMarksOnException(vm, 0);
+        return r;
     } catch (...) {
         clearBlackMarksOnException(vm, 0);
         throw;
@@ -1803,7 +1819,15 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
     vm.valueStack.resize(desc.nLocals);
 
     try {
-        return dispatchLoop(vm, /*exitDepth=*/0);
+        Value r = dispatchLoop(vm, /*exitDepth=*/0);
+        // WC-15 defensive: even on success, residual Black marks
+        // can persist on the frame stack from incomplete sub-evals
+        // that were intentionally orphaned (e.g., transitive thunk
+        // chains where intermediate frames don't reach OP_RETURN).
+        // Reset them so subsequent forces of the same Thunk don't
+        // see a stale Black mark.
+        clearBlackMarksOnException(vm, 0);
+        return r;
     } catch (...) {
         clearBlackMarksOnException(vm, 0);
         throw;
