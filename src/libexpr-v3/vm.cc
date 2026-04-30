@@ -452,6 +452,8 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
     // Only publish concrete values, not thunks/apps/blackholes.
     Tag t = v.tag();
     if (t == Tag::Thunk || t == Tag::App || t == Tag::Blackhole) return;
+    static const bool s_dbg =
+        std::getenv("NIX_V3_EARLY_PUBLISH_DBG") != nullptr;
     // Walk from bottom up.  Find the OUTERMOST CFF_THUNK_RETURN frame
     // whose thunk is Black.  This is the frame whose captured-with
     // entries (`with self;`) sub-thunks may be racing against.
@@ -462,6 +464,23 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
         if (fr.thunk->state != ThunkState::Blackhole) continue;
         // Publish to outermost Black thunk.  Idempotent — OP_RETURN
         // of this thunk frame will overwrite with the final retVal.
+        if (s_dbg) {
+            const char * tagName = "?";
+            uint32_t nKeys = 0;
+            if (t == Tag::Attrs) {
+                tagName = "Attrs";
+                if (v.payload.bindings) nKeys = v.payload.bindings->size;
+            } else if (t == Tag::List) {
+                tagName = "List";
+                if (v.payload.list) nKeys = v.payload.list->size;
+            } else {
+                tagName = "Other";
+            }
+            std::fprintf(stderr,
+                "v3 EARLY_PUBLISH: frame[%zu] thunk=%p tag=%s n=%u "
+                "(at frames=%zu)\n",
+                i, (void*)fr.thunk, tagName, nKeys, vm.frames.size());
+        }
         fr.thunk->state = ThunkState::Evaluated;
         fr.thunk->evaluated = v;
         return;
@@ -1512,7 +1531,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     static const bool s_dbg_disasm =
                         std::getenv("V3_DBG_OPCYCLE_DISASM") != nullptr;
                     if (s_dbg_disasm) {
-                        for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                        // Expanded: dump top 12 frames (was 8) for WC-38
+                        // investigation.
+                        for (size_t i = lim; i > 0 && i + 12 > lim; --i) {
                             const auto & fr = vm.frames[i - 1];
                             if (!fr.cu) continue;
                             uint32_t fip = fr.ip;
