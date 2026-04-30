@@ -2105,6 +2105,14 @@ Value forceValue(VMState & vm, Value v)
 
 Value callClosure(VMState & vm, Value fun, Value arg)
 {
+    // Mirror tree-walker's `callFunction`: callable values must be in
+    // WHNF before we dispatch on shape.  Most callers force first
+    // (OP_CALL's preceding OP_FORCE; OP_RETURN's transitive chase),
+    // but a few internal paths (the __functor recursion below; primop
+    // map-style App entries forced inline) leave a Tag::Thunk or
+    // Tag::App on `fun`.  forceValue is idempotent on already-WHNF
+    // values, so the cost is one tag check on the hot path.
+    fun = forceValue(vm, fun);
     // PrimOp / PrimOpApp: build a partial application or invoke once
     // we have all the args.  Mirrors the OP_CALL primop branch.
     if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
@@ -2151,8 +2159,31 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         }
     }
 
-    if (!fun.isClosure())
+    if (!fun.isClosure()) {
+        static const bool dbg = std::getenv("V3_DBG_CALL") != nullptr;
+        if (dbg) {
+            std::fprintf(stderr,
+                "v3 callClosure: not callable tag=%u frames=%zu\n",
+                (unsigned)fun.tag(), vm.frames.size());
+            size_t lim = vm.frames.size();
+            for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                const auto & fr = vm.frames[i - 1];
+                const LambdaDescriptor * desc = nullptr;
+                if (fr.thunk)
+                    desc = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                else if (fr.closure)
+                    desc = fr.closure->desc;
+                std::fprintf(stderr,
+                    "  frame[%zu]: %s code=[%u..) ip=%u flags=%u\n",
+                    i - 1,
+                    desc && !desc->name.empty() ? desc->name.c_str()
+                        : (desc ? "<anon>" : "<closure-body>"),
+                    desc ? desc->codeOffset : 0,
+                    fr.ip, (unsigned)fr.flags);
+            }
+        }
         throw std::runtime_error("v3 callClosure: not callable");
+    }
 
     const Closure * callee = fun.payload.closure;
     const LambdaDescriptor * desc = callee->desc;
