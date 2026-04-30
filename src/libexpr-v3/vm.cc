@@ -21,6 +21,7 @@
 #include "v3/alloc.hh"
 #include "v3/primop.hh"
 #include "v3/ir.hh"
+#include "v3/disasm.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
@@ -1058,6 +1059,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             "  frame[%zu]: %s flags=%u ip=%u thunk=%p\n",
                             i - 1, frameInfo(fr.thunk, fr.closure, fr.ip).c_str(),
                             (unsigned)fr.flags, fr.ip, (void*)fr.thunk);
+                    }
+                    // WC-32 disassembler: when V3_DBG_OPCYCLE_DISASM=1,
+                    // also dump 8 instructions surrounding each frame's ip.
+                    static const bool s_dbg_disasm =
+                        std::getenv("V3_DBG_OPCYCLE_DISASM") != nullptr;
+                    if (s_dbg_disasm) {
+                        for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                            const auto & fr = vm.frames[i - 1];
+                            if (!fr.cu) continue;
+                            uint32_t fip = fr.ip;
+                            uint32_t lo = fip > 16 ? fip - 16 : 0;
+                            uint32_t hi = fip + 16;
+                            std::fprintf(stderr,
+                                "  frame[%zu] disasm [%u..%u):\n",
+                                i - 1, lo, hi);
+                            disassembleWindow(stderr, *fr.cu, lo, hi);
+                        }
                     }
                 }
                 throw std::runtime_error("v3 OP_FORCE: infinite recursion (blackhole)");
