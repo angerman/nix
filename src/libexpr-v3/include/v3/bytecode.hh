@@ -135,6 +135,16 @@ enum Op : uint8_t
     /// sub-thunks observe the slot's live contents at force time.  See
     /// Tag::Slot's docstring in value.hh for rationale.
     OP_LOAD_SLOT_REF  = 0x83,  // [slot:24]
+    /// SECD-style heap-stable slot reference: pop a Tag::Attrs (a
+    /// rec-attrset's Bindings*), look up the entry by SymbolId, and
+    /// push a Tag::Slot Value pointing at `&entries[i].value` —
+    /// stable as long as the Bindings is alive.  Used by `with E;`
+    /// when E resolves to a rec-attrset entry: sub-thunks captured
+    /// in the with-body see the entry's live mutated value through
+    /// the slot, including the memoized resolved value once forceValue
+    /// has run on the entry once.  Mirrors tree-walker's `Value *`
+    /// slot pointer into the Env block.
+    OP_REC_BINDING_SLOT_REF = 0x84, // [sym:24]
 
     // --- Strings --------------------------------------------------------
     OP_STR_CONCAT     = 0x90,  // [n:24] forceString stored in low bit of n; pops n parts

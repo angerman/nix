@@ -2235,6 +2235,45 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, v);
             break;
         }
+        case OP_REC_BINDING_SLOT_REF: {
+            // Pop a Tag::Attrs (forced earlier), look up the entry by
+            // SymbolId in operand, push a Tag::Slot Value pointing at
+            // `&entries[i].value`.  Heap-stable because Bindings live
+            // on the v3 heap (Alloc::allocBindings), not on the
+            // value-stack.
+            Value attrs = pop(vm);
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                attrs = forceValue(vm, attrs);
+            }
+            if (!attrs.isAttrs() || !attrs.payload.bindings) {
+                throw std::runtime_error(
+                    "v3 OP_REC_BINDING_SLOT_REF: source is not a forced attrset");
+            }
+            SymbolId sym = static_cast<SymbolId>(operand);
+            // Binary search the sorted entries for `sym`.
+            Bindings * b = attrs.payload.bindings;
+            uint32_t lo = 0, hi = b->size;
+            Value * found = nullptr;
+            while (lo < hi) {
+                uint32_t mid = (lo + hi) >> 1;
+                SymbolId midName = b->entries[mid].name;
+                if (midName == sym) { found = &b->entries[mid].value; break; }
+                if (midName < sym) lo = mid + 1;
+                else               hi = mid;
+            }
+            if (!found) {
+                const auto & tbl = ir::globalSymbolTable();
+                std::string nm = (sym < tbl.size()) ? tbl[sym] : "?";
+                throw std::runtime_error(
+                    "v3 OP_REC_BINDING_SLOT_REF: name '" + nm
+                    + "' not found in source attrset");
+            }
+            Value v;
+            v.mkSlot(found);
+            push(vm, v);
+            break;
+        }
         case OP_WITH_LOOKUP: {
             uint32_t depth = cu->code[ip++];
             push(vm, withLookup(vm, static_cast<SymbolId>(operand), depth));
@@ -2904,6 +2943,13 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
 
 Value forceValue(VMState & vm, Value v)
 {
+    // Track the FIRST slot we passed through so we can memoize the
+    // final result back into it.  Mirrors tree-walker's behavior:
+    // `state.forceValue(*v2)` mutates the slot directly, so a future
+    // read of the same slot sees the resolved value (no need to walk
+    // the thunk chain again).  Without memoization, every withLookup
+    // through a Tag::Slot would re-force the underlying thunk.
+    Value * memoSlot = nullptr;
     // Loop until WHNF: a thunk's body might itself yield a thunk
     // (e.g., `let inherit outer; in outer` returns the outer thunk),
     // and we want to chase the chain until we land on a real value.
@@ -2924,6 +2970,12 @@ Value forceValue(VMState & vm, Value v)
         if (v.tag() == Tag::Slot) {
             Value * p = v.payload.slot;
             if (!p) throw std::runtime_error("v3 forceValue: null slot pointer");
+            // Remember the OUTERMOST slot for memoization.  If we
+            // pass through multiple Tag::Slot indirections (chained),
+            // memoize at the first one — its slot is what consumers
+            // hold.  Inner slots get memoized by their own future
+            // forceValue calls.
+            if (!memoSlot) memoSlot = p;
             v = *p;
             continue;
         }
@@ -3129,6 +3181,16 @@ Value forceValue(VMState & vm, Value v)
             t->state = ThunkState::Suspended;
         }
     }
+    // SECD-style slot memoization: write the resolved value back into
+    // the slot we entered through.  Future Tag::Slot derefs through
+    // the same slot will see the resolved value directly.  Mirrors
+    // tree-walker's `state.forceValue(*v2)` which mutates the slot
+    // in-place; sub-thunks observing the slot see the mutation.
+    // Important: only write back if v is a concrete WHNF value (not
+    // another Slot/Thunk/App that we somehow exited the loop with —
+    // shouldn't happen, but be safe).
+    if (memoSlot && v.tag() != Tag::Slot)
+        *memoSlot = v;
     return v;
 }
 

@@ -174,7 +174,20 @@ struct If    { VarId cond; BlockId thenBlock; BlockId elseBlock; };
 /// When `slotRef = kInvalid`, `attrs` is used as a regular value
 /// source (back-compat with the original `OP_GET_LOCAL +
 /// OP_WITH_PUSH` path).
-struct With  { VarId attrs; BlockId bodyBlock; VarId slotRef = kInvalid; };
+///
+/// `recAttrsVar` + `recAttrsName` are set when `attrs` resolves to a
+/// rec-attrset entry: the emitter should push a Tag::Slot pointing
+/// into `recAttrsVar`'s Bindings::entries[i].value (heap-stable).
+/// This is the production path for `with self;` over rec-attrsets and
+/// is what makes `lib.fix` patterns work in v3.  Both fields are
+/// kInvalid when unused.
+struct With  {
+    VarId attrs;
+    BlockId bodyBlock;
+    VarId slotRef = kInvalid;
+    VarId recAttrsVar = kInvalid;
+    SymbolId recAttrsName = kInvalidSymbol;
+};
 
 /// `assert cond; body`.  Forces `cond`; if false, raises an error; otherwise
 /// runs `bodyBlock` and yields its return value.

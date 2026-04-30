@@ -1359,28 +1359,45 @@ struct Lowerer
         // which is required for `with pkgs; ...` to work inside the
         // recursive group that defines pkgs (otherwise we'd blackhole).
         //
-        // WC-38 SECD-style slot aliasing: SCAFFOLDED but NOT YET WIRED.
+        // WC-38 SECD-style slot aliasing.
         //
-        // The intent is: when `e->attrs` resolves to a stable slot
-        // (heap-allocated, not value-stack), emit OP_LOAD_SLOT_REF so
-        // sub-thunks captured inside the with-body see live mutations
-        // through the slot pointer.
+        // When `e->attrs` is an ExprVar that resolves to a rec-attrset
+        // entry, emit OP_REC_BINDING_SLOT_REF — a stable pointer into
+        // the Bindings::entries[i].value heap memory.  This is
+        // crucial for `with self;` patterns over let-rec / rec
+        // attrsets (e.g., nixpkgs's `lib.fix toFix` and overlay-
+        // extend patterns) so that sub-thunks captured inside the
+        // with-body observe the entry's mutated/memoized value
+        // through the slot rather than a snapshot taken before the
+        // entry was forced.
         //
-        // Currently disabled because the only slots we can name at
-        // lower time are value-stack frame slots (lambda params,
-        // let-rec entries, etc.).  Those slots are transient — when
-        // the surrounding frame returns, the slot's storage is
-        // reused.  Sub-thunks captured inside `with E;` may escape
-        // the frame (stored in attrsets / closures); their
-        // captured-with snapshot would dangle.
-        //
-        // Phase 4 will introduce heap-allocated slot storage (matching
-        // tree-walker's Env block) and emit OP_LOAD_BINDING_SLOT_REF
-        // pointing into stable Bindings::entries[i].value memory for
-        // rec-attrset entries.  Until then, fall back to the snapshot
-        // path uniformly.
+        // Direct value-stack slot references (lambda params etc.)
+        // remain unhandled here — they have lifetime issues (the
+        // slot's storage is reused after the surrounding frame
+        // returns) and would dangle when sub-thunks escape.
         ir::VarId attrs = lowerExpr(e->attrs);
         ir::VarId slotRef = ir::kInvalid;
+        ir::VarId withRecAttrsVar = ir::kInvalid;
+        ir::SymbolId withRecAttrsName = ir::kInvalidSymbol;
+        if (auto * ev = dynamic_cast<nix::ExprVar *>(e->attrs)) {
+            if (!ev->fromWith && ev->level < scopes.size()) {
+                size_t scopeIdx = scopes.size() - 1 - ev->level;
+                // Check the rec-attrset entry path: if the var lives
+                // in a rec scope and `byDispl[displ]` is invalid
+                // (i.e., resolveVar would synthesize an AttrSelect),
+                // we have a heap-stable slot target.
+                bool byDisplDirect =
+                    ev->displ < scopes[scopeIdx].byDispl.size()
+                    && scopes[scopeIdx].byDispl[ev->displ] != ir::kInvalid;
+                bool inRecScope =
+                    scopes[scopeIdx].recAttrsVar != ir::kInvalid
+                    && ev->displ < scopes[scopeIdx].recAttrsNames.size();
+                if (!byDisplDirect && inRecScope) {
+                    withRecAttrsVar = scopes[scopeIdx].recAttrsVar;
+                    withRecAttrsName = scopes[scopeIdx].recAttrsNames[ev->displ];
+                }
+            }
+        }
         auto bodyB = m.freshBlock();
         blockStack.push_back(bodyB);
         // Push an empty placeholder scope: nix's bindVars counts the
@@ -1392,7 +1409,9 @@ struct Lowerer
         scopes.pop_back();
         setReturn(rv);
         blockStack.pop_back();
-        return addBinding(ir::With{attrs, bodyB, slotRef});
+        return addBinding(ir::With{
+            attrs, bodyB, slotRef,
+            withRecAttrsVar, withRecAttrsName});
     }
 
     template<class AstNode>

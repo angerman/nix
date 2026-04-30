@@ -470,25 +470,27 @@ struct Emitter
     // -- With / assert
     void emitOne(const ir::With & e)
     {
-        // WC-38 SECD-style slot aliasing.  When the `with` source was
-        // a simple ExprVar resolving to a local slot, push a Tag::Slot
-        // pointer to that slot.  withLookup will deref the slot at
-        // lookup time, picking up any in-place updates (`mkAttrs`-like
-        // mutations done by the let-rec body) rather than seeing a
-        // stale snapshot.  Falls back to OP_GET_LOCAL/UPVALUE +
-        // OP_WITH_PUSH for non-slot-ref sources.
+        // WC-38 SECD-style slot aliasing.
+        //
+        // Preferred path (heap-stable): when the source resolves to a
+        // rec-attrset entry, push a Tag::Slot pointing into the
+        // Bindings::entries[i].value memory (allocated on the v3 heap,
+        // stable for the lifetime of the bindings).  Sub-thunks
+        // captured in the with-body see the entry's live mutated /
+        // memoized value through the slot.
+        //
+        // Fallback (snapshot): for non-rec-attrset sources, emit the
+        // legacy OP_GET_LOCAL/UPVALUE + OP_WITH_PUSH path.
         bool emittedSlotRef = false;
-        if (e.slotRef != ir::kInvalid) {
-            if (auto it = ctx->slot.find(e.slotRef); it != ctx->slot.end()) {
-                unit.code.push_back(encode(OP_LOAD_SLOT_REF, it->second));
-                unit.code.push_back(encode(OP_WITH_PUSH));
-                emittedSlotRef = true;
-            }
-            // Upvalue case: we don't have a slot pointer for upvalues
-            // in the current frame's locals; fall back to snapshot.
-            // (A future refinement could thread slot pointers through
-            // closure upvalues, but that requires a wider change to
-            // Closure storage.)
+        if (e.recAttrsVar != ir::kInvalid && e.recAttrsName != ir::kInvalidSymbol) {
+            // Push the rec-attrset value, force it to attrset shape,
+            // then OP_REC_BINDING_SLOT_REF looks up the entry and
+            // pushes Tag::Slot.
+            emitVarRef(e.recAttrsVar);
+            unit.code.push_back(encode(OP_FORCE));
+            unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.recAttrsName));
+            unit.code.push_back(encode(OP_WITH_PUSH));
+            emittedSlotRef = true;
         }
         if (!emittedSlotRef) {
             emitVarRef(e.attrs);
