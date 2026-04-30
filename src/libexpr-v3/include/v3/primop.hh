@@ -79,6 +79,13 @@ struct PrimOp
     std::string_view name;
     uint8_t          arity;
     PrimOpFn         fn;
+    /// Bitmask of argument indices that should NOT be force-pre-evaluated
+    /// before the primop body runs.  Bit `i` set means args[i] is passed
+    /// in whatever form the caller had (Thunk / Tag::App / WHNF).  The
+    /// primop body forces only what it actually needs.  Mirrors
+    /// tree-walker's per-primop lazy-arg semantics.
+    /// Bit 0 = arg 0, bit 1 = arg 1, etc.
+    uint8_t          lazyArgs = 0;
     std::string_view doc;        // optional
 };
 

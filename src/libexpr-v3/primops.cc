@@ -5596,7 +5596,12 @@ void registerBuiltinPrimOps()
         registerPrimOp({"hashFile",           2, primHashFile});
         registerPrimOp({"convertHash",        1, primConvertHash});
         registerPrimOp({"readFileType",       1, primReadFileType});
-        registerPrimOp({"addErrorContext",    2, primAddErrorContext});
+        // addErrorContext's second arg ("the wrapped value") is left
+        // unforced so callers like nixpkgs `lib/modules.nix:270`
+        // (`config = addErrorContext "..." config`) don't deadlock
+        // against the rec-binding being constructed.  The primop body
+        // returns args[1] as-is — force happens at the consumer.
+        registerPrimOp({"addErrorContext", 2, primAddErrorContext, /*lazyArgs=*/0b10});
         registerPrimOp({"derivationStrict",   1, primDerivationStrict});
         // C++ port of corepkgs/derivation.nix — derivationStrict
         // synthesizes paths, primDerivation wraps them up with

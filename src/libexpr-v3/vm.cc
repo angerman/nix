@@ -708,11 +708,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 vm.frames.back().ip = ip;
                 // PrimOpApp accumulates args lazily — primops expect
-                // WHNF, so force each here before invoking.  Mirrors
-                // the eager-force lowerCall does for the
-                // direct-primop-call path.
-                for (uint32_t i = 0; i < po->arity; ++i)
+                // WHNF, so force each here before invoking, EXCEPT for
+                // args the primop has explicitly opted out of via its
+                // `lazyArgs` bitmask (e.g., addErrorContext's value arg
+                // — see lib/modules.nix's
+                // `config = addErrorContext "..." config` cycle).
+                for (uint32_t i = 0; i < po->arity; ++i) {
+                    if (po->lazyArgs & (1u << i)) continue;
                     buf[i] = forceValue(vm, buf[i]);
+                }
                 bumpPrimOpCallCount(po);
                 EvalState state; state.vm = &vm;
                 Value out;
@@ -2253,7 +2257,10 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             buf[i - 1] = chain.payload.pair->right;
             chain = chain.payload.pair->left;
         }
-        for (uint32_t i = 0; i < po->arity; ++i) buf[i] = forceValue(vm, buf[i]);
+        for (uint32_t i = 0; i < po->arity; ++i) {
+            if (po->lazyArgs & (1u << i)) continue;
+            buf[i] = forceValue(vm, buf[i]);
+        }
         EvalState state; state.vm = &vm; state.nixEvalState = getNixEvalState();
         Value out;
         po->fn(state, buf, out);

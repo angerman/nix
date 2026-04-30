@@ -724,6 +724,19 @@ struct Lowerer
             auto isLazyArg = [&](uint32_t idx) -> bool {
                 if (name == "foldl'") return idx == 1;     // nul
                 if (name == "seq" || name == "deepSeq") return idx == 1;
+                // addErrorContext's second arg is the "wrapped value" —
+                // tree-walker forces it inside the primop's try/catch
+                // so the wrapper can attach context to any error.  v3
+                // currently has no try/catch in primAddErrorContext (it
+                // just returns args[1]), but matching tree-walker's
+                // pre-force semantics here is what nixpkgs relies on:
+                // `config = addErrorContext "..." config` (modules.nix:270)
+                // captures the rec-sibling `config` in a thunk, which
+                // must NOT be eagerly forced at attrset-build time
+                // (would deadlock against the rec attrset that's still
+                // being constructed).  Tree-walker avoids this because
+                // its primop call doesn't pre-force args.
+                if (name == "addErrorContext") return idx == 1;
                 return false;
             };
 
