@@ -51,19 +51,59 @@ captured-with that slot pointer see the attrset BEFORE the outer
 forceValue call returns. v3 only sets `t.evaluated` at OP_RETURN —
 sub-thunks that fire DURING the body see Black.
 
-### Next step (deferred)
+### Next step (deferred) — REVISED ROOT CAUSE
 
-Implement "early publish" — set `t.evaluated` and `t.state = Eval`
-EARLIER, when the OUTER thunk's eventual return value can be
-predicted (e.g., when an attrset is built in a sub-frame whose return
-value will become the outer thunk's value). Experimental code is
-behind `NIX_V3_EARLY_PUBLISH=1` (currently a stub for closure-call
-to immediate-thunk-frame propagation; doesn't fix nixpkgs alone).
+The actual root cause (per deeper trace 2026-04-30) is **value-vs-
+reference capture for `with`**:
 
-The full fix likely requires propagating the "outer thunk's slot"
-through the call chain so sub-frames can mutate it directly (= what
-tree-walker does with `Value *` slot pointers). This is a major
-architectural change.
+  - Tree-walker's `ExprWith::eval` does `env2.values[0] =
+    attrs->maybeThunk(state, env)`.  For `attrs = ExprVar(self)`,
+    `ExprVar::maybeThunk` (eval.cc:1076) returns `state.lookupVar(...)`
+    — a `Value*` POINTING to the slot.  Sub-thunks created inside
+    `with self;` capture this slot pointer; when they fire LATER
+    (after `v.mkAttrs(...)` has mutated the slot), they dereference
+    the slot and see the attrset.
+  - v3's `OP_WITH_PUSH` pops a `Value` (a snapshot — `Tag::Thunk`
+    with a `Thunk*` pointer) and pushes it onto `vm.withStack`.
+    Captured-with snapshots (`closure->capturedWiths`) are
+    `ListVec<Value>` arrays — also snapshots.  When sub-thunks fire
+    DURING x's body's deep eval, they force the snapshot's Thunk*
+    which points to x in Blackhole — throws.
+
+**Architectural fix options** (all major work):
+
+  1. **Slot-pointer Tag in Value.**  Add `Tag::Slot` (a `Value *`
+     payload) and have `OP_WITH_PUSH` / captured-with snapshots
+     store slot pointers when the source is a let-rec env slot.
+     `withLookup` would deref the slot pointer at force time.
+     Requires reworking `closure.hh::Thunk`, `vm.hh::CallFrame`,
+     and the IR-to-bytecode compiler.  ~200-500 lines.
+
+  2. **Walk-up early-publish at value-producing ops.**  At every
+     `OP_ATTRS_INIT` / `OP_ATTRS_REC_INIT` / `OP_LIST_INIT`, walk
+     the frame stack to find the nearest CFF_THUNK_RETURN frame in
+     Blackhole state and publish the just-built value to its
+     `thunk->evaluated`.  Risky — intermediate values may not be
+     the thunk's final value (e.g., `OP_ATTRS_UPDATE` mutates
+     after).  Probably needs idempotency at OP_RETURN.
+
+  3. **Defer `with`-source forcing to lookup time.**  Don't force
+     the with-stack source at OP_WITH_PUSH — just store a
+     `(Value, Env-binding-info)` tuple.  At lookup time, re-evaluate
+     the binding fresh, hitting whatever the slot currently is.
+     Requires bytecode for the with-source expression to be
+     re-runnable, which v3 doesn't currently support cleanly.
+
+Option 1 most cleanly mirrors tree-walker semantics but is the
+biggest refactor.  Option 2 is a tactical fix with semantic risk.
+Option 3 reframes the problem but doesn't fit v3's compile-once
+model.
+
+**Empirical test** (commit b1186400b state): the current CFF_FORCE_RETRY
+mechanism preserves all 142/142 lang + 39/39 wc-laziness + 142/142
+cutover + 25/25 drv-parity tests.  nixpkgs `(import <nixpkgs>{}).system`
+still fails with WITH_LOOKUP miss.  See memory
+`project_wc38_with_blackhole.md` for the diagnostic procedure.
 
 ## 2026-04-30 — WC-38 root cause confirmed: OP_RETURN-chain push triggers deep eager eval
 
