@@ -5,6 +5,47 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
+## 2026-04-30 — Pure-VM nixpkgs status snapshot (end of WC-31/34/35/36/37 session)
+
+23 commits this session.  Pure-VM `(import <nixpkgs>{}).system` (and
+all probed nixpkgs queries: `.lib.version`, `.pkgs.hello.name`,
+`.hello.outPath`, `attrNames`, `.lib.trivial.release`) advanced from
+"structural blackhole on `lib.trivial` rec-construction" all the way
+past the WC-35 cycle to a UNIFORM remaining error: stdenv-bootstrap
+closure-leak (WC-37 below).
+
+### What's now correct in pure-VM v3 (regressions blocked by 30 tests)
+
+  - **Lazy attrset values**: `ConcatStrings` and pure-arith primop
+    calls in attrset value position get thunkified (3d9228726).
+  - **Force-on-receive at consumption sites**: OP_CALL, OP_FORCE
+    (already), OP_ATTRS_SELECT, OP_ATTRS_SELECT_DYN, OP_ATTRS_HAS,
+    OP_ATTRS_HAS_DYN, OP_LIST_CONCAT, OP_ATTRS_UPDATE, OP_STR_CONCAT,
+    callClosure all force lazy values (Tag::App, Tag::Thunk) before
+    shape-checking (62d2309eb, 62f9ac514, 888b56928).
+  - **Per-primop laziness**: `addErrorContext`'s arg 1 stays unforced
+    via the new `PrimOp::lazyArgs` bitmask (1f42622ef).
+  - **Lazy primop entries**: `mapAttrs`, `map`, `genList`,
+    `zipAttrsWith` all build `Tag::App(App(fn, key), value)` entries
+    instead of eagerly applying (08dcd264a, efc60b3e5, 117a31628).
+  - **primConcatMap forces fn result** (888b56928).
+  - **primToString handles list / attrset-with-outPath / path**
+    matching tree-walker's `coerceToString(coerceMore=true,
+    copyToStore=false)` (48aff0763).
+  - **Diagnostic infrastructure**: `V3_DBG_OPCYCLE_DISASM` identifies
+    BLACK frame; `V3_DBG_CALL` / `V3_DBG_STRCONCAT` /
+    `V3_DBG_ADD_ERR_CTX` localise specific consumer sites; WC-32
+    disasm now annotates symbol-id operands.
+
+### Test layers (all green at session end)
+
+| Suite                          | Pass    | Purpose                          |
+|--------------------------------|---------|----------------------------------|
+| run-lang-tests.sh              | 142/142 | upstream eval-okay-* lang tests  |
+| run-cutover-tests.sh           | 142/142 | NIX_USE_V3=1 cutover hook        |
+| run-drv-parity.sh              | 25/25   | byte-exact drvPath parity        |
+| run-wc-laziness-tests.sh       | 30/30   | WC-31/34/35/36 fix-pinned        |
+
 ## 2026-04-30 — WC-37: nixpkgs stdenv-bootstrap closure-leak (deferred)
 
 After WC-35/36's chain of force-on-receive + lazy primop fixes,
