@@ -128,6 +128,13 @@ enum Op : uint8_t
     OP_WITH_PUSH      = 0x80,  // pop attrset, push it on with-stack
     OP_WITH_POP       = 0x81,
     OP_WITH_LOOKUP    = 0x82,  // [sym:24]; data: depth (0=innermost)
+    /// SECD DUM/RAP: push a Tag::Slot Value onto the operand stack
+    /// pointing at the local slot referenced by [slot:24].  Used when
+    /// `with E;` source resolves to a let-rec slot reference — capturing
+    /// the slot pointer (rather than the slot's snapshotted value) lets
+    /// sub-thunks observe the slot's live contents at force time.  See
+    /// Tag::Slot's docstring in value.hh for rationale.
+    OP_LOAD_SLOT_REF  = 0x83,  // [slot:24]
 
     // --- Strings --------------------------------------------------------
     OP_STR_CONCAT     = 0x90,  // [n:24] forceString stored in low bit of n; pops n parts

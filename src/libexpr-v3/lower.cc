@@ -1358,7 +1358,29 @@ struct Lowerer
         // forcing until OP_WITH_LOOKUP first needs to scan the entry,
         // which is required for `with pkgs; ...` to work inside the
         // recursive group that defines pkgs (otherwise we'd blackhole).
+        //
+        // WC-38 SECD-style slot aliasing: SCAFFOLDED but NOT YET WIRED.
+        //
+        // The intent is: when `e->attrs` resolves to a stable slot
+        // (heap-allocated, not value-stack), emit OP_LOAD_SLOT_REF so
+        // sub-thunks captured inside the with-body see live mutations
+        // through the slot pointer.
+        //
+        // Currently disabled because the only slots we can name at
+        // lower time are value-stack frame slots (lambda params,
+        // let-rec entries, etc.).  Those slots are transient — when
+        // the surrounding frame returns, the slot's storage is
+        // reused.  Sub-thunks captured inside `with E;` may escape
+        // the frame (stored in attrsets / closures); their
+        // captured-with snapshot would dangle.
+        //
+        // Phase 4 will introduce heap-allocated slot storage (matching
+        // tree-walker's Env block) and emit OP_LOAD_BINDING_SLOT_REF
+        // pointing into stable Bindings::entries[i].value memory for
+        // rec-attrset entries.  Until then, fall back to the snapshot
+        // path uniformly.
         ir::VarId attrs = lowerExpr(e->attrs);
+        ir::VarId slotRef = ir::kInvalid;
         auto bodyB = m.freshBlock();
         blockStack.push_back(bodyB);
         // Push an empty placeholder scope: nix's bindVars counts the
@@ -1370,7 +1392,7 @@ struct Lowerer
         scopes.pop_back();
         setReturn(rv);
         blockStack.pop_back();
-        return addBinding(ir::With{attrs, bodyB});
+        return addBinding(ir::With{attrs, bodyB, slotRef});
     }
 
     template<class AstNode>

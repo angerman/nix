@@ -470,8 +470,30 @@ struct Emitter
     // -- With / assert
     void emitOne(const ir::With & e)
     {
-        emitVarRef(e.attrs);
-        unit.code.push_back(encode(OP_WITH_PUSH));
+        // WC-38 SECD-style slot aliasing.  When the `with` source was
+        // a simple ExprVar resolving to a local slot, push a Tag::Slot
+        // pointer to that slot.  withLookup will deref the slot at
+        // lookup time, picking up any in-place updates (`mkAttrs`-like
+        // mutations done by the let-rec body) rather than seeing a
+        // stale snapshot.  Falls back to OP_GET_LOCAL/UPVALUE +
+        // OP_WITH_PUSH for non-slot-ref sources.
+        bool emittedSlotRef = false;
+        if (e.slotRef != ir::kInvalid) {
+            if (auto it = ctx->slot.find(e.slotRef); it != ctx->slot.end()) {
+                unit.code.push_back(encode(OP_LOAD_SLOT_REF, it->second));
+                unit.code.push_back(encode(OP_WITH_PUSH));
+                emittedSlotRef = true;
+            }
+            // Upvalue case: we don't have a slot pointer for upvalues
+            // in the current frame's locals; fall back to snapshot.
+            // (A future refinement could thread slot pointers through
+            // closure upvalues, but that requires a wider change to
+            // Closure storage.)
+        }
+        if (!emittedSlotRef) {
+            emitVarRef(e.attrs);
+            unit.code.push_back(encode(OP_WITH_PUSH));
+        }
         emitBlock(e.bodyBlock);
         unit.code.push_back(encode(OP_WITH_POP));
     }

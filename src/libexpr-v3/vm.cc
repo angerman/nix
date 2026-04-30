@@ -286,6 +286,33 @@ inline Value withLookup(VMState & vm, SymbolId name, uint32_t /*depth*/)
     size_t base = vm.frames.empty() ? 0 : vm.frames.back().withStackBase;
     for (size_t i = vm.withStack.size(); i-- > base; ) {
         Value & w = vm.withStack[i];
+        // Tag::Slot: deref the slot pointer.  Slots are mutated when
+        // their backing let-rec body publishes a result, so reading
+        // through the slot here gives us the LATEST value (matches
+        // tree-walker's `state.forceValue(*v2)` on slot pointers).
+        if (w.tag() == Tag::Slot) {
+            Value * p = w.payload.slot;
+            if (!p) continue;
+            // Don't write *p back into w — leave the slot pointer in
+            // place for subsequent lookups (the slot may mutate again,
+            // e.g. OP_APPLY_OVERRIDES grows the bindings).  Force a
+            // local copy and use it for this iteration.
+            Value derefed = *p;
+            if (derefed.isThunk() || derefed.tag() == Tag::App) {
+                try {
+                    derefed = forceValue(vm, derefed);
+                } catch (const std::exception & ex) {
+                    std::string what(ex.what());
+                    if (what.find("blackhole") != std::string::npos)
+                        continue;
+                    throw;
+                }
+            }
+            if (!derefed.isAttrs()) continue;
+            if (auto * v = derefed.payload.bindings->lookup(name))
+                return *v;
+            continue;
+        }
         if (w.isThunk() || w.tag() == Tag::App) {
             try {
                 w = forceValue(vm, w);
@@ -1468,15 +1495,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             {
                 Value & topRef = vm.valueStack.back();
                 Tag t = topRef.tag();
-                if (t != Tag::Thunk && t != Tag::App) break;
+                if (t != Tag::Thunk && t != Tag::App && t != Tag::Slot) break;
             }
             // Slow path: shared with OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE
             // which push the value first and then jump here.
             op_force_slow:
             Value v = pop(vm);
-            // Chase Evaluated chains and resolve Tag::App deferred
-            // calls (used by mapAttrs et al. for lazy entries).
+            // Chase Evaluated chains, deref Tag::Slot, and resolve
+            // Tag::App deferred calls (used by mapAttrs et al. for
+            // lazy entries).
             while (true) {
+                if (v.tag() == Tag::Slot) {
+                    Value * p = v.payload.slot;
+                    if (!p) throw std::runtime_error(
+                        "v3 OP_FORCE: null slot pointer");
+                    v = *p;
+                    continue;
+                }
                 if (v.tag() == Tag::App) {
                     Value left = v.payload.pair->left;
                     Value right = v.payload.pair->right;
@@ -2189,6 +2224,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // --- With ---
         case OP_WITH_PUSH: vm.withStack.push_back(pop(vm)); break;
         case OP_WITH_POP:  vm.withStack.pop_back(); break;
+        case OP_LOAD_SLOT_REF: {
+            // Push a Tag::Slot Value pointing at vm.valueStack[stackBase + operand].
+            // The pointer remains valid as long as vm.valueStack does
+            // not reallocate.  Phase 4 will address slot-stability for
+            // pathological depth; for now we rely on the pre-reserved
+            // capacity (vm.valueStack.reserve(64*1024)).
+            Value v;
+            v.mkSlot(&vm.valueStack[stackBase + operand]);
+            push(vm, v);
+            break;
+        }
         case OP_WITH_LOOKUP: {
             uint32_t depth = cu->code[ip++];
             push(vm, withLookup(vm, static_cast<SymbolId>(operand), depth));
@@ -2868,6 +2914,19 @@ Value forceValue(VMState & vm, Value v)
         // guards.  Match those guards.
         if (__builtin_expect(vm.frames.size() >= 5000, 0))
             throw std::runtime_error("v3 forceValue: stack overflow; call depth exceeded 5000");
+        // Tag::Slot — SECD-style indirection.  The slot pointer
+        // references another stable Value that gets mutated when its
+        // let-rec body publishes a result.  Dereference and continue
+        // chasing.  See `with self;` semantics in Tag::Slot's docstring
+        // for why this matters: sub-thunks captured under `with self;`
+        // must observe the latest slot contents at force time, not a
+        // snapshot from when the with-stack was pushed.
+        if (v.tag() == Tag::Slot) {
+            Value * p = v.payload.slot;
+            if (!p) throw std::runtime_error("v3 forceValue: null slot pointer");
+            v = *p;
+            continue;
+        }
         // Tag::App is a deferred application — force it by actually
         // applying.  Used by primops like mapAttrs that build lazy
         // entries: each entry is `App(fn, arg)` and we materialize on
