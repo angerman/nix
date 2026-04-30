@@ -145,6 +145,7 @@ inline bool valueEqual(VMState & vm, Value a, Value b, bool insideContainer = fa
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default:          return a.payload.raw == b.payload.raw;
     }
 }
@@ -225,6 +226,7 @@ inline std::string coerceToString(const Value & v, bool forceString)
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default:
         {
             char buf[96];

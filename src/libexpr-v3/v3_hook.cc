@@ -910,7 +910,8 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     case Tag::App:
     case Tag::Blackhole:
     case Tag::Uninitialized:
-    case Tag::External: {
+    case Tag::External:
+    case Tag::Slot: {
         // Thunks/apps shouldn't escape v3 in normal flow (we force
         // the result at run() exit) — these are pathology cases.
         // Fall back; not worth bridging.
@@ -1273,6 +1274,7 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     case Tag::Blackhole:
     case Tag::Uninitialized:
     case Tag::External:
+    case Tag::Slot:
     default:
         return false;
     }

@@ -123,6 +123,7 @@ static nlohmann::json toJsonValue(const Value & v,
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default:
         return json(nullptr);
     }
@@ -245,6 +246,7 @@ static void printNixValue(std::ostream & out, const Value & v,
     case Tag::App:      out << "<APP>"; return;
     case Tag::Blackhole:out << "<BLACKHOLE>"; return;
     case Tag::External: out << "<EXTERNAL>"; return;
+    case Tag::Slot:     out << "<SLOT>"; return;
     case Tag::Uninitialized:
     default:            out << "<value tag=" << (int)v.tag() << ">"; return;
     }

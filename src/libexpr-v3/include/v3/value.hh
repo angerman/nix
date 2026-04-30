@@ -46,6 +46,17 @@ enum class Tag : uint8_t {
     App           = 13,
     Blackhole     = 14,
     External      = 15,
+    /// Slot pointer — a stable pointer to another Value living in
+    /// heap-allocated storage (let-rec env).  WC-38 / SECD-style
+    /// DUM/RAP: when `with E;` source resolves to a let-rec slot,
+    /// or when an upvalue captures a let-rec binding, the value
+    /// stored is `Tag::Slot` with payload = `Value*`.  Forcing a
+    /// Tag::Slot dereferences the pointer and forces *that* value;
+    /// since the pointed-to slot is mutated in-place when the
+    /// let-rec body completes (mkAttrs equivalent), sub-thunks
+    /// observing the slot at use time see the up-to-date value
+    /// rather than a stale snapshot.
+    Slot          = 16,
 };
 
 /// Two-word Value (16 bytes on 64-bit).
@@ -71,6 +82,7 @@ struct Value
         const PrimOp * primop;     // Tag::PrimOp
         Value *        next;       // Tag::Thunk Blackhole chain (transient)
         ValuePair *    pair;       // PrimOpApp / App (allocated)
+        Value *        slot;       // Tag::Slot — stable pointer to another Value
         void *         raw;        // External / generic
     } payload;
 
@@ -92,12 +104,13 @@ struct Value
     [[gnu::always_inline]] inline bool isPrimOp()   const noexcept { return tag() == Tag::PrimOp; }
     [[gnu::always_inline]] inline bool isApp()      const noexcept { return tag() == Tag::App; }
     [[gnu::always_inline]] inline bool isBlackhole()const noexcept { return tag() == Tag::Blackhole; }
+    [[gnu::always_inline]] inline bool isSlot()     const noexcept { return tag() == Tag::Slot; }
 
-    /// Forced = not a thunk, not an unevaluated app.
+    /// Forced = not a thunk, not an unevaluated app, not a slot indirection.
     [[gnu::always_inline]] inline bool isForced() const noexcept
     {
         Tag t = tag();
-        return t != Tag::Thunk && t != Tag::App;
+        return t != Tag::Thunk && t != Tag::App && t != Tag::Slot;
     }
 
     /// In-place initialisers (no allocation).
@@ -133,6 +146,11 @@ struct Value
     {
         tag_payload = static_cast<uint64_t>(Tag::String);
         payload.str = s;
+    }
+    inline void mkSlot(Value * p) noexcept
+    {
+        tag_payload = static_cast<uint64_t>(Tag::Slot);
+        payload.slot = p;
     }
 
     /// Singletons (defined in value.cc).

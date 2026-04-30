@@ -195,6 +195,7 @@ inline bool valueEqual(VMState & vm, Value a, Value b)
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default:          return a.payload.raw == b.payload.raw;
     }
 }
@@ -218,6 +219,7 @@ inline std::string toStr(const Value & v)
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default: {
         char buf[64];
         std::snprintf(buf, sizeof buf,
@@ -400,6 +402,7 @@ static std::string toStringCoerce(EvalState & state, Value v)
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default: {
         char buf[64];
         std::snprintf(buf, sizeof buf,
@@ -444,6 +447,7 @@ void primTypeOf(EvalState &, Value * args, Value & out)
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default:          t = "unknown";
     }
     out = mkStringValueOwned(t);
@@ -2385,7 +2389,8 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         case Tag::PrimOpApp:
         case Tag::App:
         case Tag::Blackhole:
-        case Tag::External: {
+        case Tag::External:
+        case Tag::Slot: {
             EvalState bridgeState;
             bridgeState.nixEvalState = &ns;
             static thread_local VMState resultBridgeVm;
@@ -2470,6 +2475,7 @@ static void primV3CallBridge2(nix::EvalState & ns, const nix::PosIdx pos,
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default:
         // Lists / attrsets / paths fall back to null.  filter returns
         // bool, so this is enough for the path test.
@@ -2877,6 +2883,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default: {
         static const bool dbg = std::getenv("V3_DBG_BRIDGE_NULL") != nullptr;
         if (dbg) std::fprintf(stderr,
@@ -4326,6 +4333,7 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default:
         out += "<unevaluated />\n";
         return;
@@ -5044,6 +5052,7 @@ nlohmann::json valueToJson(EvalState & state, const Value & vRaw)
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default:
         throw std::runtime_error("v3 toJSON: unsupported value type");
     }
@@ -5139,6 +5148,7 @@ nlohmann::json valueToJsonWithContext(
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
+    case Tag::Slot:
     default:
         throw std::runtime_error(
             "v3 BR-3 valueToJsonWithContext: unsupported value type");
