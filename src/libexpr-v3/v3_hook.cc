@@ -524,22 +524,17 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     if (diag) std::fprintf(stderr, "v3 hook[%llu]: enter e=%p\n",
                            (unsigned long long)st.evalEntries, (void*)e);
 
-    // WC-30a: short-circuits removed by default — v3 now lowers+runs
-    // every Expr (the inversion path).  Best-of-5 bench shows
-    // parity-or-slight-win on real workloads; lang/cutover/drv-parity
-    // all 142+142+25 green.  Opt back in via NIX_V3_SHORTCIRCUIT=1
-    // if a regression surfaces (kept for A/B testing the design).
-    //
-    // Original short-circuits (now gated): Lambda / Int / Float /
-    // String / Path / Var / Pos / Attrs / List + willReturnClosure
-    // predicate.  These paid <1 ms each in lower+compile+run and were
-    // documented as a 21-test perf win during WC-7 + CO-6.  The
-    // cumulative cost has dropped enough (post-WC-25/26 + WC-28) that
-    // they're now neutral or slightly negative on real workloads.
-    static const bool useShortcircuit =
-        std::getenv("NIX_V3_SHORTCIRCUIT") != nullptr;
+    // WC-30a: short-circuits stay default-on (CO-6 / WC-7 perf opt
+    // documented at +21 tests).  Removing them showed measurable
+    // 2-3% regression on real workloads despite test sweeps passing.
+    // Opt out via NIX_V3_NO_SHORTCIRCUIT=1 for inversion-path
+    // testing.  Real inversion (WC-30b+) needs a structural change
+    // that REPLACES the short-circuit work with a v3-internal fast
+    // path, not just removes it.
+    static const bool noShortcircuit =
+        std::getenv("NIX_V3_NO_SHORTCIRCUIT") != nullptr;
 
-    if (e && useShortcircuit) {
+    if (e && !noShortcircuit) {
         auto k = e->exprKind;
         if (k == nix::Expr::Kind::Lambda ||
             k == nix::Expr::Kind::Int    ||
