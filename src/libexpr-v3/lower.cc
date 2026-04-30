@@ -760,7 +760,7 @@ struct Lowerer
         // errors only fire if the callee actually forces the arg.
         ir::VarId f = forceVal(lowerExpr(e->fun));
         for (auto * a : *e->args) {
-            ir::VarId av = thunkifyForAttr(a);
+            ir::VarId av = thunkifyForArg(a);
             f = addBinding(ir::App{f, av});
             // After this App, the result might be a closure (curried)
             // or the applied value.  Force before the next App so the
@@ -771,14 +771,24 @@ struct Lowerer
         return f;
     }
 
-    /// Decide whether an attrset/list element expression needs a thunk
-    /// wrapper: trivial nodes (literals, plain var refs, lambdas)
-    /// carry no risk of failing or doing observable work, so skip the
-    /// wrapping cost.  Anything non-trivial (calls, selects, arith,
-    /// attrsets-of-attrsets) gets thunkified so that building the
-    /// outer attrset doesn't eagerly force its contents — this is what
-    /// gives Nix attrsets their lazy-by-attribute semantics.
-    bool isTrivialForLazy(nix::Expr * e) const
+    /// Two flavours of "is this expression cheap enough to skip the
+    /// thunk wrapper?":
+    ///
+    ///   - `forArg`: used for **function-call arguments**.  An eagerly
+    ///     evaluated ConcatStrings or arithmetic primop call passed as
+    ///     an arg is fine — the callee will force the argument anyway,
+    ///     and wrapping every `f (n + 1)` in a thunk dominates fib's
+    ///     hot path.
+    ///   - `forValue` (default — for attrset values and list elements):
+    ///     stricter.  ConcatStrings and arithmetic primop calls do
+    ///     **need** a thunk wrapper here because they may reference
+    ///     rec siblings (`version = release + versionSuffix;` in
+    ///     nixpkgs lib/trivial.nix).  Without the wrapper, the
+    ///     surrounding rec-attrset construction eagerly forces the
+    ///     sibling, deadlocking against the rec attrset that's still
+    ///     being built (`lib.trivial`'s body forcing
+    ///     `lib.trivial.release` cycle).
+    bool isTrivialForLazy(nix::Expr * e, bool forArg) const
     {
         if (!e) return true;
         const auto k = e->exprKind;
@@ -797,31 +807,41 @@ struct Lowerer
             auto * v = static_cast<nix::ExprVar *>(e);
             return !v->fromWith;
         }
-        // ConcatStrings (`a + b`) is treated as trivial: the operands
-        // are forced lazily by the VM's OP_STR_CONCAT path, and
-        // wrapping the entire add in an extra thunk is the dominant
-        // per-call cost on arithmetic-heavy benchmarks like fib.
-        if (k == nix::Expr::Kind::ConcatStrings) return true;
-        // Calls to known-pure arithmetic / comparison primops also
-        // skip the wrapper.  These never throw / have side effects on
-        // valid inputs, and tree-walker effectively treats them the
-        // same way (its App value is much lighter than a v3 Thunk).
-        if (k == nix::Expr::Kind::Call) {
-            auto * c = static_cast<nix::ExprCall *>(e);
-            if (c && c->fun && c->fun->exprKind == nix::Expr::Kind::Var) {
-                auto * fv = static_cast<nix::ExprVar *>(c->fun);
-                if (fv->fromWith) return false;
-                std::string n(symbols[fv->name]);
-                if (n == "__sub" || n == "__mul" || n == "__div"
-                    || n == "__lessThan") return true;
+        // ConcatStrings (`a + b`) and known-pure arithmetic primop
+        // calls — only cheap-to-skip in argument position.  In an
+        // attr-value position they may reference rec siblings, so the
+        // thunk wrapper is required for laziness.
+        if (forArg) {
+            if (k == nix::Expr::Kind::ConcatStrings) return true;
+            if (k == nix::Expr::Kind::Call) {
+                auto * c = static_cast<nix::ExprCall *>(e);
+                if (c && c->fun && c->fun->exprKind == nix::Expr::Kind::Var) {
+                    auto * fv = static_cast<nix::ExprVar *>(c->fun);
+                    if (fv->fromWith) return false;
+                    std::string n(symbols[fv->name]);
+                    if (n == "__sub" || n == "__mul" || n == "__div"
+                        || n == "__lessThan") return true;
+                }
             }
         }
         return false;
     }
 
+    /// Wrap an attrset/list-element expression in a thunk if needed.
+    /// Strict: ConcatStrings/arith get thunked here (rec-sibling
+    /// laziness — see isTrivialForLazy comment).
     ir::VarId thunkifyForAttr(nix::Expr * e)
     {
-        if (isTrivialForLazy(e)) return lowerExpr(e);
+        if (isTrivialForLazy(e, /*forArg=*/false)) return lowerExpr(e);
+        return thunkify(e);
+    }
+
+    /// Wrap a function-call argument in a thunk if needed.  Looser:
+    /// ConcatStrings + pure-arith calls pass through eagerly (fib
+    /// hot-path optimisation).
+    ir::VarId thunkifyForArg(nix::Expr * e)
+    {
+        if (isTrivialForLazy(e, /*forArg=*/true)) return lowerExpr(e);
         return thunkify(e);
     }
 

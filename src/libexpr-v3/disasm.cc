@@ -130,6 +130,26 @@ uint32_t disassembleOne(std::FILE * out,
     uint32_t extra = opExtraWords(op, operand, cu, ip);
     std::fprintf(out, "  [%u] %-22s operand=%u",
         ip, name, operand);
+    // Annotate ops whose operand is a SymbolId with the symbol name —
+    // makes cycle traces self-explanatory ("OP_ATTRS_SELECT operand=192
+    // (release)" beats raw numeric IDs).
+    const auto & gst = ir::globalSymbolTable();
+    auto symAnnotate = [&](uint32_t sid) {
+        if (sid < gst.size())
+            std::fprintf(out, " (%s)", gst[sid].c_str());
+    };
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wswitch-enum"
+    switch (op) {
+    case OP_ATTRS_SELECT:
+    case OP_ATTRS_SELECT_DYN:
+    case OP_ATTRS_HAS:
+    case OP_ATTRS_HAS_DYN:
+        symAnnotate(operand);
+        break;
+    default: break;
+    }
+#pragma clang diagnostic pop
     if (extra > 0) {
         std::fprintf(out, "  data=[");
         for (uint32_t i = 0; i < extra && (ip + 1 + i) < cu.code.size(); ++i) {
