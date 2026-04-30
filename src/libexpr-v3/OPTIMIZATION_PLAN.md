@@ -2290,6 +2290,55 @@ force-hook bridge case via lazy upvalue Bridge thunks.  The
 **same fix needs to apply to v3's internal upvalues** — not just
 upvalues that come from tree-walker via the bridge.
 
+### WC-33: pinpointed v3-eval-direct divergence (codegen, not runtime)
+
+The cycle in v3-eval direct on `(import nixpkgs).system` is reproducible
+at the smallest scale: even `(import nixpkgs {}).system` cycles, while
+the same expression succeeds on tree-walker AND on the cutover hook
+path (NIX_USE_V3=1 nix-instantiate).
+
+**Why cutover succeeds where v3-eval direct fails:** the cutover hook
+short-circuits the OUTER `Apply(Lambda, args)` to tree-walker.  The
+imported file is v3-evaluated (primImport runs the file in v3), but
+the lambda CALL happens through tree-walker's eval.  primV3CallBridge1
+is reached via tree-walker's PrimOpApp dispatch — and it sets up a
+fresh VMState with WC-25 lazy upvalue Bridge thunks.
+
+In v3-eval direct, the lambda call happens natively in v3 (OP_CALL on
+a v3 closure).  No bridge.  Upvalues captured at OP_MAKE_CLOSURE time
+are eager VALUES, not deferred Bridge thunks.
+
+### Codegen-level root cause (lower.cc:180)
+
+When a closure inside a rec-attrset body has a freeVar that resolves
+through `recAttrsVar`, lower.cc:180 emits `ir::AttrSelect{rec, name}`
+in the SURROUNDING block.  At OP_MAKE_CLOSURE time, that AttrSelect
+runs FIRST, captures the slot's CURRENT value (possibly a Black
+thunk), then OP_MAKE_CLOSURE bakes it into the closure's upvalues.
+
+Tree-walker, by contrast, captures the `Env *` by reference; the
+slot is dereferenced AT CALL TIME — by which time most rec slots
+have transitioned Suspended→Evaluated.
+
+### Two viable fix designs
+
+**Option A — thunkify rec freeVars** (simpler, more closures):
+  At lower-time, when emitting a freeVar that resolves through
+  `recAttrsVar`, emit an `ir::MkThunk` wrapping the AttrSelect
+  rather than the AttrSelect directly.  The thunk defers until
+  the closure body forces it.  Cost: extra thunks per closure
+  for each rec freeVar.
+
+**Option B — single rec_bindings upvalue** (smaller bytecode,
+  bigger lower change):
+  Capture the rec-attrset's Bindings pointer as ONE upvalue;
+  the closure body then emits OP_ATTRS_SELECT(rec_upvalue, name)
+  per access instead of OP_GET_UPVALUE.  Cost: changes upvalue
+  layout, IR shape, freeVars semantics.
+
+Option A is the lower-risk path.  Estimated 2-3 days for a clean
+implementation + lang-test validation.
+
 ### Specific divergence: stdenv/booter.nix:101-114
 
 ```nix
