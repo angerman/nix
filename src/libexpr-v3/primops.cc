@@ -893,7 +893,13 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
 
 void primRemoveAttrs(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isAttrs()) typeError("removeAttrs", "attrset");
+    if (!args[0].isAttrs()) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf,
+            "v3 primop removeAttrs: expected attrset (got tag=%u)",
+            (unsigned)args[0].tag());
+        throw std::runtime_error(buf);
+    }
     if (!args[1].isList())  typeError("removeAttrs", "list of strings");
     auto * src = args[0].payload.bindings;
     auto * names = args[1].payload.list;
