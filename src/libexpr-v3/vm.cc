@@ -2018,8 +2018,37 @@ Value forceValue(VMState & vm, Value v)
         if (!v.isThunk()) break;
         Thunk * t = v.payload.thunk;
         if (t->state == ThunkState::Evaluated) { v = t->evaluated; continue; }
-        if (t->state == ThunkState::Blackhole)
+        if (t->state == ThunkState::Blackhole) {
+            // Same diagnostic as OP_FORCE's blackhole path — V3_DBG_OPCYCLE
+            // dumps the frame stack so the cycle source is visible.
+            static const bool s_dbg = std::getenv("V3_DBG_OPCYCLE") != nullptr;
+            if (s_dbg) {
+                auto frameInfo = [&](Thunk * th, const Closure * cl, uint32_t fip) -> std::string {
+                    const LambdaDescriptor * desc = nullptr;
+                    if (th) desc = reinterpret_cast<const LambdaDescriptor *>(th->suspended.desc);
+                    else if (cl) desc = cl->desc;
+                    if (!desc) return "<closure-body>";
+                    char buf[256];
+                    std::snprintf(buf, sizeof buf,
+                        "%s code=[%u..) nUp=%u nLocals=%u",
+                        !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                        desc->codeOffset, desc->nUpvalues, desc->nLocals);
+                    return buf;
+                };
+                std::fprintf(stderr,
+                    "v3 forceValue Black thunk=%p frames=%zu\n",
+                    (void*)t, vm.frames.size());
+                size_t lim = vm.frames.size();
+                for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                    const auto & fr = vm.frames[i - 1];
+                    std::fprintf(stderr,
+                        "  frame[%zu]: %s flags=%u ip=%u thunk=%p\n",
+                        i - 1, frameInfo(fr.thunk, fr.closure, fr.ip).c_str(),
+                        (unsigned)fr.flags, fr.ip, (void*)fr.thunk);
+                }
+            }
             throw std::runtime_error("v3 forceValue: infinite recursion (blackhole)");
+        }
         if (t->state == ThunkState::Bridge) {
             v = forceBridgeThunk(t);
             t->state = ThunkState::Evaluated;

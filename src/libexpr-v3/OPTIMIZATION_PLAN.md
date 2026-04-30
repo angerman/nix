@@ -5,6 +5,59 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
+## 2026-04-30 — Pure-VM nixpkgs progress (WC-31 root-cause + WC-34 chain)
+
+After WC-31 Options A and B were empirically confirmed equivalent
+(both blackhole on `(import <nixpkgs>{}).system`), pinpointed the
+**actual** root cause: `lib/trivial.nix:453`
+`version = release + versionSuffix;` lowered as `ConcatStrings` that
+v3's `isTrivialForLazy` whitelisted as "skip the thunk wrapper".  In
+attr-value position this breaks rec-attr laziness — `release` and
+`versionSuffix` (both `inherit (lib.trivial)` thunks) get forced
+during the surrounding rec-attrset construction, while `lib.trivial`'s
+own body is still Black.
+
+Five sequential bugs fixed this session, each unblocked the next:
+
+  1. **ConcatStrings eager-eval** (commit 3d9228726): split
+     `isTrivialForLazy` into `forArg` (loose, fib hot path) and
+     attr-value (strict, laziness for rec siblings).
+  2. **OP_RETURN doesn't chase Tag::App** (commit 63a8214e8): when
+     a `CFF_THUNK_RETURN` body returns `Tag::App` (deferred call from
+     `mapAttrs` etc.), the App escaped to the caller's slot.
+     Extended OP_RETURN's chase loop to resolve App via
+     `forceValue(left) + callClosure(left, right)`.
+  3. **primToString on lists/attrsets/paths** (commit 48aff0763):
+     v3's `toStr` only handled primitives.  Added `toStringCoerce`
+     mirroring `coerceToString(copyToStore=false, coerceMore=true)` —
+     space-joined lists, attrsets via `outPath`, paths-as-strings.
+  4. **callClosure doesn't force fun** (commit 62f9ac514): the
+     `__functor` recursion left a Thunk on the second
+     `callClosure(firstStep, arg)`.  Force at top of callClosure to
+     mirror tree-walker's `callFunction`.
+  5. **Next: forceValue blackhole inside module evaluation** (this
+     session, deferred — frame[34] depth.  The chain reaches
+     `pushedDownDefinitionsByName` → `cfg` → `defsFinal'` → ... in
+     the NixOS-style module system code that nixpkgs uses for
+     internal config plumbing.  Different from WC-31 — possibly
+     `with`-stack laziness or formals-default eager force).
+
+Progression of v3-eval direct on `(import <nixpkgs>{}).system`:
+  - Pre-session: `OP_FORCE: infinite recursion (blackhole)` at
+    `lib.trivial` rec-construction
+  - After (1): `OP_CALL: callee is not a closure` (Tag::App)
+  - After (2): `toString: cannot stringify this type (tag=8)`
+    (List)
+  - After (3): `callClosure: not callable` (Tag::Thunk)
+  - After (4): `forceValue: infinite recursion (blackhole)` 35
+    frames deep into module-system eval
+  - After (5): TBD next session
+
+All five fixes preserve **lang 142/142, cutover 142/142**.  v3-eval
+direct on simple nixpkgs queries (hello.name, lib.version, attr
+counts, stdenv.system) all hit the same module-system blackhole, so
+unblocking #5 likely opens the floodgates for pure-VM nixpkgs.
+
 ## Headline data (5-second sample on `nix-instantiate --eval --strict --expr <25k-pkg-scan>`)
 
 | Metric                  | tree-walker | v3 (NIX_USE_V3=1) |
