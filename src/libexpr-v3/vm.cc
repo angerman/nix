@@ -660,6 +660,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             vm.tailCallCount = 0;
             Value arg = pop(vm), fun = pop(vm);
 
+            // Force `fun` if it's a deferred shape (Tag::App from lazy
+            // primops like mapAttrs, or a Thunk that lazy attr access
+            // produced).  Tree-walker's `callFunction` does the same up
+            // front; mirroring it here keeps the rest of the dispatch
+            // simple and avoids the OP_RETURN-chase cycle problem (where
+            // chasing while the outer thunk is still Black trips
+            // infinite-recursion).  Cheap on the hot path: one tag
+            // check on already-WHNF callables.
+            if (fun.tag() == Tag::App || fun.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                fun = forceValue(vm, fun);
+            }
+
             // PrimOp / PrimOpApp partial application.
             if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
                 // Walk the PrimOpApp chain to find the root PrimOp and
@@ -937,40 +950,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             fr.flags = fFlags;
             fr.thunk = fThunk;
             if (fFlags & CFF_THUNK_RETURN) {
-                // Chase the result toward WHNF before recording it as
-                // the thunk's evaluated value.  Three sources of
-                // non-WHNF returns must be handled:
-                //   * Evaluated thunks chained through the body's
-                //     bindings.
-                //   * Tag::App deferred-call values built by lazy
-                //     primops (mapAttrs, intersectAttrs, etc.).
-                //     Without resolving here, the caller's
-                //     immediately-following OP_SET_LOCAL stashes the
-                //     unforced App into a slot and a later OP_CALL on
-                //     that slot trips "callee is not a closure" — the
-                //     symptom seen on `(import <nixpkgs>{}).system`
-                //     after the rec-attr ConcatStrings cycle was
-                //     resolved.
-                //   * Suspended thunks (the existing transitive-force
-                //     path below).
-                while (true) {
-                    if (retVal.isThunk()
-                        && retVal.payload.thunk->state == ThunkState::Evaluated) {
-                        retVal = retVal.payload.thunk->evaluated;
-                        continue;
-                    }
-                    if (retVal.tag() == Tag::App) {
-                        // Resolve the App: forceValue(left) + callClosure(left, right).
-                        // Same C++-recursion bound by the 5000-frame
-                        // guard inside those helpers.
-                        Value left  = retVal.payload.pair->left;
-                        Value right = retVal.payload.pair->right;
-                        left = forceValue(vm, left);
-                        retVal = callClosure(vm, left, right);
-                        continue;
-                    }
-                    break;
-                }
+                // Chase Evaluated chains so the thunk caches the
+                // ultimate WHNF and not an intermediate thunk.
+                //
+                // Tag::App is intentionally NOT chased here: chasing
+                // would call callClosure while `fr.thunk` is still
+                // Blackhole, and any transitive force of fr.thunk in
+                // the App's body would trip "infinite recursion".  The
+                // App is left in `evaluated`; downstream consumers
+                // (OP_CALL, OP_FORCE, callClosure) all force-on-receive
+                // and chase Apps through forceValue's own loop, by
+                // which time `fr.thunk->state` is Evaluated and any
+                // re-entry just reads the cached App and chases it
+                // again (idempotent — the App's left/right don't
+                // change).
+                while (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Evaluated)
+                    retVal = retVal.payload.thunk->evaluated;
                 // Self-reference detection: `let x = x; in x` makes the
                 // thunk's body return the thunk itself (the chase above
                 // can't catch this since we hit a Blackhole-state thunk
@@ -1455,6 +1450,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_SELECT: {
             Value attrs = pop(vm);
+            // Force lazy shapes (Tag::App from mapAttrs entries, Thunks
+            // from chained AttrSelects).  Same rationale as OP_CALL —
+            // tree-walker forces target before AttrSelect; v3's lower
+            // emits an explicit OP_FORCE most of the time, but App/Thunk
+            // values can sneak through via OP_RETURN's no-chase
+            // semantics.  Cheap on already-forced values.
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                attrs = forceValue(vm, attrs);
+            }
             if (!attrs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: not an attrset");
             uint32_t icIdx = cu->code[ip++];
@@ -1512,6 +1517,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_SELECT_DYN: {
             Value name = pop(vm), attrs = pop(vm);
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                attrs = forceValue(vm, attrs);
+            }
             if (!name.isString() || !attrs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_SELECT_DYN: type error");
             // Intern via the global table so the SymbolId matches the
@@ -1525,12 +1534,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_HAS: {
             Value attrs = pop(vm);
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                attrs = forceValue(vm, attrs);
+            }
             push(vm, (attrs.isAttrs() && attrs.payload.bindings->has(operand))
                 ? Value::vTrue : Value::vFalse);
             break;
         }
         case OP_ATTRS_HAS_DYN: {
             Value name = pop(vm), attrs = pop(vm);
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                attrs = forceValue(vm, attrs);
+            }
             if (!name.isString() || !attrs.isAttrs()) { push(vm, Value::vFalse); break; }
             SymbolId id = ir::globalInternSymbol(name.payload.str);
             push(vm, attrs.payload.bindings->has(id)
