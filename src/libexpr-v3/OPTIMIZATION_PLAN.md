@@ -5,6 +5,54 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
+## 2026-04-30 — WC-38 SECD slot-aliasing (Phases 1-4 landed)
+
+Implemented SECD-style slot pointers for `with E;` over rec-attrsets,
+per multi-agent literature review (STG / SECD DUM-RAP / TIM):
+
+  - **Phase 1** (`07985c540`): `Tag::Slot = 16` enum + Payload `slot`
+    field + helpers.  Pure scaffolding.
+  - **Phase 2** (`7eca8f04b`): forceValue + OP_FORCE + withLookup
+    deref Tag::Slot transparently.  forceValue gained slot
+    memoization (writes resolved value back to the slot).
+  - **Phase 3** (`7eca8f04b`): OP_LOAD_SLOT_REF for value-stack
+    slots (implemented but NOT WIRED — lifetime issues).
+  - **Phase 4** (`a09278924`): OP_REC_BINDING_SLOT_REF + lower/emit
+    wiring for `with E;` where E resolves to a rec-attrset entry.
+    Slot points into `Bindings::entries[i].value` (heap-stable).
+
+  All test suites green: 142/142 lang, 39/39 wc-laziness,
+  142/142 cutover, 25/25 drv-parity.
+
+  **Status on nixpkgs:** still fails with the original
+  `callPackages` WITH_LOOKUP miss.  Phase 4 covers direct
+  rec-attrset references but not the lambda-parameter case
+  (e.g., `f = self: with self; ...` where `self` is bound by
+  `callFunction` — currently a Tag::Thunk snapshot, not a slot
+  pointer).
+
+  **Phase 5 (pending):** thread slot pointers through
+  `callFunction` so lambda params bound to rec-attrset entries
+  inherit slot identity.  Requires:
+    1. `emitVarRef` for a rec-attrset access produces Tag::Slot
+       (via OP_REC_BINDING_SLOT_REF) instead of the
+       thunkified-AttrSelect's Value result.
+    2. Force-on-receive sites (OP_ATTRS_SELECT, OP_LIST_CONCAT,
+       OP_ATTRS_UPDATE, formal-validation in OP_CALL, etc.) must
+       include Tag::Slot in their force-or-deref check.
+    3. Verify no regression — most consumers already call
+       forceValue, which derefs Tag::Slot transparently.
+
+  **Empirical validation** (commit-then-revert experiment): a
+  trial wired-up of Phase 3 (byDispl-direct slot refs for lambda
+  params) advanced nixpkgs PAST the original `callPackages`
+  error to a deeper `gnuabi64` miss before the lifetime issue
+  broke `eval-okay-delayed-with`.  This confirms slot threading
+  is the correct architectural direction.
+
+  See also: `project_wc38_with_blackhole.md` memory file.
+
+
 ## 2026-04-30 — WC-38 partial fix: GHC STG-style indirection via CFF_FORCE_RETRY
 
 Implemented (commit TBD) the CFF_FORCE_RETRY mechanism per multi-agent
