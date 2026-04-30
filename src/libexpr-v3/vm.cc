@@ -1076,6 +1076,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                 i - 1, lo, hi);
                             disassembleWindow(stderr, *fr.cu, lo, hi);
                         }
+                        // Also dump the prologue of each frame's lambda
+                        // (where the body STARTS) for context.
+                        std::fprintf(stderr, "  --- frame prologues ---\n");
+                        for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                            const auto & fr = vm.frames[i - 1];
+                            if (!fr.cu) continue;
+                            const LambdaDescriptor * desc = nullptr;
+                            if (fr.thunk)
+                                desc = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                            else if (fr.closure)
+                                desc = fr.closure->desc;
+                            if (!desc) continue;
+                            uint32_t prologueStart = desc->codeOffset;
+                            uint32_t prologueEnd = prologueStart + 16;
+                            std::fprintf(stderr,
+                                "  frame[%zu] prologue [%u..%u):\n",
+                                i - 1, prologueStart, prologueEnd);
+                            disassembleWindow(stderr, *fr.cu, prologueStart, prologueEnd);
+                        }
                     }
                 }
                 throw std::runtime_error("v3 OP_FORCE: infinite recursion (blackhole)");
