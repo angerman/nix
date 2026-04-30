@@ -421,6 +421,53 @@ inline void pushCapturedWiths(VMState & vm, ListVec * capturedWiths)
 
 namespace {
 
+/// WC-38 architectural fix attempt: walk the frame stack from BOTTOM
+/// up and publish `v` to the OUTERMOST CFF_THUNK_RETURN frame whose
+/// `thunk` is in Blackhole state.  Mirrors tree-walker's
+/// `v.mkAttrs(...)` semantics writing into the slot of the currently-
+/// forcing thunk DURING `ExprAttrs::eval`.  Sub-thunks captured-with
+/// the slot will then see the (possibly intermediate) attrset rather
+/// than blackholing.
+///
+/// We target the OUTERMOST (deepest in the stack) Black thunk, not
+/// the innermost.  Reason: the inner Black thunks (e.g., a sub-thunk
+/// firing INSIDE x's body) have a different final value than x.
+/// Publishing to inner thunks would corrupt their evaluated.  The
+/// outermost Black thunk is the one whose `with self;` capture is in
+/// scope for failing sub-thunks (e.g., x in `let x = f x; in x`).
+///
+/// Idempotent: the eventual `OP_RETURN` of the outer thunk frame
+/// will overwrite `evaluated` with the final retVal.  Risk:
+/// intermediate values may be partial.  For the lib.fix bootstrap
+/// pattern, the final value IS one of the intermediate attrsets,
+/// so a sub-thunk reading the intermediate is reading a valid
+/// snapshot.
+///
+/// Gated behind `NIX_V3_EARLY_PUBLISH=1`.  Default off until validated.
+inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
+{
+    static const bool s_enabled =
+        std::getenv("NIX_V3_EARLY_PUBLISH") != nullptr;
+    if (!s_enabled) return;
+    // Only publish concrete values, not thunks/apps/blackholes.
+    Tag t = v.tag();
+    if (t == Tag::Thunk || t == Tag::App || t == Tag::Blackhole) return;
+    // Walk from bottom up.  Find the OUTERMOST CFF_THUNK_RETURN frame
+    // whose thunk is Black.  This is the frame whose captured-with
+    // entries (`with self;`) sub-thunks may be racing against.
+    for (size_t i = 0; i < vm.frames.size(); ++i) {
+        CallFrame & fr = vm.frames[i];
+        if (!(fr.flags & CFF_THUNK_RETURN)) continue;
+        if (!fr.thunk) continue;
+        if (fr.thunk->state != ThunkState::Blackhole) continue;
+        // Publish to outermost Black thunk.  Idempotent — OP_RETURN
+        // of this thunk frame will overwrite with the final retVal.
+        fr.thunk->state = ThunkState::Evaluated;
+        fr.thunk->evaluated = v;
+        return;
+    }
+}
+
 /// Run the dispatch loop on `vm` until either:
 ///   - OP_HALT is reached (top-level exit), or
 ///   - The frame stack is popped down to `exitDepth` (used by inner
@@ -1678,6 +1725,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
+            publishToNearestBlackThunkFrame(vm, v);
             push(vm, v);
             break;
         }
@@ -1744,6 +1792,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
+            publishToNearestBlackThunkFrame(vm, v);
             push(vm, v);
             break;
         }
@@ -1769,6 +1818,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
+            publishToNearestBlackThunkFrame(vm, v);
             push(vm, v);
             break;
         }
@@ -2108,6 +2158,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = out;
+            publishToNearestBlackThunkFrame(vm, v);
             push(vm, v);
             break;
         }
