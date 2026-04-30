@@ -5,6 +5,63 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
+## 2026-04-30 — WC-35 architectural fixes + remaining option-eval cycle
+
+After WC-34's fixes, hit a forceValue blackhole 35 frames deep into
+`lib.modules.evalModules`'s `config` rec-attrset (modules.nix:279-302).
+
+Two architectural improvements landed (both green on lang/cutover
+142+142):
+
+  1. **Force-on-receive at consumption sites** (commit 62d2309eb).
+     Reverts OP_RETURN's App-chase from 63a8214e8 — that introduced
+     a cycle when the App's call body transitively touched the
+     just-popped (still Black) thunk.  Instead, the consumer ops
+     (OP_CALL, OP_ATTRS_SELECT/SELECT_DYN/HAS/HAS_DYN) force lazy
+     shapes (Tag::App, Tag::Thunk) on access.  Mirrors tree-walker's
+     "force lazily at consumption" model.
+
+  2. **Per-primop lazyArgs bitmask** (commit 1f42622ef).  Adds
+     `PrimOp::lazyArgs` so primops can opt specific arg indices out
+     of the dispatcher's auto-pre-force.  Mirrors tree-walker's
+     per-primop laziness (each primop body forces what it actually
+     needs).  Wired through both `lower.cc` direct PrimOpCall and
+     `vm.cc` runtime (OP_CALL primop branch + callClosure).
+     `addErrorContext`'s arg 1 is the first user — its "wrapped
+     value" must not be eagerly forced or `config = addErrorContext
+     "..." config` (modules.nix:270) deadlocks.
+
+### WC-35 status — root-causing the option-eval cycle
+
+The blackhole stack has BLACK = `config` (frame[16]) being re-entered
+by frame[34]'s OP_GET_LOCAL_FORCE on the result of an OP_CALL chain.
+Chain: checkUnmatched → config → declaredConfig._module.freeformType →
+mergedValue → defsFinal → ... → pushedDownDefinitionsByName → cfg
+→ value → mapAttrs body → addErrorContext's nested call.
+
+Identified candidate: `lib.modules.applyModuleArgs` (line 706) does
+```nix
+extraArgs = mapAttrs (name: _:
+  addErrorContext "..." (args.${name} or
+    addErrorContext "..." config._module.args.${name})
+) (functionArgs f);
+```
+For modules whose formals aren't in `args`, the `or` branch forces
+`config._module.args.${name}` — which transitively forces `config`.
+Tree-walker handles this because either (a) the modules being
+processed for nixpkgs's `.system` query don't trigger the `or`
+branch, or (b) tree-walker's force schedule has `config` Evaluated
+by the time this path runs.
+
+The addErrorContext lazy fix did NOT unblock this — the cycle's force
+of `config` happens in a different code path (consumer of the
+addErrorContext result, not inside the primop itself).
+
+Multi-day investigation: needs to pinpoint the SPECIFIC module/formal
+that triggers the `or` branch in v3 but not tree-walker, then either
+(i) align v3's eval order or (ii) make `config._module.args.X` access
+genuinely lazy.
+
 ## 2026-04-30 — Pure-VM nixpkgs progress (WC-31 root-cause + WC-34 chain)
 
 After WC-31 Options A and B were empirically confirmed equivalent
