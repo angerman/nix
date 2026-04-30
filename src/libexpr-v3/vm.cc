@@ -1674,6 +1674,57 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     parts[i] = forceValue(vm, parts[i]);
                 }
             }
+            // V3_DBG_STRCONCAT: when a Closure leaks into STR_CONCAT
+            // (which happens when v3's eval-order divergence forces a
+            // function value where tree-walker keeps it lazy), dump
+            // the call stack to localise the source.
+            {
+                static const bool s_dbg = std::getenv("V3_DBG_STRCONCAT") != nullptr;
+                if (s_dbg) {
+                    bool hasUncoercible = false;
+                    for (uint32_t i = 0; i < n; ++i) {
+                        Tag t = parts[i].tag();
+                        if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp || t == Tag::List)
+                            { hasUncoercible = true; break; }
+                    }
+                    if (hasUncoercible) {
+                        std::fprintf(stderr,
+                            "v3 OP_STR_CONCAT pre-trace tags=[");
+                        for (uint32_t i = 0; i < n; ++i)
+                            std::fprintf(stderr, "%s%u", i ? "," : "", (unsigned)parts[i].tag());
+                        std::fprintf(stderr, "] forceStr=%d frames=%zu callerIp=%u\n",
+                            forceStr ? 1 : 0, vm.frames.size(), ip - 1);
+                        size_t lim = vm.frames.size();
+                        for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                            const auto & fr = vm.frames[i - 1];
+                            const LambdaDescriptor * d = nullptr;
+                            if (fr.thunk) d = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                            else if (fr.closure) d = fr.closure->desc;
+                            std::fprintf(stderr,
+                                "  frame[%zu]: %s code=[%u..) ip=%u flags=%u\n",
+                                i - 1,
+                                d && !d->name.empty() ? d->name.c_str()
+                                    : (d ? "<anon>" : "<closure-body>"),
+                                d ? d->codeOffset : 0, fr.ip,
+                                (unsigned)fr.flags);
+                        }
+                        // Disasm from the frame's prologue to the failing
+                        // OP_STR_CONCAT — full body lets us trace slot
+                        // assignments back to their source.
+                        if (cu && !vm.frames.empty()) {
+                            const auto & fr = vm.frames.back();
+                            const LambdaDescriptor * d = nullptr;
+                            if (fr.thunk) d = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                            else if (fr.closure) d = fr.closure->desc;
+                            uint32_t lo = d ? d->codeOffset : (ip > 32 ? ip - 32 : 0);
+                            uint32_t hi = ip + 4;
+                            std::fprintf(stderr,
+                                "  current frame disasm [%u..%u) (prologue→ip):\n", lo, hi);
+                            disassembleWindow(stderr, *cu, lo, hi);
+                        }
+                    }
+                }
+            }
 
             // nix `+` semantics: if forceString=false and the first operand
             // is numeric (Int/Float), perform arithmetic addition; otherwise
