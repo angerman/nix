@@ -1531,10 +1531,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                 // thunk's body bytecode + upvalue tags.
                                 if (i == 0 && t->state == ThunkState::Suspended && d) {
                                     std::fprintf(stderr, "\n    body [%u..%u):\n",
-                                        d->codeOffset, d->codeOffset + 24);
+                                        d->codeOffset, d->codeOffset + 80);
                                     if (t->suspended.cu)
                                         disassembleWindow(stderr, *t->suspended.cu,
-                                            d->codeOffset, d->codeOffset + 24);
+                                            d->codeOffset, d->codeOffset + 80);
                                     std::fprintf(stderr, "    upvalues:\n");
                                     for (uint16_t u = 0; u < t->nUpvalues && u < 8; ++u) {
                                         const Value & uv = t->tail[u];
