@@ -2116,7 +2116,20 @@ void primAddErrorContext(EvalState &, Value * args, Value & out)
     // messages from the second arg.  v3 doesn't track context yet —
     // just return the second argument (the wrapped value).  The first
     // arg (the prefix string) is currently ignored.
-    (void)args;
+    //
+    // V3_DBG_ADD_ERR_CTX prints the message + arg tags — used to
+    // localise the WC-35 cycle path through nixpkgs's lib/modules.nix
+    // applyModuleArgs construction.
+    static const bool dbg = std::getenv("V3_DBG_ADD_ERR_CTX") != nullptr;
+    if (dbg) {
+        std::fprintf(stderr,
+            "v3 addErrorContext: msg-tag=%u value-tag=%u\n",
+            (unsigned)args[0].tag(), (unsigned)args[1].tag());
+        if (args[0].isString()) {
+            std::fprintf(stderr, "  msg=%.200s\n",
+                args[0].payload.str ? args[0].payload.str : "");
+        }
+    }
     out = args[1];
 }
 
