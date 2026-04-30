@@ -5,7 +5,61 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
-## 2026-04-30 — WC-38: pkgs Blackhole during stage-chain evaluation (deferred)
+## 2026-04-30 — WC-38 root cause confirmed: OP_RETURN-chain push triggers deep eager eval
+
+**Root cause** (per multi-agent analysis): the chain push at OP_RETURN
+(vm.cc lines ~1235-1300) unconditionally drives the next Suspended thunk's
+body to completion as part of the outer thunk's RETURN.  In nixpkgs's
+`lib.fix toFix` (= `let x = f x; in x`), `pkgs`'s body returns a chain of
+thunks (`recref-x → x`).  The chain push enters `x`'s body (= `toFix x`)
+which runs the entire bootstrap stage chain.  DURING `x`'s body, sub-thunks
+(e.g., from `assert prevStage.llvmPackages.clang-unwrapped`) fire and try
+to look up names via `with self;` (= with x).  But `x` is still in
+Blackhole — the WITH_LOOKUP throws.
+
+**Tree-walker doesn't hit this** because tree-walker's `let x = f x; in x`
+evaluates `Var x`'s body via `state.forceValue(*v2, pos)` which mutates
+the slot `*v2` directly.  By the time sub-thunks fire later, the slot has
+the attrset.  v3's chained-thunk model has the same logical effect but
+runs sub-thunks DURING x's body's deep eval.
+
+**Test for the root cause**: `NIX_V3_NO_RETURN_CHAIN=1` env var disables
+the chain push.  With it disabled:
+- nixpkgs eval advances PAST the WITH_LOOKUP miss to a different error
+  (`primop partition: expected list`) — confirms chain is the divergence.
+- 18 lang tests fail because OP_FORCE loses chain-driving (e.g., self-cycle
+  detection in `let x = x; in x`, primop arg forcing).
+
+**Why the chain CAN'T just be removed**: the chain has dual responsibilities:
+1. Chain Suspended thunks at body-RETURN (recref-X / inherit-from optimization).
+2. Drive OP_FORCE's transitive force WITHOUT C++ recursion.
+
+For (2), OP_FORCE pushes a frame and breaks.  After the body returns, OP_FORCE
+has no way to "loop" and force the result if it's still a thunk — unless
+OP_RETURN does the chain.
+
+**Tested but failed approaches**:
+- Disable chain entirely: breaks 18 lang tests (OP_FORCE drive).
+- Chain only for nUp<=1 thunks: still breaks 2 lang tests.
+- Chain only for trivial recref-X pattern (GET_UPVALUE+ATTRS_SELECT+RETURN):
+  breaks 18 lang tests.
+
+**Architectural fix needed (deferred)**:
+1. Make OP_FORCE drive the chain itself via a re-check after frame pop.
+   This requires a "retry" mechanism in the dispatch loop.
+2. OR: store the chain target as a "forwarded thunk" that doesn't
+   immediately run its body — the body runs only at consumer's force time.
+3. OR: implement tree-walker-style slot semantics where with-scopes
+   reference Value SLOTS (not Thunk pointers) that can be mutated in-place.
+
+WC-38 work checkpoint:
+- `NIX_V3_NO_RETURN_CHAIN=1` env var lets future investigators A/B test.
+- WC-38 positive regression tests added (lib.fix-with-self pattern works
+  via chain-on; pin against future regressions).
+- 142/142 lang tests, 37/37 wc-laziness tests, 142/142 cutover, 25/25
+  drv-parity all pass with chain-on (the default).
+
+## 2026-04-30 — WC-38 (earlier hypothesis, deferred): pkgs Blackhole during stage-chain evaluation
 
 After WC-37, `(import <nixpkgs>{}).system` advances past the closure leak and hits
 `OP_WITH_LOOKUP: name 'callPackages' not found in with-scope`.

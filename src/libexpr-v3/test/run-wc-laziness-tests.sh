@@ -418,6 +418,36 @@ TESTS=(
    builtins.seq (builtins.tryEval foo).success
      (builtins.seq (builtins.tryEval foo).success parts)'
   '"abc"'
+
+  # ----------------------------------------------------------------
+  # WC-38 positive: lib.fix-style fixed-point with `with self;` body
+  # Pre-fix symptom (from nixpkgs eval):
+  #   In `let x = f x; in x` where f returns `with self; { foo = bar; bar = "ok"; }`,
+  #   sub-thunks captured `self` (= x).  v3's OP_RETURN-chain push at
+  #   x's RETURN eagerly drives the chain through inner thunks while
+  #   x is still Blackhole.  If sub-thunks fire during this deep
+  #   eval AND look up names via `with self;`, they hit Blackhole.
+  # This MINIMAL pattern works in v3 today because the body doesn't
+  # trigger a deep stage chain.  We pin it to detect regressions.
+  # ----------------------------------------------------------------
+  WC-38-libfix-with-self
+  "lib.fix-style: let x = f x; in x with `with self;` in body"
+  'let
+     fix = f: let x = f x; in x;
+     pkgs = fix (self: with self; { foo = bar; bar = "ok"; });
+   in pkgs.foo'
+  '"ok"'
+
+  WC-38-nested-libfix-overlay
+  "fix + overlay: ensures captured-with self resolves through chain"
+  'let
+     fix = f: let x = f x; in x;
+     extends = overlay: f: self: let prev = f self; in prev // overlay self prev;
+     base = self: { a = 1; };
+     ext = self: super: { b = self.a + 1; };
+     pkgs = fix (extends ext base);
+   in pkgs.b'
+  '2'
 )
 
 pass=0

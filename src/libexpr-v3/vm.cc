@@ -1235,7 +1235,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // that next by setting up another thunk-return frame.
                 // This implements transitive force for the OP_FORCE
                 // bytecode op without C++ recursion.
-                if (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Suspended) {
+                //
+                // WC-38: this chain push is OPTIONAL.  When disabled,
+                // the outer thunk's evaluated remains a Suspended thunk;
+                // forceValue's own chase loop handles the chain at the
+                // consumer's request (matches tree-walker semantics).
+                // The chain push is over-eager: it forces the inner
+                // thunk's body to start running immediately as part of
+                // the outer's RETURN, even if no one needs it yet.  In
+                // nixpkgs, this causes deep bootstrap-chain evaluation
+                // INSIDE the lib.fix's `let x = f x; in x` body, while
+                // x is in Blackhole — sub-thunks then can't look up
+                // names via `with x;`.
+                static const bool s_no_chain =
+                    std::getenv("NIX_V3_NO_RETURN_CHAIN") != nullptr;
+                if (!s_no_chain && retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Suspended) {
                     Thunk * next = retVal.payload.thunk;
                     // Same call-depth guard — chained let-rec recursion
                     // (`let x = y; y = x; in x`) re-enters the next thunk
