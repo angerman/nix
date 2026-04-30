@@ -2039,12 +2039,77 @@ Value forceValue(VMState & vm, Value v)
                     "v3 forceValue Black thunk=%p frames=%zu\n",
                     (void*)t, vm.frames.size());
                 size_t lim = vm.frames.size();
-                for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                ssize_t blackIdx = -1;
+                for (size_t i = lim; i > 0; --i) {
                     const auto & fr = vm.frames[i - 1];
+                    bool isBlack = (fr.thunk == t);
+                    if (isBlack) blackIdx = (ssize_t)(i - 1);
                     std::fprintf(stderr,
-                        "  frame[%zu]: %s flags=%u ip=%u thunk=%p\n",
-                        i - 1, frameInfo(fr.thunk, fr.closure, fr.ip).c_str(),
+                        "  frame[%zu]:%s %s flags=%u ip=%u thunk=%p\n",
+                        i - 1, isBlack ? " <-BLACK" : "",
+                        frameInfo(fr.thunk, fr.closure, fr.ip).c_str(),
                         (unsigned)fr.flags, fr.ip, (void*)fr.thunk);
+                }
+                static const bool s_dbg_disasm =
+                    std::getenv("V3_DBG_OPCYCLE_DISASM") != nullptr;
+                if (s_dbg_disasm && blackIdx >= 0) {
+                    // Dump the BLACK frame's prologue (start of body)
+                    // through current ip — captures every OP_FORCE the
+                    // body ran before re-entering itself.
+                    const auto & fr = vm.frames[blackIdx];
+                    if (fr.cu) {
+                        const LambdaDescriptor * desc = nullptr;
+                        if (fr.thunk)
+                            desc = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                        else if (fr.closure)
+                            desc = fr.closure->desc;
+                        if (desc) {
+                            uint32_t lo = desc->codeOffset;
+                            uint32_t hi = fr.ip + 8;
+                            std::fprintf(stderr,
+                                "  BLACK frame[%zd] disasm [%u..%u) (prologue→ip):\n",
+                                blackIdx, lo, hi);
+                            disassembleWindow(stderr, *fr.cu, lo, hi);
+                        }
+                    }
+                    // Also dump the innermost frame's prologue → ip.
+                    const auto & inner = vm.frames.back();
+                    if (inner.cu) {
+                        const LambdaDescriptor * idesc = nullptr;
+                        if (inner.thunk)
+                            idesc = reinterpret_cast<const LambdaDescriptor *>(inner.thunk->suspended.desc);
+                        else if (inner.closure)
+                            idesc = inner.closure->desc;
+                        if (idesc) {
+                            uint32_t lo = idesc->codeOffset;
+                            uint32_t hi = inner.ip + 8;
+                            std::fprintf(stderr,
+                                "  INNER frame[%zu] disasm [%u..%u) (prologue→ip):\n",
+                                lim - 1, lo, hi);
+                            disassembleWindow(stderr, *inner.cu, lo, hi);
+                        }
+                    }
+                    // Also dump frame[33] — caller of innermost.  Often
+                    // the App's `left` was a closure call return, which
+                    // is the actual divergence source.
+                    if (lim >= 2) {
+                        const auto & f33 = vm.frames[lim - 2];
+                        if (f33.cu) {
+                            const LambdaDescriptor * d33 = nullptr;
+                            if (f33.thunk)
+                                d33 = reinterpret_cast<const LambdaDescriptor *>(f33.thunk->suspended.desc);
+                            else if (f33.closure)
+                                d33 = f33.closure->desc;
+                            if (d33) {
+                                uint32_t lo = d33->codeOffset;
+                                uint32_t hi = f33.ip + 8;
+                                std::fprintf(stderr,
+                                    "  CALLER frame[%zu] disasm [%u..%u) (prologue→ip):\n",
+                                    lim - 2, lo, hi);
+                                disassembleWindow(stderr, *f33.cu, lo, hi);
+                            }
+                        }
+                    }
                 }
             }
             throw std::runtime_error("v3 forceValue: infinite recursion (blackhole)");
