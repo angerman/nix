@@ -303,7 +303,87 @@ inline Value withLookup(VMState & vm, SymbolId name, uint32_t /*depth*/)
         if (auto * v = w.payload.bindings->lookup(name))
             return *v;
     }
-    throw std::runtime_error("v3 OP_WITH_LOOKUP: name not found in with-scope");
+    // V3_DBG_WITH: print the missing name + the with-stack contents to
+    // help diagnose pure-VM nixpkgs failures where eval-order divergence
+    // causes a name to be looked up before its `with` scope is visible.
+    static const bool s_dbg_with = std::getenv("V3_DBG_WITH") != nullptr;
+    const auto & symTab = ir::globalSymbolTable();
+    std::string nm = name < symTab.size() ? symTab[name] : "<?>";
+    if (s_dbg_with) {
+        std::fprintf(stderr,
+            "v3 OP_WITH_LOOKUP miss: name='%s' (sid=%u) base=%zu top=%zu\n",
+            nm.c_str(), (unsigned)name, base, vm.withStack.size());
+        for (size_t i = vm.withStack.size(); i-- > base; ) {
+            Value w = vm.withStack[i];   // copy so we can chase
+            void * orig_thunk = w.isThunk() ? (void *)w.payload.thunk : nullptr;
+            std::fprintf(stderr, "  with[%zu] tag=%u thunk_ptr=%p",
+                i, (unsigned)w.tag(), orig_thunk);
+            // Chase Evaluated thunk chains to find the underlying attrset.
+            int chase_lim = 5;
+            while (chase_lim-- > 0 && w.isThunk()
+                   && w.payload.thunk->state == ThunkState::Evaluated) {
+                w = w.payload.thunk->evaluated;
+                std::fprintf(stderr, " -> tag=%u", (unsigned)w.tag());
+                if (w.isThunk())
+                    std::fprintf(stderr, "(ptr=%p)", (void *)w.payload.thunk);
+            }
+            if (w.isAttrs() && w.payload.bindings) {
+                auto * b = w.payload.bindings;
+                std::fprintf(stderr, " attrs size=%u {", b->size);
+                for (uint32_t k = 0; k < b->size && k < 30; ++k) {
+                    SymbolId s = b->entries[k].name;
+                    std::fprintf(stderr, "%s%s",
+                        k ? "," : "",
+                        s < symTab.size() ? symTab[s].c_str() : "?");
+                }
+                if (b->size > 30) std::fprintf(stderr, ",...");
+                std::fprintf(stderr, "}");
+                // Also check if name IS in this attrset (via binary search) —
+                // if it is, we have a real bug (lookup failed but it's there).
+                if (auto * v = b->lookup(name)) {
+                    std::fprintf(stderr, " [name-IS-here-but-missed!]");
+                    (void)v;
+                }
+            } else if (w.isThunk()) {
+                Thunk * t = w.payload.thunk;
+                std::fprintf(stderr, " thunk state=%d nUp=%u",
+                    (int)t->state, (unsigned)t->nUpvalues);
+                if (t->state == ThunkState::Suspended) {
+                    auto * d = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+                    if (d)
+                        std::fprintf(stderr, " %s [%u..)",
+                            !d->name.empty() ? d->name.c_str() : "<anon>",
+                            d->codeOffset);
+                }
+            } else if (w.isClosure() && w.payload.closure
+                       && w.payload.closure->desc) {
+                auto * d = w.payload.closure->desc;
+                std::fprintf(stderr, " closure=%s nUp=%u",
+                    !d->name.empty() ? d->name.c_str() : "<anon>",
+                    w.payload.closure->nUpvalues);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        // Dump frame stack — the failing `with` lookup happens during a
+        // specific frame's body; identifying it helps localize the source.
+        size_t lim = vm.frames.size();
+        std::fprintf(stderr, "  frames=%zu (showing all):\n", lim);
+        for (size_t i = lim; i > 0; --i) {
+            const auto & fr = vm.frames[i - 1];
+            const LambdaDescriptor * d = nullptr;
+            if (fr.thunk) d = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+            else if (fr.closure) d = fr.closure->desc;
+            std::fprintf(stderr,
+                "    frame[%zu]: %s code=[%u..) ip=%u flags=%u thunk=%p withBase=%u\n",
+                i - 1,
+                d && !d->name.empty() ? d->name.c_str()
+                    : (d ? "<anon>" : "<root>"),
+                d ? d->codeOffset : 0, fr.ip,
+                (unsigned)fr.flags, (void *)fr.thunk, fr.withStackBase);
+        }
+    }
+    throw std::runtime_error(
+        "v3 OP_WITH_LOOKUP: name '" + nm + "' not found in with-scope");
 }
 
 /// Snapshot the current frame's visible with-stack (entries from

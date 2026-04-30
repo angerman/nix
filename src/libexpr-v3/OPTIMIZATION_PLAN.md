@@ -5,6 +5,60 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
+## 2026-04-30 — WC-38: pkgs Blackhole during stage-chain evaluation (deferred)
+
+After WC-37, `(import <nixpkgs>{}).system` advances past the closure leak and hits
+`OP_WITH_LOOKUP: name 'callPackages' not found in with-scope`.
+
+**Root cause analysis** (diagnosed via `V3_DBG_WITH=1`):
+
+  - The failing thunk is at codeOffset 81857 inside `llvmPackagesSet`'s body.
+  - Its captured-with is `pkgs` (the lambda parameter of `all-packages.nix`).
+  - That captured value chains through Evaluated thunks down to `x` — the
+    `let x = f x; in x` binding inside `lib.fix`.
+  - At the moment of WITH_LOOKUP, `x` is in **Blackhole** state because we
+    are currently inside its body's evaluation (frame[83] in the trace).
+  - Force throws "infinite recursion (blackhole)"; withLookup's catch sees
+    "blackhole" in the message and skips the entry; no other entries → throw
+    "name not found".
+
+**Why tree-walker doesn't hit this**: the `let x = f x; in x` body in tree-
+walker forces x in-place (via `state.forceValue(*v2, pos)` on the let slot).
+By the time `with pkgs;` lookup fires from a sub-thunk, x's body has already
+returned and `x` slot holds the attrset (no Blackhole).
+
+**Why v3 hits this**: at WITH_LOOKUP time, we're still INSIDE x's body's
+evaluation (deeply nested through bootstrap stage chain frames). x is
+genuinely Blackhole. v3's eval order somehow forces sub-thunks DURING x's
+body run rather than after.
+
+**Hypotheses ruled out**:
+  - Recref-X thunk wrapping (agents' initial hypothesis): tested with
+    `NIX_V3_NO_THUNKIFY_REC=1` — doesn't fix the bug. The captured-with is
+    a direct Thunk (still in Black state).
+  - Peephole OP_TAIL_CALL: tested earlier on WC-37, same persistent bug.
+
+**The actual divergence** must be in WHEN/WHERE sub-thunks fire. Specifically,
+something in v3's eval is forcing `pkgs.llvmPackages_21` (which transitively
+needs `callPackages`) DURING `pkgs`'s body evaluation. In tree-walker, this
+sub-attribute access happens AFTER pkgs's body completes. The frame stack
+shows ~93 frames deep through bootstrap stages — possibly a stage's strict
+attrset construction triggering an early force of llvmPackages_21.
+
+**Diagnostic infrastructure added**: `V3_DBG_WITH=1` now prints the missing
+name + the entire with-stack chain (chasing thunk evaluations) + frame stack.
+Used to identify the captured-with's Blackhole state and trace the exact
+chain.
+
+**Next-session plan**:
+  1. Identify which specific frame is evaluating `pkgs.llvmPackages_21` and
+     why it's required INSIDE pkgs's own body evaluation.
+  2. Compare with tree-walker's eval trace at the same expression to see
+     where the orderings diverge.
+  3. Likely fix: defer eager strict evaluation in stage construction, or
+     add a tree-walker-style fromWith parentWith chain so v3's `with`
+     lookup walks lexical scopes statically.
+
 ## 2026-04-30 — WC-37 ROOT-CAUSED AND FIXED: clearBlackMarksOnException ghost-frame corruption
 
 The bug: when `forceValue`'s inner `dispatchLoop` throws and a higher-level
