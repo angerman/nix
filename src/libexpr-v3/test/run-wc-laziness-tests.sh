@@ -343,6 +343,39 @@ TESTS=(
   '4'
 
   # ----------------------------------------------------------------
+  # WC-37 working cases (pin the patterns that DO work, since the
+  # full nixpkgs case is still blocked by a deeper issue)
+  # ----------------------------------------------------------------
+  WC-37-formal-default-concat
+  "formal preHook with default '' + string interpolation works"
+  'let f = { name ? "default", preHook ? "", overrides ? (s: s: {}) }:
+     preHook + " from " + name;
+   in f { name = "test"; preHook = "hello"; }'
+  '"hello from test"'
+
+  WC-37-stage-foldl-chain
+  "stage-list folded via foldl' produces final stage's result"
+  'let
+     stages = [
+       (prevStage: { v = "1"; })
+       (prevStage: { v = "2(${prevStage.v})"; })
+       (prevStage: { v = "3(${prevStage.v})"; })
+     ];
+     run = builtins.foldl'"'"' (acc: stageFn: stageFn acc) { v = "init"; } stages;
+   in run.v'
+  '"3(2(1))"'
+
+  WC-37-inherit-prevStage-pattern
+  "(prevStage: { inherit (prevStage) X Y; }) — bytecode pattern WC-37 traced to"
+  'let
+     inheritor = prevStage: {
+       inherit (prevStage) a b c;
+     };
+     stage = { a = 1; b = 2; c = 3; };
+   in (inheritor stage).b'
+  '2'
+
+  # ----------------------------------------------------------------
   # WC-31 negative test: a TRUE infinite recursion still errors.
   # We must not have made the evaluator too lenient — `let x = x; in x`
   # should still throw, not loop forever.
