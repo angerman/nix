@@ -5,6 +5,54 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
+## 2026-04-30 — WC-37: nixpkgs stdenv-bootstrap closure-leak (deferred)
+
+After WC-35/36's chain of force-on-receive + lazy primop fixes,
+v3-eval direct on `(import <nixpkgs>{}).system` advances 6 layers
+deep into nixpkgs's stdenv bootstrap (booter.nix → callPackage →
+makeOverridable → result-thunk).  The remaining error is a Closure
+named `prevStage` (a top-level lambda from one of
+`pkgs/stdenv/{darwin,linux,native,nix,freebsd}/default.nix:N (prevStage: { ... })`)
+reaching `OP_STR_CONCAT` as the first operand in a 2-part `+`.
+
+The diagnostic trace (V3_DBG_STRCONCAT=1) shows:
+  frame[89] <thunk> body forces upvalue 1 → Closure → STR_CONCAT
+  frame[88] result    (= callPackage's `result = f origArgs`)
+  frame[87] origArgs  (= `auto // args`)
+  frame[86] thisStdenv
+  frame[85] <thunk>
+  frame[84] super
+  frame[83] x
+  frame[82] <thunk>
+
+The bytecode shows a `<thing> + lib.optionalString (cond) "...${thing}/share/locale"`
+pattern, matching `pkgs/stdenv/darwin/default.nix:120-131`'s preHook
+construction.  Tree-walker handles this because either the
+`optionalString cond` short-circuits (cond=false → no string built)
+OR `prevStage` is fully an attrset there, not a closure.
+
+The hypothesis is that v3's bootstrap iteration doesn't actually
+fire the stageFun call — `args = stageFun prevStage` (booter.nix:98)
+must yield an attrset.  If prevStage flows through as the bare
+lambda, somewhere v3 captured the closure instead of its called
+result.
+
+Next-session investigation:
+  1. Add diagnostic that prints WHERE the upvalue 1 (= prevStage)
+     was captured for frame[89]'s thunk, to find which OP_MAKE_THUNK
+     site recorded the closure value.
+  2. Compare v3's eval-order trace through `dfold` (booter.nix:62)
+     against tree-walker's — the `let cur = op pred x succ;
+     succ = go cur (n+1); ` knot relies on call-by-need.  If v3
+     forces something out-of-order, the closure leaks.
+  3. Possibly v3 lowers `(prevStage: ...)` lambdas with a different
+     freeVar count (we saw nUp=0 on the leaked closure — need to
+     verify this matches the lambda's actual capture set).
+
+Until then: pure-VM nixpkgs is blocked at this bootstrap-chain
+divergence.  The architectural fixes from WC-31/34/35/36 are real
+wins; the regression suite (30 tests) protects them.
+
 ## 2026-04-30 — WC-35 ROOT-CAUSED AND FIXED: lazy zipAttrsWith + map
 
 The actual root cause of WC-35 was found and fixed.  Diagnostic
