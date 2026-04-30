@@ -218,7 +218,13 @@ inline std::string toStr(const Value & v)
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
-    default:          throw std::runtime_error("v3 toString: cannot stringify this type");
+    default: {
+        char buf[64];
+        std::snprintf(buf, sizeof buf,
+            "v3 toString: cannot stringify this type (tag=%u)",
+            (unsigned)v.tag());
+        throw std::runtime_error(buf);
+    }
     }
 }
 
@@ -336,9 +342,85 @@ void primIsNull    (EvalState &, Value * args, Value & out) { out = args[0].isNu
 void primIsFloat   (EvalState &, Value * args, Value & out) { out = args[0].isFloat()    ? Value::vTrue : Value::vFalse; }
 void primIsPath    (EvalState &, Value * args, Value & out) { out = args[0].isPath()     ? Value::vTrue : Value::vFalse; }
 
-void primToString(EvalState &, Value * args, Value & out)
+// Tree-walker's `builtins.toString` uses
+// `coerceToString(copyToStore=false, coerceMore=true)` — extends the
+// basic primitive coerce to lists (space-joined elements), attrsets
+// with __toString or outPath, paths (without store-copy), int / float
+// / bool / null.  This mirrors that without the BR-3 store-copy path
+// (which is only correct for derivationStrict's path attrs).
+static std::string toStringCoerce(EvalState & state, Value v)
 {
-    out = mkStringValueOwned(toStr(args[0]));
+    v = forceValue(*state.vm, v);
+    switch (v.tag()) {
+    case Tag::String: return std::string(v.payload.str ? v.payload.str : "");
+    case Tag::Path:   return std::string(v.payload.path ? v.payload.path : "");
+    case Tag::Int:    return std::to_string(v.payload.i);
+    case Tag::Float:  return std::to_string(v.payload.f);
+    case Tag::Bool:   return v.payload.i == 1 ? "1" : "";
+    case Tag::Null:   return "";
+    case Tag::List: {
+        std::string out;
+        auto * lv = v.payload.list;
+        if (!lv) return out;
+        for (uint32_t i = 0; i < lv->size; ++i) {
+            Value el = forceValue(*state.vm, lv->elems[i]);
+            out += toStringCoerce(state, el);
+            if (i + 1 < lv->size) {
+                bool elIsEmptyList = el.isList()
+                    && (!el.payload.list || el.payload.list->size == 0);
+                if (!elIsEmptyList) out += ' ';
+            }
+        }
+        return out;
+    }
+    case Tag::Attrs: {
+        // Tree-walker: try __toString first (call it on the attrset),
+        // then outPath.  v3 doesn't yet wire calling __toString from
+        // a primop context — fall through to outPath only.
+        if (v.payload.bindings) {
+            // outPath is the more common path in nixpkgs (every
+            // derivation has it); __toString is rarer.  Intern locally
+            // — drvStrictSymbols() lives in BR-3 territory and isn't
+            // forward-decl'd up here.
+            static const SymbolId sOutPath =
+                ir::globalInternSymbol("outPath");
+            if (auto * outV = v.payload.bindings->lookup(sOutPath)) {
+                Value forced = forceValue(*state.vm, *outV);
+                return toStringCoerce(state, forced);
+            }
+        }
+        throw std::runtime_error(
+            "v3 toString: attrset has no outPath / __toString");
+    }
+    case Tag::Uninitialized:
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::Blackhole:
+    case Tag::External:
+    default: {
+        char buf[64];
+        std::snprintf(buf, sizeof buf,
+            "v3 toString: cannot stringify type tag=%u",
+            (unsigned)v.tag());
+        throw std::runtime_error(buf);
+    }
+    }
+}
+
+void primToString(EvalState & state, Value * args, Value & out)
+{
+    out = mkStringValueOwned(toStringCoerce(state, args[0]));
+    // Forward existing string-context (preserve outPath context) if
+    // the input was a string with one.
+    if (args[0].isString() && args[0].payload.str) {
+        if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
+            std::vector<std::string> copy(raw->begin(), raw->end());
+            setStringContextEntries(out.payload.str, std::move(copy));
+        }
+    }
 }
 
 void primTypeOf(EvalState &, Value * args, Value & out)
