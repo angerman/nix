@@ -653,15 +653,28 @@ void primFoldl(EvalState & state, Value * args, Value & out)
 
 void primGenList(EvalState & state, Value * args, Value & out)
 {
-    if (!args[1].isInt()) typeError("genList", "int length");
-    int64_t n = args[1].payload.i;
+    // Tree-walker's prim_genList builds App entries: each element is
+    // `App(gen, idx_value)`, lazy.  v3 was eager (callClosure per i).
+    // Same root pattern as zipAttrsWith / map.
+    Value len = args[1];
+    if (len.tag() == Tag::App || len.tag() == Tag::Thunk)
+        len = forceValue(*state.vm, len);
+    if (!len.isInt()) typeError("genList", "int length");
+    int64_t n = len.payload.i;
     if (n < 0) throw std::runtime_error("v3 primop genList: negative length");
     Value gen = args[0];
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(n));
     allocStats().listsAllocated++;
     for (int64_t i = 0; i < n; ++i) {
+        // Build App(gen, idx_int) — lazy.
         Value idx; idx.mkInt(i);
-        result->elems[i] = callClosure(*state.vm, gen, idx);
+        ValuePair * pp = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        pp->left  = gen;
+        pp->right = idx;
+        Value v;
+        v.tag_payload = static_cast<uint64_t>(Tag::App);
+        v.payload.pair = pp;
+        result->elems[i] = v;
     }
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = result;
