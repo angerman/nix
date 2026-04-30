@@ -1496,11 +1496,73 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             uint32_t icIdx = cu->code[ip++];
             auto & ic = cu->attrSelectCache[icIdx];
             const auto * b = attrs.payload.bindings;
+            // V3_DBG_PREHOOK diagnostic: log every ATTRS_SELECT preHook
+            // attempt with what value it returns.  Used to localize WC-37.
+            static const bool s_dbg_prehook = std::getenv("V3_DBG_PREHOOK") != nullptr;
+            if (s_dbg_prehook) {
+                static const SymbolId preHookSym = ir::globalInternSymbol("preHook");
+                if (operand == preHookSym) {
+                    static int call_n = 0;
+                    ++call_n;
+                    std::fprintf(stderr,
+                        "v3 ATTRS_SELECT preHook (#%d): bindings=%p size=%u attrs:\n",
+                        call_n, (void*)b, b ? b->size : 0);
+                    if (b) {
+                        const auto & st = ir::globalSymbolTable();
+                        for (uint32_t i = 0; i < b->size && i < 30; ++i) {
+                            SymbolId nm = b->entries[i].name;
+                            const Value & vv = b->entries[i].value;
+                            Tag vtag = vv.tag();
+                            std::fprintf(stderr, "  [%u] %s tag=%u",
+                                i, nm < st.size() ? st[nm].c_str() : "?",
+                                (unsigned)vtag);
+                            if (vtag == Tag::Thunk && vv.payload.thunk) {
+                                Thunk * t = vv.payload.thunk;
+                                const LambdaDescriptor * d = nullptr;
+                                if (t->state == ThunkState::Suspended)
+                                    d = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+                                std::fprintf(stderr, " state=%d nUp=%u",
+                                    (int)t->state, (unsigned)t->nUpvalues);
+                                if (d)
+                                    std::fprintf(stderr, " %s [%u..)",
+                                        !d->name.empty() ? d->name.c_str() : "<anon>",
+                                        d->codeOffset);
+                                if (t->state == ThunkState::Evaluated) {
+                                    Tag etag = t->evaluated.tag();
+                                    std::fprintf(stderr, " EVAL=tag%u", (unsigned)etag);
+                                    if (etag == Tag::Closure && t->evaluated.payload.closure
+                                        && t->evaluated.payload.closure->desc) {
+                                        auto * ed = t->evaluated.payload.closure->desc;
+                                        std::fprintf(stderr, "(%s [%u..) nUp=%u)",
+                                            !ed->name.empty() ? ed->name.c_str() : "<anon>",
+                                            ed->codeOffset,
+                                            t->evaluated.payload.closure->nUpvalues);
+                                    } else if (etag == Tag::String && t->evaluated.payload.str) {
+                                        std::fprintf(stderr, "(\"%.40s\")",
+                                            t->evaluated.payload.str);
+                                    }
+                                }
+                            } else if (vtag == Tag::Closure && vv.payload.closure
+                                && vv.payload.closure->desc) {
+                                auto * d = vv.payload.closure->desc;
+                                std::fprintf(stderr, " %s [%u..) nUp=%u",
+                                    !d->name.empty() ? d->name.c_str() : "<anon>",
+                                    d->codeOffset, vv.payload.closure->nUpvalues);
+                            }
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
+            }
             // Inline-cache fast path: if the same Bindings* is hit
             // again, skip the binary search and read entries[lastSlot]
             // directly.  Cache miss falls back to lookup() and updates
             // the slot.
-            if (ic.lastBindings == b
+            //
+            // V3_DBG_NO_IC disables the IC fast-path — useful for
+            // bisecting whether IC corruption causes wrong-value bugs.
+            static const bool s_no_ic = std::getenv("V3_DBG_NO_IC") != nullptr;
+            if (!s_no_ic && ic.lastBindings == b
                 && ic.lastSlot < b->size
                 && b->entries[ic.lastSlot].name == static_cast<SymbolId>(operand))
             {
