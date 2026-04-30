@@ -5,6 +5,89 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
+## 2026-04-30 — WC-35 ROOT-CAUSED AND FIXED: lazy zipAttrsWith + map
+
+The actual root cause of WC-35 was found and fixed.  Diagnostic
+breakthrough: `V3_DBG_ADD_ERR_CTX=1` printed the addErrorContext
+message + arg tags every time the primop fired, revealing the cycle
+path:
+
+  while evaluating the option `_module.freeformType`
+    → while evaluating the module argument `lib` in pkgs/top-level/config.nix
+    → while evaluating the module argument `config` in pkgs/top-level/config.nix
+    → "if you get an infinite recursion here, you probably reference `config` in `imports`"
+  → forceValue: infinite recursion (blackhole)
+
+This pinned the cycle to `applyModuleArgs.extraArgs` building the
+wrapped `config` formal — but the deeper question was: WHY is v3
+forcing modules' configs while computing freeformType, when tree-
+walker doesn't?
+
+### The real bug: eager `zipAttrsWith` + eager `map`
+
+**v3's `primZipAttrsWith` was eagerly calling `fn name list` for
+EVERY name** at zipAttrsWith time, materialising every per-name
+result up-front.  Tree-walker's lib-level `zipAttrsWith` uses
+`genAttrs names (name: f name (catAttrs name sets))` — entries are
+built lazily, only fired when the consumer accesses a specific name.
+
+In `lib/modules.nix:830`:
+
+```nix
+pushedDownDefinitionsByName = zipAttrsWith (n: concatLists) (
+  map (mod: mapAttrs (n: v: ... pushDownProperties v ...) mod.config) modules
+);
+```
+
+With v3's eager zipAttrsWith, building this attrset called
+`concatLists` for every name (`warnings`, `assertions`, `matchers`,
+`_module`, ...).  `concatLists` forces each list element →
+`pushDownProperties value` → forces the value.  For
+`pkgs/top-level/config.nix`'s
+`config = { warnings = optionals config.warnUndeclaredOptions ...; ... }`,
+forcing the `warnings` value forced `config.warnUndeclaredOptions`
+— the OUTER rec config currently being computed.  Deadlock.
+
+**Fix** (commit 08dcd264a): emit `Tag::App(App(fn, name), values_list)`
+entries in `primZipAttrsWith`, mirroring `primMapAttrs`'s lazy-entry
+construction.  Forcing an entry chases the App via the standard
+`forceValue` / `OP_FORCE` resolution.
+
+**Companion fix** (commit efc60b3e5): same root pattern in
+`primMap` — was eagerly applying `fun` per element.  Made lazy
+via `Tag::App(fun, elem)` entries.  And `OP_STR_CONCAT` now forces
+`Tag::App` / `Tag::Thunk` parts on receive — without this, lazy
+map results blew up at string interpolation sites.
+
+### Outcome
+
+`(import <nixpkgs>{}).system` no longer cycles in v3-eval direct.
+Now reports `throw: Unknown CPU type: aarch64` — a NEW source-level
+throw from `lib/systems/parse.nix`'s `getCpu` lookup.  v3 is actually
+evaluating nixpkgs's lib/systems pipeline; the remaining issue is a
+different bug (likely v3 produces a cpu string that doesn't match
+what parse.nix expects) but the WC-35 cycle class is closed.
+
+### New regression coverage (run-wc-laziness-tests.sh, 22/22)
+
+The user's test-coverage question prompted a dedicated regression
+suite `src/libexpr-v3/test/run-wc-laziness-tests.sh`.  Each test pins
+ONE specific fix from this session (annotated with commit hash),
+includes both positive (works after fix) and negative (true
+infinite-recursion still throws) cases, and supports
+`V3_LAZINESS_PATTERN=WC-35` for targeted re-runs.
+
+WC-35 entries:
+  - WC-35-attrselect-on-app           (62d2309eb)
+  - WC-35-attrselect-dyn-on-app       (62d2309eb)
+  - WC-35-addErrorContext-lazy-passthrough (1f42622ef)
+  - WC-35-addErrorContext-thunk-passthrough(1f42622ef)
+  - WC-35-zipAttrs-lazy-entries       (08dcd264a)
+  - WC-35-zipAttrs-throw-not-on-queried-name (08dcd264a)
+  - WC-35-map-lazy-entries            (efc60b3e5)
+  - WC-35-map-only-queried-element-fired (efc60b3e5)
+  - WC-35-strconcat-forces-app-parts  (efc60b3e5)
+
 ## 2026-04-30 — WC-35 architectural fixes + remaining option-eval cycle
 
 After WC-34's fixes, hit a forceValue blackhole 35 frames deep into
