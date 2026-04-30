@@ -2472,6 +2472,20 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                                     std::unordered_map<const void *, nix::Value *> & seen)
 {
     auto & ns = *state.nixEvalState;
+    // WC-30b: if v is a Bridge thunk (a v3 wrapper around a tree-walker
+    // Value*), return the original tree-walker pointer directly.  This
+    // is critical for tree-walker functions: treeWalkerToV3 maps
+    // nFunction → mkNull, so going tree-walker → v3 (Bridge) → forceValue
+    // would lose the function.  By short-circuiting on Bridge, the
+    // round-trip is identity for any tree-walker value v3 has wrapped.
+    if (v.tag() == Tag::Thunk && v.payload.thunk
+        && v.payload.thunk->state == ThunkState::Bridge
+        && v.payload.thunk->bridgeSrc) {
+        nix::Value * orig = static_cast<nix::Value *>(v.payload.thunk->bridgeSrc);
+        // Force the original on the tree-walker side so callers see WHNF.
+        ns.forceValue(*orig, nix::noPos);
+        return orig;
+    }
     v = forceValue(*state.vm, v);
     // Cycle protection: if we've already started converting this
     // ListVec / Bindings, return the in-progress nix::Value.  Required
@@ -2654,18 +2668,15 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
     case Tag::Closure:
     case Tag::PrimOp:
     case Tag::PrimOpApp: {
-        // WC-21: closures with formal-attrset patterns (`{a, b ? def}: ...`)
-        // can't be safely bridged as PrimOpApp(__v3_call_bridge_1, handle):
-        // tree-walker's autoCallFunction only fires for nLambda values,
-        // not primops, so the call arrives without auto-args and v3's
-        // body throws OP_ATTRS_SELECT for missing formals.  Signal bridge
-        // failure (return null) so the caller falls back to tree-walker.
-        if (v.tag() == Tag::Closure
-            && v.payload.closure
-            && v.payload.closure->desc
-            && v.payload.closure->desc->hasFormals) {
-            return nullptr;
-        }
+        // WC-21 / WC-30b: closures with formal-attrset patterns
+        // (`{a, b ? def}: ...`) bridged as PrimOpApp(__v3_call_bridge_1,
+        // handle) lose tree-walker's autoCallFunction at the CLI top
+        // level.  But nested-closure bridges (inside attrs/lists) are
+        // typically called via tree-walker's callFunction, not auto-
+        // CallFunction — so formal defaults handled in v3's lower.cc
+        // synthesised rec-attrset machinery still work.  Bridge them.
+        // The outer eval hook in v3_hook.cc has its own hasFormals check
+        // that DOES fall back to tree-walker for top-level eval results.
         // Bridge the v3 closure as a tree-walker primop application.
         // We register `__v3_call_bridge_1` (arity 2: handle, arg) so
         // partial-application on the handle gives tree-walker a 1-arg
@@ -2698,10 +2709,14 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
-    default:
-        // Functions / external / etc. — can't easily round-trip.  Use null.
+    default: {
+        static const bool dbg = std::getenv("V3_DBG_BRIDGE_NULL") != nullptr;
+        if (dbg) std::fprintf(stderr,
+            "v3ToTreeWalker: tag=%d → mkNull (round-trip lost)\n",
+            (int)v.tag());
         out->mkNull();
         break;
+    }
     }
     return out;
 }
