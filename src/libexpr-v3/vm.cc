@@ -1527,6 +1527,52 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                     std::fprintf(stderr, " %s [%u..)",
                                         !d->name.empty() ? d->name.c_str() : "<anon>",
                                         d->codeOffset);
+                                // For preHook entry [0], also dump the
+                                // thunk's body bytecode + upvalue tags.
+                                if (i == 0 && t->state == ThunkState::Suspended && d) {
+                                    std::fprintf(stderr, "\n    body [%u..%u):\n",
+                                        d->codeOffset, d->codeOffset + 24);
+                                    if (t->suspended.cu)
+                                        disassembleWindow(stderr, *t->suspended.cu,
+                                            d->codeOffset, d->codeOffset + 24);
+                                    std::fprintf(stderr, "    upvalues:\n");
+                                    for (uint16_t u = 0; u < t->nUpvalues && u < 8; ++u) {
+                                        const Value & uv = t->tail[u];
+                                        Tag ut = uv.tag();
+                                        std::fprintf(stderr, "      [%u] tag=%u", u, (unsigned)ut);
+                                        if (ut == Tag::Closure && uv.payload.closure
+                                            && uv.payload.closure->desc) {
+                                            auto * cd = uv.payload.closure->desc;
+                                            std::fprintf(stderr, " closure=%s [%u..) nUp=%u",
+                                                !cd->name.empty() ? cd->name.c_str() : "<anon>",
+                                                cd->codeOffset, uv.payload.closure->nUpvalues);
+                                        } else if (ut == Tag::Thunk && uv.payload.thunk) {
+                                            Thunk * ut2 = uv.payload.thunk;
+                                            std::fprintf(stderr, " state=%d nUp=%u",
+                                                (int)ut2->state, (unsigned)ut2->nUpvalues);
+                                            if (ut2->state == ThunkState::Suspended) {
+                                                auto * d2 = reinterpret_cast<const LambdaDescriptor *>(ut2->suspended.desc);
+                                                if (d2)
+                                                    std::fprintf(stderr, " %s [%u..)",
+                                                        !d2->name.empty() ? d2->name.c_str() : "<anon>",
+                                                        d2->codeOffset);
+                                            } else if (ut2->state == ThunkState::Evaluated) {
+                                                Tag et = ut2->evaluated.tag();
+                                                std::fprintf(stderr, " EVAL=tag%u", (unsigned)et);
+                                                if (et == Tag::Closure && ut2->evaluated.payload.closure
+                                                    && ut2->evaluated.payload.closure->desc) {
+                                                    auto * cd = ut2->evaluated.payload.closure->desc;
+                                                    std::fprintf(stderr, "(%s [%u..) nUp=%u)",
+                                                        !cd->name.empty() ? cd->name.c_str() : "<anon>",
+                                                        cd->codeOffset, ut2->evaluated.payload.closure->nUpvalues);
+                                                }
+                                            }
+                                        } else if (ut == Tag::Attrs && uv.payload.bindings) {
+                                            std::fprintf(stderr, " attrs size=%u", uv.payload.bindings->size);
+                                        }
+                                        std::fprintf(stderr, "\n");
+                                    }
+                                }
                                 if (t->state == ThunkState::Evaluated) {
                                     Tag etag = t->evaluated.tag();
                                     std::fprintf(stderr, " EVAL=tag%u", (unsigned)etag);
