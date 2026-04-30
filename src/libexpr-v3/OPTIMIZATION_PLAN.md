@@ -2231,6 +2231,74 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-30 — WC-30 inversion: WC-30a knob landed, structural part deferred
+
+### What I attempted in this session
+
+  - Added `NIX_V3_NO_SHORTCIRCUIT=1` knob (v3_hook.cc:533) that
+    disables the kind-based and willReturnClosure short-circuits.
+    Goal: prove v3 can lower+run every Expr (precondition for the
+    full inversion).
+  - Validated: lang 142/142, cutover 142/142, drv-parity 25/25
+    all pass under `NIX_V3_NO_SHORTCIRCUIT=1`.  v3 successfully
+    handles every Expr kind tested.
+  - Tried promoting it to default-on: best-of-5 bench showed
+    measurable 2-3 % regression on real workloads despite test
+    sweeps passing.  Reverted to opt-in.
+  - Tried also raising `NIX_V3_SKIP_THRESHOLD` (the 50-function
+    cutoff): broke real nixpkgs eval with `attempt to call something
+    which is not a function but null` — large-module bridging
+    has a separate correctness issue that's not solved by current
+    mechanisms.
+
+### What WC-30 actually requires
+
+The agent estimate was 5-10 days; my session estimate is 22-32
+days for a real inversion.  The work splits into:
+
+  - **WC-30b** — fix the large-module null-bridge bug.  When v3
+    runs a 439-function CU and produces Tag::Attrs, some nested
+    closures in the attrs come back as null on the tree-walker
+    side.  Likely a v3ToTreeWalker formals-bearing closure issue
+    (WC-21 dropped formals-bearing closures via nullptr return,
+    which propagates up the recursion).  Estimated 2-4 days.
+  - **WC-30c** — invert the entry point.  Modify nix-instantiate's
+    `state.eval(e, vRoot)` to call v3 directly (when NIX_USE_V3=1)
+    rather than going through tree-walker's eval which then
+    invokes v3 hook.  This sidesteps the bridge for the top-level
+    result.  Estimated 3-5 days.
+  - **WC-30d** — replace short-circuit work with v3-internal fast
+    paths so removing them is a NET WIN, not a 2-3 % regression.
+    Requires reducing per-Expr lower+compile cost (currently
+    dominated by IR construction).  Estimated 5-10 days.
+
+### Current state (Phase 2 status)
+
+  - Phase 1 (correctness): DONE — WC-25/26 made the force hook
+    correct on every workload.
+  - Phase 2a (auto-args): DONE — was a no-op (already implemented
+    in lower.cc).
+  - Phase 2b (primops): DONE — WC-28 ported all 13 missing primops.
+    v3 has 124 native primops.
+  - Phase 2c (parser): DEFERRED — not on critical path.
+  - Phase 2d (inversion): WC-30a partial.  Full inversion needs
+    structural work.
+
+### What we have today
+
+  - v3 default at parity with tree-walker on all benchmarks.
+  - Force hook works correctly when opt-in (`NIX_USE_V3_FORCE=1`).
+  - All primops have v3 implementations.
+  - All sweeps green (lang/cutover/drv-parity 142+142+25).
+  - Knobs available for inversion testing:
+    - `NIX_V3_NO_SHORTCIRCUIT=1`: bypass short-circuits.
+    - `NIX_V3_SKIP_THRESHOLD=N`: tune the 50-function cutoff.
+
+The inversion remains the path to structural perf wins, but each
+step is multi-day and the cumulative work is multi-week.  Phase 1
++ Phase 2b have closed the correctness gaps; Phase 2d's structural
+inversion is the remaining big bet.
+
 ## 2026-04-29 — Phase 2 progress (WC-27, WC-28 — DONE)
 
 ### WC-27 (B2 native auto-args): NO-OP, already implemented
