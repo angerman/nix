@@ -1694,6 +1694,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             std::fprintf(stderr, "%s%u", i ? "," : "", (unsigned)parts[i].tag());
                         std::fprintf(stderr, "] forceStr=%d frames=%zu callerIp=%u\n",
                             forceStr ? 1 : 0, vm.frames.size(), ip - 1);
+                        // Dump current frame's upvalues / closure context.
+                        if (!vm.frames.empty()) {
+                            const auto & fr = vm.frames.back();
+                            const Closure * cl = fr.closure;
+                            const Thunk * th = fr.thunk;
+                            uint16_t nUp = 0;
+                            const Value * uvs = nullptr;
+                            if (cl) { nUp = cl->nUpvalues; uvs = cl->upvalues; }
+                            else if (th) { nUp = th->nUpvalues; uvs = th->tail; }
+                            std::fprintf(stderr,
+                                "  current-frame nUpvalues=%u\n", nUp);
+                            for (uint16_t i = 0; i < nUp && i < 8; ++i) {
+                                std::fprintf(stderr,
+                                    "    upvalue[%u] tag=%u",
+                                    i, (unsigned)uvs[i].tag());
+                                if (uvs[i].tag() == Tag::Closure
+                                    && uvs[i].payload.closure
+                                    && uvs[i].payload.closure->desc) {
+                                    std::fprintf(stderr, " closure=%s nUp=%u",
+                                        !uvs[i].payload.closure->desc->name.empty()
+                                            ? uvs[i].payload.closure->desc->name.c_str()
+                                            : "<anon>",
+                                        uvs[i].payload.closure->nUpvalues);
+                                }
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
                         size_t lim = vm.frames.size();
                         for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
                             const auto & fr = vm.frames[i - 1];
@@ -1721,6 +1748,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             std::fprintf(stderr,
                                 "  current frame disasm [%u..%u) (prologue→ip):\n", lo, hi);
                             disassembleWindow(stderr, *cu, lo, hi);
+                            // Also disasm functions referenced by MAKE_THUNK
+                            // / MAKE_CLOSURE in the prologue — these are
+                            // the inner thunks that produce slot values.
+                            std::fprintf(stderr, "  --- referenced functions ---\n");
+                            for (uint32_t cur = lo; cur < hi - 1; ) {
+                                Op op = decodeOp(cu->code[cur]);
+                                uint32_t operand = decodeOperand(cu->code[cur]);
+                                if (op == OP_MAKE_THUNK || op == OP_MAKE_CLOSURE) {
+                                    if (operand < cu->lambdas.size()) {
+                                        const LambdaDescriptor & d2 = cu->lambdas[operand];
+                                        uint32_t flo = d2.codeOffset;
+                                        uint32_t fhi = flo + 24;
+                                        std::fprintf(stderr,
+                                            "  fn[%u] (%s, nUp=%u) [%u..%u):\n",
+                                            operand,
+                                            !d2.name.empty() ? d2.name.c_str() : "<anon>",
+                                            d2.nUpvalues, flo, fhi);
+                                        disassembleWindow(stderr, *cu, flo, fhi);
+                                    }
+                                    cur += 2;  // op + nUp data
+                                } else {
+                                    cur++;
+                                }
+                            }
                         }
                     }
                 }
