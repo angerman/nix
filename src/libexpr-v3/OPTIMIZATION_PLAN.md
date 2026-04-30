@@ -5,6 +5,65 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
+## 2026-04-30 — WC-37 frame/thunk mismatch hypothesis: tail-call corrupting thunk evaluated
+
+New diagnostic infrastructure (`V3_DBG_STORE_PREVSTAGE=1`) added at OP_RETURN,
+OP_FORCE thunk-push, OP_RETURN-chain push, forceValue-helper push, and
+OP_TAIL_CALL on thunk-frame.  Run trace shows:
+
+  - The `<thunk>` at codeOffset=1346 nUp=5 (the user's preHook +chain in
+    pkgs/stdenv/darwin/default.nix) gets pushed twice via OP_RETURN-chain.
+    Suggests the body throws, blackmarks get reset, then re-attempted.
+  - At OP_RETURN time, the popped frame has `fr.thunk` pointing at the
+    +chain thunk (codeOffset=1346, nUp=5) but the running `ip-1=729` is
+    INSIDE `lambdas[30] = bintoolsPackages` (codeOffset=727, nUp=0,
+    body = `MAKE_CLOSURE 210; RETURN`).
+  - retVal = `prevStage` closure (= the inner lambda from the bootstrap chain).
+  - Result: `+chain.evaluated = prevStage closure`, propagating into
+    OP_STR_CONCAT downstream and failing with "cannot coerce type to string".
+
+**Frame/thunk mismatch is the smoking gun.** The +chain frame's `ip` should
+be in [1346..1479] (the body's range), but it's 729. The +chain body has no
+OP_TAIL_CALL (peephole only fires when last op is OP_CALL; the body ends with
+OP_STR_CONCAT). So OP_TAIL_CALL inside the +chain body itself doesn't explain
+this — it must be one of:
+
+  1. **Boehm GC reuse**: same Thunk* pointer being reused for a different
+     thunk after push #1 completed and the original was reclaimed. Push #2
+     would push a DIFFERENT thunk that prints the same address.
+  2. **Stale desc pointer through union**: after evaluated was written,
+     state was reset to Suspended (clearBlackMarksOnException), but the
+     union holds Evaluated bits. Reading suspended.desc reads garbage —
+     yet the diagnostic prints codeOffset=1346 consistently, so this would
+     be a coincidence-of-bytes (unlikely).
+  3. **OP_TAIL_CALL on a chain-pushed thunk frame** that retargets the
+     frame from the +chain body to bintoolsPackages's body. Logically would
+     require the +chain body itself to do TAIL_CALL — which it doesn't.
+
+### Verified facts
+
+  - Both pushes of the +chain show codeOffset=1346 nUp=5 (consistent).
+  - The frame[89] above the popped frame has cu=different from popped frame's
+    cu (different files imported separately).
+  - 200+ TAIL_CALL-on-thunk-frame events seen during evaluation, indicating
+    the peephole rewrite at emit.cc:569 is firing aggressively.
+
+### Most likely fix path
+
+Disable the OP_TAIL_CALL peephole rewrite for thunk bodies. Currently
+emit.cc:569 rewrites the last OP_CALL to OP_TAIL_CALL for all `fid != 0`
+functions. But thunk frames have CFF_THUNK_RETURN flag, and OP_TAIL_CALL
+preserves that flag while retargeting the body. If a thunk's tail-called
+function then itself tail-calls something else, the chain ends up with the
+ORIGINAL thunk's evaluated set to the FINAL function's return value —
+which is semantically correct for a single tail-call but creates ambiguity
+when multiple tail-calls chain through different cu boundaries.
+
+**Test**: rebuild with the peephole disabled (return early when last op
+is OP_CALL but the function is a thunk, not a regular lambda) and re-run
+the failing case. If the closure leak vanishes, peephole interaction is
+the cause.
+
 ## 2026-04-30 — Pure-VM nixpkgs status snapshot (end of WC-31/34/35/36/37 session)
 
 23 commits this session.  Pure-VM `(import <nixpkgs>{}).system` (and

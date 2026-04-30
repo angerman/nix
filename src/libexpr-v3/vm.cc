@@ -928,6 +928,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
             // Update the existing frame in place (don't push a new one).
             CallFrame & cur = vm.frames.back();
+            // V3_DBG_STORE_PREVSTAGE: trace when OP_TAIL_CALL retargets
+            // a frame that has CFF_THUNK_RETURN — this is the path that
+            // can corrupt thunk evaluated values (WC-37 hypothesis).
+            {
+                static const bool s_dbg_tc =
+                    std::getenv("V3_DBG_STORE_PREVSTAGE") != nullptr;
+                if (s_dbg_tc && (cur.flags & CFF_THUNK_RETURN) && cur.thunk) {
+                    std::fprintf(stderr,
+                        "v3 OP_TAIL_CALL on thunk-frame: thunk %p nUp=%u "
+                        "old_cu=%p old_ip=%u -> new_cu=%p new_ip=%u "
+                        "callee=%s nUp=%u\n",
+                        (void*)cur.thunk,
+                        (unsigned)cur.thunk->nUpvalues,
+                        (void*)cur.cu, cur.ip,
+                        (void*)tcCalleeCu, tcDesc->codeOffset,
+                        !tcDesc->name.empty() ? tcDesc->name.c_str() : "<anon>",
+                        tcDesc->nUpvalues);
+                }
+            }
             cur.cu = tcCalleeCu;
             cur.closure = tcCallee;
             // thunk stays whatever it was — if we're inside a thunk
@@ -995,6 +1014,98 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // chase loop above.  Match tree-walker by raising.
                 if (retVal.isThunk() && retVal.payload.thunk == fr.thunk)
                     throw std::runtime_error("v3 OP_RETURN: infinite recursion (thunk evaluates to itself)");
+                // V3_DBG_STORE_PREVSTAGE: trace any thunk that gets
+                // evaluated to a Closure whose desc is "prevStage" and
+                // codeOffset 3099, nUp=0 — used to isolate WC-37.
+                {
+                    static const bool s_dbg_pv =
+                        std::getenv("V3_DBG_STORE_PREVSTAGE") != nullptr;
+                    if (s_dbg_pv && retVal.tag() == Tag::Closure
+                        && retVal.payload.closure
+                        && retVal.payload.closure->desc
+                        && retVal.payload.closure->nUpvalues == 0
+                        && retVal.payload.closure->desc->name == "prevStage")
+                    {
+                        const auto * d = reinterpret_cast<const LambdaDescriptor *>(
+                            fr.thunk->suspended.desc);
+                        std::fprintf(stderr,
+                            "v3 OP_RETURN: storing prevStage(nUp=0) into thunk "
+                            "%p desc=%s codeOffset=%u nUp=%u; cu=%p ip=%u\n",
+                            (void*)fr.thunk,
+                            d && !d->name.empty() ? d->name.c_str()
+                                : (d ? "<anon>" : "<no-desc>"),
+                            d ? d->codeOffset : 0,
+                            (unsigned)fr.thunk->nUpvalues,
+                            (void*)cu,
+                            ip - 1);
+                        // Dump frame stack to help locate caller.
+                        size_t lim2 = vm.frames.size();
+                        for (size_t i = lim2; i > 0 && i + 6 > lim2; --i) {
+                            const auto & fr2 = vm.frames[i - 1];
+                            const LambdaDescriptor * d2 = nullptr;
+                            if (fr2.thunk) d2 = reinterpret_cast<const LambdaDescriptor *>(fr2.thunk->suspended.desc);
+                            else if (fr2.closure) d2 = fr2.closure->desc;
+                            std::fprintf(stderr,
+                                "  frame[%zu]: %s code=[%u..) ip=%u flags=%u cu=%p\n",
+                                i - 1,
+                                d2 && !d2->name.empty() ? d2->name.c_str()
+                                    : (d2 ? "<anon>" : "<closure-body>"),
+                                d2 ? d2->codeOffset : 0, fr2.ip,
+                                (unsigned)fr2.flags, (void*)fr2.cu);
+                        }
+                        // Dump bytecode around ip-1 in the popped frame's cu
+                        // — verifies that ip-1 is actually OP_RETURN.
+                        if (cu && ip > 1) {
+                            uint32_t lo = ip > 6 ? ip - 6 : 0;
+                            uint32_t hi = ip + 4;
+                            std::fprintf(stderr, "  popped frame cu=%p disasm [%u..%u):\n",
+                                (void*)cu, lo, hi);
+                            disassembleWindow(stderr, *cu, lo, hi);
+                            // Also disasm the descriptor's codeOffset region
+                            // — this is what the body SHOULD have started at.
+                            if (d && d->codeOffset != ip - 1) {
+                                std::fprintf(stderr,
+                                    "  desc.codeOffset=%u disasm [%u..%u):\n",
+                                    d->codeOffset, d->codeOffset, d->codeOffset + 200);
+                                disassembleWindow(stderr, *cu,
+                                    d->codeOffset, d->codeOffset + 200);
+                            }
+                            // Find the lambda whose codeOffset is closest
+                            // to (ip-1), going backwards.  Tells us which
+                            // function we actually returned from.
+                            uint32_t target_off = ip - 1;
+                            uint32_t best_idx = ~0u;
+                            uint32_t best_off = 0;
+                            for (uint32_t li = 0; li < cu->lambdas.size(); ++li) {
+                                uint32_t lo2 = cu->lambdas[li].codeOffset;
+                                if (lo2 <= target_off && lo2 > best_off) {
+                                    best_off = lo2;
+                                    best_idx = li;
+                                }
+                            }
+                            if (best_idx != ~0u) {
+                                const auto & ld = cu->lambdas[best_idx];
+                                std::fprintf(stderr,
+                                    "  ip-1=%u falls inside lambdas[%u]"
+                                    " (name=%s codeOffset=%u nUp=%u nLocals=%u)\n",
+                                    target_off, best_idx,
+                                    !ld.name.empty() ? ld.name.c_str() : "<anon>",
+                                    ld.codeOffset, ld.nUpvalues, ld.nLocals);
+                            }
+                            // Also dump the thunk pointer's `tail` (its
+                            // upvalues) so we can identify which specific
+                            // thunk instance.
+                            std::fprintf(stderr,
+                                "  fr.thunk->tail upvalues (nUp=%u):\n",
+                                (unsigned)fr.thunk->nUpvalues);
+                            for (uint16_t ui = 0; ui < fr.thunk->nUpvalues && ui < 8; ++ui) {
+                                const Value & uv = fr.thunk->tail[ui];
+                                std::fprintf(stderr,
+                                    "    [%u] tag=%u\n", ui, (unsigned)uv.tag());
+                            }
+                        }
+                    }
+                }
                 fr.thunk->state = ThunkState::Evaluated;
                 fr.thunk->evaluated = retVal;
 
@@ -1026,6 +1137,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     size_t newBase = vm.valueStack.size();
                     vm.valueStack.resize(newBase + desc->nLocals);
                     uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+                    {
+                        static const bool s_dbg_force =
+                            std::getenv("V3_DBG_STORE_PREVSTAGE") != nullptr;
+                        if (s_dbg_force && next->nUpvalues == 5) {
+                            std::fprintf(stderr,
+                                "v3 OP_RETURN-chain: pushing thunk %p desc=%s "
+                                "codeOffset=%u nUp=%u cu=%p\n",
+                                (void*)next,
+                                !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                                desc->codeOffset, (unsigned)next->nUpvalues,
+                                (void*)thunkCu);
+                        }
+                    }
                     vm.frames.push_back(CallFrame{
                         .cu = thunkCu,
                         .closure = fakeClo,
@@ -1217,6 +1341,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             size_t newBase = vm.valueStack.size();
             vm.valueStack.resize(newBase + desc->nLocals);
             uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+
+            // V3_DBG_STORE_PREVSTAGE: trace OP_FORCE pushes for thunks
+            // with nUp=5 to verify their codeOffset before body runs.
+            {
+                static const bool s_dbg_force =
+                    std::getenv("V3_DBG_STORE_PREVSTAGE") != nullptr;
+                if (s_dbg_force && t->nUpvalues == 5) {
+                    std::fprintf(stderr,
+                        "v3 OP_FORCE: pushing thunk %p desc=%s codeOffset=%u "
+                        "nUp=%u cu=%p\n",
+                        (void*)t,
+                        !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                        desc->codeOffset, (unsigned)t->nUpvalues,
+                        (void*)thunkCu);
+                }
+            }
 
             vm.frames.push_back(CallFrame{
                 .cu = thunkCu,
@@ -1531,10 +1671,42 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                 // thunk's body bytecode + upvalue tags.
                                 if (i == 0 && t->state == ThunkState::Suspended && d) {
                                     std::fprintf(stderr, "\n    body [%u..%u):\n",
-                                        d->codeOffset, d->codeOffset + 80);
+                                        d->codeOffset, d->codeOffset + 200);
                                     if (t->suspended.cu)
                                         disassembleWindow(stderr, *t->suspended.cu,
-                                            d->codeOffset, d->codeOffset + 80);
+                                            d->codeOffset, d->codeOffset + 200);
+                                    // Dump the FUNCTION DESCRIPTORS of every
+                                    // MAKE_THUNK target in this body — names
+                                    // like "recref-X" tell us what each
+                                    // upvalue resolves to in source.
+                                    if (t->suspended.cu) {
+                                        const auto & cu2 = *t->suspended.cu;
+                                        std::fprintf(stderr, "    referenced functions:\n");
+                                        for (uint32_t cur = d->codeOffset;
+                                             cur < d->codeOffset + 80 && cur < cu2.code.size(); ) {
+                                            Op op = decodeOp(cu2.code[cur]);
+                                            uint32_t operand = decodeOperand(cu2.code[cur]);
+                                            if (op == OP_MAKE_THUNK || op == OP_MAKE_CLOSURE) {
+                                                if (operand < cu2.lambdas.size()) {
+                                                    const auto & d3 = cu2.lambdas[operand];
+                                                    std::fprintf(stderr,
+                                                        "      [%u] -> fn[%u] (%s, nUp=%u, code=[%u..))\n",
+                                                        cur, operand,
+                                                        !d3.name.empty() ? d3.name.c_str() : "<anon>",
+                                                        d3.nUpvalues, d3.codeOffset);
+                                                    // Also dump the body of recref- thunks
+                                                    if (d3.name.find("recref-") == 0) {
+                                                        std::fprintf(stderr, "        body:\n");
+                                                        disassembleWindow(stderr, cu2,
+                                                            d3.codeOffset, d3.codeOffset + 6);
+                                                    }
+                                                }
+                                                cur += 2;
+                                            } else {
+                                                cur++;
+                                            }
+                                        }
+                                    }
                                     std::fprintf(stderr, "    upvalues:\n");
                                     for (uint16_t u = 0; u < t->nUpvalues && u < 8; ++u) {
                                         const Value & uv = t->tail[u];
@@ -1568,7 +1740,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                                 }
                                             }
                                         } else if (ut == Tag::Attrs && uv.payload.bindings) {
-                                            std::fprintf(stderr, " attrs size=%u", uv.payload.bindings->size);
+                                            auto * b2 = uv.payload.bindings;
+                                            std::fprintf(stderr, " attrs size=%u {", b2->size);
+                                            const auto & st2 = ir::globalSymbolTable();
+                                            for (uint32_t k = 0; k < b2->size && k < 30; ++k) {
+                                                SymbolId nm = b2->entries[k].name;
+                                                std::fprintf(stderr, "%s%s",
+                                                    k ? "," : "",
+                                                    nm < st2.size() ? st2[nm].c_str() : "?");
+                                            }
+                                            std::fprintf(stderr, "}");
                                         }
                                         std::fprintf(stderr, "\n");
                                     }
@@ -1825,6 +2006,97 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                             ? uvs[i].payload.closure->desc->name.c_str()
                                             : "<anon>",
                                         uvs[i].payload.closure->nUpvalues);
+                                } else if (uvs[i].tag() == Tag::Attrs
+                                           && uvs[i].payload.bindings) {
+                                    auto * b2 = uvs[i].payload.bindings;
+                                    std::fprintf(stderr, " attrs size=%u {",
+                                        (unsigned)b2->size);
+                                    const auto & st2 = ir::globalSymbolTable();
+                                    for (uint32_t k = 0; k < b2->size && k < 30; ++k) {
+                                        SymbolId nm = b2->entries[k].name;
+                                        std::fprintf(stderr, "%s%s",
+                                            k ? "," : "",
+                                            nm < st2.size() ? st2[nm].c_str() : "?");
+                                    }
+                                    std::fprintf(stderr, "}");
+                                    // For each attrs upvalue, also dump
+                                    // tag of `preHook` slot (the bug
+                                    // chases this attribute specifically).
+                                    static const SymbolId preHookSym2 =
+                                        ir::globalInternSymbol("preHook");
+                                    const Value * ph = b2->lookup(preHookSym2);
+                                    if (ph) {
+                                        Tag pht = ph->tag();
+                                        std::fprintf(stderr,
+                                            " preHook=tag%u", (unsigned)pht);
+                                        if (pht == Tag::Closure
+                                            && ph->payload.closure
+                                            && ph->payload.closure->desc) {
+                                            auto * d3 = ph->payload.closure->desc;
+                                            std::fprintf(stderr, "(%s [%u..) nUp=%u)",
+                                                !d3->name.empty() ? d3->name.c_str() : "<anon>",
+                                                d3->codeOffset,
+                                                ph->payload.closure->nUpvalues);
+                                        } else if (pht == Tag::Thunk && ph->payload.thunk) {
+                                            Thunk * pt = ph->payload.thunk;
+                                            std::fprintf(stderr, "(state=%d nUp=%u",
+                                                (int)pt->state, (unsigned)pt->nUpvalues);
+                                            if (pt->state == ThunkState::Suspended) {
+                                                auto * d3 = reinterpret_cast<const LambdaDescriptor *>(
+                                                    pt->suspended.desc);
+                                                if (d3)
+                                                    std::fprintf(stderr, " %s [%u..)",
+                                                        !d3->name.empty() ? d3->name.c_str() : "<anon>",
+                                                        d3->codeOffset);
+                                            } else if (pt->state == ThunkState::Evaluated) {
+                                                std::fprintf(stderr, " EVAL=tag%u",
+                                                    (unsigned)pt->evaluated.tag());
+                                                // Recurse one level deep
+                                                if (pt->evaluated.tag() == Tag::Thunk
+                                                    && pt->evaluated.payload.thunk) {
+                                                    Thunk * pt2 = pt->evaluated.payload.thunk;
+                                                    std::fprintf(stderr, "(state=%d nUp=%u",
+                                                        (int)pt2->state, (unsigned)pt2->nUpvalues);
+                                                    if (pt2->state == ThunkState::Suspended) {
+                                                        auto * d4 = reinterpret_cast<const LambdaDescriptor *>(
+                                                            pt2->suspended.desc);
+                                                        if (d4)
+                                                            std::fprintf(stderr, " %s [%u..)",
+                                                                !d4->name.empty() ? d4->name.c_str() : "<anon>",
+                                                                d4->codeOffset);
+                                                    } else if (pt2->state == ThunkState::Evaluated) {
+                                                        std::fprintf(stderr, " EVAL=tag%u",
+                                                            (unsigned)pt2->evaluated.tag());
+                                                        if (pt2->evaluated.tag() == Tag::Closure
+                                                            && pt2->evaluated.payload.closure
+                                                            && pt2->evaluated.payload.closure->desc) {
+                                                            auto * d5 = pt2->evaluated.payload.closure->desc;
+                                                            std::fprintf(stderr, "(closure=%s [%u..) nUp=%u)",
+                                                                !d5->name.empty() ? d5->name.c_str() : "<anon>",
+                                                                d5->codeOffset,
+                                                                pt2->evaluated.payload.closure->nUpvalues);
+                                                        } else if (pt2->evaluated.tag() == Tag::Thunk
+                                                            && pt2->evaluated.payload.thunk) {
+                                                            Thunk * pt3 = pt2->evaluated.payload.thunk;
+                                                            std::fprintf(stderr, "(state=%d nUp=%u",
+                                                                (int)pt3->state, (unsigned)pt3->nUpvalues);
+                                                            if (pt3->state == ThunkState::Suspended) {
+                                                                auto * d6 = reinterpret_cast<const LambdaDescriptor *>(
+                                                                    pt3->suspended.desc);
+                                                                if (d6)
+                                                                    std::fprintf(stderr, " %s [%u..)",
+                                                                        !d6->name.empty() ? d6->name.c_str() : "<anon>",
+                                                                        d6->codeOffset);
+                                                            }
+                                                            std::fprintf(stderr, ")");
+                                                        }
+                                                    }
+                                                    std::fprintf(stderr, ")");
+                                                }
+                                            }
+                                            std::fprintf(stderr, ")");
+                                        }
+                                    }
                                 }
                                 std::fprintf(stderr, "\n");
                             }
@@ -2429,6 +2701,19 @@ Value forceValue(VMState & vm, Value v)
         size_t newBase = vm.valueStack.size();
         vm.valueStack.resize(newBase + desc->nLocals);
         uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+
+        {
+            static const bool s_dbg_fv =
+                std::getenv("V3_DBG_STORE_PREVSTAGE") != nullptr;
+            if (s_dbg_fv && t->nUpvalues == 5) {
+                std::fprintf(stderr,
+                    "v3 forceValue: pushing thunk %p desc=%s codeOffset=%u nUp=%u cu=%p\n",
+                    (void*)t,
+                    !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                    desc->codeOffset, (unsigned)t->nUpvalues,
+                    (void*)thunkCu);
+            }
+        }
 
         vm.frames.push_back(CallFrame{
             .cu = thunkCu,
