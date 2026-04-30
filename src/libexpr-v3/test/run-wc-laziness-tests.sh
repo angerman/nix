@@ -389,6 +389,35 @@ TESTS=(
   "let x = y; y = x; in x must still raise"
   'let x = y; y = x; in x'
   '__ERROR__'
+
+  # ----------------------------------------------------------------
+  # WC-37 root-cause: clearBlackMarksOnException leaves ghost frames
+  # Commit: TBD
+  # Pre-fix symptom: when forceValue's inner dispatchLoop throws and
+  # is caught by tryEval, the inner pushed thunk frames remain on
+  # vm.frames as "ghost frames".  A subsequent OP_RETURN in the
+  # outer dispatchLoop pops the ghost frame, finds CFF_THUNK_RETURN
+  # set, and stores its retVal into the ghost thunk's evaluated slot
+  # — corrupting an unrelated thunk.  The corrupt thunk leaks into
+  # OP_STR_CONCAT (got Closure where String was expected).
+  # ----------------------------------------------------------------
+  WC-37-tryeval-ghost-frame-corrupt
+  "tryEval failure-path doesn't corrupt later thunks"
+  'let
+     foo = throw "nope";
+     bar = "ok-${"value"}-end";
+   in builtins.seq (builtins.tryEval foo).success bar'
+  '"ok-value-end"'
+
+  WC-37-double-tryeval-then-string
+  "two tryEval failures then a +chain that must produce a string"
+  'let
+     foo = throw "boom";
+     parts = "a" + "b" + "c";
+   in
+   builtins.seq (builtins.tryEval foo).success
+     (builtins.seq (builtins.tryEval foo).success parts)'
+  '"abc"'
 )
 
 pass=0

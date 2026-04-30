@@ -5,7 +5,58 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
-## 2026-04-30 — WC-37 frame/thunk mismatch hypothesis: tail-call corrupting thunk evaluated
+## 2026-04-30 — WC-37 ROOT-CAUSED AND FIXED: clearBlackMarksOnException ghost-frame corruption
+
+The bug: when `forceValue`'s inner `dispatchLoop` throws and a higher-level
+catch (e.g., `tryEval`) handles the exception, the inner-pushed thunk frames
+remained on `vm.frames` as "ghost frames" — their `flags & CFF_THUNK_RETURN`
+was set, their `thunk` pointer was valid. When a later OP_RETURN in an outer
+dispatchLoop popped `vm.frames.back()`, it popped a ghost frame, saw
+CFF_THUNK_RETURN + thunk pointer, and stored whatever was on the value stack
+into that ghost thunk's `evaluated` slot — corrupting an unrelated thunk.
+
+In the pure-VM nixpkgs `(import <nixpkgs>{}).system` case:
+  1. The +chain preHook thunk in `pkgs/stdenv/darwin/default.nix` (codeOffset
+     1346, nUp=5) was force-pushed.
+  2. Some upvalue resolution down the chain threw an exception (likely a
+     missing attribute or type mismatch in stdenv-bootstrap evaluation).
+  3. Exception was caught by tryEval/addErrorContext.
+  4. The +chain frame and its sub-frames were left on `vm.frames`.
+  5. Some unrelated outer-frame OP_RETURN popped the ghost +chain frame.
+  6. retVal at that moment was the prevStage closure (from `MAKE_CLOSURE 210;
+     RETURN` in `bintoolsPackages = prevStage: ...` at codeOffset 727).
+  7. +chain.evaluated = prevStage closure.
+  8. Later, OP_STR_CONCAT chased through preHook → got the closure → threw
+     "cannot coerce type to string".
+
+**Fix (commit TBD)**: `clearBlackMarksOnException` now also unwinds
+`vm.frames` (resizes to `exitDepth`), `vm.valueStack` (to first-popped
+frame's stackBase), and `vm.withStack` (to first-popped frame's withStackBase).
+The inline cleanup in `forceValue`'s catch block was replaced with a call to
+this helper.
+
+### Diagnostic infrastructure that nailed the root cause
+
+  - `V3_DBG_STORE_PREVSTAGE=1`: traces OP_RETURN that stores the prevStage
+    closure, OP_FORCE / OP_RETURN-chain / forceValue helper pushes, and
+    OP_TAIL_CALL on thunk-frames.
+  - `V3_DBG_TRACE_THUNK_BODY=codeoff,nUp`: per-instruction trace gated on
+    the current frame's thunk having a specific (codeOffset, nUp). This
+    revealed the smoking gun: same Thunk* pointer, state transitioning
+    Blackhole→Suspended mid-execution, ip + cu jumping to an unrelated
+    body — the ghost-frame fingerprint.
+
+### Validation
+
+  - 142/142 lang tests pass.
+  - 35/35 wc-laziness tests pass (added 2 WC-37-specific regression cases).
+  - 142/142 cutover tests pass.
+  - 25/25 drv-parity tests pass.
+  - Pure-VM nixpkgs `(import <nixpkgs>{}).system` advances PAST the closure
+    leak to a NEW error: `OP_WITH_LOOKUP: name not found in with-scope`
+    (different bug, deeper into stdenv-bootstrap).
+
+## 2026-04-30 — WC-37 (earlier hypothesis, ruled out): tail-call corrupting thunk evaluated
 
 New diagnostic infrastructure (`V3_DBG_STORE_PREVSTAGE=1`) added at OP_RETURN,
 OP_FORCE thunk-push, OP_RETURN-chain push, forceValue-helper push, and

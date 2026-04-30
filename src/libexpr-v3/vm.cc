@@ -362,7 +362,47 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     // memory write to every instruction and is only useful for
     // profiling.  Overhead on fib32 was ~3% on first-run timings.
     static const bool kCountInstructions = std::getenv("NIX_VM_STATS") != nullptr;
+    // V3_DBG_TRACE_THUNK_BODY: per-instruction trace gated on the
+    // currently-running thunk frame having a specific (codeOffset, nUp).
+    // Used to nail down WC-37 frame/thunk mismatch. Format:
+    //   V3_DBG_TRACE_THUNK_BODY=1346,5  ← trace any thunk with codeOffset
+    //                                     1346 and nUp=5
+    static const char * s_trace_env = std::getenv("V3_DBG_TRACE_THUNK_BODY");
+    static const uint32_t s_trace_codeoff =
+        s_trace_env ? static_cast<uint32_t>(std::strtoul(s_trace_env, nullptr, 10)) : 0;
+    static const uint16_t s_trace_nup = []() -> uint16_t {
+        const char * e = std::getenv("V3_DBG_TRACE_THUNK_BODY");
+        if (!e) return 0;
+        const char * comma = std::strchr(e, ',');
+        if (!comma) return 0;
+        return static_cast<uint16_t>(std::strtoul(comma + 1, nullptr, 10));
+    }();
     while (running) {
+        // V3_DBG_TRACE_THUNK_BODY: print this instruction if the current
+        // frame is a thunk frame matching the configured codeOffset/nUp.
+        if (s_trace_env && !vm.frames.empty()) {
+            const auto & cur = vm.frames.back();
+            if (cur.thunk && (cur.flags & CFF_THUNK_RETURN)
+                && cur.thunk->nUpvalues == s_trace_nup)
+            {
+                const auto * d = reinterpret_cast<const LambdaDescriptor *>(
+                    cur.thunk->suspended.desc);
+                if (d && d->codeOffset == s_trace_codeoff) {
+                    Instruction peek = cu->code[ip];
+                    Op pop_o = decodeOp(peek);
+                    uint32_t pop_n = decodeOperand(peek);
+                    // Fingerprint: pointer values of the first 3 upvalues
+                    // — distinguishes different thunks that happen to share
+                    // pointer (Boehm GC reuse) by their upvalue contents.
+                    uint64_t fp0 = cur.thunk->tail[0].tag_payload;
+                    uint64_t fp1 = cur.thunk->nUpvalues > 1 ? cur.thunk->tail[1].tag_payload : 0;
+                    std::fprintf(stderr,
+                        "  TRACE thunk=%p state=%d ip=%u op=0x%02x operand=%u (cu=%p) fp=[%016llx,%016llx]\n",
+                        (void*)cur.thunk, (int)cur.thunk->state, ip, (unsigned)pop_o, pop_n,
+                        (void*)cu, (unsigned long long)fp0, (unsigned long long)fp1);
+                }
+            }
+        }
         Instruction instr = cu->code[ip++];
         if (kCountInstructions) vm.nrInstructions++;
         Op op = decodeOp(instr);
@@ -2412,6 +2452,29 @@ static void clearBlackMarksOnException(VMState & vm, size_t exitDepth)
             fr.thunk->state = ThunkState::Suspended;
         }
     }
+    // WC-37: also unwind the leftover frames pushed by the failed
+    // dispatchLoop call.  Without this, a thunk frame that was on
+    // the stack when the exception was thrown remains as a "ghost
+    // frame" — when a subsequent OP_RETURN in an outer dispatchLoop
+    // pops vm.frames.back(), it pops the ghost frame, finds
+    // CFF_THUNK_RETURN + a thunk pointer, and stores whatever was on
+    // the value stack into that thunk's evaluated slot.  In the
+    // pure-VM nixpkgs case this corrupts the +chain preHook thunk
+    // (codeOffset=1346, nUp=5) by storing a closure (e.g.
+    // bintoolsPackages's body's MAKE_CLOSURE result) where a string
+    // was expected.  Resize valueStack & withStack to the FIRST
+    // popped frame's bases (= the stack/with depth when that frame
+    // was pushed), preserving everything below.
+    if (vm.frames.size() > exitDepth) {
+        const auto & firstPopped = vm.frames[exitDepth];
+        uint32_t targetStackBase = firstPopped.stackBaseOffset;
+        uint32_t targetWithBase  = firstPopped.withStackBase;
+        vm.frames.resize(exitDepth);
+        if (vm.valueStack.size() > targetStackBase)
+            vm.valueStack.resize(targetStackBase);
+        if (vm.withStack.size() > targetWithBase)
+            vm.withStack.resize(targetWithBase);
+    }
 }
 
 Value run(const CompilationUnit & rootCu)
@@ -2743,13 +2806,11 @@ Value forceValue(VMState & vm, Value v)
         try {
             v = dispatchLoop(vm, exitDepth);
         } catch (...) {
-            for (size_t i = vm.frames.size(); i > exitDepth; --i) {
-                auto & fr = vm.frames[i - 1];
-                if ((fr.flags & CFF_THUNK_RETURN) && fr.thunk
-                    && fr.thunk->state == ThunkState::Blackhole) {
-                    fr.thunk->state = ThunkState::Suspended;
-                }
-            }
+            // WC-37: clear blackmarks AND unwind the leftover frames
+            // so they can't become "ghost frames" picked up by a later
+            // OP_RETURN in an outer dispatchLoop (which would corrupt
+            // the thunk pointed-to by the ghost frame).
+            clearBlackMarksOnException(vm, exitDepth);
             // Also clear the outer Black mark we set just above.
             if (t->state == ThunkState::Blackhole)
                 t->state = ThunkState::Suspended;
