@@ -200,6 +200,42 @@ TESTS=(
   '55'
 
   # ----------------------------------------------------------------
+  # WC-35 ROOT-CAUSE: zipAttrsWith must build LAZY entries
+  # Commit: <next>
+  # Pre-fix symptom:
+  #   v3's primZipAttrsWith eagerly called `fn name list` for EVERY
+  #   name at zipAttrsWith time.  In nixpkgs lib/modules.nix's
+  #   pushedDownDefinitionsByName = zipAttrsWith (n: concatLists)
+  #   (map (mod: mapAttrs (n: v: ... pushDownProperties v) mod.config)
+  #   modules), this forced each module's per-name config attribute
+  #   value (e.g., pkgs/top-level/config.nix's `warnings = optionals
+  #   config.warnUndeclaredOptions ...`) — which transitively forces
+  #   the rec config sibling currently being computed.  Cycle.
+  # Tree-walker's nix-level `zipAttrsWith` definition uses genAttrs
+  # which builds entries via App-style lazy thunks.  v3 now matches
+  # via Tag::App entry construction in primZipAttrsWith.
+  # ----------------------------------------------------------------
+  WC-35-zipAttrs-lazy-entries
+  "zipAttrsWith builds lazy entries; only queried name's f runs"
+  'let
+     # Set up zipAttrsWith on attrsets where SOME entries would force
+     # an out-of-order rec sibling if eagerly evaluated.
+     r = rec {
+       sets = [ { a = 1; b = forced; } { a = 10; } ];
+       forced = builtins.length [ 1 2 3 ];
+       z = builtins.zipAttrsWith (n: vs: vs) sets;
+     };
+   in builtins.length r.z.a'  # only queries .a, never .b — should be 2
+  '2'
+
+  WC-35-zipAttrs-throw-not-on-queried-name
+  "zipAttrsWith does NOT fire f for names we do not query"
+  'let z = builtins.zipAttrsWith (n: vs: throw "fired for ${n}")
+       [ { ok = 1; } { ok = 2; bad = 3; } ];
+   in z ? ok'  # only checks presence, no entry forced
+  'true'
+
+  # ----------------------------------------------------------------
   # WC-31 negative test: a TRUE infinite recursion still errors.
   # We must not have made the evaluator too lenient — `let x = x; in x`
   # should still throw, not loop forever.

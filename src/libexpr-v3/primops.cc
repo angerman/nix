@@ -1542,10 +1542,27 @@ void primFindFile(EvalState & state, Value * args, Value & out)
 ///   per-name lists.  Order in the value list mirrors source order.
 void primZipAttrsWith(EvalState & state, Value * args, Value & out)
 {
+    // WC-35 root-cause: tree-walker's lib.attrsets.zipAttrsWith uses
+    // `genAttrs names (name: f name (catAttrs name sets))` — entries
+    // are built lazily.  v3 had an eager-call version that called
+    // `f name list` for EVERY name at zipAttrsWith time, which forced
+    // each module's per-name config attribute (via pushDownProperties)
+    // even for names we never queried.  In nixpkgs's lib/modules.nix,
+    // building pushedDownDefinitionsByName then forced `warnings`,
+    // `assertions`, etc. of pkgs/top-level/config.nix's config
+    // attribute, which transitively forced the `config` rec sibling
+    // currently being built — deadlock.
+    //
+    // Match tree-walker by emitting Tag::App entries: each entry value
+    // is `App(App(fn, name_str), values_list)`.  Forcing the entry
+    // chases the App chain via OP_FORCE / forceValue's normal App
+    // resolution.
     Value fn = args[0];
     if (!args[1].isList()) typeError("zipAttrsWith", "list of attrsets");
     auto * lst = args[1].payload.list;
-    // Group by symbol id, preserving the value order seen in `lst`.
+    // Group by symbol id, preserving value order.  Forcing each list
+    // entry to attrset shape is required to enumerate names — same
+    // strictness tree-walker has.
     std::unordered_map<SymbolId, std::vector<Value>> byName;
     if (lst) {
         for (uint32_t i = 0; i < lst->size; ++i) {
@@ -1559,21 +1576,31 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
     }
     std::vector<std::pair<SymbolId, Value>> entries;
     entries.reserve(byName.size());
+    auto & symTab = ir::globalSymbolTable();
     for (auto & [sid, vs] : byName) {
-        // Build the value list, then call fn name list.
+        // Build the values list eagerly (cheap — just allocates the
+        // ListVec; entries themselves stay lazy).
         ListVec * vl = Alloc::allocList(static_cast<uint32_t>(vs.size()));
         allocStats().listsAllocated++;
         for (size_t i = 0; i < vs.size(); ++i) vl->elems[i] = vs[i];
         Value lv;
         lv.tag_payload = static_cast<uint64_t>(Tag::List);
         lv.payload.list = vl;
-        // Call fn with name (string) then values (list).
-        auto & symTab = ir::globalSymbolTable();
+        // Build name string.
         std::string nm = sid < symTab.size() ? symTab[sid] : std::to_string(sid);
         Value nameV = mkStringValueOwned(nm);
-        Value step1 = callClosure(*state.vm, fn, nameV);
-        Value combined = callClosure(*state.vm, step1, lv);
-        entries.emplace_back(sid, combined);
+        // Build App(App(fn, nameV), lv) — a deferred call that resolves
+        // when something forces the entry.  Mirrors mapAttrs' lazy
+        // entry construction.
+        ValuePair * pp1 = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        pp1->left  = fn;
+        pp1->right = nameV;
+        Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
+        ValuePair * pp2 = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        pp2->left  = step1;
+        pp2->right = lv;
+        Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
+        entries.emplace_back(sid, step2);
     }
     std::sort(entries.begin(), entries.end(),
         [](const auto & a, const auto & b) { return a.first < b.first; });
