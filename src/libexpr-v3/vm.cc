@@ -1247,9 +1247,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // INSIDE the lib.fix's `let x = f x; in x` body, while
                 // x is in Blackhole — sub-thunks then can't look up
                 // names via `with x;`.
-                static const bool s_no_chain =
-                    std::getenv("NIX_V3_NO_RETURN_CHAIN") != nullptr;
-                if (!s_no_chain && retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Suspended) {
+                // WC-38: chain push is now OFF by default.  When OP_FORCE
+                // pushed the popped frame, it set CFF_FORCE_RETRY on the
+                // CALLER frame (one level up).  After this OP_RETURN
+                // pops the popped frame, the caller-resume path below
+                // will check CFF_FORCE_RETRY and re-enter op_force_slow
+                // if retVal is still a Thunk/App — implementing
+                // GHC STG-style indirection (the consumer drives the
+                // chain, not the producer).
+                //
+                // Set NIX_V3_RETURN_CHAIN=1 to re-enable the legacy
+                // chain push for A/B testing.  Default is OFF — this is
+                // the WC-38 fix.
+                static const bool s_chain_enabled =
+                    std::getenv("NIX_V3_RETURN_CHAIN") != nullptr;
+                if (s_chain_enabled && retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Suspended) {
                     Thunk * next = retVal.payload.thunk;
                     // Same call-depth guard — chained let-rec recursion
                     // (`let x = y; y = x; in x`) re-enters the next thunk
@@ -1319,12 +1331,65 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 running = false;
                 break;
             }
-            const auto & caller = vm.frames.back();
-            cu = caller.cu;
-            ip = caller.ip;
-            closure = caller.closure;
-            stackBase = caller.stackBaseOffset;
-            push(vm, retVal);
+            {
+                // WC-38: GHC STG-style force-retry.  If the caller frame
+                // was marked CFF_FORCE_RETRY (set by OP_FORCE /
+                // OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE before
+                // pushing the now-popped thunk frame) AND retVal is
+                // still a Thunk/App (= the body returned a forwarding
+                // pointer to another unforced value), re-enter
+                // op_force_slow to drive the chain.
+                //
+                // ALSO (WC-38 part 2 / "early publish"): if the popped
+                // frame was a CLOSURE call frame (NOT CFF_THUNK_RETURN)
+                // and the caller frame is a thunk frame in Black state,
+                // EARLY-PUBLISH retVal to the caller's thunk.evaluated.
+                // This mirrors tree-walker's `v.mkAttrs(...)` writing
+                // to the slot DURING expr->eval (not at body return),
+                // so sub-thunks captured-with that fire DURING the
+                // outer's body see the published value rather than
+                // hitting the Black state and throwing.
+                CallFrame & caller = vm.frames.back();
+                cu = caller.cu;
+                ip = caller.ip;
+                closure = caller.closure;
+                stackBase = caller.stackBaseOffset;
+
+                // Early publish: only fires when popped frame was a
+                // closure call (not a thunk frame), retVal is fully
+                // resolved (non-thunk/app), and caller is a Black
+                // thunk frame.  Idempotent — the eventual OP_RETURN
+                // of the caller's thunk frame will overwrite with the
+                // FINAL retVal.
+                //
+                // Disabled by default — set NIX_V3_EARLY_PUBLISH=1
+                // to enable.  Currently doesn't fully fix WC-38 but
+                // is kept for experimentation.
+                static const bool s_early_publish =
+                    std::getenv("NIX_V3_EARLY_PUBLISH") != nullptr;
+                if (s_early_publish
+                    && !(fFlags & CFF_THUNK_RETURN)
+                    && (caller.flags & CFF_THUNK_RETURN)
+                    && caller.thunk
+                    && caller.thunk->state == ThunkState::Blackhole
+                    && retVal.tag() != Tag::Thunk
+                    && retVal.tag() != Tag::App
+                    && retVal.tag() != Tag::Blackhole)
+                {
+                    caller.thunk->state = ThunkState::Evaluated;
+                    caller.thunk->evaluated = retVal;
+                }
+
+                bool retry = (caller.flags & CFF_FORCE_RETRY)
+                    && (retVal.tag() == Tag::Thunk
+                        || retVal.tag() == Tag::App);
+                // Clear the retry flag — it's a one-shot per
+                // OP_FORCE.  The next OP_FORCE will re-set it.
+                caller.flags &= ~CFF_FORCE_RETRY;
+                push(vm, retVal);
+                if (retry)
+                    goto op_force_slow;
+            }
             break;
         }
         case OP_FORCE: {
@@ -1471,6 +1536,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             t->state = ThunkState::Blackhole;
 
             vm.frames.back().ip = ip;
+            // WC-38: mark the caller frame for force-retry. When the
+            // pushed thunk's body returns, OP_RETURN's caller-resume
+            // path will re-enter op_force_slow if retVal is still a
+            // Thunk/App.  This replaces the over-eager OP_RETURN
+            // chain push with GHC STG-style consumer-driven chase.
+            vm.frames.back().flags |= CFF_FORCE_RETRY;
 
             size_t newBase = vm.valueStack.size();
             vm.valueStack.resize(newBase + desc->nLocals);

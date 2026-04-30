@@ -448,6 +448,37 @@ TESTS=(
      pkgs = fix (extends ext base);
    in pkgs.b'
   '2'
+
+  # ----------------------------------------------------------------
+  # WC-38 retry: GHC STG-style indirection via CFF_FORCE_RETRY.
+  # Replaces the OP_RETURN-chain push (which triggered eager deep
+  # evaluation of inner thunks at the outer's RETURN).  Now the
+  # consumer drives the chain via OP_FORCE retry: when OP_FORCE
+  # pushes a thunk frame, it marks the caller frame CFF_FORCE_RETRY;
+  # OP_RETURN's caller-resume re-enters op_force_slow if retVal is
+  # still a Thunk/App.  Pin to detect regression of the retry mechanism.
+  # ----------------------------------------------------------------
+  WC-38-deep-thunk-chain
+  "deep thunk chain — driven by OP_FORCE retry (not eager chain push)"
+  'let
+     fix = f: let x = f x; in x;
+     a = self: { x = self.y + 1; y = self.z + 1; z = 10; };
+     pkgs = fix a;
+   in pkgs.x'
+  '12'
+
+  WC-38-multi-overlay-fix
+  "3-overlay extend chain — chain driven by retry"
+  'let
+     fix = f: let x = f x; in x;
+     extends = overlay: f: self: let prev = f self; in prev // overlay self prev;
+     base = self: { a = 1; };
+     ext1 = self: super: { b = self.a + 10; };
+     ext2 = self: super: { c = self.b * 2; };
+     ext3 = self: super: { d = self.c + self.a; };
+     pkgs = fix (extends ext3 (extends ext2 (extends ext1 base)));
+   in pkgs.d'
+  '23'
 )
 
 pass=0

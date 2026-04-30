@@ -5,6 +5,66 @@ v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
 by leverage.
 
+## 2026-04-30 — WC-38 partial fix: GHC STG-style indirection via CFF_FORCE_RETRY
+
+Implemented (commit TBD) the CFF_FORCE_RETRY mechanism per multi-agent
+research convergence. The OP_RETURN-chain push (over-eager driver of
+Suspended thunks at body return) is now disabled by default; instead,
+OP_FORCE / OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE mark the caller
+frame with CFF_FORCE_RETRY before pushing the thunk frame. On
+OP_RETURN's caller-resume, if CFF_FORCE_RETRY is set AND retVal is
+still a Thunk/App, control re-enters `op_force_slow` to drive the
+chain.
+
+This mirrors GHC's STG indirection mechanism (Agent D's research):
+the consumer drives the chain at force time, not the producer at body
+return. Tree-walker uses the same pattern via slot mutation.
+
+### Status
+
+  - **All test suites green**: 142/142 lang, 39/39 wc-laziness (added
+    2 WC-38 retry-pinning tests), 142/142 cutover, 25/25 drv-parity.
+  - **Self-cycle detection preserved** (`let x = x; in x` still throws).
+  - **WC-37 ghost-frame fix preserved** — clearBlackMarksOnException
+    still unwinds.
+  - **Legacy chain push** kept behind `NIX_V3_RETURN_CHAIN=1` for A/B.
+
+### What this DOESN'T fix yet
+
+  - nixpkgs `(import <nixpkgs>{}).system` STILL fails with
+    `OP_WITH_LOOKUP: name 'callPackages' not found in with-scope`.
+    The retry mechanism replaces the chain push semantically but
+    doesn't change WHEN the deep eval happens — sub-thunks still fire
+    DURING x's body's deep eval, see x as Black, throw.
+
+### Why the retry alone is insufficient
+
+The agents' analysis converged on the chain push as the over-eager
+trigger. But the deep eval is INTRINSIC to forcing pkgs to WHNF — it
+must run x's body (= toFix x = the bootstrap stage chain). The retry
+doesn't change that the body runs; only WHO drives it.
+
+The actual semantic gap with tree-walker: tree-walker mutates the
+slot DURING `ExprAttrs::eval`'s body (`v.mkAttrs(...)` writes the
+slot in-place at the END of attrs construction), so sub-thunks
+captured-with that slot pointer see the attrset BEFORE the outer
+forceValue call returns. v3 only sets `t.evaluated` at OP_RETURN —
+sub-thunks that fire DURING the body see Black.
+
+### Next step (deferred)
+
+Implement "early publish" — set `t.evaluated` and `t.state = Eval`
+EARLIER, when the OUTER thunk's eventual return value can be
+predicted (e.g., when an attrset is built in a sub-frame whose return
+value will become the outer thunk's value). Experimental code is
+behind `NIX_V3_EARLY_PUBLISH=1` (currently a stub for closure-call
+to immediate-thunk-frame propagation; doesn't fix nixpkgs alone).
+
+The full fix likely requires propagating the "outer thunk's slot"
+through the call chain so sub-frames can mutate it directly (= what
+tree-walker does with `Value *` slot pointers). This is a major
+architectural change.
+
 ## 2026-04-30 — WC-38 root cause confirmed: OP_RETURN-chain push triggers deep eager eval
 
 **Root cause** (per multi-agent analysis): the chain push at OP_RETURN

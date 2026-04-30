@@ -21,6 +21,19 @@ enum CallFrameFlag : uint8_t
     /// On OP_RETURN, write the return value into the Thunk pointed to by
     /// `thunk` (state -> Evaluated, copy value into evaluated slot).
     CFF_THUNK_RETURN = 1 << 0,
+    /// WC-38: GHC STG-style indirection retry.  When set on the CALLER
+    /// frame at OP_RETURN's caller-resume path, if the just-popped frame's
+    /// return value is still a Thunk or App, re-enter forcing on it
+    /// (`goto op_force_slow`).  Set by OP_FORCE / OP_GET_LOCAL_FORCE /
+    /// OP_GET_UPVALUE_FORCE before they push the thunk frame.  This
+    /// replaces the over-eager OP_RETURN chain-push: instead of running
+    /// the inner thunk's body INSIDE the outer's RETURN (which causes
+    /// deep eager eval and breaks `with self;` lookups in lib.fix
+    /// patterns), we install a forwarding pointer
+    /// (`outer.evaluated = innerThunk`) and let the consumer drive the
+    /// chain.  Mirrors GHC's stg_IND mechanism + tree-walker's slot
+    /// mutation.
+    CFF_FORCE_RETRY = 1 << 1,
 };
 
 /// Slim CallFrame — 40 bytes, 2 fit in a 64B cache line minus 24B.
