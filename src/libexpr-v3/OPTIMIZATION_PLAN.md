@@ -2290,6 +2290,29 @@ force-hook bridge case via lazy upvalue Bridge thunks.  The
 **same fix needs to apply to v3's internal upvalues** — not just
 upvalues that come from tree-walker via the bridge.
 
+### Specific divergence: stdenv/booter.nix:101-114
+
+```nix
+thisStage = ...
+  let
+    adjacentPackages = ... else rec {
+      pkgsBuildBuild = prevStage.buildPackages;
+      pkgsBuildHost = prevStage;
+      pkgsBuildTarget = ... thisStage; ...
+      pkgsHostHost = ... thisStage ...;
+    };
+  in ...
+```
+
+`thisStage` (outer) is referenced inside the inner `rec` block.
+While `thisStage` is being forced, the inner rec's bodies
+reference `thisStage`.  Tree-walker handles via deferred env
+lookup; v3's bytecode emits OP_FORCE somewhere in this chain.
+
+Deeper investigation requires a v3 bytecode disassembler
+(WC-17.2 deferred) to identify the specific OP_FORCE site that
+cycles.  Once identified: change the lower to defer that force.
+
 ### Strategic plan (multi-session)
 
   1. **Lazy upvalues for rec-bindings** (~3-5 days): in
