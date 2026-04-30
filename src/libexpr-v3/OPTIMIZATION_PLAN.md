@@ -46,6 +46,77 @@ closure-leak (WC-37 below).
 | run-drv-parity.sh              | 25/25   | byte-exact drvPath parity        |
 | run-wc-laziness-tests.sh       | 30/30   | WC-31/34/35/36 fix-pinned        |
 
+## 2026-04-30 — WC-37 deeper trace: the user's preHook +chain thunk is the smoking gun
+
+The new `V3_DBG_PREHOOK=1` diagnostic (commit a67b852ec) intercepts every
+`OP_ATTRS_SELECT preHook` and dumps the Bindings's contents (each entry's
+tag, thunk state, descriptor name + codeOffset, and evaluated value tag).
+
+Running on `(import <nixpkgs>{}).system`, three preHook lookups happen:
+
+1. **Call #1 — generic's formalsRec (size=25)**: every entry is a
+   formal-binding thunk with nUp=1 and descriptor name matching the
+   formal. preHook at slot [0] is `state=0 nUp=1 preHook [960..)` —
+   correct shape (Suspended thunk pointing at the formal-binding
+   bytecode).
+
+2. **Call #2 — the user's args attrset (size=15)**: this is the
+   attrset darwin's makeStdenv passes as the actual args. preHook
+   at slot [0] is `state=0 nUp=5 <thunk> [1346..)` — Suspended thunk
+   with 5 captured upvalues, descriptor offset 1346.  This is the
+   `lib.optionalString cond1 "..." + "..." + lib.optionalString cond2 "..."`
+   +chain wrapped in v3's lazy attr-value thunkifier.  Note also
+   `[7] overrides tag=9 self [1164..) nUp=2` — the user IS passing
+   a closure for overrides (correct in this context).
+
+3. **Call #3 — generic's formalsRec again, NOW evaluated**: preHook
+   slot [0] is `state=2 EVAL=tag10` — the formal-binding thunk has
+   been forced and its evaluated value is another Thunk (correctly,
+   the user's +chain thunk).  The chain yields:
+   formal-binding-thunk → +chain-thunk → ???
+
+**The smoking gun**: the +chain thunk at `[1346..)` with nUp=5 is the
+one that, when forced, must return a string but apparently returns
+a closure (which then leaks into OP_STR_CONCAT).
+
+### Next-session investigation steps
+
+1. **Dump function at codeOffset 1346** (the +chain thunk body).
+   Use the WC-32 disassembler to print every instruction.
+2. **Match it to nixpkgs source**: the expression at that offset is
+   the exact `lib.optionalString (...) "..." + "..." + lib.optionalString (...) "..."`
+   from `pkgs/stdenv/darwin/default.nix:120-131` (or similar).
+3. **Trace upvalues at force time**: when this thunk is forced
+   (intercept at OP_FORCE / forceValue's Suspended-thunk path), dump
+   each upvalue's tag.  An upvalue with tag=Closure where it should
+   be tag=String/Attrs is the bug.
+4. **Check freeVar ordering**: the function's freeVars are sorted by
+   VarId.  If the source-level expression order doesn't match VarId
+   order, the body's `OP_GET_UPVALUE i` accesses the wrong upvalue.
+   This is unlikely (computeFreeVars is rigorous) but worth verifying.
+5. **Check WC-31's recref- thunks for the +chain's references**: the
+   +chain references `lib`, `bashNonInteractive`, `commonPreHook`,
+   `extraPreHook`, `prevStage`.  Each rec-sibling is a recref- thunk.
+   Are these correctly captured by the +chain thunk?
+
+### What we know definitively
+
+- The simpler patterns ALL work (33 regression tests).
+- The bug requires the specific combination of:
+  - `lib.makeOverridable`-wrapped function with formals
+  - Many formals (25+)
+  - +chain expression as an arg with multiple captures
+  - Multiple rec-sibling references in the +chain
+- The leaked closure is `(self: ...)` style at codeOffset 1164 with
+  nUp=2.  This happens to be the user-supplied `overrides = self: ...`
+  closure from somewhere in the bootstrap chain.
+- The leak path: forcing `args.preHook` (the +chain thunk) returns
+  the `overrides` closure instead of the +chain string.
+
+This is a **scope-resolution bug**: the +chain thunk's body is
+accessing the wrong VarId — likely fetching `overrides` (a Closure)
+instead of `lib` or `prevStage` (Attrs).
+
 ## 2026-04-30 — WC-37: nixpkgs stdenv-bootstrap closure-leak (deferred)
 
 After WC-35/36's chain of force-on-receive + lazy primop fixes,
