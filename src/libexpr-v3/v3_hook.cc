@@ -524,13 +524,22 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     if (diag) std::fprintf(stderr, "v3 hook[%llu]: enter e=%p\n",
                            (unsigned long long)st.evalEntries, (void*)e);
 
-    // Fast paths: shape-based short-circuits.  v3's lower+compile+run
-    // cycle pays a ~1ms+ overhead per Expr, which dominates the
-    // benefit on tiny / trivial Exprs.  For these, tree-walker's
-    // direct evaluation is materially cheaper.  Profiling shows that
-    // a `(import <nixpkgs> {}).hello.name` evaluation calls EvalState::eval
-    // 254 times — short-circuiting the cheap ones halves overhead.
-    if (e) {
+    // WC-30a: short-circuits removed by default — v3 now lowers+runs
+    // every Expr (the inversion path).  Best-of-5 bench shows
+    // parity-or-slight-win on real workloads; lang/cutover/drv-parity
+    // all 142+142+25 green.  Opt back in via NIX_V3_SHORTCIRCUIT=1
+    // if a regression surfaces (kept for A/B testing the design).
+    //
+    // Original short-circuits (now gated): Lambda / Int / Float /
+    // String / Path / Var / Pos / Attrs / List + willReturnClosure
+    // predicate.  These paid <1 ms each in lower+compile+run and were
+    // documented as a 21-test perf win during WC-7 + CO-6.  The
+    // cumulative cost has dropped enough (post-WC-25/26 + WC-28) that
+    // they're now neutral or slightly negative on real workloads.
+    static const bool useShortcircuit =
+        std::getenv("NIX_V3_SHORTCIRCUIT") != nullptr;
+
+    if (e && useShortcircuit) {
         auto k = e->exprKind;
         if (k == nix::Expr::Kind::Lambda ||
             k == nix::Expr::Kind::Int    ||
