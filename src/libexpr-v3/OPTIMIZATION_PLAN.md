@@ -2231,6 +2231,84 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-30 — Pure-VM memory finding + identification of actual blocker
+
+### The strategic case is real
+
+Direct invocation of v3-eval on `fib 35` (pure compute):
+
+| evaluator   | total memory | cpuTime |
+|-------------|--------------|---------|
+| tree-walker | 955 MB       | 4.06 s  |
+| v3-eval     |   1 MB       | (faster, exact)  |
+
+**~1000× memory reduction.**  v3's arena allocator + bytecode
+representation is dramatically lighter than tree-walker's per-Value
+GC allocation.  Even at CPU parity, the memory case alone justifies
+pursuing pure-VM as a deployment target.
+
+### The actual blocker: v3-eval direct fails on nixpkgs
+
+```
+v3-eval --strict '(import nixpkgs).hello.name'
+→ v3 OP_FORCE: infinite recursion (blackhole)
+```
+
+Frame trace at the cycle:
+```
+frame[5]: release        ip=622  (running)
+frame[4]: <thunk> @4028   ip=218  (Black, being re-entered)
+frame[3]: <thunk> @3916   ip=3925
+frame[2]: checked         ip=450
+frame[1]: args            ip=153
+frame[0]: <closure-body>
+```
+
+`release` early in its body does OP_FORCE on something that
+resolves back to thunk@4028.  Same WC-23-class cycle, but now
+visible PURELY in v3 (no tree-walker bridge).  Tree-walker
+evaluating the same expression doesn't cycle.
+
+### Root cause: v3's eager upvalue capture vs tree-walker's lazy env
+
+Tree-walker's closures capture `Env *` by reference; var access
+walks the env at call time and sees whatever is in the slot
+*at that moment*.  v3's `OP_MAKE_CLOSURE` reads upvalues from the
+env at closure-creation time and bakes them into the Closure
+struct.
+
+This works identically for already-evaluated values, but
+diverges for **rec-attrset** values: when a rec-binding's slot
+is currently being forced (Black), tree-walker's deferred
+access can succeed if the using expression doesn't actually
+need the in-progress value's WHNF, while v3's pre-baked upvalue
+forces the still-Black slot.
+
+`callPackageWith` / `intersectAttrs ... // args` is the exact
+nixpkgs construction that exhibits this.  WC-23 fixed it for the
+force-hook bridge case via lazy upvalue Bridge thunks.  The
+**same fix needs to apply to v3's internal upvalues** — not just
+upvalues that come from tree-walker via the bridge.
+
+### Strategic plan (multi-session)
+
+  1. **Lazy upvalues for rec-bindings** (~3-5 days): in
+     OP_MAKE_CLOSURE, when an upvalue is a slot in a rec-attrset
+     currently being constructed, capture the *slot pointer*
+     instead of the *value*.  OP_FORCE on the upvalue then
+     dereferences the slot at use time.
+  2. **Validate**: v3-eval direct must succeed on
+     `(import nixpkgs).hello.name` (today: blackhole).
+  3. **Pure-VM cutover**: route nix-instantiate through v3-eval
+     directly (skip tree-walker's eval entirely).  Memory profile
+     comparison.
+  4. **Profile-driven optimization** of v3 hotspots — only after
+     pure-VM works end-to-end.
+
+CPU regression is acceptable per the strategic call: memory
+wins (potentially 100-1000× on subgraphs v3 owns end-to-end)
+matter more than per-expression CPU parity.
+
 ## 2026-04-30 — WC-30b session: bridge round-trip improved, null-bug deferred
 
 WC-30b fixed two bridge round-trip issues:
