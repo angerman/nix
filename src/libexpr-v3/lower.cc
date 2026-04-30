@@ -177,9 +177,57 @@ struct Lowerer
             rvo.level  = level;
             rvo.names  = scopes[scopeIdx].recAttrsNames;
             m.recVarOrigins.push_back(std::move(rvo));
-            return addBinding(ir::AttrSelect{rec, nm});
+            // WC-31: defer the AttrSelect by wrapping in a thunk.
+            // Direct `AttrSelect{rec, nm}` runs at MAKE_CLOSURE time
+            // and captures whatever's in the slot AT THAT MOMENT —
+            // for closures created inside a rec body that reference
+            // siblings, this is often a Suspended/Black thunk.  When
+            // the closure is later called, forcing the captured Black
+            // thunk cycles (WC-23 family).
+            //
+            // Tree-walker captures `Env *` by reference; var access
+            // walks env at call time, by which point most rec slots
+            // have transitioned Suspended→Evaluated.  The thunkified
+            // AttrSelect achieves the same: the thunk's body runs
+            // AttrSelect at force-time (i.e., closure-call time), so
+            // the slot has had the chance to settle.
+            //
+            // Cost: one extra Thunk allocation per rec freeVar +
+            // one extra force.  Worth it for the correctness fix.
+            // Opt out via NIX_V3_NO_THUNKIFY_REC=1 for A/B testing.
+            static const bool noThunkify =
+                std::getenv("NIX_V3_NO_THUNKIFY_REC") != nullptr;
+            if (noThunkify)
+                return addBinding(ir::AttrSelect{rec, nm});
+            return thunkifyRecAttrSelect(rec, nm);
         }
         return ir::kInvalid;
+    }
+
+    /// WC-31: wrap a rec-attrset AttrSelect in a thunk so the select
+    /// runs at force time (matching tree-walker's Env-pointer-by-
+    /// reference semantics) instead of at MAKE_CLOSURE time.
+    ir::VarId thunkifyRecAttrSelect(ir::VarId rec, ir::SymbolId nm)
+    {
+        m.functions.emplace_back();
+        ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+        auto entry = m.freshBlock();
+        m.functions[fid].entryBlock = entry;
+        // Diagnostic name — appears in V3_DBG_OPCYCLE traces.
+        const auto & gst = ir::globalSymbolTable();
+        m.functions[fid].name = std::string("recref-")
+            + (nm < gst.size() ? gst[nm] : std::string("?"));
+
+        funcStack.push_back(fid);
+        blockStack.push_back(entry);
+        // Body: AttrSelect(rec, nm); return.  `rec` becomes a freeVar
+        // of this thunk (computeFreeVars discovers it later).
+        ir::VarId selectVar = addBinding(ir::AttrSelect{rec, nm});
+        setReturn(selectVar);
+        blockStack.pop_back();
+        funcStack.pop_back();
+
+        return addBinding(ir::MkThunk{fid, /*freeVars*/ {}});
     }
 
     /// Wrap a VarId in a Force if it might not be in WHNF.  Cheap:
