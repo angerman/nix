@@ -728,8 +728,40 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 break;
             }
 
-            if (!fun.isClosure())
+            if (!fun.isClosure()) {
+                static const bool dbg = std::getenv("V3_DBG_CALL") != nullptr;
+                if (dbg) {
+                    std::fprintf(stderr,
+                        "v3 OP_CALL: callee is not a closure tag=%u "
+                        "frames=%zu callerIp=%u\n",
+                        (unsigned)fun.tag(), vm.frames.size(), ip - 1);
+                    size_t lim = vm.frames.size();
+                    for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                        const auto & fr = vm.frames[i - 1];
+                        const LambdaDescriptor * desc = nullptr;
+                        if (fr.thunk)
+                            desc = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                        else if (fr.closure)
+                            desc = fr.closure->desc;
+                        std::fprintf(stderr,
+                            "  frame[%zu]: %s code=[%u..) ip=%u flags=%u\n",
+                            i - 1,
+                            desc && !desc->name.empty() ? desc->name.c_str()
+                                : (desc ? "<anon>" : "<closure-body>"),
+                            desc ? desc->codeOffset : 0,
+                            fr.ip, (unsigned)fr.flags);
+                    }
+                    // Dump 32 instructions before/after the failing OP_CALL.
+                    if (cu) {
+                        uint32_t fip = ip > 0 ? ip - 1 : 0;
+                        uint32_t lo = fip > 64 ? fip - 64 : 0;
+                        uint32_t hi = fip + 16;
+                        std::fprintf(stderr, "  current frame disasm [%u..%u):\n", lo, hi);
+                        disassembleWindow(stderr, *cu, lo, hi);
+                    }
+                }
                 throw std::runtime_error("v3 OP_CALL: callee is not a closure");
+            }
             const Closure * callee = fun.payload.closure;
             const LambdaDescriptor * desc = callee->desc;
             // Closures from imported files own their own CompilationUnit;
@@ -905,10 +937,40 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             fr.flags = fFlags;
             fr.thunk = fThunk;
             if (fFlags & CFF_THUNK_RETURN) {
-                // Chase Evaluated chains so the thunk caches the
-                // ultimate WHNF and not an intermediate thunk.
-                while (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Evaluated)
-                    retVal = retVal.payload.thunk->evaluated;
+                // Chase the result toward WHNF before recording it as
+                // the thunk's evaluated value.  Three sources of
+                // non-WHNF returns must be handled:
+                //   * Evaluated thunks chained through the body's
+                //     bindings.
+                //   * Tag::App deferred-call values built by lazy
+                //     primops (mapAttrs, intersectAttrs, etc.).
+                //     Without resolving here, the caller's
+                //     immediately-following OP_SET_LOCAL stashes the
+                //     unforced App into a slot and a later OP_CALL on
+                //     that slot trips "callee is not a closure" — the
+                //     symptom seen on `(import <nixpkgs>{}).system`
+                //     after the rec-attr ConcatStrings cycle was
+                //     resolved.
+                //   * Suspended thunks (the existing transitive-force
+                //     path below).
+                while (true) {
+                    if (retVal.isThunk()
+                        && retVal.payload.thunk->state == ThunkState::Evaluated) {
+                        retVal = retVal.payload.thunk->evaluated;
+                        continue;
+                    }
+                    if (retVal.tag() == Tag::App) {
+                        // Resolve the App: forceValue(left) + callClosure(left, right).
+                        // Same C++-recursion bound by the 5000-frame
+                        // guard inside those helpers.
+                        Value left  = retVal.payload.pair->left;
+                        Value right = retVal.payload.pair->right;
+                        left = forceValue(vm, left);
+                        retVal = callClosure(vm, left, right);
+                        continue;
+                    }
+                    break;
+                }
                 // Self-reference detection: `let x = x; in x` makes the
                 // thunk's body return the thunk itself (the chase above
                 // can't catch this since we hit a Blackhole-state thunk
