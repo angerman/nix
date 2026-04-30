@@ -263,6 +263,86 @@ TESTS=(
   '"hi!"'
 
   # ----------------------------------------------------------------
+  # WC-36: genList must build LAZY entries (matches tree-walker)
+  # Commit: 117a31628
+  # Pre-fix symptom:
+  #   Eager genList forced (gen idx) for every i.  In nixpkgs
+  #   `lib.lists.imap1 = f: list: genList (n: f (n+1) (elemAt list n))
+  #   (length list)`, eager genList meant every list element was
+  #   built up-front — surfaced bootstrap-stage closures into
+  #   contexts expecting forced values.
+  # ----------------------------------------------------------------
+  WC-36-genList-lazy-entries
+  "genList builds App entries; un-accessed positions never fire"
+  'let xs = builtins.genList (i: throw "elem ${toString i}") 100;
+   in builtins.length xs'
+  '100'
+
+  WC-36-genList-only-queried-element-fired
+  "genList accessed element fires; others stay lazy"
+  'let xs = builtins.genList (i: i * 10) 5;
+   in (builtins.elemAt xs 0) + (builtins.elemAt xs 4)'
+  '40'
+
+  # ----------------------------------------------------------------
+  # WC-36 dyn-attr ops force `name` arg
+  # Commit: 888b56928
+  # Pre-fix symptom:
+  #   `attrs.${expr}` where expr resolves to a Tag::App / Tag::Thunk
+  #   tripped "type error" or made HasAttr return false (which
+  #   caused nixpkgs's `cpuTypes.${cpu} or throw "Unknown CPU"` to
+  #   throw).
+  # ----------------------------------------------------------------
+  WC-36-dyn-select-with-app-name
+  "AttrSelect_DYN forces lazy name (Tag::App from map)"
+  'let names = builtins.map (x: x) [ "aarch64" ];
+       attrs = { aarch64 = "OK"; };
+   in attrs.${builtins.head names}'
+  '"OK"'
+
+  WC-36-dyn-has-with-thunk-name
+  "AttrSelect_HAS_DYN forces lazy name (Tag::Thunk)"
+  'let n = builtins.head [ "x" ]; attrs = { x = 1; }; in attrs ? ${n}'
+  'true'
+
+  # ----------------------------------------------------------------
+  # WC-36 OP_LIST_CONCAT forces lazy operands
+  # ----------------------------------------------------------------
+  WC-36-list-concat-on-app
+  "++ forces Tag::App lhs/rhs (e.g. from map)"
+  'let xs = builtins.map (x: x) [ 1 2 ];
+       ys = builtins.map (x: x) [ 3 4 ];
+   in builtins.length (xs ++ ys)'
+  '4'
+
+  WC-36-list-concat-on-app-elemAt
+  "++ result indexed forces individual entry"
+  'let xs = builtins.map (x: x * 10) [ 1 2 ];
+       ys = builtins.map (x: x * 100) [ 3 4 ];
+       cat = xs ++ ys;
+   in (builtins.elemAt cat 2) + (builtins.elemAt cat 0)'  # 300 + 10
+  '310'
+
+  # ----------------------------------------------------------------
+  # WC-36 OP_ATTRS_UPDATE forces lazy operands
+  # ----------------------------------------------------------------
+  WC-36-attrs-update-on-app
+  "// forces Tag::App lhs/rhs (e.g. from mapAttrs)"
+  'let a = builtins.mapAttrs (n: v: v) { x = 1; };
+       b = builtins.mapAttrs (n: v: v) { y = 2; };
+   in (a // b).y'
+  '2'
+
+  # ----------------------------------------------------------------
+  # WC-36 primConcatMap forces fn result
+  # ----------------------------------------------------------------
+  WC-36-concatMap-lazy-result
+  "concatMap forces fn's return (may be lazy mapAttrs/map result)"
+  'let xs = builtins.concatMap (x: builtins.map (y: y) [ x x ]) [ 1 2 ];
+   in builtins.length xs'
+  '4'
+
+  # ----------------------------------------------------------------
   # WC-31 negative test: a TRUE infinite recursion still errors.
   # We must not have made the evaluator too lenient — `let x = x; in x`
   # should still throw, not loop forever.
