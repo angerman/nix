@@ -2231,6 +2231,54 @@ sidestep the problem cleanly.
 WC-17.2 (full disassembler) and WC-17.3 (re-engineering) deferred
 in favor of Option 3 implementation.
 
+## 2026-04-30 — WC-30b session: bridge round-trip improved, null-bug deferred
+
+WC-30b fixed two bridge round-trip issues:
+
+  1. `v3ToTreeWalker` now short-circuits Bridge thunks to return
+     the original tree-walker `nix::Value*`.  Tree-walker
+     functions are mapped to `mkNull` by `treeWalkerToV3` (no v3
+     equivalent of nFunction); without this short-circuit, any
+     tree-walker function v3 wraps as a Bridge thunk would lose
+     its identity on round-trip.
+  2. The WC-21 nullptr-return for nested formals-bearing closures
+     was over-broad — it was meant to address autoCallFunction at
+     the CLI top level, but inside attrs/lists, formals bridge as
+     PrimOpApp normally and v3's lower.cc default-substitution
+     handles missing formals.  Drop the early return.
+
+But the symptom that originally motivated WC-30b (high
+`NIX_V3_SKIP_THRESHOLD` → "attempt to call null" on lib.throwIfNot)
+still reproduces.  V3_DBG_BRIDGE_NULL diagnostic shows zero hits in
+the explicit mkNull case, so the null is from a different path —
+likely primV3ForceAttr or intermediate forceValue.  Needs deeper
+trace; deferred.
+
+### Honest WC-30 inversion status
+
+Phase 2d is **partially done**:
+  - WC-30a: NIX_V3_NO_SHORTCIRCUIT knob (opt-in)
+  - WC-30b: bridge round-trip improvements (committed)
+  - WC-30c: nix-instantiate entry inversion (NOT ATTEMPTED — 3-5 d)
+  - WC-30d: short-circuit replacement (NOT ATTEMPTED — 5-10 d)
+
+### Final session state
+
+Phase 1 + Phase 2 closed all the **correctness** gaps:
+  - Force hook works (WC-25/26 lazy upvalues)
+  - All 13 missing primops ported (WC-28)
+  - Bridge round-trip for tree-walker functions fixed (WC-30b)
+  - All sweeps green (lang 142/142, cutover 142/142, drv-parity
+    25/25) under default + opt-in flag combinations.
+
+**Default v3 perf at parity** with tree-walker on real
+workloads (best-of-5 measurements within ±3% noise floor; -10%
+on synthetic fib35).
+
+**Force hook stays opt-in** — no clear perf win to justify
+flipping default.  Path to wins is the remaining structural
+inversion work (WC-30c/d), which is multi-week.
+
 ## 2026-04-30 — WC-30 inversion: WC-30a knob landed, structural part deferred
 
 ### What I attempted in this session
