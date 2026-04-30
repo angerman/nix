@@ -570,8 +570,20 @@ void primSubstring(EvalState &, Value * args, Value & out)
 
 void primMap(EvalState & state, Value * args, Value & out)
 {
-    if (!args[1].isList()) typeError("map", "list");
-    auto * src = args[1].payload.list;
+    // WC-35 follow-up: tree-walker's `builtins.map` builds Tag::App
+    // entries for each result element — `f x` only fires when the
+    // entry is forced.  v3 was eager (callClosure per element) which
+    // meant a `map f xs` over an `xs` whose element values include
+    // rec siblings being constructed would force them prematurely.
+    // Same root pattern as zipAttrsWith.
+    //
+    // Force the second arg to list shape (so we can read its size /
+    // elems), then emit App entries.
+    Value lst = args[1];
+    if (lst.tag() == Tag::App || lst.tag() == Tag::Thunk)
+        lst = forceValue(*state.vm, lst);
+    if (!lst.isList()) typeError("map", "list");
+    auto * src = lst.payload.list;
     if (!src || src->size == 0) {
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = Alloc::allocList(0);
@@ -582,7 +594,14 @@ void primMap(EvalState & state, Value * args, Value & out)
     ListVec * result = Alloc::allocList(src->size);
     allocStats().listsAllocated++;
     for (uint32_t i = 0; i < src->size; ++i) {
-        result->elems[i] = callClosure(*state.vm, fun, src->elems[i]);
+        // Build App(fun, elem) — lazy.
+        ValuePair * pp = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        pp->left  = fun;
+        pp->right = src->elems[i];
+        Value v;
+        v.tag_payload = static_cast<uint64_t>(Tag::App);
+        v.payload.pair = pp;
+        result->elems[i] = v;
     }
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = result;

@@ -1615,6 +1615,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             for (uint32_t i = n; i > 0; --i) parts[i - 1] = pop(vm);
 
+            // Force lazy parts (Tag::App from mapAttrs/zipAttrsWith,
+            // Tag::Thunk from lazy attr values).  Without this, a
+            // string interpolation like `"${(map f xs)[0]}"` blows up
+            // because map's entries are now Tag::App after the WC-35
+            // fix.  Cheap on already-WHNF values.
+            for (uint32_t i = 0; i < n; ++i) {
+                Tag t = parts[i].tag();
+                if (t == Tag::App || t == Tag::Thunk) {
+                    vm.frames.back().ip = ip;
+                    parts[i] = forceValue(vm, parts[i]);
+                }
+            }
+
             // nix `+` semantics: if forceString=false and the first operand
             // is numeric (Int/Float), perform arithmetic addition; otherwise
             // do string concatenation.  forceString=true (e.g. "${foo}")

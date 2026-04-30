@@ -236,6 +236,33 @@ TESTS=(
   'true'
 
   # ----------------------------------------------------------------
+  # WC-35 follow-up: builtins.map must build LAZY entries
+  # Commit: <next>
+  # Pre-fix symptom:
+  #   v3's primMap eagerly called fun on each element.  Same shape as
+  #   the zipAttrsWith bug — would force list elements that might be
+  #   rec siblings being constructed.
+  # ----------------------------------------------------------------
+  WC-35-map-lazy-entries
+  "map builds App entries; un-accessed positions never fire"
+  'let xs = builtins.map (x: throw "elem ${toString x}") [ 1 2 3 ];
+   in builtins.length xs'  # length doesn't force entries
+  '3'
+
+  WC-35-map-only-queried-element-fired
+  "map's accessed element fires; others stay lazy"
+  'let xs = builtins.map (x: x * x) [ 1 (throw "boom") 3 ];
+   in builtins.elemAt xs 0'
+  '1'
+
+  # OP_STR_CONCAT must force Tag::App parts (e.g. from mapped lists).
+  WC-35-strconcat-forces-app-parts
+  "string interpolation of map result forces Tag::App element"
+  'let xs = builtins.map (x: x + "!") [ "hi" "yo" ];
+   in builtins.head xs'
+  '"hi!"'
+
+  # ----------------------------------------------------------------
   # WC-31 negative test: a TRUE infinite recursion still errors.
   # We must not have made the evaluator too lenient — `let x = x; in x`
   # should still throw, not loop forever.
