@@ -774,13 +774,21 @@ void primCompareVersions(EvalState &, Value * args, Value & out)
 
 void primConcatMap(EvalState & state, Value * args, Value & out)
 {
-    if (!args[1].isList()) typeError("concatMap", "list");
-    auto * src = args[1].payload.list;
+    Value lst = args[1];
+    if (lst.tag() == Tag::App || lst.tag() == Tag::Thunk)
+        lst = forceValue(*state.vm, lst);
+    if (!lst.isList()) typeError("concatMap", "list");
+    auto * src = lst.payload.list;
     Value fn = args[0];
     std::vector<Value> all;
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
             Value r = callClosure(*state.vm, fn, src->elems[i]);
+            // Force the callback's return value — it may be a Tag::App
+            // (e.g., when fn = (x: map g xs) and v3's lazy map returns
+            // a list with App entries, then concatMap of that gets the
+            // nested-list-as-App-entry shape).
+            r = forceValue(*state.vm, r);
             if (!r.isList()) typeError("concatMap", "function returning list");
             if (r.payload.list)
                 for (uint32_t j = 0; j < r.payload.list->size; ++j)

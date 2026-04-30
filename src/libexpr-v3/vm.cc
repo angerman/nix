@@ -226,7 +226,23 @@ inline std::string coerceToString(const Value & v, bool forceString)
     case Tag::Blackhole:
     case Tag::External:
     default:
-        throw std::runtime_error("v3 STR_CONCAT: cannot coerce value of this type to string");
+        {
+            char buf[96];
+            std::snprintf(buf, sizeof buf,
+                "v3 STR_CONCAT: cannot coerce type to string (tag=%u)",
+                (unsigned)v.tag());
+            static const bool dbg = std::getenv("V3_DBG_STRCONCAT") != nullptr;
+            if (dbg) {
+                std::fprintf(stderr, "%s\n", buf);
+                if (v.tag() == Tag::Closure && v.payload.closure && v.payload.closure->desc) {
+                    auto * d = v.payload.closure->desc;
+                    std::fprintf(stderr, "  closure: %s code=[%u..) nUp=%u\n",
+                        !d->name.empty() ? d->name.c_str() : "<anon>",
+                        d->codeOffset, d->nUpvalues);
+                }
+            }
+            throw std::runtime_error(buf);
+        }
     }
     (void)forceString;
 }
@@ -1240,6 +1256,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_LIST_CONCAT: {
             Value rhs = pop(vm), lhs = pop(vm);
+            // Force-on-receive: lazy values (Tag::App from mapAttrs/
+            // map/zipAttrsWith, Tag::Thunk from chained AttrSelects)
+            // must be forced before shape-checking.  See WC-35.
+            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                lhs = forceValue(vm, lhs);
+            }
+            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                rhs = forceValue(vm, rhs);
+            }
             if (!lhs.isList() || !rhs.isList())
                 throw std::runtime_error("v3 OP_LIST_CONCAT: not lists");
             uint32_t n = lhs.payload.list->size + rhs.payload.list->size;
@@ -1521,6 +1548,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_SELECT_DYN: {
             Value name = pop(vm), attrs = pop(vm);
+            // Force lazy `name` too — attrs.${dynKey} where dynKey is
+            // `formal.cpu` (now lazy via mapAttrs Tag::App entries) was
+            // landing in OP_ATTRS_SELECT_DYN with name still in App form
+            // and tripping `not a string`.
+            if (name.tag() == Tag::App || name.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                name = forceValue(vm, name);
+            }
             if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
@@ -1548,6 +1583,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_HAS_DYN: {
             Value name = pop(vm), attrs = pop(vm);
+            if (name.tag() == Tag::App || name.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                name = forceValue(vm, name);
+            }
             if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
@@ -1560,6 +1599,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_UPDATE: {
             Value rhs = pop(vm), lhs = pop(vm);
+            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                lhs = forceValue(vm, lhs);
+            }
+            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk) {
+                vm.frames.back().ip = ip;
+                rhs = forceValue(vm, rhs);
+            }
             if (!lhs.isAttrs() || !rhs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_UPDATE: not attrsets");
             Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings);
