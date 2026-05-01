@@ -1505,7 +1505,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Chase Evaluated chains, deref Tag::Slot, and resolve
             // Tag::App deferred calls (used by mapAttrs et al. for
             // lazy entries).
+            //
+            // Same iteration bound as forceValue() to detect
+            // SECD-style indirection cycles (`let x = x; in x` after
+            // the Phase 5 slot-pointer rewrite).  See forceValue
+            // comment for rationale.
+            {
+            constexpr int kMaxOpForceChase = 4096;
+            int forceChaseIters = 0;
             while (true) {
+                if (__builtin_expect(++forceChaseIters > kMaxOpForceChase, 0))
+                    throw std::runtime_error(
+                        "v3 OP_FORCE: infinite recursion (chase cycle through "
+                        "Tag::Slot/Tag::Thunk indirections)");
                 if (v.tag() == Tag::Slot) {
                     Value * p = v.payload.slot;
                     if (!p) throw std::runtime_error(
@@ -1529,6 +1541,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 break;
             }
+            } // end forceChaseIters scope
             if (!v.isThunk()) { push(vm, v); break; }
             Thunk * t = v.payload.thunk;
             if (t->state == ThunkState::Blackhole) {
@@ -2951,10 +2964,25 @@ Value forceValue(VMState & vm, Value v)
     // the thunk chain again).  Without memoization, every withLookup
     // through a Tag::Slot would re-force the underlying thunk.
     Value * memoSlot = nullptr;
+    // Iteration bound: detect infinite chases through Tag::Slot →
+    // Tag::Thunk(Eval=Slot→...) cycles that arise from self-referential
+    // let-rec patterns like `let x = x; in x` or `let x = y; y = x; in x`.
+    // The Black-state check normally catches direct recursion, but
+    // SECD-style indirections (Slot→Eval→Slot) can chase forever
+    // without re-entering the Black thunk.  16 iterations is well
+    // beyond any realistic indirection chain (≤4 in practice for
+    // recref+thunkify+slot+memo) and only fires on pathological
+    // cycles.
+    constexpr int kMaxChaseIters = 4096;
+    int chaseIters = 0;
     // Loop until WHNF: a thunk's body might itself yield a thunk
     // (e.g., `let inherit outer; in outer` returns the outer thunk),
     // and we want to chase the chain until we land on a real value.
     while (true) {
+        if (__builtin_expect(++chaseIters > kMaxChaseIters, 0))
+            throw std::runtime_error(
+                "v3 forceValue: infinite recursion (chase cycle through "
+                "Tag::Slot/Tag::Thunk indirections)");
         // Same call-depth guard — `let x = x; in x` lands here in
         // a C++ recursion via dispatchLoop → forceValue → dispatchLoop
         // and never grows through the bytecode-level OP_CALL/OP_FORCE

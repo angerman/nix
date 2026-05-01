@@ -479,6 +479,32 @@ TESTS=(
      pkgs = fix (extends ext3 (extends ext2 (extends ext1 base)));
    in pkgs.d'
   '23'
+
+  # ----------------------------------------------------------------
+  # Cycle detection negative tests (regression for SECD slot-pointer
+  # path compression that previously broke `let x = x; in x` cycle
+  # detection — see Phase 5 commit a09402f03).  These MUST throw
+  # "infinite recursion" rather than loop forever — the test runner
+  # times them out after a few seconds, then verifies the error
+  # message contains the cycle keyword.
+
+  WC-38-cycle-self-ref
+  "self-referential let must throw infinite recursion (not loop)"
+  'let x = x; in x'
+  '__ERROR__'
+
+  WC-38-cycle-mutual-ref
+  "mutual cycle must throw infinite recursion (not loop)"
+  'let x = y; y = x; in x'
+  '__ERROR__'
+
+  WC-38-cycle-via-with-self
+  "self-cycle through `with self;` must throw, not loop"
+  'let
+     fix = f: let x = f x; in x;
+     pkgs = fix (self: with self; { foo = foo; });
+   in pkgs.foo'
+  '__ERROR__'
 )
 
 pass=0
