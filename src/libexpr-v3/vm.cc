@@ -428,6 +428,25 @@ inline Value withLookup(VMState & vm, SymbolId name, uint32_t /*depth*/)
                 d ? d->codeOffset : 0, fr.ip,
                 (unsigned)fr.flags, (void *)fr.thunk, fr.withStackBase);
         }
+        // V3_DBG_WITH_DISASM=1: also dump each frame's bytecode in a
+        // window around fr.ip in fr.cu (using the frame's actual
+        // executing CU, not the thunk descriptor's codeOffset which
+        // may be stale after OP_TAIL_CALL retargets cu/ip).
+        static const bool s_dbg_disasm =
+            std::getenv("V3_DBG_WITH_DISASM") != nullptr;
+        if (s_dbg_disasm) {
+            for (size_t i = lim; i > 0; --i) {
+                const auto & fr = vm.frames[i - 1];
+                if (!fr.cu) continue;
+                uint32_t fip = fr.ip;
+                uint32_t lo = fip > 32 ? fip - 32 : 0;
+                uint32_t hi = fip + 32;
+                if (hi <= lo) continue;
+                std::fprintf(stderr,
+                    "  frame[%zu] cu-disasm [%u..%u):\n", i - 1, lo, hi);
+                disassembleWindow(stderr, *fr.cu, lo, hi);
+            }
+        }
     }
     throw std::runtime_error(
         "v3 OP_WITH_LOOKUP: name '" + nm + "' not found in with-scope");
@@ -645,6 +664,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_GET_LOCAL_FORCE: {
             // Superinstruction: GET_LOCAL + FORCE.  Push the slot value
             // and apply the FORCE fast path inline.
+            //
+            // WC-38 experiment: NIX_V3_NO_GETFORCE_SUPER=1 turns this
+            // into a plain OP_GET_LOCAL (skip the force).  Used to
+            // identify whether the superinstruction emits forces in
+            // sites where tree-walker would leave the value lazy.
+            static const bool s_skipForce =
+                std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
+            if (s_skipForce) {
+                push(vm, vm.valueStack[stackBase + operand]);
+                break;
+            }
             const Value & v = vm.valueStack[stackBase + operand];
             Tag t = v.tag();
             if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
@@ -683,6 +713,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_GET_UPVALUE_FORCE: {
             if (!closure)
                 throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: no closure context");
+            // See OP_GET_LOCAL_FORCE — same NIX_V3_NO_GETFORCE_SUPER gate.
+            static const bool s_skipForceUv =
+                std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
+            if (s_skipForceUv) {
+                push(vm, closure->upvalues[operand]);
+                break;
+            }
             const Value & v = closure->upvalues[operand];
             Tag t = v.tag();
             if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
