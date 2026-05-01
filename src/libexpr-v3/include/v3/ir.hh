@@ -110,7 +110,12 @@ struct App   { VarId fun; VarId arg; };
 
 /// Force evaluation of a thunk in a strict context.  No-op on already-WHNF
 /// values.
-struct Force { VarId thunk; };
+///
+/// `srcLine` (0 = unknown) records the lower.cc line that synthesised the
+/// node, so the bytecode emitter can populate
+/// `CompilationUnit::forceEmitSites` for `V3_DBG_FORCE_SITE` traces.
+/// Default 0 keeps existing aggregate-init call sites compiling.
+struct Force { VarId thunk; int srcLine = 0; };
 
 /// Construct a deferred computation.  When forced, runs the body block in
 /// the captured environment.

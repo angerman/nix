@@ -26,13 +26,58 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <deque>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
+/// Build a `"lower.cc:NNN"` literal for an arbitrary integer line number
+/// known only at runtime (e.g. one that came in via an ir::Force srcLine
+/// field).  We intern these in a small static pool so the side-table can
+/// hold a stable `const char *` without owning storage on every entry.
+///
+/// The pool deduplicates by line number — the ~14 lower.cc force sites
+/// produce at most ~14 distinct strings across the entire process, so a
+/// linear scan is fine.
+
 namespace nix::v3 {
 
 namespace {
+
+/// Intern a `lower.cc:NNN` string for the given source line number.
+/// Returns a stable `const char *` valid for the process lifetime.
+///
+/// Uses `std::deque` rather than `std::vector` so existing `c_str()`
+/// pointers stored in `CompilationUnit::forceEmitSites` survive any
+/// future appends — `std::vector<std::string>::emplace_back` may
+/// reallocate the buffer and (for SSO-fitting short strings) move
+/// the actual character storage too, invalidating prior `c_str()`s.
+const char * internLowerCcSiteString(int line)
+{
+    // {line -> stable-cstr}.  Linear scan is fine — at most ~16
+    // entries in practice (one per forceVal call site in lower.cc).
+    static std::deque<std::pair<int, std::string>> pool;
+    for (auto & p : pool)
+        if (p.first == line) return p.second.c_str();
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "lower.cc:%d", line);
+    pool.emplace_back(line, std::string(buf));
+    return pool.back().second.c_str();
+}
+
+/// Intern an arbitrary site label (used for emit.cc-internal force
+/// sites that don't originate from lower.cc, such as `ir::With`'s
+/// rec-attrset force or `ir::RecBindingSlotRef`'s pre-force).
+/// Same `std::deque` rationale as above for pointer stability.
+const char * internEmitSiteString(const char * label)
+{
+    static std::deque<std::string> pool;
+    for (auto & s : pool)
+        if (s == label) return s.c_str();
+    pool.emplace_back(label);
+    return pool.back().c_str();
+}
 
 struct Emitter
 {
@@ -107,6 +152,52 @@ struct Emitter
         // Preserve the opcode byte; replace the 24-bit operand.
         Instruction prev = unit.code[at];
         unit.code[at] = (prev & 0xFF000000u) | (target & 0x00FFFFFFu);
+    }
+
+    /// Record `(bytecode-offset, site-string)` for a force-flavoured
+    /// opcode that is about to be appended to `unit.code` at the
+    /// current end-of-stream offset.  Caller passes the site string
+    /// (already interned to a process-stable c-string).  Entries are
+    /// always appended in monotonically increasing offset order.
+    void recordForceSite(const char * site)
+    {
+        uint32_t off = static_cast<uint32_t>(unit.code.size());
+        unit.forceEmitSites.emplace_back(off, site);
+    }
+
+    /// Append OP_FORCE plus a side-table entry for the lower.cc line
+    /// that synthesised the IR Force.  `srcLine == 0` means the IR
+    /// node carried no annotation (e.g., the smoke-test build it
+    /// directly), so we attribute it to "lower.cc:?".
+    void emitForceFromIR(int srcLine)
+    {
+        const char * site = srcLine
+            ? internLowerCcSiteString(srcLine)
+            : internEmitSiteString("lower.cc:?");
+        recordForceSite(site);
+        unit.code.push_back(encode(OP_FORCE));
+    }
+
+    /// Append a fused OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE while
+    /// recording the eventual force back to its lower.cc line.  The
+    /// recorded offset is the offset of the fused superinstruction
+    /// itself — the runtime trace path keys on whichever instruction
+    /// `ip - 1` points at.
+    void emitGetLocalForceFromIR(uint16_t slot, int srcLine)
+    {
+        const char * site = srcLine
+            ? internLowerCcSiteString(srcLine)
+            : internEmitSiteString("lower.cc:?");
+        recordForceSite(site);
+        unit.code.push_back(encode(OP_GET_LOCAL_FORCE, slot));
+    }
+    void emitGetUpvalueForceFromIR(uint16_t idx, int srcLine)
+    {
+        const char * site = srcLine
+            ? internLowerCcSiteString(srcLine)
+            : internEmitSiteString("lower.cc:?");
+        recordForceSite(site);
+        unit.code.push_back(encode(OP_GET_UPVALUE_FORCE, idx));
     }
 
     // Block emit ------------------------------------------------------------
@@ -227,18 +318,24 @@ struct Emitter
         // variable reference in the AST→IR lowering goes through this
         // path, so this is the most common bytecode pair (~25-40% of
         // instructions on benchmarks like fib).
+        //
+        // Each emitted force-flavoured opcode also records a side-
+        // table entry mapping the bytecode offset back to the
+        // lower.cc line that produced this `ir::Force`.  Zero runtime
+        // cost when V3_DBG_FORCE_SITE is unset (the table is read
+        // only by that env-gated trace path in vm.cc).
         if (auto it = ctx->slot.find(e.thunk); it != ctx->slot.end()) {
-            unit.code.push_back(encode(OP_GET_LOCAL_FORCE, it->second));
+            emitGetLocalForceFromIR(it->second, e.srcLine);
             return;
         }
         if (auto uit = ctx->upvalue.find(e.thunk); uit != ctx->upvalue.end()) {
-            unit.code.push_back(encode(OP_GET_UPVALUE_FORCE, uit->second));
+            emitGetUpvalueForceFromIR(uit->second, e.srcLine);
             return;
         }
         // Fallback: var was neither slot nor upvalue (shouldn't happen
         // for a well-formed module; emitVarRef will throw).
         emitVarRef(e.thunk);
-        unit.code.push_back(encode(OP_FORCE));
+        emitForceFromIR(e.srcLine);
     }
 
     // -- Arithmetic / comparison / logical
@@ -375,6 +472,11 @@ struct Emitter
     void emitOne(const ir::RecBindingSlotRef & e)
     {
         emitVarRef(e.attrs);
+        // This is an emit-time literal force (no lower.cc origin).
+        // Record it under the emit.cc line that synthesised it so
+        // V3_DBG_FORCE_SITE traces can still attribute the offset.
+        recordForceSite(internEmitSiteString(
+            "emit.cc:" V3_STRINGIFY(__LINE__)));
         unit.code.push_back(encode(OP_FORCE));
         unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.name));
     }
@@ -506,8 +608,11 @@ struct Emitter
             static const bool s_skipForce =
                 std::getenv("NIX_V3_NO_WITH_FORCE") != nullptr;
             emitVarRef(e.recAttrsVar);
-            if (!s_skipForce)
+            if (!s_skipForce) {
+                recordForceSite(internEmitSiteString(
+                    "emit.cc:" V3_STRINGIFY(__LINE__)));
                 unit.code.push_back(encode(OP_FORCE));
+            }
             unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.recAttrsName));
             unit.code.push_back(encode(OP_WITH_PUSH));
             emittedSlotRef = true;

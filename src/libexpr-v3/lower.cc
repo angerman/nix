@@ -45,6 +45,12 @@ namespace {
     throw std::runtime_error(std::string("v3 lower: unsupported AST node — ") + what);
 }
 
+/// Capture the lower.cc call-site line for every `forceVal(v)` invocation
+/// so the bytecode emitter can populate `CompilationUnit::forceEmitSites`
+/// without each of the ~14 forceVal sites needing to spell out `__LINE__`
+/// explicitly.  See `Lowerer::forceValAt` for the underlying helper.
+#define forceVal(v) forceValAt((v), __LINE__)
+
 /// One frame on the scope stack.  A static-env "level" walks from this
 /// frame toward the back of the stack; "displ" is the position within
 /// the frame.  We mirror nix's bindVars convention: closest enclosing
@@ -248,7 +254,16 @@ struct Lowerer
 
     /// Wrap a VarId in a Force if it might not be in WHNF.  Cheap:
     /// Force on a non-thunk is a no-op at runtime.
-    ir::VarId forceVal(ir::VarId v) { return addBinding(ir::Force{v}); }
+    ///
+    /// `srcLine` records the lower.cc line of the call site so the
+    /// bytecode emitter can attribute the eventual OP_FORCE back to
+    /// its emitter site for `V3_DBG_FORCE_SITE` traces.  Use the
+    /// `forceVal()` macro below at call sites; it captures `__LINE__`
+    /// automatically so individual call sites don't need to pass it.
+    ir::VarId forceValAt(ir::VarId v, int srcLine)
+    {
+        return addBinding(ir::Force{v, srcLine});
+    }
 
     /// True iff `e` is an ExprVar whose level resolves outside any user
     /// scope — i.e., it's a base-env primop reference.
@@ -1457,6 +1472,9 @@ struct Lowerer
         throw std::logic_error("v3 lower: unknown short-circuit kind");
     }
 };
+
+// Scope the forceVal-line-capture macro to this TU only.
+#undef forceVal
 
 } // namespace
 

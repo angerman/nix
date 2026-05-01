@@ -25,7 +25,14 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
+
+/// Stringify-then-paste helper used by EMIT_FORCE_AT below.
+#ifndef V3_STRINGIFY
+#define V3_STRINGIFY_INNER(x) #x
+#define V3_STRINGIFY(x) V3_STRINGIFY_INNER(x)
+#endif
 
 namespace nix::v3 {
 
@@ -227,6 +234,25 @@ struct CompilationUnit
 
     /// Top-level entry offset.
     uint32_t entryOffset = 0;
+
+    /// Force-emit-site side-table.
+    ///
+    /// Maps each emitted force-flavoured opcode (OP_FORCE,
+    /// OP_GET_LOCAL_FORCE, OP_GET_UPVALUE_FORCE) bytecode offset to a
+    /// short string literal naming the emit site
+    /// (e.g. "lower.cc:792" for an `ir::Force` whose annotation came
+    /// from line 792 of lower.cc, or "emit.cc:N" for emit-internal
+    /// forces such as OP_REC_BINDING_SLOT_REF's helper push).
+    ///
+    /// Sorted by ascending bytecode offset (entries are appended in
+    /// emit order, which is monotonically increasing).  Lookup is
+    /// done by `std::lower_bound` from the runtime trace path; in
+    /// the default build this table is read by nothing on the hot
+    /// path so it has zero runtime cost.
+    ///
+    /// The string pointer is a `const char *` to a string literal;
+    /// no ownership / lifetime concerns.
+    std::vector<std::pair<uint32_t, const char *>> forceEmitSites;
 };
 
 } // namespace nix::v3

@@ -56,6 +56,39 @@ inline Value pop(VMState & vm)
 [[gnu::always_inline]]
 inline Value & top(VMState & vm) { return vm.valueStack.back(); }
 
+/// V3_DBG_FORCE_SITE diagnostic: log "OP_FORCE@ip=N site=lower.cc:LINE"
+/// for each force-flavoured opcode dispatched.  Reads the side-table
+/// `cu->forceEmitSites` populated by emit.cc.  The env-var check is
+/// done exactly once (static-once-init) so when the var is unset the
+/// branch predictor will skip this entirely — no runtime cost in the
+/// default build.
+///
+/// `instrIp` is the bytecode offset of the force opcode itself (i.e.
+/// `ip - 1` at the OP_FORCE / OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE
+/// entry, before any further increments).  Lookup is via std::lower_bound
+/// on the (already-sorted) side-table — O(log N) where N is the number
+/// of force emit sites in the CU.
+[[gnu::cold]]
+inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp)
+{
+    static const bool s_enabled = std::getenv("V3_DBG_FORCE_SITE") != nullptr;
+    if (__builtin_expect(!s_enabled, 1)) return;
+    if (!cu) return;
+    const auto & tbl = cu->forceEmitSites;
+    // lower_bound finds the first entry with offset >= instrIp; since
+    // entries are unique per offset the equality case is what we want.
+    auto it = std::lower_bound(
+        tbl.begin(), tbl.end(), instrIp,
+        [](const std::pair<uint32_t, const char *> & e, uint32_t v) {
+            return e.first < v;
+        });
+    const char * site = (it != tbl.end() && it->first == instrIp)
+        ? it->second
+        : "<unknown>";
+    std::fprintf(stderr, "OP_FORCE@ip=%u site=%s\n",
+                 (unsigned)instrIp, site);
+}
+
 [[gnu::always_inline]]
 inline void push(VMState & vm, Value v)
 {
@@ -665,6 +698,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Superinstruction: GET_LOCAL + FORCE.  Push the slot value
             // and apply the FORCE fast path inline.
             //
+            // V3_DBG_FORCE_SITE: trace the lower.cc emit-site that
+            // synthesised this fused force.  See dbgLogForceSite().
+            dbgLogForceSite(cu, ip - 1);
+            //
             // WC-38 experiment: NIX_V3_NO_GETFORCE_SUPER=1 turns this
             // into a plain OP_GET_LOCAL (skip the force).  Used to
             // identify whether the superinstruction emits forces in
@@ -730,6 +767,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_GET_UPVALUE_FORCE: {
             if (!closure)
                 throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: no closure context");
+            // V3_DBG_FORCE_SITE trace; see OP_GET_LOCAL_FORCE.
+            dbgLogForceSite(cu, ip - 1);
             // See OP_GET_LOCAL_FORCE — same NIX_V3_NO_GETFORCE_SUPER gate.
             static const bool s_skipForceUv =
                 std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
@@ -1561,6 +1600,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_FORCE: {
+            // V3_DBG_FORCE_SITE trace; see dbgLogForceSite().
+            dbgLogForceSite(cu, ip - 1);
             // Fast path: peek at the top of the stack.  The vast majority
             // of OP_FORCE calls hit values already in WHNF (Int / Bool /
             // String / Attrs / List / Closure / Path / Null / Float /
