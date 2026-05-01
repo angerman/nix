@@ -69,7 +69,8 @@ inline Value & top(VMState & vm) { return vm.valueStack.back(); }
 /// on the (already-sorted) side-table — O(log N) where N is the number
 /// of force emit sites in the CU.
 [[gnu::cold]]
-inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp)
+inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp,
+                            const Value * forcing = nullptr)
 {
     static const bool s_enabled = std::getenv("V3_DBG_FORCE_SITE") != nullptr;
     if (__builtin_expect(!s_enabled, 1)) return;
@@ -85,6 +86,36 @@ inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp)
     const char * site = (it != tbl.end() && it->first == instrIp)
         ? it->second
         : "<unknown>";
+    // Option-1 enrichment: log the thunk pointer + creation codeOffset
+    // when forcing a Thunk-shape value, so post-processing can trace
+    // back which Nix expression's thunk is being forced.  pkgs.X
+    // thunks created via `inherit (rec {...}) X` have stable codeOffsets
+    // identifiable by name in the disasm.
+    //
+    // Also chase one level through Tag::Slot to surface the underlying
+    // thunk pointer — useful because OP_GET_LOCAL_FORCE on a let-rec
+    // slot reads through Tag::Slot first.
+    const Value * v = forcing;
+    Value chased{};
+    if (v && v->tag() == Tag::Slot && v->payload.slot) {
+        chased = *v->payload.slot;
+        v = &chased;
+    }
+    if (v && v->tag() == Tag::Thunk && v->payload.thunk) {
+        const Thunk * t = v->payload.thunk;
+        uint32_t codeOff = 0;
+        const char * tname = "?";
+        if (t->state == ThunkState::Suspended && t->suspended.desc) {
+            auto * d = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+            codeOff = d->codeOffset;
+            if (!d->name.empty()) tname = d->name.c_str();
+        }
+        std::fprintf(stderr,
+            "OP_FORCE@ip=%u site=%s thunk=%p name=%s codeOff=%u state=%d\n",
+            (unsigned)instrIp, site, (const void *)t, tname,
+            (unsigned)codeOff, (int)t->state);
+        return;
+    }
     std::fprintf(stderr, "OP_FORCE@ip=%u site=%s\n",
                  (unsigned)instrIp, site);
 }
@@ -711,7 +742,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             //
             // V3_DBG_FORCE_SITE: trace the lower.cc emit-site that
             // synthesised this fused force.  See dbgLogForceSite().
-            dbgLogForceSite(cu, ip - 1);
+            dbgLogForceSite(cu, ip - 1, &vm.valueStack[stackBase + operand]);
             //
             // WC-38 experiment: NIX_V3_NO_GETFORCE_SUPER=1 turns this
             // into a plain OP_GET_LOCAL (skip the force).  Used to
@@ -779,7 +810,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (!closure)
                 throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: no closure context");
             // V3_DBG_FORCE_SITE trace; see OP_GET_LOCAL_FORCE.
-            dbgLogForceSite(cu, ip - 1);
+            dbgLogForceSite(cu, ip - 1,
+                operand < closure->nUpvalues ? &closure->upvalues[operand] : nullptr);
             // See OP_GET_LOCAL_FORCE — same NIX_V3_NO_GETFORCE_SUPER gate.
             static const bool s_skipForceUv =
                 std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
@@ -1612,7 +1644,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_FORCE: {
             // V3_DBG_FORCE_SITE trace; see dbgLogForceSite().
-            dbgLogForceSite(cu, ip - 1);
+            dbgLogForceSite(cu, ip - 1,
+                vm.valueStack.empty() ? nullptr : &vm.valueStack.back());
             // Fast path: peek at the top of the stack.  The vast majority
             // of OP_FORCE calls hit values already in WHNF (Int / Bool /
             // String / Attrs / List / Closure / Path / Null / Float /
