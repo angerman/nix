@@ -347,14 +347,32 @@ inline Value withLookup(VMState & vm, SymbolId name, uint32_t /*depth*/)
             void * orig_thunk = w.isThunk() ? (void *)w.payload.thunk : nullptr;
             std::fprintf(stderr, "  with[%zu] tag=%u thunk_ptr=%p",
                 i, (unsigned)w.tag(), orig_thunk);
-            // Chase Evaluated thunk chains to find the underlying attrset.
-            int chase_lim = 5;
-            while (chase_lim-- > 0 && w.isThunk()
-                   && w.payload.thunk->state == ThunkState::Evaluated) {
-                w = w.payload.thunk->evaluated;
-                std::fprintf(stderr, " -> tag=%u", (unsigned)w.tag());
-                if (w.isThunk())
-                    std::fprintf(stderr, "(ptr=%p)", (void *)w.payload.thunk);
+            // Chase Evaluated thunk chains and Tag::Slot derefs to find
+            // the underlying attrset (or pinpoint where the chain
+            // terminates in a Black thunk / non-attrset).
+            int chase_lim = 8;
+            while (chase_lim-- > 0) {
+                if (w.tag() == Tag::Slot) {
+                    Value * p = w.payload.slot;
+                    std::fprintf(stderr, " -> SLOT(%p)", (void*)p);
+                    if (!p) break;
+                    w = *p;
+                    std::fprintf(stderr, "=tag=%u", (unsigned)w.tag());
+                    if (w.isThunk())
+                        std::fprintf(stderr, "(ptr=%p,state=%d)",
+                            (void*)w.payload.thunk, (int)w.payload.thunk->state);
+                    continue;
+                }
+                if (w.isThunk()
+                    && w.payload.thunk->state == ThunkState::Evaluated) {
+                    w = w.payload.thunk->evaluated;
+                    std::fprintf(stderr, " -> tag=%u", (unsigned)w.tag());
+                    if (w.isThunk())
+                        std::fprintf(stderr, "(ptr=%p,state=%d)",
+                            (void *)w.payload.thunk, (int)w.payload.thunk->state);
+                    continue;
+                }
+                break;
             }
             if (w.isAttrs() && w.payload.bindings) {
                 auto * b = w.payload.bindings;

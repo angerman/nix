@@ -496,8 +496,18 @@ struct Emitter
             // Push the rec-attrset value, force it to attrset shape,
             // then OP_REC_BINDING_SLOT_REF looks up the entry and
             // pushes Tag::Slot.
+            //
+            // WC-38 Experiment A: NIX_V3_NO_WITH_FORCE=1 skips the
+            // emit-time OP_FORCE.  OP_REC_BINDING_SLOT_REF still does
+            // its own receive-side force at vm.cc, so functionality
+            // stays correct.  Toggle for A/B testing whether the
+            // emit-time force triggers nixpkgs' callPackages
+            // blackhole.  See emit.cc agent investigation result.
+            static const bool s_skipForce =
+                std::getenv("NIX_V3_NO_WITH_FORCE") != nullptr;
             emitVarRef(e.recAttrsVar);
-            unit.code.push_back(encode(OP_FORCE));
+            if (!s_skipForce)
+                unit.code.push_back(encode(OP_FORCE));
             unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.recAttrsName));
             unit.code.push_back(encode(OP_WITH_PUSH));
             emittedSlotRef = true;
