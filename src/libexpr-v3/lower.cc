@@ -229,10 +229,16 @@ struct Lowerer
 
         funcStack.push_back(fid);
         blockStack.push_back(entry);
-        // Body: RecBindingSlotRef(rec, nm); return.  `rec` becomes a
-        // freeVar of this thunk (computeFreeVars discovers it later).
-        // Returns Tag::Slot rather than the entry's snapshotted Value.
-        ir::VarId selectVar = addBinding(ir::RecBindingSlotRef{rec, nm});
+        // WC-38 Phase 5b A/B gate: NIX_V3_NO_REC_SLOT_REF=1 reverts
+        // the body to ir::AttrSelect (pre-Phase 5 behavior — returns
+        // the entry's Value snapshot, NOT a Tag::Slot pointer).  Used
+        // to A/B test whether Phase 5's slot-pointer + memoization
+        // causes upstream eager-force divergence.
+        static const bool s_noSlotRef =
+            std::getenv("NIX_V3_NO_REC_SLOT_REF") != nullptr;
+        ir::VarId selectVar = s_noSlotRef
+            ? addBinding(ir::AttrSelect{rec, nm})
+            : addBinding(ir::RecBindingSlotRef{rec, nm});
         setReturn(selectVar);
         blockStack.pop_back();
         funcStack.pop_back();
