@@ -1736,6 +1736,29 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         (void*)thunkCu);
                 }
             }
+            // WC-38: V3_DBG_FORCE_TRACE=DEPTH — log every OP_FORCE
+            // pushed at frame-stack depth >= DEPTH.  Used to identify
+            // the eager-force divergence between v3 and tree-walker.
+            // Frame depth filter avoids spam — only deep forces inside
+            // pkgs's body are interesting.
+            {
+                static const char * s_dbg_force_trace =
+                    std::getenv("V3_DBG_FORCE_TRACE");
+                if (s_dbg_force_trace) {
+                    static const size_t depthFilter =
+                        std::atoll(s_dbg_force_trace);
+                    if (vm.frames.size() >= depthFilter) {
+                        std::fprintf(stderr,
+                            "v3 FORCE@d%zu: thunk=%p %s code=[%u..) nUp=%u "
+                            "callerIp=%u\n",
+                            vm.frames.size(),
+                            (void*)t,
+                            !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                            desc->codeOffset, (unsigned)t->nUpvalues,
+                            ip - 1);
+                    }
+                }
+            }
 
             vm.frames.push_back(CallFrame{
                 .cu = thunkCu,
