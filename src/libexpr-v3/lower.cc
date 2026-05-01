@@ -981,8 +981,16 @@ struct Lowerer
     ir::VarId lowerBinOp(AstNode * e, IRNode)
     {
         // Strict binary op: force both operands so the VM ops see WHNF.
-        ir::VarId a = forceVal(lowerExpr(e->e1));
-        ir::VarId b = forceVal(lowerExpr(e->e2));
+        // WC-38 experiment: NIX_V3_NO_BINOP_FORCE=1 skips both forces.
+        // Used to A/B test whether emit-time binop force triggers eager
+        // sub-thunk firing during lib.fix's body (frame trace shows
+        // OpUpdate LHS force at lower.cc:984 fires inner callPackages
+        // thunk).  VM ops should still WHNF at runtime if the gate is
+        // set; this just defers the force.
+        static const bool s_noBinopForce =
+            std::getenv("NIX_V3_NO_BINOP_FORCE") != nullptr;
+        ir::VarId a = s_noBinopForce ? lowerExpr(e->e1) : forceVal(lowerExpr(e->e1));
+        ir::VarId b = s_noBinopForce ? lowerExpr(e->e2) : forceVal(lowerExpr(e->e2));
         IRNode op{a, b};
         return addBinding(op);
     }
