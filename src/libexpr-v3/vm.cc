@@ -33,6 +33,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -105,15 +106,17 @@ inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp,
         const Thunk * t = v->payload.thunk;
         uint32_t codeOff = 0;
         const char * tname = "?";
+        const void * thunkCu = nullptr;
         if (t->state == ThunkState::Suspended && t->suspended.desc) {
             auto * d = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
             codeOff = d->codeOffset;
             if (!d->name.empty()) tname = d->name.c_str();
+            thunkCu = (const void *)t->suspended.cu;
         }
         std::fprintf(stderr,
-            "OP_FORCE@ip=%u site=%s thunk=%p name=%s codeOff=%u state=%d\n",
+            "OP_FORCE@ip=%u site=%s thunk=%p name=%s codeOff=%u state=%d cu=%p caller_cu=%p\n",
             (unsigned)instrIp, site, (const void *)t, tname,
-            (unsigned)codeOff, (int)t->state);
+            (unsigned)codeOff, (int)t->state, thunkCu, (const void *)cu);
         return;
     }
     std::fprintf(stderr, "OP_FORCE@ip=%u site=%s\n",
@@ -498,6 +501,57 @@ inline Value withLookup(VMState & vm, SymbolId name, uint32_t /*depth*/)
         // may be stale after OP_TAIL_CALL retargets cu/ip).
         static const bool s_dbg_disasm =
             std::getenv("V3_DBG_WITH_DISASM") != nullptr;
+        // V3_DUMP_LAMBDAS=1: dump every LambdaDescriptor in EVERY
+        // unique CU on the call stack with codeOffset + name.
+        if (std::getenv("V3_DUMP_LAMBDAS")) {
+            std::set<const CompilationUnit *> seenCus;
+            for (size_t fi = 0; fi < vm.frames.size(); ++fi) {
+                const auto & fr = vm.frames[fi];
+                if (!fr.cu) continue;
+                if (!seenCus.insert(fr.cu).second) continue;
+                std::fprintf(stderr,
+                    "  V3_DUMP_LAMBDAS: cu=%p (%zu entries)\n",
+                    (const void *)fr.cu, fr.cu->lambdas.size());
+                for (size_t li = 0; li < fr.cu->lambdas.size(); ++li) {
+                    const auto & d = fr.cu->lambdas[li];
+                    std::fprintf(stderr,
+                        "    L[%zu] codeOffset=%u nUp=%u name=%s\n",
+                        li, (unsigned)d.codeOffset, (unsigned)d.nUpvalues,
+                        d.name.empty() ? "<anon>" : d.name.c_str());
+                }
+            }
+        }
+        // V3_DUMP_RANGE=START:END dumps bytecode for an arbitrary
+        // range from the failing frame's CU.  Use to inspect thunks
+        // not currently on the stack (e.g., a thunk that returned
+        // through CFF_FORCE_RETRY upstream of the current frame).
+        if (const char * ranges = std::getenv("V3_DUMP_RANGE")) {
+            // Dump the range from EVERY unique CU on the call stack so
+            // we don't miss thunks in CUs other than vm.frames.back().cu
+            // (e.g., when force-chasing across imported files).
+            std::set<const CompilationUnit *> seenCusR;
+            for (size_t fi = 0; fi < vm.frames.size(); ++fi) {
+                const auto & fr = vm.frames[fi];
+                if (!fr.cu) continue;
+                if (!seenCusR.insert(fr.cu).second) continue;
+                std::string s(ranges);
+                size_t pos = 0;
+                while (pos < s.size()) {
+                    size_t comma = s.find(',', pos);
+                    std::string token = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                    size_t colon = token.find(':');
+                    if (colon != std::string::npos) {
+                        uint32_t lo = std::strtoul(token.substr(0, colon).c_str(), nullptr, 0);
+                        uint32_t hi = std::strtoul(token.substr(colon + 1).c_str(), nullptr, 0);
+                        std::fprintf(stderr, "  V3_DUMP_RANGE cu=%p [%u..%u):\n",
+                            (const void *)fr.cu, lo, hi);
+                        disassembleWindow(stderr, *fr.cu, lo, hi);
+                    }
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
+                }
+            }
+        }
         if (s_dbg_disasm) {
             for (size_t i = lim; i > 0; --i) {
                 const auto & fr = vm.frames[i - 1];
