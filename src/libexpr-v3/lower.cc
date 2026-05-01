@@ -207,6 +207,15 @@ struct Lowerer
     /// WC-31: wrap a rec-attrset AttrSelect in a thunk so the select
     /// runs at force time (matching tree-walker's Env-pointer-by-
     /// reference semantics) instead of at MAKE_CLOSURE time.
+    ///
+    /// WC-38 Phase 5: the thunk's body now returns `Tag::Slot`
+    /// (a heap-stable pointer into Bindings::entries[i].value) via
+    /// `ir::RecBindingSlotRef`.  When the thunk is forced and its
+    /// resolved value is consumed by callFunction or `with E;`, the
+    /// slot identity is preserved through the call chain — sub-
+    /// thunks captured-with the slot see the entry's mutated /
+    /// memoized value, fixing the `with self;` blackhole over
+    /// rec-attrset entries that's at the root of WC-38.
     ir::VarId thunkifyRecAttrSelect(ir::VarId rec, ir::SymbolId nm)
     {
         m.functions.emplace_back();
@@ -220,9 +229,10 @@ struct Lowerer
 
         funcStack.push_back(fid);
         blockStack.push_back(entry);
-        // Body: AttrSelect(rec, nm); return.  `rec` becomes a freeVar
-        // of this thunk (computeFreeVars discovers it later).
-        ir::VarId selectVar = addBinding(ir::AttrSelect{rec, nm});
+        // Body: RecBindingSlotRef(rec, nm); return.  `rec` becomes a
+        // freeVar of this thunk (computeFreeVars discovers it later).
+        // Returns Tag::Slot rather than the entry's snapshotted Value.
+        ir::VarId selectVar = addBinding(ir::RecBindingSlotRef{rec, nm});
         setReturn(selectVar);
         blockStack.pop_back();
         funcStack.pop_back();

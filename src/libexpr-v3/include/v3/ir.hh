@@ -126,6 +126,19 @@ struct AttrSelectDyn { VarId attrs; VarId nameVar; };
 struct HasAttr       { VarId attrs; SymbolId name; };
 struct HasAttrDyn    { VarId attrs; VarId nameVar; };
 
+/// SECD-style heap-stable slot reference for a rec-attrset entry.
+/// Lowers to `OP_FORCE` of `attrs` (a Tag::Attrs) followed by
+/// `OP_REC_BINDING_SLOT_REF name` — the result is a Tag::Slot Value
+/// pointing at `Bindings::entries[i].value` (stable as long as the
+/// Bindings is alive).  Used by `thunkifyRecAttrSelect` so that
+/// rec-attrset entry references propagate as slot pointers through
+/// callFunction: when `f x` is called and `x` is a rec entry, the
+/// callee's parameter slot inherits Tag::Slot, and `with self;` over
+/// the parameter sees the entry's mutated/memoized value via the
+/// slot.  This is the WC-38 fix for the `with self;` blackhole in
+/// lib.fix-style patterns.
+struct RecBindingSlotRef { VarId attrs; SymbolId name; };
+
 /// Construct a non-recursive attrset from sorted (name, value) pairs.
 /// `pos` is the AST PosIdx for the attribute *name* token (or 0 = none),
 /// used by `builtins.unsafeGetAttrPos`.
@@ -278,6 +291,7 @@ using Expr = std::variant<
     VarRef, WithLookup,
     Lambda, App, Force, MkThunk,
     AttrSelect, AttrSelectDyn, HasAttr, HasAttrDyn, AttrSet, AttrSetDyn, RecAttrSet,
+    RecBindingSlotRef,
     ListExpr, ConcatLists,
     If, With, Assert,
     ConcatStrings,

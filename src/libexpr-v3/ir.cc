@@ -142,7 +142,8 @@ void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
         } else if constexpr (std::is_same_v<T, Force>) {
             refs.insert(e.thunk);
         } else if constexpr (std::is_same_v<T, AttrSelect> ||
-                             std::is_same_v<T, HasAttr>) {
+                             std::is_same_v<T, HasAttr> ||
+                             std::is_same_v<T, RecBindingSlotRef>) {
             refs.insert(e.attrs);
         } else if constexpr (std::is_same_v<T, AttrSelectDyn> ||
                              std::is_same_v<T, HasAttrDyn>) {

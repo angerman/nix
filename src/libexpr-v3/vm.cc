@@ -629,7 +629,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // and apply the FORCE fast path inline.
             const Value & v = vm.valueStack[stackBase + operand];
             Tag t = v.tag();
-            if (__builtin_expect(t != Tag::Thunk && t != Tag::App, 1)) {
+            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
                 push(vm, v);
                 break;
             }
@@ -667,7 +667,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: no closure context");
             const Value & v = closure->upvalues[operand];
             Tag t = v.tag();
-            if (__builtin_expect(t != Tag::Thunk && t != Tag::App, 1)) {
+            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
                 push(vm, v);
                 break;
             }
@@ -899,7 +899,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // chasing while the outer thunk is still Black trips
             // infinite-recursion).  Cheap on the hot path: one tag
             // check on already-WHNF callables.
-            if (fun.tag() == Tag::App || fun.tag() == Tag::Thunk) {
+            if (fun.tag() == Tag::App || fun.tag() == Tag::Thunk || fun.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 fun = forceValue(vm, fun);
             }
@@ -1477,7 +1477,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
                 bool retry = (caller.flags & CFF_FORCE_RETRY)
                     && (retVal.tag() == Tag::Thunk
-                        || retVal.tag() == Tag::App);
+                        || retVal.tag() == Tag::App
+                        || retVal.tag() == Tag::Slot);
                 // Clear the retry flag — it's a one-shot per
                 // OP_FORCE.  The next OP_FORCE will re-set it.
                 caller.flags &= ~CFF_FORCE_RETRY;
@@ -1709,11 +1710,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Force-on-receive: lazy values (Tag::App from mapAttrs/
             // map/zipAttrsWith, Tag::Thunk from chained AttrSelects)
             // must be forced before shape-checking.  See WC-35.
-            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk) {
+            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk || lhs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 lhs = forceValue(vm, lhs);
             }
-            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk) {
+            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk || rhs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 rhs = forceValue(vm, rhs);
             }
@@ -1940,7 +1941,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // emits an explicit OP_FORCE most of the time, but App/Thunk
             // values can sneak through via OP_RETURN's no-chase
             // semantics.  Cheap on already-forced values.
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
@@ -2154,11 +2155,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // `formal.cpu` (now lazy via mapAttrs Tag::App entries) was
             // landing in OP_ATTRS_SELECT_DYN with name still in App form
             // and tripping `not a string`.
-            if (name.tag() == Tag::App || name.tag() == Tag::Thunk) {
+            if (name.tag() == Tag::App || name.tag() == Tag::Thunk || name.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 name = forceValue(vm, name);
             }
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
@@ -2175,7 +2176,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_HAS: {
             Value attrs = pop(vm);
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
@@ -2185,11 +2186,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_HAS_DYN: {
             Value name = pop(vm), attrs = pop(vm);
-            if (name.tag() == Tag::App || name.tag() == Tag::Thunk) {
+            if (name.tag() == Tag::App || name.tag() == Tag::Thunk || name.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 name = forceValue(vm, name);
             }
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
@@ -2201,11 +2202,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_UPDATE: {
             Value rhs = pop(vm), lhs = pop(vm);
-            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk) {
+            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk || lhs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 lhs = forceValue(vm, lhs);
             }
-            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk) {
+            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk || rhs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 rhs = forceValue(vm, rhs);
             }
@@ -2242,7 +2243,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // on the v3 heap (Alloc::allocBindings), not on the
             // value-stack.
             Value attrs = pop(vm);
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk) {
+            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }

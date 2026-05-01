@@ -368,6 +368,16 @@ struct Emitter
         emitVarRef(e.attrs); emitVarRef(e.nameVar);
         unit.code.push_back(encode(OP_ATTRS_SELECT_DYN));
     }
+    /// SECD-style heap-stable slot reference: push the rec-attrset,
+    /// force it to attrset shape, then push a Tag::Slot Value
+    /// pointing into Bindings::entries[i].value.  See ir.hh +
+    /// vm.cc OP_REC_BINDING_SLOT_REF for rationale.
+    void emitOne(const ir::RecBindingSlotRef & e)
+    {
+        emitVarRef(e.attrs);
+        unit.code.push_back(encode(OP_FORCE));
+        unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.name));
+    }
     void emitOne(const ir::HasAttr & e)
     {
         emitVarRef(e.attrs);

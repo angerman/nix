@@ -584,7 +584,7 @@ void primMap(EvalState & state, Value * args, Value & out)
     // Force the second arg to list shape (so we can read its size /
     // elems), then emit App entries.
     Value lst = args[1];
-    if (lst.tag() == Tag::App || lst.tag() == Tag::Thunk)
+    if (lst.tag() == Tag::App || lst.tag() == Tag::Thunk || lst.tag() == Tag::Slot)
         lst = forceValue(*state.vm, lst);
     if (!lst.isList()) typeError("map", "list");
     auto * src = lst.payload.list;
@@ -661,7 +661,7 @@ void primGenList(EvalState & state, Value * args, Value & out)
     // `App(gen, idx_value)`, lazy.  v3 was eager (callClosure per i).
     // Same root pattern as zipAttrsWith / map.
     Value len = args[1];
-    if (len.tag() == Tag::App || len.tag() == Tag::Thunk)
+    if (len.tag() == Tag::App || len.tag() == Tag::Thunk || len.tag() == Tag::Slot)
         len = forceValue(*state.vm, len);
     if (!len.isInt()) typeError("genList", "int length");
     int64_t n = len.payload.i;
@@ -792,7 +792,7 @@ void primCompareVersions(EvalState &, Value * args, Value & out)
 void primConcatMap(EvalState & state, Value * args, Value & out)
 {
     Value lst = args[1];
-    if (lst.tag() == Tag::App || lst.tag() == Tag::Thunk)
+    if (lst.tag() == Tag::App || lst.tag() == Tag::Thunk || lst.tag() == Tag::Slot)
         lst = forceValue(*state.vm, lst);
     if (!lst.isList()) typeError("concatMap", "list");
     auto * src = lst.payload.list;
