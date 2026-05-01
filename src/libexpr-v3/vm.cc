@@ -677,6 +677,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             const Value & v = vm.valueStack[stackBase + operand];
             Tag t = v.tag();
+            // V3_DBG_GETFORCE_TAG=DEPTH — at frame depth >= N, log
+            // GET_LOCAL_FORCE that finds a Thunk-shape value (would
+            // trigger a force).  Helpful for diagnosing which sites
+            // unexpectedly force-cascade in nixpkgs.
+            {
+                static const char * s_dbg_gflog =
+                    std::getenv("V3_DBG_GETFORCE_TAG");
+                if (s_dbg_gflog && (t == Tag::Thunk || t == Tag::App || t == Tag::Slot)) {
+                    static const size_t depthFilter =
+                        std::atoll(s_dbg_gflog);
+                    if (vm.frames.size() >= depthFilter) {
+                        std::fprintf(stderr,
+                            "v3 GLF@d%zu slot=%u tag=%u ip=%u\n",
+                            vm.frames.size(), operand, (unsigned)t, ip - 1);
+                    }
+                }
+            }
             if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
                 push(vm, v);
                 break;

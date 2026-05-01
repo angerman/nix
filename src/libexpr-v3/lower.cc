@@ -788,13 +788,23 @@ struct Lowerer
         // non-trivial expression in a thunk so that side-effects /
         // errors only fire if the callee actually forces the arg.
         ir::VarId f = forceVal(lowerExpr(e->fun));
+        // WC-38 experiment: NIX_V3_NO_INTER_ARG_FORCE=1 skips the
+        // forceVal between curried args.  Tree-walker's callFunction
+        // doesn't force between args — for `f x y z`, callFunction
+        // loops and the lambda body returns a Lambda Value (or
+        // PrimOpApp), neither of which needs forcing for the next App.
+        // v3's emit-time force here may be over-eager and trigger
+        // sub-thunk evaluation in nixpkgs' deeply-curried call chains
+        // (callPackageWith / makeOverridable).
+        static const bool s_noInterArgForce =
+            std::getenv("NIX_V3_NO_INTER_ARG_FORCE") != nullptr;
         for (auto * a : *e->args) {
             ir::VarId av = thunkifyForArg(a);
             f = addBinding(ir::App{f, av});
             // After this App, the result might be a closure (curried)
             // or the applied value.  Force before the next App so the
             // chain calls a real closure each step.
-            if (a != e->args->back())
+            if (!s_noInterArgForce && a != e->args->back())
                 f = forceVal(f);
         }
         return f;
