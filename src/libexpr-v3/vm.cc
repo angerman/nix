@@ -542,7 +542,19 @@ namespace {
 /// so a sub-thunk reading the intermediate is reading a valid
 /// snapshot.
 ///
-/// Gated behind `NIX_V3_EARLY_PUBLISH=1`.  Default off until validated.
+/// Gated behind `NIX_V3_EARLY_PUBLISH=1`.  Default off; verified
+/// non-functional for nixpkgs WC-38 and DAMAGING (corrupts slot
+/// targets with intermediate values).  Kept as scaffolding only.
+///
+/// Option 2 from the multi-agent synthesis (publish-to-all variant)
+/// was tested and rejected: writing intermediate ExprAttrs values to
+/// every Black CFF_THUNK_RETURN frame's thunk wrote tiny intermediate
+/// attrsets like `{prev=...}` into the lib.fix slot, replacing the
+/// thunk-being-forced with a wrong-typed value.  Each thunk has its
+/// OWN final value; without per-thunk destination tracking (which
+/// tree-walker has via stack-local `vCur`), v3 cannot safely publish
+/// intermediate values.  Outermost-only and publish-to-all both
+/// corrupt nixpkgs.
 inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
 {
     static const bool s_enabled =
@@ -553,16 +565,15 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
     if (t == Tag::Thunk || t == Tag::App || t == Tag::Blackhole) return;
     static const bool s_dbg =
         std::getenv("NIX_V3_EARLY_PUBLISH_DBG") != nullptr;
-    // Walk from bottom up.  Find the OUTERMOST CFF_THUNK_RETURN frame
-    // whose thunk is Black.  This is the frame whose captured-with
-    // entries (`with self;`) sub-thunks may be racing against.
+    static const bool s_publishAll =
+        std::getenv("NIX_V3_EARLY_PUBLISH_ALL") != nullptr;
+    // Default: outermost-only.  Set NIX_V3_EARLY_PUBLISH_ALL=1 for
+    // publish-to-every-Black-thunk variant (also broken on nixpkgs).
     for (size_t i = 0; i < vm.frames.size(); ++i) {
         CallFrame & fr = vm.frames[i];
         if (!(fr.flags & CFF_THUNK_RETURN)) continue;
         if (!fr.thunk) continue;
         if (fr.thunk->state != ThunkState::Blackhole) continue;
-        // Publish to outermost Black thunk.  Idempotent — OP_RETURN
-        // of this thunk frame will overwrite with the final retVal.
         if (s_dbg) {
             const char * tagName = "?";
             uint32_t nKeys = 0;
@@ -582,7 +593,7 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
         }
         fr.thunk->state = ThunkState::Evaluated;
         fr.thunk->evaluated = v;
-        return;
+        if (!s_publishAll) return;
     }
 }
 
