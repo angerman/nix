@@ -107,6 +107,18 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             Env * env = v.thunk().env;
             assert(env || v.isBlackhole());
             Expr * expr = v.thunk().expr;
+            // WC-38 diag: TW_DBG_FORCE=1 logs each forced thunk by Expr*
+            // pointer + source position.  Pair with v3's V3_DBG_FORCE_SITE
+            // to find the FIRST force present in v3 but absent in tree-
+            // walker.  Cold path; static-once-init keeps default cost zero.
+            {
+                static const bool s_twdbg = std::getenv("TW_DBG_FORCE") != nullptr;
+                if (__builtin_expect(s_twdbg, 0)) {
+                    std::fprintf(stderr,
+                        "tw FORCE: expr=%p v=%p\n",
+                        (const void *)expr, (void *)&v);
+                }
+            }
             try {
                 v.mkBlackhole();
                 if (env) [[likely]] {
