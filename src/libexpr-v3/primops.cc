@@ -2740,17 +2740,6 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 GC_add_roots(&lazyListPrim, &lazyListPrim + 1);
 #endif
             }
-            // WC-38 Phase 13: paranoid check — verify lazyListPrim is
-            // still a PrimOp at use time.
-            if (!lazyListPrim->isPrimOp()) {
-                std::fprintf(stderr,
-                    "v3ToTreeWalker: lazyListPrim NOT PrimOp at use! "
-                    "ptr=%p type=%d\n",
-                    (void*)lazyListPrim, (int)lazyListPrim->type());
-                ns.error<nix::EvalError>(
-                    "v3 bridge: lazyListPrim corrupted (type=%1%)",
-                    (int)lazyListPrim->type()).debugThrow();
-            }
             auto & tbl = v3BridgeLists();
             size_t handle = tbl.size();
             tbl.push_back({v, tlBridgeFallbackExpr});
@@ -2834,17 +2823,6 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 GC_add_roots(&lazyAttrPrim, &lazyAttrPrim + 1);
 #endif
             }
-            // WC-38 Phase 13: paranoid check — verify lazyAttrPrim is
-            // still a PrimOp at use time.
-            if (!lazyAttrPrim->isPrimOp()) {
-                std::fprintf(stderr,
-                    "v3ToTreeWalker: lazyAttrPrim NOT PrimOp at use! "
-                    "ptr=%p type=%d\n",
-                    (void*)lazyAttrPrim, (int)lazyAttrPrim->type());
-                ns.error<nix::EvalError>(
-                    "v3 bridge: lazyAttrPrim corrupted (type=%1%)",
-                    (int)lazyAttrPrim->type()).debugThrow();
-            }
             auto & tbl = v3BridgeAttrs();
             size_t handle = tbl.size();
             tbl.push_back({v, tlBridgeFallbackExpr});
@@ -2925,20 +2903,6 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         tbl.push_back({v, tlBridgeFallbackExpr});
         nix::Value * vHandle = ns.allocValue();
         vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
-        // WC-38 Phase 13: paranoid runtime check — verify bridgePrimOp1
-        // is still a PrimOp at the moment we wrap it.  If GC corruption
-        // or dylib-data-segment issues clobbered it, throw a structured
-        // error rather than a downstream assertion failure that's hard
-        // to attribute.
-        if (!bridgePrimOp1->isPrimOp()) {
-            std::fprintf(stderr,
-                "v3ToTreeWalker: bridgePrimOp1 NOT PrimOp at use! "
-                "ptr=%p type=%d\n",
-                (void*)bridgePrimOp1, (int)bridgePrimOp1->type());
-            ns.error<nix::EvalError>(
-                "v3 bridge: bridgePrimOp1 corrupted (type=%1%)",
-                (int)bridgePrimOp1->type()).debugThrow();
-        }
         out->mkPrimOpApp(bridgePrimOp1, vHandle);
         break;
     }
