@@ -623,6 +623,62 @@ TESTS=(
      pkgs = lib.fix toFix;
    in builtins.typeOf pkgs.callPackages'
   '"lambda"'
+
+  # ----------------------------------------------------------------
+  # WC-38 ROOT CAUSE: dynamic-attr-key VALUE eager-evaluation bug
+  # Commit: <pending>
+  # File:line: src/libexpr-v3/lower.cc:1084
+  #
+  # Pre-fix symptom:
+  #   v3 lowered the value expression of `{ "${name}" = expr; }` (non-rec
+  #   attrset with dynamic key) EAGERLY via lowerExpr, while:
+  #     - the rec+dyn branch (line 1047) used thunkifyForAttr;
+  #     - the static-attr non-rec branch (line 1075/1097) used thunkifyForAttr;
+  #     - tree-walker's `attrs->maybeThunk(state, env)` defers values.
+  #   This caused dynamic-key attrset entries to fully evaluate their RHS
+  #   expression at attrset-construction time, instead of lazily on access.
+  #
+  # Real-world impact:
+  #   nixpkgs darwin/stdenv stage1 overrides has
+  #     `"llvmPackages_${llvmVersion}" = overrideLlvmPackagesScope ...;`
+  #   which fully invoked makeOverridable's body (running mirrorArgs /
+  #   recoverMetadata / decorate let-bindings strictly) DURING fix's
+  #   body, chaining into the inner `callPackages ../llvm { }` thunk
+  #   while pkgs (= lib.fix x slot) was still Black.
+  #
+  # The fix: change line 1084 from `lowerExpr(da.valueExpr)` to
+  # `thunkifyForAttr(da.valueExpr)` — matching all the sibling code
+  # paths.  3-byte change, fixes WC-38.
+  # ----------------------------------------------------------------
+  WC-38-dyn-attr-value-laziness-throw
+  "dynamic-attr value with throw is lazy: not forced unless accessed"
+  'let r = { "key_${"x"}" = throw "should not fire"; other = 1; }; in r.other'
+  '1'
+
+  WC-38-dyn-attr-value-laziness-conditional
+  "dynamic-attr value evaluates only on access"
+  'let r = { "key_${"x"}" = 1 + 2 + 3; }; in r."key_x"'
+  '6'
+
+  WC-38-dyn-attr-value-deferred-call
+  "dynamic-attr value containing a function call is lazy"
+  'let f = x: throw "fn fired"; r = { "k_${"a"}" = f 1; v = 42; }; in r.v'
+  '42'
+
+  WC-38-dyn-attr-value-mixed-static-dyn
+  "dynamic-attr in attrset with static siblings: dyn value still lazy"
+  'let r = { static_a = 1; "dyn_${"b"}" = throw "lazy"; static_c = 3; }; in r.static_a + r.static_c'
+  '4'
+
+  WC-38-dyn-attr-value-makeOverridable-shape
+  "lib.makeOverridable-shaped value under dynamic key is lazy"
+  'let
+     fakeOverridable = f: let
+       inner = arg: f arg;
+     in inner;
+     r = { "wrapped_${"id"}" = fakeOverridable (x: x); other = 99; };
+   in r.other'
+  '99'
 )
 
 pass=0

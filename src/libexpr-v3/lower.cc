@@ -1081,7 +1081,24 @@ struct Lowerer
                 // Dynamic-name expression must evaluate to a string —
                 // strict context, force.
                 ir::VarId nameV = forceVal(lowerExpr(da.nameExpr));
-                ir::VarId valV  = lowerExpr(da.valueExpr);
+                // WC-38 ROOT CAUSE: dynamic-attr VALUES must be lazy
+                // (thunkified), matching:
+                //   - the rec+dyn branch above (line 1047), which uses
+                //     thunkifyForAttr;
+                //   - the static-attr non-rec branch (line 1075/1097);
+                //   - tree-walker's `attrs->maybeThunk(state, env)` for
+                //     ExprAttrs values.
+                // Pre-fix bug: v3 lowered the value eagerly via
+                // lowerExpr, so `{ "${var}" = SOME_CALL; }` would fully
+                // evaluate SOME_CALL during attrset construction.  In
+                // nixpkgs darwin/default.nix:420 the value is
+                // `overrideLlvmPackagesScope super."llvmPackages_${llvmVersion}" cb`
+                // — a function call to lib.makeOverridable that runs
+                // its let-bindings (mirrorArgs / decorate /
+                // recoverMetadata) eagerly, chaining through to the
+                // inner `callPackages ../llvm { }` thunk while pkgs
+                // (= lib.fix x) is still Black.
+                ir::VarId valV  = thunkifyForAttr(da.valueExpr);
                 dyn.dynamics.push_back({nameV, valV, posIdxToHandle(da.pos)});
             }
             if (pushedInheritFrom) inheritFromStack.pop_back();
