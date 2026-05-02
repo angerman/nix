@@ -154,7 +154,15 @@ public:
     /// 1 MB blocks: large enough that a single block holds many
     /// thousands of typical allocations, small enough that a
     /// long-running eval doesn't hold onto huge unused tails.
-    static constexpr size_t kBlockSize = 1 << 20;
+    /// 16 MB block size keeps Boehm's GC_add_roots root-region count
+    /// low for nixpkgs-scale evaluations: each 1MB block was registered
+    /// as its own root region, so a 4GB arena → 4k+ regions, exceeding
+    /// Boehm's MAX_ROOTS limit (`Too many root sets`).  16MB blocks
+    /// drop the count 16x, putting full nixpkgs evals back under the
+    /// Boehm cap.  Cost: a 16MB minimum allocation per thread on first
+    /// arena use, vs. 1MB before — accepted because the arena is the
+    /// hot allocation path.
+    static constexpr size_t kBlockSize = 16 * (1 << 20);
     /// Direct-`malloc` cutoff.  Anything bigger gets its own
     /// allocation rather than pinning down the rest of a fresh
     /// block.
