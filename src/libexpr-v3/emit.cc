@@ -28,6 +28,7 @@
 #include <cassert>
 #include <cstdio>
 #include <deque>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -178,6 +179,36 @@ struct Emitter
         unit.code.push_back(encode(OP_FORCE));
     }
 
+    /// Check if `srcLine` is in the per-line force-skip list.  If
+    /// `NIX_V3_SKIP_FORCE_LINES=305,805,984` is set, forceVal calls
+    /// emitted from those lower.cc lines compile to non-forcing
+    /// loads (OP_GET_LOCAL / OP_GET_UPVALUE) — used to bisect which
+    /// emit-site causes WC-38 without breaking other lang tests.
+    static bool skipForceAtLine(int srcLine)
+    {
+        if (srcLine == 0) return false;
+        static const auto & skipSet = []() -> const std::set<int> & {
+            static std::set<int> s;
+            const char * env = std::getenv("NIX_V3_SKIP_FORCE_LINES");
+            if (env) {
+                std::string str(env);
+                size_t pos = 0;
+                while (pos < str.size()) {
+                    size_t comma = str.find(',', pos);
+                    std::string tok = str.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                    if (!tok.empty()) {
+                        int n = std::atoi(tok.c_str());
+                        if (n > 0) s.insert(n);
+                    }
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
+                }
+            }
+            return s;
+        }();
+        return skipSet.count(srcLine) > 0;
+    }
+
     /// Append a fused OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE while
     /// recording the eventual force back to its lower.cc line.  The
     /// recorded offset is the offset of the fused superinstruction
@@ -189,7 +220,12 @@ struct Emitter
             ? internLowerCcSiteString(srcLine)
             : internEmitSiteString("lower.cc:?");
         recordForceSite(site);
-        unit.code.push_back(encode(OP_GET_LOCAL_FORCE, slot));
+        // WC-38 bisection: NIX_V3_SKIP_FORCE_LINES=N1,N2,... compiles
+        // forces at those lower.cc lines as non-forcing loads.
+        if (skipForceAtLine(srcLine))
+            unit.code.push_back(encode(OP_GET_LOCAL, slot));
+        else
+            unit.code.push_back(encode(OP_GET_LOCAL_FORCE, slot));
     }
     void emitGetUpvalueForceFromIR(uint16_t idx, int srcLine)
     {
@@ -197,7 +233,10 @@ struct Emitter
             ? internLowerCcSiteString(srcLine)
             : internEmitSiteString("lower.cc:?");
         recordForceSite(site);
-        unit.code.push_back(encode(OP_GET_UPVALUE_FORCE, idx));
+        if (skipForceAtLine(srcLine))
+            unit.code.push_back(encode(OP_GET_UPVALUE, idx));
+        else
+            unit.code.push_back(encode(OP_GET_UPVALUE_FORCE, idx));
     }
 
     // Block emit ------------------------------------------------------------

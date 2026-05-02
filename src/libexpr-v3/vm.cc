@@ -2991,6 +2991,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value args[8];
             if (nArgs > 8) throw std::runtime_error("v3 OP_CALL_PRIMOP: arity > 8 not supported");
             for (uint32_t i = nArgs; i > 0; --i) args[i - 1] = pop(vm);
+            // WC-38 fix: force non-lazy strict args at runtime via
+            // the C-recursive forceValue helper.  This replaced the
+            // compile-time force at lower.cc:787 (`forceVal(lowerExpr
+            // (*it))`), which emitted inline OP_GET_LOCAL_FORCE / OP_
+            // GET_UPVALUE_FORCE / OP_FORCE in the calling bytecode
+            // stream.  The bytecode-level force fired thunk frames
+            // inside the caller's CFF_FORCE_RETRY chain — driving
+            // sub-thunk evaluation deeper than tree-walker's
+            // recursive C-stack — and during nixpkgs's `lib.fix x`
+            // body it fired the inner `callPackages ../llvm { }`
+            // thunk while pkgs (lib.fix x slot) was still Black.
+            //
+            // The C-recursive forceValue does NOT set CFF_FORCE_
+            // RETRY, so each Suspended thunk fully resolves (and
+            // becomes Evaluated) BEFORE the next runs — matching
+            // tree-walker's call-stack semantics exactly.
+            //
+            // `po->lazyArgs` bit i set ⇒ arg i is passed lazily;
+            // primops with lazy args (tryEval, foldl', seq, deepSeq,
+            // addErrorContext) force inside their bodies inside any
+            // try/catch they need.  Mirrors OP_CALL's primop branch
+            // at vm.cc:1155-1158 (which handles PrimOpApp partial-
+            // application chains).
+            for (uint32_t i = 0; i < nArgs; ++i) {
+                if (po->lazyArgs & (1u << i)) continue;
+                args[i] = forceValue(vm, args[i]);
+            }
             // Save current frame state in case the primop calls back
             // into the VM via callClosure().
             vm.frames.back().ip = ip;

@@ -5636,7 +5636,7 @@ void registerBuiltinPrimOps()
         // Higher-order callback primops (re-enter the VM via callClosure).
         registerPrimOp({"map",                2, primMap});
         registerPrimOp({"filter",             2, primFilter});
-        registerPrimOp({"foldl'",             3, primFoldl});
+        registerPrimOp({"foldl'",             3, primFoldl, /*lazyArgs=*/0b010});
         registerPrimOp({"genList",            2, primGenList});
         registerPrimOp({"all",                2, primAll});
         registerPrimOp({"any",                2, primAny});
@@ -5654,8 +5654,8 @@ void registerBuiltinPrimOps()
         registerPrimOp({"catAttrs",           2, primCatAttrs});
         registerPrimOp({"replaceStrings",     3, primReplaceStrings});
         registerPrimOp({"abort",              1, primAbort});
-        registerPrimOp({"seq",                2, primSeq});
-        registerPrimOp({"deepSeq",            2, primDeepSeq});
+        registerPrimOp({"seq",                2, primSeq,     /*lazyArgs=*/0b10});
+        registerPrimOp({"deepSeq",            2, primDeepSeq, /*lazyArgs=*/0b10});
         registerPrimOp({"trace",              2, primTrace});
         registerPrimOp({"traceVerbose",       2, primTraceVerbose});
         registerPrimOp({"zipAttrsWith",       2, primZipAttrsWith});
@@ -5668,7 +5668,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"unsafeDiscardOutputDependency",   1, primUnsafeDiscardOutputDependency});
         registerPrimOp({"appendContext",      2, primAppendContext});
         registerPrimOp({"addDrvOutputDependencies",  1, primAddDrvOutputDependencies});
-        registerPrimOp({"tryEval",            1, primTryEval});
+        registerPrimOp({"tryEval",            1, primTryEval, /*lazyArgs=*/0b1});
         registerPrimOp({"baseNameOf",         1, primBaseNameOf});
         registerPrimOp({"dirOf",              1, primDirOf});
         registerPrimOp({"pathExists",         1, primPathExists});

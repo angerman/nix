@@ -741,50 +741,36 @@ struct Lowerer
                 }
             }
 
-            // Per-primop laziness rules: which positional arg indices
-            // should be passed as thunks (or left lazy without forcing)
-            // instead of force-evaluated up-front.
+            // Per-primop laziness rules are encoded uniformly in the
+            // `po->lazyArgs` bitmask (bit i set ⇒ arg i passed lazily).
+            // tryEval=0b1, foldl'=0b010, seq=0b10, deepSeq=0b10,
+            // addErrorContext=0b10.  This mirrors tree-walker's per-
+            // primop lazy-arg semantics.
             //
-            //  - `tryEval x` — x is the whole point of the primop; wrap
-            //    in a thunk so an error during forcing is caught.
-            //  - `foldl' op nul list` — `nul` is not strict; tree-walker
-            //    documents that explicitly.  Pass it lazy so a `throw`
-            //    that the operator never demands doesn't fire.
-            //  - `seq a b` / `deepSeq a b` — `b` is returned untouched;
-            //    only `a` gets forced.
-            const bool isTryEval = name == "tryEval";
-            auto isLazyArg = [&](uint32_t idx) -> bool {
-                if (name == "foldl'") return idx == 1;     // nul
-                if (name == "seq" || name == "deepSeq") return idx == 1;
-                // addErrorContext's second arg is the "wrapped value" —
-                // tree-walker forces it inside the primop's try/catch
-                // so the wrapper can attach context to any error.  v3
-                // currently has no try/catch in primAddErrorContext (it
-                // just returns args[1]), but matching tree-walker's
-                // pre-force semantics here is what nixpkgs relies on:
-                // `config = addErrorContext "..." config` (modules.nix:270)
-                // captures the rec-sibling `config` in a thunk, which
-                // must NOT be eagerly forced at attrset-build time
-                // (would deadlock against the rec attrset that's still
-                // being constructed).  Tree-walker avoids this because
-                // its primop call doesn't pre-force args.
-                if (name == "addErrorContext") return idx == 1;
-                return false;
-            };
+            // Strict (non-lazy) args are NOT compile-time-forced here
+            // — they're passed through to OP_CALL_PRIMOP which forces
+            // them at runtime via the C-recursive forceValue helper.
+            // The C-helper does NOT set CFF_FORCE_RETRY, so it doesn't
+            // chain-push thunks the way OP_FORCE bytecode does — each
+            // thunk fully resolves before the next runs.  This was the
+            // WC-38 fix: compile-time force at this site fired inner
+            // sub-thunks during `lib.fix x`'s body via the bytecode
+            // chain while x was still Black.
 
             std::vector<ir::VarId> args;
             args.reserve(po->arity);
             auto it = e->args->begin();
             for (uint32_t i = 0; i < po->arity; ++i, ++it) {
-                if (isTryEval) {
-                    args.push_back(thunkify(*it));
-                } else if (isLazyArg(i)) {
-                    // Lazy: lower without forcing, and wrap non-trivial
-                    // expressions in a thunk so the primop sees a
-                    // proper lazy value (callers may pass `throw` etc).
+                if (po->lazyArgs & (1u << i)) {
+                    // Lazy: wrap non-trivial expressions in a thunk so
+                    // the primop sees a proper lazy value (callers may
+                    // pass `throw` etc that should only fire if the
+                    // primop actually demands the arg).
                     args.push_back(thunkifyForAttr(*it));
                 } else {
-                    args.push_back(forceVal(lowerExpr(*it)));
+                    // Strict: pass-through; OP_CALL_PRIMOP forces at
+                    // runtime via the C-recursive forceValue helper.
+                    args.push_back(lowerExpr(*it));
                 }
             }
             ir::VarId result = addBinding(ir::PrimOpCall{po, std::move(args)});
