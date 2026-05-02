@@ -114,9 +114,24 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             {
                 static const bool s_twdbg = std::getenv("TW_DBG_FORCE") != nullptr;
                 if (__builtin_expect(s_twdbg, 0)) {
-                    std::fprintf(stderr,
-                        "tw FORCE: expr=%p v=%p\n",
-                        (const void *)expr, (void *)&v);
+                    auto p = expr->getPos();
+                    const char * tag = v.isBlackhole() ? "BLACK" : "FORCE";
+                    if (p) {
+                        try {
+                            auto pos = positions[p];
+                            std::string srcFile;
+                            if (auto * sp = std::get_if<nix::SourcePath>(&pos.origin))
+                                srcFile = sp->path.abs();
+                            std::fprintf(stderr,
+                                "tw %s: %s:%u:%u env=%p\n",
+                                tag, srcFile.c_str(), pos.line, pos.column,
+                                (void *)env);
+                        } catch (...) {
+                            std::fprintf(stderr, "tw %s: <?pos>\n", tag);
+                        }
+                    } else {
+                        std::fprintf(stderr, "tw %s: <?nopos>\n", tag);
+                    }
                 }
             }
             try {
