@@ -1230,24 +1230,46 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // ellipsis, every key in the param attrset must match a
             // declared formal name.  Tree-walker raises with the offending
             // attribute name; we mirror that message format.
-            if (desc->hasFormals && !desc->ellipsis) {
-                Value forcedArg = forceValue(vm, arg);
-                if (forcedArg.isAttrs() && forcedArg.payload.bindings) {
-                    const Bindings * b = forcedArg.payload.bindings;
-                    for (uint32_t i = 0; i < b->size; ++i) {
-                        SymbolId name = b->entries[i].name;
-                        bool found = false;
-                        for (auto & f : desc->formals)
-                            if (f.name == name) { found = true; break; }
-                        if (!found) {
-                            const auto & tbl = ir::globalSymbolTable();
-                            std::string nm = (name < tbl.size()) ? tbl[name] : "?";
-                            throw std::runtime_error("v3 OP_CALL: function "
-                                "called with unexpected argument '" + nm + "'");
+            //
+            // WC-38: tree-walker forces the arg attrset ALWAYS when the
+            // callee has formals (eval.cc state.callFunction calls
+            // forceAttrs on arg regardless of ellipsis).  v3 originally
+            // skipped this when ellipsis is set, leaving the force to
+            // each per-formal thunk (lower.cc:619-652).  This means
+            // formal access in the body forces the arg once per access
+            // — and crucially, *defers* the force until body execution.
+            // For nixpkgs's chain `arg = autoArgs // userArgs` where
+            // autoArgs = `intersectAttrs (functionArgs f) pkgs`, the
+            // deferred force fires while pkgs (= lib.fix slot) is still
+            // Black, causing the WC-38 `with`-lookup miss.
+            //
+            // NIX_V3_EAGER_ARG_FORCE=1 enables tree-walker semantics:
+            // force the arg attrset at call time.  Default off until
+            // validated against full lang + wc-laziness suites.
+            if (desc->hasFormals) {
+                static const bool s_eagerArgForce =
+                    std::getenv("NIX_V3_EAGER_ARG_FORCE") != nullptr;
+                bool needForce = !desc->ellipsis || s_eagerArgForce;
+                if (needForce) {
+                    Value forcedArg = forceValue(vm, arg);
+                    if (!desc->ellipsis && forcedArg.isAttrs() && forcedArg.payload.bindings) {
+                        // Validation: no extra args for non-ellipsis lambdas.
+                        const Bindings * b = forcedArg.payload.bindings;
+                        for (uint32_t i = 0; i < b->size; ++i) {
+                            SymbolId name = b->entries[i].name;
+                            bool found = false;
+                            for (auto & f : desc->formals)
+                                if (f.name == name) { found = true; break; }
+                            if (!found) {
+                                const auto & tbl = ir::globalSymbolTable();
+                                std::string nm = (name < tbl.size()) ? tbl[name] : "?";
+                                throw std::runtime_error("v3 OP_CALL: function "
+                                    "called with unexpected argument '" + nm + "'");
+                            }
                         }
                     }
+                    arg = forcedArg;
                 }
-                arg = forcedArg;
             }
 
             // Max call-depth check — guards `(x: x x) (x: x x)` and
@@ -1321,25 +1343,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             const LambdaDescriptor * tcDesc = tcCallee->desc;
             const CompilationUnit * tcCalleeCu = tcCallee->cu ? tcCallee->cu : cu;
 
-            // Same formals validation OP_CALL does.
-            if (tcDesc->hasFormals && !tcDesc->ellipsis) {
-                Value forcedArg = forceValue(vm, arg);
-                if (forcedArg.isAttrs() && forcedArg.payload.bindings) {
-                    const Bindings * b = forcedArg.payload.bindings;
-                    for (uint32_t i = 0; i < b->size; ++i) {
-                        SymbolId name = b->entries[i].name;
-                        bool found = false;
-                        for (auto & f : tcDesc->formals)
-                            if (f.name == name) { found = true; break; }
-                        if (!found) {
-                            const auto & tbl = ir::globalSymbolTable();
-                            std::string nm = (name < tbl.size()) ? tbl[name] : "?";
-                            throw std::runtime_error("v3 OP_TAIL_CALL: function "
-                                "called with unexpected argument '" + nm + "'");
+            // Same eager-arg-force as OP_CALL — see WC-38 explanation above.
+            if (tcDesc->hasFormals) {
+                static const bool s_eagerArgForce =
+                    std::getenv("NIX_V3_EAGER_ARG_FORCE") != nullptr;
+                bool needForce = !tcDesc->ellipsis || s_eagerArgForce;
+                if (needForce) {
+                    Value forcedArg = forceValue(vm, arg);
+                    if (!tcDesc->ellipsis && forcedArg.isAttrs() && forcedArg.payload.bindings) {
+                        const Bindings * b = forcedArg.payload.bindings;
+                        for (uint32_t i = 0; i < b->size; ++i) {
+                            SymbolId name = b->entries[i].name;
+                            bool found = false;
+                            for (auto & f : tcDesc->formals)
+                                if (f.name == name) { found = true; break; }
+                            if (!found) {
+                                const auto & tbl = ir::globalSymbolTable();
+                                std::string nm = (name < tbl.size()) ? tbl[name] : "?";
+                                throw std::runtime_error("v3 OP_TAIL_CALL: function "
+                                    "called with unexpected argument '" + nm + "'");
+                            }
                         }
                     }
+                    arg = forcedArg;
                 }
-                arg = forcedArg;
             }
 
             // Reuse the current frame: shrink valueStack down to our
