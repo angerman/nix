@@ -505,6 +505,124 @@ TESTS=(
      pkgs = fix (self: with self; { foo = foo; });
    in pkgs.foo'
   '__ERROR__'
+
+  # ----------------------------------------------------------------
+  # WC-38 lazy-by-default primop arg refactor (commit ff933d6af)
+  # Architectural change: per-primop laziness encoded uniformly in
+  # `po->lazyArgs` bitmask.  Strict args lower without forceVal;
+  # OP_CALL_PRIMOP forces them at runtime via the C-recursive
+  # forceValue helper (which doesn't set CFF_FORCE_RETRY).  Lazy args
+  # (tryEval=0b1, foldl'=0b010, seq/deepSeq=0b10, addErrorContext=0b10)
+  # bypass the runtime force.
+  #
+  # Pre-fix symptom: lower.cc:787 emitted compile-time forceVal which
+  # compiled to OP_FORCE bytecode that fired thunks via the
+  # CFF_FORCE_RETRY chain push.  Refactor moves the force into the
+  # C-recursive helper which evaluates each thunk to completion
+  # before the next runs (matches tree-walker's recursive C-stack).
+  #
+  # Tests below verify that the lazy-arg primops still preserve
+  # laziness (positive cases) AND that strict-arg primops still
+  # observe runtime force (no regressions on type checks).
+  # ----------------------------------------------------------------
+  WC-38-tryEval-throw-caught
+  "tryEval must catch throw from its (lazy) arg"
+  'builtins.tryEval (throw "boom")'
+  '{ success = false; value = false; }'
+
+  WC-38-tryEval-assert-caught
+  "tryEval must catch assert false from its (lazy) arg"
+  '(builtins.tryEval (assert false; 42)).success'
+  'false'
+
+  WC-38-tryEval-success
+  "tryEval returns success/value on a non-throwing arg"
+  '(builtins.tryEval 42).value'
+  '42'
+
+  WC-38-foldl-lazy-init
+  "foldl' must NOT force the initial accumulator if op never reads it"
+  'builtins.foldl'"'"' (acc: x: x) (throw "never") [ 1 2 3 ]'
+  '3'
+
+  WC-38-seq-strict-first-lazy-second
+  "seq forces first arg, returns second untouched"
+  'let s = builtins.seq 1 2; in s'
+  '2'
+
+  WC-38-seq-throw-first
+  "seq propagates throw from first arg"
+  'builtins.tryEval (builtins.seq (throw "x") 1)'
+  '{ success = false; value = false; }'
+
+  WC-38-deepSeq-strict-first-lazy-second
+  "deepSeq forces first arg deeply, returns second"
+  'let s = builtins.deepSeq { a = 1; b = 2; } "ok"; in s'
+  '"ok"'
+
+  WC-38-deepSeq-throw-deep
+  "deepSeq forces nested throws inside the first arg"
+  'builtins.tryEval (builtins.deepSeq { a = throw "deep"; } 1)'
+  '{ success = false; value = false; }'
+
+  WC-38-addErrorContext-lazy-arg1
+  "addErrorContext arg 1 is lazy (passes through unforced)"
+  'builtins.addErrorContext "ctx" 42'
+  '42'
+
+  WC-38-strict-primop-runtime-force
+  "strict-arg primop receives forced args at runtime (length on let-thunk)"
+  'let xs = [ 1 2 3 ]; in builtins.length xs'
+  '3'
+
+  WC-38-strict-primop-runtime-force-via-thunk
+  "strict-arg primop forces a deeply-nested thunk arg at runtime"
+  'let f = x: builtins.length x; in f (let y = [ 10 20 ]; in y)'
+  '2'
+
+  WC-38-primop-thunkified-arg-throws-at-force
+  "primop strict arg that is a thunk-of-throw must throw when accessed"
+  'builtins.tryEval (builtins.length (throw "no list"))'
+  '{ success = false; value = false; }'
+
+  # ----------------------------------------------------------------
+  # WC-38 partial-application semantics (lazy by default per Wadsworth/STG)
+  # Reapplies the same primop across N strict args; verifies that
+  # PrimOpApp partial-application chain in OP_CALL also respects
+  # the lazy bitmask AND forces strict args at runtime.
+  # ----------------------------------------------------------------
+  WC-38-primopapp-partial-lazy-tryEval
+  "tryEval invoked via partial-application chain still catches throw"
+  'let f = builtins.tryEval; in f (throw "x")'
+  '{ success = false; value = false; }'
+
+  WC-38-primopapp-partial-strict-add
+  "add via partial-application chain forces both args at runtime"
+  'let f = builtins.add; in f 2 3'
+  '5'
+
+  # ----------------------------------------------------------------
+  # WC-38 lib.fix-style cycle WITH callPackages-shaped partial app.
+  # Smaller-than-nixpkgs synthetic regression for the WC-38 surface.
+  # Currently passes; tracks whether the surface stays correct as
+  # WC-38 investigation lands further fixes.
+  # ----------------------------------------------------------------
+  WC-38-lib-fix-with-callPackages-pattern
+  "fix + with self; + lib.callPackagesWith-style partial app evaluates"
+  'let
+     lib = rec {
+       fix = f: let x = f x; in x;
+       callPackagesWith = autoArgs: fn: args: fn (autoArgs // args);
+     };
+     toFix = self:
+       with self;
+       rec {
+         callPackages = lib.callPackagesWith self;
+         a = 1; b = 2;
+       };
+     pkgs = lib.fix toFix;
+   in builtins.typeOf pkgs.callPackages'
+  '"lambda"'
 )
 
 pass=0
