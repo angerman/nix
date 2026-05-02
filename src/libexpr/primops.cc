@@ -436,6 +436,18 @@ static void import(EvalState & state, const PosIdx pos, Value & vPath, Value * v
     auto path = state.realisePath(pos, vPath, std::nullopt);
     auto path2 = path.path.abs();
 
+    // WC-38 diagnostic: log every tree-walker import path + sequence
+    // number to compare against v3's V3_DBG_IMPORT.
+    {
+        static const bool s_dbg_import =
+            std::getenv("TW_DBG_IMPORT") != nullptr;
+        if (__builtin_expect(s_dbg_import, 0)) {
+            static std::atomic<uint64_t> seq{0};
+            std::fprintf(stderr, "tw IMPORT[%llu]: %s\n",
+                (unsigned long long)seq.fetch_add(1), path2.c_str());
+        }
+    }
+
     // FIXME
     auto isValidDerivationInStore = [&]() -> std::optional<StorePath> {
         if (!state.store->isStorePath(path2))

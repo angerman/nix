@@ -4165,6 +4165,18 @@ void primImport(EvalState & state, Value * args, Value & out)
     else if (args[0].isPath()) path = args[0].payload.path;
     else typeError("import", "string or path");
 
+    // WC-38 diagnostic: log every import path + sequence number to compare
+    // import-order vs tree-walker.
+    {
+        static const bool s_dbg_import =
+            std::getenv("V3_DBG_IMPORT") != nullptr;
+        if (s_dbg_import) {
+            static std::atomic<uint64_t> seq{0};
+            std::fprintf(stderr, "v3 IMPORT[%llu]: %s\n",
+                (unsigned long long)seq.fetch_add(1), path.c_str());
+        }
+    }
+
     auto & cache = importCache();
     if (auto it = cache.results.find(path); it != cache.results.end()) {
         out = it->second;
