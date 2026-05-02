@@ -363,6 +363,11 @@ struct Function {
 
     /// Optional name for diagnostics (e.g. lambda or attribute name).
     std::string         name;
+
+    /// Source position handle (1-based index into posSnapshotPool, 0 = unknown).
+    /// Used by V3_DBG_FORCE_TRACE to print file:line:col per force,
+    /// matching tree-walker's TW_DBG_FORCE format for direct trace diff.
+    uint32_t            posHandle = 0;
 };
 
 // ---------------------------------------------------------------------------

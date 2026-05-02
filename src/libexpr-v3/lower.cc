@@ -538,6 +538,7 @@ struct Lowerer
         m.functions[fid].entryBlock = entry;
         m.functions[fid].paramVar   = param;
         m.functions[fid].name       = e->arg ? std::string(symbols[e->arg]) : "<formals>";
+        m.functions[fid].posHandle  = posIdxToHandle(e->getPos());
 
         Scope inner;
 
@@ -1171,6 +1172,7 @@ struct Lowerer
             auto eb = m.freshBlock();
             m.functions[fid].entryBlock = eb;
             m.functions[fid].name = std::string(symbols[kv.first]);
+            m.functions[fid].posHandle = posIdxToHandle(kv.second.pos);
             // CO-3 + WC-11: register every Let/Attrs binding's def
             // expression, not just top-level ones.  Same rationale
             // as `thunkify` (above): Nix is purely lexical, so

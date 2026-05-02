@@ -1931,14 +1931,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     static const size_t depthFilter =
                         std::atoll(s_dbg_force_trace);
                     if (vm.frames.size() >= depthFilter) {
-                        std::fprintf(stderr,
-                            "v3 FORCE@d%zu: thunk=%p %s code=[%u..) nUp=%u "
-                            "callerIp=%u\n",
-                            vm.frames.size(),
-                            (void*)t,
-                            !desc->name.empty() ? desc->name.c_str() : "<anon>",
-                            desc->codeOffset, (unsigned)t->nUpvalues,
-                            ip - 1);
+                        // Resolve source position for direct trace-diff
+                        // against tree-walker's TW_DBG_FORCE output.
+                        const PosSnapshot * ps = resolvePosSnapshot(desc->posHandle);
+                        if (ps && !ps->file.empty()) {
+                            std::fprintf(stderr,
+                                "v3 FORCE: %s:%u:%u\n",
+                                ps->file.c_str(), ps->line, ps->column);
+                        } else {
+                            std::fprintf(stderr,
+                                "v3 FORCE: <?nopos> name=%s codeOff=%u\n",
+                                !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                                desc->codeOffset);
+                        }
                     }
                 }
             }

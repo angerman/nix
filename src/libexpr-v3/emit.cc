@@ -732,6 +732,7 @@ struct Emitter
             .ellipsis       = static_cast<uint8_t>(f.ellipsis ? 1 : 0),
             .formals        = {},
             .name           = f.name,
+            .posHandle      = f.posHandle,
         };
         if (f.hasFormals) {
             auto & desc = unit.lambdas[fid];

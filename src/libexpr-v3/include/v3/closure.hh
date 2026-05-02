@@ -159,6 +159,11 @@ struct LambdaDescriptor
     /// V3_DBG_OPCYCLE / disassembler dumps to map LambdaDescriptor
     /// pointers back to the original AST scope.
     std::string name;
+    /// Source position handle for the lambda body (1-based posSnapshotPool
+    /// index; 0 = unknown).  Mirrors ir::Function::posHandle so
+    /// V3_DBG_FORCE_TRACE can print file:line:col per thunk-force,
+    /// matching tree-walker's TW_DBG_FORCE format.
+    uint32_t posHandle = 0;
 };
 
 struct ThunkDescriptor
