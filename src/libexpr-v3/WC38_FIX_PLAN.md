@@ -118,6 +118,66 @@ behavior
   argument" when there's no ellipsis.
 - Regression: the WC-38 nixpkgs probe — captures the actual failure.
 
+## 2026-05-02 update: Step 1 attempted (NIX_V3_EAGER_ARG_FORCE)
+
+Implemented `NIX_V3_EAGER_ARG_FORCE=1` (commit ce49480b4) to align v3
+with tree-walker's call-time arg forcing.
+
+**Result: NEGATIVE.** Setting the gate does NOT fix the nixpkgs
+WITH_LOOKUP failure.  Identical error.  Tests still 142/142 + 42/42.
+
+Conclusion: the bug is NOT WHEN v3 forces the arg attrset.  It's
+WHEN v3 reaches the failing OP_CALL in the first place.  Eager-
+forcing the arg at call time doesn't change call-stack timing.
+
+This refutes the per-formal-thunk hypothesis as the root cause.
+Step 2 (full lambda-formal refactor) would similarly only change
+WHEN forces happen, not WHICH call paths v3 traverses.
+
+## True remaining suspects (post Step 1 negative result)
+
+The bug must be in something that drives v3 to ENTER deeper call
+chains than tree-walker on the same input.  Not in:
+  - Force timing (proven — eager force doesn't fix)
+  - Lambda formal access scheme (corollary — formal access is
+    downstream of call traversal, not the cause)
+  - CFF_FORCE_RETRY semantics (proven semantically equivalent)
+  - Tag::Slot or Phase 5 work (proven via pre-Phase-1 bisect)
+
+Genuine open candidates:
+  1. **Some primop in v3 forces more than tree-walker.**  Audit:
+     - `intersectAttrs` (vm.cc 970): forces both args before primop.
+       Tree-walker also forces both.  Same.
+     - `mapAttrs` (primops.cc 995): builds Tag::App lazy chain.
+       Tree-walker similar.
+     - `lib.callPackagesWith` body: many builtin calls.  Trace
+       which primop in this body trips the chain in v3 vs tw.
+  2. **callClosure / dispatchLoop helper** (vm.cc:3192+ forceValue,
+     callClosure).  v3's helpers use C recursion through dispatchLoop;
+     tree-walker uses C call-stack.  Subtle difference may make v3's
+     forces propagate through frames differently.
+  3. **Some emit-time `OP_FORCE` insertion that tree-walker's
+     equivalent semantically isn't.**  V3_DBG_FORCE_SITE shows ~14
+     emit sites.  Need to compare each against tree-walker's
+     eval.cc for behaviour.  emit.cc:479 (OP_REC_BINDING_SLOT_REF
+     pre-force) is the highest-volume.
+
+## Recommendation
+
+After 6 sessions, no surgical fix is in reach without genuine
+architectural redesign.  The diagnostic infrastructure is excellent;
+the next session should pick ONE concrete primop that v3 forces but
+tree-walker doesn't (via TW_DBG_FORCE / V3_DBG_FORCE_TRACE diff at
+the same eval point), and chase that ONE divergence.  This requires
+running both evaluators in lock-step on a smaller-than-nixpkgs but
+still-failing test case — which we don't have, and which 23+
+synthetic attempts failed to produce.
+
+The most productive path forward is probably to defer WC-38 until
+either (a) a smaller failing test case emerges naturally during
+nixpkgs work elsewhere, or (b) a focused architectural review
+session with both evaluators side-by-side on a debugger.
+
 ## Why I'm stopping here
 
 After 5 sessions of debugging, the root cause is comprehensively
