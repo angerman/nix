@@ -47,12 +47,18 @@ NIX_PATH="${NIX_PATH:-nixpkgs=/nix/store/yb2s3slqfb45942ln5z7m3ssmn7mnr4s-source
 export NIX_PATH
 
 probes=(
+  # Smallest failing case (no attr select; just forcing pkgs to WHNF):
+  'builtins.isAttrs (import <nixpkgs>{})'
+  # Type-of callPackages (the original WC-38 surface):
   'builtins.typeOf (import <nixpkgs>{}).callPackages'
+  # Selecting .system from pkgs:
   '(import <nixpkgs>{}).system'
+  # Calling lib.id (stresses the lib.callPackagesWith chain):
   'builtins.toString ((import <nixpkgs>{}).lib.id 1)'
 )
 
 expected=(
+  'true'
   '"lambda"'
   '"aarch64-darwin"'
   '"1"'
