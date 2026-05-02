@@ -2713,6 +2713,17 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             // Register the v3 list value so the lazy primop can
             // fetch elements by index.  Identity-stable across
             // primop calls — lookup cost is O(1).
+            //
+            // WC-38 Phase 13: Boehm GC does NOT reliably scan static
+            // pointers that live in the dylib's data segment on macOS,
+            // so the underlying `nix::Value` was being collected mid-
+            // evaluation.  When a later allocValue() happened to return
+            // the same address, the contents were overwritten by a new
+            // mkApp/mkThunk — causing the resulting `tPrimOpApp` chain
+            // to walk down to a non-PrimOp leaf and trip tree-walker's
+            // assert in callFunction().  Fix: pin the pointer storage
+            // as a GC root explicitly.  Use bridgePrimOpRoot() which
+            // also handles thread-safe one-shot init.
             static nix::Value * lazyListPrim = nullptr;
             if (!lazyListPrim) {
                 auto * po = new nix::PrimOp{
@@ -2725,6 +2736,9 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 nix::Value * pv = ns.allocValue();
                 pv->mkPrimOp(po);
                 lazyListPrim = pv;
+#if NIX_USE_BOEHMGC
+                GC_add_roots(&lazyListPrim, &lazyListPrim + 1);
+#endif
             }
             auto & tbl = v3BridgeLists();
             size_t handle = tbl.size();
@@ -2791,6 +2805,8 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             }
         } else {
             // Register the original v3 attrset for later lookup.
+            // WC-38 Phase 13: see lazyListPrim above for the GC root
+            // registration rationale.
             static nix::Value * lazyAttrPrim = nullptr;
             if (!lazyAttrPrim) {
                 auto * po = new nix::PrimOp{
@@ -2803,6 +2819,9 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 nix::Value * pv = ns.allocValue();
                 pv->mkPrimOp(po);
                 lazyAttrPrim = pv;
+#if NIX_USE_BOEHMGC
+                GC_add_roots(&lazyAttrPrim, &lazyAttrPrim + 1);
+#endif
             }
             auto & tbl = v3BridgeAttrs();
             size_t handle = tbl.size();
@@ -2857,6 +2876,12 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // function — the calling convention that autoCallFunction +
         // ExprCall::eval expect.  The 2-arg variant is kept for the
         // legacy `builtins.path { filter = path: type: ...; }` shape.
+        // WC-38 Phase 13: see lazyListPrim above — Boehm GC on macOS
+        // doesn't reliably scan dylib data-segment statics, so we
+        // explicitly register the storage of the static pointer as a
+        // GC root.  Without this, `bridgePrimOp1`'s underlying Value
+        // is reclaimed and `mkPrimOpApp(bridgePrimOp1, ...)` produces
+        // a chain whose root is no longer a PrimOp.
         static nix::Value * bridgePrimOp1 = nullptr;
         if (!bridgePrimOp1) {
             auto * po = new nix::PrimOp{
@@ -2869,6 +2894,9 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             nix::Value * vp = ns.allocValue();
             vp->mkPrimOp(po);
             bridgePrimOp1 = vp;
+#if NIX_USE_BOEHMGC
+            GC_add_roots(&bridgePrimOp1, &bridgePrimOp1 + 1);
+#endif
         }
         auto & tbl = v3BridgeClosures();
         size_t handle = tbl.size();
