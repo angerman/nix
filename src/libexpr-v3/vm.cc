@@ -2036,31 +2036,38 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 push(vm, Value::vEmptyAttrs);
                 break;
             }
-            // Each entry is a (SymbolId, PosIdx) pair inlined as 2 code
-            // words.  PosIdx feeds the per-attr position side-table that
-            // backs `builtins.unsafeGetAttrPos`.
-            std::vector<SymbolId> names(n);
-            std::vector<uint32_t> poses(n);
+            // REVIEW MED-6: build entries directly into either a stack
+            // buffer (most attrsets are small) or a heap fallback when
+            // n exceeds kSmall.  Pre-fix used four std::vectors per
+            // call (names/poses/values/entries); now zero allocations
+            // for n <= kSmall and one for the heap fallback.
+            struct Entry { SymbolId name; Value value; uint32_t pos; };
+            constexpr uint32_t kSmall = 16;
+            Entry smallBuf[kSmall];
+            std::vector<Entry> bigBuf;
+            Entry * entries;
+            if (n <= kSmall) {
+                entries = smallBuf;
+            } else {
+                bigBuf.resize(n);
+                entries = bigBuf.data();
+            }
+            // Each entry is (SymbolId, PosIdx) inlined as 2 code words
+            // followed by n popped values.  PosIdx feeds the per-attr
+            // position side-table backing builtins.unsafeGetAttrPos.
             for (uint32_t i = 0; i < n; ++i) {
-                names[i] = static_cast<SymbolId>(cu->code[ip + 2 * i]);
-                poses[i] = cu->code[ip + 2 * i + 1];
+                entries[i].name = static_cast<SymbolId>(cu->code[ip + 2 * i]);
+                entries[i].pos  = cu->code[ip + 2 * i + 1];
             }
             ip += 2 * n;
-            // Pop n values (in reverse order).
-            std::vector<Value> values(n);
-            for (uint32_t i = n; i > 0; --i) values[i - 1] = pop(vm);
-            // Build sorted entries; carry pos alongside.
-            std::vector<std::tuple<SymbolId, Value, uint32_t>> entries(n);
-            for (uint32_t i = 0; i < n; ++i)
-                entries[i] = {names[i], values[i], poses[i]};
-            std::sort(entries.begin(), entries.end(),
-                      [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
-            // After sort, duplicate names are adjacent — match
-            // tree-walker by raising on dup-static-attr.
+            for (uint32_t i = n; i > 0; --i) entries[i - 1].value = pop(vm);
+            // Sort by name; duplicates become adjacent.
+            std::sort(entries, entries + n,
+                      [](const Entry & a, const Entry & b) { return a.name < b.name; });
             for (uint32_t i = 1; i < n; ++i) {
-                if (std::get<0>(entries[i]) == std::get<0>(entries[i - 1])) {
+                if (entries[i].name == entries[i - 1].name) {
                     const auto & tbl = ir::globalSymbolTable();
-                    SymbolId nm = std::get<0>(entries[i]);
+                    SymbolId nm = entries[i].name;
                     std::string s = (nm < tbl.size()) ? tbl[nm] : "?";
                     throw std::runtime_error("v3 OP_ATTRS_INIT: attribute '" + s +
                                               "' already defined");
@@ -2069,9 +2076,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Bindings * b = Alloc::allocBindings(n);
             allocStats().attrsetsAllocated++;
             for (uint32_t i = 0; i < n; ++i) {
-                b->entries[i].name  = std::get<0>(entries[i]);
-                b->entries[i].value = std::get<1>(entries[i]);
-                recordAttrPos(b, std::get<0>(entries[i]), std::get<2>(entries[i]));
+                b->entries[i].name  = entries[i].name;
+                b->entries[i].value = entries[i].value;
+                recordAttrPos(b, entries[i].name, entries[i].pos);
             }
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
