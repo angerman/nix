@@ -724,15 +724,50 @@ struct Emitter
         else
             unit.code.push_back(encode(OP_LIT_NULL));
 
-        // Tail-call peephole: for non-top-level functions, if the
-        // last emitted instruction is OP_CALL, the result of that
-        // call IS this function's return value — rewrite to
-        // OP_TAIL_CALL.  Keep the OP_RETURN that follows: a
-        // sibling thenBlock might JUMP past the OP_TAIL_CALL to
-        // the trailing OP_RETURN, and OP_TAIL_CALL itself never
-        // returns to that OP_RETURN (it replaces the frame).
-        if (fid != 0 && !unit.code.empty() && decodeOp(unit.code.back()) == OP_CALL) {
-            unit.code.back() = encode(OP_TAIL_CALL);
+        // Tail-call peephole: rewrite OP_CALL → OP_TAIL_CALL whenever
+        // the call's result IS this function's return value.  Three
+        // shapes need to be caught:
+        //
+        //   (a) `body = f x`            — last instruction is OP_CALL.
+        //   (b) `if c then result       — elseBlock's tail is OP_CALL;
+        //        else f x`                with the trailing OP_JUMP
+        //                                  target just before OP_RETURN.
+        //   (c) `if c then f x          — thenBlock's tail is OP_CALL,
+        //        else result`             then OP_JUMP to past the
+        //                                  elseBlock to the OP_RETURN.
+        //
+        // Pre-fix only (a)+(b) fired (the back of unit.code is
+        // elseBlock's last instruction).  The thenBlock's OP_CALL is
+        // followed by an OP_JUMP and never gets the rewrite, so
+        // recursion of the form `if cond then f x else result` leaks
+        // C-stack on a common idiom (REVIEW MED-2).
+        //
+        // Strategy: after the function body is emitted but before
+        // the trailing OP_RETURN, walk every OP_CALL in this
+        // function's range and rewrite to OP_TAIL_CALL when:
+        //   - it's the back of the code (case a), OR
+        //   - the immediately following instruction is OP_JUMP whose
+        //     target == codeEnd (the OP_RETURN slot we're about to
+        //     emit).
+        if (fid != 0 && unit.code.size() > codeStart) {
+            uint32_t codeEnd = static_cast<uint32_t>(unit.code.size());
+            // Case (a): last instruction is OP_CALL.
+            if (decodeOp(unit.code.back()) == OP_CALL)
+                unit.code.back() = encode(OP_TAIL_CALL);
+            // Cases (b) + (c): walk function body for OP_CALL
+            // followed by OP_JUMP-to-codeEnd.  OP_JUMP encodes its
+            // absolute 24-bit target in the operand (see vm.cc
+            // OP_JUMP dispatch: `ip = operand`).  When the target
+            // equals codeEnd (the slot the OP_RETURN we're about to
+            // emit will occupy), the OP_CALL is in tail position.
+            for (uint32_t ip = codeStart; ip + 1 < unit.code.size(); ++ip) {
+                if (decodeOp(unit.code[ip]) != OP_CALL) continue;
+                uint32_t nip = ip + 1;
+                if (decodeOp(unit.code[nip]) != OP_JUMP) continue;
+                uint32_t target = decodeOperand(unit.code[nip]);
+                if (target == codeEnd)
+                    unit.code[ip] = encode(OP_TAIL_CALL);
+            }
         }
         unit.code.push_back(encode(fid == 0 ? OP_HALT : OP_RETURN));
 
