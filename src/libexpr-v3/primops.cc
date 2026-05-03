@@ -5905,6 +5905,91 @@ void registerBuiltinPrimOps()
         // WC-28c: filterSource (delegate too).
         registerPrimOp({"filterSource",       2, primFilterSource});
         registerPrimOp({"__filterSource",     2, primFilterSource});
+
+        // EVAL-COMP §4.5 / #414: register `__`-prefixed aliases for
+        // every primop whose un-prefixed form is already in v3's
+        // registry.  Tree-walker registers both forms; nixpkgs uses
+        // the `__`-prefixed style heavily (legacy convention).
+        // Pre-fix, calls like `__substring` / `__replaceStrings`
+        // hit the lower.cc:549 `unbound variable` throw, propagated
+        // up to the cutover hook, and triggered a fall-back of the
+        // entire surrounding expression to tree-walker -- a heavy
+        // bridge tax for a one-line registration miss.
+        //
+        // The aliases below mirror the un-prefixed registrations
+        // above; arity / impl / lazyArgs are kept in sync by hand.
+        // Stable until the underlying primops change, in which case
+        // both registrations need updating.
+        registerPrimOp({"__length",           1, primLength});
+        registerPrimOp({"__head",             1, primHead});
+        registerPrimOp({"__tail",             1, primTail});
+        registerPrimOp({"__elemAt",           2, primElemAt});
+        registerPrimOp({"__attrNames",        1, primAttrNames});
+        registerPrimOp({"__attrValues",       1, primAttrValues});
+        registerPrimOp({"__isAttrs",          1, primIsAttrs});
+        registerPrimOp({"__isList",           1, primIsList});
+        registerPrimOp({"__isFunction",       1, primIsFunction});
+        registerPrimOp({"__isString",         1, primIsString});
+        registerPrimOp({"__isInt",            1, primIsInt});
+        registerPrimOp({"__isBool",           1, primIsBool});
+        registerPrimOp({"__isFloat",          1, primIsFloat});
+        registerPrimOp({"__isPath",           1, primIsPath});
+        registerPrimOp({"__typeOf",           1, primTypeOf});
+        registerPrimOp({"__stringLength",     1, primStringLength});
+        registerPrimOp({"__concatLists",      1, primConcatLists});
+        registerPrimOp({"__concatStringsSep", 2, primConcatStringsSep});
+        registerPrimOp({"__substring",        3, primSubstring});
+        registerPrimOp({"__map",              2, primMap});
+        registerPrimOp({"__filter",           2, primFilter});
+        registerPrimOp({"__foldl'",           3, primFoldl, /*lazyArgs=*/0b010});
+        registerPrimOp({"__genList",          2, primGenList});
+        registerPrimOp({"__all",              2, primAll});
+        registerPrimOp({"__any",              2, primAny});
+        registerPrimOp({"__concatMap",        2, primConcatMap});
+        registerPrimOp({"__partition",        2, primPartition});
+        registerPrimOp({"__getEnv",           1, primGetEnv});
+        registerPrimOp({"__compareVersions",  2, primCompareVersions});
+        registerPrimOp({"__listToAttrs",      1, primListToAttrs});
+        registerPrimOp({"__intersectAttrs",   2, primIntersectAttrs});
+        registerPrimOp({"__mapAttrs",         2, primMapAttrs});
+        registerPrimOp({"__elem",             2, primElem});
+        registerPrimOp({"__getAttr",          2, primGetAttr});
+        registerPrimOp({"__hasAttr",          2, primHasAttr});
+        registerPrimOp({"__catAttrs",         2, primCatAttrs});
+        registerPrimOp({"__replaceStrings",   3, primReplaceStrings});
+        registerPrimOp({"__seq",              2, primSeq,     /*lazyArgs=*/0b10});
+        registerPrimOp({"__deepSeq",          2, primDeepSeq, /*lazyArgs=*/0b10});
+        registerPrimOp({"__trace",            2, primTrace});
+        registerPrimOp({"__traceVerbose",     2, primTraceVerbose});
+        registerPrimOp({"__zipAttrsWith",     2, primZipAttrsWith});
+        registerPrimOp({"__unsafeGetAttrPos", 2, primUnsafeGetAttrPos});
+        registerPrimOp({"__toPath",           1, primToPath});
+        registerPrimOp({"__splitVersion",     1, primSplitVersion});
+        registerPrimOp({"__addErrorContext",  2, primAddErrorContext, /*lazyArgs=*/0b10});
+        registerPrimOp({"__tryEval",          1, primTryEval, /*lazyArgs=*/0b1});
+        registerPrimOp({"__pathExists",       1, primPathExists});
+        registerPrimOp({"__sort",             2, primSort});
+        registerPrimOp({"__bitAnd",           2, primBitAnd});
+        registerPrimOp({"__bitOr",            2, primBitOr});
+        registerPrimOp({"__bitXor",           2, primBitXor});
+        registerPrimOp({"__floor",            1, primFloor});
+        registerPrimOp({"__ceil",             1, primCeil});
+        registerPrimOp({"__fromJSON",         1, primFromJSON});
+        registerPrimOp({"__toJSON",           1, primToJSON});
+        registerPrimOp({"__functionArgs",     1, primFunctionArgs});
+        registerPrimOp({"__readFile",         1, primReadFile});
+        registerPrimOp({"__readDir",          1, primReadDir});
+        registerPrimOp({"__parseDrvName",     1, primParseDrvName});
+        registerPrimOp({"__groupBy",          2, primGroupBy});
+        registerPrimOp({"__match",            2, primMatch});
+        registerPrimOp({"__split",            2, primSplit});
+        registerPrimOp({"__hashString",       2, primHashString});
+        registerPrimOp({"__genericClosure",   1, primGenericClosure});
+        registerPrimOp({"__hashFile",         2, primHashFile});
+        registerPrimOp({"__convertHash",      1, primConvertHash});
+        registerPrimOp({"__readFileType",     1, primReadFileType});
+        registerPrimOp({"__path",             1, primPath});
+        registerPrimOp({"__toXML",            1, primToXML});
     });
 }
 
