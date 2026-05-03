@@ -133,28 +133,44 @@ Fiber * fiberCreate(std::function<void(Fiber *)> entry, size_t stackSize)
     auto * f = new Fiber{};
     f->entry = std::move(entry);
     f->stackSize = stackSize;
-    // WC-18 follow-up: use posix_memalign (page-aligned malloc) for
-    // the fiber stack.  Earlier attempt used mmap + PROT_NONE guard
-    // page, which appeared to crash but actually succeeded; the
-    // original SIGSEGV was unrelated (root cause: feature-test
-    // macros hiding MAP_ANON).  Sticking with posix_memalign keeps
-    // things simple and matches the verified-working test case.
-    // No guard page — the 64 MB stack is large enough that overflow
-    // is genuinely a bug worth chasing on its own; we'd just trade
-    // one segfault for another.
+    // REVIEW MED-15: mmap + PROT_NONE guard page below the stack.
+    // Stack grows DOWN on every supported arch (x86_64, aarch64), so
+    // overflow runs into the low-address guard page and triggers
+    // SIGSEGV synchronously instead of corrupting whatever lives
+    // immediately below in the heap (typically arena blocks).
+    //
+    // Layout:
+    //   [guardPage : pageSize bytes (PROT_NONE)]
+    //   [usableStack : stackSize bytes (PROT_READ|PROT_WRITE)]
+    // ss_sp is the usable-stack base; ucontext picks ss_sp+ss_size as
+    // the initial SP for downward-growing stacks.
+    //
+    // The earlier attempt at this guard page was abandoned because of
+    // unrelated MAP_ANON visibility issues (feature-test macros) --
+    // those are fixed via #include <sys/mman.h>.
     size_t pageSize = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-    void * mem = nullptr;
-    if (::posix_memalign(&mem, pageSize, stackSize) != 0) {
+    size_t totalSize = stackSize + pageSize;
+    void * region = ::mmap(nullptr, totalSize, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (region == MAP_FAILED) {
         delete f;
         throw std::bad_alloc();
     }
+    if (::mprotect(region, pageSize, PROT_NONE) != 0) {
+        ::munmap(region, totalSize);
+        delete f;
+        throw std::runtime_error("v3 fiber: mprotect guard page failed");
+    }
+    void * mem = static_cast<char *>(region) + pageSize;
     f->stack = mem;
     f->stackSize = stackSize;
+    // Track the full mmap'd region so fiberDestroy can munmap it.
+    // We re-derive (region, totalSize) from (stack, stackSize, pageSize).
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     if (::getcontext(&f->ctx) == -1) {
-        std::free(mem);
+        ::munmap(static_cast<char *>(f->stack) - pageSize, totalSize);
         delete f;
         throw std::runtime_error("v3 fiber: getcontext failed");
     }
@@ -219,7 +235,14 @@ void fiberYield(Fiber * fiber)
 void fiberDestroy(Fiber * fiber)
 {
     if (!fiber) return;
-    if (fiber->stack) std::free(fiber->stack);
+    if (fiber->stack) {
+        // Reverse the layout established in fiberCreate: usableStack
+        // sits one page above the mmap'd region, and the total mapping
+        // is stackSize + pageSize.
+        size_t pageSize = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+        void * region = static_cast<char *>(fiber->stack) - pageSize;
+        ::munmap(region, fiber->stackSize + pageSize);
+    }
     delete fiber;
 }
 
