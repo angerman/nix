@@ -1017,7 +1017,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // isBool check, and incorrectly fall through into the rhs block.
         case OP_NOT: {
             Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
+            // Phase 13: must also force Tag::Slot — formal-arg recref
+            // lookups (lower.cc:thunkifyRecAttrSelect) used to wrap the
+            // slot ref behind a Thunk wrapper, so the Thunk-only check
+            // sufficed.  Under NIX_V3_INLINE_REC_SLOT we get a bare
+            // Tag::Slot here; without forcing, the bool check fails
+            // and the wrong branch is taken.
+            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
+                v = forceValue(vm, v);
             push(vm, isTrueValue(v) ? Value::vFalse : Value::vTrue);
             break;
         }
@@ -1025,14 +1032,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_AND_BRANCH: {
             // peek; if false -> jump (keep false); if true -> pop and fall through
             Value & v = vm.valueStack.back();
-            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
+            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
+                v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 0) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
         }
         case OP_OR_BRANCH: {
             Value & v = vm.valueStack.back();
-            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
+            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
+                v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 1) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
@@ -1040,7 +1049,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_IMPL_BRANCH: {
             // If lhs false -> result is true; jump.  If lhs true -> pop, fall through.
             Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
+            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
+                v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 0) { push(vm, Value::vTrue); ip = operand; }
             break;
         }
@@ -1048,13 +1058,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_JUMP: ip = operand; break;
         case OP_BRANCH_FALSE: {
             Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
+            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
+                v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 0) ip = operand;
             break;
         }
         case OP_BRANCH_TRUE:  {
             Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App) v = forceValue(vm, v);
+            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
+                v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 1) ip = operand;
             break;
         }
