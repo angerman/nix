@@ -810,6 +810,62 @@ TESTS=(
      pkgs = fix final;
    in pkgs.a + pkgs.b'
   '3'
+
+  # ----------------------------------------------------------------
+  # REVIEW HIGH-1: OP_TAIL_CALL must reset withStackBase + truncate
+  # the with-stack to the outer floor before pushing the callees
+  # captured withs, otherwise a cross-closure tail call leaks names
+  # from the callers `with` chain into the callees lookup scope.
+  # Pre-fix symptom: g (no own `with`, no captured `leaked`) finds
+  # `leaked` via fs `with` chain because withLookup walks all the
+  # way down to fs withStackBase — through the leaked entries.
+  # Post-fix: gs withStack contains only its own captures, so
+  # `leaked` raises "undefined variable".
+  # ----------------------------------------------------------------
+  # Sentinel test for the pre-fix leak.  Both g and f have a `with`,
+  # but only fs `with` provides `leaked`.  Lexical Nix semantics: g
+  # has only its own `with {other}` in scope, so `leaked` must
+  # resolve via gs OWN with-stack, not the callers.
+  # Pre-fix: vm.withStack still holds fs `{leaked}` when g runs;
+  # withLookup walks past gs `{other}` and finds fs `{leaked}` —
+  # returns "BAD" (semantic divergence from tree-walker).
+  # Post-fix: gs withStack contains only `{other}`; lookup of
+  # `leaked` raises "undefined variable".  Test expects __ERROR__.
+  REVIEW-HIGH-1-tco-no-with-leak
+  "TC callee with-lookup cant see callers with-stack"
+  'let
+     g = with { other = 1; }; n: leaked;
+     f = with { leaked = "BAD"; }; n: g n;
+   in f 0'
+  '__ERROR__'
+
+  # Positive twin: when both g and f have a matching `with` entry,
+  # the callee resolves to its OWN binding (innermost on its stack).
+  REVIEW-HIGH-1-tco-own-with-resolves
+  "TC callee with own `with` resolves to its own binding"
+  'let
+     g = with { secret = "G"; }; n: secret;
+     f = with { secret = "F"; }; n: g n;
+   in f 0'
+  '"G"'
+
+  # ----------------------------------------------------------------
+  # REVIEW HIGH-3: valueLess must force lazy list elements before
+  # comparing.  Pre-fix: `[ (map id [1]) ] < [ ... ]` threw
+  # "OP_LESS: unsupported operand types" because the Tag::App from
+  # mapAttrs/map escaped to the const-ref valueLess recursion.
+  # ----------------------------------------------------------------
+  REVIEW-HIGH-3-less-lazy-list
+  "valueLess forces Tag::App list elements"
+  'let xs = [ (builtins.head (map (x: x) [ 1 ])) ];
+       ys = [ 2 ];
+   in xs < ys'
+  'true'
+
+  REVIEW-HIGH-3-less-mapattrs-as-list
+  "valueLess on lists whose elements come from a Tag::App chain"
+  '[ (builtins.head [ 1 ]) (builtins.head [ 2 ]) ] < [ 1 3 ]'
+  'true'
 )
 
 pass=0
