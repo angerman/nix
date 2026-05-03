@@ -36,6 +36,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -546,6 +547,45 @@ int main(int argc, char ** argv)
                 (unsigned long long)a.attrsetsAllocated,
                 (unsigned long long)a.envsAllocated,
                 (unsigned long long)(nix::v3::threadArena().bytesAllocated() >> 20));
+            // Phase 13: thunk-force counters.  ratio = forced/allocated.
+            // A healthy lazy evaluator has ratio ≤ 1 (most thunks are
+            // forced once or never).  ratio > 1 means we're allocating
+            // duplicate thunks for the same logical binding (memo bug)
+            // or a thunk gets re-forced after Suspended → Blackhole →
+            // Suspended (state regression) — both are slowness root
+            // causes.
+            double forceRatio = a.thunksAllocated
+                ? double(a.thunksForced) / double(a.thunksAllocated) : 0.0;
+            std::fprintf(stderr,
+                "v3 force stats: thunksForced=%llu bridgeForced=%llu "
+                "ratio_forced_per_alloc=%.3f\n",
+                (unsigned long long)a.thunksForced,
+                (unsigned long long)a.bridgeThunksForced,
+                forceRatio);
+            // Top-10 LambdaDescriptors by force count (entry CU only).
+            // Imported CUs aren't reachable from here without a global
+            // registry — for full dumps run on a single-CU expression
+            // (no `import` calls) or extend with V3_DBG_FORCE_TRACE.
+            if (std::getenv("V3_DBG_FORCES")) {
+                std::vector<std::pair<uint64_t, const nix::v3::LambdaDescriptor *>> top;
+                top.reserve(cu.lambdas.size());
+                for (const auto & d : cu.lambdas) {
+                    if (d.forceCount > 0)
+                        top.emplace_back(d.forceCount, &d);
+                }
+                std::sort(top.begin(), top.end(),
+                    [](const auto & a, const auto & b) { return a.first > b.first; });
+                size_t n = std::min(top.size(), size_t(10));
+                std::fprintf(stderr, "v3 top-%zu hot thunks (entry CU):\n", n);
+                for (size_t i = 0; i < n; ++i) {
+                    const auto * d = top[i].second;
+                    std::fprintf(stderr,
+                        "  forces=%-8llu codeOff=%-8u nUp=%-3u name=%s\n",
+                        (unsigned long long)top[i].first,
+                        d->codeOffset, (unsigned)d->nUpvalues,
+                        !d->name.empty() ? d->name.c_str() : "<anon>");
+                }
+            }
             // Bindings size histogram — informs VM-2 polymorphic
             // Bindings sizing.  Buckets:
             //  0=empty, 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-128, 129+.

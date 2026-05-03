@@ -117,6 +117,18 @@ struct AllocStats
     /// [7]=33-64, [8]=65-128, [9]=129+.  Used to size-tune the
     /// VM-2 polymorphic Bindings (Empty/Single/Small/Sorted) plan.
     uint64_t attrsetSizeBuckets[10] = {0,0,0,0,0,0,0,0,0,0};
+
+    /// Phase 13 instrumentation: total Suspended → Blackhole
+    /// transitions across the whole process.  Each thunk should
+    /// transition at most once per lifetime, so this should be
+    /// roughly equal to thunksAllocated under correct memoization;
+    /// a 300x slowdown with 300x more transitions tells us we're
+    /// allocating new thunks for what should be shared bindings.
+    uint64_t thunksForced = 0;
+    /// Bridge thunks (cross-evaluator value imports) — counted
+    /// separately because they can legitimately be force-resolved
+    /// once each per Bridge thunk allocated.
+    uint64_t bridgeThunksForced = 0;
 };
 
 inline AllocStats & allocStats()
@@ -251,6 +263,7 @@ struct Alloc
         auto * t = static_cast<Thunk *>(threadArena().alloc(bytes));
         t->state = ThunkState::Suspended;
         t->nUpvalues = nUpvalues;
+        t->forces = 0;
         t->suspended.capturedWiths = nullptr;
         t->suspended.cu = nullptr;
         return t;
@@ -270,6 +283,7 @@ struct Alloc
         auto * t = static_cast<Thunk *>(threadArena().alloc(bytes));
         t->state = ThunkState::Bridge;
         t->nUpvalues = 0;
+        t->forces = 0;
         t->bridgeSrc = src;
         return t;
     }

@@ -1861,6 +1861,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // result.  Defined in primops.cc so vm.cc stays free of
             // nix:: includes.
             if (t->state == ThunkState::Bridge) {
+                ++t->forces;
+                ++allocStats().bridgeThunksForced;
                 Value resolved = forceBridgeThunk(t);
                 t->state = ThunkState::Evaluated;
                 t->evaluated = resolved;
@@ -1870,6 +1872,48 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Suspended: blackhole and run.
             // We treat suspended.desc as a LambdaDescriptor* (see OP_MAKE_THUNK).
             const LambdaDescriptor * desc = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+            // Phase 13 instrumentation: bump per-thunk + per-descriptor +
+            // global counters at the Suspended → Blackhole gate.  Each
+            // thunk should transition exactly once per lifetime, so
+            // `t->forces` should never grow past 1 unless something
+            // re-suspends a previously-blackholed thunk.  Per-descriptor
+            // count tells us how many thunks share the same body
+            // (over-allocation indicator: when 1 expression yields N
+            // thunks because the binding it captures isn't shared).
+            ++t->forces;
+            ++desc->forceCount;
+            ++allocStats().thunksForced;
+            // Phase 13: live periodic stats dump.  When V3_DBG_FORCES is
+            // set, every N millionth force emits a one-line snapshot to
+            // stderr.  Lets us watch a runaway eval without waiting for
+            // atexit (which doesn't fire under SIGKILL / SIGXCPU).
+            // Default N = 10M; override via V3_DBG_FORCE_STRIDE.
+            {
+                static const bool s_periodic =
+                    std::getenv("V3_DBG_FORCES") != nullptr;
+                if (__builtin_expect(s_periodic, 0)) {
+                    static const uint64_t s_stride = []() -> uint64_t {
+                        const char * e = std::getenv("V3_DBG_FORCE_STRIDE");
+                        return e ? std::strtoull(e, nullptr, 10)
+                                 : uint64_t(10) * 1000 * 1000;
+                    }();
+                    auto & a = allocStats();
+                    if (s_stride && (a.thunksForced % s_stride) == 0) {
+                        std::fprintf(stderr,
+                            "v3 PROGRESS: forced=%llu allocated=%llu "
+                            "ratio=%.3f frames=%zu arena=%lluMB hot=%s/%llu\n",
+                            (unsigned long long)a.thunksForced,
+                            (unsigned long long)a.thunksAllocated,
+                            a.thunksAllocated
+                                ? double(a.thunksForced) / double(a.thunksAllocated)
+                                : 0.0,
+                            vm.frames.size(),
+                            (unsigned long long)(threadArena().bytesAllocated() >> 20),
+                            !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                            (unsigned long long)desc->forceCount);
+                    }
+                }
+            }
             // Synthesize a closure-like view for OP_GET_UPVALUE: we set
             // `closure` to a fake Closure pointer crafted from the thunk
             // tail.  Instead of allocating a temporary Closure, we build

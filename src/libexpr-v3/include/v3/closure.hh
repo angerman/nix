@@ -100,7 +100,17 @@ struct Thunk
     ThunkState state;
     uint8_t    _pad0;
     uint16_t   nUpvalues;   // for Suspended state
-    uint32_t   _pad1;
+    /// Phase 13 instrumentation (was `_pad1`).  Counts Suspended →
+    /// Blackhole transitions for *this* thunk instance.  Each force
+    /// transitions the thunk once per its lifetime (Suspended →
+    /// Blackhole → Evaluated, then OP_FORCE returns the cached
+    /// value), so a value > 1 indicates the thunk was reset to
+    /// Suspended by some control-flow path — a real memoization
+    /// regression.  Only meaningfully populated when V3_DBG_FORCES
+    /// is set (overhead is one int increment per force, so cheap
+    /// enough to leave on, but we gate the per-descriptor map
+    /// dumping behind the env var).
+    uint32_t   forces;
 
     union {
         // ThunkState::Suspended
@@ -164,6 +174,13 @@ struct LambdaDescriptor
     /// V3_DBG_FORCE_TRACE can print file:line:col per thunk-force,
     /// matching tree-walker's TW_DBG_FORCE format.
     uint32_t posHandle = 0;
+    /// Phase 13 instrumentation: total Suspended → Blackhole
+    /// transitions of any thunk whose `suspended.desc` points at
+    /// this descriptor.  Bumped from OP_FORCE.  Marked `mutable`
+    /// because OP_FORCE only sees a `const LambdaDescriptor *` —
+    /// the field is statistical, not part of the descriptor's
+    /// logical identity.  Single-threaded VM, no atomics needed.
+    mutable uint64_t forceCount = 0;
 };
 
 struct ThunkDescriptor
