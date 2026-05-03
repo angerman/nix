@@ -571,9 +571,7 @@ struct Lowerer
             for (auto & fm : formals->formals) {
                 ir::Formal ifm;
                 ifm.name = internSym(fm.name);
-                // We don't yet propagate default-block IDs through;
-                // for functionArgs we only need the has-default flag.
-                ifm.defaultBlock = fm.def ? 1u : ir::kInvalidBlock;
+                ifm.hasDefault = fm.def != nullptr;
                 ifm.pos = posIdxToHandle(fm.pos);
                 m.functions[fid].formals.push_back(ifm);
             }

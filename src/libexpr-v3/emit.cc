@@ -754,9 +754,7 @@ struct Emitter
             auto & desc = unit.lambdas[fid];
             desc.formals.reserve(f.formals.size());
             for (auto & fm : f.formals)
-                desc.formals.push_back({fm.name,
-                                          fm.defaultBlock != ir::kInvalidBlock,
-                                          fm.pos});
+                desc.formals.push_back({fm.name, fm.hasDefault, fm.pos});
         }
         unit.lambdaCodeOffsets[fid] = codeStart;
 

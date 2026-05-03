@@ -84,9 +84,11 @@ struct WithLookup {
 /// Lambda formal parameter (in `{ a ? def, b, ... }: body`).
 struct Formal {
     SymbolId name;
-    /// Default-value block (kInvalidBlock if formal is required).  Free vars
-    /// of the default are part of the enclosing closure's upvalues.
-    BlockId  defaultBlock = kInvalidBlock;
+    /// True if this formal has a default expression.  The default's
+    /// own block is wired into the lambda body's prologue at lower
+    /// time; we don't carry the BlockId here because the only consumer
+    /// (`builtins.functionArgs`) just needs the presence flag.
+    bool hasDefault = false;
     /// AST position handle for the formal name; 0 = unknown.  Recorded
     /// in the per-attr side-table when `builtins.functionArgs` builds
     /// its result attrset, so `unsafeGetAttrPos` works.
