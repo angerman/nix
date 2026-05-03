@@ -205,6 +205,25 @@ struct Lowerer
                 std::getenv("NIX_V3_NO_THUNKIFY_REC") != nullptr;
             if (noThunkify)
                 return addBinding(ir::AttrSelect{rec, nm});
+            // Phase 13: NIX_V3_INLINE_REC_SLOT=1 — skip the MkThunk
+            // wrapper and emit ir::RecBindingSlotRef directly at the
+            // consumer site.  The slot is heap-stable (Tag::Slot)
+            // since Phase 5, so deferring the lookup behind a Thunk
+            // adds nothing semantically — the slot reflects mutation
+            // already.  This eliminates the per-access Thunk allocation
+            // that dominated nixpkgs eval (`recref-setType` alone was
+            // forced 1.38M times under stages 0..3).
+            //
+            // The original WC-31 thunkification was added to defer
+            // rec-attr lookup past MAKE_CLOSURE time; with Tag::Slot,
+            // the consumer reads the slot at consume-time anyway, so
+            // deferral via a thunk is redundant.  Worth verifying via
+            // the lang/cutover/laziness suite before flipping the
+            // default.
+            static const bool inlineRecSlot =
+                std::getenv("NIX_V3_INLINE_REC_SLOT") != nullptr;
+            if (inlineRecSlot)
+                return addBinding(ir::RecBindingSlotRef{rec, nm});
             return thunkifyRecAttrSelect(rec, nm);
         }
         return ir::kInvalid;
