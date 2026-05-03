@@ -3397,6 +3397,38 @@ static void primDerivationStrictNative(
 /// actually realizing them.
 void primDerivationStrict(EvalState & state, Value * args, Value & out)
 {
+    // Phase 13.5: V3_DRV_CALLER=1 dumps the v3 frame stack at every
+    // primDerivationStrict call so we can see *who* is invoking it
+    // and verify whether 100x more calls trace to the same caller
+    // (v3 callsite issue) or to many distinct callers (legit graph).
+    {
+        static const bool s_dbg_caller =
+            std::getenv("V3_DRV_CALLER") != nullptr;
+        if (__builtin_expect(s_dbg_caller, 0)) {
+            static std::atomic<uint64_t> seq{0};
+            auto n = seq.fetch_add(1);
+            // Only dump every Nth call to avoid log explosion.
+            static const uint64_t stride = []() -> uint64_t {
+                const char * e = std::getenv("V3_DRV_CALLER_STRIDE");
+                return e ? std::strtoull(e, nullptr, 10) : 100;
+            }();
+            if (stride && (n % stride) == 0 && state.vm) {
+                std::fprintf(stderr, "v3 DRV_CALLER[%llu] (frames=%zu):\n",
+                    (unsigned long long)n, state.vm->frames.size());
+                size_t lim = state.vm->frames.size();
+                for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
+                    const auto & fr = state.vm->frames[i - 1];
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk) d = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                    else if (fr.closure) d = fr.closure->desc;
+                    const char * nm = (d && !d->name.empty()) ? d->name.c_str() : "<anon>";
+                    std::fprintf(stderr, "  frame[%zu] %s codeOff=%u ip=%u\n",
+                        i - 1, nm, d ? d->codeOffset : 0, fr.ip);
+                }
+            }
+        }
+    }
+
     // Phase 13.4: per-derivation call profiler.  Key = name + bindings
     // ptr — different ptrs for the same name means fresh args attrsets,
     // i.e. the scope/callPackage chain is *not* sharing the let-bound
