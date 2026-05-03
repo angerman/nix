@@ -97,7 +97,9 @@ struct UpvalueSource {
     Kind                  kind  = Kind::Direct;
     uint32_t              level = 0;
     uint32_t              displ = 0;        // valid when kind=Direct
-    std::vector<SymbolId> names;             // valid when kind=RecBuild
+    /// Shared with the originating ir::RecVarOrigin; O(1) copy.
+    /// Valid when kind == RecBuild (otherwise null).
+    std::shared_ptr<const std::vector<SymbolId>> names;
 };
 
 struct SubExprCacheEntry {
@@ -165,7 +167,7 @@ static void populateSubExprCacheLocal(
                     UpvalueSource src;
                     src.kind  = UpvalueSource::Kind::RecBuild;
                     src.level = rit->second->level;
-                    src.names = rit->second->names;
+                    src.names = rit->second->names;  // shared_ptr<vector<SymbolId>>; O(1) copy.
                     entry.upvalueSources.push_back(std::move(src));
                     continue;
                 }
@@ -1151,8 +1153,8 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                         // chains.  Lazy bridging means only entries
                         // the v3 thunk's body actually accesses pay
                         // the bridge cost — typically 1–2 of N.
-                        const auto & names = src.names;
-                        if (names.empty()) return skipReturn(1);
+                        if (!src.names || src.names->empty()) return skipReturn(1);
+                        const auto & names = *src.names;
                         std::vector<std::pair<SymbolId, Value>> pairs;
                         pairs.reserve(names.size());
                         for (uint32_t i = 0; i < names.size(); ++i) {

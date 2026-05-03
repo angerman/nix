@@ -96,6 +96,12 @@ struct Lowerer
     /// owns the inheritFromExprs vector), so a simple stack suffices.
     std::vector<std::pmr::vector<nix::Expr *> *> inheritFromStack;
 
+    /// REVIEW MED-9: cache of shared rec-attrset name vectors keyed
+    /// by recVar.  resolveVar copies recAttrsNames into every
+    /// RecVarOrigin; pre-cache makes that copy O(1) once per recVar.
+    std::unordered_map<ir::VarId, std::shared_ptr<std::vector<ir::SymbolId>>>
+        recAttrsNamesCache;
+
     /// REVIEW HIGH-4: per-scope pre-lowered VarIds for the
     /// inheritFromExprs vector currently on top of inheritFromStack.
     /// Keyed by displ.  Pushed/popped in lockstep with inheritFromStack;
@@ -186,12 +192,22 @@ struct Lowerer
             // keeps the first.  `level` here matches the AST's
             // ExprVar::level, which is the same level tree-walker's
             // lookupVar will use to walk env->up.
+            //
+            // REVIEW MED-9: share one names vector per recVar across
+            // all refs.  Pre-fix copied the full names vector per
+            // ref, O(N^2) per let-rec on the names data alone.
             ir::FuncId f = funcStack.empty() ? ir::FuncId{0} : funcStack.back();
+            auto sharedNames = recAttrsNamesCache.find(rec);
+            if (sharedNames == recAttrsNamesCache.end()) {
+                auto p = std::make_shared<std::vector<ir::SymbolId>>(
+                    scopes[scopeIdx].recAttrsNames);
+                sharedNames = recAttrsNamesCache.emplace(rec, std::move(p)).first;
+            }
             ir::RecVarOrigin rvo;
             rvo.func   = f;
             rvo.recVar = rec;
             rvo.level  = level;
-            rvo.names  = scopes[scopeIdx].recAttrsNames;
+            rvo.names  = sharedNames->second;
             m.recVarOrigins.push_back(std::move(rvo));
             // WC-31: defer the AttrSelect by wrapping in a thunk.
             // Direct `AttrSelect{rec, nm}` runs at MAKE_CLOSURE time

@@ -392,7 +392,11 @@ struct RecVarOrigin {
     FuncId                func;
     VarId                 recVar;
     uint32_t              level;
-    std::vector<SymbolId> names;
+    /// Shared with the originating Scope::recAttrsNames so multiple
+    /// rec-binding refs can record their origin without copying the
+    /// names vector per ref (REVIEW MED-9: was an O(N^2) hot path on
+    /// nixpkgs-scale let-recs).
+    std::shared_ptr<const std::vector<SymbolId>> names;
 };
 
 struct Module {
