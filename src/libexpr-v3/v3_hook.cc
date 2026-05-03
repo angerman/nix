@@ -215,6 +215,14 @@ static void populateSubExprCacheLocal(
             }
             if (!ok) entry.upvalueSources.clear();
         }
+        // REVIEW MED-12: this remaining const_cast is monotonic-true:
+        // once an Expr is registered as a v3 cache candidate, it
+        // stays one for all states sharing the AST.  The mutation is
+        // benign across states because it only enables the
+        // eval-inline.hh fast-path branch (which then calls the v3
+        // hook, which has its own per-state skip set for structural
+        // failures).  The skipPermanently false-mutation that caused
+        // cross-state pollution was removed above.
         const_cast<nix::Expr *>(static_cast<const nix::Expr *>(sef.astExpr))
             ->isV3CacheCandidate = true;
         subCache.emplace(static_cast<const nix::Expr *>(sef.astExpr),
@@ -1090,13 +1098,21 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
             st.forceSkipReason[reasonIdx]++;
         return false;
     };
-    // WC-26: when the Expr's failure mode is structural (the Expr
-    // will permanently fail this hook regardless of env), clear
-    // isV3CacheCandidate so future forces skip the hook entirely
-    // at the eval-inline.hh:119 check.  Saves the per-force
-    // hashmap lookup + DepthGuard ctor cost on the hot path.
+    // REVIEW MED-12: per-thread skip set for Exprs whose subCache
+    // entry has structural failure (phaseBFailed or empty
+    // upvalueSources).  Pre-fix used const_cast on the AST flag,
+    // which mutated state shared across EvalStates -- a different
+    // EvalState with different hook config could legitimately handle
+    // the Expr but saw the cleared flag and skipped.
+    // Per-thread set: each thread's evaluator builds its own view;
+    // mutation safe; no cross-thread or cross-state leak.  The
+    // eval-inline.hh fast-path branch on isV3CacheCandidate stays
+    // (still set true once at populate time), so the hot path is
+    // still one branch + one hashset lookup on managed Exprs.
+    static thread_local std::unordered_set<const nix::Expr *> skipSet;
+    if (e && skipSet.count(e)) return skipReturn(0);
     auto skipPermanently = [&](size_t reasonIdx) {
-        if (e) const_cast<nix::Expr *>(e)->isV3CacheCandidate = false;
+        if (e) skipSet.insert(e);
         return skipReturn(reasonIdx);
     };
 
