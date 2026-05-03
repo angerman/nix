@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 #include <unordered_set>
 
 namespace nix::v3::ir {
@@ -278,7 +279,14 @@ void computeFreeVars(Module & m)
         return fv;
     };
 
+    // Phase-13 review MED-7: assert the fixed point actually
+    // converged.  The cap exists only as a runaway-loop guard; if we
+    // hit it without `changed` going false, freeVars are still in
+    // flux and downstream upvalue capture lists / MAKE_CLOSURE
+    // operands are wrong — silent miscompilation.  Promote to a
+    // hard error so pathological mutual recursion is loud.
     constexpr int kMaxIters = 16;
+    bool converged = false;
     for (int iter = 0; iter < kMaxIters; ++iter) {
         bool changed = false;
 
@@ -327,8 +335,13 @@ void computeFreeVars(Module & m)
             }
         }
 
-        if (!changed) break;
+        if (!changed) { converged = true; break; }
     }
+    if (!converged)
+        throw std::runtime_error(
+            "v3 computeFreeVars: free-var fixed-point did not converge "
+            "within 16 iterations; pathological mutual recursion likely.  "
+            "Aborting compilation rather than emitting wrong upvalue lists.");
 }
 
 } // namespace nix::v3::ir

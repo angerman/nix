@@ -1593,102 +1593,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 fr.thunk->state = ThunkState::Evaluated;
                 fr.thunk->evaluated = retVal;
 
-                // If the body returned a Suspended thunk (e.g., the
-                // common pattern where an `inherit` binding's body is
-                // just AttrSelect on the parent's rec attrs), force
-                // that next by setting up another thunk-return frame.
-                // This implements transitive force for the OP_FORCE
-                // bytecode op without C++ recursion.
-                //
-                // WC-38: this chain push is OPTIONAL.  When disabled,
-                // the outer thunk's evaluated remains a Suspended thunk;
-                // forceValue's own chase loop handles the chain at the
-                // consumer's request (matches tree-walker semantics).
-                // The chain push is over-eager: it forces the inner
-                // thunk's body to start running immediately as part of
-                // the outer's RETURN, even if no one needs it yet.  In
-                // nixpkgs, this causes deep bootstrap-chain evaluation
-                // INSIDE the lib.fix's `let x = f x; in x` body, while
-                // x is in Blackhole — sub-thunks then can't look up
-                // names via `with x;`.
-                // WC-38: chain push is now OFF by default.  When OP_FORCE
-                // pushed the popped frame, it set CFF_FORCE_RETRY on the
-                // CALLER frame (one level up).  After this OP_RETURN
-                // pops the popped frame, the caller-resume path below
-                // will check CFF_FORCE_RETRY and re-enter op_force_slow
-                // if retVal is still a Thunk/App — implementing
-                // GHC STG-style indirection (the consumer drives the
-                // chain, not the producer).
-                //
-                // Set NIX_V3_RETURN_CHAIN=1 to re-enable the legacy
-                // chain push for A/B testing.  Default is OFF — this is
-                // the WC-38 fix.
-                static const bool s_chain_enabled =
-                    std::getenv("NIX_V3_RETURN_CHAIN") != nullptr;
-                if (s_chain_enabled && retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Suspended) {
-                    Thunk * next = retVal.payload.thunk;
-                    // Same call-depth guard — chained let-rec recursion
-                    // (`let x = y; y = x; in x`) re-enters the next thunk
-                    // here without going through OP_CALL or OP_FORCE.
-                    if (__builtin_expect(vm.frames.size() >= 5000, 0))
-                        throw std::runtime_error("v3 OP_RETURN: stack overflow; call depth exceeded 5000");
-                    const LambdaDescriptor * desc =
-                        reinterpret_cast<const LambdaDescriptor *>(next->suspended.desc);
-                    Closure * fakeClo = Alloc::allocClosure(next->nUpvalues);
-                    fakeClo->desc = desc;
-                    fakeClo->nUpvalues = next->nUpvalues;
-                    fakeClo->capturedWiths = next->suspended.capturedWiths;
-                    fakeClo->cu = next->suspended.cu;
-                    for (uint16_t i = 0; i < next->nUpvalues; ++i)
-                        fakeClo->upvalues[i] = next->tail[i];
-                    next->state = ThunkState::Blackhole;
-                    const CompilationUnit * thunkCu = next->suspended.cu ? next->suspended.cu : cu;
-
-                    size_t newBase = vm.valueStack.size();
-                    vm.valueStack.resize(newBase + desc->nLocals);
-                    uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
-                    {
-                        static const bool s_dbg_force =
-                            std::getenv("V3_DBG_STORE_PREVSTAGE") != nullptr;
-                        if (s_dbg_force && next->nUpvalues == 5) {
-                            std::fprintf(stderr,
-                                "v3 OP_RETURN-chain: pushing thunk %p desc=%s "
-                                "codeOffset=%u nUp=%u cu=%p\n",
-                                (void*)next,
-                                !desc->name.empty() ? desc->name.c_str() : "<anon>",
-                                desc->codeOffset, (unsigned)next->nUpvalues,
-                                (void*)thunkCu);
-                        }
-                    }
-                    vm.frames.push_back(CallFrame{
-                        .cu = thunkCu,
-                        .closure = fakeClo,
-                        .thunk = next,
-                        .ip = desc->codeOffset,
-                        .stackBaseOffset = static_cast<uint32_t>(newBase),
-                        .withStackBase = newWithBase,
-                        .flags = CFF_THUNK_RETURN,
-                    });
-                    pushCapturedWiths(vm, next->suspended.capturedWiths);
-                    ip = desc->codeOffset;
-                    cu = thunkCu;
-                    closure = fakeClo;
-                    stackBase = newBase;
-                    // Also write the deeper resolution back to the
-                    // outer thunk we just popped: when the next thunk
-                    // resolves, it'll re-loop and update the original.
-                    // Actually we already set fr.thunk->evaluated to
-                    // retVal (which is the next thunk).  When next
-                    // resolves and the chase loop runs above, it'll
-                    // walk back through fr.thunk.  But fr.thunk is no
-                    // longer in `next->...` — so we need a chain of
-                    // references.  Simpler: leave fr.thunk pointing at
-                    // retVal; when next becomes Evaluated, the next
-                    // chase step (in any subsequent OP_RETURN's loop or
-                    // forceValue helper) follows from fr.thunk → next →
-                    // its eval.
-                    break;
-                }
+                // WC-38: the legacy "return-chain push" — eagerly
+                // forcing the next thunk if the outer's body returned
+                // a Suspended thunk — was kept behind
+                // NIX_V3_RETURN_CHAIN=1 for A/B testing after the
+                // WC-38 fix landed.  Phase-13 review MED-19 confirmed
+                // it's never needed: forceValue's chase loop already
+                // resolves the chain on the consumer's pull, and
+                // OP_RETURN's caller-resume path re-runs op_force_slow
+                // when CFF_FORCE_RETRY is set.  Removed entirely.
             }
             if (vm.frames.size() == exitDepth) {
                 finalResult = retVal;
