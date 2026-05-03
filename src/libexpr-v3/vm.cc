@@ -1911,9 +1911,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     }();
                     auto & a = allocStats();
                     if (s_stride && (a.thunksForced % s_stride) == 0) {
+                        const PosSnapshot * ps = resolvePosSnapshot(desc->posHandle);
+                        char posBuf[256] = "";
+                        if (ps && !ps->file.empty())
+                            std::snprintf(posBuf, sizeof posBuf,
+                                " at=%s:%u:%u", ps->file.c_str(),
+                                ps->line, ps->column);
                         std::fprintf(stderr,
                             "v3 PROGRESS: forced=%llu allocated=%llu "
-                            "ratio=%.3f frames=%zu arena=%lluMB hot=%s/%llu\n",
+                            "ratio=%.3f frames=%zu arena=%lluMB hot=%s/%llu%s\n",
                             (unsigned long long)a.thunksForced,
                             (unsigned long long)a.thunksAllocated,
                             a.thunksAllocated
@@ -1922,7 +1928,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             vm.frames.size(),
                             (unsigned long long)(threadArena().bytesAllocated() >> 20),
                             !desc->name.empty() ? desc->name.c_str() : "<anon>",
-                            (unsigned long long)desc->forceCount);
+                            (unsigned long long)desc->forceCount,
+                            posBuf);
                     }
                 }
             }

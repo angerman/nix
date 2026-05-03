@@ -916,6 +916,10 @@ struct Lowerer
         auto entry = m.freshBlock();
         m.functions[fid].entryBlock = entry;
         m.functions[fid].name = "<thunk>";
+        // Phase 13: record source position so V3_DBG_FORCE_TRACE +
+        // periodic V3_DBG_FORCES progress can map hot anonymous
+        // thunks back to their .nix file:line:column.
+        m.functions[fid].posHandle = posIdxToHandle(e->getPos());
 
         // CO-3: record (Expr* -> FuncId) for the post-compile pass to
         // WC-2: register every per-thunk function in the cutover
