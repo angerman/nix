@@ -280,32 +280,94 @@ void computeFreeVars(Module & m)
     // flux and downstream upvalue capture lists / MAKE_CLOSURE
     // operands are wrong — silent miscompilation.  Promote to a
     // hard error so pathological mutual recursion is loud.
+    //
+    // REVIEW MED-8: dirty-set propagation.  A function's freeVars
+    // depends only on its own blocks' refs, which include nested
+    // Lambda/MkThunk/LetRec freeVars.  When a child function's
+    // freeVars don't change in iteration N, no parent that captures
+    // it can change either — so we only need to re-compute parents
+    // of functions that DID change.  Build a reverse-deps map once,
+    // then iterate by working set.
     constexpr int kMaxIters = 16;
     bool converged = false;
+    const size_t nFuncs = m.functions.size();
+
+    // reverseDeps[fid] = list of parent FuncIds that contain a
+    // binding referencing fid.  Built once below by walking every
+    // block's bindings.  A LetRec entry's thunkBody is also a child.
+    std::vector<std::vector<FuncId>> reverseDeps(nFuncs);
+    {
+        // funcOfBlock[bid] = the FuncId whose entryBlock walk
+        // reaches block bid.  Computed via per-function reachability.
+        std::vector<FuncId> funcOfBlock(m.blocks.size(),
+            static_cast<FuncId>(nFuncs));  // sentinel = none
+        std::vector<BlockId> stack;
+        for (size_t fid = 0; fid < nFuncs; ++fid) {
+            if (m.functions[fid].entryBlock == kInvalidBlock) continue;
+            stack.push_back(m.functions[fid].entryBlock);
+            while (!stack.empty()) {
+                BlockId bid = stack.back(); stack.pop_back();
+                if (bid == kInvalidBlock || bid >= m.blocks.size()) continue;
+                if (funcOfBlock[bid] != static_cast<FuncId>(nFuncs)) continue;
+                funcOfBlock[bid] = static_cast<FuncId>(fid);
+                std::vector<BlockId> subs;
+                for (auto & bd : m.blocks[bid].bindings) {
+                    collectExprSubBlocks(bd.expr, subs);
+                }
+                for (auto sub : subs) stack.push_back(sub);
+            }
+        }
+        for (size_t bid = 1; bid < m.blocks.size(); ++bid) {
+            FuncId parent = funcOfBlock[bid];
+            if (parent == static_cast<FuncId>(nFuncs)) continue;
+            for (auto & bd : m.blocks[bid].bindings) {
+                std::visit([&](auto & e) {
+                    using T = std::decay_t<decltype(e)>;
+                    if constexpr (std::is_same_v<T, Lambda> ||
+                                  std::is_same_v<T, MkThunk>) {
+                        if (e.funcIdx < nFuncs)
+                            reverseDeps[e.funcIdx].push_back(parent);
+                    } else if constexpr (std::is_same_v<T, LetRec>) {
+                        for (auto & en : e.entries)
+                            if (en.thunkBody < nFuncs)
+                                reverseDeps[en.thunkBody].push_back(parent);
+                    }
+                }, bd.expr);
+            }
+        }
+    }
+
+    // Initially all functions are dirty (must compute at least once).
+    std::vector<uint8_t> dirty(nFuncs, 1);
+
     for (int iter = 0; iter < kMaxIters; ++iter) {
         bool changed = false;
+        std::vector<uint8_t> nextDirty(nFuncs, 0);
 
-        // Recompute each function's freeVars from its block refs.
-        for (size_t fid = 0; fid < m.functions.size(); ++fid) {
+        // Recompute freeVars only for dirty functions.
+        for (size_t fid = 0; fid < nFuncs; ++fid) {
+            if (!dirty[fid]) continue;
             auto fv = computeOne(static_cast<FuncId>(fid));
             if (m.functions[fid].freeVars != fv) {
                 m.functions[fid].freeVars = std::move(fv);
                 changed = true;
+                // Mark every parent that captures this function as
+                // dirty for the next iteration.
+                for (auto p : reverseDeps[fid]) nextDirty[p] = 1;
             }
         }
 
-        // Propagate to Lambda/MkThunk binding freeVars (used as upvalue
-        // capture order at MAKE_CLOSURE / MAKE_THUNK time).  LetRec
-        // entries get their outerUpvalues set to each thunk body's
-        // freeVars minus the rec-self VarId (which is supplied as the
-        // implicit first upvalue at MAKE_THUNK time).
+        // Propagate to Lambda/MkThunk/LetRec binding freeVars (used
+        // as upvalue capture order at MAKE_CLOSURE / MAKE_THUNK time).
+        // This pass is cheap and global -- needs to see every binding
+        // to keep the IR consistent before emit.
         for (auto & blk : m.blocks) {
             for (auto & bd : blk.bindings) {
                 std::visit([&](auto & e) {
                     using T = std::decay_t<decltype(e)>;
                     if constexpr (std::is_same_v<T, Lambda> ||
                                   std::is_same_v<T, MkThunk>) {
-                        if (e.funcIdx < m.functions.size()) {
+                        if (e.funcIdx < nFuncs) {
                             const auto & ff = m.functions[e.funcIdx].freeVars;
                             if (e.freeVars != ff) {
                                 e.freeVars = ff;
@@ -314,7 +376,7 @@ void computeFreeVars(Module & m)
                         }
                     } else if constexpr (std::is_same_v<T, LetRec>) {
                         for (auto & en : e.entries) {
-                            if (en.thunkBody >= m.functions.size()) continue;
+                            if (en.thunkBody >= nFuncs) continue;
                             const auto & ff = m.functions[en.thunkBody].freeVars;
                             std::vector<VarId> outers;
                             outers.reserve(ff.size());
@@ -331,6 +393,7 @@ void computeFreeVars(Module & m)
         }
 
         if (!changed) { converged = true; break; }
+        dirty = std::move(nextDirty);
     }
     if (!converged)
         throw std::runtime_error(
