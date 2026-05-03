@@ -96,6 +96,16 @@ struct Lowerer
     /// owns the inheritFromExprs vector), so a simple stack suffices.
     std::vector<std::pmr::vector<nix::Expr *> *> inheritFromStack;
 
+    /// REVIEW HIGH-4: per-scope pre-lowered VarIds for the
+    /// inheritFromExprs vector currently on top of inheritFromStack.
+    /// Keyed by displ.  Pushed/popped in lockstep with inheritFromStack;
+    /// populated lazily on first lookup and emptied otherwise.  When a
+    /// displ entry is non-zero, lowerInheritFrom returns it directly
+    /// (single shared thunk) instead of re-lowering the source
+    /// expression -- side-effecting `e` (`builtins.trace`, IFD) fires
+    /// once, matching tree-walker's buildInheritFromEnv semantics.
+    std::vector<std::vector<ir::VarId>> inheritFromCacheStack;
+
     /// nix::Symbol -> ir::SymbolId interning cache (per Lowerer).
     /// Avoids the std::string allocation + global-table hashmap lookup
     /// on every lowerVar/lowerAttrs/etc. access to a repeat symbol.
@@ -976,7 +986,37 @@ struct Lowerer
         auto * fromExprs = inheritFromStack.back();
         if (!fromExprs || e->displ >= fromExprs->size())
             unsupported("ExprInheritFrom: displ out of range");
+        // REVIEW HIGH-4: return the pre-lowered VarId so all N names
+        // in `inherit (e) x y z` share one thunk for `e`.  The cache
+        // is populated by the enclosing lowerAttrs / lowerLetRec
+        // BEFORE per-attr thunk bodies are entered, so the VarId
+        // lives in the outer function's scope and the thunk bodies
+        // pick it up as an upvalue via computeFreeVars.
+        auto & cache = inheritFromCacheStack.back();
+        if (e->displ < cache.size() && cache[e->displ] != ir::kInvalid)
+            return cache[e->displ];
+        // Fallback: cache wasn't populated (shouldn't happen on the
+        // happy path).  Lower fresh -- preserves correctness at the
+        // cost of the multi-fire bug for this displ.
         return lowerExpr((*fromExprs)[e->displ]);
+    }
+
+    /// Pre-lower every from-expr in `inheritFromExprs` into the
+    /// CURRENT (outer) function so per-attr thunk bodies share a
+    /// single VarId per displ.  Caller must have just pushed the
+    /// matching inheritFromStack entry; we push the matching cache
+    /// entry here.
+    void pushInheritFromCache(std::pmr::vector<nix::Expr *> * fromExprs)
+    {
+        std::vector<ir::VarId> cache;
+        if (fromExprs) {
+            cache.resize(fromExprs->size(), ir::kInvalid);
+            for (size_t i = 0; i < fromExprs->size(); ++i) {
+                if ((*fromExprs)[i])
+                    cache[i] = lowerExpr((*fromExprs)[i]);
+            }
+        }
+        inheritFromCacheStack.push_back(std::move(cache));
     }
     ir::VarId lowerConcatStrings(nix::ExprConcatStrings * e)
     {
@@ -1082,6 +1122,7 @@ struct Lowerer
         bool pushedInheritFrom = false;
         if (e->inheritFromExprs) {
             inheritFromStack.push_back(e->inheritFromExprs.get());
+            pushInheritFromCache(e->inheritFromExprs.get());
             pushedInheritFrom = true;
         }
 
@@ -1122,7 +1163,10 @@ struct Lowerer
                 ir::VarId valV  = thunkifyForAttr(da.valueExpr);
                 dyn.dynamics.push_back({nameV, valV, posIdxToHandle(da.pos)});
             }
-            if (pushedInheritFrom) inheritFromStack.pop_back();
+            if (pushedInheritFrom) {
+                inheritFromStack.pop_back();
+                inheritFromCacheStack.pop_back();
+            }
             return addBinding(std::move(dyn));
         }
 
@@ -1134,7 +1178,10 @@ struct Lowerer
             ir::VarId vv = thunkifyForAttr(def.e);
             entries.push_back({internSym(sym), vv, posIdxToHandle(def.pos)});
         }
-        if (pushedInheritFrom) inheritFromStack.pop_back();
+        if (pushedInheritFrom) {
+            inheritFromStack.pop_back();
+            inheritFromCacheStack.pop_back();
+        }
         return addBinding(ir::AttrSet{std::move(entries)});
     }
 
@@ -1225,6 +1272,19 @@ struct Lowerer
         bool pushedInheritFrom = false;
         if (inheritFromExprs) {
             inheritFromStack.push_back(inheritFromExprs);
+            // REVIEW HIGH-4: pre-lower from-exprs into the OUTER
+            // function so all N names in `inherit (e) ...` share one
+            // VarId.  Only safe when `isRec=false` (the from-exprs
+            // don't reference rec-bindings); for `isRec=true` the
+            // from-exprs may reference siblings whose recVar isn't
+            // yet allocated when the pre-lower bytecode runs (e.g.,
+            // `rec { inherit (x) y; x = ...; }` -- scope-7 lang test).
+            // Push an empty cache for the rec case so lowerInheritFrom
+            // falls back to its old per-name re-lower path.
+            if (!isRec)
+                pushInheritFromCache(inheritFromExprs);
+            else
+                inheritFromCacheStack.emplace_back();
             pushedInheritFrom = true;
         }
 
@@ -1255,7 +1315,10 @@ struct Lowerer
             funcStack.pop_back();
         }
 
-        if (pushedInheritFrom) inheritFromStack.pop_back();
+        if (pushedInheritFrom) {
+            inheritFromStack.pop_back();
+            inheritFromCacheStack.pop_back();
+        }
 
         ir::LetRec letRec;
         letRec.recVar = recVar;

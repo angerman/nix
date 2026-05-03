@@ -939,6 +939,28 @@ TESTS=(
   'let a = { xname = 1; }; b = { yname = 2; }; merged = a // b;
    in (builtins.unsafeGetAttrPos "yname" merged).column'
   '31'
+
+  # ----------------------------------------------------------------
+  # REVIEW HIGH-4: `inherit (e) x y z` in a non-rec attrset should
+  # lower `e` once and share across all N names.  Pre-fix v3 lowered
+  # `e` once per name; with 3 names that fires builtins.trace 3x.
+  # We can't directly count traces in a pure expression, but
+  # builtins.tryEval lets us observe a side effect via abort:
+  #   - If `e` is shared, abort fires exactly once (caught by tryEval
+  #     surrounds it once).
+  #   - If `e` is multi-lowered, each per-name lowering would re-build
+  #     a fresh thunk; if the thunk's body throws, repeat firings keep
+  #     each per-name access raising independently.
+  # Simpler probe: sum a counter incremented by ImpureValue.  Nix is
+  # pure, so we resort to the trace pattern -- the runner compares
+  # the whole stdout+stderr blob, so trace fires manifest as repeated
+  # "trace: fired" lines.  Test: expect one "trace: fired" in output.
+  # The expected value here is the FULL output.
+  REVIEW-HIGH-4-inherit-from-share-once
+  "inherit-from in non-rec attrset evaluates source once"
+  'let r = { inherit (builtins.trace "fired" { a = 1; b = 2; c = 3; }) a b c; };
+   in builtins.deepSeq (r.a + r.b + r.c) "ok"'
+  $'trace: fired\n"ok"'
 )
 
 pass=0
