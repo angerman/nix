@@ -2360,7 +2360,11 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         } else {
             EvalState v3state;
             v3state.nixEvalState = &ns;
-            static thread_local VMState bridgeVm1;
+            // REVIEW MED-16: stack-allocated -- previous static
+            // thread_local could leak frames from a failed prior call
+            // into the next.  Reserves remain (they avoided per-call
+            // reallocation, not persistence).
+            VMState bridgeVm1;
             bridgeVm1.valueStack.reserve(64 * 1024);
             bridgeVm1.frames.reserve(4096);
             bridgeVm1.withStack.reserve(64);
@@ -2398,7 +2402,8 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         case Tag::Slot: {
             EvalState bridgeState;
             bridgeState.nixEvalState = &ns;
-            static thread_local VMState resultBridgeVm;
+            // REVIEW MED-16: stack-allocated.
+            VMState resultBridgeVm;
             resultBridgeVm.valueStack.reserve(64 * 1024);
             resultBridgeVm.frames.reserve(4096);
             resultBridgeVm.withStack.reserve(64);
@@ -2464,7 +2469,8 @@ static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
     if (!tlNixEvalState) tlNixEvalState = &ns;
     EvalState v3state;
     v3state.nixEvalState = &ns;
-    static thread_local VMState bridgeVmAttr;
+    // REVIEW MED-16: stack-allocated.
+    VMState bridgeVmAttr;
     bridgeVmAttr.valueStack.reserve(64 * 1024);
     bridgeVmAttr.frames.reserve(4096);
     bridgeVmAttr.withStack.reserve(64);
@@ -2539,7 +2545,8 @@ static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
     if (!tlNixEvalState) tlNixEvalState = &ns;
     EvalState v3state;
     v3state.nixEvalState = &ns;
-    static thread_local VMState bridgeVmList;
+    // REVIEW MED-16: stack-allocated.
+    VMState bridgeVmList;
     bridgeVmList.valueStack.reserve(64 * 1024);
     bridgeVmList.frames.reserve(4096);
     bridgeVmList.withStack.reserve(64);
@@ -2888,12 +2895,11 @@ struct V3ToTreeWalkerShimInit {
     V3ToTreeWalkerShimInit() {
         v3ToTreeWalkerShim = +[](nix::EvalState & ns, Value v) -> nix::Value * {
             // v3ToTreeWalker calls forceValue(*state.vm, ...) on its
-            // input, so we MUST provide a VMState — otherwise the
-            // bridge dereferences a null pointer and SEGVs.  Use a
-            // thread-local VMState dedicated to bridge calls so its
-            // lifetime spans the program; multiple bridge invocations
-            // reuse the same state.  Same pattern as primV3CallBridge2.
-            static thread_local VMState bridgeShimVm;
+            // input, so we MUST provide a VMState -- otherwise the
+            // bridge dereferences a null pointer and SEGVs.
+            // REVIEW MED-16: stack-allocated; .reserve() avoids per-
+            // call vector reallocation, not persistence.
+            VMState bridgeShimVm;
             bridgeShimVm.valueStack.reserve(64 * 1024);
             bridgeShimVm.frames.reserve(4096);
             bridgeShimVm.withStack.reserve(64);
@@ -5516,7 +5522,8 @@ nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v)
 /// resulting type tree to produce a v3 Value.
 Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv)
 {
-    static thread_local VMState bridgeShimVm;
+    // REVIEW MED-16: stack-allocated.
+    VMState bridgeShimVm;
     bridgeShimVm.valueStack.reserve(64 * 1024);
     bridgeShimVm.frames.reserve(4096);
     bridgeShimVm.withStack.reserve(64);
