@@ -4195,20 +4195,23 @@ void primImport(EvalState & state, Value * args, Value & out)
 
     // WC-38 diagnostic: log every import path + sequence number to compare
     // import-order vs tree-walker.
-    {
-        static const bool s_dbg_import =
-            std::getenv("V3_DBG_IMPORT") != nullptr;
-        if (s_dbg_import) {
-            static std::atomic<uint64_t> seq{0};
-            std::fprintf(stderr, "v3 IMPORT[%llu]: %s\n",
-                (unsigned long long)seq.fetch_add(1), path.c_str());
-        }
-    }
+    static const bool s_dbg_import =
+        std::getenv("V3_DBG_IMPORT") != nullptr;
 
     auto & cache = importCache();
     if (auto it = cache.results.find(path); it != cache.results.end()) {
+        if (s_dbg_import) {
+            static std::atomic<uint64_t> seqHit{0};
+            std::fprintf(stderr, "v3 IMPORT-HIT[%llu]: %s\n",
+                (unsigned long long)seqHit.fetch_add(1), path.c_str());
+        }
         out = it->second;
         return;
+    }
+    if (s_dbg_import) {
+        static std::atomic<uint64_t> seqMiss{0};
+        std::fprintf(stderr, "v3 IMPORT-MISS[%llu]: %s\n",
+            (unsigned long long)seqMiss.fetch_add(1), path.c_str());
     }
 
     auto & ns = *state.nixEvalState;
