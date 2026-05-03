@@ -120,6 +120,35 @@ static std::unordered_map<const nix::Expr *, SubExprCacheEntry> & v3SubExprCache
     return tbl;
 }
 
+/// REVIEW MED-17: per-(env, names) memoization of RecBuild Bindings.
+/// Every force with a RecBuild upvalue source builds a fresh
+/// Bindings* + N Bridge thunks; tree-walker's Env identity is stable
+/// across forces, so memoizing by (env-pointer, shared-names-pointer)
+/// turns the second-and-later forces into a single hash lookup.
+/// Key: pair of (nix::Env *, const std::vector<SymbolId> *) -- the
+/// names pointer is the shared_ptr's underlying pointer (MED-9), which
+/// is identical across UpvalueSources for the same recVar.
+struct RecBuildCacheKey {
+    const nix::Env *  env;
+    const std::vector<SymbolId> * names;
+    bool operator==(const RecBuildCacheKey & o) const noexcept
+    { return env == o.env && names == o.names; }
+};
+struct RecBuildCacheKeyHash {
+    size_t operator()(const RecBuildCacheKey & k) const noexcept
+    {
+        return std::hash<const void *>{}(k.env)
+             ^ (std::hash<const void *>{}(k.names) << 1);
+    }
+};
+static std::unordered_map<RecBuildCacheKey, Bindings *, RecBuildCacheKeyHash>
+    & recBuildCache()
+{
+    thread_local std::unordered_map<RecBuildCacheKey, Bindings *,
+                                     RecBuildCacheKeyHash> tbl;
+    return tbl;
+}
+
 /// Populate `v3SubExprCache` from a freshly lowered + compiled module.
 /// Used by the eval hook (after lower+compile via the cutover) and by
 /// primImport (WC-4) so that imported files contribute their per-thunk
@@ -1154,33 +1183,48 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                         // the v3 thunk's body actually accesses pay
                         // the bridge cost — typically 1–2 of N.
                         if (!src.names || src.names->empty()) return skipReturn(1);
-                        const auto & names = *src.names;
-                        std::vector<std::pair<SymbolId, Value>> pairs;
-                        pairs.reserve(names.size());
-                        for (uint32_t i = 0; i < names.size(); ++i) {
-                            nix::Value * srcV = cur->values[i];
-                            if (!srcV) return skipReturn(3);
-                            // Allocate a Bridge thunk per entry —
-                            // no eager forceValue, no eager bridge.
-                            Thunk * bridge = Alloc::allocBridgeThunk(
-                                static_cast<void *>(srcV));
-                            allocStats().thunksAllocated++;
-                            Value entry;
-                            entry.tag_payload =
-                                static_cast<uint64_t>(Tag::Thunk);
-                            entry.payload.thunk = bridge;
-                            pairs.emplace_back(names[i], entry);
-                        }
-                        std::sort(pairs.begin(), pairs.end(),
-                            [](auto & a, auto & b) {
-                                return a.first < b.first;
-                            });
-                        Bindings * b = Alloc::allocBindings(
-                            static_cast<uint32_t>(pairs.size()));
-                        allocStats().attrsetsAllocated++;
-                        for (size_t i = 0; i < pairs.size(); ++i) {
-                            b->entries[i].name  = pairs[i].first;
-                            b->entries[i].value = pairs[i].second;
+                        // REVIEW MED-17: memoize the per-(env, names)
+                        // Bindings*.  Tree-walker's env values are
+                        // identity-stable across forces, so the second
+                        // and later forces of the same per-thunk
+                        // function with the same enclosing env can
+                        // reuse the previously-built Bindings + Bridge
+                        // thunks.
+                        RecBuildCacheKey k{cur, src.names.get()};
+                        auto & cache = recBuildCache();
+                        Bindings * b;
+                        if (auto cit = cache.find(k); cit != cache.end()) {
+                            b = cit->second;
+                        } else {
+                            const auto & names = *src.names;
+                            std::vector<std::pair<SymbolId, Value>> pairs;
+                            pairs.reserve(names.size());
+                            for (uint32_t i = 0; i < names.size(); ++i) {
+                                nix::Value * srcV = cur->values[i];
+                                if (!srcV) return skipReturn(3);
+                                // Allocate a Bridge thunk per entry —
+                                // no eager forceValue, no eager bridge.
+                                Thunk * bridge = Alloc::allocBridgeThunk(
+                                    static_cast<void *>(srcV));
+                                allocStats().thunksAllocated++;
+                                Value entry;
+                                entry.tag_payload =
+                                    static_cast<uint64_t>(Tag::Thunk);
+                                entry.payload.thunk = bridge;
+                                pairs.emplace_back(names[i], entry);
+                            }
+                            std::sort(pairs.begin(), pairs.end(),
+                                [](auto & a, auto & b) {
+                                    return a.first < b.first;
+                                });
+                            b = Alloc::allocBindings(
+                                static_cast<uint32_t>(pairs.size()));
+                            allocStats().attrsetsAllocated++;
+                            for (size_t i = 0; i < pairs.size(); ++i) {
+                                b->entries[i].name  = pairs[i].first;
+                                b->entries[i].value = pairs[i].second;
+                            }
+                            cache.emplace(k, b);
                         }
                         Value v;
                         v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
