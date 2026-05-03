@@ -226,7 +226,14 @@ private:
 
     void refill() noexcept
     {
-        char * blk = static_cast<char *>(std::malloc(kBlockSize));
+        // Phase-13 review HIGH-6 fix: zero-fill the block before
+        // GC_add_roots.  Boehm scans every word in the registered
+        // region; OS-recycled garbage often contains pointer-shaped
+        // bit patterns that pin Boehm-managed objects until process
+        // exit (phantom retention scaling with arena lifetime).
+        // calloc gives us a zero page directly from the kernel —
+        // cheaper than malloc + memset for fresh allocations.
+        char * blk = static_cast<char *>(std::calloc(1, kBlockSize));
         blocks.push_back(blk);
         cur = blk;
         end = blk + kBlockSize;
