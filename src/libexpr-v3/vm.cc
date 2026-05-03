@@ -329,22 +329,39 @@ inline std::string coerceToString(const Value & v, bool forceString)
 
 inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
 {
-    // Sorted-merge two attrsets (b wins on duplicate keys).
+    // Sorted-merge two attrsets (b wins on duplicate keys).  Per-attr
+    // positions in attrPosTable are keyed by (Bindings*, SymbolId), so
+    // when an entry is copied to the freshly-allocated `out`, we
+    // forward its source position too.  Without this,
+    // `builtins.unsafeGetAttrPos` on a merged attrset returns null
+    // for every name (REVIEW critic §8 #4).
     const uint32_t na = a->size, nb = b->size;
     Bindings * out = Alloc::allocBindings(na + nb);
     uint32_t i = 0, j = 0, k = 0;
+    auto copyA = [&]() {
+        out->entries[k] = a->entries[i];
+        if (uint32_t p = lookupAttrPos(a, a->entries[i].name))
+            recordAttrPos(out, out->entries[k].name, p);
+        ++k; ++i;
+    };
+    auto copyB = [&]() {
+        out->entries[k] = b->entries[j];
+        if (uint32_t p = lookupAttrPos(b, b->entries[j].name))
+            recordAttrPos(out, out->entries[k].name, p);
+        ++k; ++j;
+    };
     while (i < na && j < nb) {
         if (a->entries[i].name < b->entries[j].name) {
-            out->entries[k++] = a->entries[i++];
+            copyA();
         } else if (a->entries[i].name > b->entries[j].name) {
-            out->entries[k++] = b->entries[j++];
+            copyB();
         } else {
-            out->entries[k++] = b->entries[j++]; // duplicate; b wins
-            i++;
+            copyB();   // duplicate; b wins (incl. its position)
+            ++i;
         }
     }
-    while (i < na) out->entries[k++] = a->entries[i++];
-    while (j < nb) out->entries[k++] = b->entries[j++];
+    while (i < na) copyA();
+    while (j < nb) copyB();
     out->size = k;
     return out;
 }
@@ -844,9 +861,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // (notably tryEval / inherit-from temp slots) write to a
             // slot that wasn't reserved by the function's nLocals
             // count — see eval-okay-tryeval-failed-thunk-reeval.
-            // Fast path: slot is already in range — just pop+store, no grow.
+            // Fast path: target slot already exists below the value
+            // we're about to pop.  Use `idx + 1 < size` to avoid the
+            // unsigned-underflow trap when valueStack is empty (size-1
+            // would wrap to SIZE_MAX and the bound check would always
+            // succeed, dereferencing past the end).
             const size_t idx = stackBase + operand;
-            if (__builtin_expect(idx < vm.valueStack.size() - 1, 1)) {
+            if (__builtin_expect(idx + 1 < vm.valueStack.size(), 1)) {
                 vm.valueStack[idx] = vm.valueStack.back();
                 vm.valueStack.pop_back();
             } else {

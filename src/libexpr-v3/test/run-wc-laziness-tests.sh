@@ -922,6 +922,23 @@ TESTS=(
   # catch only matches BlackholeError, so ThrownError propagates.
   'with { y = 99; }; let x = throw "user blackhole here"; in with x; y'
   '__ERROR__'
+
+  # ----------------------------------------------------------------
+  # REVIEW critic: mergeBindings (used by `//`) must propagate per-
+  # attr positions so unsafeGetAttrPos works on merged attrsets.
+  # Pre-fix: positions were not forwarded; lookup returned null.
+  # ----------------------------------------------------------------
+  REVIEW-critic-mergebindings-pos-from-lhs
+  "mergeBindings propagates per-attr pos from LHS"
+  'let a = { xname = 1; }; b = { yname = 2; }; merged = a // b;
+   in (builtins.unsafeGetAttrPos "xname" merged).column'
+  '11'
+
+  REVIEW-critic-mergebindings-pos-from-rhs
+  "mergeBindings propagates per-attr pos from RHS"
+  'let a = { xname = 1; }; b = { yname = 2; }; merged = a // b;
+   in (builtins.unsafeGetAttrPos "yname" merged).column'
+  '31'
 )
 
 pass=0
