@@ -2936,8 +2936,21 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
     case nix::nFloat:  out.mkFloat(nv.fpoint()); return out;
     case nix::nBool:   out = nv.boolean() ? Value::vTrue : Value::vFalse; return out;
     case nix::nNull:   out.mkNull(); return out;
+    case nix::nFunction: {
+        // REVIEW MED-1: wrap a tree-walker function in a v3 Bridge
+        // thunk.  v3ToTreeWalker's Bridge short-circuit then unwraps
+        // the thunk back to the original nix::Value*, so the
+        // tw -> v3 -> tw round-trip preserves identity (callable
+        // function instead of mkNull).  Without this wrap, code like
+        // `let f = tw_id; in [f f]` after a v3 -> tw -> v3 transition
+        // loses `f`.
+        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
+        allocStats().thunksAllocated++;
+        out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+        out.payload.thunk = bridge;
+        return out;
+    }
     case nix::nThunk:
-    case nix::nFunction:
     case nix::nExternal:
     case nix::nFailed:
         out.mkNull(); return out;
