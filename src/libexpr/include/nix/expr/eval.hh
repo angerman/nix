@@ -752,24 +752,6 @@ public:
     static V3RegisterExprHook v3RegisterExprHook;
 
     /**
-     * WC-14: callFunction cutover hook.  Called from
-     * EvalState::callFunction BEFORE tree-walker's own isLambda /
-     * isPrimOp dispatch, when `fun` is a Lambda whose env pointer
-     * matches v3's sentinel (i.e., the Lambda was produced by v3 and
-     * crossed back to tree-walker via the bridge).  Lets v3 own the
-     * body's evaluation on its own dispatcher frame stack instead of
-     * recursing through tree-walker's C++ Expr::eval — the
-     * mechanism by which we eliminate cross-VM stack growth.
-     *
-     * Returns true if v3 handled the call (and filled `vRes`); false
-     * to fall through to the standard tree-walker dispatch.
-     */
-    using V3CallFunctionHook = bool (*)(EvalState &, Value & fun,
-                                        std::span<Value *> args,
-                                        Value & vRes, const PosIdx pos);
-    static V3CallFunctionHook v3CallFunctionHook;
-
-    /**
      * WC-14.6 bounded-depth yield: when a v3 hook (force or
      * callFunction) is on the call stack, the v3 entry bumps
      * `v3HookActiveDepth` and forceValue tracks its own recursion

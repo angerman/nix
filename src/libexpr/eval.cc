@@ -1203,7 +1203,6 @@ void EvalState::resetFileCache()
 EvalState::V3EvalHook EvalState::v3EvalHook = nullptr;
 EvalState::V3ForceHook EvalState::v3ForceHook = nullptr;
 EvalState::V3RegisterExprHook EvalState::v3RegisterExprHook = nullptr;
-EvalState::V3CallFunctionHook EvalState::v3CallFunctionHook = nullptr;
 
 // WC-14.6: bounded-depth yield state.
 thread_local int EvalState::v3HookActiveDepth = 0;
@@ -1823,18 +1822,6 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
     const Attr * functor;
 
     while (args.size() > 0) {
-
-        // WC-14: v3 callFunction hook.  When `vCur` is a Lambda that
-        // v3 produced (recognised via a sentinel env tag) and v3 wants
-        // to own the body's evaluation, route the call into v3's
-        // dispatcher instead of recursing through tree-walker's
-        // ExprLambda body eval.  Eliminates the C-stack growth that
-        // forced WC-12's force-hook to stay opt-in.  Returns true on
-        // success (vRes filled, all args consumed).
-        if (vCur.isLambda() && v3CallFunctionHook
-            && v3CallFunctionHook(*this, vCur, args, vRes, pos)) {
-            return;
-        }
 
         if (vCur.isLambda()) {
 
