@@ -113,4 +113,13 @@ void registerBuiltinPrimOps();
 void bumpPrimOpCallCount(const PrimOp * po);
 void dumpPrimOpStats(std::FILE * out);
 
+struct CompilationUnit;
+/// Walk every CompilationUnit reachable from the import cache plus the
+/// supplied entry CU and print the top `limit` LambdaDescriptors by
+/// `forceCount`.  Used by V3_DBG_FORCES to surface the dominant hot
+/// thunk-bodies across the whole evaluation, not just the top-level
+/// expression's CU.
+void dumpHotDescriptors(std::FILE * out, size_t limit,
+                         const CompilationUnit * entryCu);
+
 } // namespace nix::v3

@@ -5388,6 +5388,53 @@ void dumpPrimOpStats(std::FILE * out)
                      rows[i].first.c_str());
 }
 
+void dumpHotDescriptors(std::FILE * out, size_t limit,
+                         const CompilationUnit * entryCu)
+{
+    // Collect every (forceCount, desc, cu) triple from importCache()'s
+    // CUs and the entry CU.  Skip descriptors with zero forces — most
+    // lambdas are cold.
+    struct Row {
+        uint64_t                       forces;
+        const LambdaDescriptor *       desc;
+        const CompilationUnit *        cu;
+    };
+    std::vector<Row> rows;
+    auto walk = [&](const CompilationUnit & cu) {
+        for (const auto & d : cu.lambdas) {
+            if (d.forceCount > 0)
+                rows.push_back({d.forceCount, &d, &cu});
+        }
+    };
+    auto & cache = importCache();
+    for (const auto & cu : cache.cus) walk(cu);
+    if (entryCu) walk(*entryCu);
+    if (rows.empty()) return;
+    std::sort(rows.begin(), rows.end(),
+        [](const Row & a, const Row & b) { return a.forces > b.forces; });
+    size_t n = std::min(rows.size(), limit);
+    std::fprintf(out,
+        "v3 hot LambdaDescriptors (top %zu of %zu, all CUs):\n",
+        n, rows.size());
+    for (size_t i = 0; i < n; ++i) {
+        const auto & d = *rows[i].desc;
+        const PosSnapshot * ps = resolvePosSnapshot(d.posHandle);
+        std::string posStr;
+        if (ps && !ps->file.empty()) {
+            posStr = ps->file + ":" + std::to_string(ps->line)
+                   + ":" + std::to_string(ps->column);
+        }
+        std::fprintf(out,
+            "  forces=%-9llu nUp=%-3u name=%-30s cu=%p%s%s\n",
+            (unsigned long long)rows[i].forces,
+            (unsigned)d.nUpvalues,
+            d.name.empty() ? "<anon>" : d.name.c_str(),
+            (const void *)rows[i].cu,
+            posStr.empty() ? "" : "  ",
+            posStr.c_str());
+    }
+}
+
 // Forward to the anonymous-namespace shim (initialised at static-init
 // time).  Public — callable from v3_hook.cc.
 namespace { extern nix::Value * (*v3ToTreeWalkerShim)(nix::EvalState &, Value); }
