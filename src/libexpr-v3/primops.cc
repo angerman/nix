@@ -96,6 +96,19 @@ std::unordered_map<std::string, PrimOp> & registry()
 
 thread_local nix::EvalState * tlNixEvalState = nullptr;
 
+/// REVIEW MED-13: scoped guard for tlNixEvalState.  Bridge entries
+/// installed only on null (`if (!tlNixEvalState) tlNixEvalState = &ns`)
+/// would silently use a stale pointer if a different EvalState later
+/// re-entered v3 -- e.g., a library consumer (Hydra, LSP, test
+/// harness) that creates and destroys multiple EvalStates on the
+/// same thread.  Use this RAII guard at every bridge entry to push
+/// the current EvalState and restore the previous on exit.
+struct ScopedNixEvalState {
+    nix::EvalState * prev;
+    ScopedNixEvalState(nix::EvalState * cur) : prev(tlNixEvalState) { tlNixEvalState = cur; }
+    ~ScopedNixEvalState() { tlNixEvalState = prev; }
+};
+
 // String-context side-table is in alloc.hh — entries are encoded
 // strings (`<path>` Opaque, `=<drvPath>` DrvDeep, `!<output>!<drvPath>`
 // Built).  Helpers below convert to/from nix::NixStringContext.
@@ -2299,8 +2312,7 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     Value v3fn = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
 
-    extern thread_local nix::EvalState * tlNixEvalState;
-    if (!tlNixEvalState) tlNixEvalState = &ns;
+    ScopedNixEvalState _v3evalGuard(&ns);
     ns.forceValue(*args[1], pos);
 
     // WC-18.3: run the v3 closure body in a fiber.  treeWalkerToV3
@@ -2465,8 +2477,7 @@ static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
 
     // Bridge this single value.  Set up an EvalState + thread_local
     // shim VMState (mirrors the closure-bridge primop pattern).
-    extern thread_local nix::EvalState * tlNixEvalState;
-    if (!tlNixEvalState) tlNixEvalState = &ns;
+    ScopedNixEvalState _v3evalGuard(&ns);
     EvalState v3state;
     v3state.nixEvalState = &ns;
     // REVIEW MED-16: stack-allocated.
@@ -2541,8 +2552,7 @@ static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
     if (idx < 0 || (uint32_t)idx >= l->size)
         ns.error<nix::EvalError>("v3 forceListElem: index out of range").debugThrow();
 
-    extern thread_local nix::EvalState * tlNixEvalState;
-    if (!tlNixEvalState) tlNixEvalState = &ns;
+    ScopedNixEvalState _v3evalGuard(&ns);
     EvalState v3state;
     v3state.nixEvalState = &ns;
     // REVIEW MED-16: stack-allocated.
