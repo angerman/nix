@@ -226,11 +226,9 @@ struct Lowerer
             //
             // Cost: one extra Thunk allocation per rec freeVar +
             // one extra force.  Worth it for the correctness fix.
-            // Opt out via NIX_V3_NO_THUNKIFY_REC=1 for A/B testing.
-            static const bool noThunkify =
-                std::getenv("NIX_V3_NO_THUNKIFY_REC") != nullptr;
-            if (noThunkify)
-                return addBinding(ir::AttrSelect{rec, nm});
+            // (The prior NIX_V3_NO_THUNKIFY_REC A/B gate has been
+            // removed -- thunkification is the verified-correct
+            // default; REVIEW-COMP §8.6.)
             // Phase 13: NIX_V3_INLINE_REC_SLOT=1 — skip the MkThunk
             // wrapper and emit ir::RecBindingSlotRef directly at the
             // consumer site.  The slot is heap-stable (Tag::Slot)
@@ -280,16 +278,12 @@ struct Lowerer
 
         funcStack.push_back(fid);
         blockStack.push_back(entry);
-        // WC-38 Phase 5b A/B gate: NIX_V3_NO_REC_SLOT_REF=1 reverts
-        // the body to ir::AttrSelect (pre-Phase 5 behavior — returns
-        // the entry's Value snapshot, NOT a Tag::Slot pointer).  Used
-        // to A/B test whether Phase 5's slot-pointer + memoization
-        // causes upstream eager-force divergence.
-        static const bool s_noSlotRef =
-            std::getenv("NIX_V3_NO_REC_SLOT_REF") != nullptr;
-        ir::VarId selectVar = s_noSlotRef
-            ? addBinding(ir::AttrSelect{rec, nm})
-            : addBinding(ir::RecBindingSlotRef{rec, nm});
+        // WC-38 Phase 5: thunk body returns a Tag::Slot pointer
+        // (heap-stable into Bindings::entries[i].value), not a
+        // snapshot.  REVIEW-COMP §8.6: the prior
+        // `NIX_V3_NO_REC_SLOT_REF` A/B gate is removed -- the slot
+        // ref is the verified-correct default since Phase 5.
+        ir::VarId selectVar = addBinding(ir::RecBindingSlotRef{rec, nm});
         setReturn(selectVar);
         blockStack.pop_back();
         funcStack.pop_back();
@@ -1040,17 +1034,15 @@ struct Lowerer
     template<class AstNode, class IRNode>
     ir::VarId lowerBinOp(AstNode * e, IRNode)
     {
-        // Strict binary op: force both operands so the VM ops see WHNF.
-        // WC-38 experiment: NIX_V3_NO_BINOP_FORCE=1 skips both forces.
-        // Used to A/B test whether emit-time binop force triggers eager
-        // sub-thunk firing during lib.fix's body (frame trace shows
-        // OpUpdate LHS force at lower.cc:984 fires inner callPackages
-        // thunk).  VM ops should still WHNF at runtime if the gate is
-        // set; this just defers the force.
-        static const bool s_noBinopForce =
-            std::getenv("NIX_V3_NO_BINOP_FORCE") != nullptr;
-        ir::VarId a = s_noBinopForce ? lowerExpr(e->e1) : forceVal(lowerExpr(e->e1));
-        ir::VarId b = s_noBinopForce ? lowerExpr(e->e2) : forceVal(lowerExpr(e->e2));
+        // Strict binary op: force both operands so the VM ops see
+        // WHNF.  OP_ADD / OP_SUB / OP_LESS / etc. don't auto-force
+        // (their fast path checks isInt and falls through to a
+        // type-mismatch throw on Thunks), so the emit-time force
+        // is required.  REVIEW-COMP §8.6: the prior
+        // `NIX_V3_NO_BINOP_FORCE` A/B gate is removed -- the
+        // forces were retained as the verified-correct default.
+        ir::VarId a = forceVal(lowerExpr(e->e1));
+        ir::VarId b = forceVal(lowerExpr(e->e2));
         IRNode op{a, b};
         return addBinding(op);
     }

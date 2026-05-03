@@ -614,24 +614,15 @@ struct Emitter
         // legacy OP_GET_LOCAL/UPVALUE + OP_WITH_PUSH path.
         bool emittedSlotRef = false;
         if (e.recAttrsVar != ir::kInvalid && e.recAttrsName != ir::kInvalidSymbol) {
-            // Push the rec-attrset value, force it to attrset shape,
-            // then OP_REC_BINDING_SLOT_REF looks up the entry and
-            // pushes Tag::Slot.
+            // Push the rec-attrset value, then OP_REC_BINDING_SLOT_REF
+            // looks up the entry and pushes Tag::Slot.
             //
-            // WC-38 Experiment A: NIX_V3_NO_WITH_FORCE=1 skips the
-            // emit-time OP_FORCE.  OP_REC_BINDING_SLOT_REF still does
-            // its own receive-side force at vm.cc, so functionality
-            // stays correct.  Toggle for A/B testing whether the
-            // emit-time force triggers nixpkgs' callPackages
-            // blackhole.  See emit.cc agent investigation result.
-            static const bool s_skipForce =
-                std::getenv("NIX_V3_NO_WITH_FORCE") != nullptr;
+            // REVIEW-COMP §8.6 + MED-5 follow-on: the prior emit-time
+            // OP_FORCE here was redundant -- OP_REC_BINDING_SLOT_REF
+            // already forces its source on the runtime fast path
+            // (vm.cc).  The NIX_V3_NO_WITH_FORCE A/B gate is removed;
+            // the no-force path is the verified-correct default.
             emitVarRef(e.recAttrsVar);
-            if (!s_skipForce) {
-                recordForceSite(internEmitSiteString(
-                    "emit.cc:" V3_STRINGIFY(__LINE__)));
-                unit.code.push_back(encode(OP_FORCE));
-            }
             unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.recAttrsName));
             unit.code.push_back(encode(OP_WITH_PUSH));
             emittedSlotRef = true;

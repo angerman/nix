@@ -1164,22 +1164,18 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                         // semantics.  Allocate a Bridge thunk holding
                         // nix::Value*; OP_FORCE on the slot resolves on
                         // demand via forceBridgeThunk (primops.cc).
-                        // Mirrors the RecBuild path below.  Opt out via
-                        // V3_NO_DEFER_UPVALUE=1 for A/B testing.
-                        static const bool noDeferUpvalues =
-                            std::getenv("V3_NO_DEFER_UPVALUE") != nullptr;
-                        if (!noDeferUpvalues) {
-                            Thunk * bridge = Alloc::allocBridgeThunk(
-                                static_cast<void *>(srcV));
-                            allocStats().thunksAllocated++;
-                            Value entry;
-                            entry.tag_payload =
-                                static_cast<uint64_t>(Tag::Thunk);
-                            entry.payload.thunk = bridge;
-                            upvalues.push_back(entry);
-                        } else {
-                            upvalues.push_back(treeWalkerToV3Public(state, *srcV));
-                        }
+                        // Mirrors the RecBuild path below.  REVIEW-COMP
+                        // §8.6: the V3_NO_DEFER_UPVALUE A/B gate is
+                        // removed; defer-via-Bridge is the verified-
+                        // correct default.
+                        Thunk * bridge = Alloc::allocBridgeThunk(
+                            static_cast<void *>(srcV));
+                        allocStats().thunksAllocated++;
+                        Value entry;
+                        entry.tag_payload =
+                            static_cast<uint64_t>(Tag::Thunk);
+                        entry.payload.thunk = bridge;
+                        upvalues.push_back(entry);
                     } else {
                         st.forceHookRecBuildUpvalues++;
                         sawRecBuild = true;

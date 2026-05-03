@@ -2658,11 +2658,14 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // primop calls, so nixpkgs's huge / self-referential lists
         // don't trigger eager-recursion cycles.  Gated by
         // NIX_V3_NO_LAZY_BRIDGE for A/B testing and fallback.
+        // Lazy bridge for large lists (n > 4); small lists eager-bridge
+        // since the per-element thunk overhead exceeds the deferred-
+        // force win.  REVIEW-COMP §8.6: the prior NIX_V3_NO_LAZY_BRIDGE
+        // A/B gate is removed -- lazy bridging is the verified-correct
+        // default for all sizes above the cutoff.
         auto * lv = v.payload.list;
         uint32_t n = lv ? lv->size : 0;
-        static const bool noLazy =
-            std::getenv("NIX_V3_NO_LAZY_BRIDGE") != nullptr;
-        if (noLazy || n <= 4) {
+        if (n <= 4) {
             auto lb = ns.buildList(n);
             for (uint32_t i = 0; i < n; ++i)
                 lb[i] = v3ToTreeWalker(state, lv->elems[i], seen);
@@ -2746,10 +2749,9 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // conversion via App primop calls so nixpkgs's huge self-
         // referential pkgs structure doesn't trigger eager-recursion
         // cycles.  Small attrsets stay eager (lower overhead).
-        static const bool noLazy =
-            std::getenv("NIX_V3_NO_LAZY_BRIDGE") != nullptr;
+        // REVIEW-COMP §8.6: NIX_V3_NO_LAZY_BRIDGE A/B gate removed.
         size_t bSize = b ? b->size : 0;
-        if (noLazy || bSize <= 4) {
+        if (bSize <= 4) {
             if (b) for (uint32_t i = 0; i < b->size; ++i) {
                 SymbolId sid = b->entries[i].name;
                 nix::Symbol resolved;
