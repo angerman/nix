@@ -320,17 +320,11 @@ struct Emitter
         // For now: store path string in stringConstants; accessor table TBD.
         unit.code.push_back(encode(OP_LIT_PATH, addStringConst(e.path)));
     }
-    void emitOne(const ir::PosExpr &)
-    {
-        unit.code.push_back(encode(OP_POS));
-    }
-
     // -- Variable / scoping
     void emitOne(const ir::VarRef & e) { emitVarRef(e.var); }
     void emitOne(const ir::WithLookup & e)
     {
         unit.code.push_back(encode(OP_WITH_LOOKUP, e.name));
-        unit.code.push_back(static_cast<uint32_t>(e.depth));
     }
 
     // -- Functions
@@ -382,7 +376,6 @@ struct Emitter
     void emitOne(const ir::Sub & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_SUB)); }
     void emitOne(const ir::Mul & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_MUL)); }
     void emitOne(const ir::Div & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_DIV)); }
-    void emitOne(const ir::Negate& e){ emitVarRef(e.operand); unit.code.push_back(encode(OP_NEGATE)); }
     void emitOne(const ir::Eq  & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_EQ));  }
     void emitOne(const ir::NEq & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_NEQ)); }
     void emitOne(const ir::Less& e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_LESS));}
@@ -473,19 +466,6 @@ struct Emitter
         // Dynamic-name positions follow the static block, one per
         // dynamic entry (positions for static names then dyn names).
         for (auto & en : e.dynamics) unit.code.push_back(en.pos);
-    }
-    void emitOne(const ir::RecAttrSet & e)
-    {
-        // For now treat as non-rec; real rec lowering is done by the
-        // AST→IR pass (it emits MkThunk wrappers + a synthetic selfVar).
-        for (auto & en : e.entries) emitVarRef(en.value);
-        unit.code.push_back(encode(OP_ATTRS_REC_INIT, static_cast<uint32_t>(e.entries.size())));
-        for (auto & en : e.entries) {
-            unit.code.push_back(en.name);
-            unit.code.push_back(en.pos);
-        }
-        // Honor __overrides for rec attrsets too.
-        unit.code.push_back(encode(OP_APPLY_OVERRIDES));
     }
     void emitOne(const ir::AttrSelect & e)
     {
@@ -683,9 +663,6 @@ struct Emitter
     {
         if (!visited.insert(bid).second) return;
         const ir::Block & b = m.blocks[bid];
-        for (auto pv : b.params) {
-            auto _slot = getOrAssignSlot(fc, pv); (void)_slot;
-        }
         for (auto & bd : b.bindings) {
             (void)getOrAssignSlot(fc, bd.var);
             std::vector<ir::BlockId> subs;

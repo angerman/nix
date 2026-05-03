@@ -358,7 +358,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
 /// OP_WITH_PUSH; instead we keep the thunk on the stack and only force
 /// when an unbound name actually triggers a lookup.  The forced value
 /// is written back so subsequent lookups skip the force.
-inline Value withLookup(VMState & vm, SymbolId name, uint32_t /*depth*/)
+inline Value withLookup(VMState & vm, SymbolId name)
 {
     size_t base = vm.frames.empty() ? 0 : vm.frames.back().withStackBase;
     for (size_t i = vm.withStack.size(); i-- > base; ) {
@@ -2580,8 +2580,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_WITH_LOOKUP: {
-            uint32_t depth = cu->code[ip++];
-            push(vm, withLookup(vm, static_cast<SymbolId>(operand), depth));
+            push(vm, withLookup(vm, static_cast<SymbolId>(operand)));
             break;
         }
 

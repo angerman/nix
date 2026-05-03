@@ -495,7 +495,7 @@ struct Lowerer
     {
         if (e->fromWith) {
             auto sym = internSym(e->name);
-            return addBinding(ir::WithLookup{sym, /*depth*/0});
+            return addBinding(ir::WithLookup{sym});
         }
         ir::VarId v = resolveVar(e->level, e->displ);
         if (v != ir::kInvalid) return addBinding(ir::VarRef{v});
@@ -1453,7 +1453,6 @@ struct Lowerer
         // slot's storage is reused after the surrounding frame
         // returns) and would dangle when sub-thunks escape.
         ir::VarId attrs = lowerExpr(e->attrs);
-        ir::VarId slotRef = ir::kInvalid;
         ir::VarId withRecAttrsVar = ir::kInvalid;
         ir::SymbolId withRecAttrsName = ir::kInvalidSymbol;
         if (auto * ev = dynamic_cast<nix::ExprVar *>(e->attrs)) {
@@ -1487,7 +1486,7 @@ struct Lowerer
         setReturn(rv);
         blockStack.pop_back();
         return addBinding(ir::With{
-            attrs, bodyB, slotRef,
+            attrs, bodyB,
             withRecAttrsVar, withRecAttrsName});
     }
 

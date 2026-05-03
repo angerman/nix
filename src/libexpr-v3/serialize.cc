@@ -134,7 +134,6 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
             word = encode(op, remapId(operand));
         } else if (op == OP_WITH_LOOKUP) {
             word = encode(op, remapId(operand));
-            ip++;  // 1 trailing word: depth (not a SymbolId)
         } else if (op == OP_ATTRS_SELECT) {
             word = encode(op, remapId(operand));
             ip++;  // 1 IC-index follow-up word

@@ -44,7 +44,7 @@ namespace nix::v3::serialize {
 
 /// Bumped whenever the on-disk format changes.  Mismatches at load
 /// time are a hard failure — no migration logic.
-constexpr uint32_t kSchemaVersion = 1;
+constexpr uint32_t kSchemaVersion = 2;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

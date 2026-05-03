@@ -130,7 +130,6 @@ void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
                       std::is_same_v<T, LitNull> ||
                       std::is_same_v<T, LitString> ||
                       std::is_same_v<T, LitPath> ||
-                      std::is_same_v<T, PosExpr> ||
                       std::is_same_v<T, WithLookup>) {
             (void)e;
         } else if constexpr (std::is_same_v<T, VarRef>) {
@@ -154,8 +153,6 @@ void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
         } else if constexpr (std::is_same_v<T, AttrSetDyn>) {
             for (auto & en : e.statics)  refs.insert(en.value);
             for (auto & en : e.dynamics) { refs.insert(en.nameVar); refs.insert(en.value); }
-        } else if constexpr (std::is_same_v<T, RecAttrSet>) {
-            for (auto & en : e.entries) refs.insert(en.value);
         } else if constexpr (std::is_same_v<T, ListExpr>) {
             for (auto v : e.elems) refs.insert(v);
         } else if constexpr (std::is_same_v<T, ConcatLists> ||
@@ -187,8 +184,7 @@ void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
             // they appear in the binding's direct refs.
             for (auto & en : e.entries)
                 for (auto v : en.outerUpvalues) refs.insert(v);
-        } else if constexpr (std::is_same_v<T, Not> ||
-                             std::is_same_v<T, Negate>) {
+        } else if constexpr (std::is_same_v<T, Not>) {
             refs.insert(e.operand);
         } else if constexpr (std::is_same_v<T, And> ||
                              std::is_same_v<T, Or>  ||
@@ -226,9 +222,8 @@ void collectBlockRefs(const Module & m, BlockId bid,
 {
     const Block & b = m.blocks[bid];
 
-    // Defined within this block: params + each binding's var.
+    // Defined within this block: each binding's var.
     std::unordered_set<VarId> defined;
-    for (auto v : b.params) defined.insert(v);
     for (auto & bd : b.bindings) defined.insert(bd.var);
 
     // Refs from this block's expressions and sub-blocks.

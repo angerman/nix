@@ -49,7 +49,6 @@ constexpr BlockId kInvalidBlock = 0;
 /// Index into Module::functions.  Functions own a body Block + parameter
 /// metadata (used by Lambda / MkThunk to point at the callable code).
 using FuncId = uint32_t;
-constexpr FuncId kInvalidFunc = 0xFFFFFFFFu;
 
 /// Index into Module::symbolTable.  Used for attribute names, formals,
 /// with-lookup names, etc.  Comparison is O(1) (integer compare).
@@ -75,10 +74,9 @@ struct LitPath   { std::string_view path; void * accessor; };
 struct VarRef    { VarId var; };
 
 /// Reference to a free variable resolved against a `with` scope at runtime.
-/// `depth` = how many enclosing with-scopes to skip before lookup (0 = innermost).
+/// Lookup walks the runtime with-stack from innermost to outermost.
 struct WithLookup {
     SymbolId name;
-    uint32_t depth;
 };
 
 // --- Lambdas, application, thunks ---
@@ -160,15 +158,6 @@ struct AttrSetDyn {
     std::vector<DynamicEntry> dynamics;
 };
 
-/// Recursive attrset (`rec { ... }`).  Each entry's value can reference
-/// any sibling via the synthetic `selfVar` (lowering rewrites such refs
-/// to AttrSelect on selfVar).
-struct RecAttrSet {
-    VarId selfVar;
-    struct Entry { SymbolId name; VarId value; uint32_t pos = 0; };
-    std::vector<Entry> entries;
-};
-
 // --- Lists ---
 
 struct ListExpr    { std::vector<VarId> elems; };
@@ -183,26 +172,15 @@ struct If    { VarId cond; BlockId thenBlock; BlockId elseBlock; };
 /// `with attrs; body`.  Pushes `attrs` onto the runtime with-stack, runs
 /// `bodyBlock`, then pops.  Inside the body, WithLookup resolves names.
 ///
-/// `slotRef` is set when `attrs` was lowered from a simple `ExprVar`
-/// (a direct slot reference): in that case the emitter should push a
-/// `Tag::Slot` Value pointing at the resolved local slot rather than
-/// a snapshot of the slot's contents.  This preserves SECD-style
-/// pointer aliasing for `with self;` patterns where `self` is a
-/// let-rec binding that may be mutated mid-evaluation (WC-38).
-/// When `slotRef = kInvalid`, `attrs` is used as a regular value
-/// source (back-compat with the original `OP_GET_LOCAL +
-/// OP_WITH_PUSH` path).
-///
 /// `recAttrsVar` + `recAttrsName` are set when `attrs` resolves to a
-/// rec-attrset entry: the emitter should push a Tag::Slot pointing
-/// into `recAttrsVar`'s Bindings::entries[i].value (heap-stable).
-/// This is the production path for `with self;` over rec-attrsets and
-/// is what makes `lib.fix` patterns work in v3.  Both fields are
-/// kInvalid when unused.
+/// rec-attrset entry: the emitter pushes a Tag::Slot pointing into
+/// `recAttrsVar`'s Bindings::entries[i].value (heap-stable).  This is
+/// the production path for `with self;` over rec-attrsets and is what
+/// makes `lib.fix` patterns work in v3.  Both fields are kInvalid when
+/// unused (the back-compat OP_GET_LOCAL + OP_WITH_PUSH path).
 struct With  {
     VarId attrs;
     BlockId bodyBlock;
-    VarId slotRef = kInvalid;
     VarId recAttrsVar = kInvalid;
     SymbolId recAttrsName = kInvalidSymbol;
 };
@@ -218,7 +196,6 @@ struct ConcatStrings { std::vector<VarId> parts; bool forceString; };
 // --- Boolean / comparison / arithmetic ---
 
 struct Not    { VarId operand; };
-struct Negate { VarId operand; };
 
 struct Add  { VarId lhs; VarId rhs; };
 struct Sub  { VarId lhs; VarId rhs; };
@@ -236,9 +213,6 @@ struct Impl { VarId lhs; BlockId rhsBlock; };
 
 /// Attrset update: lhs // rhs.
 struct Update { VarId lhs; VarId rhs; };
-
-/// `__curPos` — position attrset of the call site.
-struct PosExpr {};
 
 /// Direct primop call.  All arguments must be available; the primop's
 /// arity must match args.size().  Faster than going through OP_CALL since
@@ -295,15 +269,14 @@ using Expr = std::variant<
     LitInt, LitFloat, LitBool, LitNull, LitString, LitPath,
     VarRef, WithLookup,
     Lambda, App, Force, MkThunk,
-    AttrSelect, AttrSelectDyn, HasAttr, HasAttrDyn, AttrSet, AttrSetDyn, RecAttrSet,
+    AttrSelect, AttrSelectDyn, HasAttr, HasAttrDyn, AttrSet, AttrSetDyn,
     RecBindingSlotRef,
     ListExpr, ConcatLists,
     If, With, Assert,
     ConcatStrings,
-    Not, Negate, Add, Sub, Mul, Div, Eq, NEq, Less,
+    Not, Add, Sub, Mul, Div, Eq, NEq, Less,
     And, Or, Impl,
     Update,
-    PosExpr,
     PrimOpCall,
     LitPrimOp,
     LitBuiltins,
@@ -328,10 +301,6 @@ using Terminal = std::variant<TermReturn>;
 
 /// A linear sequence of bindings + a terminal.  Owned by Module::blocks.
 struct Block {
-    /// Parameters: VarIds defined "by entry" — for a function body Block,
-    /// this is the parameter Var (or the fresh slots for matched formals);
-    /// for a thunk body, empty.
-    std::vector<VarId>   params;
     std::vector<Binding> bindings;
     Terminal             terminal{TermReturn{kInvalid}};
 };
