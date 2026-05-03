@@ -59,6 +59,20 @@ struct EvalState
 void setNixEvalState(nix::EvalState * st);
 nix::EvalState * getNixEvalState();
 
+/// REVIEW MED-14: drop every entry from v3BridgeAttrs / v3BridgeLists /
+/// v3BridgeClosures.  These tables grow unboundedly with the number of
+/// lazy-bridged attrsets / lists / closures bridged across to tree-
+/// walker; on long-running daemons (Hydra, LSP, library consumers) the
+/// tables retain memory for the process lifetime.  Single-EvalState
+/// CLIs (like v3-eval) don't need to call this -- the tables are torn
+/// down at process exit.
+///
+/// SAFETY: only safe to call between top-level evals.  Existing
+/// PrimOpApp values referencing handles in these tables would
+/// dangle.  Caller is responsible for not retaining such values across
+/// the clear.
+void clearBridgeTables();
+
 /// Apply a closure (or single-arg primop) to one argument and return
 /// the result, by re-entering the VM dispatch loop on the same VMState.
 /// Used by callback primops.  Throws if `fun` is not callable.

@@ -5426,6 +5426,13 @@ const std::unordered_map<std::string, PrimOp> & allRegisteredPrimOps()
 void setNixEvalState(nix::EvalState * st) { tlNixEvalState = st; }
 nix::EvalState * getNixEvalState() { return tlNixEvalState; }
 
+void clearBridgeTables()
+{
+    v3BridgeAttrs().clear();
+    v3BridgeLists().clear();
+    v3BridgeClosures().clear();
+}
+
 // Per-primop call counters keyed by primop name (string_view backed by
 // the registered PrimOp::name).  Aggregates across the whole process —
 // invaluable for confirming which primops are hot on real workloads
