@@ -556,7 +556,9 @@ struct Lowerer
     }
     ir::VarId lowerIf(nix::ExprIf * e)
     {
-        ir::VarId cond = forceVal(lowerExpr(e->cond));
+        // REVIEW MED-5: emit-time force dropped; OP_BRANCH_FALSE
+        // (emitted via emit.cc::emitOne(ir::If)) forces the cond.
+        ir::VarId cond = lowerExpr(e->cond);
 
         auto thenB = m.freshBlock();
         auto elseB = m.freshBlock();
@@ -827,30 +829,23 @@ struct Lowerer
             }
             return result;
         }
-        // Generic application via OP_CALL.  Force the callee (must be
-        // a closure / primop / PrimOpApp).  Each argument must be
+        // Generic application via OP_CALL.  Each argument must be
         // delivered as-is (Nix is lazy in arguments) — we wrap any
         // non-trivial expression in a thunk so that side-effects /
         // errors only fire if the callee actually forces the arg.
-        ir::VarId f = forceVal(lowerExpr(e->fun));
-        // WC-38 experiment: NIX_V3_NO_INTER_ARG_FORCE=1 skips the
-        // forceVal between curried args.  Tree-walker's callFunction
-        // doesn't force between args — for `f x y z`, callFunction
-        // loops and the lambda body returns a Lambda Value (or
-        // PrimOpApp), neither of which needs forcing for the next App.
-        // v3's emit-time force here may be over-eager and trigger
-        // sub-thunk evaluation in nixpkgs' deeply-curried call chains
-        // (callPackageWith / makeOverridable).
-        static const bool s_noInterArgForce =
-            std::getenv("NIX_V3_NO_INTER_ARG_FORCE") != nullptr;
+        //
+        // REVIEW MED-5: dropped the emit-time forceVal on the callee
+        // and between curried args.  OP_CALL's runtime handler
+        // (vm.cc:1148-1151) already forces `fun` if it's Thunk/App/
+        // Slot before dispatching, so the emit-time OP_FORCE was a
+        // pure overhead.  Tree-walker's callFunction doesn't force
+        // between curried args either; matching that here avoids
+        // over-eager sub-thunk firing in nixpkgs' deeply-curried call
+        // chains (callPackageWith / makeOverridable).
+        ir::VarId f = lowerExpr(e->fun);
         for (auto * a : *e->args) {
             ir::VarId av = thunkifyForArg(a);
             f = addBinding(ir::App{f, av});
-            // After this App, the result might be a closure (curried)
-            // or the applied value.  Force before the next App so the
-            // chain calls a real closure each step.
-            if (!s_noInterArgForce && a != e->args->back())
-                f = forceVal(f);
         }
         return f;
     }
@@ -985,7 +980,8 @@ struct Lowerer
     }
     ir::VarId lowerNot(nix::ExprOpNot * e)
     {
-        return addBinding(ir::Not{forceVal(lowerExpr(e->e))});
+        // REVIEW MED-5: emit-time force dropped; OP_NOT forces.
+        return addBinding(ir::Not{lowerExpr(e->e)});
     }
 
     /// ExprInheritFrom — synthesized by the parser to represent the
@@ -1127,7 +1123,9 @@ struct Lowerer
             scopes.pop_back();
             ir::VarId dynV = addBinding(std::move(dyn));
             // Merge: dyn entries override matching rec entries.
-            return addBinding(ir::Update{forceVal(recV), forceVal(dynV)});
+            // REVIEW MED-5: emit-time forces dropped; OP_ATTRS_UPDATE
+            // forces both lhs and rhs at runtime.
+            return addBinding(ir::Update{recV, dynV});
         }
 
         // Non-rec attrset.  All entries (Plain / Inherited / InheritedFrom)
@@ -1408,9 +1406,9 @@ struct Lowerer
     {
         if (pathIdx == path.size()) return attrs;
         const auto & step = path[pathIdx];
-        // attrs must be in WHNF for AttrSelect/HasAttr to work.  Force
-        // it once at each chain step.
-        attrs = forceVal(attrs);
+        // REVIEW MED-5: dropped emit-time forces.  OP_ATTRS_SELECT /
+        // OP_ATTRS_HAS / *_DYN all force their attrs operand (and the
+        // dynamic name operand) on the runtime fast path.
 
         // Static name: regular AttrSelect / HasAttr.  Dynamic name
         // (`attrs.${expr}`): evaluate expr to a string at runtime and
@@ -1418,7 +1416,7 @@ struct Lowerer
         const bool dyn = step.expr != nullptr;
         ir::SymbolId nm = dyn ? 0 : internSym(step.symbol);
         ir::VarId nameVar = ir::kInvalid;
-        if (dyn) nameVar = forceVal(lowerExpr(step.expr));
+        if (dyn) nameVar = lowerExpr(step.expr);
 
         if (defaultExpr) {
             ir::VarId hasIt = dyn
@@ -1455,7 +1453,9 @@ struct Lowerer
         // existing attrset entry along the path.  Lower as a chain of
         // HasAttr followed by AttrSelect: at each step, if the current
         // attr exists go on, else short-circuit to false.
-        ir::VarId attrs = forceVal(lowerExpr(e->e));
+        // REVIEW MED-5: emit-time force dropped; OP_ATTRS_HAS / SELECT
+        // force at runtime.
+        ir::VarId attrs = lowerExpr(e->e);
         ir::VarId result = ir::kInvalid;
         // Build the chain bottom-up.  We model it inline here using
         // nested If blocks: `if hasAttr(attrs, p0) then if has(attrs.p0, p1) ... else false else false`.
@@ -1464,7 +1464,8 @@ struct Lowerer
                 const auto & an = e->attrPath[idx];
                 bool dyn = an.expr != nullptr;
                 ir::VarId nameVar = ir::kInvalid;
-                if (dyn) nameVar = forceVal(lowerExpr(an.expr));
+                // REVIEW MED-5: dyn name force dropped; OP_ATTRS_*_DYN forces.
+                if (dyn) nameVar = lowerExpr(an.expr);
                 ir::SymbolId nm = dyn ? 0 : internSym(an.symbol);
 
                 ir::VarId hasIt = dyn
@@ -1478,7 +1479,8 @@ struct Lowerer
                 ir::VarId got = dyn
                     ? addBinding(ir::AttrSelectDyn{cur, nameVar})
                     : addBinding(ir::AttrSelect{cur, nm});
-                got = forceVal(got);
+                // REVIEW MED-5: chain-step force dropped; the next
+                // OP_ATTRS_HAS forces.
                 ir::VarId rest = step(got, idx + 1);
                 setReturn(rest);
                 blockStack.pop_back();
