@@ -79,6 +79,33 @@ adds per-phase timing (lower / compile / run / bridge):
 
     NIX_VM_STATS=1 V3_TIMING=1 NIX_USE_V3=1 nix eval --json --expr '...'
 
+## Benchmark harness
+
+`src/libexpr-v3/test/bench-v3-vs-tw.sh` times v3 vs. tree-walker
+across a fixed set of workloads.  Use it to attribute every "perf
+win" commit to a measurable delta.
+
+    # Default: 3 runs/cell, table output.  Synthetic workloads only.
+    bash src/libexpr-v3/test/bench-v3-vs-tw.sh
+
+    # Add nixpkgs workloads.
+    NPK=$HOME/src/nixpkgs bash src/libexpr-v3/test/bench-v3-vs-tw.sh
+
+    # Higher run count for tighter stats.
+    N=10 bash src/libexpr-v3/test/bench-v3-vs-tw.sh
+
+    # Subset by workload name.
+    ONLY=fib35,letrec-fix bash src/libexpr-v3/test/bench-v3-vs-tw.sh
+
+    # Raw CSV (one row per run) for graphing.
+    FORMAT=csv N=20 bash src/libexpr-v3/test/bench-v3-vs-tw.sh \
+        > /tmp/bench-$(date +%Y%m%d-%H%M).csv
+
+Workloads cover compute-bound (fib35, ackermann), attrset path
+chains (path-deep, letrec-fix), and -- when nixpkgs is available --
+the nixpkgs-cold-path queries dominant in real-world use
+(hello-name, git-name, drv3, attr-pkgs, attr-hask).
+
 ## CO-2 / CO-3: forceValue cutover (opt-in)
 
 Set `NIX_USE_V3_FORCE=1` (in addition to `NIX_USE_V3=1`) to enable
