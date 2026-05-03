@@ -1605,6 +1605,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                     }
                 }
+                // EVAL-COMP §4.4 / §8.2: drop upvalue references on
+                // evaluation.  Once the thunk's body has returned, its
+                // upvalues are no longer needed -- the cached
+                // `evaluated` value is the only useful state.  Zeroing
+                // tail[] lets Boehm reclaim transitive references that
+                // would otherwise be retained for the thunk's
+                // lifetime.  This is the GHC selector-thunk pattern
+                // generalised: every Nix thunk gets selector-thunk
+                // memory behaviour.  Particularly important for
+                // `let pkgs = import <nixpkgs> {}; in pkgs.foo.bar`
+                // patterns where pkgs holds a giant attrset that's
+                // otherwise pinned by every per-attr selector thunk.
+                {
+                    Thunk * t = fr.thunk;
+                    for (uint16_t ui = 0; ui < t->nUpvalues; ++ui)
+                        t->tail[ui] = Value{};
+                    // Don't reset nUpvalues -- the FAM size was set at
+                    // alloc time; reusing the slot would require the
+                    // count.  Leaving it preserves alloc-time
+                    // invariants (Bridge thunks etc.).
+                }
                 fr.thunk->state = ThunkState::Evaluated;
                 fr.thunk->evaluated = retVal;
 
