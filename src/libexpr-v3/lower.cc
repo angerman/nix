@@ -601,7 +601,46 @@ struct Lowerer
             funcStack.push_back(fid);
             blockStack.push_back(entry);
 
-            // Route formal-extraction through a synthetic LetRec so each
+            // EVAL-COMP §3.3: when no formal has a default, skip the
+            // synthetic LetRec entirely and bind formals directly to
+            // AttrSelect on the param attrset.  No per-formal thunks,
+            // no per-formal MkThunk allocations on every call.
+            // Tree-walker behaviour is preserved: the runtime
+            // OP_CALL_FORMALS validation still rejects missing /
+            // unexpected attrs, and lazy access is preserved because
+            // the consumer-side OP_FORCE only fires when the body
+            // demands the formal.
+            //
+            // Defaults still need the rec-attrset machinery (a
+            // default's body may reference sibling formals
+            // mutually).  Once any formal has a default, fall back
+            // to the synthetic LetRec path.
+            bool anyDefault = false;
+            for (auto & fm : formals->formals)
+                if (fm.def) { anyDefault = true; break; }
+            if (!anyDefault) {
+                Scope direct;
+                if (e->arg) {
+                    direct.byDispl.push_back(param);
+                    direct.byName.emplace(std::string(symbols[e->arg]), param);
+                }
+                ir::VarId paramForced = forceVal(addBinding(ir::VarRef{param}));
+                for (auto & fm : formals->formals) {
+                    ir::SymbolId nm = internSym(fm.name);
+                    ir::VarId v = addBinding(ir::AttrSelect{paramForced, nm});
+                    direct.byDispl.push_back(v);
+                    direct.byName.emplace(std::string(symbols[fm.name]), v);
+                }
+                scopes.push_back(std::move(direct));
+                ir::VarId rv = lowerExpr(e->body);
+                setReturn(rv);
+                scopes.pop_back();
+                blockStack.pop_back();
+                funcStack.pop_back();
+                return addBinding(ir::Lambda{ fid, /*freeVars*/ {} });
+            }
+
+            // Default-bearing formals: synthetic LetRec so each
             // formal becomes a thunk that captures the formals scope.
             // This makes default expressions lazy — references to other
             // formals from a default body resolve via the rec attrset
