@@ -95,6 +95,23 @@ struct Bindings
         return nullptr;
     }
 
+    /// Non-const overload — returns a writable pointer for callers that
+    /// want to memoize lazy entries (e.g., resolving Tag::App in
+    /// OP_ATTRS_SELECT_DYN and writing the WHNF result back into the
+    /// slot).  Phase 13.3 mapAttrs memoization.
+    Value * lookup(SymbolId name) noexcept
+    {
+        uint32_t lo = 0, hi = size;
+        while (lo < hi) {
+            uint32_t mid = (lo + hi) >> 1;
+            SymbolId midName = entries[mid].name;
+            if (midName == name) return &entries[mid].value;
+            if (midName < name) lo = mid + 1;
+            else                hi = mid;
+        }
+        return nullptr;
+    }
+
     bool has(SymbolId name) const noexcept { return lookup(name) != nullptr; }
 };
 

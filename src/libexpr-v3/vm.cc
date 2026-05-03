@@ -2291,7 +2291,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: not an attrset");
             uint32_t icIdx = cu->code[ip++];
             auto & ic = cu->attrSelectCache[icIdx];
-            const auto * b = attrs.payload.bindings;
+            // Phase 13.3: non-const so we can write back the resolved
+            // value of a Tag::App entry — mapAttrs et al. install lazy
+            // App(App(fn,name),val) entries that, without memoization,
+            // re-apply the function on every access.
+            auto * b = attrs.payload.bindings;
             // V3_DBG_PREHOOK diagnostic: log every ATTRS_SELECT preHook
             // attempt with what value it returns.  Used to localize WC-37.
             static const bool s_dbg_prehook = std::getenv("V3_DBG_PREHOOK") != nullptr;
@@ -2449,7 +2453,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 && ic.lastSlot < b->size
                 && b->entries[ic.lastSlot].name == static_cast<SymbolId>(operand))
             {
-                push(vm, b->entries[ic.lastSlot].value);
+                Value & slot = b->entries[ic.lastSlot].value;
+                // Phase 13.3 mapAttrs memo (IC fast path).  Without
+                // writeback, every access to a mapAttrs entry re-applies
+                // its function — confirmed via per-descriptor force
+                // counter (parse.nix:60:44 = 625K forces on a 2-stage
+                // probe).  Tree-walker mutates the slot via
+                // `forceValue(*v)`; mirror that here.
+                if (__builtin_expect(slot.tag() == Tag::App, 0)) {
+                    vm.frames.back().ip = ip;
+                    Value resolved = forceValue(vm, slot);
+                    slot = resolved;
+                    push(vm, resolved);
+                } else {
+                    push(vm, slot);
+                }
             } else {
                 // Manual binary search inlined to also recover the
                 // matched slot index, so we can update the cache.
@@ -2487,7 +2505,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 ic.lastBindings = b;
                 ic.lastSlot     = lo;
-                push(vm, b->entries[lo].value);
+                Value & slot = b->entries[lo].value;
+                if (__builtin_expect(slot.tag() == Tag::App, 0)) {
+                    vm.frames.back().ip = ip;
+                    Value resolved = forceValue(vm, slot);
+                    slot = resolved;
+                    push(vm, resolved);
+                } else {
+                    push(vm, slot);
+                }
             }
             break;
         }
@@ -2510,10 +2536,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Intern via the global table so the SymbolId matches the
             // ones the attrset's bindings were built with.
             SymbolId id = ir::globalInternSymbol(name.payload.str);
-            const Value * found = attrs.payload.bindings->lookup(id);
+            Value * found = attrs.payload.bindings->lookup(id);
             if (!found)
                 throw std::runtime_error("v3 OP_ATTRS_SELECT_DYN: attribute not found");
-            push(vm, *found);
+            // Phase 13.3 mapAttrs memo (dynamic-name path).
+            if (__builtin_expect(found->tag() == Tag::App, 0)) {
+                vm.frames.back().ip = ip;
+                Value resolved = forceValue(vm, *found);
+                *found = resolved;
+                push(vm, resolved);
+            } else {
+                push(vm, *found);
+            }
             break;
         }
         case OP_ATTRS_HAS: {
