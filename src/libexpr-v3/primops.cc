@@ -3397,6 +3397,56 @@ static void primDerivationStrictNative(
 /// actually realizing them.
 void primDerivationStrict(EvalState & state, Value * args, Value & out)
 {
+    // Phase 13.4: per-derivation call profiler.  Key = name + bindings
+    // ptr — different ptrs for the same name means fresh args attrsets,
+    // i.e. the scope/callPackage chain is *not* sharing the let-bound
+    // drv across repeated accesses.  Reports periodically (every 1000
+    // calls) so runaway probes still produce visible progress before
+    // a ulimit kill.  Off by default; set V3_DRV_PER_DRV=1.
+    {
+        static const bool s_dbg_drv_perdrv =
+            std::getenv("V3_DRV_PER_DRV") != nullptr;
+        if (__builtin_expect(s_dbg_drv_perdrv, 0)) {
+            static std::mutex mtx;
+            static std::unordered_map<std::string, uint64_t> counts;
+            const auto & syms = drvStrictSymbols();
+            std::string drvName = "<no-name>";
+            const void * bindingsPtr = nullptr;
+            if (args[0].isAttrs() && args[0].payload.bindings) {
+                auto * b = args[0].payload.bindings;
+                bindingsPtr = b;
+                if (auto * nv = b->lookup(syms.name)) {
+                    Value forced = forceValue(*state.vm, *nv);
+                    if (forced.isString() && forced.payload.str)
+                        drvName = forced.payload.str;
+                    else
+                        drvName = std::string("<name-tag-")
+                                + std::to_string((int)forced.tag()) + ">";
+                }
+            }
+            char buf[64];
+            std::snprintf(buf, sizeof buf, " @%p", bindingsPtr);
+            drvName += buf;
+            std::lock_guard<std::mutex> g(mtx);
+            ++counts[drvName];
+            static uint64_t total = 0;
+            ++total;
+            if ((total % 1000) == 0) {
+                std::vector<std::pair<std::string, uint64_t>> rows(
+                    counts.begin(), counts.end());
+                std::sort(rows.begin(), rows.end(),
+                    [](const auto & a, const auto & b) { return a.second > b.second; });
+                std::fprintf(stderr,
+                    "v3 PRIM_DRV PROGRESS total=%llu unique=%zu top:",
+                    (unsigned long long)total, rows.size());
+                for (size_t i = 0; i < rows.size() && i < 5; ++i)
+                    std::fprintf(stderr, " %s/%llu",
+                        rows[i].first.c_str(), (unsigned long long)rows[i].second);
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
+
     // BR-3.5: Phase A native fast path.  Attempted ONLY if the
     // input shape passes isSimpleDerivationAttrs (cheap presence
     // check — no value forcing).  Anything that throws falls
