@@ -8,6 +8,7 @@
 #include "v3/bytecode.hh"
 #include "v3/value.hh"
 #include "v3/closure.hh"
+#include "nix/expr/eval-gc.hh"
 
 #include <vector>
 #include <cstdint>
@@ -59,12 +60,19 @@ struct CallFrame
 };
 
 /// Per-EvalState VM state.
+///
+/// REVIEW CRIT-2: valueStack and withStack hold Value payloads with
+/// Boehm-managed pointers (Closure*, Bindings*, Thunk*, ListVec*).
+/// Use traceable_allocator so the storage is in a region Boehm
+/// scans for roots; std::allocator's malloc'd storage was invisible
+/// to the GC, leaving payloads reachable only via the conservative
+/// C-stack scan.
 struct VMState
 {
-    std::vector<Value>     valueStack;   // operand + locals
+    std::vector<Value, traceable_allocator<Value>> valueStack;
     std::vector<CallFrame> frames;
     /// Stack of in-scope `with` attrset values.  Top of stack = innermost.
-    std::vector<Value>     withStack;
+    std::vector<Value, traceable_allocator<Value>> withStack;
     uint64_t nrInstructions = 0;
     /// OP_TAIL_CALL iteration counter — bumped on every tail call
     /// and reset whenever the frame stack grows or shrinks via

@@ -615,7 +615,7 @@ void primMap(EvalState & state, Value * args, Value & out)
     allocStats().listsAllocated++;
     for (uint32_t i = 0; i < src->size; ++i) {
         // Build App(fun, elem) — lazy.
-        ValuePair * pp = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        ValuePair * pp = Alloc::allocPair();
         pp->left  = fun;
         pp->right = src->elems[i];
         Value v;
@@ -688,7 +688,7 @@ void primGenList(EvalState & state, Value * args, Value & out)
     for (int64_t i = 0; i < n; ++i) {
         // Build App(gen, idx_int) — lazy.
         Value idx; idx.mkInt(i);
-        ValuePair * pp = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        ValuePair * pp = Alloc::allocPair();
         pp->left  = gen;
         pp->right = idx;
         Value v;
@@ -1023,11 +1023,11 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
         // `fn name value`.  This keeps mapAttrs lazy: `mapAttrs throw
         // attrs` only fires the throw on the entries actually demanded
         // by callers, matching tree-walker.
-        ValuePair * pp1 = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        ValuePair * pp1 = Alloc::allocPair();
         pp1->left  = fn;
         pp1->right = nameStr;
         Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
-        ValuePair * pp2 = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        ValuePair * pp2 = Alloc::allocPair();
         pp2->left  = step1;
         pp2->right = src->entries[i].value;
         Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
@@ -1654,11 +1654,11 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         // Build App(App(fn, nameV), lv) — a deferred call that resolves
         // when something forces the entry.  Mirrors mapAttrs' lazy
         // entry construction.
-        ValuePair * pp1 = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        ValuePair * pp1 = Alloc::allocPair();
         pp1->left  = fn;
         pp1->right = nameV;
         Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
-        ValuePair * pp2 = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+        ValuePair * pp2 = Alloc::allocPair();
         pp2->left  = step1;
         pp2->right = lv;
         Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;

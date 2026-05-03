@@ -1163,7 +1163,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 size_t totalArgs = depth + 1;
                 if (totalArgs < po->arity) {
                     // Build a new PrimOpApp wrapping (fun, arg).
-                    ValuePair * vp = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+                    ValuePair * vp = Alloc::allocPair();
                     vp->left = fun;
                     vp->right = arg;
                     Value v;
@@ -3602,7 +3602,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         const PrimOp * po = cur.payload.primop;
         size_t totalArgs = depth + 1;
         if (totalArgs < po->arity) {
-            ValuePair * vp = static_cast<ValuePair *>(std::malloc(sizeof(ValuePair)));
+            ValuePair * vp = Alloc::allocPair();
             vp->left = fun;
             vp->right = arg;
             Value v;

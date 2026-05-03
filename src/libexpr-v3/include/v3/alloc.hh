@@ -202,9 +202,19 @@ public:
         // 16-byte align the request.
         bytes = (bytes + 15) & ~size_t{15};
         if (bytes > kHugeCutoff) {
-            // Oversized: fall back to malloc (still leaks at exit;
-            // we don't track the pointer for now).
-            return std::malloc(bytes);
+            // Oversized: dedicated allocation outside the regular
+            // block churn.  REVIEW CRIT-4 critic: register the block
+            // with Boehm so any Value pointers stored inside it are
+            // visible to the GC.  Pre-fix used std::malloc which left
+            // the storage invisible; payloads inside (Closure*,
+            // Bindings*, ...) were reachable only via the conservative
+            // C-stack scan.  std::calloc zero-fills so stale bit
+            // patterns don't pin objects.
+            void * blk = std::calloc(1, bytes);
+#if NIX_USE_BOEHMGC
+            if (blk) GC_add_roots(blk, static_cast<char *>(blk) + bytes);
+#endif
+            return blk;
         }
         if (cur + bytes > end) refill();
         void * p = cur;
@@ -328,6 +338,17 @@ struct Alloc
         auto * l = static_cast<ListVec *>(threadArena().alloc(bytes));
         l->size = n;
         return l;
+    }
+
+    /// REVIEW CRIT-3: ValuePair allocation routed through the arena
+    /// instead of std::malloc.  Each ValuePair holds Value payloads
+    /// with Boehm-managed pointers (Closure / Thunk / Bindings); the
+    /// prior std::malloc'd storage was invisible to Boehm so the
+    /// inner payloads could be reclaimed under load.  Arena-allocated
+    /// pairs sit inside a GC_add_roots-registered region (alloc.hh:225).
+    static ValuePair * allocPair() noexcept
+    {
+        return static_cast<ValuePair *>(threadArena().alloc(sizeof(ValuePair)));
     }
 
     static Bindings * allocBindings(uint32_t n) noexcept
