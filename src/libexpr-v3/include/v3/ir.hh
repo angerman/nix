@@ -261,6 +261,22 @@ struct LetRec {
         std::vector<VarId>  outerUpvalues;
     };
     std::vector<Entry> entries;
+
+    /// REVIEW HIGH-4 follow-up: hidden from-expr thunks for
+    /// `let inherit (e) a b c; in body` shape.  Each hidden entry is
+    /// a thunk function whose body lowers `e` (the from-expr) once,
+    /// in the rec scope, capturing recVar + any other free vars.
+    /// The thunk's resulting Value is bound to `hiddenVar` -- a
+    /// regular VarId in the LetRec's containing block -- so each
+    /// `inherit (e) name` shares one force.  Emitted between OP_DUP /
+    /// OP_SET_LOCAL recSlot and the regular per-attr thunks so the
+    /// per-attr thunks can capture hiddenVar as an upvalue.
+    struct HiddenEntry {
+        VarId               hiddenVar;
+        FuncId              thunkBody;
+        std::vector<VarId>  outerUpvalues;
+    };
+    std::vector<HiddenEntry> hiddenEntries;
 };
 
 // ---------------------------------------------------------------------------

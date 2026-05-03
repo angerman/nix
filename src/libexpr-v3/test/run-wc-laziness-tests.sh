@@ -961,6 +961,26 @@ TESTS=(
   'let r = { inherit (builtins.trace "fired" { a = 1; b = 2; c = 3; }) a b c; };
    in builtins.deepSeq (r.a + r.b + r.c) "ok"'
   $'trace: fired\n"ok"'
+
+  # ----------------------------------------------------------------
+  # REVIEW HIGH-4 follow-up: rec / let inherit-from share-once.
+  # Pre-fix the rec / let path re-lowered the from-expr per name,
+  # firing trace 3x for 3 names.  Post-fix the hidden-thunk
+  # mechanism stores one shared thunk in the rec attrset's outer
+  # block and per-attr bodies AttrSelect through it.
+  # ----------------------------------------------------------------
+  REVIEW-HIGH-4-let-inherit-from-share-once
+  "let inherit-from evaluates source once"
+  'let inherit (builtins.trace "fired" { a = 1; b = 2; c = 3; }) a b c;
+   in builtins.deepSeq (a + b + c) "ok"'
+  $'trace: fired\n"ok"'
+
+  REVIEW-HIGH-4-rec-inherit-from-share-once
+  "rec inherit-from evaluates source once"
+  'let r = rec { inherit (builtins.trace "fired" { a = 1; b = 2; c = 3; }) a b c;
+                 sum = a + b + c; };
+   in builtins.deepSeq r.sum "ok"'
+  $'trace: fired\n"ok"'
 )
 
 pass=0

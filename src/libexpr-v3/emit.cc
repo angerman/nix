@@ -552,7 +552,23 @@ struct Emitter
         unit.code.push_back(encode(OP_DUP));
         unit.code.push_back(encode(OP_SET_LOCAL, recSlot));
 
-        // 3. For each IR entry, build a Thunk capturing whatever
+        // 3. REVIEW HIGH-4 follow-up: emit hidden from-expr thunks
+        //    BEFORE the regular per-attr thunks, so per-attr bodies
+        //    that reference a hidden thunk via upvalue capture see
+        //    the bound slot at MAKE_THUNK time.  Each hidden thunk
+        //    captures recVar (already bound) + any other free vars,
+        //    and writes its result Value into the hiddenVar's local
+        //    slot.
+        for (auto & he : e.hiddenEntries) {
+            const auto & ff = m.functions[he.thunkBody].freeVars;
+            for (auto fv : ff) emitVarRef(fv);
+            unit.code.push_back(encode(OP_MAKE_THUNK, he.thunkBody));
+            unit.code.push_back(static_cast<uint32_t>(ff.size()));
+            uint16_t hiddenSlot = getOrAssignSlot(he.hiddenVar);
+            unit.code.push_back(encode(OP_SET_LOCAL, hiddenSlot));
+        }
+
+        // 4. For each IR entry, build a Thunk capturing whatever
         //    upvalues its body needs and write it into the sorted slot.
         //    Each thunk body's freeVars list (sorted by VarId,
         //    populated by computeFreeVars) IS the upvalue layout: the

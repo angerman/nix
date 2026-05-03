@@ -1312,6 +1312,17 @@ struct Lowerer
             recScope.byName.emplace(std::string(symbols[p.sym]), ir::kInvalid);
         }
 
+        // REVIEW HIGH-4 follow-up: hidden from-expr thunks built
+        // for the rec case (see below).  Holds (hiddenVar, FuncId)
+        // pairs that the LetRec emit will turn into a MkThunk
+        // bound to hiddenVar's local slot, ordered after the
+        // OP_DUP/SET_LOCAL recSlot prologue.
+        struct PendingHidden {
+            ir::VarId hiddenVar;
+            ir::FuncId thunkBody;
+        };
+        std::vector<PendingHidden> pendingHidden;
+
         // Push the inheritFromExprs onto the stack so any ExprInheritFrom
         // encountered while lowering def.e resolves correctly.
         bool pushedInheritFrom = false;
@@ -1320,16 +1331,49 @@ struct Lowerer
             // REVIEW HIGH-4: pre-lower from-exprs into the OUTER
             // function so all N names in `inherit (e) ...` share one
             // VarId.  Only safe when `isRec=false` (the from-exprs
-            // don't reference rec-bindings); for `isRec=true` the
-            // from-exprs may reference siblings whose recVar isn't
-            // yet allocated when the pre-lower bytecode runs (e.g.,
-            // `rec { inherit (x) y; x = ...; }` -- scope-7 lang test).
-            // Push an empty cache for the rec case so lowerInheritFrom
-            // falls back to its old per-name re-lower path.
-            if (!isRec)
+            // don't reference rec-bindings); for `isRec=true` we use
+            // the hidden-thunk mechanism (REVIEW HIGH-4 follow-up):
+            // each from-expr lowers into a Function with the rec
+            // scope, the function's MkThunk is emitted by emit.cc
+            // immediately AFTER OP_DUP/SET_LOCAL recSlot (so recVar
+            // is bound), and the resulting Tag::Thunk Value is stored
+            // in a hidden VarId in the LetRec's containing block.
+            // Per-attr bodies capture hiddenVar as a regular upvalue;
+            // each `inherit (e) name` lowers to AttrSelect(hidden, name)
+            // so all N names share one force of `e`.
+            if (!isRec) {
                 pushInheritFromCache(inheritFromExprs);
-            else
+            } else {
                 inheritFromCacheStack.emplace_back();
+                auto & cache = inheritFromCacheStack.back();
+                cache.resize(inheritFromExprs->size(), ir::kInvalid);
+                for (size_t displ = 0; displ < inheritFromExprs->size(); ++displ) {
+                    nix::Expr * fromE = (*inheritFromExprs)[displ];
+                    if (!fromE) continue;
+                    // Synthesize a Function for the from-expr body,
+                    // lowered in the rec scope.
+                    m.functions.emplace_back();
+                    ir::FuncId hfid = static_cast<ir::FuncId>(m.functions.size() - 1);
+                    auto heb = m.freshBlock();
+                    m.functions[hfid].entryBlock = heb;
+                    m.functions[hfid].name = "<inherit-from>";
+                    funcStack.push_back(hfid);
+                    blockStack.push_back(heb);
+                    scopes.push_back(recScope);
+                    ir::VarId hrv = lowerExpr(fromE);
+                    setReturn(hrv);
+                    scopes.pop_back();
+                    blockStack.pop_back();
+                    funcStack.pop_back();
+                    // Hidden Var lives in the LetRec's containing
+                    // block; the LetRec emit code wires the
+                    // OP_MAKE_THUNK + OP_SET_LOCAL after recVar is
+                    // bound.
+                    ir::VarId hiddenVar = m.freshVar();
+                    cache[displ] = hiddenVar;
+                    pendingHidden.push_back({hiddenVar, hfid});
+                }
+            }
             pushedInheritFrom = true;
         }
 
@@ -1374,6 +1418,14 @@ struct Lowerer
             en.thunkBody = p.funcIdx;
             en.pos = p.posHandle;
             letRec.entries.push_back(std::move(en));
+        }
+        // REVIEW HIGH-4 follow-up: attach hidden from-expr thunks.
+        letRec.hiddenEntries.reserve(pendingHidden.size());
+        for (auto & ph : pendingHidden) {
+            ir::LetRec::HiddenEntry he;
+            he.hiddenVar = ph.hiddenVar;
+            he.thunkBody = ph.thunkBody;
+            letRec.hiddenEntries.push_back(std::move(he));
         }
         m.blocks[blockStack.back()].bindings.push_back(
             {recVar, std::move(letRec)});

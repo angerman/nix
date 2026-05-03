@@ -184,6 +184,11 @@ void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
             // they appear in the binding's direct refs.
             for (auto & en : e.entries)
                 for (auto v : en.outerUpvalues) refs.insert(v);
+            // Hidden from-expr thunks (REVIEW HIGH-4 follow-up): same
+            // discipline -- their outerUpvalues are MAKE_THUNK
+            // captures from the LetRec's containing block.
+            for (auto & he : e.hiddenEntries)
+                for (auto v : he.outerUpvalues) refs.insert(v);
         } else if constexpr (std::is_same_v<T, Not>) {
             refs.insert(e.operand);
         } else if constexpr (std::is_same_v<T, And> ||
@@ -222,9 +227,20 @@ void collectBlockRefs(const Module & m, BlockId bid,
 {
     const Block & b = m.blocks[bid];
 
-    // Defined within this block: each binding's var.
+    // Defined within this block: each binding's var, plus any
+    // hidden VarIds the binding's expr defines internally (e.g.
+    // ir::LetRec::hiddenEntries -- REVIEW HIGH-4 follow-up).
     std::unordered_set<VarId> defined;
-    for (auto & bd : b.bindings) defined.insert(bd.var);
+    for (auto & bd : b.bindings) {
+        defined.insert(bd.var);
+        std::visit([&](auto & e) {
+            using T = std::decay_t<decltype(e)>;
+            if constexpr (std::is_same_v<T, LetRec>) {
+                for (auto & he : e.hiddenEntries)
+                    defined.insert(he.hiddenVar);
+            }
+        }, bd.expr);
+    }
 
     // Refs from this block's expressions and sub-blocks.
     std::unordered_set<VarId> raw;
@@ -331,6 +347,9 @@ void computeFreeVars(Module & m)
                         for (auto & en : e.entries)
                             if (en.thunkBody < nFuncs)
                                 reverseDeps[en.thunkBody].push_back(parent);
+                        for (auto & he : e.hiddenEntries)
+                            if (he.thunkBody < nFuncs)
+                                reverseDeps[he.thunkBody].push_back(parent);
                     }
                 }, bd.expr);
             }
@@ -384,6 +403,22 @@ void computeFreeVars(Module & m)
                                 if (v != e.recVar) outers.push_back(v);
                             if (en.outerUpvalues != outers) {
                                 en.outerUpvalues = std::move(outers);
+                                changed = true;
+                            }
+                        }
+                        // Hidden from-expr thunks: same outerUpvalues
+                        // synthesis as regular entries (REVIEW HIGH-4
+                        // follow-up).  Skip the recVar from upvalues
+                        // since it's bound by the SET_LOCAL above.
+                        for (auto & he : e.hiddenEntries) {
+                            if (he.thunkBody >= nFuncs) continue;
+                            const auto & ff = m.functions[he.thunkBody].freeVars;
+                            std::vector<VarId> outers;
+                            outers.reserve(ff.size());
+                            for (auto v : ff)
+                                if (v != e.recVar) outers.push_back(v);
+                            if (he.outerUpvalues != outers) {
+                                he.outerUpvalues = std::move(outers);
                                 changed = true;
                             }
                         }
