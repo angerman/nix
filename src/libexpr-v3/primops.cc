@@ -4263,13 +4263,12 @@ void primImport(EvalState & state, Value * args, Value & out)
         std::getenv("NIX_V3_DISK_CACHE") != nullptr;
     disk_cache::CacheKey diskKey{};
     if (diskCacheEnabled) {
-        try {
-            nix::SourcePath sp(ns.rootFS, nix::CanonPath(path));
-            sp = nix::resolveExprPath(sp);
-            std::string content = sp.readFile();
-            if (!content.empty())
-                diskKey = disk_cache::computeKeyForString(content);
-        } catch (...) { /* best-effort */ }
+        // Read the source content directly via std::ifstream (the
+        // SourcePath/SourceAccessor abstraction rejects intermediate
+        // symlinks like macOS /tmp → /private/tmp, but a plain ifstream
+        // opens through them).  The resulting hash keys content, not
+        // identity, so symlink quirks don't affect cache correctness.
+        diskKey = disk_cache::computeKeyForFile(path);
     }
     if (!diskKey.empty()) {
         if (auto blob = disk_cache::lookup(diskKey)) {
@@ -4278,8 +4277,20 @@ void primImport(EvalState & state, Value * args, Value & out)
                 out = run(cache.cus.back());
                 cache.results.emplace(path, out);
                 return;
-            } catch (const std::exception &) {
+            } catch (const std::exception & ex) {
                 cache.cus.pop_back();
+                // Phase-13 review: a corrupt or stale disk-cache blob
+                // (e.g., a CRIT-1-class SymbolId remap miss surfacing as
+                // "name not found") would silently fall back to a fresh
+                // lower+compile and mask the regression.  V3_STRICT_DISK_CACHE=1
+                // re-throws, surfacing the fault in tests.
+                static const bool strict =
+                    std::getenv("V3_STRICT_DISK_CACHE") != nullptr;
+                if (strict) {
+                    throw std::runtime_error(
+                        std::string("v3 disk-cache restore failed for ")
+                            + path + ": " + ex.what());
+                }
                 // Fall through to fresh lower+compile.
             }
         }
