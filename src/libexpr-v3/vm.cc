@@ -379,11 +379,8 @@ inline Value withLookup(VMState & vm, SymbolId name)
             if (derefed.isThunk() || derefed.tag() == Tag::App) {
                 try {
                     derefed = forceValue(vm, derefed);
-                } catch (const std::exception & ex) {
-                    std::string what(ex.what());
-                    if (what.find("blackhole") != std::string::npos)
-                        continue;
-                    throw;
+                } catch (const BlackholeError &) {
+                    continue;
                 }
             }
             if (!derefed.isAttrs()) continue;
@@ -394,16 +391,12 @@ inline Value withLookup(VMState & vm, SymbolId name)
         if (w.isThunk() || w.tag() == Tag::App) {
             try {
                 w = forceValue(vm, w);
-            } catch (const std::exception & ex) {
-                // Blackhole here is the delayed-with corner case: the
-                // with-stack entry references something that's still
-                // being forced from a deeper frame.  Skip it so outer
-                // scopes still get a chance to define `name`.  Real
-                // errors propagate as usual.
-                std::string what(ex.what());
-                if (what.find("blackhole") != std::string::npos)
-                    continue;
-                throw;
+            } catch (const BlackholeError &) {
+                // Delayed-with corner case: the with-stack entry
+                // references something that's still being forced from
+                // a deeper frame.  Skip it so outer scopes still get a
+                // chance to define `name`.  Other errors propagate.
+                continue;
             }
         }
         if (!w.isAttrs()) continue;
@@ -1802,7 +1795,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                     }
                 }
-                throw std::runtime_error("v3 OP_FORCE: infinite recursion (blackhole)");
+                throw BlackholeError("v3 OP_FORCE: infinite recursion (blackhole)");
             }
             // WC-10: Bridge thunk — call into tree-walker for the
             // single nix::Value*, then bridge the already-forced
@@ -3435,7 +3428,7 @@ Value forceValue(VMState & vm, Value v)
                     }
                 }
             }
-            throw std::runtime_error("v3 forceValue: infinite recursion (blackhole)");
+            throw BlackholeError("v3 forceValue: infinite recursion (blackhole)");
         }
         if (t->state == ThunkState::Bridge) {
             v = forceBridgeThunk(t);

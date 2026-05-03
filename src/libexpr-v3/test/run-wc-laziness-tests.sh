@@ -905,6 +905,23 @@ TESTS=(
   "tryEval does not catch abort"
   '(builtins.tryEval (abort "stop")).success'
   '__ERROR__'
+
+  # ----------------------------------------------------------------
+  # REVIEW MED-4: withLookup must not silently swallow user errors
+  # whose message happens to contain the literal "blackhole".  The
+  # discriminator is now a typed BlackholeError, not a substring match.
+  # ----------------------------------------------------------------
+  REVIEW-MED-4-blackhole-substring-in-user-error
+  "withLookup propagates user errors whose text contains blackhole"
+  # Bug-trigger pattern: outer with provides `y`; let-bind a thunk
+  # that throws an error whose message contains "blackhole", then
+  # use it as a *deferred* with-attrs so the throw fires inside
+  # withLookups force-attempt rather than at OP_CALL_PRIMOP time.
+  # Pre-fix substring match: catch swallows the throw, walks past to
+  # outer, returns 99 -- masking the user error.  Post-fix typed
+  # catch only matches BlackholeError, so ThrownError propagates.
+  'with { y = 99; }; let x = throw "user blackhole here"; in with x; y'
+  '__ERROR__'
 )
 
 pass=0

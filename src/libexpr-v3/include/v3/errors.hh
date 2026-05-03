@@ -45,4 +45,19 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+/// Blackhole detected during forceValue — a thunk attempted to
+/// evaluate itself transitively.  `withLookup` catches this to skip
+/// the offending with-stack entry (delayed-with corner case); other
+/// callers let it propagate as "infinite recursion".
+///
+/// Replaces the prior `std::runtime_error` + substring match on
+/// `e.what().find("blackhole")` so user code that throws an error
+/// containing the literal "blackhole" is no longer silently swallowed
+/// (REVIEW MED-4).
+class BlackholeError : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+
 } // namespace nix::v3
