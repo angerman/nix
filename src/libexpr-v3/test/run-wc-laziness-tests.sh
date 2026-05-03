@@ -866,6 +866,45 @@ TESTS=(
   "valueLess on lists whose elements come from a Tag::App chain"
   '[ (builtins.head [ 1 ]) (builtins.head [ 2 ]) ] < [ 1 3 ]'
   'true'
+
+  # ----------------------------------------------------------------
+  # REVIEW HIGH-2: primTryEval must catch ONLY AssertionError-class
+  # exceptions, not std::exception.  Tree-walker catches AssertionError
+  # (and ThrownError which derives from it); type errors and abort
+  # propagate.  Pre-fix v3 swallowed everything.
+  # ----------------------------------------------------------------
+  # Positive: assert false is caught -> success = false.
+  REVIEW-HIGH-2-tryeval-catches-assert
+  "tryEval catches assert false"
+  '(builtins.tryEval (assert false; 1)).success'
+  'false'
+
+  # Positive: throw is caught -> success = false (ThrownError derives
+  # from AssertionError).
+  REVIEW-HIGH-2-tryeval-catches-throw
+  "tryEval catches throw"
+  '(builtins.tryEval (throw "boom")).success'
+  'false'
+
+  # Positive: pure value succeeds.
+  REVIEW-HIGH-2-tryeval-success
+  "tryEval on a pure value reports success"
+  '(builtins.tryEval 42).success'
+  'true'
+
+  # Negative: type error must propagate, NOT be caught.  Pre-fix this
+  # returned false; post-fix it throws.  Test expects __ERROR__.
+  REVIEW-HIGH-2-tryeval-propagates-type-error
+  "tryEval does not catch type errors"
+  '(builtins.tryEval (1 + "x")).success'
+  '__ERROR__'
+
+  # Negative: abort must propagate.  Tree-walker'\''s nix::Abort does not
+  # derive from AssertionError -- v3 mirrors with AbortError.
+  REVIEW-HIGH-2-tryeval-propagates-abort
+  "tryEval does not catch abort"
+  '(builtins.tryEval (abort "stop")).success'
+  '__ERROR__'
 )
 
 pass=0

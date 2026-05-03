@@ -22,6 +22,7 @@
 #include "v3/primop.hh"
 #include "v3/ir.hh"
 #include "v3/disasm.hh"
+#include "v3/errors.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
@@ -2953,7 +2954,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ASSERT: {
             Value c = pop(vm);
-            if (!isTrueValue(c)) throw std::runtime_error("v3 OP_ASSERT: assertion failed");
+            if (!isTrueValue(c)) throw AssertionError("v3 OP_ASSERT: assertion failed");
             break;
         }
         case OP_POS: {

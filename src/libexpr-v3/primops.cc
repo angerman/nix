@@ -25,6 +25,7 @@
 #include "v3/lower.hh"
 #include "v3/vm.hh"
 #include "v3/bridge_yield.hh"
+#include "v3/errors.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
@@ -507,7 +508,9 @@ void primDiv(EvalState &, Value * args, Value & out)
 void primThrow(EvalState &, Value * args, Value &)
 {
     if (!args[0].isString()) typeError("throw", "string");
-    throw std::runtime_error(std::string("v3 throw: ") + args[0].payload.str);
+    // ThrownError derives from AssertionError so tryEval catches it
+    // (matches tree-walker semantics).
+    throw ThrownError(std::string("v3 throw: ") + args[0].payload.str);
 }
 
 void primConcatLists(EvalState & state, Value * args, Value & out)
@@ -1133,7 +1136,9 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
 void primAbort(EvalState &, Value * args, Value &)
 {
     if (!args[0].isString()) typeError("abort", "string");
-    throw std::runtime_error(std::string("v3 abort: ") + args[0].payload.str);
+    // AbortError is a plain runtime_error (not derived from AssertionError),
+    // so tryEval does NOT catch it -- matches tree-walker's nix::Abort.
+    throw AbortError(std::string("v3 abort: ") + args[0].payload.str);
 }
 
 void primSeq(EvalState &, Value * args, Value & out)
@@ -5304,7 +5309,17 @@ void primTryEval(EvalState & state, Value * args, Value & out)
     try {
         valueV = forceValue(*state.vm, args[0]);
         successV = Value::vTrue;
-    } catch (const std::exception &) {
+    }
+    // Match tree-walker semantics: catch only AssertionError-class
+    // exceptions (assert / throw).  Type errors, abort, infinite
+    // recursion, etc. propagate.  v3::AssertionError covers v3-side
+    // throws; nix::AssertionError covers anything that crossed in
+    // through the bridge from tree-walker code.
+    catch (const AssertionError &) {
+        successV = Value::vFalse;
+        valueV = Value::vFalse;
+    }
+    catch (const ::nix::AssertionError &) {
         successV = Value::vFalse;
         valueV = Value::vFalse;
     }
