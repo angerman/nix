@@ -761,7 +761,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
         switch (op) {
 
-        case OP_NOP: break;
+        // OP_NOP removed (Phase-13 review): never emitted; bytecode
+        // value 0x00 is reserved and now hits the default panic.
 
         // --- Literals ---
         case OP_LIT_INT: {
@@ -2622,17 +2623,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // --- With ---
         case OP_WITH_PUSH: vm.withStack.push_back(pop(vm)); break;
         case OP_WITH_POP:  vm.withStack.pop_back(); break;
-        case OP_LOAD_SLOT_REF: {
-            // Push a Tag::Slot Value pointing at vm.valueStack[stackBase + operand].
-            // The pointer remains valid as long as vm.valueStack does
-            // not reallocate.  Phase 4 will address slot-stability for
-            // pathological depth; for now we rely on the pre-reserved
-            // capacity (vm.valueStack.reserve(64*1024)).
-            Value v;
-            v.mkSlot(&vm.valueStack[stackBase + operand]);
-            push(vm, v);
-            break;
-        }
+        // OP_LOAD_SLOT_REF removed (Phase-13 review): Phase-3
+        // scaffolding superseded by RecBindingSlotRef + forceValue's
+        // Tag::Slot deref.  Bytecode value 0x83 reserved; default
+        // panic catches any stray emission.
         case OP_REC_BINDING_SLOT_REF: {
             // Pop a Tag::Attrs (forced earlier), look up the entry by
             // SymbolId in operand, push a Tag::Slot Value pointing at

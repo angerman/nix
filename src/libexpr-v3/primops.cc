@@ -2412,76 +2412,12 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
 /// Tree-walker primop body: invoked when tree-walker fully applies
 /// `__v3_call_bridge_2 handle arg1 arg2`.  Look up the v3 closure
 /// stored at `handle`, convert args back to v3, call, convert result.
-static void primV3CallBridge2(nix::EvalState & ns, const nix::PosIdx pos,
-                              nix::Value ** args, nix::Value & out)
-{
-    ns.forceValue(*args[0], pos);
-    if (args[0]->type() != nix::nInt)
-        ns.error<nix::EvalError>("v3 bridge: handle must be int").debugThrow();
-    int64_t h = args[0]->integer().value;
-    auto & tbl = v3BridgeClosures();
-    if (h < 0 || (size_t)h >= tbl.size())
-        ns.error<nix::EvalError>("v3 bridge: invalid handle").debugThrow();
-    Value v3fn = tbl[(size_t)h].v3Value;
-    // Note: primV3CallBridge2 (legacy 2-arg form) doesn't currently
-    // implement the WC-19+ tree-walker fallback.  In practice it's
-    // only used for the `builtins.path { filter = path: type: ...; }`
-    // shape; the 1-arg variant has the safety net.
-    // Convert tree-walker args to v3, force only on demand inside the
-    // v3 closure — we deepForce here to preserve the invariant that
-    // v3 closures see WHNF.
-    EvalState v3state;
-    v3state.nixEvalState = &ns;
-    extern thread_local nix::EvalState * tlNixEvalState;
-    if (!tlNixEvalState) tlNixEvalState = &ns;
-
-    // Need a v3 VMState to invoke callClosure.  Use a thread-local
-    // dedicated to bridge calls so its lifetime spans the program;
-    // multiple bridge invocations reuse the same state.
-    static thread_local VMState bridgeVm;
-    bridgeVm.valueStack.reserve(64 * 1024);
-    bridgeVm.frames.reserve(4096);
-    bridgeVm.withStack.reserve(64);
-    v3state.vm = &bridgeVm;
-
-    // For each tree-walker arg (after handle), convert to v3, then
-    // walk the curry: callClosure(fn, arg1) → fn1; callClosure(fn1, arg2)
-    // → result.
-    Value fn = v3fn;
-    for (int i = 1; i <= 2; ++i) {
-        ns.forceValue(*args[i], pos);
-        Value v3arg = treeWalkerToV3(v3state, *args[i]);
-        fn = callClosure(*v3state.vm, fn, v3arg);
-    }
-    // Convert result back.
-    fn = forceValue(*v3state.vm, fn);
-    // Reuse v3ToTreeWalker by allocating a Value to hold the result.
-    nix::Value * tmp; (void)tmp;
-    // We need to write into `out`, so do the conversion inline.
-    switch (fn.tag()) {
-    case Tag::Bool:   out.mkBool(fn.payload.i == 1); break;
-    case Tag::Int:    out.mkInt(fn.payload.i); break;
-    case Tag::Float:  out.mkFloat(fn.payload.f); break;
-    case Tag::Null:   out.mkNull(); break;
-    case Tag::String: out.mkString(fn.payload.str ? fn.payload.str : "", ns.mem); break;
-    case Tag::Uninitialized:
-    case Tag::Path:
-    case Tag::Attrs:
-    case Tag::List:
-    case Tag::Closure:
-    case Tag::Thunk:
-    case Tag::PrimOp:
-    case Tag::PrimOpApp:
-    case Tag::App:
-    case Tag::Blackhole:
-    case Tag::External:
-    case Tag::Slot:
-    default:
-        // Lists / attrsets / paths fall back to null.  filter returns
-        // bool, so this is enough for the path test.
-        out.mkNull(); break;
-    }
-}
+// Phase-13 review ID-B18: primV3CallBridge2 (legacy 2-arg form for
+// `builtins.path { filter = path: type: ...; }`) was defined but
+// never registered as a primop.  Removed in the cleanup pass.
+// builtins.path's filter path falls back through the regular
+// tree-walker bridge, which has the WC-19+ safety net the legacy
+// shim lacked.
 
 /// WC-15: lazy attr-set bridge primop.  Args: handle (Int), name (String).
 /// Looks up the v3 Tag::Attrs Value at handle, finds the attr by name,

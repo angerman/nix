@@ -63,7 +63,6 @@ static const char * opName(Op op)
     case OP_ATTRS_HAS:         return "OP_ATTRS_HAS";
     case OP_ATTRS_HAS_DYN:     return "OP_ATTRS_HAS_DYN";
     case OP_ATTRS_UPDATE:      return "OP_ATTRS_UPDATE";
-    case OP_LOAD_SLOT_REF:     return "OP_LOAD_SLOT_REF";
     case OP_REC_BINDING_SLOT_REF: return "OP_REC_BINDING_SLOT_REF";
     case OP_HALT:              return "OP_HALT";
     default:                   return nullptr;

@@ -43,7 +43,9 @@ using Instruction = uint32_t;
 
 enum Op : uint8_t
 {
-    OP_NOP            = 0x00,
+    // 0x00 was OP_NOP — never emitted, removed in the review-cleanup
+    // pass.  Reserved (don't reuse in case old disk caches are still
+    // around in the wild).
 
     // --- Literals -------------------------------------------------------
     OP_LIT_INT        = 0x01,  // [imm:24]   small signed int
@@ -137,11 +139,12 @@ enum Op : uint8_t
     OP_WITH_LOOKUP    = 0x82,  // [sym:24]; data: depth (0=innermost)
     /// SECD DUM/RAP: push a Tag::Slot Value onto the operand stack
     /// pointing at the local slot referenced by [slot:24].  Used when
-    /// `with E;` source resolves to a let-rec slot reference — capturing
-    /// the slot pointer (rather than the slot's snapshotted value) lets
-    /// sub-thunks observe the slot's live contents at force time.  See
-    /// Tag::Slot's docstring in value.hh for rationale.
-    OP_LOAD_SLOT_REF  = 0x83,  // [slot:24]
+    // 0x83 was OP_LOAD_SLOT_REF — Phase-3 scaffolding for a planned
+    // `with E;`-on-let-rec-slot path that the WC-31/Phase-5 redesign
+    // (RecBindingSlotRef + Tag::Slot deref in forceValue) made
+    // unnecessary.  Never emitted by the compiler in the landed
+    // pipeline; removed in the review-cleanup pass.
+
     /// SECD-style heap-stable slot reference: pop a Tag::Attrs (a
     /// rec-attrset's Bindings*), look up the entry by SymbolId, and
     /// push a Tag::Slot Value pointing at `&entries[i].value` —
