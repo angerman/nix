@@ -138,6 +138,13 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
         } else if (op == OP_ATTRS_SELECT) {
             word = encode(op, remapId(operand));
             ip++;  // 1 IC-index follow-up word
+        } else if (op == OP_REC_BINDING_SLOT_REF) {
+            // Phase-13 review CRIT-1 fix: this opcode carries a
+            // SymbolId in its operand (the slot name to look up in
+            // the rec attrset), same as OP_ATTRS_SELECT.  Without
+            // remap, every cached CU using `with rec` / lib.fix
+            // resolved the wrong attribute after a process restart.
+            word = encode(op, remapId(operand));
         } else if (op == OP_ATTRS_INIT) {
             // Names get remapped; runtime sorts on the fly so order
             // doesn't matter.
