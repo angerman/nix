@@ -225,13 +225,28 @@ struct CompilationUnit
     std::vector<const PrimOp *> primops;
 
     /// Inline cache slots for OP_ATTRS_SELECT.  Each OP_ATTRS_SELECT
-    /// reserves an index here; the entry caches the most recently
-    /// observed (Bindings*, slot-in-Bindings) pair so a repeat
+    /// reserves an index here; the entry caches up to kWays recently
+    /// observed (Bindings*, slot-in-Bindings) pairs so a repeat
     /// access skips the binary search.  Mutated at runtime; sized at
     /// compile time so slot indices are stable.
+    ///
+    /// EVAL-COMP §8.1: 4-way polymorphic IC.  Pre-fix had a single
+    /// (Bindings*, slot) entry per call site; polymorphic sites like
+    /// `map (p: p.name) [foo bar]` thrashed on every call.  4 ways
+    /// catches the common shape-polymorphism patterns in nixpkgs
+    /// (`mapAttrs` etc.) at modest memory cost (64 B per call site
+    /// vs. 16 B previously).
     struct AttrSelectIC {
-        const Bindings * lastBindings = nullptr;
-        uint32_t lastSlot = 0;
+        static constexpr int kWays = 4;
+        struct Entry {
+            const Bindings * bindings = nullptr;
+            uint32_t slot = 0;
+        };
+        Entry entries[kWays] = {};
+        /// Round-robin replacement: index of the next slot to evict.
+        /// Cheap (one byte, no LRU bookkeeping).  Real LRU would buy
+        /// a few percent on adversarial workloads but adds complexity.
+        uint8_t evictIdx = 0;
     };
     mutable std::vector<AttrSelectIC> attrSelectCache;
 

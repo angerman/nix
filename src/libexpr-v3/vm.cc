@@ -2418,22 +2418,32 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     }
                 }
             }
-            // Inline-cache fast path: if the same Bindings* is hit
-            // again, skip the binary search and read entries[lastSlot]
-            // directly.  Cache miss falls back to lookup() and updates
-            // the slot.
+            // EVAL-COMP §8.1: 4-way polymorphic IC fast path.  Walk
+            // the small entries array; on hit, read the cached slot
+            // directly.  Hit at any way is O(kWays) compares, vs.
+            // O(log n) binary search on miss.
             //
-            // V3_DBG_NO_IC disables the IC fast-path — useful for
-            // bisecting whether IC corruption causes wrong-value bugs.
+            // V3_DBG_NO_IC disables the fast-path -- bisect aid for
+            // suspected IC corruption.
             static const bool s_no_ic = std::getenv("V3_DBG_NO_IC") != nullptr;
-            if (!s_no_ic && ic.lastBindings == b
-                && ic.lastSlot < b->size
-                && b->entries[ic.lastSlot].name == static_cast<SymbolId>(operand))
-            {
-                Value & slot = b->entries[ic.lastSlot].value;
+            uint32_t hitSlot = UINT32_MAX;
+            if (!s_no_ic) {
+                for (int w = 0; w < cu->attrSelectCache[icIdx].kWays; ++w) {
+                    auto & e = ic.entries[w];
+                    if (e.bindings == b
+                        && e.slot < b->size
+                        && b->entries[e.slot].name == static_cast<SymbolId>(operand))
+                    {
+                        hitSlot = e.slot;
+                        break;
+                    }
+                }
+            }
+            if (hitSlot != UINT32_MAX) {
+                Value & slot = b->entries[hitSlot].value;
                 // Phase 13.3 mapAttrs memo (IC fast path).  Without
                 // writeback, every access to a mapAttrs entry re-applies
-                // its function — confirmed via per-descriptor force
+                // its function -- confirmed via per-descriptor force
                 // counter (parse.nix:60:44 = 625K forces on a 2-stage
                 // probe).  Tree-walker mutates the slot via
                 // `forceValue(*v)`; mirror that here.
@@ -2447,7 +2457,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             } else {
                 // Manual binary search inlined to also recover the
-                // matched slot index, so we can update the cache.
+                // matched slot index, so we can install in the cache.
                 uint32_t lo = 0, hi = b->size;
                 while (lo < hi) {
                     uint32_t mid = (lo + hi) >> 1;
@@ -2480,8 +2490,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     }
                     throw std::runtime_error("v3 OP_ATTRS_SELECT: attribute not found");
                 }
-                ic.lastBindings = b;
-                ic.lastSlot     = lo;
+                // Install at the next eviction slot (round-robin).
+                auto & evicted = ic.entries[ic.evictIdx];
+                evicted.bindings = b;
+                evicted.slot     = lo;
+                ic.evictIdx = (ic.evictIdx + 1)
+                    % CompilationUnit::AttrSelectIC::kWays;
                 Value & slot = b->entries[lo].value;
                 if (__builtin_expect(slot.tag() == Tag::App, 0)) {
                     vm.frames.back().ip = ip;
