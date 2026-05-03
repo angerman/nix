@@ -217,7 +217,7 @@ inline bool valueEqual(VMState & vm, Value a, Value b, bool insideContainer = fa
     }
 }
 
-inline bool valueLess(const Value & a, const Value & b)
+inline bool valueLess(VMState & vm, const Value & a, const Value & b)
 {
     if (a.isInt() && b.isInt())     return a.payload.i < b.payload.i;
     if (a.isFloat() && b.isFloat()) return a.payload.f < b.payload.f;
@@ -226,15 +226,25 @@ inline bool valueLess(const Value & a, const Value & b)
     if (a.isString() && b.isString())
         return std::string_view(a.payload.str) < std::string_view(b.payload.str);
     if (a.isList() && b.isList()) {
-        // Lexicographic compare; matches tree-walker.
+        // Lexicographic compare; matches tree-walker.  Phase-13
+        // review HIGH-3 fix: force lazy elements before recursing.
+        // After WC-35, mapAttrs/map install Tag::App entries; without
+        // forcing, comparing `[(map id [1]) ...]` would throw the
+        // "unsupported operand types" branch even for valid lists.
         uint32_t na = a.payload.list ? a.payload.list->size : 0;
         uint32_t nb = b.payload.list ? b.payload.list->size : 0;
         uint32_t n = std::min(na, nb);
         for (uint32_t i = 0; i < n; ++i) {
-            const Value & ai = a.payload.list->elems[i];
-            const Value & bi = b.payload.list->elems[i];
-            if (valueLess(ai, bi)) return true;
-            if (valueLess(bi, ai)) return false;
+            Value ai = a.payload.list->elems[i];
+            Value bi = b.payload.list->elems[i];
+            if (ai.tag() == Tag::Thunk || ai.tag() == Tag::App
+                || ai.tag() == Tag::Slot)
+                ai = forceValue(vm, ai);
+            if (bi.tag() == Tag::Thunk || bi.tag() == Tag::App
+                || bi.tag() == Tag::Slot)
+                bi = forceValue(vm, bi);
+            if (valueLess(vm, ai, bi)) return true;
+            if (valueLess(vm, bi, ai)) return false;
         }
         return na < nb;
     }
@@ -1007,7 +1017,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 vm.valueStack.back() = lt ? Value::vTrue : Value::vFalse;
                 break;
             }
-            Value b = pop(vm), a = pop(vm); Value r; r = valueLess(a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break;
+            Value b = pop(vm), a = pop(vm); Value r; r = valueLess(vm, a, b) ? Value::vTrue : Value::vFalse; push(vm, r); break;
         }
 
         // --- Boolean / branches ---
@@ -1415,13 +1425,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // re-entry frame, the thunk should still be set when
             // we eventually OP_RETURN.
             cur.ip = tcDesc->codeOffset;
-            // stackBaseOffset and withStackBase are unchanged: we
-            // reuse the same operand-stack window and keep any
-            // captured-with entries the outer frame already pushed.
+            // stackBaseOffset is unchanged: we reuse the same
+            // operand-stack window.
+            //
+            // Phase-13 review HIGH-1 fix: the callee gets its OWN
+            // with-scope, so we MUST truncate the with-stack and
+            // reset withStackBase to the new size *before* pushing
+            // the callee's captured withs.  Previously we kept the
+            // outer's withs on the stack, which leaked names from
+            // the caller's `with` chain into the tail-callee's
+            // OP_WITH_LOOKUP scope (cross-closure tail call).  Self-
+            // recursive TC was unaffected because the captures match.
+            if (vm.withStack.size() > cur.withStackBase)
+                vm.withStack.resize(cur.withStackBase);
+            cur.withStackBase = static_cast<uint32_t>(vm.withStack.size());
 
-            // Push the callee's captured-withs on top of whatever
-            // the outer frame had — they get popped together at
-            // OP_RETURN since withStackBase is the outer's floor.
+            // Push the callee's captured-withs on top of the now-
+            // truncated with-stack.  They get popped at OP_RETURN
+            // since withStackBase tracks the new floor.
             pushCapturedWiths(vm, tcCallee->capturedWiths);
 
             ip = tcDesc->codeOffset;
