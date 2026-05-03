@@ -3086,7 +3086,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
 
         case OP_HALT: {
+            // Defensive: chase Tag::Thunk/App/Slot before exiting so the
+            // caller never receives an unforced value if a future bytecode
+            // change drops the trailing OP_FORCE.  Today the entry-function
+            // code emitter inserts that force, so this is a tail-handling
+            // safety net rather than a hot path.  REVIEW MED-3.
             finalResult = pop(vm);
+            if (finalResult.tag() == Tag::Thunk
+                || finalResult.tag() == Tag::App
+                || finalResult.tag() == Tag::Slot) {
+                vm.frames.back().ip = ip;
+                finalResult = forceValue(vm, finalResult);
+            }
             running = false;
             break;
         }
@@ -3145,6 +3156,14 @@ static void clearBlackMarksOnException(VMState & vm, size_t exitDepth)
         if (vm.withStack.size() > targetWithBase)
             vm.withStack.resize(targetWithBase);
     }
+    // REVIEW MED-3 + critic §8 #2: clear CFF_FORCE_RETRY on the
+    // topmost surviving frame.  The flag is a one-shot set by OP_FORCE
+    // before pushing a thunk frame, consumed by the caller's
+    // OP_RETURN.  If the pushed thunk threw, the flag stayed on the
+    // surviving caller; the next OP_RETURN would interpret a stale
+    // value as a thunk-force result and trigger spurious retry.
+    if (!vm.frames.empty())
+        vm.frames.back().flags &= ~CFF_FORCE_RETRY;
 }
 
 Value run(const CompilationUnit & rootCu)
