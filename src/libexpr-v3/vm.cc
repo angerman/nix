@@ -1726,12 +1726,32 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     continue;
                 }
                 if (v.tag() == Tag::App) {
-                    Value left = v.payload.pair->left;
-                    Value right = v.payload.pair->right;
+                    // REVIEW MED-18: walk the App spine iteratively
+                    // to find the leaf function + collected args.
+                    // Pre-fix recursed through forceValue per App level
+                    // (`left = forceValue(vm, left)`), blowing C-stack
+                    // on long mapAttrs / map chains in nixpkgs.  Now we
+                    // chase down the left side without recursion,
+                    // accumulating rights into a small vector, then
+                    // apply once.  The leaf force call is non-App, so
+                    // any forceValue recursion bottoms out at the leaf
+                    // rather than at every App level.
+                    std::vector<Value> rights;
+                    rights.reserve(8);
+                    while (v.tag() == Tag::App) {
+                        rights.push_back(v.payload.pair->right);
+                        v = v.payload.pair->left;
+                    }
                     vm.frames.back().ip = ip;
-                    // left may itself need forcing (App spines).
-                    left = forceValue(vm, left);
-                    v = callClosure(vm, left, right);
+                    if (v.tag() == Tag::Slot
+                        || v.tag() == Tag::Thunk
+                        || v.tag() == Tag::App)
+                        v = forceValue(vm, v);
+                    // Apply rights in source order (we collected
+                    // outermost-first while walking; reverse on apply).
+                    for (size_t i = rights.size(); i > 0; --i) {
+                        v = callClosure(vm, v, rights[i - 1]);
+                    }
                     continue;
                 }
                 if (!v.isThunk()) break;
