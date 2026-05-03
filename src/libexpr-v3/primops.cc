@@ -2676,10 +2676,15 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 };
                 nix::Value * pv = ns.allocValue();
                 pv->mkPrimOp(po);
-                lazyListPrim = pv;
+                // Register root BEFORE publishing the pointer.
+                // Otherwise a GC firing between the store and the
+                // GC_add_roots call could reclaim *pv -- the only
+                // reachability path is via the static, which isn't a
+                // root yet.  REVIEW MED-20.
 #if NIX_USE_BOEHMGC
                 GC_add_roots(&lazyListPrim, &lazyListPrim + 1);
 #endif
+                lazyListPrim = pv;
             }
             auto & tbl = v3BridgeLists();
             size_t handle = tbl.size();
@@ -2759,10 +2764,11 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 };
                 nix::Value * pv = ns.allocValue();
                 pv->mkPrimOp(po);
-                lazyAttrPrim = pv;
+                // Root BEFORE publish; see lazyListPrim / REVIEW MED-20.
 #if NIX_USE_BOEHMGC
                 GC_add_roots(&lazyAttrPrim, &lazyAttrPrim + 1);
 #endif
+                lazyAttrPrim = pv;
             }
             auto & tbl = v3BridgeAttrs();
             size_t handle = tbl.size();
@@ -2834,10 +2840,11 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             };
             nix::Value * vp = ns.allocValue();
             vp->mkPrimOp(po);
-            bridgePrimOp1 = vp;
+            // Root BEFORE publish; see lazyListPrim / REVIEW MED-20.
 #if NIX_USE_BOEHMGC
             GC_add_roots(&bridgePrimOp1, &bridgePrimOp1 + 1);
 #endif
+            bridgePrimOp1 = vp;
         }
         auto & tbl = v3BridgeClosures();
         size_t handle = tbl.size();
