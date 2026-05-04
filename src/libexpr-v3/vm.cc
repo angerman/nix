@@ -723,22 +723,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     // Gate the per-instruction counter behind an env var: it adds a
     // memory write to every instruction and is only useful for
     // profiling.  Overhead on fib32 was ~3% on first-run timings.
-    static const bool kCountInstructions = std::getenv("NIX_VM_STATS") != nullptr;
+    static const bool s_kCountInstructions = std::getenv("NIX_VM_STATS") != nullptr;
     // V3_DBG_TRACE_THUNK_BODY: per-instruction trace gated on the
     // currently-running thunk frame having a specific (codeOffset, nUp).
     // Used to nail down WC-37 frame/thunk mismatch. Format:
     //   V3_DBG_TRACE_THUNK_BODY=1346,5  ← trace any thunk with codeOffset
     //                                     1346 and nUp=5
-    static const char * s_trace_env = std::getenv("V3_DBG_TRACE_THUNK_BODY");
-    static const uint32_t s_trace_codeoff =
-        s_trace_env ? static_cast<uint32_t>(std::strtoul(s_trace_env, nullptr, 10)) : 0;
-    static const uint16_t s_trace_nup = []() -> uint16_t {
+    static const char * s_trace_env_static = std::getenv("V3_DBG_TRACE_THUNK_BODY");
+    static const uint32_t s_trace_codeoff_static =
+        s_trace_env_static ? static_cast<uint32_t>(std::strtoul(s_trace_env_static, nullptr, 10)) : 0;
+    static const uint16_t s_trace_nup_static = []() -> uint16_t {
         const char * e = std::getenv("V3_DBG_TRACE_THUNK_BODY");
         if (!e) return 0;
         const char * comma = std::strchr(e, ',');
         if (!comma) return 0;
         return static_cast<uint16_t>(std::strtoul(comma + 1, nullptr, 10));
     }();
+    // Profile (post-#062e3c502): even with [[unlikely]], the compiler
+    // kept reloading the function-local statics every iteration --
+    // 478 + 277 = 755 samples on the two checks (~15% of dispatchLoop
+    // time on fib38).  Promote to plain function-scope const locals
+    // so the loop sees them as loop-invariant load-once values; the
+    // compiler then hoists them entirely out of the inner loop and
+    // the trace branch becomes a single dead-code path under -O2.
+    const bool kCountInstructions = s_kCountInstructions;
+    const char * const s_trace_env = s_trace_env_static;
+    const uint32_t s_trace_codeoff = s_trace_codeoff_static;
+    const uint16_t s_trace_nup = s_trace_nup_static;
     while (running) {
         // V3_DBG_TRACE_THUNK_BODY: print this instruction if the current
         // frame is a thunk frame matching the configured codeOffset/nUp.
