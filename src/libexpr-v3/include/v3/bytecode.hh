@@ -174,6 +174,37 @@ enum Op : uint8_t
     /// reused across every reference for the lifetime of the process.
     OP_LIT_BUILTINS   = 0xB2,
 
+    // --- #428 fast-path primop opcodes (Smalltalk primitiveFailed
+    // pattern).  Each opcode is bug-compatible with the corresponding
+    // C primop -- same forcing, same throws, same return shape -- it
+    // just inlines the hot path into the dispatch loop, saving the
+    // OP_CALL_PRIMOP indirection (~30 cycles -> 1-2 cycles for type
+    // predicates).  Emitted in lieu of OP_CALL_PRIMOP when the lowerer
+    // recognises the targeted primop pointer; the primop itself stays
+    // registered for first-class uses (`map builtins.isAttrs xs`).
+    //
+    // Operand format: bare opcode (no operand bits).  Pops the args
+    // off the operand stack, pushes the result.
+
+    // Type predicates: pop one arg, force, push bool result.
+    OP_IS_NULL        = 0xC0,
+    OP_IS_BOOL        = 0xC1,
+    OP_IS_INT         = 0xC2,
+    OP_IS_FLOAT       = 0xC3,
+    OP_IS_STRING      = 0xC4,
+    OP_IS_PATH        = 0xC5,
+    OP_IS_LIST        = 0xC6,
+    OP_IS_ATTRS       = 0xC7,
+    OP_IS_FUNCTION    = 0xC8,
+
+    // List selectors: pop list (and index for OP_ELEM_AT), force,
+    // do the selector, push.  Throw with the same error messages as
+    // the primop on type/range failure.
+    OP_HEAD           = 0xD0,
+    OP_TAIL           = 0xD1,
+    OP_LENGTH         = 0xD2,  // also handles strings (matches primLength)
+    OP_ELEM_AT        = 0xD3,
+
     OP_HALT           = 0xFF,
 };
 

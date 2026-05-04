@@ -599,9 +599,66 @@ struct Emitter
         unit.primops.push_back(po);
         return static_cast<uint32_t>(unit.primops.size() - 1);
     }
+    /// #428: targeted-primop -> fast-path opcode mapping.  Returns 0
+    /// when the primop isn't one of the inlined ones; otherwise the
+    /// matching opcode.  Lazily caches the canonical PrimOp pointers
+    /// at first lookup so subsequent calls are pointer-compares.
+    static Op fastPathOpcodeFor(const PrimOp * po, uint32_t nArgs)
+    {
+        struct Cache {
+            const PrimOp * isNull = nullptr, * isBool = nullptr;
+            const PrimOp * isInt = nullptr, * isFloat = nullptr;
+            const PrimOp * isString = nullptr, * isPath = nullptr;
+            const PrimOp * isList = nullptr, * isAttrs = nullptr;
+            const PrimOp * isFunction = nullptr;
+            const PrimOp * head = nullptr, * tail = nullptr;
+            const PrimOp * length = nullptr, * elemAt = nullptr;
+            Cache() {
+                isNull     = findPrimOp("isNull");
+                isBool     = findPrimOp("isBool");
+                isInt      = findPrimOp("isInt");
+                isFloat    = findPrimOp("isFloat");
+                isString   = findPrimOp("isString");
+                isPath     = findPrimOp("isPath");
+                isList     = findPrimOp("isList");
+                isAttrs    = findPrimOp("isAttrs");
+                isFunction = findPrimOp("isFunction");
+                head       = findPrimOp("head");
+                tail       = findPrimOp("tail");
+                length     = findPrimOp("length");
+                elemAt     = findPrimOp("elemAt");
+            }
+        };
+        static const Cache c;
+        if (nArgs == 1) {
+            if (po == c.isNull)     return OP_IS_NULL;
+            if (po == c.isBool)     return OP_IS_BOOL;
+            if (po == c.isInt)      return OP_IS_INT;
+            if (po == c.isFloat)    return OP_IS_FLOAT;
+            if (po == c.isString)   return OP_IS_STRING;
+            if (po == c.isPath)     return OP_IS_PATH;
+            if (po == c.isList)     return OP_IS_LIST;
+            if (po == c.isAttrs)    return OP_IS_ATTRS;
+            if (po == c.isFunction) return OP_IS_FUNCTION;
+            if (po == c.head)       return OP_HEAD;
+            if (po == c.tail)       return OP_TAIL;
+            if (po == c.length)     return OP_LENGTH;
+        } else if (nArgs == 2) {
+            if (po == c.elemAt)     return OP_ELEM_AT;
+        }
+        return static_cast<Op>(0);
+    }
+
     void emitOne(const ir::PrimOpCall & e)
     {
         for (auto v : e.args) emitVarRef(v);
+        // #428: fast-path inline if this is one of the targeted primops.
+        // Args are already on the stack; the inline opcode pops them.
+        if (Op op = fastPathOpcodeFor(e.primop, static_cast<uint32_t>(e.args.size()));
+            op != static_cast<Op>(0)) {
+            unit.code.push_back(encode(op));
+            return;
+        }
         unit.code.push_back(encode(OP_CALL_PRIMOP, static_cast<uint32_t>(e.args.size())));
         unit.code.push_back(internPrimOp(e.primop));
     }

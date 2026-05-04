@@ -3136,6 +3136,121 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
 
+        // ---- #428 fast-path primop opcodes ----------------------------
+        // Each opcode is a bug-compatible inline of the corresponding C
+        // primop (primops.cc): same forcing, same throws, same return
+        // shape.  Emitted by the lowerer in lieu of OP_CALL_PRIMOP when
+        // the called primop is one of the targeted ones; the primop
+        // itself stays registered for first-class uses.
+
+        // -Werror=switch-enum on the outer dispatch makes a single
+        // multi-tag inner switch awkward (requires every enum value
+        // listed), so each predicate gets its own self-contained
+        // case body using a small lambda to share the force-then-test
+        // pattern.
+        #define V3_IS_OP(op_name, predExpr) \
+            case op_name: { \
+                Value v = pop(vm); \
+                if (v.isThunk() || v.tag() == Tag::App \
+                    || v.tag() == Tag::Slot) { \
+                    vm.frames.back().ip = ip; \
+                    v = forceValue(vm, v); \
+                } \
+                push(vm, (predExpr) ? Value::vTrue : Value::vFalse); \
+                break; \
+            }
+        V3_IS_OP(OP_IS_NULL,   v.isNull())
+        V3_IS_OP(OP_IS_BOOL,   v.isBool())
+        V3_IS_OP(OP_IS_INT,    v.isInt())
+        V3_IS_OP(OP_IS_FLOAT,  v.isFloat())
+        V3_IS_OP(OP_IS_STRING, v.isString())
+        V3_IS_OP(OP_IS_PATH,   v.isPath())
+        V3_IS_OP(OP_IS_LIST,   v.isList())
+        V3_IS_OP(OP_IS_ATTRS,  v.isAttrs())
+        V3_IS_OP(OP_IS_FUNCTION,
+            v.isClosure() || v.isPrimOp() || v.tag() == Tag::PrimOpApp)
+        #undef V3_IS_OP
+
+        case OP_HEAD: {
+            // Mirror primHead in primops.cc:272-278.
+            Value v = pop(vm);
+            if (v.isThunk() || v.tag() == Tag::App
+                || v.tag() == Tag::Slot) {
+                vm.frames.back().ip = ip;
+                v = forceValue(vm, v);
+            }
+            if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
+                throw std::runtime_error("v3 primop head: empty list or wrong type");
+            push(vm, v.payload.list->elems[0]);
+            break;
+        }
+
+        case OP_TAIL: {
+            // Mirror primTail in primops.cc:280-292.
+            Value v = pop(vm);
+            if (v.isThunk() || v.tag() == Tag::App
+                || v.tag() == Tag::Slot) {
+                vm.frames.back().ip = ip;
+                v = forceValue(vm, v);
+            }
+            if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
+                throw std::runtime_error("v3 primop tail: empty list or wrong type");
+            uint32_t n = v.payload.list->size;
+            ListVec * out_l = Alloc::allocList(n - 1);
+            allocStats().listsAllocated++;
+            for (uint32_t i = 1; i < n; ++i)
+                out_l->elems[i - 1] = v.payload.list->elems[i];
+            Value r;
+            r.tag_payload = static_cast<uint64_t>(Tag::List);
+            r.payload.list = out_l;
+            push(vm, r);
+            break;
+        }
+
+        case OP_LENGTH: {
+            // Mirror primLength in primops.cc:262-270.  Handles list
+            // OR string; throws otherwise with the same message.
+            Value v = pop(vm);
+            if (v.isThunk() || v.tag() == Tag::App
+                || v.tag() == Tag::Slot) {
+                vm.frames.back().ip = ip;
+                v = forceValue(vm, v);
+            }
+            int64_t n = 0;
+            if (v.isList())
+                n = v.payload.list ? v.payload.list->size : 0;
+            else if (v.isString())
+                n = static_cast<int64_t>(std::strlen(v.payload.str));
+            else
+                throw std::runtime_error("v3 primop length: expected list or string");
+            Value r; r.mkInt(n);
+            push(vm, r);
+            break;
+        }
+
+        case OP_ELEM_AT: {
+            // Mirror primElemAt in primops.cc:294-303.  Pops idx, then list.
+            Value idx = pop(vm);
+            Value lst = pop(vm);
+            if (idx.isThunk() || idx.tag() == Tag::App
+                || idx.tag() == Tag::Slot) {
+                vm.frames.back().ip = ip;
+                idx = forceValue(vm, idx);
+            }
+            if (lst.isThunk() || lst.tag() == Tag::App
+                || lst.tag() == Tag::Slot) {
+                vm.frames.back().ip = ip;
+                lst = forceValue(vm, lst);
+            }
+            if (!lst.isList() || !idx.isInt())
+                throw std::runtime_error("v3 primop elemAt: expected list and int");
+            uint32_t n = lst.payload.list ? lst.payload.list->size : 0;
+            if (idx.payload.i < 0 || static_cast<uint64_t>(idx.payload.i) >= n)
+                throw std::runtime_error("v3 primop elemAt: index out of range");
+            push(vm, lst.payload.list->elems[idx.payload.i]);
+            break;
+        }
+
         case OP_ATTRS_REC_SET: {
             uint32_t i = operand;
             Value v = pop(vm);
