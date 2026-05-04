@@ -848,10 +848,22 @@ static bool lowerCompileAndPopulate(
     if (disabled) return false;
     if (!e) return false;
     // WC-11 follow-up: if the force hook is OFF, the populated cache
-    // is never consulted, so the lower+compile cost is pure waste.
+    // is rarely consulted enough to amortise the compile cost.
     // Skip precompile to keep default-mode perf at parity with
     // tree-walker.  When the force hook is enabled (NIX_USE_V3_FORCE),
     // precompile is what makes the 57-76% wins possible.
+    //
+    // #430: tested relaxing this gate to also fire on
+    // `v3CallFunctionHook != nullptr` so the call hook (always wired
+    // post-#426) consumes the populated cache.  Result on cardano-
+    // node: ~7,301 callHookHits (up from 0) BUT a 2x wall-clock
+    // regression (3.2s -> 7.0s) because the compile cost for
+    // 50-200-function modules dominated the 7k-hit benefit.  Reverted.
+    // The proper coverage upgrade needs lazy demand-driven precompile
+    // (lambda -> root map at parse time + compile-on-first-miss in
+    // the call hook) so we only pay compile cost for files whose
+    // lambdas are actually called -- documented in the v3_hook.cc
+    // call-hook on-miss comment block.
     if (nix::EvalState::v3ForceHook == nullptr) return false;
     auto & populatedSet = v3FallbackPopulated();
     if (populatedSet.count(e)) return true;
