@@ -601,44 +601,21 @@ struct Lowerer
             funcStack.push_back(fid);
             blockStack.push_back(entry);
 
-            // EVAL-COMP §3.3: when no formal has a default, skip the
-            // synthetic LetRec entirely and bind formals directly to
-            // AttrSelect on the param attrset.  No per-formal thunks,
-            // no per-formal MkThunk allocations on every call.
-            // Tree-walker behaviour is preserved: the runtime
-            // OP_CALL_FORMALS validation still rejects missing /
-            // unexpected attrs, and lazy access is preserved because
-            // the consumer-side OP_FORCE only fires when the body
-            // demands the formal.
-            //
-            // Defaults still need the rec-attrset machinery (a
-            // default's body may reference sibling formals
-            // mutually).  Once any formal has a default, fall back
-            // to the synthetic LetRec path.
-            bool anyDefault = false;
-            for (auto & fm : formals->formals)
-                if (fm.def) { anyDefault = true; break; }
-            if (!anyDefault) {
-                Scope direct;
-                if (e->arg) {
-                    direct.byDispl.push_back(param);
-                    direct.byName.emplace(std::string(symbols[e->arg]), param);
-                }
-                ir::VarId paramForced = forceVal(addBinding(ir::VarRef{param}));
-                for (auto & fm : formals->formals) {
-                    ir::SymbolId nm = internSym(fm.name);
-                    ir::VarId v = addBinding(ir::AttrSelect{paramForced, nm});
-                    direct.byDispl.push_back(v);
-                    direct.byName.emplace(std::string(symbols[fm.name]), v);
-                }
-                scopes.push_back(std::move(direct));
-                ir::VarId rv = lowerExpr(e->body);
-                setReturn(rv);
-                scopes.pop_back();
-                blockStack.pop_back();
-                funcStack.pop_back();
-                return addBinding(ir::Lambda{ fid, /*freeVars*/ {} });
-            }
+            // EVAL-COMP §3.3 (REVERTED 2026-05-04): the
+            // direct-AttrSelect optimisation broke laziness for
+            // mapAttrs-style Tag::App formals because OP_ATTRS_SELECT
+            // eagerly forces Tag::App entries via the Phase-13.3
+            // mapAttrs memo path, even for formals the body never
+            // references.  cardano-node hit infinite recursion because
+            // an unused formal's lazy App was force-resolved at
+            // function entry, exposing an eval-order cycle that
+            // tree-walker resolves through its slot-pointer access
+            // pattern (only forces formals the body actually demands).
+            // Re-enable behind an env var only after either:
+            //   (a) emitting an OP_ATTRS_SELECT_NO_FORCE variant for
+            //       the formals path, or
+            //   (b) deferring the AttrSelect to reference time so
+            //       only used formals are touched.
 
             // Default-bearing formals: synthetic LetRec so each
             // formal becomes a thunk that captures the formals scope.
