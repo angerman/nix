@@ -1508,12 +1508,13 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     // when the sub-Expr has no outer-with dependency, or when the
     // outer-with feature is disabled.
     ListVec * capturedWiths = nullptr;
-    // Opt-in feature flag while we shake out correctness; once tests
-    // confirm parity on nixpkgs we'll flip the default.  NIX_V3_NO_OUTER_WITH
-    // explicitly disables once it's the default.
+    // #416: outer-with carriage is ON by default after passing the
+    // full v3 test sweep + targeted synthetic regressions in both
+    // modes.  NIX_V3_NO_OUTER_WITH=1 acts as a kill-switch for
+    // bisection.  NIX_V3_OUTER_WITH=1 is a no-op alias kept for
+    // back-compat with the opt-in window.
     static const bool outerWithEnabled = []{
-        if (std::getenv("NIX_V3_NO_OUTER_WITH")) return false;
-        return std::getenv("NIX_V3_OUTER_WITH") != nullptr;
+        return std::getenv("NIX_V3_NO_OUTER_WITH") == nullptr;
     }();
     auto & subCache = v3SubExprCache();
     auto sit = subCache.find(e);
