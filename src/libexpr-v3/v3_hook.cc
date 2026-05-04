@@ -1892,11 +1892,14 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
                                  nix::Value & vRes,
                                  const nix::PosIdx pos)
 {
+    // Gate: NIX_USE_V3 must be on (otherwise v3 isn't owning anything),
+    // and the call hook is now ON by default within that.  Kill-switch
+    // is NIX_V3_NO_CALL=1 (matches the #416 outer-with convention).
+    // NIX_USE_V3_CALL=1 stays as a no-op alias for back-compat.
     static const bool useV3Call = []{
         const char * a = std::getenv("NIX_USE_V3");
-        const char * b = std::getenv("NIX_USE_V3_CALL");
-        return a && std::string_view(a) == "1"
-            && b && std::string_view(b) == "1";
+        if (!a || std::string_view(a) != "1") return false;
+        return std::getenv("NIX_V3_NO_CALL") == nullptr;
     }();
     if (!useV3Call) return false;
     if (!fun.isLambda()) return false;
@@ -2018,14 +2021,11 @@ struct V3HookRegistrar {
             v && std::string_view(v) == "1") {
             nix::EvalState::v3ForceHook = &v3ForceEntry;
         }
-        // #426 / MED-21: the call-function hook is the dam.  Opt-in
-        // via NIX_USE_V3_CALL=1 while we shake out lambda-shape
-        // failures on real workloads.  Once stable, flip default ON
-        // (kill-switch via NIX_V3_NO_CALL).
-        if (const char * v = std::getenv("NIX_USE_V3_CALL");
-            v && std::string_view(v) == "1") {
-            nix::EvalState::v3CallFunctionHook = &v3CallFunctionEntry;
-        }
+        // #426 / MED-21: install the call-function hook unconditionally
+        // (its internal NIX_USE_V3 / NIX_V3_NO_CALL gate decides whether
+        // it actually fires).  Always-installed pointer keeps the
+        // tree-walker fast-path shape unchanged when v3 is off.
+        nix::EvalState::v3CallFunctionHook = &v3CallFunctionEntry;
     }
 };
 
@@ -2064,10 +2064,8 @@ void installEvalHook()
         v && std::string_view(v) == "1") {
         nix::EvalState::v3ForceHook = &v3ForceEntry;
     }
-    // #426: opt-in callFunction hook.
-    if (const char * v = std::getenv("NIX_USE_V3_CALL");
-        v && std::string_view(v) == "1") {
-        nix::EvalState::v3CallFunctionHook = &v3CallFunctionEntry;
-    }
+    // #426: install callFunction hook (gated internally by
+    // NIX_USE_V3 + NIX_V3_NO_CALL).
+    nix::EvalState::v3CallFunctionHook = &v3CallFunctionEntry;
 }
 } // namespace nix::v3
