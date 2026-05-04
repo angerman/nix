@@ -754,6 +754,8 @@ struct V3HookStats {
     uint64_t callHookHits             = 0;  // ran v3 closure body successfully
     uint64_t callHookBodyThrew        = 0;  // v3 closure threw during run
     uint64_t callHookResultBridgeFailed = 0; // result bridge declined
+    uint64_t callHookUniqueMisses     = 0;  // #unique ExprLambda*s missing
+    uint64_t callHookHottestMiss      = 0;  // max count for any single lambda
     /// #436: call-hook closure-shape result refusals.  Tracks how
     /// often v3CallFunctionEntry declined to bridge a Tag::Closure /
     /// PrimOp / PrimOpApp / Thunk / App / Blackhole result back to
@@ -1037,7 +1039,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 // v3CallFunctionEntry fire and what fraction takes
                 // the v3 fast-path?  Critical for sizing the
                 // bytecode-stdlib opportunity.
-                if (s.callHookEntries > 0)
+                if (s.callHookEntries > 0) {
                     std::fprintf(stderr,
                         "v3 call-hook: entries=%llu hits=%llu gated=%llu cacheMiss=%llu bodyThrew=%llu resultBridgeFailed=%llu\n",
                         (unsigned long long)s.callHookEntries,
@@ -1046,6 +1048,15 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                         (unsigned long long)s.callHookCacheMiss,
                         (unsigned long long)s.callHookBodyThrew,
                         (unsigned long long)s.callHookResultBridgeFailed);
+                    if (s.callHookUniqueMisses > 0)
+                        std::fprintf(stderr,
+                            "v3 call-hook: uniqueLambdaMisses=%llu hottestMissCount=%llu (avg=%.1f calls per lambda)\n",
+                            (unsigned long long)s.callHookUniqueMisses,
+                            (unsigned long long)s.callHookHottestMiss,
+                            s.callHookUniqueMisses
+                                ? (double)s.callHookCacheMiss / s.callHookUniqueMisses
+                                : 0.0);
+                }
             });
         }
         return true;
@@ -2105,7 +2116,32 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // share the same map) -- the call hook differentiates by AST kind.
     auto & subCache = v3SubExprCache();
     auto sit = subCache.find(lambda);
-    if (sit == subCache.end()) { st.callHookCacheMiss++; return false; }
+    if (sit == subCache.end()) {
+        st.callHookCacheMiss++;
+        // #430: track UNIQUE lambdas missing from subCache.  If the
+        // distribution is heavy-tailed (a few lambdas account for most
+        // misses), on-demand precompile pays off.  If there's a long
+        // tail of one-shot lambdas, lower+compile cost dominates.
+        // Keyed by ExprLambda*; that's address-stable for the run.
+        // Gated to keep the hot path branch-predictable when stats
+        // are off.
+        static const bool s_dbg =
+            std::getenv("NIX_VM_STATS") != nullptr
+            || std::getenv("V3_DBG_CALL_MISS") != nullptr;
+        if (__builtin_expect(s_dbg, 0)) [[unlikely]] {
+            static thread_local std::unordered_map<
+                nix::ExprLambda *, uint64_t> missCounts;
+            missCounts[lambda]++;
+            // Also record into the V3HookStats for atexit dump.
+            // Lazy: track the size + the top-bucket count.
+            static thread_local uint64_t maxBucket = 0;
+            if (missCounts[lambda] > maxBucket)
+                maxBucket = missCounts[lambda];
+            st.callHookUniqueMisses = missCounts.size();
+            st.callHookHottestMiss  = maxBucket;
+        }
+        return false;
+    }
     auto & ent = sit->second;
     if (!ent.isLambda) { st.callHookGated++; return false; }
     if (ent.phaseBFailed) { st.callHookGated++; return false; }
