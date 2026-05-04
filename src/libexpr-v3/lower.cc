@@ -737,6 +737,19 @@ struct Lowerer
             }
             m.blocks[blockStack.back()].bindings.push_back({formalsRec, std::move(letRec)});
 
+            // #425 followup attempt (deferred): tried registering
+            // formalsRec as a recVarId + emitting a level=0 origin
+            // pointing at the formals env.  Reduced phaseB noUpv
+            // events 60 -> 22 on hello.name and 484 -> 174 on
+            // cardano-node default mode, but caused a v3-fhook
+            // chase-cycle (Tag::Slot/Thunk indirection loop, vm.cc's
+            // 4096-iter guard) on cardano-node when Phase 5 inlining
+            // is also active.  Root cause is a level mismatch when
+            // thunks are created inside a nested let/with within the
+            // formals body -- captured env isn't env2 in zero levels.
+            // Needs per-thunk level tracking (not just the rec scope's
+            // immediate offset) to be safe across the matrix.
+
             // Lower the body with the rec scope so formal references
             // resolve via the rec attrset (and @arg, if any, via
             // recScope.byDispl[0]).
