@@ -1164,7 +1164,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // chasing while the outer thunk is still Black trips
             // infinite-recursion).  Cheap on the hot path: one tag
             // check on already-WHNF callables.
-            if (fun.tag() == Tag::App || fun.tag() == Tag::Thunk || fun.tag() == Tag::Slot) {
+            // Fast path: a Tag::Thunk in Evaluated state caches its
+            // resolved value in `evaluated`.  Most calls under
+            // thunkifyRecAttrSelect (Phase-5-off rec-attr access) hit
+            // this case after the first force, so chasing one Thunk
+            // hop inline saves a forceValue() call + its full chase
+            // setup (depth guards, iteration bound, etc.).
+            if (Tag fT = fun.tag(); fT == Tag::Thunk) {
+                Thunk * t = fun.payload.thunk;
+                if (t->state == ThunkState::Evaluated) {
+                    Value e = t->evaluated;
+                    Tag eT = e.tag();
+                    // If the evaluated value itself is in WHNF (the
+                    // common case for rec-attr-thunk-of-Closure), we're
+                    // done.  Else fall through to the full forceValue.
+                    if (eT != Tag::Thunk && eT != Tag::App && eT != Tag::Slot) {
+                        fun = e;
+                    } else {
+                        vm.frames.back().ip = ip;
+                        fun = forceValue(vm, fun);
+                    }
+                } else {
+                    vm.frames.back().ip = ip;
+                    fun = forceValue(vm, fun);
+                }
+            } else if (fT == Tag::App || fT == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 fun = forceValue(vm, fun);
             }
