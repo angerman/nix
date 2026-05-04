@@ -229,32 +229,33 @@ struct Lowerer
             // (The prior NIX_V3_NO_THUNKIFY_REC A/B gate has been
             // removed -- thunkification is the verified-correct
             // default; REVIEW-COMP §8.6.)
-            // #427 (Phase 5): emit RecBindingSlotRef directly,
-            // skipping the WC-31 thunkifyRecAttrSelect wrapper.  The
-            // slot is heap-stable (Tag::Slot) so deferral behind a
-            // Thunk adds nothing semantically -- consumers read the
-            // slot at consume-time anyway, picking up any mutation
-            // that happened between MAKE_CLOSURE and force.  This
-            // eliminates the per-access Thunk allocation that
-            // dominated nixpkgs eval (`recref-setType` alone was
-            // forced 1.38M times under stages 0..3) and threads slot
-            // identity through callFunction so `f = self: with self;
-            // ...` patterns see live mutated rec-attrset values.
+            // #427 (Phase 5): when NIX_V3_INLINE_REC_SLOT=1, emit
+            // RecBindingSlotRef directly, skipping the WC-31
+            // thunkifyRecAttrSelect wrapper.  The slot is heap-stable
+            // (Tag::Slot) so deferral behind a Thunk *should* be
+            // redundant; eliminates the per-access Thunk allocation
+            // that dominated nixpkgs eval (`recref-setType` alone was
+            // forced 1.38M times under stages 0..3).
             //
-            // The original WC-31 thunkification was added to defer
-            // rec-attr lookup past MAKE_CLOSURE time; with Tag::Slot
-            // it's redundant.  All test suites verified green with
-            // this default before flipping (lang 142/142, cutover
-            // 142/142, wc-laziness 85/85, disk-cache 5/5,
-            // eval-okay-delayed-with-inherit, nixpkgs hello.outPath).
+            // Default-OFF after a cardano-node correctness regression
+            // surfaced post-flip: Phase 5 caused `error: infinite
+            // recursion encountered` on the cardano-node flake's
+            // packages.aarch64-darwin.cardano-node.name eval, while
+            // the thunkify path is fine.  The lang/cutover/wc-laziness
+            // suites + nixpkgs hello.outPath all pass under Phase 5,
+            // so the cardano-node bug is a workload-specific eval-
+            // order divergence (likely the same shape as the WC-31
+            // bug that motivated thunkifyRecAttrSelect: forcing the
+            // slot at MAKE_CLOSURE time vs at consume time changes
+            // when intermediate Suspended thunks are observed).
             //
-            // NIX_V3_THUNKIFY_REC_SLOT=1 acts as a kill-switch
-            // (restores the WC-31 thunk-wrapper path for bisection).
-            static const bool thunkifyRecSlot =
-                std::getenv("NIX_V3_THUNKIFY_REC_SLOT") != nullptr;
-            if (thunkifyRecSlot)
-                return thunkifyRecAttrSelect(rec, nm);
-            return addBinding(ir::RecBindingSlotRef{rec, nm});
+            // Re-enable via NIX_V3_INLINE_REC_SLOT=1 once the
+            // cardano-node regression is root-caused.
+            static const bool inlineRecSlot =
+                std::getenv("NIX_V3_INLINE_REC_SLOT") != nullptr;
+            if (inlineRecSlot)
+                return addBinding(ir::RecBindingSlotRef{rec, nm});
+            return thunkifyRecAttrSelect(rec, nm);
         }
         return ir::kInvalid;
     }
