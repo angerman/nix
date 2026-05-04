@@ -90,16 +90,21 @@ on a local `/Users/angerman/Projects/iohk/cardano-node` checkout.
 mode       run1   run2   run3   run4   run5
 tw         3.34   3.35   3.36   3.36   3.38
 v3         3.45   3.43   3.45   3.44   3.42
-v3-fhook   *      *      *      *      *
+v3-fhook   4.34   4.37   4.28   4.34   4.32   (post-#436 + #438)
 ```
 
-  `*` = `expected a Boolean but found the partially applied built-in
-  function '__v3_call_bridge_1'`.  Pre-existing v3 → tree-walker bridge
-  bug (a v3 closure leaked across the boundary where tree-walker
-  expected a forced bool).  Distinct from the Phase-5-disabled
-  infinite-recursion that motivated the #427 revert; happens only
-  under v3-fhook on cardano-node, not on hello-name / attr-pkgs /
-  drv3.  Documented for follow-up.
+  Pre-#436/#438 v3-fhook errored out with
+  `expected a Boolean but found the partially applied built-in
+  function '__v3_call_bridge_1'` and then SIGSEGV'd deeper still.
+  #436 closed the closure-shape result leak.  #438 closed a
+  call-hook env-walk off-by-one that caused uninitialised
+  Bridge sources for nested-formal lambdas (cardano-node
+  hits this on a `{license-map, otherLicenseWarning}` formals
+  function inside the haskell-nix license overlay).  v3-fhook
+  now completes successfully on cardano-node.  The headline
+  +25-30% v3-fhook overhead matches the same Bridge-thunk cost
+  registrar that hits the smaller workloads (see "v3-fhook
+  regression" below); orthogonal to correctness.
 
 ## Headline deltas (v3 vs tw, on `min` to dodge cold-cache noise)
 
@@ -142,7 +147,7 @@ a systematic regression on the derivation-heavy workloads:
   - `attr-pkgs`: 0.574 vs 0.356 = +61.2%
   - `hello-name`: 0.567 vs 0.352 = +61.1%
   - `git-name` : 0.570 vs 0.352 = +61.9%
-  - `cardano-node`: bridge bug (above)
+  - `cardano-node`: 4.28 vs 3.34 = +28.1% (post-#436 + #438; was crashing before)
 
 This is the WC-25/WC-26 caveat from the registrar amplified by the
 new call-hook traffic: per-force Bridge thunk allocation cost
