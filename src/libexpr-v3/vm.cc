@@ -3470,9 +3470,28 @@ Value getBuiltinsValue() noexcept
 {
     static Value vBuiltins = []{
         const auto & reg = allRegisteredPrimOps();
-        Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(reg.size()));
+        // REVIEW_2026-05-04 §6.1 follow-up: tree-walker's `addConstant`
+        // registers `__currentSystem` etc into the BASE ENV but adds
+        // only the stripped name (`currentSystem`) to `builtins`.
+        // `RegisterPrimOp` uses the bare name throughout.  In both
+        // cases, `__`-prefixed primops never appear as `builtins.X`.
+        // Tree-walker test `eval-okay-builtins` enforces this:
+        //   `assert !builtins ? __currentSystem;`
+        // v3 used to violate the rule by exposing every registered
+        // name (including `__add` etc) in `builtins`.  Filter them
+        // out here so the `__` aliases serve only their base-env
+        // resolution role.
+        uint32_t nVisible = 0;
+        for (auto & [poName, po] : reg) {
+            if (poName.size() >= 2 && poName[0] == '_' && poName[1] == '_')
+                continue;
+            ++nVisible;
+        }
+        Bindings * b = Alloc::allocBindings(nVisible);
         uint32_t i = 0;
         for (auto & [poName, po] : reg) {
+            if (poName.size() >= 2 && poName[0] == '_' && poName[1] == '_')
+                continue;
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
             v.payload.primop = &po;

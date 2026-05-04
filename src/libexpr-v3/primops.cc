@@ -2070,6 +2070,30 @@ void primNixVersion(EvalState &, Value *, Value & out)
     out = mkStringValueOwned(nix::nixVersion.c_str());
 }
 
+/// builtins.langVersion (REVIEW_2026-05-04 §6.1).  Mirrors tree-
+/// walker's value at libexpr/primops.cc:5691.  Bumped when the
+/// language adds a new feature (independent of primop additions).
+void primLangVersion(EvalState &, Value *, Value & out)
+{
+    out.mkInt(6);
+}
+
+/// builtins.storeDir (REVIEW_2026-05-04 §6.1, F5).  Returns the
+/// active store's directory.  Tree-walker reads `store->storeDir`
+/// (libexpr/primops.cc:5669) so we mirror that.  Falls back to
+/// `/nix/store` when v3 is running standalone (no nixEvalState
+/// wired) so simple test harnesses don't crash.
+void primStoreDir(EvalState & state, Value *, Value & out)
+{
+    if (state.nixEvalState) {
+        // nix::EvalState::store is a `ref<Store>` (not a pointer);
+        // it's always non-null when nixEvalState is wired.
+        out = mkStringValueOwned(state.nixEvalState->store->storeDir);
+    } else {
+        out = mkStringValueOwned("/nix/store");
+    }
+}
+
 /// builtins.readFile path -> string contents.
 void primReadFile(EvalState &, Value * args, Value & out)
 {
@@ -6136,6 +6160,32 @@ void registerBuiltinPrimOps()
         registerPrimOp({"__readFileType",     1, primReadFileType});
         registerPrimOp({"__path",             1, primPath});
         registerPrimOp({"__toXML",            1, primToXML});
+
+        // REVIEW_2026-05-04 F5 / §6.1: register the IO/store/derivation
+        // primops' `__`-prefix aliases that were missing.  Each missing
+        // alias was causing v3 lower to throw "unbound variable" at
+        // lower.cc:566 and bridge the entire surrounding expression to
+        // tree-walker.  In tree-walker, `__currentSystem` etc are the
+        // CANONICAL form (libexpr/primops.cc:5650+ uses addConstant on
+        // the `__` name), so v3 had inverted the convention.
+        registerPrimOp({"__derivationStrict", 1, primDerivationStrict});
+        registerPrimOp({"__derivation",       1, primDerivation});
+        registerPrimOp({"__import",           1, primImport});
+        registerPrimOp({"__scopedImport",     2, primScopedImport});
+        registerPrimOp({"__placeholder",      1, primPlaceholder});
+        registerPrimOp({"__currentSystem",    0, primCurrentSystem});
+        registerPrimOp({"__currentTime",      0, primCurrentTime});
+        registerPrimOp({"__nixVersion",       0, primNixVersion});
+
+        // builtins.storeDir + __storeDir + builtins.langVersion +
+        // __langVersion: not previously registered by v3 at all.
+        // nixpkgs lib/minfeatures.nix and various store-path
+        // synthesisers reference these.  Both forms (bare and __)
+        // are registered for parity with tree-walker.
+        registerPrimOp({"storeDir",           0, primStoreDir});
+        registerPrimOp({"__storeDir",         0, primStoreDir});
+        registerPrimOp({"langVersion",        0, primLangVersion});
+        registerPrimOp({"__langVersion",      0, primLangVersion});
     });
 }
 
