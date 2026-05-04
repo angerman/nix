@@ -181,6 +181,18 @@ struct LambdaDescriptor
     /// the field is statistical, not part of the descriptor's
     /// logical identity.  Single-threaded VM, no atomics needed.
     mutable uint64_t forceCount = 0;
+
+    /// #424: selector lambda specialisation.  When non-zero, the
+    /// lambda body is exactly `paramVar.<selectorSym>` -- the emit-
+    /// time peephole detected the canonical bytecode shape:
+    ///   OP_GET_LOCAL_FORCE 0
+    ///   OP_ATTRS_SELECT [sym]
+    ///   OP_RETURN
+    /// OP_CALL takes a fast path on these: force arg, check attrset,
+    /// project the field directly, push -- no frame allocation, no
+    /// inner dispatch.  `Map (p: p.name) [...]` patterns are dominant
+    /// in nixpkgs and now actually flow through v3 since #426.
+    uint32_t selectorSym = 0;
 };
 
 struct ThunkDescriptor

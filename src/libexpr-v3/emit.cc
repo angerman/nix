@@ -855,6 +855,56 @@ struct Emitter
             for (auto & fm : f.formals)
                 desc.formals.push_back({fm.name, fm.hasDefault, fm.pos});
         }
+
+        // #424: selector lambda specialisation peephole.  Detect the
+        // canonical bytecode shape for `\x: x.f`:
+        //
+        //   OP_GET_LOCAL 0            (paramVar; OP_ATTRS_SELECT
+        //                              forces internally)
+        //   OP_ATTRS_SELECT [sym]
+        //   [icIdx]                   (uint32_t follow word)
+        //   OP_RETURN
+        //
+        // and record the projected SymbolId on the descriptor.  OP_CALL
+        // takes a fast path on these (force arg, project, push) without
+        // allocating a frame.  Only fires for arity-1 simple-arg lambdas
+        // (no formals) with no upvalues -- matches `(p: p.name)` and
+        // similar map/filter callbacks that dominate nixpkgs.
+        //
+        // OP_GET_LOCAL_FORCE 0 is also accepted for the same shape:
+        // when the IR has an explicit Force around the paramVar (rare
+        // but possible if the lowerer adds it for some path).
+        //
+        // Detection gated by NIX_V3_SELECTOR_LAMBDA=1 while we
+        // shake out shape-mismatch false positives.  Once stable, flip
+        // default ON.
+        static const bool selectorLambda =
+            std::getenv("NIX_V3_SELECTOR_LAMBDA") != nullptr;
+        if (selectorLambda
+            && fid != 0
+            && f.argName != ir::kInvalidSymbol
+            && !f.hasFormals
+            && f.freeVars.empty()
+            && unit.code.size() == codeStart + 4)
+        {
+            const Instruction i0 = unit.code[codeStart];
+            const Instruction i1 = unit.code[codeStart + 1];
+            // i2 is the IC slot index (uint32_t follow word)
+            const Instruction i3 = unit.code[codeStart + 3];
+            const Op op0 = decodeOp(i0);
+            if ((op0 == OP_GET_LOCAL || op0 == OP_GET_LOCAL_FORCE)
+                && decodeOperand(i0) == 0
+                && decodeOp(i1) == OP_ATTRS_SELECT
+                && decodeOp(i3) == OP_RETURN)
+            {
+                uint32_t sym = decodeOperand(i1);
+                // SymbolId 0 is kInvalidSymbol -- never a real attr
+                // name, so reserved as the "not a selector" sentinel.
+                if (sym != 0)
+                    unit.lambdas[fid].selectorSym = sym;
+            }
+        }
+
         unit.lambdaCodeOffsets[fid] = codeStart;
 
         ctx = nullptr;

@@ -146,6 +146,12 @@ struct AllocStats
     /// separately because they can legitimately be force-resolved
     /// once each per Bridge thunk allocated.
     uint64_t bridgeThunksForced = 0;
+
+    /// #424: how many OP_CALL invocations took the selector-lambda
+    /// fast path (frame-elision project of `arg.<sym>`).  Reported
+    /// by V3_DUMP_LAMBDAS / NIX_VM_STATS so we can confirm the
+    /// emit-time peephole is firing on real workloads.
+    uint64_t selectorLambdaCalls = 0;
 };
 
 inline AllocStats & allocStats()

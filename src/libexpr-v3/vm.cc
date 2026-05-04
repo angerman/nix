@@ -1258,6 +1258,38 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             const Closure * callee = fun.payload.closure;
             const LambdaDescriptor * desc = callee->desc;
+
+            // #424: selector-lambda fast path for `\x: x.f`.  Skips
+            // frame allocation + dispatch -- force arg, project the
+            // recorded SymbolId, push.  Detected at emit time
+            // (emit.cc; sets desc->selectorSym).  Only fires for
+            // arity-1 simple-arg lambdas with no upvalues; the
+            // frame's withStack invariants are unaffected since we
+            // never allocate one.
+            if (__builtin_expect(desc->selectorSym != 0, 0)) {
+                allocStats().selectorLambdaCalls++;
+                Value sArg = arg;
+                if (sArg.isThunk() || sArg.tag() == Tag::App
+                    || sArg.tag() == Tag::Slot) {
+                    vm.frames.back().ip = ip;
+                    sArg = forceValue(vm, sArg);
+                }
+                if (!sArg.isAttrs() || !sArg.payload.bindings)
+                    throw std::runtime_error(
+                        "v3 selector lambda: arg not an attrset");
+                // Binary-search the attrset (entries sorted ascending
+                // by SymbolId).  Mirrors what OP_ATTRS_SELECT does
+                // post-IC-miss; we don't have an IC slot here since
+                // there's no allocated bytecode site for the projection.
+                const Value * v = sArg.payload.bindings->lookup(
+                    desc->selectorSym);
+                if (!v)
+                    throw std::runtime_error(
+                        "v3 selector lambda: missing attr");
+                push(vm, *v);
+                break;
+            }
+
             // Closures from imported files own their own CompilationUnit;
             // when callee->cu differs, switch the dispatch loop to the
             // callee's bytecode/constant pools.  Falls back to the caller's
@@ -3517,6 +3549,35 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
     if (desc.nUpvalues != nUpvalues)
         throw std::runtime_error("v3 runLambda: nUpvalues mismatch");
 
+    // #424: selector-lambda fast path also fires when the call hook
+    // routes here (bypassing OP_CALL).  Same shape -- force arg,
+    // project, return.  Skips the entire frame setup + dispatch loop.
+    if (__builtin_expect(desc.selectorSym != 0, 0)) {
+        allocStats().selectorLambdaCalls++;
+        // The arg may still be a Thunk/App/Slot; force first.
+        // Need a VMState for forceValue's chase; we can use a tiny
+        // throwaway one.  Most selector calls never trigger forceValue
+        // (the caller usually passes an already-forced attrset), so
+        // this is the slow path of the fast path.
+        Value sArg = arg;
+        if (sArg.isThunk() || sArg.tag() == Tag::App
+            || sArg.tag() == Tag::Slot) {
+            VMState forceVm;
+            forceVm.valueStack.reserve(64);
+            forceVm.frames.reserve(64);
+            forceVm.withStack.reserve(8);
+            sArg = forceValue(forceVm, sArg);
+        }
+        if (!sArg.isAttrs() || !sArg.payload.bindings)
+            throw std::runtime_error(
+                "v3 selector lambda: arg not an attrset");
+        const Value * v = sArg.payload.bindings->lookup(desc.selectorSym);
+        if (!v)
+            throw std::runtime_error(
+                "v3 selector lambda: missing attr");
+        return *v;
+    }
+
     Closure * fakeClo = Alloc::allocClosure(nUpvalues);
     fakeClo->desc = &desc;
     fakeClo->cu   = &cu;
@@ -3911,6 +3972,28 @@ Value callClosure(VMState & vm, Value fun, Value arg)
 
     const Closure * callee = fun.payload.closure;
     const LambdaDescriptor * desc = callee->desc;
+
+    // #424: selector-lambda fast path -- mirrored from OP_CALL.
+    // callClosure is the entry point primops use for callback lambdas
+    // (map, filter, foldl', etc.), so this fires on the dominant
+    // `(p: p.name)`-style nixpkgs callbacks.
+    if (__builtin_expect(desc->selectorSym != 0, 0)) {
+        allocStats().selectorLambdaCalls++;
+        Value sArg = arg;
+        if (sArg.isThunk() || sArg.tag() == Tag::App
+            || sArg.tag() == Tag::Slot) {
+            sArg = forceValue(vm, sArg);
+        }
+        if (!sArg.isAttrs() || !sArg.payload.bindings)
+            throw std::runtime_error(
+                "v3 selector lambda: arg not an attrset");
+        const Value * v = sArg.payload.bindings->lookup(desc->selectorSym);
+        if (!v)
+            throw std::runtime_error(
+                "v3 selector lambda: missing attr");
+        return *v;
+    }
+
     // Cross-CU calls (e.g., calling a closure returned from
     // builtins.import): use the closure's own CU when available.
     const CompilationUnit * cu = callee->cu ? callee->cu : vm.frames.back().cu;

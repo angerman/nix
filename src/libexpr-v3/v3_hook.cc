@@ -967,6 +967,13 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                         (unsigned long long)s.forceHookOuterWithBuilt,
                         (unsigned long long)s.forceHookOuterWithRefused,
                         (unsigned long long)s.forceHookOuterWithEmpty);
+                // #424: selector-lambda fast-path firings.
+                if (uint64_t selectorCalls =
+                        allocStats().selectorLambdaCalls;
+                    selectorCalls > 0)
+                    std::fprintf(stderr,
+                        "v3 selector-lambda: fast-path calls=%llu\n",
+                        (unsigned long long)selectorCalls);
             });
         }
         return true;
