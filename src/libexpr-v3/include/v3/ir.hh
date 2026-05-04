@@ -522,11 +522,19 @@ size_t constantFold(Module & m);
 /// removed across all iterations.
 size_t deadBindingElim(Module & m);
 
+/// Collapse VarRef alias bindings.  For every `v = VarRef{u}`, rewrite
+/// every operand `v` to `u` across the whole Module and drop the
+/// alias binding.  Path-compresses chains so a chain of N aliases
+/// resolves in one rewrite.  Strictly safe: a VarRef is a pure rename
+/// — replacing it changes nothing observable.  Returns the number of
+/// alias bindings removed.
+size_t inlineTrivialBindings(Module & m);
+
 /// Run the standard optimisation pipeline.  Currently:
-/// constantFold -> deadBindingElim.  Always called between lower
-/// and computeFreeVars by the v3 hook, the import primop, and the
-/// wrapper-source primop.  No-op when `NIX_V3_NO_OPT` is set (escape
-/// hatch for debugging).
+/// constantFold -> inlineTrivialBindings -> deadBindingElim.
+/// Always called between lower and computeFreeVars by the v3 hook,
+/// the import primop, and the wrapper-source primop.  No-op when
+/// `NIX_V3_NO_OPT` is set (escape hatch for debugging).
 void optimise(Module & m);
 
 } // namespace nix::v3::ir

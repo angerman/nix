@@ -48,6 +48,7 @@ lib_sources = files(
   'lower.cc',
   'opt_const_fold.cc',
   'opt_dce.cc',
+  'opt_inline.cc',
   'serialize.cc',
   'disk_cache.cc',
   'fiber.cc',

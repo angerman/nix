@@ -381,6 +381,51 @@ static int testDceKeepsImpureUnused()
     return 0;
 }
 
+// VarRef alias collapsing: `a = LitInt{99}; b = VarRef{a}; c = VarRef{b};`
+// returning `c` should optimise to a module where a survives, b/c
+// disappear, and the terminal returns `a`.
+static int testInlineVarRefChain()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitInt{99});
+    auto b = addBinding(m, entry, ir::VarRef{a});
+    auto c = addBinding(m, entry, ir::VarRef{b});
+    setReturn(m, entry, c);
+
+    ir::optimise(m);
+
+    // After optimise: only `a` survives; the terminal returns `a`.
+    bool sawA = false, sawB = false, sawC = false;
+    for (auto & bb : m.blocks[entry].bindings) {
+        if (bb.var == a) sawA = true;
+        if (bb.var == b) sawB = true;
+        if (bb.var == c) sawC = true;
+    }
+    ir::VarId termVar = ir::kInvalid;
+    if (auto * ret = std::get_if<ir::TermReturn>(&m.blocks[entry].terminal))
+        termVar = ret->value;
+    if (!sawA || sawB || sawC || termVar != a) {
+        std::fprintf(stderr,
+            "testInlineVarRefChain: a=%d b=%d c=%d term=%u (expected 1/0/0/%u)\n",
+            (int)sawA, (int)sawB, (int)sawC,
+            (unsigned)termVar, (unsigned)a);
+        return 1;
+    }
+
+    // And the runtime should still produce 99.
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isInt() || r.payload.i != 99) {
+        std::fprintf(stderr, "testInlineVarRefChain: runtime expected 99\n");
+        return 1;
+    }
+    std::fprintf(stderr, "testInlineVarRefChain: OK (chain a<-b<-c collapsed to a)\n");
+    return 0;
+}
+
 // `(x: x + 1) 41` → 42
 static int testLambdaCall()
 {
@@ -1014,6 +1059,7 @@ int main()
     rc |= testFoldFloat();
     rc |= testDceRemovesUnusedLiteral();
     rc |= testDceKeepsImpureUnused();
+    rc |= testInlineVarRefChain();
     rc |= testLambdaCall();
     rc |= testClosureCapture();
     rc |= testIf();

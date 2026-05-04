@@ -285,6 +285,7 @@ void optimise(Module & m)
     if (disabled) return;
 
     constantFold(m);
+    inlineTrivialBindings(m);
     deadBindingElim(m);
 }
 
