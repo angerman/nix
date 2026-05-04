@@ -2379,14 +2379,14 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     // for primV3ForceAttr / primV3ForceListElem.  Only blackhole-
     // shaped runtime_errors trigger fallback — other failures (e.g.
     // wrong arg / type errors) are real bugs we don't want to mask.
-    auto isBlackhole = [](const std::exception & ex) {
-        const char * w = ex.what();
-        if (!w) return false;
-        return std::strstr(w, "infinite recursion (blackhole)") != nullptr
-            || std::strstr(w, "v3 forceValue: infinite recursion") != nullptr;
-    };
+    // REVIEW_2026-05-04 F4 / §6.3: typed `BlackholeError` (errors.hh)
+    // replaces the prior substring match on the exception's what().
+    // The string "(blackhole)" was load-bearing for fallback routing;
+    // any unrelated TU emitting that phrase would silently route to
+    // tree-walker.  Now driven by the type of the thrown exception.
     auto fallbackToTreeWalker = [&](const std::exception & ex) {
-        if (!fallbackExpr || !isBlackhole(ex)) throw std::runtime_error(ex.what());
+        if (!fallbackExpr || !dynamic_cast<const BlackholeError *>(&ex))
+            throw std::runtime_error(ex.what());
         static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
         if (dbg) std::fprintf(stderr,
             "v3 bridge1: v3 path blackholed: %s — re-running fallback Expr "
@@ -2570,19 +2570,15 @@ static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
     // safety net — reproduce it here.  Only catch blackhole-shaped
     // errors so genuine bugs (type errors, missing args, ...)
     // surface instead of being masked.
-    auto isBlackholeAttr = [](const std::exception & ex) {
-        const char * w = ex.what();
-        if (!w) return false;
-        return std::strstr(w, "infinite recursion (blackhole)") != nullptr
-            || std::strstr(w, "v3 forceValue: infinite recursion") != nullptr;
-    };
+    // REVIEW_2026-05-04 F4 / §6.3: typed `BlackholeError` instead of
+    // `strstr` -- see fallbackToTreeWalker comment in primV3CallBridge1.
     nix::Symbol resolvedName = ns.symbols.create(name);
     try {
         nix::Value * tmp = v3ToTreeWalker(v3state, *found);
         if (tmp) out = *tmp; else out.mkNull();
         return;
     } catch (const std::exception & ex) {
-        if (!fallbackExpr || !isBlackholeAttr(ex)) throw;
+        if (!fallbackExpr || !dynamic_cast<const BlackholeError *>(&ex)) throw;
         static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
         if (dbg) std::fprintf(stderr,
             "v3 forceAttr: bridge blackholed: %s — re-running outer Expr "
@@ -2638,19 +2634,14 @@ static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
     bridgeVmList.withStack.reserve(64);
     v3state.vm = &bridgeVmList;
 
-    // WC-19: same safety net as primV3ForceAttr.  Only blackholes.
-    auto isBlackholeList = [](const std::exception & ex) {
-        const char * w = ex.what();
-        if (!w) return false;
-        return std::strstr(w, "infinite recursion (blackhole)") != nullptr
-            || std::strstr(w, "v3 forceValue: infinite recursion") != nullptr;
-    };
+    // WC-19: same safety net as primV3ForceAttr.
+    // REVIEW_2026-05-04 F4 / §6.3: typed BlackholeError instead of strstr.
     try {
         nix::Value * tmp = v3ToTreeWalker(v3state, l->elems[(uint32_t)idx]);
         if (tmp) out = *tmp; else out.mkNull();
         return;
     } catch (const std::exception & ex) {
-        if (!fallbackExpr || !isBlackholeList(ex)) throw;
+        if (!fallbackExpr || !dynamic_cast<const BlackholeError *>(&ex)) throw;
         static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
         if (dbg) std::fprintf(stderr,
             "v3 forceListElem: bridge blackholed: %s — re-running outer Expr "
@@ -2971,9 +2962,13 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 v.payload.closure->desc->name.c_str(),
                 (unsigned)v.payload.closure->desc->arity,
                 v.payload.closure->desc->formals.size());
-            throw std::runtime_error(
-                "v3 forceValue: infinite recursion (blackhole) "
-                "-- <formals> closure cannot bridge as primOpApp");
+            // REVIEW_2026-05-04 F1 follow-up + F4: throw the typed
+            // `BlackholeError` (errors.hh).  Used to be `runtime_error`
+            // with the magic substring "(blackhole)" load-bearing for
+            // the fallback predicates -- now driven by exception type.
+            throw BlackholeError(
+                "v3 v3ToTreeWalker: <formals> closure cannot bridge "
+                "as primOpApp -- forcing tree-walker fallback");
         }
         auto & tbl = v3BridgeClosures();
         size_t handle = tbl.size();
