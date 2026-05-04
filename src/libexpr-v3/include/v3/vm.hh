@@ -96,7 +96,16 @@ Value run(const CompilationUnit & cu);
 /// whose Expr* matches a known per-thunk FuncId; we run that FuncId.
 /// Phase A only — funcIdx must reference a function with no upvalues
 /// (nUpvalues == 0).  Phase B will accept an upvalues array.
-Value runFunction(const CompilationUnit & cu, uint32_t funcIdx);
+///
+/// `capturedWiths` (optional, nullable): outer-scope with-attrset
+/// snapshot computed at force-hook entry from the tree-walker env
+/// chain.  If non-null, pushed onto the VM withStack BEFORE the
+/// frame's withStackBase is set, so OP_WITH_LOOKUP inside the body
+/// sees those frames as outer scope.  The function's own ir::With
+/// blocks push/pop on top of this snapshot.  Default null preserves
+/// the pre-fix behaviour (empty outer with-stack).
+Value runFunction(const CompilationUnit & cu, uint32_t funcIdx,
+                  ListVec * capturedWiths = nullptr);
 
 /// CO-2 phase B: run a per-thunk Function with a caller-provided
 /// upvalues array.  `upvalues` must have exactly the count and order
@@ -104,7 +113,10 @@ Value runFunction(const CompilationUnit & cu, uint32_t funcIdx);
 /// `freeVars` list.  The dispatcher synthesizes a Closure whose
 /// upvalues = the supplied array, sets the call frame's `closure`
 /// field to it, and runs the function until OP_RETURN/OP_HALT.
+///
+/// `capturedWiths` (optional, nullable): see runFunction.
 Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
-                               const Value * upvalues, uint32_t nUpvalues);
+                               const Value * upvalues, uint32_t nUpvalues,
+                               ListVec * capturedWiths = nullptr);
 
 } // namespace nix::v3

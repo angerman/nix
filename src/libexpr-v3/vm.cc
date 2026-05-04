@@ -3272,7 +3272,8 @@ Value run(const CompilationUnit & rootCu)
 /// No upvalues, no args.  Used by the forceValue cutover hook for
 /// per-thunk-body Functions whose `nUpvalues == 0` — i.e., closed
 /// thunks the lowerer recorded in `Module::subExprFuncs`.
-Value runFunction(const CompilationUnit & cu, uint32_t funcIdx)
+Value runFunction(const CompilationUnit & cu, uint32_t funcIdx,
+                   ListVec * capturedWiths)
 {
     if (funcIdx >= cu.lambdas.size())
         throw std::runtime_error("v3 runFunction: funcIdx out of range");
@@ -3285,15 +3286,22 @@ Value runFunction(const CompilationUnit & cu, uint32_t funcIdx)
     vm.frames.reserve(4096);
     vm.withStack.reserve(64);
 
+    // #416: outer with-stack carriage.  Set the frame's withStackBase
+    // BELOW the captured chain (i.e., at the current vm.withStack.size,
+    // which is 0 here), then push.  withLookup walks from top of stack
+    // DOWN to withStackBase (vm.cc:381), so anything ABOVE the base is
+    // visible -- exactly what we want for the captured outer withs.
+    // The function's own ir::With blocks push/pop on top of these.
     vm.frames.push_back(CallFrame{
         .cu = &cu,
         .closure = nullptr,
         .thunk = nullptr,
         .ip = desc.codeOffset,
         .stackBaseOffset = 0,
-        .withStackBase = 0,
+        .withStackBase = static_cast<uint32_t>(vm.withStack.size()),
         .flags = 0,
     });
+    pushCapturedWiths(vm, capturedWiths);
 
     vm.valueStack.resize(desc.nLocals);
 
@@ -3319,7 +3327,8 @@ Value runFunction(const CompilationUnit & cu, uint32_t funcIdx)
 /// Closure on the heap (allocated via Boehm GC; lives as long as
 /// the call's frame), point the frame's closure to it, and run.
 Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
-                               const Value * upvalues, uint32_t nUpvalues)
+                               const Value * upvalues, uint32_t nUpvalues,
+                               ListVec * capturedWiths)
 {
     if (funcIdx >= cu.lambdas.size())
         throw std::runtime_error("v3 runFunctionWithUpvalues: funcIdx out of range");
@@ -3330,7 +3339,10 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
     Closure * fakeClo = Alloc::allocClosure(nUpvalues);
     fakeClo->desc = &desc;
     fakeClo->cu   = &cu;
-    fakeClo->capturedWiths = nullptr;
+    // #416: also publish the captured chain on the closure so any
+    // sub-call that re-uses fakeClo (e.g. via tail calls in the body)
+    // sees the outer withs through pushCapturedWiths().
+    fakeClo->capturedWiths = capturedWiths;
     fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
     for (uint32_t i = 0; i < nUpvalues; ++i)
         fakeClo->upvalues[i] = upvalues[i];
@@ -3340,15 +3352,20 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
     vm.frames.reserve(4096);
     vm.withStack.reserve(64);
 
+    // #416: see runFunction() for the layering rationale -- frame's
+    // withStackBase below the captured chain, captured chain pushed
+    // on top, so OP_WITH_LOOKUP picks it up while the function's own
+    // ir::With pushes layer above.
     vm.frames.push_back(CallFrame{
         .cu = &cu,
         .closure = fakeClo,
         .thunk = nullptr,
         .ip = desc.codeOffset,
         .stackBaseOffset = 0,
-        .withStackBase = 0,
+        .withStackBase = static_cast<uint32_t>(vm.withStack.size()),
         .flags = 0,
     });
+    pushCapturedWiths(vm, capturedWiths);
 
     vm.valueStack.resize(desc.nLocals);
 

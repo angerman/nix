@@ -112,6 +112,33 @@ struct SubExprCacheEntry {
     std::vector<UpvalueSource> upvalueSources;
     /// Phase B blacklist — throws cause future forces to skip.
     bool                    phaseBFailed = false;
+
+    // -----------------------------------------------------------------
+    // #416: outer-with carriage.
+    // -----------------------------------------------------------------
+    //
+    // Static analysis of the sub-Expr's AST tree at populate time tells
+    // us which env-frames above this sub-Expr's call site are with-
+    // frames (`values[0]` of those env frames hold the with-attrset).
+    // At force-hook entry we walk the runtime env according to these
+    // offsets, snapshot each `values[0]` into a Bridge thunk, and pass
+    // the resulting list to runFunction[WithUpvalues] as capturedWiths
+    // -- so OP_WITH_LOOKUP inside the body can find names defined in
+    // outer with-scopes that the function body itself does not push.
+    //
+    // Innermost first; offset i is the number of `up` walks from the
+    // hook-entry env required to reach with-frame i.  Empty means
+    // either: (a) no outer-with dependency at all (the function never
+    // pushes WithLookup), or (b) all WithLookups inside the body are
+    // satisfied by the function's own ir::With pushes.  Either way
+    // capturedWiths is null at runtime.
+    std::vector<uint32_t>   outerWithLevels;
+    /// True if the analyzer found outer-with usage but couldn't fully
+    /// resolve the chain (e.g. an ExprVar inside the sub-Expr depends
+    /// on an outer with-frame whose env-level we cannot statically
+    /// determine).  At force time we refuse the v3 path with a fresh
+    /// skip reason instead of throwing through the body.
+    bool                    outerWithRefused = false;
 };
 
 static std::unordered_map<const nix::Expr *, SubExprCacheEntry> & v3SubExprCache()
@@ -154,6 +181,303 @@ static std::unordered_map<RecBuildCacheKey, Bindings *, RecBuildCacheKeyHash>
 /// primImport (WC-4) so that imported files contribute their per-thunk
 /// functions too.  Idempotent: if an Expr* is already cached, the
 /// existing entry wins (`emplace` semantics).
+// ---------------------------------------------------------------------------
+// #416: outer-with chain analysis
+// ---------------------------------------------------------------------------
+//
+// For a sub-Expr `e` (which becomes a thunk-body Function), walk e's
+// AST tree to determine the chain of OUTER `with` frames statically
+// enclosing it.  An outer with is one that's lexically above `e`'s
+// position; an inner with is one that lives inside `e`'s subtree (the
+// IR's own With block handles those at runtime).
+//
+// Algorithm:
+//   1. Walk `e`'s subtree once, collecting every `nix::ExprWith *`
+//      lexically inside.  These are the "interior" withs.
+//   2. Walk `e`'s subtree again with intra-e env-depth tracking; find
+//      the FIRST reachable `ExprVar` whose `fromWith` is non-null
+//      AND whose `fromWith` is not in the interior set.  That var's
+//      (level - intra_depth) gives us the env offset (relative to E0,
+//      the env at hook entry) of the innermost OUTER with-frame.
+//   3. Chain through `fromWith->parentWith` accumulating prevWith to
+//      compute offsets for subsequent outer with-frames.
+//
+// Sub-Expr boundaries we DO NOT descend through (each is its own
+// thunkified Expr with its own SubExprCacheEntry):
+//   - ExprLambda::body            (lambda body runs in fresh env at call)
+//   - ExprAttrs attr values        (each becomes its own thunk)
+//   - ExprAttrs inheritFromExprs   (each becomes a separate inheritEnv slot)
+//   - ExprAttrs dynamic attr values
+//   - ExprList elements
+//   - ExprCall::args
+//
+// AST nodes that add an env-frame (depth +1 inside their body):
+//   - ExprLet           (let frame for the bindings)
+//   - ExprAttrs (rec)   (rec frame for entries)
+//   - ExprWith          (with frame for the attrs)
+//
+// All other constructs keep depth unchanged.
+
+namespace {
+
+void collectInteriorWiths(const nix::Expr * e, std::unordered_set<const nix::ExprWith *> & set);
+
+// Forward decls so the recursive helpers below can refer to one another.
+void collectInteriorWiths_dispatch(const nix::Expr * e, std::unordered_set<const nix::ExprWith *> & set);
+
+void collectInteriorWiths(const nix::Expr * e, std::unordered_set<const nix::ExprWith *> & set)
+{
+    if (!e) return;
+    collectInteriorWiths_dispatch(e, set);
+}
+
+void collectInteriorWiths_dispatch(const nix::Expr * e, std::unordered_set<const nix::ExprWith *> & set)
+{
+    using K = nix::Expr::Kind;
+    switch (e->exprKind) {
+    case K::Unknown:
+    case K::Int:
+    case K::Float:
+    case K::String:
+    case K::Path:
+    case K::Var:
+    case K::InheritFrom:
+    case K::Pos:
+    case K::BlackHole:
+        return; // leaves -- nothing to recurse into
+    case K::With: {
+        auto * w = static_cast<const nix::ExprWith *>(e);
+        set.insert(w);
+        // Don't descend into attrs (evaluated in OUTER env -- but its
+        // own ExprVars share the same outer-with chain as `e`, so we
+        // could descend; safer to skip since the attrs become a
+        // bridge-thunk at force time anyway).  DO descend into body.
+        collectInteriorWiths(w->body, set);
+        break;
+    }
+    case K::Let: {
+        auto * l = static_cast<const nix::ExprLet *>(e);
+        // attrs values are thunkified separately; don't descend into them.
+        // body lives in the let frame.
+        collectInteriorWiths(l->body, set);
+        break;
+    }
+    case K::Attrs: {
+        // attr values are thunkified.  We DO descend into the
+        // top-level attrset structure but not into the value Exprs --
+        // those are separate sub-Exprs.  In practice ExprAttrs holds
+        // no ExprWith of its own, so this is effectively a no-op leaf.
+        break;
+    }
+    case K::Lambda:
+        // lambda body is a separate sub-Expr; don't descend.
+        break;
+    case K::Call: {
+        auto * c = static_cast<const nix::ExprCall *>(e);
+        collectInteriorWiths(c->fun, set);
+        // args are thunkified per-call; don't descend.
+        break;
+    }
+    case K::List:
+        // elements are thunkified; don't descend.
+        break;
+    case K::If: {
+        auto * i = static_cast<const nix::ExprIf *>(e);
+        collectInteriorWiths(i->cond, set);
+        collectInteriorWiths(i->then, set);
+        collectInteriorWiths(i->else_, set);
+        break;
+    }
+    case K::Assert: {
+        auto * a = static_cast<const nix::ExprAssert *>(e);
+        collectInteriorWiths(a->cond, set);
+        collectInteriorWiths(a->body, set);
+        break;
+    }
+    case K::OpNot:
+        collectInteriorWiths(static_cast<const nix::ExprOpNot *>(e)->e, set);
+        break;
+    case K::OpUpdate:
+    case K::OpConcatLists:
+    case K::OpEq:
+    case K::OpNEq:
+    case K::OpAnd:
+    case K::OpOr:
+    case K::OpImpl: {
+        // All MakeBinOp variants share e1/e2 layout (see nixexpr.hh:802).
+        auto * b = static_cast<const nix::ExprOpEq *>(e); // any binop layout works
+        collectInteriorWiths(b->e1, set);
+        collectInteriorWiths(b->e2, set);
+        break;
+    }
+    case K::Select:
+        collectInteriorWiths(static_cast<const nix::ExprSelect *>(e)->e, set);
+        // attr-path components are static (Symbol or computed via nameExpr,
+        // which would be thunkified).
+        break;
+    case K::OpHasAttr:
+        collectInteriorWiths(static_cast<const nix::ExprOpHasAttr *>(e)->e, set);
+        break;
+    case K::ConcatStrings: {
+        auto * cs = static_cast<const nix::ExprConcatStrings *>(e);
+        for (auto & p : cs->es)
+            collectInteriorWiths(p.second, set);
+        break;
+    }
+    }
+}
+
+/// AST walk to find the first reachable ExprVar with non-null fromWith
+/// whose fromWith is NOT in the interior set, tracking intra-`e` env
+/// depth.  If found, returns true and writes (anchorVar, depthAtAnchor)
+/// to outparams.  If not found, returns false (caller treats as "no
+/// outer-with dependency" -- safe: empty chain).
+bool findOuterAnchor(
+    const nix::Expr * e,
+    const std::unordered_set<const nix::ExprWith *> & interior,
+    uint32_t depth,
+    const nix::ExprVar *& anchorOut,
+    uint32_t & anchorDepthOut)
+{
+    if (!e) return false;
+    using K = nix::Expr::Kind;
+    switch (e->exprKind) {
+    case K::Unknown:
+    case K::Int:
+    case K::Float:
+    case K::String:
+    case K::Path:
+    case K::InheritFrom:
+    case K::Pos:
+    case K::BlackHole:
+        return false;
+    case K::Var: {
+        auto * v = static_cast<const nix::ExprVar *>(e);
+        if (v->fromWith && interior.count(v->fromWith) == 0) {
+            anchorOut = v;
+            anchorDepthOut = depth;
+            return true;
+        }
+        return false;
+    }
+    case K::With: {
+        auto * w = static_cast<const nix::ExprWith *>(e);
+        // attrs evaluates in OUTER scope at depth `depth`.
+        if (findOuterAnchor(w->attrs, interior, depth, anchorOut, anchorDepthOut))
+            return true;
+        return findOuterAnchor(w->body, interior, depth + 1, anchorOut, anchorDepthOut);
+    }
+    case K::Let: {
+        auto * l = static_cast<const nix::ExprLet *>(e);
+        // Body runs at depth+1; attr values are thunkified (skip).
+        return findOuterAnchor(l->body, interior, depth + 1, anchorOut, anchorDepthOut);
+    }
+    case K::Attrs:
+        // attr values are thunkified; nothing to recurse into for
+        // anchor purposes here.
+        return false;
+    case K::Lambda:
+        // separate sub-Expr; don't descend.
+        return false;
+    case K::Call: {
+        auto * c = static_cast<const nix::ExprCall *>(e);
+        if (findOuterAnchor(c->fun, interior, depth, anchorOut, anchorDepthOut))
+            return true;
+        // args thunkified.
+        return false;
+    }
+    case K::List:
+        return false; // elements thunkified.
+    case K::If: {
+        auto * i = static_cast<const nix::ExprIf *>(e);
+        if (findOuterAnchor(i->cond, interior, depth, anchorOut, anchorDepthOut)) return true;
+        if (findOuterAnchor(i->then, interior, depth, anchorOut, anchorDepthOut)) return true;
+        return findOuterAnchor(i->else_, interior, depth, anchorOut, anchorDepthOut);
+    }
+    case K::Assert: {
+        auto * a = static_cast<const nix::ExprAssert *>(e);
+        if (findOuterAnchor(a->cond, interior, depth, anchorOut, anchorDepthOut)) return true;
+        return findOuterAnchor(a->body, interior, depth, anchorOut, anchorDepthOut);
+    }
+    case K::OpNot:
+        return findOuterAnchor(static_cast<const nix::ExprOpNot *>(e)->e,
+            interior, depth, anchorOut, anchorDepthOut);
+    case K::OpUpdate:
+    case K::OpConcatLists:
+    case K::OpEq:
+    case K::OpNEq:
+    case K::OpAnd:
+    case K::OpOr:
+    case K::OpImpl: {
+        auto * b = static_cast<const nix::ExprOpEq *>(e);
+        if (findOuterAnchor(b->e1, interior, depth, anchorOut, anchorDepthOut)) return true;
+        return findOuterAnchor(b->e2, interior, depth, anchorOut, anchorDepthOut);
+    }
+    case K::Select:
+        return findOuterAnchor(static_cast<const nix::ExprSelect *>(e)->e,
+            interior, depth, anchorOut, anchorDepthOut);
+    case K::OpHasAttr:
+        return findOuterAnchor(static_cast<const nix::ExprOpHasAttr *>(e)->e,
+            interior, depth, anchorOut, anchorDepthOut);
+    case K::ConcatStrings: {
+        auto * cs = static_cast<const nix::ExprConcatStrings *>(e);
+        for (auto & p : cs->es)
+            if (findOuterAnchor(p.second, interior, depth, anchorOut, anchorDepthOut))
+                return true;
+        return false;
+    }
+    }
+    return false;
+}
+
+/// Compute outer-with offsets for a sub-Expr `e`.  Writes to `out`
+/// (innermost outer with first); returns true if the analysis completed
+/// cleanly (which includes the trivial "no outer-with dependency"
+/// case -- empty `out`), false if we found a dependency we can't
+/// resolve (caller should mark outerWithRefused).
+bool analyzeOuterWiths(const nix::Expr * e, std::vector<uint32_t> & out)
+{
+    out.clear();
+    if (!e) return true;
+
+    std::unordered_set<const nix::ExprWith *> interior;
+    collectInteriorWiths(e, interior);
+
+    const nix::ExprVar * anchor = nullptr;
+    uint32_t anchorDepth = 0;
+    if (!findOuterAnchor(e, interior, 0, anchor, anchorDepth))
+        return true; // no outer-with dependency
+
+    // anchor->level is relative to the env at the anchor's AST
+    // position.  Subtracting anchorDepth (the count of intra-e env
+    // frames between e's root and the anchor) gives the offset
+    // relative to E0 = the env at hook entry.
+    if (anchor->level < anchorDepth) {
+        // Should not happen if our depth tracking matches the parser
+        // -- it would mean the anchor's static binder thinks the var
+        // is bound deeper than our walk does.  Refuse rather than
+        // produce a wrong offset.
+        return false;
+    }
+    uint32_t off = anchor->level - anchorDepth;
+    out.push_back(off);
+
+    // Chain through fromWith.  prevWith on the CURRENT fromWith
+    // advances to its parent.
+    const nix::ExprWith * w = anchor->fromWith;
+    while (w && w->parentWith) {
+        // Defensive: prevWith is a uint32_t; check for overflow.
+        uint64_t next = (uint64_t)off + (uint64_t)w->prevWith;
+        if (next > UINT32_MAX) return false;
+        off = (uint32_t)next;
+        out.push_back(off);
+        w = w->parentWith;
+    }
+    return true;
+}
+
+} // namespace
+
 static void populateSubExprCacheLocal(
     const ir::Module & module, const CompilationUnit * cu)
 {
@@ -215,6 +539,38 @@ static void populateSubExprCacheLocal(
             }
             if (!ok) entry.upvalueSources.clear();
         }
+
+        // #416: outer-with chain analysis.  Costs one AST walk per
+        // sub-Expr at populate time; result is reused for every force.
+        // The static analysis is conservative -- a refused entry just
+        // routes future forces to tree-walker (existing skipReturn).
+        {
+            const auto * astE =
+                static_cast<const nix::Expr *>(sef.astExpr);
+            if (!analyzeOuterWiths(astE, entry.outerWithLevels)) {
+                entry.outerWithRefused = true;
+                entry.outerWithLevels.clear();
+            }
+            static const bool diagOuterWith =
+                std::getenv("V3_DEBUG_OUTER_WITH") != nullptr;
+            if (diagOuterWith) {
+                if (entry.outerWithRefused) {
+                    std::fprintf(stderr,
+                        "v3 outerWith: REFUSED expr=%p kind=%d\n",
+                        (void *)astE, (int)astE->exprKind);
+                } else if (!entry.outerWithLevels.empty()) {
+                    std::fprintf(stderr,
+                        "v3 outerWith: chain=%zu offsets=[",
+                        entry.outerWithLevels.size());
+                    for (size_t i = 0; i < entry.outerWithLevels.size(); ++i)
+                        std::fprintf(stderr, "%s%u",
+                            i ? "," : "", entry.outerWithLevels[i]);
+                    std::fprintf(stderr,
+                        "] kind=%d\n", (int)astE->exprKind);
+                }
+            }
+        }
+
         // REVIEW MED-12: this remaining const_cast is monotonic-true:
         // once an Expr is registered as a v3 cache candidate, it
         // stays one for all states sharing the AST.  The mutation is
@@ -298,6 +654,17 @@ struct V3HookStats {
     uint64_t forceHookRecBuildUpvalues = 0;
     uint64_t forceHookHitsDirectOnly   = 0;
     uint64_t forceHookHitsWithRecBuild = 0;
+
+    /// #416 instrumentation: how often the outer-with carriage path
+    /// fires.  `Built` counts subCache hits whose entry has a
+    /// non-empty outerWithLevels (a thunk that statically depends on
+    /// outer with-frames -- the new feature actually does work here).
+    /// `Refused` counts entries we marked outerWithRefused at populate
+    /// time.  `Empty` counts entries with an empty chain (the trivial
+    /// case -- no outer-with dependency, no extra cost).
+    uint64_t forceHookOuterWithBuilt   = 0;
+    uint64_t forceHookOuterWithRefused = 0;
+    uint64_t forceHookOuterWithEmpty   = 0;
 };
 
 V3HookStats & v3HookStats()
@@ -499,8 +866,8 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     "envValueNull",
                     "twToV3ConversionThrew",
                     "topLevelCUNeedsUpvalues",
-                    "(unused)",
-                    "(unused)",
+                    "outerWithRefused",       // #416 static-analysis refused
+                    "outerWithEnvWalkOff",    // #416 env walk fell off the end
                 };
                 bool anyReason = false;
                 for (size_t i = 0; i < V3HookStats::kSkipReasonCap; ++i) {
@@ -549,6 +916,14 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                         (unsigned long long)s.forceHookRecBuildUpvalues,
                         (unsigned long long)s.forceHookHitsDirectOnly,
                         (unsigned long long)s.forceHookHitsWithRecBuild);
+                if (s.forceHookOuterWithBuilt
+                    || s.forceHookOuterWithRefused
+                    || s.forceHookOuterWithEmpty)
+                    std::fprintf(stderr,
+                        "v3 force outer-with: built=%llu refused=%llu trivial(empty)=%llu\n",
+                        (unsigned long long)s.forceHookOuterWithBuilt,
+                        (unsigned long long)s.forceHookOuterWithRefused,
+                        (unsigned long long)s.forceHookOuterWithEmpty);
             });
         }
         return true;
@@ -1128,6 +1503,18 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     ir::FuncId              funcIdx = 0;
     std::vector<Value>      upvalues;
     bool sawRecBuild = false;
+    // #416: capturedWiths assembled from the sub-Expr's outer-with
+    // chain (computed at populate time, walked at hook entry).  Null
+    // when the sub-Expr has no outer-with dependency, or when the
+    // outer-with feature is disabled.
+    ListVec * capturedWiths = nullptr;
+    // Opt-in feature flag while we shake out correctness; once tests
+    // confirm parity on nixpkgs we'll flip the default.  NIX_V3_NO_OUTER_WITH
+    // explicitly disables once it's the default.
+    static const bool outerWithEnabled = []{
+        if (std::getenv("NIX_V3_NO_OUTER_WITH")) return false;
+        return std::getenv("NIX_V3_OUTER_WITH") != nullptr;
+    }();
     auto & subCache = v3SubExprCache();
     auto sit = subCache.find(e);
     if (sit != subCache.end()) {
@@ -1137,6 +1524,13 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
             // future forces of this Expr skip the hook at the eval-
             // inline.hh:119 short-circuit check.
             return skipPermanently(0);
+        }
+        if (outerWithEnabled && ent.outerWithRefused) {
+            // Static analysis flagged this Expr as having an outer-with
+            // dependency we cannot resolve.  Skip permanently; tree-
+            // walker handles the chain natively.
+            st.forceHookOuterWithRefused++;
+            return skipPermanently(6);
         }
         if (ent.nUpvalues != 0) {
             if (ent.upvalueSources.empty()) {
@@ -1250,6 +1644,42 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                 return skipReturn(4);
             }
         }
+        // #416: build the capturedWiths ListVec by walking env per the
+        // pre-computed outerWithLevels.  Each level becomes a Bridge
+        // thunk wrapping the tree-walker `nix::Value*` at env->values[0]
+        // -- mirrors the Direct upvalue path so the with-attrset is
+        // forced lazily by OP_WITH_LOOKUP.
+        if (outerWithEnabled && ent.outerWithLevels.empty()) {
+            st.forceHookOuterWithEmpty++;
+        }
+        if (outerWithEnabled && !ent.outerWithLevels.empty()) {
+            st.forceHookOuterWithBuilt++;
+            const auto & lv = ent.outerWithLevels;
+            ListVec * out = Alloc::allocList(static_cast<uint32_t>(lv.size()));
+            allocStats().listsAllocated++;
+            bool ok = true;
+            for (size_t i = 0; i < lv.size(); ++i) {
+                nix::Env * cur = &env;
+                uint32_t levels = lv[i];
+                for (uint32_t k = 0; k < levels; ++k) {
+                    if (!cur || !cur->up) { ok = false; break; }
+                    cur = cur->up;
+                }
+                if (!ok || !cur) { ok = false; break; }
+                nix::Value * srcV = cur->values[0];
+                if (!srcV) { ok = false; break; }
+                Thunk * bridge = Alloc::allocBridgeThunk(
+                    static_cast<void *>(srcV));
+                allocStats().thunksAllocated++;
+                Value entry;
+                entry.tag_payload =
+                    static_cast<uint64_t>(Tag::Thunk);
+                entry.payload.thunk = bridge;
+                out->elems[i] = entry;
+            }
+            if (!ok) return skipReturn(7);
+            capturedWiths = out;
+        }
         cu      = ent.cu;
         funcIdx = ent.funcIdx;
     } else {
@@ -1279,11 +1709,20 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     try {
         if (!upvalues.empty()) {
             r = runFunctionWithUpvalues(*cu, funcIdx,
-                upvalues.data(), static_cast<uint32_t>(upvalues.size()));
+                upvalues.data(), static_cast<uint32_t>(upvalues.size()),
+                capturedWiths);
         } else if (funcIdx == 0) {
-            r = run(*cu);
+            // Top-level entry takes the same `run` path as standalone
+            // top-level eval -- it runs from offset 0 with no upvalues
+            // and no captured-with carriage (capturedWiths null by
+            // construction here).  If capturedWiths IS non-null we
+            // must still propagate it; route through runFunction(0).
+            if (capturedWiths)
+                r = runFunction(*cu, funcIdx, capturedWiths);
+            else
+                r = run(*cu);
         } else {
-            r = runFunction(*cu, funcIdx);
+            r = runFunction(*cu, funcIdx, capturedWiths);
         }
     } catch (const std::exception & ex) {
         if (diag) std::fprintf(stderr, "v3 force hook: run threw: %s\n", ex.what());
