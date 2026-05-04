@@ -10,13 +10,16 @@
 #include "nix/util/hash.hh"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <pthread.h>
 #include <sstream>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <unistd.h>
 
 namespace nix::v3::disk_cache {
@@ -135,15 +138,31 @@ void insert(const CacheKey & key, std::string_view blob)
     auto & dir = cacheDir();
     if (dir.empty()) return;
     std::string finalPath = dir + "/" + key.hex();
-    std::string tempPath = finalPath + ".tmp";
+    // REVIEW_2026-05-04 B-4 / §6.4: writer-unique temp path.  Previous
+    // `finalPath + ".tmp"` collided when two concurrent writers (within
+    // a process or across processes) hit the same content-hash key.
+    // Same key → same blob converges harmlessly TODAY, but any schema
+    // drift mid-process or partial write would produce torn data
+    // visible to the rename winner.  Disambiguate by pid + thread id +
+    // a process-local sequence so each writer has its own temp file.
+    static std::atomic<uint64_t> seq{0};
+    char buf[64];
+    std::snprintf(buf, sizeof buf, ".tmp.%lld.%llu.%llu",
+        (long long)::getpid(),
+        (unsigned long long)pthread_self(),
+        (unsigned long long)seq.fetch_add(1, std::memory_order_relaxed));
+    std::string tempPath = finalPath + buf;
     {
         std::ofstream f(tempPath, std::ios::binary | std::ios::trunc);
         if (!f) { st.insertFailures++; return; }
         f.write(blob.data(), static_cast<std::streamsize>(blob.size()));
-        if (!f) { st.insertFailures++; return; }
+        if (!f) { st.insertFailures++; std::remove(tempPath.c_str()); return; }
     }
     if (std::rename(tempPath.c_str(), finalPath.c_str()) != 0) {
-        // Concurrent writer raced us — best-effort.  unlink temp.
+        // rename can fail if another writer already moved a file into
+        // place between our open() and rename().  Same content-hash
+        // key → same blob, so the winner's data is correct; we just
+        // discard our temp.
         std::remove(tempPath.c_str());
         st.insertFailures++;
         return;
