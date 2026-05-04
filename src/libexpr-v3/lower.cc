@@ -237,22 +237,27 @@ struct Lowerer
             // that dominated nixpkgs eval (`recref-setType` alone was
             // forced 1.38M times under stages 0..3).
             //
-            // Default-OFF after a cardano-node correctness regression
-            // surfaced post-flip: Phase 5 caused `error: infinite
-            // recursion encountered` on the cardano-node flake's
-            // packages.aarch64-darwin.cardano-node.name eval, while
-            // the thunkify path is fine.  The lang/cutover/wc-laziness
-            // suites + nixpkgs hello.outPath all pass under Phase 5,
-            // so the cardano-node bug is a workload-specific eval-
-            // order divergence (likely the same shape as the WC-31
-            // bug that motivated thunkifyRecAttrSelect: forcing the
-            // slot at MAKE_CLOSURE time vs at consume time changes
-            // when intermediate Suspended thunks are observed).
+            // Default-ON since 2026-05-04: cardano-node correctness
+            // regression (#437) was root-caused to v3 closures with
+            // formals escaping to tree-walker as `mkPrimOpApp(bridge1,
+            // h)`, where bridge1's deep arg-conversion tripped
+            // ExprBlackHole on the NixOS-module-system fixed-point's
+            // `config`.  Fixed in:
+            //   - 75dc45ebd: refuse to bridge `<formals>` closures
+            //     out of `v3ToTreeWalker` (throw blackhole-shaped
+            //     exception so existing `isBlackhole*` predicates
+            //     route to fallbackExpr re-eval paths).
+            //   - 599cb9745: skip v3 call hook for formals lambdas;
+            //     bridge non-formals call-hook args lazily (shallow
+            //     Bridge thunk instead of deep `treeWalkerToV3Public`).
             //
-            // Re-enable via NIX_V3_INLINE_REC_SLOT=1 once the
-            // cardano-node regression is root-caused.
+            // All four cardano-node modes pass with Phase 5 ON
+            // (v3, v3+fhook, v3+P5, v3+P5+fhook); fib35 retains its
+            // -21% min-vs-TW headline win.  Kill-switch
+            // `NIX_V3_NO_INLINE_REC_SLOT=1` for fallback
+            // (renamed from the prior opt-in `NIX_V3_INLINE_REC_SLOT`).
             static const bool inlineRecSlot =
-                std::getenv("NIX_V3_INLINE_REC_SLOT") != nullptr;
+                std::getenv("NIX_V3_NO_INLINE_REC_SLOT") == nullptr;
             if (inlineRecSlot)
                 return addBinding(ir::RecBindingSlotRef{rec, nm});
             return thunkifyRecAttrSelect(rec, nm);
