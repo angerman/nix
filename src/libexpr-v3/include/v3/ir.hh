@@ -448,6 +448,14 @@ struct Module {
     /// freeVars intersect this set.
     std::vector<VarId> recVarIds;
 
+    /// #425: VarIds the lowerer bound to `LitBuiltins` (the singleton
+    /// `builtins` attrset).  When a sub-Expr captures one of these as
+    /// a freeVar, the populate path generates a special UpvalueSource
+    /// that just hands back the v3 vBuiltins singleton at hook time --
+    /// no env walk needed since builtins is process-wide constant.
+    /// Closes the LitBuiltins subset of the noUpvSrc failure mode.
+    std::vector<VarId> litBuiltinsVarIds;
+
     /// WC-2-followup companion to recVarIds.  For each (function,
     /// recVar) pair where the recVar appears as a freeVar, records
     /// the level + names so the force hook can synthesise a v3

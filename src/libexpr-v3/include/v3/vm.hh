@@ -89,6 +89,13 @@ CompilationUnit compile(const ir::Module & m);
 /// Run the top-level CU's entry until OP_HALT, returning the final value.
 Value run(const CompilationUnit & cu);
 
+/// #425: process-wide lazy singleton of the `builtins` attrset.  Built
+/// on first call from the registered primops table (matching the
+/// OP_LIT_BUILTINS dispatch); subsequent calls return the same Value.
+/// Used by the v3 force/call hook to materialise an upvalue when a
+/// sub-Expr captured `builtins` as a freeVar.
+Value getBuiltinsValue() noexcept;
+
 /// Run a specific FuncId in `cu` as if it were a thunk body — no
 /// arguments pushed, the function's nLocals worth of slots reserved,
 /// and the dispatch loop runs until that function's OP_RETURN/OP_HALT.

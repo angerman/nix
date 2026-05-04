@@ -92,8 +92,12 @@ static void v3RegisterExprEntry(const nix::Expr * e, const nix::SourcePath & p)
 ///     env.values[i]) for i in 0..names.size()-1.  This bridges
 ///     v3's "rec attrset is one VarId" representation to
 ///     tree-walker's "each rec binding is its own env cell".
+///   - kind == LitBuiltins: hand back the v3 vBuiltins singleton
+///     (#425).  No env-side counterpart -- the lowerer bound the
+///     freeVar to ir::LitBuiltins, which has no tree-walker shape;
+///     the singleton is process-wide constant.
 struct UpvalueSource {
-    enum class Kind : uint8_t { Direct, RecBuild };
+    enum class Kind : uint8_t { Direct, RecBuild, LitBuiltins };
     Kind                  kind  = Kind::Direct;
     uint32_t              level = 0;
     uint32_t              displ = 0;        // valid when kind=Direct
@@ -503,6 +507,10 @@ static void populateSubExprCacheLocal(
     }
     std::unordered_set<ir::VarId> recVarSet(
         module.recVarIds.begin(), module.recVarIds.end());
+    // #425: VarIds bound to ir::LitBuiltins -- inner functions
+    // capturing one as freeVar get a LitBuiltins UpvalueSource.
+    std::unordered_set<ir::VarId> litBuiltinsSet(
+        module.litBuiltinsVarIds.begin(), module.litBuiltinsVarIds.end());
     auto & subCache = v3SubExprCache();
     static const bool diagOrigins = std::getenv("V3_DEBUG_ORIGINS") != nullptr;
     for (auto & sef : module.subExprFuncs) {
@@ -533,6 +541,14 @@ static void populateSubExprCacheLocal(
                     src.kind  = UpvalueSource::Kind::RecBuild;
                     src.level = rit->second->level;
                     src.names = rit->second->names;  // shared_ptr<vector<SymbolId>>; O(1) copy.
+                    entry.upvalueSources.push_back(std::move(src));
+                    continue;
+                }
+                // #425: LitBuiltins fv -- no env walk needed;
+                // hand back the singleton at hook time.
+                if (litBuiltinsSet.count(fv)) {
+                    UpvalueSource src;
+                    src.kind = UpvalueSource::Kind::LitBuiltins;
                     entry.upvalueSources.push_back(std::move(src));
                     continue;
                 }
@@ -1525,6 +1541,12 @@ static HookPrepResult prepHookUpvaluesAndWiths(
         try {
             upvalues.reserve(ent.nUpvalues);
             for (auto & src : ent.upvalueSources) {
+                // #425: LitBuiltins -- no env walk, just push the
+                // singleton.  Skip the env-walk preamble entirely.
+                if (src.kind == UpvalueSource::Kind::LitBuiltins) {
+                    upvalues.push_back(getBuiltinsValue());
+                    continue;
+                }
                 nix::Env * cur = &env;
                 for (uint32_t i = 0; i < src.level; ++i) {
                     if (!cur || !cur->up)

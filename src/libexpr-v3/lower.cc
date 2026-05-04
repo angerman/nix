@@ -541,7 +541,12 @@ struct Lowerer
             // Saves the per-occurrence cost of building N LitPrimOp +
             // AttrSet IR bindings, and avoids the cross-function
             // VarId-reuse trap that an IR-level cache would hit.
-            return addBinding(ir::LitBuiltins{});
+            ir::VarId v = addBinding(ir::LitBuiltins{});
+            // #425: track for the populate path so an inner function
+            // capturing this var as a freeVar gets a LitBuiltins
+            // upvalue source (no env walk -- builtins is a singleton).
+            m.litBuiltinsVarIds.push_back(v);
+            return v;
         }
         if (auto * po = findPrimOp(name)) {
             // Arity-0 primops behave as constants — invoke immediately
