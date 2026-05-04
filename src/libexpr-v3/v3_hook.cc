@@ -505,6 +505,8 @@ static void populateSubExprCacheLocal(
         if (entry.nUpvalues > 0) {
             auto & fvs = module.functions[sef.funcIdx].freeVars;
             bool ok = true;
+            const char * failClass = nullptr; // for #425 diagnostics
+            ir::VarId failedVar = ir::kInvalid;
             entry.upvalueSources.reserve(fvs.size());
             for (auto fv : fvs) {
                 uint64_t key = (static_cast<uint64_t>(sef.funcIdx) << 32) | fv;
@@ -515,6 +517,8 @@ static void populateSubExprCacheLocal(
                             "v3 origins: func=%u skip — fv=%u in recVarSet "
                             "but no recVarOrigins entry\n",
                             sef.funcIdx, fv);
+                        failClass = "rec-no-origin";
+                        failedVar = fv;
                         ok = false; break;
                     }
                     UpvalueSource src;
@@ -529,6 +533,8 @@ static void populateSubExprCacheLocal(
                     if (diagOrigins) std::fprintf(stderr,
                         "v3 origins: func=%u skip — fv=%u has no varOrigins entry\n",
                         sef.funcIdx, fv);
+                    failClass = "synthetic-no-origin";
+                    failedVar = fv;
                     ok = false; break;
                 }
                 UpvalueSource src;
@@ -537,7 +543,31 @@ static void populateSubExprCacheLocal(
                 src.displ = oit->second.second;
                 entry.upvalueSources.push_back(std::move(src));
             }
-            if (!ok) entry.upvalueSources.clear();
+            if (!ok) {
+                entry.upvalueSources.clear();
+                // #425 diagnostics: print which class of synthetic
+                // VarId is killing the upvalue translation, plus the
+                // function's own metadata so we can see the AST shape
+                // at fault.
+                static const bool diagNoUpv =
+                    std::getenv("V3_DEBUG_NOUPV") != nullptr;
+                if (diagNoUpv) {
+                    const auto * astE =
+                        static_cast<const nix::Expr *>(sef.astExpr);
+                    std::fprintf(stderr,
+                        "v3 noUpvSrc: func=%u fid_kind=%d astKind=%d "
+                        "fv=%u (%s) freeVars=[",
+                        sef.funcIdx,
+                        (int)module.functions[sef.funcIdx].entryBlock,
+                        (int)astE->exprKind,
+                        failedVar,
+                        failClass ? failClass : "?");
+                    for (size_t i = 0; i < fvs.size(); ++i)
+                        std::fprintf(stderr, "%s%u",
+                            i ? "," : "", fvs[i]);
+                    std::fprintf(stderr, "]\n");
+                }
+            }
         }
 
         // #416: outer-with chain analysis.  Costs one AST walk per
