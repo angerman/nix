@@ -2229,27 +2229,42 @@ void primReadFileType(EvalState &, Value * args, Value & out)
     out = mkStringValueOwned(t);
 }
 
-void primAddErrorContext(EvalState &, Value * args, Value & out)
+void primAddErrorContext(EvalState & state, Value * args, Value & out)
 {
-    // Stub: nix's tree-walker pre-pends a context message to error
-    // messages from the second arg.  v3 doesn't track context yet —
-    // just return the second argument (the wrapped value).  The first
-    // arg (the prefix string) is currently ignored.
+    // REVIEW_2026-05-04 F3 / B-3 / §6.2: was a no-op stub that silently
+    // dropped the prefix.  nixpkgs `lib/modules.nix:270` calls this on
+    // every module evaluation -- without context, NixOS error messages
+    // lose their breadcrumb chain entirely (silent wrong-output).
     //
-    // V3_DBG_ADD_ERR_CTX prints the message + arg tags — used to
-    // localise the WC-35 cycle path through nixpkgs's lib/modules.nix
-    // applyModuleArgs construction.
+    // Mirror tree-walker's `prim_addErrorContext` (libexpr/primops.cc:1170):
+    // force args[1] in a try/catch.  On exception, coerce args[0] to a
+    // string and PREPEND it to the exception message before rethrowing.
+    // The first arg (the message) is lazy -- only forced on the error
+    // path -- so success-path code doesn't pay the coercion cost.
+    //
+    // Type preservation: if BlackholeError fires, rethrow as
+    // BlackholeError so the F4 typed-fallback machinery still routes.
+    // Other exceptions become std::runtime_error with the prepended
+    // message (we can't generally clone arbitrary exception types).
     static const bool dbg = std::getenv("V3_DBG_ADD_ERR_CTX") != nullptr;
-    if (dbg) {
-        std::fprintf(stderr,
-            "v3 addErrorContext: msg-tag=%u value-tag=%u\n",
-            (unsigned)args[0].tag(), (unsigned)args[1].tag());
-        if (args[0].isString()) {
-            std::fprintf(stderr, "  msg=%.200s\n",
-                args[0].payload.str ? args[0].payload.str : "");
-        }
+    try {
+        Value v = forceValue(*state.vm, args[1]);
+        out = v;
+    } catch (const BlackholeError & ex) {
+        std::string msg;
+        try { msg = toStringCoerce(state, args[0]); }
+        catch (...) { msg = "<addErrorContext: error coercing message>"; }
+        if (dbg) std::fprintf(stderr,
+            "v3 addErrorContext (BlackholeError): %s\n", msg.c_str());
+        throw BlackholeError(msg + "\n" + ex.what());
+    } catch (const std::exception & ex) {
+        std::string msg;
+        try { msg = toStringCoerce(state, args[0]); }
+        catch (...) { msg = "<addErrorContext: error coercing message>"; }
+        if (dbg) std::fprintf(stderr,
+            "v3 addErrorContext: %s\n", msg.c_str());
+        throw std::runtime_error(msg + "\n" + ex.what());
     }
-    out = args[1];
 }
 
 /// Construct a v3-side derivation result that mirrors what tree-walker
