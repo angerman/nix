@@ -148,3 +148,33 @@ In `/tmp/v3-bench/`:
 
 These are not committed -- run the bench harness
 (`src/libexpr-v3/test/bench-v3-vs-tw.sh`) to regenerate.
+
+## Follow-up: IR optimisation pipeline (committed 2026-05-04)
+
+Following this benchmark a four-pass IR optimisation pipeline was
+landed in `src/libexpr-v3/`, run between `lower` and `computeFreeVars`
+at every v3 entry point:
+
+  §1  constantFold        — Lit-operand arithmetic / comparison / Not
+  §2  commonSubexprElim   — block-local CSE for arithmetic / Not / HasAttr
+  §3  inlineTrivialBindings — VarRef alias collapsing across the Module
+  §4  deadBindingElim     — sweeps unused pure bindings post-fold/CSE
+
+Pipeline can be disabled wholesale via `NIX_V3_NO_OPT=1` for
+bisection.  All four passes are correctness-preserving (operand
+shapes that may throw — div-by-zero, integer overflow, missing
+attr — are not folded/merged).
+
+Per the §C.1 finding above ("v3 dispatch loop is no longer the
+bottleneck"), the wins from these passes are largely synthetic
+(lang-tests + 142/142 still green).  Real-world impact on
+nixpkgs-shaped workloads is bounded by the cutover-hook fire
+rate (31-77 calls); meaningful wall-clock improvement requires
+unblocking phaseB upvalue translation first (see project tasks
+#416 / #418 in the workspace memory).
+
+The strictness-analysis pass and selector-thunk specialisation
+mentioned in earlier review notes are explicitly **deferred** with
+that same reasoning: until v3 owns more of the eval traffic, the
+marginal payoff doesn't justify the soundness risk (strictness)
+or the engineering effort (selector-thunk).
