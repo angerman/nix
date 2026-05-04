@@ -556,20 +556,40 @@ static void populateSubExprCacheLocal(
                 // #425 diagnostics: print which class of synthetic
                 // VarId is killing the upvalue translation, plus the
                 // function's own metadata so we can see the AST shape
-                // at fault.
+                // at fault.  Also locate WHICH binding defines the
+                // failed VarId so we can identify the lowerer helper
+                // responsible for the synth.
                 static const bool diagNoUpv =
                     std::getenv("V3_DEBUG_NOUPV") != nullptr;
                 if (diagNoUpv) {
                     const auto * astE =
                         static_cast<const nix::Expr *>(sef.astExpr);
+                    // Find the binding that defines failedVar.  VarIds
+                    // are unique across the Module so a single linear
+                    // scan suffices (slow, debug-only).
+                    int binderKind = -1;
+                    nix::v3::ir::BlockId binderBlock = 0;
+                    for (nix::v3::ir::BlockId bid = 1;
+                         bid < (nix::v3::ir::BlockId)module.blocks.size(); ++bid)
+                    {
+                        for (const auto & bd : module.blocks[bid].bindings) {
+                            if (bd.var == failedVar) {
+                                binderKind = (int)bd.expr.index();
+                                binderBlock = bid;
+                                goto found;
+                            }
+                        }
+                    }
+                    found:
                     std::fprintf(stderr,
                         "v3 noUpvSrc: func=%u fid_kind=%d astKind=%d "
-                        "fv=%u (%s) freeVars=[",
+                        "fv=%u (%s) binder=variant#%d block=%u freeVars=[",
                         sef.funcIdx,
                         (int)module.functions[sef.funcIdx].entryBlock,
                         (int)astE->exprKind,
                         failedVar,
-                        failClass ? failClass : "?");
+                        failClass ? failClass : "?",
+                        binderKind, (unsigned)binderBlock);
                     for (size_t i = 0; i < fvs.size(); ++i)
                         std::fprintf(stderr, "%s%u",
                             i ? "," : "", fvs[i]);
