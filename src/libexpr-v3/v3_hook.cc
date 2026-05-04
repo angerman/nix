@@ -114,8 +114,19 @@ struct SubExprCacheEntry {
     /// Empty when nUpvalues == 0 OR when one or more freeVars
     /// can't be expressed in either supported shape.
     std::vector<UpvalueSource> upvalueSources;
-    /// Phase B blacklist — throws cause future forces to skip.
-    bool                    phaseBFailed = false;
+    /// Phase B failure tracking.  REVIEW_2026-05-04 F2 / B-5: previously
+    /// `bool phaseBFailed` permanently disabled v3 for an Expr* on the
+    /// FIRST thrown exception.  Symptoms: a user `throw` inside one
+    /// upvalue context permanently disabled v3 in every other context;
+    /// transient errors stuck.  Now a 3-strike counter -- need 3
+    /// failures to stick.  Successful runs DON'T decrement (would race
+    /// with concurrent retries) but the threshold gives transient
+    /// throws (e.g. tryEval probes) up to 3 chances before sticking.
+    uint8_t                 phaseBFailureCount = 0;
+    /// Convenience: returns true when the entry is over the failure
+    /// limit and should be skipped.  Threshold tunable via
+    /// NIX_V3_PHASEB_FAIL_LIMIT (default 3).
+    bool isPhaseBSkipped() const noexcept;
 
     // -----------------------------------------------------------------
     // #416: outer-with carriage.
@@ -152,6 +163,16 @@ struct SubExprCacheEntry {
     /// runLambda; the force hook (v3ForceEntry) refuses them early.
     bool                    isLambda = false;
 };
+
+inline bool SubExprCacheEntry::isPhaseBSkipped() const noexcept
+{
+    static const uint8_t kFailLimit = []{
+        if (const char * v = std::getenv("NIX_V3_PHASEB_FAIL_LIMIT"))
+            return (uint8_t)std::min(255, std::max(1, std::atoi(v)));
+        return uint8_t{3};
+    }();
+    return phaseBFailureCount >= kFailLimit;
+}
 
 static std::unordered_map<const nix::Expr *, SubExprCacheEntry> & v3SubExprCache()
 {
@@ -1912,7 +1933,7 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     auto sit = subCache.find(e);
     if (sit != subCache.end()) {
         auto & ent = sit->second;
-        if (ent.phaseBFailed) {
+        if (ent.isPhaseBSkipped()) {
             // WC-26: structural failure — clear the candidate flag so
             // future forces of this Expr skip the hook at the eval-
             // inline.hh:119 short-circuit check.
@@ -2005,12 +2026,12 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
         // are deterministic per-Expr at this env shape — retrying
         // just throws again.
         auto sit2 = v3SubExprCache().find(e);
-        if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailed = true;
+        if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailureCount++;
         return false;  // Fall back: tree-walker handles the rest.
     } catch (...) {
         if (diag) std::fprintf(stderr, "v3 force hook: run threw NON-std-exception (likely BaseError-only)\n");
         auto sit2 = v3SubExprCache().find(e);
-        if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailed = true;
+        if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailureCount++;
         return false;
     }
     if (diag) std::fprintf(stderr, "v3 force hook: ran ok, tag=%d\n", (int)r.tag());
@@ -2194,7 +2215,7 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     }
     auto & ent = sit->second;
     if (!ent.isLambda) { st.callHookGated++; return false; }
-    if (ent.phaseBFailed) { st.callHookGated++; return false; }
+    if (ent.isPhaseBSkipped()) { st.callHookGated++; return false; }
     if (ent.outerWithRefused) { st.callHookGated++; return false; }
 
     // env at call entry == fun.lambda().env (the lambda's captured env).
@@ -2255,11 +2276,11 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     } catch (const std::exception &) {
         // Any throw -> blacklist this lambda for the rest of the
         // process, fall back.  Mirrors v3ForceEntry's WC-14.6 policy.
-        ent.phaseBFailed = true;
+        ent.phaseBFailureCount++;
         st.callHookBodyThrew++;
         return false;
     } catch (...) {
-        ent.phaseBFailed = true;
+        ent.phaseBFailureCount++;
         st.callHookBodyThrew++;
         return false;
     }
