@@ -139,6 +139,14 @@ struct SubExprCacheEntry {
     /// determine).  At force time we refuse the v3 path with a fresh
     /// skip reason instead of throwing through the body.
     bool                    outerWithRefused = false;
+
+    /// #426: true when this entry's astExpr is an ExprLambda, NOT a
+    /// thunk body.  Lambda bodies have a paramVar that the body's
+    /// OP_GET_LOCAL 0 reads -- forcing the function via runFunction /
+    /// runFunctionWithUpvalues would leave slot 0 uninitialised.  The
+    /// callFunction hook (v3CallFunctionEntry) handles these via
+    /// runLambda; the force hook (v3ForceEntry) refuses them early.
+    bool                    isLambda = false;
 };
 
 static std::unordered_map<const nix::Expr *, SubExprCacheEntry> & v3SubExprCache()
@@ -577,6 +585,11 @@ static void populateSubExprCacheLocal(
         {
             const auto * astE =
                 static_cast<const nix::Expr *>(sef.astExpr);
+            // #426: tag lambda registrations so the force hook can
+            // refuse them early (they need a callFunction-style entry
+            // with arg, not a thunk-body force).
+            entry.isLambda =
+                astE->exprKind == nix::Expr::Kind::Lambda;
             if (!analyzeOuterWiths(astE, entry.outerWithLevels)) {
                 entry.outerWithRefused = true;
                 entry.outerWithLevels.clear();
@@ -1556,6 +1569,11 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
             // inline.hh:119 short-circuit check.
             return skipPermanently(0);
         }
+        // #426: lambda registrations are for the call hook only.
+        // Forcing an ExprLambda Value yields the closure, NOT the
+        // body's result -- running the body via runFunction here
+        // would read uninitialised slot 0 (the paramVar).  Decline.
+        if (ent.isLambda) return false;
         if (outerWithEnabled && ent.outerWithRefused) {
             // Static analysis flagged this Expr as having an outer-with
             // dependency we cannot resolve.  Skip permanently; tree-
@@ -1810,6 +1828,222 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     }
 }
 
+/// #426 / MED-21: v3 callFunction cutover hook.
+///
+/// Tree-walker reaches `EvalState::callFunction` with `fun` (a tree-
+/// walker lambda) and `arg`.  When `fun.lambda().fun` (the ExprLambda*)
+/// has been pre-lowered to v3 IR and registered in v3SubExprCache,
+/// hand the call to v3:
+///
+///   1. Build the upvalues array from `fun.lambda().env` using the
+///      same upvalueSources mechanism as v3ForceHook.
+///   2. Build capturedWiths from outerWithLevels (#416 carriage).
+///   3. Bridge `arg` to a v3 Value.
+///   4. Call `runLambda(*cu, funcIdx, v3Arg, upvalues, capturedWiths)`.
+///   5. Bridge the result back to tree-walker.
+///
+/// On any failure path -- cache miss, upvalue translation failure,
+/// outer-with refusal, throw inside the body -- return false WITHOUT
+/// mutating vRes.  The tree-walker dispatch then proceeds normally.
+///
+/// MVP scope: handles `fun.isLambda()` with simple-arg lambdas (no
+/// formals).  Lambdas with formals (`{a, b ? def}: ...`) require the
+/// callee to handle attrset destructuring inside the body, which the
+/// lowerer DOES set up -- but the runLambda entry currently passes
+/// the arg as the first slot raw, matching OP_CALL.  So formals
+/// should "just work" since the body's prologue handles the formals
+/// attrset the same way as via OP_CALL.  Verify in tests.
+///
+/// Opt-in via NIX_USE_V3_CALL=1 (matches the v3ForceHook discipline).
+static bool v3CallFunctionEntry(nix::EvalState & state,
+                                 nix::Value & fun,
+                                 nix::Value * arg,
+                                 nix::Value & vRes,
+                                 const nix::PosIdx pos)
+{
+    static const bool useV3Call = []{
+        const char * a = std::getenv("NIX_USE_V3");
+        const char * b = std::getenv("NIX_USE_V3_CALL");
+        return a && std::string_view(a) == "1"
+            && b && std::string_view(b) == "1";
+    }();
+    if (!useV3Call) return false;
+    if (!fun.isLambda()) return false;
+    nix::ExprLambda * lambda = fun.lambda().fun;
+    if (!lambda) return false;
+
+    // Re-entrancy guard: if we're inside a v3 hook already, fall back
+    // to tree-walker.  Mirrors v3ForceEntry's discipline -- nested
+    // re-entries can ladder the C stack across the bridge.
+    static thread_local int s_callDepth = 0;
+    if (s_callDepth > 0) return false;
+    struct DepthGuard {
+        int & d;
+        DepthGuard(int & d_) : d(d_) { ++d; }
+        ~DepthGuard() { --d; }
+    } guard(s_callDepth);
+
+    // Probe the sub-Expr cache by ExprLambda*.  We register lambdas
+    // alongside thunks in v3SubExprCache (lowerLambda + this hook
+    // share the same map) -- the call hook differentiates by AST kind.
+    auto & subCache = v3SubExprCache();
+    auto sit = subCache.find(lambda);
+    if (sit == subCache.end()) return false;
+    auto & ent = sit->second;
+    if (!ent.isLambda) return false; // call hook only handles lambdas
+    if (ent.phaseBFailed) return false;
+    if (ent.outerWithRefused) return false;
+
+    // env at call entry == fun.lambda().env (the lambda's captured env).
+    // upvalueSources offsets are relative to this env, NOT to the env
+    // at the call site (which would be the caller's env).
+    if (!fun.lambda().env) return false;
+    nix::Env & env = *fun.lambda().env;
+
+    // Build upvalues array from upvalueSources.  Mirror the Direct +
+    // RecBuild paths from v3ForceEntry verbatim.  Any failure -> false.
+    std::vector<Value> upvalues;
+    if (ent.nUpvalues != 0) {
+        if (ent.upvalueSources.empty()) return false;
+        try {
+            upvalues.reserve(ent.nUpvalues);
+            for (auto & src : ent.upvalueSources) {
+                nix::Env * cur = &env;
+                for (uint32_t i = 0; i < src.level; ++i) {
+                    if (!cur || !cur->up) return false;
+                    cur = cur->up;
+                }
+                if (!cur) return false;
+                if (src.kind == UpvalueSource::Kind::Direct) {
+                    nix::Value * srcV = cur->values[src.displ];
+                    if (!srcV) return false;
+                    Thunk * bridge = Alloc::allocBridgeThunk(
+                        static_cast<void *>(srcV));
+                    allocStats().thunksAllocated++;
+                    Value entry;
+                    entry.tag_payload =
+                        static_cast<uint64_t>(Tag::Thunk);
+                    entry.payload.thunk = bridge;
+                    upvalues.push_back(entry);
+                } else {
+                    // RecBuild -- mirrors v3ForceEntry exactly, including
+                    // the per-(env, names) Bindings* memo.
+                    if (!src.names || src.names->empty()) return false;
+                    RecBuildCacheKey k{cur, src.names.get()};
+                    auto & cache = recBuildCache();
+                    Bindings * b;
+                    if (auto cit = cache.find(k); cit != cache.end()) {
+                        b = cit->second;
+                    } else {
+                        const auto & names = *src.names;
+                        std::vector<std::pair<SymbolId, Value>> pairs;
+                        pairs.reserve(names.size());
+                        for (uint32_t i = 0; i < names.size(); ++i) {
+                            nix::Value * srcV = cur->values[i];
+                            if (!srcV) return false;
+                            Thunk * bridge = Alloc::allocBridgeThunk(
+                                static_cast<void *>(srcV));
+                            allocStats().thunksAllocated++;
+                            Value vEntry;
+                            vEntry.tag_payload =
+                                static_cast<uint64_t>(Tag::Thunk);
+                            vEntry.payload.thunk = bridge;
+                            pairs.emplace_back(names[i], vEntry);
+                        }
+                        std::sort(pairs.begin(), pairs.end(),
+                            [](auto & a, auto & b) {
+                                return a.first < b.first;
+                            });
+                        b = Alloc::allocBindings(
+                            static_cast<uint32_t>(pairs.size()));
+                        allocStats().attrsetsAllocated++;
+                        for (size_t i = 0; i < pairs.size(); ++i) {
+                            b->entries[i].name  = pairs[i].first;
+                            b->entries[i].value = pairs[i].second;
+                        }
+                        cache.emplace(k, b);
+                    }
+                    Value v;
+                    v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                    v.payload.bindings = b;
+                    upvalues.push_back(v);
+                }
+            }
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
+
+    // Build capturedWiths from outerWithLevels (#416).
+    ListVec * capturedWiths = nullptr;
+    if (!ent.outerWithLevels.empty()) {
+        const auto & lv = ent.outerWithLevels;
+        ListVec * out = Alloc::allocList(static_cast<uint32_t>(lv.size()));
+        allocStats().listsAllocated++;
+        bool ok = true;
+        for (size_t i = 0; i < lv.size(); ++i) {
+            nix::Env * cur = &env;
+            uint32_t levels = lv[i];
+            for (uint32_t k = 0; k < levels; ++k) {
+                if (!cur || !cur->up) { ok = false; break; }
+                cur = cur->up;
+            }
+            if (!ok || !cur) { ok = false; break; }
+            nix::Value * srcV = cur->values[0];
+            if (!srcV) { ok = false; break; }
+            Thunk * bridge = Alloc::allocBridgeThunk(
+                static_cast<void *>(srcV));
+            allocStats().thunksAllocated++;
+            Value entry;
+            entry.tag_payload =
+                static_cast<uint64_t>(Tag::Thunk);
+            entry.payload.thunk = bridge;
+            out->elems[i] = entry;
+        }
+        if (!ok) return false;
+        capturedWiths = out;
+    }
+
+    // Bridge arg.  treeWalkerToV3Public can throw on unsupported value
+    // kinds; treat any failure as fall-back.
+    Value v3Arg;
+    try {
+        if (!arg) return false;
+        v3Arg = treeWalkerToV3Public(state, *arg);
+    } catch (const std::exception &) {
+        return false;
+    }
+
+    // Run the body.
+    setNixEvalState(&state);
+    Value r;
+    try {
+        r = runLambda(*ent.cu, ent.funcIdx, v3Arg,
+            upvalues.data(), static_cast<uint32_t>(upvalues.size()),
+            capturedWiths);
+    } catch (const std::exception &) {
+        // Any throw -> blacklist this lambda for the rest of the
+        // process, fall back.  Mirrors v3ForceEntry's WC-14.6 policy.
+        ent.phaseBFailed = true;
+        return false;
+    } catch (...) {
+        ent.phaseBFailed = true;
+        return false;
+    }
+
+    // Bridge result.
+    nix::Value * tmp = nullptr;
+    try {
+        tmp = v3ToTreeWalkerPublic(state, r);
+    } catch (const std::exception &) {
+        return false;
+    }
+    if (!tmp) return false;
+    vRes = *tmp;
+    (void)pos; // currently unused; could decorate trace messages later.
+    return true;
+}
+
 namespace {
 
 /// Static initializer — runs at library load time.  Once
@@ -1841,6 +2075,14 @@ struct V3HookRegistrar {
         if (const char * v = std::getenv("NIX_USE_V3_FORCE");
             v && std::string_view(v) == "1") {
             nix::EvalState::v3ForceHook = &v3ForceEntry;
+        }
+        // #426 / MED-21: the call-function hook is the dam.  Opt-in
+        // via NIX_USE_V3_CALL=1 while we shake out lambda-shape
+        // failures on real workloads.  Once stable, flip default ON
+        // (kill-switch via NIX_V3_NO_CALL).
+        if (const char * v = std::getenv("NIX_USE_V3_CALL");
+            v && std::string_view(v) == "1") {
+            nix::EvalState::v3CallFunctionHook = &v3CallFunctionEntry;
         }
     }
 };
@@ -1879,6 +2121,11 @@ void installEvalHook()
     if (const char * v = std::getenv("NIX_USE_V3_FORCE");
         v && std::string_view(v) == "1") {
         nix::EvalState::v3ForceHook = &v3ForceEntry;
+    }
+    // #426: opt-in callFunction hook.
+    if (const char * v = std::getenv("NIX_USE_V3_CALL");
+        v && std::string_view(v) == "1") {
+        nix::EvalState::v3CallFunctionHook = &v3CallFunctionEntry;
     }
 }
 } // namespace nix::v3

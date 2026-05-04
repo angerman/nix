@@ -740,6 +740,29 @@ public:
     static V3ForceHook v3ForceHook;
 
     /**
+     * #426 / MED-21: per-call cutover hook.  Called from
+     * `EvalState::callFunction` BEFORE the standard lambda/primop
+     * dispatch.  Lets v3 take over the lambda call when the body
+     * has been (or could be) lowered to v3 bytecode.
+     *
+     * Returns true if v3 handled the call (and filled `vRes`); false
+     * to fall through to the standard tree-walker dispatch.  The
+     * hook MUST consume exactly one argument from `args` and report
+     * how many it consumed via `argsConsumed` (today always 1; future
+     * expansions may consume multiple at once for known-arity v3
+     * closures).  On return, callFunction continues with the
+     * remaining args -- the hook is per-application, not whole-curry.
+     *
+     * Bug-compatible with v3ForceHook: any throw / unsupported case
+     * must return false WITHOUT mutating `vRes` so the tree-walker
+     * dispatch sees an unchanged state.
+     */
+    using V3CallFunctionHook = bool (*)(
+        EvalState & state, Value & fun, Value * arg, Value & vRes,
+        const PosIdx pos);
+    static V3CallFunctionHook v3CallFunctionHook;
+
+    /**
      * Parse-time registration hook.  Fired from `parseExprFromFile` /
      * `parseExprFromString` after a top-level Expr has been parsed,
      * with the SourcePath the parser used as Pos::Origin.  v3 stashes

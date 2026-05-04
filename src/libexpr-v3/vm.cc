@@ -3387,6 +3387,60 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
     }
 }
 
+/// #426: invoke a v3 lambda body Function with one supplied argument.
+/// Mirrors runFunctionWithUpvalues but seeds slot 0 with `arg` so the
+/// body's OP_GET_LOCAL 0 reads the caller-supplied value -- exactly
+/// matching what OP_CALL does at vm.cc:1323-1325.
+Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
+                Value arg,
+                const Value * upvalues, uint32_t nUpvalues,
+                ListVec * capturedWiths)
+{
+    if (funcIdx >= cu.lambdas.size())
+        throw std::runtime_error("v3 runLambda: funcIdx out of range");
+    const auto & desc = cu.lambdas[funcIdx];
+    if (desc.nUpvalues != nUpvalues)
+        throw std::runtime_error("v3 runLambda: nUpvalues mismatch");
+
+    Closure * fakeClo = Alloc::allocClosure(nUpvalues);
+    fakeClo->desc = &desc;
+    fakeClo->cu   = &cu;
+    fakeClo->capturedWiths = capturedWiths;
+    fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
+    for (uint32_t i = 0; i < nUpvalues; ++i)
+        fakeClo->upvalues[i] = upvalues[i];
+
+    VMState vm;
+    vm.valueStack.reserve(64 * 1024);
+    vm.frames.reserve(4096);
+    vm.withStack.reserve(64);
+
+    // Mirror OP_CALL's frame setup: nLocals slots reserved, slot 0 = arg.
+    size_t base = vm.valueStack.size();
+    vm.valueStack.resize(base + desc.nLocals);
+    vm.valueStack[base] = arg;
+
+    vm.frames.push_back(CallFrame{
+        .cu = &cu,
+        .closure = fakeClo,
+        .thunk = nullptr,
+        .ip = desc.codeOffset,
+        .stackBaseOffset = static_cast<uint32_t>(base),
+        .withStackBase = static_cast<uint32_t>(vm.withStack.size()),
+        .flags = 0,
+    });
+    pushCapturedWiths(vm, capturedWiths);
+
+    try {
+        Value r = dispatchLoop(vm, /*exitDepth=*/0);
+        clearBlackMarksOnException(vm, 0);
+        return r;
+    } catch (...) {
+        clearBlackMarksOnException(vm, 0);
+        throw;
+    }
+}
+
 Value forceValue(VMState & vm, Value v)
 {
     // Track the FIRST slot we passed through so we can memoize the

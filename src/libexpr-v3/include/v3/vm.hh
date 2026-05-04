@@ -119,4 +119,23 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
                                const Value * upvalues, uint32_t nUpvalues,
                                ListVec * capturedWiths = nullptr);
 
+/// #426: invoke a v3 lambda body Function with one argument.  Mirrors
+/// runFunctionWithUpvalues but ALSO seeds the function's first slot
+/// with `arg` so the body's OP_GET_LOCAL paramSlot reads the caller-
+/// supplied value.  Used by the tree-walker -> v3 callFunction
+/// cutover hook when applying a tree-walker lambda whose body has
+/// been pre-lowered to v3 IR.
+///
+/// Preconditions: cu.lambdas[funcIdx] must describe a function with
+///   - arity == 1 OR hasFormals == 1 (ie. takes a single argument
+///     or a single attrset)
+///   - nUpvalues == nUpvalues passed in
+///
+/// Behaviour mirrors v3's own OP_CALL: pushes `arg` onto the value
+/// stack, sets up the call frame, runs to OP_RETURN.
+Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
+                Value arg,
+                const Value * upvalues, uint32_t nUpvalues,
+                ListVec * capturedWiths = nullptr);
+
 } // namespace nix::v3

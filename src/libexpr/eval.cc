@@ -1202,6 +1202,7 @@ void EvalState::resetFileCache()
 
 EvalState::V3EvalHook EvalState::v3EvalHook = nullptr;
 EvalState::V3ForceHook EvalState::v3ForceHook = nullptr;
+EvalState::V3CallFunctionHook EvalState::v3CallFunctionHook = nullptr;
 EvalState::V3RegisterExprHook EvalState::v3RegisterExprHook = nullptr;
 
 // WC-14.6: bounded-depth yield state.
@@ -1824,6 +1825,23 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
     while (args.size() > 0) {
 
         if (vCur.isLambda()) {
+
+            // #426 / MED-21: try v3 callFunction cutover BEFORE the
+            // tree-walker lambda dispatch.  The hook returns true iff
+            // it handled this single application (lambda + first arg).
+            // On true, advance args and continue the curry loop with
+            // vRes as the new vCur.  Any failure returns false WITHOUT
+            // mutating vRes; tree-walker dispatch proceeds unchanged.
+            if (v3CallFunctionHook) {
+                Value vCallRes;
+                if (v3CallFunctionHook(*this, vCur, args[0], vCallRes, pos)) {
+                    vCur = vCallRes;
+                    args = args.subspan(1);
+                    if (args.size() > 0)
+                        forceValue(vCur, pos);
+                    continue;
+                }
+            }
 
             ExprLambda & lambda(*vCur.lambda().fun);
 

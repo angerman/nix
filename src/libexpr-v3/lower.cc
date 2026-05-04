@@ -750,6 +750,15 @@ struct Lowerer
             scopes.pop_back();
         }
 
+        // #426 / MED-21: register the lambda's body Function so the
+        // tree-walker -> v3 callFunction cutover can find it.  The
+        // ExprLambda* is the canonical key tree-walker uses (its
+        // Value::lambda().fun field).  Stored alongside subExprFuncs
+        // so the existing populateSubExprCacheLocal sees it and
+        // produces a SubExprCacheEntry; the call-hook differentiates
+        // by AST kind.
+        m.subExprFuncs.push_back({static_cast<const void *>(e), fid});
+
         return addBinding(ir::Lambda{ fid, /*freeVars*/ {} });
     }
     ir::VarId lowerCall(nix::ExprCall * e)
