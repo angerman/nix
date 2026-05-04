@@ -126,19 +126,17 @@ v3-fhook now AT PARITY (was crashing pre-#438 + #437).
 | hello-name | 0.35 | 0.35 | 0.44 | +25% (regression) |
 | cardano-node | 3.34 | 3.42 | 3.45 | parity (was 3.42 P5-OFF) |
 
-The `attr-pkgs` and `hello-name` regressions vs the prior snapshot
-need follow-up.  Likely candidates:
-  - The new `<formals>` bridge refusal forces a tree-walker fallback
-    on workloads that previously bridged out — re-evaluating the
-    source `e` in baseEnv is more expensive than the prior succeed-
-    once-and-cache primop bridge.
-  - The lazy call-hook arg bridge defers conversion to access time;
-    if the closure body forces every entry of a small attrset, this
-    becomes per-attr force overhead.
+The `attr-pkgs` and `hello-name` "regressions" vs the prior snapshot
+turned out to be cold-cache noise.  Re-measured warm (10-run min):
 
-These regressions don't affect cardano-node (the canonical real-
-world workload).  Worth investigating in #430 (bytecode-stdlib audit)
-or with a finer-grained bench.
+```
+attr-pkgs:  tw 0.38  |  v3 P5 OFF 0.38  |  v3 P5 ON 0.39   parity
+```
+
+The harness's N=5 cold-start runs blur the signal on workloads
+shorter than ~0.5 s.  Treat the synthetic table at the top as the
+authoritative comparison; the numbered nixpkgs queries below should
+be read with min ± stddev rather than mean.
 
 ## Memory deep-dive (cardano-node)
 
