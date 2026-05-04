@@ -744,6 +744,15 @@ struct V3HookStats {
     uint64_t forceHookOuterWithBuilt   = 0;
     uint64_t forceHookOuterWithRefused = 0;
     uint64_t forceHookOuterWithEmpty   = 0;
+
+    /// #436: call-hook closure-shape result refusals.  Tracks how
+    /// often v3CallFunctionEntry declined to bridge a Tag::Closure /
+    /// PrimOp / PrimOpApp / Thunk / App / Blackhole result back to
+    /// tree-walker.  Tree-walker re-runs the call natively in those
+    /// cases.  Non-zero is normal (curried lambdas, function-returning
+    /// helpers); spikes correlate with bodies that v3 owns but whose
+    /// consumers expect a forced primitive.
+    uint64_t callHookClosureResultRefused = 0;
 };
 
 V3HookStats & v3HookStats()
@@ -1010,6 +1019,11 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     std::fprintf(stderr,
                         "v3 selector-lambda: fast-path calls=%llu\n",
                         (unsigned long long)selectorCalls);
+                // #436: call-hook closure-result refusals.
+                if (s.callHookClosureResultRefused > 0)
+                    std::fprintf(stderr,
+                        "v3 call-hook: closure-result refused=%llu\n",
+                        (unsigned long long)s.callHookClosureResultRefused);
             });
         }
         return true;
@@ -2023,6 +2037,41 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     } catch (...) {
         ent.phaseBFailed = true;
         return false;
+    }
+
+    // #436: refuse closure-shape results to avoid the
+    // `__v3_call_bridge_1` partial-application leak.  When the v3
+    // body returns a Tag::Closure / Tag::PrimOp / Tag::PrimOpApp /
+    // Tag::Thunk / Tag::App / Tag::Blackhole, v3ToTreeWalkerPublic
+    // would bridge it as a tree-walker mkPrimOpApp(__v3_call_bridge_1,
+    // handle) -- a partially-applied 2-arity primop pretending to be
+    // a function value.  That works when the consumer is callFunction
+    // again, but explodes when the consumer is `evalBool` or
+    // similar coerce-to-X (cardano-node hits this on
+    // `assert enableGold -> withGold stdenv.targetPlatform`).
+    //
+    // Mirrors v3ForceEntry's result switch (vm.cc:1875-1908) which
+    // already declines closure-shape results for the same reason.
+    // Tree-walker re-runs the call natively when we return false.
+    //
+    // Stat counter: forceHookClosureResultRefused tracks how often
+    // this path fires, so we can spot regressions where v3 bodies
+    // start returning closures more frequently.
+    {
+        Tag rt = r.tag();
+        if (rt == Tag::Closure || rt == Tag::PrimOp || rt == Tag::PrimOpApp
+            || rt == Tag::Thunk || rt == Tag::App || rt == Tag::Blackhole)
+        {
+            v3HookStats().callHookClosureResultRefused++;
+            static const bool diagCall =
+                std::getenv("V3_DEBUG_CALL_RESULT") != nullptr;
+            if (diagCall) {
+                std::fprintf(stderr,
+                    "v3 call-hook closure-shape result tag=%d lambda=%p\n",
+                    (int)rt, (void *)lambda);
+            }
+            return false;
+        }
     }
 
     // Bridge result.

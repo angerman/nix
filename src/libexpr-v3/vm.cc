@@ -2728,6 +2728,35 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     "v3 OP_REC_BINDING_SLOT_REF: name '" + nm
                     + "' not found in source attrset");
             }
+            // #437 diagnostic: track repeated slot derefs on the same
+            // (bindings, sym) pair within a single eval.  Under
+            // NIX_V3_INLINE_REC_SLOT, the inline path lacks the Thunk
+            // identity that pins recursion via Blackhole; if cardano-
+            // node hits this opcode N>>1 times for the same key, the
+            // hypothesis from the agent analysis is confirmed.  Gated
+            // on V3_DBG_INLINE_REC=1; thread-local state is fine since
+            // the VM is single-threaded.  Reports when re-entry count
+            // for a key crosses 4.
+            {
+                static const bool s_dbg_inline_rec =
+                    std::getenv("V3_DBG_INLINE_REC") != nullptr;
+                if (__builtin_expect(s_dbg_inline_rec, 0)) [[unlikely]] {
+                    static thread_local std::unordered_map<
+                        uint64_t, uint32_t> reentries;
+                    uint64_t key = (reinterpret_cast<uint64_t>(b) << 24)
+                        ^ static_cast<uint64_t>(sym);
+                    auto & cnt = reentries[key];
+                    ++cnt;
+                    if (cnt > 4 && (cnt & (cnt - 1)) == 0) {
+                        const auto & tbl = ir::globalSymbolTable();
+                        std::string nm = (sym < tbl.size()) ? tbl[sym] : "?";
+                        std::fprintf(stderr,
+                            "v3 inline-rec re-entry #%u: bindings=%p sym='%s' frames=%zu ip=%u\n",
+                            cnt, (void *)b, nm.c_str(),
+                            vm.frames.size(), ip - 1);
+                    }
+                }
+            }
             Value v;
             v.mkSlot(found);
             push(vm, v);
