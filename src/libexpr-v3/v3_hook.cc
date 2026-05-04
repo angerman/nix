@@ -1454,6 +1454,166 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 /// entries by walking tree-walker's `env` to materialise the v3
 /// upvalues array at hook time.  Until that lands, freeVars-bearing
 /// entries are signalled via forceSkippedNeedsUpvalues.
+// ---------------------------------------------------------------------------
+// Shared hook-entry helper: assemble v3 upvalues + capturedWiths from
+// a tree-walker `env` and a populated SubExprCacheEntry.  Used by
+// both v3ForceEntry (force a thunk body) and v3CallFunctionEntry
+// (call a lambda body); the assembly logic is identical so we route
+// through one place to keep the two hooks bug-compatible.
+//
+// Returns Ok on success.  On any non-Ok return, `upvalues` and
+// `capturedWiths` are valid-but-undefined; the caller treats this as
+// fall-back-to-tree-walker.  Stats counters are bumped at every
+// success site (Direct / RecBuild / outer-with built / outer-with
+// trivial-empty); refusal stats are the caller's responsibility
+// since they map to caller-specific skipReturn slots.
+// ---------------------------------------------------------------------------
+
+enum class HookPrepResult : uint8_t
+{
+    Ok,
+    NoUpvalueSources,        // entry.nUpvalues > 0 but upvalueSources empty
+    EnvWalkLevelTooDeep,     // walking env.up off the chain
+    EnvValueNull,            // cur->values[i] was null where required
+    TwToV3ConversionThrew,   // upvalue assembly threw
+    OuterWithEnvWalkOff,     // outer-with chain walked past env top
+};
+
+static HookPrepResult prepHookUpvaluesAndWiths(
+    nix::Env & env,
+    const SubExprCacheEntry & ent,
+    std::vector<Value> & upvalues,
+    ListVec *& capturedWiths,
+    bool & sawRecBuild,
+    bool outerWithEnabled)
+{
+    auto & st = v3HookStats();
+    upvalues.clear();
+    capturedWiths = nullptr;
+    sawRecBuild = false;
+
+    if (ent.nUpvalues != 0) {
+        if (ent.upvalueSources.empty())
+            return HookPrepResult::NoUpvalueSources;
+        try {
+            upvalues.reserve(ent.nUpvalues);
+            for (auto & src : ent.upvalueSources) {
+                nix::Env * cur = &env;
+                for (uint32_t i = 0; i < src.level; ++i) {
+                    if (!cur || !cur->up)
+                        return HookPrepResult::EnvWalkLevelTooDeep;
+                    cur = cur->up;
+                }
+                if (!cur)
+                    return HookPrepResult::EnvWalkLevelTooDeep;
+                if (src.kind == UpvalueSource::Kind::Direct) {
+                    st.forceHookDirectUpvalues++;
+                    nix::Value * srcV = cur->values[src.displ];
+                    if (!srcV)
+                        return HookPrepResult::EnvValueNull;
+                    // WC-25: defer the force.  Bridge thunk wraps the
+                    // tree-walker Value*; OP_FORCE on the slot
+                    // resolves on demand via forceBridgeThunk.
+                    Thunk * bridge = Alloc::allocBridgeThunk(
+                        static_cast<void *>(srcV));
+                    allocStats().thunksAllocated++;
+                    Value entry;
+                    entry.tag_payload =
+                        static_cast<uint64_t>(Tag::Thunk);
+                    entry.payload.thunk = bridge;
+                    upvalues.push_back(entry);
+                } else {
+                    st.forceHookRecBuildUpvalues++;
+                    sawRecBuild = true;
+                    // WC-10 (Option 1): build a v3 Bindings* whose
+                    // entries are Bridge thunks (lazy bridge).  MED-17
+                    // memoises by (env, names) so repeat forces of
+                    // the same per-thunk function reuse the Bindings*.
+                    if (!src.names || src.names->empty())
+                        return HookPrepResult::NoUpvalueSources;
+                    RecBuildCacheKey k{cur, src.names.get()};
+                    auto & cache = recBuildCache();
+                    Bindings * b;
+                    if (auto cit = cache.find(k); cit != cache.end()) {
+                        b = cit->second;
+                    } else {
+                        const auto & names = *src.names;
+                        std::vector<std::pair<SymbolId, Value>> pairs;
+                        pairs.reserve(names.size());
+                        for (uint32_t i = 0; i < names.size(); ++i) {
+                            nix::Value * srcV = cur->values[i];
+                            if (!srcV)
+                                return HookPrepResult::EnvValueNull;
+                            Thunk * bridge = Alloc::allocBridgeThunk(
+                                static_cast<void *>(srcV));
+                            allocStats().thunksAllocated++;
+                            Value entry;
+                            entry.tag_payload =
+                                static_cast<uint64_t>(Tag::Thunk);
+                            entry.payload.thunk = bridge;
+                            pairs.emplace_back(names[i], entry);
+                        }
+                        std::sort(pairs.begin(), pairs.end(),
+                            [](auto & a, auto & b) {
+                                return a.first < b.first;
+                            });
+                        b = Alloc::allocBindings(
+                            static_cast<uint32_t>(pairs.size()));
+                        allocStats().attrsetsAllocated++;
+                        for (size_t i = 0; i < pairs.size(); ++i) {
+                            b->entries[i].name  = pairs[i].first;
+                            b->entries[i].value = pairs[i].second;
+                        }
+                        cache.emplace(k, b);
+                    }
+                    Value v;
+                    v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                    v.payload.bindings = b;
+                    upvalues.push_back(v);
+                }
+            }
+        } catch (const std::exception &) {
+            return HookPrepResult::TwToV3ConversionThrew;
+        }
+    }
+
+    // #416: capturedWiths from outerWithLevels.
+    if (outerWithEnabled && ent.outerWithLevels.empty()) {
+        st.forceHookOuterWithEmpty++;
+    }
+    if (outerWithEnabled && !ent.outerWithLevels.empty()) {
+        st.forceHookOuterWithBuilt++;
+        const auto & lv = ent.outerWithLevels;
+        ListVec * out = Alloc::allocList(static_cast<uint32_t>(lv.size()));
+        allocStats().listsAllocated++;
+        for (size_t i = 0; i < lv.size(); ++i) {
+            nix::Env * cur = &env;
+            uint32_t levels = lv[i];
+            for (uint32_t k = 0; k < levels; ++k) {
+                if (!cur || !cur->up)
+                    return HookPrepResult::OuterWithEnvWalkOff;
+                cur = cur->up;
+            }
+            if (!cur)
+                return HookPrepResult::OuterWithEnvWalkOff;
+            nix::Value * srcV = cur->values[0];
+            if (!srcV)
+                return HookPrepResult::OuterWithEnvWalkOff;
+            Thunk * bridge = Alloc::allocBridgeThunk(
+                static_cast<void *>(srcV));
+            allocStats().thunksAllocated++;
+            Value entry;
+            entry.tag_payload =
+                static_cast<uint64_t>(Tag::Thunk);
+            entry.payload.thunk = bridge;
+            out->elems[i] = entry;
+        }
+        capturedWiths = out;
+    }
+
+    return HookPrepResult::Ok;
+}
+
 static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
                           nix::Env & env, nix::Value & v)
 {
@@ -1581,153 +1741,24 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
             st.forceHookOuterWithRefused++;
             return skipPermanently(6);
         }
-        if (ent.nUpvalues != 0) {
-            if (ent.upvalueSources.empty()) {
-                // WC-26: synthesized rec/with/inheritFrom upvalues —
-                // permanent skip, clear the candidate flag.
-                return skipPermanently(1);
-            }
-            // CO-2 phase B + WC-2-followup: walk tree-walker's env
-            // per upvalueSource to materialise the v3 upvalues array.
-            try {
-                upvalues.reserve(ent.nUpvalues);
-                for (auto & src : ent.upvalueSources) {
-                    nix::Env * cur = &env;
-                    for (uint32_t i = 0; i < src.level; ++i) {
-                        if (!cur || !cur->up) return skipReturn(2);
-                        cur = cur->up;
-                    }
-                    if (!cur) return skipReturn(2);
-                    if (src.kind == UpvalueSource::Kind::Direct) {
-                        st.forceHookDirectUpvalues++;
-                        nix::Value * srcV = cur->values[src.displ];
-                        if (!srcV) return skipReturn(3);
-                        // WC-25: defer the force.  Eagerly forcing the
-                        // tree-walker upvalue at hook entry triggered the
-                        // WC-23 args cycle in callPackageWith — v3's force
-                        // schedule diverged from tree-walker's lazy
-                        // semantics.  Allocate a Bridge thunk holding
-                        // nix::Value*; OP_FORCE on the slot resolves on
-                        // demand via forceBridgeThunk (primops.cc).
-                        // Mirrors the RecBuild path below.  REVIEW-COMP
-                        // §8.6: the V3_NO_DEFER_UPVALUE A/B gate is
-                        // removed; defer-via-Bridge is the verified-
-                        // correct default.
-                        Thunk * bridge = Alloc::allocBridgeThunk(
-                            static_cast<void *>(srcV));
-                        allocStats().thunksAllocated++;
-                        Value entry;
-                        entry.tag_payload =
-                            static_cast<uint64_t>(Tag::Thunk);
-                        entry.payload.thunk = bridge;
-                        upvalues.push_back(entry);
-                    } else {
-                        st.forceHookRecBuildUpvalues++;
-                        sawRecBuild = true;
-                        // WC-10 (Option 1): build a v3 Bindings*
-                        // whose entries are Bridge thunks that only
-                        // force on access.  Each thunk holds a
-                        // `nix::Value *` to the corresponding rec
-                        // entry; OP_FORCE on the thunk re-enters
-                        // tree-walker for that single value via
-                        // forceBridgeThunk (defined in primops.cc).
-                        //
-                        // This replaces the previous eager-bridge
-                        // attempts that SIGSEGV'd because forcing
-                        // every rec entry up front triggered tree-
-                        // walker's deep mkDerivation recursion
-                        // chains.  Lazy bridging means only entries
-                        // the v3 thunk's body actually accesses pay
-                        // the bridge cost — typically 1–2 of N.
-                        if (!src.names || src.names->empty()) return skipReturn(1);
-                        // REVIEW MED-17: memoize the per-(env, names)
-                        // Bindings*.  Tree-walker's env values are
-                        // identity-stable across forces, so the second
-                        // and later forces of the same per-thunk
-                        // function with the same enclosing env can
-                        // reuse the previously-built Bindings + Bridge
-                        // thunks.
-                        RecBuildCacheKey k{cur, src.names.get()};
-                        auto & cache = recBuildCache();
-                        Bindings * b;
-                        if (auto cit = cache.find(k); cit != cache.end()) {
-                            b = cit->second;
-                        } else {
-                            const auto & names = *src.names;
-                            std::vector<std::pair<SymbolId, Value>> pairs;
-                            pairs.reserve(names.size());
-                            for (uint32_t i = 0; i < names.size(); ++i) {
-                                nix::Value * srcV = cur->values[i];
-                                if (!srcV) return skipReturn(3);
-                                // Allocate a Bridge thunk per entry —
-                                // no eager forceValue, no eager bridge.
-                                Thunk * bridge = Alloc::allocBridgeThunk(
-                                    static_cast<void *>(srcV));
-                                allocStats().thunksAllocated++;
-                                Value entry;
-                                entry.tag_payload =
-                                    static_cast<uint64_t>(Tag::Thunk);
-                                entry.payload.thunk = bridge;
-                                pairs.emplace_back(names[i], entry);
-                            }
-                            std::sort(pairs.begin(), pairs.end(),
-                                [](auto & a, auto & b) {
-                                    return a.first < b.first;
-                                });
-                            b = Alloc::allocBindings(
-                                static_cast<uint32_t>(pairs.size()));
-                            allocStats().attrsetsAllocated++;
-                            for (size_t i = 0; i < pairs.size(); ++i) {
-                                b->entries[i].name  = pairs[i].first;
-                                b->entries[i].value = pairs[i].second;
-                            }
-                            cache.emplace(k, b);
-                        }
-                        Value v;
-                        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                        v.payload.bindings = b;
-                        upvalues.push_back(v);
-                    }
-                }
-            } catch (const std::exception &) {
-                return skipReturn(4);
-            }
-        }
-        // #416: build the capturedWiths ListVec by walking env per the
-        // pre-computed outerWithLevels.  Each level becomes a Bridge
-        // thunk wrapping the tree-walker `nix::Value*` at env->values[0]
-        // -- mirrors the Direct upvalue path so the with-attrset is
-        // forced lazily by OP_WITH_LOOKUP.
-        if (outerWithEnabled && ent.outerWithLevels.empty()) {
-            st.forceHookOuterWithEmpty++;
-        }
-        if (outerWithEnabled && !ent.outerWithLevels.empty()) {
-            st.forceHookOuterWithBuilt++;
-            const auto & lv = ent.outerWithLevels;
-            ListVec * out = Alloc::allocList(static_cast<uint32_t>(lv.size()));
-            allocStats().listsAllocated++;
-            bool ok = true;
-            for (size_t i = 0; i < lv.size(); ++i) {
-                nix::Env * cur = &env;
-                uint32_t levels = lv[i];
-                for (uint32_t k = 0; k < levels; ++k) {
-                    if (!cur || !cur->up) { ok = false; break; }
-                    cur = cur->up;
-                }
-                if (!ok || !cur) { ok = false; break; }
-                nix::Value * srcV = cur->values[0];
-                if (!srcV) { ok = false; break; }
-                Thunk * bridge = Alloc::allocBridgeThunk(
-                    static_cast<void *>(srcV));
-                allocStats().thunksAllocated++;
-                Value entry;
-                entry.tag_payload =
-                    static_cast<uint64_t>(Tag::Thunk);
-                entry.payload.thunk = bridge;
-                out->elems[i] = entry;
-            }
-            if (!ok) return skipReturn(7);
-            capturedWiths = out;
+        // #426 refactor: assembly factored into prepHookUpvaluesAndWiths
+        // so the call hook (v3CallFunctionEntry) shares the exact same
+        // logic.  WC-26 noUpvalueSources still permanently skips here;
+        // other failure modes are per-call (env walk fell off, value
+        // null, conversion threw).
+        switch (prepHookUpvaluesAndWiths(env, ent, upvalues, capturedWiths,
+                                          sawRecBuild, outerWithEnabled)) {
+        case HookPrepResult::Ok: break;
+        case HookPrepResult::NoUpvalueSources:
+            return skipPermanently(1);
+        case HookPrepResult::EnvWalkLevelTooDeep:
+            return skipReturn(2);
+        case HookPrepResult::EnvValueNull:
+            return skipReturn(3);
+        case HookPrepResult::TwToV3ConversionThrew:
+            return skipReturn(4);
+        case HookPrepResult::OuterWithEnvWalkOff:
+            return skipReturn(7);
         }
         cu      = ent.cu;
         funcIdx = ent.funcIdx;
@@ -1900,108 +1931,19 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     if (!fun.lambda().env) return false;
     nix::Env & env = *fun.lambda().env;
 
-    // Build upvalues array from upvalueSources.  Mirror the Direct +
-    // RecBuild paths from v3ForceEntry verbatim.  Any failure -> false.
+    // Assembly factored into prepHookUpvaluesAndWiths so the call hook
+    // shares the exact same Direct / RecBuild / outer-with logic as
+    // v3ForceEntry.  Any non-Ok result -> fall back to tree-walker.
+    static const bool outerWithEnabled = []{
+        return std::getenv("NIX_V3_NO_OUTER_WITH") == nullptr;
+    }();
     std::vector<Value> upvalues;
-    if (ent.nUpvalues != 0) {
-        if (ent.upvalueSources.empty()) return false;
-        try {
-            upvalues.reserve(ent.nUpvalues);
-            for (auto & src : ent.upvalueSources) {
-                nix::Env * cur = &env;
-                for (uint32_t i = 0; i < src.level; ++i) {
-                    if (!cur || !cur->up) return false;
-                    cur = cur->up;
-                }
-                if (!cur) return false;
-                if (src.kind == UpvalueSource::Kind::Direct) {
-                    nix::Value * srcV = cur->values[src.displ];
-                    if (!srcV) return false;
-                    Thunk * bridge = Alloc::allocBridgeThunk(
-                        static_cast<void *>(srcV));
-                    allocStats().thunksAllocated++;
-                    Value entry;
-                    entry.tag_payload =
-                        static_cast<uint64_t>(Tag::Thunk);
-                    entry.payload.thunk = bridge;
-                    upvalues.push_back(entry);
-                } else {
-                    // RecBuild -- mirrors v3ForceEntry exactly, including
-                    // the per-(env, names) Bindings* memo.
-                    if (!src.names || src.names->empty()) return false;
-                    RecBuildCacheKey k{cur, src.names.get()};
-                    auto & cache = recBuildCache();
-                    Bindings * b;
-                    if (auto cit = cache.find(k); cit != cache.end()) {
-                        b = cit->second;
-                    } else {
-                        const auto & names = *src.names;
-                        std::vector<std::pair<SymbolId, Value>> pairs;
-                        pairs.reserve(names.size());
-                        for (uint32_t i = 0; i < names.size(); ++i) {
-                            nix::Value * srcV = cur->values[i];
-                            if (!srcV) return false;
-                            Thunk * bridge = Alloc::allocBridgeThunk(
-                                static_cast<void *>(srcV));
-                            allocStats().thunksAllocated++;
-                            Value vEntry;
-                            vEntry.tag_payload =
-                                static_cast<uint64_t>(Tag::Thunk);
-                            vEntry.payload.thunk = bridge;
-                            pairs.emplace_back(names[i], vEntry);
-                        }
-                        std::sort(pairs.begin(), pairs.end(),
-                            [](auto & a, auto & b) {
-                                return a.first < b.first;
-                            });
-                        b = Alloc::allocBindings(
-                            static_cast<uint32_t>(pairs.size()));
-                        allocStats().attrsetsAllocated++;
-                        for (size_t i = 0; i < pairs.size(); ++i) {
-                            b->entries[i].name  = pairs[i].first;
-                            b->entries[i].value = pairs[i].second;
-                        }
-                        cache.emplace(k, b);
-                    }
-                    Value v;
-                    v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                    v.payload.bindings = b;
-                    upvalues.push_back(v);
-                }
-            }
-        } catch (const std::exception &) {
-            return false;
-        }
-    }
-
-    // Build capturedWiths from outerWithLevels (#416).
     ListVec * capturedWiths = nullptr;
-    if (!ent.outerWithLevels.empty()) {
-        const auto & lv = ent.outerWithLevels;
-        ListVec * out = Alloc::allocList(static_cast<uint32_t>(lv.size()));
-        allocStats().listsAllocated++;
-        bool ok = true;
-        for (size_t i = 0; i < lv.size(); ++i) {
-            nix::Env * cur = &env;
-            uint32_t levels = lv[i];
-            for (uint32_t k = 0; k < levels; ++k) {
-                if (!cur || !cur->up) { ok = false; break; }
-                cur = cur->up;
-            }
-            if (!ok || !cur) { ok = false; break; }
-            nix::Value * srcV = cur->values[0];
-            if (!srcV) { ok = false; break; }
-            Thunk * bridge = Alloc::allocBridgeThunk(
-                static_cast<void *>(srcV));
-            allocStats().thunksAllocated++;
-            Value entry;
-            entry.tag_payload =
-                static_cast<uint64_t>(Tag::Thunk);
-            entry.payload.thunk = bridge;
-            out->elems[i] = entry;
-        }
-        if (!ok) return false;
-        capturedWiths = out;
+    bool sawRecBuild = false;
+    if (prepHookUpvaluesAndWiths(env, ent, upvalues, capturedWiths,
+                                  sawRecBuild, outerWithEnabled)
+        != HookPrepResult::Ok) {
+        return false;
     }
 
     // Bridge arg.  treeWalkerToV3Public can throw on unsupported value
