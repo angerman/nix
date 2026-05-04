@@ -3023,8 +3023,27 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         out.payload.list = lv;
         seen[key] = out; // store before recursing
         auto view = nv.listView();
-        for (size_t i = 0; i < n; ++i)
+        // #438 diagnostic: catch null list-element pointers BEFORE the
+        // dereference crash.  A tree-walker list whose backing storage
+        // has a null entry usually means either a v3-bridged list whose
+        // slot was never filled, or a tree-walker list whose elements
+        // were reclaimed by GC.  When V3_DEBUG_LIST_BRIDGE is set we
+        // log + abort with full context so the crash is attributable.
+        // Otherwise we fall through to the original dereference (so the
+        // SIGSEGV stack still pinpoints `Value::isThunk` for stack-trace
+        // tooling).
+        static const bool s_dbg_list = std::getenv("V3_DEBUG_LIST_BRIDGE") != nullptr;
+        for (size_t i = 0; i < n; ++i) {
+            if (__builtin_expect(s_dbg_list && view[i] == nullptr, 0)) [[unlikely]] {
+                std::fprintf(stderr,
+                    "v3 treeWalkerToV3: NULL list elem at i=%zu of n=%zu "
+                    "(parent list=%p)\n",
+                    i, n, (void *)&nv);
+                std::fflush(stderr);
+                std::abort();
+            }
             lv->elems[i] = treeWalkerToV3(state, *view[i], seen);
+        }
         return out;
     }
     case nix::nAttrs: {
@@ -5595,6 +5614,42 @@ Value forceBridgeThunk(Thunk * t)
         throw std::runtime_error(
             "v3 forceBridgeThunk: no tree-walker EvalState wired");
     auto * srcV = static_cast<nix::Value *>(t->bridgeSrc);
+    // #438 diagnostic: dump the tree-walker source's raw layout right
+    // before bridging.  If a Bridge source has been reclaimed and its
+    // memory reused, `srcV->type()` returns garbage and the recursive
+    // `treeWalkerToV3` walks into impossible territory (e.g., a list
+    // whose `bigList.size` is a stray pointer).
+    static const bool s_dbg_bridge =
+        std::getenv("V3_DEBUG_BRIDGE_SRC") != nullptr;
+    if (__builtin_expect(s_dbg_bridge, 0)) [[unlikely]] {
+        const uint64_t * raw = reinterpret_cast<const uint64_t *>(srcV);
+        // Read payload atomically into locals, then derive everything
+        // from those snapshots, so the dump and the type() call agree.
+        uint64_t p0 = raw[0];
+        uint64_t p1 = raw[1];
+        uint32_t pd = (uint32_t)(p0 & 0x7);
+        int twType = -1;
+        try { twType = (int)srcV->type(); } catch (...) { twType = -2; }
+        std::fprintf(stderr,
+            "v3 forceBridgeThunk thunk=%p src=%p type=%d pd=%u p0=%016llx p1=%016llx\n",
+            (void *)t, (void *)srcV,
+            twType, pd,
+            (unsigned long long)p0,
+            (unsigned long long)p1);
+        // #438: if the source's primary discriminator is 0, the Value
+        // is uninitialized.  Forcing it leads to UB-fueled chaos
+        // (treeWalkerToV3 falls into a phony case based on whatever
+        //  `type()` decides under the unreachable assumption).  Abort
+        // here so an attached debugger gets the v3 force stack and the
+        // ExprVar/callsite that triggered the force.
+        if (__builtin_expect(pd == 0, 0)) [[unlikely]] {
+            std::fprintf(stderr,
+                "v3 forceBridgeThunk: UNINITIALIZED bridge src "
+                "(pd=0) — aborting for backtrace\n");
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
     return treeWalkerToV3Public(*tlNixEvalState, *srcV);
 }
 

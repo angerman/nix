@@ -1534,15 +1534,26 @@ enum class HookPrepResult : uint8_t
     EnvValueNull,            // cur->values[i] was null where required
     TwToV3ConversionThrew,   // upvalue assembly threw
     OuterWithEnvWalkOff,     // outer-with chain walked past env top
+    LevelBelowEnvBase,       // #438: src.level < envBaseLevel (call-hook only)
 };
 
+/// `envBaseLevel` describes which tree-walker level the caller's `env`
+/// argument represents.  Force-hook starts at the thunk's captured env
+/// which IS the body's formal env (= tree-walker level 0), so
+/// envBaseLevel=0.  Call-hook starts at `fun.lambda().env` which is the
+/// PARENT of the formal env tree-walker would build at this call site
+/// (= tree-walker level 1), so envBaseLevel=1.  This field exists to
+/// fix the #438 cardano-node crash where the call hook walked one level
+/// too far up the env chain and read unrelated (often uninitialized)
+/// slots from the wrong env.
 static HookPrepResult prepHookUpvaluesAndWiths(
     nix::Env & env,
     const SubExprCacheEntry & ent,
     std::vector<Value> & upvalues,
     ListVec *& capturedWiths,
     bool & sawRecBuild,
-    bool outerWithEnabled)
+    bool outerWithEnabled,
+    uint32_t envBaseLevel = 0)
 {
     auto & st = v3HookStats();
     upvalues.clear();
@@ -1561,8 +1572,18 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                     upvalues.push_back(getBuiltinsValue());
                     continue;
                 }
+                // #438: walk `src.level - envBaseLevel` levels.  In the
+                // force hook envBaseLevel=0 so the walk is `src.level`.
+                // In the call hook envBaseLevel=1 (because lambda.env is
+                // already the formal env's parent), so the walk is one
+                // less.  src.level < envBaseLevel means the upvalue lives
+                // in an env that doesn't exist at hook entry (the formal
+                // env tree-walker would build) -- refuse.
+                if (src.level < envBaseLevel)
+                    return HookPrepResult::LevelBelowEnvBase;
+                uint32_t walkSteps = src.level - envBaseLevel;
                 nix::Env * cur = &env;
-                for (uint32_t i = 0; i < src.level; ++i) {
+                for (uint32_t i = 0; i < walkSteps; ++i) {
                     if (!cur || !cur->up)
                         return HookPrepResult::EnvWalkLevelTooDeep;
                     cur = cur->up;
@@ -1574,6 +1595,26 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                     nix::Value * srcV = cur->values[src.displ];
                     if (!srcV)
                         return HookPrepResult::EnvValueNull;
+                    // #438 diagnostic: refuse to wrap an uninitialized
+                    // tree-walker Value -- forcing such a bridge later
+                    // walks UB-territory inside `Value::type()`.
+                    {
+                        const uint64_t * raw =
+                            reinterpret_cast<const uint64_t *>(srcV);
+                        if (__builtin_expect((raw[0] & 0x7) == 0, 0))
+                            [[unlikely]] {
+                            static const bool s_dbg_alloc =
+                                std::getenv("V3_DEBUG_ALLOC_BRIDGE") != nullptr;
+                            if (s_dbg_alloc) {
+                                std::fprintf(stderr,
+                                    "v3 prepHookUpvalues Direct: UNINIT "
+                                    "srcV=%p displ=%u level=%u\n",
+                                    (void *)srcV, src.displ, src.level);
+                                std::fflush(stderr);
+                                std::abort();
+                            }
+                        }
+                    }
                     // WC-25: defer the force.  Bridge thunk wraps the
                     // tree-walker Value*; OP_FORCE on the slot
                     // resolves on demand via forceBridgeThunk.
@@ -1607,6 +1648,43 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                             nix::Value * srcV = cur->values[i];
                             if (!srcV)
                                 return HookPrepResult::EnvValueNull;
+                            {
+                                const uint64_t * raw =
+                                    reinterpret_cast<const uint64_t *>(srcV);
+                                if (__builtin_expect((raw[0] & 0x7) == 0, 0))
+                                    [[unlikely]] {
+                                    static const bool s_dbg_alloc =
+                                        std::getenv("V3_DEBUG_ALLOC_BRIDGE") != nullptr;
+                                    if (s_dbg_alloc) {
+                                        const auto & symTab =
+                                            ir::globalSymbolTable();
+                                        std::fprintf(stderr,
+                                            "v3 prepHookUpvalues RecBuild: "
+                                            "UNINIT srcV=%p i=%u nNames=%zu cur=%p src.level=%u envStart=%p\n",
+                                            (void *)srcV, i, names.size(),
+                                            (void *)cur, src.level, (void *)&env);
+                                        for (size_t j = 0; j < names.size(); ++j) {
+                                            auto sid = names[j];
+                                            std::string_view nm = sid < symTab.size()
+                                                ? std::string_view(symTab[sid])
+                                                : std::string_view("?");
+                                            nix::Value * sv = cur->values[j];
+                                            uint64_t p0 = sv ? ((const uint64_t*)sv)[0] : 0;
+                                            uint64_t p1 = sv ? ((const uint64_t*)sv)[1] : 0;
+                                            std::fprintf(stderr,
+                                                "  names[%zu]='%.*s' slotPtr=%p p0=%016llx p1=%016llx pd=%u\n",
+                                                j,
+                                                (int)nm.size(), nm.data(),
+                                                (void *)sv,
+                                                (unsigned long long)p0,
+                                                (unsigned long long)p1,
+                                                (unsigned)(p0 & 0x7));
+                                        }
+                                        std::fflush(stderr);
+                                        std::abort();
+                                    }
+                                }
+                            }
                             Thunk * bridge = Alloc::allocBridgeThunk(
                                 static_cast<void *>(srcV));
                             allocStats().thunksAllocated++;
@@ -1650,8 +1728,11 @@ static HookPrepResult prepHookUpvaluesAndWiths(
         ListVec * out = Alloc::allocList(static_cast<uint32_t>(lv.size()));
         allocStats().listsAllocated++;
         for (size_t i = 0; i < lv.size(); ++i) {
+            // #438: same envBaseLevel correction as the upvalue walks.
+            if (lv[i] < envBaseLevel)
+                return HookPrepResult::LevelBelowEnvBase;
+            uint32_t levels = lv[i] - envBaseLevel;
             nix::Env * cur = &env;
-            uint32_t levels = lv[i];
             for (uint32_t k = 0; k < levels; ++k) {
                 if (!cur || !cur->up)
                     return HookPrepResult::OuterWithEnvWalkOff;
@@ -1822,6 +1903,11 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
             return skipReturn(4);
         case HookPrepResult::OuterWithEnvWalkOff:
             return skipReturn(7);
+        case HookPrepResult::LevelBelowEnvBase:
+            // #438: only the call hook passes envBaseLevel=1; force
+            // hook is envBaseLevel=0, so this can't fire here.  Treat
+            // as a permanent skip just in case.
+            return skipPermanently(8);
         }
         cu      = ent.cu;
         funcIdx = ent.funcIdx;
@@ -2006,8 +2092,12 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     std::vector<Value> upvalues;
     ListVec * capturedWiths = nullptr;
     bool sawRecBuild = false;
+    // #438: call hook starts at lambda.env (= the formal env's parent
+    // tree-walker would build = level 1), so pass envBaseLevel=1 to
+    // compensate the env walk.
     if (prepHookUpvaluesAndWiths(env, ent, upvalues, capturedWiths,
-                                  sawRecBuild, outerWithEnabled)
+                                  sawRecBuild, outerWithEnabled,
+                                  /*envBaseLevel=*/1)
         != HookPrepResult::Ok) {
         return false;
     }
