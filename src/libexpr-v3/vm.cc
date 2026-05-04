@@ -831,32 +831,35 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_GET_LOCAL_FORCE: {
             // Superinstruction: GET_LOCAL + FORCE.  Push the slot value
-            // and apply the FORCE fast path inline.
+            // and apply the FORCE fast path inline.  Hot path:
+            // tag != Thunk/App/Slot -> just push.  Cold paths route
+            // through op_force_slow.
             //
-            // V3_DBG_FORCE_SITE: trace the lower.cc emit-site that
-            // synthesised this fused force.  See dbgLogForceSite().
-            dbgLogForceSite(cu, ip - 1, &vm.valueStack[stackBase + operand]);
-            //
-            // WC-38 experiment: NIX_V3_NO_GETFORCE_SUPER=1 turns this
-            // into a plain OP_GET_LOCAL (skip the force).  Used to
-            // identify whether the superinstruction emits forces in
-            // sites where tree-walker would leave the value lazy.
-            static const bool s_skipForce =
-                std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
-            if (s_skipForce) {
-                push(vm, vm.valueStack[stackBase + operand]);
-                break;
-            }
+            // Profile-guided ordering: the diagnostic env-var checks
+            // (V3_DBG_FORCE_SITE / V3_DBG_GETFORCE_TAG /
+            //  NIX_V3_NO_GETFORCE_SUPER) are statically false in
+            // production, so we only consult them after the hot
+            // fast-path bails out.
             const Value & v = vm.valueStack[stackBase + operand];
             Tag t = v.tag();
-            // V3_DBG_GETFORCE_TAG=DEPTH — at frame depth >= N, log
-            // GET_LOCAL_FORCE that finds a Thunk-shape value (would
-            // trigger a force).  Helpful for diagnosing which sites
-            // unexpectedly force-cascade in nixpkgs.
+            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
+                push(vm, v);
+                break;
+            }
+            // Slow path (cold): diagnostics + the slow force.  Static
+            // env-var checks live here so the fast path doesn't pay
+            // the load + branch on every iteration.
+            dbgLogForceSite(cu, ip - 1, &vm.valueStack[stackBase + operand]);
+            static const bool s_skipForce =
+                std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
+            if (__builtin_expect(s_skipForce, 0)) [[unlikely]] {
+                push(vm, v);
+                break;
+            }
             {
                 static const char * s_dbg_gflog =
                     std::getenv("V3_DBG_GETFORCE_TAG");
-                if (s_dbg_gflog && (t == Tag::Thunk || t == Tag::App || t == Tag::Slot)) {
+                if (__builtin_expect(s_dbg_gflog != nullptr, 0)) [[unlikely]] {
                     static const size_t depthFilter =
                         std::atoll(s_dbg_gflog);
                     if (vm.frames.size() >= depthFilter) {
@@ -865,10 +868,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             vm.frames.size(), operand, (unsigned)t, ip - 1);
                     }
                 }
-            }
-            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
-                push(vm, v);
-                break;
             }
             push(vm, v);
             goto op_force_slow;
@@ -906,19 +905,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_GET_UPVALUE_FORCE: {
             if (!closure)
                 throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: no closure context");
+            // Hot path: tag != Thunk/App/Slot.  Diagnostics and the
+            // NIX_V3_NO_GETFORCE_SUPER gate live below the bail-out so
+            // they don't pay the load + branch on every iteration.
+            const Value & v = closure->upvalues[operand];
+            Tag t = v.tag();
+            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
+                push(vm, v);
+                break;
+            }
             // V3_DBG_FORCE_SITE trace; see OP_GET_LOCAL_FORCE.
             dbgLogForceSite(cu, ip - 1,
                 operand < closure->nUpvalues ? &closure->upvalues[operand] : nullptr);
             // See OP_GET_LOCAL_FORCE — same NIX_V3_NO_GETFORCE_SUPER gate.
             static const bool s_skipForceUv =
                 std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
-            if (s_skipForceUv) {
-                push(vm, closure->upvalues[operand]);
-                break;
-            }
-            const Value & v = closure->upvalues[operand];
-            Tag t = v.tag();
-            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
+            if (__builtin_expect(s_skipForceUv, 0)) [[unlikely]] {
                 push(vm, v);
                 break;
             }
@@ -1756,18 +1758,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_FORCE: {
-            // V3_DBG_FORCE_SITE trace; see dbgLogForceSite().
-            dbgLogForceSite(cu, ip - 1,
-                vm.valueStack.empty() ? nullptr : &vm.valueStack.back());
             // Fast path: peek at the top of the stack.  The vast majority
             // of OP_FORCE calls hit values already in WHNF (Int / Bool /
             // String / Attrs / List / Closure / Path / Null / Float /
             // PrimOp / PrimOpApp).  Skip the pop+push for those.
+            // Diagnostics live BELOW the bail-out so the fast path
+            // doesn't compute the address argument when disabled.
             {
                 Value & topRef = vm.valueStack.back();
                 Tag t = topRef.tag();
                 if (t != Tag::Thunk && t != Tag::App && t != Tag::Slot) break;
             }
+            // V3_DBG_FORCE_SITE trace; see dbgLogForceSite().
+            dbgLogForceSite(cu, ip - 1,
+                vm.valueStack.empty() ? nullptr : &vm.valueStack.back());
             // Slow path: shared with OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE
             // which push the value first and then jump here.
             op_force_slow:
