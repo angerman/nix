@@ -2054,6 +2054,16 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     if (!fun.isLambda()) return false;
     nix::ExprLambda * lambda = fun.lambda().fun;
     if (!lambda) return false;
+    // #437: refuse to call v3-compiled lambdas with formal-attrset
+    // patterns (`{a, b ? def}: body`).  The v3 closure expects the
+    // arg attrset deep-converted via `treeWalkerToV3Public`, which
+    // forces every entry; if any entry is mid-construction in an
+    // outer tree-walker frame (eg the NixOS module fixed-point's
+    // `config`), the deep force trips ExprBlackHole.  Mirror the
+    // eval-hook's WC-21 hasFormals filter.  Tree-walker's
+    // autoCallFunction dispatches formals with proper per-formal
+    // default laziness.
+    if (lambda->getFormals()) return false;
 
     // Re-entrancy guard: if we're inside a v3 hook already, fall back
     // to tree-walker.  Mirrors v3ForceEntry's discipline -- nested
@@ -2102,15 +2112,28 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         return false;
     }
 
-    // Bridge arg.  treeWalkerToV3Public can throw on unsupported value
-    // kinds; treat any failure as fall-back.
+    // Bridge arg.  #437: previously this called
+    // `treeWalkerToV3Public(state, *arg)` which DEEP-FORCES every
+    // sub-attr of an attrset arg.  For NixOS-module-shaped args
+    // (`{config, options, lib, ...}`) where `config` is mid-
+    // construction in an outer tree-walker frame, the deep force
+    // trips ExprBlackHole AND -- critically -- caches the failure
+    // as `nFailed` on `config`.  Even returning false from the hook
+    // doesn't undo the cache; tree-walker's subsequent access sees
+    // the cached error and rethrows.
+    //
+    // Bridge the arg as a v3 Bridge thunk instead -- shallow / lazy.
+    // The closure body forces individual sub-values only when it
+    // accesses them, matching tree-walker's `callFunction`'s lazy
+    // semantics.  If the body references an attr that's still being
+    // computed, OP_ATTRS_SELECT's force will see the same blackhole
+    // and the v3 closure body falls back via its existing catch.
+    if (!arg) return false;
     Value v3Arg;
-    try {
-        if (!arg) return false;
-        v3Arg = treeWalkerToV3Public(state, *arg);
-    } catch (const std::exception &) {
-        return false;
-    }
+    Thunk * argBridge = Alloc::allocBridgeThunk(static_cast<void *>(arg));
+    allocStats().thunksAllocated++;
+    v3Arg.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+    v3Arg.payload.thunk = argBridge;
 
     // Run the body.
     setNixEvalState(&state);
