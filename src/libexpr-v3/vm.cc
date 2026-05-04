@@ -2701,6 +2701,41 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // on the v3 heap (Alloc::allocBindings), not on the
             // value-stack.
             Value attrs = pop(vm);
+            // #437: count and tag-distribute OP_REC_BINDING_SLOT_REF fires.
+            {
+                static const bool s_dbg_p5 =
+                    std::getenv("V3_DBG_P5") != nullptr;
+                if (__builtin_expect(s_dbg_p5, 0)) [[unlikely]] {
+                    static thread_local uint64_t total = 0;
+                    static thread_local uint64_t byTag[16] = {0};
+                    static thread_local uint64_t bridgeFires = 0;
+                    static thread_local uint64_t logged = 0;
+                    ++total;
+                    Tag at = attrs.tag();
+                    if ((unsigned)at < 16) byTag[(unsigned)at]++;
+                    bool isBridge = (at == Tag::Thunk
+                        && attrs.payload.thunk
+                        && attrs.payload.thunk->state == ThunkState::Bridge);
+                    if (isBridge) ++bridgeFires;
+                    // Print first 5 cases & every power of 10 thereafter.
+                    if (logged < 5
+                        || (total > 10 && (total & (total - 1)) == 0)) {
+                        const auto & tbl = ir::globalSymbolTable();
+                        SymbolId sym = static_cast<SymbolId>(operand);
+                        std::string nm = (sym < tbl.size()) ? tbl[sym] : "?";
+                        std::fprintf(stderr,
+                            "v3 P5#%llu: tag=%d sym='%s' frames=%zu bridges=%llu byTag=[",
+                            (unsigned long long)total, (int)at, nm.c_str(),
+                            vm.frames.size(),
+                            (unsigned long long)bridgeFires);
+                        for (int i = 0; i < 16; ++i)
+                            if (byTag[i]) std::fprintf(stderr, "%d:%llu,", i,
+                                (unsigned long long)byTag[i]);
+                        std::fprintf(stderr, "]\n");
+                        ++logged;
+                    }
+                }
+            }
             if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);

@@ -2403,7 +2403,37 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
             bridgeVm1.frames.reserve(4096);
             bridgeVm1.withStack.reserve(64);
             v3state.vm = &bridgeVm1;
-            Value v3arg = treeWalkerToV3(v3state, *args[1]);
+            Value v3arg;
+            try {
+                v3arg = treeWalkerToV3(v3state, *args[1]);
+            } catch (const std::exception & ex) {
+                static const bool s_dbg = std::getenv("V3_DBG_BRIDGE1") != nullptr;
+                if (s_dbg) {
+                    nix::Value & a = *args[1];
+                    std::fprintf(stderr,
+                        "v3 bridge1: treeWalkerToV3 threw: %s "
+                        "(handle=%lld v3fn.tag=%d args[1]=%p type=%d)\n",
+                        ex.what(), (long long)h, (int)v3fn.tag(),
+                        (void *)args[1],
+                        a.isValid() ? (int)a.type<true>() : -1);
+                    if (a.isValid() && a.type<true>() == nix::nAttrs && a.attrs()) {
+                        std::fprintf(stderr,
+                            "  args[1] is attrset with %u attrs:\n",
+                            (unsigned)a.attrs()->size());
+                        size_t shown = 0;
+                        for (auto & it : *a.attrs()) {
+                            if (shown++ >= 12) { std::fprintf(stderr, "  ...\n"); break; }
+                            int t = it.value->isValid() ? (int)it.value->type<true>() : -1;
+                            std::fprintf(stderr,
+                                "    %s -> tag=%d ptr=%p\n",
+                                std::string(ns.symbols[it.name]).c_str(),
+                                t, (void *)it.value);
+                        }
+                    }
+                    std::fflush(stderr);
+                }
+                throw;
+            }
             fn = callClosure(*v3state.vm, v3fn, v3arg);
             fn = forceValue(*v3state.vm, fn);
         }
@@ -2890,6 +2920,26 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         auto & tbl = v3BridgeClosures();
         size_t handle = tbl.size();
         tbl.push_back({v, tlBridgeFallbackExpr});
+        // #437: log closure-bridge registrations so we can identify
+        // which v3 closure handle=N corresponds to.
+        {
+            static const bool s_dbg = std::getenv("V3_DBG_BRIDGE1") != nullptr;
+            if (s_dbg) {
+                std::fprintf(stderr,
+                    "v3 bridge1 register: handle=%zu v.tag=%d closure=%p fallback=%p\n",
+                    handle, (int)v.tag(),
+                    v.tag() == Tag::Closure ? (void *)v.payload.closure : nullptr,
+                    (void *)tlBridgeFallbackExpr);
+                if (v.tag() == Tag::Closure && v.payload.closure
+                    && v.payload.closure->desc) {
+                    const auto * d = v.payload.closure->desc;
+                    std::fprintf(stderr,
+                        "  desc: name='%s' codeOffset=%u nUp=%u nLocals=%u\n",
+                        d->name.c_str(), d->codeOffset, d->nUpvalues,
+                        d->nLocals);
+                }
+            }
+        }
         nix::Value * vHandle = ns.allocValue();
         vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
         out->mkPrimOpApp(bridgePrimOp1, vHandle);
