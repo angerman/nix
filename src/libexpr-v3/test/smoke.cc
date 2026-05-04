@@ -426,6 +426,83 @@ static int testInlineVarRefChain()
     return 0;
 }
 
+// CSE: `a + b` computed twice in one block should collapse so only
+// one Add binding remains after the full optimisation pipeline.
+static int testCseSharedAdd()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a  = addBinding(m, entry, ir::LitInt{7});
+    auto b  = addBinding(m, entry, ir::LitInt{8});
+    auto s1 = addBinding(m, entry, ir::Add{a, b});  // redundant 1
+    auto s2 = addBinding(m, entry, ir::Add{a, b});  // redundant 2
+    auto sum = addBinding(m, entry, ir::Add{s1, s2});
+    setReturn(m, entry, sum);
+
+    // We need to retain s1, s2 in the IR so the test can observe CSE
+    // wired them together.  The full optimise() pipeline:
+    //   - constantFold collapses LitInt{7}+LitInt{8} -> LitInt{15}
+    //     for s1 (and the same for s2 -- both merge to LitInt{15}
+    //     literals at the same time, BEFORE CSE runs).
+    //   - To probe CSE specifically, run only commonSubexprElim
+    //     before inspecting.
+    ir::commonSubexprElim(m);
+
+    // After CSE: s2 should now be VarRef{s1}.
+    const ir::Expr * s2Expr = nullptr;
+    for (auto & bb : m.blocks[entry].bindings) if (bb.var == s2) s2Expr = &bb.expr;
+    auto * vr = s2Expr ? std::get_if<ir::VarRef>(s2Expr) : nullptr;
+    if (!vr || vr->var != s1) {
+        std::fprintf(stderr,
+            "testCseSharedAdd: s2 expected to be VarRef{s1=%u}\n", (unsigned)s1);
+        return 1;
+    }
+
+    // And the program still produces 30 = 15 + 15.
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isInt() || r.payload.i != 30) {
+        std::fprintf(stderr, "testCseSharedAdd: runtime expected 30, got tag=%d\n", (int)r.tag());
+        return 1;
+    }
+    std::fprintf(stderr, "testCseSharedAdd: OK (duplicate Add merged, runtime 30)\n");
+    return 0;
+}
+
+// CSE must NOT merge AttrSelect: it can throw on missing attr, and
+// merging two distinct selects would change the file:line position
+// reported in the error.  Build two AttrSelects with identical operands
+// and verify the second stays an AttrSelect after CSE.
+static int testCseSkipsAttrSelect()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto x = addBinding(m, entry, ir::LitInt{1});
+    auto attrs = addBinding(m, entry, ir::AttrSet{ { { m.internSymbol("x"), x } } });
+    auto sel1 = addBinding(m, entry, ir::AttrSelect{attrs, m.internSymbol("x")});
+    auto sel2 = addBinding(m, entry, ir::AttrSelect{attrs, m.internSymbol("x")});
+    auto out = addBinding(m, entry, ir::Add{sel1, sel2});
+    setReturn(m, entry, out);
+
+    ir::commonSubexprElim(m);
+
+    // Both AttrSelects must still be AttrSelects.
+    int selectCount = 0;
+    for (auto & bb : m.blocks[entry].bindings)
+        if (std::holds_alternative<ir::AttrSelect>(bb.expr)) ++selectCount;
+    if (selectCount != 2) {
+        std::fprintf(stderr,
+            "testCseSkipsAttrSelect: expected 2 AttrSelect bindings after CSE, got %d\n",
+            selectCount);
+        return 1;
+    }
+    std::fprintf(stderr, "testCseSkipsAttrSelect: OK (both AttrSelects preserved)\n");
+    return 0;
+}
+
 // `(x: x + 1) 41` → 42
 static int testLambdaCall()
 {
@@ -1060,6 +1137,8 @@ int main()
     rc |= testDceRemovesUnusedLiteral();
     rc |= testDceKeepsImpureUnused();
     rc |= testInlineVarRefChain();
+    rc |= testCseSharedAdd();
+    rc |= testCseSkipsAttrSelect();
     rc |= testLambdaCall();
     rc |= testClosureCapture();
     rc |= testIf();

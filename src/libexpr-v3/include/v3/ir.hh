@@ -530,11 +530,19 @@ size_t deadBindingElim(Module & m);
 /// alias bindings removed.
 size_t inlineTrivialBindings(Module & m);
 
+/// Block-local common subexpression elimination.  Within each Block,
+/// merges identical-shape arithmetic / comparison / boolean / static
+/// HasAttr bindings: the second occurrence becomes `VarRef{firstSeen}`
+/// so the alias-collapse pass folds it away.  Strict whitelist (see
+/// opt_cse.cc) keeps observable side effects intact.  Returns the
+/// number of bindings rewritten to aliases.
+size_t commonSubexprElim(Module & m);
+
 /// Run the standard optimisation pipeline.  Currently:
-/// constantFold -> inlineTrivialBindings -> deadBindingElim.
-/// Always called between lower and computeFreeVars by the v3 hook,
-/// the import primop, and the wrapper-source primop.  No-op when
-/// `NIX_V3_NO_OPT` is set (escape hatch for debugging).
+/// constantFold -> commonSubexprElim -> inlineTrivialBindings ->
+/// deadBindingElim.  Always called between lower and computeFreeVars
+/// by the v3 hook, the import primop, and the wrapper-source primop.
+/// No-op when `NIX_V3_NO_OPT` is set (escape hatch for debugging).
 void optimise(Module & m);
 
 } // namespace nix::v3::ir
