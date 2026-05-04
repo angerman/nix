@@ -287,6 +287,10 @@ void optimise(Module & m)
     constantFold(m);
     commonSubexprElim(m);
     inlineTrivialBindings(m);
+    // #429 runs after alias collapse (so VarRef chains are flattened
+    // and LitPrimOp -> App pairings are observable in one block) and
+    // before DCE (so the partial-App orphans get swept).
+    fusePrimOpApps(m);
     deadBindingElim(m);
 }
 

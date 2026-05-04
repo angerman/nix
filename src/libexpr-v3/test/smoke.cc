@@ -503,6 +503,87 @@ static int testCseSkipsAttrSelect()
     return 0;
 }
 
+// #429: fusing App-chains over LitPrimOp.  Build:
+//   v_isAttrs = LitPrimOp{primIsAttrs}
+//   v_obj     = AttrSet{} (an empty attrset value)
+//   v_app     = App{v_isAttrs, v_obj}
+// After fusePrimOpApps + DCE: v_app is rewritten to PrimOpCall.
+static int testFusePrimOpAppArity1()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    const PrimOp * isAttrsPo = findPrimOp("isAttrs");
+    if (!isAttrsPo) {
+        std::fprintf(stderr, "testFusePrimOpAppArity1: isAttrs not registered\n");
+        return 1;
+    }
+
+    auto vIsA = addBinding(m, entry, ir::LitPrimOp{isAttrsPo});
+    auto vObj = addBinding(m, entry, ir::AttrSet{});
+    auto vApp = addBinding(m, entry, ir::App{vIsA, vObj});
+    setReturn(m, entry, vApp);
+
+    ir::fusePrimOpApps(m);
+
+    // After fusion: vApp should now be a PrimOpCall{isAttrs, [vObj]}.
+    const ir::Expr * appExpr = nullptr;
+    for (auto & bb : m.blocks[entry].bindings)
+        if (bb.var == vApp) appExpr = &bb.expr;
+    auto * pc = appExpr ? std::get_if<ir::PrimOpCall>(appExpr) : nullptr;
+    if (!pc || pc->primop != isAttrsPo
+        || pc->args.size() != 1 || pc->args[0] != vObj) {
+        std::fprintf(stderr,
+            "testFusePrimOpAppArity1: expected PrimOpCall{isAttrs, [vObj=%u]}\n",
+            (unsigned)vObj);
+        return 1;
+    }
+    std::fprintf(stderr, "testFusePrimOpAppArity1: OK (App fused to PrimOpCall)\n");
+    return 0;
+}
+
+// #429 multi-arg variant: chain of two Apps over LitPrimOp{arity=2}
+// fuses the saturated tail; intermediate partial-App is preserved
+// (DCE sweeps it post-pipeline).
+static int testFusePrimOpChainArity2()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    const PrimOp * elemAtPo = findPrimOp("elemAt");
+    if (!elemAtPo) {
+        std::fprintf(stderr, "testFusePrimOpChainArity2: elemAt not registered\n");
+        return 1;
+    }
+
+    auto vElem = addBinding(m, entry, ir::LitPrimOp{elemAtPo});
+    auto vList = addBinding(m, entry, ir::ListExpr{});
+    auto vIdx  = addBinding(m, entry, ir::LitInt{0});
+    auto vApp1 = addBinding(m, entry, ir::App{vElem, vList});
+    auto vApp2 = addBinding(m, entry, ir::App{vApp1, vIdx});
+    setReturn(m, entry, vApp2);
+
+    ir::fusePrimOpApps(m);
+
+    // vApp2 should be PrimOpCall{elemAt, [vList, vIdx]}.
+    const ir::Expr * tailExpr = nullptr;
+    for (auto & bb : m.blocks[entry].bindings)
+        if (bb.var == vApp2) tailExpr = &bb.expr;
+    auto * pc = tailExpr ? std::get_if<ir::PrimOpCall>(tailExpr) : nullptr;
+    if (!pc || pc->primop != elemAtPo
+        || pc->args.size() != 2
+        || pc->args[0] != vList || pc->args[1] != vIdx) {
+        std::fprintf(stderr,
+            "testFusePrimOpChainArity2: expected PrimOpCall{elemAt, [vList=%u, vIdx=%u]}\n",
+            (unsigned)vList, (unsigned)vIdx);
+        return 1;
+    }
+    std::fprintf(stderr, "testFusePrimOpChainArity2: OK (App-chain fused)\n");
+    return 0;
+}
+
 // `(x: x + 1) 41` → 42
 static int testLambdaCall()
 {
@@ -1139,6 +1220,8 @@ int main()
     rc |= testInlineVarRefChain();
     rc |= testCseSharedAdd();
     rc |= testCseSkipsAttrSelect();
+    rc |= testFusePrimOpAppArity1();
+    rc |= testFusePrimOpChainArity2();
     rc |= testLambdaCall();
     rc |= testClosureCapture();
     rc |= testIf();

@@ -538,11 +538,22 @@ size_t inlineTrivialBindings(Module & m);
 /// number of bindings rewritten to aliases.
 size_t commonSubexprElim(Module & m);
 
+/// #429: fuse App-chains over LitPrimOp into a single PrimOpCall.
+/// Detects the let/inherit-from indirection pattern that escapes
+/// lowerCall's direct-recognition (e.g. `let inherit (builtins) map;
+/// in map f xs`) and rewrites the saturated tail App to PrimOpCall.
+/// Intermediate partial-Apps become orphan bindings that the next
+/// DCE pass sweeps.  Skips primops with non-zero lazyArgs to keep
+/// per-arg laziness semantics intact.  Returns the number of App
+/// bindings rewritten.
+size_t fusePrimOpApps(Module & m);
+
 /// Run the standard optimisation pipeline.  Currently:
 /// constantFold -> commonSubexprElim -> inlineTrivialBindings ->
-/// deadBindingElim.  Always called between lower and computeFreeVars
-/// by the v3 hook, the import primop, and the wrapper-source primop.
-/// No-op when `NIX_V3_NO_OPT` is set (escape hatch for debugging).
+/// fusePrimOpApps -> deadBindingElim.  Always called between lower
+/// and computeFreeVars by the v3 hook, the import primop, and the
+/// wrapper-source primop.  No-op when `NIX_V3_NO_OPT` is set (escape
+/// hatch for debugging).
 void optimise(Module & m);
 
 } // namespace nix::v3::ir

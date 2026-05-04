@@ -50,6 +50,7 @@ lib_sources = files(
   'opt_cse.cc',
   'opt_dce.cc',
   'opt_inline.cc',
+  'opt_primop_fuse.cc',
   'serialize.cc',
   'disk_cache.cc',
   'fiber.cc',
