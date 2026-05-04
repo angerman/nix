@@ -4340,6 +4340,7 @@ void primImport(EvalState & state, Value * args, Value & out)
     }
 
     auto module = lowerNixExpr(e, ns.symbols, ns.positions);
+    nix::v3::ir::optimise(module);
     nix::v3::ir::computeFreeVars(module);
     cache.cus.push_back(compile(module));
     if (!diskKey.empty() && serialize::isCacheable(cache.cus.back())) {
@@ -4991,6 +4992,7 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     nix::Expr * wrapper = ns.parseExprFromString(wrapped, sp.parent());
 
     auto module = lowerNixExpr(wrapper, ns.symbols, ns.positions);
+    nix::v3::ir::optimise(module);
     nix::v3::ir::computeFreeVars(module);
     auto & cache = importCache();
     cache.cus.push_back(compile(module));

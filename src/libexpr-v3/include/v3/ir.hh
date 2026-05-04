@@ -487,4 +487,25 @@ inline Module makeModule()
 /// in the module.  Must be run after lowering and before emit.
 void computeFreeVars(Module & m);
 
+// ---------------------------------------------------------------------------
+// Optimisation passes
+// ---------------------------------------------------------------------------
+
+/// Constant fold arithmetic / comparison / boolean operations whose every
+/// operand is a literal in the same Block.  Replaces the right-hand-side of
+/// the binding with the folded LitInt / LitFloat / LitBool.  Skips cases
+/// where the runtime would throw (div-by-zero, INT64_MIN / -1, integer
+/// overflow on Add/Sub/Mul) so eval-time semantics are preserved.
+///
+/// Safe to run before computeFreeVars: never introduces new VarRefs and
+/// never removes a VarRef that the surrounding scope might still consume.
+/// Returns the number of bindings whose expr was replaced.
+size_t constantFold(Module & m);
+
+/// Run the standard optimisation pipeline.  Currently: constantFold.
+/// Always called between lower and computeFreeVars by the v3 hook,
+/// the import primop, and the wrapper-source primop.  No-op when
+/// `NIX_V3_NO_OPT` is set (escape hatch for debugging).
+void optimise(Module & m);
+
 } // namespace nix::v3::ir

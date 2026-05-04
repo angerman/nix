@@ -25,6 +25,8 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 
 using namespace nix::v3;
@@ -92,6 +94,210 @@ static int testAdd()
         return 1;
     }
     std::fprintf(stderr, "testAdd: OK (1+2=3)\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Constant-folding regression tests
+// ---------------------------------------------------------------------------
+//
+// Each test builds a tiny IR with a foldable expression, runs ir::optimise()
+// directly on the module, and inspects the resulting Binding to confirm:
+//   - "folds" tests:    the RHS is now a Lit*  (folded)
+//   - "no-fold" tests:  the RHS is still the original op (not folded)
+// We also execute the module and check the runtime result matches what
+// the unfolded program would have produced -- guards against accidentally
+// folding to a different value.
+
+static bool isLitInt(const ir::Expr & e, int64_t expected)
+{
+    auto * x = std::get_if<ir::LitInt>(&e);
+    return x && x->value == expected;
+}
+
+static bool isLitBool(const ir::Expr & e, bool expected)
+{
+    auto * x = std::get_if<ir::LitBool>(&e);
+    return x && x->value == expected;
+}
+
+static bool isLitFloat(const ir::Expr & e, double expected)
+{
+    auto * x = std::get_if<ir::LitFloat>(&e);
+    return x && x->value == expected;
+}
+
+template <typename T>
+static bool isOp(const ir::Expr & e)
+{
+    return std::holds_alternative<T>(e);
+}
+
+// `2 + 3` → fold to LitInt{5} at IR-opt time.
+static int testFoldAddInt()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitInt{2});
+    auto b = addBinding(m, entry, ir::LitInt{3});
+    auto c = addBinding(m, entry, ir::Add{a, b});
+    setReturn(m, entry, c);
+
+    ir::optimise(m);
+
+    // The Add binding should now be a LitInt{5}.
+    const auto & cBind = m.blocks[entry].bindings[2];
+    if (cBind.var != c || !isLitInt(cBind.expr, 5)) {
+        std::fprintf(stderr, "testFoldAddInt: expected LitInt{5} after fold\n");
+        return 1;
+    }
+
+    // And the program should still produce 5.
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isInt() || r.payload.i != 5) {
+        std::fprintf(stderr, "testFoldAddInt: runtime expected 5, got tag=%d\n", (int)r.tag());
+        return 1;
+    }
+    std::fprintf(stderr, "testFoldAddInt: OK (2+3 -> LitInt{5})\n");
+    return 0;
+}
+
+// `2 / 0` → must NOT fold; runtime must throw.
+static int testNoFoldDivByZero()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitInt{2});
+    auto b = addBinding(m, entry, ir::LitInt{0});
+    auto c = addBinding(m, entry, ir::Div{a, b});
+    setReturn(m, entry, c);
+
+    ir::optimise(m);
+
+    const auto & cBind = m.blocks[entry].bindings[2];
+    if (!isOp<ir::Div>(cBind.expr)) {
+        std::fprintf(stderr, "testNoFoldDivByZero: Div was folded -- must be preserved\n");
+        return 1;
+    }
+
+    // And the runtime really does throw.
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    bool threw = false;
+    try { (void)run(cu); }
+    catch (const std::exception &) { threw = true; }
+    if (!threw) {
+        std::fprintf(stderr, "testNoFoldDivByZero: runtime did not throw on 2/0\n");
+        return 1;
+    }
+    std::fprintf(stderr, "testNoFoldDivByZero: OK (Div preserved, runtime throws)\n");
+    return 0;
+}
+
+// `INT64_MAX + 1` → must NOT fold; runtime must throw on overflow.
+static int testNoFoldAddOverflow()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitInt{std::numeric_limits<int64_t>::max()});
+    auto b = addBinding(m, entry, ir::LitInt{1});
+    auto c = addBinding(m, entry, ir::Add{a, b});
+    setReturn(m, entry, c);
+
+    ir::optimise(m);
+
+    const auto & cBind = m.blocks[entry].bindings[2];
+    if (!isOp<ir::Add>(cBind.expr)) {
+        std::fprintf(stderr, "testNoFoldAddOverflow: Add was folded -- overflow must be preserved\n");
+        return 1;
+    }
+    std::fprintf(stderr, "testNoFoldAddOverflow: OK (Add preserved at INT64_MAX+1)\n");
+    return 0;
+}
+
+// `1 == 1` → fold to LitBool{true};  `1 == 2` → fold to LitBool{false};
+// `1 < 2` → fold to LitBool{true};   `!true` → fold to LitBool{false}.
+static int testFoldComparisons()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto one  = addBinding(m, entry, ir::LitInt{1});
+    auto one2 = addBinding(m, entry, ir::LitInt{1});
+    auto two  = addBinding(m, entry, ir::LitInt{2});
+    auto t    = addBinding(m, entry, ir::LitBool{true});
+    auto eqV  = addBinding(m, entry, ir::Eq{one, one2});      // true
+    auto neV  = addBinding(m, entry, ir::NEq{one, two});      // true
+    auto ltV  = addBinding(m, entry, ir::Less{one, two});     // true
+    auto notV = addBinding(m, entry, ir::Not{t});             // false
+    setReturn(m, entry, eqV);
+
+    ir::optimise(m);
+
+    const auto & bs = m.blocks[entry].bindings;
+    auto findBy = [&](ir::VarId v) -> const ir::Expr & {
+        for (auto & bb : bs) if (bb.var == v) return bb.expr;
+        std::abort();
+    };
+
+    if (!isLitBool(findBy(eqV),  true)  ||
+        !isLitBool(findBy(neV),  true)  ||
+        !isLitBool(findBy(ltV),  true)  ||
+        !isLitBool(findBy(notV), false)) {
+        std::fprintf(stderr, "testFoldComparisons: unexpected fold result\n");
+        return 1;
+    }
+    std::fprintf(stderr, "testFoldComparisons: OK (Eq/NEq/Less/Not folded)\n");
+    return 0;
+}
+
+// VarRef chain: a = 4; b = a; c = b + 1 → c folds to LitInt{5}.
+static int testFoldThroughVarRef()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitInt{4});
+    auto b = addBinding(m, entry, ir::VarRef{a});
+    auto one = addBinding(m, entry, ir::LitInt{1});
+    auto c = addBinding(m, entry, ir::Add{b, one});
+    setReturn(m, entry, c);
+
+    ir::optimise(m);
+
+    const auto & cBind = m.blocks[entry].bindings[3];
+    if (cBind.var != c || !isLitInt(cBind.expr, 5)) {
+        std::fprintf(stderr, "testFoldThroughVarRef: expected LitInt{5}\n");
+        return 1;
+    }
+    std::fprintf(stderr, "testFoldThroughVarRef: OK (VarRef chain resolved)\n");
+    return 0;
+}
+
+// Float fold: 1.5 * 2.0 → LitFloat{3.0}.
+static int testFoldFloat()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitFloat{1.5});
+    auto b = addBinding(m, entry, ir::LitFloat{2.0});
+    auto c = addBinding(m, entry, ir::Mul{a, b});
+    setReturn(m, entry, c);
+
+    ir::optimise(m);
+
+    const auto & cBind = m.blocks[entry].bindings[2];
+    if (cBind.var != c || !isLitFloat(cBind.expr, 3.0)) {
+        std::fprintf(stderr, "testFoldFloat: expected LitFloat{3.0}\n");
+        return 1;
+    }
+    std::fprintf(stderr, "testFoldFloat: OK (1.5*2.0 -> LitFloat{3.0})\n");
     return 0;
 }
 
@@ -316,8 +522,8 @@ static int testWith()
     auto wResult = addBinding(m, entry, ir::With{attrs, bodyB});
     setReturn(m, entry, wResult);
 
-    auto wx = addBinding(m, bodyB, ir::WithLookup{sx, 0});
-    auto wy = addBinding(m, bodyB, ir::WithLookup{sy, 0});
+    auto wx = addBinding(m, bodyB, ir::WithLookup{sx});
+    auto wy = addBinding(m, bodyB, ir::WithLookup{sy});
     auto sum = addBinding(m, bodyB, ir::Add{wx, wy});
     setReturn(m, bodyB, sum);
 
@@ -621,7 +827,7 @@ static int testSerializeWithRecAttrset()
     auto attrs = addBinding(m, topEntry, std::move(a));
 
     auto withBlock = m.freshBlock();
-    auto refX = addBinding(m, withBlock, ir::WithLookup{symX, 0});
+    auto refX = addBinding(m, withBlock, ir::WithLookup{symX});
     setReturn(m, withBlock, refX);
     auto withResult = addBinding(m, topEntry, ir::With{attrs, withBlock});
     setReturn(m, topEntry, withResult);
@@ -720,6 +926,12 @@ int main()
     int rc = 0;
     rc |= testLitInt();
     rc |= testAdd();
+    rc |= testFoldAddInt();
+    rc |= testNoFoldDivByZero();
+    rc |= testNoFoldAddOverflow();
+    rc |= testFoldComparisons();
+    rc |= testFoldThroughVarRef();
+    rc |= testFoldFloat();
     rc |= testLambdaCall();
     rc |= testClosureCapture();
     rc |= testIf();

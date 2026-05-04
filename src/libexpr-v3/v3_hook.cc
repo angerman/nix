@@ -399,6 +399,7 @@ static bool lowerCompileAndPopulate(
     try {
         auto t0 = timingEnabled ? clock::now() : clock::time_point{};
         auto module = lowerNixExpr(e, state.symbols, state.positions);
+        ir::optimise(module);
         ir::computeFreeVars(module);
         auto t1 = timingEnabled ? clock::now() : clock::time_point{};
         // Skip precompile of huge modules (e.g. nixpkgs/lib's 504-lambda
@@ -712,6 +713,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         try {
             auto t0 = timingEnabled ? clock::now() : clock::time_point{};
             auto module = lowerNixExpr(e, state.symbols, state.positions);
+            ir::optimise(module);
             ir::computeFreeVars(module);
             auto t1 = timingEnabled ? clock::now() : clock::time_point{};
             // Heuristic: very large modules (typically nixpkgs/lib's
