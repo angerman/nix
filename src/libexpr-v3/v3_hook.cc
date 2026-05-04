@@ -2098,6 +2098,8 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // eval-hook's WC-21 hasFormals filter.  Tree-walker's
     // autoCallFunction dispatches formals with proper per-formal
     // default laziness.
+    // Order matters: check formals BEFORE the cache miss path below
+    // so we don't waste compile cost on lambdas we'll skip anyway.
     if (lambda->getFormals()) { st.callHookGated++; return false; }
 
     // Re-entrancy guard: if we're inside a v3 hook already, fall back
@@ -2140,6 +2142,42 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
             st.callHookUniqueMisses = missCounts.size();
             st.callHookHottestMiss  = maxBucket;
         }
+        // #430 (deferred): on-demand precompile attempted here -- when
+        // the call hook hits a lambda not in subCache, lower+compile
+        // it directly and re-probe.  Implementation in this commit's
+        // history (reverted).
+        //
+        // Result: fib35 went 4.13s tw / 3.20s v3 -> 0.05s with
+        // on-demand precompile (50x speedup, the v3 IR runs the
+        // entire fib35 in v3 with no tree-walker callbacks).  But
+        // cardano-node SILENTLY produced an empty result string
+        // instead of "cardano-node-exe-cardano-node-10.6.1" -- a
+        // correctness regression.
+        //
+        // Root cause: `lowerNixExpr(lambda, ...)` in isolation drops
+        // the enclosing scope's varOrigins.  v3's lowerer walks the
+        // ExprLambda's body and computes freeVars against the lambda's
+        // OWN scope, but the freeVar -> (level, displ) origin map
+        // populated by `resolveVar` requires the enclosing
+        // scope-stack the eval hook had when it lowered the
+        // top-level Expr.  Without that, populateSubExprCacheLocal
+        // creates SubExprCacheEntries with empty upvalueSources for
+        // any freeVar coming from outside the lambda -- and the
+        // call-hook then runs the v3 body with garbage upvalues,
+        // producing wrong results.
+        //
+        // To make this work cleanly we'd need to either:
+        //   (a) Walk back up to the enclosing root Expr (the file or
+        //       parseExprFromString origin) and lowerNixExpr on THAT,
+        //       letting it populate every contained lambda's
+        //       upvalueSources.  Need a back-pointer or AST-walk to
+        //       find the root.
+        //   (b) Pre-walk every parsed AST at parse time (parser hook)
+        //       and pre-register every ExprLambda the parser sees.
+        //   (c) Fix the lowerer to accept a partial scope-stack so a
+        //       single-lambda lower pass can compute proper origins.
+        //
+        // Without (a)-(c) the on-demand precompile is unsafe.  Reverted.
         return false;
     }
     auto & ent = sit->second;
