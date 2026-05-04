@@ -116,7 +116,7 @@ enum Op : uint8_t
 
     // --- Attrsets -------------------------------------------------------
     OP_ATTRS_INIT     = 0x70,  // [n:24]   pop n values; data: n SymbolIds; build sorted attrset
-    OP_ATTRS_INIT_DYN = 0x71,  // [nStatic:16, nDyn:8] then static syms then values then dyn name+value pairs
+    OP_ATTRS_INIT_DYN = 0x71,  // [nStatic:12, nDyn:12] then static syms then values then dyn name+value pairs (REVIEW B-14: was [16,8] in stale comment)
     OP_ATTRS_REC_INIT = 0x72,  // [n:24]   data: n SymbolIds — allocate placeholder Bindings,
                                 //          push it on op stack with placeholders; entries are filled in by
                                 //          subsequent OP_ATTRS_REC_SET ops
