@@ -3007,7 +3007,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     normalized.pop_back();
                 out = std::move(normalized);
             }
-            char * buf = static_cast<char *>(std::malloc(out.size() + 1));
+            // CRIT-4: arena allocation for long-lived string/path
+            // payload (was std::malloc + leak).
+            char * buf = Alloc::allocChars(out.size() + 1);
             std::memcpy(buf, out.data(), out.size());
             buf[out.size()] = '\0';
             Value v;

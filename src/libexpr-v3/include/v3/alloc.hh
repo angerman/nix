@@ -351,6 +351,24 @@ struct Alloc
         return static_cast<ValuePair *>(threadArena().alloc(sizeof(ValuePair)));
     }
 
+    /// REVIEW CRIT-4: long-lived character buffer allocation routed
+    /// through the arena instead of std::malloc.  Used for Tag::String
+    /// / Tag::Path payloads built by primops and by string ops in the
+    /// VM dispatch loop.  These buffers don't contain GC pointers
+    /// directly, but std::malloc'd C strings leak (we never call
+    /// std::free) and pollute heap profiling.  Arena allocation gives
+    /// process-lifetime ownership identical to the pre-fix behaviour
+    /// (no free), with allocation amortised to a single bump and the
+    /// memory in a region Boehm scans for accidental Value pointers.
+    ///
+    /// Caller is responsible for null-terminating if a C string is
+    /// expected (the caller already does buf[n] = '\0' in every
+    /// existing call site -- this helper just replaces the std::malloc).
+    static char * allocChars(size_t n) noexcept
+    {
+        return static_cast<char *>(threadArena().alloc(n));
+    }
+
     static Bindings * allocBindings(uint32_t n) noexcept
     {
         const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * n;

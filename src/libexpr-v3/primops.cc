@@ -246,7 +246,8 @@ inline std::string toStr(const Value & v)
 
 inline Value mkStringValueOwned(std::string s)
 {
-    char * buf = static_cast<char *>(std::malloc(s.size() + 1));
+    // CRIT-4: arena allocation; no per-call malloc/leak.
+    char * buf = Alloc::allocChars(s.size() + 1);
     std::memcpy(buf, s.data(), s.size());
     buf[s.size()] = '\0';
     Value v;
@@ -1248,8 +1249,10 @@ void primToPath(EvalState & state, Value * args, Value & out)
     auto fromString = [&](const char * s) {
         if (!s || s[0] != '/')
             throw std::runtime_error("v3 toPath: string is not an absolute path");
-        char * buf = static_cast<char *>(std::malloc(std::strlen(s) + 1));
-        std::strcpy(buf, s);
+        // CRIT-4: arena allocation.
+        const size_t n = std::strlen(s) + 1;
+        char * buf = Alloc::allocChars(n);
+        std::memcpy(buf, s, n);
         out.tag_payload = static_cast<uint64_t>(Tag::Path);
         out.payload.path = buf;
     };
@@ -1593,8 +1596,11 @@ void primFindFile(EvalState & state, Value * args, Value & out)
         }
     }
     auto sp = state.nixEvalState->findFile(lp, args[1].payload.str);
-    char * buf = static_cast<char *>(std::malloc(sp.path.abs().size() + 1));
-    std::strcpy(buf, sp.path.abs().c_str());
+    // CRIT-4: arena allocation.
+    const std::string & abs = sp.path.abs();
+    char * buf = Alloc::allocChars(abs.size() + 1);
+    std::memcpy(buf, abs.data(), abs.size());
+    buf[abs.size()] = '\0';
     out.tag_payload = static_cast<uint64_t>(Tag::Path);
     out.payload.path = buf;
 }
@@ -1743,8 +1749,8 @@ void primDirOf(EvalState &, Value * args, Value & out)
                       (pos == 0) ? "/" : s.substr(0, pos);
     if (isPathV) {
         Value v;
-        // Allocate a long-lived string for the path payload.
-        char * buf = static_cast<char *>(std::malloc(dir.size() + 1));
+        // CRIT-4: arena allocation for long-lived path payload.
+        char * buf = Alloc::allocChars(dir.size() + 1);
         std::memcpy(buf, dir.data(), dir.size()); buf[dir.size()] = '\0';
         v.tag_payload = static_cast<uint64_t>(Tag::Path);
         v.payload.path = buf;
@@ -2241,9 +2247,19 @@ struct BridgeClosureEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
 };
-static std::vector<BridgeClosureEntry> & v3BridgeClosures()
+// CRIT-2 (table side): the static bridge tables hold v3 Values whose
+// payloads (Closure*, Bindings*, Thunk*, ListVec*) live in the v3
+// arena.  std::allocator's malloc'd vector storage is invisible to
+// Boehm; traceable_allocator routes the storage into a Boehm-scanned
+// region so the inner payloads stay reachable across collections.
+// The vectors themselves still grow unboundedly across a process
+// lifetime -- that's MED-14 bounding work, separate from the GC
+// reachability fix here.
+static std::vector<BridgeClosureEntry,
+    traceable_allocator<BridgeClosureEntry>> & v3BridgeClosures()
 {
-    static std::vector<BridgeClosureEntry> tbl;
+    static std::vector<BridgeClosureEntry,
+        traceable_allocator<BridgeClosureEntry>> tbl;
     return tbl;
 }
 
@@ -2269,16 +2285,22 @@ struct BridgeListEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
 };
-static std::vector<BridgeAttrEntry> & v3BridgeAttrs()
+// CRIT-2 (table side): traceable storage so Boehm sees the inner
+// v3-Value payloads.
+static std::vector<BridgeAttrEntry,
+    traceable_allocator<BridgeAttrEntry>> & v3BridgeAttrs()
 {
-    static std::vector<BridgeAttrEntry> tbl;
+    static std::vector<BridgeAttrEntry,
+        traceable_allocator<BridgeAttrEntry>> tbl;
     return tbl;
 }
 
 /// Same idea for lists — each element bridged lazily on force.
-static std::vector<BridgeListEntry> & v3BridgeLists()
+static std::vector<BridgeListEntry,
+    traceable_allocator<BridgeListEntry>> & v3BridgeLists()
 {
-    static std::vector<BridgeListEntry> tbl;
+    static std::vector<BridgeListEntry,
+        traceable_allocator<BridgeListEntry>> tbl;
     return tbl;
 }
 
@@ -2985,7 +3007,8 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
     case nix::nPath: {
         out.tag_payload = static_cast<uint64_t>(Tag::Path);
         std::string p(nv.pathStrView());
-        char * buf = static_cast<char *>(std::malloc(p.size() + 1));
+        // CRIT-4: arena allocation.
+        char * buf = Alloc::allocChars(p.size() + 1);
         std::memcpy(buf, p.data(), p.size()); buf[p.size()] = '\0';
         out.payload.path = buf;
         return out;
@@ -4802,8 +4825,10 @@ void primPath(EvalState & state, Value * args, Value & out)
     }
     // Fallback: fake store path.
     std::string outPath = "/v3-fake-store/" + name;
-    char * buf = static_cast<char *>(std::malloc(outPath.size() + 1));
-    std::strcpy(buf, outPath.c_str());
+    // CRIT-4: arena allocation.
+    char * buf = Alloc::allocChars(outPath.size() + 1);
+    std::memcpy(buf, outPath.data(), outPath.size());
+    buf[outPath.size()] = '\0';
     out.tag_payload = static_cast<uint64_t>(Tag::Path);
     out.payload.path = buf;
 }
