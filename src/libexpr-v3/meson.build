@@ -47,6 +47,7 @@ lib_sources = files(
   'primops.cc',
   'lower.cc',
   'opt_const_fold.cc',
+  'opt_dce.cc',
   'serialize.cc',
   'disk_cache.cc',
   'fiber.cc',

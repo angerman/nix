@@ -26,6 +26,7 @@
 #include <variant>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nix::v3 {
 struct PrimOp;
@@ -487,6 +488,16 @@ inline Module makeModule()
 /// in the module.  Must be run after lowering and before emit.
 void computeFreeVars(Module & m);
 
+/// Insert into `refs` every VarId referenced *directly* by `e` (operand
+/// position).  Does NOT recurse into sub-blocks (If/With/Assert bodies)
+/// nor into nested functions (Lambda/MkThunk bodies).  Lambda/MkThunk
+/// freeVars vectors ARE included -- they're the captures the closing
+/// expression needs at MAKE_CLOSURE / MAKE_THUNK time.
+///
+/// Used by DCE and other IR passes that need to know which VarIds a
+/// binding consumes.
+void collectExprRefs(const Expr & e, std::unordered_set<VarId> & refs);
+
 // ---------------------------------------------------------------------------
 // Optimisation passes
 // ---------------------------------------------------------------------------
@@ -502,10 +513,20 @@ void computeFreeVars(Module & m);
 /// Returns the number of bindings whose expr was replaced.
 size_t constantFold(Module & m);
 
-/// Run the standard optimisation pipeline.  Currently: constantFold.
-/// Always called between lower and computeFreeVars by the v3 hook,
-/// the import primop, and the wrapper-source primop.  No-op when
-/// `NIX_V3_NO_OPT` is set (escape hatch for debugging).
+/// Erase bindings whose VarId is referenced nowhere else in the Module
+/// AND whose RHS is obviously pure (Lit*/VarRef/Lambda/MkThunk/AttrSet/
+/// ListExpr/LitPrimOp/LitBuiltins).  Bindings that may force a thunk,
+/// invoke a primop, or throw at evaluation time (Force, App, Add, ...)
+/// are preserved unconditionally to keep eval-order semantics intact.
+/// Iterates to a fixed point.  Returns the total number of bindings
+/// removed across all iterations.
+size_t deadBindingElim(Module & m);
+
+/// Run the standard optimisation pipeline.  Currently:
+/// constantFold -> deadBindingElim.  Always called between lower
+/// and computeFreeVars by the v3 hook, the import primop, and the
+/// wrapper-source primop.  No-op when `NIX_V3_NO_OPT` is set (escape
+/// hatch for debugging).
 void optimise(Module & m);
 
 } // namespace nix::v3::ir

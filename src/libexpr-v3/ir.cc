@@ -117,10 +117,12 @@ std::string_view Module::symbolName(SymbolId id) const
 // ---------------------------------------------------------------------------
 // Per-Expr direct VarId references (no recursion into sub-blocks).
 // ---------------------------------------------------------------------------
+//
+// Public entry-point: every IR pass that asks "what VarIds does this
+// Expr consume?" funnels through here.  Keeping a single source of
+// truth means a new variant only has to be added in one place.
 
-namespace {
-
-void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
+void collectExprRefs(const Expr & expr, std::unordered_set<VarId> & refs)
 {
     std::visit([&](const auto & e) {
         using T = std::decay_t<decltype(e)>;
@@ -199,6 +201,8 @@ void collectExprDirect(const Expr & expr, std::unordered_set<VarId> & refs)
     }, expr);
 }
 
+namespace {
+
 void collectBlockRefs(const Module & m, BlockId bid,
                       std::unordered_set<VarId> & refs);
 
@@ -245,7 +249,7 @@ void collectBlockRefs(const Module & m, BlockId bid,
     // Refs from this block's expressions and sub-blocks.
     std::unordered_set<VarId> raw;
     for (auto & bd : b.bindings) {
-        collectExprDirect(bd.expr, raw);
+        collectExprRefs(bd.expr, raw);
         std::vector<BlockId> subs;
         collectExprSubBlocks(bd.expr, subs);
         for (auto sb : subs) collectBlockRefs(m, sb, raw);

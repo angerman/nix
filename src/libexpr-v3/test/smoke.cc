@@ -144,11 +144,15 @@ static int testFoldAddInt()
     auto c = addBinding(m, entry, ir::Add{a, b});
     setReturn(m, entry, c);
 
-    ir::optimise(m);
+    // Run only the fold pass to assert it's the one doing the work.
+    // (DCE -- the next pass -- would remove the orphan a/b literals
+    // and confuse this assertion.)
+    ir::constantFold(m);
 
     // The Add binding should now be a LitInt{5}.
-    const auto & cBind = m.blocks[entry].bindings[2];
-    if (cBind.var != c || !isLitInt(cBind.expr, 5)) {
+    const ir::Expr * cExpr = nullptr;
+    for (auto & bb : m.blocks[entry].bindings) if (bb.var == c) cExpr = &bb.expr;
+    if (!cExpr || !isLitInt(*cExpr, 5)) {
         std::fprintf(stderr, "testFoldAddInt: expected LitInt{5} after fold\n");
         return 1;
     }
@@ -178,8 +182,10 @@ static int testNoFoldDivByZero()
 
     ir::optimise(m);
 
-    const auto & cBind = m.blocks[entry].bindings[2];
-    if (!isOp<ir::Div>(cBind.expr)) {
+    // Div is impure (may throw); DCE keeps it.
+    const ir::Expr * cExpr = nullptr;
+    for (auto & bb : m.blocks[entry].bindings) if (bb.var == c) cExpr = &bb.expr;
+    if (!cExpr || !isOp<ir::Div>(*cExpr)) {
         std::fprintf(stderr, "testNoFoldDivByZero: Div was folded -- must be preserved\n");
         return 1;
     }
@@ -211,8 +217,9 @@ static int testNoFoldAddOverflow()
 
     ir::optimise(m);
 
-    const auto & cBind = m.blocks[entry].bindings[2];
-    if (!isOp<ir::Add>(cBind.expr)) {
+    const ir::Expr * cExpr = nullptr;
+    for (auto & bb : m.blocks[entry].bindings) if (bb.var == c) cExpr = &bb.expr;
+    if (!cExpr || !isOp<ir::Add>(*cExpr)) {
         std::fprintf(stderr, "testNoFoldAddOverflow: Add was folded -- overflow must be preserved\n");
         return 1;
     }
@@ -237,7 +244,10 @@ static int testFoldComparisons()
     auto notV = addBinding(m, entry, ir::Not{t});             // false
     setReturn(m, entry, eqV);
 
-    ir::optimise(m);
+    // Use constantFold directly so the orphan boolean bindings stay
+    // alive for the post-fold inspection.  (DCE would otherwise
+    // remove neV/ltV/notV after they collapse to LitBool.)
+    ir::constantFold(m);
 
     const auto & bs = m.blocks[entry].bindings;
     auto findBy = [&](ir::VarId v) -> const ir::Expr & {
@@ -270,8 +280,9 @@ static int testFoldThroughVarRef()
 
     ir::optimise(m);
 
-    const auto & cBind = m.blocks[entry].bindings[3];
-    if (cBind.var != c || !isLitInt(cBind.expr, 5)) {
+    const ir::Expr * cExpr = nullptr;
+    for (auto & bb : m.blocks[entry].bindings) if (bb.var == c) cExpr = &bb.expr;
+    if (!cExpr || !isLitInt(*cExpr, 5)) {
         std::fprintf(stderr, "testFoldThroughVarRef: expected LitInt{5}\n");
         return 1;
     }
@@ -292,12 +303,81 @@ static int testFoldFloat()
 
     ir::optimise(m);
 
-    const auto & cBind = m.blocks[entry].bindings[2];
-    if (cBind.var != c || !isLitFloat(cBind.expr, 3.0)) {
+    const ir::Expr * cExpr = nullptr;
+    for (auto & bb : m.blocks[entry].bindings) if (bb.var == c) cExpr = &bb.expr;
+    if (!cExpr || !isLitFloat(*cExpr, 3.0)) {
         std::fprintf(stderr, "testFoldFloat: expected LitFloat{3.0}\n");
         return 1;
     }
     std::fprintf(stderr, "testFoldFloat: OK (1.5*2.0 -> LitFloat{3.0})\n");
+    return 0;
+}
+
+// DCE: a pure unused literal binding is removed; the impure
+// neighbour is preserved.  We construct a block with one orphan
+// LitInt and a Force binding side-by-side, run optimise, and
+// confirm only the LitInt survives the pure-DCE filter.
+static int testDceRemovesUnusedLiteral()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto orphan = addBinding(m, entry, ir::LitInt{42});       // unused
+    auto live   = addBinding(m, entry, ir::LitInt{1});         // returned
+    setReturn(m, entry, live);
+
+    ir::optimise(m);
+
+    const auto & bs = m.blocks[entry].bindings;
+    bool sawOrphan = false, sawLive = false;
+    for (auto & bb : bs) { if (bb.var == orphan) sawOrphan = true; if (bb.var == live) sawLive = true; }
+    if (sawOrphan || !sawLive) {
+        std::fprintf(stderr, "testDceRemovesUnusedLiteral: orphan=%d live=%d (expected 0/1)\n",
+            (int)sawOrphan, (int)sawLive);
+        return 1;
+    }
+    std::fprintf(stderr, "testDceRemovesUnusedLiteral: OK (orphan removed, live kept)\n");
+    return 0;
+}
+
+// DCE must NEVER eliminate an impure unused binding (e.g. Force,
+// App, AttrSelect): the program may rely on the side-effect (a
+// throw, a primop).  Construct an unused Force on a thunk and
+// verify it survives optimise().
+static int testDceKeepsImpureUnused()
+{
+    auto m = ir::makeModule();
+
+    // Inner thunk that throws if forced.  We don't actually run it;
+    // we just check the Force binding is preserved.
+    auto thunkFid = addFunction(m);
+    auto thunkBody = m.freshBlock();
+    {
+        auto & f = funcOf(m, thunkFid);
+        f.entryBlock = thunkBody;
+        f.name = "side-effect";
+        auto z = addBinding(m, thunkBody, ir::LitInt{0});
+        setReturn(m, thunkBody, z);
+    }
+
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto th = addBinding(m, entry, ir::MkThunk{thunkFid, /*freeVars*/ {}});
+    auto unused = addBinding(m, entry, ir::Force{th});         // impure, unused
+    auto live   = addBinding(m, entry, ir::LitInt{7});
+    setReturn(m, entry, live);
+
+    ir::optimise(m);
+
+    bool sawForce = false;
+    for (auto & bb : m.blocks[entry].bindings)
+        if (bb.var == unused && std::holds_alternative<ir::Force>(bb.expr)) sawForce = true;
+    if (!sawForce) {
+        std::fprintf(stderr, "testDceKeepsImpureUnused: Force was DCE'd -- impure binding must survive\n");
+        return 1;
+    }
+    std::fprintf(stderr, "testDceKeepsImpureUnused: OK (unused Force preserved)\n");
     return 0;
 }
 
@@ -932,6 +1012,8 @@ int main()
     rc |= testFoldComparisons();
     rc |= testFoldThroughVarRef();
     rc |= testFoldFloat();
+    rc |= testDceRemovesUnusedLiteral();
+    rc |= testDceKeepsImpureUnused();
     rc |= testLambdaCall();
     rc |= testClosureCapture();
     rc |= testIf();
