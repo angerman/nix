@@ -2917,29 +2917,43 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
 #endif
             bridgePrimOp1 = vp;
         }
+        // #437: refuse to bridge v3 closures that have formals
+        // (`{a, b ? def}: body`).  Bridging them as
+        // `mkPrimOpApp(__v3_call_bridge_1, h)` strips tree-walker's
+        // autoCallFunction formal dispatch, AND the future bridge1
+        // invocation will deep-force the formal arg via
+        // `treeWalkerToV3` -- if any attr is mid-construction in an
+        // outer tree-walker frame (eg the NixOS module fixed-point's
+        // `config`), the deep force trips ExprBlackHole (cardano-node
+        // Phase-5 cycle).
+        //
+        // Throw a blackhole-shaped runtime_error: the existing
+        // `isBlackhole`/`isBlackholeAttr`/`isBlackholeList` checks at
+        // primops.cc:2358/2519/2588 match this prefix and route to
+        // their fallbackExpr re-evaluation paths.  When called from a
+        // lazy list/attr bridge, that re-evaluates the source Expr
+        // via tree-walker, giving tree-walker the original ExprLambda
+        // to dispatch through its native formal-dispatch.
+        if (v.tag() == Tag::Closure
+            && v.payload.closure
+            && v.payload.closure->desc
+            && v.payload.closure->desc->hasFormals)
+        {
+            static const bool s_dbg =
+                std::getenv("V3_DBG_BRIDGE1") != nullptr;
+            if (s_dbg) std::fprintf(stderr,
+                "v3 v3ToTreeWalker: refusing <formals> closure "
+                "(name='%s' arity=%u nFormals=%zu)\n",
+                v.payload.closure->desc->name.c_str(),
+                (unsigned)v.payload.closure->desc->arity,
+                v.payload.closure->desc->formals.size());
+            throw std::runtime_error(
+                "v3 forceValue: infinite recursion (blackhole) "
+                "-- <formals> closure cannot bridge as primOpApp");
+        }
         auto & tbl = v3BridgeClosures();
         size_t handle = tbl.size();
         tbl.push_back({v, tlBridgeFallbackExpr});
-        // #437: log closure-bridge registrations so we can identify
-        // which v3 closure handle=N corresponds to.
-        {
-            static const bool s_dbg = std::getenv("V3_DBG_BRIDGE1") != nullptr;
-            if (s_dbg) {
-                std::fprintf(stderr,
-                    "v3 bridge1 register: handle=%zu v.tag=%d closure=%p fallback=%p\n",
-                    handle, (int)v.tag(),
-                    v.tag() == Tag::Closure ? (void *)v.payload.closure : nullptr,
-                    (void *)tlBridgeFallbackExpr);
-                if (v.tag() == Tag::Closure && v.payload.closure
-                    && v.payload.closure->desc) {
-                    const auto * d = v.payload.closure->desc;
-                    std::fprintf(stderr,
-                        "  desc: name='%s' codeOffset=%u nUp=%u nLocals=%u\n",
-                        d->name.c_str(), d->codeOffset, d->nUpvalues,
-                        d->nLocals);
-                }
-            }
-        }
         nix::Value * vHandle = ns.allocValue();
         vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
         out->mkPrimOpApp(bridgePrimOp1, vHandle);
