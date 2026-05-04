@@ -745,6 +745,15 @@ struct V3HookStats {
     uint64_t forceHookOuterWithRefused = 0;
     uint64_t forceHookOuterWithEmpty   = 0;
 
+    /// #430 measurement: how often the call hook fires + outcome.
+    /// Pre-#430 the hook had no entry counter, hiding what fraction
+    /// of tree-walker callFunction invocations actually reach v3.
+    uint64_t callHookEntries          = 0;  // every call to v3CallFunctionEntry
+    uint64_t callHookGated            = 0;  // returned false from gate (NIX_USE_V3 off, lambda has formals, etc.)
+    uint64_t callHookCacheMiss        = 0;  // ent missing from subCache
+    uint64_t callHookHits             = 0;  // ran v3 closure body successfully
+    uint64_t callHookBodyThrew        = 0;  // v3 closure threw during run
+    uint64_t callHookResultBridgeFailed = 0; // result bridge declined
     /// #436: call-hook closure-shape result refusals.  Tracks how
     /// often v3CallFunctionEntry declined to bridge a Tag::Closure /
     /// PrimOp / PrimOpApp / Thunk / App / Blackhole result back to
@@ -1024,6 +1033,19 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     std::fprintf(stderr,
                         "v3 call-hook: closure-result refused=%llu\n",
                         (unsigned long long)s.callHookClosureResultRefused);
+                // #430: call-hook coverage funnel.  How often does
+                // v3CallFunctionEntry fire and what fraction takes
+                // the v3 fast-path?  Critical for sizing the
+                // bytecode-stdlib opportunity.
+                if (s.callHookEntries > 0)
+                    std::fprintf(stderr,
+                        "v3 call-hook: entries=%llu hits=%llu gated=%llu cacheMiss=%llu bodyThrew=%llu resultBridgeFailed=%llu\n",
+                        (unsigned long long)s.callHookEntries,
+                        (unsigned long long)s.callHookHits,
+                        (unsigned long long)s.callHookGated,
+                        (unsigned long long)s.callHookCacheMiss,
+                        (unsigned long long)s.callHookBodyThrew,
+                        (unsigned long long)s.callHookResultBridgeFailed);
             });
         }
         return true;
@@ -2050,10 +2072,12 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         if (!a || std::string_view(a) != "1") return false;
         return std::getenv("NIX_V3_NO_CALL") == nullptr;
     }();
-    if (!useV3Call) return false;
-    if (!fun.isLambda()) return false;
+    auto & st = v3HookStats();
+    st.callHookEntries++;
+    if (!useV3Call) { st.callHookGated++; return false; }
+    if (!fun.isLambda()) { st.callHookGated++; return false; }
     nix::ExprLambda * lambda = fun.lambda().fun;
-    if (!lambda) return false;
+    if (!lambda) { st.callHookGated++; return false; }
     // #437: refuse to call v3-compiled lambdas with formal-attrset
     // patterns (`{a, b ? def}: body`).  The v3 closure expects the
     // arg attrset deep-converted via `treeWalkerToV3Public`, which
@@ -2063,13 +2087,13 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // eval-hook's WC-21 hasFormals filter.  Tree-walker's
     // autoCallFunction dispatches formals with proper per-formal
     // default laziness.
-    if (lambda->getFormals()) return false;
+    if (lambda->getFormals()) { st.callHookGated++; return false; }
 
     // Re-entrancy guard: if we're inside a v3 hook already, fall back
     // to tree-walker.  Mirrors v3ForceEntry's discipline -- nested
     // re-entries can ladder the C stack across the bridge.
     static thread_local int s_callDepth = 0;
-    if (s_callDepth > 0) return false;
+    if (s_callDepth > 0) { st.callHookGated++; return false; }
     struct DepthGuard {
         int & d;
         DepthGuard(int & d_) : d(d_) { ++d; }
@@ -2081,11 +2105,11 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // share the same map) -- the call hook differentiates by AST kind.
     auto & subCache = v3SubExprCache();
     auto sit = subCache.find(lambda);
-    if (sit == subCache.end()) return false;
+    if (sit == subCache.end()) { st.callHookCacheMiss++; return false; }
     auto & ent = sit->second;
-    if (!ent.isLambda) return false; // call hook only handles lambdas
-    if (ent.phaseBFailed) return false;
-    if (ent.outerWithRefused) return false;
+    if (!ent.isLambda) { st.callHookGated++; return false; }
+    if (ent.phaseBFailed) { st.callHookGated++; return false; }
+    if (ent.outerWithRefused) { st.callHookGated++; return false; }
 
     // env at call entry == fun.lambda().env (the lambda's captured env).
     // upvalueSources offsets are relative to this env, NOT to the env
@@ -2146,9 +2170,11 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         // Any throw -> blacklist this lambda for the rest of the
         // process, fall back.  Mirrors v3ForceEntry's WC-14.6 policy.
         ent.phaseBFailed = true;
+        st.callHookBodyThrew++;
         return false;
     } catch (...) {
         ent.phaseBFailed = true;
+        st.callHookBodyThrew++;
         return false;
     }
 
@@ -2192,10 +2218,12 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     try {
         tmp = v3ToTreeWalkerPublic(state, r);
     } catch (const std::exception &) {
+        st.callHookResultBridgeFailed++;
         return false;
     }
-    if (!tmp) return false;
+    if (!tmp) { st.callHookResultBridgeFailed++; return false; }
     vRes = *tmp;
+    st.callHookHits++;
     (void)pos; // currently unused; could decorate trace messages later.
     return true;
 }
