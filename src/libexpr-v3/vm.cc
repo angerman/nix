@@ -742,7 +742,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     while (running) {
         // V3_DBG_TRACE_THUNK_BODY: print this instruction if the current
         // frame is a thunk frame matching the configured codeOffset/nUp.
-        if (s_trace_env && !vm.frames.empty()) {
+        // Profile (sample on fib38) showed this branch alone consumed
+        // ~10% of dispatchLoop time even though it's almost always
+        // false.  Mark it unlikely so the compiler keeps the cold body
+        // off the fast path and predicts the branch correctly.
+        if (__builtin_expect(s_trace_env != nullptr, 0)
+            && !vm.frames.empty()) [[unlikely]] {
             const auto & cur = vm.frames.back();
             if (cur.thunk && (cur.flags & CFF_THUNK_RETURN)
                 && cur.thunk->nUpvalues == s_trace_nup)
@@ -766,7 +771,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
         }
         Instruction instr = cu->code[ip++];
-        if (kCountInstructions) vm.nrInstructions++;
+        if (__builtin_expect(kCountInstructions, 0)) [[unlikely]]
+            vm.nrInstructions++;
         Op op = decodeOp(instr);
         uint32_t operand = decodeOperand(instr);
 
