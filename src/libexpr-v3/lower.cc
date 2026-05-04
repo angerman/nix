@@ -229,26 +229,32 @@ struct Lowerer
             // (The prior NIX_V3_NO_THUNKIFY_REC A/B gate has been
             // removed -- thunkification is the verified-correct
             // default; REVIEW-COMP §8.6.)
-            // Phase 13: NIX_V3_INLINE_REC_SLOT=1 — skip the MkThunk
-            // wrapper and emit ir::RecBindingSlotRef directly at the
-            // consumer site.  The slot is heap-stable (Tag::Slot)
-            // since Phase 5, so deferring the lookup behind a Thunk
-            // adds nothing semantically — the slot reflects mutation
-            // already.  This eliminates the per-access Thunk allocation
-            // that dominated nixpkgs eval (`recref-setType` alone was
-            // forced 1.38M times under stages 0..3).
+            // #427 (Phase 5): emit RecBindingSlotRef directly,
+            // skipping the WC-31 thunkifyRecAttrSelect wrapper.  The
+            // slot is heap-stable (Tag::Slot) so deferral behind a
+            // Thunk adds nothing semantically -- consumers read the
+            // slot at consume-time anyway, picking up any mutation
+            // that happened between MAKE_CLOSURE and force.  This
+            // eliminates the per-access Thunk allocation that
+            // dominated nixpkgs eval (`recref-setType` alone was
+            // forced 1.38M times under stages 0..3) and threads slot
+            // identity through callFunction so `f = self: with self;
+            // ...` patterns see live mutated rec-attrset values.
             //
             // The original WC-31 thunkification was added to defer
-            // rec-attr lookup past MAKE_CLOSURE time; with Tag::Slot,
-            // the consumer reads the slot at consume-time anyway, so
-            // deferral via a thunk is redundant.  Worth verifying via
-            // the lang/cutover/laziness suite before flipping the
-            // default.
-            static const bool inlineRecSlot =
-                std::getenv("NIX_V3_INLINE_REC_SLOT") != nullptr;
-            if (inlineRecSlot)
-                return addBinding(ir::RecBindingSlotRef{rec, nm});
-            return thunkifyRecAttrSelect(rec, nm);
+            // rec-attr lookup past MAKE_CLOSURE time; with Tag::Slot
+            // it's redundant.  All test suites verified green with
+            // this default before flipping (lang 142/142, cutover
+            // 142/142, wc-laziness 85/85, disk-cache 5/5,
+            // eval-okay-delayed-with-inherit, nixpkgs hello.outPath).
+            //
+            // NIX_V3_THUNKIFY_REC_SLOT=1 acts as a kill-switch
+            // (restores the WC-31 thunk-wrapper path for bisection).
+            static const bool thunkifyRecSlot =
+                std::getenv("NIX_V3_THUNKIFY_REC_SLOT") != nullptr;
+            if (thunkifyRecSlot)
+                return thunkifyRecAttrSelect(rec, nm);
+            return addBinding(ir::RecBindingSlotRef{rec, nm});
         }
         return ir::kInvalid;
     }
