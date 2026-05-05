@@ -21,6 +21,7 @@ subdir('nix-meson-build-support/deps-lists')
 
 deps_private_maybe_subproject = [
   dependency('nix-util'),
+  dependency('nix-store'),
   dependency('nix-expr'),
   dependency('nix-main'),
 ]
@@ -31,6 +32,13 @@ subdir('nix-meson-build-support/subprojects')
 # the same way.
 toml11 = dependency('toml11', version : '>=3.7.0', method : 'cmake', modules : ['toml11::toml11'])
 deps_other += toml11
+
+# disk_cache.cc uses sqlite3 directly for BLOB column reads (the
+# libnixstore SQLiteStmt::Use API exposes only TEXT/INT bind/fetch
+# helpers; raw blobs need sqlite3_bind_blob / sqlite3_column_blob).
+# Mirrors the dependency surface of src/libexpr/meson.build.
+sqlite = dependency('sqlite3', 'sqlite', version : '>=3.6.19')
+deps_other += sqlite
 
 subdir('nix-meson-build-support/export-all-symbols')
 subdir('nix-meson-build-support/windows-version')

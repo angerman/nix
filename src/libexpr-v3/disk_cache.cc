@@ -1,26 +1,54 @@
 /// @file
-/// File-based disk cache for v3 CompilationUnit blobs.  See
-/// include/v3/disk_cache.hh.
+/// SQLite-backed disk cache for v3 CompilationUnit blobs.
+///
+/// Single SQLite DB at `$XDG_CACHE_HOME/nix/v3-bytecode-v1.sqlite`.
+/// Schema mirrors src/libexpr/bytecode-disk-cache.cc and the rest of
+/// nix's caches (libfetchers, nar-info-disk-cache, eval-cache):
+///
+///   key       BLOB PRIMARY KEY     -- 32-byte SHA-256 of source text
+///   blob      BLOB                 -- serialize::serializeCU output
+///   schema    INTEGER              -- serialize::kSchemaVersion gate
+///   last_used INTEGER              -- unix-epoch (LRU eviction)
+///   size      INTEGER              -- blob size for total-size queries
+///
+/// WAL mode + isCache() pragmas (`-PRAGMA synchronous=OFF;
+/// -PRAGMA journal_mode=TRUNCATE`) — same trade-off the eval-cache and
+/// fetcher caches make: a crash mid-write may lose recent inserts but
+/// never corrupts older entries, and the cache is fully advisory.
+///
+/// Concurrency: SQLite WAL allows one writer + N readers simultaneously
+/// across processes.  `INSERT OR IGNORE` makes racing inserts safe;
+/// the first writer's blob wins (same content-hash key → same blob, so
+/// the loser silently retries on its next lookup).
+///
+/// Replaces the prior file-per-key layout under `nix/v3-bc-v1/<hex64>`
+/// (~1 file per CU) with one DB file.  Migration: there is none — the
+/// file layout was opt-in (NIX_V3_DISK_CACHE) and never relied on by
+/// any released code.  Delete the old directory manually if it exists.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 ///   Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/disk_cache.hh"
+#include "v3/serialize.hh"
 #include "nix/util/hash.hh"
+#include "nix/util/sync.hh"
+#include "nix/util/users.hh"
+#include "nix/util/file-system.hh"
+#include "nix/store/sqlite.hh"
 
-#include <algorithm>
+#include <sqlite3.h>
+
 #include <atomic>
-#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
-#include <fstream>
-#include <pthread.h>
-#include <sstream>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <unistd.h>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
 
 namespace nix::v3::disk_cache {
 
@@ -51,42 +79,84 @@ void sha256(std::string_view data, CacheKey & out)
     std::memcpy(out.bytes, h.hash, 32);
 }
 
-/// Cache directory: $XDG_CACHE_HOME/nix/v3-bc-v1 or ~/.cache/nix/v3-bc-v1.
-/// Computed once on first use; created if missing.  On creation
-/// failure (read-only filesystem, etc.) the directory is left as
-/// an empty string and lookups/inserts no-op.
-std::string & cacheDir()
+constexpr const char * kSchema = R"sql(
+create table if not exists CompilationUnits (
+    key       blob primary key,
+    blob      blob not null,
+    schema    integer not null,
+    last_used integer not null,
+    size      integer not null
+);
+create index if not exists idx_lru on CompilationUnits(last_used);
+)sql";
+
+/// Lazily-opened SQLite handle.  Wrapped in Sync<> so any thread can
+/// call lookup/insert; the SQLite handle itself is single-threaded.
+/// On any open/exec failure we set `failed=true` and silently no-op
+/// every subsequent call — the cache is purely advisory.
+struct DbState
 {
-    static std::string dir = []{
-        const char * env = std::getenv("NIX_V3_CACHE_DIR");
-        std::string base;
-        if (env && *env) {
-            base = env;
-        } else if (const char * xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg) {
-            base = std::string(xdg) + "/nix/v3-bc-v1";
-        } else if (const char * home = std::getenv("HOME"); home && *home) {
-            base = std::string(home) + "/.cache/nix/v3-bc-v1";
-        } else {
-            return std::string{};  // No reasonable place — disable cache.
-        }
-        // Best-effort mkdir -p.  Walk up the path, mkdir each segment.
-        // Failure on the leaf is fatal; we simply leave dir empty.
-        size_t pos = 0;
-        while (pos < base.size()) {
-            size_t next = base.find('/', pos + 1);
-            std::string seg = base.substr(0, next == std::string::npos
-                                            ? base.size() : next);
-            if (!seg.empty())
-                mkdir(seg.c_str(), 0755);  // ignore errors; rely on leaf check
-            if (next == std::string::npos) break;
-            pos = next;
-        }
-        struct stat st;
-        if (stat(base.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
-            return std::string{};
-        return base;
-    }();
-    return dir;
+    nix::SQLite db;
+    nix::SQLiteStmt insert;
+    nix::SQLiteStmt lookup;
+    nix::SQLiteStmt updateLastUsed;
+    bool initialised = false;
+};
+
+struct DbHandle
+{
+    std::atomic<bool> failed{false};
+    nix::Sync<DbState> state;
+};
+
+DbHandle & dbHandle()
+{
+    static DbHandle h;
+    return h;
+}
+
+/// Compute the database path.  Honours NIX_V3_CACHE_DIR (legacy env
+/// var name from the file-per-key cache) for tests / benchmarks; falls
+/// back to `getCacheDir() / v3-bytecode-v1.sqlite` (XDG-compliant).
+std::filesystem::path computeDbPath()
+{
+    if (const char * override = std::getenv("NIX_V3_CACHE_DIR");
+        override && *override)
+        return std::filesystem::path(override) / "v3-bytecode-v1.sqlite";
+    return std::filesystem::path(nix::getCacheDir()) / "v3-bytecode-v1.sqlite";
+}
+
+/// Open + populate prepared statements on first use.  Returns false
+/// on irrecoverable failure (caller treats as cache disabled).
+bool ensureOpen()
+{
+    auto & h = dbHandle();
+    if (h.failed.load(std::memory_order_relaxed)) return false;
+    auto state = h.state.lock();
+    if (state->initialised) return true;
+    try {
+        auto path = computeDbPath();
+        nix::createDirs(path.parent_path());
+        state->db = nix::SQLite(path, {.useWAL = true});
+        state->db.isCache();
+        state->db.exec(kSchema);
+        state->insert.create(
+            state->db,
+            "insert or ignore into CompilationUnits "
+            "(key, blob, schema, last_used, size) "
+            "values (?, ?, ?, unixepoch(), ?)");
+        state->lookup.create(
+            state->db,
+            "select blob from CompilationUnits where key = ? and schema = ?");
+        state->updateLastUsed.create(
+            state->db,
+            "update CompilationUnits set last_used = unixepoch() where key = ?");
+        state->initialised = true;
+        return true;
+    } catch (...) {
+        h.failed.store(true, std::memory_order_relaxed);
+        return false;
+    }
 }
 
 } // namespace
@@ -94,12 +164,14 @@ std::string & cacheDir()
 CacheKey computeKeyForFile(const std::string & path)
 {
     CacheKey k{};
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return k;
-    std::ostringstream oss;
-    oss << f.rdbuf();
-    std::string content = oss.str();
-    sha256(content, k);
+    try {
+        // Read the file into a buffer and hash.  On failure leave the
+        // key empty so callers no-op the cache.
+        std::string content = nix::readFile(path);
+        sha256(content, k);
+    } catch (...) {
+        // Empty key signals "uncacheable".
+    }
     return k;
 }
 
@@ -113,61 +185,65 @@ CacheKey computeKeyForString(std::string_view content)
 std::optional<std::string> lookup(const CacheKey & key)
 {
     auto & st = stats();
-    if (key.empty()) {
-        // Caller passed an unset key — no cache hit possible.
+    if (key.empty()) return std::nullopt;
+    if (!ensureOpen()) { st.misses++; return std::nullopt; }
+    st.lookups++;
+    auto & h = dbHandle();
+    try {
+        auto state = h.state.lock();
+        // Use the raw sqlite3 API for blob bind + blob fetch; the
+        // SQLiteStmt::Use helper only handles TEXT/INT (its getStr
+        // path goes through column_text which truncates at NUL).
+        sqlite3_stmt * raw = static_cast<sqlite3_stmt *>(state->lookup);
+        sqlite3_reset(raw);
+        sqlite3_bind_blob(raw, 1, key.bytes, sizeof key.bytes, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(raw, 2,
+            static_cast<int64_t>(serialize::kSchemaVersion));
+        int rc = sqlite3_step(raw);
+        if (rc != SQLITE_ROW) { st.misses++; return std::nullopt; }
+        const void * data = sqlite3_column_blob(raw, 0);
+        int len = sqlite3_column_bytes(raw, 0);
+        std::string blob(static_cast<const char *>(data),
+                         static_cast<size_t>(len));
+        // Best-effort LRU bump.  Failures are silent.
+        try {
+            sqlite3_stmt * up = static_cast<sqlite3_stmt *>(state->updateLastUsed);
+            sqlite3_reset(up);
+            sqlite3_bind_blob(up, 1, key.bytes, sizeof key.bytes, SQLITE_TRANSIENT);
+            sqlite3_step(up);
+        } catch (...) { /* advisory */ }
+        st.hits++;
+        return blob;
+    } catch (...) {
+        h.failed.store(true, std::memory_order_relaxed);
+        st.misses++;
         return std::nullopt;
     }
-    st.lookups++;
-    auto & dir = cacheDir();
-    if (dir.empty()) { st.misses++; return std::nullopt; }
-    std::string path = dir + "/" + key.hex();
-    std::ifstream f(path, std::ios::binary);
-    if (!f) { st.misses++; return std::nullopt; }
-    std::ostringstream oss;
-    oss << f.rdbuf();
-    std::string content = oss.str();
-    if (content.empty()) { st.misses++; return std::nullopt; }
-    st.hits++;
-    return content;
 }
 
 void insert(const CacheKey & key, std::string_view blob)
 {
     auto & st = stats();
     if (key.empty() || blob.empty()) return;
-    auto & dir = cacheDir();
-    if (dir.empty()) return;
-    std::string finalPath = dir + "/" + key.hex();
-    // REVIEW_2026-05-04 B-4 / §6.4: writer-unique temp path.  Previous
-    // `finalPath + ".tmp"` collided when two concurrent writers (within
-    // a process or across processes) hit the same content-hash key.
-    // Same key → same blob converges harmlessly TODAY, but any schema
-    // drift mid-process or partial write would produce torn data
-    // visible to the rename winner.  Disambiguate by pid + thread id +
-    // a process-local sequence so each writer has its own temp file.
-    static std::atomic<uint64_t> seq{0};
-    char buf[64];
-    std::snprintf(buf, sizeof buf, ".tmp.%lld.%llu.%llu",
-        (long long)::getpid(),
-        (unsigned long long)pthread_self(),
-        (unsigned long long)seq.fetch_add(1, std::memory_order_relaxed));
-    std::string tempPath = finalPath + buf;
-    {
-        std::ofstream f(tempPath, std::ios::binary | std::ios::trunc);
-        if (!f) { st.insertFailures++; return; }
-        f.write(blob.data(), static_cast<std::streamsize>(blob.size()));
-        if (!f) { st.insertFailures++; std::remove(tempPath.c_str()); return; }
-    }
-    if (std::rename(tempPath.c_str(), finalPath.c_str()) != 0) {
-        // rename can fail if another writer already moved a file into
-        // place between our open() and rename().  Same content-hash
-        // key → same blob, so the winner's data is correct; we just
-        // discard our temp.
-        std::remove(tempPath.c_str());
+    if (!ensureOpen()) { st.insertFailures++; return; }
+    auto & h = dbHandle();
+    try {
+        auto state = h.state.lock();
+        sqlite3_stmt * raw = static_cast<sqlite3_stmt *>(state->insert);
+        sqlite3_reset(raw);
+        sqlite3_bind_blob(raw, 1, key.bytes, sizeof key.bytes, SQLITE_TRANSIENT);
+        sqlite3_bind_blob(raw, 2, blob.data(),
+            static_cast<int>(blob.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(raw, 3,
+            static_cast<int64_t>(serialize::kSchemaVersion));
+        sqlite3_bind_int64(raw, 4, static_cast<int64_t>(blob.size()));
+        int rc = sqlite3_step(raw);
+        if (rc != SQLITE_DONE) { st.insertFailures++; return; }
+        st.inserts++;
+    } catch (...) {
+        h.failed.store(true, std::memory_order_relaxed);
         st.insertFailures++;
-        return;
     }
-    st.inserts++;
 }
 
 Stats & stats() noexcept
