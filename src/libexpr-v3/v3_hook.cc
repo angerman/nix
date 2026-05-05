@@ -55,6 +55,20 @@ struct ScopedEagerBridge {
     ~ScopedEagerBridge() { popForceEagerBridge(prev); }
 };
 
+// #452 / Phase C: forward decl of the shallow-TW-attrs-bridge knob.
+// Held by the call hook for the duration of runLambda when the
+// lambda has formals.  Switches treeWalkerToV3's nAttrs case from
+// deep conversion to per-entry Bridge-thunk wrap, matching TW's
+// per-formal lazy semantics so mid-construction attrset entries
+// don't blackhole on lambda entry.
+bool pushShallowTWAttrsBridge();
+void popShallowTWAttrsBridge(bool prev);
+struct ScopedShallowTWAttrsBridge {
+    bool prev;
+    ScopedShallowTWAttrsBridge() : prev(pushShallowTWAttrsBridge()) {}
+    ~ScopedShallowTWAttrsBridge() { popShallowTWAttrsBridge(prev); }
+};
+
 // We don't expose treeWalkerToV3 here — the AST already carries
 // nix::Expr nodes, not nix::Value, so we lower the Expr directly.
 
@@ -2558,18 +2572,33 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     if (!fun.isLambda()) { st.callHookGated++; st.callHookGateNotLambda++; return false; }
     nix::ExprLambda * lambda = fun.lambda().fun;
     if (!lambda) { st.callHookGated++; st.callHookGateNullLambda++; return false; }
-    // #437: refuse to call v3-compiled lambdas with formal-attrset
-    // patterns (`{a, b ? def}: body`).  The v3 closure expects the
-    // arg attrset deep-converted via `treeWalkerToV3Public`, which
-    // forces every entry; if any entry is mid-construction in an
-    // outer tree-walker frame (eg the NixOS module fixed-point's
-    // `config`), the deep force trips ExprBlackHole.  Mirror the
-    // eval-hook's WC-21 hasFormals filter.  Tree-walker's
-    // autoCallFunction dispatches formals with proper per-formal
-    // default laziness.
-    // Order matters: check formals BEFORE the cache miss path below
-    // so we don't waste compile cost on lambdas we'll skip anyway.
-    if (lambda->getFormals()) { st.callHookGated++; st.callHookGateFormals++; return false; }
+    // #437 -> #452 Phase C: refuse-formals gate has been LIFTED.
+    // Originally added because deep `treeWalkerToV3Public` arg
+    // conversion forced every entry of `{config, options, lib, ...}`
+    // -> ExprBlackHole on NixOS module fix-points.  Fix A (#437,
+    // 599cb9745) made the call-hook arg a shallow Bridge thunk, so
+    // the arg itself isn't deep-converted on entry.  Phase C closes
+    // the remaining issue: the lambda body's destructuring forces
+    // the Bridge -> treeWalkerToV3 of the param attrset.  That
+    // recursive conversion still deep-forced every entry until #452.
+    //
+    // #452 introduces the per-thread `shallowTWAttrsBridge` flag.
+    // The call hook below sets it via ScopedShallowTWAttrsBridge
+    // for the duration of runLambda, so treeWalkerToV3's nAttrs
+    // case wraps each entry in a fresh Bridge thunk instead of
+    // recursively converting -- only entries the body actually
+    // accesses get force-converted, matching TW's per-formal lazy
+    // semantics.  Mid-construction entries (config, etc.) stay
+    // unforced unless the body would have forced them in TW too.
+    //
+    // Disable Phase C via NIX_V3_NO_CALL_FORMALS=1 to re-impose the
+    // gate (e.g. for A/B regressions).
+    static const bool refuseFormals =
+        std::getenv("NIX_V3_NO_CALL_FORMALS") != nullptr;
+    if (refuseFormals && lambda->getFormals()) {
+        st.callHookGated++; st.callHookGateFormals++; return false;
+    }
+    bool hasFormals = lambda->getFormals().has_value();
 
     // Re-entrancy guard: cap nested call-hook entries.  Default 0
     // (any nested entry falls back to tree-walker) is the verified-
@@ -2907,6 +2936,12 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // Optional RAII guard; held for runLambda + result bridge.
     std::optional<ScopedEagerBridge> eagerGuard;
     if (callHookEager && isOnDemandRoot) eagerGuard.emplace();
+    // #452 / Phase C: shallow TW-attrs bridge for formals lambdas.
+    // The body's first force of the param attrset converts each
+    // entry to a Bridge thunk, not a deep v3 value; only entries
+    // the body references get force-converted on demand.
+    std::optional<ScopedShallowTWAttrsBridge> shallowGuard;
+    if (hasFormals) shallowGuard.emplace();
     try {
         r = runLambda(*ent.cu, ent.funcIdx, v3Arg,
             upvalues.data(), static_cast<uint32_t>(upvalues.size()),

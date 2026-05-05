@@ -2361,8 +2361,16 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
 /// (near the public bridge entry points), at file scope.  This
 /// forward-decl is at file scope to avoid the anon-namespace name-
 /// lookup quirk that would resolve to an anon-internal symbol.
+///
+/// #452 / Phase C: same trick for the shallow-TW-attrs-bridge flag.
+/// When set, treeWalkerToV3's nAttrs case wraps each TW entry in a
+/// v3 Bridge thunk (Tag::Thunk) instead of deeply converting.  This
+/// matches TW's per-formal lazy semantics: a formals lambda body
+/// only forces the entries it actually references, so blackholes
+/// on mid-construction entries (NixOS module fix-points' `config`)
+/// don't trip until the body would have hit them in TW too.
 } } // close anon + nix::v3 to declare at file scope
-namespace nix::v3 { bool forceEagerBridge(); }
+namespace nix::v3 { bool forceEagerBridge(); bool shallowTWAttrsBridge(); }
 namespace nix::v3 { namespace {
 
 /// 1-arg variant of the v3-closure bridge.  Used by v3ToTreeWalker
@@ -3260,21 +3268,44 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
             twSymCacheFor = &ns;
             twSymCache.clear();
         }
+        // #452 / Phase C: when the call hook sets the shallow-TW-attrs
+        // flag, wrap each entry's TW Value* in a v3 Bridge thunk
+        // instead of recursively converting.  Body forces of specific
+        // entries call treeWalkerToV3 lazily on just-that-value, which
+        // matches TW's `{a, b ? def}: body` lazy formal semantics --
+        // only entries the body references get materialised.  Critical
+        // for NixOS module fix-points where some entries (e.g. `config`)
+        // are mid-construction at the call site; deep conversion would
+        // trip ExprBlackHole on every call.
+        bool shallow = shallowTWAttrsBridge();
         std::vector<std::pair<SymbolId, Value>> entries;
         entries.reserve(a->size());
         for (auto & it : *a) {
-            uint32_t key = it.name.getId();
+            uint32_t k = it.name.getId();
             SymbolId sid;
-            if (key < twSymCache.size() && twSymCache[key] != 0) {
-                sid = twSymCache[key];
+            if (k < twSymCache.size() && twSymCache[k] != 0) {
+                sid = twSymCache[k];
             } else {
                 std::string_view name(ns.symbols[it.name]);
                 sid = vmIntern(state, name);
-                if (key >= twSymCache.size())
-                    twSymCache.resize(key + 1, 0);
-                twSymCache[key] = sid;
+                if (k >= twSymCache.size())
+                    twSymCache.resize(k + 1, 0);
+                twSymCache[k] = sid;
             }
-            entries.emplace_back(sid, treeWalkerToV3(state, *it.value, seen));
+            Value entryVal;
+            if (shallow) {
+                // Wrap the TW entry's Value* in a v3 Bridge thunk.  No
+                // forcing now; the body's per-formal access will force
+                // (or not) on demand.
+                Thunk * t = Alloc::allocBridgeThunk(
+                    static_cast<void *>(it.value));
+                allocStats().thunksAllocated++;
+                entryVal.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+                entryVal.payload.thunk = t;
+            } else {
+                entryVal = treeWalkerToV3(state, *it.value, seen);
+            }
+            entries.emplace_back(sid, entryVal);
         }
         std::sort(entries.begin(), entries.end(),
             [](auto & x, auto & y) { return x.first < y.first; });
@@ -5706,6 +5737,24 @@ bool pushForceEagerBridge() {
     return prev;
 }
 void popForceEagerBridge(bool prev) { tlsForceEagerBridge = prev; }
+
+// #452 / Phase C: shallow-TW-attrs-bridge flag, parallel to the
+// eager-bridge knob above.  When set, treeWalkerToV3's nAttrs case
+// wraps each TW entry's Value* in a v3 Bridge thunk instead of
+// deeply converting.  Pushed by the call hook for the duration of
+// runLambda when the lambda has formals -- only entries the body
+// references get force-converted, matching TW's per-formal lazy
+// semantics.  Required to safely run NixOS-module-shape lambdas in
+// v3 where some param-attrset entries are mid-construction at the
+// call site (e.g. fix-point's `config`).
+thread_local bool tlsShallowTWAttrsBridge = false;
+bool shallowTWAttrsBridge() { return tlsShallowTWAttrsBridge; }
+bool pushShallowTWAttrsBridge() {
+    bool prev = tlsShallowTWAttrsBridge;
+    tlsShallowTWAttrsBridge = true;
+    return prev;
+}
+void popShallowTWAttrsBridge(bool prev) { tlsShallowTWAttrsBridge = prev; }
 
 void bumpPrimOpCallCount(const PrimOp * po)
 {
