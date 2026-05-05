@@ -81,6 +81,12 @@ Opt-in features (off by default unless noted):
     opcode-table fingerprint (caches invalidate on opcode renumbering).
   - `NIX_V3_BRIDGE1_DEPTH=N`:  cap nested `__v3_call_bridge_1` calls.
     Default 8.  Bounds pthread-stack burn on deep overlay chains.
+  - `NIX_V3_NO_BRIDGE1_SHORTCIRCUIT=1`:  disable the #458 step 2
+    bridge1 short-circuit.  Default ON: when TW's `callFunction`
+    encounters `mkPrimOpApp(__v3_call_bridge_1, handle)`, route
+    directly via v3's `callClosure`, bypassing TW's primop dispatch
+    (which eagerly forces args -- the cardano-node #455 cycle source).
+    Disable for A/B perf testing.
   - `NIX_V3_PRIMOP_DUMP=1`:  print per-primop call counts at exit
     (plus TW->v3 bridge primop counts: `__v3_call_bridge_1`,
     `__v3_force_attr`, `__v3_force_list_elem`).

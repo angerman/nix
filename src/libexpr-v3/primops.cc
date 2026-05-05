@@ -6265,6 +6265,108 @@ nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v)
     return v3ToTreeWalkerShim ? v3ToTreeWalkerShim(nixState, v) : nullptr;
 }
 
+// #458 step 2: short-circuit TW->v3 closure dispatch.  When TW is
+// about to call a `__v3_call_bridge_1` PrimOpApp, route directly to
+// v3's callClosure -- bypassing TW's primop layer (which would
+// dispatch primV3CallBridge1 and force args eagerly, the cardano-
+// node #455 cycle source).
+//
+// Walks the PrimOpApp chain to find the underlying PrimOp, checks
+// name == "__v3_call_bridge_1", extracts the handle from the chain's
+// arg position, looks up the v3 closure, calls callClosure with the
+// arg wrapped as a Bridge thunk (lazy -- v3's body forces on demand).
+//
+// Returns false on any mismatch so the caller can fall through to
+// TW's regular primop dispatch.
+bool tryDispatchBridge1Direct(nix::EvalState & ns,
+                              const nix::Value & funValue,
+                              nix::Value * arg,
+                              nix::Value & out,
+                              const nix::PosIdx pos)
+{
+    // funValue should be a PrimOpApp.  Walk its left side to find
+    // the underlying PrimOp.
+    if (!funValue.isPrimOpApp()) return false;
+    const nix::Value * cur = &funValue;
+    int depth = 0;
+    while (cur->isPrimOpApp()) {
+        cur = cur->primOpApp().left;
+        ++depth;
+    }
+    if (!cur->isPrimOp()) return false;
+    const nix::PrimOp * po = cur->primOp();
+    if (!po) return false;
+    if (po->name != "__v3_call_bridge_1") return false;
+    // bridge1 has arity 2.  PrimOpApp(bridgePrimOp1, vHandle) means
+    // arity-1-applied; the full call needs ONE more arg from caller
+    // (`arg`).  If depth != 1, the chain is mis-shaped (shouldn't
+    // happen for well-formed bridge1 wrappers) -- decline.
+    if (depth != 1) return false;
+
+    // Extract the handle from the immediate right-side arg.
+    const nix::Value * vHandle = funValue.primOpApp().right;
+    if (!vHandle) return false;
+    ns.forceValue(*const_cast<nix::Value *>(vHandle), pos);
+    if (vHandle->type() != nix::nInt) return false;
+    int64_t h = vHandle->integer().value;
+    auto & tbl = v3BridgeClosures();
+    if (h < 0 || (size_t)h >= tbl.size()) return false;
+
+    // Got a valid bridge1 invocation.  Dispatch via v3 directly:
+    //  1. Wrap the TW arg as a v3 Bridge thunk (lazy -- mirrors what
+    //     primV3CallBridge1 + LAZY_BRIDGE_ARG would have produced
+    //     after the eager force was skipped).
+    //  2. callClosure(vm, v3fn, v3arg).
+    //  3. Bridge result back to TW.
+    Value v3fn = tbl[(size_t)h].v3Value;
+    nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
+
+    Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(arg));
+    allocStats().thunksAllocated++;
+    Value v3Arg;
+    v3Arg.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+    v3Arg.payload.thunk = bridge;
+
+    ScopedNixEvalState _v3evalGuard(&ns);
+    ScopedBridgeFallbackExpr fbGuard{fallbackExpr};
+
+    VMState vm;
+    vm.valueStack.reserve(64 * 1024);
+    vm.frames.reserve(4096);
+    vm.withStack.reserve(64);
+    EvalState st;
+    st.nixEvalState = &ns;
+    st.vm = &vm;
+
+    Value r;
+    try {
+        r = callClosure(*st.vm, v3fn, v3Arg);
+        r = forceValue(*st.vm, r);
+    } catch (const std::exception & ex) {
+        // Bridge1's existing fallbackToTreeWalker path covers the
+        // BlackholeError case via re-running fallbackExpr.  Mirror
+        // that here so behaviour parity holds.
+        if (fallbackExpr && dynamic_cast<const BlackholeError *>(&ex)) {
+            nix::Value tw;
+            try {
+                fallbackExpr->eval(ns, ns.baseEnv, tw);
+                ns.forceValue(tw, pos);
+                ns.callFunction(tw, *arg, out, pos);
+                return true;
+            } catch (...) {
+                return false;  // give up; let TW dispatch handle it
+            }
+        }
+        return false;
+    }
+
+    // Bridge result back to TW.
+    nix::Value * tmp = v3ToTreeWalkerPublic(ns, r);
+    if (!tmp) return false;
+    out = *tmp;
+    return true;
+}
+
 /// Public bridge entry point for the tree-walker -> v3 direction.
 /// Used by the CO-2 phase B force hook to convert env values to
 /// v3 upvalues.  Forces nv to WHNF in tree-walker, then walks the

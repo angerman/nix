@@ -1824,24 +1824,30 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 
     while (args.size() > 0) {
 
-        if (vCur.isLambda()) {
-
-            // #426 / MED-21: try v3 callFunction cutover BEFORE the
-            // tree-walker lambda dispatch.  The hook returns true iff
-            // it handled this single application (lambda + first arg).
-            // On true, advance args and continue the curry loop with
-            // vRes as the new vCur.  Any failure returns false WITHOUT
-            // mutating vRes; tree-walker dispatch proceeds unchanged.
-            if (v3CallFunctionHook) {
-                Value vCallRes;
-                if (v3CallFunctionHook(*this, vCur, args[0], vCallRes, pos)) {
-                    vCur = vCallRes;
-                    args = args.subspan(1);
-                    if (args.size() > 0)
-                        forceValue(vCur, pos);
-                    continue;
-                }
+        // #458 step 2: lift the v3 callFunction cutover hook BEFORE the
+        // type-dispatch.  Originally (#426 / MED-21) it ran only for
+        // `vCur.isLambda()` -- TW lambdas with v3-compiled bodies.
+        // Now it also fires for PrimOpApp -- specifically to intercept
+        // `__v3_call_bridge_1` (TW's wrapper for v3-bridged closures)
+        // and dispatch directly via v3's callClosure, bypassing TW's
+        // primop layer + bridge1's eager-arg-force cycle source.
+        // On `true`, advance args and continue the curry loop with
+        // vRes as the new vCur.  On `false`, mutate nothing; TW's
+        // type-dispatch below proceeds unchanged.
+        if (v3CallFunctionHook
+            && (vCur.isLambda() || vCur.isPrimOpApp()))
+        {
+            Value vCallRes;
+            if (v3CallFunctionHook(*this, vCur, args[0], vCallRes, pos)) {
+                vCur = vCallRes;
+                args = args.subspan(1);
+                if (args.size() > 0)
+                    forceValue(vCur, pos);
+                continue;
             }
+        }
+
+        if (vCur.isLambda()) {
 
             ExprLambda & lambda(*vCur.lambda().fun);
 

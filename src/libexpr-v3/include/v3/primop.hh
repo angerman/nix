@@ -61,7 +61,11 @@ nix::EvalState * getNixEvalState();
 
 } // namespace nix::v3
 
-namespace nix { struct Expr; }
+namespace nix {
+    struct Expr;
+    struct Value;
+    class PosIdx;
+}
 
 namespace nix::v3 {
 
@@ -77,6 +81,26 @@ struct ScopedBridgeFallbackExpr {
     ScopedBridgeFallbackExpr(nix::Expr * e);
     ~ScopedBridgeFallbackExpr();
 };
+
+/// #458 step 2: when TW is about to dispatch a `__v3_call_bridge_1`
+/// PrimOpApp, route the call directly through v3's callClosure
+/// instead of going through TW's primop dispatch (which fires bridge1
+/// and forces args eagerly, the cardano-node #455 cycle source).
+///
+/// `funValue` must be a Value of v3 internal type bound to the bridge1
+/// PrimOp; `arg` is the TW Value passed in (unforced -- v3 will force
+/// on demand inside the closure body via the Bridge thunk).
+/// `out` receives the result, bridged back to a TW Value.
+///
+/// Returns true if the value was dispatched directly via v3.
+/// Returns false if the value isn't a bridge1 PrimOpApp or the
+/// handle is invalid (caller should then fall through to TW's
+/// regular primop dispatch).
+bool tryDispatchBridge1Direct(nix::EvalState & ns,
+                              const nix::Value & funValue,
+                              nix::Value * arg,
+                              nix::Value & out,
+                              const nix::PosIdx pos);
 
 /// REVIEW MED-14: drop every entry from v3BridgeAttrs / v3BridgeLists /
 /// v3BridgeClosures.  These tables grow unboundedly with the number of

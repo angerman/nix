@@ -2681,6 +2681,22 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // off the cutover overhead.
     static const bool onDemandRootEnabled =
         std::getenv("NIX_V3_ON_DEMAND_ROOT") != nullptr;
+    // #458 step 2: bridge1 short-circuit.  When fun is the TW wrapper
+    // of a v3 closure (`mkPrimOpApp(__v3_call_bridge_1, handle)`),
+    // dispatch DIRECTLY via v3's callClosure -- bypassing TW's primop
+    // layer + bridge1's eager-arg-force (the cardano-node #455 cycle
+    // source).  Gate via NIX_V3_NO_BRIDGE1_SHORTCIRCUIT=1 for A/B.
+    // CRITICAL: this MUST run before the empty-subCache bypass below;
+    // the bridge1 path doesn't depend on the lambda subcache and stays
+    // viable even when no v3 lambdas have been lowered yet.
+    static const bool bridge1Shortcut =
+        std::getenv("NIX_V3_NO_BRIDGE1_SHORTCIRCUIT") == nullptr;
+    if (bridge1Shortcut && fun.isPrimOpApp()) {
+        if (tryDispatchBridge1Direct(state, fun, arg, vRes, pos)) {
+            st.callHookHits++;
+            return true;
+        }
+    }
     if (__builtin_expect(v3SubExprCache().empty() && !onDemandRootEnabled, 1)) {
         st.callHookCacheMiss++;
         return false;
