@@ -2680,7 +2680,12 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // is a hash + bucket lookup + key compare.  At 394k entries on
     // hello.name, the difference is the entire cutover overhead.
     auto & subCache = v3SubExprCache();
-    if (__builtin_expect(subCache.empty(), 1)) {
+    // OD enabled means a cacheMiss may still resolve via the on-demand
+    // root-compile path -- only the empty-cache fast-bypass is unsafe
+    // when OD is on.  Cache the env check (cheap and stable per process).
+    static const bool onDemandRootEnabled =
+        std::getenv("NIX_V3_ON_DEMAND_ROOT") != nullptr;
+    if (__builtin_expect(subCache.empty() && !onDemandRootEnabled, 1)) {
         st.callHookCacheMiss++;
         return false;
     }
