@@ -945,23 +945,71 @@ static bool lowerCompileAndPopulate(
     using clock = std::chrono::steady_clock;
     try {
         auto t0 = timingEnabled ? clock::now() : clock::time_point{};
+        // Always lower: we need the freshly-built Module to know
+        // which Expr* maps to which FuncId for populateSubExprCacheLocal,
+        // and Expr* identities aren't stable across runs (so a disk-
+        // cache hit can't restore the AST -> FuncId mapping on its own).
         auto module = lowerNixExpr(e, state.symbols, state.positions);
         ir::optimise(module);
         ir::computeFreeVars(module);
         auto t1 = timingEnabled ? clock::now() : clock::time_point{};
         // Skip precompile of huge modules (e.g. nixpkgs/lib's 504-lambda
         // makeExtensible chain): the populated entries throw at force
-        // time, so the lower+compile cost is wasted.
+        // time, so the lower+compile cost is wasted.  Note: we run
+        // `compile` only on cache miss; a disk-cache hit bypasses
+        // this cap because the bytecode has already proven itself
+        // serializable on a prior run (where it was below the cap).
         static const size_t kMaxFunctions = []{
             if (const char * v = std::getenv("NIX_V3_PRECOMPILE_MAX_FNS"))
                 return (size_t)std::atoi(v);
             return (size_t)200;
         }();
-        if (module.functions.size() > kMaxFunctions) {
-            populatedSet.insert(e);
-            return false;
+        // #447: try the disk cache before paying the compile cost.
+        // Source content keying lives in the parse-time side table
+        // (v3ExprPaths, populated by EvalState::v3RegisterExprHook).
+        // On a hit we deserialize the CU and skip compile entirely,
+        // saving ~28% of LCAP wall (compile is ~21 ms / lower 53 ms
+        // in V3_TIMING runs) per cached file.
+        static const bool diskCacheEnabled =
+            std::getenv("NIX_V3_DISK_CACHE") != nullptr;
+        std::unique_ptr<CompilationUnit> compiled;
+        disk_cache::CacheKey diskKey{};
+        if (diskCacheEnabled && e) {
+            try {
+                auto & paths = v3ExprPaths();
+                auto pit = paths.find(e);
+                if (pit != paths.end()) {
+                    // Match parseExprFromFile's symlink behaviour
+                    // (eval.cc:3803 calls .resolveSymlinks() when
+                    // it reads the file content for parsing).
+                    std::string srcContent =
+                        pit->second.resolveSymlinks().readFile();
+                    diskKey = disk_cache::computeKeyForString(srcContent);
+                }
+            } catch (...) { /* read failure -> empty key -> no cache */ }
         }
-        auto compiled = std::make_unique<CompilationUnit>(compile(module));
+        if (!diskKey.empty()) {
+            if (auto blob = disk_cache::lookup(diskKey)) {
+                try {
+                    compiled = std::make_unique<CompilationUnit>(
+                        serialize::deserializeCU(*blob));
+                } catch (...) { compiled.reset(); /* fall through */ }
+            }
+        }
+        if (!compiled) {
+            if (module.functions.size() > kMaxFunctions) {
+                populatedSet.insert(e);
+                return false;
+            }
+            compiled = std::make_unique<CompilationUnit>(compile(module));
+            // Insert into disk cache for the next run.  Best-effort.
+            if (!diskKey.empty() && serialize::isCacheable(*compiled)) {
+                try {
+                    disk_cache::insert(diskKey,
+                        serialize::serializeCU(*compiled));
+                } catch (...) { /* advisory; failures are silent */ }
+            }
+        }
         auto t2 = timingEnabled ? clock::now() : clock::time_point{};
         if (timingEnabled) {
             st.lowerNs   += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -1089,6 +1137,21 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                         s.compileNs / 1e6,
                         s.runNs     / 1e6,
                         s.bridgeNs  / 1e6);
+                // #447: disk-cache visibility.  Print whenever the
+                // process touched the SQLite cache.
+                {
+                    auto & ds = disk_cache::stats();
+                    if (ds.lookups || ds.inserts) {
+                        std::fprintf(stderr,
+                            "v3 disk-cache: lookups=%llu hits=%llu misses=%llu "
+                            "inserts=%llu insertFailures=%llu\n",
+                            (unsigned long long)ds.lookups,
+                            (unsigned long long)ds.hits,
+                            (unsigned long long)ds.misses,
+                            (unsigned long long)ds.inserts,
+                            (unsigned long long)ds.insertFailures);
+                    }
+                }
                 if (s.forceHookDirectUpvalues || s.forceHookRecBuildUpvalues)
                     std::fprintf(stderr,
                         "v3 force upvalues: direct=%llu recBuild=%llu hitsDirect=%llu hitsWithRec=%llu\n",
