@@ -1996,6 +1996,20 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         // ensures the prior outer Expr's fallback is restored on every
         // exit including throws (manual save/restore had a leak path).
         ScopedBridgeFallbackExpr fallbackGuard{const_cast<nix::Expr *>(e)};
+        // #458 architectural note: this is the v3->TW closure bridge
+        // -- v3ToTreeWalkerPublic wraps the v3 closure as
+        // mkPrimOpApp(__v3_call_bridge_1, handle).  TW invokes via the
+        // primop chain; bridge1 dispatches back into v3.  Every such
+        // bridged closure that ends up called by TW is a candidate
+        // for the v3-primary inversion: if we can detect "the
+        // consumer is also v3" at this hook-exit point, we'd skip the
+        // bridge and keep the closure as a v3 Tag::Closure.  Today the
+        // consumer is opaque from here -- TW's eval of `e` returned to
+        // a TW caller; we don't see whether THAT caller is itself
+        // inside a v3 frame.  Cardano-node has 18+ overlay layers
+        // crossing the bridge; eliminating those would close most of
+        // the #455 cycle.  Tracked under #458; needs call-graph
+        // awareness (thread-local v3-frame depth or similar).
         try {
             nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
             if (tmp) {
