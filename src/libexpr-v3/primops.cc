@@ -2373,6 +2373,16 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
 namespace nix::v3 { bool forceEagerBridge(); bool shallowTWAttrsBridge(); }
 namespace nix::v3 { namespace {
 
+// #453 Phase D: bridge-primop call counters.  Atomics keep them off
+// the hot-path lock; dumped from v3_hook.cc atexit when
+// NIX_V3_PRIMOP_DUMP=1.  These fire when TW calls back into v3 via
+// the bridge primops registered in TW's primop table.  Hot counts
+// here mean v3 is leaking across the cutover; reducing them is the
+// Phase D goal.
+std::atomic<uint64_t> g_bridgeCallBridge1Calls{0};
+std::atomic<uint64_t> g_bridgeForceAttrCalls{0};
+std::atomic<uint64_t> g_bridgeForceListElemCalls{0};
+
 /// 1-arg variant of the v3-closure bridge.  Used by v3ToTreeWalker
 /// for the common case (every Nix lambda is unary at the AST level;
 /// `f x y` is `(f x) y` — two separate 1-arg calls).  Looks up the
@@ -2381,6 +2391,7 @@ namespace nix::v3 { namespace {
 static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
                               nix::Value ** args, nix::Value & out)
 {
+    g_bridgeCallBridge1Calls.fetch_add(1, std::memory_order_relaxed);
     ns.forceValue(*args[0], pos);
     if (args[0]->type() != nix::nInt)
         ns.error<nix::EvalError>("v3 bridge1: handle must be int").debugThrow();
@@ -2573,7 +2584,15 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
 /// Looks up the v3 Tag::Attrs Value at handle, finds the attr by name,
 /// bridges that single value to tree-walker via v3ToTreeWalker (which
 /// for nested Attrs/Lists will itself be lazy, so cycles are bounded).
+static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
+                              nix::Value ** args, nix::Value & out);
 static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
+                            nix::Value ** args, nix::Value & out)
+{
+    g_bridgeForceAttrCalls.fetch_add(1, std::memory_order_relaxed);
+    primV3ForceAttrInner(ns, pos, args, out);
+}
+static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
                              nix::Value ** args, nix::Value & out)
 {
     ns.forceValue(*args[0], pos);
@@ -2676,7 +2695,15 @@ static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
 }
 
 /// WC-15: lazy list-element bridge.  Args: handle (Int), index (Int).
+static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
+                              nix::Value ** args, nix::Value & out);
 static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
+                            nix::Value ** args, nix::Value & out)
+{
+    g_bridgeForceListElemCalls.fetch_add(1, std::memory_order_relaxed);
+    primV3ForceListElemInner(ns, pos, args, out);
+}
+static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
                                  nix::Value ** args, nix::Value & out)
 {
     ns.forceValue(*args[0], pos);
@@ -5718,8 +5745,14 @@ struct PrimOpCounter {
 };
 PrimOpCounter & primOpCounter()
 {
-    static PrimOpCounter c;
-    return c;
+    // #453 Phase D: heap-allocated and intentionally leaked so the
+    // mutex outlives the static-destruction phase.  The previous
+    // function-static had an atexit destruction-order race with libc++
+    // (mutex destroyed before some atexit-registered dump handlers
+    // ran), which is why earlier code couldn't call dumpPrimOpStats
+    // from atexit.  Now it can.
+    static PrimOpCounter * c = new PrimOpCounter();
+    return *c;
 }
 } // anonymous namespace
 
@@ -5766,6 +5799,22 @@ void bumpPrimOpCallCount(const PrimOp * po)
 
 void dumpPrimOpStats(std::FILE * out)
 {
+    // #453 Phase D: bridge primop counters (TW->v3 callbacks).  Print
+    // before the v3-side primop counts because they're the actual
+    // cutover-cost signal; high counts here mean v3 result values
+    // bridged eagerly across the v3<->TW boundary.
+    uint64_t br1 = nix::v3::g_bridgeCallBridge1Calls.load(std::memory_order_relaxed);
+    uint64_t bra = nix::v3::g_bridgeForceAttrCalls.load(std::memory_order_relaxed);
+    uint64_t brl = nix::v3::g_bridgeForceListElemCalls.load(std::memory_order_relaxed);
+    if (br1 || bra || brl) {
+        std::fprintf(out,
+            "v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=%llu "
+            "__v3_force_attr=%llu __v3_force_list_elem=%llu\n",
+            (unsigned long long)br1,
+            (unsigned long long)bra,
+            (unsigned long long)brl);
+    }
+
     auto & c = primOpCounter();
     std::lock_guard<std::mutex> g(c.mtx);
     if (c.counts.empty()) return;

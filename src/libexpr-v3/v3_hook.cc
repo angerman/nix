@@ -1342,14 +1342,14 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 {
     auto & st = v3HookStats();
     st.evalEntries++;
-    // Register a stats-dump atexit handler on first entry.  We
-    // intentionally do NOT call dumpPrimOpStats() here (its
-    // static-mutex hits a destruction-order crash on libc++ exit
-    // path); the simple POD counters in V3HookStats are safe to
-    // read since they don't have non-trivial destructors.  Use
-    // v3-eval directly for primop-level profiling.
+    // Register a stats-dump atexit handler on first entry.  As of
+    // #453 Phase D the primOpCounter mutex is heap-allocated and
+    // leaked (see primops.cc), so dumpPrimOpStats is also safe to
+    // call from atexit -- gated on NIX_V3_PRIMOP_DUMP=1 because the
+    // dump itself is noisy.
     static bool atexitDone = []{
-        if (std::getenv("NIX_VM_STATS") || std::getenv("V3_TIMING")) {
+        if (std::getenv("NIX_VM_STATS") || std::getenv("V3_TIMING")
+            || std::getenv("NIX_V3_PRIMOP_DUMP")) {
             std::atexit([]{
                 auto & s = v3HookStats();
                 std::fprintf(stderr,
@@ -1540,6 +1540,11 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                                 ? (double)s.callHookCacheMiss / s.callHookUniqueMisses
                                 : 0.0);
                 }
+                // #453 Phase D: dump per-primop call counts so we can
+                // tell which primops dominate cost / are candidates
+                // for native conversion.
+                if (std::getenv("NIX_V3_PRIMOP_DUMP"))
+                    dumpPrimOpStats(stderr);
             });
         }
         return true;
