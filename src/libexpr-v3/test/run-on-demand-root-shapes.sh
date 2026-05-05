@@ -53,6 +53,11 @@ declare -a MODES=(
   "default::NIX_USE_V3=1"
   "od-safe:NIX_V3_ON_DEMAND_ROOT=1:NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1"
   "od-unsafe:NIX_V3_ON_DEMAND_ROOT_UNSAFE=1:NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1 NIX_V3_ON_DEMAND_ROOT_UNSAFE=1"
+  # #454 Phase E: INVERT_EVAL skips willReturnClosure short-circuit
+  # and lets v3 own closure-producing top-level Exprs, bridging the
+  # Tag::Closure result back via __v3_call_bridge_1.
+  "invert:NIX_V3_INVERT_EVAL=1:NIX_USE_V3=1 NIX_V3_INVERT_EVAL=1"
+  "invert+od:NIX_V3_INVERT_EVAL=1+OD:NIX_USE_V3=1 NIX_V3_INVERT_EVAL=1 NIX_V3_ON_DEMAND_ROOT=1"
 )
 
 ok=0

@@ -1565,6 +1565,18 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     static const bool noShortcircuit =
         std::getenv("NIX_V3_NO_SHORTCIRCUIT") != nullptr;
 
+    // #454 Phase E: invert eval entry.  Opt-in via NIX_V3_INVERT_EVAL=1.
+    // Lets v3 own closure-producing Exprs (skip the willReturnClosure
+    // short-circuit) and bridges Tag::Closure results back via
+    // __v3_call_bridge_1 — implies NIX_V3_BRIDGE_CLOSURE behaviour.
+    // The trivial-kind short-circuit (Int/Float/String/Path/Var/Pos)
+    // and the Attrs/List short-circuit stay on; those measured net-
+    // negative when run through v3's lower+compile+run path.  Phase E
+    // is purposefully narrow: only the closure-result wedge moves.
+    // Mirror Phase C: opt-in until we have on-real-workload perf data.
+    static const bool invertEval =
+        std::getenv("NIX_V3_INVERT_EVAL") != nullptr;
+
     if (e && !noShortcircuit) {
         auto k = e->exprKind;
         if (k == nix::Expr::Kind::Lambda ||
@@ -1596,7 +1608,12 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         // bridge a Closure result back to tree-walker without falling
         // back anyway (see Tag::Closure case below); detecting this
         // up front saves the wasted lower+compile+run cycle.
-        if (willReturnClosure(e)) {
+        //
+        // #454 Phase E: when NIX_V3_INVERT_EVAL=1 the closure bridge
+        // takes care of Tag::Closure results, so the short-circuit
+        // becomes wasted opportunity — let v3 own these and skip
+        // straight through to lower+compile+run.
+        if (!invertEval && willReturnClosure(e)) {
             if (diag) std::fprintf(stderr,
                 "v3 hook: static closure result predicted, kind=%d\n", (int)k);
             st.evalFallbackReason[5]++;
@@ -1882,8 +1899,14 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         // into v3.  Gate via NIX_V3_BRIDGE_CLOSURE=1 to opt-in for
         // benchmarking; default OFF until the regression is verified
         // gone.
+        // #454 Phase E: NIX_V3_INVERT_EVAL implies the closure bridge.
+        // Once we let v3 own closure-producing Exprs the willReturnClosure
+        // short-circuit no longer covers them, so we MUST bridge the
+        // result rather than fall back (which would re-enter via the
+        // hook on a non-closure shape and double-evaluate).
         static const bool bridgeEnabled =
-            std::getenv("NIX_V3_BRIDGE_CLOSURE") != nullptr;
+            std::getenv("NIX_V3_BRIDGE_CLOSURE") != nullptr
+            || std::getenv("NIX_V3_INVERT_EVAL") != nullptr;
         if (!bridgeEnabled) {
             if (diag) std::fprintf(stderr,
                 "v3 hook: closure-shape result tag=%d, falling back\n",
