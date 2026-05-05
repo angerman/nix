@@ -2745,9 +2745,18 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // force win.  REVIEW-COMP §8.6: the prior NIX_V3_NO_LAZY_BRIDGE
         // A/B gate is removed -- lazy bridging is the verified-correct
         // default for all sizes above the cutoff.
+        //
+        // #455: same NIX_V3_EAGER_BRIDGE_MAX knob applies here.  The
+        // lazy bridge for lists has the same `__v3_force_list_elem`
+        // re-entry shape as Tag::Attrs and the same cycle potential.
         auto * lv = v.payload.list;
         uint32_t n = lv ? lv->size : 0;
-        if (n <= 4) {
+        static const uint32_t kEagerListMax = []{
+            if (const char * v = std::getenv("NIX_V3_EAGER_BRIDGE_MAX"))
+                return (uint32_t)std::atoi(v);
+            return (uint32_t)4;
+        }();
+        if (n <= kEagerListMax) {
             auto lb = ns.buildList(n);
             for (uint32_t i = 0; i < n; ++i)
                 lb[i] = v3ToTreeWalker(state, lv->elems[i], seen);
