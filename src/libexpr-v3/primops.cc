@@ -225,35 +225,10 @@ inline bool valueEqual(VMState & vm, Value a, Value b)
     }
 }
 
-inline std::string toStr(const Value & v)
-{
-    switch (v.tag()) {
-    case Tag::String: return std::string(v.payload.str);
-    case Tag::Path:   return std::string(v.payload.path);
-    case Tag::Int:    return std::to_string(v.payload.i);
-    case Tag::Float:  return std::to_string(v.payload.f);
-    case Tag::Bool:   return v.payload.i == 1 ? "1" : "";
-    case Tag::Null:   return "";
-    case Tag::Uninitialized:
-    case Tag::Attrs:
-    case Tag::List:
-    case Tag::Closure:
-    case Tag::Thunk:
-    case Tag::PrimOp:
-    case Tag::PrimOpApp:
-    case Tag::App:
-    case Tag::Blackhole:
-    case Tag::External:
-    case Tag::Slot:
-    default: {
-        char buf[64];
-        std::snprintf(buf, sizeof buf,
-            "v3 toString: cannot stringify this type (tag=%u)",
-            (unsigned)v.tag());
-        throw std::runtime_error(buf);
-    }
-    }
-}
+// `toStr(Value &)` was a v3-only stringifier predating the proper
+// `toStringCoerce` machinery in vm.cc.  Removed when callers migrated
+// to the official path; kept dormant in case future review work needs
+// a v3-side stringifier without the coerce variants.  Re-add as needed.
 
 inline Value mkStringValueOwned(std::string s)
 {
@@ -4560,7 +4535,9 @@ void primDerivation(EvalState & state, Value * args, Value & out)
     SymbolId sDrvPath  = vmIntern(state, "drvPath");
     SymbolId sType     = vmIntern(state, "type");
     SymbolId sOutName  = vmIntern(state, "outputName");
-    SymbolId sAll      = vmIntern(state, "all");
+    // sAll: previously interned for `drv.all` synthesis; primDerivation
+    // doesn't currently expose `.all` and the symbol was unused.
+    // Re-add when REVIEW §3 (primDerivation lazy `.all`) lands.
     SymbolId sDrvAttrs = vmIntern(state, "drvAttrs");
     const Value * drvPathV = strictB->lookup(sDrvPath);
 

@@ -61,7 +61,7 @@ nix::EvalState * getNixEvalState();
 
 } // namespace nix::v3
 
-namespace nix { class Expr; }
+namespace nix { struct Expr; }
 
 namespace nix::v3 {
 
