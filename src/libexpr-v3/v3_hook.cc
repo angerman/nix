@@ -1579,7 +1579,18 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 
     if (e && !noShortcircuit) {
         auto k = e->exprKind;
-        if (k == nix::Expr::Kind::Lambda ||
+        // #454 Phase E: under invert mode, lift the bare-Lambda
+        // short-circuit too -- the closure bridge handles Tag::Closure
+        // results, so a top-level `x: ...` flows through v3 like any
+        // other closure-producing Expr.  The trivial constants
+        // (Int/Float/String/Path/Var/Pos) stay short-circuited:
+        // lower+compile+run is pure cost over TW's `mkInt(n)` /
+        // `mkString(s)`.  Top-level Attrs/List also stay short-
+        // circuited because v3's lower forces every entry eagerly
+        // and the upvalue translation has known runtime gaps
+        // ("OP_GET_UPVALUE: no closure context") for some shapes.
+        bool lambdaShortCircuit = (k == nix::Expr::Kind::Lambda) && !invertEval;
+        if (lambdaShortCircuit ||
             k == nix::Expr::Kind::Int    ||
             k == nix::Expr::Kind::Float  ||
             k == nix::Expr::Kind::String ||
