@@ -2952,7 +2952,19 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     nix::Value * tmp = nullptr;
     bool isOnDemandRoot = v3OnDemandRootPopulated().count(lambda) > 0;
     try {
-        if (isOnDemandRoot) {
+        // #455: every call-hook result bridge runs eager.  v3 closures
+        // returned via the call hook can capture mid-evaluation TW
+        // slots (any let-rec / fix-point caller); the lazy bridge
+        // PrimOpApp re-entry forms cycles when those captures are
+        // forced.  Always-eager for call-hook results sidesteps the
+        // class.  Lazy bridging stays the default for non-call-hook
+        // paths (eval-hook nested attrsets, import primop returns,
+        // etc.) where this cycle isn't possible.
+        // NIX_V3_NO_CALL_HOOK_EAGER=1 disables for A/B testing.
+        static const bool callHookEager =
+            std::getenv("NIX_V3_NO_CALL_HOOK_EAGER") == nullptr;
+        (void)isOnDemandRoot;  // currently unused; kept for diag
+        if (callHookEager) {
             ScopedEagerBridge guard;
             tmp = v3ToTreeWalkerPublic(state, r);
         } else {
