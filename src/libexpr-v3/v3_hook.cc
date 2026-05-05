@@ -2572,30 +2572,30 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     if (!fun.isLambda()) { st.callHookGated++; st.callHookGateNotLambda++; return false; }
     nix::ExprLambda * lambda = fun.lambda().fun;
     if (!lambda) { st.callHookGated++; st.callHookGateNullLambda++; return false; }
-    // #437 -> #452 Phase C: refuse-formals gate has been LIFTED.
+    // #437 -> #452 Phase C: refuse-formals gate is OPT-OUT default.
     // Originally added because deep `treeWalkerToV3Public` arg
     // conversion forced every entry of `{config, options, lib, ...}`
     // -> ExprBlackHole on NixOS module fix-points.  Fix A (#437,
-    // 599cb9745) made the call-hook arg a shallow Bridge thunk, so
-    // the arg itself isn't deep-converted on entry.  Phase C closes
-    // the remaining issue: the lambda body's destructuring forces
-    // the Bridge -> treeWalkerToV3 of the param attrset.  That
-    // recursive conversion still deep-forced every entry until #452.
+    // 599cb9745) made the call-hook arg a shallow Bridge thunk;
+    // Phase C (#452) closes the remaining issue with per-thread
+    // `shallowTWAttrsBridge` so each TW entry stays a Bridge
+    // thunk until forced -- matches TW's per-formal lazy semantics.
     //
-    // #452 introduces the per-thread `shallowTWAttrsBridge` flag.
-    // The call hook below sets it via ScopedShallowTWAttrsBridge
-    // for the duration of runLambda, so treeWalkerToV3's nAttrs
-    // case wraps each entry in a fresh Bridge thunk instead of
-    // recursively converting -- only entries the body actually
-    // accesses get force-converted, matching TW's per-formal lazy
-    // semantics.  Mid-construction entries (config, etc.) stay
-    // unforced unless the body would have forced them in TW too.
-    //
-    // Disable Phase C via NIX_V3_NO_CALL_FORMALS=1 to re-impose the
-    // gate (e.g. for A/B regressions).
-    static const bool refuseFormals =
-        std::getenv("NIX_V3_NO_CALL_FORMALS") != nullptr;
-    if (refuseFormals && lambda->getFormals()) {
+    // STAYS OPT-IN VIA `NIX_V3_CALL_FORMALS=1` because, although the
+    // correctness work is in, the per-attr Bridge force adds bridge
+    // overhead.  On cardano-node (heavy NixOS-module shape) Phase C
+    // makes default v3 ~30% slower than TW (4.3 s vs 3.3 s) because
+    // every config.x / options.x access pays a TW round-trip.  The
+    // value-realisation needs Phase D (native primops keep more
+    // work in v3) or Phase E (TW becomes the leaf-fallback) to
+    // amortise the bridge cost.  Until then, default off keeps
+    // cardano-node at parity with TW; users opting in get the
+    // correctness path that lets formals lambdas run via v3.
+    static const bool callFormals = []{
+        const char * v = std::getenv("NIX_V3_CALL_FORMALS");
+        return v && std::string_view(v) == "1";
+    }();
+    if (!callFormals && lambda->getFormals()) {
         st.callHookGated++; st.callHookGateFormals++; return false;
     }
     bool hasFormals = lambda->getFormals().has_value();
