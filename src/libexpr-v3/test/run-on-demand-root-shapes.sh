@@ -130,5 +130,25 @@ if [[ -e "$repro_455" ]]; then
     exit 1
   fi
   echo "=== #455 EAGER_BRIDGE_MAX=10000 override knob: passes ==="
+
+  # Negative-of-positive: with NIX_V3_NO_CALL_HOOK_EAGER=1 (disable
+  # the auto-eager fix) the minimal repro should fail again.  This
+  # proves the auto-eager-bridge guard is what's actually closing
+  # the cycle.  If this assertion FLIPS (no-eager produces correct
+  # output), it means the lazy-bridge cycle was fixed elsewhere
+  # and the auto-eager guard is now redundant.
+  no_eager_out=$(NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1 NIX_V3_SKIP_THRESHOLD=0 \
+            NIX_V3_NO_CALL_HOOK_EAGER=1 "$NIX_BIN" \
+            eval --no-eval-cache --json -f "$repro_455" 2>/dev/null) \
+    || no_eager_out="<failed>"
+  if [[ "$no_eager_out" == "$tw_out" ]]; then
+    echo
+    echo "=== #455 NEGATIVE-OF-POSITIVE has FLIPPED ==="
+    echo "  NIX_V3_NO_CALL_HOOK_EAGER=1 now produces correct output."
+    echo "  The auto-eager guard may be redundant -- check if a deeper"
+    echo "  fix landed and remove the guard to simplify."
+  else
+    echo "=== #455 NIX_V3_NO_CALL_HOOK_EAGER=1 still fails (auto-eager doing the work) ==="
+  fi
 fi
 exit 0
