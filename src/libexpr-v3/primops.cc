@@ -567,13 +567,28 @@ void primSubstring(EvalState &, Value * args, Value & out)
     if (start < 0)
         throw std::runtime_error("v3 substring: negative start position");
     std::string_view src(args[2].payload.str);
+    const char * srcPtr = args[2].payload.str;
     if (static_cast<size_t>(start) >= src.size()) {
         out = mkStringValueOwned("");
-        return;
+    } else {
+        size_t available = src.size() - start;
+        size_t actualLen = (len < 0) ? available : std::min(static_cast<size_t>(len), available);
+        out = mkStringValueOwned(std::string(src.substr(start, actualLen)));
     }
-    size_t available = src.size() - start;
-    size_t actualLen = (len < 0) ? available : std::min(static_cast<size_t>(len), available);
-    out = mkStringValueOwned(std::string(src.substr(start, actualLen)));
+    // REVIEW §1.6: forward string-context entries from the input.
+    // Tree-walker (libexpr/primops.cc:1717+ prim_substring) propagates
+    // context unconditionally -- this is what `builtins.substring 0 0
+    // drv.outPath` relies on for ref-stripping (the empty-string result
+    // carries the original drvPath context, marking the derivation as
+    // a runtime dep without including the path).  Without forwarding,
+    // v3 silently drops the context and downstream string concatenation
+    // would lose the runtime dep.
+    if (srcPtr) {
+        if (auto * raw = lookupStringContextEntries(srcPtr)) {
+            std::vector<std::string> copy(raw->begin(), raw->end());
+            setStringContextEntries(out.payload.str, std::move(copy));
+        }
+    }
 }
 
 void primMap(EvalState & state, Value * args, Value & out)
@@ -2184,17 +2199,70 @@ void primStoreDir(EvalState & state, Value *, Value & out)
 }
 
 /// builtins.readFile path -> string contents.
-void primReadFile(EvalState &, Value * args, Value & out)
+///
+/// REVIEW §1.6: routes through state.realisePath for restricted-eval
+/// path checks (matches tree-walker libexpr/primops.cc:2473), forwards
+/// string-context entries from the input path Value (a path with
+/// store-dependency context yields a string with the same context),
+/// and rejects NUL bytes in the file content.
+void primReadFile(EvalState & state, Value * args, Value & out)
 {
     std::string path;
     if (args[0].isString()) path = args[0].payload.str;
     else if (args[0].isPath()) path = args[0].payload.path;
     else typeError("readFile", "string or path");
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("v3 primop readFile: cannot open " + path);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    out = mkStringValueOwned(ss.str());
+
+    // REVIEW §1.7-style routing: when a TW EvalState is wired, defer
+    // path realisation to it so pure-eval / restricted-eval mode rules
+    // apply.  Falls through to direct ifstream when no TW context
+    // (v3-eval CLI standalone case).
+    std::string content;
+    if (state.nixEvalState) {
+        auto & ns = *state.nixEvalState;
+        try {
+            nix::Value tw;
+            if (args[0].isString()) tw.mkString(path, ns.mem);
+            else                    tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(path)), ns.mem);
+            auto sp = ns.realisePath(nix::noPos, tw);
+            content = sp.readFile();
+        } catch (const nix::RestrictedPathError &) {
+            // Tree-walker's prim_readFile rethrows -- mirror.
+            throw;
+        } catch (...) {
+            // Realisation failure (path doesn't exist, etc.) -- fall
+            // through to plain ifstream so the error message matches
+            // the v3 standalone behaviour.
+            std::ifstream f(path);
+            if (!f) throw std::runtime_error("v3 primop readFile: cannot open " + path);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            content = ss.str();
+        }
+    } else {
+        std::ifstream f(path);
+        if (!f) throw std::runtime_error("v3 primop readFile: cannot open " + path);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        content = ss.str();
+    }
+
+    // §1.6: reject NUL bytes -- nix strings are NUL-terminated, so a
+    // file containing NUL would silently truncate at the first \0.
+    if (content.find('\0') != std::string::npos)
+        throw std::runtime_error("v3 primop readFile: file contains NUL byte");
+
+    out = mkStringValueOwned(std::move(content));
+
+    // §1.6: forward string-context.  When `path` was a Path Value with
+    // context (e.g. a `${drv}` interpolation result coerced to path),
+    // the returned string carries that context so downstream uses
+    // mark the original drv as a runtime dep.
+    if (args[0].isString() && args[0].payload.str) {
+        if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
+            std::vector<std::string> copy(raw->begin(), raw->end());
+            setStringContextEntries(out.payload.str, std::move(copy));
+        }
+    }
 }
 
 /// builtins.readDir path -> attrset of name -> "regular"|"directory"|"symlink"|"unknown".
