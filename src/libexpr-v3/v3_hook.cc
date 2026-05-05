@@ -2441,8 +2441,7 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
     // #416: outer-with carriage is ON by default after passing the
     // full v3 test sweep + targeted synthetic regressions in both
     // modes.  NIX_V3_NO_OUTER_WITH=1 acts as a kill-switch for
-    // bisection.  NIX_V3_OUTER_WITH=1 is a no-op alias kept for
-    // back-compat with the opt-in window.
+    // bisection.
     static const bool outerWithEnabled = []{
         return std::getenv("NIX_V3_NO_OUTER_WITH") == nullptr;
     }();
@@ -2830,7 +2829,7 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
             // diffing the subCache key set before/after.  The diff
             // is on-demand-root's contribution; we add it to
             // v3OnDemandRootPopulated() so the gate below can refuse
-            // to run those entries when NIX_V3_ON_DEMAND_ROOT_NEVER_RUN_OD=1.
+            // to run those entries when NIX_V3_NEVER_RUN_OD=1.
             auto & subCache = v3SubExprCache();
             std::unordered_set<const nix::Expr *> before;
             before.reserve(subCache.size());

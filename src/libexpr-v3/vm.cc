@@ -1554,7 +1554,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             const CallFrame & frRef = vm.frames.back();
             const uint32_t fStackBase    = frRef.stackBaseOffset;
             const uint32_t fWithBase     = frRef.withStackBase;
-            const uint8_t  fFlags        = frRef.flags;
+            const uint32_t fFlags        = frRef.flags;
             Thunk *        fThunk        = frRef.thunk;
             vm.valueStack.resize(fStackBase);
             vm.withStack.resize(fWithBase);
@@ -1704,15 +1704,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 fr.thunk->state = ThunkState::Evaluated;
                 fr.thunk->evaluated = retVal;
 
-                // WC-38: the legacy "return-chain push" — eagerly
+                // WC-38: the legacy "return-chain push" -- eagerly
                 // forcing the next thunk if the outer's body returned
-                // a Suspended thunk — was kept behind
-                // NIX_V3_RETURN_CHAIN=1 for A/B testing after the
-                // WC-38 fix landed.  Phase-13 review MED-19 confirmed
-                // it's never needed: forceValue's chase loop already
-                // resolves the chain on the consumer's pull, and
-                // OP_RETURN's caller-resume path re-runs op_force_slow
-                // when CFF_FORCE_RETRY is set.  Removed entirely.
+                // a Suspended thunk -- has been removed.  forceValue's
+                // chase loop already resolves the chain on the
+                // consumer's pull, and OP_RETURN's caller-resume path
+                // re-runs op_force_slow when CFF_FORCE_RETRY is set.
             }
             if (vm.frames.size() == exitDepth) {
                 finalResult = retVal;

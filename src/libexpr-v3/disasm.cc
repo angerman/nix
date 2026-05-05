@@ -64,6 +64,29 @@ static const char * opName(Op op)
     case OP_ATTRS_HAS_DYN:     return "OP_ATTRS_HAS_DYN";
     case OP_ATTRS_UPDATE:      return "OP_ATTRS_UPDATE";
     case OP_REC_BINDING_SLOT_REF: return "OP_REC_BINDING_SLOT_REF";
+    case OP_APPLY_OVERRIDES:   return "OP_APPLY_OVERRIDES";
+    case OP_WITH_PUSH:         return "OP_WITH_PUSH";
+    case OP_WITH_POP:          return "OP_WITH_POP";
+    case OP_WITH_LOOKUP:       return "OP_WITH_LOOKUP";
+    case OP_STR_CONCAT:        return "OP_STR_CONCAT";
+    case OP_ASSERT:            return "OP_ASSERT";
+    case OP_POS:               return "OP_POS";
+    case OP_CALL_PRIMOP:       return "OP_CALL_PRIMOP";
+    case OP_LIT_PRIMOP:        return "OP_LIT_PRIMOP";
+    case OP_LIT_BUILTINS:      return "OP_LIT_BUILTINS";
+    case OP_IS_NULL:           return "OP_IS_NULL";
+    case OP_IS_BOOL:           return "OP_IS_BOOL";
+    case OP_IS_INT:            return "OP_IS_INT";
+    case OP_IS_FLOAT:          return "OP_IS_FLOAT";
+    case OP_IS_STRING:         return "OP_IS_STRING";
+    case OP_IS_PATH:           return "OP_IS_PATH";
+    case OP_IS_LIST:           return "OP_IS_LIST";
+    case OP_IS_ATTRS:          return "OP_IS_ATTRS";
+    case OP_IS_FUNCTION:       return "OP_IS_FUNCTION";
+    case OP_HEAD:              return "OP_HEAD";
+    case OP_TAIL:              return "OP_TAIL";
+    case OP_LENGTH:            return "OP_LENGTH";
+    case OP_ELEM_AT:           return "OP_ELEM_AT";
     case OP_HALT:              return "OP_HALT";
     default:                   return nullptr;
     }
@@ -102,9 +125,18 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
     // OP_ATTRS_SELECT consumes 1 word for the inline-cache slot index.
     case OP_ATTRS_SELECT:
         return 1;
+    // OP_CALL_PRIMOP n: pops n args; 1 extra word: primop-table index.
+    // (vm.cc:3203 reads `cu->code[ip++]` for poIdx).  Without this
+    // entry, every disasm past the first OP_CALL_PRIMOP misaligned.
+    case OP_CALL_PRIMOP:
+        return 1;
     // OP_LIST_INIT n: pops n; no extra words.
     // OP_CALL: no extra words.
     // OP_FORCE: no extra words.
+    // OP_WITH_LOOKUP / OP_STR_CONCAT / OP_LIT_PRIMOP / OP_LIT_BUILTINS /
+    // OP_APPLY_OVERRIDES / OP_IS_* / OP_HEAD / OP_TAIL / OP_LENGTH /
+    // OP_ELEM_AT / OP_ASSERT / OP_POS / OP_WITH_PUSH / OP_WITH_POP:
+    // operand-only, no extra words.
     default:
         return 0;
     }
