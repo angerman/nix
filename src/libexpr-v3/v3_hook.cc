@@ -502,10 +502,22 @@ struct RecBuildCacheKeyHash {
              ^ (std::hash<const void *>{}(k.names) << 1);
     }
 };
-static std::unordered_map<RecBuildCacheKey, Bindings *, RecBuildCacheKeyHash>
+/// REVIEW §1.2: per-cache-entry stamp to detect Env-pointer ABA reuse
+/// across GC.  We snapshot the first slot pointer (`env->values[0]`)
+/// when the Bindings is built; on lookup, re-read the same slot and
+/// compare.  Boehm's collector can recycle an Env's address after it
+/// becomes unreachable, and the recycled Env will have a different
+/// (or null) values[0] -- the stamp catches that, treats the cache
+/// hit as stale, and rebuilds.  Cheap (one pointer compare on hit).
+struct RecBuildCacheValue {
+    Bindings * b;
+    const void * slot0Stamp;
+};
+static std::unordered_map<RecBuildCacheKey, RecBuildCacheValue,
+                           RecBuildCacheKeyHash>
     & recBuildCache()
 {
-    thread_local std::unordered_map<RecBuildCacheKey, Bindings *,
+    thread_local std::unordered_map<RecBuildCacheKey, RecBuildCacheValue,
                                      RecBuildCacheKeyHash> tbl;
     return tbl;
 }
@@ -2216,9 +2228,17 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                     RecBuildCacheKey k{cur, src.names.get()};
                     auto & cache = recBuildCache();
                     Bindings * b;
-                    if (auto cit = cache.find(k); cit != cache.end()) {
-                        b = cit->second;
+                    // REVIEW §1.2 ABA stamp: re-read cur->values[0] on
+                    // lookup, compare to the stamp captured at insert
+                    // time.  If different, the Env at this address has
+                    // been recycled by the GC -- treat as cache miss.
+                    const void * slot0 = (cur && cur->values[0])
+                        ? (const void *)cur->values[0] : nullptr;
+                    auto cit = cache.find(k);
+                    if (cit != cache.end() && cit->second.slot0Stamp == slot0) {
+                        b = cit->second.b;
                     } else {
+                        if (cit != cache.end()) cache.erase(cit);
                         const auto & names = *src.names;
                         std::vector<std::pair<SymbolId, Value>> pairs;
                         pairs.reserve(names.size());
@@ -2283,7 +2303,7 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                             b->entries[i].name  = pairs[i].first;
                             b->entries[i].value = pairs[i].second;
                         }
-                        cache.emplace(k, b);
+                        cache.emplace(k, RecBuildCacheValue{b, slot0});
                     }
                     Value v;
                     v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
