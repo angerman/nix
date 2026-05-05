@@ -556,6 +556,18 @@ size_t commonSubexprElim(Module & m);
 /// bindings rewritten.
 size_t fusePrimOpApps(Module & m);
 
+/// #423: eliminate redundant `Force{v}` bindings via local strictness
+/// analysis.  Lower emits Force defensively at every strict-context
+/// use; this pass detects the cases where `v` is provably already in
+/// WHNF (literals, lambdas, attrsets, lists, primitive arithmetic,
+/// etc.) and rewrites the Force as a VarRef.  Subsequent
+/// `inlineTrivialBindings` collapses the alias and `deadBindingElim`
+/// removes the orphan binding, so the OP_FORCE bytecode never gets
+/// emitted.  Block-local; chases VarRef chains within the same
+/// block.  Returns the number of Force bindings rewritten.  Disable
+/// with `NIX_V3_NO_OPT_STRICT=1`.
+size_t elimRedundantForce(Module & m);
+
 /// Run the standard optimisation pipeline.  Currently:
 /// constantFold -> commonSubexprElim -> inlineTrivialBindings ->
 /// fusePrimOpApps -> deadBindingElim.  Always called between lower

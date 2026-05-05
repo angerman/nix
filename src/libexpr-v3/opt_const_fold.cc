@@ -286,6 +286,11 @@ void optimise(Module & m)
 
     constantFold(m);
     commonSubexprElim(m);
+    // #423 runs after CSE (so duplicate Force operands collapse to a
+    // single resolved root via the alias map) and before
+    // inlineTrivialBindings (so the freshly-introduced VarRef aliases
+    // get path-compressed in the same pipeline).
+    elimRedundantForce(m);
     inlineTrivialBindings(m);
     // #429 runs after alias collapse (so VarRef chains are flattened
     // and LitPrimOp -> App pairings are observable in one block) and
