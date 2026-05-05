@@ -2837,16 +2837,6 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     }
 }
 
-/// Tree-walker primop body: invoked when tree-walker fully applies
-/// `__v3_call_bridge_2 handle arg1 arg2`.  Look up the v3 closure
-/// stored at `handle`, convert args back to v3, call, convert result.
-// Phase-13 review ID-B18: primV3CallBridge2 (legacy 2-arg form for
-// `builtins.path { filter = path: type: ...; }`) was defined but
-// never registered as a primop.  Removed in the cleanup pass.
-// builtins.path's filter path falls back through the regular
-// tree-walker bridge, which has the WC-19+ safety net the legacy
-// shim lacked.
-
 /// WC-15: lazy attr-set bridge primop.  Args: handle (Int), name (String).
 /// Looks up the v3 Tag::Attrs Value at handle, finds the attr by name,
 /// bridges that single value to tree-walker via v3ToTreeWalker (which
@@ -5390,8 +5380,10 @@ void primFromTOML(EvalState & state, Value * args, Value & out)
 // fetchToStore directly against state.nixEvalState->store.  Filter
 // closures are tricky to drive from native (they would re-enter
 // v3's VM on every directory entry); when present we fall back to
-// the bridge, which already invokes them via the
-// __v3_call_bridge_2 PrimOpApp shim (primV3CallBridge2 above).
+// the bridge, which already invokes them via tree-walker's regular
+// callFunction path (the legacy __v3_call_bridge_2 shim was removed
+// in the Phase-13 cleanup pass; its WC-19 safety net is now built
+// into the regular bridge).
 //
 // Throws on any unsupported shape; caller's primPath catches and
 // falls through to the existing bridge.
