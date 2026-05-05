@@ -352,11 +352,29 @@ void primIsPath    (EvalState &, Value * args, Value & out) { out = args[0].isPa
 // with __toString or outPath, paths (without store-copy), int / float
 // / bool / null.  This mirrors that without the BR-3 store-copy path
 // (which is only correct for derivationStrict's path attrs).
-static std::string toStringCoerce(EvalState & state, Value v)
+/// Internal toString coerce.  ctx is an out-param that accumulates
+/// string-context entries from every nested string/attrset traversed.
+/// The caller writes the merged ctx onto the result string with
+/// setStringContextEntries.
+///
+/// REVIEW §1.6: previously dropped context for List/Attrs traversal
+/// -- `toString [drvA drvB]` yielded the right text but with empty
+/// context.  Now threads through.  Tree-walker uses
+/// state.coerceToString with NixStringContext& accum (libexpr/eval.cc:
+/// coerceToString); same shape.
+static std::string toStringCoerceCtx(EvalState & state, Value v,
+                                     std::vector<std::string> & ctx)
 {
+    auto absorbCtx = [&](const char * s) {
+        if (!s) return;
+        if (auto * raw = lookupStringContextEntries(s)) {
+            ctx.insert(ctx.end(), raw->begin(), raw->end());
+        }
+    };
     v = forceValue(*state.vm, v);
     switch (v.tag()) {
-    case Tag::String: return std::string(v.payload.str ? v.payload.str : "");
+    case Tag::String: absorbCtx(v.payload.str);
+                      return std::string(v.payload.str ? v.payload.str : "");
     case Tag::Path:   return std::string(v.payload.path ? v.payload.path : "");
     case Tag::Int:    return std::to_string(v.payload.i);
     case Tag::Float:  return std::to_string(v.payload.f);
@@ -368,7 +386,7 @@ static std::string toStringCoerce(EvalState & state, Value v)
         if (!lv) return out;
         for (uint32_t i = 0; i < lv->size; ++i) {
             Value el = forceValue(*state.vm, lv->elems[i]);
-            out += toStringCoerce(state, el);
+            out += toStringCoerceCtx(state, el, ctx);
             if (i + 1 < lv->size) {
                 bool elIsEmptyList = el.isList()
                     && (!el.payload.list || el.payload.list->size == 0);
@@ -390,7 +408,7 @@ static std::string toStringCoerce(EvalState & state, Value v)
                 ir::globalInternSymbol("outPath");
             if (auto * outV = v.payload.bindings->lookup(sOutPath)) {
                 Value forced = forceValue(*state.vm, *outV);
-                return toStringCoerce(state, forced);
+                return toStringCoerceCtx(state, forced, ctx);
             }
         }
         throw std::runtime_error(
@@ -415,17 +433,23 @@ static std::string toStringCoerce(EvalState & state, Value v)
     }
 }
 
+/// No-context variant retained for callers that don't need context
+/// (currently the eval-fail trace + abort/throw error formatting).
+/// Forwards into toStringCoerceCtx and drops the accumulator.
+static std::string toStringCoerce(EvalState & state, Value v)
+{
+    std::vector<std::string> dropCtx;
+    return toStringCoerceCtx(state, v, dropCtx);
+}
+
 void primToString(EvalState & state, Value * args, Value & out)
 {
-    out = mkStringValueOwned(toStringCoerce(state, args[0]));
-    // Forward existing string-context (preserve outPath context) if
-    // the input was a string with one.
-    if (args[0].isString() && args[0].payload.str) {
-        if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
-            std::vector<std::string> copy(raw->begin(), raw->end());
-            setStringContextEntries(out.payload.str, std::move(copy));
-        }
-    }
+    // §1.6: thread context through nested list/attrs traversal.
+    std::vector<std::string> ctx;
+    std::string s = toStringCoerceCtx(state, args[0], ctx);
+    out = mkStringValueOwned(std::move(s));
+    if (!ctx.empty())
+        setStringContextEntries(out.payload.str, std::move(ctx));
 }
 
 void primTypeOf(EvalState &, Value * args, Value & out)
