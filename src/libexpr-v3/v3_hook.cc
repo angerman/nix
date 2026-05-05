@@ -2670,7 +2670,20 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // Probe the sub-Expr cache by ExprLambda*.  We register lambdas
     // alongside thunks in v3SubExprCache (lowerLambda + this hook
     // share the same map) -- the call hook differentiates by AST kind.
+    //
+    // #453 Phase D fast-bypass: on real-world workloads (hello.name
+    // baseline) the cache stays empty when on-demand-root is off --
+    // every probe misses.  A 5.6 ms cutover regression on hello.name
+    // (vs TW) collapses to ~0 when this hook returns false without
+    // probing.  Skip the probe outright when the map is empty.
+    // The empty() check is one inline load; the find() it replaces
+    // is a hash + bucket lookup + key compare.  At 394k entries on
+    // hello.name, the difference is the entire cutover overhead.
     auto & subCache = v3SubExprCache();
+    if (__builtin_expect(subCache.empty(), 1)) {
+        st.callHookCacheMiss++;
+        return false;
+    }
     auto sit = subCache.find(lambda);
     if (sit == subCache.end()) {
         st.callHookCacheMiss++;
