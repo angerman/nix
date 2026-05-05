@@ -6352,6 +6352,11 @@ void primToFile(EvalState & state, Value * args, Value & out)
 /// builtins.__outputOf drvRef outputName → input placeholder for that
 /// derivation's named output.  Tree-walker: src/libexpr/primops.cc:2589
 /// (prim_outputOf).  Used for chained derivation outputs.
+///
+/// REVIEW §3: forward v3-side string-context from args[0] when
+/// constructing tw0 -- without it, a drvRef carrying a context entry
+/// (e.g. from a chained `builtins.outputOf prevDrv "out"`) silently
+/// loses the upstream derivation reference.
 void primOutputOf(EvalState & state, Value * args, Value & out)
 {
     if (!state.nixEvalState)
@@ -6360,7 +6365,26 @@ void primOutputOf(EvalState & state, Value * args, Value & out)
     // Convert args[0] (drvRef) and args[1] (outputName) to tree-walker
     // values, delegate to tree-walker's coerceToSingleDerivedPath +
     // mkSingleDerivedPathString, bridge the result back.
-    nix::Value tw0; tw0.mkString(args[0].isString() ? args[0].payload.str : "", ns->mem);
+    nix::Value tw0;
+    {
+        std::string drvRef = args[0].isString() && args[0].payload.str
+            ? std::string(args[0].payload.str) : std::string();
+        // §3: build a NixStringContext from the v3-side entries (if any)
+        // before calling mkString -- mkString takes &context by ref.
+        nix::NixStringContext ctx;
+        if (args[0].isString() && args[0].payload.str) {
+            if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
+                for (auto & e : *raw) {
+                    try { ctx.insert(nix::NixStringContextElem::parse(e)); }
+                    catch (...) { /* skip un-parseable */ }
+                }
+            }
+        }
+        if (ctx.empty())
+            tw0.mkString(drvRef, ns->mem);
+        else
+            tw0.mkString(drvRef, ctx, ns->mem);
+    }
     if (!args[1].isString()) typeError("outputOf", "string output name");
     nix::SingleDerivedPath drvPath = ns->coerceToSingleDerivedPath(
         nix::noPos, tw0,
