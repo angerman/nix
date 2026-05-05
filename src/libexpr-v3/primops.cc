@@ -2655,7 +2655,22 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
 
     ScopedNixEvalState _v3evalGuard(&ns);
-    ns.forceValue(*args[1], pos);
+    // #455: eager-force gate.  Tree-walker's regular callFunction does
+    // NOT force the arg before invoking the function -- the function
+    // body decides when to force.  v3's primV3CallBridge1 used to
+    // pre-force args[1] which triggered TW's BlackHole detection on
+    // mid-construction fix-point args (cardano-node's `extends`
+    // overlay shape).
+    //
+    // With NIX_V3_LAZY_BRIDGE_ARG=1, skip the force and let
+    // treeWalkerToV3's nThunk case wrap the unforced thunk as a v3
+    // Bridge thunk; v3's body forces it on first access.  Default OFF
+    // until the lang sweep + cardano-node OD test verify no
+    // regressions; flip default-on once stable.
+    static const bool lazyBridgeArg =
+        std::getenv("NIX_V3_LAZY_BRIDGE_ARG") != nullptr;
+    if (!lazyBridgeArg)
+        ns.forceValue(*args[1], pos);
 
     // WC-18.3: run the v3 closure body in a fiber.  treeWalkerToV3
     // and forceBridgeThunk yield to the driver for tree-walker forces,
@@ -3467,10 +3482,22 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         out.payload.thunk = bridge;
         return out;
     }
-    case nix::nThunk:
+    case nix::nThunk: {
+        // #455: wrap as a v3 Bridge thunk (lazy).  The default flow
+        // had forceValue pre-force args before treeWalkerToV3 ran, so
+        // an nThunk reaching this case was an error path -> null.
+        // With NIX_V3_LAZY_BRIDGE_ARG=1 (#455 attempt) primV3CallBridge1
+        // skips the eager force, and arrives here with an unforced TW
+        // thunk for args[1].  Wrapping as a Bridge thunk preserves
+        // laziness all the way to the v3 body's first force, mirroring
+        // TW's regular callFunction (which doesn't force args either).
+        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
+        allocStats().thunksAllocated++;
+        out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+        out.payload.thunk = bridge;
+        return out;
+    }
     case nix::nFailed:
-        // nThunk: forceValue above should have advanced past any
-        // unforced thunk.  If we still see one, fall through as null.
         // nFailed: a previously-cached exception -- return null and
         // let downstream re-trigger via the next force (tree-walker's
         // handleEvalFailed will rethrow the cached exception).
