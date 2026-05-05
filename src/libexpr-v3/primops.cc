@@ -2573,6 +2573,51 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
                               nix::Value ** args, nix::Value & out)
 {
     g_bridgeCallBridge1Calls.fetch_add(1, std::memory_order_relaxed);
+
+    // #455 / #457: depth-limit cascade of nested bridge1 calls.  When
+    // v3 resolves a chain of `extends overlay (extends overlay2 ...)`
+    // overlays, each becomes a Tag::Closure bridged via __v3_call_
+    // bridge_1.  Calling the chain from TW dispatches into bridge1
+    // recursively; deep chains (cardano-node has ~18 layers) burn the
+    // pthread stack + cause TW's BlackHole detection to fire on `final`
+    // mid-construction.  Cap the nest at a small N; beyond that, run
+    // the fallbackExpr through TW so we don't pile bridge1 frames.
+    //
+    // Tunable via NIX_V3_BRIDGE1_DEPTH (default 8 = enough for 1-2
+    // legitimate nested overlays without triggering on cardano-node's
+    // 18+ layer fix-point).  Disable with =0.
+    static thread_local int s_bridge1Depth = 0;
+    static const int kBridge1MaxDepth = []{
+        if (const char * v = std::getenv("NIX_V3_BRIDGE1_DEPTH"))
+            return std::max(0, std::atoi(v));
+        return 8;
+    }();
+    if (kBridge1MaxDepth > 0 && s_bridge1Depth >= kBridge1MaxDepth) {
+        // Resolve handle (still need it for the fallback Expr lookup).
+        ns.forceValue(*args[0], pos);
+        if (args[0]->type() == nix::nInt) {
+            int64_t h = args[0]->integer().value;
+            auto & tbl = v3BridgeClosures();
+            if (h >= 0 && (size_t)h < tbl.size()) {
+                nix::Expr * fb = tbl[(size_t)h].fallbackExpr;
+                if (fb) {
+                    nix::Value tw;
+                    fb->eval(ns, ns.baseEnv, tw);
+                    ns.forceValue(tw, pos);
+                    ns.callFunction(tw, *args[1], out, pos);
+                    return;
+                }
+            }
+        }
+        // No fallback Expr -- fall through to the regular bridge1 path
+        // (it may still cycle, but no worse than before this guard).
+    }
+    struct Bridge1DepthGuard {
+        int & d;
+        Bridge1DepthGuard(int & d_) : d(d_) { ++d; }
+        ~Bridge1DepthGuard() { --d; }
+    } _b1dGuard(s_bridge1Depth);
+
     ns.forceValue(*args[0], pos);
     if (args[0]->type() != nix::nInt)
         ns.error<nix::EvalError>("v3 bridge1: handle must be int").debugThrow();
