@@ -47,6 +47,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <regex>
@@ -1930,6 +1931,41 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
     out.payload.list = lv;
 }
 
+/// REVIEW §2.4: thread-local regex cache for primMatch / primSplit.
+///
+/// Without it, every `lib.versions.major` call (and every other regex
+/// over a literal pattern) re-compiles the regex from scratch -- a hot
+/// path in nixpkgs.  Cache up to 64 patterns LRU-evicted; std::regex
+/// itself is reasonably small (~few hundred bytes per pattern).
+/// Thread-local because std::regex isn't threadsafe to copy across
+/// concurrent calls; per-thread caches sidestep that concern entirely.
+static const std::regex & getCachedRegex(std::string_view pattern)
+{
+    struct Entry { std::string pat; std::regex re; };
+    static thread_local std::list<Entry> lru;
+    static thread_local std::unordered_map<std::string_view,
+        std::list<Entry>::iterator> idx;
+    static constexpr size_t kCap = 64;
+    auto it = idx.find(pattern);
+    if (it != idx.end()) {
+        // Move to front (MRU).
+        lru.splice(lru.begin(), lru, it->second);
+        return it->second->re;
+    }
+    // Insert.  std::regex constructor throws on bad pattern; let it
+    // propagate -- callers wrap in try/catch.
+    lru.emplace_front(Entry{std::string(pattern),
+        std::regex(std::string(pattern), std::regex::extended)});
+    auto fresh = lru.begin();
+    idx.emplace(std::string_view(fresh->pat), fresh);
+    if (lru.size() > kCap) {
+        auto old = std::prev(lru.end());
+        idx.erase(std::string_view(old->pat));
+        lru.pop_back();
+    }
+    return fresh->re;
+}
+
 /// builtins.match regex string -> list of captures or null on no-match.
 /// Supports the standard regex syntax via std::regex (POSIX-ish).
 void primMatch(EvalState &, Value * args, Value & out)
@@ -1939,7 +1975,7 @@ void primMatch(EvalState &, Value * args, Value & out)
     try {
         // Match tree-walker: POSIX extended regex (`.` matches newline,
         // POSIX bracket classes like [[:alnum:]] work).
-        std::regex re(args[0].payload.str, std::regex::extended);
+        const std::regex & re = getCachedRegex(args[0].payload.str);
         std::cmatch m;
         if (!std::regex_match(args[1].payload.str, m, re)) {
             out = Value::vNull;
@@ -1969,7 +2005,7 @@ void primSplit(EvalState &, Value * args, Value & out)
     if (!args[0].isString() || !args[1].isString())
         typeError("split", "(regex, string)");
     try {
-        std::regex re(args[0].payload.str, std::regex::extended);
+        const std::regex & re = getCachedRegex(args[0].payload.str);
         std::string_view s(args[1].payload.str);
         std::vector<Value> parts;
         // REVIEW §1.8 note: std::cregex_iterator advances past zero-
