@@ -29,6 +29,7 @@
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/print.hh"
 #include "nix/expr/value/context.hh"
 #include "nix/util/canon-path.hh"
 #include "nix/util/experimental-features.hh"
@@ -87,6 +88,10 @@ void populateSubExprCachePublic(
 /// blackhole (eval-order divergence v3 sees but tree-walker resolves).
 /// External linkage so v3_hook.cc can extern-reference it.
 thread_local nix::Expr * tlBridgeFallbackExpr = nullptr;
+
+/// Forward decl so primTrace (which is defined earlier in this file)
+/// can use the v3->TW bridge.  Definition at the bottom of the file.
+nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
 
 ScopedBridgeFallbackExpr::ScopedBridgeFallbackExpr(nix::Expr * e)
     : saved(tlBridgeFallbackExpr)
@@ -1733,17 +1738,38 @@ nlohmann::json valueToJsonWithContext(
 
 void primTrace(EvalState & state, Value * args, Value & out)
 {
-    // tree-walker stringifies via printValueAsJSON-ish; we approximate:
-    // strings print as-is, ints/bools/null/path render via toStr,
-    // and complex values render as a short JSON dump.
     Value v = args[0];
+    // Fast paths for primitives.
     if (v.isString())   std::fprintf(stderr, "trace: %s\n", v.payload.str);
     else if (v.isInt()) std::fprintf(stderr, "trace: %lld\n", (long long)v.payload.i);
     else if (v.isFloat()) std::fprintf(stderr, "trace: %g\n", v.payload.f);
     else if (v.isBool()) std::fprintf(stderr, "trace: %s\n", v.payload.i == 1 ? "true" : "false");
     else if (v.isNull()) std::fprintf(stderr, "trace: null\n");
     else if (v.isPath()) std::fprintf(stderr, "trace: %s\n", v.payload.path);
-    else {
+    else if (state.nixEvalState) {
+        // §1.6 follow-up: route through tree-walker's ValuePrinter so
+        // trace output matches TW byte-for-byte (preserves «thunk» /
+        // <LAMBDA> / <PRIMOP> shape markers + cycle detection that
+        // valueToJson loses by force-everything-deeply).
+        try {
+            nix::Value * tw = v3ToTreeWalkerPublic(*state.nixEvalState, v);
+            if (tw) {
+                std::stringstream ss;
+                ss << nix::ValuePrinter(*state.nixEvalState, *tw);
+                std::fprintf(stderr, "trace: %s\n", ss.str().c_str());
+            } else {
+                std::fprintf(stderr, "trace: <complex value>\n");
+            }
+        } catch (...) {
+            // Fallback: best-effort JSON dump if the bridge fails.
+            try {
+                auto j = valueToJson(state, v);
+                std::fprintf(stderr, "trace: %s\n", j.dump().c_str());
+            } catch (...) {
+                std::fprintf(stderr, "trace: <complex value>\n");
+            }
+        }
+    } else {
         try {
             auto j = valueToJson(state, v);
             std::fprintf(stderr, "trace: %s\n", j.dump().c_str());
