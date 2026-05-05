@@ -156,4 +156,36 @@ if [[ -e "$repro_455" ]]; then
     echo "=== #455 NIX_V3_NO_CALL_HOOK_EAGER=1 still fails (auto-eager doing the work) ==="
   fi
 fi
+
+# v3 #455 / #457 aliases-shape POSITIVE test.  Synthetic reproducer
+# of the cardano-node aliases.nix shape: 3-arg curried lambda with
+# `with self;` over the fix-point arg + helpers via mapAttrs.  Currently
+# passes in all v3 modes -- guards against regressions in the OD-
+# resolved-lambda + with-self path.  The full cardano-node failure
+# requires deeper structural complexity (chained overlays + thousands
+# of attrs) that this synthetic shape doesn't capture.
+repro_aliases="$ROOT/src/libexpr-v3/test/repro-455-aliases.nix"
+if [[ -e "$repro_aliases" ]]; then
+  tw_alias=$("$NIX_BIN" eval --no-eval-cache --json -f "$repro_aliases" 2>/dev/null) || tw_alias="<failed>"
+  declare -a ALIAS_MODES=(
+    "default:NIX_USE_V3=1"
+    "od:NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1"
+    "od+lazy:NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1 NIX_V3_LAZY_BRIDGE_ARG=1"
+    "od+unsafe:NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1 NIX_V3_ON_DEMAND_ROOT_UNSAFE=1"
+    "pp:NIX_USE_V3=1 NIX_V3_PARSE_PRECOMPILE=1"
+  )
+  alias_ok=0; alias_fail=0
+  for spec in "${ALIAS_MODES[@]}"; do
+    IFS=':' read -r mname menv <<< "$spec"
+    aout=$(env $menv timeout 30 "$NIX_BIN" eval --no-eval-cache --json -f "$repro_aliases" 2>/dev/null) || aout="<failed>"
+    if [[ "$aout" == "$tw_alias" ]]; then
+      alias_ok=$((alias_ok + 1))
+    else
+      alias_fail=$((alias_fail + 1))
+      echo "=== #455 aliases-shape FAIL [$mname]: tw=$tw_alias v3=$aout ==="
+    fi
+  done
+  echo "=== #455 aliases-shape: ok=$alias_ok fail=$alias_fail (tw=$tw_alias) ==="
+  [[ $alias_fail -gt 0 ]] && exit 1
+fi
 exit 0
