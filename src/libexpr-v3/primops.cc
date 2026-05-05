@@ -2423,6 +2423,25 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         ns.callFunction(tw, *args[1], out, pos);
     };
 
+    // #455: cycle detection -- mirrors primV3ForceAttr's protection.
+    // Re-entry on the same handle while it's in progress means the
+    // bridged closure is forcing through itself; throw blackhole-
+    // shaped error so the caller's fallbackExpr re-eval path fires.
+    static thread_local std::unordered_set<int64_t> tlsBridge1InProgress;
+    if (!tlsBridge1InProgress.insert(h).second) {
+        // Cycle: route to fallbackToTreeWalker by throwing typed.
+        try {
+            throw BlackholeError(
+                "v3 bridge1: cycle on handle=" + std::to_string(h));
+        } catch (const std::exception & ex) {
+            fallbackToTreeWalker(ex);
+            return;
+        }
+    }
+    struct Bridge1Guard {
+        int64_t h;
+        ~Bridge1Guard() { tlsBridge1InProgress.erase(h); }
+    } _b1g{h};
     Value fn;
     try {
         if (useFiber && activeFiberDriverDepth == 0) {
@@ -2597,6 +2616,29 @@ static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
     // surface instead of being masked.
     // REVIEW_2026-05-04 F4 / §6.3: typed `BlackholeError` instead of
     // `strstr` -- see fallbackToTreeWalker comment in primV3CallBridge1.
+    //
+    // #455: cycle detection.  When a v3 thunk's body forces a Bridge
+    // that resolves to a TW lazy-bridged attrset (handle H), then v3
+    // attr-selects on that, then forces the resulting PrimOpApp via
+    // TW's force machinery, we re-enter primV3ForceAttr.  If the
+    // chain re-enters with the SAME handle that's currently in-
+    // progress on this thread, we have a cycle.  Throw a blackhole-
+    // shaped error so the caller falls back to tree-walker.
+    // Per-thread stack (no contention) of (handle, sid) pairs in
+    // progress; matches behave like blackhole.
+    static thread_local std::unordered_set<uint64_t> tlsForceAttrInProgress;
+    uint64_t cycleKey = (static_cast<uint64_t>(h) << 32) | (uint64_t)sid;
+    if (!tlsForceAttrInProgress.insert(cycleKey).second) {
+        // Cycle: throw a typed BlackholeError so the catch below
+        // routes to the fallback Expr rather than rethrowing.
+        throw BlackholeError(
+            "v3 forceAttr: cycle on handle=" + std::to_string(h)
+            + " name=" + std::string(name));
+    }
+    struct InProgressGuard {
+        uint64_t key;
+        ~InProgressGuard() { tlsForceAttrInProgress.erase(key); }
+    } _ipg{cycleKey};
     nix::Symbol resolvedName = ns.symbols.create(name);
     try {
         nix::Value * tmp = v3ToTreeWalker(v3state, *found);
