@@ -3542,6 +3542,29 @@ Value getBuiltinsValue() noexcept
     return vBuiltins;
 }
 
+/// REVIEW §3 fold: shared dispatch wrapper.  Every entry point below
+/// (run / runFunction / runFunctionWithUpvalues / runLambda) ends with
+/// `try { dispatchLoop; clearBlackMarksOnException; return r; } catch
+/// (...) { clearBlackMarksOnException; throw; }`.  Centralise so the
+/// pattern is in one place; if the cleanup ever needs more steps,
+/// they're added once.
+[[gnu::always_inline]] inline Value dispatchAndClear(VMState & vm)
+{
+    try {
+        Value r = dispatchLoop(vm, /*exitDepth=*/0);
+        // WC-15 defensive: even on success, residual Black marks can
+        // persist on the frame stack from incomplete sub-evals (e.g.
+        // transitive thunk chains where intermediate frames don't
+        // reach OP_RETURN).  Reset them so subsequent forces don't
+        // see a stale Black mark.
+        clearBlackMarksOnException(vm, 0);
+        return r;
+    } catch (...) {
+        clearBlackMarksOnException(vm, 0);
+        throw;
+    }
+}
+
 Value run(const CompilationUnit & rootCu)
 {
     VMState vm;
@@ -3566,20 +3589,7 @@ Value run(const CompilationUnit & rootCu)
     if (!rootCu.lambdas.empty())
         vm.valueStack.resize(rootCu.lambdas[0].nLocals);
 
-    try {
-        Value r = dispatchLoop(vm, /*exitDepth=*/0);
-        // WC-15 defensive: even on success, residual Black marks
-        // can persist on the frame stack from incomplete sub-evals
-        // that were intentionally orphaned (e.g., transitive thunk
-        // chains where intermediate frames don't reach OP_RETURN).
-        // Reset them so subsequent forces of the same Thunk don't
-        // see a stale Black mark.
-        clearBlackMarksOnException(vm, 0);
-        return r;
-    } catch (...) {
-        clearBlackMarksOnException(vm, 0);
-        throw;
-    }
+    return dispatchAndClear(vm);
 }
 
 /// CO-3: run an arbitrary FuncId in `cu` as if it were a thunk body.
@@ -3619,20 +3629,7 @@ Value runFunction(const CompilationUnit & cu, uint32_t funcIdx,
 
     vm.valueStack.resize(desc.nLocals);
 
-    try {
-        Value r = dispatchLoop(vm, /*exitDepth=*/0);
-        // WC-15 defensive: even on success, residual Black marks
-        // can persist on the frame stack from incomplete sub-evals
-        // that were intentionally orphaned (e.g., transitive thunk
-        // chains where intermediate frames don't reach OP_RETURN).
-        // Reset them so subsequent forces of the same Thunk don't
-        // see a stale Black mark.
-        clearBlackMarksOnException(vm, 0);
-        return r;
-    } catch (...) {
-        clearBlackMarksOnException(vm, 0);
-        throw;
-    }
+    return dispatchAndClear(vm);
 }
 
 /// CO-2 phase B: run a per-thunk Function with caller-provided
@@ -3683,20 +3680,7 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
 
     vm.valueStack.resize(desc.nLocals);
 
-    try {
-        Value r = dispatchLoop(vm, /*exitDepth=*/0);
-        // WC-15 defensive: even on success, residual Black marks
-        // can persist on the frame stack from incomplete sub-evals
-        // that were intentionally orphaned (e.g., transitive thunk
-        // chains where intermediate frames don't reach OP_RETURN).
-        // Reset them so subsequent forces of the same Thunk don't
-        // see a stale Black mark.
-        clearBlackMarksOnException(vm, 0);
-        return r;
-    } catch (...) {
-        clearBlackMarksOnException(vm, 0);
-        throw;
-    }
+    return dispatchAndClear(vm);
 }
 
 /// #426: invoke a v3 lambda body Function with one supplied argument.
@@ -3783,14 +3767,7 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
     });
     pushCapturedWiths(vm, capturedWiths);
 
-    try {
-        Value r = dispatchLoop(vm, /*exitDepth=*/0);
-        clearBlackMarksOnException(vm, 0);
-        return r;
-    } catch (...) {
-        clearBlackMarksOnException(vm, 0);
-        throw;
-    }
+    return dispatchAndClear(vm);
 }
 
 Value forceValue(VMState & vm, Value v)
