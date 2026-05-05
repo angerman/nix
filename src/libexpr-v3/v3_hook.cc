@@ -69,6 +69,179 @@ static std::unordered_map<const nix::Expr *, nix::SourcePath> & v3ExprPaths()
     return tbl;
 }
 
+/// #451 / Phase B: parse-time map ExprLambda* -> the root file's Expr*
+/// that contains it.  Built by `collectLambdasIntoMap` walking the
+/// freshly-parsed AST in v3RegisterExprEntry.
+///
+/// On call-hook miss, we look up `lambda` here, find the enclosing
+/// root file, and call `lowerCompileAndPopulate(root, ...)` -- which
+/// lowers the *whole* file with full enclosing-scope context, so
+/// `populateSubExprCacheLocal` produces correct upvalueSources for
+/// every lambda in the file (the prior failed on-demand attempt
+/// lowered the lambda in isolation, dropping the enclosing scope's
+/// varOrigins -> silent wrong-output regression).
+///
+/// Memory cost: one (ptr, ptr) entry per parsed lambda.  On nixpkgs
+/// this is a few hundred KB; cheap relative to the AST itself.
+static std::unordered_map<
+    const nix::ExprLambda *, nix::Expr *> & v3LambdaRoot()
+{
+    static std::unordered_map<const nix::ExprLambda *, nix::Expr *> tbl;
+    return tbl;
+}
+
+/// AST walker that finds every ExprLambda reachable from `e` and
+/// records (lambda -> root) in `out`.  Recurses through every Expr
+/// kind (including thunkified attr values, list elements, call args)
+/// so the map covers lambdas behind those layers, not just direct
+/// children.  Lambda bodies ARE descended into (nested lambdas).
+///
+/// Called once per parseExprFromFile via v3RegisterExprEntry.  The
+/// root pointer stays stable for the lifetime of the EvalState's
+/// AST allocator.
+static void collectLambdasIntoMap(
+    const nix::Expr * e,
+    nix::Expr * root,
+    std::unordered_map<const nix::ExprLambda *, nix::Expr *> & out)
+{
+    if (!e) return;
+    using K = nix::Expr::Kind;
+    switch (e->exprKind) {
+    case K::Unknown:
+    case K::Int:
+    case K::Float:
+    case K::String:
+    case K::Path:
+    case K::Var:
+    case K::InheritFrom:
+    case K::Pos:
+    case K::BlackHole:
+        return;
+    case K::Lambda: {
+        auto * lam = static_cast<const nix::ExprLambda *>(e);
+        // Record this lambda -> root.  First-write-wins is fine: the
+        // same ExprLambda* can't appear in two different roots (each
+        // parseExprFromFile produces a fresh AST).
+        out.emplace(lam, root);
+        // Descend into the body to catch nested lambdas + thunkified
+        // attr values inside (e.g. `a: { x = (b: a + b); }`).
+        collectLambdasIntoMap(lam->body, root, out);
+        // Also descend into formal default expressions; defaults are
+        // thunked in v3 but contain real ASTs that may include
+        // lambdas.
+        if (auto formals = lam->getFormals()) {
+            for (auto & fm : formals->formals)
+                if (fm.def) collectLambdasIntoMap(fm.def, root, out);
+        }
+        return;
+    }
+    case K::Let:
+    case K::Attrs: {
+        // ExprLet's `attrs` field has the AttrDefs we need to walk;
+        // ExprAttrs has them directly.  ExprLet additionally has body.
+        const nix::ExprAttrs * a;
+        const nix::Expr * body = nullptr;
+        if (e->exprKind == K::Let) {
+            auto * l = static_cast<const nix::ExprLet *>(e);
+            a = l->attrs;
+            body = l->body;
+        } else {
+            a = static_cast<const nix::ExprAttrs *>(e);
+        }
+        if (a) {
+            // attrs (the AttrDefs map): ordered by symbol; iterate.
+            if (a->attrs.has_value()) {
+                for (auto & kv : *a->attrs)
+                    collectLambdasIntoMap(kv.second.e, root, out);
+            }
+            if (a->dynamicAttrs) {
+                for (auto & da : *a->dynamicAttrs) {
+                    collectLambdasIntoMap(da.nameExpr, root, out);
+                    collectLambdasIntoMap(da.valueExpr, root, out);
+                }
+            }
+            if (a->inheritFromExprs) {
+                for (auto * fe : *a->inheritFromExprs)
+                    collectLambdasIntoMap(fe, root, out);
+            }
+        }
+        if (body) collectLambdasIntoMap(body, root, out);
+        return;
+    }
+    case K::Call: {
+        auto * c = static_cast<const nix::ExprCall *>(e);
+        collectLambdasIntoMap(c->fun, root, out);
+        if (c->args)
+            for (auto * arg : *c->args)
+                collectLambdasIntoMap(arg, root, out);
+        return;
+    }
+    case K::List: {
+        auto * l = static_cast<const nix::ExprList *>(e);
+        for (auto * x : l->elems)
+            collectLambdasIntoMap(x, root, out);
+        return;
+    }
+    case K::With: {
+        auto * w = static_cast<const nix::ExprWith *>(e);
+        collectLambdasIntoMap(w->attrs, root, out);
+        collectLambdasIntoMap(w->body, root, out);
+        return;
+    }
+    case K::If: {
+        auto * i = static_cast<const nix::ExprIf *>(e);
+        collectLambdasIntoMap(i->cond, root, out);
+        collectLambdasIntoMap(i->then, root, out);
+        collectLambdasIntoMap(i->else_, root, out);
+        return;
+    }
+    case K::Assert: {
+        auto * a = static_cast<const nix::ExprAssert *>(e);
+        collectLambdasIntoMap(a->cond, root, out);
+        collectLambdasIntoMap(a->body, root, out);
+        return;
+    }
+    case K::OpNot:
+        collectLambdasIntoMap(static_cast<const nix::ExprOpNot *>(e)->e, root, out);
+        return;
+    case K::OpUpdate:
+    case K::OpConcatLists:
+    case K::OpEq:
+    case K::OpNEq:
+    case K::OpAnd:
+    case K::OpOr:
+    case K::OpImpl: {
+        // All the binop variants share the e1/e2 layout.
+        auto * b = static_cast<const nix::ExprOpEq *>(e);
+        collectLambdasIntoMap(b->e1, root, out);
+        collectLambdasIntoMap(b->e2, root, out);
+        return;
+    }
+    case K::Select: {
+        auto * s = static_cast<const nix::ExprSelect *>(e);
+        collectLambdasIntoMap(s->e, root, out);
+        if (s->def) collectLambdasIntoMap(s->def, root, out);
+        // attrPath components: dynamic-name expressions can host lambdas.
+        for (auto & ap : s->getAttrPath())
+            if (ap.expr) collectLambdasIntoMap(ap.expr, root, out);
+        return;
+    }
+    case K::OpHasAttr: {
+        auto * h = static_cast<const nix::ExprOpHasAttr *>(e);
+        collectLambdasIntoMap(h->e, root, out);
+        for (auto & ap : h->attrPath)
+            if (ap.expr) collectLambdasIntoMap(ap.expr, root, out);
+        return;
+    }
+    case K::ConcatStrings: {
+        auto * cs = static_cast<const nix::ExprConcatStrings *>(e);
+        for (auto & p : cs->es)
+            collectLambdasIntoMap(p.second, root, out);
+        return;
+    }
+    }
+}
+
 // Forward decl: defined later in this file (after CachedUnit, etc).
 struct V3HookStats;
 V3HookStats & v3HookStats();
@@ -82,6 +255,34 @@ static void v3RegisterExprEntry(nix::EvalState & state,
 {
     if (!e) return;
     v3ExprPaths().emplace(e, p);
+    // #451 / Phase B: walk the parsed root and record (lambda -> root)
+    // for every reachable ExprLambda.  Cheap O(N) AST walk; cost is a
+    // few hundred KB of map entries on a nixpkgs eval.  Keyed by
+    // ExprLambda*, which is address-stable for the AST's lifetime.
+    //
+    // Consumed by v3CallFunctionEntry's cache-miss path: when a
+    // lambda isn't in subCache, look up its root here, lower+compile
+    // the *whole root file* (preserving enclosing-scope varOrigins),
+    // and re-probe.  Avoids the silent-wrong-output regression of
+    // the prior on-demand attempt that lowered lambdas in isolation
+    // (commit 2b9295437).
+    //
+    // Gated on NIX_USE_V3=1 so non-v3 invocations don't pay the walk.
+    static const bool useV3 = []{
+        const char * a = std::getenv("NIX_USE_V3");
+        return a && std::string_view(a) == "1";
+    }();
+    static const bool lambdaRootMapEnabled = []{
+        if (const char * v = std::getenv("NIX_V3_NO_LAMBDA_ROOT_MAP"))
+            return std::string_view(v) != "1";
+        return true;  // default ON when v3 is on
+    }();
+    if (useV3 && lambdaRootMapEnabled) {
+        try {
+            collectLambdasIntoMap(
+                e, const_cast<nix::Expr *>(e), v3LambdaRoot());
+        } catch (...) { /* opportunistic; ignore */ }
+    }
     // #430 / #445: opt-in parse-time precompile.  Off by default so
     // existing workloads aren't taxed; flip with
     // NIX_V3_PARSE_PRECOMPILE=1 to populate v3SubExprCache for every
@@ -101,10 +302,6 @@ static void v3RegisterExprEntry(nix::EvalState & state,
     // only the call hook is wired.  Without bypass, parse-precompile
     // populated nothing in default mode -- callHookHits stayed at 0
     // because the cache was never written.
-    static const bool useV3 = []{
-        const char * a = std::getenv("NIX_USE_V3");
-        return a && std::string_view(a) == "1";
-    }();
     static const bool parsePrecompile =
         std::getenv("NIX_V3_PARSE_PRECOMPILE") != nullptr;
     if (useV3 && parsePrecompile) {
@@ -883,6 +1080,16 @@ struct V3HookStats {
     /// Past every gate but failed at prepHookUpvaluesAndWiths or
     /// `fun.lambda().env == nullptr`.  Closes the funnel.
     uint64_t callHookPrepFail               = 0;
+
+    /// #451 / Phase B: on-demand-with-root cache-miss outcomes.
+    /// Each lambda call-hook miss either resolves via root compile
+    /// (CacheMissResolved -> proceeds to run v3) or fails one of
+    /// the sub-paths.  Sums to callHookCacheMiss when on-demand-root
+    /// is enabled.
+    uint64_t callHookCacheMissNoRoot         = 0;  // lambda not in v3LambdaRoot
+    uint64_t callHookCacheMissCompileFailed  = 0;  // root lowerCompileAndPopulate threw / returned false
+    uint64_t callHookCacheMissPostCompile    = 0;  // root compiled but lambda still not in subCache
+    uint64_t callHookCacheMissResolved       = 0;  // root compiled + lambda in subCache; proceeds
 };
 
 V3HookStats & v3HookStats()
@@ -1266,6 +1473,18 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     pg("returnsClosure", s.callHookGateReturnsClosure);
                     pg("phaseBSkipped",  s.callHookGatePhaseBSkipped);
                     pg("outerWith",      s.callHookGateOuterWith);
+                    // #451: on-demand-root cache-miss outcomes.
+                    if (s.callHookCacheMissResolved
+                        || s.callHookCacheMissNoRoot
+                        || s.callHookCacheMissCompileFailed
+                        || s.callHookCacheMissPostCompile) {
+                        std::fprintf(stderr,
+                            "v3 call-hook on-demand-root: resolved=%llu noRoot=%llu compileFailed=%llu postCompileMiss=%llu\n",
+                            (unsigned long long)s.callHookCacheMissResolved,
+                            (unsigned long long)s.callHookCacheMissNoRoot,
+                            (unsigned long long)s.callHookCacheMissCompileFailed,
+                            (unsigned long long)s.callHookCacheMissPostCompile);
+                    }
                     if (s.callHookUniqueMisses > 0)
                         std::fprintf(stderr,
                             "v3 call-hook: uniqueLambdaMisses=%llu hottestMissCount=%llu (avg=%.1f calls per lambda)\n",
@@ -2397,19 +2616,73 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         // call-hook then runs the v3 body with garbage upvalues,
         // producing wrong results.
         //
-        // To make this work cleanly we'd need to either:
-        //   (a) Walk back up to the enclosing root Expr (the file or
-        //       parseExprFromString origin) and lowerNixExpr on THAT,
-        //       letting it populate every contained lambda's
-        //       upvalueSources.  Need a back-pointer or AST-walk to
-        //       find the root.
-        //   (b) Pre-walk every parsed AST at parse time (parser hook)
-        //       and pre-register every ExprLambda the parser sees.
-        //   (c) Fix the lowerer to accept a partial scope-stack so a
-        //       single-lambda lower pass can compute proper origins.
+        // #451 / Phase B: on-demand-with-root precompile.  Implements
+        // option (a) from the comment block above: at parse time we
+        // recorded every (ExprLambda* -> root Expr*) in v3LambdaRoot.
+        // Here, on call-hook miss, we look up the root and lower the
+        // *whole file* via lowerCompileAndPopulate -- which produces
+        // correct upvalueSources for every lambda in the file (the
+        // eval-hook's existing pipeline).
         //
-        // Without (a)-(c) the on-demand precompile is unsafe.  Reverted.
-        return false;
+        // This is the keystone of #451: without it, real workloads
+        // (cardano-node) see 10.7M cacheMiss / 0 hits in this hook
+        // because the eval-hook only compiles 19 sub-Exprs per run
+        // and those lambdas rarely match what's actually called.
+        //
+        // Root compile is one-time per root + amortised across runs
+        // by the SQLite disk cache (#446 / #447).  After successful
+        // root compile, we re-probe subCache and proceed normally.
+        //
+        // Currently OPT-IN via NIX_V3_ON_DEMAND_ROOT=1 because it
+        // exposes a silent-wrong-output regression on cardano-node:
+        // the root compiles successfully and the lambda's upvalue
+        // sources populate, but at run time something in the
+        // upvalue-walk produces an empty result string.  Likely
+        // related to env shape mismatches when the lambda's runtime
+        // env differs from the level-0 v3 expected at populate time
+        // (e.g. import boundaries collapse levels in tree-walker
+        // but not in the AST resolveVar saw).  Documented in #451;
+        // the keystone speedup (3.46 s -> 0.96 s on cardano-node)
+        // is real once the env-shape issue is fixed.
+        static const bool onDemandRoot =
+            std::getenv("NIX_V3_ON_DEMAND_ROOT") != nullptr;
+        if (!onDemandRoot) return false;
+        auto & roots = v3LambdaRoot();
+        auto rit = roots.find(lambda);
+        if (rit == roots.end()) {
+            // Lambda was parsed before v3LambdaRoot was active, or
+            // came from a string-eval path that doesn't go through
+            // v3RegisterExprHook.  Fall back.
+            st.callHookCacheMissNoRoot++;
+            return false;
+        }
+        nix::Expr * root = rit->second;
+        // Run lowerCompileAndPopulate on the root.  The bypassHookGate
+        // flag matches what parse-precompile uses: forces the
+        // call-hook-friendly populate even when v3ForceHook is null.
+        // Re-uses the same idempotent populatedSet so a root that was
+        // already compiled (e.g. via parse-precompile) short-circuits
+        // in O(1).
+        bool ok = false;
+        try {
+            ok = lowerCompileAndPopulate(
+                root, state, st, /*bypassHookGate=*/true);
+        } catch (...) { ok = false; }
+        if (!ok) {
+            st.callHookCacheMissCompileFailed++;
+            return false;
+        }
+        // Re-probe.  After a successful root compile, the lambda
+        // *should* be in subCache (it's a child of root).  If not,
+        // the populate dropped it (e.g. kMaxFunctions cap hit, or
+        // the lambda's freeVars couldn't be expressed); fall back.
+        sit = subCache.find(lambda);
+        if (sit == subCache.end()) {
+            st.callHookCacheMissPostCompile++;
+            return false;
+        }
+        st.callHookCacheMissResolved++;
+        // Fall through to the normal post-cache-hit path below.
     }
     auto & ent = sit->second;
     if (!ent.isLambda) { st.callHookGated++; st.callHookGateNotIsLambdaEnt++; return false; }
