@@ -2681,6 +2681,20 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
             st.callHookCacheMissPostCompile++;
             return false;
         }
+        // #455 mitigation: env-shape mismatches between TW and v3
+        // surface as `with self;` infinite-recursion on workloads
+        // with rec-attrset captures (cardano-node).  Until properly
+        // fixed, restrict on-demand-root to lambdas with ZERO
+        // upvalues -- those have no env-walking risk because their
+        // body's freeVars are empty (pure functions of their args).
+        // Disable the safety net via NIX_V3_ON_DEMAND_ROOT_UNSAFE=1
+        // for full coverage while debugging #455.
+        static const bool onDemandRootSafe =
+            std::getenv("NIX_V3_ON_DEMAND_ROOT_UNSAFE") == nullptr;
+        if (onDemandRootSafe && sit->second.nUpvalues > 0) {
+            st.callHookCacheMissPostCompile++;
+            return false;
+        }
         st.callHookCacheMissResolved++;
         // Fall through to the normal post-cache-hit path below.
     }
