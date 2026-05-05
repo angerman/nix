@@ -1760,14 +1760,50 @@ void primDirOf(EvalState &, Value * args, Value & out)
     }
 }
 
-void primPathExists(EvalState &, Value * args, Value & out)
+void primPathExists(EvalState & state, Value * args, Value & out)
 {
     std::string s;
     if (args[0].isString()) s = args[0].payload.str;
     else if (args[0].isPath()) s = args[0].payload.path;
     else typeError("pathExists", "string or path");
-    // Match tree-walker semantics: a broken symlink still "exists" for
-    // pathExists' purposes (matches `lstat` rather than `stat`).
+
+    // REVIEW §1.7: route through nix::EvalState::realisePath when a TW
+    // EvalState is available so pure-eval / restricted-eval modes can
+    // refuse out-of-allowed-roots probes (security-relevant: a probe
+    // that returns true/false reveals filesystem layout).  Tree-walker
+    // catches RestrictedPathError and returns false; do the same.
+    if (state.nixEvalState) {
+        auto & ns = *state.nixEvalState;
+        try {
+            // Bridge to a TW Value so realisePath can use its existing
+            // type dispatch (string vs path vs context) without us
+            // duplicating the logic.
+            nix::Value tw;
+            if (args[0].isString()) tw.mkString(s, ns.mem);
+            else                    tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(s)), ns.mem);
+            // mustBeDir mirrors tree-walker (primops.cc:2128) — trailing
+            // slash forces full symlink resolution + dir check.
+            bool mustBeDir =
+                args[0].isString() && (s.ends_with("/") || s.ends_with("/."));
+            auto symRes = mustBeDir
+                ? nix::SymlinkResolution::Full
+                : nix::SymlinkResolution::Ancestors;
+            auto path = ns.realisePath(nix::noPos, tw, symRes);
+            auto st = path.maybeLstat();
+            bool exists = st && (!mustBeDir || st->type == nix::SourceAccessor::tDirectory);
+            out = exists ? Value::vTrue : Value::vFalse;
+            return;
+        } catch (const nix::RestrictedPathError &) {
+            out = Value::vFalse;
+            return;
+        } catch (...) {
+            // Anything else: fall through to the pre-§1.7 best-effort
+            // direct stat (e.g. when path conversion through TW fails
+            // for a malformed input).
+        }
+    }
+    // Fallback (no TW state): match tree-walker semantics -- a broken
+    // symlink still "exists" for pathExists (lstat-shaped).
     std::error_code ec;
     auto stat = std::filesystem::symlink_status(s, ec);
     out = (!ec && stat.type() != std::filesystem::file_type::not_found)
@@ -1925,6 +1961,12 @@ void primSplit(EvalState &, Value * args, Value & out)
         std::regex re(args[0].payload.str, std::regex::extended);
         std::string_view s(args[1].payload.str);
         std::vector<Value> parts;
+        // REVIEW §1.8 note: std::cregex_iterator advances past zero-
+        // length matches automatically (libc++ + libstdc++ both
+        // implement the standard's `match_prev_avail / no_zero` shim
+        // internally), and the empty pattern `""` is rejected by the
+        // regex constructor before we get here.  No manual `pos += 1`
+        // needed; verified across {`""`, `"a*"`, `"^"`, `"$"`, `"(?=)"`}.
         std::cregex_iterator it(s.data(), s.data() + s.size(), re);
         std::cregex_iterator end;
         size_t pos = 0;
