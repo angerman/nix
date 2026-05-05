@@ -1105,10 +1105,16 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
     auto * tos   = args[1].payload.list;
     if (!froms || !tos || froms->size != tos->size)
         throw std::runtime_error("v3 primop replaceStrings: lists must have equal length");
-    // Force `from` elements upfront — every iteration of the outer
+    // Force `from` elements upfront -- every iteration of the outer
     // loop reads them, and they're lazy by default.  `to` elements
-    // are forced lazily inside the match branch (matches tree-walker;
-    // unused replacements never fire).
+    // stay lazy and are forced inside the match branch (matches
+    // tree-walker; `replaceStrings ["match" "miss"] [.. (throw)] ..`
+    // must NOT throw for the unmatched index -- see eval-okay-
+    // replacestrings line 9 for the lang-test requirement).
+    //
+    // REVIEW §2.3 was checked but the review's claimed parity gap
+    // doesn't hold: tree-walker IS lazy on `to`.  Eager-force here
+    // would break eval-okay-replacestrings (regressed and reverted).
     for (uint32_t j = 0; j < froms->size; ++j) {
         froms->elems[j] = forceValue(*state.vm, froms->elems[j]);
         if (!froms->elems[j].isString())
