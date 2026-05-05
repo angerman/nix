@@ -1579,8 +1579,31 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     // negative when run through v3's lower+compile+run path.  Phase E
     // is purposefully narrow: only the closure-result wedge moves.
     // Mirror Phase C: opt-in until we have on-real-workload perf data.
+    // #454 Phase E defaults flip (2026-05-05): the safe lifts (bare-
+    // Lambda short-circuit, top-level Attrs/List short-circuit, AST-
+    // level willReturnClosure short-circuit) are now ON by default;
+    // master gate is NIX_V3_NO_INVERT_EVAL=1 to opt out.
+    //
+    // The IR-level willProduceClosure lift (post-lower predicate that
+    // catches Exprs whose terminal is an ir::Lambda binding) STAYS
+    // opt-in via NIX_V3_LIFT_IRWPC=1 because lifting it together with
+    // willReturnClosure-AST hits an infinite-recursion bug on cardano-
+    // node's nixpkgs-lib `eachSystem` shape (each lift alone is fine;
+    // the combo triggers a cycle).  Bisect knob: NIX_V3_NO_LIFT_<lift>
+    // to disable a specific lift independently.
     static const bool invertEval =
-        std::getenv("NIX_V3_INVERT_EVAL") != nullptr;
+        std::getenv("NIX_V3_NO_INVERT_EVAL") == nullptr;
+    static const bool liftLambda =
+        invertEval && std::getenv("NIX_V3_NO_LIFT_LAMBDA") == nullptr;
+    static const bool liftAttrsList =
+        invertEval && std::getenv("NIX_V3_NO_LIFT_ATTRSLIST") == nullptr;
+    static const bool liftWillReturnClosure =
+        invertEval && std::getenv("NIX_V3_NO_LIFT_WRC") == nullptr;
+    // IRWPC opt-in only (cardano-node bug above).
+    static const bool liftIRWillProduceClosure =
+        invertEval
+        && std::getenv("NIX_V3_LIFT_IRWPC") != nullptr
+        && std::getenv("NIX_V3_NO_LIFT_IRWPC") == nullptr;
 
     if (e && !noShortcircuit) {
         auto k = e->exprKind;
@@ -1594,7 +1617,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         // circuited because v3's lower forces every entry eagerly
         // and the upvalue translation has known runtime gaps
         // ("OP_GET_UPVALUE: no closure context") for some shapes.
-        bool lambdaShortCircuit = (k == nix::Expr::Kind::Lambda) && !invertEval;
+        bool lambdaShortCircuit = (k == nix::Expr::Kind::Lambda) && !liftLambda;
         // Top-level Attrs / List: tree-walker constructs these with
         // lazy thunks and was materially faster than v3's lower+
         // compile+run+bridge cycle, which forces every attribute
@@ -1605,7 +1628,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         // try lifting too -- gated separately on NIX_V3_INVERT_EVAL=1.
         bool attrsListShortCircuit =
             (k == nix::Expr::Kind::Attrs || k == nix::Expr::Kind::List)
-            && !invertEval;
+            && !liftAttrsList;
         if (lambdaShortCircuit ||
             attrsListShortCircuit ||
             k == nix::Expr::Kind::Int    ||
@@ -1628,7 +1651,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         // takes care of Tag::Closure results, so the short-circuit
         // becomes wasted opportunity — let v3 own these and skip
         // straight through to lower+compile+run.
-        if (!invertEval && willReturnClosure(e)) {
+        if (!liftWillReturnClosure && willReturnClosure(e)) {
             if (diag) std::fprintf(stderr,
                 "v3 hook: static closure result predicted, kind=%d\n", (int)k);
             st.evalFallbackReason[5]++;
@@ -1798,7 +1821,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             // bridge handles Tag::Closure results — don't skip here.
             // Otherwise (default), skip the run+bridge cycle since the
             // result must fall back to TW anyway.
-            if (!invertEval && willProduceClosure()) {
+            if (!liftIRWillProduceClosure && willProduceClosure()) {
                 if (diag) std::fprintf(stderr,
                     "v3 hook: skip — IR predicts closure result\n");
                 st.evalFallbackReason[5]++;
@@ -1918,14 +1941,16 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         // into v3.  Gate via NIX_V3_BRIDGE_CLOSURE=1 to opt-in for
         // benchmarking; default OFF until the regression is verified
         // gone.
-        // #454 Phase E: NIX_V3_INVERT_EVAL implies the closure bridge.
-        // Once we let v3 own closure-producing Exprs the willReturnClosure
-        // short-circuit no longer covers them, so we MUST bridge the
-        // result rather than fall back (which would re-enter via the
-        // hook on a non-closure shape and double-evaluate).
+        // #454 Phase E (now default): the closure bridge is required
+        // when v3 owns closure-producing Exprs; without it a Tag::Closure
+        // result re-enters the hook on a non-closure shape and double-
+        // evaluates.  Default ON; opt out via NIX_V3_NO_INVERT_EVAL=1
+        // (which also disables the structural lifts above so the bridge
+        // becomes unnecessary).  Legacy NIX_V3_BRIDGE_CLOSURE=1 still
+        // forces it explicitly even with NO_INVERT_EVAL.
         static const bool bridgeEnabled =
-            std::getenv("NIX_V3_BRIDGE_CLOSURE") != nullptr
-            || std::getenv("NIX_V3_INVERT_EVAL") != nullptr;
+            std::getenv("NIX_V3_NO_INVERT_EVAL") == nullptr
+            || std::getenv("NIX_V3_BRIDGE_CLOSURE") != nullptr;
         if (!bridgeEnabled) {
             if (diag) std::fprintf(stderr,
                 "v3 hook: closure-shape result tag=%d, falling back\n",
