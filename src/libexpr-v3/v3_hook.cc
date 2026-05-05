@@ -207,10 +207,20 @@ struct SubExprCacheEntry {
 
 inline bool SubExprCacheEntry::isPhaseBSkipped() const noexcept
 {
+    // #449: default lowered from 3 to 1.  The 3-strike threshold
+    // (#430-quickwin-5 / 4b7acff76) was meant to give transient
+    // throws (e.g. tryEval probes) a chance to recover, but cardano-
+    // node-class workloads have many Exprs whose first force throws
+    // a fix-point blackhole / cycle deterministically — retrying
+    // these 2 more times costs ~1 s of v3-fhook wall (verified by
+    // bisect: f456dd76c v3-fhook 4.41 s vs 4b7acff76 5.49 s, both
+    // warm; setting NIX_V3_PHASEB_FAIL_LIMIT=1 at HEAD recovers
+    // 0.6 s).  Users who need the 3-strike resurrection (e.g.
+    // workloads dominated by tryEval probes) can set the env var.
     static const uint8_t kFailLimit = []{
         if (const char * v = std::getenv("NIX_V3_PHASEB_FAIL_LIMIT"))
             return (uint8_t)std::min(255, std::max(1, std::atoi(v)));
-        return uint8_t{3};
+        return uint8_t{1};
     }();
     return phaseBFailureCount >= kFailLimit;
 }
