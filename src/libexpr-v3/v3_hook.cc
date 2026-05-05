@@ -69,6 +69,17 @@ static std::unordered_map<const nix::Expr *, nix::SourcePath> & v3ExprPaths()
     return tbl;
 }
 
+/// #455 diag: tracks which sub-Expr cache entries were populated by
+/// on-demand-root (vs the eval-hook path).  Lets the call hook
+/// selectively block only on-demand-root-populated entries from
+/// running, isolating which path's populate is producing buggy
+/// upvalueSources / IR.
+static std::unordered_set<const nix::Expr *> & v3OnDemandRootPopulated()
+{
+    static std::unordered_set<const nix::Expr *> s;
+    return s;
+}
+
 /// #451 / Phase B: parse-time map ExprLambda* -> the root file's Expr*
 /// that contains it.  Built by `collectLambdasIntoMap` walking the
 /// freshly-parsed AST in v3RegisterExprEntry.
@@ -955,8 +966,16 @@ static void populateSubExprCacheLocal(
         // hook, which has its own per-state skip set for structural
         // failures).  The skipPermanently false-mutation that caused
         // cross-state pollution was removed above.
-        const_cast<nix::Expr *>(static_cast<const nix::Expr *>(sef.astExpr))
-            ->isV3CacheCandidate = true;
+        //
+        // #455 diag: NIX_V3_NO_CACHE_CANDIDATE_FLAG=1 skips the AST
+        // mutation entirely, isolating that side effect for bisecting
+        // the on-demand-root infinite-recursion bug.
+        static const bool noCandidateFlag =
+            std::getenv("NIX_V3_NO_CACHE_CANDIDATE_FLAG") != nullptr;
+        if (!noCandidateFlag) {
+            const_cast<nix::Expr *>(static_cast<const nix::Expr *>(sef.astExpr))
+                ->isV3CacheCandidate = true;
+        }
         subCache.emplace(static_cast<const nix::Expr *>(sef.astExpr),
             std::move(entry));
     }
@@ -2665,8 +2684,21 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         // in O(1).
         bool ok = false;
         try {
+            // Track which subCache entries this populate writes by
+            // diffing the subCache key set before/after.  The diff
+            // is on-demand-root's contribution; we add it to
+            // v3OnDemandRootPopulated() so the gate below can refuse
+            // to run those entries when NIX_V3_ON_DEMAND_ROOT_NEVER_RUN_OD=1.
+            auto & subCache = v3SubExprCache();
+            std::unordered_set<const nix::Expr *> before;
+            before.reserve(subCache.size());
+            for (auto & kv : subCache) before.insert(kv.first);
             ok = lowerCompileAndPopulate(
                 root, state, st, /*bypassHookGate=*/true);
+            for (auto & kv : subCache) {
+                if (!before.count(kv.first))
+                    v3OnDemandRootPopulated().insert(kv.first);
+            }
         } catch (...) { ok = false; }
         if (!ok) {
             st.callHookCacheMissCompileFailed++;
@@ -2695,11 +2727,90 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
             st.callHookCacheMissPostCompile++;
             return false;
         }
+        // #455 diag: NIX_V3_ON_DEMAND_ROOT_POPULATE_ONLY=1 lets us
+        // isolate "populate side-effects" from "lambda execution" --
+        // we still run lowerCompileAndPopulate(root) but always
+        // refuse to resolve.  If the cardano-node failure persists
+        // with this on, the bug is in the populate's side effects
+        // (isV3CacheCandidate flag, force-hook indirect routing,
+        // import-triggered re-entrancy, ...) not in running v3
+        // lambda bodies.
+        static const bool populateOnly =
+            std::getenv("NIX_V3_ON_DEMAND_ROOT_POPULATE_ONLY") != nullptr;
+        if (populateOnly) {
+            st.callHookCacheMissPostCompile++;
+            return false;
+        }
+        // #455 diag: NIX_V3_ON_DEMAND_ROOT_LIMIT=N lets us bisect
+        // which specific lambda (by resolution order) introduces the
+        // wrong-output bug on cardano-node.  Resolves the first N
+        // lambdas via on-demand-root, blocks all subsequent ones.
+        // Setting N to 0 disables resolution entirely (matches
+        // POPULATE_ONLY semantics for the on-demand-root path; the
+        // first cache-miss path through here is what's blocked).
+        static const int kResolveLimit = []{
+            if (const char * v = std::getenv("NIX_V3_ON_DEMAND_ROOT_LIMIT"))
+                return std::atoi(v);
+            return -1;  // no limit
+        }();
+        if (kResolveLimit >= 0
+            && st.callHookCacheMissResolved >= (uint64_t)kResolveLimit) {
+            st.callHookCacheMissPostCompile++;
+            return false;
+        }
         st.callHookCacheMissResolved++;
+        // #455 diag: dump per-resolution info to track which lambdas
+        // are being unlocked + how many upvalueSources of each kind.
+        // Enables post-mortem analysis when the workload fails (e.g.
+        // cardano-node).  Disabled by default; opt in via env var.
+        static const bool diagOnDemand =
+            std::getenv("V3_DBG_ON_DEMAND_ROOT") != nullptr;
+        if (diagOnDemand) {
+            const auto & e2 = sit->second;
+            uint32_t direct = 0, recBuild = 0, litBuiltins = 0;
+            for (auto & u : e2.upvalueSources) {
+                switch (u.kind) {
+                case UpvalueSource::Kind::Direct:      ++direct; break;
+                case UpvalueSource::Kind::RecBuild:    ++recBuild; break;
+                case UpvalueSource::Kind::LitBuiltins: ++litBuiltins; break;
+                }
+            }
+            std::fprintf(stderr,
+                "v3 on-demand-root: lambda=%p funcIdx=%u nUpvalues=%u "
+                "direct=%u recBuild=%u litBuiltins=%u "
+                "outerWithLevels=%zu callReturnsClosure=%d\n",
+                (const void *)lambda,
+                (unsigned)e2.funcIdx, (unsigned)e2.nUpvalues,
+                direct, recBuild, litBuiltins,
+                e2.outerWithLevels.size(),
+                (int)e2.callReturnsClosure);
+        }
         // Fall through to the normal post-cache-hit path below.
     }
     auto & ent = sit->second;
     if (!ent.isLambda) { st.callHookGated++; st.callHookGateNotIsLambdaEnt++; return false; }
+    // #455 diag: NIX_V3_ON_DEMAND_ROOT_NEVER_RUN=1 makes the call
+    // hook refuse to run *any* lambda that's in v3LambdaRoot --
+    // tracking whether the bug is in v3 lambda execution at all,
+    // or purely in the populate's AST mutation / subCache writes.
+    static const bool neverRun =
+        std::getenv("NIX_V3_ON_DEMAND_ROOT_NEVER_RUN") != nullptr;
+    if (neverRun && v3LambdaRoot().count(lambda)) {
+        st.callHookGated++;
+        return false;
+    }
+    // #455 diag: NIX_V3_NEVER_RUN_OD=1 only refuses lambdas that
+    // were specifically populated by on-demand-root (the diff between
+    // before/after subCache).  This isolates buggy populate from
+    // correct eval-hook populate.  If cardano-node passes with this
+    // on but fails without, the bug is exclusively in on-demand-root's
+    // populated entries.
+    static const bool neverRunOD =
+        std::getenv("NIX_V3_NEVER_RUN_OD") != nullptr;
+    if (neverRunOD && v3OnDemandRootPopulated().count(lambda)) {
+        st.callHookGated++;
+        return false;
+    }
     // #450 / Phase A: static closure-result gate.  When the lambda's
     // body provably returns a closure, running v3 just to refuse the
     // result is wasted work.  Bail before paying the upvalue prep +
