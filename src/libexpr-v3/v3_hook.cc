@@ -2684,6 +2684,21 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         st.callHookCacheMiss++;
         return false;
     }
+    // #455 mitigation: per-lambda blacklist for lambdas where OD gave
+    // up (root compiled but lambda still ineligible -- has upvalues
+    // under SAFE mode, or never made it into subCache).  Without this
+    // we re-pay the populatedSet probe + post-compile re-probe + upvalue
+    // gate on every call, which on hello.name with OD enabled produces
+    // ~250k pointless cycles costing ~38 s.  The blacklist makes those
+    // cycles a single hash probe -> early return.
+    auto & blacklisted = []{
+        static std::unordered_set<const nix::ExprLambda *> s;
+        return std::ref(s);
+    }().get();
+    if (__builtin_expect(blacklisted.count(lambda) != 0, 0)) {
+        st.callHookCacheMiss++;
+        return false;
+    }
     auto sit = subCache.find(lambda);
     if (sit == subCache.end()) {
         st.callHookCacheMiss++;
@@ -2809,6 +2824,11 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         sit = subCache.find(lambda);
         if (sit == subCache.end()) {
             st.callHookCacheMissPostCompile++;
+            // #455: this lambda will never be in subCache for this
+            // root.  Blacklist so subsequent calls bail at the
+            // empty-cache fast-path's blacklist check (~10 ns instead
+            // of running OD again every time).
+            blacklisted.insert(lambda);
             return false;
         }
         // #455 mitigation: env-shape mismatches between TW and v3
@@ -2823,6 +2843,10 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
             std::getenv("NIX_V3_ON_DEMAND_ROOT_UNSAFE") == nullptr;
         if (onDemandRootSafe && sit->second.nUpvalues > 0) {
             st.callHookCacheMissPostCompile++;
+            // #455: blacklist -- this lambda's nUpvalues won't change
+            // across calls, so the SAFE-mode gate will refuse every
+            // subsequent attempt.  Save the work.
+            blacklisted.insert(lambda);
             return false;
         }
         // #455 diag: NIX_V3_ON_DEMAND_ROOT_POPULATE_ONLY=1 lets us
