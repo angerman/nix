@@ -45,14 +45,47 @@ populates the function pointer that `EvalState::eval` consults, and
 it provides a strong symbol reference so macOS's
 `-dead_strip_dylibs` can't remove libnixexprv3 from the binary.
 
-Real-world behaviour today (single-invocation runs):
+Real-world behaviour (2026-05-05 numbers, hyperfine, aarch64-darwin):
 
-  - **fib30**: v3 cutover at 0.37s user, slight win over
-    tree-walker's 0.38s.
-  - **`(import <nixpkgs> {}).hello.name`**: v3 cutover at 0.25s user,
-    tree-walker at 0.25s — **parity**.
-  - **`attrNames pkgs.haskellPackages` count**: v3 0.45s vs
-    tree-walker 0.45s — parity.
+  - **fib30**: v3 cutover ~0.30 s user, ~5% faster than tree-walker.
+  - **`(import nixpkgs {}).hello.name`** (nixpkgs cold-path):
+    TW ~366 ms, v3 ~378 ms (~3% slower).  Within noise.
+  - **cardano-node real-flake `.packages…cardano-node.name`** (deep
+    fix-point):  TW ~3.7 s user, v3 ~3.9 s user (~5% slower).  Phase E
+    closes a 12% gap that v3 default would otherwise have.
+  - **Memory** (`/usr/bin/time -l`):  v3 +36 MB on cardano-node vs TW
+    (~4% larger RSS).  Memory wins are pending under #417 / #418.
+
+Opt-in features (off by default unless noted):
+
+  - `NIX_V3_NO_INVERT_EVAL=1`:  disables Phase E (`invert eval entry`).
+    Phase E is **default-on** -- it lets v3 own closure-producing
+    top-level Exprs and bridges Tag::Closure results back via
+    `__v3_call_bridge_1`.  Three sub-lifts (`NIX_V3_NO_LIFT_LAMBDA` /
+    `NIX_V3_NO_LIFT_ATTRSLIST` / `NIX_V3_NO_LIFT_WRC`) toggle each
+    lift independently for bisection.  The IR-level `LIFT_IRWPC` is
+    OPT-IN (`NIX_V3_LIFT_IRWPC=1`) -- combining it with WRC trips an
+    infinite-recursion bug on nixpkgs-lib `eachSystem`.
+  - `NIX_V3_CALL_FORMALS=1`:  Phase C -- formals-lambdas in the call
+    hook with shallow-attrs-bridge.  Default off because it costs
+    bridge overhead on cardano-node-class workloads.
+  - `NIX_V3_ON_DEMAND_ROOT=1`:  Phase B / OD -- compile-on-call-miss
+    via lambda→root map.  Has known correctness bug on cardano-node-
+    style fix-point overlays (#455 -- env-shape mismatch in
+    `lib/fixed-points.nix:327`'s `prev // overlay final prev`).
+    Pair with `NIX_V3_ON_DEMAND_ROOT_UNSAFE=1` to lift the SAFE-mode
+    nUpvalues=0 gate.
+  - `NIX_V3_PARSE_PRECOMPILE=1`:  precompile every parsed file at
+    parse time.  Same correctness gate as OD on cardano-node.
+  - `NIX_V3_DISK_CACHE=1`:  SQLite-backed CU cache.  Schema v3 with
+    opcode-table fingerprint (caches invalidate on opcode renumbering).
+  - `NIX_V3_BRIDGE1_DEPTH=N`:  cap nested `__v3_call_bridge_1` calls.
+    Default 8.  Bounds pthread-stack burn on deep overlay chains.
+  - `NIX_V3_PRIMOP_DUMP=1`:  print per-primop call counts at exit
+    (plus TW->v3 bridge primop counts: `__v3_call_bridge_1`,
+    `__v3_force_attr`, `__v3_force_list_elem`).
+  - `NIX_VM_STATS=1` / `V3_TIMING=1`:  hook stats / lower-compile-run
+    breakdown at exit.
 
 How parity was reached:
 
