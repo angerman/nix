@@ -203,6 +203,17 @@ struct SubExprCacheEntry {
     /// callFunction hook (v3CallFunctionEntry) handles these via
     /// runLambda; the force hook (v3ForceEntry) refuses them early.
     bool                    isLambda = false;
+
+    /// #450 / Phase A: true when this entry is a Lambda whose body
+    /// statically resolves to a closure (literal `body : Lambda`,
+    /// or let/with/assert wrapping a Lambda, or if both branches are
+    /// lambdas).  v3 cannot bridge a Tag::Closure result back to
+    /// tree-walker without falling back, so running the v3 body and
+    /// then refusing the result is pure wasted work.  The call hook
+    /// gates on this flag at the head of v3CallFunctionEntry.
+    /// Computed once at populateSubExprCacheLocal time via the same
+    /// `willReturnClosure` walk the eval hook uses (v3_hook.cc:840+).
+    bool                    callReturnsClosure = false;
 };
 
 inline bool SubExprCacheEntry::isPhaseBSkipped() const noexcept
@@ -224,6 +235,10 @@ inline bool SubExprCacheEntry::isPhaseBSkipped() const noexcept
     }();
     return phaseBFailureCount >= kFailLimit;
 }
+
+// Forward decl: defined below at line ~903; used by populateSubExprCacheLocal
+// (#450 Phase A) and v3EvalEntry (the original consumer).
+static bool willReturnClosure(const nix::Expr * e);
 
 static std::unordered_map<const nix::Expr *, SubExprCacheEntry> & v3SubExprCache()
 {
@@ -698,6 +713,19 @@ static void populateSubExprCacheLocal(
             // with arg, not a thunk-body force).
             entry.isLambda =
                 astE->exprKind == nix::Expr::Kind::Lambda;
+            // #450 / Phase A: static closure-result predicate for the
+            // call hook.  A Lambda whose body returns a closure (e.g.
+            // `f = a: b: a + b` -- inner `b: a + b` is a closure)
+            // would, if called via v3, run the body and produce a
+            // Tag::Closure that the bridge cannot return to TW.  Mark
+            // such entries so v3CallFunctionEntry can gate before
+            // running.  Walks the AST body via the same predicate
+            // the eval hook uses (willReturnClosure).
+            if (entry.isLambda) {
+                const auto * lam =
+                    static_cast<const nix::ExprLambda *>(astE);
+                entry.callReturnsClosure = willReturnClosure(lam->body);
+            }
             if (!analyzeOuterWiths(astE, entry.outerWithLevels)) {
                 entry.outerWithRefused = true;
                 entry.outerWithLevels.clear();
@@ -847,6 +875,9 @@ struct V3HookStats {
     uint64_t callHookGateFormals            = 0;  // lambda has formal-attrset
     uint64_t callHookGateReentrant          = 0;  // s_callDepth > 0
     uint64_t callHookGateNotIsLambdaEnt     = 0;  // ent.isLambda==false
+    /// #450 / Phase A: lambda body provably returns a closure.
+    /// Skips the wasted v3 run that would just refuse the result.
+    uint64_t callHookGateReturnsClosure     = 0;
     uint64_t callHookGatePhaseBSkipped      = 0;  // 3-strike fail counter tripped
     uint64_t callHookGateOuterWith          = 0;  // outerWithRefused
     /// Past every gate but failed at prepHookUpvaluesAndWiths or
@@ -1232,6 +1263,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     pg("formals",        s.callHookGateFormals);
                     pg("reentrant",      s.callHookGateReentrant);
                     pg("notIsLambdaEnt", s.callHookGateNotIsLambdaEnt);
+                    pg("returnsClosure", s.callHookGateReturnsClosure);
                     pg("phaseBSkipped",  s.callHookGatePhaseBSkipped);
                     pg("outerWith",      s.callHookGateOuterWith);
                     if (s.callHookUniqueMisses > 0)
@@ -2381,6 +2413,16 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     }
     auto & ent = sit->second;
     if (!ent.isLambda) { st.callHookGated++; st.callHookGateNotIsLambdaEnt++; return false; }
+    // #450 / Phase A: static closure-result gate.  When the lambda's
+    // body provably returns a closure, running v3 just to refuse the
+    // result is wasted work.  Bail before paying the upvalue prep +
+    // runLambda + bridge cost.  Closes the closure-result-refused
+    // amplification when NIX_V3_CALL_DEPTH_LIMIT is raised above 0.
+    if (ent.callReturnsClosure) {
+        st.callHookGated++;
+        st.callHookGateReturnsClosure++;
+        return false;
+    }
     if (ent.isPhaseBSkipped()) { st.callHookGated++; st.callHookGatePhaseBSkipped++; return false; }
     if (ent.outerWithRefused) { st.callHookGated++; st.callHookGateOuterWith++; return false; }
 
