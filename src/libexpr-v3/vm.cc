@@ -2393,6 +2393,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (!attrs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: not an attrset");
             uint32_t icIdx = cu->code[ip++];
+            // REVIEW §3: IC entries key on (Bindings* shape pointer +
+            // slot index + sym).  Safe because Bindings::entries is a
+            // FAM allocated alongside Bindings -- the pointer to a
+            // specific entry doesn't move once the Bindings is built.
+            // OP_APPLY_OVERRIDES grows the entries vector via realloc
+            // (see vm.cc:2301+), but that's a different Bindings* so
+            // the IC entry doesn't alias.  If a future op were to
+            // mutate an existing Bindings in-place (resize entries[]),
+            // every cached entry pointer would dangle -- update this
+            // comment to add the assertion.
             auto & ic = cu->attrSelectCache[icIdx];
             // Phase 13.3: non-const so we can write back the resolved
             // value of a Tag::App entry — mapAttrs et al. install lazy

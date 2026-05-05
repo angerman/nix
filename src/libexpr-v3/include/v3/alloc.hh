@@ -519,4 +519,26 @@ inline const std::vector<std::string> * lookupStringContextEntries(const char * 
     return it == tbl.end() ? nullptr : &it->second;
 }
 
+/// REVIEW §2.6: drop a single side-table entry.  Useful when a string
+/// is overwritten in-place at the same arena address (rare but
+/// possible in primop fast-paths that reuse a buffer).  The default
+/// behaviour of setStringContextEntries replaces, so this helper is
+/// only needed when we want to clear context WITHOUT setting new.
+inline void dropStringContextEntries(const char * buf)
+{
+    if (!buf) return;
+    stringContextSideTable().erase(buf);
+}
+
+/// REVIEW §2.6: drop EVERY entry whose key was allocated in the
+/// caller's arena window (a reset hook for long-running daemons).
+/// Without this, the side-table grows linearly across evals; arena
+/// pointer reuse silently injects unrelated context.  The current
+/// v3-eval CLI is single-eval so it never triggers this; daemons
+/// should call between top-level evals (alongside clearBridgeTables).
+inline void clearStringContextSideTable()
+{
+    stringContextSideTable().clear();
+}
+
 } // namespace nix::v3

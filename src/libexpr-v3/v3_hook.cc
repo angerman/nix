@@ -3078,12 +3078,23 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // The body's first force of the param attrset converts each
     // entry to a Bridge thunk, not a deep v3 value; only entries
     // the body references get force-converted on demand.
-    std::optional<ScopedShallowTWAttrsBridge> shallowGuard;
-    if (hasFormals) shallowGuard.emplace();
+    //
+    // REVIEW §3: scope the shallow guard to JUST runLambda.  The
+    // shallow flag affects treeWalkerToV3 (TW->v3 direction) which
+    // only fires while the v3 body forces its arg.  The result-bridge
+    // phase below (v3->TW) is the opposite direction and isn't
+    // affected by the flag, so holding it through the result phase
+    // was lifetime-overbroad.  Tighter scope reduces the chance of an
+    // accidental TW->v3 conversion outside the body inheriting
+    // shallow-bridge semantics.
     try {
+        std::optional<ScopedShallowTWAttrsBridge> shallowGuard;
+        if (hasFormals) shallowGuard.emplace();
         r = runLambda(*ent.cu, ent.funcIdx, v3Arg,
             upvalues.data(), static_cast<uint32_t>(upvalues.size()),
             capturedWiths);
+        // shallowGuard's destructor pops the flag here, before any
+        // result-bridge work below.
     } catch (const std::exception &) {
         // Any throw -> blacklist this lambda for the rest of the
         // process, fall back.  Mirrors v3ForceEntry's WC-14.6 policy.
