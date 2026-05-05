@@ -2832,8 +2832,21 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // referential pkgs structure doesn't trigger eager-recursion
         // cycles.  Small attrsets stay eager (lower overhead).
         // REVIEW-COMP §8.6: NIX_V3_NO_LAZY_BRIDGE A/B gate removed.
+        //
+        // #455: tune the eager/lazy threshold via env var.  The lazy
+        // bridge produces an attrset whose entries are __v3_force_attr
+        // PrimOpApp values; when those entries are forced and re-enter
+        // v3 (e.g. through `with self;` looking up another attr from
+        // the same attrset), the indirection cycles infinitely.  Until
+        // a proper cycle-break lands, raising the threshold lets a
+        // workload opt out of the lazy bridge.
         size_t bSize = b ? b->size : 0;
-        if (bSize <= 4) {
+        static const size_t kEagerBridgeMax = []{
+            if (const char * v = std::getenv("NIX_V3_EAGER_BRIDGE_MAX"))
+                return (size_t)std::atoi(v);
+            return (size_t)4;
+        }();
+        if (bSize <= kEagerBridgeMax) {
             if (b) for (uint32_t i = 0; i < b->size; ++i) {
                 SymbolId sid = b->entries[i].name;
                 nix::Symbol resolved;
