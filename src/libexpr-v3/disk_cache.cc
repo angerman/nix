@@ -232,8 +232,12 @@ void insert(const CacheKey & key, std::string_view blob)
         sqlite3_stmt * raw = static_cast<sqlite3_stmt *>(state->insert);
         sqlite3_reset(raw);
         sqlite3_bind_blob(raw, 1, key.bytes, sizeof key.bytes, SQLITE_TRANSIENT);
-        sqlite3_bind_blob(raw, 2, blob.data(),
-            static_cast<int>(blob.size()), SQLITE_TRANSIENT);
+        // REVIEW §3: bind_blob takes int length -- a CU >2GB would
+        // truncate.  Use bind_blob64 which takes sqlite3_uint64.  In
+        // practice a v3 CU is small (10-200 KB), but the silent
+        // truncation has been a real foot-gun in other libs.
+        sqlite3_bind_blob64(raw, 2, blob.data(),
+            static_cast<sqlite3_uint64>(blob.size()), SQLITE_TRANSIENT);
         sqlite3_bind_int64(raw, 3,
             static_cast<int64_t>(serialize::kSchemaVersion));
         sqlite3_bind_int64(raw, 4, static_cast<int64_t>(blob.size()));

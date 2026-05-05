@@ -378,6 +378,11 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
 /// is written back so subsequent lookups skip the force.
 inline Value withLookup(VMState & vm, SymbolId name)
 {
+    // REVIEW §2.8: track whether any with-stack entry blackholed.  If
+    // EVERY enclosing scope blackholed, the failure is "with rec { ...
+    // self-referential ... }" -- report it as infinite recursion (matching
+    // tree-walker's diagnostic), not "name not found in with-scope".
+    bool anyBlackholed = false;
     size_t base = vm.frames.empty() ? 0 : vm.frames.back().withStackBase;
     for (size_t i = vm.withStack.size(); i-- > base; ) {
         Value & w = vm.withStack[i];
@@ -397,6 +402,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 try {
                     derefed = forceValue(vm, derefed);
                 } catch (const BlackholeError &) {
+                    anyBlackholed = true;
                     continue;
                 }
             }
@@ -413,6 +419,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 // references something that's still being forced from
                 // a deeper frame.  Skip it so outer scopes still get a
                 // chance to define `name`.  Other errors propagate.
+                anyBlackholed = true;
                 continue;
             }
         }
@@ -420,6 +427,15 @@ inline Value withLookup(VMState & vm, SymbolId name)
         if (auto * v = w.payload.bindings->lookup(name))
             return *v;
     }
+    // §2.8: if every enclosing scope blackholed and none defined the
+    // name, the actual cause is infinite recursion (cycles in `with rec`
+    // attrsets), not a typo.  Throw a typed BlackholeError so callers
+    // (e.g. on-demand-root's auto-eager bridge guard) can route
+    // correctly, rather than a vague "name not found" runtime_error.
+    if (anyBlackholed) throw BlackholeError(
+        "v3 OP_WITH_LOOKUP: cycle while resolving '"
+        + std::string(name < ir::globalSymbolTable().size()
+            ? ir::globalSymbolTable()[name] : "<?>") + "'");
     // V3_DBG_WITH: print the missing name + the with-stack contents to
     // help diagnose pure-VM nixpkgs failures where eval-order divergence
     // causes a name to be looked up before its `with` scope is visible.
