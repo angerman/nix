@@ -2288,11 +2288,24 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // so we don't waste compile cost on lambdas we'll skip anyway.
     if (lambda->getFormals()) { st.callHookGated++; st.callHookGateFormals++; return false; }
 
-    // Re-entrancy guard: if we're inside a v3 hook already, fall back
-    // to tree-walker.  Mirrors v3ForceEntry's discipline -- nested
-    // re-entries can ladder the C stack across the bridge.
+    // Re-entrancy guard: cap nested call-hook entries.  Default 0
+    // (any nested entry falls back to tree-walker) is the verified-
+    // fast baseline.  Widening the limit (e.g. 32) is a real
+    // possibility -- on PP-enabled workloads it lifts hits 57 -> 6043
+    // on hello.name -- but currently nets a perf regression because
+    // the additional runs include many `closure-result refused` (the
+    // v3 body produced a Tag::Closure that can't bridge back, so the
+    // work was wasted).  Until we add a static "will return closure"
+    // predicate on the call hook (parallel to v3EvalEntry's
+    // willReturnClosure), keep the default at 0.  Override via
+    // NIX_V3_CALL_DEPTH_LIMIT for A/B testing.
+    static const int kCallDepthLimit = []{
+        if (const char * v = std::getenv("NIX_V3_CALL_DEPTH_LIMIT"))
+            return std::max(0, std::atoi(v));
+        return 0;
+    }();
     static thread_local int s_callDepth = 0;
-    if (s_callDepth > 0) { st.callHookGated++; st.callHookGateReentrant++; return false; }
+    if (s_callDepth > kCallDepthLimit) { st.callHookGated++; st.callHookGateReentrant++; return false; }
     struct DepthGuard {
         int & d;
         DepthGuard(int & d_) : d(d_) { ++d; }
