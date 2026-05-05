@@ -109,7 +109,7 @@ inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp,
         const char * tname = "?";
         const void * thunkCu = nullptr;
         if (t->state == ThunkState::Suspended && t->suspended.desc) {
-            auto * d = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+            auto * d = t->suspended.desc;
             codeOff = d->codeOffset;
             if (!d->name.empty()) tname = d->name.c_str();
             thunkCu = (const void *)t->suspended.cu;
@@ -484,7 +484,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 std::fprintf(stderr, " thunk state=%d nUp=%u",
                     (int)t->state, (unsigned)t->nUpvalues);
                 if (t->state == ThunkState::Suspended) {
-                    auto * d = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+                    auto * d = t->suspended.desc;
                     if (d)
                         std::fprintf(stderr, " %s [%u..)",
                             !d->name.empty() ? d->name.c_str() : "<anon>",
@@ -506,7 +506,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
         for (size_t i = lim; i > 0; --i) {
             const auto & fr = vm.frames[i - 1];
             const LambdaDescriptor * d = nullptr;
-            if (fr.thunk) d = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+            if (fr.thunk) d = fr.thunk->suspended.desc;
             else if (fr.closure) d = fr.closure->desc;
             std::fprintf(stderr,
                 "    frame[%zu]: %s code=[%u..) ip=%u flags=%u thunk=%p withBase=%u\n",
@@ -763,8 +763,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (cur.thunk && (cur.flags & CFF_THUNK_RETURN)
                 && cur.thunk->nUpvalues == s_trace_nup)
             {
-                const auto * d = reinterpret_cast<const LambdaDescriptor *>(
-                    cur.thunk->suspended.desc);
+                const auto * d = cur.thunk->suspended.desc;
                 if (d && d->codeOffset == s_trace_codeoff) {
                     Instruction peek = cu->code[ip];
                     Op pop_o = decodeOp(peek);
@@ -1132,7 +1131,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // The "descriptor" we use is the LambdaDescriptor for the
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
-            t->suspended.desc = reinterpret_cast<const ThunkDescriptor *>(&cu->lambdas[funcIdx]);
+            t->suspended.desc = &cu->lambdas[funcIdx];
             t->suspended.capturedWiths = snapshotCurrentWiths(vm);
             t->suspended.cu = cu;
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
@@ -1271,7 +1270,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         const auto & fr = vm.frames[i - 1];
                         const LambdaDescriptor * desc = nullptr;
                         if (fr.thunk)
-                            desc = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                            desc = fr.thunk->suspended.desc;
                         else if (fr.closure)
                             desc = fr.closure->desc;
                         std::fprintf(stderr,
@@ -1594,8 +1593,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         && retVal.payload.closure->nUpvalues == 0
                         && retVal.payload.closure->desc->name == "prevStage")
                     {
-                        const auto * d = reinterpret_cast<const LambdaDescriptor *>(
-                            fr.thunk->suspended.desc);
+                        const auto * d = fr.thunk->suspended.desc;
                         std::fprintf(stderr,
                             "v3 OP_RETURN: storing prevStage(nUp=0) into thunk "
                             "%p desc=%s codeOffset=%u nUp=%u; cu=%p ip=%u\n",
@@ -1611,7 +1609,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         for (size_t i = lim2; i > 0 && i + 6 > lim2; --i) {
                             const auto & fr2 = vm.frames[i - 1];
                             const LambdaDescriptor * d2 = nullptr;
-                            if (fr2.thunk) d2 = reinterpret_cast<const LambdaDescriptor *>(fr2.thunk->suspended.desc);
+                            if (fr2.thunk) d2 = fr2.thunk->suspended.desc;
                             else if (fr2.closure) d2 = fr2.closure->desc;
                             std::fprintf(stderr,
                                 "  frame[%zu]: %s code=[%u..) ip=%u flags=%u cu=%p\n",
@@ -1865,7 +1863,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 if (s_dbg) {
                     auto frameInfo = [&](Thunk * th, const Closure * cl, uint32_t fip) -> std::string {
                         const LambdaDescriptor * desc = nullptr;
-                        if (th) desc = reinterpret_cast<const LambdaDescriptor *>(th->suspended.desc);
+                        if (th) desc = th->suspended.desc;
                         else if (cl) desc = cl->desc;
                         if (!desc) return "<closure-body>";
                         char buf[256];
@@ -1912,7 +1910,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             if (!fr.cu) continue;
                             const LambdaDescriptor * desc = nullptr;
                             if (fr.thunk)
-                                desc = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                                desc = fr.thunk->suspended.desc;
                             else if (fr.closure)
                                 desc = fr.closure->desc;
                             if (!desc) continue;
@@ -1942,7 +1940,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             // Suspended: blackhole and run.
             // We treat suspended.desc as a LambdaDescriptor* (see OP_MAKE_THUNK).
-            const LambdaDescriptor * desc = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+            const LambdaDescriptor * desc = t->suspended.desc;
             // Phase 13 instrumentation: bump per-thunk + per-descriptor +
             // global counters at the Suspended → Blackhole gate.  Each
             // thunk should transition exactly once per lifetime, so
@@ -2386,7 +2384,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                 Thunk * t = vv.payload.thunk;
                                 const LambdaDescriptor * d = nullptr;
                                 if (t->state == ThunkState::Suspended)
-                                    d = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+                                    d = t->suspended.desc;
                                 std::fprintf(stderr, " state=%d nUp=%u",
                                     (int)t->state, (unsigned)t->nUpvalues);
                                 if (d)
@@ -2449,7 +2447,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                             std::fprintf(stderr, " state=%d nUp=%u",
                                                 (int)ut2->state, (unsigned)ut2->nUpvalues);
                                             if (ut2->state == ThunkState::Suspended) {
-                                                auto * d2 = reinterpret_cast<const LambdaDescriptor *>(ut2->suspended.desc);
+                                                auto * d2 = ut2->suspended.desc;
                                                 if (d2)
                                                     std::fprintf(stderr, " %s [%u..)",
                                                         !d2->name.empty() ? d2->name.c_str() : "<anon>",
@@ -2919,8 +2917,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                             std::fprintf(stderr, "(state=%d nUp=%u",
                                                 (int)pt->state, (unsigned)pt->nUpvalues);
                                             if (pt->state == ThunkState::Suspended) {
-                                                auto * d3 = reinterpret_cast<const LambdaDescriptor *>(
-                                                    pt->suspended.desc);
+                                                auto * d3 = pt->suspended.desc;
                                                 if (d3)
                                                     std::fprintf(stderr, " %s [%u..)",
                                                         !d3->name.empty() ? d3->name.c_str() : "<anon>",
@@ -2935,8 +2932,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                                     std::fprintf(stderr, "(state=%d nUp=%u",
                                                         (int)pt2->state, (unsigned)pt2->nUpvalues);
                                                     if (pt2->state == ThunkState::Suspended) {
-                                                        auto * d4 = reinterpret_cast<const LambdaDescriptor *>(
-                                                            pt2->suspended.desc);
+                                                        auto * d4 = pt2->suspended.desc;
                                                         if (d4)
                                                             std::fprintf(stderr, " %s [%u..)",
                                                                 !d4->name.empty() ? d4->name.c_str() : "<anon>",
@@ -2958,8 +2954,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                                             std::fprintf(stderr, "(state=%d nUp=%u",
                                                                 (int)pt3->state, (unsigned)pt3->nUpvalues);
                                                             if (pt3->state == ThunkState::Suspended) {
-                                                                auto * d6 = reinterpret_cast<const LambdaDescriptor *>(
-                                                                    pt3->suspended.desc);
+                                                                auto * d6 = pt3->suspended.desc;
                                                                 if (d6)
                                                                     std::fprintf(stderr, " %s [%u..)",
                                                                         !d6->name.empty() ? d6->name.c_str() : "<anon>",
@@ -2982,7 +2977,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         for (size_t i = lim; i > 0 && i + 8 > lim; --i) {
                             const auto & fr = vm.frames[i - 1];
                             const LambdaDescriptor * d = nullptr;
-                            if (fr.thunk) d = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                            if (fr.thunk) d = fr.thunk->suspended.desc;
                             else if (fr.closure) d = fr.closure->desc;
                             std::fprintf(stderr,
                                 "  frame[%zu]: %s code=[%u..) ip=%u flags=%u\n",
@@ -2998,7 +2993,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         if (cu && !vm.frames.empty()) {
                             const auto & fr = vm.frames.back();
                             const LambdaDescriptor * d = nullptr;
-                            if (fr.thunk) d = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                            if (fr.thunk) d = fr.thunk->suspended.desc;
                             else if (fr.closure) d = fr.closure->desc;
                             uint32_t lo = d ? d->codeOffset : (ip > 32 ? ip - 32 : 0);
                             uint32_t hi = ip + 4;
@@ -3813,7 +3808,7 @@ Value forceValue(VMState & vm, Value v)
             if (s_dbg) {
                 auto frameInfo = [&](Thunk * th, const Closure * cl, uint32_t fip) -> std::string {
                     const LambdaDescriptor * desc = nullptr;
-                    if (th) desc = reinterpret_cast<const LambdaDescriptor *>(th->suspended.desc);
+                    if (th) desc = th->suspended.desc;
                     else if (cl) desc = cl->desc;
                     if (!desc) return "<closure-body>";
                     char buf[256];
@@ -3848,7 +3843,7 @@ Value forceValue(VMState & vm, Value v)
                     if (fr.cu) {
                         const LambdaDescriptor * desc = nullptr;
                         if (fr.thunk)
-                            desc = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                            desc = fr.thunk->suspended.desc;
                         else if (fr.closure)
                             desc = fr.closure->desc;
                         if (desc) {
@@ -3865,7 +3860,7 @@ Value forceValue(VMState & vm, Value v)
                     if (inner.cu) {
                         const LambdaDescriptor * idesc = nullptr;
                         if (inner.thunk)
-                            idesc = reinterpret_cast<const LambdaDescriptor *>(inner.thunk->suspended.desc);
+                            idesc = inner.thunk->suspended.desc;
                         else if (inner.closure)
                             idesc = inner.closure->desc;
                         if (idesc) {
@@ -3885,7 +3880,7 @@ Value forceValue(VMState & vm, Value v)
                         if (f33.cu) {
                             const LambdaDescriptor * d33 = nullptr;
                             if (f33.thunk)
-                                d33 = reinterpret_cast<const LambdaDescriptor *>(f33.thunk->suspended.desc);
+                                d33 = f33.thunk->suspended.desc;
                             else if (f33.closure)
                                 d33 = f33.closure->desc;
                             if (d33) {
@@ -3909,7 +3904,7 @@ Value forceValue(VMState & vm, Value v)
             continue;
         }
 
-        const LambdaDescriptor * desc = reinterpret_cast<const LambdaDescriptor *>(t->suspended.desc);
+        const LambdaDescriptor * desc = t->suspended.desc;
         Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
         fakeClo->desc = desc;
         fakeClo->nUpvalues = t->nUpvalues;
@@ -4076,7 +4071,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 const auto & fr = vm.frames[i - 1];
                 const LambdaDescriptor * desc = nullptr;
                 if (fr.thunk)
-                    desc = reinterpret_cast<const LambdaDescriptor *>(fr.thunk->suspended.desc);
+                    desc = fr.thunk->suspended.desc;
                 else if (fr.closure)
                     desc = fr.closure->desc;
                 std::fprintf(stderr,

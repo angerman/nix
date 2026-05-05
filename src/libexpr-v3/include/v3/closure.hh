@@ -34,7 +34,6 @@
 namespace nix::v3 {
 
 struct LambdaDescriptor;
-struct ThunkDescriptor;
 struct PrimOp;
 
 // ---------------------------------------------------------------------------
@@ -115,7 +114,11 @@ struct Thunk
     union {
         // ThunkState::Suspended
         struct {
-            const ThunkDescriptor * desc;
+            // Stored as `LambdaDescriptor *` directly -- the prior
+            // `ThunkDescriptor` placeholder type was only ever
+            // reinterpret_cast back to LambdaDescriptor at every read
+            // site.  Storing the real type kills ~10 reinterpret_casts.
+            const LambdaDescriptor * desc;
             /// Same semantics as Closure::capturedWiths.
             ListVec * capturedWiths;
             /// Same semantics as Closure::cu.
@@ -140,7 +143,7 @@ struct Thunk
 };
 
 // ---------------------------------------------------------------------------
-// LambdaDescriptor / ThunkDescriptor (shared blueprints)
+// LambdaDescriptor (shared blueprint)
 // ---------------------------------------------------------------------------
 
 struct LambdaDescriptor
@@ -195,11 +198,8 @@ struct LambdaDescriptor
     uint32_t selectorSym = 0;
 };
 
-struct ThunkDescriptor
-{
-    uint32_t codeOffset;
-    uint16_t nUpvalues;
-    uint16_t nLocals;
-};
+// `struct ThunkDescriptor` removed -- was a placeholder type only ever
+// reinterpret_cast to LambdaDescriptor at use sites.  Thunk::suspended
+// now stores `LambdaDescriptor *` directly.
 
 } // namespace nix::v3

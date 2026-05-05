@@ -102,9 +102,10 @@ struct Value
     [[gnu::always_inline]] inline bool isClosure()  const noexcept { return tag() == Tag::Closure; }
     [[gnu::always_inline]] inline bool isThunk()    const noexcept { return tag() == Tag::Thunk; }
     [[gnu::always_inline]] inline bool isPrimOp()   const noexcept { return tag() == Tag::PrimOp; }
-    [[gnu::always_inline]] inline bool isApp()      const noexcept { return tag() == Tag::App; }
     [[gnu::always_inline]] inline bool isBlackhole()const noexcept { return tag() == Tag::Blackhole; }
-    [[gnu::always_inline]] inline bool isSlot()     const noexcept { return tag() == Tag::Slot; }
+    // isApp / isSlot helpers removed -- 0 callers, dispatch sites all
+    // use `tag() == Tag::App` / `Tag::Slot` directly so the explicit
+    // tag check is closer to the dispatch in vm.cc and forceValue.
 
     /// Forced = not a thunk, not an unevaluated app, not a slot indirection.
     [[gnu::always_inline]] inline bool isForced() const noexcept
