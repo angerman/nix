@@ -1360,9 +1360,22 @@ struct Lowerer
             if (!isRec) {
                 pushInheritFromCache(inheritFromExprs);
             } else {
+                // #444: address by INDEX, not by reference -- the
+                // recursive `lowerExpr(fromE)` call below can re-enter
+                // `lowerLetRecCapture` and emplace_back onto the
+                // SAME `inheritFromCacheStack`, invalidating any
+                // outstanding `back()` reference.  Manifested as
+                // a write to a poisoned address (`cache[displ] = ...`)
+                // when a nested let-rec contained another let-rec
+                // with `inherit (e) ...`.  Hard to trigger from
+                // user code today (eval-hook only sees a flat root
+                // Expr) but lethal under parse-time / on-demand
+                // precompile patterns where the lowerer runs on
+                // the FULL nested AST in one go.
                 inheritFromCacheStack.emplace_back();
-                auto & cache = inheritFromCacheStack.back();
-                cache.resize(inheritFromExprs->size(), ir::kInvalid);
+                size_t cacheIdx = inheritFromCacheStack.size() - 1;
+                inheritFromCacheStack[cacheIdx].resize(
+                    inheritFromExprs->size(), ir::kInvalid);
                 for (size_t displ = 0; displ < inheritFromExprs->size(); ++displ) {
                     nix::Expr * fromE = (*inheritFromExprs)[displ];
                     if (!fromE) continue;
@@ -1386,7 +1399,9 @@ struct Lowerer
                     // OP_MAKE_THUNK + OP_SET_LOCAL after recVar is
                     // bound.
                     ir::VarId hiddenVar = m.freshVar();
-                    cache[displ] = hiddenVar;
+                    // Re-fetch by index; vector may have re-allocated
+                    // during the recursive lower above.
+                    inheritFromCacheStack[cacheIdx][displ] = hiddenVar;
                     pendingHidden.push_back({hiddenVar, hfid});
                 }
             }
