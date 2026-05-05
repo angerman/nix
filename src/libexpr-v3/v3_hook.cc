@@ -2638,6 +2638,19 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     auto & st = v3HookStats();
     st.callHookEntries++;
     if (!useV3Call) { st.callHookGated++; st.callHookGateUseV3++; return false; }
+    // #457 perf: empty-subCache short-circuit FIRST (before isLambda
+    // / formals checks).  When OD is off and parse-precompile is off,
+    // the cache is permanently empty -- no point paying the gate cost
+    // (~10ns) on every callFunction entry.  Phase D's empty-bypass
+    // moved here from after the formals gate; saves ~1-2 ns per entry
+    // and on hello.name (394k entries) shaves an additional ~0.4 ms
+    // off the cutover overhead.
+    static const bool onDemandRootEnabled =
+        std::getenv("NIX_V3_ON_DEMAND_ROOT") != nullptr;
+    if (__builtin_expect(v3SubExprCache().empty() && !onDemandRootEnabled, 1)) {
+        st.callHookCacheMiss++;
+        return false;
+    }
     if (!fun.isLambda()) { st.callHookGated++; st.callHookGateNotLambda++; return false; }
     nix::ExprLambda * lambda = fun.lambda().fun;
     if (!lambda) { st.callHookGated++; st.callHookGateNullLambda++; return false; }
@@ -2706,15 +2719,9 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // is a hash + bucket lookup + key compare.  At 394k entries on
     // hello.name, the difference is the entire cutover overhead.
     auto & subCache = v3SubExprCache();
-    // OD enabled means a cacheMiss may still resolve via the on-demand
-    // root-compile path -- only the empty-cache fast-bypass is unsafe
-    // when OD is on.  Cache the env check (cheap and stable per process).
-    static const bool onDemandRootEnabled =
-        std::getenv("NIX_V3_ON_DEMAND_ROOT") != nullptr;
-    if (__builtin_expect(subCache.empty() && !onDemandRootEnabled, 1)) {
-        st.callHookCacheMiss++;
-        return false;
-    }
+    // (Empty-subCache + OD-enabled gates moved to top of function in
+    // #457 -- by the time we reach here the cache is non-empty OR OD
+    // is on, so the second empty check would be redundant.)
     // #455 mitigation: per-lambda blacklist for lambdas where OD gave
     // up (root compiled but lambda still ineligible -- has upvalues
     // under SAFE mode, or never made it into subCache).  Without this
