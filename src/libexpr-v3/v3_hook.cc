@@ -69,10 +69,51 @@ static std::unordered_map<const nix::Expr *, nix::SourcePath> & v3ExprPaths()
     return tbl;
 }
 
-static void v3RegisterExprEntry(const nix::Expr * e, const nix::SourcePath & p)
+// Forward decl: defined later in this file (after CachedUnit, etc).
+struct V3HookStats;
+V3HookStats & v3HookStats();
+static bool lowerCompileAndPopulate(
+    nix::Expr * e, nix::EvalState & state, V3HookStats & st,
+    bool bypassHookGate = false);
+
+static void v3RegisterExprEntry(nix::EvalState & state,
+                                 const nix::Expr * e,
+                                 const nix::SourcePath & p)
 {
     if (!e) return;
     v3ExprPaths().emplace(e, p);
+    // #430 / #445: opt-in parse-time precompile.  Off by default so
+    // existing workloads aren't taxed; flip with
+    // NIX_V3_PARSE_PRECOMPILE=1 to populate v3SubExprCache for every
+    // parsed file.  This expands v3 call-hook coverage from "the 19
+    // thunk-bodies the eval hook sees" to "every lambda in every
+    // parsed file".
+    //
+    // Gated additionally on NIX_USE_V3=1 -- no point compiling if
+    // v3 won't ever run.  `lowerCompileAndPopulate` itself has an
+    // internal cap (NIX_V3_PRECOMPILE_MAX_FNS, default 200 fns)
+    // that drops oversized modules, so we don't blow up on
+    // nixpkgs's all-packages.nix.
+    //
+    // #445: pass `bypassHookGate=true` so the hook-gate check inside
+    // lowerCompileAndPopulate (which short-circuits on
+    // `v3ForceHook == nullptr`) doesn't no-op the populate when
+    // only the call hook is wired.  Without bypass, parse-precompile
+    // populated nothing in default mode -- callHookHits stayed at 0
+    // because the cache was never written.
+    static const bool useV3 = []{
+        const char * a = std::getenv("NIX_USE_V3");
+        return a && std::string_view(a) == "1";
+    }();
+    static const bool parsePrecompile =
+        std::getenv("NIX_V3_PARSE_PRECOMPILE") != nullptr;
+    if (useV3 && parsePrecompile) {
+        try {
+            (void)lowerCompileAndPopulate(
+                const_cast<nix::Expr *>(e), state, v3HookStats(),
+                /*bypassHookGate=*/true);
+        } catch (...) { /* opportunistic; ignore failures */ }
+    }
 }
 
 /// CO-3: sub-Expr cache.  Each entry maps a tree-walker AST Expr*
@@ -863,7 +904,8 @@ static std::unordered_set<const nix::Expr *> & v3FallbackPopulated()
 /// benefits more than the precompile cost.  Gated on
 /// NIX_V3_NO_PRECOMPILE to A/B-test; default is ON.
 static bool lowerCompileAndPopulate(
-    nix::Expr * e, nix::EvalState & state, V3HookStats & st)
+    nix::Expr * e, nix::EvalState & state, V3HookStats & st,
+    bool bypassHookGate)
 {
     static const bool disabled = std::getenv("NIX_V3_NO_PRECOMPILE") != nullptr;
     if (disabled) return false;
@@ -885,7 +927,13 @@ static bool lowerCompileAndPopulate(
     // the call hook) so we only pay compile cost for files whose
     // lambdas are actually called -- documented in the v3_hook.cc
     // call-hook on-miss comment block.
-    if (nix::EvalState::v3ForceHook == nullptr) return false;
+    //
+    // #445: parse-precompile (NIX_V3_PARSE_PRECOMPILE=1) explicitly
+    // opts in to compiling every parsed root.  When called from that
+    // path, `bypassHookGate=true` skips this short-circuit so the
+    // call hook actually receives populated entries.  Disk-cache
+    // amortises the compile cost across runs (NIX_V3_DISK_CACHE).
+    if (!bypassHookGate && nix::EvalState::v3ForceHook == nullptr) return false;
     auto & populatedSet = v3FallbackPopulated();
     if (populatedSet.count(e)) return true;
     auto & cache = v3HookCache();

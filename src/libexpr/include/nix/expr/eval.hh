@@ -771,7 +771,12 @@ public:
      * case for ExprLet / ExprAttrs).  Optional — a null hook is a
      * no-op.
      */
-    using V3RegisterExprHook = void (*)(const Expr *, const SourcePath &);
+    /// #430: pass `EvalState` so the v3 hook can lower+compile+populate
+    /// the file's lambdas at parse time -- expanding v3's call-hook
+    /// coverage beyond the eval-hook's "force-time top-level Expr"
+    /// subset.  EvalState is used only for `state.symbols` /
+    /// `state.positions`; no eval recursion is performed.
+    using V3RegisterExprHook = void (*)(EvalState &, const Expr *, const SourcePath &);
     static V3RegisterExprHook v3RegisterExprHook;
 
     /**

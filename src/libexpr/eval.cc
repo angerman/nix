@@ -3807,7 +3807,7 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_p
     // Tell v3 (if linked) which file this top-level Expr came from
     // so its disk-cache lookup can key on file content even when
     // the top-level Expr's getPos() returns noPos.
-    if (v3RegisterExprHook) v3RegisterExprHook(e, path);
+    if (v3RegisterExprHook) v3RegisterExprHook(*this, e, path);
     return e;
 }
 
