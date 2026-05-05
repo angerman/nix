@@ -6295,6 +6295,20 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
     // happen for well-formed bridge1 wrappers) -- decline.
     if (depth != 1) return false;
 
+    // Mirror primV3CallBridge1's depth guard.  Deep extends-overlay
+    // chains (cardano-node ~18 layers) recursively dispatch bridge1
+    // through us; without this guard we'd burn the pthread stack.
+    // Above the threshold we decline the shortcut and let the regular
+    // primV3CallBridge1 path apply its own fallbackExpr-via-TW route.
+    static thread_local int s_directDepth = 0;
+    static const int kDirectMaxDepth = []{
+        if (const char * v = std::getenv("NIX_V3_BRIDGE1_DEPTH"))
+            return std::max(0, std::atoi(v));
+        return 8;
+    }();
+    if (kDirectMaxDepth > 0 && s_directDepth >= kDirectMaxDepth)
+        return false;
+
     // Extract the handle from the immediate right-side arg.
     const nix::Value * vHandle = funValue.primOpApp().right;
     if (!vHandle) return false;
@@ -6321,6 +6335,14 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
 
     ScopedNixEvalState _v3evalGuard(&ns);
     ScopedBridgeFallbackExpr fbGuard{fallbackExpr};
+
+    // RAII increment of the depth counter for the duration of this
+    // dispatch.  Decrements on every exit including throws.
+    struct DepthGuard {
+        int & d;
+        DepthGuard(int & d_) : d(d_) { ++d; }
+        ~DepthGuard() { --d; }
+    } _depthGuard(s_directDepth);
 
     VMState vm;
     vm.valueStack.reserve(64 * 1024);
