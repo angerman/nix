@@ -2537,12 +2537,20 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
         // are deterministic per-Expr at this env shape — retrying
         // just throws again.
         auto sit2 = v3SubExprCache().find(e);
-        if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailureCount++;
+        if (sit2 != v3SubExprCache().end()) {
+            // §3 saturating: don't wrap past 255 (uint8_t).
+            if (sit2->second.phaseBFailureCount < 0xFF)
+                sit2->second.phaseBFailureCount++;
+        }
         return false;  // Fall back: tree-walker handles the rest.
     } catch (...) {
         if (diag) std::fprintf(stderr, "v3 force hook: run threw NON-std-exception (likely BaseError-only)\n");
         auto sit2 = v3SubExprCache().find(e);
-        if (sit2 != v3SubExprCache().end()) sit2->second.phaseBFailureCount++;
+        if (sit2 != v3SubExprCache().end()) {
+            // §3 saturating: don't wrap past 255 (uint8_t).
+            if (sit2->second.phaseBFailureCount < 0xFF)
+                sit2->second.phaseBFailureCount++;
+        }
         return false;
     }
     if (diag) std::fprintf(stderr, "v3 force hook: ran ok, tag=%d\n", (int)r.tag());
@@ -3052,11 +3060,12 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     } catch (const std::exception &) {
         // Any throw -> blacklist this lambda for the rest of the
         // process, fall back.  Mirrors v3ForceEntry's WC-14.6 policy.
-        ent.phaseBFailureCount++;
+        // §3 saturating: don't wrap past 255 (uint8_t).
+        if (ent.phaseBFailureCount < 0xFF) ent.phaseBFailureCount++;
         st.callHookBodyThrew++;
         return false;
     } catch (...) {
-        ent.phaseBFailureCount++;
+        if (ent.phaseBFailureCount < 0xFF) ent.phaseBFailureCount++;
         st.callHookBodyThrew++;
         return false;
     }

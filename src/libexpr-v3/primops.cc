@@ -1921,7 +1921,15 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
             throw std::runtime_error("v3 primop genericClosure: cannot compare keys of incompatible types");
         if (t == Tag::String) return std::string(k.payload.str);
         if (t == Tag::Int)    return std::to_string(k.payload.i);
-        if (t == Tag::Float)  return std::to_string(k.payload.f);
+        if (t == Tag::Float) {
+            // REVIEW §3: reject NaN explicitly -- two NaN values
+            // round-trip through std::to_string identically and would
+            // collide as duplicate keys.  Tree-walker rejects too.
+            if (std::isnan(k.payload.f))
+                throw std::runtime_error(
+                    "v3 primop genericClosure: NaN key is not orderable");
+            return std::to_string(k.payload.f);
+        }
         if (t == Tag::Path)   return std::string(k.payload.path ? k.payload.path : "");
         return k.payload.i ? "true" : "false";
     };
