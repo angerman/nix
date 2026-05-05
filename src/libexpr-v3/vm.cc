@@ -787,10 +787,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         Op op = decodeOp(instr);
         uint32_t operand = decodeOperand(instr);
 
+        // -Wswitch-enum: deliberately don't list reserved opcodes
+        // (OP_NOP, OP_POP, OP_SWAP, OP_NEGATE, OP_BRANCH_TRUE, OP_POS)
+        // in the case table -- they hit the default abort below by
+        // design.  Previous comments listed them inline; this single
+        // pragma block keeps them off the unhandled-enum diagnostic.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wswitch-enum"
         switch (op) {
-
-        // OP_NOP removed (Phase-13 review): never emitted; bytecode
-        // value 0x00 is reserved and now hits the default panic.
 
         // --- Literals ---
         case OP_LIT_INT: {
@@ -928,12 +932,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             goto op_force_slow;
         }
         case OP_DUP:  push(vm, top(vm)); break;
-        case OP_POP:  vm.valueStack.pop_back(); break;
-        case OP_SWAP: {
-            size_t n = vm.valueStack.size();
-            std::swap(vm.valueStack[n - 1], vm.valueStack[n - 2]);
-            break;
-        }
+        // OP_POP / OP_SWAP: bytecode values reserved (don't reuse for
+        // disk-cache compatibility), but no current emit path produces
+        // them, so dispatch removed.  Hits abort via the default case
+        // if a stale CU contains them.
 
         // --- Arithmetic ---
         // Int operations check for overflow via __builtin_*_overflow:
@@ -1008,14 +1010,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, r);
             break;
         }
-        case OP_NEGATE: {
-            Value v = pop(vm), r;
-            if      (v.isInt())   r.mkInt(-v.payload.i);
-            else if (v.isFloat()) r.mkFloat(-v.payload.f);
-            else throw std::runtime_error("v3 OP_NEGATE: unsupported type");
-            push(vm, r);
-            break;
-        }
+        // OP_NEGATE: bytecode value reserved (don't reuse for disk-
+        // cache compatibility); never emitted by lowerExpr.  Negation
+        // lowers as `0 - x` via OP_SUB.  Default-case abort catches a
+        // stale CU.
 
         // --- Comparison ---
         // Inline fast-path for the int-int case (common: `n == 0`,
@@ -1108,13 +1106,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (v.isBool() && v.payload.i == 0) ip = operand;
             break;
         }
-        case OP_BRANCH_TRUE:  {
-            Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
-                v = forceValue(vm, v);
-            if (v.isBool() && v.payload.i == 1) ip = operand;
-            break;
-        }
+        // OP_BRANCH_TRUE: bytecode value reserved; lowerer always emits
+        // OP_BRANCH_FALSE with negated condition or OP_AND/OP_OR-shaped
+        // branches.  Removed dispatch; default-case abort catches stale.
 
         // --- Closure / call / thunk ---
         case OP_MAKE_CLOSURE: {
@@ -3173,13 +3167,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (!isTrueValue(c)) throw AssertionError("v3 OP_ASSERT: assertion failed");
             break;
         }
-        case OP_POS: {
-            // Stub: emit an empty attrset.
-            Bindings * b = Alloc::allocBindings(0);
-            Value v; v.tag_payload = static_cast<uint64_t>(Tag::Attrs); v.payload.bindings = b;
-            push(vm, v);
-            break;
-        }
+        // OP_POS: bytecode value reserved; never emitted (lowerExpr
+        // skips ExprPos in v3).  Removed dispatch; default-case abort
+        // catches stale.
 
         case OP_LIT_PRIMOP: {
             const PrimOp * po = cu->primops[operand];
@@ -3398,6 +3388,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 static_cast<int>(op), ip - 1);
             std::abort();
         }
+#pragma clang diagnostic pop
     }
 
     return finalResult;

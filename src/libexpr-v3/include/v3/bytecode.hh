@@ -62,6 +62,9 @@ enum Op : uint8_t
     OP_SET_LOCAL      = 0x11,  // [slot:24]   pop into slot
     OP_GET_UPVALUE    = 0x12,  // [idx:24]    push closure->upvalues[idx]
     OP_DUP            = 0x13,
+    // OP_POP / OP_SWAP: reserved opcode bytes -- no current emit path,
+    // dispatch removed in vm.cc.  Don't reuse the values for new ops
+    // until disk-cache schema bumps past kSchemaVersion=2.
     OP_POP            = 0x14,
     OP_SWAP           = 0x15,
 
@@ -70,6 +73,8 @@ enum Op : uint8_t
     OP_SUB            = 0x21,
     OP_MUL            = 0x22,
     OP_DIV            = 0x23,
+    // OP_NEGATE: reserved; lowered as `0 - x` via OP_SUB.  Dispatch
+    // removed (see OP_POP / OP_SWAP above).
     OP_NEGATE         = 0x24,
 
     // --- Comparison -----------------------------------------------------
@@ -89,6 +94,8 @@ enum Op : uint8_t
 
     OP_JUMP           = 0x44,  // [target:24]
     OP_BRANCH_FALSE   = 0x45,  // [target:24]   pop, jump if false
+    // OP_BRANCH_TRUE: reserved; the lowerer always emits OP_BRANCH_FALSE
+    // with a negated condition.  Dispatch removed.
     OP_BRANCH_TRUE    = 0x46,  // [target:24]   pop, jump if true
 
     // --- Closures / calls / thunks --------------------------------------
@@ -161,6 +168,8 @@ enum Op : uint8_t
 
     // --- Assert / pos ---------------------------------------------------
     OP_ASSERT         = 0xA0,  // pop bool; raise if false
+    // OP_POS: reserved; lowerExpr skips ExprPos in v3 (positions are
+    // recovered from the side table at error time).  Dispatch removed.
     OP_POS            = 0xA1,  // [posIdx:24]  push pos attrset
 
     /// Direct primop call.  [nArgs:24]; data: primop-table index.
