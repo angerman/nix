@@ -1790,7 +1790,11 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 }
                 return false;
             };
-            if (willProduceClosure()) {
+            // #454 Phase E: when invert mode is active, the closure
+            // bridge handles Tag::Closure results — don't skip here.
+            // Otherwise (default), skip the run+bridge cycle since the
+            // result must fall back to TW anyway.
+            if (!invertEval && willProduceClosure()) {
                 if (diag) std::fprintf(stderr,
                     "v3 hook: skip — IR predicts closure result\n");
                 st.evalFallbackReason[5]++;
