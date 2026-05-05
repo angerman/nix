@@ -836,6 +836,22 @@ struct V3HookStats {
     /// helpers); spikes correlate with bodies that v3 owns but whose
     /// consumers expect a forced primitive.
     uint64_t callHookClosureResultRefused = 0;
+
+    /// #425: per-gate call-hook funnel.  Each counter increments at
+    /// exactly one specific gate; the sum equals callHookGated minus
+    /// the rare paths not yet broken down.  Lets us size which gate
+    /// is the bottleneck before adding compensating logic.
+    uint64_t callHookGateUseV3              = 0;  // NIX_USE_V3=0 (full disable)
+    uint64_t callHookGateNotLambda          = 0;  // !fun.isLambda()
+    uint64_t callHookGateNullLambda         = 0;  // fun.lambda().fun==nullptr
+    uint64_t callHookGateFormals            = 0;  // lambda has formal-attrset
+    uint64_t callHookGateReentrant          = 0;  // s_callDepth > 0
+    uint64_t callHookGateNotIsLambdaEnt     = 0;  // ent.isLambda==false
+    uint64_t callHookGatePhaseBSkipped      = 0;  // 3-strike fail counter tripped
+    uint64_t callHookGateOuterWith          = 0;  // outerWithRefused
+    /// Past every gate but failed at prepHookUpvaluesAndWiths or
+    /// `fun.lambda().env == nullptr`.  Closes the funnel.
+    uint64_t callHookPrepFail               = 0;
 };
 
 V3HookStats & v3HookStats()
@@ -1195,13 +1211,29 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 // bytecode-stdlib opportunity.
                 if (s.callHookEntries > 0) {
                     std::fprintf(stderr,
-                        "v3 call-hook: entries=%llu hits=%llu gated=%llu cacheMiss=%llu bodyThrew=%llu resultBridgeFailed=%llu\n",
+                        "v3 call-hook: entries=%llu hits=%llu gated=%llu cacheMiss=%llu bodyThrew=%llu resultBridgeFailed=%llu prepFail=%llu\n",
                         (unsigned long long)s.callHookEntries,
                         (unsigned long long)s.callHookHits,
                         (unsigned long long)s.callHookGated,
                         (unsigned long long)s.callHookCacheMiss,
                         (unsigned long long)s.callHookBodyThrew,
-                        (unsigned long long)s.callHookResultBridgeFailed);
+                        (unsigned long long)s.callHookResultBridgeFailed,
+                        (unsigned long long)s.callHookPrepFail);
+                    // #425: per-gate funnel.  Only print non-zero buckets
+                    // to keep the output tight.
+                    auto pg = [](const char * nm, uint64_t v) {
+                        if (v) std::fprintf(stderr,
+                            "v3 call-hook gate %s=%llu\n",
+                            nm, (unsigned long long)v);
+                    };
+                    pg("useV3",          s.callHookGateUseV3);
+                    pg("notLambda",      s.callHookGateNotLambda);
+                    pg("nullLambda",     s.callHookGateNullLambda);
+                    pg("formals",        s.callHookGateFormals);
+                    pg("reentrant",      s.callHookGateReentrant);
+                    pg("notIsLambdaEnt", s.callHookGateNotIsLambdaEnt);
+                    pg("phaseBSkipped",  s.callHookGatePhaseBSkipped);
+                    pg("outerWith",      s.callHookGateOuterWith);
                     if (s.callHookUniqueMisses > 0)
                         std::fprintf(stderr,
                             "v3 call-hook: uniqueLambdaMisses=%llu hottestMissCount=%llu (avg=%.1f calls per lambda)\n",
@@ -2239,10 +2271,10 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     }();
     auto & st = v3HookStats();
     st.callHookEntries++;
-    if (!useV3Call) { st.callHookGated++; return false; }
-    if (!fun.isLambda()) { st.callHookGated++; return false; }
+    if (!useV3Call) { st.callHookGated++; st.callHookGateUseV3++; return false; }
+    if (!fun.isLambda()) { st.callHookGated++; st.callHookGateNotLambda++; return false; }
     nix::ExprLambda * lambda = fun.lambda().fun;
-    if (!lambda) { st.callHookGated++; return false; }
+    if (!lambda) { st.callHookGated++; st.callHookGateNullLambda++; return false; }
     // #437: refuse to call v3-compiled lambdas with formal-attrset
     // patterns (`{a, b ? def}: body`).  The v3 closure expects the
     // arg attrset deep-converted via `treeWalkerToV3Public`, which
@@ -2254,13 +2286,13 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // default laziness.
     // Order matters: check formals BEFORE the cache miss path below
     // so we don't waste compile cost on lambdas we'll skip anyway.
-    if (lambda->getFormals()) { st.callHookGated++; return false; }
+    if (lambda->getFormals()) { st.callHookGated++; st.callHookGateFormals++; return false; }
 
     // Re-entrancy guard: if we're inside a v3 hook already, fall back
     // to tree-walker.  Mirrors v3ForceEntry's discipline -- nested
     // re-entries can ladder the C stack across the bridge.
     static thread_local int s_callDepth = 0;
-    if (s_callDepth > 0) { st.callHookGated++; return false; }
+    if (s_callDepth > 0) { st.callHookGated++; st.callHookGateReentrant++; return false; }
     struct DepthGuard {
         int & d;
         DepthGuard(int & d_) : d(d_) { ++d; }
@@ -2335,14 +2367,14 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         return false;
     }
     auto & ent = sit->second;
-    if (!ent.isLambda) { st.callHookGated++; return false; }
-    if (ent.isPhaseBSkipped()) { st.callHookGated++; return false; }
-    if (ent.outerWithRefused) { st.callHookGated++; return false; }
+    if (!ent.isLambda) { st.callHookGated++; st.callHookGateNotIsLambdaEnt++; return false; }
+    if (ent.isPhaseBSkipped()) { st.callHookGated++; st.callHookGatePhaseBSkipped++; return false; }
+    if (ent.outerWithRefused) { st.callHookGated++; st.callHookGateOuterWith++; return false; }
 
     // env at call entry == fun.lambda().env (the lambda's captured env).
     // upvalueSources offsets are relative to this env, NOT to the env
     // at the call site (which would be the caller's env).
-    if (!fun.lambda().env) return false;
+    if (!fun.lambda().env) { st.callHookPrepFail++; return false; }
     nix::Env & env = *fun.lambda().env;
 
     // Assembly factored into prepHookUpvaluesAndWiths so the call hook
@@ -2361,6 +2393,7 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
                                   sawRecBuild, outerWithEnabled,
                                   /*envBaseLevel=*/1)
         != HookPrepResult::Ok) {
+        st.callHookPrepFail++;
         return false;
     }
 
