@@ -91,11 +91,9 @@ if [[ $fail -gt 0 ]]; then
   exit 1
 fi
 
-# v3 #455 negative test: minimal reproducer for the on-demand-root
-# infinite-recursion failure mode.  Asserts that v3 + ON_DEMAND_ROOT +
-# SKIP_THRESHOLD=0 still fails on this case (and TW + plain v3 work).
-# When #455 lands a fix, this assertion will FLIP and become a positive
-# regression test.
+# v3 #455 POSITIVE test: minimal reproducer for the on-demand-root
+# infinite-recursion was *fixed* by the call-hook auto-eager-bridge
+# (commit pending).  Assert the fix sticks.
 repro_455="$ROOT/src/libexpr-v3/test/repro-455.nix"
 if [[ -e "$repro_455" ]]; then
   tw_out=$("$NIX_BIN" eval --no-eval-cache --json -f "$repro_455" 2>/dev/null)
@@ -107,25 +105,19 @@ if [[ -e "$repro_455" ]]; then
     echo "=== #455 baseline regression: TW != v3 default ($tw_out vs $v3_out) ==="
     exit 1
   fi
-  if [[ "$od_out" == "$tw_out" ]]; then
+  if [[ "$od_out" != "$tw_out" ]]; then
     echo
-    echo "=== #455 NEGATIVE TEST has FLIPPED to positive! ==="
-    echo "  on-demand-root now produces $od_out (matches TW)."
-    echo "  Update run-on-demand-root-shapes.sh to remove the negative assertion"
-    echo "  and #455 task can be marked complete."
-    # Exit 0 so the suite passes; the print serves as the heads-up.
-  else
-    echo
-    echo "=== #455 negative test: still failing as expected ==="
-    echo "  TW: $tw_out  od-result: '$od_out'"
+    echo "=== #455 minimal repro POSITIVE regression: FAILED ==="
+    echo "  TW:                                                       $tw_out"
+    echo "  v3 default:                                               $v3_out"
+    echo "  v3 + ON_DEMAND_ROOT + SKIP_THRESHOLD=0:                   '$od_out'"
+    echo "  The auto-eager-bridge fix for #455 lazy-bridge cycle has"
+    echo "  regressed.  Check the call hook's ScopedEagerBridge guard."
+    exit 1
   fi
+  echo "=== #455 minimal repro positive: passes (auto-eager fix intact) ==="
 
-  # #455 partial-fix POSITIVE assertion: NIX_V3_EAGER_BRIDGE_MAX=10000
-  # (eager bridge for attrs+lists) MUST make the minimal repro pass.
-  # This is the verified correctness path for the lazy-bridge cycle
-  # (commit 144d5bdf7 / 88de86ff1).  If this assertion FAILS, it
-  # means a regression broke the eager-bridge path itself -- separate
-  # from the underlying #455 bug.
+  # #455 also asserts the env-var override knob works.
   eb_out=$(NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1 NIX_V3_SKIP_THRESHOLD=0 \
             NIX_V3_EAGER_BRIDGE_MAX=10000 "$NIX_BIN" \
             eval --no-eval-cache --json -f "$repro_455" 2>/dev/null) \
@@ -135,9 +127,8 @@ if [[ -e "$repro_455" ]]; then
     echo "=== #455 EAGER_BRIDGE_MAX positive regression: FAILED ==="
     echo "  TW: $tw_out"
     echo "  ON_DEMAND_ROOT + EAGER_BRIDGE_MAX=10000: '$eb_out'"
-    echo "  The eager-bridge workaround should match TW; this is a regression."
     exit 1
   fi
-  echo "=== #455 EAGER_BRIDGE_MAX=10000 positive test: passes ==="
+  echo "=== #455 EAGER_BRIDGE_MAX=10000 override knob: passes ==="
 fi
 exit 0

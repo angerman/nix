@@ -42,6 +42,18 @@ namespace nix::v3 {
 nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
 Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
 
+// #455: forward decl of the eager-bridge knob in primops.cc.
+// Forces v3ToTreeWalker to use eager mode (no PrimOpApp deferrals)
+// while in scope.  Used by the call hook for on-demand-root-
+// populated lambda results to avoid the lazy-bridge cycle.
+bool pushForceEagerBridge();
+void popForceEagerBridge(bool prev);
+struct ScopedEagerBridge {
+    bool prev;
+    ScopedEagerBridge() : prev(pushForceEagerBridge()) {}
+    ~ScopedEagerBridge() { popForceEagerBridge(prev); }
+};
+
 // We don't expose treeWalkerToV3 here — the AST already carries
 // nix::Expr nodes, not nix::Value, so we lower the Expr directly.
 
@@ -2927,10 +2939,25 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         }
     }
 
-    // Bridge result.
+    // Bridge result.  #455: when this lambda was populated by
+    // on-demand-root, force eager bridging.  The lazy-bridge path
+    // (PrimOpApp(__v3_force_attr, ...)) creates cycles when v3
+    // thunks captured the call-hook arg's Bridge thunk pointing
+    // back at the let-rec slot the result is being assigned to.
+    // Eager bridging converts each entry to a real TW value during
+    // the bridge so no PrimOpApp re-entry occurs.  Lazy bridging is
+    // preserved for non-on-demand-root paths (e.g. import primop
+    // results, eval-hook nested attrsets) where the cycle isn't
+    // possible.
     nix::Value * tmp = nullptr;
+    bool isOnDemandRoot = v3OnDemandRootPopulated().count(lambda) > 0;
     try {
-        tmp = v3ToTreeWalkerPublic(state, r);
+        if (isOnDemandRoot) {
+            ScopedEagerBridge guard;
+            tmp = v3ToTreeWalkerPublic(state, r);
+        } else {
+            tmp = v3ToTreeWalkerPublic(state, r);
+        }
     } catch (const std::exception &) {
         st.callHookResultBridgeFailed++;
         return false;

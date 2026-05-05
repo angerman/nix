@@ -2355,6 +2355,16 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv);
 // Forward declaration so primV3CallBridge1 can use it.
 static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
 
+/// #455: anon-namespace forwarder so v3ToTreeWalker inside this
+/// anonymous namespace can read the eager-bridge thread-local.  The
+/// real definition + push/pop helpers live after the anon closes
+/// (near the public bridge entry points), at file scope.  This
+/// forward-decl is at file scope to avoid the anon-namespace name-
+/// lookup quirk that would resolve to an anon-internal symbol.
+} } // close anon + nix::v3 to declare at file scope
+namespace nix::v3 { bool forceEagerBridge(); }
+namespace nix::v3 { namespace {
+
 /// 1-arg variant of the v3-closure bridge.  Used by v3ToTreeWalker
 /// for the common case (every Nix lambda is unary at the AST level;
 /// `f x y` is `(f x) y` — two separate 1-arg calls).  Looks up the
@@ -2756,7 +2766,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 return (uint32_t)std::atoi(v);
             return (uint32_t)4;
         }();
-        if (n <= kEagerListMax) {
+        if (n <= kEagerListMax || forceEagerBridge()) {
             auto lb = ns.buildList(n);
             for (uint32_t i = 0; i < n; ++i)
                 lb[i] = v3ToTreeWalker(state, lv->elems[i], seen);
@@ -2848,14 +2858,18 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // v3 (e.g. through `with self;` looking up another attr from
         // the same attrset), the indirection cycles infinitely.  Until
         // a proper cycle-break lands, raising the threshold lets a
-        // workload opt out of the lazy bridge.
+        // workload opt out of the lazy bridge.  Additionally, the
+        // call-hook sets `forceEagerBridge` for on-demand-root-
+        // populated lambdas so their results don't go through the
+        // lazy path even when the global threshold is low.
         size_t bSize = b ? b->size : 0;
         static const size_t kEagerBridgeMax = []{
             if (const char * v = std::getenv("NIX_V3_EAGER_BRIDGE_MAX"))
                 return (size_t)std::atoi(v);
             return (size_t)4;
         }();
-        if (bSize <= kEagerBridgeMax) {
+        bool useEager = bSize <= kEagerBridgeMax || forceEagerBridge();
+        if (useEager) {
             if (b) for (uint32_t i = 0; i < b->size; ++i) {
                 SymbolId sid = b->entries[i].name;
                 nix::Symbol resolved;
@@ -5635,6 +5649,21 @@ PrimOpCounter & primOpCounter()
     return c;
 }
 } // anonymous namespace
+
+// #455: file-scope (external-linkage) thread-local + push/pop for
+// the eager-bridge flag.  v3_hook.cc extern-declares these and
+// wraps them in a ScopedEagerBridge RAII guard at the call hook
+// for on-demand-root-populated lambda results.  forceEagerBridge()
+// is the read-side helper used inside v3ToTreeWalker and is
+// forward-declared in the anon namespace above.
+thread_local bool tlsForceEagerBridge = false;
+bool forceEagerBridge() { return tlsForceEagerBridge; }
+bool pushForceEagerBridge() {
+    bool prev = tlsForceEagerBridge;
+    tlsForceEagerBridge = true;
+    return prev;
+}
+void popForceEagerBridge(bool prev) { tlsForceEagerBridge = prev; }
 
 void bumpPrimOpCallCount(const PrimOp * po)
 {
