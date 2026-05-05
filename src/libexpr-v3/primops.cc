@@ -4576,10 +4576,20 @@ void primImport(EvalState & state, Value * args, Value & out)
     // a directory (matches tree-walker's import semantics).  If the
     // path isn't on the real FS (e.g. the `<nix/fetchurl.nix>`
     // corepkgs entry) we fall back to corepkgsFS.
+    //
+    // REVIEW §1.5: keep the resolved SourcePath around so the disk
+    // cache key is computed from `sp.readFile()` (post-resolveExprPath)
+    // rather than the raw user input.  Without this the cache key
+    // skipped invalidation on `dir/default.nix` rewriting (the raw
+    // `path` for a directory import points at a non-file).
     nix::Expr * e = nullptr;
+    nix::SourcePath resolvedSp{ns.rootFS, nix::CanonPath::root};
+    bool haveResolved = false;
     try {
         nix::SourcePath sp(ns.rootFS, nix::CanonPath(path));
         sp = nix::resolveExprPath(sp);
+        resolvedSp = sp;
+        haveResolved = true;
         e = ns.parseExprFromFile(sp);
     } catch (...) {
         std::string corepkgsPath = path;
@@ -4588,6 +4598,8 @@ void primImport(EvalState & state, Value * args, Value & out)
         nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(),
                            nix::CanonPath(corepkgsPath));
         if (!cp.pathExists()) throw;
+        resolvedSp = cp;
+        haveResolved = true;
         e = ns.parseExprFromFile(cp);
     }
     e->bindVars(ns, ns.staticBaseEnv);
@@ -4599,13 +4611,18 @@ void primImport(EvalState & state, Value * args, Value & out)
     static const bool diskCacheEnabled =
         std::getenv("NIX_V3_DISK_CACHE") != nullptr;
     disk_cache::CacheKey diskKey{};
-    if (diskCacheEnabled) {
-        // Read the source content directly via std::ifstream (the
-        // SourcePath/SourceAccessor abstraction rejects intermediate
-        // symlinks like macOS /tmp → /private/tmp, but a plain ifstream
-        // opens through them).  The resulting hash keys content, not
-        // identity, so symlink quirks don't affect cache correctness.
-        diskKey = disk_cache::computeKeyForFile(path);
+    if (diskCacheEnabled && haveResolved) {
+        // REVIEW §1.5: hash the resolved file content (post-symlink,
+        // post-default.nix rewriting), not the raw input path.  Symlink
+        // retargeting + dir/default.nix selection both invalidate
+        // correctly because the read path changes the hash input.
+        try {
+            std::string content = resolvedSp.resolveSymlinks().readFile();
+            diskKey = disk_cache::computeKeyForString(content);
+        } catch (...) {
+            // Read failure -> empty key -> cache lookup is skipped,
+            // and no insert happens later.  Same fallback as before.
+        }
     }
     if (!diskKey.empty()) {
         if (auto blob = disk_cache::lookup(diskKey)) {
