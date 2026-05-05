@@ -119,5 +119,25 @@ if [[ -e "$repro_455" ]]; then
     echo "=== #455 negative test: still failing as expected ==="
     echo "  TW: $tw_out  od-result: '$od_out'"
   fi
+
+  # #455 partial-fix POSITIVE assertion: NIX_V3_EAGER_BRIDGE_MAX=10000
+  # (eager bridge for attrs+lists) MUST make the minimal repro pass.
+  # This is the verified correctness path for the lazy-bridge cycle
+  # (commit 144d5bdf7 / 88de86ff1).  If this assertion FAILS, it
+  # means a regression broke the eager-bridge path itself -- separate
+  # from the underlying #455 bug.
+  eb_out=$(NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1 NIX_V3_SKIP_THRESHOLD=0 \
+            NIX_V3_EAGER_BRIDGE_MAX=10000 "$NIX_BIN" \
+            eval --no-eval-cache --json -f "$repro_455" 2>/dev/null) \
+    || eb_out="<failed>"
+  if [[ "$eb_out" != "$tw_out" ]]; then
+    echo
+    echo "=== #455 EAGER_BRIDGE_MAX positive regression: FAILED ==="
+    echo "  TW: $tw_out"
+    echo "  ON_DEMAND_ROOT + EAGER_BRIDGE_MAX=10000: '$eb_out'"
+    echo "  The eager-bridge workaround should match TW; this is a regression."
+    exit 1
+  fi
+  echo "=== #455 EAGER_BRIDGE_MAX=10000 positive test: passes ==="
 fi
 exit 0
