@@ -3714,6 +3714,11 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
         // throwaway one.  Most selector calls never trigger forceValue
         // (the caller usually passes an already-forced attrset), so
         // this is the slow path of the fast path.
+        //
+        // REVIEW §3: wrap forceValue in try/catch + clearBlackMarks
+        // so a thrown forceValue doesn't leave Black marks on the
+        // throwaway VMState's frames (the VMState destructor doesn't
+        // clear them).  Mirror what the main dispatchLoop does below.
         Value sArg = arg;
         if (sArg.isThunk() || sArg.tag() == Tag::App
             || sArg.tag() == Tag::Slot) {
@@ -3721,7 +3726,13 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
             forceVm.valueStack.reserve(64);
             forceVm.frames.reserve(64);
             forceVm.withStack.reserve(8);
-            sArg = forceValue(forceVm, sArg);
+            try {
+                sArg = forceValue(forceVm, sArg);
+            } catch (...) {
+                clearBlackMarksOnException(forceVm, 0);
+                throw;
+            }
+            clearBlackMarksOnException(forceVm, 0);
         }
         if (!sArg.isAttrs() || !sArg.payload.bindings)
             throw std::runtime_error(
