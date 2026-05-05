@@ -2590,6 +2590,28 @@ std::atomic<uint64_t> g_bridgeCallBridge1Calls{0};
 std::atomic<uint64_t> g_bridgeForceAttrCalls{0};
 std::atomic<uint64_t> g_bridgeForceListElemCalls{0};
 
+// #458 step 2: shared depth counter and limit between
+// primV3CallBridge1 (the legacy TW primop) and tryDispatchBridge1Direct
+// (the #458 step 2 shortcut).  Without sharing they form a ping-pong:
+// shortcut at depth N declines, TW dispatches primV3CallBridge1 with
+// its own counter at 0, that re-enters shortcut, etc.  One thread-
+// local counter for both paths so the depth ceiling actually fires
+// regardless of which path is currently executing.
+} // close anon ns
+int & bridge1DepthCounter() {
+    static thread_local int d = 0;
+    return d;
+}
+int bridge1MaxDepth() {
+    static const int k = []{
+        if (const char * v = std::getenv("NIX_V3_BRIDGE1_DEPTH"))
+            return std::max(0, std::atoi(v));
+        return 8;
+    }();
+    return k;
+}
+namespace {
+
 /// 1-arg variant of the v3-closure bridge.  Used by v3ToTreeWalker
 /// for the common case (every Nix lambda is unary at the AST level;
 /// `f x y` is `(f x) y` — two separate 1-arg calls).  Looks up the
@@ -2612,12 +2634,8 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     // Tunable via NIX_V3_BRIDGE1_DEPTH (default 8 = enough for 1-2
     // legitimate nested overlays without triggering on cardano-node's
     // 18+ layer fix-point).  Disable with =0.
-    static thread_local int s_bridge1Depth = 0;
-    static const int kBridge1MaxDepth = []{
-        if (const char * v = std::getenv("NIX_V3_BRIDGE1_DEPTH"))
-            return std::max(0, std::atoi(v));
-        return 8;
-    }();
+    int & s_bridge1Depth = bridge1DepthCounter();
+    int kBridge1MaxDepth = bridge1MaxDepth();
     if (kBridge1MaxDepth > 0 && s_bridge1Depth >= kBridge1MaxDepth) {
         // Resolve handle (still need it for the fallback Expr lookup).
         ns.forceValue(*args[0], pos);
@@ -6295,18 +6313,16 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
     // happen for well-formed bridge1 wrappers) -- decline.
     if (depth != 1) return false;
 
-    // Mirror primV3CallBridge1's depth guard.  Deep extends-overlay
-    // chains (cardano-node ~18 layers) recursively dispatch bridge1
-    // through us; without this guard we'd burn the pthread stack.
-    // Above the threshold we decline the shortcut and let the regular
-    // primV3CallBridge1 path apply its own fallbackExpr-via-TW route.
-    static thread_local int s_directDepth = 0;
-    static const int kDirectMaxDepth = []{
-        if (const char * v = std::getenv("NIX_V3_BRIDGE1_DEPTH"))
-            return std::max(0, std::atoi(v));
-        return 8;
-    }();
-    if (kDirectMaxDepth > 0 && s_directDepth >= kDirectMaxDepth)
+    // Share the depth counter with primV3CallBridge1.  When both paths
+    // exist concurrently and use independent counters, they ping-pong:
+    // shortcut at depth N declines, TW falls through to primV3CallBridge1
+    // (its counter at 0), that re-enters shortcut, etc.  cardano-node
+    // PP exposes this -- the eval HANGS instead of throwing the proper
+    // InfiniteRecursionError that surfaces with shortcut OFF.  One
+    // shared counter ensures the depth ceiling fires regardless.
+    int & s_sharedDepth = bridge1DepthCounter();
+    int kMaxDepth = bridge1MaxDepth();
+    if (kMaxDepth > 0 && s_sharedDepth >= kMaxDepth)
         return false;
 
     // Extract the handle from the immediate right-side arg.
@@ -6336,13 +6352,13 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
     ScopedNixEvalState _v3evalGuard(&ns);
     ScopedBridgeFallbackExpr fbGuard{fallbackExpr};
 
-    // RAII increment of the depth counter for the duration of this
-    // dispatch.  Decrements on every exit including throws.
+    // RAII increment of the SHARED depth counter for the duration of
+    // this dispatch.  Decrements on every exit including throws.
     struct DepthGuard {
         int & d;
         DepthGuard(int & d_) : d(d_) { ++d; }
         ~DepthGuard() { --d; }
-    } _depthGuard(s_directDepth);
+    } _depthGuard(s_sharedDepth);
 
     VMState vm;
     vm.valueStack.reserve(64 * 1024);

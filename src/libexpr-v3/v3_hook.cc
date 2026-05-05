@@ -2686,11 +2686,26 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // dispatch DIRECTLY via v3's callClosure -- bypassing TW's primop
     // layer + bridge1's eager-arg-force (the cardano-node #455 cycle
     // source).  Gate via NIX_V3_NO_BRIDGE1_SHORTCIRCUIT=1 for A/B.
-    // CRITICAL: this MUST run before the empty-subCache bypass below;
-    // the bridge1 path doesn't depend on the lambda subcache and stays
-    // viable even when no v3 lambdas have been lowered yet.
-    static const bool bridge1Shortcut =
-        std::getenv("NIX_V3_NO_BRIDGE1_SHORTCIRCUIT") == nullptr;
+    //
+    // OD / PARSE_PRECOMPILE OPT-OUT: under those modes the v3 closure
+    // bodies that produce bridge1 PrimOpApps recursively reference
+    // mid-construction fix-point participants (cardano-node).  The
+    // existing primV3CallBridge1 path has handlers (depth limit +
+    // fallbackExpr re-eval through TW) that surface the underlying
+    // InfiniteRecursionError; the direct shortcut evades them, turning
+    // the clean error into a hang.  Keep the shortcut for default v3
+    // mode (where bridge1 is rarely exercised but the shortcut is
+    // safe) and bypass it under OD/PP, where the legacy primop path
+    // is the better-tested fallback.
+    static const bool bridge1Shortcut = []{
+        if (std::getenv("NIX_V3_NO_BRIDGE1_SHORTCIRCUIT") != nullptr)
+            return false;
+        if (std::getenv("NIX_V3_ON_DEMAND_ROOT") != nullptr)
+            return false;
+        if (std::getenv("NIX_V3_PARSE_PRECOMPILE") != nullptr)
+            return false;
+        return true;
+    }();
     if (bridge1Shortcut && fun.isPrimOpApp()) {
         if (tryDispatchBridge1Direct(state, fun, arg, vRes, pos)) {
             st.callHookHits++;
