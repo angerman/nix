@@ -3088,9 +3088,27 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         out.payload.thunk = bridge;
         return out;
     }
+    case nix::nExternal: {
+        // REVIEW_2026-05-04 B-9 / §6.7: bridge external values back as
+        // a v3 Bridge thunk, mirroring the nFunction case above (REVIEW
+        // MED-1).  Used by experimental fetchers / FFI extensions whose
+        // values are opaque to v3 -- without the Bridge wrap, the
+        // round-trip `tw → v3 → tw` would lose the original via
+        // `mkNull` and any downstream coerceToString / `==` would see
+        // null instead of the external value.
+        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
+        allocStats().thunksAllocated++;
+        out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+        out.payload.thunk = bridge;
+        return out;
+    }
     case nix::nThunk:
-    case nix::nExternal:
     case nix::nFailed:
+        // nThunk: forceValue above should have advanced past any
+        // unforced thunk.  If we still see one, fall through as null.
+        // nFailed: a previously-cached exception -- return null and
+        // let downstream re-trigger via the next force (tree-walker's
+        // handleEvalFailed will rethrow the cached exception).
         out.mkNull(); return out;
     case nix::nString: {
         out = mkStringValueOwned(std::string(nv.string_view()));
