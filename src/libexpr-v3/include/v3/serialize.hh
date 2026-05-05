@@ -44,11 +44,22 @@ namespace nix::v3::serialize {
 
 /// Bumped whenever the on-disk format changes.  Mismatches at load
 /// time are a hard failure — no migration logic.
-constexpr uint32_t kSchemaVersion = 2;
+///
+/// Schema 3 (2026-05-05): added opcode-table fingerprint to the header
+/// so opcode renumbering / addition / deletion can't produce silently-
+/// mis-executing CUs from an older build's cache (REVIEW §1.4).
+constexpr uint32_t kSchemaVersion = 3;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.
 constexpr char kMagic[8] = {'N','I','X','3','B','C','0','1'};
+
+/// Fingerprint of the opcode table that the running process knows
+/// about.  Recomputed once on first call from the constexpr enum
+/// values (so any change to bytecode.hh -- adding/removing/renumbering
+/// an opcode -- changes this hash).  Embedded in serialized blobs;
+/// loads from a CU with a different fingerprint are rejected.
+uint64_t opcodeTableFingerprint();
 
 /// Thrown when serialization or deserialization fails (truncated
 /// input, magic/schema mismatch, unknown primop name, etc.).

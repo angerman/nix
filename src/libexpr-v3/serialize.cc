@@ -77,6 +77,115 @@ bool isCacheable(const CompilationUnit & /*cu*/)
     return true;
 }
 
+uint64_t opcodeTableFingerprint()
+{
+    // FNV-1a 64-bit over (name, opcode-value) pairs for every Op the
+    // process recognises.  Constructed at static-init time and cached.
+    // Stable across processes built from the same bytecode.hh; changes
+    // immediately when an opcode is renumbered, added, or removed.
+    //
+    // We use the names too (not just numeric values) so a swap of two
+    // opcodes' meanings -- which could happen if one is renamed and
+    // another is reassigned its old value -- is still caught.
+    static const uint64_t kFp = []() -> uint64_t {
+        struct Entry { const char * name; uint32_t value; };
+        // Listed in declaration order from bytecode.hh.  Adding/removing
+        // here is the explicit mechanism for the schema bump to detect
+        // the change at runtime, in addition to source-control review.
+        const Entry table[] = {
+            {"OP_LIT_INT",         OP_LIT_INT},
+            {"OP_LIT_INT_BIG",     OP_LIT_INT_BIG},
+            {"OP_LIT_FLOAT",       OP_LIT_FLOAT},
+            {"OP_LIT_STR",         OP_LIT_STR},
+            {"OP_LIT_PATH",        OP_LIT_PATH},
+            {"OP_LIT_TRUE",        OP_LIT_TRUE},
+            {"OP_LIT_FALSE",       OP_LIT_FALSE},
+            {"OP_LIT_NULL",        OP_LIT_NULL},
+            {"OP_GET_LOCAL",       OP_GET_LOCAL},
+            {"OP_SET_LOCAL",       OP_SET_LOCAL},
+            {"OP_GET_UPVALUE",     OP_GET_UPVALUE},
+            {"OP_DUP",             OP_DUP},
+            {"OP_POP",             OP_POP},
+            {"OP_SWAP",            OP_SWAP},
+            {"OP_ADD",             OP_ADD},
+            {"OP_SUB",             OP_SUB},
+            {"OP_MUL",             OP_MUL},
+            {"OP_DIV",             OP_DIV},
+            {"OP_NEGATE",          OP_NEGATE},
+            {"OP_EQ",              OP_EQ},
+            {"OP_NEQ",             OP_NEQ},
+            {"OP_LESS",            OP_LESS},
+            {"OP_NOT",             OP_NOT},
+            {"OP_AND_BRANCH",      OP_AND_BRANCH},
+            {"OP_OR_BRANCH",       OP_OR_BRANCH},
+            {"OP_IMPL_BRANCH",     OP_IMPL_BRANCH},
+            {"OP_JUMP",            OP_JUMP},
+            {"OP_BRANCH_FALSE",    OP_BRANCH_FALSE},
+            {"OP_BRANCH_TRUE",     OP_BRANCH_TRUE},
+            {"OP_MAKE_CLOSURE",    OP_MAKE_CLOSURE},
+            {"OP_MAKE_THUNK",      OP_MAKE_THUNK},
+            {"OP_CALL",            OP_CALL},
+            {"OP_RETURN",          OP_RETURN},
+            {"OP_FORCE",           OP_FORCE},
+            {"OP_GET_LOCAL_FORCE", OP_GET_LOCAL_FORCE},
+            {"OP_GET_UPVALUE_FORCE", OP_GET_UPVALUE_FORCE},
+            {"OP_TAIL_CALL",       OP_TAIL_CALL},
+            {"OP_LIST_INIT",       OP_LIST_INIT},
+            {"OP_LIST_CONCAT",     OP_LIST_CONCAT},
+            {"OP_ATTRS_INIT",      OP_ATTRS_INIT},
+            {"OP_ATTRS_INIT_DYN",  OP_ATTRS_INIT_DYN},
+            {"OP_ATTRS_REC_INIT",  OP_ATTRS_REC_INIT},
+            {"OP_ATTRS_REC_SET",   OP_ATTRS_REC_SET},
+            {"OP_ATTRS_SELECT",    OP_ATTRS_SELECT},
+            {"OP_ATTRS_SELECT_DYN", OP_ATTRS_SELECT_DYN},
+            {"OP_ATTRS_HAS",       OP_ATTRS_HAS},
+            {"OP_ATTRS_HAS_DYN",   OP_ATTRS_HAS_DYN},
+            {"OP_ATTRS_UPDATE",    OP_ATTRS_UPDATE},
+            {"OP_REC_BINDING_SLOT_REF", OP_REC_BINDING_SLOT_REF},
+            {"OP_APPLY_OVERRIDES", OP_APPLY_OVERRIDES},
+            {"OP_WITH_PUSH",       OP_WITH_PUSH},
+            {"OP_WITH_POP",        OP_WITH_POP},
+            {"OP_WITH_LOOKUP",     OP_WITH_LOOKUP},
+            {"OP_STR_CONCAT",      OP_STR_CONCAT},
+            {"OP_ASSERT",          OP_ASSERT},
+            {"OP_POS",             OP_POS},
+            {"OP_CALL_PRIMOP",     OP_CALL_PRIMOP},
+            {"OP_LIT_PRIMOP",      OP_LIT_PRIMOP},
+            {"OP_LIT_BUILTINS",    OP_LIT_BUILTINS},
+            {"OP_IS_NULL",         OP_IS_NULL},
+            {"OP_IS_BOOL",         OP_IS_BOOL},
+            {"OP_IS_INT",          OP_IS_INT},
+            {"OP_IS_FLOAT",        OP_IS_FLOAT},
+            {"OP_IS_STRING",       OP_IS_STRING},
+            {"OP_IS_PATH",         OP_IS_PATH},
+            {"OP_IS_LIST",         OP_IS_LIST},
+            {"OP_IS_ATTRS",        OP_IS_ATTRS},
+            {"OP_IS_FUNCTION",     OP_IS_FUNCTION},
+            {"OP_HEAD",            OP_HEAD},
+            {"OP_TAIL",            OP_TAIL},
+            {"OP_LENGTH",          OP_LENGTH},
+            {"OP_ELEM_AT",         OP_ELEM_AT},
+            {"OP_HALT",            OP_HALT},
+        };
+        uint64_t h = 0xcbf29ce484222325ULL;  // FNV offset basis
+        for (auto & e : table) {
+            for (const char * p = e.name; *p; ++p) {
+                h ^= static_cast<uint8_t>(*p);
+                h *= 0x100000001b3ULL;
+            }
+            // mix in the opcode value too -- catches a renumbering even
+            // if the name stayed the same.
+            uint32_t v = e.value;
+            for (int i = 0; i < 4; ++i) {
+                h ^= (v >> (i * 8)) & 0xff;
+                h *= 0x100000001b3ULL;
+            }
+        }
+        return h;
+    }();
+    return kFp;
+}
+
 namespace {
 
 /// Walk the bytecode of `cu` and rewrite every SymbolId operand
@@ -227,9 +336,12 @@ std::string serializeCU(const CompilationUnit & cu)
     out.reserve(64 * 1024);
     Writer w{out};
 
-    // Header: magic + schema version.
+    // Header: magic + schema version + opcode-table fingerprint.
+    // Fingerprint catches opcode renumbering / addition / deletion
+    // between two builds with the same kSchemaVersion (REVIEW §1.4).
     w.writeBytes(kMagic, sizeof(kMagic));
     w.u32(kSchemaVersion);
+    w.u64(opcodeTableFingerprint());
 
     // Section: code.
     w.u32(static_cast<uint32_t>(cu.code.size()));
@@ -315,6 +427,14 @@ CompilationUnit deserializeCU(std::string_view blob)
         throw SerializationError("v3 deserialize: schema mismatch (got "
             + std::to_string(schema) + ", want "
             + std::to_string(kSchemaVersion) + ")");
+
+    // Verify opcode-table fingerprint.  Detects opcode renumbering
+    // between two builds at the same schema version (REVIEW §1.4).
+    uint64_t fp = r.u64();
+    if (fp != opcodeTableFingerprint())
+        throw SerializationError("v3 deserialize: opcode-table "
+            "fingerprint mismatch -- the cache was produced by a build "
+            "with a different opcode layout (rebuild required)");
 
     CompilationUnit cu;
 
