@@ -90,4 +90,34 @@ if [[ $fail -gt 0 ]]; then
   for n in "${fail_names[@]}"; do echo "  $n"; done
   exit 1
 fi
+
+# v3 #455 negative test: minimal reproducer for the on-demand-root
+# infinite-recursion failure mode.  Asserts that v3 + ON_DEMAND_ROOT +
+# SKIP_THRESHOLD=0 still fails on this case (and TW + plain v3 work).
+# When #455 lands a fix, this assertion will FLIP and become a positive
+# regression test.
+repro_455="$ROOT/src/libexpr-v3/test/repro-455.nix"
+if [[ -e "$repro_455" ]]; then
+  tw_out=$("$NIX_BIN" eval --no-eval-cache --json -f "$repro_455" 2>/dev/null)
+  v3_out=$(NIX_USE_V3=1 "$NIX_BIN" eval --no-eval-cache --json -f "$repro_455" 2>/dev/null)
+  od_out=$(NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1 NIX_V3_SKIP_THRESHOLD=0 "$NIX_BIN" \
+            eval --no-eval-cache --json -f "$repro_455" 2>/dev/null) || od_out="<failed>"
+
+  if [[ "$tw_out" != "$v3_out" ]]; then
+    echo "=== #455 baseline regression: TW != v3 default ($tw_out vs $v3_out) ==="
+    exit 1
+  fi
+  if [[ "$od_out" == "$tw_out" ]]; then
+    echo
+    echo "=== #455 NEGATIVE TEST has FLIPPED to positive! ==="
+    echo "  on-demand-root now produces $od_out (matches TW)."
+    echo "  Update run-on-demand-root-shapes.sh to remove the negative assertion"
+    echo "  and #455 task can be marked complete."
+    # Exit 0 so the suite passes; the print serves as the heads-up.
+  else
+    echo
+    echo "=== #455 negative test: still failing as expected ==="
+    echo "  TW: $tw_out  od-result: '$od_out'"
+  fi
+fi
 exit 0
