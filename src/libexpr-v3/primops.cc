@@ -1249,10 +1249,21 @@ void primToPath(EvalState & state, Value * args, Value & out)
     auto fromString = [&](const char * s) {
         if (!s || s[0] != '/')
             throw std::runtime_error("v3 toPath: string is not an absolute path");
-        // CRIT-4: arena allocation.
-        const size_t n = std::strlen(s) + 1;
+        // REVIEW §2.9: normalize via CanonPath so `/nix/store/../etc/passwd`
+        // and other `..` / `.` / double-slash shapes can't slip through
+        // as a path Value.  CanonPath rejects any traversal that would
+        // escape its initial root.
+        std::string canon;
+        try {
+            canon = nix::CanonPath(s).abs();
+        } catch (const std::exception & e) {
+            throw std::runtime_error(
+                std::string("v3 toPath: invalid path '") + s + "': " + e.what());
+        }
+        const size_t n = canon.size() + 1;
         char * buf = Alloc::allocChars(n);
-        std::memcpy(buf, s, n);
+        std::memcpy(buf, canon.data(), canon.size());
+        buf[canon.size()] = '\0';
         out.tag_payload = static_cast<uint64_t>(Tag::Path);
         out.payload.path = buf;
     };
