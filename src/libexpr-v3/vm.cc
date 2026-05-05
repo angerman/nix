@@ -2026,8 +2026,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (__builtin_expect(vm.frames.size() >= 5000, 0))
                 throw std::runtime_error("v3 OP_FORCE: stack overflow; call depth exceeded 5000");
 
+            // REVIEW §3: window between `t->state = Blackhole` and the
+            // frame-push could leak orphan Black thunks if any step in
+            // between threw bad_alloc (valueStack.resize, withStack
+            // reads, position-pool accesses).  Snapshot prior state so
+            // the catch path can revert.  Single thunk per OP_FORCE so
+            // the snapshot is one ThunkState.
+            ThunkState priorState = t->state;
             t->state = ThunkState::Blackhole;
 
+            // ip on caller frame must be saved BEFORE the resize too,
+            // so the catch path can leave it unchanged-but-correct.
+            uint32_t priorCallerIp = vm.frames.back().ip;
+            uint32_t priorCallerFlags = vm.frames.back().flags;
             vm.frames.back().ip = ip;
             // WC-38: mark the caller frame for force-retry. When the
             // pushed thunk's body returns, OP_RETURN's caller-resume
@@ -2037,8 +2048,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             vm.frames.back().flags |= CFF_FORCE_RETRY;
 
             size_t newBase = vm.valueStack.size();
-            vm.valueStack.resize(newBase + desc->nLocals);
-            uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+            uint32_t newWithBase;
+            try {
+                vm.valueStack.resize(newBase + desc->nLocals);
+                newWithBase = static_cast<uint32_t>(vm.withStack.size());
+            } catch (...) {
+                // Revert: thunk back to Suspended, caller frame back
+                // to its prior ip/flags.  Re-throw -- the v3 force
+                // hook / outer eval will catch and route via
+                // phaseBFailureCount or fallbackToTreeWalker.
+                t->state = priorState;
+                vm.frames.back().ip = priorCallerIp;
+                vm.frames.back().flags = priorCallerFlags;
+                throw;
+            }
 
             // V3_DBG_STORE_PREVSTAGE: trace OP_FORCE pushes for thunks
             // with nUp=5 to verify their codeOffset before body runs.
