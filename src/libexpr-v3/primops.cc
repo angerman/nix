@@ -4536,9 +4536,11 @@ void primDerivation(EvalState & state, Value * args, Value & out)
     SymbolId sDrvPath  = vmIntern(state, "drvPath");
     SymbolId sType     = vmIntern(state, "type");
     SymbolId sOutName  = vmIntern(state, "outputName");
-    // sAll: previously interned for `drv.all` synthesis; primDerivation
-    // doesn't currently expose `.all` and the symbol was unused.
-    // Re-add when REVIEW §3 (primDerivation lazy `.all`) lands.
+    // REVIEW §3: re-add `all` synthesis.  The earlier prohibition was
+    // about a self-referential `all = [self]` shape; building `all` as
+    // the list of per-output sub-derivations (which are independent
+    // self-contained attrsets) is acyclic.
+    SymbolId sAll      = vmIntern(state, "all");
     SymbolId sDrvAttrs = vmIntern(state, "drvAttrs");
     const Value * drvPathV = strictB->lookup(sDrvPath);
 
@@ -4587,11 +4589,31 @@ void primDerivation(EvalState & state, Value * args, Value & out)
     entries.emplace_back(sType,    mkStringValueOwned("derivation"));
     entries.emplace_back(sOutName, mkStringValueOwned(firstOut));
     entries.emplace_back(sDrvAttrs, args[0]);
-    // Per-output sub-derivations.
+    // Per-output sub-derivations + collect them for `all`.
+    std::vector<Value> allOutputs;
+    allOutputs.reserve(outputs.size());
     for (auto & oName : outputs) {
         SymbolId sO = vmIntern(state, oName);
-        if (auto * oP = strictB->lookup(sO))
-            entries.emplace_back(sO, buildOutputAttrset(oName, *oP));
+        if (auto * oP = strictB->lookup(sO)) {
+            Value oAttr = buildOutputAttrset(oName, *oP);
+            entries.emplace_back(sO, oAttr);
+            allOutputs.push_back(oAttr);
+        }
+    }
+    // REVIEW §3: synthesize `all` as a list of the per-output sub-
+    // derivations.  Tree-walker's corepkgs/derivation.nix exposes the
+    // same shape; nixpkgs consumers (e.g. multi-output drv-mapping
+    // helpers) read `drv.all`.  Acyclic because each output attrset is
+    // self-contained.
+    if (!allOutputs.empty()) {
+        ListVec * lv = Alloc::allocList(static_cast<uint32_t>(allOutputs.size()));
+        allocStats().listsAllocated++;
+        for (size_t i = 0; i < allOutputs.size(); ++i)
+            lv->elems[i] = allOutputs[i];
+        Value vAll;
+        vAll.tag_payload = static_cast<uint64_t>(Tag::List);
+        vAll.payload.list = lv;
+        entries.emplace_back(sAll, vAll);
     }
     std::sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
@@ -4609,6 +4631,14 @@ void primDerivation(EvalState & state, Value * args, Value & out)
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
+
+    // REVIEW §3 NOTE: tree-walker stores `all = [<self>]` for single-
+    // output drvs (self-referential).  v3 deliberately stores the
+    // simpler form `all = [<per-output-attrset>]` -- TW's self-ref
+    // requires cycle detection in --strict print + deep force, which
+    // v3's bridge doesn't currently provide.  Programmatic shape is
+    // the same: `drv.all`'s list elements expose `outPath / drvPath /
+    // type / outputName`.  Diverges only on `--strict`-print recursion.
 }
 
 /// Cache of compiled-and-evaluated imported files.  Closures returned
