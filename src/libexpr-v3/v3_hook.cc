@@ -1978,15 +1978,14 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             e->eval(state, state.baseEnv, v);
             return;
         }
-        // WC-20: capture outer Expr so primV3CallBridge1's lazy
-        // safety net can fall back to tree-walker on a deferred
-        // v3-only blackhole inside the closure body.
-        extern thread_local nix::Expr * tlBridgeFallbackExpr;  // primops.cc
-        nix::Expr * savedFallback = tlBridgeFallbackExpr;
-        tlBridgeFallbackExpr = const_cast<nix::Expr *>(e);
+        // WC-20 / REVIEW §2.1: capture outer Expr so primV3CallBridge1's
+        // lazy safety net can fall back to tree-walker on a deferred
+        // v3-only blackhole inside the closure body.  RAII guard
+        // ensures the prior outer Expr's fallback is restored on every
+        // exit including throws (manual save/restore had a leak path).
+        ScopedBridgeFallbackExpr fallbackGuard{const_cast<nix::Expr *>(e)};
         try {
             nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
-            tlBridgeFallbackExpr = savedFallback;
             if (tmp) {
                 v = *tmp;
                 if (diag) std::fprintf(stderr,
@@ -1995,7 +1994,6 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 return;
             }
         } catch (const std::exception &) {
-            tlBridgeFallbackExpr = savedFallback;
             // bridge fail — fall through to tree-walker
         }
         if (diag) std::fprintf(stderr,
@@ -2051,12 +2049,11 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         // these structures — treat any throw as a signal to fall
         // back, and pre-emptively fall back if the bridge returns null.
         //
-        // WC-19: set tlBridgeFallbackExpr so the lazy bridge can
-        // re-run the outer Expr through tree-walker if a deferred
-        // force later trips a v3-only blackhole.
-        extern thread_local nix::Expr * tlBridgeFallbackExpr;  // primops.cc
-        nix::Expr * savedFallback = tlBridgeFallbackExpr;
-        tlBridgeFallbackExpr = const_cast<nix::Expr *>(e);
+        // WC-19 / REVIEW §2.1: RAII fallback-Expr guard so the lazy
+        // bridge can re-run the outer Expr through tree-walker if a
+        // deferred force later trips a v3-only blackhole.  Restore on
+        // throw paths via destructor.
+        ScopedBridgeFallbackExpr fallbackGuard{const_cast<nix::Expr *>(e)};
         try {
             auto t0 = timingEnabled ? clock::now() : clock::time_point{};
             nix::Value * tmp = v3ToTreeWalkerPublic(state, r);
@@ -2064,11 +2061,9 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 auto t1 = clock::now();
                 st.bridgeNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
             }
-            tlBridgeFallbackExpr = savedFallback;
             if (tmp) { v = *tmp; return; }
             st.evalFallbackReason[2]++;
         } catch (const std::exception & ex) {
-            tlBridgeFallbackExpr = savedFallback;
             if (diag) std::fprintf(stderr, "v3 hook: bridge threw: %s\n", ex.what());
             st.evalFallbackReason[3]++;
         }

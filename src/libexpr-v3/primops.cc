@@ -87,6 +87,16 @@ void populateSubExprCachePublic(
 /// External linkage so v3_hook.cc can extern-reference it.
 thread_local nix::Expr * tlBridgeFallbackExpr = nullptr;
 
+ScopedBridgeFallbackExpr::ScopedBridgeFallbackExpr(nix::Expr * e)
+    : saved(tlBridgeFallbackExpr)
+{
+    tlBridgeFallbackExpr = e;
+}
+ScopedBridgeFallbackExpr::~ScopedBridgeFallbackExpr()
+{
+    tlBridgeFallbackExpr = saved;
+}
+
 namespace {
 
 std::unordered_map<std::string, PrimOp> & registry()

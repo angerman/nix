@@ -59,6 +59,25 @@ struct EvalState
 void setNixEvalState(nix::EvalState * st);
 nix::EvalState * getNixEvalState();
 
+} // namespace nix::v3
+
+namespace nix { class Expr; }
+
+namespace nix::v3 {
+
+/// REVIEW §2.1: RAII guard for the thread-local fallback Expr pointer
+/// that primV3{CallBridge1,ForceAttr,ForceListElem} read on cycle
+/// detection.  Setting it via raw save/restore was leaking the prior
+/// outer Expr's fallback into the catch path on some throw shapes,
+/// routing a subsequent re-entry's cycle-fallback to the wrong Expr.
+/// Use `ScopedBridgeFallbackExpr` to bind for an RAII scope; pop on
+/// every exit including throws.
+struct ScopedBridgeFallbackExpr {
+    nix::Expr * saved;
+    ScopedBridgeFallbackExpr(nix::Expr * e);
+    ~ScopedBridgeFallbackExpr();
+};
+
 /// REVIEW MED-14: drop every entry from v3BridgeAttrs / v3BridgeLists /
 /// v3BridgeClosures.  These tables grow unboundedly with the number of
 /// lazy-bridged attrsets / lists / closures bridged across to tree-
