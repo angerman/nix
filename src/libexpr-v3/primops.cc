@@ -49,6 +49,7 @@
 #include <fstream>
 #include <list>
 #include <mutex>
+#include <sys/stat.h>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -4615,15 +4616,43 @@ void primDerivation(EvalState & state, Value * args, Value & out)
 /// pools by raw pointer — those must outlive the closure, so we keep
 /// the CUs (and the eval result) here for the lifetime of the process.
 /// Keyed by absolute path so repeated imports are idempotent.
+///
+/// REVIEW §2.5: tracks (mtime, size) per cache entry so long-running
+/// processes (Hydra, LSP, library consumers) re-evaluate files that
+/// change on disk between imports.  Tree-walker uses mtime-based
+/// invalidation; we mirror that.  CLI tools (one eval per process)
+/// are unaffected -- the stat on cache hit is microseconds.
+struct ImportCacheEntry {
+    Value result;
+    int64_t mtimeNs = 0;
+    int64_t size    = 0;
+};
 struct ImportCache
 {
     std::deque<CompilationUnit> cus;       // stable addresses (deque doesn't reallocate)
-    std::unordered_map<std::string, Value> results;
+    std::unordered_map<std::string, ImportCacheEntry> results;
 };
 inline ImportCache & importCache()
 {
     static ImportCache c;
     return c;
+}
+
+/// Stat a path and produce (mtime_ns, size).  Returns (0, -1) on
+/// failure -- the caller treats negative size as "uncacheable" and
+/// always re-evaluates.  Uses ::stat on macOS; UTC nanosecond mtime
+/// works across all the platforms v3 builds on.
+inline std::pair<int64_t, int64_t> importStat(const std::string & path)
+{
+    struct ::stat st{};
+    if (::stat(path.c_str(), &st) != 0) return {0, -1};
+    int64_t mtimeNs =
+#if defined(__APPLE__)
+        (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
+#else
+        (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+#endif
+    return {mtimeNs, (int64_t)st.st_size};
 }
 
 /// builtins.import path -- read the file at `path`, parse, lower, run.
@@ -4645,13 +4674,29 @@ void primImport(EvalState & state, Value * args, Value & out)
 
     auto & cache = importCache();
     if (auto it = cache.results.find(path); it != cache.results.end()) {
-        if (s_dbg_import) {
-            static std::atomic<uint64_t> seqHit{0};
-            std::fprintf(stderr, "v3 IMPORT-HIT[%llu]: %s\n",
-                (unsigned long long)seqHit.fetch_add(1), path.c_str());
+        // REVIEW §2.5: validate stat (mtime, size) hasn't changed
+        // since cache insert.  Daemons (Hydra / LSP) re-evaluate
+        // edited files; CLIs see a microsecond stat overhead.
+        auto [mtimeNs, sz] = importStat(path);
+        if (sz >= 0 && mtimeNs == it->second.mtimeNs && sz == it->second.size) {
+            if (s_dbg_import) {
+                static std::atomic<uint64_t> seqHit{0};
+                std::fprintf(stderr, "v3 IMPORT-HIT[%llu]: %s\n",
+                    (unsigned long long)seqHit.fetch_add(1), path.c_str());
+            }
+            out = it->second.result;
+            return;
         }
-        out = it->second;
-        return;
+        // Stat differs -- file changed.  Drop entry, re-evaluate.
+        // Note: the prior CompilationUnit stays in cus (deque appends
+        // never invalidate prior entries) so any closures referencing
+        // it remain valid.  Memory grows linearly in changes -- daemons
+        // that hot-reload heavily may want a periodic cus.clear()
+        // between top-level evals (clearBridgeTables-style).
+        if (s_dbg_import)
+            std::fprintf(stderr,
+                "v3 IMPORT-INVAL: %s (mtime/size changed)\n", path.c_str());
+        cache.results.erase(it);
     }
     if (s_dbg_import) {
         static std::atomic<uint64_t> seqMiss{0};
@@ -4719,7 +4764,9 @@ void primImport(EvalState & state, Value * args, Value & out)
             try {
                 cache.cus.push_back(serialize::deserializeCU(*blob));
                 out = run(cache.cus.back());
-                cache.results.emplace(path, out);
+                auto [mt, sz] = importStat(path);
+                cache.results.emplace(path,
+                    ImportCacheEntry{out, mt, sz});
                 return;
             } catch (const std::exception & ex) {
                 cache.cus.pop_back();
@@ -4760,7 +4807,10 @@ void primImport(EvalState & state, Value * args, Value & out)
     // VM to run it with its own top-level frame.  Keep the CU alive
     // (it's borrowed by closures returned from the eval).
     out = run(cache.cus.back());
-    cache.results.emplace(path, out);
+    {
+        auto [mt, sz] = importStat(path);
+        cache.results.emplace(path, ImportCacheEntry{out, mt, sz});
+    }
 }
 
 /// XML escape: `<>&"` and unprintable chars become entities.
