@@ -26,6 +26,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -1203,6 +1204,96 @@ static int testSerializeRoundTrip()
     return 0;
 }
 
+/// REVIEW B8: corrupted-blob fallback test.  Verifies that
+/// deserializeCU throws SerializationError on the three documented
+/// corruption modes: bad magic, schema mismatch, opcode-table
+/// fingerprint mismatch.  Each case must throw, NOT silently produce
+/// a malformed CompilationUnit (which would then run and produce
+/// arbitrary wrong output).  disk_cache::lookup catches the throw
+/// and returns nullopt, so corrupt cache entries trigger a recompile
+/// rather than poisoning the eval.
+static int testDeserializeRejectsCorruption()
+{
+    using namespace serialize;
+    // Build a known-good blob first so we can mutate copies of it.
+    auto m = ir::makeModule();
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+    auto v = addBinding(m, topEntry, ir::LitInt{42});
+    setReturn(m, topEntry, v);
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    std::string good = serializeCU(cu);
+    if (good.size() < 16) {
+        std::fprintf(stderr,
+            "testDeserializeRejectsCorruption: serialised blob too small (%zu B)\n",
+            good.size());
+        return 1;
+    }
+
+    // Case 1: bad magic.
+    {
+        std::string bad = good;
+        bad[0] = 'X';  // corrupt the magic prefix
+        bool threw = false;
+        try { (void)deserializeCU(bad); }
+        catch (const SerializationError &) { threw = true; }
+        if (!threw) {
+            std::fprintf(stderr,
+                "testDeserializeRejectsCorruption: bad magic should throw\n");
+            return 1;
+        }
+    }
+
+    // Case 2: wrong schema version (offset 8, after the 8-byte magic).
+    {
+        std::string bad = good;
+        // Overwrite schema version with a value far in the future.
+        uint32_t wrong = 0xDEADBEEFu;
+        std::memcpy(&bad[8], &wrong, sizeof(wrong));
+        bool threw = false;
+        try { (void)deserializeCU(bad); }
+        catch (const SerializationError &) { threw = true; }
+        if (!threw) {
+            std::fprintf(stderr,
+                "testDeserializeRejectsCorruption: schema mismatch should throw\n");
+            return 1;
+        }
+    }
+
+    // Case 3: wrong opcode-table fingerprint (offset 12, after schema).
+    {
+        std::string bad = good;
+        uint64_t wrong = 0xCAFEBABE12345678ull;
+        std::memcpy(&bad[12], &wrong, sizeof(wrong));
+        bool threw = false;
+        try { (void)deserializeCU(bad); }
+        catch (const SerializationError &) { threw = true; }
+        if (!threw) {
+            std::fprintf(stderr,
+                "testDeserializeRejectsCorruption: fingerprint mismatch should throw\n");
+            return 1;
+        }
+    }
+
+    // Sanity check: the original good blob still deserialises.
+    {
+        bool ok = false;
+        try { (void)deserializeCU(good); ok = true; }
+        catch (const std::exception & e) {
+            std::fprintf(stderr,
+                "testDeserializeRejectsCorruption: good blob threw: %s\n",
+                e.what());
+        }
+        if (!ok) return 1;
+    }
+
+    std::fprintf(stderr,
+        "testDeserializeRejectsCorruption: OK (3 corruption modes rejected, "
+        "good blob accepted)\n");
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -1237,6 +1328,7 @@ int main()
     rc |= testSerializeRoundTrip();
     rc |= testSerializeWithRecAttrset();
     rc |= testDiskCacheRoundTrip();
+    rc |= testDeserializeRejectsCorruption();
 
     auto & st = allocStats();
     std::fprintf(stderr,
