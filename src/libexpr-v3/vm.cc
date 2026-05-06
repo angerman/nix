@@ -4196,6 +4196,49 @@ Value forceValue(VMState & vm, Value v)
         Thunk * t = v.payload.thunk;
         if (t->state == ThunkState::Evaluated) { v = t->evaluated; continue; }
         if (t->state == ThunkState::Blackhole) {
+            // #458 lambda-skip leaked-Black recovery (opt-in).  When the
+            // thunk's Black state was set by a previous VMState that has
+            // since unwound, the current VMState's frame stack does NOT
+            // contain the thunk.  Treat this as a leaked mark — reset to
+            // Suspended and let the chase fall through to the Suspended
+            // handler below to re-run the body idempotently.  Gated
+            // behind NIX_V3_LEAKED_BLACK_RECOVER=1 because the prior
+            // attempt (memory file) turned BlackHole into a chase cycle
+            // when the leak interpretation was wrong on a real cycle.
+            // With the slot-capture redesign + RecBuildSlot in place,
+            // genuine self-reference cycles are sidestepped earlier (via
+            // Tag::Slot deref instead of forcing a wrap thunk), so the
+            // leak interpretation should be correct in more cases.
+            static const bool s_recover =
+                std::getenv("NIX_V3_LEAKED_BLACK_RECOVER") != nullptr;
+            if (s_recover) {
+                bool onCurrentFrames = false;
+                for (size_t i = 0; i < vm.frames.size(); ++i) {
+                    if (vm.frames[i].thunk == t) { onCurrentFrames = true; break; }
+                }
+                if (!onCurrentFrames) {
+                    // Per-thunk re-entry counter: if recovery recurs on
+                    // the same thunk pointer N times in a row from the
+                    // same VMState, the leak interpretation is wrong
+                    // (it's a real cycle).  Throw the BlackholeError
+                    // through the normal path instead of looping.
+                    static thread_local std::unordered_map<Thunk *, int> reentryCount;
+                    int & cnt = reentryCount[t];
+                    if (++cnt > 4) {
+                        reentryCount.erase(t);
+                        // Fall through to throw below.
+                    } else {
+                        static const bool s_dbgRec =
+                            std::getenv("V3_DBG_LEAKED_BLACK") != nullptr;
+                        if (s_dbgRec) std::fprintf(stderr,
+                            "v3 forceValue: leaked-Black recover thunk=%p "
+                            "(frames=%zu, not on stack, attempt %d) -> Suspended\n",
+                            (void*)t, vm.frames.size(), cnt);
+                        t->state = ThunkState::Suspended;
+                        continue;
+                    }
+                }
+            }
             // Same diagnostic as OP_FORCE's blackhole path — V3_DBG_OPCYCLE
             // dumps the frame stack so the cycle source is visible.
             static const bool s_dbg = std::getenv("V3_DBG_OPCYCLE") != nullptr;
@@ -4212,9 +4255,12 @@ Value forceValue(VMState & vm, Value v)
                         desc->codeOffset, desc->nUpvalues, desc->nLocals);
                     return buf;
                 };
+                const LambdaDescriptor * tdesc = t ? t->suspended.desc : nullptr;
                 std::fprintf(stderr,
-                    "v3 forceValue Black thunk=%p frames=%zu\n",
-                    (void*)t, vm.frames.size());
+                    "v3 forceValue Black thunk=%p frames=%zu desc.name=%s desc.code=%u\n",
+                    (void*)t, vm.frames.size(),
+                    (tdesc && !tdesc->name.empty()) ? tdesc->name.c_str() : "<anon>",
+                    tdesc ? tdesc->codeOffset : 0);
                 size_t lim = vm.frames.size();
                 ssize_t blackIdx = -1;
                 for (size_t i = lim; i > 0; --i) {
