@@ -6466,6 +6466,13 @@ Value forceBridgeThunk(Thunk * t)
             std::abort();
         }
     }
+    // #458 step B: scalar fast path -- if the bridged TW Value
+    // is already a forced scalar, skip VMState allocation and
+    // direct-write the v3 equivalent.  Eliminates the heavy
+    // treeWalkerToV3Public call for the common case.
+    Value out;
+    if (tryFastBridgeScalarTwToV3(*srcV, out))
+        return out;
     return treeWalkerToV3Public(*tlNixEvalState, *srcV);
 }
 
@@ -6534,12 +6541,51 @@ std::optional<Value> tryBridgeAttrLookup(Thunk * t, SymbolId v3name)
     // Catch BlackHole specifically: a forced-blackhole entry means
     // the Attr's body is itself mid-construction; treat as "not yet
     // resolvable", let the caller try the outer scope.
+    //
+    // #458 step B: try the scalar fast path first -- ints/floats/
+    // bools/null skip VMState allocation and direct-write the v3
+    // equivalent.  Common case for entries like `system = "x86..."`
+    // that constant-folded into a forced scalar already.
+    Value v3v;
+    if (tryFastBridgeScalarTwToV3(*a->value, v3v))
+        return v3v;
     try {
-        Value v3v = treeWalkerToV3Public(*tlNixEvalState, *a->value);
+        v3v = treeWalkerToV3Public(*tlNixEvalState, *a->value);
         return v3v;
     } catch (...) {
         return std::nullopt;
     }
+}
+
+/// #458 step B (canonicalization): scalar fast-path for TW -> v3
+/// bridging.  See header for full doc.  Inspects the TW Value's
+/// discriminator without forcing; for known scalars writes the v3
+/// equivalent directly.  Caller fast-bridges into `out` and skips
+/// the regular treeWalkerToV3Public path.
+bool tryFastBridgeScalarTwToV3(const nix::Value & nv, Value & out)
+{
+    try {
+        nix::ValueType tt = nv.type();
+        if (tt == nix::nInt) {
+            out.mkInt(nv.integer().value);
+            return true;
+        }
+        if (tt == nix::nFloat) {
+            out.mkFloat(nv.fpoint());
+            return true;
+        }
+        if (tt == nix::nBool) {
+            out = nv.boolean() ? Value::vTrue : Value::vFalse;
+            return true;
+        }
+        if (tt == nix::nNull) {
+            out.mkNull();
+            return true;
+        }
+    } catch (...) {
+        // type() may throw on uninit / blackhole; bail to slow path.
+    }
+    return false;
 }
 
 /// #458 step A.4: existence-check sibling of tryBridgeAttrLookup for

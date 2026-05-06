@@ -140,6 +140,19 @@ Value forceValue(VMState & vm, Value v);
 /// thunk, preserving laziness one more level.
 std::optional<Value> tryBridgeAttrLookup(Thunk * t, uint32_t v3name);
 
+/// #458 step B (canonicalization): scalar fast-path for TW->v3
+/// bridging.  When `nv` is an already-forced scalar (Int / Float /
+/// Bool / Null), inline-write the equivalent v3::Value into `out`
+/// and return true -- skipping the heavyweight `treeWalkerToV3Public`
+/// path (VMState allocation + depth check + fiber yield + the type
+/// switch).  Returns false if `nv` is not a known scalar; caller
+/// must use the regular bridge path.
+///
+/// This reduces TW reliance: every scalar arg / attr / element
+/// previously cost a Bridge-thunk alloc + future treeWalkerToV3
+/// callback; now zero TW work after the fast bridge.
+bool tryFastBridgeScalarTwToV3(const nix::Value & nv, Value & out);
+
 /// #458 step A.4: existence check sibling to tryBridgeAttrLookup,
 /// for the `attrs ? name` operator (OP_ATTRS_HAS).  Returns:
 ///   - 0: src not in a state where we can answer (still thunk-shaped,

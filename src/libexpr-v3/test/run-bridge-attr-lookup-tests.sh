@@ -85,6 +85,22 @@ in (fix toFix).r
 EOF
 EXP_P5='true'
 
+# p6 — B (scalar fast path): TW arg = forced int, passed into v3
+#       closure body that returns it.  Should produce 42 -- the test
+#       only confirms parity; the fast-path effect is invisible to
+#       Nix-level semantics but visible in perf (no Bridge thunk
+#       allocated, no future treeWalkerToV3 callback).
+cat > "$TMP/p6.nix" <<'EOF'
+let id = x: x; in id 42
+EOF
+EXP_P6='42'
+
+# p7 — B: chain of scalar arg passes through nested lambdas.
+cat > "$TMP/p7.nix" <<'EOF'
+let f = a: b: c: a + b + c; in f 10 20 30
+EOF
+EXP_P7='60'
+
 ok=0
 fail=0
 fail_names=()
@@ -126,6 +142,8 @@ for spec in "${modes[@]}"; do
   run_one "$tag/p3" "$TMP/p3.nix" "$EXP_P3" "${envarr[@]}"
   run_one "$tag/p4" "$TMP/p4.nix" "$EXP_P4" "${envarr[@]}"
   run_one "$tag/p5" "$TMP/p5.nix" "$EXP_P5" "${envarr[@]}"
+  run_one "$tag/p6" "$TMP/p6.nix" "$EXP_P6" "${envarr[@]}"
+  run_one "$tag/p7" "$TMP/p7.nix" "$EXP_P7" "${envarr[@]}"
 done
 
 echo "=== bridge-attr-lookup tests: ok=$ok fail=$fail (total=$((ok+fail))) ==="

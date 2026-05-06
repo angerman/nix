@@ -3093,10 +3093,36 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // and the v3 closure body falls back via its existing catch.
     if (!arg) return false;
     Value v3Arg;
-    Thunk * argBridge = Alloc::allocBridgeThunk(static_cast<void *>(arg));
-    allocStats().thunksAllocated++;
-    v3Arg.tag_payload = static_cast<uint64_t>(Tag::Thunk);
-    v3Arg.payload.thunk = argBridge;
+
+    // #458 step B (canonicalization, "reduce TW reliance"): scalar
+    // fast-path for already-forced TW arg values.  Every TW arg used
+    // to be wrapped as a Bridge thunk; v3 forces the thunk on first
+    // access via forceBridgeThunk -> treeWalkerToV3Public, which
+    // allocates a VMState and calls treeWalkerToV3.  For ints/floats/
+    // bools/null the result is just a direct field copy -- the heavy
+    // path is pure overhead.
+    //
+    // Detect "already-forced scalar" by inspecting the TW Value's
+    // discriminator (no force call: arg->type() returns the cached
+    // nInt/nFloat/etc tag).  If scalar, inline-bridge directly to a
+    // v3::Value -- ZERO heap alloc, ZERO future TW callback.
+    //
+    // Composite types (attrs/list/function/external) still take the
+    // Bridge thunk path -- bridging them eagerly would change
+    // laziness semantics.  And tThunk-discriminated values fall through
+    // because we can't peek inside without a force.
+    // Use the shared scalar-fast-path helper (declared in primop.hh).
+    // Composite types (string/path/attrs/list/function) keep the
+    // Bridge thunk path to preserve laziness; thunks fall through
+    // because we can't peek inside without forcing.
+    bool fastBridged = tryFastBridgeScalarTwToV3(*arg, v3Arg);
+
+    if (!fastBridged) {
+        Thunk * argBridge = Alloc::allocBridgeThunk(static_cast<void *>(arg));
+        allocStats().thunksAllocated++;
+        v3Arg.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+        v3Arg.payload.thunk = argBridge;
+    }
 
     // Run the body.  #455: hold ScopedEagerBridge for the WHOLE
     // duration of runLambda + result bridge, but ONLY for lambdas
