@@ -2870,6 +2870,15 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         fallbackExpr->eval(ns, ns.baseEnv, tw);
         ns.forceValue(tw, pos);
         // tw should be a function; call it with args[1].
+        static const bool s_dbg =
+            std::getenv("V3_DBG_BRIDGE1_FALLBACK") != nullptr;
+        if (s_dbg) {
+            int twType = tw.isValid() ? (int)tw.type<true>() : -1;
+            std::fprintf(stderr,
+                "v3 bridge1 fallback: tw.type=%d (handle=%lld)\n",
+                twType, (long long)h);
+            std::fflush(stderr);
+        }
         ns.callFunction(tw, *args[1], out, pos);
     };
 

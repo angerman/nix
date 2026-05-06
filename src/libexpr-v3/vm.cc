@@ -1458,6 +1458,28 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 if (!argTw)
                     throw std::runtime_error(
                         "v3 OP_CALL: bridge-thunk arg failed v3->TW bridge");
+                // V3_DBG_OPCALL_BRIDGE: trace the callee shape so we
+                // can localize "TW callFunction got non-function" errors
+                // back to the v3 caller's frame name + ip.  Diagnostic
+                // only; off by default.
+                {
+                    static const bool s_dbg =
+                        std::getenv("V3_DBG_OPCALL_BRIDGE") != nullptr;
+                    if (s_dbg) {
+                        int twType = funTw->isValid()
+                            ? (int)funTw->type<true>() : -1;
+                        const LambdaDescriptor * d = nullptr;
+                        if (vm.frames.back().closure)
+                            d = vm.frames.back().closure->desc;
+                        else if (vm.frames.back().thunk)
+                            d = vm.frames.back().thunk->suspended.desc;
+                        std::fprintf(stderr,
+                            "v3 OP_CALL bridge: tw.type=%d top=%s ip=%u\n",
+                            twType,
+                            d && !d->name.empty() ? d->name.c_str() : "<?>",
+                            vm.frames.back().ip);
+                    }
+                }
                 nix::Value outTw;
                 ns->callFunction(*funTw, *argTw, outTw, nix::noPos);
                 Value v3out = treeWalkerToV3Public(*ns, outTw);
