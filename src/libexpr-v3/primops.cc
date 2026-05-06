@@ -6469,6 +6469,79 @@ Value forceBridgeThunk(Thunk * t)
     return treeWalkerToV3Public(*tlNixEvalState, *srcV);
 }
 
+/// #458 step A.2 (slot-threading for fix-point args): per-attribute
+/// lookup against a Bridge thunk's TW Value source WITHOUT forcing the
+/// whole TW Value.
+///
+/// Motivating case: cardano-node `with self;` where `self` is the
+/// fix-point argument of an `extends overlay` chain.  When v3 forces
+/// a Bridge thunk wrapping the partially-constructed `self`, TW's
+/// outer-thunk BlackHole detection fires (cardano-node #455).  The
+/// existing `forceBridgeThunk` path has no choice -- it forces the
+/// whole.  This helper instead peeks at the TW Value's tag bit
+/// (no force), and if it's already an attrset (Bindings constructed,
+/// even when individual entries are still thunks), looks up the
+/// requested name and bridges JUST that single value.
+///
+/// Returns std::nullopt if:
+///   - src is still a thunk (not yet attrset-shaped)
+///   - src is some other type (non-attrset)
+///   - the name doesn't exist in the partial bindings
+///   - forcing the single found Attr threw BlackHole (entry itself
+///     is mid-construction)
+///
+/// Returns the bridged v3 Value otherwise -- itself possibly a fresh
+/// Bridge thunk if the attr's body is still a TW thunk.
+std::optional<Value> tryBridgeAttrLookup(Thunk * t, SymbolId v3name)
+{
+    if (!t || t->state != ThunkState::Bridge || !t->bridgeSrc)
+        return std::nullopt;
+    if (!tlNixEvalState)
+        return std::nullopt;
+    auto * srcV = static_cast<nix::Value *>(t->bridgeSrc);
+
+    // PEEK without force: read the internalType discriminator.  TW's
+    // type() throws on Blackhole-tagged values; protect with try/catch
+    // so we can route to "scope blackholed" cleanly.
+    nix::ValueType tt;
+    try {
+        tt = srcV->type();
+    } catch (...) {
+        return std::nullopt;
+    }
+    if (tt != nix::nAttrs)
+        return std::nullopt;
+    const nix::Bindings * bindings = srcV->attrs();
+    if (!bindings)
+        return std::nullopt;
+
+    // Translate v3 SymbolId -> TW Symbol via the v3 symbol table's
+    // string, then through TW's symbol table.  v3's globalSymbolTable
+    // owns the canonical strings; both sides intern by string content.
+    const auto & v3Tab = ir::globalSymbolTable();
+    if (v3name >= v3Tab.size())
+        return std::nullopt;
+    std::string_view nameStr = v3Tab[v3name];
+    nix::Symbol twSym = tlNixEvalState->symbols.create(nameStr);
+
+    const nix::Attr * a = bindings->get(twSym);
+    if (!a)
+        return std::nullopt;
+
+    // Bridge the single Attr value back to v3.  treeWalkerToV3Public
+    // is the canonical bridge entry; for thunked entries it allocates
+    // a fresh Bridge thunk, which preserves laziness one more level.
+    // Catch BlackHole specifically: a forced-blackhole entry means
+    // the Attr's body is itself mid-construction; treat as "not yet
+    // resolvable", let the caller try the outer scope.
+    try {
+        Value v3v = treeWalkerToV3Public(*tlNixEvalState, *a->value);
+        return v3v;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WC-28a: small missing primops (placeholder, __warn, break, __outputOf,
 //   __storePath, __toFile).  All previously fell back to tree-walker.

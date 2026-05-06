@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -125,6 +126,19 @@ Value callClosure(VMState & vm, Value fun, Value arg);
 /// the dispatch loop on the same VMState (used by primops like tryEval
 /// that need to force from C++).
 Value forceValue(VMState & vm, Value v);
+
+/// #458 step A.2: per-attribute lookup against a Bridge thunk's TW
+/// Value source WITHOUT forcing the whole TW Value.  Used by
+/// OP_WITH_LOOKUP to resolve names against a partially-constructed
+/// fix-point attrset (cardano-node #455 shape: `with self;` over
+/// `extends overlay self` where `self` is mid-construction).
+///
+/// Returns nullopt when the lookup can't be made safely (src still
+/// thunk-shaped, not an attrset, name absent, entry itself mid-
+/// blackhole).  Returns the bridged v3 Value otherwise -- itself
+/// possibly a fresh Bridge thunk if the attr's body is still a TW
+/// thunk, preserving laziness one more level.
+std::optional<Value> tryBridgeAttrLookup(Thunk * t, uint32_t v3name);
 
 /// Function pointer signature.  The primop is given a span of forced
 /// argument Values (the dispatcher arranges forcing) and writes its

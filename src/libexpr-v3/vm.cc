@@ -412,6 +412,24 @@ inline Value withLookup(VMState & vm, SymbolId name)
             continue;
         }
         if (w.isThunk() || w.tag() == Tag::App) {
+            // #458 step A.2 (slot-threading for fix-point args):
+            // before forcing the whole TW Bridge thunk, try a per-
+            // attribute lookup that observes a partially-constructed
+            // attrset without tripping its outer-thunk BlackHole.
+            // Cardano-node `with self;` over `extends overlay self`
+            // shape: the partial Bindings already has the entries we
+            // need; only the OUTER thunk is mid-blackhole.
+            if (w.isThunk() && w.payload.thunk
+                && w.payload.thunk->state == ThunkState::Bridge) {
+                if (auto v = tryBridgeAttrLookup(w.payload.thunk, name))
+                    return *v;
+                // not found in this scope's partial bindings, OR src
+                // not yet attrset-shaped.  Don't fall through to the
+                // wholesale force below in the latter case (still-thunk
+                // means "not yet resolvable here, try outer scope").
+                anyBlackholed = true;
+                continue;
+            }
             try {
                 w = forceValue(vm, w);
             } catch (const BlackholeError &) {
