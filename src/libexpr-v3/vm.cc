@@ -2724,6 +2724,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_HAS: {
             Value attrs = pop(vm);
+            // #458 step A.4: per-attr peek for the Bridge thunk case.
+            // Cheaper than tryBridgeAttrLookup -- no bridge of the value
+            // is needed, just an existence check on the partial Bindings.
+            if (attrs.isThunk() && attrs.payload.thunk
+                && attrs.payload.thunk->state == ThunkState::Bridge) {
+                auto r = tryBridgeAttrHas(
+                    attrs.payload.thunk, static_cast<SymbolId>(operand));
+                if (r == BridgeAttrHasResult::Present) {
+                    push(vm, Value::vTrue);
+                    break;
+                }
+                if (r == BridgeAttrHasResult::Absent) {
+                    push(vm, Value::vFalse);
+                    break;
+                }
+                // Indeterminate: src still thunk-shaped, fall through.
+            }
             if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
@@ -2737,6 +2754,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (name.tag() == Tag::App || name.tag() == Tag::Thunk || name.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 name = forceValue(vm, name);
+            }
+            // #458 step A.4: same per-attr peek for the dyn variant.
+            // The name was forced above; if it's a string, intern and
+            // try the bridge-has shortcut on the partial bindings.
+            if (name.isString()
+                && attrs.isThunk() && attrs.payload.thunk
+                && attrs.payload.thunk->state == ThunkState::Bridge) {
+                SymbolId id = ir::globalInternSymbol(name.payload.str);
+                auto r = tryBridgeAttrHas(attrs.payload.thunk, id);
+                if (r == BridgeAttrHasResult::Present) {
+                    push(vm, Value::vTrue);
+                    break;
+                }
+                if (r == BridgeAttrHasResult::Absent) {
+                    push(vm, Value::vFalse);
+                    break;
+                }
             }
             if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;

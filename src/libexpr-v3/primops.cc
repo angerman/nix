@@ -6542,6 +6542,38 @@ std::optional<Value> tryBridgeAttrLookup(Thunk * t, SymbolId v3name)
     }
 }
 
+/// #458 step A.4: existence-check sibling of tryBridgeAttrLookup for
+/// the `attrs ? name` operator.  Cheaper than tryBridgeAttrLookup --
+/// no bridging the entry value, just answer whether the partial
+/// bindings already has the name.
+BridgeAttrHasResult tryBridgeAttrHas(Thunk * t, SymbolId v3name)
+{
+    if (!t || t->state != ThunkState::Bridge || !t->bridgeSrc)
+        return BridgeAttrHasResult::Indeterminate;
+    if (!tlNixEvalState)
+        return BridgeAttrHasResult::Indeterminate;
+    auto * srcV = static_cast<nix::Value *>(t->bridgeSrc);
+    nix::ValueType tt;
+    try {
+        tt = srcV->type();
+    } catch (...) {
+        return BridgeAttrHasResult::Indeterminate;
+    }
+    if (tt != nix::nAttrs)
+        return BridgeAttrHasResult::Indeterminate;
+    const nix::Bindings * bindings = srcV->attrs();
+    if (!bindings)
+        return BridgeAttrHasResult::Indeterminate;
+    const auto & v3Tab = ir::globalSymbolTable();
+    if (v3name >= v3Tab.size())
+        return BridgeAttrHasResult::Indeterminate;
+    std::string_view nameStr = v3Tab[v3name];
+    nix::Symbol twSym = tlNixEvalState->symbols.create(nameStr);
+    return bindings->get(twSym)
+        ? BridgeAttrHasResult::Present
+        : BridgeAttrHasResult::Absent;
+}
+
 // ---------------------------------------------------------------------------
 // WC-28a: small missing primops (placeholder, __warn, break, __outputOf,
 //   __storePath, __toFile).  All previously fell back to tree-walker.

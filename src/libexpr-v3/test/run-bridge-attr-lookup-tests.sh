@@ -65,6 +65,26 @@ in (fix outer).r
 EOF
 EXP_P3='"AX"'
 
+# p4 — A.4: `?` operator (OP_ATTRS_HAS) on a fix-point arg.  The
+#       bridged-thunk peek must answer present/absent without forcing.
+cat > "$TMP/p4.nix" <<'EOF'
+let
+  fix = f: let x = f x; in x;
+  toFix = self: { a = 1; b = 2; r = self ? a; s = self ? zzz; };
+in let r = fix toFix; in [ r.r r.s ]
+EOF
+EXP_P4='[ true false ]'
+
+# p5 — A.4: `?` with dynamic name (OP_ATTRS_HAS_DYN) on a fix-point arg.
+cat > "$TMP/p5.nix" <<'EOF'
+let
+  fix = f: let x = f x; in x;
+  needle = "b";
+  toFix = self: { a = 1; b = 2; r = self ? "${needle}"; };
+in (fix toFix).r
+EOF
+EXP_P5='true'
+
 ok=0
 fail=0
 fail_names=()
@@ -104,6 +124,8 @@ for spec in "${modes[@]}"; do
   run_one "$tag/p1" "$TMP/p1.nix" "$EXP_P1" "${envarr[@]}"
   run_one "$tag/p2" "$TMP/p2.nix" "$EXP_P2" "${envarr[@]}"
   run_one "$tag/p3" "$TMP/p3.nix" "$EXP_P3" "${envarr[@]}"
+  run_one "$tag/p4" "$TMP/p4.nix" "$EXP_P4" "${envarr[@]}"
+  run_one "$tag/p5" "$TMP/p5.nix" "$EXP_P5" "${envarr[@]}"
 done
 
 echo "=== bridge-attr-lookup tests: ok=$ok fail=$fail (total=$((ok+fail))) ==="

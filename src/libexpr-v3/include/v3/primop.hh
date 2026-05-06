@@ -140,6 +140,19 @@ Value forceValue(VMState & vm, Value v);
 /// thunk, preserving laziness one more level.
 std::optional<Value> tryBridgeAttrLookup(Thunk * t, uint32_t v3name);
 
+/// #458 step A.4: existence check sibling to tryBridgeAttrLookup,
+/// for the `attrs ? name` operator (OP_ATTRS_HAS).  Returns:
+///   - 0: src not in a state where we can answer (still thunk-shaped,
+///        not an attrset).  Caller should fall back to wholesale force.
+///   - 1: name is present in the partial bindings.
+///   - 2: src is an attrset, name is NOT present.
+/// Distinguishes 0 from 2 because for `has`, "not present in partial
+/// bindings" is the authoritative answer if the OUTER thunk is already
+/// nAttrs (Bindings is published, even if entries are still thunks --
+/// no entry will be added later).
+enum class BridgeAttrHasResult : uint8_t { Indeterminate = 0, Present = 1, Absent = 2 };
+BridgeAttrHasResult tryBridgeAttrHas(Thunk * t, uint32_t v3name);
+
 /// Function pointer signature.  The primop is given a span of forced
 /// argument Values (the dispatcher arranges forcing) and writes its
 /// result into `out`.
