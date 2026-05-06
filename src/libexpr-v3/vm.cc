@@ -2398,6 +2398,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_SELECT: {
             Value attrs = pop(vm);
+            // #458 step A.3: same per-attr peek as OP_WITH_LOOKUP for
+            // Bridge thunks.  When attrs is a TW Value bridged into v3
+            // and the outer thunk's type is already nAttrs (Bindings
+            // built; entries may still be thunks), look up just our
+            // operand symbol and bridge the single Attr -- avoiding
+            // deep `treeWalkerToV3Public` conversion that would walk
+            // every entry and risk fix-point cycles.  Works in concert
+            // with A.2 for the broader slot-threading-for-fix-points
+            // story.  IC cache update is skipped on this path -- the
+            // per-attr bridge result has no v3-side Bindings to cache
+            // against (and the IC's purpose is amortizing v3-internal
+            // Bindings* shape-keyed lookups).
+            if (attrs.isThunk() && attrs.payload.thunk
+                && attrs.payload.thunk->state == ThunkState::Bridge) {
+                // The opcode's 24-bit operand is the SymbolId.
+                if (auto v = tryBridgeAttrLookup(
+                        attrs.payload.thunk,
+                        static_cast<SymbolId>(operand))) {
+                    push(vm, *v);
+                    ip++;  // consume the icIdx operand word we'd
+                           // otherwise read at line below
+                    break;
+                }
+                // peek didn't resolve -- fall through to wholesale
+                // force.  May still succeed (if not in a cycle) or
+                // throw BlackholeError that propagates correctly.
+            }
             // Force lazy shapes (Tag::App from mapAttrs entries, Thunks
             // from chained AttrSelects).  Same rationale as OP_CALL —
             // tree-walker forces target before AttrSelect; v3's lower
