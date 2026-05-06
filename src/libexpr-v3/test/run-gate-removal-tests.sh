@@ -89,6 +89,25 @@ EXP_T2P2='[ true false ]'
 
 # T2.n1 — depth=0 (legacy refuse-nested) still produces correct results.
 
+# T4 — sizeHeuristicSkip lift.  Was 50 functions; now SIZE_MAX (no cap).
+# T4.p1 — synthetic large module with many lambdas.  v3 should now own it.
+cat > "$TMP/t4p1.nix" <<'EOF'
+let
+  mkLambda = n: x: x + n;
+  l1 = mkLambda 1; l2 = mkLambda 2; l3 = mkLambda 3; l4 = mkLambda 4;
+  l5 = mkLambda 5; l6 = mkLambda 6; l7 = mkLambda 7; l8 = mkLambda 8;
+  l9 = mkLambda 9; l10 = mkLambda 10; l11 = mkLambda 11; l12 = mkLambda 12;
+  l13 = mkLambda 13; l14 = mkLambda 14; l15 = mkLambda 15; l16 = mkLambda 16;
+  l17 = mkLambda 17; l18 = mkLambda 18; l19 = mkLambda 19; l20 = mkLambda 20;
+  fns = [l1 l2 l3 l4 l5 l6 l7 l8 l9 l10 l11 l12 l13 l14 l15 l16 l17 l18 l19 l20];
+in builtins.foldl' (acc: f: acc + (f 100)) 0 fns
+EOF
+EXP_T4P1='2210'
+
+# T4.n1 — restore legacy threshold via NIX_V3_SKIP_THRESHOLD=50 should
+#         work identically (correctness; just declines compilation
+#         and falls back to TW).
+
 ok=0
 fail=0
 fail_names=()
@@ -119,6 +138,7 @@ modes=(
   "v3::NIX_USE_V3=1"
   "v3-noform::NIX_USE_V3=1 NIX_V3_NO_CALL_FORMALS=1"
   "v3-depth0::NIX_USE_V3=1 NIX_V3_CALL_DEPTH_LIMIT=0"
+  "v3-thresh50::NIX_USE_V3=1 NIX_V3_SKIP_THRESHOLD=50"
 )
 
 for spec in "${modes[@]}"; do
@@ -130,6 +150,7 @@ for spec in "${modes[@]}"; do
   run_one "$tag/T1p4" "$TMP/t1p4.nix" "$EXP_T1P4" "${envarr[@]}"
   run_one "$tag/T2p1" "$TMP/t2p1.nix" "$EXP_T2P1" "${envarr[@]}"
   run_one "$tag/T2p2" "$TMP/t2p2.nix" "$EXP_T2P2" "${envarr[@]}"
+  run_one "$tag/T4p1" "$TMP/t4p1.nix" "$EXP_T4P1" "${envarr[@]}"
 done
 
 echo "=== gate-removal tests: ok=$ok fail=$fail (total=$((ok+fail))) ==="
