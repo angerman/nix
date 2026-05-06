@@ -4754,6 +4754,39 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         }
     }
 
+    // #483 part 3: Bridge thunk callee.  Per the #456 fix, forceValue
+    // can RETURN a Tag::Thunk in Bridge state (when forceBridgeThunk's
+    // result is itself a Bridge thunk wrapping a TW Function/List for
+    // round-trip identity preservation).  Without handling here,
+    // callClosure throws "not callable" on a perfectly valid bridged
+    // TW function.  Mirror OP_CALL's Bridge branch: call TW's
+    // callFunction with the original TW value, then bridge the result
+    // back to v3.  Surfaces under lambda-skip when v3 invokes a TW
+    // function passed in as an arg (e.g. via the imap1+dfold pattern
+    // in pkgs/stdenv/booter.nix).
+    if (fun.isThunk() && fun.payload.thunk
+        && fun.payload.thunk->state == ThunkState::Bridge
+        && fun.payload.thunk->bridgeSrc) {
+        if (auto * ns = getNixEvalState()) {
+            auto * funTw = static_cast<nix::Value *>(
+                fun.payload.thunk->bridgeSrc);
+            ns->forceValue(*funTw, nix::noPos);
+            // Try the bridge1 shortcut to keep work on this vm.
+            Value v3Fn;
+            static const bool s_disabled =
+                std::getenv("NIX_V3_NO_OP_CALL_BRIDGE_SHORTCUT") != nullptr;
+            if (!s_disabled && tryUnwrapBridge1Closure(*funTw, v3Fn))
+                return callClosure(vm, v3Fn, arg);
+            nix::Value * argTw = v3ToTreeWalkerPublic(*ns, arg);
+            if (!argTw)
+                throw std::runtime_error(
+                    "v3 callClosure: bridge-thunk arg failed v3->TW bridge");
+            nix::Value outTw;
+            ns->callFunction(*funTw, *argTw, outTw, nix::noPos);
+            return treeWalkerToV3Public(*ns, outTw);
+        }
+    }
+
     if (!fun.isClosure()) {
         static const bool dbg = std::getenv("V3_DBG_CALL") != nullptr;
         if (dbg) {
