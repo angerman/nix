@@ -40,6 +40,11 @@
 
 namespace nix::v3 {
 
+// #456 fix: forward decls for the bridge entry points used in
+// OP_CALL's Bridge-thunk branch.  Defined in v3_hook.cc / primops.cc.
+nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
+Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
+
 // WC-10: forward declaration at namespace scope so the `extern` use sites
 // inside the anonymous namespaces below resolve to nix::v3::forceBridgeThunk
 // (defined in primops.cc) rather than to a phantom anonymous-namespace symbol.
@@ -1269,6 +1274,52 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 Value out;
                 po->fn(state, buf, out);
                 push(vm, out);
+                break;
+            }
+
+            // #456 fix: callee is a Bridge thunk wrapping a TW
+            // lambda.  v3 can't directly execute TW lambda bytecode,
+            // so route the call back through TW's callFunction.
+            // Mirrors the OP_CALL flow for v3 closures, but at the
+            // boundary: bridge fun + arg to TW, call, bridge result
+            // back to v3.
+            //
+            // Without this, an OP_CALL on a Bridge thunk falls into
+            // the "not a closure" error below.  This case arises
+            // whenever v3 evaluates a body that calls a function
+            // captured from TW (e.g. lib.foldl' under cardano-node /
+            // hello.name flake-eval shapes).
+            //
+            // Wrap in try/catch: a TW BlackHole here means the
+            // surrounding v3 evaluation tripped a fix-point cycle the
+            // existing eager-bridge / call-hook fallback machinery
+            // handles when allowed to bubble up.  Propagate the
+            // exception so v3CallFunctionEntry's outer catch
+            // (v3_hook.cc:3183) blacklists the lambda + falls back
+            // to TW for the whole call.  Also catch generic
+            // exceptions so we don't silently corrupt the
+            // BridgeShimVm's frame state.
+            if (fun.isThunk() && fun.payload.thunk
+                && fun.payload.thunk->state == ThunkState::Bridge
+                && fun.payload.thunk->bridgeSrc) {
+                if (!getNixEvalState())
+                    throw std::runtime_error(
+                        "v3 OP_CALL: bridge-thunk call needs a TW EvalState");
+                auto * ns = getNixEvalState();
+                auto * funTw = static_cast<nix::Value *>(
+                    fun.payload.thunk->bridgeSrc);
+                // Bridge arg back to TW.  v3->TW preserves identity
+                // for Bridge thunks (unwraps to original) and converts
+                // scalars / composites otherwise.
+                nix::Value * argTw = v3ToTreeWalkerPublic(*ns, arg);
+                if (!argTw)
+                    throw std::runtime_error(
+                        "v3 OP_CALL: bridge-thunk arg failed v3->TW bridge");
+                ns->forceValue(*funTw, nix::noPos);
+                nix::Value outTw;
+                ns->callFunction(*funTw, *argTw, outTw, nix::noPos);
+                Value v3out = treeWalkerToV3Public(*ns, outTw);
+                push(vm, v3out);
                 break;
             }
 
@@ -3869,31 +3920,49 @@ Value forceValue(VMState & vm, Value v)
     // cycles.
     constexpr int kMaxChaseIters = 4096;
     int chaseIters = 0;
+    // V3_DBG_CHASE: optional ring-buffer of recent (tag, ptr) pairs so
+    // we can dump the chain shape if the limit fires.  Cheap when
+    // disabled (single static check on hot path).
+    static const bool s_dbg_chase = std::getenv("V3_DBG_CHASE") != nullptr;
+    constexpr int kRingSize = 32;
+    Tag ringTag[kRingSize] = {};
+    void * ringPtr[kRingSize] = {};
+    int ringIdx = 0;
     // Loop until WHNF: a thunk's body might itself yield a thunk
     // (e.g., `let inherit outer; in outer` returns the outer thunk),
     // and we want to chase the chain until we land on a real value.
     while (true) {
+        if (__builtin_expect(s_dbg_chase, 0)) {
+            ringTag[ringIdx % kRingSize] = v.tag();
+            void * p = nullptr;
+            if (v.tag() == Tag::Thunk) p = v.payload.thunk;
+            else if (v.tag() == Tag::Slot) p = v.payload.slot;
+            else if (v.tag() == Tag::App) p = v.payload.pair;
+            ringPtr[ringIdx % kRingSize] = p;
+            ringIdx++;
+        }
         if (__builtin_expect(++chaseIters > kMaxChaseIters, 0)) {
-            // V3_DBG_CHASE: dump the last few values we visited to
-            // localize Slot/Thunk cycles.  Only fires on the
-            // pathological cycle path; cheap because rarely entered.
-            static const bool s_dbg = std::getenv("V3_DBG_CHASE") != nullptr;
-            if (s_dbg) {
+            if (s_dbg_chase) {
                 std::fprintf(stderr,
-                    "v3 chase-cycle: last v.tag=%d payload.thunk=%p"
-                    " payload.slot=%p memoSlot=%p\n",
-                    (int)v.tag(),
-                    v.tag() == Tag::Thunk ? (void*)v.payload.thunk : nullptr,
-                    v.tag() == Tag::Slot ? (void*)v.payload.slot : nullptr,
-                    (void*)memoSlot);
-                if (v.tag() == Tag::Thunk && v.payload.thunk
-                    && v.payload.thunk->state == ThunkState::Evaluated) {
-                    Value e = v.payload.thunk->evaluated;
+                    "v3 chase-cycle limit %d hit; last %d steps:\n",
+                    kMaxChaseIters, kRingSize);
+                int start = ringIdx > kRingSize ? ringIdx - kRingSize : 0;
+                for (int i = start; i < ringIdx; ++i) {
+                    int slot = i % kRingSize;
                     std::fprintf(stderr,
-                        "  thunk evaluated tag=%d slot=%p thunk=%p\n",
-                        (int)e.tag(),
-                        e.tag() == Tag::Slot ? (void*)e.payload.slot : nullptr,
-                        e.tag() == Tag::Thunk ? (void*)e.payload.thunk : nullptr);
+                        "  step[%d]: tag=%d ptr=%p", i,
+                        (int)ringTag[slot], ringPtr[slot]);
+                    // For Thunks, additionally show their state +
+                    // evaluated tag so we can see "Evaluated → Thunk →
+                    // Evaluated → ...".
+                    if (ringTag[slot] == Tag::Thunk && ringPtr[slot]) {
+                        auto * t = static_cast<Thunk *>(ringPtr[slot]);
+                        std::fprintf(stderr, " state=%d", (int)t->state);
+                        if (t->state == ThunkState::Evaluated)
+                            std::fprintf(stderr, " evaluated.tag=%d",
+                                (int)t->evaluated.tag());
+                    }
+                    std::fprintf(stderr, "\n");
                 }
             }
             throw std::runtime_error(
@@ -4040,6 +4109,29 @@ Value forceValue(VMState & vm, Value v)
             v = forceBridgeThunk(t);
             t->state = ThunkState::Evaluated;
             t->evaluated = v;
+            // #456 fix: treat a TW-Function-bridged Thunk as WHNF.
+            // forceBridgeThunk -> treeWalkerToV3 wraps an nFunction
+            // TW Value as ANOTHER Bridge thunk (Tag::Thunk in Bridge
+            // state) for round-trip identity preservation
+            // (primops.cc treeWalkerToV3 nFunction case).  Without
+            // this break, the chase loop forces the new Bridge,
+            // forceBridgeThunk allocates ANOTHER Bridge for the
+            // same TW Value, set t->evaluated = newer Bridge, repeat
+            // ad infinitum.  Each iteration allocates a fresh Thunk
+            // pointer; the chain extends forever; kMaxChaseIters
+            // limit fires.  V3_DBG_CHASE confirms the pattern: every
+            // step is a Thunk in state=Evaluated whose evaluated.tag
+            // is Thunk again, ending at the freshly-allocated state=
+            // Bridge thunk (the next round's seed).
+            //
+            // The Bridge-thunk-wrapping-Function IS canonical WHNF
+            // from v3's perspective: there's nothing to reduce.  The
+            // consumer (TW caller via v3ToTreeWalker) will unwrap
+            // the Bridge to recover the original TW lambda for a
+            // call.  Break out so this Bridge thunk IS the result.
+            if (v.tag() == Tag::Thunk && v.payload.thunk
+                && v.payload.thunk->state == ThunkState::Bridge)
+                break;
             continue;
         }
 
