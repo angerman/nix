@@ -1473,6 +1473,27 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
 {
     auto & st = v3HookStats();
     st.evalEntries++;
+
+    // #466 active-v3-vm pre-refusal at the eval-hook.
+    //
+    // Same shape as v3CallFunctionEntry's check: when we're being
+    // re-entered from inside an outer v3 vm (set by OP_CALL Bridge or
+    // forceBridgeThunk in vm.cc), running this Expr would create a
+    // FRESH VMState whose body could force v3 thunks Black on the
+    // outer vm's frames — the cross-VMState BlackHole cycle (#466).
+    // Refuse so TW handles via native eval; the outer vm completes
+    // normally without ever spawning the nested run().
+    //
+    // Default-on; disable via NIX_V3_NO_ACTIVE_V3_VM_REFUSE=1.
+    {
+        static const bool s_refuseInActiveV3 =
+            std::getenv("NIX_V3_NO_ACTIVE_V3_VM_REFUSE") == nullptr;
+        if (s_refuseInActiveV3 && activeV3VM() != nullptr) {
+            // Fall back to TW eval.
+            e->eval(state, state.baseEnv, v);
+            return;
+        }
+    }
     // Register a stats-dump atexit handler on first entry.  As of
     // #453 Phase D the primOpCounter mutex is heap-allocated and
     // leaked (see primops.cc), so dumpPrimOpStats is also safe to
