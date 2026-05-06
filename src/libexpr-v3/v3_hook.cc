@@ -3274,6 +3274,48 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
             }
         }
     }
+
+    // #466 rec-attrset capture refusal under lambda-skip.
+    //
+    // When the lambda body's freeVars include rec-attrset captures
+    // (Kind::RecBuild or Kind::RecBuildSlot), running the body in v3
+    // creates a fresh VMState that nests inside the outer v3 vm's
+    // bridge-out call.  If the body's force chain reaches a v3 thunk
+    // that's Black on the outer vm's frames, the cross-VMState BlackHole
+    // detection fires; primV3ForceAttr's fallbackToTreeWalker re-runs
+    // via TW, which re-triggers v3 hooks, creating an unbounded chain
+    // of fresh VMStates each forcing the same Black thunk.  The
+    // existing (handle, sid) and (vm, thunk) cycle detectors all miss
+    // this because each layer has different (handle, sid) pairs and
+    // each fresh vm has its own counter space.
+    //
+    // For these specific lambdas, refuse the call-hook so TW handles
+    // via native callFunction -- TW's mkBlackHole + ExprBlackHole
+    // produces a stable cycle-detection result that consumers (tryEval,
+    // strict-context evaluators) can pattern-match.  v3 stays out of
+    // the recursive force chain entirely.
+    //
+    // Default-on; disable via NIX_V3_NO_REFUSE_REC_CAPTURE_LAMBDA=1
+    // (e.g., to bisect whether a regression is from this refusal vs.
+    // some other change in the same session).  Net effect on lambda-
+    // skip workloads: lambda-skip still owns NON-recursive lambdas
+    // (the bulk on most workloads); rec-attrset-capturing lambdas
+    // route to TW.
+    {
+        static const bool s_refuseRecCapture =
+            std::getenv("NIX_V3_NO_REFUSE_REC_CAPTURE_LAMBDA") == nullptr;
+        if (s_refuseRecCapture) {
+            for (const auto & src : ent.upvalueSources) {
+                if (src.kind == UpvalueSource::Kind::RecBuild
+                    || src.kind == UpvalueSource::Kind::RecBuildSlot)
+                {
+                    st.callHookGated++;
+                    st.callHookGateNotIsLambdaEnt++;
+                    return false;
+                }
+            }
+        }
+    }
     // #455 diag: NIX_V3_ON_DEMAND_ROOT_NEVER_RUN=1 makes the call
     // hook refuse to run *any* lambda that's in v3LambdaRoot --
     // tracking whether the bug is in v3 lambda execution at all,
