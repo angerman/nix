@@ -6320,6 +6320,30 @@ nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v)
 //
 // Returns false on any mismatch so the caller can fall through to
 // TW's regular primop dispatch.
+bool tryUnwrapBridge1Closure(const nix::Value & funTw, Value & outV3Fn)
+{
+    // Already-forced funTw must be PrimOpApp(bridge1, vHandle) shape.
+    if (!funTw.isPrimOpApp()) return false;
+    const nix::Value * cur = &funTw;
+    int depth = 0;
+    while (cur->isPrimOpApp()) {
+        cur = cur->primOpApp().left;
+        ++depth;
+    }
+    if (!cur->isPrimOp()) return false;
+    const nix::PrimOp * po = cur->primOp();
+    if (!po || po->name != "__v3_call_bridge_1") return false;
+    if (depth != 1) return false;
+    const nix::Value * vHandle = funTw.primOpApp().right;
+    if (!vHandle) return false;
+    if (vHandle->type<true>() != nix::nInt) return false;
+    int64_t h = vHandle->integer().value;
+    auto & tbl = v3BridgeClosures();
+    if (h < 0 || (size_t)h >= tbl.size()) return false;
+    outV3Fn = tbl[(size_t)h].v3Value;
+    return true;
+}
+
 bool tryDispatchBridge1Direct(nix::EvalState & ns,
                               const nix::Value & funValue,
                               nix::Value * arg,

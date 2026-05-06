@@ -1400,6 +1400,36 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 auto * ns = getNixEvalState();
                 auto * funTw = static_cast<nix::Value *>(
                     fun.payload.thunk->bridgeSrc);
+                ns->forceValue(*funTw, nix::noPos);
+
+                // #466 OP_CALL Bridge round-trip elimination.
+                //
+                // After forcing funTw, check if it's actually a v3
+                // closure that was bridged TO TW via v3ToTreeWalker —
+                // shape `mkPrimOpApp(__v3_call_bridge_1, vHandle)`.
+                // If so, dispatch directly via callClosure on THIS
+                // vm, skipping ns->callFunction entirely.
+                //
+                // Why this matters: the previous path created a fresh
+                // VMState (via ns->callFunction → v3 hook → bridge1
+                // shortcut → fresh VMState).  When the OUTER thunk's
+                // body was Black-marked on this vm's frames, the
+                // fresh VMState's force on that thunk saw Black and
+                // threw — the cross-VMState force scenario at the
+                // root of the lambda-skip cycle (#466 memory).
+                // Staying on this vm preserves the Black ancestry so
+                // the cycle is detected locally and unwinds cleanly.
+                Value v3Fn;
+                static const bool s_disabled =
+                    std::getenv("NIX_V3_NO_OP_CALL_BRIDGE_SHORTCUT") != nullptr;
+                if (!s_disabled && tryUnwrapBridge1Closure(*funTw, v3Fn)) {
+                    // Local v3 dispatch on this vm.  No TW round-trip,
+                    // no fresh VMState.
+                    Value out = callClosure(vm, v3Fn, arg);
+                    push(vm, out);
+                    break;
+                }
+
                 // Bridge arg back to TW.  v3->TW preserves identity
                 // for Bridge thunks (unwraps to original) and converts
                 // scalars / composites otherwise.
@@ -1407,7 +1437,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 if (!argTw)
                     throw std::runtime_error(
                         "v3 OP_CALL: bridge-thunk arg failed v3->TW bridge");
-                ns->forceValue(*funTw, nix::noPos);
                 nix::Value outTw;
                 ns->callFunction(*funTw, *argTw, outTw, nix::noPos);
                 Value v3out = treeWalkerToV3Public(*ns, outTw);

@@ -103,6 +103,21 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
                               nix::Value & out,
                               const nix::PosIdx pos);
 
+/// #466 OP_CALL Bridge round-trip elimination.
+///
+/// If `funTw` is a forced TW Value of the shape
+/// `mkPrimOpApp(__v3_call_bridge_1, vHandle)` — i.e., a v3 closure
+/// that was bridged TO TW via v3ToTreeWalker — return the original v3
+/// closure Value.  Returns an unset Value (tag=Uninitialized) for any
+/// other shape.
+///
+/// Lets the OP_CALL Bridge handler skip the ns->callFunction round-
+/// trip and dispatch the v3 closure directly via callClosure on the
+/// caller's VMState — eliminating the cross-VMState force scenario
+/// that motivates the lambda-skip cycle (#466).  Caller must have
+/// forced `funTw` first; this function performs no forcing.
+bool tryUnwrapBridge1Closure(const nix::Value & funTw, Value & outV3Fn);
+
 /// REVIEW MED-14: drop every entry from v3BridgeAttrs / v3BridgeLists /
 /// v3BridgeClosures.  These tables grow unboundedly with the number of
 /// lazy-bridged attrsets / lists / closures bridged across to tree-
