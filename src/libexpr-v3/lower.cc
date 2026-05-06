@@ -226,6 +226,24 @@ struct Lowerer
             rvo.level  = level;
             rvo.names  = sharedNames->second;
             m.recVarOrigins.push_back(std::move(rvo));
+            // #458 Phase B RecBuildSlot — also record an origin keyed
+            // by recSlotVar (parallel to the recVar origin above) so
+            // Phase B's recOriginLookup can find the (level, names)
+            // shape via either VarId.  Same reasoning as the recVar
+            // origin: the lowerer needs to tell Phase B "this freeVar
+            // resolves to the rec-attrset whose entries are at TW env
+            // depth `level` with these names".  Whether the freeVar
+            // is recVar (legacy capture) or recSlotVar (slot capture)
+            // changes only the upvalue's Tag at materialisation time,
+            // not the env walk itself.
+            if (scopes[scopeIdx].recSlotVar != ir::kInvalid) {
+                ir::RecVarOrigin slotOrigin;
+                slotOrigin.func   = f;
+                slotOrigin.recVar = scopes[scopeIdx].recSlotVar;
+                slotOrigin.level  = level;
+                slotOrigin.names  = sharedNames->second;
+                m.recVarOrigins.push_back(std::move(slotOrigin));
+            }
             // WC-31: defer the AttrSelect by wrapping in a thunk.
             // Direct `AttrSelect{rec, nm}` runs at MAKE_CLOSURE time
             // and captures whatever's in the slot AT THAT MOMENT —
@@ -1433,6 +1451,13 @@ struct Lowerer
         ir::VarId recSlotVar = m.freshVar();
         recScope.recSlotVar = recSlotVar;
         m.recVarToSlotVar.emplace(recVar, recSlotVar);
+        // #458 Phase B RecBuildSlot — register recSlotVar so v3_hook.cc
+        // can detect its appearance as a freeVar of a sub-thunk and
+        // emit a `Kind::RecBuildSlot` UpvalueSource that materialises
+        // Tag::Slot from a TW env walk.  Without this set, lambda-
+        // body freeVars referencing recSlotVar fall through Phase B's
+        // varOrigins lookup with no match -> v3 refuses Phase B.
+        m.recSlotVarIds.push_back(recSlotVar);
         recScope.recAttrsNames.reserve(pending.size());
         for (auto & p : pending) {
             recScope.recAttrsNames.push_back(internSym(p.sym));

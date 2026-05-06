@@ -467,6 +467,16 @@ struct Module {
     /// Empty under the legacy lowering path.
     std::unordered_map<VarId, VarId> recVarToSlotVar;
 
+    /// #458 Phase B RecBuildSlot — VarIds the lowerer allocated as
+    /// recSlotVar (Tag::Slot pointing at heap-stable rec-attrset
+    /// storage).  Companion to `recVarIds`.  Phase B's UpvalueSource
+    /// populator detects freeVars in this set and emits a
+    /// `Kind::RecBuildSlot` source — same env walk as RecBuild but
+    /// the result is wrapped as Tag::Slot pointing at a freshly-
+    /// allocated heap Value (so the lambda body's slot-capture refs
+    /// work uniformly across both lower-emit and call-hook paths).
+    std::vector<VarId> recSlotVarIds;
+
     /// #425: VarIds the lowerer bound to `LitBuiltins` (the singleton
     /// `builtins` attrset).  When a sub-Expr captures one of these as
     /// a freeVar, the populate path generates a special UpvalueSource

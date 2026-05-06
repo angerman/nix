@@ -388,12 +388,22 @@ static void v3RegisterExprEntry(nix::EvalState & state,
 ///     freeVar to ir::LitBuiltins, which has no tree-walker shape;
 ///     the singleton is process-wide constant.
 struct UpvalueSource {
-    enum class Kind : uint8_t { Direct, RecBuild, LitBuiltins };
+    /// #458 Phase B RecBuildSlot — added Kind::RecBuildSlot.  Same env
+    /// walk + Bindings build as RecBuild, but the resulting Tag::Attrs
+    /// is wrapped in a heap-allocated Value* (Alloc::allocValue) and
+    /// the upvalue pushed is Tag::Slot pointing at it.  This makes
+    /// the call-hook materialisation match the lower-emit slot-capture
+    /// convention (steps 1-5/6): inner closures capturing rec-attrset
+    /// references see Tag::Slot uniformly across both code paths,
+    /// closing the BlackholeError that fires under lambda-skip when
+    /// Phase B's RecBuild produces Tag::Attrs but the lambda body
+    /// expects Tag::Slot.
+    enum class Kind : uint8_t { Direct, RecBuild, LitBuiltins, RecBuildSlot };
     Kind                  kind  = Kind::Direct;
     uint32_t              level = 0;
     uint32_t              displ = 0;        // valid when kind=Direct
     /// Shared with the originating ir::RecVarOrigin; O(1) copy.
-    /// Valid when kind == RecBuild (otherwise null).
+    /// Valid when kind == RecBuild OR Kind::RecBuildSlot (else null).
     std::shared_ptr<const std::vector<SymbolId>> names;
 };
 
@@ -856,6 +866,12 @@ static void populateSubExprCacheLocal(
     }
     std::unordered_set<ir::VarId> recVarSet(
         module.recVarIds.begin(), module.recVarIds.end());
+    // #458 Phase B RecBuildSlot: parallel set of recSlotVar VarIds.
+    // Lambda body freeVars referring to a let-rec's recSlotVar
+    // (Tag::Slot capture from the slot-capture redesign, default-on)
+    // get a Kind::RecBuildSlot UpvalueSource at materialise time.
+    std::unordered_set<ir::VarId> recSlotVarSet(
+        module.recSlotVarIds.begin(), module.recSlotVarIds.end());
     // #425: VarIds bound to ir::LitBuiltins -- inner functions
     // capturing one as freeVar get a LitBuiltins UpvalueSource.
     std::unordered_set<ir::VarId> litBuiltinsSet(
@@ -890,6 +906,35 @@ static void populateSubExprCacheLocal(
                     src.kind  = UpvalueSource::Kind::RecBuild;
                     src.level = rit->second->level;
                     src.names = rit->second->names;  // shared_ptr<vector<SymbolId>>; O(1) copy.
+                    entry.upvalueSources.push_back(std::move(src));
+                    continue;
+                }
+                // #458 Phase B RecBuildSlot — same shape lookup as
+                // RecBuild but emits Kind::RecBuildSlot so the
+                // materialiser wraps the Bindings in a heap Value*
+                // and pushes Tag::Slot.  Parallel origin entry was
+                // recorded by lower.cc resolveVar (the slot-capture
+                // path emits a duplicate RecVarOrigin keyed by
+                // recSlotVar).  Fall-through to "synthetic-no-origin"
+                // refusal if the lowerer didn't record a parallel
+                // origin (defensive — shouldn't happen on the slot-
+                // capture path, but keeps Phase B robust to legacy
+                // capture transitions).
+                if (recSlotVarSet.count(fv)) {
+                    auto rit = recOriginLookup.find(key);
+                    if (rit == recOriginLookup.end()) {
+                        if (diagOrigins) std::fprintf(stderr,
+                            "v3 origins: func=%u skip — fv=%u in recSlotVarSet "
+                            "but no recVarOrigins entry\n",
+                            sef.funcIdx, fv);
+                        failClass = "recSlot-no-origin";
+                        failedVar = fv;
+                        ok = false; break;
+                    }
+                    UpvalueSource src;
+                    src.kind  = UpvalueSource::Kind::RecBuildSlot;
+                    src.level = rit->second->level;
+                    src.names = rit->second->names;
                     entry.upvalueSources.push_back(std::move(src));
                     continue;
                 }
@@ -2383,7 +2428,25 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                     Value v;
                     v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
                     v.payload.bindings = b;
-                    upvalues.push_back(v);
+                    if (src.kind == UpvalueSource::Kind::RecBuildSlot) {
+                        // #458 Phase B RecBuildSlot — wrap the freshly-
+                        // built Bindings (held as Tag::Attrs in `v`) in
+                        // a heap-allocated Value* so the closure
+                        // captures Tag::Slot instead of Tag::Attrs.
+                        // Mirrors the lower-emit slot-capture path
+                        // (OP_REC_SLOT_PUBLISH at let-rec entry):
+                        // forcing the captured Tag::Slot derefs to
+                        // the Bindings, sidestepping any wrap-thunk
+                        // BlackholeError on cross-VMState rec-attrset
+                        // accesses.
+                        Value * heapSlot = Alloc::allocValue();
+                        *heapSlot = v;
+                        Value slotRef;
+                        slotRef.mkSlot(heapSlot);
+                        upvalues.push_back(slotRef);
+                    } else {
+                        upvalues.push_back(v);
+                    }
                 }
             }
         } catch (const std::exception &) {
@@ -3056,21 +3119,22 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
             std::getenv("V3_DBG_ON_DEMAND_ROOT") != nullptr;
         if (diagOnDemand) {
             const auto & e2 = sit->second;
-            uint32_t direct = 0, recBuild = 0, litBuiltins = 0;
+            uint32_t direct = 0, recBuild = 0, recBuildSlot = 0, litBuiltins = 0;
             for (auto & u : e2.upvalueSources) {
                 switch (u.kind) {
-                case UpvalueSource::Kind::Direct:      ++direct; break;
-                case UpvalueSource::Kind::RecBuild:    ++recBuild; break;
-                case UpvalueSource::Kind::LitBuiltins: ++litBuiltins; break;
+                case UpvalueSource::Kind::Direct:        ++direct; break;
+                case UpvalueSource::Kind::RecBuild:      ++recBuild; break;
+                case UpvalueSource::Kind::RecBuildSlot:  ++recBuildSlot; break;
+                case UpvalueSource::Kind::LitBuiltins:   ++litBuiltins; break;
                 }
             }
             std::fprintf(stderr,
                 "v3 on-demand-root: lambda=%p funcIdx=%u nUpvalues=%u "
-                "direct=%u recBuild=%u litBuiltins=%u "
+                "direct=%u recBuild=%u recBuildSlot=%u litBuiltins=%u "
                 "outerWithLevels=%zu callReturnsClosure=%d\n",
                 (const void *)lambda,
                 (unsigned)e2.funcIdx, (unsigned)e2.nUpvalues,
-                direct, recBuild, litBuiltins,
+                direct, recBuild, recBuildSlot, litBuiltins,
                 e2.outerWithLevels.size(),
                 (int)e2.callReturnsClosure);
         }
