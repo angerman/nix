@@ -2924,10 +2924,40 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // --- With ---
         case OP_WITH_PUSH: vm.withStack.push_back(pop(vm)); break;
         case OP_WITH_POP:  vm.withStack.pop_back(); break;
-        // OP_LOAD_SLOT_REF removed (Phase-13 review): Phase-3
-        // scaffolding superseded by RecBindingSlotRef + forceValue's
-        // Tag::Slot deref.  Bytecode value 0x83 reserved; default
-        // panic catches any stray emission.
+        case OP_REC_SLOT_PUBLISH: {
+            // #458 step 1/6 — heap-stable rec-attrset slot publish.
+            //
+            // Peek the rec-attrset Tag::Attrs at top of stack (built
+            // by the OP_ATTRS_REC_INIT immediately preceding), allocate
+            // a fresh GC-managed Value*, copy the Tag::Attrs INTO that
+            // slot, and push a Tag::Slot pointing at it ON TOP.  The
+            // slot is heap-stable for the lifetime of any closure
+            // capturing the Tag::Slot via its freeVars vector (Boehm
+            // GC handles reachability automatically).
+            //
+            // Why peek-and-copy instead of move: the rec-attrset Value
+            // payload is a Bindings* — copying the Value is cheap and
+            // the Bindings is already heap-allocated, so OP_ATTRS_REC_SET
+            // mutations to its entries[] are visible through both the
+            // original Tag::Attrs (still on the stack, used by the rest
+            // of the LetRec emit) and the slot's Tag::Attrs (captured
+            // by inner closures).
+            if (vm.valueStack.empty()) {
+                throw std::runtime_error(
+                    "v3 OP_REC_SLOT_PUBLISH: empty operand stack");
+            }
+            const Value & top = vm.valueStack.back();
+            if (!top.isAttrs()) {
+                throw std::runtime_error(
+                    "v3 OP_REC_SLOT_PUBLISH: top of stack is not Tag::Attrs");
+            }
+            Value * heapSlot = Alloc::allocValue();
+            *heapSlot = top;
+            Value slotRef;
+            slotRef.mkSlot(heapSlot);
+            push(vm, slotRef);
+            break;
+        }
         case OP_REC_BINDING_SLOT_REF: {
             // Pop a Tag::Attrs (forced earlier), look up the entry by
             // SymbolId in operand, push a Tag::Slot Value pointing at

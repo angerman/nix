@@ -64,6 +64,7 @@ static const char * opName(Op op)
     case OP_ATTRS_HAS_DYN:     return "OP_ATTRS_HAS_DYN";
     case OP_ATTRS_UPDATE:      return "OP_ATTRS_UPDATE";
     case OP_REC_BINDING_SLOT_REF: return "OP_REC_BINDING_SLOT_REF";
+    case OP_REC_SLOT_PUBLISH:  return "OP_REC_SLOT_PUBLISH";
     case OP_APPLY_OVERRIDES:   return "OP_APPLY_OVERRIDES";
     case OP_WITH_PUSH:         return "OP_WITH_PUSH";
     case OP_WITH_POP:          return "OP_WITH_POP";

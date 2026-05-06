@@ -541,6 +541,33 @@ struct Emitter
             unit.code.push_back(e.entries[sortedOrder[slot]].pos);
         }
 
+        // 1.5  #458 step 1/6 — heap-stable rec-slot publish.
+        //
+        // If the lowerer registered a `recSlotVar` for this LetRec
+        // (`Module::recVarToSlotVar`), allocate a heap-stable Value*
+        // slot and publish the just-built rec Bindings into it.
+        // Stack transition pre/post:
+        //
+        //     pre:  [..., Tag::Attrs]
+        //     OP_REC_SLOT_PUBLISH
+        //     post: [..., Tag::Attrs, Tag::Slot]
+        //     OP_SET_LOCAL recSlotLocal
+        //     post: [..., Tag::Attrs]
+        //
+        // The Tag::Slot in the local outlives the let-rec frame as
+        // long as any closure referencing it stays reachable (Boehm
+        // GC tracks the slot through the closure's freeVars vector).
+        //
+        // No-op for callers that haven't enabled the slot path:
+        // recVarToSlotVar is empty, getOrAssignSlot is never called.
+        if (auto sit = m.recVarToSlotVar.find(e.recVar);
+            sit != m.recVarToSlotVar.end())
+        {
+            uint16_t recSlotLocal = getOrAssignSlot(sit->second);
+            unit.code.push_back(encode(OP_REC_SLOT_PUBLISH));
+            unit.code.push_back(encode(OP_SET_LOCAL, recSlotLocal));
+        }
+
         // 2. Spill the rec_attrs (currently on top of the operand
         //    stack) into a frame slot so each entry's thunk-body
         //    upvalue list can reference it via plain emitVarRef.  We

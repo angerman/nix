@@ -72,6 +72,23 @@ struct Scope
 
     ir::VarId recAttrsVar = ir::kInvalid;
     std::vector<ir::SymbolId> recAttrsNames;
+
+    /// #458 step 1/6 — heap-stable rec-attrset slot capture.
+    ///
+    /// Parallel VarId allocated per let-rec scope holding a Tag::Slot
+    /// pointing at heap-stable storage that contains the rec-attrset
+    /// Tag::Attrs (allocated by the OP_REC_SLOT_PUBLISH the LetRec
+    /// emitter inserts).  Inner closures crossing a function boundary
+    /// to reach this scope's `recAttrsVar` capture `recSlotVar` instead
+    /// of `recAttrsVar` so they observe the rec-attrset through a
+    /// stable slot deref rather than via the wrap thunk's evaluated
+    /// state.  Closes the BlackholeError that today fires when an
+    /// inner thunk tries to force the wrap thunk while it is mid-
+    /// construction across a different VMState.
+    ///
+    /// `kInvalid` when the let-rec emit path doesn't synthesise the
+    /// slot (e.g., test-only builds compiled before the slot path).
+    ir::VarId recSlotVar = ir::kInvalid;
 };
 
 struct Lowerer
@@ -1360,6 +1377,20 @@ struct Lowerer
 
         Scope recScope;
         recScope.recAttrsVar = recVar;
+        // #458 step 1/6: allocate a parallel VarId that will hold a
+        // Tag::Slot pointing at heap-stable storage for the rec-
+        // attrset Bindings.  Registered into Module::recVarToSlotVar
+        // so the LetRec emitter can detect it and emit
+        // OP_REC_SLOT_PUBLISH + OP_SET_LOCAL recSlotVar after
+        // OP_ATTRS_REC_INIT.  Future increments (resolveVar) will
+        // route inner-closure freeVars through recSlotVar instead of
+        // recAttrsVar.  In this initial increment, recSlotVar is
+        // ALLOCATED but only USED by the emitter (no resolveVar
+        // change yet), so behaviour is unchanged but the runtime
+        // infrastructure is exercised.
+        ir::VarId recSlotVar = m.freshVar();
+        recScope.recSlotVar = recSlotVar;
+        m.recVarToSlotVar.emplace(recVar, recSlotVar);
         recScope.recAttrsNames.reserve(pending.size());
         for (auto & p : pending) {
             recScope.recAttrsNames.push_back(internSym(p.sym));

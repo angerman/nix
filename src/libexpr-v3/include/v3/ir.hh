@@ -448,6 +448,25 @@ struct Module {
     /// freeVars intersect this set.
     std::vector<VarId> recVarIds;
 
+    /// #458 step 1/6 — heap-stable rec-attrset slot capture.
+    ///
+    /// Per let-rec scope, the lowerer allocates a parallel `recSlotVar`
+    /// alongside the regular `recVar`.  At runtime, `recSlotVar` holds a
+    /// Tag::Slot pointing at a heap-stable Value (allocated by
+    /// OP_REC_SLOT_PUBLISH) that contains the rec-attrset's Tag::Attrs.
+    /// The Bindings storage is the SAME storage as recVar's Tag::Attrs,
+    /// so OP_ATTRS_REC_SET writes are visible through both.
+    ///
+    /// Inner closures whose freeVars resolve to the rec-attrset capture
+    /// recSlotVar (Tag::Slot) instead of recVar (which today is the
+    /// wrap-thunk that triggers blackhole when forced mid-construction).
+    /// Forcing a Tag::Slot derefs to the (possibly partial) Tag::Attrs
+    /// without involving the wrap thunk's state machine.
+    ///
+    /// Map is keyed by recVar; each let-rec scope inserts one entry.
+    /// Empty under the legacy lowering path.
+    std::unordered_map<VarId, VarId> recVarToSlotVar;
+
     /// #425: VarIds the lowerer bound to `LitBuiltins` (the singleton
     /// `builtins` attrset).  When a sub-Expr captures one of these as
     /// a freeVar, the populate path generates a special UpvalueSource

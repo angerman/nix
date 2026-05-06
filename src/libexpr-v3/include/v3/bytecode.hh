@@ -144,13 +144,31 @@ enum Op : uint8_t
     OP_WITH_PUSH      = 0x80,  // pop attrset, push it on with-stack
     OP_WITH_POP       = 0x81,
     OP_WITH_LOOKUP    = 0x82,  // [sym:24]; data: depth (0=innermost)
+    /// #458 step 1/6 — heap-stable rec-attrset slot publish.
+    ///
+    /// Peeks the Tag::Attrs at top of operand stack (a freshly-built
+    /// rec-attrset Bindings allocated by OP_ATTRS_REC_INIT), allocates
+    /// a fresh heap-stable `Value*` slot via `Alloc::allocValue()`,
+    /// writes the peeked Tag::Attrs INTO that slot (so the slot now
+    /// holds a stable Tag::Attrs(Bindings*) referring to the same
+    /// Bindings that subsequent OP_ATTRS_REC_SET will populate), and
+    /// pushes a Tag::Slot Value pointing at *slot ON TOP of the
+    /// existing Tag::Attrs.  Stack transition:
+    ///
+    ///     [..., Tag::Attrs]  →  [..., Tag::Attrs, Tag::Slot]
+    ///
+    /// Inner closures captured under this let-rec scope may capture
+    /// the Tag::Slot as an upvalue (rather than the Tag::Attrs).
+    /// Forcing a Tag::Slot deref's to the Bindings, which evolves as
+    /// REC_SET writes happen — the slot is partial-bindings-safe.
+    ///
+    /// No operand; no extra data words.  The newly-allocated slot has
+    /// no compile-time reference; closures capturing it keep it alive
+    /// via Boehm GC reachability through their freeVars vector.
+    OP_REC_SLOT_PUBLISH = 0x83,
+
     /// SECD DUM/RAP: push a Tag::Slot Value onto the operand stack
     /// pointing at the local slot referenced by [slot:24].  Used when
-    // 0x83 was OP_LOAD_SLOT_REF — Phase-3 scaffolding for a planned
-    // `with E;`-on-let-rec-slot path that the WC-31/Phase-5 redesign
-    // (RecBindingSlotRef + Tag::Slot deref in forceValue) made
-    // unnecessary.  Never emitted by the compiler in the landed
-    // pipeline; removed in the review-cleanup pass.
 
     /// SECD-style heap-stable slot reference: pop a Tag::Attrs (a
     /// rec-attrset's Bindings*), look up the entry by SymbolId, and
