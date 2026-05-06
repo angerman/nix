@@ -1204,6 +1204,88 @@ static int testSerializeRoundTrip()
     return 0;
 }
 
+/// REVIEW B6 — strictness pass positive test.  Build IR with
+/// `Force{LitInt{42}}`; running elimRedundantForce should rewrite
+/// the Force as a VarRef alias (LitInt is in the WHNF whitelist) and
+/// return rewritten >= 1.
+static int testStrictnessRewritesForceOverLit()
+{
+    auto m = ir::makeModule();
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+    auto litVar = addBinding(m, topEntry, ir::LitInt{42});
+    auto forceVar = addBinding(m, topEntry, ir::Force{litVar, /*srcLine*/ 0});
+    setReturn(m, topEntry, forceVar);
+
+    size_t rewritten = ir::elimRedundantForce(m);
+    if (rewritten == 0) {
+        std::fprintf(stderr,
+            "testStrictnessRewritesForceOverLit: expected at least 1 rewrite, got %zu\n",
+            rewritten);
+        return 1;
+    }
+    // After rewrite, the Force binding's expr should be a VarRef.
+    bool isVarRef = false;
+    for (auto & bd : m.blocks[topEntry].bindings) {
+        if (bd.var == forceVar) {
+            isVarRef = std::holds_alternative<ir::VarRef>(bd.expr);
+            break;
+        }
+    }
+    if (!isVarRef) {
+        std::fprintf(stderr,
+            "testStrictnessRewritesForceOverLit: Force binding wasn't rewritten to VarRef\n");
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testStrictnessRewritesForceOverLit: OK (%zu Force(s) rewritten)\n",
+        rewritten);
+    return 0;
+}
+
+/// REVIEW B6 — strictness pass negative test.  Build IR with
+/// `Force{App{f, x}}`; running elimRedundantForce must NOT rewrite
+/// (App can return a thunk-shaped value when over-applied).
+static int testStrictnessSkipsForceOverApp()
+{
+    auto m = ir::makeModule();
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+    // Build a synthetic `f x` App.  Use freshly-allocated VarIds for
+    // both fun and arg — they don't need to resolve to anything for
+    // the strictness pass to inspect; the pass only checks the
+    // outer Force's source kind.
+    auto fVar = m.freshVar();
+    auto xVar = m.freshVar();
+    auto appVar = addBinding(m, topEntry, ir::App{fVar, xVar});
+    auto forceVar = addBinding(m, topEntry, ir::Force{appVar, /*srcLine*/ 0});
+    setReturn(m, topEntry, forceVar);
+
+    size_t rewritten = ir::elimRedundantForce(m);
+    if (rewritten != 0) {
+        std::fprintf(stderr,
+            "testStrictnessSkipsForceOverApp: expected 0 rewrites, got %zu\n",
+            rewritten);
+        return 1;
+    }
+    // Force binding's expr should still be a Force.
+    bool isStillForce = false;
+    for (auto & bd : m.blocks[topEntry].bindings) {
+        if (bd.var == forceVar) {
+            isStillForce = std::holds_alternative<ir::Force>(bd.expr);
+            break;
+        }
+    }
+    if (!isStillForce) {
+        std::fprintf(stderr,
+            "testStrictnessSkipsForceOverApp: Force binding was unexpectedly rewritten\n");
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testStrictnessSkipsForceOverApp: OK (Force over App preserved)\n");
+    return 0;
+}
+
 /// REVIEW B8: corrupted-blob fallback test.  Verifies that
 /// deserializeCU throws SerializationError on the three documented
 /// corruption modes: bad magic, schema mismatch, opcode-table
@@ -1325,6 +1407,8 @@ int main()
     rc |= testPrimOpLength();
     rc |= testPrimOpHeadTail();
     rc |= testFibonacciSelfApp();
+    rc |= testStrictnessRewritesForceOverLit();
+    rc |= testStrictnessSkipsForceOverApp();
     rc |= testSerializeRoundTrip();
     rc |= testSerializeWithRecAttrset();
     rc |= testDiskCacheRoundTrip();
