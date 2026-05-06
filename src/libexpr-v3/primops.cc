@@ -3354,7 +3354,20 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // lazy list/attr bridge, that re-evaluates the source Expr
         // via tree-walker, giving tree-walker the original ExprLambda
         // to dispatch through its native formal-dispatch.
-        if (v.tag() == Tag::Closure
+        // #458 step 7: formals-closure refusal stays default-on as
+        // the safety net.  Slot-capture + RecBuildSlot fix the original
+        // fix-point Black scenario, but lifting the refusal lets some
+        // cardano-node-class workloads progress further into a deeper
+        // TW infinite-recursion.  Net effect on passing tests is
+        // neutral (lang + cutover-parity + chase + smoke unchanged
+        // with refusal off).  Keep the lift opt-OUT via
+        // NIX_V3_NO_REFUSE_FORMALS_BRIDGE=1 for users probing
+        // workloads where the refusal is the load-bearing block, not
+        // the deeper recursion.
+        static const bool s_refuseFormals =
+            std::getenv("NIX_V3_NO_REFUSE_FORMALS_BRIDGE") == nullptr;
+        if (s_refuseFormals
+            && v.tag() == Tag::Closure
             && v.payload.closure
             && v.payload.closure->desc
             && v.payload.closure->desc->hasFormals)
@@ -3367,10 +3380,6 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 v.payload.closure->desc->name.c_str(),
                 (unsigned)v.payload.closure->desc->arity,
                 v.payload.closure->desc->formals.size());
-            // REVIEW_2026-05-04 F1 follow-up + F4: throw the typed
-            // `BlackholeError` (errors.hh).  Used to be `runtime_error`
-            // with the magic substring "(blackhole)" load-bearing for
-            // the fallback predicates -- now driven by exception type.
             throw BlackholeError(
                 "v3 v3ToTreeWalker: <formals> closure cannot bridge "
                 "as primOpApp -- forcing tree-walker fallback");
