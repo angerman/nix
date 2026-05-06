@@ -3321,6 +3321,25 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         return orig;
     }
     v = forceValue(*state.vm, v);
+    // #483: forceValue may RETURN a Bridge thunk in WHNF (per the #456
+    // fix at vm.cc:4549+: when forceBridgeThunk's result is itself a
+    // Bridge thunk wrapping a TW function/list, the chase loop breaks
+    // out instead of allocating another Bridge wrapper indefinitely).
+    // The pre-force short-circuit above doesn't fire in this case;
+    // without re-checking here, the switch below falls through Tag::Thunk
+    // to the default branch and returns mkNull -- silently losing the
+    // wrapped TW value.  Symptom: under lambda-skip, accessing a
+    // bridged-back TW function inside dfold-style iteration produces
+    // an empty list `[ ]` where TW would call the function, surfacing
+    // as "attempt to call something which is not a function but a list".
+    // Repeat the same short-circuit post-force.
+    if (v.tag() == Tag::Thunk && v.payload.thunk
+        && v.payload.thunk->state == ThunkState::Bridge
+        && v.payload.thunk->bridgeSrc) {
+        nix::Value * orig = static_cast<nix::Value *>(v.payload.thunk->bridgeSrc);
+        ns.forceValue(*orig, nix::noPos);
+        return orig;
+    }
     // Cycle protection: if we've already started converting this
     // ListVec / Bindings, return the in-progress nix::Value.  Required
     // for `let x = [x]; in x` or recursive attrsets the v3 result
