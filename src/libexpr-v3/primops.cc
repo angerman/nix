@@ -3788,6 +3788,22 @@ struct V3ToTreeWalkerShimInit {
 
 /// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
 /// thunks via tree-walker's evaluator before reading the type.
+///
+/// **CALLER INVARIANT (#484):** for nFunction / nExternal / nThunk inputs,
+/// this function captures `&nv` directly into the resulting Bridge thunk's
+/// `bridgeSrc` to preserve TW's STG-style in-place address identity (TW
+/// updates value cells in place during fix-point construction; a snapshot
+/// copy would freeze a pre-update view).  Therefore callers MUST pass an
+/// `nv` whose lifetime + address are stable for the lifetime of the
+/// resulting Bridge thunk:
+///   - GC-allocated via `ns.allocValue()` (preferred -- live-tracked by
+///     Boehm; outlives any caller frame).
+///   - A heap-allocated `nix::Value` the caller pins.
+///   - A TW `Env::values[]` slot whose Env outlives the Bridge thunk.
+/// **NOT** a stack-local `nix::Value`; bridgeSrc would dangle once the
+/// caller's frame returned (use-after-free).  See `vm.cc` OP_CALL Bridge
+/// handler + callClosure (both heap-allocate `outTw` accordingly) and
+/// `primDerivationStrict` / `primPath` for examples.
 static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
                             std::unordered_map<const void *, Value> & seen)
 {
