@@ -24,6 +24,7 @@
 #include "v3/alloc.hh"
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
+#include "v3/errors.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/nixexpr.hh"
@@ -431,9 +432,19 @@ struct SubExprCacheEntry {
     /// with concurrent retries) but the threshold gives transient
     /// throws (e.g. tryEval probes) up to 3 chances before sticking.
     uint8_t                 phaseBFailureCount = 0;
+    /// #480 / Phase 2 (Ennals-SPJ "Optimistic Evaluation" §6):
+    /// blackhole/cycle-class failures separately tracked.  Cycles are
+    /// DETERMINISTIC -- once an Expr's evaluation hits a BlackholeError
+    /// at this env shape, retrying is pure waste.  This counter
+    /// triggers permanent skip on the FIRST hit, bypassing the
+    /// 3-strike forgiveness applied to transient throws.  Saturates
+    /// at 255 like phaseBFailureCount.  Diagnosed via NIX_VM_STATS=1
+    /// (callHookBlackholeBlacklisted / forceHookBlackholeBlacklisted).
+    uint8_t                 blackholeFailureCount = 0;
     /// Convenience: returns true when the entry is over the failure
     /// limit and should be skipped.  Threshold tunable via
-    /// NIX_V3_PHASEB_FAIL_LIMIT (default 3).
+    /// NIX_V3_PHASEB_FAIL_LIMIT (default 1); blackholeFailureCount
+    /// always triggers on >= 1.
     bool isPhaseBSkipped() const noexcept;
 
     // -----------------------------------------------------------------
@@ -500,7 +511,11 @@ inline bool SubExprCacheEntry::isPhaseBSkipped() const noexcept
             return (uint8_t)std::min(255, std::max(1, std::atoi(v)));
         return uint8_t{1};
     }();
-    return phaseBFailureCount >= kFailLimit;
+    // #480 Phase 2: any blackhole-class failure permanently skips,
+    // regardless of kFailLimit.  Cycles are deterministic; retrying
+    // produces the same throw and costs C-stack growth.
+    return blackholeFailureCount >= 1
+        || phaseBFailureCount >= kFailLimit;
 }
 
 // Forward decl: defined below at line ~903; used by populateSubExprCacheLocal
@@ -1190,6 +1205,15 @@ struct V3HookStats {
     /// consumers expect a forced primitive.
     uint64_t callHookClosureResultRefused = 0;
 
+    /// #480 Phase 2: optimistic-eval rollback (Ennals & Peyton Jones,
+    /// ICFP '03 §6).  Bridge body throws separated by exception class
+    /// so cycles (BlackholeError) trigger immediate permanent skip
+    /// while transient errors retain the kFailLimit retry budget.
+    /// Lets users see how many entries got blacklisted because v3
+    /// hit a deterministic cycle vs other failure modes.
+    uint64_t callHookBlackholeBlacklisted  = 0;
+    uint64_t forceHookBlackholeBlacklisted = 0;
+
     /// #425: per-gate call-hook funnel.  Each counter increments at
     /// exactly one specific gate; the sum equals callHookGated minus
     /// the rare paths not yet broken down.  Lets us size which gate
@@ -1671,6 +1695,13 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     pg("returnsClosure", s.callHookGateReturnsClosure);
                     pg("phaseBSkipped",  s.callHookGatePhaseBSkipped);
                     pg("outerWith",      s.callHookGateOuterWith);
+                    // #480 Phase 2: blackhole-class permanent-skip count.
+                    pg("blackholeBlacklisted",
+                       s.callHookBlackholeBlacklisted);
+                    if (s.forceHookBlackholeBlacklisted)
+                        std::fprintf(stderr,
+                            "v3 force-hook blackhole-blacklisted=%llu\n",
+                            (unsigned long long)s.forceHookBlackholeBlacklisted);
                     // #451: on-demand-root cache-miss outcomes.
                     if (s.callHookCacheMissResolved
                         || s.callHookCacheMissNoRoot
@@ -2764,11 +2795,20 @@ static bool v3ForceEntry(nix::EvalState & state, nix::Expr * e,
         // entries).  Cycles, V3DepthYield, infinite-recursion etc.
         // are deterministic per-Expr at this env shape — retrying
         // just throws again.
+        // #480 Phase 2: classify BlackholeError separately.  Cycle
+        // failures bump the dedicated counter and trigger immediate
+        // permanent skip via isPhaseBSkipped() (one strike, not three).
         auto sit2 = v3SubExprCache().find(e);
         if (sit2 != v3SubExprCache().end()) {
             // §3 saturating: don't wrap past 255 (uint8_t).
-            if (sit2->second.phaseBFailureCount < 0xFF)
-                sit2->second.phaseBFailureCount++;
+            if (dynamic_cast<const BlackholeError *>(&ex)) {
+                if (sit2->second.blackholeFailureCount < 0xFF)
+                    sit2->second.blackholeFailureCount++;
+                st.forceHookBlackholeBlacklisted++;
+            } else {
+                if (sit2->second.phaseBFailureCount < 0xFF)
+                    sit2->second.phaseBFailureCount++;
+            }
         }
         return false;  // Fall back: tree-walker handles the rest.
     } catch (...) {
@@ -3512,11 +3552,18 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
             capturedWiths);
         // shallowGuard's destructor pops the flag here, before any
         // result-bridge work below.
-    } catch (const std::exception &) {
+    } catch (const std::exception & ex) {
         // Any throw -> blacklist this lambda for the rest of the
         // process, fall back.  Mirrors v3ForceEntry's WC-14.6 policy.
         // §3 saturating: don't wrap past 255 (uint8_t).
-        if (ent.phaseBFailureCount < 0xFF) ent.phaseBFailureCount++;
+        // #480 Phase 2: classify BlackholeError separately so cycles
+        // trigger immediate permanent skip (one strike, not three).
+        if (dynamic_cast<const BlackholeError *>(&ex)) {
+            if (ent.blackholeFailureCount < 0xFF) ent.blackholeFailureCount++;
+            st.callHookBlackholeBlacklisted++;
+        } else {
+            if (ent.phaseBFailureCount < 0xFF) ent.phaseBFailureCount++;
+        }
         st.callHookBodyThrew++;
         return false;
     } catch (...) {
