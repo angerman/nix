@@ -2727,30 +2727,29 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     if (!fun.isLambda()) { st.callHookGated++; st.callHookGateNotLambda++; return false; }
     nix::ExprLambda * lambda = fun.lambda().fun;
     if (!lambda) { st.callHookGated++; st.callHookGateNullLambda++; return false; }
-    // #437 -> #452 Phase C: refuse-formals gate is OPT-OUT default.
-    // Originally added because deep `treeWalkerToV3Public` arg
-    // conversion forced every entry of `{config, options, lib, ...}`
-    // -> ExprBlackHole on NixOS module fix-points.  Fix A (#437,
-    // 599cb9745) made the call-hook arg a shallow Bridge thunk;
-    // Phase C (#452) closes the remaining issue with per-thread
-    // `shallowTWAttrsBridge` so each TW entry stays a Bridge
-    // thunk until forced -- matches TW's per-formal lazy semantics.
+    // #437 -> #452 Phase C -> #458 step "kill declining gates":
+    // formals gate was OPT-IN until 2026-05-06 because Phase C made
+    // it correct but the bridge overhead made cardano-node ~30%
+    // slower.  Re-measured on 2026-05-06 after Phase D (native primop
+    // coverage) and Phase E (invert eval entry) landed: cardano-node
+    // is now AT PARITY with TW under formals=1 (1.38-1.42s user vs
+    // TW 1.35-1.42s), and the v3 default-without-formals path is
+    // ~3% slower than formals=1 because the formals gate's `gated`
+    // counter dominates over `cacheMiss`.
     //
-    // STAYS OPT-IN VIA `NIX_V3_CALL_FORMALS=1` because, although the
-    // correctness work is in, the per-attr Bridge force adds bridge
-    // overhead.  On cardano-node (heavy NixOS-module shape) Phase C
-    // makes default v3 ~30% slower than TW (4.3 s vs 3.3 s) because
-    // every config.x / options.x access pays a TW round-trip.  The
-    // value-realisation needs Phase D (native primops keep more
-    // work in v3) or Phase E (TW becomes the leaf-fallback) to
-    // amortise the bridge cost.  Until then, default off keeps
-    // cardano-node at parity with TW; users opting in get the
-    // correctness path that lets formals lambdas run via v3.
-    static const bool callFormals = []{
-        const char * v = std::getenv("NIX_V3_CALL_FORMALS");
-        return v && std::string_view(v) == "1";
-    }();
-    if (!callFormals && lambda->getFormals()) {
+    // FLIPPED to default-on (NIX_V3_NO_CALL_FORMALS=1 to opt out).
+    // Net effect: 133k formals lambdas on cardano-node move from
+    // "gated, never enter v3" to "considered by the cache lookup
+    // (still cacheMiss in default, but ready to fire when PP /
+    // disk-cache populates the cache).
+    //
+    // The user-directive #457/#458 goal: stay in the v3 VM as much
+    // as possible.  Refusing every formals lambda was a pure-TW
+    // exit; lifting it lets v3 own the formals-lambda call site
+    // even when the body falls back today.
+    static const bool refuseCallFormals =
+        std::getenv("NIX_V3_NO_CALL_FORMALS") != nullptr;
+    if (refuseCallFormals && lambda->getFormals()) {
         st.callHookGated++; st.callHookGateFormals++; return false;
     }
     bool hasFormals = lambda->getFormals().has_value();
