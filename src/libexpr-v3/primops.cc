@@ -6272,6 +6272,15 @@ void dumpHotDescriptors(std::FILE * out, size_t limit,
 namespace { extern nix::Value * (*v3ToTreeWalkerShim)(nix::EvalState &, Value); }
 nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v)
 {
+    // #458 step B note: tried adding a scalar fast-path here that
+    // skipped the v3ToTreeWalker shim's VMState alloc when v was a
+    // forced scalar.  Measured ~3-5% regression on cardano-node and
+    // fib28 -- the upfront tag check adds cost on every call, and
+    // non-scalar v3 results dominate the v3->TW direction (primops
+    // return strings/attrsets/lists).  Reverted.  The TW->v3
+    // direction (call-hook arg, bridge-attr-lookup, forceBridgeThunk)
+    // is still fast-pathed because scalar args are extremely common
+    // there.
     return v3ToTreeWalkerShim ? v3ToTreeWalkerShim(nixState, v) : nullptr;
 }
 

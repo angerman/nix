@@ -153,6 +153,7 @@ std::optional<Value> tryBridgeAttrLookup(Thunk * t, uint32_t v3name);
 /// callback; now zero TW work after the fast bridge.
 bool tryFastBridgeScalarTwToV3(const nix::Value & nv, Value & out);
 
+
 /// #458 step A.4: existence check sibling to tryBridgeAttrLookup,
 /// for the `attrs ? name` operator (OP_ATTRS_HAS).  Returns:
 ///   - 0: src not in a state where we can answer (still thunk-shaped,
