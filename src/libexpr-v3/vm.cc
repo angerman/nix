@@ -52,6 +52,39 @@ Value forceBridgeThunk(Thunk * t);
 
 namespace {
 
+/// REVIEW B5 — chase-vs-call-depth limits, documented.
+///
+/// Two distinct iteration bounds protect the VM:
+///
+/// 1. `kMaxIndirectionChase` (4096): max depth of Tag::Slot →
+///    Tag::Thunk(eval=Slot→…) indirection chains traversed by
+///    forceValue and OP_FORCE.  Fires only on pathological
+///    self-referential let-rec patterns (`let x = x; in x`,
+///    `let x = y; y = x; in x`) — the Black-state check catches
+///    direct recursion, but SECD-style indirection cycles can
+///    chase forever without re-entering the Black thunk.  Real
+///    workloads have ≤4 indirections (recref + thunkify + slot +
+///    memo) so 4096 is well above the practical maximum and
+///    triggers only when the chain is genuinely cyclic.
+///
+/// 2. `kMaxCallDepth` (5000): max number of CallFrame entries on
+///    `vm.frames`.  Mirrors tree-walker's recursive C-stack guard.
+///    Triggered by deeply recursive evaluation (e.g., infinite
+///    `let f = x: f x; in f 0` chains that aren't tail-call-
+///    optimised).  Higher than the chase limit because real
+///    programs do legitimately deep call stacks (cardano-node
+///    library evaluation has been observed at >2000 frames).
+///
+/// OP_FORCE applies BOTH bounds: it traverses Tag::Slot/Thunk
+/// chains (chase), and may push frames when it triggers a thunk
+/// body (call depth).  OP_CALL applies only the call-depth bound —
+/// it doesn't traverse indirection chains; forceValue does that
+/// before OP_CALL dispatches.  The asymmetry is intentional and
+/// noted here so future reviewers don't see "4096 here, 5000 there"
+/// and try to "fix" by unification.
+constexpr int    kMaxIndirectionChase = 4096;
+constexpr size_t kMaxCallDepth        = 5000;
+
 [[gnu::always_inline]]
 inline Value pop(VMState & vm)
 {
@@ -1524,8 +1557,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
             // Max call-depth check — guards `(x: x x) (x: x x)` and
             // similar non-thunk-mediated infinite recursion.  Tree-walker
-            // defaults to 5000; we match that.  Cheap O(1) check.
-            constexpr size_t kMaxCallDepth = 5000;
+            // defaults to 5000; we match that via kMaxCallDepth (see
+            // anonymous namespace at top of file).  Cheap O(1) check.
             if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
                 throw std::runtime_error("v3 OP_CALL: stack overflow; call depth exceeded "
                                           + std::to_string(kMaxCallDepth));
@@ -1949,10 +1982,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // the Phase 5 slot-pointer rewrite).  See forceValue
             // comment for rationale.
             {
-            constexpr int kMaxOpForceChase = 4096;
             int forceChaseIters = 0;
             while (true) {
-                if (__builtin_expect(++forceChaseIters > kMaxOpForceChase, 0))
+                if (__builtin_expect(++forceChaseIters > kMaxIndirectionChase, 0))
                     throw std::runtime_error(
                         "v3 OP_FORCE: infinite recursion (chase cycle through "
                         "Tag::Slot/Tag::Thunk indirections)");
@@ -2158,8 +2190,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Same call-depth guard as OP_CALL — catches blackhole-style
             // recursion that doesn't go through OP_CALL (e.g. `let x = x;
             // in x`, where every reference to x re-enters via OP_FORCE).
-            if (__builtin_expect(vm.frames.size() >= 5000, 0))
-                throw std::runtime_error("v3 OP_FORCE: stack overflow; call depth exceeded 5000");
+            if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
+                throw std::runtime_error("v3 OP_FORCE: stack overflow; call depth exceeded "
+                                          + std::to_string(kMaxCallDepth));
 
             // REVIEW §3: window between `t->state = Blackhole` and the
             // frame-push could leak orphan Black thunks if any step in
@@ -4069,7 +4102,8 @@ Value forceValue(VMState & vm, Value v)
     // beyond any realistic indirection chain (≤4 in practice for
     // recref+thunkify+slot+memo) and only fires on pathological
     // cycles.
-    constexpr int kMaxChaseIters = 4096;
+    // See kMaxIndirectionChase / kMaxCallDepth at the top of the
+    // anonymous namespace for rationale.
     int chaseIters = 0;
     // V3_DBG_CHASE: optional ring-buffer of recent (tag, ptr) pairs so
     // we can dump the chain shape if the limit fires.  Cheap when
@@ -4092,11 +4126,11 @@ Value forceValue(VMState & vm, Value v)
             ringPtr[ringIdx % kRingSize] = p;
             ringIdx++;
         }
-        if (__builtin_expect(++chaseIters > kMaxChaseIters, 0)) {
+        if (__builtin_expect(++chaseIters > kMaxIndirectionChase, 0)) {
             if (s_dbg_chase) {
                 std::fprintf(stderr,
                     "v3 chase-cycle limit %d hit; last %d steps:\n",
-                    kMaxChaseIters, kRingSize);
+                    kMaxIndirectionChase, kRingSize);
                 int start = ringIdx > kRingSize ? ringIdx - kRingSize : 0;
                 for (int i = start; i < ringIdx; ++i) {
                     int slot = i % kRingSize;
@@ -4124,8 +4158,9 @@ Value forceValue(VMState & vm, Value v)
         // a C++ recursion via dispatchLoop → forceValue → dispatchLoop
         // and never grows through the bytecode-level OP_CALL/OP_FORCE
         // guards.  Match those guards.
-        if (__builtin_expect(vm.frames.size() >= 5000, 0))
-            throw std::runtime_error("v3 forceValue: stack overflow; call depth exceeded 5000");
+        if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
+            throw std::runtime_error("v3 forceValue: stack overflow; call depth exceeded "
+                                      + std::to_string(kMaxCallDepth));
         // Tag::Slot — SECD-style indirection.  The slot pointer
         // references another stable Value that gets mutated when its
         // let-rec body publishes a result.  Dereference and continue
@@ -4302,7 +4337,7 @@ Value forceValue(VMState & vm, Value v)
             // forceBridgeThunk allocates ANOTHER Bridge for the
             // same TW Value, set t->evaluated = newer Bridge, repeat
             // ad infinitum.  Each iteration allocates a fresh Thunk
-            // pointer; the chain extends forever; kMaxChaseIters
+            // pointer; the chain extends forever; kMaxIndirectionChase
             // limit fires.  V3_DBG_CHASE confirms the pattern: every
             // step is a Thunk in state=Evaluated whose evaluated.tag
             // is Thunk again, ending at the freshly-allocated state=
