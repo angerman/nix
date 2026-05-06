@@ -287,6 +287,13 @@ static bool lowerCompileAndPopulate(
     nix::Expr * e, nix::EvalState & state, V3HookStats & st,
     bool bypassHookGate = false);
 
+// REVIEW B4: out-of-line increments for the parse-hook silent-catch
+// counters.  Caller-side code at v3RegisterExprEntry runs before
+// V3HookStats's full definition (needed for member access), so wrap
+// the counter bumps in functions defined later in the file.
+static void noteParseCollectMapException();
+static void noteParsePrecompileException();
+
 static void v3RegisterExprEntry(nix::EvalState & state,
                                  const nix::Expr * e,
                                  const nix::SourcePath & p)
@@ -319,7 +326,12 @@ static void v3RegisterExprEntry(nix::EvalState & state,
         try {
             collectLambdasIntoMap(
                 e, const_cast<nix::Expr *>(e), v3LambdaRoot());
-        } catch (...) { /* opportunistic; ignore */ }
+        } catch (...) {
+            // REVIEW B4: opportunistic — must not crash eval on
+            // optimisation-pass failure, but we count so a regression
+            // shows up in stats dumps rather than being silent.
+            noteParseCollectMapException();
+        }
     }
     // #430 / #445: opt-in parse-time precompile.  Off by default so
     // existing workloads aren't taxed; flip with
@@ -347,7 +359,10 @@ static void v3RegisterExprEntry(nix::EvalState & state,
             (void)lowerCompileAndPopulate(
                 const_cast<nix::Expr *>(e), state, v3HookStats(),
                 /*bypassHookGate=*/true);
-        } catch (...) { /* opportunistic; ignore failures */ }
+        } catch (...) {
+            // REVIEW B4: opportunistic — see above.
+            noteParsePrecompileException();
+        }
     }
 }
 
@@ -1148,12 +1163,36 @@ struct V3HookStats {
     uint64_t callHookCacheMissCompileFailed  = 0;  // root lowerCompileAndPopulate threw / returned false
     uint64_t callHookCacheMissPostCompile    = 0;  // root compiled but lambda still not in subCache
     uint64_t callHookCacheMissResolved       = 0;  // root compiled + lambda in subCache; proceeds
+
+    /// REVIEW B4: parse-time precompile / lambda-root-map opportunistic
+    /// catches.  The eval hook calls collectLambdasIntoMap and (under
+    /// NIX_V3_PARSE_PRECOMPILE) lowerCompileAndPopulate inside `try {
+    /// ... } catch (...) { /* opportunistic */ }`.  The reviewer
+    /// flagged that this silently drops OOM / invariant errors.  We
+    /// keep the catches (these paths must not crash eval on errors
+    /// in our optimisation passes) but COUNT them so a regression
+    /// shows up in V3_TIMING / NIX_VM_STATS dumps instead of being
+    /// silent.
+    uint64_t parseHookCollectMapException    = 0;
+    uint64_t parseHookPrecompileException    = 0;
 };
 
 V3HookStats & v3HookStats()
 {
     static V3HookStats stats;
     return stats;
+}
+
+// REVIEW B4: out-of-line counter bumps so the call sites at
+// v3RegisterExprEntry (line ~322 / ~350) can run before V3HookStats's
+// full definition.
+static void noteParseCollectMapException()
+{
+    v3HookStats().parseHookCollectMapException++;
+}
+static void noteParsePrecompileException()
+{
+    v3HookStats().parseHookPrecompileException++;
 }
 
 /// Statically detect whether evaluating `e` will produce a closure
@@ -1565,6 +1604,17 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 // don't fire the call hook (small evals, fib-style)
                 // still see bridge counts.
                 dumpBridgeTelemetry(stderr);
+                // REVIEW B4: surface previously-silent opportunistic
+                // catches in the parse / precompile hooks so any
+                // regression (OOM, invariant breach, lower-bug)
+                // becomes visible in stats output rather than silent.
+                if (s.parseHookCollectMapException
+                    || s.parseHookPrecompileException) {
+                    std::fprintf(stderr,
+                        "v3 parse-hook silent-catches: collectMap=%llu precompile=%llu (NOT crashes — opportunistic, but unexpected if non-zero)\n",
+                        (unsigned long long)s.parseHookCollectMapException,
+                        (unsigned long long)s.parseHookPrecompileException);
+                }
             });
         }
         return true;
