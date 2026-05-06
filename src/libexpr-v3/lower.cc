@@ -275,9 +275,27 @@ struct Lowerer
             // (renamed from the prior opt-in `NIX_V3_INLINE_REC_SLOT`).
             static const bool inlineRecSlot =
                 std::getenv("NIX_V3_NO_INLINE_REC_SLOT") == nullptr;
+            // #458 step 3/6: opt-in slot-capture path.  When
+            // NIX_V3_REC_SLOT_CAPTURE=1, route rec-attrset entry
+            // resolution through the let-rec's recSlotVar (Tag::Slot)
+            // instead of the wrap thunk's recAttrsVar.  RecBindingSlotRef
+            // emits OP_FORCE on Tag::Slot which derefs to the (possibly
+            // partial) Tag::Attrs without touching the wrap thunk's
+            // state machine — sidesteps the BlackholeError that fires
+            // when the wrap thunk is mid-construction in another
+            // VMState.  Gated behind an env-var while we validate that
+            // Phase B's RecBuild path (which can't synthesize Tag::Slot
+            // from TW env yet) doesn't regress on the workloads where
+            // it currently fires.  Once validated, becomes default and
+            // the env-var becomes the kill-switch.
+            static const bool slotCapture =
+                std::getenv("NIX_V3_REC_SLOT_CAPTURE") != nullptr;
+            ir::VarId source = rec;
+            if (slotCapture && scopes[scopeIdx].recSlotVar != ir::kInvalid)
+                source = scopes[scopeIdx].recSlotVar;
             if (inlineRecSlot)
-                return addBinding(ir::RecBindingSlotRef{rec, nm});
-            return thunkifyRecAttrSelect(rec, nm);
+                return addBinding(ir::RecBindingSlotRef{source, nm});
+            return thunkifyRecAttrSelect(source, nm);
         }
         return ir::kInvalid;
     }
@@ -1734,6 +1752,17 @@ struct Lowerer
                 if (!byDisplDirect && inRecScope) {
                     withRecAttrsVar = scopes[scopeIdx].recAttrsVar;
                     withRecAttrsName = scopes[scopeIdx].recAttrsNames[ev->displ];
+                    // #458 step 3/6: route through recSlotVar in slot-
+                    // capture mode so With's emit doesn't force the
+                    // wrap thunk.  emit pushes recSlotVar (Tag::Slot)
+                    // and OP_REC_BINDING_SLOT_REF derefs internally.
+                    static const bool slotCapture =
+                        std::getenv("NIX_V3_REC_SLOT_CAPTURE") != nullptr;
+                    if (slotCapture
+                        && scopes[scopeIdx].recSlotVar != ir::kInvalid)
+                    {
+                        withRecAttrsVar = scopes[scopeIdx].recSlotVar;
+                    }
                 }
             }
         }

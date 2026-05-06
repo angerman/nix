@@ -242,6 +242,20 @@ void collectBlockRefs(const Module & m, BlockId bid,
             if constexpr (std::is_same_v<T, LetRec>) {
                 for (auto & he : e.hiddenEntries)
                     defined.insert(he.hiddenVar);
+                // #458 step 3/6: the LetRec emit also binds a
+                // synthetic `recSlotVar` (heap-stable Tag::Slot) to a
+                // local in the containing function via the
+                // OP_REC_SLOT_PUBLISH + OP_SET_LOCAL pair.  The
+                // recSlotVar isn't bound by any ir::Binding so it
+                // wouldn't otherwise appear in the `defined` set --
+                // making it leak into the function's freeVars
+                // wherever it's referenced.  Look it up via
+                // Module::recVarToSlotVar (keyed by recVar).
+                if (auto sit = m.recVarToSlotVar.find(e.recVar);
+                    sit != m.recVarToSlotVar.end())
+                {
+                    defined.insert(sit->second);
+                }
             }
         }, bd.expr);
     }
