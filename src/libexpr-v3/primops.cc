@@ -115,6 +115,44 @@ std::unordered_map<std::string, PrimOp> & registry()
 
 thread_local nix::EvalState * tlNixEvalState = nullptr;
 
+/// #466 nested-bridge-primop depth bound.
+///
+/// Tracks how deeply we've nested calls into the v3 bridge primops
+/// (primV3CallBridge1 / primV3ForceAttr / primV3ForceListElem) on
+/// this thread.  Each level allocates a fresh VMState; in lambda-skip
+/// + rec-attrset-fix-point patterns the chain re-enters each primop
+/// across different (handle, sid) pairs, defeating the per-primop
+/// (handle, sid) cycle detector and the per-thunk (vm, t) recovery
+/// counter (each layer has a fresh vm).  C-stack growth is real and
+/// SIGSEGV is the eventual outcome.
+///
+/// Bound the depth at a hard limit so a structural cycle surfaces as
+/// a proper error after `kBridgePrimopMaxDepth` iterations rather
+/// than running until C-stack overflows.  When a primop hits the
+/// limit, throw a NON-Blackhole error so the catch path's
+/// fallbackToTreeWalker (which gates on dynamic_cast<BlackholeError>)
+/// does NOT trigger — the fallback would just re-enter the same
+/// chain.  Default 64; tunable via NIX_V3_BRIDGE_PRIMOP_DEPTH.
+inline int & bridgePrimopDepth()
+{
+    thread_local int d = 0;
+    return d;
+}
+inline int bridgePrimopMaxDepth()
+{
+    static const int k = []{
+        if (const char * v = std::getenv("NIX_V3_BRIDGE_PRIMOP_DEPTH"))
+            return std::max(0, std::atoi(v));
+        return 64;
+    }();
+    return k;
+}
+struct BridgePrimopDepthGuard {
+    int & d;
+    BridgePrimopDepthGuard(int & d_) : d(d_) { ++d; }
+    ~BridgePrimopDepthGuard() { --d; }
+};
+
 /// REVIEW MED-13: scoped guard for tlNixEvalState.  Bridge entries
 /// installed only on null (`if (!tlNixEvalState) tlNixEvalState = &ns`)
 /// would silently use a stale pointer if a different EvalState later
@@ -2631,6 +2669,19 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
 {
     g_bridgeCallBridge1Calls.fetch_add(1, std::memory_order_relaxed);
 
+    // #466 nested-bridge-primop depth bound (orthogonal to bridge1's
+    // own per-bridge1-cascade depth counter below).
+    {
+        int kMax = bridgePrimopMaxDepth();
+        if (kMax > 0 && bridgePrimopDepth() >= kMax) {
+            ns.error<nix::EvalError>(
+                "v3 callBridge1: nested bridge-primop depth exceeded %1% "
+                "(structural cycle through fresh-VMState chain)",
+                std::to_string(kMax)).debugThrow();
+        }
+    }
+    BridgePrimopDepthGuard _bpdg(bridgePrimopDepth());
+
     // #455 / #457: depth-limit cascade of nested bridge1 calls.  When
     // v3 resolves a chain of `extends overlay (extends overlay2 ...)`
     // overlays, each becomes a Tag::Closure bridged via __v3_call_
@@ -2879,6 +2930,19 @@ static void primV3ForceAttr(nix::EvalState & ns, const nix::PosIdx pos,
 static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
                              nix::Value ** args, nix::Value & out)
 {
+    // #466 nested-bridge-primop depth bound (see bridgePrimopDepth comment).
+    int kMax = bridgePrimopMaxDepth();
+    if (kMax > 0 && bridgePrimopDepth() >= kMax) {
+        // Throw a NON-Blackhole error so the catch's
+        // fallbackToTreeWalker doesn't re-enter the cycle.
+        ns.error<nix::EvalError>(
+            "v3 forceAttr: nested bridge-primop depth exceeded %1% "
+            "(structural cycle through fresh-VMState chain — typically "
+            "lambda-skip + rec-attrset fix-point)",
+            std::to_string(kMax)).debugThrow();
+    }
+    BridgePrimopDepthGuard _bpdg(bridgePrimopDepth());
+
     ns.forceValue(*args[0], pos);
     if (args[0]->type() != nix::nInt)
         ns.error<nix::EvalError>("v3 forceAttr: handle must be int").debugThrow();
@@ -2957,6 +3021,33 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
         return;
     } catch (const std::exception & ex) {
         if (!fallbackExpr || !dynamic_cast<const BlackholeError *>(&ex)) throw;
+        // #466 fallback re-entry bound.
+        //
+        // BlackHoleError → fallback → re-eval via TW → could re-trigger
+        // primV3ForceAttr → another BlackHoleError → another fallback.
+        // Each iteration adds C-stack depth (the catch's call to
+        // fallbackExpr->eval is on the C stack).  Without a bound,
+        // structural cycles (lambda-skip + rec-attrset fix-points)
+        // grow C-stack until SIGSEGV.
+        //
+        // Track fallback chain depth via thread_local; over the limit,
+        // re-throw the BlackholeError without fallback so the v3
+        // surface produces a proper error rather than C-stack overflow.
+        // Tunable via NIX_V3_FALLBACK_CHAIN_DEPTH.
+        static const int kFallbackMaxDepth = []{
+            if (const char * v = std::getenv("NIX_V3_FALLBACK_CHAIN_DEPTH"))
+                return std::max(0, std::atoi(v));
+            return 16;
+        }();
+        static thread_local int tlsFallbackDepth = 0;
+        if (kFallbackMaxDepth > 0 && tlsFallbackDepth >= kFallbackMaxDepth)
+            throw;
+        struct FallbackDepthGuard {
+            int & d;
+            FallbackDepthGuard(int & d_) : d(d_) { ++d; }
+            ~FallbackDepthGuard() { --d; }
+        } _fdg(tlsFallbackDepth);
+
         static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
         if (dbg) std::fprintf(stderr,
             "v3 forceAttr: bridge blackholed: %s — re-running outer Expr "
@@ -2990,6 +3081,16 @@ static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
 static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
                                  nix::Value ** args, nix::Value & out)
 {
+    // #466 nested-bridge-primop depth bound (see bridgePrimopDepth comment).
+    int kMax = bridgePrimopMaxDepth();
+    if (kMax > 0 && bridgePrimopDepth() >= kMax) {
+        ns.error<nix::EvalError>(
+            "v3 forceListElem: nested bridge-primop depth exceeded %1% "
+            "(structural cycle through fresh-VMState chain)",
+            std::to_string(kMax)).debugThrow();
+    }
+    BridgePrimopDepthGuard _bpdg(bridgePrimopDepth());
+
     ns.forceValue(*args[0], pos);
     if (args[0]->type() != nix::nInt)
         ns.error<nix::EvalError>("v3 forceListElem: handle must be int").debugThrow();
