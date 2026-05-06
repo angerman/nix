@@ -3142,6 +3142,43 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     }
     auto & ent = sit->second;
     if (!ent.isLambda) { st.callHookGated++; st.callHookGateNotIsLambdaEnt++; return false; }
+
+    // #467 wrong-shape early refusal.
+    //
+    // The cache entry's `funcIdx` points at a v3 LambdaDescriptor.
+    // For a Lambda Expr, lower.cc registers TWO fids in subExprFuncs:
+    // (1) the per-attr thunk fid (paramless 0-arg function whose body
+    // creates a Closure value), and (2) the lambda body fid (1-arg
+    // function whose body computes the lambda's actual result).
+    // emplace's first-wins picks the thunk fid -- but the call hook
+    // is invoked from TW's `callFunction(lambda, arg)`, which means
+    // we're being CALLED, not forced.  Running the paramless thunk
+    // ignores the arg and returns a fresh Tag::Closure -- semantically
+    // wrong; it's the closure-result-refusal's load-bearing reason.
+    //
+    // Pre-check the descriptor's arity: if 0 (paramless thunk fid), the
+    // entry is the wrong shape for this call site.  Refuse here, before
+    // any setup work, so TW handles via its native callFunction path.
+    // Diagnostically clearer than the post-run closure-result refusal,
+    // and lets the post-run refusal apply ONLY to genuine result-shape
+    // mismatches (callable-returning bodies bridged via primOpApp
+    // that consumers expect as nAttrs).
+    //
+    // Default-on; disable via NIX_V3_NO_WRONG_SHAPE_REFUSE=1.
+    {
+        static const bool s_refuseWrongShape =
+            std::getenv("NIX_V3_NO_WRONG_SHAPE_REFUSE") == nullptr;
+        if (s_refuseWrongShape && ent.cu
+            && ent.funcIdx < ent.cu->lambdas.size())
+        {
+            const auto & desc = ent.cu->lambdas[ent.funcIdx];
+            if (desc.arity == 0 && !desc.hasFormals) {
+                st.callHookGated++;
+                st.callHookGateNotIsLambdaEnt++;
+                return false;
+            }
+        }
+    }
     // #455 diag: NIX_V3_ON_DEMAND_ROOT_NEVER_RUN=1 makes the call
     // hook refuse to run *any* lambda that's in v3LambdaRoot --
     // tracking whether the bug is in v3 lambda execution at all,
@@ -3318,16 +3355,44 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // similar coerce-to-X (cardano-node hits this on
     // `assert enableGold -> withGold stdenv.targetPlatform`).
     //
-    // 2026-05-06 attempt: tried removing the refusal to reduce
-    // v3->tw->v3 bridging, since step 2's shortcut was meant to keep
-    // closure dispatches v3-side.  Result: #455 minimal-repro
-    // POSITIVE regression test failed under
-    // ON_DEMAND_ROOT+SKIP_THRESHOLD=0 -- the eager-bridge guard was
-    // load-bearing for that case.  Restored the refusal.  Use
-    // NIX_V3_NO_REFUSE_CLOSURE_RESULT=1 to opt out for experimentation.
+    // 2026-05-06 attempt 1: tried removing the refusal — #455 minimal-
+    // repro POSITIVE regressed under OD+SKIP_THRESHOLD=0 because the
+    // call-hook ran a paramless thunk-fid for a Lambda Expr (the per-
+    // attr thunk's body, which creates a Closure value), producing a
+    // Tag::Closure that bridged as `mkPrimOpApp(__v3_call_bridge_1,
+    // handle)` and broke `with self;` consumers expecting nAttrs.
+    //
+    // 2026-05-06 attempt 2 (#467 wrong-shape pre-refusal): added an
+    // arity check at the call-hook entry that refuses paramless
+    // thunk-fid entries BEFORE running them.  TW handles via native
+    // callFunction (correct semantics).  With wrong-shape pre-refusal
+    // in place, removing closure-result refusal is now SAFE on the
+    // full regression matrix:
+    //   - run-lang-tests: 142/142
+    //   - run-cutover-parity-tests: 142/142 (FULL parity vs 140/142
+    //     with refusal on — slot-capture + RecBuildSlot + this lift
+    //     together flip the prior inherit-from + print divergences
+    //     to parity)
+    //   - run-on-demand-root-tests (4 modes): 142/142 each
+    //   - run-on-demand-root-shapes: minimal-repro POSITIVE + aliases
+    //     all green (the original blocker for default-on)
+    //   - run-456-chase-cycle: 7/7
+    //   - run-bridge-attr-lookup: 21/21
+    //   - run-gate-removal: 35/35
+    //   - run-458-rec-slot-capture: 20/20
+    //   - run-bridge1-shortcut: 17/17
+    //   - run-wc-laziness: 85/85
+    //
+    // Default-on (refusal OFF).  Re-enable via
+    // NIX_V3_REFUSE_CLOSURE_RESULT=1 if a regression surfaces; the
+    // legacy NIX_V3_NO_REFUSE_CLOSURE_RESULT=1 alias is honoured for
+    // back-compat with prior session diagnostic flows.
     {
+        // Refuse only when explicitly asked.  Default is no refusal.
+        // (`NIX_V3_NO_REFUSE_CLOSURE_RESULT=1` from prior diagnostic
+        // flows is now a no-op — same as default.)
         static const bool noRefuse =
-            std::getenv("NIX_V3_NO_REFUSE_CLOSURE_RESULT") != nullptr;
+            std::getenv("NIX_V3_REFUSE_CLOSURE_RESULT") == nullptr;
         if (!noRefuse) {
             Tag rt = r.tag();
             if (rt == Tag::Closure || rt == Tag::PrimOp || rt == Tag::PrimOpApp
