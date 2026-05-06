@@ -3021,7 +3021,7 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
         return;
     } catch (const std::exception & ex) {
         if (!fallbackExpr || !dynamic_cast<const BlackholeError *>(&ex)) throw;
-        // #466 fallback re-entry bound.
+        // #466 fallback re-entry bound + per-fallbackExpr cycle detection.
         //
         // BlackHoleError → fallback → re-eval via TW → could re-trigger
         // primV3ForceAttr → another BlackHoleError → another fallback.
@@ -3030,10 +3030,19 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
         // structural cycles (lambda-skip + rec-attrset fix-points)
         // grow C-stack until SIGSEGV.
         //
-        // Track fallback chain depth via thread_local; over the limit,
-        // re-throw the BlackholeError without fallback so the v3
-        // surface produces a proper error rather than C-stack overflow.
-        // Tunable via NIX_V3_FALLBACK_CHAIN_DEPTH.
+        // Two complementary guards:
+        //
+        // (a) Depth bound: track fallback chain depth via thread_local;
+        //     over the limit, re-throw without fallback.  Tunable via
+        //     NIX_V3_FALLBACK_CHAIN_DEPTH (default 16).
+        //
+        // (b) Per-fallbackExpr cycle detection: if the SAME fallbackExpr
+        //     pointer is already in flight on this thread (meaning the
+        //     cycle is re-evaluating the same outer Expr that triggered
+        //     us), refuse to retry — the second attempt has no
+        //     additional information and just walks the same path.
+        //     Tighter than the depth bound for the structural cycle
+        //     case.
         static const int kFallbackMaxDepth = []{
             if (const char * v = std::getenv("NIX_V3_FALLBACK_CHAIN_DEPTH"))
                 return std::max(0, std::atoi(v));
@@ -3042,11 +3051,18 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
         static thread_local int tlsFallbackDepth = 0;
         if (kFallbackMaxDepth > 0 && tlsFallbackDepth >= kFallbackMaxDepth)
             throw;
-        struct FallbackDepthGuard {
-            int & d;
-            FallbackDepthGuard(int & d_) : d(d_) { ++d; }
-            ~FallbackDepthGuard() { --d; }
-        } _fdg(tlsFallbackDepth);
+        static thread_local std::unordered_set<const nix::Expr *>
+            tlsFallbackInProgress;
+        if (!tlsFallbackInProgress.insert(fallbackExpr).second) {
+            // Same fallbackExpr is already in flight.  Don't recurse.
+            throw;
+        }
+        struct FallbackGuards {
+            int & depth;
+            const nix::Expr * fb;
+            FallbackGuards(int & d, const nix::Expr * f) : depth(d), fb(f) { ++depth; }
+            ~FallbackGuards() { --depth; tlsFallbackInProgress.erase(fb); }
+        } _fg(tlsFallbackDepth, fallbackExpr);
 
         static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
         if (dbg) std::fprintf(stderr,
