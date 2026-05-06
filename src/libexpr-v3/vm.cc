@@ -45,6 +45,13 @@ namespace nix::v3 {
 nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
 Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
 
+// #483 part 4 forward decls: shallow-TW-attrs RAII helpers.  Defined
+// in primops.cc.  Wrap the OP_CALL Bridge result-bridge in a shallow
+// guard so that an attrset returned by the TW lambda is bridged with
+// per-entry Bridge thunks instead of recursive eager force.
+bool pushShallowTWAttrsBridge();
+void popShallowTWAttrsBridge(bool prev);
+
 // WC-10: forward declaration at namespace scope so the `extern` use sites
 // inside the anonymous namespaces below resolve to nix::v3::forceBridgeThunk
 // (defined in primops.cc) rather than to a phantom anonymous-namespace symbol.
@@ -1476,7 +1483,44 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 nix::Value outTw;
                 ns->callFunction(*funTw, *argTw, outTw, nix::noPos);
-                Value v3out = treeWalkerToV3Public(*ns, outTw);
+                // #483 part 4: TW callFunction may return a value whose
+                // ENTRIES are unforced thunks that depend on a fix-
+                // point member that's mid-construction (nixpkgs
+                // stage.nix:139 `pkgs = self.pkgsHostTarget`).  Eager
+                // bridging via treeWalkerToV3Public recursively forces
+                // each entry, tripping on the missing attr.
+                //
+                // Two cases:
+                //   (a) outTw itself is unforced (Tag::tApp / tThunk) --
+                //       wrap as a v3 Bridge thunk; consumer forces later.
+                //   (b) outTw is forced (e.g. nAttrs) but entries may be
+                //       thunks.  Use the shallow-attrs bridge mode so
+                //       entries are wrapped as per-entry Bridge thunks
+                //       rather than recursively forced.  Mirrors what
+                //       Phase C does for formals-lambda bodies.
+                Value v3out;
+                if (outTw.type<true>() == nix::nThunk) {
+                    nix::Value * heap = ns->allocValue();
+                    *heap = outTw;
+                    Thunk * bridge = Alloc::allocBridgeThunk(
+                        static_cast<void *>(heap));
+                    allocStats().thunksAllocated++;
+                    v3out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+                    v3out.payload.thunk = bridge;
+                } else {
+                    // Local RAII shallow-attrs guard — declared in
+                    // primops.cc, used here without re-introducing the
+                    // header dependency.  Same scope/idiom as the
+                    // formals-lambda body run in v3_hook.cc.
+                    bool prev = pushShallowTWAttrsBridge();
+                    try {
+                        v3out = treeWalkerToV3Public(*ns, outTw);
+                    } catch (...) {
+                        popShallowTWAttrsBridge(prev);
+                        throw;
+                    }
+                    popShallowTWAttrsBridge(prev);
+                }
                 push(vm, v3out);
                 break;
             }

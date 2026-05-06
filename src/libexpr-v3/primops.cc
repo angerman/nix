@@ -545,9 +545,35 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
         throw std::runtime_error(
             "v3 toString: attrset has no outPath / __toString");
     }
+    case Tag::Thunk: {
+        // #483 part 4: Bridge thunk wrapping a TW value -- force the
+        // underlying TW value and use TW's coerceToString.  Surfaces
+        // when v3 forces a lazy-bridged TW value (e.g. after the
+        // OP_CALL Bridge handler returns an unforced thunk that the
+        // consumer needs to stringify).
+        if (v.payload.thunk
+            && v.payload.thunk->state == ThunkState::Bridge
+            && v.payload.thunk->bridgeSrc
+            && state.nixEvalState) {
+            auto & ns = *state.nixEvalState;
+            auto * srcV = static_cast<nix::Value *>(
+                v.payload.thunk->bridgeSrc);
+            ns.forceValue(*srcV, nix::noPos);
+            // Use TW's coerceToString directly; it handles all the
+            // shape variants and accumulates context into a fresh
+            // NixStringContext that we transfer to v3's ctx accumulator.
+            nix::NixStringContext twCtx;
+            auto bsv = ns.coerceToString(nix::noPos, *srcV, twCtx,
+                "while coercing v3 Bridge thunk to string",
+                /*coerceMore=*/false, /*copyToStore=*/false);
+            std::string s(std::move(bsv).toOwned());
+            for (auto & e : twCtx) ctx.push_back(e.to_string());
+            return s;
+        }
+        [[fallthrough]];
+    }
     case Tag::Uninitialized:
     case Tag::Closure:
-    case Tag::Thunk:
     case Tag::PrimOp:
     case Tag::PrimOpApp:
     case Tag::App:
