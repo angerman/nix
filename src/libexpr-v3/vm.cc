@@ -1481,40 +1481,35 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         d && !d->name.empty() ? d->name.c_str() : "<?>",
                         vm.frames.back().ip);
                 }
-                nix::Value outTw;
-                ns->callFunction(*funTw, *argTw, outTw, nix::noPos);
-                // #483 part 4: TW callFunction may return a value whose
-                // ENTRIES are unforced thunks that depend on a fix-
-                // point member that's mid-construction (nixpkgs
-                // stage.nix:139 `pkgs = self.pkgsHostTarget`).  Eager
-                // bridging via treeWalkerToV3Public recursively forces
-                // each entry, tripping on the missing attr.
-                //
-                // Two cases:
-                //   (a) outTw itself is unforced (Tag::tApp / tThunk) --
-                //       wrap as a v3 Bridge thunk; consumer forces later.
-                //   (b) outTw is forced (e.g. nAttrs) but entries may be
-                //       thunks.  Use the shallow-attrs bridge mode so
-                //       entries are wrapped as per-entry Bridge thunks
-                //       rather than recursively forced.  Mirrors what
-                //       Phase C does for formals-lambda bodies.
+                // #484 STG-style address identity: outTw must be HEAP-
+                // allocated, NOT stack.  TW updates value cells in
+                // place when forcing thunks (the classic STG knot-tying
+                // discipline); any v3 Bridge thunk we build below
+                // points at outTw via `&` -- if outTw is a stack
+                // local, the address dies with our frame and later
+                // forces get garbage.  More subtly, even a temporary
+                // heap COPY (the prior #483 part 2 approach inside
+                // treeWalkerToV3) breaks address identity: TW's
+                // update of the ORIGINAL thunk doesn't propagate to
+                // our snapshot.  Manifested as nixpkgs by-name-
+                // overlay.nix:54 `self._internalCallByNamePackageFile
+                // missing` -- captured `self` was a pre-fix-point
+                // snapshot copy.  Heap-allocate from the start; the
+                // address we hand off is the SAME one TW will
+                // update in place.
+                nix::Value * outTwHeap = ns->allocValue();
+                ns->callFunction(*funTw, *argTw, *outTwHeap, nix::noPos);
                 Value v3out;
-                if (outTw.type<true>() == nix::nThunk) {
-                    nix::Value * heap = ns->allocValue();
-                    *heap = outTw;
+                if (outTwHeap->type<true>() == nix::nThunk) {
                     Thunk * bridge = Alloc::allocBridgeThunk(
-                        static_cast<void *>(heap));
+                        static_cast<void *>(outTwHeap));
                     allocStats().thunksAllocated++;
                     v3out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
                     v3out.payload.thunk = bridge;
                 } else {
-                    // Local RAII shallow-attrs guard — declared in
-                    // primops.cc, used here without re-introducing the
-                    // header dependency.  Same scope/idiom as the
-                    // formals-lambda body run in v3_hook.cc.
                     bool prev = pushShallowTWAttrsBridge();
                     try {
-                        v3out = treeWalkerToV3Public(*ns, outTw);
+                        v3out = treeWalkerToV3Public(*ns, *outTwHeap);
                     } catch (...) {
                         popShallowTWAttrsBridge(prev);
                         throw;
@@ -4825,18 +4820,14 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             if (!argTw)
                 throw std::runtime_error(
                     "v3 callClosure: bridge-thunk arg failed v3->TW bridge");
-            nix::Value outTw;
-            ns->callFunction(*funTw, *argTw, outTw, nix::noPos);
-            // #483 part 5: same lazy-result-bridge as the OP_CALL
-            // Bridge handler (vm.cc:1487).  TW callFunction may return
-            // an unforced thunk for a fix-point self-attr that is
-            // mid-construction; eager treeWalkerToV3Public would
-            // throw "attribute X missing" via ExprSelect::eval.
-            if (outTw.type<true>() == nix::nThunk) {
-                nix::Value * heap = ns->allocValue();
-                *heap = outTw;
+            // #484 STG-style address identity: heap-allocate outTw
+            // (see OP_CALL Bridge handler comment).  Preserves TW's
+            // in-place thunk update across the bridge.
+            nix::Value * outTwHeap = ns->allocValue();
+            ns->callFunction(*funTw, *argTw, *outTwHeap, nix::noPos);
+            if (outTwHeap->type<true>() == nix::nThunk) {
                 Thunk * bridge = Alloc::allocBridgeThunk(
-                    static_cast<void *>(heap));
+                    static_cast<void *>(outTwHeap));
                 allocStats().thunksAllocated++;
                 Value v3out;
                 v3out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
@@ -4845,7 +4836,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             }
             bool prev = pushShallowTWAttrsBridge();
             try {
-                Value r = treeWalkerToV3Public(*ns, outTw);
+                Value r = treeWalkerToV3Public(*ns, *outTwHeap);
                 popShallowTWAttrsBridge(prev);
                 return r;
             } catch (...) {

@@ -3813,21 +3813,19 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         // `let f = tw_id; in [f f]` after a v3 -> tw -> v3 transition
         // loses `f`.
         //
-        // #483 part 2: HEAP-allocate the bridgeSrc.  Several callers
-        // (vm.cc OP_CALL Bridge handler, primops bridging derivationStrict
-        // / builtins.path) pass STACK-allocated `nix::Value` -- &nv would
-        // be a dangling stack pointer once the caller's frame returned,
-        // and a subsequent force of the Bridge thunk would read garbage
-        // (manifesting as TW "not a function but a list" on use-after-free).
-        // Always copy into a heap slot via allocValue so bridgeSrc remains
-        // valid for the bridge thunk's lifetime.  Identity is preserved
-        // semantically (TW callFunction dispatches on the function value's
-        // SHAPE, not pointer identity); the slight allocation cost is
-        // unavoidable given v3 has no static "this is heap" guarantee
-        // about its callers' nix::Value& parameters.
-        nix::Value * heap = ns.allocValue();
-        *heap = nv;
-        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(heap));
+        // #484 STG-style address identity: bridgeSrc is `&nv` --
+        // the ORIGINAL TW Value pointer the caller handed us.  TW
+        // updates value cells in place (classic STG knot-tying);
+        // any snapshot copy here would freeze a pre-fix-point view
+        // of the value (manifested as nixpkgs by-name-overlay.nix:54
+        // `self._internalCallByNamePackageFile missing` -- the
+        // captured self was a copy of the thunk before the overlay's
+        // contributions were merged in place).  Callers MUST pass
+        // a heap-allocated nix::Value (vm.cc OP_CALL Bridge handler
+        // and callClosure both heap-allocate `outTw` for this reason).
+        // Stack-local Values would dangle; address identity ALSO
+        // matters for in-place updates -- both invariants now hold.
+        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
         allocStats().thunksAllocated++;
         out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         out.payload.thunk = bridge;
@@ -3835,16 +3833,8 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
     }
     case nix::nExternal: {
         // REVIEW_2026-05-04 B-9 / §6.7: bridge external values back as
-        // a v3 Bridge thunk, mirroring the nFunction case above (REVIEW
-        // MED-1).  Used by experimental fetchers / FFI extensions whose
-        // values are opaque to v3 -- without the Bridge wrap, the
-        // round-trip `tw → v3 → tw` would lose the original via
-        // `mkNull` and any downstream coerceToString / `==` would see
-        // null instead of the external value.
-        // #483 part 2: heap-allocate (see nFunction case rationale).
-        nix::Value * heap = ns.allocValue();
-        *heap = nv;
-        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(heap));
+        // a v3 Bridge thunk, mirroring the nFunction case above.
+        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
         allocStats().thunksAllocated++;
         out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         out.payload.thunk = bridge;
@@ -3859,10 +3849,11 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         // thunk for args[1].  Wrapping as a Bridge thunk preserves
         // laziness all the way to the v3 body's first force, mirroring
         // TW's regular callFunction (which doesn't force args either).
-        // #483 part 2: heap-allocate (see nFunction case rationale).
-        nix::Value * heap = ns.allocValue();
-        *heap = nv;
-        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(heap));
+        // #484 STG-style address identity: capture the ORIGINAL TW
+        // pointer (see nFunction case).  TW updates the thunk in place
+        // when forced; we MUST observe the post-update value, not a
+        // pre-update snapshot.
+        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
         allocStats().thunksAllocated++;
         out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         out.payload.thunk = bridge;
@@ -4469,9 +4460,14 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
                 if (dsAttr && dsAttr->value) cachedDrvStrict = dsAttr->value;
             }
             if (cachedDrvStrict) {
-                nix::Value result;
-                ns.callFunction(*cachedDrvStrict, *nargs, result, nix::noPos);
-                out = treeWalkerToV3(state, result);
+                // #484 STG-style address identity: heap-allocate so
+                // `&result` is a stable address for any v3 Bridge
+                // thunk treeWalkerToV3 may install (TW updates value
+                // cells in place; the bridge thunk must observe the
+                // post-update value, not a snapshot).
+                nix::Value * result = ns.allocValue();
+                ns.callFunction(*cachedDrvStrict, *nargs, *result, nix::noPos);
+                out = treeWalkerToV3(state, *result);
                 return;
             }
         } catch (const std::exception & e) {
@@ -5813,9 +5809,10 @@ void primPath(EvalState & state, Value * args, Value & out)
             ns.forceAttrs(blt, nix::noPos, "v3 builtins.path bridge");
             auto * pAttr = blt.attrs()->get(ns.symbols.create("path"));
             if (pAttr && pAttr->value) {
-                nix::Value result;
-                ns.callFunction(*pAttr->value, *nargs, result, nix::noPos);
-                out = treeWalkerToV3(state, result);
+                // #484 STG-style address identity: see derivationStrict.
+                nix::Value * result = ns.allocValue();
+                ns.callFunction(*pAttr->value, *nargs, *result, nix::noPos);
+                out = treeWalkerToV3(state, *result);
                 return;
             }
         } catch (const std::exception & e) {
