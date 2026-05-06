@@ -1895,8 +1895,23 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     const CompilationUnit * cu = nullptr;
     if (it == cache.end()) {
         st.cacheMisses++;
-        if (diag) std::fprintf(stderr, "v3 hook: cache miss kind=%d\n",
-                               e ? (int)e->exprKind : -1);
+        if (diag) {
+            auto pos = e ? state.positions[e->getPos()] : nix::Pos{};
+            std::string ploc = std::visit(nix::overloaded{
+                [&](const nix::SourcePath & sp) -> std::string {
+                    return sp.path.abs() + ":" + std::to_string(pos.line);
+                },
+                [&](const auto &) -> std::string {
+                    auto & paths = v3ExprPaths();
+                    auto pit = e ? paths.find(e) : paths.end();
+                    if (pit != paths.end()) return pit->second.path.abs();
+                    return "<no-source>";
+                },
+            }, pos.origin);
+            std::fprintf(stderr, "v3 hook: cache miss kind=%d e=%p pos=%s\n",
+                                   e ? (int)e->exprKind : -1,
+                                   (const void*)e, ploc.c_str());
+        }
 
         // VM-4: try the disk cache before lower+compile.  Cache key
         // is SHA-256 of the source file content.  Gated on

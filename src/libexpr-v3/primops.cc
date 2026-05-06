@@ -3216,10 +3216,22 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
         } _fg(tlsFallbackDepth, fallbackExpr);
 
         static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
-        if (dbg) std::fprintf(stderr,
-            "v3 forceAttr: bridge blackholed: %s — re-running outer Expr "
-            "via tree-walker for attr '%s'\n",
-            ex.what(), std::string(name).c_str());
+        if (dbg) {
+            auto pos = ns.positions[fallbackExpr->getPos()];
+            std::string ploc = std::visit(nix::overloaded{
+                [&](const nix::SourcePath & sp) -> std::string {
+                    return sp.path.abs() + ":" + std::to_string(pos.line);
+                },
+                [&](const auto &) -> std::string { return "<no-source>"; },
+            }, pos.origin);
+            std::fprintf(stderr,
+                "v3 forceAttr: bridge blackholed: %s — re-running outer Expr "
+                "(kind=%d e=%p pos=%s) via tree-walker for attr '%s'\n",
+                ex.what(),
+                (int)fallbackExpr->exprKind, (const void*)fallbackExpr,
+                ploc.c_str(),
+                std::string(name).c_str());
+        }
         nix::Value tw;
         fallbackExpr->eval(ns, ns.baseEnv, tw);
         ns.forceValue(tw, pos);
