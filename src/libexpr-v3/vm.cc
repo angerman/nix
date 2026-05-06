@@ -700,6 +700,32 @@ namespace {
 /// tree-walker has via stack-local `vCur`), v3 cannot safely publish
 /// intermediate values.  Outermost-only and publish-to-all both
 /// corrupt nixpkgs.
+/// #457/#458 partial-bindings registry.  Side-table mapping a
+/// currently-being-forced (Black) Thunk to a partial Bindings*
+/// produced by OP_ATTRS_REC_INIT in its body.  Used by callers that
+/// need to access individual entries of a mid-construction rec-
+/// attrset (specifically OP_REC_BINDING_SLOT_REF, OP_ATTRS_SELECT,
+/// OP_ATTRS_HAS) without forcing the wrapping thunk.
+///
+/// Why a side-table instead of EARLY_PUBLISH (which writes to
+/// thunk.evaluated directly): EARLY_PUBLISH corrupts nested rec-
+/// attrset constructions, since each thunk has its own final value
+/// and writing the partial Bindings to an outer thunk's evaluated
+/// field can leave a wrong-typed value if the outer thunk's body
+/// produces something else.  The side-table is safe because the
+/// thunk's actual state machine is unchanged -- the side entry is
+/// just a hint that callers can use opportunistically.
+///
+/// Lifetime: entry added at OP_ATTRS_REC_INIT (when a thunk frame
+/// is on the stack); entry removed when forceValue completes the
+/// body normally (transition to Evaluated) or when an exception
+/// unwinds (clearBlackMarksOnException scans and clears).
+inline std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry()
+{
+    static thread_local std::unordered_map<Thunk *, Bindings *> tbl;
+    return tbl;
+}
+
 inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
 {
     // 2026-05-06 #457/#458: was opt-in (NIX_V3_EARLY_PUBLISH=1)
@@ -713,9 +739,33 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
     // via NIX_V3_NO_EARLY_PUBLISH=1 if a regression surfaces.
     static const bool s_disabled =
         std::getenv("NIX_V3_NO_EARLY_PUBLISH") != nullptr;
+    // Always populate the partial-bindings side-table for Tag::Attrs
+    // values, even if the thunk-state EARLY_PUBLISH is disabled --
+    // the side-table is a safer mechanism (doesn't corrupt nested
+    // thunks).  Only the eager state-flip part of EARLY_PUBLISH
+    // depends on s_disabled.
+    Tag t = v.tag();
+    if (t == Tag::Attrs && v.payload.bindings) {
+        static const bool s_dbg_reg =
+            std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
+        // Find the nearest Black thunk frame on the stack.  Inner-
+        // most-Black gets the registry entry -- it's the one whose
+        // body just ran OP_ATTRS_REC_INIT.
+        for (size_t i = vm.frames.size(); i > 0; --i) {
+            CallFrame & fr = vm.frames[i - 1];
+            if (!(fr.flags & CFF_THUNK_RETURN)) continue;
+            if (!fr.thunk) continue;
+            if (fr.thunk->state != ThunkState::Blackhole) continue;
+            partialBindingsRegistry()[fr.thunk] = v.payload.bindings;
+            if (s_dbg_reg) std::fprintf(stderr,
+                "v3 partialBindings: register thunk=%p bindings=%p size=%u\n",
+                (void *)fr.thunk, (void *)v.payload.bindings,
+                (unsigned)v.payload.bindings->size);
+            break;  // innermost-Black only
+        }
+    }
     if (s_disabled) return;
     // Only publish concrete values, not thunks/apps/blackholes.
-    Tag t = v.tag();
     if (t == Tag::Thunk || t == Tag::App || t == Tag::Blackhole) return;
     static const bool s_dbg =
         std::getenv("NIX_V3_EARLY_PUBLISH_DBG") != nullptr;
@@ -1789,6 +1839,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 fr.thunk->state = ThunkState::Evaluated;
                 fr.thunk->evaluated = retVal;
+                // #457/#458: clear the partial-Bindings registry
+                // entry now that the thunk's final value is set.
+                {
+                    auto & reg = partialBindingsRegistry();
+                    auto it = reg.find(fr.thunk);
+                    if (it != reg.end()) reg.erase(it);
+                }
 
                 // WC-38: the legacy "return-chain push" -- eagerly
                 // forcing the next thunk if the outer's body returned
@@ -2915,7 +2972,55 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
-                attrs = forceValue(vm, attrs);
+                // #457/#458: tolerant force.  If the source thunk is
+                // currently being forced (Black) elsewhere on the
+                // stack, forceValue throws BlackHole.  But the
+                // partial-Bindings side-table may have an entry for
+                // it (populated by OP_ATTRS_REC_INIT when the thunk's
+                // body ran).  Use that to recover the partial Bindings
+                // and proceed.  Allows mid-construction rec-attrset
+                // self-reference to work without the structural
+                // closure-capture redesign.
+                Bindings * recoveredBindings = nullptr;
+                if (attrs.tag() == Tag::Thunk && attrs.payload.thunk
+                    && attrs.payload.thunk->state == ThunkState::Blackhole) {
+                    auto & reg = partialBindingsRegistry();
+                    auto it = reg.find(attrs.payload.thunk);
+                    if (it != reg.end()) {
+                        recoveredBindings = it->second;
+                    }
+                }
+                if (recoveredBindings) {
+                    Value recovered;
+                    recovered.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                    recovered.payload.bindings = recoveredBindings;
+                    attrs = recovered;
+                } else {
+                    try {
+                        attrs = forceValue(vm, attrs);
+                    } catch (const BlackholeError &) {
+                        // Last-ditch: try the registry again (the
+                        // thunk's force might have transitioned but
+                        // the top-of-stack v3 thunk it's wrapping is
+                        // black).
+                        if (attrs.tag() == Tag::Thunk
+                            && attrs.payload.thunk) {
+                            auto & reg = partialBindingsRegistry();
+                            auto it = reg.find(attrs.payload.thunk);
+                            if (it != reg.end()) {
+                                Value recovered;
+                                recovered.tag_payload =
+                                    static_cast<uint64_t>(Tag::Attrs);
+                                recovered.payload.bindings = it->second;
+                                attrs = recovered;
+                            } else {
+                                throw;
+                            }
+                        } else {
+                            throw;
+                        }
+                    }
+                }
             }
             if (!attrs.isAttrs() || !attrs.payload.bindings) {
                 throw std::runtime_error(
@@ -3591,11 +3696,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 // re-throw the same error).
 static void clearBlackMarksOnException(VMState & vm, size_t exitDepth)
 {
+    auto & reg = partialBindingsRegistry();
     for (size_t i = vm.frames.size(); i > exitDepth; --i) {
         auto & fr = vm.frames[i - 1];
         if ((fr.flags & CFF_THUNK_RETURN) && fr.thunk
             && fr.thunk->state == ThunkState::Blackhole) {
             fr.thunk->state = ThunkState::Suspended;
+            // #457/#458: drop any partial-Bindings registry entry
+            // tied to this thunk -- the body didn't complete, so
+            // the partial Bindings is incomplete and must not leak
+            // to subsequent forces.
+            auto it = reg.find(fr.thunk);
+            if (it != reg.end()) reg.erase(it);
         }
     }
     // WC-37: also unwind the leftover frames pushed by the failed
@@ -4110,6 +4222,39 @@ Value forceValue(VMState & vm, Value v)
                             }
                         }
                     }
+                }
+            }
+            // #457/#458: before throwing, consult the partial-Bindings
+            // registry.  If this Black thunk's body has run
+            // OP_ATTRS_REC_INIT and registered a partial Bindings,
+            // return that as the resolved value.  This lets self-
+            // referential `with self;` and similar mid-construction
+            // attribute access work without forcing the wrapping
+            // thunk to completion (which is exactly what TW does via
+            // its lazy attr access on partial Bindings).
+            //
+            // Disable via NIX_V3_NO_PARTIAL_BINDINGS_RECOVER=1 if it
+            // misclassifies a real cycle.
+            {
+                static const bool s_disabled =
+                    std::getenv("NIX_V3_NO_PARTIAL_BINDINGS_RECOVER") != nullptr;
+                static const bool s_dbg_reg =
+                    std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
+                if (!s_disabled) {
+                    auto & reg = partialBindingsRegistry();
+                    auto it = reg.find(t);
+                    if (it != reg.end()) {
+                        if (s_dbg_reg) std::fprintf(stderr,
+                            "v3 partialBindings: RECOVER thunk=%p bindings=%p\n",
+                            (void *)t, (void *)it->second);
+                        Value out;
+                        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                        out.payload.bindings = it->second;
+                        return out;
+                    }
+                    if (s_dbg_reg) std::fprintf(stderr,
+                        "v3 partialBindings: NO RECOVERY for thunk=%p (registry size=%zu)\n",
+                        (void *)t, reg.size());
                 }
             }
             throw BlackholeError("v3 forceValue: infinite recursion (blackhole)");
