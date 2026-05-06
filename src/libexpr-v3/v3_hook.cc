@@ -2947,6 +2947,52 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         ~DepthGuard() { --d; }
     } guard(s_callDepth);
 
+    // #466 lambda-skip self-recursion guard.
+    //
+    // When lambda-skip routes the call-hook to a lambda's body_fid,
+    // the body's freeVar materialisation through Phase B (RecBuildSlot)
+    // builds Bindings of Bridge thunks wrapping TW env values.  In
+    // rec-attrset / fix-point patterns the body may invoke a callable
+    // that recurses through TW's callFunction back into THIS hook with
+    // the SAME ExprLambda* as `lambda`.  The depth guard above
+    // (s_callDepth) catches monotonic stack growth, but per-lambda
+    // re-entry is the more specific signal — refuse it before any
+    // setup (frame-build, upvalue materialise) happens, so TW handles
+    // via native callFunction and the v3 thunks left Black on the
+    // outer VMState's frames don't get mistaken for cycles by the
+    // inner call-hook's runLambda.  Same shape as primV3CallBridge1's
+    // tlsBridge1InProgress.
+    //
+    // Default-on; disable via NIX_V3_NO_LAMBDA_REENTRY_GUARD=1.
+    static const bool s_lambdaReentryGuard =
+        std::getenv("NIX_V3_NO_LAMBDA_REENTRY_GUARD") == nullptr;
+    static thread_local std::unordered_set<const nix::ExprLambda *>
+        tlsLambdaInProgress;
+    bool inserted = false;
+    if (s_lambdaReentryGuard) {
+        auto [it, ins] = tlsLambdaInProgress.insert(lambda);
+        (void)it;
+        if (!ins) {
+            static const bool s_dbg =
+                std::getenv("V3_DBG_LAMBDA_REENTRY") != nullptr;
+            if (s_dbg) std::fprintf(stderr,
+                "v3 lambda-skip re-entry guard fired: lambda=%p\n",
+                (const void *)lambda);
+            st.callHookGated++;
+            st.callHookGateReentrant++;
+            return false;
+        }
+        inserted = true;
+    }
+    struct LambdaInProgressGuard {
+        const nix::ExprLambda * l;
+        bool inserted;
+        std::unordered_set<const nix::ExprLambda *> & tbl;
+        ~LambdaInProgressGuard() {
+            if (inserted) tbl.erase(l);
+        }
+    } _lipg{lambda, inserted, tlsLambdaInProgress};
+
     // Probe the sub-Expr cache by ExprLambda*.  We register lambdas
     // alongside thunks in v3SubExprCache (lowerLambda + this hook
     // share the same map) -- the call hook differentiates by AST kind.
