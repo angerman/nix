@@ -6274,12 +6274,9 @@ const std::unordered_map<std::string, PrimOp> & allRegisteredPrimOps()
 void setNixEvalState(nix::EvalState * st) { tlNixEvalState = st; }
 nix::EvalState * getNixEvalState() { return tlNixEvalState; }
 
-void clearBridgeTables()
-{
-    v3BridgeAttrs().clear();
-    v3BridgeLists().clear();
-    v3BridgeClosures().clear();
-}
+// `clearBridgeTables()` removed in REVIEW_2026-05-06b PR4 hygiene
+// pass -- zero callers; daemon lifetime-aware bridge cleanup is a
+// separate, larger problem (see primop.hh comment).
 
 VMState * activeV3VM() { return tlActiveV3VMRef(); }
 ScopedActiveV3VM::ScopedActiveV3VM(VMState * cur)

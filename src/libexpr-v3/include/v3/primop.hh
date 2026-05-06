@@ -118,19 +118,12 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
 /// forced `funTw` first; this function performs no forcing.
 bool tryUnwrapBridge1Closure(const nix::Value & funTw, Value & outV3Fn);
 
-/// REVIEW MED-14: drop every entry from v3BridgeAttrs / v3BridgeLists /
-/// v3BridgeClosures.  These tables grow unboundedly with the number of
-/// lazy-bridged attrsets / lists / closures bridged across to tree-
-/// walker; on long-running daemons (Hydra, LSP, library consumers) the
-/// tables retain memory for the process lifetime.  Single-EvalState
-/// CLIs (like v3-eval) don't need to call this -- the tables are torn
-/// down at process exit.
-///
-/// SAFETY: only safe to call between top-level evals.  Existing
-/// PrimOpApp values referencing handles in these tables would
-/// dangle.  Caller is responsible for not retaining such values across
-/// the clear.
-void clearBridgeTables();
+/// REVIEW_2026-05-06b PR4: `clearBridgeTables()` removed.  The function
+/// existed for "long-running daemon" cleanup but had zero callers --
+/// keeping it advertised an option that nothing exercises and that
+/// can't be wired safely without lifetime tracking on outstanding
+/// PrimOpApp handles.  Future daemon support will need a real
+/// lifetime-aware solution rather than a manual flush hook.
 
 /// Apply a closure (or single-arg primop) to one argument and return
 /// the result, by re-entering the VM dispatch loop on the same VMState.

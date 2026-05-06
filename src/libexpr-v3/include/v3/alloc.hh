@@ -535,7 +535,7 @@ inline void dropStringContextEntries(const char * buf)
 /// Without this, the side-table grows linearly across evals; arena
 /// pointer reuse silently injects unrelated context.  The current
 /// v3-eval CLI is single-eval so it never triggers this; daemons
-/// should call between top-level evals (alongside clearBridgeTables).
+/// should call between top-level evals.
 inline void clearStringContextSideTable()
 {
     stringContextSideTable().clear();
