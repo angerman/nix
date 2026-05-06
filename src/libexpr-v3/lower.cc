@@ -1387,7 +1387,20 @@ struct Lowerer
             // Until that's fixed, leave the first-wins behaviour in
             // place; the closure-result refusal at v3CallFunctionEntry
             // remains the safety net.
-            if (kv.second.e)
+            //
+            // 2026-05-06 #458 step 6/6: opt-in via NIX_V3_LAMBDA_SKIP=1.
+            // With the slot-capture redesign (steps 1-5) in place, the
+            // self-referential-force pattern that previously broke
+            // lambda-skip should be sidestepped: closures captured
+            // inside per-attr Lambda bodies that reference the rec-
+            // attrset now see Tag::Slot pointing at heap-stable
+            // storage rather than the wrap thunk.  Validating in
+            // tandem with the slot-capture flag in this session.
+            static const bool lambdaSkip =
+                std::getenv("NIX_V3_LAMBDA_SKIP") != nullptr;
+            const bool isLambda = kv.second.e
+                && kv.second.e->exprKind == nix::Expr::Kind::Lambda;
+            if (kv.second.e && !(lambdaSkip && isLambda))
                 m.subExprFuncs.push_back({static_cast<const void *>(kv.second.e), fid});
             pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb,
                                 posIdxToHandle(kv.second.pos)});
