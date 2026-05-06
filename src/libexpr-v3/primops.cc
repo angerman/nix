@@ -3777,7 +3777,22 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         // function instead of mkNull).  Without this wrap, code like
         // `let f = tw_id; in [f f]` after a v3 -> tw -> v3 transition
         // loses `f`.
-        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
+        //
+        // #483 part 2: HEAP-allocate the bridgeSrc.  Several callers
+        // (vm.cc OP_CALL Bridge handler, primops bridging derivationStrict
+        // / builtins.path) pass STACK-allocated `nix::Value` -- &nv would
+        // be a dangling stack pointer once the caller's frame returned,
+        // and a subsequent force of the Bridge thunk would read garbage
+        // (manifesting as TW "not a function but a list" on use-after-free).
+        // Always copy into a heap slot via allocValue so bridgeSrc remains
+        // valid for the bridge thunk's lifetime.  Identity is preserved
+        // semantically (TW callFunction dispatches on the function value's
+        // SHAPE, not pointer identity); the slight allocation cost is
+        // unavoidable given v3 has no static "this is heap" guarantee
+        // about its callers' nix::Value& parameters.
+        nix::Value * heap = ns.allocValue();
+        *heap = nv;
+        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(heap));
         allocStats().thunksAllocated++;
         out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         out.payload.thunk = bridge;
@@ -3791,7 +3806,10 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         // round-trip `tw → v3 → tw` would lose the original via
         // `mkNull` and any downstream coerceToString / `==` would see
         // null instead of the external value.
-        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
+        // #483 part 2: heap-allocate (see nFunction case rationale).
+        nix::Value * heap = ns.allocValue();
+        *heap = nv;
+        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(heap));
         allocStats().thunksAllocated++;
         out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         out.payload.thunk = bridge;
@@ -3806,7 +3824,10 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         // thunk for args[1].  Wrapping as a Bridge thunk preserves
         // laziness all the way to the v3 body's first force, mirroring
         // TW's regular callFunction (which doesn't force args either).
-        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
+        // #483 part 2: heap-allocate (see nFunction case rationale).
+        nix::Value * heap = ns.allocValue();
+        *heap = nv;
+        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(heap));
         allocStats().thunksAllocated++;
         out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         out.payload.thunk = bridge;
