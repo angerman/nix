@@ -4827,7 +4827,31 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                     "v3 callClosure: bridge-thunk arg failed v3->TW bridge");
             nix::Value outTw;
             ns->callFunction(*funTw, *argTw, outTw, nix::noPos);
-            return treeWalkerToV3Public(*ns, outTw);
+            // #483 part 5: same lazy-result-bridge as the OP_CALL
+            // Bridge handler (vm.cc:1487).  TW callFunction may return
+            // an unforced thunk for a fix-point self-attr that is
+            // mid-construction; eager treeWalkerToV3Public would
+            // throw "attribute X missing" via ExprSelect::eval.
+            if (outTw.type<true>() == nix::nThunk) {
+                nix::Value * heap = ns->allocValue();
+                *heap = outTw;
+                Thunk * bridge = Alloc::allocBridgeThunk(
+                    static_cast<void *>(heap));
+                allocStats().thunksAllocated++;
+                Value v3out;
+                v3out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+                v3out.payload.thunk = bridge;
+                return v3out;
+            }
+            bool prev = pushShallowTWAttrsBridge();
+            try {
+                Value r = treeWalkerToV3Public(*ns, outTw);
+                popShallowTWAttrsBridge(prev);
+                return r;
+            } catch (...) {
+                popShallowTWAttrsBridge(prev);
+                throw;
+            }
         }
     }
 

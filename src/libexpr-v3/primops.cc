@@ -3351,8 +3351,17 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         && v.payload.thunk->state == ThunkState::Bridge
         && v.payload.thunk->bridgeSrc) {
         nix::Value * orig = static_cast<nix::Value *>(v.payload.thunk->bridgeSrc);
-        // Force the original on the tree-walker side so callers see WHNF.
-        ns.forceValue(*orig, nix::noPos);
+        // #483 part 5: do NOT eager-force the original TW value here.
+        // The caller (typically TW via __v3_force_attr or similar)
+        // will forceValue when it needs WHNF, matching TW's own lazy
+        // discipline.  Eager-forcing under lambda-skip triggered
+        // ExprSelect::eval on a fix-point self-attr that wasn't yet
+        // published (e.g. by-name-overlay.nix:54 `self._internal-
+        // CallByNamePackageFile` -- the captured self in mapAttrs
+        // lambdas was mid-construction at the time of the force).
+        // Removing the force was load-bearing for one shape; if
+        // some caller requires WHNF, it should call forceValue on
+        // the returned pointer itself (which TW idiomatically does).
         return orig;
     }
     v = forceValue(*state.vm, v);
