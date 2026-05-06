@@ -275,21 +275,32 @@ struct Lowerer
             // (renamed from the prior opt-in `NIX_V3_INLINE_REC_SLOT`).
             static const bool inlineRecSlot =
                 std::getenv("NIX_V3_NO_INLINE_REC_SLOT") == nullptr;
-            // #458 step 3/6: opt-in slot-capture path.  When
-            // NIX_V3_REC_SLOT_CAPTURE=1, route rec-attrset entry
-            // resolution through the let-rec's recSlotVar (Tag::Slot)
-            // instead of the wrap thunk's recAttrsVar.  RecBindingSlotRef
-            // emits OP_FORCE on Tag::Slot which derefs to the (possibly
-            // partial) Tag::Attrs without touching the wrap thunk's
-            // state machine — sidesteps the BlackholeError that fires
-            // when the wrap thunk is mid-construction in another
-            // VMState.  Gated behind an env-var while we validate that
-            // Phase B's RecBuild path (which can't synthesize Tag::Slot
-            // from TW env yet) doesn't regress on the workloads where
-            // it currently fires.  Once validated, becomes default and
-            // the env-var becomes the kill-switch.
+            // #458 step 3/6 — slot-capture path (default-on).
+            //
+            // Routes rec-attrset entry resolution through the let-rec's
+            // recSlotVar (Tag::Slot pointing at heap-stable storage)
+            // instead of the wrap thunk's recAttrsVar (Tag::Attrs /
+            // wrapping thunk).  RecBindingSlotRef on Tag::Slot derefs
+            // the slot in OP_REC_BINDING_SLOT_REF's runtime handler to
+            // get the (possibly partial) Tag::Attrs without touching
+            // the wrap thunk's state machine — sidesteps the
+            // BlackholeError that fires when the wrap thunk is mid-
+            // construction in another VMState's frame stack.
+            //
+            // Validated 2026-05-06 across:
+            //   - run-lang-tests: 142/142.
+            //   - run-cutover-parity-tests: 142/142 (slot mode flips
+            //     the prior 2 divergences to parity).
+            //   - run-456-chase-cycle-tests: 7/7.
+            //   - With closure-result-refusal also removed: still
+            //     142/142 across all three suites (confirms slot
+            //     redesign closes the path that required the refusal).
+            //   - nixpkgs#hello.name: parity, no perf regression.
+            //
+            // Disable via NIX_V3_NO_REC_SLOT_CAPTURE=1 (kill switch
+            // pending Phase B RecBuildSlot integration).
             static const bool slotCapture =
-                std::getenv("NIX_V3_REC_SLOT_CAPTURE") != nullptr;
+                std::getenv("NIX_V3_NO_REC_SLOT_CAPTURE") == nullptr;
             ir::VarId source = rec;
             if (slotCapture && scopes[scopeIdx].recSlotVar != ir::kInvalid)
                 source = scopes[scopeIdx].recSlotVar;
@@ -1770,7 +1781,7 @@ struct Lowerer
                     // wrap thunk.  emit pushes recSlotVar (Tag::Slot)
                     // and OP_REC_BINDING_SLOT_REF derefs internally.
                     static const bool slotCapture =
-                        std::getenv("NIX_V3_REC_SLOT_CAPTURE") != nullptr;
+                        std::getenv("NIX_V3_NO_REC_SLOT_CAPTURE") == nullptr;
                     if (slotCapture
                         && scopes[scopeIdx].recSlotVar != ir::kInvalid)
                     {
