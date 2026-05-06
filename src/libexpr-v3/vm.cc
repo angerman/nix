@@ -4217,23 +4217,44 @@ Value forceValue(VMState & vm, Value v)
                     if (vm.frames[i].thunk == t) { onCurrentFrames = true; break; }
                 }
                 if (!onCurrentFrames) {
-                    // Per-thunk re-entry counter: if recovery recurs on
-                    // the same thunk pointer N times in a row from the
-                    // same VMState, the leak interpretation is wrong
-                    // (it's a real cycle).  Throw the BlackholeError
+                    // Per-(VMState, Thunk) re-entry counter: if recovery
+                    // recurs on the same thunk pointer N times in a row
+                    // from the same VMState, the leak interpretation is
+                    // wrong (it's a real cycle).  Throw the BlackholeError
                     // through the normal path instead of looping.
-                    static thread_local std::unordered_map<Thunk *, int> reentryCount;
-                    int & cnt = reentryCount[t];
+                    //
+                    // REVIEW_2026-05-06b C1: was a thread_local static
+                    // map keyed only by Thunk*.  Across multiple top-level
+                    // evals on the same thread, stale counts could leak
+                    // (a Thunk* freed in eval A whose address gets
+                    // reused for a NEW thunk in eval B inherits A's
+                    // count, mis-classifying a fresh leak as a "real
+                    // cycle").  Now keyed by (VMState*, Thunk*) so each
+                    // VMState has its own counter space.  Bounded blow-
+                    // up: stale entries from destroyed VMStates linger
+                    // until they hit the 4-attempt cap and are erased.
+                    struct KeyHash {
+                        size_t operator()(const std::pair<const void *, Thunk *> & p) const noexcept {
+                            return std::hash<const void *>{}(p.first)
+                                 ^ (std::hash<Thunk *>{}(p.second) << 1);
+                        }
+                    };
+                    static thread_local std::unordered_map<
+                        std::pair<const void *, Thunk *>, int, KeyHash>
+                        reentryCount;
+                    auto key = std::make_pair(
+                        static_cast<const void *>(&vm), t);
+                    int & cnt = reentryCount[key];
                     if (++cnt > 4) {
-                        reentryCount.erase(t);
+                        reentryCount.erase(key);
                         // Fall through to throw below.
                     } else {
                         static const bool s_dbgRec =
                             std::getenv("V3_DBG_LEAKED_BLACK") != nullptr;
                         if (s_dbgRec) std::fprintf(stderr,
                             "v3 forceValue: leaked-Black recover thunk=%p "
-                            "(frames=%zu, not on stack, attempt %d) -> Suspended\n",
-                            (void*)t, vm.frames.size(), cnt);
+                            "(vm=%p frames=%zu, not on stack, attempt %d) -> Suspended\n",
+                            (void*)t, (void*)&vm, vm.frames.size(), cnt);
                         t->state = ThunkState::Suspended;
                         continue;
                     }

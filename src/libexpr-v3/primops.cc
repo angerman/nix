@@ -2608,7 +2608,14 @@ int bridge1MaxDepth() {
     static const int k = []{
         if (const char * v = std::getenv("NIX_V3_BRIDGE1_DEPTH"))
             return std::max(0, std::atoi(v));
-        return 8;
+        // REVIEW_2026-05-06b PR1: bumped 8 → 16.  cardano-node hits the
+        // limit ≈10–18 times per eval at depth=8, paying ≈5 ms per
+        // fallback (~50–90 ms wasted).  Each extra frame costs ~50 µs
+        // worth of stack/local setup; doubling the headroom is
+        // essentially free and eliminates the bulk of the spurious
+        // depth-fallbacks.  Real cycles still surface (the depth is
+        // still bounded; cycles go infinite, not gradual).
+        return 16;
     }();
     return k;
 }
