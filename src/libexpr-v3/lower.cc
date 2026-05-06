@@ -1329,6 +1329,29 @@ struct Lowerer
             // closure-result refusal was implicitly masking that
             // bug.  Until the chase-cycle is fixed, leave the
             // first-wins behaviour in place; it's the lesser evil.
+            // 2026-05-06 #457/#458 NOTE: investigated whether to skip
+            // Lambda values here -- lowerLambda (line ~790) registers
+            // (lambda_expr, body_fid).  emplace's first-wins semantics
+            // makes the THUNK fid win for Lambda Exprs, so the call-
+            // hook calls the thunk (which produces a Closure value)
+            // instead of the body.  That triggers the closure-result
+            // refusal at v3CallFunctionEntry.
+            //
+            // Skipping Lambda values here lets the body-fid win.
+            // Tested with the #456 chase-cycle fix in place: still
+            // exposes a separate self-referential force pattern --
+            // a thunk gets Black-marked, its body recursively
+            // requires forcing itself, BlackHole thrown.  Frame
+            // dump (V3_DBG_OPCYCLE) shows the same "self" lambda
+            // re-entering itself across nested frames.  Real bug,
+            // not just a chase artifact -- v3's slot-threading for
+            // let-rec / fix-point captures isn't producing the
+            // lazy-attr-access path TW uses.  Tracked as a separate
+            // self-referential-force issue beyond #456.
+            //
+            // Until that's fixed, leave the first-wins behaviour in
+            // place; the closure-result refusal at v3CallFunctionEntry
+            // remains the safety net.
             if (kv.second.e)
                 m.subExprFuncs.push_back({static_cast<const void *>(kv.second.e), fid});
             pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb,
