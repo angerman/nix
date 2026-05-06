@@ -2140,6 +2140,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                     }
                 }
+                // #466 error-as-value (GHC-style mkBlackHole) — see
+                // forceValue's matching block for full rationale.
+                {
+                    static const bool s_blackholeAsValue =
+                        std::getenv("NIX_V3_NO_BLACKHOLE_AS_VALUE") == nullptr;
+                    if (s_blackholeAsValue) {
+                        bool onMyFrames = false;
+                        for (size_t i = 0; i < vm.frames.size(); ++i) {
+                            if (vm.frames[i].thunk == t) {
+                                onMyFrames = true; break;
+                            }
+                        }
+                        if (!onMyFrames) {
+                            push(vm, Value::vBlackhole);
+                            break;
+                        }
+                    }
+                }
                 throw BlackholeError("v3 OP_FORCE: infinite recursion (blackhole)");
             }
             // WC-10: Bridge thunk — call into tree-walker for the
@@ -4423,6 +4441,66 @@ Value forceValue(VMState & vm, Value v)
                         (void *)t, reg.size());
                 }
             }
+
+            // #466 error-as-value (GHC-style mkBlackHole).
+            //
+            // If the Black thunk is on THIS vm's frames, this is a
+            // genuine local cycle (`let x = x; in x` shape) — throw
+            // BlackholeError as before so tryEval / consumer error
+            // paths see the typed exception.
+            //
+            // If the Black thunk is on a FOREIGN vm's frames (typical
+            // under lambda-skip + bridge primop chains), the thunk is
+            // genuinely mid-construction in another VMState; throwing
+            // here triggers fallbackToTreeWalker retry chains that
+            // re-create fresh VMStates and grow the C-stack
+            // unboundedly.  Instead, return the Tag::Blackhole singleton
+            // as a propagating sentinel value.  Most consumers (OP_CALL,
+            // OP_ATTRS_*, OP_ADD, etc.) fail naturally on Blackhole
+            // operands with regular type errors, which propagate
+            // cleanly without retry cycles.  Bridge primops convert the
+            // Blackhole back to TW's mkBlackHole sentinel so TW's
+            // existing infinite-recursion protocol takes over.
+            //
+            // Mirrors GHC's blackhole-as-value protocol (rts/sm/Evac.c
+            // eval_thunk_selector and friends): when forcing a thunk
+            // that's already under evaluation by another stack, return
+            // a marker rather than blocking or throwing immediately;
+            // let the marker propagate through the operation chain
+            // until something concrete tries to use it.
+            //
+            // Default-on; opt out via NIX_V3_NO_BLACKHOLE_AS_VALUE=1
+            // for bisecting any regression.
+            {
+                static const bool s_blackholeAsValue =
+                    std::getenv("NIX_V3_NO_BLACKHOLE_AS_VALUE") == nullptr;
+                if (s_blackholeAsValue) {
+                    bool onMyFrames = false;
+                    for (size_t i = 0; i < vm.frames.size(); ++i) {
+                        if (vm.frames[i].thunk == t) {
+                            onMyFrames = true; break;
+                        }
+                    }
+                    if (!onMyFrames) {
+                        static const bool s_dbgBhv =
+                            std::getenv("V3_DBG_BLACKHOLE_AS_VALUE") != nullptr;
+                        if (s_dbgBhv) {
+                            static thread_local uint64_t hits = 0;
+                            if (++hits == 1 || (hits & (hits - 1)) == 0)
+                                std::fprintf(stderr,
+                                    "v3 blackhole-as-value: thunk=%p (vm=%p, "
+                                    "frames=%zu) returning vBlackhole "
+                                    "(hits=%llu)\n",
+                                    (void *)t, (void *)&vm,
+                                    vm.frames.size(),
+                                    (unsigned long long)hits);
+                        }
+                        return Value::vBlackhole;
+                    }
+                    // Local cycle — fall through to throw.
+                }
+            }
+
             throw BlackholeError("v3 forceValue: infinite recursion (blackhole)");
         }
         if (t->state == ThunkState::Bridge) {

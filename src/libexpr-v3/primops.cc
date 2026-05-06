@@ -3530,10 +3530,22 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         out->mkPrimOpApp(bridgePrimOp1, vHandle);
         break;
     }
+    case Tag::Blackhole: {
+        // #466 GHC-style sentinel: v3 produced a Blackhole value
+        // (typically because forceValue saw a foreign-vm Black thunk
+        // and chose to propagate-as-value rather than throw).  Bridge
+        // back to TW as TW's own mkBlackhole sentinel; TW's
+        // ExprBlackHole::eval throws InfiniteRecursionError on use,
+        // and tryEval / consumer error paths catch via the typed
+        // exception.  This is the inverse of the v3-side
+        // forceValue change: throw → return value, then back across
+        // the bridge: value → throw via TW's protocol.
+        out->mkBlackhole();
+        break;
+    }
     case Tag::Uninitialized:
     case Tag::Thunk:
     case Tag::App:
-    case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
     default: {
