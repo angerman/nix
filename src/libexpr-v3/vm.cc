@@ -1400,6 +1400,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 auto * ns = getNixEvalState();
                 auto * funTw = static_cast<nix::Value *>(
                     fun.payload.thunk->bridgeSrc);
+                // #466 active-v3-vm tracking: announce that this vm is
+                // bridging out, so any TW callback into v3 hooks can
+                // detect the re-entry and refuse cycle-prone paths
+                // (lambda-skip's body_fid invocation in particular).
+                ScopedActiveV3VM _activeV3VM(&vm);
                 ns->forceValue(*funTw, nix::noPos);
 
                 // #466 OP_CALL Bridge round-trip elimination.
@@ -4421,6 +4426,12 @@ Value forceValue(VMState & vm, Value v)
             throw BlackholeError("v3 forceValue: infinite recursion (blackhole)");
         }
         if (t->state == ThunkState::Bridge) {
+            // #466 active-v3-vm tracking: forceBridgeThunk goes
+            // through TW (treeWalkerToV3 → ns->forceValue), so any v3
+            // hook re-entered from that TW work sees this vm as the
+            // active outer.  Lets v3CallFunctionEntry refuse cycle-
+            // prone re-entries (lambda-skip's body_fid).
+            ScopedActiveV3VM _activeV3VM(&vm);
             v = forceBridgeThunk(t);
             t->state = ThunkState::Evaluated;
             t->evaluated = v;

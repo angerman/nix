@@ -115,6 +115,20 @@ std::unordered_map<std::string, PrimOp> & registry()
 
 thread_local nix::EvalState * tlNixEvalState = nullptr;
 
+/// #466 active-v3-vm tracking — defined out-of-line in primop.hh.
+///
+/// When v3 executes a Bridge-out call (OP_CALL Bridge handler that
+/// goes through ns->callFunction → TW → potentially v3 hooks), this
+/// thread_local pointer is set to the OUTER v3 VMState.  Lets the
+/// call-hook detect "we're being re-entered from inside an outer v3
+/// force chain" and refuse early — preventing the cross-VMState
+/// BlackHole cycle that's at the heart of the lambda-skip cycle.
+inline VMState *& tlActiveV3VMRef()
+{
+    thread_local VMState * p = nullptr;
+    return p;
+}
+
 /// #466 nested-bridge-primop depth bound.
 ///
 /// Tracks how deeply we've nested calls into the v3 bridge primops
@@ -6254,6 +6268,11 @@ void clearBridgeTables()
     v3BridgeLists().clear();
     v3BridgeClosures().clear();
 }
+
+VMState * activeV3VM() { return tlActiveV3VMRef(); }
+ScopedActiveV3VM::ScopedActiveV3VM(VMState * cur)
+    : prev(tlActiveV3VMRef()) { tlActiveV3VMRef() = cur; }
+ScopedActiveV3VM::~ScopedActiveV3VM() { tlActiveV3VMRef() = prev; }
 
 // Per-primop call counters keyed by primop name (string_view backed by
 // the registered PrimOp::name).  Aggregates across the whole process —

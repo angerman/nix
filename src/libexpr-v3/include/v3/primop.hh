@@ -137,6 +137,19 @@ void clearBridgeTables();
 /// Used by callback primops.  Throws if `fun` is not callable.
 Value callClosure(VMState & vm, Value fun, Value arg);
 
+/// #466 active-v3-vm tracking.  Returns the OUTER v3 VMState that is
+/// currently bridging out via OP_CALL Bridge or forceBridgeThunk's
+/// TW force; nullptr when no v3 vm is in flight.  Used by the call-
+/// hook to detect "we're being re-entered from inside an outer v3
+/// force chain" and refuse early to prevent the cross-VMState
+/// BlackHole cycle.
+VMState * activeV3VM();
+struct ScopedActiveV3VM {
+    VMState * prev;
+    ScopedActiveV3VM(VMState * cur);
+    ~ScopedActiveV3VM();
+};
+
 /// Force a thunk to WHNF.  Pass-through for non-thunk values.  Re-enters
 /// the dispatch loop on the same VMState (used by primops like tryEval
 /// that need to force from C++).

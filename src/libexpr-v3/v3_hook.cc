@@ -2947,6 +2947,29 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         ~DepthGuard() { --d; }
     } guard(s_callDepth);
 
+    // #466 active-v3-vm pre-refusal.
+    //
+    // If we're being called from INSIDE an active v3 vm (set by
+    // OP_CALL Bridge handler in vm.cc), runLambda would create a
+    // FRESH vm B whose body might force v3 thunks Black on the outer
+    // vm A's frames — the cross-VMState force scenario at the heart
+    // of the lambda-skip cycle (#466).  Refuse early so TW handles
+    // via native callFunction; the outer vm A's body completes
+    // normally without ever spawning B.
+    //
+    // Doesn't fire for top-level TW callFunction entries (no active
+    // v3 vm).  Default-on; disable via NIX_V3_NO_ACTIVE_V3_VM_REFUSE=1
+    // for benchmarking.
+    {
+        static const bool s_refuseInActiveV3 =
+            std::getenv("NIX_V3_NO_ACTIVE_V3_VM_REFUSE") == nullptr;
+        if (s_refuseInActiveV3 && activeV3VM() != nullptr) {
+            st.callHookGated++;
+            st.callHookGateReentrant++;
+            return false;
+        }
+    }
+
     // #466 lambda-skip self-recursion guard.
     //
     // When lambda-skip routes the call-hook to a lambda's body_fid,
