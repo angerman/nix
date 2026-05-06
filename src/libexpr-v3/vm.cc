@@ -702,9 +702,18 @@ namespace {
 /// corrupt nixpkgs.
 inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
 {
-    static const bool s_enabled =
-        std::getenv("NIX_V3_EARLY_PUBLISH") != nullptr;
-    if (!s_enabled) return;
+    // 2026-05-06 #457/#458: was opt-in (NIX_V3_EARLY_PUBLISH=1)
+    // because earlier nixpkgs runs corrupted under both outermost-only
+    // and publish-to-all variants.  After the #456 chase-cycle fix
+    // (vm.cc forceValue Bridge→Bridge break) and the OP_CALL Bridge-
+    // thunk handler, re-tested on hello.name, git.name, vim, curl,
+    // coreutils, python3, nodejs, cardano-node default — all produce
+    // correct output, full regression suite green, no perf regression
+    // (~1% faster on cardano-node).  Flipped default-on.  Disable
+    // via NIX_V3_NO_EARLY_PUBLISH=1 if a regression surfaces.
+    static const bool s_disabled =
+        std::getenv("NIX_V3_NO_EARLY_PUBLISH") != nullptr;
+    if (s_disabled) return;
     // Only publish concrete values, not thunks/apps/blackholes.
     Tag t = v.tag();
     if (t == Tag::Thunk || t == Tag::App || t == Tag::Blackhole) return;
