@@ -3223,9 +3223,42 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
                 static const bool diagCall =
                     std::getenv("V3_DEBUG_CALL_RESULT") != nullptr;
                 if (diagCall) {
+                    auto pos = state.positions[lambda->getPos()];
+                    std::string posStr = std::visit(nix::overloaded{
+                        [&](const nix::SourcePath & sp) -> std::string {
+                            return sp.path.abs() + ":" +
+                                   std::to_string(pos.line) + ":" +
+                                   std::to_string(pos.column);
+                        },
+                        [](const auto &) -> std::string {
+                            return "<no-source>";
+                        },
+                    }, pos.origin);
+                    std::string extra;
+                    if (rt == Tag::Closure && r.payload.closure
+                        && r.payload.closure->desc) {
+                        const auto * d = r.payload.closure->desc;
+                        extra = " result-closure-desc=";
+                        extra += !d->name.empty() ? d->name : "<anon>";
+                        extra += " code=[";
+                        extra += std::to_string(d->codeOffset);
+                        extra += "..)";
+                    }
+                    std::string entInfo;
+                    if (ent.cu && ent.funcIdx < ent.cu->lambdas.size()) {
+                        const auto & ld = ent.cu->lambdas[ent.funcIdx];
+                        entInfo = " ent.funcIdx=";
+                        entInfo += std::to_string(ent.funcIdx);
+                        entInfo += " ent.desc.name=";
+                        entInfo += !ld.name.empty() ? ld.name : "<anon>";
+                        entInfo += " ent.desc.code=[";
+                        entInfo += std::to_string(ld.codeOffset);
+                        entInfo += "..)";
+                    }
                     std::fprintf(stderr,
-                        "v3 call-hook closure-shape result tag=%d lambda=%p\n",
-                        (int)rt, (void *)lambda);
+                        "v3 call-hook closure-shape result tag=%d lambda=%p pos=%s%s%s\n",
+                        (int)rt, (void *)lambda, posStr.c_str(),
+                        entInfo.c_str(), extra.c_str());
                 }
                 return false;
             }

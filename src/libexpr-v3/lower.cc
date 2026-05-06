@@ -1313,6 +1313,22 @@ struct Lowerer
             // this, real-world workloads only register depth-0
             // bindings, leaving the bulk of forced thunks with no
             // v3 candidate flag and forceEntries=0.
+            //
+            // 2026-05-06 #457/#458 NOTE: investigated whether to skip
+            // this registration for Lambda values (the lowerLambda
+            // pass at line 790 also registers the Lambda Expr* but
+            // with the BODY fid).  Under emplace's "first-wins"
+            // semantics, this thunk-fid wins, and v3's call-hook
+            // ends up calling the thunk function (which just
+            // creates a Closure value) instead of the lambda body.
+            // That's actually what produces the Tag::Closure result
+            // that #436's closure-result refusal protects against.
+            // FIXING this exposed a deeper Slot/Thunk chase cycle
+            // (#456) on every nixpkgs workload (cardano-node, hello.
+            // name, git.name all errored on default v3) -- the
+            // closure-result refusal was implicitly masking that
+            // bug.  Until the chase-cycle is fixed, leave the
+            // first-wins behaviour in place; it's the lesser evil.
             if (kv.second.e)
                 m.subExprFuncs.push_back({static_cast<const void *>(kv.second.e), fid});
             pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb,

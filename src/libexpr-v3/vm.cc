@@ -3873,10 +3873,33 @@ Value forceValue(VMState & vm, Value v)
     // (e.g., `let inherit outer; in outer` returns the outer thunk),
     // and we want to chase the chain until we land on a real value.
     while (true) {
-        if (__builtin_expect(++chaseIters > kMaxChaseIters, 0))
+        if (__builtin_expect(++chaseIters > kMaxChaseIters, 0)) {
+            // V3_DBG_CHASE: dump the last few values we visited to
+            // localize Slot/Thunk cycles.  Only fires on the
+            // pathological cycle path; cheap because rarely entered.
+            static const bool s_dbg = std::getenv("V3_DBG_CHASE") != nullptr;
+            if (s_dbg) {
+                std::fprintf(stderr,
+                    "v3 chase-cycle: last v.tag=%d payload.thunk=%p"
+                    " payload.slot=%p memoSlot=%p\n",
+                    (int)v.tag(),
+                    v.tag() == Tag::Thunk ? (void*)v.payload.thunk : nullptr,
+                    v.tag() == Tag::Slot ? (void*)v.payload.slot : nullptr,
+                    (void*)memoSlot);
+                if (v.tag() == Tag::Thunk && v.payload.thunk
+                    && v.payload.thunk->state == ThunkState::Evaluated) {
+                    Value e = v.payload.thunk->evaluated;
+                    std::fprintf(stderr,
+                        "  thunk evaluated tag=%d slot=%p thunk=%p\n",
+                        (int)e.tag(),
+                        e.tag() == Tag::Slot ? (void*)e.payload.slot : nullptr,
+                        e.tag() == Tag::Thunk ? (void*)e.payload.thunk : nullptr);
+                }
+            }
             throw std::runtime_error(
                 "v3 forceValue: infinite recursion (chase cycle through "
                 "Tag::Slot/Tag::Thunk indirections)");
+        }
         // Same call-depth guard — `let x = x; in x` lands here in
         // a C++ recursion via dispatchLoop → forceValue → dispatchLoop
         // and never grows through the bytecode-level OP_CALL/OP_FORCE
