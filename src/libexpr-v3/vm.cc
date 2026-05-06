@@ -2874,10 +2874,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         SymbolId want = static_cast<SymbolId>(operand);
                         std::fprintf(stderr,
                             "v3 OP_ATTRS_SELECT miss: want sid=%u name=\"%s\" "
-                            "bindings=%p size=%u present=[",
+                            "bindings=%p size=%u ip=%u present=[",
                             (unsigned)want,
                             want < symTab.size() ? symTab[want].c_str() : "?",
-                            (void*)b, (unsigned)b->size);
+                            (void*)b, (unsigned)b->size, (unsigned)ip);
                         for (uint32_t i = 0; i < b->size && i < 20; ++i) {
                             SymbolId nm = b->entries[i].name;
                             std::fprintf(stderr, "%s%s",
@@ -2886,6 +2886,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                         if (b->size > 20) std::fprintf(stderr, ",...");
                         std::fprintf(stderr, "]\n");
+                        // Frame stack so we can identify WHICH function
+                        // emitted this OP_ATTRS_SELECT.
+                        std::fprintf(stderr, "  frame stack size=%zu (top first):\n",
+                            vm.frames.size());
+                        for (size_t fi = vm.frames.size(); fi > 0; --fi) {
+                            const auto & fr = vm.frames[fi - 1];
+                            const LambdaDescriptor * d = nullptr;
+                            if (fr.thunk && fr.thunk->state == ThunkState::Blackhole)
+                                d = fr.thunk->suspended.desc;
+                            else if (fr.closure)
+                                d = fr.closure->desc;
+                            std::fprintf(stderr,
+                                "    [%zu] %s ip=%u thunk=%p closure=%p flags=%u\n",
+                                fi - 1,
+                                d && !d->name.empty() ? d->name.c_str() : "<?>",
+                                fr.ip,
+                                (void*)fr.thunk, (void*)fr.closure,
+                                (unsigned)fr.flags);
+                        }
+                        if (cu) {
+                            uint32_t lo = ip > 16 ? ip - 16 : 0;
+                            uint32_t hi = ip + 8;
+                            std::fprintf(stderr,
+                                "  failing-frame disasm [%u..%u):\n", lo, hi);
+                            disassembleWindow(stderr, *cu, lo, hi);
+                        }
+                        std::fflush(stderr);
                     }
                     throw std::runtime_error("v3 OP_ATTRS_SELECT: attribute not found");
                 }

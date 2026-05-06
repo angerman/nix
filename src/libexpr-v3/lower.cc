@@ -1131,14 +1131,49 @@ struct Lowerer
     /// single VarId per displ.  Caller must have just pushed the
     /// matching inheritFromStack entry; we push the matching cache
     /// entry here.
+    ///
+    /// #466 / #482: thunkify each from-expr so its evaluation is
+    /// DEFERRED until at least one of the inherited names is actually
+    /// demanded.  Mirrors tree-walker's `from->maybeThunk(state, up)`
+    /// in `ExprAttrs::buildInheritFromEnv` (eval.cc:1520).  Eager
+    /// `lowerExpr` was running during attrset construction; for
+    /// `inherit (self.X) Y` inside a `self:` lambda passed to a
+    /// fix-point helper (e.g. nixpkgs's `makeExtensible'`), eager
+    /// evaluation tripped on `self` mid-construction and surfaced
+    /// as `OP_ATTRS_SELECT: attribute not found` (the let-bindings
+    /// scope ended up on the stack instead of the lambda's parameter
+    /// when v3 owned the body — lambda-skip + nixpkgs lib pattern).
+    /// Sharing across the N inherited names is preserved: a single
+    /// MkThunk binding produces one VarId referenced by N AttrDefs.
     void pushInheritFromCache(std::pmr::vector<nix::Expr *> * fromExprs)
     {
+        // #482 / Phase of #466: when lambda-skip is on, v3 owns lambda
+        // body execution.  Eager `lowerExpr` emits the from-expr
+        // directly into the lambda body's bytecode -- if the from-expr
+        // touches a let-rec/rec-attrset value mid-construction (e.g.
+        // `inherit (self.X) Y` inside a `self:` lambda passed to a
+        // fix-point helper like nixpkgs's `makeExtensible'`), the
+        // eager evaluation runs DURING attrset construction and trips
+        // on the mid-construction self.  Tree-walker's
+        // `from->maybeThunk(state, up)` (eval.cc:1520) defers via
+        // thunk wrappers; mirror that here ONLY when lambda-skip is
+        // active.  Default mode keeps eager (the call-hook's wrong-
+        // shape pre-refusal routes Lambda Exprs to TW so eager from-
+        // expr never gets v3-emitted under default semantics).
+        // Override with NIX_V3_NO_INHERIT_FROM_THUNK=1.
+        static const bool s_lambdaSkip =
+            std::getenv("NIX_V3_LAMBDA_SKIP") != nullptr;
+        static const bool s_noThunkify =
+            std::getenv("NIX_V3_NO_INHERIT_FROM_THUNK") != nullptr;
+        const bool useThunk = s_lambdaSkip && !s_noThunkify;
         std::vector<ir::VarId> cache;
         if (fromExprs) {
             cache.resize(fromExprs->size(), ir::kInvalid);
             for (size_t i = 0; i < fromExprs->size(); ++i) {
                 if ((*fromExprs)[i])
-                    cache[i] = lowerExpr((*fromExprs)[i]);
+                    cache[i] = useThunk
+                        ? thunkifyForAttr((*fromExprs)[i])
+                        : lowerExpr((*fromExprs)[i]);
             }
         }
         inheritFromCacheStack.push_back(std::move(cache));
