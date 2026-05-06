@@ -142,6 +142,7 @@ uint64_t opcodeTableFingerprint()
             {"OP_ATTRS_HAS_DYN",   OP_ATTRS_HAS_DYN},
             {"OP_ATTRS_UPDATE",    OP_ATTRS_UPDATE},
             {"OP_REC_BINDING_SLOT_REF", OP_REC_BINDING_SLOT_REF},
+            {"OP_REC_SLOT_PUBLISH", OP_REC_SLOT_PUBLISH},
             {"OP_APPLY_OVERRIDES", OP_APPLY_OVERRIDES},
             {"OP_WITH_PUSH",       OP_WITH_PUSH},
             {"OP_WITH_POP",        OP_WITH_POP},

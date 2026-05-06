@@ -294,6 +294,13 @@ static bool lowerCompileAndPopulate(
 static void noteParseCollectMapException();
 static void noteParsePrecompileException();
 
+// REVIEW_2026-05-06b C4: out-of-line per-failClass populator counters.
+// populateSubExprCacheLocal (line ~875) lives before V3HookStats's
+// full definition; same pattern as the B4 catch counters above.
+static void notePopulateRefuseRecNoOrigin();
+static void notePopulateRefuseRecSlotNoOrigin();
+static void notePopulateRefuseSyntheticNoOrigin();
+
 static void v3RegisterExprEntry(nix::EvalState & state,
                                  const nix::Expr * e,
                                  const nix::SourcePath & p)
@@ -900,6 +907,7 @@ static void populateSubExprCacheLocal(
                             sef.funcIdx, fv);
                         failClass = "rec-no-origin";
                         failedVar = fv;
+                        notePopulateRefuseRecNoOrigin();
                         ok = false; break;
                     }
                     UpvalueSource src;
@@ -929,6 +937,7 @@ static void populateSubExprCacheLocal(
                             sef.funcIdx, fv);
                         failClass = "recSlot-no-origin";
                         failedVar = fv;
+                        notePopulateRefuseRecSlotNoOrigin();
                         ok = false; break;
                     }
                     UpvalueSource src;
@@ -953,6 +962,7 @@ static void populateSubExprCacheLocal(
                         sef.funcIdx, fv);
                     failClass = "synthetic-no-origin";
                     failedVar = fv;
+                    notePopulateRefuseSyntheticNoOrigin();
                     ok = false; break;
                 }
                 UpvalueSource src;
@@ -1220,6 +1230,17 @@ struct V3HookStats {
     /// silent.
     uint64_t parseHookCollectMapException    = 0;
     uint64_t parseHookPrecompileException    = 0;
+
+    /// REVIEW_2026-05-06b C4: per-failClass Phase B populator refusal
+    /// counters.  Phase B refuses an entry when it can't synthesize
+    /// upvalueSources for one of its freeVars; the failClass tells us
+    /// which freeVar shape was the blocker.  Without per-class
+    /// counters, every refusal collapses into the generic
+    /// callHookCacheMiss bucket and bisecting #455-class regressions
+    /// requires recompiling with V3_DEBUG_NOUPV=1.
+    uint64_t populateRefuseRecNoOrigin       = 0; // recVarSet ∩ no origin
+    uint64_t populateRefuseRecSlotNoOrigin   = 0; // recSlotVarSet ∩ no origin
+    uint64_t populateRefuseSyntheticNoOrigin = 0; // varOrigins miss
 };
 
 V3HookStats & v3HookStats()
@@ -1238,6 +1259,20 @@ static void noteParseCollectMapException()
 static void noteParsePrecompileException()
 {
     v3HookStats().parseHookPrecompileException++;
+}
+
+// REVIEW_2026-05-06b C4 — out-of-line per-failClass populator counters.
+static void notePopulateRefuseRecNoOrigin()
+{
+    v3HookStats().populateRefuseRecNoOrigin++;
+}
+static void notePopulateRefuseRecSlotNoOrigin()
+{
+    v3HookStats().populateRefuseRecSlotNoOrigin++;
+}
+static void notePopulateRefuseSyntheticNoOrigin()
+{
+    v3HookStats().populateRefuseSyntheticNoOrigin++;
 }
 
 /// Statically detect whether evaluating `e` will produce a closure
@@ -1659,6 +1694,20 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                         "v3 parse-hook silent-catches: collectMap=%llu precompile=%llu (NOT crashes — opportunistic, but unexpected if non-zero)\n",
                         (unsigned long long)s.parseHookCollectMapException,
                         (unsigned long long)s.parseHookPrecompileException);
+                }
+                // REVIEW_2026-05-06b C4: per-failClass Phase B refusal
+                // counters.  Lets bisecting of #455-class regressions
+                // happen via stats dump instead of V3_DEBUG_NOUPV
+                // recompiles.  Only print non-zero buckets to keep
+                // the output tight.
+                if (s.populateRefuseRecNoOrigin
+                    || s.populateRefuseRecSlotNoOrigin
+                    || s.populateRefuseSyntheticNoOrigin) {
+                    std::fprintf(stderr,
+                        "v3 phaseB populate refuse: rec-no-origin=%llu recSlot-no-origin=%llu synthetic-no-origin=%llu\n",
+                        (unsigned long long)s.populateRefuseRecNoOrigin,
+                        (unsigned long long)s.populateRefuseRecSlotNoOrigin,
+                        (unsigned long long)s.populateRefuseSyntheticNoOrigin);
                 }
             });
         }
