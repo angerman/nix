@@ -68,6 +68,27 @@ EXP_T1P4='15'
 # T1.n1 — same as p1 but with NIX_V3_NO_CALL_FORMALS=1 (legacy path).
 #         Should still produce identical result.
 
+# T2 — re-entrancy depth lift: nested v3 call-hook entries now allowed
+#       up to NIX_V3_CALL_DEPTH_LIMIT=8 by default (was 0).
+# T2.p1 — recursion (nested v3 hook fires)
+cat > "$TMP/t2p1.nix" <<'EOF'
+let
+  fact = n: if n <= 1 then 1 else n * fact (n - 1);
+in fact 6
+EOF
+EXP_T2P1='720'
+
+# T2.p2 — mutual recursion
+cat > "$TMP/t2p2.nix" <<'EOF'
+let
+  even = n: if n == 0 then true else odd (n - 1);
+  odd = n: if n == 0 then false else even (n - 1);
+in [(even 10) (odd 10)]
+EOF
+EXP_T2P2='[ true false ]'
+
+# T2.n1 — depth=0 (legacy refuse-nested) still produces correct results.
+
 ok=0
 fail=0
 fail_names=()
@@ -97,6 +118,7 @@ modes=(
   "tw::"
   "v3::NIX_USE_V3=1"
   "v3-noform::NIX_USE_V3=1 NIX_V3_NO_CALL_FORMALS=1"
+  "v3-depth0::NIX_USE_V3=1 NIX_V3_CALL_DEPTH_LIMIT=0"
 )
 
 for spec in "${modes[@]}"; do
@@ -106,6 +128,8 @@ for spec in "${modes[@]}"; do
   run_one "$tag/T1p2" "$TMP/t1p2.nix" "$EXP_T1P2" "${envarr[@]}"
   run_one "$tag/T1p3" "$TMP/t1p3.nix" "$EXP_T1P3" "${envarr[@]}"
   run_one "$tag/T1p4" "$TMP/t1p4.nix" "$EXP_T1P4" "${envarr[@]}"
+  run_one "$tag/T2p1" "$TMP/t2p1.nix" "$EXP_T2P1" "${envarr[@]}"
+  run_one "$tag/T2p2" "$TMP/t2p2.nix" "$EXP_T2P2" "${envarr[@]}"
 done
 
 echo "=== gate-removal tests: ok=$ok fail=$fail (total=$((ok+fail))) ==="

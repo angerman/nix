@@ -2754,21 +2754,25 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     }
     bool hasFormals = lambda->getFormals().has_value();
 
-    // Re-entrancy guard: cap nested call-hook entries.  Default 0
-    // (any nested entry falls back to tree-walker) is the verified-
-    // fast baseline.  Widening the limit (e.g. 32) is a real
-    // possibility -- on PP-enabled workloads it lifts hits 57 -> 6043
-    // on hello.name -- but currently nets a perf regression because
-    // the additional runs include many `closure-result refused` (the
-    // v3 body produced a Tag::Closure that can't bridge back, so the
-    // work was wasted).  Until we add a static "will return closure"
-    // predicate on the call hook (parallel to v3EvalEntry's
-    // willReturnClosure), keep the default at 0.  Override via
-    // NIX_V3_CALL_DEPTH_LIMIT for A/B testing.
+    // Re-entrancy guard: cap nested call-hook entries.
+    //
+    // 2026-05-06 #457/#458 T2: was default 0 (any nested entry
+    // declines).  That was a hard "exit to TW on any nested call"
+    // policy -- exactly what we're trying to eliminate.  Re-measured
+    // on cardano-node default after T1 (formals gate flip): depth=8
+    // is parity with depth=0 (1.36-1.48s user vs 1.36-1.43s, in
+    // noise), full regression suite green.  Flipped default to 8.
+    //
+    // The closure-result-refused work-waste argued in the original
+    // comment still applies, but T1 + T3 (closure-result refusal
+    // re-investigation) is the right place to address that.  Keeping
+    // depth=0 just to avoid waste-on-closure-results is a worse cure
+    // than the disease (declines all nested calls vs filters which
+    // ones produce closures).  Override via NIX_V3_CALL_DEPTH_LIMIT.
     static const int kCallDepthLimit = []{
         if (const char * v = std::getenv("NIX_V3_CALL_DEPTH_LIMIT"))
             return std::max(0, std::atoi(v));
-        return 0;
+        return 8;
     }();
     static thread_local int s_callDepth = 0;
     if (s_callDepth > kCallDepthLimit) { st.callHookGated++; st.callHookGateReentrant++; return false; }
