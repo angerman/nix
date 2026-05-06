@@ -484,19 +484,23 @@ struct Emitter
         emitVarRef(e.attrs); emitVarRef(e.nameVar);
         unit.code.push_back(encode(OP_ATTRS_SELECT_DYN));
     }
-    /// SECD-style heap-stable slot reference: push the rec-attrset,
-    /// force it to attrset shape, then push a Tag::Slot Value
-    /// pointing into Bindings::entries[i].value.  See ir.hh +
-    /// vm.cc OP_REC_BINDING_SLOT_REF for rationale.
+    /// SECD-style heap-stable slot reference: push the rec-attrset
+    /// and let OP_REC_BINDING_SLOT_REF look up the entry, pushing a
+    /// Tag::Slot Value pointing into Bindings::entries[i].value.
+    /// See ir.hh + vm.cc OP_REC_BINDING_SLOT_REF for rationale.
+    ///
+    /// #458 step 5/6: dropped the emit-time OP_FORCE that previously
+    /// preceded OP_REC_BINDING_SLOT_REF.  The runtime handler already
+    /// forces / Tag::Slot-derefs its source on the fast path, and
+    /// the emit-time prefix added a redundant dispatch (mirrors the
+    /// REVIEW-COMP §8.6 MED-5 cleanup that removed OP_FORCE before
+    /// OP_WITH_PUSH).  In slot-capture mode the source is Tag::Slot
+    /// and an explicit OP_FORCE would chain a deref-then-no-op;
+    /// dropping it lets the slot deref happen in one place inside
+    /// the OP_REC_BINDING_SLOT_REF handler.
     void emitOne(const ir::RecBindingSlotRef & e)
     {
         emitVarRef(e.attrs);
-        // This is an emit-time literal force (no lower.cc origin).
-        // Record it under the emit.cc line that synthesised it so
-        // V3_DBG_FORCE_SITE traces can still attribute the offset.
-        recordForceSite(internEmitSiteString(
-            "emit.cc:" V3_STRINGIFY(__LINE__)));
-        unit.code.push_back(encode(OP_FORCE));
         unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.name));
     }
     void emitOne(const ir::HasAttr & e)
