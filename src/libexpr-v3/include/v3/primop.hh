@@ -201,6 +201,48 @@ void registerPrimOp(const PrimOp & op);
 /// Idempotent; call during EvalState init.
 void registerBuiltinPrimOps();
 
+/// #458 step B: bridge telemetry.  Track every v3<->TW value bridging
+/// site so we can see (a) how often each direction fires and (b) how
+/// much wall-time we spend in each.  The user directive: minimise
+/// v3->tw->v3 round-trips.  The telemetry is the ground truth that
+/// tells us where to attack next.
+///
+/// Counters are atomic uint64_t and always-on (~1 ns per call).
+/// Timings are atomic uint64_t nanoseconds, gated by
+/// NIX_V3_BRIDGE_TIMING=1 because steady_clock::now() is ~10-30 ns
+/// per call and would dominate the bridges we're measuring.
+///
+/// Six bridge sites are instrumented:
+///   - twToV3_full:   `treeWalkerToV3Public` whole-value bridge.
+///   - twToV3_scalar: scalar fast-path hits.
+///   - twToV3_attr:   `tryBridgeAttrLookup` per-attr peek (success).
+///   - twToV3_has:    `tryBridgeAttrHas` per-attr existence (success).
+///   - v3ToTw:        `v3ToTreeWalkerPublic` whole-value bridge.
+///   - twForce:       TW state.forceValue calls from v3 hooks (force
+///                    cycles that route TW->v3->TW->v3).
+enum class BridgeKind : uint8_t {
+    TwToV3Full = 0,
+    TwToV3Scalar,
+    TwToV3Attr,
+    TwToV3Has,
+    V3ToTw,
+    TwForce,
+    Count
+};
+
+void bridgeTelemetryBump(BridgeKind k, uint64_t ns);
+void dumpBridgeTelemetry(std::FILE * out);
+
+/// RAII timer that bumps the per-kind counter and (when timing is
+/// enabled) accumulates wall time.  Use:
+///   { BridgeTimer t(BridgeKind::TwToV3Full); ... heavy work ... }
+struct BridgeTimer {
+    BridgeKind kind;
+    uint64_t startNs;
+    BridgeTimer(BridgeKind k);
+    ~BridgeTimer();
+};
+
 /// Per-primop call counter.  Bumped on every OP_CALL_PRIMOP.  Used
 /// for profiling — invaluable for working out which primops are hot
 /// on a real-world workload (nixpkgs, cardano-node) vs the synthetic

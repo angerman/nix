@@ -81,6 +81,13 @@ Opt-in features (off by default unless noted):
     opcode-table fingerprint (caches invalidate on opcode renumbering).
   - `NIX_V3_BRIDGE1_DEPTH=N`:  cap nested `__v3_call_bridge_1` calls.
     Default 8.  Bounds pthread-stack burn on deep overlay chains.
+  - `NIX_V3_BRIDGE_TIMING=1`:  enable per-bridge wall-time accumulation
+    in the #458 step B telemetry (always-on counts, opt-in timings).
+    Adds ~10-30 ns per bridge call (`steady_clock::now()`); the
+    per-direction nsTotal lets you see e.g. that v3->tw consumed
+    250 ms over 5000 calls = 50 us avg.  The dump fires at exit
+    when any of NIX_V3_PRIMOP_DUMP / NIX_VM_STATS / V3_TIMING is set.
+    Counters (without timings) print regardless.
   - `NIX_V3_NO_BRIDGE1_SHORTCIRCUIT=1`:  disable the #458 step 2
     bridge1 short-circuit.  Default ON: when TW's `callFunction`
     encounters `mkPrimOpApp(__v3_call_bridge_1, handle)`, route

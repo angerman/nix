@@ -1557,6 +1557,14 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 // for native conversion.
                 if (std::getenv("NIX_V3_PRIMOP_DUMP"))
                     dumpPrimOpStats(stderr);
+                // #458 step B: bridge telemetry.  Always dump (the
+                // function returns early if no bridges fired).  Used
+                // to localize "where does v3 still go through TW"
+                // independent of call-hook traffic.  OUTSIDE the
+                // callHookEntries > 0 gate above so workloads that
+                // don't fire the call hook (small evals, fib-style)
+                // still see bridge counts.
+                dumpBridgeTelemetry(stderr);
             });
         }
         return true;
@@ -3190,27 +3198,31 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // similar coerce-to-X (cardano-node hits this on
     // `assert enableGold -> withGold stdenv.targetPlatform`).
     //
-    // Mirrors v3ForceEntry's result switch (vm.cc:1875-1908) which
-    // already declines closure-shape results for the same reason.
-    // Tree-walker re-runs the call natively when we return false.
-    //
-    // Stat counter: forceHookClosureResultRefused tracks how often
-    // this path fires, so we can spot regressions where v3 bodies
-    // start returning closures more frequently.
+    // 2026-05-06 attempt: tried removing the refusal to reduce
+    // v3->tw->v3 bridging, since step 2's shortcut was meant to keep
+    // closure dispatches v3-side.  Result: #455 minimal-repro
+    // POSITIVE regression test failed under
+    // ON_DEMAND_ROOT+SKIP_THRESHOLD=0 -- the eager-bridge guard was
+    // load-bearing for that case.  Restored the refusal.  Use
+    // NIX_V3_NO_REFUSE_CLOSURE_RESULT=1 to opt out for experimentation.
     {
-        Tag rt = r.tag();
-        if (rt == Tag::Closure || rt == Tag::PrimOp || rt == Tag::PrimOpApp
-            || rt == Tag::Thunk || rt == Tag::App || rt == Tag::Blackhole)
-        {
-            v3HookStats().callHookClosureResultRefused++;
-            static const bool diagCall =
-                std::getenv("V3_DEBUG_CALL_RESULT") != nullptr;
-            if (diagCall) {
-                std::fprintf(stderr,
-                    "v3 call-hook closure-shape result tag=%d lambda=%p\n",
-                    (int)rt, (void *)lambda);
+        static const bool noRefuse =
+            std::getenv("NIX_V3_NO_REFUSE_CLOSURE_RESULT") != nullptr;
+        if (!noRefuse) {
+            Tag rt = r.tag();
+            if (rt == Tag::Closure || rt == Tag::PrimOp || rt == Tag::PrimOpApp
+                || rt == Tag::Thunk || rt == Tag::App || rt == Tag::Blackhole)
+            {
+                v3HookStats().callHookClosureResultRefused++;
+                static const bool diagCall =
+                    std::getenv("V3_DEBUG_CALL_RESULT") != nullptr;
+                if (diagCall) {
+                    std::fprintf(stderr,
+                        "v3 call-hook closure-shape result tag=%d lambda=%p\n",
+                        (int)rt, (void *)lambda);
+                }
+                return false;
             }
-            return false;
         }
     }
 

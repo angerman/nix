@@ -27,6 +27,8 @@
 #include "v3/bridge_yield.hh"
 #include "v3/errors.hh"
 
+#include <chrono>
+
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/print.hh"
@@ -6186,6 +6188,10 @@ void bumpPrimOpCallCount(const PrimOp * po)
 
 void dumpPrimOpStats(std::FILE * out)
 {
+    // #458 step B note: bridge telemetry is dumped separately from
+    // v3_hook.cc's atexit handler (outside this function) so it
+    // fires regardless of call-hook traffic.  Don't dump again here.
+
     // #453 Phase D: bridge primop counters (TW->v3 callbacks).  Print
     // before the v3-side primop counts because they're the actual
     // cutover-cost signal; high counts here mean v3 result values
@@ -6272,6 +6278,7 @@ void dumpHotDescriptors(std::FILE * out, size_t limit,
 namespace { extern nix::Value * (*v3ToTreeWalkerShim)(nix::EvalState &, Value); }
 nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v)
 {
+    BridgeTimer _bt(BridgeKind::V3ToTw);
     // #458 step B note: tried adding a scalar fast-path here that
     // skipped the v3ToTreeWalker shim's VMState alloc when v was a
     // forced scalar.  Measured ~3-5% regression on cardano-node and
@@ -6412,6 +6419,7 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
 /// resulting type tree to produce a v3 Value.
 Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv)
 {
+    BridgeTimer _bt(BridgeKind::TwToV3Full);
     // REVIEW MED-16: stack-allocated.
     VMState bridgeShimVm;
     bridgeShimVm.valueStack.reserve(64 * 1024);
@@ -6432,6 +6440,7 @@ Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv)
 /// the bridge thunk needs tree-walker context to make sense.
 Value forceBridgeThunk(Thunk * t)
 {
+    BridgeTimer _bt(BridgeKind::TwForce);
     if (!t || t->state != ThunkState::Bridge || !t->bridgeSrc)
         throw std::runtime_error(
             "v3 forceBridgeThunk: thunk has no bridge source");
@@ -6556,10 +6565,13 @@ std::optional<Value> tryBridgeAttrLookup(Thunk * t, SymbolId v3name)
     // equivalent.  Common case for entries like `system = "x86..."`
     // that constant-folded into a forced scalar already.
     Value v3v;
-    if (tryFastBridgeScalarTwToV3(*a->value, v3v))
+    if (tryFastBridgeScalarTwToV3(*a->value, v3v)) {
+        bridgeTelemetryBump(BridgeKind::TwToV3Attr, 0);
         return v3v;
+    }
     try {
         v3v = treeWalkerToV3Public(*tlNixEvalState, *a->value);
+        bridgeTelemetryBump(BridgeKind::TwToV3Attr, 0);
         return v3v;
     } catch (...) {
         return std::nullopt;
@@ -6575,26 +6587,127 @@ bool tryFastBridgeScalarTwToV3(const nix::Value & nv, Value & out)
 {
     try {
         nix::ValueType tt = nv.type();
+        bool ok = false;
         if (tt == nix::nInt) {
             out.mkInt(nv.integer().value);
-            return true;
-        }
-        if (tt == nix::nFloat) {
+            ok = true;
+        } else if (tt == nix::nFloat) {
             out.mkFloat(nv.fpoint());
-            return true;
-        }
-        if (tt == nix::nBool) {
+            ok = true;
+        } else if (tt == nix::nBool) {
             out = nv.boolean() ? Value::vTrue : Value::vFalse;
-            return true;
-        }
-        if (tt == nix::nNull) {
+            ok = true;
+        } else if (tt == nix::nNull) {
             out.mkNull();
+            ok = true;
+        }
+        if (ok) {
+            // Bump the scalar-fast counter (no timing -- the work is
+            // a few ns and the steady_clock call would dwarf it).
+            bridgeTelemetryBump(BridgeKind::TwToV3Scalar, 0);
             return true;
         }
     } catch (...) {
         // type() may throw on uninit / blackhole; bail to slow path.
     }
     return false;
+}
+
+/// #458 step B: bridge telemetry storage + accessors.  See header
+/// for full design.  Always-on counts; opt-in timings.
+namespace {
+struct BridgeStats {
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> nsTotal{0};
+};
+BridgeStats & bridgeStats(BridgeKind k)
+{
+    static BridgeStats arr[(size_t)BridgeKind::Count];
+    return arr[(size_t)k];
+}
+} // anon ns
+
+bool bridgeTimingEnabled()
+{
+    static const bool e = std::getenv("NIX_V3_BRIDGE_TIMING") != nullptr;
+    return e;
+}
+
+void bridgeTelemetryBump(BridgeKind k, uint64_t ns)
+{
+    auto & s = bridgeStats(k);
+    s.count.fetch_add(1, std::memory_order_relaxed);
+    if (ns) s.nsTotal.fetch_add(ns, std::memory_order_relaxed);
+}
+
+BridgeTimer::BridgeTimer(BridgeKind k) : kind(k), startNs(0)
+{
+    if (bridgeTimingEnabled()) {
+        auto t = std::chrono::steady_clock::now();
+        startNs = (uint64_t)std::chrono::duration_cast<
+            std::chrono::nanoseconds>(t.time_since_epoch()).count();
+    }
+}
+BridgeTimer::~BridgeTimer()
+{
+    uint64_t ns = 0;
+    if (startNs) {
+        auto t = std::chrono::steady_clock::now();
+        uint64_t now = (uint64_t)std::chrono::duration_cast<
+            std::chrono::nanoseconds>(t.time_since_epoch()).count();
+        ns = now - startNs;
+    }
+    bridgeTelemetryBump(kind, ns);
+}
+
+void dumpBridgeTelemetry(std::FILE * out)
+{
+    static const char * labels[(size_t)BridgeKind::Count] = {
+        "tw->v3 full ",
+        "tw->v3 scalar",
+        "tw->v3 attr  ",
+        "tw->v3 has   ",
+        "v3->tw       ",
+        "tw force     ",
+    };
+    bool any = false;
+    for (size_t i = 0; i < (size_t)BridgeKind::Count; ++i) {
+        if (bridgeStats((BridgeKind)i).count.load(std::memory_order_relaxed)) {
+            any = true; break;
+        }
+    }
+    if (!any) return;
+    std::fprintf(out, "v3 bridge telemetry%s:\n",
+        bridgeTimingEnabled() ? " (count + nsTotal)" : " (count only -- "
+        "set NIX_V3_BRIDGE_TIMING=1 for timings)");
+    uint64_t totalCount = 0, totalNs = 0;
+    for (size_t i = 0; i < (size_t)BridgeKind::Count; ++i) {
+        uint64_t c = bridgeStats((BridgeKind)i).count.load(std::memory_order_relaxed);
+        uint64_t n = bridgeStats((BridgeKind)i).nsTotal.load(std::memory_order_relaxed);
+        totalCount += c;
+        totalNs    += n;
+        if (c == 0) continue;
+        if (bridgeTimingEnabled() && n) {
+            double ms = n / 1e6;
+            double avgNs = (double)n / c;
+            std::fprintf(out,
+                "  %s  count=%-12llu ns=%-15llu (%.3f ms total, %.0f ns avg)\n",
+                labels[i], (unsigned long long)c, (unsigned long long)n, ms, avgNs);
+        } else {
+            std::fprintf(out, "  %s  count=%llu\n", labels[i],
+                (unsigned long long)c);
+        }
+    }
+    if (totalCount) {
+        if (bridgeTimingEnabled() && totalNs) {
+            std::fprintf(out, "  %-13s  count=%-12llu ns=%-15llu (%.3f ms total)\n",
+                "TOTAL", (unsigned long long)totalCount,
+                (unsigned long long)totalNs, totalNs / 1e6);
+        } else {
+            std::fprintf(out, "  %-13s  count=%llu\n", "TOTAL",
+                (unsigned long long)totalCount);
+        }
+    }
 }
 
 /// #458 step A.4: existence-check sibling of tryBridgeAttrLookup for
@@ -6624,9 +6737,11 @@ BridgeAttrHasResult tryBridgeAttrHas(Thunk * t, SymbolId v3name)
         return BridgeAttrHasResult::Indeterminate;
     std::string_view nameStr = v3Tab[v3name];
     nix::Symbol twSym = tlNixEvalState->symbols.create(nameStr);
-    return bindings->get(twSym)
+    auto r = bindings->get(twSym)
         ? BridgeAttrHasResult::Present
         : BridgeAttrHasResult::Absent;
+    bridgeTelemetryBump(BridgeKind::TwToV3Has, 0);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
