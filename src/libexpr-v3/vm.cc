@@ -1428,6 +1428,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 static const bool s_disabled =
                     std::getenv("NIX_V3_NO_OP_CALL_BRIDGE_SHORTCUT") != nullptr;
                 if (!s_disabled && tryUnwrapBridge1Closure(*funTw, v3Fn)) {
+                    // #466 / #479 Phase 1: participate in the cross-
+                    // primop force chain.  The shortcut keeps work on
+                    // THIS vm (good for cycle locality), but a chain
+                    // of Bridge thunks each unwrapping to a different
+                    // closure can still grow C-stack unboundedly.  Key
+                    // by funTw pointer -- the same TW closure value
+                    // re-appearing on the chain IS the cycle.
+                    ForceChainGuard _fcg(
+                        ForceChainOp::OpCallBridge,
+                        reinterpret_cast<uint64_t>(funTw));
+                    if (_fcg.isCycle()) {
+                        throw BlackholeError(
+                            _fcg.atDepthCeiling()
+                            ? std::string("v3 OP_CALL bridge: force-chain depth ceiling reached")
+                            : std::string("v3 OP_CALL bridge: force-chain cycle"));
+                    }
                     // Local v3 dispatch on this vm.  No TW round-trip,
                     // no fresh VMState.
                     Value out = callClosure(vm, v3Fn, arg);

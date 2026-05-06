@@ -167,6 +167,78 @@ struct BridgePrimopDepthGuard {
     ~BridgePrimopDepthGuard() { --d; }
 };
 
+// ---------------------------------------------------------------------------
+// #466 / #479 Phase 1: cross-primop force-chain cycle detector.
+// ---------------------------------------------------------------------------
+//
+// See `ForceChainGuard` doc in primop.hh.  Storage helpers live inside
+// the surrounding anonymous namespace so the unordered_set/hash machinery
+// doesn't leak.  The class methods are defined out-of-line in the
+// `nix::v3` namespace below — needs a temporary close+reopen of the
+// enclosing anon ns since out-of-line method definitions cannot live
+// inside an anonymous namespace.
+
+struct ForceChainKey {
+    ForceChainOp op;
+    uint64_t     a;
+    uint64_t     b;
+    bool operator==(const ForceChainKey & o) const noexcept {
+        return op == o.op && a == o.a && b == o.b;
+    }
+};
+struct ForceChainKeyHash {
+    size_t operator()(const ForceChainKey & k) const noexcept {
+        // Mix tagged op with payloads via FNV-style multiply.  Cheap;
+        // collision quality matters less than per-call latency since
+        // the set rarely exceeds a few dozen entries in practice.
+        uint64_t h = 1469598103934665603ull;
+        h ^= static_cast<uint64_t>(k.op); h *= 1099511628211ull;
+        h ^= k.a;                          h *= 1099511628211ull;
+        h ^= k.b;                          h *= 1099511628211ull;
+        return static_cast<size_t>(h);
+    }
+};
+using ForceChainSet = std::unordered_set<ForceChainKey, ForceChainKeyHash>;
+
+inline ForceChainSet & forceChainSet()
+{
+    thread_local ForceChainSet s;
+    return s;
+}
+
+inline size_t forceChainMaxDepth()
+{
+    static const size_t k = []{
+        if (const char * v = std::getenv("NIX_V3_FORCE_CHAIN_DEPTH"))
+            return static_cast<size_t>(std::max(0, std::atoi(v)));
+        return static_cast<size_t>(256);
+    }();
+    return k;
+}
+
+} // close enclosing anonymous ns (line 108) for ForceChainGuard methods
+
+ForceChainGuard::ForceChainGuard(ForceChainOp op_, uint64_t a_, uint64_t b_)
+    : m_op(op_), m_keyA(a_), m_keyB(b_)
+{
+    auto & chain = forceChainSet();
+    size_t maxDepth = forceChainMaxDepth();
+    if (maxDepth > 0 && chain.size() >= maxDepth) {
+        m_overDepth = true;
+        return;
+    }
+    auto [it, ins] = chain.insert(ForceChainKey{m_op, m_keyA, m_keyB});
+    m_inserted = ins;
+}
+
+ForceChainGuard::~ForceChainGuard()
+{
+    if (m_inserted)
+        forceChainSet().erase(ForceChainKey{m_op, m_keyA, m_keyB});
+}
+
+namespace { // re-open enclosing anonymous ns (matches close at line 2722)
+
 /// REVIEW MED-13: scoped guard for tlNixEvalState.  Bridge entries
 /// installed only on null (`if (!tlNixEvalState) tlNixEvalState = &ns`)
 /// would silently use a stale pointer if a different EvalState later
@@ -2820,6 +2892,24 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         int64_t h;
         ~Bridge1Guard() { tlsBridge1InProgress.erase(h); }
     } _b1g{h};
+
+    // #466 / #479 Phase 1: cross-primop force-chain detector.  Catches
+    // cycles that span multiple bridge primops (each layer has its own
+    // handle so `tlsBridge1InProgress` above misses, but the chain's
+    // overall identity repeats here).  Throws BlackholeError before
+    // allocating the next VMState; fallbackToTreeWalker routes via TW.
+    ForceChainGuard _fcg(ForceChainOp::CallBridge1, static_cast<uint64_t>(h));
+    if (_fcg.isCycle()) {
+        try {
+            throw BlackholeError(
+                _fcg.atDepthCeiling()
+                ? std::string("v3 bridge1: force-chain depth ceiling reached")
+                : "v3 bridge1: force-chain cycle on handle=" + std::to_string(h));
+        } catch (const std::exception & ex) {
+            fallbackToTreeWalker(ex);
+            return;
+        }
+    }
     Value fn;
     try {
         if (useFiber && activeFiberDriverDepth == 0) {
@@ -3028,6 +3118,18 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
         uint64_t key;
         ~InProgressGuard() { tlsForceAttrInProgress.erase(key); }
     } _ipg{cycleKey};
+
+    // #466 / #479 Phase 1: cross-primop force-chain detector.
+    ForceChainGuard _fcg(ForceChainOp::ForceAttr,
+                         static_cast<uint64_t>(h),
+                         static_cast<uint64_t>(sid));
+    if (_fcg.isCycle()) {
+        throw BlackholeError(
+            _fcg.atDepthCeiling()
+            ? std::string("v3 forceAttr: force-chain depth ceiling reached")
+            : "v3 forceAttr: force-chain cycle on handle=" + std::to_string(h)
+              + " name=" + std::string(name));
+    }
     nix::Symbol resolvedName = ns.symbols.create(name);
     try {
         nix::Value * tmp = v3ToTreeWalker(v3state, *found);
@@ -3140,6 +3242,22 @@ static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
     const ListVec * l = v3list.payload.list;
     if (idx < 0 || (uint32_t)idx >= l->size)
         ns.error<nix::EvalError>("v3 forceListElem: index out of range").debugThrow();
+
+    // #466 / #479 Phase 1: cross-primop force-chain detector.  This
+    // primop previously had no cycle detection (only the global
+    // bridgePrimopDepth bound), so a chain ending in a list-elem
+    // re-entry would only surface after 64 levels of C-stack growth.
+    // Throwing a BlackholeError here lets the catch route via fallback.
+    ForceChainGuard _fcg(ForceChainOp::ForceListElem,
+                         static_cast<uint64_t>(h),
+                         static_cast<uint64_t>(idx));
+    if (_fcg.isCycle()) {
+        throw BlackholeError(
+            _fcg.atDepthCeiling()
+            ? std::string("v3 forceListElem: force-chain depth ceiling reached")
+            : "v3 forceListElem: force-chain cycle on handle=" + std::to_string(h)
+              + " idx=" + std::to_string(idx));
+    }
 
     ScopedNixEvalState _v3evalGuard(&ns);
     EvalState v3state;
@@ -6632,6 +6750,24 @@ Value forceBridgeThunk(Thunk * t)
     if (!tlNixEvalState)
         throw std::runtime_error(
             "v3 forceBridgeThunk: no tree-walker EvalState wired");
+
+    // #466 / #479 Phase 1: cross-primop force-chain detector.  Bridge
+    // thunks are the V3-side of a TW value; forcing one calls back into
+    // TW's forceValue (via treeWalkerToV3Public) which can re-enter the
+    // v3 hooks.  Without this guard a cycle through Bridge → TW force
+    // → TW callFunction → v3 hook → primV3ForceAttr → Bridge ... loops
+    // unbounded on the C stack.  Throw BlackholeError on re-entry; the
+    // OP_FORCE handler in vm.cc will translate via mkBlackhole-as-value
+    // for foreign-vm Black thunks, or surface as a proper TW infinite-
+    // recursion at the caller for same-vm cycles.
+    ForceChainGuard _fcg(ForceChainOp::ForceBridgeThunk,
+                         reinterpret_cast<uint64_t>(t));
+    if (_fcg.isCycle()) {
+        throw BlackholeError(
+            _fcg.atDepthCeiling()
+            ? std::string("v3 forceBridgeThunk: force-chain depth ceiling reached")
+            : "v3 forceBridgeThunk: force-chain cycle on thunk");
+    }
     auto * srcV = static_cast<nix::Value *>(t->bridgeSrc);
     // #438 diagnostic: dump the tree-walker source's raw layout right
     // before bridging.  If a Bridge source has been reclaimed and its

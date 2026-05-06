@@ -125,6 +125,53 @@ bool tryUnwrapBridge1Closure(const nix::Value & funTw, Value & outV3Fn);
 /// PrimOpApp handles.  Future daemon support will need a real
 /// lifetime-aware solution rather than a manual flush hook.
 
+/// #466 / #479 Phase 1: cross-primop force-chain cycle detector.
+///
+/// Every bridge entry point (`primV3CallBridge1`, `primV3ForceAttr`,
+/// `primV3ForceListElem`, `forceBridgeThunk`, the OP_CALL Bridge
+/// shortcut) allocates a fresh VMState.  When lambda-skip is on (or
+/// any time v3 owns more lambda execution), structural cycles can
+/// snake across MULTIPLE such entries -- each layer sees a different
+/// `(handle, sid)` tuple, so the per-primop `tlsBridge1InProgress` /
+/// `tlsForceAttrInProgress` sets miss the cycle entirely.  The C-stack
+/// then grows through every layer until SIGSEGV or until the static
+/// `bridgePrimopDepth` ceiling fires far above the real cycle.
+///
+/// `ForceChainGuard` records every bridge entry on a single per-thread
+/// set keyed by `(op, primary, secondary)`.  Re-entry on the same
+/// identity throws `BlackholeError` BEFORE allocating the next
+/// VMState, so the catch-side fallback (`fallbackToTreeWalker`) can
+/// route to TW with the C-stack intact.  The set scales to depths
+/// ~256 (default; tunable via `NIX_V3_FORCE_CHAIN_DEPTH`); when the
+/// depth ceiling is reached, the next entry also reports cycle so a
+/// pathological non-repeating chain still surfaces an error rather
+/// than running until SIGSEGV.
+enum class ForceChainOp : uint8_t {
+    CallBridge1      = 1,  // primV3CallBridge1 (handle h, 0)
+    ForceAttr        = 2,  // primV3ForceAttr (handle h, sid)
+    ForceListElem    = 3,  // primV3ForceListElem (handle h, idx)
+    ForceBridgeThunk = 4,  // forceBridgeThunk (thunk*, 0)
+    OpCallBridge     = 5,  // OP_CALL Bridge shortcut (funTw*, 0)
+};
+
+struct ForceChainGuard {
+    ForceChainGuard(ForceChainOp op, uint64_t primary, uint64_t secondary = 0);
+    ~ForceChainGuard();
+    bool isCycle() const noexcept { return m_overDepth || !m_inserted; }
+    /// Whether the guard was inserted at depth >= the configured ceiling
+    /// (`NIX_V3_FORCE_CHAIN_DEPTH`).  Differentiates "real cycle"
+    /// (re-entry on same key) from "depth bound" for diagnostics.
+    bool atDepthCeiling() const noexcept { return m_overDepth; }
+    ForceChainGuard(const ForceChainGuard &) = delete;
+    ForceChainGuard & operator=(const ForceChainGuard &) = delete;
+private:
+    ForceChainOp m_op;
+    uint64_t     m_keyA;
+    uint64_t     m_keyB;
+    bool         m_inserted  = false;
+    bool         m_overDepth = false;
+};
+
 /// Apply a closure (or single-arg primop) to one argument and return
 /// the result, by re-entering the VM dispatch loop on the same VMState.
 /// Used by callback primops.  Throws if `fun` is not callable.
