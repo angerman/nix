@@ -585,7 +585,14 @@ inline Value withLookup(VMState & vm, SymbolId name)
         for (size_t i = lim; i > 0; --i) {
             const auto & fr = vm.frames[i - 1];
             const LambdaDescriptor * d = nullptr;
-            if (fr.thunk) d = fr.thunk->suspended.desc;
+            // #498 fix: only read fr.thunk->suspended.desc when state
+            // is Suspended/Blackhole — Evaluated/Bridge thunks have a
+            // different union active, reading suspended.desc on them
+            // is undefined behaviour and aborts the diagnostic before
+            // printing the rest of the stack.
+            if (fr.thunk && (fr.thunk->state == ThunkState::Suspended
+                          || fr.thunk->state == ThunkState::Blackhole))
+                d = fr.thunk->suspended.desc;
             else if (fr.closure) d = fr.closure->desc;
             std::fprintf(stderr,
                 "    frame[%zu]: %s code=[%u..) ip=%u flags=%u thunk=%p withBase=%u\n",
@@ -594,6 +601,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                     : (d ? "<anon>" : "<root>"),
                 d ? d->codeOffset : 0, fr.ip,
                 (unsigned)fr.flags, (void *)fr.thunk, fr.withStackBase);
+            std::fflush(stderr);
         }
         // V3_DBG_WITH_DISASM=1: also dump each frame's bytecode in a
         // window around fr.ip in fr.cu (using the frame's actual
@@ -3350,7 +3358,65 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
 
         // --- With ---
-        case OP_WITH_PUSH: vm.withStack.push_back(pop(vm)); break;
+        case OP_WITH_PUSH: {
+            Value v = pop(vm);
+            // #498 diagnostic: trace OP_WITH_PUSH that pushes a 1-attr
+            // attrset whose only attr is "prev" — the bisect symptom
+            // that surfaces under broader thunkify.  Logs the pushing
+            // frame, ip, and chase through Tag::Slot/Tag::Thunk.
+            if (std::getenv("V3_DBG_WITH_PUSH_PREV")) {
+                Value chase = v;
+                int hops = 0;
+                while (hops < 4) {
+                    if (chase.tag() == Tag::Slot && chase.payload.slot) {
+                        chase = *chase.payload.slot;
+                    } else if (chase.tag() == Tag::Thunk
+                               && chase.payload.thunk
+                               && chase.payload.thunk->state == ThunkState::Evaluated) {
+                        chase = chase.payload.thunk->evaluated;
+                    } else break;
+                    ++hops;
+                }
+                if (chase.tag() == Tag::Attrs && chase.payload.bindings
+                    && chase.payload.bindings->size == 1) {
+                    SymbolId nm = chase.payload.bindings->entries[0].name;
+                    const auto & st = ir::globalSymbolTable();
+                    std::string s = nm < st.size() ? st[nm] : "<?>";
+                    if (s == "prev") {
+                        std::fprintf(stderr,
+                            "v3 OP_WITH_PUSH {prev}: cu=%p ip=%u frames=%zu\n",
+                            (void *)cu, ip - 1, vm.frames.size());
+                        // Dump bytecode window around the push.
+                        if (cu) {
+                            uint32_t lo = (ip > 8) ? ip - 8 : 0;
+                            uint32_t hi = ip + 4;
+                            std::fprintf(stderr,
+                                "  pushing-frame disasm [%u..%u):\n",
+                                lo, hi);
+                            disassembleWindow(stderr, *cu, lo, hi);
+                        }
+                        for (size_t fi = vm.frames.size(); fi > 0; --fi) {
+                            const auto & fr = vm.frames[fi - 1];
+                            const LambdaDescriptor * d = nullptr;
+                            if (fr.thunk
+                                && (fr.thunk->state == ThunkState::Suspended
+                                    || fr.thunk->state == ThunkState::Blackhole))
+                                d = fr.thunk->suspended.desc;
+                            else if (fr.closure) d = fr.closure->desc;
+                            std::fprintf(stderr,
+                                "  frame[%zu]: %s ip=%u flags=%u\n",
+                                fi - 1,
+                                d && !d->name.empty() ? d->name.c_str()
+                                    : (d ? "<anon>" : "<root>"),
+                                fr.ip, (unsigned)fr.flags);
+                        }
+                        std::fflush(stderr);
+                    }
+                }
+            }
+            vm.withStack.push_back(v);
+            break;
+        }
         case OP_WITH_POP:  vm.withStack.pop_back(); break;
         case OP_REC_SLOT_PUBLISH: {
             // #458 step 1/6 — heap-stable rec-attrset slot publish.
