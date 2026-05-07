@@ -365,6 +365,19 @@ struct Function {
     /// when bridging a formals closure back to TW (autoCallFunction needs
     /// the original ExprLambda for formals introspection).
     void *              astLambda = nullptr;
+
+    /// #495: native-intrinsic kind, mirrors LambdaDescriptor::Intrinsic
+    /// (enumerated as uint8_t here to keep ir.hh decoupled from
+    /// closure.hh's enum class).  Set by lower.cc's lowerLambda
+    /// structural-match pass; carried through to LambdaDescriptor at
+    /// emit time so OP_CALL can dispatch to the v3-native impl.
+    /// Values:
+    ///   0 = None
+    ///   1 = Fix
+    ///   2 = Extends
+    ///   3 = ComposeExtensions
+    ///   4 = ComposeManyExtensions
+    uint8_t             intrinsicKind = 0;
 };
 
 // ---------------------------------------------------------------------------

@@ -650,6 +650,63 @@ struct Lowerer
 
         return addBinding(ir::If{cond, thenB, elseB});
     }
+    /// #495: structurally match an ExprLambda's body against canonical
+    /// nix-stdlib fix-point patterns.  Returns the intrinsic kind code
+    /// (0=None, 1=Fix, ...) matching ir::Function::intrinsicKind.
+    ///
+    /// Currently recognises:
+    ///   Fix:  `f: let x = f x; in x`
+    ///         body = ExprLet(attrs={x = ExprCall(ExprVar(f), [ExprVar(x)])},
+    ///                        body=ExprVar(x))
+    ///
+    /// Future kinds (Extends, ComposeExtensions, ...) added incrementally.
+    /// Matchers are narrow on purpose -- if nixpkgs changes the canonical
+    /// shape, the lambda silently falls through to the non-intrinsic v3
+    /// dispatch (zero correctness loss; only optimization is lost).
+    uint8_t recogniseIntrinsic(nix::ExprLambda * e)
+    {
+        if (!e || !e->body || !e->arg) return 0;
+        if (e->getFormals()) return 0;     // intrinsics are simple-arg only
+
+        // Match Fix: body must be ExprLet with one binding `x = f x`,
+        // body of let must be `x`.
+        if (auto * letE = dynamic_cast<nix::ExprLet *>(e->body)) {
+            if (!letE->attrs || !letE->attrs->attrs) return 0;
+            const auto & defs = *letE->attrs->attrs;
+            if (defs.size() != 1) return 0;          // single binding
+            if (letE->attrs->dynamicAttrs
+                && !letE->attrs->dynamicAttrs->empty()) return 0;
+            const auto & [bindSym, bindDef] = *defs.begin();
+            if (bindDef.kind != nix::ExprAttrs::AttrDef::Kind::Plain) return 0;
+
+            // Binding's RHS must be ExprCall(f, [x]) -- one arg only.
+            auto * callE = dynamic_cast<nix::ExprCall *>(bindDef.e);
+            if (!callE || !callE->args.has_value()) return 0;
+            if (callE->args->size() != 1) return 0;
+
+            // callee must be ExprVar referencing the lambda's arg.
+            auto * fVar = dynamic_cast<nix::ExprVar *>(callE->fun);
+            if (!fVar) return 0;
+            if (fVar->name != e->arg) return 0;
+
+            // arg must be ExprVar referencing the let binding.
+            auto * xVar = dynamic_cast<nix::ExprVar *>((*callE->args)[0]);
+            if (!xVar) return 0;
+            if (xVar->name != bindSym) return 0;
+
+            // Let body must be ExprVar referencing the binding.
+            auto * bodyVar = dynamic_cast<nix::ExprVar *>(letE->body);
+            if (!bodyVar) return 0;
+            if (bodyVar->name != bindSym) return 0;
+
+            return 1;  // Intrinsic::Fix
+        }
+
+        // Future: Extends, ComposeExtensions matchers go here.
+
+        return 0;
+    }
+
     ir::VarId lowerLambda(nix::ExprLambda * e)
     {
         m.functions.emplace_back();
@@ -665,6 +722,27 @@ struct Lowerer
         // can carry it through to LambdaDescriptor and v3ToTreeWalker can
         // construct a proper TW Tag::tLambda for formals-closure bridges.
         m.functions[fid].astLambda  = static_cast<void *>(e);
+        // #495: structural-match for nix-stdlib intrinsics (lib.fix, etc.).
+        // OP_CALL on a closure with a non-zero intrinsicKind dispatches to
+        // a v3-native impl that runs the fix-point machinery in v3
+        // (eliminates the TW round-trip that today blocks lambda-skip
+        // default-on for nixpkgs -- see project_493_step3d_with_stack memo).
+        m.functions[fid].intrinsicKind = recogniseIntrinsic(e);
+        if (m.functions[fid].intrinsicKind != 0) {
+            static const bool s_dbg =
+                std::getenv("V3_DBG_INTRINSIC") != nullptr;
+            if (s_dbg) {
+                static const char * names[] = {
+                    "None", "Fix", "Extends", "ComposeExtensions",
+                    "ComposeManyExtensions",
+                };
+                uint8_t k = m.functions[fid].intrinsicKind;
+                std::fprintf(stderr,
+                    "v3 recogniseIntrinsic: fid=%u name='%s' kind=%s\n",
+                    (unsigned)fid, m.functions[fid].name.c_str(),
+                    k < (sizeof(names)/sizeof(names[0])) ? names[k] : "?");
+            }
+        }
 
         Scope inner;
 

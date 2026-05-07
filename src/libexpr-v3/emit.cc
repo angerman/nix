@@ -879,6 +879,15 @@ struct Emitter
             .formals        = {},
             .name           = f.name,
             .posHandle      = f.posHandle,
+            // #495: native-intrinsic kind (0=None, 1=Fix, 2=Extends, ...)
+            // -- when set, OP_CALL on a closure with this descriptor
+            // dispatches to a v3-native impl that evaluates the entire
+            // fix-point machinery without TW round-trips.  Carried
+            // through from ir::Function which lower.cc structurally-
+            // matched at lower-time.  (Ordered before .astLambda to
+            // match LambdaDescriptor's field declaration order --
+            // designated-initializer requirement under -Wreorder-init-list.)
+            .intrinsicKind  = static_cast<LambdaDescriptor::Intrinsic>(f.intrinsicKind),
             // #493: original ExprLambda* (or nullptr for synthesised
             // thunks).  Used by v3ToTreeWalker to construct TW Tag::tLambda
             // when bridging a formals closure back -- preserves

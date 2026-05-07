@@ -197,6 +197,28 @@ struct LambdaDescriptor
     /// in nixpkgs and now actually flow through v3 since #426.
     uint32_t selectorSym = 0;
 
+    /// #495: native intrinsic kind.  When recognised at lower-time,
+    /// the lambda's body matches a canonical Nix-stdlib pattern (lib.fix,
+    /// lib.extends, lib.composeExtensions, ...) and OP_CALL dispatches
+    /// to a v3-native implementation that evaluates the entire fix-
+    /// point machinery in v3 -- no TW round-trips.  Eliminates the
+    /// captured-env / with-stack mismatch that today blocks lambda-skip
+    /// default-on for nixpkgs (project_493_step3d_with_stack memo).
+    ///
+    /// Detection is structural AST match in lower.cc lowerLambda;
+    /// matchers are narrow (one canonical shape per kind), so a
+    /// nixpkgs change to fix.nix that alters the shape silently
+    /// falls through to the non-intrinsic v3 dispatch.  No
+    /// correctness loss -- intrinsics are PURE optimization.
+    enum class Intrinsic : uint8_t {
+        None                  = 0,
+        Fix                   = 1,  ///< fix = f: let x = f x; in x
+        Extends               = 2,  ///< extends = overlay: f: (final: ...)
+        ComposeExtensions     = 3,  ///< composeExtensions = f: g: final: prev: ...
+        ComposeManyExtensions = 4,  ///< composeManyExtensions = lib.foldr ...
+    };
+    Intrinsic intrinsicKind = Intrinsic::None;
+
     /// #493 / #484 follow-on: the original tree-walker `nix::ExprLambda *`
     /// this v3 LambdaDescriptor was lowered from, or nullptr if the
     /// lambda was synthesised internally (e.g., the per-formal default-
