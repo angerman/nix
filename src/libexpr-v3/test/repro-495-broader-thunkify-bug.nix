@@ -113,6 +113,35 @@
 #   `final`).  Pure mystery: skipping any single thunkify makes
 #   the bug disappear, no matter which one.
 #
+#   ROOT CAUSE NARROWED (V3_DBG_OP_CALL_POST=1, 2026-05-07):
+#
+#   At the OP_CALL invoking `platforms.select final`, arg.tag = 16
+#   = Tag::Slot.  So `select` IS being called with a slot pointer
+#   (correctly -- final is a let-binding, slot semantics expected).
+#   The bug is at the slot DEREF inside select's body: forcing
+#   slot → expects to find final's full attrset; instead finds the
+#   2-attr literal `{gcc=...; linux-kernel=...}` (the LEFT side of
+#   `// platforms.select final`).
+#
+#   This IS the C2 bug class: Tag::Slot semantic-staleness across
+#   structural change.  The slot's backing storage was assigned the
+#   wrong value somewhere -- either the LEFT-side literal in error,
+#   or the slot pointer itself aliases the wrong storage.
+#
+#   Hypothesis: 21 `inherit (self.X) Y` thunks each capture `self`
+#   as a Tag::Slot upvalue.  Combined with `final = ... // ...`
+#   OP_APPLY_OVERRIDES, the slot pointer space gets confused when
+#   threshold structures align (always 21 in the lib makeExtensible'
+#   shape).  Specific overlap not yet bisected.
+#
+#   NEXT INVESTIGATION:
+#   - Walk OP_REC_SLOT_PUBLISH and OP_APPLY_OVERRIDES to confirm
+#     where final's slot storage is written.
+#   - Compare slot pointer values at LIMIT=20 vs LIMIT=21 around
+#     elaborate's `... // platforms.select final` evaluation.
+#   - Check if the slot allocated for final aliases another slot
+#     in the makeExtensible' rec scope.
+#
 #   Tooling for further bisect (lower.cc + per-call-site labels):
 #     V3_DBG_LOWER_CALLS=1        -- log each lowerNixExpr call
 #     V3_DBG_SELF_DOT_FIRES=1     -- log each fire's ordinal + position

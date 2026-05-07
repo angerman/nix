@@ -1286,6 +1286,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // 5000-frame stack guard, not the tail-call counter.
             vm.tailCallCount = 0;
             Value arg = pop(vm), fun = pop(vm);
+            // V3_DBG_OP_CALL=1 logs every OP_CALL with the closure
+            // name + arg shape.  Used to trace the broader-thunkify
+            // upvalue bug.
+            static const bool s_dbgOpCall =
+                std::getenv("V3_DBG_OP_CALL") != nullptr;
+            if (s_dbgOpCall) {
+                const char * fname = "<?>";
+                if (fun.tag() == Tag::Closure && fun.payload.closure
+                    && fun.payload.closure->desc)
+                    fname = fun.payload.closure->desc->name.c_str();
+                int arg_tag = (int)arg.tag();
+                int arg_size = -1;
+                if (arg.tag() == Tag::Attrs && arg.payload.bindings)
+                    arg_size = arg.payload.bindings->size;
+                std::fprintf(stderr,
+                    "v3 OP_CALL: name=%s fun.tag=%d arg.tag=%d size=%d frames=%zu\n",
+                    fname, (int)fun.tag(), arg_tag, arg_size,
+                    vm.frames.size());
+            }
 
             // Force `fun` if it's a deferred shape (Tag::App from lazy
             // primops like mapAttrs, or a Thunk that lazy attr access
@@ -1576,6 +1595,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             const Closure * callee = fun.payload.closure;
             const LambdaDescriptor * desc = callee->desc;
+
+            // #495 follow-on bisect: log OP_CALL post-force for
+            // platform-named closures.  Used to trace the wrong-arg
+            // capture in the broader-thunkify upvalue bug.
+            if (std::getenv("V3_DBG_OP_CALL_POST")
+                && desc && !desc->name.empty()
+                && desc->name == "platform")
+            {
+                int arg_tag = (int)arg.tag();
+                int arg_size = -1;
+                if (arg.tag() == Tag::Attrs && arg.payload.bindings)
+                    arg_size = arg.payload.bindings->size;
+                std::fprintf(stderr,
+                    "v3 OP_CALL platform: callee=%p desc=%p arg.tag=%d size=%d "
+                    "frames=%zu\n",
+                    (void*)callee, (void*)desc, arg_tag, arg_size,
+                    vm.frames.size());
+            }
 
             // #495: native fix-point intrinsics fast path.  Recognised
             // at lower-time (lower.cc recogniseIntrinsic), evaluated in
@@ -4867,6 +4904,23 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     // Tag::App on `fun`.  forceValue is idempotent on already-WHNF
     // values, so the cost is one tag check on the hot path.
     fun = forceValue(vm, fun);
+    // V3_DBG_CALL_CLOSURE=1 prints every call: closure name + arg
+    // shape.  Used to trace the broader-thunkify upvalue bug.
+    static const bool s_dbgCallClosure =
+        std::getenv("V3_DBG_CALL_CLOSURE") != nullptr;
+    if (s_dbgCallClosure) {
+        const char * nm = "<?>";
+        if (fun.tag() == Tag::Closure && fun.payload.closure
+            && fun.payload.closure->desc)
+            nm = fun.payload.closure->desc->name.c_str();
+        int arg_tag = (int)arg.tag();
+        int arg_size = -1;
+        if (arg.tag() == Tag::Attrs && arg.payload.bindings)
+            arg_size = arg.payload.bindings->size;
+        std::fprintf(stderr,
+            "v3 callClosure: fun.tag=%d name=%s arg.tag=%d size=%d\n",
+            (int)fun.tag(), nm, arg_tag, arg_size);
+    }
     // PrimOp / PrimOpApp: build a partial application or invoke once
     // we have all the args.  Mirrors the OP_CALL primop branch.
     if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
