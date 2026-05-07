@@ -189,6 +189,25 @@ struct GlobalClosureHandle
 GlobalClosureHandle promoteToGlobal(EvalScope &, ClosureHandle);
 void                releaseGlobal  (GlobalClosureHandle);
 
+/// Allocate a ClosureHandle bound to the current EvalScope.  The handle
+/// becomes invalid when `scope`'s destructor runs (and all later inner
+/// scopes get torn down too).  `payload` is an opaque pointer the host
+/// owns -- v3 internals stash a Closure or arbitrary tagged value there.
+///
+/// Returns a handle whose opaque bits encode (scopeGeneration, slotIdx)
+/// so a stale handle survives only as far as its scope is alive.
+ClosureHandle allocClosureHandle(EvalScope & scope, void * payload);
+
+/// True iff `h`'s scope is still alive AND the slot generation matches.
+/// O(1).  Safe to call with arbitrary uint64_t opaques (returns false
+/// for any value that doesn't decode to a known scope/slot pair).
+bool isValid(ClosureHandle h);
+
+/// Resolve a ClosureHandle to its payload.  Returns nullptr if the
+/// handle has been invalidated (scope dtor ran) or never existed.
+/// Read-only -- the payload pointer is owned by whoever allocated it.
+void * lookupClosureHandle(ClosureHandle h);
+
 // =========================================================================
 // Category A: Parser (5 entries + 1 type)
 // =========================================================================

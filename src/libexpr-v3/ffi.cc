@@ -29,6 +29,9 @@
 #include "v3/ffi.hh"
 
 #include <atomic>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace nix::v3 {
@@ -37,21 +40,65 @@ namespace nix::v3 {
 // Evaluator
 // ---------------------------------------------------------------------------
 
+/// Per-EvalScope handle storage.  Each entry holds an opaque payload
+/// (whatever v3-internal value the host registers) and a `valid` flag
+/// flipped to false when the enclosing scope is destroyed.  The valid
+/// flag persists in the table after scope destruction (until the next
+/// gen rollover) so isValid() correctly returns false for stale handles.
+struct HandleSlot
+{
+    void *   payload;
+    bool     valid;
+};
+
 /// Per-Evaluator scope chain head.  Each EvalScope ctor pushes a new
 /// node; dtor pops.  Threadlocal -- one logical Evaluator per thread
 /// today; future work may need lock-free per-instance lists.
 struct ScopeNode
 {
     ScopeNode * prev;
-    /// Next-handle issuance counter scoped to this EvalScope.
-    /// Wraps to ensure handles allocated in different scopes are
-    /// distinguishable for invalidation purposes.
-    uint64_t baseHandle;
+    /// Generation token for handles allocated in this scope.  Encoded
+    /// in the upper 32 bits of ClosureHandle::opaque so a handle whose
+    /// scope has been destroyed (and whose generation has been removed
+    /// from g_liveScopes) fails the lookup -- ABA defence works because
+    /// each new scope gets a fresh generation from the global counter.
+    uint32_t generation;
+    /// Slot vector owned by this scope; entries are flipped to valid=false
+    /// in the dtor before the table is freed.
+    std::vector<HandleSlot> slots;
 };
 
 namespace {
 thread_local ScopeNode * g_topScope = nullptr;
-std::atomic<uint64_t> g_nextScopeBase{1};
+
+/// Scope generation counter.  Atomic so concurrent threads issue
+/// distinct generations even if their EvalScopes never interact.
+/// Starts at 1 (0 reserved for "uninitialised handle").
+std::atomic<uint32_t> g_nextScopeGen{1};
+
+/// Live-scope index: maps generation -> ScopeNode*.  Populated on ctor,
+/// erased on dtor.  Lookup-by-generation drives O(1) handle resolution.
+/// Lock guards both the map and per-slot access (writers + readers).
+std::mutex                                  g_scopeLock;
+std::unordered_map<uint32_t, ScopeNode *>   g_liveScopes;
+
+constexpr uint32_t kInvalidGen = 0;
+
+/// Pack/unpack helpers for the 64-bit handle opaque.
+struct PackedHandle
+{
+    uint32_t generation;
+    uint32_t slotIdx;
+};
+inline uint64_t packHandle(uint32_t gen, uint32_t slot) {
+    return (uint64_t(gen) << 32) | uint64_t(slot);
+}
+inline PackedHandle unpackHandle(uint64_t opaque) {
+    return PackedHandle{
+        .generation = uint32_t(opaque >> 32),
+        .slotIdx    = uint32_t(opaque & 0xFFFFFFFFu),
+    };
+}
 }
 
 class Evaluator
@@ -69,10 +116,21 @@ public:
 EvalScope::EvalScope(Evaluator & e)
     : m_ev(e)
 {
+    uint32_t gen = g_nextScopeGen.fetch_add(1, std::memory_order_relaxed);
+    // Avoid handing out gen=0 (reserved as kInvalidGen).  In practice
+    // this only matters at the 4-billion-scope rollover; bias once.
+    if (gen == kInvalidGen)
+        gen = g_nextScopeGen.fetch_add(1, std::memory_order_relaxed);
+
     auto * node = new ScopeNode{
         .prev       = g_topScope,
-        .baseHandle = g_nextScopeBase.fetch_add(0x1000, std::memory_order_relaxed),
+        .generation = gen,
+        .slots      = {},
     };
+    {
+        std::lock_guard<std::mutex> lk(g_scopeLock);
+        g_liveScopes.emplace(gen, node);
+    }
     g_topScope = node;
     m_state    = node;
 }
@@ -80,13 +138,76 @@ EvalScope::EvalScope(Evaluator & e)
 EvalScope::~EvalScope()
 {
     auto * node = static_cast<ScopeNode *>(m_state);
-    if (node && node == g_topScope) {
+    if (!node) return;
+
+    // Invalidate every handle issued by this scope.  Marking the slots
+    // (rather than just dropping the table) means a stale ClosureHandle
+    // copied out by the host still resolves cleanly to "invalid" via
+    // lookupClosureHandle / isValid -- they re-check the slot's valid
+    // bit on every call.  After the slot vector is freed, generation
+    // removal from g_liveScopes makes future lookups short-circuit.
+    {
+        std::lock_guard<std::mutex> lk(g_scopeLock);
+        for (auto & s : node->slots) s.valid = false;
+        g_liveScopes.erase(node->generation);
+    }
+
+    if (node == g_topScope) {
         g_topScope = node->prev;
         delete node;
+    } else {
+        // Mismatch (scope dtor running out of stack order) is a programmer
+        // error.  Leak the node so subsequent dtors find their state.
+        // In a debug build, an assert would fire.
     }
-    // Mismatch (scope dtor running out of stack order) is a programmer
-    // error.  We don't try to recover; leak the node so subsequent
-    // dtors find their state.  In a debug build, an assert would fire.
+}
+
+ClosureHandle allocClosureHandle(EvalScope & /*scope*/, void * payload)
+{
+    // EvalScope is non-copyable + RAII, so the scope passed in MUST be
+    // the topmost (otherwise the caller has a stack-order bug).  Read
+    // g_topScope rather than poking at EvalScope::m_state -- the API
+    // contract guarantees they match.
+    ScopeNode * top = g_topScope;
+    if (!top) return ClosureHandle{0};
+
+    HandleSlot newSlot{payload, true};
+    uint32_t slotIdx;
+    {
+        std::lock_guard<std::mutex> lk(g_scopeLock);
+        slotIdx = static_cast<uint32_t>(top->slots.size());
+        top->slots.push_back(newSlot);
+    }
+    return ClosureHandle{packHandle(top->generation, slotIdx)};
+}
+
+bool isValid(ClosureHandle h)
+{
+    auto p = unpackHandle(h.opaque);
+    if (p.generation == kInvalidGen) return false;
+
+    std::lock_guard<std::mutex> lk(g_scopeLock);
+    auto it = g_liveScopes.find(p.generation);
+    if (it == g_liveScopes.end()) return false;
+
+    ScopeNode * node = it->second;
+    if (p.slotIdx >= node->slots.size()) return false;
+    return node->slots[p.slotIdx].valid;
+}
+
+void * lookupClosureHandle(ClosureHandle h)
+{
+    auto p = unpackHandle(h.opaque);
+    if (p.generation == kInvalidGen) return nullptr;
+
+    std::lock_guard<std::mutex> lk(g_scopeLock);
+    auto it = g_liveScopes.find(p.generation);
+    if (it == g_liveScopes.end()) return nullptr;
+
+    ScopeNode * node = it->second;
+    if (p.slotIdx >= node->slots.size()) return nullptr;
+    auto & slot = node->slots[p.slotIdx];
+    return slot.valid ? slot.payload : nullptr;
 }
 
 // ---------------------------------------------------------------------------

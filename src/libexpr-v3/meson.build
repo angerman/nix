@@ -160,3 +160,21 @@ test(
   'v3-drv-preflight',
   v3_drv_preflight,
 )
+
+# #485: behavioural tests for EvalScope handle invalidation.
+v3_evalscope_handles = executable(
+  'v3-evalscope-handles',
+  'test/evalscope-handles.cc',
+  dependencies : deps_public + deps_private + deps_other + [
+    declare_dependency(
+      link_with : this_library,
+      include_directories : include_dirs,
+    ),
+  ],
+  install : false,
+)
+
+test(
+  'v3-evalscope-handles',
+  v3_evalscope_handles,
+)
