@@ -879,6 +879,13 @@ struct Emitter
             .formals        = {},
             .name           = f.name,
             .posHandle      = f.posHandle,
+            // #493: original ExprLambda* (or nullptr for synthesised
+            // thunks).  Used by v3ToTreeWalker to construct TW Tag::tLambda
+            // when bridging a formals closure back -- preserves
+            // autoCallFunction's formals introspection through the bridge.
+            // Disk-cache-loaded descriptors get nullptr (AST is gone after
+            // lowering); the bridge falls back to refusal in that case.
+            .astLambda      = f.astLambda,
         };
         if (f.hasFormals) {
             auto & desc = unit.lambdas[fid];

@@ -196,6 +196,25 @@ struct LambdaDescriptor
     /// inner dispatch.  `Map (p: p.name) [...]` patterns are dominant
     /// in nixpkgs and now actually flow through v3 since #426.
     uint32_t selectorSym = 0;
+
+    /// #493 / #484 follow-on: the original tree-walker `nix::ExprLambda *`
+    /// this v3 LambdaDescriptor was lowered from, or nullptr if the
+    /// lambda was synthesised internally (e.g., the per-formal default-
+    /// expression thunks lowerLambda emits at line 717-789).
+    ///
+    /// Used by v3ToTreeWalker when bridging a v3 Closure-with-formals
+    /// back to TW: instead of refusing (the pre-#493 behaviour, which
+    /// triggered the by-name-overlay.nix:54 cascade -- see
+    /// project_484_lambda_skip_formals memory), construct a real TW
+    /// Tag::tLambda Value pointing at this `astLambda`.  TW's
+    /// autoCallFunction can then introspect formals via `lambda.fun`;
+    /// the actual call is intercepted by v3CallFunctionEntry which
+    /// dispatches to v3's compiled body via the body_fid path.
+    ///
+    /// Forward-declared type pointer: not all callers include
+    /// libnixexpr's ExprLambda definition.  Held as `void *` to avoid
+    /// pulling the AST header into closure.hh; cast at use sites.
+    void * astLambda = nullptr;
 };
 
 // `struct ThunkDescriptor` removed -- was a placeholder type only ever

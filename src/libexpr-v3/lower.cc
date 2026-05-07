@@ -661,6 +661,10 @@ struct Lowerer
         m.functions[fid].paramVar   = param;
         m.functions[fid].name       = e->arg ? std::string(symbols[e->arg]) : "<formals>";
         m.functions[fid].posHandle  = posIdxToHandle(e->getPos());
+        // #493 / #484 follow-on: capture the original ExprLambda* so emit
+        // can carry it through to LambdaDescriptor and v3ToTreeWalker can
+        // construct a proper TW Tag::tLambda for formals-closure bridges.
+        m.functions[fid].astLambda  = static_cast<void *>(e);
 
         Scope inner;
 

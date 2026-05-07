@@ -356,6 +356,15 @@ struct Function {
     /// Used by V3_DBG_FORCE_TRACE to print file:line:col per force,
     /// matching tree-walker's TW_DBG_FORCE format for direct trace diff.
     uint32_t            posHandle = 0;
+
+    /// #493 / #484 follow-on: original `nix::ExprLambda *` this IR Function
+    /// was lowered from, or nullptr if synthesised internally (per-formal
+    /// default thunks).  Held as `void *` so ir.hh stays decoupled from
+    /// libnixexpr's AST headers.  Carried through to LambdaDescriptor at
+    /// emit time so v3ToTreeWalker can construct a proper TW Tag::tLambda
+    /// when bridging a formals closure back to TW (autoCallFunction needs
+    /// the original ExprLambda for formals introspection).
+    void *              astLambda = nullptr;
 };
 
 // ---------------------------------------------------------------------------
