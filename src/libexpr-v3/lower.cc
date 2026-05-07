@@ -31,6 +31,7 @@
 
 #include <deque>
 #include <functional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -1488,14 +1489,52 @@ struct Lowerer
             return true;
         };
 
+        // Diagnostic / bisect knobs (v3 #495 follow-on, broader-thunkify
+        // upvalue investigation):
+        //   V3_DBG_SELF_DOT_FIRES=1     -- log each self-dot fire's
+        //                                  source position
+        //   NIX_V3_SELF_DOT_LIMIT=N     -- gate self-dot fires to the
+        //                                  first N module-wide; useful
+        //                                  for narrowing the failing
+        //                                  clause (LIMIT=41 works,
+        //                                  LIMIT=42 trips the lib.systems
+        //                                  upvalue bug -- see
+        //                                  test/run-broader-thunkify-tests.sh).
+        static const bool s_dbgFires =
+            std::getenv("V3_DBG_SELF_DOT_FIRES") != nullptr;
+        static const int s_fireLimit = []() -> int {
+            const char * s = std::getenv("NIX_V3_SELF_DOT_LIMIT");
+            return s ? std::atoi(s) : -1;
+        }();
+        static int s_fireCount = 0;
         std::vector<ir::VarId> cache;
         if (fromExprs) {
             cache.resize(fromExprs->size(), ir::kInvalid);
             for (size_t i = 0; i < fromExprs->size(); ++i) {
                 nix::Expr * fx = (*fromExprs)[i];
                 if (!fx) continue;
+                bool selfDot = isSelfDotPattern(fx);
+                if (selfDot && s_fireLimit >= 0 && s_fireCount >= s_fireLimit)
+                    selfDot = false;
                 bool useThunk = !s_noThunkify
-                    && (useThunkBlanket || isSelfDotPattern(fx));
+                    && (useThunkBlanket || selfDot);
+                if (selfDot) {
+                    ++s_fireCount;
+                    if (s_dbgFires) {
+                        auto * sel = dynamic_cast<nix::ExprSelect *>(fx);
+                        auto * v = sel ? dynamic_cast<nix::ExprVar *>(sel->e) : nullptr;
+                        if (positions) {
+                            auto pos = (*positions)[fx->getPos()];
+                            std::ostringstream oss;
+                            oss << pos;
+                            std::fprintf(stderr,
+                                "v3 self-dot fires #%d: var=%s level=%u at %s\n",
+                                s_fireCount,
+                                v ? std::string(symbols[v->name]).c_str() : "?",
+                                v ? v->level : 0, oss.str().c_str());
+                        }
+                    }
+                }
                 cache[i] = useThunk ? thunkifyForAttr(fx) : lowerExpr(fx);
             }
         }
