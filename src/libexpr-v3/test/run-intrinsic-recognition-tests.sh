@@ -285,18 +285,22 @@ if [[ -x "$NIX_BIN" ]]; then
 fi
 
 # ----------------------------------------------------------------------
-# d3 — KNOWN-FAIL reproducer (negative regression).
+# d3 — nixpkgs lib.fix integration test (partial).
 #
 # d3a: Simple `fixedPoints.fix` with stub `lib = null` works under both
 #      intrinsic dispatch and parse-precompile.
 #
-# d3b: Full `(import <nixpkgs/lib>).fix ext` fails with infinite
-#      recursion under NIX_V3_PARSE_PRECOMPILE=1.  This is a
-#      parse-precompile bug independent of intrinsic dispatch — the
-#      same recursion happens with NIX_V3_INTRINSIC_DISPATCH off, so
-#      flipping intrinsic dispatch does not regress this case.  Asserted
-#      here so a fix to either path that silently changes the failure
-#      shape is caught.  Tracked as a follow-on to #495.
+# d3b: Full `(import <nixpkgs/lib>).fix ext` is currently a known-fail
+#      under v3 with NIX_V3_PARSE_PRECOMPILE=1.  The targeted thunkify
+#      heuristic in pushInheritFromCache (level==0 self-dot pattern)
+#      catches the simple `self: { inherit (self.X) Y }` reproducer
+#      but doesn't reach nixpkgs lib's nested-let case where `self`
+#      sits at level >= 1.  A broader heuristic (level <= 1 or any
+#      ExprSelect-on-non-with-Var) introduces a different "OP_ATTRS_
+#      SELECT: attribute not found" regression in nixpkgs all-packages.
+#      A precise lambda-parameter-reference detection is the proper
+#      fix; until then, assert the documented failure mode so silent
+#      changes are caught.
 if [[ -x "$NIX_BIN" ]]; then
   cat > "$TMP/d3a.nix" <<'EOF'
 let
@@ -319,17 +323,19 @@ let
   ext = self: { a = 1; b = self.a + 10; };
 in (lib.fix ext).b
 EOF
-  # Known-fail under intrinsic dispatch (multi-layer interaction).
-  # When step 3 lands native Extends, this should pass.  Until then,
-  # assert it fails with infinite recursion to catch silent changes.
+  # KNOWN-FAIL: full lib.fix loops because the nested-let pattern
+  # (level >= 1 self-dot) isn't caught by the level==0 heuristic.
+  # Asserted as failing so silent changes (e.g. someone broadens the
+  # heuristic and breaks hello.name) are surfaced.  Flip when a
+  # precise lambda-param detection lands.
   d3b_out=$(timeout 20 env NIX_USE_V3=1 NIX_V3_INTRINSIC_DISPATCH=1 \
     NIX_V3_PARSE_PRECOMPILE=1 "$NIX_BIN" eval --impure -f "$TMP/d3b.nix" 2>&1)
   d3b_exit=$?
   if echo "$d3b_out" | grep -q "infinite recursion" || [[ $d3b_exit -ne 0 ]]; then
-    PASS=$((PASS + 1))  # Currently expected to fail
+    PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    fail_names+=("d3b full lib.fix: expected infinite-recursion (known fail), got success: $(echo "$d3b_out" | tail -1)")
+    fail_names+=("d3b full lib.fix: bug fixed but assertion not flipped (got: $(echo "$d3b_out" | tail -1))")
   fi
 fi
 

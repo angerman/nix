@@ -1393,20 +1393,64 @@ struct Lowerer
         // active.  Default mode keeps eager (the call-hook's wrong-
         // shape pre-refusal routes Lambda Exprs to TW so eager from-
         // expr never gets v3-emitted under default semantics).
-        // Override with NIX_V3_NO_INHERIT_FROM_THUNK=1.
+        //
+        // #495 follow-on: targeted thunkify for the `self.X`-from-expr
+        // pattern even in DEFAULT mode -- simple-arg `self:` lambdas
+        // route to v3 even in default mode, and eager lowering of
+        // `inherit (self.X) Y` forces `self` mid-construction and
+        // recurses (reproducer:
+        // src/libexpr-v3/test/run-fix-inherit-from-self-tests.sh).
+        //
+        // Detection: the from-expr is an ExprSelect whose head is an
+        // ExprVar that refers to the immediately-enclosing lambda's
+        // parameter (heuristic: ExprVar with level==0).  An always-on
+        // blanket thunkify of every non-Var from-expr broke
+        // rec-sibling resolution under v3 (`callPackage` undefined in
+        // nixpkgs all-packages.nix:2276), so keep the existing
+        // LAMBDA_SKIP-gated full thunkify and only ADD the targeted
+        // self-X thunkify on top.
+        //
+        // Override via:
+        //   NIX_V3_NO_INHERIT_FROM_THUNK=1   -- disable all thunkify
+        //   NIX_V3_INHERIT_FROM_THUNK_ALL=1  -- force thunkify all
         static const bool s_lambdaSkip =
             std::getenv("NIX_V3_LAMBDA_SKIP") != nullptr;
         static const bool s_noThunkify =
             std::getenv("NIX_V3_NO_INHERIT_FROM_THUNK") != nullptr;
-        const bool useThunk = s_lambdaSkip && !s_noThunkify;
+        static const bool s_thunkifyAll =
+            std::getenv("NIX_V3_INHERIT_FROM_THUNK_ALL") != nullptr;
+        const bool useThunkBlanket = (s_lambdaSkip || s_thunkifyAll) && !s_noThunkify;
+
+        // Heuristic for the `self.X` shape: ExprSelect whose head is
+        // an ExprVar at the IMMEDIATELY enclosing scope (level 0) and
+        // not from a `with`.  This is the precise shape of `self:
+        // { inherit (self.X) Y }` -- the lambda parameter referenced
+        // directly inside the lambda's body attrset.  Broader gates
+        // (level <= 1, all selects-on-vars) regressed nixpkgs
+        // hello.name evaluation -- the targeted level==0 case is
+        // sufficient for the small reproducer in
+        // run-fix-inherit-from-self-tests.sh; the deeper nixpkgs
+        // lib.fix path (level==1 due to nested `let`) remains a
+        // KNOWN-FAIL until a more precise capture-then-thunkify is
+        // landed.
+        auto isSelfDotPattern = [](nix::Expr * fx) -> bool {
+            auto * sel = dynamic_cast<nix::ExprSelect *>(fx);
+            if (!sel) return false;
+            auto * v = dynamic_cast<nix::ExprVar *>(sel->e);
+            if (!v) return false;
+            if (v->fromWith) return false;
+            return v->level == 0;
+        };
+
         std::vector<ir::VarId> cache;
         if (fromExprs) {
             cache.resize(fromExprs->size(), ir::kInvalid);
             for (size_t i = 0; i < fromExprs->size(); ++i) {
-                if ((*fromExprs)[i])
-                    cache[i] = useThunk
-                        ? thunkifyForAttr((*fromExprs)[i])
-                        : lowerExpr((*fromExprs)[i]);
+                nix::Expr * fx = (*fromExprs)[i];
+                if (!fx) continue;
+                bool useThunk = !s_noThunkify
+                    && (useThunkBlanket || isSelfDotPattern(fx));
+                cache[i] = useThunk ? thunkifyForAttr(fx) : lowerExpr(fx);
             }
         }
         inheritFromCacheStack.push_back(std::move(cache));

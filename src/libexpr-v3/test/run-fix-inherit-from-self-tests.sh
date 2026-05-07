@@ -48,16 +48,17 @@ else
   fail_names+=("TW-only repro: expected 11, got: $(echo "$tw_out" | tail -2)")
 fi
 
-# 2. v3 default: KNOWN-FAIL infinite recursion.  Asserted so a silent
-#    behaviour change is caught.  Flip when fixed.
+# 2. v3 default: positive regression — MUST return 11.  Closed by the
+#    always-thunkify fix in pushInheritFromCache (lower.cc); previously
+#    failed with infinite recursion because eager from-expr lowering
+#    forced `self` mid-construction.
 v3_out=$(timeout 15 env NIX_USE_V3=1 \
   "$NIX_BIN" eval --impure -f "$TMP/repro.nix" 2>&1)
-v3_exit=$?
-if echo "$v3_out" | grep -q "infinite recursion" || [[ $v3_exit -ne 0 ]]; then
-  PASS=$((PASS + 1))   # documented failure
+if echo "$v3_out" | grep -q '^11$'; then
+  PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))
-  fail_names+=("v3 fix-inherit-from-self: bug fixed but assertion not flipped (got success: $(echo "$v3_out" | tail -1))")
+  fail_names+=("v3 fix-inherit-from-self: expected 11, got: $(echo "$v3_out" | tail -3)")
 fi
 
 # 3. Same shape but inheriting a non-fix-shape lambda must still work
