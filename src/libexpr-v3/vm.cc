@@ -5377,14 +5377,20 @@ Value forceValue(VMState & vm, Value v)
             // thunk to completion (which is exactly what TW does via
             // its lazy attr access on partial Bindings).
             //
+            // STG-3 (#498): skip under NIX_V3_STG=1.  Real cycles must
+            // throw under STG semantics so the consumer sees the typed
+            // exception, not a wrong sub-attrset.
+            //
             // Disable via NIX_V3_NO_PARTIAL_BINDINGS_RECOVER=1 if it
             // misclassifies a real cycle.
             {
+                static const bool s_stgMode_recover =
+                    std::getenv("NIX_V3_STG") != nullptr;
                 static const bool s_disabled =
                     std::getenv("NIX_V3_NO_PARTIAL_BINDINGS_RECOVER") != nullptr;
                 static const bool s_dbg_reg =
                     std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
-                if (!s_disabled) {
+                if (!s_disabled && !s_stgMode_recover) {
                     auto & reg = partialBindingsRegistry();
                     auto it = reg.find(t);
                     if (it != reg.end()) {

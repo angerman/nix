@@ -3022,10 +3022,22 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // and the call hook is now ON by default within that.  Kill-switch
     // is NIX_V3_NO_CALL=1 (matches the #416 outer-with convention).
     // NIX_USE_V3_CALL=1 stays as a no-op alias for back-compat.
+    //
+    // STG-4 (#498): under NIX_V3_STG=1, v3 must not intercept TW's
+    // call-hook chain.  TW manages fix-point construction with its
+    // env-pointer-by-reference semantics, which v3's STG-mode forcing
+    // (no publish, no side-table recovery) cannot emulate without
+    // additional slot-capture work.  Re-entering v3 mid-TW-evaluation
+    // creates v3 thunks whose Black state surfaces real cycles in
+    // patterns lib relies on (e.g. lib.fixedPoints.extends + fix).
+    // Until the slot-capture path is universal, gate the hook off
+    // when STG mode is active.
     static const bool useV3Call = []{
         const char * a = std::getenv("NIX_USE_V3");
         if (!a || std::string_view(a) != "1") return false;
-        return std::getenv("NIX_V3_NO_CALL") == nullptr;
+        if (std::getenv("NIX_V3_NO_CALL") != nullptr) return false;
+        if (std::getenv("NIX_V3_STG") != nullptr) return false;
+        return true;
     }();
     auto & st = v3HookStats();
     st.callHookEntries++;
