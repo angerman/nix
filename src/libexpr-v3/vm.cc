@@ -2700,6 +2700,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 fr.thunk->state = ThunkState::Evaluated;
                 fr.thunk->evaluated = retVal;
+                // STG-8 (#498): cell update.  If this thunk was stored
+                // at a heap-stable cell (recorded at OP_ATTRS_REC_SET
+                // time), overwrite the cell's contents with the body's
+                // final result.  This mirrors tree-walker's in-place
+                // `forceValue` update — slots / sub-thunks that
+                // captured a Tag::Slot pointing at the cell now read
+                // the result via single deref, and foreign VMState
+                // observers stop seeing the leaked Black thunk.
+                //
+                // Read-and-clear: we want the write to fire exactly
+                // once per cell binding.  Idempotent on re-entry
+                // (cell becomes nullptr after first OP_RETURN).
+                if (Value * cell = fr.thunk->cell) {
+                    *cell = retVal;
+                    fr.thunk->cell = nullptr;
+                }
                 // #457/#458: clear the partial-Bindings registry
                 // entry now that the thunk's final value is set.
                 {
@@ -4773,6 +4789,29 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (!recAttrs.payload.bindings || i >= recAttrs.payload.bindings->size)
                 throw std::runtime_error("v3 OP_ATTRS_REC_SET: index out of range");
             recAttrs.payload.bindings->entries[i].value = v;
+            // STG-8 (#498): if this entry's value is a Suspended thunk
+            // (the common case from the LetRec emit's per-attr thunks),
+            // record &entries[i].value as the thunk's heap-stable cell.
+            // OP_RETURN's CFF_THUNK_RETURN handler will write the body's
+            // result back to *cell at completion, mirroring TW's in-
+            // place forceValue update.  Sub-thunks captured-with a
+            // Tag::Slot to this cell then read the result via single
+            // deref instead of the legacy `Slot -> Thunk -> Evaluated`
+            // chase, AND foreign-VM observers (cross-VMState fresh
+            // VMStates the eval/call hooks spawn) stop seeing a leaked
+            // Black thunk after the body completes -- the cell holds
+            // the final value.
+            //
+            // We only set cell when the entry IS a fresh Suspended
+            // thunk (avoid clobbering a previously-set cell from a
+            // shared thunk, and skip non-thunk entries entirely).
+            if (v.isThunk() && v.payload.thunk
+                && v.payload.thunk->state == ThunkState::Suspended
+                && v.payload.thunk->cell == nullptr)
+            {
+                v.payload.thunk->cell =
+                    &recAttrs.payload.bindings->entries[i].value;
+            }
             break;
         }
 

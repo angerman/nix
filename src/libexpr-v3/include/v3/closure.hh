@@ -111,6 +111,23 @@ struct Thunk
     /// dumping behind the env var).
     uint32_t   forces;
 
+    /// STG-8 (#498): heap-stable cell where this thunk Value was
+    /// originally stored (typically `&Bindings::entries[i].value`).
+    /// When the thunk's body completes via OP_RETURN, the result is
+    /// written back to *cell, mirroring tree-walker's in-place
+    /// `forceValue` cell update.  Sub-thunks holding a Tag::Slot to
+    /// the same cell see the result via single-deref instead of
+    /// needing thunk-chase, AND foreign-VM observers that captured
+    /// a slot to the cell stop seeing the (possibly leaked) Black
+    /// thunk after the body completes.
+    ///
+    /// nullptr for thunks NOT stored at a heap-stable cell (e.g.
+    /// thunks on the value-stack, lazy primop args, captured upvals).
+    /// Set at OP_ATTRS_REC_SET / OP_REC_SLOT_PUBLISH / equivalent
+    /// storing sites.  Cleared (read-and-zero) at OP_RETURN so the
+    /// write happens exactly once per cell-binding.
+    Value * cell;
+
     union {
         // ThunkState::Suspended
         struct {

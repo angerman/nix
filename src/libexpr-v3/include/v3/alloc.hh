@@ -311,6 +311,7 @@ struct Alloc
         t->state = ThunkState::Suspended;
         t->nUpvalues = nUpvalues;
         t->forces = 0;
+        t->cell = nullptr;
         t->suspended.capturedWiths = nullptr;
         t->suspended.cu = nullptr;
         return t;
@@ -331,6 +332,7 @@ struct Alloc
         t->state = ThunkState::Bridge;
         t->nUpvalues = 0;
         t->forces = 0;
+        t->cell = nullptr;
         t->bridgeSrc = src;
         return t;
     }
