@@ -2981,15 +2981,37 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     };
 
     // #455: cycle detection -- mirrors primV3ForceAttr's protection.
-    // Re-entry on the same handle while it's in progress means the
-    // bridged closure is forcing through itself; throw blackhole-
-    // shaped error so the caller's fallbackExpr re-eval path fires.
-    static thread_local std::unordered_set<int64_t> tlsBridge1InProgress;
-    if (!tlsBridge1InProgress.insert(h).second) {
+    // Re-entry on the same handle while it's in progress USED to throw
+    // immediately on first re-entry; that's too eager for legitimate
+    // structural recursion (e.g., nixpkgs `extends`/`composeManyExtensions`
+    // applied across an overlay chain where the same overlay function's
+    // body re-references the fix-point through a sibling).  TW handles
+    // these via blackhole-on-thunk-slot which is per-thunk-instance, not
+    // per-handle -- so it doesn't fire spuriously for legitimate sibling
+    // recursion.
+    //
+    // Relax to a counter: allow up to N re-entries on the same handle
+    // before declaring cycle.  Same handle re-entering at different
+    // recursion depths is structurally legitimate when each call has
+    // distinct args (e.g., `f x` then `f y` via lazy evaluation).  The
+    // count bounds runaway recursion (genuine self-loop).
+    //
+    // Tunable via NIX_V3_BRIDGE1_REENTRY_MAX (default 8 = matches the
+    // bridge1MaxDepth gate's semantic without being stricter).
+    static thread_local std::unordered_map<int64_t, int> tlsBridge1ReentryCount;
+    static const int kBridge1ReentryMax = []{
+        if (const char * v = std::getenv("NIX_V3_BRIDGE1_REENTRY_MAX"))
+            return std::max(1, std::atoi(v));
+        return 8;
+    }();
+    int & reentryCount = tlsBridge1ReentryCount[h];
+    if (++reentryCount > kBridge1ReentryMax) {
+        --reentryCount;
         // Cycle: route to fallbackToTreeWalker by throwing typed.
         try {
             throw BlackholeError(
-                "v3 bridge1: cycle on handle=" + std::to_string(h));
+                "v3 bridge1: cycle on handle=" + std::to_string(h)
+                + " (reentry limit " + std::to_string(kBridge1ReentryMax) + ")");
         } catch (const std::exception & ex) {
             fallbackToTreeWalker(ex);
             return;
@@ -2997,8 +3019,14 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     }
     struct Bridge1Guard {
         int64_t h;
-        ~Bridge1Guard() { tlsBridge1InProgress.erase(h); }
-    } _b1g{h};
+        std::unordered_map<int64_t, int> * tbl;
+        ~Bridge1Guard() {
+            auto it = tbl->find(h);
+            if (it != tbl->end()) {
+                if (--it->second <= 0) tbl->erase(it);
+            }
+        }
+    } _b1g{h, &tlsBridge1ReentryCount};
 
     // #466 / #479 Phase 1: cross-primop force-chain detector.  Catches
     // cycles that span multiple bridge primops (each layer has its own
