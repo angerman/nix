@@ -1542,6 +1542,29 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     auto & st = v3HookStats();
     st.evalEntries++;
 
+    // STG-6 (#498): under NIX_V3_STG=1, refuse the eval hook entirely.
+    // Under STG semantics each v3 thunk's slot is written ONLY by its
+    // own OP_RETURN; spawning a fresh VMState mid-TW-evaluation creates
+    // v3 thunks that go Black during construction, and any later force
+    // (from a different fresh VMState the eval hook spawned) sees the
+    // leaked Black mark and throws.  TW's native eval doesn't have
+    // this cross-VMState problem because it threads env-by-reference
+    // through a single recursive eval.  Until v3 has a way to share
+    // VMState across re-entries (a substantial refactor of `run` and
+    // `runFunction`), STG mode keeps v3 out of mid-eval re-entry and
+    // limits its ownership to the user-supplied lambda bodies that
+    // OP_CALL invokes directly.
+    //
+    // Empirically: with the eval hook off under STG, nixpkgs hello.name
+    // makes progress past the all-packages.nix:28 with-block cycle
+    // (the cross-VMState fresh-VMState pattern was the source).
+    static const bool s_stgMode =
+        std::getenv("NIX_V3_STG") != nullptr;
+    if (s_stgMode) {
+        e->eval(state, state.baseEnv, v);
+        return;
+    }
+
     // #466 active-v3-vm pre-refusal at the eval-hook.
     //
     // Same shape as v3CallFunctionEntry's check: when we're being
