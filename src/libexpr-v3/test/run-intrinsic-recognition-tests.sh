@@ -163,6 +163,77 @@ EOF
 assert_no_match "e6 prev RHS arity" "$TMP/e6.nix"
 
 # ----------------------------------------------------------------------
+# c1 — canonical composeExtensions shape MUST match.
+cat > "$TMP/c1.nix" <<'EOF'
+let
+  composeExtensions = f: g: final: prev:
+    let
+      fApplied = f final prev;
+      prev' = prev // fApplied;
+    in
+    fApplied // g final prev';
+in composeExtensions
+EOF
+assert_match "c1 canonical composeExtensions" "ComposeExtensions" "$TMP/c1.nix"
+
+# ----------------------------------------------------------------------
+# c2 — composeExtensions with wrong fApplied arity: no match.
+cat > "$TMP/c2.nix" <<'EOF'
+let
+  notc = f: g: final: prev:
+    let
+      fApplied = f final;
+      prev' = prev // fApplied;
+    in
+    fApplied // g final prev';
+in notc
+EOF
+assert_no_match "c2 wrong fApplied arity" "$TMP/c2.nix"
+
+# ----------------------------------------------------------------------
+# c3 — composeExtensions with wrong prev' update direction: no match.
+cat > "$TMP/c3.nix" <<'EOF'
+let
+  notc = f: g: final: prev:
+    let
+      fApplied = f final prev;
+      prev' = fApplied // prev;
+    in
+    fApplied // g final prev';
+in notc
+EOF
+assert_no_match "c3 wrong prev' update direction" "$TMP/c3.nix"
+
+# ----------------------------------------------------------------------
+# c4 — composeExtensions with three bindings (extra): no match.
+cat > "$TMP/c4.nix" <<'EOF'
+let
+  notc = f: g: final: prev:
+    let
+      fApplied = f final prev;
+      prev' = prev // fApplied;
+      tmp = 1;
+    in
+    fApplied // g final prev';
+in notc
+EOF
+assert_no_match "c4 extra binding" "$TMP/c4.nix"
+
+# ----------------------------------------------------------------------
+# c5 — alternate names should still match (symbol-based).
+cat > "$TMP/c5.nix" <<'EOF'
+let
+  myc = a: b: x: y:
+    let
+      r = a x y;
+      y' = y // r;
+    in
+    r // b x y';
+in myc
+EOF
+assert_match "c5 alternate names" "ComposeExtensions" "$TMP/c5.nix"
+
+# ----------------------------------------------------------------------
 # d1 — DISPATCH (positive, opt-in via NIX_V3_INTRINSIC_DISPATCH=1).
 # When intrinsic dispatch is enabled, the simple fix case returns the
 # correct value AND the native dispatch counter bumps.

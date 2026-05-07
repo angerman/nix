@@ -719,74 +719,140 @@ struct Lowerer
             return 1;  // Intrinsic::Fix
         }
 
-        // Match Extends: outer lambda is `overlay`, body is a chain
-        //   overlay: f: final: let prev = f final; in prev // overlay final prev
+        // Body is ExprLambda → peel curried lambdas and match Extends or
+        // ComposeExtensions based on chain depth.
         //
-        // AST shape (peeling outermost lambda):
-        //   ExprLambda(arg=f,
-        //     body=ExprLambda(arg=final,
-        //       body=ExprLet(
-        //         attrs={prev = ExprCall(f, [final])},
-        //         body=ExprOpUpdate(
-        //           ExprVar(prev),
-        //           ExprCall(overlay, [final, prev])))))
+        //   Extends:           overlay: f: final: <Let>
+        //                      depth=2 inner lambdas (f, final), then Let.
         //
-        // Nix flattens curried application, so `overlay final prev`
-        // becomes ExprCall(overlay, [final, prev]).
-        if (auto * lamF = dynamic_cast<nix::ExprLambda *>(e->body)) {
-            if (!lamF->arg) return reject("Extends: inner-1 has no arg");
-            if (lamF->getFormals()) return reject("Extends: inner-1 has formals");
-            auto * lamFinal = dynamic_cast<nix::ExprLambda *>(lamF->body);
-            if (!lamFinal) return reject("Extends: inner-1 body not lambda");
-            if (!lamFinal->arg) return reject("Extends: inner-2 has no arg");
-            if (lamFinal->getFormals()) return reject("Extends: inner-2 has formals");
-
-            auto * letE = dynamic_cast<nix::ExprLet *>(lamFinal->body);
-            if (!letE) return reject("Extends: inner-2 body not Let");
-            if (!letE->attrs || !letE->attrs->attrs) return reject("Extends: let no attrs");
-            const auto & defs = *letE->attrs->attrs;
-            if (defs.size() != 1) return reject("Extends: let != 1 binding");
+        //   ComposeExtensions: f: g: final: prev: <Let>
+        //                      depth=3 inner lambdas (g, final, prev), then Let.
+        //
+        // We collect the lambda chain (e + all nested ExprLambdas) and
+        // dispatch by length-and-inner-shape.
+        if (dynamic_cast<nix::ExprLambda *>(e->body)) {
+            std::vector<nix::ExprLambda *> chain{e};
+            nix::Expr * cur = e->body;
+            while (auto * inner = dynamic_cast<nix::ExprLambda *>(cur)) {
+                if (!inner->arg) return reject("inner lambda has no arg");
+                if (inner->getFormals()) return reject("inner lambda has formals");
+                chain.push_back(inner);
+                cur = inner->body;
+            }
+            // cur is the body after peeling all lambdas.
+            auto * letE = dynamic_cast<nix::ExprLet *>(cur);
+            if (!letE) return reject("inner-most body not Let");
+            if (!letE->attrs || !letE->attrs->attrs) return reject("let no attrs");
             if (letE->attrs->dynamicAttrs && !letE->attrs->dynamicAttrs->empty())
-                return reject("Extends: let has dyn");
-            const auto & [prevSym, prevDef] = *defs.begin();
-            if (prevDef.kind != nix::ExprAttrs::AttrDef::Kind::Plain)
-                return reject("Extends: prev binding not Plain");
+                return reject("let has dyn");
+            const auto & defs = *letE->attrs->attrs;
 
-            // prev = f final
-            auto * fCall = dynamic_cast<nix::ExprCall *>(prevDef.e);
-            if (!fCall || !fCall->args.has_value())
-                return reject("Extends: prev RHS not ExprCall");
-            if (fCall->args->size() != 1)
-                return reject("Extends: f-call args != 1");
-            auto * fVar = dynamic_cast<nix::ExprVar *>(fCall->fun);
-            if (!fVar || fVar->name != lamF->arg)
-                return reject("Extends: f-call callee != f");
-            auto * fArgVar = dynamic_cast<nix::ExprVar *>((*fCall->args)[0]);
-            if (!fArgVar || fArgVar->name != lamFinal->arg)
-                return reject("Extends: f-call arg != final");
+            // ---------- Extends: chain of length 3, single binding ----------
+            if (chain.size() == 3 && defs.size() == 1) {
+                auto * lamF = chain[1], * lamFinal = chain[2];
+                const auto & [prevSym, prevDef] = *defs.begin();
+                if (prevDef.kind != nix::ExprAttrs::AttrDef::Kind::Plain)
+                    return reject("Extends: prev binding not Plain");
 
-            // Let body: prev // overlay final prev
-            auto * upd = dynamic_cast<nix::ExprOpUpdate *>(letE->body);
-            if (!upd) return reject("Extends: let body not OpUpdate");
-            auto * lhsVar = dynamic_cast<nix::ExprVar *>(upd->e1);
-            if (!lhsVar || lhsVar->name != prevSym)
-                return reject("Extends: update LHS != prev");
-            auto * rhsCall = dynamic_cast<nix::ExprCall *>(upd->e2);
-            if (!rhsCall || !rhsCall->args.has_value())
-                return reject("Extends: update RHS not ExprCall");
-            if (rhsCall->args->size() != 2)
-                return reject("Extends: overlay-call arity != 2");
-            auto * ovVar = dynamic_cast<nix::ExprVar *>(rhsCall->fun);
-            if (!ovVar || ovVar->name != e->arg)
-                return reject("Extends: overlay-call callee != overlay");
-            auto * a0 = dynamic_cast<nix::ExprVar *>((*rhsCall->args)[0]);
-            auto * a1 = dynamic_cast<nix::ExprVar *>((*rhsCall->args)[1]);
-            if (!a0 || a0->name != lamFinal->arg)
-                return reject("Extends: overlay arg-0 != final");
-            if (!a1 || a1->name != prevSym)
-                return reject("Extends: overlay arg-1 != prev");
+                // prev = f final
+                auto * fCall = dynamic_cast<nix::ExprCall *>(prevDef.e);
+                if (!fCall || !fCall->args.has_value()) return reject("Extends: prev RHS not ExprCall");
+                if (fCall->args->size() != 1) return reject("Extends: f-call args != 1");
+                auto * fVar = dynamic_cast<nix::ExprVar *>(fCall->fun);
+                if (!fVar || fVar->name != lamF->arg) return reject("Extends: f-call callee != f");
+                auto * fArgVar = dynamic_cast<nix::ExprVar *>((*fCall->args)[0]);
+                if (!fArgVar || fArgVar->name != lamFinal->arg)
+                    return reject("Extends: f-call arg != final");
 
-            return 2;  // Intrinsic::Extends
+                // Let body: prev // overlay final prev
+                auto * upd = dynamic_cast<nix::ExprOpUpdate *>(letE->body);
+                if (!upd) return reject("Extends: let body not OpUpdate");
+                auto * lhsVar = dynamic_cast<nix::ExprVar *>(upd->e1);
+                if (!lhsVar || lhsVar->name != prevSym) return reject("Extends: update LHS != prev");
+                auto * rhsCall = dynamic_cast<nix::ExprCall *>(upd->e2);
+                if (!rhsCall || !rhsCall->args.has_value())
+                    return reject("Extends: update RHS not ExprCall");
+                if (rhsCall->args->size() != 2)
+                    return reject("Extends: overlay-call arity != 2");
+                auto * ovVar = dynamic_cast<nix::ExprVar *>(rhsCall->fun);
+                if (!ovVar || ovVar->name != e->arg)
+                    return reject("Extends: overlay-call callee != overlay");
+                auto * a0 = dynamic_cast<nix::ExprVar *>((*rhsCall->args)[0]);
+                auto * a1 = dynamic_cast<nix::ExprVar *>((*rhsCall->args)[1]);
+                if (!a0 || a0->name != lamFinal->arg)
+                    return reject("Extends: overlay arg-0 != final");
+                if (!a1 || a1->name != prevSym)
+                    return reject("Extends: overlay arg-1 != prev");
+
+                return 2;  // Intrinsic::Extends
+            }
+
+            // ---------- ComposeExtensions: chain length 4, two bindings ----
+            if (chain.size() == 4 && defs.size() == 2) {
+                auto * lamG = chain[1], * lamFinal = chain[2], * lamPrev = chain[3];
+
+                // Identify bindings by RHS kind (one ExprCall, one ExprOpUpdate).
+                nix::Symbol fAppliedSym, prevPrimeSym;
+                nix::ExprCall * fApCall = nullptr;
+                nix::ExprOpUpdate * pPrimeUpd = nullptr;
+                for (const auto & [sym, def] : defs) {
+                    if (def.kind != nix::ExprAttrs::AttrDef::Kind::Plain)
+                        return reject("Compose: binding not Plain");
+                    if (auto * c = dynamic_cast<nix::ExprCall *>(def.e)) {
+                        fAppliedSym = sym; fApCall = c;
+                    } else if (auto * u = dynamic_cast<nix::ExprOpUpdate *>(def.e)) {
+                        prevPrimeSym = sym; pPrimeUpd = u;
+                    } else {
+                        return reject("Compose: binding RHS not Call/OpUpdate");
+                    }
+                }
+                if (!fApCall || !pPrimeUpd)
+                    return reject("Compose: missing call/update binding");
+
+                // fApplied = f final prev
+                if (!fApCall->args.has_value() || fApCall->args->size() != 2)
+                    return reject("Compose: fApplied call arity != 2");
+                auto * fv = dynamic_cast<nix::ExprVar *>(fApCall->fun);
+                if (!fv || fv->name != e->arg)
+                    return reject("Compose: fApplied callee != f");
+                auto * a0 = dynamic_cast<nix::ExprVar *>((*fApCall->args)[0]);
+                auto * a1 = dynamic_cast<nix::ExprVar *>((*fApCall->args)[1]);
+                if (!a0 || a0->name != lamFinal->arg)
+                    return reject("Compose: fApplied arg-0 != final");
+                if (!a1 || a1->name != lamPrev->arg)
+                    return reject("Compose: fApplied arg-1 != prev");
+
+                // prev' = prev // fApplied
+                auto * pLhs = dynamic_cast<nix::ExprVar *>(pPrimeUpd->e1);
+                auto * pRhs = dynamic_cast<nix::ExprVar *>(pPrimeUpd->e2);
+                if (!pLhs || pLhs->name != lamPrev->arg)
+                    return reject("Compose: prev'-update LHS != prev");
+                if (!pRhs || pRhs->name != fAppliedSym)
+                    return reject("Compose: prev'-update RHS != fApplied");
+
+                // Let body: fApplied // g final prev'
+                auto * upd = dynamic_cast<nix::ExprOpUpdate *>(letE->body);
+                if (!upd) return reject("Compose: let body not OpUpdate");
+                auto * lhsVar = dynamic_cast<nix::ExprVar *>(upd->e1);
+                if (!lhsVar || lhsVar->name != fAppliedSym)
+                    return reject("Compose: body LHS != fApplied");
+                auto * gCall = dynamic_cast<nix::ExprCall *>(upd->e2);
+                if (!gCall || !gCall->args.has_value() || gCall->args->size() != 2)
+                    return reject("Compose: g-call arity != 2");
+                auto * gv = dynamic_cast<nix::ExprVar *>(gCall->fun);
+                if (!gv || gv->name != lamG->arg)
+                    return reject("Compose: g-call callee != g");
+                auto * b0 = dynamic_cast<nix::ExprVar *>((*gCall->args)[0]);
+                auto * b1 = dynamic_cast<nix::ExprVar *>((*gCall->args)[1]);
+                if (!b0 || b0->name != lamFinal->arg)
+                    return reject("Compose: g-call arg-0 != final");
+                if (!b1 || b1->name != prevPrimeSym)
+                    return reject("Compose: g-call arg-1 != prev'");
+
+                return 3;  // Intrinsic::ComposeExtensions
+            }
+
+            return reject("lambda chain length doesn't match any intrinsic");
         }
         return reject("body not ExprLet or ExprLambda");
     }
