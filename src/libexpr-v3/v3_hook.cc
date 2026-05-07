@@ -1660,6 +1660,13 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     std::fprintf(stderr,
                         "v3 selector-lambda: fast-path calls=%llu\n",
                         (unsigned long long)selectorCalls);
+                // #495: native intrinsic fast-path firings.
+                if (uint64_t fixCalls =
+                        allocStats().intrinsicFixCalls;
+                    fixCalls > 0)
+                    std::fprintf(stderr,
+                        "v3 intrinsic Fix: native dispatch calls=%llu\n",
+                        (unsigned long long)fixCalls);
                 // #436: call-hook closure-result refusals.
                 if (s.callHookClosureResultRefused > 0)
                     std::fprintf(stderr,

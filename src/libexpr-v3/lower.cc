@@ -665,46 +665,60 @@ struct Lowerer
     /// dispatch (zero correctness loss; only optimization is lost).
     uint8_t recogniseIntrinsic(nix::ExprLambda * e)
     {
-        if (!e || !e->body || !e->arg) return 0;
-        if (e->getFormals()) return 0;     // intrinsics are simple-arg only
+        static const bool s_dbgVerbose =
+            std::getenv("V3_DBG_INTRINSIC_REJECT") != nullptr;
+        auto reject = [&](const char * reason) -> uint8_t {
+            if (s_dbgVerbose && e && e->arg)
+                std::fprintf(stderr,
+                    "v3 recogniseIntrinsic REJECT (arg=%s): %s\n",
+                    std::string(symbols[e->arg]).c_str(), reason);
+            return 0;
+        };
+        if (!e || !e->body || !e->arg) return reject("nullptr / no arg");
+        if (e->getFormals()) return reject("has formals");
+
+        if (s_dbgVerbose && e->arg
+            && std::string_view(symbols[e->arg]) == "f")
+            std::fprintf(stderr,
+                "v3 recogniseIntrinsic: arg=f body.kind=%d (Let=%d Attrs=%d Var=%d Call=%d)\n",
+                (int)e->body->exprKind,
+                (int)nix::Expr::Kind::Let, (int)nix::Expr::Kind::Attrs,
+                (int)nix::Expr::Kind::Var, (int)nix::Expr::Kind::Call);
 
         // Match Fix: body must be ExprLet with one binding `x = f x`,
         // body of let must be `x`.
         if (auto * letE = dynamic_cast<nix::ExprLet *>(e->body)) {
-            if (!letE->attrs || !letE->attrs->attrs) return 0;
+            if (!letE->attrs || !letE->attrs->attrs) return reject("let no attrs");
             const auto & defs = *letE->attrs->attrs;
-            if (defs.size() != 1) return 0;          // single binding
+            if (defs.size() != 1) return reject("let != 1 binding");
             if (letE->attrs->dynamicAttrs
-                && !letE->attrs->dynamicAttrs->empty()) return 0;
+                && !letE->attrs->dynamicAttrs->empty()) return reject("let has dyn");
             const auto & [bindSym, bindDef] = *defs.begin();
-            if (bindDef.kind != nix::ExprAttrs::AttrDef::Kind::Plain) return 0;
+            if (bindDef.kind != nix::ExprAttrs::AttrDef::Kind::Plain) return reject("binding not Plain");
 
             // Binding's RHS must be ExprCall(f, [x]) -- one arg only.
             auto * callE = dynamic_cast<nix::ExprCall *>(bindDef.e);
-            if (!callE || !callE->args.has_value()) return 0;
-            if (callE->args->size() != 1) return 0;
+            if (!callE || !callE->args.has_value()) return reject("RHS not ExprCall");
+            if (callE->args->size() != 1) return reject("ExprCall args != 1");
 
             // callee must be ExprVar referencing the lambda's arg.
             auto * fVar = dynamic_cast<nix::ExprVar *>(callE->fun);
-            if (!fVar) return 0;
-            if (fVar->name != e->arg) return 0;
+            if (!fVar) return reject("callee not ExprVar");
+            if (fVar->name != e->arg) return reject("callee name != lambda arg");
 
             // arg must be ExprVar referencing the let binding.
             auto * xVar = dynamic_cast<nix::ExprVar *>((*callE->args)[0]);
-            if (!xVar) return 0;
-            if (xVar->name != bindSym) return 0;
+            if (!xVar) return reject("call arg not ExprVar");
+            if (xVar->name != bindSym) return reject("call arg name != binding sym");
 
             // Let body must be ExprVar referencing the binding.
             auto * bodyVar = dynamic_cast<nix::ExprVar *>(letE->body);
-            if (!bodyVar) return 0;
-            if (bodyVar->name != bindSym) return 0;
+            if (!bodyVar) return reject("let body not ExprVar");
+            if (bodyVar->name != bindSym) return reject("let body name != binding sym");
 
             return 1;  // Intrinsic::Fix
         }
-
-        // Future: Extends, ComposeExtensions matchers go here.
-
-        return 0;
+        return reject("body not ExprLet");
     }
 
     ir::VarId lowerLambda(nix::ExprLambda * e)
@@ -728,7 +742,7 @@ struct Lowerer
         // (eliminates the TW round-trip that today blocks lambda-skip
         // default-on for nixpkgs -- see project_493_step3d_with_stack memo).
         m.functions[fid].intrinsicKind = recogniseIntrinsic(e);
-        if (m.functions[fid].intrinsicKind != 0) {
+        {
             static const bool s_dbg =
                 std::getenv("V3_DBG_INTRINSIC") != nullptr;
             if (s_dbg) {
@@ -737,10 +751,11 @@ struct Lowerer
                     "ComposeManyExtensions",
                 };
                 uint8_t k = m.functions[fid].intrinsicKind;
-                std::fprintf(stderr,
-                    "v3 recogniseIntrinsic: fid=%u name='%s' kind=%s\n",
-                    (unsigned)fid, m.functions[fid].name.c_str(),
-                    k < (sizeof(names)/sizeof(names[0])) ? names[k] : "?");
+                if (k != 0 || std::getenv("V3_DBG_INTRINSIC_ALL") != nullptr)
+                    std::fprintf(stderr,
+                        "v3 recogniseIntrinsic: fid=%u name='%s' kind=%s\n",
+                        (unsigned)fid, m.functions[fid].name.c_str(),
+                        k < (sizeof(names)/sizeof(names[0])) ? names[k] : "?");
             }
         }
 

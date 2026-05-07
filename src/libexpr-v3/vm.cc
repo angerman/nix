@@ -1577,6 +1577,79 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             const Closure * callee = fun.payload.closure;
             const LambdaDescriptor * desc = callee->desc;
 
+            // #495: native fix-point intrinsics fast path.  Recognised
+            // at lower-time (lower.cc recogniseIntrinsic), evaluated in
+            // v3 without TW round-trips.  Permanent optimization: the
+            // bytecode for `lib.fix` etc. never runs; we dispatch
+            // directly to a v3-native impl that mirrors the canonical
+            // pure-Nix definition.
+            //
+            // Fix:  `f: let x = f x; in x`
+            //   Allocate a heap-stable Value slot (Boehm-traced),
+            //   make a Tag::Slot pointing at it, push slot as arg,
+            //   call f(slot), store result into slot, return result.
+            //   Knot-tying via slot mutation -- exactly what TW's
+            //   `let x = f x; in x;` does via Env::values[].
+            //
+            // Caller invariant: arg is the lambda's `f` (a callable).
+            //
+            // OPT-IN via NIX_V3_INTRINSIC_DISPATCH=1.  Default OFF until
+            // validated against full nixpkgs lib evaluation; the simple
+            // case works (`fix ext` returns the right attrset) but
+            // nixpkgs lib's fix-point chain (makeExtensible' + extends
+            // chain) interacts in ways not yet diagnosed.
+            static const bool s_intrinsicEnable =
+                std::getenv("NIX_V3_INTRINSIC_DISPATCH") != nullptr;
+            if (s_intrinsicEnable && __builtin_expect(
+                    desc->intrinsicKind != LambdaDescriptor::Intrinsic::None,
+                    0)) {
+                if (desc->intrinsicKind == LambdaDescriptor::Intrinsic::Fix) {
+                    allocStats().intrinsicFixCalls++;
+                    static const bool s_dbg =
+                        std::getenv("V3_DBG_INTRINSIC") != nullptr;
+                    if (s_dbg) std::fprintf(stderr,
+                        "v3 intrinsic Fix dispatch: arg.tag=%d\n",
+                        (int)arg.tag());
+                    // Heap-allocate the slot storage (GC-traced).  Initial
+                    // value is Tag::Uninitialized; populated by the body's
+                    // result.  Tag::Slot wraps a Value*; reading through
+                    // the slot during body eval re-reads from this heap
+                    // location, so the body sees the in-progress result
+                    // (TW-style knot-tying).
+                    Value * slotStorage = Alloc::allocValue();
+                    slotStorage->tag_payload =
+                        static_cast<uint64_t>(Tag::Uninitialized);
+                    Value slotV;
+                    slotV.tag_payload = static_cast<uint64_t>(Tag::Slot);
+                    slotV.payload.slot = slotStorage;
+                    // Save current ip on this frame so callClosure's
+                    // re-entry into the dispatch loop can return cleanly.
+                    vm.frames.back().ip = ip;
+                    // Evaluate `f slotV`.  callClosure forces `fun` (the
+                    // user-supplied f) and runs its body with the slot
+                    // as arg.  The body may force the slot (chases via
+                    // Tag::Slot deref); blackhole detection is per-thunk,
+                    // not per-slot, so a self-referential `let x = f x;`
+                    // shape works as long as f is sufficiently lazy
+                    // (the standard Nix `lib.fix` precondition).
+                    Value res = callClosure(vm, arg, slotV);
+                    if (s_dbg) std::fprintf(stderr,
+                        "v3 intrinsic Fix: callClosure returned tag=%d\n",
+                        (int)res.tag());
+                    // Don't forceValue eagerly -- TW's `let x = f x; in x`
+                    // returns whatever `f` returns (could be a thunk if f
+                    // is lazy).  Eager force here can drive a Tag::Slot
+                    // chase through the as-yet-uninitialised slot.
+                    *slotStorage = res;
+                    push(vm, res);
+                    break;
+                }
+                // Other intrinsic kinds (Extends, ComposeExtensions, ...)
+                // fall through to the regular dispatch path below.
+                // Step 1's recogniseIntrinsic only sets Fix; future
+                // commits add the rest.
+            }
+
             // #424: selector-lambda fast path for `\x: x.f`.  Skips
             // frame allocation + dispatch -- force arg, project the
             // recorded SymbolId, push.  Detected at emit time

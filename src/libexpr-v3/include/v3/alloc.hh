@@ -152,6 +152,13 @@ struct AllocStats
     /// by V3_DUMP_LAMBDAS / NIX_VM_STATS so we can confirm the
     /// emit-time peephole is firing on real workloads.
     uint64_t selectorLambdaCalls = 0;
+
+    /// #495: how many OP_CALL invocations dispatched to the v3-native
+    /// `lib.fix` intrinsic (instead of running its bytecode body).
+    /// Mirrors selectorLambdaCalls -- confirms that lower.cc's
+    /// recogniseIntrinsic is firing AND the runtime dispatch is
+    /// taking the fast path on real workloads.
+    uint64_t intrinsicFixCalls = 0;
 };
 
 inline AllocStats & allocStats()
