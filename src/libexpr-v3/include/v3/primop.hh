@@ -103,6 +103,27 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
                               nix::Value & out,
                               const nix::PosIdx pos);
 
+/// #493: dispatch helper for the TW-lambda formals-closure bridge.
+///
+/// When `v3ToTreeWalker` bridges a v3 Tag::Closure with hasFormals=true
+/// to TW, it produces a `Tag::tLambda` Value whose `lambda.env` is a
+/// sentinel keyed in `v3FormalsLambdaBridges()` to the underlying v3
+/// Closure (with captured upvalues).  TW's `autoCallFunction` introspects
+/// formals via `lambda.fun` (the original ExprLambda) and dispatches via
+/// `callFunction`; this helper detects the sentinel env, recovers the
+/// v3 Closure from the side-table, and runs the body in v3 with the
+/// captured upvalues.
+///
+/// Returns true if the value was dispatched directly via v3.  Returns
+/// false if `funValue` is NOT a TW lambda whose `lambda.env` is in the
+/// bridge side-table (caller falls through to the regular call hook
+/// logic).
+bool tryDispatchFormalsLambdaBridge(nix::EvalState & ns,
+                                    const nix::Value & funValue,
+                                    nix::Value * arg,
+                                    nix::Value & out,
+                                    const nix::PosIdx pos);
+
 /// #466 OP_CALL Bridge round-trip elimination.
 ///
 /// If `funTw` is a forced TW Value of the shape

@@ -2702,6 +2702,35 @@ static std::vector<BridgeListEntry,
     return tbl;
 }
 
+/// #493: side-table mapping sentinel `nix::Env *` (held in
+/// `Value::lambda().env` of bridged TW lambdas) to the handle in
+/// `v3BridgeClosures()` of the underlying v3 Closure (with its
+/// captured upvalues).
+///
+/// When `v3ToTreeWalker` bridges a v3 Tag::Closure with hasFormals=true
+/// to TW, instead of refusing (the pre-#493 behaviour) it constructs a
+/// real `Tag::tLambda` whose `lambda.fun` points at the original
+/// `nix::ExprLambda *` (recovered from `LambdaDescriptor::astLambda`)
+/// and whose `lambda.env` is a freshly-allocated sentinel Env keyed
+/// here.  TW's `autoCallFunction` then introspects formals via
+/// `lambda.fun->getFormals()` and dispatches via `callFunction` -- the
+/// v3 call hook detects the sentinel env, recovers the v3 Closure, and
+/// runs the body in v3 with the original captured upvalues.
+///
+/// Pointer keys are stable: the sentinel Env is GC-allocated by
+/// `EvalMemory::allocEnv` and held alive by the closure value
+/// reference.  Boehm scans the key set indirectly via the `Closure*`
+/// in `v3BridgeClosures` (traceable_allocator there).  This map is
+/// non-traceable but values are size_t, not pointers, so no roots
+/// needed for the values; the keys (Env*) are held by the bridged TW
+/// lambda Value which is itself rooted by its consumer.
+static std::unordered_map<const nix::Env *, size_t> &
+v3FormalsLambdaBridges()
+{
+    static std::unordered_map<const nix::Env *, size_t> tbl;
+    return tbl;
+}
+
 /// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
 /// thunks via tree-walker's evaluator before reading the type.
 /// Per-call cycle table prevents infinite recursion on self-referential
@@ -3697,6 +3726,20 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // the deeper recursion.
         static const bool s_refuseFormals =
             std::getenv("NIX_V3_NO_REFUSE_FORMALS_BRIDGE") == nullptr;
+        // #493: opt-in TW-lambda bridge for formals closures.  When
+        // enabled, instead of refusing (which triggered fallback
+        // cascades surfacing as `_internalCallByNamePackageFile
+        // missing` under lambda-skip), construct a real Tag::tLambda
+        // whose `fun` is the original ExprLambda (autoCallFunction
+        // works) and whose `env` is a sentinel keyed in
+        // v3FormalsLambdaBridges() to recover the v3 Closure with its
+        // captured upvalues at call time.
+        //
+        // Default OFF until validated; enable via NIX_V3_TW_LAMBDA_BRIDGE=1.
+        // Default-mode lang/cutover-parity tests pass without it; the
+        // bridge is the lambda-skip default-on prerequisite (#466).
+        static const bool s_twLambdaBridge =
+            std::getenv("NIX_V3_TW_LAMBDA_BRIDGE") != nullptr;
         if (s_refuseFormals
             && v.tag() == Tag::Closure
             && v.payload.closure
@@ -3705,12 +3748,36 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         {
             static const bool s_dbg =
                 std::getenv("V3_DBG_BRIDGE1") != nullptr;
+            const auto * desc = v.payload.closure->desc;
+            if (s_twLambdaBridge && desc->astLambda) {
+                auto * astL = static_cast<nix::ExprLambda *>(desc->astLambda);
+                // Allocate sentinel Env (size 0) and key the side-map
+                // before publishing the lambda Value.
+                nix::Env & sentinelEnv = ns.mem.allocEnv(0);
+                sentinelEnv.up = nullptr;
+
+                auto & closureTbl = v3BridgeClosures();
+                size_t handle = closureTbl.size();
+                closureTbl.push_back({v, tlBridgeFallbackExpr});
+                v3FormalsLambdaBridges()[&sentinelEnv] = handle;
+
+                if (s_dbg) std::fprintf(stderr,
+                    "v3 v3ToTreeWalker: BRIDGE <formals> closure "
+                    "(name='%s' nFormals=%zu) → tLambda env=%p h=%zu\n",
+                    desc->name.c_str(),
+                    desc->formals.size(),
+                    (const void *)&sentinelEnv, handle);
+
+                out->mkLambda(&sentinelEnv, astL);
+                break;
+            }
             if (s_dbg) std::fprintf(stderr,
                 "v3 v3ToTreeWalker: refusing <formals> closure "
-                "(name='%s' arity=%u nFormals=%zu)\n",
-                v.payload.closure->desc->name.c_str(),
-                (unsigned)v.payload.closure->desc->arity,
-                v.payload.closure->desc->formals.size());
+                "(name='%s' arity=%u nFormals=%zu, twLambdaBridge=%d)\n",
+                desc->name.c_str(),
+                (unsigned)desc->arity,
+                desc->formals.size(),
+                (int)s_twLambdaBridge);
             throw BlackholeError(
                 "v3 v3ToTreeWalker: <formals> closure cannot bridge "
                 "as primOpApp -- forcing tree-walker fallback");
@@ -6822,6 +6889,106 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
     nix::Value * tmp = v3ToTreeWalkerPublic(ns, r);
     if (!tmp) return false;
     out = *tmp;
+    return true;
+}
+
+// #493 dispatch helper.  See declaration in primop.hh.
+//
+// Mirrors tryDispatchBridge1Direct's structure (depth guard, VMState
+// allocation, try/catch on the call) but recovers the v3 Closure via
+// `v3FormalsLambdaBridges()` keyed on `funValue.lambda().env` instead
+// of via the primOpApp handle chain.
+bool tryDispatchFormalsLambdaBridge(nix::EvalState & ns,
+                                    const nix::Value & funValue,
+                                    nix::Value * arg,
+                                    nix::Value & out,
+                                    const nix::PosIdx pos)
+{
+    // Only TW lambdas can be the bridged shape.
+    if (!funValue.isLambda()) return false;
+    const auto & l = funValue.lambda();
+    if (!l.env || !l.fun) return false;
+
+    auto & bridgeMap = v3FormalsLambdaBridges();
+    auto it = bridgeMap.find(l.env);
+    if (it == bridgeMap.end()) return false;
+    size_t handle = it->second;
+
+    static const bool s_dbg =
+        std::getenv("V3_DBG_BRIDGE1") != nullptr;
+    if (s_dbg) std::fprintf(stderr,
+        "v3 tryDispatchFormalsLambdaBridge: ENTER env=%p h=%zu argType=%d\n",
+        (const void *)l.env, handle,
+        arg && arg->isValid() ? (int)arg->type<true>() : -1);
+
+    auto & closureTbl = v3BridgeClosures();
+    if (handle >= closureTbl.size()) return false;
+    Value v3fn = closureTbl[handle].v3Value;
+    nix::Expr * fallbackExpr = closureTbl[handle].fallbackExpr;
+
+    // Share bridge1's depth counter so cycles bound consistently with
+    // the primOpApp path.  Same rationale as tryDispatchBridge1Direct
+    // (independent counters ping-pong).
+    int & s_sharedDepth = bridge1DepthCounter();
+    int kMaxDepth = bridge1MaxDepth();
+    if (kMaxDepth > 0 && s_sharedDepth >= kMaxDepth)
+        return false;
+
+    // Wrap the TW arg as a v3 Bridge thunk -- mirrors
+    // tryDispatchBridge1Direct's lazy-arg-wrap so the body forces only
+    // what it needs (the formal-attrset's specific entries via
+    // OP_ATTRS_SELECT lazily resolved through the Bridge).
+    Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(arg));
+    allocStats().thunksAllocated++;
+    Value v3Arg;
+    v3Arg.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+    v3Arg.payload.thunk = bridge;
+
+    ScopedNixEvalState _v3evalGuard(&ns);
+    ScopedBridgeFallbackExpr fbGuard{fallbackExpr};
+
+    struct DepthGuard {
+        int & d;
+        DepthGuard(int & d_) : d(d_) { ++d; }
+        ~DepthGuard() { --d; }
+    } _depthGuard(s_sharedDepth);
+
+    VMState vm;
+    vm.valueStack.reserve(64 * 1024);
+    vm.frames.reserve(4096);
+    vm.withStack.reserve(64);
+    EvalState st;
+    st.nixEvalState = &ns;
+    st.vm = &vm;
+
+    Value r;
+    try {
+        r = callClosure(*st.vm, v3fn, v3Arg);
+        r = forceValue(*st.vm, r);
+    } catch (const std::exception & ex) {
+        // BlackholeError → re-run fallbackExpr through TW (same
+        // recovery as the primOpApp bridge) and call its result with
+        // the original arg.
+        if (fallbackExpr && dynamic_cast<const BlackholeError *>(&ex)) {
+            nix::Value tw;
+            try {
+                fallbackExpr->eval(ns, ns.baseEnv, tw);
+                ns.forceValue(tw, pos);
+                ns.callFunction(tw, *arg, out, pos);
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    nix::Value * tmp = v3ToTreeWalkerPublic(ns, r);
+    if (!tmp) return false;
+    out = *tmp;
+    if (s_dbg) std::fprintf(stderr,
+        "v3 tryDispatchFormalsLambdaBridge: EXIT outType=%d\n",
+        out.isValid() ? (int)out.type<true>() : -1);
     return true;
 }
 

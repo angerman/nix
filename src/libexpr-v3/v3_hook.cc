@@ -2961,6 +2961,19 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
             return true;
         }
     }
+    // #493: TW-lambda formals bridge.  v3ToTreeWalker now constructs
+    // `Tag::tLambda` for v3 closures with hasFormals=true (instead of
+    // refusing).  When TW dispatches such a lambda via callFunction, we
+    // detect the sentinel `lambda.env` here and run the body in v3 with
+    // the captured upvalues, recovered from v3FormalsLambdaBridges().
+    // Same shortcut gating as bridge1Shortcut (skip under OD/PP where
+    // the legacy refusal+fallback path is the load-bearing recovery).
+    if (bridge1Shortcut && fun.isLambda()) {
+        if (tryDispatchFormalsLambdaBridge(state, fun, arg, vRes, pos)) {
+            st.callHookHits++;
+            return true;
+        }
+    }
     if (__builtin_expect(v3SubExprCache().empty() && !onDemandRootEnabled, 1)) {
         st.callHookCacheMiss++;
         return false;
