@@ -1493,17 +1493,23 @@ struct Lowerer
         // upvalue investigation):
         //   V3_DBG_SELF_DOT_FIRES=1     -- log each self-dot fire's
         //                                  source position
-        //   NIX_V3_SELF_DOT_LIMIT=N     -- gate self-dot fires to the
-        //                                  first N module-wide; useful
-        //                                  for narrowing the failing
-        //                                  clause (LIMIT=41 works,
-        //                                  LIMIT=42 trips the lib.systems
-        //                                  upvalue bug -- see
-        //                                  test/run-broader-thunkify-tests.sh).
+        //   NIX_V3_SELF_DOT_LIMIT=N     -- gate fires to the first N
+        //                                  module-wide (LIMIT=41 works,
+        //                                  LIMIT=42 trips the bug).
+        //   NIX_V3_SELF_DOT_SKIP_NTH=N  -- skip JUST the Nth fire
+        //                                  (1-indexed); other fires
+        //                                  proceed normally.  Helps
+        //                                  distinguish "the Nth clause
+        //                                  is special" from "any extra
+        //                                  fire past N triggers".
         static const bool s_dbgFires =
             std::getenv("V3_DBG_SELF_DOT_FIRES") != nullptr;
         static const int s_fireLimit = []() -> int {
             const char * s = std::getenv("NIX_V3_SELF_DOT_LIMIT");
+            return s ? std::atoi(s) : -1;
+        }();
+        static const int s_fireSkipNth = []() -> int {
+            const char * s = std::getenv("NIX_V3_SELF_DOT_SKIP_NTH");
             return s ? std::atoi(s) : -1;
         }();
         static int s_fireCount = 0;
@@ -1513,13 +1519,16 @@ struct Lowerer
             for (size_t i = 0; i < fromExprs->size(); ++i) {
                 nix::Expr * fx = (*fromExprs)[i];
                 if (!fx) continue;
-                bool selfDot = isSelfDotPattern(fx);
-                if (selfDot && s_fireLimit >= 0 && s_fireCount >= s_fireLimit)
-                    selfDot = false;
+                bool selfDotMatches = isSelfDotPattern(fx);
+                int thisOrdinal = selfDotMatches ? (++s_fireCount) : -1;
+                bool selfDot = selfDotMatches;
+                if (selfDot && s_fireLimit >= 0
+                    && s_fireCount > s_fireLimit) selfDot = false;
+                if (selfDot && s_fireSkipNth >= 1
+                    && thisOrdinal == s_fireSkipNth) selfDot = false;
                 bool useThunk = !s_noThunkify
                     && (useThunkBlanket || selfDot);
-                if (selfDot) {
-                    ++s_fireCount;
+                if (selfDotMatches) {
                     if (s_dbgFires) {
                         auto * sel = dynamic_cast<nix::ExprSelect *>(fx);
                         auto * v = sel ? dynamic_cast<nix::ExprVar *>(sel->e) : nullptr;
