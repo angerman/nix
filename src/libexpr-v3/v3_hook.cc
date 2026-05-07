@@ -1558,9 +1558,16 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     // Empirically: with the eval hook off under STG, nixpkgs hello.name
     // makes progress past the all-packages.nix:28 with-block cycle
     // (the cross-VMState fresh-VMState pattern was the source).
+    //
+    // STG-7 (debugging): NIX_V3_STG_KEEP_HOOKS=1 forces the eval hook
+    // ON even under STG.  Used to bisect the §4.5 lambda-parameter
+    // slot work — re-enables the hook so we can see exactly what
+    // breaks when v3 owns mid-TW evaluations.
     static const bool s_stgMode =
         std::getenv("NIX_V3_STG") != nullptr;
-    if (s_stgMode) {
+    static const bool s_stgKeepHooks =
+        std::getenv("NIX_V3_STG_KEEP_HOOKS") != nullptr;
+    if (s_stgMode && !s_stgKeepHooks) {
         e->eval(state, state.baseEnv, v);
         return;
     }
@@ -3059,7 +3066,11 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
         const char * a = std::getenv("NIX_USE_V3");
         if (!a || std::string_view(a) != "1") return false;
         if (std::getenv("NIX_V3_NO_CALL") != nullptr) return false;
-        if (std::getenv("NIX_V3_STG") != nullptr) return false;
+        // STG-4 (#498): STG mode disables the call hook by default.
+        // STG-7 (debugging): NIX_V3_STG_KEEP_HOOKS=1 keeps it on.
+        if (std::getenv("NIX_V3_STG") != nullptr
+            && std::getenv("NIX_V3_STG_KEEP_HOOKS") == nullptr)
+            return false;
         return true;
     }();
     auto & st = v3HookStats();
