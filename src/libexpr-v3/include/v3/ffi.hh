@@ -310,9 +310,16 @@ BlockingFFI<void>                copyPathToStore   (StoreHandle &, nix::StorePat
 // allowedReferences, multiple outputs, placeholder synthesis, .drv file
 // writing.
 //
-// **TODO (#488):** populate this struct fully.  Today, derivationStrict
-// has hand-rolled checks across primops.cc; this descriptor lifts them
-// to one place.
+// **#488 status (2026-05-07):** all 10 A3 fields declared + nested
+// OutputChecks + structuredAttrsJSON; added `contentAddressed` and
+// `impure` flags consulted by derivationStrictInternal
+// (primops.cc:1709-1720) which the original A3 enumeration omitted.
+//
+// **Next step:** add a builder function `DerivationDescriptor
+// fromAttrs(const v3::Bindings &)` that walks an attrset and populates
+// this struct one place, replacing the hand-rolled checks scattered
+// across primops.cc's derivationStrictInternal.  Out of scope for the
+// type-level task; tracked separately.
 
 struct DerivationDescriptor
 {
@@ -329,6 +336,13 @@ struct DerivationDescriptor
     std::optional<std::string> outputHash;
     std::optional<std::string> outputHashAlgo;
     std::optional<std::string> outputHashMode;
+
+    // CA / impure flags (#488 follow-on -- not strictly part of the
+    // A3 enumeration but consulted by derivationStrictInternal at
+    // primops.cc:1709-1720; without them the descriptor is missing
+    // information the actual primop branches on).
+    bool                       contentAddressed = false; ///< __contentAddressed (CaDerivations xp-feat)
+    bool                       impure           = false; ///< __impure (ImpureDerivations xp-feat)
 
     // Sandbox / platform (§A3 first batch)
     bool                       noChroot                   = false; ///< __noChroot
