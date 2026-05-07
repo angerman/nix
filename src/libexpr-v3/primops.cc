@@ -217,6 +217,36 @@ inline size_t forceChainMaxDepth()
     return k;
 }
 
+/// #493 step 3c: force-chain detector relaxed from binary set to
+/// N-reentry counter, mirroring the bridge1 per-handle counter (step
+/// 3b).  Pre-step-3c: first re-entry on the same (op, keyA, keyB)
+/// fired BlackholeError; too eager for legitimate structural recursion
+/// (nixpkgs overlay chains apply the SAME bridge1 handle across many
+/// layers as the fix-point propagates).  TW handles such cases via
+/// blackhole-on-thunk-slot which is per-thunk-instance, not per-key.
+///
+/// Tunable via NIX_V3_FORCE_CHAIN_REENTRY_MAX (default 8).  Same
+/// rationale as kBridge1ReentryMax: bound runaway recursion without
+/// firing on structurally legitimate re-entries.  The chain depth
+/// ceiling (NIX_V3_FORCE_CHAIN_DEPTH, default 256) remains as the
+/// outer bound.
+inline size_t forceChainReentryMax()
+{
+    static const size_t k = []{
+        if (const char * v = std::getenv("NIX_V3_FORCE_CHAIN_REENTRY_MAX"))
+            return static_cast<size_t>(std::max(1, std::atoi(v)));
+        return static_cast<size_t>(8);
+    }();
+    return k;
+}
+
+inline std::unordered_map<ForceChainKey, int, ForceChainKeyHash> &
+forceChainCounters()
+{
+    thread_local std::unordered_map<ForceChainKey, int, ForceChainKeyHash> m;
+    return m;
+}
+
 } // close enclosing anonymous ns (line 108) for ForceChainGuard methods
 
 ForceChainGuard::ForceChainGuard(ForceChainOp op_, uint64_t a_, uint64_t b_)
@@ -228,14 +258,34 @@ ForceChainGuard::ForceChainGuard(ForceChainOp op_, uint64_t a_, uint64_t b_)
         m_overDepth = true;
         return;
     }
-    auto [it, ins] = chain.insert(ForceChainKey{m_op, m_keyA, m_keyB});
-    m_inserted = ins;
+    // #493 step 3c: counter, not binary set.  Same key may re-enter up
+    // to forceChainReentryMax() times before declaring cycle.
+    ForceChainKey k{m_op, m_keyA, m_keyB};
+    auto & counters = forceChainCounters();
+    int & cnt = counters[k];
+    if (cnt >= static_cast<int>(forceChainReentryMax())) {
+        m_overReentry = true;
+        return;
+    }
+    if (cnt == 0)
+        chain.insert(k); // membership for set-based callers
+    ++cnt;
+    m_inserted = true;
 }
 
 ForceChainGuard::~ForceChainGuard()
 {
-    if (m_inserted)
-        forceChainSet().erase(ForceChainKey{m_op, m_keyA, m_keyB});
+    if (m_inserted) {
+        ForceChainKey k{m_op, m_keyA, m_keyB};
+        auto & counters = forceChainCounters();
+        auto it = counters.find(k);
+        if (it != counters.end()) {
+            if (--it->second <= 0) {
+                counters.erase(it);
+                forceChainSet().erase(k);
+            }
+        }
+    }
 }
 
 namespace { // re-open enclosing anonymous ns (matches close at line 2722)
@@ -3008,6 +3058,21 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     int & reentryCount = tlsBridge1ReentryCount[h];
     if (++reentryCount > kBridge1ReentryMax) {
         --reentryCount;
+        // V3_DBG_BRIDGE1_CYCLE diagnostic: which closure is cycling?
+        static const bool s_dbgCycle =
+            std::getenv("V3_DBG_BRIDGE1_CYCLE") != nullptr;
+        if (s_dbgCycle) {
+            const char * name = "<anon>";
+            if (v3fn.tag() == Tag::Closure && v3fn.payload.closure
+                && v3fn.payload.closure->desc
+                && !v3fn.payload.closure->desc->name.empty())
+            {
+                name = v3fn.payload.closure->desc->name.c_str();
+            }
+            std::fprintf(stderr,
+                "v3 bridge1: cycle on handle=%lld name='%s' reentryMax=%d\n",
+                (long long)h, name, kBridge1ReentryMax);
+        }
         // Cycle: route to fallbackToTreeWalker by throwing typed.
         try {
             throw BlackholeError(

@@ -178,7 +178,12 @@ enum class ForceChainOp : uint8_t {
 struct ForceChainGuard {
     ForceChainGuard(ForceChainOp op, uint64_t primary, uint64_t secondary = 0);
     ~ForceChainGuard();
-    bool isCycle() const noexcept { return m_overDepth || !m_inserted; }
+    /// #493 step 3c: cycle if either depth ceiling reached OR per-key
+    /// reentry exceeded.  Pre-step-3c the second condition was
+    /// !m_inserted (binary set; first re-entry fired); now relaxed to
+    /// a counter so legitimate structural recursion (overlay chains)
+    /// can re-enter up to NIX_V3_FORCE_CHAIN_REENTRY_MAX times.
+    bool isCycle() const noexcept { return m_overDepth || m_overReentry; }
     /// Whether the guard was inserted at depth >= the configured ceiling
     /// (`NIX_V3_FORCE_CHAIN_DEPTH`).  Differentiates "real cycle"
     /// (re-entry on same key) from "depth bound" for diagnostics.
@@ -189,8 +194,9 @@ private:
     ForceChainOp m_op;
     uint64_t     m_keyA;
     uint64_t     m_keyB;
-    bool         m_inserted  = false;
-    bool         m_overDepth = false;
+    bool         m_inserted    = false;
+    bool         m_overDepth   = false;
+    bool         m_overReentry = false;
 };
 
 /// Apply a closure (or single-arg primop) to one argument and return
