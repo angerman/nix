@@ -66,6 +66,7 @@ lib_sources = files(
   'bridge_yield.cc',
   'v3_hook.cc',
   'disasm.cc',
+  'ffi.cc',
 )
 
 this_library = library(
