@@ -2961,6 +2961,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (t->state == ThunkState::Bridge) {
                 ++t->forces;
                 ++allocStats().bridgeThunksForced;
+                // #466 / STG-7 (#498): forceBridgeThunk reaches into TW
+                // (ns->forceValue), and TW may re-enter v3 via the eval
+                // hook on whatever Expr it ends up driving.  Without
+                // ScopedActiveV3VM here the re-entry guard
+                // (v3EvalEntry's `activeV3VM() != nullptr` check) stays
+                // inactive, so the inner v3 call spawns a fresh VMState
+                // that black-marks v3 thunks already mid-flight on this
+                // outer vm — exactly the cross-VMState fresh-VMState
+                // cycle that surfaces under STG-mode + KEEP_HOOKS=1.
+                // Mirror the forceValue Bridge handler at line 5539.
+                ScopedActiveV3VM _activeV3VM(&vm);
                 Value resolved = forceBridgeThunk(t);
                 t->state = ThunkState::Evaluated;
                 t->evaluated = resolved;
