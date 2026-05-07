@@ -323,11 +323,11 @@ let
   ext = self: { a = 1; b = self.a + 10; };
 in (lib.fix ext).b
 EOF
-  # KNOWN-FAIL: full lib.fix loops because the nested-let pattern
-  # (level >= 1 self-dot) isn't caught by the level==0 heuristic.
-  # Asserted as failing so silent changes (e.g. someone broadens the
-  # heuristic and breaks hello.name) are surfaced.  Flip when a
-  # precise lambda-param detection lands.
+  # d3b-default: KNOWN-FAIL.  Full lib.fix loops at level 0 because the
+  # nested-let `inherit (self.fixedPoints) fix` sits at level 1.  The
+  # default heuristic only catches level==0, so the eager from-expr
+  # tries to force `self` mid-construction.  Asserted as failing so
+  # silent changes are caught when the upvalue-capture bug landed.
   d3b_out=$(timeout 20 env NIX_USE_V3=1 NIX_V3_INTRINSIC_DISPATCH=1 \
     NIX_V3_PARSE_PRECOMPILE=1 "$NIX_BIN" eval --impure -f "$TMP/d3b.nix" 2>&1)
   d3b_exit=$?
@@ -335,7 +335,22 @@ EOF
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    fail_names+=("d3b full lib.fix: bug fixed but assertion not flipped (got: $(echo "$d3b_out" | tail -1))")
+    fail_names+=("d3b default: known-fail assertion stale (got: $(echo "$d3b_out" | tail -1))")
+  fi
+
+  # d3b-optin: NIX_V3_SELF_DOT_MAX_LEVEL=2 walks the lambda chain
+  # through the intermediate `let` and thunkifies `self.fixedPoints`.
+  # MUST return 11.  This is the lib.fix workaround that's safe to
+  # enable per-eval until the upvalue-capture bug for deeper-nested
+  # patterns is root-caused.
+  d3b_optin_out=$(timeout 20 env NIX_USE_V3=1 NIX_V3_INTRINSIC_DISPATCH=1 \
+    NIX_V3_PARSE_PRECOMPILE=1 NIX_V3_SELF_DOT_MAX_LEVEL=2 \
+    "$NIX_BIN" eval --impure -f "$TMP/d3b.nix" 2>&1)
+  if echo "$d3b_optin_out" | grep -q '^11$'; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    fail_names+=("d3b MAX_LEVEL=2: expected 11, got: $(echo "$d3b_optin_out" | tail -3)")
   fi
 fi
 
