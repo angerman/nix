@@ -4872,6 +4872,31 @@ Value forceValue(VMState & vm, Value v)
                 }
             }
 
+            // #497 diagnostic: dump frame stack + identify Black thunk
+            // when V3_DBG_BLACKHOLE_TRACE=1.  Used to investigate
+            // post-#496 BlackholeError shape under broader thunkify.
+            if (std::getenv("V3_DBG_BLACKHOLE_TRACE")) {
+                std::fprintf(stderr,
+                    "v3 BLACKHOLE thunk=%p forces=%u (frames=%zu):\n",
+                    (void *)t, (unsigned)t->forces, vm.frames.size());
+                for (size_t fi = vm.frames.size(); fi > 0; --fi) {
+                    const auto & fr = vm.frames[fi - 1];
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk && fr.thunk->state == ThunkState::Blackhole)
+                        d = fr.thunk->suspended.desc;
+                    else if (fr.closure)
+                        d = fr.closure->desc;
+                    std::fprintf(stderr,
+                        "  [%zu] %s ip=%u thunk=%p closure=%p flags=%u%s\n",
+                        fi - 1,
+                        d && !d->name.empty() ? d->name.c_str() : "<?>",
+                        fr.ip,
+                        (void *)fr.thunk, (void *)fr.closure,
+                        (unsigned)fr.flags,
+                        fr.thunk == t ? " <-- TARGET" : "");
+                }
+                std::fflush(stderr);
+            }
             throw BlackholeError("v3 forceValue: infinite recursion (blackhole)");
         }
         if (t->state == ThunkState::Bridge) {

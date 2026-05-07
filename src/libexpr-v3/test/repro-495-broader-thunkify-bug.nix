@@ -1,5 +1,6 @@
 # #495 follow-on: smaller reproducer for the broader-thunkify
-# regression that fires when NIX_V3_SELF_DOT_MAX_LEVEL >= 1.
+# regression.  RESOLVED 2026-05-07 via #496 + #497.  Returns "x86_64"
+# under default mode, MAX_LEVEL=1, and TW.
 #
 # History (2026-05-07):
 #   Pre-#496: "v3 OP_ATTRS_SELECT: attribute not found" -- a CONSEQUENCE
@@ -8,27 +9,29 @@
 #       shape attrset that survived all the way into select's body.
 #   Post-#496 (publishToNearestBlackThunkFrame restricted to
 #       OP_ATTRS_REC_INIT): the false partial-bindings pollution is
-#       gone; what remains is the underlying recursive force chain
-#       which now surfaces as a clean BlackholeError:
+#       gone; what remained was the underlying recursive force chain
+#       surfacing as `forceValue: infinite recursion (blackhole)`.
+#   Post-#497 (lower.cc thunkifies ExprOpUpdate from-exprs): the
+#       eager lowering of `inherit ({...} // platforms.select final)
+#       ...` was the real culprit -- it forced `final` mid-construction
+#       inside its own definition.  Wrapping the from-expr in a v3
+#       Thunk (matching TW's `from->maybeThunk(state, up)` in
+#       ExprAttrs::buildInheritFromEnv) defers evaluation to attribute-
+#       access time, by which point `final`'s let-binding thunk has
+#       finished.
 #
-#           error: v3 forceValue: infinite recursion (blackhole)
-#
-#       i.e. the broader-thunkify shape exposes a real cycle that v3's
-#       eager from-expr lowering walks into.  Tree-walker handles the
-#       same shape via lazy attr-access machinery v3 doesn't yet have
-#       on every path.  BlackholeError is the truthful diagnosis;
-#       fixing it requires a deeper change (preserving from-expr
-#       laziness across the inherit-from + apply-overrides chain) than
-#       the partialBindings fix.
-#
-# Triggers:
+# Trigger (post-fix):
 #
 #   $ NIX_USE_V3=1 NIX_V3_SELF_DOT_MAX_LEVEL=1 \
 #       nix eval --impure --raw -f this-file.nix
-#   error: v3 forceValue: infinite recursion (blackhole)
+#   x86_64
 #
-# With NIX_V3_SELF_DOT_MAX_LEVEL unset (default 0), this returns "x86_64".
-# Tree-walker also returns "x86_64".
+# Pin the pre-fix failure shape (for regression-testing the rule
+# stays in place):
+#
+#   $ NIX_USE_V3=1 NIX_V3_SELF_DOT_MAX_LEVEL=1 NIX_V3_NO_COMPLEX_FROM_THUNK=1 \
+#       nix eval --impure --raw -f this-file.nix
+#   error: v3 forceValue: infinite recursion (blackhole)
 #
 # Failure trace (V3_DBG_ATTRS_SELECT=1) reports:
 #

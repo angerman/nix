@@ -1489,6 +1489,46 @@ struct Lowerer
             return true;
         };
 
+        // #497 follow-on: TW always thunkifies inherit-from from-exprs
+        // (`from->maybeThunk(state, up)` in ExprAttrs::buildInheritFromEnv,
+        // eval.cc:1520).  v3 was lowering them eagerly EXCEPT for the
+        // narrow self-dot pattern, which broke any from-expr that
+        // references a let/rec sibling mid-construction (e.g.
+        // lib/systems/default.nix's `inherit ({...} // platforms.select
+        // final) ...` -- the eager evaluation forces `final` while
+        // final's let-binding thunk is still Black, throwing
+        // BlackholeError).
+        //
+        // Rule: thunkify any from-expr whose shape can re-enter the
+        // enclosing scope's let/rec bindings.  Conservative shape list:
+        //   - ExprOpUpdate (`A // B`): both sides may capture rec/let
+        //     siblings, common in fix-point-style elaborate code.
+        //   - ExprCall: function calls of any flavour can force the
+        //     enclosing rec/let by reading its bindings as args or
+        //     captured upvalues; `inherit (callPackages ...) ...` is
+        //     the canonical nixpkgs shape.
+        //   - ExprIf: branch-dependent reads of the surrounding scope.
+        // ExprVar / ExprSelect-on-ExprVar / literals stay eager
+        // (ExprVar via isTrivialForLazy in thunkifyForAttr; ExprSelect-
+        // on-ExprVar handled by the self-dot rule above).
+        // Other shapes (ExprWith, ExprOpConcatLists, etc.) are rare in
+        // practice; thunkify them too for parity with TW.
+        auto isComplexFromExpr = [](nix::Expr * fx) -> bool {
+            if (!fx) return false;
+            const auto k = fx->exprKind;
+            // Targeted-only: ExprOpUpdate (`A // B`) is the canonical
+            // shape that captures rec/let siblings via a `//` merge
+            // (e.g. lib/systems/default.nix's `inherit ({...} //
+            // platforms.select final) ...`).  Other shapes were tried
+            // (ExprCall, broader sweep) but regress nixpkgs paths
+            // (callPackage undefined at all-packages.nix:2276) — the
+            // freeVar capture across thunk wrap interacts poorly with
+            // `with self;`-driven environments under default eval.
+            // Stay narrow until that's root-caused (#497 follow-on).
+            if (k == nix::Expr::Kind::OpUpdate) return true;
+            return false;
+        };
+
         // Diagnostic / bisect knobs (v3 #495 follow-on, broader-thunkify
         // upvalue investigation):
         //   V3_DBG_SELF_DOT_FIRES=1     -- log each self-dot fire's
@@ -1526,8 +1566,14 @@ struct Lowerer
                     && s_fireCount > s_fireLimit) selfDot = false;
                 if (selfDot && s_fireSkipNth >= 1
                     && thisOrdinal == s_fireSkipNth) selfDot = false;
+                // #497: always-default-on opt-in for the broader complex-
+                // from-expr rule.  Set NIX_V3_NO_COMPLEX_FROM_THUNK=1 to
+                // disable for bisection.
+                static const bool s_noComplex =
+                    std::getenv("NIX_V3_NO_COMPLEX_FROM_THUNK") != nullptr;
+                bool complexFromExpr = !s_noComplex && isComplexFromExpr(fx);
                 bool useThunk = !s_noThunkify
-                    && (useThunkBlanket || selfDot);
+                    && (useThunkBlanket || selfDot || complexFromExpr);
                 if (selfDotMatches) {
                     if (s_dbgFires) {
                         auto * sel = dynamic_cast<nix::ExprSelect *>(fx);
