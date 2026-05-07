@@ -449,16 +449,37 @@ Fallible<Value> evalExpr(Evaluator &, Expr *);
 Fallible<Value> evalFile(Evaluator &, nix::SourcePath);
 
 // =========================================================================
-// Plugin ABI (deferred decision, see FFI_PLAN_2026-05-06b §A9)
+// Plugin ABI (FFI_PLAN_2026-05-06b §A9)
 // =========================================================================
 //
-// Two viable answers:
-//   (a) Hard cut: extern "C" void nix_plugin_v3(v3::PrimOpRegistry &)
-//   (b) Compat shim: old RegisterPrimOp plugins wrapped in a closure
-//       that marshals v3 <-> TW values
+// **Decision:** Option B (compat shim) during transition, Option A
+// (hard cut) after a deprecation window.  See plan §A9 for rationale.
 //
-// **#492 recommendation:** Option B during transition, Option A after a
-// deprecation window.  Not declared yet -- depends on the plugin ABI
-// decision.
+// **Option B (active during transition):** old plugins continue to use
+// `RegisterPrimOp` (libnixexpr's primops.hh).  At plugin-load time,
+// v3's hook intercepts each registration and wraps the old `PrimOp`
+// into a `v3::PrimOp` whose `fn` marshals v3 Values to TW Values
+// before calling the old `impl`, then bridges the TW result back.
+// Slow-path -- one extra round-trip per plugin call -- but no
+// compatibility break.  No FFI declarations needed for Option B; the
+// shim lives entirely inside v3 (registerPrimOp interception in
+// `lower.cc` / `v3_hook.cc`).
+//
+// **Option A (post-deprecation):** new plugins use the v3-native ABI:
+//
+//   extern "C" void nix_plugin_v3(::nix::v3::PrimOpRegistry &);
+//
+// The plugin's entry point registers v3-native PrimOp values directly,
+// skipping the marshaling round-trip.  Deprecation window: until at
+// least one full Nix release after Option A is announced; older
+// plugins fall through Option B's shim.
+
+class PrimOpRegistry; // forward (impl in primop_registry.hh, future)
+
+/// Plugin entry-point signature for Option A (the post-deprecation
+/// v3-native plugin ABI).  Not yet wired -- the registry type is
+/// pending design.  Plugins that don't define this symbol are
+/// loaded via the Option B compat shim.
+extern "C" using V3PluginEntry = void (*)(PrimOpRegistry &);
 
 } // namespace nix::v3
