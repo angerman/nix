@@ -5347,7 +5347,29 @@ void primImport(EvalState & state, Value * args, Value & out)
     std::string path;
     if (args[0].isString()) path = args[0].payload.str;
     else if (args[0].isPath()) path = args[0].payload.path;
-    else typeError("import", "string or path");
+    else {
+        // #493 diag: when args[0] is a Bridge thunk, print the TW
+        // source's REAL type so we can trace force-chase issues.
+        if (std::getenv("V3_DBG_IMPORT") != nullptr) {
+            std::fprintf(stderr,
+                "v3 primop import: arg tag=%d", (int)args[0].tag());
+            if (args[0].tag() == Tag::Thunk && args[0].payload.thunk
+                && args[0].payload.thunk->state == ThunkState::Bridge
+                && args[0].payload.thunk->bridgeSrc)
+            {
+                auto * src = static_cast<nix::Value *>(
+                    args[0].payload.thunk->bridgeSrc);
+                int twType = -1;
+                try { twType = (int)src->type(); }
+                catch (...) { twType = -2; }
+                std::fprintf(stderr,
+                    " (Bridge.bridgeSrc=%p TW.type=%d)",
+                    (const void *)src, twType);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        typeError("import", "string or path");
+    }
 
     // WC-38 diagnostic: log every import path + sequence number to compare
     // import-order vs tree-walker.
