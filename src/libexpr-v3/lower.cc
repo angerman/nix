@@ -1432,12 +1432,22 @@ struct Lowerer
         // Override via:
         //   NIX_V3_NO_INHERIT_FROM_THUNK=1   -- disable all thunkify
         //   NIX_V3_INHERIT_FROM_THUNK_ALL=1  -- force thunkify all
+        //
+        // STG-5 (#498): under NIX_V3_STG=1, thunkify ALL inherit-from
+        // from-exprs unconditionally — matches TW's
+        // `from->maybeThunk(state, up)` in
+        // ExprAttrs::buildInheritFromEnv (libexpr/eval.cc:1520).  STG
+        // mode runs without the publish/recovery side-table, so the
+        // narrow self-dot heuristic that was needed to avoid Black-
+        // thunk leaks is no longer necessary.
+        static const bool s_stgMode =
+            std::getenv("NIX_V3_STG") != nullptr;
         static const bool s_lambdaSkip =
             std::getenv("NIX_V3_LAMBDA_SKIP") != nullptr;
         static const bool s_noThunkify =
             std::getenv("NIX_V3_NO_INHERIT_FROM_THUNK") != nullptr;
         static const bool s_thunkifyAll =
-            std::getenv("NIX_V3_INHERIT_FROM_THUNK_ALL") != nullptr;
+            std::getenv("NIX_V3_INHERIT_FROM_THUNK_ALL") != nullptr || s_stgMode;
         const bool useThunkBlanket = (s_lambdaSkip || s_thunkifyAll) && !s_noThunkify;
 
         // Heuristic for the `self.X` shape: ExprSelect whose head is
