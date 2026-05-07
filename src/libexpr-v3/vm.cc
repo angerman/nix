@@ -1542,6 +1542,39 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // 5000-frame stack guard, not the tail-call counter.
             vm.tailCallCount = 0;
             Value arg = pop(vm), fun = pop(vm);
+            // V3_DBG_FINAL_CALL=1: log Apply of extends's `final:`
+            // lambda OR allPackages's `self:` outer lambda — tracing
+            // the broader-thunkify upvalue bug at #498.
+            if (std::getenv("V3_DBG_FINAL_CALL")
+                && fun.tag() == Tag::Closure && fun.payload.closure
+                && fun.payload.closure->desc
+                && (fun.payload.closure->desc->name == "final"
+                    || fun.payload.closure->desc->name == "self"
+                    || fun.payload.closure->desc->name == "rattrs"
+                    || fun.payload.closure->desc->name == "overlay")) {
+                Value chase = arg;
+                int hops = 0;
+                while (hops < 4) {
+                    if (chase.tag() == Tag::Slot && chase.payload.slot)
+                        chase = *chase.payload.slot;
+                    else if (chase.tag() == Tag::Thunk && chase.payload.thunk
+                             && chase.payload.thunk->state == ThunkState::Evaluated)
+                        chase = chase.payload.thunk->evaluated;
+                    else break;
+                    ++hops;
+                }
+                std::fprintf(stderr,
+                    "v3 OP_CALL %s-lambda: arg.tag=%d",
+                    fun.payload.closure->desc->name.c_str(),
+                    (int)arg.tag());
+                if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                    auto * b = chase.payload.bindings;
+                    std::fprintf(stderr, " -> attrs size=%u", b->size);
+                } else {
+                    std::fprintf(stderr, " -> tag=%d", (int)chase.tag());
+                }
+                std::fprintf(stderr, " (frames=%zu)\n", vm.frames.size());
+            }
             // V3_DBG_OP_CALL=1 logs every OP_CALL with the closure
             // name + arg shape.  Used to trace the broader-thunkify
             // upvalue bug.
