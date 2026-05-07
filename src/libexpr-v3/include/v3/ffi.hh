@@ -75,7 +75,7 @@ namespace nix {
 
 namespace nix::v3 {
 
-class Value; // v3 16-byte tagged value (declared in value.hh)
+struct Value; // v3 16-byte tagged value (declared in value.hh)
 
 // =========================================================================
 // Framework: lifetime + error + latency-class wrappers

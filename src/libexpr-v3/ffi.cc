@@ -28,6 +28,10 @@
 
 #include "v3/ffi.hh"
 
+#include "v3/value.hh"
+#include "v3/vm.hh"
+#include "v3/primop.hh"
+
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -233,6 +237,54 @@ void releaseGlobal(GlobalClosureHandle /*h*/)
     // No-op for now -- the underlying v3BridgeClosures table is grow-
     // only.  When we migrate to a slot-recycling registry, this will
     // free the slot and any captured values.
+}
+
+// ---------------------------------------------------------------------------
+// applyClosure (Sprint priority 1, FFI plan §G)
+// ---------------------------------------------------------------------------
+//
+// Calls a v3 closure (registered via allocClosureHandle whose payload is a
+// `Value *` pointing at the closure) with the given argument.  Returns
+// `Fallible<Value>`: success carries the result; failure carries a
+// v3::EvalError translated from a thrown C++ exception.
+//
+// **Threading / VMState:** allocates a fresh VMState per call.  This is
+// the same pattern bridge1 (`primops.cc:3138`) already uses for TW→v3
+// transitions.  Deeper integration (one VMState per EvalScope, fiber
+// hand-off, BlockingFFI<T> wrapping for Port-class blocking calls)
+// lands incrementally per the FFI plan.
+
+Fallible<Value> applyClosure(EvalScope & scope, ClosureHandle h, Value arg)
+{
+    void * payload = lookupClosureHandle(h);
+    if (!payload) {
+        EvalError err;
+        err.msg = "applyClosure: invalid handle (scope expired or never existed)";
+        return Fallible<Value>{err};
+    }
+    (void)scope;  // EvalScope ownership is the validity check above.
+
+    Value * funPtr = static_cast<Value *>(payload);
+
+    // Allocate a fresh VMState.  Reserve sizes mirror bridge1's
+    // (primops.cc:3138-3141): enough for a typical closure call without
+    // re-allocation, but heap-bounded.
+    VMState vm;
+    vm.valueStack.reserve(64 * 1024);
+    vm.frames.reserve(4096);
+    vm.withStack.reserve(64);
+
+    try {
+        Value result = callClosure(vm, *funPtr, arg);
+        return Fallible<Value>{result};
+    } catch (const std::exception & e) {
+        EvalError err;
+        err.msg = e.what();
+        // primaryPos / trace / suggestions left empty for now;
+        // FFI plan §A5 boundary shim catches the structured nix::EvalError
+        // (when v3 throws it) and copies position + trace.  See #489.
+        return Fallible<Value>{err};
+    }
 }
 
 } // namespace nix::v3

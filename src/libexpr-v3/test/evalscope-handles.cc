@@ -18,6 +18,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ffi.hh"
+#include "v3/value.hh"
 
 #include <cassert>
 #include <cstdio>
@@ -154,6 +155,48 @@ static void test_multi_alloc_in_scope()
     CHECK(uint32_t(h2.opaque) != uint32_t(h3.opaque));
 }
 
+// Sprint priority 1: applyClosure proof-of-life.  These tests don't
+// build a real v3 closure (that requires the full lower→compile→run
+// pipeline); they verify the FFI surface — invalid-handle path, error
+// translation, scope-aware payload retrieval — works end-to-end.
+
+static void test_apply_closure_invalid_handle()
+{
+    // A handle that's never been allocated must yield Fallible-error
+    // without crashing.
+    Evaluator ev;
+    EvalScope sc(ev);
+    ClosureHandle bogus{0xDEADBEEFCAFEBABEULL};
+    Value dummyArg{};  // tag=0 / payload=0; never read on this path.
+    auto result = applyClosure(sc, bogus, dummyArg);
+    CHECK(!result.ok());
+    if (!result.ok()) {
+        const auto & err = result.error();
+        CHECK(!err.msg.empty());
+        CHECK(err.msg.find("invalid handle") != std::string::npos);
+    }
+}
+
+static void test_apply_closure_handle_after_scope_death()
+{
+    // Allocate a handle in an inner scope, exit the scope, then call
+    // applyClosure.  The handle's scope is dead → invalid-handle path.
+    Evaluator ev;
+    ClosureHandle escaped{0};
+    int placeholder = 0;
+    {
+        EvalScope inner(ev);
+        escaped = allocClosureHandle(inner, &placeholder);
+        CHECK(isValid(escaped));
+    }
+    CHECK(!isValid(escaped));
+
+    EvalScope outer(ev);
+    Value dummyArg{};
+    auto result = applyClosure(outer, escaped, dummyArg);
+    CHECK(!result.ok());
+}
+
 int main()
 {
     test_alloc_basic();
@@ -162,6 +205,8 @@ int main()
     test_random_inputs_are_safe();
     test_consecutive_scopes_get_fresh_generations();
     test_multi_alloc_in_scope();
+    test_apply_closure_invalid_handle();
+    test_apply_closure_handle_after_scope_death();
 
     std::fprintf(stderr, "evalscope-handles: passed=%d failed=%d\n",
                  g_passed, g_failed);
