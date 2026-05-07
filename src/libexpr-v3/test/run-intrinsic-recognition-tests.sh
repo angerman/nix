@@ -109,6 +109,60 @@ EOF
 assert_match "p6 alternate names" "Fix" "$TMP/p6.nix"
 
 # ----------------------------------------------------------------------
+# e1 — canonical extends shape MUST match.
+cat > "$TMP/e1.nix" <<'EOF'
+let
+  extends = overlay: f: final: let prev = f final; in prev // overlay final prev;
+in extends
+EOF
+assert_match "e1 canonical extends" "Extends" "$TMP/e1.nix"
+
+# ----------------------------------------------------------------------
+# e2 — extends with wrong overlay-call arity (1 arg instead of 2): no match.
+cat > "$TMP/e2.nix" <<'EOF'
+let
+  notext = overlay: f: final: let prev = f final; in prev // overlay final;
+in notext
+EOF
+assert_no_match "e2 wrong overlay arity" "$TMP/e2.nix"
+
+# ----------------------------------------------------------------------
+# e3 — extends with extra binding in let: no match.
+cat > "$TMP/e3.nix" <<'EOF'
+let
+  notext = overlay: f: final: let prev = f final; tmp = 1; in prev // overlay final prev;
+in notext
+EOF
+assert_no_match "e3 extra binding" "$TMP/e3.nix"
+
+# ----------------------------------------------------------------------
+# e4 — extends with swapped final/prev order in overlay call: no match.
+cat > "$TMP/e4.nix" <<'EOF'
+let
+  notext = overlay: f: final: let prev = f final; in prev // overlay prev final;
+in notext
+EOF
+assert_no_match "e4 swapped overlay args" "$TMP/e4.nix"
+
+# ----------------------------------------------------------------------
+# e5 — extends with alternate names (matcher is symbol-based): MUST match.
+cat > "$TMP/e5.nix" <<'EOF'
+let
+  myext = ov: g: x: let p = g x; in p // ov x p;
+in myext
+EOF
+assert_match "e5 alternate names" "Extends" "$TMP/e5.nix"
+
+# ----------------------------------------------------------------------
+# e6 — extends nested-call instead of f-call as prev RHS: no match.
+cat > "$TMP/e6.nix" <<'EOF'
+let
+  notext = overlay: f: final: let prev = f final final; in prev // overlay final prev;
+in notext
+EOF
+assert_no_match "e6 prev RHS arity" "$TMP/e6.nix"
+
+# ----------------------------------------------------------------------
 # d1 — DISPATCH (positive, opt-in via NIX_V3_INTRINSIC_DISPATCH=1).
 # When intrinsic dispatch is enabled, the simple fix case returns the
 # correct value AND the native dispatch counter bumps.
@@ -160,13 +214,18 @@ if [[ -x "$NIX_BIN" ]]; then
 fi
 
 # ----------------------------------------------------------------------
-# d3 — KNOWN-FAIL reproducer (negative regression): under
-# NIX_V3_INTRINSIC_DISPATCH=1, importing nixpkgs' full <nixpkgs/lib>
-# triggers an infinite recursion through makeExtensible' + extends.
-# Simple `lib.fix` with stub `lib = null` works (d3a); full lib import
-# fails (d3b -- known to fail until step 3 lands native Extends).
-# This test EXPECTS the failure mode to remain documented (so a future
-# fix that silently changes the failure shape is caught).
+# d3 — KNOWN-FAIL reproducer (negative regression).
+#
+# d3a: Simple `fixedPoints.fix` with stub `lib = null` works under both
+#      intrinsic dispatch and parse-precompile.
+#
+# d3b: Full `(import <nixpkgs/lib>).fix ext` fails with infinite
+#      recursion under NIX_V3_PARSE_PRECOMPILE=1.  This is a
+#      parse-precompile bug independent of intrinsic dispatch — the
+#      same recursion happens with NIX_V3_INTRINSIC_DISPATCH off, so
+#      flipping intrinsic dispatch does not regress this case.  Asserted
+#      here so a fix to either path that silently changes the failure
+#      shape is caught.  Tracked as a follow-on to #495.
 if [[ -x "$NIX_BIN" ]]; then
   cat > "$TMP/d3a.nix" <<'EOF'
 let

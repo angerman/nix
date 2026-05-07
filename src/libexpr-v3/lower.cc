@@ -718,7 +718,77 @@ struct Lowerer
 
             return 1;  // Intrinsic::Fix
         }
-        return reject("body not ExprLet");
+
+        // Match Extends: outer lambda is `overlay`, body is a chain
+        //   overlay: f: final: let prev = f final; in prev // overlay final prev
+        //
+        // AST shape (peeling outermost lambda):
+        //   ExprLambda(arg=f,
+        //     body=ExprLambda(arg=final,
+        //       body=ExprLet(
+        //         attrs={prev = ExprCall(f, [final])},
+        //         body=ExprOpUpdate(
+        //           ExprVar(prev),
+        //           ExprCall(overlay, [final, prev])))))
+        //
+        // Nix flattens curried application, so `overlay final prev`
+        // becomes ExprCall(overlay, [final, prev]).
+        if (auto * lamF = dynamic_cast<nix::ExprLambda *>(e->body)) {
+            if (!lamF->arg) return reject("Extends: inner-1 has no arg");
+            if (lamF->getFormals()) return reject("Extends: inner-1 has formals");
+            auto * lamFinal = dynamic_cast<nix::ExprLambda *>(lamF->body);
+            if (!lamFinal) return reject("Extends: inner-1 body not lambda");
+            if (!lamFinal->arg) return reject("Extends: inner-2 has no arg");
+            if (lamFinal->getFormals()) return reject("Extends: inner-2 has formals");
+
+            auto * letE = dynamic_cast<nix::ExprLet *>(lamFinal->body);
+            if (!letE) return reject("Extends: inner-2 body not Let");
+            if (!letE->attrs || !letE->attrs->attrs) return reject("Extends: let no attrs");
+            const auto & defs = *letE->attrs->attrs;
+            if (defs.size() != 1) return reject("Extends: let != 1 binding");
+            if (letE->attrs->dynamicAttrs && !letE->attrs->dynamicAttrs->empty())
+                return reject("Extends: let has dyn");
+            const auto & [prevSym, prevDef] = *defs.begin();
+            if (prevDef.kind != nix::ExprAttrs::AttrDef::Kind::Plain)
+                return reject("Extends: prev binding not Plain");
+
+            // prev = f final
+            auto * fCall = dynamic_cast<nix::ExprCall *>(prevDef.e);
+            if (!fCall || !fCall->args.has_value())
+                return reject("Extends: prev RHS not ExprCall");
+            if (fCall->args->size() != 1)
+                return reject("Extends: f-call args != 1");
+            auto * fVar = dynamic_cast<nix::ExprVar *>(fCall->fun);
+            if (!fVar || fVar->name != lamF->arg)
+                return reject("Extends: f-call callee != f");
+            auto * fArgVar = dynamic_cast<nix::ExprVar *>((*fCall->args)[0]);
+            if (!fArgVar || fArgVar->name != lamFinal->arg)
+                return reject("Extends: f-call arg != final");
+
+            // Let body: prev // overlay final prev
+            auto * upd = dynamic_cast<nix::ExprOpUpdate *>(letE->body);
+            if (!upd) return reject("Extends: let body not OpUpdate");
+            auto * lhsVar = dynamic_cast<nix::ExprVar *>(upd->e1);
+            if (!lhsVar || lhsVar->name != prevSym)
+                return reject("Extends: update LHS != prev");
+            auto * rhsCall = dynamic_cast<nix::ExprCall *>(upd->e2);
+            if (!rhsCall || !rhsCall->args.has_value())
+                return reject("Extends: update RHS not ExprCall");
+            if (rhsCall->args->size() != 2)
+                return reject("Extends: overlay-call arity != 2");
+            auto * ovVar = dynamic_cast<nix::ExprVar *>(rhsCall->fun);
+            if (!ovVar || ovVar->name != e->arg)
+                return reject("Extends: overlay-call callee != overlay");
+            auto * a0 = dynamic_cast<nix::ExprVar *>((*rhsCall->args)[0]);
+            auto * a1 = dynamic_cast<nix::ExprVar *>((*rhsCall->args)[1]);
+            if (!a0 || a0->name != lamFinal->arg)
+                return reject("Extends: overlay arg-0 != final");
+            if (!a1 || a1->name != prevSym)
+                return reject("Extends: overlay arg-1 != prev");
+
+            return 2;  // Intrinsic::Extends
+        }
+        return reject("body not ExprLet or ExprLambda");
     }
 
     ir::VarId lowerLambda(nix::ExprLambda * e)
