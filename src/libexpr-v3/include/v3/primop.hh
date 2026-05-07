@@ -240,6 +240,44 @@ BridgeAttrHasResult tryBridgeAttrHas(Thunk * t, uint32_t v3name);
 /// result into `out`.
 using PrimOpFn = void (*)(EvalState & state, Value * args, Value & out);
 
+/// FFI plan A13 / migration step 3: per-primop flags for sandbox-at-
+/// dispatch.  Today every "pure-eval / restricted-eval / impure /
+/// experimental-feature" check is hand-rolled inside the primop body
+/// (e.g., `if (settings.pureEval) state.error<EvalError>(...)`).  The
+/// flags field declares the gate ONCE per primop; dispatch consults
+/// the flags at OP_CALL_PRIMOP entry and refuses before running the
+/// body.  Removes per-primop boilerplate and centralises the policy.
+///
+/// Bitmask, not enum-class, so `flags = Impure | Restricted` works
+/// without verbose casts at registration sites.  Held as uint8_t in
+/// PrimOp so the struct stays cache-friendly (fits with arity +
+/// lazyArgs in one cache line).
+enum PrimOpFlags : uint8_t {
+    PRIMOP_NONE         = 0,
+    /// Side-effecting primop that fails in pure-eval mode (e.g.,
+    /// builtins.fetchurl, builtins.exec, builtins.derivationStrict in
+    /// some modes).  Dispatch throws a typed error before the body.
+    PRIMOP_IMPURE       = 1 << 0,
+    /// Subject to restricted-eval gating (allowed-uris, NIX_PATH
+    /// scrubbing).  Dispatch consults eval settings before the body.
+    PRIMOP_RESTRICTED   = 1 << 1,
+    /// Not exposed in `builtins.<name>` (mirrors TW's `bool internal`
+    /// in PrimOp).  Used for `__v3_force_attr`, `__v3_call_bridge_1`,
+    /// etc. -- bridge-internal helpers.
+    PRIMOP_INTERNAL     = 1 << 2,
+    /// Gated on an experimental feature flag.  Today's TW uses
+    /// `optional<ExperimentalFeature>`; v3 uses a small registry
+    /// mapping (PrimOp*, ExperimentalFeature) populated at
+    /// registerPrimOp time.  Dispatch checks the registry before the
+    /// body.
+    PRIMOP_EXPERIMENTAL = 1 << 3,
+    /// Suppress the auto-generated trace frame `while calling the
+    /// '<name>' builtin` (e.g., for builtins.addErrorContext where the
+    /// frame would be redundant).  Mirrors TW's `bool addTrace = true`
+    /// (default-on); set this flag to suppress.
+    PRIMOP_NO_TRACE     = 1 << 4,
+};
+
 struct PrimOp
 {
     std::string_view name;
@@ -252,6 +290,11 @@ struct PrimOp
     /// tree-walker's per-primop lazy-arg semantics.
     /// Bit 0 = arg 0, bit 1 = arg 1, etc.
     uint8_t          lazyArgs = 0;
+    /// FFI plan A13: dispatch-time policy flags (see PrimOpFlags above).
+    /// Default `PRIMOP_NONE` preserves today's behaviour for primops
+    /// that haven't been audited; the goal is to decorate every primop
+    /// with its actual policy and lift the per-body checks out.
+    uint8_t          flags = PRIMOP_NONE;
     std::string_view doc;        // optional
 };
 
