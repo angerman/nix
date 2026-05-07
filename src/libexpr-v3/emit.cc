@@ -609,6 +609,33 @@ struct Emitter
         for (uint32_t i = 0; i < n; ++i) {
             auto & en = e.entries[i];
             const auto & ff = m.functions[en.thunkBody].freeVars;
+            // #498: trace LetRec entry's freeVars for thunks named "res"
+            // with size==4 — the all-packages.nix invocation we're
+            // root-causing.
+            if (std::getenv("V3_DBG_RES_FREEVARS")
+                && m.functions[en.thunkBody].name == "res"
+                && ff.size() == 4) {
+                std::fprintf(stderr,
+                    "v3 emit LetRec res: fid=%u freeVars=[",
+                    (unsigned)en.thunkBody);
+                for (auto fv : ff) std::fprintf(stderr, "%u,", (unsigned)fv);
+                std::fprintf(stderr, "]\n");
+                // Print where each freeVar resolves in the OUTER ctx.
+                std::fprintf(stderr, "  outer ctx resolution:\n");
+                for (auto fv : ff) {
+                    if (auto it = ctx->slot.find(fv); it != ctx->slot.end())
+                        std::fprintf(stderr,
+                            "    var=%u -> outer slot %u\n",
+                            (unsigned)fv, (unsigned)it->second);
+                    else if (auto uit = ctx->upvalue.find(fv); uit != ctx->upvalue.end())
+                        std::fprintf(stderr,
+                            "    var=%u -> outer upvalue %u\n",
+                            (unsigned)fv, (unsigned)uit->second);
+                    else
+                        std::fprintf(stderr,
+                            "    var=%u -> UNBOUND\n", (unsigned)fv);
+                }
+            }
             for (auto fv : ff) emitVarRef(fv);
             unit.code.push_back(encode(OP_MAKE_THUNK, en.thunkBody));
             unit.code.push_back(static_cast<uint32_t>(ff.size()));
@@ -803,6 +830,15 @@ struct Emitter
         // Upvalue order = freeVars.
         for (uint16_t i = 0; i < f.freeVars.size(); ++i)
             fc.upvalue[f.freeVars[i]] = i;
+        // #498: trace freeVars for body emit of "res" with 4 freeVars.
+        if (std::getenv("V3_DBG_RES_FREEVARS")
+            && f.name == "res" && f.freeVars.size() == 4) {
+            std::fprintf(stderr,
+                "v3 emit body res: fid=%u freeVars=[",
+                (unsigned)fid);
+            for (auto fv : f.freeVars) std::fprintf(stderr, "%u,", (unsigned)fv);
+            std::fprintf(stderr, "]\n");
+        }
         // Pre-assign slots for every VarId reachable from the entry
         // block (including in sub-blocks: if-branches, with bodies, etc.)
         // so forward references resolve at emit time.

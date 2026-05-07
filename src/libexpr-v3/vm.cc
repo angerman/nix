@@ -1308,6 +1308,150 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             c->nUpvalues = nUp;
             c->capturedWiths = snapshotCurrentWiths(vm);
             for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
+            // #498: when the closure being made is named "super" with
+            // 4 upvalues (matches all-packages.nix's failing inner
+            // lambda), log the captured upvalues + the current frame.
+            if (std::getenv("V3_DBG_MAKE_SUPER")
+                && c->desc && c->desc->name == "super"
+                && nUp == 4) {
+                auto chase = [](Value v, int hops) -> Value {
+                    while (hops-- > 0) {
+                        if (v.tag() == Tag::Slot && v.payload.slot)
+                            v = *v.payload.slot;
+                        else if (v.tag() == Tag::Thunk && v.payload.thunk
+                                 && v.payload.thunk->state == ThunkState::Evaluated)
+                            v = v.payload.thunk->evaluated;
+                        else break;
+                    }
+                    return v;
+                };
+                std::fprintf(stderr,
+                    "v3 OP_MAKE_CLOSURE super: cu=%p desc.codeOffset=%u "
+                    "frames=%zu\n",
+                    (void *)cu, c->desc->codeOffset, vm.frames.size());
+                for (uint16_t i = 0; i < nUp; ++i) {
+                    Value uv = c->upvalues[i];
+                    Value chased = chase(uv, 4);
+                    std::fprintf(stderr,
+                        "  upvalue[%u]: tag=%d", i, (int)uv.tag());
+                    if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                        const auto & st = ir::globalSymbolTable();
+                        auto * b = chased.payload.bindings;
+                        std::fprintf(stderr,
+                            " -> attrs size=%u {", (unsigned)b->size);
+                        for (uint32_t k = 0; k < b->size && k < 6; ++k) {
+                            SymbolId nm = b->entries[k].name;
+                            std::fprintf(stderr, "%s%s", k ? "," : "",
+                                nm < st.size() ? st[nm].c_str() : "?");
+                        }
+                        if (b->size > 6) std::fprintf(stderr, ",...");
+                        std::fprintf(stderr, "}");
+                    } else {
+                        std::fprintf(stderr, " -> tag=%d", (int)chased.tag());
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                // Print all frames.
+                for (size_t fi = vm.frames.size(); fi > 0; --fi) {
+                    const auto & fr = vm.frames[fi - 1];
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk
+                        && (fr.thunk->state == ThunkState::Suspended
+                            || fr.thunk->state == ThunkState::Blackhole))
+                        d = fr.thunk->suspended.desc;
+                    else if (fr.closure) d = fr.closure->desc;
+                    std::fprintf(stderr,
+                        "  maker frame[%zu]: %s ip=%u flags=%u\n",
+                        fi - 1,
+                        d && !d->name.empty() ? d->name.c_str()
+                            : (d ? "<anon>" : "<root>"),
+                        fr.ip, (unsigned)fr.flags);
+                }
+                // Dump bytecode of the calling frame (res's thunk body) to
+                // identify what immediately preceded the call to pkgs.
+                if (vm.frames.size() >= 2) {
+                    const auto & callerFr = vm.frames[vm.frames.size() - 2];
+                    if (callerFr.cu) {
+                        uint32_t lo = (callerFr.ip > 8) ? callerFr.ip - 8 : 0;
+                        uint32_t hi = callerFr.ip + 4;
+                        std::fprintf(stderr,
+                            "  caller frame disasm cu=%p [%u..%u):\n",
+                            (void*)callerFr.cu, lo, hi);
+                        disassembleWindow(stderr, *callerFr.cu, lo, hi);
+                        // Find caller's containing lambda
+                        const auto & cuRef = *callerFr.cu;
+                        uint32_t target = callerFr.ip;
+                        uint32_t bestIdx = ~0u;
+                        uint32_t bestOff = 0;
+                        for (uint32_t li = 0; li < cuRef.lambdas.size(); ++li) {
+                            uint32_t lo2 = cuRef.lambdas[li].codeOffset;
+                            if (lo2 <= target && lo2 > bestOff) {
+                                bestOff = lo2;
+                                bestIdx = li;
+                            }
+                        }
+                        if (bestIdx != ~0u) {
+                            const auto & ld = cuRef.lambdas[bestIdx];
+                            std::fprintf(stderr,
+                                "  caller lambda[%u]: name=%s codeOffset=%u nUp=%u\n",
+                                bestIdx,
+                                ld.name.empty() ? "<anon>" : ld.name.c_str(),
+                                ld.codeOffset, ld.nUpvalues);
+                            // Print full body of caller's lambda (extended)
+                            std::fprintf(stderr,
+                                "  caller lambda body [%u..%u):\n",
+                                ld.codeOffset, callerFr.ip + 30);
+                            disassembleWindow(stderr, cuRef,
+                                ld.codeOffset, callerFr.ip + 30);
+                        }
+                    }
+                }
+                // Also print the maker frame's locals (especially local[0],
+                // which is the formal arg `pkgs` whose value should be
+                // the fix-point but appears to be `{prev}`).
+                if (!vm.frames.empty()) {
+                    const auto & fr = vm.frames.back();
+                    uint32_t nLoc = fr.thunk
+                        && (fr.thunk->state == ThunkState::Suspended
+                            || fr.thunk->state == ThunkState::Blackhole)
+                            ? fr.thunk->suspended.desc->nLocals
+                        : (fr.closure ? fr.closure->desc->nLocals : 0);
+                    std::fprintf(stderr,
+                        "  maker frame.local[0..min(2,%u)]:\n", nLoc);
+                    for (uint32_t li = 0; li < std::min(nLoc, 2u); ++li) {
+                        Value lv = vm.valueStack[fr.stackBaseOffset + li];
+                        Value chased = lv;
+                        for (int hops = 0; hops < 4; ++hops) {
+                            if (chased.tag() == Tag::Slot && chased.payload.slot)
+                                chased = *chased.payload.slot;
+                            else if (chased.tag() == Tag::Thunk
+                                     && chased.payload.thunk
+                                     && chased.payload.thunk->state == ThunkState::Evaluated)
+                                chased = chased.payload.thunk->evaluated;
+                            else break;
+                        }
+                        std::fprintf(stderr,
+                            "    local[%u]: tag=%d", li, (int)lv.tag());
+                        if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                            const auto & st = ir::globalSymbolTable();
+                            auto * b = chased.payload.bindings;
+                            std::fprintf(stderr,
+                                " -> attrs size=%u {", (unsigned)b->size);
+                            for (uint32_t k = 0; k < b->size && k < 6; ++k) {
+                                SymbolId nm = b->entries[k].name;
+                                std::fprintf(stderr, "%s%s", k ? "," : "",
+                                    nm < st.size() ? st[nm].c_str() : "?");
+                            }
+                            if (b->size > 6) std::fprintf(stderr, ",...");
+                            std::fprintf(stderr, "}");
+                        } else {
+                            std::fprintf(stderr, " -> tag=%d", (int)chased.tag());
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+                std::fflush(stderr);
+            }
             Value v; v.mkClosure(c); push(vm, v);
             break;
         }
@@ -1323,6 +1467,68 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             t->suspended.capturedWiths = snapshotCurrentWiths(vm);
             t->suspended.cu = cu;
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
+            // #498: trace MK_THUNK for thunks named "res" with nUp=4
+            // (the all-packages.nix `let res = ...` thunk) and dump
+            // captured upvalues to identify which freeVars[1] is.
+            // Filter by upvalue[3] presence of 'conflictingAttrs' attr
+            // to pin the all-packages.nix one (stage.nix's let has res
+            // and conflictingAttrs).
+            auto chaseFn = [](Value v, int hops) -> Value {
+                while (hops-- > 0) {
+                    if (v.tag() == Tag::Slot && v.payload.slot)
+                        v = *v.payload.slot;
+                    else if (v.tag() == Tag::Thunk && v.payload.thunk
+                             && v.payload.thunk->state == ThunkState::Evaluated)
+                        v = v.payload.thunk->evaluated;
+                    else break;
+                }
+                return v;
+            };
+            bool isStageRes = false;
+            if (t->suspended.desc && t->suspended.desc->name == "res"
+                && nUp == 4) {
+                Value uv3chased = chaseFn(t->tail[3], 4);
+                if (uv3chased.tag() == Tag::Attrs && uv3chased.payload.bindings
+                    && uv3chased.payload.bindings->size == 2) {
+                    auto * b = uv3chased.payload.bindings;
+                    static const SymbolId conflictSym =
+                        ir::globalInternSymbol("conflictingAttrs");
+                    for (uint32_t k = 0; k < b->size; ++k) {
+                        if (b->entries[k].name == conflictSym) {
+                            isStageRes = true; break;
+                        }
+                    }
+                }
+            }
+            if (std::getenv("V3_DBG_MAKE_RES") && isStageRes) {
+                std::fprintf(stderr,
+                    "v3 OP_MAKE_THUNK res (stage.nix): cu=%p thunk=%p "
+                    "frames=%zu\n",
+                    (void *)cu, (void *)t, vm.frames.size());
+                for (uint16_t i = 0; i < nUp; ++i) {
+                    Value uv = t->tail[i];
+                    Value chased = chaseFn(uv, 4);
+                    std::fprintf(stderr,
+                        "  upvalue[%u]: tag=%d", i, (int)uv.tag());
+                    if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                        const auto & st = ir::globalSymbolTable();
+                        auto * b = chased.payload.bindings;
+                        std::fprintf(stderr,
+                            " -> attrs size=%u {", (unsigned)b->size);
+                        for (uint32_t k = 0; k < b->size && k < 6; ++k) {
+                            SymbolId nm = b->entries[k].name;
+                            std::fprintf(stderr, "%s%s", k ? "," : "",
+                                nm < st.size() ? st[nm].c_str() : "?");
+                        }
+                        if (b->size > 6) std::fprintf(stderr, ",...");
+                        std::fprintf(stderr, "}");
+                    } else {
+                        std::fprintf(stderr, " -> tag=%d", (int)chased.tag());
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                std::fflush(stderr);
+            }
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Thunk);
             v.payload.thunk = t;
@@ -3388,12 +3594,42 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             (void *)cu, ip - 1, vm.frames.size());
                         // Dump bytecode window around the push.
                         if (cu) {
-                            uint32_t lo = (ip > 8) ? ip - 8 : 0;
-                            uint32_t hi = ip + 4;
+                            uint32_t lo = (ip > 16) ? ip - 16 : 0;
+                            uint32_t hi = ip + 8;
                             std::fprintf(stderr,
                                 "  pushing-frame disasm [%u..%u):\n",
                                 lo, hi);
                             disassembleWindow(stderr, *cu, lo, hi);
+                            // Find the LambdaDescriptor whose codeOffset
+                            // is closest BELOW the failing IP -- the
+                            // function whose body contains this push.
+                            uint32_t target = ip - 1;
+                            uint32_t bestIdx = ~0u;
+                            uint32_t bestOff = 0;
+                            for (uint32_t li = 0; li < cu->lambdas.size(); ++li) {
+                                uint32_t lo2 = cu->lambdas[li].codeOffset;
+                                if (lo2 <= target && lo2 > bestOff) {
+                                    bestOff = lo2;
+                                    bestIdx = li;
+                                }
+                            }
+                            if (bestIdx != ~0u) {
+                                const auto & ld = cu->lambdas[bestIdx];
+                                std::fprintf(stderr,
+                                    "  containing lambdas[%u]: "
+                                    "codeOffset=%u nUp=%u nLocals=%u name=%s\n",
+                                    bestIdx, ld.codeOffset,
+                                    ld.nUpvalues, ld.nLocals,
+                                    ld.name.empty() ? "<anon>"
+                                                    : ld.name.c_str());
+                                // Dump full body of that lambda
+                                uint32_t bodyLo = ld.codeOffset;
+                                uint32_t bodyHi = ip + 8;
+                                std::fprintf(stderr,
+                                    "  containing lambda body [%u..%u):\n",
+                                    bodyLo, bodyHi);
+                                disassembleWindow(stderr, *cu, bodyLo, bodyHi);
+                            }
                         }
                         for (size_t fi = vm.frames.size(); fi > 0; --fi) {
                             const auto & fr = vm.frames[fi - 1];
