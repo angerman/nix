@@ -1590,6 +1590,43 @@ struct Lowerer
                         }
                     }
                 }
+                // V3_DBG_INHERIT_FROM_THUNK=1 logs each inherit-from
+                // from-expr's lower-time decision (THUNK vs EAGER), the
+                // AST kind, and source position.  Used to bisect which
+                // shape regresses under broader thunkify rules.
+                // NIX_V3_INHERIT_FROM_THUNK_FILTER=substring restricts
+                // thunkify to from-exprs whose source position contains
+                // the given substring; useful for bisecting which file's
+                // from-exprs are the problem under always-thunkify.
+                static const char * s_filter =
+                    std::getenv("NIX_V3_INHERIT_FROM_THUNK_FILTER");
+                if (useThunk && s_filter && positions) {
+                    auto pos = (*positions)[fx->getPos()];
+                    std::ostringstream oss; oss << pos;
+                    if (oss.str().find(s_filter) == std::string::npos)
+                        useThunk = false;
+                }
+                if (std::getenv("V3_DBG_INHERIT_FROM_THUNK")) {
+                    auto * sel = dynamic_cast<nix::ExprSelect *>(fx);
+                    auto * v = sel ? dynamic_cast<nix::ExprVar *>(sel->e) : dynamic_cast<nix::ExprVar *>(fx);
+                    int kind = (int)fx->exprKind;
+                    const char * pos_str = "<no-pos>";
+                    std::string pos_buf;
+                    if (positions) {
+                        auto pos = (*positions)[fx->getPos()];
+                        std::ostringstream oss; oss << pos;
+                        pos_buf = oss.str();
+                        pos_str = pos_buf.c_str();
+                    }
+                    std::fprintf(stderr,
+                        "v3 inherit-from %s: kind=%d %s%s%s at %s\n",
+                        useThunk ? "THUNK" : "EAGER",
+                        kind,
+                        v ? "var=" : "",
+                        v ? std::string(symbols[v->name]).c_str() : "",
+                        v && v->fromWith ? "(fromWith)" : "",
+                        pos_str);
+                }
                 cache[i] = useThunk ? thunkifyForAttr(fx) : lowerExpr(fx);
             }
         }

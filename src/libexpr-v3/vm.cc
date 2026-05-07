@@ -803,7 +803,13 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
     // legitimately publish their result to the enclosing Black thunk
     // because the result is a sub-expression value, not the thunk's
     // return value.  Bail out.
-    if (!isRecInit) return;
+    //
+    // NIX_V3_PUBLISH_NON_REC_INIT=1 is a #496 reversion gate for
+    // bisecting whether always-thunkify regressions hinge on the
+    // pre-#496 partial-bindings pollution.
+    static const bool s_publishNonRec =
+        std::getenv("NIX_V3_PUBLISH_NON_REC_INIT") != nullptr;
+    if (!isRecInit && !s_publishNonRec) return;
     // 2026-05-06 #457/#458: was opt-in (NIX_V3_EARLY_PUBLISH=1)
     // because earlier nixpkgs runs corrupted under both outermost-only
     // and publish-to-all variants.  After the #456 chase-cycle fix
