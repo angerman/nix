@@ -495,10 +495,45 @@ inline Value withLookup(VMState & vm, SymbolId name)
     // attrsets), not a typo.  Throw a typed BlackholeError so callers
     // (e.g. on-demand-root's auto-eager bridge guard) can route
     // correctly, rather than a vague "name not found" runtime_error.
-    if (anyBlackholed) throw BlackholeError(
-        "v3 OP_WITH_LOOKUP: cycle while resolving '"
-        + std::string(name < ir::globalSymbolTable().size()
-            ? ir::globalSymbolTable()[name] : "<?>") + "'");
+    if (anyBlackholed) {
+        // STG-6 (#498) diagnostic: dump with-stack contents at cycle
+        // throw so we can identify which name + which black-thunk
+        // shape triggers the cross-VMState fix-point cycle.  Set
+        // V3_DBG_WITH_CYCLE=1 to trigger.
+        if (std::getenv("V3_DBG_WITH_CYCLE")) {
+            const auto & sym = ir::globalSymbolTable();
+            std::string nm = name < sym.size() ? sym[name] : "<?>";
+            std::fprintf(stderr,
+                "v3 OP_WITH_LOOKUP cycle: name='%s' base=%zu top=%zu vm=%p frames=%zu\n",
+                nm.c_str(), base, vm.withStack.size(), (void *)&vm,
+                vm.frames.size());
+            for (size_t i = vm.withStack.size(); i-- > base; ) {
+                Value w = vm.withStack[i];
+                std::fprintf(stderr, "  with[%zu] tag=%u",
+                    i, (unsigned)w.tag());
+                if (w.tag() == Tag::Slot && w.payload.slot) {
+                    Value d = *w.payload.slot;
+                    std::fprintf(stderr, " -> SLOT(%p)=tag=%u",
+                        (void *)w.payload.slot, (unsigned)d.tag());
+                    if (d.isThunk() && d.payload.thunk) {
+                        std::fprintf(stderr, "(thunk=%p state=%d)",
+                            (void *)d.payload.thunk,
+                            (int)d.payload.thunk->state);
+                    }
+                } else if (w.isThunk() && w.payload.thunk) {
+                    std::fprintf(stderr, " thunk=%p state=%d",
+                        (void *)w.payload.thunk,
+                        (int)w.payload.thunk->state);
+                }
+                std::fprintf(stderr, "\n");
+            }
+            std::fflush(stderr);
+        }
+        throw BlackholeError(
+            "v3 OP_WITH_LOOKUP: cycle while resolving '"
+            + std::string(name < ir::globalSymbolTable().size()
+                ? ir::globalSymbolTable()[name] : "<?>") + "'");
+    }
     // V3_DBG_WITH: print the missing name + the with-stack contents to
     // help diagnose pure-VM nixpkgs failures where eval-order divergence
     // causes a name to be looked up before its `with` scope is visible.
@@ -808,12 +843,13 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
                                              bool isRecInit)
 {
     // STG-1 (#498): when NIX_V3_STG=1 is set, publish is disabled.
-    // Each thunk's slot is written ONLY by its own OP_RETURN; no outer
-    // thunk write-through.  Pre-STG behaviour (legacy default) is
-    // preserved otherwise -- the publish mechanism is the root cause
-    // of #498 but STG-proper requires accompanying changes (proper
-    // slot-only captures + cycle detection in CFF_FORCE_RETRY) to
-    // handle every nixpkgs path that the publish currently masks.
+    // Each thunk's slot is written ONLY by its own OP_RETURN; no
+    // outer thunk write-through.  Legacy publish stays default-on
+    // because dropping it surfaces a small set of cutover-parity +
+    // chase-cycle test diffs that need separate investigation
+    // before a flag-flip is safe.  STG mode is the validated path
+    // for nixpkgs and uses the slot mechanism (Phase 4-5) to handle
+    // the rec-attrset self-reference cases publish was masking.
     static const bool s_stgMode =
         std::getenv("NIX_V3_STG") != nullptr;
     if (s_stgMode) return;
