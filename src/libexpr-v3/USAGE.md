@@ -99,6 +99,31 @@ Opt-in features (off by default unless noted):
     `__v3_force_attr`, `__v3_force_list_elem`).
   - `NIX_VM_STATS=1` / `V3_TIMING=1`:  hook stats / lower-compile-run
     breakdown at exit.
+  - `NIX_V3_INTRINSIC_DISPATCH=1`:  #495 native fix-point intrinsic
+    dispatch.  Pattern-matched lambda bodies (canonical `lib.fix`
+    shape) bypass the bytecode call path and run a v3-native impl
+    that knot-ties via Tag::Slot.  Recognition is always on
+    (zero-cost when this flag is unset); only the dispatch is opt-in.
+    Counter `intrinsic Fix: native dispatch calls=N` reported under
+    `NIX_VM_STATS=1`.  See also `NIX_V3_SELF_DOT_MAX_LEVEL`.
+  - `NIX_V3_SELF_DOT_MAX_LEVEL=N`:  #495 follow-on -- targeted
+    thunkify of `inherit (self.X) Y` from-exprs walks up to N scope
+    levels to find a Lambda scope (default 0 = only the immediately
+    enclosing `self:` lambda).  Set to 2 to catch the nixpkgs
+    `lib.fix` shape (where `self` sits behind an intermediate `let`
+    inside `makeExtensible'`).  Higher values currently regress
+    nixpkgs hello.name with an `OP_ATTRS_SELECT: attribute not found`
+    upvalue-capture bug -- safe levels are 0 (default) and 2 (only
+    when the user knows they're evaluating fix-point-heavy code,
+    typically alongside `NIX_V3_INTRINSIC_DISPATCH=1`).
+  - `NIX_V3_NO_INHERIT_FROM_THUNK=1`:  disable all inherit-from
+    thunkification (force eager from-expr lowering).  For perf
+    measurement / debugging only; introduces the `inherit (self.X) Y`
+    infinite recursion bug.
+  - `NIX_V3_INHERIT_FROM_THUNK_ALL=1`:  thunkify every inherit-from
+    from-expr unconditionally.  Equivalent to the
+    `NIX_V3_LAMBDA_SKIP=1` blanket gate; regresses nixpkgs hello.name
+    same as the broader self-dot heuristic.  Debugging only.
 
 How parity was reached:
 
