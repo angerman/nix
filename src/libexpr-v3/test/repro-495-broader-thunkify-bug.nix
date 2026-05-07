@@ -66,7 +66,39 @@
 #   at the original).  Per the reviewer's hypothesis: fixing one
 #   likely fixes both.
 #
-#   Tooling for further bisect (lower.cc):
+#   Root-cause narrowed (V3_DBG_LOWER_CALLS, 2026-05-07):
+#
+#   Five lowerNixExpr calls in this repro path:
+#     1. v3EvalEntry@1999  (kind=13 Let, no-pos)  -- top-level repro file
+#     2. primImport@5671   (kind=13 Let, no-pos)  -- lib/default.nix
+#                          -> fires #1-21 on its 21 inherit clauses
+#     3. primImport@5671   (kind=11 Lambda, lib/systems/default.nix:1:1)
+#     4. primImport@5671   (kind=11 Lambda, platforms.nix:8:1)
+#     5. v3EvalEntry@1999  (kind=13 Let, no-pos)  -- ???
+#                          -> fires #22-42 on the SAME 21 inherit clauses
+#
+#   Call 2 lowers lib/default.nix's full AST.  Call 5 fires v3EvalEntry
+#   for ANOTHER Expr* whose AST tree OVERLAPS with lib/default.nix.
+#   v3HookCache (keyed by Expr*) doesn't hit because the call-5 Expr*
+#   has a different address from call-2's parsed root.
+#
+#   The two modules share AST nodes (sub-Expr*s) for the inherit-from
+#   from-exprs but produce DISTINCT IR (own m.functions table, own
+#   FuncIds, own freeVars analysis).  populateSubExprCacheLocal stores
+#   the FIRST module's (cu, FuncIdx) per Expr*; the second module's
+#   thunks reference its OWN FuncIds.  When TW later forces a thunk
+#   that landed in the cache from module-1, the bytecode path runs
+#   module-1's CU; its freeVars list might mismatch what the second
+#   call site (compiled per module-2) expects.
+#
+#   Likely fix path: when primImport@5671 finishes lowering, ALSO
+#   populate v3HookCache so v3EvalEntry's later lookup with an
+#   overlapping AST hits and skips re-lowering.  Alternatively: unify
+#   importCache + v3HookCache.  Both are tracked under the
+#   "cache-tightening" TODO.
+#
+#   Tooling for further bisect (lower.cc + per-call-site labels):
+#     V3_DBG_LOWER_CALLS=1        -- log each lowerNixExpr call
 #     V3_DBG_SELF_DOT_FIRES=1     -- log each fire's ordinal + position
 #     NIX_V3_SELF_DOT_LIMIT=N     -- gate to first N fires module-wide
 #     NIX_V3_SELF_DOT_SKIP_NTH=N  -- skip the Nth fire (1-indexed)

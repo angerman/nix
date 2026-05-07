@@ -2268,6 +2268,15 @@ ir::Module lowerNixExpr(nix::Expr * e, const nix::SymbolTable & symbols)
 
 ir::Module lowerNixExpr(nix::Expr * e, const nix::SymbolTable & symbols, const nix::PosTable & positions)
 {
+    static const bool s_dbg = std::getenv("V3_DBG_LOWER_CALLS") != nullptr;
+    if (s_dbg) {
+        auto pos = positions[e->getPos()];
+        std::ostringstream oss;
+        oss << pos;
+        std::fprintf(stderr,
+            "v3 lowerNixExpr: e=%p kind=%d at %s\n",
+            (void*)e, (int)e->exprKind, oss.str().c_str());
+    }
     Lowerer L(symbols, positions);
     return L.run(e);
 }
