@@ -766,8 +766,44 @@ inline std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry()
     return tbl;
 }
 
-inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v)
+/// Publish a freshly-built attrset to the innermost Black thunk frame's
+/// partial-bindings side-table and (optionally) eagerly transition outer
+/// Black thunks to Evaluated.  `isRecInit` MUST be true only when `v` IS
+/// the rec-attrset under construction by that thunk's body — i.e., the
+/// caller is OP_ATTRS_REC_INIT.  Non-rec attrset construction
+/// (OP_ATTRS_INIT, OP_ATTRS_INIT_DYN, OP_ATTRS_UPDATE) MUST pass
+/// isRecInit=false and the function becomes a no-op.
+///
+/// #495 follow-on (2026-05-07 root-cause): publishing on every attrset
+/// construction (including non-rec sub-expressions like the LEFT side
+/// of `LEFT // RIGHT` inside an inherit-from from-expr) pollutes the
+/// outer thunk's partialBindings entry.  When a recursive force on the
+/// outer thunk consults the registry, it returns the SUB-EXPRESSION's
+/// bindings instead of the outer thunk's actual (in-progress) value,
+/// causing closures called from sub-expressions to receive the wrong
+/// argument.  Reproduced by repro-495-broader-thunkify-bug.nix (lib.
+/// systems.elaborate's `inherit ({...} // platforms.select final) ...`):
+/// the LEFT-side `{linux-kernel, gcc}` was being registered as final's
+/// partial bindings, so `select(final)` saw `{linux-kernel, gcc}`
+/// instead of the elaborated platform record and threw on
+/// `final.isx86`.
+///
+/// Restricting publishing to OP_ATTRS_REC_INIT preserves the legitimate
+/// use case (rec attrset self-reference like `rec { x = 1; y = self.x;
+/// }`) while eliminating the cross-expression contamination.  The
+/// kept behaviour: when a rec attrset's body is being constructed and
+/// inner code re-enters via `self.X`, partialBindings recovery returns
+/// the rec's in-progress Bindings (which is the SAME pointer that
+/// OP_ATTRS_REC_SET writes into, so subsequent SET writes are visible
+/// to the recovery path).
+inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
+                                             bool isRecInit)
 {
+    // Non-rec callers (OP_ATTRS_INIT/INIT_DYN/UPDATE) cannot
+    // legitimately publish their result to the enclosing Black thunk
+    // because the result is a sub-expression value, not the thunk's
+    // return value.  Bail out.
+    if (!isRecInit) return;
     // 2026-05-06 #457/#458: was opt-in (NIX_V3_EARLY_PUBLISH=1)
     // because earlier nixpkgs runs corrupted under both outermost-only
     // and publish-to-all variants.  After the #456 chase-cycle fix
@@ -1598,7 +1634,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
             // #495 follow-on bisect: log OP_CALL post-force for
             // platform-named closures.  Used to trace the wrong-arg
-            // capture in the broader-thunkify upvalue bug.
+            // capture in the broader-thunkify upvalue bug.  Also derefs
+            // Tag::Slot args to show the slot's storage pointer and
+            // the Value found there (chasing one indirection).  The
+            // bug: arg=Tag::Slot(p), *p = Tag::Attrs{gcc, linux-kernel}
+            // but should be the platform record `final` containing
+            // isx86 etc.
             if (std::getenv("V3_DBG_OP_CALL_POST")
                 && desc && !desc->name.empty()
                 && desc->name == "platform")
@@ -1612,6 +1653,73 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     "frames=%zu\n",
                     (void*)callee, (void*)desc, arg_tag, arg_size,
                     vm.frames.size());
+                // Dereference Tag::Slot indirections (chase up to 4
+                // hops to handle Slot→Slot rebinding) and print the
+                // ultimate Value's tag + a few attr names.
+                if (arg.tag() == Tag::Slot && arg.payload.slot) {
+                    Value * p = arg.payload.slot;
+                    int hop = 0;
+                    while (p && hop < 4) {
+                        std::fprintf(stderr,
+                            "  slot[%d] @ %p tag=%d", hop, (void*)p,
+                            (int)p->tag());
+                        if (p->tag() == Tag::Attrs && p->payload.bindings) {
+                            const auto & st = ir::globalSymbolTable();
+                            auto * b = p->payload.bindings;
+                            std::fprintf(stderr, " bindings=%p size=%u present=[",
+                                (void*)b, (unsigned)b->size);
+                            for (uint32_t i = 0; i < b->size && i < 10; ++i) {
+                                SymbolId nm = b->entries[i].name;
+                                std::fprintf(stderr, "%s%s",
+                                    i == 0 ? "" : ",",
+                                    nm < st.size() ? st[nm].c_str() : "?");
+                            }
+                            std::fprintf(stderr, "]\n");
+                            break;
+                        }
+                        if (p->tag() == Tag::Slot) {
+                            std::fprintf(stderr, " → @ %p\n",
+                                (void*)p->payload.slot);
+                            p = p->payload.slot;
+                            ++hop;
+                            continue;
+                        }
+                        if (p->tag() == Tag::Thunk && p->payload.thunk) {
+                            auto * th = p->payload.thunk;
+                            std::fprintf(stderr,
+                                " thunk=%p state=%d",
+                                (void*)th, (int)th->state);
+                            // Chase Evaluated thunks one hop to see the
+                            // cached value (the actual Bindings the
+                            // closure body will see).
+                            if (th->state == ThunkState::Evaluated) {
+                                Value & ev = th->evaluated;
+                                std::fprintf(stderr,
+                                    " evaluated.tag=%d", (int)ev.tag());
+                                if (ev.tag() == Tag::Attrs && ev.payload.bindings) {
+                                    auto * b = ev.payload.bindings;
+                                    const auto & st = ir::globalSymbolTable();
+                                    std::fprintf(stderr,
+                                        " bindings=%p size=%u present=[",
+                                        (void*)b, (unsigned)b->size);
+                                    for (uint32_t i = 0; i < b->size && i < 10; ++i) {
+                                        SymbolId nm = b->entries[i].name;
+                                        std::fprintf(stderr, "%s%s",
+                                            i == 0 ? "" : ",",
+                                            nm < st.size() ? st[nm].c_str() : "?");
+                                    }
+                                    std::fprintf(stderr, "]");
+                                }
+                            }
+                            std::fprintf(stderr, "\n");
+                        } else if (p->tag() == Tag::App) {
+                            std::fprintf(stderr, " app\n");
+                        } else {
+                            std::fprintf(stderr, "\n");
+                        }
+                        break;
+                    }
+                }
             }
 
             // #495: native fix-point intrinsics fast path.  Recognised
@@ -2646,7 +2754,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
-            publishToNearestBlackThunkFrame(vm, v);
+            publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/false);
             push(vm, v);
             break;
         }
@@ -2713,7 +2821,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
-            publishToNearestBlackThunkFrame(vm, v);
+            publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/false);
             push(vm, v);
             break;
         }
@@ -2739,7 +2847,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
-            publishToNearestBlackThunkFrame(vm, v);
+            // OP_ATTRS_REC_INIT is the ONLY callsite with isRecInit=true.
+            // The rec attrset's Bindings* registered here is the same
+            // pointer that subsequent OP_ATTRS_REC_SET writes into, so
+            // self-reference recovery via partialBindings observes the
+            // entries as they are filled in.
+            publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/true);
             push(vm, v);
             break;
         }
@@ -3225,7 +3338,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = out;
-            publishToNearestBlackThunkFrame(vm, v);
+            publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/false);
             push(vm, v);
             break;
         }

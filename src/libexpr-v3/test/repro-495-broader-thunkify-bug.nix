@@ -1,11 +1,31 @@
-# #495 follow-on: smaller reproducer for the OP_ATTRS_SELECT upvalue
+# #495 follow-on: smaller reproducer for the broader-thunkify
 # regression that fires when NIX_V3_SELF_DOT_MAX_LEVEL >= 1.
+#
+# History (2026-05-07):
+#   Pre-#496: "v3 OP_ATTRS_SELECT: attribute not found" -- a CONSEQUENCE
+#       of stale partial bindings being silently substituted for an
+#       in-progress Black thunk.  The substitution returned a wrong-
+#       shape attrset that survived all the way into select's body.
+#   Post-#496 (publishToNearestBlackThunkFrame restricted to
+#       OP_ATTRS_REC_INIT): the false partial-bindings pollution is
+#       gone; what remains is the underlying recursive force chain
+#       which now surfaces as a clean BlackholeError:
+#
+#           error: v3 forceValue: infinite recursion (blackhole)
+#
+#       i.e. the broader-thunkify shape exposes a real cycle that v3's
+#       eager from-expr lowering walks into.  Tree-walker handles the
+#       same shape via lazy attr-access machinery v3 doesn't yet have
+#       on every path.  BlackholeError is the truthful diagnosis;
+#       fixing it requires a deeper change (preserving from-expr
+#       laziness across the inherit-from + apply-overrides chain) than
+#       the partialBindings fix.
 #
 # Triggers:
 #
 #   $ NIX_USE_V3=1 NIX_V3_SELF_DOT_MAX_LEVEL=1 \
 #       nix eval --impure --raw -f this-file.nix
-#   error: v3 OP_ATTRS_SELECT: attribute not found
+#   error: v3 forceValue: infinite recursion (blackhole)
 #
 # With NIX_V3_SELF_DOT_MAX_LEVEL unset (default 0), this returns "x86_64".
 # Tree-walker also returns "x86_64".
