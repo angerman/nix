@@ -3275,6 +3275,27 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
             "v3 forceAttr: attr '%1%' not found in bridged attrset",
             std::string(name)).debugThrow();
 
+    // #494 step 3d diagnostic: print the v3 entry's tag so we can see
+    // whether v3's body actually lazified the entry as a v3 Tag::Thunk
+    // Suspended (with captured withStack) or as a Tag::Thunk Bridge /
+    // Tag::App / Tag::Closure / etc. that loses the with-stack capture
+    // because the underlying body is a TW value (whose env was captured
+    // by TW, possibly without the v3-side `with` layers).
+    //
+    // 2026-05-07 finding (NIX_V3_LAMBDA_SKIP=1 NIX_V3_TW_LAMBDA_BRIDGE=1
+    // on `(import <nixpkgs> {}).hello.name`): entries are Tag::Thunk(10)
+    // Bridge and Tag::App(13) -- NEVER Tag::Thunk Suspended -- which
+    // confirms v3 didn't build the entry as its own thunk; the entry
+    // values are TW-side thunks bridged into v3.  When forced, TW's
+    // own env-walk does the lookup, finding no `with pkgs;` because the
+    // TW thunk was captured BEFORE / OUTSIDE that scope.
+    if (std::getenv("V3_DBG_FORCE_ATTR_ENTRY") != nullptr) {
+        std::fprintf(stderr,
+            "v3 forceAttr h=%lld name='%s' entry.tag=%d\n",
+            (long long)h, std::string(name).c_str(),
+            (int)found->tag());
+    }
+
     // Bridge this single value.  Set up an EvalState + thread_local
     // shim VMState (mirrors the closure-bridge primop pattern).
     ScopedNixEvalState _v3evalGuard(&ns);
