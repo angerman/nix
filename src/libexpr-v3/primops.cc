@@ -469,7 +469,50 @@ void primAttrValues(EvalState &, Value * args, Value & out)
 
 void primIsAttrs   (EvalState &, Value * args, Value & out) { out = args[0].isAttrs()    ? Value::vTrue : Value::vFalse; }
 void primIsList    (EvalState &, Value * args, Value & out) { out = args[0].isList()     ? Value::vTrue : Value::vFalse; }
-void primIsFunction(EvalState &, Value * args, Value & out) { out = (args[0].isClosure() || args[0].isPrimOp() || args[0].tag() == Tag::PrimOpApp) ? Value::vTrue : Value::vFalse; }
+/// Peek through a v3 Bridge thunk wrapping a TW Value: returns the
+/// underlying TW ValueType, or std::nullopt if `v` isn't a Bridge or
+/// the source is unreadable.  Used by primIs* type predicates so a
+/// bridged TW Function/Attrset/List/etc. answers correctly without
+/// forcing (which would re-wrap as another Bridge per the #456
+/// chase break).  No state changes; pure peek.
+inline std::optional<nix::ValueType> peekBridgeTwType(const Value & v)
+{
+    if (v.tag() != Tag::Thunk) return std::nullopt;
+    if (!v.payload.thunk) return std::nullopt;
+    if (v.payload.thunk->state != ThunkState::Bridge) return std::nullopt;
+    if (!v.payload.thunk->bridgeSrc) return std::nullopt;
+    try {
+        auto * src = static_cast<nix::Value *>(v.payload.thunk->bridgeSrc);
+        return src->type();
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+void primIsFunction(EvalState &, Value * args, Value & out)
+{
+    // #493 step 3: peek through Bridge thunks for bridged TW lambdas
+    // (e.g., the v3FormalsLambdaBridges sentinel-tLambda values that
+    // round-trip back to v3 as Bridge thunks).  Without this, nixpkgs
+    // loadModule's `if isFunction m then ... else import m` mis-routes
+    // a bridged-lambda module to import, surfacing as
+    // "v3 primop import: expected string or path".
+    static const bool s_dbg =
+        std::getenv("V3_DBG_IS_FUNCTION") != nullptr;
+    if (auto tt = peekBridgeTwType(args[0])) {
+        if (s_dbg) std::fprintf(stderr,
+            "v3 primIsFunction: Bridge tag=%d twType=%d → %s\n",
+            (int)args[0].tag(), (int)*tt,
+            (*tt == nix::nFunction) ? "true" : "false");
+        out = (*tt == nix::nFunction) ? Value::vTrue : Value::vFalse;
+        return;
+    }
+    bool isfn = (args[0].isClosure() || args[0].isPrimOp() || args[0].tag() == Tag::PrimOpApp);
+    if (s_dbg) std::fprintf(stderr,
+        "v3 primIsFunction: tag=%d → %s\n",
+        (int)args[0].tag(), isfn ? "true" : "false");
+    out = isfn ? Value::vTrue : Value::vFalse;
+}
 void primIsString  (EvalState &, Value * args, Value & out) { out = args[0].isString()   ? Value::vTrue : Value::vFalse; }
 void primIsInt     (EvalState &, Value * args, Value & out) { out = args[0].isInt()      ? Value::vTrue : Value::vFalse; }
 void primIsBool    (EvalState &, Value * args, Value & out) { out = args[0].isBool()     ? Value::vTrue : Value::vFalse; }
@@ -5365,6 +5408,25 @@ void primImport(EvalState & state, Value * args, Value & out)
                 std::fprintf(stderr,
                     " (Bridge.bridgeSrc=%p TW.type=%d)",
                     (const void *)src, twType);
+                // If TW value is a Lambda, print its source file:line.
+                if (twType == (int)nix::nFunction) {
+                    try {
+                        if (src->isLambda() && src->lambda().fun) {
+                            auto pos = state.nixEvalState->positions[
+                                src->lambda().fun->getPos()];
+                            std::string ploc = std::visit(nix::overloaded{
+                                [&](const nix::SourcePath & sp) -> std::string {
+                                    return sp.path.abs() + ":" + std::to_string(pos.line);
+                                },
+                                [](const auto &) -> std::string { return "<no-source>"; },
+                            }, pos.origin);
+                            std::fprintf(stderr,
+                                " lambda fun=%p pos=%s",
+                                (const void *)src->lambda().fun,
+                                ploc.c_str());
+                        }
+                    } catch (...) {}
+                }
             }
             std::fprintf(stderr, "\n");
         }
@@ -6165,9 +6227,62 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
 /// builtins.functionArgs lam → { name = false; ... } where the bool
 /// indicates whether the formal has a default value.  For simple
 /// lambdas (no formals) returns an empty attrset.
-void primFunctionArgs(EvalState &, Value * args, Value & out)
+void primFunctionArgs(EvalState & state, Value * args, Value & out)
 {
     Value v = args[0];
+    // #493 step 3: peek through a Bridge thunk wrapping a TW Lambda
+    // (e.g., the v3FormalsLambdaBridges sentinel-tLambda values that
+    // round-trip back to v3 as Bridge thunks).  Read formals directly
+    // from the TW ExprLambda; matches what TW's primFunctionArgs would
+    // produce, just bridged.  Without this peek, bridged-lambda
+    // arguments hit the typeError path.
+    if (v.tag() == Tag::Thunk && v.payload.thunk
+        && v.payload.thunk->state == ThunkState::Bridge
+        && v.payload.thunk->bridgeSrc)
+    {
+        try {
+            auto * src = static_cast<nix::Value *>(v.payload.thunk->bridgeSrc);
+            if (src->isLambda() && src->lambda().fun) {
+                auto * twLambda = src->lambda().fun;
+                auto twFormals = twLambda->getFormals();
+                if (!twFormals) {
+                    // Plain `x: ...` -- no formals attrset; return empty.
+                    Bindings * b = Alloc::allocBindings(0);
+                    allocStats().attrsetsAllocated++;
+                    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                    out.payload.bindings = b;
+                    return;
+                }
+                std::vector<std::tuple<SymbolId, Value, uint32_t>> entries;
+                entries.reserve(twFormals->formals.size());
+                for (auto & f : twFormals->formals) {
+                    Value bv = (f.def != nullptr) ? Value::vTrue : Value::vFalse;
+                    SymbolId sid = ir::globalInternSymbol(
+                        std::string_view(state.nixEvalState->symbols[f.name]));
+                    entries.emplace_back(sid, bv, 0u);
+                }
+                std::sort(entries.begin(), entries.end(),
+                    [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
+                Bindings * bb = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+                allocStats().attrsetsAllocated++;
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    bb->entries[i].name  = std::get<0>(entries[i]);
+                    bb->entries[i].value = std::get<1>(entries[i]);
+                }
+                out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                out.payload.bindings = bb;
+                return;
+            }
+            // Bridge wraps a non-lambda function (e.g., primOpApp).
+            if (src->type() == nix::nFunction) {
+                Bindings * b = Alloc::allocBindings(0);
+                allocStats().attrsetsAllocated++;
+                out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                out.payload.bindings = b;
+                return;
+            }
+        } catch (...) {}
+    }
     if (v.tag() == Tag::Closure && v.payload.closure && v.payload.closure->desc) {
         const LambdaDescriptor * desc = v.payload.closure->desc;
         if (!desc->hasFormals) {
@@ -6987,6 +7102,9 @@ bool tryDispatchFormalsLambdaBridge(nix::EvalState & ns,
     try {
         r = callClosure(*st.vm, v3fn, v3Arg);
         r = forceValue(*st.vm, r);
+        if (s_dbg) std::fprintf(stderr,
+            "v3 tryDispatchFormalsLambdaBridge: callClosure returned tag=%d\n",
+            (int)r.tag());
     } catch (const std::exception & ex) {
         // BlackholeError → re-run fallbackExpr through TW (same
         // recovery as the primOpApp bridge) and call its result with

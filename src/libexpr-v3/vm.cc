@@ -3751,6 +3751,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // listed), so each predicate gets its own self-contained
         // case body using a small lambda to share the force-then-test
         // pattern.
+        //
+        // #493: forceValue may break early on Tag::Thunk in Bridge
+        // state when the underlying TW Value is a Function (the #456
+        // chase-break: forceBridgeThunk would re-wrap as another
+        // Bridge ad infinitum).  Result: v stays Tag::Thunk even
+        // though the WHNF type is whatever TW says.  The naive
+        // predicate `v.isClosure() || ...` answers false for these
+        // bridged-TW-function values, mis-routing nixpkgs loadModule's
+        // `if isFunction m then ... else import m` to import.  Peek
+        // through Bridge thunks for the TW ValueType.  Cheap; only
+        // fires on the Bridge case.
+        #define V3_BRIDGE_PEEK_OR(v, twTypePred, fallback) \
+            (((v).tag() == Tag::Thunk && (v).payload.thunk \
+                && (v).payload.thunk->state == ThunkState::Bridge \
+                && (v).payload.thunk->bridgeSrc) \
+                ? ([&]() -> bool { \
+                    try { \
+                        auto * src = static_cast<nix::Value *>( \
+                            (v).payload.thunk->bridgeSrc); \
+                        nix::ValueType tt = src->type(); \
+                        return (twTypePred); \
+                    } catch (...) { return (fallback); } \
+                  }()) \
+                : (fallback))
         #define V3_IS_OP(op_name, predExpr) \
             case op_name: { \
                 Value v = pop(vm); \
@@ -3762,17 +3786,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 push(vm, (predExpr) ? Value::vTrue : Value::vFalse); \
                 break; \
             }
-        V3_IS_OP(OP_IS_NULL,   v.isNull())
-        V3_IS_OP(OP_IS_BOOL,   v.isBool())
-        V3_IS_OP(OP_IS_INT,    v.isInt())
-        V3_IS_OP(OP_IS_FLOAT,  v.isFloat())
-        V3_IS_OP(OP_IS_STRING, v.isString())
-        V3_IS_OP(OP_IS_PATH,   v.isPath())
-        V3_IS_OP(OP_IS_LIST,   v.isList())
-        V3_IS_OP(OP_IS_ATTRS,  v.isAttrs())
+        V3_IS_OP(OP_IS_NULL,
+            V3_BRIDGE_PEEK_OR(v, tt == nix::nNull,    v.isNull()))
+        V3_IS_OP(OP_IS_BOOL,
+            V3_BRIDGE_PEEK_OR(v, tt == nix::nBool,    v.isBool()))
+        V3_IS_OP(OP_IS_INT,
+            V3_BRIDGE_PEEK_OR(v, tt == nix::nInt,     v.isInt()))
+        V3_IS_OP(OP_IS_FLOAT,
+            V3_BRIDGE_PEEK_OR(v, tt == nix::nFloat,   v.isFloat()))
+        V3_IS_OP(OP_IS_STRING,
+            V3_BRIDGE_PEEK_OR(v, tt == nix::nString,  v.isString()))
+        V3_IS_OP(OP_IS_PATH,
+            V3_BRIDGE_PEEK_OR(v, tt == nix::nPath,    v.isPath()))
+        V3_IS_OP(OP_IS_LIST,
+            V3_BRIDGE_PEEK_OR(v, tt == nix::nList,    v.isList()))
+        V3_IS_OP(OP_IS_ATTRS,
+            V3_BRIDGE_PEEK_OR(v, tt == nix::nAttrs,   v.isAttrs()))
         V3_IS_OP(OP_IS_FUNCTION,
-            v.isClosure() || v.isPrimOp() || v.tag() == Tag::PrimOpApp)
+            V3_BRIDGE_PEEK_OR(v, tt == nix::nFunction,
+                v.isClosure() || v.isPrimOp() || v.tag() == Tag::PrimOpApp))
         #undef V3_IS_OP
+        #undef V3_BRIDGE_PEEK_OR
 
         case OP_HEAD: {
             // Mirror primHead in primops.cc:272-278.
