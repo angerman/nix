@@ -1308,6 +1308,54 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             c->nUpvalues = nUp;
             c->capturedWiths = snapshotCurrentWiths(vm);
             for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
+            // #498 v2: log ALL super lambdas being made (V3_DBG_MAKE_SUPER_ALL).
+            if (std::getenv("V3_DBG_MAKE_SUPER_ALL")
+                && c->desc && c->desc->name == "super") {
+                std::fprintf(stderr,
+                    "v3 OP_MAKE_CLOSURE super (codeOff=%u nUp=%u): cu=%p frames=%zu\n",
+                    c->desc->codeOffset, (unsigned)nUp,
+                    (void *)cu, vm.frames.size());
+                if (!vm.frames.empty()) {
+                    const auto & fr = vm.frames.back();
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk
+                        && (fr.thunk->state == ThunkState::Suspended
+                            || fr.thunk->state == ThunkState::Blackhole))
+                        d = fr.thunk->suspended.desc;
+                    else if (fr.closure) d = fr.closure->desc;
+                    std::fprintf(stderr,
+                        "  maker frame: %s ip=%u flags=%u\n",
+                        d && !d->name.empty() ? d->name.c_str()
+                            : (d ? "<anon>" : "<root>"),
+                        fr.ip, (unsigned)fr.flags);
+                    // Dump the local[0] of the maker frame (= caller's arg
+                    // for OP_CALL targets).
+                    if (fr.stackBaseOffset < vm.valueStack.size()) {
+                        Value lv = vm.valueStack[fr.stackBaseOffset];
+                        Value chase = lv;
+                        for (int hops = 0; hops < 4; ++hops) {
+                            if (chase.tag() == Tag::Slot && chase.payload.slot)
+                                chase = *chase.payload.slot;
+                            else if (chase.tag() == Tag::Thunk
+                                     && chase.payload.thunk
+                                     && chase.payload.thunk->state == ThunkState::Evaluated)
+                                chase = chase.payload.thunk->evaluated;
+                            else break;
+                        }
+                        std::fprintf(stderr,
+                            "  maker.local[0] tag=%d", (int)lv.tag());
+                        if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                            std::fprintf(stderr, " -> attrs size=%u",
+                                (unsigned)chase.payload.bindings->size);
+                        } else {
+                            std::fprintf(stderr, " -> chased.tag=%d",
+                                (int)chase.tag());
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+                std::fflush(stderr);
+            }
             // #498: when the closure being made is named "super" with
             // 4 upvalues (matches all-packages.nix's failing inner
             // lambda), log the captured upvalues + the current frame.
@@ -1499,6 +1547,75 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                     }
                 }
+            }
+            // #498 diagnostic: trace prev-thunk MAKE_THUNK (nUp==2,
+            // name=="prev") and dump captured upvalues to verify
+            // tail[1] (= captured "final") IS extends.final's local[0]
+            // at MAKE_THUNK time.
+            if (std::getenv("V3_DBG_MAKE_PREV")
+                && t->suspended.desc && t->suspended.desc->name == "prev"
+                && nUp == 2) {
+                // Dump the maker frame's local[0] for comparison with
+                // tail[1] (which should be a snapshot of local[0]).
+                {
+                    const auto & fr = vm.frames.back();
+                    Value uv0 = vm.valueStack[fr.stackBaseOffset + 0];
+                    Value chased = chaseFn(uv0, 4);
+                    const LambdaDescriptor * desc = nullptr;
+                    if (fr.closure) desc = fr.closure->desc;
+                    else if (fr.thunk) desc = fr.thunk->suspended.desc;
+                    std::fprintf(stderr,
+                        "v3 OP_MAKE_THUNK prev MAKER %s codeOff=%u.local[0].tag=%d",
+                        desc && !desc->name.empty() ? desc->name.c_str() : "?",
+                        (unsigned)(desc ? desc->codeOffset : 0),
+                        (int)uv0.tag());
+                    if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                        const auto & st = ir::globalSymbolTable();
+                        auto * b = chased.payload.bindings;
+                        std::fprintf(stderr, " -> attrs size=%u {",
+                            (unsigned)b->size);
+                        for (uint32_t k = 0; k < b->size && k < 4; ++k) {
+                            SymbolId nm = b->entries[k].name;
+                            std::fprintf(stderr, "%s%s", k ? "," : "",
+                                nm < st.size() ? st[nm].c_str() : "?");
+                        }
+                        std::fprintf(stderr, "}");
+                    } else {
+                        std::fprintf(stderr, " -> tag=%d", (int)chased.tag());
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                std::fprintf(stderr,
+                    "v3 OP_MAKE_THUNK prev: thunk=%p frames=%zu\n",
+                    (void *)t, vm.frames.size());
+                for (uint16_t i = 0; i < nUp; ++i) {
+                    Value uv = t->tail[i];
+                    Value chased = chaseFn(uv, 4);
+                    std::fprintf(stderr,
+                        "  upvalue[%u]: tag=%d", i, (int)uv.tag());
+                    if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                        const auto & st = ir::globalSymbolTable();
+                        auto * b = chased.payload.bindings;
+                        std::fprintf(stderr,
+                            " -> attrs size=%u {", (unsigned)b->size);
+                        for (uint32_t k = 0; k < b->size && k < 6; ++k) {
+                            SymbolId nm = b->entries[k].name;
+                            std::fprintf(stderr, "%s%s", k ? "," : "",
+                                nm < st.size() ? st[nm].c_str() : "?");
+                        }
+                        if (b->size > 6) std::fprintf(stderr, ",...");
+                        std::fprintf(stderr, "}");
+                    } else if (chased.tag() == Tag::Closure
+                               && chased.payload.closure
+                               && chased.payload.closure->desc) {
+                        std::fprintf(stderr, " -> Closure name=%s",
+                            chased.payload.closure->desc->name.c_str());
+                    } else {
+                        std::fprintf(stderr, " -> tag=%d", (int)chased.tag());
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                std::fflush(stderr);
             }
             if (std::getenv("V3_DBG_MAKE_RES") && isStageRes) {
                 std::fprintf(stderr,
@@ -2161,6 +2278,47 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             vm.valueStack.resize(newBase + desc->nLocals);
             vm.valueStack[newBase + 0] = arg;
 
+            // #498 frame-entry diagnostic: log every OP_CALL closure entry
+            // with name + local[0] shape.  V3_DBG_FRAME_ENTRY=<name> filters
+            // by closure name (e.g. "final" or "self").
+            {
+                static const char * s_filter =
+                    std::getenv("V3_DBG_FRAME_ENTRY");
+                if (s_filter && desc && desc->name == s_filter) {
+                    Value chase = arg;
+                    int hops = 0;
+                    while (hops < 4) {
+                        if (chase.tag() == Tag::Slot && chase.payload.slot)
+                            chase = *chase.payload.slot;
+                        else if (chase.tag() == Tag::Thunk && chase.payload.thunk
+                                 && chase.payload.thunk->state == ThunkState::Evaluated)
+                            chase = chase.payload.thunk->evaluated;
+                        else break;
+                        ++hops;
+                    }
+                    std::fprintf(stderr,
+                        "v3 FRAME_ENTRY OP_CALL %s codeOff=%u: local[0].tag=%d",
+                        desc->name.c_str(), (unsigned)desc->codeOffset,
+                        (int)arg.tag());
+                    if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                        auto * b = chase.payload.bindings;
+                        std::fprintf(stderr, " -> attrs size=%u {",
+                            b->size);
+                        const auto & tbl = ir::globalSymbolTable();
+                        for (uint32_t i = 0; i < b->size && i < 3; ++i) {
+                            uint32_t nm = b->entries[i].name;
+                            std::fprintf(stderr, "%s%s", i ? "," : "",
+                                nm < tbl.size() ? tbl[nm].c_str() : "?");
+                        }
+                        if (b->size > 3) std::fprintf(stderr, ",...");
+                        std::fprintf(stderr, "}");
+                    } else {
+                        std::fprintf(stderr, " -> tag=%d", (int)chase.tag());
+                    }
+                    std::fprintf(stderr, " (frames=%zu)\n", vm.frames.size());
+                }
+            }
+
             uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
             // Push the new frame in a single move-construct: lets the
             // compiler initialize the trailing 40 bytes inline at the
@@ -2250,6 +2408,45 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // we just retarget cu/closure/ip and overwrite locals.
             vm.valueStack.resize(stackBase + tcDesc->nLocals);
             vm.valueStack[stackBase + 0] = arg;
+
+            // #498 frame-entry diagnostic for OP_TAIL_CALL.
+            {
+                static const char * s_filter =
+                    std::getenv("V3_DBG_FRAME_ENTRY");
+                if (s_filter && tcDesc && tcDesc->name == s_filter) {
+                    Value chase = arg;
+                    int hops = 0;
+                    while (hops < 4) {
+                        if (chase.tag() == Tag::Slot && chase.payload.slot)
+                            chase = *chase.payload.slot;
+                        else if (chase.tag() == Tag::Thunk && chase.payload.thunk
+                                 && chase.payload.thunk->state == ThunkState::Evaluated)
+                            chase = chase.payload.thunk->evaluated;
+                        else break;
+                        ++hops;
+                    }
+                    std::fprintf(stderr,
+                        "v3 FRAME_ENTRY OP_TAIL_CALL %s codeOff=%u: local[0].tag=%d",
+                        tcDesc->name.c_str(),
+                        (unsigned)tcDesc->codeOffset, (int)arg.tag());
+                    if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                        auto * b = chase.payload.bindings;
+                        std::fprintf(stderr, " -> attrs size=%u {",
+                            b->size);
+                        const auto & tbl = ir::globalSymbolTable();
+                        for (uint32_t i = 0; i < b->size && i < 4; ++i) {
+                            uint32_t nm = b->entries[i].name;
+                            std::fprintf(stderr, "%s%s", i ? "," : "",
+                                nm < tbl.size() ? tbl[nm].c_str() : "?");
+                        }
+                        if (b->size > 4) std::fprintf(stderr, ",...");
+                        std::fprintf(stderr, "}");
+                    } else {
+                        std::fprintf(stderr, " -> tag=%d", (int)chase.tag());
+                    }
+                    std::fprintf(stderr, " (frames=%zu)\n", vm.frames.size());
+                }
+            }
 
             // Update the existing frame in place (don't push a new one).
             CallFrame & cur = vm.frames.back();
@@ -3079,6 +3276,46 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_ATTRS_REC_INIT: {
+            // #498 diagnostic: log local[0] of the current frame at
+            // OP_ATTRS_REC_INIT for "final"-named maker frames.
+            if (std::getenv("V3_DBG_REC_INIT_LOCAL0")) {
+                const auto & fr = vm.frames.back();
+                const LambdaDescriptor * d = nullptr;
+                if (fr.closure) d = fr.closure->desc;
+                else if (fr.thunk) d = fr.thunk->suspended.desc;
+                if (d && d->name == "final") {
+                    Value v = vm.valueStack[fr.stackBaseOffset + 0];
+                    Value chase = v;
+                    int hops = 0;
+                    while (hops < 4) {
+                        if (chase.tag() == Tag::Slot && chase.payload.slot)
+                            chase = *chase.payload.slot;
+                        else if (chase.tag() == Tag::Thunk && chase.payload.thunk
+                                 && chase.payload.thunk->state == ThunkState::Evaluated)
+                            chase = chase.payload.thunk->evaluated;
+                        else break;
+                        ++hops;
+                    }
+                    std::fprintf(stderr,
+                        "v3 OP_ATTRS_REC_INIT in final codeOff=%u: local[0].tag=%d",
+                        (unsigned)d->codeOffset, (int)v.tag());
+                    if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                        const auto & st = ir::globalSymbolTable();
+                        auto * b = chase.payload.bindings;
+                        std::fprintf(stderr, " -> attrs size=%u {",
+                            (unsigned)b->size);
+                        for (uint32_t k = 0; k < b->size && k < 4; ++k) {
+                            SymbolId nm = b->entries[k].name;
+                            std::fprintf(stderr, "%s%s", k ? "," : "",
+                                nm < st.size() ? st[nm].c_str() : "?");
+                        }
+                        std::fprintf(stderr, "}");
+                    } else {
+                        std::fprintf(stderr, " -> tag=%d", (int)chase.tag());
+                    }
+                    std::fprintf(stderr, " (frames=%zu)\n", vm.frames.size());
+                }
+            }
             // Allocate a Bindings(n) with placeholder values; values
             // are written later by OP_ATTRS_REC_SET[slot].  Names come
             // pre-sorted from emit (LetRec emit sorts entries by
@@ -5597,6 +5834,45 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     size_t newBase = vm.valueStack.size();
     vm.valueStack.resize(newBase + desc->nLocals);
     vm.valueStack[newBase + 0] = arg;
+
+    // #498 frame-entry diagnostic for callClosure path.
+    {
+        static const char * s_filter =
+            std::getenv("V3_DBG_FRAME_ENTRY");
+        if (s_filter && desc && desc->name == s_filter) {
+            Value chase = arg;
+            int hops = 0;
+            while (hops < 4) {
+                if (chase.tag() == Tag::Slot && chase.payload.slot)
+                    chase = *chase.payload.slot;
+                else if (chase.tag() == Tag::Thunk && chase.payload.thunk
+                         && chase.payload.thunk->state == ThunkState::Evaluated)
+                    chase = chase.payload.thunk->evaluated;
+                else break;
+                ++hops;
+            }
+            std::fprintf(stderr,
+                "v3 FRAME_ENTRY callClosure %s codeOff=%u: local[0].tag=%d",
+                desc->name.c_str(), (unsigned)desc->codeOffset,
+                (int)arg.tag());
+            if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                auto * b = chase.payload.bindings;
+                std::fprintf(stderr, " -> attrs size=%u {", b->size);
+                const auto & tbl = ir::globalSymbolTable();
+                for (uint32_t i = 0; i < b->size && i < 4; ++i) {
+                    uint32_t nm = b->entries[i].name;
+                    std::fprintf(stderr, "%s%s", i ? "," : "",
+                        nm < tbl.size() ? tbl[nm].c_str() : "?");
+                }
+                if (b->size > 4) std::fprintf(stderr, ",...");
+                std::fprintf(stderr, "}");
+            } else {
+                std::fprintf(stderr, " -> tag=%d", (int)chase.tag());
+            }
+            std::fprintf(stderr, " (frames=%zu)\n", vm.frames.size());
+        }
+    }
+
     uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
 
     vm.frames.push_back(CallFrame{
