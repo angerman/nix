@@ -32,6 +32,10 @@
 #include "v3/vm.hh"
 #include "v3/primop.hh"
 
+#include "nix/util/source-path.hh"
+#include "nix/util/source-accessor.hh"
+#include "nix/util/error.hh"
+
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -286,5 +290,96 @@ Fallible<Value> applyClosure(EvalScope & scope, ClosureHandle h, Value arg)
         return Fallible<Value>{err};
     }
 }
+
+// ---------------------------------------------------------------------------
+// Category C: Filesystem I/O (Sprint priority 2, FFI plan §A12)
+// ---------------------------------------------------------------------------
+//
+// Pure-filesystem reads -- no store daemon involvement.  Each function is a
+// thin wrapper around the corresponding `nix::SourcePath` method, with
+// exceptions translated to v3::EvalError at the boundary.  Sandbox /
+// pure-eval gating is the dispatcher's concern (PrimOp flags, Cat. K).
+
+namespace {
+
+/// Map a SourceAccessor::Type enumerator to a stable lower-case string.
+/// Matches the names builtins.readFileType uses ("regular", "directory",
+/// "symlink", "unknown").  "unknown" subsumes char/block/socket/fifo so
+/// the FFI surface is small; consumers that need the precise sub-kind
+/// can call lstat directly.
+const char * typeToString(nix::SourceAccessor::Type t)
+{
+    using T = nix::SourceAccessor::Type;
+    switch (t) {
+        case T::tRegular:   return "regular";
+        case T::tDirectory: return "directory";
+        case T::tSymlink:   return "symlink";
+        case T::tChar:      return "unknown";
+        case T::tBlock:     return "unknown";
+        case T::tSocket:    return "unknown";
+        case T::tFifo:      return "unknown";
+        case T::tUnknown:   return "unknown";
+    }
+    return "unknown";
+}
+
+/// Wrap a thrown C++ exception as an EvalError at the FFI boundary.
+/// Position / trace / suggestions stay empty until the §A5 structured
+/// nix::EvalError catch lands (see #489).
+EvalError exceptionToEvalError(const std::exception & e)
+{
+    EvalError err;
+    err.msg = e.what();
+    return err;
+}
+
+} // namespace
+
+Fallible<std::string> readFile(nix::SourcePath path)
+{
+    try {
+        return Fallible<std::string>{path.readFile()};
+    } catch (const std::exception & e) {
+        return Fallible<std::string>{exceptionToEvalError(e)};
+    }
+}
+
+Fallible<std::map<std::string, std::string>> readDir(nix::SourcePath path)
+{
+    try {
+        auto entries = path.readDirectory();
+        std::map<std::string, std::string> out;
+        for (auto & [name, optType] : entries) {
+            // Unknown / lazy-resolution entries (some FS layers skip the
+            // type lookup) are reported as "unknown" so consumers know
+            // to call lstat for the precise kind.  Mirrors TW
+            // primReadDir's behaviour at primops.cc:2549-2569.
+            out.emplace(name,
+                optType ? typeToString(*optType) : "unknown");
+        }
+        return Fallible<std::map<std::string, std::string>>{std::move(out)};
+    } catch (const std::exception & e) {
+        return Fallible<std::map<std::string, std::string>>{
+            exceptionToEvalError(e)};
+    }
+}
+
+bool pathExists(nix::SourcePath path)
+{
+    // No Fallible -- pathExists in nix:: itself returns bool and does not
+    // throw on missing-path; only on permission / I/O errors which
+    // surface as exceptions.  Match that contract: false on any throw.
+    try {
+        return path.pathExists();
+    } catch (...) {
+        return false;
+    }
+}
+
+// findFile is a host-environment lookup (NIX_PATH search-path resolution)
+// rather than a pure-filesystem op.  Implementing it requires either
+// EvalState's searchPath or an injected lookup function.  Deferred to
+// the EvaluatorSettings wiring (sprint priority 3); declared in ffi.hh
+// for the eventual host migration.
 
 } // namespace nix::v3

@@ -20,9 +20,17 @@
 #include "v3/ffi.hh"
 #include "v3/value.hh"
 
+#include "nix/util/source-path.hh"
+#include "nix/util/source-accessor.hh"
+#include "nix/util/posix-source-accessor.hh"
+
 #include <cassert>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <unistd.h>
 
 using namespace nix::v3;
 
@@ -197,6 +205,94 @@ static void test_apply_closure_handle_after_scope_death()
     CHECK(!result.ok());
 }
 
+// Sprint priority 2: Category C Filesystem I/O proof-of-life.
+
+static nix::SourcePath spOfPath(const std::filesystem::path & p)
+{
+    // Canonicalise to defeat macOS /tmp -> /private/tmp symlink
+    // (PosixSourceAccessor::readFile asserts no symlinks in the path).
+    std::error_code ec;
+    auto resolved = std::filesystem::weakly_canonical(p, ec);
+    if (ec) resolved = p;
+    return nix::PosixSourceAccessor::createAtRoot(resolved);
+}
+
+static void test_readFile_happy()
+{
+    // Create a temp file with known content; readFile must return it.
+    auto tmp = std::filesystem::temp_directory_path()
+             / std::filesystem::path("v3-ffi-readFile-XXXXXX");
+    std::string tmpStr = tmp.string();
+    int fd = mkstemp(tmpStr.data());
+    CHECK(fd >= 0);
+    const char * content = "hello v3 ffi";
+    write(fd, content, std::strlen(content));
+    close(fd);
+
+    auto result = readFile(spOfPath(tmpStr));
+    CHECK(result.ok());
+    if (result.ok()) {
+        CHECK(result.unwrap() == content);
+    }
+    std::filesystem::remove(tmpStr);
+}
+
+static void test_readFile_missing_path_errors()
+{
+    auto bogus = std::filesystem::temp_directory_path()
+               / "v3-ffi-no-such-path-please-do-not-exist";
+    auto result = readFile(spOfPath(bogus));
+    CHECK(!result.ok());
+    if (!result.ok()) {
+        CHECK(!result.error().msg.empty());
+    }
+}
+
+static void test_pathExists_round_trip()
+{
+    // Tempdir always exists.
+    auto tmp = std::filesystem::temp_directory_path();
+    CHECK(pathExists(spOfPath(tmp)));
+
+    auto bogus = tmp / "v3-ffi-no-such-path-please-do-not-exist";
+    CHECK(!pathExists(spOfPath(bogus)));
+}
+
+static void test_readDir_happy()
+{
+    // Create a temp dir with two known entries; readDir must list them.
+    auto tmp = std::filesystem::temp_directory_path()
+             / std::filesystem::path("v3-ffi-readDir-XXXXXX");
+    std::string tmpStr = tmp.string();
+    char buf[1024];
+    std::strncpy(buf, tmpStr.c_str(), sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char * mk = mkdtemp(buf);
+    CHECK(mk != nullptr);
+    if (mk) {
+        std::filesystem::create_directories(std::filesystem::path(mk) / "subdir");
+        {
+            FILE * f = std::fopen((std::filesystem::path(mk) / "afile").c_str(), "w");
+            std::fputs("x", f);
+            std::fclose(f);
+        }
+
+        auto result = readDir(spOfPath(mk));
+        CHECK(result.ok());
+        if (result.ok()) {
+            const auto & entries = result.unwrap();
+            CHECK(entries.find("afile") != entries.end());
+            CHECK(entries.find("subdir") != entries.end());
+            // Type strings should be one of the expected enumeration.
+            for (auto & [n, t] : entries) {
+                CHECK(t == "regular" || t == "directory"
+                   || t == "symlink" || t == "unknown");
+            }
+        }
+        std::filesystem::remove_all(mk);
+    }
+}
+
 int main()
 {
     test_alloc_basic();
@@ -207,6 +303,10 @@ int main()
     test_multi_alloc_in_scope();
     test_apply_closure_invalid_handle();
     test_apply_closure_handle_after_scope_death();
+    test_readFile_happy();
+    test_readFile_missing_path_errors();
+    test_pathExists_round_trip();
+    test_readDir_happy();
 
     std::fprintf(stderr, "evalscope-handles: passed=%d failed=%d\n",
                  g_passed, g_failed);
