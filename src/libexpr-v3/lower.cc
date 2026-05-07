@@ -67,6 +67,22 @@ namespace {
 ///     references work.
 struct Scope
 {
+    /// #495 follow-on: tag a scope as introduced by a Lambda (param +
+    /// formals).  pushInheritFromCache uses this to decide whether a
+    /// from-expr's head ExprVar resolves to a lambda parameter -- such
+    /// vars can be mid-construction (e.g. fix0's `let x = f x; in x`
+    /// passes the not-yet-evaluated x as the lambda arg), so eager
+    /// `lowerExpr` of `param.X` triggers a recursion.  Other scopes
+    /// (Let, Rec, With) are tagged with their respective kinds.
+    enum class Kind : uint8_t {
+        Lambda,   ///< function body — byDispl[0..N] are param + formals
+        Let,      ///< plain let body — byDispl[i] are bindings
+        Rec,      ///< rec attrset / let-rec — recAttrsVar set
+        With,     ///< inside `with E;` body
+        Other,    ///< unknown / irrelevant for our heuristic
+    };
+    Kind kind = Kind::Other;
+
     std::vector<ir::VarId> byDispl;
     std::unordered_map<std::string, ir::VarId> byName;
 
@@ -896,6 +912,7 @@ struct Lowerer
         }
 
         Scope inner;
+        inner.kind = Scope::Kind::Lambda;
 
         if (auto formals = e->getFormals()) {
             // Param is the attrset.  Formals get extracted from it.
@@ -968,6 +985,7 @@ struct Lowerer
             // @arg slot so AttrSelect lookups land on the right
             // formal name.
             Scope recScope;
+            recScope.kind = Scope::Kind::Lambda;
             recScope.recAttrsVar = formalsRec;
             if (e->arg) {
                 recScope.byDispl.push_back(param);
@@ -1422,24 +1440,28 @@ struct Lowerer
         const bool useThunkBlanket = (s_lambdaSkip || s_thunkifyAll) && !s_noThunkify;
 
         // Heuristic for the `self.X` shape: ExprSelect whose head is
-        // an ExprVar at the IMMEDIATELY enclosing scope (level 0) and
-        // not from a `with`.  This is the precise shape of `self:
-        // { inherit (self.X) Y }` -- the lambda parameter referenced
-        // directly inside the lambda's body attrset.  Broader gates
-        // (level <= 1, all selects-on-vars) regressed nixpkgs
-        // hello.name evaluation -- the targeted level==0 case is
-        // sufficient for the small reproducer in
-        // run-fix-inherit-from-self-tests.sh; the deeper nixpkgs
-        // lib.fix path (level==1 due to nested `let`) remains a
-        // KNOWN-FAIL until a more precise capture-then-thunkify is
-        // landed.
-        auto isSelfDotPattern = [](nix::Expr * fx) -> bool {
+        // an ExprVar that resolves directly to the IMMEDIATELY enclosing
+        // simple-arg lambda's parameter (level 0, scope tagged Lambda,
+        // no formals, not from-with).  This catches `self: { inherit
+        // (self.X) Y }` directly; nixpkgs lib's nested-let case
+        // (level >= 1 self-dot via intermediate `let`) is a known-fail
+        // -- a broader heuristic (any Lambda-scope var, regardless of
+        // level) regressed nixpkgs hello.name with `OP_ATTRS_SELECT:
+        // attribute not found` errors that point at upvalue-capture
+        // bugs in the thunkify path under deep nesting.  Solving that
+        // is a separate investigation (#495 follow-on).
+        auto isSelfDotPattern = [this](nix::Expr * fx) -> bool {
             auto * sel = dynamic_cast<nix::ExprSelect *>(fx);
             if (!sel) return false;
             auto * v = dynamic_cast<nix::ExprVar *>(sel->e);
             if (!v) return false;
             if (v->fromWith) return false;
-            return v->level == 0;
+            if (v->level != 0) return false;
+            if (scopes.empty()) return false;
+            const auto & sc = scopes.back();
+            if (sc.kind != Scope::Kind::Lambda) return false;
+            if (sc.recAttrsVar != ir::kInvalid) return false;
+            return true;
         };
 
         std::vector<ir::VarId> cache;
