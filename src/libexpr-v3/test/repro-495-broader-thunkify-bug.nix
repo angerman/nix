@@ -91,17 +91,35 @@
 #   module-1's CU; its freeVars list might mismatch what the second
 #   call site (compiled per module-2) expects.
 #
-#   Likely fix path: when primImport@5671 finishes lowering, ALSO
-#   populate v3HookCache so v3EvalEntry's later lookup with an
-#   overlapping AST hits and skips re-lowering.  Alternatively: unify
-#   importCache + v3HookCache.  Both are tracked under the
-#   "cache-tightening" TODO.
+#   PARTIAL FIX (commit 0a480cfb0, content-keyed cache):
+#     primImport now registers (sourceHash → CU) in an in-memory
+#     content cache.  v3EvalEntry consults it on Expr* miss, hits,
+#     and skips re-lowering.  Net effect: fire count drops from
+#     42 to 21.  But the broader-thunkify upvalue bug STILL fires
+#     at 21 fires -- so the duplicate-lowering theory was only
+#     partially right.  At MAX_LEVEL=1, thunkifying ALL 21 of
+#     lib/default.nix's `inherit (self.X) Y` clauses (within the
+#     `(self: let callLibs = ...; in {...})` lambda body) causes
+#     the lib.systems.elaborate path to fail.  Skipping ANY ONE of
+#     the 21 makes it work (NIX_V3_SELF_DOT_LIMIT=20 passes,
+#     NIX_V3_SELF_DOT_SKIP_NTH=1..21 all pass; LIMIT=21 fails).
+#     Convergence cap (kMaxIters=16 in computeFreeVars) raised to
+#     256 didn't help.
+#
+#   The underlying bug remains: SOMETHING about thunkifying all
+#   21 self-dot from-exprs simultaneously corrupts an upvalue
+#   binding in a downstream closure (`platforms.select` receives
+#   a 2-attr `pc`-style attrset instead of the platform record
+#   `final`).  Pure mystery: skipping any single thunkify makes
+#   the bug disappear, no matter which one.
 #
 #   Tooling for further bisect (lower.cc + per-call-site labels):
 #     V3_DBG_LOWER_CALLS=1        -- log each lowerNixExpr call
 #     V3_DBG_SELF_DOT_FIRES=1     -- log each fire's ordinal + position
 #     NIX_V3_SELF_DOT_LIMIT=N     -- gate to first N fires module-wide
 #     NIX_V3_SELF_DOT_SKIP_NTH=N  -- skip the Nth fire (1-indexed)
+#     NIX_V3_NO_CONTENT_CACHE=1   -- disable the content cache layer
+#                                    (returns to the old 42-fire shape)
 #
 # Until root-caused, asserted as KNOWN-FAIL in the test suite so a
 # silent change to the failure shape (e.g., someone broadens the
