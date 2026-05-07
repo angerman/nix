@@ -1286,6 +1286,97 @@ static int testStrictnessSkipsForceOverApp()
     return 0;
 }
 
+/// REVIEW B6 follow-on: strictness pass MUST rewrite Force over each
+/// non-Lit WHNF-producing kind in the whitelist.  Coverage gap from
+/// the original review (only Force-over-Lit was tested explicitly).
+///
+/// Helper: builds `Force{<expr>}` and asserts elimRedundantForce
+/// converts the binding to a VarRef alias.
+static int checkForceRewrite(const char * name, ir::Expr inner)
+{
+    auto m = ir::makeModule();
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+    auto innerVar = addBinding(m, topEntry, std::move(inner));
+    auto forceVar = addBinding(m, topEntry, ir::Force{innerVar, 0});
+    setReturn(m, topEntry, forceVar);
+
+    size_t rewritten = ir::elimRedundantForce(m);
+    if (rewritten == 0) {
+        std::fprintf(stderr,
+            "%s: expected at least 1 rewrite, got 0\n", name);
+        return 1;
+    }
+    bool isVarRef = false;
+    for (auto & bd : m.blocks[topEntry].bindings) {
+        if (bd.var == forceVar) {
+            isVarRef = std::holds_alternative<ir::VarRef>(bd.expr);
+            break;
+        }
+    }
+    if (!isVarRef) {
+        std::fprintf(stderr,
+            "%s: Force binding wasn't rewritten to VarRef\n", name);
+        return 1;
+    }
+    std::fprintf(stderr, "%s: OK\n", name);
+    return 0;
+}
+
+static int testStrictnessRewritesForceOverLambda()
+{
+    // Build a synthetic Lambda binding (no body needed -- the strictness
+    // pass only inspects the outer Force's source kind via std::variant
+    // discriminator).
+    auto fid = ir::FuncId{0};  // placeholder; pass doesn't dereference
+    return checkForceRewrite(
+        "testStrictnessRewritesForceOverLambda",
+        ir::Lambda{fid, /*freeVars*/ {}});
+}
+
+static int testStrictnessRewritesForceOverAdd()
+{
+    auto m = ir::makeModule();
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+    auto a = addBinding(m, topEntry, ir::LitInt{1});
+    auto b = addBinding(m, topEntry, ir::LitInt{2});
+    auto sum = addBinding(m, topEntry, ir::Add{a, b});
+    auto forceVar = addBinding(m, topEntry, ir::Force{sum, 0});
+    setReturn(m, topEntry, forceVar);
+
+    size_t rewritten = ir::elimRedundantForce(m);
+    bool isVarRef = false;
+    for (auto & bd : m.blocks[topEntry].bindings) {
+        if (bd.var == forceVar) {
+            isVarRef = std::holds_alternative<ir::VarRef>(bd.expr);
+            break;
+        }
+    }
+    if (!isVarRef || rewritten == 0) {
+        std::fprintf(stderr,
+            "testStrictnessRewritesForceOverAdd: rewritten=%zu, isVarRef=%d\n",
+            rewritten, (int)isVarRef);
+        return 1;
+    }
+    std::fprintf(stderr, "testStrictnessRewritesForceOverAdd: OK\n");
+    return 0;
+}
+
+static int testStrictnessRewritesForceOverAttrSet()
+{
+    return checkForceRewrite(
+        "testStrictnessRewritesForceOverAttrSet",
+        ir::AttrSet{/*entries*/ {}});
+}
+
+static int testStrictnessRewritesForceOverListExpr()
+{
+    return checkForceRewrite(
+        "testStrictnessRewritesForceOverListExpr",
+        ir::ListExpr{/*elems*/ {}});
+}
+
 /// REVIEW B8: corrupted-blob fallback test.  Verifies that
 /// deserializeCU throws SerializationError on the three documented
 /// corruption modes: bad magic, schema mismatch, opcode-table
@@ -1409,6 +1500,10 @@ int main()
     rc |= testFibonacciSelfApp();
     rc |= testStrictnessRewritesForceOverLit();
     rc |= testStrictnessSkipsForceOverApp();
+    rc |= testStrictnessRewritesForceOverLambda();
+    rc |= testStrictnessRewritesForceOverAdd();
+    rc |= testStrictnessRewritesForceOverAttrSet();
+    rc |= testStrictnessRewritesForceOverListExpr();
     rc |= testSerializeRoundTrip();
     rc |= testSerializeWithRecAttrset();
     rc |= testDiskCacheRoundTrip();
