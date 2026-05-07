@@ -807,14 +807,17 @@ inline std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry()
 inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
                                              bool isRecInit)
 {
-    // Non-rec callers (OP_ATTRS_INIT/INIT_DYN/UPDATE) cannot
-    // legitimately publish their result to the enclosing Black thunk
-    // because the result is a sub-expression value, not the thunk's
-    // return value.  Bail out.
-    //
-    // NIX_V3_PUBLISH_NON_REC_INIT=1 is a #496 reversion gate for
-    // bisecting whether always-thunkify regressions hinge on the
-    // pre-#496 partial-bindings pollution.
+    // STG-1 (#498): when NIX_V3_STG=1 is set, publish is disabled.
+    // Each thunk's slot is written ONLY by its own OP_RETURN; no outer
+    // thunk write-through.  Pre-STG behaviour (legacy default) is
+    // preserved otherwise -- the publish mechanism is the root cause
+    // of #498 but STG-proper requires accompanying changes (proper
+    // slot-only captures + cycle detection in CFF_FORCE_RETRY) to
+    // handle every nixpkgs path that the publish currently masks.
+    static const bool s_stgMode =
+        std::getenv("NIX_V3_STG") != nullptr;
+    if (s_stgMode) return;
+    // ---- Pre-STG path (legacy default) ----
     static const bool s_publishNonRec =
         std::getenv("NIX_V3_PUBLISH_NON_REC_INIT") != nullptr;
     if (!isRecInit && !s_publishNonRec) return;
