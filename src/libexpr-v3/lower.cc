@@ -1450,15 +1450,32 @@ struct Lowerer
         // attribute not found` errors that point at upvalue-capture
         // bugs in the thunkify path under deep nesting.  Solving that
         // is a separate investigation (#495 follow-on).
+        // The maximum level offset we'll thunkify a self-dot-pattern at.
+        // 0 = only the immediately-enclosing simple-arg lambda's parameter
+        // (the fix-inherit-from-self repro shape).  Higher = walk N scope
+        // levels to reach a Lambda scope (catches the nixpkgs lib.fix
+        // pattern: `lambda_param: let X = ...; in { inherit
+        // (lambda_param.Y) Z }`, where the Let bumps the level).  But
+        // higher also currently triggers a wrong-upvalue-capture bug in
+        // nixpkgs all-packages (`OP_ATTRS_SELECT: attribute not found
+        // "isx86"` -- platform closure receives the wrong attrset).  Keep
+        // default at 0; opt into the broader gate via
+        // NIX_V3_SELF_DOT_MAX_LEVEL=N for testing.  TODO: root-cause and
+        // fix the upvalue capture, then default to a safe higher level.
+        static const unsigned s_maxLevel = []() -> unsigned {
+            const char * s = std::getenv("NIX_V3_SELF_DOT_MAX_LEVEL");
+            return s ? unsigned(std::atoi(s)) : 0u;
+        }();
         auto isSelfDotPattern = [this](nix::Expr * fx) -> bool {
             auto * sel = dynamic_cast<nix::ExprSelect *>(fx);
             if (!sel) return false;
             auto * v = dynamic_cast<nix::ExprVar *>(sel->e);
             if (!v) return false;
             if (v->fromWith) return false;
-            if (v->level != 0) return false;
-            if (scopes.empty()) return false;
-            const auto & sc = scopes.back();
+            if (v->level > s_maxLevel) return false;
+            if (v->level >= scopes.size()) return false;
+            size_t idx = scopes.size() - 1 - v->level;
+            const auto & sc = scopes[idx];
             if (sc.kind != Scope::Kind::Lambda) return false;
             if (sc.recAttrsVar != ir::kInvalid) return false;
             return true;

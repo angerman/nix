@@ -81,6 +81,45 @@ else
   fail_names+=("v3 non-fix lambda inherit: expected 6, got: $(echo "$nf_out" | tail -2)")
 fi
 
+# 4. Nested-let case: `outer = self: let X = ...; in { inherit (self.Y) Z }`.
+#    `self`'s level is 1 (from-expr in attrset goes one scope up through
+#    the let).  Default mode (NIX_V3_SELF_DOT_MAX_LEVEL=0 implicit) does
+#    NOT thunkify this, so it loops -- documented KNOWN-FAIL.
+cat > "$TMP/deep.nix" <<'NIX'
+let
+  fix0 = f: let x = f x; in x;
+  outer = self:
+    let helper = 5; in
+    {
+      fixedPoints = { fn = g: let y = g y; in y; };
+      inherit (self.fixedPoints) fn;
+    };
+  ext = sf: { a = 1; b = sf.a + 10; };
+in (((fix0 outer).fn) ext).b
+NIX
+deep_default_out=$(timeout 10 env NIX_USE_V3=1 \
+  "$NIX_BIN" eval --impure -f "$TMP/deep.nix" 2>&1)
+deep_default_exit=$?
+if echo "$deep_default_out" | grep -q "infinite recursion" \
+   || [[ $deep_default_exit -ne 0 ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  fail_names+=("deep default: expected loop / fail, got: $(echo "$deep_default_out" | tail -1)")
+fi
+
+# 5. Same nested-let case under NIX_V3_SELF_DOT_MAX_LEVEL=2 -- the
+#    opt-in heuristic walks level 1 to find the Lambda scope and
+#    thunkifies.  MUST return 11.  This is the lib.fix d3b path.
+deep_optin_out=$(timeout 10 env NIX_USE_V3=1 NIX_V3_SELF_DOT_MAX_LEVEL=2 \
+  "$NIX_BIN" eval --impure -f "$TMP/deep.nix" 2>&1)
+if echo "$deep_optin_out" | grep -q '^11$'; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  fail_names+=("deep MAX_LEVEL=2: expected 11, got: $(echo "$deep_optin_out" | tail -3)")
+fi
+
 echo
 echo "=== fix-inherit-from-self tests: ok=$PASS fail=$FAIL ==="
 if [[ $FAIL -gt 0 ]]; then
