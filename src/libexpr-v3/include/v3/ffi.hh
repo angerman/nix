@@ -87,6 +87,13 @@ class Value; // v3 16-byte tagged value (declared in value.hh)
 /// rendering.  v3 supplies positions and a HintFmt-compatible message;
 /// the host renders.  Width / colour / terminal-vs-JSON is the
 /// renderer's concern, not v3's.
+///
+/// **#489 status (2026-05-07):** type-level shape complete -- matches
+/// `nix::EvalError`'s Suggestions + trace-with-positions structure.
+/// The FFI boundary shim that catches a `nix::EvalError` C++ exception
+/// and constructs a v3::EvalError variant is part of the per-category
+/// migration steps (each Fallible<T>-returning FFI entry-point will
+/// carry the catch-and-translate logic at its body).
 struct TraceFrame
 {
     nix::PosIdx pos;        ///< 1-based index into shared PosTable; 0 = unknown.
@@ -283,6 +290,13 @@ BlockingFFI<FetchResult> fetchTarball(std::string_view url);
 //
 // Per FFI_PLAN_2026-05-06b §A12: addMultipleToStore, computeFSClosure,
 // PathFilter callback type added (count goes 10 -> 13).
+//
+// **#490 status (2026-05-07):** type-level shape complete -- all 13
+// store-op declarations + PathFilter type are present.  Wiring v3
+// internals (today libnixstore is reached directly via the global
+// `getStore()`) onto these typed entry points is a separate
+// migration step; tracked under the broader category-E body work in
+// the FFI plan migration path.
 
 using PathFilter = std::function<bool(std::string_view path)>;
 
