@@ -1604,12 +1604,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     desc->intrinsicKind != LambdaDescriptor::Intrinsic::None,
                     0)) {
                 if (desc->intrinsicKind == LambdaDescriptor::Intrinsic::Fix) {
+                    // Refuse native dispatch when the user's `f` is a
+                    // Bridge thunk (a TW value bridged into v3): TW
+                    // lambdas can't handle a v3 Tag::Slot as an arg.
+                    // Fall through to the regular bytecode dispatch
+                    // which already knows how to bridge across.
+                    Value forcedArg = arg;
+                    if (forcedArg.tag() == Tag::Thunk
+                        && forcedArg.payload.thunk
+                        && forcedArg.payload.thunk->state == ThunkState::Bridge)
+                    {
+                        // Skip intrinsic; fall through to bytecode path.
+                        goto skip_intrinsic_fix_op_call;
+                    }
                     allocStats().intrinsicFixCalls++;
                     static const bool s_dbg =
                         std::getenv("V3_DBG_INTRINSIC") != nullptr;
                     if (s_dbg) std::fprintf(stderr,
-                        "v3 intrinsic Fix dispatch: arg.tag=%d\n",
-                        (int)arg.tag());
+                        "v3 intrinsic Fix dispatch [#%llu]: arg.tag=%d desc=%s\n",
+                        (unsigned long long)allocStats().intrinsicFixCalls,
+                        (int)arg.tag(),
+                        desc->name.empty() ? "<anon>" : desc->name.c_str());
                     // Heap-allocate the slot storage (GC-traced).  Initial
                     // value is Tag::Uninitialized; populated by the body's
                     // result.  Tag::Slot wraps a Value*; reading through
@@ -1649,6 +1664,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // Step 1's recogniseIntrinsic only sets Fix; future
                 // commits add the rest.
             }
+            skip_intrinsic_fix_op_call:;
 
             // #424: selector-lambda fast path for `\x: x.f`.  Skips
             // frame allocation + dispatch -- force arg, project the
@@ -4981,6 +4997,42 @@ Value callClosure(VMState & vm, Value fun, Value arg)
 
     const Closure * callee = fun.payload.closure;
     const LambdaDescriptor * desc = callee->desc;
+
+    // #495: native fix-point intrinsic -- mirrored from OP_CALL.
+    // callClosure is the entry point primops + bridges use; the
+    // intrinsic check must fire here too or recognised lambdas
+    // dispatched via this path silently take the bytecode body.
+    static const bool s_intrinsicEnable =
+        std::getenv("NIX_V3_INTRINSIC_DISPATCH") != nullptr;
+    if (s_intrinsicEnable && __builtin_expect(
+            desc->intrinsicKind != LambdaDescriptor::Intrinsic::None, 0)) {
+        if (desc->intrinsicKind == LambdaDescriptor::Intrinsic::Fix) {
+            // Refuse native dispatch when the user's `f` is a Bridge
+            // thunk -- TW lambdas can't handle v3 Tag::Slot.  Fall
+            // through to bytecode which knows the bridge dance.
+            bool argIsBridge = arg.tag() == Tag::Thunk
+                && arg.payload.thunk
+                && arg.payload.thunk->state == ThunkState::Bridge;
+            if (!argIsBridge) {
+                allocStats().intrinsicFixCalls++;
+                static const bool s_dbg =
+                    std::getenv("V3_DBG_INTRINSIC") != nullptr;
+                if (s_dbg) std::fprintf(stderr,
+                    "v3 callClosure intrinsic Fix [#%llu]: arg.tag=%d\n",
+                    (unsigned long long)allocStats().intrinsicFixCalls,
+                    (int)arg.tag());
+                Value * slotStorage = Alloc::allocValue();
+                slotStorage->tag_payload =
+                    static_cast<uint64_t>(Tag::Uninitialized);
+                Value slotV;
+                slotV.tag_payload = static_cast<uint64_t>(Tag::Slot);
+                slotV.payload.slot = slotStorage;
+                Value res = callClosure(vm, arg, slotV);
+                *slotStorage = res;
+                return res;
+            }
+        }
+    }
 
     // #424: selector-lambda fast path -- mirrored from OP_CALL.
     // callClosure is the entry point primops use for callback lambdas
