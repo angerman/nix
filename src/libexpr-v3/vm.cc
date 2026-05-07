@@ -4014,8 +4014,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // and proceed.  Allows mid-construction rec-attrset
                 // self-reference to work without the structural
                 // closure-capture redesign.
+                // STG-2: skip side-table recovery under NIX_V3_STG=1.
+                // STG semantics: a Black thunk access is a cycle and
+                // must throw, not be papered over with whatever the
+                // publish-walk happened to register.
+                static const bool s_stgMode_recref =
+                    std::getenv("NIX_V3_STG") != nullptr;
                 Bindings * recoveredBindings = nullptr;
-                if (attrs.tag() == Tag::Thunk && attrs.payload.thunk
+                if (!s_stgMode_recref
+                    && attrs.tag() == Tag::Thunk && attrs.payload.thunk
                     && attrs.payload.thunk->state == ThunkState::Blackhole) {
                     auto & reg = partialBindingsRegistry();
                     auto it = reg.find(attrs.payload.thunk);
@@ -4035,8 +4042,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         // Last-ditch: try the registry again (the
                         // thunk's force might have transitioned but
                         // the top-of-stack v3 thunk it's wrapping is
-                        // black).
-                        if (attrs.tag() == Tag::Thunk
+                        // black).  STG-2: skip under NIX_V3_STG=1.
+                        if (!s_stgMode_recref
+                            && attrs.tag() == Tag::Thunk
                             && attrs.payload.thunk) {
                             auto & reg = partialBindingsRegistry();
                             auto it = reg.find(attrs.payload.thunk);
