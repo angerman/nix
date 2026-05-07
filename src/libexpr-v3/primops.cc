@@ -84,6 +84,12 @@ namespace nix::v3 {
 void populateSubExprCachePublic(
     const ir::Module & module, const CompilationUnit * cu);
 
+// #495 follow-on: defined in v3_hook.cc.  Registers (sourceContentHash
+// → CU) so v3EvalEntry's later lookup with a fresh-parse Expr* hits
+// and skips re-lowering.
+void registerContentCachePublic(
+    const disk_cache::CacheKey & key, const CompilationUnit * cu);
+
 /// WC-19: TLS pointer to the outer Expr the v3 hook is currently
 /// processing.  v3_hook.cc sets this before calling v3ToTreeWalker;
 /// the lazy-bridge registration captures it so primV3ForceAttr /
@@ -5626,8 +5632,15 @@ void primImport(EvalState & state, Value * args, Value & out)
     // remap in serialize::deserializeCU.
     static const bool diskCacheEnabled =
         std::getenv("NIX_V3_DISK_CACHE") != nullptr;
+    // #495 follow-on: content-cache (in-memory) is default-on.  Compute
+    // the content hash whenever EITHER cache is enabled.  Content
+    // cache lets v3EvalEntry's later lookup with a fresh-parse Expr*
+    // hit and skip re-lowering -- the trigger for the broader-thunkify
+    // upvalue bug.
+    static const bool contentCacheEnabled =
+        std::getenv("NIX_V3_NO_CONTENT_CACHE") == nullptr;
     disk_cache::CacheKey diskKey{};
-    if (diskCacheEnabled && haveResolved) {
+    if ((diskCacheEnabled || contentCacheEnabled) && haveResolved) {
         // REVIEW §1.5: hash the resolved file content (post-symlink,
         // post-default.nix rewriting), not the raw input path.  Symlink
         // retargeting + dir/default.nix selection both invalidate
@@ -5640,10 +5653,14 @@ void primImport(EvalState & state, Value * args, Value & out)
             // and no insert happens later.  Same fallback as before.
         }
     }
-    if (!diskKey.empty()) {
+    if (diskCacheEnabled && !diskKey.empty()) {
         if (auto blob = disk_cache::lookup(diskKey)) {
             try {
                 cache.cus.push_back(serialize::deserializeCU(*blob));
+                // Also populate the content cache so v3EvalEntry's
+                // later lookup with a fresh-parse Expr* hits.
+                if (contentCacheEnabled)
+                    registerContentCachePublic(diskKey, &cache.cus.back());
                 out = run(cache.cus.back());
                 auto [mt, sz] = importStat(path);
                 cache.results.emplace(path,
@@ -5672,7 +5689,17 @@ void primImport(EvalState & state, Value * args, Value & out)
     nix::v3::ir::optimise(module);
     nix::v3::ir::computeFreeVars(module);
     cache.cus.push_back(compile(module));
-    if (!diskKey.empty() && serialize::isCacheable(cache.cus.back())) {
+    // #495 follow-on: register in the content cache before disk-cache
+    // insertion so v3EvalEntry's later lookup with a fresh-parse
+    // Expr* of the same source hits and skips re-lowering.  Without
+    // this, lib/default.nix is parsed twice in some eval paths and
+    // its 21 inherit-from clauses thunkify twice, producing the
+    // broader-thunkify upvalue bug.
+    if (contentCacheEnabled && !diskKey.empty()) {
+        registerContentCachePublic(diskKey, &cache.cus.back());
+    }
+    if (diskCacheEnabled && !diskKey.empty()
+        && serialize::isCacheable(cache.cus.back())) {
         try {
             std::string blob = serialize::serializeCU(cache.cus.back());
             disk_cache::insert(diskKey, blob);

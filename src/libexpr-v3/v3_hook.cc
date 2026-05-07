@@ -87,6 +87,50 @@ static std::unordered_map<const nix::Expr *, CachedUnit> & v3HookCache()
     return tbl;
 }
 
+// Content-keyed cache layer (#495 follow-on, aligns with UNISON_IDEAS
+// item 1: content-addressed IR fragments at file granularity).
+//
+// v3HookCache is keyed by Expr*, so two parses of the same file
+// produce different keys and the second misses → re-lowers.  This
+// surfaced as the broader-thunkify upvalue bug: lib/default.nix is
+// parsed twice in some eval paths (once via primImport, once via
+// the WC-1 fall-back through TW), and the two lowerings produce
+// distinct IR for the same source positions.  When both modules'
+// thunks intermingle at force time (one CU's bytecode, another
+// CU's freeVar layout) the wrong upvalues are captured.
+//
+// This second cache is keyed by source-content SHA256.  On Expr*
+// miss in v3HookCache, we compute the content hash (using the same
+// path-resolution as the disk-cache) and consult the content cache
+// FIRST.  Hit → reuse the CU (also write to v3HookCache so the
+// next force on this Expr* hits the fast Expr*-keyed path).
+//
+// Content cache pointers are non-owning -- the CompilationUnit is
+// owned by v3HookCache via unique_ptr.  Lifetime: as long as the
+// CU stays in v3HookCache (which is forever, currently).
+//
+// Opt out via NIX_V3_NO_CONTENT_CACHE=1 (e.g. for A/B perf tests).
+static std::unordered_map<std::string, const CompilationUnit *> & v3HookContentCache()
+{
+    static std::unordered_map<std::string, const CompilationUnit *> tbl;
+    return tbl;
+}
+
+// Public wrapper so primImport / scopedImport can populate the content
+// cache after their own lowerings -- without this, v3EvalEntry's
+// later cache lookup with a fresh-parse Expr* misses and re-lowers,
+// which is the broader-thunkify upvalue-bug trigger.  Non-owning
+// pointer; caller (primImport's importCache.cus) keeps the CU alive.
+void registerContentCachePublic(const disk_cache::CacheKey & key,
+                                 const CompilationUnit * cu)
+{
+    if (key.empty() || !cu) return;
+    if (std::getenv("NIX_V3_NO_CONTENT_CACHE") != nullptr) return;
+    std::string contentKey(reinterpret_cast<const char *>(key.bytes),
+                            sizeof(key.bytes));
+    v3HookContentCache().emplace(contentKey, cu);
+}
+
 /// VM-4 ext: parse-time side table populated by `EvalState::v3RegisterExprHook`.
 /// Maps a top-level parsed Expr* to the SourcePath the parser was given.
 /// Used as a fallback when the Expr's getPos() returns noPos (very common
@@ -1935,9 +1979,20 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
         //      Exprs not registered (e.g. parseExprFromString).
         static const bool diskCacheEnabled =
             std::getenv("NIX_V3_DISK_CACHE") != nullptr;
+        // #495 follow-on: content-keyed in-memory cache layer.  Cheap
+        // (one SHA-256 of the source on Expr* miss) and dedupes
+        // across multiple parses of the same file in one process
+        // run -- the bug class triggered by lib/default.nix being
+        // parsed twice.  Default-on; opt out with
+        // NIX_V3_NO_CONTENT_CACHE=1.
+        static const bool contentCacheEnabled =
+            std::getenv("NIX_V3_NO_CONTENT_CACHE") == nullptr;
         std::string srcContent;
         disk_cache::CacheKey diskKey{};
-        if (diskCacheEnabled && e) {
+        // Compute the content hash if EITHER cache is enabled.  The
+        // content cache always uses the hash; the disk cache uses it
+        // when its env-flag is set.
+        if ((diskCacheEnabled || contentCacheEnabled) && e) {
             try {
                 auto & paths = v3ExprPaths();
                 auto pit = paths.find(e);
@@ -1949,7 +2004,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     srcContent = pit->second.resolveSymlinks().readFile();
                     diskKey = disk_cache::computeKeyForString(srcContent);
                     if (diag) std::fprintf(stderr,
-                        "v3 hook: disk-cache key from side-table path=%s\n",
+                        "v3 hook: content-cache key from side-table path=%s\n",
                         pit->second.path.abs().c_str());
                 } else {
                     auto pos = state.positions[e->getPos()];
@@ -1957,7 +2012,7 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                         srcContent = sp->resolveSymlinks().readFile();
                         diskKey = disk_cache::computeKeyForString(srcContent);
                         if (diag) std::fprintf(stderr,
-                            "v3 hook: disk-cache key from getPos path=%s\n",
+                            "v3 hook: content-cache key from getPos path=%s\n",
                             sp->path.abs().c_str());
                     } else if (diag) {
                         std::fprintf(stderr,
@@ -1967,11 +2022,37 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                 }
             } catch (const std::exception & ex) {
                 if (diag) std::fprintf(stderr,
-                    "v3 hook: disk-cache key calc threw: %s\n", ex.what());
-                // Best-effort — any read failure means no disk lookup.
+                    "v3 hook: content-cache key calc threw: %s\n", ex.what());
+                // Best-effort — any read failure means no lookup.
             } catch (...) {
                 if (diag) std::fprintf(stderr,
-                    "v3 hook: disk-cache key calc threw (unknown)\n");
+                    "v3 hook: content-cache key calc threw (unknown)\n");
+            }
+        }
+        // In-memory content cache: hits when a different parse of
+        // the same source has already been lowered+compiled in this
+        // process.  Pointer is non-owning (CompilationUnit is owned
+        // by v3HookCache via unique_ptr) but stable for v3HookCache's
+        // lifetime.
+        if (contentCacheEnabled && !diskKey.empty()) {
+            std::string contentKey(reinterpret_cast<const char *>(diskKey.bytes),
+                                    sizeof(diskKey.bytes));
+            auto & ccache = v3HookContentCache();
+            auto cit = ccache.find(contentKey);
+            if (cit != ccache.end()) {
+                cu = cit->second;
+                // Register this Expr* in the Expr*-keyed cache too so
+                // subsequent forces on the same Expr* hit the fast
+                // path.  We don't OWN the CU here -- store an empty
+                // CachedUnit (cu=nullptr) keyed by Expr* with a
+                // pointer-only entry.  That breaks the unique_ptr
+                // invariant; instead, we just accept the duplicate
+                // Expr*-cache lookup miss next time.  Cheap enough.
+                if (diag) std::fprintf(stderr,
+                    "v3 hook: content-cache HIT key=%s (e=%p)\n",
+                    diskKey.hex().substr(0, 16).c_str(), (const void*)e);
+                st.cacheHits++;  // count toward hit, not miss
+                goto cu_ready;
             }
         }
         if (!diskKey.empty()) {
@@ -1981,6 +2062,11 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                         serialize::deserializeCU(*blob));
                     cu = compiled.get();
                     cache.emplace(e, CachedUnit{std::move(compiled)});
+                    if (contentCacheEnabled) {
+                        std::string contentKey(reinterpret_cast<const char *>(diskKey.bytes),
+                                                sizeof(diskKey.bytes));
+                        v3HookContentCache().emplace(contentKey, cu);
+                    }
                     if (diag) std::fprintf(stderr,
                         "v3 hook: disk-cache HIT key=%s\n",
                         diskKey.hex().substr(0, 16).c_str());
@@ -2088,6 +2174,22 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
             // force hook can walk tree-walker's env at force time.
             populateSubExprCacheLocal(module, cu);
             cache.emplace(e, CachedUnit{std::move(compiled)});
+
+            // #495 follow-on: also register in the content-keyed cache
+            // so subsequent parses of the same source (e.g. via the
+            // WC-1 fall-back through TW) hit and skip re-lowering.
+            // The CU is owned by v3HookCache (above); this stores a
+            // non-owning pointer.  First-emplace wins (idempotent if
+            // we somehow lower the same content twice -- the pointer
+            // stays the same as cache.emplace also got first-wins).
+            if (contentCacheEnabled && !diskKey.empty()) {
+                std::string contentKey(reinterpret_cast<const char *>(diskKey.bytes),
+                                        sizeof(diskKey.bytes));
+                v3HookContentCache().emplace(contentKey, cu);
+                if (diag) std::fprintf(stderr,
+                    "v3 hook: content-cache INSERT key=%s\n",
+                    diskKey.hex().substr(0, 16).c_str());
+            }
 
             // VM-4: write the freshly-compiled CU to disk cache for
             // reuse on subsequent invocations of this same source.
