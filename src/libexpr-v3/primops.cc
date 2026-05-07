@@ -25,6 +25,7 @@
 #include "v3/lower.hh"
 #include "v3/vm.hh"
 #include "v3/bridge_yield.hh"
+#include "v3/ffi.hh"  // FFI plan migration step 1: surface declarations.
 #include "v3/errors.hh"
 
 #include <chrono>
