@@ -1462,6 +1462,13 @@ struct Lowerer
         // default at 0; opt into the broader gate via
         // NIX_V3_SELF_DOT_MAX_LEVEL=N for testing.  TODO: root-cause and
         // fix the upvalue capture, then default to a safe higher level.
+        //
+        // NOTE: NIX_V3_INTRINSIC_DISPATCH=1 alone does NOT auto-bump
+        // this, because intrinsic dispatch + nixpkgs (e.g. evaluating
+        // hello.name with NIX_V3_INTRINSIC_DISPATCH=1) trips the same
+        // upvalue bug.  Users who want the full lib.fix path must opt
+        // into BOTH NIX_V3_INTRINSIC_DISPATCH=1 and
+        // NIX_V3_SELF_DOT_MAX_LEVEL=N explicitly.
         static const unsigned s_maxLevel = []() -> unsigned {
             const char * s = std::getenv("NIX_V3_SELF_DOT_MAX_LEVEL");
             return s ? unsigned(std::atoi(s)) : 0u;
