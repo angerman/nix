@@ -240,24 +240,32 @@ now stale; assertions need updating):
 * `run-on-demand-root-shapes.sh` #455 NEGATIVE-OF-POSITIVE:
   `NIX_V3_NO_CALL_HOOK_EAGER=1` no longer trips the auto-eager guard.
 
-OPEN (post-landing diagnostic):
+RESOLVED post-landing diagnostic (commit `298870af2`):
 
-* **`(import <nixpkgs> {}).lib.id 5` fails with `OP_GET_UPVALUE: no
-  closure context`** under `NIX_V3_DIRECT_EVAL=1`.  Standalone repros
-  of `mergeAttrsList`-shape (the failing thunk per FORCE_TRACE,
-  `attrsets.nix:1627:22`) work.  The full nixpkgs evaluation goes
-  through by-name-overlay's `_internalCallByName` machinery; some
-  thunk is being force-called via runFunction (closure=nullptr)
-  with a body that emits OP_GET_UPVALUE.
-  - Hypothesis: a nested Lambda inside a function whose lexicalWiths
-    propagation causes its freeVars to grow.  When that function is
-    called via `runFunction(funcIdx, capturedWiths)` (no upvalues
-    arg) somehow without nUpvalues mismatch firing first, OP_GET_UPVALUE
-    falls off the closure context.
-  - Investigation: `V3_DBG_FORCE_TRACE` shows the failing chain
-    ends at `attrsets.nix:1627:22` (binaryMerge call).  Need to
-    trace which v3 entry-point dispatches that thunk and verify it
-    propagates the closure correctly.
+* `OP_GET_UPVALUE: no closure context` on `(import <nixpkgs>
+  {}).lib.id 5` was caused by `opt_inline.cc rewriteVar` not walking
+  the new `lexicalWiths` vectors on `LetRec::Entry` /
+  `LetRec::HiddenEntry`.  The trivial-binding inliner aliased some
+  VarIds, but the LetRec entries' `lexicalWiths` retained pre-alias
+  VarIds, which then leaked into fn[0]'s freeVars during
+  computeFreeVars (the stale VarId pointed at a now-dead binding
+  whose only "user" was the un-rewritten `lexicalWiths`).  Lambda /
+  MkThunk lexicalWiths were already rewritten in the main #530
+  commit.
+
+  After the fix, `(import <nixpkgs> {}).lib.id 5` reverts to the
+  PRE-existing `OP_WITH_LOOKUP: name 'callPackage' not found in
+  with-scope` failure documented under
+  project_493_step3d_with_stack — proving the lexical chain change
+  is fully transparent, and the remaining failure is unchanged from
+  before this branch.
+
+REMAINING (unchanged from before #530):
+
+* `OP_WITH_LOOKUP: name 'callPackage' not found in with-scope` —
+  documented in project_493_step3d_with_stack memory.  Likely a
+  with-stack carriage gap through bridged TW thunks in the by-name-
+  overlay machinery.  Independent of the lexical-with chain.
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
