@@ -37,6 +37,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <execinfo.h>
 
 namespace nix::v3 {
 
@@ -2282,6 +2283,60 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     std::getenv("NIX_V3_EAGER_ARG_FORCE") != nullptr;
                 bool needForce = !desc->ellipsis || s_eagerArgForce;
                 if (needForce) {
+                    // STG-12 (#498) diagnostic: see what we're about to
+                    // force at OP_CALL.  V3_DBG_OPCALL_FORCE=1 to enable.
+                    static const bool s_dbg_callforce =
+                        std::getenv("V3_DBG_OPCALL_FORCE") != nullptr;
+                    if (s_dbg_callforce) {
+                        Value chase = arg;
+                        Thunk * blackOnFrames = nullptr;
+                        for (int hops = 0; hops < 16; ++hops) {
+                            if (chase.tag() == Tag::Slot && chase.payload.slot)
+                                chase = *chase.payload.slot;
+                            else if (chase.tag() == Tag::Thunk
+                                     && chase.payload.thunk) {
+                                Thunk * th = chase.payload.thunk;
+                                if (th->state == ThunkState::Evaluated) {
+                                    chase = th->evaluated;
+                                } else if (th->state == ThunkState::Blackhole) {
+                                    for (size_t i = 0; i < vm.frames.size(); ++i)
+                                        if (vm.frames[i].thunk == th) {
+                                            blackOnFrames = th; break;
+                                        }
+                                    break;
+                                } else break;
+                            } else break;
+                        }
+                        if (blackOnFrames) {
+                            const auto & curFr = vm.frames.back();
+                            const LambdaDescriptor * cd = nullptr;
+                            if (curFr.thunk
+                                && (curFr.thunk->state == ThunkState::Suspended
+                                    || curFr.thunk->state == ThunkState::Blackhole))
+                                cd = curFr.thunk->suspended.desc;
+                            else if (curFr.closure) cd = curFr.closure->desc;
+                            const LambdaDescriptor * bd = blackOnFrames->suspended.desc;
+                            std::fprintf(stderr,
+                                "v3 OP_CALL force-arg → BLACK arg-thunk=%s "
+                                "callee=%s formals=%zu ellipsis=%d "
+                                "from-frame=%s ip=%u nUpvalues=%u\n",
+                                bd && !bd->name.empty() ? bd->name.c_str() : "<?>",
+                                desc->name.empty() ? "<?>" : desc->name.c_str(),
+                                desc->formals.size(),
+                                (int)desc->ellipsis,
+                                cd && !cd->name.empty() ? cd->name.c_str() : "<?>",
+                                curFr.ip, (unsigned)desc->nUpvalues);
+                            const auto & tbl = ir::globalSymbolTable();
+                            std::fprintf(stderr, "  callee formals: ");
+                            for (size_t i = 0; i < desc->formals.size() && i < 12; ++i) {
+                                uint32_t nm = desc->formals[i].name;
+                                std::fprintf(stderr, "%s%s", i ? "," : "",
+                                    nm < tbl.size() ? tbl[nm].c_str() : "?");
+                            }
+                            if (desc->formals.size() > 12) std::fprintf(stderr, ",...");
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
                     Value forcedArg = forceValue(vm, arg);
                     if (!desc->ellipsis && forcedArg.isAttrs() && forcedArg.payload.bindings) {
                         // Validation: no extra args for non-ellipsis lambdas.
@@ -2405,6 +2460,58 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // need the full OP_CALL machinery.  We jump back into the
             // OP_CALL case via goto.
             Value arg = pop(vm), fun = pop(vm);
+            // STG-12 diagnostic: when the topmost prev thunk dispatches
+            // TAIL_CALL on a Black-chasing arg, log the fun's tag and
+            // (if closure) name + hasFormals.
+            if (std::getenv("V3_DBG_TC_PRE")) {
+                Value chase = arg;
+                Thunk * blackOnFrames = nullptr;
+                for (int hops = 0; hops < 16; ++hops) {
+                    if (chase.tag() == Tag::Slot && chase.payload.slot)
+                        chase = *chase.payload.slot;
+                    else if (chase.tag() == Tag::Thunk && chase.payload.thunk) {
+                        Thunk * th = chase.payload.thunk;
+                        if (th->state == ThunkState::Evaluated)
+                            chase = th->evaluated;
+                        else if (th->state == ThunkState::Blackhole) {
+                            for (size_t i = 0; i < vm.frames.size(); ++i)
+                                if (vm.frames[i].thunk == th) {
+                                    blackOnFrames = th; break;
+                                }
+                            break;
+                        } else break;
+                    } else break;
+                }
+                if (blackOnFrames) {
+                    const char * funName = "<?>";
+                    int funIsClosure = (int)fun.isClosure();
+                    int funHasFormals = -1;
+                    int funEllipsis = -1;
+                    int funThunkState = -1;
+                    const char * thunkName = "";
+                    if (fun.isClosure() && fun.payload.closure
+                        && fun.payload.closure->desc) {
+                        funName = fun.payload.closure->desc->name.c_str();
+                        funHasFormals = (int)fun.payload.closure->desc->hasFormals;
+                        funEllipsis = (int)fun.payload.closure->desc->ellipsis;
+                    } else if (fun.tag() == Tag::Thunk && fun.payload.thunk) {
+                        funThunkState = (int)fun.payload.thunk->state;
+                        if (fun.payload.thunk->state == ThunkState::Suspended
+                            || fun.payload.thunk->state == ThunkState::Blackhole) {
+                            const auto * d = fun.payload.thunk->suspended.desc;
+                            if (d) thunkName = d->name.c_str();
+                        }
+                    }
+                    std::fprintf(stderr,
+                        "v3 OP_TAIL_CALL pre-dispatch BLACK arg: "
+                        "fun.tag=%d ptr=%p isClosure=%d name=%s hasFormals=%d ellipsis=%d "
+                        "thunkState=%d thunkName=%s\n",
+                        (int)fun.tag(), fun.payload.thunk,
+                        funIsClosure, funName,
+                        funHasFormals, funEllipsis,
+                        funThunkState, thunkName);
+                }
+            }
             if (!fun.isClosure()) {
                 // Push back and replay through OP_CALL.
                 push(vm, fun);
@@ -2421,6 +2528,62 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     std::getenv("NIX_V3_EAGER_ARG_FORCE") != nullptr;
                 bool needForce = !tcDesc->ellipsis || s_eagerArgForce;
                 if (needForce) {
+                    // STG-12 (#498) diagnostic: see what we're about to
+                    // force.  V3_DBG_TAIL_FORCE=1 to enable.
+                    static const bool s_dbg_tcforce =
+                        std::getenv("V3_DBG_TAIL_FORCE") != nullptr;
+                    if (s_dbg_tcforce) {
+                        Value chase = arg;
+                        Thunk * blackOnFrames = nullptr;
+                        for (int hops = 0; hops < 16; ++hops) {
+                            if (chase.tag() == Tag::Slot && chase.payload.slot)
+                                chase = *chase.payload.slot;
+                            else if (chase.tag() == Tag::Thunk
+                                     && chase.payload.thunk) {
+                                Thunk * th = chase.payload.thunk;
+                                if (th->state == ThunkState::Evaluated) {
+                                    chase = th->evaluated;
+                                } else if (th->state == ThunkState::Blackhole) {
+                                    for (size_t i = 0; i < vm.frames.size(); ++i)
+                                        if (vm.frames[i].thunk == th) {
+                                            blackOnFrames = th; break;
+                                        }
+                                    break;
+                                } else break;
+                            } else break;
+                        }
+                        if (blackOnFrames) {
+                            const auto & curFr = vm.frames.back();
+                            const LambdaDescriptor * cd = nullptr;
+                            if (curFr.thunk
+                                && (curFr.thunk->state == ThunkState::Suspended
+                                    || curFr.thunk->state == ThunkState::Blackhole))
+                                cd = curFr.thunk->suspended.desc;
+                            else if (curFr.closure) cd = curFr.closure->desc;
+                            const LambdaDescriptor * bd = blackOnFrames->suspended.desc;
+                            std::fprintf(stderr,
+                                "v3 OP_TAIL_CALL force-arg → BLACK arg-thunk=%s "
+                                "callee=%s formals.size=%zu ellipsis=%d "
+                                "from-frame=%s ip=%u (cu=%p code-off=%u)\n",
+                                bd && !bd->name.empty() ? bd->name.c_str() : "<?>",
+                                tcDesc->name.empty() ? "<?>" : tcDesc->name.c_str(),
+                                tcDesc->formals.size(),
+                                (int)tcDesc->ellipsis,
+                                cd && !cd->name.empty() ? cd->name.c_str() : "<?>",
+                                curFr.ip, (const void *)curFr.cu,
+                                cd ? cd->codeOffset : 0u);
+                            // Print formals names.
+                            const auto & tbl = ir::globalSymbolTable();
+                            std::fprintf(stderr, "  callee formals: ");
+                            for (size_t i = 0; i < tcDesc->formals.size() && i < 8; ++i) {
+                                uint32_t nm = tcDesc->formals[i].name;
+                                std::fprintf(stderr, "%s%s", i ? "," : "",
+                                    nm < tbl.size() ? tbl[nm].c_str() : "?");
+                            }
+                            if (tcDesc->formals.size() > 8) std::fprintf(stderr, ",...");
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
                     Value forcedArg = forceValue(vm, arg);
                     if (!tcDesc->ellipsis && forcedArg.isAttrs() && forcedArg.payload.bindings) {
                         const Bindings * b = forcedArg.payload.bindings;
@@ -5408,6 +5571,211 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
 
 Value forceValue(VMState & vm, Value v)
 {
+    // STG-12 (#498) diagnostic: log the call site (current top frame
+    // CU + ip) when forceValue is invoked with an input that, after
+    // chase, lands on a Black thunk on this VM's frames.  That tells
+    // us which opcode handler is calling forceValue with the cycle
+    // source.  V3_DBG_FORCE_CALLSITE=1 to enable.
+    if (std::getenv("V3_DBG_FORCE_CALLSITE")) {
+        Value chase = v;
+        Thunk * blackOnFrames = nullptr;
+        // Record chase trace for printing.
+        constexpr int kTraceMax = 8;
+        Tag traceTag[kTraceMax] = {};
+        void * tracePtr[kTraceMax] = {};
+        int traceCount = 0;
+        auto recordHop = [&](Value val) {
+            if (traceCount < kTraceMax) {
+                traceTag[traceCount] = val.tag();
+                tracePtr[traceCount] = val.payload.thunk;  // any pointer
+                ++traceCount;
+            }
+        };
+        recordHop(chase);
+        for (int hops = 0; hops < 16; ++hops) {
+            if (chase.tag() == Tag::Slot && chase.payload.slot) {
+                chase = *chase.payload.slot;
+                recordHop(chase);
+            } else if (chase.tag() == Tag::Thunk
+                       && chase.payload.thunk) {
+                Thunk * th = chase.payload.thunk;
+                if (th->state == ThunkState::Evaluated) {
+                    chase = th->evaluated;
+                    recordHop(chase);
+                } else if (th->state == ThunkState::Blackhole) {
+                    // Black on this VM's frames?
+                    for (size_t i = 0; i < vm.frames.size(); ++i) {
+                        if (vm.frames[i].thunk == th) {
+                            blackOnFrames = th; break;
+                        }
+                    }
+                    break;
+                } else {
+                    break;
+                }
+            } else break;
+        }
+        if (blackOnFrames) {
+            const LambdaDescriptor * bd = blackOnFrames->suspended.desc;
+            void * caller = __builtin_return_address(0);
+            std::fprintf(stderr,
+                "v3 forceValue → BLACK on-frames thunk=%p name=%s frames=%zu caller=%p\n",
+                (void *)blackOnFrames,
+                bd && !bd->name.empty() ? bd->name.c_str() : "<?>",
+                vm.frames.size(), caller);
+            // C-stack backtrace via execinfo so we can see who called
+            // public forceValue.
+            {
+                void * cstack[32];
+                int nFrames = ::backtrace(cstack, 32);
+                char ** syms = ::backtrace_symbols(cstack, nFrames);
+                std::fprintf(stderr, "  C-stack (%d frames):\n", nFrames);
+                for (int k = 0; k < nFrames && k < 12; ++k)
+                    std::fprintf(stderr, "    %s\n", syms[k]);
+                if (syms) std::free(syms);
+            }
+            std::fprintf(stderr, "  chase trace (%d hops):", traceCount);
+            for (int k = 0; k < traceCount; ++k) {
+                std::fprintf(stderr, " [%d:tag=%d ptr=%p]",
+                    k, (int)traceTag[k], tracePtr[k]);
+            }
+            std::fprintf(stderr, "\n");
+            // Find which frame holds the BLACK thunk so we can show
+            // it explicitly in the trace.
+            size_t blackIdx = (size_t)-1;
+            for (size_t i = 0; i < vm.frames.size(); ++i) {
+                if (vm.frames[i].thunk == blackOnFrames) {
+                    blackIdx = i; break;
+                }
+            }
+            std::fprintf(stderr, "  blackIdx=%zd\n", (ssize_t)blackIdx);
+            // Backtrace: show the top 12 frames so we can identify the
+            // forceValue caller chain.  Always include the BLACK frame
+            // even if outside the window.
+            size_t n = vm.frames.size();
+            size_t lo = n > 12 ? n - 12 : 0;
+            if (blackIdx != (size_t)-1 && blackIdx < lo) lo = blackIdx;
+            for (size_t i = n; i-- > lo;) {
+                const auto & fr = vm.frames[i];
+                const LambdaDescriptor * d = nullptr;
+                if (fr.thunk
+                    && (fr.thunk->state == ThunkState::Suspended
+                        || fr.thunk->state == ThunkState::Blackhole))
+                    d = fr.thunk->suspended.desc;
+                else if (fr.closure) d = fr.closure->desc;
+                Instruction prev = (fr.cu && fr.ip > 0
+                                    && fr.ip <= fr.cu->code.size())
+                    ? fr.cu->code[fr.ip - 1] : 0;
+                std::fprintf(stderr,
+                    "  fr[%zu]: %s ip=%u prev-op=0x%02x cu=%p flags=0x%x thunk=%p"
+                    " codeOff=%u%s\n",
+                    i,
+                    d && !d->name.empty() ? d->name.c_str() : "<?>",
+                    fr.ip, (unsigned)((prev >> 24) & 0xFF),
+                    (const void *)fr.cu,
+                    (unsigned)fr.flags, (void *)fr.thunk,
+                    d ? d->codeOffset : 0u,
+                    fr.thunk == blackOnFrames ? " ← BLACK" : "");
+                if (fr.cu && fr.ip > 0
+                    && fr.ip <= fr.cu->code.size()) {
+                    // Find the enclosing LambdaDescriptor by scanning the
+                    // cu's funcs (codeOffset closest to but not exceeding
+                    // fr.ip).
+                    const LambdaDescriptor * encl = nullptr;
+                    for (const auto & ld : fr.cu->lambdas) {
+                        if (ld.codeOffset <= fr.ip
+                            && (!encl || ld.codeOffset > encl->codeOffset))
+                            encl = &ld;
+                    }
+                    std::fprintf(stderr, "    enclosing-lambda: %s codeOff=%u nL=%u\n",
+                        encl
+                            ? (encl->name.empty() ? "<?>" : encl->name.c_str())
+                            : "<no-funcs>",
+                        encl ? encl->codeOffset : 0u,
+                        encl ? encl->nLocals : 0u);
+                    // For fr[16] only: dump the full body of the
+                    // enclosing lambda so we can see where ip=157 sits.
+                    static bool dumped_full = false;
+                    if (encl && i == n - 2 && !dumped_full) {
+                        dumped_full = true;
+                        // Find end of this lambda (start of next lambda
+                        // by codeOffset).
+                        uint32_t bodyEnd = (uint32_t)fr.cu->code.size();
+                        for (const auto & ld : fr.cu->lambdas) {
+                            if (ld.codeOffset > encl->codeOffset
+                                && ld.codeOffset < bodyEnd)
+                                bodyEnd = ld.codeOffset;
+                        }
+                        std::fprintf(stderr,
+                            "    full body codeOff=%u..%u:\n",
+                            encl->codeOffset, bodyEnd);
+                        for (uint32_t k = encl->codeOffset; k < bodyEnd; ++k) {
+                            Instruction w = fr.cu->code[k];
+                            std::fprintf(stderr,
+                                "      [%u:%02x %06x]%s\n",
+                                k, (unsigned)((w >> 24) & 0xFF),
+                                (unsigned)(w & 0xFFFFFF),
+                                k == fr.ip ? "  <-- ip" : "");
+                        }
+                        // Dump symbols 1176 (prev) and 138 (the one referenced
+                        // in x's body — see fr[5]'s code).
+                        const auto & tbl = ir::globalSymbolTable();
+                        std::fprintf(stderr, "    sym 1176 = %s   sym 138 = %s\n",
+                            1176u < tbl.size() ? tbl[1176].c_str() : "<?>",
+                            138u < tbl.size() ? tbl[138].c_str() : "<?>");
+                    }
+                    int lo = (int)fr.ip - 6; if (lo < 0) lo = 0;
+                    int hi = (int)fr.ip + 4;
+                    if (hi > (int)fr.cu->code.size())
+                        hi = (int)fr.cu->code.size();
+                    std::fprintf(stderr, "    code: ");
+                    for (int k = lo; k < hi; ++k) {
+                        Instruction w = fr.cu->code[k];
+                        std::fprintf(stderr, "[%d:%02x %06x]%s",
+                            k, (unsigned)((w >> 24) & 0xFF),
+                            (unsigned)(w & 0xFFFFFF),
+                            k == (int)fr.ip ? "*" : " ");
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            const auto & fr = vm.frames.back();
+            const LambdaDescriptor * d = nullptr;
+            if (fr.thunk
+                && (fr.thunk->state == ThunkState::Suspended
+                    || fr.thunk->state == ThunkState::Blackhole))
+                d = fr.thunk->suspended.desc;
+            else if (fr.closure) d = fr.closure->desc;
+            // Print the opcode at ip-1 (the op that was just running)
+            // and ip (next op).
+            if (fr.cu && fr.ip > 0
+                && fr.ip <= fr.cu->code.size()) {
+                // Opcode = top 8 bits of the 32-bit Instruction word.
+                Instruction prev = fr.ip > 0 ? fr.cu->code[fr.ip - 1] : 0;
+                Instruction curr = fr.ip < fr.cu->code.size()
+                    ? fr.cu->code[fr.ip] : 0;
+                std::fprintf(stderr,
+                    "  prev op (ip-1=%u) = 0x%02x  next op (ip=%u) = 0x%02x\n",
+                    fr.ip - 1, (unsigned)((prev >> 24) & 0xFF),
+                    fr.ip, (unsigned)((curr >> 24) & 0xFF));
+                // Also dump a small window so we can see the surrounding
+                // instructions if op alone isn't enough.
+                std::fprintf(stderr, "  ip window: ");
+                int lo = (int)fr.ip - 3; if (lo < 0) lo = 0;
+                int hi = (int)fr.ip + 3;
+                if (hi > (int)fr.cu->code.size())
+                    hi = (int)fr.cu->code.size();
+                for (int k = lo; k < hi; ++k) {
+                    Instruction w = fr.cu->code[k];
+                    std::fprintf(stderr, "[%d:%02x %06x]%s",
+                        k, (unsigned)((w >> 24) & 0xFF),
+                        (unsigned)(w & 0xFFFFFF),
+                        k == (int)fr.ip ? "*" : " ");
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
     // Track the FIRST slot we passed through so we can memoize the
     // final result back into it.  Mirrors tree-walker's behavior:
     // `state.forceValue(*v2)` mutates the slot directly, so a future
