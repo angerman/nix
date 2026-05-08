@@ -382,6 +382,14 @@ std::string serializeCU(const CompilationUnit & cu)
             w.u8(0); w.u8(0); w.u8(0);  // pad to align pos
             w.u32(f.pos);
         }
+        // Schema 4 (#495/#509 STG-13d): native-intrinsic metadata.
+        // Carries kind + upvalue indices for ExtendsBody / ComposeBody
+        // dispatch through the disk cache so cache-loaded CUs participate
+        // in native dispatch instead of running the bytecode body.
+        w.u8(static_cast<uint8_t>(l.intrinsicKind));
+        w.u8(static_cast<uint8_t>(l.intrinsicVar0));  // signed int8 reinterpreted
+        w.u8(static_cast<uint8_t>(l.intrinsicVar1));
+        w.u8(static_cast<uint8_t>(l.intrinsicVar2));
     }
 
     // Section: lambdaCodeOffsets.
@@ -498,6 +506,11 @@ CompilationUnit deserializeCU(std::string_view blob)
                 f.pos        = r.u32();
                 l.formals.push_back(f);
             }
+            // Schema 4 (#495/#509 STG-13d): native-intrinsic metadata.
+            l.intrinsicKind = static_cast<LambdaDescriptor::Intrinsic>(r.u8());
+            l.intrinsicVar0 = static_cast<int8_t>(r.u8());
+            l.intrinsicVar1 = static_cast<int8_t>(r.u8());
+            l.intrinsicVar2 = static_cast<int8_t>(r.u8());
             cu.lambdas.push_back(std::move(l));
         }
     }

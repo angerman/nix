@@ -48,7 +48,14 @@ namespace nix::v3::serialize {
 /// Schema 3 (2026-05-05): added opcode-table fingerprint to the header
 /// so opcode renumbering / addition / deletion can't produce silently-
 /// mis-executing CUs from an older build's cache (REVIEW §1.4).
-constexpr uint32_t kSchemaVersion = 3;
+///
+/// Schema 4 (2026-05-08): #495/#509 STG-13d -- added per-LambdaDescriptor
+/// intrinsicKind (uint8) + intrinsicVar0/1/2 (int8) for native dispatch
+/// of the inner Extends/Compose lambdas.  Without this, cache-loaded CUs
+/// for nixpkgs lib/fixed-points.nix have intrinsicKind=None and the
+/// recogniseIntrinsic-driven native dispatch never fires on cached
+/// loads (the dominant case in production workloads).
+constexpr uint32_t kSchemaVersion = 4;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.
