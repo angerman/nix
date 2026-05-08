@@ -613,6 +613,9 @@ static std::unordered_map<RecBuildCacheKey, RecBuildCacheValue,
     return tbl;
 }
 
+// STG-14b (#516): the shared bridge-thunk cache lives in primops.cc;
+// see primop.hh's getOrAllocBridgeThunkCached doc.
+
 /// Populate `v3SubExprCache` from a freshly lowered + compiled module.
 /// Used by the eval hook (after lower+compile via the cutover) and by
 /// primImport (WC-4) so that imported files contribute their per-thunk
@@ -2596,9 +2599,14 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                     // WC-25: defer the force.  Bridge thunk wraps the
                     // tree-walker Value*; OP_FORCE on the slot
                     // resolves on demand via forceBridgeThunk.
-                    Thunk * bridge = Alloc::allocBridgeThunk(
-                        static_cast<void *>(srcV));
-                    allocStats().thunksAllocated++;
+                    //
+                    // STG-14b (#516): use the per-Value* cached helper
+                    // so re-entries see the SAME Thunk* identity (the
+                    // root cause of the STG_KEEP_HOOKS hang -- without
+                    // this, blackhole detection on Thunk* identity
+                    // fails to terminate cycles that TW handles via
+                    // its per-nix::Value blackhole).
+                    Thunk * bridge = getOrAllocBridgeThunkCached(srcV);
                     Value entry;
                     entry.tag_payload =
                         static_cast<uint64_t>(Tag::Thunk);
@@ -2747,9 +2755,12 @@ static HookPrepResult prepHookUpvaluesAndWiths(
             nix::Value * srcV = cur->values[0];
             if (!srcV)
                 return HookPrepResult::OuterWithEnvWalkOff;
-            Thunk * bridge = Alloc::allocBridgeThunk(
-                static_cast<void *>(srcV));
-            allocStats().thunksAllocated++;
+            // STG-14b (#516): cached Bridge thunk -- see Direct path
+            // above for rationale.  Each TW->v3 re-entry of the same
+            // outer-with frame must see the SAME Thunk* identity so
+            // v3's blackhole detection on Thunk* matches the underlying
+            // nix::Value's blackhole.
+            Thunk * bridge = getOrAllocBridgeThunkCached(srcV);
             Value entry;
             entry.tag_payload =
                 static_cast<uint64_t>(Tag::Thunk);
@@ -3700,8 +3711,10 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     bool fastBridged = tryFastBridgeScalarTwToV3(*arg, v3Arg);
 
     if (!fastBridged) {
-        Thunk * argBridge = Alloc::allocBridgeThunk(static_cast<void *>(arg));
-        allocStats().thunksAllocated++;
+        // STG-14b (#516): cached Bridge thunk -- same Thunk* identity
+        // for repeat re-entries with the same TW arg (so v3's blackhole
+        // detection on Thunk* matches the underlying nix::Value).
+        Thunk * argBridge = getOrAllocBridgeThunkCached(arg);
         v3Arg.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         v3Arg.payload.thunk = argBridge;
     }

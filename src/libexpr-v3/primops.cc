@@ -4138,8 +4138,11 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         // and callClosure both heap-allocate `outTw` for this reason).
         // Stack-local Values would dangle; address identity ALSO
         // matters for in-place updates -- both invariants now hold.
-        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
-        allocStats().thunksAllocated++;
+        // STG-14b (#516): cached bridge thunk -- same Thunk* identity
+        // across all callers wrapping the same nix::Value*, so v3's
+        // blackhole detection on Thunk* matches the underlying Value's
+        // blackhole.
+        Thunk * bridge = getOrAllocBridgeThunkCached(&nv);
         out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         out.payload.thunk = bridge;
         return out;
@@ -4147,8 +4150,8 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
     case nix::nExternal: {
         // REVIEW_2026-05-04 B-9 / §6.7: bridge external values back as
         // a v3 Bridge thunk, mirroring the nFunction case above.
-        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
-        allocStats().thunksAllocated++;
+        // STG-14b (#516): cached.
+        Thunk * bridge = getOrAllocBridgeThunkCached(&nv);
         out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         out.payload.thunk = bridge;
         return out;
@@ -4166,8 +4169,8 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         // pointer (see nFunction case).  TW updates the thunk in place
         // when forced; we MUST observe the post-update value, not a
         // pre-update snapshot.
-        Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(&nv));
-        allocStats().thunksAllocated++;
+        // STG-14b (#516): cached -- preserves identity across re-entries.
+        Thunk * bridge = getOrAllocBridgeThunkCached(&nv);
         out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
         out.payload.thunk = bridge;
         return out;
@@ -6900,6 +6903,33 @@ const std::unordered_map<std::string, PrimOp> & allRegisteredPrimOps()
 
 void setNixEvalState(nix::EvalState * st) { tlNixEvalState = st; }
 nix::EvalState * getNixEvalState() { return tlNixEvalState; }
+
+// STG-14b (#516): shared thread-local Bridge thunk cache.  See
+// primop.hh getOrAllocBridgeThunkCached for full rationale.  The cache
+// is intentionally pointer-keyed without an ABA stamp -- a TW Value
+// may legitimately transition through tThunk -> tAttrs under our
+// Bridge thunk, and we MUST return the same Thunk* across that
+// transition.  Boehm-GC recycling of live Value addresses is rare in
+// practice; the small risk of stale-bridge-on-recycle is worth it for
+// the much larger win of consistent Thunk* identity (which is what
+// v3's blackhole detection uses).
+static std::unordered_map<const nix::Value *, Thunk *> & bridgeThunkCache()
+{
+    thread_local std::unordered_map<const nix::Value *, Thunk *> tbl;
+    return tbl;
+}
+
+Thunk * getOrAllocBridgeThunkCached(nix::Value * srcV)
+{
+    if (!srcV) return nullptr;
+    auto & cache = bridgeThunkCache();
+    auto it = cache.find(srcV);
+    if (it != cache.end()) return it->second;
+    Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(srcV));
+    allocStats().thunksAllocated++;
+    cache.emplace(srcV, bridge);
+    return bridge;
+}
 
 // `clearBridgeTables()` removed in REVIEW_2026-05-06b PR4 hygiene
 // pass -- zero callers; daemon lifetime-aware bridge cleanup is a

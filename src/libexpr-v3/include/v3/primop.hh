@@ -273,6 +273,23 @@ std::optional<Value> tryBridgeAttrLookup(Thunk * t, uint32_t v3name);
 /// callback; now zero TW work after the fast bridge.
 bool tryFastBridgeScalarTwToV3(const nix::Value & nv, Value & out);
 
+/// STG-14b (#516): get-or-create a v3 Bridge thunk for a TW Value*.
+/// Returns the SAME `Thunk*` for repeated calls with the same `srcV`,
+/// so v3's `Thunk*`-keyed blackhole detection terminates the same
+/// recursion patterns TW does (TW's blackhole keys on the underlying
+/// nix::Value, which is shared; without this cache, v3 issues fresh
+/// `Thunk*` per re-entry and never matches its own Black mark).
+///
+/// Pointer-keyed only -- no ABA stamp -- because the underlying TW
+/// Value may legitimately transition (tThunk -> tAttrs etc.) under our
+/// Bridge thunk, and we MUST keep returning the same Bridge thunk
+/// across that transition to preserve blackhole identity.  Boehm-GC
+/// recycling of nix::Value addresses is rare for live values; we
+/// accept that small staleness window over breaking the
+/// blackhole-identity invariant.
+struct Thunk;
+Thunk * getOrAllocBridgeThunkCached(nix::Value * srcV);
+
 
 /// #458 step A.4: existence check sibling to tryBridgeAttrLookup,
 /// for the `attrs ? name` operator (OP_ATTRS_HAS).  Returns:
