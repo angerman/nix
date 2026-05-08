@@ -166,6 +166,12 @@ void rewriteExpr(Expr & expr, const std::unordered_map<VarId, VarId> & alias)
                 for (auto & v : en.outerUpvalues) rewriteVar(v, alias);
             for (auto & he : e.hiddenEntries)
                 for (auto & v : he.outerUpvalues) rewriteVar(v, alias);
+            // #530 lexical-with chain — these ARE populated at lower
+            // time, so rewrite always.
+            for (auto & en : e.entries)
+                for (auto & v : en.lexicalWiths) rewriteVar(v, alias);
+            for (auto & he : e.hiddenEntries)
+                for (auto & v : he.lexicalWiths) rewriteVar(v, alias);
         }
     }, expr);
 }
