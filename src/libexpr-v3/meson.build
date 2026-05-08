@@ -67,6 +67,7 @@ lib_sources = files(
   'v3_hook.cc',
   'disasm.cc',
   'ffi.cc',
+  'print.cc',
 )
 
 this_library = library(
@@ -103,6 +104,7 @@ install_headers(
     'include/v3/disk_cache.hh',
     'include/v3/lower.hh',
     'include/v3/primop.hh',
+    'include/v3/print.hh',
     'include/v3/serialize.hh',
     'include/v3/value.hh',
     'include/v3/vm.hh',
