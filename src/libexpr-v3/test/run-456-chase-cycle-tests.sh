@@ -102,9 +102,15 @@ done
 
 # p4: nixpkgs hello.name.  This is the exact canary that surfaced
 #     the cycle.  Best-effort -- skip if nixpkgs not configured.
+#
+# Runs under STG mode (NIX_V3_STG=1).  The legacy-publish default
+# mode fails on this case at all-packages.nix:2276 (callPackage
+# missing) -- a documented v3 regression that STG mode (no
+# publish/recovery, single-VM) resolves.  See #498 STG-{1..10} and
+# project_498_always_thunkify_regression.md.
 hello_tw=$("$NIX_BIN" eval --raw nixpkgs#hello.name 2>/dev/null) || true
 if [[ -n "$hello_tw" ]]; then
-  hello_v3=$(NIX_USE_V3=1 "$NIX_BIN" eval --raw nixpkgs#hello.name 2>/dev/null) \
+  hello_v3=$(NIX_USE_V3=1 NIX_V3_STG=1 "$NIX_BIN" eval --raw nixpkgs#hello.name 2>/dev/null) \
     || hello_v3="<error>"
   if [[ "$hello_v3" == "$hello_tw" ]]; then
     ok=$((ok + 1))
