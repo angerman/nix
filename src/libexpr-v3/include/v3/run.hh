@@ -15,15 +15,21 @@
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
 #include "v3/value.hh"
+#include "v3/bytecode.hh"
 
 namespace nix {
-class Expr;
+struct Expr;
 class EvalState;
 }
 
 namespace nix::v3 {
 
 /// Lower, compile, and run an already-parsed Expr through v3.
+///
+/// Lifetime: the result Value contains pointers into the
+/// CompilationUnit's `stringConstants` (for OP_LIT_STR / OP_LIT_PATH
+/// literals).  Caller MUST keep the returned `cu` alive for as long as
+/// the Value is reachable; otherwise string/path payloads dangle.
 ///
 /// Side-effects:
 ///   - calls `registerBuiltinPrimOps()` (idempotent — safe to call
@@ -34,14 +40,18 @@ namespace nix::v3 {
 ///   - allocates a fresh VMState internally (or reuses the active one
 ///     via STG-10 if we're being re-entered).
 ///
-/// Returns the result Value in WHNF.  Caller is responsible for any
-/// further forcing / printing / bridging.
+/// Returns the compiled CompilationUnit and the result Value (in WHNF).
+/// Caller is responsible for any further forcing / printing / bridging.
 ///
 /// Pre-conditions:
 ///   - `e` must already have had `bindVars` applied against the
 ///     EvalState's static base env.  Without that, references like
 ///     `builtins.foo` haven't been resolved to (level, displ) and
 ///     the lowerer will fail.
-Value runRootExpr(EvalState & state, Expr * e);
+struct RootResult {
+    CompilationUnit cu;
+    Value value;
+};
+RootResult runRootExpr(EvalState & state, Expr * e);
 
 } // namespace nix::v3

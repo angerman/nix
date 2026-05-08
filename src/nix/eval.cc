@@ -1,4 +1,5 @@
 #include "nix/cmd/command-installable-value.hh"
+#include "nix/cmd/installable-attr-path.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
@@ -6,9 +7,186 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/value-to-json.hh"
 
+// v3 INVERSION step 3 (#526): when NIX_V3_DIRECT_EVAL=1 + --expr/--file
+// installable, bypass `installable->toValue` (which routes through
+// state.eval and TW's eval hook) and run the v3 pipeline directly
+// from parsed Expr to v3::Value to printer output.  No bridge to TW
+// shapes, so the lib.fix formals-closure refusal cycle disappears at
+// the source.
+#include "v3/run.hh"
+#include "v3/print.hh"
+#include "v3/primop.hh"
+#include "v3/alloc.hh"
+#include "v3/ir.hh"
+#include "v3/lower.hh"
+#include "v3/vm.hh"
+
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <iostream>
+#include <set>
+#include <sstream>
+
 namespace nix {
+
+/// v3-direct path for `nix eval --expr/--file`.  Bypasses
+/// `installable->toValue` (which routes through TW's `state.eval` and
+/// the v3 eval hook + bridge) and runs v3 from parsed Expr to result
+/// directly.  Output rendered by v3's own printer.
+///
+/// Returns true if the v3-direct path handled the command; false if
+/// the caller should fall through to the existing TW path.
+///
+/// Currently handles: --expr / --file with -A attrPath, --apply,
+/// --raw, --json, default print.  Falls back to TW for: flake
+/// installables (no --expr/--file), --write-to (recursive directory
+/// emission depends on TW Value shape), autoArgs (--arg/--argstr —
+/// not yet routed through v3-direct).
+static bool runV3DirectEval(
+    EvalState & state,
+    SourceExprCommand & cmd,
+    Installable & installable,
+    bool raw,
+    bool json,
+    std::optional<std::string> apply,
+    std::optional<std::filesystem::path> writeTo)
+{
+    // --write-to is recursive directory emission; falls back to TW.
+    if (writeTo) return false;
+    // autoArgs not yet supported on the v3-direct path.
+    if (cmd.getAutoArgs(state)->size() > 0) return false;
+
+    // We need the user's --expr / --file.  Without one of these we
+    // can't reconstruct the expression for v3 (the installable's
+    // already-evaluated TW Value is a one-shot bridge dead-end —
+    // re-using it would defeat the inversion's purpose).
+    if (!cmd.expr && !cmd.file) return false;
+
+    // Only handle InstallableAttrPath shapes (the kind constructed
+    // from --expr/--file + positional attrPath).  Flake installables
+    // need different machinery — Phase 2.
+    if (!dynamic_cast<InstallableAttrPath *>(&installable)) return false;
+    // Read the attrPath through the public virtual `Installable::what`
+    // (the override in InstallableAttrPath is private but virtual
+    // access is resolved against the static type at the call site).
+    std::string attrPath = installable.what();  // e.g. "lib.fix" or "" for root.
+
+    // Re-parse the expression directly.  Same logic as
+    // libcmd/installables.cc:464-474 but writing to a v3 path instead
+    // of `state.eval`.
+    Expr * e;
+    if (cmd.file) {
+        if (*cmd.file == "-") {
+            e = state.parseStdin();
+        } else {
+            auto dir = absPath(cmd.getCommandBaseDir());
+            e = state.parseExprFromFile(
+                lookupFileArg(state, cmd.file->string(), &dir));
+        }
+    } else {
+        auto dir = absPath(cmd.getCommandBaseDir());
+        e = state.parseExprFromString(*cmd.expr, state.rootPath(dir.string()));
+    }
+    e->bindVars(state, state.staticBaseEnv);
+
+    // Run v3 pipeline.  Returns (cu, value) — keep cu alive for the
+    // lifetime of the value (string / path payloads point into
+    // cu->stringConstants).  setNixEvalState is wired internally;
+    // primops that need TW (import, derivation strict-merge) reach
+    // back via the global pointer.
+    auto rootResult = v3::runRootExpr(state, e);
+    v3::Value r = rootResult.value;
+
+    // Set up a VMState for further forcing / callClosure work.  STG-10
+    // (vm.cc:5530+) ensures a single VMState is shared across re-
+    // entries within this thread, but we still need an outer frame
+    // for the chase loops to land on.  Push a synthetic frame on
+    // rootResult.cu so dispatchLoop's `vm.frames.back().cu` is valid
+    // when callClosure / forceValue need to run inner thunks.
+    v3::VMState vm;
+    vm.frames.push_back(v3::CallFrame{
+        .cu = &rootResult.cu, .closure = nullptr, .thunk = nullptr,
+        .ip = rootResult.cu.entryOffset, .stackBaseOffset = 0,
+        .withStackBase = 0, .flags = 0,
+    });
+
+    // Force the result to WHNF so attr/list access works.
+    r = v3::forceValue(vm, r);
+
+    // -A attrPath descent: split on '.' and lookup successive attrs.
+    if (!attrPath.empty()) {
+        std::string segment;
+        for (size_t i = 0; i <= attrPath.size(); ++i) {
+            if (i == attrPath.size() || attrPath[i] == '.') {
+                if (!segment.empty()) {
+                    if (!r.isAttrs() || !r.payload.bindings) {
+                        state.error<EvalError>(
+                            "v3-direct -A: '%1%' is not an attrset",
+                            segment).debugThrow();
+                    }
+                    auto sid = v3::ir::globalInternSymbol(segment);
+                    const v3::Value * found = r.payload.bindings->lookup(sid);
+                    if (!found) {
+                        state.error<EvalError>(
+                            "v3-direct -A: attribute '%1%' not found",
+                            segment).debugThrow();
+                    }
+                    r = v3::forceValue(vm, *found);
+                    segment.clear();
+                }
+            } else {
+                segment.push_back(attrPath[i]);
+            }
+        }
+    }
+
+    // --apply: run the apply expression and call it on the descended
+    // value.  Allocates its own cu so the apply expr has a stable IR
+    // home; the cu must outlive any string/path payloads produced by
+    // the call (same reason rootResult.cu sticks around).
+    std::optional<v3::RootResult> applyResult;
+    if (apply) {
+        auto dir = absPath(cmd.getCommandBaseDir());
+        Expr * applyE = state.parseExprFromString(
+            *apply, state.rootPath(dir.string()));
+        applyE->bindVars(state, state.staticBaseEnv);
+        applyResult.emplace(v3::runRootExpr(state, applyE));
+        v3::Value applyV = v3::forceValue(vm, applyResult->value);
+        r = v3::callClosure(vm, applyV, r);
+        r = v3::forceValue(vm, r);
+    }
+
+    // Render.  Same dispatch as the TW path: --raw → string-coerce,
+    // --json → toJsonValue, default → printNixValue.
+    if (raw) {
+        // String-coerce: deep-force, demand a Tag::String.  No context
+        // tracking here (we'd need to lift coerceToString into v3 for
+        // full parity; that's Phase 2 work).  For now, accept only
+        // already-string values.
+        r = v3::forceDeep(vm, r);
+        if (r.tag() != v3::Tag::String) {
+            state.error<EvalError>(
+                "v3-direct --raw: result is not a string (tag=%1%)",
+                (int)r.tag()).debugThrow();
+        }
+        std::string_view sv = r.payload.str ? r.payload.str : "";
+        std::cout.write(sv.data(), (std::streamsize)sv.size());
+    } else if (json) {
+        r = v3::forceDeep(vm, r);
+        std::cout << v3::toJsonValue(r, v3::ir::globalSymbolTable()).dump() << "\n";
+    } else {
+        // Default print.  forceDeep so nested thunks render as values.
+        r = v3::forceDeep(vm, r);
+        std::ostringstream os;
+        v3::printNixValue(os, r, v3::ir::globalSymbolTable());
+        logger->cout("%s", os.str());
+    }
+
+    return true;
+}
 
 struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
 {
@@ -63,6 +241,21 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             throw UsageError("--raw and --json are mutually exclusive");
 
         auto state = getEvalState();
+
+        // v3 INVERSION step 3 (#526): when NIX_V3_DIRECT_EVAL=1, try
+        // the v3-direct path first.  If it handles the command (--expr/
+        // --file shape, no autoArgs, no --write-to), we're done — no
+        // bridge cycles, no fallback retries.  Otherwise fall through
+        // to the existing TW path which still goes via state.eval +
+        // hooks + bridges (and may succeed or hit the lib.fix issue).
+        static const bool s_directEval =
+            std::getenv("NIX_V3_DIRECT_EVAL") != nullptr;
+        if (s_directEval) {
+            if (runV3DirectEval(*state, *this, *installable, raw, json,
+                                 apply, writeTo)) {
+                return;
+            }
+        }
 
         auto [v, pos] = installable->toValue(*state);
         NixStringContext context;

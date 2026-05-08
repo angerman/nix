@@ -18,7 +18,7 @@
 
 namespace nix::v3 {
 
-Value runRootExpr(nix::EvalState & state, nix::Expr * e)
+RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
 {
     // Idempotent: register the builtin primop table on first call.
     // Safe to call per-invocation — the underlying registry is global
@@ -43,14 +43,18 @@ Value runRootExpr(nix::EvalState & state, nix::Expr * e)
     // knows which upvalues each closure captures.
     ir::computeFreeVars(module);
 
-    // Compile IR to bytecode.  Single-pass, returns a CompilationUnit
-    // owning instructions + LambdaDescriptor table.
-    auto cu = compile(module);
+    // Compile IR to bytecode.  The CompilationUnit owns
+    // `stringConstants` referenced by OP_LIT_STR / OP_LIT_PATH; the
+    // resulting Value's string/path payloads point into that vector.
+    // Return the cu by-move so caller keeps it alive alongside the
+    // Value.
+    RootResult out{compile(module), Value{}};
 
     // Run.  STG-10 (vm.cc:5530) automatically routes through
     // `runOnExistingVm` if we're re-entered from another v3 dispatch
     // loop — so calling `runRootExpr` from inside a primop is safe.
-    return run(cu);
+    out.value = run(out.cu);
+    return out;
 }
 
 } // namespace nix::v3
