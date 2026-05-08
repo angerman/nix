@@ -6169,9 +6169,16 @@ Value forceValue(VMState & vm, Value v)
             // dumps the frame stack so the cycle source is visible.
             static const bool s_dbg = std::getenv("V3_DBG_OPCYCLE") != nullptr;
             if (s_dbg) {
+                // suspended.desc is only valid for Suspended/Blackhole
+                // thunks — reading it on Bridge/Evaluated thunks accesses
+                // the wrong union variant and the resulting `desc->name`
+                // segfaults silently, terminating the dump after one
+                // frame.  Guard the read.
                 auto frameInfo = [&](Thunk * th, const Closure * cl, uint32_t fip) -> std::string {
                     const LambdaDescriptor * desc = nullptr;
-                    if (th) desc = th->suspended.desc;
+                    if (th && (th->state == ThunkState::Suspended
+                            || th->state == ThunkState::Blackhole))
+                        desc = th->suspended.desc;
                     else if (cl) desc = cl->desc;
                     if (!desc) return "<closure-body>";
                     char buf[256];
@@ -6181,7 +6188,10 @@ Value forceValue(VMState & vm, Value v)
                         desc->codeOffset, desc->nUpvalues, desc->nLocals);
                     return buf;
                 };
-                const LambdaDescriptor * tdesc = t ? t->suspended.desc : nullptr;
+                const LambdaDescriptor * tdesc =
+                    (t && (t->state == ThunkState::Suspended
+                        || t->state == ThunkState::Blackhole))
+                    ? t->suspended.desc : nullptr;
                 std::fprintf(stderr,
                     "v3 forceValue Black thunk=%p frames=%zu desc.name=%s desc.code=%u\n",
                     (void*)t, vm.frames.size(),
