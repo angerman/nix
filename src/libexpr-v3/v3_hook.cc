@@ -2698,6 +2698,37 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                         for (size_t i = 0; i < pairs.size(); ++i) {
                             b->entries[i].name  = pairs[i].first;
                             b->entries[i].value = pairs[i].second;
+                            // STG-14b option (a): wire bridge -> cell so
+                            // the Bridge's first force writes the
+                            // resolved value into the Bindings entry
+                            // slot.  Without this, the entry stays as
+                            // Tag::Thunk{bridge} forever even after
+                            // the bridge resolves to its TW value;
+                            // foreign-VMState observers reading
+                            // entries[i].value see the still-Bridge
+                            // tag and re-force, but the resolution
+                            // memo lives in `t->evaluated`, not at
+                            // entries[i].value.  The cell propagates
+                            // the result so all consumers (including
+                            // those who read entries[i].value as
+                            // already-WHNF, e.g., via Tag::Slot deref)
+                            // see the same resolved value.
+                            //
+                            // Safety: the entry was just set to
+                            // Tag::Thunk{bridge}; we know
+                            // entries[i].value.payload.thunk == bridge.
+                            // The Bindings is GC-allocated and
+                            // reachable for as long as the cache /
+                            // upvalues hold it, so &entries[i].value
+                            // is a stable cell pointer for the
+                            // bridge's lifetime.  Only set if cell
+                            // unset (idempotent across re-entries that
+                            // hit the recBuildCache).
+                            Thunk * bridge =
+                                pairs[i].second.payload.thunk;
+                            if (bridge && bridge->cell == nullptr) {
+                                bridge->cell = &b->entries[i].value;
+                            }
                         }
                         cache.emplace(k, RecBuildCacheValue{b, slot0});
                     }

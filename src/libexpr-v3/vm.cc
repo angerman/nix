@@ -3357,6 +3357,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 Value resolved = forceBridgeThunk(t);
                 t->state = ThunkState::Evaluated;
                 t->evaluated = resolved;
+                // STG-14b option (a): cell update protocol on Bridge
+                // thunks.  Mirrors STG-8's OP_RETURN cell-update for
+                // Suspended thunks.  When prepHookUpvaluesAndWiths
+                // builds a per-Bindings-entry Bridge with
+                // bridge->cell = &entries[i].value, this single write
+                // propagates the resolved TW value into every consumer
+                // observing entries[i].value (inner+outer call-hook
+                // entries that share the recBuildCache Bindings).
+                // Without it, only `t->evaluated` is set, but new
+                // observers reading entries[i].value still see Tag::Thunk{t};
+                // they hit the memo only via OP_FORCE on the same t,
+                // and any view that picked up entries[i].value as a
+                // pre-thunk-state Tag::Slot stays out of sync.
+                if (Value * cell = t->cell) {
+                    *cell = resolved;
+                    t->cell = nullptr;
+                }
                 push(vm, resolved);
                 break;
             }
@@ -6364,6 +6381,15 @@ Value forceValue(VMState & vm, Value v)
             v = forceBridgeThunk(t);
             t->state = ThunkState::Evaluated;
             t->evaluated = v;
+            // STG-14b option (a): cell update protocol on Bridge
+            // thunks (mirror of OP_FORCE Bridge handler above).
+            // When the Bridge was built with a cell pointing at a
+            // Bindings entry slot, this write propagates the resolved
+            // TW value into all observers of that entry.
+            if (Value * cell = t->cell) {
+                *cell = v;
+                t->cell = nullptr;
+            }
             // #456 fix: treat a TW-Function-bridged Thunk as WHNF.
             // forceBridgeThunk -> treeWalkerToV3 wraps an nFunction
             // TW Value as ANOTHER Bridge thunk (Tag::Thunk in Bridge
