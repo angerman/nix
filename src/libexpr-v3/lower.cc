@@ -1651,6 +1651,40 @@ struct Lowerer
             // `with self;`-driven environments under default eval.
             // Stay narrow until that's root-caused (#497 follow-on).
             if (k == nix::Expr::Kind::OpUpdate) return true;
+            // #529: `inherit (X) Y` where X is a with-resolved Var
+            // (e.g. `with pkgs; ... inherit (nix-update) script;` from
+            // pkgs/top-level/all-packages.nix:196).  Eager lowering
+            // emits OP_WITH_LOOKUP on `nix-update` immediately during
+            // attrset construction; the with-scope (`pkgs` =
+            // mid-construction `self`) is still Black, so the lookup
+            // throws "cycle while resolving 'nix-update'" / blackhole.
+            // Thunkifying defers the with-lookup until `Y` is forced,
+            // matching TW's lazy `inherit (X) Y` semantics.
+            //
+            // Bare ExprVar with fromWith (no Select) is the canonical
+            // form; the self-dot heuristic above already covers
+            // ExprSelect-on-fromWith-Var (its v->fromWith check
+            // explicitly excludes those — they fall through to here).
+            if (k == nix::Expr::Kind::Var) {
+                auto * v = static_cast<nix::ExprVar *>(fx);
+                if (v->fromWith) return true;
+            }
+            // #529 follow-up: ExprCall whose head is a fromWith Var
+            // (e.g. `inherit (callPackages ../some/path { }) name1
+            // name2;` from pkgs/top-level/all-packages.nix:532).  The
+            // eager lowering of the call forces `callPackages` via
+            // OP_WITH_LOOKUP; the with-scope is `pkgs` mid-construction
+            // so the lookup throws "cycle while resolving 'callPackages'".
+            // Same fix as the bare-Var case: thunkify so the call runs
+            // at the consumer's force time, by which point `pkgs` has
+            // settled.
+            if (k == nix::Expr::Kind::Call) {
+                auto * c = static_cast<nix::ExprCall *>(fx);
+                if (c && c->fun && c->fun->exprKind == nix::Expr::Kind::Var) {
+                    auto * fv = static_cast<nix::ExprVar *>(c->fun);
+                    if (fv->fromWith) return true;
+                }
+            }
             return false;
         };
 

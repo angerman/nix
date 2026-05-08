@@ -128,6 +128,39 @@ run_pair "level-0 multi-attr inherit-self" '
       v = mk { sub = { a = 1; b = 2; }; };
   in v.a + v.b'
 
+# REGRESSION — `with self;` + `inherit (X) Y` where X is a fromWith Var
+# (#529).  The canonical nixpkgs all-packages.nix:196 shape:
+#   with pkgs;
+#   {
+#     inherit (nix-update) nix-update-script;
+#   }
+# Eager lowering of `nix-update` forces the with-stack `pkgs` which is
+# mid-construction when `self = rattrs self` is being computed.
+# Thunkifying defers the with-lookup until the `nix-update-script`
+# entry is forced.
+run_pair "with-self inherit-from-Var" '
+  let
+    makeExt = rattrs: let self = rattrs self; in self;
+    pkgs = makeExt (self: with self; {
+      nix-update = "u";
+      nix-update-script = "us";
+      inherit (nix-update) something;
+    });
+  in pkgs.nix-update'
+
+# REGRESSION — `with self;` + `inherit (callExpr X) Y` (#529 follow-up).
+# The from-expr is an ExprCall whose head is a fromWith Var.  Same fix
+# class as the bare-Var case.  Mirrors nixpkgs all-packages.nix:532
+# `inherit (callPackages ../some/path { }) name1 name2;`.
+run_pair "with-self inherit-from-Call" '
+  let
+    makeExt = rattrs: let self = rattrs self; in self;
+    pkgs = makeExt (self: with self; {
+      mkSet = path: { greeting = "g"; };
+      inherit (mkSet ./somewhere) greeting;
+    });
+  in pkgs.greeting'
+
 echo "=== self-dot-thunkify test results ==="
 echo "  passing: $ok"
 echo "  failing: $fail"
