@@ -2795,18 +2795,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // STG-11 (#498): diagnostic — log the retry value's
                 // shape so we can see what's about to be re-forced.
                 // V3_DBG_RETRY=1 dumps each retry's retVal tag + chase.
-                if (retry && std::getenv("V3_DBG_RETRY")) {
+                // V3_DBG_RETRY_BLACK=1 only logs when the retry's
+                // chain would hit a Black thunk (= the cycle source).
+                if (retry &&
+                    (std::getenv("V3_DBG_RETRY")
+                     || std::getenv("V3_DBG_RETRY_BLACK")))
+                {
                     Value chase = retVal;
                     int hops = 0;
                     Thunk * retryThunk = nullptr;
-                    while (hops < 4) {
-                        if (chase.tag() == Tag::Slot && chase.payload.slot)
+                    Thunk * blackHit = nullptr;
+                    while (hops < 16) {
+                        if (chase.tag() == Tag::Slot && chase.payload.slot) {
                             chase = *chase.payload.slot;
-                        else if (chase.tag() == Tag::Thunk
-                                 && chase.payload.thunk
-                                 && chase.payload.thunk->state == ThunkState::Evaluated)
-                            chase = chase.payload.thunk->evaluated;
-                        else break;
+                        } else if (chase.tag() == Tag::Thunk
+                                   && chase.payload.thunk) {
+                            Thunk * th = chase.payload.thunk;
+                            if (th->state == ThunkState::Evaluated) {
+                                chase = th->evaluated;
+                            } else if (th->state == ThunkState::Blackhole) {
+                                blackHit = th;
+                                break;
+                            } else {
+                                break;
+                            }
+                        } else break;
                         ++hops;
                     }
                     if (retVal.tag() == Tag::Thunk
@@ -2816,21 +2829,46 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                              && retVal.payload.slot
                              && retVal.payload.slot->tag() == Tag::Thunk)
                         retryThunk = retVal.payload.slot->payload.thunk;
-                    std::fprintf(stderr,
-                        "v3 OP_RETURN retry: retVal.tag=%d chase.tag=%d",
-                        (int)retVal.tag(), (int)chase.tag());
-                    if (retryThunk) {
-                        const LambdaDescriptor * d =
-                            retryThunk->state == ThunkState::Suspended
-                                ? retryThunk->suspended.desc : nullptr;
+                    bool onlyBlack = std::getenv("V3_DBG_RETRY_BLACK")
+                        != nullptr;
+                    if (!onlyBlack || blackHit) {
                         std::fprintf(stderr,
-                            " thunk=%p state=%d desc.name=%s",
-                            (void *)retryThunk,
-                            (int)retryThunk->state,
-                            d && !d->name.empty() ? d->name.c_str() : "<?>");
+                            "v3 OP_RETURN retry: retVal.tag=%d chase.tag=%d hops=%d",
+                            (int)retVal.tag(), (int)chase.tag(), hops);
+                        if (blackHit) {
+                            const LambdaDescriptor * bd =
+                                blackHit->suspended.desc;
+                            std::fprintf(stderr,
+                                " BLACK thunk=%p name=%s code=%u",
+                                (void *)blackHit,
+                                bd && !bd->name.empty() ? bd->name.c_str() : "<?>",
+                                bd ? bd->codeOffset : 0);
+                        }
+                        if (retryThunk) {
+                            const LambdaDescriptor * d =
+                                retryThunk->state == ThunkState::Suspended
+                                || retryThunk->state == ThunkState::Blackhole
+                                    ? retryThunk->suspended.desc : nullptr;
+                            std::fprintf(stderr,
+                                " retryThunk=%p state=%d name=%s",
+                                (void *)retryThunk,
+                                (int)retryThunk->state,
+                                d && !d->name.empty() ? d->name.c_str() : "<?>");
+                        }
+                        // Dump caller frame name so we know where the
+                        // retry fires from.
+                        const LambdaDescriptor * cd = nullptr;
+                        if (caller.thunk
+                            && (caller.thunk->state == ThunkState::Suspended
+                                || caller.thunk->state == ThunkState::Blackhole))
+                            cd = caller.thunk->suspended.desc;
+                        else if (caller.closure)
+                            cd = caller.closure->desc;
+                        std::fprintf(stderr,
+                            " caller.name=%s frames=%zu\n",
+                            cd && !cd->name.empty() ? cd->name.c_str() : "<?>",
+                            vm.frames.size());
                     }
-                    std::fprintf(stderr, " frames=%zu\n",
-                        vm.frames.size());
                 }
                 push(vm, retVal);
                 if (retry)
