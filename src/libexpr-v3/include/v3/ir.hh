@@ -103,6 +103,18 @@ struct Lambda {
     /// Free vars of the body, in the order the body expects to read them
     /// via OP_GET_UPVALUE.  Populated by computeFreeVars before emit.
     std::vector<VarId> freeVars;
+
+    /// #530 lexical-with chain — outermost-first VarIds of every
+    /// enclosing `with X;` in lexical scope at this Lambda's creation
+    /// site.  Materialised by the lowerer at lambda-creation time
+    /// from `Scope::Kind::With` entries on the scopes stack.  Emit
+    /// pushes these values BEFORE freeVars; OP_MAKE_CLOSURE consumes
+    /// them and stuffs them into the resulting Closure's
+    /// `capturedWiths` ListVec.  Order matches the order
+    /// OP_WITH_LOOKUP walks (outermost-first), so a name lookup inside
+    /// the closure's body finds the with-target whose attrset binds
+    /// the name innermost-first when scanned in reverse.
+    std::vector<VarId> lexicalWiths;
 };
 
 /// Strict (single-arg) function application.  In v3, OP_CALL takes one arg;
@@ -123,6 +135,17 @@ struct Force { VarId thunk; int srcLine = 0; };
 struct MkThunk {
     FuncId             funcIdx;
     std::vector<VarId> freeVars;
+
+    /// #530 lexical-with chain — outermost-first VarIds of every
+    /// enclosing `with X;` in lexical scope at this MkThunk's
+    /// creation site.  Materialised by the lowerer at thunkify time
+    /// from `Scope::Kind::With` entries on the scopes stack.  Emit
+    /// pushes these values BEFORE freeVars; OP_MAKE_THUNK consumes
+    /// them and stuffs them into the resulting Thunk's
+    /// `suspended.capturedWiths` ListVec, replacing the runtime
+    /// snapshot of the with-stack as the source of truth for the
+    /// thunk's lexical with-environment.
+    std::vector<VarId> lexicalWiths;
 };
 
 // --- Attribute sets ---
@@ -260,6 +283,11 @@ struct LetRec {
         /// counting the rec attrset (which is implicitly upvalue 0).
         /// Populated by computeFreeVars.
         std::vector<VarId>  outerUpvalues;
+
+        /// #530 lexical-with chain — outermost-first VarIds of every
+        /// enclosing `with X;` in lexical scope at this LetRec entry's
+        /// thunk-body creation site.  Materialised by the lowerer.
+        std::vector<VarId>  lexicalWiths;
     };
     std::vector<Entry> entries;
 
@@ -276,6 +304,12 @@ struct LetRec {
         VarId               hiddenVar;
         FuncId              thunkBody;
         std::vector<VarId>  outerUpvalues;
+
+        /// #530 lexical-with chain — outermost-first VarIds of every
+        /// enclosing `with X;` in lexical scope at this hidden
+        /// from-expr thunk's creation site.  Materialised by the
+        /// lowerer.
+        std::vector<VarId>  lexicalWiths;
     };
     std::vector<HiddenEntry> hiddenEntries;
 };
@@ -348,6 +382,18 @@ struct Function {
     /// order they appear as upvalues at runtime.  Populated by
     /// computeFreeVars before emit.
     std::vector<VarId>  freeVars;
+
+    /// #530 lexical-with chain — count of with-target VarIds the
+    /// MAKE_THUNK / MAKE_CLOSURE opcode for this Function pushes
+    /// before its upvalue block.  Mirrors the size of the
+    /// `lexicalWiths` field on the IR node (ir::Lambda /
+    /// ir::MkThunk / ir::LetRec::Entry / ir::LetRec::HiddenEntry)
+    /// that creates this Function.  Carried through to
+    /// LambdaDescriptor::nWithTargets so the runtime can pop the
+    /// right number of values.  Populated at the IR-creation site
+    /// (lowerer) by simply mirroring `lexicalWiths.size()`; emit
+    /// reads it back into LambdaDescriptor.
+    uint16_t            nWithTargets = 0;
 
     /// Optional name for diagnostics (e.g. lambda or attribute name).
     std::string         name;

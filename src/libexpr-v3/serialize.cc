@@ -317,7 +317,7 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
         } else if (op == OP_CALL_PRIMOP) {
             ip++;  // primop-index follow-up
         } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
-            ip++;  // nUpvalues follow-up
+            ip += 2;  // nUpvalues + nWithTargets (#530)
         }
         // All other opcodes either have no trailing data or no
         // SymbolIds in their data; leave ip alone.
@@ -375,6 +375,8 @@ std::string serializeCU(const CompilationUnit & cu)
         w.u8(l.hasFormals);
         w.u8(l.ellipsis);
         w.u8(0);  // _pad
+        // Schema 5 (#530): per-descriptor with-target count.
+        w.u32(l.nWithTargets);
         w.u32(static_cast<uint32_t>(l.formals.size()));
         for (auto & f : l.formals) {
             w.u32(f.name);
@@ -496,6 +498,8 @@ CompilationUnit deserializeCU(std::string_view blob)
             l.hasFormals    = r.u8();
             l.ellipsis      = r.u8();
             r.u8();  // _pad
+            // Schema 5 (#530): per-descriptor with-target count.
+            l.nWithTargets  = static_cast<uint16_t>(r.u32());
             uint32_t nFormals = r.u32();
             l.formals.reserve(nFormals);
             for (uint32_t j = 0; j < nFormals; ++j) {

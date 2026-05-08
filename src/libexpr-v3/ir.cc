@@ -139,6 +139,14 @@ void collectExprRefs(const Expr & expr, std::unordered_set<VarId> & refs)
         } else if constexpr (std::is_same_v<T, Lambda> ||
                              std::is_same_v<T, MkThunk>) {
             for (auto v : e.freeVars) refs.insert(v);
+            // #530 lexical-with chain: lexicalWiths VarIds are
+            // emitted from the maker's frame at MAKE_THUNK /
+            // MAKE_CLOSURE time (alongside freeVars), so they must
+            // appear in the maker function's freeVars set too if the
+            // with-target was bound in an enclosing function.  Treat
+            // them as direct refs of this binding to give the same
+            // free-var-analysis treatment that freeVars receive.
+            for (auto v : e.lexicalWiths) refs.insert(v);
         } else if constexpr (std::is_same_v<T, App>) {
             refs.insert(e.fun); refs.insert(e.arg);
         } else if constexpr (std::is_same_v<T, Force>) {
@@ -191,6 +199,14 @@ void collectExprRefs(const Expr & expr, std::unordered_set<VarId> & refs)
             // captures from the LetRec's containing block.
             for (auto & he : e.hiddenEntries)
                 for (auto v : he.outerUpvalues) refs.insert(v);
+            // #530 lexical-with chain: the lexicalWiths VarIds are
+            // also emitted from the maker frame's value stack at
+            // OP_MAKE_THUNK time (alongside outerUpvalues), so they
+            // need to flow into the surrounding function's freeVars.
+            for (auto & en : e.entries)
+                for (auto v : en.lexicalWiths) refs.insert(v);
+            for (auto & he : e.hiddenEntries)
+                for (auto v : he.lexicalWiths) refs.insert(v);
         } else if constexpr (std::is_same_v<T, Not>) {
             refs.insert(e.operand);
         } else if constexpr (std::is_same_v<T, And> ||

@@ -331,15 +331,30 @@ struct Emitter
     // -- Functions
     void emitOne(const ir::Lambda & e)
     {
+        // #530 lexical-with chain — push with-target VarIds FIRST so
+        // they sit BELOW the upvalue block on the value stack.
+        // OP_MAKE_CLOSURE pops nUpvalues then nWithTargets in that
+        // order (top-down).
+        for (auto wv : e.lexicalWiths) emitVarRef(wv);
         for (auto fv : e.freeVars) emitVarRef(fv);
         unit.code.push_back(encode(OP_MAKE_CLOSURE, e.funcIdx));
         unit.code.push_back(static_cast<uint32_t>(e.freeVars.size()));
+        unit.code.push_back(static_cast<uint32_t>(e.lexicalWiths.size()));
+        // Mirror count into LambdaDescriptor::nWithTargets.  This
+        // function emit may run before the descriptor is built (the
+        // function-emit loop populates descriptors in a later pass);
+        // we populate the descriptor separately in `compile()` from
+        // `Function::lexicalWiths` after free-var convergence.  Here
+        // we only encode the count into the bytecode stream.
     }
     void emitOne(const ir::MkThunk & e)
     {
+        // Same push order as ir::Lambda — see comment there.
+        for (auto wv : e.lexicalWiths) emitVarRef(wv);
         for (auto fv : e.freeVars) emitVarRef(fv);
         unit.code.push_back(encode(OP_MAKE_THUNK, e.funcIdx));
         unit.code.push_back(static_cast<uint32_t>(e.freeVars.size()));
+        unit.code.push_back(static_cast<uint32_t>(e.lexicalWiths.size()));
     }
     void emitOne(const ir::App & e)
     {
@@ -606,9 +621,13 @@ struct Emitter
         // 05-08.md).
         for (auto & he : e.hiddenEntries) {
             const auto & ff = m.functions[he.thunkBody].freeVars;
+            // #530 lexical-with chain — push with-target VarIds FIRST
+            // so they sit BELOW the upvalue block.
+            for (auto wv : he.lexicalWiths) emitVarRef(wv);
             for (auto fv : ff) emitVarRef(fv);
             unit.code.push_back(encode(OP_MAKE_THUNK, he.thunkBody));
             unit.code.push_back(static_cast<uint32_t>(ff.size()));
+            unit.code.push_back(static_cast<uint32_t>(he.lexicalWiths.size()));
             uint16_t hiddenSlot = getOrAssignSlot(he.hiddenVar);
             unit.code.push_back(encode(OP_THUNK_SET_LOCAL_THROUGH_CELL, hiddenSlot));
         }
@@ -650,9 +669,12 @@ struct Emitter
                             "    var=%u -> UNBOUND\n", (unsigned)fv);
                 }
             }
+            // #530 lexical-with chain — push with-target VarIds FIRST.
+            for (auto wv : en.lexicalWiths) emitVarRef(wv);
             for (auto fv : ff) emitVarRef(fv);
             unit.code.push_back(encode(OP_MAKE_THUNK, en.thunkBody));
             unit.code.push_back(static_cast<uint32_t>(ff.size()));
+            unit.code.push_back(static_cast<uint32_t>(en.lexicalWiths.size()));
             unit.code.push_back(encode(OP_ATTRS_REC_SET, entryToSlot[i]));
         }
         // After all SETs, apply __overrides if the rec contains it —
@@ -948,6 +970,11 @@ struct Emitter
             .arity          = static_cast<uint8_t>(f.argName != ir::kInvalidSymbol ? 1 : (f.hasFormals ? 1 : 0)),
             .hasFormals     = static_cast<uint8_t>(f.hasFormals ? 1 : 0),
             .ellipsis       = static_cast<uint8_t>(f.ellipsis ? 1 : 0),
+            // #530 lexical-with chain — mirror the count from
+            // ir::Function (populated by the lowerer).  Runtime uses
+            // this to consume the with-target block before the
+            // upvalue block at OP_MAKE_CLOSURE / OP_MAKE_THUNK.
+            .nWithTargets   = f.nWithTargets,
             .formals        = {},
             .name           = f.name,
             .posHandle      = f.posHandle,

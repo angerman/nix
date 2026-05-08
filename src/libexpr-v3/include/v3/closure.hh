@@ -173,6 +173,17 @@ struct LambdaDescriptor
     uint8_t  hasFormals;    // 0 = simple arg, 1 = formals attrset
     uint8_t  ellipsis;      // formals with `...` accept extra args; otherwise reject
 
+    /// #530 lexical-with chain — the count of with-target VarIds this
+    /// closure / thunk captures into its `capturedWiths` ListVec at
+    /// MAKE time.  Set by emit from the lowerer-populated
+    /// ir::Lambda::lexicalWiths / ir::MkThunk::lexicalWiths /
+    /// ir::LetRec::Entry::lexicalWiths chains.  OP_MAKE_CLOSURE /
+    /// OP_MAKE_THUNK pop `nUpvalues + nWithTargets` values; the with-
+    /// target block is consumed first (it sits BELOW the upvalue
+    /// block on the stack — pushed first by the maker frame), then
+    /// the upvalue block.
+    uint16_t nWithTargets = 0;
+
     /// Formal parameters (`{a, b ? def}: body`).  Each entry is
     /// (name SymbolId, hasDefault, posHandle).  posHandle is an index
     /// into the global posSnapshotPool; 0 means unknown.  Used by

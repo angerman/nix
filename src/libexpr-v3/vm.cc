@@ -1341,13 +1341,35 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_MAKE_CLOSURE: {
             uint32_t funcIdx = operand;
             uint16_t nUp = static_cast<uint16_t>(cu->code[ip++]);
+            // #530 lexical-with chain — second data word is the count
+            // of with-target Values pushed BELOW the upvalue block on
+            // the value stack.
+            uint16_t nWiths = static_cast<uint16_t>(cu->code[ip++]);
             Closure * c = Alloc::allocClosure(nUp);
             allocStats().closuresAllocated++;
             c->desc = &cu->lambdas[funcIdx];
             c->cu   = cu;
             c->nUpvalues = nUp;
-            c->capturedWiths = snapshotCurrentWiths(vm);
+            // Pop upvalues first (they sit on TOP of stack), then pop
+            // the with-target block beneath.  Build capturedWiths
+            // outermost-first by filling reverse into the ListVec.
             for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
+            if (nWiths > 0) {
+                ListVec * lws = Alloc::allocList(nWiths);
+                for (uint16_t i = nWiths; i > 0; --i)
+                    lws->elems[i - 1] = pop(vm);
+                c->capturedWiths = lws;
+            } else {
+                // No lexical `with` enclosing this lambda — fall back
+                // to runtime-snapshot path for top-level cases like
+                // primop bridges where the lowerer didn't see the
+                // creation site (e.g., synthesized closures from
+                // setNixEvalState glue).  Concrete v3-lowered code
+                // will always set nWiths==0 only when there are
+                // genuinely no enclosing `with` scopes, so the
+                // snapshot returns nullptr too — safe overlap.
+                c->capturedWiths = snapshotCurrentWiths(vm);
+            }
             // #498 v2: log ALL super lambdas being made (V3_DBG_MAKE_SUPER_ALL).
             if (std::getenv("V3_DBG_MAKE_SUPER_ALL")
                 && c->desc && c->desc->name == "super") {
@@ -1546,15 +1568,29 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_MAKE_THUNK: {
             uint32_t funcIdx = operand;
             uint16_t nUp = static_cast<uint16_t>(cu->code[ip++]);
+            // #530 lexical-with chain — see OP_MAKE_CLOSURE for the
+            // protocol.  Second data word is the with-target count;
+            // the with-targets sit BELOW the upvalues on the stack.
+            uint16_t nWiths = static_cast<uint16_t>(cu->code[ip++]);
             Thunk * t = Alloc::allocThunkSuspended(nUp);
             allocStats().thunksAllocated++;
             // The "descriptor" we use is the LambdaDescriptor for the
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
             t->suspended.desc = &cu->lambdas[funcIdx];
-            t->suspended.capturedWiths = snapshotCurrentWiths(vm);
             t->suspended.cu = cu;
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
+            if (nWiths > 0) {
+                ListVec * lws = Alloc::allocList(nWiths);
+                for (uint16_t i = nWiths; i > 0; --i)
+                    lws->elems[i - 1] = pop(vm);
+                t->suspended.capturedWiths = lws;
+            } else {
+                // No lexical with-chain at the creation site — fall
+                // back to runtime snapshot for parity with synthetic
+                // make-paths (see OP_MAKE_CLOSURE comment).
+                t->suspended.capturedWiths = snapshotCurrentWiths(vm);
+            }
             // #498: trace MK_THUNK for thunks named "res" with nUp=4
             // (the all-packages.nix `let res = ...` thunk) and dump
             // captured upvalues to identify which freeVars[1] is.
@@ -3986,7 +4022,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                                             d3.codeOffset, d3.codeOffset + 6);
                                                     }
                                                 }
-                                                cur += 2;
+                                                // #530: encode word + nUpvalues + nWithTargets.
+                                                cur += 3;
                                             } else {
                                                 cur++;
                                             }
@@ -4872,7 +4909,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                             d2.nUpvalues, flo, fhi);
                                         disassembleWindow(stderr, *cu, flo, fhi);
                                     }
-                                    cur += 2;  // op + nUp data
+                                    // #530: op + nUp + nWiths data.
+                                    cur += 3;
                                 } else {
                                     cur++;
                                 }

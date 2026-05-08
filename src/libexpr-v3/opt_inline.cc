@@ -111,6 +111,8 @@ void rewriteExpr(Expr & expr, const std::unordered_map<VarId, VarId> & alias)
             // freeVars empty pre-computeFreeVars; rewrite anyway in
             // case a future pipeline change populates it earlier.
             for (auto & v : e.freeVars) rewriteVar(v, alias);
+            // #530 lexical-with chain — same discipline.
+            for (auto & v : e.lexicalWiths) rewriteVar(v, alias);
         } else if constexpr (std::is_same_v<T, App>) {
             rewriteVar(e.fun, alias); rewriteVar(e.arg, alias);
         } else if constexpr (std::is_same_v<T, Force>) {

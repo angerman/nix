@@ -106,6 +106,18 @@ struct Scope
     /// `kInvalid` when the let-rec emit path doesn't synthesise the
     /// slot (e.g., test-only builds compiled before the slot path).
     ir::VarId recSlotVar = ir::kInvalid;
+
+    /// #530 lexical-with chain — the IR VarId of this `with` scope's
+    /// `attrs` expression.  Set only on `Kind::With` scopes pushed by
+    /// `lowerWith`; collectLexicalWiths() walks the scopes stack and
+    /// gathers these VarIds (outermost-first) into MkThunk / Lambda
+    /// `lexicalWiths`, so that thunks and closures created inside a
+    /// `with X;` body materialise their captured-with chain at make
+    /// time from the *static* lexical structure rather than from a
+    /// runtime snapshot of the with-stack.
+    ///
+    /// `kInvalid` on every non-With-kind scope.
+    ir::VarId withTargetVar = ir::kInvalid;
 };
 
 struct Lowerer
@@ -178,6 +190,43 @@ struct Lowerer
     explicit Lowerer(const nix::SymbolTable & st) : symbols(st) {}
     Lowerer(const nix::SymbolTable & st, const nix::PosTable & pt)
         : symbols(st), positions(&pt) {}
+
+    /// #530 lexical-with chain — collect the IR VarIds of every
+    /// enclosing `with X;` scope, in outermost-first order, that lies
+    /// **within the current function frame**.  We stop walking outward
+    /// at the first Kind::Lambda boundary because a closure / thunk
+    /// emitted in this frame has its own freeVars list for vars that
+    /// crossed the lambda boundary; the lexical-with chain we attach
+    /// here is consumed by emit at MAKE time using emitVarRef, which
+    /// itself handles upvalue translation if a `with`-target VarId
+    /// resolves to an upvalue of the maker function.  In other words
+    /// emit doesn't care whether the var is local or upvalue — but to
+    /// stay symmetric with how freeVars are populated we collect all
+    /// With scopes regardless of whether they cross a Lambda
+    /// boundary; computeFreeVars's collectExprRefs will route the
+    /// VarIds into the maker function's freeVars set if needed.
+    ///
+    /// Order is outermost-first: the first VarId in the returned
+    /// vector is the OUTERMOST enclosing `with` (closest to file
+    /// root); the last is the INNERMOST.  This matches the order
+    /// `pushCapturedWiths` pushes onto the runtime with-stack so
+    /// OP_WITH_LOOKUP's reverse scan finds innermost-binds-first.
+    std::vector<ir::VarId> collectLexicalWiths() const
+    {
+        std::vector<ir::VarId> out;
+        out.reserve(scopes.size());
+        // Walk outermost-first (front-to-back), keeping every
+        // Kind::With scope's withTargetVar.  We do NOT stop at the
+        // Kind::Lambda boundary — the With-chain is a global lexical
+        // property of the source location.  emit / runtime handle the
+        // upvalue translation if a with-target VarId came from a
+        // surrounding function.
+        for (const Scope & s : scopes) {
+            if (s.kind == Scope::Kind::With && s.withTargetVar != ir::kInvalid)
+                out.push_back(s.withTargetVar);
+        }
+        return out;
+    }
 
     ir::SymbolId internSym(nix::Symbol s)
     {
@@ -403,7 +452,14 @@ struct Lowerer
         blockStack.pop_back();
         funcStack.pop_back();
 
-        return addBinding(ir::MkThunk{fid, /*freeVars*/ {}});
+        // #530 lexical-with chain — capture the lexical with-targets
+        // visible at the thunkify site so the resulting thunk's
+        // capturedWiths are populated from the static structure.
+        std::vector<ir::VarId> lws = collectLexicalWiths();
+        m.functions[fid].nWithTargets =
+            static_cast<uint16_t>(lws.size());
+        return addBinding(
+            ir::MkThunk{fid, /*freeVars*/ {}, lws});
     }
 
     /// Wrap a VarId in a Force if it might not be in WHNF.  Cheap:
@@ -1191,7 +1247,15 @@ struct Lowerer
         // by AST kind.
         m.subExprFuncs.push_back({static_cast<const void *>(e), fid});
 
-        return addBinding(ir::Lambda{ fid, /*freeVars*/ {} });
+        // #530 lexical-with chain — capture the lexical with-targets
+        // visible at this lambda's creation site so the resulting
+        // closure's capturedWiths are populated from the static
+        // structure.
+        std::vector<ir::VarId> lws = collectLexicalWiths();
+        m.functions[fid].nWithTargets =
+            static_cast<uint16_t>(lws.size());
+        return addBinding(
+            ir::Lambda{ fid, /*freeVars*/ {}, lws });
     }
     ir::VarId lowerCall(nix::ExprCall * e)
     {
@@ -1427,7 +1491,14 @@ struct Lowerer
         blockStack.pop_back();
         funcStack.pop_back();
 
-        return addBinding(ir::MkThunk{fid, /*freeVars*/ {}});
+        // #530 lexical-with chain — capture the lexical with-targets
+        // visible at this thunkify site so the resulting thunk's
+        // capturedWiths are populated from the static structure.
+        std::vector<ir::VarId> lws = collectLexicalWiths();
+        m.functions[fid].nWithTargets =
+            static_cast<uint16_t>(lws.size());
+        return addBinding(
+            ir::MkThunk{fid, /*freeVars*/ {}, lws});
     }
     ir::VarId lowerNot(nix::ExprOpNot * e)
     {
@@ -2228,11 +2299,26 @@ struct Lowerer
         ir::LetRec letRec;
         letRec.recVar = recVar;
         letRec.entries.reserve(pending.size());
+        // #530 lexical-with chain — capture the chain ONCE at the
+        // LetRec construction site; every per-entry thunk and every
+        // hidden from-expr thunk created here lives at the same
+        // lexical position (the source `let-rec` form), so they share
+        // the chain.  Per-entry inner `with` scopes are seen INSIDE
+        // the entry body's lowering and would attach to thunks built
+        // there.
+        std::vector<ir::VarId> letRecWiths = collectLexicalWiths();
+        const uint16_t nWiths =
+            static_cast<uint16_t>(letRecWiths.size());
         for (auto & p : pending) {
             ir::LetRec::Entry en;
             en.name = internSym(p.sym);
             en.thunkBody = p.funcIdx;
             en.pos = p.posHandle;
+            en.lexicalWiths = letRecWiths;
+            // Mirror count into Function::nWithTargets so the
+            // descriptor-build pass sees a consistent value.
+            if (p.funcIdx < m.functions.size())
+                m.functions[p.funcIdx].nWithTargets = nWiths;
             letRec.entries.push_back(std::move(en));
         }
         // REVIEW HIGH-4 follow-up: attach hidden from-expr thunks.
@@ -2241,6 +2327,9 @@ struct Lowerer
             ir::LetRec::HiddenEntry he;
             he.hiddenVar = ph.hiddenVar;
             he.thunkBody = ph.thunkBody;
+            he.lexicalWiths = letRecWiths;
+            if (ph.thunkBody < m.functions.size())
+                m.functions[ph.thunkBody].nWithTargets = nWiths;
             letRec.hiddenEntries.push_back(std::move(he));
         }
         m.blocks[blockStack.back()].bindings.push_back(
@@ -2465,11 +2554,38 @@ struct Lowerer
         }
         auto bodyB = m.freshBlock();
         blockStack.push_back(bodyB);
-        // Push an empty placeholder scope: nix's bindVars counts the
-        // with's env as a level when resolving ExprVar in the body, so
-        // v3's `scopes` stack must match that depth or resolveVar's
-        // (level, displ) lookup falls off the end.
-        scopes.emplace_back();
+        // Push a Kind::With scope that records the with-target VarId
+        // (#530 lexical-with chain).  nix's bindVars counts the with's
+        // env as a level when resolving ExprVar in the body, so v3's
+        // `scopes` stack must match that depth or resolveVar's (level,
+        // displ) lookup falls off the end.  In addition, the scope
+        // carries `withTargetVar` so collectLexicalWiths() can collect
+        // a static outermost-first chain for thunks / closures created
+        // anywhere in the body.
+        //
+        // `withTargetVar` records the TARGET expression's VarId — this
+        // is what gets re-emitted at MAKE_THUNK / MAKE_CLOSURE time so
+        // the thunk/closure's `capturedWiths` are populated from the
+        // lexical with-chain rather than from a runtime snapshot of
+        // the with-stack.
+        //
+        // Always use the lowered `attrs` VarId (the result of
+        // `lowerExpr(e->attrs)`).  When `attrs` is a rec-attrset
+        // entry, the lowerer already produces a Tag::Slot reference
+        // (RecBindingSlotRef on `recSlotVar`) for it — heap-stable —
+        // so capturing `attrs` directly gives the right value.  We
+        // intentionally do NOT route through `withRecAttrsVar` here:
+        // that var points at the WHOLE rec-attrset, and combining it
+        // with `withRecAttrsName` would require re-running an
+        // OP_REC_BINDING_SLOT_REF at MAKE time, which doesn't compose
+        // with the simple `emitVarRef` push-and-pop protocol the
+        // lexical-with chain uses.  The slot tag carried by `attrs`
+        // is what makes formals + `with` work (the slot persists
+        // beyond the maker frame's lifetime via Bindings allocation).
+        Scope withScope;
+        withScope.kind = Scope::Kind::With;
+        withScope.withTargetVar = attrs;
+        scopes.emplace_back(std::move(withScope));
         ir::VarId rv = lowerExpr(e->body);
         scopes.pop_back();
         setReturn(rv);

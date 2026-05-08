@@ -106,10 +106,10 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wswitch-enum"
     switch (op) {
-    // Multi-word: nUpvalues following.
+    // Multi-word: nUpvalues + nWithTargets (#530) following.
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:
-        return 1;
+        return 2;
     // OP_ATTRS_INIT[n] then 2*n words (name, pos pairs).
     case OP_ATTRS_INIT:
         return 2 * operand;

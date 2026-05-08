@@ -55,7 +55,16 @@ namespace nix::v3::serialize {
 /// for nixpkgs lib/fixed-points.nix have intrinsicKind=None and the
 /// recogniseIntrinsic-driven native dispatch never fires on cached
 /// loads (the dominant case in production workloads).
-constexpr uint32_t kSchemaVersion = 4;
+///
+/// Schema 5 (2026-05-08): #530 lexical-with chain -- OP_MAKE_THUNK and
+/// OP_MAKE_CLOSURE now carry a SECOND data word (`nWithTargets`) after
+/// the existing `nUpvalues` data word, and LambdaDescriptor gains a
+/// `nWithTargets` (uint16) field.  At MAKE time the runtime pops
+/// nUpvalues followed by nWithTargets values; the with-target block
+/// is materialised into the resulting Closure / Thunk's
+/// `capturedWiths` ListVec.  Replaces `snapshotCurrentWiths` as the
+/// source of truth for the lexical with-chain.
+constexpr uint32_t kSchemaVersion = 5;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.
