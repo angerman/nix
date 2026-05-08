@@ -123,8 +123,8 @@ assert_eq "p2 TW=v3-default" "$p2_tw" "$p2_v3"
 assert_eq "p2 TW=v3-skip (lambda-skip + fix-point inherit-from)" \
     "$p2_tw" "$p2_v3_skip"
 
-# p2 strict — v3 ideally owns the evaluation without triggering the
-# WC-1 `run threw` fallback.  History:
+# p2 strict — v3 owns the evaluation without triggering the WC-1
+# `run threw` TW fallback.  History:
 #   #466/#482 fix: lambda-skip + thunkifyForAttr keeps from-exprs
 #       lazy, eliminating eager mid-construction force.  At that
 #       point the self-referential force was masked by the
@@ -132,23 +132,18 @@ assert_eq "p2 TW=v3-skip (lambda-skip + fix-point inherit-from)" \
 #       attrset — which happened to be the right shape for
 #       self.trivial access, so v3 owned the evaluation cleanly.
 #   #496 fix (2026-05-07): partialBindings registration restricted
-#       to OP_ATTRS_REC_INIT (publishing every non-rec attrset
-#       construction is wrong — it pollutes the outer thunk's
-#       partial bindings with unrelated sub-expression values, see
-#       repro-495-broader-thunkify-bug.nix for the failure mode).
-#       Side-effect: this lambda-skip path no longer has the partial-
-#       bindings safety net, so the self-referential mid-construction
-#       force now surfaces as BlackholeError → TW fallback.  Result
-#       is still correct ("1.0").  Removing the fallback requires a
-#       deeper change (lazy from-expr threading across the whole
-#       inherit-from + apply-overrides chain).
+#       to OP_ATTRS_REC_INIT.  Side-effect: this lambda-skip path
+#       lost the partial-bindings safety net so the mid-construction
+#       force surfaced as BlackholeError → TW fallback (runThrew=1).
+#   #530 fix (2026-05-08): lexical-with chain materialises
+#       capturedWiths statically at MAKE_THUNK time, so the inner
+#       inherit-from thunk no longer trips the mid-construction
+#       force.  v3 owns the evaluation cleanly: runThrew=0.
 #
-# Until that deeper change lands, accept runThrew=1 here.  The
-# negative regression is the assertion: silently going BACK to
-# runThrew=0 without the deeper change would mean partialBindings
-# pollution has crept back in.
+# Regression asserts runThrew=0 — going back to 1 means we regressed
+# either the lexical chain or the from-expr lazy thunkify path.
 p2_v3_skip_runthrew=$(NIX_USE_V3=1 NIX_V3_LAMBDA_SKIP=1 count_run_threw "$TMP/p2.nix")
-assert_eq "p2 v3-skip runThrew=1 (TW fallback, post-#496)" "1" "$p2_v3_skip_runthrew"
+assert_eq "p2 v3-skip runThrew=0 (v3 owns eval, post-#530)" "0" "$p2_v3_skip_runthrew"
 
 # ----------------------------------------------------------------------
 # p3 — NEGATIVE: inherit-from with unused name (must stay lazy).  TW

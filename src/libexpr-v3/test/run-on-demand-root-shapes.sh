@@ -136,24 +136,27 @@ if [[ -e "$repro_455" ]]; then
   fi
   echo "=== #455 EAGER_BRIDGE_MAX=10000 override knob: passes ==="
 
-  # Negative-of-positive: with NIX_V3_NO_CALL_HOOK_EAGER=1 (disable
-  # the auto-eager fix) the minimal repro should fail again.  This
-  # proves the auto-eager-bridge guard is what's actually closing
-  # the cycle.  If this assertion FLIPS (no-eager produces correct
-  # output), it means the lazy-bridge cycle was fixed elsewhere
-  # and the auto-eager guard is now redundant.
+  # Post-#530 regression: with NIX_V3_NO_CALL_HOOK_EAGER=1 (auto-eager
+  # bridge guard disabled) the minimal repro now produces the correct
+  # output too.  Originally this was the NEGATIVE-OF-POSITIVE
+  # assertion (no-eager MUST fail to prove auto-eager was what closed
+  # the cycle).  The lexical-with chain (#530) made the captured-with
+  # propagation static, removing the underlying lazy-bridge slot
+  # aliasing that the auto-eager guard was working around.  The
+  # guard is now redundant for this shape; assert correctness rather
+  # than failure so a regression in the lexical chain is caught.
   no_eager_out=$(NIX_USE_V3=1 NIX_V3_ON_DEMAND_ROOT=1 NIX_V3_SKIP_THRESHOLD=0 \
             NIX_V3_NO_CALL_HOOK_EAGER=1 "$NIX_BIN" \
             eval --no-eval-cache --json -f "$repro_455" 2>/dev/null) \
     || no_eager_out="<failed>"
   if [[ "$no_eager_out" == "$tw_out" ]]; then
-    echo
-    echo "=== #455 NEGATIVE-OF-POSITIVE has FLIPPED ==="
-    echo "  NIX_V3_NO_CALL_HOOK_EAGER=1 now produces correct output."
-    echo "  The auto-eager guard may be redundant -- check if a deeper"
-    echo "  fix landed and remove the guard to simplify."
+    echo "=== #455 NIX_V3_NO_CALL_HOOK_EAGER=1 + ON_DEMAND_ROOT: passes (post-#530) ==="
   else
-    echo "=== #455 NIX_V3_NO_CALL_HOOK_EAGER=1 still fails (auto-eager doing the work) ==="
+    echo
+    echo "=== #455 NIX_V3_NO_CALL_HOOK_EAGER=1 REGRESSED ==="
+    echo "  Post-#530 expected this shape to work without the auto-eager"
+    echo "  guard.  TW: $tw_out  no-eager: $no_eager_out"
+    exit 1
   fi
 fi
 

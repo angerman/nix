@@ -290,17 +290,18 @@ fi
 # d3a: Simple `fixedPoints.fix` with stub `lib = null` works under both
 #      intrinsic dispatch and parse-precompile.
 #
-# d3b: Full `(import <nixpkgs/lib>).fix ext` is currently a known-fail
-#      under v3 with NIX_V3_PARSE_PRECOMPILE=1.  The targeted thunkify
-#      heuristic in pushInheritFromCache (level==0 self-dot pattern)
-#      catches the simple `self: { inherit (self.X) Y }` reproducer
-#      but doesn't reach nixpkgs lib's nested-let case where `self`
-#      sits at level >= 1.  A broader heuristic (level <= 1 or any
-#      ExprSelect-on-non-with-Var) introduces a different "OP_ATTRS_
-#      SELECT: attribute not found" regression in nixpkgs all-packages.
-#      A precise lambda-parameter-reference detection is the proper
-#      fix; until then, assert the documented failure mode so silent
-#      changes are caught.
+# d3b: Full `(import <nixpkgs/lib>).fix ext`.
+#
+#      History:
+#      - Originally KNOWN-FAIL: the targeted thunkify heuristic in
+#        pushInheritFromCache (level==0 self-dot pattern) catches the
+#        simple `self: { inherit (self.X) Y }` reproducer but didn't
+#        reach nixpkgs lib's nested-let case where `self` sits at
+#        level >= 1.
+#      - Closed by the lexical-with chain (#530): the static
+#        materialisation of capturedWiths at MAKE_THUNK time now
+#        survives the level>=1 nested-let, so d3b returns 11 with no
+#        SELF_DOT_MAX_LEVEL workaround.
 if [[ -x "$NIX_BIN" ]]; then
   cat > "$TMP/d3a.nix" <<'EOF'
 let
@@ -323,26 +324,25 @@ let
   ext = self: { a = 1; b = self.a + 10; };
 in (lib.fix ext).b
 EOF
-  # d3b-default: KNOWN-FAIL.  Full lib.fix loops at level 0 because the
-  # nested-let `inherit (self.fixedPoints) fix` sits at level 1.  The
-  # default heuristic only catches level==0, so the eager from-expr
-  # tries to force `self` mid-construction.  Asserted as failing so
-  # silent changes are caught when the upvalue-capture bug landed.
+  # d3b-default: POSITIVE post-#530.  Full lib.fix returns 11 with the
+  # default settings.  The lexical-with chain materialises captured
+  # withs from the static structure at MAKE_THUNK time, eliminating
+  # the eager mid-construction force that previously surfaced as
+  # "infinite recursion".  Regression-asserted as 11 so silent
+  # reintroduction of the level>=1 bug is caught.
   d3b_out=$(timeout 20 env NIX_USE_V3=1 NIX_V3_INTRINSIC_DISPATCH=1 \
     NIX_V3_PARSE_PRECOMPILE=1 "$NIX_BIN" eval --impure -f "$TMP/d3b.nix" 2>&1)
-  d3b_exit=$?
-  if echo "$d3b_out" | grep -q "infinite recursion" || [[ $d3b_exit -ne 0 ]]; then
+  if echo "$d3b_out" | grep -q '^11$'; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    fail_names+=("d3b default: known-fail assertion stale (got: $(echo "$d3b_out" | tail -1))")
+    fail_names+=("d3b default: expected 11, got: $(echo "$d3b_out" | tail -3)")
   fi
 
-  # d3b-optin: NIX_V3_SELF_DOT_MAX_LEVEL=2 walks the lambda chain
-  # through the intermediate `let` and thunkifies `self.fixedPoints`.
-  # MUST return 11.  This is the lib.fix workaround that's safe to
-  # enable per-eval until the upvalue-capture bug for deeper-nested
-  # patterns is root-caused.
+  # d3b-optin: NIX_V3_SELF_DOT_MAX_LEVEL=2 still works (and is now a
+  # superset of default behaviour since #530 closed the level>=1 gap).
+  # Kept as a regression check that the wider heuristic doesn't itself
+  # introduce a different shape failure.
   d3b_optin_out=$(timeout 20 env NIX_USE_V3=1 NIX_V3_INTRINSIC_DISPATCH=1 \
     NIX_V3_PARSE_PRECOMPILE=1 NIX_V3_SELF_DOT_MAX_LEVEL=2 \
     "$NIX_BIN" eval --impure -f "$TMP/d3b.nix" 2>&1)
