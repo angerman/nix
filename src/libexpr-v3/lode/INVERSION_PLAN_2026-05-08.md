@@ -123,6 +123,69 @@ of v3 closures.  `.fix` accessor returns a v3 Tag::Closure.  v3's
 printer prints `«lambda fix @ ...»`.  No bridge.  No fallback retry.
 No cycle.
 
+## Phase 1 result — landed 2026-05-08
+
+Phase 1 ships in 4 commits:
+
+1. `bcd041fc9` — lift v3 printer + forceDeep + JSON renderer to public header.
+2. `eb7b385fd` — add `runRootExpr` helper.
+3. `cd490979f` — wire `NIX_V3_DIRECT_EVAL` gate in `CmdEval::run`.
+4. `10189b368` — regression test (`run-direct-eval-tests.sh`, 26/26 pass).
+
+The v3-direct path is wired and works for the 26 representative shapes in
+the regression test (scalars, lists, attrs, let/let-rec, lambdas with
+formals, conditionals, primops, JSON output).  Existing TW path
+unaffected; lang-tests stay 142/142, cutover-parity stays 140/142.
+
+What v3-direct revealed: **the lib.fix cycle was masking an underlying
+v3 evaluator bug**, not a bridge issue.
+
+Under `NIX_V3_DIRECT_EVAL=1`:
+- `(import <nixpkgs> {}).hello.name` fails with `OP_ATTRS_SELECT:
+  attribute not found` — `self` (lib's fix-point parameter) chases
+  to a Bindings of size=1 with key `callLibs` (the inner let-rec's
+  bindings) instead of the outer fix-point.
+- The standalone `v3-eval` binary fails on the SAME expression with
+  the SAME error.  v3-direct's behavior matches v3-eval — the
+  inversion correctly decoupled from the bridge cycle.
+
+The bug is documented at lower.cc:1546-1568 as a known
+"wrong-upvalue-capture bug in the thunkify path under deep nesting"
+— `inherit (self.X) Y` inside `let X = ...; in {...}` where the
+let-rec bumps the level offset.  Default `NIX_V3_SELF_DOT_MAX_LEVEL=0`
+only thunkifies at the immediately-enclosing lambda; nixpkgs lib
+hits level=1 (across the inner `let callLibs = ...`).
+
+Setting `NIX_V3_SELF_DOT_MAX_LEVEL=1` swaps this for a different bug
+(`OP_WITH_LOOKUP: name 'nix-update' not found in with-scope`) — a
+separate upvalue-capture issue under the broader thunkify path.
+
+**Phase 1 success criteria met.**  Bridge bug architecturally bypassed
+on the v3-direct path; remaining failures are pre-existing v3 bugs
+that hook-mode previously masked via TW fallback.
+
+## Phase 2+ — remaining work
+
+The v3-direct path now exposes the actual bugs to fix:
+
+a. **#524-#527 follow-up: lib.fix self.trivial wrong-upvalue capture**
+   — when `inherit (self.X) Y` lowers via blanket thunkify with
+   level≥1, the synthesized hidden thunk captures the WRONG `self`
+   (the inner let-rec's bindings instead of the outer lambda
+   parameter).  Root-cause is in lower.cc thunkify path's freeVar
+   resolution under deep nesting.
+
+b. **flake installables** — `nix eval nixpkgs#hello.name` (option 2a:
+   keep flake resolution in TW, one-shot bridge to v3 once resolved).
+
+c. **autoArgs** (`--arg` / `--argstr`) on the v3-direct path.
+
+d. **`--write-to`** recursive directory emission.
+
+e. **other CLI commands** — `nix build`, `nix run`,
+   `nix-instantiate` — each has its own eval entry that needs the
+   same `NIX_V3_DIRECT_EVAL` gate.
+
 ## First-week scope
 
 A focused first sprint can land Phase 1 in 4 commits:
