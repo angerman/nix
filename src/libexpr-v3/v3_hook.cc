@@ -3936,7 +3936,118 @@ struct V3HookRegistrar {
 
 [[maybe_unused]] V3HookRegistrar _v3_hook_registrar_instance;
 
+/// STG-14a (#509/#515): direct v3-side dispatch for a TW lambda whose
+/// body has been pre-lowered to v3 IR.  Used by vm.cc OP_CALL Bridge
+/// handler to AVOID the `v3ToTreeWalkerPublic(arg)` step that today
+/// forces a v3 Tag::Slot/Tag::Thunk arg into TW format -- the throw
+/// site for the nixpkgs hello.name STG_KEEP_HOOKS cycle (STG-12).
+///
+/// Mirrors v3CallFunctionEntry's gates + dispatch but takes the arg
+/// as a v3 Value directly (not nix::Value*).  No TW round-trip on the
+/// arg side; the body's freeVars are still materialised by walking
+/// funTw.lambda().env (TW env), with each TW upvalue wrapped as a v3
+/// Bridge thunk lazily (preserves laziness without eager forces).
+///
+/// Return convention:
+///   true  -- body ran in v3; v3Out holds the result (still a v3 Value).
+///   false -- funTw doesn't qualify (not a TW lambda, body not in
+///            v3SubExprCache, gate failure, or body threw).  Caller
+///            must fall through to the existing TW-bridge dispatch.
+static bool tryDispatchTWLambdaInV3Inner(nix::EvalState & state,
+                                          nix::Value & funTw,
+                                          Value v3Arg,
+                                          Value & v3Out)
+{
+    // 1. Must be a TW lambda with a non-null Expr* and env.
+    if (!funTw.isLambda()) return false;
+    nix::ExprLambda * lambda = funTw.lambda().fun;
+    if (!lambda) return false;
+    nix::Env * envPtr = funTw.lambda().env;
+    if (!envPtr) return false;
+
+    // 2. Look up in v3SubExprCache.  If the body isn't pre-lowered,
+    //    bail -- caller takes the TW round-trip.
+    static const bool s_dbg =
+        std::getenv("V3_DBG_TW_LAMBDA_INV3") != nullptr;
+    auto reject = [&](const char * reason) -> bool {
+        if (s_dbg) std::fprintf(stderr,
+            "v3 tryDispatchTWLambdaInV3: REJECT lambda=%p (%s)\n",
+            (void *)lambda, reason);
+        return false;
+    };
+    auto & subCache = v3SubExprCache();
+    auto it = subCache.find(static_cast<const nix::Expr *>(lambda));
+    if (it == subCache.end()) return reject("not in cache");
+    auto & ent = it->second;
+    if (!ent.cu) return reject("no cu");
+    if (ent.isPhaseBSkipped()) return reject("PhaseBSkipped");
+    if (!ent.isLambda) return reject("not isLambda ent");
+
+    // 3. Closure-result refusal mirrors v3CallFunctionEntry:#436 --
+    //    don't run a body whose result would re-bridge as a partial
+    //    primop application.
+    if (ent.callReturnsClosure) return reject("callReturnsClosure");
+    if (ent.outerWithRefused) return reject("outerWithRefused");
+
+    // 4. Materialise upvalues + capturedWiths from funTw's TW env.
+    //    Same envBaseLevel=1 as v3CallFunctionEntry: lambda.env is
+    //    PARENT of the formal env (level 1), not the formal env itself.
+    static const bool outerWithEnabled = []{
+        return std::getenv("NIX_V3_NO_OUTER_WITH") == nullptr;
+    }();
+    std::vector<Value> upvalues;
+    ListVec * capturedWiths = nullptr;
+    bool sawRecBuild = false;
+    if (prepHookUpvaluesAndWiths(*envPtr, ent, upvalues, capturedWiths,
+                                  sawRecBuild, outerWithEnabled,
+                                  /*envBaseLevel=*/1) != HookPrepResult::Ok)
+        return reject("prepUpvalues failed");
+    if (s_dbg) std::fprintf(stderr,
+        "v3 tryDispatchTWLambdaInV3: ENTER lambda=%p name=%s\n",
+        (void *)lambda,
+        ent.cu->lambdas[ent.funcIdx].name.empty() ? "<anon>"
+            : ent.cu->lambdas[ent.funcIdx].name.c_str());
+
+    // 5. Run the body in v3 with the v3 arg directly.  If the body
+    //    throws, propagate as failure -- caller falls back to TW
+    //    dispatch which has its own recovery (fallbackExpr re-eval).
+    setNixEvalState(&state);
+    Value r;
+    try {
+        // shallow-TW-attrs guard for formals lambdas, mirrors
+        // v3CallFunctionEntry's #452 / Phase C scope.
+        std::optional<ScopedShallowTWAttrsBridge> shallowGuard;
+        if (lambda->getFormals().has_value()) shallowGuard.emplace();
+        r = runLambda(*ent.cu, ent.funcIdx, v3Arg,
+            upvalues.data(), static_cast<uint32_t>(upvalues.size()),
+            capturedWiths);
+    } catch (const std::exception & ex) {
+        if (auto * be = dynamic_cast<const BlackholeError *>(&ex)) {
+            (void)be;
+            // BlackholeError on the body indicates a real cycle the
+            // caller should propagate, NOT a transient cache issue.
+            // Letting it bubble up triggers the existing fallbackExpr
+            // recovery in vm.cc / primV3CallBridge1.
+            throw;
+        }
+        return false;
+    }
+    v3Out = r;
+    return true;
+}
+
 } // anonymous namespace
+
+/// STG-14a (#509/#515): public wrapper for the new shortcut, callable
+/// from vm.cc's OP_CALL Bridge handler.  Returns true iff the helper
+/// successfully ran the body in v3.
+bool tryDispatchTWLambdaInV3(nix::EvalState & state,
+                              nix::Value & funTw,
+                              Value v3Arg,
+                              Value & v3Out)
+{
+    return tryDispatchTWLambdaInV3Inner(state, funTw, v3Arg, v3Out);
+}
 
 } // namespace nix::v3
 
