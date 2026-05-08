@@ -3355,6 +3355,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // Mirror the forceValue Bridge handler at line 5539.
                 ScopedActiveV3VM _activeV3VM(&vm);
                 Value resolved = forceBridgeThunk(t);
+                // Self-Bridge guard (#520): forceBridgeThunk goes
+                // through getOrAllocBridgeThunkCached, which is
+                // pointer-keyed on `nix::Value *` (== bridgeSrc).
+                // When bridgeSrc is an nFunction TW value, the
+                // treeWalkerToV3 nFunction case calls
+                // getOrAllocBridgeThunkCached(&nv) and the cache
+                // hits — returning Tag::Thunk{t} (the SAME bridge
+                // back).  If we then `t->state = Evaluated;
+                // t->evaluated = Tag::Thunk{t}`, the chase loop's
+                // Evaluated branch follows t->evaluated → t →
+                // t->evaluated → ... ad infinitum.  Treat the
+                // self-Bridge as canonical WHNF (a Bridge wrapping a
+                // Function IS the v3 representation; consumers
+                // unwrap via v3ToTreeWalker to recover the TW
+                // lambda).  Leave state == Bridge so future forces
+                // re-resolve harmlessly and the cache still hits.
+                if (resolved.tag() == Tag::Thunk
+                    && resolved.payload.thunk == t) {
+                    push(vm, resolved);
+                    break;
+                }
                 t->state = ThunkState::Evaluated;
                 t->evaluated = resolved;
                 // STG-14b option (a): cell update protocol on Bridge
@@ -3365,11 +3386,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // propagates the resolved TW value into every consumer
                 // observing entries[i].value (inner+outer call-hook
                 // entries that share the recBuildCache Bindings).
-                // Without it, only `t->evaluated` is set, but new
-                // observers reading entries[i].value still see Tag::Thunk{t};
-                // they hit the memo only via OP_FORCE on the same t,
-                // and any view that picked up entries[i].value as a
-                // pre-thunk-state Tag::Slot stays out of sync.
                 if (Value * cell = t->cell) {
                     *cell = resolved;
                     t->cell = nullptr;
@@ -6379,6 +6395,16 @@ Value forceValue(VMState & vm, Value v)
             // prone re-entries (lambda-skip's body_fid).
             ScopedActiveV3VM _activeV3VM(&vm);
             v = forceBridgeThunk(t);
+            // Self-Bridge guard (#520): see OP_FORCE Bridge handler
+            // above.  Returns Tag::Thunk{t} (cache hit on same
+            // nix::Value*) when bridgeSrc is an nFunction; setting
+            // t->evaluated = Tag::Thunk{t} would make the chase loop
+            // (state=Evaluated → evaluated → self) infinite.  Leave
+            // state == Bridge and let the break below catch us as a
+            // Bridge-wrapping-Function WHNF.
+            if (v.tag() == Tag::Thunk && v.payload.thunk == t) {
+                break;
+            }
             t->state = ThunkState::Evaluated;
             t->evaluated = v;
             // STG-14b option (a): cell update protocol on Bridge
