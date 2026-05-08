@@ -168,14 +168,27 @@ that hook-mode previously masked via TW fallback.
 
 The v3-direct path now exposes the actual bugs to fix:
 
-a. **#524-#527 follow-up: lib.fix self.trivial wrong-upvalue capture**
-   — when `inherit (self.X) Y` lowers via blanket thunkify with
-   level≥1, the synthesized hidden thunk captures the WRONG `self`
-   (the inner let-rec's bindings instead of the outer lambda
-   parameter).  Root-cause is in lower.cc thunkify path's freeVar
-   resolution under deep nesting.
+a. **#528 [LANDED 917b4fc5a]: self-dot inherit-from default level
+   0 → 4.**  The earlier `s_maxLevel=0` default left
+   `inherit (lambda_param.X) Y` eager whenever wrapped in a `let`
+   (the canonical lib.fix shape).  Bumped default to 4; thunkify
+   itself was correct (it defers `self.X` until `Y` is forced,
+   matching TW).  9/9 self-dot regression suite, all 13+ other v3
+   suites still green.
 
-b. **flake installables** — `nix eval nixpkgs#hello.name` (option 2a:
+b. **lib `with self;` / `with pkgs;` lookup miss (NEXT under v3-direct).**
+   With (a) landed, `(import &lt;nixpkgs&gt; {}).hello.name` advances past
+   the inherit-from cycle and now fails with `OP_WITH_LOOKUP: name
+   'nix-update' not found in with-scope`.  Source:
+   `pkgs/top-level/all-packages.nix:28` `with pkgs;` followed by
+   `inherit (nix-update) nix-update-script;` (line 196).  v3
+   resolves the with-lookup against an attrset that does not
+   contain `nix-update` — likely the same shape of wrong-upvalue-
+   capture bug as (a) but for `with`-captured names.  Probably
+   wants a similar widening of the `with`-scope thunkify gate, or
+   a similar slot-capture-vs-eager evaluation timing fix.
+
+c. **flake installables** — `nix eval nixpkgs#hello.name` (option 2a:
    keep flake resolution in TW, one-shot bridge to v3 once resolved).
 
 c. **autoArgs** (`--arg` / `--argstr`) on the v3-direct path.
