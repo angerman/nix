@@ -2214,6 +2214,112 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     push(vm, res);
                     break;
                 }
+                // STG-13c (#509/#512): native dispatch for ExtendsBody.
+                // chain[2] of `extends = overlay: f: final: <body>`.
+                // body: `let prev = f final; in prev // overlay final prev`.
+                //
+                // Closure upvalues at indices `desc->intrinsicVar0`
+                // (overlay) and `intrinsicVar1` (f).  arg = final.
+                if (desc->intrinsicKind == LambdaDescriptor::Intrinsic::ExtendsBody
+                    && desc->intrinsicVar0 >= 0 && desc->intrinsicVar1 >= 0
+                    && (uint16_t)desc->intrinsicVar0 < callee->nUpvalues
+                    && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues) {
+                    allocStats().intrinsicExtendsCalls++;
+                    static const bool s_dbg =
+                        std::getenv("V3_DBG_INTRINSIC") != nullptr;
+                    Value overlay = callee->upvalues[(uint16_t)desc->intrinsicVar0];
+                    Value f       = callee->upvalues[(uint16_t)desc->intrinsicVar1];
+                    Value final_  = arg;
+                    if (s_dbg) std::fprintf(stderr,
+                        "v3 intrinsic ExtendsBody dispatch [#%llu]: "
+                        "overlay.tag=%d f.tag=%d final.tag=%d\n",
+                        (unsigned long long)allocStats().intrinsicExtendsCalls,
+                        (int)overlay.tag(), (int)f.tag(), (int)final_.tag());
+                    vm.frames.back().ip = ip;
+                    // prev = f(final); force to attrs WHNF.
+                    Value prev = callClosure(vm, f, final_);
+                    prev = forceValue(vm, prev);
+                    if (!prev.isAttrs() || !prev.payload.bindings)
+                        throw std::runtime_error(
+                            "v3 intrinsic ExtendsBody: prev (= f final) didn't reduce to attrs");
+                    // overlay_partial = overlay(final), then
+                    // overlay_result = overlay_partial(prev); force to attrs.
+                    Value overlay_partial = callClosure(vm, overlay, final_);
+                    Value overlay_result  = callClosure(vm, overlay_partial, prev);
+                    overlay_result = forceValue(vm, overlay_result);
+                    if (!overlay_result.isAttrs() || !overlay_result.payload.bindings)
+                        throw std::runtime_error(
+                            "v3 intrinsic ExtendsBody: overlay final prev didn't reduce to attrs");
+                    Bindings * merged = mergeBindings(prev.payload.bindings,
+                                                      overlay_result.payload.bindings);
+                    Value res;
+                    res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                    res.payload.bindings = merged;
+                    push(vm, res);
+                    break;
+                }
+
+                // STG-13c (#509/#512): native dispatch for ComposeBody.
+                // chain[3] of `composeExtensions = f: g: final: prev: <body>`.
+                // body: `let fApplied = f final prev; prev' = prev //
+                // fApplied; in fApplied // g final prev'`.
+                //
+                // Closure upvalues: intrinsicVar0 (f), intrinsicVar1 (g),
+                // intrinsicVar2 (final).  arg = prev.
+                if (desc->intrinsicKind == LambdaDescriptor::Intrinsic::ComposeBody
+                    && desc->intrinsicVar0 >= 0 && desc->intrinsicVar1 >= 0
+                    && desc->intrinsicVar2 >= 0
+                    && (uint16_t)desc->intrinsicVar0 < callee->nUpvalues
+                    && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues
+                    && (uint16_t)desc->intrinsicVar2 < callee->nUpvalues) {
+                    allocStats().intrinsicComposeCalls++;
+                    static const bool s_dbg =
+                        std::getenv("V3_DBG_INTRINSIC") != nullptr;
+                    Value f       = callee->upvalues[(uint16_t)desc->intrinsicVar0];
+                    Value g       = callee->upvalues[(uint16_t)desc->intrinsicVar1];
+                    Value final_  = callee->upvalues[(uint16_t)desc->intrinsicVar2];
+                    Value prev_   = arg;
+                    if (s_dbg) std::fprintf(stderr,
+                        "v3 intrinsic ComposeBody dispatch [#%llu]: "
+                        "f.tag=%d g.tag=%d final.tag=%d prev.tag=%d\n",
+                        (unsigned long long)allocStats().intrinsicComposeCalls,
+                        (int)f.tag(), (int)g.tag(), (int)final_.tag(),
+                        (int)prev_.tag());
+                    vm.frames.back().ip = ip;
+                    // fApplied = f final prev; force to attrs.
+                    Value f_partial = callClosure(vm, f, final_);
+                    Value fApplied  = callClosure(vm, f_partial, prev_);
+                    fApplied = forceValue(vm, fApplied);
+                    if (!fApplied.isAttrs() || !fApplied.payload.bindings)
+                        throw std::runtime_error(
+                            "v3 intrinsic ComposeBody: f final prev didn't reduce to attrs");
+                    // prev' = prev // fApplied (force prev_ to attrs first).
+                    Value prevForced = forceValue(vm, prev_);
+                    if (!prevForced.isAttrs() || !prevForced.payload.bindings)
+                        throw std::runtime_error(
+                            "v3 intrinsic ComposeBody: prev didn't reduce to attrs");
+                    Bindings * prevPrimeB = mergeBindings(prevForced.payload.bindings,
+                                                          fApplied.payload.bindings);
+                    Value prevPrime;
+                    prevPrime.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                    prevPrime.payload.bindings = prevPrimeB;
+                    // gApplied = g final prev'; force to attrs.
+                    Value g_partial = callClosure(vm, g, final_);
+                    Value gApplied  = callClosure(vm, g_partial, prevPrime);
+                    gApplied = forceValue(vm, gApplied);
+                    if (!gApplied.isAttrs() || !gApplied.payload.bindings)
+                        throw std::runtime_error(
+                            "v3 intrinsic ComposeBody: g final prev' didn't reduce to attrs");
+                    // result = fApplied // gApplied.
+                    Bindings * merged = mergeBindings(fApplied.payload.bindings,
+                                                       gApplied.payload.bindings);
+                    Value res;
+                    res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                    res.payload.bindings = merged;
+                    push(vm, res);
+                    break;
+                }
+
                 // Other intrinsic kinds (Extends, ComposeExtensions, ...)
                 // fall through to the regular dispatch path below.
                 // Step 1's recogniseIntrinsic only sets Fix; future
@@ -6496,6 +6602,79 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 *slotStorage = res;
                 return res;
             }
+        }
+
+        // STG-13c (#509/#512): native dispatch for ExtendsBody --
+        // mirrored from OP_CALL.  callClosure is the entry point for
+        // primops + bridges, so the intrinsic check must fire here too
+        // or recognised lambdas dispatched via this path silently take
+        // the bytecode body.
+        if (desc->intrinsicKind == LambdaDescriptor::Intrinsic::ExtendsBody
+            && desc->intrinsicVar0 >= 0 && desc->intrinsicVar1 >= 0
+            && (uint16_t)desc->intrinsicVar0 < callee->nUpvalues
+            && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues) {
+            allocStats().intrinsicExtendsCalls++;
+            Value overlay = callee->upvalues[(uint16_t)desc->intrinsicVar0];
+            Value f       = callee->upvalues[(uint16_t)desc->intrinsicVar1];
+            Value final_  = arg;
+            Value prev = callClosure(vm, f, final_);
+            prev = forceValue(vm, prev);
+            if (!prev.isAttrs() || !prev.payload.bindings)
+                throw std::runtime_error(
+                    "v3 callClosure intrinsic ExtendsBody: prev not attrs");
+            Value overlay_partial = callClosure(vm, overlay, final_);
+            Value overlay_result  = callClosure(vm, overlay_partial, prev);
+            overlay_result = forceValue(vm, overlay_result);
+            if (!overlay_result.isAttrs() || !overlay_result.payload.bindings)
+                throw std::runtime_error(
+                    "v3 callClosure intrinsic ExtendsBody: overlay-result not attrs");
+            Bindings * merged = mergeBindings(prev.payload.bindings,
+                                               overlay_result.payload.bindings);
+            Value res;
+            res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+            res.payload.bindings = merged;
+            return res;
+        }
+
+        // STG-13c (#509/#512): native dispatch for ComposeBody.
+        if (desc->intrinsicKind == LambdaDescriptor::Intrinsic::ComposeBody
+            && desc->intrinsicVar0 >= 0 && desc->intrinsicVar1 >= 0
+            && desc->intrinsicVar2 >= 0
+            && (uint16_t)desc->intrinsicVar0 < callee->nUpvalues
+            && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues
+            && (uint16_t)desc->intrinsicVar2 < callee->nUpvalues) {
+            allocStats().intrinsicComposeCalls++;
+            Value f       = callee->upvalues[(uint16_t)desc->intrinsicVar0];
+            Value g       = callee->upvalues[(uint16_t)desc->intrinsicVar1];
+            Value final_  = callee->upvalues[(uint16_t)desc->intrinsicVar2];
+            Value prev_   = arg;
+            Value f_partial = callClosure(vm, f, final_);
+            Value fApplied  = callClosure(vm, f_partial, prev_);
+            fApplied = forceValue(vm, fApplied);
+            if (!fApplied.isAttrs() || !fApplied.payload.bindings)
+                throw std::runtime_error(
+                    "v3 callClosure intrinsic ComposeBody: fApplied not attrs");
+            Value prevForced = forceValue(vm, prev_);
+            if (!prevForced.isAttrs() || !prevForced.payload.bindings)
+                throw std::runtime_error(
+                    "v3 callClosure intrinsic ComposeBody: prev not attrs");
+            Bindings * prevPrimeB = mergeBindings(prevForced.payload.bindings,
+                                                   fApplied.payload.bindings);
+            Value prevPrime;
+            prevPrime.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+            prevPrime.payload.bindings = prevPrimeB;
+            Value g_partial = callClosure(vm, g, final_);
+            Value gApplied  = callClosure(vm, g_partial, prevPrime);
+            gApplied = forceValue(vm, gApplied);
+            if (!gApplied.isAttrs() || !gApplied.payload.bindings)
+                throw std::runtime_error(
+                    "v3 callClosure intrinsic ComposeBody: gApplied not attrs");
+            Bindings * merged = mergeBindings(fApplied.payload.bindings,
+                                               gApplied.payload.bindings);
+            Value res;
+            res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+            res.payload.bindings = merged;
+            return res;
         }
     }
 

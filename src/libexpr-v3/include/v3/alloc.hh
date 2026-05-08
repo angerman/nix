@@ -159,6 +159,16 @@ struct AllocStats
     /// recogniseIntrinsic is firing AND the runtime dispatch is
     /// taking the fast path on real workloads.
     uint64_t intrinsicFixCalls = 0;
+
+    /// STG-13c (#509/#512): native-dispatch counters for the inner
+    /// `extends` / `composeExtensions` lambdas.  Each call replaces
+    /// the bytecode body of `final: let prev = f final; in prev //
+    /// overlay final prev` (or the 4-arg compose body) with a v3-side
+    /// computation that calls f/overlay (or f/g) directly + merges the
+    /// resulting attrsets via mergeBindings.  Eliminates the OP_CALL
+    /// frames that today bridge to TW for the chain's leaf rattrs.
+    uint64_t intrinsicExtendsCalls = 0;
+    uint64_t intrinsicComposeCalls = 0;
 };
 
 inline AllocStats & allocStats()

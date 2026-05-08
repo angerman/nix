@@ -233,8 +233,39 @@ struct LambdaDescriptor
         Extends               = 2,  ///< extends = overlay: f: (final: ...)
         ComposeExtensions     = 3,  ///< composeExtensions = f: g: final: prev: ...
         ComposeManyExtensions = 4,  ///< composeManyExtensions = lib.foldr ...
+        /// STG-13a (#509/#510): innermost lambda of an `extends` chain,
+        /// i.e. chain[2] = `final: let prev = f final; in prev // overlay
+        /// final prev`.  Recognised when chain[0] (`overlay:`) is matched
+        /// as Extends; lower.cc threads the marker via a deferred map so
+        /// chain[2]'s ir::Function gets this kind set when it is lowered
+        /// recursively.  Native dispatch in OP_CALL/callClosure executes
+        /// the body without going through bytecode -- the call path that
+        /// today bridges the recursive rattrs through TW and trips the
+        /// STG-12 BlackholeError when arg chases to a Black v3 thunk.
+        ExtendsBody           = 5,
+        /// STG-13a (#509/#510): innermost lambda of a
+        /// `composeExtensions` chain, i.e. chain[3] = `prev: <body>`
+        /// where the body computes `f final prev // g final prev'` (with
+        /// the intermediate `f final prev`/`prev // f final prev`
+        /// bindings).  Same recognition + deferred-marker scheme as
+        /// ExtendsBody.
+        ComposeBody           = 6,
     };
     Intrinsic intrinsicKind = Intrinsic::None;
+
+    /// STG-13b (#509/#511): for ExtendsBody / ComposeBody dispatch, the
+    /// upvalue indices of the captured `f` / `overlay` / `g` / `final`
+    /// vars (or -1 if unused).  Native dispatch reads these to load the
+    /// right closure->upvalues[i] without name-matching at runtime.
+    /// Populated by emit.cc after freeVars are finalised; ordered by the
+    /// natural roles of each intrinsic:
+    ///   ExtendsBody : intrinsicVar0 = overlay, intrinsicVar1 = f
+    ///   ComposeBody : intrinsicVar0 = f, intrinsicVar1 = g,
+    ///                 intrinsicVar2 = final
+    /// (final is the runtime arg in both cases; prev is local.)
+    int8_t intrinsicVar0 = -1;
+    int8_t intrinsicVar1 = -1;
+    int8_t intrinsicVar2 = -1;
 
     /// #493 / #484 follow-on: the original tree-walker `nix::ExprLambda *`
     /// this v3 LambdaDescriptor was lowered from, or nullptr if the

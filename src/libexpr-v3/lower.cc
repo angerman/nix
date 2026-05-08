@@ -153,6 +153,28 @@ struct Lowerer
     /// on its int id is cheap.
     std::unordered_map<uint32_t, ir::SymbolId> symbolCache;
 
+    /// STG-13a (#509/#510): deferred intrinsic-kind assignments for
+    /// inner lambdas of a recognised chain.  When recogniseIntrinsic
+    /// matches the OUTER lambda of an Extends or ComposeExtensions
+    /// chain, it walks to chain[2]/chain[3] and records the desired
+    /// inner intrinsic kind here.  lowerLambda checks this map after
+    /// running recogniseIntrinsic on the inner lambda; if the inner
+    /// lambda is in the map, the deferred kind overrides the inner's
+    /// own recognition (which would return None for a chain[2]/[3]
+    /// body in isolation).
+    ///
+    /// The mapped value also carries the SymbolIds of the captured
+    /// vars (overlay/f for ExtendsBody; f/g/final for ComposeBody) so
+    /// emit can compute upvalue indices later.
+    struct DeferredIntrinsic {
+        uint8_t  kind;          ///< ExtendsBody=5 or ComposeBody=6
+        ir::SymbolId sym0;      ///< overlay (Extends) or f (Compose)
+        ir::SymbolId sym1;      ///< f       (Extends) or g (Compose)
+        ir::SymbolId sym2;      ///< unused  (Extends) or final (Compose)
+    };
+    std::unordered_map<nix::ExprLambda *, DeferredIntrinsic>
+        deferredIntrinsics;
+
     explicit Lowerer(const nix::SymbolTable & st) : symbols(st) {}
     Lowerer(const nix::SymbolTable & st, const nix::PosTable & pt)
         : symbols(st), positions(&pt) {}
@@ -801,6 +823,18 @@ struct Lowerer
                 if (!a1 || a1->name != prevSym)
                     return reject("Extends: overlay arg-1 != prev");
 
+                // STG-13a (#509/#510): mark chain[2] (the final-lambda)
+                // as ExtendsBody so OP_CALL/callClosure dispatches to
+                // the v3-native impl.  Carry the SymbolIds of overlay
+                // and f (chain[0]'s arg + chain[1]'s arg) so emit can
+                // compute upvalue indices for the native dispatch.
+                deferredIntrinsics[lamFinal] = DeferredIntrinsic{
+                    /*kind*/ 5u,  // Intrinsic::ExtendsBody
+                    /*sym0 overlay*/ internSym(e->arg),
+                    /*sym1 f*/ internSym(lamF->arg),
+                    /*sym2 unused*/ 0,
+                };
+
                 return 2;  // Intrinsic::Extends
             }
 
@@ -866,6 +900,19 @@ struct Lowerer
                 if (!b1 || b1->name != prevPrimeSym)
                     return reject("Compose: g-call arg-1 != prev'");
 
+                // STG-13a (#509/#510): mark chain[3] (the prev-lambda)
+                // as ComposeBody so OP_CALL/callClosure dispatches to
+                // the v3-native impl.  Carry the SymbolIds of f, g and
+                // final (chain[0..2]'s args) so emit can compute
+                // upvalue indices.  prev is the runtime arg (local 0),
+                // not an upvalue.
+                deferredIntrinsics[lamPrev] = DeferredIntrinsic{
+                    /*kind*/ 6u,  // Intrinsic::ComposeBody
+                    /*sym0 f*/ internSym(e->arg),
+                    /*sym1 g*/ internSym(lamG->arg),
+                    /*sym2 final*/ internSym(lamFinal->arg),
+                };
+
                 return 3;  // Intrinsic::ComposeExtensions
             }
 
@@ -895,6 +942,44 @@ struct Lowerer
         // (eliminates the TW round-trip that today blocks lambda-skip
         // default-on for nixpkgs -- see project_493_step3d_with_stack memo).
         m.functions[fid].intrinsicKind = recogniseIntrinsic(e);
+        // STG-13a (#509/#510): inner-lambda marker.  recogniseIntrinsic
+        // populates deferredIntrinsics for chain[2]/chain[3] when matching
+        // Extends/ComposeExtensions on the outer lambda; here we apply the
+        // marker to the inner lambda's ir::Function as it gets lowered
+        // recursively.  The outer chain's recogniseIntrinsic-on-inner call
+        // would return 0 (chain[2] in isolation isn't a known shape); the
+        // deferred map overrides that.
+        //
+        // We also resolve the captured-var SymbolIds (overlay/f/... for
+        // Extends; f/g/final for Compose) to their VarIds via the live
+        // scope stack: at this point in lowerLambda, scopes still
+        // contains the parent chain[0..n-1] with byName populated, so a
+        // simple top-down search finds each VarId.  The VarIds are
+        // recorded on the inner ir::Function and looked up at emit time
+        // to fill in LambdaDescriptor::intrinsicVar0/1/2 (upvalue
+        // indices into the closure).
+        if (auto it = deferredIntrinsics.find(e); it != deferredIntrinsics.end()) {
+            m.functions[fid].intrinsicKind = it->second.kind;
+            // Resolve each named capture to a VarId by walking scopes.
+            // The outermost scope (chain[0]'s lambda body context) is
+            // closest to the back end of the vector; chain[2]/chain[3]
+            // hasn't pushed its inner scope yet.  Search innermost-first
+            // (= highest index) which honours shadowing if any.
+            auto findVarBySymbol = [&](ir::SymbolId sid) -> ir::VarId {
+                if (sid == 0) return ir::kInvalid;
+                const auto & tbl = ir::globalSymbolTable();
+                if (sid >= tbl.size()) return ir::kInvalid;
+                const std::string & nm = tbl[sid];
+                for (auto sIt = scopes.rbegin(); sIt != scopes.rend(); ++sIt) {
+                    auto bIt = sIt->byName.find(nm);
+                    if (bIt != sIt->byName.end()) return bIt->second;
+                }
+                return ir::kInvalid;
+            };
+            m.functions[fid].intrinsicVar0 = findVarBySymbol(it->second.sym0);
+            m.functions[fid].intrinsicVar1 = findVarBySymbol(it->second.sym1);
+            m.functions[fid].intrinsicVar2 = findVarBySymbol(it->second.sym2);
+        }
         {
             static const bool s_dbg =
                 std::getenv("V3_DBG_INTRINSIC") != nullptr;
@@ -902,6 +987,7 @@ struct Lowerer
                 static const char * names[] = {
                     "None", "Fix", "Extends", "ComposeExtensions",
                     "ComposeManyExtensions",
+                    "ExtendsBody", "ComposeBody",
                 };
                 uint8_t k = m.functions[fid].intrinsicKind;
                 if (k != 0 || std::getenv("V3_DBG_INTRINSIC_ALL") != nullptr)

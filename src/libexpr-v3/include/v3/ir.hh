@@ -377,7 +377,28 @@ struct Function {
     ///   2 = Extends
     ///   3 = ComposeExtensions
     ///   4 = ComposeManyExtensions
+    ///   5 = ExtendsBody  (STG-13a #509/#510 — chain[2] of extends)
+    ///   6 = ComposeBody  (STG-13a #509/#510 — chain[3] of compose)
     uint8_t             intrinsicKind = 0;
+
+    /// STG-13a (#509/#510): for ExtendsBody / ComposeBody, the captured
+    /// VarIds we'll read from the closure as upvalues at native dispatch
+    /// time.  Resolved by lowerLambda when it processes chain[2]/chain[3]
+    /// against the live scope stack: scopes still contain chain[0]/chain[1]
+    /// (and chain[2] for ComposeBody) with their byName/byDispl, so we
+    /// can find the VarId for `overlay`/`f`/`g`/`final` directly.
+    ///
+    /// At emit time, these VarIds are looked up in `freeVars` to compute
+    /// the upvalue indices stored on LambdaDescriptor.
+    ///
+    /// Roles per intrinsic:
+    ///   ExtendsBody : intrinsicVar0 = overlay, intrinsicVar1 = f
+    ///   ComposeBody : intrinsicVar0 = f, intrinsicVar1 = g,
+    ///                 intrinsicVar2 = final
+    /// kInvalid sentinel = unused.
+    VarId intrinsicVar0 = kInvalid;
+    VarId intrinsicVar1 = kInvalid;
+    VarId intrinsicVar2 = kInvalid;
 };
 
 // ---------------------------------------------------------------------------
