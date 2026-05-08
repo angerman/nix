@@ -181,6 +181,26 @@ enum Op : uint8_t
     /// slot pointer into the Env block.
     OP_REC_BINDING_SLOT_REF = 0x84, // [sym:24]
 
+    /// STG-14b (#516/#517): pop a Tag::Thunk from the operand stack,
+    /// allocate a heap-stable Value cell, store the thunk into the
+    /// cell, set `thunk->cell = cell`, and write a Tag::Slot{cell}
+    /// into the local at [slot:24].  Equivalent to:
+    ///   OP_MAKE_THUNK fid; OP_SET_LOCAL slot
+    /// PLUS attaching the slot's storage as the thunk's cell so the
+    /// thunk's eventual OP_RETURN's cell-update at vm.cc:3003 fires.
+    /// Used by emit.cc:594-601 for hidden-from-expr thunks (the
+    /// `inherit (X // Y) ...` lowering's inheritFromExpr thunks),
+    /// which previously had `cell == nullptr` -- causing per-attr
+    /// thunks that captured the hidden slot via emitVarRef to see a
+    /// stale Black thunk pointer when the hidden thunk was forced
+    /// mid-construction under STG_KEEP_HOOKS=1 (#517 root cause).
+    ///
+    /// The heap-stable cell is necessary because value-stack
+    /// addresses are not stable across `valueStack.resize()`; using
+    /// `&valueStack[stackBase+slot]` directly would dangle on the
+    /// next OP_CALL/OP_MAKE_THUNK that grew the stack.
+    OP_THUNK_SET_LOCAL_THROUGH_CELL = 0x85, // [slot:24]
+
     // --- Strings --------------------------------------------------------
     OP_STR_CONCAT     = 0x90,  // [n:24] forceString stored in low bit of n; pops n parts
 

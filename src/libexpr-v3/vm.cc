@@ -4390,6 +4390,63 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, slotRef);
             break;
         }
+        case OP_THUNK_SET_LOCAL_THROUGH_CELL: {
+            // STG-14b (#516/#517): pop a Tag::Thunk, allocate a heap
+            // cell holding it, attach the cell as the thunk's
+            // OP_RETURN-update target, and write a Tag::Slot{cell}
+            // into the local at [slot:24].
+            //
+            // Used by emit.cc:594-601 for hidden-from-expr thunks
+            // (the `inherit (X // Y) ...` lowering's inheritFromExpr
+            // thunks).  Before this opcode, hidden thunks were stored
+            // as Tag::Thunk in their slots; per-attr thunks captured
+            // them via emitVarRef, holding a stale Black thunk pointer
+            // when the hidden was forced mid-construction (the
+            // STG_KEEP_HOOKS hang on `(import <nixpkgs> {}).lib`).
+            //
+            // After this opcode, the slot holds Tag::Slot{cell}; the
+            // cell initially contains the Tag::Thunk and -- on the
+            // hidden thunk's OP_RETURN -- gets `*cell = retVal`
+            // applied (vm.cc:3003 cell-update path).  Captures
+            // observing the slot deref through the cell to the
+            // Evaluated value.
+            if (vm.valueStack.empty()) {
+                throw std::runtime_error(
+                    "v3 OP_THUNK_SET_LOCAL_THROUGH_CELL: empty operand stack");
+            }
+            Value top = vm.valueStack.back();
+            vm.valueStack.pop_back();
+            if (top.tag() != Tag::Thunk || !top.payload.thunk) {
+                throw std::runtime_error(
+                    "v3 OP_THUNK_SET_LOCAL_THROUGH_CELL: top of stack is not Tag::Thunk");
+            }
+            // Heap-stable cell: holds the thunk Value initially; the
+            // thunk's OP_RETURN cell-update will overwrite it with
+            // the evaluated value.
+            Value * cell = Alloc::allocValue();
+            *cell = top;
+            // Attach cell to the thunk so OP_RETURN's CFF_THUNK_RETURN
+            // handler at vm.cc:3003 fires `*cell = retVal`.  Only
+            // attach if the thunk is fresh (Suspended with no cell
+            // yet); otherwise we'd clobber an existing cell binding
+            // (e.g., from OP_ATTRS_REC_SET).  Fresh OP_MAKE_THUNK
+            // produces Suspended with cell == nullptr by construction
+            // (alloc.hh:317-348), so this is the expected branch.
+            if (top.payload.thunk->state == ThunkState::Suspended
+                && top.payload.thunk->cell == nullptr) {
+                top.payload.thunk->cell = cell;
+            }
+            // Slot pointing at cell -- captures see the slot, deref
+            // resolves through cell to the (eventually Evaluated) value.
+            Value slotRef;
+            slotRef.mkSlot(cell);
+            uint16_t slot = static_cast<uint16_t>(operand);
+            if (stackBase + slot >= vm.valueStack.size()) {
+                vm.valueStack.resize(stackBase + slot + 1);
+            }
+            vm.valueStack[stackBase + slot] = slotRef;
+            break;
+        }
         case OP_REC_BINDING_SLOT_REF: {
             // Pop a Tag::Attrs (forced earlier), look up the entry by
             // SymbolId in operand, push a Tag::Slot Value pointing at

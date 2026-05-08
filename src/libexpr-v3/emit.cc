@@ -591,13 +591,26 @@ struct Emitter
         //    captures recVar (already bound) + any other free vars,
         //    and writes its result Value into the hiddenVar's local
         //    slot.
+        //
+        // STG-14b (#516/#517): use OP_THUNK_SET_LOCAL_THROUGH_CELL
+        // instead of OP_SET_LOCAL.  The new opcode wraps the thunk
+        // in a heap-stable cell and attaches the cell as the thunk's
+        // OP_RETURN-update target, then writes Tag::Slot{cell} into
+        // the local.  Per-attr thunks capturing the slot deref
+        // through the cell -- so when the hidden thunk's body
+        // completes via OP_RETURN, captures see the Evaluated value
+        // instead of the stale Black thunk pointer (the previous
+        // Tag::Thunk by-value capture broke under STG_KEEP_HOOKS
+        // because cell-update at OP_RETURN never fired without a
+        // cell attached -- audit memo lode/CELL_UPDATE_AUDIT_2026-
+        // 05-08.md).
         for (auto & he : e.hiddenEntries) {
             const auto & ff = m.functions[he.thunkBody].freeVars;
             for (auto fv : ff) emitVarRef(fv);
             unit.code.push_back(encode(OP_MAKE_THUNK, he.thunkBody));
             unit.code.push_back(static_cast<uint32_t>(ff.size()));
             uint16_t hiddenSlot = getOrAssignSlot(he.hiddenVar);
-            unit.code.push_back(encode(OP_SET_LOCAL, hiddenSlot));
+            unit.code.push_back(encode(OP_THUNK_SET_LOCAL_THROUGH_CELL, hiddenSlot));
         }
 
         // 4. For each IR entry, build a Thunk capturing whatever
