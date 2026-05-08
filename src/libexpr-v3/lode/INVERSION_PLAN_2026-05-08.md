@@ -176,17 +176,27 @@ a. **#528 [LANDED 917b4fc5a]: self-dot inherit-from default level
    matching TW).  9/9 self-dot regression suite, all 13+ other v3
    suites still green.
 
-b. **lib `with self;` / `with pkgs;` lookup miss (NEXT under v3-direct).**
-   With (a) landed, `(import &lt;nixpkgs&gt; {}).hello.name` advances past
-   the inherit-from cycle and now fails with `OP_WITH_LOOKUP: name
-   'nix-update' not found in with-scope`.  Source:
-   `pkgs/top-level/all-packages.nix:28` `with pkgs;` followed by
-   `inherit (nix-update) nix-update-script;` (line 196).  v3
-   resolves the with-lookup against an attrset that does not
-   contain `nix-update` — likely the same shape of wrong-upvalue-
-   capture bug as (a) but for `with`-captured names.  Probably
-   wants a similar widening of the `with`-scope thunkify gate, or
-   a similar slot-capture-vs-eager evaluation timing fix.
+b. **#529 [LANDED c8362c2f9]: thunkify `inherit (X) Y` where X is a
+   fromWith Var or fromWith-Var Call.**  Closes the `nix-update` and
+   `callPackages` with-lookup misses by extending the
+   `isComplexFromExpr` gate to also catch:
+     - bare `ExprVar` with `fromWith=true`
+     - `ExprCall` whose head is a fromWith ExprVar
+   Both cases now thunkify so the with-lookup is deferred to
+   force-time of the inherited Y-attribute.  11/11 self-dot
+   regression suite (was 9/9), all other suites still green.
+
+c. **next failure under v3-direct: `OP_WITH_LOOKUP callPackage not
+   found`.**  Different shape — captured-withs propagation through
+   deeply-nested thunks inside the stdenv booter.  The diagnostic
+   trace shows a thunk frame with `withBase=1` whose captured-with
+   slot resolves to `attrs size=1 {prev}` — the inner extends-
+   chain's let-rec bindings, NOT the outer `with pkgs;`.  Hypothesis:
+   the failing thunk was captured inside a `with X;` where X (a
+   `prev` lambda parameter) is mid-construction, and the OUTER `with
+   pkgs;` is not in this thunk's captured-withs because module
+   imports break the dynamic-with-stack chain at file boundaries.
+   Tracked as #529 follow-up.
 
 c. **flake installables** — `nix eval nixpkgs#hello.name` (option 2a:
    keep flake resolution in TW, one-shot bridge to v3 once resolved).
