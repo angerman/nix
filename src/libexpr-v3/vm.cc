@@ -2792,6 +2792,46 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // Clear the retry flag — it's a one-shot per
                 // OP_FORCE.  The next OP_FORCE will re-set it.
                 caller.flags &= ~CFF_FORCE_RETRY;
+                // STG-11 (#498): diagnostic — log the retry value's
+                // shape so we can see what's about to be re-forced.
+                // V3_DBG_RETRY=1 dumps each retry's retVal tag + chase.
+                if (retry && std::getenv("V3_DBG_RETRY")) {
+                    Value chase = retVal;
+                    int hops = 0;
+                    Thunk * retryThunk = nullptr;
+                    while (hops < 4) {
+                        if (chase.tag() == Tag::Slot && chase.payload.slot)
+                            chase = *chase.payload.slot;
+                        else if (chase.tag() == Tag::Thunk
+                                 && chase.payload.thunk
+                                 && chase.payload.thunk->state == ThunkState::Evaluated)
+                            chase = chase.payload.thunk->evaluated;
+                        else break;
+                        ++hops;
+                    }
+                    if (retVal.tag() == Tag::Thunk
+                        && retVal.payload.thunk)
+                        retryThunk = retVal.payload.thunk;
+                    else if (retVal.tag() == Tag::Slot
+                             && retVal.payload.slot
+                             && retVal.payload.slot->tag() == Tag::Thunk)
+                        retryThunk = retVal.payload.slot->payload.thunk;
+                    std::fprintf(stderr,
+                        "v3 OP_RETURN retry: retVal.tag=%d chase.tag=%d",
+                        (int)retVal.tag(), (int)chase.tag());
+                    if (retryThunk) {
+                        const LambdaDescriptor * d =
+                            retryThunk->state == ThunkState::Suspended
+                                ? retryThunk->suspended.desc : nullptr;
+                        std::fprintf(stderr,
+                            " thunk=%p state=%d desc.name=%s",
+                            (void *)retryThunk,
+                            (int)retryThunk->state,
+                            d && !d->name.empty() ? d->name.c_str() : "<?>");
+                    }
+                    std::fprintf(stderr, " frames=%zu\n",
+                        vm.frames.size());
+                }
                 push(vm, retVal);
                 if (retry)
                     goto op_force_slow;
