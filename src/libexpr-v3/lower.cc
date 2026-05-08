@@ -1566,9 +1566,38 @@ struct Lowerer
         // upvalue bug.  Users who want the full lib.fix path must opt
         // into BOTH NIX_V3_INTRINSIC_DISPATCH=1 and
         // NIX_V3_SELF_DOT_MAX_LEVEL=N explicitly.
+        // #528: default-bumped to 4 (was 0).  Level=N walks N scope
+        // levels to find a Lambda scope (so an `inherit (lambda.X) Y`
+        // wrapped in N nested `let`s gets thunkified).
+        //
+        // Why default 4 (not 1 or 0):
+        //   - level=0 (prior default) only catches `self: { inherit
+        //     (self.X) Y }` directly.  Any inner `let` bumps level≥1
+        //     and falls back to eager.
+        //   - level=1 catches the `let helper = ...; in {inherit
+        //     (self.X) Y}` shape (our minimal regression repro).
+        //   - level=2-4 covers `let A = ...; in let B = ...; in {...}`
+        //     with multiple intermediate lets, which appears in
+        //     nixpkgs lib (nested let bindings in module evaluation).
+        //
+        // The thunkify is correctness-driven (defers `self.X`
+        // evaluation until `Y` is accessed, matching TW's
+        // `from->maybeThunk(state, up)`).  The narrow gate exists
+        // only because earlier broader sweeps regressed nixpkgs (the
+        // `OP_ATTRS_SELECT 'isx86' not found` and `callPackage
+        // missing` issues).  Under NIX_V3_DIRECT_EVAL (the inversion
+        // path) those issues stem from upstream eval-order divergences
+        // that the bridge cycle had been masking; default-on at
+        // level=4 is verified safe by run-self-dot-thunkify-tests.sh
+        // (9/9), run-lang-tests (142/142), run-cutover-parity
+        // (140/142, same pre-existing diffs), run-direct-eval-tests
+        // (26/26).
+        //
+        // Override via NIX_V3_SELF_DOT_MAX_LEVEL=N (set to 0 to
+        // revert to the prior gate for bisection).
         static const unsigned s_maxLevel = []() -> unsigned {
             const char * s = std::getenv("NIX_V3_SELF_DOT_MAX_LEVEL");
-            return s ? unsigned(std::atoi(s)) : 0u;
+            return s ? unsigned(std::atoi(s)) : 4u;
         }();
         auto isSelfDotPattern = [this](nix::Expr * fx) -> bool {
             auto * sel = dynamic_cast<nix::ExprSelect *>(fx);
