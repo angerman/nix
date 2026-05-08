@@ -4977,8 +4977,111 @@ Value getBuiltinsValue() noexcept
     }
 }
 
+/// STG-10 (#498) single-VM evaluation: when `activeV3VM()` is non-null
+/// (= we're being re-entered from inside an outer v3 dispatchLoop via
+/// a TW callback into the eval/call hook), push a frame onto that
+/// existing VM and re-enter dispatchLoop with `exitDepth` set to the
+/// frame count BEFORE we pushed.  When the new frame returns
+/// (OP_RETURN brings frames back to exitDepth), dispatchLoop exits and
+/// returns the body's result.
+///
+/// This eliminates fresh-VMState spawning at TW→v3 boundaries.  All v3
+/// evaluation runs on a single VM per thread; thunks Black-marked by
+/// any nested call are visible to all frames on the same VM (so the
+/// existing forceValue cycle detection works correctly), and the
+/// cross-VMState fresh-VMState pattern that surfaced in nixpkgs
+/// hello.name under STG_KEEP_HOOKS=1 disappears at the source.
+///
+/// Mirrors the OP_CALL frame-setup contract: caller-provided arg goes
+/// at slot 0 (when `arg` is non-null); caller-provided upvalues go on
+/// a synthetic Closure; capturedWiths are pushed AFTER the frame's
+/// withStackBase is set, so OP_WITH_LOOKUP picks them up.  Any
+/// exception thrown from the body is caught here, the inner frames
+/// are unwound via clearBlackMarksOnException scoped to exitDepth (so
+/// the outer's existing Black marks are preserved), and the exception
+/// is re-thrown to the caller of run/runFunction/runLambda.
+inline Value runOnExistingVm(VMState & vm,
+                              const CompilationUnit & cu,
+                              const LambdaDescriptor & desc,
+                              const Value * upvalues,
+                              uint32_t nUpvalues,
+                              ListVec * capturedWiths,
+                              const Value * arg)
+{
+    const size_t exitDepth = vm.frames.size();
+
+    // Synthesize a Closure (carries upvalues + captured-withs through
+    // the frame for OP_GET_UPVALUE / pushCapturedWiths).  Allocated on
+    // the v3 heap (Boehm GC); lives as long as the frame needs it.
+    Closure * fakeClo = nullptr;
+    if (nUpvalues > 0 || arg != nullptr) {
+        // Even arg-only frames (no upvalues) need a Closure so the
+        // dispatch loop's `closure` register has a valid descriptor
+        // to query (e.g. for capturedWiths or selector fast-paths).
+        fakeClo = Alloc::allocClosure(nUpvalues);
+        fakeClo->desc = &desc;
+        fakeClo->cu   = &cu;
+        fakeClo->capturedWiths = capturedWiths;
+        fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
+        for (uint32_t i = 0; i < nUpvalues; ++i)
+            fakeClo->upvalues[i] = upvalues[i];
+    }
+
+    // Frame-setup mirrors OP_CALL (vm.cc:2316+) for arg-bearing calls
+    // and runFunction's outer-with carriage layering for the no-arg
+    // case (#416 layering rationale).
+    const size_t base = vm.valueStack.size();
+    vm.valueStack.resize(base + desc.nLocals);
+    if (arg != nullptr)
+        vm.valueStack[base] = *arg;
+
+    const uint32_t newWithBase =
+        static_cast<uint32_t>(vm.withStack.size());
+
+    vm.frames.push_back(CallFrame{
+        .cu = &cu,
+        .closure = fakeClo,
+        .thunk = nullptr,
+        .ip = desc.codeOffset,
+        .stackBaseOffset = static_cast<uint32_t>(base),
+        .withStackBase = newWithBase,
+        .flags = 0,
+    });
+    pushCapturedWiths(vm, capturedWiths);
+
+    // Re-enter dispatchLoop on the SAME VM, with exitDepth set so the
+    // new frame's OP_RETURN unwinds dispatchLoop back to the caller.
+    // Black-mark cleanup is scoped to exitDepth so outer frames'
+    // existing Black marks are preserved on exception (they belong to
+    // the outer dispatchLoop's frames, which we MUST NOT touch).
+    try {
+        Value r = dispatchLoop(vm, exitDepth);
+        clearBlackMarksOnException(vm, exitDepth);
+        return r;
+    } catch (...) {
+        clearBlackMarksOnException(vm, exitDepth);
+        throw;
+    }
+}
+
 Value run(const CompilationUnit & rootCu)
 {
+    // STG-10: re-use an active VM if available (TW→v3 re-entry while a
+    // v3 dispatchLoop is on the C-stack).  `run` is the top-level
+    // entry, so no arg / no upvalues; the body opens at
+    // `rootCu.entryOffset` which lambdas[0]'s codeOffset points at by
+    // construction (see CompilationUnit::entryOffset documentation).
+    if (VMState * activeVm = activeV3VM(); activeVm && !rootCu.lambdas.empty()) {
+        // The top-level "lambda" is the synthetic entry function the
+        // emitter generates for the whole program; its codeOffset is
+        // `rootCu.entryOffset` (verified equal in the emitter).  Push
+        // a frame at that offset onto the existing VM.
+        return runOnExistingVm(*activeVm, rootCu, rootCu.lambdas[0],
+                                /*upvalues*/nullptr, /*nUp*/0,
+                                /*capturedWiths*/nullptr,
+                                /*arg*/nullptr);
+    }
+
     VMState vm;
     // Generous initial reservations: deep-recursive workloads (fib,
     // ackermann, large fold chains) churn the value/frame stacks
@@ -5016,6 +5119,16 @@ Value runFunction(const CompilationUnit & cu, uint32_t funcIdx,
     const auto & desc = cu.lambdas[funcIdx];
     if (desc.nUpvalues != 0)
         throw std::runtime_error("v3 runFunction: function expects upvalues; use runFunctionWithUpvalues");
+
+    // STG-10: re-use the active VM if we're being re-entered from
+    // inside an outer v3 dispatchLoop (TW→v3 re-entry).  Avoids
+    // spawning a fresh VMState, which would create cross-VMState
+    // Black-mark leaks for thunks visited by both VMs.
+    if (VMState * activeVm = activeV3VM()) {
+        return runOnExistingVm(*activeVm, cu, desc,
+                                /*upvalues*/nullptr, /*nUp*/0,
+                                capturedWiths, /*arg*/nullptr);
+    }
 
     VMState vm;
     vm.valueStack.reserve(64 * 1024);
@@ -5058,6 +5171,13 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
     const auto & desc = cu.lambdas[funcIdx];
     if (desc.nUpvalues != nUpvalues)
         throw std::runtime_error("v3 runFunctionWithUpvalues: nUpvalues mismatch");
+
+    // STG-10: re-use the active VM if available (TW→v3 re-entry).
+    if (VMState * activeVm = activeV3VM()) {
+        return runOnExistingVm(*activeVm, cu, desc,
+                                upvalues, nUpvalues,
+                                capturedWiths, /*arg*/nullptr);
+    }
 
     Closure * fakeClo = Alloc::allocClosure(nUpvalues);
     fakeClo->desc = &desc;
@@ -5116,29 +5236,46 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
     if (__builtin_expect(desc.selectorSym != 0, 0)) {
         allocStats().selectorLambdaCalls++;
         // The arg may still be a Thunk/App/Slot; force first.
-        // Need a VMState for forceValue's chase; we can use a tiny
-        // throwaway one.  Most selector calls never trigger forceValue
-        // (the caller usually passes an already-forced attrset), so
-        // this is the slow path of the fast path.
+        //
+        // STG-10 (#498): re-use the active VM's forceValue rather than
+        // a throwaway VMState.  The throwaway pattern was the original
+        // source of cross-VMState Black-mark leaks: if `arg` is a slot
+        // pointing at a thunk currently being forced on the outer VM,
+        // forcing on a fresh VM throws BlackholeError that the outer
+        // VM has no way to recover from.  Sharing the outer VM means
+        // the cycle detection sees the in-flight thunk on the same
+        // frame stack and the existing chase logic (vm.cc:5293+)
+        // handles it correctly.
         //
         // REVIEW §3: wrap forceValue in try/catch + clearBlackMarks
         // so a thrown forceValue doesn't leave Black marks on the
-        // throwaway VMState's frames (the VMState destructor doesn't
-        // clear them).  Mirror what the main dispatchLoop does below.
+        // (potentially throwaway) VMState's frames.  Mirror what the
+        // main dispatchLoop does below.
         Value sArg = arg;
         if (sArg.isThunk() || sArg.tag() == Tag::App
             || sArg.tag() == Tag::Slot) {
-            VMState forceVm;
-            forceVm.valueStack.reserve(64);
-            forceVm.frames.reserve(64);
-            forceVm.withStack.reserve(8);
-            try {
-                sArg = forceValue(forceVm, sArg);
-            } catch (...) {
+            if (VMState * activeVm = activeV3VM()) {
+                size_t exitDepth = activeVm->frames.size();
+                try {
+                    sArg = forceValue(*activeVm, sArg);
+                } catch (...) {
+                    clearBlackMarksOnException(*activeVm, exitDepth);
+                    throw;
+                }
+                clearBlackMarksOnException(*activeVm, exitDepth);
+            } else {
+                VMState forceVm;
+                forceVm.valueStack.reserve(64);
+                forceVm.frames.reserve(64);
+                forceVm.withStack.reserve(8);
+                try {
+                    sArg = forceValue(forceVm, sArg);
+                } catch (...) {
+                    clearBlackMarksOnException(forceVm, 0);
+                    throw;
+                }
                 clearBlackMarksOnException(forceVm, 0);
-                throw;
             }
-            clearBlackMarksOnException(forceVm, 0);
         }
         if (!sArg.isAttrs() || !sArg.payload.bindings)
             throw std::runtime_error(
@@ -5148,6 +5285,15 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
             throw std::runtime_error(
                 "v3 selector lambda: missing attr");
         return *v;
+    }
+
+    // STG-10: re-use the active VM if available (TW→v3 re-entry).
+    // Slot identity in `arg` is preserved through runOnExistingVm's
+    // OP_CALL-shaped frame setup.
+    if (VMState * activeVm = activeV3VM()) {
+        return runOnExistingVm(*activeVm, cu, desc,
+                                upvalues, nUpvalues,
+                                capturedWiths, /*arg*/&arg);
     }
 
     Closure * fakeClo = Alloc::allocClosure(nUpvalues);

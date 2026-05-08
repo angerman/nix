@@ -3137,15 +3137,31 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         } else {
             EvalState v3state;
             v3state.nixEvalState = &ns;
+            // STG-10 (#498): re-use the active v3 VM when available.
+            // primV3CallBridge1 fires when TW invokes a v3 closure via
+            // the bridge primop; if there's an outer v3 dispatchLoop on
+            // the C-stack (= activeV3VM() != nullptr), pushing the body
+            // call onto a FRESH VMState creates the cross-VMState
+            // Black-mark leak we've spent the rest of #498 plugging.
+            // Reuse the outer vm so the body's calls and forces share
+            // the same frame stack and forceValue's chase logic sees
+            // any in-flight thunks correctly.
+            //
             // REVIEW MED-16: stack-allocated -- previous static
             // thread_local could leak frames from a failed prior call
             // into the next.  Reserves remain (they avoided per-call
             // reallocation, not persistence).
             VMState bridgeVm1;
-            bridgeVm1.valueStack.reserve(64 * 1024);
-            bridgeVm1.frames.reserve(4096);
-            bridgeVm1.withStack.reserve(64);
-            v3state.vm = &bridgeVm1;
+            VMState * vmToUse;
+            if (VMState * activeVm = activeV3VM()) {
+                vmToUse = activeVm;
+            } else {
+                bridgeVm1.valueStack.reserve(64 * 1024);
+                bridgeVm1.frames.reserve(4096);
+                bridgeVm1.withStack.reserve(64);
+                vmToUse = &bridgeVm1;
+            }
+            v3state.vm = vmToUse;
             Value v3arg;
             try {
                 v3arg = treeWalkerToV3(v3state, *args[1]);
@@ -3209,12 +3225,21 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         case Tag::Slot: {
             EvalState bridgeState;
             bridgeState.nixEvalState = &ns;
+            // STG-10 (#498): re-use the active v3 VM if available; the
+            // result-bridge for the body's return value has the same
+            // cross-VMState concern as the body call itself.
             // REVIEW MED-16: stack-allocated.
             VMState resultBridgeVm;
-            resultBridgeVm.valueStack.reserve(64 * 1024);
-            resultBridgeVm.frames.reserve(4096);
-            resultBridgeVm.withStack.reserve(64);
-            bridgeState.vm = &resultBridgeVm;
+            VMState * resultVm;
+            if (VMState * activeVm = activeV3VM()) {
+                resultVm = activeVm;
+            } else {
+                resultBridgeVm.valueStack.reserve(64 * 1024);
+                resultBridgeVm.frames.reserve(4096);
+                resultBridgeVm.withStack.reserve(64);
+                resultVm = &resultBridgeVm;
+            }
+            bridgeState.vm = resultVm;
             nix::Value * tmp = v3ToTreeWalker(bridgeState, fn);
             if (tmp) out = *tmp; else out.mkNull();
             break;
@@ -3302,17 +3327,28 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
             (int)found->tag());
     }
 
-    // Bridge this single value.  Set up an EvalState + thread_local
-    // shim VMState (mirrors the closure-bridge primop pattern).
+    // Bridge this single value.  Set up an EvalState + shim VMState
+    // (mirrors the closure-bridge primop pattern).
+    //
+    // STG-10 (#498): re-use the active v3 VM if available so cross-
+    // VMState fresh-VMState forces don't trip on Black thunks the
+    // outer vm is mid-evaluating.  Same rationale as primV3CallBridge1
+    // (see lengthier comment there).
     ScopedNixEvalState _v3evalGuard(&ns);
     EvalState v3state;
     v3state.nixEvalState = &ns;
     // REVIEW MED-16: stack-allocated.
     VMState bridgeVmAttr;
-    bridgeVmAttr.valueStack.reserve(64 * 1024);
-    bridgeVmAttr.frames.reserve(4096);
-    bridgeVmAttr.withStack.reserve(64);
-    v3state.vm = &bridgeVmAttr;
+    VMState * attrVm;
+    if (VMState * activeVm = activeV3VM()) {
+        attrVm = activeVm;
+    } else {
+        bridgeVmAttr.valueStack.reserve(64 * 1024);
+        bridgeVmAttr.frames.reserve(4096);
+        bridgeVmAttr.withStack.reserve(64);
+        attrVm = &bridgeVmAttr;
+    }
+    v3state.vm = attrVm;
 
     // WC-19: deferred forces can hit eval-order cycles v3 sees but
     // tree-walker would resolve.  The eager-bridge path catches these
@@ -3503,11 +3539,19 @@ static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
     EvalState v3state;
     v3state.nixEvalState = &ns;
     // REVIEW MED-16: stack-allocated.
+    // STG-10 (#498): re-use the active v3 VM if available (same
+    // rationale as primV3CallBridge1 / primV3ForceAttr).
     VMState bridgeVmList;
-    bridgeVmList.valueStack.reserve(64 * 1024);
-    bridgeVmList.frames.reserve(4096);
-    bridgeVmList.withStack.reserve(64);
-    v3state.vm = &bridgeVmList;
+    VMState * listVm;
+    if (VMState * activeVm = activeV3VM()) {
+        listVm = activeVm;
+    } else {
+        bridgeVmList.valueStack.reserve(64 * 1024);
+        bridgeVmList.frames.reserve(4096);
+        bridgeVmList.withStack.reserve(64);
+        listVm = &bridgeVmList;
+    }
+    v3state.vm = listVm;
 
     // WC-19: same safety net as primV3ForceAttr.
     // REVIEW_2026-05-04 F4 / §6.3: typed BlackholeError instead of strstr.
@@ -4004,13 +4048,23 @@ struct V3ToTreeWalkerShimInit {
             // bridge dereferences a null pointer and SEGVs.
             // REVIEW MED-16: stack-allocated; .reserve() avoids per-
             // call vector reallocation, not persistence.
+            //
+            // STG-10 (#498): re-use the active v3 VM if available so
+            // any forces during the bridge see in-flight thunks
+            // correctly (no cross-VMState Black leaks).
             VMState bridgeShimVm;
-            bridgeShimVm.valueStack.reserve(64 * 1024);
-            bridgeShimVm.frames.reserve(4096);
-            bridgeShimVm.withStack.reserve(64);
+            VMState * vmToUse;
+            if (VMState * activeVm = activeV3VM()) {
+                vmToUse = activeVm;
+            } else {
+                bridgeShimVm.valueStack.reserve(64 * 1024);
+                bridgeShimVm.frames.reserve(4096);
+                bridgeShimVm.withStack.reserve(64);
+                vmToUse = &bridgeShimVm;
+            }
             EvalState st;
             st.nixEvalState = &ns;
-            st.vm           = &bridgeShimVm;
+            st.vm           = vmToUse;
             return v3ToTreeWalker(st, v);
         };
     }
@@ -7134,13 +7188,24 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
         ~DepthGuard() { --d; }
     } _depthGuard(s_sharedDepth);
 
+    // STG-10 (#498): re-use the active v3 VM if available so the body
+    // call shares its frame stack with the outer dispatchLoop (avoiding
+    // cross-VMState Black-mark leaks).  This is the bridge1-direct
+    // shortcut path used when the call hook hits a v3 closure wrapped
+    // as `mkPrimOpApp(__v3_call_bridge_1, handle)`.
     VMState vm;
-    vm.valueStack.reserve(64 * 1024);
-    vm.frames.reserve(4096);
-    vm.withStack.reserve(64);
+    VMState * vmToUse;
+    if (VMState * activeVm = activeV3VM()) {
+        vmToUse = activeVm;
+    } else {
+        vm.valueStack.reserve(64 * 1024);
+        vm.frames.reserve(4096);
+        vm.withStack.reserve(64);
+        vmToUse = &vm;
+    }
     EvalState st;
     st.nixEvalState = &ns;
-    st.vm = &vm;
+    st.vm = vmToUse;
 
     Value r;
     try {
@@ -7282,13 +7347,20 @@ Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv)
 {
     BridgeTimer _bt(BridgeKind::TwToV3Full);
     // REVIEW MED-16: stack-allocated.
+    // STG-10 (#498): re-use the active v3 VM if available.
     VMState bridgeShimVm;
-    bridgeShimVm.valueStack.reserve(64 * 1024);
-    bridgeShimVm.frames.reserve(4096);
-    bridgeShimVm.withStack.reserve(64);
+    VMState * vmToUse;
+    if (VMState * activeVm = activeV3VM()) {
+        vmToUse = activeVm;
+    } else {
+        bridgeShimVm.valueStack.reserve(64 * 1024);
+        bridgeShimVm.frames.reserve(4096);
+        bridgeShimVm.withStack.reserve(64);
+        vmToUse = &bridgeShimVm;
+    }
     EvalState st;
     st.nixEvalState = &nixState;
-    st.vm           = &bridgeShimVm;
+    st.vm           = vmToUse;
     return treeWalkerToV3(st, nv);
 }
 
