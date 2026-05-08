@@ -174,5 +174,90 @@ follow-up.
   ensuring it stays correct under tail-call is a separate concern
   (already the existing semantics).
 
+## Implementation status — 2026-05-08
+
+LANDED (commit `af8715433`):
+
+* `Scope::Kind::With` push with `withTargetVar` records the lowered
+  attrs VarId for each enclosing `with`.
+* `ir::MkThunk`, `ir::Lambda`, `ir::LetRec::Entry`,
+  `ir::LetRec::HiddenEntry` carry `lexicalWiths: vector<VarId>`.
+* `ir::Function::nWithTargets` and `LambdaDescriptor::nWithTargets`
+  carry the count to runtime / disk cache.
+* Lowerer's `collectLexicalWiths()` populates the chain at every
+  thunkify / make-closure site.  Per-entry letrec thunks share the
+  chain captured ONCE at the LetRec construction site (matches
+  lexical position).
+* `computeFreeVars`'s `collectExprRefs` adds `lexicalWiths` to the
+  binding's outer-block refs so they propagate up to the maker
+  function's freeVars when crossing frame boundaries.
+* `emit.cc` pushes `lexicalWiths` BEFORE `freeVars`; OP_MAKE_CLOSURE /
+  OP_MAKE_THUNK carry TWO data words now (`nUpvalues` then
+  `nWithTargets`).
+* `vm.cc` OP_MAKE_CLOSURE / OP_MAKE_THUNK pop upvalues into
+  `upvalues[]`/`tail[]` first (top of stack), then with-targets into
+  `capturedWiths` ListVec.  Falls back to `snapshotCurrentWiths` only
+  when `nWithTargets == 0` (synthetic call paths that didn't go
+  through the lowerer).
+* `serialize.cc` schema bumped 4→5; `disasm.cc` and vm diagnostic
+  walkers updated for the new 3-word encoding.
+* `opt_inline.cc` rewriteVar honours `lexicalWiths`.
+
+Tests (all green except KNOWN-FAIL flips that should be tightened):
+
+* `run-lexical-withs-tests.sh` 15/15 — positive + negative + regression
+  including formals-with-pkgs and curried with-escape.
+* `run-self-dot-thunkify-tests.sh` 11/11.
+* `run-direct-eval-tests.sh` 26/26.
+* `run-lang-tests.sh` 142/142.
+* `run-cutover-parity-tests.sh` 140/142 (pre-existing).
+* `run-on-demand-root-tests.sh` 142×4 / 142×4 (all four modes).
+* `run-broader-thunkify-tests.sh` 4/4, `run-456-chase-cycle-tests.sh`
+  7/7, `run-evalscope-tests.sh` 4/4, `run-disk-cache-tests.sh` 5/5,
+  `run-bridge-attr-lookup-tests.sh` 21/21,
+  `run-bridge-thunk-after-force-tests.sh` 8/8,
+  `run-bridge-stack-uaf-tests.sh` 6/6,
+  `run-lazy-bridge-arg-tests.sh` 9/9,
+  `run-bridge1-shortcut-tests.sh` 17/17,
+  `run-tw-lambda-bridge-tests.sh` 12/12,
+  `run-mutual-circular-formals-tests.sh` 10/10,
+  `run-wc-laziness-tests.sh` 85/85,
+  `run-fix-inherit-from-self-tests.sh` 5/5,
+  `run-gate-removal-tests.sh` 35/35.
+* `run-458-rec-slot-capture-tests.sh` 18/20 (same 2 nixpkgs#hello.name
+  fails as pre-existing).
+
+KNOWN-FAIL → flipped-to-pass (tests asserting the failure mode are
+now stale; assertions need updating):
+
+* `run-intrinsic-recognition-tests.sh` d3b default: full lib.fix +
+  extends now returns 11 without `NIX_V3_SELF_DOT_MAX_LEVEL=2`
+  workaround.  The lexical chain materialises the fix-point's `self`
+  with-targets correctly at level=1.
+* `run-inherit-from-laziness-tests.sh` p2 v3-skip: v3 owns the
+  evaluation cleanly without TW fallback (`runThrew=0`); the post-#496
+  fallback is no longer needed under the lexical chain.
+* `run-on-demand-root-shapes.sh` #455 NEGATIVE-OF-POSITIVE:
+  `NIX_V3_NO_CALL_HOOK_EAGER=1` no longer trips the auto-eager guard.
+
+OPEN (post-landing diagnostic):
+
+* **`(import <nixpkgs> {}).lib.id 5` fails with `OP_GET_UPVALUE: no
+  closure context`** under `NIX_V3_DIRECT_EVAL=1`.  Standalone repros
+  of `mergeAttrsList`-shape (the failing thunk per FORCE_TRACE,
+  `attrsets.nix:1627:22`) work.  The full nixpkgs evaluation goes
+  through by-name-overlay's `_internalCallByName` machinery; some
+  thunk is being force-called via runFunction (closure=nullptr)
+  with a body that emits OP_GET_UPVALUE.
+  - Hypothesis: a nested Lambda inside a function whose lexicalWiths
+    propagation causes its freeVars to grow.  When that function is
+    called via `runFunction(funcIdx, capturedWiths)` (no upvalues
+    arg) somehow without nUpvalues mismatch firing first, OP_GET_UPVALUE
+    falls off the closure context.
+  - Investigation: `V3_DBG_FORCE_TRACE` shows the failing chain
+    ends at `attrsets.nix:1627:22` (binaryMerge call).  Need to
+    trace which v3 entry-point dispatches that thunk and verify it
+    propagates the closure correctly.
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
