@@ -1741,6 +1741,19 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     std::fprintf(stderr,
                         "v3 intrinsic Fix: native dispatch calls=%llu\n",
                         (unsigned long long)fixCalls);
+                // STG-13c (#509/#512): ExtendsBody / ComposeBody.
+                if (uint64_t exCalls =
+                        allocStats().intrinsicExtendsCalls;
+                    exCalls > 0)
+                    std::fprintf(stderr,
+                        "v3 intrinsic ExtendsBody: native dispatch calls=%llu\n",
+                        (unsigned long long)exCalls);
+                if (uint64_t coCalls =
+                        allocStats().intrinsicComposeCalls;
+                    coCalls > 0)
+                    std::fprintf(stderr,
+                        "v3 intrinsic ComposeBody: native dispatch calls=%llu\n",
+                        (unsigned long long)coCalls);
                 // #436: call-hook closure-result refusals.
                 if (s.callHookClosureResultRefused > 0)
                     std::fprintf(stderr,
