@@ -64,7 +64,18 @@ namespace nix::v3::serialize {
 /// is materialised into the resulting Closure / Thunk's
 /// `capturedWiths` ListVec.  Replaces `snapshotCurrentWiths` as the
 /// source of truth for the lexical with-chain.
-constexpr uint32_t kSchemaVersion = 5;
+///
+/// Schema 6 (2026-05-09): #546 v3-direct callPackage with-scope fix --
+/// new OP_ATTRS_LET_REC_INIT (0x86) opcode emitted in lieu of
+/// OP_ATTRS_REC_INIT for `let ... in body` shapes (lowerLet, hasBody=
+/// true).  Bytecode-identical (same trailing data, same following
+/// REC_SETs) but the runtime skips publishToNearestBlackThunkFrame --
+/// the recAttrs is intermediate state, not the surrounding thunk's
+/// eventual return value.  Old caches must reload because they used
+/// OP_ATTRS_REC_INIT for both shapes; the opcode-table fingerprint
+/// catches the difference but bumping the schema makes the rejection
+/// crisp.  See lode/CALLPACKAGE_BUG_2026-05-09.md.
+constexpr uint32_t kSchemaVersion = 6;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

@@ -219,6 +219,7 @@ void dumpLitBuiltins(W & w, const LitBuiltins &) { w.put("LitBuiltins"); }
 
 void dumpLetRec(W & w, const LetRec & e) {
     w.put("LetRec recVar="); w.var(e.recVar);
+    w.put(e.hasBody ? " kind=let-in-body" : " kind=rec-attrs");
     w.put(" entries={");
     for (size_t i = 0; i < e.entries.size(); ++i) {
         if (i) w.put(",");

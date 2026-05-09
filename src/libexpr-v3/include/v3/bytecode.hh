@@ -201,6 +201,27 @@ enum Op : uint8_t
     /// next OP_CALL/OP_MAKE_THUNK that grew the stack.
     OP_THUNK_SET_LOCAL_THROUGH_CELL = 0x85, // [slot:24]
 
+    /// Bytecode-identical to OP_ATTRS_REC_INIT (allocates a placeholder
+    /// rec-attrset Bindings of size [n:24], with n trailing (SymbolId,
+    /// PosIdx) pairs in the same layout) BUT does NOT call
+    /// publishToNearestBlackThunkFrame.  Emitted by the lowerer for
+    /// `let ... in body` shapes (lowerLet -> lowerLetRecCapture with
+    /// hasBody=true) where the rec-attrset is INTERMEDIATE state, not
+    /// the surrounding thunk's eventual return value.
+    ///
+    /// The publish-to-Black-thunk behaviour of OP_ATTRS_REC_INIT only
+    /// makes sense for bare `rec { ... }` literals, where the rec-
+    /// attrset IS the surrounding thunk's eventual return value (so
+    /// publishing it as the thunk's `evaluated` field is correct, and
+    /// lets self-references like `rec { x = 1; y = self.x; }` resolve
+    /// without forcing the wrap thunk).  For `let prev = ...; in
+    /// body`, the thunk's eventual return value is `body`, NOT the
+    /// `{prev}` recAttrs — publishing `{prev}` corrupts the thunk's
+    /// state with a wrong-shape value.  Surfaced as the v3-direct
+    /// callPackage-with-scope bug (lib.extends / lib.fix interaction
+    /// in nixpkgs hello.name; see lode/CALLPACKAGE_BUG_2026-05-09.md).
+    OP_ATTRS_LET_REC_INIT = 0x86, // [n:24]; data: 2n (name, pos) pairs
+
     // --- Strings --------------------------------------------------------
     OP_STR_CONCAT     = 0x90,  // [n:24] forceString stored in low bit of n; pops n parts
 

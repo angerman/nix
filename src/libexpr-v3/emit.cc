@@ -816,9 +816,22 @@ struct Emitter
         for (uint32_t slot = 0; slot < n; ++slot)
             entryToSlot[sortedOrder[slot]] = slot;
 
-        // 1. OP_ATTRS_REC_INIT[n] + n sorted (SymbolId, PosIdx) pairs:
-        //    push placeholder rec Bindings on operand stack.
-        unit.code.push_back(encode(OP_ATTRS_REC_INIT, n));
+        // 1. OP_ATTRS_REC_INIT or OP_ATTRS_LET_REC_INIT (based on
+        //    hasBody) + n sorted (SymbolId, PosIdx) pairs: push
+        //    placeholder rec Bindings on operand stack.
+        //
+        // OP_ATTRS_REC_INIT additionally publishes the rec-attrs to
+        // the nearest Black thunk frame's `evaluated` field (legitimate
+        // for `rec { ... }` literals where the rec-attrs IS the
+        // surrounding thunk's eventual return value).  OP_ATTRS_LET_REC
+        // _INIT skips that publish (correct for `let ... in body`
+        // where the thunk's return value is `body`, not the recAttrs;
+        // publishing the let's intermediate `{prev}` etc. corrupts the
+        // surrounding thunk's state -- the v3-direct callPackage with-
+        // scope bug; see CALLPACKAGE_BUG_2026-05-09.md).
+        const Op initOp = e.hasBody ? OP_ATTRS_LET_REC_INIT
+                                    : OP_ATTRS_REC_INIT;
+        unit.code.push_back(encode(initOp, n));
         for (uint32_t slot = 0; slot < n; ++slot) {
             unit.code.push_back(e.entries[sortedOrder[slot]].name);
             unit.code.push_back(e.entries[sortedOrder[slot]].pos);

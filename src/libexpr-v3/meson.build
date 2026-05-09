@@ -209,4 +209,17 @@ if python3.found()
     args : [files('test/lint-no-inline-getenv.sh')],
     timeout : 30,
   )
+
+  # #546: regression suite for the OP_ATTRS_REC_INIT vs
+  # OP_ATTRS_LET_REC_INIT split.  Verifies rec-attrs self-reference
+  # (publish path) still works AND let-in-body / formals-default paths
+  # (no-publish path) still work after the split.  See
+  # CALLPACKAGE_BUG_2026-05-09.md.
+  test(
+    'v3-let-rec-publish-split',
+    find_program('bash'),
+    args : [files('test/run-let-rec-publish-split-tests.sh')],
+    timeout : 60,
+    env : {'NIX' : meson.global_build_root() / 'src' / 'nix' / 'nix'},
+  )
 endif

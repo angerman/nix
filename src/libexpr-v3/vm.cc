@@ -3927,6 +3927,49 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, v);
             break;
         }
+        case OP_ATTRS_LET_REC_INIT: {
+            // Bytecode-identical body to OP_ATTRS_REC_INIT (allocate a
+            // placeholder rec-attrset with the n trailing (name, pos)
+            // pairs; entries are filled in by following OP_ATTRS_REC_SET
+            // ops sharing the same n-slot layout).
+            //
+            // KEY DIFFERENCE: no publishToNearestBlackThunkFrame.  The
+            // emitter selects this opcode for `let ... in body` shapes
+            // (lowerLet -> lowerLetRecCapture with hasBody=true), where
+            // the rec-attrset is INTERMEDIATE state -- the surrounding
+            // thunk's eventual return value is `body`'s evaluation,
+            // NOT the recAttrs.  Publishing the placeholder recAttrs
+            // (or its in-progress fill) to the surrounding Black thunk
+            // sets thunk->state=Evaluated with a wrong-shape value,
+            // which later participates in with-scope lookups and
+            // produces "name X not found in with-scope" errors when
+            // the with-source dereferences to that wrong shape.
+            //
+            // Specifically surfaces in lib.extends's body
+            //   `final: let prev = f final; in prev // overlay final prev`
+            // where `let prev = ...` ran inside lib.fix's `x`-thunk
+            // body and published `{prev}` (size 1) onto `x`'s thunk.
+            // Inner closures that captured `pkgs = self = final = x`
+            // then saw `{prev}` instead of the full pkgs attrset and
+            // failed to resolve `with pkgs; callPackage`.  See
+            // CALLPACKAGE_BUG_2026-05-09.md for the full analysis.
+            uint32_t n = operand;
+            Bindings * b = Alloc::allocBindings(n);
+            allocStats().attrsetsAllocated++;
+            for (uint32_t i = 0; i < n; ++i) {
+                SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
+                uint32_t ps = cu->code[ip + 2 * i + 1];
+                b->entries[i].name = nm;
+                b->entries[i].value.mkNull();
+                recordAttrPos(b, nm, ps);
+            }
+            ip += 2 * n;
+            Value v;
+            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+            v.payload.bindings = b;
+            push(vm, v);
+            break;
+        }
         case OP_APPLY_OVERRIDES: {
             // Peek the attrset on top of stack.  If it has __overrides,
             // force it and merge each (name, value) into the rec attrs:

@@ -135,6 +135,7 @@ uint64_t opcodeTableFingerprint()
             {"OP_ATTRS_INIT",      OP_ATTRS_INIT},
             {"OP_ATTRS_INIT_DYN",  OP_ATTRS_INIT_DYN},
             {"OP_ATTRS_REC_INIT",  OP_ATTRS_REC_INIT},
+            {"OP_ATTRS_LET_REC_INIT", OP_ATTRS_LET_REC_INIT},
             {"OP_ATTRS_REC_SET",   OP_ATTRS_REC_SET},
             {"OP_ATTRS_SELECT",    OP_ATTRS_SELECT},
             {"OP_ATTRS_SELECT_DYN", OP_ATTRS_SELECT_DYN},
@@ -192,7 +193,8 @@ namespace {
 /// Walk the bytecode of `cu` and rewrite every SymbolId operand
 /// (in OP_WITH_LOOKUP / OP_ATTRS_SELECT / OP_ATTRS_HAS) and every
 /// trailing-data SymbolId (in OP_ATTRS_INIT / OP_ATTRS_INIT_DYN /
-/// OP_ATTRS_REC_INIT) using the supplied remap table.
+/// OP_ATTRS_REC_INIT / OP_ATTRS_LET_REC_INIT) using the supplied
+/// remap table.
 ///
 /// `remap[oldId] = newGlobalId`.  For ids beyond `remap.size()`
 /// (shouldn't happen if cu.symbolTable was the source of truth at
@@ -270,10 +272,13 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
                 ip += 2;
             }
             ip += nDyn;
-        } else if (op == OP_ATTRS_REC_INIT) {
+        } else if (op == OP_ATTRS_REC_INIT || op == OP_ATTRS_LET_REC_INIT) {
             // Remap names + remember their old positions so we can
             // re-sort and propagate the permutation to the matching
-            // OP_ATTRS_REC_SETs.
+            // OP_ATTRS_REC_SETs.  OP_ATTRS_LET_REC_INIT shares the
+            // same trailing data layout (n (name, pos) pairs) as
+            // OP_ATTRS_REC_INIT and emits the same OP_ATTRS_REC_SETs
+            // afterwards -- only the runtime semantics differ.
             uint32_t n = operand;
             std::vector<std::pair<uint32_t, uint32_t>> namePos(n);  // (newName, pos)
             for (uint32_t i = 0; i < n; ++i) {

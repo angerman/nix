@@ -312,6 +312,29 @@ struct LetRec {
         std::vector<VarId>  lexicalWiths;
     };
     std::vector<HiddenEntry> hiddenEntries;
+
+    /// True when this LetRec was lowered from `let ... in body` (i.e.
+    /// the rec-attrset is INTERMEDIATE state, the binding's value is
+    /// `body`).  False when lowered from `rec { ... }` (where the
+    /// rec-attrset IS the binding's value).
+    ///
+    /// Drives the choice of init-opcode in emit:
+    ///   hasBody=false -> OP_ATTRS_REC_INIT      (publishes recAttrs
+    ///                                              to nearest Black
+    ///                                              thunk -- legitimate
+    ///                                              self-reference path)
+    ///   hasBody=true  -> OP_ATTRS_LET_REC_INIT  (no publish -- the
+    ///                                              thunk's return value
+    ///                                              is `body`, not the
+    ///                                              rec-attrs)
+    ///
+    /// Without this distinction, a `let prev = f final; in prev //
+    /// overlay final prev` (the lib.extends shape) publishes the
+    /// `{prev}` placeholder recAttrs to the surrounding thunk, which
+    /// later participates as a wrong-shape value in with-scope lookups
+    /// (the v3-direct callPackage-with-scope bug; see
+    /// CALLPACKAGE_BUG_2026-05-09.md).
+    bool hasBody = false;
 };
 
 // ---------------------------------------------------------------------------

@@ -1198,6 +1198,17 @@ struct Lowerer
             // entry's thunkBody is the function we just lowered.
             ir::LetRec letRec;
             letRec.recVar = formalsRec;
+            // Synthetic LetRec for default-bearing formals: the rec
+            // attrs is INTERMEDIATE state -- the lambda body
+            // (lowered below) is what produces the lambda's return
+            // value.  Mark hasBody=true so the emitter selects
+            // OP_ATTRS_LET_REC_INIT (no publish-to-Black-thunk),
+            // matching the lowerLet path.  Without this, every
+            // default-bearing formals lambda publishes the placeholder
+            // formals attrs onto its surrounding Black thunk -- a
+            // latent variant of the v3-direct callPackage with-scope
+            // bug (CALLPACKAGE_BUG_2026-05-09.md).
+            letRec.hasBody = true;
             letRec.entries.reserve(nF);
             for (size_t i = 0; i < nF; ++i) {
                 ir::LetRec::Entry en;
@@ -2310,6 +2321,12 @@ struct Lowerer
 
         ir::LetRec letRec;
         letRec.recVar = recVar;
+        // Track whether this is `let ... in body` (intermediate
+        // recAttrs) vs `rec { ... }` (recAttrs IS the value).  emit.cc
+        // selects OP_ATTRS_LET_REC_INIT vs OP_ATTRS_REC_INIT based on
+        // this.  See ir::LetRec::hasBody comment + bytecode.hh's
+        // OP_ATTRS_LET_REC_INIT documentation for why this matters.
+        letRec.hasBody = hasBody;
         letRec.entries.reserve(pending.size());
         // #530 lexical-with chain — capture the chain ONCE at the
         // LetRec construction site; every per-entry thunk and every

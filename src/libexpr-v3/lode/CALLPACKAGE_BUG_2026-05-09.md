@@ -290,3 +290,73 @@ the load-bearing real-world signal.
 cardano-node would face the same wall: it's `import nixpkgs {} //
 import ./pkgs.nix` shape, which goes through the same all-packages
 + extends path.
+
+## 2026-05-09 fix step 1: split OP_ATTRS_REC_INIT (#546)
+
+Implemented a clean split between two semantically-different rec-
+attrset construction sites:
+
+- **`rec { ... }` literal** (where the rec-attrs IS the surrounding
+  thunk's eventual return value).  Continues to emit
+  `OP_ATTRS_REC_INIT`, which publishes the rec-attrs to the nearest
+  Black thunk frame's `evaluated` field.  Preserves the legitimate
+  `rec { x = 1; y = self.x; }` self-reference path that
+  publish-on-init enabled.
+
+- **`let ... in body`** (where the rec-attrs is INTERMEDIATE state,
+  the thunk's eventual return value is `body`).  Now emits
+  `OP_ATTRS_LET_REC_INIT`, which is bytecode-identical (same
+  trailing data, same following REC_SETs) but skips the publish.
+
+Lower.cc plumbing: `ir::LetRec::hasBody` is set true by `lowerLet`
+(the `let-in-body` source) and by the synthetic LetRec inside
+`lowerLambda` for default-bearing formals (where the formals attrs
+is intermediate state ahead of the lambda body).  False for
+`lowerAttrs`'s recursive `rec { ... }` attrsets.
+
+emit.cc line ~821 selects the opcode from `e.hasBody`.  Schema
+bumped to 6 (CALLPACKAGE_BUG_2026-05-09 reference in the comment),
+opcode-table fingerprint updated, disasm + serialize remap walks
+updated.
+
+### Effect
+
+- The `OP_WITH_LOOKUP: name 'callPackage' not found in with-scope`
+  symptom is GONE.  The with-source no longer derefs to the
+  `{prev}` size-1 attrs (publish would have written it onto lib.fix's
+  outermost Black thunk; with publish skipped, the cell stays
+  pointing at the recAttrs's actual value).
+
+- New symptom (under `(import /tmp/nixpkgs-bisect {}).hello.name`):
+  ```
+  v3 OP_WITH_LOOKUP cycle: name='callPackage' base=1 top=2 frames=90
+    with[1] tag=16 -> SLOT(0x...) = tag=10 (Thunk state=1 Blackhole)
+  ```
+  The with-source is a Tag::Slot to a Black thunk (lib.fix's `x`
+  thunk currently being forced).  withLookup tries to force it,
+  hits BlackholeError, throws cycle.
+
+  This is a SEPARATE issue from the publish-mistake -- the v3-direct
+  path is forcing some `with pkgs;` thunk DURING construction of
+  pkgs, where TW would only force it AFTER pkgs is fully evaluated.
+  Tracked architecturally by STG-13 (lazy v3-to-TW bridge for
+  Tag::Slot/Tag::Thunk).  My fix here unblocks the symptom-shift but
+  the deeper eval-order divergence requires the slot-bridge work.
+
+### Synthetic regression coverage
+
+These all pass under v3-direct after the fix:
+
+- `rec { x = 1; y = x + 1; }` -> `{ x = 1; y = 2; }` (rec-attrs path
+  still publishes correctly).
+- `(let f = x: rec { a = x; b = a + 1; }; in (f 5).b)` -> `6`
+  (rec-attrs through a let-in-body return).
+- `lib.fix (self: { x = 1; y = self.x + 1; })` -> `{ x = 1; y = 2; }`
+  (the rec attrs path under lib.fix).
+- `lib.fix (lib.extends overlay base)` -> works (single-stage).
+- `lib.fix (lib.extends overlay base) where overlay uses `with final;`
+  -> works.
+
+So the regression surface is clean: every shape that worked before
+still works, and the wrong-shape-`{prev}` symptom shifts to a
+crisp Black-thunk cycle that surfaces the deeper architectural gap.
