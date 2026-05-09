@@ -86,6 +86,14 @@ struct Emitter
     const ir::Module & m;
     CompilationUnit unit;
 
+    /// #542 — module-wide occurrence info, computed once per compile.
+    /// Drives the per-binding "defer SET vs emit SET" decision: only
+    /// OnceLinear bindings are safe to defer (single use → the
+    /// consumer pops the value off the runtime stack exactly once).
+    /// Many-use bindings need a real SET so subsequent GETs read from
+    /// the slot.
+    ir::OccMap occ;
+
     struct FuncCtx
     {
         ir::FuncId                          fid;
@@ -93,10 +101,99 @@ struct Emitter
         std::unordered_map<ir::VarId, uint16_t> upvalue;
         uint16_t nextSlot = 0;
         uint16_t nLocals  = 0;
+
+        /// #542 emit-time deferring stack.  Each entry corresponds to
+        /// a runtime-stack value that has NOT yet been flushed to its
+        /// slot (its binding's SET_LOCAL was elided).  pendingDefer.back()
+        /// is the top of the runtime stack; pendingDefer[0] is the
+        /// deepest deferred value.  Mirrors the runtime-stack region
+        /// above the *previous* "stable" depth.
+        ///
+        /// Discipline:
+        ///   - Push only OnceLinear bindings (count==1, single use).
+        ///   - emitVarRef matches and consumes top (or flushes above
+        ///     and consumes deeper).
+        ///   - Binary-op fast path detects [lhs, rhs] at end of
+        ///     pending and emits the OP without GETs.
+        ///   - At sub-block boundary (emitBlock for then/else/rhs/
+        ///     body), caller flushes via flushAllDeferred() before
+        ///     descending — sub-blocks always run with empty pending.
+        std::vector<ir::VarId> pendingDefer;
     };
     FuncCtx * ctx = nullptr;
 
-    Emitter(const ir::Module & mod) : m(mod) {}
+    Emitter(const ir::Module & mod) : m(mod) {
+        // #542: occurrence info drives the defer-vs-SET decision
+        // per binding.  Cheap (~O(N) on module size); compute once.
+        occ = ir::analyseOccurrence(m);
+    }
+
+    // -- #542 deferring helpers --------------------------------------------
+
+    /// Flush all pending deferred values to their slots, top-down.
+    /// After this returns, pending is empty and every previously-
+    /// deferred binding's slot has been populated.
+    void flushAllDeferred()
+    {
+        while (!ctx->pendingDefer.empty()) {
+            ir::VarId v = ctx->pendingDefer.back();
+            ctx->pendingDefer.pop_back();
+            uint16_t slot = getOrAssignSlot(v);
+            unit.code.push_back(encode(OP_SET_LOCAL, slot));
+        }
+    }
+
+    /// Flush deferred values whose pendingDefer index is > `keepIdx`.
+    /// Used when emitVarRef finds the target var deeper in the stack:
+    /// flush everything ABOVE it so it ends up on top, then consume.
+    void flushDeferAbove(size_t keepIdx)
+    {
+        while (ctx->pendingDefer.size() > keepIdx + 1) {
+            ir::VarId v = ctx->pendingDefer.back();
+            ctx->pendingDefer.pop_back();
+            uint16_t slot = getOrAssignSlot(v);
+            unit.code.push_back(encode(OP_SET_LOCAL, slot));
+        }
+    }
+
+    /// Try to consume a binary-op's [lhs, rhs] from the pending stack
+    /// top.  If pending ends with [lhs, rhs] in order, pop both and
+    /// return true (caller emits just the OP).  Else return false
+    /// (caller falls back to emitVarRef path).
+    bool tryFastPathBinary(ir::VarId lhs, ir::VarId rhs)
+    {
+        auto & p = ctx->pendingDefer;
+        if (p.size() < 2) return false;
+        if (p[p.size() - 2] != lhs) return false;
+        if (p.back() != rhs) return false;
+        p.pop_back();
+        p.pop_back();
+        return true;
+    }
+
+    /// Push `v` to pendingDefer if it's safe to defer (OnceLinear).
+    /// Called by emitBlock instead of emitting OP_SET_LOCAL.  For
+    /// non-OnceLinear bindings this falls through to a real SET so
+    /// the slot is populated for multiple GETs.
+    /// Returns true iff deferred (caller skipped SET).
+    bool tryDefer(ir::VarId var)
+    {
+        // NIX_V3_NO_DEFER=1: A/B switch.  Disables deferring entirely
+        // so a regression can be bisected to "v3 emit deferring
+        // optimisation" vs "everything else."
+        static const bool disabled =
+            std::getenv("NIX_V3_NO_DEFER") != nullptr;
+        if (disabled) return false;
+
+        // Only OnceLinear bindings are safe to defer: by definition a
+        // single use exists and the consumer pops the value off the
+        // runtime stack.  Many / OnceCaptured / Param: not safe (the
+        // value must persist in a slot for multiple/cross-frame uses).
+        if (occ.lookup(var).kind != ir::OccKind::OnceLinear)
+            return false;
+        ctx->pendingDefer.push_back(var);
+        return true;
+    }
 
     // Helpers ---------------------------------------------------------------
 
@@ -112,6 +209,22 @@ struct Emitter
 
     void emitVarRef(ir::VarId v)
     {
+        // #542 deferring discipline: emitVarRef ALWAYS flushes any
+        // pending deferred values to their slots before emitting the
+        // GET.  This is safe and simple — the alternative (consuming
+        // top-of-pending without flushing) requires the immediate
+        // next emit step to be an OP that pops the consumed value,
+        // and getting the consume/non-consume invariant right at
+        // every emitVarRef call site is fragile.
+        //
+        // The actual win from deferring comes via op-level fast
+        // paths (tryFastPathBinary / tryFastPathUnary) which check
+        // pending BEFORE calling emitVarRef.  When the fast path
+        // fires, both/all operands are popped from pending and only
+        // the OP itself is emitted — no GETs.  When it doesn't fire,
+        // we degrade gracefully to the standard flush+GET pattern,
+        // matching the no-deferring baseline.
+        flushAllDeferred();
         if (auto it = ctx->slot.find(v); it != ctx->slot.end()) {
             unit.code.push_back(encode(OP_GET_LOCAL, it->second));
             return;
@@ -121,6 +234,16 @@ struct Emitter
             return;
         }
         throw std::runtime_error("v3 emit: unbound VarId " + std::to_string(v));
+    }
+
+    /// #542 unary fast path: if `operand` is at top of pendingDefer,
+    /// pop it and return true (caller emits just the OP, no GET).
+    bool tryFastPathUnary(ir::VarId operand)
+    {
+        auto & p = ctx->pendingDefer;
+        if (p.empty() || p.back() != operand) return false;
+        p.pop_back();
+        return true;
     }
 
     uint32_t addIntConst(int64_t n)
@@ -249,42 +372,79 @@ struct Emitter
         const ir::Block & b = m.blocks[bid];
         const auto & ret = std::get<ir::TermReturn>(b.terminal);
 
+        // #542: at every emitBlock entry, flushAllDeferred().  Any
+        // pending entries from outside this block (the function's
+        // entry block has none; sub-blocks may inherit outer pending)
+        // get committed to slots BEFORE this block's bindings emit.
+        // After the flush the runtime stack has no deferred values;
+        // sub-block bindings build their own pending state from
+        // scratch and clean it up before exit.
+        //
+        // This is the load-bearing safety property: emitBlock always
+        // runs with pending=[] at entry and exits with pending=[].
+        flushAllDeferred();
+
         // Optimisation: when the very last binding's VarId is the
         // block's TermReturn value, the binding's expression result
         // is already on top of the operand stack right after we
-        // emit it.  Emit the trailing SET_LOCAL only if a slot was
-        // previously assigned (someone else might reference this
-        // var), but skip the SET+GET round-trip and leave the value
-        // on the stack — the function-tail OP_CALL→OP_TAIL_CALL
-        // peephole then has a chance to fire.
+        // emit it.  Skip the SET + trailing GET round-trip.  Combined
+        // with #542 deferring, we additionally need to flush any
+        // mid-block pending BEFORE the tail binding emits (so the
+        // tail's value sits cleanly on top with no deferred values
+        // beneath it that would conflict with sub-block-exit
+        // invariants).
         const size_t nBd = b.bindings.size();
         bool tailLast = nBd > 0 && b.bindings.back().var == ret.value;
 
-        // Params have already been bound by the caller (e.g., function
-        // prologue assigned param-VarId -> slot 0).
         for (size_t i = 0; i < nBd; ++i) {
             auto & bd = b.bindings[i];
-            emitExpr(bd.expr);
-            // For the tail binding (last binding == term value), the
-            // emitted bytecode already left the value on the operand
-            // stack.  Skip the SET + trailing GET round-trip — slots
-            // are pre-assigned by preassignSlotsInBlock but only
-            // referenced when something explicitly emits OP_GET_LOCAL
-            // for them; nothing in this block does.  Other blocks
-            // can't reach this var (it's bound only here).
             bool isTail = tailLast && (i + 1 == nBd);
-            if (isTail) continue;
-            uint16_t slot = getOrAssignSlot(bd.var);
-            unit.code.push_back(encode(OP_SET_LOCAL, slot));
+
+            emitExpr(bd.expr);
+
+            if (isTail) {
+                // #542: AFTER tail's emit, pending may still contain
+                // entries that were deferred by earlier bindings AND
+                // not consumed by tail's emit.  Their runtime values
+                // sit BELOW tail's value on the stack.  We must flush
+                // them so emitBlock exits with pending=[] and the
+                // tail's value cleanly on top.  Use the binding's
+                // slot as a scratch: SET tail_slot; flush; GET
+                // tail_slot.  When pending is empty (binary fast
+                // path consumed everything — the common case for
+                // fib's `Less(force(k), 2)` shape), this branch is
+                // skipped and we save the 3-op overhead.
+                if (!ctx->pendingDefer.empty()) {
+                    uint16_t slot = getOrAssignSlot(bd.var);
+                    unit.code.push_back(encode(OP_SET_LOCAL, slot));
+                    flushAllDeferred();
+                    unit.code.push_back(encode(OP_GET_LOCAL, slot));
+                }
+                continue;
+            }
+
+            // #542: try to defer this binding's SET if its var is
+            // OnceLinear.  Subsequent emitOne calls may consume it
+            // via fast paths (binary/unary) or via emitVarRef-with-
+            // top-match.  If not OnceLinear, fall back to the real
+            // SET so the slot is populated for multiple GETs.
+            if (!tryDefer(bd.var)) {
+                uint16_t slot = getOrAssignSlot(bd.var);
+                unit.code.push_back(encode(OP_SET_LOCAL, slot));
+            }
         }
 
-        // Terminal: TermReturn.  If we elided the SET for the tail
-        // binding, the value is already on top — skip the trailing
-        // emitVarRef.
+        // Terminal: TermReturn.  If tailLast, the value is already on
+        // top — nothing to emit.  Else: emit the value via emitVarRef
+        // (which flushes any remaining pending and emits GET).
         if (ret.value != ir::kInvalid && !tailLast)
             emitVarRef(ret.value);
         else if (ret.value == ir::kInvalid)
             unit.code.push_back(encode(OP_LIT_NULL));
+
+        // Invariant: pending is empty here.  emitVarRef flushes; tail
+        // path doesn't push to pending.  Mid-block pending was flushed
+        // before tail emitted.
     }
 
     // Expr emit -------------------------------------------------------------
@@ -358,21 +518,41 @@ struct Emitter
     }
     void emitOne(const ir::App & e)
     {
+        // #542: fast path when [fun, arg] are both OnceLinear and
+        // pending in order.  Saves the SET+GET on each.
+        if (tryFastPathBinary(e.fun, e.arg)) {
+            unit.code.push_back(encode(OP_CALL));
+            return;
+        }
         emitVarRef(e.fun); emitVarRef(e.arg);
         unit.code.push_back(encode(OP_CALL));
     }
     void emitOne(const ir::Force & e)
     {
-        // Fuse `Force(VarRef)` into a single superinstruction: every
-        // variable reference in the AST→IR lowering goes through this
-        // path, so this is the most common bytecode pair (~25-40% of
-        // instructions on benchmarks like fib).
+        // #542 unary fast path: if e.thunk's value is already on top
+        // of the runtime stack (its binding's SET was deferred), skip
+        // the GET entirely — emit just OP_FORCE which pops top, forces,
+        // pushes.  Saves the SET (deferred) + GET (we don't emit) =
+        // 2 ops, AND collapses to a single dispatch even though we
+        // still go through OP_FORCE rather than the
+        // GET_LOCAL_FORCE / GET_UPVALUE_FORCE superinstruction.
+        if (tryFastPathUnary(e.thunk)) {
+            emitForceFromIR(e.srcLine);
+            return;
+        }
+
+        // Otherwise fall through to the existing superinstruction
+        // path.  emitGet*ForceFromIR fuses `Force(VarRef)` into a
+        // single opcode: every variable reference in the AST→IR
+        // lowering goes through this path, so this is the most
+        // common bytecode pair (~25-40% of instructions on
+        // benchmarks like fib).
         //
-        // Each emitted force-flavoured opcode also records a side-
-        // table entry mapping the bytecode offset back to the
-        // lower.cc line that produced this `ir::Force`.  Zero runtime
-        // cost when V3_DBG_FORCE_SITE is unset (the table is read
-        // only by that env-gated trace path in vm.cc).
+        // The superinstruction emit doesn't go through emitVarRef,
+        // so flushAllDeferred isn't called automatically — call
+        // explicitly to commit any pending bindings to slots before
+        // we read from the slot.
+        flushAllDeferred();
         if (auto it = ctx->slot.find(e.thunk); it != ctx->slot.end()) {
             emitGetLocalForceFromIR(it->second, e.srcLine);
             return;
@@ -388,14 +568,46 @@ struct Emitter
     }
 
     // -- Arithmetic / comparison / logical
-    void emitOne(const ir::Add & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_ADD)); }
-    void emitOne(const ir::Sub & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_SUB)); }
-    void emitOne(const ir::Mul & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_MUL)); }
-    void emitOne(const ir::Div & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_DIV)); }
-    void emitOne(const ir::Eq  & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_EQ));  }
-    void emitOne(const ir::NEq & e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_NEQ)); }
-    void emitOne(const ir::Less& e)  { emitVarRef(e.lhs); emitVarRef(e.rhs); unit.code.push_back(encode(OP_LESS));}
-    void emitOne(const ir::Not & e)  { emitVarRef(e.operand); unit.code.push_back(encode(OP_NOT)); }
+    //
+    // #542 binary fast path: when pendingDefer ends with [lhs, rhs]
+    // — i.e., both operands' bindings were OnceLinear and emitted
+    // immediately before this binary op — pop both from pending and
+    // emit just the OP.  Saves the 2 SETs (deferred) plus 2 GETs
+    // (we don't emit) — 4 ops per binary op when both operands are
+    // OnceLinear and adjacent.
+    //
+    // For fib's body `Less(force(k), 2)`, the IR has bindings
+    // T_force_k = Force(k); T_lit2 = LitInt 2; T_less = Less(T_force_k,
+    // T_lit2).  All OnceLinear.  Pending = [T_force_k, T_lit2] when
+    // T_less.emit fires; fast path matches; emit OP_LESS; pending =
+    // [T_less] (deferred for the next consumer, the If).
+#define V3_EMIT_BINARY(IRType, OP) \
+    void emitOne(const ir::IRType & e) { \
+        if (tryFastPathBinary(e.lhs, e.rhs)) { \
+            unit.code.push_back(encode(OP)); \
+            return; \
+        } \
+        emitVarRef(e.lhs); \
+        emitVarRef(e.rhs); \
+        unit.code.push_back(encode(OP)); \
+    }
+    V3_EMIT_BINARY(Add,  OP_ADD)
+    V3_EMIT_BINARY(Sub,  OP_SUB)
+    V3_EMIT_BINARY(Mul,  OP_MUL)
+    V3_EMIT_BINARY(Div,  OP_DIV)
+    V3_EMIT_BINARY(Eq,   OP_EQ)
+    V3_EMIT_BINARY(NEq,  OP_NEQ)
+    V3_EMIT_BINARY(Less, OP_LESS)
+#undef V3_EMIT_BINARY
+
+    void emitOne(const ir::Not & e) {
+        if (tryFastPathUnary(e.operand)) {
+            unit.code.push_back(encode(OP_NOT));
+            return;
+        }
+        emitVarRef(e.operand);
+        unit.code.push_back(encode(OP_NOT));
+    }
 
     // -- Short-circuit
     void emitOne(const ir::And & e)
@@ -440,7 +652,11 @@ struct Emitter
     }
     void emitOne(const ir::ConcatLists & e)
     {
-        emitVarRef(e.lhs); emitVarRef(e.rhs);
+        // #542 binary fast path.
+        if (!tryFastPathBinary(e.lhs, e.rhs)) {
+            emitVarRef(e.lhs);
+            emitVarRef(e.rhs);
+        }
         unit.code.push_back(encode(OP_LIST_CONCAT));
     }
     void emitOne(const ir::ConcatStrings & e)
@@ -485,7 +701,9 @@ struct Emitter
     }
     void emitOne(const ir::AttrSelect & e)
     {
-        emitVarRef(e.attrs);
+        // #542 unary fast path.
+        if (!tryFastPathUnary(e.attrs))
+            emitVarRef(e.attrs);
         unit.code.push_back(encode(OP_ATTRS_SELECT, e.name));
         // Reserve an inline-cache slot.  At runtime the VM will write
         // the most recently seen (Bindings*, slot) tuple here so a
@@ -497,7 +715,11 @@ struct Emitter
     }
     void emitOne(const ir::AttrSelectDyn & e)
     {
-        emitVarRef(e.attrs); emitVarRef(e.nameVar);
+        // #542 binary fast path.
+        if (!tryFastPathBinary(e.attrs, e.nameVar)) {
+            emitVarRef(e.attrs);
+            emitVarRef(e.nameVar);
+        }
         unit.code.push_back(encode(OP_ATTRS_SELECT_DYN));
     }
     /// SECD-style heap-stable slot reference: push the rec-attrset
@@ -516,28 +738,56 @@ struct Emitter
     /// the OP_REC_BINDING_SLOT_REF handler.
     void emitOne(const ir::RecBindingSlotRef & e)
     {
-        emitVarRef(e.attrs);
+        // #542 unary fast path.
+        if (!tryFastPathUnary(e.attrs))
+            emitVarRef(e.attrs);
         unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.name));
     }
     void emitOne(const ir::HasAttr & e)
     {
-        emitVarRef(e.attrs);
+        // #542 unary fast path.
+        if (!tryFastPathUnary(e.attrs))
+            emitVarRef(e.attrs);
         unit.code.push_back(encode(OP_ATTRS_HAS, e.name));
     }
     void emitOne(const ir::HasAttrDyn & e)
     {
-        emitVarRef(e.attrs); emitVarRef(e.nameVar);
+        // #542 binary fast path.
+        if (!tryFastPathBinary(e.attrs, e.nameVar)) {
+            emitVarRef(e.attrs);
+            emitVarRef(e.nameVar);
+        }
         unit.code.push_back(encode(OP_ATTRS_HAS_DYN));
     }
     void emitOne(const ir::Update & e)
     {
-        emitVarRef(e.lhs); emitVarRef(e.rhs);
+        // #542 binary fast path.
+        if (!tryFastPathBinary(e.lhs, e.rhs)) {
+            emitVarRef(e.lhs);
+            emitVarRef(e.rhs);
+        }
         unit.code.push_back(encode(OP_ATTRS_UPDATE));
     }
 
     // -- Recursive let / rec attrset
     void emitOne(const ir::LetRec & e)
     {
+        // #542: LetRec's emit does multiple direct-push ops
+        // (OP_ATTRS_REC_INIT, intermediate OP_DUP / OP_SET_LOCALs,
+        // OP_MAKE_THUNK loops with REC_SET writes) where the runtime
+        // stack mid-emit is in a complex state — `bindings` on top
+        // with various intermediates above it, then a thunk pushed,
+        // then REC_SET pops the thunk back into the bindings entry,
+        // etc.  In this state, our deferring tracker would mis-
+        // attribute the runtime stack top: pending says "var X is on
+        // top" but actually `bindings` (or a thunk) is on top.
+        // flushAllDeferred() at LetRec entry commits any prior
+        // pending to slots BEFORE we begin the rec construction,
+        // ensuring the runtime stack is in sync with the LetRec
+        // emit's expected state.  After this, pending = [] and the
+        // construction proceeds on a clean foundation.
+        flushAllDeferred();
+
         // Sort entries by SymbolId so the resulting Bindings are valid
         // (Bindings::lookup uses binary search on the sorted array).
         // Each REC_SET's operand becomes the entry's slot in the
