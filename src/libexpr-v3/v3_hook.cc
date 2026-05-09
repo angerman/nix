@@ -125,7 +125,9 @@ void registerContentCachePublic(const disk_cache::CacheKey & key,
                                  const CompilationUnit * cu)
 {
     if (key.empty() || !cu) return;
-    if (std::getenv("NIX_V3_NO_CONTENT_CACHE") != nullptr) return;
+    static const bool s_noContentCache =
+        std::getenv("NIX_V3_NO_CONTENT_CACHE") != nullptr;
+    if (s_noContentCache) return;
     std::string contentKey(reinterpret_cast<const char *>(key.bytes),
                             sizeof(key.bytes));
     v3HookContentCache().emplace(contentKey, cu);

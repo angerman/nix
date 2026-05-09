@@ -3320,7 +3320,9 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
     // values are TW-side thunks bridged into v3.  When forced, TW's
     // own env-walk does the lookup, finding no `with pkgs;` because the
     // TW thunk was captured BEFORE / OUTSIDE that scope.
-    if (std::getenv("V3_DBG_FORCE_ATTR_ENTRY") != nullptr) {
+    static const bool s_dbgForceAttrEntry =
+        std::getenv("V3_DBG_FORCE_ATTR_ENTRY") != nullptr;
+    if (__builtin_expect(s_dbgForceAttrEntry, 0)) {
         std::fprintf(stderr,
             "v3 forceAttr h=%lld name='%s' entry.tag=%d\n",
             (long long)h, std::string(name).c_str(),
