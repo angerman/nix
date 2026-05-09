@@ -202,31 +202,49 @@ Cycle on `(import nixpkgs {}).hello.name` advances:
   - Before: `cycle while resolving 'callPackage'` at frame depth 90
   - After:  `cycle while resolving 'texlive'` at frame depth 88
 
-### Remaining: 'texlive' cycle in `super:` body
+### Resolved: 'texlive' cycle (ExprSelect from-expr)
 
-PC=183 mid-`OP_ATTRS_SELECT systems` after
-`OP_REC_BINDING_SLOT_REF 142`.  Sequence:
+The texlive cycle was driven by `inherit (lib.systems) X Y` —
+the from-expr is a simple `ExprSelect(Var(lib), systems)`.  Same
+class of bug as the curried-call gap: TW's
+`from->maybeThunk(state, up)` thunkifies unconditionally; v3's
+`isComplexFromExpr` only matched ExprCall and ExprOpUpdate.
 
-```
-[180] OP_GET_UPVALUE 0
-[181] OP_REC_BINDING_SLOT_REF 142    ; rec-binding 'lib'
-[182] OP_ATTRS_SELECT systems         ; lib.systems
-[184] OP_SET_LOCAL 10
-```
+Fix: extend rule to match ExprSelect whose immediate head is an
+ExprVar.  Pushes the cycle one step further to 'libsForQt5'.
 
-`lib.systems` selection forces `lib`'s lib.fix.  Inside that
-fix-point, some sub-thunk does `with pkgs; ... texlive`.  pkgs is
-mid-construction (still Black) → cycle.
+### Remaining: 'libsForQt5' cycle (call-on-select shape)
 
-This is a different shape than the curried-call case: the SELECT
-itself is being computed eagerly, suggesting either:
-  (a) lib (the rec-binding) is being eagerly forced via OP_REC_BINDING_SLOT_REF + OP_ATTRS_SELECT,
-      and v3's chain forces the let-binding's body where TW would defer.
-  (b) some other expression in the `super:` body forces this SELECT
-      mid-construction.
+`inherit (libsForQt5.callPackage path0) Y Z` — outer ExprCall whose
+`fun` is `ExprSelect(Var(libsForQt5), callPackage)`.  Neither rule
+matches: Call rule walks `c->fun` chain expecting ExprCall/Var, hits
+ExprSelect and stops; Select rule looks at the head expression,
+which is ExprCall, so misses too.
 
-Next step: identify the source-level expression for PC=180..184.
-Likely candidate: `lib = recurseIntoAttrs lib.systems.systems-list-or-similar` in stage.nix or all-packages.nix — but the body suggests `local 10 = lib.systems` is computed eagerly, indicating an attribute SELECT in let-binding RHS position.
+A combined walk (Calls + 1 Select before terminating at Var) was
+attempted but caused nixpkgs eval to **hang for >3 minutes**
+without progress — likely a thunk-explosion or infinite force
+chain triggered by the broader thunkify.  Reverted; the call-on-
+select pattern needs deeper investigation before the rule can be
+broadened.
+
+Hypotheses for the hang:
+- (1) Some thunkified site re-enters itself via the lexical-with
+      capture and infinite-loops in the chase machinery.
+- (2) Boehm GC root explosion (analogous to the
+      `Too many root sets` failure under
+      NIX_V3_INHERIT_FROM_THUNK_ALL).
+- (3) A specific expression shape gets thunkified that has freeVar
+      capture issues in the broader-thunkify path
+      (project_498_always_thunkify_regression in memory).
+
+Next session should:
+1. Re-enable Call+1Select walking with V3_DBG_INHERIT_FROM_THUNK=1
+   to count how many additional sites get thunkified vs. baseline.
+2. Sample-trace where the eval gets stuck (V3_DBG_FORCES, perf-
+   profile, or simply attaching lldb during a hang).
+3. If thunk count is reasonable but eval still hangs, look at the
+   specific thunkified sites for self-referential force loops.
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input
 Output Group.
