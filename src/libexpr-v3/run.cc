@@ -103,7 +103,9 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // collapses VarRef chains and elides redundant Forces.  The
     // import-primop path (`primops.cc primImport`) already does this;
     // the runRootExpr path silently skipped it before this fix.
-    ir::optimise(module);
+    static const bool s_noOptimise =
+        std::getenv("NIX_V3_NO_OPTIMISE") != nullptr;
+    if (!s_noOptimise) ir::optimise(module);
     pt.mark(pt.optimise_ms);
 
     // computeFreeVars: populates each `ir::Function::freeVars` from

@@ -760,6 +760,18 @@ struct Lowerer
     /// dispatch (zero correctness loss; only optimization is lost).
     uint8_t recogniseIntrinsic(nix::ExprLambda * e)
     {
+        // #516 follow-on: NIX_V3_NO_INTRINSIC_RECOGNISE=1 disables ALL
+        // intrinsic recognition (Fix / Extends / Compose / etc.).
+        // Without this, even when the runtime dispatch
+        // (NIX_V3_INTRINSIC_DISPATCH) is OFF, the recognition still
+        // sets `deferredIntrinsics` for chain[2]/chain[3] which carries
+        // through to ir::Function::intrinsicKind.  Used to bisect
+        // whether the recognition itself has a side effect on
+        // lowering of inner lambdas (`final:` body of Extends has
+        // `let prev = ...; in prev // overlay final prev`).
+        static const bool s_disableRecognise =
+            std::getenv("NIX_V3_NO_INTRINSIC_RECOGNISE") != nullptr;
+        if (s_disableRecognise) return 0;
         static const bool s_dbgVerbose =
             std::getenv("V3_DBG_INTRINSIC_REJECT") != nullptr;
         auto reject = [&](const char * reason) -> uint8_t {
