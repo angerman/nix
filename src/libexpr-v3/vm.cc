@@ -116,6 +116,86 @@ inline Value & top(VMState & vm) { return vm.valueStack.back(); }
 /// entry, before any further increments).  Lookup is via std::lower_bound
 /// on the (already-sorted) side-table — O(log N) where N is the number
 /// of force emit sites in the CU.
+/// V3_DBG_FORCE_INSIDE_X — tightly scoped force tracer for the v3-direct
+/// nixpkgs eval-order RCA.  Fires only when there's a Black thunk
+/// named "x" anywhere on the frame stack (== lib.fix's x_thunk being
+/// forced).  Logs the forced thunk's name + codeOffset, the forcing
+/// site's bytecode IP, and the immediate enclosing thunk/closure
+/// frame.  Capped at 200 entries so it doesn't flood.  Useful for
+/// finding the v3-specific eager force that has no TW analog —
+/// compare two traces (one v3-direct + STG, one a synthetic that
+/// works) and the divergent line is the smoking gun.
+[[gnu::cold]]
+inline void dbgLogForceInsideX(VMState & vm, const Value * forcing)
+{
+    static const bool s_enabled =
+        std::getenv("V3_DBG_FORCE_INSIDE_X") != nullptr;
+    if (__builtin_expect(!s_enabled, 1)) return;
+    static thread_local int s_logged = 0;
+    if (s_logged >= 2000) return;
+    bool insideX = false;
+    for (const auto & f : vm.frames) {
+        if (!(f.flags & CFF_THUNK_RETURN)) continue;
+        if (!f.thunk) continue;
+        if (f.thunk->state != ThunkState::Blackhole) continue;
+        const auto * d = f.thunk->suspended.desc;
+        if (d && d->name == "x") { insideX = true; break; }
+    }
+    if (!insideX) return;
+    // Filter: only log Thunk-shaped values (where the force actually
+    // does work).  WHNF values (Int/Bool/Attrs/etc.) are no-ops and
+    // would flood the log.  We DO want Tag::Slot since that's how
+    // captured rec / lambda-param refs reach us.
+    if (!forcing) return;
+    Value chased = *forcing;
+    if (chased.tag() == Tag::Slot && chased.payload.slot)
+        chased = *chased.payload.slot;
+    if (chased.tag() != Tag::Thunk && chased.tag() != Tag::App)
+        return;
+    // Filter: only log Suspended thunks (the FIRST force that flips
+    // state to Blackhole).  Already-Evaluated thunks are harmless
+    // and just flood the log.  Bridge/Blackhole are also informative.
+    if (chased.tag() == Tag::Thunk && chased.payload.thunk
+        && chased.payload.thunk->state == ThunkState::Evaluated)
+        return;
+    // Identify the forcing site: innermost frame's name + ip.
+    const char * outerName = "?";
+    uint32_t outerCodeOff = 0;
+    uint32_t outerIp = 0;
+    if (!vm.frames.empty()) {
+        const auto & f = vm.frames.back();
+        const LambdaDescriptor * d = nullptr;
+        if (f.closure) d = f.closure->desc;
+        else if (f.thunk) d = f.thunk->suspended.desc;
+        if (d && !d->name.empty()) {
+            outerName = d->name.c_str();
+            outerCodeOff = d->codeOffset;
+        }
+        outerIp = f.ip;
+    }
+    // Identify forcee (the thunk we're about to force).
+    const char * forcedName = "?";
+    uint32_t forcedCodeOff = 0;
+    void * forcedThunk = nullptr;
+    int forcedState = -1;
+    if (chased.tag() == Tag::Thunk && chased.payload.thunk) {
+        forcedThunk = (void *)chased.payload.thunk;
+        forcedState = (int)chased.payload.thunk->state;
+        if (chased.payload.thunk->state == ThunkState::Suspended
+            && chased.payload.thunk->suspended.desc) {
+            const auto * d = chased.payload.thunk->suspended.desc;
+            if (!d->name.empty()) forcedName = d->name.c_str();
+            forcedCodeOff = d->codeOffset;
+        }
+    }
+    std::fprintf(stderr,
+        "FORCE-IN-X[%d] outer=%s@codeOff=%u ip=%u forced=%s thunk=%p codeOff=%u state=%d frames=%zu\n",
+        s_logged++,
+        outerName, (unsigned)outerCodeOff, (unsigned)outerIp,
+        forcedName, forcedThunk, (unsigned)forcedCodeOff,
+        forcedState, vm.frames.size());
+}
+
 [[gnu::cold]]
 inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp,
                             const Value * forcing = nullptr)
@@ -563,6 +643,21 @@ inline Value withLookup(VMState & vm, SymbolId name)
                         static_cast<uint32_t>(f.cu->code.size()));
                     if (lo < hi) {
                         std::fprintf(stderr, "      bytecode [%u-%u):\n",
+                            lo, hi);
+                        disassembleWindow(stderr, *f.cu, lo, hi);
+                    }
+                }
+                // For frames with d->name=="super" but unfamiliar codeOff,
+                // dump bytecode from the function's START so we can see
+                // its prologue / what kind of function it is (lambda body
+                // vs let-rec entry vs hidden-from-expr thunk).
+                if (d && d->name == "super" && f.cu && (f.flags & CFF_THUNK_RETURN)) {
+                    uint32_t lo = d->codeOffset;
+                    uint32_t hi = std::min<uint32_t>(lo + 25,
+                        static_cast<uint32_t>(f.cu->code.size()));
+                    if (lo < hi) {
+                        std::fprintf(stderr,
+                            "      'super' THUNK body-start [%u-%u):\n",
                             lo, hi);
                         disassembleWindow(stderr, *f.cu, lo, hi);
                     }
@@ -1162,6 +1257,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // env-var checks live here so the fast path doesn't pay
             // the load + branch on every iteration.
             dbgLogForceSite(cu, ip - 1, &vm.valueStack[stackBase + operand]);
+            dbgLogForceInsideX(vm, &vm.valueStack[stackBase + operand]);
             static const bool s_skipForce =
                 std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
             if (__builtin_expect(s_skipForce, 0)) [[unlikely]] {
@@ -1685,6 +1781,34 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Reuse the LambdaDescriptor pointer through suspended.desc.
             t->suspended.desc = &cu->lambdas[funcIdx];
             t->suspended.cu = cu;
+            // V3_DBG_MK_THUNK_SUPER -- log every OP_MAKE_THUNK that
+            // creates a thunk named "super".  Helps identify whether
+            // the unexpected `super` thunk is from a lambda fid being
+            // misused, a let-rec entry, or a formals-default thunk.
+            // Captures funcIdx, codeOffset, and the calling site.
+            static const bool s_dbgMkThunkSuper =
+                std::getenv("V3_DBG_MK_THUNK_SUPER") != nullptr;
+            if (__builtin_expect(s_dbgMkThunkSuper, 0) && t->suspended.desc
+                && t->suspended.desc->name == "super") {
+                static thread_local int s_n = 0;
+                if (s_n++ < 30) {
+                    std::fprintf(stderr,
+                        "MK_THUNK super[%d]: funcIdx=%u codeOff=%u nUp=%u nWiths=%u "
+                        "called-from-ip=%u arity=%u hasFormals=%u\n",
+                        s_n, funcIdx, t->suspended.desc->codeOffset,
+                        nUp, nWiths, ip - 3,
+                        t->suspended.desc->arity,
+                        t->suspended.desc->hasFormals);
+                    // Also dump bytecode at the function's body start
+                    // so we can see what kind of function it is.
+                    if (cu) {
+                        uint32_t lo = t->suspended.desc->codeOffset;
+                        uint32_t hi = std::min<uint32_t>(lo + 12,
+                            static_cast<uint32_t>(cu->code.size()));
+                        if (lo < hi) disassembleWindow(stderr, *cu, lo, hi);
+                    }
+                }
+            }
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
             if (nWiths > 0) {
                 ListVec * lws = Alloc::allocList(nWiths);
@@ -3335,6 +3459,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             // V3_DBG_FORCE_SITE trace; see dbgLogForceSite().
             dbgLogForceSite(cu, ip - 1,
+                vm.valueStack.empty() ? nullptr : &vm.valueStack.back());
+            dbgLogForceInsideX(vm,
                 vm.valueStack.empty() ? nullptr : &vm.valueStack.back());
             // Slow path: shared with OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE
             // which push the value first and then jump here.
