@@ -155,6 +155,36 @@ note = "count of lib.attrNames — full lib enumeration"
 expr = "builtins.length (builtins.attrNames (import @NIXPKGS@/lib))"
 tags = ["real-world", "lib", "enumerate"]
 
+[lib-makebinpath]
+kind = "lib"
+note = "lib.makeBinPath — string concatenation across a list"
+expr = "let lib = import @NIXPKGS@/lib; in lib.makeBinPath [\"/p1\" \"/p2\" \"/p3\" \"/p4\" \"/p5\"]"
+tags = ["real-world", "lib", "string"]
+
+[lib-evalModules-trivial]
+kind = "lib"
+note = "lib.evalModules with one option — exercises the NixOS module system core"
+expr = "let lib = import @NIXPKGS@/lib; in (lib.evalModules { modules = [ { options.foo = lib.mkOption { type = lib.types.int; default = 42; }; } ]; }).config.foo"
+tags = ["real-world", "lib", "modules"]
+
+[lib-evalModules-100]
+kind = "lib"
+note = "lib.evalModules with 100 options — scales the NixOS module system"
+expr = "let lib = import @NIXPKGS@/lib; mods = lib.genList (i: { options.\"opt${toString i}\" = lib.mkOption { type = lib.types.int; default = i; }; }) 100; in builtins.length (builtins.attrNames (lib.evalModules { modules = mods; }).options)"
+tags = ["real-world", "lib", "modules"]
+
+[lib-types-int]
+kind = "lib"
+note = "lib.types.int merge through evalModules — exercises type system"
+expr = "let lib = import @NIXPKGS@/lib; in (lib.evalModules { modules = [ { options.x = lib.mkOption { type = lib.types.int; }; config.x = 7; } ]; }).config.x"
+tags = ["real-world", "lib", "modules", "types"]
+
+[lib-strings-ops]
+kind = "lib"
+note = "lib.strings.{splitString, concatStringsSep, removeSuffix} pipeline"
+expr = "let lib = import @NIXPKGS@/lib; in lib.strings.concatStringsSep \"-\" (map lib.strings.toUpper (lib.strings.splitString \" \" \"the quick brown fox\"))"
+tags = ["real-world", "lib", "string"]
+
 # -----------------------------------------------------------------------------
 # Full nixpkgs workloads.  Currently FAILING in v3 modes due to #498
 # (callPackage upvalue regression).  Re-enable when that closes.
