@@ -1803,6 +1803,29 @@ struct Lowerer
                 }
                 if (head && head->exprKind == nix::Expr::Kind::Var)
                     return true;
+                // #548 follow-on (2026-05-09): call-on-Select-on-Var
+                // (`libsForQt5.callPackage path`).  Closes the
+                // libsForQt5 cycle in nixpkgs all-packages.nix.
+                // GATED behind NIX_V3_THUNK_CALL_ON_SELECT_VAR
+                // because enabling it default-on triggered a runtime
+                // force-count explosion (~6M forces of
+                // lib/systems/parse.nix:64 in 30s) — the broader
+                // thunkify breaks TW's sharing of `lib.systems.*`
+                // computations under v3's freeVar-capture semantics.
+                // Same bug class as project_498 always-thunkify
+                // regression: the thunk wrap's upvalue capture
+                // doesn't propagate the same memoization that TW's
+                // env-driven thunks do.  Tracked separately; flip
+                // default-on once the upvalue-capture root-cause is
+                // fixed.
+                if (head && head->exprKind == nix::Expr::Kind::Select) {
+                    auto * sel = static_cast<nix::ExprSelect *>(head);
+                    if (sel->e && sel->e->exprKind == nix::Expr::Kind::Var) {
+                        static const bool s_callOnSelectVar =
+                            std::getenv("NIX_V3_THUNK_CALL_ON_SELECT_VAR") != nullptr;
+                        if (s_callOnSelectVar) return true;
+                    }
+                }
             }
             // #548 (2026-05-09): ExprSelect from-expr where head is a
             // Var (e.g. `inherit (lib.systems) X`).  Lazy in TW via
