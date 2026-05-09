@@ -1425,7 +1425,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 c->capturedWiths = snapshotCurrentWiths(vm);
             }
             // #498 v2: log ALL super lambdas being made (V3_DBG_MAKE_SUPER_ALL).
-            if (std::getenv("V3_DBG_MAKE_SUPER_ALL")
+            static const bool s_dbgMakeSuperAll =
+                std::getenv("V3_DBG_MAKE_SUPER_ALL") != nullptr;
+            if (__builtin_expect(s_dbgMakeSuperAll, 0)
                 && c->desc && c->desc->name == "super") {
                 std::fprintf(stderr,
                     "v3 OP_MAKE_CLOSURE super (codeOff=%u nUp=%u): cu=%p frames=%zu\n",
@@ -1475,7 +1477,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // #498: when the closure being made is named "super" with
             // 4 upvalues (matches all-packages.nix's failing inner
             // lambda), log the captured upvalues + the current frame.
-            if (std::getenv("V3_DBG_MAKE_SUPER")
+            static const bool s_dbgMakeSuper =
+                std::getenv("V3_DBG_MAKE_SUPER") != nullptr;
+            if (__builtin_expect(s_dbgMakeSuper, 0)
                 && c->desc && c->desc->name == "super"
                 && nUp == 4) {
                 auto chase = [](Value v, int hops) -> Value {
@@ -1682,7 +1686,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // name=="prev") and dump captured upvalues to verify
             // tail[1] (= captured "final") IS extends.final's local[0]
             // at MAKE_THUNK time.
-            if (std::getenv("V3_DBG_MAKE_PREV")
+            static const bool s_dbgMakePrev =
+                std::getenv("V3_DBG_MAKE_PREV") != nullptr;
+            if (__builtin_expect(s_dbgMakePrev, 0)
                 && t->suspended.desc && t->suspended.desc->name == "prev"
                 && nUp == 2) {
                 // Dump the maker frame's local[0] for comparison with
@@ -1747,7 +1753,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 std::fflush(stderr);
             }
-            if (std::getenv("V3_DBG_MAKE_RES") && isStageRes) {
+            static const bool s_dbgMakeRes =
+                std::getenv("V3_DBG_MAKE_RES") != nullptr;
+            if (__builtin_expect(s_dbgMakeRes, 0) && isStageRes) {
                 std::fprintf(stderr,
                     "v3 OP_MAKE_THUNK res (stage.nix): cu=%p thunk=%p "
                     "frames=%zu\n",
@@ -1791,8 +1799,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value arg = pop(vm), fun = pop(vm);
             // V3_DBG_FINAL_CALL=1: log Apply of extends's `final:`
             // lambda OR allPackages's `self:` outer lambda — tracing
-            // the broader-thunkify upvalue bug at #498.
-            if (std::getenv("V3_DBG_FINAL_CALL")
+            // the broader-thunkify upvalue bug at #498.  Cache the
+            // env-var lookup as `static const bool` so OP_CALL — the
+            // hottest opcode on fib/ackermann/lib.foldl' — doesn't
+            // pay a libc getenv call per iteration.  Same pattern as
+            // s_dbgOpCall below.
+            static const bool s_dbgFinalCall =
+                std::getenv("V3_DBG_FINAL_CALL") != nullptr;
+            if (__builtin_expect(s_dbgFinalCall, 0)
                 && fun.tag() == Tag::Closure && fun.payload.closure
                 && fun.payload.closure->desc
                 && (fun.payload.closure->desc->name == "final"
@@ -2159,7 +2173,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // bug: arg=Tag::Slot(p), *p = Tag::Attrs{gcc, linux-kernel}
             // but should be the platform record `final` containing
             // isx86 etc.
-            if (std::getenv("V3_DBG_OP_CALL_POST")
+            static const bool s_dbgOpCallPost =
+                std::getenv("V3_DBG_OP_CALL_POST") != nullptr;
+            if (__builtin_expect(s_dbgOpCallPost, 0)
                 && desc && !desc->name.empty()
                 && desc->name == "platform")
             {
@@ -2678,7 +2694,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // STG-12 diagnostic: when the topmost prev thunk dispatches
             // TAIL_CALL on a Black-chasing arg, log the fun's tag and
             // (if closure) name + hasFormals.
-            if (std::getenv("V3_DBG_TC_PRE")) {
+            static const bool s_dbgTcPre =
+                std::getenv("V3_DBG_TC_PRE") != nullptr;
+            if (__builtin_expect(s_dbgTcPre, 0)) {
                 Value chase = arg;
                 Thunk * blackOnFrames = nullptr;
                 for (int hops = 0; hops < 16; ++hops) {
