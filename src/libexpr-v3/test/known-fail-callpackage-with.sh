@@ -52,8 +52,28 @@ out=$(NIX_V3_DIRECT_EVAL=1 "$NIX" --extra-experimental-features nix-command \
 rc=$?
 
 if [[ $rc -ne 0 ]]; then
-    if [[ "$out" == *"OP_WITH_LOOKUP: name 'callPackage' not found in with-scope"* ]]; then
-        echo "known-fail-callpackage-with: KNOWN-FAIL still present (this is expected)"
+    # 2026-05-09 (#548): v3-direct's eval-order divergence exposed three
+    # cycle floors as we incrementally widened the inherit-from
+    # thunkify rules in lower.cc.  Each closes one site of eager
+    # OP_WITH_LOOKUP under super:'s body construction.  History:
+    #   - 'callPackage' — closed by curried-call walk (0931b77a3)
+    #   - 'texlive'      — closed by ExprSelect-with-Var head (eae55d149)
+    #   - 'libsForQt5'   — current floor.  Closing requires the
+    #     call-on-Select-Var rule (NIX_V3_THUNK_CALL_ON_SELECT_VAR=1)
+    #     which is opt-in because default-on triggers a runtime
+    #     force-count explosion (see #548c / RCA memo).
+    #
+    # The script accepts ANY of these as a known-fail.  When the floor
+    # advances, update the regex and re-run.  When all three are gone,
+    # promote this script to a positive test.
+    if [[ "$out" == *"OP_WITH_LOOKUP: name 'callPackage' not found in with-scope"* \
+       || "$out" == *"OP_WITH_LOOKUP: cycle while resolving 'callPackage'"* \
+       || "$out" == *"OP_WITH_LOOKUP: cycle while resolving 'texlive'"* \
+       || "$out" == *"OP_WITH_LOOKUP: cycle while resolving 'libsForQt5'"* ]]; then
+        # Extract the resolved symbol so the message tracks progress.
+        sym=$(printf '%s\n' "$out" | sed -n "s/.*resolving '\\([^']*\\)'.*/\\1/p" | head -1)
+        if [[ -z "$sym" ]]; then sym="callPackage(legacy)"; fi
+        echo "known-fail-callpackage-with: KNOWN-FAIL still present at '$sym'"
         exit 0
     else
         echo "known-fail-callpackage-with: failed but with a NEW symptom:" >&2
