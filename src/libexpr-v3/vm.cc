@@ -5900,8 +5900,12 @@ Value forceValue(VMState & vm, Value v)
     // CU + ip) when forceValue is invoked with an input that, after
     // chase, lands on a Black thunk on this VM's frames.  That tells
     // us which opcode handler is calling forceValue with the cycle
-    // source.  V3_DBG_FORCE_CALLSITE=1 to enable.
-    if (std::getenv("V3_DBG_FORCE_CALLSITE")) {
+    // source.  V3_DBG_FORCE_CALLSITE=1 to enable.  Cached because
+    // forceValue is called on every OP_FORCE / get-local-force-on-
+    // thunk slow path; the per-call getenv was visible in profiling.
+    static const bool s_dbgForceCallsite =
+        std::getenv("V3_DBG_FORCE_CALLSITE") != nullptr;
+    if (__builtin_expect(s_dbgForceCallsite, 0)) {
         Value chase = v;
         Thunk * blackOnFrames = nullptr;
         // Record chase trace for printing.
