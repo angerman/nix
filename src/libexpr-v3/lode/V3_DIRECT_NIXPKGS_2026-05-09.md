@@ -91,42 +91,86 @@ not a tweakable knob.
   emit time, it's the runtime force inside OP_ATTRS_UPDATE itself
   that triggers the chain.  Reverted.
 
-## What the actual fix needs
+## What the actual fix needs (corrected — *not* via TW)
 
-Per `PUBLISH_RECOVERY_USE_AUDIT_2026-05-08.md` Gap A and
-`EVAL_ORDER_DIVERGENCE_2026-05-08.md`:
+**Earlier draft of this memo proposed routing through TW for
+mid-flight observation.  That was wrong.** The inversion plan
+(#454 → #457 → #458) is explicit: v3 owns eval, TW is leaf-only
+(FFI boundary — store ops, derivation, path resolution).  Borrowing
+TW's force at a Tag::Slot deref would re-create the cross-VM
+fresh-thunk pattern documented in `EVAL_ORDER_DIVERGENCE_2026-05-08.md`
+and undo the whole point of the slot architecture.
 
-The slot-bridge work (STG-13, currently pending): when v3 forces
-through a Tag::Slot whose backing thunk is currently Black, fall
-back to TW's slot-pointer-into-env path.  TW handles
-mid-construction observation via per-Value tBlackhole tracking;
-v3's per-Thunk state machine doesn't have an equivalent.
+The fix has to be **v3-native**.  Two angles, both legitimate:
 
-Concrete shape (sketched, not implemented):
+### Angle A: match TW's eval-order (eliminate the divergence)
 
-1. At OP_FORCE / OP_WITH_LOOKUP, when the value is a Tag::Slot to
-   a thunk in Blackhole state, AND we're inside a v3 eval whose
-   outer frames include that thunk's force frame, route the deref
-   through TW: ask TW's `forceValue(*nix::Value*)` on the equivalent
-   TW value, which sees the Black via TW's mechanism.
-2. TW either returns a partial-shape Value (if its env binding is
-   mid-construction with a partial slot) or throws the same cycle
-   error.
+TW completes the assert + res forcing without firing the inner
+`with pkgs; callPackage` thunk.  v3 fires it.  Find the v3-specific
+eager force and remove it.
 
-Effectively v3 borrows TW's mid-flight observation path for the
-narrow case where v3-direct's eval-order pushes us into one.  Not
-a workaround — TW IS the canonical reference for these semantics.
+The kill-switch sweep above showed the cycle is robust to every
+v3 optimisation toggle, so the divergence is in the *core* lower
+or VM dispatch path — not in any opt-pass.  Candidates worth
+instrumenting (haven't been ruled out yet):
+
+- **OP_ATTRS_INIT** ordering: TW's `ExprAttrs::eval` builds the
+  binding map but invokes `maybeThunk` on every entry — does v3's
+  OP_ATTRS_INIT build the same shape, or does it force entry
+  values in some path (dynamic-name attrs, inherit-from)?
+- **Inherit-from from-expr lowering**: hidden-from-expr thunks
+  fire when ANY of `inherit (X) a b c` is referenced.  If v3
+  references one during construction (e.g., for the `assert
+  conflictingAttrs == {}` evaluation) but TW doesn't, that's the
+  divergence.  `lib.attrNames` in the assert error message is a
+  candidate — it forces the attrset top-level which could trigger
+  hidden-thunk evaluation.
+- **OP_CALL on a primop with strict args**: `lib.intersectAttrs`
+  forces both args; v3's primop dispatch might evaluate them in
+  a different order than TW.
+- **OP_RETURN cell-update**: if a let-rec entry's cell update
+  cascades into evaluating sibling entries (chain effect), that
+  could force more than TW does.
+
+The most promising next instrumentation is to log every OP_FORCE
+inside the lib.fix x_thunk's lifetime and identify the FIRST force
+that has no analog in TW.  Done by tracking the "outer thunk
+name" set at OP_FORCE entry and printing the trip when it's "x".
+
+### Angle B: native mid-flight observation (no TW)
+
+If we can't eliminate the divergence, give v3 a way to observe
+partial state during construction without touching TW.  The slot
+mechanism (#458) gets us part of the way: heap-stable cells with
+OP_RETURN-time updates.  Extending it would require:
+
+1. **Per-Bindings progressive view**: each rec attrs's Bindings*
+   is mutated as `OP_ATTRS_REC_SET` fires.  An in-progress reader
+   (forcing through Tag::Slot) sees the entries that have been
+   set so far.  Already true for `rec { x = 1; y = self.x; }`
+   patterns — the slot mechanism handles them.
+2. **Progressive write for the let-rec body's intermediate
+   values**: when a `let prev = ...; in body` is mid-evaluating
+   `body` (e.g., an OP_UPDATE), and a foreign Slot reader hits
+   its outer thunk, return whatever the body has accumulated.
+   This is hard because the OP_UPDATE doesn't have a "result so
+   far" — it's transient operand-stack state.
+
+Angle A is cleaner if we can find the divergence.  Angle B is a
+deeper structural change.
 
 ## Recommended next step
 
-Don't keep instrumenting v3-direct's nixpkgs path tactically.  Pick
-up STG-13 (slot-bridge): plumb a TW fallback into Tag::Slot deref
-when the backing thunk is Black on the current vm's frames.
+Instrument the FIRST eager force during lib.fix x_thunk's
+forcing; trace through to its lowering origin.  That tells us
+which lowering decision creates an OP_FORCE that TW doesn't have
+analog for.  THAT is the v3-native fix: change the lowering to
+match TW's lazy structure.
 
-Until then, **users wanting full nixpkgs eval should use the v3-
-fhook path** (`NIX_USE_V3=1`, no `NIX_V3_DIRECT_EVAL`), which
-is the user-facing default after #547 and works correctly under
-STG default-on.
+Until that lands: users wanting full nixpkgs eval can use
+`NIX_USE_V3=1` (without `NIX_V3_DIRECT_EVAL`), which works under
+#547's STG default-on flip.  But that's a workaround, not the
+goal — the goal is v3-direct fully working on nixpkgs.
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input
 Output Group.
