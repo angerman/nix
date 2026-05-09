@@ -1547,9 +1547,9 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     auto & st = v3HookStats();
     st.evalEntries++;
 
-    // STG-6 (#498): under NIX_V3_STG=1, refuse the eval hook entirely.
-    // Under STG semantics each v3 thunk's slot is written ONLY by its
-    // own OP_RETURN; spawning a fresh VMState mid-TW-evaluation creates
+    // STG-6 (#547): the eval hook is refused by default under STG
+    // semantics.  Each v3 thunk's slot is written ONLY by its own
+    // OP_RETURN; spawning a fresh VMState mid-TW-evaluation creates
     // v3 thunks that go Black during construction, and any later force
     // (from a different fresh VMState the eval hook spawned) sees the
     // leaked Black mark and throws.  TW's native eval doesn't have
@@ -1564,12 +1564,13 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
     // makes progress past the all-packages.nix:28 with-block cycle
     // (the cross-VMState fresh-VMState pattern was the source).
     //
-    // STG-7 (debugging): NIX_V3_STG_KEEP_HOOKS=1 forces the eval hook
-    // ON even under STG.  Used to bisect the §4.5 lambda-parameter
-    // slot work — re-enables the hook so we can see exactly what
-    // breaks when v3 owns mid-TW evaluations.
+    // 2026-05-09 (#547 Phase 2): inventory matrix shows
+    // v3-fhook + STG = OK on nixpkgs while v3-fhook (legacy) = BLACKHOLE.
+    // Default-on is a strict win.  NIX_V3_NO_STG=1 restores the
+    // legacy hook-eager path; NIX_V3_STG_KEEP_HOOKS=1 keeps the hook
+    // active under STG semantics for debugging.
     static const bool s_stgMode =
-        std::getenv("NIX_V3_STG") != nullptr;
+        std::getenv("NIX_V3_NO_STG") == nullptr;
     static const bool s_stgKeepHooks =
         std::getenv("NIX_V3_STG_KEEP_HOOKS") != nullptr;
     if (s_stgMode && !s_stgKeepHooks) {
@@ -3122,22 +3123,23 @@ static bool v3CallFunctionEntry(nix::EvalState & state,
     // is NIX_V3_NO_CALL=1 (matches the #416 outer-with convention).
     // NIX_USE_V3_CALL=1 stays as a no-op alias for back-compat.
     //
-    // STG-4 (#498): under NIX_V3_STG=1, v3 must not intercept TW's
-    // call-hook chain.  TW manages fix-point construction with its
-    // env-pointer-by-reference semantics, which v3's STG-mode forcing
-    // (no publish, no side-table recovery) cannot emulate without
-    // additional slot-capture work.  Re-entering v3 mid-TW-evaluation
-    // creates v3 thunks whose Black state surfaces real cycles in
-    // patterns lib relies on (e.g. lib.fixedPoints.extends + fix).
-    // Until the slot-capture path is universal, gate the hook off
-    // when STG mode is active.
+    // STG-4 (#547): under STG semantics (default-on), v3 must not
+    // intercept TW's call-hook chain.  TW manages fix-point
+    // construction with its env-pointer-by-reference semantics, which
+    // v3's STG-mode forcing (no publish, no side-table recovery)
+    // cannot emulate without additional slot-capture work.  Re-entering
+    // v3 mid-TW-evaluation creates v3 thunks whose Black state
+    // surfaces real cycles in patterns lib relies on (e.g.
+    // lib.fixedPoints.extends + fix).  Until the slot-capture path is
+    // universal, gate the hook off when STG is active.
     static const bool useV3Call = []{
         const char * a = std::getenv("NIX_USE_V3");
         if (!a || std::string_view(a) != "1") return false;
         if (std::getenv("NIX_V3_NO_CALL") != nullptr) return false;
-        // STG-4 (#498): STG mode disables the call hook by default.
+        // STG-4 (#547): STG mode default-on disables the call hook.
         // STG-7 (debugging): NIX_V3_STG_KEEP_HOOKS=1 keeps it on.
-        if (std::getenv("NIX_V3_STG") != nullptr
+        // NIX_V3_NO_STG=1 restores the legacy hook-active path.
+        if (std::getenv("NIX_V3_NO_STG") == nullptr
             && std::getenv("NIX_V3_STG_KEEP_HOOKS") == nullptr)
             return false;
         return true;

@@ -886,16 +886,21 @@ inline std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry()
 inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
                                              bool isRecInit)
 {
-    // STG-1 (#498): when NIX_V3_STG=1 is set, publish is disabled.
-    // Each thunk's slot is written ONLY by its own OP_RETURN; no
-    // outer thunk write-through.  Legacy publish stays default-on
-    // because dropping it surfaces a small set of cutover-parity +
-    // chase-cycle test diffs that need separate investigation
-    // before a flag-flip is safe.  STG mode is the validated path
-    // for nixpkgs and uses the slot mechanism (Phase 4-5) to handle
-    // the rec-attrset self-reference cases publish was masking.
+    // STG-1 (#498/#547): publish is disabled by default.  Each
+    // thunk's slot is written ONLY by its own OP_RETURN; no outer
+    // thunk write-through.  STG mode (the slot mechanism) is the
+    // validated path for nixpkgs.
+    //
+    // 2026-05-09 (#547 Phase 2): flipped default-on after the inventory
+    // matrix in lode/STG_INVENTORY_2026-05-09.md showed STG fixes
+    // v3-fhook on nixpkgs (BLACKHOLE → OK) without regressing any
+    // synthetic / lib workload.  The legacy publish was actively
+    // corrupting outer Black thunks with wrong-shape intermediate
+    // values; the slot mechanism + cell-update at OP_RETURN is the
+    // architecturally-correct replacement.  Set NIX_V3_NO_STG=1 to
+    // restore the legacy publish path (will be deleted in a follow-up).
     static const bool s_stgMode =
-        std::getenv("NIX_V3_STG") != nullptr;
+        std::getenv("NIX_V3_NO_STG") == nullptr;
     if (s_stgMode) return;
     // ---- Pre-STG path (legacy default) ----
     static const bool s_publishNonRec =
@@ -4733,12 +4738,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // and proceed.  Allows mid-construction rec-attrset
                 // self-reference to work without the structural
                 // closure-capture redesign.
-                // STG-2: skip side-table recovery under NIX_V3_STG=1.
-                // STG semantics: a Black thunk access is a cycle and
-                // must throw, not be papered over with whatever the
-                // publish-walk happened to register.
+                // STG-2 (#547): side-table recovery is disabled by
+                // default.  STG semantics: a Black thunk access is a
+                // cycle and must throw, not be papered over with
+                // whatever the publish-walk happened to register.
+                // NIX_V3_NO_STG=1 restores the legacy recovery path.
                 static const bool s_stgMode_recref =
-                    std::getenv("NIX_V3_STG") != nullptr;
+                    std::getenv("NIX_V3_NO_STG") == nullptr;
                 Bindings * recoveredBindings = nullptr;
                 if (!s_stgMode_recref
                     && attrs.tag() == Tag::Thunk && attrs.payload.thunk
@@ -6485,15 +6491,17 @@ Value forceValue(VMState & vm, Value v)
             // thunk to completion (which is exactly what TW does via
             // its lazy attr access on partial Bindings).
             //
-            // STG-3 (#498): skip under NIX_V3_STG=1.  Real cycles must
-            // throw under STG semantics so the consumer sees the typed
-            // exception, not a wrong sub-attrset.
+            // STG-3 (#547): partialBindings recovery is disabled by
+            // default.  Real cycles must throw under STG semantics so
+            // the consumer sees the typed exception, not a wrong
+            // sub-attrset.  NIX_V3_NO_STG=1 restores the legacy
+            // recovery path.
             //
-            // Disable via NIX_V3_NO_PARTIAL_BINDINGS_RECOVER=1 if it
-            // misclassifies a real cycle.
+            // Disable via NIX_V3_NO_PARTIAL_BINDINGS_RECOVER=1 if the
+            // legacy path is restored and misclassifies a real cycle.
             {
                 static const bool s_stgMode_recover =
-                    std::getenv("NIX_V3_STG") != nullptr;
+                    std::getenv("NIX_V3_NO_STG") == nullptr;
                 static const bool s_disabled =
                     std::getenv("NIX_V3_NO_PARTIAL_BINDINGS_RECOVER") != nullptr;
                 static const bool s_dbg_reg =

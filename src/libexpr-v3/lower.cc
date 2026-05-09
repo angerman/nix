@@ -1613,13 +1613,19 @@ struct Lowerer
         //   NIX_V3_NO_INHERIT_FROM_THUNK=1   -- disable all thunkify
         //   NIX_V3_INHERIT_FROM_THUNK_ALL=1  -- force thunkify all
         //
-        // STG-5 (#498): under NIX_V3_STG=1, thunkify ALL inherit-from
+        // STG-5 (#547): under NIX_V3_STG=1 (explicit opt-in for the
+        // lower-time behavior change), thunkify ALL inherit-from
         // from-exprs unconditionally — matches TW's
         // `from->maybeThunk(state, up)` in
-        // ExprAttrs::buildInheritFromEnv (libexpr/eval.cc:1520).  STG
-        // mode runs without the publish/recovery side-table, so the
-        // narrow self-dot heuristic that was needed to avoid Black-
-        // thunk leaks is no longer necessary.
+        // ExprAttrs::buildInheritFromEnv (libexpr/eval.cc:1520).
+        //
+        // Note: this stays opt-in even after #547 flipped the
+        // *runtime* STG gates default-on -- the lower-time blanket
+        // thunkify changes the static IR (more MkThunk nodes), and
+        // empirical testing showed it triggers different forcing
+        // behaviours that aren't yet hardened.  Tracked separately
+        // for re-flip once cell-update + slot semantics are
+        // universally wired (CALLPACKAGE_BUG_2026-05-09.md context).
         static const bool s_stgMode =
             std::getenv("NIX_V3_STG") != nullptr;
         static const bool s_lambdaSkip =
