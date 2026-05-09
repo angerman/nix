@@ -16,7 +16,56 @@
 
 #include "nix/expr/eval.hh"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 namespace nix::v3 {
+
+namespace {
+
+/// Phase-timing helper: present iff `V3_TIMING` env var is set.  We
+/// cache the env-var lookup once per process via a static-const-bool;
+/// mirrors the pattern used throughout vm.cc / primops.cc for
+/// hot-path env-var checks (see #538 follow-ups).
+struct PhaseTimer {
+    using Clock = std::chrono::steady_clock;
+    using TP = Clock::time_point;
+    bool active;
+    TP start;
+    double lower_ms = 0, compile_ms = 0, optimise_ms = 0, run_ms = 0;
+    explicit PhaseTimer() : active(s_active())
+    {
+        if (active) start = Clock::now();
+    }
+    void mark(double & accum)
+    {
+        if (!active) return;
+        TP now = Clock::now();
+        accum += std::chrono::duration<double, std::milli>(now - start).count();
+        start = now;
+    }
+    ~PhaseTimer()
+    {
+        if (!active) return;
+        // Mirror the v3_hook.cc atexit dump format so existing
+        // bench tools that grep for `lower=` / `compile=` / `run=`
+        // / `bridge=` keep working.  bridge=0.000 because the
+        // v3-direct path doesn't bridge into TW (any TW call is via
+        // a primop callback, which is counted under run_ms here).
+        std::fprintf(stderr,
+            "v3-direct timing (ms): lower=%.3f optimise=%.3f compile=%.3f run=%.3f bridge=0.000\n",
+            lower_ms, optimise_ms, compile_ms, run_ms);
+    }
+private:
+    static bool s_active()
+    {
+        static const bool v = std::getenv("V3_TIMING") != nullptr;
+        return v;
+    }
+};
+
+} // anonymous namespace
 
 RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
 {
@@ -34,9 +83,16 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // address-stability contract.
     setNixEvalState(&state);
 
+    // V3_TIMING phase split — mirrors v3_hook.cc's atexit dump for
+    // the call-hook entry point so bench harnesses can compare
+    // apples-to-apples between v3-hook and v3-direct modes.  A no-op
+    // (zero overhead) when V3_TIMING is unset.
+    PhaseTimer pt;
+
     // Lower the AST → IR → bytecode.  `lowerNixExpr` requires `e` to
     // have had `bindVars` applied; the caller's contract.
     auto module = lowerNixExpr(e, state.symbols, state.positions);
+    pt.mark(pt.lower_ms);
 
     // #538: run the IR optimization pipeline (constant fold, CSE,
     // strictness, alias inline, primop fuse, DCE).  Without this the
@@ -48,6 +104,7 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // import-primop path (`primops.cc primImport`) already does this;
     // the runRootExpr path silently skipped it before this fix.
     ir::optimise(module);
+    pt.mark(pt.optimise_ms);
 
     // computeFreeVars: populates each `ir::Function::freeVars` from
     // `Function::vars`.  Required before `compile` so the emitter
@@ -61,11 +118,13 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // Return the cu by-move so caller keeps it alive alongside the
     // Value.
     RootResult out{compile(module), Value{}};
+    pt.mark(pt.compile_ms);
 
     // Run.  STG-10 (vm.cc:5530) automatically routes through
     // `runOnExistingVm` if we're re-entered from another v3 dispatch
     // loop — so calling `runRootExpr` from inside a primop is safe.
     out.value = run(out.cu);
+    pt.mark(pt.run_ms);
     return out;
 }
 
