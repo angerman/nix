@@ -125,6 +125,30 @@ The actual nixpkgs has:
   in pkgs/top-level/).
 - Disk-cache hit/miss interactions.
 
+## Symptom-changing kill switch (NIX_V3_SELF_DOT_MAX_LEVEL)
+
+**Important:** while most kill switches leave the symptom unchanged,
+`NIX_V3_SELF_DOT_MAX_LEVEL` switches between TWO failure modes:
+
+| value | symptom |
+|-------|---------|
+| 0 | `error: v3 OP_ATTRS_SELECT: attribute not found` |
+| 1, 2, 3, 4 (default), 5+ | `error: v3 OP_WITH_LOOKUP: name 'callPackage' not found in with-scope` |
+
+The level=0 → level≥1 transition flips which way the eval crashes.
+This means the self-dot heuristic INTERACTS with the bug:
+- At level=0, the `inherit (self.X) Y` pattern is lowered EAGERLY,
+  triggering an early-force somewhere that produces `OP_ATTRS_SELECT`
+  before `OP_WITH_LOOKUP` would have fired.
+- At level≥1, those patterns get thunkified, deferring the force,
+  letting the with-scope construction proceed further → and THEN
+  the with-scope value-corruption manifests as `OP_WITH_LOOKUP`.
+
+So both errors are consequences of the same underlying corruption,
+just surfaced at different points in the eval pipeline.  The real
+bug fires REGARDLESS of self-dot heuristic.  This is an important
+constraint: any candidate fix must address both manifestations.
+
 ## Negative results (narrow the search)
 
 The following diagnostic kill switches all leave the symptom
