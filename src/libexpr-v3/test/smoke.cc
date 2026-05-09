@@ -17,6 +17,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/ir_dump.hh"
 #include "v3/vm.hh"
 #include "v3/alloc.hh"
 #include "v3/primop.hh"
@@ -1467,6 +1468,405 @@ static int testDeserializeRejectsCorruption()
     return 0;
 }
 
+// ===========================================================================
+// #539 — IR text dumper + FileCheck-style helper.
+// ===========================================================================
+
+// dumpModule produces a stable, line-oriented representation suitable
+// for `; CHECK:` directives.  Build a tiny module, dump it, and verify
+// every binding shows up in the expected form.
+static int testIrDumpBasic()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitInt{42});       // v1
+    auto b = addBinding(m, entry, ir::LitInt{1});         // v2
+    auto c = addBinding(m, entry, ir::Add{a, b});         // v3
+    setReturn(m, entry, c);
+
+    std::string dump = ir::dumpModule(m);
+
+    const char * expected = R"(
+        ; CHECK: ; module n_funcs=1
+        ; CHECK: ; func f0 entry=B1
+        ; CHECK: B1:
+        ; CHECK:   v1 = LitInt 42
+        ; CHECK:   v2 = LitInt 1
+        ; CHECK:   v3 = Add v1 v2
+        ; CHECK:   return v3
+    )";
+
+    auto err = ir::checkIr(dump, expected);
+    if (!err.empty()) {
+        std::fprintf(stderr, "testIrDumpBasic: %s\nfull dump:\n%s\n",
+            err.c_str(), dump.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "testIrDumpBasic: OK\n");
+    return 0;
+}
+
+// Verify CHECK-NOT directives fire when forbidden patterns appear.
+static int testIrDumpNegativeCheckNot()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitInt{99});
+    setReturn(m, entry, a);
+
+    std::string dump = ir::dumpModule(m);
+
+    // We assert that the literal 99 is ABSENT — but it IS present, so
+    // the check should fail.  Use this to validate the NOT arm.
+    const char * expected = R"(
+        ; CHECK: B1:
+        ; CHECK-NOT: LitInt 99
+        ; CHECK: return v1
+    )";
+
+    auto err = ir::checkIr(dump, expected);
+    if (err.empty()) {
+        std::fprintf(stderr, "testIrDumpNegativeCheckNot: CHECK-NOT was supposed to fail but didn't\n");
+        return 1;
+    }
+    if (err.find("CHECK-NOT") == std::string::npos
+        || err.find("LitInt 99") == std::string::npos) {
+        std::fprintf(stderr,
+            "testIrDumpNegativeCheckNot: failure diagnostic missing context: %s\n",
+            err.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "testIrDumpNegativeCheckNot: OK (CHECK-NOT fired correctly)\n");
+    return 0;
+}
+
+// Verify CHECK directives are ordered: out-of-order CHECK lines fail.
+static int testIrDumpOrderingMatters()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    (void)addBinding(m, entry, ir::LitInt{1});
+    auto b = addBinding(m, entry, ir::LitInt{2});
+    setReturn(m, entry, b);
+
+    std::string dump = ir::dumpModule(m);
+
+    // Ask for `LitInt 2` BEFORE `LitInt 1` — the actual order is
+    // reversed.  CHECK is in-order so this should fail.
+    const char * expected = R"(
+        ; CHECK: LitInt 2
+        ; CHECK: LitInt 1
+    )";
+
+    auto err = ir::checkIr(dump, expected);
+    if (err.empty()) {
+        std::fprintf(stderr, "testIrDumpOrderingMatters: out-of-order CHECK passed when it shouldn't\n");
+        return 1;
+    }
+    std::fprintf(stderr, "testIrDumpOrderingMatters: OK (in-order CHECK enforced)\n");
+    return 0;
+}
+
+// ===========================================================================
+// #540 — analyseOccurrence: 12-case corpus per OPT_OCCUR_PLAN §A.5.
+// ===========================================================================
+
+// Helper: assert OccInfo for a specific VarId; logs failure context.
+static bool assertOcc(const ir::OccMap & occ, ir::VarId v,
+                      ir::OccKind kind, uint16_t count, bool captured,
+                      const char * label)
+{
+    auto info = occ.lookup(v);
+    if (info.kind == kind && info.count == count && info.capturedUse == captured)
+        return true;
+    std::fprintf(stderr,
+        "  %s: var=%u kind=%d count=%u captured=%d  expected kind=%d count=%u captured=%d\n",
+        label, (unsigned)v, (int)info.kind, (unsigned)info.count, (int)info.capturedUse,
+        (int)kind, (unsigned)count, (int)captured);
+    return false;
+}
+
+// Empty module: just slot 0 (kInvalid sentinel).
+static int testOccurEmptyModule()
+{
+    auto m = ir::makeModule();
+    auto occ = ir::analyseOccurrence(m);
+    if (occ.data.size() != 1) {  // slot 0 = kInvalid sentinel
+        std::fprintf(stderr,
+            "testOccurEmptyModule: expected size 1, got %zu\n", occ.data.size());
+        return 1;
+    }
+    std::fprintf(stderr, "testOccurEmptyModule: OK\n");
+    return 0;
+}
+
+// `let x = 1 in []` -> x is Dead (count 0).
+static int testOccurDeadLiteral()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto x = addBinding(m, entry, ir::LitInt{1});
+    auto ret = addBinding(m, entry, ir::ListExpr{{}});  // empty list, doesn't reference x
+    setReturn(m, entry, ret);
+
+    auto occ = ir::analyseOccurrence(m);
+    bool ok = assertOcc(occ, x,   ir::OccKind::Dead,       0, false, "x")
+           && assertOcc(occ, ret, ir::OccKind::OnceLinear, 1, false, "ret (used by terminal)");
+    if (!ok) return 1;
+    std::fprintf(stderr, "testOccurDeadLiteral: OK\n");
+    return 0;
+}
+
+// `let x = 1 in x + 1` -> x OnceLinear, count 1.
+static int testOccurOnceLinear()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto x   = addBinding(m, entry, ir::LitInt{1});
+    auto one = addBinding(m, entry, ir::LitInt{1});
+    auto sum = addBinding(m, entry, ir::Add{x, one});
+    setReturn(m, entry, sum);
+
+    auto occ = ir::analyseOccurrence(m);
+    bool ok = assertOcc(occ, x,   ir::OccKind::OnceLinear, 1, false, "x")
+           && assertOcc(occ, one, ir::OccKind::OnceLinear, 1, false, "one")
+           && assertOcc(occ, sum, ir::OccKind::OnceLinear, 1, false, "sum");
+    if (!ok) return 1;
+    std::fprintf(stderr, "testOccurOnceLinear: OK\n");
+    return 0;
+}
+
+// `let x = 1 in x + x` -> x Many, count 2 (saturating).
+static int testOccurManyTwoUses()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto x   = addBinding(m, entry, ir::LitInt{1});
+    auto sum = addBinding(m, entry, ir::Add{x, x});
+    setReturn(m, entry, sum);
+
+    auto occ = ir::analyseOccurrence(m);
+    bool ok = assertOcc(occ, x,   ir::OccKind::Many,       2, false, "x")
+           && assertOcc(occ, sum, ir::OccKind::OnceLinear, 1, false, "sum");
+    if (!ok) return 1;
+    std::fprintf(stderr, "testOccurManyTwoUses: OK\n");
+    return 0;
+}
+
+// `let x = 1 in (\y: x)` -> x is captured (lambda body in different fn).
+//
+// Note: after `computeFreeVars` runs, `x` would also appear in the
+// inner lambda's freeVars list.  analyseOccurrence MUST NOT
+// double-count those (the captured-list is derived data).  We assert
+// count==1 even after running computeFreeVars to validate the
+// invariant.
+static int testOccurOnceCapturedAcrossLambda()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto x = addBinding(m, entry, ir::LitInt{42});
+
+    // Inner lambda: `\y: x`.
+    auto innerFid  = addFunction(m);
+    auto innerBody = m.freshBlock();
+    auto innerParam = m.freshVar();
+    {
+        auto & f = funcOf(m, innerFid);
+        f.entryBlock = innerBody;
+        f.argName    = ir::SymbolId{1};  // arbitrary symbol
+        f.paramVar   = innerParam;
+        // Body just references x.
+        setReturn(m, innerBody, x);
+    }
+
+    auto innerVar = addBinding(m, entry, ir::Lambda{innerFid, /*freeVars*/ {x}});
+    setReturn(m, entry, innerVar);
+
+    auto occ = ir::analyseOccurrence(m);
+    // x: count 1 (one direct use in innerBody's terminal), captured (innerBody is in fn1).
+    bool ok = assertOcc(occ, x,         ir::OccKind::OnceCaptured, 1, true,  "x")
+           && assertOcc(occ, innerVar,  ir::OccKind::OnceLinear,   1, false, "innerVar")
+           && assertOcc(occ, innerParam, ir::OccKind::Param,       0, false, "innerParam");
+    if (!ok) return 1;
+    std::fprintf(stderr, "testOccurOnceCapturedAcrossLambda: OK\n");
+    return 0;
+}
+
+// `\x: x + x` -> paramVar Param, count 2 across two direct uses.
+//
+// Test the captured-list double-count regression: run computeFreeVars
+// FIRST, then analyseOccurrence.  Param should still be classified
+// Param with count 2 (NOT 4 if freeVars somehow leak into the count).
+static int testOccurNoDoubleCountAfterComputeFreeVars()
+{
+    auto m = ir::makeModule();
+
+    auto innerFid = addFunction(m);
+    auto innerBody = m.freshBlock();
+    auto innerParam = m.freshVar();
+    {
+        auto & f = funcOf(m, innerFid);
+        f.entryBlock = innerBody;
+        f.argName    = ir::SymbolId{1};
+        f.paramVar   = innerParam;
+        auto sum = addBinding(m, innerBody, ir::Add{innerParam, innerParam});
+        setReturn(m, innerBody, sum);
+    }
+
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto lamb = addBinding(m, entry, ir::Lambda{innerFid, /*freeVars*/ {}});
+    setReturn(m, entry, lamb);
+
+    // Run computeFreeVars to populate Lambda::freeVars and similar.
+    ir::computeFreeVars(m);
+
+    auto occ = ir::analyseOccurrence(m);
+    bool ok = assertOcc(occ, innerParam, ir::OccKind::Param, 2, false, "innerParam")
+           && assertOcc(occ, lamb, ir::OccKind::OnceLinear, 1, false, "lamb");
+    if (!ok) {
+        std::fprintf(stderr, "testOccurNoDoubleCountAfterComputeFreeVars: param count must stay at 2\n");
+        return 1;
+    }
+    std::fprintf(stderr, "testOccurNoDoubleCountAfterComputeFreeVars: OK\n");
+    return 0;
+}
+
+// `\x: 42` -> paramVar Param with count 0 (unused parameter).
+static int testOccurParamUnused()
+{
+    auto m = ir::makeModule();
+    auto innerFid = addFunction(m);
+    auto innerBody = m.freshBlock();
+    auto innerParam = m.freshVar();
+    {
+        auto & f = funcOf(m, innerFid);
+        f.entryBlock = innerBody;
+        f.argName    = ir::SymbolId{1};
+        f.paramVar   = innerParam;
+        auto k42 = addBinding(m, innerBody, ir::LitInt{42});
+        setReturn(m, innerBody, k42);
+    }
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto lamb = addBinding(m, entry, ir::Lambda{innerFid, {}});
+    setReturn(m, entry, lamb);
+
+    auto occ = ir::analyseOccurrence(m);
+    bool ok = assertOcc(occ, innerParam, ir::OccKind::Param, 0, false, "innerParam");
+    if (!ok) return 1;
+    std::fprintf(stderr, "testOccurParamUnused: OK\n");
+    return 0;
+}
+
+// `let x = 1 in if c then x else 2` -> x OnceLinear (one branch arm).
+//
+// MVP conservatively counts syntactic uses; `x` appears once in
+// thenBlock so count==1 -> OnceLinear.
+static int testOccurOnceLinearIfBranch()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto x = addBinding(m, entry, ir::LitInt{1});
+
+    auto thenB = m.freshBlock();
+    auto elseB = m.freshBlock();
+    setReturn(m, thenB, x);
+    auto two = addBinding(m, elseB, ir::LitInt{2});
+    setReturn(m, elseB, two);
+
+    auto cond = addBinding(m, entry, ir::LitBool{true});
+    auto ifv  = addBinding(m, entry, ir::If{cond, thenB, elseB});
+    setReturn(m, entry, ifv);
+
+    auto occ = ir::analyseOccurrence(m);
+    bool ok = assertOcc(occ, x,    ir::OccKind::OnceLinear, 1, false, "x")
+           && assertOcc(occ, cond, ir::OccKind::OnceLinear, 1, false, "cond")
+           && assertOcc(occ, ifv,  ir::OccKind::OnceLinear, 1, false, "ifv");
+    if (!ok) return 1;
+    std::fprintf(stderr, "testOccurOnceLinearIfBranch: OK\n");
+    return 0;
+}
+
+// `let x = 1 in if c then x else x` -> x Many (MVP counts 2 syntactic uses).
+static int testOccurManyAcrossBranches()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto x = addBinding(m, entry, ir::LitInt{1});
+
+    auto thenB = m.freshBlock();
+    auto elseB = m.freshBlock();
+    setReturn(m, thenB, x);
+    setReturn(m, elseB, x);
+
+    auto cond = addBinding(m, entry, ir::LitBool{true});
+    auto ifv  = addBinding(m, entry, ir::If{cond, thenB, elseB});
+    setReturn(m, entry, ifv);
+
+    auto occ = ir::analyseOccurrence(m);
+    bool ok = assertOcc(occ, x, ir::OccKind::Many, 2, false, "x");
+    if (!ok) return 1;
+    std::fprintf(stderr, "testOccurManyAcrossBranches: OK\n");
+    return 0;
+}
+
+// `with attrs; foo` -> attrs OnceLinear (single use at With::attrs).
+static int testOccurWithAttrsOnce()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    // attrs = an empty AttrSet for simplicity.
+    auto attrs = addBinding(m, entry, ir::AttrSet{});
+
+    auto bodyB = m.freshBlock();
+    auto v = addBinding(m, bodyB, ir::WithLookup{ir::SymbolId{1}});
+    setReturn(m, bodyB, v);
+
+    auto wb = addBinding(m, entry, ir::With{attrs, bodyB,
+                                            ir::kInvalid, ir::kInvalidSymbol});
+    setReturn(m, entry, wb);
+
+    auto occ = ir::analyseOccurrence(m);
+    bool ok = assertOcc(occ, attrs, ir::OccKind::OnceLinear, 1, false, "attrs");
+    if (!ok) return 1;
+    std::fprintf(stderr, "testOccurWithAttrsOnce: OK\n");
+    return 0;
+}
+
+// isTrivialRhs sanity: literals, VarRef, primops are trivial; arithmetic
+// and structural ops are not.
+static int testIsTrivialRhs()
+{
+    if (!ir::isTrivialRhs(ir::Expr{ir::LitInt{0}}))      { std::fprintf(stderr, "trivial LitInt failed\n"); return 1; }
+    if (!ir::isTrivialRhs(ir::Expr{ir::LitFloat{1.0}}))  { std::fprintf(stderr, "trivial LitFloat failed\n"); return 1; }
+    if (!ir::isTrivialRhs(ir::Expr{ir::LitBool{true}}))  { std::fprintf(stderr, "trivial LitBool failed\n"); return 1; }
+    if (!ir::isTrivialRhs(ir::Expr{ir::LitNull{}}))      { std::fprintf(stderr, "trivial LitNull failed\n"); return 1; }
+    if (!ir::isTrivialRhs(ir::Expr{ir::LitString{"x"}})) { std::fprintf(stderr, "trivial LitString failed\n"); return 1; }
+    if (!ir::isTrivialRhs(ir::Expr{ir::LitPath{"."}}))   { std::fprintf(stderr, "trivial LitPath failed\n"); return 1; }
+    if (!ir::isTrivialRhs(ir::Expr{ir::VarRef{1}}))      { std::fprintf(stderr, "trivial VarRef failed\n"); return 1; }
+    if (!ir::isTrivialRhs(ir::Expr{ir::LitBuiltins{}}))  { std::fprintf(stderr, "trivial LitBuiltins failed\n"); return 1; }
+
+    if (ir::isTrivialRhs(ir::Expr{ir::Add{1, 2}}))       { std::fprintf(stderr, "Add wrongly trivial\n"); return 1; }
+    if (ir::isTrivialRhs(ir::Expr{ir::AttrSet{}}))       { std::fprintf(stderr, "AttrSet wrongly trivial\n"); return 1; }
+    if (ir::isTrivialRhs(ir::Expr{ir::ListExpr{}}))      { std::fprintf(stderr, "ListExpr wrongly trivial\n"); return 1; }
+    if (ir::isTrivialRhs(ir::Expr{ir::Force{1}}))        { std::fprintf(stderr, "Force wrongly trivial\n"); return 1; }
+
+    std::fprintf(stderr, "testIsTrivialRhs: OK\n");
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -1508,6 +1908,24 @@ int main()
     rc |= testSerializeWithRecAttrset();
     rc |= testDiskCacheRoundTrip();
     rc |= testDeserializeRejectsCorruption();
+
+    // #539 — IR text dumper + FileCheck.
+    rc |= testIrDumpBasic();
+    rc |= testIrDumpNegativeCheckNot();
+    rc |= testIrDumpOrderingMatters();
+
+    // #540 — analyseOccurrence corpus.
+    rc |= testOccurEmptyModule();
+    rc |= testOccurDeadLiteral();
+    rc |= testOccurOnceLinear();
+    rc |= testOccurManyTwoUses();
+    rc |= testOccurOnceCapturedAcrossLambda();
+    rc |= testOccurNoDoubleCountAfterComputeFreeVars();
+    rc |= testOccurParamUnused();
+    rc |= testOccurOnceLinearIfBranch();
+    rc |= testOccurManyAcrossBranches();
+    rc |= testOccurWithAttrsOnce();
+    rc |= testIsTrivialRhs();
 
     auto & st = allocStats();
     std::fprintf(stderr,

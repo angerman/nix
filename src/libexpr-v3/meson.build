@@ -50,6 +50,7 @@ include_dirs = [ include_directories('include') ]
 lib_sources = files(
   'value.cc',
   'ir.cc',
+  'ir_dump.cc',
   'emit.cc',
   'vm.cc',
   'primops.cc',
@@ -58,6 +59,7 @@ lib_sources = files(
   'opt_cse.cc',
   'opt_dce.cc',
   'opt_inline.cc',
+  'opt_occur.cc',
   'opt_primop_fuse.cc',
   'opt_strictness.cc',
   'serialize.cc',

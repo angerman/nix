@@ -694,4 +694,105 @@ size_t elimRedundantForce(Module & m);
 /// hatch for debugging).
 void optimise(Module & m);
 
+// ---------------------------------------------------------------------------
+// #540: occurrence analysis (per lode/OPT_OCCUR_PLAN_2026-05-08.md)
+// ---------------------------------------------------------------------------
+
+/// Per-binder occurrence kind.  Mirrors GHC `OccurAnal`'s coarse
+/// classification minus loop-breakers (no inliner yet) and minus
+/// branch-aware OneOcc refinement (deferred to v2 of the pass).
+///
+/// Authorization table for downstream consumers:
+///
+///   | Kind          | Substitute RHS at use? | Drop binding?           |
+///   |---------------|------------------------|-------------------------|
+///   | Unknown       | NEVER                  | NEVER                   |
+///   | Param         | NEVER                  | NEVER (externally bound)|
+///   | Dead          | n/a                    | YES (subject to purity) |
+///   | OnceLinear    | YES (any RHS)          | YES (after substitution)|
+///   | OnceCaptured  | ONLY trivial RHS       | NEVER automatically     |
+///   | Many          | ONLY trivial RHS       | NEVER                   |
+///
+/// Trivial RHS = LitInt/Float/Bool/Null/String/Path, VarRef,
+/// LitPrimOp, LitBuiltins.  Zero evaluation cost so duplicating is
+/// free.
+enum class OccKind : uint8_t {
+    /// Out-of-range, not a defined VarId, or not analysed.  Consumers
+    /// MUST treat as conservative ("don't touch").
+    Unknown = 0,
+    /// Function paramVar / LetRec recVar / hidden-entry hiddenVar.
+    /// Externally bound (the runtime supplies the value); count is
+    /// meaningful but consumers should not drop the binding.
+    Param,
+    /// Zero references across the whole module.  Subject to existing
+    /// purity check, droppable.
+    Dead,
+    /// One reference, in the same function as the def, NOT through a
+    /// captured-list entry (Lambda::freeVars / MkThunk::freeVars /
+    /// LetRec::*::outerUpvalues / lexicalWiths).  Substituting the
+    /// RHS at the use site is safe; the binding can be dropped after.
+    OnceLinear,
+    /// One reference, but the use is inside a different function.
+    /// The binding's value crosses a closure capture, so substitution
+    /// is only safe for trivial RHSes (zero evaluation cost).
+    OnceCaptured,
+    /// Two or more references (saturating count).  Substitution only
+    /// safe for trivial RHSes; binding stays.
+    Many,
+};
+
+/// Per-VarId occurrence record.
+struct OccInfo {
+    OccKind  kind        = OccKind::Unknown;
+    /// Saturating count: capped at 2 (for "Many" we don't need the
+    /// exact value).  Direct uses only — captured-list entries are
+    /// excluded (those refs are derived data populated by
+    /// computeFreeVars and would double-count).
+    uint16_t count       = 0;
+    /// True if any direct use is inside a different Function than the
+    /// definition.  Drives OnceLinear vs OnceCaptured classification
+    /// for count==1; for count>=2 it's still meaningful info for
+    /// future passes (e.g., a Many-with-captured RHS may still be
+    /// safe to inline at certain use kinds).
+    bool     capturedUse = false;
+};
+
+/// Module-wide occurrence map.  `data[v] = OccInfo` for every VarId
+/// `v < nextVar`.  Out-of-range lookups return Unknown.
+struct OccMap {
+    std::vector<OccInfo> data;
+    OccInfo lookup(VarId v) const noexcept
+    {
+        if (v == kInvalid || v >= data.size()) return {};
+        return data[v];
+    }
+};
+
+/// Compute the occurrence map for `m`.
+///
+/// Algorithm:
+///   1. Compute funcOfBlock[bid] -> fid via reachability from each
+///      Function::entryBlock; sub-blocks (If/With/Assert bodies,
+///      And/Or/Impl rhsBlocks) inherit the parent's fid.
+///   2. defFunc[var] = fid for every binding's var, paramVar, recVar,
+///      hiddenVar.
+///   3. Initialise kind = Dead for binding vars, Param for the
+///      lambda/letrec-bound params and synthesised hidden vars.
+///   4. Forward-walk every block; for every binding's expr and the
+///      terminal, accumulate operand uses.  CAPTURED-LIST entries
+///      (Lambda::freeVars / MkThunk::freeVars / LetRec::*::outerUpvalues
+///      / Lambda::lexicalWiths / MkThunk::lexicalWiths /
+///      LetRec::*::lexicalWiths) are SKIPPED — those VarIds are
+///      already counted via the body's direct operand uses, and
+///      counting them too would double-count.
+///   5. Finalise: count==0 -> Dead; count==1 && !captured -> OnceLinear;
+///      count==1 && captured -> OnceCaptured; count>=2 -> Many.
+///
+/// O(N) in the size of the IR (one pass per binding/terminal).
+OccMap analyseOccurrence(const Module & m);
+
+/// Convenience: return true iff the given Expr is a "trivial" RHS
+/// — zero evaluation cost, safe to duplicate at any use site.
+bool isTrivialRhs(const Expr & e) noexcept;
+
 } // namespace nix::v3::ir
