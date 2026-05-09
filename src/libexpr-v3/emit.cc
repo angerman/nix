@@ -612,21 +612,25 @@ struct Emitter
     // -- Short-circuit
     void emitOne(const ir::And & e)
     {
-        emitVarRef(e.lhs);
+        // #542 unary fast path: lhs may be deferred at top of pending.
+        if (!tryFastPathUnary(e.lhs))
+            emitVarRef(e.lhs);
         uint32_t at = emitJumpPlaceholder(OP_AND_BRANCH);
         emitBlock(e.rhsBlock);
         patchJump(at, static_cast<uint32_t>(unit.code.size()));
     }
     void emitOne(const ir::Or & e)
     {
-        emitVarRef(e.lhs);
+        if (!tryFastPathUnary(e.lhs))
+            emitVarRef(e.lhs);
         uint32_t at = emitJumpPlaceholder(OP_OR_BRANCH);
         emitBlock(e.rhsBlock);
         patchJump(at, static_cast<uint32_t>(unit.code.size()));
     }
     void emitOne(const ir::Impl & e)
     {
-        emitVarRef(e.lhs);
+        if (!tryFastPathUnary(e.lhs))
+            emitVarRef(e.lhs);
         uint32_t at = emitJumpPlaceholder(OP_IMPL_BRANCH);
         emitBlock(e.rhsBlock);
         patchJump(at, static_cast<uint32_t>(unit.code.size()));
@@ -635,7 +639,16 @@ struct Emitter
     // -- If
     void emitOne(const ir::If & e)
     {
-        emitVarRef(e.cond);
+        // #542 unary fast path: when the cond binding is OnceLinear
+        // and was deferred (its value is on top of stack), skip the
+        // GET — OP_BRANCH_FALSE pops top.  This is the canonical
+        // shape for fib's `if k < 2 then ... else ...`: the LESS
+        // result is consumed by If, both bindings are tail-adjacent
+        // OnceLinear, and the binary fast path on Less + this unary
+        // fast path on If together collapse `<expr-cond>; SET; GET;
+        // BRANCH_FALSE` to `<expr-cond>; BRANCH_FALSE`.
+        if (!tryFastPathUnary(e.cond))
+            emitVarRef(e.cond);
         uint32_t bf = emitJumpPlaceholder(OP_BRANCH_FALSE);
         emitBlock(e.thenBlock);
         uint32_t je = emitJumpPlaceholder(OP_JUMP);
@@ -1039,6 +1052,16 @@ struct Emitter
             // already forces its source on the runtime fast path
             // (vm.cc).  The NIX_V3_NO_WITH_FORCE A/B gate is removed;
             // the no-force path is the verified-correct default.
+            //
+            // #542: do NOT use unary fast path here.  emitOne(With)'s
+            // body block emits ITS OWN bindings using the with-stack,
+            // and OP_WITH_PUSH happens BETWEEN the operand push and
+            // the body emit.  Consuming pending top here would leave
+            // pending non-empty; the subsequent OP_WITH_PUSH and
+            // emitBlock(body) sequence assumes runtime stack matches
+            // pending exactly, which it wouldn't.  Stay safe: just
+            // emitVarRef (flushes everything before pushing the
+            // attrs).
             emitVarRef(e.recAttrsVar);
             unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.recAttrsName));
             unit.code.push_back(encode(OP_WITH_PUSH));
@@ -1053,6 +1076,9 @@ struct Emitter
     }
     void emitOne(const ir::Assert & e)
     {
+        // #542: Assert's cond is consumed by OP_ASSERT (pops top).
+        // tryFastPathUnary is sound here.  Skip for now — limited
+        // win and Assert is uncommon.
         emitVarRef(e.cond);
         unit.code.push_back(encode(OP_ASSERT));
         emitBlock(e.bodyBlock);

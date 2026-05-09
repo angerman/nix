@@ -2049,6 +2049,60 @@ static int testDeferSkipsManyUseBinding()
     return 0;
 }
 
+// Positive: the fib `if k < 2 then ... else ...` shape combines the
+// binary fast path on Less with the unary fast path on If.  The
+// expected disasm collapses to FORCE k; LIT 2; LESS; BRANCH_FALSE
+// — no SET/GET intermediates between LESS and BRANCH_FALSE.
+static int testDeferIfOnLessShape()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    auto thenB = m.freshBlock();
+    auto elseB = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto & f = funcOf(m, 0);
+    f.argName = ir::SymbolId{1};
+    f.paramVar = m.freshVar();
+    auto kVar = f.paramVar;
+
+    // body: let kf = force k; two = 2; c = kf < two; if c then 100 else 200
+    auto kf   = addBinding(m, entry, ir::Force{kVar});
+    auto two  = addBinding(m, entry, ir::LitInt{2});
+    auto less = addBinding(m, entry, ir::Less{kf, two});
+    auto ifv  = addBinding(m, entry, ir::If{less, thenB, elseB});
+    setReturn(m, entry, ifv);
+    auto t1 = addBinding(m, thenB, ir::LitInt{100});
+    setReturn(m, thenB, t1);
+    auto e1 = addBinding(m, elseB, ir::LitInt{200});
+    setReturn(m, elseB, e1);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    std::string dis = disasmFunction(cu, 0);
+
+    // Expected: GET_LOCAL_FORCE; LIT_INT; LESS; BRANCH_FALSE — no
+    // OP_SET_LOCAL between LESS and BRANCH_FALSE (the OnceLinear
+    // `less` binding must be deferred and consumed by the unary fast
+    // path on If).
+    const char * expected = R"(
+        ; CHECK: OP_GET_LOCAL_FORCE
+        ; CHECK: OP_LIT_INT
+        ; CHECK: OP_LESS
+        ; CHECK-NOT: OP_SET_LOCAL
+        ; CHECK: OP_BRANCH_FALSE
+    )";
+    auto err = ir::checkIr(dis, expected);
+    if (!err.empty()) {
+        std::fprintf(stderr,
+            "testDeferIfOnLessShape: %s\nactual disasm:\n%s\n",
+            err.c_str(), dis.c_str());
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testDeferIfOnLessShape: OK (binary+unary fast paths chain)\n");
+    return 0;
+}
+
 // Regression: rec attrset construction must not be broken by deferring.
 // `rec { x = 7; y = x + 1; }` should produce { x = 7, y = 8 }.
 static int testDeferLetRecCorrect()
@@ -2168,6 +2222,7 @@ int main()
     // #542 — emit-time deferring + binary fast path.
     rc |= testDeferAddCorrectness();
     rc |= testDeferFibCondShape();
+    rc |= testDeferIfOnLessShape();
     rc |= testDeferSkipsManyUseBinding();
     rc |= testDeferLetRecCorrect();
     rc |= testDeferKillSwitch();
