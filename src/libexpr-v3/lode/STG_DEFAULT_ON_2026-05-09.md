@@ -8,6 +8,33 @@ gates: publish (vm.cc), side-table recovery (vm.cc x2), eval-hook
 `NIX_V3_NO_STG` instead of `NIX_V3_STG`.  Set `NIX_V3_NO_STG=1` to
 restore the legacy publish-and-recover path.
 
+## Validated inventory matrix (post-flip)
+
+```
+workload             | tw          | v3-direct | v3-direct-stg | v3-fhook  | v3-fhook-stg
+---------------------+-------------+-----------+---------------+-----------+-------------
+rec-simple           | OK          | OK        | OK            | OK        | OK
+rec-self-dot         | OK          | OK        | OK            | OK        | OK
+let-prev-update      | OK          | OK        | OK            | OK        | OK
+let-rec-mutual       | OK          | OK        | OK            | OK        | OK
+formals-default      | OK          | OK        | OK            | OK        | OK
+formals-mutual       | OK          | OK        | OK            | OK        | OK
+lib-id               | OK          | OK        | OK            | OK        | OK
+lib-fix-simple       | OK          | OK        | OK            | OK        | OK
+lib-extends-1        | OK          | OK        | OK            | OK        | OK
+lib-extends-with     | OK          | OK        | OK            | OK        | OK
+lib-makeextensible   | OK          | OK        | OK            | OK        | OK
+nixpkgs-typeof       | OK "set"    | CYCLE     | TIMEOUT       | OK "set"  | OK "set"
+nixpkgs-lib-id       | OK 42       | CYCLE     | TIMEOUT       | OK 42     | OK 42
+nixpkgs-hello-name   | OK "hello"  | CYCLE     | (killed)      | OK "hello"| OK "hello"
+```
+
+Headline: `v3-fhook` (the user-visible mode after `NIX_USE_V3=1`)
+is now FULLY GREEN on full nixpkgs — `typeof`, `lib.id`, `hello.name`
+all match TW.  Before the flip these were `BLACKHOLE`.  The STG
+default-on flip fixes them transparently with no env-var changes
+required from users.
+
 ## What this fixes
 
 - `(import <nixpkgs> {}).hello.name` under v3-fhook: was BLACKHOLE,
