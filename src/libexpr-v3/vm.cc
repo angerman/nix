@@ -947,6 +947,37 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     Value finalResult{};
     finalResult.mkNull();
 
+    // V3_DUMP_AT_START=1: on entry, dump every lambda descriptor in
+    // the top frame's CU.  Useful for profiling tools that want to
+    // see the full bytecode without forcing an error condition.
+    // Idempotent (we'd dump on every dispatchLoop entry but the
+    // outer call gates on initial entry depth).
+    static const bool s_dump_at_start =
+        std::getenv("V3_DUMP_AT_START") != nullptr;
+    if (__builtin_expect(s_dump_at_start, 0)) [[unlikely]] {
+        if (cu) {
+            static std::set<const CompilationUnit *> dumpedCus;
+            if (dumpedCus.insert(cu).second) {
+                std::fprintf(stderr,
+                    "  V3_DUMP_AT_START: cu=%p (%zu lambdas, code.size=%zu)\n",
+                    (const void *)cu, cu->lambdas.size(), cu->code.size());
+                for (size_t li = 0; li < cu->lambdas.size(); ++li) {
+                    const auto & d = cu->lambdas[li];
+                    uint32_t end = (li + 1 < cu->lambdas.size())
+                        ? cu->lambdas[li + 1].codeOffset
+                        : static_cast<uint32_t>(cu->code.size());
+                    std::fprintf(stderr,
+                        "    L[%zu] code=[%u..%u) nUp=%u nLocals=%u nWiths=%u name=%s\n",
+                        li, (unsigned)d.codeOffset, end,
+                        (unsigned)d.nUpvalues, (unsigned)d.nLocals,
+                        (unsigned)d.nWithTargets,
+                        d.name.empty() ? "<anon>" : d.name.c_str());
+                    disassembleWindow(stderr, *cu, d.codeOffset, end);
+                }
+            }
+        }
+    }
+
     bool running = true;
     // Gate the per-instruction counter behind an env var: it adds a
     // memory write to every instruction and is only useful for
@@ -1009,8 +1040,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
         }
         Instruction instr = cu->code[ip++];
-        if (__builtin_expect(kCountInstructions, 0)) [[unlikely]]
+        if (__builtin_expect(kCountInstructions, 0)) [[unlikely]] {
             vm.nrInstructions++;
+            allocStats().bytecodeInstructions++;
+        }
         Op op = decodeOp(instr);
         uint32_t operand = decodeOperand(instr);
 
@@ -1170,15 +1203,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // match.  Float operations have no such check (NaN/Inf semantics
         // mirror IEEE-754, same as tree-walker).
         case OP_ADD: {
+            // Hot path mirror of OP_EQ/OP_LESS: in-place stack mutate on
+            // int-int (the dominant case for the fib/ackermann/numeric-
+            // loop shape) to avoid the pop+pop+push triple.  __builtin_
+            // expect(int-int, 1) keeps the slow Float / mixed paths off
+            // the inner-loop hot trace.
+            Value & top1 = vm.valueStack.back();
+            Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+            if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
+                int64_t sum;
+                if (__builtin_expect(__builtin_add_overflow(
+                        top0.payload.i, top1.payload.i, &sum), 0))
+                    throw std::runtime_error("v3 OP_ADD: integer overflow");
+                vm.valueStack.pop_back();
+                vm.valueStack.back().mkInt(sum);
+                break;
+            }
+            // Slow path: Float / mixed Int-Float.
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
-            if (lhs.isInt() && rhs.isInt()) {
-                int64_t sum;
-                if (__builtin_add_overflow(lhs.payload.i, rhs.payload.i, &sum))
-                    throw std::runtime_error("v3 OP_ADD: integer overflow");
-                r.mkInt(sum);
-            }
-            else if (lhs.isFloat() && rhs.isFloat()) r.mkFloat(lhs.payload.f + rhs.payload.f);
+            if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.payload.f + rhs.payload.f);
             else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) + rhs.payload.f);
             else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f + static_cast<double>(rhs.payload.i));
             else throw std::runtime_error("v3 OP_ADD: type mismatch");
@@ -1186,15 +1230,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_SUB: {
+            Value & top1 = vm.valueStack.back();
+            Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+            if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
+                int64_t diff;
+                if (__builtin_expect(__builtin_sub_overflow(
+                        top0.payload.i, top1.payload.i, &diff), 0))
+                    throw std::runtime_error("v3 OP_SUB: integer overflow");
+                vm.valueStack.pop_back();
+                vm.valueStack.back().mkInt(diff);
+                break;
+            }
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
-            if (lhs.isInt() && rhs.isInt()) {
-                int64_t diff;
-                if (__builtin_sub_overflow(lhs.payload.i, rhs.payload.i, &diff))
-                    throw std::runtime_error("v3 OP_SUB: integer overflow");
-                r.mkInt(diff);
-            }
-            else if (lhs.isFloat() && rhs.isFloat()) r.mkFloat(lhs.payload.f - rhs.payload.f);
+            if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.payload.f - rhs.payload.f);
             else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) - rhs.payload.f);
             else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f - static_cast<double>(rhs.payload.i));
             else throw std::runtime_error("v3 OP_SUB: type mismatch");
@@ -1202,15 +1251,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_MUL: {
+            Value & top1 = vm.valueStack.back();
+            Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+            if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
+                int64_t prod;
+                if (__builtin_expect(__builtin_mul_overflow(
+                        top0.payload.i, top1.payload.i, &prod), 0))
+                    throw std::runtime_error("v3 OP_MUL: integer overflow");
+                vm.valueStack.pop_back();
+                vm.valueStack.back().mkInt(prod);
+                break;
+            }
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
-            if (lhs.isInt() && rhs.isInt()) {
-                int64_t prod;
-                if (__builtin_mul_overflow(lhs.payload.i, rhs.payload.i, &prod))
-                    throw std::runtime_error("v3 OP_MUL: integer overflow");
-                r.mkInt(prod);
-            }
-            else if (lhs.isFloat() && rhs.isFloat()) r.mkFloat(lhs.payload.f * rhs.payload.f);
+            if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.payload.f * rhs.payload.f);
             else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) * rhs.payload.f);
             else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f * static_cast<double>(rhs.payload.i));
             else throw std::runtime_error("v3 OP_MUL: unsupported types");

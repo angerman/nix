@@ -38,9 +38,21 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // have had `bindVars` applied; the caller's contract.
     auto module = lowerNixExpr(e, state.symbols, state.positions);
 
+    // #538: run the IR optimization pipeline (constant fold, CSE,
+    // strictness, alias inline, primop fuse, DCE).  Without this the
+    // v3-direct path emits massive amounts of redundant SET_LOCAL /
+    // GET_LOCAL through trivial bindings, plus per-LitInt force
+    // overhead — the lowerer's A-normal-form-style binding-per-
+    // subexpression pattern bloats the bytecode unless the optimizer
+    // collapses VarRef chains and elides redundant Forces.  The
+    // import-primop path (`primops.cc primImport`) already does this;
+    // the runRootExpr path silently skipped it before this fix.
+    ir::optimise(module);
+
     // computeFreeVars: populates each `ir::Function::freeVars` from
     // `Function::vars`.  Required before `compile` so the emitter
-    // knows which upvalues each closure captures.
+    // knows which upvalues each closure captures.  Must run AFTER
+    // `optimise` so any newly-introduced VarRef aliases are walked.
     ir::computeFreeVars(module);
 
     // Compile IR to bytecode.  The CompilationUnit owns

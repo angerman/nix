@@ -1737,6 +1737,18 @@ static void v3EvalEntry(nix::EvalState & state, nix::Expr * e, nix::Value & v)
                     std::fprintf(stderr,
                         "v3 selector-lambda: fast-path calls=%llu\n",
                         (unsigned long long)selectorCalls);
+                // #538 dispatch profiling: total bytecode instructions
+                // executed.  Lets us divide v3 hook timing's `run=...`
+                // by this count to get nanoseconds per dispatched op
+                // — the amortised cost of one VM iteration.  Only
+                // populated under NIX_VM_STATS=1 because the inner
+                // counter add costs ~3% on hot loops.
+                if (uint64_t insns =
+                        allocStats().bytecodeInstructions;
+                    insns > 0)
+                    std::fprintf(stderr,
+                        "v3 dispatch: bytecode instructions=%llu\n",
+                        (unsigned long long)insns);
                 // #495: native intrinsic fast-path firings.
                 if (uint64_t fixCalls =
                         allocStats().intrinsicFixCalls;

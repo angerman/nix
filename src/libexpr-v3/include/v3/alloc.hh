@@ -129,6 +129,15 @@ struct AllocStats
     uint64_t listsAllocated    = 0;
     uint64_t attrsetsAllocated = 0;
 
+    /// #538 dispatch profiling: total bytecode instructions executed
+    /// across all VMState instances in the process.  Bumped by
+    /// `dispatchLoop` per opcode iteration when NIX_VM_STATS=1 enables
+    /// the per-instruction counter.  Reported at atexit alongside
+    /// alloc counters; lets us divide v3.run wall time by the
+    /// instruction count to get nanoseconds-per-op (the dispatch
+    /// loop's amortised cost).
+    uint64_t bytecodeInstructions = 0;
+
     /// Bindings allocation histogram by size.  Buckets:
     /// [0]=0, [1]=1, [2]=2, [3]=3-4, [4]=5-8, [5]=9-16, [6]=17-32,
     /// [7]=33-64, [8]=65-128, [9]=129+.  Used to size-tune the
