@@ -125,6 +125,94 @@ The actual nixpkgs has:
   in pkgs/top-level/).
 - Disk-cache hit/miss interactions.
 
+## NIXPKGS BISECT RESULTS
+
+**Setup:** writable copy of nixpkgs at `/tmp/nixpkgs-bisect/`.
+
+### 1. Trigger localized to `autoCalledPackages` stage
+
+Replacing `autoCalledPackages` with a no-op (`self: super: {}`) in
+`pkgs/top-level/stage.nix` makes v3-direct fail SAME way as TW (both
+report `bison missing`).  The "OP_WITH_LOOKUP callPackage" symptom
+DISAPPEARS.
+
+So the bug is triggered by `pkgs/top-level/by-name-overlay.nix`,
+which is the `autoCalledPackages` stage.
+
+### 2. Triggered by `mapAttrs` over real package set
+
+by-name-overlay returns:
+```nix
+self: super:
+{
+  _internalCallByNamePackageFile = file: self.callPackage file { };
+}
+// mapAttrs (name: self._internalCallByNamePackageFile) packageFiles
+```
+
+Replacing `mapAttrs (...) packageFiles` with a stub or 1-entry dict
+does NOT trigger the bug (eval fails earlier with "bison missing").
+The full set of by-name packages is required.
+
+### 3. Bug fires AFTER processing 83 packages, ON the 84th (hello)
+
+Per-package tracing shows TW and v3-direct call
+`_internalCallByNamePackageFile` 83 times in the same order,
+ending with package `hello`.  TW returns "hello-2.12.2"; v3-direct
+crashes immediately after `BYNAME-hello` trace.
+
+So the bug fires during evaluation of hello's package, NOT during
+the previous 83 successful packages.
+
+### 4. Bug NOT in hello's content
+
+Replacing `pkgs/by-name/he/hello/package.nix` with a minimal stub
+`{ }: { name = "hello-no-formals"; }` STILL triggers the bug.
+
+So the bug is in the **`self.callPackage <hello-path> {}` machinery
+itself**, not in hello's content.
+
+### 5. Failing OP_WITH_LOOKUP is at code 45693
+
+The actual failing thunk's bytecode at 45693:
+```
+[45693] OP_WITH_LOOKUP operand=2128  (sid=2128 = "callPackage")
+[45694] OP_LIT_PATH    operand=17
+[45695] OP_CALL        operand=0
+```
+
+This thunk does `callPackage <some-path>` — looks up `callPackage`
+via with-stack, calls it with a path.  Container frame is "attrs"
+at code 3585.
+
+The thunk has `[0,1]` at OP_MAKE_THUNK — 0 freeVars, 1 lexicalWith.
+So when MADE, it captured 1 with-target value.  At RUN time, that
+with-target's deref gives `{prev}` size 1 (lib.extends's let-rec
+recAttrs).  Should give `pkgs` (the fix-point).
+
+### Key conclusion
+
+The bug is in the path between:
+1. `self.callPackage <path>` calls  (in `_internalCallByNamePackageFile`)
+2. `lib.callPackageWith pkgsForCall <path> {}` (callPackage = newScope {} = callPackageWith pkgsForCall)
+3. The thunk created somewhere in that chain captures the WRONG
+   with-target (the let-rec recAttrs from lib.extends instead of the
+   real pkgs).
+
+The thunk's name "attrs" suggests it's an attrset entry's lazy
+thunk.  The container "attrs" lambda at code 3585 has 5177 nLocals
+(matching all-packages.nix size).  So the failing thunk lives
+INSIDE all-packages.nix's body — created during evaluation of one
+of all-packages.nix's many attrs that uses with-resolved
+`callPackage`.
+
+This means: when by-name calls `self.callPackage`, it forces the
+fix-point pkgs, which forces all-packages.nix's body to evaluate.
+Inside that body, MANY attrs use `callPackage` via `with pkgs;`.
+SOME of those attrs' lazy thunks are FORCED during by-name's
+processing — and those thunks have a stale/wrong with-target
+captured.
+
 ## Symptom-changing kill switch (NIX_V3_SELF_DOT_MAX_LEVEL)
 
 **Important:** while most kill switches leave the symptom unchanged,
