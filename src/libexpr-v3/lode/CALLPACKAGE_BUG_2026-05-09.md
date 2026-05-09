@@ -125,6 +125,25 @@ The actual nixpkgs has:
   in pkgs/top-level/).
 - Disk-cache hit/miss interactions.
 
+## Negative results (narrow the search)
+
+The following diagnostic kill switches all leave the symptom
+unchanged (still `OP_WITH_LOOKUP: name 'callPackage' not found`):
+
+| env var                            | what it disables                  | result    |
+|------------------------------------|-----------------------------------|-----------|
+| `NIX_V3_NO_INTRINSIC_RECOGNISE=1`  | Fix/Extends/Compose recognition   | unchanged |
+| `NIX_V3_NO_OPTIMISE=1`             | the IR optimiser pipeline         | unchanged |
+| `NIX_V3_NO_REC_SLOT_CAPTURE=1`     | rec-slot capture (Tag::Slot path) | unchanged |
+| `NIX_V3_NO_INLINE_REC_SLOT=1`      | inline RecBindingSlotRef          | unchanged |
+| `NIX_V3_NO_INVERT_EVAL=1`          | invert-eval direct path           | unchanged |
+| `NIX_V3_NO_LIFT_LAMBDA=1`          | lambda hoisting                   | unchanged |
+| `NIX_V3_NO_LAMBDA_SKIP=1`          | lambda-skip pass                  | unchanged |
+| `NIX_V3_THUNKIFY=0`                | broader-thunkify                  | unchanged |
+
+So the bug lives in core lowering / emit / runtime — NOT in the
+optional optimisation paths these gates control.
+
 ## What to do next session
 
 1. **Bisect for triggering complexity**: keep adding nixpkgs-shape
