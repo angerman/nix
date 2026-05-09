@@ -530,6 +530,44 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 }
                 std::fprintf(stderr, "\n");
             }
+            // #546 follow-on: dump the call-frame chain so we can
+            // identify WHICH thunk is forcing the with-source.  The
+            // bottom of the chain holds the OP_WITH_LOOKUP-firing
+            // thunk; outer frames show the cause chain leading to it.
+            std::fprintf(stderr, "  frames (top=%zu, last 12):\n",
+                vm.frames.size());
+            size_t lim = vm.frames.size() < 12 ? 0 : vm.frames.size() - 12;
+            for (size_t i = vm.frames.size(); i-- > lim; ) {
+                const auto & f = vm.frames[i];
+                const char * kind = (f.flags & CFF_THUNK_RETURN) ? "thunk"
+                    : f.closure ? "call" : "?";
+                const LambdaDescriptor * d = nullptr;
+                if (f.closure) d = f.closure->desc;
+                else if (f.thunk) d = f.thunk->suspended.desc;
+                std::fprintf(stderr,
+                    "    [%zu] %s ip=%u name='%s' codeOff=%u",
+                    i, kind, f.ip,
+                    d && !d->name.empty() ? d->name.c_str() : "<anon>",
+                    d ? (unsigned)d->codeOffset : 0u);
+                if (f.thunk)
+                    std::fprintf(stderr, " thunk=%p state=%d",
+                        (void *)f.thunk, (int)f.thunk->state);
+                std::fprintf(stderr, "\n");
+                // Disassemble around current ip for the inner-most few
+                // frames so we can see the failing IR-ops + their
+                // immediate predecessors (the value that became the
+                // failing with-source).
+                if (i + 3 >= vm.frames.size() && f.cu) {
+                    uint32_t lo = f.ip > 5 ? f.ip - 5 : 0;
+                    uint32_t hi = std::min<uint32_t>(f.ip + 5,
+                        static_cast<uint32_t>(f.cu->code.size()));
+                    if (lo < hi) {
+                        std::fprintf(stderr, "      bytecode [%u-%u):\n",
+                            lo, hi);
+                        disassembleWindow(stderr, *f.cu, lo, hi);
+                    }
+                }
+            }
             std::fflush(stderr);
         }
         throw BlackholeError(
