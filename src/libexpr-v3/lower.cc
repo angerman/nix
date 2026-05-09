@@ -1778,12 +1778,31 @@ struct Lowerer
             // Same fix as the bare-Var case: thunkify so the call runs
             // at the consumer's force time, by which point `pkgs` has
             // settled.
+            //
+            // #548 (2026-05-09): also handle CURRIED calls — the AST
+            // for `callPackagesWith {} ./path` is
+            //   ExprCall{ fun = ExprCall{ fun = ExprVar(callPackagesWith),
+            //                             arg = {} },
+            //             arg = ./path }
+            // so the outer ExprCall's `fun` is an inner ExprCall, not a
+            // Var.  Walk the chain to the root callee and thunkify if
+            // it's a Var (regardless of fromWith — let-bound function
+            // calls in `inherit (E) ...` from-expr position must also
+            // be deferred to match TW's `from->maybeThunk(state, up)`).
+            // This catches the v3-direct nixpkgs cycle on `hello.name`
+            // where stage.nix's allPackages has
+            //   inherit (callPackagesWith pkgs ./top-level/...) Y Z;
+            // and v3's eager lowering trips OP_WITH_LOOKUP-cycle.
             if (k == nix::Expr::Kind::Call) {
-                auto * c = static_cast<nix::ExprCall *>(fx);
-                if (c && c->fun && c->fun->exprKind == nix::Expr::Kind::Var) {
-                    auto * fv = static_cast<nix::ExprVar *>(c->fun);
-                    if (fv->fromWith) return true;
+                nix::Expr * head = fx;
+                int hops = 0;
+                while (head && head->exprKind == nix::Expr::Kind::Call
+                       && hops < 8) {
+                    head = static_cast<nix::ExprCall *>(head)->fun;
+                    ++hops;
                 }
+                if (head && head->exprKind == nix::Expr::Kind::Var)
+                    return true;
             }
             return false;
         };

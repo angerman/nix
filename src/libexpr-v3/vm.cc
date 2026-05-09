@@ -37,6 +37,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <execinfo.h>
 
 namespace nix::v3 {
@@ -92,6 +93,27 @@ namespace {
 /// and try to "fix" by unification.
 constexpr int    kMaxIndirectionChase = 4096;
 constexpr size_t kMaxCallDepth        = 5000;
+
+// V3_DBG_TRACE_THUNK_X — file-scope thunk-creation registry.  Bumped
+// at every OP_MAKE_THUNK; consulted by the OP_WITH_LOOKUP cycle dump
+// so we can compare each frame's *current* `t->suspended.desc`
+// against the descriptor pointer that was written at creation time.
+// A mismatch = in-place mutation (descriptor table relocated, union
+// overlap UB, or a different writer to suspended.desc somewhere).
+struct ThunkCreationInfo {
+    uint32_t funcIdx;
+    uint32_t codeOff;
+    std::string name;
+    const LambdaDescriptor * descPtr;
+    const CompilationUnit * cu;
+};
+static const bool g_traceThunkX =
+    std::getenv("V3_DBG_TRACE_THUNK_X") != nullptr;
+inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
+{
+    static thread_local std::unordered_map<const Thunk *, ThunkCreationInfo> m;
+    return m;
+}
 
 [[gnu::always_inline]]
 inline Value pop(VMState & vm)
@@ -622,24 +644,100 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 const char * kind = (f.flags & CFF_THUNK_RETURN) ? "thunk"
                     : f.closure ? "call" : "?";
                 const LambdaDescriptor * d = nullptr;
-                if (f.closure) d = f.closure->desc;
-                else if (f.thunk) d = f.thunk->suspended.desc;
+                // BUGFIX (2026-05-09): the THUNK_RETURN flag should
+                // route to f.thunk's desc, not f.closure's.  Earlier
+                // version preferred f.closure unconditionally, which
+                // meant a frame that had BOTH set (set by some path
+                // we haven't pinpointed) showed the wrong descriptor.
+                //
+                // suspended.desc is union-shared with `evaluated:Value`
+                // / `bridgeSrc:void*`; reading it when state isn't
+                // Suspended/Blackhole returns garbage (pre-state-guard
+                // version was reporting bogus codeOffsets).  Fall
+                // through to the closure's desc in that case.
+                bool descValid = f.thunk && (
+                    f.thunk->state == ThunkState::Suspended
+                    || f.thunk->state == ThunkState::Blackhole);
+                if (f.flags & CFF_THUNK_RETURN) {
+                    if (descValid) d = f.thunk->suspended.desc;
+                    else if (f.closure) d = f.closure->desc;
+                } else {
+                    if (f.closure) d = f.closure->desc;
+                    else if (descValid) d = f.thunk->suspended.desc;
+                }
+                const CompilationUnit * thunkCu =
+                    (descValid && f.thunk) ? f.thunk->suspended.cu : nullptr;
+                // OP_TAIL_CALL retargets cur.cu/cur.closure but leaves
+                // f.thunk's descriptor pointing at the original
+                // thunk-body lambda.  So `d` (the THUNK descriptor)
+                // names the *outer* thunk, while f.closure->desc names
+                // what the frame is *actually executing*.  Print BOTH
+                // when they differ -- the executing-desc + f.cu match
+                // the disassembly window below; the thunk-desc is the
+                // identity that OP_RETURN will deposit the result into.
+                const LambdaDescriptor * exec = f.closure ? f.closure->desc : nullptr;
+                bool tailCalled = exec && d && exec != d;
                 std::fprintf(stderr,
-                    "    [%zu] %s ip=%u name='%s' codeOff=%u",
+                    "    [%zu] %s ip=%u thunk-name='%s' thunk-codeOff=%u",
                     i, kind, f.ip,
                     d && !d->name.empty() ? d->name.c_str() : "<anon>",
                     d ? (unsigned)d->codeOffset : 0u);
+                if (tailCalled)
+                    std::fprintf(stderr, " EXEC=%s codeOff=%u",
+                        !exec->name.empty() ? exec->name.c_str() : "<anon>",
+                        (unsigned)exec->codeOffset);
+                std::fprintf(stderr,
+                    " f.cu=%p thunk.cu=%p closure=%p thunk=%p flags=%x",
+                    (const void *)f.cu, (const void *)thunkCu,
+                    (const void *)f.closure, (const void *)f.thunk,
+                    (unsigned)f.flags);
                 if (f.thunk)
                     std::fprintf(stderr, " thunk=%p state=%d",
                         (void *)f.thunk, (int)f.thunk->state);
                 std::fprintf(stderr, "\n");
+                // V3_DBG_TRACE_THUNK_X: cross-check current desc
+                // against the descriptor pointer recorded at
+                // OP_MAKE_THUNK time.  If `descPtr` differs, the
+                // suspended-union has been overwritten.  If `descPtr`
+                // matches but `codeOffset`/`name` differ, the
+                // descriptor itself was mutated in place (or the
+                // cu->lambdas vector relocated its storage).  Either
+                // is a hard data-corruption signal.
+                if (g_traceThunkX && f.thunk) {
+                    auto & m = thunkCreationMap();
+                    auto it = m.find(f.thunk);
+                    if (it == m.end()) {
+                        std::fprintf(stderr,
+                            "      [trace-x] thunk=%p NOT in creation "
+                            "map (allocated outside OP_MAKE_THUNK)\n",
+                            (void *)f.thunk);
+                    } else {
+                        const auto & ci = it->second;
+                        const LambdaDescriptor * curD =
+                            (f.thunk->state == ThunkState::Suspended
+                              || f.thunk->state == ThunkState::Blackhole)
+                            ? f.thunk->suspended.desc : nullptr;
+                        bool ptrMatch  = (curD == ci.descPtr);
+                        bool codeMatch = curD && curD->codeOffset == ci.codeOff;
+                        bool nameMatch = curD && curD->name == ci.name;
+                        std::fprintf(stderr,
+                            "      [trace-x] created: fid=%u codeOff=%u "
+                            "name='%s' descPtr=%p cu=%p%s%s%s\n",
+                            ci.funcIdx, ci.codeOff, ci.name.c_str(),
+                            (const void *)ci.descPtr,
+                            (const void *)ci.cu,
+                            ptrMatch ? "" : " [DESC-PTR-CHANGED]",
+                            codeMatch ? "" : " [CODEOFF-CHANGED]",
+                            nameMatch ? "" : " [NAME-CHANGED]");
+                    }
+                }
                 // Disassemble around current ip for the inner-most few
                 // frames so we can see the failing IR-ops + their
                 // immediate predecessors (the value that became the
                 // failing with-source).
                 if (i + 3 >= vm.frames.size() && f.cu) {
-                    uint32_t lo = f.ip > 5 ? f.ip - 5 : 0;
-                    uint32_t hi = std::min<uint32_t>(f.ip + 5,
+                    uint32_t lo = f.ip > 30 ? f.ip - 30 : 0;
+                    uint32_t hi = std::min<uint32_t>(f.ip + 6,
                         static_cast<uint32_t>(f.cu->code.size()));
                     if (lo < hi) {
                         std::fprintf(stderr, "      bytecode [%u-%u):\n",
@@ -1781,32 +1879,47 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Reuse the LambdaDescriptor pointer through suspended.desc.
             t->suspended.desc = &cu->lambdas[funcIdx];
             t->suspended.cu = cu;
-            // V3_DBG_MK_THUNK_SUPER -- log every OP_MAKE_THUNK that
-            // creates a thunk named "super".  Helps identify whether
-            // the unexpected `super` thunk is from a lambda fid being
-            // misused, a let-rec entry, or a formals-default thunk.
-            // Captures funcIdx, codeOffset, and the calling site.
-            static const bool s_dbgMkThunkSuper =
-                std::getenv("V3_DBG_MK_THUNK_SUPER") != nullptr;
-            if (__builtin_expect(s_dbgMkThunkSuper, 0) && t->suspended.desc
-                && t->suspended.desc->name == "super") {
+            // V3_DBG_TRACE_THUNK_X -- track creation of every thunk into
+            // a process-wide map (thunk_ptr -> (funcIdx, codeOff,
+            // name, descPtr, cu)).  Consumed by the cycle-dump
+            // diagnostic at OP_WITH_LOOKUP-cycle to verify whether the
+            // thunk's current `suspended.desc` matches what it was at
+            // creation time.  A mismatch is hard evidence of in-place
+            // descriptor mutation (or thunk-pointer reuse).
+            if (__builtin_expect(g_traceThunkX, 0)) {
+                ThunkCreationInfo info{
+                    funcIdx,
+                    t->suspended.desc ? t->suspended.desc->codeOffset : 0u,
+                    t->suspended.desc ? t->suspended.desc->name : std::string(),
+                    t->suspended.desc,
+                    cu};
+                thunkCreationMap()[t] = info;
+            }
+            // V3_DBG_MK_THUNK_ANY -- log every OP_MAKE_THUNK with funcIdx,
+            // descriptor name, codeOffset.  Use to verify (1) the
+            // diagnostic codepath compiles in, (2) which fids are
+            // actually being thunkified at runtime, and (3) whether a
+            // "super"-named thunk is ever created via OP_MAKE_THUNK.
+            //
+            // Filtered by codeOffset to keep the log small: only prints
+            // when codeOffset < 600 (== the early functions in the cu),
+            // capturing the unusual codeOff=140 'super' thunk if it's
+            // created here.
+            static const bool s_dbgMkThunkAny =
+                std::getenv("V3_DBG_MK_THUNK_ANY") != nullptr;
+            if (__builtin_expect(s_dbgMkThunkAny, 0)) {
                 static thread_local int s_n = 0;
-                if (s_n++ < 30) {
+                if (t->suspended.desc
+                    && t->suspended.desc->name == "super") {
+                    s_n++;
                     std::fprintf(stderr,
-                        "MK_THUNK super[%d]: funcIdx=%u codeOff=%u nUp=%u nWiths=%u "
-                        "called-from-ip=%u arity=%u hasFormals=%u\n",
-                        s_n, funcIdx, t->suspended.desc->codeOffset,
-                        nUp, nWiths, ip - 3,
+                        "MK_THUNK super[%d] cu=%p funcIdx=%u codeOff=%u "
+                        "nUp=%u nWiths=%u arity=%u hasFormals=%u\n",
+                        s_n, (const void *)cu, funcIdx,
+                        t->suspended.desc->codeOffset,
+                        nUp, nWiths,
                         t->suspended.desc->arity,
                         t->suspended.desc->hasFormals);
-                    // Also dump bytecode at the function's body start
-                    // so we can see what kind of function it is.
-                    if (cu) {
-                        uint32_t lo = t->suspended.desc->codeOffset;
-                        uint32_t hi = std::min<uint32_t>(lo + 12,
-                            static_cast<uint32_t>(cu->code.size()));
-                        if (lo < hi) disassembleWindow(stderr, *cu, lo, hi);
-                    }
                 }
             }
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);

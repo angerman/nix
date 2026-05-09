@@ -137,6 +137,97 @@ becomes diagnoseable: knowing WHICH function the cycle's thunk is,
 we can trace its creation site in lower.cc and determine why v3
 forces it (and TW doesn't).
 
+## Update — afternoon 2026-05-09
+
+### Resolved: H1/H2/H3 were ALL wrong — display artifact
+
+After adding `V3_DBG_TRACE_THUNK_X` (records each thunk's
+creation-time `desc` pointer / codeOff / name) and consulting it
+at cycle-throw, the descPtr **matched** at every frame.  No
+descriptor mutation, no union UB, no descriptor-table aliasing.
+
+The "ip < codeOff" puzzle was a **display artifact** of
+`OP_TAIL_CALL` (vm.cc:3176) which retargets `cur.cu`,
+`cur.closure`, `cur.ip` in place but leaves `cur.thunk->suspended.desc`
+pointing at the original thunk-body lambda.  Frame[87] was the 'res'
+thunk (codeOff=431 in lib's CU) but its body had tail-called into
+`super:` (codeOff=140 in all-packages.nix's CU); the frame's
+*executing* desc ≠ the *thunk's* desc.
+
+Cycle-dump diagnostic now prints both: `thunk-name='res' codeOff=431
+EXEC=super codeOff=140` so future investigators don't repeat this.
+
+### Real root cause — found
+
+The eager-force site is in `super:` body around PC=219..222:
+
+```
+OP_GET_LOCAL 17        ; rec-binding[289] (a let-bound function)
+OP_GET_LOCAL 18        ; thunk arg
+OP_CALL                ; fn(arg) — EAGER
+OP_SET_LOCAL 19
+```
+
+This is an `inherit (E) Y` clause where E is a **curried call** like
+`callPackagesWith pkgs ./path { args }`.  AST shape:
+
+```
+ExprCall {
+  fun = ExprCall {
+    fun = ExprCall { fun = ExprVar(callPackagesWith), arg = pkgs },
+    arg = ./path
+  },
+  arg = { args }
+}
+```
+
+The lowerer's `pushInheritFromCache` thunkifies from-exprs only
+when the from-expr's `c->fun` is a Var (immediate).  For curried
+calls, the outer ExprCall's `fun` is itself an ExprCall, so the
+rule misses them and the from-expr is lowered eagerly into the
+parent scope's bytecode — exactly the OP_CALL we see.
+
+### Fix landed
+
+`lower.cc::isComplexFromExpr`: walk the `c->fun` chain to find the
+rooted Var, regardless of `fromWith`.  Up to 8 hops.  Tested:
+
+  - `run-direct-eval-tests.sh` — 26/26 pass
+  - `run-lang-tests.sh` — 142/142 pass
+  - `run-self-dot-thunkify-tests.sh` — 11/11 pass
+  - `run-cutover-parity-tests.sh` — 142/142 parity (TW vs v3-direct)
+
+Cycle on `(import nixpkgs {}).hello.name` advances:
+
+  - Before: `cycle while resolving 'callPackage'` at frame depth 90
+  - After:  `cycle while resolving 'texlive'` at frame depth 88
+
+### Remaining: 'texlive' cycle in `super:` body
+
+PC=183 mid-`OP_ATTRS_SELECT systems` after
+`OP_REC_BINDING_SLOT_REF 142`.  Sequence:
+
+```
+[180] OP_GET_UPVALUE 0
+[181] OP_REC_BINDING_SLOT_REF 142    ; rec-binding 'lib'
+[182] OP_ATTRS_SELECT systems         ; lib.systems
+[184] OP_SET_LOCAL 10
+```
+
+`lib.systems` selection forces `lib`'s lib.fix.  Inside that
+fix-point, some sub-thunk does `with pkgs; ... texlive`.  pkgs is
+mid-construction (still Black) → cycle.
+
+This is a different shape than the curried-call case: the SELECT
+itself is being computed eagerly, suggesting either:
+  (a) lib (the rec-binding) is being eagerly forced via OP_REC_BINDING_SLOT_REF + OP_ATTRS_SELECT,
+      and v3's chain forces the let-binding's body where TW would defer.
+  (b) some other expression in the `super:` body forces this SELECT
+      mid-construction.
+
+Next step: identify the source-level expression for PC=180..184.
+Likely candidate: `lib = recurseIntoAttrs lib.systems.systems-list-or-similar` in stage.nix or all-packages.nix — but the body suggests `local 10 = lib.systems` is computed eagerly, indicating an attribute SELECT in let-binding RHS position.
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input
 Output Group.
 SPDX-License-Identifier: Apache-2.0

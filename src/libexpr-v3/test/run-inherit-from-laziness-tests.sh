@@ -197,6 +197,64 @@ assert_eq "p5 TW=v3-default sharing" "$p5_tw" "$p5_v3"
 assert_eq "p5 TW=v3-skip sharing"    "$p5_tw" "$p5_v3_skip"
 
 # ----------------------------------------------------------------------
+# p6 — #548 (2026-05-09) curried-call from-expr.  AST shape:
+#   ExprCall {
+#     fun = ExprCall { fun = ExprVar(f), arg = a },
+#     arg = b
+#   }
+# i.e. `f a b` where f is a let-bound (or fromWith) function.  Prior
+# to the fix, isComplexFromExpr only matched when c->fun->exprKind ==
+# Var (the IMMEDIATE fun) — curried calls slipped through and were
+# lowered eagerly.  Under v3-direct nixpkgs eval, this surfaced as
+# `OP_WITH_LOOKUP: cycle while resolving 'callPackage'` because
+# stage.nix's allPackages has `inherit (callPackagesWith pkgs ./top-
+# level/...) Y Z;` and the eager call forced the with-source `pkgs`
+# (= the lib.fix x_thunk being computed → Black) → cycle.
+#
+# Synthetic repro: a self-referential rec-attrset where one entry's
+# inherit-from source is a curried call that references the rec
+# binding mid-construction.
+cat > "$TMP/p6.nix" <<'EOF'
+let
+  fix = f: let x = f x; in x;
+in fix (self:
+  let
+    callIt = a: b: { result = a; meta = b; };
+  in
+  rec {
+    config = { foo = "bar"; };
+    inherit (callIt config "x") result meta;
+  }).result
+EOF
+
+p6_tw=$(run_eval "$TMP/p6.nix")
+p6_v3=$(NIX_USE_V3=1 run_eval "$TMP/p6.nix")
+p6_v3_direct=$(NIX_V3_DIRECT_EVAL=1 run_eval "$TMP/p6.nix")
+assert_eq "p6 TW=v3-default (curried-call from-expr lazy)" "$p6_tw" "$p6_v3"
+assert_eq "p6 TW=v3-direct (curried-call from-expr lazy)"  "$p6_tw" "$p6_v3_direct"
+
+# p6b — NEGATIVE: same shape, unused inherited name + a throw inside
+# the curried call.  Must stay lazy and produce a non-throw result.
+cat > "$TMP/p6b.nix" <<'EOF'
+let
+  fix = f: let x = f x; in x;
+in fix (self:
+  let
+    callIt = a: b: { result = a; meta = b; bomb = throw "boom"; };
+  in
+  rec {
+    config = { foo = "bar"; };
+    inherit (callIt config "x") result;
+  }).result.foo
+EOF
+
+p6b_tw=$(run_eval "$TMP/p6b.nix")
+p6b_v3=$(NIX_USE_V3=1 run_eval "$TMP/p6b.nix")
+p6b_v3_direct=$(NIX_V3_DIRECT_EVAL=1 run_eval "$TMP/p6b.nix")
+assert_eq "p6b TW=v3-default (unused throw stays lazy)" "$p6b_tw" "$p6b_v3"
+assert_eq "p6b TW=v3-direct (unused throw stays lazy)"  "$p6b_tw" "$p6b_v3_direct"
+
+# ----------------------------------------------------------------------
 echo
 echo "=== inherit-from-laziness tests: ok=$PASS fail=$FAIL ==="
 if [[ $FAIL -gt 0 ]]; then
