@@ -184,3 +184,29 @@ test(
   'v3-evalscope-handles',
   v3_evalscope_handles,
 )
+
+# #545: bench-harness self-tests.  Pure Python; loads workloads.toml,
+# exercises filtering / stats / JSON / baseline-diff, and runs a tiny
+# `nix eval` smoke test under TW + v3-direct.  Validates the
+# V3_TIMING phase split for v3-direct landed in run.cc.
+python3 = find_program('python3', required : false)
+if python3.found()
+  test(
+    'v3-bench-harness-self-tests',
+    python3,
+    args : [files('bench/test_bench.py')],
+    timeout : 60,
+  )
+
+  # #545: lint guarding against re-introduced inline std::getenv()
+  # calls in vm.cc / primops.cc hot paths.  Cached env-var lookups
+  # are the difference between v3-faster-than-TW and v3-1.5x-slower
+  # on tight loops; we don't want a future contributor to silently
+  # regress that.
+  test(
+    'v3-lint-no-inline-getenv',
+    find_program('bash'),
+    args : [files('test/lint-no-inline-getenv.sh')],
+    timeout : 30,
+  )
+endif
