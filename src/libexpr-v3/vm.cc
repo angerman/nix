@@ -5085,6 +5085,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_WITH_LOOKUP: {
+            // Sync local ip into the top frame BEFORE withLookup may
+            // throw — otherwise the cycle dump's frame[top].ip is
+            // stale (still showing the value last written at
+            // OP_FORCE / OP_CALL push time, which is often the body
+            // start) and the disasm window misses the failing
+            // OP_WITH_LOOKUP itself.  Cheap on the hot path: one
+            // store per OP_WITH_LOOKUP, only adds a memory write
+            // ahead of an opcode that already does an STL hashmap
+            // lookup.
+            vm.frames.back().ip = ip;
             push(vm, withLookup(vm, static_cast<SymbolId>(operand)));
             break;
         }

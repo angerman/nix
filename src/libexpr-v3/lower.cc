@@ -1804,6 +1804,15 @@ struct Lowerer
                 if (head && head->exprKind == nix::Expr::Kind::Var)
                     return true;
             }
+            // #548 (2026-05-09): ExprSelect from-expr where head is a
+            // Var (e.g. `inherit (lib.systems) X`).  Lazy in TW via
+            // `from->maybeThunk`.  Eager v3 lowering forces the
+            // surrounding rec/let scope mid-construction.
+            if (k == nix::Expr::Kind::Select) {
+                auto * sel = static_cast<nix::ExprSelect *>(fx);
+                if (sel->e && sel->e->exprKind == nix::Expr::Kind::Var)
+                    return true;
+            }
             return false;
         };
 
