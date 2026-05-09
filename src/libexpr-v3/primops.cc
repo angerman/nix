@@ -4595,7 +4595,9 @@ static uint64_t & drvNativeFallbacks() { static uint64_t v = 0; return v; }
 namespace {
 struct DrvStatsAtExit {
     ~DrvStatsAtExit() {
-        if (std::getenv("V3_DRV_STATS"))
+        static const bool s_drvStats =
+            std::getenv("V3_DRV_STATS") != nullptr;
+        if (s_drvStats)
             std::fprintf(stderr,
                 "v3 drv final stats: native=%llu fallback=%llu\n",
                 (unsigned long long)drvNativeHits(),
@@ -4734,8 +4736,13 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
             // instrumentation.  When the error is a real
             // user-facing one (missing builder etc.), the bridge
             // re-throws with proper Nix-style traces; we still
-            // see this debug line first.
-            if (std::getenv("V3_DRV_DEBUG")) {
+            // see this debug line first.  Cache the env-var lookup
+            // (function-static bool) — derivationStrict is on the
+            // hot path of nixpkgs eval, fires per drv build.  See
+            // vm.cc:1808 for the canonical pattern.
+            static const bool s_drvDebug =
+                std::getenv("V3_DRV_DEBUG") != nullptr;
+            if (__builtin_expect(s_drvDebug, 0)) {
                 std::string drvName = "<unknown>";
                 const auto & syms = drvStrictSymbols();
                 if (auto * nv = args[0].payload.bindings->lookup(syms.name)) {
@@ -4789,7 +4796,11 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
                 return;
             }
         } catch (const std::exception & e) {
-            if (std::getenv("V3_DRV_DEBUG"))
+            // Reuses s_drvDebug from above (visible via function-
+            // static lookup on retry).
+            static const bool s_drvDebugCatch =
+                std::getenv("V3_DRV_DEBUG") != nullptr;
+            if (__builtin_expect(s_drvDebugCatch, 0))
                 std::fprintf(stderr, "v3 derivationStrict bridge fell back: %s\n", e.what());
             // fall through to fake-store path
         }
@@ -5573,7 +5584,9 @@ void primImport(EvalState & state, Value * args, Value & out)
     else {
         // #493 diag: when args[0] is a Bridge thunk, print the TW
         // source's REAL type so we can trace force-chase issues.
-        if (std::getenv("V3_DBG_IMPORT") != nullptr) {
+        static const bool s_dbgImportPrim =
+            std::getenv("V3_DBG_IMPORT") != nullptr;
+        if (__builtin_expect(s_dbgImportPrim, 0)) {
             std::fprintf(stderr,
                 "v3 primop import: arg tag=%d", (int)args[0].tag());
             if (args[0].tag() == Tag::Thunk && args[0].payload.thunk
@@ -6170,7 +6183,9 @@ void primPath(EvalState & state, Value * args, Value & out)
                 primPathNative(state, args, out);
                 return;
             } catch (const std::exception & e) {
-                if (std::getenv("V3_DRV_DEBUG"))
+                static const bool s_drvDebugPathNative =
+                    std::getenv("V3_DRV_DEBUG") != nullptr;
+                if (__builtin_expect(s_drvDebugPathNative, 0))
                     std::fprintf(stderr,
                         "v3 builtins.path native fell back: %s\n", e.what());
                 // fall through.
@@ -6196,7 +6211,9 @@ void primPath(EvalState & state, Value * args, Value & out)
                 return;
             }
         } catch (const std::exception & e) {
-            if (std::getenv("V3_DRV_DEBUG"))
+            static const bool s_drvDebugPathBridge =
+                std::getenv("V3_DRV_DEBUG") != nullptr;
+            if (__builtin_expect(s_drvDebugPathBridge, 0))
                 std::fprintf(stderr, "v3 builtins.path bridge fell back: %s\n", e.what());
         }
     }

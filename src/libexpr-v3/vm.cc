@@ -501,7 +501,9 @@ inline Value withLookup(VMState & vm, SymbolId name)
         // throw so we can identify which name + which black-thunk
         // shape triggers the cross-VMState fix-point cycle.  Set
         // V3_DBG_WITH_CYCLE=1 to trigger.
-        if (std::getenv("V3_DBG_WITH_CYCLE")) {
+        static const bool s_dbgWithCycle =
+            std::getenv("V3_DBG_WITH_CYCLE") != nullptr;
+        if (__builtin_expect(s_dbgWithCycle, 0)) {
             const auto & sym = ir::globalSymbolTable();
             std::string nm = name < sym.size() ? sym[name] : "<?>";
             std::fprintf(stderr,
@@ -647,7 +649,9 @@ inline Value withLookup(VMState & vm, SymbolId name)
             std::getenv("V3_DBG_WITH_DISASM") != nullptr;
         // V3_DUMP_LAMBDAS=1: dump every LambdaDescriptor in EVERY
         // unique CU on the call stack with codeOffset + name.
-        if (std::getenv("V3_DUMP_LAMBDAS")) {
+        static const bool s_dumpLambdas =
+            std::getenv("V3_DUMP_LAMBDAS") != nullptr;
+        if (__builtin_expect(s_dumpLambdas, 0)) {
             std::set<const CompilationUnit *> seenCus;
             for (size_t fi = 0; fi < vm.frames.size(); ++fi) {
                 const auto & fr = vm.frames[fi];
@@ -669,7 +673,8 @@ inline Value withLookup(VMState & vm, SymbolId name)
         // range from the failing frame's CU.  Use to inspect thunks
         // not currently on the stack (e.g., a thunk that returned
         // through CFF_FORCE_RETRY upstream of the current frame).
-        if (const char * ranges = std::getenv("V3_DUMP_RANGE")) {
+        static const char * s_dumpRange = std::getenv("V3_DUMP_RANGE");
+        if (const char * ranges = s_dumpRange; __builtin_expect(ranges != nullptr, 0)) {
             // Dump the range from EVERY unique CU on the call stack so
             // we don't miss thunks in CUs other than vm.frames.back().cu
             // (e.g., when force-chasing across imported files).
@@ -3193,9 +3198,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // V3_DBG_RETRY=1 dumps each retry's retVal tag + chase.
                 // V3_DBG_RETRY_BLACK=1 only logs when the retry's
                 // chain would hit a Black thunk (= the cycle source).
-                if (retry &&
-                    (std::getenv("V3_DBG_RETRY")
-                     || std::getenv("V3_DBG_RETRY_BLACK")))
+                static const bool s_dbgRetry =
+                    std::getenv("V3_DBG_RETRY") != nullptr;
+                static const bool s_dbgRetryBlack =
+                    std::getenv("V3_DBG_RETRY_BLACK") != nullptr;
+                if (retry && (s_dbgRetry || s_dbgRetryBlack))
                 {
                     Value chase = retVal;
                     int hops = 0;
@@ -3225,8 +3232,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                              && retVal.payload.slot
                              && retVal.payload.slot->tag() == Tag::Thunk)
                         retryThunk = retVal.payload.slot->payload.thunk;
-                    bool onlyBlack = std::getenv("V3_DBG_RETRY_BLACK")
-                        != nullptr;
+                    bool onlyBlack = s_dbgRetryBlack;
                     if (!onlyBlack || blackHit) {
                         std::fprintf(stderr,
                             "v3 OP_RETURN retry: retVal.tag=%d chase.tag=%d hops=%d",
@@ -3851,7 +3857,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_ATTRS_REC_INIT: {
             // #498 diagnostic: log local[0] of the current frame at
             // OP_ATTRS_REC_INIT for "final"-named maker frames.
-            if (std::getenv("V3_DBG_REC_INIT_LOCAL0")) {
+            static const bool s_dbgRecInitLocal0 =
+                std::getenv("V3_DBG_REC_INIT_LOCAL0") != nullptr;
+            if (__builtin_expect(s_dbgRecInitLocal0, 0)) {
                 const auto & fr = vm.frames.back();
                 const LambdaDescriptor * d = nullptr;
                 if (fr.closure) d = fr.closure->desc;
@@ -4414,7 +4422,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // attrset whose only attr is "prev" — the bisect symptom
             // that surfaces under broader thunkify.  Logs the pushing
             // frame, ip, and chase through Tag::Slot/Tag::Thunk.
-            if (std::getenv("V3_DBG_WITH_PUSH_PREV")) {
+            static const bool s_dbgWithPushPrev =
+                std::getenv("V3_DBG_WITH_PUSH_PREV") != nullptr;
+            if (__builtin_expect(s_dbgWithPushPrev, 0)) {
                 Value chase = v;
                 int hops = 0;
                 while (hops < 4) {
@@ -6487,7 +6497,9 @@ Value forceValue(VMState & vm, Value v)
             // #497 diagnostic: dump frame stack + identify Black thunk
             // when V3_DBG_BLACKHOLE_TRACE=1.  Used to investigate
             // post-#496 BlackholeError shape under broader thunkify.
-            if (std::getenv("V3_DBG_BLACKHOLE_TRACE")) {
+            static const bool s_dbgBlackholeTrace =
+                std::getenv("V3_DBG_BLACKHOLE_TRACE") != nullptr;
+            if (__builtin_expect(s_dbgBlackholeTrace, 0)) {
                 std::fprintf(stderr,
                     "v3 BLACKHOLE thunk=%p forces=%u (frames=%zu):\n",
                     (void *)t, (unsigned)t->forces, vm.frames.size());
