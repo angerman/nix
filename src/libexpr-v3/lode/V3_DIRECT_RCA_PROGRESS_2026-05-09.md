@@ -215,36 +215,61 @@ ExprVar.  Pushes the cycle one step further to 'libsForQt5'.
 
 ### Remaining: 'libsForQt5' cycle (call-on-select shape)
 
-`inherit (libsForQt5.callPackage path0) Y Z` — outer ExprCall whose
-`fun` is `ExprSelect(Var(libsForQt5), callPackage)`.  Neither rule
-matches: Call rule walks `c->fun` chain expecting ExprCall/Var, hits
-ExprSelect and stops; Select rule looks at the head expression,
-which is ExprCall, so misses too.
+`inherit (libsForQt5.callPackage path0) Y Z` — outer ExprCall
+whose `fun` is `ExprSelect(Var(libsForQt5), callPackage)`.
+Neither base rule matches: the Call walk hits ExprSelect and
+stops; the Select rule looks at the head expression, which is
+ExprCall.
 
-A combined walk (Calls + 1 Select before terminating at Var) was
-attempted but caused nixpkgs eval to **hang for >3 minutes**
-without progress — likely a thunk-explosion or infinite force
-chain triggered by the broader thunkify.  Reverted; the call-on-
-select pattern needs deeper investigation before the rule can be
-broadened.
+Implemented: opt-in via `NIX_V3_THUNK_CALL_ON_SELECT_VAR=1`
+which, after the call walk, additionally accepts an ExprSelect-
+on-Var as a Var-rooted head.  Default-off because flipping it on
+triggers a **runtime force-count explosion**:
 
-Hypotheses for the hang:
-- (1) Some thunkified site re-enters itself via the lexical-with
-      capture and infinite-loops in the chase machinery.
-- (2) Boehm GC root explosion (analogous to the
-      `Too many root sets` failure under
-      NIX_V3_INHERIT_FROM_THUNK_ALL).
-- (3) A specific expression shape gets thunkified that has freeVar
-      capture issues in the broader-thunkify path
-      (project_498_always_thunkify_regression in memory).
+  - hot descriptor: `lib/systems/parse.nix:64:44`
+    (the `({inherit name;} // value)` OpUpdate inside setType)
+  - `forced = 10.7M`, hot count = 6.2M (in 30 s)
+  - `arena = 56 GB`, peak frame depth 3604
 
-Next session should:
-1. Re-enable Call+1Select walking with V3_DBG_INHERIT_FROM_THUNK=1
-   to count how many additional sites get thunkified vs. baseline.
-2. Sample-trace where the eval gets stuck (V3_DBG_FORCES, perf-
-   profile, or simply attaching lldb during a hang).
-3. If thunk count is reasonable but eval still hangs, look at the
-   specific thunkified sites for self-referential force loops.
+Bisecting with NIX_V3_INHERIT_FROM_THUNK_FILTER showed the
+explosion fires even when the rule is restricted to a single
+`inherit (libsForQt5) ...` clause — i.e. one clause is enough to
+trip it.  That rules out a "many small thunks" hypothesis;
+instead, ONE additional thunkified from-expr breaks SHARING in
+the lib.fix iteration so setTypes reruns thousands of times.
+
+Hypothesis (architectural): the thunk wrap captures `with pkgs;`
+into `capturedWiths` at MakeThunk time (lexical-with chain).
+Forcing the thunk re-pushes those withs and runs the body.
+Under TW, the SAME thunk is shared across fix-point iterations
+because TW's env-driven thunks share representation; under v3's
+lexical-with chain, a fresh thunk is materialised per iteration
+and each one forces independently.  This is the same bug class
+as project_498 always-thunkify regression / project_516 lambda-
+param Slot conflation.
+
+For libsForQt5 to close cleanly we need either:
+  (a) Tag::Slot sharing such that the from-expr thunk is
+      memoised across fix-point iterations (cell-update protocol
+      for from-expr thunks, mirroring the rec-attrset cell
+      update at OP_RETURN).
+  (b) Explicit shared from-expr cache outside the per-iteration
+      lexical-with chain — a per-CU cache of (Expr*, env-shape)
+      → thunk pointer that survives across `f x` iterations.
+
+Both are STG-territory.  Tracked as #548c.
+
+### Files committed this session
+
+- 0931b77a3 — curried-call thunkify + diagnostic improvements
+- eae55d149 — ExprSelect-with-Var-head + sync ip on OP_WITH_LOOKUP
+- c8d90c521 — RCA memo update
+- 78a24bb63 — opt-in call-on-Select-Var
+  (NIX_V3_THUNK_CALL_ON_SELECT_VAR=1)
+
+Cycle progression:
+  callPackage → texlive → libsForQt5 (current floor)
+  All regressions clean (170/170 across 4 suites).
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input
 Output Group.
