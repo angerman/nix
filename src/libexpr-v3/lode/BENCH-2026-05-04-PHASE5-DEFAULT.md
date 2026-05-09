@@ -1,5 +1,9 @@
 # v3 perf snapshot — Phase 5 default-ON, post-#436/#437/#438
 
+> **Superseded:** numbers below are point-in-time (2026-05-04). For
+> current real-world performance see `../USAGE.md` "Real-world
+> behaviour" section (last updated 2026-05-05).
+
 **Date:** 2026-05-04 (evening, post-#437 closure)
 **System:** aarch64-darwin
 **Build:** 70b004ee7 (Phase 5 default-ON via `NIX_V3_NO_INLINE_REC_SLOT` opt-out)

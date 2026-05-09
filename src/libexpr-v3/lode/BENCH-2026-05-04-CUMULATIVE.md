@@ -1,5 +1,9 @@
 # v3 cumulative bench — post #426/427/428/429/432 + perf hints + #424 + #425 (LitBuiltins)
 
+> **Superseded:** numbers below are point-in-time (2026-05-04). For
+> current real-world performance see `../USAGE.md` "Real-world
+> behaviour" section (last updated 2026-05-05).
+
 **Date:** 2026-05-04 (afternoon, post-#427-revert)
 **System:** aarch64-darwin
 **Comparand:** in-tree tree-walker (default `nix-instantiate`, no env vars)

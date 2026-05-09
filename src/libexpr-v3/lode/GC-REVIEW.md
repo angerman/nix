@@ -1,5 +1,10 @@
 # Memory & GC Strategy in Nix v3 — A Critical Review
 
+> **Status update (2026-05-07):** Phase 0 (CRIT-2/3/4 arena
+> correctness) closed via #432.  Phase 1+ (runtime GC redesign)
+> recommendations in this doc still useful as research, not yet
+> scoped.
+
 *2026-05-04. Synthesises a code audit of `libexpr-v3/` against modern GC literature
 (GHC RTS, OCaml, V8 Orinoco, Immix/LXR/Whippet, MMTk).*
 

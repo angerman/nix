@@ -1,5 +1,9 @@
 # Real-world benchmark — cardano-node + nixpkgs scan
 
+> **Superseded:** numbers below are point-in-time (2026-05-04). For
+> current real-world performance see `../USAGE.md` "Real-world
+> behaviour" section (last updated 2026-05-05).
+
 **Date:** 2026-05-04
 **System:** aarch64-darwin
 **Build:** v3 at HEAD (this branch's full optimisation set landed)

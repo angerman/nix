@@ -1,5 +1,12 @@
 # v3 Optimization Plan (post-parity, October 2026)
 
+> **Status update (2026-05-07):** chronological log; Phases 1-4 of the
+> WC-38 work landed pre-2026-05-05.  Phase 5 is now default-on (see
+> `../USAGE.md`).  Forward-looking sections are mostly superseded by
+> `OPTIMIZER_REPORT_2026-05-07.md`, `UNISON_IDEAS_2026-05-07.md`, and
+> the `REVIEW_2026-05-0{6,6b,7}.md` series.  Don't trust this doc for
+> current perf state or current open work.
+
 This is a synthesis of four parallel research investigations into where the
 v3 evaluator can still be made faster, after reaching synthetic+real-world
 parity with the tree-walker.  Each finding is critically reviewed and ranked
