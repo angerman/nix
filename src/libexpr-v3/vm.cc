@@ -1436,13 +1436,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     // whether it wants to scavenge.  If it does, we re-read the
     // dispatch locals from `vm.frames.back()` because frame
     // pointers may have been forwarded in place.
+    //
+    // CRITICAL: scavenge ONLY runs in the outermost dispatchLoop
+    // (`exitDepth == 0`).  Inner dispatchLoops are entered from
+    // C++ helpers (forceValue, runOnExistingVm, runFunction) that
+    // hold v3 nursery pointers in C-stack locals across the call
+    // — those locals are NOT in any walked root set.  If we
+    // scavenged inside an inner dispatchLoop, the outer caller's
+    // popped-but-still-used `Value`s would have stale payload
+    // pointers after the call returned.  By restricting scavenge
+    // to the outermost loop, every C++ local that holds a
+    // potentially-nursery pointer is one of:
+    //   (1) bounded by an opcode handler that runs to completion
+    //       within ONE iteration (no scavenge can interleave); or
+    //   (2) on `vm.valueStack` / in a `vm.frames[]` slot (which
+    //       the scavenger walks).
+    // Cost: re-entry chains let the nursery fill to its overflow
+    // ceiling before they exit; the next outer iteration will then
+    // reclaim.  Acceptable because re-entry depth is bounded by
+    // the call depth, and primop callbacks return promptly.
     static const bool s_kNurseryOn_static =
         std::getenv("NIX_V3_NURSERY") != nullptr
         && std::getenv("NIX_V3_NURSERY")[0] != '0';
     static const bool s_kScavengeOn_static =
         std::getenv("NIX_V3_NURSERY_SCAVENGE") != nullptr
         && std::getenv("NIX_V3_NURSERY_SCAVENGE")[0] != '0';
-    const bool kNurseryGate = s_kNurseryOn_static && s_kScavengeOn_static;
+    const bool kNurseryGate = s_kNurseryOn_static && s_kScavengeOn_static
+                              && exitDepth == 0;
     while (running) {
         // Phase C scavenge trigger.  Only inspected when
         // NIX_V3_NURSERY_SCAVENGE=1.  shouldScavenge() is a cheap
