@@ -7273,7 +7273,19 @@ Value forceValue(VMState & vm, Value v)
             // so they can't become "ghost frames" picked up by a later
             // OP_RETURN in an outer dispatchLoop (which would corrupt
             // the thunk pointed-to by the ghost frame).
-            clearBlackMarksOnException(vm, exitDepth);
+            //
+            // #557 hardening: wrap clearBlackMarksOnException in its
+            // own try/catch.  If it ever throws during the outer
+            // exception handling (e.g. partialBindingsRegistry hash
+            // operation, or accessing a freed thunk pointer), the
+            // C++ runtime would call terminate() — surfacing as the
+            // brk #0x1 / EXC_BREAKPOINT trap observed when the
+            // libsForQt5 cycle bypass diverges into a cascading
+            // exception loop.  Swallowing here lets the original
+            // exception propagate normally.
+            try {
+                clearBlackMarksOnException(vm, exitDepth);
+            } catch (...) { /* swallow secondary throws during cleanup */ }
             // Also clear the outer Black mark we set just above.
             if (t->state == ThunkState::Blackhole)
                 t->state = ThunkState::Suspended;
