@@ -123,7 +123,16 @@ inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
 // peek lets withLookup find a sibling entry that has already been
 // SET via OP_ATTRS_REC_SET — STG-style "selector thunk" semantics
 // for `with self;` over a mid-construction recAttrs.
-inline std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry();
+// External linkage so gc.cc can rewrite forwarded Thunk * keys
+// after a nursery scavenge.  Definition lives below at file scope
+// outside the anonymous namespace.  We close the surrounding anon
+// namespace so this declaration is at `nix::v3` scope (matching the
+// definition); otherwise it would silently declare a separate
+// internal-linkage function inside the anon namespace and conflict
+// with the real definition.
+} // -- close anon for partialBindingsRegistry forward decl
+std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry();
+namespace { // -- reopen anon
 
 // #548c (2026-05-10) per-CU registry for the alloc/force atexit dump.
 // V3_DBG_ALLOC_DUMP=1 enables.  At process exit, top-N descriptors
@@ -1154,11 +1163,17 @@ namespace {
 /// is on the stack); entry removed when forceValue completes the
 /// body normally (transition to Evaluated) or when an exception
 /// unwinds (clearBlackMarksOnException scans and clears).
-inline std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry()
+//
+// Defined OUTSIDE the surrounding anonymous namespace so the symbol
+// has external linkage and gc.cc can call it from another TU
+// (for nursery-scavenge key rewrites).
+} // -- close anon namespace for partialBindingsRegistry definition
+std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry()
 {
     static thread_local std::unordered_map<Thunk *, Bindings *> tbl;
     return tbl;
 }
+namespace { // -- reopen anon namespace
 
 /// Publish a freshly-built attrset to the innermost Black thunk frame's
 /// partial-bindings side-table and (optionally) eagerly transition outer
@@ -1413,7 +1428,46 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     const char * const s_trace_env = s_trace_env_static;
     const uint32_t s_trace_codeoff = s_trace_codeoff_static;
     const uint16_t s_trace_nup = s_trace_nup_static;
+    // Cheney nursery (#434 Phase C): scavenge gate at top-of-loop.
+    // We avoid the per-iteration env-var check by promoting the gate
+    // to a function-scope const.  When nursery+scavenge are both on,
+    // every Nth iteration we sync `ip` back to the current frame
+    // (so root-walking sees consistent state) and ask the nursery
+    // whether it wants to scavenge.  If it does, we re-read the
+    // dispatch locals from `vm.frames.back()` because frame
+    // pointers may have been forwarded in place.
+    static const bool s_kNurseryOn_static =
+        std::getenv("NIX_V3_NURSERY") != nullptr
+        && std::getenv("NIX_V3_NURSERY")[0] != '0';
+    static const bool s_kScavengeOn_static =
+        std::getenv("NIX_V3_NURSERY_SCAVENGE") != nullptr
+        && std::getenv("NIX_V3_NURSERY_SCAVENGE")[0] != '0';
+    const bool kNurseryGate = s_kNurseryOn_static && s_kScavengeOn_static;
     while (running) {
+        // Phase C scavenge trigger.  Only inspected when
+        // NIX_V3_NURSERY_SCAVENGE=1.  shouldScavenge() is a cheap
+        // arithmetic compare; under -O2 the whole branch folds into
+        // a no-op when the gate is off.
+        if (__builtin_expect(kNurseryGate, 0)) [[unlikely]] {
+            if (threadNursery().shouldScavenge()) {
+                // Sync ip into the frame so the scavenger walks a
+                // consistent VM state.  ip is a per-iteration
+                // running counter; valueStack/withStack/frames are
+                // already source-of-truth.
+                if (!vm.frames.empty()) vm.frames.back().ip = ip;
+                if (threadNursery().maybeScavenge(vm)) {
+                    // Frame pointers may have been forwarded.  Re-
+                    // read the dispatch locals from the top frame.
+                    if (!vm.frames.empty()) {
+                        auto & f = vm.frames.back();
+                        cu        = f.cu;
+                        closure   = f.closure;
+                        stackBase = f.stackBaseOffset;
+                        ip        = f.ip;
+                    }
+                }
+            }
+        }
         // V3_DBG_TRACE_THUNK_BODY: print this instruction if the current
         // frame is a thunk frame matching the configured codeOffset/nUp.
         // Profile (sample on fib38) showed this branch alone consumed

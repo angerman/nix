@@ -32,6 +32,8 @@
 
 namespace nix::v3 {
 
+struct VMState;
+
 /// Nursery — fixed-size bump-pointer young generation.
 ///
 /// Lifetime: per-thread (thread_local), zero-initialised on first
@@ -103,23 +105,80 @@ public:
         };
     }
 
-    /// Phase B/C entry point — copies live nursery objects to
-    /// tenured and resets `next`.  Phase A: stub that does nothing
-    /// (nursery already drained back to base via fall-through).
-    void scavengeStub() noexcept
+    /// True iff `p` lies inside this nursery's backing buffer.
+    /// Compared as plain pointer arithmetic on the malloc'd block.
+    /// O(1) range check.
+    bool contains(const void * p) const noexcept
     {
-        // Phase A intentionally a no-op — fall-throughs in
-        // tryAlloc keep tenured allocations correct without
-        // resetting the nursery.  Resetting prematurely would
-        // free still-live nursery objects.
-        //
-        // Phase C will replace this with the real Cheney pass.
+        return p && static_cast<const char *>(p) >= base
+               && static_cast<const char *>(p) < end;
+    }
+
+    /// Phase C: heuristic check — true when the nursery is past
+    /// the fill threshold and a scavenge should run.  Cheap branch
+    /// in the dispatch hot path; the actual scavenge cost is paid
+    /// only when this fires.
+    bool shouldScavenge() const noexcept
+    {
+        if (!enabled || !base) return false;
+        // 75% fill: leaves headroom so a single opcode that
+        // allocates several objects in succession doesn't get
+        // half-way through and overflow before the next loop top
+        // can call maybeScavenge.
+        size_t threshold = sizeBytes - (sizeBytes >> 2);
+        return size_t(next - base) >= threshold;
+    }
+
+    /// Phase C: scavenge driver.  Triggered between opcodes from
+    /// the dispatch loop.  Returns true iff a scavenge ran (caller
+    /// must then re-read frame locals from `vm.frames.back()`).
+    /// Implementation in `gc.cc`.
+    bool maybeScavenge(VMState & vm) noexcept;
+
+    /// Reset the bump pointer; called by `gc.cc` at the end of
+    /// `scavengeNursery`.  The buffer keeps its backing memory.
+    void resetBumpAfterScavenge() noexcept
+    {
+        if (base) {
+            // Zero only the used region — Boehm's conservative scan
+            // is currently triggered through other code paths
+            // (`GC_add_roots` on the tenured arena), so the nursery
+            // doesn't need a clean slate, but a memset hides any
+            // accidentally-retained pointer-shaped bit pattern from
+            // future allocators that read uninitialized bytes.
+            // Cheap relative to the work we just did.
+            std::memset(base, 0, size_t(next - base));
+            next = base;
+        }
+        ++scavengeCount;
+    }
+
+    /// Allocator helper for `gc.cc`: bump-pointer allocate `bytes`
+    /// from this nursery, ignoring the tenured fall-through path.
+    /// Used to implement to-space when (in a future phase) we move
+    /// from one half of the nursery to the other.  Currently
+    /// unused — scavenge always copies to tenured.
+    [[gnu::always_inline]] inline void * tryAllocLocal(size_t bytes) noexcept
+    {
+        if (!enabled || !base) return nullptr;
+        bytes = (bytes + 15) & ~size_t{15};
+        if (next + bytes > end) return nullptr;
+        void * p = next;
+        next += bytes;
+        return p;
     }
 
     /// Toggle from env var on first access.  Default: disabled
     /// (Phase A is purely instrumentation; gates the routing
     /// without correctness risk).
     bool isEnabled() const noexcept { return enabled; }
+
+    /// Phase C: env-var-gated toggle for the actual scavenge.
+    /// `NIX_V3_NURSERY_SCAVENGE=1` (default OFF for safe rollout).
+    /// Independent of `NIX_V3_NURSERY` so we can route allocations
+    /// to the nursery (Phase A) without enabling reclamation
+    /// (Phase C) until validated.
+    bool isScavengeEnabled() const noexcept { return scavengeEnabled; }
 
 private:
     void initLazy() noexcept
@@ -131,6 +190,11 @@ private:
             return;
         }
         enabled = true;
+        // Phase C: independent gate for scavenge.  Lets us route
+        // allocations to the nursery (Phase A) without reclaiming
+        // them (Phase C) until validation completes.
+        const char * sg = std::getenv("NIX_V3_NURSERY_SCAVENGE");
+        scavengeEnabled = sg && sg[0] != '0';
         const char * sz = std::getenv("NIX_V3_NURSERY_SIZE");
         size_t mb = 32;
         if (sz) {
@@ -154,11 +218,12 @@ private:
         end  = base + sizeBytes;
     }
 
-    bool   enabled = false;
-    char * base    = nullptr;
-    char * next    = nullptr;
-    char * end     = nullptr;
-    size_t sizeBytes = 0;
+    bool     enabled         = false;
+    bool     scavengeEnabled = false;
+    char *   base    = nullptr;
+    char *   next    = nullptr;
+    char *   end     = nullptr;
+    size_t   sizeBytes = 0;
     uint64_t allocCount    = 0;
     uint64_t allocBytes    = 0;
     uint64_t overflowCount = 0;

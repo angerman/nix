@@ -362,26 +362,31 @@ suite.  We can pause between any two phases.
   for testing the trigger mechanism; Phase A's tests already
   exercised the routing, so we can skip directly to C).
 
-- **Phase C: NOT YET STARTED.**  This is the value-delivery
-  phase.  It requires:
-  1. Walk functions for Thunk / Closure / Bindings / ListVec
-     (visit each contained Value reference).
-  2. Root walker that visits `vm.valueStack`, `vm.withStack`,
-     `vm.frames[].closure`/`.thunk`, `partialBindingsRegistry`.
-  3. Cell registry: long-lived `Value*` cells need to be in a
-     side-set that the walker visits.
-  4. Forwarding: oldPtr → newPtr side-table, populated as we
-     copy nursery objects to tenured.
-  5. Trigger point: OP-boundary in `dispatchLoop` (between
-     opcodes), called when a nursery allocation would overflow.
-  6. Validation: full regression suite under `NIX_V3_NURSERY=1`,
-     synthetic stress (`fib 25`, deep `let-rec`) under valgrind,
-     v3-direct nixpkgs.hello.name with Phase 2 cycle bypass
-     should *complete* (any speed).
-
-  Key risk: missed roots.  Audit checklist enumerated under
-  "Risks" above.  Recommend walking ALL roots conservatively in
-  the first version, optimizing later.
+- **Phase C: LANDED.**  Side-table forwarding scavenge under
+  `NIX_V3_NURSERY_SCAVENGE=1` (independent gate from
+  `NIX_V3_NURSERY` so we can route allocations without reclaiming
+  until the implementation is validated).  Files: `gc.hh` /
+  `gc.cc`; trigger wired into `dispatchLoop` top-of-loop with
+  `Nursery::shouldScavenge()` (75 % fill threshold) and
+  `Nursery::maybeScavenge()`.  Frame locals (`cu`, `closure`,
+  `stackBase`, `ip`) are re-read after a scavenge runs, since
+  forwarded `frame.closure` / `.thunk` may have been rewritten.
+  Scope deltas vs the original design:
+   - Bindings stay tenured (cell pointers + Tag::Slot targets
+     would otherwise be invalidated by a move).
+   - ValuePair stays tenured (allocPair() unchanged).
+   - No cell registry yet (Phase D).  Instead, every reachable
+     tenured object is also walked (gated by a `walked` set) so
+     tenured-to-nursery references are still found.  This is
+     O(reachable tenured) per scavenge — accepted for v1 since
+     the priority was correctness; Phase D's cell registry will
+     bound this to O(remembered cells).
+  Validation (2026-05-10):
+   - `run-nursery-tests.sh` 14/14 (8 Phase A + 6 Phase C added).
+   - `run-direct-eval-tests.sh` 26/26 under
+     `NIX_V3_NURSERY_SCAVENGE=1 NIX_V3_NURSERY_SIZE=2`.
+   - `run-cutover-parity-tests.sh` 142/142 under same env.
+   - `run-let-rec-publish-split-tests.sh` 11/11 under same env.
 
 - **Phase D: not yet started.**  Cell registry + walk.
 

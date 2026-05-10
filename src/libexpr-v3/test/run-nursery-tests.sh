@@ -76,6 +76,30 @@ off2=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_NURSERY=0 "$NIX" \
     --expr 'let g = x: x * 2; in g 21' 2>&1)
 assert_eq "p4 NIX_V3_NURSERY=0 disabled" "42" "$off2"
 
+# p5 — scavenge ON, small nursery (1 MB) — forces multiple scavenge
+# cycles for any non-trivial expression.  Validates Phase C: live
+# nursery objects are correctly forwarded to tenured each cycle.
+for expr in 'let f = x: if x == 0 then 0 else f (x - 1); in f 1000' \
+            'let fib = n: if n < 2 then n else fib (n - 1) + fib (n - 2); in fib 20' \
+            '(let lib = { fix = f: let x = f x; in x; }; in (lib.fix (self: { x = 1; y = self.x + 1; z = self.y * 2; }))).z' \
+            'builtins.length (builtins.genList (i: i * 2) 5000)' \
+            'builtins.foldl'"'"' (a: b: a + b) 0 (builtins.genList (i: i) 1000)'
+do
+    expected=$(NIX_V3_DIRECT_EVAL=1 "$NIX" --extra-experimental-features \
+        nix-command eval --impure --expr "$expr" 2>&1)
+    actual=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1 \
+        NIX_V3_NURSERY_SIZE=1 "$NIX" --extra-experimental-features \
+        nix-command eval --impure --expr "$expr" 2>&1)
+    assert_eq "p5[$expr] scavenge==no-scavenge" "$expected" "$actual"
+done
+
+# p6 — scavenge ON with default nursery size (32 MB) — should
+# rarely trigger scavenge for short evals, but exercises the gate.
+big6=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1 \
+    "$NIX" --extra-experimental-features nix-command eval --impure \
+    --expr 'let lib = { fix = f: let x = f x; in x; }; in (lib.fix (self: { x = 1; y = self.x + 1; })).y' 2>&1)
+assert_eq "p6 default-size scavenge" "2" "$big6"
+
 echo
 echo "=== nursery tests: ok=$PASS fail=$FAIL ==="
 if [[ $FAIL -gt 0 ]]; then

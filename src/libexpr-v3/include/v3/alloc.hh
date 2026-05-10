@@ -308,15 +308,21 @@ struct Alloc
 {
     /// #548c (2026-05-10) Cheney nursery routing.  When the
     /// nursery is enabled (NIX_V3_NURSERY=1), short-lived
-    /// allocations (Thunk / Closure / Bindings / ListVec) try the
-    /// nursery first and fall back to the tenured arena on
-    /// overflow.  Phase A: fall-back-only (no scavenge yet).
-    /// Phase C will add scavenge so the nursery actually reclaims.
-    /// Phase E will flip default-on.  See `lode/CHENEY_NURSERY_DESIGN.md`.
+    /// allocations (Thunk / Closure / ListVec) try the nursery
+    /// first and fall back to the tenured arena on overflow.
+    /// Phase A: fall-back-only (no scavenge yet).
+    /// Phase C: scavenge implemented in gc.cc — copies live
+    /// nursery objects to tenured, rewrites pointers in roots and
+    /// any walked tenured objects, then resets the nursery's bump
+    /// pointer.  Phase E will flip default-on.  See
+    /// `lode/CHENEY_NURSERY_DESIGN.md`.
     ///
-    /// Cells (allocValue) and pairs (allocPair) stay tenured by
-    /// design — they're referenced by long-lived Tag::Slot
-    /// captures and must outlive a single nursery cycle.
+    /// Cells (allocValue), pairs (allocPair), AND Bindings stay
+    /// tenured by design — Bindings entries are pointed at by
+    /// long-lived Tag::Slot captures and `Thunk::cell` write-back
+    /// pointers; moving a Bindings would invalidate those.  Phase
+    /// D will revisit if Bindings turns out to dominate nursery
+    /// pressure.
     [[gnu::always_inline]]
     static void * nurseryOrArena(size_t bytes) noexcept
     {
@@ -425,7 +431,13 @@ struct Alloc
     static Bindings * allocBindings(uint32_t n) noexcept
     {
         const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * n;
-        auto * b = static_cast<Bindings *>(nurseryOrArena(bytes));
+        // Tenured by design (Phase C v1): Bindings entries[] hold
+        // long-lived Tag::Slot targets and `Thunk::cell` write-back
+        // pointers that must stay pointer-stable across nursery
+        // scavenges.  Phase D may revisit if Bindings turns out to
+        // dominate nursery pressure (then we'd need a remembered
+        // set / cell registry).
+        auto * b = static_cast<Bindings *>(threadArena().alloc(bytes));
         b->size = n;
         // Track size distribution for VM-2 sizing decisions.  Cheap
         // (one branch + one increment) — runs once per attrset.
