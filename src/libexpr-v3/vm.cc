@@ -158,22 +158,53 @@ inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
 using PartialBindingsChain = std::vector<Bindings *>;
 std::unordered_map<Thunk *, PartialBindingsChain> & partialBindingsRegistry();
 
-/// #558: lookup a name across all Bindings in the chain.  Walks
-/// back-to-front; returns the first hit (LATEST-WINS-PER-NAME).
+/// #558: lookup a name across all Bindings in the chain.
 ///
-/// Returns nullptr if no chain entry has the name.  Bindings::lookup
-/// returns the entry's *current* value (which may still be a Null
-/// placeholder if the chain entry's REC_SET hasn't fired yet) — the
-/// caller decides what to do (e.g. fall through and force the slot).
+/// Strategy: prefer ENTRIES FROM THE LARGEST CHAIN LAYER that contains
+/// the key.  Larger layers are more likely to be actual fix-point
+/// WHNF approximations (e.g. all-packages.nix's 4831-key bindings or
+/// the merged 19085-key pkgs); smaller layers are typically
+/// sub-attrsets (e.g. setFunctionArgs's {__functor, __functionArgs}
+/// or qt5-packages.nix's `attrs` of size 4).
+///
+/// Falls back to "latest registration" (back-to-front) if multiple
+/// layers tie on size — preserves overlay-style override semantics
+/// for layers of the same size.
+///
+/// STG analog: when multiple shape hints are available for an indirect,
+/// prefer the most informative (largest) one.  This matches GHC's
+/// pattern of preferring tighter strictness/shape info.
+///
+/// Gated by NIX_V3_NO_LARGEST_PEEK=1 (reverts to back-to-front).
+///
+/// Returns nullptr if no chain entry has the name.
 inline Value * lookupInPartialChain(const PartialBindingsChain & chain,
                                      SymbolId name)
 {
+    static const bool s_noLargest =
+        std::getenv("NIX_V3_NO_LARGEST_PEEK") != nullptr;
+    if (s_noLargest) {
+        // Original back-to-front (LATEST-WINS).
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            if (!*it) continue;
+            if (auto * v = (*it)->lookup(name)) return v;
+        }
+        return nullptr;
+    }
+    // LARGEST-LAYER-WINS: walk all layers, pick the value from the
+    // largest matching layer.  Tie-break: latest (back-to-front).
+    Value * best = nullptr;
+    uint32_t bestSize = 0;
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
         if (!*it) continue;
-        if (auto * v = (*it)->lookup(name))
-            return v;
+        uint32_t sz = (*it)->size;
+        if (best && sz <= bestSize) continue;
+        if (auto * v = (*it)->lookup(name)) {
+            best = v;
+            bestSize = sz;
+        }
     }
-    return nullptr;
+    return best;
 }
 namespace { // -- reopen anon
 
@@ -6136,9 +6167,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 if (__builtin_expect(s_dbgSlotRef, 0)) {
                     const auto & tbl = ir::globalSymbolTable();
                     std::string nm = (sym < tbl.size()) ? tbl[sym] : "?";
-                    std::fprintf(stderr,
-                        "v3 SLOT_REF: bindings=%p size=%u sym='%s' slot-tag=%d\n",
-                        (void *)b, b->size, nm.c_str(), (int)found->tag());
+                    if (found->isThunk() && found->payload.thunk) {
+                        Thunk * t = found->payload.thunk;
+                        const auto * d =
+                            (t->state == ThunkState::Suspended
+                             || t->state == ThunkState::Blackhole)
+                            ? t->suspended.desc : nullptr;
+                        const PosSnapshot * ps =
+                            d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                        std::fprintf(stderr,
+                            "v3 SLOT_REF: bindings=%p size=%u sym='%s' "
+                            "slot-tag=Thunk thunk=%p state=%d desc-name='%s' pos=%s:%u:%u\n",
+                            (void *)b, b->size, nm.c_str(),
+                            (void *)t, (int)t->state,
+                            d && !d->name.empty() ? d->name.c_str() : "<?>",
+                            (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                            ps ? ps->line : 0u, ps ? ps->column : 0u);
+                    } else {
+                        std::fprintf(stderr,
+                            "v3 SLOT_REF: bindings=%p size=%u sym='%s' slot-tag=%d\n",
+                            (void *)b, b->size, nm.c_str(), (int)found->tag());
+                    }
                 }
             }
             // #437 diagnostic: track repeated slot derefs on the same
