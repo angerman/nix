@@ -345,6 +345,48 @@ Phases A–E: ~3-5 focused sessions of work.  Each phase is
 independently committable and validates against the full test
 suite.  We can pause between any two phases.
 
+## Status (last updated 2026-05-10)
+
+- **Phase A: LANDED** (commit `f8b489ada`).  Bump-pointer routing
+  for Closure / Thunk / Bindings / ListVec under `NIX_V3_NURSERY=1`,
+  fall-back-to-tenured on overflow, no scavenge.  Allocator,
+  config gates, and `run-nursery-tests.sh` are in place.
+  **Reality check**: Phase A alone does NOT yield memory benefit.
+  When the 32 MB nursery fills, all subsequent allocations spill
+  to the tenured arena — so memory characteristics match the
+  no-nursery baseline.  Phase A's role is to validate the
+  routing infrastructure and provide the `NIX_V3_NURSERY` toggle
+  that Phase C will re-use.
+
+- **Phase B: SKIPPABLE** (the design doc proposed a stub scavenge
+  for testing the trigger mechanism; Phase A's tests already
+  exercised the routing, so we can skip directly to C).
+
+- **Phase C: NOT YET STARTED.**  This is the value-delivery
+  phase.  It requires:
+  1. Walk functions for Thunk / Closure / Bindings / ListVec
+     (visit each contained Value reference).
+  2. Root walker that visits `vm.valueStack`, `vm.withStack`,
+     `vm.frames[].closure`/`.thunk`, `partialBindingsRegistry`.
+  3. Cell registry: long-lived `Value*` cells need to be in a
+     side-set that the walker visits.
+  4. Forwarding: oldPtr → newPtr side-table, populated as we
+     copy nursery objects to tenured.
+  5. Trigger point: OP-boundary in `dispatchLoop` (between
+     opcodes), called when a nursery allocation would overflow.
+  6. Validation: full regression suite under `NIX_V3_NURSERY=1`,
+     synthetic stress (`fib 25`, deep `let-rec`) under valgrind,
+     v3-direct nixpkgs.hello.name with Phase 2 cycle bypass
+     should *complete* (any speed).
+
+  Key risk: missed roots.  Audit checklist enumerated under
+  "Risks" above.  Recommend walking ALL roots conservatively in
+  the first version, optimizing later.
+
+- **Phase D: not yet started.**  Cell registry + walk.
+
+- **Phase E: not yet started.**  Default-on flip.
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 Input Output Group.
 SPDX-License-Identifier: Apache-2.0
