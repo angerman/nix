@@ -5452,6 +5452,57 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (midName < static_cast<SymbolId>(operand)) lo = mid + 1; else hi = mid;
                 }
                 if (lo >= b->size || b->entries[lo].name != static_cast<SymbolId>(operand)) {
+                    // #558 (2026-05-10) Registry-wide chain peek
+                    // recovery.  When the lookup misses on this
+                    // single Bindings, search the partial-Bindings
+                    // registry for any thunk whose chain contains
+                    // THIS Bindings as a layer.  If found, walk that
+                    // thunk's full chain (lookupInPartialChain) for
+                    // the symbol — recovers access to OTHER chain
+                    // layers that the chain.back()-collapse in OP_FORCE
+                    // / forceValue lost.
+                    //
+                    // STG analog: when forcing collapsed an indirect
+                    // chain to a single shape, the lookup may need
+                    // to chase through other shapes that aren't
+                    // visible from the collapsed result.
+                    //
+                    // Cost: O(chains * layers) on each miss.  In
+                    // practice misses are rare (most lookups hit
+                    // directly), so this is acceptable.
+                    //
+                    // Gated by NIX_V3_NO_REGISTRY_PEEK=1 for bisecting.
+                    static const bool s_noRegistryPeek =
+                        std::getenv("NIX_V3_NO_REGISTRY_PEEK") != nullptr;
+                    if (!s_noRegistryPeek) {
+                        auto & reg = partialBindingsRegistry();
+                        static const bool s_dbgRegPeek =
+                            std::getenv("V3_DBG_REGISTRY_PEEK") != nullptr;
+                        size_t regSize = reg.size();
+                        size_t matchedThunks = 0;
+                        for (auto & kv : reg) {
+                            const auto & chain = kv.second;
+                            // Check if THIS Bindings is in the chain.
+                            bool match = false;
+                            for (auto * cb : chain) {
+                                if (cb == b) { match = true; break; }
+                            }
+                            if (!match) continue;
+                            ++matchedThunks;
+                            // Walk chain for the symbol.
+                            if (auto * v = lookupInPartialChain(
+                                    chain, static_cast<SymbolId>(operand))) {
+                                if (s_dbgRegPeek) std::fprintf(stderr,
+                                    "v3 registry-peek HIT: bindings=%p sym=%u found in chain (depth=%zu)\n",
+                                    (void *)b, operand, chain.size());
+                                push(vm, *v);
+                                goto attrs_select_done;
+                            }
+                        }
+                        if (s_dbgRegPeek) std::fprintf(stderr,
+                            "v3 registry-peek MISS: bindings=%p sym=%u registry-size=%zu matched-thunks=%zu\n",
+                            (void *)b, operand, regSize, matchedThunks);
+                    }
                     // WC-21 diagnostic: dump requested attr + present
                     // attr names to help root-cause closure-bridge
                     // attr-shape divergences.  Off by default.
@@ -5519,6 +5570,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     push(vm, slot);
                 }
             }
+        attrs_select_done:
             break;
         }
         case OP_ATTRS_SELECT_DYN: {
