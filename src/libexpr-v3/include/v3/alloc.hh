@@ -19,6 +19,7 @@
 
 #include "v3/value.hh"
 #include "v3/closure.hh"
+#include "v3/nursery.hh"
 
 #include <cstddef>
 #include <cstdint>
@@ -305,6 +306,24 @@ inline Arena & threadArena() noexcept
 
 struct Alloc
 {
+    /// #548c (2026-05-10) Cheney nursery routing.  When the
+    /// nursery is enabled (NIX_V3_NURSERY=1), short-lived
+    /// allocations (Thunk / Closure / Bindings / ListVec) try the
+    /// nursery first and fall back to the tenured arena on
+    /// overflow.  Phase A: fall-back-only (no scavenge yet).
+    /// Phase C will add scavenge so the nursery actually reclaims.
+    /// Phase E will flip default-on.  See `lode/CHENEY_NURSERY_DESIGN.md`.
+    ///
+    /// Cells (allocValue) and pairs (allocPair) stay tenured by
+    /// design — they're referenced by long-lived Tag::Slot
+    /// captures and must outlive a single nursery cycle.
+    [[gnu::always_inline]]
+    static void * nurseryOrArena(size_t bytes) noexcept
+    {
+        if (void * p = threadNursery().tryAlloc(bytes)) return p;
+        return threadArena().alloc(bytes);
+    }
+
     static Value * allocValue() noexcept
     {
         return static_cast<Value *>(threadArena().alloc(sizeof(Value)));
@@ -313,7 +332,7 @@ struct Alloc
     static Closure * allocClosure(uint16_t nUpvalues) noexcept
     {
         const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
-        auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
+        auto * c = static_cast<Closure *>(nurseryOrArena(bytes));
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
         c->capturedWiths = nullptr;
@@ -326,7 +345,7 @@ struct Alloc
     static Thunk * allocThunkSuspended(uint16_t nUpvalues) noexcept
     {
         const size_t bytes = sizeof(Thunk) + sizeof(Value) * nUpvalues;
-        auto * t = static_cast<Thunk *>(threadArena().alloc(bytes));
+        auto * t = static_cast<Thunk *>(nurseryOrArena(bytes));
         t->state = ThunkState::Suspended;
         t->nUpvalues = nUpvalues;
         t->forces = 0;
@@ -369,7 +388,7 @@ struct Alloc
     static ListVec * allocList(uint32_t n) noexcept
     {
         const size_t bytes = sizeof(ListVec) + sizeof(Value) * n;
-        auto * l = static_cast<ListVec *>(threadArena().alloc(bytes));
+        auto * l = static_cast<ListVec *>(nurseryOrArena(bytes));
         l->size = n;
         return l;
     }
@@ -406,7 +425,7 @@ struct Alloc
     static Bindings * allocBindings(uint32_t n) noexcept
     {
         const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * n;
-        auto * b = static_cast<Bindings *>(threadArena().alloc(bytes));
+        auto * b = static_cast<Bindings *>(nurseryOrArena(bytes));
         b->size = n;
         // Track size distribution for VM-2 sizing decisions.  Cheap
         // (one branch + one increment) — runs once per attrset.
