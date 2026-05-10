@@ -379,8 +379,25 @@ void Scavenger::run()
 
 void scavengeNursery(Nursery & n, VMState & vm) noexcept
 {
+    static const bool s_dbg = std::getenv("V3_DBG_NURSERY") != nullptr;
+    Nursery::Stats pre{};
+    if (s_dbg) pre = n.stats();
     Scavenger sc{n, vm, {}, {}, {}};
     sc.run();
+    // V3_DBG_NURSERY=1 — print one line per scavenge with the
+    // forward-map size + tenured-walk size so we can verify the
+    // pass actually moved live data and how much it had to
+    // process.  Cached env-var lookup so the loop hot path stays
+    // free of getenv calls.
+    if (s_dbg) [[unlikely]] {
+        Nursery::Stats post = n.stats();
+        std::fprintf(stderr,
+            "[v3 nursery] scavenge#%llu  forwarded=%zu  walked=%zu  "
+            "used-pre=%zuB/%zuB\n",
+            (unsigned long long)post.scavengeCount,
+            sc.forward.size(), sc.walked.size(),
+            pre.used, pre.sizeBytes);
+    }
 }
 
 bool Nursery::maybeScavenge(VMState & vm) noexcept

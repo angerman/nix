@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -66,8 +67,15 @@ public:
     /// Phase C: scavenge first, retry once.
     void * tryAlloc(size_t bytes) noexcept
     {
+        // Lazy init runs unconditionally on first access — sets
+        // `enabled` from the env var.  Was previously gated behind
+        // `if (!enabled) return nullptr` BEFORE initLazy(), which
+        // meant initLazy could never run (latent Phase A bug —
+        // tests passed only because fall-back-to-tenured always
+        // works).  `inited` separates "we've seen this nursery"
+        // from "this nursery is enabled".
+        if (!inited) initLazy();
         if (!enabled) return nullptr;
-        if (!base) initLazy();
         // Caller already aligned to 16, but defensively re-align.
         bytes = (bytes + 15) & ~size_t{15};
         if (next + bytes > end) {
@@ -183,7 +191,10 @@ public:
 private:
     void initLazy() noexcept
     {
-        // Read env vars exactly once.
+        // Read env vars exactly once.  `inited` is set FIRST so a
+        // re-entry from inside getenv (extremely unlikely but
+        // defensible) doesn't recurse.
+        inited = true;
         const char * gate = std::getenv("NIX_V3_NURSERY");
         if (!gate || gate[0] == '0') {
             enabled = false;
@@ -218,6 +229,7 @@ private:
         end  = base + sizeBytes;
     }
 
+    bool     inited          = false;
     bool     enabled         = false;
     bool     scavengeEnabled = false;
     char *   base    = nullptr;
