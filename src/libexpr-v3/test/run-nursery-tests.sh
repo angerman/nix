@@ -100,6 +100,36 @@ big6=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1 \
     --expr 'let lib = { fix = f: let x = f x; in x; }; in (lib.fix (self: { x = 1; y = self.x + 1; })).y' 2>&1)
 assert_eq "p6 default-size scavenge" "2" "$big6"
 
+# p7 — deep recursion through a let-rec / fix combination, with
+# 1 MB nursery forcing many scavenge cycles per eval.  Validates
+# the Phase C exitDepth==0 gate: forceValue chains re-enter
+# dispatchLoop with exitDepth>0; scavenge MUST stay disabled there
+# so the outer opcode handler's C++ Value locals stay valid across
+# the nested call.  Pre-fix (no exitDepth gate), this would have
+# corrupted `arg`/`fun` C-stack locals after an inner scavenge.
+deep_lr=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1 \
+    NIX_V3_NURSERY_SIZE=1 "$NIX" --extra-experimental-features \
+    nix-command eval --impure --expr '
+      let
+        rec1 = self: { a = 1; b = 2; c = self.a + self.b;
+                       d = self.c * 2; e = self.d + self.a; };
+        fix = f: let x = f x; in x;
+        deep = n: if n == 0 then 0
+                  else (fix rec1).e + deep (n - 1);
+      in deep 4000' 2>&1)
+assert_eq "p7 deep let-rec/fix scavenge" "28000" "$deep_lr"
+
+# p8 — primop callback chain (foldl' over a long genList).  The
+# primop body iterates in C++; nursery fills before the outer
+# dispatchLoop iterates again.  Pre-exitDepth-gate: any inner
+# scavenge inside the foldl' callback's forceValue would have
+# corrupted the outer's C-locals.  Verifies the gate keeps the
+# call chain safe even when the nursery overflows during it.
+fold_pc=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1 \
+    NIX_V3_NURSERY_SIZE=1 "$NIX" --extra-experimental-features \
+    nix-command eval --impure --expr 'builtins.foldl'"'"' (a: b: a + b) 0 (builtins.genList (i: i) 100000)' 2>&1)
+assert_eq "p8 primop chain scavenge" "4999950000" "$fold_pc"
+
 echo
 echo "=== nursery tests: ok=$PASS fail=$FAIL ==="
 if [[ $FAIL -gt 0 ]]; then
