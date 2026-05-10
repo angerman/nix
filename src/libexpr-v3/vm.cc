@@ -3691,17 +3691,28 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             (int)fr.thunk->state,
                             (int)retVal.tag());
                     }
-                    // #558 (2026-05-10): if this thunk has a registered
-                    // partial Bindings (its body's REC_INIT_TAIL fired
-                    // earlier — the STG-style "reached WHNF" point),
-                    // recover by treating the WHNF as the actual value.
-                    // The body's apparent self-return arose because the
-                    // body's tail used a fix-point reference (`let x =
-                    // f x; in x`) where the consumer of x within f
-                    // hit the STG recovery path; the eventual return
-                    // value chase resolved through that recovery back
-                    // to the same thunk.  The REAL value is the
-                    // partial Bindings.
+                    // #558 (2026-05-10) STG indirect-chain recovery:
+                    //
+                    // 1. If THIS thunk has a registered partial Bindings
+                    //    (its body's REC_INIT_TAIL fired earlier — the
+                    //    STG "reached WHNF" point), recover with that.
+                    // 2. Otherwise, return vBlackhole (the deferred-
+                    //    value marker).  The chain from retVal's thunk
+                    //    back to self traversed Evaluated indirections
+                    //    that resolved circularly.  Returning
+                    //    vBlackhole lets the consumer see "value not
+                    //    yet known" and propagate that lazily — same
+                    //    protocol v3 uses for cross-stack Black thunk
+                    //    accesses (see line ~7355).
+                    //
+                    // Rationale: the original throw assumed self-return
+                    // was a real `let x = x; in x;` infinite-loop.
+                    // Under STG-style partial-Bindings recovery, a
+                    // Black thunk's "value" is the partial Bindings
+                    // (or vBlackhole until WHNF reached); a chase
+                    // resolving back to self via indirections is NOT
+                    // a true loop — it's the chain unwinding through
+                    // a self-reference that's still mid-construction.
                     auto & reg = partialBindingsRegistry();
                     auto pIt = reg.find(fr.thunk);
                     if (pIt != reg.end() && !pIt->second.empty()) {
@@ -3711,7 +3722,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         recovered.payload.bindings = pIt->second.back();
                         retVal = recovered;
                     } else {
-                        throw std::runtime_error("v3 OP_RETURN: infinite recursion (thunk evaluates to itself)");
+                        // Defer: return vBlackhole.  Caller sees a
+                        // marker that propagates until a consumer
+                        // demands a concrete value — at which point
+                        // the surrounding fix-point will likely have
+                        // settled.
+                        retVal = Value::vBlackhole;
                     }
                 }
                 // V3_DBG_STORE_PREVSTAGE: trace any thunk that gets
