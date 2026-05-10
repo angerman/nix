@@ -300,7 +300,19 @@ struct Or   { VarId lhs; BlockId rhsBlock; };
 struct Impl { VarId lhs; BlockId rhsBlock; };
 
 /// Attrset update: lhs // rhs.
-struct Update { VarId lhs; VarId rhs; };
+///
+/// #558 (2026-05-10) `isFunctionReturn` mirrors AttrSet's analogous
+/// flag.  When this Update is in tail-return position of an enclosing
+/// function (= the function's body's terminal-return value resolves
+/// through transparent IR wrappers to this Update), it emits as
+/// OP_ATTRS_UPDATE_TAIL instead of OP_ATTRS_UPDATE.  The tail variant
+/// publishes the merged Bindings to all THUNK_RETURN frames on the
+/// call stack via publishToAllThunkFrames — analog of STG's
+/// "constructor allocation reaches WHNF" but for // results that are
+/// the actual fix-point cell, not partial sub-AttrSets.
+///
+/// Static (markTailReturnAttrSets) — see lower.cc.
+struct Update { VarId lhs; VarId rhs; bool isFunctionReturn = false; };
 
 /// Direct primop call.  All arguments must be available; the primop's
 /// arity must match args.size().  Faster than going through OP_CALL since

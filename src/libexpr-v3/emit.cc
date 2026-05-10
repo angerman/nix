@@ -936,7 +936,13 @@ struct Emitter
             emitVarRef(e.lhs);
             emitVarRef(e.rhs);
         }
-        unit.code.push_back(encode(OP_ATTRS_UPDATE));
+        // #558 (2026-05-10) tail-return // emits OP_ATTRS_UPDATE_TAIL
+        // which additionally publishes the merged Bindings to all
+        // THUNK_RETURN frames (publishToAllThunkFrames).  This is the
+        // STG analog of "constructor reaches WHNF" for // results.
+        // See ir::Update::isFunctionReturn doc.
+        unit.code.push_back(encode(
+            e.isFunctionReturn ? OP_ATTRS_UPDATE_TAIL : OP_ATTRS_UPDATE));
     }
 
     // -- Recursive let / rec attrset

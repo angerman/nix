@@ -596,6 +596,18 @@ struct Lowerer
                 using T = std::decay_t<decltype(e)>;
                 if constexpr (std::is_same_v<T, ir::AttrSet>) {
                     e.isFunctionReturn = true;
+                } else if constexpr (std::is_same_v<T, ir::Update>) {
+                    // #558 (2026-05-10) Update in tail position is the
+                    // STG analog of "constructor allocation reaches
+                    // WHNF" for // results: the merged Bindings IS
+                    // this function's eventual return value.  Mark it
+                    // so emit picks OP_ATTRS_UPDATE_TAIL.
+                    //
+                    // Gated by NIX_V3_NO_UPDATE_TAIL=1 for bisecting.
+                    static const bool s_disabled =
+                        std::getenv("NIX_V3_NO_UPDATE_TAIL") != nullptr;
+                    if (!s_disabled)
+                        e.isFunctionReturn = true;
                 } else if constexpr (std::is_same_v<T, ir::With>) {
                     // `with X; body` is transparent — body's
                     // terminal-return is the function's return.

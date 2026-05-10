@@ -4333,12 +4333,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             push(vm, Value::vBlackhole);
                             break;
                         }
-                        // #558 (2026-05-10) STG WHNF recovery in OP_FORCE.
-                        // Mirrors forceValue's recovery — when the thunk
-                        // is on our own frames AND has registered partial
-                        // Bindings, return the most-informative chain
-                        // entry (MAX-SIZE) as Tag::Attrs.  Lets the
-                        // dispatch loop continue without throwing.
+                        // #558 (2026-05-10) STG WHNF deferral in OP_FORCE.
+                        //
+                        // When the Black thunk is on our own frames AND
+                        // has registered partial Bindings, leave the
+                        // value on stack UNCHANGED (still Tag::Thunk
+                        // Black).  Consumers (OP_ATTRS_SELECT,
+                        // OP_WITH_LOOKUP) detect Tag::Thunk Black and
+                        // use the chain peek mechanism — walks all chain
+                        // layers via lookupInPartialChain, finding the
+                        // key in whichever layer has it.
+                        //
+                        // Why not return Tag::Attrs (chain.back() or
+                        // any single layer): chain.back() is the LATEST
+                        // registered AttrSet, which may be a small
+                        // sub-attrset (e.g. {__functor, __functionArgs}
+                        // from setFunctionArgs) that doesn't have the
+                        // looked-up key.  Returning a single layer
+                        // collapses the chain — we lose access to
+                        // OTHER layers' keys.
+                        //
+                        // STG analog: when forcing a Black thunk that
+                        // already has partial WHNF info, the forcing
+                        // is idempotent — return the thunk identifier
+                        // and let the consumer project from it.
                         static const bool s_noStgWhnfFp =
                             std::getenv("NIX_V3_NO_STG_WHNF") != nullptr;
                         if (!s_noStgWhnfFp) {
@@ -5160,6 +5178,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     }
                     throw;
                 }
+                // #558 (2026-05-10) Post-force chain peek.  When
+                // forceValue returns Tag::Thunk Black (under the
+                // Tag::Thunk-deferral STG WHNF semantics), use chain
+                // peek to walk all chain layers.  forceValue defers
+                // instead of collapsing to chain.back() so that
+                // consumers see the full chain.
+                if (attrs.isThunk() && attrs.payload.thunk
+                    && attrs.payload.thunk->state == ThunkState::Blackhole)
+                {
+                    auto & reg = partialBindingsRegistry();
+                    auto it = reg.find(attrs.payload.thunk);
+                    if (it != reg.end()) {
+                        if (auto * v = lookupInPartialChain(
+                                it->second,
+                                static_cast<SymbolId>(operand))) {
+                            push(vm, *v);
+                            ip++;
+                            break;
+                        }
+                    }
+                }
             }
             if (!attrs.isAttrs()) {
                 // #558 (2026-05-10) diagnostic: log tag + symbol + frame
@@ -5585,6 +5624,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 vm.frames.back().ip = ip;
                 rhs = forceValue(vm, rhs);
             }
+            // #558 (2026-05-10): collapse Tag::Thunk Black operands
+            // (returned by forceValue's deferral path) to chain.back()
+            // for the merge.  // semantics need a Bindings.
+            auto collapseDeferred = [](Value & v) {
+                if (v.isThunk() && v.payload.thunk
+                    && v.payload.thunk->state == ThunkState::Blackhole)
+                {
+                    auto & reg = partialBindingsRegistry();
+                    auto it = reg.find(v.payload.thunk);
+                    if (it != reg.end() && !it->second.empty()) {
+                        Value collapsed;
+                        collapsed.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                        collapsed.payload.bindings = it->second.back();
+                        v = collapsed;
+                    }
+                }
+            };
+            collapseDeferred(lhs);
+            collapseDeferred(rhs);
             if (!lhs.isAttrs() || !rhs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_UPDATE: not attrsets");
             Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings);
@@ -5593,6 +5651,76 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = out;
             publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/false);
+            push(vm, v);
+            break;
+        }
+        case OP_ATTRS_UPDATE_TAIL: {
+            // #558 (2026-05-10): tail-return // operation.  Same as
+            // OP_ATTRS_UPDATE but additionally publishes the merged
+            // Bindings to all THUNK_RETURN frames via
+            // publishToAllThunkFrames.  STG analog of "constructor
+            // allocation reaches WHNF" — when a function's tail
+            // expression is `lhs // rhs`, the merged Bindings IS the
+            // function's WHNF (and transitively, every tail-call
+            // ancestor's).  The most-correct partial-WHNF approximation
+            // for nested fix-points (lib.fix's `let x = f x; in x`
+            // with f producing a // chain in tail position).
+            Value rhs = pop(vm), lhs = pop(vm);
+            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk || lhs.tag() == Tag::Slot) {
+                vm.frames.back().ip = ip;
+                lhs = forceValue(vm, lhs);
+            }
+            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk || rhs.tag() == Tag::Slot) {
+                vm.frames.back().ip = ip;
+                rhs = forceValue(vm, rhs);
+            }
+            // #558: if forceValue deferred (returned Tag::Thunk Black
+            // with chain), collapse to chain.back() for the merge.
+            // // semantics need a Bindings; the chain peek approach
+            // doesn't apply to // operands directly.  Approximation:
+            // use the latest chain entry as the operand.
+            auto collapseDeferred = [](Value & v) {
+                if (v.isThunk() && v.payload.thunk
+                    && v.payload.thunk->state == ThunkState::Blackhole)
+                {
+                    auto & reg = partialBindingsRegistry();
+                    auto it = reg.find(v.payload.thunk);
+                    if (it != reg.end() && !it->second.empty()) {
+                        Value collapsed;
+                        collapsed.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                        collapsed.payload.bindings = it->second.back();
+                        v = collapsed;
+                    }
+                }
+            };
+            collapseDeferred(lhs);
+            collapseDeferred(rhs);
+            if (!lhs.isAttrs() || !rhs.isAttrs()) {
+                static const bool s_dbg =
+                    std::getenv("V3_DBG_UPDATE_FAIL") != nullptr;
+                if (s_dbg) {
+                    std::fprintf(stderr,
+                        "v3 OP_ATTRS_UPDATE_TAIL: not attrsets lhs.tag=%d rhs.tag=%d\n",
+                        (int)lhs.tag(), (int)rhs.tag());
+                    if (lhs.isThunk() && lhs.payload.thunk)
+                        std::fprintf(stderr,
+                            "  lhs thunk=%p state=%d\n",
+                            (void *)lhs.payload.thunk,
+                            (int)lhs.payload.thunk->state);
+                    if (rhs.isThunk() && rhs.payload.thunk)
+                        std::fprintf(stderr,
+                            "  rhs thunk=%p state=%d\n",
+                            (void *)rhs.payload.thunk,
+                            (int)rhs.payload.thunk->state);
+                }
+                throw std::runtime_error("v3 OP_ATTRS_UPDATE_TAIL: not attrsets");
+            }
+            Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings);
+            allocStats().attrsetsAllocated++;
+            Value v;
+            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+            v.payload.bindings = out;
+            publishToAllThunkFrames(vm, v);
             push(vm, v);
             break;
         }
@@ -7786,6 +7914,10 @@ Value forceValue(VMState & vm, Value v)
                                         (unsigned)it->second.back()->size,
                                         (unsigned long long)hits);
                             }
+                            // #558 (2026-05-10) STG WHNF: return
+                            // chain.back() as a single-layer Bindings.
+                            // Consumers may need to peek the chain
+                            // separately for full layer access.
                             Value recovered;
                             recovered.tag_payload =
                                 static_cast<uint64_t>(Tag::Attrs);

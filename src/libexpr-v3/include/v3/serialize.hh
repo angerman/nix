@@ -84,7 +84,11 @@ namespace nix::v3::serialize {
 /// computation; closes the v3-direct nixpkgs `cycle while resolving
 /// 'libsForQt5'` failure.  Old caches must reload because the same
 /// IR (ir::AttrSet) now produces different bytecode.
-constexpr uint32_t kSchemaVersion = 7;
+///
+/// 8: #558 (2026-05-10) introduce OP_ATTRS_UPDATE_TAIL (0x88).  IR
+/// `Update::isFunctionReturn` flag.  Old caches must reload because
+/// tail-position // expressions now emit a different opcode.
+constexpr uint32_t kSchemaVersion = 8;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

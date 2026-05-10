@@ -257,6 +257,25 @@ enum Op : uint8_t
     /// that drives this opcode emission.
     OP_ATTRS_REC_INIT_TAIL = 0x87, // [n:24]; data: 2n (name, pos) pairs
 
+    /// #558 (2026-05-10) tail-return // operation.  Bytecode-identical
+    /// to OP_ATTRS_UPDATE (pops 2 operands, pushes merged Bindings)
+    /// BUT additionally publishes the merged Bindings to every
+    /// THUNK_RETURN frame on the call stack via
+    /// publishToAllThunkFrames.
+    ///
+    /// STG analog: when a function's tail expression is a constructor
+    /// allocation (// produces a new Bindings cell), the cell IS the
+    /// function's WHNF.  STG's update-frame chain propagates this
+    /// constructor up through tail-call ancestors.  For Nix's
+    /// lib.fix's `let x = f x; in x` with f producing a // chain in
+    /// tail position, the // result IS x's WHNF — registering it with
+    /// x's chain gives consumers (e.g. `with self;` lookups, select
+    /// thunks) a more-correct WHNF approximation than any
+    /// intermediate REC_INIT_TAIL sub-AttrSet.
+    ///
+    /// See ir::Update::isFunctionReturn for the lower-time tagging.
+    OP_ATTRS_UPDATE_TAIL = 0x88,
+
     // --- Strings --------------------------------------------------------
     OP_STR_CONCAT     = 0x90,  // [n:24] forceString stored in low bit of n; pops n parts
 
