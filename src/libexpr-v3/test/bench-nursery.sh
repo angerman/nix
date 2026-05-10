@@ -24,6 +24,9 @@ declare -a WORKLOADS=(
     "list-build-1k|let mk=n: if n==0 then [] else [n] ++ mk (n - 1); in builtins.length (mk 1000)"
     "fold-add-50k|builtins.foldl' (a: b: a + b) 0 (builtins.genList (x: x) 50000)"
     "deep-letrec-2k|let rec1=self: { a=1; b=2; c=self.a + self.b; d=self.c * 2; e=self.d + self.a; }; fix=f: let x=f x; in x; deep=n: if n==0 then 0 else (fix rec1).e + deep (n - 1); in deep 2000"
+    "big-tree-6x6|let bt=d: w: if d==0 then \"leaf\" else builtins.listToAttrs (builtins.genList (i: { name = \"k\" + toString i; value = bt (d - 1) w; }) w); in builtins.stringLength (builtins.toJSON (bt 6 6))"
+    "attrs-1k-listToAttrs|builtins.length (builtins.attrNames (builtins.listToAttrs (builtins.genList (i: { name = builtins.toString i; value = i; }) 1000)))"
+    "string-fold-1k|builtins.stringLength (builtins.foldl' (a: b: a + b) \"\" (builtins.genList (x: builtins.toString x) 1000))"
 )
 
 time_run() {
