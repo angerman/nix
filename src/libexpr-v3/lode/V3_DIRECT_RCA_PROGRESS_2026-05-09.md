@@ -266,10 +266,85 @@ Both are STG-territory.  Tracked as #548c.
 - c8d90c521 — RCA memo update
 - 78a24bb63 — opt-in call-on-Select-Var
   (NIX_V3_THUNK_CALL_ON_SELECT_VAR=1)
+- 626cadb85 — Phase 1: STG-style early-alloc for non-rec attrsets
+  (emit OP_ATTRS_REC_INIT + REC_SET, registry-population under
+  STG, withLookup partial-bindings peek)
 
 Cycle progression:
   callPackage → texlive → libsForQt5 (current floor)
-  All regressions clean (170/170 across 4 suites).
+  All regressions clean (337/337 across 5 suites).
+
+### Phase 1 STG-style early-alloc — landed 2026-05-10
+
+GHC's STG mapping is now in place at the bytecode level:
+  - Con cell allocated upfront with lazy slots ↔ OP_ATTRS_REC_INIT
+    used universally for non-rec `{ ... }` (was OP_ATTRS_INIT).
+  - Selector thunk reading slot ↔ withLookup peeks at the
+    partial-bindings registry when a Tag::Slot deref's to a Black
+    thunk.
+  - BLACKHOLE+UPDATE on cell ↔ OP_ATTRS_REC_SET attaches
+    &entries[i].value as the entry thunk's cell so OP_RETURN's
+    cell-update fires.
+
+What Phase 1 does NOT yet fix: the v3-direct nixpkgs `hello.name`
+cycle on `libsForQt5`.  The reason is sequencing — the inherit-from
+cache's eager from-expr eval still happens BEFORE the OUTER
+attrset's REC_INIT (cache is emitted as a sibling let-binding
+above the AttrSet IR node).  At cache-firing time, the registry is
+empty.
+
+### Phase 2 attempts (not landed; documented for next session)
+
+Two fixes were tried for the inherit-from cache sequencing:
+
+a) Per-name re-lowering (lower.cc::pushInheritFromCache sets
+   cache[i] = kInvalid for `Var.attr arg` shapes; per-attr fid's
+   body re-lowers fresh).  Bypasses the eager from-expr eval at
+   construction (re-lowered emit goes inside the lazy per-attr
+   thunk).
+
+b) Always-thunkify (NIX_V3_INHERIT_FROM_THUNK_ALL=1).  Wraps
+   every from-expr in a thunk; the thunk's body runs at consumer-
+   force time, after pkgs has WHNF'd.
+
+BOTH (a) and (b) bypass the cycle BUT trigger a downstream
+PERFORMANCE EXPLOSION:
+  - 6 million forces of `lib/systems/parse.nix:64:44`
+    (setType's `({inherit name;} // value)` thunk)
+  - 60K parse.nix re-evaluations (vs. 1 expected)
+  - Arena climbs to 56 GB, frame stack peaks at 3604 deep
+  - Eval doesn't complete in 10 minutes
+
+Bisecting via NIX_V3_INHERIT_FROM_THUNK_FILTER showed even ONE
+inherit-from clause is enough to trip the explosion.  This is a
+SEPARATE issue from the cycle: a downstream sharing failure where
+`lib.systems.parse` (a let-binding that should evaluate ONCE)
+gets re-evaluated thousands of times.
+
+### Required next steps (multi-session)
+
+The libsForQt5 closure requires fixing TWO independent issues:
+
+1. **Reorder inherit-from cache emit** so the cache fires AFTER
+   the OUTER attrset's REC_INIT AND AFTER non-inherit-from
+   sibling entries are SET.  This makes `OP_WITH_LOOKUP libsForQt5`
+   in the cache's from-expr peek at the partial Bindings and find
+   libsForQt5's already-SET slot.  Mechanically: split AttrSet
+   emit into (a) REC_INIT, (b) SET regular entries, (c) build
+   inherit-from caches, (d) SET inherit-from entries.  Either as
+   IR restructure or as emit-time reordering with an annotated
+   AttrSet IR node.
+
+2. **Root-cause the lib.systems.parse re-evaluation explosion**.
+   When the cycle is bypassed (by either Phase 2 path), eval
+   reaches lib.systems.parse and re-evaluates it ~60K times.
+   This is a v3-level let-binding sharing bug independent of
+   #548c.  Tracked separately.
+
+Both pieces are concrete and tractable but need careful work.
+Phase 1's bytecode foundation is the right base — it implements
+the STG architecture at the lowest level; the remaining pieces
+build on top.
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input
 Output Group.
