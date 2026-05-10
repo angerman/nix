@@ -152,36 +152,6 @@ Closure * Scavenger::fwdClosure(Closure * c)
     return c;
 }
 
-/// True iff `tg` denotes a Value whose `payload` carries no v3-heap
-/// pointer that the walker would need to forward.  Used as a fast-
-/// path predicate by `fwdThunk` (and analogous walks) to skip queuing
-/// already-WHNF Thunks whose evaluated payload is a leaf scalar.
-[[gnu::always_inline]] static inline bool isLeafTag(Tag tg) noexcept
-{
-    switch (tg) {
-    case Tag::Int:
-    case Tag::Float:
-    case Tag::Bool:
-    case Tag::Null:
-    case Tag::String:
-    case Tag::Path:
-    case Tag::PrimOp:
-    case Tag::Blackhole:
-    case Tag::External:
-    case Tag::Uninitialized:
-        return true;
-    case Tag::Closure:
-    case Tag::Thunk:
-    case Tag::Attrs:
-    case Tag::List:
-    case Tag::App:
-    case Tag::PrimOpApp:
-    case Tag::Slot:
-        return false;
-    }
-    return false;
-}
-
 Thunk * Scavenger::fwdThunk(Thunk * t)
 {
     if (!t) return nullptr;
@@ -207,36 +177,6 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
         forward.emplace(t, dst);
         graylist.push_back({dst, GK_THUNK});
         return static_cast<Thunk *>(dst);
-    }
-    // Tenured Thunk fast paths — skip queuing entirely when the
-    // thunk has no v3-heap payload to walk.  Material on workloads
-    // that build many tenured thunks then evaluate them to leaf
-    // scalars (e.g. genList of integers force-iterated by foldl'):
-    // pre-fix, every such thunk was hashed into `walked` and
-    // queued + walked + dispatched-on-state, even though its only
-    // ref-bearing fields contained Tag::Int.  Hash insert + queue +
-    // drain dominated the per-scavenge cost.
-    //
-    // Bridge: bridgeSrc is a `nix::Value *` (TW heap), never v3
-    // nursery — no work for the walker.  Blackhole: state has no
-    // payload (the body is mid-execution; its frame is a separate
-    // root).  Evaluated with leaf tag: `evaluated` payload has no
-    // forwardable pointer.
-    //
-    // We skip hashing into `walked` too — it's safe because the
-    // skipped thunks have no edges that could re-enter our walk.
-    // If a future change adds a payload-bearing tag here, update
-    // `isLeafTag` to match.
-    switch (t->state) {
-    case ThunkState::Bridge:
-    case ThunkState::Blackhole:
-        return t;
-    case ThunkState::Evaluated:
-        if (isLeafTag(t->evaluated.tag()) && !t->cell) return t;
-        break;
-    case ThunkState::Suspended:
-    case ThunkState::Native:
-        break;
     }
     if (walked.insert(t).second) graylist.push_back({t, GK_THUNK});
     return t;
@@ -275,14 +215,6 @@ ValuePair * Scavenger::fwdPair(ValuePair * p)
 {
     if (!p) return nullptr;
     if (n.contains(p)) std::abort();  // pairs are tenured (allocPair)
-    // Fast path — both members carry no v3-heap pointer.  Common
-    // for `Tag::App` / `Tag::PrimOpApp` pairs constructed by primops
-    // like genList where left is a (already-walked) Closure pointer
-    // applied to a leaf-typed argument: detecting the leaf side
-    // alone doesn't help (still need to forward the closure), but
-    // when BOTH sides are leaves we save the queue + drain.  Also
-    // skips the hash insert.
-    if (isLeafTag(p->left.tag()) && isLeafTag(p->right.tag())) return p;
     if (walked.insert(p).second) graylist.push_back({p, GK_PAIR});
     return p;
 }
