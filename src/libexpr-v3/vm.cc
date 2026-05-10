@@ -115,6 +115,15 @@ inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
     return m;
 }
 
+// #548c (2026-05-10): forward-declare the partial-bindings registry
+// so withLookup (defined before the registry's body at line ~1077)
+// can peek into it when a with-source is a Black thunk whose
+// rec-attrset construction registered its partial Bindings.  The
+// peek lets withLookup find a sibling entry that has already been
+// SET via OP_ATTRS_REC_SET — STG-style "selector thunk" semantics
+// for `with self;` over a mid-construction recAttrs.
+inline std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry();
+
 [[gnu::always_inline]]
 inline Value pop(VMState & vm)
 {
@@ -546,10 +555,40 @@ inline Value withLookup(VMState & vm, SymbolId name)
             // e.g. OP_APPLY_OVERRIDES grows the bindings).  Force a
             // local copy and use it for this iteration.
             Value derefed = *p;
+            // #548c STG-style partial-Bindings peek: BEFORE forcing,
+            // check if `derefed` is a Black thunk whose construction
+            // has registered partial Bindings via
+            // publishToNearestBlackThunkFrame.  If so, peek there
+            // first — this is the "selector thunk on Con cell"
+            // analog that lets `with self;` find sibling entries
+            // during a rec-attrset's mid-construction.  No force, no
+            // blackhole error: just a Bindings::lookup on the
+            // already-allocated Con cell.
+            if (derefed.isThunk() && derefed.payload.thunk
+                && derefed.payload.thunk->state == ThunkState::Blackhole)
+            {
+                auto & reg = partialBindingsRegistry();
+                auto it = reg.find(derefed.payload.thunk);
+                if (it != reg.end() && it->second) {
+                    if (auto * v = it->second->lookup(name))
+                        return *v;
+                }
+            }
             if (derefed.isThunk() || derefed.tag() == Tag::App) {
                 try {
                     derefed = forceValue(vm, derefed);
                 } catch (const BlackholeError &) {
+                    // Last-chance peek for partial Bindings (in case
+                    // a deeper chase landed on a Black thunk we hadn't
+                    // seen at the top level).
+                    if (derefed.isThunk() && derefed.payload.thunk) {
+                        auto & reg = partialBindingsRegistry();
+                        auto it = reg.find(derefed.payload.thunk);
+                        if (it != reg.end() && it->second) {
+                            if (auto * v = it->second->lookup(name))
+                                return *v;
+                        }
+                    }
                     anyBlackholed = true;
                     continue;
                 }
@@ -1094,7 +1133,56 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
     // restore the legacy publish path (will be deleted in a follow-up).
     static const bool s_stgMode =
         std::getenv("NIX_V3_NO_STG") == nullptr;
-    if (s_stgMode) return;
+    // #548c (2026-05-10) STG-style early-alloc:
+    //
+    // Under STG mode, we keep the eager-state-flip OFF (the slot
+    // mechanism + cell-update at OP_RETURN replaces it) but ENABLE
+    // the partial-bindings side-table population.  The side-table
+    // is the "selector thunk" analog from GHC's STG: with the
+    // Bindings allocated upfront by OP_ATTRS_REC_INIT (now also
+    // emitted for non-rec attrsets — see emit.cc:emitOne(AttrSet)),
+    // any sub-expression that derefs the outer Black thunk via
+    // Tag::Slot can peek at the partial Bindings via withLookup
+    // (see vm.cc:withLookup partial-bindings peek path).  Earlier-
+    // SET entries (alphabetical sort order) are already visible to
+    // later-SET entries' from-expressions.
+    //
+    // Only register for isRecInit=true (the rec-attrset's own
+    // OP_ATTRS_REC_INIT path).  This preserves #495's fix: non-rec
+    // sub-attrsets inside `LEFT // RIGHT` still don't pollute the
+    // outer thunk because they go through OP_ATTRS_INIT — wait —
+    // **with Phase A, ALL non-rec attrsets emit through
+    // OP_ATTRS_REC_INIT now**.  This is correct because the
+    // side-table is only ever read by withLookup; it doesn't flip
+    // the thunk's `evaluated` field, so the #495 corruption can't
+    // recur.  The "wrong-shape" pollution was specifically the
+    // eager state-flip writing a sub-expression's Bindings into
+    // the outer thunk's `evaluated` — that write is firmly OFF
+    // under STG mode (the legacy path below `if (s_stgMode) ...`
+    // is bypassed).
+    if (s_stgMode) {
+        if (!isRecInit) return;
+        Tag t = v.tag();
+        if (t != Tag::Attrs || !v.payload.bindings) return;
+        // Find innermost Black thunk frame, register its partial
+        // Bindings.  Same scan as the legacy path; only this side-
+        // table effect runs under STG.
+        for (size_t i = vm.frames.size(); i > 0; --i) {
+            CallFrame & fr = vm.frames[i - 1];
+            if (!(fr.flags & CFF_THUNK_RETURN)) continue;
+            if (!fr.thunk) continue;
+            if (fr.thunk->state != ThunkState::Blackhole) continue;
+            partialBindingsRegistry()[fr.thunk] = v.payload.bindings;
+            static const bool s_dbg_reg =
+                std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
+            if (s_dbg_reg) std::fprintf(stderr,
+                "v3 STG partialBindings: register thunk=%p bindings=%p size=%u\n",
+                (void *)fr.thunk, (void *)v.payload.bindings,
+                (unsigned)v.payload.bindings->size);
+            break;
+        }
+        return;
+    }
     // ---- Pre-STG path (legacy default) ----
     static const bool s_publishNonRec =
         std::getenv("NIX_V3_PUBLISH_NON_REC_INIT") != nullptr;

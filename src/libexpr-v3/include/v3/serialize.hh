@@ -75,7 +75,16 @@ namespace nix::v3::serialize {
 /// OP_ATTRS_REC_INIT for both shapes; the opcode-table fingerprint
 /// catches the difference but bumping the schema makes the rejection
 /// crisp.  See lode/CALLPACKAGE_BUG_2026-05-09.md.
-constexpr uint32_t kSchemaVersion = 6;
+///
+/// Schema 7 (#548c, 2026-05-10): non-rec attrset emit switched from
+/// OP_ATTRS_INIT (compute-then-allocate) to the OP_ATTRS_REC_INIT +
+/// OP_ATTRS_REC_SET pattern (allocate-first-fill-later).  This is
+/// the STG-style early-alloc for `{ a = ...; b = ...; }` literals
+/// so withLookup can peek at the partial Bindings during entry
+/// computation; closes the v3-direct nixpkgs `cycle while resolving
+/// 'libsForQt5'` failure.  Old caches must reload because the same
+/// IR (ir::AttrSet) now produces different bytecode.
+constexpr uint32_t kSchemaVersion = 7;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

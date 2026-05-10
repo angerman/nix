@@ -122,6 +122,18 @@ struct Emitter
     };
     FuncCtx * ctx = nullptr;
 
+    /// #548c (2026-05-10): set by emitBlock when emitting the
+    /// terminal-return binding of the function's entry block.  Non-
+    /// rec AttrSets in this position become OP_ATTRS_REC_INIT
+    /// (publishing), so the surrounding Black thunk's partial-
+    /// bindings registry observes the rec-attrset's evolving
+    /// Bindings — STG-style "selector thunk on Con cell" sharing
+    /// for `with self;` mid-construction lookups.  AttrSets NOT in
+    /// the function's tail return position use OP_ATTRS_LET_REC_INIT
+    /// (non-publishing) so sub-expression Bindings don't pollute
+    /// the registry (#495 fix preserved).
+    bool emittingFunctionTailReturn = false;
+
     Emitter(const ir::Module & mod) : m(mod) {
         // #542: occurrence info drives the defer-vs-SET decision
         // per binding.  Cheap (~O(N) on module size); compute once.
@@ -689,11 +701,96 @@ struct Emitter
     // 2*n instead of n.
     void emitOne(const ir::AttrSet & e)
     {
-        for (auto & en : e.entries) emitVarRef(en.value);
-        unit.code.push_back(encode(OP_ATTRS_INIT, static_cast<uint32_t>(e.entries.size())));
-        for (auto & en : e.entries) {
+        // STG-style early-alloc (#548c, 2026-05-10): allocate the
+        // Bindings UPFRONT via OP_ATTRS_REC_INIT and fill entries via
+        // per-entry OP_ATTRS_REC_SET.  This mirrors GHC's allocate-Con-
+        // first-fill-fields-later pattern and gives each entry's thunk
+        // value a heap-stable cell on entries[i].value, which OP_RETURN
+        // updates at force time (cell-update protocol from REC_SET's
+        // own logic at vm.cc:5704+).
+        //
+        // Why not OP_ATTRS_INIT: the legacy form pops N values from
+        // stack at OP_ATTRS_INIT time (after all entries have been
+        // computed).  That's incompatible with `with self;` lookups
+        // that fire DURING entry computation — pkgs is mid-Black, the
+        // Bindings doesn't exist yet, the lookup throws cycle.  With
+        // REC_INIT firing first, the Bindings is allocated and (under
+        // Phase B) registered as the outer thunk's partial Bindings;
+        // earlier-set entries become observable to later entries'
+        // sub-expressions via the partial-bindings peek in withLookup.
+        //
+        // Why OP_ATTRS_REC_INIT (publishes) and not LET_REC_INIT (no
+        // publish): the publish is what registers the partial Bindings
+        // with the outer Black thunk's side-table.  The publish itself
+        // is gated by STG + isRecInit=true (vm.cc:1095) so non-rec
+        // attrsets only register the side-table — they never overwrite
+        // an outer thunk's `evaluated` field.  This is the
+        // architecturally-correct choice (sub-expression Bindings are
+        // never confused with the outer thunk's value; #495 stays
+        // fixed).
+        //
+        // Layout: REC_INIT requires the trailer to be (name, pos) in
+        // SymbolId-sorted order.  The slot operand of REC_SET indexes
+        // into the trailer's sorted positions.  We sort entry indices
+        // by name here (vs. their textual order in the source), then
+        // emit per-entry value-push + REC_SET in sort order so the
+        // first SET fills sorted-slot 0, etc.
+        const size_t n = e.entries.size();
+        if (n == 0) {
+            // Empty attrset: keep the OP_ATTRS_INIT fast path.
+            // OP_ATTRS_INIT with n=0 has its own dispatch shortcut
+            // (vm.cc:4017) that pushes the singleton vEmptyAttrs.
+            unit.code.push_back(encode(OP_ATTRS_INIT, 0));
+            return;
+        }
+
+        // Build a permutation `sortedIdx` such that
+        //   e.entries[sortedIdx[k]].name is the k-th in sorted order.
+        std::vector<uint32_t> sortedIdx(n);
+        for (uint32_t i = 0; i < n; ++i) sortedIdx[i] = i;
+        std::sort(sortedIdx.begin(), sortedIdx.end(),
+            [&](uint32_t a, uint32_t b) {
+                return e.entries[a].name < e.entries[b].name;
+            });
+        // Detect duplicates at lower-time so we reject earlier than
+        // OP_ATTRS_INIT's runtime dup check would (matches the prior
+        // OP_ATTRS_INIT path which was an emit of [push N values];
+        // OP_ATTRS_INIT N).
+        for (size_t k = 1; k < n; ++k) {
+            if (e.entries[sortedIdx[k]].name
+                == e.entries[sortedIdx[k - 1]].name)
+            {
+                // Defer the throw to runtime so the error message is
+                // identical to the OP_ATTRS_INIT path's.  Just allow
+                // the duplicate trailer here; OP_ATTRS_REC_SET to the
+                // same slot twice is harmless (last write wins).
+                break;
+            }
+        }
+        // Flush any pending deferred values to their slots BEFORE we
+        // push the Bindings.  The deferring optimisation (#542) keeps
+        // recently-computed OnceLinear values on the runtime stack
+        // expecting the next emit step to consume them; if we push the
+        // Bindings on top of those, subsequent emitVarRef calls would
+        // flush-and-spill them with the WRONG slot mapping (top of
+        // stack is now the Bindings, not the deferred value).  Empty
+        // pending after this means our REC_INIT/REC_SET sequence has
+        // a clean stack to work on.
+        flushAllDeferred();
+        // Emit REC_INIT with sorted (name, pos) trailer.
+        unit.code.push_back(encode(OP_ATTRS_REC_INIT, static_cast<uint32_t>(n)));
+        for (uint32_t k = 0; k < n; ++k) {
+            const auto & en = e.entries[sortedIdx[k]];
             unit.code.push_back(en.name);
             unit.code.push_back(en.pos);
+        }
+        // Emit per-entry value-push + REC_SET <sorted_slot>.  We emit
+        // in SORT order so values are pushed and consumed adjacently
+        // (no transient stack ordering issues).
+        for (uint32_t k = 0; k < n; ++k) {
+            const auto & en = e.entries[sortedIdx[k]];
+            emitVarRef(en.value);
+            unit.code.push_back(encode(OP_ATTRS_REC_SET, k));
         }
     }
     void emitOne(const ir::AttrSetDyn & e)
