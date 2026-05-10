@@ -1482,14 +1482,32 @@ inline void publishToAllThunkFrames(VMState & vm, const Value & v)
     static const bool s_dbg_reg =
         std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
     auto & reg = partialBindingsRegistry();
+    // #558 (2026-05-10) NIX_V3_TAIL_REGISTER_SCOPE controls how
+    // many thunk frames to register with.
+    //   "all" (default): every thunk frame on the call stack.
+    //     Closes lib.fix-style cycles spanning many lib.extends layers.
+    //     Risk: registering with thunks ACROSS lib.fix boundaries
+    //     (e.g., this AttrSet is part of stage_n's eval, but stage_n+1's
+    //     thunk is also on the stack — registering with stage_n+1 is
+    //     incorrect since this AttrSet isn't part of its value).
+    //   "immediate": only the innermost THUNK_RETURN frame.
+    //     Conservative; matches the original innermost-Black behavior.
+    //     Reverts the libsForQt5 fix.
+    //   "black": every Black thunk only (skip Suspended).
+    //     Avoids registering with lib.fix's outer x_thunk that's
+    //     Suspended-but-currently-in-an-active-force.
+    static const char * s_scope_env = std::getenv("NIX_V3_TAIL_REGISTER_SCOPE");
+    static const std::string s_scope = s_scope_env ? s_scope_env : "all";
     for (size_t i = vm.frames.size(); i > 0; --i) {
         CallFrame & fr = vm.frames[i - 1];
         if (!(fr.flags & CFF_THUNK_RETURN)) continue;
         if (!fr.thunk) continue;
-        // Register with Black AND Suspended thunks.  Evaluated thunks
-        // have a final value and would be stale registrations.
+        // Default: register with Black AND Suspended thunks.  Evaluated
+        // thunks have a final value and would be stale registrations.
         if (fr.thunk->state != ThunkState::Blackhole
             && fr.thunk->state != ThunkState::Suspended) continue;
+        if (s_scope == "black"
+            && fr.thunk->state != ThunkState::Blackhole) continue;
         // Append the new tail-return Bindings to this thunk's chain.
         // Duplicates (same Bindings* registered twice for one thunk)
         // are skipped to keep the chain compact; lookup walks back so
@@ -1504,6 +1522,7 @@ inline void publishToAllThunkFrames(VMState & vm, const Value & v)
                 (unsigned)v.payload.bindings->size,
                 chain.size());
         }
+        if (s_scope == "immediate") break;
     }
 }
 
