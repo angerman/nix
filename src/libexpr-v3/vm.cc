@@ -131,7 +131,50 @@ inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
 // internal-linkage function inside the anon namespace and conflict
 // with the real definition.
 } // -- close anon for partialBindingsRegistry forward decl
-std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry();
+/// #558 (2026-05-10) per-thunk Bindings CHAIN.
+///
+/// The registry maps each in-progress thunk to a list of partial
+/// Bindings — one per `OP_ATTRS_REC_INIT_TAIL` event that fired while
+/// this thunk was on the call stack.  Walk back-to-front on lookup;
+/// the first Bindings containing the looked-up name wins.
+///
+/// Why a chain instead of a single Bindings*: lib.extends-style fold
+/// (`prev // overlay final prev`) composes layers.  Each layer's body
+/// has its own tail-return AttrSet that contributes a partial set of
+/// names.  A `with self;` lookup mid-eval needs to see contributions
+/// from ALL layers, with later layers shadowing earlier ones for
+/// shared names — exactly the // semantics.  A single Bindings* can
+/// only hold one snapshot; eager-merge into a fresh Bindings copies
+/// entries by-value at merge time, missing subsequent OP_ATTRS_REC_SET
+/// writes into the source bindings (Bindings is allocated upfront by
+/// REC_INIT_TAIL with placeholder values, then progressively SET).
+///
+/// The chain stores POINTERS to the original Bindings, so SETs on a
+/// chain entry's bindings (via REC_SET on the same heap object) ARE
+/// observed by the lookup that walks the chain.
+///
+/// Lookup order (back-to-front = LATEST first): mirrors lib.extends's
+/// `// overlay` semantics where later layers win on key conflicts.
+using PartialBindingsChain = std::vector<Bindings *>;
+std::unordered_map<Thunk *, PartialBindingsChain> & partialBindingsRegistry();
+
+/// #558: lookup a name across all Bindings in the chain.  Walks
+/// back-to-front; returns the first hit (LATEST-WINS-PER-NAME).
+///
+/// Returns nullptr if no chain entry has the name.  Bindings::lookup
+/// returns the entry's *current* value (which may still be a Null
+/// placeholder if the chain entry's REC_SET hasn't fired yet) — the
+/// caller decides what to do (e.g. fall through and force the slot).
+inline Value * lookupInPartialChain(const PartialBindingsChain & chain,
+                                     SymbolId name)
+{
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (!*it) continue;
+        if (auto * v = (*it)->lookup(name))
+            return v;
+    }
+    return nullptr;
+}
 namespace { // -- reopen anon
 
 // #548c (2026-05-10) per-CU registry for the alloc/force atexit dump.
@@ -653,8 +696,8 @@ inline Value withLookup(VMState & vm, SymbolId name)
             {
                 auto & reg = partialBindingsRegistry();
                 auto it = reg.find(derefed.payload.thunk);
-                if (it != reg.end() && it->second) {
-                    if (auto * v = it->second->lookup(name))
+                if (it != reg.end()) {
+                    if (auto * v = lookupInPartialChain(it->second, name))
                         return *v;
                 }
             }
@@ -668,8 +711,8 @@ inline Value withLookup(VMState & vm, SymbolId name)
                     if (derefed.isThunk() && derefed.payload.thunk) {
                         auto & reg = partialBindingsRegistry();
                         auto it = reg.find(derefed.payload.thunk);
-                        if (it != reg.end() && it->second) {
-                            if (auto * v = it->second->lookup(name))
+                        if (it != reg.end()) {
+                            if (auto * v = lookupInPartialChain(it->second, name))
                                 return *v;
                         }
                     }
@@ -731,10 +774,23 @@ inline Value withLookup(VMState & vm, SymbolId name)
         if (__builtin_expect(s_dbgWithCycle, 0)) {
             const auto & sym = ir::globalSymbolTable();
             std::string nm = name < sym.size() ? sym[name] : "<?>";
+            // Print source position of the firing frame so we can
+            // identify which AST source location triggered the cycle.
+            const auto & frFire = vm.frames.back();
+            const LambdaDescriptor * dFire = nullptr;
+            if (frFire.thunk && (frFire.thunk->state == ThunkState::Suspended
+                || frFire.thunk->state == ThunkState::Blackhole))
+                dFire = frFire.thunk->suspended.desc;
+            if (!dFire && frFire.closure) dFire = frFire.closure->desc;
+            const PosSnapshot * psFire =
+                dFire ? resolvePosSnapshot(dFire->posHandle) : nullptr;
             std::fprintf(stderr,
-                "v3 OP_WITH_LOOKUP cycle: name='%s' base=%zu top=%zu vm=%p frames=%zu\n",
+                "v3 OP_WITH_LOOKUP cycle: name='%s' base=%zu top=%zu vm=%p frames=%zu pos=%s:%u:%u\n",
                 nm.c_str(), base, vm.withStack.size(), (void *)&vm,
-                vm.frames.size());
+                vm.frames.size(),
+                (psFire && !psFire->file.empty()) ? psFire->file.c_str() : "<no-pos>",
+                psFire ? psFire->line : 0u,
+                psFire ? psFire->column : 0u);
             for (size_t i = vm.withStack.size(); i-- > base; ) {
                 Value w = vm.withStack[i];
                 std::fprintf(stderr, "  with[%zu] tag=%u",
@@ -1168,9 +1224,9 @@ namespace {
 // has external linkage and gc.cc can call it from another TU
 // (for nursery-scavenge key rewrites).
 } // -- close anon namespace for partialBindingsRegistry definition
-std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry()
+std::unordered_map<Thunk *, PartialBindingsChain> & partialBindingsRegistry()
 {
-    static thread_local std::unordered_map<Thunk *, Bindings *> tbl;
+    static thread_local std::unordered_map<Thunk *, PartialBindingsChain> tbl;
     return tbl;
 }
 namespace { // -- reopen anon namespace
@@ -1270,7 +1326,14 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
             if (!(fr.flags & CFF_THUNK_RETURN)) continue;
             if (!fr.thunk) continue;
             if (fr.thunk->state != ThunkState::Blackhole) continue;
-            partialBindingsRegistry()[fr.thunk] = v.payload.bindings;
+            // Sub-attrset (non-tail) registration: REPLACE the chain
+            // with a single-element vector containing this Bindings.
+            // Sub-attrsets shouldn't accumulate — only the latest
+            // sub-attrset for this innermost-Black thunk represents
+            // its currently-relevant partial state.
+            auto & chain = partialBindingsRegistry()[fr.thunk];
+            chain.clear();
+            chain.push_back(v.payload.bindings);
             static const bool s_dbg_reg =
                 std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
             if (s_dbg_reg) std::fprintf(stderr,
@@ -1313,7 +1376,11 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
             if (!(fr.flags & CFF_THUNK_RETURN)) continue;
             if (!fr.thunk) continue;
             if (fr.thunk->state != ThunkState::Blackhole) continue;
-            partialBindingsRegistry()[fr.thunk] = v.payload.bindings;
+            // Legacy non-STG path: replace the chain (single-element)
+            // for back-compat with the old single-Bindings registry.
+            auto & chain = partialBindingsRegistry()[fr.thunk];
+            chain.clear();
+            chain.push_back(v.payload.bindings);
             if (s_dbg_reg) std::fprintf(stderr,
                 "v3 partialBindings: register thunk=%p bindings=%p size=%u\n",
                 (void *)fr.thunk, (void *)v.payload.bindings,
@@ -1360,31 +1427,51 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
 
 /// #558: tail-return-AttrSet publish.  Register `v`'s Bindings with
 /// EVERY thunk frame on the call stack — Black AND Suspended — using
-/// FIRST-WINS semantics so an outer thunk's earlier registration
-/// (e.g. from a deeper function's tail-return) sticks.
+/// MERGE semantics: the new registration is `//`'d (Nix attrset
+/// update) over any prior registration so accumulated multi-layer
+/// contributions stay visible to the partial-Bindings peek path.
 ///
 /// Architectural rationale: lib.fix-style fix-points produce a chain
 /// of nested thunks (`final → prev_outer → ... → prev_inner →
 /// super_lambda`) all conceptually waiting for super's return value.
 /// When `with self;` derefs through the with-source slot, it can land
-/// on ANY of these thunks (depending on which is on the with-stack).
-/// Registering super's partial Bindings with each of them lets the
-/// withLookup partial-Bindings peek find the entries regardless of
-/// which thunk the slot derefs to.
+/// on ANY of these thunks.  Registering super's partial Bindings with
+/// each of them lets the withLookup partial-Bindings peek find the
+/// entries regardless of which thunk the slot derefs to.
 ///
 /// Suspended-state inclusion: lib.fix's `let x = f x;` keeps `x` in
-/// Suspended state for the duration of `f x`'s evaluation (v3's
-/// force protocol marks Black only inside the immediate forceValue
+/// Suspended state for the duration of `f x`'s evaluation (v3's force
+/// protocol marks Black only inside the immediate forceValue
 /// dispatch).  Without registering with Suspended thunks, x's slot
 /// derefs would miss the registry.
 ///
-/// First-wins: when a function deeper in the call chain (e.g. a
-/// helper thunk spawned by super's body) later fires its OWN
-/// REC_INIT_TAIL, we don't want it to overwrite super's earlier
-/// registration on the OUTER chain thunks.  The helper's registration
-/// is correct only for ITSELF (its own thunk hasn't been registered
-/// yet, so first-wins lets it claim its own slot).  The outer chain
-/// keeps super.
+/// MERGE-on-conflict (lib.extends multi-layer support): when a thunk
+/// already has a registered Bindings (from a deeper function's
+/// tail-return), MERGE the new bindings into the existing ones.
+///   reg[T] = mergeBindings(reg[T], v.bindings)  // RHS wins on dup
+///
+/// Why merge: the lib.extends fold (`prev // overlay final prev`)
+/// composes layers.  Each layer's body has its own tail-return
+/// AttrSet that contributes a partial set of names.  pkgs's eventual
+/// value at thunk T is the // of all layer outputs.  A `with self;`
+/// lookup mid-eval needs to see ALL contributions, not just the most
+/// recent layer's.
+///
+/// Single-Bindings-per-thunk representation: `mergeBindings` (defined
+/// at vm.cc:571) is the same primitive that OP_ATTRS_UPDATE uses to
+/// implement Nix's `//` operator.  It allocates a fresh combined
+/// Bindings; b's entries shadow a's on duplicate keys.  This matches
+/// lib.extends's overlay-wins-on-conflict semantics exactly.
+///
+/// Cost: O(|reg[T]| + |v|) per REC_INIT_TAIL when `reg[T]` is already
+/// populated; one Bindings allocation.  In a deep extends chain
+/// (~10 layers, ~4000 entries each), that's ~40k entry copies per
+/// chain-level — bounded and amortized over the whole pkgs eval.
+///
+/// Caveat: stale entries linger until their thunk transitions to
+/// Evaluated.  withLookup's peek path gates on `state == Blackhole`
+/// (vm.cc:651), so an Evaluated thunk's stale entry is unreachable.
+/// No correctness issue; future work could clean up at OP_RETURN.
 inline void publishToAllThunkFrames(VMState & vm, const Value & v)
 {
     static const bool s_stgMode =
@@ -1403,16 +1490,20 @@ inline void publishToAllThunkFrames(VMState & vm, const Value & v)
         // have a final value and would be stale registrations.
         if (fr.thunk->state != ThunkState::Blackhole
             && fr.thunk->state != ThunkState::Suspended) continue;
-        // First-wins: emplace returns false if the key was already
-        // present, leaving the existing entry alone.
-        auto [it, inserted] =
-            reg.emplace(fr.thunk, v.payload.bindings);
-        (void)it;
-        if (s_dbg_reg && inserted) std::fprintf(stderr,
-            "v3 STG partialBindings(TAIL): register thunk=%p state=%d bindings=%p size=%u\n",
-            (void *)fr.thunk, (int)fr.thunk->state,
-            (void *)v.payload.bindings,
-            (unsigned)v.payload.bindings->size);
+        // Append the new tail-return Bindings to this thunk's chain.
+        // Duplicates (same Bindings* registered twice for one thunk)
+        // are skipped to keep the chain compact; lookup walks back so
+        // a duplicate at the end is harmless but wastes work.
+        auto & chain = reg[fr.thunk];
+        if (chain.empty() || chain.back() != v.payload.bindings) {
+            chain.push_back(v.payload.bindings);
+            if (s_dbg_reg) std::fprintf(stderr,
+                "v3 STG partialBindings(TAIL): register thunk=%p state=%d bindings=%p size=%u (chain depth=%zu)\n",
+                (void *)fr.thunk, (int)fr.thunk->state,
+                (void *)v.payload.bindings,
+                (unsigned)v.payload.bindings->size,
+                chain.size());
+        }
     }
 }
 
@@ -5389,8 +5480,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     && attrs.payload.thunk->state == ThunkState::Blackhole) {
                     auto & reg = partialBindingsRegistry();
                     auto it = reg.find(attrs.payload.thunk);
-                    if (it != reg.end()) {
-                        recoveredBindings = it->second;
+                    if (it != reg.end() && !it->second.empty()) {
+                        // Use the latest (back) entry as the
+                        // recovered bindings.  The chain's other
+                        // entries represent older layer
+                        // contributions; for whole-attrset recovery,
+                        // the latest-layer's view is closest to the
+                        // thunk's eventual value.
+                        recoveredBindings = it->second.back();
                     }
                 }
                 if (recoveredBindings) {
@@ -5411,11 +5508,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             && attrs.payload.thunk) {
                             auto & reg = partialBindingsRegistry();
                             auto it = reg.find(attrs.payload.thunk);
-                            if (it != reg.end()) {
+                            if (it != reg.end() && !it->second.empty()) {
                                 Value recovered;
                                 recovered.tag_payload =
                                     static_cast<uint64_t>(Tag::Attrs);
-                                recovered.payload.bindings = it->second;
+                                recovered.payload.bindings = it->second.back();
                                 attrs = recovered;
                             } else {
                                 throw;
@@ -7157,13 +7254,17 @@ Value forceValue(VMState & vm, Value v)
                 if (!s_disabled && !s_stgMode_recover) {
                     auto & reg = partialBindingsRegistry();
                     auto it = reg.find(t);
-                    if (it != reg.end()) {
+                    if (it != reg.end() && !it->second.empty()) {
+                        // Use the latest (back) entry for recovery.
+                        // This is the legacy non-STG path; the chain
+                        // typically has only one entry under non-STG
+                        // mode (single-element replacement).
                         if (s_dbg_reg) std::fprintf(stderr,
                             "v3 partialBindings: RECOVER thunk=%p bindings=%p\n",
-                            (void *)t, (void *)it->second);
+                            (void *)t, (void *)it->second.back());
                         Value out;
                         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                        out.payload.bindings = it->second;
+                        out.payload.bindings = it->second.back();
                         return out;
                     }
                     if (s_dbg_reg) std::fprintf(stderr,

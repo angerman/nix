@@ -572,7 +572,24 @@ struct Lowerer
         auto & blk = m.blocks[blkId];
         auto * ret = std::get_if<ir::TermReturn>(&blk.terminal);
         if (!ret || ret->value == ir::kInvalid) return;
-        ir::VarId target = ret->value;
+        markTailVarInBlock(blkId, ret->value, /*depth=*/0);
+    }
+
+    // Recursively follow a VarId through transparent IR wrappers
+    // (VarRef, With, Assert, If) inside a single block, marking the
+    // ultimate AttrSet binding as the function's tail-return.
+    //
+    // Depth bound prevents pathological cycles (the IR shouldn't have
+    // any, but defensive — VarRef chains in particular could loop if a
+    // future optimizer creates them).
+    void markTailVarInBlock(ir::BlockId blkId, ir::VarId target,
+                            int depth)
+    {
+        if (depth > 16) return;  // pathological-loop guard
+        if (blkId == ir::kInvalidBlock
+            || blkId >= m.blocks.size()) return;
+        if (target == ir::kInvalid) return;
+        auto & blk = m.blocks[blkId];
         for (auto & bd : blk.bindings) {
             if (bd.var != target) continue;
             std::visit([&](auto & e) {
@@ -580,15 +597,21 @@ struct Lowerer
                 if constexpr (std::is_same_v<T, ir::AttrSet>) {
                     e.isFunctionReturn = true;
                 } else if constexpr (std::is_same_v<T, ir::With>) {
-                    // `with X; body` is transparent — the body's
+                    // `with X; body` is transparent — body's
                     // terminal-return is the function's return.
                     markTailAttrSetInBlock(e.bodyBlock);
                 } else if constexpr (std::is_same_v<T, ir::Assert>) {
                     markTailAttrSetInBlock(e.bodyBlock);
                 } else if constexpr (std::is_same_v<T, ir::If>) {
-                    // Both branches are potential returns; mark each.
+                    // Both branches are potential returns.
                     markTailAttrSetInBlock(e.thenBlock);
                     markTailAttrSetInBlock(e.elseBlock);
+                } else if constexpr (std::is_same_v<T, ir::VarRef>) {
+                    // VarRef is an alias.  `let X = ...; in body`
+                    // wraps the body's value in a VarRef binding (see
+                    // lowerLetRec), so following the VarRef finds the
+                    // actual body AttrSet (in the same block).
+                    markTailVarInBlock(blkId, e.var, depth + 1);
                 }
                 // Other expr kinds (App, Update, ConcatLists, etc.)
                 // produce values that aren't AttrSet REC_INIT outputs;
