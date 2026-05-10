@@ -4829,59 +4829,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // emits an explicit OP_FORCE most of the time, but App/Thunk
             // values can sneak through via OP_RETURN's no-chase
             // semantics.  Cheap on already-forced values.
-            //
-            // #558 (2026-05-10) partial-Bindings peek for OP_ATTRS_SELECT:
-            // when the source is a Black thunk in mid-construction (the
-            // canonical lib.fix `let x = f x; in x` shape, where x is
-            // currently being forced and an inner `self.X` access tries
-            // to select through it), peek the partial-Bindings registry
-            // chain BEFORE forcing.  If the chain has an entry for the
-            // looked-up name, return it — avoids the BlackholeError that
-            // forceValue would throw on the Black thunk.
-            //
-            // Mirror of the OP_WITH_LOOKUP partial-Bindings peek path
-            // (vm.cc:withLookup) but for direct Select access.  Both
-            // paths share the same registry chain (populated by
-            // OP_ATTRS_REC_INIT_TAIL via publishToAllThunkFrames).
-            if (attrs.isThunk() && attrs.payload.thunk
-                && attrs.payload.thunk->state == ThunkState::Blackhole)
-            {
-                auto & reg = partialBindingsRegistry();
-                auto it = reg.find(attrs.payload.thunk);
-                if (it != reg.end()) {
-                    if (auto * v = lookupInPartialChain(
-                            it->second,
-                            static_cast<SymbolId>(operand))) {
-                        push(vm, *v);
-                        ip++;  // consume the icIdx operand word
-                        break;
-                    }
-                }
-            }
             if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
-                try {
-                    attrs = forceValue(vm, attrs);
-                } catch (const BlackholeError &) {
-                    // Last-chance peek for partial Bindings (in case
-                    // the chase landed on a Black thunk we hadn't
-                    // seen at the top level).  Mirrors the
-                    // OP_WITH_LOOKUP catch-and-peek pattern.
-                    if (attrs.isThunk() && attrs.payload.thunk) {
-                        auto & reg = partialBindingsRegistry();
-                        auto it = reg.find(attrs.payload.thunk);
-                        if (it != reg.end()) {
-                            if (auto * v = lookupInPartialChain(
-                                    it->second,
-                                    static_cast<SymbolId>(operand))) {
-                                push(vm, *v);
-                                ip++;
-                                break;
-                            }
-                        }
-                    }
-                    throw;
-                }
+                attrs = forceValue(vm, attrs);
             }
             if (!attrs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: not an attrset");
