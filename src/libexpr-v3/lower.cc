@@ -2043,8 +2043,36 @@ struct Lowerer
         // InheritedFrom AttrDefs have def.e = ExprSelect(ExprInheritFrom,
         // name); lowerExpr handles ExprInheritFrom by looking up the
         // current inheritFromStack.
+        //
+        // #558 emit-order restructure (non-rec, non-dyn branch only —
+        // see below).  When `e->inheritFromExprs` is non-null (i.e.
+        // there are `inherit (FROM_EXPR) name1 name2 ...;` clauses),
+        // we LOWER IN A SPECIFIC ORDER so that the runtime emission
+        // closes the libsForQt5-style cycle architecturally:
+        //
+        //   1. Regular (non-IF) entry value bindings.
+        //   2. The `AttrSet` binding (REC_INIT + regular SETs only at
+        //      emit time — IF entries' `value` is kInvalid placeholder).
+        //   3. From-expr cache bindings (pushInheritFromCache).
+        //   4. IF entry value bindings (Select(cache_var, name)).
+        //   5. The `AttrSetSetInheritFrom` binding (IF SETs).
+        //
+        // Why: at runtime, step 2 publishes the partial Bindings to the
+        // outer Black thunk's registry AND populates regular slots;
+        // when step 3's bytecode runs (e.g. `OP_WITH_LOOKUP libsForQt5`
+        // for an `inherit (libsForQt5.callPackage ...) wt4` clause),
+        // the with-source's mid-construction Bindings now has
+        // libsForQt5 visible via the partial-Bindings peek path.
+        // Cycle closed without thunkifying the from-expr (the prior
+        // `NIX_V3_THUNK_CALL_ON_SELECT_VAR` workaround which produced
+        // divergent eval semantics — see project_libsForQt5_deferred
+        // and #557 root-cause analysis).
         bool pushedInheritFrom = false;
-        if (e->inheritFromExprs) {
+        // Non-non-rec/non-dyn paths still take the legacy order: the
+        // dyn branch builds an `AttrSetDyn` which has its own emit
+        // pipeline (no REC_INIT split), and rec attrsets go through
+        // lowerLetRecCapture which has its own lazy/cell story.
+        if (e->inheritFromExprs && hasDyn) {
             inheritFromStack.push_back(e->inheritFromExprs.get());
             pushInheritFromCache(e->inheritFromExprs.get());
             pushedInheritFrom = true;
@@ -2094,19 +2122,140 @@ struct Lowerer
             return addBinding(std::move(dyn));
         }
 
+        // #558 emit-order restructure: phase 1 — lower REGULAR entry
+        // values FIRST (independent of any from-expr cache).  Build
+        // entries vector with isInheritFrom flags; IF entries get
+        // kInvalid value placeholder (filled in phase 4).
+        //
+        // We iterate the attrs map TWICE: once to lower regulars +
+        // build entry shape, then later for IF values.  Cost: a second
+        // map walk; nixpkgs attrsets are small enough that this is in
+        // the noise.
         std::vector<ir::AttrSet::Entry> entries;
-        for (auto & kv : *e->attrs) {
-            const auto & sym = kv.first;
-            const auto & def = kv.second;
-            // Lazy entries — see comment on the dyn branch above.
-            ir::VarId vv = thunkifyForAttr(def.e);
-            entries.push_back({internSym(sym), vv, posIdxToHandle(def.pos)});
+        entries.reserve(e->attrs->size());
+
+        // Track which entry slots correspond to IF entries — we'll
+        // backfill their `value` field in phase 4 after pushing the
+        // inherit-from cache.  Pair = (entries[] index, AST kv pointer).
+        std::vector<std::pair<size_t, decltype(e->attrs->begin())>>
+            ifEntrySlots;
+        for (auto it = e->attrs->begin(); it != e->attrs->end(); ++it) {
+            const auto & sym = it->first;
+            const auto & def = it->second;
+            const bool isIF =
+                def.kind == nix::ExprAttrs::AttrDef::Kind::InheritedFrom;
+            if (isIF) {
+                // Placeholder value — filled in phase 4 once the
+                // from-expr cache is available.
+                ifEntrySlots.emplace_back(entries.size(), it);
+                entries.push_back(
+                    {internSym(sym), ir::kInvalid,
+                     posIdxToHandle(def.pos), /*isInheritFrom=*/true});
+            } else {
+                // Lazy entries — see comment on the dyn branch above.
+                ir::VarId vv = thunkifyForAttr(def.e);
+                entries.push_back(
+                    {internSym(sym), vv, posIdxToHandle(def.pos),
+                     /*isInheritFrom=*/false});
+            }
         }
+
+        // Sort entries by SymbolId (the AttrSet IR invariant: entries
+        // sorted ascending — see ir.hh).  Capture the post-sort index
+        // for each entry so the IF SET binding (and the IF entry value
+        // backfill below) can reference the correct slot.
+        //
+        // Note: emit.cc historically also re-sorted at emit time via a
+        // local sortedIdx — that's redundant once the IR is sorted, but
+        // we keep it as a defensive idempotent sort in emitOne(AttrSet).
+        std::vector<size_t> oldToNew(entries.size());
+        {
+            std::vector<std::pair<ir::SymbolId, size_t>> idxOrder;
+            idxOrder.reserve(entries.size());
+            for (size_t i = 0; i < entries.size(); ++i)
+                idxOrder.emplace_back(entries[i].name, i);
+            std::stable_sort(idxOrder.begin(), idxOrder.end(),
+                             [](const auto & a, const auto & b) {
+                                 return a.first < b.first;
+                             });
+            std::vector<ir::AttrSet::Entry> sorted;
+            sorted.reserve(entries.size());
+            for (size_t newIdx = 0; newIdx < idxOrder.size(); ++newIdx) {
+                size_t oldIdx = idxOrder[newIdx].second;
+                oldToNew[oldIdx] = newIdx;
+                sorted.push_back(entries[oldIdx]);
+            }
+            entries = std::move(sorted);
+        }
+
+        // Phase 2: add the AttrSet binding NOW.  Its emit at runtime
+        // does REC_INIT + regular SETs.  IF SETs are deferred to the
+        // AttrSetSetInheritFrom binding emitted in phase 5.
+        ir::VarId attrSetVar =
+            addBinding(ir::AttrSet{std::move(entries)});
+
+        // If there are no inherit-from clauses, we're done — emit the
+        // attrset as before (no IF SETs needed).
+        if (!e->inheritFromExprs) {
+            return attrSetVar;
+        }
+
+        // Phase 3: push the from-expr cache.  This adds bindings to the
+        // current parent block (in lower-time order, AFTER the AttrSet
+        // binding).  At runtime, these bindings' bytecode runs AFTER the
+        // AttrSet's REC_INIT + regular SETs — partial-Bindings now has
+        // sibling regular entries visible to OP_WITH_LOOKUP from inside
+        // the from-expr.
+        inheritFromStack.push_back(e->inheritFromExprs.get());
+        pushInheritFromCache(e->inheritFromExprs.get());
+        pushedInheritFrom = true;
+
+        // Phase 4: lower IF entry values.  Each IF entry's `def.e` is
+        // typically `ExprSelect(ExprInheritFrom, name)`; thunkifyForAttr
+        // produces a thunk binding wrapping a Select on cache_var.
+        std::vector<ir::AttrSetSetInheritFrom::IFEntry> ifSets;
+        ifSets.reserve(ifEntrySlots.size());
+        for (auto & [oldIdx, it] : ifEntrySlots) {
+            const auto & def = it->second;
+            ir::VarId vv = thunkifyForAttr(def.e);
+            const size_t newIdx = oldToNew[oldIdx];
+            ifSets.push_back(
+                {static_cast<uint32_t>(newIdx), vv});
+        }
+        // The AttrSet IR's IF entries still hold kInvalid placeholders
+        // — they're not consumed by emit (emitOne(AttrSet) only emits
+        // REC_INIT names+pos for IF entries; the SETs come from the
+        // AttrSetSetInheritFrom binding).  Leaving the placeholder in
+        // place keeps optimizer passes (DCE / occur) consistent: an IF
+        // entry's value var is referenced ONLY by the IF SET binding,
+        // not by the AttrSet itself.
+
+        // Sort IF SETs by sortedSlot for deterministic emit order
+        // (matches the regular SET pass which also walks slots in
+        // ascending order).  Stable so equal slots — which can't
+        // happen for distinct names — preserve.
+        std::stable_sort(ifSets.begin(), ifSets.end(),
+                         [](const auto & a, const auto & b) {
+                             return a.sortedSlot < b.sortedSlot;
+                         });
+
+        // Phase 5: pop inherit-from stack BEFORE emitting the
+        // AttrSetSetInheritFrom binding (mirrors the legacy pop site).
         if (pushedInheritFrom) {
             inheritFromStack.pop_back();
             inheritFromCacheStack.pop_back();
+            pushedInheritFrom = false;
         }
-        return addBinding(ir::AttrSet{std::move(entries)});
+
+        // Phase 6: add the AttrSetSetInheritFrom binding.  Its var is
+        // a fresh discardable that aliases the attrset (the SET ops
+        // mutate the same heap Bindings).  Future bindings in the
+        // parent block (or the terminal-return) reference attrSetVar
+        // directly — they don't need the alias.
+        addBinding(ir::AttrSetSetInheritFrom{
+            attrSetVar, std::move(ifSets)});
+
+        return attrSetVar;
     }
 
     /// Shared between ExprLet and ExprAttrs (both rec and non-rec when

@@ -125,7 +125,15 @@ void rewriteExpr(Expr & expr, const std::unordered_map<VarId, VarId> & alias)
                              std::is_same_v<T, HasAttrDyn>) {
             rewriteVar(e.attrs, alias); rewriteVar(e.nameVar, alias);
         } else if constexpr (std::is_same_v<T, AttrSet>) {
-            for (auto & en : e.entries) rewriteVar(en.value, alias);
+            // #558: skip IF entries (kInvalid placeholder) — IF SETs are
+            // emitted by AttrSetSetInheritFrom which has its own visit.
+            for (auto & en : e.entries) {
+                if (en.value != kInvalid)
+                    rewriteVar(en.value, alias);
+            }
+        } else if constexpr (std::is_same_v<T, AttrSetSetInheritFrom>) {
+            rewriteVar(e.attrSetVar, alias);
+            for (auto & en : e.entries) rewriteVar(en.valueVar, alias);
         } else if constexpr (std::is_same_v<T, AttrSetDyn>) {
             for (auto & en : e.statics)  rewriteVar(en.value, alias);
             for (auto & en : e.dynamics) { rewriteVar(en.nameVar, alias); rewriteVar(en.value, alias); }

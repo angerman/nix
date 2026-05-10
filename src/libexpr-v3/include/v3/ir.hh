@@ -171,9 +171,46 @@ struct RecBindingSlotRef { VarId attrs; SymbolId name; };
 /// Construct a non-recursive attrset from sorted (name, value) pairs.
 /// `pos` is the AST PosIdx for the attribute *name* token (or 0 = none),
 /// used by `builtins.unsafeGetAttrPos`.
+///
+/// #558 emit-order restructure: when an attrset has `inherit (E) y;`
+/// entries (`isInheritFrom = true`), the from-expr `E` is lowered as
+/// SEPARATE parent-block bindings AFTER this AttrSet binding (instead
+/// of before it, which would force `E` while `pkgs`-style with-sources
+/// are still mid-construction).  emitOne(AttrSet) emits REC_INIT +
+/// regular SETs only; the inherit-from REC_SETs are emitted by a
+/// trailing `AttrSetSetInheritFrom` binding once cache vars exist.
+/// IF entries' `value` is `kInvalid` here (placeholder).
 struct AttrSet {
-    struct Entry { SymbolId name; VarId value; uint32_t pos = 0; };
+    struct Entry {
+        SymbolId name;
+        VarId    value;          // kInvalid for isInheritFrom entries
+        uint32_t pos = 0;
+        bool     isInheritFrom = false;
+    };
     std::vector<Entry> entries; // sorted ascending by SymbolId
+};
+
+/// #558 emit-order restructure: companion to `AttrSet` that emits the
+/// `inherit (E) y;` per-entry REC_SETs.  Lowered AFTER the `AttrSet`
+/// binding and AFTER the from-expr cache + IF entry value bindings, so
+/// the from-expr's runtime evaluation (e.g. `OP_WITH_LOOKUP libsForQt5`)
+/// fires AFTER the attrset's regular entries are visible via the
+/// partial-Bindings registry.
+///
+/// Emit:
+///   emitVarRef(attrSetVar)          # push attrset on stack
+///   for each entry:
+///     emitVarRef(valueVar)          # push value
+///     OP_ATTRS_REC_SET sortedSlot   # consumes value, leaves attrset
+///   # binding's slot ends up holding the attrset (idempotent — same
+///   # heap Bindings*; the IR var is a discardable alias).
+struct AttrSetSetInheritFrom {
+    VarId attrSetVar;
+    struct IFEntry {
+        uint32_t sortedSlot;
+        VarId    valueVar;
+    };
+    std::vector<IFEntry> entries; // sorted ascending by sortedSlot
 };
 
 /// Attrset with one or more dynamic-name attributes.
@@ -345,7 +382,7 @@ using Expr = std::variant<
     LitInt, LitFloat, LitBool, LitNull, LitString, LitPath,
     VarRef, WithLookup,
     Lambda, App, Force, MkThunk,
-    AttrSelect, AttrSelectDyn, HasAttr, HasAttrDyn, AttrSet, AttrSetDyn,
+    AttrSelect, AttrSelectDyn, HasAttr, HasAttrDyn, AttrSet, AttrSetSetInheritFrom, AttrSetDyn,
     RecBindingSlotRef,
     ListExpr, ConcatLists,
     If, With, Assert,

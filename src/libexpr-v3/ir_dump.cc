@@ -126,7 +126,25 @@ void dumpAttrSet(W & w, const AttrSet & e) {
     for (size_t i = 0; i < e.entries.size(); ++i) {
         if (i) w.put(",");
         w.sym(e.entries[i].name);
-        w.put("="); w.var(e.entries[i].value);
+        if (e.entries[i].isInheritFrom) {
+            // #558: IF entry — value backfilled by trailing
+            // AttrSetSetInheritFrom binding.  Mark with `=IF` to make
+            // the dump unambiguous (a kInvalid placeholder would print
+            // as `var=0` otherwise).
+            w.put("=IF");
+        } else {
+            w.put("="); w.var(e.entries[i].value);
+        }
+    }
+    w.put("}");
+}
+void dumpAttrSetSetInheritFrom(W & w, const AttrSetSetInheritFrom & e) {
+    w.put("AttrSetSetInheritFrom attrs="); w.var(e.attrSetVar);
+    w.put(" {");
+    for (size_t i = 0; i < e.entries.size(); ++i) {
+        if (i) w.put(",");
+        w.put("slot="); w.put(std::to_string(e.entries[i].sortedSlot));
+        w.put(":"); w.var(e.entries[i].valueVar);
     }
     w.put("}");
 }
@@ -266,6 +284,7 @@ void dumpExprInto(W & w, const Module & m, const Expr & e)
         else if constexpr (std::is_same_v<T, HasAttr>)      dumpHasAttr(w, x);
         else if constexpr (std::is_same_v<T, HasAttrDyn>)   dumpHasAttrDyn(w, x);
         else if constexpr (std::is_same_v<T, AttrSet>)      dumpAttrSet(w, x);
+        else if constexpr (std::is_same_v<T, AttrSetSetInheritFrom>) dumpAttrSetSetInheritFrom(w, x);
         else if constexpr (std::is_same_v<T, AttrSetDyn>)   dumpAttrSetDyn(w, x);
         else if constexpr (std::is_same_v<T, RecBindingSlotRef>) dumpRecBindingSlotRef(w, x);
         else if constexpr (std::is_same_v<T, ListExpr>)     dumpListExpr(w, x);

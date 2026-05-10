@@ -125,7 +125,16 @@ void visitDirectOperandVars(const Expr & e, F && f)
                           || std::is_same_v<T, HasAttrDyn>) {
             f(x.attrs); f(x.nameVar);
         } else if constexpr (std::is_same_v<T, AttrSet>) {
-            for (const auto & en : x.entries) f(en.value);
+            // #558: IF entries hold kInvalid placeholder values — skip
+            // them.  Their actual values are referenced by the trailing
+            // AttrSetSetInheritFrom binding.
+            for (const auto & en : x.entries) {
+                if (!en.isInheritFrom && en.value != kInvalid)
+                    f(en.value);
+            }
+        } else if constexpr (std::is_same_v<T, AttrSetSetInheritFrom>) {
+            f(x.attrSetVar);
+            for (const auto & en : x.entries) f(en.valueVar);
         } else if constexpr (std::is_same_v<T, AttrSetDyn>) {
             for (const auto & en : x.statics)  f(en.value);
             for (const auto & en : x.dynamics) { f(en.nameVar); f(en.value); }

@@ -787,12 +787,54 @@ struct Emitter
         // Emit per-entry value-push + REC_SET <sorted_slot>.  We emit
         // in SORT order so values are pushed and consumed adjacently
         // (no transient stack ordering issues).
+        //
+        // #558 emit-order restructure: entries with `isInheritFrom=true`
+        // are SKIPPED here.  Their REC_SETs are emitted by a trailing
+        // `AttrSetSetInheritFrom` binding lowered AFTER the from-expr
+        // cache + IF entry value bindings — see ir.hh `AttrSet` doc and
+        // lower.cc lowerAttrs (non-rec / non-dyn branch).  IF entries
+        // contribute their NAME + POS to the REC_INIT trailer so slot
+        // indexing remains contiguous; their slot stays default-init
+        // (vEmptyAttrs / placeholder) until the trailing IF SET binding
+        // populates it.  No code path reads an IF slot between the two
+        // bindings — the AttrSet is the parent block's terminal result,
+        // and intermediate from-expr bindings only do OP_WITH_LOOKUP /
+        // OP_ATTRS_SELECT on outer-scope vars and the cache_var, not on
+        // the AttrSet under construction.
         for (uint32_t k = 0; k < n; ++k) {
             const auto & en = e.entries[sortedIdx[k]];
+            if (en.isInheritFrom) continue;
             emitVarRef(en.value);
             unit.code.push_back(encode(OP_ATTRS_REC_SET, k));
         }
     }
+
+    /// #558 emit-order restructure: emit the per-entry REC_SETs for
+    /// the inherit-from entries of an attrset built by an earlier
+    /// `AttrSet` binding.  Pushes the attrset on the runtime stack,
+    /// then for each (slot, valueVar): pushes value, OP_ATTRS_REC_SET k.
+    /// The attrset stays on top of the stack at the end — emitBlock
+    /// flushes/spills it to a slot like any other binding result.  The
+    /// var that this binding produces is a discardable alias of the
+    /// attrset (same heap Bindings*).
+    void emitOne(const ir::AttrSetSetInheritFrom & e)
+    {
+        // Match emitOne(AttrSet)'s flush discipline: deferred values on
+        // the runtime stack would interleave wrong with the
+        // attrset-on-top + value-push + REC_SET sequence.
+        flushAllDeferred();
+        emitVarRef(e.attrSetVar);
+        for (const auto & en : e.entries) {
+            emitVarRef(en.valueVar);
+            unit.code.push_back(encode(OP_ATTRS_REC_SET, en.sortedSlot));
+        }
+        // Attrset stays on top of stack — caller (emitBlock) handles
+        // SET_LOCAL / pendingDefer for our binding's var.  The var is
+        // typically dead (no GET_LOCAL on it elsewhere) but we still
+        // assign a slot so `tryDefer`'s OnceLinear classification has
+        // something to work with.
+    }
+
     void emitOne(const ir::AttrSetDyn & e)
     {
         // Emit static values in order, then dynamic name+value pairs.

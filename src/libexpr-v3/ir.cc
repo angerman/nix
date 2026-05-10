@@ -159,7 +159,16 @@ void collectExprRefs(const Expr & expr, std::unordered_set<VarId> & refs)
                              std::is_same_v<T, HasAttrDyn>) {
             refs.insert(e.attrs); refs.insert(e.nameVar);
         } else if constexpr (std::is_same_v<T, AttrSet>) {
-            for (auto & en : e.entries) refs.insert(en.value);
+            // #558: IF entries hold kInvalid placeholder values — skip
+            // them.  Their actual values are referenced by the trailing
+            // AttrSetSetInheritFrom binding (handled below).
+            for (auto & en : e.entries) {
+                if (!en.isInheritFrom && en.value != kInvalid)
+                    refs.insert(en.value);
+            }
+        } else if constexpr (std::is_same_v<T, AttrSetSetInheritFrom>) {
+            refs.insert(e.attrSetVar);
+            for (auto & en : e.entries) refs.insert(en.valueVar);
         } else if constexpr (std::is_same_v<T, AttrSetDyn>) {
             for (auto & en : e.statics)  refs.insert(en.value);
             for (auto & en : e.dynamics) { refs.insert(en.nameVar); refs.insert(en.value); }
