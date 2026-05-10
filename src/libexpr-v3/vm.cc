@@ -1498,6 +1498,34 @@ inline void publishToAllThunkFrames(VMState & vm, const Value & v)
     //     Suspended-but-currently-in-an-active-force.
     static const char * s_scope_env = std::getenv("NIX_V3_TAIL_REGISTER_SCOPE");
     static const std::string s_scope = s_scope_env ? s_scope_env : "all";
+    // Diagnostic: print the AttrSet's source position (= the
+    // currently-executing thunk's lambda position).  Helps identify
+    // which AttrSet expression is being TAIL-registered.
+    if (s_dbg_reg) {
+        // The running thunk is the topmost thunk frame.
+        Thunk * runningThunk = nullptr;
+        for (size_t i = vm.frames.size(); i > 0; --i) {
+            if ((vm.frames[i - 1].flags & CFF_THUNK_RETURN)
+                && vm.frames[i - 1].thunk) {
+                runningThunk = vm.frames[i - 1].thunk;
+                break;
+            }
+        }
+        if (runningThunk) {
+            const auto * d = (runningThunk->state == ThunkState::Suspended
+                              || runningThunk->state == ThunkState::Blackhole)
+                ? runningThunk->suspended.desc : nullptr;
+            const PosSnapshot * ps =
+                d ? resolvePosSnapshot(d->posHandle) : nullptr;
+            std::fprintf(stderr,
+                "v3 STG TAIL ORIGIN: bindings=%p size=%u pos=%s:%u:%u\n",
+                (void *)v.payload.bindings,
+                (unsigned)v.payload.bindings->size,
+                (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                ps ? ps->line : 0u,
+                ps ? ps->column : 0u);
+        }
+    }
     for (size_t i = vm.frames.size(); i > 0; --i) {
         CallFrame & fr = vm.frames[i - 1];
         if (!(fr.flags & CFF_THUNK_RETURN)) continue;
@@ -3682,6 +3710,41 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // re-entry just reads the cached App and chases it
                 // again (idempotent — the App's left/right don't
                 // change).
+                {
+                    // Diagnostic: trace the chase chain for OP_RETURN
+                    // self-cycle root-cause analysis.  Gated on
+                    // V3_DBG_RET_CHASE=1.
+                    static const bool s_dbgRetChase =
+                        std::getenv("V3_DBG_RET_CHASE") != nullptr;
+                    if (s_dbgRetChase && retVal.isThunk() && fr.thunk) {
+                        Value chase = retVal;
+                        std::fprintf(stderr,
+                            "v3 OP_RETURN chase: fr.thunk=%p initial=%p\n",
+                            (void *)fr.thunk,
+                            (void *)retVal.payload.thunk);
+                        int hops = 0;
+                        while (chase.isThunk() && hops < 32) {
+                            Thunk * th = chase.payload.thunk;
+                            const auto * d = (th->state == ThunkState::Suspended
+                                              || th->state == ThunkState::Blackhole)
+                                ? th->suspended.desc : nullptr;
+                            const PosSnapshot * ps =
+                                d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                            std::fprintf(stderr,
+                                "  hop=%d thunk=%p state=%d name='%s' pos=%s:%u:%u%s\n",
+                                hops, (void *)th, (int)th->state,
+                                d && !d->name.empty() ? d->name.c_str() : "<?>",
+                                (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                                ps ? ps->line : 0u,
+                                ps ? ps->column : 0u,
+                                th == fr.thunk ? " <-- SELF" : "");
+                            if (th->state != ThunkState::Evaluated) break;
+                            chase = th->evaluated;
+                            ++hops;
+                        }
+                        std::fflush(stderr);
+                    }
+                }
                 while (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Evaluated)
                     retVal = retVal.payload.thunk->evaluated;
                 // Self-reference detection: `let x = x; in x` makes the
@@ -3746,6 +3809,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         // demands a concrete value — at which point
                         // the surrounding fix-point will likely have
                         // settled.
+                        static const bool s_dbgVBHProd =
+                            std::getenv("V3_DBG_VBH_PROD") != nullptr;
+                        if (s_dbgVBHProd) {
+                            const auto * d = (fr.thunk
+                                && (fr.thunk->state == ThunkState::Suspended
+                                    || fr.thunk->state == ThunkState::Blackhole))
+                                ? fr.thunk->suspended.desc : nullptr;
+                            const PosSnapshot * ps =
+                                d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                            std::fprintf(stderr,
+                                "v3 OP_RETURN→vBlackhole defer: thunk=%p name='%s' pos=%s:%u:%u\n",
+                                (void *)fr.thunk,
+                                d && !d->name.empty() ? d->name.c_str() : "<?>",
+                                (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                                ps ? ps->line : 0u,
+                                ps ? ps->column : 0u);
+                        }
                         retVal = Value::vBlackhole;
                     }
                 }
@@ -3885,6 +3965,49 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     auto & reg = partialBindingsRegistry();
                     auto it = reg.find(fr.thunk);
                     if (it != reg.end()) reg.erase(it);
+                }
+                // #558 (2026-05-10) Cross-chain cleanup.  When the
+                // thunk's body returns a Bindings via REC_INIT_TAIL,
+                // that Bindings was registered with MULTIPLE thunks'
+                // chains (publishToAllThunkFrames).  Once THIS thunk
+                // is Evaluated, the Bindings is no longer "in
+                // construction" — it's a finalized value.  Other
+                // thunks' chains shouldn't keep this Bindings as
+                // their "partial WHNF" approximation.
+                //
+                // Concrete bug this fixes: qt5-packages.nix:35's
+                // `attrs = { inherit (pkgs) lib fetchurl; ... }`.
+                // When attrs's REC_INIT_TAIL fires, attrs's bindings
+                // gets registered with pkgs's chain (because pkgs's
+                // thunk is on the call stack as Suspended/Black).
+                // attrs's bindings has `lib` -> T_lib (the
+                // inherit-from select thunk) which itself reads
+                // pkgs.lib.  Without this cleanup, after attrs's
+                // OP_RETURN, pkgs's chain.back() = attrs's bindings,
+                // and a future T_lib force triggering STG WHNF
+                // recovery on pkgs returns attrs's bindings → select
+                // lib → T_lib (cycle).
+                //
+                // STG analog: when an indirect thunk forwards to
+                // another thunk's value, the indirect's "last seen
+                // shape" is updated; old shapes are no longer
+                // visible.  For us, "old shapes" are stale partial
+                // bindings registered cross-thunk.
+                //
+                // Gated by NIX_V3_NO_CROSS_CHAIN_CLEANUP=1 for
+                // bisecting any regression.
+                if (retVal.tag() == Tag::Attrs && retVal.payload.bindings) {
+                    static const bool s_noCleanup =
+                        std::getenv("NIX_V3_NO_CROSS_CHAIN_CLEANUP") != nullptr;
+                    if (!s_noCleanup) {
+                        Bindings * b = retVal.payload.bindings;
+                        auto & reg = partialBindingsRegistry();
+                        for (auto & [t, chain] : reg) {
+                            chain.erase(
+                                std::remove(chain.begin(), chain.end(), b),
+                                chain.end());
+                        }
+                    }
                 }
 
                 // WC-38: the legacy "return-chain push" -- eagerly
@@ -4209,6 +4332,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         if (!onMyFrames) {
                             push(vm, Value::vBlackhole);
                             break;
+                        }
+                        // #558 (2026-05-10) STG WHNF recovery in OP_FORCE.
+                        // Mirrors forceValue's recovery — when the thunk
+                        // is on our own frames AND has registered partial
+                        // Bindings, return the most-informative chain
+                        // entry (MAX-SIZE) as Tag::Attrs.  Lets the
+                        // dispatch loop continue without throwing.
+                        static const bool s_noStgWhnfFp =
+                            std::getenv("NIX_V3_NO_STG_WHNF") != nullptr;
+                        if (!s_noStgWhnfFp) {
+                            auto & reg = partialBindingsRegistry();
+                            auto pIt = reg.find(t);
+                            if (pIt != reg.end() && !pIt->second.empty()) {
+                                Value recovered;
+                                recovered.tag_payload =
+                                    static_cast<uint64_t>(Tag::Attrs);
+                                recovered.payload.bindings = pIt->second.back();
+                                vm.valueStack.back() = recovered;
+                                break;
+                            }
                         }
                     }
                 }
@@ -4918,6 +5061,44 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // (vm.cc:withLookup) but for direct Select access.  Both
             // paths share the same registry chain (populated by
             // OP_ATTRS_REC_INIT_TAIL via publishToAllThunkFrames).
+            // #558 (2026-05-10) Chase Evaluated thunks to find a
+            // potentially-Black target.  When `attrs` is a thunk that
+            // was Evaluated to another thunk (e.g., the inherit-from
+            // cache thunk's `evaluated` was set to a recovered
+            // Tag::Thunk for the outer Black fix-point), the chain
+            // peek path SHOULD fire on the chased target.  Without
+            // this chase, we'd see Tag::Attrs (from STG WHNF's
+            // recovery in the cache thunk's body) which doesn't have
+            // all the chain layers' keys.
+            {
+                Value chase = attrs;
+                int hops = 0;
+                while (hops < 8
+                       && chase.isThunk()
+                       && chase.payload.thunk
+                       && chase.payload.thunk->state == ThunkState::Evaluated
+                       && chase.payload.thunk->evaluated.isThunk())
+                {
+                    chase = chase.payload.thunk->evaluated;
+                    ++hops;
+                }
+                if (chase.isThunk()
+                    && chase.payload.thunk
+                    && chase.payload.thunk->state == ThunkState::Blackhole)
+                {
+                    auto & reg = partialBindingsRegistry();
+                    auto it = reg.find(chase.payload.thunk);
+                    if (it != reg.end()) {
+                        if (auto * v = lookupInPartialChain(
+                                it->second,
+                                static_cast<SymbolId>(operand))) {
+                            push(vm, *v);
+                            ip++;
+                            break;
+                        }
+                    }
+                }
+            }
             if (attrs.isThunk() && attrs.payload.thunk
                 && attrs.payload.thunk->state == ThunkState::Blackhole)
             {
@@ -4927,6 +5108,28 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (auto * v = lookupInPartialChain(
                             it->second,
                             static_cast<SymbolId>(operand))) {
+                        // Diagnostic: when chain peek returns a thunk
+                        // value (potentially the cycle-creating value),
+                        // log the source thunk + bindings.
+                        // V3_DBG_PEEK_THUNK=1.
+                        static const bool s_dbgPeekThunk =
+                            std::getenv("V3_DBG_PEEK_THUNK") != nullptr;
+                        if (s_dbgPeekThunk && v->isThunk()) {
+                            const auto & st = ir::globalSymbolTable();
+                            std::fprintf(stderr,
+                                "v3 OP_ATTRS_SELECT chain-peek: source=%p sym='%s' result-tag=%d result-thunk=%p chain-depth=%zu\n",
+                                (void *)attrs.payload.thunk,
+                                operand < st.size() ? st[operand].c_str() : "?",
+                                (int)v->tag(),
+                                (void *)v->payload.thunk,
+                                it->second.size());
+                            for (size_t li = 0; li < it->second.size(); ++li) {
+                                Bindings * b = it->second[li];
+                                std::fprintf(stderr,
+                                    "  layer[%zu] bindings=%p size=%u\n",
+                                    li, (void *)b, b ? b->size : 0);
+                            }
+                        }
                         push(vm, *v);
                         ip++;  // consume the icIdx operand word
                         break;
@@ -4958,8 +5161,47 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     throw;
                 }
             }
-            if (!attrs.isAttrs())
+            if (!attrs.isAttrs()) {
+                // #558 (2026-05-10) diagnostic: log tag + symbol + frame
+                // chain when a Select fails on a non-attrs value.  Used
+                // to root-cause the v3-vs-TW divergence on nixpkgs.
+                static const bool s_dbgSelFail =
+                    std::getenv("V3_DBG_SELECT_FAIL") != nullptr;
+                if (s_dbgSelFail) {
+                    const auto & st = ir::globalSymbolTable();
+                    std::fprintf(stderr,
+                        "v3 OP_ATTRS_SELECT: not an attrset (tag=%d) "
+                        "looking up '%s' (frames=%zu)\n",
+                        (int)attrs.tag(),
+                        operand < st.size() ? st[operand].c_str() : "?",
+                        vm.frames.size());
+                    size_t lim = vm.frames.size();
+                    for (size_t fi = lim; fi > 0 && fi + 12 > lim; --fi) {
+                        const auto & frD = vm.frames[fi - 1];
+                        const LambdaDescriptor * d = nullptr;
+                        if (frD.thunk
+                            && (frD.thunk->state == ThunkState::Suspended
+                                || frD.thunk->state == ThunkState::Blackhole))
+                            d = frD.thunk->suspended.desc;
+                        else if (frD.closure)
+                            d = frD.closure->desc;
+                        const PosSnapshot * ps =
+                            d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                        std::fprintf(stderr,
+                            "  [%zu] %s ip=%u thunk=%p flags=%u %s:%u:%u\n",
+                            fi - 1,
+                            d && !d->name.empty() ? d->name.c_str() : "<?>",
+                            frD.ip,
+                            (void *)frD.thunk,
+                            (unsigned)frD.flags,
+                            (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                            ps ? ps->line : 0u,
+                            ps ? ps->column : 0u);
+                    }
+                    std::fflush(stderr);
+                }
                 throw std::runtime_error("v3 OP_ATTRS_SELECT: not an attrset");
+            }
             uint32_t icIdx = cu->code[ip++];
             // REVIEW §3: IC entries key on (Bindings* shape pointer +
             // slot index + sym).  Safe because Bindings::entries is a
@@ -7451,6 +7693,22 @@ Value forceValue(VMState & vm, Value v)
                                     vm.frames.size(),
                                     (unsigned long long)hits);
                         }
+                        static const bool s_dbgVBHProd2 =
+                            std::getenv("V3_DBG_VBH_PROD") != nullptr;
+                        if (s_dbgVBHProd2) {
+                            const auto * d = (t->state == ThunkState::Suspended
+                                              || t->state == ThunkState::Blackhole)
+                                ? t->suspended.desc : nullptr;
+                            const PosSnapshot * ps =
+                                d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                            std::fprintf(stderr,
+                                "v3 forceValue→vBlackhole(cross-stack): thunk=%p name='%s' pos=%s:%u:%u\n",
+                                (void *)t,
+                                d && !d->name.empty() ? d->name.c_str() : "<?>",
+                                (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                                ps ? ps->line : 0u,
+                                ps ? ps->column : 0u);
+                        }
                         return Value::vBlackhole;
                     }
                     // #558 (2026-05-10) STG-style "reached WHNF" recovery.
@@ -7490,6 +7748,31 @@ Value forceValue(VMState & vm, Value v)
                             // eventual value.  Pointers (not copies), so
                             // subsequent SETs into the chain entry's
                             // bindings are visible.
+                            static const bool s_dbgWhnf =
+                                std::getenv("V3_DBG_WHNF_RECOVERY") != nullptr;
+                            if (s_dbgWhnf) {
+                                const auto & st = ir::globalSymbolTable();
+                                std::fprintf(stderr,
+                                    "v3 STG WHNF recovery: thunk=%p chain-depth=%zu\n",
+                                    (void *)t,
+                                    it->second.size());
+                                for (size_t li = 0; li < it->second.size(); ++li) {
+                                    Bindings * b = it->second[li];
+                                    std::fprintf(stderr,
+                                        "  layer[%zu] bindings=%p size=%u keys=[",
+                                        li, (void *)b, b ? b->size : 0);
+                                    if (b) {
+                                        for (uint32_t i = 0; i < b->size && i < 8; ++i) {
+                                            SymbolId nm = b->entries[i].name;
+                                            std::fprintf(stderr, "%s%s",
+                                                i ? "," : "",
+                                                nm < st.size() ? st[nm].c_str() : "?");
+                                        }
+                                        if (b->size > 8) std::fprintf(stderr, ",...");
+                                    }
+                                    std::fprintf(stderr, "]\n");
+                                }
+                            }
                             static const bool s_dbgBhv =
                                 std::getenv("V3_DBG_BLACKHOLE_AS_VALUE") != nullptr;
                             if (s_dbgBhv) {
