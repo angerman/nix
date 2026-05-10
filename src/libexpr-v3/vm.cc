@@ -1463,19 +1463,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         && std::getenv("NIX_V3_NURSERY_SCAVENGE")[0] != '0';
     const bool kNurseryGate = s_kNurseryOn_static && s_kScavengeOn_static
                               && exitDepth == 0;
+    // Cache the per-thread Nursery* once per dispatchLoop entry to
+    // avoid the thread_local re-resolution per iteration (Darwin's
+    // tlv_atomic_thunk is cheap but not free; on fib33 the per-
+    // iteration cost was visible in -fprofile-generate runs).
+    // `nullptr` when the gate is off — the check below short-circuits.
+    Nursery * const nursery = kNurseryGate ? &threadNursery() : nullptr;
     while (running) {
-        // Phase C scavenge trigger.  Only inspected when
-        // NIX_V3_NURSERY_SCAVENGE=1.  shouldScavenge() is a cheap
-        // arithmetic compare; under -O2 the whole branch folds into
-        // a no-op when the gate is off.
-        if (__builtin_expect(kNurseryGate, 0)) [[unlikely]] {
-            if (threadNursery().shouldScavenge()) {
+        // Phase C scavenge trigger.  Only inspected when the gate
+        // is on (kNurseryGate covers env-var + exitDepth == 0).
+        // The shouldScavenge() body is a small arithmetic compare;
+        // under -O2 with the [[unlikely]] hint the whole branch
+        // folds to a single conditional jump on the hot path.
+        if (__builtin_expect(nursery != nullptr, 0)) [[unlikely]] {
+            if (nursery->shouldScavenge()) {
                 // Sync ip into the frame so the scavenger walks a
                 // consistent VM state.  ip is a per-iteration
                 // running counter; valueStack/withStack/frames are
                 // already source-of-truth.
                 if (!vm.frames.empty()) vm.frames.back().ip = ip;
-                if (threadNursery().maybeScavenge(vm)) {
+                if (nursery->maybeScavenge(vm)) {
                     // Frame pointers may have been forwarded.  Re-
                     // read the dispatch locals from the top frame.
                     if (!vm.frames.empty()) {

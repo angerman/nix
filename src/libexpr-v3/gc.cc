@@ -68,19 +68,46 @@ enum GrayKind : uint8_t {
 
 struct Gray { void * ptr; uint8_t kind; };
 
-/// Per-scavenge state.  Created on the stack inside
-/// `scavengeNursery`; lifetime is bounded by that call.
+/// Persistent per-thread scratch buffers.  Reused across scavenge
+/// calls (cleared at the start of each one, capacity retained).
+/// Cuts per-scavenge malloc/free traffic from O(reachable) buckets +
+/// O(reachable) hashes per pass to amortised zero — the buffers grow
+/// to the high-water-mark of the eval and stay there.  Material
+/// under aggressive scavenge (small nursery, frequent reclaims).
+struct ScavengeBuffers
+{
+    std::unordered_map<void *, void *> forward;
+    std::unordered_set<void *>         walked;
+    std::vector<Gray>                  graylist;
+
+    void clear()
+    {
+        forward.clear();
+        walked.clear();
+        graylist.clear();
+    }
+};
+
+ScavengeBuffers & threadScavengeBuffers() noexcept
+{
+    thread_local ScavengeBuffers b;
+    return b;
+}
+
+/// Per-scavenge state — references into the thread-local
+/// `ScavengeBuffers` above so we don't allocate fresh containers
+/// on every call.  Lifetime is bounded by `scavengeNursery`.
 struct Scavenger
 {
     Nursery & n;
     VMState & vm;
     /// nursery oldPtr -> tenured newPtr (lookup before copy)
-    std::unordered_map<void *, void *> forward;
+    std::unordered_map<void *, void *> & forward;
     /// objects already queued for walk (deduplication for both
     /// freshly-copied tenured AND originally-tenured paths)
-    std::unordered_set<void *> walked;
+    std::unordered_set<void *> & walked;
     /// queued objects to walk in `drain()`
-    std::vector<Gray> graylist;
+    std::vector<Gray> & graylist;
 
     // -- pointer forwarders (no recursion; just copy + queue) ----
 
@@ -368,10 +395,12 @@ void Scavenger::run()
 
     drain();
 
-    // -- Stage 3: reset bump pointer, drop forward map ---------
+    // -- Stage 3: reset bump pointer ----------------------------
+    // forward / walked / graylist live in `threadScavengeBuffers()`
+    // and will be cleared by the next call to `scavengeNursery`.
+    // Leaving them populated until then is harmless and saves the
+    // hash-table hashing-pass that `clear()` does when called now.
 
-    forward.clear();
-    walked.clear();
     n.resetBumpAfterScavenge();
 }
 
@@ -382,7 +411,9 @@ void scavengeNursery(Nursery & n, VMState & vm) noexcept
     static const bool s_dbg = std::getenv("V3_DBG_NURSERY") != nullptr;
     Nursery::Stats pre{};
     if (s_dbg) pre = n.stats();
-    Scavenger sc{n, vm, {}, {}, {}};
+    ScavengeBuffers & buf = threadScavengeBuffers();
+    buf.clear();
+    Scavenger sc{n, vm, buf.forward, buf.walked, buf.graylist};
     sc.run();
     // V3_DBG_NURSERY=1 — print one line per scavenge with the
     // forward-map size + tenured-walk size so we can verify the
