@@ -381,12 +381,37 @@ suite.  We can pause between any two phases.
      O(reachable tenured) per scavenge — accepted for v1 since
      the priority was correctness; Phase D's cell registry will
      bound this to O(remembered cells).
+   - **`exitDepth == 0` gate**: scavenge only fires from the
+     outermost `dispatchLoop`.  Inner `dispatchLoop` invocations
+     (re-entered via `forceValue`, `runOnExistingVm`,
+     `runFunction`, or any TW→v3 bridge) hold v3 nursery
+     pointers in C-stack locals (`Value arg = pop(vm), fun =
+     pop(vm); ... fun = forceValue(vm, fun); ... use arg`) that
+     are NOT in any walked root set.  A scavenge during the
+     inner loop would orphan those C-locals.  The gate keeps
+     scavenge confined to the outer loop's iteration boundary
+     where opcode handlers have already run to completion.
+     Cost: re-entry chains let the nursery fill to its overflow
+     ceiling; the next outer iteration reclaims.  Acceptable
+     because re-entry depth is bounded by the call chain.
+     A future shadow-stack of "Rooted<Value>" wrappers would let
+     us scavenge from inner loops too.
   Validation (2026-05-10):
-   - `run-nursery-tests.sh` 14/14 (8 Phase A + 6 Phase C added).
+   - `run-nursery-tests.sh` 16/16 (8 Phase A + 8 Phase C added,
+     including p7/p8 for the exitDepth gate).
    - `run-direct-eval-tests.sh` 26/26 under
      `NIX_V3_NURSERY_SCAVENGE=1 NIX_V3_NURSERY_SIZE=2`.
    - `run-cutover-parity-tests.sh` 142/142 under same env.
    - `run-let-rec-publish-split-tests.sh` 11/11 under same env.
+   - `V3_DBG_NURSERY=1` confirms scavenge fires on the outermost
+     loop with full reclamation (forwarded=0 walked=0 on a
+     drained foldl' workload, used-pre ≈ threshold).
+   - Latent Phase A bug discovered + fixed: `tryAlloc` gated
+     `initLazy()` behind `!enabled`, so the nursery silently
+     fell back to tenured even with `NIX_V3_NURSERY=1` set.
+     Phase A's tests passed because they only checked result
+     equality between on/off, which is trivially true when
+     "on" is a no-op.
 
 - **Phase D: not yet started.**  Cell registry + walk.
 
