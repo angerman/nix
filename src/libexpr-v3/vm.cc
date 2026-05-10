@@ -3672,8 +3672,48 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // to assign).  Storing self into evaluated would make
                 // subsequent forceValue calls spin forever in the
                 // chase loop above.  Match tree-walker by raising.
-                if (retVal.isThunk() && retVal.payload.thunk == fr.thunk)
-                    throw std::runtime_error("v3 OP_RETURN: infinite recursion (thunk evaluates to itself)");
+                if (retVal.isThunk() && retVal.payload.thunk == fr.thunk) {
+                    // Diagnostic: gated on V3_DBG_RETURN_SELF=1.
+                    if (std::getenv("V3_DBG_RETURN_SELF")) {
+                        const LambdaDescriptor * d = fr.thunk
+                            && (fr.thunk->state == ThunkState::Suspended
+                                || fr.thunk->state == ThunkState::Blackhole)
+                            ? fr.thunk->suspended.desc : nullptr;
+                        const PosSnapshot * ps =
+                            d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                        std::fprintf(stderr,
+                            "v3 OP_RETURN self-cycle: thunk=%p name='%s' pos=%s:%u:%u state=%d retTag=%d\n",
+                            (void *)fr.thunk,
+                            d && !d->name.empty() ? d->name.c_str() : "<?>",
+                            (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                            ps ? ps->line : 0u,
+                            ps ? ps->column : 0u,
+                            (int)fr.thunk->state,
+                            (int)retVal.tag());
+                    }
+                    // #558 (2026-05-10): if this thunk has a registered
+                    // partial Bindings (its body's REC_INIT_TAIL fired
+                    // earlier — the STG-style "reached WHNF" point),
+                    // recover by treating the WHNF as the actual value.
+                    // The body's apparent self-return arose because the
+                    // body's tail used a fix-point reference (`let x =
+                    // f x; in x`) where the consumer of x within f
+                    // hit the STG recovery path; the eventual return
+                    // value chase resolved through that recovery back
+                    // to the same thunk.  The REAL value is the
+                    // partial Bindings.
+                    auto & reg = partialBindingsRegistry();
+                    auto pIt = reg.find(fr.thunk);
+                    if (pIt != reg.end() && !pIt->second.empty()) {
+                        Value recovered;
+                        recovered.tag_payload =
+                            static_cast<uint64_t>(Tag::Attrs);
+                        recovered.payload.bindings = pIt->second.back();
+                        retVal = recovered;
+                    } else {
+                        throw std::runtime_error("v3 OP_RETURN: infinite recursion (thunk evaluates to itself)");
+                    }
+                }
                 // V3_DBG_STORE_PREVSTAGE: trace any thunk that gets
                 // evaluated to a Closure whose desc is "prevStage" and
                 // codeOffset 3099, nUp=0 — used to isolate WC-37.
@@ -7378,7 +7418,60 @@ Value forceValue(VMState & vm, Value v)
                         }
                         return Value::vBlackhole;
                     }
-                    // Local cycle — fall through to throw.
+                    // #558 (2026-05-10) STG-style "reached WHNF" recovery.
+                    //
+                    // The thunk IS on our own call stack — a real cycle
+                    // from forceValue's perspective.  But if the thunk
+                    // has reached WHNF (its `OP_ATTRS_REC_INIT_TAIL`
+                    // already fired and registered the partial Bindings
+                    // shape), we can RETURN that shape as the thunk's
+                    // value — the entries are progressively filled in
+                    // place via OP_ATTRS_REC_SET, so consumers see the
+                    // currently-known fields through the same Bindings*.
+                    //
+                    // STG analog: a constructor allocation reaches WHNF
+                    // even when the constructor's lazy fields are still
+                    // unevaluated.  Forcing the thunk again returns the
+                    // already-allocated cell.  For Nix attrsets,
+                    // OP_ATTRS_REC_INIT_TAIL plays the role of the
+                    // constructor allocation; its trailer (sorted name
+                    // list) defines the SHAPE.
+                    //
+                    // Without this, lib.fix's `let x = f x; in x` cycles
+                    // when something deep inside f's body re-projects
+                    // through x — projections would force x → throws.
+                    // With this, the projection sees x's currently-known
+                    // shape (the merged // result so far) and proceeds.
+                    auto & reg = partialBindingsRegistry();
+                    auto it = reg.find(t);
+                    if (it != reg.end() && !it->second.empty()) {
+                        // Use the LATEST chain entry — it represents the
+                        // most recent layer's contribution to t's
+                        // eventual value.  The entries are pointers
+                        // (not copies), so subsequent SETs into the
+                        // chain entry's bindings will be visible
+                        // through this returned Value.
+                        static const bool s_dbgBhv =
+                            std::getenv("V3_DBG_BLACKHOLE_AS_VALUE") != nullptr;
+                        if (s_dbgBhv) {
+                            static thread_local uint64_t hits = 0;
+                            if (++hits == 1 || (hits & (hits - 1)) == 0)
+                                std::fprintf(stderr,
+                                    "v3 blackhole-as-WHNF (self-frame): thunk=%p "
+                                    "bindings=%p size=%u (hits=%llu)\n",
+                                    (void *)t,
+                                    (void *)it->second.back(),
+                                    (unsigned)it->second.back()->size,
+                                    (unsigned long long)hits);
+                        }
+                        Value recovered;
+                        recovered.tag_payload =
+                            static_cast<uint64_t>(Tag::Attrs);
+                        recovered.payload.bindings = it->second.back();
+                        return recovered;
+                    }
+                    // Local cycle without registered partial Bindings —
+                    // fall through to throw.
                 }
             }
 
