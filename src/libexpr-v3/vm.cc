@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <limits>
 #include <set>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -123,6 +124,80 @@ inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
 // SET via OP_ATTRS_REC_SET — STG-style "selector thunk" semantics
 // for `with self;` over a mid-construction recAttrs.
 inline std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry();
+
+// #548c (2026-05-10) per-CU registry for the alloc/force atexit dump.
+// V3_DBG_ALLOC_DUMP=1 enables.  At process exit, top-N descriptors
+// by (allocCount + forceCount) are dumped with file:line:col, so we
+// can identify hot re-instantiation sites.  Populated lazily as
+// dispatchLoop sees CUs (the first OP_MAKE_THUNK with a CU pointer
+// adds it to the set).
+inline std::unordered_set<const CompilationUnit *> & cuRegistry()
+{
+    static thread_local std::unordered_set<const CompilationUnit *> s;
+    return s;
+}
+static const bool g_dbgAllocDump =
+    std::getenv("V3_DBG_ALLOC_DUMP") != nullptr;
+
+// #548c (2026-05-10) atexit dump.  Walks every CU registered above
+// and every LambdaDescriptor in each CU's lambdas vector; emits the
+// top-N by (allocCount + forceCount).  Source positions are
+// resolved via the global posSnapshotPool so output rows look like
+//   alloc=12345 force=12345 setType@/nix/store/.../parse.nix:64:44
+// suitable for one-pass scanning.
+struct AllocDumpInstaller {
+    AllocDumpInstaller() {
+        if (g_dbgAllocDump) {
+            std::atexit([] {
+                struct Row {
+                    uint64_t alloc;
+                    uint64_t force;
+                    const LambdaDescriptor * desc;
+                };
+                std::vector<Row> rows;
+                for (auto * cu : cuRegistry()) {
+                    if (!cu) continue;
+                    for (const auto & ld : cu->lambdas) {
+                        if (ld.allocCount == 0 && ld.forceCount == 0)
+                            continue;
+                        rows.push_back({ld.allocCount, ld.forceCount, &ld});
+                    }
+                }
+                std::sort(rows.begin(), rows.end(),
+                    [](const Row & a, const Row & b) {
+                        return (a.alloc + a.force) > (b.alloc + b.force);
+                    });
+                size_t lim = std::min<size_t>(rows.size(), 50);
+                std::fprintf(stderr,
+                    "\nv3 V3_DBG_ALLOC_DUMP: top %zu/%zu lambdas by (alloc+force)\n",
+                    lim, rows.size());
+                for (size_t i = 0; i < lim; ++i) {
+                    const auto & r = rows[i];
+                    const auto * d = r.desc;
+                    const char * name = d->name.empty()
+                        ? "<anon>" : d->name.c_str();
+                    const PosSnapshot * ps = resolvePosSnapshot(d->posHandle);
+                    char buf[256];
+                    if (ps && !ps->file.empty()) {
+                        std::snprintf(buf, sizeof buf,
+                            "%s:%u:%u",
+                            ps->file.c_str(), ps->line, ps->column);
+                    } else {
+                        std::snprintf(buf, sizeof buf,
+                            "<no-pos> codeOff=%u", d->codeOffset);
+                    }
+                    std::fprintf(stderr,
+                        "  alloc=%llu force=%llu %s @ %s\n",
+                        (unsigned long long)r.alloc,
+                        (unsigned long long)r.force,
+                        name, buf);
+                }
+                std::fflush(stderr);
+            });
+        }
+    }
+};
+static AllocDumpInstaller s_allocDumpInstaller;
 
 [[gnu::always_inline]]
 inline Value pop(VMState & vm)
@@ -1966,6 +2041,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
             t->suspended.desc = &cu->lambdas[funcIdx];
+            // #548c diagnostic: track per-descriptor allocCount so the
+            // atexit dump can reveal hot re-instantiation sites.
+            ++cu->lambdas[funcIdx].allocCount;
+            if (__builtin_expect(g_dbgAllocDump, 0)) {
+                cuRegistry().insert(cu);
+            }
             t->suspended.cu = cu;
             // V3_DBG_TRACE_THUNK_X -- track creation of every thunk into
             // a process-wide map (thunk_ptr -> (funcIdx, codeOff,
@@ -3926,6 +4007,50 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             !desc->name.empty() ? desc->name.c_str() : "<anon>",
                             (unsigned long long)desc->forceCount,
                             posBuf);
+                        // #548c (2026-05-10): if V3_DBG_ALLOC_DUMP is
+                        // also set, list the top-10 descriptors by
+                        // (alloc + force) right here — atexit doesn't
+                        // fire on `timeout` SIGKILL, so emitting at
+                        // each progress tick guarantees we capture the
+                        // hot pattern before the run terminates.
+                        if (g_dbgAllocDump) {
+                            struct R { uint64_t a, f; const LambdaDescriptor * d; };
+                            std::vector<R> rows;
+                            for (auto * cui : cuRegistry()) {
+                                if (!cui) continue;
+                                for (const auto & ld : cui->lambdas) {
+                                    if (ld.allocCount + ld.forceCount < 1000)
+                                        continue;
+                                    rows.push_back({ld.allocCount, ld.forceCount, &ld});
+                                }
+                            }
+                            std::sort(rows.begin(), rows.end(),
+                                [](const R & x, const R & y) {
+                                    return (x.a + x.f) > (y.a + y.f);
+                                });
+                            size_t lim = std::min<size_t>(rows.size(), 10);
+                            std::fprintf(stderr,
+                                "  top-10 hot descriptors:\n");
+                            for (size_t i = 0; i < lim; ++i) {
+                                const auto & r = rows[i];
+                                const PosSnapshot * pps = resolvePosSnapshot(r.d->posHandle);
+                                char b[256];
+                                if (pps && !pps->file.empty())
+                                    std::snprintf(b, sizeof b,
+                                        "%s:%u:%u",
+                                        pps->file.c_str(), pps->line, pps->column);
+                                else
+                                    std::snprintf(b, sizeof b,
+                                        "<no-pos> codeOff=%u",
+                                        r.d->codeOffset);
+                                std::fprintf(stderr,
+                                    "    a=%llu f=%llu %s @ %s\n",
+                                    (unsigned long long)r.a,
+                                    (unsigned long long)r.f,
+                                    !r.d->name.empty() ? r.d->name.c_str() : "<anon>",
+                                    b);
+                            }
+                        }
                     }
                 }
             }

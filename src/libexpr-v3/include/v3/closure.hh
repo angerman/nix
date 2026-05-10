@@ -213,6 +213,23 @@ struct LambdaDescriptor
     /// logical identity.  Single-threaded VM, no atomics needed.
     mutable uint64_t forceCount = 0;
 
+    /// #548c diagnostic (2026-05-10): bumped at every OP_MAKE_THUNK
+    /// whose funcIdx points at this descriptor.  When dumped at
+    /// process exit (atexit), allocCount reveals descriptors that
+    /// are re-instantiated many times — i.e., `let x = E` bindings
+    /// where the surrounding scope is entered many times despite
+    /// `x` being conceptually a fix-point.  A high allocCount with
+    /// high forceCount but allocCount > forceCount indicates a
+    /// sharing failure: the binding is being re-instantiated more
+    /// times than its results are used.  When allocCount ≈ forceCount
+    /// AND both are huge, the surrounding scope is hot-looped (the
+    /// real failure to investigate).
+    ///
+    /// `mutable` for the same reason as forceCount: only OP_MAKE_THUNK
+    /// has a `LambdaDescriptor *` (not `const`); other sites see it
+    /// as `const` so the field is statistical only.
+    mutable uint64_t allocCount = 0;
+
     /// #424: selector lambda specialisation.  When non-zero, the
     /// lambda body is exactly `paramVar.<selectorSym>` -- the emit-
     /// time peephole detected the canonical bytecode shape:
