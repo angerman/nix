@@ -778,7 +778,25 @@ struct Emitter
         // a clean stack to work on.
         flushAllDeferred();
         // Emit REC_INIT with sorted (name, pos) trailer.
-        unit.code.push_back(encode(OP_ATTRS_REC_INIT, static_cast<uint32_t>(n)));
+        //
+        // #558: choose between OP_ATTRS_REC_INIT_TAIL (publishes to
+        // every thunk frame on the call stack — Black + Suspended,
+        // first-wins) and OP_ATTRS_REC_INIT (publishes only to the
+        // innermost Black thunk frame).  The TAIL variant fires when
+        // this AttrSet is the function's tail-return value — i.e.
+        // forcing the surrounding thunk produces THIS AttrSet's
+        // Bindings.  Outer thunks waiting for that thunk benefit
+        // from seeing our partial Bindings via the partial-Bindings
+        // peek path in withLookup.
+        //
+        // The non-tail variant is conservative: it preserves the
+        // original innermost-Black-only registration so sub-attrsets
+        // (let-bindings, function args) don't pollute outer thunks'
+        // registry entries with intermediate sub-expression shapes.
+        const Op initOp =
+            e.isFunctionReturn ? OP_ATTRS_REC_INIT_TAIL
+                               : OP_ATTRS_REC_INIT;
+        unit.code.push_back(encode(initOp, static_cast<uint32_t>(n)));
         for (uint32_t k = 0; k < n; ++k) {
             const auto & en = e.entries[sortedIdx[k]];
             unit.code.push_back(en.name);

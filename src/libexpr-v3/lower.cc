@@ -524,7 +524,78 @@ struct Lowerer
 
         ir::VarId rv = forceVal(lowerExpr(e));
         setReturn(rv);
+        // #558: post-lower pass — mark each function's tail-return
+        // AttrSet so emit can choose the right opcode.
+        markTailReturnAttrSets();
         return std::move(m);
+    }
+
+    // ---------------------------------------------------------------
+    // #558 post-lower analysis: tag the AttrSet that is each function's
+    // tail-return value (the value forcing the surrounding thunk
+    // produces) with `isFunctionReturn = true`.  This drives emit's
+    // choice of OP_ATTRS_REC_INIT_TAIL (publishes to all thunk frames)
+    // vs OP_ATTRS_REC_INIT (publishes only to innermost Black thunk).
+    //
+    // The analysis walks the entry block's terminal-return value
+    // through transparent wrappers (With, Assert, If) until it finds
+    // the underlying AttrSet binding.  For If, both branches are
+    // potential returns and both are marked.  For LetRec with
+    // hasBody=false (i.e. `rec { ... }` IS the value), the rec-attrs
+    // already publishes via its own OP_ATTRS_REC_INIT path; we don't
+    // need to mark it (LetRec doesn't have an AttrSet IR node, just a
+    // direct LetRec node which emit handles separately).
+    //
+    // Edge cases NOT yet handled:
+    //   - Tail return through a function call (e.g. `f x`); the
+    //     call's result is the return value but no AttrSet is built
+    //     in *this* function — the AttrSet is built in `f`'s body
+    //     (which gets its own marking pass).
+    //   - Tail return via Update (`A // B`); the result is a fresh
+    //     Bindings allocated by OP_ATTRS_UPDATE, not via REC_INIT,
+    //     so the publish path doesn't apply.
+    // ---------------------------------------------------------------
+    void markTailReturnAttrSets()
+    {
+        for (ir::FuncId fid = 0;
+             fid < (ir::FuncId)m.functions.size(); ++fid) {
+            ir::BlockId be = m.functions[fid].entryBlock;
+            if (be == ir::kInvalidBlock) continue;
+            markTailAttrSetInBlock(be);
+        }
+    }
+
+    void markTailAttrSetInBlock(ir::BlockId blkId)
+    {
+        if (blkId == ir::kInvalidBlock
+            || blkId >= m.blocks.size()) return;
+        auto & blk = m.blocks[blkId];
+        auto * ret = std::get_if<ir::TermReturn>(&blk.terminal);
+        if (!ret || ret->value == ir::kInvalid) return;
+        ir::VarId target = ret->value;
+        for (auto & bd : blk.bindings) {
+            if (bd.var != target) continue;
+            std::visit([&](auto & e) {
+                using T = std::decay_t<decltype(e)>;
+                if constexpr (std::is_same_v<T, ir::AttrSet>) {
+                    e.isFunctionReturn = true;
+                } else if constexpr (std::is_same_v<T, ir::With>) {
+                    // `with X; body` is transparent — the body's
+                    // terminal-return is the function's return.
+                    markTailAttrSetInBlock(e.bodyBlock);
+                } else if constexpr (std::is_same_v<T, ir::Assert>) {
+                    markTailAttrSetInBlock(e.bodyBlock);
+                } else if constexpr (std::is_same_v<T, ir::If>) {
+                    // Both branches are potential returns; mark each.
+                    markTailAttrSetInBlock(e.thenBlock);
+                    markTailAttrSetInBlock(e.elseBlock);
+                }
+                // Other expr kinds (App, Update, ConcatLists, etc.)
+                // produce values that aren't AttrSet REC_INIT outputs;
+                // the publish path doesn't apply.
+            }, bd.expr);
+            break;
+        }
     }
 
     // Dispatcher.

@@ -58,6 +58,7 @@ static const char * opName(Op op)
     case OP_ATTRS_INIT_DYN:    return "OP_ATTRS_INIT_DYN";
     case OP_ATTRS_REC_INIT:    return "OP_ATTRS_REC_INIT";
     case OP_ATTRS_LET_REC_INIT: return "OP_ATTRS_LET_REC_INIT";
+    case OP_ATTRS_REC_INIT_TAIL: return "OP_ATTRS_REC_INIT_TAIL";
     case OP_ATTRS_REC_SET:     return "OP_ATTRS_REC_SET";
     case OP_ATTRS_SELECT:      return "OP_ATTRS_SELECT";
     case OP_ATTRS_SELECT_DYN:  return "OP_ATTRS_SELECT_DYN";
@@ -124,6 +125,7 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
     }
     case OP_ATTRS_REC_INIT:
     case OP_ATTRS_LET_REC_INIT:
+    case OP_ATTRS_REC_INIT_TAIL:
         // n words: n SymbolId + n PosIdx32 pairs (2*n total).
         return 2 * operand;
     // OP_ATTRS_SELECT consumes 1 word for the inline-cache slot index.

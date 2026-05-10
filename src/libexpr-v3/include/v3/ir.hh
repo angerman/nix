@@ -188,6 +188,31 @@ struct AttrSet {
         bool     isInheritFrom = false;
     };
     std::vector<Entry> entries; // sorted ascending by SymbolId
+
+    /// #558 (2026-05-10): true iff this AttrSet is the eventual return
+    /// value of its enclosing function — i.e. forcing the surrounding
+    /// thunk produces this AttrSet's Bindings (modulo wrappers like
+    /// `with` or `assert` that don't change the value).
+    ///
+    /// Set by `markTailReturnAttrSets` (lower.cc) as a post-lower
+    /// analysis pass.  Consumed by `emitOne(AttrSet)` (emit.cc): true →
+    /// `OP_ATTRS_REC_INIT_TAIL` (publishes partial Bindings to all
+    /// thunk frames on the call stack, first-wins, so `with self;`-
+    /// style lookups through any outer thunk find this AttrSet's
+    /// in-progress Bindings); false → `OP_ATTRS_REC_INIT` (publishes
+    /// only to the innermost Black thunk, the legacy non-tail-return
+    /// behavior, which is conservative for sub-expression attrsets
+    /// that aren't the function's return value).
+    ///
+    /// Why this distinction matters: in lib.fix-style fix-points
+    /// (`let x = f x; in x`), the entire chain of thunks waiting for
+    /// `f x` to return is conceptually waiting for the function
+    /// body's tail-return AttrSet.  Sub-attrsets within that body
+    /// (let-bindings, function args) don't represent the chain's
+    /// expected value, so registering them with outer thunks would
+    /// falsely advertise sub-expression shapes via the partial-
+    /// Bindings peek path (vm.cc:withLookup).
+    bool isFunctionReturn = false;
 };
 
 /// #558 emit-order restructure: companion to `AttrSet` that emits the

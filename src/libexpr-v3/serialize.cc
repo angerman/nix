@@ -136,6 +136,7 @@ uint64_t opcodeTableFingerprint()
             {"OP_ATTRS_INIT_DYN",  OP_ATTRS_INIT_DYN},
             {"OP_ATTRS_REC_INIT",  OP_ATTRS_REC_INIT},
             {"OP_ATTRS_LET_REC_INIT", OP_ATTRS_LET_REC_INIT},
+            {"OP_ATTRS_REC_INIT_TAIL", OP_ATTRS_REC_INIT_TAIL},
             {"OP_ATTRS_REC_SET",   OP_ATTRS_REC_SET},
             {"OP_ATTRS_SELECT",    OP_ATTRS_SELECT},
             {"OP_ATTRS_SELECT_DYN", OP_ATTRS_SELECT_DYN},
@@ -272,7 +273,9 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
                 ip += 2;
             }
             ip += nDyn;
-        } else if (op == OP_ATTRS_REC_INIT || op == OP_ATTRS_LET_REC_INIT) {
+        } else if (op == OP_ATTRS_REC_INIT
+                   || op == OP_ATTRS_LET_REC_INIT
+                   || op == OP_ATTRS_REC_INIT_TAIL) {
             // Remap names + remember their old positions so we can
             // re-sort and propagate the permutation to the matching
             // OP_ATTRS_REC_SETs.  OP_ATTRS_LET_REC_INIT shares the

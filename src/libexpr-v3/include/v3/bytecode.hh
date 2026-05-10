@@ -222,6 +222,41 @@ enum Op : uint8_t
     /// in nixpkgs hello.name; see lode/CALLPACKAGE_BUG_2026-05-09.md).
     OP_ATTRS_LET_REC_INIT = 0x86, // [n:24]; data: 2n (name, pos) pairs
 
+    /// Bytecode-identical to OP_ATTRS_REC_INIT (allocates a placeholder
+    /// rec-attrset Bindings of size [n:24], with n trailing (SymbolId,
+    /// PosIdx) pairs in the same layout) BUT publishes the partial
+    /// Bindings to EVERY thunk frame on the call stack — Black AND
+    /// Suspended — using FIRST-WINS semantics.
+    ///
+    /// Emitted by the lowerer when this AttrSet is the function's
+    /// tail-return value (i.e. the value the surrounding thunk will
+    /// eventually evaluate to).  Outer thunks on the call stack are
+    /// transitively waiting for THIS AttrSet's value, so registering
+    /// it as their partial Bindings lets `with self;`-style lookups
+    /// resolve through any of them via the partial-Bindings peek path
+    /// (vm.cc:withLookup).
+    ///
+    /// Sub-attrsets (let-bindings, function args, intermediate
+    /// expressions) emit OP_ATTRS_REC_INIT instead — they don't
+    /// represent the function's eventual return value, so registering
+    /// them with outer thunks would falsely advertise sub-expression
+    /// shapes to consumers expecting the function's return.
+    ///
+    /// FIRST-WINS: when an outer thunk already has a registry entry
+    /// (e.g. from an earlier function's tail-return AttrSet that's
+    /// still on the call stack), we leave the existing entry in
+    /// place.  This preserves the outermost-tail-return property:
+    /// once super's body's REC_INIT_TAIL fires and registers super
+    /// with the surrounding lib.fix chain's thunks, later inner
+    /// function calls (e.g. helper thunks spawned during super body)
+    /// don't displace super's registration on those outer thunks.
+    /// They get to register on their OWN thunk (which super hasn't
+    /// touched), but not on x_thunk / prev_thunk / etc.
+    ///
+    /// See ir::AttrSet::isFunctionReturn for the lower-time tagging
+    /// that drives this opcode emission.
+    OP_ATTRS_REC_INIT_TAIL = 0x87, // [n:24]; data: 2n (name, pos) pairs
+
     // --- Strings --------------------------------------------------------
     OP_STR_CONCAT     = 0x90,  // [n:24] forceString stored in low bit of n; pops n parts
 

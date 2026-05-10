@@ -1254,81 +1254,30 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
         if (!isRecInit) return;
         Tag t = v.tag();
         if (t != Tag::Attrs || !v.payload.bindings) return;
-        // #558 (2026-05-10): register with EVERY thunk frame on the
-        // stack — Black AND Suspended — using INSERT-IF-ABSENT
-        // semantics.  The first AttrSet REC_INIT to fire for a given
-        // thunk wins; later REC_INITs for sub-attrsets do NOT
-        // overwrite.
+        // OP_ATTRS_REC_INIT (non-tail-return path).  Register with the
+        // INNERMOST Black thunk frame only.  This is the conservative
+        // choice for sub-expression attrsets: they aren't the
+        // function's eventual return value, so registering them with
+        // OUTER thunks (waiting for the function's return) would
+        // falsely advertise sub-expression shapes via the partial-
+        // Bindings peek path (vm.cc:withLookup).
         //
-        // Rationale: lib.fix-style fix-points produce a chain of
-        // thunks (final/prev_outer/.../prev_inner/super_lambda).
-        // The OUTERMOST (`final` / `x` in `let x = f x`) is what
-        // `with self;` derefs to — but it's NOT the innermost Black
-        // thunk during super's body execution, and may even be in
-        // Suspended state for the duration of `f x`'s evaluation
-        // (v3's force protocol marks Black only inside the immediate
-        // forceValue dispatch, not for the whole body).
-        //
-        // To make `with self;` find super's partial Bindings, we
-        // register super's Bindings with every thunk frame on the
-        // call stack at REC_INIT time — including Suspended.  But
-        // because nested REC_INITs (sub-attrsets inside super's body)
-        // would otherwise overwrite super's registration, we use
-        // FIRST-WINS: the OUTER (super's) REC_INIT fires before any
-        // nested sub-attrset's REC_INIT, so its registration is
-        // preserved.  Sub-attrsets never displace the outer
-        // attrset's view of the surrounding fix-point thunks.
-        //
-        // Correctness: stale entries become unreachable when their
-        // thunk transitions to Evaluated — withLookup's peek path
-        // gates on `state == Blackhole` (vm.cc:651).  The Suspended-
-        // → Blackhole → Evaluated transition is monotonic; a thunk
-        // never re-enters Suspended once it's left.  So a registry
-        // entry installed during a thunk's first activation is
-        // either consumed by an in-flight withLookup peek or becomes
-        // dead (never read) once the thunk completes.
-        //
-        // The first-wins property only matters for outer chain
-        // thunks; the innermost Black IS still registered (its first
-        // entry is super's, since super's REC_INIT fires before any
-        // sub-attrset's).  So the prior innermost-only behavior is
-        // a strict subset of this change.
-        static const bool s_dbg_reg =
-            std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
+        // Tail-return AttrSets emit OP_ATTRS_REC_INIT_TAIL instead,
+        // which calls publishToAllThunkFrames — see that path for the
+        // architectural rationale (#558).
         for (size_t i = vm.frames.size(); i > 0; --i) {
             CallFrame & fr = vm.frames[i - 1];
             if (!(fr.flags & CFF_THUNK_RETURN)) continue;
             if (!fr.thunk) continue;
-            // Register with Black AND Suspended thunks — see lib.fix
-            // `let x = f x;` analysis.  Evaluated thunks have a final
-            // value and would be stale registrations.
-            if (fr.thunk->state != ThunkState::Blackhole
-                && fr.thunk->state != ThunkState::Suspended) continue;
-            // LARGEST-WINS: keep whichever registration has more
-            // entries.  Sub-attrsets (small) don't displace super's
-            // (large) registration; super's registration doesn't
-            // shadow the function's actual tail-return result IF we
-            // ever register that.  This is a heuristic — the
-            // architecturally-correct fix is tail-position-only
-            // registration but that requires emitter cooperation
-            // (set a flag on the AttrSet binding when it's the
-            // function's tail-return).  Tracked as follow-up.
-            auto & reg = partialBindingsRegistry();
-            auto it = reg.find(fr.thunk);
-            bool replaced = false;
-            if (it == reg.end()) {
-                reg.emplace(fr.thunk, v.payload.bindings);
-                replaced = true;
-            } else if (it->second
-                       && it->second->size < v.payload.bindings->size) {
-                it->second = v.payload.bindings;
-                replaced = true;
-            }
-            if (s_dbg_reg && replaced) std::fprintf(stderr,
-                "v3 STG partialBindings: register thunk=%p state=%d bindings=%p size=%u\n",
-                (void *)fr.thunk, (int)fr.thunk->state,
-                (void *)v.payload.bindings,
+            if (fr.thunk->state != ThunkState::Blackhole) continue;
+            partialBindingsRegistry()[fr.thunk] = v.payload.bindings;
+            static const bool s_dbg_reg =
+                std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
+            if (s_dbg_reg) std::fprintf(stderr,
+                "v3 STG partialBindings: register thunk=%p bindings=%p size=%u\n",
+                (void *)fr.thunk, (void *)v.payload.bindings,
                 (unsigned)v.payload.bindings->size);
+            break;
         }
         return;
     }
@@ -1406,6 +1355,64 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
         fr.thunk->state = ThunkState::Evaluated;
         fr.thunk->evaluated = v;
         if (!s_publishAll) return;
+    }
+}
+
+/// #558: tail-return-AttrSet publish.  Register `v`'s Bindings with
+/// EVERY thunk frame on the call stack — Black AND Suspended — using
+/// FIRST-WINS semantics so an outer thunk's earlier registration
+/// (e.g. from a deeper function's tail-return) sticks.
+///
+/// Architectural rationale: lib.fix-style fix-points produce a chain
+/// of nested thunks (`final → prev_outer → ... → prev_inner →
+/// super_lambda`) all conceptually waiting for super's return value.
+/// When `with self;` derefs through the with-source slot, it can land
+/// on ANY of these thunks (depending on which is on the with-stack).
+/// Registering super's partial Bindings with each of them lets the
+/// withLookup partial-Bindings peek find the entries regardless of
+/// which thunk the slot derefs to.
+///
+/// Suspended-state inclusion: lib.fix's `let x = f x;` keeps `x` in
+/// Suspended state for the duration of `f x`'s evaluation (v3's
+/// force protocol marks Black only inside the immediate forceValue
+/// dispatch).  Without registering with Suspended thunks, x's slot
+/// derefs would miss the registry.
+///
+/// First-wins: when a function deeper in the call chain (e.g. a
+/// helper thunk spawned by super's body) later fires its OWN
+/// REC_INIT_TAIL, we don't want it to overwrite super's earlier
+/// registration on the OUTER chain thunks.  The helper's registration
+/// is correct only for ITSELF (its own thunk hasn't been registered
+/// yet, so first-wins lets it claim its own slot).  The outer chain
+/// keeps super.
+inline void publishToAllThunkFrames(VMState & vm, const Value & v)
+{
+    static const bool s_stgMode =
+        std::getenv("NIX_V3_NO_STG") == nullptr;
+    if (!s_stgMode) return;
+    Tag t = v.tag();
+    if (t != Tag::Attrs || !v.payload.bindings) return;
+    static const bool s_dbg_reg =
+        std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
+    auto & reg = partialBindingsRegistry();
+    for (size_t i = vm.frames.size(); i > 0; --i) {
+        CallFrame & fr = vm.frames[i - 1];
+        if (!(fr.flags & CFF_THUNK_RETURN)) continue;
+        if (!fr.thunk) continue;
+        // Register with Black AND Suspended thunks.  Evaluated thunks
+        // have a final value and would be stale registrations.
+        if (fr.thunk->state != ThunkState::Blackhole
+            && fr.thunk->state != ThunkState::Suspended) continue;
+        // First-wins: emplace returns false if the key was already
+        // present, leaving the existing entry alone.
+        auto [it, inserted] =
+            reg.emplace(fr.thunk, v.payload.bindings);
+        (void)it;
+        if (s_dbg_reg && inserted) std::fprintf(stderr,
+            "v3 STG partialBindings(TAIL): register thunk=%p state=%d bindings=%p size=%u\n",
+            (void *)fr.thunk, (int)fr.thunk->state,
+            (void *)v.payload.bindings,
+            (unsigned)v.payload.bindings->size);
     }
 }
 
@@ -4602,6 +4609,45 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
+            push(vm, v);
+            break;
+        }
+        case OP_ATTRS_REC_INIT_TAIL: {
+            // #558 (2026-05-10): tail-return-AttrSet variant.
+            // Bytecode-identical to OP_ATTRS_REC_INIT (allocates a
+            // Bindings(n) with placeholder values, n trailing (name,
+            // pos) pairs in the same layout) BUT registers the partial
+            // Bindings with EVERY thunk frame on the call stack —
+            // Black AND Suspended — using FIRST-WINS semantics.
+            //
+            // Emitted by the lowerer when the AttrSet IR's
+            // `isFunctionReturn` flag is true — i.e. this AttrSet IS
+            // the function body's tail-return value.  Outer thunks
+            // currently waiting for this function's return are
+            // therefore conceptually waiting for THIS AttrSet's
+            // value, so registering with all of them lets `with self;`
+            // / `with pkgs;`-style lookups find the in-progress
+            // entries via the partial-Bindings peek path
+            // (vm.cc:withLookup).
+            //
+            // See bytecode.hh OP_ATTRS_REC_INIT_TAIL doc + ir.hh
+            // AttrSet::isFunctionReturn doc for the complete design
+            // rationale.
+            uint32_t n = operand;
+            Bindings * b = Alloc::allocBindings(n);
+            allocStats().attrsetsAllocated++;
+            for (uint32_t i = 0; i < n; ++i) {
+                SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
+                uint32_t ps = cu->code[ip + 2 * i + 1];
+                b->entries[i].name = nm;
+                b->entries[i].value.mkNull();
+                recordAttrPos(b, nm, ps);
+            }
+            ip += 2 * n;
+            Value v;
+            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+            v.payload.bindings = b;
+            publishToAllThunkFrames(vm, v);
             push(vm, v);
             break;
         }
