@@ -47,14 +47,21 @@ struct VMState;
 /// preserved).  Phase C will add a scavenge pass that copies live
 /// nursery objects to the tenured arena and resets `next`.
 ///
-/// Nursery memory is malloc'd, NOT registered with Boehm via
-/// `GC_add_roots`.  This is intentional: nursery objects are
-/// short-lived; their roots are reachable through `VMState`'s C++
-/// references which are visible to Boehm's conservative C-stack
-/// scan.  Once we add scavenge, all surviving objects move to
-/// tenured (which IS Boehm-rooted), and the nursery itself never
-/// needs to be reclaimed by Boehm — we reuse the same buffer
-/// across scavenges.
+/// Nursery memory is malloc'd AND registered with Boehm via
+/// `GC_add_roots` at `initLazy` time.  Earlier design assumed
+/// Boehm's conservative C-stack scan would suffice: nursery
+/// objects' contents (Bridge `bridgeSrc` pointing at TW
+/// `nix::Value*`, Closure upvalues holding TW Values, etc.)
+/// would be reached through VMState's C-stack references.
+/// That assumption was wrong for cross-library exception paths —
+/// the `__cxa_rethrow` -> `_Unwind_RaiseException` chain in
+/// libc++abi can run while v3 nursery memory holds the only
+/// references to TW values, and Boehm reclaiming those values
+/// would leave dangling pointers that surface as SIGTRAP at
+/// rethrow boundaries.  Registering the nursery as a Boehm root
+/// closes that gap at zero perf cost (nursery memory never
+/// holds objects Boehm itself manages, so the GC scan over the
+/// nursery just walks zero-filled / aligned-payload bytes).
 class Nursery
 {
 public:
@@ -225,6 +232,39 @@ private:
             sizeBytes = 0;
             return;
         }
+#if NIX_USE_BOEHMGC
+        // CORRECTNESS CRITICAL: register the nursery as a Boehm root.
+        //
+        // The original Phase A design assumed Boehm's conservative
+        // C-stack scan would keep nursery objects' contents alive
+        // because all v3 roots transitively touch the C stack.
+        // That assumption is WRONG for libsForQt5-bypass + v3-direct:
+        // nursery `Closure::upvalues[]` and `Thunk::tail[]` cells
+        // hold `Tag::Thunk{Bridge}` Values pointing at TW
+        // (Boehm-managed) `nix::Value*`s, and the Bridge thunk
+        // header itself sits in nursery memory.  When Boehm runs
+        // its own collection (it can fire any time during the
+        // primop callback chain that bypass triggers), it walks
+        // the GC roots looking for live TW values.  The nursery
+        // is NOT a Boehm root, so the bridge's `bridgeSrc` ->
+        // `nix::Value*` chain is invisible; Boehm reclaims TW
+        // values that v3 still references.  Subsequent dereference
+        // through the Bridge segfaults / SIGTRAPs.
+        //
+        // Why the regression suite missed this: synthetic tests
+        // produce TW values only via known-rooted paths (TW eval
+        // owns the values; Boehm has its own roots into them).
+        // The libsForQt5 bypass + nixpkgs eval routes
+        // treeWalkerToV3 through chains where the only path to a
+        // TW value is via a v3 nursery cell.
+        //
+        // Why a 512 MB nursery still crashes (no scavenge fires):
+        // the bug is in the ROUTING (nursery memory invisible to
+        // Boehm), not the SCAVENGING.  Bigger nursery just gives
+        // Boehm more time to find the unrooted references and
+        // reclaim them mid-eval.
+        GC_add_roots(base, base + sizeBytes);
+#endif
         next = base;
         end  = base + sizeBytes;
     }
