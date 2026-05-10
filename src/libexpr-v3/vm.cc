@@ -7436,6 +7436,8 @@ Value forceValue(VMState & vm, Value v)
                     }
                     // #558 (2026-05-10) STG-style "reached WHNF" recovery.
                     //
+                    // Gated by NIX_V3_NO_STG_WHNF=1 (bisect kill switch).
+                    //
                     // The thunk IS on our own call stack — a real cycle
                     // from forceValue's perspective.  But if the thunk
                     // has reached WHNF (its `OP_ATTRS_REC_INIT_TAIL`
@@ -7458,33 +7460,36 @@ Value forceValue(VMState & vm, Value v)
                     // through x — projections would force x → throws.
                     // With this, the projection sees x's currently-known
                     // shape (the merged // result so far) and proceeds.
-                    auto & reg = partialBindingsRegistry();
-                    auto it = reg.find(t);
-                    if (it != reg.end() && !it->second.empty()) {
-                        // Use the LATEST chain entry — it represents the
-                        // most recent layer's contribution to t's
-                        // eventual value.  The entries are pointers
-                        // (not copies), so subsequent SETs into the
-                        // chain entry's bindings will be visible
-                        // through this returned Value.
-                        static const bool s_dbgBhv =
-                            std::getenv("V3_DBG_BLACKHOLE_AS_VALUE") != nullptr;
-                        if (s_dbgBhv) {
-                            static thread_local uint64_t hits = 0;
-                            if (++hits == 1 || (hits & (hits - 1)) == 0)
-                                std::fprintf(stderr,
-                                    "v3 blackhole-as-WHNF (self-frame): thunk=%p "
-                                    "bindings=%p size=%u (hits=%llu)\n",
-                                    (void *)t,
-                                    (void *)it->second.back(),
-                                    (unsigned)it->second.back()->size,
-                                    (unsigned long long)hits);
+                    static const bool s_noStgWhnf =
+                        std::getenv("NIX_V3_NO_STG_WHNF") != nullptr;
+                    if (!s_noStgWhnf) {
+                        auto & reg = partialBindingsRegistry();
+                        auto it = reg.find(t);
+                        if (it != reg.end() && !it->second.empty()) {
+                            // Use the LATEST chain entry — represents the
+                            // most recent layer's contribution to t's
+                            // eventual value.  Pointers (not copies), so
+                            // subsequent SETs into the chain entry's
+                            // bindings are visible.
+                            static const bool s_dbgBhv =
+                                std::getenv("V3_DBG_BLACKHOLE_AS_VALUE") != nullptr;
+                            if (s_dbgBhv) {
+                                static thread_local uint64_t hits = 0;
+                                if (++hits == 1 || (hits & (hits - 1)) == 0)
+                                    std::fprintf(stderr,
+                                        "v3 blackhole-as-WHNF (self-frame): thunk=%p "
+                                        "bindings=%p size=%u (hits=%llu)\n",
+                                        (void *)t,
+                                        (void *)it->second.back(),
+                                        (unsigned)it->second.back()->size,
+                                        (unsigned long long)hits);
+                            }
+                            Value recovered;
+                            recovered.tag_payload =
+                                static_cast<uint64_t>(Tag::Attrs);
+                            recovered.payload.bindings = it->second.back();
+                            return recovered;
                         }
-                        Value recovered;
-                        recovered.tag_payload =
-                            static_cast<uint64_t>(Tag::Attrs);
-                        recovered.payload.bindings = it->second.back();
-                        return recovered;
                     }
                     // Local cycle without registered partial Bindings —
                     // fall through to throw.
