@@ -1498,6 +1498,41 @@ inline void publishToAllThunkFrames(VMState & vm, const Value & v)
     //     Suspended-but-currently-in-an-active-force.
     static const char * s_scope_env = std::getenv("NIX_V3_TAIL_REGISTER_SCOPE");
     static const std::string s_scope = s_scope_env ? s_scope_env : "all";
+    // #558 (2026-05-10) "synthetic" detection: when the running thunk
+    // is a synthetic let-binding thunk (name="<thunk>") rather than a
+    // real lambda body, the AttrSet is a SUB-EXPRESSION (e.g.
+    // qt5-packages.nix's `attrs = { inherit (pkgs) lib; ... }`).
+    // Such sub-AttrSets aren't part of any outer thunk's WHNF — they
+    // shouldn't pollute outer chains.  STG-true: only register with
+    // the running thunk.
+    //
+    // Real lambda bodies (named, non-"<thunk>") DO represent the
+    // function's WHNF, and may be tail-call propagated via Tag::Slot
+    // / lib.fix; register with all THUNK_RETURN frames.
+    //
+    // Gated by NIX_V3_NO_SYNTH_RESTRICT=1 for bisecting.
+    bool runningIsSynthetic = false;
+    {
+        Thunk * runningThunk = nullptr;
+        for (size_t i = vm.frames.size(); i > 0; --i) {
+            if ((vm.frames[i - 1].flags & CFF_THUNK_RETURN)
+                && vm.frames[i - 1].thunk) {
+                runningThunk = vm.frames[i - 1].thunk;
+                break;
+            }
+        }
+        if (runningThunk) {
+            const auto * d =
+                (runningThunk->state == ThunkState::Suspended
+                 || runningThunk->state == ThunkState::Blackhole)
+                ? runningThunk->suspended.desc : nullptr;
+            if (d && d->name == "<thunk>") runningIsSynthetic = true;
+        }
+    }
+    static const bool s_noSynthRestrict =
+        std::getenv("NIX_V3_NO_SYNTH_RESTRICT") != nullptr;
+    bool restrictToImmediate =
+        runningIsSynthetic && !s_noSynthRestrict;
     // Diagnostic: print the AttrSet's source position (= the
     // currently-executing thunk's lambda position).  Helps identify
     // which AttrSet expression is being TAIL-registered.
@@ -1550,7 +1585,7 @@ inline void publishToAllThunkFrames(VMState & vm, const Value & v)
                 (unsigned)v.payload.bindings->size,
                 chain.size());
         }
-        if (s_scope == "immediate") break;
+        if (s_scope == "immediate" || restrictToImmediate) break;
     }
 }
 
@@ -6092,6 +6127,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 throw std::runtime_error(
                     "v3 OP_REC_BINDING_SLOT_REF: name '" + nm
                     + "' not found in source attrset");
+            }
+            // #558 (2026-05-10) diagnostic: V3_DBG_SLOT_REF=1 shows
+            // what slot was selected and its current value's tag.
+            {
+                static const bool s_dbgSlotRef =
+                    std::getenv("V3_DBG_SLOT_REF") != nullptr;
+                if (__builtin_expect(s_dbgSlotRef, 0)) {
+                    const auto & tbl = ir::globalSymbolTable();
+                    std::string nm = (sym < tbl.size()) ? tbl[sym] : "?";
+                    std::fprintf(stderr,
+                        "v3 SLOT_REF: bindings=%p size=%u sym='%s' slot-tag=%d\n",
+                        (void *)b, b->size, nm.c_str(), (int)found->tag());
+                }
             }
             // #437 diagnostic: track repeated slot derefs on the same
             // (bindings, sym) pair within a single eval.  Under
