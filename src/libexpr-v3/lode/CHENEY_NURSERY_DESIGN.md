@@ -413,7 +413,52 @@ suite.  We can pause between any two phases.
      equality between on/off, which is trivially true when
      "on" is a no-op.
 
-- **Phase D: not yet started.**  Cell registry + walk.
+- **Phase D: not yet started.**  Cell registry + walk.  Designed
+  + investigated 2026-05-10; first-cut "Bindings dirty bit + write
+  barrier on entries[].value writes" turns out to be *unsafe* on
+  its own because of the OP_RETURN cell-write path:
+
+  ```
+  if (Value * cell = fr.thunk->cell) {
+      *cell = retVal;        // cell may point INTO bindings->entries[i].value
+      fr.thunk->cell = nullptr;
+  }
+  ```
+
+  We don't know the containing `Bindings *` from a raw `Value *`.
+  If `retVal` carries a nursery payload and we don't mark the
+  containing Bindings dirty, the next scavenge skips it (dirty=0
+  from a prior clean walk) and the nursery memory gets reset
+  while the entry still points into it → use-after-free at the
+  next read.
+
+  Three viable Phase-D shapes:
+
+  a. **Track Bindings* in Thunk.**  Add `Thunk::cellContainer` (8
+     bytes) populated wherever `t->cell = &bindings->entries[i].value`
+     is set.  At cell-write, set `cellContainer->dirty = 1`.
+     Standalone `allocValue()` cells leave it null.
+
+  b. **Conservative "any cell-write happened" global flag.**
+     When set, scavenge ignores Bindings dirty bits and walks all
+     Bindings (Phase C v1 behavior).  Reset after scavenge.  Loses
+     Phase-D benefit when there are cell-writes between scavenges
+     (the common case during active eval) but trivial to wire.
+
+  c. **Card-marking write barrier.**  Tenured arena divided into
+     4 KB cards, each with a dirty bit.  Cell-writes mark the
+     card; scavenge scans dirty cards for word-aligned candidate
+     pointers (precise scanning since allocations are 16-aligned
+     and Value layout is known).  Standard HotSpot/Hotspot-style
+     approach.
+
+  Recommendation: (a) for the first cut.  Pairs cleanly with the
+  existing per-Bindings dirty bit; cellContainer can be re-used
+  later for any per-Bindings remembered-set work.
+
+- **Phase D Bindings-dirty-bit alone is INSUFFICIENT** without
+  one of the cell-write-barrier mechanisms above.  Documented
+  here so a future contributor doesn't repeat the half-step.
 
 - **Phase E: not yet started.**  Default-on flip.
 
