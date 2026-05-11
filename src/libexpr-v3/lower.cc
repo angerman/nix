@@ -1990,6 +1990,28 @@ struct Lowerer
                 bool complexFromExpr = !s_noComplex && isComplexFromExpr(fx);
                 bool useThunk = !s_noThunkify
                     && (useThunkBlanket || selfDot || complexFromExpr);
+                // #558 Phase 2 perf: even under blanket THUNK_ALL,
+                // skip thunkify for TRIVIAL from-exprs (Int, String,
+                // Path, Lambda, ExprVar without fromWith).  This
+                // matches TW's `from->maybeThunk(state, up)` which
+                // dispatches via Expr::maybeThunk virtual overrides
+                // that inline trivial values directly.  Under blanket
+                // mode we were wrapping every inherit-from regardless,
+                // which created millions of useless wrapper thunks
+                // under nixpkgs.  Trivial values are inherently lazy
+                // (no allocation, no force needed), so wrapping them
+                // adds pure overhead.
+                //
+                // Override via NIX_V3_THUNK_ALL_TRIVIAL=1 to restore
+                // the pre-optimization "wrap everything" behavior for
+                // bisection.
+                if (useThunkBlanket && useThunk) {
+                    static const bool s_thunkAllTrivial =
+                        std::getenv("NIX_V3_THUNK_ALL_TRIVIAL") != nullptr;
+                    if (!s_thunkAllTrivial
+                        && isTrivialForLazy(fx, /*forArg=*/false))
+                        useThunk = false;
+                }
                 if (selfDotMatches) {
                     if (s_dbgFires) {
                         auto * sel = dynamic_cast<nix::ExprSelect *>(fx);
