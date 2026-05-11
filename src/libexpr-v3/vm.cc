@@ -7543,7 +7543,15 @@ Value forceValue(VMState & vm, Value v)
         }
 
         const LambdaDescriptor * desc = t->suspended.desc;
-        Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
+        // #558 Phase 4: pull a fakeClo from the thread-local pool when
+        // available; OP_RETURN's CFF_THUNK_RETURN handler will recycle
+        // it after the body completes (the frame we push below has
+        // CFF_THUNK_RETURN set).
+        static const bool s_noClosurePool =
+            std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
+        Closure * fakeClo = __builtin_expect(s_noClosurePool, 0)
+            ? Alloc::allocClosure(t->nUpvalues)
+            : Alloc::allocFakeClo(t->nUpvalues);
         fakeClo->desc = desc;
         fakeClo->nUpvalues = t->nUpvalues;
         fakeClo->capturedWiths = t->suspended.capturedWiths;
