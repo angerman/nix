@@ -5806,8 +5806,49 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
-            push(vm, (attrs.isAttrs() && attrs.payload.bindings->has(operand))
-                ? Value::vTrue : Value::vFalse);
+            bool hasIt = (attrs.isAttrs() && attrs.payload.bindings->has(operand));
+            // #558 (2026-05-12): V3_DBG_ATTRS_HAS_KEY filter — trace
+            // every OP_ATTRS_HAS that matches a target SymbolId.  Used
+            // to verify the hypothesis that v3's partial-Bindings
+            // recovery makes `pkg.passthru.isFromBootstrapFiles or
+            // false` flip vs. TW.  Set to the SymbolId or name to
+            // filter (we just match on the name string via the global
+            // symbol table).
+            {
+                static const char * s_dbgKey =
+                    std::getenv("V3_DBG_ATTRS_HAS_KEY");
+                if (__builtin_expect(s_dbgKey != nullptr, 0)) [[unlikely]] {
+                    const auto & st = ir::globalSymbolTable();
+                    SymbolId sid = static_cast<SymbolId>(operand);
+                    const char * nm = (sid < st.size()) ? st[sid].c_str() : "?";
+                    if (std::strcmp(nm, s_dbgKey) == 0) {
+                        Bindings * b = attrs.isAttrs()
+                            ? attrs.payload.bindings : nullptr;
+                        // Caller frame pos for context.
+                        const LambdaDescriptor * dC = nullptr;
+                        if (!vm.frames.empty()) {
+                            const auto & cfr = vm.frames.back();
+                            if (cfr.thunk
+                                && (cfr.thunk->state == ThunkState::Suspended
+                                    || cfr.thunk->state == ThunkState::Blackhole))
+                                dC = cfr.thunk->suspended.desc;
+                            else if (cfr.closure) dC = cfr.closure->desc;
+                        }
+                        const PosSnapshot * psC =
+                            dC ? resolvePosSnapshot(dC->posHandle) : nullptr;
+                        std::fprintf(stderr,
+                            "v3 OP_ATTRS_HAS '%s' result=%s bindings=%p size=%u "
+                            "caller='%s' pos=%s:%u:%u\n",
+                            nm, hasIt ? "TRUE" : "FALSE",
+                            (void *)b, b ? b->size : 0,
+                            dC && !dC->name.empty() ? dC->name.c_str() : "<?>",
+                            (psC && !psC->file.empty()) ? psC->file.c_str() : "<no-pos>",
+                            psC ? psC->line : 0u,
+                            psC ? psC->column : 0u);
+                    }
+                }
+            }
+            push(vm, hasIt ? Value::vTrue : Value::vFalse);
             break;
         }
         case OP_ATTRS_HAS_DYN: {
