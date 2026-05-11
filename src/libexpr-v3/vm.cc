@@ -7971,6 +7971,79 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
 
 Value forceValue(VMState & vm, Value v)
 {
+    // Phase A7 (RCA 2026-05-11): C-stack guard at forceValue entry.
+    // forceValue → dispatchLoop → forceValue recursion can burn 8 MiB
+    // of C-stack at ~3000 nested levels (each pair ≈ 1.4 KiB).  The
+    // chase-cycle guard at line 8268 only fires AFTER 5000 frames —
+    // too late if C-stack is the limit.  Throw a clear error when
+    // vm.frames.size() crosses a safer threshold; previously the
+    // C-stack overflow surfaced as EXC_BAD_ACCESS with no diagnostic.
+    // Phase A7 telemetry — opt-in via NIX_V3_DEPTH_GUARD=1.  Throwing
+    // here loops via catch-and-retry sites (e.g. v3_hook fall-through
+    // to TW), each leaking memory — 41 throws on hello.name took 20 GB
+    // before SIGKILL.  Default-off; only enable to confirm where in
+    // the chase the depth grows.  When enabled, ABORTS rather than
+    // throws so the recursion doesn't get retried by upstream catchers.
+    {
+        static const bool s_depthGuard =
+            std::getenv("NIX_V3_DEPTH_GUARD") != nullptr;
+        if (__builtin_expect(s_depthGuard, 0)) {
+            static thread_local size_t peakDepth = 0;
+            if (__builtin_expect(vm.frames.size() > peakDepth, 0)) {
+                peakDepth = vm.frames.size();
+                if (peakDepth > 500 && (peakDepth % 100) == 0) {
+                    std::fprintf(stderr,
+                        "v3 forceValue depth=%zu (peak)\n", peakDepth);
+                    std::fflush(stderr);
+                }
+            }
+            if (__builtin_expect(vm.frames.size() >= 2000, 0)) {
+                std::fprintf(stderr,
+                    "v3 forceValue: VM frame depth %zu — aborting\n",
+                    vm.frames.size());
+                // Dump the stack at three strides — bottom (outermost
+                // call origin), middle (every 100 frames), top (newest
+                // recursion site) — so a single dump pinpoints the
+                // call chain without needing per-frame trace output.
+                size_t lim = vm.frames.size();
+                auto dumpFrame = [&](size_t fi) {
+                    const auto & fr = vm.frames[fi];
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk
+                        && (fr.thunk->state == ThunkState::Suspended
+                            || fr.thunk->state == ThunkState::Blackhole))
+                        d = fr.thunk->suspended.desc;
+                    else if (fr.closure) d = fr.closure->desc;
+                    const PosSnapshot * ps =
+                        d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                    std::fprintf(stderr,
+                        "  [%zu] name=%-22s codeOff=%-5u ip=%-5u "
+                        "flags=0x%x thunk=%p %s:%u:%u\n",
+                        fi,
+                        d && !d->name.empty() ? d->name.c_str() : "<?>",
+                        d ? d->codeOffset : 0,
+                        fr.ip,
+                        (unsigned)fr.flags,
+                        (void *)fr.thunk,
+                        (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                        ps ? ps->line : 0u,
+                        ps ? ps->column : 0u);
+                };
+                std::fprintf(stderr, "--- bottom 20 (outermost) ---\n");
+                size_t bottomEnd = std::min<size_t>(lim, 20);
+                for (size_t fi = bottomEnd; fi > 0; --fi) dumpFrame(fi - 1);
+                std::fprintf(stderr, "--- middle (every 100 frames) ---\n");
+                for (size_t fi = 20;
+                     lim >= 40 && fi < lim - 40; fi += 100)
+                    dumpFrame(fi);
+                std::fprintf(stderr, "--- top 40 (newest) ---\n");
+                size_t start = lim > 40 ? lim - 40 : 0;
+                for (size_t fi = lim; fi > start; --fi) dumpFrame(fi - 1);
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
+    }
     // STG-12 (#498) diagnostic: log the call site (current top frame
     // CU + ip) when forceValue is invoked with an input that, after
     // chase, lands on a Black thunk on this VM's frames.  That tells
