@@ -133,3 +133,41 @@ Resume by implementing option A:
 6. **Disk-cache schema bump** if Thunk size changes affect serialized lambda metadata.
 
 Estimated: ~1 day for option A.  Then validate v3-direct nixpkgs eval.  If cascade closes, proceed to Phase 2 (retire partial-Bindings registry).
+
+---
+
+## Phase 1.5 landed + scope decision (2026-05-12 final)
+
+Phase 1.5 option A implemented as commits:
+- `20adafe31`: Thunk::shapeCell field, allocation in allocThunkSuspended.
+- `0677e7cd8`: 12-test cell-update protocol semantic suite.
+- `ead3f33ae`: STG-correct innermost-only update; dropped the cross-thunk propagation hack from `52eb8f261`.
+
+**Decision (user directive 2026-05-12):** do NOT take the cross-thunk propagation shortcut.  That re-introduces the same shape of pollution as the partial-Bindings registry and is fundamentally non-STG.  STG semantics: a thunk's cell holds only that thunk's own state; cycles throw.
+
+Current state under `NIX_V3_CELL_EVERYWHERE=1`:
+- Each thunk has its own shapeCell.
+- OP_ATTRS_REC_INIT writes the in-progress Bindings to the INNERMOST THUNK_RETURN frame's shapeCell (and no others).
+- forceValue Black reads `*t->shapeCell` before falling through to STG WHNF recovery.
+- Per-thunk cell update is STG-correct; no cross-thunk pollution.
+
+Tests pass under both modes.  v3-direct nixpkgs still fails the same way as before — shapeCell recovery doesn't fire for the outer x thunk because x's body doesn't directly fire OP_ATTRS_REC_INIT (its body just calls f), so x's shapeCell stays at the sentinel.  Recovery falls through to legacy STG WHNF (which still has the cross-thunk pollution).  This is correct STG behavior — the residual failure now demonstrates that the cascade IS a real cycle from STG's perspective, and the right fix is to eliminate the eager forcing that produces the cycle, not to paper over with cross-thunk publication.
+
+## Proper architectural plan (post Phase 1.5)
+
+| Phase | Work | Goal |
+|---|---|---|
+| 1.5 ✅ | Thunk::shapeCell + innermost-only update | STG-correct per-thunk cell update foundation |
+| 2 | Make inherit-from unconditionally lazy in lower.cc (match TW's `from->maybeThunk`) | Eliminate the eager-force cycles that the partial-Bindings registry currently masks.  Investigate and fix the perf-hang of NIX_V3_INHERIT_FROM_THUNK_ALL=1. |
+| 3 | Retire partial-Bindings infrastructure | After Phase 2 closes the legitimate-cycle cases, delete `publishToAllThunkFrames`, `publishToNearestBlackThunkFrame`, `partialBindingsRegistry`, chain peek, `pickLargestLayer`, `lookupInPartialChain`, `CFF_TAINTED`, STG WHNF recovery.  Mechanical deletion + test pass. |
+| 4 | Validation | Full nixpkgs eval, cardano-node v3-fhook bench. |
+
+Phase 2 is the critical path.  The hang with `NIX_V3_INHERIT_FROM_THUNK_ALL=1` is the obstacle; investigating that is the next concrete action.  Once inherit-from is properly lazy, the cascade disappears.
+
+## Why not the cross-thunk hack?
+
+We tested cross-thunk shapeCell propagation (Phase 1.5b, since reverted).  It DID change the cascade's error symptom (eliminated the bootstrap-passthru pollution) but introduced a new "OP_ATTRS_SELECT: not an attrset" failure.  The root cause: writing the same inner Bindings to all outer thunks' shapeCells means an outer thunk's "value" is observed as the inner Bindings, even though the outer's eventual value is something else (the // of the inner with other contributions).
+
+This is the same shape of mistake as the partial-Bindings registry.  It can sometimes succeed because the inner Bindings happens to contain enough state, but it's semantically wrong — any consumer that reads a non-existing key, or that reads while the inner Bindings is being mutated, gets corrupt data.
+
+The proper fix is to ensure no thunk is forced while it's mid-construction (no real cycle in TW-equivalent eval).  That requires laziness — which Phase 2 addresses.
