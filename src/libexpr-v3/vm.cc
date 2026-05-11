@@ -158,6 +158,27 @@ inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
 using PartialBindingsChain = std::vector<Bindings *>;
 std::unordered_map<Thunk *, PartialBindingsChain> & partialBindingsRegistry();
 
+/// #558 (2026-05-11): pick the most-informative chain layer (largest
+/// size).  Used by every site that needs a SINGLE Bindings from a
+/// chain (STG WHNF recovery, OP_ATTRS_UPDATE collapseDeferred, etc.).
+/// Mirrors lookupInPartialChain's largest-layer-wins for the
+/// "collapse to one Bindings" case.
+///
+/// Gated by NIX_V3_NO_LARGEST_WHNF=1 (reverts to chain.back()).
+inline Bindings * pickLargestLayer(const PartialBindingsChain & chain)
+{
+    if (chain.empty()) return nullptr;
+    static const bool s_noLargestWhnf =
+        std::getenv("NIX_V3_NO_LARGEST_WHNF") != nullptr;
+    if (s_noLargestWhnf) return chain.back();
+    Bindings * pick = chain.back();
+    for (auto * b : chain) {
+        if (b && (!pick || b->size > pick->size))
+            pick = b;
+    }
+    return pick;
+}
+
 /// #558: lookup a name across all Bindings in the chain.
 ///
 /// Strategy: prefer ENTRIES FROM THE LARGEST CHAIN LAYER that contains
@@ -3867,7 +3888,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         Value recovered;
                         recovered.tag_payload =
                             static_cast<uint64_t>(Tag::Attrs);
-                        recovered.payload.bindings = pIt->second.back();
+                        recovered.payload.bindings =
+                            pickLargestLayer(pIt->second);
                         retVal = recovered;
                     } else {
                         // Defer: return vBlackhole.  Caller sees a
@@ -4455,7 +4477,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                 Value recovered;
                                 recovered.tag_payload =
                                     static_cast<uint64_t>(Tag::Attrs);
-                                recovered.payload.bindings = pIt->second.back();
+                                recovered.payload.bindings =
+                                    pickLargestLayer(pIt->second);
                                 vm.valueStack.back() = recovered;
                                 break;
                             }
@@ -5777,7 +5800,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (it != reg.end() && !it->second.empty()) {
                         Value collapsed;
                         collapsed.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                        collapsed.payload.bindings = it->second.back();
+                        collapsed.payload.bindings =
+                            pickLargestLayer(it->second);
                         v = collapsed;
                     }
                 }
@@ -5829,7 +5853,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (it != reg.end() && !it->second.empty()) {
                         Value collapsed;
                         collapsed.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                        collapsed.payload.bindings = it->second.back();
+                        collapsed.payload.bindings =
+                            pickLargestLayer(it->second);
                         v = collapsed;
                     }
                 }
@@ -8112,10 +8137,26 @@ Value forceValue(VMState & vm, Value v)
                                     }
                                 }
                             }
+                            // #558 (2026-05-11) Largest-layer-wins for
+                            // STG WHNF return: pick the most-informative
+                            // chain entry (largest size) rather than
+                            // chain.back().  Mirrors lookupInPartialChain's
+                            // largest-layer-wins.  When forcing a Black
+                            // thunk to a single Bindings (e.g. the lhs
+                            // of an //), the largest layer is the most
+                            // accurate WHNF approximation — typically
+                            // the outermost overlay's merged result.
+                            //
+                            // STG analog: indirection chains prefer the
+                            // most-resolved cell at each access.
+                            //
+                            // Gated by NIX_V3_NO_LARGEST_WHNF=1 (reverts
+                            // to chain.back() if needed for bisecting).
                             Value recovered;
                             recovered.tag_payload =
                                 static_cast<uint64_t>(Tag::Attrs);
-                            recovered.payload.bindings = it->second.back();
+                            recovered.payload.bindings =
+                                pickLargestLayer(it->second);
                             return recovered;
                         }
                     }
