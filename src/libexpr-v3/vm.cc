@@ -1419,9 +1419,26 @@ namespace { // -- reopen anon namespace
 /// the rec's in-progress Bindings (which is the SAME pointer that
 /// OP_ATTRS_REC_SET writes into, so subsequent SET writes are visible
 /// to the recovery path).
+/// #558 Phase 3: unified gate that disables ALL partial-Bindings
+/// publication (both nearest-frame and tail-all-frames) and
+/// recovery (chain peek, registry-wide search, STG WHNF recovery).
+/// When set, the only mechanism for mid-construction state visibility
+/// is the per-thunk shapeCell (#558 Phase 1.5).
+///
+/// Goal: validate cell-update-everywhere as the standalone STG-correct
+/// mechanism before retiring the partial-Bindings infrastructure
+/// entirely.
+inline bool partialBindingsDisabled()
+{
+    static const bool s_disabled =
+        std::getenv("NIX_V3_NO_PARTIAL_BINDINGS") != nullptr;
+    return s_disabled;
+}
+
 inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
                                              bool isRecInit)
 {
+    if (partialBindingsDisabled()) return;
     // STG-1 (#498/#547): publish is disabled by default.  Each
     // thunk's slot is written ONLY by its own OP_RETURN; no outer
     // thunk write-through.  STG mode (the slot mechanism) is the
@@ -1639,6 +1656,7 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
 /// No correctness issue; future work could clean up at OP_RETURN.
 inline void publishToAllThunkFrames(VMState & vm, const Value & v)
 {
+    if (partialBindingsDisabled()) return;
     static const bool s_stgMode =
         std::getenv("NIX_V3_NO_STG") == nullptr;
     if (!s_stgMode) return;
