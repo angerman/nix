@@ -5998,33 +5998,63 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 for (auto & s : *v) ctxAccum.push_back(s);
             };
             for (uint32_t i = 0; i < n; ++i) {
-                const Value & p = parts[i];
-                // Attrset coercion: __toString self  or  outPath.
-                // Matches tree-walker's coerceToString behaviour for
-                // attrsets (used to interpolate derivation values).
-                if (p.isAttrs() && p.payload.bindings) {
+                // Attrset coercion: mirror tree-walker's
+                // `tryAttrsToString` + `coerceToString` recursion.
+                // Used to interpolate derivation values and any attrset
+                // that has `__toString self` or `outPath` (which itself
+                // may be a string, a path, or yet another attrset that
+                // needs further coercion — nixpkgs's `pkgs.hello`
+                // resolves via outPath → derivation outPath → string).
+                //
+                // Unwind into parts[i] in-place so the existing String /
+                // Path / coerceToString branches below handle the
+                // resulting primitive.  Depth limit 8 matches tree-
+                // walker's implicit recursion depth; deeper chains are
+                // pathological and surface a clearer error than a stack
+                // overflow.
+                if (parts[i].isAttrs() && parts[i].payload.bindings) {
                     static const SymbolId tsId  = ir::globalInternSymbol("__toString");
                     static const SymbolId outId = ir::globalInternSymbol("outPath");
-                    if (auto * fn = p.payload.bindings->lookup(tsId)) {
-                        Value forced = forceValue(vm, *fn);
-                        Value s = callClosure(vm, forced, p);
-                        s = forceValue(vm, s);
-                        if (s.isString()) {
-                            out.append(s.payload.str);
-                            addCtx(lookupStringContextEntries(s.payload.str));
+                    int depth = 0;
+                    while (parts[i].isAttrs() && parts[i].payload.bindings && depth < 8) {
+                        Bindings * b = parts[i].payload.bindings;
+                        if (auto * fn = b->lookup(tsId)) {
+                            Value forced = forceValue(vm, *fn);
+                            parts[i] = callClosure(vm, forced, parts[i]);
+                            parts[i] = forceValue(vm, parts[i]);
+                            ++depth;
                             continue;
                         }
-                    }
-                    if (auto * op = p.payload.bindings->lookup(outId)) {
-                        Value forced = forceValue(vm, *op);
-                        if (forced.isString()) {
-                            out.append(forced.payload.str);
-                            addCtx(lookupStringContextEntries(forced.payload.str));
+                        if (auto * op = b->lookup(outId)) {
+                            parts[i] = forceValue(vm, *op);
+                            ++depth;
                             continue;
                         }
-                        if (forced.isPath())   { out.append(forced.payload.path); continue; }
+                        // V3_DBG_STRCONCAT: dump the attr names for an
+                        // attrset that has neither __toString nor outPath
+                        // — narrows the source of v3-specific
+                        // eval-order divergence that surfaces a coerce
+                        // attempt TW would never reach.
+                        static const bool s_dbgUnc =
+                            std::getenv("V3_DBG_STRCONCAT") != nullptr;
+                        if (s_dbgUnc) {
+                            const auto & st = ir::globalSymbolTable();
+                            std::fprintf(stderr,
+                                "v3 STR_CONCAT: attrs missing __toString/outPath "
+                                "(attrs size=%u): {", (unsigned)b->size);
+                            for (uint32_t k = 0; k < b->size && k < 16; ++k) {
+                                SymbolId nm = b->entries[k].name;
+                                std::fprintf(stderr, "%s%s",
+                                    k ? "," : "",
+                                    nm < st.size() ? st[nm].c_str() : "?");
+                            }
+                            if (b->size > 16) std::fprintf(stderr, ",...");
+                            std::fprintf(stderr, "}\n");
+                        }
+                        break;  // no __toString, no outPath — fall through to coerceToString error
                     }
                 }
+                const Value & p = parts[i];
                 if (p.isString())
                     addCtx(lookupStringContextEntries(p.payload.str));
                 if (p.isPath() && forceStr) {
