@@ -1348,6 +1348,13 @@ void compactPartialBindingsRegistry()
     auto & fin = finalizedBindings();
     if (fin.empty()) return;
     auto & reg = partialBindingsRegistry();
+    static const bool s_dbg =
+        std::getenv("V3_DBG_LAZY_CLEANUP") != nullptr;
+    size_t totalChainBefore = 0;
+    size_t totalChainAfter  = 0;
+    if (__builtin_expect(s_dbg, 0)) {
+        for (auto & [t, chain] : reg) totalChainBefore += chain.size();
+    }
     for (auto & [t, chain] : reg) {
         chain.erase(
             std::remove_if(chain.begin(), chain.end(),
@@ -1355,6 +1362,14 @@ void compactPartialBindingsRegistry()
                     return b && fin.count(b);
                 }),
             chain.end());
+    }
+    if (__builtin_expect(s_dbg, 0)) {
+        for (auto & [t, chain] : reg) totalChainAfter += chain.size();
+        std::fprintf(stderr,
+            "v3 compact: regSize=%zu finalized=%zu chainTotal %zu→%zu (-%zu)\n",
+            reg.size(), fin.size(),
+            totalChainBefore, totalChainAfter,
+            totalChainBefore - totalChainAfter);
     }
     fin.clear();
 }
