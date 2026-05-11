@@ -531,6 +531,16 @@ struct Alloc
     static constexpr uint16_t kPoolMaxBuckets  = 16;
     static constexpr size_t   kPoolPerBucket   = 128;
 
+    /// Sentinel value stamped into `Closure::_pad` by allocFakeClo and
+    /// checked at recycleFakeClo.  Without this, a "real" closure
+    /// produced by OP_MAKE_CLOSURE can end up in a CFF_THUNK_RETURN
+    /// frame's `closure` field (e.g., via OP_TAIL_CALL replacement) and
+    /// be incorrectly pooled, where a later allocFakeClo pops it and
+    /// overwrites its desc — silently corrupting cell-stored
+    /// Tag::Closure entries that still reference that pointer.
+    /// 0xFA5E ("FASE", chosen for distinctness from 0/sentinel padding).
+    static constexpr uint16_t kFakeCloMagic = 0xFA5E;
+
     /// Pop a recycled Closure of the requested size, or nullptr if no
     /// matching entry is pooled.  The returned closure has unspecified
     /// upvalues — the caller MUST overwrite all `nUpvalues` slots
@@ -575,18 +585,35 @@ inline Closure * Alloc::tryPopFakeClo(uint16_t nUpvalues) noexcept
     if (n == 0) return nullptr;
     Closure * c = pool.slots[nUpvalues][n - 1];
     pool.count[nUpvalues] = n - 1;
+    {
+        static const bool s_dbg =
+            std::getenv("V3_DBG_POP_FAKECLO") != nullptr;
+        if (__builtin_expect(s_dbg, 0)) {
+            std::fprintf(stderr,
+                "v3 POP fakeClo=%p (prev desc=%p codeOff=%u nUp=%u)\n",
+                (void *)c, (void *)c->desc,
+                c->desc ? c->desc->codeOffset : 0,
+                (unsigned)nUpvalues);
+        }
+    }
     return c;
 }
 
 inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
 {
-    if (Closure * c = tryPopFakeClo(nUpvalues)) return c;
+    if (Closure * c = tryPopFakeClo(nUpvalues)) {
+        // Pool hit — closure was previously stamped with the fakeClo
+        // magic at allocFakeClo time, and the magic survived through
+        // recycleFakeClo (which doesn't touch _pad).  Caller is about
+        // to overwrite desc/cu/capturedWiths/upvalues; magic stays.
+        return c;
+    }
     // Pool miss: always arena (never nursery) so subsequent
     // recycle's pointer stability survives Cheney scavenges.
     const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
     auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
     c->nUpvalues = nUpvalues;
-    c->_pad = 0;
+    c->_pad = kFakeCloMagic;   // Mark as fakeClo for safe pooling.
     c->capturedWiths = nullptr;
     c->cu = nullptr;
     return c;
@@ -595,6 +622,42 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
 inline void Alloc::recycleFakeClo(Closure * c) noexcept
 {
     if (!c) return;
+    // Phase A5 FIX (RCA 2026-05-11): only recycle when the closure
+    // carries the fakeClo magic in _pad.  Real closures produced by
+    // OP_MAKE_CLOSURE have _pad=0; recycling them would let allocFakeClo
+    // return their pointer for a different thunk's force frame, where
+    // `fakeClo->desc = newDesc` would silently corrupt cell-stored
+    // Tag::Closure entries that still reference the address.
+    if (c->_pad != kFakeCloMagic) {
+        static const bool s_dbg =
+            std::getenv("V3_DBG_RECYCLE_REJECT") != nullptr;
+        if (__builtin_expect(s_dbg, 0)) {
+            std::fprintf(stderr,
+                "v3 RECYCLE REJECT (not a fakeClo): closure=%p _pad=0x%x "
+                "desc=%p codeOff=%u nUp=%u\n",
+                (void *)c, (unsigned)c->_pad,
+                (void *)c->desc,
+                c->desc ? c->desc->codeOffset : 0,
+                (unsigned)c->nUpvalues);
+        }
+        return;
+    }
+    // Phase A5 RCA: diagnostic — log every recycle when env-var set.
+    // This catches whether a closure with a "real" body (e.g., the
+    // OP_MAKE_CLOSURE-allocated darwinArch closure at codeOff=2863)
+    // ends up in the pool, which would let allocFakeClo overwrite its
+    // desc and corrupt cell-resident closures.
+    {
+        static const bool s_dbg =
+            std::getenv("V3_DBG_RECYCLE_FAKECLO") != nullptr;
+        if (__builtin_expect(s_dbg, 0)) {
+            std::fprintf(stderr,
+                "v3 RECYCLE fakeClo=%p desc=%p codeOff=%u nUp=%u\n",
+                (void *)c, (void *)c->desc,
+                c->desc ? c->desc->codeOffset : 0,
+                (unsigned)c->nUpvalues);
+        }
+    }
     const uint16_t nUp = c->nUpvalues;
     if (nUp >= kPoolMaxBuckets) return;
     auto & pool = threadClosurePool();
@@ -852,6 +915,24 @@ inline void cellTraceWrite(const Value * storage, const Thunk * t,
         }
     } else if (writtenValue.tag() == Tag::String && writtenValue.payload.str) {
         std::fprintf(stderr, " str=\"%.40s\"", writtenValue.payload.str);
+    } else if (writtenValue.tag() == Tag::Closure && writtenValue.payload.closure) {
+        // Log closure pointer + desc codeOff so we can correlate with
+        // later fakeClo allocations.  Phase A5 RCA: if the pooled
+        // fakeClo pool returns a closure whose pointer matches a
+        // cell-resident closure, the next OP_FORCE will overwrite
+        // c->desc with the new thunk's desc — silently mutating the
+        // cell-stored closure to the WRONG body.
+        auto * c = writtenValue.payload.closure;
+        std::fprintf(stderr, " closure-ptr=%p desc=%p",
+            (const void *)c, (const void *)c->desc);
+        if (c->desc) {
+            std::fprintf(stderr, " codeOff=%u nUp=%u",
+                c->desc->codeOffset, (unsigned)c->nUpvalues);
+        }
+    } else if (writtenValue.tag() == Tag::Thunk && writtenValue.payload.thunk) {
+        std::fprintf(stderr, " thunk-ptr=%p state=%d",
+            (const void *)writtenValue.payload.thunk,
+            (int)writtenValue.payload.thunk->state);
     }
     std::fprintf(stderr, "\n");
 }

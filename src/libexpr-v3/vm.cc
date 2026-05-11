@@ -1461,6 +1461,72 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (operand >= closure->nUpvalues)
                 throw std::runtime_error("v3 OP_GET_UPVALUE: index out of range");
             push(vm, closure->upvalues[operand]);
+            // Phase A5: frame-focused upvalue trace.  When
+            // V3_DBG_SELECT_AT_CODEOFF=<codeoff> is set, log every
+            // OP_GET_UPVALUE in matching frames.  Logs the tag of the
+            // pushed value + chase-through-WHNF, so we can see if the
+            // captured upvalue is what we expect.
+            {
+                static const char * s_atCo =
+                    std::getenv("V3_DBG_SELECT_AT_CODEOFF");
+                if (__builtin_expect(s_atCo != nullptr, 0)) {
+                    uint32_t targetCo = static_cast<uint32_t>(std::atoi(s_atCo));
+                    const auto & fr = vm.frames.back();
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk
+                        && (fr.thunk->state == ThunkState::Suspended
+                            || fr.thunk->state == ThunkState::Blackhole))
+                        d = fr.thunk->suspended.desc;
+                    else if (fr.closure)
+                        d = fr.closure->desc;
+                    if (d && d->codeOffset == targetCo) {
+                        const Value & top = vm.valueStack.back();
+                        std::fprintf(stderr,
+                            "v3 GET_UPVALUE@codeOff[%u] idx=%u tag=%u",
+                            targetCo, (unsigned)operand, (unsigned)top.tag());
+                        Value chase = top;
+                        int hops = 0;
+                        while (hops < 16) {
+                            if (chase.tag() == Tag::Slot && chase.payload.slot)
+                                chase = *chase.payload.slot;
+                            else if (chase.tag() == Tag::Thunk
+                                     && chase.payload.thunk
+                                     && chase.payload.thunk->state == ThunkState::Evaluated)
+                                chase = chase.payload.thunk->evaluated;
+                            else break;
+                            ++hops;
+                        }
+                        std::fprintf(stderr,
+                            " chase-tag=%u (hops=%d)",
+                            (unsigned)chase.tag(), hops);
+                        if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                            const auto & st = ir::globalSymbolTable();
+                            uint32_t sz = chase.payload.bindings->size;
+                            std::fprintf(stderr, " size=%u keys={", sz);
+                            for (uint32_t k = 0; k < sz && k < 16; ++k) {
+                                SymbolId nn =
+                                    chase.payload.bindings->entries[k].name;
+                                std::fprintf(stderr, "%s%s",
+                                    k ? "," : "",
+                                    nn < st.size() ? st[nn].c_str() : "?");
+                            }
+                            std::fprintf(stderr, "}");
+                            if (const BindingsOrigin * o =
+                                    lookupBindingsOrigin(chase.payload.bindings)) {
+                                const PosSnapshot * ps =
+                                    resolvePosSnapshot(o->posHandle);
+                                std::fprintf(stderr,
+                                    " origin=%s@%s:%u",
+                                    o->source ? o->source : "?",
+                                    (ps && !ps->file.empty())
+                                        ? ps->file.c_str() : "?",
+                                    ps ? ps->line : 0u);
+                            }
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
             break;
         }
         case OP_GET_UPVALUE_FORCE: {
@@ -1918,6 +1984,63 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 std::fflush(stderr);
             }
             Value v; v.mkClosure(c); push(vm, v);
+            // Phase A5: trace OP_MAKE_CLOSURE results whose body codeOff
+            // matches V3_DBG_MAKE_CLO_AT_CODEOFF.  This catches the
+            // wrong-closure-build bug — where the cpuName trace shows
+            // darwinArch resolving to a closure whose body is at
+            // inspect.nix:198:13 codeOff=1927 (the {family} thunk).  By
+            // logging every MAKE_CLOSURE that produces a desc with
+            // codeOff=<target>, we'll see WHICH bytecode site emitted
+            // OP_MAKE_CLOSURE with the wrong funcIdx.
+            {
+                static const char * s_atCo =
+                    std::getenv("V3_DBG_MAKE_CLO_AT_CODEOFF");
+                if (__builtin_expect(s_atCo != nullptr, 0)) {
+                    uint32_t targetCo = static_cast<uint32_t>(std::atoi(s_atCo));
+                    if (c->desc && c->desc->codeOffset == targetCo) {
+                        const PosSnapshot * dps =
+                            resolvePosSnapshot(c->desc->posHandle);
+                        std::fprintf(stderr,
+                            "v3 MAKE_CLOSURE produced closure-ptr=%p "
+                            "desc-codeOff=%u name='%s' pos=%s:%u:%u nUp=%u\n",
+                            (void *)c,
+                            targetCo,
+                            !c->desc->name.empty() ? c->desc->name.c_str() : "<?>",
+                            (dps && !dps->file.empty()) ? dps->file.c_str() : "<no-pos>",
+                            dps ? dps->line : 0u, dps ? dps->column : 0u,
+                            (unsigned)nUp);
+                        // Caller frame info — who made this closure?
+                        if (!vm.frames.empty()) {
+                            const auto & fr = vm.frames.back();
+                            const LambdaDescriptor * d2 = nullptr;
+                            if (fr.thunk
+                                && (fr.thunk->state == ThunkState::Suspended
+                                    || fr.thunk->state == ThunkState::Blackhole))
+                                d2 = fr.thunk->suspended.desc;
+                            else if (fr.closure) d2 = fr.closure->desc;
+                            const PosSnapshot * fps =
+                                d2 ? resolvePosSnapshot(d2->posHandle) : nullptr;
+                            std::fprintf(stderr,
+                                "  maker frame: name=%s pos=%s:%u:%u "
+                                "maker-codeOff=%u maker-cu=%p maker-funcIdx=%u\n",
+                                d2 && !d2->name.empty() ? d2->name.c_str() : "<?>",
+                                (fps && !fps->file.empty()) ? fps->file.c_str() : "<no-pos>",
+                                fps ? fps->line : 0u, fps ? fps->column : 0u,
+                                d2 ? d2->codeOffset : 0u,
+                                (const void *)cu,
+                                (unsigned)funcIdx);
+                            // Disasm a window around the OP_MAKE_CLOSURE site
+                            // so we can see what bytecode emitted it.
+                            uint32_t opIp = ip - 3;  // operand+nUp+nWiths consumed already
+                            uint32_t lo3 = opIp > 4 ? opIp - 4 : 0;
+                            uint32_t hi3 = opIp + 4;
+                            std::fprintf(stderr,
+                                "  emit-site disasm [%u..%u):\n", lo3, hi3);
+                            disassembleWindow(stderr, *cu, lo3, hi3);
+                        }
+                    }
+                }
+            }
             break;
         }
         case OP_MAKE_THUNK: {
@@ -3262,6 +3385,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
             cur.cu = tcCalleeCu;
+            // Phase A5 (RCA 2026-05-11): when a CFF_THUNK_RETURN frame's
+            // body tail-calls into a real closure, cur.closure is
+            // replaced with the callee's REAL closure pointer.  The
+            // original fakeClo is no longer referenced; Boehm GC will
+            // reclaim it.  At OP_RETURN, the recycle path WOULD try to
+            // pool cur.closure — but the sentinel check in
+            // recycleFakeClo (kFakeCloMagic in _pad) rejects real
+            // closures, preventing the cell-stored-closure corruption
+            // described in lode/RCA_FAMILY_DIVERGENCE_ROOTCAUSE_2026-05-11.md.
             cur.closure = tcCallee;
             // thunk stays whatever it was — if we're inside a thunk
             // re-entry frame, the thunk should still be set when
@@ -3299,6 +3431,66 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // different chain start fresh.
             vm.tailCallCount = 0;
             Value retVal = pop(vm);
+            // Phase A5: trace EVERY OP_RETURN whose frame's codeOff
+            // matches V3_DBG_RETURN_AT_CODEOFF.  Logs retVal's tag +
+            // (for closures) the closure-body codeOff so we can see
+            // exactly what value a target thunk's body produces.
+            {
+                static const char * s_atCo =
+                    std::getenv("V3_DBG_RETURN_AT_CODEOFF");
+                if (__builtin_expect(s_atCo != nullptr, 0)) {
+                    uint32_t targetCo = static_cast<uint32_t>(std::atoi(s_atCo));
+                    const auto & fr = vm.frames.back();
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk
+                        && (fr.thunk->state == ThunkState::Suspended
+                            || fr.thunk->state == ThunkState::Blackhole))
+                        d = fr.thunk->suspended.desc;
+                    else if (fr.closure) d = fr.closure->desc;
+                    if (d && d->codeOffset == targetCo) {
+                        const PosSnapshot * dps =
+                            resolvePosSnapshot(d->posHandle);
+                        std::fprintf(stderr,
+                            "v3 RETURN@codeOff[%u] name=%s pos=%s:%u:%u "
+                            "ip=%u retVal-tag=%u flags=0x%x thunk=%p",
+                            targetCo,
+                            !d->name.empty() ? d->name.c_str() : "<?>",
+                            (dps && !dps->file.empty()) ? dps->file.c_str() : "<no-pos>",
+                            dps ? dps->line : 0u, dps ? dps->column : 0u,
+                            ip - 1, (unsigned)retVal.tag(),
+                            (unsigned)fr.flags, (const void *)fr.thunk);
+                        if (retVal.tag() == Tag::Closure
+                            && retVal.payload.closure
+                            && retVal.payload.closure->desc) {
+                            auto * cd = retVal.payload.closure->desc;
+                            const PosSnapshot * cps =
+                                resolvePosSnapshot(cd->posHandle);
+                            std::fprintf(stderr,
+                                " retVal-closure=%s@%s:%u:%u codeOff=%u nUp=%u",
+                                !cd->name.empty() ? cd->name.c_str() : "<?>",
+                                (cps && !cps->file.empty()) ? cps->file.c_str() : "<no-pos>",
+                                cps ? cps->line : 0u, cps ? cps->column : 0u,
+                                cd->codeOffset,
+                                retVal.payload.closure->nUpvalues);
+                        } else if (retVal.tag() == Tag::Attrs
+                                   && retVal.payload.bindings) {
+                            std::fprintf(stderr, " retVal-attrs-size=%u",
+                                (unsigned)retVal.payload.bindings->size);
+                        }
+                        std::fprintf(stderr, "\n");
+                        // Dump the thunk's body bytecode + descriptor info
+                        // (the thunk's source location and the bytecode
+                        // around the OP_RETURN site).
+                        if (cu) {
+                            uint32_t bodyStart = d->codeOffset;
+                            uint32_t hi = ip + 2;
+                            std::fprintf(stderr,
+                                "  body disasm [%u..%u):\n", bodyStart, hi);
+                            disassembleWindow(stderr, *cu, bodyStart, hi);
+                        }
+                    }
+                }
+            }
             // Phase A4 (RCA 2026-05-11): trace returns whose retVal is
             // a size-1 attrs matching V3_DBG_RETURN_KEY (e.g. "family").
             // Used to localize WHICH thunk's body produces the {family}
@@ -3677,8 +3869,70 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 {
                     static const bool s_noClosurePool =
                         std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
-                    if (__builtin_expect(!s_noClosurePool, 1))
+                    if (__builtin_expect(!s_noClosurePool, 1)) {
+                        // Phase A5: when V3_DBG_RECYCLE_OF_PTR is set,
+                        // log the recycle CALL with rich frame context
+                        // for the specific closure pointer.  Catches
+                        // "real" closures being incorrectly recycled.
+                        {
+                            static const char * s_pt =
+                                std::getenv("V3_DBG_RECYCLE_OF_PTR");
+                            static const char * s_co =
+                                std::getenv("V3_DBG_RECYCLE_OF_CODEOFF");
+                            void * tgt = nullptr;
+                            uint32_t coTarget = 0;
+                            if (s_pt) sscanf(s_pt, "%p", &tgt);
+                            if (s_co) coTarget = (uint32_t)std::atoi(s_co);
+                            bool matchPtr = tgt && fClosure == tgt;
+                            bool matchCo = coTarget != 0 && fClosure
+                                && fClosure->desc
+                                && fClosure->desc->codeOffset == coTarget;
+                            if (matchPtr || matchCo) {
+                                    std::fprintf(stderr,
+                                        "v3 RECYCLE-CALLSITE: fClosure=%p "
+                                        "desc=%p codeOff=%u nUp=%u fThunk=%p "
+                                        "fFlags=0x%x retVal-tag=%u\n",
+                                        (void *)fClosure,
+                                        (void *)(fClosure ? fClosure->desc : nullptr),
+                                        fClosure && fClosure->desc
+                                            ? fClosure->desc->codeOffset : 0,
+                                        fClosure ? (unsigned)fClosure->nUpvalues : 0,
+                                        (const void *)fThunk,
+                                        (unsigned)fFlags,
+                                        (unsigned)retVal.tag());
+                                    // Dump current frame stack (after pop).
+                                    std::fprintf(stderr,
+                                        "  frame stack post-pop (size=%zu):\n",
+                                        vm.frames.size());
+                                    size_t lim = vm.frames.size();
+                                    for (size_t fi = lim;
+                                         fi > 0 && fi + 6 > lim; --fi) {
+                                        const auto & frD = vm.frames[fi - 1];
+                                        const LambdaDescriptor * d2 = nullptr;
+                                        if (frD.thunk
+                                            && (frD.thunk->state == ThunkState::Suspended
+                                                || frD.thunk->state == ThunkState::Blackhole))
+                                            d2 = frD.thunk->suspended.desc;
+                                        else if (frD.closure) d2 = frD.closure->desc;
+                                        std::fprintf(stderr,
+                                            "    [%zu] name=%s codeOff=%u ip=%u flags=0x%x closure=%p thunk=%p\n",
+                                            fi - 1,
+                                            d2 && !d2->name.empty() ? d2->name.c_str() : "<?>",
+                                            d2 ? d2->codeOffset : 0,
+                                            frD.ip, (unsigned)frD.flags,
+                                            (const void *)frD.closure,
+                                            (const void *)frD.thunk);
+                                    }
+                            }
+                        }
+                        // Phase A5 FIX (RCA 2026-05-11): recycleFakeClo
+                        // self-rejects when fClosure isn't actually a
+                        // fakeClo (kFakeCloMagic sentinel check in
+                        // alloc.hh).  Safe to call unconditionally; a
+                        // tail-call-replaced cur.closure is a real
+                        // closure with _pad=0 and gets rejected.
                         Alloc::recycleFakeClo(fClosure);
+                    }
                 }
 
                 // WC-38: the legacy "return-chain push" -- eagerly
@@ -4266,6 +4520,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Closure * fakeClo = __builtin_expect(s_noClosurePool, 0)
                 ? Alloc::allocClosure(t->nUpvalues)
                 : Alloc::allocFakeClo(t->nUpvalues);
+            // Phase A5 RCA: alarm when fakeClo's pre-overwrite desc is
+            // a "real" closure body (i.e., codeOff != 0 and name not
+            // empty).  A recycled-fakeClo pool would only set desc to a
+            // thunk-body — never to an OP_MAKE_CLOSURE-created closure.
+            // If we ever see a recycled fakeClo whose existing desc was
+            // for a real closure (e.g., codeOff=2863), the pool has
+            // returned a pointer that's STILL alive in the cell.
+            {
+                static const char * s_atFC =
+                    std::getenv("V3_DBG_FAKECLO_AT_PTR");
+                if (__builtin_expect(s_atFC != nullptr, 0)) {
+                    void * target = nullptr;
+                    sscanf(s_atFC, "%p", &target);
+                    if (fakeClo == target) {
+                        const LambdaDescriptor * preDesc = fakeClo->desc;
+                        std::fprintf(stderr,
+                            "v3 FAKECLO@%p: OVERWRITE desc pre=%p new=%p"
+                            " (pre-codeOff=%u new-codeOff=%u nUp=%u)\n",
+                            (void *)fakeClo,
+                            (const void *)preDesc,
+                            (const void *)desc,
+                            preDesc ? preDesc->codeOffset : 0,
+                            desc ? desc->codeOffset : 0,
+                            (unsigned)t->nUpvalues);
+                    }
+                }
+            }
             fakeClo->desc = desc;
             fakeClo->nUpvalues = t->nUpvalues;
             fakeClo->capturedWiths = t->suspended.capturedWiths;
@@ -5212,32 +5493,79 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     push(vm, slot);
                 }
                 // Phase A4 diagnostic mirror (IC fast path).
+                // Chases through Tag::Thunk(Evaluated) + Tag::Slot to
+                // find size-1 attrs results.  Without the chase, we miss
+                // cases where SELECT pushes a still-thunk that later
+                // resolves to the matching attrs.
                 {
                     static const char * s_dbgSelR =
                         std::getenv("V3_DBG_SELECT_RESULT");
                     if (__builtin_expect(s_dbgSelR != nullptr, 0)) {
-                        const Value & top_val = vm.valueStack.back();
-                        if (top_val.tag() == Tag::Attrs && top_val.payload.bindings
-                            && top_val.payload.bindings->size == 1) {
+                        Value chase = vm.valueStack.back();
+                        int hops = 0;
+                        while (hops < 8) {
+                            if (chase.tag() == Tag::Slot && chase.payload.slot) {
+                                chase = *chase.payload.slot;
+                            } else if (chase.tag() == Tag::Thunk && chase.payload.thunk
+                                       && chase.payload.thunk->state == ThunkState::Evaluated) {
+                                chase = chase.payload.thunk->evaluated;
+                            } else break;
+                            ++hops;
+                        }
+                        if (chase.tag() == Tag::Attrs && chase.payload.bindings
+                            && chase.payload.bindings->size == 1) {
                             const auto & st = ir::globalSymbolTable();
-                            SymbolId rnm = top_val.payload.bindings->entries[0].name;
+                            SymbolId rnm = chase.payload.bindings->entries[0].name;
                             const char * rnmStr = rnm < st.size() ? st[rnm].c_str() : "?";
                             if (std::strcmp(rnmStr, s_dbgSelR) == 0) {
                                 SymbolId selSym = static_cast<SymbolId>(operand);
                                 const char * selStr = selSym < st.size() ? st[selSym].c_str() : "?";
                                 std::fprintf(stderr,
-                                    "v3 SELECT(IC) returned {%s} (size=1) when selecting '%s' "
-                                    "from bindings ptr=%p size=%u\n",
-                                    rnmStr, selStr, (const void *)b, (unsigned)b->size);
+                                    "v3 SELECT(IC) returned chase-to {%s} (chase-hops=%d) "
+                                    "when selecting '%s' from bindings ptr=%p size=%u; "
+                                    "pushed-tag=%u\n",
+                                    rnmStr, hops, selStr, (const void *)b,
+                                    (unsigned)b->size,
+                                    (unsigned)vm.valueStack.back().tag());
                                 if (const BindingsOrigin * o =
                                         lookupBindingsOrigin(b)) {
                                     const PosSnapshot * ps =
                                         resolvePosSnapshot(o->posHandle);
                                     std::fprintf(stderr,
-                                        "  bindings-origin=%s@%s:%u\n",
+                                        "  source-bindings-origin=%s@%s:%u\n",
                                         o->source ? o->source : "?",
                                         (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
                                         ps ? ps->line : 0u);
+                                }
+                                if (const BindingsOrigin * o2 =
+                                        lookupBindingsOrigin(chase.payload.bindings)) {
+                                    const PosSnapshot * ps =
+                                        resolvePosSnapshot(o2->posHandle);
+                                    std::fprintf(stderr,
+                                        "  chased-result-origin=%s@%s:%u\n",
+                                        o2->source ? o2->source : "?",
+                                        (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                                        ps ? ps->line : 0u);
+                                }
+                                // Dump current frame so we know which
+                                // lambda/thunk is reading the bad slot.
+                                if (!vm.frames.empty()) {
+                                    const auto & fr = vm.frames.back();
+                                    const LambdaDescriptor * d = nullptr;
+                                    if (fr.thunk
+                                        && (fr.thunk->state == ThunkState::Suspended
+                                            || fr.thunk->state == ThunkState::Blackhole))
+                                        d = fr.thunk->suspended.desc;
+                                    else if (fr.closure) d = fr.closure->desc;
+                                    const PosSnapshot * fps =
+                                        d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                                    std::fprintf(stderr,
+                                        "  reading-frame: name=%s pos=%s:%u:%u codeOff=%u thunk=%p\n",
+                                        d && !d->name.empty() ? d->name.c_str() : "<?>",
+                                        (fps && !fps->file.empty()) ? fps->file.c_str() : "<?>",
+                                        fps ? fps->line : 0u, fps ? fps->column : 0u,
+                                        d ? d->codeOffset : 0u,
+                                        (const void *)fr.thunk);
                                 }
                             }
                         }
@@ -5320,10 +5648,84 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 } else {
                     push(vm, slot);
                 }
-                // Phase A3: when the selected value is a size-1 attrs
-                // matching V3_DBG_SELECT_RESULT, dump the SOURCE
-                // attrset's full keyset + values so we can see what
-                // attrset has the bad `.name = {family}` entry.
+                // Phase A4: chase Tag::Slot / Tag::Thunk(Evaluated) so
+                // we catch results that *resolve* to {family} after
+                // chasing.
+                {
+                    static const char * s_dbgSelR_chase =
+                        std::getenv("V3_DBG_SELECT_RESULT");
+                    if (__builtin_expect(s_dbgSelR_chase != nullptr, 0)) {
+                        Value chase = vm.valueStack.back();
+                        int hops = 0;
+                        while (hops < 8) {
+                            if (chase.tag() == Tag::Slot && chase.payload.slot) {
+                                chase = *chase.payload.slot;
+                            } else if (chase.tag() == Tag::Thunk
+                                       && chase.payload.thunk
+                                       && chase.payload.thunk->state == ThunkState::Evaluated) {
+                                chase = chase.payload.thunk->evaluated;
+                            } else break;
+                            ++hops;
+                        }
+                        if (chase.tag() == Tag::Attrs && chase.payload.bindings
+                            && chase.payload.bindings->size == 1) {
+                            const auto & st = ir::globalSymbolTable();
+                            SymbolId rnm = chase.payload.bindings->entries[0].name;
+                            const char * rnmStr = rnm < st.size() ? st[rnm].c_str() : "?";
+                            if (std::strcmp(rnmStr, s_dbgSelR_chase) == 0) {
+                                SymbolId selSym = static_cast<SymbolId>(operand);
+                                const char * selStr = selSym < st.size() ? st[selSym].c_str() : "?";
+                                std::fprintf(stderr,
+                                    "v3 SELECT(slow) returned chase-to {%s} (hops=%d) "
+                                    "selecting '%s' from bindings ptr=%p size=%u; pushed-tag=%u\n",
+                                    rnmStr, hops, selStr, (const void *)b,
+                                    (unsigned)b->size,
+                                    (unsigned)vm.valueStack.back().tag());
+                                if (const BindingsOrigin * o =
+                                        lookupBindingsOrigin(b)) {
+                                    const PosSnapshot * ps =
+                                        resolvePosSnapshot(o->posHandle);
+                                    std::fprintf(stderr,
+                                        "  source-origin=%s@%s:%u\n",
+                                        o->source ? o->source : "?",
+                                        (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                                        ps ? ps->line : 0u);
+                                }
+                                if (const BindingsOrigin * o2 =
+                                        lookupBindingsOrigin(chase.payload.bindings)) {
+                                    const PosSnapshot * ps =
+                                        resolvePosSnapshot(o2->posHandle);
+                                    std::fprintf(stderr,
+                                        "  chased-origin=%s@%s:%u\n",
+                                        o2->source ? o2->source : "?",
+                                        (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                                        ps ? ps->line : 0u);
+                                }
+                                if (!vm.frames.empty()) {
+                                    const auto & fr = vm.frames.back();
+                                    const LambdaDescriptor * d = nullptr;
+                                    if (fr.thunk
+                                        && (fr.thunk->state == ThunkState::Suspended
+                                            || fr.thunk->state == ThunkState::Blackhole))
+                                        d = fr.thunk->suspended.desc;
+                                    else if (fr.closure) d = fr.closure->desc;
+                                    const PosSnapshot * fps =
+                                        d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                                    std::fprintf(stderr,
+                                        "  reading-frame: name=%s pos=%s:%u:%u codeOff=%u\n",
+                                        d && !d->name.empty() ? d->name.c_str() : "<?>",
+                                        (fps && !fps->file.empty()) ? fps->file.c_str() : "<?>",
+                                        fps ? fps->line : 0u, fps ? fps->column : 0u,
+                                        d ? d->codeOffset : 0u);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Phase A3 (original): when the SELECT immediate result
+                // is a size-1 attrs matching V3_DBG_SELECT_RESULT, dump
+                // it.  Kept for back-compat; the chase-version above
+                // is more permissive.
                 {
                     static const char * s_dbgSelR =
                         std::getenv("V3_DBG_SELECT_RESULT");
@@ -5361,6 +5763,113 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                 std::fprintf(stderr, "\n");
                             }
                         }
+                    }
+                }
+            }
+            // Phase A5 (RCA 2026-05-11): frame-focused unconditional SELECT
+            // trace.  When V3_DBG_SELECT_AT_CODEOFF=<codeoff> is set, dump
+            // EVERY OP_ATTRS_SELECT executed in any frame whose thunk's
+            // descriptor has the matching codeOffset.  This is the
+            // narrowest possible scope — only fires inside the specific
+            // body being investigated.  Logs source bindings shape, the
+            // result on top of stack (with chase), and the SELECT operand
+            // name.  Used to localise the cpuName thunk's SELECT that
+            // produces {family}.
+            {
+                static const char * s_atCo =
+                    std::getenv("V3_DBG_SELECT_AT_CODEOFF");
+                if (__builtin_expect(s_atCo != nullptr, 0)) {
+                    uint32_t targetCo = static_cast<uint32_t>(std::atoi(s_atCo));
+                    const auto & fr = vm.frames.back();
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk
+                        && (fr.thunk->state == ThunkState::Suspended
+                            || fr.thunk->state == ThunkState::Blackhole))
+                        d = fr.thunk->suspended.desc;
+                    else if (fr.closure)
+                        d = fr.closure->desc;
+                    if (d && d->codeOffset == targetCo) {
+                        const auto & st = ir::globalSymbolTable();
+                        SymbolId selSym = static_cast<SymbolId>(operand);
+                        const char * selStr =
+                            selSym < st.size() ? st[selSym].c_str() : "?";
+                        const Value & top = vm.valueStack.back();
+                        std::fprintf(stderr,
+                            "v3 SELECT@codeOff[%u] sym='%s' ip=%u "
+                            "src-bindings=%p src-size=%u src-keys={",
+                            targetCo, selStr, ip - 2,
+                            (const void *)b, (unsigned)b->size);
+                        for (uint32_t k = 0; k < b->size && k < 16; ++k) {
+                            SymbolId nm = b->entries[k].name;
+                            std::fprintf(stderr, "%s%s",
+                                k ? "," : "",
+                                nm < st.size() ? st[nm].c_str() : "?");
+                        }
+                        std::fprintf(stderr, "} pushed-tag=%u",
+                            (unsigned)top.tag());
+                        // Walk chase for the pushed value to find the
+                        // ultimate WHNF.
+                        Value chase = top;
+                        int hops = 0;
+                        while (hops < 16) {
+                            if (chase.tag() == Tag::Slot && chase.payload.slot)
+                                chase = *chase.payload.slot;
+                            else if (chase.tag() == Tag::Thunk
+                                     && chase.payload.thunk
+                                     && chase.payload.thunk->state == ThunkState::Evaluated)
+                                chase = chase.payload.thunk->evaluated;
+                            else break;
+                            ++hops;
+                        }
+                        std::fprintf(stderr,
+                            " chase-tag=%u (hops=%d)",
+                            (unsigned)chase.tag(), hops);
+                        if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                            std::fprintf(stderr, " chase-attrs-size=%u chase-keys={",
+                                chase.payload.bindings->size);
+                            uint32_t sz = chase.payload.bindings->size;
+                            for (uint32_t k = 0; k < sz && k < 16; ++k) {
+                                SymbolId nm =
+                                    chase.payload.bindings->entries[k].name;
+                                std::fprintf(stderr, "%s%s",
+                                    k ? "," : "",
+                                    nm < st.size() ? st[nm].c_str() : "?");
+                            }
+                            std::fprintf(stderr, "}");
+                            if (const BindingsOrigin * o2 =
+                                    lookupBindingsOrigin(chase.payload.bindings)) {
+                                const PosSnapshot * ps =
+                                    resolvePosSnapshot(o2->posHandle);
+                                std::fprintf(stderr,
+                                    " chase-attrs-origin=%s@%s:%u",
+                                    o2->source ? o2->source : "?",
+                                    (ps && !ps->file.empty())
+                                        ? ps->file.c_str() : "?",
+                                    ps ? ps->line : 0u);
+                            }
+                        } else if (chase.tag() == Tag::String
+                                   && chase.payload.str) {
+                            std::fprintf(stderr,
+                                " chase-str=\"%.40s\"", chase.payload.str);
+                        } else if (chase.tag() == Tag::Thunk
+                                   && chase.payload.thunk) {
+                            std::fprintf(stderr,
+                                " chase-thunk=%p state=%d",
+                                (void *)chase.payload.thunk,
+                                (int)chase.payload.thunk->state);
+                        }
+                        if (const BindingsOrigin * o =
+                                lookupBindingsOrigin(b)) {
+                            const PosSnapshot * ps =
+                                resolvePosSnapshot(o->posHandle);
+                            std::fprintf(stderr,
+                                " src-origin=%s@%s:%u",
+                                o->source ? o->source : "?",
+                                (ps && !ps->file.empty())
+                                    ? ps->file.c_str() : "?",
+                                ps ? ps->line : 0u);
+                        }
+                        std::fprintf(stderr, "\n");
                     }
                 }
             }
@@ -5914,6 +6423,119 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.mkSlot(found);
             push(vm, v);
+            // Phase A5: frame-focused unconditional SLOT_REF trace.  When
+            // V3_DBG_SELECT_AT_CODEOFF=<codeoff> is set, dump every
+            // OP_REC_BINDING_SLOT_REF executed in any frame whose thunk's
+            // descriptor has the matching codeOffset.  Logs the slot's
+            // current contents (and chase-through-WHNF for indirect cases).
+            {
+                static const char * s_atCo =
+                    std::getenv("V3_DBG_SELECT_AT_CODEOFF");
+                if (__builtin_expect(s_atCo != nullptr, 0)) {
+                    uint32_t targetCo = static_cast<uint32_t>(std::atoi(s_atCo));
+                    const auto & fr = vm.frames.back();
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk
+                        && (fr.thunk->state == ThunkState::Suspended
+                            || fr.thunk->state == ThunkState::Blackhole))
+                        d = fr.thunk->suspended.desc;
+                    else if (fr.closure)
+                        d = fr.closure->desc;
+                    if (d && d->codeOffset == targetCo) {
+                        const auto & st = ir::globalSymbolTable();
+                        std::string nm = (sym < st.size()) ? st[sym] : "?";
+                        Tag slotTag = found->tag();
+                        std::fprintf(stderr,
+                            "v3 SLOT_REF@codeOff[%u] sym='%s' "
+                            "src-bindings=%p src-size=%u slot=%p slot-tag=%u",
+                            targetCo, nm.c_str(),
+                            (void *)b, (unsigned)b->size,
+                            (void *)found, (unsigned)slotTag);
+                        // Chase slot contents to WHNF (read-only inspect).
+                        Value cur = *found;
+                        int hops = 0;
+                        while (hops < 16) {
+                            if (cur.tag() == Tag::Slot && cur.payload.slot)
+                                cur = *cur.payload.slot;
+                            else if (cur.tag() == Tag::Thunk
+                                     && cur.payload.thunk
+                                     && cur.payload.thunk->state == ThunkState::Evaluated)
+                                cur = cur.payload.thunk->evaluated;
+                            else break;
+                            ++hops;
+                        }
+                        std::fprintf(stderr,
+                            " chase-tag=%u (hops=%d)",
+                            (unsigned)cur.tag(), hops);
+                        if (cur.tag() == Tag::Attrs && cur.payload.bindings) {
+                            uint32_t sz = cur.payload.bindings->size;
+                            std::fprintf(stderr, " size=%u keys={", sz);
+                            for (uint32_t k = 0; k < sz && k < 16; ++k) {
+                                SymbolId nn =
+                                    cur.payload.bindings->entries[k].name;
+                                std::fprintf(stderr, "%s%s",
+                                    k ? "," : "",
+                                    nn < st.size() ? st[nn].c_str() : "?");
+                            }
+                            std::fprintf(stderr, "}");
+                            if (const BindingsOrigin * o2 =
+                                    lookupBindingsOrigin(cur.payload.bindings)) {
+                                const PosSnapshot * ps =
+                                    resolvePosSnapshot(o2->posHandle);
+                                std::fprintf(stderr,
+                                    " origin=%s@%s:%u",
+                                    o2->source ? o2->source : "?",
+                                    (ps && !ps->file.empty())
+                                        ? ps->file.c_str() : "?",
+                                    ps ? ps->line : 0u);
+                            }
+                        } else if (cur.tag() == Tag::String && cur.payload.str) {
+                            std::fprintf(stderr,
+                                " str=\"%.40s\"", cur.payload.str);
+                        } else if (cur.tag() == Tag::Thunk && cur.payload.thunk) {
+                            std::fprintf(stderr,
+                                " thunk=%p state=%d",
+                                (void *)cur.payload.thunk,
+                                (int)cur.payload.thunk->state);
+                            // Dump the thunk's body source position so
+                            // we can tell whether the wrapped lambda is
+                            // what we expect.  Important for catching
+                            // upvalue mis-wires: e.g., the cpuName
+                            // thunk's darwinArch slot pointing at the
+                            // wrong closure body.
+                            auto * tt = cur.payload.thunk;
+                            const LambdaDescriptor * dd =
+                                (tt->state == ThunkState::Suspended
+                                 || tt->state == ThunkState::Blackhole)
+                                ? tt->suspended.desc : nullptr;
+                            const PosSnapshot * pps =
+                                dd ? resolvePosSnapshot(dd->posHandle) : nullptr;
+                            std::fprintf(stderr,
+                                " thunk-body=%s@%s:%u:%u codeOff=%u",
+                                dd && !dd->name.empty() ? dd->name.c_str() : "<?>",
+                                (pps && !pps->file.empty()) ? pps->file.c_str() : "<no-pos>",
+                                pps ? pps->line : 0u, pps ? pps->column : 0u,
+                                dd ? dd->codeOffset : 0u);
+                        } else if (cur.tag() == Tag::Closure
+                                   && cur.payload.closure
+                                   && cur.payload.closure->desc) {
+                            auto * dd = cur.payload.closure->desc;
+                            const PosSnapshot * pps =
+                                resolvePosSnapshot(dd->posHandle);
+                            std::fprintf(stderr,
+                                " closure-ptr=%p desc=%p closure-body=%s@%s:%u:%u codeOff=%u nUp=%u",
+                                (const void *)cur.payload.closure,
+                                (const void *)dd,
+                                !dd->name.empty() ? dd->name.c_str() : "<?>",
+                                (pps && !pps->file.empty()) ? pps->file.c_str() : "<no-pos>",
+                                pps ? pps->line : 0u, pps ? pps->column : 0u,
+                                dd->codeOffset,
+                                cur.payload.closure->nUpvalues);
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
             break;
         }
         case OP_WITH_LOOKUP: {
