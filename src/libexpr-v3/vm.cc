@@ -8190,6 +8190,22 @@ Value forceValue(VMState & vm, Value v)
                                     auto & fr = vm.frames[i - 1];
                                     if (fr.flags & CFF_THUNK_RETURN) {
                                         fr.flags |= CFF_TAINTED;
+                                        static const bool s_dbgTaint =
+                                            std::getenv("V3_DBG_TAINT") != nullptr;
+                                        if (s_dbgTaint) {
+                                            const auto * dd = (fr.thunk
+                                                && (fr.thunk->state == ThunkState::Suspended
+                                                    || fr.thunk->state == ThunkState::Blackhole))
+                                                ? fr.thunk->suspended.desc : nullptr;
+                                            const PosSnapshot * pps =
+                                                dd ? resolvePosSnapshot(dd->posHandle) : nullptr;
+                                            std::fprintf(stderr,
+                                                "v3 TAINT: thunk=%p name='%s' pos=%s:%u:%u\n",
+                                                (void *)fr.thunk,
+                                                dd && !dd->name.empty() ? dd->name.c_str() : "<?>",
+                                                (pps && !pps->file.empty()) ? pps->file.c_str() : "?",
+                                                pps ? pps->line : 0u, pps ? pps->column : 0u);
+                                        }
                                         break;
                                     }
                                 }
