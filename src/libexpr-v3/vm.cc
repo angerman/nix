@@ -4007,23 +4007,46 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // count.  Leaving it preserves alloc-time
                     // invariants (Bridge thunks etc.).
                 }
-                fr.thunk->state = ThunkState::Evaluated;
-                fr.thunk->evaluated = retVal;
-                // STG-8 (#498): cell update.  If this thunk was stored
-                // at a heap-stable cell (recorded at OP_ATTRS_REC_SET
-                // time), overwrite the cell's contents with the body's
-                // final result.  This mirrors tree-walker's in-place
-                // `forceValue` update — slots / sub-thunks that
-                // captured a Tag::Slot pointing at the cell now read
-                // the result via single deref, and foreign VMState
-                // observers stop seeing the leaked Black thunk.
+                // #558 (2026-05-11) Taint check: if this thunk's body
+                // used STG WHNF recovery (CFF_TAINTED set on this
+                // frame), the retVal is an APPROXIMATE result derived
+                // from chain.back() — a partial fix-point shape.
+                // Don't memoize: keep state Suspended so future forces
+                // re-run the body with whatever chain.back() is then.
                 //
-                // Read-and-clear: we want the write to fire exactly
-                // once per cell binding.  Idempotent on re-entry
-                // (cell becomes nullptr after first OP_RETURN).
-                if (Value * cell = fr.thunk->cell) {
-                    *cell = retVal;
-                    fr.thunk->cell = nullptr;
+                // The retVal is still returned to the caller (so this
+                // access gets the partial-but-best-current result),
+                // but no Evaluated transition.
+                //
+                // STG analog: a thunk that observed an in-flight
+                // indirection must re-evaluate.  Mirrors GHC's
+                // re-entrancy of selector thunks that observed
+                // BLACKHOLE.
+                if (fFlags & CFF_TAINTED) {
+                    // Don't memoize.  retVal stays on the value-stack
+                    // (already pushed earlier in OP_RETURN's pop).
+                    // No cell update either — would corrupt the slot
+                    // with stale data.
+                    fr.thunk->state = ThunkState::Suspended;
+                } else {
+                    fr.thunk->state = ThunkState::Evaluated;
+                    fr.thunk->evaluated = retVal;
+                    // STG-8 (#498): cell update.  If this thunk was stored
+                    // at a heap-stable cell (recorded at OP_ATTRS_REC_SET
+                    // time), overwrite the cell's contents with the body's
+                    // final result.  This mirrors tree-walker's in-place
+                    // `forceValue` update — slots / sub-thunks that
+                    // captured a Tag::Slot pointing at the cell now read
+                    // the result via single deref, and foreign VMState
+                    // observers stop seeing the leaked Black thunk.
+                    //
+                    // Read-and-clear: we want the write to fire exactly
+                    // once per cell binding.  Idempotent on re-entry
+                    // (cell becomes nullptr after first OP_RETURN).
+                    if (Value * cell = fr.thunk->cell) {
+                        *cell = retVal;
+                        fr.thunk->cell = nullptr;
+                    }
                 }
                 // #457/#458: clear the partial-Bindings registry
                 // entry now that the thunk's final value is set.
@@ -8067,6 +8090,28 @@ Value forceValue(VMState & vm, Value v)
                             // chain.back() as a single-layer Bindings.
                             // Consumers may need to peek the chain
                             // separately for full layer access.
+                            //
+                            // #558 (2026-05-11) Taint the calling
+                            // frame: this access returned an
+                            // APPROXIMATE WHNF.  If the frame is a
+                            // THUNK_RETURN, the thunk's body computed
+                            // a result derived from this approximation
+                            // — that result shouldn't be memoized
+                            // (since the chain may grow more-accurate
+                            // entries).  See CFF_TAINTED docs.
+                            //
+                            // Gated by NIX_V3_NO_TAINT=1 for bisecting.
+                            static const bool s_noTaint =
+                                std::getenv("NIX_V3_NO_TAINT") != nullptr;
+                            if (!s_noTaint) {
+                                for (size_t i = vm.frames.size(); i > 0; --i) {
+                                    auto & fr = vm.frames[i - 1];
+                                    if (fr.flags & CFF_THUNK_RETURN) {
+                                        fr.flags |= CFF_TAINTED;
+                                        break;
+                                    }
+                                }
+                            }
                             Value recovered;
                             recovered.tag_payload =
                                 static_cast<uint64_t>(Tag::Attrs);
