@@ -3299,6 +3299,59 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // different chain start fresh.
             vm.tailCallCount = 0;
             Value retVal = pop(vm);
+            // Phase A4 (RCA 2026-05-11): trace returns whose retVal is
+            // a size-1 attrs matching V3_DBG_RETURN_KEY (e.g. "family").
+            // Used to localize WHICH thunk's body produces the {family}
+            // value that ends up at the cpuName cell.
+            {
+                static const char * s_dbgRetK =
+                    std::getenv("V3_DBG_RETURN_KEY");
+                if (__builtin_expect(s_dbgRetK != nullptr, 0)
+                    && retVal.tag() == Tag::Attrs
+                    && retVal.payload.bindings
+                    && retVal.payload.bindings->size == 1) {
+                    const auto & st = ir::globalSymbolTable();
+                    SymbolId nm = retVal.payload.bindings->entries[0].name;
+                    const char * nmStr =
+                        nm < st.size() ? st[nm].c_str() : "?";
+                    if (std::strcmp(nmStr, s_dbgRetK) == 0) {
+                        const auto & fr = vm.frames.back();
+                        const LambdaDescriptor * d = nullptr;
+                        if (fr.thunk
+                            && (fr.thunk->state == ThunkState::Suspended
+                                || fr.thunk->state == ThunkState::Blackhole))
+                            d = fr.thunk->suspended.desc;
+                        else if (fr.closure) d = fr.closure->desc;
+                        const PosSnapshot * fps =
+                            d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                        std::fprintf(stderr,
+                            "v3 OP_RETURN with retVal={%s} (size=1) "
+                            "from frame: name=%s pos=%s:%u:%u codeOff=%u "
+                            "thunk=%p flags=0x%x ip=%u\n",
+                            nmStr,
+                            d && !d->name.empty() ? d->name.c_str() : "<?>",
+                            (fps && !fps->file.empty())
+                                ? fps->file.c_str() : "<no-pos>",
+                            fps ? fps->line : 0u,
+                            fps ? fps->column : 0u,
+                            d ? d->codeOffset : 0u,
+                            (const void *)fr.thunk,
+                            (unsigned)fr.flags,
+                            ip - 1);
+                        if (const BindingsOrigin * o =
+                                lookupBindingsOrigin(retVal.payload.bindings)) {
+                            const PosSnapshot * ops =
+                                resolvePosSnapshot(o->posHandle);
+                            std::fprintf(stderr,
+                                "  retVal-origin=%s@%s:%u\n",
+                                o->source ? o->source : "?",
+                                (ops && !ops->file.empty())
+                                    ? ops->file.c_str() : "?",
+                                ops ? ops->line : 0u);
+                        }
+                    }
+                }
+            }
             // Capture only the fields we need across the pop_back —
             // copying the whole CallFrame is the per-recursion-call
             // hot path on fib/ack benchmarks.
@@ -3594,6 +3647,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (Value * cell = fr.thunk->cell) {
                         cellOwnRecordWrite(cell, fr.thunk,
                                             "OP_RETURN/CFF_THUNK_RETURN");
+                        cellTraceWrite(cell, fr.thunk, retVal,
+                                        "OP_RETURN/CFF_THUNK_RETURN");
                         *cell = retVal;
                         fr.thunk->cell = nullptr;
                     }
@@ -4030,6 +4085,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // entries that share the recBuildCache Bindings).
                 if (Value * cell = t->cell) {
                     cellOwnRecordWrite(cell, t, "OP_FORCE-Bridge");
+                    cellTraceWrite(cell, t, resolved, "OP_FORCE-Bridge");
                     *cell = resolved;
                     t->cell = nullptr;
                 }
@@ -5154,6 +5210,38 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     push(vm, resolved);
                 } else {
                     push(vm, slot);
+                }
+                // Phase A4 diagnostic mirror (IC fast path).
+                {
+                    static const char * s_dbgSelR =
+                        std::getenv("V3_DBG_SELECT_RESULT");
+                    if (__builtin_expect(s_dbgSelR != nullptr, 0)) {
+                        const Value & top_val = vm.valueStack.back();
+                        if (top_val.tag() == Tag::Attrs && top_val.payload.bindings
+                            && top_val.payload.bindings->size == 1) {
+                            const auto & st = ir::globalSymbolTable();
+                            SymbolId rnm = top_val.payload.bindings->entries[0].name;
+                            const char * rnmStr = rnm < st.size() ? st[rnm].c_str() : "?";
+                            if (std::strcmp(rnmStr, s_dbgSelR) == 0) {
+                                SymbolId selSym = static_cast<SymbolId>(operand);
+                                const char * selStr = selSym < st.size() ? st[selSym].c_str() : "?";
+                                std::fprintf(stderr,
+                                    "v3 SELECT(IC) returned {%s} (size=1) when selecting '%s' "
+                                    "from bindings ptr=%p size=%u\n",
+                                    rnmStr, selStr, (const void *)b, (unsigned)b->size);
+                                if (const BindingsOrigin * o =
+                                        lookupBindingsOrigin(b)) {
+                                    const PosSnapshot * ps =
+                                        resolvePosSnapshot(o->posHandle);
+                                    std::fprintf(stderr,
+                                        "  bindings-origin=%s@%s:%u\n",
+                                        o->source ? o->source : "?",
+                                        (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                                        ps ? ps->line : 0u);
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 // Manual binary search inlined to also recover the
@@ -6618,9 +6706,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (std::strcmp(nmStr, s_dbgRecSetName) == 0) {
                         std::fprintf(stderr,
                             "v3 OP_ATTRS_REC_SET slot[%u]=%s on bindings ptr=%p"
-                            " (size=%u) <- value tag=%u",
+                            " (slot-storage=%p, size=%u) <- value tag=%u",
                             i, nmStr, (const void *)b,
+                            (const void *)&b->entries[i].value,
                             (unsigned)b->size, (unsigned)v.tag());
+                        if (v.isThunk() && v.payload.thunk)
+                            std::fprintf(stderr, " thunk-ptr=%p",
+                                (const void *)v.payload.thunk);
                         if (v.isAttrs() && v.payload.bindings) {
                             auto * vb = v.payload.bindings;
                             std::fprintf(stderr, " attrs size=%u {",
@@ -7985,6 +8077,7 @@ Value forceValue(VMState & vm, Value v)
             // TW value into all observers of that entry.
             if (Value * cell = t->cell) {
                 cellOwnRecordWrite(cell, t, "forceValue-Bridge");
+                cellTraceWrite(cell, t, v, "forceValue-Bridge");
                 *cell = v;
                 t->cell = nullptr;
             }

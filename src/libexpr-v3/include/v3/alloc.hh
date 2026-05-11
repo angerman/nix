@@ -817,6 +817,45 @@ inline void cellOwnRecordSet(const Value * storage, const Thunk * t,
     tbl[storage] = t;
 }
 
+// Trace every cell write when NIX_V3_DBG_CELL_TRACE=1 — orthogonal to
+// the I-CELL-1 ownership check.  Logs (storage, t, value-tag,
+// for-attrs-the-key-set) for each `*cell = v` that fires.  Used to
+// localize WHAT value lands at a given cell.
+inline bool cellTraceEnabled()
+{
+    static const bool v = std::getenv("NIX_V3_DBG_CELL_TRACE") != nullptr;
+    return v;
+}
+
+// Minimal cell-write trace: prints (storage, thunk, tag, attrs-size,
+// bindings-origin source@line if recorded).  Doesn't reach into the
+// ir:: namespace (alloc.hh sits below ir.hh in include order); callers
+// that want symbol-table annotation should call this AND then their
+// own context-aware dump.
+inline void cellTraceWrite(const Value * storage, const Thunk * t,
+                            const Value & writtenValue,
+                            const char * source) noexcept
+{
+    if (!storage || !cellTraceEnabled()) return;
+    Tag tg = writtenValue.tag();
+    std::fprintf(stderr,
+        "v3 CELL WRITE storage=%p thunk=%p value-tag=%u source=%s",
+        (const void *)storage, (const void *)t, (unsigned)tg,
+        source ? source : "<?>");
+    if (writtenValue.tag() == Tag::Attrs && writtenValue.payload.bindings) {
+        auto * b = writtenValue.payload.bindings;
+        std::fprintf(stderr, " attrs ptr=%p size=%u",
+            (const void *)b, (unsigned)b->size);
+        if (const BindingsOrigin * o = lookupBindingsOrigin(b)) {
+            std::fprintf(stderr, " value-origin=%s",
+                o->source ? o->source : "?");
+        }
+    } else if (writtenValue.tag() == Tag::String && writtenValue.payload.str) {
+        std::fprintf(stderr, " str=\"%.40s\"", writtenValue.payload.str);
+    }
+    std::fprintf(stderr, "\n");
+}
+
 inline void cellOwnRecordWrite(const Value * storage, const Thunk * t,
                                 const char * source) noexcept
 {
