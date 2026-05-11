@@ -8167,7 +8167,34 @@ Value forceValue(VMState & vm, Value v)
                                 std::getenv("V3_DBG_BLACKHOLE_AS_VALUE") != nullptr;
                             if (s_dbgBhv) {
                                 static thread_local uint64_t hits = 0;
-                                if (++hits == 1 || (hits & (hits - 1)) == 0)
+                                if (++hits == 1 || (hits & (hits - 1)) == 0) {
+                                    // #558: enrich with the thunk's name +
+                                    // source pos + caller frame.  Tells us
+                                    // WHICH thunk is being recovered and
+                                    // (via caller) what code path triggered
+                                    // the force.
+                                    const auto * dT =
+                                        (t->state == ThunkState::Suspended
+                                         || t->state == ThunkState::Blackhole)
+                                        ? t->suspended.desc : nullptr;
+                                    const PosSnapshot * psT =
+                                        dT ? resolvePosSnapshot(dT->posHandle)
+                                           : nullptr;
+                                    const LambdaDescriptor * dC = nullptr;
+                                    uint32_t cIp = 0;
+                                    if (!vm.frames.empty()) {
+                                        const auto & cfr = vm.frames.back();
+                                        cIp = cfr.ip;
+                                        if (cfr.thunk
+                                            && (cfr.thunk->state == ThunkState::Suspended
+                                                || cfr.thunk->state == ThunkState::Blackhole))
+                                            dC = cfr.thunk->suspended.desc;
+                                        else if (cfr.closure)
+                                            dC = cfr.closure->desc;
+                                    }
+                                    const PosSnapshot * psC =
+                                        dC ? resolvePosSnapshot(dC->posHandle)
+                                           : nullptr;
                                     std::fprintf(stderr,
                                         "v3 blackhole-as-WHNF (self-frame): thunk=%p "
                                         "bindings=%p size=%u (hits=%llu)\n",
@@ -8175,6 +8202,20 @@ Value forceValue(VMState & vm, Value v)
                                         (void *)it->second.back(),
                                         (unsigned)it->second.back()->size,
                                         (unsigned long long)hits);
+                                    std::fprintf(stderr,
+                                        "  thunk-name='%s' thunk-pos=%s:%u:%u\n",
+                                        dT && !dT->name.empty() ? dT->name.c_str() : "<?>",
+                                        (psT && !psT->file.empty()) ? psT->file.c_str() : "<no-pos>",
+                                        psT ? psT->line : 0u,
+                                        psT ? psT->column : 0u);
+                                    std::fprintf(stderr,
+                                        "  caller-frame: name='%s' pos=%s:%u:%u ip=%u\n",
+                                        dC && !dC->name.empty() ? dC->name.c_str() : "<?>",
+                                        (psC && !psC->file.empty()) ? psC->file.c_str() : "<no-pos>",
+                                        psC ? psC->line : 0u,
+                                        psC ? psC->column : 0u,
+                                        cIp);
+                                }
                             }
                             // #558 (2026-05-10) STG WHNF: return
                             // chain.back() as a single-layer Bindings.
