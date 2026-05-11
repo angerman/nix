@@ -6050,6 +6050,50 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             }
                             if (b->size > 16) std::fprintf(stderr, ",...");
                             std::fprintf(stderr, "}\n");
+
+                            // Source position chain — which nixpkgs
+                            // call site triggers this?  Walk the frame
+                            // stack and dump every frame's lambda name
+                            // + position so the failing source line
+                            // can be located.
+                            std::fprintf(stderr,
+                                "  STR_CONCAT call: n=%u forceStr=%d ip=%u\n",
+                                (unsigned)n, forceStr ? 1 : 0, ip - 1);
+                            size_t depth = vm.frames.size();
+                            size_t lo = depth > 16 ? depth - 16 : 0;
+                            for (size_t fi = depth; fi-- > lo; ) {
+                                const auto & fr = vm.frames[fi];
+                                const LambdaDescriptor * d = nullptr;
+                                if (fr.thunk
+                                    && (fr.thunk->state == ThunkState::Suspended
+                                        || fr.thunk->state == ThunkState::Blackhole))
+                                    d = fr.thunk->suspended.desc;
+                                else if (fr.closure) d = fr.closure->desc;
+                                const PosSnapshot * ps = d
+                                    ? resolvePosSnapshot(d->posHandle)
+                                    : nullptr;
+                                std::fprintf(stderr,
+                                    "  fr[%zu]: name=%s pos=%s:%u:%u ip=%u flags=0x%x%s\n",
+                                    fi,
+                                    d && !d->name.empty() ? d->name.c_str() : "<anon>",
+                                    (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                                    ps ? ps->line : 0u,
+                                    ps ? ps->column : 0u,
+                                    fr.ip, (unsigned)fr.flags,
+                                    fr.thunk ? " THUNK" : "");
+                            }
+                            // Also dump the i-th part's tag context —
+                            // useful when more than one operand is on
+                            // the stack to identify which is the bad
+                            // attrset.
+                            std::fprintf(stderr,
+                                "  failing part index=%u of %u operands; "
+                                "other operand tags=[", i, n);
+                            for (uint32_t k = 0; k < n; ++k) {
+                                if (k == i) std::fprintf(stderr, "%s%u←", k?",":"", (unsigned)parts[k].tag());
+                                else std::fprintf(stderr, "%s%u", k?",":"", (unsigned)parts[k].tag());
+                            }
+                            std::fprintf(stderr, "]\n");
                         }
                         break;  // no __toString, no outPath — fall through to coerceToString error
                     }
