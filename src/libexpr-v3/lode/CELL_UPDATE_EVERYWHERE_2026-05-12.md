@@ -98,3 +98,38 @@ Gate the new behavior with `NIX_V3_CELL_EVERYWHERE=1` for bisection. Default-off
 - Phase 1 hardening: ~2 days (run all tests, fix edge cases, document).
 - Phase 2 deletion: ~1-2 days (mechanical cleanup; harder to validate than to write).
 - Phase 3 validation: ~1 day (full nixpkgs + cardano-node v3-fhook bench).
+
+## Phase 1.5 design challenge (2026-05-12 follow-up)
+
+After committing the Phase 1 prototype (commit `421b97069`), we tried Phase 1.5 (pre-allocating cells at MAKE_THUNK so the outer `x` thunk has a cell to read).  We hit a structural conflict:
+
+**The existing STG-8 cell mechanism is dual-purpose:**
+
+1. **In-place parent slot update**: `OP_ATTRS_REC_SET` sets `child.cell = &parent.bindings.entries[i].value` so that at child's `OP_RETURN`, `*cell = retVal` updates the parent's entry IN PLACE.  This is TW's `forceValue(*v)` semantics — consumers reading the parent's entry get the updated value automatically.
+
+2. **"This thunk's value lives at this stable heap location"**: any code that wants to deref the value via a stable pointer can use `Tag::Slot(cell)`.
+
+If we pre-allocate `cell = allocValue()` at MAKE_THUNK, then OP_ATTRS_REC_SET (which only sets cell when nullptr) skips, and the cell stays pointing at a STANDALONE heap Value instead of the parent's entry slot.  At OP_RETURN, `*cell = retVal` updates the standalone Value, but the parent's entry stays at `Tag::Thunk(t)` — consumers reading the parent's entry pay an unnecessary force + chase.  STG-8's in-place update is broken.
+
+**Resolution options:**
+
+A. **Add a separate `shapeCell` field to Thunk** for the in-progress cell.  `cell` stays for STG-8's parent-slot semantics; `shapeCell` is the new pre-allocated heap Value.  forceValue Black reads `shapeCell` (if non-null and updated past the sentinel).  OP_ATTRS_REC_INIT updates `shapeCell` of the innermost THUNK_RETURN frame.  +16 bytes per Thunk, no STG-8 conflict.
+
+B. **Flip OP_ATTRS_REC_SET to override unconditionally** (delete the `cell == nullptr` precondition).  Pre-allocate at MAKE_THUNK; OP_ATTRS_REC_SET still wins.  Pro: same Thunk size.  Con: shared thunks (a literal used in two parent entries) — only the LAST parent's entry would get the cell, breaking the FIRST parent's slot-update.  Currently rare; need to audit.
+
+C. **Tag::Slot wrapper indirection**: don't store thunks directly in entries.  Always wrap as `Tag::Slot(cell)`.  Consumer reads slot → reads *cell → gets Thunk or final value.  More allocations but cleanest semantically — matches the existing STG-7 lambda-parameter slot pattern.
+
+**Recommendation:** Start with **option A** (separate shapeCell field).  Lowest risk, no regression to STG-8, fastest to validate.  Promote to option C in Phase 2 if it cleans up further.
+
+## Next session entry point
+
+Resume by implementing option A:
+
+1. **closure.hh**: add `Value * shapeCell` next to `Value * cell` in `struct Thunk`.
+2. **alloc.hh**: `allocThunkSuspended` allocates `shapeCell = allocValue()` and initializes `*shapeCell = Tag::Thunk(t)`.  Gated `NIX_V3_CELL_EVERYWHERE=1` via a static getenv check (or always-on if memory cost is acceptable).
+3. **vm.cc OP_ATTRS_REC_INIT**: update logic now writes to `fr.thunk->shapeCell` (not `cell`).
+4. **vm.cc forceValue Black branch**: read `t->shapeCell` (not `t->cell`).
+5. **vm.cc OP_RETURN**: clear `shapeCell` like `cell` is cleared (read-once).
+6. **Disk-cache schema bump** if Thunk size changes affect serialized lambda metadata.
+
+Estimated: ~1 day for option A.  Then validate v3-direct nixpkgs eval.  If cascade closes, proceed to Phase 2 (retire partial-Bindings registry).
