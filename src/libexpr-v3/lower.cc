@@ -1738,8 +1738,20 @@ struct Lowerer
             std::getenv("NIX_V3_LAMBDA_SKIP") != nullptr;
         static const bool s_noThunkify =
             std::getenv("NIX_V3_NO_INHERIT_FROM_THUNK") != nullptr;
-        static const bool s_thunkifyAll =
-            std::getenv("NIX_V3_INHERIT_FROM_THUNK_ALL") != nullptr || s_stgMode;
+        // #558 Phase 3 (2026-05-12): flipped DEFAULT-ON.  THUNK_ALL is
+        // required for cell-update-everywhere correctness — under
+        // NIX_V3_NO_PARTIAL_BINDINGS=1 (also default-on), the libsForQt5
+        // emit-order tests fail without THUNK_ALL because partial-
+        // Bindings was the legacy workaround for v3's eager inherit-from
+        // lowering.  With THUNK_ALL, inherit-from from-exprs are
+        // unconditionally lazy (matching TW's `from->maybeThunk`), so
+        // the cycle never arises.
+        //
+        // Opt back to the legacy "thunkify only complex from-exprs"
+        // mode via NIX_V3_NO_INHERIT_FROM_THUNK_ALL=1.
+        static const bool s_noThunkifyAll =
+            std::getenv("NIX_V3_NO_INHERIT_FROM_THUNK_ALL") != nullptr;
+        static const bool s_thunkifyAll = !s_noThunkifyAll;
         const bool useThunkBlanket = (s_lambdaSkip || s_thunkifyAll) && !s_noThunkify;
 
         // Heuristic for the `self.X` shape: ExprSelect whose head is

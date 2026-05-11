@@ -1425,14 +1425,20 @@ namespace { // -- reopen anon namespace
 /// When set, the only mechanism for mid-construction state visibility
 /// is the per-thunk shapeCell (#558 Phase 1.5).
 ///
+/// Phase 3.2 (2026-05-12): flipped DEFAULT-ON.  All 33 v3 test scripts
+/// pass with partial-Bindings disabled.  Cell-update-everywhere is the
+/// validated standalone mechanism.  Opt back to the legacy chain-based
+/// mechanism via NIX_V3_KEEP_PARTIAL_BINDINGS=1 for bisection if a
+/// regression surfaces.
+///
 /// Goal: validate cell-update-everywhere as the standalone STG-correct
 /// mechanism before retiring the partial-Bindings infrastructure
-/// entirely.
+/// entirely (Phase 3.3 — mechanical deletion).
 inline bool partialBindingsDisabled()
 {
-    static const bool s_disabled =
-        std::getenv("NIX_V3_NO_PARTIAL_BINDINGS") != nullptr;
-    return s_disabled;
+    static const bool s_enabled =
+        std::getenv("NIX_V3_KEEP_PARTIAL_BINDINGS") != nullptr;
+    return !s_enabled;
 }
 
 inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
