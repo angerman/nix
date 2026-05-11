@@ -8215,6 +8215,34 @@ Value forceValue(VMState & vm, Value v)
                                         psC ? psC->line : 0u,
                                         psC ? psC->column : 0u,
                                         cIp);
+                                    // #558: also dump the full caller stack
+                                    // so we can see the WHOLE chain that led
+                                    // to the force.  hits=1 alone tells us
+                                    // the entry point; deeper context tells
+                                    // us how we got there.
+                                    size_t nFrames = vm.frames.size();
+                                    size_t lo = 0;
+                                    for (size_t i = nFrames; i-- > lo;) {
+                                        const auto & cfr2 = vm.frames[i];
+                                        const LambdaDescriptor * dd = nullptr;
+                                        if (cfr2.thunk
+                                            && (cfr2.thunk->state == ThunkState::Suspended
+                                                || cfr2.thunk->state == ThunkState::Blackhole))
+                                            dd = cfr2.thunk->suspended.desc;
+                                        else if (cfr2.closure)
+                                            dd = cfr2.closure->desc;
+                                        const PosSnapshot * pps =
+                                            dd ? resolvePosSnapshot(dd->posHandle) : nullptr;
+                                        std::fprintf(stderr,
+                                            "    [%zu] %s ip=%u pos=%s:%u:%u flags=%u\n",
+                                            i,
+                                            dd && !dd->name.empty() ? dd->name.c_str() : "<?>",
+                                            cfr2.ip,
+                                            (pps && !pps->file.empty()) ? pps->file.c_str() : "<no-pos>",
+                                            pps ? pps->line : 0u,
+                                            pps ? pps->column : 0u,
+                                            (unsigned)cfr2.flags);
+                                    }
                                 }
                             }
                             // #558 (2026-05-10) STG WHNF: return
