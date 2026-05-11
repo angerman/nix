@@ -4933,105 +4933,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     chase = chase.payload.thunk->evaluated;
                     ++hops;
                 }
-                if (chase.isThunk()
-                    && chase.payload.thunk
-                    && chase.payload.thunk->state == ThunkState::Blackhole)
-                {
-                    auto & reg = partialBindingsRegistry();
-                    auto it = reg.find(chase.payload.thunk);
-                    if (it != reg.end()) {
-                        if (auto * v = lookupInPartialChain(
-                                it->second,
-                                static_cast<SymbolId>(operand))) {
-                            push(vm, *v);
-                            ip++;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (attrs.isThunk() && attrs.payload.thunk
-                && attrs.payload.thunk->state == ThunkState::Blackhole)
-            {
-                auto & reg = partialBindingsRegistry();
-                auto it = reg.find(attrs.payload.thunk);
-                if (it != reg.end()) {
-                    if (auto * v = lookupInPartialChain(
-                            it->second,
-                            static_cast<SymbolId>(operand))) {
-                        // Diagnostic: when chain peek returns a thunk
-                        // value (potentially the cycle-creating value),
-                        // log the source thunk + bindings.
-                        // V3_DBG_PEEK_THUNK=1.
-                        static const bool s_dbgPeekThunk =
-                            std::getenv("V3_DBG_PEEK_THUNK") != nullptr;
-                        if (s_dbgPeekThunk && v->isThunk()) {
-                            const auto & st = ir::globalSymbolTable();
-                            std::fprintf(stderr,
-                                "v3 OP_ATTRS_SELECT chain-peek: source=%p sym='%s' result-tag=%d result-thunk=%p chain-depth=%zu\n",
-                                (void *)attrs.payload.thunk,
-                                operand < st.size() ? st[operand].c_str() : "?",
-                                (int)v->tag(),
-                                (void *)v->payload.thunk,
-                                it->second.size());
-                            for (size_t li = 0; li < it->second.size(); ++li) {
-                                Bindings * b = it->second[li];
-                                std::fprintf(stderr,
-                                    "  layer[%zu] bindings=%p size=%u\n",
-                                    li, (void *)b, b ? b->size : 0);
-                            }
-                        }
-                        push(vm, *v);
-                        ip++;  // consume the icIdx operand word
-                        break;
-                    }
-                }
             }
             if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
-                try {
-                    attrs = forceValue(vm, attrs);
-                } catch (const BlackholeError &) {
-                    // Last-chance peek for partial Bindings (in case
-                    // the chase landed on a Black thunk we hadn't
-                    // seen at the top level).  Mirrors the
-                    // OP_WITH_LOOKUP catch-and-peek pattern.
-                    if (attrs.isThunk() && attrs.payload.thunk) {
-                        auto & reg = partialBindingsRegistry();
-                        auto it = reg.find(attrs.payload.thunk);
-                        if (it != reg.end()) {
-                            if (auto * v = lookupInPartialChain(
-                                    it->second,
-                                    static_cast<SymbolId>(operand))) {
-                                push(vm, *v);
-                                ip++;
-                                break;
-                            }
-                        }
-                    }
-                    throw;
-                }
-                // #558 (2026-05-10) Post-force chain peek.  When
-                // forceValue returns Tag::Thunk Black (under the
-                // Tag::Thunk-deferral STG WHNF semantics), use chain
-                // peek to walk all chain layers.  forceValue defers
-                // instead of collapsing to chain.back() so that
-                // consumers see the full chain.
-                if (attrs.isThunk() && attrs.payload.thunk
-                    && attrs.payload.thunk->state == ThunkState::Blackhole)
-                {
-                    auto & reg = partialBindingsRegistry();
-                    auto it = reg.find(attrs.payload.thunk);
-                    if (it != reg.end()) {
-                        if (auto * v = lookupInPartialChain(
-                                it->second,
-                                static_cast<SymbolId>(operand))) {
-                            push(vm, *v);
-                            ip++;
-                            break;
-                        }
-                    }
-                }
+                attrs = forceValue(vm, attrs);
             }
             if (!attrs.isAttrs()) {
                 // #558 (2026-05-10) diagnostic: log tag + symbol + frame
