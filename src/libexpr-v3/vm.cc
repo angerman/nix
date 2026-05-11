@@ -2864,9 +2864,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // `lazyArgs` bitmask (e.g., addErrorContext's value arg
                 // — see lib/modules.nix's
                 // `config = addErrorContext "..." config` cycle).
+                //
+                // Fast-path: skip forceValue function call if the arg
+                // is already in WHNF (Tag is not Thunk/App/Slot).
+                // CPU sample showed forceValue+424 (chase loop entry)
+                // at 5% of CPU under THUNK_ALL on nixpkgs — most of
+                // those are no-op calls for WHNF args.  Inline the
+                // tag check saves CALL/RET + setup per skipped arg.
                 for (uint32_t i = 0; i < po->arity; ++i) {
                     if (po->lazyArgs & (1u << i)) continue;
-                    buf[i] = forceValue(vm, buf[i]);
+                    Tag at = buf[i].tag();
+                    if (__builtin_expect(at == Tag::Thunk
+                                         || at == Tag::App
+                                         || at == Tag::Slot, 0))
+                        buf[i] = forceValue(vm, buf[i]);
                 }
                 bumpPrimOpCallCount(po);
                 EvalState state; state.vm = &vm;
@@ -8817,9 +8828,18 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     // (OP_CALL's preceding OP_FORCE; OP_RETURN's transitive chase),
     // but a few internal paths (the __functor recursion below; primop
     // map-style App entries forced inline) leave a Tag::Thunk or
-    // Tag::App on `fun`.  forceValue is idempotent on already-WHNF
-    // values, so the cost is one tag check on the hot path.
-    fun = forceValue(vm, fun);
+    // Tag::App on `fun`.  Fast-path: skip forceValue call if `fun` is
+    // already in WHNF.  Saves the CALL/RET + chase-loop setup for the
+    // common case where the caller already forced.  CPU sample showed
+    // callClosure+forceValue at >50% of CPU on nixpkgs THUNK_ALL;
+    // every saved no-op call counts.
+    {
+        Tag ft = fun.tag();
+        if (__builtin_expect(ft == Tag::Thunk
+                             || ft == Tag::App
+                             || ft == Tag::Slot, 0))
+            fun = forceValue(vm, fun);
+    }
     // V3_DBG_CALL_CLOSURE=1 prints every call: closure name + arg
     // shape.  Used to trace the broader-thunkify upvalue bug.
     static const bool s_dbgCallClosure =
