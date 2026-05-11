@@ -4423,6 +4423,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 b->entries[i].value = entries[i].value;
                 recordAttrPos(b, entries[i].name, entries[i].pos);
             }
+            // Phase A1: origin tracking (NIX_V3_DBG_BINDINGS_ORIGIN=1).
+            // Use the first entry's posHandle as a representative source
+            // location — the attrset literal's `{` is unattributed at IR
+            // level, but entry positions are close enough to localize.
+            recordBindingsOrigin(b, n > 0 ? entries[0].pos : 0, "OP_ATTRS_INIT");
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
@@ -4490,6 +4495,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 b->entries[i].value = std::get<1>(entries[i]);
                 recordAttrPos(b, std::get<0>(entries[i]), std::get<2>(entries[i]));
             }
+            // Phase A1: origin tracking.
+            recordBindingsOrigin(b,
+                entries.empty() ? 0 : std::get<2>(entries[0]),
+                "OP_ATTRS_INIT_DYN");
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
@@ -4550,14 +4559,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             uint32_t n = operand;
             Bindings * b = Alloc::allocBindings(n);
             allocStats().attrsetsAllocated++;
+            uint32_t firstPos = 0;
             for (uint32_t i = 0; i < n; ++i) {
                 SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
                 uint32_t ps = cu->code[ip + 2 * i + 1];
                 b->entries[i].name = nm;
                 b->entries[i].value.mkNull();
                 recordAttrPos(b, nm, ps);
+                if (i == 0) firstPos = ps;
             }
             ip += 2 * n;
+            // Phase A1: origin tracking.  Rec attrsets have stable
+            // identity (they're written to via OP_ATTRS_REC_SET); their
+            // origin is the same place across the rec-init/rec-set
+            // sequence.
+            recordBindingsOrigin(b, firstPos, "OP_ATTRS_REC_INIT");
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
@@ -4666,14 +4682,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             uint32_t n = operand;
             Bindings * b = Alloc::allocBindings(n);
             allocStats().attrsetsAllocated++;
+            uint32_t firstPosTail = 0;
             for (uint32_t i = 0; i < n; ++i) {
                 SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
                 uint32_t ps = cu->code[ip + 2 * i + 1];
                 b->entries[i].name = nm;
                 b->entries[i].value.mkNull();
                 recordAttrPos(b, nm, ps);
+                if (i == 0) firstPosTail = ps;
             }
             ip += 2 * n;
+            // Phase A1: origin tracking.  This is the tail-return rec
+            // init — the load-bearing one for cell-update-everywhere.
+            // Identifying which Nix source line emits this lets us
+            // localize which `rec { ... }` is being observed mid-state.
+            recordBindingsOrigin(b, firstPosTail, "OP_ATTRS_REC_INIT_TAIL");
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
@@ -6041,7 +6064,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             const auto & st = ir::globalSymbolTable();
                             std::fprintf(stderr,
                                 "v3 STR_CONCAT: attrs missing __toString/outPath "
-                                "(attrs size=%u): {", (unsigned)b->size);
+                                "(ptr=%p size=%u): {",
+                                (const void*)b, (unsigned)b->size);
                             for (uint32_t k = 0; k < b->size && k < 16; ++k) {
                                 SymbolId nm = b->entries[k].name;
                                 std::fprintf(stderr, "%s%s",
@@ -6050,6 +6074,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             }
                             if (b->size > 16) std::fprintf(stderr, ",...");
                             std::fprintf(stderr, "}\n");
+
+                            // Phase A2 (RCA 2026-05-11): bindings-origin
+                            // lookup.  When NIX_V3_DBG_BINDINGS_ORIGIN=1
+                            // is set, dump where this Bindings was
+                            // allocated (source file:line + alloc kind).
+                            // Without origin, we know the symptom but
+                            // not whose Bindings is misbehaving.
+                            if (const BindingsOrigin * orig =
+                                    lookupBindingsOrigin(b)) {
+                                const PosSnapshot * ops =
+                                    resolvePosSnapshot(orig->posHandle);
+                                std::fprintf(stderr,
+                                    "  bindings origin: source=%s pos=%s:%u:%u\n",
+                                    orig->source ? orig->source : "<?>",
+                                    (ops && !ops->file.empty())
+                                        ? ops->file.c_str()
+                                        : "<no-pos>",
+                                    ops ? ops->line : 0u,
+                                    ops ? ops->column : 0u);
+                            } else {
+                                std::fprintf(stderr,
+                                    "  bindings origin: <not recorded — "
+                                    "NIX_V3_DBG_BINDINGS_ORIGIN=1 to enable>\n");
+                            }
 
                             // Source position chain — which nixpkgs
                             // call site triggers this?  Walk the frame
@@ -6094,6 +6142,64 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                 else std::fprintf(stderr, "%s%u", k?",":"", (unsigned)parts[k].tag());
                             }
                             std::fprintf(stderr, "]\n");
+
+                            // Phase A2 (RCA 2026-05-11): dump the
+                            // top-frame's locals so we can see what
+                            // value `cpu` (or whichever local feeds the
+                            // failing operand) actually holds.  For
+                            // tripleFromSystem the formals destructure
+                            // into local slots [0..N]; the first slots
+                            // are cpu/vendor/kernel/abi.
+                            if (depth > 0) {
+                                const auto & topFr = vm.frames.back();
+                                size_t base = topFr.stackBaseOffset;
+                                size_t numLocals = vm.valueStack.size() - base;
+                                if (numLocals > 8) numLocals = 8;
+                                std::fprintf(stderr,
+                                    "  top-frame locals (base=%zu, %zu shown):\n",
+                                    base, numLocals);
+                                for (size_t li = 0; li < numLocals; ++li) {
+                                    const Value & lv = vm.valueStack[base + li];
+                                    Tag t = lv.tag();
+                                    std::fprintf(stderr,
+                                        "    local[%zu]: tag=%u", li, (unsigned)t);
+                                    if (t == Tag::Attrs && lv.payload.bindings) {
+                                        auto * lb = lv.payload.bindings;
+                                        std::fprintf(stderr, " attrs ptr=%p size=%u {",
+                                            (const void*)lb, (unsigned)lb->size);
+                                        for (uint32_t kk = 0; kk < lb->size && kk < 8; ++kk) {
+                                            SymbolId nm = lb->entries[kk].name;
+                                            std::fprintf(stderr, "%s%s", kk?",":"",
+                                                nm < st.size() ? st[nm].c_str() : "?");
+                                        }
+                                        if (lb->size > 8) std::fprintf(stderr, ",...");
+                                        std::fprintf(stderr, "}");
+                                        if (const BindingsOrigin * o2 =
+                                                lookupBindingsOrigin(lb)) {
+                                            const PosSnapshot * ops2 =
+                                                resolvePosSnapshot(o2->posHandle);
+                                            std::fprintf(stderr,
+                                                " origin=%s@%s:%u",
+                                                o2->source ? o2->source : "?",
+                                                (ops2 && !ops2->file.empty())
+                                                    ? ops2->file.c_str() : "?",
+                                                ops2 ? ops2->line : 0u);
+                                        }
+                                    } else if (t == Tag::String && lv.payload.str) {
+                                        std::fprintf(stderr, " str=\"%.40s\"",
+                                            lv.payload.str);
+                                    } else if (t == Tag::Slot && lv.payload.slot) {
+                                        std::fprintf(stderr,
+                                            " slot->tag=%u",
+                                            (unsigned)lv.payload.slot->tag());
+                                    } else if (t == Tag::Thunk && lv.payload.thunk) {
+                                        std::fprintf(stderr,
+                                            " thunk-state=%d",
+                                            (int)lv.payload.thunk->state);
+                                    }
+                                    std::fprintf(stderr, "\n");
+                                }
+                            }
                         }
                         break;  // no __toString, no outPath — fall through to coerceToString error
                     }

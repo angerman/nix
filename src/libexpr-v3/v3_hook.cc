@@ -2710,6 +2710,11 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                         b = Alloc::allocBindings(
                             static_cast<uint32_t>(pairs.size()));
                         allocStats().attrsetsAllocated++;
+                        // Phase A1 (RCA 2026-05-11): mark this Bindings
+                        // as a TW-bridge materialization.  The diagnostic
+                        // disambiguates bridge-built Bindings from v3-built
+                        // ones when investigating shape divergence.
+                        recordBindingsOrigin(b, 0, "treeWalkerToV3");
                         for (size_t i = 0; i < pairs.size(); ++i) {
                             b->entries[i].name  = pairs[i].first;
                             b->entries[i].value = pairs[i].second;

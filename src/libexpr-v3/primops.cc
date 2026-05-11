@@ -1345,6 +1345,7 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     if (!src) { out = args[1]; return; }
     Bindings * result = Alloc::allocBindings(src->size);
     allocStats().attrsetsAllocated++;
+    recordBindingsOrigin(result, 0, "primMapAttrs");
     for (uint32_t i = 0; i < src->size; ++i) {
         SymbolId sym = src->entries[i].name;
         Value nameStr = mkStringValueOwned(std::string(vmSymName(state, sym)));

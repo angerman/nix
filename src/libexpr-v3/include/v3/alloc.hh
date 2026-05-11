@@ -305,6 +305,12 @@ inline Arena & threadArena() noexcept
 // Allocator surface
 // ---------------------------------------------------------------------------
 
+// Forward declaration — defined further down, after the BindingsOrigin
+// table.  Allocators in `Alloc` call this to record the caller's source
+// file:line when NIX_V3_DBG_BINDINGS_ORIGIN=1.
+struct Bindings;
+void bindingsAllocSiteRecord(const Bindings * b, const char * file, uint32_t line) noexcept;
+
 struct Alloc
 {
     /// #548c (2026-05-10) Cheney nursery routing.  When the
@@ -448,7 +454,22 @@ struct Alloc
         return static_cast<char *>(threadArena().alloc(n));
     }
 
-    static Bindings * allocBindings(uint32_t n) noexcept
+    // Phase A1 (RCA 2026-05-11): record the C++ source location of every
+    // allocBindings call when NIX_V3_DBG_BINDINGS_ORIGIN=1.  Uses
+    // __builtin_FILE / __builtin_LINE so the actual caller file:line is
+    // captured without changing every call site.  Zero perf cost when
+    // the env-var is off — both __builtin_FILE and __builtin_LINE are
+    // compile-time constants embedded directly in the call.
+    //
+    // We don't store the full file:line at every binding (would explode
+    // the side-table), but we DO use the file+line as a hash to a small
+    // pool of "alloc-site" labels.  Callers that want a semantic label
+    // (e.g. "primMapAttrs") still get explicit recordBindingsOrigin()
+    // calls; this hook is the default-on fallback that makes EVERY
+    // Bindings allocation tagged with where it came from.
+    static Bindings * allocBindings(uint32_t n,
+                                     const char * file = __builtin_FILE(),
+                                     uint32_t     line = __builtin_LINE()) noexcept
     {
         const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * n;
         // Tenured by design (Phase C v1): Bindings entries[] hold
@@ -472,6 +493,13 @@ struct Alloc
         else if (n <= 64)       buckets[7]++;
         else if (n <= 128)      buckets[8]++;
         else                    buckets[9]++;
+        // Phase A1 default-recording (RCA 2026-05-11): tag every
+        // Bindings allocation with its C++ caller file:line when
+        // NIX_V3_DBG_BINDINGS_ORIGIN=1.  Routed through a forward-
+        // declared free helper that's defined further down (it needs
+        // <unordered_map> and the BindingsOrigin types, which appear
+        // later in this header).  Zero cost when the env-var is off.
+        bindingsAllocSiteRecord(b, file, line);
         return b;
     }
 
@@ -633,6 +661,98 @@ inline uint32_t lookupAttrPos(const Bindings * b, SymbolId name)
     auto & tbl = attrPosTable();
     auto it = tbl.find({b, name});
     return it == tbl.end() ? 0 : it->second;
+}
+
+// ---------------------------------------------------------------------------
+// Bindings origin side-table (Phase A1, RCA 2026-05-11).
+//
+// Diagnostic-only side-table that maps `Bindings*` → "where was this attrset
+// allocated".  Lets the cross-evaluator divergence harness answer the
+// "where did THIS specific size-1 {family} attrset come from?" question
+// that the STR_CONCAT failure surfaces.
+//
+// Gate: `NIX_V3_DBG_BINDINGS_ORIGIN=1`.  When unset, both record and lookup
+// are a single cached-bool branch — zero perf cost on the hot path.
+//
+// The origin info has two parts:
+//   - `posHandle` — index into `posSnapshotPool` (file:line:col).  Set when
+//     the OP_ATTRS_INIT call site has a known source position; 0 otherwise.
+//   - `source` — a string literal naming the alloc kind ("OP_ATTRS_INIT",
+//     "OP_ATTRS_REC_INIT", "primMapAttrs", "treeWalkerToV3", etc.).  Always
+//     non-null at record time; lookup returns nullptr for unrecorded ptrs.
+//
+// Lifetime: same as the per-attr position table — Bindings live process-
+// long; entries are not freed.  Bounded by the count of allocated Bindings
+// (~hundreds of thousands on full nixpkgs; ~MB of map storage).
+// ---------------------------------------------------------------------------
+
+struct BindingsOrigin
+{
+    uint32_t     posHandle;
+    const char * source;
+};
+
+inline bool bindingsOriginEnabled()
+{
+    static const bool v = std::getenv("NIX_V3_DBG_BINDINGS_ORIGIN") != nullptr;
+    return v;
+}
+
+inline std::unordered_map<const Bindings *, BindingsOrigin> & bindingsOriginTable()
+{
+    static std::unordered_map<const Bindings *, BindingsOrigin> tbl;
+    return tbl;
+}
+
+inline void recordBindingsOrigin(const Bindings * b, uint32_t pos, const char * src) noexcept
+{
+    if (!b || !bindingsOriginEnabled()) return;
+    bindingsOriginTable()[b] = {pos, src};
+}
+
+inline const BindingsOrigin * lookupBindingsOrigin(const Bindings * b)
+{
+    if (!b) return nullptr;
+    auto & tbl = bindingsOriginTable();
+    auto it = tbl.find(b);
+    return it == tbl.end() ? nullptr : &it->second;
+}
+
+// Default-record: tag a freshly-allocated Bindings with its caller's
+// C++ source location.  Forward-declared near the top of this header
+// so Alloc::allocBindings can call it.  No-op when
+// NIX_V3_DBG_BINDINGS_ORIGIN is unset; interns label strings into a
+// thread-local pool so the BindingsOrigin->source pointer is stable.
+inline void bindingsAllocSiteRecord(const Bindings * b,
+                                     const char * file,
+                                     uint32_t line) noexcept
+{
+    if (!b || !bindingsOriginEnabled()) return;
+    // Don't overwrite an explicit recordBindingsOrigin() call that
+    // happened just before allocBindings returned — the explicit
+    // semantic label wins.  (Per the recordBindingsOrigin contract:
+    // last write wins.  In practice the explicit recorder is called
+    // AFTER allocBindings, so this branch is a no-op for the explicit
+    // case.  But guarding here means we don't fight ourselves.)
+    if (lookupBindingsOrigin(b)) return;
+    static thread_local std::unordered_map<uint64_t, const char *> labels;
+    uint64_t key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(file)) * 1024
+                 + line;
+    auto it = labels.find(key);
+    const char * lbl;
+    if (it != labels.end()) {
+        lbl = it->second;
+    } else {
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "alloc@%s:%u",
+            file ? file : "<?>", line);
+        size_t len = std::strlen(buf) + 1;
+        char * out = static_cast<char *>(std::malloc(len));
+        std::memcpy(out, buf, len);
+        lbl = out;
+        labels[key] = lbl;
+    }
+    recordBindingsOrigin(b, 0, lbl);
 }
 
 // Resolved AST source position: file path string, line, and column.
