@@ -939,7 +939,13 @@ void primFilter(EvalState & state, Value * args, Value & out)
     for (uint32_t i = 0; i < src->size; ++i) {
         Value r = callClosure(*state.vm, pred, src->elems[i]);
         // Predicate result may be a thunk / app — force to WHNF.
-        r = forceValue(*state.vm, r);
+        {
+            Tag rt = r.tag();
+            if (__builtin_expect(rt == Tag::Thunk
+                                 || rt == Tag::App
+                                 || rt == Tag::Slot, 0))
+                r = forceValue(*state.vm, r);
+        }
         if (!r.isBool()) typeError("filter", "predicate returning bool");
         if (r.payload.i == 1) kept.push_back(src->elems[i]);
     }
@@ -1005,7 +1011,13 @@ void primAll(EvalState & state, Value * args, Value & out)
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
             Value r = callClosure(*state.vm, pred, src->elems[i]);
-            r = forceValue(*state.vm, r);
+            {
+                Tag rt = r.tag();
+                if (__builtin_expect(rt == Tag::Thunk
+                                     || rt == Tag::App
+                                     || rt == Tag::Slot, 0))
+                    r = forceValue(*state.vm, r);
+            }
             if (!r.isBool()) typeError("all", "bool from predicate");
             if (r.payload.i == 0) { all = false; break; }
         }
@@ -1022,7 +1034,13 @@ void primAny(EvalState & state, Value * args, Value & out)
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
             Value r = callClosure(*state.vm, pred, src->elems[i]);
-            r = forceValue(*state.vm, r);
+            {
+                Tag rt = r.tag();
+                if (__builtin_expect(rt == Tag::Thunk
+                                     || rt == Tag::App
+                                     || rt == Tag::Slot, 0))
+                    r = forceValue(*state.vm, r);
+            }
             if (!r.isBool()) typeError("any", "bool from predicate");
             if (r.payload.i == 1) { any = true; break; }
         }
@@ -1117,7 +1135,16 @@ void primConcatMap(EvalState & state, Value * args, Value & out)
             // (e.g., when fn = (x: map g xs) and v3's lazy map returns
             // a list with App entries, then concatMap of that gets the
             // nested-list-as-App-entry shape).
-            r = forceValue(*state.vm, r);
+            // #558 Phase 2: inline WHNF check.  callClosure typically
+            // returns an already-forced value; skip the forceValue
+            // function call for the WHNF path.
+            {
+                Tag rt = r.tag();
+                if (__builtin_expect(rt == Tag::Thunk
+                                     || rt == Tag::App
+                                     || rt == Tag::Slot, 0))
+                    r = forceValue(*state.vm, r);
+            }
             if (!r.isList()) typeError("concatMap", "function returning list");
             if (r.payload.list)
                 for (uint32_t j = 0; j < r.payload.list->size; ++j)
@@ -1142,7 +1169,13 @@ void primPartition(EvalState & state, Value * args, Value & out)
             Value r = callClosure(*state.vm, pred, src->elems[i]);
             // The predicate may return a thunk / app / closure-eval-
             // pending value — force it to WHNF before the bool check.
-            r = forceValue(*state.vm, r);
+            {
+                Tag rt = r.tag();
+                if (__builtin_expect(rt == Tag::Thunk
+                                     || rt == Tag::App
+                                     || rt == Tag::Slot, 0))
+                    r = forceValue(*state.vm, r);
+            }
             if (!r.isBool()) typeError("partition", "predicate returning bool");
             if (r.payload.i == 1) right_.push_back(src->elems[i]);
             else                  wrong_.push_back(src->elems[i]);
