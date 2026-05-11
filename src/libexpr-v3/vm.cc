@@ -7978,20 +7978,35 @@ Value forceValue(VMState & vm, Value v)
     // too late if C-stack is the limit.  Throw a clear error when
     // vm.frames.size() crosses a safer threshold; previously the
     // C-stack overflow surfaced as EXC_BAD_ACCESS with no diagnostic.
-    // Phase A7 telemetry — opt-in via NIX_V3_DEPTH_GUARD=1.  Throwing
-    // here loops via catch-and-retry sites (e.g. v3_hook fall-through
-    // to TW), each leaking memory — 41 throws on hello.name took 20 GB
-    // before SIGKILL.  Default-off; only enable to confirm where in
-    // the chase the depth grows.  When enabled, ABORTS rather than
-    // throws so the recursion doesn't get retried by upstream catchers.
+    // Phase A7 (RCA 2026-05-11): C-stack depth guard.  v3's forceValue
+    // is C-recursive (calls dispatchLoop which calls forceValue), so a
+    // long thunk-indirection chain — e.g. the darwin stdenv's final-
+    // stage assertions at pkgs/stdenv/darwin/default.nix:1174-1188,
+    // which transitively force many layered package thunks — blows the
+    // 8 MiB macOS thread stack at ~3000 nested forceValue frames.
+    //
+    // Without this guard the process is OOM-killed (SIGKILL, 10+ GB
+    // memory consumed in derivation construction) BEFORE the C-stack
+    // overflow finishes.  Default-on so v3-direct fails fast and
+    // visibly on workloads that exceed v3's recursive-eval capacity.
+    // Opt-out via NIX_V3_NO_DEPTH_GUARD=1 (e.g., for debug builds with
+    // larger thread stacks, or post-iterative-forceValue when this
+    // guard becomes redundant).
+    //
+    // Aborts (not throws) — a previous throw-based variant of this
+    // guard was caught by v3_hook bridge fall-through paths and retried
+    // 41 times, leaking ~20 GB before SIGKILL.
     {
-        static const bool s_depthGuard =
-            std::getenv("NIX_V3_DEPTH_GUARD") != nullptr;
-        if (__builtin_expect(s_depthGuard, 0)) {
+        static const bool s_noDepthGuard =
+            std::getenv("NIX_V3_NO_DEPTH_GUARD") != nullptr;
+        if (__builtin_expect(!s_noDepthGuard, 1)) {
             static thread_local size_t peakDepth = 0;
             if (__builtin_expect(vm.frames.size() > peakDepth, 0)) {
                 peakDepth = vm.frames.size();
-                if (peakDepth > 500 && (peakDepth % 100) == 0) {
+                static const bool s_logDepth =
+                    std::getenv("NIX_V3_LOG_DEPTH") != nullptr;
+                if (s_logDepth && peakDepth > 500
+                    && (peakDepth % 100) == 0) {
                     std::fprintf(stderr,
                         "v3 forceValue depth=%zu (peak)\n", peakDepth);
                     std::fflush(stderr);
