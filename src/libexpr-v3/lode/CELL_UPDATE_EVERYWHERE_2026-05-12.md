@@ -232,3 +232,56 @@ So the perf gap isn't "THUNK_ALL adds extra thunks for inherit-from".  It's "v3'
 | 2g | Run full nixpkgs `hello.name` end-to-end | Returns `"hello-2.12.2"` |
 
 Each sub-phase commits independently with regression gate.  No flag flips until 2f.
+
+---
+
+## Phase 2b investigation log (2026-05-12)
+
+Attempted to identify the THUNK_ALL slowdown via differential benchmarks:
+
+| Benchmark | TW | v3 | v3+THUNK_ALL |
+|---|---|---|---|
+| `1+2` | 50ms | 50ms | 50ms |
+| `import nixpkgs/lib` | 60ms | 50ms | 50ms |
+| `lib.systems.elaborate "aarch64-darwin"` | 60ms | 80ms | 80ms |
+| `foldl' 10K ints` | 50ms | 40ms | 40ms |
+| `mapAttrs over 1000 entries + // value` | 100ms | 60ms | 50ms |
+| `deep let-rec inherit-from (depth 100)` | 50ms | 50ms | 50ms |
+| `fix-point + 50-layer extends` | 50ms | 50ms | 50ms |
+| `mapAttrs + inherit-from combined` | 50ms | 60ms | 50ms |
+| Synthetic 50-stage bootstrap | 80ms | 50ms | 50ms |
+| Synthetic 100-stage bootstrap | 50ms | — | 50ms |
+| `pkgs ? lib` (full nixpkgs aarch64-darwin) | **500ms** | 600ms (error) | **>120s timeout** |
+| `pkgs.typeOf (overlays=[]; config={})` | **1.1s** | 600ms (error) | **>78s timeout** |
+
+**Finding:** The 100x+ slowdown is REPRODUCIBLY EXCLUSIVE to actual nixpkgs full-eval.  No synthetic workload reproduces it, including:
+- mapAttrs over 1000 entries (same pattern as parse.nix hot path)
+- 100-stage bootstrap with inherit-from across stages
+- Deep let-rec chains
+- Fix-point + extends layers
+- All combinations of these patterns
+
+**Hypothesis:** Something specific to nixpkgs's particular pattern density triggers a perf cliff that we can't reproduce synthetically.  Candidates we couldn't reach without a CPU profiler:
+- Cache thrashing from working-set exceeding L2/L3
+- Pathological exception-flow (BlackholeError catches/rethrows)
+- Phase-B fallback churn on specific TW-bridged primops
+- Quadratic behavior in `partialBindingsRegistry` registry walks
+- A specific opcode (OP_WITH_LOOKUP?) that becomes hot only at nixpkgs's with-scope density
+- Boehm GC pressure from arena hitting 224MB
+
+**The investigation is blocked on CPU profiler access.** macOS `sample`, `Instruments.app`, or `perf` on Linux would give CPU-cycle-attributed hot paths.  Without those, we're guessing.
+
+### Next-session entry point (CONCRETE)
+
+1. Attach `Instruments.app` Time Profiler or `sample` to a v3+THUNK_ALL nixpkgs eval that hits the slowdown.
+2. Capture the top-10 hot functions by CPU time.
+3. Match those to specific v3 code paths.
+4. Identify whether the bottleneck is:
+   - A specific opcode (OP_*)
+   - A primop callback bridge
+   - An allocator path
+   - A GC pause
+   - A hashing/comparison hot path
+5. Pick the top-1 hotspot, optimize it, re-time, iterate.
+
+Until profiler data is available, additional algorithmic guessing is unproductive.  The architecture is sound; the optimization needs measured hotspots, not speculation.
