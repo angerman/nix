@@ -5189,6 +5189,29 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
             publishToAllThunkFrames(vm, v);
+            // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere
+            // TAIL variant: tail-position result IS the function's
+            // (and tail-call ancestors') value.  Update ALL outer
+            // THUNK_RETURN frames' shapeCells — each gets its OWN
+            // shapeCell updated, no cross-thunk pollution at
+            // lookup time (consumers only read their own thunk's
+            // shapeCell, never others').  Mirrors
+            // publishToAllThunkFrames but per-thunk cell-targeted.
+            {
+                static const bool s_cellEverywhere =
+                    std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
+                if (__builtin_expect(s_cellEverywhere, 0)) {
+                    for (size_t fi = vm.frames.size(); fi > 0; --fi) {
+                        auto & fr = vm.frames[fi - 1];
+                        if (!(fr.flags & CFF_THUNK_RETURN)) continue;
+                        if (!fr.thunk) continue;
+                        if (!fr.thunk->shapeCell) continue;
+                        *fr.thunk->shapeCell = v;
+                        // Note: NO break — update ALL outer frames
+                        // (tail-position propagation).
+                    }
+                }
+            }
             push(vm, v);
             break;
         }
@@ -6030,6 +6053,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = out;
             publishToAllThunkFrames(vm, v);
+            // #558 Phase 1.5: tail-position // result.  Same
+            // cell-everywhere propagation as OP_ATTRS_REC_INIT_TAIL.
+            {
+                static const bool s_cellEverywhere =
+                    std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
+                if (__builtin_expect(s_cellEverywhere, 0)) {
+                    for (size_t fi = vm.frames.size(); fi > 0; --fi) {
+                        auto & fr = vm.frames[fi - 1];
+                        if (!(fr.flags & CFF_THUNK_RETURN)) continue;
+                        if (!fr.thunk) continue;
+                        if (!fr.thunk->shapeCell) continue;
+                        *fr.thunk->shapeCell = v;
+                    }
+                }
+            }
             push(vm, v);
             break;
         }
