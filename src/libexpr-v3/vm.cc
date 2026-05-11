@@ -5356,26 +5356,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 vm.frames.back().ip = ip;
                 rhs = forceValue(vm, rhs);
             }
-            // #558 (2026-05-10): collapse Tag::Thunk Black operands
-            // (returned by forceValue's deferral path) to chain.back()
-            // for the merge.  // semantics need a Bindings.
-            auto collapseDeferred = [](Value & v) {
-                if (v.isThunk() && v.payload.thunk
-                    && v.payload.thunk->state == ThunkState::Blackhole)
-                {
-                    auto & reg = partialBindingsRegistry();
-                    auto it = reg.find(v.payload.thunk);
-                    if (it != reg.end() && !it->second.empty()) {
-                        Value collapsed;
-                        collapsed.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                        collapsed.payload.bindings =
-                            pickLargestLayer(it->second);
-                        v = collapsed;
-                    }
-                }
-            };
-            collapseDeferred(lhs);
-            collapseDeferred(rhs);
+            // #558 Phase 3.3: Tag::Thunk Blackhole collapse retired.
             if (!lhs.isAttrs() || !rhs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_UPDATE: not attrsets");
             Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings);
@@ -5411,24 +5392,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // with chain), collapse to chain.back() for the merge.
             // // semantics need a Bindings; the chain peek approach
             // doesn't apply to // operands directly.  Approximation:
-            // use the latest chain entry as the operand.
-            auto collapseDeferred = [](Value & v) {
-                if (v.isThunk() && v.payload.thunk
-                    && v.payload.thunk->state == ThunkState::Blackhole)
-                {
-                    auto & reg = partialBindingsRegistry();
-                    auto it = reg.find(v.payload.thunk);
-                    if (it != reg.end() && !it->second.empty()) {
-                        Value collapsed;
-                        collapsed.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                        collapsed.payload.bindings =
-                            pickLargestLayer(it->second);
-                        v = collapsed;
-                    }
-                }
-            };
-            collapseDeferred(lhs);
-            collapseDeferred(rhs);
+            // #558 Phase 3.3: Tag::Thunk Blackhole collapse retired.
             if (!lhs.isAttrs() || !rhs.isAttrs()) {
                 static const bool s_dbg =
                     std::getenv("V3_DBG_UPDATE_FAIL") != nullptr;
@@ -5704,76 +5668,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
-                // #457/#458: tolerant force.  If the source thunk is
-                // currently being forced (Black) elsewhere on the
-                // stack, forceValue throws BlackHole.  But the
-                // partial-Bindings side-table may have an entry for
-                // it (populated by OP_ATTRS_REC_INIT when the thunk's
-                // body ran).  Use that to recover the partial Bindings
-                // and proceed.  Allows mid-construction rec-attrset
-                // self-reference to work without the structural
-                // closure-capture redesign.
-                // STG-2 (#547): side-table recovery is disabled by
-                // default.  STG semantics: a Black thunk access is a
-                // cycle and must throw, not be papered over with
-                // whatever the publish-walk happened to register.
-                // NIX_V3_NO_STG=1 restores the legacy recovery path.
-                static const bool s_stgMode_recref =
-                    std::getenv("NIX_V3_NO_STG") == nullptr;
-                Bindings * recoveredBindings = nullptr;
-                if (!s_stgMode_recref
-                    && attrs.tag() == Tag::Thunk && attrs.payload.thunk
-                    && attrs.payload.thunk->state == ThunkState::Blackhole) {
-                    auto & reg = partialBindingsRegistry();
-                    auto it = reg.find(attrs.payload.thunk);
-                    if (it != reg.end() && !it->second.empty()) {
-                        // Use the latest (back) entry as the
-                        // recovered bindings.  The chain's other
-                        // entries represent older layer
-                        // contributions; for whole-attrset recovery,
-                        // the latest-layer's view is closest to the
-                        // thunk's eventual value.
-                        //
-                        // #558 Phase 2: pickLargestLayer skips
-                        // finalized entries (lazy-cleanup).
-                        recoveredBindings = pickLargestLayer(it->second);
-                    }
-                }
-                if (recoveredBindings) {
-                    Value recovered;
-                    recovered.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                    recovered.payload.bindings = recoveredBindings;
-                    attrs = recovered;
-                } else {
-                    try {
-                        attrs = forceValue(vm, attrs);
-                    } catch (const BlackholeError &) {
-                        // Last-ditch: try the registry again (the
-                        // thunk's force might have transitioned but
-                        // the top-of-stack v3 thunk it's wrapping is
-                        // black).  STG-2: skip under NIX_V3_STG=1.
-                        if (!s_stgMode_recref
-                            && attrs.tag() == Tag::Thunk
-                            && attrs.payload.thunk) {
-                            auto & reg = partialBindingsRegistry();
-                            auto it = reg.find(attrs.payload.thunk);
-                            Bindings * recBnd = nullptr;
-                            if (it != reg.end())
-                                recBnd = pickLargestLayer(it->second);
-                            if (recBnd) {
-                                Value recovered;
-                                recovered.tag_payload =
-                                    static_cast<uint64_t>(Tag::Attrs);
-                                recovered.payload.bindings = recBnd;
-                                attrs = recovered;
-                            } else {
-                                throw;
-                            }
-                        } else {
-                            throw;
-                        }
-                    }
-                }
+                // #558 Phase 3.3: partial-Bindings recovery retired.
+                // Black thunk access throws — no chain consultation.
+                attrs = forceValue(vm, attrs);
             }
             if (!attrs.isAttrs() || !attrs.payload.bindings) {
                 throw std::runtime_error(
@@ -6548,18 +6445,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 // re-throw the same error).
 static void clearBlackMarksOnException(VMState & vm, size_t exitDepth)
 {
-    auto & reg = partialBindingsRegistry();
     for (size_t i = vm.frames.size(); i > exitDepth; --i) {
         auto & fr = vm.frames[i - 1];
         if ((fr.flags & CFF_THUNK_RETURN) && fr.thunk
             && fr.thunk->state == ThunkState::Blackhole) {
             fr.thunk->state = ThunkState::Suspended;
-            // #457/#458: drop any partial-Bindings registry entry
-            // tied to this thunk -- the body didn't complete, so
-            // the partial Bindings is incomplete and must not leak
-            // to subsequent forces.
-            auto it = reg.find(fr.thunk);
-            if (it != reg.end()) reg.erase(it);
         }
     }
     // WC-37: also unwind the leftover frames pushed by the failed
@@ -7510,56 +7400,7 @@ Value forceValue(VMState & vm, Value v)
                     }
                 }
             }
-            // #457/#458: before throwing, consult the partial-Bindings
-            // registry.  If this Black thunk's body has run
-            // OP_ATTRS_REC_INIT and registered a partial Bindings,
-            // return that as the resolved value.  This lets self-
-            // referential `with self;` and similar mid-construction
-            // attribute access work without forcing the wrapping
-            // thunk to completion (which is exactly what TW does via
-            // its lazy attr access on partial Bindings).
-            //
-            // STG-3 (#547): partialBindings recovery is disabled by
-            // default.  Real cycles must throw under STG semantics so
-            // the consumer sees the typed exception, not a wrong
-            // sub-attrset.  NIX_V3_NO_STG=1 restores the legacy
-            // recovery path.
-            //
-            // Disable via NIX_V3_NO_PARTIAL_BINDINGS_RECOVER=1 if the
-            // legacy path is restored and misclassifies a real cycle.
-            {
-                static const bool s_stgMode_recover =
-                    std::getenv("NIX_V3_NO_STG") == nullptr;
-                static const bool s_disabled =
-                    std::getenv("NIX_V3_NO_PARTIAL_BINDINGS_RECOVER") != nullptr;
-                static const bool s_dbg_reg =
-                    std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
-                if (!s_disabled && !s_stgMode_recover) {
-                    auto & reg = partialBindingsRegistry();
-                    auto it = reg.find(t);
-                    Bindings * recBnd = nullptr;
-                    if (it != reg.end())
-                        recBnd = pickLargestLayer(it->second);
-                    if (recBnd) {
-                        // Use the latest (back) entry for recovery.
-                        // This is the legacy non-STG path; the chain
-                        // typically has only one entry under non-STG
-                        // mode (single-element replacement).
-                        // #558 Phase 2: pickLargestLayer skips
-                        // finalized entries (lazy-cleanup).
-                        if (s_dbg_reg) std::fprintf(stderr,
-                            "v3 partialBindings: RECOVER thunk=%p bindings=%p\n",
-                            (void *)t, (void *)recBnd);
-                        Value out;
-                        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                        out.payload.bindings = recBnd;
-                        return out;
-                    }
-                    if (s_dbg_reg) std::fprintf(stderr,
-                        "v3 partialBindings: NO RECOVERY for thunk=%p (registry size=%zu)\n",
-                        (void *)t, reg.size());
-                }
-            }
+            // #558 Phase 3.3: partial-Bindings recovery retired.
 
             // #466 error-as-value (GHC-style mkBlackHole).
             //
@@ -7694,191 +7535,9 @@ Value forceValue(VMState & vm, Value v)
                             return shapeVal;
                         }
                     }
-                    static const bool s_noStgWhnf =
-                        std::getenv("NIX_V3_NO_STG_WHNF") != nullptr;
-                    if (!s_noStgWhnf) {
-                        auto & reg = partialBindingsRegistry();
-                        auto it = reg.find(t);
-                        if (it != reg.end() && !it->second.empty()) {
-                            // Use the LATEST chain entry — represents the
-                            // most recent layer's contribution to t's
-                            // eventual value.  Pointers (not copies), so
-                            // subsequent SETs into the chain entry's
-                            // bindings are visible.
-                            static const bool s_dbgWhnf =
-                                std::getenv("V3_DBG_WHNF_RECOVERY") != nullptr;
-                            if (s_dbgWhnf) {
-                                const auto & st = ir::globalSymbolTable();
-                                std::fprintf(stderr,
-                                    "v3 STG WHNF recovery: thunk=%p chain-depth=%zu\n",
-                                    (void *)t,
-                                    it->second.size());
-                                for (size_t li = 0; li < it->second.size(); ++li) {
-                                    Bindings * b = it->second[li];
-                                    std::fprintf(stderr,
-                                        "  layer[%zu] bindings=%p size=%u keys=[",
-                                        li, (void *)b, b ? b->size : 0);
-                                    if (b) {
-                                        for (uint32_t i = 0; i < b->size && i < 8; ++i) {
-                                            SymbolId nm = b->entries[i].name;
-                                            std::fprintf(stderr, "%s%s",
-                                                i ? "," : "",
-                                                nm < st.size() ? st[nm].c_str() : "?");
-                                        }
-                                        if (b->size > 8) std::fprintf(stderr, ",...");
-                                    }
-                                    std::fprintf(stderr, "]\n");
-                                }
-                            }
-                            static const bool s_dbgBhv =
-                                std::getenv("V3_DBG_BLACKHOLE_AS_VALUE") != nullptr;
-                            if (s_dbgBhv) {
-                                static thread_local uint64_t hits = 0;
-                                if (++hits == 1 || (hits & (hits - 1)) == 0) {
-                                    // #558: enrich with the thunk's name +
-                                    // source pos + caller frame.  Tells us
-                                    // WHICH thunk is being recovered and
-                                    // (via caller) what code path triggered
-                                    // the force.
-                                    const auto * dT =
-                                        (t->state == ThunkState::Suspended
-                                         || t->state == ThunkState::Blackhole)
-                                        ? t->suspended.desc : nullptr;
-                                    const PosSnapshot * psT =
-                                        dT ? resolvePosSnapshot(dT->posHandle)
-                                           : nullptr;
-                                    const LambdaDescriptor * dC = nullptr;
-                                    uint32_t cIp = 0;
-                                    if (!vm.frames.empty()) {
-                                        const auto & cfr = vm.frames.back();
-                                        cIp = cfr.ip;
-                                        if (cfr.thunk
-                                            && (cfr.thunk->state == ThunkState::Suspended
-                                                || cfr.thunk->state == ThunkState::Blackhole))
-                                            dC = cfr.thunk->suspended.desc;
-                                        else if (cfr.closure)
-                                            dC = cfr.closure->desc;
-                                    }
-                                    const PosSnapshot * psC =
-                                        dC ? resolvePosSnapshot(dC->posHandle)
-                                           : nullptr;
-                                    std::fprintf(stderr,
-                                        "v3 blackhole-as-WHNF (self-frame): thunk=%p "
-                                        "bindings=%p size=%u (hits=%llu)\n",
-                                        (void *)t,
-                                        (void *)it->second.back(),
-                                        (unsigned)it->second.back()->size,
-                                        (unsigned long long)hits);
-                                    std::fprintf(stderr,
-                                        "  thunk-name='%s' thunk-pos=%s:%u:%u\n",
-                                        dT && !dT->name.empty() ? dT->name.c_str() : "<?>",
-                                        (psT && !psT->file.empty()) ? psT->file.c_str() : "<no-pos>",
-                                        psT ? psT->line : 0u,
-                                        psT ? psT->column : 0u);
-                                    std::fprintf(stderr,
-                                        "  caller-frame: name='%s' pos=%s:%u:%u ip=%u\n",
-                                        dC && !dC->name.empty() ? dC->name.c_str() : "<?>",
-                                        (psC && !psC->file.empty()) ? psC->file.c_str() : "<no-pos>",
-                                        psC ? psC->line : 0u,
-                                        psC ? psC->column : 0u,
-                                        cIp);
-                                    // #558: also dump the full caller stack
-                                    // so we can see the WHOLE chain that led
-                                    // to the force.  hits=1 alone tells us
-                                    // the entry point; deeper context tells
-                                    // us how we got there.
-                                    size_t nFrames = vm.frames.size();
-                                    size_t lo = 0;
-                                    for (size_t i = nFrames; i-- > lo;) {
-                                        const auto & cfr2 = vm.frames[i];
-                                        const LambdaDescriptor * dd = nullptr;
-                                        if (cfr2.thunk
-                                            && (cfr2.thunk->state == ThunkState::Suspended
-                                                || cfr2.thunk->state == ThunkState::Blackhole))
-                                            dd = cfr2.thunk->suspended.desc;
-                                        else if (cfr2.closure)
-                                            dd = cfr2.closure->desc;
-                                        const PosSnapshot * pps =
-                                            dd ? resolvePosSnapshot(dd->posHandle) : nullptr;
-                                        std::fprintf(stderr,
-                                            "    [%zu] %s ip=%u pos=%s:%u:%u flags=%u\n",
-                                            i,
-                                            dd && !dd->name.empty() ? dd->name.c_str() : "<?>",
-                                            cfr2.ip,
-                                            (pps && !pps->file.empty()) ? pps->file.c_str() : "<no-pos>",
-                                            pps ? pps->line : 0u,
-                                            pps ? pps->column : 0u,
-                                            (unsigned)cfr2.flags);
-                                    }
-                                }
-                            }
-                            // #558 (2026-05-10) STG WHNF: return
-                            // chain.back() as a single-layer Bindings.
-                            // Consumers may need to peek the chain
-                            // separately for full layer access.
-                            //
-                            // #558 (2026-05-11) Taint the calling
-                            // frame: this access returned an
-                            // APPROXIMATE WHNF.  If the frame is a
-                            // THUNK_RETURN, the thunk's body computed
-                            // a result derived from this approximation
-                            // — that result shouldn't be memoized
-                            // (since the chain may grow more-accurate
-                            // entries).  See CFF_TAINTED docs.
-                            //
-                            // Gated by NIX_V3_NO_TAINT=1 for bisecting.
-                            static const bool s_noTaint =
-                                std::getenv("NIX_V3_NO_TAINT") != nullptr;
-                            if (!s_noTaint) {
-                                for (size_t i = vm.frames.size(); i > 0; --i) {
-                                    auto & fr = vm.frames[i - 1];
-                                    if (fr.flags & CFF_THUNK_RETURN) {
-                                        fr.flags |= CFF_TAINTED;
-                                        static const bool s_dbgTaint =
-                                            std::getenv("V3_DBG_TAINT") != nullptr;
-                                        if (s_dbgTaint) {
-                                            const auto * dd = (fr.thunk
-                                                && (fr.thunk->state == ThunkState::Suspended
-                                                    || fr.thunk->state == ThunkState::Blackhole))
-                                                ? fr.thunk->suspended.desc : nullptr;
-                                            const PosSnapshot * pps =
-                                                dd ? resolvePosSnapshot(dd->posHandle) : nullptr;
-                                            std::fprintf(stderr,
-                                                "v3 TAINT: thunk=%p name='%s' pos=%s:%u:%u\n",
-                                                (void *)fr.thunk,
-                                                dd && !dd->name.empty() ? dd->name.c_str() : "<?>",
-                                                (pps && !pps->file.empty()) ? pps->file.c_str() : "?",
-                                                pps ? pps->line : 0u, pps ? pps->column : 0u);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            // #558 (2026-05-11) Largest-layer-wins for
-                            // STG WHNF return: pick the most-informative
-                            // chain entry (largest size) rather than
-                            // chain.back().  Mirrors lookupInPartialChain's
-                            // largest-layer-wins.  When forcing a Black
-                            // thunk to a single Bindings (e.g. the lhs
-                            // of an //), the largest layer is the most
-                            // accurate WHNF approximation — typically
-                            // the outermost overlay's merged result.
-                            //
-                            // STG analog: indirection chains prefer the
-                            // most-resolved cell at each access.
-                            //
-                            // Gated by NIX_V3_NO_LARGEST_WHNF=1 (reverts
-                            // to chain.back() if needed for bisecting).
-                            Value recovered;
-                            recovered.tag_payload =
-                                static_cast<uint64_t>(Tag::Attrs);
-                            recovered.payload.bindings =
-                                pickLargestLayer(it->second);
-                            return recovered;
-                        }
-                    }
-                    // Local cycle without registered partial Bindings —
-                    // fall through to throw.
+                    // #558 Phase 3.3: STG WHNF recovery via partial-
+                    // Bindings retired.  Local cycle falls through to
+                    // BlackholeError throw.
                 }
             }
 
