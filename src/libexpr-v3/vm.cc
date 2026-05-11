@@ -3808,6 +3808,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // comment for rationale.
             {
             int forceChaseIters = 0;
+            // #558 Phase 4 follow-up: path compression for the
+            // OP_FORCE chase loop — mirror of forceValue's chase.
+            // Records up to kCompressMax Evaluated thunks; after the
+            // chase resolves to a stable WHNF, write that value into
+            // each recorded `t->evaluated` so future forces hit in
+            // O(1).  Opt-out: NIX_V3_NO_PATH_COMPRESS=1.
+            static const bool s_opForceNoCompress =
+                std::getenv("NIX_V3_NO_PATH_COMPRESS") != nullptr;
+            constexpr int kOpForceCompressMax = 16;
+            Thunk * opForceCompressChain[kOpForceCompressMax];
+            int opForceCompressCount = 0;
             while (true) {
                 if (__builtin_expect(++forceChaseIters > kMaxIndirectionChase, 0))
                     throw std::runtime_error(
@@ -3851,10 +3862,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 if (!v.isThunk()) break;
                 if (v.payload.thunk->state == ThunkState::Evaluated) {
+                    if (!s_opForceNoCompress
+                        && opForceCompressCount < kOpForceCompressMax)
+                        opForceCompressChain[opForceCompressCount++] =
+                            v.payload.thunk;
                     v = v.payload.thunk->evaluated;
                     continue;
                 }
                 break;
+            }
+            // Path compression writeback: only on a stable WHNF.
+            if (opForceCompressCount > 0
+                && v.tag() != Tag::Thunk
+                && v.tag() != Tag::Slot
+                && v.tag() != Tag::App
+                && v.tag() != Tag::Blackhole)
+            {
+                for (int i = 0; i < opForceCompressCount; ++i)
+                    opForceCompressChain[i]->evaluated = v;
             }
             } // end forceChaseIters scope
             if (!v.isThunk()) { push(vm, v); break; }
