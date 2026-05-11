@@ -4248,7 +4248,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             // reduction is the headline target.
                             auto & fin = finalizedBindings();
                             fin.insert(b);
-                            if (fin.size() >= 256) {
+                            // Threshold 4096: minimizes compaction
+                            // count on long-running evals.  Lookups
+                            // skip finalized entries in O(1) hash
+                            // lookups, so chain growth is bounded by
+                            // skip overhead alone (no quadratic).
+                            // CPU sample showed 256-threshold
+                            // compaction at 5% of CPU on nixpkgs
+                            // THUNK_ALL; 16x larger threshold should
+                            // amortize that to ~0.3%.
+                            if (fin.size() >= 4096) {
                                 compactPartialBindingsRegistry();
                             }
                         }
