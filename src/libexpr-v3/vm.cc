@@ -1297,389 +1297,7 @@ std::unordered_map<Thunk *, PartialBindingsChain> & partialBindingsRegistry()
     return tbl;
 }
 
-namespace { // -- reopen anon namespace
-
-/// Publish a freshly-built attrset to the innermost Black thunk frame's
-/// partial-bindings side-table and (optionally) eagerly transition outer
-/// Black thunks to Evaluated.  `isRecInit` MUST be true only when `v` IS
-/// the rec-attrset under construction by that thunk's body — i.e., the
-/// caller is OP_ATTRS_REC_INIT.  Non-rec attrset construction
-/// (OP_ATTRS_INIT, OP_ATTRS_INIT_DYN, OP_ATTRS_UPDATE) MUST pass
-/// isRecInit=false and the function becomes a no-op.
-///
-/// #495 follow-on (2026-05-07 root-cause): publishing on every attrset
-/// construction (including non-rec sub-expressions like the LEFT side
-/// of `LEFT // RIGHT` inside an inherit-from from-expr) pollutes the
-/// outer thunk's partialBindings entry.  When a recursive force on the
-/// outer thunk consults the registry, it returns the SUB-EXPRESSION's
-/// bindings instead of the outer thunk's actual (in-progress) value,
-/// causing closures called from sub-expressions to receive the wrong
-/// argument.  Reproduced by repro-495-broader-thunkify-bug.nix (lib.
-/// systems.elaborate's `inherit ({...} // platforms.select final) ...`):
-/// the LEFT-side `{linux-kernel, gcc}` was being registered as final's
-/// partial bindings, so `select(final)` saw `{linux-kernel, gcc}`
-/// instead of the elaborated platform record and threw on
-/// `final.isx86`.
-///
-/// Restricting publishing to OP_ATTRS_REC_INIT preserves the legitimate
-/// use case (rec attrset self-reference like `rec { x = 1; y = self.x;
-/// }`) while eliminating the cross-expression contamination.  The
-/// kept behaviour: when a rec attrset's body is being constructed and
-/// inner code re-enters via `self.X`, partialBindings recovery returns
-/// the rec's in-progress Bindings (which is the SAME pointer that
-/// OP_ATTRS_REC_SET writes into, so subsequent SET writes are visible
-/// to the recovery path).
-/// #558 Phase 3: unified gate that disables ALL partial-Bindings
-/// publication (both nearest-frame and tail-all-frames) and
-/// recovery (chain peek, registry-wide search, STG WHNF recovery).
-/// When set, the only mechanism for mid-construction state visibility
-/// is the per-thunk shapeCell (#558 Phase 1.5).
-///
-/// Phase 3.2 (2026-05-12): flipped DEFAULT-ON.  All 33 v3 test scripts
-/// pass with partial-Bindings disabled.  Cell-update-everywhere is the
-/// validated standalone mechanism.  Opt back to the legacy chain-based
-/// mechanism via NIX_V3_KEEP_PARTIAL_BINDINGS=1 for bisection if a
-/// regression surfaces.
-///
-/// Goal: validate cell-update-everywhere as the standalone STG-correct
-/// mechanism before retiring the partial-Bindings infrastructure
-/// entirely (Phase 3.3 — mechanical deletion).
-inline bool partialBindingsDisabled()
-{
-    static const bool s_enabled =
-        std::getenv("NIX_V3_KEEP_PARTIAL_BINDINGS") != nullptr;
-    return !s_enabled;
-}
-
-inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
-                                             bool isRecInit)
-{
-    if (partialBindingsDisabled()) return;
-    // STG-1 (#498/#547): publish is disabled by default.  Each
-    // thunk's slot is written ONLY by its own OP_RETURN; no outer
-    // thunk write-through.  STG mode (the slot mechanism) is the
-    // validated path for nixpkgs.
-    //
-    // 2026-05-09 (#547 Phase 2): flipped default-on after the inventory
-    // matrix in lode/STG_INVENTORY_2026-05-09.md showed STG fixes
-    // v3-fhook on nixpkgs (BLACKHOLE → OK) without regressing any
-    // synthetic / lib workload.  The legacy publish was actively
-    // corrupting outer Black thunks with wrong-shape intermediate
-    // values; the slot mechanism + cell-update at OP_RETURN is the
-    // architecturally-correct replacement.  Set NIX_V3_NO_STG=1 to
-    // restore the legacy publish path (will be deleted in a follow-up).
-    static const bool s_stgMode =
-        std::getenv("NIX_V3_NO_STG") == nullptr;
-    // #548c (2026-05-10) STG-style early-alloc:
-    //
-    // Under STG mode, we keep the eager-state-flip OFF (the slot
-    // mechanism + cell-update at OP_RETURN replaces it) but ENABLE
-    // the partial-bindings side-table population.  The side-table
-    // is the "selector thunk" analog from GHC's STG: with the
-    // Bindings allocated upfront by OP_ATTRS_REC_INIT (now also
-    // emitted for non-rec attrsets — see emit.cc:emitOne(AttrSet)),
-    // any sub-expression that derefs the outer Black thunk via
-    // Tag::Slot can peek at the partial Bindings via withLookup
-    // (see vm.cc:withLookup partial-bindings peek path).  Earlier-
-    // SET entries (alphabetical sort order) are already visible to
-    // later-SET entries' from-expressions.
-    //
-    // Only register for isRecInit=true (the rec-attrset's own
-    // OP_ATTRS_REC_INIT path).  This preserves #495's fix: non-rec
-    // sub-attrsets inside `LEFT // RIGHT` still don't pollute the
-    // outer thunk because they go through OP_ATTRS_INIT — wait —
-    // **with Phase A, ALL non-rec attrsets emit through
-    // OP_ATTRS_REC_INIT now**.  This is correct because the
-    // side-table is only ever read by withLookup; it doesn't flip
-    // the thunk's `evaluated` field, so the #495 corruption can't
-    // recur.  The "wrong-shape" pollution was specifically the
-    // eager state-flip writing a sub-expression's Bindings into
-    // the outer thunk's `evaluated` — that write is firmly OFF
-    // under STG mode (the legacy path below `if (s_stgMode) ...`
-    // is bypassed).
-    if (s_stgMode) {
-        if (!isRecInit) return;
-        Tag t = v.tag();
-        if (t != Tag::Attrs || !v.payload.bindings) return;
-        // OP_ATTRS_REC_INIT (non-tail-return path).  Register with the
-        // INNERMOST Black thunk frame only.  This is the conservative
-        // choice for sub-expression attrsets: they aren't the
-        // function's eventual return value, so registering them with
-        // OUTER thunks (waiting for the function's return) would
-        // falsely advertise sub-expression shapes via the partial-
-        // Bindings peek path (vm.cc:withLookup).
-        //
-        // Tail-return AttrSets emit OP_ATTRS_REC_INIT_TAIL instead,
-        // which calls publishToAllThunkFrames — see that path for the
-        // architectural rationale (#558).
-        for (size_t i = vm.frames.size(); i > 0; --i) {
-            CallFrame & fr = vm.frames[i - 1];
-            if (!(fr.flags & CFF_THUNK_RETURN)) continue;
-            if (!fr.thunk) continue;
-            if (fr.thunk->state != ThunkState::Blackhole) continue;
-            // Sub-attrset (non-tail) registration: REPLACE the chain
-            // with a single-element vector containing this Bindings.
-            // Sub-attrsets shouldn't accumulate — only the latest
-            // sub-attrset for this innermost-Black thunk represents
-            // its currently-relevant partial state.
-            auto & chain = partialBindingsRegistry()[fr.thunk];
-            chain.clear();
-            chain.push_back(v.payload.bindings);
-            static const bool s_dbg_reg =
-                std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
-            if (s_dbg_reg) std::fprintf(stderr,
-                "v3 STG partialBindings: register thunk=%p bindings=%p size=%u\n",
-                (void *)fr.thunk, (void *)v.payload.bindings,
-                (unsigned)v.payload.bindings->size);
-            break;
-        }
-        return;
-    }
-    // ---- Pre-STG path (legacy default) ----
-    static const bool s_publishNonRec =
-        std::getenv("NIX_V3_PUBLISH_NON_REC_INIT") != nullptr;
-    if (!isRecInit && !s_publishNonRec) return;
-    // 2026-05-06 #457/#458: was opt-in (NIX_V3_EARLY_PUBLISH=1)
-    // because earlier nixpkgs runs corrupted under both outermost-only
-    // and publish-to-all variants.  After the #456 chase-cycle fix
-    // (vm.cc forceValue Bridge→Bridge break) and the OP_CALL Bridge-
-    // thunk handler, re-tested on hello.name, git.name, vim, curl,
-    // coreutils, python3, nodejs, cardano-node default — all produce
-    // correct output, full regression suite green, no perf regression
-    // (~1% faster on cardano-node).  Flipped default-on.  Disable
-    // via NIX_V3_NO_EARLY_PUBLISH=1 if a regression surfaces.
-    static const bool s_disabled =
-        std::getenv("NIX_V3_NO_EARLY_PUBLISH") != nullptr;
-    // Always populate the partial-bindings side-table for Tag::Attrs
-    // values, even if the thunk-state EARLY_PUBLISH is disabled --
-    // the side-table is a safer mechanism (doesn't corrupt nested
-    // thunks).  Only the eager state-flip part of EARLY_PUBLISH
-    // depends on s_disabled.
-    Tag t = v.tag();
-    if (t == Tag::Attrs && v.payload.bindings) {
-        static const bool s_dbg_reg =
-            std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
-        // Find the nearest Black thunk frame on the stack.  Inner-
-        // most-Black gets the registry entry -- it's the one whose
-        // body just ran OP_ATTRS_REC_INIT.
-        for (size_t i = vm.frames.size(); i > 0; --i) {
-            CallFrame & fr = vm.frames[i - 1];
-            if (!(fr.flags & CFF_THUNK_RETURN)) continue;
-            if (!fr.thunk) continue;
-            if (fr.thunk->state != ThunkState::Blackhole) continue;
-            // Legacy non-STG path: replace the chain (single-element)
-            // for back-compat with the old single-Bindings registry.
-            auto & chain = partialBindingsRegistry()[fr.thunk];
-            chain.clear();
-            chain.push_back(v.payload.bindings);
-            if (s_dbg_reg) std::fprintf(stderr,
-                "v3 partialBindings: register thunk=%p bindings=%p size=%u\n",
-                (void *)fr.thunk, (void *)v.payload.bindings,
-                (unsigned)v.payload.bindings->size);
-            break;  // innermost-Black only
-        }
-    }
-    if (s_disabled) return;
-    // Only publish concrete values, not thunks/apps/blackholes.
-    if (t == Tag::Thunk || t == Tag::App || t == Tag::Blackhole) return;
-    static const bool s_dbg =
-        std::getenv("NIX_V3_EARLY_PUBLISH_DBG") != nullptr;
-    static const bool s_publishAll =
-        std::getenv("NIX_V3_EARLY_PUBLISH_ALL") != nullptr;
-    // Default: outermost-only.  Set NIX_V3_EARLY_PUBLISH_ALL=1 for
-    // publish-to-every-Black-thunk variant (also broken on nixpkgs).
-    for (size_t i = 0; i < vm.frames.size(); ++i) {
-        CallFrame & fr = vm.frames[i];
-        if (!(fr.flags & CFF_THUNK_RETURN)) continue;
-        if (!fr.thunk) continue;
-        if (fr.thunk->state != ThunkState::Blackhole) continue;
-        if (s_dbg) {
-            const char * tagName = "?";
-            uint32_t nKeys = 0;
-            if (t == Tag::Attrs) {
-                tagName = "Attrs";
-                if (v.payload.bindings) nKeys = v.payload.bindings->size;
-            } else if (t == Tag::List) {
-                tagName = "List";
-                if (v.payload.list) nKeys = v.payload.list->size;
-            } else {
-                tagName = "Other";
-            }
-            std::fprintf(stderr,
-                "v3 EARLY_PUBLISH: frame[%zu] thunk=%p tag=%s n=%u "
-                "(at frames=%zu)\n",
-                i, (void*)fr.thunk, tagName, nKeys, vm.frames.size());
-        }
-        fr.thunk->state = ThunkState::Evaluated;
-        fr.thunk->evaluated = v;
-        if (!s_publishAll) return;
-    }
-}
-
-/// #558: tail-return-AttrSet publish.  Register `v`'s Bindings with
-/// EVERY thunk frame on the call stack — Black AND Suspended — using
-/// MERGE semantics: the new registration is `//`'d (Nix attrset
-/// update) over any prior registration so accumulated multi-layer
-/// contributions stay visible to the partial-Bindings peek path.
-///
-/// Architectural rationale: lib.fix-style fix-points produce a chain
-/// of nested thunks (`final → prev_outer → ... → prev_inner →
-/// super_lambda`) all conceptually waiting for super's return value.
-/// When `with self;` derefs through the with-source slot, it can land
-/// on ANY of these thunks.  Registering super's partial Bindings with
-/// each of them lets the withLookup partial-Bindings peek find the
-/// entries regardless of which thunk the slot derefs to.
-///
-/// Suspended-state inclusion: lib.fix's `let x = f x;` keeps `x` in
-/// Suspended state for the duration of `f x`'s evaluation (v3's force
-/// protocol marks Black only inside the immediate forceValue
-/// dispatch).  Without registering with Suspended thunks, x's slot
-/// derefs would miss the registry.
-///
-/// MERGE-on-conflict (lib.extends multi-layer support): when a thunk
-/// already has a registered Bindings (from a deeper function's
-/// tail-return), MERGE the new bindings into the existing ones.
-///   reg[T] = mergeBindings(reg[T], v.bindings)  // RHS wins on dup
-///
-/// Why merge: the lib.extends fold (`prev // overlay final prev`)
-/// composes layers.  Each layer's body has its own tail-return
-/// AttrSet that contributes a partial set of names.  pkgs's eventual
-/// value at thunk T is the // of all layer outputs.  A `with self;`
-/// lookup mid-eval needs to see ALL contributions, not just the most
-/// recent layer's.
-///
-/// Single-Bindings-per-thunk representation: `mergeBindings` (defined
-/// at vm.cc:571) is the same primitive that OP_ATTRS_UPDATE uses to
-/// implement Nix's `//` operator.  It allocates a fresh combined
-/// Bindings; b's entries shadow a's on duplicate keys.  This matches
-/// lib.extends's overlay-wins-on-conflict semantics exactly.
-///
-/// Cost: O(|reg[T]| + |v|) per REC_INIT_TAIL when `reg[T]` is already
-/// populated; one Bindings allocation.  In a deep extends chain
-/// (~10 layers, ~4000 entries each), that's ~40k entry copies per
-/// chain-level — bounded and amortized over the whole pkgs eval.
-///
-/// Caveat: stale entries linger until their thunk transitions to
-/// Evaluated.  withLookup's peek path gates on `state == Blackhole`
-/// (vm.cc:651), so an Evaluated thunk's stale entry is unreachable.
-/// No correctness issue; future work could clean up at OP_RETURN.
-inline void publishToAllThunkFrames(VMState & vm, const Value & v)
-{
-    if (partialBindingsDisabled()) return;
-    static const bool s_stgMode =
-        std::getenv("NIX_V3_NO_STG") == nullptr;
-    if (!s_stgMode) return;
-    Tag t = v.tag();
-    if (t != Tag::Attrs || !v.payload.bindings) return;
-    static const bool s_dbg_reg =
-        std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
-    auto & reg = partialBindingsRegistry();
-    // #558 (2026-05-10) NIX_V3_TAIL_REGISTER_SCOPE controls how
-    // many thunk frames to register with.
-    //   "all" (default): every thunk frame on the call stack.
-    //     Closes lib.fix-style cycles spanning many lib.extends layers.
-    //     Risk: registering with thunks ACROSS lib.fix boundaries
-    //     (e.g., this AttrSet is part of stage_n's eval, but stage_n+1's
-    //     thunk is also on the stack — registering with stage_n+1 is
-    //     incorrect since this AttrSet isn't part of its value).
-    //   "immediate": only the innermost THUNK_RETURN frame.
-    //     Conservative; matches the original innermost-Black behavior.
-    //     Reverts the libsForQt5 fix.
-    //   "black": every Black thunk only (skip Suspended).
-    //     Avoids registering with lib.fix's outer x_thunk that's
-    //     Suspended-but-currently-in-an-active-force.
-    static const char * s_scope_env = std::getenv("NIX_V3_TAIL_REGISTER_SCOPE");
-    static const std::string s_scope = s_scope_env ? s_scope_env : "all";
-    // #558 (2026-05-10) "synthetic" detection: when the running thunk
-    // is a synthetic let-binding thunk (name="<thunk>") rather than a
-    // real lambda body, the AttrSet is a SUB-EXPRESSION (e.g.
-    // qt5-packages.nix's `attrs = { inherit (pkgs) lib; ... }`).
-    // Such sub-AttrSets aren't part of any outer thunk's WHNF — they
-    // shouldn't pollute outer chains.  STG-true: only register with
-    // the running thunk.
-    //
-    // Real lambda bodies (named, non-"<thunk>") DO represent the
-    // function's WHNF, and may be tail-call propagated via Tag::Slot
-    // / lib.fix; register with all THUNK_RETURN frames.
-    //
-    // Gated by NIX_V3_NO_SYNTH_RESTRICT=1 for bisecting.
-    bool runningIsSynthetic = false;
-    {
-        Thunk * runningThunk = nullptr;
-        for (size_t i = vm.frames.size(); i > 0; --i) {
-            if ((vm.frames[i - 1].flags & CFF_THUNK_RETURN)
-                && vm.frames[i - 1].thunk) {
-                runningThunk = vm.frames[i - 1].thunk;
-                break;
-            }
-        }
-        if (runningThunk) {
-            const auto * d =
-                (runningThunk->state == ThunkState::Suspended
-                 || runningThunk->state == ThunkState::Blackhole)
-                ? runningThunk->suspended.desc : nullptr;
-            if (d && d->name == "<thunk>") runningIsSynthetic = true;
-        }
-    }
-    static const bool s_noSynthRestrict =
-        std::getenv("NIX_V3_NO_SYNTH_RESTRICT") != nullptr;
-    bool restrictToImmediate =
-        runningIsSynthetic && !s_noSynthRestrict;
-    // Diagnostic: print the AttrSet's source position (= the
-    // currently-executing thunk's lambda position).  Helps identify
-    // which AttrSet expression is being TAIL-registered.
-    if (s_dbg_reg) {
-        // The running thunk is the topmost thunk frame.
-        Thunk * runningThunk = nullptr;
-        for (size_t i = vm.frames.size(); i > 0; --i) {
-            if ((vm.frames[i - 1].flags & CFF_THUNK_RETURN)
-                && vm.frames[i - 1].thunk) {
-                runningThunk = vm.frames[i - 1].thunk;
-                break;
-            }
-        }
-        if (runningThunk) {
-            const auto * d = (runningThunk->state == ThunkState::Suspended
-                              || runningThunk->state == ThunkState::Blackhole)
-                ? runningThunk->suspended.desc : nullptr;
-            const PosSnapshot * ps =
-                d ? resolvePosSnapshot(d->posHandle) : nullptr;
-            std::fprintf(stderr,
-                "v3 STG TAIL ORIGIN: bindings=%p size=%u pos=%s:%u:%u\n",
-                (void *)v.payload.bindings,
-                (unsigned)v.payload.bindings->size,
-                (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
-                ps ? ps->line : 0u,
-                ps ? ps->column : 0u);
-        }
-    }
-    for (size_t i = vm.frames.size(); i > 0; --i) {
-        CallFrame & fr = vm.frames[i - 1];
-        if (!(fr.flags & CFF_THUNK_RETURN)) continue;
-        if (!fr.thunk) continue;
-        // Default: register with Black AND Suspended thunks.  Evaluated
-        // thunks have a final value and would be stale registrations.
-        if (fr.thunk->state != ThunkState::Blackhole
-            && fr.thunk->state != ThunkState::Suspended) continue;
-        if (s_scope == "black"
-            && fr.thunk->state != ThunkState::Blackhole) continue;
-        // Append the new tail-return Bindings to this thunk's chain.
-        // Duplicates (same Bindings* registered twice for one thunk)
-        // are skipped to keep the chain compact; lookup walks back so
-        // a duplicate at the end is harmless but wastes work.
-        auto & chain = reg[fr.thunk];
-        if (chain.empty() || chain.back() != v.payload.bindings) {
-            chain.push_back(v.payload.bindings);
-            if (s_dbg_reg) std::fprintf(stderr,
-                "v3 STG partialBindings(TAIL): register thunk=%p state=%d bindings=%p size=%u (chain depth=%zu)\n",
-                (void *)fr.thunk, (int)fr.thunk->state,
-                (void *)v.payload.bindings,
-                (unsigned)v.payload.bindings->size,
-                chain.size());
-        }
-        if (s_scope == "immediate" || restrictToImmediate) break;
-    }
-}
+namespace { // -- reopen anon namespace for dispatchLoop and friends
 
 /// Run the dispatch loop on `vm` until either:
 ///   - OP_HALT is reached (top-level exit), or
@@ -4136,55 +3754,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     auto it = reg.find(fr.thunk);
                     if (it != reg.end()) reg.erase(it);
                 }
-                // #558 (2026-05-10) Cross-chain cleanup.  When the
-                // thunk's body returns a Bindings via REC_INIT_TAIL,
-                // that Bindings was registered with MULTIPLE thunks'
-                // chains (publishToAllThunkFrames).  Once THIS thunk
-                // is Evaluated, the Bindings is no longer "in
-                // construction" — it's a finalized value.  Other
-                // thunks' chains shouldn't keep this Bindings as
-                // their "partial WHNF" approximation.
-                //
-                // Concrete bug this fixes: qt5-packages.nix:35's
-                // `attrs = { inherit (pkgs) lib fetchurl; ... }`.
-                // When attrs's REC_INIT_TAIL fires, attrs's bindings
-                // gets registered with pkgs's chain (because pkgs's
-                // thunk is on the call stack as Suspended/Black).
-                // attrs's bindings has `lib` -> T_lib (the
-                // inherit-from select thunk) which itself reads
-                // pkgs.lib.  Without this cleanup, after attrs's
-                // OP_RETURN, pkgs's chain.back() = attrs's bindings,
-                // and a future T_lib force triggering STG WHNF
-                // recovery on pkgs returns attrs's bindings → select
-                // lib → T_lib (cycle).
-                //
-                // STG analog: when an indirect thunk forwards to
-                // another thunk's value, the indirect's "last seen
-                // shape" is updated; old shapes are no longer
-                // visible.  For us, "old shapes" are stale partial
-                // bindings registered cross-thunk.
-                //
                 // #558 Phase 3.3 (2026-05-12): cross-chain cleanup
-                // retired alongside the partial-Bindings infrastructure.
-                // No publishes fire under the default
-                // partialBindingsDisabled()==true, so the registry
-                // chains stay empty and cleanup is unnecessary.  Opt
-                // back via NIX_V3_KEEP_PARTIAL_BINDINGS=1 if the legacy
-                // path is needed; in that mode the chains do
-                // accumulate stale entries but consumers walk them
-                // back-to-front, so the staleness is harmless for the
-                // workloads that historically required the workaround.
-                if (!partialBindingsDisabled()
-                    && retVal.tag() == Tag::Attrs
-                    && retVal.payload.bindings) {
-                    Bindings * b = retVal.payload.bindings;
-                    auto & reg = partialBindingsRegistry();
-                    for (auto & [t, chain] : reg) {
-                        chain.erase(
-                            std::remove(chain.begin(), chain.end(), b),
-                            chain.end());
-                    }
-                }
+                // retired alongside the partial-Bindings publish
+                // mechanism.  No publishes fire so the registry
+                // chains stay empty; cleanup is unnecessary.
 
                 // WC-38: the legacy "return-chain push" -- eagerly
                 // forcing the next thunk if the outer's body returned
@@ -4994,7 +4567,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
-            publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/false);
+
             push(vm, v);
             break;
         }
@@ -5061,7 +4634,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
-            publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/false);
+
             push(vm, v);
             break;
         }
@@ -5134,7 +4707,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // pointer that subsequent OP_ATTRS_REC_SET writes into, so
             // self-reference recovery via partialBindings observes the
             // entries as they are filled in.
-            publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/true);
+
             // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere:
             // publish the in-progress Bindings to the innermost
             // THUNK_RETURN frame's shapeCell.  Consumers that
@@ -5245,7 +4818,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
-            publishToAllThunkFrames(vm, v);
+
             // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere:
             // update ONLY the innermost THUNK_RETURN frame's
             // shapeCell.  Per-thunk cell update is STG-correct;
@@ -6040,7 +5613,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = out;
-            publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/false);
+
             push(vm, v);
             break;
         }
@@ -6111,7 +5684,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = out;
-            publishToAllThunkFrames(vm, v);
+
             // #558 Phase 1.5: tail-position // result.  Update only
             // the innermost THUNK_RETURN frame's shapeCell — STG-
             // correct per-thunk cell update.
