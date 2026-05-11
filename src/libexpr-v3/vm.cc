@@ -4069,6 +4069,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         *cell = retVal;
                         fr.thunk->cell = nullptr;
                     }
+                    // #558 Phase 1.5: also update shapeCell with the
+                    // final value, then clear it.  This makes a final
+                    // forceValue-after-body see the actual result
+                    // through shapeCell, mirroring the cell semantics.
+                    if (Value * sc = fr.thunk->shapeCell) {
+                        *sc = retVal;
+                        fr.thunk->shapeCell = nullptr;
+                    }
                 }
                 // #457/#458: clear the partial-Bindings registry
                 // entry now that the thunk's final value is set.
@@ -5070,19 +5078,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // self-reference recovery via partialBindings observes the
             // entries as they are filled in.
             publishToNearestBlackThunkFrame(vm, v, /*isRecInit=*/true);
-            // #558 Phase 1 (2026-05-12) Cell-Update Everywhere:
-            // if the running thunk has a cell set (typical for a
-            // thunk stored at a heap-stable slot via OP_ATTRS_REC_SET),
-            // update the cell to point at the in-progress Bindings.
-            // Sub-thunks holding a Tag::Slot at the cell, or other
-            // thunks that forceValue this Black thunk, can then read
-            // the partial Bindings via single deref — eliminating the
-            // need for cross-thunk partial-Bindings registry pollution
-            // (which causes the #558 isFromBootstrapFiles cascade).
+            // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere:
+            // publish the in-progress Bindings to the innermost
+            // THUNK_RETURN frame's shapeCell.  Consumers that
+            // forceValue this Black thunk can read *shapeCell to
+            // get the partial state — without consulting the
+            // cross-thunk partial-Bindings registry that causes
+            // the #558 isFromBootstrapFiles cascade.
+            //
+            // Only the INNERMOST THUNK_RETURN frame is updated:
+            // this Bindings is the running thunk's own in-progress
+            // value, not the outer frames'.  (For tail-position
+            // results, OP_ATTRS_REC_INIT_TAIL / OP_RETURN propagate
+            // the final value up through the cell chain.)
             //
             // Gated by NIX_V3_CELL_EVERYWHERE=1 for safe rollout.
-            // When validated, this replaces the publishToAllThunkFrames /
-            // chain-peek mechanism (S3 → S2 in COMPREHENSIVE_REPORT).
             {
                 static const bool s_cellEverywhere =
                     std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
@@ -5091,26 +5101,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         auto & fr = vm.frames[fi - 1];
                         if (!(fr.flags & CFF_THUNK_RETURN)) continue;
                         if (!fr.thunk) continue;
-                        if (!fr.thunk->cell) continue;
-                        // Only update if the cell still holds the
-                        // pre-body sentinel (Tag::Thunk pointing at us)
-                        // or a previous in-progress Bindings of THIS
-                        // thunk's body.  Don't overwrite cells already
-                        // updated by a previous body run (re-entry).
-                        Value * cell = fr.thunk->cell;
-                        Tag ct = cell->tag();
-                        if (ct == Tag::Thunk && cell->payload.thunk == fr.thunk) {
-                            *cell = v;
-                        } else if (ct == Tag::Attrs) {
-                            // Already an in-progress Bindings — overwrite
-                            // with newer state (later REC_INIT inside the
-                            // same body, e.g., nested attrset literal).
-                            // Only do this for the IMMEDIATE THUNK_RETURN
-                            // frame to avoid cross-thunk pollution; break
-                            // after the first match.
-                            *cell = v;
-                        }
-                        break;  // only the innermost THUNK_RETURN frame
+                        if (!fr.thunk->shapeCell) continue;
+                        *fr.thunk->shapeCell = v;
+                        break;  // innermost THUNK_RETURN only
                     }
                 }
             }
@@ -8212,13 +8205,18 @@ Value forceValue(VMState & vm, Value v)
                     // through x — projections would force x → throws.
                     // With this, the projection sees x's currently-known
                     // shape (the merged // result so far) and proceeds.
-                    // #558 Phase 1 (2026-05-12) Cell-Update Everywhere:
+                    // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere:
                     // BEFORE consulting the partial-Bindings registry,
-                    // check if the thunk's cell has been updated by its
-                    // own body's OP_ATTRS_REC_INIT.  If so, return that
-                    // value directly — this is the precise per-thunk
-                    // partial state, free of the cross-thunk pollution
-                    // that the registry-wide peek introduces.
+                    // check the thunk's shapeCell.  shapeCell is a
+                    // dedicated heap-stable Value* allocated at
+                    // MAKE_THUNK time; *shapeCell starts as Tag::Thunk(t)
+                    // (sentinel "not updated yet") and gets overwritten
+                    // by OP_ATTRS_REC_INIT inside the body.
+                    //
+                    // If shapeCell has been updated past the sentinel,
+                    // return its contents — this is the precise per-
+                    // thunk in-progress state, free of the cross-thunk
+                    // pollution that the registry-wide peek introduces.
                     //
                     // Gated by NIX_V3_CELL_EVERYWHERE=1.  When validated,
                     // the partial-Bindings registry path (below) can be
@@ -8226,26 +8224,21 @@ Value forceValue(VMState & vm, Value v)
                     static const bool s_cellEverywhere =
                         std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
                     if (__builtin_expect(s_cellEverywhere, 0)
-                        && t->cell != nullptr)
+                        && t->shapeCell != nullptr)
                     {
-                        Value cellVal = *t->cell;
-                        // Only return the cell if it's been updated PAST
-                        // the initial Tag::Thunk(t) state — i.e., the
-                        // body has progressed and published in-progress
-                        // state.  If the cell still points at us, fall
-                        // through (no progress yet).
-                        if (!(cellVal.tag() == Tag::Thunk
-                              && cellVal.payload.thunk == t)) {
+                        Value shapeVal = *t->shapeCell;
+                        if (!(shapeVal.tag() == Tag::Thunk
+                              && shapeVal.payload.thunk == t)) {
                             static const bool s_dbgCell =
                                 std::getenv("V3_DBG_CELL_EVERYWHERE") != nullptr;
                             if (__builtin_expect(s_dbgCell, 0)) {
                                 std::fprintf(stderr,
-                                    "v3 cell-everywhere recovery: thunk=%p "
-                                    "cell=%p cellVal.tag=%d\n",
-                                    (void *)t, (void *)t->cell,
-                                    (int)cellVal.tag());
+                                    "v3 shapeCell recovery: thunk=%p "
+                                    "shapeCell=%p shapeVal.tag=%d\n",
+                                    (void *)t, (void *)t->shapeCell,
+                                    (int)shapeVal.tag());
                             }
-                            return cellVal;
+                            return shapeVal;
                         }
                     }
                     static const bool s_noStgWhnf =

@@ -356,6 +356,22 @@ struct Alloc
         t->nUpvalues = nUpvalues;
         t->forces = 0;
         t->cell = nullptr;
+        t->shapeCell = nullptr;
+        // #558 Phase 1.5: pre-allocate shapeCell so the body can
+        // publish in-progress state via *shapeCell, and forceValue
+        // Black can read it.  Gated NIX_V3_CELL_EVERYWHERE=1.  Cache
+        // the env var once at first call to avoid per-thunk getenv.
+        static const bool s_cellEverywhere =
+            std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
+        if (__builtin_expect(s_cellEverywhere, 0)) {
+            Value * sc = allocValue();
+            // Sentinel: Tag::Thunk(t) — "this thunk has not yet
+            // published in-progress state."  Readers compare against
+            // (Tag::Thunk && ptr == t) to detect the sentinel.
+            sc->tag_payload = static_cast<uint64_t>(Tag::Thunk);
+            sc->payload.thunk = t;
+            t->shapeCell = sc;
+        }
         t->suspended.capturedWiths = nullptr;
         t->suspended.cu = nullptr;
         return t;
@@ -377,6 +393,8 @@ struct Alloc
         t->nUpvalues = 0;
         t->forces = 0;
         t->cell = nullptr;
+        // Bridge thunks don't have a v3-side body; no shapeCell needed.
+        t->shapeCell = nullptr;
         t->bridgeSrc = src;
         return t;
     }

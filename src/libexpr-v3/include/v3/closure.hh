@@ -128,6 +128,33 @@ struct Thunk
     /// write happens exactly once per cell-binding.
     Value * cell;
 
+    /// #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere: separate
+    /// heap-stable Value* used for IN-PROGRESS shape publishing during
+    /// body execution.  Distinct from `cell` (which is the
+    /// parent-entry-slot pointer for STG-8 in-place updates).
+    ///
+    /// Lifecycle:
+    ///   - At MAKE_THUNK / allocThunkSuspended: allocated, initialized
+    ///     to *shapeCell = Tag::Thunk(this).  The sentinel value
+    ///     "this thunk has not published anything yet."
+    ///   - During body execution, OP_ATTRS_REC_INIT (and friends)
+    ///     update *shapeCell with the in-progress Bindings as the
+    ///     body constructs them.
+    ///   - At OP_RETURN: *shapeCell = retVal; shapeCell = nullptr
+    ///     (read-once).
+    ///
+    /// forceValue's Black branch reads *shapeCell BEFORE consulting
+    /// the partial-Bindings registry.  If shapeCell has been updated
+    /// past the pre-body sentinel, return its contents — this is the
+    /// precise per-thunk in-progress state, free of the cross-thunk
+    /// pollution that publishToAllThunkFrames' registry-wide search
+    /// introduces.
+    ///
+    /// Gated by NIX_V3_CELL_EVERYWHERE=1 for safe rollout.
+    /// nullptr if not allocated (cell-everywhere off, or thunk not
+    /// of a kind that benefits).
+    Value * shapeCell;
+
     union {
         // ThunkState::Suspended
         struct {
