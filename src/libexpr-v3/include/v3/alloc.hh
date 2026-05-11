@@ -474,7 +474,112 @@ struct Alloc
         else                    buckets[9]++;
         return b;
     }
+
+    // -----------------------------------------------------------------
+    // #558 Phase 4: fakeClo recycling pool.
+    //
+    // Each Suspended thunk force in vm.cc:OP_FORCE allocates a "fake"
+    // Closure to carry the thunk's upvalues + capturedWiths + cu through
+    // the body's frame.  Under THUNK_ALL on full nixpkgs, this fires
+    // hundreds of millions of times — Boehm allocation + zeroing
+    // dominates the per-force budget.  Recycling the fakeClo at
+    // OP_RETURN reuses already-warm cache lines and skips the alloc
+    // entirely.
+    //
+    // Buckets are indexed by nUpvalues (0..15); each bucket holds up
+    // to kPoolPerBucket pointers.  Closures with nUp >= 16 are not
+    // pooled (rare; would also blow up bucket count); they fall back
+    // to plain allocClosure.
+    //
+    // SAFETY: pooled closures are always arena-backed (threadArena,
+    // never nursery), so the pointer stays valid across scavenges.
+    // We zero out the upvalues on recycle so the closure doesn't
+    // pin stale GC references between uses.
+    //
+    // Gate: NIX_V3_NO_CLOSURE_POOL=1 reverts to plain allocClosure on
+    // every force.
+    static constexpr uint16_t kPoolMaxBuckets  = 16;
+    static constexpr size_t   kPoolPerBucket   = 128;
+
+    /// Pop a recycled Closure of the requested size, or nullptr if no
+    /// matching entry is pooled.  The returned closure has unspecified
+    /// upvalues — the caller MUST overwrite all `nUpvalues` slots
+    /// before any forceValue / dispatch sees it.
+    static Closure * tryPopFakeClo(uint16_t nUpvalues) noexcept;
+
+    /// Allocate a fakeClo, preferring the pool.  Always returns a
+    /// closure with `c->nUpvalues == nUpvalues`; caller fills in the
+    /// remaining fields (desc, cu, capturedWiths, upvalues).
+    static Closure * allocFakeClo(uint16_t nUpvalues) noexcept;
+
+    /// Return a fakeClo to the pool.  Caller must guarantee the
+    /// closure is no longer referenced by any frame / Value /
+    /// transitively.  Safe to call with nullptr or a closure that
+    /// can't be pooled (nUp >= kPoolMaxBuckets or bucket full) —
+    /// these become no-ops.
+    static void recycleFakeClo(Closure * c) noexcept;
 };
+
+/// Thread-local closure pool storage.  Declared as a free function
+/// (analogous to threadArena()) so the singleton is one per OS thread.
+struct ClosurePool
+{
+    // Each bucket is a small fixed array used as a free-stack.  We
+    // avoid std::vector here to keep the per-force fast path purely
+    // pointer arithmetic — no heap allocations for the pool itself.
+    Closure * slots[Alloc::kPoolMaxBuckets][Alloc::kPoolPerBucket] = {};
+    uint16_t  count[Alloc::kPoolMaxBuckets] = {};
+};
+
+inline ClosurePool & threadClosurePool() noexcept
+{
+    thread_local ClosurePool pool;
+    return pool;
+}
+
+inline Closure * Alloc::tryPopFakeClo(uint16_t nUpvalues) noexcept
+{
+    if (__builtin_expect(nUpvalues >= kPoolMaxBuckets, 0)) return nullptr;
+    auto & pool = threadClosurePool();
+    uint16_t n = pool.count[nUpvalues];
+    if (n == 0) return nullptr;
+    Closure * c = pool.slots[nUpvalues][n - 1];
+    pool.count[nUpvalues] = n - 1;
+    return c;
+}
+
+inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
+{
+    if (Closure * c = tryPopFakeClo(nUpvalues)) return c;
+    // Pool miss: always arena (never nursery) so subsequent
+    // recycle's pointer stability survives Cheney scavenges.
+    const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
+    auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
+    c->nUpvalues = nUpvalues;
+    c->_pad = 0;
+    c->capturedWiths = nullptr;
+    c->cu = nullptr;
+    return c;
+}
+
+inline void Alloc::recycleFakeClo(Closure * c) noexcept
+{
+    if (!c) return;
+    const uint16_t nUp = c->nUpvalues;
+    if (nUp >= kPoolMaxBuckets) return;
+    auto & pool = threadClosurePool();
+    uint16_t n = pool.count[nUp];
+    if (n >= kPoolPerBucket) return;
+    // Zero upvalues to avoid pinning stale GC references between uses.
+    // desc / cu / capturedWiths are overwritten by the next user, so
+    // we don't bother zeroing those.  upvalues[] is FAM and Value
+    // payloads can contain Boehm pointers — clearing avoids accidental
+    // retention through the pool itself (which sits in arena memory
+    // GC_add_roots'd).
+    for (uint16_t i = 0; i < nUp; ++i) c->upvalues[i] = Value{};
+    pool.slots[nUp][n] = c;
+    pool.count[nUp] = n + 1;
+}
 
 // ---------------------------------------------------------------------------
 // Per-attr position side-table.

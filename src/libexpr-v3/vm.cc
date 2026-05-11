@@ -3307,6 +3307,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             const uint32_t fWithBase     = frRef.withStackBase;
             const uint32_t fFlags        = frRef.flags;
             Thunk *        fThunk        = frRef.thunk;
+            // #558 Phase 4: capture the closure pointer too so we can
+            // recycle the fakeClo back to the pool below.  Only the
+            // CFF_THUNK_RETURN frames' closures are synthesized
+            // fakeClos eligible for pooling; OP_CALL frames' closures
+            // are owned by the caller's Value graph and must NOT be
+            // recycled.  Casting away const here is safe: the pool
+            // restores fakeClos to a clean state on recycle and the
+            // VM owns them once popped from the frame stack.
+            Closure *      fClosure      = const_cast<Closure *>(frRef.closure);
             vm.valueStack.resize(fStackBase);
             vm.withStack.resize(fWithBase);
             vm.frames.pop_back();
@@ -3598,6 +3607,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // #558 Phase 3.3 (2026-05-12): partial-Bindings
                 // infrastructure retired.  No publishes fire so the
                 // registry stays empty; nothing to erase at OP_RETURN.
+
+                // #558 Phase 4 (2026-05-12): recycle the fakeClo back
+                // to the thread-local pool now that its frame has
+                // popped and nothing else references it.  The body
+                // can't have stashed a pointer to the fakeClo
+                // anywhere persistent: OP_MAKE_CLOSURE copies the
+                // upvalue Values (not the Closure*) and Tag::Closure
+                // payloads only point at real closures produced by
+                // OP_MAKE_CLOSURE / primops, not fakeClos.  Pool
+                // bypassed when NIX_V3_NO_CLOSURE_POOL=1.
+                {
+                    static const bool s_noClosurePool =
+                        std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
+                    if (__builtin_expect(!s_noClosurePool, 1))
+                        Alloc::recycleFakeClo(fClosure);
+                }
 
                 // WC-38: the legacy "return-chain push" -- eagerly
                 // forcing the next thunk if the outer's body returned
@@ -4146,9 +4171,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             // Synthesize a closure-like view for OP_GET_UPVALUE: we set
             // `closure` to a fake Closure pointer crafted from the thunk
-            // tail.  Instead of allocating a temporary Closure, we build
-            // one on the heap (cheap; thunk forcing is uncommon enough).
-            Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
+            // tail.  #558 Phase 4: prefer a recycled Closure from the
+            // thread-local pool over a fresh allocation; OP_RETURN's
+            // CFF_THUNK_RETURN handler puts the fakeClo back in the
+            // pool after the body completes.  Under THUNK_ALL this
+            // saves hundreds of millions of Boehm allocations per
+            // top-level eval.  Opt-out via NIX_V3_NO_CLOSURE_POOL=1.
+            static const bool s_noClosurePool =
+                std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
+            Closure * fakeClo = __builtin_expect(s_noClosurePool, 0)
+                ? Alloc::allocClosure(t->nUpvalues)
+                : Alloc::allocFakeClo(t->nUpvalues);
             fakeClo->desc = desc;
             fakeClo->nUpvalues = t->nUpvalues;
             fakeClo->capturedWiths = t->suspended.capturedWiths;
