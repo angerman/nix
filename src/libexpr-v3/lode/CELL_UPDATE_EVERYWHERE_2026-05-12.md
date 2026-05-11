@@ -171,3 +171,64 @@ We tested cross-thunk shapeCell propagation (Phase 1.5b, since reverted).  It DI
 This is the same shape of mistake as the partial-Bindings registry.  It can sometimes succeed because the inner Bindings happens to contain enough state, but it's semantically wrong — any consumer that reads a non-existing key, or that reads while the inner Bindings is being mutated, gets corrupt data.
 
 The proper fix is to ensure no thunk is forced while it's mid-construction (no real cycle in TW-equivalent eval).  That requires laziness — which Phase 2 addresses.
+
+---
+
+## Phase 2 perf investigation (2026-05-12)
+
+`NIX_V3_INHERIT_FROM_THUNK_ALL=1` IS functionally correct.  10 v3 regression suites pass under it (see `run-thunk-all-regression-tests.sh`).  The blocker is per-force perf cost at nixpkgs scale.
+
+### Measured baselines
+
+| Workload | TW | v3 default | v3 + THUNK_ALL |
+|---|---|---|---|
+| `1+2` | 0.05s | 0.05s | 0.05s |
+| `import nixpkgs/lib` (462 attrs) | 0.06s | 0.05s | 0.05s |
+| `lib.systems.parse.mkSystemFromString "x86_64-linux"` | 0.07s | 0.08s | 0.08s |
+| `foldl' 10K ints` | 0.05s | 0.04s | 0.04s |
+| `(import nixpkgs {}) ? lib` | 0.5s | 0.6s (error) | **>120s (timeout)** |
+| `(import nixpkgs {}).hello.name` | 0.7s | 0.6s (error) | **>120s (timeout)** |
+
+THUNK_ALL is COMPETITIVE with TW on isolated workloads.  The 100x+ gap only manifests on full nixpkgs bootstrap.
+
+### Allocation profile under THUNK_ALL (30s of nixpkgs eval)
+
+```
+110000 forces, 416278 thunks allocated (ratio 0.264)
+arena 224MB
+hot descriptor: <thunk> at lib/systems/parse.nix:64:44
+  = wrap-thunk for `{inherit name;} // value` (function-arg in setType)
+  88858 forces (80% of all forces)
+```
+
+Key observation: the hot thunk is NOT a THUNK_ALL-induced wrap-thunk.  It's the regular function-argument thunkification that exists in BOTH modes.  THUNK_ALL just lets the eval RUN LONGER because the cycle is eliminated; default mode fails fast.
+
+So the perf gap isn't "THUNK_ALL adds extra thunks for inherit-from".  It's "v3's per-thunk-force cost is X, and nixpkgs has a LOT of thunks to force during stage iteration".
+
+### Optimization candidates (ranked)
+
+1. **Memoization audit**: ratio 0.264 = 4x more thunks allocated than forced.  3x of allocated thunks are NEVER forced.  Are we creating wrap-thunks for entries that get short-circuited?  E.g., `inherit (X) a b c d e` creates 5 entry-thunks; if consumer only accesses `a`, 4 entry-thunks are wasted.  Reduce allocation by hoisting shared decisions to lower-time.
+
+2. **Inline arg-thunkify for trivial bodies**: the hot wrap-thunk `{inherit name;} // value` body is 7 ops.  Each force pays dispatchLoop frame push/pop overhead (~50-200ns).  Replace MkThunk with a "lazy cell" that has the body bytecode inlined into the caller's bytecode at force point.  Saves ~half the per-force overhead.
+
+3. **Thunk-pool / nursery**: v3's nursery is already Cheney-style but Thunk allocations may not be in the nursery hot path.  Verify via gc.cc which allocations go through nursery vs threadArena.
+
+4. **OP_FORCE fast path**: when forceValue receives Tag::Thunk(t) where t is already Evaluated, return t->evaluated immediately.  Current code goes through full chase loop.  Add inlined fast-path check at OP_FORCE.
+
+5. **Skip OP_RETURN cell-update writes** when both cell and shapeCell are nullptr.  Two conditional branches saved per OP_RETURN.
+
+6. **Inline single-entry attrset construction**: `{inherit name;}` builds a Bindings(1) every time.  Pool small Bindings or use stack-allocated lookup.
+
+### Phase 2 plan (revised, multi-session)
+
+| Sub-phase | Work | Acceptance |
+|---|---|---|
+| 2a | Run `run-thunk-all-regression-tests.sh` in CI to lock functional correctness | All 10 suites pass |
+| 2b | Pick optimization #1 (memoization audit) — find where wasted thunks come from | Allocation count down by 30%+ |
+| 2c | Pick optimization #2 (inline trivial arg thunks) | Per-force cost down by 50%+ |
+| 2d | Re-time `pkgs ? lib` under THUNK_ALL | Within 5x of TW |
+| 2e | Iterate until within 1.5x | Within 1.5x of TW |
+| 2f | Flip THUNK_ALL default-on; retire partial-Bindings | Cascade closes |
+| 2g | Run full nixpkgs `hello.name` end-to-end | Returns `"hello-2.12.2"` |
+
+Each sub-phase commits independently with regression gate.  No flag flips until 2f.
