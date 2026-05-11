@@ -7044,6 +7044,19 @@ Value forceValue(VMState & vm, Value v)
     // the thunk chain again).  Without memoization, every withLookup
     // through a Tag::Slot would re-force the underlying thunk.
     Value * memoSlot = nullptr;
+    // #558 Phase 4 follow-up: path compression for Evaluated thunk
+    // chains.  When we walk through Tag::Thunk → Tag::Thunk → ... in
+    // the Evaluated state, every consumer that holds a pointer to the
+    // FIRST thunk pays the full chase cost on every force.  Record up
+    // to kCompressMax thunks and, after resolution, write the final
+    // WHNF back to each so future forces resolve in one hop.  Cheap:
+    // 16 pointers on the C-stack, written only on success.  Opt-out
+    // via NIX_V3_NO_PATH_COMPRESS=1.
+    static const bool s_noPathCompress =
+        std::getenv("NIX_V3_NO_PATH_COMPRESS") != nullptr;
+    constexpr int kCompressMax = 16;
+    Thunk * compressChain[kCompressMax];
+    int compressCount = 0;
     // Iteration bound: detect infinite chases through Tag::Slot →
     // Tag::Thunk(Eval=Slot→...) cycles that arise from self-referential
     // let-rec patterns like `let x = x; in x` or `let x = y; y = x; in x`.
@@ -7145,7 +7158,19 @@ Value forceValue(VMState & vm, Value v)
         }
         if (!v.isThunk()) break;
         Thunk * t = v.payload.thunk;
-        if (t->state == ThunkState::Evaluated) { v = t->evaluated; continue; }
+        if (t->state == ThunkState::Evaluated) {
+            // #558 Phase 4 follow-up: record this thunk for path
+            // compression below.  After the chase resolves to a final
+            // WHNF, we rewrite each recorded thunk's `evaluated` slot
+            // so future forces hit in O(1) instead of walking the same
+            // chain again.  Cap at kCompressMax to bound the chain
+            // memory; longer chains are rare and the cap is well above
+            // any observed depth (≤4 in practice for nested let-rec).
+            if (!s_noPathCompress && compressCount < kCompressMax)
+                compressChain[compressCount++] = t;
+            v = t->evaluated;
+            continue;
+        }
         if (t->state == ThunkState::Blackhole) {
             // #458 lambda-skip leaked-Black recovery (opt-in).  When the
             // thunk's Black state was set by a previous VMState that has
@@ -7656,6 +7681,21 @@ Value forceValue(VMState & vm, Value v)
     // shouldn't happen, but be safe).
     if (memoSlot && v.tag() != Tag::Slot)
         *memoSlot = v;
+    // #558 Phase 4 follow-up: path compression writeback.  Only write
+    // back when v is a stable WHNF — never vBlackhole (the cross-stack
+    // deferred-value marker, which is transient and shouldn't be
+    // memoized; the next force should re-attempt) and never another
+    // Tag::Thunk/Tag::Slot/Tag::App (defensive: the chase loop
+    // shouldn't exit with one of these, but guard regardless).
+    if (compressCount > 0
+        && v.tag() != Tag::Thunk
+        && v.tag() != Tag::Slot
+        && v.tag() != Tag::App
+        && v.tag() != Tag::Blackhole)
+    {
+        for (int i = 0; i < compressCount; ++i)
+            compressChain[i]->evaluated = v;
+    }
     return v;
 }
 
