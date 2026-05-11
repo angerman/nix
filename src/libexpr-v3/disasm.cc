@@ -184,6 +184,7 @@ uint32_t disassembleOne(std::FILE * out,
     case OP_ATTRS_SELECT_DYN:
     case OP_ATTRS_HAS:
     case OP_ATTRS_HAS_DYN:
+    case OP_REC_BINDING_SLOT_REF:
         symAnnotate(operand);
         break;
     default: break;

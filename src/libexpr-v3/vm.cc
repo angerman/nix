@@ -4856,6 +4856,61 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
+            // Phase A3: when SELECT operates on a 1-entry attrset
+            // matching V3_DBG_SELECT_PATTERN (e.g. "family"), dump the
+            // source position + selecting attribute name.  Used to
+            // catch the moment v3 reaches SELECT on a `{family}` shape
+            // that TW would have skipped.
+            {
+                static const char * s_dbgSelP =
+                    std::getenv("V3_DBG_SELECT_PATTERN");
+                if (__builtin_expect(s_dbgSelP != nullptr, 0)) {
+                    if (attrs.isAttrs() && attrs.payload.bindings
+                        && attrs.payload.bindings->size == 1) {
+                        const auto & st = ir::globalSymbolTable();
+                        SymbolId nm = attrs.payload.bindings->entries[0].name;
+                        const char * nmStr =
+                            nm < st.size() ? st[nm].c_str() : "?";
+                        if (std::strcmp(nmStr, s_dbgSelP) == 0) {
+                            SymbolId sym = static_cast<SymbolId>(operand);
+                            const char * symStr =
+                                sym < st.size() ? st[sym].c_str() : "?";
+                            std::fprintf(stderr,
+                                "v3 OP_ATTRS_SELECT on {%s} (size=1) "
+                                "selecting '%s' [ptr=%p]",
+                                nmStr, symStr,
+                                (const void *)attrs.payload.bindings);
+                            if (const BindingsOrigin * o =
+                                    lookupBindingsOrigin(attrs.payload.bindings)) {
+                                const PosSnapshot * ps =
+                                    resolvePosSnapshot(o->posHandle);
+                                std::fprintf(stderr,
+                                    " bindings-origin=%s@%s:%u",
+                                    o->source ? o->source : "?",
+                                    (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                                    ps ? ps->line : 0u);
+                            }
+                            if (!vm.frames.empty()) {
+                                const auto & fr = vm.frames.back();
+                                const LambdaDescriptor * d = nullptr;
+                                if (fr.thunk
+                                    && (fr.thunk->state == ThunkState::Suspended
+                                        || fr.thunk->state == ThunkState::Blackhole))
+                                    d = fr.thunk->suspended.desc;
+                                else if (fr.closure) d = fr.closure->desc;
+                                const PosSnapshot * fps =
+                                    d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                                std::fprintf(stderr,
+                                    " from %s@%s:%u (ip=%u)",
+                                    d && !d->name.empty() ? d->name.c_str() : "<?>",
+                                    (fps && !fps->file.empty()) ? fps->file.c_str() : "?",
+                                    fps ? fps->line : 0u, ip - 1);
+                            }
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
+            }
             if (!attrs.isAttrs()) {
                 // #558 (2026-05-10) diagnostic: log tag + symbol + frame
                 // chain when a Select fails on a non-attrs value.  Used
@@ -5173,6 +5228,49 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     push(vm, resolved);
                 } else {
                     push(vm, slot);
+                }
+                // Phase A3: when the selected value is a size-1 attrs
+                // matching V3_DBG_SELECT_RESULT, dump the SOURCE
+                // attrset's full keyset + values so we can see what
+                // attrset has the bad `.name = {family}` entry.
+                {
+                    static const char * s_dbgSelR =
+                        std::getenv("V3_DBG_SELECT_RESULT");
+                    if (__builtin_expect(s_dbgSelR != nullptr, 0)) {
+                        const Value & top_val = vm.valueStack.back();
+                        if (top_val.isAttrs() && top_val.payload.bindings
+                            && top_val.payload.bindings->size == 1) {
+                            const auto & st = ir::globalSymbolTable();
+                            SymbolId rnm = top_val.payload.bindings->entries[0].name;
+                            const char * rnmStr = rnm < st.size() ? st[rnm].c_str() : "?";
+                            if (std::strcmp(rnmStr, s_dbgSelR) == 0) {
+                                SymbolId selSym = static_cast<SymbolId>(operand);
+                                const char * selStr = selSym < st.size() ? st[selSym].c_str() : "?";
+                                std::fprintf(stderr,
+                                    "v3 SELECT returned {%s} (size=1) when selecting '%s' "
+                                    "from bindings ptr=%p size=%u: {",
+                                    rnmStr, selStr, (const void *)b, (unsigned)b->size);
+                                for (uint32_t k = 0; k < b->size && k < 16; ++k) {
+                                    SymbolId nm = b->entries[k].name;
+                                    std::fprintf(stderr, "%s%s",
+                                        k ? "," : "",
+                                        nm < st.size() ? st[nm].c_str() : "?");
+                                }
+                                std::fprintf(stderr, "}");
+                                if (const BindingsOrigin * o =
+                                        lookupBindingsOrigin(b)) {
+                                    const PosSnapshot * ps =
+                                        resolvePosSnapshot(o->posHandle);
+                                    std::fprintf(stderr,
+                                        " bindings-origin=%s@%s:%u",
+                                        o->source ? o->source : "?",
+                                        (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                                        ps ? ps->line : 0u);
+                                }
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
+                    }
                 }
             }
             break;
@@ -6498,6 +6596,124 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 throw std::runtime_error("v3 OP_ATTRS_REC_SET: top is not an attrset");
             if (!recAttrs.payload.bindings || i >= recAttrs.payload.bindings->size)
                 throw std::runtime_error("v3 OP_ATTRS_REC_SET: index out of range");
+            // Phase A3 (RCA 2026-05-11): trace SETs that write into a
+            // slot whose name matches V3_DBG_REC_SET_NAME.  Used to
+            // localize cross-binding contamination — e.g., what value
+            // is written into the `cpuName` slot of tripleFromSystem's
+            // let-block.
+            {
+                static const char * s_dbgRecSetName =
+                    std::getenv("V3_DBG_REC_SET_NAME");
+                if (__builtin_expect(s_dbgRecSetName != nullptr, 0)) {
+                    auto * b = recAttrs.payload.bindings;
+                    SymbolId nm = b->entries[i].name;
+                    const auto & st = ir::globalSymbolTable();
+                    const char * nmStr =
+                        nm < st.size() ? st[nm].c_str() : "?";
+                    if (std::strcmp(nmStr, s_dbgRecSetName) == 0) {
+                        std::fprintf(stderr,
+                            "v3 OP_ATTRS_REC_SET slot[%u]=%s on bindings ptr=%p"
+                            " (size=%u) <- value tag=%u",
+                            i, nmStr, (const void *)b,
+                            (unsigned)b->size, (unsigned)v.tag());
+                        if (v.isAttrs() && v.payload.bindings) {
+                            auto * vb = v.payload.bindings;
+                            std::fprintf(stderr, " attrs size=%u {",
+                                (unsigned)vb->size);
+                            for (uint32_t k = 0; k < vb->size && k < 6; ++k) {
+                                SymbolId nm2 = vb->entries[k].name;
+                                std::fprintf(stderr, "%s%s", k ? "," : "",
+                                    nm2 < st.size() ? st[nm2].c_str() : "?");
+                            }
+                            std::fprintf(stderr, "}");
+                            if (const BindingsOrigin * o =
+                                    lookupBindingsOrigin(vb)) {
+                                const PosSnapshot * ps =
+                                    resolvePosSnapshot(o->posHandle);
+                                std::fprintf(stderr,
+                                    " value-origin=%s@%s:%u",
+                                    o->source ? o->source : "?",
+                                    (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                                    ps ? ps->line : 0u);
+                            }
+                        } else if (v.isThunk() && v.payload.thunk) {
+                            Thunk * t = v.payload.thunk;
+                            const LambdaDescriptor * td =
+                                t->state == ThunkState::Suspended
+                                    ? t->suspended.desc : nullptr;
+                            std::fprintf(stderr,
+                                " thunk-state=%d nUp=%u codeOff=%u",
+                                (int)t->state, (unsigned)t->nUpvalues,
+                                td ? td->codeOffset : 0u);
+                            // Also dump the body bytecode (40 words) so
+                            // we can sanity-check the lowerer emitted
+                            // the right ops for `cpu.name` etc.
+                            if (td && t->suspended.cu) {
+                                std::fprintf(stderr, "\n      body disasm:\n");
+                                disassembleWindow(stderr, *t->suspended.cu,
+                                    td->codeOffset, td->codeOffset + 40);
+                            }
+                            // Dump up to 6 upvalues with their tags + (for
+                            // Attrs) their shape & origin.
+                            for (uint16_t ui = 0; ui < t->nUpvalues && ui < 6; ++ui) {
+                                const Value & uv = t->tail[ui];
+                                std::fprintf(stderr, "\n      up[%u] tag=%u",
+                                    ui, (unsigned)uv.tag());
+                                if (uv.tag() == Tag::Attrs && uv.payload.bindings) {
+                                    auto * ub = uv.payload.bindings;
+                                    std::fprintf(stderr, " ptr=%p size=%u {",
+                                        (const void *)ub, (unsigned)ub->size);
+                                    for (uint32_t k = 0; k < ub->size && k < 6; ++k) {
+                                        SymbolId nm3 = ub->entries[k].name;
+                                        std::fprintf(stderr, "%s%s", k?",":"",
+                                            nm3 < st.size() ? st[nm3].c_str() : "?");
+                                    }
+                                    std::fprintf(stderr, "}");
+                                    if (const BindingsOrigin * o3 =
+                                            lookupBindingsOrigin(ub)) {
+                                        const PosSnapshot * ps =
+                                            resolvePosSnapshot(o3->posHandle);
+                                        std::fprintf(stderr,
+                                            " origin=%s@%s:%u",
+                                            o3->source ? o3->source : "?",
+                                            (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                                            ps ? ps->line : 0u);
+                                    }
+                                } else if (uv.tag() == Tag::Slot && uv.payload.slot) {
+                                    std::fprintf(stderr, " slot->tag=%u",
+                                        (unsigned)uv.payload.slot->tag());
+                                } else if (uv.tag() == Tag::Thunk && uv.payload.thunk) {
+                                    std::fprintf(stderr,
+                                        " thunk-state=%d", (int)uv.payload.thunk->state);
+                                } else if (uv.isString()) {
+                                    std::fprintf(stderr, " str=\"%.20s\"", uv.payload.str);
+                                }
+                            }
+                        } else if (v.isString()) {
+                            std::fprintf(stderr, " str=\"%.40s\"",
+                                v.payload.str);
+                        }
+                        // Current frame's position.
+                        if (!vm.frames.empty()) {
+                            const auto & fr = vm.frames.back();
+                            const LambdaDescriptor * d = nullptr;
+                            if (fr.thunk
+                                && (fr.thunk->state == ThunkState::Suspended
+                                    || fr.thunk->state == ThunkState::Blackhole))
+                                d = fr.thunk->suspended.desc;
+                            else if (fr.closure) d = fr.closure->desc;
+                            const PosSnapshot * fps =
+                                d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                            std::fprintf(stderr,
+                                " from %s@%s:%u (ip=%u)",
+                                d && !d->name.empty() ? d->name.c_str() : "<?>",
+                                (fps && !fps->file.empty()) ? fps->file.c_str() : "?",
+                                fps ? fps->line : 0u, ip - 1);
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
             recAttrs.payload.bindings->entries[i].value = v;
             // STG-8 (#498): if this entry's value is a Suspended thunk
             // (the common case from the LetRec emit's per-attr thunks),
