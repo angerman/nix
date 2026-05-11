@@ -52,10 +52,6 @@
 
 namespace nix::v3 {
 
-// vm.cc owns the registry; we re-declare the accessor here so we
-// can rewrite forwarded `Thunk *` keys and walk `Bindings *` values.
-std::unordered_map<Thunk *, Bindings *> & partialBindingsRegistry();
-
 namespace {
 
 enum GrayKind : uint8_t {
@@ -441,23 +437,8 @@ void Scavenger::run()
         }
     }
 
-    // partialBindings registry (vm.cc): Thunk * keys may have been
-    // copied; Bindings * values need to be walked (they're tenured
-    // but might hold nursery refs in entries[]).  We rebuild the
-    // map in one pass to fix forwarded keys.
-    {
-        auto & reg = partialBindingsRegistry();
-        if (!reg.empty()) {
-            std::unordered_map<Thunk *, Bindings *> rebuilt;
-            rebuilt.reserve(reg.size());
-            for (auto & [k, v] : reg) {
-                Thunk * nk = fwdThunk(k);
-                Bindings * nv = fwdBindings(v);
-                rebuilt[nk] = nv;
-            }
-            reg = std::move(rebuilt);
-        }
-    }
+    // #558 Phase 3.3: partialBindingsRegistry retired (no longer
+    // referenced by vm.cc).  No scavenge work needed.
 
     // -- Stage 2: walk graylist ---------------------------------
 

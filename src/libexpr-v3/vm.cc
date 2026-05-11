@@ -116,119 +116,13 @@ inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
     return m;
 }
 
-// #548c (2026-05-10): forward-declare the partial-bindings registry
-// so withLookup (defined before the registry's body at line ~1077)
-// can peek into it when a with-source is a Black thunk whose
-// rec-attrset construction registered its partial Bindings.  The
-// peek lets withLookup find a sibling entry that has already been
-// SET via OP_ATTRS_REC_SET — STG-style "selector thunk" semantics
-// for `with self;` over a mid-construction recAttrs.
-// External linkage so gc.cc can rewrite forwarded Thunk * keys
-// after a nursery scavenge.  Definition lives below at file scope
-// outside the anonymous namespace.  We close the surrounding anon
-// namespace so this declaration is at `nix::v3` scope (matching the
-// definition); otherwise it would silently declare a separate
-// internal-linkage function inside the anon namespace and conflict
-// with the real definition.
-} // -- close anon for partialBindingsRegistry forward decl
-/// #558 (2026-05-10) per-thunk Bindings CHAIN.
-///
-/// The registry maps each in-progress thunk to a list of partial
-/// Bindings — one per `OP_ATTRS_REC_INIT_TAIL` event that fired while
-/// this thunk was on the call stack.  Walk back-to-front on lookup;
-/// the first Bindings containing the looked-up name wins.
-///
-/// Why a chain instead of a single Bindings*: lib.extends-style fold
-/// (`prev // overlay final prev`) composes layers.  Each layer's body
-/// has its own tail-return AttrSet that contributes a partial set of
-/// names.  A `with self;` lookup mid-eval needs to see contributions
-/// from ALL layers, with later layers shadowing earlier ones for
-/// shared names — exactly the // semantics.  A single Bindings* can
-/// only hold one snapshot; eager-merge into a fresh Bindings copies
-/// entries by-value at merge time, missing subsequent OP_ATTRS_REC_SET
-/// writes into the source bindings (Bindings is allocated upfront by
-/// REC_INIT_TAIL with placeholder values, then progressively SET).
-///
-/// The chain stores POINTERS to the original Bindings, so SETs on a
-/// chain entry's bindings (via REC_SET on the same heap object) ARE
-/// observed by the lookup that walks the chain.
-///
-/// Lookup order (back-to-front = LATEST first): mirrors lib.extends's
-/// `// overlay` semantics where later layers win on key conflicts.
-using PartialBindingsChain = std::vector<Bindings *>;
-std::unordered_map<Thunk *, PartialBindingsChain> & partialBindingsRegistry();
-
-/// #558 (2026-05-11): pick the most-informative chain layer (largest
-/// size).  Used by every site that needs a SINGLE Bindings from a
-/// chain (STG WHNF recovery, OP_ATTRS_UPDATE collapseDeferred, etc.).
-/// Mirrors lookupInPartialChain's largest-layer-wins for the
-/// "collapse to one Bindings" case.
-///
-/// Gated by NIX_V3_NO_LARGEST_WHNF=1 (reverts to chain.back()).
-inline Bindings * pickLargestLayer(const PartialBindingsChain & chain)
-{
-    if (chain.empty()) return nullptr;
-    static const bool s_noLargestWhnf =
-        std::getenv("NIX_V3_NO_LARGEST_WHNF") != nullptr;
-    if (s_noLargestWhnf) return chain.back();
-    Bindings * pick = nullptr;
-    for (auto * b : chain) {
-        if (!b) continue;
-        if (!pick || b->size > pick->size)
-            pick = b;
-    }
-    return pick;
-}
-
-/// #558: lookup a name across all Bindings in the chain.
-///
-/// Strategy: prefer ENTRIES FROM THE LARGEST CHAIN LAYER that contains
-/// the key.  Larger layers are more likely to be actual fix-point
-/// WHNF approximations (e.g. all-packages.nix's 4831-key bindings or
-/// the merged 19085-key pkgs); smaller layers are typically
-/// sub-attrsets (e.g. setFunctionArgs's {__functor, __functionArgs}
-/// or qt5-packages.nix's `attrs` of size 4).
-///
-/// Falls back to "latest registration" (back-to-front) if multiple
-/// layers tie on size — preserves overlay-style override semantics
-/// for layers of the same size.
-///
-/// STG analog: when multiple shape hints are available for an indirect,
-/// prefer the most informative (largest) one.  This matches GHC's
-/// pattern of preferring tighter strictness/shape info.
-///
-/// Gated by NIX_V3_NO_LARGEST_PEEK=1 (reverts to back-to-front).
-///
-/// Returns nullptr if no chain entry has the name.
-inline Value * lookupInPartialChain(const PartialBindingsChain & chain,
-                                     SymbolId name)
-{
-    static const bool s_noLargest =
-        std::getenv("NIX_V3_NO_LARGEST_PEEK") != nullptr;
-    if (s_noLargest) {
-        // Original back-to-front (LATEST-WINS).
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-            if (!*it) continue;
-            if (auto * v = (*it)->lookup(name)) return v;
-        }
-        return nullptr;
-    }
-    // LARGEST-LAYER-WINS: walk all layers, pick the value from the
-    // largest matching layer.  Tie-break: latest (back-to-front).
-    Value * best = nullptr;
-    uint32_t bestSize = 0;
-    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-        if (!*it) continue;
-        uint32_t sz = (*it)->size;
-        if (best && sz <= bestSize) continue;
-        if (auto * v = (*it)->lookup(name)) {
-            best = v;
-            bestSize = sz;
-        }
-    }
-    return best;
-}
-namespace { // -- reopen anon
+// #558 Phase 3.3 (2026-05-12): partialBindingsRegistry +
+// lookupInPartialChain + pickLargestLayer retired.  Cell-update-
+// everywhere via Thunk::shapeCell (Phase 1.5) replaces them.
+//
+// Note: the anon namespace closing/reopening that used to be required
+// for the external-linkage `partialBindingsRegistry` forward decl is
+// also gone — gc.cc no longer references it either.
 
 // #548c (2026-05-10) per-CU registry for the alloc/force atexit dump.
 // V3_DBG_ALLOC_DUMP=1 enables.  At process exit, top-N descriptors
@@ -1265,17 +1159,7 @@ namespace {
 /// body normally (transition to Evaluated) or when an exception
 /// unwinds (clearBlackMarksOnException scans and clears).
 //
-// Defined OUTSIDE the surrounding anonymous namespace so the symbol
-// has external linkage and gc.cc can call it from another TU
-// (for nursery-scavenge key rewrites).
-} // -- close anon namespace for partialBindingsRegistry definition
-std::unordered_map<Thunk *, PartialBindingsChain> & partialBindingsRegistry()
-{
-    static thread_local std::unordered_map<Thunk *, PartialBindingsChain> tbl;
-    return tbl;
-}
-
-namespace { // -- reopen anon namespace for dispatchLoop and friends
+// #558 Phase 3.3 (2026-05-12): partialBindingsRegistry retired.
 
 /// Run the dispatch loop on `vm` until either:
 ///   - OP_HALT is reached (top-level exit), or
