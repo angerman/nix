@@ -757,32 +757,10 @@ inline Value withLookup(VMState & vm, SymbolId name)
             // analog that lets `with self;` find sibling entries
             // during a rec-attrset's mid-construction.  No force, no
             // blackhole error: just a Bindings::lookup on the
-            // already-allocated Con cell.
-            if (derefed.isThunk() && derefed.payload.thunk
-                && derefed.payload.thunk->state == ThunkState::Blackhole)
-            {
-                auto & reg = partialBindingsRegistry();
-                auto it = reg.find(derefed.payload.thunk);
-                if (it != reg.end()) {
-                    if (auto * v = lookupInPartialChain(it->second, name))
-                        return *v;
-                }
-            }
             if (derefed.isThunk() || derefed.tag() == Tag::App) {
                 try {
                     derefed = forceValue(vm, derefed);
                 } catch (const BlackholeError &) {
-                    // Last-chance peek for partial Bindings (in case
-                    // a deeper chase landed on a Black thunk we hadn't
-                    // seen at the top level).
-                    if (derefed.isThunk() && derefed.payload.thunk) {
-                        auto & reg = partialBindingsRegistry();
-                        auto it = reg.find(derefed.payload.thunk);
-                        if (it != reg.end()) {
-                            if (auto * v = lookupInPartialChain(it->second, name))
-                                return *v;
-                        }
-                    }
                     anyBlackholed = true;
                     continue;
                 }
@@ -3551,40 +3529,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // resolving back to self via indirections is NOT
                     // a true loop — it's the chain unwinding through
                     // a self-reference that's still mid-construction.
-                    auto & reg = partialBindingsRegistry();
-                    auto pIt = reg.find(fr.thunk);
-                    if (pIt != reg.end() && !pIt->second.empty()) {
-                        Value recovered;
-                        recovered.tag_payload =
-                            static_cast<uint64_t>(Tag::Attrs);
-                        recovered.payload.bindings =
-                            pickLargestLayer(pIt->second);
-                        retVal = recovered;
-                    } else {
-                        // Defer: return vBlackhole.  Caller sees a
-                        // marker that propagates until a consumer
-                        // demands a concrete value — at which point
-                        // the surrounding fix-point will likely have
-                        // settled.
-                        static const bool s_dbgVBHProd =
-                            std::getenv("V3_DBG_VBH_PROD") != nullptr;
-                        if (s_dbgVBHProd) {
-                            const auto * d = (fr.thunk
-                                && (fr.thunk->state == ThunkState::Suspended
-                                    || fr.thunk->state == ThunkState::Blackhole))
-                                ? fr.thunk->suspended.desc : nullptr;
-                            const PosSnapshot * ps =
-                                d ? resolvePosSnapshot(d->posHandle) : nullptr;
-                            std::fprintf(stderr,
-                                "v3 OP_RETURN→vBlackhole defer: thunk=%p name='%s' pos=%s:%u:%u\n",
-                                (void *)fr.thunk,
-                                d && !d->name.empty() ? d->name.c_str() : "<?>",
-                                (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
-                                ps ? ps->line : 0u,
-                                ps ? ps->column : 0u);
-                        }
-                        retVal = Value::vBlackhole;
+                    // #558 Phase 3.3: partial-Bindings recovery
+                    // retired.  Defer the self-cycle via vBlackhole.
+                    static const bool s_dbgVBHProd =
+                        std::getenv("V3_DBG_VBH_PROD") != nullptr;
+                    if (s_dbgVBHProd) {
+                        const auto * d = (fr.thunk
+                            && (fr.thunk->state == ThunkState::Suspended
+                                || fr.thunk->state == ThunkState::Blackhole))
+                            ? fr.thunk->suspended.desc : nullptr;
+                        const PosSnapshot * ps =
+                            d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                        std::fprintf(stderr,
+                            "v3 OP_RETURN→vBlackhole defer: thunk=%p name='%s' pos=%s:%u:%u\n",
+                            (void *)fr.thunk,
+                            d && !d->name.empty() ? d->name.c_str() : "<?>",
+                            (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                            ps ? ps->line : 0u,
+                            ps ? ps->column : 0u);
                     }
+                    retVal = Value::vBlackhole;
                 }
                 // V3_DBG_STORE_PREVSTAGE: trace any thunk that gets
                 // evaluated to a Closure whose desc is "prevStage" and
