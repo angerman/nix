@@ -4569,6 +4569,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     std::getenv("V3_DBG_FORCE_NAME");
                 static const char * s_focusPos =
                     std::getenv("V3_DBG_FORCE_POS");
+                // V3_DBG_FORCE_FILE: optional file-name substring filter
+                // (combine with V3_DBG_FORCE_POS to match by file+line).
+                // E.g., V3_DBG_FORCE_FILE=darwin/default.nix V3_DBG_FORCE_POS=232.
+                static const char * s_focusFile =
+                    std::getenv("V3_DBG_FORCE_FILE");
                 bool nameMatch = s_focusName && desc
                     && desc->name == s_focusName;
                 bool posMatch = false;
@@ -4576,7 +4581,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     const PosSnapshot * ps = resolvePosSnapshot(desc->posHandle);
                     if (ps) {
                         uint32_t want = std::strtoul(s_focusPos, nullptr, 10);
-                        if (ps->line == want) posMatch = true;
+                        bool lineOk = ps->line == want;
+                        bool fileOk = !s_focusFile
+                            || (ps->file.find(s_focusFile) != std::string::npos);
+                        if (lineOk && fileOk) posMatch = true;
                     }
                 }
                 if (__builtin_expect((nameMatch || posMatch)
