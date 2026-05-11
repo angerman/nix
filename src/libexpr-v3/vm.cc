@@ -7172,13 +7172,30 @@ Value forceValue(VMState & vm, Value v)
         // Tag::App is a deferred application — force it by actually
         // applying.  Used by primops like mapAttrs that build lazy
         // entries: each entry is `App(fn, arg)` and we materialize on
-        // demand.  `left` may itself be an App / Thunk (e.g. mapAttrs
-        // builds App(App(fn, name), value)) — force the spine first.
+        // demand.  `left` may itself be an App (e.g. mapAttrs builds
+        // App(App(fn, name), value) for curried application).
+        //
+        // Mirrors OP_FORCE's iterative spine walk (vm.cc:3823): walk
+        // down the left chain into a small `rights` buffer, then
+        // force the leaf and apply the rights in source order.  The
+        // pre-fix recursive `forceValue(vm, left)` pattern blew C-stack
+        // on long mapAttrs/map chains in nixpkgs; this version bottoms
+        // out the recursion at the leaf rather than at every App
+        // level.  `rights.reserve(8)` keeps typical depths on the
+        // stack — std::vector only grows beyond that.
         if (v.tag() == Tag::App) {
-            Value left  = v.payload.pair->left;
-            Value right = v.payload.pair->right;
-            left = forceValue(vm, left);
-            v = callClosure(vm, left, right);
+            std::vector<Value> rights;
+            rights.reserve(8);
+            while (v.tag() == Tag::App) {
+                rights.push_back(v.payload.pair->right);
+                v = v.payload.pair->left;
+            }
+            if (v.tag() == Tag::Slot
+                || v.tag() == Tag::Thunk
+                || v.tag() == Tag::App)
+                v = forceValue(vm, v);
+            for (size_t i = rights.size(); i > 0; --i)
+                v = callClosure(vm, v, rights[i - 1]);
             continue;
         }
         if (!v.isThunk()) break;
