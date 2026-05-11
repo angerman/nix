@@ -5189,14 +5189,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = b;
             publishToAllThunkFrames(vm, v);
-            // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere
-            // TAIL variant: tail-position result IS the function's
-            // (and tail-call ancestors') value.  Update ALL outer
-            // THUNK_RETURN frames' shapeCells — each gets its OWN
-            // shapeCell updated, no cross-thunk pollution at
-            // lookup time (consumers only read their own thunk's
-            // shapeCell, never others').  Mirrors
-            // publishToAllThunkFrames but per-thunk cell-targeted.
+            // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere:
+            // update ONLY the innermost THUNK_RETURN frame's
+            // shapeCell.  Per-thunk cell update is STG-correct;
+            // cross-thunk propagation would re-introduce the same
+            // pollution shape the partial-Bindings registry suffers
+            // from (publishToAllThunkFrames).  If a consumer hits
+            // BLACK on a non-innermost thunk and its shapeCell is
+            // still the sentinel, that's a real cycle from STG's
+            // perspective — fall through to legacy STG WHNF recovery
+            // (which will be retired in Phase 2 once IR-level
+            // laziness eliminates the legitimate-cycle cases).
             {
                 static const bool s_cellEverywhere =
                     std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
@@ -5207,8 +5210,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         if (!fr.thunk) continue;
                         if (!fr.thunk->shapeCell) continue;
                         *fr.thunk->shapeCell = v;
-                        // Note: NO break — update ALL outer frames
-                        // (tail-position propagation).
+                        break;  // innermost only — STG-correct
                     }
                 }
             }
@@ -6053,8 +6055,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = out;
             publishToAllThunkFrames(vm, v);
-            // #558 Phase 1.5: tail-position // result.  Same
-            // cell-everywhere propagation as OP_ATTRS_REC_INIT_TAIL.
+            // #558 Phase 1.5: tail-position // result.  Update only
+            // the innermost THUNK_RETURN frame's shapeCell — STG-
+            // correct per-thunk cell update.
             {
                 static const bool s_cellEverywhere =
                     std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
@@ -6065,6 +6068,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         if (!fr.thunk) continue;
                         if (!fr.thunk->shapeCell) continue;
                         *fr.thunk->shapeCell = v;
+                        break;  // innermost only — STG-correct
                     }
                 }
             }
