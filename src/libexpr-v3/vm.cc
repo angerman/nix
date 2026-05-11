@@ -4558,6 +4558,63 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             ++t->forces;
             ++desc->forceCount;
             ++allocStats().thunksForced;
+            // #558 (2026-05-11) Focused trace: log when a thunk with a
+            // specific name is forced for the first time.  Used to
+            // diagnose v3-specific eager forces vs TW.  Set
+            // V3_DBG_FORCE_NAME=libsForQt5 to trace.  Also matches
+            // by file:line if name doesn't match — set V3_DBG_FORCE_POS=8390
+            // to match by line number.
+            {
+                static const char * s_focusName =
+                    std::getenv("V3_DBG_FORCE_NAME");
+                static const char * s_focusPos =
+                    std::getenv("V3_DBG_FORCE_POS");
+                bool nameMatch = s_focusName && desc
+                    && desc->name == s_focusName;
+                bool posMatch = false;
+                if (s_focusPos && desc && desc->posHandle) {
+                    const PosSnapshot * ps = resolvePosSnapshot(desc->posHandle);
+                    if (ps) {
+                        uint32_t want = std::strtoul(s_focusPos, nullptr, 10);
+                        if (ps->line == want) posMatch = true;
+                    }
+                }
+                if (__builtin_expect((nameMatch || posMatch)
+                                     && desc && desc->forceCount == 1, 0)) {
+                    if (true)
+                    {
+                        const PosSnapshot * ps =
+                            resolvePosSnapshot(desc->posHandle);
+                        std::fprintf(stderr,
+                            "v3 FORCE-NAME-FIRST: '%s' thunk=%p pos=%s:%u:%u frames=%zu\n",
+                            desc->name.c_str(), (void *)t,
+                            (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
+                            ps ? ps->line : 0u, ps ? ps->column : 0u,
+                            vm.frames.size());
+                        size_t lim = vm.frames.size();
+                        for (size_t fi = lim; fi > 0 && fi + 20 > lim; --fi) {
+                            const auto & fr = vm.frames[fi - 1];
+                            const LambdaDescriptor * d = nullptr;
+                            if (fr.thunk
+                                && (fr.thunk->state == ThunkState::Suspended
+                                    || fr.thunk->state == ThunkState::Blackhole))
+                                d = fr.thunk->suspended.desc;
+                            else if (fr.closure)
+                                d = fr.closure->desc;
+                            const PosSnapshot * ps2 =
+                                d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                            std::fprintf(stderr,
+                                "  [%zu] %s ip=%u flags=%u %s:%u:%u\n",
+                                fi - 1,
+                                d && !d->name.empty() ? d->name.c_str() : "<?>",
+                                fr.ip, (unsigned)fr.flags,
+                                (ps2 && !ps2->file.empty()) ? ps2->file.c_str() : "?",
+                                ps2 ? ps2->line : 0u, ps2 ? ps2->column : 0u);
+                        }
+                        std::fflush(stderr);
+                    }
+                }
+            }
             // Phase 13: live periodic stats dump.  When V3_DBG_FORCES is
             // set, every N millionth force emits a one-line snapshot to
             // stderr.  Lets us watch a runaway eval without waiting for
