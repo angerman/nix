@@ -158,6 +158,13 @@ inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
 using PartialBindingsChain = std::vector<Bindings *>;
 std::unordered_map<Thunk *, PartialBindingsChain> & partialBindingsRegistry();
 
+/// #558 Phase 2 lazy-cleanup: thread_local set of Bindings* that
+/// have been OP_RETURNed (their owning thunk is finalized) but
+/// not yet evicted from per-thunk chains.  Chain readers skip
+/// entries in this set.  See definition for full design notes.
+std::unordered_set<Bindings *> & finalizedBindings();
+void compactPartialBindingsRegistry();
+
 /// #558 (2026-05-11): pick the most-informative chain layer (largest
 /// size).  Used by every site that needs a SINGLE Bindings from a
 /// chain (STG WHNF recovery, OP_ATTRS_UPDATE collapseDeferred, etc.).
@@ -170,10 +177,24 @@ inline Bindings * pickLargestLayer(const PartialBindingsChain & chain)
     if (chain.empty()) return nullptr;
     static const bool s_noLargestWhnf =
         std::getenv("NIX_V3_NO_LARGEST_WHNF") != nullptr;
-    if (s_noLargestWhnf) return chain.back();
-    Bindings * pick = chain.back();
+    static const bool s_noLazyCleanup =
+        std::getenv("NIX_V3_NO_LAZY_CLEANUP") != nullptr;
+    auto & fin = finalizedBindings();
+    if (s_noLargestWhnf) {
+        // Back-to-front: pick latest non-finalized.
+        if (!s_noLazyCleanup && !fin.empty()) {
+            for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+                if (*it && !fin.count(*it)) return *it;
+            }
+            return nullptr;
+        }
+        return chain.back();
+    }
+    Bindings * pick = nullptr;
     for (auto * b : chain) {
-        if (b && (!pick || b->size > pick->size))
+        if (!b) continue;
+        if (!s_noLazyCleanup && fin.count(b)) continue;
+        if (!pick || b->size > pick->size)
             pick = b;
     }
     return pick;
@@ -204,10 +225,14 @@ inline Value * lookupInPartialChain(const PartialBindingsChain & chain,
 {
     static const bool s_noLargest =
         std::getenv("NIX_V3_NO_LARGEST_PEEK") != nullptr;
+    static const bool s_noLazyCleanup =
+        std::getenv("NIX_V3_NO_LAZY_CLEANUP") != nullptr;
+    auto & fin = finalizedBindings();
     if (s_noLargest) {
         // Original back-to-front (LATEST-WINS).
         for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
             if (!*it) continue;
+            if (!s_noLazyCleanup && fin.count(*it)) continue;
             if (auto * v = (*it)->lookup(name)) return v;
         }
         return nullptr;
@@ -218,6 +243,7 @@ inline Value * lookupInPartialChain(const PartialBindingsChain & chain,
     uint32_t bestSize = 0;
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
         if (!*it) continue;
+        if (!s_noLazyCleanup && fin.count(*it)) continue;
         uint32_t sz = (*it)->size;
         if (best && sz <= bestSize) continue;
         if (auto * v = (*it)->lookup(name)) {
@@ -1281,6 +1307,57 @@ std::unordered_map<Thunk *, PartialBindingsChain> & partialBindingsRegistry()
     static thread_local std::unordered_map<Thunk *, PartialBindingsChain> tbl;
     return tbl;
 }
+
+/// #558 Phase 2 lazy-cleanup (2026-05-11).
+///
+/// The synchronous OP_RETURN cross-chain cleanup at vm.cc:4118
+/// (`for (auto & [t, chain] : reg) chain.erase(remove(b))`) is
+/// O(R x C) per OP_RETURN where R = registry size and C = avg
+/// chain length. macOS `sample` profiling showed this at 22% of
+/// CPU samples under NIX_V3_INHERIT_FROM_THUNK_ALL=1 on nixpkgs.
+///
+/// Lazy-cleanup defers the work: OP_RETURN inserts the just-
+/// finalized Bindings* into this set (O(1)); chain readers skip
+/// entries that are in the set; a periodic compaction walks all
+/// chains and erases the finalized entries (amortizing O(R x C)
+/// over the compaction threshold N).
+///
+/// Correctness: a Bindings* is in the set iff it was OP_RETURNed
+/// and not subsequently re-published.  publish-paths
+/// (publishToAllThunkFrames / publishToNearestBlackThunkFrame)
+/// erase from the set before adding to a chain, so a single
+/// Bindings* is never simultaneously in a chain and in the set.
+/// This guards against the (extremely rare) GC-reuses-the-same-
+/// address race.
+///
+/// Gated by NIX_V3_NO_LAZY_CLEANUP=1 to fall back to synchronous
+/// cleanup for bisection.
+std::unordered_set<Bindings *> & finalizedBindings()
+{
+    static thread_local std::unordered_set<Bindings *> tbl;
+    return tbl;
+}
+
+/// Walk the entire partial-Bindings registry and erase entries
+/// that are in finalizedBindings.  Clears the finalized set
+/// afterward.  Called when finalizedBindings exceeds the
+/// compaction threshold or by explicit code paths that need a
+/// clean registry (e.g. exception unwind).
+void compactPartialBindingsRegistry()
+{
+    auto & fin = finalizedBindings();
+    if (fin.empty()) return;
+    auto & reg = partialBindingsRegistry();
+    for (auto & [t, chain] : reg) {
+        chain.erase(
+            std::remove_if(chain.begin(), chain.end(),
+                [&fin](Bindings * b) {
+                    return b && fin.count(b);
+                }),
+            chain.end());
+    }
+    fin.clear();
+}
 namespace { // -- reopen anon namespace
 
 /// Publish a freshly-built attrset to the innermost Black thunk frame's
@@ -1385,6 +1462,11 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
             // its currently-relevant partial state.
             auto & chain = partialBindingsRegistry()[fr.thunk];
             chain.clear();
+            // #558 Phase 2 lazy-cleanup: a Bindings* that re-enters
+            // a chain MUST be removed from finalizedBindings so
+            // chain readers see it.  Guards GC-reuses-the-same-
+            // address race.
+            finalizedBindings().erase(v.payload.bindings);
             chain.push_back(v.payload.bindings);
             static const bool s_dbg_reg =
                 std::getenv("NIX_V3_DBG_PARTIAL_BINDINGS") != nullptr;
@@ -1432,6 +1514,8 @@ inline void publishToNearestBlackThunkFrame(VMState & vm, const Value & v,
             // for back-compat with the old single-Bindings registry.
             auto & chain = partialBindingsRegistry()[fr.thunk];
             chain.clear();
+            // #558 Phase 2 lazy-cleanup: see same comment above.
+            finalizedBindings().erase(v.payload.bindings);
             chain.push_back(v.payload.bindings);
             if (s_dbg_reg) std::fprintf(stderr,
                 "v3 partialBindings: register thunk=%p bindings=%p size=%u\n",
@@ -1628,6 +1712,12 @@ inline void publishToAllThunkFrames(VMState & vm, const Value & v)
         // are skipped to keep the chain compact; lookup walks back so
         // a duplicate at the end is harmless but wastes work.
         auto & chain = reg[fr.thunk];
+        // #558 Phase 2 lazy-cleanup: undo any stale finalized mark
+        // before exposing this Bindings (guards GC reuse race; also
+        // covers the "chain.back() already == v.payload.bindings"
+        // path where we skip the push but still want readers to see
+        // the entry).
+        finalizedBindings().erase(v.payload.bindings);
         if (chain.empty() || chain.back() != v.payload.bindings) {
             chain.push_back(v.payload.bindings);
             if (s_dbg_reg) std::fprintf(stderr,
@@ -4119,12 +4209,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     static const bool s_noCleanup =
                         std::getenv("NIX_V3_NO_CROSS_CHAIN_CLEANUP") != nullptr;
                     if (!s_noCleanup) {
+                        static const bool s_noLazyCleanup =
+                            std::getenv("NIX_V3_NO_LAZY_CLEANUP") != nullptr;
                         Bindings * b = retVal.payload.bindings;
-                        auto & reg = partialBindingsRegistry();
-                        for (auto & [t, chain] : reg) {
-                            chain.erase(
-                                std::remove(chain.begin(), chain.end(), b),
-                                chain.end());
+                        if (s_noLazyCleanup) {
+                            // Synchronous fallback (legacy path).  O(R x C).
+                            auto & reg = partialBindingsRegistry();
+                            for (auto & [t, chain] : reg) {
+                                chain.erase(
+                                    std::remove(chain.begin(), chain.end(), b),
+                                    chain.end());
+                            }
+                        } else {
+                            // #558 Phase 2: lazy-cleanup.  O(1) mark for
+                            // skip; periodic compaction amortizes the
+                            // chain-walk over many OP_RETURNs.
+                            //
+                            // Threshold 256: small enough to keep the
+                            // skip-check cost bounded, large enough to
+                            // amortize ~256x over baseline.  macOS
+                            // sample showed the synchronous loop at
+                            // 22% of CPU on nixpkgs THUNK_ALL; 256x
+                            // reduction is the headline target.
+                            auto & fin = finalizedBindings();
+                            fin.insert(b);
+                            if (fin.size() >= 256) {
+                                compactPartialBindingsRegistry();
+                            }
                         }
                     }
                 }
@@ -6333,7 +6444,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         // contributions; for whole-attrset recovery,
                         // the latest-layer's view is closest to the
                         // thunk's eventual value.
-                        recoveredBindings = it->second.back();
+                        //
+                        // #558 Phase 2: pickLargestLayer skips
+                        // finalized entries (lazy-cleanup).
+                        recoveredBindings = pickLargestLayer(it->second);
                     }
                 }
                 if (recoveredBindings) {
@@ -6354,11 +6468,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             && attrs.payload.thunk) {
                             auto & reg = partialBindingsRegistry();
                             auto it = reg.find(attrs.payload.thunk);
-                            if (it != reg.end() && !it->second.empty()) {
+                            Bindings * recBnd = nullptr;
+                            if (it != reg.end())
+                                recBnd = pickLargestLayer(it->second);
+                            if (recBnd) {
                                 Value recovered;
                                 recovered.tag_payload =
                                     static_cast<uint64_t>(Tag::Attrs);
-                                recovered.payload.bindings = it->second.back();
+                                recovered.payload.bindings = recBnd;
                                 attrs = recovered;
                             } else {
                                 throw;
@@ -8131,17 +8248,22 @@ Value forceValue(VMState & vm, Value v)
                 if (!s_disabled && !s_stgMode_recover) {
                     auto & reg = partialBindingsRegistry();
                     auto it = reg.find(t);
-                    if (it != reg.end() && !it->second.empty()) {
+                    Bindings * recBnd = nullptr;
+                    if (it != reg.end())
+                        recBnd = pickLargestLayer(it->second);
+                    if (recBnd) {
                         // Use the latest (back) entry for recovery.
                         // This is the legacy non-STG path; the chain
                         // typically has only one entry under non-STG
                         // mode (single-element replacement).
+                        // #558 Phase 2: pickLargestLayer skips
+                        // finalized entries (lazy-cleanup).
                         if (s_dbg_reg) std::fprintf(stderr,
                             "v3 partialBindings: RECOVER thunk=%p bindings=%p\n",
-                            (void *)t, (void *)it->second.back());
+                            (void *)t, (void *)recBnd);
                         Value out;
                         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                        out.payload.bindings = it->second.back();
+                        out.payload.bindings = recBnd;
                         return out;
                     }
                     if (s_dbg_reg) std::fprintf(stderr,
