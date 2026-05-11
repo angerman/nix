@@ -3592,6 +3592,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // once per cell binding.  Idempotent on re-entry
                     // (cell becomes nullptr after first OP_RETURN).
                     if (Value * cell = fr.thunk->cell) {
+                        cellOwnRecordWrite(cell, fr.thunk,
+                                            "OP_RETURN/CFF_THUNK_RETURN");
                         *cell = retVal;
                         fr.thunk->cell = nullptr;
                     }
@@ -4027,6 +4029,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // observing entries[i].value (inner+outer call-hook
                 // entries that share the recBuildCache Bindings).
                 if (Value * cell = t->cell) {
+                    cellOwnRecordWrite(cell, t, "OP_FORCE-Bridge");
                     *cell = resolved;
                     t->cell = nullptr;
                 }
@@ -5675,6 +5678,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (top.payload.thunk->state == ThunkState::Suspended
                 && top.payload.thunk->cell == nullptr) {
                 top.payload.thunk->cell = cell;
+                cellOwnRecordSet(cell, top.payload.thunk,
+                                  "OP_THUNK_SET_LOCAL_THROUGH_CELL");
             }
             // Slot pointing at cell -- captures see the slot, deref
             // resolves through cell to the (eventually Evaluated) value.
@@ -6735,8 +6740,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 && v.payload.thunk->state == ThunkState::Suspended
                 && v.payload.thunk->cell == nullptr)
             {
-                v.payload.thunk->cell =
+                Value * cellTarget =
                     &recAttrs.payload.bindings->entries[i].value;
+                v.payload.thunk->cell = cellTarget;
+                cellOwnRecordSet(cellTarget, v.payload.thunk,
+                                  "OP_ATTRS_REC_SET");
             }
             break;
         }
@@ -7976,6 +7984,7 @@ Value forceValue(VMState & vm, Value v)
             // Bindings entry slot, this write propagates the resolved
             // TW value into all observers of that entry.
             if (Value * cell = t->cell) {
+                cellOwnRecordWrite(cell, t, "forceValue-Bridge");
                 *cell = v;
                 t->cell = nullptr;
             }

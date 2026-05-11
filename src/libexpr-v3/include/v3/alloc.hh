@@ -21,9 +21,11 @@
 #include "v3/closure.hh"
 #include "v3/nursery.hh"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include <new>
 
@@ -716,6 +718,141 @@ inline const BindingsOrigin * lookupBindingsOrigin(const Bindings * b)
     auto & tbl = bindingsOriginTable();
     auto it = tbl.find(b);
     return it == tbl.end() ? nullptr : &it->second;
+}
+
+// ---------------------------------------------------------------------------
+// Cell-ownership invariant tracker (RCA 2026-05-11, Phase A4a).
+//
+// v3 thunks carry an optional `cell : Value*` field that's used as a
+// heap-stable update target.  When the thunk's body completes, the
+// CFF_THUNK_RETURN handler writes the body's retVal to `*cell` and
+// clears `t->cell = nullptr`.  This is v3's approximation of STG's
+// `Ind` (indirection) closure.
+//
+// STG invariant: each (cell-bearing) thunk owns its cell — no two
+// distinct thunks shall have the same `cell` pointer.  This invariant
+// is implicit in the code: each S2/S3 setter site (cf. CELL_INVARIANTS.md)
+// guards with `t->cell == nullptr` to prevent double-setting the SAME
+// thunk, but does NOT protect against two DIFFERENT thunks pointing at
+// the SAME storage.
+//
+// This tracker maintains a side-table `cellOwner: Value* → Thunk*` and
+// fires on every cell-set / cell-write.  When a setter targets storage
+// already owned by ANOTHER thunk, we log the invariant violation
+// (NIX_V3_DBG_CELL_OWN=1 — log-only by default; NIX_V3_ASSERT_CELL_OWN=1
+// to abort instead).
+//
+// Zero hot-path cost when the env-var is off.  When enabled, each cell
+// op pays one hash-map lookup + one write.
+// ---------------------------------------------------------------------------
+
+struct Thunk;  // forward decl — defined in closure.hh
+
+inline bool cellOwnEnabled()
+{
+    static const bool v = std::getenv("NIX_V3_DBG_CELL_OWN") != nullptr;
+    return v;
+}
+
+inline bool cellOwnAssertEnabled()
+{
+    static const bool v = std::getenv("NIX_V3_ASSERT_CELL_OWN") != nullptr;
+    return v;
+}
+
+inline std::unordered_map<const Value *, const Thunk *> & cellOwnerTable()
+{
+    static std::unordered_map<const Value *, const Thunk *> tbl;
+    return tbl;
+}
+
+inline std::atomic<uint64_t> & cellOwnViolationCount()
+{
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
+/// Record a setter: `t->cell = storage` is about to happen.  If
+/// `storage` already has a DIFFERENT owner, log the violation.
+/// `source` is a string literal naming the setter site (e.g.
+/// "OP_ATTRS_REC_SET", "OP_THUNK_SET_LOCAL_THROUGH_CELL").
+void cellOwnRecordSet(const Value * storage, const Thunk * t,
+                       const char * source) noexcept;
+
+/// Record a writer: `*cell = ...; t->cell = nullptr` is about to
+/// happen.  Verify that `storage` is indeed owned by `t`; clear the
+/// ownership entry.
+void cellOwnRecordWrite(const Value * storage, const Thunk * t,
+                         const char * source) noexcept;
+
+/// Cell-ownership tracker — see CELL_INVARIANTS.md (Phase A4a).
+///
+/// We use INLINE definitions to avoid a separate cell_invariants.cc.
+/// Both `cellOwnRecordSet` and `cellOwnRecordWrite` are gated by the
+/// cached env-var; the fast path is one branch + return.
+inline void cellOwnRecordSet(const Value * storage, const Thunk * t,
+                              const char * source) noexcept
+{
+    if (!storage || !t || !cellOwnEnabled()) return;
+    auto & tbl = cellOwnerTable();
+    auto it = tbl.find(storage);
+    if (it != tbl.end() && it->second != t) {
+        // Invariant I-CELL-1 violation: two different thunks point at
+        // the same cell storage.  Log the offender + the original
+        // owner so the divergence can be traced.
+        ++cellOwnViolationCount();
+        std::fprintf(stderr,
+            "v3 CELL OWNERSHIP VIOLATION: storage=%p — was owned by "
+            "thunk=%p, now being claimed by thunk=%p (setter=%s)\n",
+            (const void *)storage,
+            (const void *)it->second,
+            (const void *)t,
+            source ? source : "<?>");
+        if (cellOwnAssertEnabled()) {
+            std::fprintf(stderr,
+                "v3 CELL OWNERSHIP: aborting (NIX_V3_ASSERT_CELL_OWN=1)\n");
+            std::abort();
+        }
+    }
+    tbl[storage] = t;
+}
+
+inline void cellOwnRecordWrite(const Value * storage, const Thunk * t,
+                                const char * source) noexcept
+{
+    if (!storage || !t || !cellOwnEnabled()) return;
+    auto & tbl = cellOwnerTable();
+    auto it = tbl.find(storage);
+    if (it == tbl.end()) {
+        // Writing to a cell with no recorded owner — could mean the
+        // setter site is not instrumented, or a different process
+        // already cleared the entry.  Log but don't assert.
+        std::fprintf(stderr,
+            "v3 CELL WRITE on UNOWNED storage=%p thunk=%p (writer=%s)\n",
+            (const void *)storage, (const void *)t,
+            source ? source : "<?>");
+        return;
+    }
+    if (it->second != t) {
+        // Invariant I-CELL-1 violation observed at write time: the
+        // thunk that's writing isn't the recorded owner.  This
+        // catches the case where the setter wasn't instrumented but
+        // ownership conflict still happened.
+        ++cellOwnViolationCount();
+        std::fprintf(stderr,
+            "v3 CELL WRITE OWNERSHIP MISMATCH: storage=%p owned by "
+            "thunk=%p, write attempted by thunk=%p (writer=%s)\n",
+            (const void *)storage,
+            (const void *)it->second,
+            (const void *)t,
+            source ? source : "<?>");
+        if (cellOwnAssertEnabled()) {
+            std::fprintf(stderr,
+                "v3 CELL OWNERSHIP: aborting (NIX_V3_ASSERT_CELL_OWN=1)\n");
+            std::abort();
+        }
+    }
+    tbl.erase(it);
 }
 
 // Default-record: tag a freshly-allocated Bindings with its caller's

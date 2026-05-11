@@ -2748,6 +2748,8 @@ static HookPrepResult prepHookUpvaluesAndWiths(
                                 pairs[i].second.payload.thunk;
                             if (bridge && bridge->cell == nullptr) {
                                 bridge->cell = &b->entries[i].value;
+                                cellOwnRecordSet(&b->entries[i].value, bridge,
+                                                  "v3_hook prepHook bridge");
                             }
                         }
                         cache.emplace(k, RecBuildCacheValue{b, slot0});
