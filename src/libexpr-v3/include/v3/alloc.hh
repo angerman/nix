@@ -129,6 +129,7 @@ struct AllocStats
     uint64_t envsAllocated     = 0;
     uint64_t listsAllocated    = 0;
     uint64_t attrsetsAllocated = 0;
+    uint64_t pairsAllocated    = 0;
 
     /// #538 dispatch profiling: total bytecode instructions executed
     /// across all VMState instances in the process.  Bumped by
@@ -425,6 +426,7 @@ struct Alloc
     /// pairs sit inside a GC_add_roots-registered region (alloc.hh:225).
     static ValuePair * allocPair() noexcept
     {
+        ++allocStats().pairsAllocated;
         return static_cast<ValuePair *>(threadArena().alloc(sizeof(ValuePair)));
     }
 

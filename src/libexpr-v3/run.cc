@@ -13,6 +13,7 @@
 #include "v3/vm.hh"
 #include "v3/primop.hh"
 #include "v3/ir.hh"
+#include "v3/alloc.hh"
 
 #include "nix/expr/eval.hh"
 
@@ -127,6 +128,27 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // loop — so calling `runRootExpr` from inside a primop is safe.
     out.value = run(out.cu);
     pt.mark(pt.run_ms);
+
+    // NIX_VM_STATS=1: dump alloc counters at completion (mirrors
+    // v3_hook.cc's atexit dump format).  Lets us attribute alloc
+    // explosions to thunks vs closures vs Bindings vs lists.
+    static const bool s_dumpStats =
+        std::getenv("NIX_VM_STATS") != nullptr;
+    if (__builtin_expect(s_dumpStats, 0)) {
+        const auto & a = allocStats();
+        std::fprintf(stderr,
+            "v3-direct alloc: values=%llu closures=%llu thunks=%llu "
+            "lists=%llu attrsets=%llu pairs=%llu thunksForced=%llu bridge=%llu insns=%llu\n",
+            (unsigned long long)a.valuesAllocated,
+            (unsigned long long)a.closuresAllocated,
+            (unsigned long long)a.thunksAllocated,
+            (unsigned long long)a.listsAllocated,
+            (unsigned long long)a.attrsetsAllocated,
+            (unsigned long long)a.pairsAllocated,
+            (unsigned long long)a.thunksForced,
+            (unsigned long long)a.bridgeThunksForced,
+            (unsigned long long)a.bytecodeInstructions);
+    }
     return out;
 }
 
