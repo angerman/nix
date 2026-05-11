@@ -505,8 +505,22 @@ inline void push(VMState & vm, Value v)
 /// payload pointer is identical.
 inline bool valueEqual(VMState & vm, Value a, Value b, bool insideContainer = false)
 {
-    a = forceValue(vm, a);
-    b = forceValue(vm, b);
+    // #558 Phase 2: inline WHNF check.  valueEqual is called from
+    // primop bodies (primElem, primAll, etc.) and primConcatMap;
+    // when both sides are already WHNF (common after a previous
+    // force), skip the forceValue function call.
+    {
+        Tag at = a.tag();
+        if (__builtin_expect(at == Tag::Thunk
+                             || at == Tag::App
+                             || at == Tag::Slot, 0))
+            a = forceValue(vm, a);
+        Tag bt = b.tag();
+        if (__builtin_expect(bt == Tag::Thunk
+                             || bt == Tag::App
+                             || bt == Tag::Slot, 0))
+            b = forceValue(vm, b);
+    }
     if (a.tag() != b.tag()) {
         if (a.isInt() && b.isFloat()) return static_cast<double>(a.payload.i) == b.payload.f;
         if (a.isFloat() && b.isInt()) return a.payload.f == static_cast<double>(b.payload.i);
