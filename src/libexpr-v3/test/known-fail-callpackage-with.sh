@@ -52,27 +52,40 @@ out=$(NIX_V3_DIRECT_EVAL=1 "$NIX" --extra-experimental-features nix-command \
 rc=$?
 
 if [[ $rc -ne 0 ]]; then
-    # 2026-05-09 (#548): v3-direct's eval-order divergence exposed three
-    # cycle floors as we incrementally widened the inherit-from
-    # thunkify rules in lower.cc.  Each closes one site of eager
-    # OP_WITH_LOOKUP under super:'s body construction.  History:
-    #   - 'callPackage' — closed by curried-call walk (0931b77a3)
-    #   - 'texlive'      — closed by ExprSelect-with-Var head (eae55d149)
-    #   - 'libsForQt5'   — current floor.  Closing requires the
-    #     call-on-Select-Var rule (NIX_V3_THUNK_CALL_ON_SELECT_VAR=1)
-    #     which is opt-in because default-on triggers a runtime
-    #     force-count explosion (see #548c / RCA memo).
+    # Symptom history as the v3 lower.cc / STG mechanism evolved.  Each
+    # row represents the failure mode at a point-in-time — the script
+    # accepts ANY of them as a known-fail.  When all symptoms are gone,
+    # promote this to a positive test.
     #
-    # The script accepts ANY of these as a known-fail.  When the floor
-    # advances, update the regex and re-run.  When all three are gone,
-    # promote this script to a positive test.
+    # 2026-05-09 (#548): inherit-from thunkify widening exposed three
+    # OP_WITH_LOOKUP cycle floors:
+    #   - 'callPackage' — closed by curried-call walk (0931b77a3)
+    #   - 'texlive'     — closed by ExprSelect-with-Var head (eae55d149)
+    #   - 'libsForQt5'  — closed by 15-commit STG ladder (ff629384b..1214a40b0)
+    # 2026-05-12 (#558 force-list diff): post-STG-ladder symptom is now
+    # `OP_ATTRS_SELECT: attribute not found` looking up `qt5`.  Root
+    # cause traced to darwin/default.nix:1058's
+    # `assert allDeps isBuiltByNixpkgsCompiler [...]` — v3's STG WHNF
+    # recovery returns a partial Bindings that flips
+    # `pkg.passthru.isFromBootstrapFiles or false` evaluation, which
+    # flips `lib.all checkFn` from TRUE (TW) to FALSE (v3) → fires
+    # `lib.deepSeq` cascade through pkg.stdenv.cc.cc → libsForQt5's
+    # `inherit (pkgs) lib` thunk → forces pkgs (= lib.fix's x, BLACK).
+    # See project_libsForQt5_deferred.md memory.
     if [[ "$out" == *"OP_WITH_LOOKUP: name 'callPackage' not found in with-scope"* \
        || "$out" == *"OP_WITH_LOOKUP: cycle while resolving 'callPackage'"* \
        || "$out" == *"OP_WITH_LOOKUP: cycle while resolving 'texlive'"* \
-       || "$out" == *"OP_WITH_LOOKUP: cycle while resolving 'libsForQt5'"* ]]; then
+       || "$out" == *"OP_WITH_LOOKUP: cycle while resolving 'libsForQt5'"* \
+       || "$out" == *"OP_ATTRS_SELECT: attribute not found"* ]]; then
         # Extract the resolved symbol so the message tracks progress.
         sym=$(printf '%s\n' "$out" | sed -n "s/.*resolving '\\([^']*\\)'.*/\\1/p" | head -1)
-        if [[ -z "$sym" ]]; then sym="callPackage(legacy)"; fi
+        if [[ -z "$sym" ]]; then
+            if [[ "$out" == *"OP_ATTRS_SELECT: attribute not found"* ]]; then
+                sym="ATTRS_SELECT-attr-not-found (allDeps deepSeq → partial-Bindings recovery, see #558)"
+            else
+                sym="callPackage(legacy)"
+            fi
+        fi
         echo "known-fail-callpackage-with: KNOWN-FAIL still present at '$sym'"
         exit 0
     else
