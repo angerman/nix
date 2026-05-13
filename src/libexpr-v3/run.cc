@@ -68,6 +68,14 @@ private:
 
 } // anonymous namespace
 
+/// Force-link the v3 library.  Called once from `mainWrapped` so the
+/// linker's `-dead_strip_dylibs` pass keeps libnixexprv3 in the
+/// binary.  No side effects.
+bool keepLibAlive()
+{
+    return true;
+}
+
 RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
 {
     // Idempotent: register the builtin primop table on first call.

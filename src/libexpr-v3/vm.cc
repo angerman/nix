@@ -2507,24 +2507,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     break;
                 }
 
-                // STG-14a (#509/#515): direct v3 dispatch for TW lambdas
-                // with v3 bodies in the subCache.  Avoids the
-                // `v3ToTreeWalkerPublic(arg)` step below -- which today
-                // forces a v3 Tag::Slot/Tag::Thunk arg eagerly (the
-                // STG-12 cycle source on nixpkgs hello.name under
-                // STG_KEEP_HOOKS).  When this shortcut applies, the v3
-                // arg flows through unchanged (slot identity preserved
-                // all the way into the body) and runLambda dispatches
-                // the bytecode locally.
-                static const bool s_twLambdaShortcutDisabled =
-                    std::getenv("NIX_V3_NO_TW_LAMBDA_INV3") != nullptr;
-                if (!s_twLambdaShortcutDisabled) {
-                    Value v3Out;
-                    if (tryDispatchTWLambdaInV3(*ns, *funTw, arg, v3Out)) {
-                        push(vm, v3Out);
-                        break;
-                    }
-                }
+                // Hook-removal 2026-05-13: tryDispatchTWLambdaInV3
+                // was tied to v3_hook.cc's per-Lambda subCache (gone
+                // with the hook).  TW handles the lambda call normally.
 
                 // Bridge arg back to TW.  v3->TW preserves identity
                 // for Bridge thunks (unwraps to original) and converts
@@ -9057,17 +9042,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 std::getenv("NIX_V3_NO_OP_CALL_BRIDGE_SHORTCUT") != nullptr;
             if (!s_disabled && tryUnwrapBridge1Closure(*funTw, v3Fn))
                 return callClosure(vm, v3Fn, arg);
-            // STG-14a (#509/#515): mirror the OP_CALL Bridge handler's
-            // direct-v3-dispatch shortcut here so callClosure's recursive
-            // path (e.g. native ExtendsBody/ComposeBody calling f as
-            // Bridge) also bypasses v3ToTreeWalkerPublic.
-            static const bool s_twLambdaShortcutDisabled =
-                std::getenv("NIX_V3_NO_TW_LAMBDA_INV3") != nullptr;
-            if (!s_twLambdaShortcutDisabled) {
-                Value v3Out;
-                if (tryDispatchTWLambdaInV3(*ns, *funTw, arg, v3Out))
-                    return v3Out;
-            }
+            // Hook-removal 2026-05-13: tryDispatchTWLambdaInV3 retired.
             nix::Value * argTw = v3ToTreeWalkerPublic(*ns, arg);
             if (!argTw)
                 throw std::runtime_error(

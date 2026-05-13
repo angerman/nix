@@ -117,7 +117,6 @@ template class EvalErrorBuilder<TypeError>;
 template class EvalErrorBuilder<UndefinedVarError>;
 template class EvalErrorBuilder<MissingArgumentError>;
 template class EvalErrorBuilder<InfiniteRecursionError>;
-template class EvalErrorBuilder<V3DepthYield>;
 template class EvalErrorBuilder<StackOverflowError>;
 template class EvalErrorBuilder<InvalidPathError>;
 template class EvalErrorBuilder<IFDError>;

@@ -80,22 +80,16 @@
 
 namespace nix::v3 {
 
-// WC-4: defined in v3_hook.cc.
-void populateSubExprCachePublic(
-    const ir::Module & module, const CompilationUnit * cu);
-
-// #495 follow-on: defined in v3_hook.cc.  Registers (sourceContentHash
-// → CU) so v3EvalEntry's later lookup with a fresh-parse Expr* hits
-// and skips re-lowering.
-void registerContentCachePublic(
-    const disk_cache::CacheKey & key, const CompilationUnit * cu);
+// Hook-removal 2026-05-13: populateSubExprCachePublic and
+// registerContentCachePublic are gone with v3_hook.cc.  The sub-Expr
+// cache existed only for the force-hook's per-Expr* lookup; the
+// content cache mapped sourceContentHash → CU so v3EvalEntry could
+// short-circuit a fresh-parse.  Neither is reachable from v3-direct.
+// primImport's call sites below are no-ops.
 
 /// WC-19: TLS pointer to the outer Expr the v3 hook is currently
-/// processing.  v3_hook.cc sets this before calling v3ToTreeWalker;
-/// the lazy-bridge registration captures it so primV3ForceAttr /
-/// primV3ForceListElem can fall back to tree-walker on a deferred
-/// blackhole (eval-order divergence v3 sees but tree-walker resolves).
-/// External linkage so v3_hook.cc can extern-reference it.
+/// processing.  Now unused (hook removed) but kept as an extern
+/// definition because primops.cc references it.
 thread_local nix::Expr * tlBridgeFallbackExpr = nullptr;
 
 /// Forward decl so primTrace (which is defined earlier in this file)
@@ -4141,18 +4135,9 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
                             std::unordered_map<const void *, Value> & seen)
 {
     auto & ns = *state.nixEvalState;
-    // WC-14.6: bounded-depth yield at the v3↔tree-walker boundary.
-    if (++nix::EvalState::v3HookForceDepth >
-        nix::EvalState::v3HookMaxForceDepth) {
-        --nix::EvalState::v3HookForceDepth;
-        ns.error<nix::V3DepthYield>(
-            "v3 bridge depth %1% exceeded threshold %2%",
-            nix::EvalState::v3HookForceDepth,
-            nix::EvalState::v3HookMaxForceDepth).debugThrow();
-    }
-    struct DepthDec {
-        ~DepthDec() { --nix::EvalState::v3HookForceDepth; }
-    } _dec;
+    // Hook-removal 2026-05-13: depth-yield retired with the v3↔TW
+    // hook integration.  The recursion this used to bound is now
+    // capped by the depth-guard on v3's forceValue (vm.cc).
     // WC-18.4: when running inside a fiber, yield to the driver so
     // the recursive tree-walker forceValue runs on the driver's
     // pthread stack rather than the fiber's 16 MB stack — keeps
@@ -5775,10 +5760,6 @@ void primImport(EvalState & state, Value * args, Value & out)
         if (auto blob = disk_cache::lookup(diskKey)) {
             try {
                 cache.cus.push_back(serialize::deserializeCU(*blob));
-                // Also populate the content cache so v3EvalEntry's
-                // later lookup with a fresh-parse Expr* hits.
-                if (contentCacheEnabled)
-                    registerContentCachePublic(diskKey, &cache.cus.back());
                 out = run(cache.cus.back());
                 auto [mt, sz] = importStat(path);
                 cache.results.emplace(path,
@@ -5807,15 +5788,6 @@ void primImport(EvalState & state, Value * args, Value & out)
     nix::v3::ir::optimise(module);
     nix::v3::ir::computeFreeVars(module);
     cache.cus.push_back(compile(module));
-    // #495 follow-on: register in the content cache before disk-cache
-    // insertion so v3EvalEntry's later lookup with a fresh-parse
-    // Expr* of the same source hits and skips re-lowering.  Without
-    // this, lib/default.nix is parsed twice in some eval paths and
-    // its 21 inherit-from clauses thunkify twice, producing the
-    // broader-thunkify upvalue bug.
-    if (contentCacheEnabled && !diskKey.empty()) {
-        registerContentCachePublic(diskKey, &cache.cus.back());
-    }
     if (diskCacheEnabled && !diskKey.empty()
         && serialize::isCacheable(cache.cus.back())) {
         try {
@@ -5823,12 +5795,6 @@ void primImport(EvalState & state, Value * args, Value & out)
             disk_cache::insert(diskKey, blob);
         } catch (...) { /* best-effort */ }
     }
-    // WC-4: pre-populate the sub-Expr cache so subsequent forces
-    // (from either v3 or tree-walker via the v3ForceHook) hit on
-    // imported files' inner thunks.  Without this the WC-2 lift of
-    // the function-0-only restriction has nothing to bite on for
-    // files that are imported (the bulk of nixpkgs).
-    populateSubExprCachePublic(module, &cache.cus.back());
     // Each imported file is its own CompilationUnit; we re-enter the
     // VM to run it with its own top-level frame.  Keep the CU alive
     // (it's borrowed by closures returned from the eval).

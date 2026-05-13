@@ -137,18 +137,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             try {
                 v.mkBlackhole();
                 if (env) [[likely]] {
-                    // V3 sub-Expr cutover: only invoke the hook for
-                    // Expr*s that v3 has actually cached.  The flag is
-                    // false on every Expr until libnixexprv3's post-
-                    // compile pass marks it true; this keeps the per-
-                    // force overhead to a single branch on the hot
-                    // path even when NIX_USE_V3_FORCE=1.
-                    if (__builtin_expect(expr->isV3CacheCandidate, 0)
-                        && v3ForceHook != nullptr
-                        && v3ForceHook(*this, expr, *env, v))
-                        ; // handled by v3
-                    else
-                        expr->eval(*this, *env, v);
+                    expr->eval(*this, *env, v);
                 }
                 else
                     ExprBlackHole::throwInfiniteRecursionError(*this, v);

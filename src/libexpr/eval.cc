@@ -1200,58 +1200,11 @@ void EvalState::resetFileCache()
     positions.clear();
 }
 
-EvalState::V3EvalHook EvalState::v3EvalHook = nullptr;
-EvalState::V3ForceHook EvalState::v3ForceHook = nullptr;
-EvalState::V3CallFunctionHook EvalState::v3CallFunctionHook = nullptr;
-EvalState::V3RegisterExprHook EvalState::v3RegisterExprHook = nullptr;
-
-// WC-14.6: bounded-depth yield state.
-thread_local int EvalState::v3HookActiveDepth = 0;
-thread_local int EvalState::v3HookForceDepth  = 0;
-int EvalState::v3HookMaxForceDepth = []{
-    if (const char * s = std::getenv("NIX_V3_MAX_FORCE_DEPTH"))
-        return std::max(16, std::atoi(s));
-    return 256;
-}();
+// v3 hook fields removed 2026-05-13.  v3 is now invoked directly via
+// nix::v3::runRootExpr from src/nix/eval.cc when NIX_V3_DIRECT_EVAL=1.
 
 void EvalState::eval(Expr * e, Value & v)
 {
-    // V3 cutover: when NIX_USE_V3=1 is set AND the v3 library is
-    // linked in (so its static initializer has filled in the hook),
-    // route the entire evaluation through v3's bytecode VM.  The
-    // hook is responsible for running v3 and storing its result back
-    // into the tree-walker `Value` we hand it.
-    static bool useV3 = getEnv("NIX_USE_V3").value_or("") == "1";
-    if (useV3 && v3EvalHook) {
-        // Inline short-circuit for AST shapes where v3's lower+
-        // compile cost is net-negative versus tree-walker's direct
-        // dispatch (literals, Var, Lambda, Pos, Attrs, List).  v3's
-        // own hook applies the same filter internally — moving it
-        // here saves the function-call into the hook for the ~95%
-        // of top-level evals that are these trivial shapes.  At
-        // 254 evals × ~15-20us each on hello.name, this is the
-        // dominant residual cutover overhead.
-        auto k = e->exprKind;
-        if (k != Expr::Kind::Lambda && k != Expr::Kind::Int &&
-            k != Expr::Kind::Float  && k != Expr::Kind::String &&
-            k != Expr::Kind::Path   && k != Expr::Kind::Var &&
-            k != Expr::Kind::Pos    && k != Expr::Kind::Attrs &&
-            k != Expr::Kind::List   && k != Expr::Kind::Select) {
-            v3EvalHook(*this, e, v);
-            return;
-        }
-        // Trivial shape (literals/Var/Lambda/Pos/Attrs/List) or
-        // Select — top-level Select is typically the user expression
-        // (`pkgs.foo.bar`); tree-walker handles selects directly,
-        // and v3's lower of the chain triggers a known blackhole on
-        // import cascades.  Better to defer to tree-walker than to
-        // lower+throw+fall-back.
-        // Trivial shape — fall through to tree-walker dispatch
-        // below.  Order is preserved: v3 takes precedence over the
-        // remaining v2/disk-cache paths only for non-trivial shapes,
-        // and for trivial shapes tree-walker handles them directly.
-    }
-
     // When NIX_VM_V2=1 is set, use the v2 IR pipeline:
     //   AST -> IR (lower) -> bytecode (emitFromIR) -> vmExec.
     // This is the new upvalue-based compilation path.
@@ -1440,17 +1393,7 @@ inline bool EvalState::evalBool(Env & env, Expr * e, const PosIdx pos, std::stri
 {
     try {
         Value v;
-        // WC-3: route through v3ForceHook when available — same env-
-        // aware dispatch the forceValue cutover uses.  If v3 has this
-        // Expr cached and can materialise upvalues from `env`, it
-        // produces the result; otherwise we fall through to the
-        // tree-walker dispatch below.
-        if (v3ForceHook && e && e->isV3CacheCandidate
-            && v3ForceHook(*this, e, env, v)) {
-            // hook filled `v`.
-        } else {
-            e->eval(*this, env, v);
-        }
+        e->eval(*this, env, v);
         if (v.type() != nBool)
             error<TypeError>(
                 "expected a Boolean but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
@@ -1467,13 +1410,7 @@ inline bool EvalState::evalBool(Env & env, Expr * e, const PosIdx pos, std::stri
 inline void EvalState::evalAttrs(Env & env, Expr * e, Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     try {
-        // WC-3: same routing as evalBool.
-        if (v3ForceHook && e && e->isV3CacheCandidate
-            && v3ForceHook(*this, e, env, v)) {
-            // hook filled `v`.
-        } else {
-            e->eval(*this, env, v);
-        }
+        e->eval(*this, env, v);
         if (v.type() != nAttrs)
             error<TypeError>(
                 "expected a set but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
@@ -1823,29 +1760,6 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
     const Attr * functor;
 
     while (args.size() > 0) {
-
-        // #458 step 2: lift the v3 callFunction cutover hook BEFORE the
-        // type-dispatch.  Originally (#426 / MED-21) it ran only for
-        // `vCur.isLambda()` -- TW lambdas with v3-compiled bodies.
-        // Now it also fires for PrimOpApp -- specifically to intercept
-        // `__v3_call_bridge_1` (TW's wrapper for v3-bridged closures)
-        // and dispatch directly via v3's callClosure, bypassing TW's
-        // primop layer + bridge1's eager-arg-force cycle source.
-        // On `true`, advance args and continue the curry loop with
-        // vRes as the new vCur.  On `false`, mutate nothing; TW's
-        // type-dispatch below proceeds unchanged.
-        if (v3CallFunctionHook
-            && (vCur.isLambda() || vCur.isPrimOpApp()))
-        {
-            Value vCallRes;
-            if (v3CallFunctionHook(*this, vCur, args[0], vCallRes, pos)) {
-                vCur = vCallRes;
-                args = args.subspan(1);
-                if (args.size() > 0)
-                    forceValue(vCur, pos);
-                continue;
-            }
-        }
 
         if (vCur.isLambda()) {
 
@@ -3810,10 +3724,6 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_p
     // readFile hopefully have left some extra space for terminators
     buffer.append("\0\0", 2);
     Expr * e = parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);
-    // Tell v3 (if linked) which file this top-level Expr came from
-    // so its disk-cache lookup can key on file content even when
-    // the top-level Expr's getPos() returns noPos.
-    if (v3RegisterExprHook) v3RegisterExprHook(*this, e, path);
     return e;
 }
 

@@ -67,7 +67,6 @@ lib_sources = files(
   'fiber.cc',
   'bridge_yield.cc',
   'gc.cc',
-  'v3_hook.cc',
   'disasm.cc',
   'ffi.cc',
   'print.cc',

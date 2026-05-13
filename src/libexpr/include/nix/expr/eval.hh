@@ -712,90 +712,18 @@ public:
     void eval(Expr * e, Value & v);
 
     /**
-     * Optional v3 evaluator hook.  When the v3 bytecode VM library is
-     * linked into the binary it sets this pointer via a static
-     * initializer.  At runtime, EvalState::eval consults `NIX_USE_V3=1`
-     * and dispatches to v3 via this hook when set.  Keeping it as a
-     * raw function pointer avoids a circular library dependency between
-     * libnixexpr and libnixexprv3 (the v3 lib already depends on
-     * libnixexpr for the AST/Symbol types).
+     * v3 evaluator integration retired (2026-05-13).  The v3 bytecode
+     * VM is now invoked directly as the top-level evaluator via
+     * `nix::v3::runRootExpr` from `src/nix/eval.cc` when
+     * NIX_V3_DIRECT_EVAL=1; the call/force/eval/parse-register hooks
+     * that used to live here (V3EvalHook, V3ForceHook,
+     * V3CallFunctionHook, V3RegisterExprHook, v3HookActiveDepth,
+     * v3HookForceDepth, v3HookMaxForceDepth, V3DepthYield) are gone.
+     * v3 still bridges to TW for irreducible primops (import,
+     * derivationStrict, ...) via the bidirectional converters in
+     * libexpr-v3/primops.cc, but no longer plugs into libexpr's
+     * dispatch.
      */
-    using V3EvalHook = void (*)(EvalState &, Expr *, Value &);
-    static V3EvalHook v3EvalHook;
-
-    /**
-     * forceValue cutover hook.  Called from EvalState::forceValue (in
-     * eval-inline.hh) BEFORE the expr->eval() dispatch, when a thunk
-     * is being forced with an associated Expr*.
-     *
-     * Returns true if v3 handled the evaluation (and filled `v`); false
-     * to fall through to the standard expr->eval(...) path.
-     *
-     * This is the entry point for sub-Expr cutover (CO-2/CO-3): the
-     * hook can consult v3's per-Expr* cache and, on a hit, run the
-     * pre-compiled bytecode against a v3 closure built from `env`'s
-     * current values.  Misses fall through cleanly.
-     */
-    using V3ForceHook = bool (*)(EvalState &, Expr *, Env &, Value &);
-    static V3ForceHook v3ForceHook;
-
-    /**
-     * #426 / MED-21: per-call cutover hook.  Called from
-     * `EvalState::callFunction` BEFORE the standard lambda/primop
-     * dispatch.  Lets v3 take over the lambda call when the body
-     * has been (or could be) lowered to v3 bytecode.
-     *
-     * Returns true if v3 handled the call (and filled `vRes`); false
-     * to fall through to the standard tree-walker dispatch.  The
-     * hook MUST consume exactly one argument from `args` and report
-     * how many it consumed via `argsConsumed` (today always 1; future
-     * expansions may consume multiple at once for known-arity v3
-     * closures).  On return, callFunction continues with the
-     * remaining args -- the hook is per-application, not whole-curry.
-     *
-     * Bug-compatible with v3ForceHook: any throw / unsupported case
-     * must return false WITHOUT mutating `vRes` so the tree-walker
-     * dispatch sees an unchanged state.
-     */
-    using V3CallFunctionHook = bool (*)(
-        EvalState & state, Value & fun, Value * arg, Value & vRes,
-        const PosIdx pos);
-    static V3CallFunctionHook v3CallFunctionHook;
-
-    /**
-     * Parse-time registration hook.  Fired from `parseExprFromFile` /
-     * `parseExprFromString` after a top-level Expr has been parsed,
-     * with the SourcePath the parser used as Pos::Origin.  v3 stashes
-     * (Expr*, SourcePath) so its disk-cache lookup can hit even when
-     * the top-level Expr's `getPos()` returns `noPos` (the common
-     * case for ExprLet / ExprAttrs).  Optional — a null hook is a
-     * no-op.
-     */
-    /// #430: pass `EvalState` so the v3 hook can lower+compile+populate
-    /// the file's lambdas at parse time -- expanding v3's call-hook
-    /// coverage beyond the eval-hook's "force-time top-level Expr"
-    /// subset.  EvalState is used only for `state.symbols` /
-    /// `state.positions`; no eval recursion is performed.
-    using V3RegisterExprHook = void (*)(EvalState &, const Expr *, const SourcePath &);
-    static V3RegisterExprHook v3RegisterExprHook;
-
-    /**
-     * WC-14.6 bounded-depth yield: when a v3 hook (force or
-     * callFunction) is on the call stack, the v3 entry bumps
-     * `v3HookActiveDepth` and forceValue tracks its own recursion
-     * via `v3HookForceDepth`.  If the latter exceeds
-     * `v3HookMaxForceDepth` while we're inside a hook, forceValue
-     * throws `V3DepthYield` (a recoverable Error subclass).  v3's
-     * hook entry catches it, marks phaseBFailed, and falls back to
-     * tree-walker.
-     *
-     * This caps C-stack growth caused by tree-walker recursion that
-     * runs inside a v3 hook (the WC-12 root cause), without a full
-     * tree-walker rewrite.
-     */
-    static thread_local int v3HookActiveDepth;
-    static thread_local int v3HookForceDepth;
-    static int v3HookMaxForceDepth; // tunable via NIX_V3_MAX_FORCE_DEPTH
 
     /**
      * Evaluation the expression, then verify that it has the expected

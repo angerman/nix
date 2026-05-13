@@ -370,10 +370,13 @@ void mainWrapped(int argc, char ** argv)
 {
     savedArgv = argv;
 
-    // Install the v3 evaluator hook (no-op unless NIX_USE_V3=1).
-    // The function reference also keeps the linker from
-    // `-dead_strip_dylibs`-ing libnixexprv3 entirely.
-    nix::v3::installEvalHook();
+    // Touch libnixexprv3 so the linker keeps it (it's loaded for the
+    // v3-direct path that `src/nix/eval.cc` switches into when
+    // NIX_V3_DIRECT_EVAL=1).  The reference is a single bool-returning
+    // probe — no hook installation, since v3 is no longer plugged into
+    // libexpr's dispatch.
+    [[maybe_unused]] volatile bool v3KeepAlive =
+        nix::v3::keepLibAlive();
 
     registerCrashHandler();
 
