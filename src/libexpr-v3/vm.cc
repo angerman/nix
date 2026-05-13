@@ -7312,14 +7312,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     } catch (...) { return (fallback); } \
                   }()) \
                 : (fallback))
+        // A8: iterative force.  On non-WHNF top, rewind ip, set
+        // CFF_FORCE_RETRY, and goto op_force_slow — the opcode re-enters
+        // with WHNF on top.  No C-recursion through forceValue.
         #define V3_IS_OP(op_name, predExpr) \
             case op_name: { \
-                Value v = pop(vm); \
-                if (v.isThunk() || v.tag() == Tag::App \
-                    || v.tag() == Tag::Slot) { \
-                    vm.frames.back().ip = ip; \
-                    v = forceValue(vm, v); \
+                Value & topRef = vm.valueStack.back(); \
+                if (topRef.isThunk() || topRef.tag() == Tag::App \
+                    || topRef.tag() == Tag::Slot) { \
+                    ip = ip - 1; \
+                    vm.frames.back().flags |= CFF_FORCE_RETRY; \
+                    goto op_force_slow; \
                 } \
+                Value v = pop(vm); \
                 push(vm, (predExpr) ? Value::vTrue : Value::vFalse); \
                 break; \
             }
@@ -7347,12 +7352,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
         case OP_HEAD: {
             // Mirror primHead in primops.cc:272-278.
-            Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App
-                || v.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                v = forceValue(vm, v);
+            // A8: iterative force.
+            {
+                Value & topRef = vm.valueStack.back();
+                if (topRef.isThunk() || topRef.tag() == Tag::App
+                    || topRef.tag() == Tag::Slot) {
+                    ip = ip - 1;
+                    vm.frames.back().flags |= CFF_FORCE_RETRY;
+                    goto op_force_slow;
+                }
             }
+            Value v = pop(vm);
             if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
                 throw std::runtime_error("v3 primop head: empty list or wrong type");
             push(vm, v.payload.list->elems[0]);
@@ -7361,12 +7371,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
         case OP_TAIL: {
             // Mirror primTail in primops.cc:280-292.
-            Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App
-                || v.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                v = forceValue(vm, v);
+            // A8: iterative force.
+            {
+                Value & topRef = vm.valueStack.back();
+                if (topRef.isThunk() || topRef.tag() == Tag::App
+                    || topRef.tag() == Tag::Slot) {
+                    ip = ip - 1;
+                    vm.frames.back().flags |= CFF_FORCE_RETRY;
+                    goto op_force_slow;
+                }
             }
+            Value v = pop(vm);
             if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
                 throw std::runtime_error("v3 primop tail: empty list or wrong type");
             uint32_t n = v.payload.list->size;
@@ -7384,12 +7399,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_LENGTH: {
             // Mirror primLength in primops.cc:262-270.  Handles list
             // OR string; throws otherwise with the same message.
-            Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App
-                || v.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                v = forceValue(vm, v);
+            // A8: iterative force.
+            {
+                Value & topRef = vm.valueStack.back();
+                if (topRef.isThunk() || topRef.tag() == Tag::App
+                    || topRef.tag() == Tag::Slot) {
+                    ip = ip - 1;
+                    vm.frames.back().flags |= CFF_FORCE_RETRY;
+                    goto op_force_slow;
+                }
             }
+            Value v = pop(vm);
             int64_t n = 0;
             if (v.isList())
                 n = v.payload.list ? v.payload.list->size : 0;
@@ -7403,19 +7423,36 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
 
         case OP_ELEM_AT: {
-            // Mirror primElemAt in primops.cc:294-303.  Pops idx, then list.
+            // Mirror primElemAt in primops.cc:294-303.  Stack: [..., lst, idx]
+            // (idx on top).  A8: iterative writeback-force for the two args.
+            {
+                size_t topIdx = vm.valueStack.size() - 1;
+                Value & idxRef = vm.valueStack[topIdx];
+                Value & lstRef = vm.valueStack[topIdx - 1];
+                if (idxRef.isThunk() || idxRef.tag() == Tag::App
+                    || idxRef.tag() == Tag::Slot) {
+                    ip = ip - 1;
+                    vm.frames.back().flags |= CFF_FORCE_RETRY;
+                    goto op_force_slow;
+                }
+                if (lstRef.isThunk() || lstRef.tag() == Tag::App
+                    || lstRef.tag() == Tag::Slot) {
+                    // Writeback for the deeper slot.  Slot offset =
+                    // (topIdx - 1) - stackBase.
+                    uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
+                    if (__builtin_expect(off > 0xFFFFu, 0))
+                        throw std::runtime_error(
+                            "v3 OP_ELEM_AT: writeback slot offset too large");
+                    push(vm, lstRef);
+                    CallFrame & frame = vm.frames.back();
+                    setForceWriteback(frame, static_cast<uint16_t>(off));
+                    frame.flags |= CFF_FORCE_RETRY;
+                    ip = ip - 1;
+                    goto op_force_slow;
+                }
+            }
             Value idx = pop(vm);
             Value lst = pop(vm);
-            if (idx.isThunk() || idx.tag() == Tag::App
-                || idx.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                idx = forceValue(vm, idx);
-            }
-            if (lst.isThunk() || lst.tag() == Tag::App
-                || lst.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                lst = forceValue(vm, lst);
-            }
             if (!lst.isList() || !idx.isInt())
                 throw std::runtime_error("v3 primop elemAt: expected list and int");
             uint32_t n = lst.payload.list ? lst.payload.list->size : 0;
