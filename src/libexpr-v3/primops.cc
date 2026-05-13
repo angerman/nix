@@ -4446,10 +4446,11 @@ static std::string v3CoerceToString(
 // applied to the attrset itself producing a string), call it and
 // coerce the result.  Returns std::nullopt if no __toString.
 //
-// For Phase A we only support the case where __toString is a v3
-// closure or a tree-walker function reachable via the bridge's
-// PrimOpApp encoding.  Anything more exotic throws and is caught
-// by the scaffold's fall-back.
+// Implements TW's `coerceToString` __toString branch
+// (libexpr/eval.cc:2865-2870): call `__toString self` (where self is
+// the attrset itself), then recursively coerce the result.  __toString
+// is typically a Lambda / Closure but may also be a primop or a
+// PrimOpApp partial application; callClosure handles all three.
 static std::optional<std::string> v3TryAttrsToString(
     EvalState & state,
     Value & v,
@@ -4461,15 +4462,15 @@ static std::optional<std::string> v3TryAttrsToString(
     const Value * tsRaw = v.payload.bindings->lookup(sym.toString);
     if (!tsRaw) return std::nullopt;
     Value tsFn = forceValue(*state.vm, *tsRaw);
-    // Phase A scope: don't try to call __toString at all — every
-    // case I've audited in nixpkgs has it as a closure that pulls
-    // in the full eval state, and bridging into v3 from this
-    // context isn't yet wired.  Fall back.  (BR-3.13 / Phase E
-    // can expand this once the path is hot enough to matter.)
-    (void)tsFn;
-    throw std::runtime_error(
-        "v3 BR-3 coerceToString: __toString fall-back path "
-        "not yet implemented; bridging");
+    // Only attempt the call for callable shapes — TW's coerceToString
+    // doesn't error on a non-callable __toString, it just falls
+    // through to the outPath branch.  Match that.
+    if (!(tsFn.isClosure() || tsFn.isPrimOp()
+          || tsFn.tag() == Tag::PrimOpApp))
+        return std::nullopt;
+    Value result = callClosure(*state.vm, tsFn, v);
+    Value forced = forceValue(*state.vm, result);
+    return v3CoerceToString(state, forced, context, errorCtx);
 }
 
 static std::string v3CoerceToString(
