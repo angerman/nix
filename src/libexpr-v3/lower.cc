@@ -1534,8 +1534,30 @@ struct Lowerer
         // calls — only cheap-to-skip in argument position.  In an
         // attr-value position they may reference rec siblings, so the
         // thunk wrapper is required for laziness.
+        //
+        // BR-3 bug-1 (2026-05-13): Nix's parser produces a single
+        // `ExprConcatStrings` node for BOTH `a + b` arithmetic and
+        // `"...${expr}..."` string interpolation.  The two are
+        // distinguished by the `forceString` flag (false for the
+        // former, true for the latter).  Treating an interpolation as
+        // "trivial for arg" is WRONG — the interpolated parts may
+        // contain attribute access (`${pkg.missing}`) which would
+        // throw at lower-time when the function it's passed to never
+        // actually uses the arg (e.g. lib.optionalString's `else`
+        // branch).  Repro: `optionalString false "${obj.missing}"`
+        // throws under v3-direct but returns "" under TW.  Arithmetic
+        // `n + 1` stays eager because (a) Nix `+` on Int/Float types
+        // is itself strict in both operands and (b) hot benchmarks
+        // (fib) chain many `f (n - 1)` calls where the thunk overhead
+        // would dominate.
         if (forArg) {
-            if (k == nix::Expr::Kind::ConcatStrings) return true;
+            if (k == nix::Expr::Kind::ConcatStrings) {
+                auto * cs = static_cast<nix::ExprConcatStrings *>(e);
+                if (!cs->forceString) return true;  // arithmetic — safe eager
+                // String interpolation — must thunk so unused branches
+                // don't evaluate the parts.
+                return false;
+            }
             if (k == nix::Expr::Kind::Call) {
                 auto * c = static_cast<nix::ExprCall *>(e);
                 if (c && c->fun && c->fun->exprKind == nix::Expr::Kind::Var) {
