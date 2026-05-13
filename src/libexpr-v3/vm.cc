@@ -1702,16 +1702,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // a thunk whose evaluated value is the bool we need to branch on.
         // Without a force, `arg || y` would peek the thunk, fail the
         // isBool check, and incorrectly fall through into the rhs block.
+        // A8 (2026-05-13) — boolean/branch opcodes now drive force
+        // iteratively: when top-of-stack is non-WHNF, the case rewinds
+        // `ip` to its own opcode, sets CFF_FORCE_RETRY on the current
+        // frame, and `goto op_force_slow` to push a thunk-force frame.
+        // dispatchLoop's main loop drains the force frame; on return
+        // the same opcode re-runs with WHNF on top.  This replaces the
+        // C-recursive `v = forceValue(vm, v)` pattern that grew the C
+        // stack by one dispatchLoop frame per nested force.
+
         case OP_NOT: {
+            Value & top = vm.valueStack.back();
+            if (top.isThunk() || top.tag() == Tag::App
+                || top.tag() == Tag::Slot)
+            {
+                ip = ip - 1;
+                vm.frames.back().flags |= CFF_FORCE_RETRY;
+                goto op_force_slow;
+            }
             Value v = pop(vm);
-            // Phase 13: must also force Tag::Slot — formal-arg recref
-            // lookups (lower.cc:thunkifyRecAttrSelect) used to wrap the
-            // slot ref behind a Thunk wrapper, so the Thunk-only check
-            // sufficed.  Under NIX_V3_INLINE_REC_SLOT we get a bare
-            // Tag::Slot here; without forcing, the bool check fails
-            // and the wrong branch is taken.
-            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
-                v = forceValue(vm, v);
             push(vm, isTrueValue(v) ? Value::vFalse : Value::vTrue);
             break;
         }
@@ -1719,34 +1728,52 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_AND_BRANCH: {
             // peek; if false -> jump (keep false); if true -> pop and fall through
             Value & v = vm.valueStack.back();
-            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
-                v = forceValue(vm, v);
+            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot) {
+                ip = ip - 1;
+                vm.frames.back().flags |= CFF_FORCE_RETRY;
+                goto op_force_slow;
+            }
             if (v.isBool() && v.payload.i == 0) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
         }
         case OP_OR_BRANCH: {
             Value & v = vm.valueStack.back();
-            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
-                v = forceValue(vm, v);
+            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot) {
+                ip = ip - 1;
+                vm.frames.back().flags |= CFF_FORCE_RETRY;
+                goto op_force_slow;
+            }
             if (v.isBool() && v.payload.i == 1) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
         }
         case OP_IMPL_BRANCH: {
             // If lhs false -> result is true; jump.  If lhs true -> pop, fall through.
+            Value & top = vm.valueStack.back();
+            if (top.isThunk() || top.tag() == Tag::App
+                || top.tag() == Tag::Slot)
+            {
+                ip = ip - 1;
+                vm.frames.back().flags |= CFF_FORCE_RETRY;
+                goto op_force_slow;
+            }
             Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
-                v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 0) { push(vm, Value::vTrue); ip = operand; }
             break;
         }
 
         case OP_JUMP: ip = operand; break;
         case OP_BRANCH_FALSE: {
+            Value & top = vm.valueStack.back();
+            if (top.isThunk() || top.tag() == Tag::App
+                || top.tag() == Tag::Slot)
+            {
+                ip = ip - 1;
+                vm.frames.back().flags |= CFF_FORCE_RETRY;
+                goto op_force_slow;
+            }
             Value v = pop(vm);
-            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot)
-                v = forceValue(vm, v);
             if (v.isBool() && v.payload.i == 0) ip = operand;
             break;
         }
@@ -5107,40 +5134,39 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_ATTRS_SELECT: {
-            Value attrs = pop(vm);
-            // #458 step A.3: same per-attr peek as OP_WITH_LOOKUP for
-            // Bridge thunks.  When attrs is a TW Value bridged into v3
-            // and the outer thunk's type is already nAttrs (Bindings
-            // built; entries may still be thunks), look up just our
-            // operand symbol and bridge the single Attr -- avoiding
-            // deep `treeWalkerToV3Public` conversion that would walk
-            // every entry and risk fix-point cycles.  Works in concert
-            // with A.2 for the broader slot-threading-for-fix-points
-            // story.  IC cache update is skipped on this path -- the
-            // per-attr bridge result has no v3-side Bindings to cache
-            // against (and the IC's purpose is amortizing v3-internal
-            // Bindings* shape-keyed lookups).
-            if (attrs.isThunk() && attrs.payload.thunk
-                && attrs.payload.thunk->state == ThunkState::Bridge) {
-                // The opcode's 24-bit operand is the SymbolId.
-                if (auto v = tryBridgeAttrLookup(
-                        attrs.payload.thunk,
-                        static_cast<SymbolId>(operand))) {
-                    push(vm, *v);
-                    ip++;  // consume the icIdx operand word we'd
-                           // otherwise read at line below
-                    break;
+            // A8: bridge-thunk peek BEFORE the iterative force — the
+            // peek is cheap (no force) and breaks the common case of
+            // a TW-bridged attrset getting opened one attr at a time.
+            {
+                Value & topRef = vm.valueStack.back();
+                if (topRef.isThunk() && topRef.payload.thunk
+                    && topRef.payload.thunk->state == ThunkState::Bridge) {
+                    if (auto v = tryBridgeAttrLookup(
+                            topRef.payload.thunk,
+                            static_cast<SymbolId>(operand))) {
+                        vm.valueStack.pop_back();
+                        push(vm, *v);
+                        ip++;  // skip icIdx
+                        break;
+                    }
+                    // Bridge peek didn't resolve; fall through to force.
                 }
-                // peek didn't resolve -- fall through to wholesale
-                // force.  May still succeed (if not in a cycle) or
-                // throw BlackholeError that propagates correctly.
             }
-            // Force lazy shapes (Tag::App from mapAttrs entries, Thunks
-            // from chained AttrSelects).  Same rationale as OP_CALL —
-            // tree-walker forces target before AttrSelect; v3's lower
-            // emits an explicit OP_FORCE most of the time, but App/Thunk
-            // values can sneak through via OP_RETURN's no-chase
-            // semantics.  Cheap on already-forced values.
+            // A8: iterative force — when top is non-WHNF, rewind to
+            // OP_ATTRS_SELECT and goto op_force_slow.  Replaces the
+            // C-recursive `attrs = forceValue(vm, attrs)` below.
+            {
+                Value & topRef = vm.valueStack.back();
+                if (topRef.tag() == Tag::App
+                    || topRef.tag() == Tag::Thunk
+                    || topRef.tag() == Tag::Slot)
+                {
+                    ip = ip - 1;
+                    vm.frames.back().flags |= CFF_FORCE_RETRY;
+                    goto op_force_slow;
+                }
+            }
+            Value attrs = pop(vm);
             //
             // #558 (2026-05-10) partial-Bindings peek for OP_ATTRS_SELECT:
             // when the source is a Black thunk in mid-construction (the
@@ -5177,10 +5203,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     ++hops;
                 }
             }
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                attrs = forceValue(vm, attrs);
-            }
+            // A8: force is handled at case entry (iterative).  By here
+            // `attrs` is WHNF.
             // Phase A3: when SELECT operates on a 1-entry attrset
             // matching V3_DBG_SELECT_PATTERN (e.g. "family"), dump the
             // source position + selecting attribute name.  Used to
@@ -6280,6 +6304,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // `&entries[i].value`.  Heap-stable because Bindings live
             // on the v3 heap (Alloc::allocBindings), not on the
             // value-stack.
+            // A8: iterative force at case entry.
+            {
+                Value & topRef = vm.valueStack.back();
+                if (topRef.tag() == Tag::App
+                    || topRef.tag() == Tag::Thunk
+                    || topRef.tag() == Tag::Slot)
+                {
+                    ip = ip - 1;
+                    vm.frames.back().flags |= CFF_FORCE_RETRY;
+                    goto op_force_slow;
+                }
+            }
             Value attrs = pop(vm);
             // #437: count and tag-distribute OP_REC_BINDING_SLOT_REF fires.
             {
@@ -6316,12 +6352,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     }
                 }
             }
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                // #558 Phase 3.3: partial-Bindings recovery retired.
-                // Black thunk access throws — no chain consultation.
-                attrs = forceValue(vm, attrs);
-            }
+            // A8: force handled at case entry — attrs is WHNF here.
             if (!attrs.isAttrs() || !attrs.payload.bindings) {
                 throw std::runtime_error(
                     "v3 OP_REC_BINDING_SLOT_REF: source is not a forced attrset");
