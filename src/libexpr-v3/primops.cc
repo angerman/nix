@@ -8028,23 +8028,46 @@ void registerBuiltinPrimOps()
         registerPrimOp({"substring",          3, primSubstring});
         // Higher-order callback primops (re-enter the VM via callClosure).
         registerPrimOp({"map",                2, primMap});
-        registerPrimOp({"filter",             2, primFilter});
-        registerPrimOp({"foldl'",             3, primFoldl, /*lazyArgs=*/0b010});
+        // A8 phase 2: list-walking primops marked deepForceList for the
+        // appropriate arg.  Only those whose bodies WOULD force every
+        // element (no short-circuit, no laziness-preserving passes) are
+        // safe to pre-force iteratively — pre-forcing must not introduce
+        // a throw that lazy evaluation would have skipped.
+        //   filter (arg 1):      pred is called on every element → safe
+        //   foldl' (arg 2):      op is called on every element → safe
+        //   partition (arg 1):   same shape as filter
+        //   listToAttrs (arg 0): body explicitly forces each entry
+        //   catAttrs (arg 1):    body explicitly forces each attrset
+        //   groupBy (arg 1):     keyFn is called on every element
+        // Skipped (short-circuit / lazy):
+        //   map: builds Tag::App entries, never forces inputs
+        //   all / any: short-circuit; pre-force would surface throws
+        //              that lazy eval would have skipped
+        //   elem: short-circuit on first match
+        //   concatMap: fn may discard its arg
+        //   sort: comparator may not visit every pair
+        registerPrimOp({"filter",             2, primFilter,
+                        /*lazyArgs=*/0, /*deepForceList=*/0b10});
+        registerPrimOp({"foldl'",             3, primFoldl,
+                        /*lazyArgs=*/0b010, /*deepForceList=*/0b100});
         registerPrimOp({"genList",            2, primGenList});
         registerPrimOp({"all",                2, primAll});
         registerPrimOp({"any",                2, primAny});
         registerPrimOp({"concatMap",          2, primConcatMap});
-        registerPrimOp({"partition",          2, primPartition});
+        registerPrimOp({"partition",          2, primPartition,
+                        /*lazyArgs=*/0, /*deepForceList=*/0b10});
         registerPrimOp({"getEnv",             1, primGetEnv});
         registerPrimOp({"compareVersions",    2, primCompareVersions});
-        registerPrimOp({"listToAttrs",        1, primListToAttrs});
+        registerPrimOp({"listToAttrs",        1, primListToAttrs,
+                        /*lazyArgs=*/0, /*deepForceList=*/0b1});
         registerPrimOp({"removeAttrs",        2, primRemoveAttrs});
         registerPrimOp({"intersectAttrs",     2, primIntersectAttrs});
         registerPrimOp({"mapAttrs",           2, primMapAttrs});
         registerPrimOp({"elem",               2, primElem});
         registerPrimOp({"getAttr",            2, primGetAttr});
         registerPrimOp({"hasAttr",            2, primHasAttr});
-        registerPrimOp({"catAttrs",           2, primCatAttrs});
+        registerPrimOp({"catAttrs",           2, primCatAttrs,
+                        /*lazyArgs=*/0, /*deepForceList=*/0b10});
         registerPrimOp({"replaceStrings",     3, primReplaceStrings});
         registerPrimOp({"abort",              1, primAbort});
         registerPrimOp({"seq",                2, primSeq,     /*lazyArgs=*/0b10});
@@ -8080,7 +8103,8 @@ void registerBuiltinPrimOps()
         registerPrimOp({"readFile",           1, primReadFile});
         registerPrimOp({"readDir",            1, primReadDir});
         registerPrimOp({"parseDrvName",       1, primParseDrvName});
-        registerPrimOp({"groupBy",            2, primGroupBy});
+        registerPrimOp({"groupBy",            2, primGroupBy,
+                        /*lazyArgs=*/0, /*deepForceList=*/0b10});
         registerPrimOp({"match",              2, primMatch});
         registerPrimOp({"split",              2, primSplit});
         registerPrimOp({"hashString",         2, primHashString});
