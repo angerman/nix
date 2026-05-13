@@ -359,6 +359,15 @@ struct PrimOp
     /// tree-walker's per-primop lazy-arg semantics.
     /// Bit 0 = arg 0, bit 1 = arg 1, etc.
     uint8_t          lazyArgs = 0;
+    /// Bitmask of argument indices whose LIST ELEMENTS should be
+    /// pre-forced iteratively by OP_CALL_PRIMOP / OP_CALL before the
+    /// primop body runs.  Eliminates the C-recursive forceValue inside
+    /// list-walking primops (concatLists, map, foldl', filter, all,
+    /// any, etc.); each element is forced through the VM frame stack
+    /// via writeback to its ListVec storage slot.  Bit `i` set ⇒ arg i
+    /// must already be a List (combine with `lazyArgs` clear so the
+    /// outer list itself is also WHNF on entry).
+    uint8_t          deepForceList = 0;
     /// FFI plan A13: dispatch-time policy flags (see PrimOpFlags above).
     /// Default `PRIMOP_NONE` preserves today's behaviour for primops
     /// that haven't been audited; the goal is to decorate every primop

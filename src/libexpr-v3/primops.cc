@@ -8015,7 +8015,15 @@ void registerBuiltinPrimOps()
         registerPrimOp({"__mul",        2, primMul});
         registerPrimOp({"__div",        2, primDiv});
         registerPrimOp({"__lessThan",   2, primLessThan});
-        registerPrimOp({"concatLists",        1, primConcatLists});
+        // A8 phase 2 (2026-05-13): deepForceList=0b1 — OP_CALL_PRIMOP
+        // pre-forces all elements of arg 0 (the outer list) iteratively
+        // through the VM frame stack BEFORE calling primConcatLists.
+        // primConcatLists's own `forceValue(...elems[i]...)` calls then
+        // hit Evaluated thunks and return without C-recursion.  This
+        // closes the dominant forceValue→dispatchLoop chain that built
+        // up to 4500 C-stack frames on nixpkgs derivation construction.
+        registerPrimOp({"concatLists",        1, primConcatLists,
+                        /*lazyArgs=*/0, /*deepForceList=*/0b1});
         registerPrimOp({"concatStringsSep",   2, primConcatStringsSep});
         registerPrimOp({"substring",          3, primSubstring});
         // Higher-order callback primops (re-enter the VM via callClosure).

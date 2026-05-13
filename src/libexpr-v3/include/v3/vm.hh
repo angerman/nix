@@ -53,6 +53,18 @@ enum CallFrameFlag : uint8_t
     /// caller (so this access gets the partial-but-best-current
     /// result), but future forces will re-run.
     CFF_TAINTED = 1 << 2,
+    /// A8 (2026-05-13): the upper 16 bits of `flags` encode a
+    /// stack-base-relative slot offset for a pending force writeback.
+    /// Clear unless an opcode has set up an iterative force.  See
+    /// applyForceWriteback in vm.cc for the protocol.
+    CFF_FORCE_WB = 1 << 3,
+    /// A8 (2026-05-13) phase 2: pointer-target writeback.  When set,
+    /// `forceWriteTarget` (heap-pointer or list/attr slot) is the
+    /// destination, NOT a stackBase-relative slot.  Used by OP_CALL_PRIMOP
+    /// / OP_CALL when pre-forcing list elements iteratively into their
+    /// ListVec storage.  Mutually exclusive with CFF_FORCE_WB (the
+    /// applyForceWriteback helper checks pointer first).
+    CFF_FORCE_WB_PTR = 1 << 4,
 };
 
 /// Slim CallFrame — 40 bytes, 2 fit in a 64B cache line minus 24B.
@@ -75,6 +87,13 @@ struct CallFrame
     /// captured snapshot.  At OP_RETURN we truncate to this base.
     uint32_t  withStackBase;            // 4
     uint32_t  flags;                    // 4 (widened from u8 for clean 40-byte layout)
+    /// A8 phase 2 (2026-05-13): heap-pointer writeback target.  Set
+    /// by opcode handlers that pre-force collection elements (e.g.
+    /// OP_CALL_PRIMOP's deepForceList phase) so the forced WHNF gets
+    /// stored back into the source list/attrset directly, not onto
+    /// the value stack.  Valid only when `flags & CFF_FORCE_WB_PTR`.
+    /// Cleared by applyForceWriteback after the write.
+    Value *   forceWriteTarget = nullptr;   // 8
 };
 
 /// Per-EvalState VM state.

@@ -1188,18 +1188,22 @@ namespace {
 // args, and either finds the next non-WHNF arg to force or proceeds with
 // all args in WHNF.
 //
-// CFF_FORCE_WB (bit 3 of flags) indicates the upper 16 bits of flags
-// encode a stack-base-relative slot offset for the writeback target.
-// When the bit is clear, forces use the legacy "push result to top of
-// stack" behavior — which OP_FORCE / OP_GET_LOCAL_FORCE /
-// OP_GET_UPVALUE_FORCE and the 7 single-arg branch opcodes (OP_NOT,
-// OP_*_BRANCH, OP_ATTRS_SELECT, OP_REC_BINDING_SLOT_REF) rely on.
+// CFF_FORCE_WB (bit 3 of flags, defined in v3/vm.hh) indicates the
+// upper 16 bits of flags encode a stack-base-relative slot offset for
+// the writeback target.  When the bit is clear, forces use the legacy
+// "push result to top of stack" behavior — which OP_FORCE /
+// OP_GET_LOCAL_FORCE / OP_GET_UPVALUE_FORCE and the 7 single-arg
+// branch opcodes (OP_NOT, OP_*_BRANCH, OP_ATTRS_SELECT,
+// OP_REC_BINDING_SLOT_REF) rely on.
 //
 // We cannot use a sentinel value in the upper 16 bits because a fresh
 // CallFrame has flags=0, which would collide with "slot 0".  An
 // explicit flag bit is unambiguous.
-
-constexpr uint32_t CFF_FORCE_WB = 1u << 3;
+//
+// CFF_FORCE_WB_PTR (bit 4) overrides: target is `forceWriteTarget`
+// (a heap Value*), not a stack slot.  Used by deep-force passes
+// (OP_CALL_PRIMOP's deepForceList) to writeback into list/attr storage
+// directly.
 
 inline uint16_t getForceWriteback(const CallFrame & f) noexcept
 {
@@ -1218,12 +1222,22 @@ inline void clearForceWriteback(CallFrame & f) noexcept
 }
 
 /// Apply pending writeback if any: top-of-stack holds the forced value;
-/// write it into the caller's recorded slot and pop top.  Returns true
-/// when a writeback was applied (so callers can suppress the
-/// CFF_FORCE_RETRY chain — the opcode will re-scan on re-entry).
+/// write it to either the recorded heap Value* target (CFF_FORCE_WB_PTR,
+/// used by deep-force passes) or the stackBase-relative slot
+/// (CFF_FORCE_WB, used by per-opcode arg pre-forcing) and pop top.
+/// Returns true when a writeback was applied (so callers can suppress
+/// the CFF_FORCE_RETRY chain — the opcode will re-scan on re-entry).
 inline bool applyForceWriteback(VMState & vm) noexcept
 {
     CallFrame & f = vm.frames.back();
+    if (f.flags & CFF_FORCE_WB_PTR) {
+        Value forced = vm.valueStack.back();
+        vm.valueStack.pop_back();
+        if (f.forceWriteTarget) *f.forceWriteTarget = forced;
+        f.forceWriteTarget = nullptr;
+        f.flags &= ~CFF_FORCE_WB_PTR;
+        return true;
+    }
     if (!(f.flags & CFF_FORCE_WB)) return false;
     uint16_t off = getForceWriteback(f);
     Value forced = vm.valueStack.back();
@@ -7318,6 +7332,39 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         frame.flags |= CFF_FORCE_RETRY;
                         ip = ip - 1;  // rewind to re-enter this OP_CALL_PRIMOP
                         goto op_force_slow;
+                    }
+                }
+                // A8 phase 2 (2026-05-13): deepForceList pre-pass.
+                // For each arg flagged DEEP_FORCE_LIST, the outer list
+                // is WHNF (phase 1 above) but its elements are still
+                // lazy.  Walk the list and iteratively force any
+                // non-WHNF element via writeback to its ListVec
+                // storage slot (CFF_FORCE_WB_PTR + forceWriteTarget).
+                // The primop body's later `forceValue` calls on these
+                // elements hit Evaluated thunks → no C-recursion.
+                // Eliminates the recursive `forceValue` chain that
+                // primConcatLists / primMap / primFoldl' had built up
+                // (3500+ levels on nixpkgs derivation construction).
+                if (po->deepForceList) {
+                    for (uint32_t k = 0; k < nArgs; ++k) {
+                        if (!(po->deepForceList & (1u << k))) continue;
+                        Value & a = vm.valueStack[argBase + k];
+                        if (!a.isList() || !a.payload.list) continue;
+                        ListVec * list = a.payload.list;
+                        for (uint32_t i = 0; i < list->size; ++i) {
+                            Value & e = list->elems[i];
+                            Tag t = e.tag();
+                            if (t == Tag::Thunk || t == Tag::App
+                                || t == Tag::Slot) {
+                                push(vm, e);
+                                CallFrame & frame = vm.frames.back();
+                                frame.forceWriteTarget = &e;
+                                frame.flags |= CFF_FORCE_WB_PTR
+                                             | CFF_FORCE_RETRY;
+                                ip = ip - 1;  // re-enter OP_CALL_PRIMOP
+                                goto op_force_slow;
+                            }
+                        }
                     }
                 }
             }
