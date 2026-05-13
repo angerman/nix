@@ -4781,18 +4781,36 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_LIST_CONCAT: {
-            Value rhs = pop(vm), lhs = pop(vm);
             // Force-on-receive: lazy values (Tag::App from mapAttrs/
             // map/zipAttrsWith, Tag::Thunk from chained AttrSelects)
             // must be forced before shape-checking.  See WC-35.
-            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk || lhs.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                lhs = forceValue(vm, lhs);
+            // A8: iterative writeback-force for the two args.  Stack:
+            // [..., lhs, rhs] (rhs on top).
+            {
+                size_t topIdx = vm.valueStack.size() - 1;
+                Value & rhsRef = vm.valueStack[topIdx];
+                Value & lhsRef = vm.valueStack[topIdx - 1];
+                if (rhsRef.tag() == Tag::App || rhsRef.tag() == Tag::Thunk
+                    || rhsRef.tag() == Tag::Slot) {
+                    ip = ip - 1;
+                    vm.frames.back().flags |= CFF_FORCE_RETRY;
+                    goto op_force_slow;
+                }
+                if (lhsRef.tag() == Tag::App || lhsRef.tag() == Tag::Thunk
+                    || lhsRef.tag() == Tag::Slot) {
+                    uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
+                    if (__builtin_expect(off > 0xFFFFu, 0))
+                        throw std::runtime_error(
+                            "v3 OP_LIST_CONCAT: writeback slot offset too large");
+                    push(vm, lhsRef);
+                    CallFrame & frame = vm.frames.back();
+                    setForceWriteback(frame, static_cast<uint16_t>(off));
+                    frame.flags |= CFF_FORCE_RETRY;
+                    ip = ip - 1;
+                    goto op_force_slow;
+                }
             }
-            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk || rhs.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                rhs = forceValue(vm, rhs);
-            }
+            Value rhs = pop(vm), lhs = pop(vm);
             if (!lhs.isList() || !rhs.isList())
                 throw std::runtime_error("v3 OP_LIST_CONCAT: not lists");
             uint32_t n = lhs.payload.list->size + rhs.payload.list->size;
@@ -6107,15 +6125,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_ATTRS_UPDATE: {
+            // A8: iterative writeback-force for the two args.  Stack:
+            // [..., lhs, rhs] (rhs on top).
+            {
+                size_t topIdx = vm.valueStack.size() - 1;
+                Value & rhsRef = vm.valueStack[topIdx];
+                Value & lhsRef = vm.valueStack[topIdx - 1];
+                if (rhsRef.tag() == Tag::App || rhsRef.tag() == Tag::Thunk
+                    || rhsRef.tag() == Tag::Slot) {
+                    ip = ip - 1;
+                    vm.frames.back().flags |= CFF_FORCE_RETRY;
+                    goto op_force_slow;
+                }
+                if (lhsRef.tag() == Tag::App || lhsRef.tag() == Tag::Thunk
+                    || lhsRef.tag() == Tag::Slot) {
+                    uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
+                    if (__builtin_expect(off > 0xFFFFu, 0))
+                        throw std::runtime_error(
+                            "v3 OP_ATTRS_UPDATE: writeback slot offset too large");
+                    push(vm, lhsRef);
+                    CallFrame & frame = vm.frames.back();
+                    setForceWriteback(frame, static_cast<uint16_t>(off));
+                    frame.flags |= CFF_FORCE_RETRY;
+                    ip = ip - 1;
+                    goto op_force_slow;
+                }
+            }
             Value rhs = pop(vm), lhs = pop(vm);
-            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk || lhs.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                lhs = forceValue(vm, lhs);
-            }
-            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk || rhs.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                rhs = forceValue(vm, rhs);
-            }
             // #558 Phase 3.3: Tag::Thunk Blackhole collapse retired.
             if (!lhs.isAttrs() || !rhs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_UPDATE: not attrsets");
@@ -6139,15 +6175,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // ancestor's).  The most-correct partial-WHNF approximation
             // for nested fix-points (lib.fix's `let x = f x; in x`
             // with f producing a // chain in tail position).
+            // A8: iterative writeback-force for the two args.  Stack:
+            // [..., lhs, rhs] (rhs on top).
+            {
+                size_t topIdx = vm.valueStack.size() - 1;
+                Value & rhsRef = vm.valueStack[topIdx];
+                Value & lhsRef = vm.valueStack[topIdx - 1];
+                if (rhsRef.tag() == Tag::App || rhsRef.tag() == Tag::Thunk
+                    || rhsRef.tag() == Tag::Slot) {
+                    ip = ip - 1;
+                    vm.frames.back().flags |= CFF_FORCE_RETRY;
+                    goto op_force_slow;
+                }
+                if (lhsRef.tag() == Tag::App || lhsRef.tag() == Tag::Thunk
+                    || lhsRef.tag() == Tag::Slot) {
+                    uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
+                    if (__builtin_expect(off > 0xFFFFu, 0))
+                        throw std::runtime_error(
+                            "v3 OP_ATTRS_UPDATE_TAIL: writeback slot offset too large");
+                    push(vm, lhsRef);
+                    CallFrame & frame = vm.frames.back();
+                    setForceWriteback(frame, static_cast<uint16_t>(off));
+                    frame.flags |= CFF_FORCE_RETRY;
+                    ip = ip - 1;
+                    goto op_force_slow;
+                }
+            }
             Value rhs = pop(vm), lhs = pop(vm);
-            if (lhs.tag() == Tag::App || lhs.tag() == Tag::Thunk || lhs.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                lhs = forceValue(vm, lhs);
-            }
-            if (rhs.tag() == Tag::App || rhs.tag() == Tag::Thunk || rhs.tag() == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                rhs = forceValue(vm, rhs);
-            }
             // #558: if forceValue deferred (returned Tag::Thunk Black
             // with chain), collapse to chain.back() for the merge.
             // // semantics need a Bindings; the chain peek approach
@@ -6690,20 +6744,34 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 overflow.resize(n);
                 parts = overflow.data();
             }
-            for (uint32_t i = n; i > 0; --i) parts[i - 1] = pop(vm);
-
-            // Force lazy parts (Tag::App from mapAttrs/zipAttrsWith,
-            // Tag::Thunk from lazy attr values).  Without this, a
-            // string interpolation like `"${(map f xs)[0]}"` blows up
-            // because map's entries are now Tag::App after the WC-35
-            // fix.  Cheap on already-WHNF values.
-            for (uint32_t i = 0; i < n; ++i) {
-                Tag t = parts[i].tag();
-                if (t == Tag::App || t == Tag::Thunk) {
-                    vm.frames.back().ip = ip;
-                    parts[i] = forceValue(vm, parts[i]);
+            // A8: iterative writeback-force for all `n` parts.  Stack:
+            // [..., part0, part1, ..., part(n-1)] (part(n-1) on top).
+            // Scan in place WITHOUT popping; on first non-WHNF, set up
+            // writeback for that slot and goto op_force_slow.  On
+            // re-entry the opcode rescans.  Note: tag check ignores
+            // Tag::Slot for backwards compat with the prior loop, but
+            // Slot values should be rare here (they'd appear only if
+            // lower emitted an unforced Slot into a string operand).
+            {
+                size_t argBase = vm.valueStack.size() - n;
+                for (uint32_t k = 0; k < n; ++k) {
+                    Value & p = vm.valueStack[argBase + k];
+                    Tag t = p.tag();
+                    if (t == Tag::App || t == Tag::Thunk) {
+                        uint32_t off = static_cast<uint32_t>((argBase + k) - stackBase);
+                        if (__builtin_expect(off > 0xFFFFu, 0))
+                            throw std::runtime_error(
+                                "v3 OP_STR_CONCAT: writeback slot offset too large");
+                        push(vm, p);
+                        CallFrame & frame = vm.frames.back();
+                        setForceWriteback(frame, static_cast<uint16_t>(off));
+                        frame.flags |= CFF_FORCE_RETRY;
+                        ip = ip - 1;
+                        goto op_force_slow;
+                    }
                 }
             }
+            for (uint32_t i = n; i > 0; --i) parts[i - 1] = pop(vm);
             // V3_DBG_STRCONCAT: when a Closure leaks into STR_CONCAT
             // (which happens when v3's eval-order divergence forces a
             // function value where tree-walker keeps it lazy), dump
