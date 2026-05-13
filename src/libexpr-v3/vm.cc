@@ -7020,6 +7020,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 break;
             }
 
+            // Blackhole propagation: if any part is a propagating
+            // Blackhole sentinel (cross-VM cycle marker), the whole
+            // concat result is a Blackhole.  Match the
+            // blackhole-as-value semantics established for OP_FORCE
+            // and forceValue's foreign-VM Black case (vm.cc:~4290 /
+            // ~8643): rather than throwing here (which would break
+            // tryEval and the fall-back paths that expect typed
+            // propagation), push vBlackhole and break.
+            for (uint32_t i = 0; i < n; ++i) {
+                if (parts[i].tag() == Tag::Blackhole) {
+                    push(vm, Value::vBlackhole);
+                    goto str_concat_done;
+                }
+            }
+            {
             std::string out;
             // Accumulate string contexts from all parts.  Path parts
             // produce a fresh Opaque entry (the store path of the
@@ -7274,6 +7289,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
             push(vm, v);
+            }   // close scope for the Blackhole-propagation early-exit
+        str_concat_done:
             break;
         }
         case OP_ASSERT: {
