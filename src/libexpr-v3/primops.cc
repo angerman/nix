@@ -7645,6 +7645,14 @@ bool bridgeTimingEnabled()
     return e;
 }
 
+uint64_t bridgeTotalNs()
+{
+    uint64_t total = 0;
+    for (size_t i = 0; i < (size_t)BridgeKind::Count; ++i)
+        total += bridgeStats((BridgeKind)i).nsTotal.load(std::memory_order_relaxed);
+    return total;
+}
+
 void bridgeTelemetryBump(BridgeKind k, uint64_t ns)
 {
     auto & s = bridgeStats(k);

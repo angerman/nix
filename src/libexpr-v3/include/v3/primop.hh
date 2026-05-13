@@ -413,6 +413,16 @@ enum class BridgeKind : uint8_t {
 void bridgeTelemetryBump(BridgeKind k, uint64_t ns);
 void dumpBridgeTelemetry(std::FILE * out);
 
+/// Sum nanoseconds accumulated across all bridge kinds.  Only
+/// populated when NIX_V3_BRIDGE_TIMING=1.  Used by run.cc's
+/// PhaseTimer to split run_ms into vm_ms (pure v3 dispatch) and
+/// bridge_ms (TW-side time reached via the bridge).  Returns 0 when
+/// timing is disabled, so callers can unconditionally subtract.
+uint64_t bridgeTotalNs();
+
+/// Whether NIX_V3_BRIDGE_TIMING=1 was set at process start.
+bool bridgeTimingEnabled();
+
 /// RAII timer that bumps the per-kind counter and (when timing is
 /// enabled) accumulates wall time.  Use:
 ///   { BridgeTimer t(BridgeKind::TwToV3Full); ... heavy work ... }

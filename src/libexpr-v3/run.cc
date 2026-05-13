@@ -49,14 +49,24 @@ struct PhaseTimer {
     ~PhaseTimer()
     {
         if (!active) return;
-        // Mirror the v3_hook.cc atexit dump format so existing
-        // bench tools that grep for `lower=` / `compile=` / `run=`
-        // / `bridge=` keep working.  bridge=0.000 because the
-        // v3-direct path doesn't bridge into TW (any TW call is via
-        // a primop callback, which is counted under run_ms here).
+        // Sum bridge time (TW-side) from the per-kind telemetry so
+        // we can report the v3-VM / TW split.  Returns 0 unless
+        // NIX_V3_BRIDGE_TIMING=1 was set; in that case the bridge
+        // callbacks accumulate wall-time at each call site.
+        double bridge_ms = bridgeTotalNs() / 1e6;
+        // VM-time is run_ms minus bridge_ms (the time spent inside
+        // TW callbacks reached from v3, otherwise accounted under
+        // run).  Clamp negative (clock granularity) to 0.
+        double vm_ms = run_ms - bridge_ms;
+        if (vm_ms < 0) vm_ms = 0;
         std::fprintf(stderr,
-            "v3-direct timing (ms): lower=%.3f optimise=%.3f compile=%.3f run=%.3f bridge=0.000\n",
-            lower_ms, optimise_ms, compile_ms, run_ms);
+            "v3-direct timing (ms): lower=%.3f optimise=%.3f compile=%.3f "
+            "run=%.3f vm=%.3f bridge=%.3f\n",
+            lower_ms, optimise_ms, compile_ms, run_ms, vm_ms, bridge_ms);
+        // If bridge timing is enabled, also dump the per-kind
+        // breakdown so we can see WHERE the TW time goes.
+        if (bridgeTimingEnabled())
+            dumpBridgeTelemetry(stderr);
     }
 private:
     static bool s_active()
