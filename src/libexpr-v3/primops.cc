@@ -633,23 +633,47 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
         return out;
     }
     case Tag::Attrs: {
-        // Tree-walker: try __toString first (call it on the attrset),
-        // then outPath.  v3 doesn't yet wire calling __toString from
-        // a primop context — fall through to outPath only.
+        // TW behaviour: try __toString first (call it on the attrset),
+        // then fall through to outPath.  See libexpr/eval.cc:2865.
         if (v.payload.bindings) {
-            // outPath is the more common path in nixpkgs (every
-            // derivation has it); __toString is rarer.  Intern locally
-            // — drvStrictSymbols() lives in BR-3 territory and isn't
-            // forward-decl'd up here.
+            static const SymbolId sToString =
+                ir::globalInternSymbol("__toString");
             static const SymbolId sOutPath =
                 ir::globalInternSymbol("outPath");
+            // __toString: call it with `self` as the single arg, then
+            // recursively coerce the result.  Only fires for callable
+            // shapes; non-callable falls through to outPath.
+            if (auto * tsRaw = v.payload.bindings->lookup(sToString)) {
+                Value tsFn = forceValue(*state.vm, *tsRaw);
+                if (tsFn.isClosure() || tsFn.isPrimOp()
+                    || tsFn.tag() == Tag::PrimOpApp) {
+                    Value res = callClosure(*state.vm, tsFn, v);
+                    Value forced = forceValue(*state.vm, res);
+                    return toStringCoerceCtx(state, forced, ctx);
+                }
+                // non-callable: fall through to outPath
+            }
             if (auto * outV = v.payload.bindings->lookup(sOutPath)) {
                 Value forced = forceValue(*state.vm, *outV);
                 return toStringCoerceCtx(state, forced, ctx);
             }
+            // Include keys in the error for diagnosability.
+            const auto & symTab = ir::globalSymbolTable();
+            std::string msg = "v3 toString: attrset has no outPath / "
+                              "__toString; keys=[";
+            uint32_t lim = std::min<uint32_t>(v.payload.bindings->size, 12u);
+            for (uint32_t i = 0; i < lim; ++i) {
+                SymbolId sid = v.payload.bindings->entries[i].name;
+                if (i) msg += ",";
+                msg += (sid < symTab.size())
+                    ? symTab[sid] : std::string("<sid?>");
+            }
+            if (v.payload.bindings->size > lim) msg += ",...";
+            msg += "]";
+            throw std::runtime_error(msg);
         }
         throw std::runtime_error(
-            "v3 toString: attrset has no outPath / __toString");
+            "v3 toString: null-bindings attrset");
     }
     case Tag::Thunk: {
         // #483 part 4: Bridge thunk wrapping a TW value -- force the
@@ -4524,9 +4548,25 @@ static std::string v3CoerceToString(
                 return v3CoerceToString(state, forced, context, errorCtx);
             }
         }
-        throw std::runtime_error(
-            "v3 BR-3 coerceToString: attrset has neither "
-            "__toString nor outPath");
+        // Include the attrset's keys in the error so callers (and
+        // V3_DRV_DEBUG fallback diagnostics) can see WHICH attrset
+        // failed coercion.  Truncate to first 12 keys to avoid log
+        // bloat on huge attrsets.
+        std::string msg = "v3 BR-3 coerceToString: attrset has neither "
+                          "__toString nor outPath; keys=[";
+        if (v.payload.bindings) {
+            const auto & symTab = ir::globalSymbolTable();
+            uint32_t lim = std::min<uint32_t>(v.payload.bindings->size, 12u);
+            for (uint32_t i = 0; i < lim; ++i) {
+                SymbolId sid = v.payload.bindings->entries[i].name;
+                if (i) msg += ",";
+                msg += (sid < symTab.size())
+                    ? symTab[sid] : std::string("<sid?>");
+            }
+            if (v.payload.bindings->size > lim) msg += ",...";
+        } else msg += "<no bindings>";
+        msg += "]";
+        throw std::runtime_error(msg);
     }
 
     // coerceMore = true cases (matching tree-walker's behaviour for

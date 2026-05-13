@@ -5760,7 +5760,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                         std::fflush(stderr);
                     }
-                    throw std::runtime_error("v3 OP_ATTRS_SELECT: attribute not found");
+                    // Include the missing attr name in the error so
+                    // catch-and-fallback paths (primDerivationStrict) can
+                    // surface a more useful diagnostic without the
+                    // V3_DBG_ATTRS_SELECT env var.
+                    {
+                        const auto & symTab = ir::globalSymbolTable();
+                        SymbolId want = static_cast<SymbolId>(operand);
+                        std::string nm = want < symTab.size()
+                            ? symTab[want]
+                            : std::string("<sid=") + std::to_string(want) + ">";
+                        throw std::runtime_error(
+                            "v3 OP_ATTRS_SELECT: attribute '" + nm
+                            + "' not found");
+                    }
                 }
                 // Install at the next eviction slot (round-robin).
                 auto & evicted = ic.entries[ic.evictIdx];
