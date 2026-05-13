@@ -1161,6 +1161,78 @@ namespace {
 //
 // #558 Phase 3.3 (2026-05-12): partialBindingsRegistry retired.
 
+// ---------------------------------------------------------------------------
+// A8 (2026-05-13): iterative-force writeback protocol
+// ---------------------------------------------------------------------------
+//
+// Multi-arg opcodes (OP_CALL_PRIMOP, OP_LIST_CONCAT, OP_ATTRS_UPDATE,
+// OP_STR_CONCAT, V3_IS_OP, OP_HEAD, OP_TAIL, OP_LENGTH, OP_ELEM_AT, etc.)
+// historically forced their non-lazy args via the C-recursive
+// `forceValue(vm, args[i])` helper.  Each call burns ~1.4 KiB of C-stack,
+// and deep nixpkgs evals chain through ~2000+ such forces, blowing the
+// 8 MiB macOS thread stack.
+//
+// To make these iterative without changing bytecode, opcodes use a
+// per-frame "writeback slot": before goto op_force_slow, the opcode
+//   1. Pushes a duplicate of the unforced value to top-of-stack.
+//   2. Encodes the original slot's offset (relative to stackBase) into
+//      the upper 16 bits of CallFrame::flags.
+//   3. Rewinds `ip` so the opcode re-enters after the force completes.
+//   4. Sets CFF_FORCE_RETRY and goto op_force_slow.
+//
+// When the inner force completes (either synchronously via op_force_slow's
+// Slot/Evaluated/Bridge chase OR via the thunk body's OP_RETURN), the
+// writeback helper writes the forced result into the caller's original
+// slot, pops the top duplicate, clears the writeback field, and suppresses
+// the retry chain.  The opcode re-enters its switch case, re-scans its
+// args, and either finds the next non-WHNF arg to force or proceeds with
+// all args in WHNF.
+//
+// CFF_FORCE_WB (bit 3 of flags) indicates the upper 16 bits of flags
+// encode a stack-base-relative slot offset for the writeback target.
+// When the bit is clear, forces use the legacy "push result to top of
+// stack" behavior — which OP_FORCE / OP_GET_LOCAL_FORCE /
+// OP_GET_UPVALUE_FORCE and the 7 single-arg branch opcodes (OP_NOT,
+// OP_*_BRANCH, OP_ATTRS_SELECT, OP_REC_BINDING_SLOT_REF) rely on.
+//
+// We cannot use a sentinel value in the upper 16 bits because a fresh
+// CallFrame has flags=0, which would collide with "slot 0".  An
+// explicit flag bit is unambiguous.
+
+constexpr uint32_t CFF_FORCE_WB = 1u << 3;
+
+inline uint16_t getForceWriteback(const CallFrame & f) noexcept
+{
+    return static_cast<uint16_t>(f.flags >> 16);
+}
+
+inline void setForceWriteback(CallFrame & f, uint16_t off) noexcept
+{
+    f.flags = (f.flags & 0x0000FFFFu) | (static_cast<uint32_t>(off) << 16)
+            | CFF_FORCE_WB;
+}
+
+inline void clearForceWriteback(CallFrame & f) noexcept
+{
+    f.flags &= 0x0000FFFFu & ~CFF_FORCE_WB;
+}
+
+/// Apply pending writeback if any: top-of-stack holds the forced value;
+/// write it into the caller's recorded slot and pop top.  Returns true
+/// when a writeback was applied (so callers can suppress the
+/// CFF_FORCE_RETRY chain — the opcode will re-scan on re-entry).
+inline bool applyForceWriteback(VMState & vm) noexcept
+{
+    CallFrame & f = vm.frames.back();
+    if (!(f.flags & CFF_FORCE_WB)) return false;
+    uint16_t off = getForceWriteback(f);
+    Value forced = vm.valueStack.back();
+    vm.valueStack.pop_back();
+    vm.valueStack[f.stackBaseOffset + off] = forced;
+    clearForceWriteback(f);
+    return true;
+}
+
 /// Run the dispatch loop on `vm` until either:
 ///   - OP_HALT is reached (top-level exit), or
 ///   - The frame stack is popped down to `exitDepth` (used by inner
@@ -4095,6 +4167,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     }
                 }
                 push(vm, retVal);
+                // A8: iterative-force writeback.  When the caller set a
+                // writeback slot before goto op_force_slow, write the
+                // forced retVal back into the original arg slot and
+                // suppress the retry chain — the opcode that initiated
+                // the force will re-scan its args on re-entry.
+                if (applyForceWriteback(vm))
+                    retry = false;
                 if (retry)
                     goto op_force_slow;
             }
@@ -4205,7 +4284,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     opForceCompressChain[i]->evaluated = v;
             }
             } // end forceChaseIters scope
-            if (!v.isThunk()) { push(vm, v); break; }
+            if (!v.isThunk()) {
+                push(vm, v);
+                // A8: apply writeback if the opcode that initiated this
+                // force set a writeback slot.  No-op when off==FORCE_WB_NONE.
+                applyForceWriteback(vm);
+                break;
+            }
             Thunk * t = v.payload.thunk;
             if (t->state == ThunkState::Blackhole) {
                 // WC-17.1 diagnostic: dump the v3 frame stack with
@@ -4293,6 +4378,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                         if (!onMyFrames) {
                             push(vm, Value::vBlackhole);
+                            applyForceWriteback(vm);
                             break;
                         }
                     }
@@ -4337,6 +4423,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 if (resolved.tag() == Tag::Thunk
                     && resolved.payload.thunk == t) {
                     push(vm, resolved);
+                    applyForceWriteback(vm);
                     break;
                 }
                 t->state = ThunkState::Evaluated;
@@ -4356,6 +4443,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     t->cell = nullptr;
                 }
                 push(vm, resolved);
+                applyForceWriteback(vm);
                 break;
             }
             // Suspended: blackhole and run.
@@ -7118,42 +7206,61 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
         case OP_CALL_PRIMOP: {
             uint32_t nArgs = operand;
-            uint32_t poIdx = cu->code[ip++];
+            // A8 (2026-05-13): iterative-force pattern.  Read poIdx by
+            // peek (NOT `ip++`) so a rewind cleanly re-enters this case
+            // after an inner force completes.  We advance past poIdx
+            // only once all strict args are confirmed WHNF.
+            uint32_t poIdx = cu->code[ip];
             const PrimOp * po = cu->primops[poIdx];
+            if (nArgs > 8) throw std::runtime_error("v3 OP_CALL_PRIMOP: arity > 8 not supported");
+            // Args occupy the top `nArgs` slots of valueStack, with arg0
+            // at the deepest and arg(N-1) at the top.  Scan them in
+            // place — peek without popping — so we can rewind and
+            // re-enter cleanly if a non-WHNF strict arg needs forcing.
+            // A8 supersedes the previous C-recursive
+            // `args[i] = forceValue(vm, args[i])` loop, which burned one
+            // C-stack frame per nested force and overflowed at ~3000
+            // levels deep on nixpkgs.
+            {
+                size_t argBase = vm.valueStack.size() - nArgs;
+                for (uint32_t k = 0; k < nArgs; ++k) {
+                    if (po->lazyArgs & (1u << k)) continue;
+                    Value & a = vm.valueStack[argBase + k];
+                    Tag t = a.tag();
+                    if (t == Tag::Thunk || t == Tag::App || t == Tag::Slot) {
+                        // Set up writeback: duplicate the unforced
+                        // value to top-of-stack, encode the original
+                        // slot's offset (relative to stackBase) in the
+                        // upper 16 bits of the caller frame's flags,
+                        // rewind ip to OP_CALL_PRIMOP, set
+                        // CFF_FORCE_RETRY, and goto op_force_slow.
+                        // After the force completes (synchronously via
+                        // chase, or via OP_RETURN of the thunk body),
+                        // applyForceWriteback writes the forced result
+                        // into the arg slot and the opcode re-enters
+                        // for another scan.
+                        uint32_t off = static_cast<uint32_t>((argBase + k) - stackBase);
+                        // Defensive: 16-bit slot offset capacity.
+                        if (__builtin_expect(off > 0xFFFFu, 0))
+                            throw std::runtime_error(
+                                "v3 OP_CALL_PRIMOP: writeback slot offset too large");
+                        push(vm, a);
+                        CallFrame & frame = vm.frames.back();
+                        setForceWriteback(frame, static_cast<uint16_t>(off));
+                        frame.flags |= CFF_FORCE_RETRY;
+                        ip = ip - 1;  // rewind to re-enter this OP_CALL_PRIMOP
+                        goto op_force_slow;
+                    }
+                }
+            }
+            // All strict args are WHNF.  Advance past poIdx and call.
+            ip++;
             // Profiling counter (gated on NIX_VM_STATS at process exit).
             // The bump is unconditional — the primop dispatch already
             // does substantially more work, so the cost is invisible.
             bumpPrimOpCallCount(po);
             Value args[8];
-            if (nArgs > 8) throw std::runtime_error("v3 OP_CALL_PRIMOP: arity > 8 not supported");
             for (uint32_t i = nArgs; i > 0; --i) args[i - 1] = pop(vm);
-            // WC-38 fix: force non-lazy strict args at runtime via
-            // the C-recursive forceValue helper.  This replaced the
-            // compile-time force at lower.cc:787 (`forceVal(lowerExpr
-            // (*it))`), which emitted inline OP_GET_LOCAL_FORCE / OP_
-            // GET_UPVALUE_FORCE / OP_FORCE in the calling bytecode
-            // stream.  The bytecode-level force fired thunk frames
-            // inside the caller's CFF_FORCE_RETRY chain — driving
-            // sub-thunk evaluation deeper than tree-walker's
-            // recursive C-stack — and during nixpkgs's `lib.fix x`
-            // body it fired the inner `callPackages ../llvm { }`
-            // thunk while pkgs (lib.fix x slot) was still Black.
-            //
-            // The C-recursive forceValue does NOT set CFF_FORCE_
-            // RETRY, so each Suspended thunk fully resolves (and
-            // becomes Evaluated) BEFORE the next runs — matching
-            // tree-walker's call-stack semantics exactly.
-            //
-            // `po->lazyArgs` bit i set ⇒ arg i is passed lazily;
-            // primops with lazy args (tryEval, foldl', seq, deepSeq,
-            // addErrorContext) force inside their bodies inside any
-            // try/catch they need.  Mirrors OP_CALL's primop branch
-            // at vm.cc:1155-1158 (which handles PrimOpApp partial-
-            // application chains).
-            for (uint32_t i = 0; i < nArgs; ++i) {
-                if (po->lazyArgs & (1u << i)) continue;
-                args[i] = forceValue(vm, args[i]);
-            }
             // Save current frame state in case the primop calls back
             // into the VM via callClosure().
             vm.frames.back().ip = ip;
