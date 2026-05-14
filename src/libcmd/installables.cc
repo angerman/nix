@@ -461,16 +461,42 @@ Installables SourceExprCommand::parseInstallables(ref<Store> store, std::vector<
         auto state = getEvalState();
         auto vFile = state->allocValue();
 
+        // v3-direct (NIX_V3_DIRECT_EVAL=1) parses cmd.expr / cmd.file
+        // itself inside runV3DirectEval and never reads *vFile.  When
+        // the flag is set we therefore skip the unconditional TW
+        // `state->eval(e, *vFile)` here and only parse + thunkify so
+        // *vFile is a valid Tag::Thunk in case the v3-direct path
+        // returns false and TW takes over (toValue's forceValue will
+        // run the eval at that point).  Saves a full duplicate
+        // evaluation of the input expression on every v3-direct query
+        // and removes ~hundreds of thousands of TW pre-eval events
+        // from the NIX_TRACE_EVAL trace so v3's behaviour is the
+        // first thing the diff sees.
+        static const bool s_v3DirectEval =
+            std::getenv("NIX_V3_DIRECT_EVAL") != nullptr;
+
         if (file == "-") {
             auto e = state->parseStdin();
-            state->eval(e, *vFile);
+            if (s_v3DirectEval)
+                vFile->mkThunk(&state->baseEnv, e);
+            else
+                state->eval(e, *vFile);
         } else if (file) {
             auto dir = absPath(getCommandBaseDir());
-            state->evalFile(lookupFileArg(*state, file->string(), &dir), *vFile);
+            if (s_v3DirectEval) {
+                auto e = state->parseExprFromFile(
+                    lookupFileArg(*state, file->string(), &dir));
+                vFile->mkThunk(&state->baseEnv, e);
+            } else {
+                state->evalFile(lookupFileArg(*state, file->string(), &dir), *vFile);
+            }
         } else {
             auto dir = absPath(getCommandBaseDir());
             auto e = state->parseExprFromString(*expr, state->rootPath(dir.string()));
-            state->eval(e, *vFile);
+            if (s_v3DirectEval)
+                vFile->mkThunk(&state->baseEnv, e);
+            else
+                state->eval(e, *vFile);
         }
 
         for (auto & s : ss) {
