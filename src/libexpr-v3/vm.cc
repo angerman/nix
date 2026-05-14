@@ -1249,6 +1249,55 @@ inline bool applyForceWriteback(VMState & vm) noexcept
     return true;
 }
 
+/// NIX_TRACE_EVAL helpers used by OP_FORCE / OP_RETURN to emit
+/// F / W events whenever a CFF_THUNK_RETURN frame is pushed or
+/// popped.  Definitions hoisted here so both dispatchLoop (which
+/// contains OP_FORCE / OP_RETURN) and forceValue (defined later)
+/// can call them with consistent formatting.
+static inline std::string v3ValueTypeName(Value v)
+{
+    switch (v.tag()) {
+    case Tag::Int:       return "Int";
+    case Tag::Float:     return "Float";
+    case Tag::Bool:      return "Bool";
+    case Tag::Null:      return "Null";
+    case Tag::String:    return "String";
+    case Tag::Path:      return "Path";
+    case Tag::List: {
+        char b[32];
+        std::snprintf(b, sizeof b, "List(%zu)",
+            v.payload.list ? (size_t)v.payload.list->size : (size_t)0);
+        return b;
+    }
+    case Tag::Attrs: {
+        char b[32];
+        std::snprintf(b, sizeof b, "Attrs(%zu)",
+            v.payload.bindings ? (size_t)v.payload.bindings->size : (size_t)0);
+        return b;
+    }
+    case Tag::Closure:   return "Lambda";
+    case Tag::PrimOp:    return "Lambda";
+    case Tag::PrimOpApp: return "Lambda";
+    case Tag::Thunk:     return "Thunk";
+    case Tag::App:       return "App";
+    case Tag::Blackhole: return "Blackhole";
+    case Tag::External:  return "External";
+    case Tag::Slot:      return "Slot";
+    case Tag::Uninitialized: return "Uninitialized";
+    }
+    return "?";
+}
+
+static inline std::string v3ThunkTracePos(const Thunk * t)
+{
+    if (!t) return "<no-pos>";
+    const LambdaDescriptor * d = t->suspended.desc;
+    if (!d) return "<no-pos>";
+    const PosSnapshot * ps = resolvePosSnapshot(d->posHandle);
+    if (!ps || ps->file.empty()) return "<no-pos>";
+    return nix::evalTrace::formatPos(ps->file, ps->line, ps->column);
+}
+
 /// Run the dispatch loop on `vm` until either:
 ///   - OP_HALT is reached (top-level exit), or
 ///   - The frame stack is popped down to `exitDepth` (used by inner
@@ -3667,6 +3716,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             CallFrame fr;  // referenced by name later — only thunk + flags matter.
             fr.flags = fFlags;
             fr.thunk = fThunk;
+            // NIX_TRACE_EVAL: W event for OP_RETURN of any
+            // CFF_THUNK_RETURN frame.  Pairs with the F emitted at
+            // OP_FORCE's or forceValue's frame push.  Uses the popped
+            // closure's desc (fClosure->desc) which is identical to
+            // the suspended.desc that produced the F.  Cheap when
+            // disabled (one FILE* null check).
+            if (__builtin_expect(nix::evalTrace::enabled(), 0)
+                && (fFlags & CFF_THUNK_RETURN) && fClosure && fClosure->desc) {
+                const PosSnapshot * ps =
+                    resolvePosSnapshot(fClosure->desc->posHandle);
+                std::string posStr =
+                    (ps && !ps->file.empty())
+                        ? nix::evalTrace::formatPos(ps->file, ps->line, ps->column)
+                        : std::string("<no-pos>");
+                nix::evalTrace::leaveWhnf(posStr, v3ValueTypeName(retVal));
+            }
             if (fFlags & CFF_THUNK_RETURN) {
                 // Chase Evaluated chains so the thunk caches the
                 // ultimate WHNF and not an intermediate thunk.
@@ -4760,6 +4825,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
 
+            // NIX_TRACE_EVAL: F event for OP_FORCE's CFF_THUNK_RETURN
+            // frame push.  Paired W is emitted by OP_RETURN's
+            // CFF_THUNK_RETURN branch when this frame pops.
+            // Conditional-cheap (single FILE* null check when disabled).
+            if (__builtin_expect(nix::evalTrace::enabled(), 0)) {
+                const PosSnapshot * ps = resolvePosSnapshot(desc->posHandle);
+                std::string posStr =
+                    (ps && !ps->file.empty())
+                        ? nix::evalTrace::formatPos(ps->file, ps->line, ps->column)
+                        : std::string("<no-pos>");
+                nix::evalTrace::enterForce(posStr);
+            }
             vm.frames.push_back(CallFrame{
                 .cu = thunkCu,
                 .closure = fakeClo,
@@ -8278,55 +8355,8 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
     return dispatchAndClear(vm);
 }
 
-/// Counterpart to libexpr/eval-inline.hh's `twValueTypeName`.  Returns
-/// short label strings ("Int", "Attrs(N)", "Lambda", ...) used by the
-/// NIX_TRACE_EVAL emitter so v3's trace lines diff cleanly against TW's.
-static inline std::string v3ValueTypeName(Value v)
-{
-    switch (v.tag()) {
-    case Tag::Int:       return "Int";
-    case Tag::Float:     return "Float";
-    case Tag::Bool:      return "Bool";
-    case Tag::Null:      return "Null";
-    case Tag::String:    return "String";
-    case Tag::Path:      return "Path";
-    case Tag::List: {
-        char b[32];
-        std::snprintf(b, sizeof b, "List(%zu)",
-            v.payload.list ? (size_t)v.payload.list->size : (size_t)0);
-        return b;
-    }
-    case Tag::Attrs: {
-        char b[32];
-        std::snprintf(b, sizeof b, "Attrs(%zu)",
-            v.payload.bindings ? (size_t)v.payload.bindings->size : (size_t)0);
-        return b;
-    }
-    case Tag::Closure:   return "Lambda";
-    case Tag::PrimOp:    return "Lambda";
-    case Tag::PrimOpApp: return "Lambda";
-    case Tag::Thunk:     return "Thunk";
-    case Tag::App:       return "App";
-    case Tag::Blackhole: return "Blackhole";
-    case Tag::External:  return "External";
-    case Tag::Slot:      return "Slot";
-    case Tag::Uninitialized: return "Uninitialized";
-    }
-    return "?";
-}
-
-/// Build the canonical "file:line:col" string for NIX_TRACE_EVAL from
-/// a Thunk's LambdaDescriptor.  Returns "<no-pos>" when the descriptor
-/// has no source.
-static inline std::string v3ThunkTracePos(const Thunk * t)
-{
-    if (!t) return "<no-pos>";
-    const LambdaDescriptor * d = t->suspended.desc;
-    if (!d) return "<no-pos>";
-    const PosSnapshot * ps = resolvePosSnapshot(d->posHandle);
-    if (!ps || ps->file.empty()) return "<no-pos>";
-    return nix::evalTrace::formatPos(ps->file, ps->line, ps->column);
-}
+// v3ValueTypeName, v3ThunkTracePos and v3DescTracePos: hoisted above
+// dispatchLoop so OP_FORCE / OP_RETURN can call them.
 
 Value forceValue(VMState & vm, Value v)
 {
@@ -9137,16 +9167,15 @@ Value forceValue(VMState & vm, Value v)
         }
 
         const LambdaDescriptor * desc = t->suspended.desc;
-        // NIX_TRACE_EVAL: canonical eval-order trace.  Schema-identical
-        // to libexpr/eval-inline.hh's TW emitter, so the two outputs are
-        // diff-aligned line-for-line.  Scope's dtor distinguishes
-        // success (W <type>) from exception (B) via
-        // std::uncaught_exceptions(); recordWhnf is called on the
-        // success path just before scope exit below.
-        std::optional<nix::evalTrace::Scope> tr;
-        if (__builtin_expect(nix::evalTrace::enabled(), 0)) {
-            tr.emplace(v3ThunkTracePos(t));
-        }
+        // NIX_TRACE_EVAL: emit F at the about-to-push point.  The
+        // matching W is emitted by OP_RETURN's CFF_THUNK_RETURN branch
+        // (3925-ish) when the frame pops, so the F/W pair brackets the
+        // entire thunk-body evaluation including all nested forces.
+        // The depth counter (`nix::evalTrace::depthRef`) tracks active
+        // CFF_THUNK_RETURN frames and aligns the trace shape between
+        // OP_FORCE-driven and forceValue-driven thunk pushes.
+        if (__builtin_expect(nix::evalTrace::enabled(), 0))
+            nix::evalTrace::enterForce(v3ThunkTracePos(t));
         // #558 Phase 4: pull a fakeClo from the thread-local pool when
         // available; OP_RETURN's CFF_THUNK_RETURN handler will recycle
         // it after the body completes (the frame we push below has
@@ -9249,11 +9278,10 @@ Value forceValue(VMState & vm, Value v)
                 "thunk=%p Suspended\n", (void*)t);
             t->state = ThunkState::Suspended;
         }
-        // NIX_TRACE_EVAL: record the WHNF type of `v` so the scope's
-        // dtor emits "W <depth> <pos> -> <ty>" on the way out.  No-op
-        // when tracing is disabled.  Must come AFTER all post-dispatch
-        // cleanup so `v` is in its final form.
-        if (tr) tr->recordWhnf(v3ValueTypeName(v));
+        // NIX_TRACE_EVAL: the matching W for the F emitted at frame-
+        // push (above) is produced by OP_RETURN's CFF_THUNK_RETURN
+        // branch when the thunk body's OP_RETURN runs inside the
+        // dispatchLoop above.  No emit needed here.
     }
     // SECD-style slot memoization: write the resolved value back into
     // the slot we entered through.  Future Tag::Slot derefs through
