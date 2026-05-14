@@ -36,6 +36,7 @@ headers = [ config_pub_h ] + files(
   'demangle.hh',
   'english.hh',
   'environment-variables.hh',
+  'eval-trace.hh',
   'error.hh',
   'exec.hh',
   'executable-path.hh',

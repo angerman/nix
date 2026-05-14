@@ -5,9 +5,47 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/util/eval-trace.hh"
 #include <exception>
+#include <optional>
 
 namespace nix {
+
+/// Cheap WHNF-type string formatter for NIX_TRACE_EVAL.  Returns
+/// short labels like "Int" / "Attrs(11)" / "Lambda" that v3's
+/// counterpart (vm.cc:v3ValueTypeName) emits in identical shape so
+/// the two traces are diff-aligned line-for-line.
+inline std::string twValueTypeName(const Value & v)
+{
+    switch (v.type()) {
+    case nInt: return "Int";
+    case nFloat: return "Float";
+    case nBool: return "Bool";
+    case nNull: return "Null";
+    case nString: return "String";
+    case nPath: return "Path";
+    case nList: {
+        char b[32];
+        std::snprintf(b, sizeof b, "List(%zu)", v.listSize());
+        return b;
+    }
+    case nAttrs: {
+        char b[32];
+        std::snprintf(b, sizeof b, "Attrs(%zu)",
+            v.attrs() ? v.attrs()->size() : (size_t)0);
+        return b;
+    }
+    case nFunction: return "Lambda";
+    case nExternal: return "External";
+    case nThunk: {
+        if (v.isBlackhole()) return "Blackhole";
+        if (v.isApp()) return "App";
+        return "Thunk";
+    }
+    case nFailed: return "Failed";
+    }
+    return "?";
+}
 
 /**
  * Note: Various places expect the allocated memory to be zeroed.
@@ -134,6 +172,27 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
                     }
                 }
             }
+            // NIX_TRACE_EVAL: canonical eval-order trace, schema-identical
+            // to v3's emitter (see src/libexpr-v3/vm.cc forceValue).  RAII
+            // Scope handles both the WHNF emit on success and the B emit
+            // on exception (via std::uncaught_exceptions()).
+            std::optional<nix::evalTrace::Scope> tr;
+            if (__builtin_expect(nix::evalTrace::enabled(), 0)) {
+                std::string posStr;
+                auto p = expr->getPos();
+                if (p) {
+                    try {
+                        auto rp = positions[p];
+                        std::string srcFile;
+                        if (auto * sp = std::get_if<nix::SourcePath>(&rp.origin))
+                            srcFile = sp->path.abs();
+                        posStr = nix::evalTrace::formatPos(srcFile, rp.line, rp.column);
+                    } catch (...) { posStr = "<bad-pos>"; }
+                } else {
+                    posStr = "<no-pos>";
+                }
+                tr.emplace(std::move(posStr));
+            }
             try {
                 v.mkBlackhole();
                 if (env) [[likely]] {
@@ -147,6 +206,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             }
             // If result is still a thunk/app, loop to resolve the chain
             // iteratively (no C stack growth from recursive forceValue).
+            if (tr) tr->recordWhnf(twValueTypeName(v));
             if (v.isThunk() || v.isApp()) {
                 nrThunkChains++;
                 continue;
@@ -159,6 +219,26 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             Value * right = v.app().right;
             Value savedApp = v;
             v.mkBlackhole();
+            // NIX_TRACE_EVAL: App force has no expr position; fall back
+            // to the caller's `pos`.  Tagged as `<app>` in the file
+            // column so it's distinguishable from a thunk-from-expr.
+            std::optional<nix::evalTrace::Scope> tr;
+            if (__builtin_expect(nix::evalTrace::enabled(), 0)) {
+                std::string posStr;
+                if (pos) {
+                    try {
+                        auto rp = positions[pos];
+                        std::string srcFile;
+                        if (auto * sp = std::get_if<nix::SourcePath>(&rp.origin))
+                            srcFile = sp->path.abs();
+                        posStr = nix::evalTrace::formatPos(srcFile, rp.line, rp.column);
+                        posStr += " <app>";
+                    } catch (...) { posStr = "<bad-pos> <app>"; }
+                } else {
+                    posStr = "<no-pos> <app>";
+                }
+                tr.emplace(std::move(posStr));
+            }
             try {
                 callFunction(*left, *right, v, pos);
             } catch (...) {
@@ -166,6 +246,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
                 handleEvalExceptionForApp(v, savedApp);
                 throw;
             }
+            if (tr) tr->recordWhnf(twValueTypeName(v));
             if (v.isThunk() || v.isApp()) {
                 nrThunkChains++;
                 continue;

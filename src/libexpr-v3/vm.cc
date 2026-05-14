@@ -27,6 +27,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/canon-path.hh"
+#include "nix/util/eval-trace.hh"
 
 #include <algorithm>
 #include <cassert>
@@ -34,6 +35,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <set>
 #include <unordered_set>
 #include <stdexcept>
@@ -8276,6 +8278,56 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
     return dispatchAndClear(vm);
 }
 
+/// Counterpart to libexpr/eval-inline.hh's `twValueTypeName`.  Returns
+/// short label strings ("Int", "Attrs(N)", "Lambda", ...) used by the
+/// NIX_TRACE_EVAL emitter so v3's trace lines diff cleanly against TW's.
+static inline std::string v3ValueTypeName(Value v)
+{
+    switch (v.tag()) {
+    case Tag::Int:       return "Int";
+    case Tag::Float:     return "Float";
+    case Tag::Bool:      return "Bool";
+    case Tag::Null:      return "Null";
+    case Tag::String:    return "String";
+    case Tag::Path:      return "Path";
+    case Tag::List: {
+        char b[32];
+        std::snprintf(b, sizeof b, "List(%zu)",
+            v.payload.list ? (size_t)v.payload.list->size : (size_t)0);
+        return b;
+    }
+    case Tag::Attrs: {
+        char b[32];
+        std::snprintf(b, sizeof b, "Attrs(%zu)",
+            v.payload.bindings ? (size_t)v.payload.bindings->size : (size_t)0);
+        return b;
+    }
+    case Tag::Closure:   return "Lambda";
+    case Tag::PrimOp:    return "Lambda";
+    case Tag::PrimOpApp: return "Lambda";
+    case Tag::Thunk:     return "Thunk";
+    case Tag::App:       return "App";
+    case Tag::Blackhole: return "Blackhole";
+    case Tag::External:  return "External";
+    case Tag::Slot:      return "Slot";
+    case Tag::Uninitialized: return "Uninitialized";
+    }
+    return "?";
+}
+
+/// Build the canonical "file:line:col" string for NIX_TRACE_EVAL from
+/// a Thunk's LambdaDescriptor.  Returns "<no-pos>" when the descriptor
+/// has no source.
+static inline std::string v3ThunkTracePos(const Thunk * t)
+{
+    if (!t) return "<no-pos>";
+    const LambdaDescriptor * d = t->suspended.desc;
+    if (!d) return "<no-pos>";
+    const PosSnapshot * ps = resolvePosSnapshot(d->posHandle);
+    if (!ps || ps->file.empty()) return "<no-pos>";
+    return nix::evalTrace::formatPos(ps->file, ps->line, ps->column);
+}
+
 Value forceValue(VMState & vm, Value v)
 {
     // A8 (2026-05-13): the previous Phase-A7 hard-abort at VM frame
@@ -9085,6 +9137,16 @@ Value forceValue(VMState & vm, Value v)
         }
 
         const LambdaDescriptor * desc = t->suspended.desc;
+        // NIX_TRACE_EVAL: canonical eval-order trace.  Schema-identical
+        // to libexpr/eval-inline.hh's TW emitter, so the two outputs are
+        // diff-aligned line-for-line.  Scope's dtor distinguishes
+        // success (W <type>) from exception (B) via
+        // std::uncaught_exceptions(); recordWhnf is called on the
+        // success path just before scope exit below.
+        std::optional<nix::evalTrace::Scope> tr;
+        if (__builtin_expect(nix::evalTrace::enabled(), 0)) {
+            tr.emplace(v3ThunkTracePos(t));
+        }
         // #558 Phase 4: pull a fakeClo from the thread-local pool when
         // available; OP_RETURN's CFF_THUNK_RETURN handler will recycle
         // it after the body completes (the frame we push below has
@@ -9187,6 +9249,11 @@ Value forceValue(VMState & vm, Value v)
                 "thunk=%p Suspended\n", (void*)t);
             t->state = ThunkState::Suspended;
         }
+        // NIX_TRACE_EVAL: record the WHNF type of `v` so the scope's
+        // dtor emits "W <depth> <pos> -> <ty>" on the way out.  No-op
+        // when tracing is disabled.  Must come AFTER all post-dispatch
+        // cleanup so `v` is in its final form.
+        if (tr) tr->recordWhnf(v3ValueTypeName(v));
     }
     // SECD-style slot memoization: write the resolved value back into
     // the slot we entered through.  Future Tag::Slot derefs through
