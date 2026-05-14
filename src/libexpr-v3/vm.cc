@@ -8740,29 +8740,43 @@ Value forceValue(VMState & vm, Value v)
                 // the wrong union variant and the resulting `desc->name`
                 // segfaults silently, terminating the dump after one
                 // frame.  Guard the read.
-                auto frameInfo = [&](Thunk * th, const Closure * cl, uint32_t fip) -> std::string {
+                auto frameInfo = [&](Thunk * th, const Closure * cl, uint32_t /*fip*/) -> std::string {
                     const LambdaDescriptor * desc = nullptr;
                     if (th && (th->state == ThunkState::Suspended
                             || th->state == ThunkState::Blackhole))
                         desc = th->suspended.desc;
                     else if (cl) desc = cl->desc;
                     if (!desc) return "<closure-body>";
-                    char buf[256];
-                    std::snprintf(buf, sizeof buf,
-                        "%s code=[%u..) nUp=%u nLocals=%u",
-                        !desc->name.empty() ? desc->name.c_str() : "<anon>",
-                        desc->codeOffset, desc->nUpvalues, desc->nLocals);
+                    char buf[512];
+                    const PosSnapshot * ps =
+                        desc->posHandle ? resolvePosSnapshot(desc->posHandle) : nullptr;
+                    if (ps && !ps->file.empty()) {
+                        std::snprintf(buf, sizeof buf,
+                            "%s code=[%u..) nUp=%u nLocals=%u @ %s:%u:%u",
+                            !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                            desc->codeOffset, desc->nUpvalues, desc->nLocals,
+                            ps->file.c_str(), ps->line, ps->column);
+                    } else {
+                        std::snprintf(buf, sizeof buf,
+                            "%s code=[%u..) nUp=%u nLocals=%u",
+                            !desc->name.empty() ? desc->name.c_str() : "<anon>",
+                            desc->codeOffset, desc->nUpvalues, desc->nLocals);
+                    }
                     return buf;
                 };
                 const LambdaDescriptor * tdesc =
                     (t && (t->state == ThunkState::Suspended
                         || t->state == ThunkState::Blackhole))
                     ? t->suspended.desc : nullptr;
+                const PosSnapshot * tps = (tdesc && tdesc->posHandle)
+                    ? resolvePosSnapshot(tdesc->posHandle) : nullptr;
                 std::fprintf(stderr,
-                    "v3 forceValue Black thunk=%p frames=%zu desc.name=%s desc.code=%u\n",
+                    "v3 forceValue Black thunk=%p frames=%zu desc.name=%s desc.code=%u @ %s:%u:%u\n",
                     (void*)t, vm.frames.size(),
                     (tdesc && !tdesc->name.empty()) ? tdesc->name.c_str() : "<anon>",
-                    tdesc ? tdesc->codeOffset : 0);
+                    tdesc ? tdesc->codeOffset : 0,
+                    (tps && !tps->file.empty()) ? tps->file.c_str() : "<no-pos>",
+                    tps ? tps->line : 0u, tps ? tps->column : 0u);
                 size_t lim = vm.frames.size();
                 ssize_t blackIdx = -1;
                 for (size_t i = lim; i > 0; --i) {
