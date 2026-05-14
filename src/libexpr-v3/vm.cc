@@ -7375,7 +7375,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // Eliminates the recursive `forceValue` chain that
                 // primConcatLists / primMap / primFoldl' had built up
                 // (3500+ levels on nixpkgs derivation construction).
-                if (po->deepForceList) {
+                static const bool s_noDeepForce =
+                    std::getenv("NIX_V3_NO_DEEP_FORCE") != nullptr;
+                if (po->deepForceList && !s_noDeepForce) {
                     for (uint32_t k = 0; k < nArgs; ++k) {
                         if (!(po->deepForceList & (1u << k))) continue;
                         Value & a = vm.valueStack[argBase + k];
