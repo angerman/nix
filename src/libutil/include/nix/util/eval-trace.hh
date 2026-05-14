@@ -159,6 +159,18 @@ inline void leaveBlack(std::string_view pos) noexcept
         depthRef(), (int)pos.size(), pos.data());
 }
 
+/// Emit an "M" (marker) line, no depth change.  Used by callers to
+/// tag the trace with the name of an external forceValue / forceDeep
+/// call site so we can attribute top-level force entries to their
+/// origin (e.g. nix CLI eval.cc lines).  Cheap when disabled.
+inline void mark(std::string_view tag) noexcept
+{
+    FILE * f = sink();
+    if (!f) return;
+    std::fprintf(f, "M %u %.*s\n",
+        depthRef(), (int)tag.size(), tag.data());
+}
+
 /// RAII helper that emits F on construction and matching W (or B if
 /// destroyed during stack unwinding) on destruction.  Uses
 /// `std::uncaught_exceptions()` to distinguish normal exit from

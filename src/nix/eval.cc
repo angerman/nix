@@ -6,6 +6,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/util/eval-trace.hh"
 
 // v3 INVERSION step 3 (#526): when NIX_V3_DIRECT_EVAL=1 + --expr/--file
 // installable, bypass `installable->toValue` (which routes through
@@ -54,21 +55,34 @@ static bool runV3DirectEval(
     std::optional<std::string> apply,
     std::optional<std::filesystem::path> writeTo)
 {
+    nix::evalTrace::mark("eval.cc:runV3DirectEval entry");
     // --write-to is recursive directory emission; falls back to TW.
-    if (writeTo) return false;
+    if (writeTo) {
+        nix::evalTrace::mark("eval.cc:runV3DirectEval reject(writeTo)");
+        return false;
+    }
     // autoArgs not yet supported on the v3-direct path.
-    if (cmd.getAutoArgs(state)->size() > 0) return false;
+    if (cmd.getAutoArgs(state)->size() > 0) {
+        nix::evalTrace::mark("eval.cc:runV3DirectEval reject(autoArgs)");
+        return false;
+    }
 
     // We need the user's --expr / --file.  Without one of these we
     // can't reconstruct the expression for v3 (the installable's
     // already-evaluated TW Value is a one-shot bridge dead-end —
     // re-using it would defeat the inversion's purpose).
-    if (!cmd.expr && !cmd.file) return false;
+    if (!cmd.expr && !cmd.file) {
+        nix::evalTrace::mark("eval.cc:runV3DirectEval reject(no-expr/file)");
+        return false;
+    }
 
     // Only handle InstallableAttrPath shapes (the kind constructed
     // from --expr/--file + positional attrPath).  Flake installables
     // need different machinery — Phase 2.
-    if (!dynamic_cast<InstallableAttrPath *>(&installable)) return false;
+    if (!dynamic_cast<InstallableAttrPath *>(&installable)) {
+        nix::evalTrace::mark("eval.cc:runV3DirectEval reject(not InstallableAttrPath)");
+        return false;
+    }
     // Read the attrPath through the public virtual `Installable::what`
     // (the override in InstallableAttrPath is private but virtual
     // access is resolved against the static type at the call site).
@@ -97,6 +111,7 @@ static bool runV3DirectEval(
     // cu->stringConstants).  setNixEvalState is wired internally;
     // primops that need TW (import, derivation strict-merge) reach
     // back via the global pointer.
+    nix::evalTrace::mark("eval.cc:100 runRootExpr(root)");
     auto rootResult = v3::runRootExpr(state, e);
     v3::Value r = rootResult.value;
 
@@ -114,6 +129,7 @@ static bool runV3DirectEval(
     });
 
     // Force the result to WHNF so attr/list access works.
+    nix::evalTrace::mark("eval.cc:117 forceValue(root-WHNF)");
     r = v3::forceValue(vm, r);
 
     // -A attrPath descent: split on '.' and lookup successive attrs.
@@ -134,6 +150,7 @@ static bool runV3DirectEval(
                             "v3-direct -A: attribute '%1%' not found",
                             segment).debugThrow();
                     }
+                    nix::evalTrace::mark("eval.cc:137 forceValue(attrPath-segment)");
                     r = v3::forceValue(vm, *found);
                     segment.clear();
                 }
@@ -153,9 +170,12 @@ static bool runV3DirectEval(
         Expr * applyE = state.parseExprFromString(
             *apply, state.rootPath(dir.string()));
         applyE->bindVars(state, state.staticBaseEnv);
+        nix::evalTrace::mark("eval.cc:156 runRootExpr(--apply)");
         applyResult.emplace(v3::runRootExpr(state, applyE));
+        nix::evalTrace::mark("eval.cc:157 forceValue(--apply fn)");
         v3::Value applyV = v3::forceValue(vm, applyResult->value);
         r = v3::callClosure(vm, applyV, r);
+        nix::evalTrace::mark("eval.cc:159 forceValue(--apply result)");
         r = v3::forceValue(vm, r);
     }
 
@@ -166,6 +186,7 @@ static bool runV3DirectEval(
         // tracking here (we'd need to lift coerceToString into v3 for
         // full parity; that's Phase 2 work).  For now, accept only
         // already-string values.
+        nix::evalTrace::mark("eval.cc:169 forceDeep(--raw)");
         r = v3::forceDeep(vm, r);
         if (r.tag() != v3::Tag::String) {
             state.error<EvalError>(
@@ -175,10 +196,12 @@ static bool runV3DirectEval(
         std::string_view sv = r.payload.str ? r.payload.str : "";
         std::cout.write(sv.data(), (std::streamsize)sv.size());
     } else if (json) {
+        nix::evalTrace::mark("eval.cc:178 forceDeep(--json)");
         r = v3::forceDeep(vm, r);
         std::cout << v3::toJsonValue(r, v3::ir::globalSymbolTable()).dump() << "\n";
     } else {
         // Default print.  forceDeep so nested thunks render as values.
+        nix::evalTrace::mark("eval.cc:182 forceDeep(default print)");
         r = v3::forceDeep(vm, r);
         std::ostringstream os;
         v3::printNixValue(os, r, v3::ir::globalSymbolTable());
@@ -237,10 +260,13 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
 
     void run(ref<Store> store, ref<InstallableValue> installable) override
     {
+        nix::evalTrace::mark("eval.cc:CmdEval::run ENTRY");
         if (raw && json)
             throw UsageError("--raw and --json are mutually exclusive");
 
+        nix::evalTrace::mark("eval.cc:CmdEval::run before getEvalState");
         auto state = getEvalState();
+        nix::evalTrace::mark("eval.cc:CmdEval::run after getEvalState");
 
         // v3 INVERSION step 3 (#526): when NIX_V3_DIRECT_EVAL=1, try
         // the v3-direct path first.  If it handles the command (--expr/
@@ -251,12 +277,16 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
         static const bool s_directEval =
             std::getenv("NIX_V3_DIRECT_EVAL") != nullptr;
         if (s_directEval) {
+            nix::evalTrace::mark("eval.cc:CmdEval::run before runV3DirectEval");
             if (runV3DirectEval(*state, *this, *installable, raw, json,
                                  apply, writeTo)) {
+                nix::evalTrace::mark("eval.cc:CmdEval::run v3-direct returned true");
                 return;
             }
+            nix::evalTrace::mark("eval.cc:CmdEval::run v3-direct returned false, falling back");
         }
 
+        nix::evalTrace::mark("eval.cc:CmdEval::run TW installable->toValue");
         auto [v, pos] = installable->toValue(*state);
         NixStringContext context;
 
