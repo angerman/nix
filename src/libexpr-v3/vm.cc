@@ -8786,10 +8786,10 @@ Value forceValue(VMState & vm, Value v)
                     bool isBlack = (fr.thunk == t);
                     if (isBlack) blackIdx = (ssize_t)(i - 1);
                     std::fprintf(stderr,
-                        "  frame[%zu]:%s %s flags=%u ip=%u thunk=%p\n",
+                        "  frame[%zu]:%s %s flags=%u ip=%u\n",
                         i - 1, isBlack ? " <-BLACK" : "",
                         frameInfo(fr.thunk, fr.closure, fr.ip).c_str(),
-                        (unsigned)fr.flags, fr.ip, (void*)fr.thunk);
+                        (unsigned)fr.flags, fr.ip);
                 }
                 static const bool s_dbg_disasm =
                     std::getenv("V3_DBG_OPCYCLE_DISASM") != nullptr;

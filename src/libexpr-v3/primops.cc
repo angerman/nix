@@ -4829,6 +4829,30 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
         }
     }
 
+    // V3_DRV_NO_BRIDGE=1 makes the native-path throw user-visible
+    // instead of bouncing through the TW bridge.  Used to diagnose
+    // which native-path error is the actual blocker for a given
+    // workload; the bridge cascade otherwise hides the root cause
+    // behind a soup of follow-on TW-callback failures.
+    static const bool s_drvNoBridge =
+        std::getenv("V3_DRV_NO_BRIDGE") != nullptr;
+    if (__builtin_expect(s_drvNoBridge, 0)) {
+        // Native path either succeeded (returned above) or threw.
+        // If it threw, the catch above swallowed it and we're here
+        // — re-throw a generic error that includes the drv name.
+        std::string drvName = "<unknown>";
+        if (args[0].isAttrs() && args[0].payload.bindings) {
+            const auto & syms = drvStrictSymbols();
+            if (auto * nv = args[0].payload.bindings->lookup(syms.name)) {
+                if (nv->isString() && nv->payload.str)
+                    drvName = nv->payload.str;
+            }
+        }
+        throw std::runtime_error(
+            "v3 primDerivationStrict: native path failed for `" + drvName
+            + "` and V3_DRV_NO_BRIDGE=1; check V3_DRV_DEBUG output for "
+              "the underlying error");
+    }
     // If a tree-walker EvalState is wired, delegate to its real
     // `builtins.derivationStrict` so we get content-addressed
     // /nix/store paths.  Falls back to the v3 fake-store path on any
