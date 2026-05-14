@@ -9010,13 +9010,17 @@ Value forceValue(VMState & vm, Value v)
                         d = fr.thunk->suspended.desc;
                     else if (fr.closure)
                         d = fr.closure->desc;
+                    const PosSnapshot * ps =
+                        d ? resolvePosSnapshot(d->posHandle) : nullptr;
                     std::fprintf(stderr,
-                        "  [%zu] %s ip=%u thunk=%p closure=%p flags=%u%s\n",
+                        "  [%zu] %s ip=%u flags=%u pos=%s:%u:%u%s\n",
                         fi - 1,
                         d && !d->name.empty() ? d->name.c_str() : "<?>",
                         fr.ip,
-                        (void *)fr.thunk, (void *)fr.closure,
                         (unsigned)fr.flags,
+                        (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                        ps ? ps->line : 0u,
+                        ps ? ps->column : 0u,
                         fr.thunk == t ? " <-- TARGET" : "");
                 }
                 std::fflush(stderr);
