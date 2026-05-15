@@ -832,11 +832,21 @@ void primConcatLists(EvalState & state, Value * args, Value & out)
     auto & outer = args[0];
     // Force each outer element (each should be a list); they're lazy
     // by default now.
+    //
+    // Phase 1.2 step 2 (action plan): inline WHNF skip — most concatLists
+    // arguments are already-forced inner lists (the common idiom is
+    // `concatLists (map f xs)` where map returns Apps that downstream
+    // forces have already resolved).  Skip the forceValue function-call
+    // cost for those.
     for (uint32_t i = 0; i < outer.payload.list->size; ++i) {
-        outer.payload.list->elems[i] = forceValue(*state.vm, outer.payload.list->elems[i]);
-        const Value & el = outer.payload.list->elems[i];
-        if (!el.isList()) typeError("concatLists", "list of lists");
-        total += el.payload.list ? el.payload.list->size : 0;
+        Value & e = outer.payload.list->elems[i];
+        Tag et = e.tag();
+        if (__builtin_expect(et == Tag::Thunk
+                             || et == Tag::App
+                             || et == Tag::Slot, 0))
+            e = forceValue(*state.vm, e);
+        if (!e.isList()) typeError("concatLists", "list of lists");
+        total += e.payload.list ? e.payload.list->size : 0;
     }
     ListVec * result = Alloc::allocList(total);
     allocStats().listsAllocated++;
@@ -858,9 +868,18 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
     std::string sep(args[0].payload.str);
     std::string result;
     auto * list = args[1].payload.list;
+    // Phase 1.2 step 2 (action plan): inline WHNF skip — most
+    // concatStringsSep arguments are already-forced strings (the
+    // common idiom is `concatStringsSep ":" (map toString xs)` where
+    // map's per-element Apps have been resolved upstream).
     for (uint32_t i = 0; list && i < list->size; ++i) {
         if (i > 0) result += sep;
-        Value el = forceValue(*state.vm, list->elems[i]);
+        Value el = list->elems[i];
+        Tag et = el.tag();
+        if (__builtin_expect(et == Tag::Thunk
+                             || et == Tag::App
+                             || et == Tag::Slot, 0))
+            el = forceValue(*state.vm, el);
         if (!el.isString()) typeError("concatStringsSep", "list of strings");
         result += el.payload.str;
     }
