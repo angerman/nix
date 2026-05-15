@@ -2295,6 +2295,54 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             ++cu->lambdas[funcIdx].allocCount;
             if (__builtin_expect(g_dbgAllocDump, 0)) {
                 cuRegistry().insert(cu);
+                // A12 #583: periodic dump every 2M allocations since
+                // atexit doesn't fire under SIGTERM (the timeout case
+                // we're trying to debug).  Snapshot top-20 then continue.
+                static std::atomic<uint64_t> s_allocSeq{0};
+                uint64_t n = s_allocSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((n % 2000000) == 0) {
+                    struct Row {
+                        uint64_t alloc; uint64_t force;
+                        const LambdaDescriptor * d;
+                    };
+                    std::vector<Row> rows;
+                    for (auto * cu2 : cuRegistry()) {
+                        if (!cu2) continue;
+                        for (const auto & ld : cu2->lambdas) {
+                            if (ld.allocCount + ld.forceCount < 100) continue;
+                            rows.push_back({ld.allocCount, ld.forceCount, &ld});
+                        }
+                    }
+                    std::sort(rows.begin(), rows.end(),
+                        [](const Row & a, const Row & b) {
+                            return (a.alloc + a.force) > (b.alloc + b.force);
+                        });
+                    size_t lim = std::min<size_t>(rows.size(), 20);
+                    std::fprintf(stderr,
+                        "\nv3 ALLOC_PERIODIC[%llu]: top %zu/%zu\n",
+                        (unsigned long long)n, lim, rows.size());
+                    for (size_t i = 0; i < lim; ++i) {
+                        const auto & r = rows[i];
+                        const PosSnapshot * ps =
+                            resolvePosSnapshot(r.d->posHandle);
+                        const char * nm = r.d->name.empty()
+                            ? "<anon>" : r.d->name.c_str();
+                        if (ps && !ps->file.empty()) {
+                            std::fprintf(stderr,
+                                "  alloc=%llu force=%llu %s @ %s:%u:%u\n",
+                                (unsigned long long)r.alloc,
+                                (unsigned long long)r.force,
+                                nm,
+                                ps->file.c_str(), ps->line, ps->column);
+                        } else {
+                            std::fprintf(stderr,
+                                "  alloc=%llu force=%llu %s @ <no-pos>\n",
+                                (unsigned long long)r.alloc,
+                                (unsigned long long)r.force, nm);
+                        }
+                    }
+                    std::fflush(stderr);
+                }
             }
             t->suspended.cu = cu;
             // V3_DBG_TRACE_THUNK_X -- track creation of every thunk into
