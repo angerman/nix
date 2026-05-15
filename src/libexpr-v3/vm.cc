@@ -30,11 +30,13 @@
 #include "nix/util/eval-trace.hh"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <unordered_set>
@@ -1296,6 +1298,74 @@ static inline std::string v3ThunkTracePos(const Thunk * t)
     const PosSnapshot * ps = resolvePosSnapshot(d->posHandle);
     if (!ps || ps->file.empty()) return "<no-pos>";
     return nix::evalTrace::formatPos(ps->file, ps->line, ps->column);
+}
+
+/// V3_DBG_HOT_FORCE=<suffix>: count total Suspended-thunk dispatches
+/// and unique Thunk* pointers at any position whose normalised
+/// `<store>/...` file path ENDS WITH the configured suffix.  Used to
+/// distinguish "same thunk forced many times" (memoisation failure)
+/// from "fresh thunk allocated per access" (per-access allocation
+/// failure).  Atexit prints a summary.  Suffix matching keeps the
+/// option robust against the random `<hash>-source` prefix.
+///
+/// Example: V3_DBG_HOT_FORCE='lib/systems/parse.nix:61:44'
+///   -> total=11504278 unique=1     -> same thunk re-forced (memoisation)
+///   -> total=11504278 unique=11504 -> fresh thunk per access (allocation)
+static inline void hotForceCheck(const Thunk * t)
+{
+    static const char * s_suffix = std::getenv("V3_DBG_HOT_FORCE");
+    if (__builtin_expect(s_suffix == nullptr, 1)) return;
+    if (!t) return;
+    const LambdaDescriptor * d = t->suspended.desc;
+    if (!d) return;
+    const PosSnapshot * ps = resolvePosSnapshot(d->posHandle);
+    if (!ps || ps->file.empty()) return;
+    std::string pos = nix::evalTrace::formatPos(ps->file, ps->line, ps->column);
+    std::string_view suf{s_suffix};
+    if (pos.size() < suf.size()) return;
+    if (std::string_view(pos).substr(pos.size() - suf.size()) != suf) return;
+
+    static struct HotForceStats {
+        std::atomic<uint64_t> total{0};
+        std::mutex mtx;
+        std::unordered_set<const Thunk *> uniq;
+        std::string suffix;
+        bool atexitInstalled = false;
+    } stats;
+
+    uint64_t n = stats.total.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Periodic dump every 100k forces so the count is visible under
+    // `timeout`-killed runs (atexit doesn't fire when SIGTERM'd).
+    if ((n % 100000) == 0) {
+        std::lock_guard<std::mutex> g(stats.mtx);
+        stats.uniq.insert(t);
+        std::fprintf(stderr,
+            "v3 V3_DBG_HOT_FORCE [%s] progress: total=%llu unique=%zu\n",
+            s_suffix,
+            (unsigned long long)n, stats.uniq.size());
+        std::fflush(stderr);
+    } else {
+        std::lock_guard<std::mutex> g(stats.mtx);
+        stats.uniq.insert(t);
+    }
+    {
+        std::lock_guard<std::mutex> g(stats.mtx);
+        if (stats.suffix.empty()) stats.suffix = s_suffix;
+        if (!stats.atexitInstalled) {
+            stats.atexitInstalled = true;
+            std::atexit([] {
+                std::lock_guard<std::mutex> g(stats.mtx);
+                std::fprintf(stderr,
+                    "v3 V3_DBG_HOT_FORCE [%s]: total=%llu unique-thunks=%zu "
+                    "ratio=%.1f\n",
+                    stats.suffix.c_str(),
+                    (unsigned long long)stats.total.load(),
+                    stats.uniq.size(),
+                    stats.uniq.empty() ? 0.0
+                        : (double)stats.total.load() / (double)stats.uniq.size());
+            });
+        }
+    }
 }
 
 /// Run the dispatch loop on `vm` until either:
@@ -4837,6 +4907,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         : std::string("<no-pos>");
                 nix::evalTrace::enterForce(posStr);
             }
+            // V3_DBG_HOT_FORCE: count total dispatches + unique thunk
+            // pointers at the configured source position suffix.
+            hotForceCheck(t);
             vm.frames.push_back(CallFrame{
                 .cu = thunkCu,
                 .closure = fakeClo,
@@ -9176,6 +9249,7 @@ Value forceValue(VMState & vm, Value v)
         // OP_FORCE-driven and forceValue-driven thunk pushes.
         if (__builtin_expect(nix::evalTrace::enabled(), 0))
             nix::evalTrace::enterForce(v3ThunkTracePos(t));
+        hotForceCheck(t);
         // #558 Phase 4: pull a fakeClo from the thread-local pool when
         // available; OP_RETURN's CFF_THUNK_RETURN handler will recycle
         // it after the body completes (the frame we push below has
