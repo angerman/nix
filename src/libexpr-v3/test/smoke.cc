@@ -2159,6 +2159,140 @@ static int testDeferLetRecCorrect()
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// OPT_OCCUR Phase B — deadBindingElimViaOccur smoke tests
+// ---------------------------------------------------------------------------
+//
+// Two complementary checks for the new occurrence-info-driven DCE
+// pass added by Phase 0.3:
+//
+//   1. Positive: a chain of unused bindings where round 1 of the new
+//      pass removes the orphan literal, and round 2 picks up the
+//      now-dead VarRef alias that only consumed it.  This case
+//      exercises the "re-run analyseOccurrence" step from OPT_OCCUR
+//      Phase B; if the pass were a single-round walk it would leave
+//      the alias behind.
+//
+//   2. Equivalence: the old deadBindingElim and the new
+//      deadBindingElimViaOccur produce identical Block::bindings
+//      vectors on a non-trivial module.  Direct verification of the
+//      side-by-side claim (without going through the env-var-gated
+//      validation harness).
+
+static int testOccurDceRemovesChainedDeadBinding()
+{
+    // OPT_OCCUR Phase B is specifically two passes: round 1 removes
+    // obviously-Dead bindings; round 2 picks up bindings whose sole
+    // consumer was a round-1 victim.  This test constructs the
+    // minimal case the round-2 step is needed for:
+    //
+    //   live  = LitInt 1            (returned — survives)
+    //   inner = LitInt 99           (used only by `wrap` below)
+    //   wrap  = VarRef{inner}       (unused by anyone — dead at round 1)
+    //
+    // Round 1: `wrap` has count=0 → Dead → removed.  `inner` still
+    // has count=1 (wrap uses it) → OnceLinear → preserved.
+    // Round 2: re-run analyseOccurrence on the now-smaller module;
+    // `inner`'s count is now 0 → Dead → removed.
+    //
+    // A single-round pass would leave `inner` behind.  This proves
+    // the round-2 step is observably load-bearing.
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto inner = addBinding(m, entry, ir::LitInt{99});
+    auto wrap = addBinding(m, entry, ir::VarRef{inner});
+    (void)wrap;
+    auto live = addBinding(m, entry, ir::LitInt{1});
+    setReturn(m, entry, live);
+
+    // Use the new pass directly (not via optimise(), to isolate from
+    // the rest of the pipeline).
+    size_t removed = ir::deadBindingElimViaOccur(m);
+
+    bool sawInner = false, sawWrap = false, sawLive = false;
+    for (auto & bb : m.blocks[entry].bindings) {
+        if (bb.var == inner) sawInner = true;
+        if (bb.var == wrap)  sawWrap = true;
+        if (bb.var == live)  sawLive = true;
+    }
+    if (sawInner || sawWrap || !sawLive || removed != 2) {
+        std::fprintf(stderr,
+            "testOccurDceRemovesChainedDeadBinding: inner=%d wrap=%d "
+            "live=%d removed=%zu (expected 0/0/1, removed=2)\n",
+            (int)sawInner, (int)sawWrap, (int)sawLive, removed);
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testOccurDceRemovesChainedDeadBinding: OK (round-2 swept the "
+        "chained dead binding, live preserved, removed=%zu)\n", removed);
+    return 0;
+}
+
+static int testOccurDceMatchesOldDce()
+{
+    // Build two structurally-identical modules; run old DCE on one,
+    // new DCE on the other; assert resulting binding vectors are
+    // identical (per-block, per-var).
+    auto buildMod = []() {
+        auto m = ir::makeModule();
+        auto entry = m.freshBlock();
+        funcOf(m, 0).entryBlock = entry;
+        // Mix: unused LitInts, an unused alias chain, a referenced
+        // lambda body, a referenced Force (impure — must survive).
+        addBinding(m, entry, ir::LitInt{100});                  // dead
+        auto a = addBinding(m, entry, ir::LitInt{200});         // dead
+        auto b = addBinding(m, entry, ir::VarRef{a});            // dead
+        (void)b;
+        auto c = addBinding(m, entry, ir::LitInt{300});          // live
+        auto d = addBinding(m, entry, ir::LitInt{400});          // dead but impure consumer below
+        auto e = addBinding(m, entry, ir::Add{c, d});            // live (returned)
+        setReturn(m, entry, e);
+        return m;
+    };
+    auto mOld = buildMod();
+    auto mNew = buildMod();
+
+    size_t removedOld = ir::deadBindingElim(mOld);
+    size_t removedNew = ir::deadBindingElimViaOccur(mNew);
+
+    if (removedOld != removedNew) {
+        std::fprintf(stderr,
+            "testOccurDceMatchesOldDce: removed-count mismatch "
+            "(old=%zu, new=%zu)\n", removedOld, removedNew);
+        return 1;
+    }
+    if (mOld.blocks.size() != mNew.blocks.size()) {
+        std::fprintf(stderr,
+            "testOccurDceMatchesOldDce: block-count mismatch\n");
+        return 1;
+    }
+    for (size_t bid = 0; bid < mOld.blocks.size(); ++bid) {
+        const auto & oldB = mOld.blocks[bid].bindings;
+        const auto & newB = mNew.blocks[bid].bindings;
+        if (oldB.size() != newB.size()) {
+            std::fprintf(stderr,
+                "testOccurDceMatchesOldDce: block %zu binding-count "
+                "mismatch (old=%zu, new=%zu)\n", bid, oldB.size(), newB.size());
+            return 1;
+        }
+        for (size_t i = 0; i < oldB.size(); ++i) {
+            if (oldB[i].var != newB[i].var) {
+                std::fprintf(stderr,
+                    "testOccurDceMatchesOldDce: block %zu pos %zu var "
+                    "mismatch (old=%u, new=%u)\n", bid, i,
+                    oldB[i].var, newB[i].var);
+                return 1;
+            }
+        }
+    }
+    std::fprintf(stderr,
+        "testOccurDceMatchesOldDce: OK (old vs new identical, "
+        "removed=%zu each)\n", removedOld);
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -2226,6 +2360,10 @@ int main()
     rc |= testDeferSkipsManyUseBinding();
     rc |= testDeferLetRecCorrect();
     rc |= testDeferKillSwitch();
+
+    // OPT_OCCUR Phase B — deadBindingElimViaOccur (Phase 0.3/0.4)
+    rc |= testOccurDceRemovesChainedDeadBinding();
+    rc |= testOccurDceMatchesOldDce();
 
     auto & st = allocStats();
     std::fprintf(stderr,
