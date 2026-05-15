@@ -1,0 +1,12 @@
+error:
+       … from call site
+         at /pwd/lang/eval-fail-c2-missing-required-formal.nix:1:1:
+            1| ({a, b}: a + b) { a = 1; }
+             | ^
+            2|
+
+       error: function 'anonymous lambda' called without required argument 'b'
+       at /pwd/lang/eval-fail-c2-missing-required-formal.nix:1:2:
+            1| ({a, b}: a + b) { a = 1; }
+             |  ^
+            2|

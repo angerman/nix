@@ -1,0 +1,12 @@
+error:
+       … in the left operand of the AND (&&) operator
+         at /pwd/lang/eval-fail-c1-null-and-true.nix:1:6:
+            1| null && true
+             |      ^
+            2|
+
+       error: expected a Boolean but found null: null
+       at /pwd/lang/eval-fail-c1-null-and-true.nix:1:6:
+            1| null && true
+             |      ^
+            2|

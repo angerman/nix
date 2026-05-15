@@ -1,0 +1,8 @@
+error:
+       … while evaluating a path segment
+         at /pwd/lang/eval-fail-c5-path-plus-int.nix:1:9:
+            1| ./foo + 1
+             |         ^
+            2|
+
+       error: cannot coerce an integer to a string: 1

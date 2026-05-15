@@ -1,0 +1,10 @@
+error:
+       … ctx:
+
+       … while calling the 'throw' builtin
+         at /pwd/lang/eval-fail-c7-addErrorContext-throw.nix:1:35:
+            1| builtins.addErrorContext "ctx: " (throw "inner")
+             |                                   ^
+            2|
+
+       error: inner
