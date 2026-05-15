@@ -9569,9 +9569,25 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             buf[i - 1] = chain.payload.pair->right;
             chain = chain.payload.pair->left;
         }
+        // Phase 1.2 (action plan): mirror OP_CALL's primop-arg force loop
+        // (vm.cc:2708-2715) — fast-path the WHNF case inline so that
+        // arg-forcing on an already-resolved Value doesn't pay the
+        // forceValue function-call + chase-loop setup cost.  callClosure
+        // is the entry point primops use for callback lambdas (map,
+        // filter, foldl', etc.), so this fires on the dominant
+        // `(p: p.name)`-style nixpkgs callbacks AND on every recursive
+        // primop-from-primop call.  Without this fast path, callClosure
+        // diverged from OP_CALL on the same workload.
+        //
+        // Audit category B1 (see ITERATIVE_FORCE_AUDIT_2026-05-18.md):
+        // first scoped iterative-force conversion landed.
         for (uint32_t i = 0; i < po->arity; ++i) {
             if (po->lazyArgs & (1u << i)) continue;
-            buf[i] = forceValue(vm, buf[i]);
+            Tag at = buf[i].tag();
+            if (__builtin_expect(at == Tag::Thunk
+                                 || at == Tag::App
+                                 || at == Tag::Slot, 0))
+                buf[i] = forceValue(vm, buf[i]);
         }
         EvalState state; state.vm = &vm; state.nixEvalState = getNixEvalState();
         Value out;
