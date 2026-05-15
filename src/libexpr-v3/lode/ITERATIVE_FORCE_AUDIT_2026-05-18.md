@@ -190,3 +190,62 @@ alone. The audit above does the architectural triage instead:
 identify the high-leverage targets, leave the long tail to be
 audited as Phase 1.2 closes each candidate. This matches the action
 plan's "1 day" budget — full enumeration is for Phase 4 cleanup.
+
+## Phase 1.2 progress log
+
+Per action plan Rule 0 (every commit must answer "what hypothesis
+does this kill?"): the work below incrementally falsifies the
+"forceValue function call is paid on every primop arg" model.
+
+### Step 1 — RESOLVED 2026-05-15 (commit 8df749725)
+
+**Hypothesis killed**: "callClosure and OP_CALL share the same
+primop-arg force fast path." (They didn't — OP_CALL had inline
+WHNF skip from #558 Phase 2.3; callClosure did not.)
+
+**Site**: `vm.cc` callClosure primop-arg force loop (formerly
+B1 in the audit's priority list, lines ~9572-9575).
+
+**Pattern applied**: inline tag check before forceValue, same as
+OP_CALL's existing pattern. No iterative-via-writeback yet — the
+fast-path is the WHNF-skip flavour.
+
+**Verification**: regression tests pass; bench n=5 vs the morning's
+baseline shows movement within ±3% noise (workloads in the corpus
+don't heavily exercise recursive-primop chains).
+
+### Step 2 — RESOLVED 2026-05-15 (commit 557d1fac8)
+
+**Hypothesis killed**: "all hot primop list iterations have the
+WHNF fast-path applied uniformly." (They didn't — primConcatMap /
+primPartition / primAll / primAny / primMap had it; primConcatLists
+and primConcatStringsSep didn't.)
+
+**Sites**:
+- `primops.cc` primConcatLists element-force loop (B5 family).
+- `primops.cc` primConcatStringsSep element-force loop (B5 family).
+
+**Pattern applied**: same inline WHNF-skip as step 1.
+
+**Verification**: regression tests pass; bench within ±3% noise.
+
+### Remaining Phase 1.2 candidates
+
+The WHNF-skip pattern is the easy half. The remaining work is the
+**iterative-via-writeback** conversion for sites where the
+recursion isn't on a single value-check but on a deeply-nested
+structure. From the audit:
+
+- **B3 valueEqual** — recursive list/attrset comparison. Converting
+  requires an explicit `std::vector<std::pair<Value, Value>>` work
+  stack. Independent effort; 1-2 days. Not closed by step 1/2.
+- **App-spine deep recursion** — surfaces in the
+  `v3-iterative-force-depth` test's app-spine-5000 probe (still
+  fails at the kMaxCallDepth=5000 guard, per the probe). Each `id
+  (id (... 0))` application's body forces its arg, recursing into
+  callClosure → forceValue. Fix requires making the inner force
+  chain truly iterative — push frames onto vm.frames and let the
+  outer dispatchLoop drive, instead of C-recursing through
+  forceValue + callClosure. Architectural change; multi-day.
+
+These are the remaining hypotheses the rest of Phase 1.2 will kill.
