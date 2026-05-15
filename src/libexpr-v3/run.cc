@@ -102,9 +102,8 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // address-stability contract.
     setNixEvalState(&state);
 
-    // V3_TIMING phase split — mirrors v3_hook.cc's atexit dump for
-    // the call-hook entry point so bench harnesses can compare
-    // apples-to-apples between v3-hook and v3-direct modes.  A no-op
+    // V3_TIMING phase split — capture lower / compile / run / bridge
+    // phase durations so bench harnesses can attribute time.  A no-op
     // (zero overhead) when V3_TIMING is unset.
     PhaseTimer pt;
 
@@ -147,9 +146,9 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     out.value = run(out.cu);
     pt.mark(pt.run_ms);
 
-    // NIX_VM_STATS=1: dump alloc counters at completion (mirrors
-    // v3_hook.cc's atexit dump format).  Lets us attribute alloc
-    // explosions to thunks vs closures vs Bindings vs lists.
+    // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
+    // attribute alloc explosions to thunks vs closures vs Bindings
+    // vs lists.
     static const bool s_dumpStats =
         std::getenv("NIX_VM_STATS") != nullptr;
     if (__builtin_expect(s_dumpStats, 0)) {

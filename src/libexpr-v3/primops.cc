@@ -2926,11 +2926,11 @@ namespace nix::v3 { bool forceEagerBridge(); bool shallowTWAttrsBridge(); }
 namespace nix::v3 { namespace {
 
 // #453 Phase D: bridge-primop call counters.  Atomics keep them off
-// the hot-path lock; dumped from v3_hook.cc atexit when
-// NIX_V3_PRIMOP_DUMP=1.  These fire when TW calls back into v3 via
-// the bridge primops registered in TW's primop table.  Hot counts
-// here mean v3 is leaking across the cutover; reducing them is the
-// Phase D goal.
+// the hot-path lock; dumped from dumpPrimOpStats() at process exit
+// when NIX_V3_PRIMOP_DUMP=1.  These fire when TW calls back into v3
+// via the bridge primops registered in TW's primop table.  Hot
+// counts here mean v3 is leaking across the cutover; reducing them
+// is the Phase D goal.
 std::atomic<uint64_t> g_bridgeCallBridge1Calls{0};
 std::atomic<uint64_t> g_bridgeForceAttrCalls{0};
 std::atomic<uint64_t> g_bridgeForceListElemCalls{0};
@@ -3417,12 +3417,11 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
     v3state.vm = attrVm;
 
     // WC-19: deferred forces can hit eval-order cycles v3 sees but
-    // tree-walker would resolve.  The eager-bridge path catches these
-    // in v3_hook.cc's Tag::Attrs try/catch and falls back to tree-
-    // walker on the outer Expr.  The lazy path was missing that
-    // safety net — reproduce it here.  Only catch blackhole-shaped
-    // errors so genuine bugs (type errors, missing args, ...)
-    // surface instead of being masked.
+    // tree-walker would resolve.  Local try/catch on blackhole-
+    // shaped errors only — genuine bugs (type errors, missing
+    // args, ...) surface unchanged.  (The original eager-bridge
+    // catch in v3_hook.cc that this mirrored is gone; this local
+    // catch is now the sole safety net.)
     // REVIEW_2026-05-04 F4 / §6.3: typed `BlackholeError` instead of
     // `strstr` -- see fallbackToTreeWalker comment in primV3CallBridge1.
     //
@@ -3940,8 +3939,6 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // typically called via tree-walker's callFunction, not auto-
         // CallFunction — so formal defaults handled in v3's lower.cc
         // synthesised rec-attrset machinery still work.  Bridge them.
-        // The outer eval hook in v3_hook.cc has its own hasFormals check
-        // that DOES fall back to tree-walker for top-level eval results.
         // Bridge the v3 closure as a tree-walker primop application.
         // We register `__v3_call_bridge_1` (arity 2: handle, arg) so
         // partial-application on the handle gives tree-walker a 1-arg
@@ -7060,11 +7057,14 @@ PrimOpCounter & primOpCounter()
 } // anonymous namespace
 
 // #455: file-scope (external-linkage) thread-local + push/pop for
-// the eager-bridge flag.  v3_hook.cc extern-declares these and
-// wraps them in a ScopedEagerBridge RAII guard at the call hook
-// for on-demand-root-populated lambda results.  forceEagerBridge()
-// is the read-side helper used inside v3ToTreeWalker and is
-// forward-declared in the anon namespace above.
+// the eager-bridge flag.  forceEagerBridge() is the read-side
+// helper used inside v3ToTreeWalker and is forward-declared in the
+// anon namespace above.  (Historical: v3_hook.cc's call-hook used
+// to push the flag via a ScopedEagerBridge guard for on-demand-
+// root-populated lambda results — with v3_hook.cc deleted, there
+// are no remaining writers and the reader always returns false.
+// Push/pop kept for future plugin-side use, but the flag is
+// effectively dead infrastructure pending removal.)
 thread_local bool tlsForceEagerBridge = false;
 bool forceEagerBridge() { return tlsForceEagerBridge; }
 bool pushForceEagerBridge() {
@@ -7102,10 +7102,6 @@ void bumpPrimOpCallCount(const PrimOp * po)
 
 void dumpPrimOpStats(std::FILE * out)
 {
-    // #458 step B note: bridge telemetry is dumped separately from
-    // v3_hook.cc's atexit handler (outside this function) so it
-    // fires regardless of call-hook traffic.  Don't dump again here.
-
     // #453 Phase D: bridge primop counters (TW->v3 callbacks).  Print
     // before the v3-side primop counts because they're the actual
     // cutover-cost signal; high counts here mean v3 result values
@@ -7188,7 +7184,8 @@ void dumpHotDescriptors(std::FILE * out, size_t limit,
 }
 
 // Forward to the anonymous-namespace shim (initialised at static-init
-// time).  Public — callable from v3_hook.cc.
+// time).  Public — exported for v3 internal callers (vm.cc OP_CALL
+// Bridge-thunk branch, etc.).
 namespace { extern nix::Value * (*v3ToTreeWalkerShim)(nix::EvalState &, Value); }
 nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v)
 {

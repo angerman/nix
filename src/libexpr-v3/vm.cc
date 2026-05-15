@@ -48,7 +48,7 @@
 namespace nix::v3 {
 
 // #456 fix: forward decls for the bridge entry points used in
-// OP_CALL's Bridge-thunk branch.  Defined in v3_hook.cc / primops.cc.
+// OP_CALL's Bridge-thunk branch.  Defined in primops.cc.
 nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
 Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
 
@@ -2735,14 +2735,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // hello.name flake-eval shapes).
             //
             // Wrap in try/catch: a TW BlackHole here means the
-            // surrounding v3 evaluation tripped a fix-point cycle the
-            // existing eager-bridge / call-hook fallback machinery
-            // handles when allowed to bubble up.  Propagate the
-            // exception so v3CallFunctionEntry's outer catch
-            // (v3_hook.cc:3183) blacklists the lambda + falls back
-            // to TW for the whole call.  Also catch generic
-            // exceptions so we don't silently corrupt the
-            // BridgeShimVm's frame state.
+            // surrounding v3 evaluation tripped a fix-point cycle.
+            // Propagate the exception so the OP_CALL Bridge-thunk
+            // outer catch handles it (was previously routed through
+            // v3CallFunctionEntry's blacklist machinery in v3_hook.cc;
+            // that path is gone — the exception now flows normally).
+            // Catch generic exceptions so we don't silently corrupt
+            // the BridgeShimVm's frame state.
             if (fun.isThunk() && fun.payload.thunk
                 && fun.payload.thunk->state == ThunkState::Bridge
                 && fun.payload.thunk->bridgeSrc) {

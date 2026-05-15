@@ -510,7 +510,7 @@ Fallible<Value> evalFile(Evaluator &, nix::SourcePath);
 // Slow-path -- one extra round-trip per plugin call -- but no
 // compatibility break.  No FFI declarations needed for Option B; the
 // shim lives entirely inside v3 (registerPrimOp interception in
-// `lower.cc` / `v3_hook.cc`).
+// `lower.cc`).
 //
 // **Option A (post-deprecation):** new plugins use the v3-native ABI:
 //

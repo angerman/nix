@@ -240,8 +240,8 @@ def test_run_one_success_v3_direct():
                       "let f = n: if n < 2 then n else f (n - 1) + f (n - 2); in f 20",
                       with_v3_timing=True, with_vm_stats=False, timeout=30)
     check("run_one_v3_direct: rc == 0", r.rc == 0)
-    # Without the run.cc V3_TIMING fix, run_ms would be 0 because
-    # v3-direct never fires the v3_hook.cc atexit handler.
+    # The run.cc PhaseTimer captures run_ms inline; v3-direct's
+    # entry point is runRootExpr, which owns timing directly.
     check("run_one_v3_direct: phase data captured", r.v3_run_ms > 0,
           f"v3_run_ms={r.v3_run_ms}; "
           f"if 0, the run.cc PhaseTimer is not firing")

@@ -1622,17 +1622,11 @@ struct Lowerer
         // values regardless of which dynamic call-site reached the
         // body.
         //
-        // The remaining safety nets in v3_hook.cc still apply:
-        //   - recVarSet excludes thunks whose freeVars include a
-        //     rec-attrset VarId (those don't live in a single env
-        //     cell).
-        //   - upvalueSources.empty() causes Phase B to skip.
-        //   - phaseBFailed remembers throws on a per-Expr basis.
-        //
-        // If a nested thunk turns out to misbehave at force time,
-        // Phase B will catch the throw and mark phaseBFailed,
-        // routing the same Expr through tree-walker on subsequent
-        // forces — bounded blast radius.
+        // (Historical: prior Phase B safety nets — recVarSet,
+        // upvalueSources.empty(), phaseBFailed — lived in the now-
+        // deleted v3_hook.cc.  v3-direct relies on the lexical
+        // correctness argument above; bugs surface as cycles or
+        // wrong-value, not silently routed to tree-walker.)
         m.subExprFuncs.push_back({static_cast<const void *>(e), fid});
 
         funcStack.push_back(fid);
@@ -2561,12 +2555,13 @@ struct Lowerer
         ir::VarId recSlotVar = m.freshVar();
         recScope.recSlotVar = recSlotVar;
         m.recVarToSlotVar.emplace(recVar, recSlotVar);
-        // #458 Phase B RecBuildSlot — register recSlotVar so v3_hook.cc
-        // can detect its appearance as a freeVar of a sub-thunk and
-        // emit a `Kind::RecBuildSlot` UpvalueSource that materialises
-        // Tag::Slot from a TW env walk.  Without this set, lambda-
-        // body freeVars referencing recSlotVar fall through Phase B's
-        // varOrigins lookup with no match -> v3 refuses Phase B.
+        // #458 Phase B RecBuildSlot — register recSlotVar so the
+        // lowerer's downstream upvalue-translation pass can detect its
+        // appearance as a freeVar of a sub-thunk and emit a
+        // `Kind::RecBuildSlot` UpvalueSource (materialises Tag::Slot
+        // from the env walk).  Without this set, lambda-body freeVars
+        // referencing recSlotVar fall through varOrigins lookup with
+        // no match.
         m.recSlotVarIds.push_back(recSlotVar);
         recScope.recAttrsNames.reserve(pending.size());
         for (auto & p : pending) {

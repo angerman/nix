@@ -79,13 +79,13 @@ this_library = library(
   dependencies : deps_public + deps_private + deps_other,
   include_directories : include_dirs,
   install : true,
-  prelink : true,  # For the static-init that registers v3EvalHook.
+  prelink : true,  # Pull static initializers into the final binary.
 )
 
 # Expose as a meson dependency so the main `nix` binary can link
-# against us.  The cutover hook in v3_hook.cc relies on its static
-# initializer firing — that requires the binary to actually pull in
-# this library.
+# against us.  prelink + this override_dependency ensure libnixexprv3
+# is pulled in and its static initializers fire (primop registry,
+# content-cache, eval-trace, etc.).
 meson.override_dependency(
   'nix-expr-v3',
   declare_dependency(
