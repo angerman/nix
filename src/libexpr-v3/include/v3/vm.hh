@@ -35,24 +35,6 @@ enum CallFrameFlag : uint8_t
     /// chain.  Mirrors GHC's stg_IND mechanism + tree-walker's slot
     /// mutation.
     CFF_FORCE_RETRY = 1 << 1,
-    /// #558 (2026-05-11) Taint: this thunk's body used STG WHNF
-    /// recovery (chain.back() collapse) during evaluation.  Such
-    /// thunks compute APPROXIMATE results — they should NOT be
-    /// memoized as Evaluated, because future forces may pick up a
-    /// more-accurate chain.back() (e.g., when an outer fix-point's
-    /// merged WHNF is reached after the current evaluation).
-    ///
-    /// STG analog: a thunk that read from an "indirection in flight"
-    /// must re-evaluate.  Mirrors GHC's "tainted by black-hole" — a
-    /// computation that observed partial state may need to re-run
-    /// when the state finalizes.
-    ///
-    /// Set by forceValue's STG WHNF path on the running THUNK_RETURN
-    /// frame.  Checked at OP_RETURN: if set, the thunk's state stays
-    /// Suspended (not Evaluated); retVal is still returned to the
-    /// caller (so this access gets the partial-but-best-current
-    /// result), but future forces will re-run.
-    CFF_TAINTED = 1 << 2,
     /// A8 (2026-05-13): the upper 16 bits of `flags` encode a
     /// stack-base-relative slot offset for a pending force writeback.
     /// Clear unless an opcode has set up an iterative force.  See

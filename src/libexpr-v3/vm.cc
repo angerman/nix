@@ -4172,58 +4172,35 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // count.  Leaving it preserves alloc-time
                     // invariants (Bridge thunks etc.).
                 }
-                // #558 (2026-05-11) Taint check: if this thunk's body
-                // used STG WHNF recovery (CFF_TAINTED set on this
-                // frame), the retVal is an APPROXIMATE result derived
-                // from chain.back() — a partial fix-point shape.
-                // Don't memoize: keep state Suspended so future forces
-                // re-run the body with whatever chain.back() is then.
+                fr.thunk->state = ThunkState::Evaluated;
+                fr.thunk->evaluated = retVal;
+                // STG-8 (#498): cell update.  If this thunk was stored
+                // at a heap-stable cell (recorded at OP_ATTRS_REC_SET
+                // time), overwrite the cell's contents with the body's
+                // final result.  This mirrors tree-walker's in-place
+                // `forceValue` update — slots / sub-thunks that
+                // captured a Tag::Slot pointing at the cell now read
+                // the result via single deref, and foreign VMState
+                // observers stop seeing the leaked Black thunk.
                 //
-                // The retVal is still returned to the caller (so this
-                // access gets the partial-but-best-current result),
-                // but no Evaluated transition.
-                //
-                // STG analog: a thunk that observed an in-flight
-                // indirection must re-evaluate.  Mirrors GHC's
-                // re-entrancy of selector thunks that observed
-                // BLACKHOLE.
-                if (fFlags & CFF_TAINTED) {
-                    // Don't memoize.  retVal stays on the value-stack
-                    // (already pushed earlier in OP_RETURN's pop).
-                    // No cell update either — would corrupt the slot
-                    // with stale data.
-                    fr.thunk->state = ThunkState::Suspended;
-                } else {
-                    fr.thunk->state = ThunkState::Evaluated;
-                    fr.thunk->evaluated = retVal;
-                    // STG-8 (#498): cell update.  If this thunk was stored
-                    // at a heap-stable cell (recorded at OP_ATTRS_REC_SET
-                    // time), overwrite the cell's contents with the body's
-                    // final result.  This mirrors tree-walker's in-place
-                    // `forceValue` update — slots / sub-thunks that
-                    // captured a Tag::Slot pointing at the cell now read
-                    // the result via single deref, and foreign VMState
-                    // observers stop seeing the leaked Black thunk.
-                    //
-                    // Read-and-clear: we want the write to fire exactly
-                    // once per cell binding.  Idempotent on re-entry
-                    // (cell becomes nullptr after first OP_RETURN).
-                    if (Value * cell = fr.thunk->cell) {
-                        cellOwnRecordWrite(cell, fr.thunk,
-                                            "OP_RETURN/CFF_THUNK_RETURN");
-                        cellTraceWrite(cell, fr.thunk, retVal,
+                // Read-and-clear: we want the write to fire exactly
+                // once per cell binding.  Idempotent on re-entry
+                // (cell becomes nullptr after first OP_RETURN).
+                if (Value * cell = fr.thunk->cell) {
+                    cellOwnRecordWrite(cell, fr.thunk,
                                         "OP_RETURN/CFF_THUNK_RETURN");
-                        *cell = retVal;
-                        fr.thunk->cell = nullptr;
-                    }
-                    // #558 Phase 1.5: also update shapeCell with the
-                    // final value, then clear it.  This makes a final
-                    // forceValue-after-body see the actual result
-                    // through shapeCell, mirroring the cell semantics.
-                    if (Value * sc = fr.thunk->shapeCell) {
-                        *sc = retVal;
-                        fr.thunk->shapeCell = nullptr;
-                    }
+                    cellTraceWrite(cell, fr.thunk, retVal,
+                                    "OP_RETURN/CFF_THUNK_RETURN");
+                    *cell = retVal;
+                    fr.thunk->cell = nullptr;
+                }
+                // #558 Phase 1.5: also update shapeCell with the
+                // final value, then clear it.  This makes a final
+                // forceValue-after-body see the actual result
+                // through shapeCell, mirroring the cell semantics.
+                if (Value * sc = fr.thunk->shapeCell) {
+                    *sc = retVal;
+                    fr.thunk->shapeCell = nullptr;
                 }
                 // #558 Phase 3.3 (2026-05-12): partial-Bindings
                 // infrastructure retired.  No publishes fire so the
