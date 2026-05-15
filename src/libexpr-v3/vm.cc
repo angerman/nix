@@ -2302,45 +2302,59 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 uint64_t n = s_allocSeq.fetch_add(1, std::memory_order_relaxed) + 1;
                 if ((n % 2000000) == 0) {
                     struct Row {
-                        uint64_t alloc; uint64_t force;
+                        uint64_t alloc; uint64_t force; uint64_t call;
                         const LambdaDescriptor * d;
                     };
                     std::vector<Row> rows;
                     for (auto * cu2 : cuRegistry()) {
                         if (!cu2) continue;
                         for (const auto & ld : cu2->lambdas) {
-                            if (ld.allocCount + ld.forceCount < 100) continue;
-                            rows.push_back({ld.allocCount, ld.forceCount, &ld});
+                            if (ld.allocCount + ld.forceCount + ld.callCount < 100)
+                                continue;
+                            rows.push_back({ld.allocCount, ld.forceCount,
+                                            ld.callCount, &ld});
                         }
                     }
-                    std::sort(rows.begin(), rows.end(),
-                        [](const Row & a, const Row & b) {
-                            return (a.alloc + a.force) > (b.alloc + b.force);
-                        });
-                    size_t lim = std::min<size_t>(rows.size(), 20);
+                    auto emitTop = [&](const char * heading,
+                                       auto keyFn) {
+                        std::sort(rows.begin(), rows.end(),
+                            [&](const Row & a, const Row & b) {
+                                return keyFn(a) > keyFn(b);
+                            });
+                        size_t lim = std::min<size_t>(rows.size(), 15);
+                        std::fprintf(stderr,
+                            "\n  %s (top %zu):\n", heading, lim);
+                        for (size_t i = 0; i < lim; ++i) {
+                            const auto & r = rows[i];
+                            if (keyFn(r) == 0) break;
+                            const PosSnapshot * ps =
+                                resolvePosSnapshot(r.d->posHandle);
+                            const char * nm = r.d->name.empty()
+                                ? "<anon>" : r.d->name.c_str();
+                            if (ps && !ps->file.empty()) {
+                                std::fprintf(stderr,
+                                    "    alloc=%llu force=%llu call=%llu %s @ %s:%u:%u\n",
+                                    (unsigned long long)r.alloc,
+                                    (unsigned long long)r.force,
+                                    (unsigned long long)r.call,
+                                    nm,
+                                    ps->file.c_str(), ps->line, ps->column);
+                            } else {
+                                std::fprintf(stderr,
+                                    "    alloc=%llu force=%llu call=%llu %s @ <no-pos>\n",
+                                    (unsigned long long)r.alloc,
+                                    (unsigned long long)r.force,
+                                    (unsigned long long)r.call, nm);
+                            }
+                        }
+                    };
                     std::fprintf(stderr,
-                        "\nv3 ALLOC_PERIODIC[%llu]: top %zu/%zu\n",
-                        (unsigned long long)n, lim, rows.size());
-                    for (size_t i = 0; i < lim; ++i) {
-                        const auto & r = rows[i];
-                        const PosSnapshot * ps =
-                            resolvePosSnapshot(r.d->posHandle);
-                        const char * nm = r.d->name.empty()
-                            ? "<anon>" : r.d->name.c_str();
-                        if (ps && !ps->file.empty()) {
-                            std::fprintf(stderr,
-                                "  alloc=%llu force=%llu %s @ %s:%u:%u\n",
-                                (unsigned long long)r.alloc,
-                                (unsigned long long)r.force,
-                                nm,
-                                ps->file.c_str(), ps->line, ps->column);
-                        } else {
-                            std::fprintf(stderr,
-                                "  alloc=%llu force=%llu %s @ <no-pos>\n",
-                                (unsigned long long)r.alloc,
-                                (unsigned long long)r.force, nm);
-                        }
-                    }
+                        "\nv3 ALLOC_PERIODIC[%llu]: %zu lambdas active\n",
+                        (unsigned long long)n, rows.size());
+                    emitTop("by alloc",
+                        [](const Row & r) -> uint64_t { return r.alloc; });
+                    emitTop("by call",
+                        [](const Row & r) -> uint64_t { return r.call; });
                     std::fflush(stderr);
                 }
             }
@@ -3392,6 +3406,81 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
 
             uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+            // #583 (2026-05-15): per-Closure call counter for V3_DBG_ALLOC_DUMP.
+            // The OP_MAKE_THUNK side gives us alloc/force-of-thunk, but Closure
+            // invocations go through OP_CALL — without this we can't see who
+            // re-evaluates `final.isLinux` 1.6M times in nixpkgs hello.name.
+            // Gated behind g_dbgAllocDump so the bump (and the dependent
+            // register read) only fires when diagnostic mode is on.
+            if (__builtin_expect(g_dbgAllocDump, 0) && desc) {
+                uint64_t cnt = ++desc->callCount;
+                // V3_DBG_HOT_CALLEE=<name>:<every_n>:<max_dumps>
+                // dumps the frame stack each time the named callee's
+                // callCount hits a multiple of every_n.  Used to find
+                // who's driving the hello.name re-eval loop.
+                static const char * s_hotCallee =
+                    std::getenv("V3_DBG_HOT_CALLEE");
+                if (__builtin_expect(s_hotCallee != nullptr, 0)
+                    && !desc->name.empty())
+                {
+                    // Parse: name[:everyN[:maxDumps]]
+                    static std::string s_targetName;
+                    static uint64_t s_everyN = 100000;
+                    static int s_maxDumps = 8;
+                    static bool s_parsed = false;
+                    if (!s_parsed) {
+                        s_parsed = true;
+                        std::string spec{s_hotCallee};
+                        size_t c1 = spec.find(':');
+                        s_targetName = spec.substr(0, c1);
+                        if (c1 != std::string::npos) {
+                            size_t c2 = spec.find(':', c1 + 1);
+                            s_everyN = std::strtoull(
+                                spec.substr(c1 + 1, c2 - c1 - 1).c_str(),
+                                nullptr, 10);
+                            if (c2 != std::string::npos)
+                                s_maxDumps = (int)std::strtol(
+                                    spec.substr(c2 + 1).c_str(),
+                                    nullptr, 10);
+                        }
+                        if (s_everyN == 0) s_everyN = 100000;
+                    }
+                    if (desc->name == s_targetName
+                        && (cnt % s_everyN) == 0
+                        && s_maxDumps > 0)
+                    {
+                        --s_maxDumps;
+                        std::fprintf(stderr,
+                            "\nv3 HOT_CALLEE %s[cnt=%llu] frames=%zu:\n",
+                            desc->name.c_str(),
+                            (unsigned long long)cnt,
+                            vm.frames.size());
+                        size_t lim = vm.frames.size();
+                        size_t depth = std::min<size_t>(lim, 16);
+                        for (size_t i = lim; i > 0 && i + depth > lim; --i) {
+                            const auto & fr = vm.frames[i - 1];
+                            const LambdaDescriptor * d2 = nullptr;
+                            if (fr.thunk
+                                && (fr.thunk->state == ThunkState::Suspended
+                                    || fr.thunk->state == ThunkState::Blackhole))
+                                d2 = fr.thunk->suspended.desc;
+                            else if (fr.closure) d2 = fr.closure->desc;
+                            const PosSnapshot * ps =
+                                d2 ? resolvePosSnapshot(d2->posHandle) : nullptr;
+                            std::fprintf(stderr,
+                                "  [%zu] %s @ %s:%u:%u ip=%u\n",
+                                i - 1,
+                                d2 && !d2->name.empty() ? d2->name.c_str()
+                                    : (d2 ? "<anon>" : "<?>"),
+                                (ps && !ps->file.empty()) ? ps->file.c_str()
+                                    : "<no-pos>",
+                                ps ? ps->line : 0u, ps ? ps->column : 0u,
+                                fr.ip);
+                        }
+                        std::fflush(stderr);
+                    }
+                }
+            }
             // Push the new frame in a single move-construct: lets the
             // compiler initialize the trailing 40 bytes inline at the
             // back of the vector rather than emplace_back + 7 separate

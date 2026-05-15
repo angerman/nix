@@ -257,6 +257,13 @@ struct LambdaDescriptor
     /// as `const` so the field is statistical only.
     mutable uint64_t allocCount = 0;
 
+    /// #583 (2026-05-15): bumped at every OP_CALL whose callee is a
+    /// Closure pointing at this descriptor.  Reveals which lambdas are
+    /// repeatedly invoked — the hello.name re-evaluation loop suspects
+    /// matchAttrs/matchAnyAttrs/elaborate's `final` builder.  Statistical
+    /// only; gated behind V3_DBG_ALLOC_DUMP for zero cost otherwise.
+    mutable uint64_t callCount = 0;
+
     /// #424: selector lambda specialisation.  When non-zero, the
     /// lambda body is exactly `paramVar.<selectorSym>` -- the emit-
     /// time peephole detected the canonical bytecode shape:
