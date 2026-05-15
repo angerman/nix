@@ -462,18 +462,22 @@ Installables SourceExprCommand::parseInstallables(ref<Store> store, std::vector<
         auto vFile = state->allocValue();
 
         // v3-direct (NIX_V3_DIRECT_EVAL=1) parses cmd.expr / cmd.file
-        // itself inside runV3DirectEval and never reads *vFile.  When
-        // the flag is set we therefore skip the unconditional TW
-        // `state->eval(e, *vFile)` here and only parse + thunkify so
-        // *vFile is a valid Tag::Thunk in case the v3-direct path
-        // returns false and TW takes over (toValue's forceValue will
-        // run the eval at that point).  Saves a full duplicate
-        // evaluation of the input expression on every v3-direct query
-        // and removes ~hundreds of thousands of TW pre-eval events
-        // from the NIX_TRACE_EVAL trace so v3's behaviour is the
-        // first thing the diff sees.
+        // itself inside runV3DirectEval and never reads *vFile.
+        //
+        // OPT-IN: NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 skips the TW
+        // pre-eval and lazy-thunks *vFile instead so the
+        // NIX_TRACE_EVAL output starts with v3's own events instead
+        // of 353k TW pre-eval lines.  Default OFF because a v3
+        // memoization-failure loop (parse.nix:61 / matchAttrs / ...)
+        // currently re-evaluates the same thunks millions of times
+        // on nixpkgs queries -- without the TW pre-eval to mask it,
+        // even `builtins.isAttrs (import <nixpkgs>{})` runs away to
+        // 50+s CPU at 89%.  Task A12 tracks the memoization fix;
+        // until that lands, the safe default keeps the TW pre-eval
+        // so basic nixpkgs queries complete.
         static const bool s_v3DirectEval =
-            std::getenv("NIX_V3_DIRECT_EVAL") != nullptr;
+            std::getenv("NIX_V3_DIRECT_EVAL") != nullptr
+            && std::getenv("NIX_V3_SKIP_INSTALLABLE_PREEVAL") != nullptr;
 
         if (file == "-") {
             auto e = state->parseStdin();
