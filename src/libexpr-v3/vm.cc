@@ -3998,8 +3998,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // subsequent forceValue calls spin forever in the
                 // chase loop above.  Match tree-walker by raising.
                 if (retVal.isThunk() && retVal.payload.thunk == fr.thunk) {
-                    // Diagnostic: gated on V3_DBG_RETURN_SELF=1.
-                    if (std::getenv("V3_DBG_RETURN_SELF")) {
+                    // gate: V3_DBG_RETURN_SELF — log OP_RETURN self-cycle
+                    // cases (thunk-body returns its own Thunk*).  Retire
+                    // when STG indirect-chain recovery is replaced by
+                    // a deterministic cycle-handling architecture
+                    // (action plan Phase 2).
+                    static const bool s_dbgReturnSelf =
+                        std::getenv("V3_DBG_RETURN_SELF") != nullptr;
+                    if (__builtin_expect(s_dbgReturnSelf, 0)) {
                         const LambdaDescriptor * d = fr.thunk
                             && (fr.thunk->state == ThunkState::Suspended
                                 || fr.thunk->state == ThunkState::Blackhole)
