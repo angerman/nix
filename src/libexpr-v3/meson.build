@@ -223,4 +223,17 @@ if python3.found()
     timeout : 60,
     env : {'NIX' : meson.global_build_root() / 'src' / 'nix' / 'nix'},
   )
+
+  # Action plan Phase 1.3: regression-prevention for the A8 iterative-
+  # force conversion.  Asserts deep let-chain (5000), deep curry-
+  # apply (5000), and deep App-spine (3000) all complete without
+  # C-stack overflow.  Also probes app-spine-5000 informationally
+  # (Phase 1.2 candidate).
+  test(
+    'v3-iterative-force-depth',
+    find_program('bash'),
+    args : [files('test/iterative-force-depth.sh')],
+    timeout : 180,
+    env : {'NIX' : meson.global_build_root() / 'src' / 'nix' / 'nix'},
+  )
 endif
