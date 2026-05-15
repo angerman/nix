@@ -161,4 +161,50 @@ size_t deadBindingElim(Module & m)
     return total;
 }
 
+// ---------------------------------------------------------------------------
+// Public entry: deadBindingElimViaOccur  (OPT_OCCUR Phase B)
+// ---------------------------------------------------------------------------
+//
+// Uses analyseOccurrence's OccMap instead of re-walking the global
+// reference set each iteration.  Same purity rules as deadBindingElim
+// (exprIsPure on the RHS).  Bounded at exactly two analyseOccurrence
+// invocations: round 1 catches the obvious Dead bindings; round 2
+// catches anything that became Dead because its sole consumer was a
+// round-1 victim.  In practice both rounds together match the 8-round
+// fixed point of deadBindingElim.
+//
+// One subtle correctness point: paramVars are classified as `Param`
+// in OccMap, NOT Dead, regardless of count.  So a Function::paramVar
+// is never erased.  This matches deadBindingElim's defensive `refs`
+// pre-population.
+
+size_t deadBindingElimViaOccur(Module & m)
+{
+    size_t total = 0;
+    for (int round = 0; round < 2; ++round) {
+        OccMap occ = analyseOccurrence(m);
+        size_t removed = 0;
+        for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
+            Block & b = m.blocks[bid];
+            if (b.bindings.empty()) continue;
+
+            auto src = b.bindings.begin();
+            auto dst = b.bindings.begin();
+            for (; src != b.bindings.end(); ++src) {
+                OccInfo info = occ.lookup(src->var);
+                if (info.kind == OccKind::Dead && exprIsPure(src->expr)) {
+                    ++removed;
+                    continue;
+                }
+                if (dst != src) *dst = std::move(*src);
+                ++dst;
+            }
+            b.bindings.erase(dst, b.bindings.end());
+        }
+        total += removed;
+        if (removed == 0) break;
+    }
+    return total;
+}
+
 } // namespace nix::v3::ir

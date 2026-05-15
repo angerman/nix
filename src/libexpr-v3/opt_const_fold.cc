@@ -27,9 +27,11 @@
 #include "v3/ir.hh"
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nix::v3::ir {
 
@@ -296,7 +298,72 @@ void optimise(Module & m)
     // and LitPrimOp -> App pairings are observable in one block) and
     // before DCE (so the partial-App orphans get swept).
     fusePrimOpApps(m);
-    deadBindingElim(m);
+
+    // OPT_OCCUR Phase B: opt-in occurrence-info-driven DCE.  When both
+    // gates are set, run side-by-side and assert identical removal
+    // sets (the migration-validation harness).  When only NIX_V3_OCCUR_DCE
+    // is set, use the new variant.  Default: old deadBindingElim.
+    //
+    // gate: NIX_V3_OCCUR_DCE — opt-in to deadBindingElimViaOccur.
+    // Retire after one release of NIX_V3_OCCUR_DCE_VALIDATE clean
+    // runs across the functional test suite (Phase B exit criterion).
+    //
+    // gate: NIX_V3_OCCUR_DCE_VALIDATE — side-by-side migration
+    // harness.  Retire alongside NIX_V3_OCCUR_DCE.
+    static const bool occurDce =
+        std::getenv("NIX_V3_OCCUR_DCE") != nullptr;
+    static const bool occurDceValidate =
+        std::getenv("NIX_V3_OCCUR_DCE_VALIDATE") != nullptr;
+
+    if (__builtin_expect(occurDceValidate, 0)) {
+        // Snapshot pre-DCE binding set: a vector of (block, var) pairs
+        // gives us an O(1) per-binding "did this survive" check.
+        std::unordered_set<uint64_t> beforeKey;
+        auto key = [](BlockId b, VarId v) -> uint64_t {
+            return (uint64_t)b << 32 | (uint64_t)v;
+        };
+        for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid)
+            for (const auto & bd : m.blocks[bid].bindings)
+                beforeKey.insert(key(bid, bd.var));
+
+        // Path A: old DCE on a clone-by-copy of the bindings only
+        // (cheap — no need to clone the whole Module since DCE only
+        // touches Block::bindings).  Capture the survivors.
+        std::vector<std::vector<Binding>> savedBindings;
+        savedBindings.reserve(m.blocks.size());
+        for (const auto & b : m.blocks) savedBindings.push_back(b.bindings);
+        size_t removedOld = deadBindingElim(m);
+        std::unordered_set<uint64_t> oldSurvivors;
+        for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid)
+            for (const auto & bd : m.blocks[bid].bindings)
+                oldSurvivors.insert(key(bid, bd.var));
+
+        // Restore, then run new DCE.
+        for (BlockId bid = 0; bid < (BlockId)m.blocks.size(); ++bid)
+            m.blocks[bid].bindings = std::move(savedBindings[bid]);
+        size_t removedNew = deadBindingElimViaOccur(m);
+
+        // Compare survivors.
+        std::unordered_set<uint64_t> newSurvivors;
+        for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid)
+            for (const auto & bd : m.blocks[bid].bindings)
+                newSurvivors.insert(key(bid, bd.var));
+
+        if (oldSurvivors != newSurvivors || removedOld != removedNew) {
+            std::fprintf(stderr,
+                "v3 OPT_OCCUR_DCE_VALIDATE MISMATCH: "
+                "old removed=%zu new removed=%zu old.survivors=%zu "
+                "new.survivors=%zu\n",
+                removedOld, removedNew,
+                oldSurvivors.size(), newSurvivors.size());
+        }
+        // If we got here, the new DCE result is the module's current
+        // state — that's what we keep going.
+    } else if (occurDce) {
+        deadBindingElimViaOccur(m);
+    } else {
+        deadBindingElim(m);
+    }
 }
 
 } // namespace nix::v3::ir

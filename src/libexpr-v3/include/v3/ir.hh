@@ -745,6 +745,21 @@ size_t constantFold(Module & m);
 /// removed across all iterations.
 size_t deadBindingElim(Module & m);
 
+/// OPT_OCCUR Phase B variant of deadBindingElim.  Consults the OccMap
+/// produced by `analyseOccurrence` instead of re-walking the reference
+/// graph each iteration.  Two passes (per OPT_OCCUR_PLAN_2026-05-08.md
+/// §B): first pass removes Dead+pure bindings; second pass picks up
+/// any newly-Dead bindings whose sole consumer was removed by the
+/// first.  Equivalent result to `deadBindingElim` (8-round fixed point)
+/// but bounded at exactly 2 occurrence-info walks.  Returns total
+/// bindings removed.
+///
+/// gate: NIX_V3_OCCUR_DCE — opt-in switch to use this variant in
+/// place of deadBindingElim.  Retire once side-by-side validation
+/// (NIX_V3_OCCUR_DCE_VALIDATE) confirms identical removal sets
+/// across the full functional test suite for one release.
+size_t deadBindingElimViaOccur(Module & m);
+
 /// Collapse VarRef alias bindings.  For every `v = VarRef{u}`, rewrite
 /// every operand `v` to `u` across the whole Module and drop the
 /// alias binding.  Path-compresses chains so a chain of N aliases
