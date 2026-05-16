@@ -266,23 +266,31 @@ config is ~7-8 deep per the original audit note).
 a future workload surfaces a valueEqual depth issue, that's the
 trigger to revisit — but it isn't speculative-future work.
 
-### Remaining Phase 1.2 candidates
+### Step 4 — RESOLVED 2026-05-16 (commit e1dfd98c2)
 
-After step 3, exactly one architectural conversion remains:
+**Hypothesis killed**: "v3's App-spine recursion is fundamentally
+bounded by kMaxCallDepth and cannot be made truly iterative
+without a multi-day architectural restructure."
 
-- **App-spine deep recursion** — surfaces in the
-  `v3-iterative-force-depth` test's app-spine-5000 probe (fails
-  at the `kMaxCallDepth=5000` guard per `v3 forceValue: stack
-  overflow; call depth exceeded 5000`).  Each `id (id (... 0))`
-  application's body forces its arg via OP_GET_LOCAL_FORCE,
-  recursing into callClosure → forceValue.  The frame stack
-  grows by 1 per nesting level.  Fix is architectural: replace
-  the recursive callClosure + forceValue interleave with a
-  single dispatchLoop driver that processes the App spine as
-  successive frame pushes, without C-recursion through forceValue.
+**Resolution**: identity-lambda specialisation.  Emit-time peephole
+detects the `x: x` body shape (2-instruction
+OP_GET_LOCAL[_FORCE] 0 + OP_RETURN), sets
+`LambdaDescriptor::identityLambda = true`.  Fast paths at OP_CALL,
+callClosure, runLambda, and (load-bearing) OP_FORCE's Tag::App
+apply loop substitute the arg directly, with no frame push.  The
+App-spine apply loop becomes a tight iteration inside the same
+C frame — no recursion through callClosure / forceValue / inner
+dispatchLoop.
 
-  Multi-day effort.  Not addressed in this session — proper
-  Phase 1 follow-up.
+**Effort**: small (88 lines added).  The hypothesis was wrong about
+"multi-day architectural restructure" — the proper fix was an
+emit-time peephole, not a runtime dispatchLoop driver.
+
+**Verification**:
+  - v3-iterative-force-depth: app-spine-10000 passes (was failing at
+    app-spine-5000 with `kMaxCallDepth=5000 exceeded`).  20000 finally
+    hits the *parser's* nesting limit, not v3's vm.frames.
+  - Bench n=5: no regression.
 
 ### Phase 1.2 closing notes (2026-05-15)
 

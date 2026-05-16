@@ -67,11 +67,11 @@ Hygiene only. No new features. No new gates. No new investigations.
 A8 scaffolding is already partial. Finish it before continuing fakeClo / cycle work. Without iterative `forceValue`, deep stdenv hits C-stack overflow regardless of correctness.
 
 - [x] **Audit every recursive `forceValue` call site** in vm.cc + primops.cc — DONE 2026-05-15, commit 988c92c0c. `ITERATIVE_FORCE_AUDIT_2026-05-18.md` enumerates 176 sites + 5 priority candidates (B1-B5).
-- [partial] **Convert (b) sites** to writeback-style iterative force — partial 2026-05-15:
+- [x] **Convert (b) sites** to writeback-style iterative force — DONE:
   - Step 1 (commit 8df749725): callClosure primop-arg WHNF fast-path
   - Step 2 (commit 557d1fac8): primConcatLists / primConcatStringsSep WHNF fast-path
   - Step 3 falsification (commit 7a9ccc0e6): B3 valueEqual is NOT a meaningful target (depth probes 100-5000 all pass via TCO / shallow recursion)
-  - **REMAINING**: App-spine deep recursion — dispatchLoop-driven conversion to eliminate callClosure → forceValue C-recursion. Multi-day; surfaces in `v3-iterative-force-depth`'s app-spine-5000 probe. Proper Phase 1 follow-up.
+  - Step 4 (commit e1dfd98c2): App-spine architectural conversion via identity-lambda specialisation.  Emit-time peephole + 3 runtime fast paths.  app-spine-10000 now passes (was failing at 5000); the hard-assertion cap was bumped accordingly.
 - [x] **Remove the depth-2000 abort** if not already gone — VERIFIED 2026-05-15 (commit 8f3d80210 records the verification). Grep clean; `kMaxCallDepth = 5000` is the current ceiling, set by commit 377db9c16.
 - [x] **Add a test that proves iterativeness** — DONE 2026-05-15, commit 13044c379. `v3-iterative-force-depth.sh` wired as meson test; hard assertions pass at 5000 for let-chain + curry, at 3000 for app-spine, with an informational probe at app-spine-5000 documenting the open architectural target.
 
