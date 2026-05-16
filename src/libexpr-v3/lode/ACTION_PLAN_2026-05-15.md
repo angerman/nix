@@ -66,10 +66,14 @@ Hygiene only. No new features. No new gates. No new investigations.
 
 A8 scaffolding is already partial. Finish it before continuing fakeClo / cycle work. Without iterative `forceValue`, deep stdenv hits C-stack overflow regardless of correctness.
 
-- [ ] **Audit every recursive `forceValue` call site** in vm.cc + primops.cc. Tag each: (a) already iterative, (b) needs writeback-conversion, (c) is a leaf primop that can stay recursive but with explicit depth-cap. List in `ITERATIVE_FORCE_AUDIT_2026-05-18.md`. (1 day)
-- [ ] **Convert (b) sites** to writeback-style iterative force per the pattern in commits f6bf3fe8d, f82a2f725, 5d9909d8c, f5804ea05. (3-5 days)
-- [ ] **Remove the depth-2000 abort** if not already gone (377db9c16 removed it; verify no resurrected `if (depth > 2000) abort()` exists). (15 m)
-- [ ] **Add a test that proves iterativeness**, not just absence-of-crash. A 5000-deep `let x0 = x1; ... x4999 = …` chain that completes; assert via `V3_TIMING` that C-stack peak stays under a small bound. (4 h)
+- [x] **Audit every recursive `forceValue` call site** in vm.cc + primops.cc — DONE 2026-05-15, commit 988c92c0c. `ITERATIVE_FORCE_AUDIT_2026-05-18.md` enumerates 176 sites + 5 priority candidates (B1-B5).
+- [partial] **Convert (b) sites** to writeback-style iterative force — partial 2026-05-15:
+  - Step 1 (commit 8df749725): callClosure primop-arg WHNF fast-path
+  - Step 2 (commit 557d1fac8): primConcatLists / primConcatStringsSep WHNF fast-path
+  - Step 3 falsification (commit 7a9ccc0e6): B3 valueEqual is NOT a meaningful target (depth probes 100-5000 all pass via TCO / shallow recursion)
+  - **REMAINING**: App-spine deep recursion — dispatchLoop-driven conversion to eliminate callClosure → forceValue C-recursion. Multi-day; surfaces in `v3-iterative-force-depth`'s app-spine-5000 probe. Proper Phase 1 follow-up.
+- [x] **Remove the depth-2000 abort** if not already gone — VERIFIED 2026-05-15 (commit 8f3d80210 records the verification). Grep clean; `kMaxCallDepth = 5000` is the current ceiling, set by commit 377db9c16.
+- [x] **Add a test that proves iterativeness** — DONE 2026-05-15, commit 13044c379. `v3-iterative-force-depth.sh` wired as meson test; hard assertions pass at 5000 for let-chain + curry, at 3000 for app-spine, with an informational probe at app-spine-5000 documenting the open architectural target.
 
 **Phase 1 exit criterion**: `(import <nixpkgs> {}).hello.name` evaluates to a string under `NIX_V3_DIRECT_EVAL=1` *without C-stack overflow* (perf irrelevant — could be 100×). If it returns the wrong string or hits a different bug class, that's still progress: A7 closed, next bug visible.
 
