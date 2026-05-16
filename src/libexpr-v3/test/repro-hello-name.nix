@@ -35,11 +35,23 @@
 #              → ... parsedPlatform.check ...
 #                → cycle of (b @ flip → openKernel.check → setTypes)
 #
-# Hypothesis kept open: the cycle involves overlays applied to lib
-# during pkgs construction (each stage re-applies overlays via
-# `lib.extends` / `lib.composeExtensions`), and v3's lib.fix
-# / extends intrinsic path interacts badly with parsedPlatform.check
-# when called from inside the stage's lazy attrset.
+# Confirmed via gate-bisection (2026-05-16):
+#   - With NIX_V3_INHERIT_FROM_THUNK_ALL=1 (DEFAULT): hot loop, 44+ s.
+#     5.7M setType calls inside parsedPlatform.check / flip / setTypes.
+#   - With NIX_V3_NO_INHERIT_FROM_THUNK_ALL=1: 1.5 s with the error
+#       error: v3 OP_WITH_LOOKUP: cycle while resolving
+#     i.e. THUNK_ALL was workaround-ing a real v3-direct cycle
+#     that surfaces as soon as the workaround is disabled.
+#   - With NIX_V3_NO_INHERIT_FROM_THUNK_ALL=1 +
+#         NIX_V3_NO_INTRINSIC_RECOGNISE=1: same OP_WITH_LOOKUP cycle,
+#     0.6 s.  Disabling native lib.fix / extends dispatch does not
+#     close the cycle.
+#
+# This is exactly the Phase 2 decision point named in the action
+# plan: Path A (keep THUNK_ALL, fix the 100x slowdown in the cycle)
+# vs Path B (finish CELL_EVERYWHERE, fix the underlying OP_WITH_LOOKUP
+# cycle and retire THUNK_ALL).  The bisection above gives Phase 2 a
+# concrete entry point either way.
 #
 # This expression alone is NOT a self-contained repro — it imports
 # nixpkgs.  A truly self-contained synthetic repro could not be
