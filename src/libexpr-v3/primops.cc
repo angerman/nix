@@ -2941,7 +2941,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
 /// on mid-construction entries (NixOS module fix-points' `config`)
 /// don't trip until the body would have hit them in TW too.
 } } // close anon + nix::v3 to declare at file scope
-namespace nix::v3 { bool forceEagerBridge(); bool shallowTWAttrsBridge(); }
+namespace nix::v3 { bool shallowTWAttrsBridge(); }
 namespace nix::v3 { namespace {
 
 // #453 Phase D: bridge-primop call counters.  Atomics keep them off
@@ -3772,7 +3772,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 return (uint32_t)std::atoi(v);
             return (uint32_t)4;
         }();
-        if (n <= kEagerListMax || forceEagerBridge()) {
+        if (n <= kEagerListMax) {
             auto lb = ns.buildList(n);
             for (uint32_t i = 0; i < n; ++i)
                 lb[i] = v3ToTreeWalker(state, lv->elems[i], seen);
@@ -3863,18 +3863,18 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // PrimOpApp values; when those entries are forced and re-enter
         // v3 (e.g. through `with self;` looking up another attr from
         // the same attrset), the indirection cycles infinitely.  Until
-        // a proper cycle-break lands, raising the threshold lets a
-        // workload opt out of the lazy bridge.  Additionally, the
-        // call-hook sets `forceEagerBridge` for on-demand-root-
-        // populated lambdas so their results don't go through the
-        // lazy path even when the global threshold is low.
+        // a proper cycle-break lands, raising the threshold via
+        // NIX_V3_EAGER_BRIDGE_MAX lets a workload opt out of the lazy
+        // bridge.  (Historical: the call-hook in v3_hook.cc used to
+        // also push a `forceEagerBridge` TLS flag for on-demand-root-
+        // populated lambdas; the hook and the flag are gone.)
         size_t bSize = b ? b->size : 0;
         static const size_t kEagerBridgeMax = []{
             if (const char * v = std::getenv("NIX_V3_EAGER_BRIDGE_MAX"))
                 return (size_t)std::atoi(v);
             return (size_t)4;
         }();
-        bool useEager = bSize <= kEagerBridgeMax || forceEagerBridge();
+        bool useEager = bSize <= kEagerBridgeMax;
         if (useEager) {
             if (b) for (uint32_t i = 0; i < b->size; ++i) {
                 SymbolId sid = b->entries[i].name;
@@ -7075,26 +7075,8 @@ PrimOpCounter & primOpCounter()
 }
 } // anonymous namespace
 
-// #455: file-scope (external-linkage) thread-local + push/pop for
-// the eager-bridge flag.  forceEagerBridge() is the read-side
-// helper used inside v3ToTreeWalker and is forward-declared in the
-// anon namespace above.  (Historical: v3_hook.cc's call-hook used
-// to push the flag via a ScopedEagerBridge guard for on-demand-
-// root-populated lambda results — with v3_hook.cc deleted, there
-// are no remaining writers and the reader always returns false.
-// Push/pop kept for future plugin-side use, but the flag is
-// effectively dead infrastructure pending removal.)
-thread_local bool tlsForceEagerBridge = false;
-bool forceEagerBridge() { return tlsForceEagerBridge; }
-bool pushForceEagerBridge() {
-    bool prev = tlsForceEagerBridge;
-    tlsForceEagerBridge = true;
-    return prev;
-}
-void popForceEagerBridge(bool prev) { tlsForceEagerBridge = prev; }
-
-// #452 / Phase C: shallow-TW-attrs-bridge flag, parallel to the
-// eager-bridge knob above.  When set, treeWalkerToV3's nAttrs case
+// #452 / Phase C: shallow-TW-attrs-bridge flag.  When set,
+// treeWalkerToV3's nAttrs case
 // wraps each TW entry's Value* in a v3 Bridge thunk instead of
 // deeply converting.  Pushed by the call hook for the duration of
 // runLambda when the lambda has formals -- only entries the body

@@ -62,10 +62,10 @@ These have no remaining writers (or no remaining readers after
 v3_hook.cc deletion) and can be removed in Phase 4 without behavior
 change. Discovered during Phase 0.2 tombstone reaping.
 
-| name | first use | reason |
+| name | first use | reason / status |
 |---|---|---|
-| `CFF_TAINTED` | — | Removed in commit 156939f43 (Phase 0.1). Listed for completeness. |
-| (eager-bridge TLS readers) | `primops.cc:3757`, `3859` | `forceEagerBridge()` always returns false; `pushForceEagerBridge` / `popForceEagerBridge` have zero callers. The whole TLS apparatus is unreachable. |
+| `CFF_TAINTED` | — | **DONE** — Removed in commit 156939f43 (Phase 0.1). |
+| eager-bridge TLS apparatus | `primops.cc:7087-7094` | **DONE** — `tlsForceEagerBridge` / `forceEagerBridge()` / `pushForceEagerBridge` / `popForceEagerBridge` deleted + the two dead `|| forceEagerBridge()` reader sites simplified. Hypothesis killed: "the eager-bridge apparatus has remaining callers." |
 | `V3_DEBUG_HOOK` | `primops.cc:3084` | Reader is inside a code path that no longer matters with the hook deleted. Triage in Phase 4. |
 
 ## RETIRE-AFTER-X (single-use gates tied to a specific phase / bug close)

@@ -117,7 +117,8 @@ if [[ -e "$repro_455" ]]; then
     echo "  v3 default:                                               $v3_out"
     echo "  v3 + ON_DEMAND_ROOT + SKIP_THRESHOLD=0:                   '$od_out'"
     echo "  The auto-eager-bridge fix for #455 lazy-bridge cycle has"
-    echo "  regressed.  Check the call hook's ScopedEagerBridge guard."
+    echo "  regressed.  Check NIX_V3_EAGER_BRIDGE_MAX threshold logic"
+    echo "  in primops.cc treeWalkerToV3 (Tag::Attrs case)."
     exit 1
   fi
   echo "=== #455 minimal repro positive: passes (auto-eager fix intact) ==="
