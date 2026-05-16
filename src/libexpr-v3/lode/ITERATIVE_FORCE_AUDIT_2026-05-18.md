@@ -214,6 +214,21 @@ fast-path is the WHNF-skip flavour.
 baseline shows movement within ±3% noise (workloads in the corpus
 don't heavily exercise recursive-primop chains).
 
+### Step 1.5 — RESOLVED 2026-05-15 (verification only, no commit)
+
+**Hypothesis killed**: "the depth-2000 hard-abort in forceValue
+has been resurrected somewhere".  This was the Phase 1 action
+plan's 15-minute check.
+
+**Method**: grep for `depth > 2000`, `2000 abort`, `abort 2000`,
+`level > 2000` across src/libexpr-v3/.  Zero matches.  The current
+ceiling is `kMaxCallDepth = 5000` (vm.cc:100), per commit 377db9c16
+("v3 A8: remove the depth-2000 hard-abort in forceValue").
+
+**Outcome**: no code change required.  Recorded here so the model
+is explicitly confirmed (Rule 0: "confirming a model" exits the
+investigation).
+
 ### Step 2 — RESOLVED 2026-05-15 (commit 557d1fac8)
 
 **Hypothesis killed**: "all hot primop list iterations have the

@@ -1,12 +1,37 @@
-# `lode/` -- engineering logbook (historical)
+# `lode/` -- engineering logbook (historical + current)
 
-Files in this directory are **point-in-time artifacts** -- review snapshots,
+Most files in this directory are **point-in-time artifacts** -- review snapshots,
 benchmark logs, fix-plan postmortems.  They were accurate when written but the
 codebase has moved past them.  Don't trust them for current state.
 
-For current state:
+## Current canonical reference (2026-05-15) — read these first
+
+These four docs supersede everything below them on strategic direction. Read
+them before any of the older review / RCA / plan docs.
+
+- **`ACTION_PLAN_2026-05-15.md`** -- active 8-week phased plan (Phases 0-4)
+  with TODO checklists, exit criteria, kill criteria. Drives day-to-day work.
+  **Rule 0** (the falsification rule, in Part 1) is the meta-rule for all v3
+  commits.
+- **`LESSONS_LEARNED_2026-05-15.md`** -- distilled from ~1380 commits + the
+  older lode/ archive. Part 0 names the main issue (multi-agent diagnosis).
+  Part 1-3 codify constraints (V3-NATIVE, v3-native primops, eager-vs-lazy
+  asymmetry), what worked, what didn't. Part 4 has Nix-domain knowledge +
+  §4.8 bisection methodology + §4.9 the 10-item debug story.
+- **`ALIGNMENT_SCORECARD_2026-05-15.md`** -- vision-vs-reality scorecard for
+  12 components + 6 drift items + orphan gaps. Re-score quarterly.
+- **`ROADMAP_TO_VISION_2026-05-15.md`** -- long-horizon Stages 1-8
+  (44 weeks, ≈ 2027-Q1). Picks up where ACTION_PLAN leaves off.
+
+Companion: `../CLAUDE.md` loads this set into every Claude session.
+
+For current state of build commands / supported AST shapes / lang-test status:
 
 - `../USAGE.md` -- living usage guide (still at top level on purpose).
+  **Caveat**: perf claims and parity assertions in USAGE.md are from
+  2026-05-05 and are inaccurate on real workloads today. v3-hook described
+  there was deleted in `e8d7c3885`. Use USAGE.md for build + supported
+  features; consult the four strategic docs above for current direction.
 - `../test/wc38-bisect-README.md` -- co-located with the harness it documents.
 
 ## Reviews & audits (point-in-time)

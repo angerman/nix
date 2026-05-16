@@ -38,6 +38,7 @@ All subsequent rules in this section are specializations of Rule 0.
 - **Bench is the floor, not the ceiling.** If `bench/` hasn't been re-run in 7 days, all perf claims expire. If v3-direct cannot complete `hello.name`, "parity" is an unsupported claim about lang tests + micros only.
 - **Reap before adding.** Each landing PR must net-decrease one of: gate count, vm.cc line count, lode/ open-doc count, dead-read references. CI computes the deltas.
 - **Decision points are mandatory.** Each phase below has a kill criterion. If the criterion fails, the phase pauses; we do not silently roll into the next sub-phase.
+- **Bisect nixpkgs to find the unit you can falsify against.** When a v3-direct failure on real nixpkgs surfaces, do not debug against the full eval — bisect nixpkgs itself (overlays, system, attribute path, by-name slices, commit history, env-gate combinations) until you have a 5-20 line `.nix` reproducer. Save it as `test/repro-<issue>-<shape>.nix` with a `run-<issue>-tests.sh` driver. Keep it as a regression test forever, even after the bug closes — the repro becomes a positive guardrail. Full methodology: `LESSONS_LEARNED_2026-05-15.md` §4.8.
 
 ---
 
