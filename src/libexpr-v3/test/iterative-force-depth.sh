@@ -104,29 +104,15 @@ for D in 100 1000 "$DEPTH"; do
   run_test "let-chain-${D}"       "$(gen_chain "$D")"      "0"
   run_test "curry-apply-${D}"     "$(gen_curry "$D")"      "$((D - 1))"
 done
-# App-spine: capped at 3000.  v3 currently C-stack-overflows around
-# 5000; that's a Phase 1.2 follow-up.  3000 is a regression-
-# prevention guard with margin.
-for D in 100 1000 3000; do
+# App-spine: capped at 10000.  Phase 1.2 identity-lambda specialisation
+# (emit.cc + vm.cc; LambdaDescriptor::identityLambda) made the App-
+# spine apply loop truly iterative: each `id` substitutes the arg
+# directly with no frame push.  Prior to that fix, the cap was 3000
+# (kMaxCallDepth=5000 fired at ~4000-5000).  Now bounded only by
+# the parser's nesting limit (~15000 for our generator pattern).
+for D in 100 1000 5000 10000; do
   run_test "app-spine-${D}"       "$(gen_appspine "$D")"   "0"
 done
-
-# Informational probe — NOT counted toward failures.  Documents the
-# current C-stack ceiling on app-spine; expected to move up as
-# Phase 1.2 converts callClosure / OP_CALL primop-arg force loops.
-# If this case starts passing, the test's hard-assertion app-spine
-# cap can be bumped to 5000.
-probe_app_spine_5000() {
-  local out rc
-  out=$(NIX_V3_DIRECT_EVAL=1 timeout -s KILL "$TIMEOUT" "$NIX" eval --impure --expr "$(gen_appspine 5000)" 2>&1)
-  rc=$?
-  if [[ $rc -eq 0 && "$out" == "0" ]]; then
-    echo "PROBE app-spine-5000: PASS (consider bumping hard-assertion cap)"
-  else
-    echo "PROBE app-spine-5000: fails (rc=$rc) — Phase 1.2 candidate"
-  fi
-}
-probe_app_spine_5000
 
 echo "=== iterative-force-depth results ==="
 echo "  total failures: $failures"

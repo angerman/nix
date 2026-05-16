@@ -1548,6 +1548,32 @@ struct Emitter
             }
         }
 
+        // Phase 1.2 identity-lambda detection: body is exactly
+        //   OP_GET_LOCAL[_FORCE] 0
+        //   OP_RETURN
+        // Two instructions, no frame setup needed at call time —
+        // arg substitutes directly.  Critical for deep App spines
+        // like `id (id (id ... 0))` that otherwise push 5000 frames
+        // and hit kMaxCallDepth.  Same gating conditions as the
+        // selectorSym detection above (non-top-level, single param,
+        // no formals, no captures) to keep the recognition narrow.
+        if (fid != 0
+            && f.argName != ir::kInvalidSymbol
+            && !f.hasFormals
+            && f.freeVars.empty()
+            && unit.code.size() == codeStart + 2)
+        {
+            const Instruction i0 = unit.code[codeStart];
+            const Instruction i1 = unit.code[codeStart + 1];
+            const Op op0 = decodeOp(i0);
+            if ((op0 == OP_GET_LOCAL || op0 == OP_GET_LOCAL_FORCE)
+                && decodeOperand(i0) == 0
+                && decodeOp(i1) == OP_RETURN)
+            {
+                unit.lambdas[fid].identityLambda = true;
+            }
+        }
+
         unit.lambdaCodeOffsets[fid] = codeStart;
 
         ctx = nullptr;

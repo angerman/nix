@@ -276,6 +276,21 @@ struct LambdaDescriptor
     /// in nixpkgs and now actually flow through v3 since #426.
     uint32_t selectorSym = 0;
 
+    /// Phase 1.2 (2026-05-16): identity-lambda specialisation.  When
+    /// `true`, the lambda body is exactly `x: x` -- the emit-time
+    /// peephole detected the canonical 2-instruction body:
+    ///   OP_GET_LOCAL[_FORCE] 0
+    ///   OP_RETURN
+    /// OP_CALL / callClosure / OP_FORCE's Tag::App apply step take a
+    /// fast path: substitute the arg directly, skip the frame push.
+    /// Critical for deep App spines like `id (id (id ... 0))` where
+    /// every level otherwise pushes a frame and hits the
+    /// kMaxCallDepth=5000 guard.  Also pays on nixpkgs callPackage
+    /// chains where `let foo = bar: bar; in foo (foo ...)` patterns
+    /// occur — the elaboration helpers in lib have many of these.
+    /// Set in emit.cc next to the selectorSym detection block.
+    bool identityLambda = false;
+
     /// #495: native intrinsic kind.  When recognised at lower-time,
     /// the lambda's body matches a canonical Nix-stdlib pattern (lib.fix,
     /// lib.extends, lib.composeExtensions, ...) and OP_CALL dispatches

@@ -3243,6 +3243,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 break;
             }
 
+            // Phase 1.2 identity-lambda fast path: body is `x: x`.
+            // Push arg back, skip frame allocation entirely.  Matches
+            // the selectorSym pattern above.  Detection in emit.cc.
+            if (__builtin_expect(desc->identityLambda, 0)) {
+                push(vm, arg);
+                break;
+            }
+
             // Closures from imported files own their own CompilationUnit;
             // when callee->cu differs, switch the dispatch loop to the
             // callee's bytecode/constant pools.  Falls back to the caller's
@@ -4527,7 +4535,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         v = forceValue(vm, v);
                     // Apply rights in source order (we collected
                     // outermost-first while walking; reverse on apply).
+                    //
+                    // Phase 1.2 (2026-05-16): identity-lambda fast path.
+                    // `id (id (id ... 0))` x N otherwise pushes N frames
+                    // via callClosure → dispatchLoop → OP_GET_LOCAL_FORCE
+                    // → OP_FORCE → callClosure (each id's body forces
+                    // its arg, triggering the next nested OP_FORCE), and
+                    // hits the kMaxCallDepth=5000 guard around N=5000.
+                    // For identity lambdas the body is `x: x`; the arg
+                    // substitutes directly with no frame setup needed.
+                    // This collapses the App spine to a tight loop
+                    // inside this OP_FORCE handler.
                     for (size_t i = rights.size(); i > 0; --i) {
+                        if (v.tag() == Tag::Closure
+                            && v.payload.closure
+                            && v.payload.closure->desc
+                            && v.payload.closure->desc->identityLambda)
+                        {
+                            v = rights[i - 1];
+                            continue;
+                        }
                         v = callClosure(vm, v, rights[i - 1]);
                     }
                     continue;
@@ -8449,6 +8476,13 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
     if (desc.nUpvalues != nUpvalues)
         throw std::runtime_error("v3 runLambda: nUpvalues mismatch");
 
+    // Phase 1.2 identity-lambda fast path — mirrored from OP_CALL /
+    // callClosure.  Body is `x: x`; return arg directly, no force
+    // (the consumer drives force-on-demand per Nix semantics).
+    if (__builtin_expect(desc.identityLambda, 0)) {
+        return arg;
+    }
+
     // #424: selector-lambda fast path also fires when the call hook
     // routes here (bypassing OP_CALL).  Same shape -- force arg,
     // project, return.  Skips the entire frame setup + dispatch loop.
@@ -9816,6 +9850,12 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             throw std::runtime_error(
                 "v3 selector lambda: missing attr");
         return *v;
+    }
+
+    // Phase 1.2 identity-lambda fast path — mirrored from OP_CALL.
+    // Body is `x: x`; return arg directly with no frame push.
+    if (__builtin_expect(desc->identityLambda, 0)) {
+        return arg;
     }
 
     // Cross-CU calls (e.g., calling a closure returned from
