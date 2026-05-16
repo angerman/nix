@@ -244,23 +244,54 @@ and primConcatStringsSep didn't.)
 
 **Verification**: regression tests pass; bench within ±3% noise.
 
+### Step 3 — RESOLVED 2026-05-15 (verification only, no commit)
+
+**Hypothesis killed**: "valueEqual's recursive list / attrset
+comparison creates a meaningful C-stack overflow risk at deep
+nested-value comparison."  Falsified.
+
+**Method**: synthetic deep-equality probes at depths 100 / 1000 /
+3000 / 5000 across three patterns:
+  - nested list  `[[[ ... [0] ... ]]]`
+  - nested attrs `{v={v={v={...v=0...}}}}`
+  - mixed        `[{v=[{v=...0...}]}]`
+
+All three return `true` at all tested depths without C-stack
+overflow.  Either the C++ compiler is performing TCO on the
+tail-recursive single-element / single-attr case, or real-world
+deep-equality depths are too shallow to matter (cardano-node
+config is ~7-8 deep per the original audit note).
+
+**Outcome**: B3 is removed from the Phase 1.2 priority list.  If
+a future workload surfaces a valueEqual depth issue, that's the
+trigger to revisit — but it isn't speculative-future work.
+
 ### Remaining Phase 1.2 candidates
 
-The WHNF-skip pattern is the easy half. The remaining work is the
-**iterative-via-writeback** conversion for sites where the
-recursion isn't on a single value-check but on a deeply-nested
-structure. From the audit:
+After step 3, exactly one architectural conversion remains:
 
-- **B3 valueEqual** — recursive list/attrset comparison. Converting
-  requires an explicit `std::vector<std::pair<Value, Value>>` work
-  stack. Independent effort; 1-2 days. Not closed by step 1/2.
 - **App-spine deep recursion** — surfaces in the
-  `v3-iterative-force-depth` test's app-spine-5000 probe (still
-  fails at the kMaxCallDepth=5000 guard, per the probe). Each `id
-  (id (... 0))` application's body forces its arg, recursing into
-  callClosure → forceValue. Fix requires making the inner force
-  chain truly iterative — push frames onto vm.frames and let the
-  outer dispatchLoop drive, instead of C-recursing through
-  forceValue + callClosure. Architectural change; multi-day.
+  `v3-iterative-force-depth` test's app-spine-5000 probe (fails
+  at the `kMaxCallDepth=5000` guard per `v3 forceValue: stack
+  overflow; call depth exceeded 5000`).  Each `id (id (... 0))`
+  application's body forces its arg via OP_GET_LOCAL_FORCE,
+  recursing into callClosure → forceValue.  The frame stack
+  grows by 1 per nesting level.  Fix is architectural: replace
+  the recursive callClosure + forceValue interleave with a
+  single dispatchLoop driver that processes the App spine as
+  successive frame pushes, without C-recursion through forceValue.
 
-These are the remaining hypotheses the rest of Phase 1.2 will kill.
+  Multi-day effort.  Not addressed in this session — proper
+  Phase 1 follow-up.
+
+### Phase 1.2 closing notes (2026-05-15)
+
+Three WHNF-skip wins landed; one verification (depth-2000) and
+one falsification (B3 valueEqual) recorded.  The single remaining
+architectural conversion (App-spine via dispatchLoop driver) is
+the proper multi-day Phase 1 work the action plan budgets.  Phase
+1 exit criterion ("hello.name evaluates without C-stack overflow")
+is NOT met today — but the failure is no longer a C-stack issue.
+It's the matchAttrs / mapAttrs re-evaluation hot loop documented
+in `project_583_memoization_loop.md`, which is Phase 2 territory
+(memoization on rec-attrset entries).
