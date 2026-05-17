@@ -54,6 +54,7 @@ lib_sources = files(
   'emit.cc',
   'vm.cc',
   'primops.cc',
+  'bytecode_primops.cc',
   'lower.cc',
   'opt_const_fold.cc',
   'opt_cse.cc',

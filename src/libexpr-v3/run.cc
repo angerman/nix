@@ -14,6 +14,7 @@
 #include "v3/primop.hh"
 #include "v3/ir.hh"
 #include "v3/alloc.hh"
+#include "v3/bytecode_primops.hh"
 
 #include "nix/expr/eval.hh"
 
@@ -101,6 +102,17 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // thunks; see `primops.cc treeWalkerToV3` nFunction case for the
     // address-stability contract.
     setNixEvalState(&state);
+
+    // A12b T0: install bytecode replacements for callback primops
+    // (foldl' / map / filter / etc.) once per process.  The install
+    // itself runs runRootExpr recursively to compile each primop's
+    // Nix source; the function has its own thread-local guard that
+    // short-circuits on recursive entry so we don't loop.  Disable
+    // with NIX_V3_NO_BYTECODE_PRIMOPS=1 for A/B comparison.
+    static const bool s_noBytecodePrimops =
+        std::getenv("NIX_V3_NO_BYTECODE_PRIMOPS") != nullptr;
+    if (!s_noBytecodePrimops)
+        installAllBytecodePrimops(state);
 
     // V3_TIMING phase split — capture lower / compile / run / bridge
     // phase durations so bench harnesses can attribute time.  A no-op
