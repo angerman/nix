@@ -4747,6 +4747,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // apply once.  The leaf force call is non-App, so
                     // any forceValue recursion bottoms out at the leaf
                     // rather than at every App level.
+                    //
+                    // 2026-05-18: App-result memoization.  See the
+                    // matching comment in forceValue's Tag::App handler
+                    // (~line 9257).  Memo-hit fast path returns the
+                    // cached result; cold path computes + stores back.
+                    ValuePair * outerPair = v.payload.pair;
+                    if (__builtin_expect(outerPair
+                        && outerPair->evaluated.tag() != Tag::Uninitialized, 1))
+                    {
+                        v = outerPair->evaluated;
+                        continue;
+                    }
                     std::vector<Value> rights;
                     rights.reserve(8);
                     while (v.tag() == Tag::App) {
@@ -4781,6 +4793,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             continue;
                         }
                         v = callClosure(vm, v, rights[i - 1]);
+                    }
+                    // 2026-05-18: App-result memoization writeback.
+                    // See forceValue's matching code at ~line 9285 for
+                    // rationale.
+                    if (outerPair) {
+                        Tag rt = v.tag();
+                        if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::Slot
+                            && rt != Tag::Uninitialized && rt != Tag::Blackhole)
+                            outerPair->evaluated = v;
                     }
                     continue;
                 }
@@ -9254,7 +9275,32 @@ Value forceValue(VMState & vm, Value v)
         // out the recursion at the leaf rather than at every App
         // level.  `rights.reserve(8)` keeps typical depths on the
         // stack — std::vector only grows beyond that.
+        //
+        // 2026-05-18: App-result memoization.  After resolving the
+        // App chain to a WHNF result, store the result in the OUTERMOST
+        // App's `pair->evaluated` field.  On the next force of the
+        // same App pointer, the top-of-loop fast-path below returns
+        // the cached result directly without re-running the lambda.
+        // Closes the H3 memoization gap (extendDerivation outputsList
+        // at customisation.nix:409 forced 64K times pre-fix).
         if (v.tag() == Tag::App) {
+            // gate: NIX_V3_NO_APP_MEMO — disables the App-result memo
+            // for A/B measurement.  Retire when the memo is stable
+            // (parity + non-regression demonstrated across the bench
+            // corpus + cardano-node nixpkgs eval).
+            static const bool s_noAppMemo =
+                std::getenv("NIX_V3_NO_APP_MEMO") != nullptr;
+            ValuePair * outerPair = v.payload.pair;
+            // Memo-hit fast path: outerPair->evaluated holds the
+            // previously-resolved result.  Tag::Uninitialized (== 0)
+            // is the sentinel meaning "not yet resolved".
+            if (__builtin_expect(!s_noAppMemo
+                && outerPair
+                && outerPair->evaluated.tag() != Tag::Uninitialized, 1))
+            {
+                v = outerPair->evaluated;
+                continue;
+            }
             std::vector<Value> rights;
             rights.reserve(8);
             while (v.tag() == Tag::App) {
@@ -9267,6 +9313,18 @@ Value forceValue(VMState & vm, Value v)
                 v = forceValue(vm, v);
             for (size_t i = rights.size(); i > 0; --i)
                 v = callClosure(vm, v, rights[i - 1]);
+            // Memoize: store the result in the outermost App's
+            // evaluated field so the next force of this exact App
+            // pointer short-circuits.  Defensive: avoid writing
+            // back a non-WHNF result (which can happen if the
+            // callClosure chain leaves a Thunk/App/Slot on the
+            // stack).  The next force will re-attempt.
+            if (!s_noAppMemo && outerPair) {
+                Tag rt = v.tag();
+                if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::Slot
+                    && rt != Tag::Uninitialized && rt != Tag::Blackhole)
+                    outerPair->evaluated = v;
+            }
             continue;
         }
         if (!v.isThunk()) break;

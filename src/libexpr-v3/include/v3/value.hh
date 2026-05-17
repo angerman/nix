@@ -165,7 +165,22 @@ struct Value
 
 /// Pair of Values for App / PrimOpApp.  Heap allocated; pointer kept in the
 /// payload of the parent Value to keep the Value itself at 16 bytes.
-struct ValuePair { Value left; Value right; };
+///
+/// 2026-05-18: `evaluated` field added for App-result memoization.  When
+/// forceValue resolves a Tag::App, it stores the WHNF result in
+/// `evaluated` (initially Tag::Uninitialized).  Subsequent forces of the
+/// same App short-circuit by reading `evaluated.tag() != Uninitialized`.
+/// Without this, lazy entries built by genList/map (e.g.
+/// extendDerivation's `outputsList = map (...)` lambda body) re-execute
+/// the lambda on every access — observed as 32%+ of forces hitting a
+/// single thunk on nixpkgs hello.drvPath.  Cost: 16 bytes per ValuePair
+/// (32 → 48), but each lazy entry needs only one alloc total.
+///
+/// PrimOpApp doesn't use `evaluated` (the App-arg chain is consumed by
+/// callClosure / OP_CALL's primop branch which reads left/right then
+/// invokes; no force happens on PrimOpApp itself).  The extra field is
+/// inert for PrimOpApp instances — small per-instance waste.
+struct ValuePair { Value left; Value right; Value evaluated; };
 
 static_assert(sizeof(Value) == 16, "v3 Value must be exactly 16 bytes");
 
