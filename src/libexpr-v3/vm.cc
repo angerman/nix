@@ -1337,6 +1337,23 @@ inline void clearForceWriteback(CallFrame & f) noexcept
 inline bool applyForceWriteback(VMState & vm) noexcept
 {
     CallFrame & f = vm.frames.back();
+    if (f.flags & CFF_FORCE_WB_PTR_KEEP) {
+        // 2026-05-17: keep-on-stack variant.  Used by opcodes whose
+        // architectural contract leaves the selected value on the
+        // stack (e.g. OP_ATTRS_SELECT_IC).  Only fires once retVal
+        // is in WHNF — non-WHNF stays on the stack and `retry`
+        // resumes op_force_slow to chase further.  This keeps the
+        // source slot from being polluted with intermediate
+        // Tag::App / Tag::Thunk forwarders.
+        Value top = vm.valueStack.back();
+        Tag t = top.tag();
+        if (t == Tag::Thunk || t == Tag::App || t == Tag::Slot)
+            return false;
+        if (f.forceWriteTarget) *f.forceWriteTarget = top;
+        f.forceWriteTarget = nullptr;
+        f.flags &= ~CFF_FORCE_WB_PTR_KEEP;
+        return true;
+    }
     if (f.flags & CFF_FORCE_WB_PTR) {
         Value forced = vm.valueStack.back();
         vm.valueStack.pop_back();
@@ -6045,20 +6062,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             if (hitSlot != UINT32_MAX) {
                 Value & slot = b->entries[hitSlot].value;
-                // Phase 13.3 mapAttrs memo (IC fast path).  Without
-                // writeback, every access to a mapAttrs entry re-applies
-                // its function -- confirmed via per-descriptor force
-                // counter (parse.nix:60:44 = 625K forces on a 2-stage
-                // probe).  Tree-walker mutates the slot via
-                // `forceValue(*v)`; mirror that here.
+                // 2026-05-17: iterative force + memoizing writeback for
+                // mapAttrs/genList App entries.  Previously this site
+                // C-recursed via `forceValue(vm, slot)` (1.2 KB +
+                // dispatchLoop's 1.6 KB per level).  Replaced with the
+                // CFF_FORCE_WB_PTR_KEEP protocol: push, mark slot as
+                // writeback target, goto op_force_slow.  The retry chain
+                // chases through Suspended thunks via vm.frames pushes
+                // (no extra C-recursion); on WHNF, applyForceWriteback
+                // memoizes slot=forced and leaves the value on the stack
+                // for the IC handler's natural continuation.
                 if (__builtin_expect(slot.tag() == Tag::App, 0)) {
-                    vm.frames.back().ip = ip;
-                    Value resolved = forceValue(vm, slot);
-                    slot = resolved;
-                    push(vm, resolved);
-                } else {
                     push(vm, slot);
+                    CallFrame & f = vm.frames.back();
+                    f.forceWriteTarget = &slot;
+                    f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
+                    f.ip = ip;  // resume past the IC handler on success
+                    goto op_force_slow;
                 }
+                push(vm, slot);
                 // Phase A4 diagnostic mirror (IC fast path).
                 // Chases through Tag::Thunk(Evaluated) + Tag::Slot to
                 // find size-1 attrs results.  Without the chase, we miss
@@ -6220,14 +6242,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 ic.evictIdx = (ic.evictIdx + 1)
                     % CompilationUnit::AttrSelectIC::kWays;
                 Value & slot = b->entries[lo].value;
+                // 2026-05-17: iterative force + memoizing writeback
+                // (IC install path).  Mirror of the IC HIT path above —
+                // see comment there for rationale.
                 if (__builtin_expect(slot.tag() == Tag::App, 0)) {
-                    vm.frames.back().ip = ip;
-                    Value resolved = forceValue(vm, slot);
-                    slot = resolved;
-                    push(vm, resolved);
-                } else {
                     push(vm, slot);
+                    CallFrame & f = vm.frames.back();
+                    f.forceWriteTarget = &slot;
+                    f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
+                    f.ip = ip;
+                    goto op_force_slow;
                 }
+                push(vm, slot);
                 // Phase A4: chase Tag::Slot / Tag::Thunk(Evaluated) so
                 // we catch results that *resolve* to {family} after
                 // chasing.

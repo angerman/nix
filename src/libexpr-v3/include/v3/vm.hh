@@ -45,8 +45,19 @@ enum CallFrameFlag : uint8_t
     /// destination, NOT a stackBase-relative slot.  Used by OP_CALL_PRIMOP
     /// / OP_CALL when pre-forcing list elements iteratively into their
     /// ListVec storage.  Mutually exclusive with CFF_FORCE_WB (the
-    /// applyForceWriteback helper checks pointer first).
+    /// applyForceWriteback helper checks pointer first).  Pops the forced
+    /// value from the stack after writing.
     CFF_FORCE_WB_PTR = 1 << 4,
+    /// 2026-05-17: pointer-target writeback that KEEPS the forced value
+    /// on the stack.  Same target semantics as CFF_FORCE_WB_PTR but
+    /// applyForceWriteback does NOT pop.  Used by opcodes whose
+    /// architectural contract is "leave the selected value on top of
+    /// stack" while ALSO memoizing the force into the source slot
+    /// (e.g. OP_ATTRS_SELECT_IC's mapAttrs-entry force path).  Also
+    /// gated on WHNF: returns false (no write, flag kept) if the top is
+    /// still Thunk/App/Slot so the retry chain can chase further
+    /// without polluting the source slot with a non-WHNF intermediate.
+    CFF_FORCE_WB_PTR_KEEP = 1 << 5,
 };
 
 /// Slim CallFrame — 40 bytes, 2 fit in a 64B cache line minus 24B.
