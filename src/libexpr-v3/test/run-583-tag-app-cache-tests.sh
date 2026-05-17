@@ -130,6 +130,14 @@ check_parity "REG-1 parsedPlatform.check shape" \
     "0" \
     "FORCE-"
 
+# POSITIVE: A12b iterative OP_CALL fun-force.
+# Exercises OP_CALL's iterative `fun` force (op_force_slow +
+# writeback slot) on a Tag::App fun (from primMapAttrs) — including a
+# 200-step cascade.  Correctness check; parity with TW required.
+check_parity "POS-4 OP_CALL iter-force" \
+    "$TESTDIR/repro-a12b-op-call-iter-force.nix" \
+    "\"ok\""
+
 echo
 echo "=== Results: $pass pass, $fail fail ==="
 exit $fail

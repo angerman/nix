@@ -2737,6 +2737,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // this case after the first force, so chasing one Thunk
             // hop inline saves a forceValue() call + its full chase
             // setup (depth guards, iteration bound, etc.).
+            //
+            // A12b (2026-05-17): when the one-hop fast path doesn't
+            // resolve to WHNF, convert the deep force to iterative
+            // (op_force_slow + writeback) instead of C-recursing into
+            // forceValue.  This is the largest C-stack consumer on
+            // deep nixpkgs eval graphs (stdenv.mkDerivation's chained
+            // finalPackage / commonAttrs / overlappingArgs) and the
+            // root cause of the depth=5000 SIGSEGV that affected
+            // `(import <nixpkgs>{})`.  Each OP_CALL fun-force used to
+            // grow the C-stack by ~14 KiB (forceValue + dispatchLoop
+            // + their callees); after this conversion, the inner
+            // force runs as a regular frame on vm.frames and the
+            // outer OP_CALL re-runs on completion without C-recursion.
+            //
+            // To force the fun-slot (which is at top-1 after the
+            // pop+pop above, but we've already extracted fun + arg
+            // into locals), we push BOTH back to the stack and use
+            // the writeback-slot pattern: fun ends up at top-2 after
+            // pushing fun, arg, dup-of-fun.  The forced value
+            // overwrites the original fun-slot on retry.
             if (Tag fT = fun.tag(); fT == Tag::Thunk) {
                 Thunk * t = fun.payload.thunk;
                 if (t->state == ThunkState::Evaluated) {
@@ -2744,21 +2764,38 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     Tag eT = e.tag();
                     // If the evaluated value itself is in WHNF (the
                     // common case for rec-attr-thunk-of-Closure), we're
-                    // done.  Else fall through to the full forceValue.
+                    // done.  Else fall through to iterative force.
                     if (eT != Tag::Thunk && eT != Tag::App && eT != Tag::Slot) {
                         fun = e;
                     } else {
-                        vm.frames.back().ip = ip;
-                        fun = forceValue(vm, fun);
+                        goto op_call_iter_force;
                     }
                 } else {
-                    vm.frames.back().ip = ip;
-                    fun = forceValue(vm, fun);
+                    goto op_call_iter_force;
                 }
             } else if (fT == Tag::App || fT == Tag::Slot) {
-                vm.frames.back().ip = ip;
-                fun = forceValue(vm, fun);
+                goto op_call_iter_force;
             }
+            goto op_call_have_fun;
+            op_call_iter_force: {
+                // Restore stack to [..., fun, arg] then push dup-of-fun
+                // for op_force_slow.  Writeback target is the restored
+                // fun slot (offset relative to stackBase).
+                push(vm, fun);
+                push(vm, arg);
+                size_t funIdx = vm.valueStack.size() - 2;
+                uint32_t off = static_cast<uint32_t>(funIdx - stackBase);
+                if (__builtin_expect(off > 0xFFFFu, 0))
+                    throw std::runtime_error(
+                        "v3 OP_CALL: writeback slot offset too large");
+                push(vm, fun);  // dup, will be popped by op_force_slow
+                CallFrame & frame = vm.frames.back();
+                setForceWriteback(frame, static_cast<uint16_t>(off));
+                frame.flags |= CFF_FORCE_RETRY;
+                ip = ip - 1;
+                goto op_force_slow;
+            }
+            op_call_have_fun:;
 
             // PrimOp / PrimOpApp partial application.
             if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
