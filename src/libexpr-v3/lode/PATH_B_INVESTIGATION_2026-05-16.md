@@ -212,6 +212,121 @@ fires the chain.
   `libsForQt5.callPackage path`.  The bug is the WHO is firing
   the super closure, not WHAT the super closure does.
 
+## 2026-05-17 — Root cause fully localized
+
+Extended V3_DBG_WITH_CYCLE to dump ALL frames + cu->stringConstants.
+Combined with the existing V3_DBG_INHERIT_FROM_THUNK gate, the
+cycle source is now a SINGLE source line in nixpkgs and a SINGLE
+gated code path in v3's lowerer.
+
+**Nixpkgs source line** (the firing FROM_EXPR):
+
+  `pkgs/top-level/all-packages.nix:7385`:
+  ```nix
+  inherit (libsForQt5.callPackage ../development/libraries/wt { })
+    wt4
+    ;
+  ```
+
+  The path `../development/libraries/wt` matches
+  `cu->stringConstants[4]` (operand of the firing `OP_LIT_PATH`
+  at bytecode offset 34292).
+
+**V3 lowerer decision** (the gated code path):
+
+  `lower.cc:1955-1962` — `isComplexFromExpr`'s "Call on Select on
+  Var" case for `libsForQt5.callPackage path`:
+
+  ```cpp
+  if (head && head->exprKind == nix::Expr::Kind::Select) {
+      auto * sel = static_cast<nix::ExprSelect *>(head);
+      if (sel->e && sel->e->exprKind == nix::Expr::Kind::Var) {
+          static const bool s_callOnSelectVar =
+              std::getenv("NIX_V3_THUNK_CALL_ON_SELECT_VAR") != nullptr;
+          if (s_callOnSelectVar) return true;   // ← gated OFF by default
+      }
+  }
+  ```
+
+  `V3_DBG_INHERIT_FROM_THUNK=1` confirms line 7385's FROM_EXPR is
+  decided `EAGER` under default flags.  Line 7389 (the next
+  `inherit (callPackages ../xapian { })` clause) is decided
+  `THUNK` because its head is a Var, not a Select-on-Var.
+
+**Why the gate is OFF**:
+
+  The existing comment at lower.cc:1944-1954 explains it best:
+
+  > GATED behind NIX_V3_THUNK_CALL_ON_SELECT_VAR because enabling
+  > it default-on triggered a runtime force-count explosion (~6M
+  > forces of lib/systems/parse.nix:64 in 30s) — the broader
+  > thunkify breaks TW's sharing of lib.systems.* computations
+  > under v3's freeVar-capture semantics.  Same bug class as
+  > project_498 always-thunkify regression: the thunk wrap's
+  > upvalue capture doesn't propagate the same memoization that
+  > TW's env-driven thunks do.
+
+**The complete picture**:
+
+| flag combo | wt4 FROM_EXPR | hello.name result |
+|---|---|---|
+| THUNK_ALL=on (default), CALL_ON_SELECT_VAR=off | thunk | 5.7M setType hot loop, 44s timeout |
+| THUNK_ALL=off, CALL_ON_SELECT_VAR=off | EAGER | OP_WITH_LOOKUP cycle, 0.6s |
+| THUNK_ALL=off, CALL_ON_SELECT_VAR=on | thunk | (same 6M force explosion, per existing comment) |
+
+All three paths hit the same 100× slowdown via different routes.
+
+**The actual root bug** (the action plan's Path B real target):
+
+The thunk wrap for a thunkified inherit-from FROM_EXPR captures
+its freeVars/upvalues at MK_THUNK time.  The captures are VALUE
+COPIES (or Tag::Slot pointers), not env-slot references like TW
+uses.  When TW forces a thunk over `lib.systems.parse`, the env
+slot for `parse` gets mutated in-place; the thunk's body sees the
+mutation.  Subsequent thunks built later inherit the SAME slot
+(via env-chain sharing), so all share the cpuTypes attrset.
+
+In v3, each thunkified FROM_EXPR allocates its own thunk with its
+own captured upvalues.  Even if the underlying values point to
+the same `lib.systems` Bindings, the FORCE of each thunk
+re-evaluates the body, which (because of how rec-attrset entries
+are accessed via OP_ATTRS_SELECT IC writeback that's
+per-attrset-instance) doesn't share the work.  Result: cpuTypes
+gets rebuilt per FROM_EXPR force.
+
+**Path B's real architectural fix**:
+
+The fix is at v3's freeVar/upvalue capture protocol, not at
+`Thunk::shapeCell` cross-thunk propagation (the action plan's
+Phase B as written).  Specifically:
+
+  - Make thunkified inherit-from FROM_EXPR thunks share storage
+    with the surrounding scope's let-rec slots.  When two FROM_EXPR
+    thunks both reference `lib.systems.parse`, they should both
+    deref the SAME `parse` slot (Tag::Slot pointing to the same
+    parent Value cell).  Forcing one of them updates the slot;
+    the other sees the updated value automatically.
+  - That requires propagating Tag::Slot semantics down through
+    `thunkifyForAttr` -> `thunkify` -> the per-Function freeVar
+    list, so the thunk body's OP_GET_UPVALUE reads via the shared
+    slot pointer instead of a copied Value.
+
+This is a real but bounded architectural change.  ~3-5 days of
+work per CELL_UPDATE_EVERYWHERE-style estimates.
+
+## Next concrete commit candidates
+
+1. **Add a smaller `repro-wt-cycle.nix` fixture** that uses just
+   the `inherit (libsForQt5.callPackage path { }) wt4` pattern in
+   isolation — should reproduce the cycle without all of nixpkgs.
+2. **Audit v3's MK_THUNK freeVar capture**: identify where the
+   upvalue is captured as a Value (copy) vs Tag::Slot (sharing).
+3. **Prototype Tag::Slot propagation through thunkifyForAttr**:
+   when the body's freeVar resolves to a let-rec slot, capture as
+   Tag::Slot; otherwise capture as Value.
+
+
+
 
 
 How does TW resolve `with self; libsForQt5` while self is mid-

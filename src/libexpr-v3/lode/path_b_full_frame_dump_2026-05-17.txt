@@ -1,0 +1,200 @@
+warning: Nix search path entry '/nix/var/nix/profiles/per-user/root/channels' does not exist, ignoring
+v3 OP_WITH_LOOKUP cycle: name='libsForQt5' base=0 top=1 vm=0x16fa31aa0 frames=94 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/top-level/stage.nix:150:7
+  with[0] tag=16 -> SLOT(0xe84a13d90)=tag=10(thunk=0xe84a13db0 state=1)
+  frames (top=94, last 12):
+    [93] thunk ip=34290 thunk-name='res' thunk-codeOff=454 EXEC=super codeOff=140 f.cu=0x7aa0f02e8 thunk.cu=0x7a91c7ba0 closure=0xe85531290 thunk=0xe85530770 flags=1 thunk=0xe85530770 state=1
+      bytecode [34260-34296):
+  [34260] OP_GET_LOCAL           operand=3267
+  [34261] OP_ATTRS_REC_SET       operand=6
+  [34262] OP_GET_LOCAL           operand=3268
+  [34263] OP_ATTRS_REC_SET       operand=7
+  [34264] OP_GET_LOCAL           operand=3269
+  [34265] OP_ATTRS_REC_SET       operand=8
+  [34266] OP_SET_LOCAL           operand=3270
+  [34267] OP_GET_UPVALUE         operand=3
+  [34268] OP_MAKE_THUNK          operand=7949  data=[0,1]
+  [34271] OP_SET_LOCAL           operand=3271
+  [34272] OP_GET_UPVALUE         operand=3
+  [34273] OP_MAKE_THUNK          operand=7950  data=[0,1]
+  [34276] OP_SET_LOCAL           operand=3272
+  [34277] OP_GET_UPVALUE         operand=3
+  [34278] OP_GET_UPVALUE         operand=3
+  [34279] OP_MAKE_THUNK          operand=7951  data=[1,1]
+  [34282] OP_SET_LOCAL           operand=3273
+  [34283] OP_GET_UPVALUE         operand=3
+  [34284] OP_GET_UPVALUE         operand=3
+  [34285] OP_MAKE_THUNK          operand=7953  data=[1,1]
+  [34288] OP_SET_LOCAL           operand=3274
+  [34289] OP_WITH_LOOKUP         operand=24029
+  [34290] OP_ATTRS_SELECT        operand=1987 (callPackage)  data=[9]
+  [34292] OP_LIT_PATH            operand=4
+  [34293] OP_CALL                operand=0
+  [34294] OP_SET_LOCAL           operand=3278
+  [34295] OP_GET_UPVALUE         operand=3
+    [92] thunk ip=528 thunk-name='conflictingAttrs' thunk-codeOff=513 f.cu=0x7a91c7ba0 thunk.cu=0x7a91c7ba0 closure=0xe84a127b0 thunk=0xe855307e0 flags=3 thunk=0xe855307e0 state=1
+      bytecode [498-534):
+  [498] OP_SET_LOCAL           operand=10
+  [499] OP_GET_LOCAL           operand=9
+  [500] OP_GET_LOCAL           operand=10
+  [501] OP_CALL                operand=0
+  [502] OP_FORCE               operand=0
+  [503] OP_SET_LOCAL           operand=12
+  [504] OP_GET_LOCAL           operand=12
+  [505] OP_GET_UPVALUE         operand=1
+  [506] OP_CALL                operand=0
+  [507] OP_FORCE               operand=0
+  [508] OP_SET_LOCAL           operand=14
+  [509] OP_GET_LOCAL           operand=14
+  [510] OP_GET_UPVALUE         operand=2
+  [511] OP_TAIL_CALL           operand=0
+  [512] OP_RETURN              operand=0
+  [513] OP_GET_UPVALUE         operand=0
+  [514] OP_REC_BINDING_SLOT_REF operand=144 (lib)
+  [515] OP_ATTRS_SELECT        operand=66 (intersectAttrs)  data=[20]
+  [517] OP_SET_LOCAL           operand=1
+  [518] OP_GET_UPVALUE         operand=2
+  [519] OP_REC_BINDING_SLOT_REF operand=589 (res)
+  [520] OP_SET_LOCAL           operand=2
+  [521] OP_GET_LOCAL           operand=1
+  [522] OP_GET_LOCAL           operand=2
+  [523] OP_CALL                operand=0
+  [524] OP_SET_LOCAL           operand=3
+  [525] OP_GET_LOCAL           operand=3
+  [526] OP_GET_UPVALUE         operand=1
+  [527] OP_TAIL_CALL           operand=0
+  [528] OP_RETURN              operand=0
+  [529] OP_GET_UPVALUE         operand=0
+  [530] OP_REC_BINDING_SLOT_REF operand=2015 (conflictingAttrs)
+  [531] OP_FORCE               operand=0
+  [532] OP_ATTRS_INIT          operand=0
+  [533] OP_EQ                  operand=0
+    [91] thunk ip=532 thunk-name='<thunk>' thunk-codeOff=529 f.cu=0x7a91c7ba0 thunk.cu=0x7a91c7ba0 closure=0xe84a12910 thunk=0xe85530840 flags=3 thunk=0xe85530840 state=1
+      bytecode [502-538):
+  [502] OP_FORCE               operand=0
+  [503] OP_SET_LOCAL           operand=12
+  [504] OP_GET_LOCAL           operand=12
+  [505] OP_GET_UPVALUE         operand=1
+  [506] OP_CALL                operand=0
+  [507] OP_FORCE               operand=0
+  [508] OP_SET_LOCAL           operand=14
+  [509] OP_GET_LOCAL           operand=14
+  [510] OP_GET_UPVALUE         operand=2
+  [511] OP_TAIL_CALL           operand=0
+  [512] OP_RETURN              operand=0
+  [513] OP_GET_UPVALUE         operand=0
+  [514] OP_REC_BINDING_SLOT_REF operand=144 (lib)
+  [515] OP_ATTRS_SELECT        operand=66 (intersectAttrs)  data=[20]
+  [517] OP_SET_LOCAL           operand=1
+  [518] OP_GET_UPVALUE         operand=2
+  [519] OP_REC_BINDING_SLOT_REF operand=589 (res)
+  [520] OP_SET_LOCAL           operand=2
+  [521] OP_GET_LOCAL           operand=1
+  [522] OP_GET_LOCAL           operand=2
+  [523] OP_CALL                operand=0
+  [524] OP_SET_LOCAL           operand=3
+  [525] OP_GET_LOCAL           operand=3
+  [526] OP_GET_UPVALUE         operand=1
+  [527] OP_TAIL_CALL           operand=0
+  [528] OP_RETURN              operand=0
+  [529] OP_GET_UPVALUE         operand=0
+  [530] OP_REC_BINDING_SLOT_REF operand=2015 (conflictingAttrs)
+  [531] OP_FORCE               operand=0
+  [532] OP_ATTRS_INIT          operand=0
+  [533] OP_EQ                  operand=0
+  [534] OP_RETURN              operand=0
+  [535] OP_LIT_STR             operand=5
+  [536] OP_SET_LOCAL           operand=0
+  [537] OP_GET_UPVALUE         operand=0
+    [90] call ip=149 thunk-name='msg' thunk-codeOff=148 f.cu=0x7aa0f01f0 thunk.cu=0x0 closure=0xe85530ce0 thunk=0x0 flags=2
+    [89] call ip=447 thunk-name='super' thunk-codeOff=398 f.cu=0x7a91c7ba0 thunk.cu=0x0 closure=0xe855306e0 thunk=0x0 flags=0
+    [88] thunk ip=177 thunk-name='prev' thunk-codeOff=183 EXEC=final codeOff=148 f.cu=0x7a91c7c98 thunk.cu=0x7a91c7c98 closure=0xe84a145a0 thunk=0xe84a14b80 flags=3 thunk=0xe84a14b80 state=1
+    [87] thunk ip=166 thunk-name='prev' thunk-codeOff=183 EXEC=final codeOff=148 f.cu=0x7a91c7c98 thunk.cu=0x7a91c7c98 closure=0xe84a14650 thunk=0xe84a14b00 flags=3 thunk=0xe84a14b00 state=1
+    [86] thunk ip=166 thunk-name='prev' thunk-codeOff=183 EXEC=final codeOff=148 f.cu=0x7a91c7c98 thunk.cu=0x7a91c7c98 closure=0xe84a14700 thunk=0xe84a14a80 flags=3 thunk=0xe84a14a80 state=1
+    [85] thunk ip=166 thunk-name='prev' thunk-codeOff=183 EXEC=final codeOff=148 f.cu=0x7a91c7c98 thunk.cu=0x7a91c7c98 closure=0xe84a147b0 thunk=0xe84a14a00 flags=3 thunk=0xe84a14a00 state=1
+    [84] thunk ip=166 thunk-name='prev' thunk-codeOff=183 EXEC=final codeOff=148 f.cu=0x7a91c7c98 thunk.cu=0x7a91c7c98 closure=0xe84a14860 thunk=0xe84a14980 flags=3 thunk=0xe84a14980 state=1
+    [83] call ip=166 thunk-name='final' thunk-codeOff=148 f.cu=0x7a91c7c98 thunk.cu=0x0 closure=0xe84a14910 thunk=0x0 flags=2
+    [82] thunk ip=211 thunk-name='x' thunk-codeOff=205 f.cu=0x7a91c7c98 thunk.cu=0x7a91c7c98 closure=0xe848e8100 thunk=0xe84a13db0 flags=3 thunk=0xe84a13db0 state=1
+  frames (OUTER 82, indices 0..81):
+    [0] ? ip=18 name='<anon>' codeOff=0 pos=<no-pos>:0:0 flags=2
+    [1] thunk ip=525 name='pkgs' codeOff=516 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/top-level/default.nix:217:3 flags=3
+    [2] call ip=75 name='stageFuns' codeOff=32 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:42:1 flags=2
+    [3] thunk ip=458 name='thisStage' codeOff=453 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:106:7 flags=3
+    [4] thunk ip=431 name='args' codeOff=428 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:98:7 flags=1
+    [5] call ip=357 name='prevStage' codeOff=343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:86:22 flags=0
+    [6] call ip=10308 name='prevStage' codeOff=10297 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:1166:5 flags=2
+    [7] call ip=1367 name='pkg' codeOff=1361 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:42:30 flags=2
+    [8] call ip=1341 name='pkg' codeOff=1335 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:40:19 flags=2
+    [9] call ip=1345 name='pkg' codeOff=1343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:41:26 flags=0
+    [10] thunk ip=10529 name='<thunk>' codeOff=10528 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:1168:37 flags=3
+    [11] thunk ip=458 name='thisStage' codeOff=453 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:106:7 flags=3
+    [12] thunk ip=431 name='args' codeOff=428 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:98:7 flags=1
+    [13] call ip=357 name='prevStage' codeOff=343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:86:22 flags=0
+    [14] call ip=8149 name='prevStage' codeOff=8129 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:953:5 flags=0
+    [15] call ip=399 name='x' codeOff=398 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/debug.nix:79:16 flags=2
+    [16] thunk ip=1760 name='<thunk>' codeOff=1758 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:185:19 flags=3
+    [17] thunk ip=1715 name='result' codeOff=1697 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:182:7 flags=3
+    [18] thunk ip=1755 name='<thunk>' codeOff=1744 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:182:33 flags=3
+    [19] thunk ip=1722 name='sets'' codeOff=1716 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:181:7 flags=3
+    [20] call ip=4417 name='y' codeOff=4384 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/attrsets.nix:2239:8 flags=2
+    [21] thunk ip=1571 name='<thunk>' codeOff=8284 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:957:8 flags=3
+    [22] thunk ip=1594 name='<thunk>' codeOff=1572 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/attrsets.nix:662:45 flags=3
+    [23] call ip=1608 name='name' codeOff=1595 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/attrsets.nix:662:53 flags=0
+    [24] call ip=8321 name='pkg' codeOff=8313 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:957:28 flags=2
+    [25] call ip=4752 name='x' codeOff=4746 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/strings.nix:2024:5 flags=2
+    [26] thunk ip=2103 name='<thunk>' codeOff=2102 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:192:7 flags=3
+    [27] thunk ip=458 name='thisStage' codeOff=453 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:106:7 flags=3
+    [28] thunk ip=431 name='args' codeOff=428 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:98:7 flags=1
+    [29] call ip=357 name='prevStage' codeOff=343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:86:22 flags=0
+    [30] call ip=7495 name='prevStage' codeOff=7476 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:882:5 flags=0
+    [31] call ip=399 name='x' codeOff=398 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/debug.nix:79:16 flags=2
+    [32] thunk ip=1760 name='<thunk>' codeOff=1758 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:185:19 flags=3
+    [33] thunk ip=1715 name='result' codeOff=1697 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:182:7 flags=3
+    [34] call ip=1394 name='pkg' codeOff=1388 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:43:37 flags=2
+    [35] call ip=1341 name='pkg' codeOff=1335 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:40:19 flags=2
+    [36] call ip=1345 name='pkg' codeOff=1343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:41:26 flags=0
+    [37] thunk ip=2103 name='<thunk>' codeOff=2102 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:192:7 flags=3
+    [38] thunk ip=458 name='thisStage' codeOff=453 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:106:7 flags=3
+    [39] thunk ip=431 name='args' codeOff=428 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:98:7 flags=1
+    [40] call ip=357 name='prevStage' codeOff=343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:86:22 flags=0
+    [41] call ip=6821 name='prevStage' codeOff=6802 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:806:5 flags=0
+    [42] call ip=399 name='x' codeOff=398 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/debug.nix:79:16 flags=2
+    [43] thunk ip=1760 name='<thunk>' codeOff=1758 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:185:19 flags=3
+    [44] thunk ip=1715 name='result' codeOff=1697 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:182:7 flags=3
+    [45] call ip=1394 name='pkg' codeOff=1388 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:43:37 flags=2
+    [46] call ip=1341 name='pkg' codeOff=1335 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:40:19 flags=2
+    [47] call ip=1345 name='pkg' codeOff=1343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:41:26 flags=0
+    [48] thunk ip=2103 name='<thunk>' codeOff=2102 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:192:7 flags=3
+    [49] thunk ip=458 name='thisStage' codeOff=453 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:106:7 flags=3
+    [50] thunk ip=431 name='args' codeOff=428 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:98:7 flags=1
+    [51] call ip=357 name='prevStage' codeOff=343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:86:22 flags=0
+    [52] call ip=6017 name='prevStage' codeOff=5998 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:727:5 flags=0
+    [53] call ip=399 name='x' codeOff=398 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/debug.nix:79:16 flags=2
+    [54] thunk ip=1760 name='<thunk>' codeOff=1758 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:185:19 flags=3
+    [55] thunk ip=1715 name='result' codeOff=1697 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:182:7 flags=3
+    [56] call ip=1394 name='pkg' codeOff=1388 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:43:37 flags=2
+    [57] call ip=1341 name='pkg' codeOff=1335 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:40:19 flags=2
+    [58] call ip=1345 name='pkg' codeOff=1343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:41:26 flags=0
+    [59] thunk ip=2867 name='<thunk>' codeOff=2866 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:290:7 flags=3
+    [60] thunk ip=2863 name='<thunk>' codeOff=2862 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:289:14 flags=3
+    [61] thunk ip=458 name='thisStage' codeOff=453 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:106:7 flags=3
+    [62] thunk ip=431 name='args' codeOff=428 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:98:7 flags=1
+    [63] call ip=357 name='prevStage' codeOff=343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:86:22 flags=0
+    [64] call ip=5388 name='prevStage' codeOff=5369 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:657:5 flags=0
+    [65] call ip=399 name='x' codeOff=398 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/debug.nix:79:16 flags=2
+    [66] thunk ip=1760 name='<thunk>' codeOff=1758 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:185:19 flags=3
+    [67] thunk ip=1715 name='result' codeOff=1697 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:182:7 flags=3
+    [68] call ip=1345 name='pkg' codeOff=1343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:41:26 flags=0
+    [69] thunk ip=2550 name='<thunk>' codeOff=2549 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:261:55 flags=3
+    [70] thunk ip=2548 name='<thunk>' codeOff=2535 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:261:14 flags=1
+    [71] thunk ip=458 name='thisStage' codeOff=453 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:106:7 flags=3
+    [72] thunk ip=431 name='args' codeOff=428 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:98:7 flags=1
+    [73] call ip=357 name='prevStage' codeOff=343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:86:22 flags=0
+    [74] call ip=4094 name='prevStage' codeOff=4075 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:520:5 flags=0
+    [75] call ip=399 name='x' codeOff=398 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/lib/debug.nix:79:16 flags=2
+    [76] thunk ip=1760 name='<thunk>' codeOff=1758 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:185:19 flags=3
+    [77] thunk ip=1715 name='result' codeOff=1697 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:182:7 flags=3
+    [78] call ip=1345 name='pkg' codeOff=1343 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:41:26 flags=0
+    [79] thunk ip=4272 name='<thunk>' codeOff=4271 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/darwin/default.nix:527:11 flags=3
+    [80] thunk ip=481 name='thisStage' codeOff=453 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/stdenv/booter.nix:106:7 flags=3
+    [81] call ip=176 name='args' codeOff=9 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/top-level/stage.nix:21:1 flags=2
+error: v3 OP_WITH_LOOKUP: cycle while resolving 'libsForQt5'

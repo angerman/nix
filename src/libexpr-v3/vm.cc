@@ -883,6 +883,74 @@ inline Value withLookup(VMState & vm, SymbolId name)
                     }
                 }
             }
+            // Path B investigation (2026-05-17): also dump ALL frames
+            // when V3_DBG_WITH_CYCLE_FULL=1 (capped at 200 to avoid
+            // spam).  Otherwise show outer 16 + the existing inner 12.
+            // Outer frames identify the eager-force whose body invoked
+            // the chain.
+            static const bool s_dbgWithCycleFull =
+                std::getenv("V3_DBG_WITH_CYCLE_FULL") != nullptr;
+            size_t outerN;
+            if (s_dbgWithCycleFull) {
+                outerN = std::min<size_t>(200, vm.frames.size() - 12);
+            } else {
+                outerN = std::min<size_t>(16, vm.frames.size() - 12);
+            }
+            if (vm.frames.size() > 12) {
+                std::fprintf(stderr,
+                    "  frames (OUTER %zu, indices 0..%zu):\n",
+                    outerN, outerN - 1);
+                for (size_t i = 0; i < outerN; ++i) {
+                    const auto & f = vm.frames[i];
+                    const char * kind = (f.flags & CFF_THUNK_RETURN) ? "thunk"
+                        : f.closure ? "call" : "?";
+                    const LambdaDescriptor * d = nullptr;
+                    bool descValid = f.thunk && (
+                        f.thunk->state == ThunkState::Suspended
+                        || f.thunk->state == ThunkState::Blackhole);
+                    if (f.flags & CFF_THUNK_RETURN) {
+                        if (descValid) d = f.thunk->suspended.desc;
+                        else if (f.closure) d = f.closure->desc;
+                    } else {
+                        if (f.closure) d = f.closure->desc;
+                        else if (descValid) d = f.thunk->suspended.desc;
+                    }
+                    const PosSnapshot * ps =
+                        d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                    std::fprintf(stderr,
+                        "    [%zu] %s ip=%u name='%s' codeOff=%u pos=%s:%u:%u flags=%x\n",
+                        i, kind, f.ip,
+                        d && !d->name.empty() ? d->name.c_str() : "<anon>",
+                        d ? (unsigned)d->codeOffset : 0u,
+                        (ps && !ps->file.empty()) ? ps->file.c_str()
+                            : "<no-pos>",
+                        ps ? ps->line : 0u, ps ? ps->column : 0u,
+                        (unsigned)f.flags);
+                }
+            }
+            // Path B investigation (2026-05-17): under WITH_CYCLE_FULL,
+            // also dump the firing frame's CU stringConstants/paths.
+            // The bytecode disasm shows OP_LIT_PATH operand=N; the path
+            // string at that index identifies WHICH `libsForQt5.callPackage
+            // <path>` site we're inside.
+            if (s_dbgWithCycleFull && !vm.frames.empty()) {
+                const auto & fInner = vm.frames.back();
+                const CompilationUnit * cuI = fInner.cu;
+                if (cuI) {
+                    std::fprintf(stderr,
+                        "  firing-cu stringConstants (first 32):\n");
+                    size_t sn = std::min<size_t>(32, cuI->stringConstants.size());
+                    for (size_t i = 0; i < sn; ++i) {
+                        const auto & s = cuI->stringConstants[i];
+                        // Truncate long strings for display.
+                        std::string display = s.substr(0, 100);
+                        std::fprintf(stderr,
+                            "    [%zu] (%zu bytes) %s%s\n",
+                            i, s.size(), display.c_str(),
+                            s.size() > 100 ? "..." : "");
+                    }
+                }
+            }
             std::fflush(stderr);
         }
         throw BlackholeError(
