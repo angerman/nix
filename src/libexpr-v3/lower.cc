@@ -1413,6 +1413,45 @@ struct Lowerer
         {
             const std::string_view name(po->name);
 
+            // 2026-05-17 seq fast-path: `builtins.seq x y` emits as an
+            // OP_FORCE on x's bytecode form + lowerExpr(y).  Saves the
+            // OP_CALL_PRIMOP + the C-recursive forceValue(args[0]) the
+            // arg-prep loop would otherwise do (vm.cc:2876).  OP_FORCE
+            // uses op_force_slow + CFF_FORCE_RETRY which drives the
+            // force iteratively via vm.frames pushes — no C-recursion.
+            //
+            // Used by the primDerivation* hybrid wrapper to pre-force
+            // arbitrary-typed attrs at bytecode level before passing
+            // them to the C leaf primop (Option 4 in the strategic
+            // primDerivation* note).
+            //
+            // Mechanism: the force result is captured in a fresh VarId
+            // that emit.cc allocates a local slot for; it's never
+            // referenced downstream, so the slot stays unused (but the
+            // OP_FORCE side effect fires).  DCE preserves ir::Force
+            // (it's classified Impure — see opt_dce.cc).
+            if (po->arity == 2 && (name == "seq" || name == "__seq")
+                && e->args->size() >= 2)
+            {
+                auto it = e->args->begin();
+                ir::VarId xv = lowerExpr(*it);
+                (void)forceVal(xv);  // force x; result intentionally unused
+                ++it;
+                ir::VarId result = lowerExpr(*it);
+                ++it;
+                // Extra args (Nix's `builtins.seq A B C D` parses as
+                // (((seq A) B) C) D): seq returns B, which is then
+                // applied to C, D, ... Mirror the App-chain handling
+                // from the generic primop path below so curried-extras
+                // semantics is preserved.
+                for (; it != e->args->end(); ++it) {
+                    result = forceVal(result);
+                    ir::VarId av = lowerExpr(*it);
+                    result = addBinding(ir::App{result, av});
+                }
+                return result;
+            }
+
             // Fast path: arithmetic / comparison primops (`a * b`,
             // `a < b`, ... lower as ExprCall(__mul, a, b) etc.).  Emit
             // direct VM ops instead of OP_CALL_PRIMOP.  Saves the

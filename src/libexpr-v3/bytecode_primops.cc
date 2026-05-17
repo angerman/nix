@@ -365,14 +365,22 @@ void installAllBytecodePrimops(nix::EvalState & state)
 
         // T13-T17 (catAttrs, concatLists, listToAttrs, removeAttrs,
         // intersectAttrs) — REVERTED 2026-05-17.  These primops don't
-        // take user lambdas as args; they don't C-recurse on
-        // callbacks.  Their C versions are O(N) (or O(N log N) with
-        // sorted-merge); the bytecode equivalents I wrote use
-        // repeated `++` / `//` which is O(N²) (each step copies the
-        // accumulator).  Measured regression on attrset-build-1k
-        // (+60.4%); keeping them as C primops is the right choice for
-        // A12b (which targets CALLBACK C-recursion, not arbitrary
-        // primop replacement).
+        // take user lambdas as args; they don't C-recurse on callbacks.
+        // Their C versions are O(N) (or O(N log N) with sorted-merge);
+        // the bytecode equivalents I wrote use repeated `++` / `//`
+        // which is O(N²) (each step copies the accumulator).  Measured
+        // regression on attrset-build-1k (+60.4%); keeping them as C
+        // primops is the right choice for A12b (which targets CALLBACK
+        // C-recursion, not arbitrary primop replacement).
+        //
+        // 2026-05-17b A/B re-test: tried adding ONLY concatLists back
+        // (since it shows up in the hello.name C-stack profile) — turns
+        // out it makes things WORSE.  vm.frames depth at SIGBUS goes
+        // 3215 → 1201 (-63%): the bytecode foldl'+`++` chain consumes
+        // more vm.frames per call than the C primConcatLists does, and
+        // since the dispatchLoop frame is what blows C-stack, more
+        // vm.frames per "primDerivation level" means we hit the C-stack
+        // ceiling at fewer levels.  Leave concatLists as C primop.
 
         // T10 — groupBy: group list elements by key-fn result.
         //   { ${fn x}: [matching xs] for each x in list }

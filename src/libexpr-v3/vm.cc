@@ -1205,6 +1205,18 @@ inline void pushCapturedWiths(VMState & vm, ListVec * capturedWiths)
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Forward declarations spanning the next anonymous namespace.
+// ---------------------------------------------------------------------------
+
+// 2026-05-17: dispatchLoop's body-level try/catch (added so callers
+// can tail-call dispatchLoop instead of holding their C-frame open
+// to catch + clean up) calls clearBlackMarksOnException before re-
+// throwing.  The definition lives at file scope (line ~8330);
+// declare it here so the anonymous-namespace-scoped dispatchLoop can
+// reach it by unqualified name.
+static void clearBlackMarksOnException(VMState & vm, size_t exitDepth);
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -1493,6 +1505,15 @@ static inline void hotForceCheck(const Thunk * t)
 ///   - The frame stack is popped down to `exitDepth` (used by inner
 ///     re-entries from callback primops to return to the caller).
 /// Returns the final value (whatever was on the operand stack at exit).
+///
+/// 2026-05-17: an internal try/catch around the main while loop calls
+/// `clearBlackMarksOnException(vm, exitDepth)` before re-throwing.
+/// Callers (forceValue / callClosure / runOnExistingVm) historically
+/// did this cleanup themselves; moving it inside dispatchLoop lets the
+/// callers tail-call dispatchLoop instead of holding their C-frame
+/// open to catch the exception.  Single-call-site cleanup → caller
+/// frames can be elided (saves ~1.2-1.7 KB per Suspended-thunk
+/// dispatch).
 Value dispatchLoop(VMState & vm, size_t exitDepth)
 {
     const CallFrame & topFrame = vm.frames.back();
@@ -1607,6 +1628,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     // iteration cost was visible in -fprofile-generate runs).
     // `nullptr` when the gate is off — the check below short-circuits.
     Nursery * const nursery = kNurseryGate ? &threadNursery() : nullptr;
+
+    // 2026-05-17: internal exception barrier.  Any exception that
+    // escapes the dispatch loop (from a primop body, from forceValue,
+    // from any opcode handler) triggers clearBlackMarksOnException
+    // BEFORE re-throwing.  Centralizes the cleanup that callers
+    // (forceValue / callClosure / runOnExistingVm) used to do, letting
+    // them tail-call dispatchLoop without holding their C-frame open
+    // to catch.  Reverts Blackhole→Suspended on pushed thunk frames,
+    // unwinds vm.frames / valueStack / withStack down to exitDepth,
+    // clears CFF_FORCE_RETRY on the surviving top frame.  See
+    // clearBlackMarksOnException's docstring for the protocol details.
+    try {
     while (running) {
         // Phase C scavenge trigger.  Only inspected when the gate
         // is on (kNurseryGate covers env-var + exitDepth == 0).
@@ -1882,10 +1915,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             goto op_force_slow;
         }
         case OP_DUP:  push(vm, top(vm)); break;
-        // OP_POP / OP_SWAP: bytecode values reserved (don't reuse for
-        // disk-cache compatibility), but no current emit path produces
-        // them, so dispatch removed.  Hits abort via the default case
-        // if a stale CU contains them.
+        // OP_POP: drop the top of the value stack.  Used by lower.cc's
+        // builtins.seq fast-path (2026-05-17): emit `lowerExpr(x);
+        // OP_FORCE; OP_POP; lowerExpr(y)` so x's force is done via
+        // iterative OP_FORCE instead of the C-recursive OP_CALL_PRIMOP
+        // arg-prep path.  Cheap: just pop_back().
+        case OP_POP:  vm.valueStack.pop_back(); break;
+        // OP_SWAP: bytecode value reserved (don't reuse for disk-cache
+        // compatibility), but no current emit path produces it, so
+        // dispatch falls through to default (abort).
 
         // --- Arithmetic ---
         // Int operations check for overflow via __builtin_*_overflow:
@@ -8269,6 +8307,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
 #pragma clang diagnostic pop
     }
+    } catch (...) {
+        // 2026-05-17 exception barrier — see comment at try { above.
+        // Cleanup is best-effort; if it throws (e.g. partial-bindings
+        // access on a freed thunk pointer), swallow so the original
+        // exception propagates undisturbed.
+        try {
+            clearBlackMarksOnException(vm, exitDepth);
+        } catch (...) {}
+        throw;
+    }
 
     return finalResult;
 }
@@ -8472,19 +8520,13 @@ inline Value runOnExistingVm(VMState & vm,
     });
     pushCapturedWiths(vm, capturedWiths);
 
-    // Re-enter dispatchLoop on the SAME VM, with exitDepth set so the
-    // new frame's OP_RETURN unwinds dispatchLoop back to the caller.
-    // Black-mark cleanup is scoped to exitDepth so outer frames'
-    // existing Black marks are preserved on exception (they belong to
-    // the outer dispatchLoop's frames, which we MUST NOT touch).
-    try {
-        Value r = dispatchLoop(vm, exitDepth);
-        clearBlackMarksOnException(vm, exitDepth);
-        return r;
-    } catch (...) {
-        clearBlackMarksOnException(vm, exitDepth);
-        throw;
-    }
+    // Re-enter dispatchLoop on the SAME VM.  2026-05-17: exception
+    // cleanup happens INSIDE dispatchLoop's body-level try/catch
+    // (which calls clearBlackMarksOnException before re-throwing).
+    // Plain tail call enables compiler TCO — no try/catch in this
+    // wrapper means runOnExistingVm's frame can be elided in favor
+    // of dispatchLoop's directly.
+    return dispatchLoop(vm, exitDepth);
 }
 
 Value run(const CompilationUnit & rootCu)
@@ -10149,12 +10191,14 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     });
     pushCapturedWiths(vm, callee->capturedWiths);
 
-    try {
-        return dispatchLoop(vm, exitDepth);
-    } catch (...) {
-        clearBlackMarksOnException(vm, exitDepth);
-        throw;
-    }
+    // 2026-05-17: exception cleanup happens inside dispatchLoop's
+    // body-level try/catch; the plain tail call here enables compiler
+    // TCO so callClosure's C-frame can be elided in favor of
+    // dispatchLoop's.  Saves ~0.5 KB per call (callClosure's frame
+    // size) which compounds across the App-spine / __functor /
+    // intrinsic-dispatch recursive sites that re-enter callClosure
+    // from inside forceValue or another callClosure body.
+    return dispatchLoop(vm, exitDepth);
 }
 
 } // namespace nix::v3
