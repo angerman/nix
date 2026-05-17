@@ -516,3 +516,33 @@ but hit the depth-5000 crash without the iterative-force work:
 
 All three are mechanical writeback transforms of the same form as
 primElem.  Land them after the recursion bound is fixed.
+
+## 2026-05-17 (later) — A12b architectural step 1: OP_CALL fun-force
+
+Commit `7f5a392f4` converts OP_CALL's `fun` force from C-recursive
+`forceValue(vm, fun)` to the iterative `op_force_slow + writeback-
+slot` pattern (the same one used by OP_NOT / OP_AND_BRANCH /
+OP_LIST_CONCAT et al.).
+
+The conversion preserves the Tag::Thunk fast path (one-hop chase
+in-place when the evaluated value is WHNF) and routes only the
+non-WHNF cases (Tag::App, Tag::Slot, Suspended/non-fast Thunk)
+through the iterative path.  Validation: 143/143 cutover lang
+tests + 7/7 A12 cache + iter-force tests pass.
+
+Test `test/repro-a12b-op-call-iter-force.nix` (POS-4) exercises:
+  - tripleResult = fns.triple 14 where fns is a primMapAttrs result
+    (fun is Tag::App): expect 42.
+  - doubleResult = fns.double 7: expect 14.
+  - accResult = foldl' (acc: f: f acc) 0 (attrValues bumps) over
+    200 mapAttrs-built lambdas: expect 19900.
+
+**Caveat**: hello.name's depth=5000 crash is NOT fixed by this
+single conversion, because the deep eval chain in stdenv.mkDerivation
+has `fun=Closure` (already WHNF) in the hot path — the iterative
+force only fires on Tag::App / non-Evaluated Thunk.  The
+C-recursive depth comes from OTHER call sites (callClosure's
+fun-force, valueEqual's pre-force, OP_CALL's primop-arg loop)
+which weren't converted in this commit.  See
+`memory/project_a12b_depth5000.md` for the remaining open
+conversions and architectural blockers.
