@@ -24,6 +24,7 @@
 #include "v3/ir.hh"
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/bytecode_primops.hh"
 
 #include "nix/expr/nixexpr.hh"
 #include "nix/expr/symbol-table.hh"
@@ -1397,6 +1398,17 @@ struct Lowerer
         if ((isPrimOpRef(e->fun, &po) || isBuiltinsPrimOp(e->fun, &po))
             && e->args->size() >= po->arity)
         {
+            // A12b T0b: skip the static PrimOpCall emission for primops
+            // that have a bytecode-closure replacement installed.  We
+            // null out `po` so the static-emission block below is
+            // skipped and we fall through to the generic App-chain
+            // path.  Each App in that chain dispatches via OP_CALL on
+            // the closure Value pushed by OP_LIT_PRIMOP's redirect.
+            if (lookupPrimopReplacement(po)) {
+                po = nullptr;
+            }
+        }
+        if (po) {
             const std::string_view name(po->name);
 
             // Fast path: arithmetic / comparison primops (`a * b`,

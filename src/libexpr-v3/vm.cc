@@ -23,6 +23,7 @@
 #include "v3/ir.hh"
 #include "v3/disasm.hh"
 #include "v3/errors.hh"
+#include "v3/bytecode_primops.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
@@ -7741,6 +7742,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
         case OP_LIT_PRIMOP: {
             const PrimOp * po = cu->primops[operand];
+            // A12b T0b: bytecode-primop replacement.  If `po` has a
+            // registered bytecode-closure replacement (installed via
+            // `installBytecodePrimop`), push that Closure Value instead
+            // of a Tag::PrimOp Value.  Subsequent OP_CALL sees a
+            // Closure (or Bridge-wrapped Closure) and dispatches it
+            // iteratively, never reaching the C-recursive
+            // primop-arg-force path.
+            if (const Value * repl = lookupPrimopReplacement(po)) {
+                push(vm, *repl);
+                break;
+            }
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
             v.payload.primop = po;

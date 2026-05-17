@@ -9,10 +9,18 @@
 #include "v3/run.hh"
 #include "v3/value.hh"
 #include "v3/bytecode.hh"
+#include "v3/primop.hh"
+#include "v3/ir.hh"
+#include "v3/alloc.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/nixexpr.hh"
 #include "nix/util/source-path.hh"
+
+// Forward declaration: defined in vm.cc.
+namespace nix::v3 {
+Value getBuiltinsValue() noexcept;
+}
 
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +29,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Forward declaration: defined in primops.cc.  Bridges a v3 Value into
@@ -37,14 +46,16 @@ namespace {
 
 /// Process-global storage that keeps installed bytecode primops alive.
 ///
-/// The Value field references string constants / path constants in the
-/// CompilationUnit; if `cu` were freed, the Value would dangle.  We
-/// keep both in a holder that lives forever (one entry per installed
-/// primop, never removed).
+/// The Closure Value's `payload.closure->cu` field references the
+/// CompilationUnit by pointer.  The pointer is set during `run(cu)`
+/// inside `runRootExpr`, so it points to wherever the cu lived at
+/// that moment.  Any subsequent MOVE of the cu invalidates the
+/// pointer.  Fix: store the RootResult AS-IS (cu + value together)
+/// in a heap-allocated holder, and patch `closure->cu` to point at
+/// the holder's final cu location.
 struct InstalledPrimop {
-    std::string      name;       // primop name (e.g. "foldl'")
-    CompilationUnit  cu;         // owns bytecode + string constants
-    Value            v3Closure;  // the compiled lambda value
+    std::string name;        // primop name (e.g. "foldl'")
+    RootResult  rr;          // owns cu + the compiled lambda Value
 };
 
 std::vector<std::unique_ptr<InstalledPrimop>> & installedPrimops()
@@ -74,7 +85,31 @@ std::set<std::string> & installedNames()
     return s;
 }
 
+/// Side-table: maps a v3 PrimOp pointer to its bytecode-Closure
+/// replacement Value.  Populated by `installBytecodePrimop`.
+/// Read by:
+///   - `vm.cc` OP_LIT_PRIMOP to push the replacement instead of a
+///     Tag::PrimOp Value (so `let f = builtins.foldl'; in f a b c`
+///     and similar dynamic dispatch see the closure).
+///   - `lower.cc` `lowerCall` to skip the static PrimOpCall path
+///     for replaced primops (so saturated `builtins.foldl' a b c`
+///     calls also see the closure via the App-chain → OP_CALL
+///     emit path).
+std::unordered_map<const PrimOp *, Value> & primopReplacementMap()
+{
+    static std::unordered_map<const PrimOp *, Value> m;
+    return m;
+}
+
 } // anonymous namespace
+
+const Value * lookupPrimopReplacement(const PrimOp * po) noexcept
+{
+    if (!po) return nullptr;
+    auto & m = primopReplacementMap();
+    auto it = m.find(po);
+    return it == m.end() ? nullptr : &it->second;
+}
 
 void installBytecodePrimop(
     nix::EvalState & state,
@@ -111,34 +146,98 @@ void installBytecodePrimop(
             std::to_string(static_cast<int>(rr.value.tag())) + ")");
     }
 
-    // Bridge the v3 Closure to a TW Value
+    // Stash the holder FIRST so the CU + Value live at stable heap
+    // addresses.  Then patch the closure's cu pointer to point at the
+    // heap-stable location.  The closure was built by `run()` inside
+    // runRootExpr with `desc->cu = &local_cu`; after we move the cu
+    // to the holder, that pointer is stale unless we re-point it.
+    // Bridge and side-table install must use the PATCHED value, not
+    // the pre-move one.
+    auto holder = std::make_unique<InstalledPrimop>();
+    holder->name = primopName;
+    holder->rr = std::move(rr);
+    if (holder->rr.value.tag() == Tag::Closure
+        && holder->rr.value.payload.closure)
+    {
+        // Cast-away-const intentional: the Closure was built with
+        // `desc->cu = &cu` where cu was at the old address.  We
+        // re-point at the heap-stable address now.
+        Closure * c = const_cast<Closure *>(holder->rr.value.payload.closure);
+        c->cu = &holder->rr.cu;
+    }
+    InstalledPrimop * installedPtr = holder.get();
+    installedPrimops().push_back(std::move(holder));
+    auto & installed = *installedPtr;
+
+    // Bridge the (PATCHED) v3 Closure to a TW Value
     // (`mkPrimOpApp(__v3_call_bridge_1, handle)`) so that:
     //   - TW dispatch (`callFunction` from primops or top-level CLI)
     //     routes back into v3 via primV3CallBridge1.
     //   - v3 dispatch (OP_CALL on the bridged value) unwraps via
     //     `tryUnwrapBridge1Closure` (vm.cc:2920) and dispatches the
     //     underlying closure on the same VM — no fresh dispatchLoop.
-    nix::Value * bridged = v3ToTreeWalkerPublic(state, rr.value);
+    nix::Value * bridged = v3ToTreeWalkerPublic(state, installed.rr.value);
     if (!bridged) {
         throw std::runtime_error(
             "installBytecodePrimop: v3ToTreeWalkerPublic returned null "
             "for '" + primopName + "'");
     }
 
-    // Stash the holder so the CU + Value live forever.
-    auto holder = std::make_unique<InstalledPrimop>();
-    holder->name = primopName;
-    holder->cu = std::move(rr.cu);
-    holder->v3Closure = rr.value;
-    installedPrimops().push_back(std::move(holder));
-
-    // Install: mutate the Value in TW's builtins attrset.  Both
-    // `state.getBuiltins().attrs()->get(sym)->value` and
-    // `state.baseEnv.values[displ]` point to the same Value* (per
-    // `addPrimOp` in libexpr/eval.cc:580-589), so this single
-    // mutation propagates to all lookup paths.
+    // Install path 1: mutate the Value in TW's builtins attrset so
+    // TW-side dispatch (and any code reading TW's baseEnv) sees the
+    // bytecode closure.  Both `state.getBuiltins().attrs()->get(sym)
+    // ->value` and `state.baseEnv.values[displ]` point to the same
+    // Value* (per `addPrimOp` in libexpr/eval.cc:580-589), so this
+    // single mutation propagates to all TW lookup paths.
     nix::Value & target = state.getBuiltin(primopName);
     target = *bridged;
+
+    // Install path 2: register in v3's side-table keyed by v3 PrimOp
+    // pointer.  This is what makes v3's OP_LIT_PRIMOP / OP_CALL_PRIMOP
+    // dispatch see the replacement — v3 has its own builtins attrset
+    // (vm.cc:8298 getBuiltinsValue) built from the v3 PrimOp registry,
+    // bypassing TW's builtins entirely.  The v3 lookup in vm.cc and
+    // the v3 lowerCall skip-check in lower.cc both consult
+    // `lookupPrimopReplacement(po)`.
+    const PrimOp * po = findPrimOp(primopName);
+    if (!po) {
+        // Should not happen: getBuiltin succeeded above, so the primop
+        // is in TW's registry — but the v3 registry is independent.
+        // Most primops are dual-registered (in both); if not, the
+        // OP_LIT_PRIMOP / OP_CALL_PRIMOP redirect won't fire and the
+        // installed closure is only visible to dynamic TW lookups.
+        if (dbgEnabled())
+            std::fprintf(stderr,
+                "v3 bytecode-primop install: '%s' has no v3 PrimOp "
+                "registration; closure visible only to TW dispatch\n",
+                primopName.c_str());
+        return;
+    }
+    primopReplacementMap()[po] = installed.rr.value;
+
+    // Install path 3: patch v3's static `vBuiltins` attrset in place
+    // so dynamic dispatch (`builtins.foldl'`, `let f = builtins.foldl';
+    // in f`) sees the closure.  vBuiltins is built lazily on the
+    // first OP_LIT_BUILTINS access; if the install happens AFTER that
+    // (e.g. because compiling a previous bytecode-primop source
+    // triggered the first access), patching in place is required.
+    // If vBuiltins hasn't been built yet, we still need to patch:
+    // calling getBuiltinsValue() materialises it now with the
+    // replacement applied at the OP_LIT_BUILTINS-rebuild check (which
+    // we don't have — so the materialise-then-patch is the cleanest).
+    {
+        Value vBuiltins = getBuiltinsValue();
+        if (vBuiltins.isAttrs() && vBuiltins.payload.bindings) {
+            SymbolId sid = ir::globalInternSymbol(primopName);
+            Bindings * b = vBuiltins.payload.bindings;
+            for (uint32_t i = 0; i < b->size; ++i) {
+                if (b->entries[i].name == sid) {
+                    b->entries[i].value = installed.rr.value;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 
@@ -155,46 +254,29 @@ void installAllBytecodePrimops(nix::EvalState & state)
     done = true;  // set BEFORE work so nested calls short-circuit
 
     try {
-        // T0 status (2026-05-17): the install pipeline (parse → lower
-        // → compile → bridge → mutate TW.getBuiltin) is verified to
-        // work — V3_DBG_BYTECODE_PRIMOP=1 confirms the install fires
-        // and produces a valid bridged Closure Value.
+        // T0b status (2026-05-17): dispatch hook live.
+        //   - vm.cc OP_LIT_PRIMOP checks lookupPrimopReplacement and
+        //     pushes the closure Value if found.
+        //   - lower.cc lowerCall skips the static PrimOpCall emission
+        //     for replaced primops (forcing the call through the
+        //     generic App-chain → OP_CALL path that goes through the
+        //     OP_LIT_PRIMOP redirect above).
+        //   - installBytecodePrimop also patches v3's static vBuiltins
+        //     in place so dynamic lookups of `builtins.foo` see the
+        //     replacement.
         //
-        // HOWEVER, v3 bypasses TW's builtins attrset when dispatching
-        // `builtins.X`: `getBuiltinsValue()` in vm.cc:8298 builds v3's
-        // own builtins attrset from the v3 PrimOp registry directly.
-        // Mutating TW.getBuiltin therefore does NOT redirect v3
-        // dispatch.  Additionally, `lower.cc` statically resolves
-        // saturated `builtins.foo arg1 arg2` calls to OP_CALL_PRIMOP
-        // referencing the C PrimOp pointer, bypassing the runtime
-        // builtins lookup entirely.
-        //
-        // To make the install effective, T0b (next sub-task) must
-        // ONE OF:
-        //   (a) Add a side-table `unordered_map<const PrimOp*, Value>`
-        //       of replacements and check it in OP_LIT_PRIMOP +
-        //       OP_CALL_PRIMOP in vm.cc.  OP_CALL_PRIMOP redirect is
-        //       non-trivial: args are already on the stack and
-        //       dispatching a closure curried over N args requires
-        //       the iterative OP_CALL chain (partial — only fun-force
-        //       converted, primop-arg redirect not yet wired up).
-        //
-        //   (b) IR-level inlining: at lower-time (in
-        //       fusePrimOpApps or a new pass), rewrite saturated calls
-        //       to replaced primops as the inlined source IR.  Avoids
-        //       runtime dispatch entirely.  Each call site gets
-        //       specialised bytecode.  Higher up-front cost
-        //       (IR inlining + variable substitution) but cleaner
-        //       runtime.
-        //
-        // This scaffold (T0) lands the install function + bridge wiring
-        // + idempotency / recursion guards / dbg trace.  Subsequent
-        // commits (T0b → T1-T17) layer on the dispatch hook and the
-        // actual primop sources.
+        // T0b self-test gate: install `floor` as `x: x + 1` so that
+        // `builtins.floor 41 == 42` under v3.  TW remains unchanged
+        // (this is opt-in for verification only).
+        if (std::getenv("NIX_V3_BYTECODE_PRIMOP_SELFTEST"))
+            installBytecodePrimop(state, "floor", "x: x + 1");
 
-        // Phase 1 (T1-T17): no primops installed yet.  Each conversion
-        // task appends one `installBytecodePrimop(state, name, src)`
-        // call here after T0b's dispatch hook is wired up.
+        // Phase 1 (T1-T17): bytecode primops added here one at a time.
+        // The order matters when one bytecode primop's source uses
+        // another — install dependencies first.  All current callback
+        // primops use only non-callback primitives (length, elemAt,
+        // arithmetic, comparisons) which remain C primops, so order
+        // is flat for now.
     } catch (...) {
         // Reset `done` so a future call retries — otherwise a
         // transient error here would permanently disable bytecode

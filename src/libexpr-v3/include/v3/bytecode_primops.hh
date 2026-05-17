@@ -44,6 +44,22 @@ class EvalState;
 
 namespace nix::v3 {
 
+struct PrimOp;
+
+/// Returns the bytecode-closure replacement Value for `po`, or
+/// nullptr if no replacement has been installed.  Used by:
+///   - `vm.cc` OP_LIT_PRIMOP to push the replacement Closure
+///     instead of a Tag::PrimOp Value.
+///   - `lower.cc` `lowerCall` to skip the static PrimOpCall path
+///     for replaced primops (forcing the call through the generic
+///     App-chain → OP_CALL emit path, which then sees the
+///     replacement Closure via the OP_LIT_PRIMOP hook above).
+///
+/// Cheap (one unordered_map lookup).  Safe to call before
+/// `installAllBytecodePrimops` — returns nullptr until populated.
+const Value * lookupPrimopReplacement(const PrimOp * po) noexcept;
+
+
 /// Compile `nixSource` (which must be a lambda expression like
 /// `op: nul: list: <body>`) via the v3 lowering pipeline and replace
 /// the entry for `primopName` in TW's `builtins` attrset with the

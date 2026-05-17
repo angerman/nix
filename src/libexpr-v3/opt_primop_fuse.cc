@@ -49,6 +49,7 @@
 
 #include "v3/ir.hh"
 #include "v3/primop.hh"
+#include "v3/bytecode_primops.hh"
 
 #include <unordered_map>
 
@@ -66,11 +67,16 @@ struct PartialApp {
 size_t fusePrimOpApps(Module & m)
 {
     // Pass 1: collect (VarId -> PrimOp *) for every LitPrimOp binding.
+    // A12b T0b: skip primops that have a bytecode-closure replacement
+    // installed — those must dispatch via OP_CALL on the closure value
+    // (pushed by OP_LIT_PRIMOP's redirect in vm.cc), not via the
+    // fused PrimOpCall path which would bypass the redirect.
     std::unordered_map<VarId, const v3::PrimOp *> primopOf;
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid)
         for (auto & b : m.blocks[bid].bindings)
             if (auto * lp = std::get_if<LitPrimOp>(&b.expr))
-                if (lp->primop && lp->primop->lazyArgs == 0)
+                if (lp->primop && lp->primop->lazyArgs == 0
+                    && !lookupPrimopReplacement(lp->primop))
                     primopOf[b.var] = lp->primop;
 
     if (primopOf.empty()) return 0;
