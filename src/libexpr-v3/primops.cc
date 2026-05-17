@@ -1343,7 +1343,16 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
     if (!src || !names || names->size == 0) { out = args[0]; return; }
     std::unordered_set<SymbolId> toRemove;
     for (uint32_t i = 0; i < names->size; ++i) {
-        const Value & el = names->elems[i];
+        // 2026-05-18: force each element to WHNF.  v3's lazy list
+        // primops (mapAttrs/genList) install Tag::App entries that
+        // resolve to strings only on force.  Without this, a
+        // `removeAttrs s (map f xs)` call sees Tag::App where it
+        // expects Tag::String.  Mirror primAttrNames' force pattern.
+        Value el = names->elems[i];
+        if (__builtin_expect(el.tag() == Tag::Thunk
+                             || el.tag() == Tag::App
+                             || el.tag() == Tag::Slot, 0))
+            el = forceValue(*state.vm, el);
         if (!el.isString()) typeError("removeAttrs", "list of strings");
         toRemove.insert(vmIntern(state, el.payload.str));
     }
@@ -5087,9 +5096,426 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
 // Throws on any unsupported shape; the caller's primDerivationStrict
 // catches the throw and falls through to the existing bridge.
 //
-// Currently stops short of writeDerivation — that's BR-3.7.  This
-// commit demonstrates the iteration logic; the bridge fall-back
-// keeps semantics identical.
+// 2026-05-17 — Option 4 hybrid: phases 4-7 (context processing,
+// output configuration, writeDerivation, result attrset construction)
+// are extracted into `buildAndWriteDrvNative` so both
+// `primDerivationStrictNative` (the all-C path) AND the new
+// `primDerivationFromPreprocessed` (the bytecode-wrapper FFI leaf)
+// can share the implementation.  See the bytecode wrapper's
+// installation site in bytecode_primops.cc for the protocol.
+static void buildAndWriteDrvNative(
+    EvalState & state,
+    nix::Derivation & drv,
+    const nix::NixStringContext & context,
+    const std::vector<std::string> & declaredOutputs,
+    bool contentAddressed, bool isImpure,
+    const std::optional<std::string> & outputHashStr,
+    const std::optional<std::string> & outputHashAlgoStr,
+    const std::optional<std::string> & outputHashModeStr,
+    Value & out)
+{
+    auto & ns = *state.nixEvalState;
+    const auto & sym = drvStrictSymbols();
+
+    if (drv.builder.empty())
+        throw std::runtime_error(
+            "v3 BR-3 native: required attribute `builder` missing");
+    if (drv.platform.empty())
+        throw std::runtime_error(
+            "v3 BR-3 native: required attribute `system` missing");
+
+    // ---- BR-3.6: process accumulated NixStringContext into
+    // drv.inputSrcs / drv.inputDrvs.  Mirrors derivationStrictInternal
+    // (eval.cc:1849).  Variant dispatch:
+    //
+    //   - DrvDeep{drvPath}    : add the entire FS closure of drvPath as
+    //                           sources; for each derivation in the
+    //                           closure, also pull in its full output
+    //                           name set as an inputDrv.
+    //   - Built{drvPath, out} : insert `out` into inputDrvs[drvPath].
+    //   - Opaque{path}        : insert `path` into inputSrcs.
+    //
+    // The context comes from coerceToString calls that flowed
+    // through derivation strings (`outPath`, `drvPath`) and path
+    // values (copyPathToStore).
+    for (auto & c : context) {
+        std::visit(
+            nix::overloaded{
+                [&](const nix::NixStringContextElem::DrvDeep & d) {
+                    nix::StorePathSet refs;
+                    ns.store->computeFSClosure(d.drvPath, refs);
+                    for (auto & j : refs) {
+                        drv.inputSrcs.insert(j);
+                        if (j.isDerivation()) {
+                            drv.inputDrvs.map[j].value =
+                                ns.store->readDerivation(j).outputNames();
+                        }
+                    }
+                },
+                [&](const nix::NixStringContextElem::Built & b) {
+                    drv.inputDrvs.ensureSlot(*b.drvPath).value.insert(b.output);
+                },
+                [&](const nix::NixStringContextElem::Opaque & o) {
+                    drv.inputSrcs.insert(o.path);
+                },
+            },
+            c.raw);
+    }
+
+    // ---- BR-3.11 / BR-3.10 / BR-3.7: output configuration.
+    if (contentAddressed || isImpure) {
+        nix::HashAlgorithm ha = nix::HashAlgorithm::SHA256;
+        if (outputHashAlgoStr) {
+            if (auto parsed = nix::parseHashAlgoOpt(*outputHashAlgoStr))
+                ha = *parsed;
+        }
+        nix::ContentAddressMethod method =
+            nix::ContentAddressMethod::Raw::NixArchive;
+        if (outputHashModeStr) {
+            if (*outputHashModeStr == "recursive")
+                method = nix::ContentAddressMethod::Raw::NixArchive;
+            else
+                method = nix::ContentAddressMethod::parse(*outputHashModeStr);
+        }
+        for (auto & o : declaredOutputs) {
+            drv.env[o] = nix::hashPlaceholder(o);
+            if (isImpure) {
+                drv.outputs.insert_or_assign(o,
+                    nix::DerivationOutput{nix::DerivationOutput::Impure{
+                        .method   = method,
+                        .hashAlgo = ha,
+                    }});
+            } else {
+                drv.outputs.insert_or_assign(o,
+                    nix::DerivationOutput{nix::DerivationOutput::CAFloating{
+                        .method   = method,
+                        .hashAlgo = ha,
+                    }});
+            }
+        }
+    } else if (outputHashStr) {
+        if (declaredOutputs.size() != 1 || declaredOutputs[0] != "out") {
+            throw std::runtime_error(
+                "v3 BR-3 native: multiple outputs are not supported in "
+                "fixed-output derivations");
+        }
+        std::optional<nix::HashAlgorithm> ha;
+        if (outputHashAlgoStr)
+            ha = nix::parseHashAlgoOpt(*outputHashAlgoStr);
+        nix::Hash h = nix::newHashAllowEmpty(*outputHashStr, ha);
+
+        nix::ContentAddressMethod method = nix::ContentAddressMethod::Raw::Flat;
+        if (outputHashModeStr) {
+            if (*outputHashModeStr == "recursive")
+                method = nix::ContentAddressMethod::Raw::NixArchive;
+            else
+                method = nix::ContentAddressMethod::parse(*outputHashModeStr);
+        }
+
+        nix::DerivationOutput::CAFixed dof{
+            .ca = nix::ContentAddress{
+                .method = std::move(method),
+                .hash   = std::move(h),
+            },
+        };
+        drv.env["out"] = ns.store->printStorePath(
+            dof.path(*ns.store, drv.name, "out"));
+        drv.outputs.insert_or_assign("out", std::move(dof));
+    } else {
+        for (auto & o : declaredOutputs) {
+            drv.env[o] = "";
+            drv.outputs.insert_or_assign(
+                o, nix::DerivationOutput{nix::DerivationOutput::Deferred{}});
+        }
+        drv.fillInOutputPaths(*ns.store);
+    }
+
+    // Materialise + cache + build result attrset.
+    nix::StorePath drvPath = nix::settings.readOnlyMode
+        ? nix::computeStorePath(*ns.store, drv)
+        : ns.store->writeDerivation(drv, ns.repair);
+    std::string drvPathS = ns.store->printStorePath(drvPath);
+
+    {
+        auto h = nix::hashDerivationModulo(*ns.store, drv, false);
+        nix::drvHashes.insert_or_assign(drvPath, std::move(h));
+    }
+
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(1 + drv.outputs.size());
+
+    {
+        Value v3DrvPath = mkStringValueOwned(drvPathS);
+        nix::NixStringContext drvCtx;
+        drvCtx.insert(
+            nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{
+                .drvPath = drvPath}});
+        setStringContext(v3DrvPath.payload.str, drvCtx);
+        entries.emplace_back(sym.drvPath, v3DrvPath);
+    }
+
+    for (auto & [outName, outDef] : drv.outputs) {
+        SymbolId outSid = ir::globalInternSymbol(outName);
+        std::optional<nix::StorePath> optStaticOutputPath =
+            outDef.path(*ns.store, drv.name, outName);
+        if (!optStaticOutputPath) {
+            throw std::runtime_error(
+                "v3 BR-3 native: output '" + outName +
+                "' has no static path after fillInOutputPaths");
+        }
+        std::string outPathS = ns.store->printStorePath(*optStaticOutputPath);
+
+        Value v3OutPath = mkStringValueOwned(outPathS);
+        nix::NixStringContext outCtx;
+        outCtx.insert(nix::NixStringContextElem{
+            nix::NixStringContextElem::Built{
+                .drvPath = nix::makeConstantStorePathRef(drvPath),
+                .output  = outName,
+            }});
+        setStringContext(v3OutPath.payload.str, outCtx);
+        entries.emplace_back(outSid, v3OutPath);
+    }
+
+    std::sort(entries.begin(), entries.end(),
+        [](auto & a, auto & b) { return a.first < b.first; });
+
+    Bindings * resultB = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+    allocStats().attrsetsAllocated++;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        resultB->entries[i].name  = entries[i].first;
+        resultB->entries[i].value = entries[i].second;
+    }
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = resultB;
+}
+
+// 2026-05-17 — Option 4 hybrid FFI leaf.
+//
+// Takes a preprocessed-args attrset from the bytecode wrapper and
+// runs phases 4-7 (context → inputs, output config, writeDerivation,
+// result attrset).  The bytecode wrapper handles phases 1-3 (attr
+// iteration, force, coerceToString) at bytecode level — iterative,
+// no C-recursion.
+//
+// Input attrset shape (all fields force/cast-checked):
+//   name             : string             (drv name)
+//   builder          : string             (with context)
+//   system           : string             (platform string)
+//   args             : list of strings    (with context — drv args)
+//   outputs          : list of strings    (output names; default ["out"])
+//   env              : attrset of strings (with context; env vars)
+//   __ignoreNulls    : bool               (unused at leaf; wrapper applied)
+//   __contentAddressed : bool             (CA output config)
+//   __impure         : bool               (impure output config)
+//   __structuredAttrs : bool              (must be false; wrapper falls back
+//                                          to C for structured)
+//   outputHash       : null or string     (fixed-output hash; opt.)
+//   outputHashAlgo   : null or string     (hash algorithm; opt.)
+//   outputHashMode   : null or string     (hash mode; opt.)
+//
+// Throws on missing/malformed input.  The bytecode wrapper is
+// responsible for shape correctness.
+static void primDerivationFromPreprocessed(EvalState & state, Value * args, Value & out)
+{
+    if (!args[0].isAttrs() || !args[0].payload.bindings)
+        typeError("__derivationFromPreprocessed", "attrset");
+    auto * pp = args[0].payload.bindings;
+
+    // Symbol IDs we'll look up.  Cache by static-local for reuse.
+    static const SymbolId sName            = ir::globalInternSymbol("name");
+    static const SymbolId sBuilder         = ir::globalInternSymbol("builder");
+    static const SymbolId sSystem          = ir::globalInternSymbol("system");
+    static const SymbolId sArgs            = ir::globalInternSymbol("args");
+    static const SymbolId sOutputs         = ir::globalInternSymbol("outputs");
+    static const SymbolId sEnv             = ir::globalInternSymbol("env");
+    static const SymbolId sIgnoreNulls     = ir::globalInternSymbol("__ignoreNulls");
+    static const SymbolId sContentAddressed= ir::globalInternSymbol("__contentAddressed");
+    static const SymbolId sImpure          = ir::globalInternSymbol("__impure");
+    static const SymbolId sStructuredAttrs = ir::globalInternSymbol("__structuredAttrs");
+    static const SymbolId sOutputHash      = ir::globalInternSymbol("outputHash");
+    static const SymbolId sOutputHashAlgo  = ir::globalInternSymbol("outputHashAlgo");
+    static const SymbolId sOutputHashMode  = ir::globalInternSymbol("outputHashMode");
+
+    auto forceField = [&](const Value * v) -> Value {
+        if (!v) return Value{};
+        return forceValue(*state.vm, *v);
+    };
+
+    auto getString = [&](SymbolId sid, const std::string & label) -> std::string {
+        const Value * v = pp->lookup(sid);
+        if (!v) throw std::runtime_error(
+            "v3 __derivationFromPreprocessed: missing field '" + label + "'");
+        Value f = forceField(v);
+        if (!f.isString())
+            throw std::runtime_error(
+                "v3 __derivationFromPreprocessed: field '" + label +
+                "' is not a string (tag=" + std::to_string((int)f.tag()) + ")");
+        return std::string(f.payload.str ? f.payload.str : "");
+    };
+
+    auto getOptString = [&](SymbolId sid) -> std::optional<std::string> {
+        const Value * v = pp->lookup(sid);
+        if (!v) return std::nullopt;
+        Value f = forceField(v);
+        if (f.tag() == Tag::Null) return std::nullopt;
+        if (!f.isString()) return std::nullopt;
+        return std::string(f.payload.str ? f.payload.str : "");
+    };
+
+    auto getBool = [&](SymbolId sid, bool defaultV) -> bool {
+        const Value * v = pp->lookup(sid);
+        if (!v) return defaultV;
+        Value f = forceField(v);
+        if (!f.isBool()) return defaultV;
+        return f.payload.i == 1;
+    };
+
+    // Absorb string-context entries (v3 side-table) into a
+    // NixStringContext.  Same parse path as nix::NixStringContextElem::parse;
+    // each ctxStr is the unparsed "format token" v3 stores in
+    // lookupStringContextEntries.
+    auto absorbCtx = [&](const char * s, nix::NixStringContext & ctx) {
+        if (!s) return;
+        auto * raw = lookupStringContextEntries(s);
+        if (!raw) return;
+        for (auto & token : *raw) {
+            try {
+                // NixStringContextElem::parse(s [, xpSettings]) — the
+                // second arg is the ExperimentalFeatureSettings; default
+                // uses the global singleton, which is what we want here.
+                ctx.insert(nix::NixStringContextElem::parse(token));
+            } catch (const std::exception & e) {
+                // Skip malformed tokens — same defensive policy as
+                // the existing primDerivationStrictNative path.
+            }
+        }
+    };
+
+    // ---- Parse preprocessed args ----
+
+    nix::Derivation drv;
+    drv.name = getString(sName, "name");
+    nix::checkName(drv.name);
+    drv.builder = getString(sBuilder, "builder");
+    drv.platform = getString(sSystem, "system");
+
+    nix::NixStringContext context;
+
+    // builder + system have their own context entries
+    {
+        const Value * bV = pp->lookup(sBuilder);
+        if (bV) {
+            Value f = forceField(bV);
+            if (f.isString()) absorbCtx(f.payload.str, context);
+        }
+        const Value * sV = pp->lookup(sSystem);
+        if (sV) {
+            Value f = forceField(sV);
+            if (f.isString()) absorbCtx(f.payload.str, context);
+        }
+    }
+
+    // Read flags
+    bool ignoreNulls       = getBool(sIgnoreNulls, false);
+    (void)ignoreNulls;  // wrapper applied; flag carried for completeness
+    bool contentAddressed  = getBool(sContentAddressed, false);
+    bool isImpure          = getBool(sImpure, false);
+    bool useStructuredAttrs= getBool(sStructuredAttrs, false);
+
+    if (useStructuredAttrs) {
+        throw std::runtime_error(
+            "v3 __derivationFromPreprocessed: __structuredAttrs is set; "
+            "the bytecode wrapper must fall back to C "
+            "__derivationStrictRaw for structured derivations.");
+    }
+    if (contentAddressed && isImpure)
+        throw std::runtime_error(
+            "v3 __derivationFromPreprocessed: derivation cannot be both "
+            "content-addressed and impure");
+
+    // Hash fields
+    auto outputHashStr     = getOptString(sOutputHash);
+    auto outputHashAlgoStr = getOptString(sOutputHashAlgo);
+    auto outputHashModeStr = getOptString(sOutputHashMode);
+
+    // Read outputs list
+    std::vector<std::string> declaredOutputs;
+    {
+        const Value * v = pp->lookup(sOutputs);
+        if (v) {
+            Value f = forceField(v);
+            if (f.isList() && f.payload.list) {
+                for (uint32_t i = 0; i < f.payload.list->size; ++i) {
+                    Value el = forceValue(*state.vm, f.payload.list->elems[i]);
+                    if (!el.isString())
+                        throw std::runtime_error(
+                            "v3 __derivationFromPreprocessed: outputs[*] "
+                            "is not a string");
+                    std::string s(el.payload.str ? el.payload.str : "");
+                    if (s.empty() || s == "drvPath")
+                        throw std::runtime_error(
+                            "v3 __derivationFromPreprocessed: invalid "
+                            "output name '" + s + "'");
+                    declaredOutputs.push_back(s);
+                }
+            }
+        }
+    }
+    if (declaredOutputs.empty()) declaredOutputs.push_back("out");
+
+    // Read args list → drv.args + absorb context
+    {
+        const Value * v = pp->lookup(sArgs);
+        if (v) {
+            Value f = forceField(v);
+            if (f.isList() && f.payload.list) {
+                for (uint32_t i = 0; i < f.payload.list->size; ++i) {
+                    Value el = forceValue(*state.vm, f.payload.list->elems[i]);
+                    if (!el.isString())
+                        throw std::runtime_error(
+                            "v3 __derivationFromPreprocessed: args[*] "
+                            "is not a string");
+                    drv.args.push_back(el.payload.str ? el.payload.str : "");
+                    absorbCtx(el.payload.str, context);
+                }
+            }
+        }
+    }
+
+    // Read env attrset → drv.env + absorb context for each value
+    {
+        const Value * v = pp->lookup(sEnv);
+        if (v) {
+            Value f = forceField(v);
+            if (!f.isAttrs())
+                throw std::runtime_error(
+                    "v3 __derivationFromPreprocessed: `env` is not an attrset");
+            if (f.payload.bindings) {
+                const auto & st = ir::globalSymbolTable();
+                auto * b = f.payload.bindings;
+                for (uint32_t i = 0; i < b->size; ++i) {
+                    SymbolId nm = b->entries[i].name;
+                    Value elv = forceValue(*state.vm, b->entries[i].value);
+                    if (!elv.isString())
+                        throw std::runtime_error(
+                            "v3 __derivationFromPreprocessed: env value "
+                            "for an attr is not a string");
+                    std::string keyStr(nm < st.size() ? st[nm] : "");
+                    drv.env.emplace(keyStr,
+                        elv.payload.str ? elv.payload.str : "");
+                    absorbCtx(elv.payload.str, context);
+                }
+            }
+        }
+    }
+
+    // Delegate to the shared phases-4-7 helper.
+    buildAndWriteDrvNative(state, drv, context, declaredOutputs,
+                            contentAddressed, isImpure,
+                            outputHashStr, outputHashAlgoStr, outputHashModeStr,
+                            out);
+}
+
 static void primDerivationStrictNative(
     EvalState & state, Value * args, Value & out)
 {
@@ -5331,6 +5757,33 @@ static void primDerivationStrictNative(
         drv.structuredAttrs = std::move(sa);
     }
 
+    // 2026-05-17 — Option 4 refactor: delegate phases 4-7 (context
+    // processing, output config, writeDerivation, result attrset) to
+    // the shared helper.  This same helper is called by the bytecode
+    // hybrid's FFI leaf `__derivationFromPreprocessed`.  See
+    // bytecode_primops.cc for the wrapper protocol.
+    buildAndWriteDrvNative(state, drv, context, declaredOutputs,
+        contentAddressed, isImpure,
+        outputHashStr, outputHashAlgoStr, outputHashModeStr,
+        out);
+}
+
+// Legacy inline phase-4-7 code from primDerivationStrictNative, kept as
+// reference until the 2026-05-17 refactor stabilizes.  Compiled out
+// (`#if 0`) so it doesn't affect runtime behavior.
+#if 0
+static void primDerivationStrictNative_phases_4_7_legacy_ref(
+    EvalState & state, nix::Derivation & drv,
+    const nix::NixStringContext & context,
+    const std::vector<std::string> & declaredOutputs,
+    bool contentAddressed, bool isImpure,
+    const std::optional<std::string> & outputHashStr,
+    const std::optional<std::string> & outputHashAlgoStr,
+    const std::optional<std::string> & outputHashModeStr,
+    Value & out)
+{
+    auto & ns = *state.nixEvalState;
+    const auto & sym = drvStrictSymbols();
     if (drv.builder.empty())
         throw std::runtime_error(
             "v3 BR-3 native: required attribute `builder` missing");
@@ -5552,6 +6005,7 @@ static void primDerivationStrictNative(
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = resultB;
 }
+#endif // legacy phase-4-7 inline reference
 
 void primDerivation(EvalState & state, Value * args, Value & out)
 {
@@ -8249,6 +8703,12 @@ void registerBuiltinPrimOps()
         // name so it's invisible from `builtins.X` (per the convention
         // in getBuiltinsValue at vm.cc:8341).
         registerPrimOp({"__derivationStrictRaw", 1, primDerivationStrict});
+        // 2026-05-17 Option 4 hybrid FFI leaf.  Receives a pre-
+        // processed attrset built by the bytecode wrapper and runs
+        // phases 4-7 (context → inputs, output config, writeDerivation,
+        // result attrset) via the shared `buildAndWriteDrvNative`
+        // helper.  See bytecode_primops.cc for the wrapper protocol.
+        registerPrimOp({"__derivationFromPreprocessed", 1, primDerivationFromPreprocessed});
         // C++ port of corepkgs/derivation.nix — derivationStrict
         // synthesizes paths, primDerivation wraps them up with
         // commonAttrs and outputName for tree-walker parity.

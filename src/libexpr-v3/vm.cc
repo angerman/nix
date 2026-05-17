@@ -538,8 +538,38 @@ inline bool valueLess(VMState & vm, const Value & a, const Value & b)
 
 inline bool isTrueValue(const Value & v)
 {
-    if (!v.isBool()) throw std::runtime_error("v3: expected bool");
-    return v.payload.i == 1;
+    // 2026-05-18: defensively chase Tag::Slot.  The OP_NOT/OP_ASSERT
+    // call sites WHNF-check before invoking us, but their check happens
+    // BEFORE the iterative-force retry — when the retry path writes a
+    // Slot back via CFF_FORCE_WB_PTR_KEEP (e.g. OP_ATTRS_SELECT_IC's
+    // mapAttrs writeback) the next OP_NOT execution can see the Slot
+    // again.  Dereferencing here is cheap (1-hop max in practice) and
+    // mirrors the chase op_force_slow already does.
+    const Value * cur = &v;
+    int hops = 0;
+    while (cur->tag() == Tag::Slot && cur->payload.slot && hops < 32) {
+        cur = cur->payload.slot;
+        ++hops;
+    }
+    if (!cur->isBool()) {
+        // Diagnostic: when V3_DBG_EXPECTED_BOOL=1, dump tag + C-stack
+        // backtrace so we can locate the offending OP_NOT/OP_ASSERT.
+        static const bool s_dbg =
+            std::getenv("V3_DBG_EXPECTED_BOOL") != nullptr;
+        if (__builtin_expect(s_dbg, 0)) {
+            std::fprintf(stderr,
+                "v3 isTrueValue: not bool — tag=%d (after %d Slot hops)\n",
+                (int)cur->tag(), hops);
+            void * cstack[32];
+            int n = ::backtrace(cstack, 32);
+            char ** syms = ::backtrace_symbols(cstack, n);
+            for (int i = 0; i < n && i < 12; ++i)
+                std::fprintf(stderr, "  %s\n", syms[i]);
+            if (syms) std::free(syms);
+        }
+        throw std::runtime_error("v3: expected bool");
+    }
+    return cur->payload.i == 1;
 }
 
 /// Coerce a Value to its string representation for OP_STR_CONCAT.

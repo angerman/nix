@@ -187,6 +187,72 @@ let
   l10 = mk "l10" [l9];
 in l10.drvPath'
 
+# Case 14-23: directly call builtins.derivationStrict (exercises the
+# Option 4 wrapper → __derivationFromPreprocessed path on v3).
+# These ARE the route through MY bytecode wrapper.
+run "ds-minimal" '
+(builtins.derivationStrict {
+  name = "dsmin";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+}).drvPath'
+
+run "ds-with-args" '
+(builtins.derivationStrict {
+  name = "dsargs";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+  args = ["-c" "echo"];
+}).drvPath'
+
+run "ds-multi-output" '
+(builtins.derivationStrict {
+  name = "dsmulti";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+  outputs = ["out" "dev" "doc"];
+}).drvPath'
+
+run "ds-mixed-env" '
+(builtins.derivationStrict {
+  name = "dsenv";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+  envStr = "hello";
+  envInt = 42;
+  envBool = true;
+}).drvPath'
+
+run "ds-build-inputs" '
+let
+  a = derivation { name = "a"; system = "x86_64-linux"; builder = "/bin/sh"; };
+in (builtins.derivationStrict {
+  name = "dsbi";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+  buildInputs = [a];
+}).drvPath'
+
+run "ds-ignore-nulls" '
+(builtins.derivationStrict {
+  name = "dsign";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+  __ignoreNulls = true;
+  nullAttr = null;
+  realAttr = "yes";
+}).drvPath'
+
+run "ds-fixed-output" '
+(builtins.derivationStrict {
+  name = "dsfixed";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+  outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  outputHashAlgo = "sha256";
+  outputHashMode = "flat";
+}).drvPath'
+
 echo
 echo "=== derivation-parity results ==="
 echo "  total: $total"

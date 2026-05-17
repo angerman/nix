@@ -497,6 +497,33 @@ void installAllBytecodePrimops(nix::EvalState & state)
             // attr-by-attr force: foldl' iterates a HARDCODED list of
             // "safe-to-pre-force" attr names and skips any not present
             // in args (via `args ? k` then `args.${k}`).
+            // 2026-05-17 Option 4 full wrapper.  Replaces the prior
+            // "pre-force then call C primop" approach.  The wrapper now
+            // does phases 1-3 (validation, attr iteration, coerce-to-
+            // string) entirely in Nix-source-compiled-to-bytecode, then
+            // calls the C FFI leaf `__derivationFromPreprocessed` which
+            // runs phases 4-7 (context → inputs, output config,
+            // writeDerivation, result attrset) via the shared
+            // `buildAndWriteDrvNative` helper in primops.cc.
+            //
+            // Why "Option 4 full" instead of "pre-force then call C":
+            // breaking the C-stack recursion requires every level of
+            // recursion through the derivation graph to ride bytecode
+            // (vm.frames pushes) rather than C-stack frames.  The
+            // pre-force-only approach left the C-body's iteration as
+            // a C-recursion vector — primDerivationStrictNative's
+            // `forceValue(attrV)` (vm.cc-equiv line 5183) is the
+            // call into deeper derivation chains.  Doing the iteration
+            // in bytecode replaces every per-level C frame with a
+            // dispatchLoop-internal vm.frames push.
+            //
+            // Falls back to `__derivationStrictRaw` (the C primop) for
+            // __structuredAttrs=true derivations — the wrapper doesn't
+            // yet handle JSON encoding (TODO: port `valueToJsonWithContext`
+            // to bytecode for the full Option 4 closure).
+            //
+            // (Old wrapper kept below as commented reference.)
+#if 0
             // The wrapper has TWO pre-force passes:
             //
             //   (1) safeKeys: shallow-force the concrete-typed attrs
@@ -587,6 +614,161 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 std::string(wrapper_body)
                 + " (builtins.__derivationRaw args)"
                 + wrapper_tail);
+#endif  // legacy pre-force wrapper
+
+            // Full Option 4 wrapper.  Iterates args's attrs at bytecode
+            // level, coerces each non-flag-non-special attr to string
+            // via `builtins.toString`, builds the env attrset + special
+            // fields, then calls `__derivationFromPreprocessed`.
+            //
+            // For structured-attrs derivations, falls back to the C
+            // primop (the wrapper doesn't yet do JSON encoding).
+            //
+            // The coerce uses `builtins.toString` (C primToString).
+            // toString is C-recursive for nested values (list-of-
+            // attrset-with-outPath), but each top-level invocation
+            // adds only a SMALL C-frame chain.  The KEY: the OUTER
+            // iteration (one entry per attr) runs at bytecode level —
+            // no per-attr C-frame stack consumption.
+            const char * full_wrapper =
+                "args: "
+                "  let "
+                "    keys = builtins.attrNames args; "
+                "    flagKeys = [ "
+                "      \"__ignoreNulls\" \"__contentAddressed\" "
+                "      \"impure\" \"__structuredAttrs\" "
+                "    ]; "
+                // `args` is the ONLY attr that skips drv.env (TW
+                // populates drv.args from it instead).  `outputs` /
+                // `outputHash*` / `builder` / `system` ALL emplace
+                // into drv.env in TW's primDerivationStrictNative
+                // (lines 5301-5316 in primops.cc), even though they
+                // also feed drv.builder / drv.platform / outputHash /
+                // declaredOutputs.  Match that here — otherwise the
+                // drv hash diverges.
+                "    specialEnvKeys = [ \"args\" \"outputs\" ]; "
+                "    isFlag = k: builtins.elem k flagKeys; "
+                "    isSpecialEnv = k: builtins.elem k specialEnvKeys; "
+                // Defensive bool coercion: nixpkgs may pass non-bool
+                // values for these flag attrs (e.g. null), and an
+                // `if (non-bool)` opcode in subsequent logic would
+                // throw "v3: expected bool".  Use `== true` to force
+                // a clean bool result for any non-true value.
+                "    asBool = v: v == true; "
+                "    ignoreNullsFlag = asBool (args.__ignoreNulls or false); "
+                "    structuredFlag = asBool (args.__structuredAttrs or false); "
+                "    contentAddressedFlag = asBool (args.__contentAddressed or false); "
+                "    impureFlag = asBool (args.impure or false); "
+                "    drvName = args.name; "
+                "    builderStr = builtins.toString args.builder; "
+                "    systemStr = builtins.toString args.system; "
+                "    outputsList = "
+                "      if args ? outputs "
+                "      then builtins.map builtins.toString args.outputs "
+                "      else [ \"out\" ]; "
+                "    outputsEnvEntry = builtins.concatStringsSep \" \" outputsList; "
+                "    argsList = "
+                "      if args ? args "
+                "      then builtins.map builtins.toString args.args "
+                "      else [ ]; "
+                "    outputHashStr = "
+                "      if args ? outputHash then builtins.toString args.outputHash "
+                "      else null; "
+                "    outputHashAlgoStr = "
+                "      if args ? outputHashAlgo then builtins.toString args.outputHashAlgo "
+                "      else null; "
+                "    outputHashModeStr = "
+                "      if args ? outputHashMode then builtins.toString args.outputHashMode "
+                "      else null; "
+                "    envKeyValue = k: "
+                "      if isFlag k then null "
+                "      else if isSpecialEnv k then null "
+                "      else if ignoreNullsFlag && (args.${k}) == null then null "
+                "      else { name = k; value = builtins.toString args.${k}; }; "
+                "    envEntries = "
+                "      builtins.filter (e: e != null) "
+                "        (builtins.map envKeyValue keys); "
+                "    baseEnv = builtins.listToAttrs envEntries; "
+                // Only synthesize an `outputs` env entry when the user
+                // ACTUALLY provided `outputs` in args.  TW's
+                // primDerivationStrict adds it only in the explicit-
+                // outputs branch (lines 5269-5294 in primops.cc).  Adding
+                // it when missing creates a divergent drvPath hash.
+                "    envWithSpecialsBase = "
+                "      baseEnv // { "
+                "        builder = builderStr; "
+                "        system = systemStr; "
+                "        name = drvName; "
+                "      }; "
+                "    envWithSpecials = "
+                "      if args ? outputs "
+                "      then envWithSpecialsBase // { outputs = outputsEnvEntry; } "
+                "      else envWithSpecialsBase; "
+                "    preprocessed = { "
+                "      name = drvName; "
+                "      builder = builderStr; "
+                "      system = systemStr; "
+                "      args = argsList; "
+                "      outputs = outputsList; "
+                "      env = envWithSpecials; "
+                "      __ignoreNulls = ignoreNullsFlag; "
+                "      __contentAddressed = contentAddressedFlag; "
+                "      __impure = impureFlag; "
+                "      __structuredAttrs = structuredFlag; "
+                "      outputHash = outputHashStr; "
+                "      outputHashAlgo = outputHashAlgoStr; "
+                "      outputHashMode = outputHashModeStr; "
+                "    }; "
+                "  in "
+                "    if structuredFlag "
+                "    then builtins.__derivationStrictRaw args "
+                "    else builtins.__derivationFromPreprocessed preprocessed";
+
+            installBytecodePrimop(state, "derivationStrict", full_wrapper);
+
+            // Also wrap `derivation` so user-facing `derivation { ... }`
+            // routes through MY bytecode wrapper.  Without this, the C
+            // primDerivation would call primDerivationStrict (the C
+            // function pointer) directly — bypassing my wrapper.
+            //
+            // The body mirrors primDerivation's logic: call
+            // builtins.derivationStrict (intercepted by the wrapper
+            // above), then build the output attrset (args // strict //
+            // {outPath; drvPath; type; outputName; drvAttrs; all;} +
+            // per-output sub-attrsets).
+            const char * derivation_wrapper =
+                "args: "
+                "  let "
+                "    strict = builtins.derivationStrict args; "
+                "    outputsList = "
+                "      if args ? outputs "
+                "      then builtins.map builtins.toString args.outputs "
+                "      else [ \"out\" ]; "
+                "    firstOut = builtins.head outputsList; "
+                "    drvPath = strict.drvPath; "
+                "    firstOutPath = strict.${firstOut}; "
+                "    perOutput = o: { "
+                "      inherit drvPath; "
+                "      outPath = strict.${o}; "
+                "      type = \"derivation\"; "
+                "      outputName = o; "
+                "    }; "
+                "    perOutputAttrs = "
+                "      builtins.listToAttrs "
+                "        (builtins.map "
+                "          (o: { name = o; value = perOutput o; }) "
+                "          outputsList); "
+                "  in "
+                "    args // { "
+                "      drvPath = drvPath; "
+                "      outPath = firstOutPath; "
+                "      type = \"derivation\"; "
+                "      outputName = firstOut; "
+                "      drvAttrs = args; "
+                "      all = builtins.map perOutput outputsList; "
+                "    } // perOutputAttrs";
+
+            installBytecodePrimop(state, "derivation", derivation_wrapper);
         }
     } catch (...) {
         // Reset `done` so a future call retries — otherwise a
