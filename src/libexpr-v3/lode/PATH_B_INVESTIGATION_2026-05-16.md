@@ -153,10 +153,64 @@ Most likely v3 culprits:
       pure-call recognized by isTrivialForLazy(forArg=true)) but
       whose body resolves `with pkgs;`.
 
-The next concrete step: enable `V3_DBG_FORCE_TRACE` filtered to
-position `stage.nix:150` or to res's CU, capture the EXACT op that
-fires the look-up, work backward from there to the lower.cc
-emission site.
+## 2026-05-17 — Bytecode site of the cycle
+
+`V3_DBG_WITH_CYCLE=1 V3_DBG_OPCYCLE_DISASM=1` dumps the bytecode
+window around the firing OP.  At ip=34289 inside the `super`-named
+closure (desc.codeOff=140):
+
+```
+[34288] OP_SET_LOCAL     operand=3274
+[34289] OP_WITH_LOOKUP   operand=24029           ← cycle fires
+[34290] OP_ATTRS_SELECT  operand=1987 (callPackage)
+[34292] OP_LIT_PATH      operand=4
+[34293] OP_CALL          operand=0
+```
+
+The pattern is `libsForQt5.callPackage <path>` — `OP_WITH_LOOKUP`
+resolves `libsForQt5` via the `with pkgs;` scope at
+`all-packages.nix:29`, then `.callPackage`, then call with a
+literal path.
+
+The firing op is INSIDE a closure named `super` (the convention
+for overlay-style `super: ...` parameter).  The `super` closure
+runs when its containing overlay is applied during the lib.fix
+fixpoint construction.
+
+**Narrowed culprit class**: v3 forces some attribute eagerly whose
+body invokes `super`.  TW defers that attribute's force; v3
+doesn't.  The bug is at the SITE OF THE EAGER FORCE OF THAT
+ATTRIBUTE, not at the `super` closure or the `libsForQt5.callPackage`
+expression itself (both are correctly lowered).
+
+## Outstanding: which attribute is force-eagerly?
+
+The cycle stack [82..93] traverses:
+  x (lib.fix) → final → 5×prev (extends chain) → super →
+  msg → conflictingAttrs's anon thunk → conflictingAttrs → res
+
+`conflictingAttrs = lib.intersectAttrs res super` is the only
+non-thunked computation at this layer of stage.nix.  But its
+primop body forces both args to WHNF (attrset), which is fine —
+that's just OUTER shape, no inner value force.
+
+The 5×prev frames are EXEC=final (overlay-composition's `final:
+let prev = f final; in prev // overlay final prev`).  Each prev
+forces all-packages's output to attrset, also fine.
+
+The eager FORCE that fires the with-lookup must be deeper.  Next
+session: instrument OP_FORCE / forceValue with a name+pos filter
+matching `libsForQt5` or `super` to find which higher-level frame
+fires the chain.
+
+## What rules out
+
+- **Hypothesis killed**: "the libsForQt5 look-up site itself is
+  badly lowered."  The bytecode at code 34289 is CORRECT —
+  `OP_WITH_LOOKUP libsForQt5; OP_ATTRS_SELECT callPackage;
+  OP_LIT_PATH; OP_CALL`.  That's exactly the right shape for
+  `libsForQt5.callPackage path`.  The bug is the WHO is firing
+  the super closure, not WHAT the super closure does.
 
 
 
