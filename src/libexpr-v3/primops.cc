@@ -1413,7 +1413,26 @@ void primElem(EvalState & state, Value * args, Value & out)
     bool found = false;
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
-            if (valueEqual(*state.vm, x, src->elems[i])) { found = true; break; }
+            // A12 (2026-05-17) writeback-force: list elements built by
+            // primMapAttrs / primGenList are Tag::App and need to be
+            // resolved before valueEqual.  v3's forceValue takes Value
+            // by value, so without writeback the resolved WHNF is lost
+            // and every elem call re-runs the mapAttrs lambda for every
+            // entry.  Tree-walker's forceValue takes Value& and its
+            // list elements are Value*, so forces memoize via the
+            // pointer.  Mirror that by forcing through the lvalue here.
+            // Synthetic probe (test/repro-583-mapattrs-app-cache.nix)
+            // confirms: TW = 3 forces, v3 without fix = 5N+ forces, v3
+            // with fix = 3 forces.  Falsifies the prior memo note's
+            // "not a generic memoization bug" conclusion — the bug is
+            // generic but the probe used trivial lambda bodies that
+            // hid the cost.  See PATH_B_INVESTIGATION_2026-05-16.md.
+            Value & el = src->elems[i];
+            if (el.tag() == Tag::App
+                || el.tag() == Tag::Thunk
+                || el.tag() == Tag::Slot)
+                el = forceValue(*state.vm, el);
+            if (valueEqual(*state.vm, x, el)) { found = true; break; }
         }
     }
     out = found ? Value::vTrue : Value::vFalse;
