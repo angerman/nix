@@ -1396,19 +1396,21 @@ struct Lowerer
         // for the first `arity` args, then App-chain the remainder).
         const PrimOp * po = nullptr;
         if ((isPrimOpRef(e->fun, &po) || isBuiltinsPrimOp(e->fun, &po))
-            && e->args->size() >= po->arity)
-        {
+            && e->args->size() >= po->arity
             // A12b T0b: skip the static PrimOpCall emission for primops
-            // that have a bytecode-closure replacement installed.  We
-            // null out `po` so the static-emission block below is
-            // skipped and we fall through to the generic App-chain
-            // path.  Each App in that chain dispatches via OP_CALL on
-            // the closure Value pushed by OP_LIT_PRIMOP's redirect.
-            if (lookupPrimopReplacement(po)) {
-                po = nullptr;
-            }
-        }
-        if (po) {
+            // that have a bytecode-closure replacement installed.  The
+            // call falls through to the App-chain path below, where
+            // each App dispatches via OP_CALL on the closure Value
+            // pushed by OP_LIT_PRIMOP's redirect.  Inline-and-check
+            // (NOT a separate `if (po) { ... }` outside) so a primop
+            // ref with size<arity (partial application like
+            // `builtins.foldl' op acc`) cleanly falls through — the
+            // size<arity short-circuit MUST gate the primop emission,
+            // otherwise the inner loop's `++it` walks past end() (UB
+            // — produces "nullptr expr" lower errors on patterns like
+            // `(import <nixpkgs>) {}`).
+            && !lookupPrimopReplacement(po))
+        {
             const std::string_view name(po->name);
 
             // Fast path: arithmetic / comparison primops (`a * b`,
