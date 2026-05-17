@@ -413,8 +413,25 @@ inline bool valueEqual(VMState & vm, Value a, Value b, bool insideContainer = fa
         uint32_t na = la ? la->size : 0;
         uint32_t nb = lb ? lb->size : 0;
         if (na != nb) return false;
-        for (uint32_t i = 0; i < na; ++i)
-            if (!valueEqual(vm, la->elems[i], lb->elems[i], /*insideContainer=*/true)) return false;
+        // A12 (2026-05-17) writeback-force on each element: mirrors
+        // the primElem fix.  Forces list slots through the lvalue so
+        // resolved WHNFs persist in the source list, matching
+        // tree-walker's pointer-sharing semantics.  Without this,
+        // nested list comparisons re-evaluate Tag::App entries on
+        // every outer pass.  Test: test/repro-583-valueEqual-list.nix.
+        for (uint32_t i = 0; i < na; ++i) {
+            Value & ae = la->elems[i];
+            Value & be = lb->elems[i];
+            if (ae.tag() == Tag::App
+                || ae.tag() == Tag::Thunk
+                || ae.tag() == Tag::Slot)
+                ae = forceValue(vm, ae);
+            if (be.tag() == Tag::App
+                || be.tag() == Tag::Thunk
+                || be.tag() == Tag::Slot)
+                be = forceValue(vm, be);
+            if (!valueEqual(vm, ae, be, /*insideContainer=*/true)) return false;
+        }
         return true;
     }
     case Tag::Attrs: {
@@ -443,9 +460,23 @@ inline bool valueEqual(VMState & vm, Value a, Value b, bool insideContainer = fa
         uint32_t na = aa ? aa->size : 0;
         uint32_t nb = bb ? bb->size : 0;
         if (na != nb) return false;
+        // A12 (2026-05-17) writeback-force on each entry value: see
+        // List case above.  Attrs entries built by primMapAttrs or
+        // lower.cc's lazy-binding lowering are Tag::App; without this,
+        // every valueEqual on the same attrset re-evaluates them.
         for (uint32_t i = 0; i < na; ++i) {
             if (aa->entries[i].name != bb->entries[i].name) return false;
-            if (!valueEqual(vm, aa->entries[i].value, bb->entries[i].value, /*insideContainer=*/true)) return false;
+            Value & av = aa->entries[i].value;
+            Value & bv = bb->entries[i].value;
+            if (av.tag() == Tag::App
+                || av.tag() == Tag::Thunk
+                || av.tag() == Tag::Slot)
+                av = forceValue(vm, av);
+            if (bv.tag() == Tag::App
+                || bv.tag() == Tag::Thunk
+                || bv.tag() == Tag::Slot)
+                bv = forceValue(vm, bv);
+            if (!valueEqual(vm, av, bv, /*insideContainer=*/true)) return false;
         }
         return true;
     }
@@ -481,12 +512,15 @@ inline bool valueLess(VMState & vm, const Value & a, const Value & b)
         // After WC-35, mapAttrs/map install Tag::App entries; without
         // forcing, comparing `[(map id [1]) ...]` would throw the
         // "unsupported operand types" branch even for valid lists.
+        // A12 (2026-05-17): force THROUGH the lvalue (writeback) so
+        // the resolved WHNF persists in the source list; mirrors the
+        // primElem fix.
         uint32_t na = a.payload.list ? a.payload.list->size : 0;
         uint32_t nb = b.payload.list ? b.payload.list->size : 0;
         uint32_t n = std::min(na, nb);
         for (uint32_t i = 0; i < n; ++i) {
-            Value ai = a.payload.list->elems[i];
-            Value bi = b.payload.list->elems[i];
+            Value & ai = a.payload.list->elems[i];
+            Value & bi = b.payload.list->elems[i];
             if (ai.tag() == Tag::Thunk || ai.tag() == Tag::App
                 || ai.tag() == Tag::Slot)
                 ai = forceValue(vm, ai);
