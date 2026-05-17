@@ -431,6 +431,21 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "          (n: { name = n; value = builtins.getAttr n b; }) "
                 "          keep)");
 
+        // T10 — groupBy: group list elements by key-fn result.
+        //   { ${fn x}: [matching xs] for each x in list }
+        // Built on bytecode foldl'.  Uses `acc.${key} or []` to
+        // accumulate per-key lists.
+        if (!std::getenv("NIX_V3_NO_BC_GROUPBY"))
+            installBytecodePrimop(state, "groupBy",
+                "fn: list: "
+                "  builtins.foldl' "
+                "    (acc: x: "
+                "       let key = fn x; "
+                "           prev = acc.${key} or []; "
+                "       in acc // { ${key} = prev ++ [x]; }) "
+                "    {} "
+                "    list");
+
         // T9 — partition: { right, wrong } split by predicate.
         // Built on bytecode foldl' (T1).  Two accumulators carried
         // in an attrset; iteration is iterative via foldl''s
