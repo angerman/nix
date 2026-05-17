@@ -363,6 +363,74 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "             else go (i + 1); "
                 "  in go 0");
 
+        // T13 — catAttrs: collect attr `name` from each attrset in the
+        // list that has it.  Built on bytecode foldl'.  Used by
+        // nixpkgs lib heavily (e.g. `catAttrs "buildInputs" deps`).
+        if (!std::getenv("NIX_V3_NO_BC_CATATTRS"))
+            installBytecodePrimop(state, "catAttrs",
+                "name: list: "
+                "  builtins.foldl' "
+                "    (acc: x: "
+                "       if builtins.hasAttr name x "
+                "       then acc ++ [(builtins.getAttr name x)] "
+                "       else acc) "
+                "    [] "
+                "    list");
+
+        // T14 — concatLists: flatten a list of lists.  Trivial via
+        // foldl' (T1) — the same shape as concatMap with the identity
+        // function.
+        if (!std::getenv("NIX_V3_NO_BC_CONCATLISTS"))
+            installBytecodePrimop(state, "concatLists",
+                "lists: "
+                "  builtins.foldl' "
+                "    (acc: xs: acc ++ xs) "
+                "    [] "
+                "    lists");
+
+        // T15 — listToAttrs: convert a list of {name, value} records
+        // to an attrset.  Order-sensitive: later entries override
+        // earlier ones via // (matches TW's primListToAttrs).  Built
+        // on bytecode foldl' + attrset merge.
+        if (!std::getenv("NIX_V3_NO_BC_LISTTOATTRS"))
+            installBytecodePrimop(state, "listToAttrs",
+                "list: "
+                "  builtins.foldl' "
+                "    (acc: x: acc // { ${x.name} = x.value; }) "
+                "    {} "
+                "    list");
+
+        // T16 — removeAttrs: build a new attrset that excludes `names`.
+        // Composes bytecode filter (T3) + listToAttrs (T15) on the
+        // attrNames of the input.  Each kept name's value is read
+        // from the original via `getAttr`.
+        if (!std::getenv("NIX_V3_NO_BC_REMOVEATTRS"))
+            installBytecodePrimop(state, "removeAttrs",
+                "attrs: names: "
+                "  let keep = builtins.filter "
+                "               (n: ! (builtins.elem n names)) "
+                "               (builtins.attrNames attrs); "
+                "  in builtins.listToAttrs "
+                "       (builtins.map "
+                "          (n: { name = n; value = builtins.getAttr n attrs; }) "
+                "          keep)");
+
+        // T17 — intersectAttrs: keep entries in `b` whose names also
+        // appear in `a`.  TW's primIntersectAttrs is non-trivial in C
+        // (sorted-merge); the bytecode version is simpler: filter
+        // attrNames of b by membership in a, then rebuild via
+        // listToAttrs.  O(|b|×log|a|) via hasAttr lookups.
+        if (!std::getenv("NIX_V3_NO_BC_INTERSECTATTRS"))
+            installBytecodePrimop(state, "intersectAttrs",
+                "a: b: "
+                "  let keep = builtins.filter "
+                "               (n: builtins.hasAttr n a) "
+                "               (builtins.attrNames b); "
+                "  in builtins.listToAttrs "
+                "       (builtins.map "
+                "          (n: { name = n; value = builtins.getAttr n b; }) "
+                "          keep)");
+
         // T9 — partition: { right, wrong } split by predicate.
         // Built on bytecode foldl' (T1).  Two accumulators carried
         // in an attrset; iteration is iterative via foldl''s
