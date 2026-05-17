@@ -98,7 +98,67 @@ synthetic works on ALL paths (TW, default v3, NO_THUNK_ALL +
 CELL_EVERYWHERE).  The bug requires structural complexity beyond
 2-overlay lib.fix + with-self-lookup.
 
-## Open question — the next investigation
+## 2026-05-17 — TW-side instrumentation lands the hypothesis kill
+
+Added `TW_DBG_WITH_NAME=<symbol>` gate to `src/libexpr/eval.cc`
+`lookupVar`: when set, logs every with-lookup of the named symbol
+with the with-source's current type-tag.  Counterpart to v3's
+existing `V3_DBG_WITH_CYCLE`.
+
+Measurement on `(import <nixpkgs>{}).hello.name` AND on
+`builtins.isAttrs (import <nixpkgs>{})`:
+
+  - TW: **zero** with-lookups for `libsForQt5`.  The look-up that
+    cycles v3 never fires under TW at all.
+  - v3 (NO_THUNK_ALL): single look-up firing inside `res` thunk's
+    `super`-executing closure, with-source is a Black slot.
+
+**Hypothesis killed**: "TW also fires the same `with self;
+libsForQt5` look-up and handles it gracefully via some mechanism
+v3 lacks."  FALSE.  TW never reaches the look-up.  v3 is forcing
+something eagerly that TW defers.
+
+Per LESSONS_LEARNED §1.3 ("Eager-vs-lazy asymmetry is the dominant
+bug class"): the Path B fix is to find the v3-side eager force and
+make it lazy in `lower.cc`, matching TW.
+
+## Where to look — narrowed targets
+
+The cycle stack:
+  [93] thunk `res` codeOff=454 EXEC=super
+  [92] thunk `conflictingAttrs` codeOff=513
+  [91] anon `<thunk>` codeOff=529
+  [90] call `msg` codeOff=148
+  [89] call `super` codeOff=398
+
+Frame 93 IS inside res's body (with EXEC=super, meaning the closure
+currently dispatched is named "super").  The with-stack at fire is
+a single source — the `with pkgs;` from `all-packages.nix:29`.
+
+`with pkgs;` at the top of `all-packages.nix` is the look-up
+scope: any unresolved name in res's body falls through to pkgs
+(=fixpoint).  Under TW, res's outer attrset construction does not
+fire the look-up; under v3, something DOES.
+
+Most likely v3 culprits:
+  (a) An attrset entry in res that v3 emits non-thunked but TW
+      defers via `maybeThunk`.  Audit `lowerAttrs` -> `thunkifyForAttr`
+      -> `isTrivialForLazy` for any AST shape that's currently
+      classified as "trivial" but contains a `fromWith` reference
+      transitively.
+  (b) An `inherit` clause without `(from ...)` where the inherited
+      name has `fromWith=true` but v3 emits an eager `OP_GET_LOCAL`
+      via a path that bypasses `thunkifyForAttr`.
+  (c) A let-binding in res's body that v3 forces eagerly (e.g.
+      pure-call recognized by isTrivialForLazy(forArg=true)) but
+      whose body resolves `with pkgs;`.
+
+The next concrete step: enable `V3_DBG_FORCE_TRACE` filtered to
+position `stage.nix:150` or to res's CU, capture the EXACT op that
+fires the look-up, work backward from there to the lower.cc
+emission site.
+
+
 
 How does TW resolve `with self; libsForQt5` while self is mid-
 construction in `lib.fix (extends ... allPackages)`?

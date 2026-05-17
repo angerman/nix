@@ -944,7 +944,25 @@ void Value::mkPath(const SourcePath & path, EvalMemory & mem)
         return nullptr;
 
     auto * fromWith = var.fromWith;
+    // gate: TW_DBG_WITH_NAME=<symbol> — counterpart to v3's
+    // V3_DBG_WITH_CYCLE.  When set, log every with-lookup of the
+    // named symbol with the with-source's current type-tag.  Used
+    // to diagnose v3-vs-TW divergence on `with self; libsForQt5`
+    // (action plan Path B investigation).  Retire when Path B
+    // selects an architectural fix.
+    static const char * s_dbgWithName = std::getenv("TW_DBG_WITH_NAME");
     while (1) {
+        if (__builtin_expect(s_dbgWithName != nullptr, 0)) {
+            auto nm = symbols[var.name];
+            if (std::string_view(nm) == s_dbgWithName) {
+                Value & ws = *env->values[0];
+                std::fprintf(stderr,
+                    "tw with-lookup: name=%s source-type=%d isThunk=%d isApp=%d isBlackhole=%d\n",
+                    std::string(nm).c_str(),
+                    ws.isValid() ? (int)ws.type<true>() : -1,
+                    (int)ws.isThunk(), (int)ws.isApp(), (int)ws.isBlackhole());
+            }
+        }
         forceAttrs(*env->values[0], fromWith->pos, "while evaluating the first subexpression of a with expression");
         if (auto j = env->values[0]->attrs()->get(var.name)) {
             if (countCalls) [[unlikely]]
