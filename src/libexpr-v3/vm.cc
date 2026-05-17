@@ -6541,15 +6541,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value * found = attrs.payload.bindings->lookup(id);
             if (!found)
                 throw std::runtime_error("v3 OP_ATTRS_SELECT_DYN: attribute not found");
-            // Phase 13.3 mapAttrs memo (dynamic-name path).
+            // Phase 13.3 mapAttrs memo (dynamic-name path).  2026-05-17:
+            // mirror OP_ATTRS_SELECT_IC's iterative force + memoizing
+            // writeback (CFF_FORCE_WB_PTR_KEEP) — see the comment at
+            // OP_ATTRS_SELECT_IC's site (vm.cc:6075-ish) for protocol
+            // details.  Was C-recursive forceValue here; now iterative
+            // via op_force_slow + slot writeback.
             if (__builtin_expect(found->tag() == Tag::App, 0)) {
-                vm.frames.back().ip = ip;
-                Value resolved = forceValue(vm, *found);
-                *found = resolved;
-                push(vm, resolved);
-            } else {
                 push(vm, *found);
+                CallFrame & f = vm.frames.back();
+                f.forceWriteTarget = found;
+                f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
+                f.ip = ip;
+                goto op_force_slow;
             }
+            push(vm, *found);
             break;
         }
         case OP_ATTRS_HAS: {

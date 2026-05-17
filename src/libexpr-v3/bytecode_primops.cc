@@ -426,6 +426,104 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "    (acc: x: if pred x then acc ++ [x] else acc) "
                 "    [] "
                 "    list");
+        // 2026-05-17 — primDerivation* hybrid wrapper (Option 4 in the
+        // strategic note).  Replaces the user-facing `derivation` /
+        // `derivationStrict` primops with a bytecode wrapper that
+        // pre-forces top-level attrs (+ list elements) at bytecode
+        // level (iterative via the new seq fast-path in lower.cc),
+        // then calls the C leaf primop (`__derivationRaw` /
+        // `__derivationStrictRaw`) which finds attrs WHNF and so its
+        // internal forceValue calls become trivial chases — no
+        // C-recursion.
+        //
+        // The user-requested architectural shape: outer driver in
+        // bytecode (attr-walking, iteration), inner FFI leaf for the
+        // libnixstore work.  We DON'T replicate primDerivation's full
+        // logic in Nix — the leaf primops are the existing C bodies
+        // wholesale; the wrapper just hoists the forceValue calls
+        // from C to bytecode.  This avoids the regression risk of a
+        // ~700-line C-to-Nix port while still breaking the C-stack
+        // recursion that hits hello.name today.
+        //
+        // For inner derivation invocations triggered during pre-force
+        // (e.g. `args.buildInputs` containing other derivation thunks):
+        // forcing each element via bytecode OP_FORCE pushes a thunk
+        // frame, runs the thunk body via the SAME dispatchLoop — when
+        // that body invokes `builtins.derivation { ... }`, it hits MY
+        // wrapper (intercepted by the install).  All derivation calls
+        // ride the same bytecode wrapper, so recursion through the
+        // derivation graph runs as vm.frames pushes rather than C
+        // stack frames.
+        //
+        // The wrapper's pre-force does two passes:
+        //   (a) shallow: force each top-level attr value (so the
+        //       primop's internal `forceValue(attrV)` becomes a no-op
+        //       chase).
+        //   (b) list-element: for list-typed attrs (args / outputs /
+        //       buildInputs / nativeBuildInputs / ...), force each
+        //       element so the primop's element-iteration forces
+        //       (lines 5206, 5221, 5255, 5277) also become no-ops.
+        //
+        // The `builtins.isList v` check in pass (b) calls a C primop
+        // (primIsList) whose OP_CALL_PRIMOP arg-prep would normally
+        // C-recurse on v.  Pass (a) ran first → v is already WHNF
+        // → arg-prep's forceValue is a trivial chase.
+        if (!std::getenv("NIX_V3_NO_BC_DERIVATION_HYBRID")) {
+            // gate: NIX_V3_NO_BC_DERIVATION_HYBRID — opt-out for A/B
+            // measurement vs the all-C path.  Retire when bench shows
+            // hybrid is unambiguously better (or worse, in which case
+            // the wrapper is the revert candidate).
+            // Wrapper body: pre-force each top-level attr value, then
+            // call the C leaf primop.  TARGETED pre-force — only the
+            // attrs that primDerivationStrict's C-body iterates AND
+            // would otherwise C-recurse for: the "concrete" string-
+            // typed attrs (name, builder, system) + the list-typed
+            // attrs (args, outputs, allowedReferences, ...) where
+            // primConcatLists / list-iteration is the recursion source.
+            //
+            // EXCLUDES recursive/extensible attrs like `passthru`,
+            // `meta`, `__overrides`, `__functionArgs`, `override*` —
+            // these are typically structured by the fix-point pattern
+            // and forcing them eagerly trips the
+            // `self.passthru // {...}` Blackhole that TW navigates by
+            // its on-demand attr-by-attr forcing in primDerivation's
+            // iteration order (specifically: when TW iterates and
+            // forces passthru, only at THAT moment is self.passthru
+            // looked up, and the chain is set up so the inner thunk
+            // is Evaluated by then — bytecode-side pre-force ahead of
+            // primDerivation's iteration breaks this ordering).
+            //
+            // Implemented as a hand-rolled filter rather than a full
+            // attr-by-attr force: foldl' iterates a HARDCODED list of
+            // "safe-to-pre-force" attr names and skips any not present
+            // in args (via `args ? k` then `args.${k}`).
+            const char * wrapper_body =
+                "args: "
+                "  let "
+                "    safeKeys = [ "
+                "      \"name\" \"builder\" \"system\" \"args\" "
+                "      \"outputs\" \"outputHash\" \"outputHashAlgo\" "
+                "      \"outputHashMode\" "
+                "    ]; "
+                "    forceSafe = "
+                "      builtins.foldl' "
+                "        (acc: k: "
+                "           if args ? ${k} "
+                "           then builtins.seq (args.${k}) acc "
+                "           else acc) "
+                "        null "
+                "        safeKeys; "
+                "  in "
+                "    builtins.seq forceSafe ";
+
+            installBytecodePrimop(state, "derivationStrict",
+                std::string(wrapper_body)
+                + " (builtins.__derivationStrictRaw args)");
+
+            installBytecodePrimop(state, "derivation",
+                std::string(wrapper_body)
+                + " (builtins.__derivationRaw args)");
+        }
     } catch (...) {
         // Reset `done` so a future call retries — otherwise a
         // transient error here would permanently disable bytecode

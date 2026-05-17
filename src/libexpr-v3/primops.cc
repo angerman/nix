@@ -8241,10 +8241,20 @@ void registerBuiltinPrimOps()
         // returns args[1] as-is — force happens at the consumer.
         registerPrimOp({"addErrorContext", 2, primAddErrorContext, /*lazyArgs=*/0b10});
         registerPrimOp({"derivationStrict",   1, primDerivationStrict});
+        // 2026-05-17: __derivationStrictRaw — the unwrapped C primop.
+        // The bytecode hybrid wrapper for `derivationStrict` (installed
+        // in bytecode_primops.cc) pre-forces args at bytecode level
+        // (iterative via OP_FORCE), then calls __derivationStrictRaw
+        // to do the actual drv work.  Exposed under a `__`-prefixed
+        // name so it's invisible from `builtins.X` (per the convention
+        // in getBuiltinsValue at vm.cc:8341).
+        registerPrimOp({"__derivationStrictRaw", 1, primDerivationStrict});
         // C++ port of corepkgs/derivation.nix — derivationStrict
         // synthesizes paths, primDerivation wraps them up with
         // commonAttrs and outputName for tree-walker parity.
         registerPrimOp({"derivation",         1, primDerivation});
+        // 2026-05-17: __derivationRaw — companion to the wrapper above.
+        registerPrimOp({"__derivationRaw",    1, primDerivation});
         registerPrimOp({"findFile",           2, primFindFile});
         registerPrimOp({"__findFile",         2, primFindFile});
         registerPrimOp({"nixPath",            0, primNixPath});
