@@ -388,3 +388,52 @@ construction).  The Path B work needs to either:
 encode the gate-bisection.  This doc adds the cycle's exact
 location + the architectural blockers.  Phase 2 next session:
 investigate TW's behavior on the same `with self;` lookup.
+
+## 2026-05-17 falsification — Select-chain `isComplexFromExpr`
+
+**Hypothesis tested**: "v3's `isComplexFromExpr` only matches
+depth-1 Select-on-Var (`inherit (lib.systems) X`), so deeper chains
+like `inherit (lib.systems.parse) X` fall through to EAGER lowering.
+Walking the Select chain up to N hops and accepting any chain
+rooted in Var should match TW's blanket `from->maybeThunk` and
+close the hot loop on parsedPlatform.check."
+
+**Change applied (then reverted)**: in `src/libexpr-v3/lower.cc`
+`isComplexFromExpr`, replaced the single-step `sel->e->Var` check
+with an up-to-8-hop Select-walk to the head, accepting `head->Var`.
+
+**Outcome**:
+- Build clean; `v3-iterative-force-depth` and
+  `v3-let-rec-publish-split` regression tests pass.
+- `bench.py --modes tw,v3-direct -n 5` flags
+  `lib-mapAttrs-100`: tw -5.5% (noise / improvement); and
+  `lib-strings-ops`: v3-direct **+6.2% REGRESSION** — extending
+  Select-chain thunkification penalizes lib/strings.nix workloads
+  that previously lowered EAGER without harm.
+- `(import <nixpkgs>{}).hello.name` still times out at ~85 s
+  with the **same 5.77M setType / 4.02M flip / 3.6M mkOptionType.check
+  hot-loop alloc pattern** documented in
+  `~/.claude-io/.../project_583_memoization_loop.md`.
+
+**Hypothesis killed**: "extending `isComplexFromExpr` to walk
+Select chains rooted in Var fixes the parsedPlatform.check hot
+loop."  FALSE — the deeper-chain thunkification rule changes
+**which** sites are thunkified, but does not change the **shape
+of the cycle** at parse.nix:953 (`mkSystem` → parsedPlatform.check).
+The hot loop is invariant under inherit-from thunkification granularity.
+
+**Implication**: the cycle's amplification factor (~3000 deep, 1M+
+mkSystem calls for a single package) is NOT caused by under-
+thunkification of `inherit (lib.systems.parse) ...`.  It is in:
+- (i) `flip` re-entry inside `enum.check` / `setTypes` cycle, or
+- (ii) `attrValues cpuTypes` re-evaluation (per-call rather than
+      once at lib-init), or
+- (iii) `_type` field force triggering setType re-execution via a
+       v3-specific cell-write hook.
+
+Memory `project_583_memoization_loop.md` rules out (ii) at N=100
+via synthetic probe.  Next session should test (i) and (iii)
+*before* trying further lowering-rule edits.
+
+**Working tree**: revert applied (`git checkout
+src/libexpr-v3/lower.cc`).  No uncommitted code change.
