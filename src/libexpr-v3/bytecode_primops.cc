@@ -271,12 +271,50 @@ void installAllBytecodePrimops(nix::EvalState & state)
         if (std::getenv("NIX_V3_BYTECODE_PRIMOP_SELFTEST"))
             installBytecodePrimop(state, "floor", "x: x + 1");
 
-        // Phase 1 (T1-T17): bytecode primops added here one at a time.
-        // The order matters when one bytecode primop's source uses
-        // another — install dependencies first.  All current callback
-        // primops use only non-callback primitives (length, elemAt,
-        // arithmetic, comparisons) which remain C primops, so order
-        // is flat for now.
+        // Phase 1: bytecode-emit callback-heavy primops.  Each
+        // conversion replaces the C primop's callClosure-per-iteration
+        // (C-recursive) with a Nix-source loop where the inner
+        // `op acc elem` call dispatches via OP_CALL (iterative, since
+        // commit 7f5a392f4) and the outer recursive `go i acc` is
+        // rewritten to OP_TAIL_CALL by emit.cc's tail-call peephole.
+        // Result: O(1) C-stack regardless of list size.
+        //
+        // Disable per-primop via NIX_V3_NO_BC_<NAME>=1, or globally
+        // via NIX_V3_NO_BYTECODE_PRIMOPS=1 (gated above in run.cc).
+        // Hot primops first; each one runs the property suite + lang
+        // tests + bench as part of its landing commit.
+
+        // T1 — foldl': strict left fold (the prototype for T2-T17).
+        //
+        // Source mirrors lib.lists.foldl' but uses builtins.elemAt to
+        // walk the list iteratively rather than via head/tail destruc-
+        // turing (avoids per-step list allocation).  The recursive
+        // `go` tail-calls itself, which emit.cc rewrites to OP_TAIL_
+        // CALL — so even a 1M-element list runs in O(1) vm.frames.
+        // Lazy arg note: TW's primFoldl marks the accumulator arg
+        // (bit 1) and op (bit 0) as strict; only the list (bit 2)
+        // is lazy at the surface.  Our bytecode mirrors that: `nul`
+        // and `op` are forced by OP_CALL on `op`, and the inner
+        // accumulator is force-on-write by the tail call.
+        if (!std::getenv("NIX_V3_NO_BC_FOLDL"))
+            installBytecodePrimop(state, "foldl'",
+                // STRICT left fold: `builtins.seq` forces each
+                // intermediate accumulator before the recursive call,
+                // matching TW's primFoldl semantics (the prime in
+                // foldl' marks strict evaluation).  Without seq, each
+                // step thunkifies `next` and the chain grows linearly
+                // with list length — forcing at the end overflows the
+                // C-stack at ~5000 elements.  With seq, the
+                // accumulator is in WHNF on every tail call, so the
+                // recursive `go` is true O(1)-space.
+                "op: nul: list: "
+                "  let n = builtins.length list; "
+                "      go = i: acc: "
+                "        if i >= n then acc "
+                "        else "
+                "          let next = op acc (builtins.elemAt list i); "
+                "          in builtins.seq next (go (i + 1) next); "
+                "  in go 0 nul");
     } catch (...) {
         // Reset `done` so a future call retries — otherwise a
         // transient error here would permanently disable bytecode
