@@ -336,6 +336,20 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "             else false; "
                 "  in go 0");
 
+        // T6 — concatMap: apply fn to each elem (fn returns a list),
+        // concat the results.  Built on bytecode foldl' (T1) with
+        // `++` between accumulator and each sublist.  Elements
+        // inside the sublists are passed through unchanged (lazy
+        // values remain lazy).  Matches TW primConcatMap semantics
+        // (strict on the spine, lazy on the elements).
+        if (!std::getenv("NIX_V3_NO_BC_CONCATMAP"))
+            installBytecodePrimop(state, "concatMap",
+                "fn: list: "
+                "  builtins.foldl' "
+                "    (acc: x: acc ++ (fn x)) "
+                "    [] "
+                "    list");
+
         // T5 — any: short-circuit fold for "some elem satisfies pred".
         // Mirror of all (early exit on true instead of false).
         if (!std::getenv("NIX_V3_NO_BC_ANY"))
