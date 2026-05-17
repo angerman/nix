@@ -1002,9 +1002,20 @@ void primFoldl(EvalState & state, Value * args, Value & out)
     auto * src = args[2].payload.list;
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
-            // Curried: op acc elem
+            // Curried: op acc elem.  step1 is a partial closure; we
+            // don't force it (callClosure forces its callee on entry
+            // via its own WHNF fast-path).  The final `acc` IS forced
+            // each iteration since foldl' is strict in the accumulator
+            // -- callers expect the seq behaviour and a Tag::Thunk acc
+            // would defer subsequent op-calls' force into the next
+            // iteration's first action.  Match TW's `forceValue(*vAcc)`
+            // in primops.cc primFoldl'.
             Value step1 = callClosure(*state.vm, op, acc);
             acc = callClosure(*state.vm, step1, src->elems[i]);
+            if (__builtin_expect(acc.tag() == Tag::Thunk
+                                 || acc.tag() == Tag::App
+                                 || acc.tag() == Tag::Slot, 0))
+                acc = forceValue(*state.vm, acc);
         }
     }
     out = acc;
@@ -2335,6 +2346,19 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
         if (!seen.insert(key).second) continue;
         result.push_back(it);
         Value next = callClosure(*state.vm, opV, it);
+        // V3-NATIVE / iterative-force discipline: callClosure returns
+        // exactly what the closure body produced.  The OP_RETURN /
+        // OP_TAIL_CALL paths do NOT eagerly force the return value (a
+        // tail-call's last OP_CALL chain leaves whatever tag the inner
+        // primop produced — Tag::List for our bytecode filter, but
+        // Tag::Thunk/App if the call result happens to wrap a deferred
+        // computation).  Tree-walker's `state.callFunction` returns
+        // unforced too — TW callers force at the consumer side.  Match
+        // that: force here before the shape check.
+        if (__builtin_expect(next.tag() == Tag::Thunk
+                             || next.tag() == Tag::App
+                             || next.tag() == Tag::Slot, 0))
+            next = forceValue(*state.vm, next);
         if (!next.isList())
             throw std::runtime_error("v3 primop genericClosure: operator must return a list");
         if (next.payload.list) {
@@ -2746,6 +2770,13 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
             Value k = callClosure(*state.vm, keyFn, src->elems[i]);
+            // Bytecode-closure key fn can return Tag::Thunk wrapping a
+            // string (see genericClosure rationale at #624) — force to
+            // WHNF before the shape check.
+            if (__builtin_expect(k.tag() == Tag::Thunk
+                                 || k.tag() == Tag::App
+                                 || k.tag() == Tag::Slot, 0))
+                k = forceValue(*state.vm, k);
             if (!k.isString()) typeError("groupBy", "key fn returning string");
             groups[std::string(k.payload.str)].push_back(src->elems[i]);
         }
@@ -6892,6 +6923,12 @@ void primSort(EvalState & state, Value * args, Value & out)
         [&](const Value & a, const Value & b) {
             Value step1 = callClosure(*state.vm, cmp, a);
             Value r = callClosure(*state.vm, step1, b);
+            // Bytecode-closure comparator can return Tag::Thunk wrapping
+            // a bool — force to WHNF before the shape check.
+            if (__builtin_expect(r.tag() == Tag::Thunk
+                                 || r.tag() == Tag::App
+                                 || r.tag() == Tag::Slot, 0))
+                r = forceValue(*state.vm, r);
             if (!r.isBool()) typeError("sort", "comparator returning bool");
             return r.payload.i == 1;
         });
