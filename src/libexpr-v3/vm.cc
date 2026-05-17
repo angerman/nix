@@ -8682,6 +8682,59 @@ Value forceValue(VMState & vm, Value v)
                     std::fflush(stderr);
                 }
             }
+            // A12b diagnostic: at NIX_V3_DBG_DEEP_FRAMES (single
+            // threshold), dump every Nth distinct frame so we can see
+            // what's filling vm.frames when we approach kMaxCallDepth.
+            // One-shot: fires on the first frame size at or beyond the
+            // threshold, then never again in this thread.
+            static const char * s_dbgDeep = std::getenv("NIX_V3_DBG_DEEP_FRAMES");
+            if (__builtin_expect(s_dbgDeep != nullptr, 0)) {
+                static thread_local bool fired = false;
+                size_t threshold = (size_t)std::atoi(s_dbgDeep);
+                if (!fired && threshold > 0 && vm.frames.size() >= threshold) {
+                    fired = true;
+                    std::fprintf(stderr,
+                        "v3 NIX_V3_DBG_DEEP_FRAMES: depth=%zu, dumping every-50th frame:\n",
+                        vm.frames.size());
+                    for (size_t i = 0; i < vm.frames.size(); i += 50) {
+                        const auto & fr = vm.frames[i];
+                        const LambdaDescriptor * d = nullptr;
+                        if (fr.thunk
+                            && (fr.thunk->state == ThunkState::Suspended
+                                || fr.thunk->state == ThunkState::Blackhole))
+                            d = fr.thunk->suspended.desc;
+                        else if (fr.closure) d = fr.closure->desc;
+                        const char * nm = d && !d->name.empty()
+                            ? d->name.c_str() : "<?>";
+                        unsigned codeOff = d ? d->codeOffset : 0u;
+                        std::fprintf(stderr,
+                            "  fr[%zu]: %s codeOff=%u ip=%u thunk=%p flags=0x%x\n",
+                            i, nm, codeOff, fr.ip, (void *)fr.thunk,
+                            (unsigned)fr.flags);
+                    }
+                    // Also dump top-12 frames so we can see the immediate
+                    // recursion pattern.
+                    std::fprintf(stderr, "  ---- TOP 12 ----\n");
+                    size_t n = vm.frames.size();
+                    size_t lo = n > 12 ? n - 12 : 0;
+                    for (size_t i = lo; i < n; ++i) {
+                        const auto & fr = vm.frames[i];
+                        const LambdaDescriptor * d = nullptr;
+                        if (fr.thunk
+                            && (fr.thunk->state == ThunkState::Suspended
+                                || fr.thunk->state == ThunkState::Blackhole))
+                            d = fr.thunk->suspended.desc;
+                        else if (fr.closure) d = fr.closure->desc;
+                        const char * nm = d && !d->name.empty()
+                            ? d->name.c_str() : "<?>";
+                        unsigned codeOff = d ? d->codeOffset : 0u;
+                        std::fprintf(stderr,
+                            "  TOP fr[%zu]: %s codeOff=%u ip=%u\n",
+                            i, nm, codeOff, fr.ip);
+                    }
+                    std::fflush(stderr);
+                }
+            }
         }
     }
     // STG-12 (#498) diagnostic: log the call site (current top frame
