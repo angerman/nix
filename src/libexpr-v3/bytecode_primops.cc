@@ -497,6 +497,36 @@ void installAllBytecodePrimops(nix::EvalState & state)
             // attr-by-attr force: foldl' iterates a HARDCODED list of
             // "safe-to-pre-force" attr names and skips any not present
             // in args (via `args ? k` then `args.${k}`).
+            // The wrapper has TWO pre-force passes:
+            //
+            //   (1) safeKeys: shallow-force the concrete-typed attrs
+            //       (name, builder, system, args, outputs, outputHash*).
+            //       These are the attrs primDerivationStrict reads
+            //       directly + the list-of-strings attrs.  Pre-forcing
+            //       at bytecode level avoids the C-recursive
+            //       forceValue in primDerivationStrictNative.
+            //
+            //   (2) inputListKeys: deep-force the build-input lists.
+            //       buildInputs / nativeBuildInputs / etc. are LISTS
+            //       OF DERIVATIONS.  primDerivationStrictNative's
+            //       generic attr-loop calls coerceToString on each,
+            //       which forces each element — these forces are the
+            //       MAIN C-recursion source on hello.name (each
+            //       element's derivation thunk triggers another
+            //       primDerivation chain).  By pre-forcing each
+            //       element via bytecode OP_FORCE (iterative through
+            //       op_force_slow + frame push), the inner derivation
+            //       chain runs as vm.frames pushes rather than C
+            //       stack frames.
+            //
+            // Why selective rather than "force every attr": forcing
+            // recursive fix-point attrs like `passthru` (which often
+            // reads `self.passthru` to extend it) ahead of the C
+            // primop's own iteration trips Blackhole cycles that TW
+            // navigates by on-demand attr-by-attr forcing.  The
+            // hardcoded list of safe + input-list keys is the
+            // intersection of "primDerivationStrict will force it
+            // anyway" and "no fix-point loop hazard".
             const char * wrapper_body =
                 "args: "
                 "  let "
@@ -513,16 +543,50 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "           else acc) "
                 "        null "
                 "        safeKeys; "
+                "    inputListKeys = [ "
+                "      \"buildInputs\" \"nativeBuildInputs\" "
+                "      \"propagatedBuildInputs\" \"propagatedNativeBuildInputs\" "
+                "      \"depsBuildBuild\" \"depsBuildBuildPropagated\" "
+                "      \"depsBuildHost\" \"depsBuildHostPropagated\" "
+                "      \"depsBuildTarget\" \"depsBuildTargetPropagated\" "
+                "      \"depsHostHost\" \"depsHostHostPropagated\" "
+                "      \"depsHostTarget\" \"depsHostTargetPropagated\" "
+                "      \"depsTargetTarget\" \"depsTargetTargetPropagated\" "
+                "      \"checkInputs\" \"nativeCheckInputs\" "
+                "      \"installCheckInputs\" \"nativeInstallCheckInputs\" "
+                "    ]; "
+                "    forceInputList = k: "
+                "      if args ? ${k} "
+                "      then "
+                "        let lst = args.${k}; in "
+                "        if builtins.isList lst "
+                "        then "
+                "          builtins.foldl' "
+                "            (acc: e: builtins.seq e acc) "
+                "            null "
+                "            lst "
+                "        else null "
+                "      else null; "
+                "    forceInputs = "
+                "      builtins.foldl' "
+                "        (acc: k: builtins.seq (forceInputList k) acc) "
+                "        null "
+                "        inputListKeys; "
                 "  in "
-                "    builtins.seq forceSafe ";
+                "    builtins.seq forceSafe "
+                "      (builtins.seq forceInputs ";
+
+            const char * wrapper_tail = ")";
 
             installBytecodePrimop(state, "derivationStrict",
                 std::string(wrapper_body)
-                + " (builtins.__derivationStrictRaw args)");
+                + " (builtins.__derivationStrictRaw args)"
+                + wrapper_tail);
 
             installBytecodePrimop(state, "derivation",
                 std::string(wrapper_body)
-                + " (builtins.__derivationRaw args)");
+                + " (builtins.__derivationRaw args)"
+                + wrapper_tail);
         }
     } catch (...) {
         // Reset `done` so a future call retries — otherwise a
