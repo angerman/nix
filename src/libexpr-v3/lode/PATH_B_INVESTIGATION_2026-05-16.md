@@ -437,3 +437,82 @@ via synthetic probe.  Next session should test (i) and (iii)
 
 **Working tree**: revert applied (`git checkout
 src/libexpr-v3/lower.cc`).  No uncommitted code change.
+
+## 2026-05-17 root cause — Tag::App-no-writeback (commit 189497b81)
+
+After ruling out the lowering-rule hypothesis above, the real root
+cause turned out to be in primops, not in lower.cc.
+
+**Re-framing the 2026-05-16 "not a memoization bug" claim**: that
+falsification used a synthetic probe with trivial mapAttrs lambda
+bodies (`{}`).  A faithful probe with builtins.trace shows the gap:
+
+```
+let
+  mapped = builtins.mapAttrs (n: v: builtins.trace "FORCE-${n}" v) {a=0;b=1;c=2;};
+  values = builtins.attrValues mapped;
+  needle = -1;
+  result = builtins.foldl' (acc: i: acc + (if builtins.elem needle values then 1 else 0)) 0
+    (builtins.genList (i: i) 4);
+in result
+```
+
+- TW: 3 FORCE traces (cached after first iteration).
+- v3-direct: 15 FORCE traces (re-evaluates on every elem call).
+
+The trivial-body probe hid this because re-evaluating `{}` 100× is
+~free.  Real mapAttrs lambdas (setTypes' assert+setType, e.g.) cost
+serious work per re-evaluation.
+
+**Actual root cause**: v3's `forceValue(VMState&, Value v)` takes
+`Value` BY VALUE.  primElem iterates `src->elems[i]` of a list of
+Tag::App entries (from primMapAttrs / primGenList).  forceValue
+resolves the App locally and returns the WHNF, but the caller's
+list slot is never updated.  TW's `forceValue(Value & v)` mutates
+through the reference; TW's list elements are `Value *` shared with
+bindings entries, so forces memoize via the pointer.
+
+**Fix (commit 189497b81)**: in primElem, take the list slot by
+lvalue reference and force through it.  Subsequent elem-calls on
+the same list see cached WHNFs.
+
+**Validation**:
+- Synthetic: 15 → 3 forces (TW parity).
+- 143/143 cutover-parity lang tests pass.
+- Bench (-n 5 against 2026-05-15 baseline): no v3-direct cell
+  regresses > 5%.
+- **Real nixpkgs `builtins.isAttrs (import <nixpkgs>{})`** with
+  NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 + NIX_V3_LOG_DEPTH=1:
+  baseline 65.96 s → with fix 27.35 s = **2.41× speedup**.
+  (Both reach vm.frames depth=5000 peak; the win is in per-call
+  cost, not depth reduction.)
+
+## Open: A12b — vm.frames depth=5000 stack overflow
+
+After the primElem fix, `(import <nixpkgs>{})` still SIGSEGVs
+(rc=139) without LOG_DEPTH on.  Both baseline and fix reach
+kMaxCallDepth (5000); without LOG_DEPTH, the C-stack overflows
+before the v3-level throw can unwind cleanly.
+
+This is a pre-existing architectural issue (commit 189497b81's
+comment notes it).  Direct-forceValue call sites in callClosure /
+valueEqual / primop helpers C-recurse where TW iterates.  The
+iterative-force refactor only converted opcode-level forces, not
+helper-level forces.  See
+`ITERATIVE_FORCE_AUDIT_2026-05-18.md` (callClosure primop-arg
+loop already done as B1) for the audit.
+
+Next: pick the highest-impact remaining direct-forceValue site
+(probably callClosure's `fun` force, line 9626, or valueEqual's
+recursive list/attrs entries) and convert to iterative.  Defer
+the valueEqual/valueLess inner-writeback variant of the primElem
+fix until this is resolved (they were stashed for the same reason).
+
+Candidate writebacks (in vm.cc) that build clean + pass lang tests
+but hit the depth-5000 crash without the iterative-force work:
+- `valueEqual` case Tag::List: writeback `la/lb->elems[i]`.
+- `valueEqual` case Tag::Attrs: writeback `aa/bb->entries[i].value`.
+- `valueLess` case List: writeback list elements.
+
+All three are mechanical writeback transforms of the same form as
+primElem.  Land them after the recursion bound is fixed.
