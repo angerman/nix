@@ -321,6 +321,34 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "    (i: fn (builtins.elemAt list i)) "
                 "    (builtins.length list)");
 
+        // T4 — all: short-circuit fold for "every elem satisfies pred".
+        // Direct tail-recursive go with early exit on false.  Pure
+        // bytecode iteration (no foldl' dependency — needs early
+        // exit which foldl' doesn't provide).
+        if (!std::getenv("NIX_V3_NO_BC_ALL"))
+            installBytecodePrimop(state, "all",
+                "pred: list: "
+                "  let n = builtins.length list; "
+                "      go = i: "
+                "        if i >= n then true "
+                "        else if pred (builtins.elemAt list i) "
+                "             then go (i + 1) "
+                "             else false; "
+                "  in go 0");
+
+        // T5 — any: short-circuit fold for "some elem satisfies pred".
+        // Mirror of all (early exit on true instead of false).
+        if (!std::getenv("NIX_V3_NO_BC_ANY"))
+            installBytecodePrimop(state, "any",
+                "pred: list: "
+                "  let n = builtins.length list; "
+                "      go = i: "
+                "        if i >= n then false "
+                "        else if pred (builtins.elemAt list i) "
+                "             then true "
+                "             else go (i + 1); "
+                "  in go 0");
+
         // T3 — filter: iterate, keep elements where pred returns true.
         // Built on bytecode foldl' (T1) — the iteration runs via
         // OP_TAIL_CALL inside foldl' so no per-element C-recursion.
