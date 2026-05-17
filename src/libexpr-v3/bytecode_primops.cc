@@ -284,43 +284,23 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // Hot primops first; each one runs the property suite + lang
         // tests + bench as part of its landing commit.
 
-        // T2 — map: lazy list mapping.  Preserves TW's primMap
-        // laziness (each result entry is forced on demand) by
-        // expressing map in terms of genList — which itself is a
-        // C primop that builds Tag::App entries lazily.  The result
-        // is a list where each entry forces only on access.
-        //
-        // Equivalent to TW: `map fn list = genList (i: fn list[i]) n`.
-        if (!std::getenv("NIX_V3_NO_BC_MAP"))
-            installBytecodePrimop(state, "map",
-                "fn: list: "
-                "  builtins.genList "
-                "    (i: fn (builtins.elemAt list i)) "
-                "    (builtins.length list)");
+        // ORDER MATTERS: bytecode primops are visible to the lowerer
+        // only AFTER they're installed.  If primop B's source uses
+        // primop A, install A first so B's lowering sees A as
+        // replaced and emits App-chain → OP_CALL on the closure
+        // (rather than PrimOpCall on A's C function, which would
+        // C-recurse on every callback).  Foundation primops
+        // (foldl', map) install first; primops built on top of them
+        // (filter, all, any) install after.
 
-        // T1 — foldl': strict left fold (the prototype for T2-T17).
-        //
-        // Source mirrors lib.lists.foldl' but uses builtins.elemAt to
-        // walk the list iteratively rather than via head/tail destruc-
-        // turing (avoids per-step list allocation).  The recursive
-        // `go` tail-calls itself, which emit.cc rewrites to OP_TAIL_
-        // CALL — so even a 1M-element list runs in O(1) vm.frames.
-        // Lazy arg note: TW's primFoldl marks the accumulator arg
-        // (bit 1) and op (bit 0) as strict; only the list (bit 2)
-        // is lazy at the surface.  Our bytecode mirrors that: `nul`
-        // and `op` are forced by OP_CALL on `op`, and the inner
-        // accumulator is force-on-write by the tail call.
+        // T1 — foldl': strict left fold.  Foundation: many downstream
+        // primops (filter, partition, listToAttrs, ...) compose on
+        // top of it.  Strict via `builtins.seq` so the accumulator is
+        // WHNF on every tail call (matches TW primFoldl semantics).
+        // The recursive `go` is rewritten to OP_TAIL_CALL by emit.cc's
+        // peephole — O(1) vm.frames regardless of list size.
         if (!std::getenv("NIX_V3_NO_BC_FOLDL"))
             installBytecodePrimop(state, "foldl'",
-                // STRICT left fold: `builtins.seq` forces each
-                // intermediate accumulator before the recursive call,
-                // matching TW's primFoldl semantics (the prime in
-                // foldl' marks strict evaluation).  Without seq, each
-                // step thunkifies `next` and the chain grows linearly
-                // with list length — forcing at the end overflows the
-                // C-stack at ~5000 elements.  With seq, the
-                // accumulator is in WHNF on every tail call, so the
-                // recursive `go` is true O(1)-space.
                 "op: nul: list: "
                 "  let n = builtins.length list; "
                 "      go = i: acc: "
@@ -329,6 +309,32 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "          let next = op acc (builtins.elemAt list i); "
                 "          in builtins.seq next (go (i + 1) next); "
                 "  in go 0 nul");
+
+        // T2 — map: lazy list mapping.  Preserves TW's primMap
+        // laziness (each result entry is forced on demand) by
+        // expressing map in terms of genList — which itself is a
+        // C primop that builds Tag::App entries lazily.
+        if (!std::getenv("NIX_V3_NO_BC_MAP"))
+            installBytecodePrimop(state, "map",
+                "fn: list: "
+                "  builtins.genList "
+                "    (i: fn (builtins.elemAt list i)) "
+                "    (builtins.length list)");
+
+        // T3 — filter: iterate, keep elements where pred returns true.
+        // Built on bytecode foldl' (T1) — the iteration runs via
+        // OP_TAIL_CALL inside foldl' so no per-element C-recursion.
+        // Each step does either `acc ++ [x]` (kept) or skip; result
+        // elements are passed through unchanged (lazy values remain
+        // lazy).  Worst-case O(N²) due to repeated ++, matching TW
+        // primFilter's append-per-match semantics.
+        if (!std::getenv("NIX_V3_NO_BC_FILTER"))
+            installBytecodePrimop(state, "filter",
+                "pred: list: "
+                "  builtins.foldl' "
+                "    (acc: x: if pred x then acc ++ [x] else acc) "
+                "    [] "
+                "    list");
     } catch (...) {
         // Reset `done` so a future call retries — otherwise a
         // transient error here would permanently disable bytecode
