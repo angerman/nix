@@ -363,6 +363,21 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "             else go (i + 1); "
                 "  in go 0");
 
+        // T9 — partition: { right, wrong } split by predicate.
+        // Built on bytecode foldl' (T1).  Two accumulators carried
+        // in an attrset; iteration is iterative via foldl''s
+        // OP_TAIL_CALL.
+        if (!std::getenv("NIX_V3_NO_BC_PARTITION"))
+            installBytecodePrimop(state, "partition",
+                "pred: list: "
+                "  builtins.foldl' "
+                "    (acc: x: "
+                "       if pred x "
+                "       then { right = acc.right ++ [x]; wrong = acc.wrong; } "
+                "       else { right = acc.right; wrong = acc.wrong ++ [x]; }) "
+                "    { right = []; wrong = []; } "
+                "    list");
+
         // T3 — filter: iterate, keep elements where pred returns true.
         // Built on bytecode foldl' (T1) — the iteration runs via
         // OP_TAIL_CALL inside foldl' so no per-element C-recursion.
