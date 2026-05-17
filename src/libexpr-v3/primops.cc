@@ -5317,6 +5317,20 @@ static void buildAndWriteDrvNative(
 // responsible for shape correctness.
 static void primDerivationFromPreprocessed(EvalState & state, Value * args, Value & out)
 {
+    // Per-call counter for V3_DBG_DRVPP=1 — reports how many times
+    // the FFI leaf is invoked during a single eval.  TW vs v3 parity
+    // expects ~one call per actual derivation node in the graph; if
+    // v3 calls 100x that, a memoization gap exists upstream.
+    static const bool s_dbg = std::getenv("V3_DBG_DRVPP") != nullptr;
+    if (__builtin_expect(s_dbg, 0)) {
+        static thread_local uint64_t calls = 0;
+        ++calls;
+        if (calls % 100 == 0) {
+            std::fprintf(stderr,
+                "v3 __derivationFromPreprocessed call #%llu\n",
+                (unsigned long long)calls);
+        }
+    }
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("__derivationFromPreprocessed", "attrset");
     auto * pp = args[0].payload.bindings;
