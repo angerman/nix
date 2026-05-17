@@ -284,6 +284,20 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // Hot primops first; each one runs the property suite + lang
         // tests + bench as part of its landing commit.
 
+        // T2 — map: lazy list mapping.  Preserves TW's primMap
+        // laziness (each result entry is forced on demand) by
+        // expressing map in terms of genList — which itself is a
+        // C primop that builds Tag::App entries lazily.  The result
+        // is a list where each entry forces only on access.
+        //
+        // Equivalent to TW: `map fn list = genList (i: fn list[i]) n`.
+        if (!std::getenv("NIX_V3_NO_BC_MAP"))
+            installBytecodePrimop(state, "map",
+                "fn: list: "
+                "  builtins.genList "
+                "    (i: fn (builtins.elemAt list i)) "
+                "    (builtins.length list)");
+
         // T1 — foldl': strict left fold (the prototype for T2-T17).
         //
         // Source mirrors lib.lists.foldl' but uses builtins.elemAt to
