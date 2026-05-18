@@ -692,6 +692,34 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
 /// OP_WITH_PUSH; instead we keep the thunk on the stack and only force
 /// when an unbound name actually triggers a lookup.  The forced value
 /// is written back so subsequent lookups skip the force.
+// 2026-05-18 cc-wrapper bisection layer 3: when withLookup finds a
+// Tag::PrimOp value with arity=0 in a with-scope attrset (typically
+// `with builtins; storeDir`), TW evaluates it implicitly to its
+// constant value.  v3's vBuiltins stores arity-0 primops as raw
+// Tag::PrimOp values; without auto-calling them at lookup-resolution
+// time, the raw primop leaks into downstream string coercion / attr
+// merge / etc. contexts and throws "toString tag=11" or similar.
+//
+// lower.cc:826,2861 already handles the STATIC `builtins.storeDir`
+// case at lower-time (emits ir::PrimOpCall directly).  This runtime
+// helper covers the DYNAMIC paths that lower.cc can't statically
+// detect: `with X; primop`, `X.primop` where X is an unknown attrset,
+// indirect `let b = builtins; in b.storeDir`, etc.
+inline Value autoCallArity0(VMState & vm, const Value & v)
+{
+    if (v.tag() == Tag::PrimOp && v.payload.primop
+        && v.payload.primop->arity == 0)
+    {
+        EvalState evs;
+        evs.vm = &vm;
+        evs.nixEvalState = getNixEvalState();
+        Value out;
+        v.payload.primop->fn(evs, nullptr, out);
+        return out;
+    }
+    return v;
+}
+
 inline Value withLookup(VMState & vm, SymbolId name)
 {
     // REVIEW §2.8: track whether any with-stack entry blackholed.  If
@@ -821,7 +849,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
             }
             if (!derefed.isAttrs()) continue;
             if (auto * v = derefed.payload.bindings->lookup(name))
-                return *v;
+                return autoCallArity0(vm, *v);
             continue;
         }
         if (w.isThunk() || w.tag() == Tag::App) {
@@ -856,7 +884,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
         }
         if (!w.isAttrs()) continue;
         if (auto * v = w.payload.bindings->lookup(name))
-            return *v;
+            return autoCallArity0(vm, *v);
     }
     // §2.8: if every enclosing scope blackholed and none defined the
     // name, the actual cause is infinite recursion (cycles in `with rec`
@@ -8718,8 +8746,45 @@ Value getBuiltinsValue() noexcept
             if (poName.size() >= 2 && poName[0] == '_' && poName[1] == '_')
                 continue;
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
-            v.payload.primop = &po;
+            // 2026-05-18 cc-wrapper bisection layer 3: arity-0 primops
+            // are CONSTANTS (currentSystem, storeDir, nixVersion, ...).
+            // lower.cc:826,2861 already pre-calls them at lower time
+            // for static `builtins.X` references.  For DYNAMIC paths
+            // (`with builtins; storeDir`, `inherit (builtins) storeDir;`,
+            // `let b = builtins; in b.storeDir`), v3 used to leave them
+            // as raw Tag::PrimOp values — which then leaked into
+            // downstream toString / STR_CONCAT / etc. as tag=11 errors.
+            // TW evaluates them implicitly because TW's force machinery
+            // calls arity-0 primops on attr-select.
+            //
+            // Pre-call here once at vBuiltins lazy-init time.  By the
+            // time getBuiltinsValue is first called (on OP_LIT_BUILTINS),
+            // setNixEvalState has been wired (run.cc:105 / v3-eval main),
+            // so the primop body has access to store + paths.
+            //
+            // Caveat: primops that need a live VMState (rather than just
+            // nixEvalState) can't be pre-called here.  For nullary
+            // primops in the current registry — currentSystem,
+            // currentTime, storeDir, langVersion, nixVersion, nixPath,
+            // nixVersion — none touch state.vm, so the pre-call is safe.
+            if (po.arity == 0 && po.fn) {
+                try {
+                    EvalState evs;
+                    evs.vm = nullptr;
+                    evs.nixEvalState = getNixEvalState();
+                    po.fn(evs, nullptr, v);
+                } catch (...) {
+                    // Some primops may legitimately fail at init time
+                    // (e.g. `nixPath` if NIX_PATH is unset).  Fall back
+                    // to the raw primop value; user-level access still
+                    // gets the proper exception when actually used.
+                    v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
+                    v.payload.primop = &po;
+                }
+            } else {
+                v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
+                v.payload.primop = &po;
+            }
             SymbolId sid = ir::globalInternSymbol(poName);
             b->entries[i] = { sid, v };
             ++i;

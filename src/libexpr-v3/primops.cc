@@ -712,10 +712,33 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
     case Tag::External:
     case Tag::Slot:
     default: {
-        char buf[64];
+        // 2026-05-18 cc-wrapper bisection: enhance the diagnostic
+        // when we hit a non-stringifiable value.  Specifically for
+        // PrimOp / PrimOpApp / Closure, print the function NAME so
+        // we can identify which Nix function leaked into a string-
+        // coerce context (where TW would have evaluated it differently).
+        char buf[256];
+        const char * extra = "";
+        std::string nameInfo;
+        if (v.tag() == Tag::PrimOp && v.payload.primop) {
+            nameInfo = std::string(" name='")
+                + (v.payload.primop->name.empty()
+                       ? "<anon>" : std::string(v.payload.primop->name))
+                + "' arity="
+                + std::to_string(v.payload.primop->arity);
+            extra = nameInfo.c_str();
+        } else if (v.tag() == Tag::Closure
+                   && v.payload.closure
+                   && v.payload.closure->desc) {
+            nameInfo = std::string(" closure-name='")
+                + (v.payload.closure->desc->name.empty()
+                       ? "<anon>" : v.payload.closure->desc->name)
+                + "'";
+            extra = nameInfo.c_str();
+        }
         std::snprintf(buf, sizeof buf,
-            "v3 toString: cannot stringify type tag=%u",
-            (unsigned)v.tag());
+            "v3 toString: cannot stringify type tag=%u%s",
+            (unsigned)v.tag(), extra);
         throw std::runtime_error(buf);
     }
     }
