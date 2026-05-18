@@ -62,6 +62,7 @@ lib_sources = files(
   'opt_dce.cc',
   'opt_inline.cc',
   'opt_occur.cc',
+  'opt_genlist_unroll.cc',
   'opt_if_fold.cc',
   'opt_primop_fold.cc',
   'opt_primop_fuse.cc',

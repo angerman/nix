@@ -339,6 +339,15 @@ void optimise(Module & m)
         inlineTrivialBindings(m);
     }
 
+    // 2026-05-18 IR Phase H: static genList unrolling.  Recognises
+    // `PrimOpCall("genList", [f, n])` where n is a known small
+    // literal (≤ 8) and expands to an N-element ListExpr of
+    // per-element MkThunks.  Runs after Phase B so that
+    // `builtins.length [a b c d]`-style n-args fold to LitInt before
+    // we examine them.  No follow-up cleanup pass — the unrolled
+    // form is itself in canonical IR shape.
+    genListUnroll(m);
+
     // OPT_OCCUR Phase B: opt-in occurrence-info-driven DCE.  When both
     // gates are set, run side-by-side and assert identical removal
     // sets (the migration-validation harness).  When only NIX_V3_OCCUR_DCE

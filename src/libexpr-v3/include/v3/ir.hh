@@ -815,6 +815,15 @@ size_t streamFusion(Module & m);
 /// disables.  Returns the number of If bindings folded.
 size_t ifThenFold(Module & m);
 
+/// IR Phase H (2026-05-18): static genList unrolling.  Recognises
+/// `PrimOpCall("genList", [f, n])` where `n` resolves to a LitInt
+/// in 0..8 and rewrites to an N-element ListExpr of per-element
+/// MkThunk bindings (each thunk's body is `App(f, LitInt i)`).
+/// Laziness preserved: each MkThunk forces its body only on demand.
+/// Gate: NIX_V3_NO_GENLIST_UNROLL=1 disables.  Returns the number of
+/// genList calls unrolled.
+size_t genListUnroll(Module & m);
+
 /// #429: fuse App-chains over LitPrimOp into a single PrimOpCall.
 /// Detects the let/inherit-from indirection pattern that escapes
 /// lowerCall's direct-recognition (e.g. `let inherit (builtins) map;
