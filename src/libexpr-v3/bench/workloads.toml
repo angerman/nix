@@ -186,18 +186,82 @@ expr = "let lib = import @NIXPKGS@/lib; in lib.strings.concatStringsSep \"-\" (m
 tags = ["real-world", "lib", "string"]
 
 # -----------------------------------------------------------------------------
-# Full nixpkgs workloads.  Currently FAILING in v3 modes due to #498
-# (callPackage upvalue regression).  Re-enable when that closes.
+# Full nixpkgs workloads.
+#
+# As of 2026-05-18 (Phase 1 closure via Option 4 hybrid), hello.name
+# and related light-attr queries are functional under v3-direct at
+# parity with TW (~0.6s v3 vs ~0.5s TW).  hello.drvPath and .outPath
+# remain slow (>30s vs TW ~1.3s) — tagged perf-known-slow so the
+# bench harness includes them for trend tracking without failing CI.
 # -----------------------------------------------------------------------------
 
 [hello-name]
 kind = "nixpkgs"
-note = "the canonical real-world test — nixpkgs#hello.name (BLOCKED on #498)"
+note = "canonical real-world — nixpkgs#hello.name (Phase 1 exit criterion)"
 expr = "(import @NIXPKGS@ { system = \"@SYSTEM@\"; }).hello.name"
-tags = ["real-world", "nixpkgs", "skip-by-default"]
+tags = ["real-world", "nixpkgs"]
+
+[hello-pname]
+kind = "nixpkgs"
+note = "hello.pname — should match hello-name perf"
+expr = "(import @NIXPKGS@ { system = \"@SYSTEM@\"; }).hello.pname"
+tags = ["real-world", "nixpkgs"]
+
+[hello-version]
+kind = "nixpkgs"
+note = "hello.version — should match hello-name perf"
+expr = "(import @NIXPKGS@ { system = \"@SYSTEM@\"; }).hello.version"
+tags = ["real-world", "nixpkgs"]
+
+[hello-meta]
+kind = "nixpkgs"
+note = "hello.meta.description — light meta-attr access"
+expr = "(import @NIXPKGS@ { system = \"@SYSTEM@\"; }).hello.meta.description"
+tags = ["real-world", "nixpkgs"]
+
+[hello-system]
+kind = "nixpkgs"
+note = "hello.system — derivation attr; should be parity"
+expr = "(import @NIXPKGS@ { system = \"@SYSTEM@\"; }).hello.system"
+tags = ["real-world", "nixpkgs"]
+
+[hello-drvpath]
+kind = "nixpkgs"
+note = "hello.drvPath — requires deep stdenv chain; v3 currently >30x slow"
+expr = "(import @NIXPKGS@ { system = \"@SYSTEM@\"; }).hello.drvPath"
+tags = ["real-world", "nixpkgs", "perf-known-slow", "skip-by-default"]
+
+[hello-outpath]
+kind = "nixpkgs"
+note = "hello.outPath — same depth as drvPath; v3 currently >30x slow"
+expr = "(import @NIXPKGS@ { system = \"@SYSTEM@\"; }).hello.outPath"
+tags = ["real-world", "nixpkgs", "perf-known-slow", "skip-by-default"]
 
 [attrnames-pkgs]
 kind = "nixpkgs"
-note = "count of pkgs.attrNames — full top-level enumeration (BLOCKED on #498)"
+note = "count of pkgs.attrNames — full top-level enumeration"
 expr = "builtins.length (builtins.attrNames (import @NIXPKGS@ { system = \"@SYSTEM@\"; }))"
-tags = ["real-world", "nixpkgs", "enumerate", "skip-by-default"]
+tags = ["real-world", "nixpkgs", "enumerate"]
+
+# -----------------------------------------------------------------------------
+# Derivation-chain synthetic workloads — stress the Option 4 wrapper
+# at increasing depth without nixpkgs overhead.
+# -----------------------------------------------------------------------------
+
+[derivation-chain-10]
+kind = "synthetic"
+note = "10-level derivation chain via buildInputs — drvPath of head"
+expr = "let mk = n: ds: derivation { name = n; system = \"x86_64-linux\"; builder = \"/bin/sh\"; buildInputs = ds; }; chain = builtins.foldl' (acc: i: acc ++ [(mk (toString i) acc)]) [] (builtins.genList (i: i) 10); in (builtins.elemAt chain 9).drvPath"
+tags = ["data", "derivation", "chain"]
+
+[derivation-chain-30]
+kind = "synthetic"
+note = "30-level derivation chain — drvPath of head"
+expr = "let mk = n: ds: derivation { name = n; system = \"x86_64-linux\"; builder = \"/bin/sh\"; buildInputs = ds; }; chain = builtins.foldl' (acc: i: acc ++ [(mk (toString i) acc)]) [] (builtins.genList (i: i) 30); in (builtins.elemAt chain 29).drvPath"
+tags = ["data", "derivation", "chain"]
+
+[derivation-strict-multi-output]
+kind = "synthetic"
+note = "builtins.derivationStrict with 3 outputs — exercises the Option 4 FFI leaf"
+expr = "(builtins.derivationStrict { name = \"mout\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ \"out\" \"dev\" \"doc\" ]; }).drvPath"
+tags = ["data", "derivation"]
