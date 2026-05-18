@@ -5784,14 +5784,32 @@ static void primDerivationStrictNative(
                 continue;
             }
             // builder/system/outputHash* still extracted out to drv.
-            std::string s = v3CoerceToString(
-                state, attrV, context,
-                "while evaluating a derivation attribute");
-            if (sid == sym.builder)             drv.builder = s;
-            else if (sid == sym.system)         drv.platform = s;
-            else if (sid == sym.outputHash)     outputHashStr = s;
-            else if (sid == sym.outputHashAlgo) outputHashAlgoStr = s;
-            else if (sid == sym.outputHashMode) outputHashModeStr = s;
+            // Only coerce-to-string for the SPECIAL fields below; under
+            // __structuredAttrs every OTHER attr is already captured
+            // into `structuredJson` above (via valueToJsonWithContext),
+            // and calling v3CoerceToString on, say, an env attr that's
+            // a nested attrset (`{ SSL_CERT_FILE = ...; }`) would
+            // throw "attrset has neither __toString nor outPath" and
+            // bounce the whole derivation through the TW bridge for no
+            // reason.  Pre-2026-05-18 this unconditional coerce was the
+            // root cause of 63 structured-attrs derivations on
+            // hello.drvPath falling back to TW (see
+            // project_bridge_primop_status_2026-05-18.md).
+            if (sid == sym.builder
+                || sid == sym.system
+                || sid == sym.outputHash
+                || sid == sym.outputHashAlgo
+                || sid == sym.outputHashMode)
+            {
+                std::string s = v3CoerceToString(
+                    state, attrV, context,
+                    "while evaluating a derivation attribute");
+                if (sid == sym.builder)             drv.builder = s;
+                else if (sid == sym.system)         drv.platform = s;
+                else if (sid == sym.outputHash)     outputHashStr = s;
+                else if (sid == sym.outputHashAlgo) outputHashAlgoStr = s;
+                else if (sid == sym.outputHashMode) outputHashModeStr = s;
+            }
             // No drv.env emit under structuredAttrs.
             continue;
         }
