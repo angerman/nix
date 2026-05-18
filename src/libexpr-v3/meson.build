@@ -343,4 +343,20 @@ if python3.found()
     },
   )
 
+  # 2026-05-18: IR-dump determinism guard.  Runs a representative
+  # corpus of expressions through `v3-eval --emit-ir{,-raw}` three
+  # times each and diffs the outputs.  Codifies §1.7 of
+  # IR_CHECK_INFRASTRUCTURE_PLAN_2026-05-18.md — catches any future
+  # nondeterminism (unordered_map iteration, pointer-order sorting,
+  # etc.) before fixtures become flaky.
+  test(
+    'v3-ir-dump-determinism',
+    find_program('bash'),
+    args : [files('test/run-ir-dump-determinism.sh')],
+    timeout : 30,
+    env : {
+      'V3_BUILD_BIN' : meson.global_build_root() / 'src' / 'libexpr-v3',
+    },
+  )
+
 endif

@@ -441,6 +441,17 @@ int main(int argc, char ** argv)
         }
         return rc;
     } catch (const std::exception & ex) {
+        // IR-CHECK robustness (plan §1.4 R1.4): when --emit-ir is
+        // active and lowering / optimisation throws, emit a marker
+        // line on stdout so a downstream `v3-check %s` invocation
+        // can detect the failure cleanly (in addition to the
+        // non-zero exit code that pipefail-aware runners already
+        // catch).  Without this marker, a partial stdout buffer
+        // could be silently consumed by v3-check and produce a
+        // misleading "no CHECK matched" diagnostic.
+        if (irDumpMode != IrDumpMode::None) {
+            std::cout << "; LOWERING ERROR: " << ex.what() << "\n";
+        }
         std::fprintf(stderr, "v3-eval error: %s\n", ex.what());
         return 1;
     }

@@ -115,11 +115,16 @@ pattern, and the surrounding context.  Typical failure modes:
 
 ## Files
 
+Positive (assert pass FIRES correctly):
 - `constantFold-arith-pos.nix` — Phase B (opt_const_fold): `2 * 3 → LitInt 6`.
 - `primOpFold-length-pos.nix` — Phase B (opt_primop_fold): `length [1..5] → LitInt 5`.
 - `betaReduce-composition-pos.nix` — Phase A + Phase B: `(x: x*2) 21 → LitInt 42` (multi-RUN).
 - `streamFusion-foldlMap-pos.nix` — Phase C: `foldl' op nul (map f xs) → __foldlMap` App-chain.
 - `lambdaLift-capture-free-pos.nix` — Phase D precondition: lowerer marks freeVars correctly.
+- `elimRedundantForce-inline-pos.nix` — inlineTrivialBindings + elimRedundantForce: cleanup of A-normal-form scaffolding.
+
+Negative (assert pass DOES NOT fire when its safety check should refuse):
+- `betaReduce-nested-lambda-neg.nix` — Phase A refuses `(x: y: x + y) 5` (body contains nested Lambda).
 
 ## Adding a new fixture
 

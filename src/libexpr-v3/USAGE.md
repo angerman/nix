@@ -8,6 +8,26 @@ upvalues for Closures, and a re-entrant dispatcher.
 This file documents what works **today** so we don't have to guess.
 Update it as coverage grows.
 
+> **Important — partial historical content.** Sections of this file
+> (notably "How parity was reached", "NIX_USE_V3 cutover", "CO-2 / CO-3
+> forceValue cutover", and the "Performance" table at the end) describe
+> mechanisms and numbers from 2026-05-05 that are no longer current.
+> The v3-hook integration described there was deleted in commit
+> `e8d7c3885` (2026-05-13). Parity claims do not hold on real nixpkgs
+> workloads as of 2026-05-15 — v3-direct currently cannot complete
+> `(import <nixpkgs>{}).hello.name`. For current strategic direction,
+> phased plan, lessons-learned, scorecard, and roadmap, see:
+>
+> - `CLAUDE.md` (session-level instructions; auto-loaded)
+> - `lode/ACTION_PLAN_2026-05-15.md` (active work plan, Phases 0-4)
+> - `lode/LESSONS_LEARNED_2026-05-15.md` (what worked / what didn't)
+> - `lode/ALIGNMENT_SCORECARD_2026-05-15.md` (vision vs reality)
+> - `lode/ROADMAP_TO_VISION_2026-05-15.md` (long-horizon Stages 1-8)
+>
+> The sections below remain useful for build commands, the supported
+> AST shapes, the primop inventory, the lang-test status, and the
+> tested examples — those parts are stable.
+
 ## Building
 
 ```bash
@@ -30,6 +50,70 @@ lowers to v3 IR, compiles to bytecode, and runs through the v3 VM.
 Exits with status 0 on success; prints the resulting value on stdout.
 On unsupported AST shapes or runtime errors, prints `v3-eval error: …`
 on stderr and exits 1.
+
+### IR dump flags (IR-CHECK MVP, 2026-05-18)
+
+For LLVM-FileCheck-style testing of the optimizer pipeline:
+
+| Flag | Meaning |
+|------|---------|
+| `--emit-ir` | Dump POST-optimisation IR to stdout and exit (suppresses normal eval). |
+| `--emit-ir-raw` | Dump PRE-optimisation IR (after lower, before optimise). |
+| `--no-opt` | When combined with `--emit-ir`, skip the optimise pass — equivalent to `--emit-ir-raw` but available for explicit A/B comparison. |
+| `--file PATH` | Read the Nix expression from PATH (mutually exclusive with `--expr`).  Used by IR-CHECK fixtures as `--file %s`. |
+
+Example session:
+
+```
+$ v3-eval --expr '(x: x * 2) 21' --emit-ir-raw
+; module n_funcs=2 n_blocks=3 nextVar=11
+; func f0 entry=B1 nUp=0
+B1:
+  v7 = Lambda f1 freeVars=[]
+  v8 = LitInt 21
+  v9 = App v7 v8
+  ...
+
+$ v3-eval --expr '(x: x * 2) 21' --emit-ir
+; module n_funcs=2 n_blocks=3 nextVar=16
+; func f0 entry=B1 nUp=0
+B1:
+  v15 = LitInt 42
+  return v15
+  ...
+```
+
+The output format is stable and byte-deterministic across runs
+(guarded by `test/run-ir-dump-determinism.sh`).
+
+### v3-check CLI (LLVM-FileCheck subset)
+
+`v3-check MATCH-FILE [--check-prefix=PREFIX]` reads stdin as the
+"actual" output, parses CHECK directives from MATCH-FILE (`.nix`
+files using `#` line-comments), and exits 0 on PASS / non-zero with
+diagnostic on FAIL.  Supported:
+
+- `# CHECK: pat` — forward substring search.
+- `# CHECK-NOT: pat` — forbid `pat` before next positive match.
+- `# CHECK-LABEL: pat` — strong anchor; resets cursor.
+- `# CHECK-NEXT: pat` — match the line immediately after the prior positive.
+- `{{regex}}` — embedded regex within an otherwise-literal pattern.
+- `--check-prefix=FOO` — substitute "CHECK" for "FOO" (multi-RUN).
+
+### IR-CHECK fixtures
+
+`test/ir-fixtures/*.nix` are LLVM-`lit`-style fixtures.  Each file
+contains:
+
+1. One or more `# RUN: ...` shell-command lines (the runner extracts
+   these; `%s` is substituted with the fixture path).
+2. A Nix expression body (parsed by `v3-eval --file %s`).
+3. `# CHECK:` directives that `v3-check` asserts against the
+   `v3-eval` IR dump.
+
+Run all fixtures: `nix develop -c bash src/libexpr-v3/test/run-ir-checks.sh` (or via meson: `meson test -C build v3-ir-checks`).
+
+See `test/ir-fixtures/README.md` for the fixture-authoring guide.
 
 ## NIX_USE_V3 cutover
 
