@@ -147,6 +147,10 @@ v3_smoke = executable(
 test(
   'v3-smoke',
   v3_smoke,
+  # v3-smoke's disk-cache subtest writes to NIX_V3_CACHE_DIR (or XDG
+  # cache when unset).  Use a meson-isolated path so concurrent
+  # test runs don't collide on a shared cache directory.
+  env : {'NIX_V3_CACHE_DIR' : meson.global_build_root() / 'v3-smoke-cache'},
 )
 
 # BR-3.0 pre-flight: validate the libnixstore Derivation APIs we'll
@@ -237,4 +241,70 @@ if python3.found()
     timeout : 180,
     env : {'NIX' : meson.global_build_root() / 'src' / 'nix' / 'nix'},
   )
+
+  # 2026-05-18: derivation parity harness.  20 cases of drvPath
+  # byte-for-byte comparison v3-direct vs TW.  Covers minimal,
+  # multi-output, mixed-env, drv-cross-ref, buildInputs chains,
+  # ignoreNulls, fixed-output, passthru, outpath-ref, deep chains
+  # + direct builtins.derivationStrict variants.  Pinned to current
+  # HEAD; regressions here surface broken Option 4 hybrid.
+  test(
+    'v3-derivation-parity',
+    find_program('bash'),
+    args : [files('test/derivation-parity.sh')],
+    timeout : 120,
+    env : {'NIX' : meson.global_build_root() / 'src' / 'nix' / 'nix'},
+  )
+
+  # 2026-05-18: lang test suite — 143 tests from functional/lang/
+  # routed through v3-eval.  142 pass; 1 pre-existing fail tracked
+  # in the test runner.  Catches AST-level + opcode-level
+  # regressions.  Longer-running (~2 min).
+  test(
+    'v3-lang-tests',
+    find_program('bash'),
+    args : [files('test/run-lang-tests.sh')],
+    timeout : 300,
+  )
+
+  # 2026-05-18: property tests — 58 primop categories × 10 cases of
+  # TW vs v3 parity.  580 cases total.  Pure Python harness.
+  test(
+    'v3-property-tests',
+    python3,
+    args : [files('test/property/property_tests.py')],
+    timeout : 300,
+    env : {'V3_PROP_NIX' : meson.global_build_root() / 'src' / 'nix' / 'nix'},
+  )
+
+  # 2026-05-18: standalone repro-*.nix fixture runner — see REPROS.md
+  # for the per-fixture lesson manifest.  Quick smoke (<10s).
+  test(
+    'v3-repros',
+    find_program('bash'),
+    args : [files('test/run-repros.sh')],
+    timeout : 60,
+    env : {'NIX' : meson.global_build_root() / 'src' / 'nix' / 'nix'},
+  )
+
+  # 2026-05-18: bug-specific repro suites.  Each has its own driver
+  # script with its own pass/fail semantics; we treat exit-0 as PASS.
+  # Run a curated subset by default — the master `all-v3-tests.sh
+  # --full` covers everything else by hand.
+  foreach script_info : [
+    ['v3-583-tag-app-cache', 'test/run-583-tag-app-cache-tests.sh', 60],
+    ['v3-456-chase-cycle',   'test/run-456-chase-cycle-tests.sh',   60],
+    ['v3-558-emit-order',    'test/run-558-emit-order-tests.sh',    60],
+    ['v3-direct-eval',       'test/run-direct-eval-tests.sh',       60],
+    ['v3-lazy-bridge-arg',   'test/run-lazy-bridge-arg-tests.sh',   60],
+    ['v3-cutover-parity',    'test/run-cutover-parity-tests.sh',    60],
+  ]
+    test(
+      script_info[0],
+      find_program('bash'),
+      args : [files(script_info[1])],
+      timeout : script_info[2],
+      env : {'NIX' : meson.global_build_root() / 'src' / 'nix' / 'nix'},
+    )
+  endforeach
 endif

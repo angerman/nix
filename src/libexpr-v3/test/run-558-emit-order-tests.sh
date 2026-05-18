@@ -76,9 +76,9 @@ in (fix stage).wt4
 EOF
 
 t1_tw=$("$NIX_BIN" --extra-experimental-features 'nix-command flakes' \
-    eval --impure --file "$TMP/t1.nix" 2>&1)
+    eval --impure --file "$TMP/t1.nix" 2>/dev/null)
 t1_v3=$(NIX_V3_DIRECT_EVAL=1 "$NIX_BIN" --extra-experimental-features \
-    'nix-command flakes' eval --impure --file "$TMP/t1.nix" 2>&1)
+    'nix-command flakes' eval --impure --file "$TMP/t1.nix" 2>/dev/null)
 assert_eq "t1-tw"     '"wt4-evaluated"' "$t1_tw"
 assert_eq "t1-v3"     '"wt4-evaluated"' "$t1_v3"
 
@@ -99,9 +99,9 @@ in pkgs.wt4
 EOF
 
 t2_tw=$("$NIX_BIN" --extra-experimental-features 'nix-command flakes' \
-    eval --impure --file "$TMP/t2.nix" 2>&1)
+    eval --impure --file "$TMP/t2.nix" 2>/dev/null)
 t2_v3=$(NIX_V3_DIRECT_EVAL=1 "$NIX_BIN" --extra-experimental-features \
-    'nix-command flakes' eval --impure --file "$TMP/t2.nix" 2>&1)
+    'nix-command flakes' eval --impure --file "$TMP/t2.nix" 2>/dev/null)
 assert_eq "t2-tw"     '"wt4-evaluated"' "$t2_tw"
 assert_eq "t2-v3"     '"wt4-evaluated"' "$t2_v3"
 
