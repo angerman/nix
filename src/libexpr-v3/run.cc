@@ -15,6 +15,7 @@
 #include "v3/ir.hh"
 #include "v3/alloc.hh"
 #include "v3/bytecode_primops.hh"
+#include "v3/limits.hh"
 
 #include "nix/expr/eval.hh"
 
@@ -102,6 +103,13 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // thunks; see `primops.cc treeWalkerToV3` nFunction case for the
     // address-stability contract.
     setNixEvalState(&state);
+
+    // Phase 1.6 — initialise resource limits.  Idempotent across
+    // subsequent runRootExpr calls.  Reads NIX_V3_MAX_HEAP /
+    // NIX_V3_MAX_CPU_TIME / NIX_V3_MAX_WALL_TIME and installs the
+    // Boehm OOM handler if heap cap is set.  Cheap (one mutex + a
+    // boolean check) when re-entered.
+    initLimits();
 
     // A12b T0: install bytecode replacements for callback primops
     // (foldl' / map / filter / etc.) once per process.  The install

@@ -24,6 +24,7 @@
 #include "v3/disasm.hh"
 #include "v3/errors.hh"
 #include "v3/bytecode_primops.hh"
+#include "v3/limits.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
@@ -1729,6 +1730,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         if (__builtin_expect(kCountInstructions, 0)) [[unlikely]] {
             vm.nrInstructions++;
             allocStats().bytecodeInstructions++;
+        }
+        // Phase 1.6 (2026-05-18) — resource-limit polling.  When no
+        // cap is configured (`limitsActive()` is false), the outer
+        // branch elides everything; per-opcode overhead is one
+        // branch-predicted-not-taken (≤1 cycle).  When caps ARE set,
+        // a thread-local poll counter gates the actual getrusage /
+        // steady_clock / atomic-OOM check to once per kPollInterval
+        // (10000) opcodes — amortised ≤2ns per opcode.
+        //
+        // Gate: NIX_V3_MAX_HEAP / NIX_V3_MAX_CPU_TIME / NIX_V3_MAX_WALL_TIME.
+        // Retire individual gates when bounded-memory / termination
+        // / bounded-wall-time guarantees become structural (see
+        // limits.cc).
+        if (__builtin_expect(nix::v3::limitsActive(), 0)) [[unlikely]] {
+            static thread_local uint32_t s_pollCounter = 0;
+            if (__builtin_expect(++s_pollCounter >= nix::v3::kPollInterval, 0)) {
+                s_pollCounter = 0;
+                nix::v3::checkLimits();  // throws on cap exceed
+            }
         }
         Op op = decodeOp(instr);
         // 2026-05-18 per-opcode profiling: bump under NIX_VM_OPCOUNTS=1.

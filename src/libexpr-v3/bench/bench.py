@@ -224,12 +224,18 @@ _V3_INSNS = re.compile(r"v3 dispatch: bytecode instructions=(\d+)")
 def run_one(nix: Path, mode: str, expr: str,
             with_v3_timing: bool = False,
             with_vm_stats: bool = False,
-            timeout: float = 300.0) -> Run:
+            timeout: float = 300.0,
+            caps: Optional[dict] = None) -> Run:
     """Execute one (mode, expr) and capture metrics.
 
     Wraps the real `nix eval` with `/usr/bin/time -l` so we get RSS.
     Routes stderr through to also capture V3_TIMING / NIX_VM_STATS
     dumps when those env vars are set.
+
+    `caps` (Phase 1.6): dict with optional keys `max_heap` /
+    `max_cpu` / `max_wall`.  Each value sets the corresponding
+    NIX_V3_MAX_* env var.  None or empty values are not set —
+    runs without that cap.
 
     Returns a Run with wall=0 and rc=non-zero if the eval failed.
     """
@@ -239,6 +245,13 @@ def run_one(nix: Path, mode: str, expr: str,
         env["V3_TIMING"] = "1"
     if with_vm_stats:
         env["NIX_VM_STATS"] = "1"
+    if caps:
+        if caps.get("max_heap"):
+            env["NIX_V3_MAX_HEAP"] = caps["max_heap"]
+        if caps.get("max_cpu"):
+            env["NIX_V3_MAX_CPU_TIME"] = caps["max_cpu"]
+        if caps.get("max_wall"):
+            env["NIX_V3_MAX_WALL_TIME"] = caps["max_wall"]
     cmd = [
         "/usr/bin/time", "-l",
         str(nix), "--extra-experimental-features", "nix-command",
@@ -290,17 +303,22 @@ def run_one(nix: Path, mode: str, expr: str,
 # ---------------------------------------------------------------------------
 
 def run_cell(nix: Path, workload_name: str, mode: str, expr: str,
-             n: int, deep: bool, verbose: bool) -> Cell:
+             n: int, deep: bool, verbose: bool,
+             caps: Optional[dict] = None) -> Cell:
     """Run a workload+mode N times.  When `deep`, the LAST run also
     collects V3_TIMING + NIX_VM_STATS data; that cell-level data lands
-    on the corresponding Run."""
+    on the corresponding Run.
+
+    `caps` (Phase 1.6): Phase-1.6 resource-cap env-var values, applied
+    to every subprocess invocation.  See run_one for the schema."""
     cell = Cell(workload=workload_name, mode=mode, n=n)
     for i in range(n):
         is_last = (i == n - 1)
         r = run_one(
             nix=nix, mode=mode, expr=expr,
             with_v3_timing=deep and is_last and mode != "tw",
-            with_vm_stats=deep and is_last and mode != "tw")
+            with_vm_stats=deep and is_last and mode != "tw",
+            caps=caps)
         cell.runs.append(r)
         if verbose:
             tag = "OK" if r.rc == 0 else f"FAIL(rc={r.rc})"
@@ -563,6 +581,20 @@ def main():
                     help="log each individual run to stderr")
     ap.add_argument("--timeout", type=float, default=300.0,
                     help="per-run timeout in seconds (default 300)")
+    # Phase 1.6 caps — applied via NIX_V3_MAX_HEAP / NIX_V3_MAX_CPU_TIME
+    # / NIX_V3_MAX_WALL_TIME env vars in each subprocess.  Defaults
+    # are generous (4G / 300s / 600s) — they exist to fail-fast on
+    # accidental hot-loops / OOMs, NOT to constrain normal benchmark
+    # runs.  Override per-invocation with --max-heap=128M etc., or
+    # pass --no-caps to disable entirely.
+    ap.add_argument("--max-heap", default="4G",
+                    help="NIX_V3_MAX_HEAP value (default 4G; --no-caps to disable)")
+    ap.add_argument("--cpu-budget", default="300s",
+                    help="NIX_V3_MAX_CPU_TIME value (default 300s)")
+    ap.add_argument("--wall-budget", default="600s",
+                    help="NIX_V3_MAX_WALL_TIME value (default 600s)")
+    ap.add_argument("--no-caps", action="store_true",
+                    help="disable all Phase 1.6 resource caps")
     args = ap.parse_args()
 
     # Resolve inputs.
@@ -602,6 +634,21 @@ def main():
         print("ERROR: no workloads selected after filtering.", file=sys.stderr)
         sys.exit(2)
 
+    # Phase 1.6 caps assembled here.  --no-caps disables; otherwise
+    # the three defaults guard against accidental hot loops + OOM.
+    caps = None
+    if not args.no_caps:
+        caps = {
+            "max_heap": args.max_heap,
+            "max_cpu":  args.cpu_budget,
+            "max_wall": args.wall_budget,
+        }
+        print(f"# resource caps: heap={args.max_heap} cpu={args.cpu_budget} "
+              f"wall={args.wall_budget} (override with --no-caps)",
+              file=sys.stderr)
+    else:
+        print("# resource caps: DISABLED via --no-caps", file=sys.stderr)
+
     print(f"# {len(workloads)} workload(s) × {len(modes)} mode(s) × "
           f"n={args.n} = {len(workloads)*len(modes)*args.n} runs",
           file=sys.stderr)
@@ -614,7 +661,8 @@ def main():
         for mode in modes:
             c = run_cell(
                 nix=nix, workload_name=wl_name, mode=mode, expr=expr,
-                n=args.n, deep=args.deep, verbose=args.verbose)
+                n=args.n, deep=args.deep, verbose=args.verbose,
+                caps=caps)
             cells.append(c)
             if c.fail_count() > 0:
                 print(f"# {wl_name}/{mode}: {c.fail_count()}/{c.n} failed",

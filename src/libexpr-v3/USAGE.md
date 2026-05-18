@@ -261,6 +261,62 @@ chains (path-deep, letrec-fix), and -- when nixpkgs is available --
 the nixpkgs-cold-path queries dominant in real-world use
 (hello-name, git-name, drv3, attr-pkgs, attr-hask).
 
+## Resource limits — `NIX_V3_MAX_*` (Phase 1.6, 2026-05-18)
+
+Three opt-in caps, each gracefully throws a typed exception
+within ~10 ms of the cap being exceeded.  Default-off — set the
+env var to enable.
+
+| Env var | Suffixes | Exception |
+|---|---|---|
+| `NIX_V3_MAX_HEAP` | K / M / G (1024-base; B optional) | `OutOfMemoryError` |
+| `NIX_V3_MAX_CPU_TIME` | s / m / h | `CpuTimeExceededError` |
+| `NIX_V3_MAX_WALL_TIME` | s / m / h | `WallTimeExceededError` |
+
+Examples:
+
+```
+# Fail fast (≤ ~2s + 100 ms slack) on an infinite tail recursion.
+NIX_V3_MAX_WALL_TIME=2s v3-eval --expr 'let f = x: f x; in f 0'
+
+# Cap an eval to 30 CPU-seconds (catches busy loops that drift
+# across wall time due to thermal throttling).
+NIX_V3_MAX_CPU_TIME=30s v3-eval --file workload.nix
+
+# Cap Boehm heap at 1 GiB — best-effort; Boehm's
+# GC_set_max_heap_size is approximate.  For deterministic OOM
+# enforcement on production, also set the OS-level
+# `setrlimit RLIMIT_AS` via the shell (`ulimit -v 1048576`).
+NIX_V3_MAX_HEAP=1G v3-eval --file workload.nix
+```
+
+Exception output (stderr):
+
+```
+v3-eval error: v3 WallTimeExceededError: NIX_V3_MAX_WALL_TIME=2.00s exceeded
+after 2.00s (alloc: closures=1 thunks=1 lists=0 attrsets=1
+rss=25.55 MB boehm_heap=384.25 MB)
+```
+
+Polling cadence is every 10 000 opcodes (`kPollInterval` in
+`limits.cc`).  Per-opcode amortised cost when caps are inactive:
+**zero** (the entire poll site elides to one branch-predicted-not-
+taken branch).  Per-opcode amortised cost when caps are active:
+~1-2 ns (a thread-local counter increment + comparison).
+
+The bench harness (`bench/bench.py`) sets all three by default
+(4G / 300s / 600s) so accidental hot-loops fail-fast instead of
+stalling the runner.  Override per-invocation:
+
+```
+nix develop -c python3 src/libexpr-v3/bench/bench.py \
+    --max-heap 8G --cpu-budget 60s --wall-budget 120s \
+    --modes tw,v3-direct -n 5
+
+# Disable all caps:
+nix develop -c python3 src/libexpr-v3/bench/bench.py --no-caps ...
+```
+
 ## Profiling workflow (2026-05-18)
 
 Two complementary profiling tools, layered for different

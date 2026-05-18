@@ -55,6 +55,7 @@ lib_sources = files(
   'vm.cc',
   'primops.cc',
   'bytecode_primops.cc',
+  'limits.cc',
   'lower.cc',
   'opt_beta_reduce.cc',
   'opt_const_fold.cc',
@@ -113,6 +114,7 @@ install_headers(
     'include/v3/ir.hh',
     'include/v3/disk_cache.hh',
     'include/v3/gc.hh',
+    'include/v3/limits.hh',
     'include/v3/lower.hh',
     'include/v3/primop.hh',
     'include/v3/print.hh',
@@ -321,6 +323,7 @@ if python3.found()
     ['v3-cutover-parity',    'test/run-cutover-parity-tests.sh',    60],
     ['v3-stream-fusion',     'test/run-stream-fusion-tests.sh',     60],
     ['v3-lambda-lift',       'test/run-lambda-lift-tests.sh',       60],
+    ['v3-resource-limits',   'test/run-resource-limits-tests.sh',   60],
   ]
     test(
       script_info[0],

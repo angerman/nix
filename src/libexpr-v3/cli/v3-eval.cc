@@ -35,6 +35,7 @@
 #include "v3/disasm.hh"
 #include "v3/ir.hh"
 #include "v3/ir_dump.hh"
+#include "v3/limits.hh"
 #include "v3/print.hh"
 
 #include "nix/expr/eval.hh"
@@ -259,6 +260,9 @@ int main(int argc, char ** argv)
 
         nix::v3::registerBuiltinPrimOps();
         nix::v3::setNixEvalState(&state);
+        // Phase 1.6: read NIX_V3_MAX_HEAP / NIX_V3_MAX_CPU_TIME /
+        // NIX_V3_MAX_WALL_TIME and arm the dispatch-loop poll.
+        nix::v3::initLimits();
 
         auto m = nix::v3::lowerNixExpr(e, state.symbols, state.positions);
 
