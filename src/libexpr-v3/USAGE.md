@@ -261,6 +261,86 @@ chains (path-deep, letrec-fix), and -- when nixpkgs is available --
 the nixpkgs-cold-path queries dominant in real-world use
 (hello-name, git-name, drv3, attr-pkgs, attr-hask).
 
+## Profiling workflow (2026-05-18)
+
+Two complementary profiling tools, layered for different
+granularities:
+
+### Per-opcode dispatch counter (in-process, low overhead)
+
+Set `NIX_VM_OPCOUNTS=1` alongside `NIX_VM_STATS=1` to get a sorted
+top-20 hot opcodes report:
+
+    NIX_VM_OPCOUNTS=1 NIX_VM_STATS=1 \
+      ./build/src/libexpr-v3/v3-eval --strict --expr "EXPR"
+
+Example output:
+
+    v3 opcode profile (total=14018, top 20 of 10 distinct):
+      OP_GET_LOCAL                       4005 (28.57%)
+      OP_SET_LOCAL                       2005 (14.30%)
+      OP_FORCE                           2001 (14.27%)
+      OP_RETURN                          2000 (14.27%)
+      OP_MAKE_CLOSURE                    1002 ( 7.15%)
+      OP_CALL_PRIMOP                     1002 ( 7.15%)
+      OP_GET_UPVALUE                     1000 ( 7.13%)
+      OP_STR_CONCAT                      1000 ( 7.13%)
+      ...
+
+Tells you which dispatch branches dominate.  Each percentage
+point above ~5% is a worthwhile fast-path or peephole candidate
+(e.g. `GET_LOCAL`+`FORCE` adjacency is already fused as
+`OP_GET_LOCAL_FORCE`; a high `OP_FORCE` percentage suggests the
+fusion isn't kicking in on the workload — investigate).
+
+**Overhead**: one extra memory write per dispatch.  Measured ~3-5%
+on tight inner loops.  Tolerable for profiling sessions; do not
+ship default-on.
+
+### Sampling CPU profiler (OS-level, all overhead)
+
+For finer-grained call-graph data (which C++ function is hot, not
+just which opcode), use the OS sampling profiler.
+
+**macOS — Instruments**:
+
+    # 1. Run the workload in the foreground; let Instruments attach.
+    NIX_V3_DIRECT_EVAL=1 ./build/src/libexpr-v3/v3-eval \
+        --file /path/to/heavy.nix --strict &
+    PID=$!
+    # 2. Profile for 5 seconds, save to /tmp/v3.trace.
+    xcrun xctrace record --template "Time Profiler" \
+        --output /tmp/v3.trace --attach $PID --time-limit 5s
+    # 3. Open the trace in Instruments.app to drill into call paths.
+    open /tmp/v3.trace
+
+**Linux — perf**:
+
+    # Record at 999Hz for the duration of the eval.
+    NIX_V3_DIRECT_EVAL=1 perf record -F 999 -g -- \
+        ./build/src/libexpr-v3/v3-eval --file /path/to/heavy.nix --strict
+    perf report  # interactive
+    perf script | flamegraph.pl > /tmp/v3.svg  # FlameGraph
+
+**What to look for**:
+- `dispatchLoop` and its inlined opcode handlers should dominate
+  (>50% inclusive).  If a primop body (e.g. `primDerivationStrict`)
+  outranks dispatch, the primop is the bottleneck — focus there.
+- Boehm GC functions (`GC_*`) appearing in the top-N indicates
+  alloc-heavy paths.  Cross-reference with the alloc stats output
+  (`closures=N thunks=M`) to localise the alloc site.
+- `callClosure` and `forceValue` (C-recursive paths) appearing
+  high suggests the iterative-force conversion isn't covering some
+  shape — that's a Phase 1.2 / A12b follow-up.
+
+### Composing the two
+
+A typical session: run the workload under `NIX_VM_OPCOUNTS=1` first
+to identify the hot opcodes; then run under `perf record` to see
+WHERE those opcodes' C++ handlers spend their time.  The two views
+together answer "which dispatch branches dominate" + "what does
+each branch do that's slow."
+
 ## CO-2 / CO-3: forceValue cutover (opt-in)
 
 Set `NIX_USE_V3_FORCE=1` (in addition to `NIX_USE_V3=1`) to enable

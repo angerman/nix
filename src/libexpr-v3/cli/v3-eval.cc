@@ -32,6 +32,7 @@
 #include "v3/vm.hh"
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/disasm.hh"
 #include "v3/ir.hh"
 #include "v3/ir_dump.hh"
 #include "v3/print.hh"
@@ -448,6 +449,48 @@ int main(int argc, char ** argv)
                 std::fprintf(stderr, "  size %-7s %10llu (%5.1f%%)\n",
                     labels[i],
                     (unsigned long long)a.attrsetSizeBuckets[i], pct);
+            }
+
+            // 2026-05-18 per-opcode dispatch profile (NIX_VM_OPCOUNTS=1
+            // must be set for any per-op data to have been gathered;
+            // the dispatch loop only bumps under that gate).  Reports
+            // the top 20 hot opcodes sorted by count, with each row's
+            // percentage of total dispatches.  Drives VM-level
+            // optimisation focus: e.g. if OP_GET_LOCAL_FORCE is 40%
+            // of dispatches, fusing the GET+FORCE peephole is the
+            // first win to grab; if OP_CALL dominates, looking at
+            // the call fast-paths (selectorLambda, identityLambda)
+            // pays.
+            if (std::getenv("NIX_VM_OPCOUNTS")) {
+                uint64_t opTotal = 0;
+                for (size_t i = 0; i < 256; ++i) opTotal += a.opcodeCounts[i];
+                if (opTotal > 0) {
+                    // Collect (count, op) pairs for non-zero entries
+                    // then sort descending.
+                    std::vector<std::pair<uint64_t, uint8_t>> rows;
+                    rows.reserve(64);
+                    for (size_t i = 0; i < 256; ++i) {
+                        if (a.opcodeCounts[i] > 0)
+                            rows.emplace_back(a.opcodeCounts[i],
+                                static_cast<uint8_t>(i));
+                    }
+                    std::sort(rows.begin(), rows.end(),
+                        [](const auto & a, const auto & b) {
+                            return a.first > b.first;
+                        });
+                    std::fprintf(stderr,
+                        "v3 opcode profile (total=%llu, top 20 of %zu "
+                        "distinct):\n",
+                        (unsigned long long)opTotal, rows.size());
+                    size_t shown = std::min<size_t>(rows.size(), 20);
+                    for (size_t i = 0; i < shown; ++i) {
+                        double pct = 100.0 * double(rows[i].first) / double(opTotal);
+                        std::fprintf(stderr, "  %-26s %12llu (%5.2f%%)\n",
+                            nix::v3::opName(
+                                static_cast<nix::v3::Op>(rows[i].second)),
+                            (unsigned long long)rows[i].first, pct);
+                    }
+                }
             }
         }
         return rc;

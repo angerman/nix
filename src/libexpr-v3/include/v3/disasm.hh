@@ -31,4 +31,9 @@ uint32_t disassembleOne(
     const CompilationUnit & cu,
     uint32_t ip);
 
+/// Map an Op code to its `OP_*` mnemonic string.  Returns "OP_???"
+/// for unknown codes.  Used by the per-opcode dispatch counter
+/// reporter (NIX_VM_OPCOUNTS) and any future profiling tools.
+const char * opName(Op op);
+
 } // namespace nix::v3

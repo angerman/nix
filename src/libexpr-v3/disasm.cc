@@ -10,7 +10,7 @@
 
 namespace nix::v3 {
 
-static const char * opName(Op op)
+const char * opName(Op op)
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wswitch-enum"

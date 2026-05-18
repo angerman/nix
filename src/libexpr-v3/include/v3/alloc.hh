@@ -142,6 +142,20 @@ struct AllocStats
     /// loop's amortised cost).
     uint64_t bytecodeInstructions = 0;
 
+    /// 2026-05-18 profiling: per-opcode dispatch counter.  Indexed by
+    /// the `Op` enum value (uint8_t, 0..255).  Bumped at the same
+    /// dispatch site as `bytecodeInstructions` but ONLY when
+    /// NIX_VM_OPCOUNTS=1 — the per-op increment is one extra memory
+    /// write per dispatch (a few percent overhead on tight loops).
+    /// Dumped at process exit as a top-N table sorted by count.
+    ///
+    /// Workflow:
+    ///   NIX_VM_OPCOUNTS=1 NIX_VM_STATS=1 v3-eval --file ... --strict
+    /// Reports the top 20 hot opcodes; tells us which dispatch
+    /// branches dominate (e.g. OP_FORCE vs OP_GET_LOCAL vs OP_CALL),
+    /// driving where to focus VM-level optimisation work.
+    uint64_t opcodeCounts[256] = {};
+
     /// Bindings allocation histogram by size.  Buckets:
     /// [0]=0, [1]=1, [2]=2, [3]=3-4, [4]=5-8, [5]=9-16, [6]=17-32,
     /// [7]=33-64, [8]=65-128, [9]=129+.  Used to size-tune the

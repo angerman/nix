@@ -1731,6 +1731,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             allocStats().bytecodeInstructions++;
         }
         Op op = decodeOp(instr);
+        // 2026-05-18 per-opcode profiling: bump under NIX_VM_OPCOUNTS=1.
+        // Separate gate from NIX_VM_STATS because the per-op increment
+        // adds one extra cache write per dispatch — a few % overhead
+        // on tight inner loops where we'd want to KNOW the cost is
+        // attributable to the workload, not the meter.
+        static const bool s_countOpcodes =
+            std::getenv("NIX_VM_OPCOUNTS") != nullptr;
+        if (__builtin_expect(s_countOpcodes, 0)) [[unlikely]] {
+            allocStats().opcodeCounts[static_cast<uint8_t>(op)]++;
+        }
         uint32_t operand = decodeOperand(instr);
 
         // -Wswitch-enum: deliberately don't list reserved opcodes
