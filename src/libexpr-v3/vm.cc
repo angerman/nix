@@ -709,11 +709,100 @@ inline Value withLookup(VMState & vm, SymbolId name)
         if (w.tag() == Tag::Slot) {
             Value * p = w.payload.slot;
             if (!p) continue;
-            // Don't write *p back into w — leave the slot pointer in
-            // place for subsequent lookups (the slot may mutate again,
-            // e.g. OP_APPLY_OVERRIDES grows the bindings).  Force a
-            // local copy and use it for this iteration.
-            Value derefed = *p;
+            // 2026-05-18 cc-wrapper bisection: nixpkgs's `lib.fix` /
+            // `extends` / `callPackage` machinery can produce a CHAIN
+            // of Slot indirections for a single with-scope entry
+            // (e.g. `Slot -> Slot -> Slot -> Slot -> Slot -> Attrs(121)`
+            // for `with targetPlatform;` inside bintools-wrapper's
+            // dynamicLinker selection).  A single-level deref would
+            // land on the NEXT Slot, fall through `!isAttrs()`, and
+            // skip the with-entry entirely — even though the chain
+            // resolves to an attrset containing the looked-up name
+            // (V3_DBG_WITH dump: `[name-IS-here-but-missed!]`).
+            //
+            // Chase Slot indirections with cycle detection.  Two
+            // distinct failure modes:
+            //   - CYCLE: revisiting a Slot pointer we've already seen.
+            //     Treat as blackholed (skip this scope, try outer).
+            //   - OVERFLOW: chain longer than NIX_V3_WITH_CHAIN_LIMIT
+            //     (default 64).  Throw an actionable error reporting
+            //     the chain and how to raise the limit.
+            //
+            // Memory: static thread_local vector reused across calls,
+            // cleared per call.  Zero allocation after warmup.
+            //
+            // NIX_V3_NO_WITH_SLOT_CHASE=1 reverts to the pre-fix
+            // single-deref behaviour for A/B comparison and bisecting
+            // downstream regressions exposed by the deeper chase.
+            static const bool s_noChase =
+                std::getenv("NIX_V3_NO_WITH_SLOT_CHASE") != nullptr;
+            if (s_noChase) {
+                // Pre-fix behaviour: one deref; if result is also a
+                // Slot or non-attrset, skip this with-entry.
+                Value derefed = *p;
+                if (derefed.isThunk() || derefed.tag() == Tag::App) {
+                    try { derefed = forceValue(vm, derefed); }
+                    catch (const BlackholeError &) { anyBlackholed = true; continue; }
+                }
+                if (!derefed.isAttrs()) continue;
+                if (auto * v = derefed.payload.bindings->lookup(name))
+                    return *v;
+                continue;
+            }
+            static const int kChainLimit = []() {
+                if (const char * e = std::getenv("NIX_V3_WITH_CHAIN_LIMIT"))
+                    return std::max(1, std::atoi(e));
+                return 64;
+            }();
+            static thread_local std::vector<Value *> visitedBuf;
+            visitedBuf.clear();
+            Value derefed = w;  // start from `w` (which IS a Slot here)
+            bool chase_cycle = false;
+            bool chase_overflow = false;
+            while (derefed.tag() == Tag::Slot) {
+                Value * q = derefed.payload.slot;
+                if (!q) { derefed.mkNull(); break; }
+                bool seen = false;
+                for (Value * v : visitedBuf) {
+                    if (v == q) { seen = true; break; }
+                }
+                if (seen) { chase_cycle = true; break; }
+                if ((int)visitedBuf.size() >= kChainLimit) {
+                    visitedBuf.push_back(q);
+                    chase_overflow = true;
+                    break;
+                }
+                visitedBuf.push_back(q);
+                derefed = *q;
+            }
+            if (chase_overflow) {
+                const auto & symTab2 = ir::globalSymbolTable();
+                std::string nm2 = name < symTab2.size()
+                    ? symTab2[name] : "<?>";
+                std::string chainDump;
+                char ptrBuf[40];
+                for (size_t i = 0; i < visitedBuf.size(); ++i) {
+                    if (i) chainDump += " -> ";
+                    std::snprintf(ptrBuf, sizeof ptrBuf,
+                        "SLOT(%p)", (void *)visitedBuf[i]);
+                    chainDump += ptrBuf;
+                }
+                throw std::runtime_error(
+                    "v3 OP_WITH_LOOKUP: with-scope Slot chain depth "
+                    "exceeded " + std::to_string(kChainLimit)
+                    + " while resolving '" + nm2
+                    + "'.  Try NIX_V3_WITH_CHAIN_LIMIT="
+                    + std::to_string(kChainLimit * 2)
+                    + " (or higher).  Chain: " + chainDump);
+            }
+            if (chase_cycle) {
+                // Treat unresolvable chain like a blackholed entry —
+                // skip this scope but mark anyBlackholed so outer
+                // logic reports infinite-recursion correctly when no
+                // other scope defines the name.
+                anyBlackholed = true;
+                continue;
+            }
             // #548c STG-style partial-Bindings peek: BEFORE forcing,
             // check if `derefed` is a Black thunk whose construction
             // has registered partial Bindings via
