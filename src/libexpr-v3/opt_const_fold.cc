@@ -348,6 +348,22 @@ void optimise(Module & m)
     // form is itself in canonical IR shape.
     genListUnroll(m);
 
+    // 2026-05-18 IR Phase F: static App-spine folding.  Collapses
+    // curried multi-arg chains (`(x: y: z: x+y+z) 1 2 3` → `1+2+3`)
+    // in a single rewrite, eliminating intermediate PartialApp
+    // allocations.  Runs AFTER Phase A's single-step beta-reduce so
+    // any 1-arg inlinings that Phase A already handled don't bloat
+    // the spines this pass walks.  If folds fired, re-run the
+    // cleanup chain (elimRedundantForce removes the lowerer's
+    // Force-on-param-access wrappers that the cloned body inherits;
+    // then constantFold can see arithmetic on literals; then
+    // inlineTrivialBindings collapses the VarRef aliases).
+    if (appSpineFold(m)) {
+        elimRedundantForce(m);
+        constantFold(m);
+        inlineTrivialBindings(m);
+    }
+
     // OPT_OCCUR Phase B: opt-in occurrence-info-driven DCE.  When both
     // gates are set, run side-by-side and assert identical removal
     // sets (the migration-validation harness).  When only NIX_V3_OCCUR_DCE

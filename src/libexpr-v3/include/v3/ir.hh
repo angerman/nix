@@ -824,6 +824,15 @@ size_t ifThenFold(Module & m);
 /// genList calls unrolled.
 size_t genListUnroll(Module & m);
 
+/// IR Phase F (2026-05-18): static App-spine folding.  Recognises
+/// curried call chains `App(App(...App(f, a0), ...), a_N-1)` where
+/// `f` resolves to a Lambda whose body is an N-deep canonical
+/// curried-Lambda chain and all `a_i` are PURE.  Substitutes all N
+/// args into the deepest body in one shot, eliminating N-1
+/// PartialApp allocations.  Gate: NIX_V3_NO_APP_SPINE_FOLD=1
+/// disables.  Returns the number of spines folded.
+size_t appSpineFold(Module & m);
+
 /// #429: fuse App-chains over LitPrimOp into a single PrimOpCall.
 /// Detects the let/inherit-from indirection pattern that escapes
 /// lowerCall's direct-recognition (e.g. `let inherit (builtins) map;
