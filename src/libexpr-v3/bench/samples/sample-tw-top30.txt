@@ -1,0 +1,35 @@
+=== tw — top 30 hot leaves (Self time samples) ===
+Sort by top of stack, same collapsed (when >= 5):
+        __psynch_cvwait  (in libsystem_kernel.dylib)        3031
+        __workq_kernreturn  (in libsystem_kernel.dylib)        1299
+        __sigwait  (in libsystem_kernel.dylib)        433
+        read  (in libsystem_kernel.dylib)        203
+        yylex(nix::parser::BisonParser::value_type*, nix::ParserLocation*, void*, nix::ParserState*)  (in libnixexpr.2.35.0.dylib)        14
+        __open_nocancel  (in libsystem_kernel.dylib)        13
+        __getdirentries64  (in libsystem_kernel.dylib)        12
+        __open  (in libsystem_kernel.dylib)        11
+        nix::parser::BisonParser::parse()  (in libnixexpr.2.35.0.dylib)        8
+        <deduplicated_symbol>  (in libsystem_malloc.dylib)        6
+        _xzm_free  (in libsystem_malloc.dylib)        6
+        write  (in libsystem_kernel.dylib)        6
+        nix::Bindings::iterator::operator++()  (in libnixexpr.2.35.0.dylib)        5
+        nix::EvalState::callFunction(nix::Value&, std::span<nix::Value*, 18446744073709551615ul>, nix::Value&, nix::PosIdx)  (in libnixexpr.2.35.0.dylib)        5
+        nix::ExprSelect::eval(nix::EvalState&, nix::Env&, nix::Value&)  (in libnixexpr.2.35.0.dylib)        5
+        nix::ExprVar::eval(nix::EvalState&, nix::Env&, nix::Value&)  (in libnixexpr.2.35.0.dylib)        5
+        nix::ExprVar::maybeThunk(nix::EvalState&, nix::Env&)  (in libnixexpr.2.35.0.dylib)        5
+        nix::parser::BisonParser::basic_symbol<nix::parser::BisonParser::by_state>::clear()  (in libnixexpr.2.35.0.dylib)        5
+        std::__pop_heap[abi:se190102]<std::_RangeAlgPolicy, std::greater<nix::Bindings::iterator::BindingsCursor>, boost::container::vec_iterator<nix::Bindings::iterator::BindingsCursor*, false>>(boost::container::vec_iterator<nix::Bindings::iterator::BindingsCursor*, false>, boost::container::vec_iterator<nix::Bindings::iterator::BindingsCursor*, false>, std::greater<nix::Bindings::iterator::BindingsCursor>&, std::iterator_traits<boost::container::vec_iterator<nix::Bindings::iterator::BindingsCursor*, false>>::difference_type)  (in libnixexpr.2.35.0.dylib)        5
+
+Binary Images:
+       0x100ba0000 -        0x100dabffb +nix (0) <3418BA9A-CC9A-3D34-B566-742F74D76567> /Users/*/nix
+       0x1010ec000 -        0x1010effff +libboost_system.dylib (0) <4A3DE52D-E17D-32A1-B786-1439201FFC86> /Volumes/*/libboost_system.dylib
+       0x1010f4000 -        0x1010fbfff +libblake3.1.8.2.dylib (0) <87515E2C-6354-3E12-BE48-076A06A61D15> /Volumes/*/libblake3.1.8.2.dylib
+       0x101104000 -        0x101107fff +libboost_context.dylib (0) <C34D820A-B902-38C0-A265-9031DCA4AE59> /Volumes/*/libboost_context.dylib
+       0x101118000 -        0x101123ffb +libbrotlidec.1.1.0.dylib (0) <739315B6-CD85-3540-8198-A23F0A58F0EB> /Volumes/*/libbrotlidec.1.1.0.dylib
+       0x10112c000 -        0x10112ffff +libcharset.1.dylib (0) <3DEA980B-B19B-31B3-BA37-26CFF1320629> /Volumes/*/libcharset.1.dylib
+       0x10113c000 -        0x10113ffff +libboost_random.dylib (0) <96118362-986B-331C-92FD-9089EAC0E6F4> /Volumes/*/libboost_random.dylib
+       0x10114c000 -        0x10115bff7 +libboost_iostreams.dylib (0) <859DBF51-6D19-301C-AD31-34D4CA7475A7> /Volumes/*/libboost_iostreams.dylib
+       0x10116c000 -        0x10119fff3 +libnixmain.2.35.0.dylib (0) <6702344F-891B-334A-A63E-D908B262EEC6> /Users/*/libnixmain.2.35.0.dylib
+       0x1011f0000 -        0x101233ff7 +libsodium.26.dylib (0) <03EAFFF1-3444-3FC7-8CFD-A30189FC5CCA> /Volumes/*/libsodium.26.dylib
+       0x10124c000 -        0x10125bffb +libbz2.1.dylib (0) <5DE5E18B-217B-398D-9C12-C57A3B3BF4B2> /Volumes/*/libbz2.1.dylib
+

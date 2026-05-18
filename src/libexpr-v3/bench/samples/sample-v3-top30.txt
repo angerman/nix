@@ -1,0 +1,35 @@
+=== v3 — top 30 hot leaves (Self time samples) ===
+Sort by top of stack, same collapsed (when >= 5):
+        __psynch_cvwait  (in libsystem_kernel.dylib)        4837
+        __workq_kernreturn  (in libsystem_kernel.dylib)        1382
+        __sigwait  (in libsystem_kernel.dylib)        691
+        std::__hash_table<std::__hash_value_type<nix::v3::PosKey, unsigned int>>::find<nix::v3::PosKey>(nix::v3::PosKey const&)  (in libnixexprv3.dylib)        39
+        _xzm_free  (in libsystem_malloc.dylib)        34
+        read  (in libsystem_kernel.dylib)        29
+        nix::v3::(anonymous namespace)::primIntersectAttrs(nix::v3::EvalState&, nix::v3::Value*, nix::v3::Value&)  (in libnixexprv3.dylib)        25
+        _xzm_xzone_malloc  (in libsystem_malloc.dylib)        23
+        std::__hash_table<std::__hash_value_type<nix::v3::PosKey, unsigned int>>::__emplace_unique_key_args<nix::v3::PosKey, std::piecewise_construct_t const&, std::tuple<nix::v3::PosKey&&>, std::tuple<>>(nix::v3::PosKey const&, std::piecewise_construct_t const&, std::tuple<nix::v3::PosKey&&>&&, std::tuple<>&&)  (in libnixexprv3.dylib)        23
+        ???  (in libnixexprv3.dylib)  load address 0x104c40000 + 0x8404  [0x104c48404]        22
+        nix::v3::(anonymous namespace)::dispatchLoop(nix::v3::VMState&, unsigned long)  (in libnixexprv3.dylib)        22
+        <deduplicated_symbol>  (in libsystem_malloc.dylib)        21
+        nix::v3::(anonymous namespace)::mergeBindings(nix::v3::Bindings const*, nix::v3::Bindings const*)::'lambda'()::operator()() const  (in libnixexprv3.dylib)        18
+        _free  (in libsystem_malloc.dylib)        17
+        _platform_memmove  (in libsystem_platform.dylib)        17
+        __open_nocancel  (in libsystem_kernel.dylib)        15
+        _platform_memset  (in libsystem_platform.dylib)        15
+        std::__hash_table<std::__hash_value_type<unsigned int, std::variant<nix::v3::ir::LitInt, nix::v3::ir::LitFloat, nix::v3::ir::LitBool, nix::v3::ir::LitNull, nix::v3::ir::LitString, nix::v3::ir::LitPath, nix::v3::ir::VarRef, nix::v3::ir::WithLookup, nix::v3::ir::Lambda, nix::v3::ir::App, nix::v3::ir::Force, nix::v3::ir::MkThunk, nix::v3::ir::AttrSelect, nix::v3::ir::AttrSelectDyn, nix::v3::ir::HasAttr, nix::v3::ir::HasAttrDyn, nix::v3::ir::AttrSet, nix::v3::ir::AttrSetSetInheritFrom, nix::v3::ir::AttrSetDyn, nix::v3::ir::RecBindingSlotRef, nix::v3::ir::ListExpr, nix::v3::ir::ConcatLists, nix::v3::ir::If, nix::v3::ir::With, nix::v3::ir::Assert, nix::v3::ir::ConcatStrings, nix::v3::ir::Not, nix::v3::ir::Add, nix::v3::ir::Sub, nix::v3::ir::Mul, nix::v3::ir::Div, nix::v3::ir::Eq, nix::v3::ir::NEq, nix::v3::ir::Less, nix::v3::ir::And, nix::v3::ir::Or, nix::v3::ir::Impl, nix::v3::ir::Update, nix::v3::ir::PrimOpCall, nix::v3::ir::LitPrimOp, nix::v3::ir::LitBuiltins, nix::v3::ir::LetRec> const*>>::__emplace_unique_key_args<unsigned int, unsigned int const&, std::variant<nix::v3::ir::LitInt, nix::v3::ir::LitFloat, nix::v3::ir::LitBool, nix::v3::ir::LitNull, nix::v3::ir::LitString, nix::v3::ir::LitPath, nix::v3::ir::VarRef, nix::v3::ir::WithLookup, nix::v3::ir::Lambda, nix::v3::ir::App, nix::v3::ir::Force, nix::v3::ir::MkThunk, nix::v3::ir::AttrSelect, nix::v3::ir::AttrSelectDyn, nix::v3::ir::HasAttr, nix::v3::ir::HasAttrDyn, nix::v3::ir::AttrSet, nix::v3::ir::AttrSetSetInheritFrom, nix::v3::ir::AttrSetDyn, nix::v3::ir::RecBindingSlotRef, nix::v3::ir::ListExpr, nix::v3::ir::ConcatLists, nix::v3::ir::If, nix::v3::ir::With, nix::v3::ir::Assert, nix::v3::ir::ConcatStrings, nix::v3::ir::Not, nix::v3::ir::Add, nix::v3::ir::Sub, nix::v3::ir::Mul, nix::v3::ir::Div, nix::v3::ir::Eq, nix::v3::ir::NEq, nix::v3::ir::Less, nix::v3::ir::And, nix::v3::ir::Or, nix::v3::ir::Impl, nix::v3::ir::Update, nix::v3::ir::PrimOpCall, nix::v3::ir::LitPrimOp, nix::v3::ir::LitBuiltins, nix::v3::ir::LetRec> const*>(unsigned int const&, unsigned int const&, std::variant<nix::v3::ir::LitInt, nix::v3::ir::LitFloat, nix::v3::ir::LitBool, nix::v3::ir::LitNull, nix::v3::ir::LitString, nix::v3::ir::LitPath, nix::v3::ir::VarRef, nix::v3::ir::WithLookup, nix::v3::ir::Lambda, nix::v3::ir::App, nix::v3::ir::Force, nix::v3::ir::MkThunk, nix::v3::ir::AttrSelect, nix::v3::ir::AttrSelectDyn, nix::v3::ir::HasAttr, nix::v3::ir::HasAttrDyn, nix::v3::ir::AttrSet, nix::v3::ir::AttrSetSetInheritFrom, nix::v3::ir::AttrSetDyn, nix::v3::ir::RecBindingSlotRef, nix::v3::ir::ListExpr, nix::v3::ir::ConcatLists, nix::v3::ir::If, nix::v3::ir::With, nix::v3::ir::Assert, nix::v3::ir::ConcatStrings, nix::v3::ir::Not, nix::v3::ir::Add, nix::v3::ir::Sub, nix::v3::ir::Mul, nix::v3::ir::Div, nix::v3::ir::Eq, nix::v3::ir::NEq, nix::v3::ir::Less, nix::v3::ir::And, nix::v3::ir::Or, nix::v3::ir::Impl, nix::v3::ir::Update, nix::v3::ir::PrimOpCall, nix::v3::ir::LitPrimOp, nix::v3::ir::LitBuiltins, nix::v3::ir::LetRec> const*&&)  (in libnixexprv3.dylib)        15
+        std::__hash_table<unsigned int>::__emplace_unique_key_args<unsigned int, unsigned int const&>(unsigned int const&, unsigned int const&)  (in libnixexprv3.dylib)        12
+        __open  (in libsystem_kernel.dylib)        11
+        __bzero  (in libsystem_platform.dylib)        10
+        DYLD-STUB$$free  (in libc++abi.dylib)        9
+        __getdirentries64  (in libsystem_kernel.dylib)        8
+        nix::v3::CompilationUnit::~CompilationUnit()  (in libnixexprv3.dylib)        8
+        std::vector<std::basic_string<char>>::__append(unsigned long)  (in libnixexprv3.dylib)        8
+        _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib)        7
+        nix::v3::(anonymous namespace)::mergeBindings(nix::v3::Bindings const*, nix::v3::Bindings const*)::'lambda0'()::operator()() const  (in libnixexprv3.dylib)        7
+        std::vector<std::basic_string<char>>::__assign_with_size[abi:se190102]<std::basic_string<char>*, std::basic_string<char>*>(std::basic_string<char>*, std::basic_string<char>*, long)  (in libnixexprv3.dylib)        7
+        yylex(nix::parser::BisonParser::value_type*, nix::ParserLocation*, void*, nix::ParserState*)  (in libnixexpr.2.35.0.dylib)        7
+        ???  (in libnixexprv3.dylib)  load address 0x104c40000 + 0x8474  [0x104c48474]        6
+        _platform_memcmp  (in libsystem_platform.dylib)        6
+        _tlv_get_addr  (in libdyld.dylib)        6
+

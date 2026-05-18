@@ -1,0 +1,34 @@
+=== hello.drvPath sample — top 30 hot leaves ===
+Sort by top of stack, same collapsed (when >= 5):
+        __psynch_cvwait  (in libsystem_kernel.dylib)        39669
+        __workq_kernreturn  (in libsystem_kernel.dylib)        5772
+        __sigwait  (in libsystem_kernel.dylib)        5667
+        __bzero  (in libsystem_platform.dylib)        4562
+        GC_allochblk_nth  (in libgc.1.dylib)        216
+        GC_freehblk  (in libgc.1.dylib)        171
+        mach_absolute_time  (in libsystem_kernel.dylib)        114
+        nix::v3::(anonymous namespace)::treeWalkerToV3(nix::v3::EvalState&, nix::Value&, std::unordered_map<void const*, nix::v3::Value>&)  (in libnixexprv3.dylib)        63
+        _platform_memmove  (in libsystem_platform.dylib)        28
+        nix::EvalState::callFunction(nix::Value&, std::span<nix::Value*, 18446744073709551615ul>, nix::Value&, nix::PosIdx)  (in libnixexpr.2.35.0.dylib)        26
+        _xzm_free  (in libsystem_malloc.dylib)        22
+        nix::EvalState::allocValue()  (in libnixexprv3.dylib)        22
+        nix::v3::(anonymous namespace)::v3ToTreeWalker(nix::v3::EvalState&, nix::v3::Value, std::unordered_map<void const*, nix::Value*>&)  (in libnixexprv3.dylib)        22
+        _platform_memset  (in libsystem_platform.dylib)        20
+        _tlv_get_addr  (in libdyld.dylib)        19
+        GC_generic_malloc_many  (in libgc.1.dylib)        16
+        nix::v3::(anonymous namespace)::primV3ForceAttrInner(nix::EvalState&, nix::PosIdx, nix::Value**, nix::Value&)  (in libnixexprv3.dylib)        14
+        nix::v3::forceValue(nix::v3::VMState&, nix::v3::Value)  (in libnixexprv3.dylib)        14
+        <deduplicated_symbol>  (in libsystem_malloc.dylib)        13
+        _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib)        13
+        nix::v3::ForceChainGuard::ForceChainGuard(nix::v3::ForceChainOp, unsigned long long, unsigned long long)  (in libnixexprv3.dylib)        12
+        GC_generic_malloc_uncollectable  (in libgc.1.dylib)        11
+        nix::SymbolTable::create(std::basic_string_view<char>)  (in libnixexprv3.dylib)        11
+        nix::v3::ForceChainGuard::~ForceChainGuard()  (in libnixexprv3.dylib)        11
+        pthread_mutex_lock  (in libsystem_pthread.dylib)        11
+        nix::v3::yieldForceTreeWalker(nix::EvalState&, nix::Value&)  (in libnixexprv3.dylib)        10
+        _xzm_segment_group_span_mark_smaller  (in libsystem_malloc.dylib)        9
+        _xzm_xzone_malloc  (in libsystem_malloc.dylib)        9
+        _platform_memcmp  (in libsystem_platform.dylib)        8
+        ???  (in libnixexprv3.dylib)  load address 0x1025d4000 + 0x8450  [0x1025dc450]        7
+        nix::Value::mkString(std::basic_string_view<char>, nix::EvalMemory&)  (in libnixexpr.2.35.0.dylib)        7
+        setup_header  (in libgc.1.dylib)        7

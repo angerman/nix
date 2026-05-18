@@ -1,0 +1,35 @@
+=== v3-noopt — top 30 hot leaves (Self time samples) ===
+Sort by top of stack, same collapsed (when >= 5):
+        __psynch_cvwait  (in libsystem_kernel.dylib)        6167
+        __workq_kernreturn  (in libsystem_kernel.dylib)        1762
+        __sigwait  (in libsystem_kernel.dylib)        881
+        read  (in libsystem_kernel.dylib)        296
+        std::__hash_table<std::__hash_value_type<nix::v3::PosKey, unsigned int>>::find<nix::v3::PosKey>(nix::v3::PosKey const&)  (in libnixexprv3.dylib)        45
+        nix::v3::(anonymous namespace)::dispatchLoop(nix::v3::VMState&, unsigned long)  (in libnixexprv3.dylib)        29
+        _xzm_free  (in libsystem_malloc.dylib)        27
+        _platform_memmove  (in libsystem_platform.dylib)        24
+        ???  (in libnixexprv3.dylib)  load address 0x102c7c000 + 0x8404  [0x102c84404]        19
+        nix::v3::(anonymous namespace)::mergeBindings(nix::v3::Bindings const*, nix::v3::Bindings const*)::'lambda'()::operator()() const  (in libnixexprv3.dylib)        17
+        __open  (in libsystem_kernel.dylib)        16
+        yylex(nix::parser::BisonParser::value_type*, nix::ParserLocation*, void*, nix::ParserState*)  (in libnixexpr.2.35.0.dylib)        16
+        __open_nocancel  (in libsystem_kernel.dylib)        14
+        nix::v3::(anonymous namespace)::primIntersectAttrs(nix::v3::EvalState&, nix::v3::Value*, nix::v3::Value&)  (in libnixexprv3.dylib)        13
+        std::__hash_table<std::__hash_value_type<nix::v3::PosKey, unsigned int>>::__emplace_unique_key_args<nix::v3::PosKey, std::piecewise_construct_t const&, std::tuple<nix::v3::PosKey&&>, std::tuple<>>(nix::v3::PosKey const&, std::piecewise_construct_t const&, std::tuple<nix::v3::PosKey&&>&&, std::tuple<>&&)  (in libnixexprv3.dylib)        13
+        std::vector<std::basic_string<char>>::__assign_with_size[abi:se190102]<std::basic_string<char>*, std::basic_string<char>*>(std::basic_string<char>*, std::basic_string<char>*, long)  (in libnixexprv3.dylib)        13
+        _xzm_xzone_malloc  (in libsystem_malloc.dylib)        12
+        std::__hash_table<unsigned int>::__emplace_unique_key_args<unsigned int, unsigned int const&>(unsigned int const&, unsigned int const&)  (in libnixexprv3.dylib)        11
+        nix::parser::BisonParser::parse()  (in libnixexpr.2.35.0.dylib)        10
+        nix::v3::(anonymous namespace)::mergeBindings(nix::v3::Bindings const*, nix::v3::Bindings const*)::'lambda0'()::operator()() const  (in libnixexprv3.dylib)        10
+        _free  (in libsystem_malloc.dylib)        9
+        <deduplicated_symbol>  (in libsystem_malloc.dylib)        7
+        __findenv_locked  (in libsystem_c.dylib)        7
+        __getdirentries64  (in libsystem_kernel.dylib)        7
+        nix::v3::CompilationUnit::~CompilationUnit()  (in libnixexprv3.dylib)        7
+        operator new(unsigned long)  (in libc++abi.dylib)        7
+        _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib)        6
+        nix::parser::BisonParser::basic_symbol<nix::parser::BisonParser::by_state>::clear()  (in libnixexpr.2.35.0.dylib)        6
+        nix::v3::(anonymous namespace)::Lowerer::lowerExpr(nix::Expr*)  (in libnixexprv3.dylib)        6
+        std::__tree_balance_after_insert[abi:se190102]<std::__tree_node_base<void*>*>(std::__tree_node_base<void*>*, std::__tree_node_base<void*>*)  (in libnixexpr.2.35.0.dylib)        6
+        ???  (in libnixexprv3.dylib)  load address 0x102c7c000 + 0x842c  [0x102c8442c]        5
+        ???  (in libnixexprv3.dylib)  load address 0x102c7c000 + 0x8474  [0x102c84474]        5
+
