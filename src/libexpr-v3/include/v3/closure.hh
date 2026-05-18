@@ -264,6 +264,35 @@ struct LambdaDescriptor
     /// only; gated behind V3_DBG_ALLOC_DUMP for zero cost otherwise.
     mutable uint64_t callCount = 0;
 
+    /// IR Phase D (2026-05-18): closure-free lambda lifting.
+    ///
+    /// When `nUpvalues == 0` AND `nWithTargets == 0`, every
+    /// OP_MAKE_CLOSURE invocation for this descriptor produces a
+    /// semantically identical Closure: same `desc`, same `cu`,
+    /// `nUpvalues=0`, no upvalues, and `capturedWiths=nullptr` (the
+    /// body has no lexically captured `with` to look up — guaranteed
+    /// by the lowerer's `ir::Lambda::lexicalWiths.empty()` check).
+    ///
+    /// We intern by caching the FIRST allocated Closure here; every
+    /// subsequent OP_MAKE_CLOSURE returns the cached pointer.  Skips
+    /// one `Alloc::allocClosure(0)` + `snapshotCurrentWiths(vm)`
+    /// per creation site, which adds up under loop-heavy patterns
+    /// like `map (x: x * 2) ...` or `foldl' (a: b: a + b) ...` where
+    /// the inner lambda's outer captureless layer re-allocates per
+    /// element under broken sharing.
+    ///
+    /// `mutable` for the same reason as the other instrumentation
+    /// fields below: OP_MAKE_CLOSURE sees `cu` as `const` so reaches
+    /// the descriptor as `const &`; the cache slot is runtime state,
+    /// not part of the descriptor's logical identity.  Single-threaded
+    /// VM — no atomics needed.  Lifetime is bounded by the
+    /// CompilationUnit: when the CU is dropped, the descriptor goes
+    /// with it and the cached Closure becomes unreachable (Boehm GC
+    /// collects it on the next sweep).
+    ///
+    /// Disabled via NIX_V3_NO_LAMBDA_LIFT=1 (A/B gate).
+    mutable Closure * cachedSingletonClosure = nullptr;
+
     /// #424: selector lambda specialisation.  When non-zero, the
     /// lambda body is exactly `paramVar.<selectorSym>` -- the emit-
     /// time peephole detected the canonical bytecode shape:

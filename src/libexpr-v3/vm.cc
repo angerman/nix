@@ -2184,6 +2184,62 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // of with-target Values pushed BELOW the upvalue block on
             // the value stack.
             uint16_t nWiths = static_cast<uint16_t>(cu->code[ip++]);
+
+            // IR Phase D (2026-05-18): closure-free lambda lifting.
+            // When nUp==0 && nWiths==0, the descriptor's body has no
+            // upvalues and no captured `with` (lowerer guarantees
+            // lexicalWiths.empty() implies the body's WithLookup chain
+            // doesn't reach any enclosing with).  Every invocation
+            // would produce a semantically identical Closure; intern
+            // a singleton in the descriptor and reuse it.
+            //
+            // Gate: NIX_V3_NO_LAMBDA_LIFT=1 disables the fast path
+            // (falls through to plain Alloc::allocClosure for A/B).
+            // Cached static so the env lookup happens once per
+            // process.  Single-threaded VM — no atomics needed.
+            static const bool s_noLift =
+                std::getenv("NIX_V3_NO_LAMBDA_LIFT") != nullptr;
+            if (__builtin_expect(nUp == 0 && nWiths == 0 && !s_noLift, 0)) {
+                const LambdaDescriptor & desc = cu->lambdas[funcIdx];
+                if (desc.cachedSingletonClosure) {
+                    Value v;
+                    v.mkClosure(desc.cachedSingletonClosure);
+                    push(vm, v);
+                    break;
+                }
+                Closure * c = Alloc::allocClosure(0);
+                allocStats().closuresAllocated++;
+                c->desc = &desc;
+                c->cu   = cu;
+                c->nUpvalues = 0;
+                // No upvalues to pop (nUp==0); no withs to pop (nWiths==0).
+                // The body cannot reach any enclosing `with` (lowerer
+                // computed lexicalWiths.empty()), so the absent
+                // capturedWiths is safe regardless of the runtime
+                // with-stack.  This intentionally differs from the
+                // generic path's snapshotCurrentWiths() fallback —
+                // that fallback exists for synthetic non-bytecode
+                // Closures (primop bridges); bytecode-emitted
+                // lambdas with nWiths==0 are guaranteed by the
+                // lowerer to be with-independent.
+                c->capturedWiths = nullptr;
+                desc.cachedSingletonClosure = c;
+
+                static const bool s_dbg =
+                    std::getenv("V3_DBG_LAMBDA_LIFT") != nullptr;
+                if (__builtin_expect(s_dbg, 0)) {
+                    std::fprintf(stderr,
+                        "v3 OP_MAKE_CLOSURE: intern %s "
+                        "(funcIdx=%u codeOff=%u) → %p\n",
+                        desc.name.empty() ? "<anon>" : desc.name.c_str(),
+                        funcIdx, desc.codeOffset, (void *)c);
+                }
+                Value v;
+                v.mkClosure(c);
+                push(vm, v);
+                break;
+            }
+
             Closure * c = Alloc::allocClosure(nUp);
             allocStats().closuresAllocated++;
             c->desc = &cu->lambdas[funcIdx];
