@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# v3 master test runner — invokes every regression suite in one place.
+#
+# Modes:
+#   ./all-v3-tests.sh              # default: "core" suite (~5 min)
+#   ./all-v3-tests.sh --core       # explicit core
+#   ./all-v3-tests.sh --full       # core + every run-*.sh repro (~15 min)
+#   ./all-v3-tests.sh --quick      # smoke only (~30 sec)
+#
+# Modes pick which tests run; per-test verbosity is set by V3_TEST_VERBOSE=1
+# (passed through to scripts that honour it).
+#
+# Exit codes:
+#   0   all suites passed
+#   1   any suite failed
+#   2   harness / preflight error
+#
+# Output: one line per suite with PASS / FAIL / SKIP markers; a final
+# summary table.  Per-suite stdout/stderr captured under
+# /tmp/v3-test-logs-<PID>/ for failure diagnostics.
+#
+# Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
+# Input Output Group.  SPDX-License-Identifier: Apache-2.0
+
+set -u
+
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+TEST_DIR="$ROOT/src/libexpr-v3/test"
+PROPERTY_DIR="$TEST_DIR/property"
+NIX="${NIX:-$ROOT/build/src/nix/nix}"
+V3_EVAL="${V3_EVAL:-$ROOT/build/src/libexpr-v3/v3-eval}"
+
+mode="core"
+case "${1:-}" in
+  --core)  mode="core"  ;;
+  --full)  mode="full"  ;;
+  --quick) mode="quick" ;;
+  "")      mode="core"  ;;
+  -h|--help)
+    sed -n '2,17p' "$0"
+    exit 0
+    ;;
+  *)
+    echo "all-v3-tests: unknown argument '$1' (try --help)" >&2
+    exit 2
+    ;;
+esac
+
+# Preflight — verify binaries exist.  If not, hint at what to build.
+if [[ ! -x "$NIX" ]]; then
+  echo "all-v3-tests: NIX not executable at $NIX" >&2
+  echo "  Build with: nix develop -c ninja -C build" >&2
+  exit 2
+fi
+if [[ ! -x "$V3_EVAL" ]]; then
+  echo "all-v3-tests: v3-eval not executable at $V3_EVAL" >&2
+  echo "  Build with: nix develop -c ninja -C build" >&2
+  exit 2
+fi
+
+# Portable temp dir: macOS mktemp's `-t` is a PREFIX (not template), so
+# use `--tmpdir` equivalent via explicit TMPDIR / fallback.  Both BSD
+# and GNU mktemp accept `-d <template-with-XXXXX>`.
+logdir="${TMPDIR:-/tmp}/v3-test-logs.$$"
+mkdir -p "$logdir" || {
+  echo "all-v3-tests: cannot create logdir $logdir" >&2
+  exit 2
+}
+echo "all-v3-tests: mode=$mode logdir=$logdir"
+echo
+
+# -- Test definitions ------------------------------------------------------
+#
+# Each entry: name|description|invocation
+# The runner captures stdout/stderr to $logdir/<name>.log and reports
+# PASS / FAIL based on exit status.
+
+declare -a SUITES=()
+
+# Quick (~30 sec) — smoke + parity + iterative-force
+# meson tests: invoke the test binaries directly so we don't depend on
+# `meson` being on $PATH (it lives inside nix develop's shell, not the
+# user's interactive env).  Each test() block in meson.build points at
+# one of these binaries.
+#
+# v3-smoke's disk-cache subtest writes to $NIX_V3_CACHE_DIR (or the user's
+# XDG cache when unset).  Scope it to the logdir so the test is hermetic
+# and isolated from prior runs that may have populated a shared cache.
+SUITES+=( "smoke|v3-smoke|NIX_V3_CACHE_DIR=$logdir/cache $ROOT/build/src/libexpr-v3/v3-smoke" )
+SUITES+=( "drv-preflight|libnixstore drvPath validation|$ROOT/build/src/libexpr-v3/v3-drv-preflight" )
+SUITES+=( "evalscope|EvalScope handle invalidation|$ROOT/build/src/libexpr-v3/v3-evalscope-handles" )
+SUITES+=( "iterative-force|deep let/curry/app-spine|NIX=$NIX $TEST_DIR/iterative-force-depth.sh" )
+SUITES+=( "derivation-parity|drvPath byte-equal vs TW|$TEST_DIR/derivation-parity.sh" )
+
+# Core (~5 min) — quick + lang + property + key repros
+if [[ "$mode" == "core" || "$mode" == "full" ]]; then
+  SUITES+=( "lang|143 functional/lang tests through v3|$TEST_DIR/run-lang-tests.sh" )
+  SUITES+=( "property|58 primop categories × 10 cases|$PROPERTY_DIR/run-property-tests.sh" )
+  SUITES+=( "let-rec-publish|#546 OP_ATTRS_REC_INIT split regression|NIX=$NIX $TEST_DIR/run-let-rec-publish-split-tests.sh" )
+  SUITES+=( "583-tag-app-cache|mapAttrs-style App cache regression|$TEST_DIR/run-583-tag-app-cache-tests.sh" )
+  # broader-thunkify: NOT included in core — the test still uses the
+  # retired NIX_USE_V3=1 cutover hook (deleted in e8d7c3885) and pins
+  # the pre-#497 failure mode behind NIX_V3_NO_COMPLEX_FROM_THUNK=1, a
+  # negative-test setup that's stale.  Re-add when the test is
+  # updated to use NIX_V3_DIRECT_EVAL=1 + a current gate.
+  #SUITES+=( "broader-thunkify|#496-498 broader-thunkify upvalue bug|$TEST_DIR/run-broader-thunkify-tests.sh" )
+  SUITES+=( "lint-no-inline-getenv|cached env-var lint|$TEST_DIR/lint-no-inline-getenv.sh" )
+fi
+
+# Full (~15 min) — every run-*.sh that exists.  Each script is responsible
+# for its own pass/fail semantics; if it exits 0 we mark PASS.
+if [[ "$mode" == "full" ]]; then
+  # Already-covered repros (above).  Skip in this loop to avoid double-run.
+  declare -A already_added
+  already_added[run-lang-tests.sh]=1
+  already_added[run-let-rec-publish-split-tests.sh]=1
+  already_added[run-583-tag-app-cache-tests.sh]=1
+  already_added[run-broader-thunkify-tests.sh]=1
+
+  for script in "$TEST_DIR"/run-*.sh; do
+    base="$(basename "$script")"
+    [[ -n "${already_added[$base]:-}" ]] && continue
+    # Some scripts are interactive / benchmarks — skip.
+    case "$base" in
+      run-v3-tests.sh)            ;;  # included below
+      bench-*)        continue ;;
+      *)              ;;
+    esac
+    name="${base%-tests.sh}"
+    name="${name#run-}"
+    SUITES+=( "$name|repro script $base|$script" )
+  done
+  SUITES+=( "v3-eval-tests|hand-rolled run-v3-tests.sh|BUILD=$ROOT/build $TEST_DIR/run-v3-tests.sh" )
+fi
+
+# -- Execute ---------------------------------------------------------------
+
+declare -i total=0 pass=0 fail=0
+declare -a failed_names=()
+
+for entry in "${SUITES[@]}"; do
+  name="${entry%%|*}"
+  rest="${entry#*|}"
+  desc="${rest%%|*}"
+  cmd="${rest#*|}"
+  total=$((total + 1))
+  log="$logdir/$name.log"
+  echo "  [$total] running $name ($desc)..."
+  if bash -c "$cmd" >"$log" 2>&1; then
+    pass=$((pass + 1))
+    echo "       PASS"
+  else
+    fail=$((fail + 1))
+    failed_names+=( "$name" )
+    echo "       FAIL  (log: $log)"
+    if [[ "${V3_TEST_VERBOSE:-0}" == "1" ]]; then
+      tail -20 "$log" | sed 's/^/         /'
+    fi
+  fi
+done
+
+# -- Summary ---------------------------------------------------------------
+
+echo
+echo "==================== summary ===================="
+echo "  mode:   $mode"
+echo "  total:  $total"
+echo "  pass:   $pass"
+echo "  fail:   $fail"
+echo "  logdir: $logdir"
+if (( fail > 0 )); then
+  echo "  failed: ${failed_names[*]}"
+  echo
+  echo "To re-run a single failed suite verbosely:"
+  echo "  V3_TEST_VERBOSE=1 $0 ${mode/--}"
+  exit 1
+fi
+echo "ALL GREEN"
+exit 0

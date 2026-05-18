@@ -41,8 +41,10 @@ run_case() {
   local expected="$3"
 
   local tw_out v3_out
-  tw_out="$("$NIX" --extra-experimental-features "nix-command" eval --impure --expr "$expr" 2>&1 || echo "<TW-ERROR>")"
-  v3_out="$(NIX_V3_DIRECT_EVAL=1 "$NIX" --extra-experimental-features "nix-command" eval --impure --expr "$expr" 2>&1 || echo "<V3-ERROR>")"
+  # Drop stderr: macOS link-time stack-bump emits a harmless warning
+  # that otherwise leaks into value comparison via 2>&1.
+  tw_out="$("$NIX" --extra-experimental-features "nix-command" eval --impure --expr "$expr" 2>/dev/null || echo "<TW-ERROR>")"
+  v3_out="$(NIX_V3_DIRECT_EVAL=1 "$NIX" --extra-experimental-features "nix-command" eval --impure --expr "$expr" 2>/dev/null || echo "<V3-ERROR>")"
 
   if [[ "$tw_out" != "$expected" ]]; then
     echo "FAIL [$name]: TW unexpected output: '$tw_out' (wanted '$expected')"

@@ -42,16 +42,21 @@ failures=0
 run_test() {
   local name="$1" expr="$2" expected="$3"
   local out rc
-  out=$(NIX_V3_DIRECT_EVAL=1 timeout -s KILL "$TIMEOUT" "$NIX" eval --impure --expr "$expr" 2>&1)
+  # Capture stdout ONLY for value comparison; stderr captured separately
+  # for diagnostics.  Without this split, the harmless macOS warning
+  # "Failed to increase stack size ..." (which lands on stderr) was
+  # leaking into the comparison via 2>&1.
+  local stdout stderr
+  stdout="$(NIX_V3_DIRECT_EVAL=1 timeout -s KILL "$TIMEOUT" "$NIX" eval --impure --expr "$expr" 2>/dev/null)"
   rc=$?
   if [[ $rc -ne 0 ]]; then
     echo "FAIL  $name (rc=$rc — likely C-stack overflow or timeout)" >&2
-    [[ "$VERBOSE" == "1" ]] && echo "$out" >&2
+    [[ "$VERBOSE" == "1" ]] && echo "$stdout" >&2
     failures=$((failures + 1))
     return
   fi
-  if [[ "$out" != "$expected" ]]; then
-    echo "FAIL  $name (got '$out', expected '$expected')" >&2
+  if [[ "$stdout" != "$expected" ]]; then
+    echo "FAIL  $name (got '$stdout', expected '$expected')" >&2
     failures=$((failures + 1))
     return
   fi
