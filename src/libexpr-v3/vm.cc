@@ -6032,8 +6032,36 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             d = frD.closure->desc;
                         const PosSnapshot * ps =
                             d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                        // For closure frames, peek at slot 0 (the lambda
+                        // param) — when it's a string, print its value.
+                        // This is the cheapest way to tell "envKeyValue
+                        // called with k=<which attr name>" without
+                        // instrumenting the wrapper itself.
+                        char argBuf[128] = "";
+                        if (frD.closure
+                            && frD.stackBaseOffset < vm.valueStack.size())
+                        {
+                            const Value & v0 = vm.valueStack[frD.stackBaseOffset];
+                            if (v0.tag() == Tag::String && v0.payload.str) {
+                                const char * s = v0.payload.str;
+                                std::snprintf(argBuf, sizeof(argBuf),
+                                              " arg0=\"%.96s\"", s);
+                            } else if (v0.tag() == Tag::Int) {
+                                std::snprintf(argBuf, sizeof(argBuf),
+                                              " arg0=%lld", (long long)v0.payload.i);
+                            } else if (v0.tag() == Tag::Bool) {
+                                std::snprintf(argBuf, sizeof(argBuf),
+                                              " arg0=%s",
+                                              v0.payload.i == 1 ? "true" : "false");
+                            } else if (v0.tag() == Tag::Null) {
+                                std::snprintf(argBuf, sizeof(argBuf), " arg0=null");
+                            } else {
+                                std::snprintf(argBuf, sizeof(argBuf),
+                                              " arg0=<tag=%d>", (int)v0.tag());
+                            }
+                        }
                         std::fprintf(stderr,
-                            "  [%zu] %s ip=%u thunk=%p flags=%u %s:%u:%u\n",
+                            "  [%zu] %s ip=%u thunk=%p flags=%u %s:%u:%u%s\n",
                             fi - 1,
                             d && !d->name.empty() ? d->name.c_str() : "<?>",
                             frD.ip,
@@ -6041,7 +6069,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             (unsigned)frD.flags,
                             (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
                             ps ? ps->line : 0u,
-                            ps ? ps->column : 0u);
+                            ps ? ps->column : 0u,
+                            argBuf);
                     }
                     std::fflush(stderr);
                 }
