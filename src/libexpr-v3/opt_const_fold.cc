@@ -327,6 +327,18 @@ void optimise(Module & m)
     // pattern match.
     streamFusion(m);
 
+    // 2026-05-18 IR Phase G: pure if-then-else folding.  Recognises
+    // `If(LitBool, then, else)` patterns and inlines the chosen
+    // branch.  Runs AFTER Phase B's constantFold loop so any
+    // condition exposed by primOpFold (e.g. `if builtins.length [] == 0
+    // then a else b`) has resolved to a literal.  Then re-run
+    // constantFold + inlineTrivialBindings to propagate the inlined
+    // VarRef chain through the surrounding bindings.
+    if (ifThenFold(m)) {
+        constantFold(m);
+        inlineTrivialBindings(m);
+    }
+
     // OPT_OCCUR Phase B: opt-in occurrence-info-driven DCE.  When both
     // gates are set, run side-by-side and assert identical removal
     // sets (the migration-validation harness).  When only NIX_V3_OCCUR_DCE

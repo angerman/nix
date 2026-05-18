@@ -807,6 +807,14 @@ size_t primOpFold(Module & m);
 /// foldl' bindings rewritten.
 size_t streamFusion(Module & m);
 
+/// IR Phase G (2026-05-18): pure if-then-else folding.  Recognises
+/// `If(LitBool, thenBlock, elseBlock)` patterns and rewrites the
+/// binding to inline the chosen block's bindings + a VarRef to the
+/// chosen block's TermReturn target.  Eliminates the OP_BRANCH_FALSE
+/// emit + the discarded branch's bytecode.  Gate: NIX_V3_NO_IF_FOLD=1
+/// disables.  Returns the number of If bindings folded.
+size_t ifThenFold(Module & m);
+
 /// #429: fuse App-chains over LitPrimOp into a single PrimOpCall.
 /// Detects the let/inherit-from indirection pattern that escapes
 /// lowerCall's direct-recognition (e.g. `let inherit (builtins) map;
