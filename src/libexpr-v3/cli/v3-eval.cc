@@ -32,6 +32,7 @@
 #include "v3/vm.hh"
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/bytecode_primops.hh"
 #include "v3/disasm.hh"
 #include "v3/ir.hh"
 #include "v3/ir_dump.hh"
@@ -263,6 +264,22 @@ int main(int argc, char ** argv)
         // Phase 1.6: read NIX_V3_MAX_HEAP / NIX_V3_MAX_CPU_TIME /
         // NIX_V3_MAX_WALL_TIME and arm the dispatch-loop poll.
         nix::v3::initLimits();
+
+        // 2026-05-18: install bytecode-primop replacements BEFORE
+        // lowering the user expression.  v3-eval was historically
+        // calling lowerNixExpr + compile + run directly (bypassing
+        // runRootExpr), which meant `installAllBytecodePrimops` —
+        // the function that wires the bytecode wrapper for
+        // `derivationStrict` / `derivation` / `foldl'` / etc. — was
+        // never invoked.  Result: v3-eval calls fell into the C
+        // primops' C-recursive forceValue helpers and SIGBUS'd on
+        // deep nixpkgs eval, while `nix eval --impure` (which goes
+        // through runRootExpr) ran the same workload to completion.
+        // Gated by NIX_V3_NO_BYTECODE_PRIMOPS=1 for A/B testing.
+        static const bool s_noBytecodePrimops =
+            std::getenv("NIX_V3_NO_BYTECODE_PRIMOPS") != nullptr;
+        if (!s_noBytecodePrimops)
+            nix::v3::installAllBytecodePrimops(state);
 
         auto m = nix::v3::lowerNixExpr(e, state.symbols, state.positions);
 
