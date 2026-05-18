@@ -1,0 +1,252 @@
+{
+  "metadata": {
+    "date": "2026-05-18T17:31:12",
+    "git_rev": "b879623573e5b10c135647f53c0452ad9f3c9863",
+    "modes": [
+      "tw",
+      "v3-direct"
+    ],
+    "n": 3,
+    "nix_path": "/Users/angerman/Projects/iohk/nix/build/src/nix/nix",
+    "nixpkgs_path": "/nix/store/jfyir74ca49jbl4kx7idp5s6inm3vqn9-77dbgds155bbz3vd3qywq1sii07i5ljs-source",
+    "system": "arm64-darwin"
+  },
+  "results": [
+    {
+      "fail_count": 0,
+      "mode": "tw",
+      "n": 3,
+      "rss_max_b": 143196160,
+      "runs": [
+        {
+          "rc": 0,
+          "rss_max_b": 143147008,
+          "sys": 0.09,
+          "user": 0.29,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 0.6415682919323444
+        },
+        {
+          "rc": 0,
+          "rss_max_b": 143179776,
+          "sys": 0.08,
+          "user": 0.29,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 0.5629524579271674
+        },
+        {
+          "rc": 0,
+          "rss_max_b": 143196160,
+          "sys": 0.08,
+          "user": 0.29,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 0.5589338750578463
+        }
+      ],
+      "v3_run_ms_min": 0.0,
+      "wall": {
+        "mean": 0.587818208305786,
+        "min": 0.5589338750578463,
+        "p50": 0.5629524579271674,
+        "p95": 0.6415682919323444,
+        "stddev": 0.04659228336823508
+      },
+      "workload": "hello-drvpath"
+    },
+    {
+      "fail_count": 0,
+      "mode": "v3-direct",
+      "n": 3,
+      "rss_max_b": 614924288,
+      "runs": [
+        {
+          "rc": 0,
+          "rss_max_b": 612761600,
+          "sys": 0.16,
+          "user": 0.9,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 1.2644649581052363
+        },
+        {
+          "rc": 0,
+          "rss_max_b": 614924288,
+          "sys": 0.16,
+          "user": 0.89,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 1.3092884588986635
+        },
+        {
+          "rc": 0,
+          "rss_max_b": 612581376,
+          "sys": 0.17,
+          "user": 0.88,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.059,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.065,
+          "v3_run_ms": 0.091,
+          "wall": 1.2820447080302984
+        }
+      ],
+      "v3_run_ms_min": 0.091,
+      "wall": {
+        "mean": 1.2852660416780661,
+        "min": 1.2644649581052363,
+        "p50": 1.2820447080302984,
+        "p95": 1.3092884588986635,
+        "stddev": 0.022584713828102253
+      },
+      "workload": "hello-drvpath"
+    },
+    {
+      "fail_count": 0,
+      "mode": "tw",
+      "n": 3,
+      "rss_max_b": 143032320,
+      "runs": [
+        {
+          "rc": 0,
+          "rss_max_b": 143032320,
+          "sys": 0.08,
+          "user": 0.29,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 0.6060681662056595
+        },
+        {
+          "rc": 0,
+          "rss_max_b": 142917632,
+          "sys": 0.09,
+          "user": 0.29,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 0.6076904160436243
+        },
+        {
+          "rc": 0,
+          "rss_max_b": 142950400,
+          "sys": 0.09,
+          "user": 0.29,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 0.6046511249151081
+        }
+      ],
+      "v3_run_ms_min": 0.0,
+      "wall": {
+        "mean": 0.6061365690547973,
+        "min": 0.6046511249151081,
+        "p50": 0.6060681662056595,
+        "p95": 0.6076904160436243,
+        "stddev": 0.001520799741352207
+      },
+      "workload": "hello-outpath"
+    },
+    {
+      "fail_count": 0,
+      "mode": "v3-direct",
+      "n": 3,
+      "rss_max_b": 614875136,
+      "runs": [
+        {
+          "rc": 0,
+          "rss_max_b": 612827136,
+          "sys": 0.17,
+          "user": 0.89,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 1.2944271659944206
+        },
+        {
+          "rc": 0,
+          "rss_max_b": 612925440,
+          "sys": 0.17,
+          "user": 0.89,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.0,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.0,
+          "v3_run_ms": 0.0,
+          "wall": 1.3040790420491248
+        },
+        {
+          "rc": 0,
+          "rss_max_b": 614875136,
+          "sys": 0.16,
+          "user": 0.9,
+          "v3_bridge_ms": 0.0,
+          "v3_compile_ms": 0.082,
+          "v3_dispatch_insns": 0,
+          "v3_eval_entries": 0,
+          "v3_force_entries": 0,
+          "v3_lower_ms": 0.056,
+          "v3_run_ms": 0.108,
+          "wall": 1.2934257499873638
+        }
+      ],
+      "v3_run_ms_min": 0.108,
+      "wall": {
+        "mean": 1.2973106526769698,
+        "min": 1.2934257499873638,
+        "p50": 1.2944271659944206,
+        "p95": 1.3040790420491248,
+        "stddev": 0.0058829439504914285
+      },
+      "workload": "hello-outpath"
+    }
+  ]
+}

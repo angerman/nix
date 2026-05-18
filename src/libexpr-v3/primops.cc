@@ -3057,7 +3057,8 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
 /// on mid-construction entries (NixOS module fix-points' `config`)
 /// don't trip until the body would have hit them in TW too.
 } } // close anon + nix::v3 to declare at file scope
-namespace nix::v3 { bool shallowTWAttrsBridge(); }
+// `shallowTWAttrsBridge` forward declaration retired 2026-05-18 —
+// treeWalkerToV3 is now always shallow (see PROFILE_HELLO_NAME_2026-05-18.md).
 namespace nix::v3 { namespace {
 
 // #453 Phase D: bridge-primop call counters.  Atomics keep them off
@@ -4405,6 +4406,24 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         return out;
     }
     case nix::nList: {
+        // ALWAYS-SHALLOW (2026-05-18, Phase F architectural fix): wrap
+        // each TW list element's `Value *` in a v3 Bridge thunk.  The
+        // element only converts to a v3 Value when v3 actually accesses
+        // it (OP_HEAD / OP_ELEM_AT / OP_LENGTH on a forced spine etc.
+        // all go through forceValue which understands Tag::Bridge).
+        //
+        // Previously this case deep-recursed via treeWalkerToV3(state,
+        // *view[i], seen), which on derivation graphs (where every
+        // input contains the whole transitive closure of attrsets +
+        // lists) self-recurses 60+ frames deep and accounts for ~60%
+        // of CPU samples on hello.drvPath.  Sample evidence is in
+        // bench/samples/sample-drv-top30.txt; analysis is in
+        // PROFILE_HELLO_NAME_2026-05-18.md.
+        //
+        // The `seen` cache is retained so two references to the same
+        // TW Value in the same top-level conversion share one v3
+        // ListVec (cheap memory dedup); not for cycle-breaking
+        // anymore — without recursion there's no cycle to break.
         const void * key = &nv;
         if (auto it = seen.find(key); it != seen.end()) return it->second;
         size_t n = nv.listSize();
@@ -4412,20 +4431,16 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         allocStats().listsAllocated++;
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = lv;
-        seen[key] = out; // store before recursing
+        seen[key] = out;
         auto view = nv.listView();
         // #438 diagnostic: catch null list-element pointers BEFORE the
-        // dereference crash.  A tree-walker list whose backing storage
-        // has a null entry usually means either a v3-bridged list whose
-        // slot was never filled, or a tree-walker list whose elements
-        // were reclaimed by GC.  When V3_DEBUG_LIST_BRIDGE is set we
-        // log + abort with full context so the crash is attributable.
-        // Otherwise we fall through to the original dereference (so the
-        // SIGSEGV stack still pinpoints `Value::isThunk` for stack-trace
-        // tooling).
+        // dereference crash.  A null `view[i]` would usually crash
+        // inside the Bridge force; we abort early when
+        // V3_DEBUG_LIST_BRIDGE is set so the crash is attributable.
         static const bool s_dbg_list = std::getenv("V3_DEBUG_LIST_BRIDGE") != nullptr;
         for (size_t i = 0; i < n; ++i) {
-            if (__builtin_expect(s_dbg_list && view[i] == nullptr, 0)) [[unlikely]] {
+            nix::Value * twElem = view[i];
+            if (__builtin_expect(s_dbg_list && twElem == nullptr, 0)) [[unlikely]] {
                 std::fprintf(stderr,
                     "v3 treeWalkerToV3: NULL list elem at i=%zu of n=%zu "
                     "(parent list=%p)\n",
@@ -4433,7 +4448,23 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
                 std::fflush(stderr);
                 std::abort();
             }
-            lv->elems[i] = treeWalkerToV3(state, *view[i], seen);
+            if (twElem == nullptr) {
+                // Defensive: emit a null sentinel rather than crashing
+                // in alloc.  The element will fault on access — that's
+                // the existing "SIGSEGV pinpoints `Value::isThunk`"
+                // behaviour pre-fix.
+                Value nullV; nullV.mkNull();
+                lv->elems[i] = nullV;
+                continue;
+            }
+            // Wrap the TW element pointer in a Bridge thunk.  Forcing
+            // the thunk calls treeWalkerToV3 on `*twElem` lazily.
+            Thunk * t = Alloc::allocBridgeThunk(static_cast<void *>(twElem));
+            allocStats().thunksAllocated++;
+            Value entryVal;
+            entryVal.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+            entryVal.payload.thunk = t;
+            lv->elems[i] = entryVal;
         }
         return out;
     }
@@ -4457,16 +4488,28 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
             twSymCacheFor = &ns;
             twSymCache.clear();
         }
-        // #452 / Phase C: when the call hook sets the shallow-TW-attrs
-        // flag, wrap each entry's TW Value* in a v3 Bridge thunk
-        // instead of recursively converting.  Body forces of specific
-        // entries call treeWalkerToV3 lazily on just-that-value, which
-        // matches TW's `{a, b ? def}: body` lazy formal semantics --
-        // only entries the body references get materialised.  Critical
-        // for NixOS module fix-points where some entries (e.g. `config`)
-        // are mid-construction at the call site; deep conversion would
-        // trip ExprBlackHole on every call.
-        bool shallow = shallowTWAttrsBridge();
+        // ALWAYS-SHALLOW (2026-05-18, Phase F architectural fix):
+        // wrap every entry's TW Value* in a v3 Bridge thunk.  Body
+        // forces of specific entries call treeWalkerToV3 lazily on
+        // just-that-value, matching TW's `{a, b ? def}: body` lazy
+        // formal semantics — only entries the body references get
+        // materialised.
+        //
+        // Previously this case had two paths gated by
+        // `tlsShallowTWAttrsBridge`: the call-hook set the flag for
+        // closure-return conversions (added for #452 / Phase C) but
+        // every other treeWalkerToV3 caller went through the deep
+        // recursion, which on derivation graphs accounts for ~60%
+        // CPU on hello.drvPath and ~5% on hello.name (samples in
+        // bench/samples/, analysis in PROFILE_HELLO_NAME_2026-05-18.md).
+        // The shallow path was always correct (Bridge thunks force
+        // lazily, preserving TW lazy semantics); the deep path was
+        // an early eager-evaluation choice we can now retire.
+        //
+        // The `seen` cache is retained so repeated occurrences of the
+        // same TW Bindings share one v3 Tag::Attrs.  Cycle-breaking
+        // is no longer needed (no recursion); the cache is now
+        // purely a memory-dedup optimisation.
         std::vector<std::pair<SymbolId, Value>> entries;
         entries.reserve(a->size());
         for (auto & it : *a) {
@@ -4481,19 +4524,15 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
                     twSymCache.resize(k + 1, 0);
                 twSymCache[k] = sid;
             }
+            // Wrap the TW entry's Value* in a v3 Bridge thunk.  The
+            // body's per-attr access calls treeWalkerToV3 lazily on
+            // just-that-value when forced.
+            Thunk * t = Alloc::allocBridgeThunk(
+                static_cast<void *>(it.value));
+            allocStats().thunksAllocated++;
             Value entryVal;
-            if (shallow) {
-                // Wrap the TW entry's Value* in a v3 Bridge thunk.  No
-                // forcing now; the body's per-formal access will force
-                // (or not) on demand.
-                Thunk * t = Alloc::allocBridgeThunk(
-                    static_cast<void *>(it.value));
-                allocStats().thunksAllocated++;
-                entryVal.tag_payload = static_cast<uint64_t>(Tag::Thunk);
-                entryVal.payload.thunk = t;
-            } else {
-                entryVal = treeWalkerToV3(state, *it.value, seen);
-            }
+            entryVal.tag_payload = static_cast<uint64_t>(Tag::Thunk);
+            entryVal.payload.thunk = t;
             entries.emplace_back(sid, entryVal);
         }
         std::sort(entries.begin(), entries.end(),
@@ -7672,23 +7711,16 @@ PrimOpCounter & primOpCounter()
 }
 } // anonymous namespace
 
-// #452 / Phase C: shallow-TW-attrs-bridge flag.  When set,
-// treeWalkerToV3's nAttrs case
-// wraps each TW entry's Value* in a v3 Bridge thunk instead of
-// deeply converting.  Pushed by the call hook for the duration of
-// runLambda when the lambda has formals -- only entries the body
-// references get force-converted, matching TW's per-formal lazy
-// semantics.  Required to safely run NixOS-module-shape lambdas in
-// v3 where some param-attrset entries are mid-construction at the
-// call site (e.g. fix-point's `config`).
-thread_local bool tlsShallowTWAttrsBridge = false;
-bool shallowTWAttrsBridge() { return tlsShallowTWAttrsBridge; }
-bool pushShallowTWAttrsBridge() {
-    bool prev = tlsShallowTWAttrsBridge;
-    tlsShallowTWAttrsBridge = true;
-    return prev;
-}
-void popShallowTWAttrsBridge(bool prev) { tlsShallowTWAttrsBridge = prev; }
+// #452 / Phase C → 2026-05-18: the `tlsShallowTWAttrsBridge` flag
+// was retired when treeWalkerToV3 became always-shallow for both
+// nAttrs and nList cases.  The previous conditional (deep recursion
+// when the flag was unset) accounted for ~60% of CPU on hello.drvPath
+// per the sample profile, and the shallow path was always
+// semantically correct (Bridge thunks force lazily; force-time
+// conversion matches the original deep result).  pushShallowTWAttrsBridge
+// / popShallowTWAttrsBridge / shallowTWAttrsBridge symbols were
+// referenced only from vm.cc; their call sites are now no-ops.  See
+// PROFILE_HELLO_NAME_2026-05-18.md option #1.
 
 void bumpPrimOpCallCount(const PrimOp * po)
 {

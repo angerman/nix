@@ -54,12 +54,13 @@ namespace nix::v3 {
 nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
 Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
 
-// #483 part 4 forward decls: shallow-TW-attrs RAII helpers.  Defined
-// in primops.cc.  Wrap the OP_CALL Bridge result-bridge in a shallow
-// guard so that an attrset returned by the TW lambda is bridged with
-// per-entry Bridge thunks instead of recursive eager force.
-bool pushShallowTWAttrsBridge();
-void popShallowTWAttrsBridge(bool prev);
+// #483 part 4 → 2026-05-18: the shallow-TW-attrs RAII helpers retired
+// when treeWalkerToV3 became always-shallow for both nAttrs AND
+// nList cases.  The push/pop call sites below are now no-ops, kept
+// only until the next round of dead-code sweep.  See
+// PROFILE_HELLO_NAME_2026-05-18.md option #1 + the comment in
+// primops.cc treeWalkerToV3 nAttrs case for the architectural
+// reasoning.
 
 // WC-10: forward declaration at namespace scope so the `extern` use sites
 // inside the anonymous namespaces below resolve to nix::v3::forceBridgeThunk
@@ -3166,14 +3167,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     v3out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
                     v3out.payload.thunk = bridge;
                 } else {
-                    bool prev = pushShallowTWAttrsBridge();
-                    try {
-                        v3out = treeWalkerToV3Public(*ns, *outTwHeap);
-                    } catch (...) {
-                        popShallowTWAttrsBridge(prev);
-                        throw;
-                    }
-                    popShallowTWAttrsBridge(prev);
+                    // 2026-05-18: tlsShallowTWAttrsBridge push/pop
+                    // retired — treeWalkerToV3 is now always shallow.
+                    v3out = treeWalkerToV3Public(*ns, *outTwHeap);
                 }
                 push(vm, v3out);
                 break;
@@ -10133,15 +10129,9 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 v3out.payload.thunk = bridge;
                 return v3out;
             }
-            bool prev = pushShallowTWAttrsBridge();
-            try {
-                Value r = treeWalkerToV3Public(*ns, *outTwHeap);
-                popShallowTWAttrsBridge(prev);
-                return r;
-            } catch (...) {
-                popShallowTWAttrsBridge(prev);
-                throw;
-            }
+            // 2026-05-18: tlsShallowTWAttrsBridge push/pop retired —
+            // treeWalkerToV3 is now always shallow.
+            return treeWalkerToV3Public(*ns, *outTwHeap);
         }
     }
 
