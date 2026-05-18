@@ -26,14 +26,31 @@ run_fixture() {
     local attr="$3"
     local expected="$4"
 
-    local val
-    val=$(env $extra_env \
+    # Run with v3-direct enabled so the stream-fusion pass is actually
+    # exercised.  Without NIX_V3_DIRECT_EVAL=1, the expression goes
+    # through TW and the NIX_V3_NO_STREAM_FUSION gate has no effect —
+    # the test was previously a no-op.
+    #
+    # Important: do NOT redirect stderr to /dev/null — if v3 emit
+    # fails (e.g. "unbound VarId" from a bad hoist), the empty stdout
+    # would silently masquerade as an empty string that happens to
+    # match no expected value.  Capture stderr to a temp file and
+    # surface it on failure.
+    local val errfile
+    errfile=$(mktemp)
+    val=$(env NIX_V3_DIRECT_EVAL=1 $extra_env \
         "$NIX" $NIX_FLAGS eval --impure \
-        --expr "(import $FIXTURE).$attr" 2>/dev/null)
+        --expr "(import $FIXTURE).$attr" 2>"$errfile")
     if [ "$val" != "$expected" ]; then
-        echo "FAIL [$label]: $attr = $val (expected $expected)"
+        echo "FAIL [$label]: $attr = '$val' (expected '$expected')"
+        if [ -s "$errfile" ]; then
+            echo "  stderr:"
+            sed 's/^/    /' "$errfile" | head -10
+        fi
+        rm -f "$errfile"
         return 1
     fi
+    rm -f "$errfile"
     return 0
 }
 
@@ -49,16 +66,22 @@ for mode in "OFF:NIX_V3_NO_STREAM_FUSION=1" "ON:"; do
     run_fixture "$label" "$env_part" singleton  90      || fail=1
 done
 
-# Cross-check string result.
+# Cross-check string result.  Same v3-direct enforcement as above.
 for mode in "OFF:NIX_V3_NO_STREAM_FUSION=1" "ON:"; do
     label="${mode%%:*}"
     env_part="${mode##*:}"
-    val=$(env $env_part "$NIX" $NIX_FLAGS eval --impure --raw \
-        --expr "(import $FIXTURE).strings" 2>/dev/null)
+    errfile=$(mktemp)
+    val=$(env NIX_V3_DIRECT_EVAL=1 $env_part "$NIX" $NIX_FLAGS eval --impure --raw \
+        --expr "(import $FIXTURE).strings" 2>"$errfile")
     if [ "$val" != "1,2,3," ]; then
         echo "FAIL [$label]: strings = '$val' (expected '1,2,3,')"
+        if [ -s "$errfile" ]; then
+            echo "  stderr:"
+            sed 's/^/    /' "$errfile" | head -10
+        fi
         fail=1
     fi
+    rm -f "$errfile"
 done
 
 # Perf guard: N=100K foldl' + map under v3-direct must finish quickly.

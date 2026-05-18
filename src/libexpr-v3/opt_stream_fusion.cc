@@ -507,6 +507,32 @@ size_t streamFusion(Module & m)
             hoistChain(outer->args[2]);
             hoistChain(inner->args[1]);  // xs may itself be a thunk
 
+            // 2026-05-18 BUGFIX: splice hoisted bindings inline at the
+            // CURRENT position in `out`, BEFORE the fused App-chain we
+            // are about to emit.
+            //
+            // Why this matters: hoisted bindings often reference outer-
+            // scope VarIds defined by an enclosing LetRec (notably the
+            // recSlotVar via RecBindingSlotRef::attrs).  The recSlotVar
+            // is not allocated by a Binding — it is a virtual VarId
+            // materialised at LetRec emit time (lower.cc:2608, the
+            // `m.freshVar()` registered to `m.recVarToSlotVar`).  It is
+            // only IN SCOPE in the outer block AFTER the `v? = LetRec`
+            // binding has emitted.  Prior to this fix we accumulated
+            // `hoisted` and prepended the whole vector to `out` at end-
+            // of-block, which placed RecBindingSlotRef bindings BEFORE
+            // their enclosing LetRec — emit.cc then rejected the IR
+            // with "unbound VarId" (the slotVar reference reached the
+            // emitter before its defining LetRec).  Splicing inline
+            // preserves the lexical order: LetRec emits first, then
+            // (potentially) the hoisted bindings, then the fused call.
+            // hoistedFuncs still dedupes across multiple fusion sites
+            // in the same block — duplicates would only occur if a
+            // single thunk's body is shared by multiple fused calls,
+            // which the use-once safety check prevents anyway.
+            for (auto & h : hoisted) out.push_back(std::move(h));
+            hoisted.clear();
+
             // Build the fused call as an App-chain over LitPrimOp.
             // __foldlMap has a bytecode-closure replacement installed
             // via installBytecodePrimop (bytecode_primops.cc).  The
@@ -541,18 +567,20 @@ size_t streamFusion(Module & m)
                 (unsigned)bd.var, hoisted.size());
         }
 
-        if (fused > 0 || !hoisted.empty()) {
-            // Prepend hoisted bindings to the output.  Their VarIds
-            // dominate the fused call (they were body bindings of a
-            // MkThunk that, in source order, was constructed BEFORE
-            // the call).  Order of hoisted bindings amongst themselves
-            // is preserved from the body block (which is dependency-
-            // ordered by the lowerer).
-            std::vector<Binding> finalBindings;
-            finalBindings.reserve(hoisted.size() + out.size());
-            for (auto & b : hoisted) finalBindings.push_back(std::move(b));
-            for (auto & b : out)     finalBindings.push_back(std::move(b));
-            blk.bindings = std::move(finalBindings);
+        if (fused > 0) {
+            // `out` already has hoisted bindings spliced inline (just
+            // before each fused App-chain) — see the BUGFIX comment
+            // above.  No end-of-block prepend needed.  Assert that we
+            // didn't leak any hoisted bindings past the splice point.
+            if (!hoisted.empty()) {
+                std::fprintf(stderr,
+                    "v3 stream-fusion: WARNING — %zu hoisted bindings "
+                    "leaked past splice (block %u).  This indicates a "
+                    "bug in the inline-splice; the bindings will be "
+                    "dropped.\n",
+                    hoisted.size(), (unsigned)bid);
+            }
+            blk.bindings = std::move(out);
         }
     }
 
