@@ -684,9 +684,26 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "  else "
                 "    let "
                 "      keys = builtins.attrNames args; "
+                // 2026-05-18 bash bootstrap bisection: TW's
+                // primDerivationStrict EMITS `__structuredAttrs` into
+                // drv.env (coerced to "" when false) — verified by
+                // diffing mirrors-list.drv between v3 and TW.  Pre-fix
+                // v3 listed `__structuredAttrs` in flagKeys and
+                // EXCLUDED it from env, causing every non-structured
+                // nixpkgs derivation that explicitly sets
+                // __structuredAttrs=false to diverge from TW (drv hash
+                // depends on env attr list).  The cascade tainted
+                // bashNonInteractive → stdenv.shell → every derivation
+                // on aarch64-darwin nixpkgs.
+                //
+                // The other "flags" (`__ignoreNulls`, `__contentAddressed`,
+                // `impure`) are NOT in TW's emitted env even when set,
+                // so they remain in flagKeys.  __structuredAttrs is
+                // special: it controls JSON vs flat-env shape, but the
+                // false case still flows through to env.
                 "      flagKeys = [ "
                 "        \"__ignoreNulls\" \"__contentAddressed\" "
-                "        \"impure\" \"__structuredAttrs\" "
+                "        \"impure\" "
                 "      ]; "
                 // `args` is the ONLY attr that skips drv.env (TW
                 // populates drv.args from it instead).  `outputs` /

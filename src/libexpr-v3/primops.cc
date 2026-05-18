@@ -613,7 +613,51 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
     switch (v.tag()) {
     case Tag::String: absorbCtx(v.payload.str);
                       return std::string(v.payload.str ? v.payload.str : "");
-    case Tag::Path:   return std::string(v.payload.path ? v.payload.path : "");
+    case Tag::Path: {
+        // 2026-05-18 bash bootstrap bisection: TW's coerceToString
+        // with copyToStore=true (eval.cc:2898) copies path values
+        // to /nix/store as content-addressed entries and adds the
+        // resulting store path to the string context.  v3 used to
+        // just return the raw path string, which:
+        //   1. used the original source-tree path in drv args
+        //      (e.g. /nix/store/<src>-source/pkgs/.../X.sh) rather
+        //      than the copied /nix/store/<hash>-X.sh, AND
+        //   2. didn't add the copied path to inputSrcs.
+        //
+        // Result: every fetchurl-style derivation that interpolated
+        // `${./X.sh}` in its args diverged from TW because the
+        // drv.inputSrcs was empty + the args path differed.  This
+        // cascade tainted bashNonInteractive → stdenv.shell → every
+        // real-world nixpkgs derivation on darwin (confirmed by
+        // diffing mirrors-list.drv between v3 and TW).
+        //
+        // Mirror TW's copyToStore=true behaviour: when nixEvalState
+        // is wired (i.e. we're inside a real eval, not v3-eval-only
+        // synthetic tests), copy the source path to the store and
+        // add an Opaque context entry.  When nixEvalState isn't
+        // wired, fall back to returning the raw path (preserves
+        // the v3-eval-CLI-without-store test scenarios).
+        if (!v.payload.path) return std::string();
+        if (!state.nixEvalState)
+            return std::string(v.payload.path);
+        try {
+            auto & ns = *state.nixEvalState;
+            nix::SourcePath sp = ns.rootPath(
+                nix::CanonPath(v.payload.path));
+            nix::NixStringContext twCtx;
+            nix::StorePath sPath = ns.copyPathToStore(twCtx, sp);
+            // Insert the copy's context (an Opaque element pointing
+            // to the new store path).  copyPathToStore populates
+            // twCtx with this — forward into ctx.
+            for (auto & e : twCtx) ctx.push_back(e.to_string());
+            return ns.store->printStorePath(sPath);
+        } catch (const std::exception &) {
+            // Path doesn't exist on disk or store-copy refused
+            // (e.g. /no-cert-file.crt that TW also can't copy).
+            // Fall back to raw path; downstream may handle it.
+            return std::string(v.payload.path);
+        }
+    }
     case Tag::Int:    return std::to_string(v.payload.i);
     case Tag::Float:  return std::to_string(v.payload.f);
     case Tag::Bool:   return v.payload.i == 1 ? "1" : "";
