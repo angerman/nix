@@ -309,6 +309,17 @@ void optimise(Module & m)
     // before DCE (so the partial-App orphans get swept).
     fusePrimOpApps(m);
 
+    // 2026-05-18 IR Phase B: pure-primop constant folding.  Runs
+    // AFTER fusePrimOpApps so we see the canonical PrimOpCall shape
+    // (rather than the App-chain that lower.cc emits for indirect
+    // primop calls like `let map = builtins.map; in map f xs`).  Then
+    // we re-run constantFold + inlineTrivialBindings to propagate the
+    // folded literals + collapse the VarRef aliases primOpFold
+    // introduces (e.g. `head [a b c]` → VarRef(a)).
+    primOpFold(m);
+    constantFold(m);
+    inlineTrivialBindings(m);
+
     // OPT_OCCUR Phase B: opt-in occurrence-info-driven DCE.  When both
     // gates are set, run side-by-side and assert identical removal
     // sets (the migration-validation harness).  When only NIX_V3_OCCUR_DCE

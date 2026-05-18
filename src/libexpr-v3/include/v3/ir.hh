@@ -786,6 +786,17 @@ size_t commonSubexprElim(Module & m);
 /// App bindings rewritten.
 size_t betaReduce(Module & m);
 
+/// IR Phase B (2026-05-18): pure-primop constant folding.  Recognises
+/// PrimOpCall shapes where the operands are statically known
+/// (ListExpr / LitInt / LitString / LitBool / AttrSet) AND the
+/// primop has a known compile-time semantics (length / stringLength /
+/// head / tail / elemAt / toString / attrNames).  Rewrites to a
+/// literal / VarRef / ListExpr.  Conservative — only folds patterns
+/// whose runtime result is statically computable without throwing.
+/// Gate: NIX_V3_NO_PRIMOP_FOLD=1 disables.  Returns the number of
+/// PrimOpCall bindings folded.
+size_t primOpFold(Module & m);
+
 /// #429: fuse App-chains over LitPrimOp into a single PrimOpCall.
 /// Detects the let/inherit-from indirection pattern that escapes
 /// lowerCall's direct-recognition (e.g. `let inherit (builtins) map;
