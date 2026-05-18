@@ -1626,21 +1626,27 @@ struct Lowerer
                 // outer block (see project_cc_wrapper_bisection_2026-05-18.md
                 // for the trace divergence and IR evidence).
                 //
-                // Fix: recursively check operands.  If any operand is
-                // itself a string-interpolation (fS=true) ConcatStrings,
-                // the whole `+` expression is not safe-eager; thunkify
-                // the outer.  Arithmetic `n + 1` (all operands trivial
-                // Int/Var/etc.) still bypasses thunkification — fib's
-                // hot-path `f (n - 1)` chain stays cheap.
+                // Fix: RECURSIVELY check operands — the outer ConcatStrings
+                // is safe-eager iff EVERY operand is itself trivial-eager.
+                // Arithmetic `n + 1` (operands are Int + Var) → both
+                // trivial → outer trivial.  Nested `(a + b) + c` →
+                // recursively descends.  Catches the case-D pattern
+                // `(''a${X}b'' + ''c'') + ''d''` that a one-level check
+                // (the v1 version of this fix) missed: operand 1 is
+                // fS=false ConcatStrings but its OWN operand is fS=true,
+                // so isTrivialForLazy(operand1) returns false via this
+                // recursion → outer non-trivial → thunkify.
+                //
+                // Depth bound: ConcatStrings nesting is typically <10
+                // in real-world Nix.  Each operand is one isTrivialForLazy
+                // call; total O(operands × depth).  Negligible at lower
+                // time (lowering happens once per CU).
                 for (auto & p : cs->es) {
                     nix::Expr * sub = p.second;
                     if (!sub) continue;
-                    if (sub->exprKind == nix::Expr::Kind::ConcatStrings) {
-                        auto * subCs = static_cast<nix::ExprConcatStrings *>(sub);
-                        if (subCs->forceString) return false;
-                    }
+                    if (!isTrivialForLazy(sub, forArg)) return false;
                 }
-                return true;  // pure arithmetic — safe eager
+                return true;  // all operands trivial — safe eager
             }
             if (k == nix::Expr::Kind::Call) {
                 auto * c = static_cast<nix::ExprCall *>(e);
