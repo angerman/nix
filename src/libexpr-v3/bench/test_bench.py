@@ -62,9 +62,15 @@ def test_workload_load_smoke():
           f"got {len(workloads)} workloads")
     check("load_smoke: fib33 present", "fib33" in workloads)
     check("load_smoke: fib33 has expr", "expr" in workloads.get("fib33", {}))
-    check("load_smoke: hello-name has skip-by-default tag",
-          "skip-by-default" in workloads.get("hello-name", {}).get("tags", []),
-          "real-world workloads requiring full pkgs eval should default-skip")
+    # 2026-05-18: hello-name no longer has skip-by-default (Phase 1
+    # closed via Option 4 hybrid).  hello-drvpath / hello-outpath
+    # retain it (perf-known-slow gate).
+    check("load_smoke: hello-name un-skipped (Phase 1 closure)",
+          "skip-by-default" not in workloads.get("hello-name", {}).get("tags", []),
+          "Phase 1 exit criterion met; hello-name should run by default")
+    check("load_smoke: hello-drvpath skip-by-default (perf gate)",
+          "skip-by-default" in workloads.get("hello-drvpath", {}).get("tags", []),
+          "hello-drvpath remains perf-known-slow until Phase 2 IR opts land")
 
 
 def test_filter_only():
@@ -82,13 +88,15 @@ def test_filter_skip_by_default():
     f_default = bench.filter_workloads(workloads, only=None, tags=None,
                                        skip_tags=None,
                                        nixpkgs_path="/dev/null")
-    check("filter_skip_default: hello-name absent",
-          "hello-name" not in f_default)
-    f_explicit = bench.filter_workloads(workloads, only=["hello-name"],
+    # 2026-05-18: use hello-drvpath as the skip-by-default canary
+    # (hello-name was un-skipped post-Phase-1).
+    check("filter_skip_default: hello-drvpath absent by default",
+          "hello-drvpath" not in f_default)
+    f_explicit = bench.filter_workloads(workloads, only=["hello-drvpath"],
                                         tags=None, skip_tags=None,
                                         nixpkgs_path="/dev/null")
-    check("filter_skip_default: hello-name present when --only",
-          "hello-name" in f_explicit)
+    check("filter_skip_default: hello-drvpath present when --only",
+          "hello-drvpath" in f_explicit)
 
 
 def test_filter_nixpkgs_unavailable():

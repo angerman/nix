@@ -56,6 +56,7 @@ lib_sources = files(
   'primops.cc',
   'bytecode_primops.cc',
   'lower.cc',
+  'opt_beta_reduce.cc',
   'opt_const_fold.cc',
   'opt_cse.cc',
   'opt_dce.cc',

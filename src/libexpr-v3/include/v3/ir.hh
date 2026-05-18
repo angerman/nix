@@ -776,6 +776,16 @@ size_t inlineTrivialBindings(Module & m);
 /// number of bindings rewritten to aliases.
 size_t commonSubexprElim(Module & m);
 
+/// IR Phase A (2026-05-18): 1-shot beta reduction.  Inlines
+/// `App(VarRef→Lambda, arg)` patterns when SAFE — i.e. the Lambda is
+/// same-block, OnceLinear, single-arg (no formals), no intrinsic,
+/// body has no nested Function/Block-carrying Exprs (Lambda/MkThunk/
+/// LetRec/If/With/Assert/And/Or/Impl).  See opt_beta_reduce.cc for
+/// the exact predicate and the clone-with-substitution algorithm.
+/// Gate: NIX_V3_NO_BETA_REDUCE=1 disables.  Returns the number of
+/// App bindings rewritten.
+size_t betaReduce(Module & m);
+
 /// #429: fuse App-chains over LitPrimOp into a single PrimOpCall.
 /// Detects the let/inherit-from indirection pattern that escapes
 /// lowerCall's direct-recognition (e.g. `let inherit (builtins) map;

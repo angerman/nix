@@ -287,6 +287,16 @@ void optimise(Module & m)
     if (disabled) return;
 
     constantFold(m);
+    // 2026-05-18 IR Phase A: beta-reduce App(VarRef→Lambda, arg)
+    // patterns before constantFold runs again — inlining frequently
+    // surfaces new literal-arithmetic shapes that constantFold can
+    // collapse.  Runs BEFORE CSE so inlined bindings get the CSE
+    // pass too (the inlined body may duplicate existing bindings
+    // in the enclosing block).
+    betaReduce(m);
+    // Re-run constantFold to pick up the literal-arithmetic exposed
+    // by beta-reduction (e.g. `(x: x + 1) 5` → `5 + 1` → `6`).
+    constantFold(m);
     commonSubexprElim(m);
     // #423 runs after CSE (so duplicate Force operands collapse to a
     // single resolved root via the alias map) and before
