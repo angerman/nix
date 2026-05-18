@@ -27,6 +27,7 @@
 #include "v3/bridge_yield.hh"
 #include "v3/ffi.hh"  // FFI plan migration step 1: surface declarations.
 #include "v3/errors.hh"
+#include "v3/limits.hh"
 
 #include <chrono>
 
@@ -3027,6 +3028,17 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
                             std::unordered_map<const void *, Value> & seen);
 static Value treeWalkerToV3(EvalState & state, nix::Value & nv);
 
+// Phase 1.6 poll counter for native-C++ helpers that recurse outside
+// the dispatch loop.  Bumped by the helper entries; periodic
+// checkLimits() throws on cap exceed.  Threshold matches the
+// dispatch loop's kPollInterval (10 000) so the polling overhead
+// is consistent across VM and FFI code paths.
+//
+// Without this site, a runaway treeWalkerToV3 on a cyclic
+// derivation graph hangs forever despite NIX_V3_MAX_WALL_TIME being
+// set — the VM dispatch loop is stalled inside the FFI helper and
+// can't reach its own poll.
+
 // Forward declaration so primV3CallBridge1 can use it.
 static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
 
@@ -4278,6 +4290,22 @@ struct V3ToTreeWalkerShimInit {
 static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
                             std::unordered_map<const void *, Value> & seen)
 {
+    // Phase 1.6 (2026-05-18): cap-poll site inside the recursive FFI
+    // helper.  Without this, a runaway TW→v3 conversion on a deeply
+    // nested derivation graph hangs forever even when
+    // NIX_V3_MAX_WALL_TIME is set (the VM dispatch loop is stalled
+    // here and can't reach its own poll).  Polled per-entry; the
+    // checkLimits() body itself is cheap (atomic-flag read +
+    // chrono::now() + getrusage) and is gated by `limitsActive()`
+    // when no cap is set.
+    if (__builtin_expect(nix::v3::limitsActive(), 0)) [[unlikely]] {
+        static thread_local uint32_t s_pollCounter = 0;
+        if (__builtin_expect(++s_pollCounter >= nix::v3::kPollInterval, 0)) {
+            s_pollCounter = 0;
+            nix::v3::checkLimits();
+        }
+    }
+
     auto & ns = *state.nixEvalState;
     // Hook-removal 2026-05-13: depth-yield retired with the v3↔TW
     // hook integration.  The recursion this used to bound is now
