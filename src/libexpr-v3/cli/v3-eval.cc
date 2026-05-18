@@ -16,6 +16,15 @@
 ///   --strict         force-evaluate the result deeply before printing
 ///                    (default: just WHNF)
 ///
+/// IR dump modes (for LLVM-FileCheck-style testing of optimizer passes):
+///   --emit-ir        dump POST-optimisation IR to stdout and exit
+///                    (suppresses normal evaluation + value print)
+///   --emit-ir-raw    dump PRE-optimisation (lowered, no opt passes) IR
+///   --no-opt         alias for emit/eval without running optimise()
+///
+/// See lode/IR_CHECK_INFRASTRUCTURE_PLAN_2026-05-18.md for the
+/// IR-CHECK design that consumes these flags.
+///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
 
@@ -24,6 +33,7 @@
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
 #include "v3/ir.hh"
+#include "v3/ir_dump.hh"
 #include "v3/print.hh"
 
 #include "nix/expr/eval.hh"
@@ -97,10 +107,20 @@ static void usage(const char * argv0)
         argv0, argv0);
 }
 
+// IR dump mode: which point in the pipeline to dump from.
+enum class IrDumpMode {
+    None,       // normal eval, no dump
+    PostOpt,    // --emit-ir: dump after lower + optimise + computeFreeVars
+    PreOpt,     // --emit-ir-raw: dump after lower only (before optimise)
+};
+
 int main(int argc, char ** argv)
 {
     std::string path, expr;
     bool jsonOut = false, strict = false;
+    // IR-CHECK MVP (2026-05-18): IR dump mode + opt control.
+    IrDumpMode irDumpMode = IrDumpMode::None;
+    bool noOpt = false;  // --no-opt: skip optimise() entirely
     // Extra search-path entries (each is either "PATH" or "NAME=PATH").
     // Mirrors `nix-instantiate -I` so the lang test runner's per-test
     // .flags files (which reference `-I lang/dir1` etc.) work.
@@ -154,6 +174,10 @@ int main(int argc, char ** argv)
         else if (a == "--experimental-features" && i + 1 < argc) {
             experimentalFeaturesOverride = argv[++i];
         }
+        // IR-CHECK MVP (2026-05-18).
+        else if (a == "--emit-ir")        irDumpMode = IrDumpMode::PostOpt;
+        else if (a == "--emit-ir-raw")    irDumpMode = IrDumpMode::PreOpt;
+        else if (a == "--no-opt")         noOpt = true;
         else if (!a.empty() && a[0] == '-') {
             // Unknown flag — quietly ignore so test runners can pass
             // nix-instantiate flags without v3-eval refusing them.
@@ -236,6 +260,27 @@ int main(int argc, char ** argv)
         nix::v3::setNixEvalState(&state);
 
         auto m = nix::v3::lowerNixExpr(e, state.symbols, state.positions);
+
+        // IR-CHECK MVP path: when --emit-ir / --emit-ir-raw is set,
+        // dump the IR at the requested phase and exit BEFORE compile.
+        //
+        // Note: normal v3-eval eval (no --emit-ir flag) intentionally
+        // skips ir::optimise() — that's a pre-existing v3-eval design
+        // (it calls compile() directly, not runRootExpr() which is
+        // the runtime path that runs optimise).  We don't change that
+        // default here; --emit-ir gives explicit control via --no-opt.
+        if (irDumpMode != IrDumpMode::None) {
+            if (irDumpMode == IrDumpMode::PostOpt && !noOpt)
+                nix::v3::ir::optimise(m);
+            // computeFreeVars BEFORE the dump so freeVars=[...] fields
+            // are populated (otherwise every Lambda shows nUp=0 and
+            // RAW-mode fixtures can't tell capture-bearing lambdas
+            // apart from capture-free ones).
+            nix::v3::ir::computeFreeVars(m);
+            std::cout << nix::v3::ir::dumpModule(m);
+            return 0;
+        }
+
         nix::v3::ir::computeFreeVars(m);
         auto cu = nix::v3::compile(m);
         Value r = nix::v3::run(cu);

@@ -134,6 +134,21 @@ v3_eval = executable(
   install : true,
 )
 
+# 2026-05-18: IR-CHECK MVP — LLVM-FileCheck-compatible (subset)
+# directive matcher.  In-tree, ~100 lines on top of `checkIrEx` in
+# ir_dump.cc.  See lode/IR_CHECK_INFRASTRUCTURE_PLAN_2026-05-18.md.
+v3_check = executable(
+  'v3-check',
+  'cli/v3-check.cc',
+  dependencies : deps_public + deps_private + deps_other + [
+    declare_dependency(
+      link_with : this_library,
+      include_directories : include_dirs,
+    ),
+  ],
+  install : true,
+)
+
 # Smoke-test binary (hand-built IR; no parser).
 v3_smoke = executable(
   'v3-smoke',
@@ -312,4 +327,20 @@ if python3.found()
       env : {'NIX' : meson.global_build_root() / 'src' / 'nix' / 'nix'},
     )
   endforeach
+
+  # 2026-05-18: IR-CHECK MVP.  LLVM-FileCheck-compatible fixture
+  # runner.  Walks test/ir-fixtures/*.nix and extracts # RUN: lines.
+  # See lode/IR_CHECK_INFRASTRUCTURE_PLAN_2026-05-18.md.  Requires
+  # both v3-eval and v3-check to be on PATH at runtime — the runner
+  # script prepends the build's bin path via BUILD env var.
+  test(
+    'v3-ir-checks',
+    find_program('bash'),
+    args : [files('test/run-ir-checks.sh')],
+    timeout : 60,
+    env : {
+      'V3_BUILD_BIN' : meson.global_build_root() / 'src' / 'libexpr-v3',
+    },
+  )
+
 endif

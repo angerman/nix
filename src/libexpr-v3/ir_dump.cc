@@ -9,10 +9,14 @@
 #include "v3/ir_dump.hh"
 #include "v3/primop.hh"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace nix::v3::ir {
 
@@ -417,38 +421,300 @@ std::string trim(std::string_view s)
 }
 
 struct CheckDirective {
-    enum class Kind { Match, NotMatch };
+    enum class Kind { Match, NotMatch, Label, Next };
     Kind kind;
     std::string pattern;
+    /// True if the pattern contains `{{regex}}` placeholders that need
+    /// regex semantics.  False = plain substring match (cheap fast path).
+    bool hasRegex = false;
     size_t directiveLine = 0;  // for diagnostics
 };
 
-/// Parse `; CHECK: pat` and `; CHECK-NOT: pat` directives from the
-/// expected text.  Lines that don't start with `; CHECK` are ignored.
-std::vector<CheckDirective> parseChecks(std::string_view expected)
+/// Convert a `{{regex}}`-flavoured FileCheck pattern into a `std::regex`.
+/// Literal text outside the `{{...}}` delimiters is escaped; text inside
+/// is taken verbatim as a regex fragment.  Example:
+///   "v{{[0-9]+}} = LitInt {{[0-9]+}}"
+/// → regex literal: `v[0-9]+ = LitInt [0-9]+`
+std::regex compileRegexPattern(std::string_view pat)
+{
+    std::string out;
+    out.reserve(pat.size() + 8);
+    size_t i = 0;
+    while (i < pat.size()) {
+        if (i + 1 < pat.size() && pat[i] == '{' && pat[i+1] == '{') {
+            // Find closing `}}`.
+            size_t end = pat.find("}}", i + 2);
+            if (end == std::string_view::npos) {
+                // Unmatched `{{` — treat the rest as literal.
+                for (size_t k = i; k < pat.size(); ++k) {
+                    char c = pat[k];
+                    if (std::strchr("\\^$.|?*+(){}[]", c)) out.push_back('\\');
+                    out.push_back(c);
+                }
+                break;
+            }
+            // Emit the contents of `{{...}}` as raw regex.
+            out.append(pat.data() + i + 2, end - (i + 2));
+            i = end + 2;
+        } else {
+            char c = pat[i];
+            // Escape regex metacharacters in literal segments.
+            if (std::strchr("\\^$.|?*+(){}[]", c)) out.push_back('\\');
+            out.push_back(c);
+            ++i;
+        }
+    }
+    return std::regex(out);
+}
+
+/// True if `pat` contains a `{{...}}` regex segment.
+bool patternHasRegex(std::string_view pat)
+{
+    for (size_t i = 0; i + 1 < pat.size(); ++i)
+        if (pat[i] == '{' && pat[i+1] == '{') return true;
+    return false;
+}
+
+/// Test whether `actualLine` matches `directive`'s pattern.  Plain
+/// patterns use substring search (cheap); regex patterns build a
+/// `std::regex` lazily on each call (acceptable — typical fixtures
+/// have under 100 directives × under 1000 actual lines).
+bool lineMatches(const CheckDirective & d, std::string_view actualLine)
+{
+    if (!d.hasRegex)
+        return actualLine.find(d.pattern) != std::string::npos;
+    try {
+        std::regex re = compileRegexPattern(d.pattern);
+        return std::regex_search(actualLine.begin(), actualLine.end(), re);
+    } catch (const std::regex_error &) {
+        return false;
+    }
+}
+
+/// Parse CHECK directives from `expected`.  Supports:
+///   - prefix-character `;` OR `#` (LLVM `.ll` style and Nix `.nix` style).
+///   - prefix-name PREFIX (default "CHECK"; e.g. "RAW" or "OPT" with
+///     LLVM's `--check-prefix=`).
+///   - PREFIX:           positive match (forward search).
+///   - PREFIX-NOT:       negative — forbid pattern before next positive.
+///   - PREFIX-LABEL:     strong anchor — resets cursor after matching.
+///   - PREFIX-NEXT:      must be the IMMEDIATELY-NEXT line after prior match.
+///   - `{{regex}}`       embedded regex within an otherwise-literal pattern.
+///   - RUN:/COM: line-skip: if a line contains "RUN:" or "COM:" anywhere,
+///     ignore any PREFIX directive on the same line.  Matches LLVM behavior
+///     and lets you write `# RUN: v3-eval ... | v3-check %s` without
+///     accidentally matching itself.
+std::vector<CheckDirective>
+parseChecks(std::string_view expected, std::string_view prefix = "CHECK")
 {
     std::vector<CheckDirective> out;
     auto lines = splitLines(expected);
+
+    // Build the four directive tags for this prefix: e.g. "CHECK:",
+    // "CHECK-NOT:", "CHECK-LABEL:", "CHECK-NEXT:".
+    std::string tagMatch (prefix); tagMatch  += ":";
+    std::string tagNot   (prefix); tagNot    += "-NOT:";
+    std::string tagLabel (prefix); tagLabel  += "-LABEL:";
+    std::string tagNext  (prefix); tagNext   += "-NEXT:";
+
     for (size_t i = 0; i < lines.size(); ++i) {
-        std::string l = trim(lines[i]);
-        if (l.size() < 2 || l[0] != ';') continue;
-        // Skip leading "; ".
-        size_t p = 1;
+        const std::string & raw = lines[i];
+        std::string l = trim(raw);
+        if (l.size() < 2) continue;
+        // Comment-prefix character.  LLVM uses `;`; we also accept `#`
+        // for Nix-style fixtures, and `//` for C-comment style.
+        char c0 = l[0];
+        size_t p = 0;
+        if      (c0 == ';' || c0 == '#') p = 1;
+        else if (c0 == '/' && l.size() >= 2 && l[1] == '/') p = 2;
+        else continue;
         while (p < l.size() && (l[p] == ' ' || l[p] == '\t')) ++p;
+        if (p >= l.size()) continue;
         std::string_view rest(l.data() + p, l.size() - p);
-        // CHECK-NOT
-        constexpr std::string_view tagNot = "CHECK-NOT:";
-        constexpr std::string_view tagPos = "CHECK:";
-        if (rest.substr(0, tagNot.size()) == tagNot) {
-            std::string_view pat = rest.substr(tagNot.size());
-            out.push_back({CheckDirective::Kind::NotMatch, trim(pat), i + 1});
-        } else if (rest.substr(0, tagPos.size()) == tagPos) {
-            std::string_view pat = rest.substr(tagPos.size());
-            out.push_back({CheckDirective::Kind::Match, trim(pat), i + 1});
-        }
-        // Other "; ..." lines are ignored — lets users write commentary.
+
+        // RUN:/COM: line-skip.  If this line is a RUN: shell-command or
+        // a COM: comment, don't parse CHECK on it.  Matches LLVM.
+        if (rest.find("RUN:") != std::string::npos
+            || rest.find("COM:") != std::string::npos)
+            continue;
+
+        auto tryTag = [&](std::string_view tag, CheckDirective::Kind k) -> bool {
+            if (rest.size() < tag.size()) return false;
+            if (rest.substr(0, tag.size()) != tag) return false;
+            std::string_view pat = rest.substr(tag.size());
+            std::string p2 = trim(pat);
+            out.push_back({k, p2, patternHasRegex(p2), i + 1});
+            return true;
+        };
+
+        // Order matters: -LABEL / -NOT / -NEXT must be probed BEFORE
+        // the bare PREFIX: tag (which is a prefix of all of them).
+        if      (tryTag(tagLabel, CheckDirective::Kind::Label)) {}
+        else if (tryTag(tagNot,   CheckDirective::Kind::NotMatch)) {}
+        else if (tryTag(tagNext,  CheckDirective::Kind::Next)) {}
+        else if (tryTag(tagMatch, CheckDirective::Kind::Match)) {}
+        // Other comment lines are ignored (commentary allowed).
     }
     return out;
+}
+
+/// Render a one-line summary of a directive for diagnostics.
+std::string directiveDesc(const CheckDirective & c, size_t idx)
+{
+    const char * kindStr;
+    switch (c.kind) {
+        case CheckDirective::Kind::Match:    kindStr = "CHECK";       break;
+        case CheckDirective::Kind::NotMatch: kindStr = "CHECK-NOT";   break;
+        case CheckDirective::Kind::Label:    kindStr = "CHECK-LABEL"; break;
+        case CheckDirective::Kind::Next:     kindStr = "CHECK-NEXT";  break;
+    }
+    std::ostringstream s;
+    s << kindStr << " directive #" << (idx + 1)
+      << " (expected line " << c.directiveLine << ")";
+    return s.str();
+}
+
+/// Format a "no match" diagnostic with context lines from `actualLines`.
+std::string formatNoMatch(
+    const CheckDirective & c, size_t idx,
+    const std::vector<std::string> & actualLines,
+    size_t cursor)
+{
+    std::ostringstream e;
+    e << "checkIr: " << directiveDesc(c, idx) << " failed:\n"
+      << "  expected to find: '" << c.pattern << "'"
+      << (c.hasRegex ? "  (regex)" : "") << "\n"
+      << "  in actual lines [" << cursor << ".."
+      << actualLines.size() << "):\n";
+    size_t ctxFrom = cursor;
+    size_t ctxTo = std::min(actualLines.size(), cursor + 16);
+    for (size_t a = ctxFrom; a < ctxTo; ++a)
+        e << "    [" << a << "] " << actualLines[a] << "\n";
+    return e.str();
+}
+
+/// Find the line index where directive `c`'s pattern would match
+/// searching forward from `from`.  Returns npos if no match.
+size_t findFirstMatch(
+    const CheckDirective & c,
+    const std::vector<std::string> & actualLines,
+    size_t from)
+{
+    for (size_t a = from; a < actualLines.size(); ++a)
+        if (lineMatches(c, actualLines[a])) return a;
+    return std::string::npos;
+}
+
+/// Run the actual matching algorithm.  Shared between `checkIr` (default
+/// CHECK prefix) and `checkIrEx` (custom prefix).
+std::string runChecks(
+    const std::vector<std::string> & actualLines,
+    const std::vector<CheckDirective> & checks)
+{
+    if (checks.empty())
+        return "checkIr: no `CHECK` directives found in expected text";
+
+    size_t cursor = 0;  // exclusive — past the most recently matched line.
+    // After a CHECK-LABEL hit, subsequent CHECK-NOT may not look back
+    // past the label.  Track the LABEL floor.
+    size_t labelFloor = 0;
+    // For CHECK-NEXT, we need the EXACT line index where the prior
+    // positive (CHECK/LABEL/NEXT) matched, so we can require the next
+    // directive at `priorMatchLine + 1`.
+    size_t priorMatchLine = std::string::npos;
+
+    for (size_t i = 0; i < checks.size(); ++i) {
+        const auto & c = checks[i];
+
+        switch (c.kind) {
+        case CheckDirective::Kind::Match: {
+            size_t hit = findFirstMatch(c, actualLines, cursor);
+            if (hit == std::string::npos)
+                return formatNoMatch(c, i, actualLines, cursor);
+            priorMatchLine = hit;
+            cursor = hit + 1;
+            break;
+        }
+
+        case CheckDirective::Kind::Label: {
+            // Strong anchor: scan forward from cursor; on match, RESET
+            // cursor.  CHECK-NOT directives positioned BEFORE the label
+            // in the directive list cannot scan past the label match
+            // (handled below in NotMatch case via `labelFloor`).
+            size_t hit = findFirstMatch(c, actualLines, cursor);
+            if (hit == std::string::npos)
+                return formatNoMatch(c, i, actualLines, cursor);
+            priorMatchLine = hit;
+            cursor = hit + 1;
+            labelFloor = hit + 1;
+            break;
+        }
+
+        case CheckDirective::Kind::Next: {
+            // Must match the line IMMEDIATELY after the prior positive
+            // match (cursor == priorMatchLine + 1 at this point if the
+            // prior directive was a positive Match/Label).  If
+            // priorMatchLine is npos (no prior positive), the directive
+            // is malformed.
+            if (priorMatchLine == std::string::npos) {
+                std::ostringstream e;
+                e << "checkIr: " << directiveDesc(c, i)
+                  << " has no prior CHECK / CHECK-LABEL — "
+                     "CHECK-NEXT requires a preceding positive directive\n";
+                return e.str();
+            }
+            size_t expectLine = priorMatchLine + 1;
+            if (expectLine >= actualLines.size()
+                || !lineMatches(c, actualLines[expectLine])) {
+                std::ostringstream e;
+                e << "checkIr: " << directiveDesc(c, i) << " failed:\n"
+                  << "  expected to find: '" << c.pattern << "'"
+                  << (c.hasRegex ? "  (regex)" : "") << "\n"
+                  << "  on line " << expectLine << " (immediately after "
+                  << "the previous positive match at line "
+                  << priorMatchLine << ")\n"
+                  << "  actual line " << expectLine << ": "
+                  << (expectLine < actualLines.size()
+                      ? actualLines[expectLine] : "<eof>") << "\n";
+                return e.str();
+            }
+            priorMatchLine = expectLine;
+            cursor = expectLine + 1;
+            break;
+        }
+
+        case CheckDirective::Kind::NotMatch: {
+            // Forbid pattern from appearing between cursor and the
+            // NEXT positive directive's match position (or
+            // end-of-actual if none).  Honour labelFloor so we don't
+            // scan back past a recent CHECK-LABEL anchor.
+            size_t scanEnd = actualLines.size();
+            for (size_t j = i + 1; j < checks.size(); ++j) {
+                if (checks[j].kind == CheckDirective::Kind::Match
+                    || checks[j].kind == CheckDirective::Kind::Label
+                    || checks[j].kind == CheckDirective::Kind::Next) {
+                    size_t lh = findFirstMatch(checks[j], actualLines, cursor);
+                    if (lh != std::string::npos) scanEnd = lh;
+                    break;
+                }
+            }
+            size_t scanStart = std::max(cursor, labelFloor);
+            for (size_t a = scanStart; a < scanEnd; ++a) {
+                if (lineMatches(c, actualLines[a])) {
+                    std::ostringstream e;
+                    e << "checkIr: " << directiveDesc(c, i) << " failed:\n"
+                      << "  forbidden pattern: '" << c.pattern << "'"
+                      << (c.hasRegex ? "  (regex)" : "") << "\n"
+                      << "  found at actual line " << a << ": "
+                      << actualLines[a] << "\n";
+                    return e.str();
+                }
+            }
+            break;
+        }
+        }
+    }
+    return {};  // success
 }
 
 } // namespace
@@ -456,63 +722,18 @@ std::vector<CheckDirective> parseChecks(std::string_view expected)
 std::string checkIr(std::string_view actual, std::string_view expected)
 {
     auto actualLines = splitLines(actual);
-    auto checks = parseChecks(expected);
-    if (checks.empty())
-        return "; checkIr: no `; CHECK:` directives found in expected text";
+    auto checks = parseChecks(expected, "CHECK");
+    return runChecks(actualLines, checks);
+}
 
-    size_t cursor = 0;  // current line in actualLines we've matched up to (exclusive).
-    for (size_t i = 0; i < checks.size(); ++i) {
-        const auto & c = checks[i];
-        if (c.kind == CheckDirective::Kind::Match) {
-            // Search forward from cursor.
-            size_t hit = std::string::npos;
-            for (size_t a = cursor; a < actualLines.size(); ++a) {
-                if (actualLines[a].find(c.pattern) != std::string::npos) {
-                    hit = a; break;
-                }
-            }
-            if (hit == std::string::npos) {
-                std::ostringstream e;
-                e << "checkIr: CHECK directive #" << (i + 1)
-                  << " (expected line " << c.directiveLine << ") failed:\n"
-                  << "  expected to find: '" << c.pattern << "'\n"
-                  << "  in actual lines [" << cursor << ".."
-                  << actualLines.size() << "):\n";
-                size_t ctxFrom = cursor;
-                size_t ctxTo = std::min(actualLines.size(), cursor + 16);
-                for (size_t a = ctxFrom; a < ctxTo; ++a)
-                    e << "    [" << a << "] " << actualLines[a] << "\n";
-                return e.str();
-            }
-            cursor = hit + 1;
-        } else {
-            // CHECK-NOT: forbid the pattern from appearing between the
-            // current cursor and the NEXT positive CHECK's match position
-            // (or end of actual if no further positive check).
-            size_t scanEnd = actualLines.size();
-            for (size_t j = i + 1; j < checks.size(); ++j) {
-                if (checks[j].kind == CheckDirective::Kind::Match) {
-                    for (size_t a = cursor; a < actualLines.size(); ++a)
-                        if (actualLines[a].find(checks[j].pattern) != std::string::npos) {
-                            scanEnd = a; break;
-                        }
-                    break;
-                }
-            }
-            for (size_t a = cursor; a < scanEnd; ++a) {
-                if (actualLines[a].find(c.pattern) != std::string::npos) {
-                    std::ostringstream e;
-                    e << "checkIr: CHECK-NOT directive #" << (i + 1)
-                      << " (expected line " << c.directiveLine << ") failed:\n"
-                      << "  forbidden pattern: '" << c.pattern << "'\n"
-                      << "  found at actual line " << a << ": "
-                      << actualLines[a] << "\n";
-                    return e.str();
-                }
-            }
-        }
-    }
-    return {};  // success
+std::string checkIrEx(
+    std::string_view actual,
+    std::string_view expected,
+    std::string_view prefix)
+{
+    auto actualLines = splitLines(actual);
+    auto checks = parseChecks(expected, prefix);
+    return runChecks(actualLines, checks);
 }
 
 } // namespace nix::v3::ir

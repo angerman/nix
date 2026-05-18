@@ -79,9 +79,35 @@ std::string dumpExpr(const Module & m, const Expr & e);
 // Returns empty string on success; on failure, returns a diagnostic
 // describing which directive failed and the surrounding context.
 
-/// Run a list of `; CHECK:` / `; CHECK-NOT:` directives extracted from
-/// `expected` against the actual output text.  Empty return = pass;
-/// non-empty return = failure diagnostic.
+/// Run a list of CHECK directives extracted from `expected` against
+/// the actual output text.  Empty return = pass; non-empty return =
+/// failure diagnostic.
+///
+/// Supported directives (default `CHECK` prefix):
+///   `; CHECK: pat`        — forward search; advance cursor past match.
+///   `; CHECK-NOT: pat`    — forbid pat before the next positive match.
+///   `; CHECK-LABEL: pat`  — strong anchor; resets cursor.
+///   `; CHECK-NEXT: pat`   — must match the line immediately after the
+///                           prior positive directive.
+///
+/// Pattern syntax: substring match by default.  `{{regex}}` segments
+/// inside a pattern are interpreted as `std::regex` fragments (literal
+/// text outside `{{...}}` is escaped).
+///
+/// Comment-prefix character: `;` (LLVM style), `#` (Nix style), `//`
+/// (C-style) are all accepted.
+///
+/// RUN:/COM: line-skip: if a directive line contains "RUN:" or "COM:"
+/// anywhere, no CHECK directive is parsed from it — lets `; RUN: ...`
+/// shell-command lines coexist with CHECK directives.
 std::string checkIr(std::string_view actual, std::string_view expected);
+
+/// Like `checkIr`, but with a custom directive prefix (e.g. "RAW",
+/// "OPT") to support multi-RUN fixtures using `--check-prefix=`.
+/// `prefix="CHECK"` is identical to `checkIr`.
+std::string checkIrEx(
+    std::string_view actual,
+    std::string_view expected,
+    std::string_view prefix);
 
 } // namespace nix::v3::ir
