@@ -663,14 +663,31 @@ void installAllBytecodePrimops(nix::EvalState & state)
             // adds only a SMALL C-frame chain.  The KEY: the OUTER
             // iteration (one entry per attr) runs at bytecode level —
             // no per-attr C-frame stack consumption.
+            // Hoisted-structured-flag form (2026-05-18).  The previous
+            // shape kept `preprocessed` and its sub-bindings (envEntries
+            // / baseEnv / envWithSpecials / ...) in the outer let, then
+            // gated only the FINAL select with `if structuredFlag`.
+            // v3's emission was forcing those preprocessing thunks even
+            // for structured-attrs derivations (where the else branch
+            // never runs), tripping "OP_ATTRS_SELECT: not an attrset"
+            // when an env attr like cc-wrapper's `isGNU` selector sat
+            // on a string (the structured-attrs JSON shape allows env
+            // values that aren't string-coercible).  Hoist the check
+            // to the OUTER if so `preprocessed` enters scope only on
+            // the non-structured path; structured derivations go
+            // straight to `__derivationStrictRaw` with no surrounding
+            // let-bindings to force eagerly.
             const char * full_wrapper =
                 "args: "
-                "  let "
-                "    keys = builtins.attrNames args; "
-                "    flagKeys = [ "
-                "      \"__ignoreNulls\" \"__contentAddressed\" "
-                "      \"impure\" \"__structuredAttrs\" "
-                "    ]; "
+                "  if args.__structuredAttrs or false "
+                "  then builtins.__derivationStrictRaw args "
+                "  else "
+                "    let "
+                "      keys = builtins.attrNames args; "
+                "      flagKeys = [ "
+                "        \"__ignoreNulls\" \"__contentAddressed\" "
+                "        \"impure\" \"__structuredAttrs\" "
+                "      ]; "
                 // `args` is the ONLY attr that skips drv.env (TW
                 // populates drv.args from it instead).  `outputs` /
                 // `outputHash*` / `builder` / `system` ALL emplace
@@ -679,83 +696,80 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 // also feed drv.builder / drv.platform / outputHash /
                 // declaredOutputs.  Match that here — otherwise the
                 // drv hash diverges.
-                "    specialEnvKeys = [ \"args\" \"outputs\" ]; "
-                "    isFlag = k: builtins.elem k flagKeys; "
-                "    isSpecialEnv = k: builtins.elem k specialEnvKeys; "
+                "      specialEnvKeys = [ \"args\" \"outputs\" ]; "
+                "      isFlag = k: builtins.elem k flagKeys; "
+                "      isSpecialEnv = k: builtins.elem k specialEnvKeys; "
                 // Defensive bool coercion: nixpkgs may pass non-bool
                 // values for these flag attrs (e.g. null), and an
                 // `if (non-bool)` opcode in subsequent logic would
                 // throw "v3: expected bool".  Use `== true` to force
                 // a clean bool result for any non-true value.
-                "    asBool = v: v == true; "
-                "    ignoreNullsFlag = asBool (args.__ignoreNulls or false); "
-                "    structuredFlag = asBool (args.__structuredAttrs or false); "
-                "    contentAddressedFlag = asBool (args.__contentAddressed or false); "
-                "    impureFlag = asBool (args.impure or false); "
-                "    drvName = args.name; "
-                "    builderStr = builtins.toString args.builder; "
-                "    systemStr = builtins.toString args.system; "
-                "    outputsList = "
-                "      if args ? outputs "
-                "      then builtins.map builtins.toString args.outputs "
-                "      else [ \"out\" ]; "
-                "    outputsEnvEntry = builtins.concatStringsSep \" \" outputsList; "
-                "    argsList = "
-                "      if args ? args "
-                "      then builtins.map builtins.toString args.args "
-                "      else [ ]; "
-                "    outputHashStr = "
-                "      if args ? outputHash then builtins.toString args.outputHash "
-                "      else null; "
-                "    outputHashAlgoStr = "
-                "      if args ? outputHashAlgo then builtins.toString args.outputHashAlgo "
-                "      else null; "
-                "    outputHashModeStr = "
-                "      if args ? outputHashMode then builtins.toString args.outputHashMode "
-                "      else null; "
-                "    envKeyValue = k: "
-                "      if isFlag k then null "
-                "      else if isSpecialEnv k then null "
-                "      else if ignoreNullsFlag && (args.${k}) == null then null "
-                "      else { name = k; value = builtins.toString args.${k}; }; "
-                "    envEntries = "
-                "      builtins.filter (e: e != null) "
-                "        (builtins.map envKeyValue keys); "
-                "    baseEnv = builtins.listToAttrs envEntries; "
+                "      asBool = v: v == true; "
+                "      ignoreNullsFlag = asBool (args.__ignoreNulls or false); "
+                "      contentAddressedFlag = asBool (args.__contentAddressed or false); "
+                "      impureFlag = asBool (args.impure or false); "
+                "      drvName = args.name; "
+                "      builderStr = builtins.toString args.builder; "
+                "      systemStr = builtins.toString args.system; "
+                "      outputsList = "
+                "        if args ? outputs "
+                "        then builtins.map builtins.toString args.outputs "
+                "        else [ \"out\" ]; "
+                "      outputsEnvEntry = builtins.concatStringsSep \" \" outputsList; "
+                "      argsList = "
+                "        if args ? args "
+                "        then builtins.map builtins.toString args.args "
+                "        else [ ]; "
+                "      outputHashStr = "
+                "        if args ? outputHash then builtins.toString args.outputHash "
+                "        else null; "
+                "      outputHashAlgoStr = "
+                "        if args ? outputHashAlgo then builtins.toString args.outputHashAlgo "
+                "        else null; "
+                "      outputHashModeStr = "
+                "        if args ? outputHashMode then builtins.toString args.outputHashMode "
+                "        else null; "
+                "      envKeyValue = k: "
+                "        if isFlag k then null "
+                "        else if isSpecialEnv k then null "
+                "        else if ignoreNullsFlag && (args.${k}) == null then null "
+                "        else { name = k; value = builtins.toString args.${k}; }; "
+                "      envEntries = "
+                "        builtins.filter (e: e != null) "
+                "          (builtins.map envKeyValue keys); "
+                "      baseEnv = builtins.listToAttrs envEntries; "
                 // Only synthesize an `outputs` env entry when the user
                 // ACTUALLY provided `outputs` in args.  TW's
                 // primDerivationStrict adds it only in the explicit-
                 // outputs branch (lines 5269-5294 in primops.cc).  Adding
                 // it when missing creates a divergent drvPath hash.
-                "    envWithSpecialsBase = "
-                "      baseEnv // { "
+                "      envWithSpecialsBase = "
+                "        baseEnv // { "
+                "          builder = builderStr; "
+                "          system = systemStr; "
+                "          name = drvName; "
+                "        }; "
+                "      envWithSpecials = "
+                "        if args ? outputs "
+                "        then envWithSpecialsBase // { outputs = outputsEnvEntry; } "
+                "        else envWithSpecialsBase; "
+                "      preprocessed = { "
+                "        name = drvName; "
                 "        builder = builderStr; "
                 "        system = systemStr; "
-                "        name = drvName; "
+                "        args = argsList; "
+                "        outputs = outputsList; "
+                "        env = envWithSpecials; "
+                "        __ignoreNulls = ignoreNullsFlag; "
+                "        __contentAddressed = contentAddressedFlag; "
+                "        __impure = impureFlag; "
+                "        __structuredAttrs = false; "
+                "        outputHash = outputHashStr; "
+                "        outputHashAlgo = outputHashAlgoStr; "
+                "        outputHashMode = outputHashModeStr; "
                 "      }; "
-                "    envWithSpecials = "
-                "      if args ? outputs "
-                "      then envWithSpecialsBase // { outputs = outputsEnvEntry; } "
-                "      else envWithSpecialsBase; "
-                "    preprocessed = { "
-                "      name = drvName; "
-                "      builder = builderStr; "
-                "      system = systemStr; "
-                "      args = argsList; "
-                "      outputs = outputsList; "
-                "      env = envWithSpecials; "
-                "      __ignoreNulls = ignoreNullsFlag; "
-                "      __contentAddressed = contentAddressedFlag; "
-                "      __impure = impureFlag; "
-                "      __structuredAttrs = structuredFlag; "
-                "      outputHash = outputHashStr; "
-                "      outputHashAlgo = outputHashAlgoStr; "
-                "      outputHashMode = outputHashModeStr; "
-                "    }; "
-                "  in "
-                "    if structuredFlag "
-                "    then builtins.__derivationStrictRaw args "
-                "    else builtins.__derivationFromPreprocessed preprocessed";
+                "    in "
+                "      builtins.__derivationFromPreprocessed preprocessed";
 
             installBytecodePrimop(state, "derivationStrict", full_wrapper);
 
