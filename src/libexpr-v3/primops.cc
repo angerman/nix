@@ -601,7 +601,8 @@ void primIsPath    (EvalState &, Value * args, Value & out) { out = args[0].isPa
 /// state.coerceToString with NixStringContext& accum (libexpr/eval.cc:
 /// coerceToString); same shape.
 static std::string toStringCoerceCtx(EvalState & state, Value v,
-                                     std::vector<std::string> & ctx)
+                                     std::vector<std::string> & ctx,
+                                     bool copyPathsToStore = false)
 {
     auto absorbCtx = [&](const char * s) {
         if (!s) return;
@@ -614,31 +615,34 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
     case Tag::String: absorbCtx(v.payload.str);
                       return std::string(v.payload.str ? v.payload.str : "");
     case Tag::Path: {
-        // 2026-05-18 bash bootstrap bisection: TW's coerceToString
-        // with copyToStore=true (eval.cc:2898) copies path values
-        // to /nix/store as content-addressed entries and adds the
-        // resulting store path to the string context.  v3 used to
-        // just return the raw path string, which:
-        //   1. used the original source-tree path in drv args
-        //      (e.g. /nix/store/<src>-source/pkgs/.../X.sh) rather
-        //      than the copied /nix/store/<hash>-X.sh, AND
-        //   2. didn't add the copied path to inputSrcs.
+        // TW splits this into TWO behaviours via the `copyToStore` flag
+        // of `EvalState::coerceToString` (libexpr/eval.cc:2880-2902):
         //
-        // Result: every fetchurl-style derivation that interpolated
-        // `${./X.sh}` in its args diverged from TW because the
-        // drv.inputSrcs was empty + the args path differed.  This
-        // cascade tainted bashNonInteractive → stdenv.shell → every
-        // real-world nixpkgs derivation on darwin (confirmed by
-        // diffing mirrors-list.drv between v3 and TW).
+        //   copyToStore=false: return the source-tree absolute path
+        //     as-is.  Used by `builtins.toString` (primops.cc:4806 —
+        //     `prim_toString` calls coerceToString(..., copyToStore=
+        //     false)).  No store copy, no context entry.
         //
-        // Mirror TW's copyToStore=true behaviour: when nixEvalState
-        // is wired (i.e. we're inside a real eval, not v3-eval-only
-        // synthetic tests), copy the source path to the store and
-        // add an Opaque context entry.  When nixEvalState isn't
-        // wired, fall back to returning the raw path (preserves
-        // the v3-eval-CLI-without-store test scenarios).
+        //   copyToStore=true: copy the path to /nix/store and return
+        //     the resulting store path.  Used by primDerivationStrict
+        //     for `args`/`builder`/`system`/env-entry coercion
+        //     (primops.cc:1727,1809) so paths-as-drv-args end up as
+        //     content-addressed store entries with proper inputSrcs.
+        //
+        // 2026-05-19 #665: pre-fix v3 unconditionally COPIED here,
+        // breaking the substitute.nix pattern `name = baseNameOf
+        // (toString args.src)` where TW expects the source-tree path
+        // (so baseName returns "X.sh") but v3 returned the store path
+        // (so baseName returned "<hash>-X.sh") — every substituted
+        // setup-hook derivation diverged, cascading into stdenv and
+        // every downstream package.
+        //
+        // Now: the caller chooses via `copyPathsToStore`.  primToString
+        // passes false (TW-compatible toString).  The bytecode-wrapper
+        // path coercion (via the new __derivCoerce primop) passes true
+        // so derivation args/builder/env retain the store-copy.
         if (!v.payload.path) return std::string();
-        if (!state.nixEvalState)
+        if (!copyPathsToStore || !state.nixEvalState)
             return std::string(v.payload.path);
         try {
             auto & ns = *state.nixEvalState;
@@ -668,7 +672,7 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
         if (!lv) return out;
         for (uint32_t i = 0; i < lv->size; ++i) {
             Value el = forceValue(*state.vm, lv->elems[i]);
-            out += toStringCoerceCtx(state, el, ctx);
+            out += toStringCoerceCtx(state, el, ctx, copyPathsToStore);
             if (i + 1 < lv->size) {
                 bool elIsEmptyList = el.isList()
                     && (!el.payload.list || el.payload.list->size == 0);
@@ -694,13 +698,13 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
                     || tsFn.tag() == Tag::PrimOpApp) {
                     Value res = callClosure(*state.vm, tsFn, v);
                     Value forced = forceValue(*state.vm, res);
-                    return toStringCoerceCtx(state, forced, ctx);
+                    return toStringCoerceCtx(state, forced, ctx, copyPathsToStore);
                 }
                 // non-callable: fall through to outPath
             }
             if (auto * outV = v.payload.bindings->lookup(sOutPath)) {
                 Value forced = forceValue(*state.vm, *outV);
-                return toStringCoerceCtx(state, forced, ctx);
+                return toStringCoerceCtx(state, forced, ctx, copyPathsToStore);
             }
             // Include keys in the error for diagnosability.
             const auto & symTab = ir::globalSymbolTable();
@@ -800,8 +804,33 @@ static std::string toStringCoerce(EvalState & state, Value v)
 void primToString(EvalState & state, Value * args, Value & out)
 {
     // §1.6: thread context through nested list/attrs traversal.
+    // user-facing `builtins.toString`: TW-compatible non-copying
+    // behaviour for paths (eval.cc:2880-2902, copyToStore=false).
     std::vector<std::string> ctx;
-    std::string s = toStringCoerceCtx(state, args[0], ctx);
+    std::string s = toStringCoerceCtx(state, args[0], ctx,
+                                       /*copyPathsToStore=*/false);
+    out = mkStringValueOwned(std::move(s));
+    if (!ctx.empty())
+        setStringContextEntries(out.payload.str, std::move(ctx));
+}
+
+/// Internal `__derivCoerce` primop: like `builtins.toString` but
+/// COPIES path values to /nix/store and adds an Opaque context entry
+/// — matches TW's coerceToString(copyToStore=true) used by
+/// primDerivationStrict for `args` / `builder` / `system` / env-entry
+/// coercion (libexpr/primops.cc:1727,1809).
+///
+/// Used by the bytecode `derivationStrict` wrapper to ensure path
+/// values in drv attributes get content-addressed and recorded in
+/// drv.inputSrcs — separate primop from `toString` so user-facing
+/// `toString` keeps the TW non-copying semantics that nixpkgs's
+/// `substitute.nix` (`name = baseNameOf (toString args.src)`) relies
+/// on.  See #665 RCA in toStringCoerceCtx comment above.
+void primDerivCoerce(EvalState & state, Value * args, Value & out)
+{
+    std::vector<std::string> ctx;
+    std::string s = toStringCoerceCtx(state, args[0], ctx,
+                                       /*copyPathsToStore=*/true);
     out = mkStringValueOwned(std::move(s));
     if (!ctx.empty())
         setStringContextEntries(out.payload.str, std::move(ctx));
@@ -936,6 +965,23 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
     std::string sep(args[0].payload.str);
     std::string result;
     auto * list = args[1].payload.list;
+    // 2026-05-19 #665: accumulate string context from the separator
+    // and every list element.  TW's prim_concatStringsSep
+    // (libexpr/primops.cc:prim_concatStringsSep) calls coerceToString
+    // on each element which appends its context to the shared
+    // `context` arg; the result string carries the union.  Without
+    // this, sequences like `concatStringsSep " " [ "${drv}" ... ]`
+    // produce a context-free string, dropping the derivation
+    // dependency — caught when utils.bash.drv was missing
+    // expand-response-params from its inputDrvs in nixpkgs's
+    // pkgconf-wrapper buildPhase.
+    std::vector<std::string> ctx;
+    auto absorb = [&](const char * s) {
+        if (!s) return;
+        if (auto * raw = lookupStringContextEntries(s))
+            ctx.insert(ctx.end(), raw->begin(), raw->end());
+    };
+    absorb(args[0].payload.str);
     // Phase 1.2 step 2 (action plan): inline WHNF skip — most
     // concatStringsSep arguments are already-forced strings (the
     // common idiom is `concatStringsSep ":" (map toString xs)` where
@@ -949,9 +995,15 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
                              || et == Tag::Slot, 0))
             el = forceValue(*state.vm, el);
         if (!el.isString()) typeError("concatStringsSep", "list of strings");
+        absorb(el.payload.str);
         result += el.payload.str;
     }
     out = mkStringValueOwned(result);
+    if (!ctx.empty()) {
+        std::sort(ctx.begin(), ctx.end());
+        ctx.erase(std::unique(ctx.begin(), ctx.end()), ctx.end());
+        setStringContextEntries(out.payload.str, std::move(ctx));
+    }
 }
 
 void primSubstring(EvalState &, Value * args, Value & out)
@@ -1622,6 +1674,20 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
     auto * tos   = args[1].payload.list;
     if (!froms || !tos || froms->size != tos->size)
         throw std::runtime_error("v3 primop replaceStrings: lists must have equal length");
+    // 2026-05-19 #665: collect string-context from the input string
+    // and any `to` element whose pattern actually matched (TW's
+    // prim_replaceStrings at libexpr/primops.cc:5328-5353 maintains
+    // an outer NixStringContext from forceString(input) + accumulates
+    // forceString(to[i].ctx) on each matched replacement).  Without
+    // this, `replaceStrings ["@x@"] ["${drv}"] s` produces a context-
+    // free output, dropping the derivation dep.
+    std::vector<std::string> ctxAccum;
+    auto absorb = [&](const char * s) {
+        if (!s) return;
+        if (auto * raw = lookupStringContextEntries(s))
+            ctxAccum.insert(ctxAccum.end(), raw->begin(), raw->end());
+    };
+    absorb(args[2].payload.str);
     // Force `from` elements upfront -- every iteration of the outer
     // loop reads them, and they're lazy by default.  `to` elements
     // stay lazy and are forced inside the match branch (matches
@@ -1656,6 +1722,7 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
             Value t = forceValue(*state.vm, tos->elems[j]);
             if (!t.isString()) typeError("replaceStrings", "list of strings");
             result.append(t.payload.str);
+            absorb(t.payload.str);
             return static_cast<int>(fv.size());
         }
         return -1;
@@ -1669,6 +1736,11 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
     // Final empty-match at end-of-string (handles `["" ...]` -> trailing X).
     tryReplaceAt(s.size());
     out = mkStringValueOwned(result);
+    if (!ctxAccum.empty()) {
+        std::sort(ctxAccum.begin(), ctxAccum.end());
+        ctxAccum.erase(std::unique(ctxAccum.begin(), ctxAccum.end()), ctxAccum.end());
+        setStringContextEntries(out.payload.str, std::move(ctxAccum));
+    }
 }
 
 void primAbort(EvalState &, Value * args, Value &)
@@ -5838,11 +5910,17 @@ static void primDerivationStrictNative(
         // which matches tree-walker's forceString[NoCtx] semantics
         // for the typical (string-typed) cases this path sees.
         if (useStructuredAttrs) {
-            std::string keyStr(key);
-            structuredJson[keyStr] = valueToJsonWithContext(
-                state, attrV, context);
-            // Special-case fields still need to populate drv.* so
-            // libnixstore can write the .drv correctly.
+            // 2026-05-19 #665: `args` is special — it goes to drv.args
+            // ONLY and is NOT serialised into the structuredAttrs JSON.
+            // Matches tree-walker's libexpr/primops.cc:1721-1732 where
+            // `case args:` breaks out of the switch BEFORE reaching the
+            // `default:` jsonObject-emit branch (line 1742).  Pre-fix
+            // v3 emitted `args` into structuredJson too, causing
+            // structured-attrs derivations (every bash53-NNN patch,
+            // tarballs, etc.) to have a JSON `args` entry their TW
+            // counterparts don't — drv hashes diverged for every
+            // single nix eval --impure path lookup.  Tested via
+            // bashNonInteractive cascade (#665).
             if (sid == sym.args) {
                 Value listV = forceValue(*state.vm, attrV);
                 if (!listV.isList())
@@ -5858,6 +5936,11 @@ static void primDerivationStrictNative(
                 }
                 continue;
             }
+            std::string keyStr(key);
+            structuredJson[keyStr] = valueToJsonWithContext(
+                state, attrV, context);
+            // Special-case fields still need to populate drv.* so
+            // libnixstore can write the .drv correctly.
             if (sid == sym.outputs) {
                 Value listV = forceValue(*state.vm, attrV);
                 if (!listV.isList())
@@ -8806,6 +8889,9 @@ void registerBuiltinPrimOps()
         registerPrimOp({"isFloat",      1, primIsFloat});
         registerPrimOp({"isPath",       1, primIsPath});
         registerPrimOp({"toString",     1, primToString});
+        // Internal primop used by the bytecode derivationStrict wrapper
+        // for path-copying string coercion (#665, see primDerivCoerce).
+        registerPrimOp({"__derivCoerce", 1, primDerivCoerce});
         registerPrimOp({"typeOf",       1, primTypeOf});
         registerPrimOp({"stringLength", 1, primStringLength});
         registerPrimOp({"add",          2, primAdd});

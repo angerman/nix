@@ -3163,7 +3163,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         buf[i] = forceValue(vm, buf[i]);
                 }
                 bumpPrimOpCallCount(po);
+                // Wire nixEvalState so primops that touch the
+                // store / file system (toString-on-path, import,
+                // path coercion) can reach the live nix::EvalState.
+                // 2026-05-19 #665 root cause: this path is the
+                // hot OP_CALL fall-through when the callee is a
+                // PrimOp/PrimOpApp (e.g. the derivationStrict
+                // bytecode wrapper's `builtins.toString args.X`
+                // calls).  Without nixEvalState, toStringCoerceCtx
+                // hits its `!state.nixEvalState` early-return and
+                // produces raw source-tree paths instead of
+                // copying them to /nix/store, causing every
+                // derivation that interpolates a `${./X.sh}`-style
+                // path to diverge from TW (drv hash mismatch
+                // cascading through bash → stdenv → all packages).
                 EvalState state; state.vm = &vm;
+                state.nixEvalState = getNixEvalState();
                 Value out;
                 po->fn(state, buf, out);
                 push(vm, out);
@@ -8723,28 +8738,43 @@ Value getBuiltinsValue() noexcept
 {
     static Value vBuiltins = []{
         const auto & reg = allRegisteredPrimOps();
-        // REVIEW_2026-05-04 §6.1 follow-up: tree-walker's `addConstant`
-        // registers `__currentSystem` etc into the BASE ENV but adds
-        // only the stripped name (`currentSystem`) to `builtins`.
-        // `RegisterPrimOp` uses the bare name throughout.  In both
-        // cases, `__`-prefixed primops never appear as `builtins.X`.
-        // Tree-walker test `eval-okay-builtins` enforces this:
-        //   `assert !builtins ? __currentSystem;`
-        // v3 used to violate the rule by exposing every registered
-        // name (including `__add` etc) in `builtins`.  Filter them
-        // out here so the `__` aliases serve only their base-env
-        // resolution role.
-        uint32_t nVisible = 0;
+        // TW's `EvalState::addPrimOp` (libexpr/eval.cc:577) STRIPS the
+        // leading `__` from a primop's name before inserting it into
+        // the `builtins` attrset, while keeping the original prefixed
+        // name in the base env (so `__add` resolves to the same primop
+        // as `builtins.add`).
+        //
+        // 2026-05-19 #665: pre-fix v3 SKIPPED all `__`-prefixed primops
+        // from vBuiltins entirely, which meant `builtins.toFile`,
+        // `builtins.readFile`, `builtins.elem`, etc. weren't visible —
+        // the lutok-0.4 derivation (used by libiconv → gnugrep →
+        // clang-wrapper) calls `builtins.toFile` in its native-derivation
+        // path, native fell back to bridge, bridge cycled, fake-store
+        // path leaked into clang-wrapper's env and cascaded across all
+        // wrapped derivations.
+        //
+        // Match TW: include `__`-prefixed primops under their stripped
+        // name (skip if a non-prefixed entry already exists — TW's
+        // addPrimOp would have shadowed too).  De-dupe up-front: count
+        // distinct stripped names so allocBindings gets the right size,
+        // then populate with a "first-write wins" rule.
+        std::unordered_map<std::string, std::reference_wrapper<const nix::v3::PrimOp>> stripped;
         for (auto & [poName, po] : reg) {
-            if (poName.size() >= 2 && poName[0] == '_' && poName[1] == '_')
-                continue;
-            ++nVisible;
+            std::string key = poName;
+            if (key.size() >= 2 && key[0] == '_' && key[1] == '_')
+                key.erase(0, 2);
+            // If the non-prefixed name is also registered, the
+            // non-prefixed entry wins (TW's addPrimOp order:
+            // RegisterPrimOp for non-`__` name first registers normally,
+            // the `__` alias is added separately; we mimic by keeping
+            // first-inserted).  Since reg is ordered, first wins.
+            stripped.emplace(std::move(key), std::cref(po));
         }
+        uint32_t nVisible = static_cast<uint32_t>(stripped.size());
         Bindings * b = Alloc::allocBindings(nVisible);
         uint32_t i = 0;
-        for (auto & [poName, po] : reg) {
-            if (poName.size() >= 2 && poName[0] == '_' && poName[1] == '_')
-                continue;
+        for (auto & [poName, poRef] : stripped) {
+            const auto & po = poRef.get();
             Value v;
             // 2026-05-18 cc-wrapper bisection layer 3: arity-0 primops
             // are CONSTANTS (currentSystem, storeDir, nixVersion, ...).

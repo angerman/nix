@@ -725,8 +725,17 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "      ignoreNullsFlag = asBool (args.__ignoreNulls or false); "
                 "      contentAddressedFlag = asBool (args.__contentAddressed or false); "
                 "      impureFlag = asBool (args.impure or false); "
+                // 2026-05-19 #665: use `__derivCoerce` (path-copying
+                // coerce) for derivation fields that TW handles via
+                // `coerceToString(copyToStore=true)`.  `builtins.toString`
+                // is now non-copying (TW-compatible user-facing
+                // toString), so paths-as-attr-values would leak as
+                // raw source-tree paths without the explicit copy.
+                // outputs/outputHash*/system are forceStringNoCtx in
+                // TW (no copying ever applies — they reject paths) so
+                // they can stay on `builtins.toString`.
                 "      drvName = args.name; "
-                "      builderStr = builtins.toString args.builder; "
+                "      builderStr = builtins.__derivCoerce args.builder; "
                 "      systemStr = builtins.toString args.system; "
                 "      outputsList = "
                 "        if args ? outputs "
@@ -735,7 +744,7 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "      outputsEnvEntry = builtins.concatStringsSep \" \" outputsList; "
                 "      argsList = "
                 "        if args ? args "
-                "        then builtins.map builtins.toString args.args "
+                "        then builtins.map builtins.__derivCoerce args.args "
                 "        else [ ]; "
                 "      outputHashStr = "
                 "        if args ? outputHash then builtins.toString args.outputHash "
@@ -750,7 +759,7 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "        if isFlag k then null "
                 "        else if isSpecialEnv k then null "
                 "        else if ignoreNullsFlag && (args.${k}) == null then null "
-                "        else { name = k; value = builtins.toString args.${k}; }; "
+                "        else { name = k; value = builtins.__derivCoerce args.${k}; }; "
                 "      envEntries = "
                 "        builtins.filter (e: e != null) "
                 "          (builtins.map envKeyValue keys); "
