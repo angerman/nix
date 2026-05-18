@@ -1457,10 +1457,30 @@ static inline std::string v3ValueTypeName(Value v)
 static inline std::string v3ThunkTracePos(const Thunk * t)
 {
     if (!t) return "<no-pos>";
+    // 2026-05-18: disambiguate <no-pos> cases for cc-wrapper bisection.
+    // Pre-fix the kind annotation when the thunk lacks position info so
+    // the cross-evaluator NIX_TRACE_EVAL diff makes the source of the
+    // mystery thunk visible.  Gated on NIX_TRACE_EVAL_VERBOSE_NOPOS so
+    // normal trace stays clean for fixture comparisons.
+    static const bool s_verboseNoPos =
+        std::getenv("NIX_TRACE_EVAL_VERBOSE_NOPOS") != nullptr;
+    auto formatNoPos = [t](const char * label) -> std::string {
+        if (!s_verboseNoPos) return "<no-pos>";
+        char buf[96];
+        std::snprintf(buf, sizeof buf,
+            "<no-pos:%s t=%p st=%d>", label, (void *)t, (int)t->state);
+        return std::string(buf);
+    };
+    // For Bridge thunks, suspended.desc reads the wrong union member;
+    // their position info isn't useful.  Tag them as bridge.
+    if (t->state == ThunkState::Bridge) return formatNoPos("bridge");
+    if (t->state == ThunkState::Evaluated) return formatNoPos("evald");
+    if (t->state == ThunkState::Native) return formatNoPos("native");
     const LambdaDescriptor * d = t->suspended.desc;
-    if (!d) return "<no-pos>";
+    if (!d) return formatNoPos("nodesc");
     const PosSnapshot * ps = resolvePosSnapshot(d->posHandle);
-    if (!ps || ps->file.empty()) return "<no-pos>";
+    if (!ps) return formatNoPos("noresol");
+    if (ps->file.empty()) return formatNoPos("emptyfile");
     return nix::evalTrace::formatPos(ps->file, ps->line, ps->column);
 }
 
@@ -5375,10 +5395,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Conditional-cheap (single FILE* null check when disabled).
             if (__builtin_expect(nix::evalTrace::enabled(), 0)) {
                 const PosSnapshot * ps = resolvePosSnapshot(desc->posHandle);
-                std::string posStr =
-                    (ps && !ps->file.empty())
-                        ? nix::evalTrace::formatPos(ps->file, ps->line, ps->column)
-                        : std::string("<no-pos>");
+                std::string posStr;
+                if (ps && !ps->file.empty()) {
+                    posStr = nix::evalTrace::formatPos(ps->file, ps->line, ps->column);
+                } else {
+                    // 2026-05-18 cc-wrapper bisection: when verbose-no-pos
+                    // is requested, decorate <no-pos> with desc name +
+                    // thunk pointer so the cross-evaluator diff can
+                    // disambiguate which synthesized thunk we're forcing.
+                    static const bool s_verboseNoPos =
+                        std::getenv("NIX_TRACE_EVAL_VERBOSE_NOPOS") != nullptr;
+                    if (s_verboseNoPos) {
+                        char buf[128];
+                        std::snprintf(buf, sizeof buf,
+                            "<no-pos:opforce name=%.40s t=%p>",
+                            desc->name.empty() ? "<?>" : desc->name.c_str(),
+                            (void *)t);
+                        posStr = buf;
+                    } else {
+                        posStr = "<no-pos>";
+                    }
+                }
                 nix::evalTrace::enterForce(posStr);
             }
             // V3_DBG_HOT_FORCE: count total dispatches + unique thunk

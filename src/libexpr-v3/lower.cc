@@ -1606,10 +1606,41 @@ struct Lowerer
         if (forArg) {
             if (k == nix::Expr::Kind::ConcatStrings) {
                 auto * cs = static_cast<nix::ExprConcatStrings *>(e);
-                if (!cs->forceString) return true;  // arithmetic — safe eager
                 // String interpolation — must thunk so unused branches
                 // don't evaluate the parts.
-                return false;
+                if (cs->forceString) return false;
+                // BR-3 bug-2 (2026-05-18): `''str ${X} str'' + Y` is
+                // parsed as an OUTER ExprConcatStrings(forceString=false,
+                // [(p1, inner-interp), (p2, Y)]).  The OUTER fS=false
+                // suggested "arithmetic — safe eager" historically, but
+                // the INNER operand may be an ExprConcatStrings with
+                // forceString=true (the `''str ${X} str''` interpolation)
+                // whose eager lowering forces ${X} immediately.
+                //
+                // Repro: forcing `stdenv.cc.drvAttrs.postFixup` on aarch64-
+                // darwin nixpkgs hits `targetPackages.stdenv.cc.isGNU`
+                // (null) because the optionalString call at cc-wrapper.nix:
+                // 665-682 has body `''shell ${gccForLibs}...'' + optionals
+                // (!isArocc) (...)` whose outer `+` matched fS=false here
+                // and the inner ${gccForLibs} got force-emitted in the
+                // outer block (see project_cc_wrapper_bisection_2026-05-18.md
+                // for the trace divergence and IR evidence).
+                //
+                // Fix: recursively check operands.  If any operand is
+                // itself a string-interpolation (fS=true) ConcatStrings,
+                // the whole `+` expression is not safe-eager; thunkify
+                // the outer.  Arithmetic `n + 1` (all operands trivial
+                // Int/Var/etc.) still bypasses thunkification — fib's
+                // hot-path `f (n - 1)` chain stays cheap.
+                for (auto & p : cs->es) {
+                    nix::Expr * sub = p.second;
+                    if (!sub) continue;
+                    if (sub->exprKind == nix::Expr::Kind::ConcatStrings) {
+                        auto * subCs = static_cast<nix::ExprConcatStrings *>(sub);
+                        if (subCs->forceString) return false;
+                    }
+                }
+                return true;  // pure arithmetic — safe eager
             }
             if (k == nix::Expr::Kind::Call) {
                 auto * c = static_cast<nix::ExprCall *>(e);
