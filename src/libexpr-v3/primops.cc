@@ -5005,12 +5005,40 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
                 std::string drvName = "<unknown>";
                 const auto & syms = drvStrictSymbols();
                 if (auto * nv = args[0].payload.bindings->lookup(syms.name)) {
-                    if (nv->isString() && nv->payload.str)
-                        drvName = nv->payload.str;
+                    // Force the name attr (it may still be a Thunk
+                    // when the native path throws — eg if name comes
+                    // alphabetically after the attr that triggered
+                    // the throw, primDerivationStrictNative's iter
+                    // hasn't reached it yet).  Wrap in try/catch so
+                    // diagnostic doesn't itself blow up.
+                    try {
+                        Value forced = forceValue(*state.vm, *nv);
+                        if (forced.isString() && forced.payload.str)
+                            drvName = forced.payload.str;
+                    } catch (...) { drvName = "<force-failed>"; }
                 }
                 std::fprintf(stderr,
                     "v3 derivationStrict native fell back on `%s`: %s\n",
                     drvName.c_str(), e.what());
+                // Also dump args attrNames for forensics.  Helps
+                // determine whether the failing args truly belong to
+                // the named derivation or some inner wrapper layer.
+                if (args[0].payload.bindings) {
+                    std::fprintf(stderr,
+                                 "  args attrNames (%u): ",
+                                 args[0].payload.bindings->size);
+                    const auto & symTab = ir::globalSymbolTable();
+                    const Bindings * b = args[0].payload.bindings;
+                    for (uint32_t i = 0; i < b->size && i < 40; ++i) {
+                        SymbolId sid = b->entries[i].name;
+                        std::fprintf(stderr, "%s ",
+                                     sid < symTab.size()
+                                         ? symTab[sid].c_str() : "<?>");
+                    }
+                    if (b->size > 40)
+                        std::fprintf(stderr, "...(+%u more)", b->size - 40);
+                    std::fprintf(stderr, "\n");
+                }
             }
             // fall through to the bridge below.
         }

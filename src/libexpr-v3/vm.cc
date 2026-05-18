@@ -6037,27 +6037,43 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         // This is the cheapest way to tell "envKeyValue
                         // called with k=<which attr name>" without
                         // instrumenting the wrapper itself.
+                        //
+                        // If slot 0 is a Thunk, peek into the thunk's
+                        // body for a known-value (the v3 thunk may
+                        // already be in Evaluated state with the result
+                        // cached, in which case .value is the forced
+                        // string).  We do NOT call forceValue here —
+                        // we're in the middle of an exception throw
+                        // path, recursion is dangerous.
                         char argBuf[128] = "";
+                        auto formatValue = [&](const Value & v) {
+                            if (v.tag() == Tag::String && v.payload.str) {
+                                std::snprintf(argBuf, sizeof(argBuf),
+                                              " arg0=\"%.96s\"", v.payload.str);
+                            } else if (v.tag() == Tag::Int) {
+                                std::snprintf(argBuf, sizeof(argBuf),
+                                              " arg0=%lld", (long long)v.payload.i);
+                            } else if (v.tag() == Tag::Bool) {
+                                std::snprintf(argBuf, sizeof(argBuf),
+                                              " arg0=%s",
+                                              v.payload.i == 1 ? "true" : "false");
+                            } else if (v.tag() == Tag::Null) {
+                                std::snprintf(argBuf, sizeof(argBuf), " arg0=null");
+                            } else {
+                                std::snprintf(argBuf, sizeof(argBuf),
+                                              " arg0=<tag=%d>", (int)v.tag());
+                            }
+                        };
                         if (frD.closure
                             && frD.stackBaseOffset < vm.valueStack.size())
                         {
                             const Value & v0 = vm.valueStack[frD.stackBaseOffset];
-                            if (v0.tag() == Tag::String && v0.payload.str) {
-                                const char * s = v0.payload.str;
-                                std::snprintf(argBuf, sizeof(argBuf),
-                                              " arg0=\"%.96s\"", s);
-                            } else if (v0.tag() == Tag::Int) {
-                                std::snprintf(argBuf, sizeof(argBuf),
-                                              " arg0=%lld", (long long)v0.payload.i);
-                            } else if (v0.tag() == Tag::Bool) {
-                                std::snprintf(argBuf, sizeof(argBuf),
-                                              " arg0=%s",
-                                              v0.payload.i == 1 ? "true" : "false");
-                            } else if (v0.tag() == Tag::Null) {
-                                std::snprintf(argBuf, sizeof(argBuf), " arg0=null");
+                            if (v0.tag() == Tag::Thunk && v0.payload.thunk
+                                && v0.payload.thunk->state == ThunkState::Evaluated)
+                            {
+                                formatValue(v0.payload.thunk->evaluated);
                             } else {
-                                std::snprintf(argBuf, sizeof(argBuf),
-                                              " arg0=<tag=%d>", (int)v0.tag());
+                                formatValue(v0);
                             }
                         }
                         std::fprintf(stderr,
