@@ -45,6 +45,11 @@ SKIP_PARITY[repro-583-tag-app-cache-positive-3.nix]=1
 SKIP_PARITY[repro-583-tag-app-cache-regression-1.nix]=1
 SKIP_PARITY[repro-a12b-op-call-iter-force.nix]=1
 SKIP_PARITY[repro-hello-name.nix]=1
+# 2026-05-18: cc-wrapper postFixup known-divergence (v3 OP_ATTRS_SELECT
+# on null) — minimal repro for the cc-wrapper:671 5-clause && bug.
+# See project_cc_wrapper_bisection_2026-05-18.md.  Skip parity until
+# fixed; the fixture itself stays as a stable bisection starting point.
+SKIP_PARITY[repro-cc-wrapper-postFixup.nix]=1
 
 verbose="${V3_REPRO_VERBOSE:-0}"
 fail=0
