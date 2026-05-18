@@ -320,6 +320,13 @@ void optimise(Module & m)
     constantFold(m);
     inlineTrivialBindings(m);
 
+    // 2026-05-18 IR Phase C: stream fusion.  Recognises
+    // `foldl'(op, init, map(f, xs))` and rewrites to a single
+    // __foldlMap PrimOpCall.  Runs AFTER Phase B so any Phase-B
+    // folding of `map` (none today, but future) doesn't break the
+    // pattern match.
+    streamFusion(m);
+
     // OPT_OCCUR Phase B: opt-in occurrence-info-driven DCE.  When both
     // gates are set, run side-by-side and assert identical removal
     // sets (the migration-validation harness).  When only NIX_V3_OCCUR_DCE

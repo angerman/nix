@@ -33,6 +33,7 @@ on the bisect → fixture → permanent-guard workflow.
 | `repro-beta-reduce.nix` | IR Phase A semantic guard (8 patterns) | (session 2026-05-18) | TW + v3 ON + v3 OFF (NIX_V3_NO_BETA_REDUCE=1) all match |
 | `repro-beta-reduce-perf.nix` | IR Phase A alloc-reduction guard | (session 2026-05-18) | v3 ON: 10 closures; v3 OFF: 19 closures (47% reduction) |
 | `repro-primop-fold.nix` | IR Phase B semantic guard (11 patterns) | (session 2026-05-18) | TW + v3 ON + v3 OFF (NIX_V3_NO_PRIMOP_FOLD=1) all match; on static `length [1..10]`: insns 56→23, lists 1→0 |
+| `repro-stream-fusion.nix` | IR Phase C semantic + perf guard (foldl'+map → __foldlMap) | (session 2026-05-18) | TW + v3 ON + v3 OFF (NIX_V3_NO_STREAM_FUSION=1) all match; N=100K perf budget 5s catches PrimOpCall-shape regression (60× slowdown) |
 
 ## Run all repros
 

@@ -797,6 +797,16 @@ size_t betaReduce(Module & m);
 /// PrimOpCall bindings folded.
 size_t primOpFold(Module & m);
 
+/// IR Phase C (2026-05-18): stream fusion.  Recognises
+/// `foldl'(op, init, map(f, xs))` IR patterns and rewrites to
+/// `__foldlMap(op, init, f, xs)` — a single-pass FFI leaf primop.
+/// Eliminates the intermediate map result list + N callClosure
+/// invocations + one list traversal.  Use-once safety check on the
+/// map's result VarId prevents work duplication.
+/// Gate: NIX_V3_NO_STREAM_FUSION=1 disables.  Returns the number of
+/// foldl' bindings rewritten.
+size_t streamFusion(Module & m);
+
 /// #429: fuse App-chains over LitPrimOp into a single PrimOpCall.
 /// Detects the let/inherit-from indirection pattern that escapes
 /// lowerCall's direct-recognition (e.g. `let inherit (builtins) map;

@@ -189,8 +189,22 @@ void installBytecodePrimop(
     // ->value` and `state.baseEnv.values[displ]` point to the same
     // Value* (per `addPrimOp` in libexpr/eval.cc:580-589), so this
     // single mutation propagates to all TW lookup paths.
-    nix::Value & target = state.getBuiltin(primopName);
-    target = *bridged;
+    //
+    // 2026-05-18: try/catch — some primops are registered only in v3
+    // (e.g. __foldlMap from IR Phase C).  getBuiltin throws on
+    // missing names.  Falling through to path 2 + path 3 still
+    // installs the v3-side replacement, which is all we need for
+    // v3-direct evaluation.
+    try {
+        nix::Value & target = state.getBuiltin(primopName);
+        target = *bridged;
+    } catch (const std::exception & e) {
+        if (dbgEnabled())
+            std::fprintf(stderr,
+                "v3 bytecode-primop install: '%s' not in TW builtins "
+                "(%s) — skipping path 1, continuing with v3-side install\n",
+                primopName.c_str(), e.what());
+    }
 
     // Install path 2: register in v3's side-table keyed by v3 PrimOp
     // pointer.  This is what makes v3's OP_LIT_PRIMOP / OP_CALL_PRIMOP
@@ -307,6 +321,25 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "        if i >= n then acc "
                 "        else "
                 "          let next = op acc (builtins.elemAt list i); "
+                "          in builtins.seq next (go (i + 1) next); "
+                "  in go 0 nul");
+
+        // 2026-05-18: IR Phase C stream-fusion target.  __foldlMap
+        // implements `foldl' op nul (map f xs)` in a single iterative
+        // pass — no intermediate list allocation, no per-element
+        // C-recursion via callClosure.  Body mirrors the foldl'
+        // bytecode above but inlines the `f` application per element.
+        // The opt_stream_fusion pass rewrites detected foldl'+map
+        // patterns to PrimOpCall(__foldlMap, [op, nul, f, xs]).
+        if (!std::getenv("NIX_V3_NO_BC_FOLDLMAP"))
+            installBytecodePrimop(state, "__foldlMap",
+                "op: nul: f: list: "
+                "  let n = builtins.length list; "
+                "      go = i: acc: "
+                "        if i >= n then acc "
+                "        else "
+                "          let fx = f (builtins.elemAt list i); "
+                "              next = op acc fx; "
                 "          in builtins.seq next (go (i + 1) next); "
                 "  in go 0 nul");
 
