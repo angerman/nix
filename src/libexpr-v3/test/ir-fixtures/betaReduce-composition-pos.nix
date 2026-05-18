@@ -1,5 +1,5 @@
-# RUN: v3-eval --expr '(x: x * 2) 21' --emit-ir-raw | v3-check %s --check-prefix=RAW
-# RUN: v3-eval --expr '(x: x * 2) 21' --emit-ir | v3-check %s --check-prefix=OPT
+# RUN: v3-eval --file %s --emit-ir-raw | v3-check %s --check-prefix=RAW
+# RUN: v3-eval --file %s --emit-ir     | v3-check %s --check-prefix=OPT
 #
 # Phase A (betaReduce) + Phase B (constantFold) composition.
 # `(x: x * 2) 21` lowers to App(Lambda, 21).  Beta-reduction inlines
@@ -8,6 +8,8 @@
 #
 # Multi-RUN demonstrates --check-prefix= for testing the same source
 # under different optimisation modes (RAW = pre-opt, OPT = post-opt).
+
+(x: x * 2) 21
 
 # Pre-opt: the unfolded App-of-Lambda + the body's Mul are present.
 # RAW-LABEL: B1:

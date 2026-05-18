@@ -88,8 +88,10 @@ in multi-RUN fixtures to assert different shapes per RUN.
 2. **Find a minimal Nix expression** that exercises the phase.  Smaller
    = less brittle.  E.g. `2 * 3` for Mul folding, not `let a = ...;
    in 2 * 3 + a`.
-3. **Run `v3-eval --expr '<EXPR>' --emit-ir`** by hand to see the
-   actual post-opt IR.
+3. **Run `v3-eval --file %s --emit-ir`** by hand (substituting `%s`
+   with your fixture's path) to see the actual post-opt IR.  Do NOT
+   use `--expr 'EXPR'` for fixtures: the `--file %s` form is the
+   canonical convention (see `src/libexpr-v3/CLAUDE.md`).
 4. **Write the CHECK directives** asserting the SPECIFIC thing the
    phase does:
    - `CHECK:` — what should appear (the desired post-opt shape).
@@ -113,18 +115,67 @@ pattern, and the surrounding context.  Typical failure modes:
   pattern.  Either the pass regressed, or the fixture is too strict
   (e.g. forbids something that's legitimately present).
 
+## Canonical RUN: line convention
+
+All fixtures use the **`--file %s`** form (per the plan's §501-525
+canonical convention):
+
+```
+# RUN: v3-eval --file %s --emit-ir | v3-check %s
+```
+
+The Nix expression body of the fixture is the test source.  `%s` is
+substituted by the runner with the fixture's own path, so `v3-eval`
+parses the fixture's Nix expression directly and `v3-check` reads
+the same file for `# CHECK:` directives.  This mirrors LLVM's
+`.ll`-file pattern exactly: one self-contained file, one logical
+test scenario, one source body, optionally multiple RUN: lines
+under different compiler modes (with `--check-prefix=`).
+
+For different SOURCES (different Nix expressions), use SEPARATE
+fixture files — that's how the `ifFold-true-pos.nix` /
+`ifFold-false-pos.nix` / `appSpineFold-n2-pos.nix` /
+`appSpineFold-n3-pos.nix` etc. families are organized.
+
 ## Files
 
-Positive (assert pass FIRES correctly):
-- `constantFold-arith-pos.nix` — Phase B (opt_const_fold): `2 * 3 → LitInt 6`.
-- `primOpFold-length-pos.nix` — Phase B (opt_primop_fold): `length [1..5] → LitInt 5`.
-- `betaReduce-composition-pos.nix` — Phase A + Phase B: `(x: x*2) 21 → LitInt 42` (multi-RUN).
-- `streamFusion-foldlMap-pos.nix` — Phase C: `foldl' op nul (map f xs) → __foldlMap` App-chain.
-- `lambdaLift-capture-free-pos.nix` — Phase D precondition: lowerer marks freeVars correctly.
-- `elimRedundantForce-inline-pos.nix` — inlineTrivialBindings + elimRedundantForce: cleanup of A-normal-form scaffolding.
+Phase A — beta-reduce:
+- `betaReduce-composition-pos.nix` — `(x: x*2) 21 → LitInt 42` (multi-RUN RAW/OPT).
+- `betaReduce-nested-lambda-neg.nix` — refuses `(x: y: x + y) 5` (nested Lambda body).
 
-Negative (assert pass DOES NOT fire when its safety check should refuse):
-- `betaReduce-nested-lambda-neg.nix` — Phase A refuses `(x: y: x + y) 5` (body contains nested Lambda).
+Phase B — const-fold + primop-fold:
+- `constantFold-arith-pos.nix` — `2 * 3 → LitInt 6`.
+- `primOpFold-length-pos.nix` — `length [1..5] → LitInt 5`.
+
+Phase C — stream fusion:
+- `streamFusion-foldlMap-pos.nix` — `foldl' op nul (map f xs) → __foldlMap` App-chain.
+
+Phase D — lambda lift precondition:
+- `lambdaLift-capture-free-pos.nix` — capture-free lambda has no freeVars.
+- `lambdaLift-capturing-neg.nix` — capturing lambda has freeVars + nUp=1.
+
+Phase E — selector recognition:
+- `selectorLambda-recognition-pos.nix` — `(p: p.name)` IR shape preserved through opt.
+
+Phase F — App-spine fold:
+- `appSpineFold-n2-pos.nix` — `(x: y: x*y) 6 7 → LitInt 42`.
+- `appSpineFold-n3-pos.nix` — `(x: y: z: x*y*z) 2 3 4 → LitInt 24`.
+- `appSpineFold-n4-pos.nix` — 4-arg curry (ConcatStrings due to `+` ambiguity).
+- `appSpineFold-impure-arg-neg.nix` — refuses impure args.
+
+Phase G — if-fold:
+- `ifFold-true-pos.nix` — `if true then 100 else 200 → LitInt 100`.
+- `ifFold-false-pos.nix` — `if false then 100 else 200 → LitInt 200`.
+- `ifFold-with-less-cond-pos.nix` — `if 1<2 ...` (Phase B + G composition).
+- `ifFold-with-eq-cond-pos.nix` — `if (1==2) ...` (Phase B + G composition).
+
+Phase H — genList unroll:
+- `genListUnroll-n4-pos.nix` — N=4 unrolls to 4 MkThunks + ListExpr.
+- `genListUnroll-n1-pos.nix` — N=1 boundary case still unrolls.
+- `genListUnroll-n16-neg.nix` — N=16 above kMaxUnrollN=8; PrimOpCall preserved.
+
+Cleanup composition:
+- `elimRedundantForce-inline-pos.nix` — inlineTrivialBindings + elimRedundantForce.
 
 ## Adding a new fixture
 
