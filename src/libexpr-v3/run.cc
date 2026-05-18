@@ -185,6 +185,12 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             (unsigned long long)a.thunksForced,
             (unsigned long long)a.bridgeThunksForced,
             (unsigned long long)a.bytecodeInstructions);
+        // #660 verification: dump bridge-primop call counts.  v3-eval
+        // already does this via its own NIX_VM_STATS path; mirror here
+        // so the integrated `nix` CLI (and any future v3 driver that
+        // goes through `runRootExpr`) reports the same data without
+        // depending on the CLI specifically.
+        dumpPrimOpStats(stderr);
     }
     return out;
 }

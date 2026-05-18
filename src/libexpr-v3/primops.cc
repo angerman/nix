@@ -7739,14 +7739,16 @@ void dumpPrimOpStats(std::FILE * out)
     uint64_t br1 = nix::v3::g_bridgeCallBridge1Calls.load(std::memory_order_relaxed);
     uint64_t bra = nix::v3::g_bridgeForceAttrCalls.load(std::memory_order_relaxed);
     uint64_t brl = nix::v3::g_bridgeForceListElemCalls.load(std::memory_order_relaxed);
-    if (br1 || bra || brl) {
-        std::fprintf(out,
-            "v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=%llu "
-            "__v3_force_attr=%llu __v3_force_list_elem=%llu\n",
-            (unsigned long long)br1,
-            (unsigned long long)bra,
-            (unsigned long long)brl);
-    }
+    // Always print: a zero on these is itself the kill-criterion signal
+    // we need to retire the TW-side bridge primops (#660 / OPT #3).
+    // Suppression-on-zero made "did the workload exercise this path?"
+    // un-answerable from stats alone.
+    std::fprintf(out,
+        "v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=%llu "
+        "__v3_force_attr=%llu __v3_force_list_elem=%llu\n",
+        (unsigned long long)br1,
+        (unsigned long long)bra,
+        (unsigned long long)brl);
 
     auto & c = primOpCounter();
     std::lock_guard<std::mutex> g(c.mtx);

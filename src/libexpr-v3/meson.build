@@ -127,6 +127,18 @@ install_headers(
 )
 
 # Tiny CLI: `v3-eval FILE.nix` — parses, lowers, runs.
+#
+# Bumped stack on darwin to 64 MiB to mirror `src/nix/meson.build`'s
+# main-`nix` executable: v3-direct's residual C-recursion on deep
+# stdenv.mkDerivation chains consumes ~14 KiB/frame × ~5000 logical
+# forces, which overflows darwin's kernel-default 8 MiB pthread stack
+# and SIGSEGVs silently.  Backstop pending the iterative-force
+# refactor (see lode/A12B_BYTECODE_PRIMOPS_2026-05-17.md).
+v3_eval_link_args = []
+if host_machine.system() == 'darwin'
+  v3_eval_link_args += [ '-Wl,-stack_size,0x4000000' ]  # 64 MiB
+endif
+
 v3_eval = executable(
   'v3-eval',
   'cli/v3-eval.cc',
@@ -136,6 +148,7 @@ v3_eval = executable(
       include_directories : include_dirs,
     ),
   ],
+  link_args : v3_eval_link_args,
   install : true,
 )
 
