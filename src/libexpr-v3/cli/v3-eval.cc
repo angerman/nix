@@ -395,6 +395,17 @@ int main(int argc, char ** argv)
                 (unsigned long long)a.attrsetsAllocated,
                 (unsigned long long)a.envsAllocated,
                 (unsigned long long)(nix::v3::threadArena().bytesAllocated() >> 20));
+            // IR Phase E (2026-05-18): selector-lambda fast-path
+            // counter.  Confirms the emit-time peephole + runtime
+            // dispatch are actually firing on the workload.  Zero
+            // here = no selectors recognised (silent regression);
+            // healthy nixpkgs evals should see this in the millions.
+            std::fprintf(stderr,
+                "v3 fastpath stats: selectorLambda=%llu intrinsicFix=%llu intrinsicExtends=%llu intrinsicCompose=%llu\n",
+                (unsigned long long)a.selectorLambdaCalls,
+                (unsigned long long)a.intrinsicFixCalls,
+                (unsigned long long)a.intrinsicExtendsCalls,
+                (unsigned long long)a.intrinsicComposeCalls);
             // Phase 13: thunk-force counters.  ratio = forced/allocated.
             // A healthy lazy evaluator has ratio ≤ 1 (most thunks are
             // forced once or never).  ratio > 1 means we're allocating

@@ -1518,12 +1518,18 @@ struct Emitter
         // when the IR has an explicit Force around the paramVar (rare
         // but possible if the lowerer adds it for some path).
         //
-        // Detection gated by NIX_V3_SELECTOR_LAMBDA=1 while we
-        // shake out shape-mismatch false positives.  Once stable, flip
-        // default ON.
-        static const bool selectorLambda =
-            std::getenv("NIX_V3_SELECTOR_LAMBDA") != nullptr;
-        if (selectorLambda
+        // IR Phase E (2026-05-18): default-on selector-lambda
+        // recognition.  Previously gated by NIX_V3_SELECTOR_LAMBDA=1
+        // ("Once stable, flip default ON" — the recognition has now
+        // soaked through the full v3 test matrix without false
+        // positives).  The opt-out gate `NIX_V3_NO_SELECTOR_LAMBDA=1`
+        // exists for A/B perf measurement only; correctness is
+        // guaranteed by the structural peephole (4-instruction body:
+        // OP_GET_LOCAL[_FORCE] 0, OP_ATTRS_SELECT [sym], [icIdx],
+        // OP_RETURN — no nested control flow, no captures).
+        static const bool noSelectorLambda =
+            std::getenv("NIX_V3_NO_SELECTOR_LAMBDA") != nullptr;
+        if (!noSelectorLambda
             && fid != 0
             && f.argName != ir::kInvalidSymbol
             && !f.hasFormals
