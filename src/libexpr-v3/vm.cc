@@ -46,8 +46,64 @@
 #include <string>
 #include <unordered_map>
 #include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+#include <cstring>
 
 namespace nix::v3 {
+
+// #670 diagnostic: SIGTRAP / SIGBUS / SIGSEGV handler.  Gated on
+// `V3_DBG_SIGTRAP=1`.  When the v3 dispatcher hits a `brk #1` or
+// other fatal-signal landing pad without a clean exception throw,
+// the default macOS handler kills the process with exit 133/138 and
+// no diagnostics.  This handler captures the trap PC, signal info,
+// and C-stack backtrace to stderr via async-signal-safe primitives
+// before exiting cleanly.  Off by default so debuggers' SIGTRAP
+// (breakpoint) handling stays normal.
+namespace {
+[[noreturn]] void v3SignalDiagHandler(int sig, siginfo_t * info, void * /*ucontext*/)
+{
+    const char header[] = "\n*** v3 fatal-signal diag (V3_DBG_SIGTRAP=1) ***\n";
+    (void)::write(2, header, sizeof header - 1);
+
+    char buf[256];
+    int n = std::snprintf(buf, sizeof buf,
+        "signal=%d si_code=%d si_addr=%p si_errno=%d\n",
+        sig, info ? info->si_code : 0,
+        info ? info->si_addr : nullptr,
+        info ? info->si_errno : 0);
+    if (n > 0) (void)::write(2, buf, std::min<int>(n, (int)sizeof buf));
+
+    void * frames[64];
+    int nf = ::backtrace(frames, 64);
+    if (nf > 0) ::backtrace_symbols_fd(frames, nf, 2);
+
+    // _exit (not exit) to avoid running atexit handlers that may
+    // re-throw or recurse.  133 = signal 5 (SIGTRAP) by the +128
+    // convention; macOS sets exit code = signum.  Stay consistent
+    // with the original signal so callers see the same exit code.
+    int code = (sig == SIGTRAP) ? 133 : (sig == SIGBUS) ? 138 : (sig == SIGSEGV) ? 139 : 134;
+    _exit(code);
+}
+
+struct V3SignalDiagInstaller {
+    V3SignalDiagInstaller() {
+        if (!std::getenv("V3_DBG_SIGTRAP")) return;
+        struct sigaction sa = {};
+        sa.sa_sigaction = v3SignalDiagHandler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        ::sigaction(SIGTRAP, &sa, nullptr);
+        ::sigaction(SIGBUS,  &sa, nullptr);
+        ::sigaction(SIGSEGV, &sa, nullptr);
+        const char msg[] = "v3 signal-diag installed (SIGTRAP/SIGBUS/SIGSEGV)\n";
+        (void)::write(2, msg, sizeof msg - 1);
+    }
+};
+// Static init runs at library load.  Cost on no-env case: one
+// std::getenv lookup + a non-taken branch.
+static V3SignalDiagInstaller _v3_signal_diag_installer;
+} // namespace
 
 // #456 fix: forward decls for the bridge entry points used in
 // OP_CALL's Bridge-thunk branch.  Defined in primops.cc.
@@ -1485,9 +1541,35 @@ inline void clearForceWriteback(CallFrame & f) noexcept
 /// (CFF_FORCE_WB, used by per-opcode arg pre-forcing) and pop top.
 /// Returns true when a writeback was applied (so callers can suppress
 /// the CFF_FORCE_RETRY chain — the opcode will re-scan on re-entry).
-inline bool applyForceWriteback(VMState & vm) noexcept
+// #670 (2026-05-19): dropped the `noexcept` qualifier that was here.
+// Under macOS clang+libc++ with hardening, out-of-bounds vector access
+// traps via `__builtin_trap` (brk #1).  When that fires inside a
+// `noexcept` function, the C++ runtime can't unwind cleanly — it routes
+// directly to `std::terminate`, which clang compiles to another `brk #1`
+// shared across every throw site in `dispatchLoop`.  Result: silent
+// SIGTRAP (exit 133) with no diagnostic, no `__cxa_throw` breakpoint,
+// no stderr.  Pinned via lldb: link register at trap time pointed to
+// the instruction right after `applyForceWriteback(vm)` at vm.cc:4960
+// — i.e. the trap was INSIDE this function.  Bounds-check each
+// `valueStack.back()` / `valueStack[...]` access and throw a
+// `std::runtime_error` with state.  Without `noexcept`, the exception
+// propagates to the dispatch-loop catch and surfaces as a normal error.
+// Pre-fix, ghc98.drvPath / ghc910 / ghc984 all SIGTRAPped at this
+// point; post-fix they surface a typed error (or succeed, if the
+// upstream stack-state corruption isn't really a corruption — see
+// project_670_ghc98_sigtrap_2026-05-19.md for the diagnostic chain).
+inline bool applyForceWriteback(VMState & vm)
 {
+    if (__builtin_expect(vm.frames.empty(), 0))
+        throw std::runtime_error(
+            "v3 applyForceWriteback: vm.frames is empty (FWB invariant violated)");
     CallFrame & f = vm.frames.back();
+    auto needTop = [&](const char * where) {
+        if (vm.valueStack.empty())
+            throw std::runtime_error(
+                std::string("v3 applyForceWriteback: valueStack empty in ") + where
+                + " (flags=" + std::to_string((unsigned)f.flags) + ")");
+    };
     if (f.flags & CFF_FORCE_WB_PTR_KEEP) {
         // 2026-05-17: keep-on-stack variant.  Used by opcodes whose
         // architectural contract leaves the selected value on the
@@ -1496,6 +1578,7 @@ inline bool applyForceWriteback(VMState & vm) noexcept
         // resumes op_force_slow to chase further.  This keeps the
         // source slot from being polluted with intermediate
         // Tag::App / Tag::Thunk forwarders.
+        needTop("CFF_FORCE_WB_PTR_KEEP");
         Value top = vm.valueStack.back();
         Tag t = top.tag();
         if (t == Tag::Thunk || t == Tag::App || t == Tag::Slot)
@@ -1506,6 +1589,7 @@ inline bool applyForceWriteback(VMState & vm) noexcept
         return true;
     }
     if (f.flags & CFF_FORCE_WB_PTR) {
+        needTop("CFF_FORCE_WB_PTR");
         Value forced = vm.valueStack.back();
         vm.valueStack.pop_back();
         if (f.forceWriteTarget) *f.forceWriteTarget = forced;
@@ -1515,9 +1599,24 @@ inline bool applyForceWriteback(VMState & vm) noexcept
     }
     if (!(f.flags & CFF_FORCE_WB)) return false;
     uint16_t off = getForceWriteback(f);
+    needTop("CFF_FORCE_WB");
     Value forced = vm.valueStack.back();
     vm.valueStack.pop_back();
-    vm.valueStack[f.stackBaseOffset + off] = forced;
+    // #670: bounds-check the slot write.  After pop_back, the
+    // valueStack size shrank by 1, so the target index must be
+    // < the post-pop size.  When defer-on + with-slot-chase is on,
+    // certain emit-time corruptions produced a writeback slot that
+    // pointed BEYOND the current frame's reserved locals, hitting
+    // the libc++ hardened operator[] trap.
+    size_t idx = (size_t)f.stackBaseOffset + (size_t)off;
+    if (__builtin_expect(idx >= vm.valueStack.size(), 0)) {
+        throw std::runtime_error(
+            "v3 applyForceWriteback: writeback slot out of bounds "
+            "(stackBase=" + std::to_string(f.stackBaseOffset)
+            + " off=" + std::to_string(off)
+            + " size=" + std::to_string(vm.valueStack.size()) + ")");
+    }
+    vm.valueStack[idx] = forced;
     clearForceWriteback(f);
     return true;
 }
