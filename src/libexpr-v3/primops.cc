@@ -394,6 +394,32 @@ inline bool valueEqual(VMState & vm, Value a, Value b)
     case Tag::Attrs: {
         auto * aa = a.payload.bindings; auto * bb = b.payload.bindings;
         if (aa == bb) return true;
+        // 2026-05-19 #666: TW's eqValues (libexpr/eval.cc:3365)
+        // special-cases derivations: if both sides have `type =
+        // "derivation"`, compare ONLY their `outPath` (the canonical
+        // derivation identity).  Skipping this caused v3's
+        // `builtins.elem` / `lib.unique` to consider two references
+        // to the same derivation (e.g. `pkgs.python3` vs
+        // `pkgs.python3Packages.python`) as DIFFERENT when one had a
+        // slightly different attr-set shape — duplicates leaked into
+        // `requiredPythonModules` and propagated into the python3-env
+        // buildEnv's chosenOutputs JSON, diverging the drv hash.
+        static const SymbolId sType    = ir::globalInternSymbol("type");
+        static const SymbolId sOutPath = ir::globalInternSymbol("outPath");
+        auto isDerivation = [&](Bindings * b) -> bool {
+            if (!b) return false;
+            if (const Value * tv = b->lookup(sType)) {
+                Value f = forceValue(vm, *tv);
+                return f.isString() && f.payload.str
+                    && std::string_view(f.payload.str) == "derivation";
+            }
+            return false;
+        };
+        if (isDerivation(aa) && isDerivation(bb)) {
+            const Value * oa = aa->lookup(sOutPath);
+            const Value * ob = bb->lookup(sOutPath);
+            if (oa && ob) return valueEqual(vm, *oa, *ob);
+        }
         uint32_t na = aa ? aa->size : 0; uint32_t nb = bb ? bb->size : 0;
         if (na != nb) return false;
         for (uint32_t i = 0; i < na; ++i) {
@@ -994,7 +1020,22 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
                              || et == Tag::App
                              || et == Tag::Slot, 0))
             el = forceValue(*state.vm, el);
-        if (!el.isString()) typeError("concatStringsSep", "list of strings");
+        // 2026-05-19 #666: TW's prim_concatStringsSep
+        // (libexpr/primops.cc:5282) calls coerceToString on each
+        // element, which handles paths, derivation attrsets (via
+        // __toString / outPath), bools, etc. — not just already-
+        // strings.  Pre-fix v3 only accepted strings, so e.g.
+        // buildEnv's `paths = [ drv1 drv2 ]` passed through
+        // `lib.concatStringsSep " " paths` (in postBuild) was
+        // rejected when each `drv` is an attrset.  Caused python3-
+        // env / firefox / lutok / etc. to fall back to the v3
+        // fake-store path.  Reuse toStringCoerceCtx to match TW.
+        if (!el.isString()) {
+            std::string coerced = toStringCoerceCtx(state, el, ctx,
+                /*copyPathsToStore=*/false);
+            result += coerced;
+            continue;
+        }
         absorb(el.payload.str);
         result += el.payload.str;
     }
