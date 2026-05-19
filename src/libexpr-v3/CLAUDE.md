@@ -34,6 +34,55 @@ A commit may exit an investigation by falsifying a model (delete code + gate), c
 
 This is the upstream rule. All others in ACTION_PLAN Part 1 are specializations.
 
+## Running v3 probes safely (operational essentials)
+
+When invoking `v3-eval` or `nix eval --impure --expr ...` against any non-trivial workload (anything that touches nixpkgs), **always** combine these:
+
+```bash
+NIX_V3_MAX_WALL_TIME=30s   # or 60s for known-long evals
+NIX_V3_MAX_HEAP=2G          # tune per workload (Boehm grows past 1 GB on hello.drvPath)
+NIX_V3_MAX_CPU_TIME=60s     # CPU budget; useful when WALL_TIME may be too loose
+NIX_V3_DIRECT_EVAL=1
+NIX_V3_SKIP_INSTALLABLE_PREEVAL=1
+```
+
+The limits are real (`limits.cc` / `initLimits()`, called from `runRootExpr`).
+They throw typed errors (`WallTimeExceededError` / `CpuTimeExceededError` /
+`OutOfMemoryError`) with allocation stats — far better than a SIGKILL.
+USAGE.md §"Resource limits" documents the units (K/M/G for heap; s/m/h for time).
+
+**Verified 2026-05-19**: `NIX_V3_MAX_WALL_TIME=2s v3-eval --expr 'let f = x: f x; in f 0'` throws
+`v3 WallTimeExceededError: NIX_V3_MAX_WALL_TIME=2.00s exceeded after 2.00s
+ (alloc: closures=12 thunks=1 lists=1 attrsets=1 rss=29.73 MB boehm_heap=384.25 MB)`.
+
+**Do NOT rely on shell-level `timeout`** when probing v3:
+- macOS `ulimit -v` is a no-op for virtual memory.
+- SIGTERM from `timeout` skips v3's clean unwind and drops the alloc stats.
+- The v3-internal cap survives across re-entrant `runRootExpr` calls (bytecode-primop install path).
+
+### NIX_V3_SKIP_INSTALLABLE_PREEVAL is mandatory for honest v3-direct testing
+
+For `nix eval --impure --expr ...`, `NIX_V3_DIRECT_EVAL=1` alone is **not enough**.
+The CLI's `parseInstallables` (libcmd/installables.cc:482-504) runs
+`state->eval(e, *vFile)` — full TW evaluation — UNLESS BOTH
+`NIX_V3_DIRECT_EVAL=1` AND `NIX_V3_SKIP_INSTALLABLE_PREEVAL=1` are set, in which
+case it uses `vFile->mkThunk(...)` (lazy, no TW eval).
+
+Without `SKIP_INSTALLABLE_PREEVAL`, TW evaluates the entire expression first; its
+result populates `*vFile` but is unused by `runV3DirectEval`. The user sees v3's
+output, but for working expressions both evaluators succeed and the answers
+agree — masking v3-only failures behind TW's working result. **A "v3 matches
+TW" finding from `nix eval --impure` is meaningless unless `SKIP_PREEVAL` is set.**
+
+This bit me on 2026-05-19 during #665/#666/#667: hello.drvPath etc. appeared to
+match TW even when v3-direct alone couldn't compute them — TW was carrying the
+load. Discovered when investigating `builtins.__derivCoerce` (v3-only primop)
+threw "missing" via `nix eval --impure --expr` even though `v3-eval` standalone
+worked: TW's preeval was raising before v3 could lower.
+
+For the `v3-eval` binary directly, there is no preeval — it's already
+v3-only. The gate is only needed in the `nix` CLI path.
+
 ## Critical constraints (hard rules; load-bearing)
 
 0. **Today's allocator is Boehm conservative GC**, inherited from cppnix. The Cheney nursery design (`CHENEY_NURSERY_DESIGN.md`) exists; Phase A (allocator) and Phase C (scavenge) have landed but are gated `NIX_V3_NURSERY=1` opt-in (default-OFF). Phase D (write barriers) is unresolved. **Do not assume nursery semantics in v3 code**. Empirical consequence: Boehm heap grows past 1 GB on `hello.drvPath` runs and stays there. See LESSONS §1.6 and `EXTEND_DERIVATION_INVESTIGATION_2026-05-18.md`.
