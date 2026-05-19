@@ -201,10 +201,16 @@ static bool runV3DirectEval(
         std::cout << v3::toJsonValue(r, v3::ir::globalSymbolTable()).dump() << "\n";
     } else {
         // Default print.  forceDeep so nested thunks render as values.
+        // #669: use the TW-style rich printer (`«derivation /path»`,
+        // `«lambda <name>? @ <pos>»`, `«primop <name>»`) instead of the
+        // simplified printer that powers `nix-instantiate --eval`.  The
+        // simplified printer is reserved for the lang-test golden
+        // comparison harness (v3-eval / nix-instantiate); user-facing
+        // `nix eval` matches TW's surface form.
         nix::evalTrace::mark("eval.cc:182 forceDeep(default print)");
         r = v3::forceDeep(vm, r);
         std::ostringstream os;
-        v3::printNixValue(os, r, v3::ir::globalSymbolTable());
+        v3::printNixValueRich(os, r, v3::ir::globalSymbolTable());
         logger->cout("%s", os.str());
     }
 

@@ -13,7 +13,8 @@
 
 #include "v3/print.hh"
 #include "v3/alloc.hh"
-#include "v3/primop.hh"  // forceValue
+#include "v3/closure.hh"  // LambdaDescriptor for printNixValueRich
+#include "v3/primop.hh"  // forceValue, PrimOp
 
 #include <nlohmann/json.hpp>
 
@@ -238,6 +239,188 @@ void printNixValue(std::ostream & out, const Value & v,
 {
     std::set<const void *> seen;
     printNixValue(out, v, symTab, seen);
+}
+
+// ===========================================================================
+// printNixValueRich — TW-style printer for `nix eval --impure` (#669)
+// ---------------------------------------------------------------------------
+// Differs from `printNixValue` only in the function / derivation / primop
+// cases.  Scalars and recursive structure (lists, attrset entries) reuse
+// the same formatting so output stays consistent across modes.
+// ===========================================================================
+
+/// Returns true iff the attrset looks like a derivation (matches TW's
+/// `isDerivation(v)` predicate: has `type = "derivation"` attr).  When
+/// true, `outDrvPath` is set to the value's `drvPath` attr (a String).
+/// Used by the rich printer to emit `«derivation <drvPath>»` instead of
+/// expanding the full attrset.
+static bool tryGetDerivationDrvPath(const Value & v,
+                                    const std::vector<std::string> & symTab,
+                                    std::string_view & outDrvPath)
+{
+    if (v.tag() != Tag::Attrs || !v.payload.bindings) return false;
+    auto * b = v.payload.bindings;
+    // Helper: linear-scan lookup of a key by name (Bindings is sorted by
+    // SymbolId, not name, so we cannot bsearch on the name directly without
+    // resolving every SymbolId first).  Derivations have ~5-10 attrs at this
+    // level so the linear cost is negligible.
+    auto find = [&](std::string_view want) -> const Value * {
+        for (uint32_t i = 0; i < b->size; ++i) {
+            auto & en = b->entries[i];
+            std::string_view nm = (en.name < symTab.size())
+                ? std::string_view(symTab[en.name])
+                : std::string_view{};
+            if (nm == want) return &en.value;
+        }
+        return nullptr;
+    };
+    const Value * typeV = find("type");
+    if (!typeV || typeV->tag() != Tag::String) return false;
+    if (!typeV->payload.str || std::string_view(typeV->payload.str) != "derivation")
+        return false;
+    const Value * drvPathV = find("drvPath");
+    if (!drvPathV || drvPathV->tag() != Tag::String) return false;
+    outDrvPath = drvPathV->payload.str ? drvPathV->payload.str : "";
+    return true;
+}
+
+void printNixValueRich(std::ostream & out, const Value & v,
+                       const std::vector<std::string> & symTab,
+                       std::set<const void *> & seen)
+{
+    switch (v.tag()) {
+    case Tag::Int:    out << (long long)v.payload.i; return;
+    case Tag::Float:  out << v.payload.f; return;
+    case Tag::Bool:   out << (v.payload.i == 1 ? "true" : "false"); return;
+    case Tag::Null:   out << "null"; return;
+    case Tag::String: printLiteralString(out, v.payload.str ? std::string_view(v.payload.str) : std::string_view()); return;
+    case Tag::Path:   out << (v.payload.path ? v.payload.path : ""); return;
+    case Tag::List: {
+        if (v.payload.list && v.payload.list->size > 0 &&
+            !seen.insert(&v).second) {
+            out << "«repeated»"; return;
+        }
+        out << "[ ";
+        if (v.payload.list)
+            for (uint32_t i = 0; i < v.payload.list->size; ++i) {
+                printNixValueRich(out, v.payload.list->elems[i], symTab, seen);
+                out << ' ';
+            }
+        out << "]";
+        return;
+    }
+    case Tag::Attrs: {
+        // Derivation detection happens BEFORE cycle tracking so the
+        // compact form prints even if we'd revisit the bindings — TW
+        // does the same (a derivation rendered twice prints
+        // `«derivation /path»` both times).
+        std::string_view drvPath;
+        if (tryGetDerivationDrvPath(v, symTab, drvPath)) {
+            out << "«derivation " << drvPath << "»";
+            return;
+        }
+        if (v.payload.bindings && v.payload.bindings->size > 0 &&
+            !seen.insert(v.payload.bindings).second) {
+            out << "«repeated»"; return;
+        }
+        out << "{ ";
+        if (v.payload.bindings) {
+            std::vector<std::pair<std::string, const Value *>> items;
+            items.reserve(v.payload.bindings->size);
+            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
+                auto & en = v.payload.bindings->entries[i];
+                std::string key = (en.name < symTab.size())
+                    ? symTab[en.name] : std::to_string(en.name);
+                items.emplace_back(std::move(key), &en.value);
+            }
+            std::sort(items.begin(), items.end(),
+                      [](auto & a, auto & b) { return a.first < b.first; });
+            for (auto & [name, val] : items) {
+                printAttrName(out, name);
+                out << " = ";
+                printNixValueRich(out, *val, symTab, seen);
+                out << "; ";
+            }
+        }
+        out << "}";
+        return;
+    }
+    case Tag::Closure: {
+        // TW format: «lambda <name>? @ <file>:<line>:<col>».
+        // - Name: TW prints `lambda <name>` only when the lambda has a
+        //   contextual binding (e.g. let-bound).  v3 stores either the
+        //   contextual name or the arg name in `desc->name`; without
+        //   the source distinction TW makes, we omit the name entirely
+        //   to avoid diverging on the anonymous-lambda case (which is
+        //   the common one in `nix eval --impure --expr "x: x"`).
+        //   Full parity requires lower.cc to track "is this name a
+        //   contextual binding?" — see #669 follow-up.
+        // - File: lower.cc emits `<string>` / `<stdin>` / `<unknown>`
+        //   for the synthesized source markers; TW emits the French-
+        //   quoted forms `«string»` / `«stdin»`.  Rewrite at print time.
+        out << "«lambda";
+        const auto * c = v.payload.closure;
+        if (c && c->desc) {
+            if (auto * ps = resolvePosSnapshot(c->desc->posHandle)) {
+                out << " @ ";
+                if (ps->file.empty()) {
+                    out << "«string»";
+                } else if (ps->file == "<string>") {
+                    out << "«string»";
+                } else if (ps->file == "<stdin>") {
+                    out << "«stdin»";
+                } else if (ps->file == "<unknown>") {
+                    out << "«none»";
+                } else {
+                    out << ps->file;
+                }
+                out << ':' << ps->line << ':' << ps->column;
+            }
+        }
+        out << "»";
+        return;
+    }
+    case Tag::PrimOp: {
+        out << "«primop";
+        if (v.payload.primop && !v.payload.primop->name.empty())
+            out << ' ' << v.payload.primop->name;
+        out << "»";
+        return;
+    }
+    case Tag::PrimOpApp: {
+        // TW format: «partially applied primop <name>».  Walk the
+        // App-spine via ValuePair::left until we reach the base
+        // Tag::PrimOp; that's the primop being curried.  Limit to a
+        // small depth to avoid pathological loops (real chains are
+        // bounded by the primop's arity, at most 8).
+        out << "«partially applied primop";
+        const Value * cur = &v;
+        int hops = 0;
+        while (cur && cur->tag() == Tag::PrimOpApp && cur->payload.pair && hops < 16) {
+            cur = &cur->payload.pair->left;
+            ++hops;
+        }
+        if (cur && cur->tag() == Tag::PrimOp
+            && cur->payload.primop && !cur->payload.primop->name.empty())
+            out << ' ' << cur->payload.primop->name;
+        out << "»";
+        return;
+    }
+    case Tag::Thunk:    out << "«thunk»"; return;
+    case Tag::App:      out << "«app»"; return;
+    case Tag::Blackhole:out << "«blackhole»"; return;
+    case Tag::External: out << "«external»"; return;
+    case Tag::Slot:     out << "«slot»"; return;
+    case Tag::Uninitialized:
+    default:            out << "«value tag=" << (int)v.tag() << "»"; return;
+    }
+}
+
+void printNixValueRich(std::ostream & out, const Value & v,
+                       const std::vector<std::string> & symTab)
+{
+    std::set<const void *> seen;
+    printNixValueRich(out, v, symTab, seen);
 }
 
 } // namespace nix::v3

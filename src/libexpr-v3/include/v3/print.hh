@@ -54,6 +54,30 @@ void printNixValue(std::ostream & out, const Value & v,
 void printNixValue(std::ostream & out, const Value & v,
                    const std::vector<std::string> & symTab);
 
+/// Rich-form printer used by `nix eval --impure` (i.e. the
+/// runV3DirectEval path).  Matches TW's `ValuePrinter`
+/// (`libexpr/print.cc`):
+///
+///   - Tag::Attrs whose payload looks like a derivation (has `type =
+///     "derivation"` AND `drvPath`) → `«derivation /nix/store/<...>.drv»`.
+///   - Tag::Closure → `«lambda <name>? @ <file>:<line>:<col>»` (the
+///     name is omitted for anonymous lambdas; the position comes from
+///     the closure's LambdaDescriptor `posHandle`).
+///   - Tag::PrimOp / PrimOpApp → `«primop <name>»` / `«primop-app»`.
+///   - Tag::Thunk / App / Slot / Blackhole / External / Uninitialized
+///     → the existing simplified tokens (no TW-rich equivalent).
+///
+/// The simplified `printNixValue` is preserved verbatim so the
+/// lang-test golden suite (`tests/functional/lang/eval-okay-*.exp`)
+/// keeps passing — `nix-instantiate --eval --strict` uses TW's
+/// `printAmbiguous`, which IS the simplified form.  Only the
+/// user-facing `nix eval` CLI gets the rich form.  See #669.
+void printNixValueRich(std::ostream & out, const Value & v,
+                       const std::vector<std::string> & symTab,
+                       std::set<const void *> & seen);
+void printNixValueRich(std::ostream & out, const Value & v,
+                       const std::vector<std::string> & symTab);
+
 /// v3 Value → JSON, matching `builtins.toJSON` semantics:
 ///   - scalars / lists / attrs serialise normally.
 ///   - functions throw `runtime_error("cannot convert a function to
