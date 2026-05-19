@@ -227,6 +227,14 @@ struct LambdaDescriptor
     /// V3_DBG_OPCYCLE / disassembler dumps to map LambdaDescriptor
     /// pointers back to the original AST scope.
     std::string name;
+    /// #669 follow-up: contextual binding name (set when this lambda
+    /// originated from a `let foo = ...` / `{ foo = ...; }` binding).
+    /// Empty for anonymous lambdas — `name` may still have an arg-name
+    /// fallback for diagnostics, but `contextualName` only carries the
+    /// real binding name.  Used by `printNixValueRich` to match TW's
+    /// `«lambda <name>? @ pos»` exactly (TW omits the `<name>` slot
+    /// unless `ExprLambda::name` was set by the parser via setName).
+    std::string contextualName;
     /// Source position handle for the lambda body (1-based posSnapshotPool
     /// index; 0 = unknown).  Mirrors ir::Function::posHandle so
     /// V3_DBG_FORCE_TRACE can print file:line:col per thunk-force,

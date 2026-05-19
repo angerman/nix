@@ -495,6 +495,15 @@ struct Function {
     /// Optional name for diagnostics (e.g. lambda or attribute name).
     std::string         name;
 
+    /// #669 follow-up: contextual binding name (let-bound / attr-bound)
+    /// as set by TW's parser on `ExprLambda::name` via `setName`.  Empty
+    /// for anonymous lambdas, even when `name` (above) carries an
+    /// arg-name fallback for diagnostic dumps.  Used by
+    /// `printNixValueRich` (the `nix eval` printer) to decide whether
+    /// to emit `«lambda <name> @ pos»` — TW only emits the name when
+    /// this contextual binding is set.
+    std::string         contextualName;
+
     /// Source position handle (1-based index into posSnapshotPool, 0 = unknown).
     /// Used by V3_DBG_FORCE_TRACE to print file:line:col per force,
     /// matching tree-walker's TW_DBG_FORCE format for direct trace diff.

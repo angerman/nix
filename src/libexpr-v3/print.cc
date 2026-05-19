@@ -347,20 +347,21 @@ void printNixValueRich(std::ostream & out, const Value & v,
     }
     case Tag::Closure: {
         // TW format: «lambda <name>? @ <file>:<line>:<col>».
-        // - Name: TW prints `lambda <name>` only when the lambda has a
-        //   contextual binding (e.g. let-bound).  v3 stores either the
-        //   contextual name or the arg name in `desc->name`; without
-        //   the source distinction TW makes, we omit the name entirely
-        //   to avoid diverging on the anonymous-lambda case (which is
-        //   the common one in `nix eval --impure --expr "x: x"`).
-        //   Full parity requires lower.cc to track "is this name a
-        //   contextual binding?" — see #669 follow-up.
+        // - Name: print `desc->contextualName` (set by lower.cc from
+        //   `ExprLambda::name`, which TW's parser populates via
+        //   `setName` for let/attr-bound lambdas).  Empty for
+        //   anonymous lambdas, which TW also prints without a name.
+        //   The arg-name in `desc->name` is the diagnostic fallback
+        //   (V3_DBG_* dumps) — never emitted in user-facing output.
         // - File: lower.cc emits `<string>` / `<stdin>` / `<unknown>`
         //   for the synthesized source markers; TW emits the French-
         //   quoted forms `«string»` / `«stdin»`.  Rewrite at print time.
         out << "«lambda";
         const auto * c = v.payload.closure;
         if (c && c->desc) {
+            if (!c->desc->contextualName.empty()) {
+                out << ' ' << c->desc->contextualName;
+            }
             if (auto * ps = resolvePosSnapshot(c->desc->posHandle)) {
                 out << " @ ";
                 if (ps->file.empty()) {

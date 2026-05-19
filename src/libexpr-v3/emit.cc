@@ -1483,6 +1483,7 @@ struct Emitter
             .nWithTargets   = f.nWithTargets,
             .formals        = {},
             .name           = f.name,
+            .contextualName = f.contextualName,
             .posHandle      = f.posHandle,
             // #495: native-intrinsic kind (0=None, 1=Fix, 2=Extends, ...)
             // -- when set, OP_CALL on a closure with this descriptor

@@ -1106,6 +1106,17 @@ struct Lowerer
         m.functions[fid].entryBlock = entry;
         m.functions[fid].paramVar   = param;
         m.functions[fid].name       = e->arg ? std::string(symbols[e->arg]) : "<formals>";
+        // #669 follow-on: TW's parser writes `ExprLambda::name` via
+        // `setName` when the lambda is bound by a `let foo = ...` or
+        // `{ foo = ...; }` (see libexpr/nixexpr.cc).  Carry that
+        // contextual name through to the LambdaDescriptor so the
+        // user-facing `nix eval` printer can emit `«lambda foo @ pos»`
+        // and match TW's `printFunction`.  Stays empty for anonymous
+        // lambdas; `name` (above) keeps the arg-name diagnostic
+        // fallback for V3_DBG_* dumps.
+        if (e->name) {
+            m.functions[fid].contextualName = std::string(symbols[e->name]);
+        }
         m.functions[fid].posHandle  = posIdxToHandle(e->getPos());
         // #493 / #484 follow-on: capture the original ExprLambda* so emit
         // can carry it through to LambdaDescriptor and v3ToTreeWalker can
