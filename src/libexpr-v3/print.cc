@@ -408,10 +408,14 @@ void printNixValueRich(std::ostream & out, const Value & v,
         return;
     }
     case Tag::Thunk:    out << "«thunk»"; return;
-    case Tag::App:      out << "«app»"; return;
-    case Tag::Blackhole:out << "«blackhole»"; return;
+    case Tag::App:      out << "«thunk»"; return;  // TW prints both Thunk + App as «thunk»
+    // TW's printThunk emits the explanatory phrasing for Blackhole — see
+    // libexpr/print.cc:489-500.  The phrasing is intentionally hedged
+    // ("potential") because a blackhole-in-context might still resolve
+    // via builtins.trace etc.; match it byte-for-byte.
+    case Tag::Blackhole:out << "«potential infinite recursion»"; return;
     case Tag::External: out << "«external»"; return;
-    case Tag::Slot:     out << "«slot»"; return;
+    case Tag::Slot:     out << "«slot»"; return;  // v3-only; no TW analog
     case Tag::Uninitialized:
     default:            out << "«value tag=" << (int)v.tag() << "»"; return;
     }
