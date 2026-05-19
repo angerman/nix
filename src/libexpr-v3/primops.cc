@@ -7637,8 +7637,21 @@ void primFromJSON(EvalState & state, Value * args, Value & out)
 
 void primToJSON(EvalState & state, Value * args, Value & out)
 {
-    auto j = valueToJson(state, args[0]);
+    // 2026-05-19 #672: builtins.toJSON must preserve string contexts of
+    // interpolated derivations / paths.  Pre-fix v3 used valueToJson()
+    // which dropped contexts, breaking luaPackages / nixpkgs callPackage
+    // chains that use `lib.generators.toLua` which emits `toJSON "${drv}"`
+    // — the resulting writeText derivation lost inputDrvs entries for
+    // every interpolated derivation, producing divergent .drv hashes
+    // (luaPackages.dkjson etc.).  Tree-walker's prim_toJSON uses
+    // printValueAsJSON with a NixStringContext& accum (libexpr/primops.cc:
+    // 2154); switch to v3's matching valueToJsonWithContext + register
+    // entries on the output string buffer.
+    nix::NixStringContext context;
+    auto j = valueToJsonWithContext(state, args[0], context);
     out = mkStringValueOwned(j.dump());
+    if (!context.empty())
+        setStringContext(out.payload.str, context);
 }
 
 // BR-3.12: context-tracking JSON serialization.  Mirrors
@@ -7686,10 +7699,19 @@ nlohmann::json valueToJsonWithContext(
     }
     case Tag::Attrs: {
         // __toString self overrides JSON serialization (matches Nix
-        // coercion rules) — but Phase A defers __toString.  For
-        // Phase D we accept that and fall through to outPath instead;
-        // structuredAttrs derivations very rarely use __toString.
+        // coercion rules); check before outPath so an attrset with both
+        // (e.g. lib.makeStorePathAppendable) uses __toString.  #672
+        // (2026-05-19): used by builtins.toJSON via primToJSON, which
+        // previously bypassed __toString — eval-okay-tojson exercises
+        // this with `k = { __toString = self: self.a; a = "foo"; }`.
         if (v.payload.bindings) {
+            static const SymbolId tsId = ir::globalInternSymbol("__toString");
+            if (auto * fn = v.payload.bindings->lookup(tsId)) {
+                Value forced = forceValue(*state.vm, *fn);
+                Value s = callClosure(*state.vm, forced, v);
+                s = forceValue(*state.vm, s);
+                return valueToJsonWithContext(state, s, context);
+            }
             const auto & sym = drvStrictSymbols();
             // outPath fallback for derivations.
             if (auto * op = v.payload.bindings->lookup(sym.outPath)) {
