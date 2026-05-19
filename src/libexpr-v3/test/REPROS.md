@@ -39,6 +39,7 @@ on the bisect → fixture → permanent-guard workflow.
 | `repro-665-tostring-vs-derivcoerce.nix` | `toString` non-copying vs new `__derivCoerce` copying; bash bootstrap cascade fix | `7b2535fc9` (2026-05-19, #665) | TW + v3-direct must match |
 | `repro-666-derivation-equality.nix` | `primops.cc` `valueEqual` derivation outPath special-case (was diverging from `vm.cc` `valueEqual`) — `builtins.elem` + `lib.unique` on derivations | `45da225c6` (2026-05-19, #666) | TW + v3-direct must match |
 | `repro-667-assert-force.nix` | `OP_ASSERT` CFF_FORCE_RETRY iterative-force protocol (was the only bool-consuming opcode missing it) — unblocks gtk3 / firefox-unwrapped / firefox | `120def5bc` (2026-05-19, #667) | TW + v3-direct must match |
+| `repro-668-defer-across-branch.nix` | #542 emit-time deferring leaked OP_SET_LOCAL ops INSIDE then-block via flushAllDeferred-on-block-entry; else-path saw mismatched stack depth → later OP_GET_LOCAL on Uninit slot → STR_CONCAT cascade → SIGTRAP on go.drvPath | (2026-05-19, #668) | TW + v3-direct must match |
 
 ## Run all repros
 

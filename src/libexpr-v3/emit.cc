@@ -168,6 +168,46 @@ struct Emitter
         }
     }
 
+    /// Flush deferred entries that sit BELOW the runtime-stack TOP
+    /// (the conditional value) before a divergent branch opcode runs.
+    ///
+    /// Why this exists (the #668 bug): tryFastPathUnary(cond) pops the
+    /// cond from pendingDefer but leaves DEEPER pending entries in
+    /// place.  Those entries' runtime values sit BELOW the cond on the
+    /// value stack.  The branch opcode (OP_BRANCH_FALSE / OP_AND_BRANCH
+    /// / OP_OR_BRANCH / OP_IMPL_BRANCH) then dispatches one of two
+    /// disjoint paths.  Each path's first emitBlock() entry calls
+    /// flushAllDeferred(), which emits OP_SET_LOCAL ops that pop the
+    /// deferred runtime values to their slots.  But the SETs are
+    /// emitted INSIDE whichever path the emitter visits FIRST; the
+    /// other path (the JUMP target) sees no SETs and leaves the
+    /// deferred values un-consumed on the value stack.  At the merge
+    /// point both paths must have the same stack depth — they don't,
+    /// and subsequent OP_GET_LOCAL reads return Tag::Uninitialized.
+    ///
+    /// Repro pinned in test/repro-668-defer-across-branch.nix:
+    ///   with { a = "x"; }; "_${if a == "z" then "y" else "n"}_"
+    /// Bytecode dump showed `OP_SET_LOCAL 4` emitted inside the THEN
+    /// branch (from the inner flushAllDeferred) but absent in ELSE; at
+    /// runtime ELSE path's later `OP_GET_LOCAL 4` read the never-set
+    /// slot, surfacing as `STR_CONCAT cannot coerce type to string
+    /// (tag=0)` and a SIGTRAP exception cascade on go.drvPath.
+    ///
+    /// Fix: stash cond into a scratch slot, flush remaining pending
+    /// (their SETs now run UNCONDITIONALLY before the branch dispatch),
+    /// then restore cond on top.  When pending is already empty (the
+    /// fib `if k < 2 then ... else ...` fast path), this is a no-op
+    /// and the branch op runs directly on the deferred cond as before.
+    void flushBelowBranchCond()
+    {
+        if (ctx->pendingDefer.empty()) return;
+        uint16_t scratchSlot = ctx->nextSlot++;
+        if (scratchSlot + 1 > ctx->nLocals) ctx->nLocals = scratchSlot + 1;
+        unit.code.push_back(encode(OP_SET_LOCAL, scratchSlot));
+        flushAllDeferred();
+        unit.code.push_back(encode(OP_GET_LOCAL, scratchSlot));
+    }
+
     /// Try to consume a binary-op's [lhs, rhs] from the pending stack
     /// top.  If pending ends with [lhs, rhs] in order, pop both and
     /// return true (caller emits just the OP).  Else return false
@@ -627,6 +667,10 @@ struct Emitter
         // #542 unary fast path: lhs may be deferred at top of pending.
         if (!tryFastPathUnary(e.lhs))
             emitVarRef(e.lhs);
+        // #668: flush deferred values below the cond (see comment on
+        // flushBelowBranchCond).  Both OP_AND_BRANCH paths must see
+        // identical stack depth at the merge.
+        flushBelowBranchCond();
         uint32_t at = emitJumpPlaceholder(OP_AND_BRANCH);
         emitBlock(e.rhsBlock);
         patchJump(at, static_cast<uint32_t>(unit.code.size()));
@@ -635,6 +679,7 @@ struct Emitter
     {
         if (!tryFastPathUnary(e.lhs))
             emitVarRef(e.lhs);
+        flushBelowBranchCond();  // #668
         uint32_t at = emitJumpPlaceholder(OP_OR_BRANCH);
         emitBlock(e.rhsBlock);
         patchJump(at, static_cast<uint32_t>(unit.code.size()));
@@ -643,6 +688,7 @@ struct Emitter
     {
         if (!tryFastPathUnary(e.lhs))
             emitVarRef(e.lhs);
+        flushBelowBranchCond();  // #668
         uint32_t at = emitJumpPlaceholder(OP_IMPL_BRANCH);
         emitBlock(e.rhsBlock);
         patchJump(at, static_cast<uint32_t>(unit.code.size()));
@@ -661,6 +707,14 @@ struct Emitter
         // BRANCH_FALSE` to `<expr-cond>; BRANCH_FALSE`.
         if (!tryFastPathUnary(e.cond))
             emitVarRef(e.cond);
+        // #668: when tryFastPathUnary popped only the cond from a
+        // non-singleton pending list, the deeper deferred values sit
+        // BELOW the cond on the runtime stack.  Without this flush
+        // thenBlock's emitBlock would commit them to slots ONLY in the
+        // then path, leaving elseBlock with the deeper values still on
+        // stack and later OP_GET_LOCAL reads landing on Uninitialized
+        // slots.  See flushBelowBranchCond for the full reasoning.
+        flushBelowBranchCond();
         uint32_t bf = emitJumpPlaceholder(OP_BRANCH_FALSE);
         emitBlock(e.thenBlock);
         uint32_t je = emitJumpPlaceholder(OP_JUMP);

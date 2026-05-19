@@ -627,45 +627,6 @@ inline std::string coerceToString(const Value & v, bool forceString)
             std::snprintf(buf, sizeof buf,
                 "v3 STR_CONCAT: cannot coerce type to string (tag=%u)",
                 (unsigned)v.tag());
-            // 2026-05-19 #668 trace: Tag::Uninitialized (tag=0) appears
-            // in nixpkgs go.drvPath / haskell.compiler.ghc98.drvPath
-            // evaluation, recursively through primDerivationFromPreprocessed
-            // → getString("builder") → forceValue → OP_STR_CONCAT.  Always
-            // log the C-stack frame for tag=0 so the producer can be
-            // identified.  The Boost coroutine in sourceToSink can cascade
-            // this throw into terminate; logging makes the root cause
-            // diagnosable from a single crash run rather than requiring
-            // lldb.
-            static const bool dbg = std::getenv("V3_DBG_STRCONCAT") != nullptr;
-            // 2026-05-19 #668 Tag::Uninitialized origin probe: dump a
-            // C-stack backtrace on FIRST encounter (rate-limited to once
-            // per process) so the producer of the default-constructed
-            // Value is visible in the failure output without lldb.
-            if (v.tag() == Tag::Uninitialized) {
-                static std::atomic<int> seen{0};
-                if (seen.fetch_add(1) == 0) {
-                    std::fprintf(stderr,
-                        "v3 STR_CONCAT: FIRST Tag::Uninitialized — origin probe (#668):\n");
-                    void * cstack[40];
-                    int n = ::backtrace(cstack, 40);
-                    char ** syms = ::backtrace_symbols(cstack, n);
-                    for (int i = 0; i < n && i < 20; ++i)
-                        std::fprintf(stderr, "  %s\n", syms[i]);
-                    if (syms) std::free(syms);
-                }
-            }
-            if (dbg || v.tag() == Tag::Uninitialized) {
-                std::fprintf(stderr, "%s%s\n", buf,
-                    v.tag() == Tag::Uninitialized
-                        ? "  (this is a default-constructed Value — bug; see #668)"
-                        : "");
-                if (v.tag() == Tag::Closure && v.payload.closure && v.payload.closure->desc) {
-                    auto * d = v.payload.closure->desc;
-                    std::fprintf(stderr, "  closure: %s code=[%u..) nUp=%u\n",
-                        !d->name.empty() ? d->name.c_str() : "<anon>",
-                        d->codeOffset, d->nUpvalues);
-                }
-            }
             throw std::runtime_error(buf);
         }
     }
