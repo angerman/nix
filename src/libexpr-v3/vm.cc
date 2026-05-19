@@ -8149,6 +8149,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_ASSERT: {
+            // 2026-05-19 #667: like OP_NOT / OP_AND_BRANCH / OP_BRANCH_FALSE,
+            // OP_ASSERT must force its operand before the bool check.
+            // Pre-fix v3 popped raw and called isTrueValue, which throws
+            // "v3: expected bool" on Thunk/App/Slot.  Caught while
+            // investigating gtk3.drvPath (an assertion in nixpkgs's
+            // mkDerivation chain — typically `assert lib.assertMsg ...;`
+            // — landed on a Slot pointing to a Thunk during the
+            // derivation-attr iteration of primConcatLists).  The other
+            // bool-consuming opcodes already handle this via the
+            // CFF_FORCE_RETRY iterative-force protocol; OP_ASSERT was
+            // simply missed.
+            Value & top = vm.valueStack.back();
+            if (top.isThunk() || top.tag() == Tag::App
+                || top.tag() == Tag::Slot)
+            {
+                ip = ip - 1;
+                vm.frames.back().flags |= CFF_FORCE_RETRY;
+                goto op_force_slow;
+            }
             Value c = pop(vm);
             if (!isTrueValue(c)) throw AssertionError("v3 OP_ASSERT: assertion failed");
             break;
