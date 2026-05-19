@@ -339,6 +339,47 @@ static void setStringContext(const char * buf, const nix::NixStringContext & ctx
     setStringContextEntries(buf, encodeStringContext(ctx));
 }
 
+/// Throw `the string '%s' is not allowed to refer to a store path` if the
+/// argument carries any string context.  Mirrors TW's `forceStringNoCtx`
+/// (eval.cc:2826).  Used by primops that take a string and must reject
+/// contexted inputs: parseDrvName / splitVersion / getEnv /
+/// compareVersions / etc.  Caller has already verified
+/// `args[0].isString()`.
+///
+/// Format matches TW exactly: `(such as '<displayed-context-elem>')`
+/// where `<displayed-context-elem>` is the elem's `display(*store)`
+/// form (e.g. `/nix/store/<hash>-<name>.drv^out` for a Built entry).
+/// Without the display-format conversion, callers that pattern-match
+/// the error string would see v3's internal encoding instead.
+static void requireNoStringContext(EvalState & state, const Value & v,
+                                    std::string_view primopName)
+{
+    if (!v.isString()) return;
+    auto * raw = lookupStringContextEntries(v.payload.str);
+    if (!raw || raw->empty()) return;
+    std::string display;
+    if (state.nixEvalState) {
+        try {
+            auto elem = nix::NixStringContextElem::parse(raw->front());
+            // `store` is `ref<Store>` so always non-null; deref directly.
+            display = elem.display(*state.nixEvalState->store);
+        } catch (...) {
+            display = raw->front();
+        }
+    } else {
+        display = raw->front();
+    }
+    // Match TW's wording byte-for-byte (eval.cc:2832) so callers that
+    // pattern-match the error string don't need a v3-specific branch.
+    (void)primopName;
+    std::string buf = "the string '";
+    if (v.payload.str) buf.append(v.payload.str);
+    buf += "' is not allowed to refer to a store path (such as '";
+    buf += display;
+    buf += "')";
+    throw std::runtime_error(std::move(buf));
+}
+
 std::mutex & registryMutex()
 {
     static std::mutex m;
@@ -1302,9 +1343,13 @@ void primAny(EvalState & state, Value * args, Value & out)
     out = any ? Value::vTrue : Value::vFalse;
 }
 
-void primGetEnv(EvalState &, Value * args, Value & out)
+void primGetEnv(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("getEnv", "string");
+    // #674: TW's prim_getEnv uses forceStringNoCtx; mirror it so
+    // contexted strings can't be used as env-var names (would mask
+    // accidental drv references in callers).
+    requireNoStringContext(state, args[0], "getEnv");
     const char * e = std::getenv(args[0].payload.str);
     out = mkStringValueOwned(e ? e : "");
 }
@@ -1356,10 +1401,14 @@ bool componentsLT(std::string_view c1, std::string_view c2)
 
 } // anonymous namespace
 
-void primCompareVersions(EvalState &, Value * args, Value & out)
+void primCompareVersions(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString() || !args[1].isString())
         typeError("compareVersions", "two strings");
+    // #674: TW's prim_compareVersions uses forceStringNoCtx on both
+    // args (libexpr/primops.cc:1463-area).
+    requireNoStringContext(state, args[0], "compareVersions");
+    requireNoStringContext(state, args[1], "compareVersions");
     std::string_view v1(args[0].payload.str);
     std::string_view v2(args[1].payload.str);
     auto p1 = v1.begin();
@@ -1928,9 +1977,13 @@ void primToPath(EvalState & state, Value * args, Value & out)
 /// builtins.splitVersion "1.2.3-alpha" -> ["1" "2" "3" "alpha"].
 /// Splits on '.' and '-'; consecutive separators produce empty strings
 /// (matching tree-walker behaviour).
-void primSplitVersion(EvalState &, Value * args, Value & out)
+void primSplitVersion(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("splitVersion", "string");
+    // #674: TW's prim_splitVersion uses forceStringNoCtx; v3 must
+    // reject contexted strings to match (eval-okay-version tests pin
+    // the error path).
+    requireNoStringContext(state, args[0], "splitVersion");
     std::string_view s(args[0].payload.str);
     std::vector<std::string> parts;
     std::string cur;
@@ -2989,6 +3042,10 @@ void primReadDir(EvalState & state, Value * args, Value & out)
 void primParseDrvName(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("parseDrvName", "string");
+    // #674: TW's prim_parseDrvName uses forceStringNoCtx; v3 must
+    // match the rejection so contexted derivation-name strings can't
+    // sneak through (e.g. callers that accidentally pass `"${drv}"`).
+    requireNoStringContext(state, args[0], "parseDrvName");
     std::string s(args[0].payload.str);
     size_t cut = std::string::npos;
     for (size_t i = 0; i + 1 < s.size(); ++i) {
@@ -6790,13 +6847,24 @@ static std::string xmlEscape(std::string_view s)
 
 /// Recursive XML serializer mirroring tree-walker's printValueAsXML
 /// (no source-location tracking — v3 doesn't carry that yet anyway).
-static void valueToXml(EvalState & state, std::string & out, Value v, int indent)
+static void valueToXml(EvalState & state, std::string & out, Value v, int indent,
+                       nix::NixStringContext & context)
 {
     auto pad = [&](int n) { for (int i = 0; i < n; ++i) out += "  "; };
     v = forceValue(*state.vm, v);
     pad(indent);
     switch (v.tag()) {
     case Tag::String:
+        // #674: accumulate the input string's side-table context into
+        // the caller's accumulator so the resulting XML string carries
+        // every referenced drv/path forward (matches TW's
+        // printValueAsXML, libexpr/eval-xml.cc).
+        if (auto * raw = lookupStringContextEntries(v.payload.str)) {
+            for (auto & e : *raw) {
+                try { context.insert(nix::NixStringContextElem::parse(e)); }
+                catch (...) { /* skip un-parseable */ }
+            }
+        }
         out += "<string value=\""; out += xmlEscape(v.payload.str); out += "\" />\n";
         return;
     case Tag::Int:
@@ -6818,7 +6886,7 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
         out += "<list>\n";
         if (v.payload.list)
             for (uint32_t i = 0; i < v.payload.list->size; ++i)
-                valueToXml(state, out, v.payload.list->elems[i], indent + 1);
+                valueToXml(state, out, v.payload.list->elems[i], indent + 1, context);
         pad(indent);
         out += "</list>\n";
         return;
@@ -6839,7 +6907,7 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
             for (auto & [nm, val] : entries) {
                 pad(indent + 1);
                 out += "<attr name=\""; out += xmlEscape(nm); out += "\">\n";
-                valueToXml(state, out, val, indent + 2);
+                valueToXml(state, out, val, indent + 2, context);
                 pad(indent + 1);
                 out += "</attr>\n";
             }
@@ -6867,10 +6935,17 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
 
 void primToXML(EvalState & state, Value * args, Value & out)
 {
+    // #674: thread NixStringContext through the XML serializer so the
+    // resulting string carries every drv/path reference encountered
+    // (matches TW's prim_toXML at libexpr/primops.cc, which uses
+    // printValueAsXML with a NixStringContext accumulator).
     std::string s = "<?xml version='1.0' encoding='utf-8'?>\n<expr>\n";
-    valueToXml(state, s, args[0], 1);
+    nix::NixStringContext context;
+    valueToXml(state, s, args[0], 1, context);
     s += "</expr>\n";
     out = mkStringValueOwned(s);
+    if (!context.empty())
+        setStringContext(out.payload.str, context);
 }
 
 /// builtins.parseFlakeRef "github:NixOS/nixpkgs/23.05?dir=lib"
