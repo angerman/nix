@@ -204,6 +204,22 @@ void printNixValue(std::ostream & out, const Value & v,
         out << "}";
         return;
     }
+    // The simplified `<LAMBDA>` / `<PRIMOP>` / `<PRIMOP-APP>` /
+    // `<thunk>` form matches TW's `printAmbiguous` (libexpr/print-
+    // ambiguous.cc), which is what `nix-instantiate --eval --strict`
+    // (the lang-test baseline) emits.  TW's OTHER printer — the
+    // user-facing `ValuePrinter` used by `nix eval` (libexpr/print.cc:
+    // printFunction) — emits the richer `«lambda <name>? @ <pos>»`
+    // form.  v3 currently uses the simplified form for BOTH v3-eval
+    // and the runV3DirectEval path, which means `nix eval --impure`
+    // output diverges cosmetically from TW's `nix eval` (drvPath
+    // values still match — see #665/#666/#667).  Matching TW's
+    // `nix eval` printer requires (a) context-sensitive printer
+    // selection (eval vs eval-via-instantiate) and (b) refactoring
+    // lower.cc to fill `desc->name` from TW's contextual-name
+    // heuristic rather than the arg name.  Tracked separately
+    // (#669); the simplified form is preserved here to keep the
+    // lang-test goldens passing.
     case Tag::Closure: out << "<LAMBDA>"; return;
     case Tag::PrimOp:  out << "<PRIMOP>"; return;
     case Tag::PrimOpApp:out << "<PRIMOP-APP>"; return;
