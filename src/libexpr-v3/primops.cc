@@ -2394,7 +2394,8 @@ void primBaseNameOf(EvalState &, Value * args, Value & out)
     // `baseNameOf "a//"` is "" (a 10-year-old quirk that
     // `eval-okay-baseNameOf.nix` pins down).
     std::string_view s;
-    if (args[0].isString()) s = args[0].payload.str;
+    bool inputIsString = args[0].isString();
+    if (inputIsString) s = args[0].payload.str;
     else if (args[0].isPath()) s = args[0].payload.path;
     else typeError("baseNameOf", "string or path");
     if (s.empty()) { out = mkStringValueOwned(""); return; }
@@ -2404,6 +2405,17 @@ void primBaseNameOf(EvalState &, Value * args, Value & out)
     if (pos == std::string_view::npos) pos = 0;
     else pos += 1;
     out = mkStringValueOwned(std::string(s.substr(pos, last - pos + 1)));
+    // #672 follow-up: when input was a String with context (e.g. the
+    // interpolation of a derivation), TW propagates that context to
+    // the output.  Without this, callers that derive a basename from
+    // a store path lose the underlying drv reference.  Paths have no
+    // context to propagate.
+    if (inputIsString) {
+        if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
+            std::vector<std::string> copy = *raw;
+            setStringContextEntries(out.payload.str, std::move(copy));
+        }
+    }
 }
 
 void primDirOf(EvalState &, Value * args, Value & out)
@@ -2426,6 +2438,12 @@ void primDirOf(EvalState &, Value * args, Value & out)
         out = v;
     } else {
         out = mkStringValueOwned(dir);
+        // #672 follow-up: propagate input string context (same
+        // reasoning as primBaseNameOf — Path inputs have no context).
+        if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
+            std::vector<std::string> copy = *raw;
+            setStringContextEntries(out.payload.str, std::move(copy));
+        }
     }
 }
 

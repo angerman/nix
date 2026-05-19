@@ -41,6 +41,7 @@ on the bisect → fixture → permanent-guard workflow.
 | `repro-667-assert-force.nix` | `OP_ASSERT` CFF_FORCE_RETRY iterative-force protocol (was the only bool-consuming opcode missing it) — unblocks gtk3 / firefox-unwrapped / firefox | `120def5bc` (2026-05-19, #667) | TW + v3-direct must match |
 | `repro-668-defer-across-branch.nix` | #542 emit-time deferring leaked OP_SET_LOCAL ops INSIDE then-block via flushAllDeferred-on-block-entry; else-path saw mismatched stack depth → later OP_GET_LOCAL on Uninit slot → STR_CONCAT cascade → SIGTRAP on go.drvPath | (2026-05-19, #668) | TW + v3-direct must match |
 | `repro-672-tojson-context.nix` | `builtins.toJSON` lost string context for interpolated paths / derivations (lib.generators.toLua → writeText drvs missing inputDrvs); also exercises `__toString` lookup path | (2026-05-19, #672) | TW + v3-direct must match |
+| `repro-673-basename-dirof-context.nix` | `baseNameOf` / `dirOf` dropped string context on String input; preserved on Path input (no context to drop). Found during #672 audit. | (2026-05-19, #673) | TW + v3-direct must match |
 
 ## Run all repros
 
