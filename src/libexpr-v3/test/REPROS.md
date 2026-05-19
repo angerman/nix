@@ -44,6 +44,7 @@ on the bisect → fixture → permanent-guard workflow.
 | `repro-673-basename-dirof-context.nix` | `baseNameOf` / `dirOf` dropped string context on String input; preserved on Path input (no context to drop). Found during #672 audit. | (2026-05-19, #673) | TW + v3-direct must match |
 | `repro-674-no-ctx-primops.nix` | `parseDrvName`/`splitVersion`/`getEnv`/`compareVersions` silently accepted contexted strings (TW rejects via `forceStringNoCtx`); also `toXML` dropped context. Fix mirrors TW's exact error string for the rejection path. | (2026-05-19, #674) | TW + v3-direct must match |
 | `repro-669-lambda-contextual-name.nix` | `nix eval --impure` printer emits the contextual binding name for let/attr-bound lambdas (matches TW's `«lambda foo @ pos»`); anonymous lambdas stay nameless. Plumbed via new `LambdaDescriptor::contextualName` (lower.cc reads `ExprLambda::name`). | (2026-05-19, #669 follow-up) | TW + v3-direct must match |
+| `repro-670-671-ghc-sphinx-bisection.nix` | Bisection result: `haskell.compiler.{ghc96,ghc98,ghc910,ghc984}` with `enableDocs=false` produce byte-identical drvPaths to TW. Sphinx/docs is the trigger for both #670 (SIGTRAP) and #671 (fake-store fallback). | (2026-05-19, #670/#671 bisection) | TW + v3-direct must match |
 
 ## Run all repros
 
