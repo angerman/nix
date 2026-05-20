@@ -398,6 +398,42 @@ struct Alloc
         return c;
     }
 
+    /// #705 (2026-05-20): tenured-only Closure allocator.
+    ///
+    /// Use this when the returned pointer will be stored in a
+    /// long-lived tenured location that the scavenger DOES NOT walk.
+    /// Putting such a pointer through `nurseryOrArena()` would be
+    /// unsound: the scavenger would (correctly) reclaim the nursery
+    /// memory, but the tenured holder would still hold the stale
+    /// pointer.  Next deref → SIGSEGV.
+    ///
+    /// Concrete known case: `LambdaDescriptor::cachedSingletonClosure`
+    /// is mutated in-place by `OP_MAKE_CLOSURE` to memoize a
+    /// nUp==0 / nWiths==0 lambda's Closure.  The LambdaDescriptor
+    /// lives in `cu->lambdas` (tenured) and is NOT a scavenge root.
+    /// Routing the underlying Closure to the nursery caused SIGSEGV
+    /// on hello.drvPath at the first scavenge.
+    ///
+    /// Audit: any future caller adding a tenured cache for
+    /// Closure* / Thunk* / ListVec* MUST use a tenured-only
+    /// allocator and add itself to this list:
+    ///   - LambdaDescriptor::cachedSingletonClosure  (this fix)
+    ///
+    /// Safety: identical layout to `allocClosure`; only the alloc
+    /// backend differs.  No nursery slack lost (the singleton path
+    /// is rare).
+    static Closure * allocClosureTenured(uint16_t nUpvalues) noexcept
+    {
+        const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
+        allocStats().bytesClosures += bytes;
+        auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
+        c->nUpvalues = nUpvalues;
+        c->_pad = 0;
+        c->capturedWiths = nullptr;
+        c->cu = nullptr;
+        return c;
+    }
+
     /// Allocate a Suspended thunk with `nUpvalues` captured upvalues
     /// stored in the FAM tail.
     static Thunk * allocThunkSuspended(uint16_t nUpvalues) noexcept

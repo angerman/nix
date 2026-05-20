@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -92,6 +93,24 @@ namespace nix {
 }
 
 namespace nix::v3 {
+
+/// #705 (2026-05-20): walk the v3 bridge-table roots for the
+/// scavenger.  Each Value held in `v3BridgeClosures()` /
+/// `v3BridgeAttrs()` / `v3BridgeLists()` carries a potential
+/// nursery pointer (Closure / Bindings / ListVec) in its payload.
+/// Without this walk, a TW->v3 bridge handle's underlying v3 Value
+/// can be left pointing into freed nursery memory after a scavenge.
+///
+/// Symptom: hello.drvPath SIGSEGVed after scavenge#1 even when
+/// `forwarded=0` (no objects were reachable via the standard roots
+/// — vm.valueStack / vm.withStack / vm.frames — yet the dispatch
+/// loop later dereferenced a nursery pointer obtained via a bridge
+/// table lookup).
+///
+/// The callback receives each `Value &` in turn; it should forward
+/// the payload (e.g. by calling the scavenger's `visitValue`).
+/// Implemented in `primops.cc` where the bridge tables live.
+void walkV3BridgeRoots(const std::function<void(Value &)> & visit);
 
 /// REVIEW §2.1: RAII guard for the thread-local fallback Expr pointer
 /// that primV3{CallBridge1,ForceAttr,ForceListElem} read on cycle

@@ -2741,7 +2741,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     push(vm, v);
                     break;
                 }
-                Closure * c = Alloc::allocClosure(0);
+                // #705 (2026-05-20): tenured allocator MANDATORY.  The
+                // returned pointer is stored in `desc.cachedSingletonClosure`
+                // (a tenured field on LambdaDescriptor that's not a
+                // scavenge root).  Routing this through `allocClosure`
+                // (which can use the nursery) → SIGSEGV after the first
+                // scavenge.  See allocClosureTenured docstring.
+                Closure * c = Alloc::allocClosureTenured(0);
                 allocStats().closuresAllocated++;
                 c->desc = &desc;
                 c->cu   = cu;

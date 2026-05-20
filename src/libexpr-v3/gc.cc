@@ -41,11 +41,13 @@
 #include "v3/nursery.hh"
 #include "v3/alloc.hh"
 #include "v3/closure.hh"
+#include "v3/primop.hh"  // #705: walkV3BridgeRoots
 #include "v3/value.hh"
 #include "v3/vm.hh"
 
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -436,6 +438,17 @@ void Scavenger::run()
             f.thunk = fwdThunk(f.thunk);
         }
     }
+
+    // #705 (2026-05-20): bridge-table roots.  The TW->v3 bridge
+    // tables (v3BridgeClosures / v3BridgeAttrs / v3BridgeLists)
+    // hold v3 Values keyed by handle; each Value's payload may
+    // point at a nursery-allocated Closure / Bindings / ListVec.
+    // Without forwarding these, hello.drvPath SIGSEGVs on the
+    // first scavenge — TW-side bridge primops dereference stale
+    // pointers post-memset.
+    std::function<void(Value &)> bridgeVisit =
+        [this](Value & v) { visitValue(v); };
+    walkV3BridgeRoots(bridgeVisit);
 
     // #558 Phase 3.3: partialBindingsRegistry retired (no longer
     // referenced by vm.cc).  No scavenge work needed.

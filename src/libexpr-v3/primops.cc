@@ -3571,6 +3571,9 @@ static std::vector<BridgeListEntry,
     return tbl;
 }
 
+// #705 walkV3BridgeRoots lives below the anonymous-namespace close
+// so the linker can see it.  See the function-body comment there.
+
 /// #493: side-table mapping sentinel `nix::Env *` (held in
 /// `Value::lambda().env` of bridged TW lambdas) to the handle in
 /// `v3BridgeClosures()` of the underlying v3 Closure (with its
@@ -3660,6 +3663,19 @@ std::atomic<uint64_t> g_bridgeForceListElemCalls{0};
 // local counter for both paths so the depth ceiling actually fires
 // regardless of which path is currently executing.
 } // close anon ns
+
+// #705 (2026-05-20): scavenge-roots accessor.  Must live at
+// namespace-nix::v3 scope (not inside the anon ns above) so the
+// linker can resolve it from gc.cc.  Reaches into the
+// file-static bridge tables defined in the anon ns above —
+// `static` (internal linkage) lookup is fine within the same TU.
+void walkV3BridgeRoots(const std::function<void(Value &)> & visit)
+{
+    for (auto & e : v3BridgeClosures()) visit(e.v3Value);
+    for (auto & e : v3BridgeAttrs())    visit(e.v3Value);
+    for (auto & e : v3BridgeLists())    visit(e.v3Value);
+}
+
 int & bridge1DepthCounter() {
     static thread_local int d = 0;
     return d;
