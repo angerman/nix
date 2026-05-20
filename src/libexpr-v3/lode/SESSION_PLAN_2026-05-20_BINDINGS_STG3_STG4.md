@@ -74,8 +74,45 @@ rewrite candidate must be falsifier-tested against the nylon repro suite.
 Status quantified this session:
 - `NIX_V3_NURSERY=1` (routing only): 143/143 lang tests pass; no perf change
   on hello.drvPath (no reclamation).
+- `NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1` + 1 MB nursery: **143/143 lang
+  tests STILL pass under aggressive scavenge**.  Plus all 7 test suites
+  (smoke / iterative-force / derivation-parity / lang / property /
+  evalscope / 583-tag-app-cache).
 - `NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1`: hello.drvPath SIGSEGV (exit
-  139) within seconds.  Scavenge correctness is the blocker.
+  139) under various nursery sizes.  The lighter workloads (`hello.name`,
+  `hello.outPath`, all lang tests) survive — so the scavenge is broadly
+  correct, but heavy workloads hit at least one more tenured-to-nursery
+  missed-root path.
+
+**Two missed roots fixed this session** (`d835f2dc9`):
+
+1. `LambdaDescriptor::cachedSingletonClosure` — tenured field that held
+   a Closure* pointing into the nursery via `Alloc::allocClosure(0)`.
+   The cached singleton survived scavenge as a dangling pointer.
+   Fix: added `Alloc::allocClosureTenured()` and routed the singleton
+   site through it.
+
+2. `v3BridgeClosures` / `v3BridgeAttrs` / `v3BridgeLists` (primops.cc)
+   — thread-local vectors of v3 Values keyed by handle.  Their payload
+   pointers (Closure / Bindings / ListVec) were nursery-routed but
+   never walked by the scavenger.  Fix: added `walkV3BridgeRoots()`
+   in primops.cc and a call from `Scavenger::run()`.
+
+**At least one more missed root remains** — hello.drvPath still SIGSEGVs
+in `forceValue` on a stale Thunk pointer after both fixes.  Per the
+lldb backtrace the stale thunk is read inside the chase loop; could be
+either:
+  - another tenured cache holding a Thunk* (analogous to fix 1)
+  - a Tag::Slot cell stored in some non-walked location
+  - an as-yet-undiscovered missed root
+
+Audit work needed: grep every `static thread_local *` and every
+`mutable Closure*/Thunk*/ListVec*/Bindings*` field on a tenured
+struct, route each through tenured allocator or add a scavenge
+root walker for it.  Per `NURSERY_PHASE_D_DESIGN_2026-05-18.md`,
+a proper write-barrier-based approach would be more robust than
+chase-the-roots; estimated 5-7 days for the design's "card-table"
+shape.
 
 The SIGSEGV is the Phase D necessity — intergenerational pointers (a
 tenured object holding a nursery pointer that gets copied on scavenge) need
