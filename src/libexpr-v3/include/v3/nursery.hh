@@ -162,7 +162,16 @@ public:
             // accidentally-retained pointer-shaped bit pattern from
             // future allocators that read uninitialized bytes.
             // Cheap relative to the work we just did.
-            std::memset(base, 0, size_t(next - base));
+            //
+            // #705 diagnostic gate: `NIX_V3_NURSERY_NO_RESET=1` keeps
+            // the buffer's bytes intact so a stale pointer dereference
+            // hits VALID old data rather than zeros.  Lets us isolate
+            // "memset wiped a missed root" from a downstream logic
+            // bug — if the eval completes with NO_RESET=1, the bug is
+            // purely "missed root."  Production must always reset.
+            static const bool s_noReset =
+                std::getenv("NIX_V3_NURSERY_NO_RESET") != nullptr;
+            if (!s_noReset) std::memset(base, 0, size_t(next - base));
             next = base;
         }
         ++scavengeCount;

@@ -9372,9 +9372,24 @@ static void clearBlackMarksOnException(VMState & vm, size_t exitDepth)
 /// captured `builtins` (via `LitBuiltins`) as a freeVar -- there's
 /// no env-side counterpart to walk to, so we just hand back the
 /// singleton.  Same Value pushed by OP_LIT_BUILTINS at runtime.
+// #705 (2026-05-20): file-static vBuiltins storage (was a function-
+// local-static) so the scavenger can access it via `peekBuiltinsValue`
+// without triggering lazy init mid-scavenge.  The init flag is set
+// to true by `getBuiltinsValue` on first call; `peekBuiltinsValue`
+// returns the address only after that flip.  Single-threaded VM — no
+// atomics needed.
+static bool g_vBuiltinsInitialized = false;
+static Value g_vBuiltins;
+
+Value * peekBuiltinsValue() noexcept
+{
+    return g_vBuiltinsInitialized ? &g_vBuiltins : nullptr;
+}
+
 Value getBuiltinsValue() noexcept
 {
-    static Value vBuiltins = []{
+    if (g_vBuiltinsInitialized) return g_vBuiltins;
+    g_vBuiltins = []{
         const auto & reg = allRegisteredPrimOps();
         // TW's `EvalState::addPrimOp` (libexpr/eval.cc:577) STRIPS the
         // leading `__` from a primop's name before inserting it into
@@ -9465,7 +9480,8 @@ Value getBuiltinsValue() noexcept
         v.payload.bindings = b;
         return v;
     }();
-    return vBuiltins;
+    g_vBuiltinsInitialized = true;
+    return g_vBuiltins;
 }
 
 /// REVIEW §3 fold: shared dispatch wrapper.  Every entry point below
@@ -10747,6 +10763,73 @@ Value forceValue(VMState & vm, Value v)
         }
 
         const LambdaDescriptor * desc = t->suspended.desc;
+        // #705 (2026-05-20): diagnostic — if we got here with a null
+        // desc, something handed us a Thunk whose Suspended payload
+        // is zeroed-out.  Most likely cause: stale nursery pointer
+        // (post-scavenge memset).  Dump everything we know and abort.
+        // Includes the compress-chain so we can identify whether the
+        // stale pointer was the initial v or chased through an
+        // Evaluated thunk's evaluated field.
+        if (__builtin_expect(!desc, 0)) [[unlikely]] {
+            const Nursery & nu = threadNursery();
+            std::fprintf(stderr,
+                "v3 forceValue: STALE THUNK suspected.\n"
+                "  t=%p in nursery=%s\n"
+                "  frames=%zu  valueStack=%zu  withStack=%zu\n",
+                (void*)t, nu.contains(t) ? "YES" : "no",
+                vm.frames.size(), vm.valueStack.size(),
+                vm.withStack.size());
+            std::fprintf(stderr, "  compressChain (chase predecessors), N=%d:\n",
+                compressCount);
+            for (int ci = 0; ci < compressCount; ++ci) {
+                const Thunk * pt = compressChain[ci];
+                std::fprintf(stderr,
+                    "    [%d] t=%p state=%d in-nursery=%s evaluated.tag=%d\n",
+                    ci, (const void*)pt, (int)pt->state,
+                    nu.contains(pt) ? "YES" : "no",
+                    (int)pt->evaluated.tag());
+            }
+            // Dump valueStack non-uninitialized entries (the active
+            // ones; trailing slots may have been pre-resized).
+            std::fprintf(stderr, "  valueStack non-zero entries:\n");
+            size_t nz = 0;
+            for (size_t i = 0; i < vm.valueStack.size() && nz < 16; ++i) {
+                const Value & sv = vm.valueStack[i];
+                if (sv.tag() == Tag::Uninitialized) continue;
+                const void * sp =
+                    sv.tag() == Tag::Thunk   ? (const void*)sv.payload.thunk
+                    : sv.tag() == Tag::Closure ? (const void*)sv.payload.closure
+                    : sv.tag() == Tag::Attrs   ? (const void*)sv.payload.bindings
+                    : sv.tag() == Tag::List    ? (const void*)sv.payload.list
+                    : sv.tag() == Tag::App || sv.tag() == Tag::PrimOpApp
+                                              ? (const void*)sv.payload.pair
+                    : sv.tag() == Tag::Slot   ? (const void*)sv.payload.slot
+                    : nullptr;
+                std::fprintf(stderr,
+                    "    [%zu] tag=%d ptr=%p%s\n",
+                    i, (int)sv.tag(), sp,
+                    (sp && nu.contains(sp)) ? " <-- IN NURSERY" : "");
+                ++nz;
+            }
+            // Dump the top few frames to see what's executing.
+            std::fprintf(stderr, "  frames (top -8):\n");
+            size_t flim = vm.frames.size();
+            for (size_t i = flim; i > 0 && i + 8 > flim; --i) {
+                const auto & fr = vm.frames[i - 1];
+                const LambdaDescriptor * fd = nullptr;
+                if (fr.thunk) fd = fr.thunk->suspended.desc;
+                else if (fr.closure) fd = fr.closure->desc;
+                std::fprintf(stderr,
+                    "    [%zu] ip=%u flags=%u closure=%p thunk=%p%s%s desc=%s\n",
+                    i - 1, fr.ip, (unsigned)fr.flags,
+                    (const void*)fr.closure, (const void*)fr.thunk,
+                    (fr.closure && nu.contains(fr.closure)) ? " CL-IN-NURSERY" : "",
+                    (fr.thunk   && nu.contains(fr.thunk))   ? " TH-IN-NURSERY" : "",
+                    (fd && !fd->name.empty()) ? fd->name.c_str() : "<?>");
+            }
+            std::fflush(stderr);
+            std::abort();
+        }
         // NIX_TRACE_EVAL: emit F at the about-to-push point.  The
         // matching W is emitted by OP_RETURN's CFF_THUNK_RETURN branch
         // (3925-ish) when the frame pops, so the F/W pair brackets the

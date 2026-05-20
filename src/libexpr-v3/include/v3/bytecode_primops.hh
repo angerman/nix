@@ -36,6 +36,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/value.hh"
+#include <functional>
 #include <string>
 
 namespace nix {
@@ -45,6 +46,23 @@ class EvalState;
 namespace nix::v3 {
 
 struct PrimOp;
+
+/// #705 (2026-05-20): walk the primop-replacement map as a scavenger
+/// root.  Each Value in the map can carry a nursery Closure*; without
+/// this walk, scavenge frees the closure and the next
+/// `lookupPrimopReplacement` returns a stale pointer.  Caller supplies
+/// a visitor that forwards each Value's payload.
+void walkBytecodePrimopRoots(const std::function<void(Value &)> & visit);
+
+/// #705 (2026-05-20): walk the static `vBuiltins` Value as a
+/// scavenger root.  `vBuiltins` is a process-wide singleton built by
+/// `getBuiltinsValue()`; the bytecode-primop install path patches its
+/// Bindings entries in-place to point at fresh bytecode closures,
+/// which may live in the nursery.  Without this walk, scavenge frees
+/// those closures and the next OP_LIT_BUILTINS push hands the dispatch
+/// a stale pointer.  No-op if `vBuiltins` hasn't been materialised
+/// yet.
+void walkBuiltinsRoot(const std::function<void(Value &)> & visit);
 
 /// Returns the bytecode-closure replacement Value for `po`, or
 /// nullptr if no replacement has been installed.  Used by:

@@ -42,6 +42,7 @@
 #include "v3/alloc.hh"
 #include "v3/closure.hh"
 #include "v3/primop.hh"  // #705: walkV3BridgeRoots
+#include "v3/bytecode_primops.hh"  // #705: walkBytecodePrimopRoots, walkBuiltinsRoot
 #include "v3/value.hh"
 #include "v3/vm.hh"
 
@@ -216,19 +217,23 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
     // drain dominated the per-scavenge cost.
     //
     // Bridge: bridgeSrc is a `nix::Value *` (TW heap), never v3
-    // nursery — no work for the walker.  Blackhole: state has no
-    // payload (the body is mid-execution; its frame is a separate
-    // root).  Evaluated with leaf tag: `evaluated` payload has no
-    // forwardable pointer.
+    // nursery — no work for that field.  BUT a Bridge thunk MAY
+    // carry a `cell` (`STG-14b option (a)` cell-update protocol;
+    // see vm.cc Bridge handler comment) whose contents may hold a
+    // nursery payload.  #705 (2026-05-20): if the cell is set,
+    // queue the thunk so walkThunk walks the cell.
     //
-    // We skip hashing into `walked` too — it's safe because the
-    // skipped thunks have no edges that could re-enter our walk.
-    // If a future change adds a payload-bearing tag here, update
-    // `isLeafTag` to match.
+    // Blackhole: state's payload is irrelevant (body mid-exec),
+    // but the cell is preserved across blackhole → evaluated
+    // (CFF_THUNK_RETURN propagates), so the same caveat applies.
+    //
+    // Evaluated with leaf tag: `evaluated` payload has no
+    // forwardable pointer.  Cell included in the gate.
     switch (t->state) {
     case ThunkState::Bridge:
     case ThunkState::Blackhole:
-        return t;
+        if (!t->cell) return t;  // truly nothing to walk
+        break;                   // fall through to queue if cell set
     case ThunkState::Evaluated:
         if (isLeafTag(t->evaluated.tag()) && !t->cell) return t;
         break;
@@ -446,9 +451,28 @@ void Scavenger::run()
     // Without forwarding these, hello.drvPath SIGSEGVs on the
     // first scavenge — TW-side bridge primops dereference stale
     // pointers post-memset.
-    std::function<void(Value &)> bridgeVisit =
+    std::function<void(Value &)> rootVisit =
         [this](Value & v) { visitValue(v); };
-    walkV3BridgeRoots(bridgeVisit);
+    walkV3BridgeRoots(rootVisit);
+
+    // #705 (2026-05-21): bytecode-primop replacement roots.  Each
+    // Value in `primopReplacementMap` may carry a nursery Closure
+    // (compiled by `installBytecodePrimop` via `runRootExpr`).  The
+    // map is consulted by every OP_LIT_PRIMOP / OP_CALL_PRIMOP
+    // dispatch; if the cached closure dangles, the next dispatch
+    // reads from freed nursery memory → forceValue chase finds a
+    // memset Thunk pointer and SIGSEGVs at `desc->nLocals`.  This
+    // walk closes the missed-root identified on hello.drvPath under
+    // NIX_V3_NURSERY_SCAVENGE=1.
+    walkBytecodePrimopRoots(rootVisit);
+
+    // #705 (2026-05-21): static `vBuiltins` Value root.  The
+    // bytecode-primop install path patches `vBuiltins.payload.bindings`
+    // entries in place to point at the freshly-compiled bytecode
+    // closures (see bytecode_primops.cc "Install path 3" — patches
+    // `b->entries[i].value = installed.rr.value`).  Those entries
+    // can carry nursery Closures.  Walk so they're forwarded.
+    walkBuiltinsRoot(rootVisit);
 
     // #558 Phase 3.3: partialBindingsRegistry retired (no longer
     // referenced by vm.cc).  No scavenge work needed.
@@ -468,15 +492,159 @@ void Scavenger::run()
 
 } // namespace
 
+// #705 post-scavenge audit (gated via V3_DBG_NURSERY_AUDIT=1).
+// Walks DEEP from the scavenger's roots and asserts no nursery
+// pointer remains anywhere reachable.  Localizes a missed-root.
+namespace {
+
+struct Auditor {
+    const Nursery & n;
+    std::unordered_set<const void *> visited;
+    bool ok = true;
+
+    void check(const void * p, const char * what, const char * site)
+    {
+        if (n.contains(p)) {
+            std::fprintf(stderr,
+                "v3 SCAVENGE AUDIT: nursery %s %p reachable via %s\n",
+                what, p, site);
+            ok = false;
+        }
+    }
+
+    void visitValue(const Value & v, const char * site);
+
+    void visitClosure(const Closure * c, const char * site)
+    {
+        if (!c) return;
+        check(c, "Closure", site);
+        if (!visited.insert(c).second) return;
+        if (c->capturedWiths) check(c->capturedWiths, "Closure.capturedWiths", site);
+        if (c->capturedWiths) {
+            for (uint32_t i = 0; i < c->capturedWiths->size; ++i)
+                visitValue(c->capturedWiths->elems[i], "Closure.capturedWiths.elem");
+        }
+        for (uint16_t i = 0; i < c->nUpvalues; ++i)
+            visitValue(c->upvalues[i], "Closure.upvalues[]");
+    }
+
+    void visitThunk(const Thunk * t, const char * site)
+    {
+        if (!t) return;
+        check(t, "Thunk", site);
+        if (!visited.insert(t).second) return;
+        if (t->cell) {
+            // cell is tenured Value*; its content may transitively
+            // reach nursery.  Recurse into the cell value.
+            visitValue(*t->cell, "Thunk.cell");
+        }
+        switch (t->state) {
+        case ThunkState::Suspended:
+        case ThunkState::Native:
+            if (t->suspended.capturedWiths)
+                check(t->suspended.capturedWiths, "Thunk.suspended.capturedWiths", site);
+            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                visitValue(t->tail[i], "Thunk.suspended.tail[]");
+            break;
+        case ThunkState::Evaluated:
+            visitValue(t->evaluated, "Thunk.evaluated");
+            break;
+        case ThunkState::Bridge:
+        case ThunkState::Blackhole:
+            break;
+        }
+    }
+
+    void visitBindings(const Bindings * b, const char * site)
+    {
+        if (!b) return;
+        check(b, "Bindings", site);
+        if (!visited.insert(b).second) return;
+        for (uint32_t i = 0; i < b->size; ++i)
+            visitValue(b->entries[i].value, "Bindings.entries[].value");
+    }
+
+    void visitList(const ListVec * l, const char * site)
+    {
+        if (!l) return;
+        check(l, "ListVec", site);
+        if (!visited.insert(l).second) return;
+        for (uint32_t i = 0; i < l->size; ++i)
+            visitValue(l->elems[i], "ListVec.elems[]");
+    }
+
+    void visitPair(const ValuePair * p, const char * site)
+    {
+        if (!p) return;
+        check(p, "ValuePair", site);
+        if (!visited.insert(p).second) return;
+        visitValue(p->left,  "ValuePair.left");
+        visitValue(p->right, "ValuePair.right");
+    }
+};
+
+void Auditor::visitValue(const Value & v, const char * site)
+{
+    switch (v.tag()) {
+    case Tag::Closure:  visitClosure(v.payload.closure,   site); break;
+    case Tag::Thunk:    visitThunk  (v.payload.thunk,     site); break;
+    case Tag::Attrs:    visitBindings(v.payload.bindings, site); break;
+    case Tag::List:     visitList   (v.payload.list,      site); break;
+    case Tag::App:
+    case Tag::PrimOpApp: visitPair  (v.payload.pair,      site); break;
+    case Tag::Slot:
+        if (v.payload.slot) visitValue(*v.payload.slot, "Slot.cell");
+        break;
+    case Tag::Uninitialized:
+    case Tag::Int:
+    case Tag::Float:
+    case Tag::Bool:
+    case Tag::Null:
+    case Tag::String:
+    case Tag::Path:
+    case Tag::PrimOp:
+    case Tag::Blackhole:
+    case Tag::External:
+        break;
+    }
+}
+
+void postScavengeAudit(const Nursery & n, const VMState & vm)
+{
+    Auditor a{n, {}, true};
+    for (size_t i = 0; i < vm.valueStack.size(); ++i)
+        a.visitValue(vm.valueStack[i], "valueStack[i]");
+    for (size_t i = 0; i < vm.withStack.size(); ++i)
+        a.visitValue(vm.withStack[i], "withStack[i]");
+    for (size_t i = 0; i < vm.frames.size(); ++i) {
+        const CallFrame & f = vm.frames[i];
+        if (f.closure) a.visitClosure(f.closure, "frame.closure");
+        if (f.thunk)   a.visitThunk  (f.thunk,   "frame.thunk");
+    }
+    if (a.ok) {
+        std::fprintf(stderr,
+            "v3 SCAVENGE AUDIT: clean (deep walk found no nursery pointers)\n");
+    } else {
+        std::fprintf(stderr,
+            "v3 SCAVENGE AUDIT: visited=%zu objects; pointers above are stale\n",
+            a.visited.size());
+    }
+    std::fflush(stderr);
+}
+
+} // namespace
+
 void scavengeNursery(Nursery & n, VMState & vm) noexcept
 {
     static const bool s_dbg = std::getenv("V3_DBG_NURSERY") != nullptr;
+    static const bool s_audit = std::getenv("V3_DBG_NURSERY_AUDIT") != nullptr;
     Nursery::Stats pre{};
     if (s_dbg) pre = n.stats();
     ScavengeBuffers & buf = threadScavengeBuffers();
     buf.clear();
     Scavenger sc{n, vm, buf.forward, buf.walked, buf.graylist};
     sc.run();
+    if (__builtin_expect(s_audit, 0)) postScavengeAudit(n, vm);
     // V3_DBG_NURSERY=1 — print one line per scavenge with the
     // forward-map size + tenured-walk size so we can verify the
     // pass actually moved live data and how much it had to

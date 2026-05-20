@@ -20,6 +20,7 @@
 // Forward declaration: defined in vm.cc.
 namespace nix::v3 {
 Value getBuiltinsValue() noexcept;
+Value * peekBuiltinsValue() noexcept;  // #705
 }
 
 #include <cstdio>
@@ -102,6 +103,35 @@ std::unordered_map<const PrimOp *, Value> & primopReplacementMap()
 }
 
 } // anonymous namespace
+
+// #705 (2026-05-20): expose the primopReplacementMap as a scavenger
+// root.  Each entry's `Value` payload can be a nursery Closure*
+// (the bytecode-primop install path compiles a Nix source via
+// `runRootExpr` and the resulting closure may be allocated through
+// the nursery).  Without this walk, the map holds a stale closure
+// pointer after scavenge → next OP_LIT_PRIMOP / OP_CALL_PRIMOP
+// hands the dispatch a Value that derefs into freed nursery memory.
+//
+// Discovered 2026-05-21 while hunting the hello.drvPath scavenge
+// SIGSEGV.  The crash signature (`desc = nullptr` in forceValue
+// after chase through Tag::Thunk steps) traces back to dispatch
+// reading a stale closure handed out via `lookupPrimopReplacement`.
+void walkBytecodePrimopRoots(const std::function<void(Value &)> & visit)
+{
+    for (auto & [po, v] : primopReplacementMap()) {
+        (void)po;
+        visit(v);
+    }
+}
+
+void walkBuiltinsRoot(const std::function<void(Value &)> & visit)
+{
+    // Only walk if the singleton has been materialised.  Otherwise
+    // there's nothing reachable through it yet (and triggering
+    // materialisation during scavenge would re-enter the allocator
+    // path we're about to reset).
+    if (Value * b = peekBuiltinsValue()) visit(*b);
+}
 
 const Value * lookupPrimopReplacement(const PrimOp * po) noexcept
 {
