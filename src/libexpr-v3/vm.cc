@@ -591,7 +591,37 @@ inline bool valueLess(VMState & vm, const Value & a, const Value & b)
         }
         return na < nb;
     }
-    throw std::runtime_error("v3 OP_LESS: unsupported operand types");
+    // #680 — TW phrasing (libexpr/eval.cc): for same type that's
+    // incomparable, "cannot compare a <type> with a <type>; values
+    // of that type are incomparable".  For mixed types, "cannot
+    // compare a <t1> with a <t2>".  v3 emits the simpler core text
+    // (without the "values are ..." suffix); reconstructing exact
+    // ValuePrinter output is out of scope for this opcode helper.
+    auto typeWord = [](const Value & v) -> std::pair<const char *, const char *> {
+        Tag t = v.tag();
+        if (t == Tag::Int)    return {"an", "integer"};
+        if (t == Tag::Float)  return {"a",  "float"};
+        if (t == Tag::Bool)   return {"a",  "Boolean"};
+        if (t == Tag::Null)   return {"",   "null"};
+        if (t == Tag::String) return {"a",  "string"};
+        if (t == Tag::Path)   return {"a",  "path"};
+        if (t == Tag::List)   return {"a",  "list"};
+        if (t == Tag::Attrs)  return {"a",  "set"};
+        if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+            return {"a", "function"};
+        return {"a", "value"};
+    };
+    auto withArticle = [&](const Value & v) -> std::string {
+        auto [art, name] = typeWord(v);
+        std::string r;
+        if (*art) { r += art; r += ' '; }
+        r += name;
+        return r;
+    };
+    std::string msg = "cannot compare " + withArticle(a) + " with " + withArticle(b);
+    if (a.tag() == b.tag())
+        msg += "; values of that type are incomparable";
+    throw std::runtime_error(msg);
 }
 
 inline bool isTrueValue(const Value & v)
@@ -641,8 +671,62 @@ inline bool isTrueValue(const Value & v)
 /// `/nix/store/<32-hash>-name` representation, not the absolute file
 /// path.  Required by tests like `eval-okay-context` that count on the
 /// store-path prefix length.
+/// #680 — coerce a value to a string for the `+` operator and `${...}`
+/// interpolation.  Mirrors TW's `coerceToString(coerceMore=false)`
+/// (libexpr/eval.cc:2874): String + Path → string (paths optionally
+/// copied to store when forceString=true); EVERYTHING else rejects
+/// with `cannot coerce <type> to a string: <value>` matching TW's
+/// libexpr/eval.cc:2911 phrasing.
+///
+/// Pre-fix v3 silently accepted Int/Float/Bool/Null: `"x" + 1`
+/// returned `"x1"`, `null + 1` returned `"1"`, `"${1}"` returned `"1"`.
+/// All of these are TW errors.  The relaxed behavior could hide bugs
+/// in nixpkgs / user code where a value of the wrong type leaks into
+/// string-context.
+///
+/// Attrset coercion (`__toString` / `outPath`) is handled BEFORE this
+/// helper by the OP_STR_CONCAT attr-unwind loop (vm.cc:8051+), so by
+/// the time we get here the value is a primitive.
 inline std::string coerceToString(const Value & v, bool forceString)
 {
+    // Use if/else rather than switch to avoid -Wswitch-enum on every
+    // tag we don't care to spell out individually.
+    auto typeName = [](const Value & v) -> std::pair<const char *, const char *> {
+        Tag t = v.tag();
+        if (t == Tag::Int)   return {"an", "integer"};
+        if (t == Tag::Float) return {"a",  "float"};
+        if (t == Tag::Bool)  return {"a",  "Boolean"};
+        if (t == Tag::Null)  return {"",   "null"};
+        if (t == Tag::List)  return {"a",  "list"};
+        if (t == Tag::Attrs) return {"a",  "set"};
+        if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+            return {"a", "function"};
+        if (t == Tag::Thunk || t == Tag::App)
+            return {"a", "thunk"};
+        return {"a", "value"};
+    };
+    auto valueRepr = [](const Value & v) -> std::string {
+        Tag t = v.tag();
+        if (t == Tag::Int)   return std::to_string(v.payload.i);
+        if (t == Tag::Float) return std::to_string(v.payload.f);
+        if (t == Tag::Bool)  return v.payload.i == 1 ? "true" : "false";
+        if (t == Tag::Null)  return "null";
+        if (t == Tag::List)  return "[ ... ]";
+        if (t == Tag::Attrs) return "{ ... }";
+        if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+            return "<LAMBDA>";
+        return "<value>";
+    };
+    auto throwCoerceError = [&](const Value & v) -> std::string {
+        auto [article, name] = typeName(v);
+        std::string msg = "cannot coerce ";
+        if (*article) { msg += article; msg += ' '; }
+        msg += name;
+        msg += " to a string: ";
+        msg += valueRepr(v);
+        throw std::runtime_error(msg);
+    };
+
     switch (v.tag()) {
     case Tag::String: return std::string(v.payload.str);
     case Tag::Path: {
@@ -662,31 +746,24 @@ inline std::string coerceToString(const Value & v, bool forceString)
         }
         return p;
     }
-    case Tag::Int:    return std::to_string(v.payload.i);
-    case Tag::Float:  return std::to_string(v.payload.f);
-    case Tag::Bool:   return v.payload.i == 1 ? "1" : "";
-    case Tag::Null:   return "";
-    case Tag::Uninitialized:
-    case Tag::Attrs:
+    case Tag::Int:
+    case Tag::Float:
+    case Tag::Bool:
+    case Tag::Null:
     case Tag::List:
+    case Tag::Attrs:
     case Tag::Closure:
-    case Tag::Thunk:
     case Tag::PrimOp:
     case Tag::PrimOpApp:
+    case Tag::Thunk:
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
+    case Tag::Uninitialized:
     default:
-        {
-            char buf[96];
-            std::snprintf(buf, sizeof buf,
-                "v3 STR_CONCAT: cannot coerce type to string (tag=%u)",
-                (unsigned)v.tag());
-            throw std::runtime_error(buf);
-        }
+        return throwCoerceError(v);
     }
-    (void)forceString;
 }
 
 inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
@@ -5057,9 +5134,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             int opForceCompressCount = 0;
             while (true) {
                 if (__builtin_expect(++forceChaseIters > kMaxIndirectionChase, 0))
-                    throw std::runtime_error(
-                        "v3 OP_FORCE: infinite recursion (chase cycle through "
-                        "Tag::Slot/Tag::Thunk indirections)");
+                    // #680 — match TW phrasing
+                    // (libexpr/eval.cc:2594 InfiniteRecursionError).
+                    throw std::runtime_error("infinite recursion encountered");
                 if (v.tag() == Tag::Slot) {
                     Value * p = v.payload.slot;
                     if (!p) throw std::runtime_error(
@@ -5257,7 +5334,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                     }
                 }
-                throw BlackholeError("v3 OP_FORCE: infinite recursion (blackhole)");
+                // #680 — match TW phrasing
+                // (libexpr/eval.cc:2594 InfiniteRecursionError).
+                throw BlackholeError("infinite recursion encountered");
             }
             // WC-10: Bridge thunk — call into tree-walker for the
             // single nix::Value*, then bridge the already-forced
@@ -8588,14 +8667,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
             Value v = pop(vm);
-            int64_t n = 0;
-            if (v.isList())
-                n = v.payload.list ? v.payload.list->size : 0;
-            else if (v.isString())
-                n = static_cast<int64_t>(std::strlen(v.payload.str));
-            else
-                throw std::runtime_error("v3 primop length: expected list or string");
-            Value r; r.mkInt(n);
+            // #680 — TW's `builtins.length` only accepts lists
+            // (libexpr/primops.cc:4109).  Pre-fix v3 also accepted
+            // strings as a "bonus" — silent semantic divergence.
+            // TW's forceList raises `expected a list but found a
+            // <type>: <value>` (libexpr/eval.cc:1444 family).
+            if (!v.isList()) {
+                const char * art = "a";
+                const char * name = "value";
+                Tag t = v.tag();
+                if (t == Tag::Int)        { art = "an"; name = "integer"; }
+                else if (t == Tag::Float) { art = "a";  name = "float"; }
+                else if (t == Tag::Bool)  { art = "a";  name = "Boolean"; }
+                else if (t == Tag::Null)  { art = "";   name = "null"; }
+                else if (t == Tag::String){ art = "a";  name = "string"; }
+                else if (t == Tag::Path)  { art = "a";  name = "path"; }
+                else if (t == Tag::Attrs) { art = "a";  name = "set"; }
+                else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+                                          { art = "a";  name = "function"; }
+                std::string msg = "expected a list but found ";
+                if (*art) { msg += art; msg += ' '; }
+                msg += name;
+                throw std::runtime_error(msg);
+            }
+            Value r; r.mkInt(v.payload.list ? v.payload.list->size : 0);
             push(vm, r);
             break;
         }
@@ -9750,9 +9845,10 @@ Value forceValue(VMState & vm, Value v)
                     std::fprintf(stderr, "\n");
                 }
             }
-            throw std::runtime_error(
-                "v3 forceValue: infinite recursion (chase cycle through "
-                "Tag::Slot/Tag::Thunk indirections)");
+            // #680 — match TW's `InfiniteRecursionError` text
+            // (libexpr/eval.cc:2594).  Internal cause (chase-cycle
+            // through Tag::Slot/Thunk) is debug-only; not user-facing.
+            throw std::runtime_error("infinite recursion encountered");
         }
         // Same call-depth guard — `let x = x; in x` lands here in
         // a C++ recursion via dispatchLoop → forceValue → dispatchLoop
@@ -10218,7 +10314,8 @@ Value forceValue(VMState & vm, Value v)
                 }
                 std::fflush(stderr);
             }
-            throw BlackholeError("v3 forceValue: infinite recursion (blackhole)");
+            // #680 — match TW phrasing (libexpr/eval.cc:2594).
+            throw BlackholeError("infinite recursion encountered");
         }
         if (t->state == ThunkState::Bridge) {
             // #466 active-v3-vm tracking: forceBridgeThunk goes

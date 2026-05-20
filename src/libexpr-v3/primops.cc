@@ -511,11 +511,13 @@ inline Value mkStringValueOwned(std::string s)
 void primLength(EvalState &, Value * args, Value & out)
 {
     const Value & v = args[0];
-    int64_t n = 0;
-    if (v.isList())   n = v.payload.list ? v.payload.list->size : 0;
-    else if (v.isString()) n = static_cast<int64_t>(std::strlen(v.payload.str));
-    else                   typeError("length", "list or string");
-    out.mkInt(n);
+    // #680 — TW's `builtins.length` only accepts lists
+    // (libexpr/primops.cc:4109).  v3 pre-fix also accepted strings
+    // as a "bonus" — silent semantic divergence (`length "abc"`
+    // returned 3 in v3, errored in TW).  Use `stringLength` for
+    // strings.
+    if (!v.isList()) typeError("length", "list");
+    out.mkInt(v.payload.list ? v.payload.list->size : 0);
 }
 
 void primHead(EvalState &, Value * args, Value & out)
