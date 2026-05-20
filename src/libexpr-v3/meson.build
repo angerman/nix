@@ -24,6 +24,11 @@ deps_private_maybe_subproject = [
   dependency('nix-store'),
   dependency('nix-expr'),
   dependency('nix-main'),
+  # #698: v3-native callFlake — links libflake for parseFlakeRef,
+  # lockFlake, LockedFlake, flake::Settings.  No circular dep
+  # (libflake depends on nix-expr / nix-store / nix-util; libexpr-v3
+  # wraps libexpr; libflake does NOT depend on libexpr-v3).
+  dependency('nix-flake'),
 ]
 deps_public_maybe_subproject = []
 subdir('nix-meson-build-support/subprojects')
@@ -44,6 +49,17 @@ subdir('nix-meson-build-support/export-all-symbols')
 subdir('nix-meson-build-support/windows-version')
 
 subdir('nix-meson-build-support/common')
+
+# #698: generate call-flake.nix.gen.hh from the canonical libflake
+# source, so v3 can compile + run call-flake.nix natively without
+# duplicating the source.  Mirrors libflake/meson.build:35-40.
+subdir('nix-meson-build-support/generate-header')
+generated_headers = []
+foreach header : [
+  '../libflake/call-flake.nix',
+]
+  generated_headers += gen_header.process(header)
+endforeach
 
 include_dirs = [ include_directories('include') ]
 
@@ -79,11 +95,14 @@ lib_sources = files(
   'ffi.cc',
   'print.cc',
   'run.cc',
+  # #698: v3-native callFlake — see lode/V3_NATIVE_CALL_FLAKE_DESIGN_2026-05-20.md
+  'v3_call_flake.cc',
 )
 
 this_library = library(
   'nixexprv3',
   lib_sources,
+  generated_headers,  # #698: call-flake.nix.gen.hh
   dependencies : deps_public + deps_private + deps_other,
   include_directories : include_dirs,
   install : true,
