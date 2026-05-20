@@ -8,6 +8,9 @@
 
 #include "v3/limits.hh"
 #include "v3/alloc.hh"  // for allocStats() in diagnostics
+#include "v3/primop.hh"  // for activeV3VM()
+#include "v3/vm.hh"      // for VMState, CallFrame
+#include "v3/disasm.hh"  // for disassembleWindow
 
 #include <gc/gc.h>
 
@@ -347,6 +350,50 @@ void checkLimits()
                 + fmtDuration(double(st.maxWallTime.count()))
                 + " exceeded after " + fmtDuration(secs)
                 + " (" + snapshot() + ")";
+            // V3_DBG_TRAP_ON_LIMIT — dump active VMState's frame
+            // stack + recent bytecode around each frame's IP before
+            // throwing.  Diagnoses "where is v3 stuck" when an
+            // infinite loop trips the wall-time cap with low
+            // allocation counts (the alloc snapshot in the message
+            // above already gives the macro-level state; this gives
+            // the micro-level instruction context).
+            static const bool s_dbgTrap =
+                std::getenv("V3_DBG_TRAP_ON_LIMIT") != nullptr;
+            if (s_dbgTrap) {
+                // Prefer currentDispatchVM (set at dispatchLoop entry/exit)
+                // over activeV3VM (only set at bridge boundaries).
+                VMState * vm = currentDispatchVM();
+                if (!vm) vm = activeV3VM();
+                if (vm) {
+                    std::fprintf(stderr,
+                        "v3 trap-on-limit: VMState=%p frames=%zu  "
+                        "valueStack=%zu  withStack=%zu\n",
+                        (const void *)vm,
+                        vm->frames.size(),
+                        vm->valueStack.size(),
+                        vm->withStack.size());
+                    size_t n = vm->frames.size();
+                    size_t maxFrames = 12;
+                    size_t start = n > maxFrames ? n - maxFrames : 0;
+                    for (size_t i = start; i < n; ++i) {
+                        const auto & fr = vm->frames[i];
+                        std::fprintf(stderr,
+                            "  frame[%zu]: cu=%p ip=%u thunk=%p closure=%p "
+                            "flags=0x%x\n",
+                            i, (const void *)fr.cu, fr.ip,
+                            (const void *)fr.thunk, (const void *)fr.closure,
+                            unsigned(fr.flags));
+                        if (fr.cu) {
+                            uint32_t lo = fr.ip > 24 ? fr.ip - 24 : 0;
+                            uint32_t hi = fr.ip + 12;
+                            disassembleWindow(stderr, *fr.cu, lo, hi);
+                        }
+                    }
+                } else {
+                    std::fprintf(stderr, "v3 trap-on-limit: no active VMState\n");
+                }
+                std::fflush(stderr);
+            }
             throw WallTimeExceededError(msg);
         }
     }

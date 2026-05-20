@@ -2002,8 +2002,31 @@ static inline void hotForceCheck(const Thunk * t)
 /// open to catch the exception.  Single-call-site cleanup → caller
 /// frames can be elided (saves ~1.2-1.7 KB per Suspended-thunk
 /// dispatch).
+} // close current anon ns (briefly)
+} // close namespace nix::v3 (briefly)
+
+// #698 Phase 3 diagnostic: thread-local pointer to the current
+// dispatchLoop's vm.  Set at dispatch entry, restored at exit.
+// Read by limits.cc's V3_DBG_TRAP_ON_LIMIT to dump frame state on
+// wall-time / cpu-time / heap-cap abort.  Cheap (one thread-local
+// store on entry/exit, no per-instruction cost).
+namespace nix::v3 {
+    thread_local VMState * tlCurrentDispatchVM = nullptr;
+    VMState * currentDispatchVM() { return tlCurrentDispatchVM; }
+}
+
+namespace nix::v3 {
+namespace { // re-open anon ns
+
 Value dispatchLoop(VMState & vm, size_t exitDepth)
 {
+    VMState * prevDispatchVM = tlCurrentDispatchVM;
+    tlCurrentDispatchVM = &vm;
+    struct VMScope {
+        VMState * prev;
+        ~VMScope() { tlCurrentDispatchVM = prev; }
+    } _vmScope{prevDispatchVM};
+
     const CallFrame & topFrame = vm.frames.back();
     const CompilationUnit * cu = topFrame.cu;
     uint32_t ip = topFrame.ip;

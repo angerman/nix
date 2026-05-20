@@ -119,6 +119,12 @@ CompilationUnit compile(const ir::Module & m);
 /// Run the top-level CU's entry until OP_HALT, returning the final value.
 Value run(const CompilationUnit & cu);
 
+/// #698 Phase 3 diagnostic: returns the inner-most dispatchLoop's
+/// VMState pointer on the current thread, or nullptr if no dispatch
+/// loop is active.  Used by limits.cc's `V3_DBG_TRAP_ON_LIMIT` to
+/// dump frame stacks on wall-time / cpu-time / heap-cap abort.
+VMState * currentDispatchVM();
+
 /// #425: process-wide lazy singleton of the `builtins` attrset.  Built
 /// on first call from the registered primops table (matching the
 /// OP_LIT_BUILTINS dispatch); subsequent calls return the same Value.

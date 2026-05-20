@@ -165,8 +165,23 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
         throw std::runtime_error("v3::callFlakeV3: no TW EvalState wired");
     auto & ns = *state.nixEvalState;
 
+    // V3_DBG_CALLFLAKE_TIMING — phase split inside callFlakeV3.
+    // Prints ms elapsed per phase to stderr.  Retire when v3-native
+    // matches TW on cardano-node (the opt-in gate retirement
+    // criterion).
+    static const bool s_dbgTiming =
+        std::getenv("V3_DBG_CALLFLAKE_TIMING") != nullptr;
+    auto t0 = std::chrono::steady_clock::now();
+    auto tick = [&](const char * label) {
+        if (!s_dbgTiming) return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "v3 callFlakeV3 [%6.1f ms cumulative] %s\n", ms, label);
+    };
+
     // (1) Compile call-flake.nix in v3 (cached after first call).
     Value vCallFlake = g_cachedCallFlake.get(ns);
+    tick("cache.get done");
 
     // (2) Build TW args — replicates libflake/flake.cc:callFlake
     //     lines 932-969.  Uses TW's existing emitTreeAttrs +
