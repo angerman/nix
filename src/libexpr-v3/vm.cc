@@ -687,6 +687,36 @@ inline bool isTrueValue(const Value & v)
 /// Attrset coercion (`__toString` / `outPath`) is handled BEFORE this
 /// helper by the OP_STR_CONCAT attr-unwind loop (vm.cc:8051+), so by
 /// the time we get here the value is a primitive.
+
+/// #685 — opcode-side mirror of TW's `forceStringNoCtx`
+/// (libexpr/eval.cc:2826).  Throws TW's exact error text when the
+/// string value carries any context.  Used for dynamic attr names
+/// (`{ ${ctxedStr} = v; }` / `.${ctxedStr}` / `?${ctxedStr}`) which
+/// TW gates via forceStringNoCtx in evalDynamicAttrs.  The
+/// primops.cc version of this helper takes an EvalState; this one
+/// reaches the store via the global `getNixEvalState()` so it can
+/// be called from inside opcode dispatch where no `state` is in
+/// scope.  Empty-context strings short-circuit cheaply.
+inline void requireNoStringContextRuntime(const Value & v,
+                                          std::string_view siteHint)
+{
+    if (!v.isString() || !v.payload.str) return;
+    auto * raw = lookupStringContextEntries(v.payload.str);
+    if (!raw || raw->empty()) return;
+    std::string display = raw->front();
+    if (auto * ns = getNixEvalState()) {
+        try {
+            auto elem = nix::NixStringContextElem::parse(raw->front());
+            display = elem.display(*ns->store);
+        } catch (...) { /* keep raw fallback */ }
+    }
+    (void)siteHint;
+    throw std::runtime_error(
+        std::string("the string '") + v.payload.str
+        + "' is not allowed to refer to a store path (such as '"
+        + display + "')");
+}
+
 inline std::string coerceToString(const Value & v, bool forceString)
 {
     // Use if/else rather than switch to avoid -Wswitch-enum on every
@@ -6060,6 +6090,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 if (nameV.isNull()) continue;
                 if (!nameV.isString())
                     throw std::runtime_error("v3 OP_ATTRS_INIT_DYN: dynamic name must be a string");
+                // #685 — TW rejects dynamic attr names with string
+                // context (libexpr/eval.cc:2826 forceStringNoCtx).
+                requireNoStringContextRuntime(nameV, "OP_ATTRS_INIT_DYN");
                 // Use the global symbol table — IDs from any CU stay
                 // consistent so attrset lookups across CUs work.
                 SymbolId id = ir::globalInternSymbol(nameV.payload.str);
@@ -7208,6 +7241,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             if (!name.isString() || !attrs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_SELECT_DYN: type error");
+            // #685 — dynamic-attr-name forceStringNoCtx mirror.
+            requireNoStringContextRuntime(name, "OP_ATTRS_SELECT_DYN");
             // Intern via the global table so the SymbolId matches the
             // ones the attrset's bindings were built with.
             SymbolId id = ir::globalInternSymbol(name.payload.str);
@@ -7333,6 +7368,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 attrs = forceValue(vm, attrs);
             }
             if (!name.isString() || !attrs.isAttrs()) { push(vm, Value::vFalse); break; }
+            // #685 — dynamic-attr-name forceStringNoCtx mirror.  Note:
+            // TW also throws here when the name has context (the
+            // `?` operator forces its dynamic name via the same
+            // evalDynamicAttrs path).  We throw rather than return
+            // false to match TW.
+            requireNoStringContextRuntime(name, "OP_ATTRS_HAS_DYN");
             SymbolId id = ir::globalInternSymbol(name.payload.str);
             push(vm, attrs.payload.bindings->has(id)
                 ? Value::vTrue : Value::vFalse);
