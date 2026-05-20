@@ -6919,13 +6919,21 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
         out += "<attrs>\n";
         if (v.payload.bindings) {
             // Sort by name for stable output.
+            // #670/#671 follow-on: store names as OWNING std::string,
+            // not string_view, because the recursive valueToXml call
+            // below may force values that intern new symbols and
+            // realloc the global symbol table — invalidating any
+            // string_views into it.  Same UB pattern as the
+            // structuredAttrs branch (commit bcc8d6cf1).
             auto & symTab = ir::globalSymbolTable();
-            std::vector<std::pair<std::string_view, Value>> entries;
+            std::vector<std::pair<std::string, Value>> entries;
             entries.reserve(v.payload.bindings->size);
             for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
                 SymbolId sid = v.payload.bindings->entries[i].name;
-                std::string_view nm = sid < symTab.size() ? std::string_view(symTab[sid]) : std::string_view("");
-                entries.emplace_back(nm, v.payload.bindings->entries[i].value);
+                std::string nm = sid < symTab.size()
+                    ? std::string(symTab[sid]) : std::string();
+                entries.emplace_back(std::move(nm),
+                    v.payload.bindings->entries[i].value);
             }
             std::sort(entries.begin(), entries.end(),
                 [](auto & a, auto & b) { return a.first < b.first; });
@@ -7726,8 +7734,17 @@ nlohmann::json valueToJson(EvalState & state, const Value & vRaw)
         if (v.payload.bindings) {
             for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
                 auto & en = v.payload.bindings->entries[i];
-                std::string_view k = vmSymName(state, en.name);
-                obj[std::string(k)] = valueToJson(state, en.value);
+                // #670/#671 follow-on: capture the key as std::string
+                // BEFORE valueToJson runs.  valueToJson's recursive
+                // forceValue may intern new symbols, which grows the
+                // global symbol table's std::vector<std::string> and
+                // invalidates string_views into it.  In `obj[k] = v`,
+                // LHS and RHS evaluation order is unsequenced; if RHS
+                // runs first and reallocs, the LHS std::string(k)
+                // would copy from dangling memory.  Same UB pattern
+                // as the structuredAttrs branch (commit bcc8d6cf1).
+                std::string k = std::string(vmSymName(state, en.name));
+                obj[std::move(k)] = valueToJson(state, en.value);
             }
         }
         return obj;
@@ -7843,8 +7860,12 @@ nlohmann::json valueToJsonWithContext(
         if (v.payload.bindings) {
             for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
                 auto & en = v.payload.bindings->entries[i];
-                std::string_view k = vmSymName(state, en.name);
-                obj[std::string(k)] = valueToJsonWithContext(
+                // #670/#671 follow-on (same as valueToJson above): copy
+                // the key to an OWNING std::string before the recursive
+                // valueToJsonWithContext, whose forceValue can grow
+                // the global symbol table and invalidate string_views.
+                std::string k = std::string(vmSymName(state, en.name));
+                obj[std::move(k)] = valueToJsonWithContext(
                     state, en.value, context);
             }
         }
