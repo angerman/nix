@@ -472,4 +472,148 @@ void printNixValueRich(std::ostream & out, const Value & v,
     printNixValueRich(out, v, symTab, seen);
 }
 
+// ---------------------------------------------------------------------------
+// Lazy + per-error rich printer (TW parity for `nix eval` on lazy values)
+// ---------------------------------------------------------------------------
+//
+// TW's `ValuePrinter::print` (libexpr/print.cc:546-631) forces each value
+// INLINE inside a try/catch, so an attrset like `{ a = 1; b = throw "no";
+// c = 3; }` renders as `{ a = 1; b = «error: no»; c = 3; }` rather than
+// aborting the whole print.
+//
+// Pre-fix `runV3DirectEval` ran `forceDeep` BEFORE the printer, so any
+// `throw` deep in the attrset propagated up and aborted the print
+// entirely.  This overload mirrors TW: force the value at the entry, and
+// recurse into list/attrset children that each in turn force themselves
+// inside their own try/catch.
+//
+// `vm` is required to call `forceValue`.  All other shape and tag
+// handling is identical to the no-vm overload, so we delegate via a
+// per-recursion lambda that forces + dispatches.
+void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
+                       const std::vector<std::string> & symTab,
+                       std::set<const void *> & seen)
+{
+    // Force the current value before printing.  TW catches errors at
+    // every depth (libexpr/print.cc:625) and emits `«error: <msg>»`
+    // instead; we mirror that with std::exception catch (v3 errors all
+    // derive from BaseError → std::exception).
+    //
+    // Track-repeated identity uses the caller-supplied `&v` (the
+    // attrset-entry's storage address), NOT the stack-local force
+    // target — `&forced` is reused across sibling recursion frames and
+    // would generate false-positive `«repeated»` for the second of
+    // two equally-structured sibling list values.  Matches TW's
+    // `seen->insert(&v)` discipline.
+    Value forced;
+    try {
+        forced = forceValue(vm, v);
+    } catch (const std::exception & e) {
+        out << "«error: " << e.what() << "»";
+        return;
+    }
+
+    // Only List and Attrs need the lazy-recursing path (their children
+    // may be unforced thunks that throw); every other tag is a leaf
+    // the no-vm overload handles correctly given an already-forced
+    // value.  Use if/else so we don't have to enumerate every Tag for
+    // `-Werror=switch-enum`.
+    if (forced.tag() == Tag::List) {
+        if (forced.payload.list && forced.payload.list->size > 0 &&
+            !seen.insert(&v).second) {
+            out << "«repeated»"; return;
+        }
+        out << "[ ";
+        if (forced.payload.list)
+            for (uint32_t i = 0; i < forced.payload.list->size; ++i) {
+                printNixValueRich(out, vm, forced.payload.list->elems[i],
+                                  symTab, seen);
+                out << ' ';
+            }
+        out << "]";
+        return;
+    }
+    if (forced.tag() == Tag::Attrs) {
+        // Derivation detection must force `type` (TW's
+        // `EvalState::isDerivation`; libexpr/eval.cc:2848) AND
+        // `drvPath` for the print shortcut.  Without force, the
+        // bindings entry is Tag::Thunk, the helper rejects, and the
+        // printer falls through to the full attrset path — which
+        // forces every attr including `passthru.tests`, triggering
+        // nixpkgs's deprecation warning that TW never emits because
+        // it short-circuits at the `type` check.
+        if (forced.payload.bindings) {
+            auto * b = forced.payload.bindings;
+            // Inline force-then-check; can't reuse the const helper
+            // because we need to mutate-in-place for cache and the
+            // helper's signature is `const Value &`.
+            auto findEntry = [&](std::string_view want) -> Value * {
+                for (uint32_t i = 0; i < b->size; ++i) {
+                    std::string_view nm = (b->entries[i].name < symTab.size())
+                        ? std::string_view(symTab[b->entries[i].name])
+                        : std::string_view{};
+                    if (nm == want) return &b->entries[i].value;
+                }
+                return nullptr;
+            };
+            Value * typeV = findEntry("type");
+            if (typeV) {
+                try { *typeV = forceValue(vm, *typeV); }
+                catch (const std::exception &) { typeV = nullptr; }
+            }
+            if (typeV && typeV->tag() == Tag::String
+                && typeV->payload.str
+                && std::string_view(typeV->payload.str) == "derivation")
+            {
+                Value * drvPathV = findEntry("drvPath");
+                if (drvPathV) {
+                    try { *drvPathV = forceValue(vm, *drvPathV); }
+                    catch (const std::exception &) { drvPathV = nullptr; }
+                }
+                if (drvPathV && drvPathV->tag() == Tag::String
+                    && drvPathV->payload.str)
+                {
+                    out << "«derivation " << drvPathV->payload.str << "»";
+                    return;
+                }
+            }
+        }
+        if (forced.payload.bindings && forced.payload.bindings->size > 0 &&
+            !seen.insert(forced.payload.bindings).second) {
+            out << "«repeated»"; return;
+        }
+        out << "{ ";
+        if (forced.payload.bindings) {
+            std::vector<std::pair<std::string, const Value *>> items;
+            items.reserve(forced.payload.bindings->size);
+            for (uint32_t i = 0; i < forced.payload.bindings->size; ++i) {
+                auto & en = forced.payload.bindings->entries[i];
+                std::string key = (en.name < symTab.size())
+                    ? symTab[en.name] : std::to_string(en.name);
+                items.emplace_back(std::move(key), &en.value);
+            }
+            std::sort(items.begin(), items.end(),
+                      [](auto & a, auto & b) { return a.first < b.first; });
+            for (auto & [name, val] : items) {
+                printAttrName(out, name);
+                out << " = ";
+                printNixValueRich(out, vm, *val, symTab, seen);
+                out << "; ";
+            }
+        }
+        out << "}";
+        return;
+    }
+    // Scalars + closures + primops + thunks: delegate to the no-vm
+    // overload so leaf-token formatting stays in one place.
+    printNixValueRich(out, forced, symTab, seen);
+}
+
+void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
+                       const std::vector<std::string> & symTab)
+{
+    std::set<const void *> seen;
+    printNixValueRich(out, vm, v, symTab, seen);
+}
+
 } // namespace nix::v3

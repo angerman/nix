@@ -985,8 +985,11 @@ void primThrow(EvalState &, Value * args, Value &)
 {
     if (!args[0].isString()) typeError("throw", "string");
     // ThrownError derives from AssertionError so tryEval catches it
-    // (matches tree-walker semantics).
-    throw ThrownError(std::string("v3 throw: ") + args[0].payload.str);
+    // (matches tree-walker semantics).  #677 — emit the message verbatim
+    // (no "v3 throw:" prefix) so default-mode `nix eval` byte-matches
+    // TW's `«error: <msg>»` form (libexpr/primops.cc:1167 throws
+    // `ThrownError(s)` with no prefix).
+    throw ThrownError(std::string(args[0].payload.str));
 }
 
 void primConcatLists(EvalState & state, Value * args, Value & out)
@@ -1838,7 +1841,14 @@ void primAbort(EvalState &, Value * args, Value &)
     if (!args[0].isString()) typeError("abort", "string");
     // AbortError is a plain runtime_error (not derived from AssertionError),
     // so tryEval does NOT catch it -- matches tree-walker's nix::Abort.
-    throw AbortError(std::string("v3 abort: ") + args[0].payload.str);
+    //
+    // #677 — match TW's exact phrasing
+    // (libexpr/primops.cc:1147): "evaluation aborted with the
+    // following error message: '<msg>'".  Drops the v3-specific
+    // prefix so default-mode `nix eval` byte-matches TW.
+    throw AbortError(
+        std::string("evaluation aborted with the following error message: '")
+        + args[0].payload.str + "'");
 }
 
 void primSeq(EvalState &, Value * args, Value & out)

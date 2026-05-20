@@ -205,17 +205,21 @@ static bool runV3DirectEval(
         nix::evalTrace::mark("eval.cc:178 lazy json");
         std::cout << v3::toJsonValue(vm, r, v3::ir::globalSymbolTable()).dump() << "\n";
     } else {
-        // Default print.  forceDeep so nested thunks render as values.
-        // #669: use the TW-style rich printer (`«derivation /path»`,
-        // `«lambda <name>? @ <pos>»`, `«primop <name>»`) instead of the
-        // simplified printer that powers `nix-instantiate --eval`.  The
-        // simplified printer is reserved for the lang-test golden
-        // comparison harness (v3-eval / nix-instantiate); user-facing
-        // `nix eval` matches TW's surface form.
-        nix::evalTrace::mark("eval.cc:182 forceDeep(default print)");
-        r = v3::forceDeep(vm, r);
+        // Default print.  TW renders `{ a = 1; b = throw "no"; c = 3; }`
+        // as `{ a = 1; b = «error: no»; c = 3; }` — per-attr try/catch
+        // catches `throw` deep in the value and emits an inline error
+        // token.  v3's vm-aware printer overload mirrors that: forces
+        // each value lazily inside a try/catch, recursing without an
+        // upfront `forceDeep` (which would propagate the throw to the
+        // top level and abort the print).
+        //
+        // #669 contributed the rich-form tokens (`«derivation /path»`,
+        // `«lambda <name>? @ <pos>»`, `«primop <name>»`); the new
+        // VMState-aware overload (this commit) adds the lazy + per-
+        // error force discipline.
+        nix::evalTrace::mark("eval.cc:182 lazy print(default)");
         std::ostringstream os;
-        v3::printNixValueRich(os, r, v3::ir::globalSymbolTable());
+        v3::printNixValueRich(os, vm, r, v3::ir::globalSymbolTable());
         logger->cout("%s", os.str());
     }
 

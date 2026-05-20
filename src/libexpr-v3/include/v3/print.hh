@@ -78,6 +78,21 @@ void printNixValueRich(std::ostream & out, const Value & v,
 void printNixValueRich(std::ostream & out, const Value & v,
                        const std::vector<std::string> & symTab);
 
+/// Lazy + per-error rich printer (TW `ValuePrinter` parity).
+///
+/// Like the const-Value overload above, but takes a `VMState&` and
+/// lazy-forces each value inline.  Catches `nix::Error` and emits
+/// `«error: <msg>»` at every depth, matching TW's
+/// `libexpr/print.cc:625` behavior.  Required for default-mode
+/// `nix eval` parity on inputs like `{ a = 1; b = throw "no"; }`
+/// — pre-fix v3 ran `forceDeep` upfront and propagated any inner
+/// `throw` to the top level, aborting the whole print.
+void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
+                       const std::vector<std::string> & symTab,
+                       std::set<const void *> & seen);
+void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
+                       const std::vector<std::string> & symTab);
+
 /// v3 Value → JSON, matching `builtins.toJSON` semantics:
 ///   - scalars / lists / attrs serialise normally.
 ///   - functions throw `runtime_error("cannot convert a function to
