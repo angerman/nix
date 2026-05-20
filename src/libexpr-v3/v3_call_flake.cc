@@ -238,6 +238,16 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
             // Build TW sourceInfo via emitTreeAttrs (FFI leaf — knows
             // how to format outPath context, narHash, lastModified
             // etc. from a fetchers::Input).
+            //
+            // TODO #701 (Phase 4b — deferred): port emitTreeAttrs to v3.
+            // Currently this is the ONE residual bridge per node in
+            // callFlakeV3; eliminating it requires ~150-200 LoC reading
+            // fetchers::Input + StorePath fields and constructing a v3
+            // Bindings with proper NixStringContext.  Deferred until a
+            // workload appears where the per-node sourceInfo
+            // construction dominates.  See
+            // lode/V3_NATIVE_CALL_FLAKE_DESIGN_2026-05-20.md §9 and
+            // memory `project_701_deferred_emitTreeAttrs_v3.md`.
             nix::Value * twSourceInfo = ns.allocValue();
             nix::emitTreeAttrs(
                 ns,

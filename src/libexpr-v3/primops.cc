@@ -9478,39 +9478,38 @@ void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("f
 Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake);
 
 void primGetFlake(EvalState & s, Value * a, Value & o) {
-    // #698 Phase 3 status (2026-05-20):
-    //   - The v3-native path WORKS semantically on trivial flakes
-    //     (`(getFlake X).smoke` byte-identical to TW).
-    //   - On heavy workloads (cardano-node ~30 inputs) it's
-    //     significantly slower than the post-#697 bridge: 60s+ vs
-    //     7s.  Allocations during the slow path show real eval work
-    //     (170 attrsets, 81 thunks) — not a hang — but throughput
-    //     is ~10× the TW-bridge baseline.
+    // #698/#700 status (2026-05-20):
+    // The v3-native path is **default-on** post-#700.  Phase 4
+    // (commit 88199c4a0) eliminated the bridge tax that previously
+    // made it slower than TW; v3-native is now 1.5× FASTER than TW
+    // on cardano-node `(getFlake X) ? outputs`:
+    //   TW alone:        12.16 s
+    //   v3-native:        8.05 s
+    //   bridge (control): 7.44 s
     //
-    // Root cause is in v3's per-call overhead compounding across
-    // call-flake.nix's allNodes recursion (each input flake triggers
-    // primImport + outputs lambda call + attrset merging).  Same
-    // perf-class as the hello.drvPath per-force gap; tracked under
-    // Stage 3-4 / Phase 1.5.
+    // Opt-OUT via `NIX_V3_NO_NATIVE_CALL_FLAKE=1` retained for
+    // emergency rollback during broader regression validation.
+    // Retirement criterion for the opt-out gate: once a full
+    // regression sweep across nixpkgs flakes shows zero divergence
+    // vs the bridge path, delete the gate body and the bridgeBuiltin
+    // fallback (DCE the bridge path entirely).
     //
-    // **Retirement criterion** for the opt-in gate below: when
-    // v3-native completes cardano-node `(getFlake X) ? outputs` in
-    // ≤ 2× TW time, flip the default and delete the gate body.
-    // Until then the gate stays opt-IN to preserve the #697
-    // perf win for everyday users; v3-native is reachable via
-    // `NIX_V3_NATIVE_CALL_FLAKE=1` for measurement + future
-    // perf-track validation.
-    static const bool s_enableNative =
-        std::getenv("NIX_V3_NATIVE_CALL_FLAKE") != nullptr;
+    // ALSO falls back to the bridge when:
+    //   - flakeSettings hasn't been wired (e.g., v3-eval standalone
+    //     without libcmd → getFlakeSettings() returns nullptr).
+    //   - s.nixEvalState is null (v3 invoked outside any TW context).
+    // Both are degraded-mode safety nets, not perf-related.
+    static const bool s_disableNative =
+        std::getenv("NIX_V3_NO_NATIVE_CALL_FLAKE") != nullptr;
     const nix::flake::Settings * flakeSettings = getFlakeSettings();
 
-    if (!s_enableNative || !flakeSettings || !s.nixEvalState) {
+    if (s_disableNative || !flakeSettings || !s.nixEvalState) {
         bridgeBuiltin<1>("getFlake", s, a, o);
         return;
     }
     auto & ns = *s.nixEvalState;
 
-    // V3-native path (opt-in via NIX_V3_NATIVE_CALL_FLAKE=1).
+    // V3-native path (default; opt out via NIX_V3_NO_NATIVE_CALL_FLAKE=1).
 
     // (1) FFI leaves: parseFlakeRef + lockFlake.  Pure C functions
     //     (no Nix eval); per V3-NATIVE rule these stay in TW.

@@ -609,6 +609,77 @@ its own compiler instead of TW's.
   herrings; same bug fires without them"; applies here as
   "don't add gates that hide the divergence we want to falsify."
 
+## §8 — Phase 4 status (LANDED 2026-05-20)
+
+The user pushed back on Phase 3 with: *"why do we bridge structures?
+Didn't we want to stay in pure VM land?"*  That correction drove
+Phase 4, which eliminates the bridge tax in callFlakeV3:
+
+| Mode                                              | Cardano-node `(getFlake X) ? outputs` |
+| ------------------------------------------------- | --- |
+| TW alone                                          | 12.16 s |
+| v3-direct + NIX_V3_NATIVE_CALL_FLAKE=1 (Phase 4)  |  **8.05 s** |
+| v3-direct default (post-#697 bridge)              |  7.44 s |
+
+Phase 4 changes (commit `88199c4a0`):
+
+- **vLocks**: built as v3 String via `Alloc::allocChars` +
+  `Value::mkString`.  Zero bridges.
+- **vOverrides**: outer Bindings is v3-native via `Alloc::allocBindings(N)`
+  with entries sorted by SymbolId.  Inner `{sourceInfo; dir;}` is
+  also v3-native (sourceInfo bridged ONCE per node, not per access).
+  `dir` is a v3 String.
+- **vFetchTreeFinal**: new v3 primop `__fetchFinalTree` looked up via
+  `findPrimOp`; constructed directly as a v3 PrimOp Value.  Bridge
+  only fires if the primop is actually called (rare in `getFlake`).
+
+The v3-native opt-in gate's retirement criterion ("≤ 2× TW on
+cardano-node `? outputs`") is MET — v3-native is 1.5× faster than
+TW.  Default flip follows in a separate commit.
+
+## §9 — Deferred: full Phase 4b — port `emitTreeAttrs` to v3
+
+Phase 4 leaves ONE residual bridge per node: `nix::emitTreeAttrs`
+(libflake/flake.cc:emitTreeAttrs and its libfetchers callers) is
+still TW C++ code that produces a TW sourceInfo attrset, which
+callFlakeV3 then bridges once per node via `treeWalkerToV3Public`.
+
+For cardano-node-class workloads this is **acceptable** — the per-
+node bridge is O(N_nodes) construction-time cost, not O(M_accesses)
+runtime cost.  Phase 4 numbers show v3-native is already faster than
+TW.
+
+But the V3-NATIVE rule isn't fully realised until `emitTreeAttrs`
+itself is ported to v3.  Phase 4b would:
+
+  - Take a `fetchers::Input` + `StorePath` (both C++ structs; no Nix
+    eval needed to read their fields).
+  - Construct a v3 Bindings directly with v3 String values for
+    `outPath` (with proper string context — `NixStringContext`
+    Opaque entry for the storePath), `narHash`, `lastModified`,
+    `lastModifiedDate`, `rev`, `shortRev`, `revCount`, `submodules`,
+    and the fetcher-specific extras.
+  - Place the result in callFlakeV3's outer overrides directly,
+    bypassing the TW value + bridge entirely.
+
+**Effort**: ~150-200 LoC.  Each field is straightforward
+(string/int formatting from the C++ struct).  The tricky bit is
+preserving string context on `outPath` — the v3 string-context
+side-table API (`setStringContextEntries`) is the right tool;
+mirror how `primStorePath` or `primFetchurl`'s body would do it
+v3-natively (if those were native rather than bridged — neither is
+today).
+
+**Trigger to land Phase 4b**: when a workload appears where the
+per-node `emitTreeAttrs` cost dominates.  Candidates: flakes with
+*many* nodes (NixOS toplevel, nixpkgs as a sub-flake input) or
+where the per-node bridge thunk fires multiple times per node
+(possible if reading `sourceInfo` more than once per node and the
+bridge isn't memoized).
+
+**Until then**: Phase 4 is the floor.  Phase 4b is `#701` in the
+task tracker, listed as a perf-track item without a deadline.
+
 ## Copyright
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
