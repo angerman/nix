@@ -8,30 +8,18 @@
 /// calls `builtins.getFlake`.  That's a V3-NATIVE violation: pure
 /// Nix code (no FFI inside call-flake.nix) should run on v3's VM.
 ///
-/// This file implements `v3::callFlakeV3(state, lockedFlake)` which:
-///   1. Loads call-flake.nix from the canonical libflake source
-///      (shared via the generated header).
-///   2. Parses (via TW's `parseExprFromString` — parsing IS TW's
-///      responsibility per V3-NATIVE; v3 wraps the AST → IR pipeline).
-///   3. Lowers + compiles in v3 (cached on a static so subsequent
-///      getFlake calls reuse the same CU).
-///   4. Builds the args (vLocks, vOverrides, vFetchTreeFinal) by
-///      mirroring libflake's `callFlake` body — these are TW Values.
-///   5. Bridges the TW args to v3 Values via `treeWalkerToV3`.
-///   6. Applies the 3-arg call-flake.nix lambda via `callClosure`.
-///   7. Returns the resulting v3 Value.
+/// **Phase 2 (this file)**: load call-flake.nix from the canonical
+/// libflake source (via the shared generated header), parse it with
+/// TW's parser (parsing IS TW's responsibility per V3-NATIVE — v3
+/// only owns lower → bytecode → run), lower into v3 IR, optimise,
+/// compile to a CompilationUnit, run to obtain the top-level
+/// 3-arg lambda closure.  The CU is held alive via a static.
 ///
-/// The v3-compiled call-flake.nix internally calls
-/// `import (outPath + "/flake.nix")`, which routes through v3's
-/// `primImport` (post-#696 supports IFD too).  So the entire
-/// post-FFI evaluation chain (call-flake.nix + each flake's
-/// outputs lambda) runs on v3's VM.  TW handles only:
-///   - `parseFlakeRef` (string → FlakeRef)
-///   - `lockFlake` (fetch + write lockfile)
-///   - `fetchTreeFinal` (fetch a single source)
-///   - Parsing .nix file sources (TW owns the parser)
-///
-/// All of those are FFI leaves per the V3-NATIVE rule.
+/// `callFlakeV3` itself (the integration point) is Phase 3: it will
+/// build TW args via libflake helpers, bridge to v3, and apply via
+/// callClosure × 3.  For now `callFlakeV3` invokes the cache to
+/// verify the compilation pipeline works end-to-end, then throws a
+/// PHASE-3 marker.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 /// Input Output Group.  SPDX-License-Identifier: Apache-2.0
@@ -39,13 +27,14 @@
 #include "v3/primop.hh"
 #include "v3/closure.hh"
 #include "v3/lower.hh"
+#include "v3/ir.hh"
+#include "v3/vm.hh"
 #include "v3/value.hh"
 
 #include "nix/expr/eval.hh"
-#include "nix/expr/eval-inline.hh"
 #include "nix/flake/flake.hh"
-#include "nix/flake/settings.hh"
 
+#include <deque>
 #include <mutex>
 
 namespace nix::v3 {
@@ -58,109 +47,199 @@ constexpr const char * callFlakeSource =
 #include "call-flake.nix.gen.hh"
     ;
 
-/// Lazily-initialised v3-compiled call-flake.nix closure.  The CU is
-/// kept alive via the importCache's `cus` deque (similar to
-/// primImport's caching) so closures captured here remain valid.
+/// Lazily-initialised v3-compiled call-flake.nix closure.
 ///
 /// First-call cost: parse + lower + compile (~tens of ms for this
-/// 105-line file).  Subsequent calls: O(1) lookup.
+/// 105-line file).  Subsequent calls: O(1) — return the cached
+/// Closure Value.
 ///
-/// Thread safety: called_once initialises atomically.  After that,
-/// the Value is immutable (the CU is GC-rooted via cache).
+/// CU lifetime (per design doc §2.1):
+/// `std::deque<CompilationUnit>` — push_back never invalidates
+/// prior elements, so closures embedding `c->cu = &back()` stay
+/// valid for the program's lifetime.  Same pattern as primImport's
+/// importCache.cus.
+///
+/// We use a LOCAL static deque (not the shared importCache.cus)
+/// because: (a) ownership is clearer — clearImportCache shouldn't
+/// drop the call-flake CU mid-eval; (b) the deque is reset only on
+/// process exit; (c) keeps the symbol table reference dependency
+/// localised — the design doc warns against std::unique_ptr that
+/// outlives the EvalState, but a static deque has the same lifetime
+/// hazard.  TODO Phase 3: reconsider lifetime — pass the cache slot
+/// through EvalState if we hit symbol-table-staleness in practice.
+///
+/// Thread safety: `std::call_once` guarantees atomic initialisation.
+/// After init, the Closure Value is read-only.
 struct CachedCallFlake {
     std::once_flag flag;
+    std::deque<CompilationUnit> cus;  // stable addresses (deque doesn't reallocate)
     Value closureValue;
 
+    /// Build (or fetch cached) the v3-compiled call-flake.nix
+    /// closure.  Throws via `std::runtime_error` if any step fails;
+    /// callers should propagate to surface v3 language-support gaps
+    /// rather than masking with a TW fallback (per design doc §0
+    /// Rule 0 falsification criterion).
     Value get(nix::EvalState & ns) {
         std::call_once(flag, [&] {
-            // (1) Parse call-flake.nix as a Nix expression.  We use
-            // the TW parser since v3 doesn't have its own.
+            // (1) Parse call-flake.nix as a Nix expression via the
+            // TW parser.  Per V3-NATIVE, parsing IS TW's
+            // responsibility (the .nix-grammar parser lives in TW).
+            // v3 owns the post-parse pipeline (lower → bytecode →
+            // run).
+            //
+            // The basePath is synthetic: call-flake.nix is loaded
+            // from an in-memory string, so we use the rootPath
+            // marker so any relative-path operations inside the
+            // expression (there shouldn't be any — call-flake.nix
+            // does its own outPath plumbing) point at a clearly-
+            // synthetic location.
             nix::Expr * e = ns.parseExprFromString(
-                callFlakeSource, ns.rootPath("/«v3-call-flake»"));
+                callFlakeSource,
+                ns.rootPath("/«v3-call-flake»"));
             e->bindVars(ns, ns.staticBaseEnv);
 
-            // (2) Lower + optimise + compile into a v3 CU.
-            // TODO: actual implementation.  Skeleton currently
-            // throws to surface that this path isn't wired yet.
-            //
-            // Steps once implemented:
-            //   auto module = lowerNixExpr(e, ns.symbols, ns.positions);
-            //   ir::optimise(module);
-            //   ir::computeFreeVars(module);
-            //   auto cu = std::make_unique<CompilationUnit>(compile(module));
-            //   // Hold cu alive via a static or via importCache.
-            //   closureValue = run(*cu);
-            //   if (closureValue.tag() != Tag::Closure)
-            //       throw std::runtime_error("call-flake.nix did not compile to a closure");
+            // (2) Lower into v3 IR.  Same pipeline as primImport
+            // (primops.cc:7180-7183).
+            auto module = lowerNixExpr(e, ns.symbols, ns.positions);
+            ir::optimise(module);
+            ir::computeFreeVars(module);
 
-            (void)e;  // suppress unused warning until wired
-            throw std::runtime_error(
-                "v3::callFlakeV3: PHASE 1 SCAFFOLD — implementation pending "
-                "(see lode/V3_NATIVE_CALL_FLAKE_DESIGN_2026-05-20.md)");
+            // (3) Compile to bytecode + hold the CU alive.
+            cus.push_back(compile(module));
+
+            // (4) Run the top-level expression.  call-flake.nix's
+            // top-level form is a 3-arg lambda
+            // (`lockFileStr: overrides: fetchTreeFinal: <body>`),
+            // so the resulting Value must be a Tag::Closure.
+            closureValue = run(cus.back());
+
+            if (closureValue.tag() != Tag::Closure) {
+                throw std::runtime_error(
+                    "v3::CachedCallFlake::get: call-flake.nix did "
+                    "not compile to a closure (tag="
+                    + std::to_string(static_cast<int>(closureValue.tag()))
+                    + ")");
+            }
         });
         return closureValue;
     }
 };
 
+/// Process-wide cache.  Single instance per process — the .nix
+/// source is fixed at build time, so the compiled closure is
+/// reusable across all `builtins.getFlake` calls.
 CachedCallFlake g_cachedCallFlake;
 
 } // namespace
 
-/// Public entry point — invoked from `primGetFlake` (when the
-/// `NIX_V3_NATIVE_CALL_FLAKE` gate is on; in a follow-up commit
-/// this becomes the default).
+/// Public entry point — invoked from `primGetFlake` when the
+/// v3-native path is enabled (Phase 3 wires this; until then no
+/// caller exists).
 ///
 /// `state.nixEvalState` must be wired.
 ///
-/// Returns a v3 Value representing the flake's outputs attrset
-/// (with `outputs`, `inputs`, `sourceInfo`, `outPath`, `_type`).
+/// PHASE 2 (this commit): verifies the cache-build (parse + lower
+/// + compile + run) succeeds and returns a closure.  Then throws
+/// `PHASE 3 PENDING` to surface that args-building + callClosure
+/// is not yet wired.
 ///
-/// PHASE 1: skeleton — will throw a "scaffold pending" exception
-/// when invoked.  Phase 2 fills in the body per the design doc.
+/// PHASE 3 will replace the throw with:
+///   1. Build TW args (vLocks, vOverrides, vFetchTreeFinal)
+///      mirroring libflake/flake.cc:callFlake lines 932-969.
+///   2. Bridge args via treeWalkerToV3Public.
+///   3. Apply via callClosure(*activeV3VM(), ...) three times.
+///   4. Return the resulting v3 Value.
 Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake)
 {
     if (!state.nixEvalState)
         throw std::runtime_error("v3::callFlakeV3: no TW EvalState wired");
     auto & ns = *state.nixEvalState;
 
-    // PHASE 1: surface the cached-compile attempt so we know the
-    // generated header + meson wiring is correct.  When this throws
-    // "PHASE 1 SCAFFOLD", parse + bind succeeded; the rest of the
-    // skeleton is what Phase 2 fills in.
+    // Phase 2 verification: trigger the cache-build.  If
+    // call-flake.nix exercises a Nix language construct v3 doesn't
+    // support, this throws and surfaces the specific gap.
     Value vCallFlake = g_cachedCallFlake.get(ns);
 
-    // PHASE 2 work (sketched below):
+    // Phase 3 work (see design doc):
     //
     //   auto [lockFileStr, keyMap] = lockedFlake.lockFile.to_string();
     //
-    //   // Build TW args (replicate libflake/flake.cc:callFlake lines 932-969)
+    //   // Build TW args — replicate libflake/flake.cc:callFlake 932-969
     //   nix::Value vLocks; vLocks.mkString(lockFileStr, ns.mem);
-    //   nix::Value vOverrides = buildOverrides(state, lockedFlake, keyMap);
+    //   auto overrides = ns.buildBindings(lockedFlake.nodePaths.size());
+    //   for (auto & [node, sourcePath] : lockedFlake.nodePaths) {
+    //       auto override = ns.buildBindings(2);
+    //       auto & vSourceInfo = override.alloc(ns.symbols.create("sourceInfo"));
+    //       auto lockedNode = node.dynamic_pointer_cast<const flake::LockedNode>();
+    //       auto [storePath, subdir] = ns.store->toStorePath(sourcePath.path.abs());
+    //       nix::emitTreeAttrs(ns, storePath,
+    //           lockedNode ? lockedNode->lockedRef.input : lockedFlake.flake.lockedRef.input,
+    //           vSourceInfo, false, !lockedNode && lockedFlake.flake.forceDirty);
+    //       auto key = keyMap.find(node);
+    //       override.alloc(ns.symbols.create("dir")).mkString(CanonPath(subdir).rel(), ns.mem);
+    //       overrides.alloc(ns.symbols.create(key->second)).mkAttrs(override);
+    //   }
+    //   nix::Value vOverrides; vOverrides.mkAttrs(overrides);
     //   auto * pFetchTreeFinal = nix::get(ns.internalPrimOps, "fetchFinalTree");
-    //   if (!pFetchTreeFinal || !*pFetchTreeFinal)
-    //       throw std::runtime_error("v3::callFlakeV3: fetchFinalTree primop missing");
+    //   if (!pFetchTreeFinal) throw std::runtime_error("fetchFinalTree primop missing");
     //
-    //   // Bridge args to v3 (shallow)
-    //   Value v3Locks       = treeWalkerToV3(state, vLocks);
-    //   Value v3Overrides   = treeWalkerToV3(state, vOverrides);
-    //   Value v3FetchFinal  = treeWalkerToV3(state, **pFetchTreeFinal);
+    //   // Bridge to v3 (shallow per #662)
+    //   extern Value treeWalkerToV3Public(nix::EvalState &, nix::Value &);
+    //   Value v3Locks      = treeWalkerToV3Public(ns, vLocks);
+    //   Value v3Overrides  = treeWalkerToV3Public(ns, vOverrides);
+    //   Value v3FetchFinal = treeWalkerToV3Public(ns, **pFetchTreeFinal);
     //
-    //   // Apply args one at a time via the existing callClosure API.
-    //   // We reuse the active VMState (stronger than spawning a fresh
-    //   // one — avoids cross-VM thunk-Black-mark issues, per STG-10).
+    //   // Apply args via callClosure on the active VMState
     //   VMState * vm = activeV3VM();
-    //   if (!vm) throw std::runtime_error("v3::callFlakeV3: no active VMState");
+    //   if (!vm) throw std::runtime_error("no active VMState");
     //   Value r1 = callClosure(*vm, vCallFlake, v3Locks);
     //   Value r2 = callClosure(*vm, r1, v3Overrides);
     //   Value r3 = callClosure(*vm, r2, v3FetchFinal);
     //   return r3;
-    //
-    // For Phase 1, surface the not-yet-implemented marker.
-    (void)vCallFlake;
+
     (void)lockedFlake;
+    (void)vCallFlake;
     throw std::runtime_error(
-        "v3::callFlakeV3: PHASE 2 implementation pending — "
-        "see lode/V3_NATIVE_CALL_FLAKE_DESIGN_2026-05-20.md for the plan");
+        "v3::callFlakeV3: PHASE 3 PENDING — call-flake.nix compiles "
+        "successfully in v3 (cache build OK); args-building + "
+        "callClosure wiring is the next commit");
+}
+
+/// Phase 2 verification primop — accessible as `builtins.__v3CompileCallFlake null`.
+///
+/// Triggers the v3-side compile of call-flake.nix and returns:
+///   - `"compiled-ok-closure-tag-<N>"` on success (proves the
+///     entire parse → lower → optimise → compile → run pipeline
+///     produces a closure).
+///   - Throws with a descriptive error if compilation fails (v3
+///     language-support gap — surface, don't mask).
+///
+/// This is a TEMPORARY diagnostic primop.  Phase 3 will remove it
+/// once `callFlakeV3` is wired into `primGetFlake` and the
+/// regression suite gives end-to-end verification.
+void primV3CompileCallFlake(EvalState & state, Value * /*args*/, Value & out)
+{
+    if (!state.nixEvalState)
+        throw std::runtime_error(
+            "v3 __v3CompileCallFlake: no TW EvalState wired");
+    auto & ns = *state.nixEvalState;
+
+    Value closure = g_cachedCallFlake.get(ns);
+
+    // Build a result string describing the closure tag — opaque
+    // string, just an "I ran successfully" indicator.
+    std::string msg = "compiled-ok-closure-tag-"
+                    + std::to_string(static_cast<int>(closure.tag()));
+
+    // Return as a v3 string Value.
+    out.tag_payload = static_cast<uint64_t>(Tag::String);
+    // We need a stable string — allocate via the v3 string interner
+    // or just copy into a static.  For a diagnostic primop, a static
+    // is fine: the message is fixed-content.
+    static std::string s_msg;
+    s_msg = msg;
+    out.payload.str = s_msg.c_str();
 }
 
 } // namespace nix::v3

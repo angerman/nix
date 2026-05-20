@@ -35,6 +35,11 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/print.hh"
 #include "nix/expr/value/context.hh"
+// #698 Phase 2: flake headers pulled in for primops.cc's
+// `Value callFlakeV3(...)` forward-declaration used by Phase 3.
+// Currently unused at the call site (primGetFlake stays on TW
+// bridge until Phase 3); Phase 3 wires the v3-native dispatch.
+#include "nix/flake/flake.hh"
 #include "nix/util/canon-path.hh"
 #include "nix/util/experimental-features.hh"
 #include "nix/util/hash.hh"
@@ -9449,7 +9454,21 @@ void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("f
 // Note: primParseFlakeRef and primFlakeRefToString are already
 // implemented natively in v3 above (lines 7319 / 7380); only getFlake
 // needs the TW bridge here.
-void primGetFlake     (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("getFlake",     s, a, o); }
+// #698 Phase 2: forward-declared in v3_call_flake.cc.  The full
+// dispatch (parseFlakeRef → lockFlake → callFlakeV3) lands in Phase 3
+// once the flake::Settings plumbing is sorted (current blocker:
+// nix::flakeSettings lives in libcmd, not libflake, so libexpr-v3
+// can't link directly — needs a DI/accessor pattern).
+//
+// For now primGetFlake stays on the TW bridge.  v3-side
+// call-flake.nix compilation can still be verified by invoking
+// `nix::v3::callFlakeV3` from a future test harness; the Phase 2
+// CachedCallFlake::get implementation in v3_call_flake.cc does the
+// parse + lower + compile + run-to-closure dance.
+
+void primGetFlake(EvalState & s, Value * a, Value & o) {
+    bridgeBuiltin<1>("getFlake", s, a, o);
+}
 
 void registerPrimOp(const PrimOp & op)
 {
@@ -9647,6 +9666,12 @@ void registerBuiltinPrimOps()
         registerPrimOp({"__warn",             2, primWarn});
         registerPrimOp({"break",              1, primBreak});
         registerPrimOp({"__storePath",        1, primStorePath});
+        // #698 Phase 2 diagnostic — verifies v3-side compilation of
+        // call-flake.nix works.  Remove in Phase 3 once primGetFlake
+        // uses the v3-native path and regression tests give end-to-end
+        // coverage.
+        extern void primV3CompileCallFlake(EvalState&, Value*, Value&);
+        registerPrimOp({"__v3CompileCallFlake", 1, primV3CompileCallFlake});
         registerPrimOp({"__toFile",           2, primToFile});
         registerPrimOp({"__outputOf",         2, primOutputOf});
         // WC-28b: fetch primops (delegate to tree-walker builtins.X).
