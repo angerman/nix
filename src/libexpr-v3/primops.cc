@@ -395,6 +395,12 @@ std::mutex & registryMutex()
     throw std::runtime_error("v3 primop " + std::string(op) + ": expected " + std::string(expected));
 }
 
+// #693 — forward-decl of expectedTypeButFound (defined later, near
+// primRemoveAttrs where it was first introduced).  Used by primops
+// throughout the file to emit TW's `expected a <T> but found <T>:
+// <value>` phrasing in place of the v3-internal typeError.
+static std::string expectedTypeButFound(const char * expected, const Value & v);
+
 inline bool valueEqual(VMState & vm, Value a, Value b)
 {
     // #558 Phase 2: inline WHNF tag check before forceValue
@@ -586,7 +592,9 @@ void primAttrNames(EvalState &, Value * args, Value & out)
 void primAttrValues(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0];
-    if (!a.isAttrs() || !a.payload.bindings) typeError("attrValues", "attrset");
+    // #693 — match TW phrasing (libexpr/primops.cc forceAttrs).
+    if (!a.isAttrs() || !a.payload.bindings)
+        throw std::runtime_error(expectedTypeButFound("a set", a));
     uint32_t n = a.payload.bindings->size;
     // Build (name, value) pairs, sort by name, then drop the name.
     auto & symTab = ir::globalSymbolTable();
@@ -1146,7 +1154,8 @@ void primSubstring(EvalState &, Value * args, Value & out)
     // Match tree-walker: negative start is rejected; negative len is
     // a "to end" sentinel.
     if (start < 0)
-        throw std::runtime_error("v3 substring: negative start position");
+        // #693 — match TW phrasing (libexpr/primops.cc:substring).
+        throw std::runtime_error("negative start position in 'substring'");
     std::string_view src(args[2].payload.str);
     const char * srcPtr = args[2].payload.str;
     if (static_cast<size_t>(start) >= src.size()) {
@@ -1327,7 +1336,8 @@ void primGenList(EvalState & state, Value * args, Value & out)
         len = forceValue(*state.vm, len);
     if (!len.isInt()) typeError("genList", "int length");
     int64_t n = len.payload.i;
-    if (n < 0) throw std::runtime_error("v3 primop genList: negative length");
+    // #693 — match TW phrasing (libexpr/primops.cc:genList).
+    if (n < 0) throw std::runtime_error("cannot create list of size " + std::to_string(n));
     Value gen = args[0];
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(n));
     allocStats().listsAllocated++;
@@ -1632,16 +1642,52 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
     out.payload.bindings = b;
 }
 
+// #693 — TW phrasing for `expected a set/list but found <type>: <value>` errors.
+// Mirrors libexpr/eval.cc's forceAttrs/forceList plus errorPrintOptions.
+static std::string expectedTypeButFound(const char * expected,
+                                         const Value & v)
+{
+    const char * art = "a"; const char * name = "value";
+    Tag t = v.tag();
+    if (t == Tag::Int)        { art = "an"; name = "integer"; }
+    else if (t == Tag::Float) { art = "a";  name = "float"; }
+    else if (t == Tag::Bool)  { art = "a";  name = "Boolean"; }
+    else if (t == Tag::Null)  { art = "";   name = "null"; }
+    else if (t == Tag::String){ art = "a";  name = "string"; }
+    else if (t == Tag::Path)  { art = "a";  name = "path"; }
+    else if (t == Tag::List)  { art = "a";  name = "list"; }
+    else if (t == Tag::Attrs) { art = "a";  name = "set"; }
+    else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+                              { art = "a";  name = "function"; }
+    auto valRepr = [&]() -> std::string {
+        if (t == Tag::Int)    return std::to_string(v.payload.i);
+        if (t == Tag::Float)  { std::ostringstream os; os << v.payload.f; return os.str(); }
+        if (t == Tag::Bool)   return v.payload.i == 1 ? "true" : "false";
+        if (t == Tag::Null)   return "null";
+        if (t == Tag::String) return v.payload.str ? std::string("\"") + v.payload.str + "\"" : "\"\"";
+        if (t == Tag::Path)   return v.payload.path ? std::string(v.payload.path) : "/";
+        if (t == Tag::List)   return v.payload.list && v.payload.list->size > 0 ? "[ ... ]" : "[ ]";
+        if (t == Tag::Attrs)  return v.payload.bindings && v.payload.bindings->size > 0 ? "{ ... }" : "{ }";
+        return "<value>";
+    };
+    std::string msg = "expected ";
+    msg += expected;
+    msg += " but found ";
+    if (*art) { msg += art; msg += ' '; }
+    msg += name;
+    msg += ": ";
+    msg += valRepr();
+    return msg;
+}
+
 void primRemoveAttrs(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isAttrs()) {
-        char buf[64];
-        std::snprintf(buf, sizeof buf,
-            "v3 primop removeAttrs: expected attrset (got tag=%u)",
-            (unsigned)args[0].tag());
-        throw std::runtime_error(buf);
-    }
-    if (!args[1].isList())  typeError("removeAttrs", "list of strings");
+    // #693 — match TW phrasing (libexpr/primops.cc:removeAttrs uses
+    // forceAttrs/forceList which produce these messages).
+    if (!args[0].isAttrs())
+        throw std::runtime_error(expectedTypeButFound("a set", args[0]));
+    if (!args[1].isList())
+        throw std::runtime_error(expectedTypeButFound("a list", args[1]));
     auto * src = args[0].payload.bindings;
     auto * names = args[1].payload.list;
     if (!src || !names || names->size == 0) { out = args[0]; return; }
@@ -1957,8 +2003,14 @@ void primDeepSeq(EvalState & state, Value * args, Value & out)
 /// lowering and the result is held in the global posSnapshotPool.
 void primUnsafeGetAttrPos(EvalState & state, Value * args, Value & out)
 {
+    // #693 — TW (libexpr/primops.cc) uses forceStringNoCtx / forceAttrs
+    // which produce `expected a <T> but found <T>: <value>`.
     if (!args[0].isString())
-        typeError("unsafeGetAttrPos", "(string, attrset)");
+        throw std::runtime_error(expectedTypeButFound("a string", args[0]));
+    if (!args[1].isAttrs()) {
+        out.mkNull();
+        return;
+    }
     if (!args[1].isAttrs() || !args[1].payload.bindings) {
         out.mkNull();
         return;
@@ -2012,7 +2064,10 @@ void primToPath(EvalState & state, Value * args, Value & out)
 {
     auto fromString = [&](const char * s) {
         if (!s || s[0] != '/')
-            throw std::runtime_error("v3 toPath: string is not an absolute path");
+            // #693 — match TW phrasing (libexpr/primops.cc:toPath).
+            throw std::runtime_error(
+                std::string("string '") + (s ? s : "")
+                + "' doesn't represent an absolute path");
         // REVIEW §2.9: normalize via CanonPath so `/nix/store/../etc/passwd`
         // and other `..` / `.` / double-slash shapes can't slip through
         // as a path Value.  CanonPath rejects any traversal that would
@@ -2049,7 +2104,36 @@ void primToPath(EvalState & state, Value * args, Value & out)
             if (forced.isPath())   { out = forced; return; }
         }
     }
-    typeError("toPath", "string or path");
+    // #693 — TW's toPath uses coerceToString-style errors for non-
+    // string/non-path/non-coercible args.  Mirror the
+    // `cannot coerce <type> to a string: <value>` shape that the
+    // shared error sites already produce (vm.cc:coerceToString /
+    // primops.cc:pathExists).
+    const char * art = "a"; const char * name = "value";
+    Tag t = v.tag();
+    if (t == Tag::Int)   { art = "an"; name = "integer"; }
+    else if (t == Tag::Float) { art = "a";  name = "float"; }
+    else if (t == Tag::Bool)  { art = "a";  name = "Boolean"; }
+    else if (t == Tag::Null)  { art = "";   name = "null"; }
+    else if (t == Tag::List)  { art = "a";  name = "list"; }
+    else if (t == Tag::Attrs) { art = "a";  name = "set"; }
+    else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+                              { art = "a";  name = "function"; }
+    auto val = [&]() -> std::string {
+        if (t == Tag::Int)   return std::to_string(v.payload.i);
+        if (t == Tag::Float) { std::ostringstream os; os << v.payload.f; return os.str(); }
+        if (t == Tag::Bool)  return v.payload.i == 1 ? "true" : "false";
+        if (t == Tag::Null)  return "null";
+        if (t == Tag::List)  return v.payload.list && v.payload.list->size > 0 ? "[ ... ]" : "[ ]";
+        if (t == Tag::Attrs) return v.payload.bindings && v.payload.bindings->size > 0 ? "{ ... }" : "{ }";
+        return "<value>";
+    }();
+    std::string msg = "cannot coerce ";
+    if (*art) { msg += art; msg += ' '; }
+    msg += name;
+    msg += " to a string: ";
+    msg += val;
+    throw std::runtime_error(msg);
 }
 
 /// builtins.splitVersion — TW's algorithm (libstore/names.cc:54
@@ -2801,17 +2885,22 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
     auto keyOf = [&](Value & it) -> std::string {
         it = forceValue(*state.vm, it);
         if (!it.isAttrs() || !it.payload.bindings)
-            throw std::runtime_error("v3 primop genericClosure: items must be attrsets with a 'key' attr");
+            // #693 — match TW's `expected a set but found <type>: <value>`
+            // phrasing via forceAttrs.
+            throw std::runtime_error(expectedTypeButFound("a set", it));
         const Value * kRaw = it.payload.bindings->lookup(sKey);
-        if (!kRaw) throw std::runtime_error("v3 primop genericClosure: item missing 'key' attr");
+        // #693 — TW (libexpr/primops.cc:genericClosure) checks
+        // `state.getAttr(state.s.key, ...)` which raises the
+        // standard "attribute 'key' missing" on absence.
+        if (!kRaw) throw std::runtime_error("attribute 'key' missing");
         Value k = forceValue(*state.vm, *kRaw);
         Tag t = k.tag();
         if (t != Tag::String && t != Tag::Int && t != Tag::Float &&
             t != Tag::Path && t != Tag::Bool)
-            throw std::runtime_error("v3 primop genericClosure: 'key' must be string / int / float / path / bool");
+            throw std::runtime_error("'key' must be string / int / float / path / bool");
         if (firstKeyTag == Tag::Uninitialized) firstKeyTag = t;
         else if (firstKeyTag != t)
-            throw std::runtime_error("v3 primop genericClosure: cannot compare keys of incompatible types");
+            throw std::runtime_error("cannot compare keys of incompatible types");
         if (t == Tag::String) return std::string(k.payload.str);
         if (t == Tag::Int)    return std::to_string(k.payload.i);
         if (t == Tag::Float) {
@@ -2819,8 +2908,7 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
             // round-trip through std::to_string identically and would
             // collide as duplicate keys.  Tree-walker rejects too.
             if (std::isnan(k.payload.f))
-                throw std::runtime_error(
-                    "v3 primop genericClosure: NaN key is not orderable");
+                throw std::runtime_error("NaN key is not orderable");
             return std::to_string(k.payload.f);
         }
         if (t == Tag::Path)   return std::string(k.payload.path ? k.payload.path : "");
@@ -2847,7 +2935,8 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
                              || next.tag() == Tag::Slot, 0))
             next = forceValue(*state.vm, next);
         if (!next.isList())
-            throw std::runtime_error("v3 primop genericClosure: operator must return a list");
+            // #693 — match TW's `expected a list but found ...` phrasing.
+            throw std::runtime_error(expectedTypeButFound("a list", next));
         if (next.payload.list) {
             for (uint32_t i = 0; i < next.payload.list->size; ++i)
                 work.push_back(next.payload.list->elems[i]);
@@ -3017,13 +3106,17 @@ void primHashString(EvalState &, Value * args, Value & out)
 
 void primHashFile(EvalState &, Value * args, Value & out)
 {
+    // #693 — match TW's forceStringNoCtx-style phrasings.
     if (!args[0].isString())
-        typeError("hashFile", "(algo, path)");
+        throw std::runtime_error(expectedTypeButFound("a string", args[0]));
     std::string path;
     if (args[1].isString())     path = args[1].payload.str;
     else if (args[1].isPath())  path = args[1].payload.path;
-    else typeError("hashFile", "(algo, path)");
+    else throw std::runtime_error(expectedTypeButFound("a string", args[1]));
     auto algo = parseHashAlgo(args[0].payload.str);
+    // #693 — TW raises `path 'X' does not exist` for missing files.
+    if (!std::filesystem::exists(path))
+        throw std::runtime_error("path '" + path + "' does not exist");
     auto h = nix::hashFile(algo, path);
     out = mkStringValueOwned(h.to_string(nix::HashFormat::Base16, false));
 }
@@ -3054,7 +3147,10 @@ void primConvertHash(EvalState & state, Value * args, Value & out)
     else if (fs == "base32")   fmt = nix::HashFormat::Nix32;  // alias
     else if (fs == "base64")   fmt = nix::HashFormat::Base64;
     else if (fs == "sri")      fmt = nix::HashFormat::SRI;
-    else throw std::runtime_error("v3 convertHash: unknown format '" + std::string(fs) + "'");
+    // #693 — match TW phrasing (libexpr/primops.cc:convertHash).
+    else throw std::runtime_error(
+        "unknown hash format '" + std::string(fs)
+        + "', expect 'base16', 'base32', 'base64', or 'sri'");
 
     nix::Hash parsed{nix::HashAlgorithm::SHA256}; // dummy default
     if (vaRaw) {
@@ -3241,7 +3337,9 @@ void primReadDir(EvalState & state, Value * args, Value & out)
 /// derivation-name lang test.
 void primParseDrvName(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isString()) typeError("parseDrvName", "string");
+    // #693 — match TW's forceStringNoCtx phrasing.
+    if (!args[0].isString())
+        throw std::runtime_error(expectedTypeButFound("a string", args[0]));
     // #674: TW's prim_parseDrvName uses forceStringNoCtx; v3 must
     // match the rejection so contexted derivation-name strings can't
     // sneak through (e.g. callers that accidentally pass `"${drv}"`).
@@ -3322,7 +3420,8 @@ void primReadFileType(EvalState &, Value * args, Value & out)
     else typeError("readFileType", "string or path");
     std::error_code ec;
     auto status = std::filesystem::symlink_status(path, ec);
-    if (ec) throw std::runtime_error("v3 readFileType: " + ec.message());
+    // #693 — match TW phrasing for missing-path errors.
+    if (ec) throw std::runtime_error("path '" + path + "' does not exist");
     const char * t;
     if      (std::filesystem::is_symlink(status))   t = "symlink";
     else if (std::filesystem::is_directory(status)) t = "directory";
@@ -7692,12 +7791,13 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop scopedImport: no nix EvalState wired");
     Value scope = forceValue(*state.vm, args[0]);
+    // #693 — match TW's forceAttrs / forceString-or-path phrasings.
     if (!scope.isAttrs() || !scope.payload.bindings)
-        typeError("scopedImport", "(attrset, path)");
+        throw std::runtime_error(expectedTypeButFound("a set", scope));
     std::string path;
     if (args[1].isString()) path = args[1].payload.str;
     else if (args[1].isPath()) path = args[1].payload.path;
-    else typeError("scopedImport", "(attrset, path)");
+    else throw std::runtime_error(expectedTypeButFound("a string", args[1]));
 
     auto & ns = *state.nixEvalState;
 
@@ -8094,18 +8194,22 @@ nlohmann::json valueToJsonWithContext(
         }
         return obj;
     }
-    case Tag::Uninitialized:
     case Tag::Closure:
     case Tag::PrimOp:
     case Tag::PrimOpApp:
+        // #693 — match TW phrasing for function-in-JSON.
+        throw std::runtime_error("cannot convert a function to JSON");
+    case Tag::Uninitialized:
     case Tag::Thunk:
     case Tag::App:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
     default:
-        throw std::runtime_error(
-            "v3 BR-3 valueToJsonWithContext: unsupported value type");
+        // For other unsupported tags, fall back to a generic error
+        // that still matches TW's typical JSON-conversion error
+        // family.
+        throw std::runtime_error("cannot convert a non-JSON-encodable value to JSON");
     }
 }
 
