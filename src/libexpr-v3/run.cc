@@ -193,6 +193,31 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             (unsigned long long)a.thunksForced,
             (unsigned long long)a.bridgeThunksForced,
             (unsigned long long)a.bytecodeInstructions);
+        // #702: BYTES per allocation category.  The count counters
+        // above are partly bumped at primop call sites and miss
+        // Alloc::* invocations from vm.cc dispatch; the byte
+        // counters are bumped inside Alloc::* itself so they are
+        // authoritative.  Use them to attribute non-Boehm RSS
+        // growth (per `hello-drvpath-analysis.md`: the 4 GB on
+        // hello.drvPath lives outside Boehm — these byte counters
+        // tell us which v3 subsystem owns the growth).
+        const uint64_t totalAllocBytes =
+              a.bytesValues + a.bytesClosures + a.bytesThunks + a.bytesEnvs
+            + a.bytesLists  + a.bytesBindings + a.bytesPairs   + a.bytesChars;
+        std::fprintf(stderr,
+            "v3-direct bytes (in arena/nursery): values=%.1fMB closures=%.1fMB "
+            "thunks=%.1fMB envs=%.1fMB lists=%.1fMB bindings=%.1fMB pairs=%.1fMB "
+            "chars=%.1fMB total_alloc=%.1fMB arena_pinned=%.1fMB\n",
+            a.bytesValues   / 1e6,
+            a.bytesClosures / 1e6,
+            a.bytesThunks   / 1e6,
+            a.bytesEnvs     / 1e6,
+            a.bytesLists    / 1e6,
+            a.bytesBindings / 1e6,
+            a.bytesPairs    / 1e6,
+            a.bytesChars    / 1e6,
+            totalAllocBytes / 1e6,
+            threadArena().bytesAllocated() / 1e6);
         // #660 verification: dump bridge-primop call counts.  v3-eval
         // already does this via its own NIX_VM_STATS path; mirror here
         // so the integrated `nix` CLI (and any future v3 driver that

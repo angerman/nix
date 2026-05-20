@@ -196,6 +196,33 @@ struct AllocStats
     /// frames that today bridge to TW for the chain's leaf rattrs.
     uint64_t intrinsicExtendsCalls = 0;
     uint64_t intrinsicComposeCalls = 0;
+
+    /// #702 / 2026-05-20: BYTES per allocation category.  Existing
+    /// counts above were partly bumped by primop call sites
+    /// (listsAllocated, attrsetsAllocated) and missed Alloc::*
+    /// invocations from vm.cc dispatch, so they undercount.  These
+    /// byte counters are bumped *inside* the Alloc::* functions
+    /// (which are the chokepoint for every v3 allocation), so they
+    /// are authoritative.
+    ///
+    /// Use case: hello.drvPath 4 GB RSS came from "somewhere outside
+    /// Boehm" — these counters let us split the arena bytes by
+    /// category and identify which subsystem owns the growth.
+    ///
+    /// Reported by NIX_VM_STATS=1 in run.cc.
+    ///
+    /// Retirement criterion: when Stage 3 (nursery default-on) lands
+    /// and per-allocator telemetry moves into the nursery's own
+    /// stats() API, these become redundant.  Until then they're the
+    /// only honest byte counter v3 has.
+    uint64_t bytesValues   = 0;
+    uint64_t bytesClosures = 0;
+    uint64_t bytesThunks   = 0;
+    uint64_t bytesEnvs     = 0;
+    uint64_t bytesLists    = 0;
+    uint64_t bytesBindings = 0;
+    uint64_t bytesPairs    = 0;
+    uint64_t bytesChars    = 0;
 };
 
 inline AllocStats & allocStats()
@@ -355,12 +382,14 @@ struct Alloc
 
     static Value * allocValue() noexcept
     {
+        allocStats().bytesValues += sizeof(Value);
         return static_cast<Value *>(threadArena().alloc(sizeof(Value)));
     }
 
     static Closure * allocClosure(uint16_t nUpvalues) noexcept
     {
         const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
+        allocStats().bytesClosures += bytes;
         auto * c = static_cast<Closure *>(nurseryOrArena(bytes));
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
@@ -374,6 +403,7 @@ struct Alloc
     static Thunk * allocThunkSuspended(uint16_t nUpvalues) noexcept
     {
         const size_t bytes = sizeof(Thunk) + sizeof(Value) * nUpvalues;
+        allocStats().bytesThunks += bytes;
         auto * t = static_cast<Thunk *>(nurseryOrArena(bytes));
         t->state = ThunkState::Suspended;
         t->nUpvalues = nUpvalues;
@@ -411,6 +441,7 @@ struct Alloc
     {
         // No upvalues / no FAM tail.
         const size_t bytes = sizeof(Thunk);
+        allocStats().bytesThunks += bytes;
         auto * t = static_cast<Thunk *>(threadArena().alloc(bytes));
         t->state = ThunkState::Bridge;
         t->nUpvalues = 0;
@@ -425,6 +456,7 @@ struct Alloc
     static Env * allocEnv(uint16_t nValues) noexcept
     {
         const size_t bytes = sizeof(Env) + sizeof(Value) * nValues;
+        allocStats().bytesEnvs += bytes;
         auto * e = static_cast<Env *>(threadArena().alloc(bytes));
         e->parent = nullptr;
         e->isWithEnv = false;
@@ -435,6 +467,7 @@ struct Alloc
     static ListVec * allocList(uint32_t n) noexcept
     {
         const size_t bytes = sizeof(ListVec) + sizeof(Value) * n;
+        allocStats().bytesLists += bytes;
         auto * l = static_cast<ListVec *>(nurseryOrArena(bytes));
         l->size = n;
         return l;
@@ -449,6 +482,7 @@ struct Alloc
     static ValuePair * allocPair() noexcept
     {
         ++allocStats().pairsAllocated;
+        allocStats().bytesPairs += sizeof(ValuePair);
         return static_cast<ValuePair *>(threadArena().alloc(sizeof(ValuePair)));
     }
 
@@ -467,6 +501,7 @@ struct Alloc
     /// existing call site -- this helper just replaces the std::malloc).
     static char * allocChars(size_t n) noexcept
     {
+        allocStats().bytesChars += n;
         return static_cast<char *>(threadArena().alloc(n));
     }
 
@@ -488,6 +523,7 @@ struct Alloc
                                      uint32_t     line = __builtin_LINE()) noexcept
     {
         const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * n;
+        allocStats().bytesBindings += bytes;
         // Tenured by design (Phase C v1): Bindings entries[] hold
         // long-lived Tag::Slot targets and `Thunk::cell` write-back
         // pointers that must stay pointer-stable across nursery
@@ -625,6 +661,7 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
     // Pool miss: always arena (never nursery) so subsequent
     // recycle's pointer stability survives Cheney scavenges.
     const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
+    allocStats().bytesClosures += bytes;
     auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
     c->nUpvalues = nUpvalues;
     c->_pad = kFakeCloMagic;   // Mark as fakeClo for safe pooling.
