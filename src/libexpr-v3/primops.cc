@@ -3199,23 +3199,45 @@ void primAddErrorContext(EvalState & state, Value * args, Value & out)
     // Other exceptions become std::runtime_error with the prepended
     // message (we can't generally clone arbitrary exception types).
     static const bool dbg = std::getenv("V3_DBG_ADD_ERR_CTX") != nullptr;
+    auto coerceMsg = [&]() -> std::string {
+        try { return toStringCoerce(state, args[0]); }
+        catch (...) { return "<addErrorContext: error coercing message>"; }
+    };
+    // #684 — preserve the exception's RUNTIME TYPE when re-throwing.
+    // Pre-fix v3 collapsed every caught exception into `std::runtime_error`,
+    // breaking `tryEval` (which catches only `AssertionError`-derived) for
+    // wrapped `throw`/`assert` errors: `tryEval (addErrorContext "ctx"
+    // (throw "x"))` returned the error instead of `{ success = false;
+    // value = false; }`.  Match TW's `e.addTrace(...)` semantics (which
+    // mutates and rethrows the same exception) by preserving the type.
+    //
+    // Message order: TW prints `error: <orig>` at the BOTTOM with trace
+    // frames above (`… <ctx>`).  v3 doesn't have the frame machinery
+    // yet — emit `<orig>\n… <ctx>` so the standard one-line error grep
+    // sees the original message (matching TW's bottom-line behavior).
     try {
         Value v = forceValue(*state.vm, args[1]);
         out = v;
+    } catch (const ThrownError & ex) {
+        auto msg = coerceMsg();
+        if (dbg) std::fprintf(stderr, "v3 addErrorContext (ThrownError): %s\n", msg.c_str());
+        throw ThrownError(std::string(ex.what()) + "\n… " + msg);
+    } catch (const AssertionError & ex) {
+        auto msg = coerceMsg();
+        if (dbg) std::fprintf(stderr, "v3 addErrorContext (AssertionError): %s\n", msg.c_str());
+        throw AssertionError(std::string(ex.what()) + "\n… " + msg);
+    } catch (const AbortError & ex) {
+        auto msg = coerceMsg();
+        if (dbg) std::fprintf(stderr, "v3 addErrorContext (AbortError): %s\n", msg.c_str());
+        throw AbortError(std::string(ex.what()) + "\n… " + msg);
     } catch (const BlackholeError & ex) {
-        std::string msg;
-        try { msg = toStringCoerce(state, args[0]); }
-        catch (...) { msg = "<addErrorContext: error coercing message>"; }
-        if (dbg) std::fprintf(stderr,
-            "v3 addErrorContext (BlackholeError): %s\n", msg.c_str());
-        throw BlackholeError(msg + "\n" + ex.what());
+        auto msg = coerceMsg();
+        if (dbg) std::fprintf(stderr, "v3 addErrorContext (BlackholeError): %s\n", msg.c_str());
+        throw BlackholeError(std::string(ex.what()) + "\n… " + msg);
     } catch (const std::exception & ex) {
-        std::string msg;
-        try { msg = toStringCoerce(state, args[0]); }
-        catch (...) { msg = "<addErrorContext: error coercing message>"; }
-        if (dbg) std::fprintf(stderr,
-            "v3 addErrorContext: %s\n", msg.c_str());
-        throw std::runtime_error(msg + "\n" + ex.what());
+        auto msg = coerceMsg();
+        if (dbg) std::fprintf(stderr, "v3 addErrorContext: %s\n", msg.c_str());
+        throw std::runtime_error(std::string(ex.what()) + "\n… " + msg);
     }
 }
 
