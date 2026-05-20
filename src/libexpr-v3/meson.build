@@ -97,6 +97,8 @@ lib_sources = files(
   'run.cc',
   # #698: v3-native callFlake — see lode/V3_NATIVE_CALL_FLAKE_DESIGN_2026-05-20.md
   'v3_call_flake.cc',
+  # PERF_TRACE_TOOL_DESIGN_2026-05-20.md: in-process Boehm-heap sampler.
+  'heap_trace.cc',
 )
 
 this_library = library(

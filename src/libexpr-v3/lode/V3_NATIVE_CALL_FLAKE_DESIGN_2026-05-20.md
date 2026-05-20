@@ -680,6 +680,73 @@ bridge isn't memoized).
 **Until then**: Phase 4 is the floor.  Phase 4b is `#701` in the
 task tracker, listed as a perf-track item without a deadline.
 
+## §10 — CORRIGENDUM: hyperfine numbers (added 2026-05-20)
+
+The §8 table reported single-run wall times: "TW 12.16 s, bridge 7.44 s,
+v3-native 8.05 s".  Those numbers were taken cold, ad-hoc, with build
+activity competing for CPU.  When the user asked "did we ensure we
+validated cardano-node perf with hyperfine?" the answer was *no*, and
+when we did the proper measurement the headline collapses.
+
+### Clean hyperfine, 10 runs each, no concurrent builds
+
+Workload: `nix flake check --no-build --no-update-lock-file ~/Projects/iohk/cardano-node`
+
+| Mode                                   | Mean ± σ            | Range            |
+| -------------------------------------- | ------------------- | ---------------- |
+| TW alone                               | 7.904 s ± 0.332 s   | 7.627 – 8.740 s  |
+| v3-direct + bridge                     | 7.812 s ± 0.197 s   | 7.606 – 8.270 s  |
+| v3-direct default (v3-native)          | 8.087 s ± 0.472 s   | 7.697 – 9.328 s  |
+
+Pairwise summary (hyperfine's own):
+- bridge ran 1.01 × ± 0.05 faster than TW (within σ)
+- bridge ran 1.04 × ± 0.07 faster than v3-native (within σ)
+
+**Honest reading**: all three modes are within ~3 % of each other; the
+differences are noise.  The §8 "v3-native is 1.5× faster than TW"
+claim is wrong.
+
+### What still holds
+
+- **The retirement criterion is met.**  v3-native at 1.02 × TW is
+  well inside the "≤ 2 × TW" gate's exit condition.  The default-flip
+  in `511074ff6` stands.
+- **#697 still matters.**  Without `NIX_V3_KEEP_TW_BUILTINS_MUTATION`
+  defaulting OFF, the bridge path would be the 16× slower version
+  with per-element ping-pong.  The reason all three modes are tied is
+  that the bridge is no longer the bottleneck.
+- **V3-NATIVE is still the right architectural goal.**  Bridge-parity
+  is acceptable only as long as the workload doesn't stress the bridge.
+  Workloads that read `sourceInfo` per-node many times still benefit
+  from Phase 4b; the cardano-node `? outputs` query reads it once.
+
+### What's falsified
+
+- "v3-native callFlake is materially faster than TW on cardano-node."
+  False — within noise.
+- "The Phase 4 bridge-removal closes a measurable gap."
+  False — bridge and v3-native are tied on this workload.
+- "Single-run wall-time captures perf signal."  False — cold-cache +
+  build contention swing the number by ~2×; hyperfine's warmup +
+  multi-run averaging is mandatory.
+
+### Lesson
+
+Rule 0 ask of any perf commit message: "What hypothesis does this
+kill?"  My #700 message claimed "2× faster than TW" — that was a
+hypothesis I should have tested with hyperfine before stating it.
+The user's prompt for hyperfine validation was the falsifier.
+
+Going forward: any perf-related commit body that asserts a ratio
+**must** cite hyperfine output (mean ± σ, ≥ 5 runs) inline, or the
+ratio is non-evidence and the claim should be downgraded to
+"changes the code path but perf-equivalent on this workload".
+
+Raw hyperfine JSON for these runs:
+- `bench/samples/2026-05-20/cardano-node-getflake-outputs-clean.json` — clean run (no concurrent build)
+- `bench/samples/2026-05-20/cardano-node-getflake-outputs.json` — earlier run with build activity (noise reference)
+- `bench/samples/2026-05-20/cardano-node-getflake-outputs-clean.md` — hyperfine markdown summary
+
 ## Copyright
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,

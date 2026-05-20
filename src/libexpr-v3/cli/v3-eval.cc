@@ -38,6 +38,7 @@
 #include "v3/ir_dump.hh"
 #include "v3/limits.hh"
 #include "v3/print.hh"
+#include "v3/heap_trace.hh"
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-gc.hh"
@@ -195,6 +196,13 @@ int main(int argc, char ** argv)
     try {
         nix::initNix();
         nix::initGC();
+
+        // PERF_TRACE_TOOL_DESIGN_2026-05-20.md: start the
+        // Boehm-heap sampler if NIX_V3_HEAP_TRACE is set.  Idempotent.
+        // Pthread runs daemon-detached; emits "v3 heap-trace" lines
+        // to stderr at the cadence set by NIX_V3_HEAP_TRACE_INTERVAL_MS
+        // (default 50 ms).
+        nix::v3::startHeapTrace();
 
         // Apply experimental-feature flags collected from the CLI.
         // Has to happen *after* initNix so the Config setter takes

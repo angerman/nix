@@ -2,6 +2,7 @@
 #include "nix/fetchers/fetch-settings.hh"
 #include "v3/install.hh"
 #include "v3/primop.hh"  // #698 Phase 3: setFlakeSettings
+#include "v3/heap_trace.hh"  // PERF_TRACE_TOOL_DESIGN_2026-05-20: Boehm sampler
 #include "nix/util/args/root.hh"
 #include "nix/util/current-process.hh"
 #include "nix/cmd/command.hh"
@@ -412,6 +413,11 @@ void mainWrapped(int argc, char ** argv)
     // libcmd into libexpr-v3.  Mirrors the existing setNixEvalState
     // pattern (set once at startup, read by v3 primops).
     nix::v3::setFlakeSettings(&flakeSettings);
+
+    // PERF_TRACE_TOOL_DESIGN_2026-05-20.md: start the Boehm-heap
+    // sampler if NIX_V3_HEAP_TRACE is set.  No-op if env var is
+    // absent.  Daemon thread; runs alongside the eval.
+    nix::v3::startHeapTrace();
 
 #ifdef __linux__
     if (isRootUser()) {
