@@ -20,6 +20,15 @@ Bindings sEmptyBindings = []{ Bindings b; b.size = 0; b._pad = 0; return b; }();
 ListVec  sEmptyList     = []{ ListVec l; l.size = 0; l._pad = 0; return l; }();
 } // anonymous namespace
 
+// #703: expose the empty-Bindings sentinel to `Alloc::allocBindings(0)`.
+// Defined out-of-line here (rather than as an inline in alloc.hh) so
+// the sentinel address is stable across translation units — every
+// caller observes the same pointer.
+Bindings * Alloc::emptyBindingsSentinel() noexcept
+{
+    return &sEmptyBindings;
+}
+
 Value Value::vTrue       = []() { Value v; v.tag_payload = static_cast<uint64_t>(Tag::Bool);      v.payload.i = 1; return v; }();
 Value Value::vFalse      = []() { Value v; v.tag_payload = static_cast<uint64_t>(Tag::Bool);      v.payload.i = 0; return v; }();
 Value Value::vNull       = []() { Value v; v.tag_payload = static_cast<uint64_t>(Tag::Null);      v.payload.raw = nullptr; return v; }();

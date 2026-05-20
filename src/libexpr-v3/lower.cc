@@ -1584,6 +1584,46 @@ struct Lowerer
             || k == nix::Expr::Kind::String
             || k == nix::Expr::Kind::Path
             || k == nix::Expr::Kind::Lambda) return true;
+        // #704 (2026-05-20): empty literal `[]` and `{}` are trivially
+        // strict — their construction has no side effects and the
+        // result is a static singleton (`Value::vEmptyList` /
+        // `Value::vEmptyAttrs`).  TW already short-circuits empty
+        // `ExprList` in `eval.cc:1609 ExprList::maybeThunk` via
+        // `&Value::vEmptyList`; v3 didn't, so every empty list got a
+        // throwaway thunk wrapper.  Empty `ExprAttrs` is symmetric.
+        //
+        // Safety: only when the attrset literal has NO entries (incl.
+        // no `inherit`, no `inherit from`, no dynamic attrs) AND is
+        // NOT recursive — a rec-attrset with no explicit attrs is
+        // still empty, but its rec semantics are inert, so no harm.
+        // We require !recursive defensively to match the eager-emit
+        // path used by `lowerAttrs` for empty literals.
+        //
+        // Falsifies: "all of v3's 6.75 M unforced thunks come from
+        // non-trivial Expr Kinds" (see hello-drvpath-allocator-
+        // breakdown.md).  Re-measurement quantifies the share.
+        if (k == nix::Expr::Kind::List) {
+            auto * el = static_cast<nix::ExprList *>(e);
+            if (el->elems.empty()) return true;
+        }
+        if (k == nix::Expr::Kind::Attrs) {
+            auto * ea = static_cast<nix::ExprAttrs *>(e);
+            // attrs / dynamicAttrs are std::optional<…> (the parser
+            // always sets them, so has_value() is always true in
+            // practice — but we still check defensively).  Empty
+            // bodies are common when nixpkgs / lib code writes `{}`
+            // as a default arg value.
+            const bool hasAttrs =
+                ea->attrs.has_value() && !ea->attrs.value().empty();
+            const bool hasDyn =
+                ea->dynamicAttrs.has_value() && !ea->dynamicAttrs.value().empty();
+            // inheritFromExprs is unique_ptr<vector<Expr*>>; treat
+            // null and empty as equivalent.
+            const bool hasFroms =
+                ea->inheritFromExprs && !ea->inheritFromExprs->empty();
+            if (!ea->recursive && !hasAttrs && !hasDyn && !hasFroms)
+                return true;
+        }
         // ExprVar is mostly trivial — but a `fromWith` reference
         // performs a runtime OP_WITH_LOOKUP that forces the with-stack
         // entries.  Inside `with pkgs; { a = b; }` where pkgs is part

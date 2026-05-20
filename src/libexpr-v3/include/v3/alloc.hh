@@ -518,10 +518,37 @@ struct Alloc
     // (e.g. "primMapAttrs") still get explicit recordBindingsOrigin()
     // calls; this hook is the default-on fallback that makes EVERY
     // Bindings allocation tagged with where it came from.
+    /// Empty-Bindings sentinel.  Returned by `allocBindings(0)` to
+    /// avoid per-empty-attrset arena allocation (97 K allocs on
+    /// hello.drvPath = 0.78 MB, plus per-alloc bookkeeping cost).
+    /// Defined alongside `Value::vEmptyAttrs`' inner payload in
+    /// `value.cc`'s anonymous namespace, but addressable via this
+    /// extern so call sites read it directly.  Read-only after init.
+    ///
+    /// Safety: callers must never write to `entries[]` of an
+    /// empty-Bindings.  All existing call sites either guard on
+    /// `size > 0` before writing or use `lookup()` which returns
+    /// nullptr immediately for an empty Bindings (so they don't
+    /// touch entries[]).  Audited 2026-05-20.
+    static Bindings * emptyBindingsSentinel() noexcept;
+
     static Bindings * allocBindings(uint32_t n,
                                      const char * file = __builtin_FILE(),
                                      uint32_t     line = __builtin_LINE()) noexcept
     {
+        // #703 (2026-05-20): route empty Bindings to a static
+        // sentinel.  Track the histogram-bucket count for the dump
+        // (so the size-0 stat still increments), record an
+        // "alloc-site" if the env-var is on, then return the
+        // shared sentinel — no arena allocation.
+        if (n == 0) {
+            allocStats().attrsetSizeBuckets[0]++;
+            // Don't bump bytesBindings — the shared sentinel doesn't
+            // grow the arena.  Don't record per-Bindings origin
+            // either (the sentinel is reused, so a per-pointer
+            // record would be a write race / stale label).
+            return emptyBindingsSentinel();
+        }
         const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * n;
         allocStats().bytesBindings += bytes;
         // Tenured by design (Phase C v1): Bindings entries[] hold

@@ -218,6 +218,21 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             a.bytesChars    / 1e6,
             totalAllocBytes / 1e6,
             threadArena().bytesAllocated() / 1e6);
+        // #703: per-Bindings-size histogram.  Tells us how much of
+        // the 2.97 M Bindings would benefit from Empty/Single/Small
+        // sentinel shapes vs. how many really need the full Sorted
+        // form.  Buckets are: 0, 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64,
+        // 65-128, 129+.
+        const auto & bk = a.attrsetSizeBuckets;
+        std::fprintf(stderr,
+            "v3-direct bindings size hist: 0=%llu 1=%llu 2=%llu "
+            "3-4=%llu 5-8=%llu 9-16=%llu 17-32=%llu 33-64=%llu "
+            "65-128=%llu 129+=%llu\n",
+            (unsigned long long)bk[0], (unsigned long long)bk[1],
+            (unsigned long long)bk[2], (unsigned long long)bk[3],
+            (unsigned long long)bk[4], (unsigned long long)bk[5],
+            (unsigned long long)bk[6], (unsigned long long)bk[7],
+            (unsigned long long)bk[8], (unsigned long long)bk[9]);
         // #660 verification: dump bridge-primop call counts.  v3-eval
         // already does this via its own NIX_VM_STATS path; mirror here
         // so the integrated `nix` CLI (and any future v3 driver that
