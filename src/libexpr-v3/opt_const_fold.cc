@@ -209,10 +209,15 @@ static bool tryFold(const Expr & in, const BlockMap & m, Expr & out)
             out = LitInt{a.i / b.i};
             return true;
         }
-        // Float division does not throw; produce the IEEE-754 result.
+        // #683 — TW also throws on float div-by-zero
+        // (libexpr/primops.cc:4703 `if (f2 == 0) division by zero`,
+        // unconditional on int/float).  Pre-fix this comment claimed
+        // otherwise and folded to ±inf — silently bypassing the
+        // runtime check.  Refuse to fold when denominator is 0 in
+        // either form so the runtime path raises matching TW.
         double da = (a.kind == Lit::K_Float) ? a.f : (double)a.i;
         double db = (b.kind == Lit::K_Float) ? b.f : (double)b.i;
-        // Mirror tree-walker: float / 0.0 yields ±inf (no throw) per IEEE.
+        if (db == 0.0) return false;
         out = LitFloat{da / db};
         return true;
     }

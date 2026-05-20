@@ -977,14 +977,22 @@ void primMul(EvalState &, Value * args, Value & out)
 void primDiv(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
+    // #683 — TW's div errors on float-by-zero too (libexpr/primops.cc:
+    // 4703 unconditional `if (f2 == 0) division by zero`).  Pre-fix v3
+    // only guarded the Int/Int path; Float/Float and mixed produced
+    // ±inf / NaN silently — a SEMANTIC divergence on numeric code that
+    // could mask divide-by-zero bugs in nixpkgs builders.
     if (a.isInt() && b.isInt()) {
-        if (b.payload.i == 0) throw std::runtime_error("v3 primop div: division by zero");
+        if (b.payload.i == 0) throw std::runtime_error("division by zero");
         out.mkInt(a.payload.i / b.payload.i);
     } else if (a.isFloat() && b.isFloat()) {
+        if (b.payload.f == 0.0) throw std::runtime_error("division by zero");
         out.mkFloat(a.payload.f / b.payload.f);
     } else if (a.isInt() && b.isFloat()) {
+        if (b.payload.f == 0.0) throw std::runtime_error("division by zero");
         out.mkFloat(static_cast<double>(a.payload.i) / b.payload.f);
     } else if (a.isFloat() && b.isInt()) {
+        if (b.payload.i == 0) throw std::runtime_error("division by zero");
         out.mkFloat(a.payload.f / static_cast<double>(b.payload.i));
     } else typeError("div", "numeric");
 }
@@ -2844,7 +2852,12 @@ inline nix::HashAlgorithm parseHashAlgo(std::string_view a)
     if (a == "sha256") return nix::HashAlgorithm::SHA256;
     if (a == "sha512") return nix::HashAlgorithm::SHA512;
     if (a == "blake3") return nix::HashAlgorithm::BLAKE3;
-    throw std::runtime_error("v3: unknown hash algorithm '" + std::string(a) + "'");
+    // #683 — match TW phrasing (libutil/hash.cc:53):
+    // "unknown hash algorithm '<a>', expect 'blake3', 'md5', 'sha1',
+    //  'sha256', or 'sha512'"
+    throw std::runtime_error(
+        "unknown hash algorithm '" + std::string(a)
+        + "', expect 'blake3', 'md5', 'sha1', 'sha256', or 'sha512'");
 }
 
 /// builtins.hashString algo s -> hex string of the digest.  Backed by
