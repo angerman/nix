@@ -2049,31 +2049,48 @@ void primToPath(EvalState & state, Value * args, Value & out)
     typeError("toPath", "string or path");
 }
 
-/// builtins.splitVersion "1.2.3-alpha" -> ["1" "2" "3" "alpha"].
-/// Splits on '.' and '-'; consecutive separators produce empty strings
-/// (matching tree-walker behaviour).
+/// builtins.splitVersion — TW's algorithm (libstore/names.cc:54
+/// `nextComponent`).  Splits version string into components:
+///   - Skip '.' and '-' separators.
+///   - Each component is either ALL DIGITS or ALL NON-DIGIT-NON-SEP.
+///   - So "1.0.0-rc1" → ["1", "0", "0", "rc", "1"] (the "rc1" tail
+///     splits into "rc" then "1" because of the letter→digit boundary).
+///
+/// Pre-fix v3 only split on '.' and '-', producing ["1","0","0","rc1"]
+/// which made `compareVersions` give wrong results for any version
+/// like "1.0-rc1" vs "1.0-rc2" (it compared the strings "rc1" vs
+/// "rc2" as opaque tokens rather than splitting into "rc"="rc" then
+/// 1<2).  This is a SEMANTIC bug affecting nixpkgs version
+/// resolution.
 void primSplitVersion(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("splitVersion", "string");
     // #674: TW's prim_splitVersion uses forceStringNoCtx; v3 must
-    // reject contexted strings to match (eval-okay-version tests pin
-    // the error path).
+    // reject contexted strings to match.
     requireNoStringContext(state, args[0], "splitVersion");
     std::string_view s(args[0].payload.str);
-    std::vector<std::string> parts;
-    std::string cur;
-    auto emit = [&]() {
-        if (!cur.empty()) parts.push_back(std::move(cur));
-        cur.clear();
-    };
-    for (char c : s) {
-        if (c == '.' || c == '-') emit();
-        else cur.push_back(c);
+    std::vector<std::string_view> parts;
+    auto isSep = [](char c) { return c == '.' || c == '-'; };
+    auto p = s.begin();
+    while (p != s.end()) {
+        // Skip separators.
+        while (p != s.end() && isSep(*p)) ++p;
+        if (p == s.end()) break;
+        auto start = p;
+        if (std::isdigit(static_cast<unsigned char>(*p))) {
+            // All digits.
+            while (p != s.end() && std::isdigit(static_cast<unsigned char>(*p))) ++p;
+        } else {
+            // All non-digit, non-separator.
+            while (p != s.end() && !std::isdigit(static_cast<unsigned char>(*p))
+                   && !isSep(*p)) ++p;
+        }
+        parts.emplace_back(start, p - start);
     }
-    emit();
     ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
     allocStats().listsAllocated++;
-    for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = mkStringValueOwned(parts[i]);
+    for (size_t i = 0; i < parts.size(); ++i)
+        lv->elems[i] = mkStringValueOwned(std::string(parts[i]));
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = lv;
 }
