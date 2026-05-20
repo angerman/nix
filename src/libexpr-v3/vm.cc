@@ -2334,11 +2334,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // the inner-loop hot trace.
             Value & top1 = vm.valueStack.back();
             Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+            // #687 — TW phrasing (libexpr/eval.cc:2515):
+            //   `integer overflow in adding <a> + <b>`
+            // Pre-fix v3: `v3 OP_ADD: integer overflow` (no operands).
             if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
                 int64_t sum;
                 if (__builtin_expect(__builtin_add_overflow(
                         top0.payload.i, top1.payload.i, &sum), 0))
-                    throw std::runtime_error("v3 OP_ADD: integer overflow");
+                    throw std::runtime_error(
+                        "integer overflow in adding "
+                        + std::to_string(top0.payload.i) + " + "
+                        + std::to_string(top1.payload.i));
                 vm.valueStack.pop_back();
                 vm.valueStack.back().mkInt(sum);
                 break;
@@ -2349,18 +2355,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.payload.f + rhs.payload.f);
             else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) + rhs.payload.f);
             else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f + static_cast<double>(rhs.payload.i));
-            else throw std::runtime_error("v3 OP_ADD: type mismatch");
+            else throw std::runtime_error("value is not a number");
             push(vm, r);
             break;
         }
         case OP_SUB: {
             Value & top1 = vm.valueStack.back();
             Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+            // #687 — TW pattern (libexpr/eval.cc:2515 family):
+            //   `integer overflow in subtracting <a> - <b>`
             if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
                 int64_t diff;
                 if (__builtin_expect(__builtin_sub_overflow(
                         top0.payload.i, top1.payload.i, &diff), 0))
-                    throw std::runtime_error("v3 OP_SUB: integer overflow");
+                    throw std::runtime_error(
+                        "integer overflow in subtracting "
+                        + std::to_string(top0.payload.i) + " - "
+                        + std::to_string(top1.payload.i));
                 vm.valueStack.pop_back();
                 vm.valueStack.back().mkInt(diff);
                 break;
@@ -2370,18 +2381,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.payload.f - rhs.payload.f);
             else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) - rhs.payload.f);
             else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f - static_cast<double>(rhs.payload.i));
-            else throw std::runtime_error("v3 OP_SUB: type mismatch");
+            else throw std::runtime_error("value is not a number");
             push(vm, r);
             break;
         }
         case OP_MUL: {
             Value & top1 = vm.valueStack.back();
             Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
+            // #687 — TW pattern:
+            //   `integer overflow in multiplying <a> * <b>`
             if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
                 int64_t prod;
                 if (__builtin_expect(__builtin_mul_overflow(
                         top0.payload.i, top1.payload.i, &prod), 0))
-                    throw std::runtime_error("v3 OP_MUL: integer overflow");
+                    throw std::runtime_error(
+                        "integer overflow in multiplying "
+                        + std::to_string(top0.payload.i) + " * "
+                        + std::to_string(top1.payload.i));
                 vm.valueStack.pop_back();
                 vm.valueStack.back().mkInt(prod);
                 break;
@@ -2391,7 +2407,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.payload.f * rhs.payload.f);
             else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) * rhs.payload.f);
             else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f * static_cast<double>(rhs.payload.i));
-            else throw std::runtime_error("v3 OP_MUL: unsupported types");
+            else throw std::runtime_error("value is not a number");
             push(vm, r);
             break;
         }
@@ -7982,8 +7998,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
                 if (top0.isInt() && top1.isInt()) {
                     int64_t sum;
+                    // #687 — TW phrasing (libexpr/eval.cc:2515):
+                    //   `integer overflow in adding <a> + <b>`
                     if (__builtin_add_overflow(top0.payload.i, top1.payload.i, &sum))
-                        throw std::runtime_error("v3 OP_STR_CONCAT: integer overflow");
+                        throw std::runtime_error(
+                            "integer overflow in adding "
+                            + std::to_string(top0.payload.i) + " + "
+                            + std::to_string(top1.payload.i));
                     vm.valueStack.pop_back();
                     vm.valueStack.back().mkInt(sum);
                     break;

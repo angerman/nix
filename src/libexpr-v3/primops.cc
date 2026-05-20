@@ -947,7 +947,19 @@ void primStringLength(EvalState &, Value * args, Value & out)
 void primAdd(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
-    if (a.isInt() && b.isInt())          out.mkInt(a.payload.i + b.payload.i);
+    // #687 — TW's primAdd raises on integer overflow.  Pre-fix v3
+    // produced the wrapped value (-9223372036854775808 for
+    // INT64_MAX + 1) — a SILENT semantic divergence that could
+    // mask integer-arithmetic bugs in nixpkgs builders.
+    if (a.isInt() && b.isInt()) {
+        int64_t sum;
+        if (__builtin_add_overflow(a.payload.i, b.payload.i, &sum))
+            throw std::runtime_error(
+                "integer overflow in adding "
+                + std::to_string(a.payload.i) + " + "
+                + std::to_string(b.payload.i));
+        out.mkInt(sum);
+    }
     else if (a.isFloat() && b.isFloat()) out.mkFloat(a.payload.f + b.payload.f);
     else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.payload.i) + b.payload.f);
     else if (a.isFloat() && b.isInt())   out.mkFloat(a.payload.f + static_cast<double>(b.payload.i));
@@ -957,7 +969,16 @@ void primAdd(EvalState &, Value * args, Value & out)
 void primSub(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
-    if (a.isInt() && b.isInt())          out.mkInt(a.payload.i - b.payload.i);
+    // #687 — primSub overflow guard, mirror of primAdd.
+    if (a.isInt() && b.isInt()) {
+        int64_t diff;
+        if (__builtin_sub_overflow(a.payload.i, b.payload.i, &diff))
+            throw std::runtime_error(
+                "integer overflow in subtracting "
+                + std::to_string(a.payload.i) + " - "
+                + std::to_string(b.payload.i));
+        out.mkInt(diff);
+    }
     else if (a.isFloat() && b.isFloat()) out.mkFloat(a.payload.f - b.payload.f);
     else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.payload.i) - b.payload.f);
     else if (a.isFloat() && b.isInt())   out.mkFloat(a.payload.f - static_cast<double>(b.payload.i));
@@ -967,7 +988,16 @@ void primSub(EvalState &, Value * args, Value & out)
 void primMul(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0]; const Value & b = args[1];
-    if (a.isInt() && b.isInt())          out.mkInt(a.payload.i * b.payload.i);
+    // #687 — primMul overflow guard, mirror of primAdd.
+    if (a.isInt() && b.isInt()) {
+        int64_t prod;
+        if (__builtin_mul_overflow(a.payload.i, b.payload.i, &prod))
+            throw std::runtime_error(
+                "integer overflow in multiplying "
+                + std::to_string(a.payload.i) + " * "
+                + std::to_string(b.payload.i));
+        out.mkInt(prod);
+    }
     else if (a.isFloat() && b.isFloat()) out.mkFloat(a.payload.f * b.payload.f);
     else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.payload.i) * b.payload.f);
     else if (a.isFloat() && b.isInt())   out.mkFloat(a.payload.f * static_cast<double>(b.payload.i));
