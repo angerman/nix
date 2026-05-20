@@ -1,0 +1,3 @@
+{"kind": "meta", "mode": "v3-native", "label": "v3-direct (v3-native default)", "wall_ms": 53.482917, "exit": 0, "stdout": "3"}
+{"t_ns": 5471875, "rss_b": 1851392, "vms_b": 427059494912, "cpu_pct": 99.8, "threads": 1, "kind": "sample"}
+{"t_ns": 49136417, "kind": "heap", "heap_b": 402915328, "free_b": 402915328, "total_b": 0}

@@ -1,0 +1,22 @@
+{"kind": "meta", "mode": "tw", "label": "TW alone", "wall_ms": 644.768666, "exit": 0, "stdout": "\"/nix/store/7mqjbnwdn0cvxiahbidaf3qckr7mw8q9-hello-2.12.1.drv\""}
+{"t_ns": 6036833, "rss_b": 1900544, "vms_b": 427059494912, "cpu_pct": 94.5, "threads": 1, "kind": "sample"}
+{"t_ns": 66544833, "rss_b": 38453248, "vms_b": 470867296256, "cpu_pct": 80.1, "threads": 12, "kind": "sample"}
+{"t_ns": 126985500, "rss_b": 57180160, "vms_b": 470867296256, "cpu_pct": 76.1, "threads": 12, "kind": "sample"}
+{"t_ns": 187901500, "rss_b": 73908224, "vms_b": 470867820544, "cpu_pct": 68.5, "threads": 12, "kind": "sample"}
+{"t_ns": 248785750, "rss_b": 98058240, "vms_b": 470868344832, "cpu_pct": 70.8, "threads": 12, "kind": "sample"}
+{"t_ns": 309600791, "rss_b": 123289600, "vms_b": 470869131264, "cpu_pct": 64.2, "threads": 12, "kind": "sample"}
+{"t_ns": 370294041, "rss_b": 133447680, "vms_b": 470869393408, "cpu_pct": 57.3, "threads": 12, "kind": "sample"}
+{"t_ns": 430956625, "rss_b": 145539072, "vms_b": 470869917696, "cpu_pct": 51.3, "threads": 12, "kind": "sample"}
+{"t_ns": 491806708, "rss_b": 153485312, "vms_b": 470870441984, "cpu_pct": 55.8, "threads": 12, "kind": "sample"}
+{"t_ns": 551602916, "rss_b": 170557440, "vms_b": 470875422720, "cpu_pct": 63.8, "threads": 12, "kind": "sample"}
+{"t_ns": 612318291, "rss_b": 181518336, "vms_b": 470875947008, "cpu_pct": 52.8, "threads": 12, "kind": "sample"}
+{"t_ns": 105578291, "kind": "heap", "heap_b": 402915328, "free_b": 400015360, "total_b": 2782464}
+{"t_ns": 160588708, "kind": "heap", "heap_b": 402915328, "free_b": 387661824, "total_b": 14981488}
+{"t_ns": 215603250, "kind": "heap", "heap_b": 402915328, "free_b": 370122752, "total_b": 32285968}
+{"t_ns": 270622375, "kind": "heap", "heap_b": 402915328, "free_b": 354885632, "total_b": 47313488}
+{"t_ns": 324254541, "kind": "heap", "heap_b": 402915328, "free_b": 341684224, "total_b": 60314560}
+{"t_ns": 379265666, "kind": "heap", "heap_b": 402915328, "free_b": 332279808, "total_b": 69590304}
+{"t_ns": 434278916, "kind": "heap", "heap_b": 402915328, "free_b": 325410816, "total_b": 76388080}
+{"t_ns": 493468375, "kind": "heap", "heap_b": 402915328, "free_b": 319225856, "total_b": 82471264}
+{"t_ns": 542678500, "kind": "heap", "heap_b": 402915328, "free_b": 303771648, "total_b": 97684064}
+{"t_ns": 597029041, "kind": "heap", "heap_b": 402915328, "free_b": 299687936, "total_b": 101772896}

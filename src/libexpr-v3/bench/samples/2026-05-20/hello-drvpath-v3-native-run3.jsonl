@@ -1,0 +1,322 @@
+{"kind": "meta", "mode": "v3-native", "label": "v3-direct (v3-native default)", "wall_ms": 10329.7675, "exit": 0, "stdout": "\"/nix/store/7mqjbnwdn0cvxiahbidaf3qckr7mw8q9-hello-2.12.1.drv\""}
+{"t_ns": 5520167, "rss_b": 1622016, "vms_b": 426742530048, "cpu_pct": 98.4, "threads": 1, "kind": "sample"}
+{"t_ns": 66058417, "rss_b": 36405248, "vms_b": 470885253120, "cpu_pct": 70.2, "threads": 12, "kind": "sample"}
+{"t_ns": 126462750, "rss_b": 49774592, "vms_b": 470893641728, "cpu_pct": 100.1, "threads": 12, "kind": "sample"}
+{"t_ns": 187097417, "rss_b": 105086976, "vms_b": 470945628160, "cpu_pct": 99.9, "threads": 12, "kind": "sample"}
+{"t_ns": 247588959, "rss_b": 118407168, "vms_b": 470956883968, "cpu_pct": 97.2, "threads": 12, "kind": "sample"}
+{"t_ns": 308195250, "rss_b": 183615488, "vms_b": 471018946560, "cpu_pct": 102.9, "threads": 12, "kind": "sample"}
+{"t_ns": 369233084, "rss_b": 190513152, "vms_b": 471028400128, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 429658459, "rss_b": 215990272, "vms_b": 471048470528, "cpu_pct": 98.8, "threads": 12, "kind": "sample"}
+{"t_ns": 490287084, "rss_b": 280248320, "vms_b": 471134748672, "cpu_pct": 101.1, "threads": 12, "kind": "sample"}
+{"t_ns": 550814625, "rss_b": 326041600, "vms_b": 471190847488, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 611384375, "rss_b": 328941568, "vms_b": 471195975680, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 671917042, "rss_b": 405569536, "vms_b": 471301423104, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 732551834, "rss_b": 497893376, "vms_b": 471416373248, "cpu_pct": 96.2, "threads": 12, "kind": "sample"}
+{"t_ns": 793062417, "rss_b": 561610752, "vms_b": 471508647936, "cpu_pct": 103.8, "threads": 12, "kind": "sample"}
+{"t_ns": 854113459, "rss_b": 648986624, "vms_b": 471647584256, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 914675417, "rss_b": 670253056, "vms_b": 471664361472, "cpu_pct": 45.0, "threads": 12, "kind": "sample"}
+{"t_ns": 970788584, "rss_b": 688406528, "vms_b": 471672750080, "cpu_pct": 60.9, "threads": 12, "kind": "sample"}
+{"t_ns": 1030223209, "rss_b": 742686720, "vms_b": 471742218240, "cpu_pct": 94.5, "threads": 12, "kind": "sample"}
+{"t_ns": 1090844084, "rss_b": 760676352, "vms_b": 471750606848, "cpu_pct": 79.8, "threads": 12, "kind": "sample"}
+{"t_ns": 1151686875, "rss_b": 772751360, "vms_b": 471761616896, "cpu_pct": 100.1, "threads": 12, "kind": "sample"}
+{"t_ns": 1212354750, "rss_b": 778125312, "vms_b": 471770005504, "cpu_pct": 99.6, "threads": 12, "kind": "sample"}
+{"t_ns": 1270611292, "rss_b": 789823488, "vms_b": 471778394112, "cpu_pct": 54.9, "threads": 12, "kind": "sample"}
+{"t_ns": 1331057042, "rss_b": 801030144, "vms_b": 471799365632, "cpu_pct": 51.8, "threads": 12, "kind": "sample"}
+{"t_ns": 1391550625, "rss_b": 842842112, "vms_b": 471845502976, "cpu_pct": 75.5, "threads": 12, "kind": "sample"}
+{"t_ns": 1452089959, "rss_b": 891486208, "vms_b": 471925719040, "cpu_pct": 78.8, "threads": 12, "kind": "sample"}
+{"t_ns": 1512682125, "rss_b": 926318592, "vms_b": 471980244992, "cpu_pct": 77.0, "threads": 12, "kind": "sample"}
+{"t_ns": 1573255625, "rss_b": 964968448, "vms_b": 472051548160, "cpu_pct": 82.4, "threads": 12, "kind": "sample"}
+{"t_ns": 1633897417, "rss_b": 992083968, "vms_b": 472076713984, "cpu_pct": 71.3, "threads": 12, "kind": "sample"}
+{"t_ns": 1694511125, "rss_b": 1026359296, "vms_b": 472118657024, "cpu_pct": 74.0, "threads": 12, "kind": "sample"}
+{"t_ns": 1755247250, "rss_b": 1064714240, "vms_b": 472169512960, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 1815802625, "rss_b": 1101955072, "vms_b": 472198873088, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 1876348542, "rss_b": 1138343936, "vms_b": 472245010432, "cpu_pct": 100.1, "threads": 12, "kind": "sample"}
+{"t_ns": 1936981875, "rss_b": 1172914176, "vms_b": 472274370560, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 1997549042, "rss_b": 1207517184, "vms_b": 472303730688, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 2058311750, "rss_b": 1240317952, "vms_b": 472337285120, "cpu_pct": 96.5, "threads": 12, "kind": "sample"}
+{"t_ns": 2115112417, "rss_b": 1265516544, "vms_b": 472362450944, "cpu_pct": 90.1, "threads": 12, "kind": "sample"}
+{"t_ns": 2171116750, "rss_b": 1385037824, "vms_b": 472488787968, "cpu_pct": 96.1, "threads": 12, "kind": "sample"}
+{"t_ns": 2232077125, "rss_b": 1385037824, "vms_b": 472488787968, "cpu_pct": 93.7, "threads": 12, "kind": "sample"}
+{"t_ns": 2292802334, "rss_b": 1385037824, "vms_b": 472488787968, "cpu_pct": 107.0, "threads": 12, "kind": "sample"}
+{"t_ns": 2353337084, "rss_b": 1394769920, "vms_b": 472493506560, "cpu_pct": 94.9, "threads": 12, "kind": "sample"}
+{"t_ns": 2413821709, "rss_b": 1428701184, "vms_b": 472539643904, "cpu_pct": 95.0, "threads": 12, "kind": "sample"}
+{"t_ns": 2470940500, "rss_b": 1460666368, "vms_b": 472569004032, "cpu_pct": 95.3, "threads": 12, "kind": "sample"}
+{"t_ns": 2531624167, "rss_b": 1493663744, "vms_b": 472594169856, "cpu_pct": 94.3, "threads": 12, "kind": "sample"}
+{"t_ns": 2592309959, "rss_b": 1523335168, "vms_b": 472623529984, "cpu_pct": 90.5, "threads": 12, "kind": "sample"}
+{"t_ns": 2653017125, "rss_b": 1555513344, "vms_b": 472648695808, "cpu_pct": 92.7, "threads": 12, "kind": "sample"}
+{"t_ns": 2713494834, "rss_b": 1586118656, "vms_b": 472694833152, "cpu_pct": 91.9, "threads": 12, "kind": "sample"}
+{"t_ns": 2774100375, "rss_b": 1615462400, "vms_b": 472719998976, "cpu_pct": 90.1, "threads": 12, "kind": "sample"}
+{"t_ns": 2832025584, "rss_b": 1643642880, "vms_b": 472745164800, "cpu_pct": 91.2, "threads": 12, "kind": "sample"}
+{"t_ns": 2891395250, "rss_b": 1674330112, "vms_b": 472775049216, "cpu_pct": 94.7, "threads": 12, "kind": "sample"}
+{"t_ns": 2952087959, "rss_b": 1703608320, "vms_b": 472800215040, "cpu_pct": 92.4, "threads": 12, "kind": "sample"}
+{"t_ns": 3008507625, "rss_b": 1733050368, "vms_b": 472825380864, "cpu_pct": 94.2, "threads": 12, "kind": "sample"}
+{"t_ns": 3069258000, "rss_b": 1763983360, "vms_b": 472871518208, "cpu_pct": 95.2, "threads": 12, "kind": "sample"}
+{"t_ns": 3130089417, "rss_b": 1794801664, "vms_b": 472900878336, "cpu_pct": 95.9, "threads": 12, "kind": "sample"}
+{"t_ns": 3187403500, "rss_b": 1823948800, "vms_b": 472926044160, "cpu_pct": 95.8, "threads": 12, "kind": "sample"}
+{"t_ns": 3247589417, "rss_b": 1851850752, "vms_b": 472951209984, "cpu_pct": 93.1, "threads": 12, "kind": "sample"}
+{"t_ns": 3307747542, "rss_b": 1882898432, "vms_b": 472980570112, "cpu_pct": 96.8, "threads": 12, "kind": "sample"}
+{"t_ns": 3366167625, "rss_b": 1914617856, "vms_b": 473009930240, "cpu_pct": 99.6, "threads": 12, "kind": "sample"}
+{"t_ns": 3426830375, "rss_b": 1942978560, "vms_b": 473052397568, "cpu_pct": 93.4, "threads": 12, "kind": "sample"}
+{"t_ns": 3487489000, "rss_b": 1972781056, "vms_b": 473081757696, "cpu_pct": 97.2, "threads": 12, "kind": "sample"}
+{"t_ns": 3548281709, "rss_b": 2001731584, "vms_b": 473106923520, "cpu_pct": 95.2, "threads": 12, "kind": "sample"}
+{"t_ns": 3608936625, "rss_b": 2030747648, "vms_b": 473132089344, "cpu_pct": 95.0, "threads": 12, "kind": "sample"}
+{"t_ns": 3669562667, "rss_b": 2060025856, "vms_b": 473165643776, "cpu_pct": 96.3, "threads": 12, "kind": "sample"}
+{"t_ns": 3730165417, "rss_b": 2086764544, "vms_b": 473195003904, "cpu_pct": 92.1, "threads": 12, "kind": "sample"}
+{"t_ns": 3787447375, "rss_b": 2103967744, "vms_b": 473199198208, "cpu_pct": 88.6, "threads": 12, "kind": "sample"}
+{"t_ns": 3900086042, "rss_b": 2131296256, "vms_b": 473249529856, "cpu_pct": 43.4, "threads": 12, "kind": "sample"}
+{"t_ns": 3972790709, "rss_b": 2141159424, "vms_b": 473287802880, "cpu_pct": 34.6, "threads": 12, "kind": "sample"}
+{"t_ns": 4030083584, "rss_b": 2169438208, "vms_b": 473329745920, "cpu_pct": 90.4, "threads": 12, "kind": "sample"}
+{"t_ns": 4090606125, "rss_b": 2188984320, "vms_b": 473354911744, "cpu_pct": 74.0, "threads": 12, "kind": "sample"}
+{"t_ns": 4151381917, "rss_b": 2216820736, "vms_b": 473380077568, "cpu_pct": 91.6, "threads": 12, "kind": "sample"}
+{"t_ns": 4212269709, "rss_b": 2246656000, "vms_b": 473426214912, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 4273126875, "rss_b": 2276835328, "vms_b": 473455575040, "cpu_pct": 99.9, "threads": 12, "kind": "sample"}
+{"t_ns": 4333841917, "rss_b": 2306605056, "vms_b": 473480740864, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 4394801500, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 93.0, "threads": 12, "kind": "sample"}
+{"t_ns": 4455586375, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 100.4, "threads": 12, "kind": "sample"}
+{"t_ns": 4516434000, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 93.9, "threads": 12, "kind": "sample"}
+{"t_ns": 4577223500, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 112.2, "threads": 12, "kind": "sample"}
+{"t_ns": 4637908667, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 97.0, "threads": 12, "kind": "sample"}
+{"t_ns": 4698572459, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 103.5, "threads": 12, "kind": "sample"}
+{"t_ns": 4756588084, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 100.0, "threads": 12, "kind": "sample"}
+{"t_ns": 4814508167, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 85.9, "threads": 12, "kind": "sample"}
+{"t_ns": 4870774084, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 110.0, "threads": 12, "kind": "sample"}
+{"t_ns": 4931562792, "rss_b": 2530869248, "vms_b": 473695666176, "cpu_pct": 102.6, "threads": 12, "kind": "sample"}
+{"t_ns": 4992235917, "rss_b": 2565619712, "vms_b": 473745997824, "cpu_pct": 101.7, "threads": 12, "kind": "sample"}
+{"t_ns": 5052911875, "rss_b": 2595307520, "vms_b": 473771687936, "cpu_pct": 92.0, "threads": 12, "kind": "sample"}
+{"t_ns": 5113345584, "rss_b": 2626781184, "vms_b": 473796853760, "cpu_pct": 93.6, "threads": 12, "kind": "sample"}
+{"t_ns": 5170914959, "rss_b": 2657566720, "vms_b": 473826213888, "cpu_pct": 95.6, "threads": 12, "kind": "sample"}
+{"t_ns": 5231749834, "rss_b": 2689073152, "vms_b": 473855574016, "cpu_pct": 94.5, "threads": 12, "kind": "sample"}
+{"t_ns": 5290609375, "rss_b": 2718121984, "vms_b": 473880739840, "cpu_pct": 92.6, "threads": 12, "kind": "sample"}
+{"t_ns": 5351304917, "rss_b": 2748547072, "vms_b": 473922682880, "cpu_pct": 93.7, "threads": 12, "kind": "sample"}
+{"t_ns": 5411912334, "rss_b": 2777382912, "vms_b": 473952043008, "cpu_pct": 91.5, "threads": 12, "kind": "sample"}
+{"t_ns": 5472474750, "rss_b": 2805055488, "vms_b": 473976635392, "cpu_pct": 90.6, "threads": 11, "kind": "sample"}
+{"t_ns": 5529067375, "rss_b": 2833924096, "vms_b": 474005995520, "cpu_pct": 95.0, "threads": 11, "kind": "sample"}
+{"t_ns": 5587329125, "rss_b": 2863300608, "vms_b": 474031685632, "cpu_pct": 94.1, "threads": 11, "kind": "sample"}
+{"t_ns": 5647897959, "rss_b": 2894610432, "vms_b": 474061045760, "cpu_pct": 95.6, "threads": 11, "kind": "sample"}
+{"t_ns": 5708258125, "rss_b": 2924134400, "vms_b": 474102988800, "cpu_pct": 94.4, "threads": 11, "kind": "sample"}
+{"t_ns": 5768808834, "rss_b": 2955952128, "vms_b": 474132348928, "cpu_pct": 97.4, "threads": 11, "kind": "sample"}
+{"t_ns": 5829278209, "rss_b": 2985492480, "vms_b": 474157514752, "cpu_pct": 93.7, "threads": 11, "kind": "sample"}
+{"t_ns": 5889735125, "rss_b": 3015901184, "vms_b": 474186874880, "cpu_pct": 95.2, "threads": 11, "kind": "sample"}
+{"t_ns": 5950384334, "rss_b": 3041001472, "vms_b": 474216235008, "cpu_pct": 76.3, "threads": 11, "kind": "sample"}
+{"t_ns": 6010955500, "rss_b": 3059826688, "vms_b": 474241400832, "cpu_pct": 81.0, "threads": 11, "kind": "sample"}
+{"t_ns": 6070966500, "rss_b": 3083042816, "vms_b": 474279149568, "cpu_pct": 79.5, "threads": 11, "kind": "sample"}
+{"t_ns": 6131753792, "rss_b": 3116417024, "vms_b": 474309033984, "cpu_pct": 99.1, "threads": 11, "kind": "sample"}
+{"t_ns": 6187520334, "rss_b": 3147104256, "vms_b": 474338394112, "cpu_pct": 100.1, "threads": 11, "kind": "sample"}
+{"t_ns": 6248205709, "rss_b": 3180167168, "vms_b": 474367754240, "cpu_pct": 99.8, "threads": 11, "kind": "sample"}
+{"t_ns": 6308992917, "rss_b": 3213049856, "vms_b": 474413891584, "cpu_pct": 99.7, "threads": 11, "kind": "sample"}
+{"t_ns": 6369765292, "rss_b": 3245555712, "vms_b": 474443251712, "cpu_pct": 100.1, "threads": 11, "kind": "sample"}
+{"t_ns": 6430537042, "rss_b": 3277914112, "vms_b": 474472611840, "cpu_pct": 100.0, "threads": 11, "kind": "sample"}
+{"t_ns": 6491223042, "rss_b": 3310419968, "vms_b": 474501971968, "cpu_pct": 100.0, "threads": 11, "kind": "sample"}
+{"t_ns": 6550342209, "rss_b": 3337797632, "vms_b": 474527137792, "cpu_pct": 94.0, "threads": 11, "kind": "sample"}
+{"t_ns": 6611074834, "rss_b": 3364732928, "vms_b": 474552827904, "cpu_pct": 92.1, "threads": 11, "kind": "sample"}
+{"t_ns": 6670808125, "rss_b": 3391324160, "vms_b": 474594770944, "cpu_pct": 92.8, "threads": 11, "kind": "sample"}
+{"t_ns": 6731342917, "rss_b": 3420749824, "vms_b": 474624131072, "cpu_pct": 96.0, "threads": 11, "kind": "sample"}
+{"t_ns": 6791887625, "rss_b": 3449667584, "vms_b": 474649296896, "cpu_pct": 95.9, "threads": 11, "kind": "sample"}
+{"t_ns": 6852615209, "rss_b": 3478585344, "vms_b": 474678657024, "cpu_pct": 96.6, "threads": 11, "kind": "sample"}
+{"t_ns": 6913588667, "rss_b": 3505700864, "vms_b": 474703822848, "cpu_pct": 94.2, "threads": 11, "kind": "sample"}
+{"t_ns": 6974147875, "rss_b": 3531964416, "vms_b": 474728988672, "cpu_pct": 92.7, "threads": 11, "kind": "sample"}
+{"t_ns": 7034685084, "rss_b": 3560603648, "vms_b": 474754154496, "cpu_pct": 95.2, "threads": 11, "kind": "sample"}
+{"t_ns": 7095227334, "rss_b": 3587751936, "vms_b": 474779320320, "cpu_pct": 92.5, "threads": 11, "kind": "sample"}
+{"t_ns": 7155838042, "rss_b": 3614425088, "vms_b": 474804486144, "cpu_pct": 91.7, "threads": 11, "kind": "sample"}
+{"t_ns": 7216930792, "rss_b": 3640623104, "vms_b": 474830176256, "cpu_pct": 93.0, "threads": 11, "kind": "sample"}
+{"t_ns": 7276047834, "rss_b": 3667394560, "vms_b": 474859536384, "cpu_pct": 94.9, "threads": 11, "kind": "sample"}
+{"t_ns": 7332781584, "rss_b": 3693690880, "vms_b": 474884702208, "cpu_pct": 95.3, "threads": 11, "kind": "sample"}
+{"t_ns": 7393478917, "rss_b": 3720429568, "vms_b": 474909868032, "cpu_pct": 93.8, "threads": 11, "kind": "sample"}
+{"t_ns": 7454137209, "rss_b": 3747840000, "vms_b": 474935033856, "cpu_pct": 94.2, "threads": 11, "kind": "sample"}
+{"t_ns": 7514655792, "rss_b": 3774709760, "vms_b": 474976976896, "cpu_pct": 94.6, "threads": 11, "kind": "sample"}
+{"t_ns": 7570824167, "rss_b": 3801022464, "vms_b": 475006337024, "cpu_pct": 96.1, "threads": 11, "kind": "sample"}
+{"t_ns": 7631482417, "rss_b": 3829219328, "vms_b": 475031502848, "cpu_pct": 95.6, "threads": 11, "kind": "sample"}
+{"t_ns": 7692270875, "rss_b": 3855597568, "vms_b": 475056668672, "cpu_pct": 92.6, "threads": 11, "kind": "sample"}
+{"t_ns": 7753012584, "rss_b": 3884482560, "vms_b": 475086553088, "cpu_pct": 96.5, "threads": 11, "kind": "sample"}
+{"t_ns": 7813634167, "rss_b": 3914711040, "vms_b": 475111718912, "cpu_pct": 99.5, "threads": 11, "kind": "sample"}
+{"t_ns": 7874168834, "rss_b": 3941548032, "vms_b": 475136884736, "cpu_pct": 94.5, "threads": 11, "kind": "sample"}
+{"t_ns": 7934871209, "rss_b": 3969269760, "vms_b": 475166244864, "cpu_pct": 95.9, "threads": 11, "kind": "sample"}
+{"t_ns": 7995397125, "rss_b": 3996549120, "vms_b": 475191410688, "cpu_pct": 94.8, "threads": 11, "kind": "sample"}
+{"t_ns": 8054858334, "rss_b": 4024549376, "vms_b": 475216576512, "cpu_pct": 97.4, "threads": 11, "kind": "sample"}
+{"t_ns": 8115603125, "rss_b": 4051582976, "vms_b": 475245936640, "cpu_pct": 95.7, "threads": 11, "kind": "sample"}
+{"t_ns": 8176128000, "rss_b": 4078141440, "vms_b": 475271102464, "cpu_pct": 95.1, "threads": 11, "kind": "sample"}
+{"t_ns": 8236877792, "rss_b": 4097769472, "vms_b": 475292073984, "cpu_pct": 82.4, "threads": 11, "kind": "sample"}
+{"t_ns": 8297410125, "rss_b": 4129521664, "vms_b": 475342929920, "cpu_pct": 87.9, "threads": 11, "kind": "sample"}
+{"t_ns": 8357985875, "rss_b": 4185079808, "vms_b": 475431010304, "cpu_pct": 96.5, "threads": 11, "kind": "sample"}
+{"t_ns": 8418641084, "rss_b": 4221485056, "vms_b": 475506507776, "cpu_pct": 92.8, "threads": 11, "kind": "sample"}
+{"t_ns": 8479206334, "rss_b": 4246618112, "vms_b": 475548450816, "cpu_pct": 87.7, "threads": 11, "kind": "sample"}
+{"t_ns": 8537646084, "rss_b": 4271341568, "vms_b": 475577810944, "cpu_pct": 73.7, "threads": 11, "kind": "sample"}
+{"t_ns": 8598428625, "rss_b": 4300144640, "vms_b": 475620278272, "cpu_pct": 71.3, "threads": 11, "kind": "sample"}
+{"t_ns": 8659105417, "rss_b": 4320264192, "vms_b": 475658027008, "cpu_pct": 72.2, "threads": 11, "kind": "sample"}
+{"t_ns": 8715604042, "rss_b": 4341432320, "vms_b": 475683192832, "cpu_pct": 82.1, "threads": 11, "kind": "sample"}
+{"t_ns": 8776426250, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 86.4, "threads": 11, "kind": "sample"}
+{"t_ns": 8832495875, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 99.7, "threads": 11, "kind": "sample"}
+{"t_ns": 8893124667, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 97.7, "threads": 11, "kind": "sample"}
+{"t_ns": 8954071959, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 97.4, "threads": 11, "kind": "sample"}
+{"t_ns": 9014875334, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 98.7, "threads": 11, "kind": "sample"}
+{"t_ns": 9070779125, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 97.3, "threads": 11, "kind": "sample"}
+{"t_ns": 9127132875, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 108.5, "threads": 11, "kind": "sample"}
+{"t_ns": 9188051125, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 100.6, "threads": 11, "kind": "sample"}
+{"t_ns": 9248690542, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 94.6, "threads": 11, "kind": "sample"}
+{"t_ns": 9309293209, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 99.0, "threads": 11, "kind": "sample"}
+{"t_ns": 9370170792, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 100.1, "threads": 11, "kind": "sample"}
+{"t_ns": 9430866625, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 91.9, "threads": 11, "kind": "sample"}
+{"t_ns": 9491539750, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 114.9, "threads": 11, "kind": "sample"}
+{"t_ns": 9551512584, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 92.6, "threads": 11, "kind": "sample"}
+{"t_ns": 9612129375, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 104.5, "threads": 11, "kind": "sample"}
+{"t_ns": 9670882667, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 102.2, "threads": 11, "kind": "sample"}
+{"t_ns": 9727161959, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 88.9, "threads": 11, "kind": "sample"}
+{"t_ns": 9787723084, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 102.0, "threads": 11, "kind": "sample"}
+{"t_ns": 9848390084, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 102.8, "threads": 11, "kind": "sample"}
+{"t_ns": 9908953042, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 99.1, "threads": 11, "kind": "sample"}
+{"t_ns": 9969565334, "rss_b": 4324130816, "vms_b": 458524295168, "cpu_pct": 104.1, "threads": 11, "kind": "sample"}
+{"t_ns": 10030133167, "rss_b": 4324147200, "vms_b": 458524295168, "cpu_pct": 103.2, "threads": 11, "kind": "sample"}
+{"t_ns": 10090790042, "rss_b": 4324163584, "vms_b": 458524295168, "cpu_pct": 100.0, "threads": 11, "kind": "sample"}
+{"t_ns": 10151384209, "rss_b": 4158259200, "vms_b": 458358439936, "cpu_pct": 100.0, "threads": 11, "kind": "sample"}
+{"t_ns": 10212040125, "rss_b": 4158390272, "vms_b": 458358571008, "cpu_pct": 99.9, "threads": 11, "kind": "sample"}
+{"t_ns": 10273027500, "rss_b": 4158668800, "vms_b": 458358833152, "cpu_pct": 100.1, "threads": 11, "kind": "sample"}
+{"t_ns": 57926500, "kind": "heap", "heap_b": 402915328, "free_b": 402915328, "total_b": 0}
+{"t_ns": 167960250, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 53577936}
+{"t_ns": 222984584, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 53577936}
+{"t_ns": 278004042, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 53577936}
+{"t_ns": 386013334, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 55677776}
+{"t_ns": 436466167, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 65127056}
+{"t_ns": 539008334, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 139671376}
+{"t_ns": 594030250, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 139671376}
+{"t_ns": 704060125, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 176418576}
+{"t_ns": 759076542, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 177468496}
+{"t_ns": 814102292, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 187967696}
+{"t_ns": 869149667, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 199516816}
+{"t_ns": 979153917, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 214215760}
+{"t_ns": 1034179709, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 214215760}
+{"t_ns": 1092719042, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 218415440}
+{"t_ns": 1142475125, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 218415440}
+{"t_ns": 1194470459, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 218415440}
+{"t_ns": 1300397792, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 227864720}
+{"t_ns": 1355083542, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 238363920}
+{"t_ns": 1410090834, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 255162640}
+{"t_ns": 1465106292, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 274061200}
+{"t_ns": 1518814792, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 276161040}
+{"t_ns": 1575128125, "kind": "heap", "heap_b": 402915328, "free_b": 401780736, "total_b": 281410640}
+{"t_ns": 1682388875, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 299259520}
+{"t_ns": 1733738042, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 299259520}
+{"t_ns": 1787448500, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 299259520}
+{"t_ns": 1842463792, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 299259520}
+{"t_ns": 1897479667, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 299259520}
+{"t_ns": 1952488875, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 299259520}
+{"t_ns": 2060182042, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2116984250, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2166178917, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2221206500, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2331243792, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2386259542, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2441275875, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2551304000, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2606310084, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2661321875, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2716328792, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2775967000, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2825412084, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2880427334, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 2930851042, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3040871875, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3095884667, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3150566667, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3205584000, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3260604917, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3315616084, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3428699375, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3480653125, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3535667417, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3590690667, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3645712959, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 300309440}
+{"t_ns": 3754028334, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 304509120}
+{"t_ns": 3809045834, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 306608960}
+{"t_ns": 3932067959, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 306608960}
+{"t_ns": 3932095334, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 306608960}
+{"t_ns": 4042024209, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 306608960}
+{"t_ns": 4097037417, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4153269959, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4260428750, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4315449875, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4425486625, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4480303250, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4590339000, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4700441917, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4758475375, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4864925417, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 4919933084, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5026835375, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5081843000, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5136853667, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5191868334, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5246876334, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5301886750, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5356898667, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5413779834, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5466931667, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5521944209, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5576956292, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5631985084, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5687001500, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5740670417, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5850694250, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 5905430500, "kind": "heap", "heap_b": 402915328, "free_b": 401772544, "total_b": 310808640}
+{"t_ns": 6012827042, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 324457872}
+{"t_ns": 6062189209, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6117033500, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6227071292, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6282084292, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6336186000, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6391198542, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6443058000, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6498077209, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6612628000, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6662255792, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6716393334, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6826432584, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6881452042, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 6936465334, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7045590209, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7100601042, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7208220167, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7263273375, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7373261417, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7428273292, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7483290792, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7538302292, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7593313125, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7648324709, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7703333709, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7758345834, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7815507125, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7923391500, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 7978405417, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 8033418459, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 8088435167, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 8138751917, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 8193766834, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 325507792}
+{"t_ns": 8303790417, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 328657552}
+{"t_ns": 8359857584, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 357005392}
+{"t_ns": 8409340250, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 367504592}
+{"t_ns": 8463031334, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 367504592}
+{"t_ns": 8513335500, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 375903952}
+{"t_ns": 8568351792, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 389552912}
+{"t_ns": 8623357834, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 395852432}
+{"t_ns": 8733386500, "kind": "heap", "heap_b": 402915328, "free_b": 401768448, "total_b": 400052112}
+{"t_ns": 8788412500, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 8843425042, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 8955949125, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9000352500, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9055376875, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9110388792, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9220440709, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9272346709, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9327361250, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9436378459, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9493412417, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9541508625, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9596523875, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9706566750, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9760497125, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9870543750, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9925557625, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 9980572417, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 10092657709, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 10142058334, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}
+{"t_ns": 10250356792, "kind": "heap", "heap_b": 402915328, "free_b": 402837504, "total_b": 400052112}

@@ -1,0 +1,3 @@
+{"kind": "meta", "mode": "tw", "label": "TW alone", "wall_ms": 63.207583, "exit": 0, "stdout": "3"}
+{"t_ns": 7817292, "rss_b": 1900544, "vms_b": 427059494912, "cpu_pct": 98.1, "threads": 1, "kind": "sample"}
+{"t_ns": 61019708, "kind": "heap", "heap_b": 402915328, "free_b": 402915328, "total_b": 0}
