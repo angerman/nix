@@ -155,15 +155,23 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // Compile IR to bytecode.  The CompilationUnit owns
     // `stringConstants` referenced by OP_LIT_STR / OP_LIT_PATH; the
     // resulting Value's string/path payloads point into that vector.
-    // Return the cu by-move so caller keeps it alive alongside the
-    // Value.
-    RootResult out{compile(module), Value{}};
+    //
+    // #676 — heap-allocate the CU via make_unique so its address is
+    // stable across any RootResult moves the caller may do (e.g.
+    // `std::optional::emplace` in eval.cc --apply).  Closures emitted
+    // by `run()` capture `c->cu = &cu` at OP_MAKE_CLOSURE time; if
+    // the CU lived inside RootResult by value, a subsequent move
+    // would leave every captured cu pointer dangling.  Pre-#676 this
+    // manifested as a SIGTRAP on `nix eval --impure --apply '(x: 42)'
+    // --expr '1'` — the closure's stale cu pointer made dispatchLoop
+    // read garbage bytecode.
+    RootResult out{std::make_unique<CompilationUnit>(compile(module)), Value{}};
     pt.mark(pt.compile_ms);
 
     // Run.  STG-10 (vm.cc:5530) automatically routes through
     // `runOnExistingVm` if we're re-entered from another v3 dispatch
     // loop — so calling `runRootExpr` from inside a primop is safe.
-    out.value = run(out.cu);
+    out.value = run(*out.cu);
     pt.mark(pt.run_ms);
 
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us

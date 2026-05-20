@@ -17,6 +17,8 @@
 #include "v3/value.hh"
 #include "v3/bytecode.hh"
 
+#include <memory>
+
 namespace nix {
 struct Expr;
 class EvalState;
@@ -48,8 +50,15 @@ namespace nix::v3 {
 ///     EvalState's static base env.  Without that, references like
 ///     `builtins.foo` haven't been resolved to (level, displ) and
 ///     the lowerer will fail.
+///
+/// #676 — the `cu` is held by `std::unique_ptr` (NOT by value) so its
+/// address is stable across moves.  Closures created during `run()`
+/// store `c->cu = &cu` at emit time; if RootResult itself were moved
+/// (e.g. via `std::optional::emplace`), every embedded closure's `cu`
+/// pointer would dangle.  Heap-allocating the CU and moving the
+/// unique_ptr (not the CU) preserves the contract.
 struct RootResult {
-    CompilationUnit cu;
+    std::unique_ptr<CompilationUnit> cu;
     Value value;
 };
 RootResult runRootExpr(EvalState & state, Expr * e);

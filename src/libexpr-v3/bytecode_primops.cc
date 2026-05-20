@@ -146,25 +146,16 @@ void installBytecodePrimop(
             std::to_string(static_cast<int>(rr.value.tag())) + ")");
     }
 
-    // Stash the holder FIRST so the CU + Value live at stable heap
-    // addresses.  Then patch the closure's cu pointer to point at the
-    // heap-stable location.  The closure was built by `run()` inside
-    // runRootExpr with `desc->cu = &local_cu`; after we move the cu
-    // to the holder, that pointer is stale unless we re-point it.
-    // Bridge and side-table install must use the PATCHED value, not
-    // the pre-move one.
+    // #676: post-#676 the CU is held as unique_ptr<CompilationUnit>
+    // inside RootResult — its heap address is stable from the moment
+    // runRootExpr's make_unique returns, regardless of how many times
+    // RootResult itself is moved.  So this branch no longer needs the
+    // historical cu-pointer fix-up (the closure's `cu` pointer already
+    // points at the stable heap CU).  The holder still owns the CU
+    // for lifetime (installedPrimops() keeps it alive for the process).
     auto holder = std::make_unique<InstalledPrimop>();
     holder->name = primopName;
     holder->rr = std::move(rr);
-    if (holder->rr.value.tag() == Tag::Closure
-        && holder->rr.value.payload.closure)
-    {
-        // Cast-away-const intentional: the Closure was built with
-        // `desc->cu = &cu` where cu was at the old address.  We
-        // re-point at the heap-stable address now.
-        Closure * c = const_cast<Closure *>(holder->rr.value.payload.closure);
-        c->cu = &holder->rr.cu;
-    }
     InstalledPrimop * installedPtr = holder.get();
     installedPrimops().push_back(std::move(holder));
     auto & installed = *installedPtr;

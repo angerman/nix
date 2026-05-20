@@ -47,6 +47,7 @@ on the bisect → fixture → permanent-guard workflow.
 | `repro-670-671-ghc-sphinx-bisection.nix` | Bisection result: `haskell.compiler.{ghc96,ghc98,ghc910,ghc984}` with `enableDocs=false` produce byte-identical drvPaths to TW. Sphinx/docs is the trigger for both #670 (SIGTRAP) and #671 (fake-store fallback). | (2026-05-19, #670/#671 bisection) | TW + v3-direct must match |
 | `repro-670-671-python-mismatch.nix` | Root-cause guard: ghc94/96/98/910/984 must all produce byte-identical drvPaths to TW. Pre-fix the dangling-string_view bug in primDerivationStrictNative made ghc96+ non-deterministically fail. | (2026-05-20, #670/#671 FIX) | TW + v3-direct must match |
 | `repro-675-tojson-shortcircuit.nix` | `nix eval --impure --json` on a derivation must emit just its outPath string (TW parity); pre-fix v3 recursed into the full transitive graph (>3 min, 0 bytes for hello.drvAttrs.src). | (2026-05-20, #675) | TW + v3-direct must match |
+| `run-676-apply-cu-stability.sh` | `nix eval --impure --apply <fn>` must not SIGTRAP when the apply fn returns a non-arg-derived value. Pre-fix: RootResult moved via `std::optional::emplace` left closure `cu` pointers dangling at the pre-move stack address; dispatchLoop read garbage bytecode. Fix: heap-allocate CompilationUnit via `std::unique_ptr` so its address is move-stable. | (2026-05-20, #676) | TW + v3-direct must match (9 shapes via shell driver — `.nix` fixtures can't repro since the bug needs two `runRootExpr` calls) |
 
 ## Run all repros
 

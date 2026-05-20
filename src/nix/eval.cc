@@ -123,8 +123,8 @@ static bool runV3DirectEval(
     // when callClosure / forceValue need to run inner thunks.
     v3::VMState vm;
     vm.frames.push_back(v3::CallFrame{
-        .cu = &rootResult.cu, .closure = nullptr, .thunk = nullptr,
-        .ip = rootResult.cu.entryOffset, .stackBaseOffset = 0,
+        .cu = rootResult.cu.get(), .closure = nullptr, .thunk = nullptr,
+        .ip = rootResult.cu->entryOffset, .stackBaseOffset = 0,
         .withStackBase = 0, .flags = 0,
     });
 
