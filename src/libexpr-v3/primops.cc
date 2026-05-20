@@ -2272,20 +2272,34 @@ void primAddDrvOutputDependencies(EvalState & state, Value * args, Value & out)
     auto existing = lookupStringContext(args[0].payload.str);
     // Tree-walker requires exactly one context entry which must be a
     // single .drv path (Opaque or DrvDeep).  v3 must mirror that.
+    // #692 — match TW's exact error phrasing
+    // (libexpr/primops.cc:addDrvOutputDependencies family).  Drops the
+    // "v3 addDrvOutputDependencies:" debug prefix and uses TW's
+    // `context of string 'X' must have exactly one element, but has N`
+    // pattern.  The trailing ", but has 0/N" carries the actual count.
     if (existing.empty())
-        throw std::runtime_error("v3 addDrvOutputDependencies: empty string context");
+        throw std::runtime_error(
+            "context of string '" + std::string(args[0].payload.str)
+            + "' must have exactly one element, but has 0");
     if (existing.size() > 1)
-        throw std::runtime_error("v3 addDrvOutputDependencies: string context has multiple entries");
+        throw std::runtime_error(
+            "context of string '" + std::string(args[0].payload.str)
+            + "' must have exactly one element, but has "
+            + std::to_string(existing.size()));
     const auto & e = *existing.begin();
     if (!std::holds_alternative<nix::NixStringContextElem::Opaque>(e.raw) &&
         !std::holds_alternative<nix::NixStringContextElem::DrvDeep>(e.raw))
-        throw std::runtime_error("v3 addDrvOutputDependencies: context entry is not a single drv path");
+        throw std::runtime_error(
+            "context entry of string '" + std::string(args[0].payload.str)
+            + "' is not a derivation path");
     nix::NixStringContext ctx;
     if (auto * o = std::get_if<nix::NixStringContextElem::Opaque>(&e.raw)) {
         // Opaque entries are also rejected if they don't end in .drv —
         // tree-walker requires the path be a derivation.
         if (!o->path.name().ends_with(".drv"))
-            throw std::runtime_error("v3 addDrvOutputDependencies: context entry is not a derivation path");
+            throw std::runtime_error(
+                "context entry of string '" + std::string(args[0].payload.str)
+                + "' is not a derivation path");
         ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{.drvPath = o->path}});
     } else {
         ctx.insert(e);
@@ -2600,7 +2614,79 @@ void primPathExists(EvalState & state, Value * args, Value & out)
     std::string s;
     if (args[0].isString()) s = args[0].payload.str;
     else if (args[0].isPath()) s = args[0].payload.path;
-    else typeError("pathExists", "string or path");
+    else {
+        // #692 — TW (libexpr/primops.cc:prim_pathExists) uses
+        // `state.coerceToString(..., coerceMore=false, copyToStore=false)`
+        // which produces `cannot coerce <type> to a string: <value>`
+        // for non-string/non-path args.  Mirror that exact text by
+        // delegating to the shared valueRepr-style format.
+        const char * art = "a"; const char * name = "value";
+        Tag t = args[0].tag();
+        if (t == Tag::Int)        { art = "an"; name = "integer"; }
+        else if (t == Tag::Float) { art = "a";  name = "float"; }
+        else if (t == Tag::Bool)  { art = "a";  name = "Boolean"; }
+        else if (t == Tag::Null)  { art = "";   name = "null"; }
+        else if (t == Tag::List)  { art = "a";  name = "list"; }
+        else if (t == Tag::Attrs) { art = "a";  name = "set"; }
+        else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+                                  { art = "a";  name = "function"; }
+        // Render the value using a small inline helper that mirrors
+        // TW's `ValuePrinter(state, v, errorPrintOptions)` for the
+        // common cases (small attrsets/lists rendered fully; large
+        // ones truncated).  Matches vm.cc:valueRepr behavior.
+        auto val = [&](const Value & v) -> std::string {
+            Tag tt = v.tag();
+            if (tt == Tag::Int)   return std::to_string(v.payload.i);
+            if (tt == Tag::Float) { std::ostringstream os; os << v.payload.f; return os.str(); }
+            if (tt == Tag::Bool)  return v.payload.i == 1 ? "true" : "false";
+            if (tt == Tag::Null)  return "null";
+            if (tt == Tag::List) {
+                if (!v.payload.list || v.payload.list->size == 0) return "[ ]";
+                // Truncated for brevity at one-level (no recursion to
+                // avoid pulling in vm.cc's valueRepr).
+                return "[ ... ]";
+            }
+            if (tt == Tag::Attrs) {
+                if (!v.payload.bindings || v.payload.bindings->size == 0) return "{ }";
+                // Render small attrsets fully matching TW.
+                auto * b = v.payload.bindings;
+                const auto & symTab = ir::globalSymbolTable();
+                std::string out = "{ ";
+                uint32_t n = b->size;
+                uint32_t lim = n > 10 ? 10 : n;
+                for (uint32_t i = 0; i < lim; ++i) {
+                    uint32_t nameIdx = b->entries[i].name;
+                    std::string nm = (nameIdx < symTab.size())
+                        ? symTab[nameIdx] : std::string("<sym?>");
+                    out += nm;
+                    out += " = ";
+                    // One-level only — leaf scalars rendered; deeper
+                    // containers truncated to keep error message tight.
+                    const Value & e = b->entries[i].value;
+                    if (e.isInt())   out += std::to_string(e.payload.i);
+                    else if (e.isString() && e.payload.str) {
+                        out += "\""; out += e.payload.str; out += "\"";
+                    }
+                    else if (e.isBool()) out += e.payload.i == 1 ? "true" : "false";
+                    else if (e.isNull()) out += "null";
+                    else if (e.isList())  out += "[ ... ]";
+                    else if (e.isAttrs()) out += "{ ... }";
+                    else                  out += "<...>";
+                    out += "; ";
+                }
+                if (n > lim) out += "...; ";
+                out += "}";
+                return out;
+            }
+            return "<value>";
+        }(args[0]);
+        std::string msg = "cannot coerce ";
+        if (*art) { msg += art; msg += ' '; }
+        msg += name;
+        msg += " to a string: ";
+        msg += val;
+        throw std::runtime_error(msg);
+    }
 
     // REVIEW §1.7: route through nix::EvalState::realisePath when a TW
     // EvalState is available so pure-eval / restricted-eval modes can
@@ -3075,7 +3161,8 @@ void primReadFile(EvalState & state, Value * args, Value & out)
             // through to plain ifstream so the error message matches
             // the v3 standalone behaviour.
             std::ifstream f(path);
-            if (!f) throw std::runtime_error("v3 primop readFile: cannot open " + path);
+            // #692 — match TW phrasing (libexpr/primops.cc readFile).
+            if (!f) throw std::runtime_error("path '" + path + "' does not exist");
             std::stringstream ss;
             ss << f.rdbuf();
             content = ss.str();
@@ -3115,6 +3202,11 @@ void primReadDir(EvalState & state, Value * args, Value & out)
     else if (args[0].isPath()) path = args[0].payload.path;
     else typeError("readDir", "string or path");
     std::vector<std::pair<SymbolId, Value>> entries;
+    // #692 — match TW phrasing for missing paths (libexpr/primops.cc:
+    // readDir).  std::filesystem::directory_iterator throws a verbose
+    // libc++ error; mirror TW's `path 'X' does not exist`.
+    if (!std::filesystem::exists(path))
+        throw std::runtime_error("path '" + path + "' does not exist");
     for (auto & ent : std::filesystem::directory_iterator(path)) {
         std::string name = ent.path().filename().string();
         // is_symlink must be checked first: is_directory()/is_regular_file()
@@ -7355,7 +7447,8 @@ void primFromTOML(EvalState & state, Value * args, Value & out)
     try {
         out = tomlToValue(state, toml::parse(stream, "fromTOML"));
     } catch (std::exception & e) {
-        throw std::runtime_error(std::string("v3 primop fromTOML: ") + e.what());
+        // #692 — match TW phrasing (libexpr/primops.cc:fromTOML).
+        throw std::runtime_error(std::string("while parsing TOML: ") + e.what());
     }
 }
 
