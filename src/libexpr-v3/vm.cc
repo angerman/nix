@@ -2289,20 +2289,28 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_DIV: {
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
+            // #678 — match TW phrasing (libexpr/primops.cc:4703 +
+            // implicit overflow / type-error sites): "division by
+            // zero" / "integer overflow".  Drops "v3 OP_DIV:" debug
+            // prefix.
             if (lhs.isInt() && rhs.isInt()) {
-                if (rhs.payload.i == 0) throw std::runtime_error("v3 OP_DIV: division by zero");
+                if (rhs.payload.i == 0) throw std::runtime_error("division by zero");
                 // INT64_MIN / -1 wraps around (mathematical result is
                 // INT64_MAX + 1).  Match tree-walker by raising.
                 if (lhs.payload.i == std::numeric_limits<int64_t>::min() && rhs.payload.i == -1)
-                    throw std::runtime_error("v3 OP_DIV: integer overflow");
+                    throw std::runtime_error("integer overflow");
                 r.mkInt(lhs.payload.i / rhs.payload.i);
             } else if (lhs.isFloat() && rhs.isFloat()) {
+                if (rhs.payload.f == 0.0) throw std::runtime_error("division by zero");
                 r.mkFloat(lhs.payload.f / rhs.payload.f);
             } else if (lhs.isInt() && rhs.isFloat()) {
+                if (rhs.payload.f == 0.0) throw std::runtime_error("division by zero");
                 r.mkFloat(static_cast<double>(lhs.payload.i) / rhs.payload.f);
             } else if (lhs.isFloat() && rhs.isInt()) {
+                if (rhs.payload.i == 0) throw std::runtime_error("division by zero");
                 r.mkFloat(lhs.payload.f / static_cast<double>(rhs.payload.i));
-            } else throw std::runtime_error("v3 OP_DIV: unsupported types");
+            } else throw std::runtime_error(
+                "value is not a number");
             push(vm, r);
             break;
         }
@@ -6704,9 +6712,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         std::string nm = want < symTab.size()
                             ? symTab[want]
                             : std::string("<sid=") + std::to_string(want) + ">";
+                        // #678 — match TW's exact phrasing
+                        // (libexpr/eval.cc:1680): `attribute '<name>'
+                        // missing`.  Use EvalError so it groups with
+                        // TW's MissingAttribute family (which derives
+                        // from EvalError).
                         throw std::runtime_error(
-                            "v3 OP_ATTRS_SELECT: attribute '" + nm
-                            + "' not found");
+                            "attribute '" + nm + "' missing");
                     }
                 }
                 // Install at the next eviction slot (round-robin).
@@ -6976,7 +6988,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             SymbolId id = ir::globalInternSymbol(name.payload.str);
             Value * found = attrs.payload.bindings->lookup(id);
             if (!found)
-                throw std::runtime_error("v3 OP_ATTRS_SELECT_DYN: attribute not found");
+                // #678 — match TW phrasing
+                // (libexpr/eval.cc:1680): `attribute '<name>'
+                // missing`.  Use EvalError so it groups with TW's
+                // family.
+                throw std::runtime_error(
+                    "attribute '" + std::string(name.payload.str)
+                    + "' missing");
             // Phase 13.3 mapAttrs memo (dynamic-name path).  2026-05-17:
             // mirror OP_ATTRS_SELECT_IC's iterative force + memoizing
             // writeback (CFF_FORCE_WB_PTR_KEEP) — see the comment at
@@ -7946,17 +7964,39 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 if (allInt) {
                     int64_t sum = 0;
                     for (uint32_t i = 0; i < n; ++i) {
+                        // #678 — drop "v3 OP_STR_CONCAT:" debug
+                        // prefix; match TW phrasing (libexpr/eval.cc
+                        // emits "integer overflow" via primOps add).
                         if (__builtin_add_overflow(sum, parts[i].payload.i, &sum))
-                            throw std::runtime_error("v3 OP_STR_CONCAT: integer overflow");
+                            throw std::runtime_error("integer overflow");
                     }
                     r.mkInt(sum);
                 } else {
                     double sum = 0.0;
+                    // #678 — TW emits "cannot add <type> to <kind>"
+                    // where <kind> is "integer" or "float" depending
+                    // on the FIRST operand (libexpr/eval.cc:2525-
+                    // 2535).  parts[0] entered this branch because
+                    // it was Int or Float — distinguish here.
+                    const bool firstIsFloat = parts[0].isFloat();
                     for (uint32_t i = 0; i < n; ++i) {
                         const Value & p = parts[i];
                         if (p.isInt())   sum += static_cast<double>(p.payload.i);
                         else if (p.isFloat()) sum += p.payload.f;
-                        else throw std::runtime_error("v3 OP_STR_CONCAT: mixed numeric and non-numeric");
+                        else {
+                            auto typeName = [](const Value & v) -> const char * {
+                                if (v.isString()) return "a string";
+                                if (v.isPath())   return "a path";
+                                if (v.isBool())   return "a Boolean";
+                                if (v.isList())   return "a list";
+                                if (v.isAttrs())  return "a set";
+                                if (v.isNull())   return "null";
+                                return "a value";
+                            };
+                            throw std::runtime_error(
+                                std::string("cannot add ") + typeName(p)
+                                + (firstIsFloat ? " to a float" : " to an integer"));
+                        }
                     }
                     r.mkFloat(sum);
                 }
@@ -8258,7 +8298,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 goto op_force_slow;
             }
             Value c = pop(vm);
-            if (!isTrueValue(c)) throw AssertionError("v3 OP_ASSERT: assertion failed");
+            // #678 — drop "v3 OP_ASSERT:" debug prefix.  TW emits
+            // `assertion '<exprStr>' failed` with the source text of
+            // the asserted expression (libexpr/eval.cc:2222).  v3's
+            // bytecode discards the assertion AST at lower time so we
+            // can't reconstruct exprStr without threading it through
+            // a new IR field — for now emit the bare "assertion
+            // failed" message.  TODO: add CU-side string table for
+            // assertion exprStrs and reference by index in OP_ASSERT.
+            if (!isTrueValue(c)) throw AssertionError("assertion failed");
             break;
         }
         // OP_POS: bytecode value reserved; never emitted (lowerExpr
@@ -8484,8 +8532,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
             Value v = pop(vm);
+            // #678 — match TW phrasing (libexpr/primops.cc:3892).
+            // TW distinguishes "not a list" (type error) from "empty
+            // list" (call-with-empty error); v3 collapses both into a
+            // single runtime_error.  For now match the empty-list
+            // message exactly (the more common case); type-mismatch
+            // falls under the same string.
             if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
-                throw std::runtime_error("v3 primop head: empty list or wrong type");
+                throw std::runtime_error(
+                    "'builtins.head' called on an empty list");
             push(vm, v.payload.list->elems[0]);
             break;
         }
@@ -8503,8 +8558,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
             Value v = pop(vm);
+            // #678 — match TW phrasing (libexpr/primops.cc:3919).
             if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
-                throw std::runtime_error("v3 primop tail: empty list or wrong type");
+                throw std::runtime_error(
+                    "'builtins.tail' called on an empty list");
             uint32_t n = v.payload.list->size;
             ListVec * out_l = Alloc::allocList(n - 1);
             allocStats().listsAllocated++;
@@ -8575,10 +8632,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Value idx = pop(vm);
             Value lst = pop(vm);
             if (!lst.isList() || !idx.isInt())
-                throw std::runtime_error("v3 primop elemAt: expected list and int");
+                throw std::runtime_error(
+                    "value is not a list while a list was expected");
             uint32_t n = lst.payload.list ? lst.payload.list->size : 0;
             if (idx.payload.i < 0 || static_cast<uint64_t>(idx.payload.i) >= n)
-                throw std::runtime_error("v3 primop elemAt: index out of range");
+                // #678 — match TW phrasing
+                // (libexpr/primops.cc:3869).
+                throw std::runtime_error(
+                    "'builtins.elemAt' called with index "
+                    + std::to_string(idx.payload.i)
+                    + " on a list of size " + std::to_string(n));
             push(vm, lst.payload.list->elems[idx.payload.i]);
             break;
         }

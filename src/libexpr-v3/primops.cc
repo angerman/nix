@@ -521,16 +521,18 @@ void primLength(EvalState &, Value * args, Value & out)
 void primHead(EvalState &, Value * args, Value & out)
 {
     const Value & v = args[0];
+    // #678 — match TW phrasing (libexpr/primops.cc:3892).
     if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
-        throw std::runtime_error("v3 primop head: empty list or wrong type");
+        throw std::runtime_error("'builtins.head' called on an empty list");
     out = v.payload.list->elems[0];
 }
 
 void primTail(EvalState &, Value * args, Value & out)
 {
     const Value & v = args[0];
+    // #678 — match TW phrasing (libexpr/primops.cc:3919).
     if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
-        throw std::runtime_error("v3 primop tail: empty list or wrong type");
+        throw std::runtime_error("'builtins.tail' called on an empty list");
     uint32_t n = v.payload.list->size;
     ListVec * out_l = Alloc::allocList(n - 1);
     allocStats().listsAllocated++;
@@ -546,8 +548,12 @@ void primElemAt(EvalState &, Value * args, Value & out)
     const Value & idx = args[1];
     if (!lst.isList() || !idx.isInt()) typeError("elemAt", "list and int");
     uint32_t n = lst.payload.list ? lst.payload.list->size : 0;
+    // #678 — match TW phrasing (libexpr/primops.cc:3869).
     if (idx.payload.i < 0 || static_cast<uint64_t>(idx.payload.i) >= n)
-        throw std::runtime_error("v3 primop elemAt: index out of range");
+        throw std::runtime_error(
+            "'builtins.elemAt' called with index "
+            + std::to_string(idx.payload.i)
+            + " on a list of size " + std::to_string(n));
     out = lst.payload.list->elems[idx.payload.i];
 }
 
@@ -1722,9 +1728,13 @@ void primGetAttr(EvalState & state, Value * args, Value & out)
     if (!args[1].isAttrs())  typeError("getAttr", "attrset");
     SymbolId k = vmIntern(state, args[0].payload.str);
     auto * b = args[1].payload.bindings;
-    if (!b) throw std::runtime_error("v3 primop getAttr: attribute not found");
+    // #678 — match TW's `attribute '<name>' missing`
+    // (libexpr/eval.cc:2766) instead of v3-specific phrasing.
+    if (!b) throw std::runtime_error(
+        "attribute '" + std::string(args[0].payload.str) + "' missing");
     const Value * v = b->lookup(k);
-    if (!v) throw std::runtime_error("v3 primop getAttr: attribute not found");
+    if (!v) throw std::runtime_error(
+        "attribute '" + std::string(args[0].payload.str) + "' missing");
     out = *v;
 }
 
