@@ -9415,6 +9415,17 @@ void primFetchGit    (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("f
 void primFetchMercurial(EvalState & s, Value * a, Value & o){ bridgeBuiltin<1>("fetchMercurial", s, a, o); }
 void primFetchClosure(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchClosure", s, a, o); }
 void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("filterSource", s, a, o); }
+// Path B M3: getFlake is registered into TW via evalSettings.extraPrimOps
+// (libflake/settings.cc:14).  bridgeBuiltin resolves it by name from
+// TW's builtins attrset at call time — so the lazy registration order
+// (libflake settings → TW state init → v3 startup → first call) works
+// out as long as the experimental-features gate is on (otherwise TW
+// throws on access, which the bridge propagates verbatim).
+//
+// Note: primParseFlakeRef and primFlakeRefToString are already
+// implemented natively in v3 above (lines 7319 / 7380); only getFlake
+// needs the TW bridge here.
+void primGetFlake     (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("getFlake",     s, a, o); }
 
 void registerPrimOp(const PrimOp & op)
 {
@@ -9625,6 +9636,14 @@ void registerBuiltinPrimOps()
         // WC-28c: filterSource (delegate too).
         registerPrimOp({"filterSource",       2, primFilterSource});
         registerPrimOp({"__filterSource",     2, primFilterSource});
+        // Path B M3 (2026-05-20): getFlake primop.  Registered into TW
+        // via libflake's evalSettings.extraPrimOps; bridge through to
+        // TW so v3-direct can resolve `builtins.getFlake` for cardano-
+        // node-class flake-driven workloads.  Experimental-feature
+        // gate (Xp::Flakes) enforced TW-side.  parseFlakeRef /
+        // flakeRefToString are already native v3 (see lines 7319/7380).
+        registerPrimOp({"getFlake",           1, primGetFlake});
+        registerPrimOp({"__getFlake",         1, primGetFlake});
 
         // EVAL-COMP §4.5 / #414: register `__`-prefixed aliases for
         // every primop whose un-prefixed form is already in v3's
