@@ -1924,6 +1924,21 @@ void primUnsafeGetAttrPos(EvalState & state, Value * args, Value & out)
     uint32_t handle = lookupAttrPos(args[1].payload.bindings, nameId);
     const PosSnapshot * snap = resolvePosSnapshot(handle);
     if (!snap) { out.mkNull(); return; }
+    // TW behavior (libexpr/eval.cc:1007 mkPos): return null when the
+    // position's origin is NOT a SourcePath — synthetic sources like
+    // `<string>` (used by `nix eval --expr`), `<stdin>`, or `<unknown>`
+    // are not user-visible file paths and shouldn't surface as a
+    // `{ file = "<string>"; line; column }` attrset.  v3 stores the
+    // synthetic markers as literal strings in PosSnapshot::file; check
+    // for them here to match TW's null-on-non-SourcePath behavior.
+    if (snap->file.empty()
+        || snap->file == "<string>"
+        || snap->file == "<stdin>"
+        || snap->file == "<unknown>")
+    {
+        out.mkNull();
+        return;
+    }
     SymbolId sFile   = vmIntern(state, "file");
     SymbolId sLine   = vmIntern(state, "line");
     SymbolId sColumn = vmIntern(state, "column");

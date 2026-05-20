@@ -328,6 +328,42 @@ static bool tryGetDerivationDrvPath(const Value & v,
     return true;
 }
 
+/// Emit TW's `«lambda <name>? @ <file>:<line>:<col>»` token.  `nameHint`
+/// is used when the closure's `desc->contextualName` is empty (which
+/// happens for dynamic-attr names — TW's parser only setName's static
+/// attr/let bindings at compile time, while dynamic attrs like
+/// `{ ${name} = f: ...; }` get setName at runtime via eval.cc:1566.
+/// V3 doesn't propagate that runtime mutation to the LambdaDescriptor,
+/// so we accept the printing context's attr-name as a hint.
+static void printClosureToken(std::ostream & out, const Closure * c,
+                              std::string_view nameHint)
+{
+    out << "«lambda";
+    if (c && c->desc) {
+        if (!c->desc->contextualName.empty()) {
+            out << ' ' << c->desc->contextualName;
+        } else if (!nameHint.empty()) {
+            out << ' ' << nameHint;
+        }
+        if (auto * ps = resolvePosSnapshot(c->desc->posHandle)) {
+            out << " @ ";
+            if (ps->file.empty()) {
+                out << "«string»";
+            } else if (ps->file == "<string>") {
+                out << "«string»";
+            } else if (ps->file == "<stdin>") {
+                out << "«stdin»";
+            } else if (ps->file == "<unknown>") {
+                out << "«none»";
+            } else {
+                out << ps->file;
+            }
+            out << ':' << ps->line << ':' << ps->column;
+        }
+    }
+    out << "»";
+}
+
 void printNixValueRich(std::ostream & out, const Value & v,
                        const std::vector<std::string> & symTab,
                        std::set<const void *> & seen)
@@ -390,39 +426,12 @@ void printNixValueRich(std::ostream & out, const Value & v,
         return;
     }
     case Tag::Closure: {
-        // TW format: «lambda <name>? @ <file>:<line>:<col>».
-        // - Name: print `desc->contextualName` (set by lower.cc from
-        //   `ExprLambda::name`, which TW's parser populates via
-        //   `setName` for let/attr-bound lambdas).  Empty for
-        //   anonymous lambdas, which TW also prints without a name.
-        //   The arg-name in `desc->name` is the diagnostic fallback
-        //   (V3_DBG_* dumps) — never emitted in user-facing output.
-        // - File: lower.cc emits `<string>` / `<stdin>` / `<unknown>`
-        //   for the synthesized source markers; TW emits the French-
-        //   quoted forms `«string»` / `«stdin»`.  Rewrite at print time.
-        out << "«lambda";
-        const auto * c = v.payload.closure;
-        if (c && c->desc) {
-            if (!c->desc->contextualName.empty()) {
-                out << ' ' << c->desc->contextualName;
-            }
-            if (auto * ps = resolvePosSnapshot(c->desc->posHandle)) {
-                out << " @ ";
-                if (ps->file.empty()) {
-                    out << "«string»";
-                } else if (ps->file == "<string>") {
-                    out << "«string»";
-                } else if (ps->file == "<stdin>") {
-                    out << "«stdin»";
-                } else if (ps->file == "<unknown>") {
-                    out << "«none»";
-                } else {
-                    out << ps->file;
-                }
-                out << ':' << ps->line << ':' << ps->column;
-            }
-        }
-        out << "»";
+        // TW format: «lambda <name>? @ <file>:<line>:<col>».  The
+        // dispatch is factored into `printClosureToken` so the lazy
+        // overload can pass an attr-name hint for dynamic-attr-bound
+        // lambdas (where `desc->contextualName` is empty at compile
+        // time but TW assigns the name at runtime).
+        printClosureToken(out, v.payload.closure, std::string_view{});
         return;
     }
     case Tag::PrimOp: {
@@ -600,6 +609,16 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
                 printNixValueRich(out, vm, *val, symTab, seen);
                 out << "; ";
             }
+            // KNOWN LIMITATION: dynamic-attr-bound lambdas like `{ ${n}
+            // = f: ...; }` print without a name because TW's runtime
+            // name assignment (eval.cc:1566 `i.valueExpr->setName`) is
+            // a TW AST mutation that doesn't translate cleanly to v3
+            // bytecode.  Using the attr-name as a printer hint was
+            // tried and rejected — it over-applies for var-bound
+            // attrs like `{ __unfix__ = f; }` (fix' in nixpkgs).
+            // A correct fix needs per-Closure runtime-name storage,
+            // updated by an emit-time-detected dynamic-attr-inline-
+            // lambda path.  Tracked as future work.
         }
         out << "}";
         return;
