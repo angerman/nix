@@ -3012,7 +3012,22 @@ struct Lowerer
         // remain unhandled here — they have lifetime issues (the
         // slot's storage is reused after the surrounding frame
         // returns) and would dangle when sub-thunks escape.
-        ir::VarId attrs = lowerExpr(e->attrs);
+        // #686 — TW evaluates the with-arg lazily via `maybeThunk`
+        // (libexpr/eval.cc evalLazily): only forced when OP_WITH_LOOKUP
+        // first scans an entry.  Pre-fix v3 eagerly evaluated the
+        // expression here, so `with (throw "x"); 1` threw even though
+        // the body never referenced the with-scope (TW returns 1).
+        //
+        // Use thunkifyForArg semantics: leaves trivial cases
+        // (ExprVar / literals) as eager (they're cheap to evaluate
+        // and can't throw on evaluation); thunks anything that could
+        // throw or have side effects, e.g. `(throw _)`, `(if _)`,
+        // a function call, etc.
+        //
+        // The rec-attrset slot-ref path below overrides this `attrs`
+        // VarId entirely (emit.cc:1300 uses recAttrsVar when set), so
+        // the thunkify here only affects the fallback (non-rec) path.
+        ir::VarId attrs = thunkifyForArg(e->attrs);
         ir::VarId withRecAttrsVar = ir::kInvalid;
         ir::SymbolId withRecAttrsName = ir::kInvalidSymbol;
         if (auto * ev = dynamic_cast<nix::ExprVar *>(e->attrs)) {

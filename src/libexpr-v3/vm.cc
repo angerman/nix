@@ -1473,8 +1473,10 @@ inline Value withLookup(VMState & vm, SymbolId name)
             }
         }
     }
-    throw std::runtime_error(
-        "v3 OP_WITH_LOOKUP: name '" + nm + "' not found in with-scope");
+    // #686 — match TW's `undefined variable '<name>'` phrasing
+    // (libexpr/eval-error.cc).  Drops the "v3 OP_WITH_LOOKUP:" debug
+    // prefix.
+    throw std::runtime_error("undefined variable '" + nm + "'");
 }
 
 /// Snapshot the current frame's visible with-stack (entries from
