@@ -84,35 +84,69 @@ Status quantified this session:
   correct, but heavy workloads hit at least one more tenured-to-nursery
   missed-root path.
 
-**Two missed roots fixed this session** (`d835f2dc9`):
+**Four missed roots fixed across two sessions** (`d835f2dc9`, `dca4c3861`):
 
 1. `LambdaDescriptor::cachedSingletonClosure` — tenured field that held
    a Closure* pointing into the nursery via `Alloc::allocClosure(0)`.
-   The cached singleton survived scavenge as a dangling pointer.
    Fix: added `Alloc::allocClosureTenured()` and routed the singleton
    site through it.
 
 2. `v3BridgeClosures` / `v3BridgeAttrs` / `v3BridgeLists` (primops.cc)
    — thread-local vectors of v3 Values keyed by handle.  Their payload
    pointers (Closure / Bindings / ListVec) were nursery-routed but
-   never walked by the scavenger.  Fix: added `walkV3BridgeRoots()`
-   in primops.cc and a call from `Scavenger::run()`.
+   never walked by the scavenger.  Fix: added `walkV3BridgeRoots()`.
 
-**At least one more missed root remains** — hello.drvPath still SIGSEGVs
-in `forceValue` on a stale Thunk pointer after both fixes.  Per the
-lldb backtrace the stale thunk is read inside the chase loop; could be
-either:
-  - another tenured cache holding a Thunk* (analogous to fix 1)
-  - a Tag::Slot cell stored in some non-walked location
-  - an as-yet-undiscovered missed root
+3. `primopReplacementMap` (bytecode_primops.cc) — static map keyed by
+   `const PrimOp *`; Values may contain nursery Closure pointers
+   (bytecode-primop compile path stores closures, can be nursery).
+   Fix: added `walkBytecodePrimopRoots()`.
 
-Audit work needed: grep every `static thread_local *` and every
-`mutable Closure*/Thunk*/ListVec*/Bindings*` field on a tenured
-struct, route each through tenured allocator or add a scavenge
-root walker for it.  Per `NURSERY_PHASE_D_DESIGN_2026-05-18.md`,
-a proper write-barrier-based approach would be more robust than
-chase-the-roots; estimated 5-7 days for the design's "card-table"
-shape.
+4. `vBuiltins` (vm.cc) — process-wide singleton; bytecode-primop
+   install path patches Bindings entries in place to fresh-compiled
+   closures, which may be nursery.  Fix: extracted to file-static
+   with init flag + `peekBuiltinsValue()` accessor; added
+   `walkBuiltinsRoot()`.
+
+**Additional scavenger correctness improvement**: Bridge/Blackhole
+thunks with non-null cells now get walked (the old `return t` early
+in `fwdThunk` missed the cell walk; the cell may carry a nursery
+payload).
+
+**Diagnostic infrastructure** (`dca4c3861`):
+- `V3_DBG_NURSERY_AUDIT=1` — post-scavenge deep audit walking the
+  whole reachable graph; asserts no nursery pointer survives.
+- `NIX_V3_NURSERY_NO_RESET=1` — skip the memset of reclaimed nursery
+  for diagnostic isolation.
+- `forceValue` null-desc check — when `t->suspended.desc` is null
+  (the smoking-gun signature of a memset stale thunk), dump frame
+  stack + valueStack non-zero entries + chase predecessors and abort.
+
+**Status after fixes**:
+- 143/143 lang tests pass with scavenge + 1 MB nursery (aggressive)
+- All 7 v3 test suites pass with scavenge
+- hello.drvPath STILL SIGSEGVs — confirmed via diagnostic that:
+  - The stale Thunk's chain length (compressChain) is 0 — first
+    iteration's t is stale
+  - Audit AFTER scavenge confirms direct roots clean (no nursery
+    pointers reachable from valueStack/withStack/frames + the 4
+    extra root walkers)
+  - The stale pointer must come from somewhere outside this set
+  - All-zero state (state=0 + desc=null) confirms memset-after-
+    scavenge survivor (not an uninitialized fresh allocation)
+
+**Open: the missing root**
+This remains the unresolved blocker for Stage 3 default-on.  Given
+audit confirms clean direct roots, the stale must enter via one of:
+  - A post-scavenge mutation that reads from a non-walked container
+  - An in-flight C-stack helper (inner dispatchLoop) holds a local
+    Value that becomes reachable when it returns
+  - A static cache I haven't yet identified
+
+Next-session approach: extend the audit to fire periodically during
+dispatch (e.g. every 1024 iterations) so we catch the moment a stale
+pointer becomes reachable.  Or: implement Phase D write barriers per
+`NURSERY_PHASE_D_DESIGN_2026-05-18.md` to eliminate the chase-the-
+roots fragility entirely (5-7 days for the card-table shape).
 
 The SIGSEGV is the Phase D necessity — intergenerational pointers (a
 tenured object holding a nursery pointer that gets copied on scavenge) need
