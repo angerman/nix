@@ -347,7 +347,19 @@ void computeFreeVars(Module & m)
     // it can change either — so we only need to re-compute parents
     // of functions that DID change.  Build a reverse-deps map once,
     // then iterate by working set.
-    constexpr int kMaxIters = 16;
+    // #690 — raised from 16 to 256.  The free-var lattice is monotone
+    // (a function's freeVars set only grows across iterations, bounded
+    // by the number of distinct VarIds in the program), so termination
+    // is guaranteed; kMaxIters is purely an infinite-loop safety net.
+    //
+    // Empirical: NixOS module-system evaluation
+    // (`config.system.build.toplevel.drvPath`) hit the old 16 limit
+    // because the deeply-recursive module fix-point chain
+    // (lib.evalModules → modules.nix:fix-point → submodule config
+    //  → mkOption types → ...) accumulates free-var dependencies
+    // across many lambda nesting levels.  256 gives 16× headroom; in
+    // practice all real workloads converge in <50 iterations.
+    constexpr int kMaxIters = 256;
     bool converged = false;
     const size_t nFuncs = m.functions.size();
 
