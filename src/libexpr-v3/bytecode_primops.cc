@@ -788,7 +788,8 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "    in "
                 "      builtins.__derivationFromPreprocessed preprocessed";
 
-            installBytecodePrimop(state, "derivationStrict", full_wrapper);
+            if (!std::getenv("NIX_V3_NO_BC_DERIV_STRICT"))
+                installBytecodePrimop(state, "derivationStrict", full_wrapper);
 
             // Also wrap `derivation` so user-facing `derivation { ... }`
             // routes through MY bytecode wrapper.  Without this, the C
@@ -832,7 +833,8 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "      all = builtins.map perOutput outputsList; "
                 "    } // perOutputAttrs";
 
-            installBytecodePrimop(state, "derivation", derivation_wrapper);
+            if (!std::getenv("NIX_V3_NO_BC_DERIV_TOPLEVEL"))
+                installBytecodePrimop(state, "derivation", derivation_wrapper);
         }
     } catch (...) {
         // Reset `done` so a future call retries — otherwise a
