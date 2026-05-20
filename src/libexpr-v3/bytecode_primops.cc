@@ -176,26 +176,57 @@ void installBytecodePrimop(
 
     // Install path 1: mutate the Value in TW's builtins attrset so
     // TW-side dispatch (and any code reading TW's baseEnv) sees the
-    // bytecode closure.  Both `state.getBuiltins().attrs()->get(sym)
-    // ->value` and `state.baseEnv.values[displ]` point to the same
-    // Value* (per `addPrimOp` in libexpr/eval.cc:580-589), so this
-    // single mutation propagates to all TW lookup paths.
+    // bytecode closure.
     //
-    // 2026-05-18: try/catch — some primops are registered only in v3
-    // (e.g. __foldlMap from IR Phase C).  getBuiltin throws on
-    // missing names.  Falling through to path 2 + path 3 still
-    // installs the v3-side replacement, which is all we need for
-    // v3-direct evaluation.
-    try {
-        nix::Value & target = state.getBuiltin(primopName);
-        target = *bridged;
-    } catch (const std::exception & e) {
-        if (dbgEnabled())
-            std::fprintf(stderr,
-                "v3 bytecode-primop install: '%s' not in TW builtins "
-                "(%s) — skipping path 1, continuing with v3-side install\n",
-                primopName.c_str(), e.what());
+    // 2026-05-20 #697 RCA — Path 1 caused a 16× slowdown on
+    // cardano-node `builtins.getFlake`.  When the bridge enters TW's
+    // `prim_getFlake` → `callFlake` → `call-flake.nix`, TW's evaluator
+    // runs Nix code that calls `builtins.foldl'`, `builtins.filter`,
+    // etc.  Pre-#697 those builtins-attr lookups returned the v3
+    // bridge wrapper (because Path 1 had mutated them), so each call
+    // bounced TW → v3 wrapper → TW (forcing each `op`-arg lambda) →
+    // v3 → TW — N times per list element.  On cardano-node's heavy
+    // callFlake (lots of attrset merging, listToAttrs, foldl'), the
+    // ping-pong dominated wall time.
+    //
+    // **Fix**: skip Path 1 by default.  TW's builtins.X stays the
+    // original C primop, so TW's internal evaluations (callFlake,
+    // imported .nix files) run at TW-native speed.  v3-side dispatch
+    // is unaffected — Path 2 (primopReplacementMap) is what v3's
+    // OP_LIT_PRIMOP / lower.cc consult, and Path 3 patches v3's
+    // vBuiltins for dynamic `with builtins; foldl' ...` patterns.
+    //
+    // **Opt-in restore**: NIX_V3_KEEP_TW_BUILTINS_MUTATION=1 brings
+    // back the pre-#697 behaviour for A/B measurement.  Retirement
+    // criterion: once a regression suite proves no semantic
+    // difference for any workload, drop the gate.
+    //
+    // Measured on cardano-node `(builtins.getFlake X) ? outputs`:
+    //   - TW alone:                    6.77s
+    //   - v3-direct (default, post-#697): ~7.16s
+    //   - v3-direct (default, pre-#697):  >110s (16× slowdown)
+    {
+        static const bool s_keepTWMut =
+            std::getenv("NIX_V3_KEEP_TW_BUILTINS_MUTATION") != nullptr;
+        if (s_keepTWMut) {
+            // 2026-05-18 history: try/catch — some primops are
+            // registered only in v3 (e.g. __foldlMap from IR Phase C).
+            // getBuiltin throws on missing names.  Falling through to
+            // path 2 + path 3 still installs the v3-side replacement,
+            // which is all v3-direct needs.
+            try {
+                nix::Value & target = state.getBuiltin(primopName);
+                target = *bridged;
+            } catch (const std::exception & e) {
+                if (dbgEnabled())
+                    std::fprintf(stderr,
+                        "v3 bytecode-primop install: '%s' not in TW builtins "
+                        "(%s) — skipping path 1, continuing with v3-side install\n",
+                        primopName.c_str(), e.what());
+            }
+        }
     }
+    (void)bridged;  // unused when path 1 is skipped (default post-#697)
 
     // Install path 2: register in v3's side-table keyed by v3 PrimOp
     // pointer.  This is what makes v3's OP_LIT_PRIMOP / OP_CALL_PRIMOP
