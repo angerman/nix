@@ -8975,13 +8975,37 @@ void primToFile(EvalState & state, Value * args, Value & out)
     auto * ns = state.nixEvalState;
     if (!args[0].isString()) typeError("toFile", "string name");
     if (!args[1].isString()) typeError("toFile", "string contents");
+    // #682 — match TW (libexpr/primops.cc:2820-2834): "name" must have
+    // NO context (forceStringNoCtx); "contents" may have context, but
+    // only Opaque (store-path) entries are allowed.  Built/Drv entries
+    // (i.e., derivation references) trigger TW's exact rejection
+    // message because the resulting store-file would shadow a real
+    // derivation's outputs.
+    //
+    // Pre-fix v3 ignored the contents' context entirely → silently
+    // wrote a file with no refs, producing a wrong-hash store path
+    // when the contents contained a derivation interpolation
+    // (`builtins.toFile "x" "${drv}"`).  This produced a different
+    // drvPath than TW would, breaking any downstream derivation that
+    // depended on the toFile output.
+    requireNoStringContext(state, args[0], "toFile name");
     std::string name(args[0].payload.str);
     std::string contents(args[1].payload.str);
-    // For string context tracking: v3 strings can carry context too
-    // (see contextStorage in primops.cc).  For toFile, refs come from
-    // the contents' context — which on the v3 side may be empty if the
-    // string was literal.  Future work: thread v3 context through.
     nix::StorePathSet refs;
+    if (args[1].payload.str) {
+        nix::NixStringContext ctx = lookupStringContext(args[1].payload.str);
+        for (auto & c : ctx) {
+            if (auto p = std::get_if<nix::NixStringContextElem::Opaque>(&c.raw)) {
+                refs.insert(p->path);
+            } else {
+                // Match TW phrasing byte-for-byte
+                // (libexpr/primops.cc:2828).
+                throw std::runtime_error(
+                    "files created by builtins.toFile may not reference derivations, but "
+                    + name + " references " + c.to_string());
+            }
+        }
+    }
     auto storePath = nix::settings.readOnlyMode
         ? ns->store->makeFixedOutputPathFromCA(
             name,
