@@ -45,22 +45,52 @@ run_case() {
   fi
 }
 
+# Positive cases — without these, the always-on arg force (the fix's
+# core change) could silently regress legitimate formals call patterns
+# under workloads that today rely on the laziness.  These verify each
+# shape the validation touches still WORKS for valid args.
+run_pos_case() {
+  local label="$1" expr="$2" expected="$3"
+  local tw v3
+  tw="$("$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
+  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+        NIX_V3_MAX_WALL_TIME=5s "$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
+  if [[ "$tw" == "$v3" && "$tw" == "$expected" ]]; then
+    printf "  POS-OK   %-35s => %s\n" "$label" "$tw"
+    return 0
+  else
+    printf "  POS-FAIL %-35s expected=%s\n    TW: %s\n    V3: %s\n" "$label" "$expected" "$tw" "$v3"
+    return 1
+  fi
+}
+
 fail=0
-# Type-check on non-attrset arg
+# NEGATIVE — type-check on non-attrset arg.
 run_case "ellipsis-int"        '({ ... }: 1) 42'                                  || fail=$((fail+1))
 run_case "ellipsis-string"     '({ ... }: 1) "x"'                                 || fail=$((fail+1))
 run_case "ellipsis-null"       '({ ... }: 1) null'                                || fail=$((fail+1))
 run_case "ellipsis-list"       '({ ... }: 1) [ ]'                                 || fail=$((fail+1))
 run_case "formal-int"          '({ a }: a) 42'                                    || fail=$((fail+1))
-# Missing required argument (with + without lambda name)
+# NEGATIVE — missing required argument (with + without lambda name).
 run_case "missing-anon"        '({ a, b }: a) { a = 1; }'                         || fail=$((fail+1))
 run_case "missing-named"       '(let foo = { a, b }: a; in foo) { a = 1; }'       || fail=$((fail+1))
-# Extra argument (with + without lambda name)
+# NEGATIVE — extra argument (with + without lambda name).
 run_case "extra-anon"          '({ a }: a) { a = 1; b = 2; }'                     || fail=$((fail+1))
 run_case "extra-named"         '(let bar = { a }: a; in bar) { a = 1; b = 2; }'   || fail=$((fail+1))
 
+# POSITIVE — happy path for each shape the validation touches.
+run_pos_case "pos-simple-formals"   '({ a, b }: a + b) { a = 1; b = 2; }'           '3'      || fail=$((fail+1))
+run_pos_case "pos-default-arg"      '({ a, b ? 99 }: b) { a = 1; }'                 '99'     || fail=$((fail+1))
+run_pos_case "pos-default-override" '({ a, b ? 99 }: b) { a = 1; b = 2; }'          '2'      || fail=$((fail+1))
+run_pos_case "pos-ellipsis-empty"   '({ ... }: 42) { }'                             '42'     || fail=$((fail+1))
+run_pos_case "pos-ellipsis-extra"   '({ a, ... }: a) { a = 1; b = 2; c = 3; }'      '1'      || fail=$((fail+1))
+run_pos_case "pos-at-pattern"       '({ a, ... } @ args: args.b) { a = 1; b = 2; }' '2'      || fail=$((fail+1))
+run_pos_case "pos-default-uses-arg" '({ a ? 1, b ? a + 1 }: b) { }'                 '2'      || fail=$((fail+1))
+run_pos_case "pos-thunked-arg"      '({ a, b }: a + b) (let x = { a = 1; b = 2; }; in x)' '3' || fail=$((fail+1))
+run_pos_case "pos-empty-formals"    '({ }: 42) { }'                                 '42'     || fail=$((fail+1))
+
 if [[ "$fail" -eq 0 ]]; then
-  echo "run-681: PASS (9/9 formals-validation shapes match TW)"
+  echo "run-681: PASS (9 negative + 9 positive shapes match TW)"
   exit 0
 else
   echo "run-681: FAIL ($fail divergence(s))"

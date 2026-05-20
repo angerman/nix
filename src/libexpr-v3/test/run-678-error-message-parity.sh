@@ -54,7 +54,27 @@ run_case() {
   fi
 }
 
+# Positive tests — verify the happy-path of each primop/operator still
+# produces the correct value.  The error-class fixes in #678 touched
+# the same throw sites as the success paths; without these positive
+# tests a future change could silently break legitimate use.
+run_pos_case() {
+  local label="$1" expr="$2" expected="$3"
+  local tw v3
+  tw="$("$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
+  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+        NIX_V3_MAX_WALL_TIME=5s "$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
+  if [[ "$tw" == "$v3" && "$tw" == "$expected" ]]; then
+    printf "  POS-OK   %-30s => %s\n" "$label" "$tw"
+    return 0
+  else
+    printf "  POS-FAIL %-30s expected=%s\n    TW: %s\n    V3: %s\n" "$label" "$expected" "$tw" "$v3"
+    return 1
+  fi
+}
+
 fail=0
+# NEGATIVE — error-message text must match TW (modulo trailing value).
 run_case "attr-missing-select" '{ a = 1; }.b'                       || fail=$((fail+1))
 run_case "getAttr-missing"     'builtins.getAttr "x" { }'           || fail=$((fail+1))
 run_case "head-empty"          'builtins.head [ ]'                  || fail=$((fail+1))
@@ -64,8 +84,18 @@ run_case "elemAt-oob-2"        'builtins.elemAt [ 1 2 ] 5'          || fail=$((f
 run_case "div-by-zero-int"     'builtins.div 1 0'                   || fail=$((fail+1))
 run_case "add-str-int"         '1 + "x"'                            || fail=$((fail+1))
 
+# POSITIVE — happy path of each touched primop/operator still works.
+run_pos_case "pos-attr-select"     '{ a = 42; }.a'                  '42' || fail=$((fail+1))
+run_pos_case "pos-getAttr"         'builtins.getAttr "a" { a = 42; }' '42' || fail=$((fail+1))
+run_pos_case "pos-head"            'builtins.head [ 1 2 3 ]'         '1'  || fail=$((fail+1))
+run_pos_case "pos-tail"            'builtins.tail [ 1 2 3 ]'         '[ 2 3 ]' || fail=$((fail+1))
+run_pos_case "pos-elemAt-in-range" 'builtins.elemAt [ 10 20 30 ] 1'  '20' || fail=$((fail+1))
+run_pos_case "pos-div-ok"          'builtins.div 10 2'               '5'  || fail=$((fail+1))
+run_pos_case "pos-add-int"         '1 + 2'                           '3'  || fail=$((fail+1))
+run_pos_case "pos-add-str"         '"a" + "b"'                       '"ab"' || fail=$((fail+1))
+
 if [[ "$fail" -eq 0 ]]; then
-  echo "run-678: PASS (8/8 error-message shapes match TW)"
+  echo "run-678: PASS (8 negative + 8 positive shapes match TW)"
   exit 0
 else
   echo "run-678: FAIL ($fail divergence(s))"

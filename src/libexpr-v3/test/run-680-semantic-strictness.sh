@@ -69,8 +69,23 @@ run_case() {
   fi
 }
 
-# Cases where v3 was SILENTLY producing a value where TW errors — these
-# are semantic-strictness regressions in v3, not just message issues.
+# Positive case — same comparison as run_case but for happy paths.
+run_pos_case() {
+  local label="$1" expr="$2" expected="$3"
+  local tw v3
+  tw="$("$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
+  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+        NIX_V3_MAX_WALL_TIME=5s "$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
+  if [[ "$tw" == "$v3" && "$tw" == "$expected" ]]; then
+    printf "  POS-OK   %-30s => %s\n" "$label" "$tw"
+    return 0
+  else
+    printf "  POS-FAIL %-30s expected=%s\n    TW: %s\n    V3: %s\n" "$label" "$expected" "$tw" "$v3"
+    return 1
+  fi
+}
+
+# NEGATIVE — v3 was SILENTLY producing a value where TW errors.
 fail=0
 run_case "str-plus-int"     '"x" + 1'                       || fail=$((fail+1))
 run_case "null-plus-int"    'null + 1'                      || fail=$((fail+1))
@@ -78,14 +93,30 @@ run_case "interp-int"       '"${1}"'                        || fail=$((fail+1))
 run_case "bool-plus-int"    'true + 1'                      || fail=$((fail+1))
 run_case "null-plus-null"   'null + null'                   || fail=$((fail+1))
 run_case "length-string"    'builtins.length "abc"'         || fail=$((fail+1))
-# Message-only alignments
+# NEGATIVE — message-only alignments.
 run_case "infrec-let-x-x"   'let x = x; in x'               || fail=$((fail+1))
 run_case "compare-null"     'null < null'                   || fail=$((fail+1))
 run_case "compare-mixed"    '"a" < 1'                       || fail=$((fail+1))
 run_case "compare-set"      '{ } < { }'                     || fail=$((fail+1))
 
+# POSITIVE — without these, future changes to coerceToString / `+` /
+# `length` / comparison could silently break valid code.  These verify
+# the touched operators STILL accept the types they should.
+run_pos_case "pos-add-int-int"      '1 + 2'                   '3'         || fail=$((fail+1))
+run_pos_case "pos-add-float-float"  '1.5 + 2.5'               '4'         || fail=$((fail+1))
+run_pos_case "pos-add-int-float"    '1 + 1.5'                 '2.5'       || fail=$((fail+1))
+run_pos_case "pos-add-str-str"      '"a" + "b"'               '"ab"'      || fail=$((fail+1))
+run_pos_case "pos-add-path-path"    '/foo + /bar'             '/foo/bar'  || fail=$((fail+1))
+run_pos_case "pos-interp-str"       '"${"hello"} world"'      '"hello world"' || fail=$((fail+1))
+run_pos_case "pos-interp-toString"  '"x=${toString 1}"'       '"x=1"'     || fail=$((fail+1))
+run_pos_case "pos-length-list"      'builtins.length [ 1 2 3 ]' '3'       || fail=$((fail+1))
+run_pos_case "pos-length-empty"     'builtins.length [ ]'      '0'        || fail=$((fail+1))
+run_pos_case "pos-compare-int"      '1 < 2'                    'true'     || fail=$((fail+1))
+run_pos_case "pos-compare-str"      '"a" < "b"'                'true'     || fail=$((fail+1))
+run_pos_case "pos-compare-list"     '[ 1 ] < [ 2 ]'            'true'     || fail=$((fail+1))
+
 if [[ "$fail" -eq 0 ]]; then
-  echo "run-680: PASS (10/10 semantic-strictness shapes match TW)"
+  echo "run-680: PASS (10 negative + 12 positive shapes match TW)"
   exit 0
 else
   echo "run-680: FAIL ($fail divergence(s))"
