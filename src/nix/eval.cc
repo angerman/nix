@@ -196,9 +196,14 @@ static bool runV3DirectEval(
         std::string_view sv = r.payload.str ? r.payload.str : "";
         std::cout.write(sv.data(), (std::streamsize)sv.size());
     } else if (json) {
-        nix::evalTrace::mark("eval.cc:178 forceDeep(--json)");
-        r = v3::forceDeep(vm, r);
-        std::cout << v3::toJsonValue(r, v3::ir::globalSymbolTable()).dump() << "\n";
+        // #675: toJsonValue now lazy-forces internally + short-circuits
+        // on derivations (outPath / __toString).  Skip the upfront
+        // forceDeep — it would still work but uselessly traverses the
+        // whole graph (TW takes <2s on hello.drvAttrs.src; pre-fix v3
+        // took >3 min and produced 0 bytes due to the missing
+        // short-circuit).
+        nix::evalTrace::mark("eval.cc:178 lazy json");
+        std::cout << v3::toJsonValue(vm, r, v3::ir::globalSymbolTable()).dump() << "\n";
     } else {
         // Default print.  forceDeep so nested thunks render as values.
         // #669: use the TW-style rich printer (`«derivation /path»`,

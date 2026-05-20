@@ -14,6 +14,7 @@
 #include "v3/print.hh"
 #include "v3/alloc.hh"
 #include "v3/closure.hh"  // LambdaDescriptor for printNixValueRich
+#include "v3/ir.hh"      // globalInternSymbol for toJsonValue short-circuit
 #include "v3/primop.hh"  // forceValue, PrimOp
 
 #include <nlohmann/json.hpp>
@@ -53,10 +54,16 @@ Value forceDeep(VMState & vm, Value v)
     return forceDeep(vm, v, seen);
 }
 
-nlohmann::json toJsonValue(const Value & v,
+nlohmann::json toJsonValue(VMState & vm, Value v,
                             const std::vector<std::string> & symTab)
 {
     using json = nlohmann::json;
+    // Force lazily as we serialize.  Mirrors TW's printValueAsJSON in
+    // libexpr/value-to-json.cc which interleaves force + emit instead
+    // of doing a deep-force upfront.  Critical for perf on derivations:
+    // a 50-attr derivation that short-circuits via outPath becomes
+    // O(1) instead of O(transitive-graph).
+    v = forceValue(vm, v);
     switch (v.tag()) {
     case Tag::Null:   return json(nullptr);
     case Tag::Bool:   return json(v.payload.i == 1);
@@ -68,18 +75,55 @@ nlohmann::json toJsonValue(const Value & v,
         json arr = json::array();
         if (v.payload.list)
             for (uint32_t i = 0; i < v.payload.list->size; ++i)
-                arr.push_back(toJsonValue(v.payload.list->elems[i], symTab));
+                arr.push_back(toJsonValue(vm, v.payload.list->elems[i], symTab));
         return arr;
     }
     case Tag::Attrs: {
+        // TW parity (value-to-json.cc:52-58): attrset short-circuits.
+        //
+        //   1) `__toString self` → emit its string result.
+        //   2) `outPath` → emit just outPath (no full attrset emit).
+        //
+        // Without this, a derivation (which has outPath but ~50 other
+        // attrs) renders as a deeply-nested JSON object instead of a
+        // single string.  Pre-fix, `nix eval --impure --json --expr
+        // 'hello.drvAttrs.src'` took >3 minutes and produced 0 bytes
+        // (forceDeep blew through the full nixpkgs graph reachable
+        // from src); TW does it in <2s.  See follow-on memo
+        // project_675_tojson_shortcircuit.
+        if (v.payload.bindings) {
+            static const SymbolId tsId = ir::globalInternSymbol("__toString");
+            if (auto * fn = v.payload.bindings->lookup(tsId)) {
+                Value forced = forceValue(vm, *fn);
+                if (forced.tag() == Tag::Closure
+                    || forced.tag() == Tag::PrimOp
+                    || forced.tag() == Tag::PrimOpApp)
+                {
+                    Value s = callClosure(vm, forced, v);
+                    s = forceValue(vm, s);
+                    if (s.isString())
+                        return json(std::string(s.payload.str));
+                }
+            }
+            static const SymbolId outId = ir::globalInternSymbol("outPath");
+            if (auto * op = v.payload.bindings->lookup(outId)) {
+                return toJsonValue(vm, *op, symTab);
+            }
+        }
         json obj = json::object();
-        if (v.payload.bindings)
+        if (v.payload.bindings) {
             for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
                 auto & en = v.payload.bindings->entries[i];
-                std::string key = (en.name < symTab.size()) ? symTab[en.name] :
-                    std::to_string(en.name);
-                obj[key] = toJsonValue(en.value, symTab);
+                // #670/#671 follow-on: copy key to owning std::string
+                // before recursive toJsonValue — recursion may force
+                // values that intern new symbols, invalidating any
+                // string_view into the global symbol table.
+                std::string key = (en.name < symTab.size())
+                    ? std::string(symTab[en.name])
+                    : std::to_string(en.name);
+                obj[std::move(key)] = toJsonValue(vm, en.value, symTab);
             }
+        }
         return obj;
     }
     case Tag::Closure:

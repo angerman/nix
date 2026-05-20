@@ -88,7 +88,7 @@ void printNixValueRich(std::ostream & out, const Value & v,
 /// `nlohmann::json` is forward-declared in the header to keep the
 /// libnixexprv3 ABI surface light; consumers must include
 /// `<nlohmann/json.hpp>` themselves before using the result.
-nlohmann::json toJsonValue(const Value & v,
+nlohmann::json toJsonValue(VMState & vm, Value v,
                            const std::vector<std::string> & symTab);
 
 } // namespace nix::v3

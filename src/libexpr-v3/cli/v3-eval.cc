@@ -76,11 +76,13 @@ using nix::v3::forceDeep;
 using nix::v3::printNixValue;
 using nix::v3::toJsonValue;
 
-static int printValue(const Value & r, bool jsonOut,
+static int printValue(nix::v3::VMState & vm, Value r, bool jsonOut,
                       const std::vector<std::string> & symTab)
 {
     if (jsonOut) {
-        std::cout << toJsonValue(r, symTab).dump() << "\n";
+        // #675: toJsonValue lazy-forces + short-circuits on derivations
+        // (outPath / __toString).  vm is required.
+        std::cout << toJsonValue(vm, r, symTab).dump() << "\n";
         return 0;
     }
     printNixValue(std::cout, r, symTab);
@@ -382,22 +384,19 @@ int main(int argc, char ** argv)
 
         // For --strict and --json modes we need to force any thunks
         // remaining inside lists/attrsets so the output is concrete.
-        if (jsonOut || strict) {
-            // Use a fresh VMState wrapping the same CU (the result was
-            // produced by run() which created its own VMState — that's
-            // gone by now).  We re-enter dispatchLoop via callClosure /
-            // forceValue, which need a live frame on the VMState.  So
-            // run again with a sentinel: call a no-op closure to give
-            // forceDeep a frame to operate on.
-            //
-            // Simpler approach: construct a fresh VMState and a fake
-            // top-level frame with the CU, then forceDeep.
-            nix::v3::VMState vm;
-            vm.frames.push_back(nix::v3::CallFrame{
-                .cu = &cu, .closure = nullptr, .thunk = nullptr,
-                .ip = cu.entryOffset, .stackBaseOffset = 0,
-                .withStackBase = 0, .flags = 0,
-            });
+        // #675: vm is also needed by toJsonValue for lazy-forcing
+        // during --json output (was const-Value-only pre-fix), so
+        // construct it unconditionally for the print branch.
+        nix::v3::VMState vm;
+        vm.frames.push_back(nix::v3::CallFrame{
+            .cu = &cu, .closure = nullptr, .thunk = nullptr,
+            .ip = cu.entryOffset, .stackBaseOffset = 0,
+            .withStackBase = 0, .flags = 0,
+        });
+        if (strict) {
+            // --strict still does the upfront deep-force to flush all
+            // thunks (the goal of --strict is no thunks in output).
+            // --json no longer needs this — toJsonValue forces lazily.
             r = forceDeep(vm, r);
         }
 
@@ -405,7 +404,7 @@ int main(int argc, char ** argv)
         // and a superset of every per-CU table, so it always covers
         // attribute names from imported CUs that the top-level CU's
         // (frozen-at-compile-time) snapshot wouldn't see.
-        int rc = printValue(r, jsonOut, nix::v3::ir::globalSymbolTable());
+        int rc = printValue(vm, r, jsonOut, nix::v3::ir::globalSymbolTable());
         if (std::getenv("NIX_VM_STATS")) {
             nix::v3::dumpPrimOpStats(stderr);
             auto & a = nix::v3::allocStats();
