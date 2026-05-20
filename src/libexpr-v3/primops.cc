@@ -5636,6 +5636,7 @@ static void buildAndWriteDrvNative(
         nix::drvHashes.insert_or_assign(drvPath, std::move(h));
     }
 
+
     std::vector<std::pair<SymbolId, Value>> entries;
     entries.reserve(1 + drv.outputs.size());
 
@@ -5999,9 +6000,33 @@ static void primDerivationStrictNative(
 
     for (uint32_t idx : order) {
         SymbolId sid = src->entries[idx].name;
-        std::string_view key = sid < symTab.size()
-            ? std::string_view(symTab[sid])
-            : std::string_view{};
+        // 2026-05-20 #670/#671 ROOT CAUSE FIX: capture the attr key as a
+        // std::string COPY, not a std::string_view into the global
+        // symbol table.  The forceValue / valueToJsonWithContext calls
+        // below run arbitrary v3 code which may intern new symbols.
+        // Symbol interning grows the underlying
+        // `std::vector<std::string>` symbol table; on realloc, every
+        // existing std::string in the vector is moved to new storage,
+        // which invalidates every previously-captured std::string_view
+        // into the table.  Pre-fix, this surfaced as a non-deterministic
+        // "phantom python3-3.13.12" derivation under ghc96.drvPath +
+        // friends: when the dangling string_view was COPIED into the
+        // structuredAttrs JSON key map after the realloc, it picked up
+        // garbage bytes from whatever now lived at that address.
+        // Symptom: nixpkgs `validatePythonMatches` fires "Python
+        // version mismatch" because alabaster.pythonModule.outPath
+        // hashes to a python3 whose drvPath differs from sphinx's
+        // python.outPath — the difference is one or more drvAttrs keys
+        // being corrupted in the structuredAttrs JSON of the affected
+        // sub-derivation.  Reclassified from "callPackage fix-point"
+        // (A-series family) to "dangling string_view across realloc"
+        // (a UB pattern that touched several recursive derivation
+        // evaluations).  See project_670_671_phantom_python_2026-05-20
+        // and project_670_671_dangling_strview_FIX_2026-05-20.
+        std::string keyStr = sid < symTab.size()
+            ? std::string(symTab[sid])
+            : std::string{};
+        std::string_view key = keyStr;
         Value & attrV = src->entries[idx].value;
 
         // Skip flag attrs — they're meta, not env vars.  Mirrors
@@ -6052,7 +6077,7 @@ static void primDerivationStrictNative(
                 }
                 continue;
             }
-            std::string keyStr(key);
+            // keyStr was captured at iteration start (#670/#671 fix).
             structuredJson[keyStr] = valueToJsonWithContext(
                 state, attrV, context);
             // Special-case fields still need to populate drv.* so
