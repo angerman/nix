@@ -3911,9 +3911,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // force the arg attrset at call time.  Default off until
             // validated against full lang + wc-laziness suites.
             if (desc->hasFormals) {
+                // #681 — for ANY formals lambda (including ellipsis-
+                // only), TW forces the arg and validates it's a set
+                // (libexpr/eval.cc:1434 forceAttrs in callFunction).
+                // Pre-fix v3 deferred the force for ellipsis lambdas,
+                // and the type check fired only for already-WHNF
+                // primitive args — Thunk-wrapped non-attrsets (e.g.
+                // `({ ... }: 1) [ ]` where `[ ]` lowers through a
+                // Thunk) slipped through and the body ran with the
+                // wrong-typed arg, returning the wrong-vs-TW result.
+                //
+                // We can't skip the force entirely without breaking
+                // the type check.  The original needForce gate was
+                // motivated by nixpkgs perf concerns around forcing
+                // huge attrset args before checking ellipsis — but
+                // since attrsets dominate the formals call sites,
+                // the force is usually a no-op (already WHNF).  The
+                // remaining cost is a tag check on a cached value.
                 static const bool s_eagerArgForce =
                     std::getenv("NIX_V3_EAGER_ARG_FORCE") != nullptr;
-                bool needForce = !desc->ellipsis || s_eagerArgForce;
+                bool needForce = true; (void)s_eagerArgForce;
                 if (needForce) {
                     // STG-12 (#498) diagnostic: see what we're about to
                     // force at OP_CALL.  V3_DBG_OPCALL_FORCE=1 to enable.
@@ -3970,19 +3987,80 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                     }
                     Value forcedArg = forceValue(vm, arg);
-                    if (!desc->ellipsis && forcedArg.isAttrs() && forcedArg.payload.bindings) {
-                        // Validation: no extra args for non-ellipsis lambdas.
+                    // #680 — TW raises "expected a set but found <type>"
+                    // when a formals-lambda is called with a non-attrset
+                    // argument (libexpr/eval.cc:1434 forceAttrs).  Pre-fix
+                    // v3 either silently produced a value (when the body
+                    // didn't touch the formals — e.g. `({ ... }: 1) 42`)
+                    // or surfaced a generic OP_ATTRS_SELECT error from
+                    // the destructuring path.
+                    if (!forcedArg.isAttrs()) {
+                        auto typeWord = [](const Value & v) -> std::pair<const char *, const char *> {
+                            Tag t = v.tag();
+                            if (t == Tag::Int)    return {"an", "integer"};
+                            if (t == Tag::Float)  return {"a",  "float"};
+                            if (t == Tag::Bool)   return {"a",  "Boolean"};
+                            if (t == Tag::Null)   return {"",   "null"};
+                            if (t == Tag::String) return {"a",  "string"};
+                            if (t == Tag::Path)   return {"a",  "path"};
+                            if (t == Tag::List)   return {"a",  "list"};
+                            if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+                                return {"a", "function"};
+                            return {"a", "value"};
+                        };
+                        auto [art, name] = typeWord(forcedArg);
+                        std::string msg = "expected a set but found ";
+                        if (*art) { msg += art; msg += ' '; }
+                        msg += name;
+                        throw std::runtime_error(msg);
+                    }
+                    if (forcedArg.payload.bindings) {
+                        // #680 — emit TW's exact error phrasing
+                        // (libexpr/eval.cc:1849 + extra-arg sibling) so
+                        // user-visible formals errors don't expose
+                        // "v3 OP_CALL: ..." debug naming.  Lambda name
+                        // uses `contextualName` (set by lower.cc from
+                        // ExprLambda::name) when present, else falls
+                        // back to TW's literal "anonymous lambda".
+                        std::string lambdaName = desc && !desc->contextualName.empty()
+                            ? desc->contextualName
+                            : std::string("anonymous lambda");
                         const Bindings * b = forcedArg.payload.bindings;
-                        for (uint32_t i = 0; i < b->size; ++i) {
-                            SymbolId name = b->entries[i].name;
+                        const auto & tbl = ir::globalSymbolTable();
+                        // (a) Extra-arg check for non-ellipsis lambdas.
+                        if (!desc->ellipsis) {
+                            for (uint32_t i = 0; i < b->size; ++i) {
+                                SymbolId name = b->entries[i].name;
+                                bool found = false;
+                                for (auto & f : desc->formals)
+                                    if (f.name == name) { found = true; break; }
+                                if (!found) {
+                                    std::string nm = (name < tbl.size()) ? tbl[name] : "?";
+                                    throw std::runtime_error(
+                                        "function '" + lambdaName
+                                        + "' called with unexpected argument '"
+                                        + nm + "'");
+                                }
+                            }
+                        }
+                        // (b) Missing-arg check: every formal without
+                        // a default must be in the input bindings.  TW
+                        // does this in eval.cc:1847.  Pre-#680 v3
+                        // emitted the generic "attribute 'X' missing"
+                        // from the formal-destructure OP_ATTRS_SELECT
+                        // (post-#678 alignment); now we catch it earlier
+                        // with the function-specific phrasing.
+                        for (auto & f : desc->formals) {
+                            if (f.hasDefault) continue;
                             bool found = false;
-                            for (auto & f : desc->formals)
-                                if (f.name == name) { found = true; break; }
+                            for (uint32_t i = 0; i < b->size; ++i)
+                                if (b->entries[i].name == f.name) { found = true; break; }
                             if (!found) {
-                                const auto & tbl = ir::globalSymbolTable();
-                                std::string nm = (name < tbl.size()) ? tbl[name] : "?";
-                                throw std::runtime_error("v3 OP_CALL: function "
-                                    "called with unexpected argument '" + nm + "'");
+                                std::string nm = (f.name < tbl.size()) ? tbl[f.name] : "?";
+                                throw std::runtime_error(
+                                    "function '" + lambdaName
+                                    + "' called without required argument '"
+                                    + nm + "'");
                             }
                         }
                     }
@@ -4233,6 +4311,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
             // Same eager-arg-force as OP_CALL — see WC-38 explanation above.
             if (tcDesc->hasFormals) {
+                // #680 — pre-force type check (mirror of OP_CALL site).
+                if (arg.tag() != Tag::Attrs
+                    && arg.tag() != Tag::Thunk
+                    && arg.tag() != Tag::App
+                    && arg.tag() != Tag::Slot)
+                {
+                    auto typeWord = [](const Value & v) -> std::pair<const char *, const char *> {
+                        Tag t = v.tag();
+                        if (t == Tag::Int)    return {"an", "integer"};
+                        if (t == Tag::Float)  return {"a",  "float"};
+                        if (t == Tag::Bool)   return {"a",  "Boolean"};
+                        if (t == Tag::Null)   return {"",   "null"};
+                        if (t == Tag::String) return {"a",  "string"};
+                        if (t == Tag::Path)   return {"a",  "path"};
+                        if (t == Tag::List)   return {"a",  "list"};
+                        if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+                            return {"a", "function"};
+                        return {"a", "value"};
+                    };
+                    auto [art, name] = typeWord(arg);
+                    std::string msg = "expected a set but found ";
+                    if (*art) { msg += art; msg += ' '; }
+                    msg += name;
+                    throw std::runtime_error(msg);
+                }
                 static const bool s_eagerArgForce =
                     std::getenv("NIX_V3_EAGER_ARG_FORCE") != nullptr;
                 bool needForce = !tcDesc->ellipsis || s_eagerArgForce;
@@ -4294,18 +4397,61 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                     }
                     Value forcedArg = forceValue(vm, arg);
-                    if (!tcDesc->ellipsis && forcedArg.isAttrs() && forcedArg.payload.bindings) {
+                    // #680 — TAIL_CALL path mirror of OP_CALL formals
+                    // validation.  Type-check arg is a set; emit TW's
+                    // exact phrasing for extra/missing args.
+                    if (!forcedArg.isAttrs()) {
+                        auto typeWord = [](const Value & v) -> std::pair<const char *, const char *> {
+                            Tag t = v.tag();
+                            if (t == Tag::Int)    return {"an", "integer"};
+                            if (t == Tag::Float)  return {"a",  "float"};
+                            if (t == Tag::Bool)   return {"a",  "Boolean"};
+                            if (t == Tag::Null)   return {"",   "null"};
+                            if (t == Tag::String) return {"a",  "string"};
+                            if (t == Tag::Path)   return {"a",  "path"};
+                            if (t == Tag::List)   return {"a",  "list"};
+                            if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+                                return {"a", "function"};
+                            return {"a", "value"};
+                        };
+                        auto [art, name] = typeWord(forcedArg);
+                        std::string msg = "expected a set but found ";
+                        if (*art) { msg += art; msg += ' '; }
+                        msg += name;
+                        throw std::runtime_error(msg);
+                    }
+                    if (forcedArg.payload.bindings) {
+                        std::string lambdaName = tcDesc && !tcDesc->contextualName.empty()
+                            ? tcDesc->contextualName
+                            : std::string("anonymous lambda");
                         const Bindings * b = forcedArg.payload.bindings;
-                        for (uint32_t i = 0; i < b->size; ++i) {
-                            SymbolId name = b->entries[i].name;
+                        const auto & tbl = ir::globalSymbolTable();
+                        if (!tcDesc->ellipsis) {
+                            for (uint32_t i = 0; i < b->size; ++i) {
+                                SymbolId name = b->entries[i].name;
+                                bool found = false;
+                                for (auto & f : tcDesc->formals)
+                                    if (f.name == name) { found = true; break; }
+                                if (!found) {
+                                    std::string nm = (name < tbl.size()) ? tbl[name] : "?";
+                                    throw std::runtime_error(
+                                        "function '" + lambdaName
+                                        + "' called with unexpected argument '"
+                                        + nm + "'");
+                                }
+                            }
+                        }
+                        for (auto & f : tcDesc->formals) {
+                            if (f.hasDefault) continue;
                             bool found = false;
-                            for (auto & f : tcDesc->formals)
-                                if (f.name == name) { found = true; break; }
+                            for (uint32_t i = 0; i < b->size; ++i)
+                                if (b->entries[i].name == f.name) { found = true; break; }
                             if (!found) {
-                                const auto & tbl = ir::globalSymbolTable();
-                                std::string nm = (name < tbl.size()) ? tbl[name] : "?";
-                                throw std::runtime_error("v3 OP_TAIL_CALL: function "
-                                    "called with unexpected argument '" + nm + "'");
+                                std::string nm = (f.name < tbl.size()) ? tbl[f.name] : "?";
+                                throw std::runtime_error(
+                                    "function '" + lambdaName
+                                    + "' called without required argument '"
+                                    + nm + "'");
                             }
                         }
                     }
