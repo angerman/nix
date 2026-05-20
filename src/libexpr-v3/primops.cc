@@ -6981,6 +6981,30 @@ void primImport(EvalState & state, Value * args, Value & out)
     std::string path;
     if (args[0].isString()) path = args[0].payload.str;
     else if (args[0].isPath()) path = args[0].payload.path;
+    else if (args[0].isAttrs()) {
+        // #695 follow-on: IFD support.  When args[0] is a derivation
+        // attrset (or any attrset with `__toString` / `outPath`), bridge
+        // to TW so its realisePath does the build-context dance.
+        // realisePath:
+        //   - Forces the value.
+        //   - Coerces to string with context (DrvDeep / Opaque / ...).
+        //   - For DrvDeep context, calls realiseContext → buildPaths.
+        //   - Returns a SourcePath to the realised store output.
+        // TW's import (libexpr/primops.cc:434) uses exactly this pattern.
+        // For non-IFD plain string/path, the fast-path above stays cheap;
+        // we only pay the bridge tax when we'd otherwise typeError.
+        auto & ns = *state.nixEvalState;
+        nix::Value * tw = v3ToTreeWalker(state, args[0]);
+        if (!tw) typeError("import", "string or path");
+        try {
+            auto resolved = ns.realisePath(nix::noPos, *tw);
+            path = resolved.path.abs();
+        } catch (...) {
+            // Surface TW's error verbatim (build failures, missing
+            // outputs, restricted-eval, etc.).
+            throw;
+        }
+    }
     else {
         // #493 diag: when args[0] is a Bridge thunk, print the TW
         // source's REAL type so we can trace force-chase issues.
