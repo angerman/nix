@@ -1816,7 +1816,10 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
     auto * froms = args[0].payload.list;
     auto * tos   = args[1].payload.list;
     if (!froms || !tos || froms->size != tos->size)
-        throw std::runtime_error("v3 primop replaceStrings: lists must have equal length");
+        // #689 — TW phrasing (libexpr/primops.cc:replaceStrings).
+        throw std::runtime_error(
+            "'from' and 'to' arguments passed to builtins.replaceStrings "
+            "have different lengths");
     // 2026-05-19 #665: collect string-context from the input string
     // and any `to` element whose pattern actually matched (TW's
     // prim_replaceStrings at libexpr/primops.cc:5328-5353 maintains
@@ -2834,8 +2837,13 @@ void primMatch(EvalState &, Value * args, Value & out)
         }
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = lv;
-    } catch (const std::regex_error & e) {
-        throw std::runtime_error(std::string("v3 primop match: invalid regex: ") + e.what());
+    } catch (const std::regex_error &) {
+        // #689 — TW phrasing (libexpr/primops.cc): `invalid regular
+        // expression '<regex>'`.  The std::regex_error message is
+        // implementation-defined; TW just emits the pattern.
+        throw std::runtime_error(
+            std::string("invalid regular expression '")
+            + (args[0].payload.str ? args[0].payload.str : "") + "'");
     }
 }
 
@@ -2886,8 +2894,11 @@ void primSplit(EvalState &, Value * args, Value & out)
         for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = parts[i];
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = lv;
-    } catch (const std::regex_error & e) {
-        throw std::runtime_error(std::string("v3 primop split: invalid regex: ") + e.what());
+    } catch (const std::regex_error &) {
+        // #689 — TW phrasing (mirror of #689 fix in primMatch).
+        throw std::runtime_error(
+            std::string("invalid regular expression '")
+            + (args[0].payload.str ? args[0].payload.str : "") + "'");
     }
 }
 
