@@ -1665,8 +1665,27 @@ struct Lowerer
                     auto * fv = static_cast<nix::ExprVar *>(c->fun);
                     if (fv->fromWith) return false;
                     std::string n(symbols[fv->name]);
-                    if (n == "__sub" || n == "__mul" || n == "__div"
-                        || n == "__lessThan") return true;
+                    // #694: `__lessThan` (i.e. `<`, `>`, `<=`, `>=` operators)
+                    // MUST NOT be eager-trivial in arg position.  TW passes
+                    // function args lazily; a `mkIf (length cfg > 0) body`
+                    // pre-fix evaluated the `>` eagerly, forcing cfg before
+                    // the module merger had finished resolving config —
+                    // tripping the lib.modules `_module.freeformType` cycle
+                    // that TW navigates by treating the mkIf condition as a
+                    // thunk and only forcing it when pushDownProperties or
+                    // a defn-collector actually demands it.
+                    //
+                    // The remaining arithmetic ops (`__sub`/`__mul`/`__div`)
+                    // stay eager: their args are typically Int literals or
+                    // simple Var refs in hot paths (fib's `f (n - 1)`), so
+                    // the pre-#694 fast path's perf win still applies.  If
+                    // a future repro shows those triggering similar cycles,
+                    // narrow them too — `__lessThan` was the specific
+                    // operator that fired the module-cycle (operator-bisected
+                    // on the nylon-services repro: only `<`/`>`/`<=`/`>=`
+                    // failed, all parse to ExprCall(__lessThan, ...)).
+                    if (n == "__sub" || n == "__mul" || n == "__div")
+                        return true;
                 }
             }
         }
