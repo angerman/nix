@@ -557,6 +557,9 @@ inline bool valueEqual(VMState & vm, Value a, Value b, bool insideContainer = fa
     }
 }
 
+// Forward declaration — defined later in the file.
+inline std::string valueRepr(const Value & v, int depth = 0);
+
 inline bool valueLess(VMState & vm, const Value & a, const Value & b)
 {
     if (a.isInt() && b.isInt())     return a.payload.i < b.payload.i;
@@ -621,6 +624,16 @@ inline bool valueLess(VMState & vm, const Value & a, const Value & b)
     std::string msg = "cannot compare " + withArticle(a) + " with " + withArticle(b);
     if (a.tag() == b.tag())
         msg += "; values of that type are incomparable";
+    // #691 — append `(values are X and Y)` / `; values are X and Y`
+    // matching TW.  Closes the prior PREFIX gap (`compare-null` etc.
+    // tests previously accepted the truncated form).
+    msg += a.tag() == b.tag()
+        ? " (values are "
+        : "; values are ";
+    msg += valueRepr(a);
+    msg += " and ";
+    msg += valueRepr(b);
+    if (a.tag() == b.tag()) msg += ")";
     throw std::runtime_error(msg);
 }
 
@@ -688,6 +701,123 @@ inline bool isTrueValue(const Value & v)
 /// helper by the OP_STR_CONCAT attr-unwind loop (vm.cc:8051+), so by
 /// the time we get here the value is a primitive.
 
+/// #691 — TW `ValuePrinter` mirror for error-message value rendering.
+/// Matches TW's `errorPrintOptions` defaults: maxDepth=10, maxAttrs=10,
+/// maxListItems=10, force=false (i.e., don't force lazy values — they
+/// might be the source of the very error we're rendering).
+///
+/// This is the helper that closes the PREFIX-class gap in many v3
+/// error messages where v3 currently emits truncated placeholders
+/// like `{ ... }` / `[ ... ]` while TW shows the actual values.
+/// Used by `coerceToString`, `valueLess`, and the formals-validation
+/// error paths in OP_CALL / OP_TAIL_CALL.
+///
+/// IMPORTANT: this function does NOT force lazy values.  Tag::Thunk /
+/// Tag::App / Tag::Slot render as `«…»` placeholders.  Forcing during
+/// error rendering risks recursing into the very error we're trying
+/// to report — TW's `force=false` discipline is correctness-load-
+/// bearing here.
+inline std::string valueRepr(const Value & v, int depth)
+{
+    constexpr int kMaxDepth = 10;
+    constexpr int kMaxItems = 10;
+    constexpr size_t kMaxStrLen = 1024;
+    Tag t = v.tag();
+    if (depth > kMaxDepth) return "«…»";
+    if (t == Tag::Int) {
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "%lld", (long long)v.payload.i);
+        return buf;
+    }
+    if (t == Tag::Float) {
+        // Match TW's `output << double` — default ostream formatting
+        // (not %f's fixed 6-decimal).
+        std::ostringstream os; os << v.payload.f;
+        return os.str();
+    }
+    if (t == Tag::Bool)   return v.payload.i == 1 ? "true" : "false";
+    if (t == Tag::Null)   return "null";
+    if (t == Tag::String) {
+        std::string out = "\"";
+        std::string_view sv = v.payload.str ? std::string_view(v.payload.str)
+                                            : std::string_view{};
+        size_t n = sv.size();
+        size_t lim = n > kMaxStrLen ? kMaxStrLen : n;
+        for (size_t i = 0; i < lim; ++i) {
+            char c = sv[i];
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                case '$':
+                    if (i + 1 < lim && sv[i + 1] == '{') {
+                        out += "\\$";
+                    } else {
+                        out += c;
+                    }
+                    break;
+                default: out += c;
+            }
+        }
+        if (n > kMaxStrLen) out += "«…elided…»";
+        out += "\"";
+        return out;
+    }
+    if (t == Tag::Path)   return v.payload.path ? v.payload.path : "/";
+    if (t == Tag::List) {
+        if (!v.payload.list || v.payload.list->size == 0) return "[ ]";
+        std::string out = "[ ";
+        uint32_t n = v.payload.list->size;
+        uint32_t lim = n > kMaxItems ? kMaxItems : n;
+        for (uint32_t i = 0; i < lim; ++i) {
+            out += valueRepr(v.payload.list->elems[i], depth + 1);
+            out += ' ';
+        }
+        if (n > kMaxItems) {
+            out += "«…";
+            out += std::to_string(n - kMaxItems);
+            out += " items elided…» ";
+        }
+        out += ']';
+        return out;
+    }
+    if (t == Tag::Attrs) {
+        if (!v.payload.bindings || v.payload.bindings->size == 0) return "{ }";
+        std::string out = "{ ";
+        auto * b = v.payload.bindings;
+        const auto & symTab = ir::globalSymbolTable();
+        uint32_t n = b->size;
+        uint32_t lim = n > kMaxItems ? kMaxItems : n;
+        for (uint32_t i = 0; i < lim; ++i) {
+            uint32_t nameIdx = b->entries[i].name;
+            std::string nm = (nameIdx < symTab.size())
+                ? symTab[nameIdx]
+                : std::string("<sym?>");
+            out += nm;
+            out += " = ";
+            out += valueRepr(b->entries[i].value, depth + 1);
+            out += "; ";
+        }
+        if (n > kMaxItems) {
+            out += "«…";
+            out += std::to_string(n - kMaxItems);
+            out += " attrs elided…» ";
+        }
+        out += '}';
+        return out;
+    }
+    if (t == Tag::Closure)   return "«lambda»";
+    if (t == Tag::PrimOp)    return "«primop»";
+    if (t == Tag::PrimOpApp) return "«partially applied primop»";
+    if (t == Tag::Thunk)     return "«unforced thunk»";
+    if (t == Tag::App)       return "«unforced app»";
+    if (t == Tag::Blackhole) return "«potential infinite recursion»";
+    if (t == Tag::Slot)      return "«slot»";
+    return "«value»";
+}
+
 /// #685 — opcode-side mirror of TW's `forceStringNoCtx`
 /// (libexpr/eval.cc:2826).  Throws TW's exact error text when the
 /// string value carries any context.  Used for dynamic attr names
@@ -735,19 +865,10 @@ inline std::string coerceToString(const Value & v, bool forceString)
             return {"a", "thunk"};
         return {"a", "value"};
     };
-    auto valueRepr = [](const Value & v) -> std::string {
-        Tag t = v.tag();
-        if (t == Tag::Int)   return std::to_string(v.payload.i);
-        if (t == Tag::Float) return std::to_string(v.payload.f);
-        if (t == Tag::Bool)  return v.payload.i == 1 ? "true" : "false";
-        if (t == Tag::Null)  return "null";
-        if (t == Tag::List)  return "[ ... ]";
-        if (t == Tag::Attrs) return "{ ... }";
-        if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
-            return "<LAMBDA>";
-        return "<value>";
-    };
     auto throwCoerceError = [&](const Value & v) -> std::string {
+        // #691 — use the shared `valueRepr` for TW-equivalent rendering.
+        // Pre-fix this lambda used a stub that emitted `{ ... }` / `[ ... ]`
+        // placeholders, leaving a PREFIX-class gap vs TW's actual values.
         auto [article, name] = typeName(v);
         std::string msg = "cannot coerce ";
         if (*article) { msg += article; msg += ' '; }
@@ -4060,6 +4181,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         std::string msg = "expected a set but found ";
                         if (*art) { msg += art; msg += ' '; }
                         msg += name;
+                        // #691 — append `: <value>` matching TW.
+                        msg += ": ";
+                        msg += valueRepr(forcedArg);
                         throw std::runtime_error(msg);
                     }
                     if (forcedArg.payload.bindings) {
@@ -4382,6 +4506,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     std::string msg = "expected a set but found ";
                     if (*art) { msg += art; msg += ' '; }
                     msg += name;
+                    // #691 — append the value via shared valueRepr.
+                    msg += ": ";
+                    msg += valueRepr(arg);
                     throw std::runtime_error(msg);
                 }
                 static const bool s_eagerArgForce =
@@ -4466,6 +4593,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         std::string msg = "expected a set but found ";
                         if (*art) { msg += art; msg += ' '; }
                         msg += name;
+                        // #691 — append `: <value>` matching TW.
+                        msg += ": ";
+                        msg += valueRepr(forcedArg);
                         throw std::runtime_error(msg);
                     }
                     if (forcedArg.payload.bindings) {
@@ -8898,6 +9028,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 std::string msg = "expected a list but found ";
                 if (*art) { msg += art; msg += ' '; }
                 msg += name;
+                // #691 — append `: <value>` matching TW.
+                msg += ": ";
+                msg += valueRepr(v);
                 throw std::runtime_error(msg);
             }
             Value r; r.mkInt(v.payload.list ? v.payload.list->size : 0);
