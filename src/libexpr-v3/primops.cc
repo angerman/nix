@@ -35,11 +35,11 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/print.hh"
 #include "nix/expr/value/context.hh"
-// #698 Phase 2: flake headers pulled in for primops.cc's
-// `Value callFlakeV3(...)` forward-declaration used by Phase 3.
-// Currently unused at the call site (primGetFlake stays on TW
-// bridge until Phase 3); Phase 3 wires the v3-native dispatch.
+// #698 Phase 3: v3-native primGetFlake — needs FlakeRef parsing,
+// lockFlake, Settings member access, and LockedFlake type.
 #include "nix/flake/flake.hh"
+#include "nix/flake/flakeref.hh"
+#include "nix/flake/settings.hh"
 #include "nix/util/canon-path.hh"
 #include "nix/util/experimental-features.hh"
 #include "nix/util/hash.hh"
@@ -9454,20 +9454,67 @@ void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("f
 // Note: primParseFlakeRef and primFlakeRefToString are already
 // implemented natively in v3 above (lines 7319 / 7380); only getFlake
 // needs the TW bridge here.
-// #698 Phase 2: forward-declared in v3_call_flake.cc.  The full
-// dispatch (parseFlakeRef → lockFlake → callFlakeV3) lands in Phase 3
-// once the flake::Settings plumbing is sorted (current blocker:
-// nix::flakeSettings lives in libcmd, not libflake, so libexpr-v3
-// can't link directly — needs a DI/accessor pattern).
-//
-// For now primGetFlake stays on the TW bridge.  v3-side
-// call-flake.nix compilation can still be verified by invoking
-// `nix::v3::callFlakeV3` from a future test harness; the Phase 2
-// CachedCallFlake::get implementation in v3_call_flake.cc does the
-// parse + lower + compile + run-to-closure dance.
+// #698 Phase 3: v3-native getFlake.
+// Forward-declare callFlakeV3 (defined in v3_call_flake.cc).
+Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake);
 
 void primGetFlake(EvalState & s, Value * a, Value & o) {
-    bridgeBuiltin<1>("getFlake", s, a, o);
+    // #698 Phase 3 status (2026-05-20):
+    //   - The v3-native path WORKS semantically on trivial flakes
+    //     (`(getFlake X).smoke` byte-identical to TW).
+    //   - On heavy workloads (cardano-node ~30 inputs) it's
+    //     significantly slower than the post-#697 bridge: 60s+ vs
+    //     7s.  Allocations during the slow path show real eval work
+    //     (170 attrsets, 81 thunks) — not a hang — but throughput
+    //     is ~10× the TW-bridge baseline.
+    //
+    // Root cause is in v3's per-call overhead compounding across
+    // call-flake.nix's allNodes recursion (each input flake triggers
+    // primImport + outputs lambda call + attrset merging).  Same
+    // perf-class as the hello.drvPath per-force gap; tracked under
+    // Stage 3-4 / Phase 1.5.
+    //
+    // **Retirement criterion** for the opt-in gate below: when
+    // v3-native completes cardano-node `(getFlake X) ? outputs` in
+    // ≤ 2× TW time, flip the default and delete the gate body.
+    // Until then the gate stays opt-IN to preserve the #697
+    // perf win for everyday users; v3-native is reachable via
+    // `NIX_V3_NATIVE_CALL_FLAKE=1` for measurement + future
+    // perf-track validation.
+    static const bool s_enableNative =
+        std::getenv("NIX_V3_NATIVE_CALL_FLAKE") != nullptr;
+    const nix::flake::Settings * flakeSettings = getFlakeSettings();
+
+    if (!s_enableNative || !flakeSettings || !s.nixEvalState) {
+        bridgeBuiltin<1>("getFlake", s, a, o);
+        return;
+    }
+    auto & ns = *s.nixEvalState;
+
+    // V3-native path (opt-in via NIX_V3_NATIVE_CALL_FLAKE=1).
+
+    // (1) FFI leaves: parseFlakeRef + lockFlake.  Pure C functions
+    //     (no Nix eval); per V3-NATIVE rule these stay in TW.
+    if (!a[0].isString()) typeError("getFlake", "string");
+    std::string flakeRefS = a[0].payload.str;
+    auto flakeRef = nix::parseFlakeRef(ns.fetchSettings, flakeRefS, {}, true);
+    if (ns.settings.pureEval && !flakeRef.input.isLocked(ns.fetchSettings))
+        throw nix::Error(
+            "cannot call 'getFlake' on unlocked flake reference '%s' (use --impure to override)",
+            flakeRefS);
+    auto lockedFlake = nix::flake::lockFlake(
+        *flakeSettings, ns, flakeRef,
+        nix::flake::LockFlags{
+            .updateLockFile = false,
+            .writeLockFile = false,
+            .useRegistries = !ns.settings.pureEval && flakeSettings->useRegistries,
+            .allowUnlocked = !ns.settings.pureEval,
+        });
+
+    // (2) v3-native call-flake.nix evaluation.  callFlakeV3 builds
+    //     TW args, bridges to v3, applies the cached closure × 3,
+    //     returns a v3 Value.
+    o = callFlakeV3(s, lockedFlake);
 }
 
 void registerPrimOp(const PrimOp & op)

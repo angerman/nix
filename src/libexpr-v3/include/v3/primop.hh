@@ -62,6 +62,29 @@ nix::EvalState * getNixEvalState();
 
 } // namespace nix::v3
 
+// Forward-declare flake::Settings so v3 can hold a pointer without
+// pulling in the full libflake header surface from this primop header.
+namespace nix::flake { struct Settings; }
+
+namespace nix::v3 {
+
+/// #698 Phase 3: thread-local pointer to libcmd's `nix::flakeSettings`
+/// global so v3 can call `nix::flake::lockFlake(*flakeSettings, ...)`
+/// directly from `primGetFlake` without linking libcmd (which would
+/// create an architecturally-undesirable libexpr-v3 → libcmd edge).
+///
+/// The CLI (`src/nix/main.cc`) calls `setFlakeSettings(&nix::flakeSettings)`
+/// once at startup, alongside the existing `setNixEvalState` wiring.
+///
+/// Returns nullptr if no caller has wired it (e.g. v3-eval standalone
+/// without flake support).  Phase 3's primGetFlake falls back to the
+/// existing TW bridge when null — preserves correctness while keeping
+/// v3-native opt-in.
+void setFlakeSettings(const nix::flake::Settings * s);
+const nix::flake::Settings * getFlakeSettings();
+
+} // namespace nix::v3
+
 namespace nix {
     struct Expr;
     struct Value;

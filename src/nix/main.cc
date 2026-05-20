@@ -1,6 +1,7 @@
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "v3/install.hh"
+#include "v3/primop.hh"  // #698 Phase 3: setFlakeSettings
 #include "nix/util/args/root.hh"
 #include "nix/util/current-process.hh"
 #include "nix/cmd/command.hh"
@@ -404,6 +405,13 @@ void mainWrapped(int argc, char ** argv)
     initNix();
     initGC();
     flakeSettings.configureEvalSettings(evalSettings);
+
+    // #698 Phase 3: wire libcmd's `flakeSettings` global into v3's
+    // thread-local pointer so `nix::v3::primGetFlake` can call
+    // `nix::flake::lockFlake(*flakeSettings, ...)` without linking
+    // libcmd into libexpr-v3.  Mirrors the existing setNixEvalState
+    // pattern (set once at startup, read by v3 primops).
+    nix::v3::setFlakeSettings(&flakeSettings);
 
 #ifdef __linux__
     if (isRootUser()) {

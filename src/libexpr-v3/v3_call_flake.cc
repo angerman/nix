@@ -33,11 +33,26 @@
 
 #include "nix/expr/eval.hh"
 #include "nix/flake/flake.hh"
+#include "nix/flake/lockfile.hh"   // for flake::LockedNode (dynamic_pointer_cast target)
+#include "nix/store/store-api.hh"  // for Store::toStorePath
+#include "nix/util/canon-path.hh"  // for CanonPath::rel
 
 #include <deque>
 #include <mutex>
 
 namespace nix::v3 {
+
+namespace {
+
+/// #698 Phase 3: thread-local pointer to libcmd's nix::flakeSettings.
+/// Wired by CLI startup via setFlakeSettings.  Lifetime is the
+/// process — flakeSettings is a global in common-eval-args.cc.
+thread_local const nix::flake::Settings * tlFlakeSettings = nullptr;
+
+} // (close inner anon ns; re-open below)
+
+void setFlakeSettings(const nix::flake::Settings * s) { tlFlakeSettings = s; }
+const nix::flake::Settings * getFlakeSettings() { return tlFlakeSettings; }
 
 namespace {
 
@@ -133,77 +148,93 @@ CachedCallFlake g_cachedCallFlake;
 
 } // namespace
 
+// Forward declaration: defined in primops.cc.  Bridges a TW Value
+// (forced to WHNF inside) to a v3 Value (shallow per #662).
+extern Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
+
 /// Public entry point — invoked from `primGetFlake` when the
-/// v3-native path is enabled (Phase 3 wires this; until then no
-/// caller exists).
+/// v3-native path is enabled.  Returns the flake's outputs attrset
+/// as a v3 Value.
 ///
-/// `state.nixEvalState` must be wired.
-///
-/// PHASE 2 (this commit): verifies the cache-build (parse + lower
-/// + compile + run) succeeds and returns a closure.  Then throws
-/// `PHASE 3 PENDING` to surface that args-building + callClosure
-/// is not yet wired.
-///
-/// PHASE 3 will replace the throw with:
-///   1. Build TW args (vLocks, vOverrides, vFetchTreeFinal)
-///      mirroring libflake/flake.cc:callFlake lines 932-969.
-///   2. Bridge args via treeWalkerToV3Public.
-///   3. Apply via callClosure(*activeV3VM(), ...) three times.
-///   4. Return the resulting v3 Value.
+/// Mirrors `nix::flake::callFlake` (libflake/flake.cc:928-973) but
+/// runs call-flake.nix on v3's VM via the cached closure instead of
+/// `state.callFunction(vCallFlake, args, vRes)`.
 Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake)
 {
     if (!state.nixEvalState)
         throw std::runtime_error("v3::callFlakeV3: no TW EvalState wired");
     auto & ns = *state.nixEvalState;
 
-    // Phase 2 verification: trigger the cache-build.  If
-    // call-flake.nix exercises a Nix language construct v3 doesn't
-    // support, this throws and surfaces the specific gap.
+    // (1) Compile call-flake.nix in v3 (cached after first call).
     Value vCallFlake = g_cachedCallFlake.get(ns);
 
-    // Phase 3 work (see design doc):
-    //
-    //   auto [lockFileStr, keyMap] = lockedFlake.lockFile.to_string();
-    //
-    //   // Build TW args — replicate libflake/flake.cc:callFlake 932-969
-    //   nix::Value vLocks; vLocks.mkString(lockFileStr, ns.mem);
-    //   auto overrides = ns.buildBindings(lockedFlake.nodePaths.size());
-    //   for (auto & [node, sourcePath] : lockedFlake.nodePaths) {
-    //       auto override = ns.buildBindings(2);
-    //       auto & vSourceInfo = override.alloc(ns.symbols.create("sourceInfo"));
-    //       auto lockedNode = node.dynamic_pointer_cast<const flake::LockedNode>();
-    //       auto [storePath, subdir] = ns.store->toStorePath(sourcePath.path.abs());
-    //       nix::emitTreeAttrs(ns, storePath,
-    //           lockedNode ? lockedNode->lockedRef.input : lockedFlake.flake.lockedRef.input,
-    //           vSourceInfo, false, !lockedNode && lockedFlake.flake.forceDirty);
-    //       auto key = keyMap.find(node);
-    //       override.alloc(ns.symbols.create("dir")).mkString(CanonPath(subdir).rel(), ns.mem);
-    //       overrides.alloc(ns.symbols.create(key->second)).mkAttrs(override);
-    //   }
-    //   nix::Value vOverrides; vOverrides.mkAttrs(overrides);
-    //   auto * pFetchTreeFinal = nix::get(ns.internalPrimOps, "fetchFinalTree");
-    //   if (!pFetchTreeFinal) throw std::runtime_error("fetchFinalTree primop missing");
-    //
-    //   // Bridge to v3 (shallow per #662)
-    //   extern Value treeWalkerToV3Public(nix::EvalState &, nix::Value &);
-    //   Value v3Locks      = treeWalkerToV3Public(ns, vLocks);
-    //   Value v3Overrides  = treeWalkerToV3Public(ns, vOverrides);
-    //   Value v3FetchFinal = treeWalkerToV3Public(ns, **pFetchTreeFinal);
-    //
-    //   // Apply args via callClosure on the active VMState
-    //   VMState * vm = activeV3VM();
-    //   if (!vm) throw std::runtime_error("no active VMState");
-    //   Value r1 = callClosure(*vm, vCallFlake, v3Locks);
-    //   Value r2 = callClosure(*vm, r1, v3Overrides);
-    //   Value r3 = callClosure(*vm, r2, v3FetchFinal);
-    //   return r3;
+    // (2) Build TW args — replicates libflake/flake.cc:callFlake
+    //     lines 932-969.  Uses TW's existing emitTreeAttrs +
+    //     buildBindings helpers since they produce TW Values
+    //     anyway; the bridge to v3 happens once at the end.
+    auto [lockFileStr, keyMap] = lockedFlake.lockFile.to_string();
 
-    (void)lockedFlake;
-    (void)vCallFlake;
-    throw std::runtime_error(
-        "v3::callFlakeV3: PHASE 3 PENDING — call-flake.nix compiles "
-        "successfully in v3 (cache build OK); args-building + "
-        "callClosure wiring is the next commit");
+    auto overrides = ns.buildBindings(lockedFlake.nodePaths.size());
+    for (auto & [node, sourcePath] : lockedFlake.nodePaths) {
+        auto override = ns.buildBindings(2);
+        auto & vSourceInfo = override.alloc(ns.symbols.create("sourceInfo"));
+        auto lockedNode = node.dynamic_pointer_cast<const nix::flake::LockedNode>();
+        auto [storePath, subdir] = ns.store->toStorePath(sourcePath.path.abs());
+        nix::emitTreeAttrs(
+            ns,
+            storePath,
+            lockedNode ? lockedNode->lockedRef.input : lockedFlake.flake.lockedRef.input,
+            vSourceInfo,
+            false,
+            !lockedNode && lockedFlake.flake.forceDirty);
+
+        auto key = keyMap.find(node);
+        if (key == keyMap.end())
+            throw std::runtime_error(
+                "v3::callFlakeV3: node missing from lockfile keyMap");
+
+        override.alloc(ns.symbols.create("dir")).mkString(
+            nix::CanonPath(subdir).rel(), ns.mem);
+        overrides.alloc(ns.symbols.create(key->second)).mkAttrs(override);
+    }
+    nix::Value * vOverrides = ns.allocValue();
+    vOverrides->mkAttrs(overrides);
+
+    nix::Value * vLocks = ns.allocValue();
+    vLocks->mkString(lockFileStr, ns.mem);
+
+    auto pFetchTreeFinal = nix::get(ns.internalPrimOps, "fetchFinalTree");
+    if (!pFetchTreeFinal || !*pFetchTreeFinal)
+        throw std::runtime_error(
+            "v3::callFlakeV3: state.internalPrimOps['fetchFinalTree'] missing");
+    nix::Value & vFetchTreeFinal = **pFetchTreeFinal;
+
+    // (3) Bridge TW args to v3 Values.  Shallow per #662 — we don't
+    //     deep-walk; conversion is just a wrapper tag flip.
+    Value v3Locks      = treeWalkerToV3Public(ns, *vLocks);
+    Value v3Overrides  = treeWalkerToV3Public(ns, *vOverrides);
+    Value v3FetchFinal = treeWalkerToV3Public(ns, vFetchTreeFinal);
+
+    // (4) Apply args via callClosure on the active VMState.  Per
+    //     STG-10, reuse the caller's VM — fresh VMState spawning at
+    //     TW→v3 boundaries created cross-VM Black-mark issues.
+    //
+    // Source of vm: the v3 EvalState struct carries a `vm` pointer
+    // set by the dispatcher when calling a primop (vm.cc:8858-8859).
+    // If that's missing (unusual — primGetFlake should always be
+    // invoked from a v3 dispatch loop), fall back to activeV3VM
+    // for completeness; if both are null, abort.
+    VMState * vm = state.vm ? state.vm : activeV3VM();
+    if (!vm)
+        throw std::runtime_error(
+            "v3::callFlakeV3: no active VMState (state.vm and "
+            "activeV3VM both null — must be called inside a v3 "
+            "dispatch loop)");
+
+    Value r1 = callClosure(*vm, vCallFlake, v3Locks);
+    Value r2 = callClosure(*vm, r1, v3Overrides);
+    Value r3 = callClosure(*vm, r2, v3FetchFinal);
+    return r3;
 }
 
 /// Phase 2 verification primop — accessible as `builtins.__v3CompileCallFlake null`.
