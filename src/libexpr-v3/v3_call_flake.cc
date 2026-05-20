@@ -30,6 +30,7 @@
 #include "v3/ir.hh"
 #include "v3/vm.hh"
 #include "v3/value.hh"
+#include "v3/alloc.hh"  // #700/2a: v3-native Bindings allocation
 
 #include "nix/expr/eval.hh"
 #include "nix/flake/flake.hh"
@@ -37,6 +38,9 @@
 #include "nix/store/store-api.hh"  // for Store::toStorePath
 #include "nix/util/canon-path.hh"  // for CanonPath::rel
 
+#include <algorithm>
+#include <cstring>
+#include <chrono>
 #include <deque>
 #include <mutex>
 
@@ -183,52 +187,131 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
     Value vCallFlake = g_cachedCallFlake.get(ns);
     tick("cache.get done");
 
-    // (2) Build TW args — replicates libflake/flake.cc:callFlake
-    //     lines 932-969.  Uses TW's existing emitTreeAttrs +
-    //     buildBindings helpers since they produce TW Values
-    //     anyway; the bridge to v3 happens once at the end.
+    // (2) Build args V3-NATIVE per the steady-state V3-NATIVE
+    //     constraint: pure-data values are v3-allocated, TW touches
+    //     only the FFI leaves (emitTreeAttrs for the per-node
+    //     sourceInfo, fetchFinalTree primop invocation).
+    //
+    //     Pre-#700 this was 3 × `treeWalkerToV3Public` on full
+    //     TW-built Values, which forced every subsequent
+    //     `overrides.${key}.sourceInfo.outPath` etc. select to pay a
+    //     v3↔TW round-trip.  Now:
+    //       - vLocks: v3 String (Alloc::allocChars).
+    //       - vOverrides: outer Bindings is v3-native; per-node
+    //         `sourceInfo` is bridged ONCE per node (still pays
+    //         emitTreeAttrs's TW construction cost — it's the FFI
+    //         leaf for path/hash/timestamp formatting), but
+    //         subsequent selects on the OUTER attrset are v3-native.
+    //       - vFetchTreeFinal: v3 PrimOp Value wrapping
+    //         `__fetchFinalTree` (registered v3-side; its body
+    //         bridges into TW's internal primop on invocation —
+    //         which is rare with overrides supplied for all nodes).
     auto [lockFileStr, keyMap] = lockedFlake.lockFile.to_string();
+    tick("lockFile.to_string done");
 
-    auto overrides = ns.buildBindings(lockedFlake.nodePaths.size());
-    for (auto & [node, sourcePath] : lockedFlake.nodePaths) {
-        auto override = ns.buildBindings(2);
-        auto & vSourceInfo = override.alloc(ns.symbols.create("sourceInfo"));
-        auto lockedNode = node.dynamic_pointer_cast<const nix::flake::LockedNode>();
-        auto [storePath, subdir] = ns.store->toStorePath(sourcePath.path.abs());
-        nix::emitTreeAttrs(
-            ns,
-            storePath,
-            lockedNode ? lockedNode->lockedRef.input : lockedFlake.flake.lockedRef.input,
-            vSourceInfo,
-            false,
-            !lockedNode && lockedFlake.flake.forceDirty);
-
-        auto key = keyMap.find(node);
-        if (key == keyMap.end())
-            throw std::runtime_error(
-                "v3::callFlakeV3: node missing from lockfile keyMap");
-
-        override.alloc(ns.symbols.create("dir")).mkString(
-            nix::CanonPath(subdir).rel(), ns.mem);
-        overrides.alloc(ns.symbols.create(key->second)).mkAttrs(override);
+    // --- vLocks (v3 String) ---
+    Value v3Locks;
+    {
+        size_t n = lockFileStr.size();
+        char * buf = Alloc::allocChars(n + 1);
+        std::memcpy(buf, lockFileStr.data(), n);
+        buf[n] = '\0';
+        v3Locks.mkString(buf);
     }
-    nix::Value * vOverrides = ns.allocValue();
-    vOverrides->mkAttrs(overrides);
+    tick("vLocks built (v3 String)");
 
-    nix::Value * vLocks = ns.allocValue();
-    vLocks->mkString(lockFileStr, ns.mem);
+    // --- vOverrides (v3 outer Bindings, sourceInfo bridged once) ---
+    Value v3Overrides;
+    {
+        size_t N = lockedFlake.nodePaths.size();
+        Bindings * outer = Alloc::allocBindings(static_cast<uint32_t>(N));
+        allocStats().attrsetsAllocated++;
+        // Pre-intern the inner attr keys (used N times each).
+        SymbolId sidSourceInfo = ir::globalInternSymbol("sourceInfo");
+        SymbolId sidDir        = ir::globalInternSymbol("dir");
 
-    auto pFetchTreeFinal = nix::get(ns.internalPrimOps, "fetchFinalTree");
-    if (!pFetchTreeFinal || !*pFetchTreeFinal)
-        throw std::runtime_error(
-            "v3::callFlakeV3: state.internalPrimOps['fetchFinalTree'] missing");
-    nix::Value & vFetchTreeFinal = **pFetchTreeFinal;
+        size_t i = 0;
+        for (auto & [node, sourcePath] : lockedFlake.nodePaths) {
+            auto lockedNode = node.dynamic_pointer_cast<const nix::flake::LockedNode>();
+            auto [storePath, subdir] = ns.store->toStorePath(sourcePath.path.abs());
 
-    // (3) Bridge TW args to v3 Values.  Shallow per #662 — we don't
-    //     deep-walk; conversion is just a wrapper tag flip.
-    Value v3Locks      = treeWalkerToV3Public(ns, *vLocks);
-    Value v3Overrides  = treeWalkerToV3Public(ns, *vOverrides);
-    Value v3FetchFinal = treeWalkerToV3Public(ns, vFetchTreeFinal);
+            // Build TW sourceInfo via emitTreeAttrs (FFI leaf — knows
+            // how to format outPath context, narHash, lastModified
+            // etc. from a fetchers::Input).
+            nix::Value * twSourceInfo = ns.allocValue();
+            nix::emitTreeAttrs(
+                ns,
+                storePath,
+                lockedNode ? lockedNode->lockedRef.input
+                           : lockedFlake.flake.lockedRef.input,
+                *twSourceInfo,
+                false,
+                !lockedNode && lockedFlake.flake.forceDirty);
+            // Bridge ONCE per node — subsequent reads are v3-native
+            // until the per-attr value is forced.
+            Value v3SourceInfo = treeWalkerToV3Public(ns, *twSourceInfo);
+
+            // v3 String for `dir`.  CanonPath::rel returns string_view; copy.
+            std::string dirRel(nix::CanonPath(subdir).rel());
+            Value v3Dir;
+            {
+                size_t dn = dirRel.size();
+                char * dbuf = Alloc::allocChars(dn + 1);
+                std::memcpy(dbuf, dirRel.data(), dn);
+                dbuf[dn] = '\0';
+                v3Dir.mkString(dbuf);
+            }
+
+            // Inner Bindings { sourceInfo; dir; } — sorted by SymbolId.
+            Bindings * inner = Alloc::allocBindings(2);
+            allocStats().attrsetsAllocated++;
+            if (sidSourceInfo < sidDir) {
+                inner->entries[0] = {sidSourceInfo, v3SourceInfo};
+                inner->entries[1] = {sidDir,        v3Dir};
+            } else {
+                inner->entries[0] = {sidDir,        v3Dir};
+                inner->entries[1] = {sidSourceInfo, v3SourceInfo};
+            }
+            Value v3Inner;
+            v3Inner.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+            v3Inner.payload.bindings = inner;
+
+            // Outer key — the node-key string from keyMap.
+            auto key = keyMap.find(node);
+            if (key == keyMap.end())
+                throw std::runtime_error(
+                    "v3::callFlakeV3: node missing from lockfile keyMap");
+            SymbolId sidKey = ir::globalInternSymbol(key->second);
+
+            outer->entries[i++] = {sidKey, v3Inner};
+        }
+        // Bindings expects entries sorted by SymbolId (binary search).
+        std::sort(&outer->entries[0], &outer->entries[outer->size],
+            [](const auto & a, const auto & b){ return a.name < b.name; });
+        v3Overrides.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        v3Overrides.payload.bindings = outer;
+    }
+    tick("vOverrides built (v3 outer + bridged sourceInfo per node)");
+
+    // --- vFetchTreeFinal (v3 PrimOp Value) ---
+    //
+    // Looks up `__fetchFinalTree` in v3's PrimOp registry — Phase 3's
+    // accompanying primops.cc change registers this primop (body
+    // bridges into TW's internalPrimOps["fetchFinalTree"] when
+    // actually invoked).  Stays a v3 Value, doesn't pay a bridge
+    // round-trip at lookup time.
+    Value v3FetchFinal;
+    {
+        const PrimOp * po = findPrimOp("__fetchFinalTree");
+        if (!po)
+            throw std::runtime_error(
+                "v3::callFlakeV3: v3 primop `__fetchFinalTree` not "
+                "registered — primops.cc registerBuiltinPrimOps "
+                "should include it");
+        v3FetchFinal.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
+        v3FetchFinal.payload.primop = po;
+    }
+    tick("vFetchTreeFinal built (v3 PrimOp Value)");
 
     // (4) Apply args via callClosure on the active VMState.  Per
     //     STG-10, reuse the caller's VM — fresh VMState spawning at

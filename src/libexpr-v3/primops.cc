@@ -9438,6 +9438,25 @@ static void bridgeBuiltin(const char * name, EvalState & state,
 }
 
 void primFetchurl    (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchurl",    s, a, o); }
+// #700/step 3: v3-side wrapper for TW's `internalPrimOps["fetchFinalTree"]`.
+// Unlike `builtins.fetchTree` (in TW's builtins attrset), fetchFinalTree
+// is registered in TW's `internalPrimOps` map and isn't reachable via
+// `bridgeBuiltin` (which looks up `builtins.<name>`).  This wrapper looks
+// up the TW primop in internalPrimOps directly + dispatches the FFI fetch
+// + bridges the result.  Registered as `__fetchFinalTree` for v3.
+void primFetchFinalTree(EvalState & s, Value * a, Value & o) {
+    if (!s.nixEvalState)
+        throw std::runtime_error("v3 __fetchFinalTree: no TW state");
+    auto & ns = *s.nixEvalState;
+    auto pPrim = nix::get(ns.internalPrimOps, "fetchFinalTree");
+    if (!pPrim || !*pPrim)
+        throw std::runtime_error(
+            "v3 __fetchFinalTree: state.internalPrimOps['fetchFinalTree'] missing");
+    nix::Value * narg = v3ToTreeWalker(s, a[0]);
+    nix::Value twResult;
+    ns.callFunction(**pPrim, *narg, twResult, nix::noPos);
+    o = treeWalkerToV3Public(ns, twResult);
+}
 void primFetchTarball(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchTarball", s, a, o); }
 void primFetchTree   (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchTree",   s, a, o); }
 void primFetchGit    (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchGit",    s, a, o); }
@@ -9732,6 +9751,15 @@ void registerBuiltinPrimOps()
         // WC-28c: filterSource (delegate too).
         registerPrimOp({"filterSource",       2, primFilterSource});
         registerPrimOp({"__filterSource",     2, primFilterSource});
+        // #700/step 3: v3-native wrapper for TW's
+        // `internalPrimOps["fetchFinalTree"]`.  Used by call-flake.nix
+        // when an input lacks an override + is non-relative.  In the
+        // common `builtins.getFlake "X"` path, all nodes have
+        // overrides supplied by callFlakeV3 → this is a fallback path
+        // rarely hit; but it must exist as a v3 PrimOp Value so
+        // call-flake.nix's `fetchTreeFinal` parameter has the right
+        // type even when never called.
+        registerPrimOp({"__fetchFinalTree",   1, primFetchFinalTree});
         // Path B M3 (2026-05-20): getFlake primop.  Registered into TW
         // via libflake's evalSettings.extraPrimOps; bridge through to
         // TW so v3-direct can resolve `builtins.getFlake` for cardano-
