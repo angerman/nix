@@ -77,6 +77,7 @@ lib_sources = files(
   'opt_const_fold.cc',
   'opt_cse.cc',
   'opt_dce.cc',
+  'opt_func_strictness.cc',
   'opt_inline.cc',
   'opt_occur.cc',
   'opt_app_spine_fold.cc',

@@ -551,6 +551,33 @@ struct Function {
     VarId intrinsicVar0 = kInvalid;
     VarId intrinsicVar1 = kInvalid;
     VarId intrinsicVar2 = kInvalid;
+
+    /// #737 Stage 4 v2 (2026-05-21) per-Function strictness signature.
+    ///
+    /// One entry per formal argument the function accepts at the
+    /// emit-time call ABI level.  Order matches `formals` (for
+    /// formals-style lambdas) or `[paramVar]` (for single-arg `x:
+    /// body`).  Computed by `computeFunctionStrictness` (in
+    /// opt_func_strictness.cc) AFTER `optimise` and BEFORE
+    /// `computeFreeVars`.
+    ///
+    /// `strictArgs[i] == true` means: EVERY execution path through
+    /// the body forces formal #i before any branching point.  Such
+    /// formals are SAFE to pre-force at the call site (no thunk
+    /// allocation needed; direct value push).
+    ///
+    /// `strictArgs[i] == false` means: at least one path through
+    /// the body does NOT force formal #i — the formal MUST stay
+    /// lazy at the call site (thunkify-for-arg as today).
+    ///
+    /// This is INFORMATION ONLY for v2 — the call-site emitter does
+    /// not yet consume the signature.  Future v3 wiring through
+    /// OP_CALL_STRICT (or equivalent) will skip MkThunk on strict
+    /// positions when the callee is statically known.
+    ///
+    /// The vector is sized once by `computeFunctionStrictness`;
+    /// empty if the pass hasn't run yet.
+    std::vector<bool> strictArgs;
 };
 
 // ---------------------------------------------------------------------------
@@ -871,6 +898,30 @@ size_t elimRedundantForce(Module & m);
 /// wrapper-source primop.  No-op when `NIX_V3_NO_OPT` is set (escape
 /// hatch for debugging).
 void optimise(Module & m);
+
+/// #737 Stage 4 v2 (2026-05-21) per-Function strictness inference.
+///
+/// For each `ir::Function` in `m.functions`, computes the
+/// `strictArgs` bitmap (one bit per formal argument).  The bit is
+/// set iff EVERY execution path through the body forces the formal
+/// before any branching point.
+///
+/// Forward dataflow over body blocks:
+///   - maintain a "definitely forced" VarId set.
+///   - each binding `var = e` adds e's strict operands to the set.
+///   - terminal flow: `TermReturn{v}` does NOT force v (the caller
+///     forces the return value, not the function itself).
+///   - branching ops (If/With/Assert) force their scrutinee but
+///     branch bodies are NOT walked recursively in v2 — only the
+///     pre-branch linear prefix is considered.  This is conservative
+///     (under-marks strictness) and safe.
+///
+/// Result is INFORMATION ONLY for this commit (Stage 4 v2): the
+/// emitter does not yet apply the signature at call sites.  Future
+/// v3 will wire caller-side use through OP_CALL_STRICT.  When
+/// `NIX_V3_DBG_STRICTNESS=1` is set, emits a one-line summary at
+/// the end of the pass.
+void computeFunctionStrictness(Module & m);
 
 // ---------------------------------------------------------------------------
 // #540: occurrence analysis (per lode/OPT_OCCUR_PLAN_2026-05-08.md)

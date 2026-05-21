@@ -152,6 +152,15 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     if (!s_noOptimise) ir::optimise(module);
     pt.mark(pt.optimise_ms);
 
+    // #737 Stage 4 v2: per-Function strictness inference.  Runs
+    // AFTER `optimise` (so any DCE-removed dead bindings and any
+    // inlined VarRef aliases are already collapsed) and BEFORE
+    // `computeFreeVars` (the strictness bitmap is information-only
+    // for v2; doesn't affect freeVars computation).  Result is
+    // stored in `ir::Function::strictArgs`; future v3 will consume
+    // it at call-site emit.
+    ir::computeFunctionStrictness(module);
+
     // computeFreeVars: populates each `ir::Function::freeVars` from
     // `Function::vars`.  Required before `compile` so the emitter
     // knows which upvalues each closure captures.  Must run AFTER
