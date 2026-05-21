@@ -159,18 +159,18 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // `ir::Function::strictArgs`.
     ir::computeFunctionStrictness(module);
 
-    // #742 Stage 4 v4: caller-side use of strictness signature.
-    // Walks every App; if `fun` resolves to a known Lambda whose
-    // callee.strictArgs[0] is true AND the App's arg is a
-    // single-use MkThunk with a simple body, inline the thunk body
-    // and replace the App's arg with the inlined tail.  The
-    // MkThunk binding becomes dead — DCE not re-run here (kept
-    // small to avoid disturbing optimise's invariants), but the
-    // orphan MkThunk binding is a value-creation no-op once its
-    // VarId is unreferenced.  Future v4.1 may add a targeted
-    // dead-thunk sweep.  Runs BEFORE computeFreeVars so the
-    // inlined bindings get their freeVars populated correctly.
-    ir::applyStrictnessAtCallSites(module);
+    // #742 Stage 4 v4 / #743 v4.1: caller-side use of strictness
+    // signature.  Each pass elides single-use MkThunk wraps at
+    // strict positions where the callee is statically known.  We
+    // iterate up to 8× to handle compound shapes: e.g. `f { a =
+    // [1 2 3]; }` has both an outer MkThunk wrapping the AttrSet
+    // AND inner MkThunk wraps on the entries' values.  Pass 1
+    // elides the outer wrap (exposing the AttrSet directly); pass
+    // 2 sees the AttrSet and elides the strict-formal entries'
+    // wraps.  Iteration terminates when a pass returns 0 elisions.
+    for (int it = 0; it < 8; ++it) {
+        if (ir::applyStrictnessAtCallSites(module) == 0) break;
+    }
 
     // computeFreeVars: populates each `ir::Function::freeVars` from
     // `Function::vars`.  Required before `compile` so the emitter

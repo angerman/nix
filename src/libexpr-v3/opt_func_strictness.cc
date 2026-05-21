@@ -283,11 +283,54 @@ void computeFunctionStrictness(Module & m)
                 }
             }
         }
+        // #743 v4.1 — for formals-style lambdas, if ANY formal is
+        // strict, paramVar is implicitly strict.  Reason: every formal
+        // access (RecBindingSlotRef{formalsRec, name}) forces the
+        // formalsRec entry's thunk, which in turn calls AttrSelect on
+        // paramVar.  An unconditional formal access therefore forces
+        // paramVar.  This lets caller-side strictness elide the
+        // outer MkThunk wrap around the App's arg attrset.
+        if (hasFormals && hasParam && !f.strictArgs.empty()
+            && !f.strictArgs[paramSlot])
+        {
+            bool anyFormalStrict = false;
+            for (size_t i = 0; i < f.formals.size(); ++i) {
+                const size_t slot = formalsStart + i;
+                if (slot < f.strictArgs.size() && f.strictArgs[slot]) {
+                    anyFormalStrict = true;
+                    break;
+                }
+            }
+            if (anyFormalStrict) {
+                f.strictArgs[paramSlot] = true;
+                ++strictForFn;
+            }
+        }
         if (strictForFn > 0) ++fnsWithArgs;
         formalsStrict += strictForFn;
     }
 
     if (s_dbg) {
+        // v4.1 verbose: dump per-Function strictArgs when any are set.
+        static const bool sv_dbg_verbose =
+            std::getenv("NIX_V3_DBG_STRICTNESS_VERBOSE") != nullptr;
+        if (sv_dbg_verbose) {
+            for (FuncId fid = 0; fid < (FuncId)m.functions.size(); ++fid) {
+                const Function & f = m.functions[fid];
+                if (f.strictArgs.empty()) continue;
+                bool any = false;
+                for (auto b : f.strictArgs) if (b) { any = true; break; }
+                if (!any) continue;
+                std::fprintf(stderr,
+                    "  fid=%u name=%s hasFormals=%d strictArgs=[",
+                    (unsigned)fid, f.name.empty() ? "?" : f.name.c_str(),
+                    (int)f.hasFormals);
+                for (size_t i = 0; i < f.strictArgs.size(); ++i)
+                    std::fprintf(stderr, "%s%d",
+                        i ? "," : "", (int)bool(f.strictArgs[i]));
+                std::fprintf(stderr, "]\n");
+            }
+        }
         std::fprintf(stderr,
             "v3 stage4 strictness: functions=%zu with-strict-args=%zu "
             "formals=%zu strict=%zu (%.1f%%)\n",

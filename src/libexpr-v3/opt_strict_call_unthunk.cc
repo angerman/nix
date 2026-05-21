@@ -125,9 +125,30 @@ bool remapExprVars(Expr & e, const std::unordered_map<VarId, VarId> & sub)
             }
             return true;
         }
-        // Refuse cloning: sub-block / sub-Function carriers.
-        else if constexpr (std::is_same_v<T, Lambda>   || std::is_same_v<T, MkThunk>
-                        || std::is_same_v<T, If>       || std::is_same_v<T, With>
+        // #743 v4.1 — Lambda / MkThunk are cloneable WITHOUT
+        // recursively cloning their sub-Function: both old and new
+        // bindings share the same `funcIdx`.  Only `freeVars` (and
+        // for Lambda/MkThunk `lws` — lexical-with capture list)
+        // need VarId remapping.  This unblocks inlining of outer
+        // thunks that wrap an AttrSet whose entries are themselves
+        // MkThunk bindings — the common formals-style call site
+        // shape `f { a = e1; b = e2; }`.
+        //
+        // Note: `freeVars` is populated by computeFreeVars, which
+        // runs AFTER this pass.  So at clone time freeVars is
+        // empty and remapping is a no-op — the post-pass freeVars
+        // analysis rebuilds them in the cloned binding's location.
+        else if constexpr (std::is_same_v<T, Lambda>) {
+            remapVarVec(v.freeVars, sub);
+            return true;
+        }
+        else if constexpr (std::is_same_v<T, MkThunk>) {
+            remapVarVec(v.freeVars, sub);
+            return true;
+        }
+        // Refuse cloning: sub-block carriers that would need
+        // recursive block cloning (out of v4.1 scope).
+        else if constexpr (std::is_same_v<T, If>       || std::is_same_v<T, With>
                         || std::is_same_v<T, Assert>   || std::is_same_v<T, And>
                         || std::is_same_v<T, Or>       || std::is_same_v<T, Impl>
                         || std::is_same_v<T, LetRec>)
@@ -325,23 +346,24 @@ const Lambda * resolveCalleeLambda(
     if (const auto * lam = std::get_if<Lambda>(e))
         return lam;
 
-    // RecBindingSlotRef: trace through the LetRec.  Note that
-    // rb->attrs is typically the recSlotVar (heap-stable slot
-    // pointer; v3 default with NIX_V3_NO_REC_SLOT_CAPTURE unset),
-    // NOT the LetRec binding's defining VarId directly.  Resolve
-    // via Module::recVarToSlotVar (reverse lookup) if available.
+    // RecBindingSlotRef: trace through the LetRec.  Three resolution
+    // strategies tried in order:
+    //   1. rb->attrs is the LetRec binding's defining VarId directly.
+    //   2. rb->attrs is a recSlotVar, mapped via
+    //      Module::recVarToSlotVar (reverse lookup).
+    //   3. Structural match (#743 v4.1 fallback): walk all LetRec
+    //      bindings in same block; pick one whose entries contains a
+    //      name matching rb->name.  Robust to post-optimise VarId
+    //      renumbering that breaks the strict (recVar, slotVar)
+    //      bookkeeping path.
     const auto * rb = std::get_if<RecBindingSlotRef>(e);
     if (!rb) return nullptr;
-    // First try: rb->attrs is the LetRec binding directly.
     const LetRec * lr = nullptr;
     auto recIt = defs.find(rb->attrs);
     if (recIt != defs.end()) {
         if (const auto * direct = std::get_if<LetRec>(recIt->second))
             lr = direct;
     }
-    // Fallback: rb->attrs is a recSlotVar.  Find the recVar from
-    // Module::recVarToSlotVar (which maps recVar → slotVar), then
-    // look up the LetRec binding at recVar.
     if (!lr) {
         for (const auto & [recVar, slotVar] : m.recVarToSlotVar) {
             if (slotVar != rb->attrs) continue;
@@ -352,6 +374,22 @@ const Lambda * resolveCalleeLambda(
                     break;
                 }
             }
+        }
+    }
+    if (!lr) {
+        // Structural fallback — pick first same-block LetRec whose
+        // entries contain `rb->name`.  In real Nix, multiple LetRecs
+        // in one block with the same entry name is rare; if it
+        // happens, the conservative outcome (picking the first match
+        // for a shadowed name) is "miss the strictness opportunity,"
+        // not a correctness violation.
+        for (const auto & [varId, exprPtr] : defs) {
+            const auto * candidate = std::get_if<LetRec>(exprPtr);
+            if (!candidate) continue;
+            for (const auto & ent : candidate->entries) {
+                if (ent.name == rb->name) { lr = candidate; break; }
+            }
+            if (lr) break;
         }
     }
     if (!lr) return nullptr;
@@ -395,6 +433,34 @@ const Lambda * resolveCalleeLambda(
 // Public entry: applyStrictnessAtCallSites.
 // ---------------------------------------------------------------------------
 
+// #743 v4.1 helper: is the MkThunk safe to inline at this call site?
+// Checks: arg is a MkThunk in same block, exactly one use, body is
+// `bodyIsSimple` (cloneable).  Returns true on success and fills the
+// out-params; false on any safety failure.
+static bool isInlinableMkThunk(VarId argVar, const Module & m,
+                                const std::unordered_map<VarId, const Expr *> & defs,
+                                const UseCounter & uses,
+                                VarId & outDefVar,
+                                const MkThunk * & outMkt,
+                                const Block * & outBody)
+{
+    auto res = chaseInBlockResolved(argVar, defs);
+    if (!res.expr) return false;
+    const MkThunk * mkt = std::get_if<MkThunk>(res.expr);
+    if (!mkt) return false;
+    if (uses.at(res.definer) != 1) return false;
+    if (mkt->funcIdx >= (FuncId)m.functions.size()) return false;
+    const Function & thunkFn = m.functions[mkt->funcIdx];
+    if (thunkFn.entryBlock == kInvalidBlock
+        || thunkFn.entryBlock >= (BlockId)m.blocks.size()) return false;
+    const Block & body = m.blocks[thunkFn.entryBlock];
+    if (!bodyIsSimple(body)) return false;
+    outDefVar = res.definer;
+    outMkt    = mkt;
+    outBody   = &body;
+    return true;
+}
+
 size_t applyStrictnessAtCallSites(Module & m)
 {
     static const bool disabled =
@@ -406,86 +472,172 @@ size_t applyStrictnessAtCallSites(Module & m)
     // Module-wide use count for the "MkThunk has one use" safety check.
     UseCounter uses = countModuleUses(m);
 
-    size_t elided = 0;
-    size_t consideredApps = 0;
+    size_t elidedSingleArg = 0;
+    size_t elidedFormals   = 0;
+    size_t consideredApps  = 0;
 
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
         Block & blk = m.blocks[bid];
         auto defs = mapBlockDefs(blk);
 
+        // ----- PRE-ANALYSIS -----
+        // Identify all MkThunk binding VarIds that should be elided
+        // (their body inlined and the MkThunk binding skipped during
+        // the main rewrite pass).  Two patterns:
+        //
+        //   single-arg: App{fun, arg} where arg is a MkThunk and the
+        //               callee is single-arg with strictArgs[0]=true.
+        //
+        //   formals-style: App{fun, attrSet} where attrSet is an
+        //               AttrSet binding and the callee is formals-
+        //               style.  For each strict-formal name with a
+        //               matching entry whose value is a MkThunk,
+        //               mark for elision.
+        std::unordered_set<VarId> mkthunksToElide;
+
+        for (const auto & bd : blk.bindings) {
+            const App * app = std::get_if<App>(&bd.expr);
+            if (!app) continue;
+            ++consideredApps;
+
+            const Lambda * lam = resolveCalleeLambda(app->fun, m, defs);
+            if (!lam) continue;
+            if (lam->funcIdx >= (FuncId)m.functions.size()) continue;
+            const Function & callee = m.functions[lam->funcIdx];
+            if (callee.strictArgs.empty()) continue;
+
+            // (A) Outer-thunk elision — applies to any callee
+            // whose strictArgs[0] is true (the paramVar position).
+            // For single-arg lambdas this is the only arg; for
+            // formals-style this is the entire attrset.  Stage 4 v3's
+            // "any-formal-strict → paramVar-strict" heuristic ensures
+            // formals-style lambdas with strict formals trip this
+            // branch too.
+            if (callee.strictArgs[0]) {
+                VarId defVar = kInvalid;
+                const MkThunk * mkt = nullptr;
+                const Block * body = nullptr;
+                if (isInlinableMkThunk(app->arg, m, defs, uses,
+                                       defVar, mkt, body)) {
+                    mkthunksToElide.insert(defVar);
+                }
+            }
+
+            // (B) Inner attrset-entry elision — applies to formals-
+            // style callees where individual formals are strict.
+            // Requires App's arg to be a DIRECT AttrSet binding in
+            // the same block.  Hit on iteration 2 after outer elision
+            // has inlined any wrapping MkThunk in pass 1.
+            if (callee.hasFormals) {
+                const bool hasParam = (callee.paramVar != kInvalid);
+                const size_t formalsStart = hasParam ? 1 : 0;
+                std::unordered_map<SymbolId, bool> strictByName;
+                for (size_t i = 0; i < callee.formals.size(); ++i) {
+                    const size_t slot = formalsStart + i;
+                    if (slot >= callee.strictArgs.size()) break;
+                    if (callee.strictArgs[slot])
+                        strictByName.emplace(callee.formals[i].name, true);
+                }
+                if (strictByName.empty()) continue;
+
+                // Resolve App's arg to an AttrSet binding in same block.
+                auto argRes = chaseInBlockResolved(app->arg, defs);
+                if (!argRes.expr) continue;
+                const AttrSet * as = std::get_if<AttrSet>(argRes.expr);
+                if (!as) continue;
+
+                // For each strict-formal name with a matching entry,
+                // check if the entry's value VarId resolves to a
+                // single-use MkThunk with a simple body.
+                for (const auto & ent : as->entries) {
+                    if (!strictByName.count(ent.name)) continue;
+                    VarId defVar = kInvalid;
+                    const MkThunk * mkt = nullptr;
+                    const Block * body = nullptr;
+                    if (!isInlinableMkThunk(ent.value, m, defs, uses,
+                                            defVar, mkt, body)) continue;
+                    mkthunksToElide.insert(defVar);
+                }
+            }
+        }
+
+        // ----- MAIN PASS -----
+        // Walk bindings; inline elide-marked MkThunks (replacing the
+        // MkThunk binding with its cloned body) and rewrite any
+        // downstream AttrSet / App that references the elided VarId.
+        std::unordered_map<VarId, VarId> elidedToInline;
         std::vector<Binding> out;
         out.reserve(blk.bindings.size() * 2);
 
         for (const auto & bd : blk.bindings) {
-            // Default action: keep binding unchanged.  Each `continue`
-            // below short-circuits to this path.
-            const App * app = std::get_if<App>(&bd.expr);
-            if (!app) { out.push_back(bd); continue; }
-            ++consideredApps;
-
-            // Resolve `fun` to a Lambda — direct inline OR through
-            // a same-block RecBindingSlotRef → LetRec.entry chain.
-            const Lambda * lam = resolveCalleeLambda(app->fun, m, defs);
-            if (!lam) { out.push_back(bd); continue; }
-
-            // Look up callee Function.
-            if (lam->funcIdx >= (FuncId)m.functions.size()) {
-                out.push_back(bd); continue;
-            }
-            const Function & callee = m.functions[lam->funcIdx];
-
-            // v4 scope: single-arg lambdas only.  Formals-style lambdas
-            // would need attrset-entry-level rewriting (the App's arg is
-            // the whole attrset, not individual formals); deferred.
-            if (callee.hasFormals) { out.push_back(bd); continue; }
-
-            // Strict-arg-0 required (paramVar slot).
-            if (callee.strictArgs.empty() || !callee.strictArgs[0]) {
-                out.push_back(bd); continue;
+            // Elide MkThunk binding by inlining its body.
+            if (mkthunksToElide.count(bd.var)) {
+                const auto * mkt = std::get_if<MkThunk>(&bd.expr);
+                // We pre-verified this in the analysis pass.
+                if (!mkt) { out.push_back(bd); continue; }
+                const Function & thunkFn = m.functions[mkt->funcIdx];
+                const Block & thunkBody = m.blocks[thunkFn.entryBlock];
+                VarId tail = inlineThunkBody(m, thunkBody, out);
+                elidedToInline[bd.var] = tail;
+                // SKIP emitting the MkThunk binding itself.
+                continue;
             }
 
-            // Resolve `arg` to a MkThunk in the same block.
-            auto argRes = chaseInBlockResolved(app->arg, defs);
-            if (!argRes.expr) { out.push_back(bd); continue; }
-            const MkThunk * mkt = std::get_if<MkThunk>(argRes.expr);
-            if (!mkt) { out.push_back(bd); continue; }
-
-            // Safety: the MkThunk's defining VarId must have exactly
-            // ONE use — the App we're about to rewrite.  Otherwise
-            // other consumers expect the thunk's lazy semantics.
-            if (uses.at(argRes.definer) != 1) { out.push_back(bd); continue; }
-
-            // Thunk body must be "simple" (no nested sub-block /
-            // Function-creator nodes that would require recursive
-            // cloning).
-            if (mkt->funcIdx >= (FuncId)m.functions.size()) {
-                out.push_back(bd); continue;
+            // Rewrite downstream references via elidedToInline.
+            // The bindings we need to rewrite are:
+            //   - App.arg (single-arg case)
+            //   - AttrSet.entries[i].value (formals-style case)
+            // Other Expr kinds may reference an elided var indirectly
+            // through VarRef chains, but those should also resolve
+            // correctly without explicit rewriting since we left the
+            // VarRef bindings intact.  (A VarRef pointing at an
+            // elided MkThunk var becomes a dangling reference; we
+            // need to remap those too.)
+            if (auto * app = std::get_if<App>(&bd.expr)) {
+                App copy = *app;
+                auto it = elidedToInline.find(copy.arg);
+                if (it != elidedToInline.end()) {
+                    copy.arg = it->second;
+                    ++elidedSingleArg;
+                }
+                out.push_back({bd.var, std::move(copy)});
+                continue;
             }
-            const Function & thunkFn = m.functions[mkt->funcIdx];
-            if (thunkFn.entryBlock == kInvalidBlock
-                || thunkFn.entryBlock >= (BlockId)m.blocks.size()) {
-                out.push_back(bd); continue;
+            if (auto * as = std::get_if<AttrSet>(&bd.expr)) {
+                AttrSet copy = *as;
+                bool anyChange = false;
+                for (auto & ent : copy.entries) {
+                    auto it = elidedToInline.find(ent.value);
+                    if (it != elidedToInline.end()) {
+                        ent.value = it->second;
+                        anyChange = true;
+                        ++elidedFormals;
+                    }
+                }
+                (void)anyChange;
+                out.push_back({bd.var, std::move(copy)});
+                continue;
             }
-            const Block & thunkBody = m.blocks[thunkFn.entryBlock];
-            if (!bodyIsSimple(thunkBody)) {
-                out.push_back(bd); continue;
+            if (auto * vr = std::get_if<VarRef>(&bd.expr)) {
+                VarRef copy = *vr;
+                auto it = elidedToInline.find(copy.var);
+                if (it != elidedToInline.end()) copy.var = it->second;
+                out.push_back({bd.var, std::move(copy)});
+                continue;
             }
-
-            // All safety checks passed — inline the thunk body.
-            VarId tail = inlineThunkBody(m, thunkBody, out);
-            // Emit the App with the elided arg.
-            out.push_back({bd.var, App{app->fun, tail}});
-            ++elided;
+            // Default: emit as-is.
+            out.push_back(bd);
         }
 
         blk.bindings = std::move(out);
     }
 
+    const size_t elided = elidedSingleArg + elidedFormals;
     if (dbg) {
         std::fprintf(stderr,
-            "v3 stage4 v4 strict-call-unthunk: elided=%zu "
-            "of %zu Apps considered\n",
-            elided, consideredApps);
+            "v3 stage4 v4.1 strict-call-unthunk: elided=%zu "
+            "(single-arg=%zu formals=%zu) of %zu Apps considered\n",
+            elided, elidedSingleArg, elidedFormals, consideredApps);
     }
 
     return elided;
