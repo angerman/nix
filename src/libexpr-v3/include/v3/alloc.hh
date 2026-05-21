@@ -936,6 +936,12 @@ struct BindingsOrigin
 {
     uint32_t     posHandle;
     const char * source;
+    /// 2026-05-21 diagnostic for #747: capture the `n` passed to
+    /// allocBindings so dumpBindingsAttribution can compare
+    /// alloc-time bytes vs dump-time bytes (b->size after any
+    /// post-alloc mutation) per origin.  Bumped from
+    /// `bindingsAllocSiteRecord` / `recordBindingsOrigin`.
+    uint32_t     allocN;
 };
 
 inline bool bindingsOriginEnabled()
@@ -970,7 +976,13 @@ inline std::unordered_map<const Bindings *, BindingsOrigin> & bindingsOriginTabl
 inline void recordBindingsOrigin(const Bindings * b, uint32_t pos, const char * src) noexcept
 {
     if (!b || !bindingsOriginEnabled()) return;
-    bindingsOriginTable()[b] = {pos, src};
+    // Preserve allocN if already recorded (the implicit
+    // bindingsAllocSiteRecord captures it first; explicit semantic
+    // labels via recordBindingsOrigin should NOT clobber it).
+    auto & tbl = bindingsOriginTable();
+    auto it = tbl.find(b);
+    uint32_t prevAllocN = (it != tbl.end()) ? it->second.allocN : (b ? b->size : 0u);
+    tbl[b] = {pos, src, prevAllocN};
 }
 
 inline const BindingsOrigin * lookupBindingsOrigin(const Bindings * b)
@@ -1207,7 +1219,10 @@ inline void bindingsAllocSiteRecord(const Bindings * b,
         lbl = out;
         labels[key] = lbl;
     }
-    recordBindingsOrigin(b, 0, lbl);
+    // recordBindingsOrigin preserves allocN if it was previously set;
+    // since this is the FIRST record for `b`, capture the current
+    // b->size (== n at alloc time, before any post-alloc mutation).
+    bindingsOriginTable()[b] = {0, lbl, b->size};
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,8 +1258,9 @@ struct BindingsAttrRollupEntry
 {
     const char * source;
     uint64_t     allocCount;
-    uint64_t     totalBytes;
-    uint64_t     sizeBuckets[10]; // matches attrsetSizeBuckets layout
+    uint64_t     totalBytes;       // dump-time: 8 + 24 * b->size summed
+    uint64_t     totalAllocBytes;  // alloc-time: 8 + 24 * allocN summed
+    uint64_t     sizeBuckets[10];  // matches attrsetSizeBuckets layout
 };
 
 inline void dumpBindingsAttribution(std::FILE * out, size_t topN = 20) noexcept
@@ -1283,6 +1299,9 @@ inline void dumpBindingsAttribution(std::FILE * out, size_t topN = 20) noexcept
         const uint64_t bytes = sizeof(Bindings)
                              + sizeof(Bindings::Entry) * b->size;
         r.totalBytes += bytes;
+        const uint64_t allocBytes = sizeof(Bindings)
+                                  + sizeof(Bindings::Entry) * o.allocN;
+        r.totalAllocBytes += allocBytes;
         const uint32_t n = b->size;
         int bk;
         if      (n == 0)        bk = 0;
@@ -1306,40 +1325,41 @@ inline void dumpBindingsAttribution(std::FILE * out, size_t topN = 20) noexcept
     std::sort(sorted.begin(), sorted.end(),
         [](const BindingsAttrRollupEntry & a,
            const BindingsAttrRollupEntry & b) {
-            if (a.totalBytes != b.totalBytes)
-                return a.totalBytes > b.totalBytes;
-            // Tiebreak by allocCount, then by source pointer
-            // (deterministic given identical labels share a pointer).
+            // Sort by ALLOC bytes (what each origin actually drew
+            // from the arena) — this is what reduces RSS, not the
+            // dump-time live-entry count.
+            if (a.totalAllocBytes != b.totalAllocBytes)
+                return a.totalAllocBytes > b.totalAllocBytes;
             if (a.allocCount != b.allocCount)
                 return a.allocCount > b.allocCount;
             return std::less<const char *>{}(a.source, b.source);
         });
 
-    uint64_t grandBytes = 0, grandAllocs = 0;
+    uint64_t grandBytes = 0, grandAllocs = 0, grandAllocBytes = 0;
     for (const auto & r : sorted) {
-        grandBytes  += r.totalBytes;
-        grandAllocs += r.allocCount;
+        grandBytes      += r.totalBytes;
+        grandAllocBytes += r.totalAllocBytes;
+        grandAllocs     += r.allocCount;
     }
     std::fprintf(out,
         "v3-direct bindings-attr: %zu distinct origins, "
-        "%llu total allocs, %.1f MB total tracked "
-        "(top %zu by bytes; skipped null-source=%llu):\n",
+        "%llu total allocs, dump=%.1f MB alloc=%.1f MB slack=%.1f MB "
+        "(top %zu by alloc-bytes; skipped null-source=%llu):\n",
         sorted.size(),
         (unsigned long long)grandAllocs,
-        grandBytes / 1e6,
+        grandBytes      / 1e6,
+        grandAllocBytes / 1e6,
+        (grandAllocBytes - grandBytes) / 1e6,
         std::min(topN, sorted.size()),
         (unsigned long long)skippedNullSource);
     // Header — left-aligned label up to 70 cols; tabular counts.
     std::fprintf(out,
-        "  %-70s %12s %10s %7s    %s\n",
-        "origin", "allocs", "bytes", "pct",
-        "[0 / 1 / 2 / 3-4 / 5-8 / 9-16 / 17-32 / 33-64 / 65-128 / 129+]");
+        "  %-70s %10s %10s %10s %7s   %s\n",
+        "origin", "allocs", "dump_MB", "alloc_MB", "slack%",
+        "[0/1/2/3-4/5-8/9-16/17-32/33-64/65-128/129+]");
     const size_t lim = std::min(topN, sorted.size());
     for (size_t i = 0; i < lim; ++i) {
         const auto & r = sorted[i];
-        const double pct = grandBytes > 0
-            ? double(r.totalBytes) * 100.0 / double(grandBytes)
-            : 0.0;
         // Truncate to 70 chars to keep output table-shaped.
         const char * src = r.source ? r.source : "<unknown>";
         const size_t slen = std::strlen(src);
@@ -1351,13 +1371,18 @@ inline void dumpBindingsAttribution(std::FILE * out, size_t topN = 20) noexcept
             // alloc-site labels) — that's the part we want to read.
             std::snprintf(label, sizeof label, "...%s", src + (slen - 67));
         }
+        const double slackPct = r.totalAllocBytes > 0
+            ? double(r.totalAllocBytes - r.totalBytes) * 100.0
+              / double(r.totalAllocBytes)
+            : 0.0;
         std::fprintf(out,
-            "  %-70s %12llu %9.1fMB %6.1f%%    "
+            "  %-70s %10llu %9.1fMB %9.1fMB %6.1f%%   "
             "[%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu]\n",
             label,
             (unsigned long long)r.allocCount,
-            r.totalBytes / 1e6,
-            pct,
+            r.totalBytes      / 1e6,
+            r.totalAllocBytes / 1e6,
+            slackPct,
             (unsigned long long)r.sizeBuckets[0],
             (unsigned long long)r.sizeBuckets[1],
             (unsigned long long)r.sizeBuckets[2],
@@ -1373,16 +1398,16 @@ inline void dumpBindingsAttribution(std::FILE * out, size_t topN = 20) noexcept
     // top-N?  Useful for "is this a long-tail or head-heavy?"
     // decisions when picking the lever.
     if (lim < sorted.size()) {
-        uint64_t topBytes = 0, topAllocs = 0;
+        uint64_t topAllocBytes = 0, topAllocs = 0;
         for (size_t i = 0; i < lim; ++i) {
-            topBytes  += sorted[i].totalBytes;
-            topAllocs += sorted[i].allocCount;
+            topAllocBytes += sorted[i].totalAllocBytes;
+            topAllocs     += sorted[i].allocCount;
         }
-        const double topPct = grandBytes > 0
-            ? double(topBytes) * 100.0 / double(grandBytes)
+        const double topPct = grandAllocBytes > 0
+            ? double(topAllocBytes) * 100.0 / double(grandAllocBytes)
             : 0.0;
         std::fprintf(out,
-            "  (top-%zu covers %.1f%% of bytes / %llu of %llu allocs; "
+            "  (top-%zu covers %.1f%% of alloc-bytes / %llu of %llu allocs; "
             "%zu more origins in the tail)\n",
             lim, topPct,
             (unsigned long long)topAllocs,
