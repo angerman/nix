@@ -939,6 +939,23 @@ void optimise(Module & m);
 /// the end of the pass.
 void computeFunctionStrictness(Module & m);
 
+/// #742 Stage 4 v4 (2026-05-21) — caller-side application of the
+/// strictness signature.  Walks every App binding; if `fun`
+/// statically resolves to a Lambda whose target Function has
+/// strictArgs[0] == true, AND the App's arg is a MkThunk in the
+/// same block with exactly one use and a simple body, inline the
+/// thunk body into the calling block and replace the App's arg
+/// with the inlined tail.  Defined in opt_strict_call_unthunk.cc.
+///
+/// Returns the number of MkThunk wraps elided.
+///
+/// Runs AFTER `computeFunctionStrictness` (so strictArgs is set)
+/// and BEFORE `computeFreeVars` (so the inlined bindings are
+/// visible to freeVars).  Gate: NIX_V3_NO_STRICT_CALL_UNTHUNK=1
+/// disables.  Telemetry: NIX_V3_DBG_STRICT_CALL_UNTHUNK=1 prints
+/// elision count.
+size_t applyStrictnessAtCallSites(Module & m);
+
 // ---------------------------------------------------------------------------
 // #540: occurrence analysis (per lode/OPT_OCCUR_PLAN_2026-05-08.md)
 // ---------------------------------------------------------------------------

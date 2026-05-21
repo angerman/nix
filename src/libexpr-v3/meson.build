@@ -79,6 +79,7 @@ lib_sources = files(
   'opt_dce.cc',
   'opt_func_strictness.cc',
   'opt_inline.cc',
+  'opt_strict_call_unthunk.cc',
   'opt_occur.cc',
   'opt_app_spine_fold.cc',
   'opt_genlist_unroll.cc',

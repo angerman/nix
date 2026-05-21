@@ -155,11 +155,22 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // #737 Stage 4 v2: per-Function strictness inference.  Runs
     // AFTER `optimise` (so any DCE-removed dead bindings and any
     // inlined VarRef aliases are already collapsed) and BEFORE
-    // `computeFreeVars` (the strictness bitmap is information-only
-    // for v2; doesn't affect freeVars computation).  Result is
-    // stored in `ir::Function::strictArgs`; future v3 will consume
-    // it at call-site emit.
+    // `computeFreeVars`.  Result is stored in
+    // `ir::Function::strictArgs`.
     ir::computeFunctionStrictness(module);
+
+    // #742 Stage 4 v4: caller-side use of strictness signature.
+    // Walks every App; if `fun` resolves to a known Lambda whose
+    // callee.strictArgs[0] is true AND the App's arg is a
+    // single-use MkThunk with a simple body, inline the thunk body
+    // and replace the App's arg with the inlined tail.  The
+    // MkThunk binding becomes dead — DCE not re-run here (kept
+    // small to avoid disturbing optimise's invariants), but the
+    // orphan MkThunk binding is a value-creation no-op once its
+    // VarId is unreferenced.  Future v4.1 may add a targeted
+    // dead-thunk sweep.  Runs BEFORE computeFreeVars so the
+    // inlined bindings get their freeVars populated correctly.
+    ir::applyStrictnessAtCallSites(module);
 
     // computeFreeVars: populates each `ir::Function::freeVars` from
     // `Function::vars`.  Required before `compile` so the emitter
