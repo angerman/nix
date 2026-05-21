@@ -21,9 +21,11 @@
 #include "v3/closure.hh"
 #include "v3/nursery.hh"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -938,7 +940,24 @@ struct BindingsOrigin
 
 inline bool bindingsOriginEnabled()
 {
-    static const bool v = std::getenv("NIX_V3_DBG_BINDINGS_ORIGIN") != nullptr;
+    // 2026-05-21 #746 spike: recording also auto-enables when the
+    // attribution rollup is requested, so users can ask for the dump
+    // with a single env var (NIX_V3_BINDINGS_ATTR=1) instead of two.
+    // Retirement criterion: when Bindings-attribution data has been
+    // captured and the next Bindings lever decision has landed, this
+    // OR'd second gate (and dumpBindingsAttribution) come out.
+    static const bool v = std::getenv("NIX_V3_DBG_BINDINGS_ORIGIN") != nullptr
+                       || std::getenv("NIX_V3_BINDINGS_ATTR") != nullptr;
+    return v;
+}
+
+/// 2026-05-21 #746 spike gate: when set, dumpBindingsAttribution()
+/// rolls up the bindingsOriginTable at run-exit and prints the
+/// top-N construction sites by total bytes.  Retirement criterion:
+/// see bindingsOriginEnabled() comment above.
+inline bool bindingsAttrDumpEnabled() noexcept
+{
+    static const bool v = std::getenv("NIX_V3_BINDINGS_ATTR") != nullptr;
     return v;
 }
 
@@ -1189,6 +1208,187 @@ inline void bindingsAllocSiteRecord(const Bindings * b,
         labels[key] = lbl;
     }
     recordBindingsOrigin(b, 0, lbl);
+}
+
+// ---------------------------------------------------------------------------
+// 2026-05-21 #746 spike — per-origin Bindings allocation rollup.
+//
+// Phase 1 of the post-Stage-4-v4.2 plan.  The dominant v3-arena
+// consumer on hello.drvPath is Bindings (84% / 956 MB).  Until we
+// know WHERE those Bindings come from we cannot pick between (a)
+// persistent-map overlay sharing, (b) construction-site inlining,
+// or (c) Bindings-shape polymorphism as the next lever.
+//
+// Mechanism: walk the existing bindingsOriginTable (which already
+// captures __builtin_FILE/__builtin_LINE for every non-empty
+// allocBindings call), aggregate by `source` label string,
+// compute per-origin total bytes + per-size-bucket breakdown,
+// sort by total bytes descending, print the top N.
+//
+// Gated by NIX_V3_BINDINGS_ATTR=1.  Because bindingsOriginEnabled()
+// also fires on this env var, setting it alone is sufficient for
+// both recording and dumping.
+//
+// Cost: when off, zero.  When on: each allocBindings pays one
+// unordered_map insertion + one cached string-intern; the dump
+// itself walks ~millions of entries once at exit.
+//
+// Retirement criterion: when the next Bindings lever decision has
+// landed (and the associated Rule 0 falsifier-or-confirmer commit
+// has measured the actual size impact), the spike and its env-var
+// gate come out of the tree.
+// ---------------------------------------------------------------------------
+
+struct BindingsAttrRollupEntry
+{
+    const char * source;
+    uint64_t     allocCount;
+    uint64_t     totalBytes;
+    uint64_t     sizeBuckets[10]; // matches attrsetSizeBuckets layout
+};
+
+inline void dumpBindingsAttribution(std::FILE * out, size_t topN = 20) noexcept
+{
+    if (!bindingsAttrDumpEnabled()) return;
+    auto & tbl = bindingsOriginTable();
+    if (tbl.empty()) {
+        if (bindingsOriginEnabled()) {
+            std::fprintf(out,
+                "v3-direct bindings-attr: empty (recording is on, "
+                "no Bindings allocated yet at this dump)\n");
+        } else {
+            std::fprintf(out,
+                "v3-direct bindings-attr: empty (recording is OFF — "
+                "NIX_V3_BINDINGS_ATTR / NIX_V3_DBG_BINDINGS_ORIGIN "
+                "must be set BEFORE the recorded run)\n");
+        }
+        return;
+    }
+    // Aggregate by source label.  We use the label POINTER as the
+    // map key (not the string contents): bindingsAllocSiteRecord's
+    // intern pool ensures identical labels share a pointer, and
+    // explicit recordBindingsOrigin call-sites pass C string
+    // literals (also pointer-equal across calls).
+    std::unordered_map<const char *, BindingsAttrRollupEntry> agg;
+    agg.reserve(1024);
+    uint64_t skippedNullSource = 0;
+    for (const auto & kv : tbl) {
+        const Bindings * b = kv.first;
+        const BindingsOrigin & o = kv.second;
+        if (!b) continue;
+        if (!o.source) { ++skippedNullSource; continue; }
+        auto & r = agg[o.source];
+        r.source = o.source;
+        ++r.allocCount;
+        const uint64_t bytes = sizeof(Bindings)
+                             + sizeof(Bindings::Entry) * b->size;
+        r.totalBytes += bytes;
+        const uint32_t n = b->size;
+        int bk;
+        if      (n == 0)        bk = 0;
+        else if (n == 1)        bk = 1;
+        else if (n == 2)        bk = 2;
+        else if (n <= 4)        bk = 3;
+        else if (n <= 8)        bk = 4;
+        else if (n <= 16)       bk = 5;
+        else if (n <= 32)       bk = 6;
+        else if (n <= 64)       bk = 7;
+        else if (n <= 128)      bk = 8;
+        else                    bk = 9;
+        r.sizeBuckets[bk]++;
+    }
+    // Sort by totalBytes descending — the biggest arena consumers
+    // first.  Stable across runs because we sort by bytes (a
+    // deterministic function of the workload), not pointer identity.
+    std::vector<BindingsAttrRollupEntry> sorted;
+    sorted.reserve(agg.size());
+    for (auto & kv : agg) sorted.push_back(kv.second);
+    std::sort(sorted.begin(), sorted.end(),
+        [](const BindingsAttrRollupEntry & a,
+           const BindingsAttrRollupEntry & b) {
+            if (a.totalBytes != b.totalBytes)
+                return a.totalBytes > b.totalBytes;
+            // Tiebreak by allocCount, then by source pointer
+            // (deterministic given identical labels share a pointer).
+            if (a.allocCount != b.allocCount)
+                return a.allocCount > b.allocCount;
+            return std::less<const char *>{}(a.source, b.source);
+        });
+
+    uint64_t grandBytes = 0, grandAllocs = 0;
+    for (const auto & r : sorted) {
+        grandBytes  += r.totalBytes;
+        grandAllocs += r.allocCount;
+    }
+    std::fprintf(out,
+        "v3-direct bindings-attr: %zu distinct origins, "
+        "%llu total allocs, %.1f MB total tracked "
+        "(top %zu by bytes; skipped null-source=%llu):\n",
+        sorted.size(),
+        (unsigned long long)grandAllocs,
+        grandBytes / 1e6,
+        std::min(topN, sorted.size()),
+        (unsigned long long)skippedNullSource);
+    // Header — left-aligned label up to 70 cols; tabular counts.
+    std::fprintf(out,
+        "  %-70s %12s %10s %7s    %s\n",
+        "origin", "allocs", "bytes", "pct",
+        "[0 / 1 / 2 / 3-4 / 5-8 / 9-16 / 17-32 / 33-64 / 65-128 / 129+]");
+    const size_t lim = std::min(topN, sorted.size());
+    for (size_t i = 0; i < lim; ++i) {
+        const auto & r = sorted[i];
+        const double pct = grandBytes > 0
+            ? double(r.totalBytes) * 100.0 / double(grandBytes)
+            : 0.0;
+        // Truncate to 70 chars to keep output table-shaped.
+        const char * src = r.source ? r.source : "<unknown>";
+        const size_t slen = std::strlen(src);
+        char label[72];
+        if (slen <= 70) {
+            std::snprintf(label, sizeof label, "%s", src);
+        } else {
+            // Keep the tail (file:line is usually at the end of
+            // alloc-site labels) — that's the part we want to read.
+            std::snprintf(label, sizeof label, "...%s", src + (slen - 67));
+        }
+        std::fprintf(out,
+            "  %-70s %12llu %9.1fMB %6.1f%%    "
+            "[%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu]\n",
+            label,
+            (unsigned long long)r.allocCount,
+            r.totalBytes / 1e6,
+            pct,
+            (unsigned long long)r.sizeBuckets[0],
+            (unsigned long long)r.sizeBuckets[1],
+            (unsigned long long)r.sizeBuckets[2],
+            (unsigned long long)r.sizeBuckets[3],
+            (unsigned long long)r.sizeBuckets[4],
+            (unsigned long long)r.sizeBuckets[5],
+            (unsigned long long)r.sizeBuckets[6],
+            (unsigned long long)r.sizeBuckets[7],
+            (unsigned long long)r.sizeBuckets[8],
+            (unsigned long long)r.sizeBuckets[9]);
+    }
+    // Trailing summary: how much of the total is captured by the
+    // top-N?  Useful for "is this a long-tail or head-heavy?"
+    // decisions when picking the lever.
+    if (lim < sorted.size()) {
+        uint64_t topBytes = 0, topAllocs = 0;
+        for (size_t i = 0; i < lim; ++i) {
+            topBytes  += sorted[i].totalBytes;
+            topAllocs += sorted[i].allocCount;
+        }
+        const double topPct = grandBytes > 0
+            ? double(topBytes) * 100.0 / double(grandBytes)
+            : 0.0;
+        std::fprintf(out,
+            "  (top-%zu covers %.1f%% of bytes / %llu of %llu allocs; "
+            "%zu more origins in the tail)\n",
+            lim, topPct,
+            (unsigned long long)topAllocs,
+            (unsigned long long)grandAllocs,
+            sorted.size() - lim);
+    }
 }
 
 // Resolved AST source position: file path string, line, and column.

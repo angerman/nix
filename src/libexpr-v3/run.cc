@@ -389,6 +389,17 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                 std::fprintf(stderr, "\n");
             }
         }
+        // #746 (2026-05-21) Bindings-attribution rollup.  Phase 1 of
+        // the post-Stage-4-v4.2 plan: the dominant v3-arena consumer
+        // on hello.drvPath is Bindings (84% / 956 MB).  Until we know
+        // WHERE those Bindings come from we cannot pick the next
+        // lever (persistent-map overlay, construction-site inlining,
+        // or shape polymorphism).
+        //
+        // dumpBindingsAttribution() is a no-op when
+        // NIX_V3_BINDINGS_ATTR is unset; when set, the recording
+        // gate also auto-enables via bindingsOriginEnabled().
+        dumpBindingsAttribution(stderr);
     }
     return out;
 }
