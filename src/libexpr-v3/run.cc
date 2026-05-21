@@ -16,6 +16,8 @@
 #include "v3/alloc.hh"
 #include "v3/bytecode_primops.hh"
 #include "v3/limits.hh"
+#include "v3/nursery.hh"
+#include "v3/barrier.hh"
 
 #include "nix/expr/eval.hh"
 
@@ -400,6 +402,111 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // NIX_V3_BINDINGS_ATTR is unset; when set, the recording
         // gate also auto-enables via bindingsOriginEnabled().
         dumpBindingsAttribution(stderr);
+        // #751 (2026-05-21) "elsewhere" attribution.  After #750 the
+        // v3_arena dropped 386 MB but peak_rss dropped only 248 MB;
+        // the "elsewhere" share (RSS - boehm_heap - v3_arena) grew
+        // from 790 → 928 MB.  Before committing to #748's multi-week
+        // Bindings-overlay work we want to know what's IN that
+        // 928 MB — it might host a bigger lever than the remaining
+        // v3_arena.  This probe dumps the size + estimated byte
+        // footprint of the major C++ containers v3 maintains
+        // outside the threadArena().  Always on under NIX_VM_STATS
+        // (no separate gate — these are cheap reads on shared
+        // counters).
+        {
+            auto estUMap = [](size_t entries, size_t buckets,
+                              size_t keyBytes, size_t valBytes) -> size_t {
+                // Standard unordered_map memory model: bucket array
+                // of pointer-per-bucket + node-per-entry (key + val
+                // + next-pointer + cached-hash).
+                return buckets * sizeof(void *)
+                     + entries * (keyBytes + valBytes
+                                  + 2 * sizeof(void *));
+            };
+            const auto & apt = attrPosTable();
+            const auto & sct = stringContextSideTable();
+            const auto & pps = posSnapshotPool();
+            const auto & bot = bindingsOriginTable();
+            const auto & cot = cellOwnerTable();
+            const auto & gst = ir::globalSymbolTable();
+            const auto & dirty = dirtyContainers();
+            const auto & standalone = standaloneCellRoots();
+            const auto & nstats = threadNursery().stats();
+
+            const size_t attrPosEst = estUMap(apt.size(), apt.bucket_count(),
+                                              sizeof(PosKey), sizeof(uint32_t));
+            // String-context entry approximates each vector<string>
+            // by entry-count × avg-string-overhead (40 B for a
+            // small std::string node).  Per-entry: pointer-key +
+            // sizeof(vector<string>) header (~24 B).
+            uint64_t sctEntryStrings = 0;
+            uint64_t sctEntryBytes   = 0;
+            for (const auto & kv : sct) {
+                sctEntryStrings += kv.second.size();
+                for (const auto & s : kv.second) sctEntryBytes += s.size();
+            }
+            const size_t sctEst = estUMap(sct.size(), sct.bucket_count(),
+                                          sizeof(const char *),
+                                          sizeof(std::vector<std::string>))
+                                + sctEntryStrings * 40   // string node
+                                + sctEntryBytes;          // string bodies
+            const size_t ppsEst = pps.capacity() * sizeof(PosSnapshot);
+            // PosSnapshot has a std::string; approximate string body
+            // by 1.5× avg-path-length (40 B typical for /nix/store/...).
+            const uint64_t ppsStringBytes = pps.size() * 40;
+            const size_t botEst = estUMap(bot.size(), bot.bucket_count(),
+                                          sizeof(const Bindings *),
+                                          sizeof(BindingsOrigin));
+            const size_t cotEst = estUMap(cot.size(), cot.bucket_count(),
+                                          sizeof(const Value *),
+                                          sizeof(const Thunk *));
+            // Global symbol table: vector<string> + index map.
+            uint64_t gstStringBytes = 0;
+            for (const auto & s : gst) gstStringBytes += s.size();
+            const size_t gstEst = gst.capacity() * sizeof(std::string)
+                                + gstStringBytes
+                                + gst.size() * (24 + 4 + 2 * sizeof(void*));
+            const size_t dirtyEst      = dirty.capacity() * sizeof(void *) * 2;
+            const size_t standaloneEst = standalone.capacity() * sizeof(void *);
+            // Nursery: young + (when Phase E active) two survivor
+            // buffers of equal size.  When Phase E is off the
+            // single nursery is just `sizeBytes`.
+            uint64_t nurseryBytes = nstats.sizeBytes;
+            if (threadNursery().isPhaseEActive())
+                nurseryBytes += 2 * nstats.sizeBytes; // approx, S=Y default
+
+            const size_t sumEst = attrPosEst + sctEst + ppsEst + ppsStringBytes
+                                + botEst + cotEst + gstEst + dirtyEst
+                                + standaloneEst + nurseryBytes;
+            std::fprintf(stderr,
+                "v3-direct elsewhere-probe (entries / est_MB):\n"
+                "  attrPosTable        %12zu  ~%6.1f MB  (buckets=%zu)\n"
+                "  stringContextSide   %12zu  ~%6.1f MB  (buckets=%zu, "
+                "strings=%llu, body=%llu B)\n"
+                "  posSnapshotPool     %12zu  ~%6.1f MB  (capacity=%zu)\n"
+                "  bindingsOriginTable %12zu  ~%6.1f MB  (buckets=%zu)\n"
+                "  cellOwnerTable      %12zu  ~%6.1f MB  (buckets=%zu)\n"
+                "  globalSymbolTable   %12zu  ~%6.1f MB  (capacity=%zu, "
+                "stringBytes=%llu)\n"
+                "  dirtyContainers     %12zu  ~%6.1f MB  (capacity=%zu)\n"
+                "  standaloneCellRoots %12zu  ~%6.1f MB  (capacity=%zu)\n"
+                "  nursery (Y+S buffs) %12s  ~%6.1f MB\n"
+                "  ----- elsewhere-probe sum: ~%.1f MB -----\n",
+                apt.size(),         attrPosEst    / 1e6, apt.bucket_count(),
+                sct.size(),         sctEst        / 1e6, sct.bucket_count(),
+                (unsigned long long)sctEntryStrings,
+                (unsigned long long)sctEntryBytes,
+                pps.size(),         (ppsEst + ppsStringBytes) / 1e6,
+                pps.capacity(),
+                bot.size(),         botEst        / 1e6, bot.bucket_count(),
+                cot.size(),         cotEst        / 1e6, cot.bucket_count(),
+                gst.size(),         gstEst        / 1e6, gst.capacity(),
+                (unsigned long long)gstStringBytes,
+                dirty.size(),       dirtyEst      / 1e6, dirty.capacity(),
+                standalone.size(),  standaloneEst / 1e6, standalone.capacity(),
+                "<mmap>",           nurseryBytes  / 1e6,
+                sumEst / 1e6);
+        }
     }
     return out;
 }
