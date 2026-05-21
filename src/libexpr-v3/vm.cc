@@ -5449,8 +5449,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                         "OP_RETURN/CFF_THUNK_RETURN");
                     cellTraceWrite(cell, fr.thunk, retVal,
                                     "OP_RETURN/CFF_THUNK_RETURN");
-                    *cell = retVal;
+                    // Phase D Step 3 batch D: cellWrite routes to
+                    // dirtyContainers (if cellContainer is a Bindings)
+                    // or standaloneCellRoots (if cellContainer is
+                    // nullptr — e.g. allocValue() standalone cells).
+                    cellWrite(cell, retVal, fr.thunk->cellContainer);
                     fr.thunk->cell = nullptr;
+                    fr.thunk->cellContainer = nullptr;  // Phase D Step 4
                 }
                 // #558 Phase 1.5: also update shapeCell with the
                 // final value, then clear it.  This makes a final
@@ -6004,8 +6009,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 if (Value * cell = t->cell) {
                     cellOwnRecordWrite(cell, t, "OP_FORCE-Bridge");
                     cellTraceWrite(cell, t, resolved, "OP_FORCE-Bridge");
-                    *cell = resolved;
+                    // Phase D Step 3 batch D.
+                    cellWrite(cell, resolved, t->cellContainer);
                     t->cell = nullptr;
+                    t->cellContainer = nullptr;  // Phase D Step 4
                 }
                 push(vm, resolved);
                 applyForceWriteback(vm);
@@ -9559,6 +9566,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 Value * cellTarget =
                     &recAttrs.payload.bindings->entries[i].value;
                 v.payload.thunk->cell = cellTarget;
+                // Phase D Step 4: record the owning Bindings so the
+                // cell-write barrier at OP_RETURN can dirty-mark the
+                // correct container.  cellTarget points INTO
+                // recAttrs's entries[], so the container is the
+                // recAttrs Bindings itself.
+                v.payload.thunk->cellContainer = recAttrs.payload.bindings;
                 cellOwnRecordSet(cellTarget, v.payload.thunk,
                                   "OP_ATTRS_REC_SET");
             }
@@ -11039,8 +11052,10 @@ Value forceValue(VMState & vm, Value v)
             if (Value * cell = t->cell) {
                 cellOwnRecordWrite(cell, t, "forceValue-Bridge");
                 cellTraceWrite(cell, t, v, "forceValue-Bridge");
-                *cell = v;
+                // Phase D Step 3 batch D.
+                cellWrite(cell, v, t->cellContainer);
                 t->cell = nullptr;
+                t->cellContainer = nullptr;  // Phase D Step 4
             }
             // #456 fix: treat a TW-Function-bridged Thunk as WHNF.
             // forceBridgeThunk -> treeWalkerToV3 wraps an nFunction
