@@ -25,6 +25,10 @@
 #include <sstream>
 #include <string>
 #include <sys/resource.h>
+#include <sys/time.h>
+#include <signal.h>
+#include <unistd.h>
+#include <cerrno>
 
 #if defined(__APPLE__)
 # include <mach/mach.h>
@@ -253,6 +257,103 @@ std::optional<std::chrono::seconds> parseDuration(std::string_view s)
     return std::chrono::seconds(v * multiplier);
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// #753 RSS watchdog — total-process memory enforcement.
+//
+// Background: NIX_V3_MAX_HEAP only caps Boehm GC's heap
+// (GC_set_max_heap_size).  The v3 threadArena (raw malloc), the
+// nursery (calloc), and every C++ STL container (libc malloc) live
+// OUTSIDE Boehm and are unbounded by the cap.  A 2026-05-21
+// cardano-node M5 attempt consumed 100+ GB with MAX_HEAP=8G —
+// because the runaway allocation happened in TW-side / libexpr
+// std::vector / std::unordered_map growth, none of which Boehm
+// sees.
+//
+// This watchdog enforces an HONEST whole-process RSS cap.  Three
+// defensive layers:
+//   1. Boehm OOM handler (existing): typed OutOfMemoryError when
+//      Boehm-only allocs hit the cap.  Fires for v3-arena-less
+//      paths within libexpr's Boehm-managed code.
+//   2. setrlimit(RLIMIT_AS, cap + 256 MB): Linux kernel-enforced
+//      virtual-memory cap with headroom for stacks/libs/Boehm
+//      metadata.  Causes malloc/mmap to return ENOMEM cleanly.
+//      No-op on macOS (Apple's setrlimit ignores RLIMIT_AS).
+//   3. SIGALRM itimer watchdog (100 ms polling): reads RSS via
+//      mach task_info on macOS / getrusage on Linux.  When RSS
+//      exceeds the cap, writes a banner + _exit(137).  This is the
+//      only mechanism that fires while v3 is suspended in a deep
+//      TW/libexpr callback — the dispatch-loop limit poll cannot
+//      run in that state.  Async-signal-safe: only write(2) and
+//      _exit(2) inside the handler.
+//
+// Plus a RSS check at the start of checkLimits() (below) — for the
+// in-dispatch case, this throws a clean typed error rather than
+// _exit so the eval frame can unwind.
+// ---------------------------------------------------------------------------
+
+inline uint64_t getProcessRssBytes() noexcept
+{
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &count) == KERN_SUCCESS)
+        return static_cast<uint64_t>(info.resident_size);
+    return 0;
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+        // Linux: ru_maxrss is in KB.
+        return static_cast<uint64_t>(ru.ru_maxrss) * 1024;
+    return 0;
+#endif
+}
+
+// Global RSS cap for the SIGALRM handler.  Relaxed atomic so the
+// handler is async-signal-safe (no lock acquisition).  Written
+// exactly once by initLimits.
+std::atomic<uint64_t> g_rssCap{0};
+
+extern "C" void rssCapTimerHandler(int /*signo*/) noexcept
+{
+    const uint64_t cap = g_rssCap.load(std::memory_order_relaxed);
+    if (cap == 0) return;
+    const uint64_t rss = getProcessRssBytes();
+    if (rss < cap) return;
+    // Async-signal-safe path: single fixed-string banner via write(2)
+    // then _exit(2).  No fprintf, no malloc, no atexit chain.
+    static const char msg[] =
+        "v3 SAFETY: RSS exceeded NIX_V3_MAX_HEAP cap; process exiting "
+        "via SIGALRM watchdog (137).  Set NIX_V3_MAX_HEAP=<bytes> "
+        "with a larger budget OR investigate the runaway allocation.\n";
+    (void) !write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(137);
+}
+
+void installRssWatchdog(uint64_t capBytes) noexcept
+{
+    g_rssCap.store(capBytes, std::memory_order_relaxed);
+
+    struct sigaction sa{};
+    sa.sa_handler = &rssCapTimerHandler;
+    sigemptyset(&sa.sa_mask);
+    // SA_RESTART so v3's read/write/etc. don't return EINTR when
+    // the timer fires during a syscall.  Without this, every 100 ms
+    // could spuriously interrupt long IFD reads.
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &sa, nullptr);
+
+    struct itimerval itv{};
+    itv.it_interval.tv_sec = 0;
+    itv.it_interval.tv_usec = 100 * 1000;  // 100 ms poll
+    itv.it_value = itv.it_interval;
+    setitimer(ITIMER_REAL, &itv, nullptr);
+}
+
+} // anonymous namespace
+
 // ---------------------------------------------------------------------------
 // initLimits.  Idempotent; reads env vars; installs Boehm OOM handler.
 // ---------------------------------------------------------------------------
@@ -274,6 +375,32 @@ void initLimits()
             st.maxHeapBytes = *bytes;
             GC_set_max_heap_size(static_cast<size_t>(*bytes));
             GC_set_oom_fn(&oomHandler);
+            // #753 belt: kernel-enforced virtual-memory cap with
+            // headroom for stacks, libc data, and Boehm/system
+            // mmap regions outside the heap.  Linux enforces;
+            // macOS silently ignores (setrlimit returns 0 but the
+            // kernel doesn't act on RLIMIT_AS).  When this fires
+            // on Linux, malloc/mmap returns ENOMEM cleanly.
+            const uint64_t headroom = uint64_t(256) * 1024 * 1024;
+            struct rlimit rl{};
+            rl.rlim_cur = static_cast<rlim_t>(*bytes + headroom);
+            rl.rlim_max = rl.rlim_cur;
+            if (setrlimit(RLIMIT_AS, &rl) != 0) {
+                // Not fatal — macOS often returns success but
+                // doesn't enforce, or may return EPERM if the
+                // requested cap exceeds the inherited hard limit.
+                // The SIGALRM watchdog below covers both cases.
+                std::fprintf(stderr,
+                    "v3 limits: setrlimit(RLIMIT_AS, %llu) failed (%s); "
+                    "relying on SIGALRM watchdog\n",
+                    (unsigned long long)rl.rlim_cur,
+                    std::strerror(errno));
+            }
+            // #753 suspenders: 100 ms-polled RSS watchdog that
+            // calls _exit(137) if the cap is exceeded.  Covers the
+            // case where v3 is in a deep TW/libexpr callback and
+            // the dispatch-loop's checkLimits() poll cannot run.
+            installRssWatchdog(*bytes);
         } else {
             std::fprintf(stderr,
                 "v3 limits: NIX_V3_MAX_HEAP='%s' is not a valid size "
@@ -336,6 +463,25 @@ void checkLimits()
         // same cap will set the flag again.
         st.oomFlag.store(false, std::memory_order_release);
         throw OutOfMemoryError(msg);
+    }
+
+    // #753 in-dispatch RSS check.  The SIGALRM watchdog calls
+    // _exit() when RSS exceeds the cap from ANY thread of
+    // execution (TW callbacks, libexpr code, etc.), but doing so
+    // skips destructor / atexit chains.  When the cap is reached
+    // WHILE v3's dispatch loop happens to be polling, we can
+    // throw a clean typed error instead and unwind the eval
+    // frame normally — preserving stats output and any user
+    // try-catch around the eval.  Only fires when MAX_HEAP cap
+    // is active.
+    if (st.maxHeapBytes > 0) {
+        const uint64_t rss = getProcessRssBytes();
+        if (rss >= st.maxHeapBytes) {
+            std::string msg = "v3 OutOfMemoryError: NIX_V3_MAX_HEAP="
+                + fmtBytes(st.maxHeapBytes) + " exceeded; RSS="
+                + fmtBytes(rss) + " (" + snapshot() + ")";
+            throw OutOfMemoryError(msg);
+        }
     }
 
     // Wall time — cheap (no syscall on most platforms; vDSO).
