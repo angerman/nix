@@ -19,9 +19,15 @@
 
 #include "nix/expr/eval.hh"
 
+#include "nix/expr/config.hh"
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <sys/resource.h>
+#if NIX_USE_BOEHMGC
+#include <gc/gc.h>
+#endif
 
 namespace nix::v3 {
 
@@ -233,6 +239,52 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             (unsigned long long)bk[4], (unsigned long long)bk[5],
             (unsigned long long)bk[6], (unsigned long long)bk[7],
             (unsigned long long)bk[8], (unsigned long long)bk[9]);
+        // #719 (#702 falsifier chain, 2026-05-21): three-way RSS
+        // decomposition.  v3's RSS minus (Boehm-heap + v3-arena) is
+        // the "elsewhere" remainder — scratch buffers, libc malloc
+        // for std::vector/unordered_map growth, mmap'd nursery,
+        // process bookkeeping.  Lets the user attribute the cppnix-
+        // vs-v3 RSS gap by category instead of treating it as a
+        // single number.
+        //
+        // Why this matters: hello.drvPath under v3 measures ~2.14 GB
+        // peak RSS vs 145 MB for TW.  Existing byte counters already
+        // attribute ~940 MB to the v3 arena; the remaining ~1.2 GB
+        // must be split between Boehm (TW interop) and "other"
+        // (libc malloc, mmap).  Stage 3 Phase D shape (a/b/c) depends
+        // on which one dominates.
+#if NIX_USE_BOEHMGC
+        size_t boehmHeap = GC_get_heap_size();
+        size_t boehmFree = GC_get_free_bytes();
+#else
+        size_t boehmHeap = 0;
+        size_t boehmFree = 0;
+#endif
+        size_t rssBytes = 0;
+        {
+            struct rusage ru;
+            if (getrusage(RUSAGE_SELF, &ru) == 0) {
+#ifdef __APPLE__
+                // macOS reports ru_maxrss in bytes.
+                rssBytes = static_cast<size_t>(ru.ru_maxrss);
+#else
+                // Linux reports ru_maxrss in KB.
+                rssBytes = static_cast<size_t>(ru.ru_maxrss) * 1024;
+#endif
+            }
+        }
+        const size_t arenaPin = threadArena().bytesAllocated();
+        // "Elsewhere" = RSS − Boehm-heap − v3-arena (clamped at 0).
+        const size_t elsewhere = (rssBytes > boehmHeap + arenaPin)
+            ? rssBytes - boehmHeap - arenaPin : 0;
+        std::fprintf(stderr,
+            "v3-direct memory: peak_rss=%.1fMB boehm_heap=%.1fMB "
+            "boehm_free=%.1fMB v3_arena=%.1fMB elsewhere=%.1fMB\n",
+            rssBytes   / 1e6,
+            boehmHeap  / 1e6,
+            boehmFree  / 1e6,
+            arenaPin   / 1e6,
+            elsewhere  / 1e6);
         // #660 verification: dump bridge-primop call counts.  v3-eval
         // already does this via its own NIX_VM_STATS path; mirror here
         // so the integrated `nix` CLI (and any future v3 driver that
