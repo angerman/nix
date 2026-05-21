@@ -45,6 +45,7 @@
 #include "v3/primop.hh"  // #705: walkV3BridgeRoots
 #include "v3/bytecode_primops.hh"  // #705: walkBytecodePrimopRoots, walkBuiltinsRoot
 #include "v3/print.hh"  // Round 1 #7: walkDeepForceRoots
+#include "v3/barrier.hh"  // Phase D: dirty-list + standalone cells
 #include "v3/value.hh"
 #include "v3/vm.hh"
 
@@ -769,6 +770,64 @@ void Scavenger::run()
     // #558 Phase 3.3: partialBindingsRegistry retired (no longer
     // referenced by vm.cc).  No scavenge work needed.
 
+    // Phase D (Stage 3, 2026-05-21): drain the inter-gen dirty-list.
+    //
+    // Each entry is a tenured Bindings / ValuePair / Thunk whose
+    // contents were mutated to point at a nursery payload since the
+    // last scavenge.  The natural-root walk above won't necessarily
+    // reach these (e.g. a Bindings on the heap that's only
+    // referenced from another tenured container, where the only edge
+    // is through a Tag::Slot from a tenured cell that wasn't
+    // otherwise reachable from valueStack/withStack/frames).  The
+    // dirty-list is the remembered-set that closes the gap.
+    //
+    // walked-set dedup handles duplicate entries (a single container
+    // pushed multiple times for multiple writes) for free.
+    //
+    // See `lode/NURSERY_PHASE_D_DECISION_2026-05-21.md` §2.3 for
+    // design rationale + §4 Step 6 for the implementation contract.
+    {
+        auto & dirty = dirtyContainers();
+        for (const DirtyEntry & e : dirty) {
+            switch (e.kind) {
+            case DirtyKind::Bindings: {
+                auto * b = static_cast<Bindings *>(e.ptr);
+                if (walked.insert(b).second) {
+                    graylist.push_back({b, GK_BINDINGS});
+                }
+                break;
+            }
+            case DirtyKind::Pair: {
+                auto * p = static_cast<ValuePair *>(e.ptr);
+                if (walked.insert(p).second) {
+                    graylist.push_back({p, GK_PAIR});
+                }
+                break;
+            }
+            case DirtyKind::Thunk: {
+                auto * t = static_cast<Thunk *>(e.ptr);
+                if (walked.insert(t).second) {
+                    graylist.push_back({t, GK_THUNK});
+                }
+                break;
+            }
+            }
+        }
+        // Clear retaining capacity — typical steady-state list size
+        // is ~thousands of entries between scavenges; keeping the
+        // backing storage avoids per-scavenge realloc churn.
+        dirty.clear();
+
+        // Standalone cells: the cell pointers themselves are
+        // tenured (`Alloc::allocValue`), but their CONTENTS may
+        // hold a nursery payload.  Walk each cell as a root.
+        auto & cells = standaloneCellRoots();
+        for (Value * cell : cells) {
+            visitValue(*cell);
+        }
+        cells.clear();
+    }
+
     // -- Stage 2: walk graylist ---------------------------------
 
     drain();
@@ -1021,6 +1080,32 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
         std::function<void(Value &)> visit =
             [&](Value & v) { a.visitValue(v, "deepForceRoots"); };
         walkDeepForceRoots(visit);
+    }
+
+    // 6c. Phase D inter-gen dirty list (2026-05-21).  At AUDIT
+    // time the scavenger has already drained the list; this is a
+    // diagnostic-parity walk that catches missed-drain regressions.
+    // The list will normally be empty by the time auditor runs.
+    {
+        for (const DirtyEntry & e : dirtyContainers()) {
+            switch (e.kind) {
+            case DirtyKind::Bindings:
+                if (a.visited.insert(e.ptr).second)
+                    a.visitBindings(static_cast<Bindings *>(e.ptr), "dirty.Bindings");
+                break;
+            case DirtyKind::Pair:
+                if (a.visited.insert(e.ptr).second)
+                    a.visitPair(static_cast<ValuePair *>(e.ptr), "dirty.Pair");
+                break;
+            case DirtyKind::Thunk:
+                if (a.visited.insert(e.ptr).second)
+                    a.visitThunk(static_cast<Thunk *>(e.ptr), "dirty.Thunk");
+                break;
+            }
+        }
+        for (Value * cell : standaloneCellRoots()) {
+            a.visitValue(*cell, "dirty.cell");
+        }
     }
 
     // 7. AttrSelectIC entries via reached Closures / Thunks.
