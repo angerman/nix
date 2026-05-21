@@ -1720,7 +1720,16 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
         requireNoStringContext(state, el, "removeAttrs");
         toRemove.insert(vmIntern(state, el.payload.str));
     }
-    Bindings * result = Alloc::allocBindings(src->size);
+    // #747 two-pass to avoid arena slack: pass 1 counts kept
+    // entries, pass 2 allocates exact and fills.  Without this, the
+    // original allocBindings(src->size) call pinned the full src
+    // size in the arena even when many entries were removed.
+    // #746 attribution on hello.drvPath measured 17.4 % slack here.
+    uint32_t kExact = 0;
+    for (uint32_t i = 0; i < src->size; ++i)
+        if (toRemove.count(src->entries[i].name) == 0)
+            ++kExact;
+    Bindings * result = Alloc::allocBindings(kExact);
     allocStats().attrsetsAllocated++;
     uint32_t k = 0;
     for (uint32_t i = 0; i < src->size; ++i) {
@@ -1728,7 +1737,7 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
             bindingsSetEntry(result, k++, src->entries[i]);  // Phase D
         }
     }
-    result->size = k;
+    // k == kExact by construction; allocBindings already set the size.
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = result;
 }
@@ -1746,14 +1755,42 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
         out.payload.bindings = b;
         return;
     }
-    Bindings * result = Alloc::allocBindings(src->size);
+    // #747 two-pass to avoid arena slack: pass 1 counts the
+    // intersection, pass 2 allocates exact and fills.  The single-
+    // pass version was the dominant slack site on hello.drvPath —
+    // #746 attribution measured 100 % slack (386.3 MB of pure waste
+    // from 1664 calls) because `builtins.intersectAttrs builtins
+    // pkgs`-style patterns allocate `pkgs->size` (thousands) but
+    // keep only a handful.
+    //
+    // Pass 1 uses the same sorted-vector property as `keep`: a
+    // linear merge instead of N binary searches is O(|keep|+|src|)
+    // vs O(|src| log |keep|).  Pass 2 walks `src` again with the
+    // same lookup.  In practice |keep| << |src| so the merge is
+    // already faster than the old single-pass binary-search per
+    // entry.
+    uint32_t kExact = 0;
+    {
+        uint32_t i = 0, j = 0;
+        while (i < keep->size && j < src->size) {
+            const SymbolId kn = keep->entries[i].name;
+            const SymbolId sn = src->entries[j].name;
+            if (kn < sn)        ++i;
+            else if (kn > sn)   ++j;
+            else                { ++kExact; ++i; ++j; }
+        }
+    }
+    Bindings * result = Alloc::allocBindings(kExact);
     allocStats().attrsetsAllocated++;
     uint32_t k = 0;
+    // Pass 2 keeps the original keep->lookup loop for code
+    // simplicity; sorted-merge copy would also work but the lookup
+    // is already O(log |keep|) and `keep` is small in practice.
     for (uint32_t i = 0; i < src->size; ++i) {
         if (keep->lookup(src->entries[i].name))
             bindingsSetEntry(result, k++, src->entries[i]);  // Phase D
     }
-    result->size = k;
+    // k == kExact by construction; allocBindings already set the size.
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = result;
 }
