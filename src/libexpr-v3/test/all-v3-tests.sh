@@ -6,6 +6,14 @@
 #   ./all-v3-tests.sh --core       # explicit core
 #   ./all-v3-tests.sh --full       # core + every run-*.sh repro (~15 min)
 #   ./all-v3-tests.sh --quick      # smoke only (~30 sec)
+#   ./all-v3-tests.sh --brute      # core suite under aggressive scavenge +
+#                                  # V3_DBG_NURSERY_BRUTE / _AUDIT; fails if
+#                                  # any post-scavenge brute or audit hit
+#                                  # signature appears in stderr (~10 min).
+#                                  # Closes ACTION_PLAN Phase 1.7 exit
+#                                  # criterion (audit's "highest-leverage
+#                                  # tooling investment").  See GC_AUDIT_
+#                                  # ROUND_2_2026-05-21.md §3.4 R1.
 #
 # Modes pick which tests run; per-test verbosity is set by V3_TEST_VERBOSE=1
 # (passed through to scripts that honour it).
@@ -35,9 +43,10 @@ case "${1:-}" in
   --core)  mode="core"  ;;
   --full)  mode="full"  ;;
   --quick) mode="quick" ;;
+  --brute) mode="brute" ;;
   "")      mode="core"  ;;
   -h|--help)
-    sed -n '2,17p' "$0"
+    sed -n '2,25p' "$0"
     exit 0
     ;;
   *)
@@ -45,6 +54,28 @@ case "${1:-}" in
     exit 2
     ;;
 esac
+
+# In `--brute` mode the core suite runs with the post-scavenge brute
+# scanner and reachable-graph auditor both on, plus aggressive 1 MB
+# nursery (forces frequent scavenge so any missed root is exercised).
+# A hit in either diagnostic flips the suite to FAIL via the
+# post-process step below — even if the underlying eval succeeds.
+#
+# Exporting here (instead of per-command) lets every SUITES[] entry
+# inherit the gates without rewriting the table.  The gates are pure
+# diagnostics; they don't change semantic correctness, only surface
+# missed-root bugs the gateless run would silently swallow.
+if [[ "$mode" == "brute" ]]; then
+  export NIX_V3_NURSERY=1
+  export NIX_V3_NURSERY_SCAVENGE=1
+  export NIX_V3_NURSERY_SIZE=1                   # 1 MB nursery → frequent scavenge
+  export V3_DBG_NURSERY_AUDIT=1
+  export V3_DBG_NURSERY_BRUTE=1
+  echo "all-v3-tests: --brute — gates exported:"
+  echo "  NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1 NIX_V3_NURSERY_SIZE=1"
+  echo "  V3_DBG_NURSERY_AUDIT=1 V3_DBG_NURSERY_BRUTE=1"
+  echo
+fi
 
 # Preflight — verify binaries exist.  If not, hint at what to build.
 if [[ ! -x "$NIX" ]]; then
@@ -92,8 +123,22 @@ SUITES+=( "evalscope|EvalScope handle invalidation|$ROOT/build/src/libexpr-v3/v3
 SUITES+=( "iterative-force|deep let/curry/app-spine|NIX=$NIX $TEST_DIR/iterative-force-depth.sh" )
 SUITES+=( "derivation-parity|drvPath byte-equal vs TW|$TEST_DIR/derivation-parity.sh" )
 
+# Brute mode (~2 min) — purpose-built BRUTE / AUDIT harness.  Runs
+# a curated battery of allocating workloads, captures stderr
+# separately, and fails on any `v3 SCAVENGE BRUTE: N>0 tenured words`
+# or `v3 SCAVENGE AUDIT: nursery ... reachable via` line.  The other
+# suites in core (lang / property / derivation-parity) pipe their
+# eval output through `tail -1`, so a per-suite stderr-grep is
+# unreliable — this dedicated harness is what closes the Phase 1.7
+# exit criterion.
+if [[ "$mode" == "brute" ]]; then
+  SUITES+=( "brute-audit|BRUTE / AUDIT diagnostic regression|$TEST_DIR/run-brute-audit.sh" )
+fi
+
 # Core (~5 min) — quick + lang + property + key repros
-if [[ "$mode" == "core" || "$mode" == "full" ]]; then
+# Brute mode runs the same core suite under the scavenge gates above,
+# then post-processes logs (see "brute hit scan" block at end).
+if [[ "$mode" == "core" || "$mode" == "full" || "$mode" == "brute" ]]; then
   SUITES+=( "lang|143 functional/lang tests through v3|$TEST_DIR/run-lang-tests.sh" )
   SUITES+=( "property|58 primop categories × 10 cases|$PROPERTY_DIR/run-property-tests.sh" )
   SUITES+=( "let-rec-publish|#546 OP_ATTRS_REC_INIT split regression|NIX=$NIX $TEST_DIR/run-let-rec-publish-split-tests.sh" )
@@ -147,12 +192,44 @@ for entry in "${SUITES[@]}"; do
   log="$logdir/$name.log"
   echo "  [$total] running $name ($desc)..."
   if bash -c "$cmd" >"$log" 2>&1; then
+    suite_status="PASS"
+  else
+    suite_status="FAIL"
+  fi
+  # Brute mode: post-process the captured log for any BRUTE / AUDIT
+  # hit signature and demote PASS to FAIL.  The diagnostic patterns:
+  #   - `v3 SCAVENGE BRUTE: N tenured words` with N > 0  (missed root)
+  #   - `v3 SCAVENGE AUDIT: nursery .* reachable via`    (post-scav root)
+  # Both are emitted by gc.cc's postScavengeBruteScan / postScavengeAudit
+  # when V3_DBG_NURSERY_BRUTE / V3_DBG_NURSERY_AUDIT are set.  The
+  # gateless run never emits them, so this scan is a no-op outside
+  # --brute mode.
+  brute_hit=""
+  if [[ "$mode" == "brute" ]]; then
+    # `[1-9][0-9]*` matches any non-zero word count.  The "0 tenured
+    # words" line is emitted at every scavenge in BRUTE mode and is
+    # the expected steady-state output.
+    if grep -E 'v3 SCAVENGE BRUTE: [1-9][0-9]* tenured words' "$log" >/dev/null \
+       || grep -E 'v3 SCAVENGE AUDIT: nursery .* reachable via' "$log" >/dev/null; then
+      brute_hit="yes"
+      suite_status="FAIL"
+    fi
+  fi
+  if [[ "$suite_status" == "PASS" ]]; then
     pass=$((pass + 1))
     echo "       PASS"
   else
     fail=$((fail + 1))
     failed_names+=( "$name" )
-    echo "       FAIL  (log: $log)"
+    if [[ -n "$brute_hit" ]]; then
+      echo "       FAIL  (BRUTE / AUDIT hit; log: $log)"
+      # Show the first 3 hit lines inline so the failure mode is
+      # obvious without opening the log.
+      grep -E '(v3 SCAVENGE BRUTE: [1-9][0-9]* tenured words|v3 SCAVENGE AUDIT: nursery .* reachable via)' "$log" \
+        | head -3 | sed 's/^/         /'
+    else
+      echo "       FAIL  (log: $log)"
+    fi
     if [[ "${V3_TEST_VERBOSE:-0}" == "1" ]]; then
       tail -20 "$log" | sed 's/^/         /'
     fi
