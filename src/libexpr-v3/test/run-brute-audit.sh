@@ -35,11 +35,18 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 V3_EVAL="${V3_EVAL:-$ROOT/build/src/libexpr-v3/v3-eval}"
+NIX="${NIX:-$ROOT/build/src/nix/nix}"
 
 if [[ ! -x "$V3_EVAL" ]]; then
     echo "brute-audit: $V3_EVAL not found, build first" >&2
     exit 2
 fi
+
+# Optional: nixpkgs cases require the integrated nix CLI for
+# `--impure` channel resolution.  Skip those cases if `nix` isn't
+# available (i.e. running in a stripped-down test env).
+HAS_NIX=0
+if [[ -x "$NIX" ]]; then HAS_NIX=1; fi
 
 # Shared gates.  1 MB nursery so a 1000-iteration workload scavenges
 # many times — exposes any sticky tenured→nursery edge.
@@ -72,7 +79,38 @@ run_case() {
     NIX_V3_MAX_WALL_TIME=60s NIX_V3_MAX_HEAP=2G \
         "$V3_EVAL" --expr "$expr" \
         >"$stdout_f" 2>"$stderr_f"
-    local rc=$?
+    _process_case "$name" "$want" "$stdout_f" "$stderr_f" $?
+}
+
+# run_case_nix <name> <expected-stdout-substring> <expr>
+# Same as run_case but invokes the integrated `nix eval --impure`
+# path so nixpkgs / channel expressions resolve.  Requires
+# `NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1` to
+# bypass the TW pre-eval at the installable layer (otherwise TW
+# evaluates first and v3 doesn't see the workload).
+# Wider budget (120 s wall, 4 G heap) because nixpkgs evals
+# allocate substantially more even for `.name`.
+run_case_nix() {
+    if (( ! HAS_NIX )); then
+        echo "SKIP  $1 (nix CLI not built)"
+        return 0
+    fi
+    local name="$1" want="$2" expr="$3"
+    local stdout_f stderr_f
+    stdout_f="$(mktemp -t v3-brute-nix-stdout.XXXXXX)"
+    stderr_f="$(mktemp -t v3-brute-nix-stderr.XXXXXX)"
+    NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+        NIX_V3_MAX_WALL_TIME=120s NIX_V3_MAX_HEAP=4G \
+        "$NIX" --extra-experimental-features nix-command \
+        eval --impure --expr "$expr" \
+        >"$stdout_f" 2>"$stderr_f"
+    _process_case "$name" "$want" "$stdout_f" "$stderr_f" $?
+}
+
+# Body of pass/fail accounting + diagnostic dump shared between
+# run_case (v3-eval) and run_case_nix (integrated nix CLI).
+_process_case() {
+    local name="$1" want="$2" stdout_f="$3" stderr_f="$4" rc="$5"
     local stdout_val brute_hits audit_hits
     stdout_val="$(cat "$stdout_f")"
     brute_hits="$(grep -E '^v3 SCAVENGE BRUTE: [1-9][0-9]* tenured words' "$stderr_f" || true)"
@@ -154,6 +192,23 @@ run_case "deep-let-rec-fix" "28000" '
     deep = n: if n == 0 then 0
               else (fix rec1).e + deep (n - 1);
   in deep 4000'
+
+# 7) nixpkgs slice — real-world workloads that exercise the integrated
+#    nix CLI + treeWalkerToV3 bridge + bytecode-installed primops +
+#    derivationStrict.  These are the canonical "is v3 default-on
+#    safe?" workloads; a BRUTE hit here means the bug shows up under
+#    actual user-facing eval.
+#
+#    Sized intentionally small.  hello.name is the warm-eval baseline.
+#    hello.drvPath exercises derivationStrict + outPath caching.
+#    firefox.name exercises a substantially larger transitive eval
+#    (qt5-packages + GTK + Rust toolchain) to surface anything that
+#    only triggers under nixpkgs-scale pressure.
+run_case_nix "hello-name"     "hello-2.12.3"               '(import <nixpkgs> { }).hello.name'
+run_case_nix "hello-drvPath"  "hello-2.12.3.drv"           '(import <nixpkgs> { }).hello.drvPath'
+run_case_nix "hello-outPath"  "hello-2.12.3"               '(import <nixpkgs> { }).hello.outPath'
+run_case_nix "gcc-name"       "gcc-wrapper"                '(import <nixpkgs> { }).gcc.name'
+run_case_nix "firefox-name"   "firefox-150.0.3"            '(import <nixpkgs> { }).firefox.name'
 
 echo
 echo "=== brute-audit: ok=$PASS fail=$FAIL ==="
