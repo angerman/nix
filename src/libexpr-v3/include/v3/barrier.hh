@@ -173,6 +173,22 @@ bindingsSetValue(Bindings * b, uint32_t i, Value v) noexcept
     }
 }
 
+/// Write a full Bindings::Entry `{name, value}` at index i.  Covers
+/// the struct-init form (`b->entries[i] = {sym, v}`) that some
+/// primop code uses for simultaneous name + value assignment.
+/// Semantically equivalent to `bindingsSetValue(b, i, e.value);
+/// b->entries[i].name = e.name;`.
+[[gnu::always_inline]] inline void
+bindingsSetEntry(Bindings * b, uint32_t i, Bindings::Entry e) noexcept
+{
+    b->entries[i] = e;
+    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+        const Nursery & n = threadNursery();
+        if (!n.contains(b) && isNurseryPayload(e.value, n))
+            dirtyContainers().push_back({DirtyKind::Bindings, b});
+    }
+}
+
 /// Write `v` into `p->evaluated` (Tag::App memoization).  Append
 /// `p` to `dirtyContainers` if inter-gen.  ValuePair is always
 /// tenured (`Alloc::allocPair` calls threadArena()), so we skip the

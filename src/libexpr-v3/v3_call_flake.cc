@@ -31,6 +31,7 @@
 #include "v3/vm.hh"
 #include "v3/value.hh"
 #include "v3/alloc.hh"  // #700/2a: v3-native Bindings allocation
+#include "v3/barrier.hh"  // Phase D write-barrier helpers
 
 #include "nix/expr/eval.hh"
 #include "nix/flake/flake.hh"
@@ -291,11 +292,11 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
             Bindings * inner = Alloc::allocBindings(2);
             allocStats().attrsetsAllocated++;
             if (sidSourceInfo < sidDir) {
-                inner->entries[0] = {sidSourceInfo, v3SourceInfo};
-                inner->entries[1] = {sidDir,        v3Dir};
+                bindingsSetEntry(inner, 0, {sidSourceInfo, v3SourceInfo});  // Phase D
+                bindingsSetEntry(inner, 1, {sidDir,        v3Dir});
             } else {
-                inner->entries[0] = {sidDir,        v3Dir};
-                inner->entries[1] = {sidSourceInfo, v3SourceInfo};
+                bindingsSetEntry(inner, 0, {sidDir,        v3Dir});
+                bindingsSetEntry(inner, 1, {sidSourceInfo, v3SourceInfo});
             }
             Value v3Inner;
             v3Inner.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -308,7 +309,7 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
                     "v3::callFlakeV3: node missing from lockfile keyMap");
             SymbolId sidKey = ir::globalInternSymbol(key->second);
 
-            outer->entries[i++] = {sidKey, v3Inner};
+            bindingsSetEntry(outer, i++, {sidKey, v3Inner});  // Phase D
         }
         // Bindings expects entries sorted by SymbolId (binary search).
         std::sort(&outer->entries[0], &outer->entries[outer->size],

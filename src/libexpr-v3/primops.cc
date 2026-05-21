@@ -552,6 +552,7 @@ void primTail(EvalState &, Value * args, Value & out)
     allocStats().listsAllocated++;
     for (uint32_t i = 1; i < n; ++i)
         out_l->elems[i - 1] = v.payload.list->elems[i];
+    listPostConstructBarrier(out_l);  // Phase D
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = out_l;
 }
@@ -584,6 +585,7 @@ void primAttrNames(EvalState &, Value * args, Value & out)
         Value v = mkStringValueOwned(sid < symTab.size() ? symTab[sid] : std::to_string(sid));
         lv->elems[i] = v;
     }
+    listPostConstructBarrier(lv);  // Phase D
     // Sort lexicographically by name — matches tree-walker semantics
     // and decouples output order from the global symbol-table
     // insertion order.
@@ -1569,11 +1571,11 @@ void primPartition(EvalState & state, Value * args, Value & out)
     Bindings * b = Alloc::allocBindings(2);
     allocStats().attrsetsAllocated++;
     if (sRight < sWrong) {
-        b->entries[0] = {sRight, rightV};
-        b->entries[1] = {sWrong, wrongV};
+        bindingsSetEntry(b, 0, {sRight, rightV});  // Phase D
+        bindingsSetEntry(b, 1, {sWrong, wrongV});
     } else {
-        b->entries[0] = {sWrong, wrongV};
-        b->entries[1] = {sRight, rightV};
+        bindingsSetEntry(b, 0, {sWrong, wrongV});  // Phase D
+        bindingsSetEntry(b, 1, {sRight, rightV});
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
@@ -1717,7 +1719,7 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
     uint32_t k = 0;
     for (uint32_t i = 0; i < src->size; ++i) {
         if (toRemove.count(src->entries[i].name) == 0) {
-            result->entries[k++] = src->entries[i];
+            bindingsSetEntry(result, k++, src->entries[i]);  // Phase D
         }
     }
     result->size = k;
@@ -1743,7 +1745,7 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
     uint32_t k = 0;
     for (uint32_t i = 0; i < src->size; ++i) {
         if (keep->lookup(src->entries[i].name))
-            result->entries[k++] = src->entries[i];
+            bindingsSetEntry(result, k++, src->entries[i]);  // Phase D
     }
     result->size = k;
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -2443,11 +2445,11 @@ void primNixPath(EvalState & state, Value *, Value & out)
         Value vA = mkStringValueOwned(el.path.s);
         Value vB = mkStringValueOwned(el.prefix.s);
         if (nA < nB) {
-            b->entries[0] = {nA, vA};
-            b->entries[1] = {nB, vB};
+            bindingsSetEntry(b, 0, {nA, vA});  // Phase D
+            bindingsSetEntry(b, 1, {nB, vB});
         } else {
-            b->entries[0] = {nB, vB};
-            b->entries[1] = {nA, vA};
+            bindingsSetEntry(b, 0, {nB, vB});  // Phase D
+            bindingsSetEntry(b, 1, {nA, vA});
         }
         Value v;
         v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -3368,8 +3370,8 @@ void primParseDrvName(EvalState & state, Value * args, Value & out)
     allocStats().attrsetsAllocated++;
     Value vn = mkStringValueOwned(name);
     Value vv = mkStringValueOwned(version);
-    if (sName < sVersion) { b->entries[0] = {sName, vn}; b->entries[1] = {sVersion, vv}; }
-    else                  { b->entries[0] = {sVersion, vv}; b->entries[1] = {sName, vn}; }
+    if (sName < sVersion) { bindingsSetEntry(b, 0, {sName, vn}); bindingsSetEntry(b, 1, {sVersion, vv}); }  // Phase D
+    else                  { bindingsSetEntry(b, 0, {sVersion, vv}); bindingsSetEntry(b, 1, {sName, vn}); }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
 }
@@ -7441,7 +7443,8 @@ void primParseFlakeRef(EvalState & state, Value * args, Value & out)
         [](auto & a, auto & b) { return a.first < b.first; });
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
     allocStats().attrsetsAllocated++;
-    for (size_t i = 0; i < entries.size(); ++i) b->entries[i] = {entries[i].first, entries[i].second};
+    for (size_t i = 0; i < entries.size(); ++i)  // Phase D
+        bindingsSetEntry(b, static_cast<uint32_t>(i), {entries[i].first, entries[i].second});
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
 }
@@ -7595,8 +7598,8 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
         allocStats().attrsetsAllocated++;
         Value typeV = mkStringValueOwned("timestamp");
         Value valV  = mkStringValueOwned(str);
-        if (sType < sVal) { b->entries[0]={sType,typeV}; b->entries[1]={sVal,valV}; }
-        else              { b->entries[0]={sVal,valV};  b->entries[1]={sType,typeV}; }
+        if (sType < sVal) { bindingsSetEntry(b, 0, {sType,typeV}); bindingsSetEntry(b, 1, {sVal,valV}); }  // Phase D
+        else              { bindingsSetEntry(b, 0, {sVal,valV}); bindingsSetEntry(b, 1, {sType,typeV}); }
         v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         v.payload.bindings = b;
         return v;
@@ -8384,11 +8387,11 @@ void primTryEval(EvalState & state, Value * args, Value & out)
     Bindings * b = Alloc::allocBindings(2);
     allocStats().attrsetsAllocated++;
     if (sSuccess < sValue) {
-        b->entries[0] = {sSuccess, successV};
-        b->entries[1] = {sValue, valueV};
+        bindingsSetEntry(b, 0, {sSuccess, successV});  // Phase D
+        bindingsSetEntry(b, 1, {sValue, valueV});
     } else {
-        b->entries[0] = {sValue, valueV};
-        b->entries[1] = {sSuccess, successV};
+        bindingsSetEntry(b, 0, {sValue, valueV});  // Phase D
+        bindingsSetEntry(b, 1, {sSuccess, successV});
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;

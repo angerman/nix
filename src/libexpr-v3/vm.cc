@@ -930,13 +930,13 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
     Bindings * out = Alloc::allocBindings(na + nb);
     uint32_t i = 0, j = 0, k = 0;
     auto copyA = [&]() {
-        out->entries[k] = a->entries[i];
+        bindingsSetEntry(out, k, a->entries[i]);  // Phase D
         if (uint32_t p = lookupAttrPos(a, a->entries[i].name))
             recordAttrPos(out, out->entries[k].name, p);
         ++k; ++i;
     };
     auto copyB = [&]() {
-        out->entries[k] = b->entries[j];
+        bindingsSetEntry(out, k, b->entries[j]);  // Phase D
         if (uint32_t p = lookupAttrPos(b, b->entries[j].name))
             recordAttrPos(out, out->entries[k].name, p);
         ++k; ++j;
@@ -9808,7 +9808,7 @@ Value getBuiltinsValue() noexcept
                 v.payload.primop = &po;
             }
             SymbolId sid = ir::globalInternSymbol(poName);
-            b->entries[i] = { sid, v };
+            bindingsSetEntry(b, i, { sid, v });  // Phase D
             ++i;
         }
         // Bindings expects entries sorted by SymbolId for binary search.
