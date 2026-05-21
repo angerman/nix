@@ -6475,7 +6475,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             allocStats().attrsetsAllocated++;
             for (uint32_t i = 0; i < n; ++i) {
                 b->entries[i].name  = entries[i].name;
-                b->entries[i].value = entries[i].value;
+                bindingsSetValue(b, i, entries[i].value);  // Phase D barrier
                 recordAttrPos(b, entries[i].name, entries[i].pos);
             }
             // Phase A1: origin tracking (NIX_V3_DBG_BINDINGS_ORIGIN=1).
@@ -6550,7 +6550,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             allocStats().attrsetsAllocated++;
             for (size_t i = 0; i < entries.size(); ++i) {
                 b->entries[i].name  = std::get<0>(entries[i]);
-                b->entries[i].value = std::get<1>(entries[i]);
+                bindingsSetValue(b, static_cast<uint32_t>(i),
+                                 std::get<1>(entries[i]));  // Phase D barrier
                 recordAttrPos(b, std::get<0>(entries[i]), std::get<2>(entries[i]));
             }
             // Phase A1: origin tracking.
@@ -6833,7 +6834,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     [](auto & a, auto & b) { return a.first < b.first; });
                 for (size_t i = 0; i < all.size(); ++i) {
                     grown->entries[i].name  = all[i].first;
-                    grown->entries[i].value = all[i].second;
+                    bindingsSetValue(grown, static_cast<uint32_t>(i),
+                                     all[i].second);  // Phase D barrier
                 }
                 top.payload.bindings = grown;
             }
@@ -9533,7 +9535,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     }
                 }
             }
-            recAttrs.payload.bindings->entries[i].value = v;
+            bindingsSetValue(recAttrs.payload.bindings, i, v);  // Phase D barrier
             // STG-8 (#498): if this entry's value is a Suspended thunk
             // (the common case from the LetRec emit's per-attr thunks),
             // record &entries[i].value as the thunk's heap-stable cell.
