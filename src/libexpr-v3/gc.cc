@@ -281,6 +281,15 @@ Closure * Scavenger::fwdClosure(Closure * c)
         bytesPhaseEYToTOvf  += bytes;  // map legacy onto overflow slot for uniform stats
         return static_cast<Closure *>(dst);
     }
+    // #738 Phase E v0.2 — under Phase E, force tenured-Closure walk
+    // (same rationale as fwdBindings): the scavenger may update
+    // upvalue[] entries to point into the active-S buffer, and
+    // Phase D Step 7's dirty-list-only path doesn't account for
+    // edges created BY the scavenger itself.
+    if (n.isPhaseEActive()) {
+        if (walked.insert(c).second) graylist.push_back({c, GK_CLOSURE});
+        return c;
+    }
     // Originally-tenured: under Phase D Step 7 gate, skip the
     // transitive walk — the dirty-list mechanism (barriers in
     // v3/barrier.hh) guarantees any nursery edge in this Closure
@@ -387,6 +396,26 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
         bytesPhaseEYToTOvf  += bytes;
         return static_cast<Thunk *>(dst);
     }
+    // #738 Phase E v0.2 force-walk tenured Thunk — see fwdBindings.
+    if (n.isPhaseEActive()) {
+        // Skip leaf-tag Bridge/Evaluated as in the optimized path —
+        // those carry no v3-heap pointer to walk.  Suspended/Native/
+        // Blackhole DO carry pointers; walk them under Phase E.
+        switch (t->state) {
+        case ThunkState::Bridge:
+            if (!t->cell) return t;
+            break;
+        case ThunkState::Evaluated:
+            if (isLeafTag(t->evaluated.tag()) && !t->cell) return t;
+            break;
+        case ThunkState::Suspended:
+        case ThunkState::Native:
+        case ThunkState::Blackhole:
+            break;
+        }
+        if (walked.insert(t).second) graylist.push_back({t, GK_THUNK});
+        return t;
+    }
     // Tenured Thunk fast paths — skip queuing entirely when the
     // thunk has no v3-heap payload to walk.  Material on workloads
     // that build many tenured thunks then evaluate them to leaf
@@ -474,6 +503,11 @@ ListVec * Scavenger::fwdList(ListVec * l)
         bytesPhaseEYToTOvf  += bytes;
         return static_cast<ListVec *>(dst);
     }
+    // #738 Phase E v0.2 force-walk tenured List — see fwdBindings.
+    if (n.isPhaseEActive()) {
+        if (walked.insert(l).second) graylist.push_back({l, GK_LIST});
+        return l;
+    }
     // Phase D Step 7: skip queueing originally-tenured.  See fwdClosure.
     if (__builtin_expect(phaseDStep7Active(), 1)) return l;
     if (walked.insert(l).second) graylist.push_back({l, GK_LIST});
@@ -488,10 +522,19 @@ Bindings * Scavenger::fwdBindings(Bindings * b)
     // moving Bindings would orphan any Tag::Slot / Thunk::cell
     // that points into entries[].
     if (n.contains(b)) std::abort();
-    // Phase D Step 7: skip queueing.  Bindings entry writes go
-    // through `bindingsSetValue` which records dirty-list entries
-    // for inter-gen edges; the dirty list catches what this walk
-    // would have found.
+    // #738 Phase E v0.2 — Phase D Step 7's "trust the dirty list"
+    // optimization is unsafe under Phase E for Bindings reached
+    // via path-roots (AttrSelectIC, bridge handle tables) that
+    // weren't dirtied by a mutator write because the Bindings was
+    // last-modified BEFORE the most recent mutator phase.  Under
+    // Phase E, the scavenger itself updates such Bindings' entries
+    // when forwarding Y/S→T → the new pointers may be in active-S
+    // and need re-barriering.  Force the walk under Phase E so
+    // walkBindings + its post-walk barrier handle the new edges.
+    if (n.isPhaseEActive()) {
+        if (walked.insert(b).second) graylist.push_back({b, GK_BINDINGS});
+        return b;
+    }
     if (__builtin_expect(phaseDStep7Active(), 1)) return b;
     if (walked.insert(b).second) graylist.push_back({b, GK_BINDINGS});
     return b;
@@ -509,6 +552,11 @@ ValuePair * Scavenger::fwdPair(ValuePair * p)
     // primary cause of hello.drvPath SIGSEGV under scavenge.
     if (isLeafTag(p->left.tag()) && isLeafTag(p->right.tag())
         && isLeafTag(p->evaluated.tag())) return p;
+    // #738 Phase E v0.2 force-walk tenured Pair — see fwdBindings.
+    if (n.isPhaseEActive()) {
+        if (walked.insert(p).second) graylist.push_back({p, GK_PAIR});
+        return p;
+    }
     // Phase D Step 7: same gate as the other fwd*().  Pair evaluated
     // writes go through `pairSetEvaluated`; the dirty list catches.
     if (__builtin_expect(phaseDStep7Active(), 1)) return p;
