@@ -25,6 +25,7 @@
 #include "v3/errors.hh"
 #include "v3/bytecode_primops.hh"
 #include "v3/limits.hh"
+#include "v3/barrier.hh"  // Phase D write-barrier helpers
 
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
@@ -5430,7 +5431,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // invariants (Bridge thunks etc.).
                 }
                 fr.thunk->state = ThunkState::Evaluated;
-                fr.thunk->evaluated = retVal;
+                thunkSetEvaluated(fr.thunk, retVal);  // Phase D barrier
                 // STG-8 (#498): cell update.  If this thunk was stored
                 // at a heap-stable cell (recorded at OP_ATTRS_REC_SET
                 // time), overwrite the cell's contents with the body's
@@ -5599,7 +5600,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     && retVal.tag() != Tag::Blackhole)
                 {
                     caller.thunk->state = ThunkState::Evaluated;
-                    caller.thunk->evaluated = retVal;
+                    thunkSetEvaluated(caller.thunk, retVal);  // Phase D barrier
                 }
 
                 bool retry = (caller.flags & CFF_FORCE_RETRY)
@@ -5820,7 +5821,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         Tag rt = v.tag();
                         if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::Slot
                             && rt != Tag::Uninitialized && rt != Tag::Blackhole)
-                            outerPair->evaluated = v;
+                            pairSetEvaluated(outerPair, v);  // Phase D barrier
                     }
                     continue;
                 }
@@ -5843,7 +5844,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 && v.tag() != Tag::Blackhole)
             {
                 for (int i = 0; i < opForceCompressCount; ++i)
-                    opForceCompressChain[i]->evaluated = v;
+                    thunkSetEvaluated(opForceCompressChain[i], v);  // Phase D barrier
             }
             } // end forceChaseIters scope
             if (!v.isThunk()) {
@@ -5991,7 +5992,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     break;
                 }
                 t->state = ThunkState::Evaluated;
-                t->evaluated = resolved;
+                thunkSetEvaluated(t, resolved);  // Phase D barrier
                 // STG-14b option (a): cell update protocol on Bridge
                 // thunks.  Mirrors STG-8's OP_RETURN cell-update for
                 // Suspended thunks.  When prepHookUpvaluesAndWiths
@@ -10629,7 +10630,7 @@ Value forceValue(VMState & vm, Value v)
                 Tag rt = v.tag();
                 if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::Slot
                     && rt != Tag::Uninitialized && rt != Tag::Blackhole)
-                    outerPair->evaluated = v;
+                    pairSetEvaluated(outerPair, v);  // Phase D barrier
             }
             continue;
         }
@@ -11027,7 +11028,7 @@ Value forceValue(VMState & vm, Value v)
                 break;
             }
             t->state = ThunkState::Evaluated;
-            t->evaluated = v;
+            thunkSetEvaluated(t, v);  // Phase D barrier
             // STG-14b option (a): cell update protocol on Bridge
             // thunks (mirror of OP_FORCE Bridge handler above).
             // When the Bridge was built with a cell pointing at a
@@ -11483,7 +11484,7 @@ Value forceValue(VMState & vm, Value v)
         && v.tag() != Tag::Blackhole)
     {
         for (int i = 0; i < compressCount; ++i)
-            compressChain[i]->evaluated = v;
+            thunkSetEvaluated(compressChain[i], v);  // Phase D barrier
     }
     return v;
 }
