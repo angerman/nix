@@ -1715,6 +1715,9 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
                              || el.tag() == Tag::Slot, 0))
             el = forceValue(*state.vm, el);
         if (!el.isString()) typeError("removeAttrs", "list of strings");
+        // #734: TW's prim_removeAttrs iterates with forceStringNoCtx per
+        // element (libexpr/primops.cc).  Reject contexted names here too.
+        requireNoStringContext(state, el, "removeAttrs");
         toRemove.insert(vmIntern(state, el.payload.str));
     }
     Bindings * result = Alloc::allocBindings(src->size);
@@ -1825,6 +1828,9 @@ void primGetAttr(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("getAttr", "string");
     if (!args[1].isAttrs())  typeError("getAttr", "attrset");
+    // #734: TW's prim_getAttr calls forceStringNoCtx on the name arg
+    // (libexpr/primops.cc).  v3 must reject contexted names.
+    requireNoStringContext(state, args[0], "getAttr");
     SymbolId k = vmIntern(state, args[0].payload.str);
     auto * b = args[1].payload.bindings;
     // #678 — match TW's `attribute '<name>' missing`
@@ -1841,6 +1847,8 @@ void primHasAttr(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("hasAttr", "string");
     if (!args[1].isAttrs())  typeError("hasAttr", "attrset");
+    // #734: TW's prim_hasAttr calls forceStringNoCtx on the name arg.
+    requireNoStringContext(state, args[0], "hasAttr");
     SymbolId k = vmIntern(state, args[0].payload.str);
     auto * b = args[1].payload.bindings;
     out = (b && b->has(k)) ? Value::vTrue : Value::vFalse;
@@ -3002,10 +3010,15 @@ static const std::regex & getCachedRegex(std::string_view pattern)
 
 /// builtins.match regex string -> list of captures or null on no-match.
 /// Supports the standard regex syntax via std::regex (POSIX-ish).
-void primMatch(EvalState &, Value * args, Value & out)
+void primMatch(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString() || !args[1].isString())
         typeError("match", "(regex, string)");
+    // #734: TW's prim_match (libexpr/primops.cc) calls forceStringNoCtx
+    // on the regex only.  The subject is forceString(...) with a
+    // context accumulator that is then discarded — context-carrying
+    // subjects are permitted (typical for path-interpolated strings).
+    requireNoStringContext(state, args[0], "match");
     try {
         // Match tree-walker: POSIX extended regex (`.` matches newline,
         // POSIX bracket classes like [[:alnum:]] work).
@@ -3039,10 +3052,13 @@ void primMatch(EvalState &, Value * args, Value & out)
 
 /// builtins.split regex string -> list alternating strings and captures.
 /// E.g. split "[ ]+" "hello  world" -> ["hello" [] "world"].
-void primSplit(EvalState &, Value * args, Value & out)
+void primSplit(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString() || !args[1].isString())
         typeError("split", "(regex, string)");
+    // #734: TW's prim_split mirrors prim_match: forceStringNoCtx on the
+    // regex only.  The subject is allowed to carry context.
+    requireNoStringContext(state, args[0], "split");
     try {
         const std::regex & re = getCachedRegex(args[0].payload.str);
         std::string_view s(args[1].payload.str);
@@ -3110,20 +3126,28 @@ inline nix::HashAlgorithm parseHashAlgo(std::string_view a)
 
 /// builtins.hashString algo s -> hex string of the digest.  Backed by
 /// nix::hashString (libutil) which uses libcrypto.
-void primHashString(EvalState &, Value * args, Value & out)
+void primHashString(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString() || !args[1].isString())
         typeError("hashString", "(algo, string)");
+    // #734: TW's prim_hashString calls forceStringNoCtx on the algo
+    // only.  The input string is forceString with a discarded context
+    // accumulator — context-carrying inputs are permitted.
+    requireNoStringContext(state, args[0], "hashString");
     auto algo = parseHashAlgo(args[0].payload.str);
     auto h = nix::hashString(algo, args[1].payload.str);
     out = mkStringValueOwned(h.to_string(nix::HashFormat::Base16, false));
 }
 
-void primHashFile(EvalState &, Value * args, Value & out)
+void primHashFile(EvalState & state, Value * args, Value & out)
 {
     // #693 — match TW's forceStringNoCtx-style phrasings.
     if (!args[0].isString())
         throw std::runtime_error(expectedTypeButFound("a string", args[0]));
+    // #734: TW's prim_hashFile calls forceStringNoCtx on the algo arg.
+    // The path arg may legitimately carry context (e.g. a CA path), so
+    // do not require NoCtx there.
+    requireNoStringContext(state, args[0], "hashFile");
     std::string path;
     if (args[1].isString())     path = args[1].payload.str;
     else if (args[1].isPath())  path = args[1].payload.path;
@@ -8171,6 +8195,8 @@ nlohmann::json valueToJson(EvalState & state, const Value & vRaw)
 void primFromJSON(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("fromJSON", "string");
+    // #734: TW's prim_fromJSON calls forceStringNoCtx on the input.
+    requireNoStringContext(state, args[0], "fromJSON");
     auto j = nlohmann::json::parse(std::string(args[0].payload.str), nullptr, /*allow_exceptions=*/true);
     out = jsonToValue(state, j);
 }
