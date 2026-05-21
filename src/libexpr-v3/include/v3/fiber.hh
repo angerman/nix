@@ -23,6 +23,23 @@
 ///     mailbox holds — and the mailbox lives on the driver's stack
 ///     (which IS scanned).  No additional GC integration needed.
 ///
+///     GC_AUDIT_ROUND_2 N2 (LATENT, documented 2026-05-21): the
+///     paragraph above predates the v3 nursery scavenger.  Boehm
+///     scans the driver's pthread stack, but the v3 scavenger does
+///     NOT — and a yielded fiber's `fiberVm` is invisible to a
+///     scavenge fired from a re-entry on a FRESH VMState (driver
+///     callback path).  Two pre-flips are required before enabling
+///     `NIX_V3_FIBER_BRIDGE`:
+///       (1) `GC_add_roots(stack, stack+stackSize)` in
+///           `fiberCreate` + `GC_remove_roots` in `fiberDestroy`, so
+///           Boehm covers TW Value pointers held on the fiber stack.
+///       (2) The scavenger must walk every live fiber's `fiberVm`
+///           (currently only walks the VMState handed to `run()`
+///           and any in `activeVMStack`; a yielded fiber is in
+///           neither).
+///     See `lode/GC_AUDIT_ROUND_2_2026-05-21.md` §2.2 N2 for the
+///     full diagnosis + sites.
+///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
 

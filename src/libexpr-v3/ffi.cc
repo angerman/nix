@@ -53,6 +53,19 @@ namespace nix::v3 {
 /// flipped to false when the enclosing scope is destroyed.  The valid
 /// flag persists in the table after scope destruction (until the next
 /// gen rollover) so isValid() correctly returns false for stale handles.
+///
+/// GC_AUDIT_ROUND_2 N6 (LATENT, documented 2026-05-21): `payload` is
+/// cast to `Value *` by `applyClosure` (this file ~line 271).
+/// Production FFI consumers (the embedding host API) would store v3
+/// `Closure *` / `Bindings *` / `ListVec *` here, any of which can be
+/// nursery-resident.  Today only test code paths use
+/// `allocClosureHandle`, so the absence of a scavenger walk is not
+/// active.  Before opening the FFI to production embedders, add
+/// `walkEvalScopeRoots(visit)` that iterates every live `ScopeNode`
+/// (via `g_topScope` chain) and calls `visit(*reinterpret_cast<Value *>(&slot.payload))`
+/// for each valid slot — then call it from `gc.cc::Scavenger::run()`
+/// and from `postScavengeAudit`.  See
+/// `lode/GC_AUDIT_ROUND_2_2026-05-21.md` §2.4 N6.
 struct HandleSlot
 {
     void *   payload;

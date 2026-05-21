@@ -30,19 +30,82 @@
 
 namespace nix::v3 {
 
+// -------------------------------------------------------------------
+// GC_AUDIT_ROUND_2 Round 1 #7 — deep-force root stack
+// -------------------------------------------------------------------
+//
+// Thread-local stack of in-flight Values for the deep-force /
+// rich-print / JSON-render recursions.  Each recursion frame pushes
+// its `v` (the Value whose List / Attrs container it's about to
+// iterate) and accesses the container through `roots[idx]` instead of
+// the C-local `v`.  The scavenger walks the stack via
+// walkDeepForceRoots (declared in print.hh) so that when the
+// underlying ListVec / Bindings is forwarded nursery->tenured during
+// the inner forceValue, the slot's payload pointer follows.
+//
+// Using std::vector + index is robust against vector growth from
+// deeper recursion frames (push_back may reallocate; indices stay
+// valid because the new buffer is a copy).  We do NOT cache
+// references / pointers into the vector across calls that may push.
+//
+// Lifetime: thread_local; no destructor needed (process-exit
+// reclaims the storage).  Currently only invoked from print.cc
+// recursion frames where the v3 dispatch is the only producer of
+// nursery-allocated containers — no other module pushes onto it.
+namespace {
+thread_local std::vector<Value> tlDeepForceRoots;
+
+struct DeepForceGuard
+{
+    size_t idx;
+    DeepForceGuard(const Value & v) : idx(tlDeepForceRoots.size())
+    {
+        tlDeepForceRoots.push_back(v);
+    }
+    ~DeepForceGuard()
+    {
+        // Single-threaded LIFO discipline — pop the slot we pushed.
+        // Defensive: only pop if back() matches our index (vector
+        // growth never reorders; this should always hold).
+        if (tlDeepForceRoots.size() > idx)
+            tlDeepForceRoots.resize(idx);
+    }
+    Value & ref()       { return tlDeepForceRoots[idx]; }
+    const Value & ref() const { return tlDeepForceRoots[idx]; }
+};
+} // namespace
+
+void walkDeepForceRoots(const std::function<void(Value &)> & visit)
+{
+    for (auto & v : tlDeepForceRoots) visit(v);
+}
+
 Value forceDeep(VMState & vm, Value v, std::set<const void *> & seen)
 {
     v = forceValue(vm, v);
     if (v.isList() && v.payload.list && v.payload.list->size > 0) {
         if (seen.insert(v.payload.list).second) {
-            for (uint32_t i = 0; i < v.payload.list->size; ++i)
-                v.payload.list->elems[i] = forceDeep(vm, v.payload.list->elems[i], seen);
+            // Round 1 #7: read container fields through the root
+            // stack slot so they survive scavenge during the inner
+            // forceDeep call.
+            DeepForceGuard g(v);
+            for (uint32_t i = 0; i < g.ref().payload.list->size; ++i)
+                g.ref().payload.list->elems[i] =
+                    forceDeep(vm, g.ref().payload.list->elems[i], seen);
+            v = g.ref();
         }
     } else if (v.isAttrs() && v.payload.bindings) {
         if (seen.insert(v.payload.bindings).second) {
-            for (uint32_t i = 0; i < v.payload.bindings->size; ++i)
-                v.payload.bindings->entries[i].value =
-                    forceDeep(vm, v.payload.bindings->entries[i].value, seen);
+            // Round 1 #7: same protection for the Bindings entries[].
+            // Note: Bindings are tenured-only today, so the slot
+            // never actually moves, but the protection is uniform
+            // and zero-cost — and it future-proofs the path if
+            // Bindings ever become nursery-allocatable.
+            DeepForceGuard g(v);
+            for (uint32_t i = 0; i < g.ref().payload.bindings->size; ++i)
+                g.ref().payload.bindings->entries[i].value =
+                    forceDeep(vm, g.ref().payload.bindings->entries[i].value, seen);
+            v = g.ref();
         }
     }
     return v;
@@ -73,9 +136,15 @@ nlohmann::json toJsonValue(VMState & vm, Value v,
     case Tag::Path:   return json(std::string(v.payload.path));
     case Tag::List: {
         json arr = json::array();
-        if (v.payload.list)
-            for (uint32_t i = 0; i < v.payload.list->size; ++i)
-                arr.push_back(toJsonValue(vm, v.payload.list->elems[i], symTab));
+        if (v.payload.list) {
+            // Round 1 #7: hold `v` on the deep-force root stack across
+            // recursive toJsonValue calls — its payload.list may sit
+            // in the nursery and get forwarded by a scavenge inside
+            // the recursion's forceValue.
+            DeepForceGuard g(v);
+            for (uint32_t i = 0; i < g.ref().payload.list->size; ++i)
+                arr.push_back(toJsonValue(vm, g.ref().payload.list->elems[i], symTab));
+        }
         return arr;
     }
     case Tag::Attrs: {
@@ -112,8 +181,13 @@ nlohmann::json toJsonValue(VMState & vm, Value v,
         }
         json obj = json::object();
         if (v.payload.bindings) {
-            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
-                auto & en = v.payload.bindings->entries[i];
+            // Round 1 #7: same root-stack protection.  Bindings are
+            // tenured-only today, but reading entries through the
+            // stack slot is uniform and zero-cost; it makes the JSON
+            // walk match the printer / forceDeep discipline.
+            DeepForceGuard g(v);
+            for (uint32_t i = 0; i < g.ref().payload.bindings->size; ++i) {
+                auto & en = g.ref().payload.bindings->entries[i];
                 // #670/#671 follow-on: copy key to owning std::string
                 // before recursive toJsonValue — recursion may force
                 // values that intern new symbols, invalidating any
@@ -533,12 +607,18 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
             out << "«repeated»"; return;
         }
         out << "[ ";
-        if (forced.payload.list)
-            for (uint32_t i = 0; i < forced.payload.list->size; ++i) {
-                printNixValueRich(out, vm, forced.payload.list->elems[i],
+        if (forced.payload.list) {
+            // Round 1 #7: hold `forced` on the deep-force root stack
+            // so its `payload.list` survives scavenge during the
+            // recursive printNixValueRich call (which re-enters
+            // forceValue).
+            DeepForceGuard g(forced);
+            for (uint32_t i = 0; i < g.ref().payload.list->size; ++i) {
+                printNixValueRich(out, vm, g.ref().payload.list->elems[i],
                                   symTab, seen);
                 out << ' ';
             }
+        }
         out << "]";
         return;
     }

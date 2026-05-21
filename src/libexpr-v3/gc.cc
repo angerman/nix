@@ -44,6 +44,7 @@
 #include "v3/closure.hh"
 #include "v3/primop.hh"  // #705: walkV3BridgeRoots
 #include "v3/bytecode_primops.hh"  // #705: walkBytecodePrimopRoots, walkBuiltinsRoot
+#include "v3/print.hh"  // Round 1 #7: walkDeepForceRoots
 #include "v3/value.hh"
 #include "v3/vm.hh"
 
@@ -698,6 +699,21 @@ void Scavenger::run()
     // first getFlake; closure may be nursery-allocated.
     walkCallFlakeRoot(rootVisit);
 
+    // GC_AUDIT_ROUND_2 Round 1 #7 (2026-05-21): deep-force roots.
+    // `print.cc::forceDeep`, `printNixValueRich(out, vm, ...)`, and
+    // `toJsonValue(vm, ...)` walk Values whose `payload.list` /
+    // `payload.bindings` C-locals live across recursive `forceValue`
+    // calls.  When invoked at `vm.frames.empty()` (post-eval print /
+    // JSON dump from the CLI), the inner forceValue enters
+    // dispatchLoop at exitDepth==0 → scavenge enabled → the C-locals
+    // dangle if the container is forwarded.  The fix: each of those
+    // call sites pushes its current Value onto a thread-local
+    // index-addressable root stack here, accesses the container
+    // through the stack slot (not the C-local), and pops on exit.
+    // The scavenger walks the slots so their payload pointers
+    // forward correctly across nested scavenges.
+    walkDeepForceRoots(rootVisit);
+
     // #558 Phase 3.3: partialBindingsRegistry retired (no longer
     // referenced by vm.cc).  No scavenge work needed.
 
@@ -946,6 +962,13 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
         std::function<void(Value &)> visit =
             [&](Value & v) { a.visitValue(v, "callFlakeRoot"); };
         walkCallFlakeRoot(visit);
+    }
+
+    // 6b. deep-force roots (Round 1 #7).  See gc.cc:run() comment.
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.visitValue(v, "deepForceRoots"); };
+        walkDeepForceRoots(visit);
     }
 
     // 7. AttrSelectIC entries via reached Closures / Thunks.

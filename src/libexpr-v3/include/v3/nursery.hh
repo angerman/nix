@@ -291,6 +291,16 @@ private:
     uint64_t scavengeCount = 0;
 };
 
+// GC_AUDIT_ROUND_2 N5 (LATENT, documented 2026-05-21):
+// `thread_local Nursery n` has no destructor — base/end/etc. are
+// trivially destructible POD.  Today single-threaded so process
+// exit reclaims everything.  When multi-threaded eval lands, threads
+// that complete during runtime will leak their nursery buffer AND
+// their `GC_add_roots(base, base+sizeBytes)` registration; Boehm
+// would continue scanning freed/recycled memory as if it held v3
+// objects.  Pre-multi-thread checklist: add a Nursery destructor
+// that `GC_remove_roots(base, base+size); free(base);` before the
+// thread_local goes out of scope.
 inline Nursery & threadNursery() noexcept
 {
     thread_local Nursery n;

@@ -17,6 +17,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <functional>
 #include <iosfwd>
 #include <set>
 #include <string>
@@ -105,5 +106,22 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
 /// `<nlohmann/json.hpp>` themselves before using the result.
 nlohmann::json toJsonValue(VMState & vm, Value v,
                            const std::vector<std::string> & symTab);
+
+/// GC_AUDIT_ROUND_2 Round 1 #7 (2026-05-21): scavenge root for the
+/// thread-local deep-force root stack.  The deep-force / printer /
+/// JSON paths recurse with container pointers in C-locals across
+/// `forceValue` calls; at `vm.frames.empty()` the inner forceValue
+/// enters a fresh dispatchLoop where scavenge fires at exitDepth==0.
+/// To survive that scavenge, each recursion frame pushes its
+/// in-flight `Value` onto a thread-local stack accessed by stable
+/// index (so vector growth from deeper frames doesn't invalidate
+/// the slot identity).  The scavenger walks the stack so each
+/// slot's payload pointer forwards correctly when the underlying
+/// Closure/Bindings/ListVec moves.
+///
+/// Called from `gc.cc::Scavenger::run()` and from
+/// `gc.cc::postScavengeAudit`.  The visitor will be called once per
+/// active root slot, in push order (oldest first).
+void walkDeepForceRoots(const std::function<void(Value &)> & visit);
 
 } // namespace nix::v3

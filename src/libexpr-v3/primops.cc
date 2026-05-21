@@ -8454,6 +8454,18 @@ nix::EvalState * getNixEvalState() { return tlNixEvalState; }
 // practice; the small risk of stale-bridge-on-recycle is worth it for
 // the much larger win of consistent Thunk* identity (which is what
 // v3's blackhole detection uses).
+//
+// GC_AUDIT_ROUND_2 Round 1 #3 (LATENT, documented 2026-05-21):
+// The values stored here are `Thunk *` headers allocated via
+// `Alloc::allocBridgeThunk` (tenured arena, always Boehm-rooted) and
+// their bridge state has NO `cell` write-back today (vm.cc:5806's
+// `prepHookUpvaluesAndWiths` is defunct; Bridge thunks carry only the
+// `bridgeSrc` pointer).  Failure to walk this cache from the
+// scavenger is therefore safe RIGHT NOW.  If the Bridge cell-update
+// protocol is ever reintroduced (or `bridgeSrc` ever points at a
+// nursery-resident object), this cache must be walked as a scavenger
+// root.  See `src/libexpr-v3/lode/GC_AUDIT_ROUND_2_2026-05-21.md` §1
+// row 3 for the diagnosis.
 static std::unordered_map<const nix::Value *, Thunk *> & bridgeThunkCache()
 {
     thread_local std::unordered_map<const nix::Value *, Thunk *> tbl;
