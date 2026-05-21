@@ -1815,7 +1815,12 @@ inline bool applyForceWriteback(VMState & vm)
         Tag t = top.tag();
         if (t == Tag::Thunk || t == Tag::App || t == Tag::Slot)
             return false;
-        if (f.forceWriteTarget) *f.forceWriteTarget = top;
+        // Phase D coverage: forceWriteTarget can point into a
+        // Bindings entry (OP_ATTRS_SELECT_DYN / IC path) or into a
+        // stack slot.  We don't track the container here, so route
+        // through `cellWrite` with cellContainer=nullptr — the
+        // standalone-cell registry catches inter-gen writes.
+        if (f.forceWriteTarget) cellWrite(f.forceWriteTarget, top, nullptr);
         f.forceWriteTarget = nullptr;
         f.flags &= ~CFF_FORCE_WB_PTR_KEEP;
         return true;
@@ -1824,7 +1829,8 @@ inline bool applyForceWriteback(VMState & vm)
         needTop("CFF_FORCE_WB_PTR");
         Value forced = vm.valueStack.back();
         vm.valueStack.pop_back();
-        if (f.forceWriteTarget) *f.forceWriteTarget = forced;
+        // Phase D: same standalone-cell route as above.
+        if (f.forceWriteTarget) cellWrite(f.forceWriteTarget, forced, nullptr);
         f.forceWriteTarget = nullptr;
         f.flags &= ~CFF_FORCE_WB_PTR;
         return true;
