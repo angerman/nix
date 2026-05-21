@@ -1019,8 +1019,17 @@ struct Auditor {
         if (!b) return;
         check(b, "Bindings", site);
         if (!visited.insert(b).second) return;
-        for (uint32_t i = 0; i < b->size; ++i)
-            visitValue(b->entries[i].value, "Bindings.entries[].value");
+        // Phase D diagnostic: include the Bindings pointer + entry
+        // index when a child value is nursery-resident — helps trace
+        // back to the construction site.
+        for (uint32_t i = 0; i < b->size; ++i) {
+            // Build a per-entry site string so the audit message
+            // identifies which Bindings + which entry.
+            char ebuf[80];
+            std::snprintf(ebuf, sizeof(ebuf),
+                "Bindings(%p).entries[%u].value", (const void *)b, i);
+            visitValue(b->entries[i].value, ebuf);
+        }
     }
 
     void visitList(const ListVec * l, const char * site)

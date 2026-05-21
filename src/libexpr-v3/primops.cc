@@ -1219,11 +1219,13 @@ void primMap(EvalState & state, Value * args, Value & out)
         ValuePair * pp = Alloc::allocPair();
         pp->left  = fun;
         pp->right = src->elems[i];
+        pairPostConstructBarrier(pp);  // Phase D
         Value v;
         v.tag_payload = static_cast<uint64_t>(Tag::App);
         v.payload.pair = pp;
         result->elems[i] = v;
     }
+    listPostConstructBarrier(result);  // Phase D
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = result;
 }
@@ -1355,6 +1357,7 @@ void primGenList(EvalState & state, Value * args, Value & out)
         ValuePair * pp = Alloc::allocPair();
         pp->left  = gen;
         pp->right = idx;
+        pairPostConstructBarrier(pp);  // Phase D
         Value v;
         v.tag_payload = static_cast<uint64_t>(Tag::App);
         v.payload.pair = pp;
@@ -1771,10 +1774,12 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
         ValuePair * pp1 = Alloc::allocPair();
         pp1->left  = fn;
         pp1->right = nameStr;
+        pairPostConstructBarrier(pp1);  // Phase D
         Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
         ValuePair * pp2 = Alloc::allocPair();
         pp2->left  = step1;
         pp2->right = src->entries[i].value;
+        pairPostConstructBarrier(pp2);  // Phase D
         Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
         result->entries[i].name  = sym;
         bindingsSetValue(result, i, step2);  // Phase D
@@ -2565,10 +2570,12 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         ValuePair * pp1 = Alloc::allocPair();
         pp1->left  = fn;
         pp1->right = nameV;
+        pairPostConstructBarrier(pp1);  // Phase D
         Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
         ValuePair * pp2 = Alloc::allocPair();
         pp2->left  = step1;
         pp2->right = lv;
+        pairPostConstructBarrier(pp2);  // Phase D
         Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
         entries.emplace_back(sid, step2);
     }
@@ -5072,6 +5079,7 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
             entryVal.payload.thunk = t;
             lv->elems[i] = entryVal;
         }
+        listPostConstructBarrier(lv);  // Phase D
         return out;
     }
     case nix::nAttrs: {

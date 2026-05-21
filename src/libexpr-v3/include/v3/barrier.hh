@@ -322,6 +322,34 @@ listPostConstructBarrier(ListVec * l) noexcept
     }
 }
 
+/// Post-construct barrier for a ValuePair.  Iterates `left`,
+/// `right`, and `evaluated` and pushes a DirtyEntry on first
+/// inter-gen edge.  ValuePair is always tenured (`Alloc::allocPair`
+/// uses threadArena directly), so the `!n.contains(p)` check
+/// always falls through — kept as one branch for uniformity.
+///
+/// Used at Tag::App / Tag::PrimOpApp construction sites where the
+/// caller writes `p->left = X; p->right = Y;` after `allocPair()`.
+/// The per-write `pairSetEvaluated` helper covers the LATER
+/// `evaluated` field memo writes; this batch barrier covers the
+/// `left`/`right` initial assignment that pairs need at birth.
+[[gnu::always_inline]] inline void
+pairPostConstructBarrier(ValuePair * p) noexcept
+{
+    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+        const Nursery & n = threadNursery();
+        // ValuePair always tenured by design (Alloc::allocPair
+        // calls threadArena directly); defensive double-check.
+        if (n.contains(p)) return;
+        if (isNurseryPayload(p->left, n)
+            || isNurseryPayload(p->right, n)
+            || isNurseryPayload(p->evaluated, n))
+        {
+            dirtyContainers().push_back({DirtyKind::Pair, p});
+        }
+    }
+}
+
 /// Write `v` through the standalone-cell pointer `cell`, with
 /// optional `cellContainer` (the owning Bindings if any).  Cleared
 /// at the same site (read-and-zero on Thunk).

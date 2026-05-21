@@ -3720,6 +3720,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     ValuePair * vp = Alloc::allocPair();
                     vp->left = fun;
                     vp->right = arg;
+                    pairPostConstructBarrier(vp);  // Phase D
                     Value v;
                     v.tag_payload = static_cast<uint64_t>(Tag::PrimOpApp);
                     v.payload.pair = vp;
@@ -11581,6 +11582,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             ValuePair * vp = Alloc::allocPair();
             vp->left = fun;
             vp->right = arg;
+            pairPostConstructBarrier(vp);  // Phase D
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::PrimOpApp);
             v.payload.pair = vp;
