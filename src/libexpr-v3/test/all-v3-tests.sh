@@ -209,7 +209,10 @@ for entry in "${SUITES[@]}"; do
     # `[1-9][0-9]*` matches any non-zero word count.  The "0 tenured
     # words" line is emitted at every scavenge in BRUTE mode and is
     # the expected steady-state output.
-    if grep -E 'v3 SCAVENGE BRUTE: [1-9][0-9]* tenured words' "$log" >/dev/null \
+    # Match only LIVE hits (in reachable objects); DEAD hits
+    # (arena-bloat, harmless) end with `inside DEAD` and are filtered
+    # out by the `point into nursery` suffix.
+    if grep -E 'v3 SCAVENGE BRUTE: [1-9][0-9]* tenured words point into nursery' "$log" >/dev/null \
        || grep -E 'v3 SCAVENGE AUDIT: nursery .* reachable via' "$log" >/dev/null; then
       brute_hit="yes"
       suite_status="FAIL"

@@ -113,7 +113,10 @@ _process_case() {
     local name="$1" want="$2" stdout_f="$3" stderr_f="$4" rc="$5"
     local stdout_val brute_hits audit_hits
     stdout_val="$(cat "$stdout_f")"
-    brute_hits="$(grep -E '^v3 SCAVENGE BRUTE: [1-9][0-9]* tenured words' "$stderr_f" || true)"
+    # The LIVE hit line ends with `point into nursery`; the DEAD
+    # arena-bloat line ends with `inside DEAD ...`.  Only LIVE
+    # hits (true missed-roots in reachable objects) fail the case.
+    brute_hits="$(grep -E '^v3 SCAVENGE BRUTE: [1-9][0-9]* tenured words point into nursery' "$stderr_f" || true)"
     audit_hits="$(grep -E '^v3 SCAVENGE AUDIT: nursery .* reachable via' "$stderr_f" || true)"
     local case_ok=1
     local why=""

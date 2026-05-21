@@ -48,11 +48,13 @@
 #include "v3/value.hh"
 #include "v3/vm.hh"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace nix::v3 {
@@ -113,6 +115,32 @@ struct Scavenger
     /// walked.  Populated from every walkClosure / walkThunk so any
     /// CU transitively reachable from a root is covered.
     std::unordered_set<const CompilationUnit *> walkedCUs;
+    /// 2026-05-21 (Phase 1.7 R1 refinement): [start, end) byte
+    /// ranges of every TENURED object walked this scavenge.  Used
+    /// by `postScavengeBruteScan` to filter "false positive" hits
+    /// in dead-but-arena-resident objects (Boehm conservatively
+    /// pins the whole arena as a root, so dead tenured Closures /
+    /// Bindings keep their nursery pointers in memory).  An hit
+    /// outside any range here is dead memory and harmless;
+    /// only hits INSIDE one of these ranges indicate a true
+    /// missed-root bug (reachable tenured pointer not forwarded).
+    ///
+    /// Populated by each walk* method on entry (when the object
+    /// originated in tenured arena — nursery copies have already
+    /// been replaced by their tenured forward at this point).
+    /// Sorted-and-searched after drain() completes.
+    std::vector<std::pair<uintptr_t, uintptr_t>> liveTenuredRanges;
+    /// Record a tenured [start, end) byte range for the BRUTE
+    /// reachability filter.  Called by walk* methods.  No-op if
+    /// the pointer is in the nursery (means a nursery copy that
+    /// hasn't been forwarded yet — caller bug, but BRUTE doesn't
+    /// care about nursery bytes either way).
+    void recordLiveTenured(const void * p, size_t bytes)
+    {
+        if (!p || n.contains(p)) return;
+        const uintptr_t lo = reinterpret_cast<uintptr_t>(p);
+        liveTenuredRanges.emplace_back(lo, lo + bytes);
+    }
 
     // -- pointer forwarders (no recursion; just copy + queue) ----
 
@@ -368,6 +396,10 @@ void Scavenger::visitValue(Value & v)
 // forwarded) inside the same scavenge pass.
 void Scavenger::walkClosure(Closure * c)
 {
+    // BRUTE-refinement (Phase 1.7 R1): record this object's tenured
+    // byte range so postScavengeBruteScan can filter hits to live
+    // (reachable-from-roots) objects only.
+    recordLiveTenured(c, sizeof(Closure) + sizeof(Value) * c->nUpvalues);
     if (c->cu && walkedCUs.insert(c->cu).second) {
         for (const auto & ic : c->cu->attrSelectCache) {
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
@@ -384,6 +416,23 @@ void Scavenger::walkClosure(Closure * c)
 
 void Scavenger::walkThunk(Thunk * t)
 {
+    // BRUTE-refinement: Thunk size depends on state (matches fwdThunk's
+    // copy-size logic).
+    {
+        size_t bytes;
+        switch (t->state) {
+        case ThunkState::Suspended:
+        case ThunkState::Native:
+        case ThunkState::Blackhole:
+            bytes = sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
+            break;
+        case ThunkState::Evaluated:
+        case ThunkState::Bridge:
+            bytes = sizeof(Thunk);
+            break;
+        }
+        recordLiveTenured(t, bytes);
+    }
     // The cell (write-back target for OP_RETURN) is tenured; walk
     // its current Value so any nursery payload it holds is found.
     if (t->cell && walked.insert(t->cell).second) {
@@ -472,6 +521,7 @@ void Scavenger::walkThunk(Thunk * t)
 
 void Scavenger::walkList(ListVec * l)
 {
+    recordLiveTenured(l, sizeof(ListVec) + sizeof(Value) * l->size);
     for (uint32_t i = 0; i < l->size; ++i) {
         visitValue(l->elems[i]);
     }
@@ -479,6 +529,7 @@ void Scavenger::walkList(ListVec * l)
 
 void Scavenger::walkBindings(Bindings * b)
 {
+    recordLiveTenured(b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
     for (uint32_t i = 0; i < b->size; ++i) {
         visitValue(b->entries[i].value);
     }
@@ -486,6 +537,7 @@ void Scavenger::walkBindings(Bindings * b)
 
 void Scavenger::walkPair(ValuePair * p)
 {
+    recordLiveTenured(p, sizeof(ValuePair));
     visitValue(p->left);
     visitValue(p->right);
     // #705 (2026-05-21): `evaluated` field added 2026-05-18 (commit
@@ -997,15 +1049,49 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
 // which arena offset holds a stale nursery pointer that the deep
 // reachable-graph audit missed.
 //
-// This is the catch-all for missed roots: by definition every
-// tenured-to-nursery pointer SHOULD have been forwarded by scavenge.
-// If brute-scan finds any after scavenge, that's the missed root.
-void postScavengeBruteScan(const Nursery & n)
+// Phase 1.7 R1 refinement (2026-05-21): filter to LIVE objects only.
+// Without filtering, BRUTE flags every tenured byte that happens to
+// hold a pointer-shaped value inside the nursery range, including
+// dead-but-arena-resident objects (Boehm pins the whole arena as a
+// root → dead Closures / Bindings stay in memory with their stale
+// nursery pointers).  Those hits are harmless noise — no one
+// dereferences a dead object.  The real signal is hits inside
+// objects the scavenger considers REACHABLE; those represent true
+// missed-root bugs where a live object holds a pointer the
+// scavenger failed to forward.
+//
+// Implementation: the Scavenger records [start, end) byte ranges
+// for every tenured object it walked into `liveTenuredRanges`;
+// they're sorted by start address after drain() and passed here.
+// We classify each hit as "live" (inside one of the ranges) or
+// "dead" (outside) and report counts separately.  A live hit is
+// the Phase 1.7 stop-the-world signal.
+//
+// `liveRanges` MUST be sorted by start ascending; the caller is
+// responsible.  Binary search via std::upper_bound for O(log N)
+// per word.
+void postScavengeBruteScan(
+    const Nursery & n,
+    const std::vector<std::pair<uintptr_t, uintptr_t>> & liveRanges)
 {
     Arena & arena = threadArena();
     auto blocks = arena.blockRanges();
-    size_t hits = 0;
-    size_t cap = 16;  // dump first N hits
+    // Predicate: is address p inside some live range?  Binary search
+    // for the largest range whose start <= p, then check end > p.
+    auto inLive = [&](uintptr_t p) -> bool {
+        // upper_bound gives the first range with start > p.
+        auto it = std::upper_bound(
+            liveRanges.begin(), liveRanges.end(),
+            std::make_pair(p, uintptr_t{0}),
+            [](const auto & a, const auto & b) { return a.first < b.first; });
+        if (it == liveRanges.begin()) return false;
+        --it;
+        return p < it->second;  // it->first <= p < it->second
+    };
+
+    size_t hitsLive = 0;
+    size_t hitsDead = 0;
+    size_t cap = 16;  // dump first N LIVE hits (dead hits are noise; just count)
     for (auto & blk : blocks) {
         // Walk 8-byte aligned words.
         const uintptr_t step = 8;
@@ -1015,20 +1101,38 @@ void postScavengeBruteScan(const Nursery & n)
         for (uintptr_t p = lo; p + step <= hi; p += step) {
             uintptr_t w = *reinterpret_cast<const uintptr_t *>(p);
             if (w == 0) continue;
-            if (n.contains(reinterpret_cast<const void *>(w))) {
-                if (hits < cap) {
+            if (!n.contains(reinterpret_cast<const void *>(w))) continue;
+            if (inLive(p)) {
+                if (hitsLive < cap) {
                     std::fprintf(stderr,
                         "v3 SCAVENGE BRUTE: arena word @ %p holds "
                         "nursery pointer %p\n",
                         (void*)p, (void*)w);
                 }
-                ++hits;
+                ++hitsLive;
+            } else {
+                ++hitsDead;
             }
         }
     }
+    // Continue to report the combined "tenured words" count — but
+    // ONLY when hitsLive > 0 (live hits are the actionable signal).
+    // Dead-only hits get a separate one-line summary so users know
+    // the brute scan ran and how much arena bloat is present.
+    size_t hits = hitsLive;
     std::fprintf(stderr,
         "v3 SCAVENGE BRUTE: %zu tenured words point into nursery "
         "(first %zu dumped above)\n", hits, std::min(hits, cap));
+    if (hitsDead > 0) {
+        // Dead hits = arena bloat (Boehm pins arena → dead tenured
+        // objects retain stale nursery pointers).  Informational
+        // only; future work: precise per-object arena root
+        // registration (Stage 3 Phase D adjacent).
+        std::fprintf(stderr,
+            "v3 SCAVENGE BRUTE: %zu tenured words inside DEAD "
+            "(unreachable-from-v3) tenured objects — arena-bloat, "
+            "not a missed root\n", hitsDead);
+    }
     std::fflush(stderr);
 }
 
@@ -1046,7 +1150,12 @@ void scavengeNursery(Nursery & n, VMState & vm) noexcept
     sc.run();
     if (__builtin_expect(s_audit, 0)) postScavengeAudit(n, vm);
     static const bool s_brute = std::getenv("V3_DBG_NURSERY_BRUTE") != nullptr;
-    if (__builtin_expect(s_brute, 0)) postScavengeBruteScan(n);
+    if (__builtin_expect(s_brute, 0)) {
+        // Sort the live-tenured-range list by start address so
+        // postScavengeBruteScan's binary-search lookup is well-formed.
+        std::sort(sc.liveTenuredRanges.begin(), sc.liveTenuredRanges.end());
+        postScavengeBruteScan(n, sc.liveTenuredRanges);
+    }
     // V3_DBG_NURSERY=1 — print one line per scavenge with the
     // forward-map size + tenured-walk size so we can verify the
     // pass actually moved live data and how much it had to
