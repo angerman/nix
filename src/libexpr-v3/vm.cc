@@ -2173,14 +2173,49 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     static const bool s_kScavengeOn_static =
         std::getenv("NIX_V3_NURSERY_SCAVENGE") != nullptr
         && std::getenv("NIX_V3_NURSERY_SCAVENGE")[0] != '0';
-    const bool kNurseryGate = s_kNurseryOn_static && s_kScavengeOn_static
-                              && exitDepth == 0;
+    // Stage 3 prereq (action plan Phase 1.7): V3_DBG_GC_STRESS=N
+    // forces a scavenge every N opcodes regardless of nursery
+    // occupancy.  Surfaces missed-root bugs that natural scavenge
+    // frequency hides.  Retirement criterion: retire this gate once
+    // Stage 3 ships nursery-default-on AND
+    // `./run-brute-audit.sh` passes under
+    // `V3_DBG_GC_STRESS=10` on the full nixpkgs slice in CI for two
+    // consecutive weeks without a new missed-root finding.
+    //
+    // 0 / unset → STRESS off.  N > 0 → scavenge every N dispatch
+    // iterations at exitDepth==0.  N capped at 10^6 to avoid silent
+    // typos (`STRESS=1000000000` would effectively disable STRESS).
+    //
+    // The action plan calls for "thread-local opcode-counter
+    // decrement at the dispatch loop top"; we use a per-
+    // dispatchLoop-entry uint32_t counter (allocated on the C stack,
+    // not thread_local) which is fine because the action's
+    // requirement is per-thread monotonicity, not cross-loop state.
+    // Re-entries (forceValue → inner dispatchLoop) get their own
+    // counter, which is intentional — inner loops have exitDepth>0
+    // and don't fire scavenge anyway.
+    static const uint32_t s_kGcStressBudget = []() -> uint32_t {
+        const char * v = std::getenv("V3_DBG_GC_STRESS");
+        if (!v || v[0] == '\0' || v[0] == '0') return 0;
+        long n = std::strtol(v, nullptr, 10);
+        if (n <= 0 || n > 1000000) return 0;
+        return static_cast<uint32_t>(n);
+    }();
+    const bool kNurseryGate = (s_kNurseryOn_static && s_kScavengeOn_static
+                               && exitDepth == 0)
+                              || (s_kGcStressBudget > 0
+                                  && s_kNurseryOn_static
+                                  && exitDepth == 0);
     // Cache the per-thread Nursery* once per dispatchLoop entry to
     // avoid the thread_local re-resolution per iteration (Darwin's
     // tlv_atomic_thunk is cheap but not free; on fib33 the per-
     // iteration cost was visible in -fprofile-generate runs).
     // `nullptr` when the gate is off — the check below short-circuits.
     Nursery * const nursery = kNurseryGate ? &threadNursery() : nullptr;
+    // STRESS countdown — only meaningful when nursery != nullptr +
+    // s_kGcStressBudget > 0.  Initialized at budget; decrements
+    // every iteration; fires force-scavenge + reset on zero.
+    uint32_t gcStressCountdown = s_kGcStressBudget;
 
     // 2026-05-17: internal exception barrier.  Any exception that
     // escapes the dispatch loop (from a primop body, from forceValue,
@@ -2200,7 +2235,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // under -O2 with the [[unlikely]] hint the whole branch
         // folds to a single conditional jump on the hot path.
         if (__builtin_expect(nursery != nullptr, 0)) [[unlikely]] {
-            if (nursery->shouldScavenge()) {
+            // STRESS countdown — gated by s_kGcStressBudget > 0.
+            // Decrement every iteration; when it hits 0, force a
+            // scavenge regardless of `shouldScavenge`.  Reset to
+            // budget on fire.  When STRESS is off (budget == 0)
+            // the counter stays at 0 and `stressFire` evaluates
+            // false on every iteration — the branch is fully
+            // predicted-not-taken on production builds.
+            bool stressFire = false;
+            if (s_kGcStressBudget > 0) {
+                if (gcStressCountdown == 0)
+                    gcStressCountdown = s_kGcStressBudget;
+                else
+                    --gcStressCountdown;
+                stressFire = (gcStressCountdown == 0);
+            }
+            if (stressFire || nursery->shouldScavenge()) {
                 // #705 N1-followup (2026-05-21): defer scavenge if a
                 // NESTED VMState exists on the active stack.  When a
                 // primop body creates a secondary VMState via
@@ -2228,7 +2278,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // active stack will reclaim.  Cost: nursery may
                     // overshoot its threshold under primop chains
                     // that nest runFunctionWithUpvalues — bounded by
-                    // NIX_V3_MAX_HEAP.
+                    // NIX_V3_MAX_HEAP.  STRESS mode also has to
+                    // defer here: forcing a scavenge under a nested
+                    // VMState would corrupt the outer's C-locals.
+                    // The countdown stays at 0, so the next outer
+                    // iteration with single-vm active stack will
+                    // fire.
                     static const bool s_dbg =
                         std::getenv("V3_DBG_NURSERY") != nullptr;
                     if (__builtin_expect(s_dbg, 0)) {
@@ -2244,7 +2299,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // running counter; valueStack/withStack/frames are
                 // already source-of-truth.
                 if (!vm.frames.empty()) vm.frames.back().ip = ip;
-                if (nursery->maybeScavenge(vm)) {
+                // STRESS path uses forceScavenge (bypasses both the
+                // `scavengeEnabled` env var AND the `shouldScavenge`
+                // threshold).  Natural-frequency path stays on
+                // `maybeScavenge` so production builds without
+                // _SCAVENGE=1 still don't scavenge.
+                const bool ran = stressFire
+                    ? nursery->forceScavenge(vm)
+                    : nursery->maybeScavenge(vm);
+                if (ran) {
                     // Frame pointers may have been forwarded.  Re-
                     // read the dispatch locals from the top frame.
                     if (!vm.frames.empty()) {

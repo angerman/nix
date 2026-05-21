@@ -150,6 +150,26 @@ public:
     /// Implementation in `gc.cc`.
     bool maybeScavenge(VMState & vm) noexcept;
 
+    /// Stage 3 prereq (action plan Phase 1.7) — force a scavenge
+    /// unconditionally, bypassing both `scavengeEnabled` and
+    /// `shouldScavenge()`'s threshold check.  Used by the
+    /// `V3_DBG_GC_STRESS=N` debug gate to fire scavenge every N
+    /// opcodes regardless of nursery occupancy — surfaces
+    /// missed-root bugs that natural scavenge frequency would
+    /// otherwise hide.
+    ///
+    /// Pre-conditions identical to `maybeScavenge`'s caller:
+    ///   - Called only at `exitDepth == 0` (per
+    ///     `feedback_v3_nursery_cstack_safety.md`).
+    ///   - `activeVMStack` contains exactly the caller's `vm`
+    ///     (no nested VMState; deferral logic handled by caller).
+    ///
+    /// Returns true iff a scavenge ran (i.e. the nursery itself
+    /// was enabled).  When NIX_V3_NURSERY=0 the nursery is a no-op
+    /// allocator and `forceScavenge` returns false — STRESS does
+    /// nothing in that case because there's no nursery to clear.
+    bool forceScavenge(VMState & vm) noexcept;
+
     /// Reset the bump pointer; called by `gc.cc` at the end of
     /// `scavengeNursery`.  The buffer keeps its backing memory.
     void resetBumpAfterScavenge() noexcept

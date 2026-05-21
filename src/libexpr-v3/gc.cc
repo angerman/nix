@@ -1179,4 +1179,16 @@ bool Nursery::maybeScavenge(VMState & vm) noexcept
     return true;
 }
 
+bool Nursery::forceScavenge(VMState & vm) noexcept
+{
+    // STRESS bypasses the `scavengeEnabled` gate (the whole point
+    // is to force scavenges even when production users haven't
+    // opted in to NIX_V3_NURSERY_SCAVENGE=1).  Still requires the
+    // nursery itself to be `enabled` — without it there's no
+    // backing buffer to scavenge.
+    if (!enabled || !base) return false;
+    scavengeNursery(*this, vm);
+    return true;
+}
+
 } // namespace nix::v3

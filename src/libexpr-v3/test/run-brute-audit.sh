@@ -74,9 +74,15 @@ run_case() {
     local stdout_f stderr_f
     stdout_f="$(mktemp -t v3-brute-stdout.XXXXXX)"
     stderr_f="$(mktemp -t v3-brute-stderr.XXXXXX)"
-    # 60 s + 2 G heap — workloads here are small (genList up to 50000);
-    # the budget catches infinite-loop regressions cleanly.
-    NIX_V3_MAX_WALL_TIME=60s NIX_V3_MAX_HEAP=2G \
+    # 60 s + 2 G heap baseline.  When V3_DBG_GC_STRESS is on we bump
+    # wall-time to 300 s — scavenge-every-N-ops on a 100k-element
+    # workload fires tens of thousands of full graph walks; the
+    # increased budget covers it without masking real hangs.
+    local wall_s=60
+    if [[ -n "${V3_DBG_GC_STRESS:-}" && "${V3_DBG_GC_STRESS}" != "0" ]]; then
+        wall_s=300
+    fi
+    NIX_V3_MAX_WALL_TIME="${wall_s}s" NIX_V3_MAX_HEAP=2G \
         "$V3_EVAL" --expr "$expr" \
         >"$stdout_f" 2>"$stderr_f"
     _process_case "$name" "$want" "$stdout_f" "$stderr_f" $?
@@ -99,8 +105,16 @@ run_case_nix() {
     local stdout_f stderr_f
     stdout_f="$(mktemp -t v3-brute-nix-stdout.XXXXXX)"
     stderr_f="$(mktemp -t v3-brute-nix-stderr.XXXXXX)"
+    # nixpkgs workloads under STRESS need substantially more wall
+    # budget — `firefox.name` already touches ~1 GB of allocations
+    # without scavenge stress.  Scale the budget similarly to
+    # run_case above.
+    local wall_s=120
+    if [[ -n "${V3_DBG_GC_STRESS:-}" && "${V3_DBG_GC_STRESS}" != "0" ]]; then
+        wall_s=600
+    fi
     NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
-        NIX_V3_MAX_WALL_TIME=120s NIX_V3_MAX_HEAP=4G \
+        NIX_V3_MAX_WALL_TIME="${wall_s}s" NIX_V3_MAX_HEAP=4G \
         "$NIX" --extra-experimental-features nix-command \
         eval --impure --expr "$expr" \
         >"$stdout_f" 2>"$stderr_f"
