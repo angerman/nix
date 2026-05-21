@@ -350,6 +350,31 @@ pairPostConstructBarrier(ValuePair * p) noexcept
     }
 }
 
+/// #738 Phase E v0.2 (2026-05-21) — scan all Bindings entries and
+/// add to dirty list if any entry holds a nursery payload.  Mirrors
+/// the per-entry `bindingsSetValue`/`bindingsSetEntry` barriers but
+/// for the post-walk case where the scavenger updated multiple
+/// entries during a single walk.
+///
+/// Cost: O(b->size).  Acceptable in scavenge context where the
+/// alternative would be per-entry tracking through the walk's
+/// `visitValue`.  Called once per walked Bindings under Phase E.
+[[gnu::always_inline]] inline void
+bindingsPostConstructBarrier(Bindings * b) noexcept
+{
+    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+        const Nursery & n = threadNursery();
+        // Defensive double-check: Bindings always tenured today.
+        if (n.contains(b)) return;
+        for (uint32_t i = 0; i < b->size; ++i) {
+            if (isNurseryPayload(b->entries[i].value, n)) {
+                dirtyContainers().push_back({DirtyKind::Bindings, b});
+                return;
+            }
+        }
+    }
+}
+
 /// Write `v` through the standalone-cell pointer `cell`, with
 /// optional `cellContainer` (the owning Bindings if any).  Cleared
 /// at the same site (read-and-zero on Thunk).

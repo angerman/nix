@@ -311,7 +311,8 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // in survivor pool instead of tenured.  This is the Rule 0
         // input that drives the v0.2 architectural decision.
         {
-            const auto & ns = threadNursery().stats();
+            const auto & nur = threadNursery();
+            const auto & ns  = nur.stats();
             if (ns.scavengeCount > 0
                 && (ns.survivedBytes > 0 || ns.diedBytes > 0))
             {
@@ -327,6 +328,31 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     ns.survivedBytes / 1e6,
                     ns.diedBytes     / 1e6,
                     mortality);
+                // #738 Phase E v0.2: when active, show per-region
+                // promotion breakdown.  yToS is age-1 survivors
+                // (kept in survivor pool, not tenured); sToT is
+                // age-2 (truly tenured); yToTOvf is direct
+                // promotion when the survivor pool overflowed (or
+                // the legacy Phase D path where there's no S at
+                // all).  reclaimedFromS = bytesYToS - bytesSToT
+                // tracks the marginal Phase E reclamation: bytes
+                // that survived Y but died in S before tenuring.
+                if (nur.isPhaseEActive()) {
+                    const uint64_t yToS    = nur.getBytesYToS();
+                    const uint64_t sToT    = nur.getBytesSToT();
+                    const uint64_t yToTOvf = nur.getBytesYToTOvf();
+                    const int64_t reclaimedFromS =
+                        (int64_t)yToS - (int64_t)sToT;
+                    std::fprintf(stderr,
+                        "v3-direct phase-e regions: yToS=%.1fMB "
+                        "sToT=%.1fMB yToTOvf=%.1fMB "
+                        "reclaimedFromS=%.1fMB (Phase E v0.2 marginal "
+                        "win over Phase D)\n",
+                        yToS    / 1e6,
+                        sToT    / 1e6,
+                        yToTOvf / 1e6,
+                        reclaimedFromS / 1e6);
+                }
             }
         }
         // #736 (2026-05-21) IFD-probe summary.  Per IFD_DEEP_DIVE
