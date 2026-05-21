@@ -122,6 +122,17 @@ void walkBytecodePrimopRoots(const std::function<void(Value &)> & visit)
         (void)po;
         visit(v);
     }
+    // GC_AUDIT_ROUND_2 N12: each `InstalledPrimop::rr.value` carries the
+    // same closure also held in `primopReplacementMap`.  Today nothing
+    // re-reads `rr.value` (the map is the only consumer), so failing to
+    // walk it is latent — but it IS the holder's record of the live
+    // closure; if any future code reads `installed.rr.value` after a
+    // scavenge it would see a stale nursery pointer.  Walking both
+    // copies costs O(nPrimops) and keeps the redundant slot consistent
+    // with primopReplacementMap.
+    for (auto & up : installedPrimops()) {
+        if (up) visit(up->rr.value);
+    }
 }
 
 void walkBuiltinsRoot(const std::function<void(Value &)> & visit)

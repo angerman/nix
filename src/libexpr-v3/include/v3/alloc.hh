@@ -291,6 +291,16 @@ public:
 #if NIX_USE_BOEHMGC
             if (blk) GC_add_roots(blk, static_cast<char *>(blk) + bytes);
 #endif
+            // N11/R10 (audit Round 2): track huge allocations so
+            // V3_DBG_NURSERY_BRUTE's scan covers them.  Without this,
+            // a stale-pointer hit inside a huge Bindings (e.g. one
+            // with >170K entries at nixpkgs scale) is invisible to
+            // BRUTE — false-clean diagnostic.
+            if (blk) {
+                hugeBlocks.push_back({static_cast<char *>(blk),
+                                       static_cast<char *>(blk) + bytes});
+                totalBytes += bytes;
+            }
             return blk;
         }
         if (cur + bytes > end) refill();
@@ -308,11 +318,14 @@ public:
     /// `cur` is the bump pointer in the active block — we only scan
     /// up to `cur` for that block, and the full block size for the
     /// older blocks.
+    /// N11/R10 (audit Round 2): also returns the huge-allocation
+    /// ranges so callers walk every byte the arena owns, not just
+    /// the regular block churn.
     struct BlockRange { const char * begin; const char * end; };
     std::vector<BlockRange> blockRanges() const
     {
         std::vector<BlockRange> r;
-        r.reserve(blocks.size());
+        r.reserve(blocks.size() + hugeBlocks.size());
         for (size_t i = 0; i < blocks.size(); ++i) {
             const char * b = blocks[i];
             const char * e = (b == (cur ? blocks.back() : nullptr) && i + 1 == blocks.size())
@@ -320,6 +333,12 @@ public:
             // Defensive: if cur is null (no allocations yet), use full block.
             if (!cur && i + 1 == blocks.size()) e = b + kBlockSize;
             r.push_back({b, e});
+        }
+        // Huge allocations: each is fully used (allocator does the
+        // entire calloc'd region as one object), so begin..end is
+        // the whole block.
+        for (const auto & h : hugeBlocks) {
+            r.push_back({h.begin, h.end});
         }
         return r;
     }
@@ -330,6 +349,13 @@ private:
     /// Owning blocks; never freed in normal operation (they live
     /// for the lifetime of the thread).
     std::vector<char *> blocks;
+    /// N11/R10 (audit Round 2): track oversized allocations
+    /// (kHugeCutoff < bytes) so V3_DBG_NURSERY_BRUTE can scan them
+    /// for stale nursery pointers.  Without this list, allocations
+    /// > 4 MB (kHugeCutoff = kBlockSize / 4) bypass `blocks[]` and
+    /// `blockRanges()` returns an incomplete view.
+    struct HugeBlock { char * begin; char * end; };
+    std::vector<HugeBlock> hugeBlocks;
     size_t  totalBytes = 0;
 
     void refill() noexcept
@@ -799,12 +825,16 @@ inline void Alloc::recycleFakeClo(Closure * c) noexcept
     uint16_t n = pool.count[nUp];
     if (n >= kPoolPerBucket) return;
     // Zero upvalues to avoid pinning stale GC references between uses.
-    // desc / cu / capturedWiths are overwritten by the next user, so
-    // we don't bother zeroing those.  upvalues[] is FAM and Value
-    // payloads can contain Boehm pointers — clearing avoids accidental
-    // retention through the pool itself (which sits in arena memory
-    // GC_add_roots'd).
+    // N9 (audit Round 2): also zero capturedWiths.  desc / cu are
+    // ALWAYS overwritten by the next user; capturedWiths was assumed
+    // to be (caller writes it before any opcode runs that reads it),
+    // but defensively zeroing here means a scavenge that sees a
+    // pool-resident closure won't try to forward a stale ListVec*.
+    // upvalues[] is FAM and Value payloads can contain Boehm pointers
+    // — clearing avoids accidental retention through the pool itself
+    // (which sits in arena memory GC_add_roots'd).
     for (uint16_t i = 0; i < nUp; ++i) c->upvalues[i] = Value{};
+    c->capturedWiths = nullptr;
     pool.slots[nUp][n] = c;
     pool.count[nUp] = n + 1;
 }

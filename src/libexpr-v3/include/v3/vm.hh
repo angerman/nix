@@ -100,7 +100,13 @@ struct CallFrame
 struct VMState
 {
     std::vector<Value, traceable_allocator<Value>> valueStack;
-    std::vector<CallFrame> frames;
+    // N10 (audit Round 2): traceable_allocator so frame storage is
+    // Boehm-scanned.  CallFrame holds closure/thunk/forceWriteTarget
+    // pointers; today they're rooted via other paths (arena
+    // GC_add_roots) AND the scavenger walks frames directly, but
+    // traceable_allocator makes the storage robust against any
+    // future refactor that skips the explicit frames-walk.
+    std::vector<CallFrame, traceable_allocator<CallFrame>> frames;
     /// Stack of in-scope `with` attrset values.  Top of stack = innermost.
     std::vector<Value, traceable_allocator<Value>> withStack;
     uint64_t nrInstructions = 0;

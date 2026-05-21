@@ -388,6 +388,14 @@ void Scavenger::walkThunk(Thunk * t)
     if (t->cell && walked.insert(t->cell).second) {
         visitValue(*t->cell);
     }
+    // Round 1 #5 (defensive): shapeCell is only populated when
+    // NIX_V3_CELL_EVERYWHERE=1 — currently default-off — but if
+    // anything flips that gate the cell holds Tag::Thunk(self) at
+    // first then in-progress Bindings; both must be forwarded.
+    // No-op when shapeCell is null (the default).
+    if (t->shapeCell && walked.insert(t->shapeCell).second) {
+        visitValue(*t->shapeCell);
+    }
     switch (t->state) {
     case ThunkState::Suspended:
         if (t->suspended.cu && walkedCUs.insert(t->suspended.cu).second) {
@@ -572,7 +580,30 @@ void Scavenger::run()
         // The fix: visit the cell's content as if it were on the
         // value stack.  Safe even when the flag bit is clear —
         // walking *cell is a no-op for tag::Uninitialized / leaf.
-        if (f.forceWriteTarget) visitValue(*f.forceWriteTarget);
+        if (f.forceWriteTarget) {
+            // GC_AUDIT_ROUND_2 Round 1 #6 diagnostic: warn (under
+            // V3_DBG_NURSERY_FWT=1) if the writeback pointer itself
+            // sits inside the nursery.  The known case is
+            // OP_CALL_PRIMOP's deepForceList pre-pass storing
+            // `&list->elems[i]` for nursery-resident lists.  We
+            // walk the value the pointer references but do NOT
+            // update the pointer; the writeback after this
+            // scavenge will land in dead nursery bytes.  Per audit:
+            // silent memoization loss only, not a SIGSEGV — the
+            // next OP_CALL_PRIMOP scan re-derives WHNF on the
+            // forwarded copy.
+            static const bool s_dbgFwt =
+                std::getenv("V3_DBG_NURSERY_FWT") != nullptr;
+            if (__builtin_expect(s_dbgFwt, 0)
+                && n.contains(f.forceWriteTarget)) {
+                std::fprintf(stderr,
+                    "[v3-gc] forceWriteTarget=%p inside nursery; "
+                    "writeback after scavenge will be lost "
+                    "(latent — see Round 1 #6)\n",
+                    (void *)f.forceWriteTarget);
+            }
+            visitValue(*f.forceWriteTarget);
+        }
     }
 
     // #705 (2026-05-20): bridge-table roots.  The TW->v3 bridge
@@ -693,6 +724,9 @@ namespace {
 struct Auditor {
     const Nursery & n;
     std::unordered_set<const void *> visited;
+    // #705 R6 (audit Round 2): mirror scavenger's walkedCUs so the
+    // audit also walks AttrSelectIC entries transitively.
+    std::unordered_set<const CompilationUnit *> walkedCUs;
     bool ok = true;
 
     void check(const void * p, const char * what, const char * site)
@@ -706,12 +740,25 @@ struct Auditor {
     }
 
     void visitValue(const Value & v, const char * site);
+    // Forward decl: visitBindings defined further down in the struct.
+
+    void walkCUAttrSelectCache(const CompilationUnit * cu)
+    {
+        if (!cu || !walkedCUs.insert(cu).second) return;
+        for (const auto & ic : cu->attrSelectCache) {
+            for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                if (const Bindings * b = ic.entries[w].bindings)
+                    visitBindings(b, "CU.attrSelectCache");
+            }
+        }
+    }
 
     void visitClosure(const Closure * c, const char * site)
     {
         if (!c) return;
         check(c, "Closure", site);
         if (!visited.insert(c).second) return;
+        walkCUAttrSelectCache(c->cu);
         if (c->capturedWiths) check(c->capturedWiths, "Closure.capturedWiths", site);
         if (c->capturedWiths) {
             for (uint32_t i = 0; i < c->capturedWiths->size; ++i)
@@ -731,13 +778,28 @@ struct Auditor {
             // reach nursery.  Recurse into the cell value.
             visitValue(*t->cell, "Thunk.cell");
         }
+        // Round 1 #5: shapeCell (NIX_V3_CELL_EVERYWHERE) — same as
+        // cell, walk through the contents to catch nursery payloads.
+        if (t->shapeCell) {
+            visitValue(*t->shapeCell, "Thunk.shapeCell");
+        }
         switch (t->state) {
         case ThunkState::Suspended:
-        case ThunkState::Native:
+            // #705 R9: walk this CU's IC.
+            walkCUAttrSelectCache(t->suspended.cu);
             if (t->suspended.capturedWiths)
                 check(t->suspended.capturedWiths, "Thunk.suspended.capturedWiths", site);
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                 visitValue(t->tail[i], "Thunk.suspended.tail[]");
+            break;
+        case ThunkState::Native:
+            // N7 (audit Round 2): Suspended and Native have DIFFERENT
+            // union variants.  Native's variant is { const PrimOp * fn },
+            // no capturedWiths / cu / desc.  Reading those fields here
+            // is out-of-bounds.  Just walk the tail[] which holds the
+            // primop's accumulated args (still valid).
+            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                visitValue(t->tail[i], "Thunk.Native.tail[]");
             break;
         case ThunkState::Evaluated:
             visitValue(t->evaluated, "Thunk.evaluated");
@@ -749,6 +811,7 @@ struct Auditor {
             // suspended.capturedWiths are live because
             // clearBlackMarksOnException can revert Blackhole →
             // Suspended on exception unwind.  See gc.cc walkThunk.
+            walkCUAttrSelectCache(t->suspended.cu);
             if (t->suspended.capturedWiths)
                 check(t->suspended.capturedWiths,
                       "Thunk.Blackhole.suspended.capturedWiths", site);
@@ -815,16 +878,82 @@ void Auditor::visitValue(const Value & v, const char * site)
 
 void postScavengeAudit(const Nursery & n, const VMState & vm)
 {
-    Auditor a{n, {}, true};
-    for (size_t i = 0; i < vm.valueStack.size(); ++i)
-        a.visitValue(vm.valueStack[i], "valueStack[i]");
-    for (size_t i = 0; i < vm.withStack.size(); ++i)
-        a.visitValue(vm.withStack[i], "withStack[i]");
-    for (size_t i = 0; i < vm.frames.size(); ++i) {
-        const CallFrame & f = vm.frames[i];
-        if (f.closure) a.visitClosure(f.closure, "frame.closure");
-        if (f.thunk)   a.visitThunk  (f.thunk,   "frame.thunk");
+    Auditor a{n, {}, {}, true};
+    // #705 R6 (2026-05-21 audit round 2 #8): mirror EVERY root the
+    // scavenger walks, so a clean audit verdict is actually a
+    // statement of "no nursery pointer reachable from any walked
+    // root."  Pre-R6 the auditor walked only valueStack/withStack/
+    // frames, missing bridge tables / primopReplacementMap /
+    // vBuiltins / importCache / callFlake / AttrSelectIC /
+    // forceWriteTarget / active-VMStack — any of those holding a
+    // stale pointer would produce a false-positive clean verdict.
+
+    // 1. Per-vm roots (current + every other active VMState on the
+    //    thread — same set the scavenger walks via activeVMStack).
+    auto walkVm = [&](const char * label, const VMState * vmp) {
+        if (!vmp) return;
+        for (size_t i = 0; i < vmp->valueStack.size(); ++i)
+            a.visitValue(vmp->valueStack[i], label);
+        for (size_t i = 0; i < vmp->withStack.size(); ++i)
+            a.visitValue(vmp->withStack[i], label);
+        for (size_t i = 0; i < vmp->frames.size(); ++i) {
+            const CallFrame & f = vmp->frames[i];
+            if (f.closure) a.visitClosure(f.closure, "frame.closure");
+            if (f.thunk)   a.visitThunk  (f.thunk,   "frame.thunk");
+            // Round 1 #6: forceWriteTarget points at a tenured Value
+            // cell; the contents may carry nursery payloads.
+            if (f.forceWriteTarget)
+                a.visitValue(*f.forceWriteTarget, "frame.forceWriteTarget");
+        }
+    };
+    walkVm("currentVm", &vm);
+    std::unordered_set<const VMState *> seenVms{&vm};
+    for (VMState * other : activeVMStack()) {
+        if (!other || !seenVms.insert(other).second) continue;
+        walkVm("otherVm", other);
     }
+
+    // 2. Bridge tables — v3BridgeClosures / Attrs / Lists (primops.cc)
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.visitValue(v, "v3BridgeRoots"); };
+        walkV3BridgeRoots(visit);
+    }
+
+    // 3. Bytecode-primop replacement map (bytecode_primops.cc).
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.visitValue(v, "primopReplacementMap"); };
+        walkBytecodePrimopRoots(visit);
+    }
+
+    // 4. vBuiltins singleton.
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.visitValue(v, "vBuiltins"); };
+        walkBuiltinsRoot(visit);
+    }
+
+    // 5. import-cache results.
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.visitValue(v, "importCache"); };
+        walkImportCacheRoots(visit);
+    }
+
+    // 6. call-flake closure.
+    {
+        std::function<void(Value &)> visit =
+            [&](Value & v) { a.visitValue(v, "callFlakeRoot"); };
+        walkCallFlakeRoot(visit);
+    }
+
+    // 7. AttrSelectIC entries via reached Closures / Thunks.
+    //    Already handled implicitly: visitClosure / visitThunk above
+    //    queue the IC entries' Bindings via the walkedCUs/visited
+    //    deduplication.  No extra step needed here — but if R6 is
+    //    ever reorganized, add explicit IC walks per CU.
+
     if (a.ok) {
         std::fprintf(stderr,
             "v3 SCAVENGE AUDIT: clean (deep walk found no nursery pointers)\n");

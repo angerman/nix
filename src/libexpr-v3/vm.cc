@@ -9048,6 +9048,36 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         Value & a = vm.valueStack[argBase + k];
                         if (!a.isList() || !a.payload.list) continue;
                         ListVec * list = a.payload.list;
+                        // GC_AUDIT_ROUND_2 Round 1 #6 (LATENT, documented):
+                        // `frame.forceWriteTarget = &e` where `e` is
+                        // `list->elems[i]` pinches a pointer into a
+                        // potentially nursery-resident ListVec.  If
+                        // scavenge fires during the force chain, the
+                        // ListVec is forwarded tenured and the pointer
+                        // becomes stale; the scavenger walks the Value
+                        // at `*forceWriteTarget` (gc.cc postScavengeAudit
+                        // mirror) but does NOT update the pointer when
+                        // its underlying container moves.  Current state
+                        // (per audit): silent memoization loss only;
+                        // applyForceWriteback writes WHNF into freed
+                        // nursery bytes, the next loop iteration re-forces
+                        // (correctness preserved by re-derivation), and
+                        // the stale-write target is dead memory.
+                        //
+                        // Attempted fix (`if (listInNursery) target=null`)
+                        // produced an infinite loop because the unforced
+                        // element is never replaced; without a per-
+                        // primop iteration limit the scan re-enters
+                        // forever.  Correct fix requires either:
+                        //   (a) extending scavenger to track and update
+                        //       container-relative pointers, OR
+                        //   (b) promoting the list to tenured before
+                        //       deepForceList runs, OR
+                        //   (c) frame-encoded (listPtr, index) writeback
+                        //       descriptor that the scavenger rewrites.
+                        // Deferred until measurement shows the silent
+                        // loss meaningfully impacts perf or until a
+                        // crash path surfaces.
                         for (uint32_t i = 0; i < list->size; ++i) {
                             Value & e = list->elems[i];
                             Tag t = e.tag();
@@ -9557,8 +9587,23 @@ static void clearBlackMarksOnException(VMState & vm, size_t exitDepth)
     // OP_RETURN.  If the pushed thunk threw, the flag stayed on the
     // surviving caller; the next OP_RETURN would interpret a stale
     // value as a thunk-force result and trigger spurious retry.
-    if (!vm.frames.empty())
-        vm.frames.back().flags &= ~CFF_FORCE_RETRY;
+    //
+    // N8/R8 (audit Round 2): also clear ALL force-writeback flags +
+    // forceWriteTarget on every surviving frame.  These flags are
+    // one-shots set by OP_FORCE / OP_CALL_PRIMOP / OP_ATTRS_SELECT_IC
+    // before entering a sub-force; if the sub-force throws, the flag
+    // + target stay set on the caller.  Next opcode landing on that
+    // frame triggers a spurious applyForceWriteback that pops a
+    // wrong-stack value and writes it to forceWriteTarget — silently
+    // corrupting a list / attrset slot.
+    if (!vm.frames.empty()) {
+        auto & f = vm.frames.back();
+        f.flags &= ~(CFF_FORCE_RETRY
+                     | CFF_FORCE_WB
+                     | CFF_FORCE_WB_PTR
+                     | CFF_FORCE_WB_PTR_KEEP);
+        f.forceWriteTarget = nullptr;
+    }
 }
 
 /// #425: get the `builtins` attrset singleton (lazily built once,
