@@ -1574,11 +1574,11 @@ void primPartition(EvalState & state, Value * args, Value & out)
     Bindings * b = Alloc::allocBindings(2);
     allocStats().attrsetsAllocated++;
     if (sRight < sWrong) {
-        bindingsSetEntry(b, 0, {sRight, rightV});  // Phase D
-        bindingsSetEntry(b, 1, {sWrong, wrongV});
+        bindingsSetEntry(b, 0, {sRight, 0, rightV});  // Phase D
+        bindingsSetEntry(b, 1, {sWrong, 0, wrongV});
     } else {
-        bindingsSetEntry(b, 0, {sWrong, wrongV});  // Phase D
-        bindingsSetEntry(b, 1, {sRight, rightV});
+        bindingsSetEntry(b, 0, {sWrong, 0, wrongV});  // Phase D
+        bindingsSetEntry(b, 1, {sRight, 0, rightV});
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
@@ -2495,11 +2495,11 @@ void primNixPath(EvalState & state, Value *, Value & out)
         Value vA = mkStringValueOwned(el.path.s);
         Value vB = mkStringValueOwned(el.prefix.s);
         if (nA < nB) {
-            bindingsSetEntry(b, 0, {nA, vA});  // Phase D
-            bindingsSetEntry(b, 1, {nB, vB});
+            bindingsSetEntry(b, 0, {nA, 0, vA});  // Phase D
+            bindingsSetEntry(b, 1, {nB, 0, vB});
         } else {
-            bindingsSetEntry(b, 0, {nB, vB});  // Phase D
-            bindingsSetEntry(b, 1, {nA, vA});
+            bindingsSetEntry(b, 0, {nB, 0, vB});  // Phase D
+            bindingsSetEntry(b, 1, {nA, 0, vA});
         }
         Value v;
         v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -3438,8 +3438,8 @@ void primParseDrvName(EvalState & state, Value * args, Value & out)
     allocStats().attrsetsAllocated++;
     Value vn = mkStringValueOwned(name);
     Value vv = mkStringValueOwned(version);
-    if (sName < sVersion) { bindingsSetEntry(b, 0, {sName, vn}); bindingsSetEntry(b, 1, {sVersion, vv}); }  // Phase D
-    else                  { bindingsSetEntry(b, 0, {sVersion, vv}); bindingsSetEntry(b, 1, {sName, vn}); }
+    if (sName < sVersion) { bindingsSetEntry(b, 0, {sName, 0, vn}); bindingsSetEntry(b, 1, {sVersion, 0, vv}); }  // Phase D
+    else                  { bindingsSetEntry(b, 0, {sVersion, 0, vv}); bindingsSetEntry(b, 1, {sName, 0, vn}); }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
 }
@@ -7513,7 +7513,7 @@ void primParseFlakeRef(EvalState & state, Value * args, Value & out)
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < entries.size(); ++i)  // Phase D
-        bindingsSetEntry(b, static_cast<uint32_t>(i), {entries[i].first, entries[i].second});
+        bindingsSetEntry(b, static_cast<uint32_t>(i), {entries[i].first, 0, entries[i].second});
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
 }
@@ -7667,8 +7667,8 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
         allocStats().attrsetsAllocated++;
         Value typeV = mkStringValueOwned("timestamp");
         Value valV  = mkStringValueOwned(str);
-        if (sType < sVal) { bindingsSetEntry(b, 0, {sType,typeV}); bindingsSetEntry(b, 1, {sVal,valV}); }  // Phase D
-        else              { bindingsSetEntry(b, 0, {sVal,valV}); bindingsSetEntry(b, 1, {sType,typeV}); }
+        if (sType < sVal) { bindingsSetEntry(b, 0, {sType, 0, typeV}); bindingsSetEntry(b, 1, {sVal, 0, valV}); }  // Phase D
+        else              { bindingsSetEntry(b, 0, {sVal, 0, valV}); bindingsSetEntry(b, 1, {sType, 0, typeV}); }
         v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         v.payload.bindings = b;
         return v;
@@ -8074,10 +8074,10 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
         Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
         allocStats().attrsetsAllocated++;
         for (size_t i = 0; i < entries.size(); ++i) {
-            b->entries[i].name  = std::get<0>(entries[i]);
+            b->entries[i].name = std::get<0>(entries[i]);
+            b->entries[i].pos  = std::get<2>(entries[i]);  // #752 inline
             bindingsSetValue(b, static_cast<uint32_t>(i),  // Phase D
                              std::get<1>(entries[i]));
-            recordAttrPos(b, std::get<0>(entries[i]), std::get<2>(entries[i]));
         }
         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         out.payload.bindings = b;
@@ -8458,11 +8458,11 @@ void primTryEval(EvalState & state, Value * args, Value & out)
     Bindings * b = Alloc::allocBindings(2);
     allocStats().attrsetsAllocated++;
     if (sSuccess < sValue) {
-        bindingsSetEntry(b, 0, {sSuccess, successV});  // Phase D
-        bindingsSetEntry(b, 1, {sValue, valueV});
+        bindingsSetEntry(b, 0, {sSuccess, 0, successV});  // Phase D
+        bindingsSetEntry(b, 1, {sValue, 0, valueV});
     } else {
-        bindingsSetEntry(b, 0, {sValue, valueV});  // Phase D
-        bindingsSetEntry(b, 1, {sSuccess, successV});
+        bindingsSetEntry(b, 0, {sValue, 0, valueV});  // Phase D
+        bindingsSetEntry(b, 1, {sSuccess, 0, successV});
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;

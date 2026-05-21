@@ -80,7 +80,16 @@ constexpr PosIdx32 kNoPos = 0;
 
 struct Bindings
 {
-    struct Entry { SymbolId name; Value value; };
+    /// 2026-05-21 #752: PosIdx32 fits in what used to be Entry's
+    /// implicit padding slot (between the 4-byte SymbolId at offset
+    /// 0 and the 8-byte-aligned Value at offset 8).  sizeof(Entry)
+    /// is unchanged at 24 B; the side-table-style attrPosTable
+    /// that previously held ~14 M (Bindings*,SymbolId)->PosIdx32
+    /// mappings on hello.drvPath (~ 719 MB of "elsewhere" RSS per
+    /// #751 attribution) is no longer required for entries we
+    /// allocate ourselves — `entry.pos` IS the position.  Default
+    /// 0 means "no position info."
+    struct Entry { SymbolId name; PosIdx32 pos; Value value; };
 
     uint32_t size;
     uint32_t _pad;
@@ -856,33 +865,16 @@ inline void Alloc::recycleFakeClo(Closure * c) noexcept
 }
 
 // ---------------------------------------------------------------------------
-// Per-attr position side-table.
+// Per-attr position.
 //
-// Tree-walker stores a PosIdx alongside every Bindings::Entry; v3 keeps
-// the Entry slim (24 bytes) and uses this side-table instead.  The key
-// `(bindings, name)` is uniquely defined: each Bindings sees exactly one
-// PosIdx per name.  The side-table is populated by OP_ATTRS_INIT[_DYN] /
-// OP_ATTRS_REC_INIT and looked up by `builtins.unsafeGetAttrPos`.
-// Lifetime tracking is best-effort: we never explicitly free entries
-// since Bindings live for the duration of the eval anyway.
+// Tree-walker stores a PosIdx alongside every Bindings::Entry; v3
+// matches that exactly by inlining a PosIdx32 into the Entry's pad
+// slot (see Bindings::Entry above).  The prior side-table
+// (Bindings*,SymbolId) -> PosIdx32 was retired in #752 after the
+// #751 elsewhere-probe measured 14 M entries / ~719 MB on
+// hello.drvPath.  Lookup is now O(log N) binary search reading
+// `entries[mid].pos` (see lookupAttrPos below).
 // ---------------------------------------------------------------------------
-
-struct PosKey
-{
-    const Bindings * bindings;
-    SymbolId         name;
-    bool operator==(const PosKey & o) const noexcept
-    { return bindings == o.bindings && name == o.name; }
-};
-
-struct PosKeyHash
-{
-    size_t operator()(const PosKey & k) const noexcept
-    {
-        return std::hash<const Bindings *>{}(k.bindings) ^
-               (std::hash<SymbolId>{}(k.name) << 1);
-    }
-};
 
 } // namespace nix::v3
 
@@ -890,23 +882,24 @@ struct PosKeyHash
 
 namespace nix::v3 {
 
-inline std::unordered_map<PosKey, uint32_t, PosKeyHash> & attrPosTable()
-{
-    static std::unordered_map<PosKey, uint32_t, PosKeyHash> tbl;
-    return tbl;
-}
-
-inline void recordAttrPos(const Bindings * b, SymbolId name, uint32_t pos)
-{
-    if (pos == 0) return;
-    attrPosTable()[{b, name}] = pos;
-}
-
+/// Read the per-attr position for entry `name` in Bindings `b`.
+/// Returns 0 ("no position") when not found.  Reads directly from
+/// `entry.pos` after binary-searching for the entry — the side-
+/// table-style attrPosTable that this function used to consult was
+/// retired in #752 once every recordAttrPos call site was converted
+/// to write `b->entries[i].pos = ps` directly by index.
 inline uint32_t lookupAttrPos(const Bindings * b, SymbolId name)
 {
-    auto & tbl = attrPosTable();
-    auto it = tbl.find({b, name});
-    return it == tbl.end() ? 0 : it->second;
+    if (!b || b->size == 0) return 0;
+    uint32_t lo = 0, hi = b->size;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) >> 1;
+        SymbolId midName = b->entries[mid].name;
+        if (midName == name) return b->entries[mid].pos;
+        if (midName < name) lo = mid + 1;
+        else                hi = mid;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------

@@ -423,7 +423,6 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                      + entries * (keyBytes + valBytes
                                   + 2 * sizeof(void *));
             };
-            const auto & apt = attrPosTable();
             const auto & sct = stringContextSideTable();
             const auto & pps = posSnapshotPool();
             const auto & bot = bindingsOriginTable();
@@ -432,9 +431,6 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             const auto & dirty = dirtyContainers();
             const auto & standalone = standaloneCellRoots();
             const auto & nstats = threadNursery().stats();
-
-            const size_t attrPosEst = estUMap(apt.size(), apt.bucket_count(),
-                                              sizeof(PosKey), sizeof(uint32_t));
             // String-context entry approximates each vector<string>
             // by entry-count × avg-string-overhead (40 B for a
             // small std::string node).  Per-entry: pointer-key +
@@ -475,12 +471,11 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             if (threadNursery().isPhaseEActive())
                 nurseryBytes += 2 * nstats.sizeBytes; // approx, S=Y default
 
-            const size_t sumEst = attrPosEst + sctEst + ppsEst + ppsStringBytes
+            const size_t sumEst = sctEst + ppsEst + ppsStringBytes
                                 + botEst + cotEst + gstEst + dirtyEst
                                 + standaloneEst + nurseryBytes;
             std::fprintf(stderr,
                 "v3-direct elsewhere-probe (entries / est_MB):\n"
-                "  attrPosTable        %12zu  ~%6.1f MB  (buckets=%zu)\n"
                 "  stringContextSide   %12zu  ~%6.1f MB  (buckets=%zu, "
                 "strings=%llu, body=%llu B)\n"
                 "  posSnapshotPool     %12zu  ~%6.1f MB  (capacity=%zu)\n"
@@ -492,7 +487,6 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                 "  standaloneCellRoots %12zu  ~%6.1f MB  (capacity=%zu)\n"
                 "  nursery (Y+S buffs) %12s  ~%6.1f MB\n"
                 "  ----- elsewhere-probe sum: ~%.1f MB -----\n",
-                apt.size(),         attrPosEst    / 1e6, apt.bucket_count(),
                 sct.size(),         sctEst        / 1e6, sct.bucket_count(),
                 (unsigned long long)sctEntryStrings,
                 (unsigned long long)sctEntryBytes,

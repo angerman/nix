@@ -996,16 +996,17 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
     // shared read-only state).
     Bindings * out = Alloc::allocBindings(kExact);
     uint32_t i = 0, j = 0, k = 0;
+    // #752: bindingsSetEntry now copies the entire Entry struct
+    // including the inline `pos` field, so the per-attr position is
+    // forwarded by the Entry copy itself.  The old explicit
+    // recordAttrPos call (which used the side-table) is no longer
+    // needed and would be a no-op anyway.
     auto copyA = [&]() {
         bindingsSetEntry(out, k, a->entries[i]);  // Phase D
-        if (uint32_t p = lookupAttrPos(a, a->entries[i].name))
-            recordAttrPos(out, out->entries[k].name, p);
         ++k; ++i;
     };
     auto copyB = [&]() {
         bindingsSetEntry(out, k, b->entries[j]);  // Phase D
-        if (uint32_t p = lookupAttrPos(b, b->entries[j].name))
-            recordAttrPos(out, out->entries[k].name, p);
         ++k; ++j;
     };
     while (i < na && j < nb) {
@@ -6517,9 +6518,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Bindings * b = Alloc::allocBindings(n);
             allocStats().attrsetsAllocated++;
             for (uint32_t i = 0; i < n; ++i) {
-                b->entries[i].name  = entries[i].name;
+                b->entries[i].name = entries[i].name;
+                b->entries[i].pos  = entries[i].pos;  // #752 inline
                 bindingsSetValue(b, i, entries[i].value);  // Phase D barrier
-                recordAttrPos(b, entries[i].name, entries[i].pos);
             }
             // Phase A1: origin tracking (NIX_V3_DBG_BINDINGS_ORIGIN=1).
             // Use the first entry's posHandle as a representative source
@@ -6592,10 +6593,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
             allocStats().attrsetsAllocated++;
             for (size_t i = 0; i < entries.size(); ++i) {
-                b->entries[i].name  = std::get<0>(entries[i]);
+                b->entries[i].name = std::get<0>(entries[i]);
+                b->entries[i].pos  = std::get<2>(entries[i]);  // #752 inline
                 bindingsSetValue(b, static_cast<uint32_t>(i),
                                  std::get<1>(entries[i]));  // Phase D barrier
-                recordAttrPos(b, std::get<0>(entries[i]), std::get<2>(entries[i]));
             }
             // Phase A1: origin tracking.
             recordBindingsOrigin(b,
@@ -6666,8 +6667,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
                 uint32_t ps = cu->code[ip + 2 * i + 1];
                 b->entries[i].name = nm;
+                b->entries[i].pos  = ps;  // #752 inline
                 b->entries[i].value.mkNull();
-                recordAttrPos(b, nm, ps);
                 if (i == 0) firstPos = ps;
             }
             ip += 2 * n;
@@ -6750,8 +6751,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
                 uint32_t ps = cu->code[ip + 2 * i + 1];
                 b->entries[i].name = nm;
+                b->entries[i].pos  = ps;  // #752 inline
                 b->entries[i].value.mkNull();
-                recordAttrPos(b, nm, ps);
             }
             ip += 2 * n;
             Value v;
@@ -6789,8 +6790,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
                 uint32_t ps = cu->code[ip + 2 * i + 1];
                 b->entries[i].name = nm;
+                b->entries[i].pos  = ps;  // #752 inline
                 b->entries[i].value.mkNull();
-                recordAttrPos(b, nm, ps);
                 if (i == 0) firstPosTail = ps;
             }
             ip += 2 * n;
@@ -9845,7 +9846,7 @@ Value getBuiltinsValue() noexcept
                 v.payload.primop = &po;
             }
             SymbolId sid = ir::globalInternSymbol(poName);
-            bindingsSetEntry(b, i, { sid, v });  // Phase D
+            bindingsSetEntry(b, i, { sid, 0, v });  // Phase D
             ++i;
         }
         // Bindings expects entries sorted by SymbolId for binary search.

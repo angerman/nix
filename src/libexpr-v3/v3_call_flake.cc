@@ -292,11 +292,11 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
             Bindings * inner = Alloc::allocBindings(2);
             allocStats().attrsetsAllocated++;
             if (sidSourceInfo < sidDir) {
-                bindingsSetEntry(inner, 0, {sidSourceInfo, v3SourceInfo});  // Phase D
-                bindingsSetEntry(inner, 1, {sidDir,        v3Dir});
+                bindingsSetEntry(inner, 0, {sidSourceInfo, 0, v3SourceInfo});  // Phase D
+                bindingsSetEntry(inner, 1, {sidDir, 0, v3Dir});
             } else {
-                bindingsSetEntry(inner, 0, {sidDir,        v3Dir});
-                bindingsSetEntry(inner, 1, {sidSourceInfo, v3SourceInfo});
+                bindingsSetEntry(inner, 0, {sidDir, 0, v3Dir});
+                bindingsSetEntry(inner, 1, {sidSourceInfo, 0, v3SourceInfo});
             }
             Value v3Inner;
             v3Inner.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -309,7 +309,7 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
                     "v3::callFlakeV3: node missing from lockfile keyMap");
             SymbolId sidKey = ir::globalInternSymbol(key->second);
 
-            bindingsSetEntry(outer, i++, {sidKey, v3Inner});  // Phase D
+            bindingsSetEntry(outer, i++, {sidKey, 0, v3Inner});  // Phase D
         }
         // Bindings expects entries sorted by SymbolId (binary search).
         std::sort(&outer->entries[0], &outer->entries[outer->size],
