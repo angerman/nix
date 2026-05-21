@@ -43,6 +43,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace nix::v3::ir {
@@ -180,30 +181,81 @@ void computeFunctionStrictness(Module & m)
     size_t formalsTotal = 0;
     size_t formalsStrict = 0;
 
+    // #740 Stage 4 v3 (2026-05-21) — extend to formals-style lambdas.
+    // For `{a, b}: body`, formal references in the body lower to
+    // `RecBindingSlotRef{formalsRecVar, name}` bindings (default
+    // path; see lower.cc inlineRecSlot).  Build a map var→formalIdx
+    // for each such binding so the existing forced-set analysis can
+    // determine whether formal i is strict-used.
+
     for (FuncId fid = 0; fid < (FuncId)m.functions.size(); ++fid) {
         Function & f = m.functions[fid];
 
-        // v2 scope: single-arg lambdas only (`x: body`).  Formals-
-        // style lambdas (`{a, b}: body`) bind each formal to a fresh
-        // VarId inside the body's prologue rather than via paramVar;
-        // ir::Formal doesn't carry that VarId so we can't trace it
-        // back to a call-ABI position.  Skip until v3 wires the
-        // formal-VarIds into ir::Function.
-        std::vector<VarId> formals;
-        if (f.paramVar != kInvalid && !f.hasFormals)
-            formals.push_back(f.paramVar);
+        // Build the strictArgs vector layout:
+        //   [0] paramVar (the @arg attrset alias, if present)
+        //   [1..N] formals[0..N-1] (in the same order as `f.formals`)
+        // For single-arg lambdas (no formals): just [paramVar].
+        // For formals-style without @arg: [formals[0..N-1]].
+        const bool hasParam   = (f.paramVar != kInvalid);
+        const bool hasFormals = f.hasFormals && !f.formals.empty();
+        std::vector<VarId> argVars;
+        size_t paramSlot = (size_t)-1;
+        size_t formalsStart = 0;
+        if (hasParam) {
+            paramSlot = argVars.size();
+            argVars.push_back(f.paramVar);
+        }
+        if (hasFormals) {
+            // We use kInvalid as a placeholder here; the actual
+            // VarId discovery happens by walking the body for
+            // RecBindingSlotRef bindings.  The MAP we build is
+            // (varId → formalIdx).
+            formalsStart = argVars.size();
+            for (size_t i = 0; i < f.formals.size(); ++i) {
+                argVars.push_back(kInvalid);
+            }
+        }
 
-        f.strictArgs.assign(formals.size(), false);
+        f.strictArgs.assign(argVars.size(), false);
         ++fnsTotal;
-        formalsTotal += formals.size();
-        if (formals.empty()) continue;
-
-        // Forward walk of the entry block's bindings.  Stop at the
-        // first branching expression (If/With/Assert/And/Or/Impl).
-        std::unordered_set<VarId> forced;
+        formalsTotal += argVars.size();
+        if (argVars.empty()) continue;
         if (f.entryBlock == kInvalidBlock
             || f.entryBlock >= (BlockId)m.blocks.size()) continue;
         const Block & b = m.blocks[f.entryBlock];
+
+        // First pass: discover formal-reference VarIds.
+        // formalVarToIdx[var] = index in f.formals[] (0-based).
+        std::unordered_map<VarId, size_t> formalVarToIdx;
+        if (hasFormals && f.formalsRecVar != kInvalid) {
+            // Build (name → formals[] index).
+            std::unordered_map<SymbolId, size_t> nameToIdx;
+            for (size_t i = 0; i < f.formals.size(); ++i) {
+                nameToIdx.emplace(f.formals[i].name, i);
+            }
+            for (const auto & bind : b.bindings) {
+                if (auto * rb = std::get_if<RecBindingSlotRef>(&bind.expr)) {
+                    if (rb->attrs == f.formalsRecVar) {
+                        auto it = nameToIdx.find(rb->name);
+                        if (it != nameToIdx.end()) {
+                            formalVarToIdx.emplace(bind.var, it->second);
+                        }
+                    }
+                }
+                // Also chase VarRef aliases — the body might
+                // re-alias via inlineTrivialBindings or similar
+                // optimisations.  Handle one alias hop here (rare
+                // in practice but cheap).
+                else if (auto * vr = std::get_if<VarRef>(&bind.expr)) {
+                    auto it = formalVarToIdx.find(vr->var);
+                    if (it != formalVarToIdx.end())
+                        formalVarToIdx.emplace(bind.var, it->second);
+                }
+            }
+        }
+
+        // Second pass: existing forced-set analysis.
+        std::unordered_set<VarId> forced;
         for (const auto & bind : b.bindings) {
             if (!collectForced(bind.expr, forced)) break;
         }
@@ -211,10 +263,24 @@ void computeFunctionStrictness(Module & m)
         // itself — the caller forces it.  Skip.
 
         size_t strictForFn = 0;
-        for (size_t i = 0; i < formals.size(); ++i) {
-            if (forced.count(formals[i])) {
-                f.strictArgs[i] = true;
+        // paramVar slot.
+        if (hasParam) {
+            if (forced.count(f.paramVar)) {
+                f.strictArgs[paramSlot] = true;
                 ++strictForFn;
+            }
+        }
+        // formals[i] slots.
+        if (hasFormals) {
+            for (const auto & [varId, formalIdx] : formalVarToIdx) {
+                if (forced.count(varId)) {
+                    const size_t slot = formalsStart + formalIdx;
+                    if (slot < f.strictArgs.size()
+                        && !f.strictArgs[slot]) {
+                        f.strictArgs[slot] = true;
+                        ++strictForFn;
+                    }
+                }
             }
         }
         if (strictForFn > 0) ++fnsWithArgs;

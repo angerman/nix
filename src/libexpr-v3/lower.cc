@@ -1249,6 +1249,11 @@ struct Lowerer
             }
 
             ir::VarId formalsRec = m.freshVar();
+            // #740 Stage 4 v3 — record the formalsRec VarId on the
+            // Function so opt_func_strictness.cc can identify
+            // RecBindingSlotRef{formalsRec, name} bindings in the
+            // body and trace formal strictness.
+            m.functions[fid].formalsRecVar = formalsRec;
 
             // Build a single scope holding both @arg (if any) at
             // displ 0 plus the formals as rec slots starting at the

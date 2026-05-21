@@ -552,6 +552,22 @@ struct Function {
     VarId intrinsicVar1 = kInvalid;
     VarId intrinsicVar2 = kInvalid;
 
+    /// #740 Stage 4 v3 (2026-05-21) formal-rec attrset VarId.
+    ///
+    /// For formals-style lambdas (`{a, b ? def}: body`), the lowerer
+    /// synthesises a LetRec attrset whose entries are per-formal
+    /// thunks.  Body references to formals lower to
+    /// `RecBindingSlotRef{formalsRecVar, name}` bindings.  Recording
+    /// the formalsRecVar here lets the Stage 4 v3 strictness pass
+    /// (opt_func_strictness.cc) identify formal-reference bindings
+    /// in the body and trace which formals are forced before
+    /// branching.
+    ///
+    /// `kInvalid` for single-arg lambdas (no formals) and any
+    /// formals-style lambda whose lowering doesn't go through the
+    /// synthetic LetRec path (none currently).
+    VarId formalsRecVar = kInvalid;
+
     /// #737 Stage 4 v2 (2026-05-21) per-Function strictness signature.
     ///
     /// One entry per formal argument the function accepts at the
