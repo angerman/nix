@@ -33,6 +33,12 @@
 #include <chrono>
 
 #include "nix/expr/eval.hh"
+
+#include <sys/resource.h>
+#if defined(__APPLE__)
+# include <mach/mach.h>
+# include <mach/task.h>
+#endif
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/print.hh"
 #include "nix/expr/value/context.hh"
@@ -7197,13 +7203,33 @@ void primImport(EvalState & state, Value * args, Value & out)
                 "v3 IMPORT-INVAL: %s (mtime/size changed)\n", path.c_str());
         cache.results.erase(it);
     }
+    // #755 instrumentation: RSS-per-import to localize which file
+    // dominates the cumulative memory cost.  Same trigger as
+    // V3_DBG_IMPORT for combined output.  Cheap (one task_info /
+    // getrusage per import).
+    auto rssMBImp = []() -> uint64_t {
+#if defined(__APPLE__)
+        mach_task_basic_info_data_t info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      (task_info_t)&info, &count) == KERN_SUCCESS)
+            return info.resident_size / (1024 * 1024);
+#else
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0)
+            return (uint64_t)ru.ru_maxrss / 1024;
+#endif
+        return 0;
+    };
     if (s_dbg_import) {
         static std::atomic<uint64_t> seqMiss{0};
-        std::fprintf(stderr, "v3 IMPORT-MISS[%llu]: %s\n",
-            (unsigned long long)seqMiss.fetch_add(1), path.c_str());
+        std::fprintf(stderr, "v3 IMPORT-MISS[%llu] RSS=%lluMB: %s\n",
+            (unsigned long long)seqMiss.fetch_add(1),
+            (unsigned long long)rssMBImp(), path.c_str());
     }
 
     auto & ns = *state.nixEvalState;
+
     // Default: rootFS (the real filesystem under restricted-mode rules
     // + the augmented store accessor).  Use `resolveExprPath` to
     // follow symlink chains and append `default.nix` when the path is
@@ -7293,17 +7319,48 @@ void primImport(EvalState & state, Value * args, Value & out)
         }
     }
 
-    auto module = lowerNixExpr(e, ns.symbols, ns.positions);
-    nix::v3::ir::optimise(module);
-    nix::v3::ir::computeFreeVars(module);
-    cache.cus.push_back(compile(module));
-    if (diskCacheEnabled && !diskKey.empty()
-        && serialize::isCacheable(cache.cus.back())) {
-        try {
-            std::string blob = serialize::serializeCU(cache.cus.back());
-            disk_cache::insert(diskKey, blob);
-        } catch (...) { /* best-effort */ }
+    // #755 fix: scope `module` tightly so its std::vector<Block> /
+    // std::vector<Function> heap storage is freed BEFORE we recurse
+    // into `run()` — which may transitively call `primImport` again
+    // (cardano-node M5 has 52+ nested imports of nixpkgs.lib files;
+    // each nested call would otherwise keep its own `module` on the
+    // C++ stack with all its IR vectors live in libc malloc).
+    // After `compile(module)` produces the CU, the bytecode is self-
+    // contained and the IR is no longer needed.  The CU itself stays
+    // alive in the cache.cus deque.
+    if (s_dbg_import) std::fprintf(stderr,
+        "v3 IMPORT-PHASE before-lower RSS=%lluMB: %s\n",
+        (unsigned long long)rssMBImp(), path.c_str());
+    {
+        auto module = lowerNixExpr(e, ns.symbols, ns.positions);
+        if (s_dbg_import) std::fprintf(stderr,
+            "v3 IMPORT-PHASE after-lower RSS=%lluMB: %s\n",
+            (unsigned long long)rssMBImp(), path.c_str());
+        nix::v3::ir::optimise(module);
+        if (s_dbg_import) std::fprintf(stderr,
+            "v3 IMPORT-PHASE after-optimise RSS=%lluMB: %s\n",
+            (unsigned long long)rssMBImp(), path.c_str());
+        nix::v3::ir::computeFreeVars(module);
+        if (s_dbg_import) std::fprintf(stderr,
+            "v3 IMPORT-PHASE after-freeVars RSS=%lluMB: %s\n",
+            (unsigned long long)rssMBImp(), path.c_str());
+        cache.cus.push_back(compile(module));
+        if (s_dbg_import) std::fprintf(stderr,
+            "v3 IMPORT-PHASE after-compile RSS=%lluMB: %s\n",
+            (unsigned long long)rssMBImp(), path.c_str());
+        if (diskCacheEnabled && !diskKey.empty()
+            && serialize::isCacheable(cache.cus.back())) {
+            try {
+                std::string blob = serialize::serializeCU(cache.cus.back());
+                disk_cache::insert(diskKey, blob);
+            } catch (...) { /* best-effort */ }
+        }
+        // `module` destructed here, freeing all IR-side vectors
+        // before the recursive `run()` below.
     }
+    if (s_dbg_import) std::fprintf(stderr,
+        "v3 IMPORT-PHASE before-run RSS=%lluMB: %s\n",
+        (unsigned long long)rssMBImp(), path.c_str());
     // Each imported file is its own CompilationUnit; we re-enter the
     // VM to run it with its own top-level frame.  Keep the CU alive
     // (it's borrowed by closures returned from the eval).
@@ -7311,6 +7368,10 @@ void primImport(EvalState & state, Value * args, Value & out)
     {
         auto [mt, sz] = importStat(path);
         cache.results.emplace(path, ImportCacheEntry{out, mt, sz});
+    }
+    if (s_dbg_import) {
+        std::fprintf(stderr, "v3 IMPORT-DONE RSS=%lluMB: %s\n",
+            (unsigned long long)rssMBImp(), path.c_str());
     }
 }
 
@@ -9670,6 +9731,31 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
         throw nix::Error(
             "cannot call 'getFlake' on unlocked flake reference '%s' (use --impure to override)",
             flakeRefS);
+    // #755 instrumentation: RSS checkpoint around lockFlake to
+    // localize the over-allocation that #754 bisection traced to
+    // v3-native callFlake on haskell.nix flakes.  When
+    // V3_DBG_GETFLAKE_RSS=1, prints RSS in MB before/after the
+    // lockFlake call.  Cheap (one task_info / getrusage per call).
+    static const bool s_dbgGetFlakeRss =
+        std::getenv("V3_DBG_GETFLAKE_RSS") != nullptr;
+    auto dbgRssMB = [&]() -> uint64_t {
+#if defined(__APPLE__)
+        mach_task_basic_info_data_t info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      (task_info_t)&info, &count) == KERN_SUCCESS)
+            return info.resident_size / (1024 * 1024);
+#else
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0)
+            return (uint64_t)ru.ru_maxrss / 1024;
+#endif
+        return 0;
+    };
+    if (s_dbgGetFlakeRss)
+        std::fprintf(stderr,
+            "v3 getFlake: RSS=%llu MB before lockFlake('%s')\n",
+            (unsigned long long)dbgRssMB(), flakeRefS.c_str());
     auto lockedFlake = nix::flake::lockFlake(
         *flakeSettings, ns, flakeRef,
         nix::flake::LockFlags{
@@ -9678,6 +9764,11 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
             .useRegistries = !ns.settings.pureEval && flakeSettings->useRegistries,
             .allowUnlocked = !ns.settings.pureEval,
         });
+    if (s_dbgGetFlakeRss)
+        std::fprintf(stderr,
+            "v3 getFlake: RSS=%llu MB after lockFlake (nodes=%zu)\n",
+            (unsigned long long)dbgRssMB(),
+            lockedFlake.nodePaths.size());
 
     // (2) v3-native call-flake.nix evaluation.  callFlakeV3 builds
     //     TW args, bridges to v3, applies the cached closure × 3,

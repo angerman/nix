@@ -316,19 +316,153 @@ inline uint64_t getProcessRssBytes() noexcept
 // exactly once by initLimits.
 std::atomic<uint64_t> g_rssCap{0};
 
+// Async-signal-safe integer-to-ASCII conversion.  Writes the
+// decimal representation of `v` into `out` (advancing `out`).
+// `out` must have at least 24 bytes of room (enough for uint64_t).
+inline void aSafeAppendU64(char *& out, uint64_t v) noexcept
+{
+    if (v == 0) { *out++ = '0'; return; }
+    char tmp[24];
+    int n = 0;
+    while (v > 0) { tmp[n++] = char('0' + (v % 10)); v /= 10; }
+    while (n > 0) *out++ = tmp[--n];
+}
+
+inline void aSafeAppendLit(char *& out, const char * s) noexcept
+{
+    while (*s) *out++ = *s++;
+}
+
+inline void aSafeAppendBytes(char *& out, uint64_t v) noexcept
+{
+    if (v < (1ull << 20)) {
+        aSafeAppendU64(out, v);
+        aSafeAppendLit(out, "B");
+    } else if (v < (1ull << 30)) {
+        aSafeAppendU64(out, v / (1ull << 20));
+        aSafeAppendLit(out, "MB");
+    } else {
+        // GB with one decimal.
+        const uint64_t gb_tenths = (v * 10) >> 30;
+        aSafeAppendU64(out, gb_tenths / 10);
+        *out++ = '.';
+        aSafeAppendU64(out, gb_tenths % 10);
+        aSafeAppendLit(out, "GB");
+    }
+}
+
 extern "C" void rssCapTimerHandler(int /*signo*/) noexcept
 {
     const uint64_t cap = g_rssCap.load(std::memory_order_relaxed);
     if (cap == 0) return;
     const uint64_t rss = getProcessRssBytes();
     if (rss < cap) return;
-    // Async-signal-safe path: single fixed-string banner via write(2)
-    // then _exit(2).  No fprintf, no malloc, no atexit chain.
-    static const char msg[] =
-        "v3 SAFETY: RSS exceeded NIX_V3_MAX_HEAP cap; process exiting "
-        "via SIGALRM watchdog (137).  Set NIX_V3_MAX_HEAP=<bytes> "
-        "with a larger budget OR investigate the runaway allocation.\n";
-    (void) !write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    // Async-signal-safe forensic dump.  No fprintf, no malloc, no
+    // locks.  Reads atomic-ish allocStats() counters (uint64_t
+    // writes are atomic on aarch64/x86_64 for normal-aligned
+    // accesses) and the static opName() table.
+    //
+    // Format:
+    //   v3 SAFETY watchdog (137): RSS=<rss> cap=<cap>
+    //     alloc: closures=N thunks=N attrsets=N lists=N pairs=N
+    //            insns=N forced=N bridge=N
+    //     bytes: closures=NMB thunks=NMB bindings=NMB lists=NMB ...
+    //     top opcodes (with NIX_VM_OPCOUNTS=1):
+    //       OP_xxx (n)
+    //       OP_yyy (m)
+    //       ...
+    //   exit 137
+    char buf[3072];
+    char * p = buf;
+    aSafeAppendLit(p,
+        "\nv3 SAFETY watchdog: process exit (137); RSS=");
+    aSafeAppendBytes(p, rss);
+    aSafeAppendLit(p, " cap=");
+    aSafeAppendBytes(p, cap);
+    aSafeAppendLit(p, "\n");
+
+    const auto & a = allocStats();
+    aSafeAppendLit(p,
+        "  alloc: closures=");   aSafeAppendU64(p, a.closuresAllocated);
+    aSafeAppendLit(p, " thunks=");  aSafeAppendU64(p, a.thunksAllocated);
+    aSafeAppendLit(p, " attrsets="); aSafeAppendU64(p, a.attrsetsAllocated);
+    aSafeAppendLit(p, " lists=");    aSafeAppendU64(p, a.listsAllocated);
+    aSafeAppendLit(p, " pairs=");    aSafeAppendU64(p, a.pairsAllocated);
+    aSafeAppendLit(p, " values=");   aSafeAppendU64(p, a.valuesAllocated);
+    aSafeAppendLit(p, "\n         insns=");
+    aSafeAppendU64(p, a.bytecodeInstructions);
+    aSafeAppendLit(p, " forced=");   aSafeAppendU64(p, a.thunksForced);
+    aSafeAppendLit(p, " bridgeForced=");
+    aSafeAppendU64(p, a.bridgeThunksForced);
+    aSafeAppendLit(p, "\n");
+
+    aSafeAppendLit(p, "  bytes: closures=");
+    aSafeAppendBytes(p, a.bytesClosures);
+    aSafeAppendLit(p, " thunks=");  aSafeAppendBytes(p, a.bytesThunks);
+    aSafeAppendLit(p, " bindings="); aSafeAppendBytes(p, a.bytesBindings);
+    aSafeAppendLit(p, " lists=");    aSafeAppendBytes(p, a.bytesLists);
+    aSafeAppendLit(p, " pairs=");    aSafeAppendBytes(p, a.bytesPairs);
+    aSafeAppendLit(p, " chars=");    aSafeAppendBytes(p, a.bytesChars);
+    const uint64_t v3Total =
+          a.bytesValues + a.bytesClosures + a.bytesThunks + a.bytesEnvs
+        + a.bytesLists  + a.bytesBindings + a.bytesPairs + a.bytesChars;
+    aSafeAppendLit(p, "\n         v3_total=");
+    aSafeAppendBytes(p, v3Total);
+    // Boehm heap size at this instant.  GC_get_heap_size is
+    // documented async-signal-safe in Boehm 8.0+ (used by other
+    // GC-aware runtime watchdogs).
+    const uint64_t boehmHeap = (uint64_t) GC_get_heap_size();
+    aSafeAppendLit(p, " boehm=");
+    aSafeAppendBytes(p, boehmHeap);
+    // "Elsewhere" = RSS - boehm - v3_arena (libc malloc, mmap,
+    // bridge tables, etc.).  When v3-native callFlake's runaway
+    // happens here, the bug is in code that v3 doesn't track.
+    const uint64_t elsewhere =
+        (rss > boehmHeap + v3Total)
+          ? (rss - boehmHeap - v3Total)
+          : 0;
+    aSafeAppendLit(p, " elsewhere=");
+    aSafeAppendBytes(p, elsewhere);
+    aSafeAppendLit(p, "\n");
+
+    // Top-N opcodes by count.  Find them via a single linear scan
+    // selecting the highest unseen entry each iteration — O(N * 256)
+    // total work, no allocation, no sort.
+    const auto & oc = a.opcodeCounts;
+    uint64_t totalOps = 0;
+    for (int i = 0; i < 256; ++i) totalOps += oc[i];
+    if (totalOps > 0) {
+        aSafeAppendLit(p, "  top opcodes (NIX_VM_OPCOUNTS):\n");
+        bool seen[256] = {};
+        const int topN = 10;
+        for (int k = 0; k < topN; ++k) {
+            int bestIdx = -1;
+            uint64_t bestCnt = 0;
+            for (int i = 0; i < 256; ++i) {
+                if (seen[i]) continue;
+                if (oc[i] > bestCnt) { bestCnt = oc[i]; bestIdx = i; }
+            }
+            if (bestIdx < 0 || bestCnt == 0) break;
+            seen[bestIdx] = true;
+            aSafeAppendLit(p, "    ");
+            const char * nm = opName(static_cast<Op>(bestIdx));
+            aSafeAppendLit(p, nm ? nm : "OP_?");
+            aSafeAppendLit(p, " ");
+            aSafeAppendU64(p, bestCnt);
+            // % of total
+            aSafeAppendLit(p, " (");
+            aSafeAppendU64(p, totalOps > 0
+                ? (bestCnt * 100) / totalOps : 0);
+            aSafeAppendLit(p, "%)\n");
+            // Safety check on buffer space.
+            if (p - buf > int(sizeof buf) - 256) break;
+        }
+    } else {
+        aSafeAppendLit(p,
+            "  (opcode breakdown unavailable; rerun with NIX_VM_OPCOUNTS=1)\n");
+    }
+
+    (void) !write(STDERR_FILENO, buf, size_t(p - buf));
     _exit(137);
 }
 

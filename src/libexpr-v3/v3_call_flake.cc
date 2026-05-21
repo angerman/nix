@@ -41,6 +41,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <sys/resource.h>
+#if defined(__APPLE__)
+# include <mach/mach.h>
+# include <mach/task.h>
+#endif
 #include <chrono>
 #include <deque>
 #include <mutex>
@@ -355,9 +360,43 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
             "activeV3VM both null — must be called inside a v3 "
             "dispatch loop)");
 
+    // #755 instrumentation: log RSS at each callClosure boundary
+    // to localize which apply blows up.
+    static const bool s_dbgRss =
+        std::getenv("V3_DBG_GETFLAKE_RSS") != nullptr;
+    auto rssMB = []() -> uint64_t {
+#if defined(__APPLE__)
+        mach_task_basic_info_data_t info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      (task_info_t)&info, &count) == KERN_SUCCESS)
+            return info.resident_size / (1024 * 1024);
+#else
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0)
+            return (uint64_t)ru.ru_maxrss / 1024;
+#endif
+        return 0;
+    };
+    if (s_dbgRss)
+        std::fprintf(stderr,
+            "v3 callFlakeV3: RSS=%llu MB before callClosure(vCallFlake, vLocks)\n",
+            (unsigned long long)rssMB());
     Value r1 = callClosure(*vm, vCallFlake, v3Locks);
+    if (s_dbgRss)
+        std::fprintf(stderr,
+            "v3 callFlakeV3: RSS=%llu MB after callClosure #1 (lockFileStr applied)\n",
+            (unsigned long long)rssMB());
     Value r2 = callClosure(*vm, r1, v3Overrides);
+    if (s_dbgRss)
+        std::fprintf(stderr,
+            "v3 callFlakeV3: RSS=%llu MB after callClosure #2 (overrides applied)\n",
+            (unsigned long long)rssMB());
     Value r3 = callClosure(*vm, r2, v3FetchFinal);
+    if (s_dbgRss)
+        std::fprintf(stderr,
+            "v3 callFlakeV3: RSS=%llu MB after callClosure #3 (fetchTreeFinal applied)\n",
+            (unsigned long long)rssMB());
     return r3;
 }
 
