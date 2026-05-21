@@ -192,16 +192,26 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
     if (n.contains(t)) {
         auto it = forward.find(t);
         if (it != forward.end()) return static_cast<Thunk *>(it->second);
-        // Suspended / Native carry a FAM tail of `nUpvalues` Values;
-        // Evaluated / Bridge / Blackhole occupy only the header.
+        // #705 / N1 (2026-05-21): Blackhole MUST copy the full
+        // Suspended-layout (header + tail[nUpvalues]).  The union
+        // variant remains `suspended` while the body is executing,
+        // and `clearBlackMarksOnException` can revert Blackhole →
+        // Suspended on exception unwind — at which point OP_FORCE
+        // re-reads `tail[i]` and `suspended.capturedWiths` to
+        // rebuild the fakeClo.  If we copy only the header, the
+        // tenured copy's tail[i] is uninitialized garbage; the
+        // post-revert force builds a fakeClo with stale upvalues.
+        //
+        // Suspended / Native / Blackhole all carry a FAM tail of
+        // nUpvalues Values.  Evaluated / Bridge use only the header.
         size_t bytes;
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Native:
+        case ThunkState::Blackhole:
             bytes = sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
             break;
         case ThunkState::Evaluated:
-        case ThunkState::Blackhole:
         case ThunkState::Bridge:
             bytes = sizeof(Thunk);
             break;
@@ -345,8 +355,26 @@ void Scavenger::visitValue(Value & v)
     }
 }
 
+// #705 R9 (audit Round 2 N3): register every CU reached transitively
+// so its `attrSelectCache` IC entries are walked too.  Without this,
+// an OP_ATTRS_SELECT_IC hit on an IC entry whose Bindings is only
+// reachable via the cache slot (not via any other vm root) leaves
+// the Bindings's entries unforwarded → next hit returns a stale
+// Tag::Thunk payload.
+//
+// Drains immediately so any nursery Bindings the IC points at gets
+// queued for walkBindings (and its entries' nursery payloads
+// forwarded) inside the same scavenge pass.
 void Scavenger::walkClosure(Closure * c)
 {
+    if (c->cu && walkedCUs.insert(c->cu).second) {
+        for (const auto & ic : c->cu->attrSelectCache) {
+            for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
+                    fwdBindings(b);
+            }
+        }
+    }
     if (c->capturedWiths) c->capturedWiths = fwdList(c->capturedWiths);
     for (uint16_t i = 0; i < c->nUpvalues; ++i) {
         visitValue(c->upvalues[i]);
@@ -362,6 +390,14 @@ void Scavenger::walkThunk(Thunk * t)
     }
     switch (t->state) {
     case ThunkState::Suspended:
+        if (t->suspended.cu && walkedCUs.insert(t->suspended.cu).second) {
+            for (const auto & ic : t->suspended.cu->attrSelectCache) {
+                for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                    if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
+                        fwdBindings(b);
+                }
+            }
+        }
         if (t->suspended.capturedWiths)
             t->suspended.capturedWiths = fwdList(t->suspended.capturedWiths);
         for (uint16_t i = 0; i < t->nUpvalues; ++i) {
@@ -383,8 +419,44 @@ void Scavenger::walkThunk(Thunk * t)
         // not a v3 nursery pointer, so nothing to forward here.
         break;
     case ThunkState::Blackhole:
-        // Currently-being-forced; payload is irrelevant until the
-        // body completes (state will flip to Evaluated then).
+        // Mirror Suspended: walk CU's AttrSelectIC (R9) too.
+        if (t->suspended.cu && walkedCUs.insert(t->suspended.cu).second) {
+            for (const auto & ic : t->suspended.cu->attrSelectCache) {
+                for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                    if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
+                        fwdBindings(b);
+                }
+            }
+        }
+        // #705 / N1 (2026-05-21 Round 2 GC audit): walk the
+        // Suspended-layout fields even while the thunk is Blackhole.
+        // The union variant is still `suspended` (state is just a
+        // marker that the body is currently executing); tail[i] hold
+        // the captured upvalues and suspended.capturedWiths the
+        // outer with-chain.
+        //
+        // Why this matters: `clearBlackMarksOnException` reverts
+        // Blackhole → Suspended on exception unwind (vm.cc ~9400).
+        // After the revert, OP_FORCE re-reads `t->tail[i]` and
+        // `t->suspended.capturedWiths` to rebuild the fakeClo
+        // (vm.cc ~6027 / 11089).  If a scavenge fired while the
+        // state was Blackhole, those fields hold stale nursery
+        // pointers → next force builds a fakeClo with stale upvalues
+        // → OP_TAIL_CALL / OP_GET_UPVALUE crash with desc=null
+        // (the "stale callee" / OOR signature we saw on
+        // hello.outPath and hello.drvPath).
+        //
+        // Trigger conditions (all common at workload scale):
+        //   - exception during a thunk body (assert / throw / addErrorContext)
+        //   - outer dispatch at exitDepth==0
+        //   - scavenge fires during the body
+        //
+        // Fix: identical to the Suspended case.
+        if (t->suspended.capturedWiths)
+            t->suspended.capturedWiths = fwdList(t->suspended.capturedWiths);
+        for (uint16_t i = 0; i < t->nUpvalues; ++i) {
+            visitValue(t->tail[i]);
+        }
         break;
     }
 }
@@ -671,7 +743,17 @@ struct Auditor {
             visitValue(t->evaluated, "Thunk.evaluated");
             break;
         case ThunkState::Bridge:
+            break;
         case ThunkState::Blackhole:
+            // #705 / N1: mirror scavenger's Blackhole walk — tail and
+            // suspended.capturedWiths are live because
+            // clearBlackMarksOnException can revert Blackhole →
+            // Suspended on exception unwind.  See gc.cc walkThunk.
+            if (t->suspended.capturedWiths)
+                check(t->suspended.capturedWiths,
+                      "Thunk.Blackhole.suspended.capturedWiths", site);
+            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                visitValue(t->tail[i], "Thunk.Blackhole.tail[]");
             break;
         }
     }

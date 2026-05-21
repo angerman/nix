@@ -2201,6 +2201,44 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // folds to a single conditional jump on the hot path.
         if (__builtin_expect(nursery != nullptr, 0)) [[unlikely]] {
             if (nursery->shouldScavenge()) {
+                // #705 N1-followup (2026-05-21): defer scavenge if a
+                // NESTED VMState exists on the active stack.  When a
+                // primop body creates a secondary VMState via
+                // `runFunctionWithUpvalues`, the secondary's
+                // dispatchLoop has exitDepth==0 on its own vm — so
+                // this gate fires there too.  But the OUTER primop
+                // body's C-stack locals (Values holding nursery
+                // pointers passed as args, intermediate results,
+                // etc.) are invisible to the scavenger — only
+                // vm.valueStack/withStack/frames are walked.  If we
+                // scavenge while the outer body is mid-execution,
+                // those C-locals dangle, producing the
+                // hello.outPath / hello.drvPath stale-callee crashes.
+                //
+                // The defer is conservative: scavenge only fires when
+                // every active VMState on the thread is THIS vm.
+                // Same-vm re-entries (forceValue → inner dispatchLoop)
+                // push the same pointer multiple times — that's fine.
+                bool nestedDistinct = false;
+                for (VMState * vmp : activeVMStack()) {
+                    if (vmp && vmp != &vm) { nestedDistinct = true; break; }
+                }
+                if (nestedDistinct) {
+                    // Skip; next outer iteration with single-vm
+                    // active stack will reclaim.  Cost: nursery may
+                    // overshoot its threshold under primop chains
+                    // that nest runFunctionWithUpvalues — bounded by
+                    // NIX_V3_MAX_HEAP.
+                    static const bool s_dbg =
+                        std::getenv("V3_DBG_NURSERY") != nullptr;
+                    if (__builtin_expect(s_dbg, 0)) {
+                        std::fprintf(stderr,
+                            "[v3 nursery] DEFER scavenge — nested VMState "
+                            "active (stack size=%zu, current=%p)\n",
+                            activeVMStack().size(), (void*)&vm);
+                    }
+                    goto skip_scavenge;
+                }
                 // Sync ip into the frame so the scavenger walks a
                 // consistent VM state.  ip is a per-iteration
                 // running counter; valueStack/withStack/frames are
@@ -2219,6 +2257,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
         }
+        skip_scavenge:;
         // V3_DBG_TRACE_THUNK_BODY: print this instruction if the current
         // frame is a thunk frame matching the configured codeOffset/nUp.
         // Profile (sample on fib38) showed this branch alone consumed
@@ -10998,6 +11037,50 @@ Value forceValue(VMState & vm, Value v)
                     }
                 }
                 std::fprintf(stderr, "  total arena refs to t: %zu\n", hits);
+
+                // #705 N1-followup: search vm.valueStack / vm.withStack
+                // and ALL active VMStates for any Tag::Thunk Value with
+                // payload == stale t.  Pinpoints which root holds the
+                // stale pointer that scavenge missed.
+                {
+                    auto searchVm = [&](const char * label, const VMState * vmp) {
+                        if (!vmp) return;
+                        size_t vhits = 0;
+                        for (size_t i = 0; i < vmp->valueStack.size(); ++i) {
+                            const Value & sv = vmp->valueStack[i];
+                            if (sv.tag() != Tag::Thunk) continue;
+                            if ((uintptr_t)sv.payload.thunk != target) continue;
+                            if (vhits++ < 4)
+                                std::fprintf(stderr,
+                                    "  %s.valueStack[%zu] = Tag::Thunk(stale)\n",
+                                    label, i);
+                        }
+                        for (size_t i = 0; i < vmp->withStack.size(); ++i) {
+                            const Value & sv = vmp->withStack[i];
+                            if (sv.tag() != Tag::Thunk) continue;
+                            if ((uintptr_t)sv.payload.thunk != target) continue;
+                            std::fprintf(stderr,
+                                "  %s.withStack[%zu] = Tag::Thunk(stale)\n",
+                                label, i);
+                        }
+                        for (size_t i = 0; i < vmp->frames.size(); ++i) {
+                            const CallFrame & f = vmp->frames[i];
+                            if ((uintptr_t)f.thunk == target)
+                                std::fprintf(stderr,
+                                    "  %s.frames[%zu].thunk = stale\n",
+                                    label, i);
+                        }
+                        std::fprintf(stderr,
+                            "  %s: total valueStack matches=%zu\n",
+                            label, vhits);
+                    };
+                    searchVm("currentVm", &vm);
+                    for (VMState * vmp : activeVMStack()) {
+                        if (vmp && vmp != &vm) {
+                            searchVm("otherVm", vmp);
+                        }
+                    }
+                }
 
                 // Second pass: the missed-root Bindings is at (p - 48)
                 // per the layout decoded above.  Search the arena for
