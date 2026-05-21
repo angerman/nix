@@ -202,6 +202,35 @@ inline std::unordered_set<const CompilationUnit *> & cuRegistry()
 static const bool g_dbgAllocDump =
     std::getenv("V3_DBG_ALLOC_DUMP") != nullptr;
 
+// #733 (2026-05-21) hot-path stat-counter gate.  The per-descriptor
+// allocCount/forceCount + global thunksForced/thunksAllocated/
+// bridgeThunksForced increments live on the hottest paths in the
+// interpreter — every OP_MAKE_THUNK and every Suspended→Blackhole
+// transition.  Two of the three writes (desc->forceCount,
+// allocStats().thunksForced) target cache lines shared across
+// thunks/threads, so an unconditional ++ is a cross-cache-line
+// dirty write per force.  Five known consumers exist:
+//   V3_DBG_ALLOC_DUMP (atexit per-descriptor dump),
+//   V3_DBG_FORCES (periodic stride dump),
+//   V3_DBG_FORCE_NAME / V3_DBG_FORCE_POS (first-force trace),
+//   NIX_VM_STATS (v3-eval --json/--strict completion banner +
+//   run.cc completion banner).
+// None of these is in the default production path.  Gate all
+// counter mutations behind a single static OR of the five env
+// vars; the unlikely-branch hint keeps the predicted fall-through
+// near the original code.  Retirement criterion: delete this gate
+// + restore unconditional increments WHEN a measurement shows the
+// gating is no-op (e.g. all consumers move to sampling).
+inline bool dbgForceStatsActive() noexcept
+{
+    static const bool s_active = [] {
+        return std::getenv("V3_DBG_ALLOC_DUMP") || std::getenv("V3_DBG_FORCES")
+            || std::getenv("V3_DBG_FORCE_NAME") || std::getenv("V3_DBG_FORCE_POS")
+            || std::getenv("NIX_VM_STATS");
+    }();
+    return s_active;
+}
+
 // #548c (2026-05-10) atexit dump.  Walks every CU registered above
 // and every LambdaDescriptor in each CU's lambdas vector; emits the
 // top-N by (allocCount + forceCount).  Source positions are
@@ -3295,14 +3324,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // the with-targets sit BELOW the upvalues on the stack.
             uint16_t nWiths = static_cast<uint16_t>(cu->code[ip++]);
             Thunk * t = Alloc::allocThunkSuspended(nUp);
-            allocStats().thunksAllocated++;
             // The "descriptor" we use is the LambdaDescriptor for the
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
             t->suspended.desc = &cu->lambdas[funcIdx];
-            // #548c diagnostic: track per-descriptor allocCount so the
-            // atexit dump can reveal hot re-instantiation sites.
-            ++cu->lambdas[funcIdx].allocCount;
+            // #733: thunksAllocated + per-descriptor allocCount serve
+            // V3_DBG_ALLOC_DUMP / V3_DBG_FORCES / NIX_VM_STATS only —
+            // gate the writes (cross-cache-line; unconditional cost
+            // ~1-2 ns per alloc on hot paths).
+            if (__builtin_expect(dbgForceStatsActive(), 0)) {
+                allocStats().thunksAllocated++;
+                ++cu->lambdas[funcIdx].allocCount;
+            }
             if (__builtin_expect(g_dbgAllocDump, 0)) {
                 cuRegistry().insert(cu);
                 // A12 #583: periodic dump every 2M allocations since
@@ -5912,8 +5945,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // result.  Defined in primops.cc so vm.cc stays free of
             // nix:: includes.
             if (t->state == ThunkState::Bridge) {
-                ++t->forces;
-                ++allocStats().bridgeThunksForced;
+                // #733: gate bridge-force stats (see dbgForceStatsActive).
+                if (__builtin_expect(dbgForceStatsActive(), 0)) {
+                    ++t->forces;
+                    ++allocStats().bridgeThunksForced;
+                }
                 // #466 / STG-7 (#498): forceBridgeThunk reaches into TW
                 // (ns->forceValue), and TW may re-enter v3 via the eval
                 // hook on whatever Expr it ends up driving.  Without
@@ -5981,9 +6017,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // count tells us how many thunks share the same body
             // (over-allocation indicator: when 1 expression yields N
             // thunks because the binding it captures isn't shared).
-            ++t->forces;
-            ++desc->forceCount;
-            ++allocStats().thunksForced;
+            // #733: per-Thunk + per-LambdaDescriptor + global force
+            // stats — gate behind dbgForceStatsActive (see comment near
+            // dbgForceStatsActive in this file).  desc->forceCount and
+            // allocStats().thunksForced are the contended writes.
+            if (__builtin_expect(dbgForceStatsActive(), 0)) {
+                ++t->forces;
+                ++desc->forceCount;
+                ++allocStats().thunksForced;
+            }
             // #558 (2026-05-11) Focused trace: log when a thunk with a
             // specific name is forced for the first time.  Used to
             // diagnose v3-specific eager forces vs TW.  Set
