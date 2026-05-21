@@ -22,6 +22,7 @@
 
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/barrier.hh"  // Phase D write-barrier helpers
 #include "v3/lower.hh"
 #include "v3/vm.hh"
 #include "v3/bridge_yield.hh"
@@ -1641,7 +1642,7 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < dedup.size(); ++i) {
         b->entries[i].name  = dedup[i].first;
-        b->entries[i].value = dedup[i].second;
+        bindingsSetValue(b, static_cast<uint32_t>(i), dedup[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
@@ -1774,7 +1775,7 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
         pp2->right = src->entries[i].value;
         Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
         result->entries[i].name  = sym;
-        result->entries[i].value = step2;
+        bindingsSetValue(result, i, step2);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = result;
@@ -1978,8 +1979,8 @@ static Value forceDeepRec(VMState & vm, Value v, std::unordered_set<const void *
     } else if (v.isAttrs() && v.payload.bindings) {
         if (!seen.insert(v.payload.bindings).second) return v;
         for (uint32_t i = 0; i < v.payload.bindings->size; ++i)
-            v.payload.bindings->entries[i].value =
-                forceDeepRec(vm, v.payload.bindings->entries[i].value, seen);
+            bindingsSetValue(v.payload.bindings, i,  // Phase D
+                forceDeepRec(vm, v.payload.bindings->entries[i].value, seen));
     }
     return v;
 }
@@ -2055,7 +2056,7 @@ void primUnsafeGetAttrPos(EvalState & state, Value * args, Value & out)
         [](auto & a, auto & b) { return a.first < b.first; });
     for (size_t i = 0; i < entries.size(); ++i) {
         b->entries[i].name  = entries[i].first;
-        b->entries[i].value = entries[i].second;
+        bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
@@ -2272,7 +2273,7 @@ void primGetContext(EvalState & state, Value * args, Value & out)
         allocStats().attrsetsAllocated++;
         for (size_t i = 0; i < subEntries.size(); ++i) {
             sb->entries[i].name  = subEntries[i].first;
-            sb->entries[i].value = subEntries[i].second;
+            bindingsSetValue(sb, static_cast<uint32_t>(i), subEntries[i].second);  // Phase D
         }
         Value subVal;
         subVal.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -2285,7 +2286,7 @@ void primGetContext(EvalState & state, Value * args, Value & out)
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < entries.size(); ++i) {
         bb->entries[i].name  = entries[i].first;
-        bb->entries[i].value = entries[i].second;
+        bindingsSetValue(bb, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = bb;
@@ -2575,7 +2576,7 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < entries.size(); ++i) {
         b->entries[i].name = entries[i].first;
-        b->entries[i].value = entries[i].second;
+        bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
@@ -3327,7 +3328,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < entries.size(); ++i) {
         b->entries[i].name  = entries[i].first;
-        b->entries[i].value = entries[i].second;
+        bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
@@ -3411,7 +3412,7 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < entries.size(); ++i) {
         b->entries[i].name  = entries[i].first;
-        b->entries[i].value = entries[i].second;
+        bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
@@ -5142,7 +5143,7 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
             [](auto & x, auto & y) { return x.first < y.first; });
         for (size_t i = 0; i < entries.size(); ++i) {
             b->entries[i].name  = entries[i].first;
-            b->entries[i].value = entries[i].second;
+            bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
         }
         return out;
     }
@@ -5823,7 +5824,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < entries.size(); ++i) {
         b->entries[i].name  = entries[i].first;
-        b->entries[i].value = entries[i].second;
+        bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
@@ -6027,7 +6028,7 @@ static void buildAndWriteDrvNative(
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < entries.size(); ++i) {
         resultB->entries[i].name  = entries[i].first;
-        resultB->entries[i].value = entries[i].second;
+        bindingsSetValue(resultB, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = resultB;
@@ -6811,7 +6812,7 @@ static void primDerivationStrictNative_phases_4_7_legacy_ref(
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < entries.size(); ++i) {
         resultB->entries[i].name  = entries[i].first;
-        resultB->entries[i].value = entries[i].second;
+        bindingsSetValue(resultB, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = resultB;
@@ -6884,7 +6885,7 @@ void primDerivation(EvalState & state, Value * args, Value & out)
         allocStats().attrsetsAllocated++;
         for (size_t i = 0; i < oEntries.size(); ++i) {
             ob->entries[i].name  = oEntries[i].first;
-            ob->entries[i].value = oEntries[i].second;
+            bindingsSetValue(ob, static_cast<uint32_t>(i), oEntries[i].second);  // Phase D
         }
         Value v;
         v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -6940,7 +6941,7 @@ void primDerivation(EvalState & state, Value * args, Value & out)
     allocStats().attrsetsAllocated++;
     for (size_t i = 0; i < dedup.size(); ++i) {
         b->entries[i].name  = dedup[i].first;
-        b->entries[i].value = dedup[i].second;
+        bindingsSetValue(b, static_cast<uint32_t>(i), dedup[i].second);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = b;
@@ -7515,7 +7516,7 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
         allocStats().attrsetsAllocated++;
         for (size_t i = 0; i < entries.size(); ++i) {
             b->entries[i].name  = entries[i].first;
-            b->entries[i].value = entries[i].second;
+            bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
         }
         v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         v.payload.bindings = b;
@@ -7962,7 +7963,8 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
                 allocStats().attrsetsAllocated++;
                 for (size_t i = 0; i < entries.size(); ++i) {
                     bb->entries[i].name  = std::get<0>(entries[i]);
-                    bb->entries[i].value = std::get<1>(entries[i]);
+                    bindingsSetValue(bb, static_cast<uint32_t>(i),  // Phase D
+                                     std::get<1>(entries[i]));
                 }
                 out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
                 out.payload.bindings = bb;
@@ -8001,7 +8003,8 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
         allocStats().attrsetsAllocated++;
         for (size_t i = 0; i < entries.size(); ++i) {
             b->entries[i].name  = std::get<0>(entries[i]);
-            b->entries[i].value = std::get<1>(entries[i]);
+            bindingsSetValue(b, static_cast<uint32_t>(i),  // Phase D
+                             std::get<1>(entries[i]));
             recordAttrPos(b, std::get<0>(entries[i]), std::get<2>(entries[i]));
         }
         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -8071,7 +8074,7 @@ Value jsonToValue(EvalState & state, const nlohmann::json & j)
         allocStats().attrsetsAllocated++;
         for (size_t i = 0; i < entries.size(); ++i) {
             b->entries[i].name = entries[i].first;
-            b->entries[i].value = entries[i].second;
+            bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
         }
         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         out.payload.bindings = b;

@@ -13,6 +13,7 @@
 
 #include "v3/print.hh"
 #include "v3/alloc.hh"
+#include "v3/barrier.hh"  // Phase D write-barrier helpers
 #include "v3/closure.hh"  // LambdaDescriptor for printNixValueRich
 #include "v3/ir.hh"      // globalInternSymbol for toJsonValue short-circuit
 #include "v3/primop.hh"  // forceValue, PrimOp
@@ -103,8 +104,9 @@ Value forceDeep(VMState & vm, Value v, std::set<const void *> & seen)
             // Bindings ever become nursery-allocatable.
             DeepForceGuard g(v);
             for (uint32_t i = 0; i < g.ref().payload.bindings->size; ++i)
-                g.ref().payload.bindings->entries[i].value =
-                    forceDeep(vm, g.ref().payload.bindings->entries[i].value, seen);
+                bindingsSetValue(  // Phase D barrier
+                    g.ref().payload.bindings, i,
+                    forceDeep(vm, g.ref().payload.bindings->entries[i].value, seen));
             v = g.ref();
         }
     }

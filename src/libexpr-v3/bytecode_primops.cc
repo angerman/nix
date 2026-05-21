@@ -8,6 +8,7 @@
 #include "v3/bytecode_primops.hh"
 #include "v3/run.hh"
 #include "v3/value.hh"
+#include "v3/barrier.hh"  // Phase D write-barrier helpers
 #include "v3/bytecode.hh"
 #include "v3/primop.hh"
 #include "v3/ir.hh"
@@ -309,7 +310,7 @@ void installBytecodePrimop(
             Bindings * b = vBuiltins.payload.bindings;
             for (uint32_t i = 0; i < b->size; ++i) {
                 if (b->entries[i].name == sid) {
-                    b->entries[i].value = installed.rr.value;
+                    bindingsSetValue(b, i, installed.rr.value);  // Phase D barrier
                     break;
                 }
             }
