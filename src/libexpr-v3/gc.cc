@@ -442,6 +442,34 @@ void Scavenger::run()
     for (Value & v : vm.valueStack) visitValue(v);
     for (Value & v : vm.withStack)  visitValue(v);
 
+    // #705 (2026-05-21): walk the OTHER active VMStates first
+    // (under nested runFunctionWithUpvalues / runFunction).  Their
+    // frames hold nursery closure/thunk pointers that the per-vm
+    // walk below wouldn't reach.  The nursery is shared across
+    // VMStates on the thread, so a scavenge fired from any vm must
+    // forward roots in ALL active vms.  Dedup happens via
+    // `walked.insert(...)` inside fwdXxx.
+    static const bool s_dbgVms =
+        std::getenv("V3_DBG_NURSERY") != nullptr;
+    std::unordered_set<VMState *> walkedVms{&vm};
+    for (VMState * other : activeVMStack()) {
+        if (!other || !walkedVms.insert(other).second) continue;
+        if (__builtin_expect(s_dbgVms, 0)) {
+            std::fprintf(stderr,
+                "  walking secondary vm=%p frames=%zu valueStack=%zu\n",
+                (void*)other, other->frames.size(), other->valueStack.size());
+        }
+        for (Value & v : other->valueStack) visitValue(v);
+        for (Value & v : other->withStack)  visitValue(v);
+        for (CallFrame & f : other->frames) {
+            if (f.closure)
+                f.closure = fwdClosure(const_cast<Closure *>(f.closure));
+            if (f.thunk)
+                f.thunk = fwdThunk(f.thunk);
+            if (f.forceWriteTarget) visitValue(*f.forceWriteTarget);
+        }
+    }
+
     // Frames carry the call-chain's closure / thunk pointers.
     // CallFrame::closure is `const Closure *` so we cast away
     // const for the forward; the const is a documentation hint

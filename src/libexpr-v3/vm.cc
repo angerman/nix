@@ -2013,6 +2013,41 @@ static inline void hotForceCheck(const Thunk * t)
 namespace nix::v3 {
     thread_local VMState * tlCurrentDispatchVM = nullptr;
     VMState * currentDispatchVM() { return tlCurrentDispatchVM; }
+
+    // #705 (2026-05-21): thread-local stack of active VMStates.
+    //
+    // Without this, a nested runFunctionWithUpvalues / runFunction
+    // creates a new local VMState whose dispatch fires its own
+    // scavenge.  The OUTER VMState's frames hold nursery closure /
+    // thunk pointers that the inner scavenge doesn't walk — the
+    // shared nursery is memset, leaving outer's f.closure stale.
+    //
+    // The scavenger walks ALL entries here, so every VMState on the
+    // call chain has its roots forwarded.  Same VM may appear
+    // multiple times under forceValue / inner-dispatch re-entries;
+    // scavenge dedupes via its `walked` set.
+    //
+    // Identified 2026-05-21 by V3_DBG_NURSERY_BRUTE + crash
+    // diagnostic: a stale closure at frame[50] with 0 arena refs
+    // (because the only reference is in vm.frames of an OUTER vm
+    // not seen by the inner scavenge).
+    thread_local std::vector<VMState *> tlActiveVMStack;
+    void pushActiveVMState(VMState * vm) { tlActiveVMStack.push_back(vm); }
+    void popActiveVMState(VMState * vm) {
+        // Pop the matching VM (typically the back, but defensively
+        // search for it in case of exception unwind ordering issues).
+        if (!tlActiveVMStack.empty() && tlActiveVMStack.back() == vm) {
+            tlActiveVMStack.pop_back();
+            return;
+        }
+        for (auto it = tlActiveVMStack.rbegin(); it != tlActiveVMStack.rend(); ++it) {
+            if (*it == vm) {
+                tlActiveVMStack.erase(std::next(it).base());
+                return;
+            }
+        }
+    }
+    const std::vector<VMState *> & activeVMStack() { return tlActiveVMStack; }
 }
 
 namespace nix::v3 {
@@ -2022,10 +2057,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 {
     VMState * prevDispatchVM = tlCurrentDispatchVM;
     tlCurrentDispatchVM = &vm;
+    // #705: register on the active-VM stack so nested scavenges
+    // walk THIS vm's roots even when fired from another dispatch.
+    pushActiveVMState(&vm);
     struct VMScope {
         VMState * prev;
-        ~VMScope() { tlCurrentDispatchVM = prev; }
-    } _vmScope{prevDispatchVM};
+        VMState * vm;
+        ~VMScope() {
+            popActiveVMState(vm);
+            tlCurrentDispatchVM = prev;
+        }
+    } _vmScope{prevDispatchVM, &vm};
 
     const CallFrame & topFrame = vm.frames.back();
     const CompilationUnit * cu = topFrame.cu;
@@ -2358,8 +2400,75 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_GET_UPVALUE: {
             if (!closure)
                 throw std::runtime_error("v3 OP_GET_UPVALUE: no closure context");
-            if (operand >= closure->nUpvalues)
+            if (operand >= closure->nUpvalues) {
+                // #705 (2026-05-21) diagnostic: dump closure + frame
+                // state to localize which lambda body is reading an
+                // out-of-range upvalue.  Common signature when the
+                // frame.closure is the WRONG closure (a different
+                // lambda's body with fewer upvalues) post-scavenge.
+                const LambdaDescriptor * d = closure->desc;
+                const Nursery & nu = threadNursery();
+                std::fprintf(stderr,
+                    "v3 OP_GET_UPVALUE OOR: operand=%u nUpvalues=%u "
+                    "closure=%p (nursery=%s) desc=%p desc.name=%.*s codeOff=%u "
+                    "ip=%u frames=%zu\n",
+                    (unsigned)operand, (unsigned)closure->nUpvalues,
+                    (const void*)closure,
+                    nu.contains(closure) ? "YES (stale)" : "no",
+                    (const void*)d,
+                    d ? (int)d->name.size() : 0,
+                    d ? d->name.data() : "",
+                    d ? d->codeOffset : 0u, (unsigned)(ip - 1),
+                    vm.frames.size());
+                // Dump top frames to see what desc the parent has.
+                std::fprintf(stderr, "  top 5 frames:\n");
+                for (size_t i = vm.frames.size(); i > 0 && i + 5 > vm.frames.size(); --i) {
+                    const auto & fr = vm.frames[i - 1];
+                    const LambdaDescriptor * fd = nullptr;
+                    if (fr.thunk && (fr.thunk->state == ThunkState::Suspended
+                                     || fr.thunk->state == ThunkState::Blackhole))
+                        fd = fr.thunk->suspended.desc;
+                    else if (fr.closure) fd = fr.closure->desc;
+                    std::fprintf(stderr,
+                        "    [%zu] closure=%p (ns=%s) thunk=%p (ns=%s) "
+                        "ip=%u desc=%.*s\n",
+                        i - 1, (const void*)fr.closure,
+                        nu.contains(fr.closure) ? "Y" : "n",
+                        (const void*)fr.thunk,
+                        fr.thunk && nu.contains(fr.thunk) ? "Y" : "n",
+                        fr.ip,
+                        fd ? (int)fd->name.size() : 5,
+                        fd ? fd->name.data() : "<?>");
+                }
+                // Search arena for refs to the stale closure pointer.
+                if (nu.contains(closure)) {
+                    Arena & arena = threadArena();
+                    auto blocks = arena.blockRanges();
+                    uintptr_t target = reinterpret_cast<uintptr_t>(closure);
+                    size_t hits = 0;
+                    std::fprintf(stderr, "  arena refs to stale closure:\n");
+                    for (auto & blk : blocks) {
+                        uintptr_t lo = reinterpret_cast<uintptr_t>(blk.begin);
+                        uintptr_t hi = reinterpret_cast<uintptr_t>(blk.end);
+                        lo = (lo + 7) & ~uintptr_t{7};
+                        for (uintptr_t p = lo; p + 8 <= hi; p += 8) {
+                            if (*reinterpret_cast<const uintptr_t *>(p) != target)
+                                continue;
+                            if (hits++ < 8) {
+                                uint64_t prev = (p >= 8)
+                                    ? *reinterpret_cast<const uint64_t *>(p - 8) : 0;
+                                std::fprintf(stderr,
+                                    "    @ %p (preceding word = 0x%llx tag=%d)\n",
+                                    (void*)p, (unsigned long long)prev,
+                                    (int)(prev & 0xff));
+                            }
+                        }
+                    }
+                    std::fprintf(stderr, "  total: %zu\n", hits);
+                }
+                std::fflush(stderr);
                 throw std::runtime_error("v3 OP_GET_UPVALUE: index out of range");
+            }
             push(vm, closure->upvalues[operand]);
             // Phase A5: frame-focused upvalue trace.  When
             // V3_DBG_SELECT_AT_CODEOFF=<codeoff> is set, log every
@@ -4507,6 +4616,53 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 goto op_call_dispatch;
             }
             const Closure * tcCallee = fun.payload.closure;
+            // #705 (2026-05-21): defensive null-desc check (similar to
+            // forceValue's STALE THUNK detection).  If tcCallee was a
+            // stale nursery closure that got memset, desc reads as 0.
+            // Catch here with diagnostic + abort so we can localize
+            // the missed-root source.
+            {
+                const Nursery & nu = threadNursery();
+                if (__builtin_expect(!tcCallee || !tcCallee->desc, 0)) {
+                    std::fprintf(stderr,
+                        "v3 OP_TAIL_CALL: STALE callee suspected.\n"
+                        "  tcCallee=%p in-nursery=%s desc=%p nUpvalues=%u\n"
+                        "  ip=%u frames=%zu exitDepth=%zu\n",
+                        (const void*)tcCallee,
+                        tcCallee && nu.contains(tcCallee) ? "YES" : "no",
+                        tcCallee ? (const void*)tcCallee->desc : nullptr,
+                        tcCallee ? (unsigned)tcCallee->nUpvalues : 0,
+                        (unsigned)(ip - 1), vm.frames.size(),
+                        exitDepth);
+                    if (tcCallee && nu.contains(tcCallee)) {
+                        // Search arena for refs to this stale pointer.
+                        Arena & arena = threadArena();
+                        auto blocks = arena.blockRanges();
+                        uintptr_t target = reinterpret_cast<uintptr_t>(tcCallee);
+                        size_t hits = 0;
+                        for (auto & blk : blocks) {
+                            uintptr_t lo = reinterpret_cast<uintptr_t>(blk.begin);
+                            uintptr_t hi = reinterpret_cast<uintptr_t>(blk.end);
+                            lo = (lo + 7) & ~uintptr_t{7};
+                            for (uintptr_t p = lo; p + 8 <= hi; p += 8) {
+                                if (*reinterpret_cast<const uintptr_t *>(p) != target) continue;
+                                if (hits++ < 4) {
+                                    uint64_t prev = p >= 8
+                                        ? *reinterpret_cast<const uint64_t *>(p - 8) : 0;
+                                    std::fprintf(stderr,
+                                        "  arena @ %p (prev word 0x%llx tag=%d)\n",
+                                        (void*)p,
+                                        (unsigned long long)prev,
+                                        (int)(prev & 0xff));
+                                }
+                            }
+                        }
+                        std::fprintf(stderr, "  total arena refs to tcCallee: %zu\n", hits);
+                    }
+                    std::fflush(stderr);
+                    throw std::runtime_error("v3 OP_TAIL_CALL: stale callee");
+                }
+            }
             const LambdaDescriptor * tcDesc = tcCallee->desc;
             const CompilationUnit * tcCalleeCu = tcCallee->cu ? tcCallee->cu : cu;
 

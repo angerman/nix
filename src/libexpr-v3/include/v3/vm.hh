@@ -125,6 +125,14 @@ Value run(const CompilationUnit & cu);
 /// dump frame stacks on wall-time / cpu-time / heap-cap abort.
 VMState * currentDispatchVM();
 
+/// #705 (2026-05-21): every dispatchLoop pushes/pops its `vm` here
+/// on entry/exit (RAII).  Scavenger walks every entry so nested
+/// VMStates' roots are visible to a scavenge fired from any inner
+/// dispatch.  Order of entries: outermost-first.  Same vm may
+/// appear more than once under forceValue / inner re-entries;
+/// scavenge dedupes via its `walked` set.
+const std::vector<VMState *> & activeVMStack();
+
 /// #425: process-wide lazy singleton of the `builtins` attrset.  Built
 /// on first call from the registered primops table (matching the
 /// OP_LIT_BUILTINS dispatch); subsequent calls return the same Value.
