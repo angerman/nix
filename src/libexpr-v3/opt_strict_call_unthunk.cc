@@ -283,38 +283,164 @@ UseCounter countModuleUses(const Module & m)
     return uc;
 }
 
-bool bodyIsSimple(const Block & body)
+// #744 v4.2 — forward declarations for recursive sub-block cloning.
+bool bodyIsCloneable(const Module & m, BlockId srcBid,
+                     std::unordered_set<BlockId> & visited);
+VarId cloneBlockBindings(Module & m, BlockId srcBid,
+                         std::unordered_map<VarId, VarId> & sub,
+                         std::vector<Binding> & out);
+BlockId cloneSubBlock(Module & m, BlockId srcBid,
+                      const std::unordered_map<VarId, VarId> & parentSub);
+
+/// #744 v4.2 — predicate: can the block at `srcBid` (and any
+/// sub-blocks reachable through If/With/Assert/And/Or/Impl) be
+/// cloned by `cloneBlockBindings`?  Recursive; tracks visited
+/// blocks to avoid infinite cycles (shouldn't happen in a
+/// well-formed IR but defensive).  Returns false on:
+///   - Invalid BlockId.
+///   - Any binding containing LetRec (entry-Function clone is
+///     out of scope; would also need to clone the per-entry
+///     Functions' bodies with recVar substitution).
+///   - Any nested sub-block that itself fails the check.
+bool bodyIsCloneable(const Module & m, BlockId srcBid,
+                     std::unordered_set<BlockId> & visited)
 {
-    static const std::unordered_map<VarId, VarId> empty;
-    for (const auto & bd : body.bindings) {
-        Expr probe = bd.expr;
-        if (!remapExprVars(probe, empty))
-            return false;
+    if (srcBid == kInvalidBlock || srcBid >= (BlockId)m.blocks.size())
+        return false;
+    if (!visited.insert(srcBid).second) return true;
+    const Block & b = m.blocks[srcBid];
+    for (const auto & bd : b.bindings) {
+        bool ok = std::visit([&](const auto & v) -> bool {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, If>) {
+                return bodyIsCloneable(m, v.thenBlock, visited)
+                    && bodyIsCloneable(m, v.elseBlock, visited);
+            } else if constexpr (std::is_same_v<T, With>
+                              || std::is_same_v<T, Assert>) {
+                return bodyIsCloneable(m, v.bodyBlock, visited);
+            } else if constexpr (std::is_same_v<T, And>
+                              || std::is_same_v<T, Or>
+                              || std::is_same_v<T, Impl>) {
+                return bodyIsCloneable(m, v.rhsBlock, visited);
+            } else if constexpr (std::is_same_v<T, LetRec>) {
+                // LetRec entry Functions reference recVar; cloning
+                // the LetRec with a fresh recVar would require
+                // cloning the per-entry Function bodies too.
+                // Refuse for v4.2.  (v4.3 could lift this.)
+                return false;
+            } else {
+                // Non-sub-block expr — check via remapExprVars
+                // with empty substitution (probe only).
+                Expr probe = bd.expr;
+                static const std::unordered_map<VarId, VarId> empty;
+                return remapExprVars(probe, empty);
+            }
+        }, bd.expr);
+        if (!ok) return false;
     }
     return true;
 }
 
-/// Clone body's bindings into `out` with fresh local VarIds.  Outer
-/// VarIds (the thunk's free variables) stay unchanged.  Returns the
-/// VarId that the body's TermReturn ultimately resolves to (after
-/// substitution).  No paramVar substitution because thunks have no
-/// formal parameter.
-VarId inlineThunkBody(Module & m,
-                      const Block & body,
-                      std::vector<Binding> & out)
+/// #744 v4.2 — clone the bindings of `srcBid` into `out` with
+/// fresh local VarIds.  Sub-blocks (If/With/Assert/And/Or/Impl)
+/// get fresh BlockIds via `cloneSubBlock`; their bindings are
+/// cloned recursively.  Returns the tail VarId (the cloned
+/// terminal's return value) or `kInvalid` if any binding refuses
+/// to clone (callers should treat as failure and not splice
+/// `out`).
+///
+/// `sub` is mutable: each binding adds (oldVar → newVar) for
+/// downstream remapping.  Outer VarIds (free variables of the
+/// thunk body that reference the surrounding scope) stay
+/// unchanged — they're not in `sub`, so remapVar leaves them.
+VarId cloneBlockBindings(Module & m, BlockId srcBid,
+                         std::unordered_map<VarId, VarId> & sub,
+                         std::vector<Binding> & out)
 {
-    std::unordered_map<VarId, VarId> sub;
-    sub.reserve(body.bindings.size());
-    for (const auto & bd : body.bindings) {
+    if (srcBid == kInvalidBlock || srcBid >= (BlockId)m.blocks.size())
+        return kInvalid;
+    // Snapshot by value — `m.blocks` may reallocate during nested
+    // `cloneSubBlock` invocations (when `freshBlock()` resizes
+    // the underlying vector).  References into m.blocks[srcBid]
+    // would dangle after that point; copying the bindings + terminal
+    // up front avoids the hazard.
+    std::vector<Binding> srcBindings = m.blocks[srcBid].bindings;
+    Terminal srcTerm = m.blocks[srcBid].terminal;
+    for (auto & bd : srcBindings) {
         VarId newVar = m.freshVar();
         sub[bd.var] = newVar;
         Expr cloned = bd.expr;
-        (void)remapExprVars(cloned, sub);  // bodyIsSimple already verified
+        bool ok = std::visit([&](auto & v) -> bool {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, If>) {
+                remapVar(v.cond, sub);
+                v.thenBlock = cloneSubBlock(m, v.thenBlock, sub);
+                v.elseBlock = cloneSubBlock(m, v.elseBlock, sub);
+                return v.thenBlock != kInvalidBlock
+                    && v.elseBlock != kInvalidBlock;
+            } else if constexpr (std::is_same_v<T, With>) {
+                remapVar(v.attrs, sub);
+                v.bodyBlock = cloneSubBlock(m, v.bodyBlock, sub);
+                return v.bodyBlock != kInvalidBlock;
+            } else if constexpr (std::is_same_v<T, Assert>) {
+                remapVar(v.cond, sub);
+                v.bodyBlock = cloneSubBlock(m, v.bodyBlock, sub);
+                return v.bodyBlock != kInvalidBlock;
+            } else if constexpr (std::is_same_v<T, And>
+                              || std::is_same_v<T, Or>
+                              || std::is_same_v<T, Impl>) {
+                remapVar(v.lhs, sub);
+                v.rhsBlock = cloneSubBlock(m, v.rhsBlock, sub);
+                return v.rhsBlock != kInvalidBlock;
+            } else {
+                return remapExprVars(cloned, sub);
+            }
+        }, cloned);
+        if (!ok) return kInvalid;
         out.push_back({newVar, std::move(cloned)});
     }
-    VarId tailOriginal = std::get<TermReturn>(body.terminal).value;
-    auto it = sub.find(tailOriginal);
-    return (it != sub.end()) ? it->second : tailOriginal;
+    if (const auto * tr = std::get_if<TermReturn>(&srcTerm)) {
+        auto it = sub.find(tr->value);
+        return (it != sub.end()) ? it->second : tr->value;
+    }
+    return kInvalid;
+}
+
+/// #744 v4.2 — clone a sub-block referenced from If/With/etc.
+/// Allocates a fresh BlockId, clones bindings into the new block's
+/// vector, sets the terminal.  Returns the new BlockId or
+/// kInvalidBlock on failure.  `parentSub` is COPIED so the
+/// sub-block's local bindings don't leak back to the parent's
+/// substitution map.
+BlockId cloneSubBlock(Module & m, BlockId srcBid,
+                      const std::unordered_map<VarId, VarId> & parentSub)
+{
+    if (srcBid == kInvalidBlock || srcBid >= (BlockId)m.blocks.size())
+        return kInvalidBlock;
+    // freshBlock may grow m.blocks — DO NOT hold references.
+    BlockId newBid = m.freshBlock();
+    std::unordered_map<VarId, VarId> sub = parentSub;
+    std::vector<Binding> newBindings;
+    VarId tail = cloneBlockBindings(m, srcBid, sub, newBindings);
+    if (tail == kInvalid) {
+        // The cloned block has been allocated but won't be referenced.
+        // It's a wasted slot but harmless.  Return failure so the
+        // caller knows not to use this BlockId.
+        return kInvalidBlock;
+    }
+    m.blocks[newBid].bindings = std::move(newBindings);
+    m.blocks[newBid].terminal = TermReturn{tail};
+    return newBid;
+}
+
+/// Inline a thunk body into `out`.  Thin wrapper over
+/// `cloneBlockBindings` that initializes an empty substitution map.
+/// Returns the cloned tail VarId or kInvalid on failure.
+VarId inlineThunkBody(Module & m, BlockId srcBid,
+                      std::vector<Binding> & out)
+{
+    std::unordered_map<VarId, VarId> sub;
+    return cloneBlockBindings(m, srcBid, sub, out);
 }
 
 /// Resolve a call site's `fun` VarId to a Lambda IR node, following
@@ -433,10 +559,14 @@ const Lambda * resolveCalleeLambda(
 // Public entry: applyStrictnessAtCallSites.
 // ---------------------------------------------------------------------------
 
-// #743 v4.1 helper: is the MkThunk safe to inline at this call site?
-// Checks: arg is a MkThunk in same block, exactly one use, body is
-// `bodyIsSimple` (cloneable).  Returns true on success and fills the
-// out-params; false on any safety failure.
+// #743 v4.1 / #744 v4.2 helper: is the MkThunk safe to inline at
+// this call site?  Checks: arg is a MkThunk in same block, exactly
+// one use, body is `bodyIsCloneable` (transitively cloneable
+// including sub-blocks).  Returns true on success and fills the
+// out-params; false on any safety failure.  Note that `outBody`
+// is no longer used post-v4.2 (cloneBlockBindings takes the
+// BlockId directly via the MkThunk's funcIdx), but kept for
+// signature compatibility.
 static bool isInlinableMkThunk(VarId argVar, const Module & m,
                                 const std::unordered_map<VarId, const Expr *> & defs,
                                 const UseCounter & uses,
@@ -453,11 +583,12 @@ static bool isInlinableMkThunk(VarId argVar, const Module & m,
     const Function & thunkFn = m.functions[mkt->funcIdx];
     if (thunkFn.entryBlock == kInvalidBlock
         || thunkFn.entryBlock >= (BlockId)m.blocks.size()) return false;
-    const Block & body = m.blocks[thunkFn.entryBlock];
-    if (!bodyIsSimple(body)) return false;
+    // v4.2: recursive cloneability check.
+    std::unordered_set<BlockId> visited;
+    if (!bodyIsCloneable(m, thunkFn.entryBlock, visited)) return false;
     outDefVar = res.definer;
     outMkt    = mkt;
-    outBody   = &body;
+    outBody   = &m.blocks[thunkFn.entryBlock];
     return true;
 }
 
@@ -576,8 +707,17 @@ size_t applyStrictnessAtCallSites(Module & m)
                 // We pre-verified this in the analysis pass.
                 if (!mkt) { out.push_back(bd); continue; }
                 const Function & thunkFn = m.functions[mkt->funcIdx];
-                const Block & thunkBody = m.blocks[thunkFn.entryBlock];
-                VarId tail = inlineThunkBody(m, thunkBody, out);
+                BlockId thunkBodyBid = thunkFn.entryBlock;
+                // v4.2: cloneBlockBindings handles sub-blocks via
+                // fresh-block allocation.  Returns kInvalid on
+                // failure (in which case we keep the original
+                // MkThunk binding — bodyIsCloneable should have
+                // caught this in pre-analysis, but defensive).
+                VarId tail = inlineThunkBody(m, thunkBodyBid, out);
+                if (tail == kInvalid) {
+                    out.push_back(bd);
+                    continue;
+                }
                 elidedToInline[bd.var] = tail;
                 // SKIP emitting the MkThunk binding itself.
                 continue;
