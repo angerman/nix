@@ -955,8 +955,46 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
     // forward its source position too.  Without this,
     // `builtins.unsafeGetAttrPos` on a merged attrset returns null
     // for every name (REVIEW critic §8 #4).
+    //
+    // #747 (2026-05-21) two-pass: pass 1 counts the exact number of
+    // distinct keys; pass 2 allocates the precise size and fills.
+    // The prior single-pass version called Alloc::allocBindings(na +
+    // nb) up front and wrote `out->size = k` at the end, leaving the
+    // arena pinned at the worst-case size even when duplicates were
+    // collapsed.  #746 attribution measured ~387 MB of that slack on
+    // hello.drvPath (~half of all v3-arena Bindings bytes).  The
+    // bump-pointer arena cannot reclaim the unused tail, so the slack
+    // becomes permanent until process exit.
+    //
+    // Pass 1 cost: one extra mirror-merge sweep reading only `name`
+    // fields (4 B per Entry).  For na+nb in the thousands the array
+    // stays L1-warm across both passes.  The arithmetic is identical
+    // to the original branch logic so `kExact` and the final `k` from
+    // pass 2 always agree by construction.
     const uint32_t na = a->size, nb = b->size;
-    Bindings * out = Alloc::allocBindings(na + nb);
+
+    // Pass 1: count distinct keys.  Mirror of the branch logic
+    // below; only reads `name` fields, no allocations, no copies,
+    // no position lookups.
+    uint32_t kExact = 0;
+    {
+        uint32_t i = 0, j = 0;
+        while (i < na && j < nb) {
+            const SymbolId an = a->entries[i].name;
+            const SymbolId bn = b->entries[j].name;
+            if (an < bn)        { ++kExact; ++i; }
+            else if (an > bn)   { ++kExact; ++j; }
+            else                { ++kExact; ++i; ++j; } // duplicate collapsed
+        }
+        kExact += (na - i) + (nb - j);
+    }
+
+    // Pass 2: allocate the exact size and fill.  `Alloc::allocBindings`
+    // already sets `out->size = kExact`, so no second size-write is
+    // needed (or wanted — it would be a redundant store to a Phase D
+    // shared cell line, and on the empty-sentinel path a write to
+    // shared read-only state).
+    Bindings * out = Alloc::allocBindings(kExact);
     uint32_t i = 0, j = 0, k = 0;
     auto copyA = [&]() {
         bindingsSetEntry(out, k, a->entries[i]);  // Phase D
@@ -982,7 +1020,8 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
     }
     while (i < na) copyA();
     while (j < nb) copyB();
-    out->size = k;
+    // Invariant: k == kExact by construction (the two passes share
+    // identical branch arithmetic).  No need to rewrite out->size.
     return out;
 }
 
