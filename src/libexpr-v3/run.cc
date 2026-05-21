@@ -291,6 +291,29 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // goes through `runRootExpr`) reports the same data without
         // depending on the CLI specifically.
         dumpPrimOpStats(stderr);
+        // #736 (2026-05-21) IFD-probe summary.  Per IFD_DEEP_DIVE
+        // §8 step 1 falsifier: "dispatcher counts the probes;
+        // counter > 0 on a haskell.nix run".  When ANY probe fired,
+        // emit a one-line breakdown by kind so users can attribute
+        // IFD activity to specific primops without enabling per-call
+        // tracing.  Zero probes = no output (silent on the default
+        // hello.drvPath case where no IFD fires).
+        {
+            uint64_t totalProbes = 0;
+            for (int k = 1; k < (int)kIfdProbeKindCount; ++k)
+                totalProbes += a.ifdProbeCount[k];
+            if (totalProbes > 0) {
+                std::fprintf(stderr, "v3-direct ifd probes: total=%llu",
+                    (unsigned long long)totalProbes);
+                for (int k = 1; k < (int)kIfdProbeKindCount; ++k) {
+                    if (a.ifdProbeCount[k] > 0)
+                        std::fprintf(stderr, " %s=%llu",
+                            ifdProbeKindName(static_cast<uint8_t>(k)),
+                            (unsigned long long)a.ifdProbeCount[k]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
     }
     return out;
 }

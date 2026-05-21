@@ -285,6 +285,35 @@ enum Op : uint8_t
     // recovered from the side table at error time).  Dispatch removed.
     OP_POS            = 0xA1,  // [posIdx:24]  push pos attrset
 
+    // --- #736 IFD probe (S5 from IFD_DEEP_DIVE_2026-05-21.md) ----------
+    /// Compile-time-emitted marker for primops that may trigger
+    /// Import-From-Derivation.  Operand encodes the IfdProbeKind
+    /// (low 8 bits).  Zero stack effect: the probe observes that an
+    /// IFD-class primop is about to be invoked but does not consume
+    /// or transform its arguments.
+    ///
+    /// Default runtime cost: one branch + (when active) one
+    /// uint64_t++ into `allocStats().ifdProbeCount[kind]`.  No
+    /// allocation, no force, no FFI cross.  Future S2 (batching) /
+    /// S4 (content-addressed eval cache) will dispatch additional
+    /// behavior from this opcode without each primop reaching into
+    /// its own special-case logic.
+    OP_IFD_PROBE      = 0xA2,  // [kind:24]   IFD-class primop about to fire
+    //
+    // Probe kinds — keep in sync with `emit.cc::ifdProbeKindForPrimop`
+    // and `allocStats().ifdProbeCount[]` (which sizes to 16 slots).
+    // The 1..N numbering leaves slot 0 as the kIfdNone sentinel so a
+    // zero in the counter table unambiguously means "kind not used."
+    //
+    // Categorization rationale:
+    //   - Imports / file reads of (possibly-context) paths trigger
+    //     classic Nix IFD.
+    //   - Network fetches don't trigger IFD per se but block eval the
+    //     same way and benefit from the same batching/cache layers,
+    //     so they're tracked as separate kinds.
+    //   - filterSource realises a path but doesn't go through TW's
+    //     realisePath bridge today; tracked for completeness.
+
     /// Direct primop call.  [nArgs:24]; data: primop-table index.
     /// Pops nArgs from stack (in argument order: arg0, arg1, ...) and
     /// pushes the primop's result.
@@ -329,6 +358,47 @@ enum Op : uint8_t
 
     OP_HALT           = 0xFF,
 };
+
+/// #736 IFD-probe kinds.  Encoded in OP_IFD_PROBE's 24-bit operand;
+/// see vm.cc OP_IFD_PROBE dispatch + allocStats().ifdProbeCount[].
+enum IfdProbeKind : uint8_t
+{
+    kIfdNone           = 0,   // sentinel — never emitted
+    kIfdImport         = 1,   // import / __import
+    kIfdReadFile       = 2,   // readFile / __readFile
+    kIfdReadDir        = 3,   // readDir / __readDir
+    kIfdPathExists     = 4,   // pathExists / __pathExists
+    kIfdReadFileType   = 5,   // readFileType / __readFileType
+    kIfdFindFile       = 6,   // findFile / __findFile (also: <nixpkgs> via NIX_PATH)
+    kIfdFetchurl       = 7,   // fetchurl / __fetchurl
+    kIfdFetchTarball   = 8,   // fetchTarball
+    kIfdFetchTree      = 9,   // fetchTree
+    kIfdFetchGit       = 10,  // fetchGit
+    kIfdFetchMercurial = 11,  // fetchMercurial
+    kIfdFilterSource   = 12,  // filterSource / path
+    kIfdProbeKindCount = 13,
+};
+
+/// Render a probe kind as a stable short string (for stats banners).
+/// Returns "?" for out-of-range values.
+inline const char * ifdProbeKindName(uint8_t k) noexcept
+{
+    switch (k) {
+        case kIfdImport:         return "import";
+        case kIfdReadFile:       return "readFile";
+        case kIfdReadDir:        return "readDir";
+        case kIfdPathExists:     return "pathExists";
+        case kIfdReadFileType:   return "readFileType";
+        case kIfdFindFile:       return "findFile";
+        case kIfdFetchurl:       return "fetchurl";
+        case kIfdFetchTarball:   return "fetchTarball";
+        case kIfdFetchTree:      return "fetchTree";
+        case kIfdFetchGit:       return "fetchGit";
+        case kIfdFetchMercurial: return "fetchMercurial";
+        case kIfdFilterSource:   return "filterSource";
+        default:                 return "?";
+    }
+}
 
 constexpr inline Op decodeOp(Instruction i) noexcept
 {

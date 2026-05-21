@@ -223,6 +223,16 @@ struct AllocStats
     uint64_t bytesBindings = 0;
     uint64_t bytesPairs    = 0;
     uint64_t bytesChars    = 0;
+
+    /// #736 (2026-05-21) IFD-probe per-kind counters.  Bumped from
+    /// OP_IFD_PROBE dispatch (see vm.cc and IFD_DEEP_DIVE §5 / S5).
+    /// Indexed by IfdProbeKind values 1..(kIfdProbeKindCount-1);
+    /// slot 0 is unused (kIfdNone sentinel).
+    ///
+    /// Read by run.cc / v3-eval.cc NIX_VM_STATS summary.  When all
+    /// entries are zero, the workload triggered no IFD-class primops
+    /// — the production-default expectation.
+    uint64_t ifdProbeCount[16] = {};
 };
 
 inline AllocStats & allocStats()

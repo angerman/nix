@@ -9026,6 +9026,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // skips ExprPos in v3).  Removed dispatch; default-case abort
         // catches stale.
 
+        case OP_IFD_PROBE: {
+            // #736 (2026-05-21) Zero stack effect; emitted by emit.cc
+            // right before an IFD-class primop call.  See bytecode.hh's
+            // OP_IFD_PROBE / IfdProbeKind documentation.
+            //
+            // The probe MUST be cheap: a single bounded-array bump.
+            // The primop call that follows does the actual IFD work
+            // (synchronously via realisePath today; future S2/S4
+            // layers will hook here to batch / cache instead).
+            //
+            // Bounds-check the kind against ifdProbeCount[]'s 16 slots
+            // — emit.cc guarantees kind ∈ [1, kIfdProbeKindCount), but
+            // a defensive check costs nothing here.
+            uint8_t kind = static_cast<uint8_t>(operand);
+            if (__builtin_expect(kind < 16, 1)) {
+                ++allocStats().ifdProbeCount[kind];
+            }
+            break;
+        }
+
         case OP_LIT_PRIMOP: {
             const PrimOp * po = cu->primops[operand];
             // A12b T0b: bytecode-primop replacement.  If `po` has a

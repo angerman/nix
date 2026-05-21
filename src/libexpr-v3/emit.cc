@@ -1236,9 +1236,73 @@ struct Emitter
         return static_cast<Op>(0);
     }
 
+    /// #736 IFD-class primop detector.  Returns one of the
+    /// `kIfd*` constants for primops that may trigger Import-From-
+    /// Derivation (or block-eval network fetches that benefit from
+    /// the same batching/cache layers).  Returns `kIfdNone` for any
+    /// primop that does not require an OP_IFD_PROBE marker.
+    ///
+    /// Lazily caches canonical PrimOp pointers at first call so
+    /// subsequent dispatch is a string-free pointer compare.  Both
+    /// the un-prefixed and `__`-prefixed names are matched because
+    /// nixpkgs uses both spellings interchangeably.
+    static uint8_t ifdProbeKindForPrimop(const PrimOp * po)
+    {
+        struct Cache {
+            const PrimOp * import = nullptr;         const PrimOp * iimport = nullptr;
+            const PrimOp * readFile = nullptr;       const PrimOp * ireadFile = nullptr;
+            const PrimOp * readDir = nullptr;        const PrimOp * ireadDir = nullptr;
+            const PrimOp * pathExists = nullptr;     const PrimOp * ipathExists = nullptr;
+            const PrimOp * readFileType = nullptr;   const PrimOp * ireadFileType = nullptr;
+            const PrimOp * findFile = nullptr;       const PrimOp * ifindFile = nullptr;
+            const PrimOp * fetchurl = nullptr;       const PrimOp * ifetchurl = nullptr;
+            const PrimOp * fetchTarball = nullptr;
+            const PrimOp * fetchTree = nullptr;
+            const PrimOp * fetchGit = nullptr;
+            const PrimOp * fetchMercurial = nullptr;
+            const PrimOp * filterSource = nullptr;
+            Cache() {
+                import         = findPrimOp("import");         iimport         = findPrimOp("__import");
+                readFile       = findPrimOp("readFile");       ireadFile       = findPrimOp("__readFile");
+                readDir        = findPrimOp("readDir");        ireadDir        = findPrimOp("__readDir");
+                pathExists     = findPrimOp("pathExists");     ipathExists     = findPrimOp("__pathExists");
+                readFileType   = findPrimOp("readFileType");   ireadFileType   = findPrimOp("__readFileType");
+                findFile       = findPrimOp("findFile");       ifindFile       = findPrimOp("__findFile");
+                fetchurl       = findPrimOp("fetchurl");       ifetchurl       = findPrimOp("__fetchurl");
+                fetchTarball   = findPrimOp("fetchTarball");
+                fetchTree      = findPrimOp("fetchTree");
+                fetchGit       = findPrimOp("fetchGit");
+                fetchMercurial = findPrimOp("fetchMercurial");
+                filterSource   = findPrimOp("filterSource");
+            }
+        };
+        static const Cache c;
+        if (po == c.import         || po == c.iimport)         return kIfdImport;
+        if (po == c.readFile       || po == c.ireadFile)       return kIfdReadFile;
+        if (po == c.readDir        || po == c.ireadDir)        return kIfdReadDir;
+        if (po == c.pathExists     || po == c.ipathExists)     return kIfdPathExists;
+        if (po == c.readFileType   || po == c.ireadFileType)   return kIfdReadFileType;
+        if (po == c.findFile       || po == c.ifindFile)       return kIfdFindFile;
+        if (po == c.fetchurl       || po == c.ifetchurl)       return kIfdFetchurl;
+        if (po == c.fetchTarball)                              return kIfdFetchTarball;
+        if (po == c.fetchTree)                                 return kIfdFetchTree;
+        if (po == c.fetchGit)                                  return kIfdFetchGit;
+        if (po == c.fetchMercurial)                            return kIfdFetchMercurial;
+        if (po == c.filterSource)                              return kIfdFilterSource;
+        return kIfdNone;
+    }
+
     void emitOne(const ir::PrimOpCall & e)
     {
         for (auto v : e.args) emitVarRef(v);
+        // #736 IFD probe: bytecode-level marker emitted right before
+        // an IFD-class primop call.  Zero stack effect; identifies
+        // the call site as a future S2 (batching) / S4 (eval cache)
+        // dispatch point.  Cost when no consumer is active: a single
+        // dispatched opcode that increments a counter.
+        if (uint8_t kind = ifdProbeKindForPrimop(e.primop); kind != kIfdNone) {
+            unit.code.push_back(encode(OP_IFD_PROBE, kind));
+        }
         // #428: fast-path inline if this is one of the targeted primops.
         // Args are already on the stack; the inline opcode pops them.
         if (Op op = fastPathOpcodeFor(e.primop, static_cast<uint32_t>(e.args.size()));
