@@ -5489,83 +5489,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // infrastructure retired.  No publishes fire so the
                 // registry stays empty; nothing to erase at OP_RETURN.
 
-                // #558 Phase 4 (2026-05-12): recycle the fakeClo back
-                // to the thread-local pool now that its frame has
-                // popped and nothing else references it.  The body
-                // can't have stashed a pointer to the fakeClo
-                // anywhere persistent: OP_MAKE_CLOSURE copies the
-                // upvalue Values (not the Closure*) and Tag::Closure
-                // payloads only point at real closures produced by
-                // OP_MAKE_CLOSURE / primops, not fakeClos.  Pool
-                // bypassed when NIX_V3_NO_CLOSURE_POOL=1.
-                {
-                    static const bool s_noClosurePool =
-                        std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
-                    if (__builtin_expect(!s_noClosurePool, 1)) {
-                        // Phase A5: when V3_DBG_RECYCLE_OF_PTR is set,
-                        // log the recycle CALL with rich frame context
-                        // for the specific closure pointer.  Catches
-                        // "real" closures being incorrectly recycled.
-                        {
-                            static const char * s_pt =
-                                std::getenv("V3_DBG_RECYCLE_OF_PTR");
-                            static const char * s_co =
-                                std::getenv("V3_DBG_RECYCLE_OF_CODEOFF");
-                            void * tgt = nullptr;
-                            uint32_t coTarget = 0;
-                            if (s_pt) sscanf(s_pt, "%p", &tgt);
-                            if (s_co) coTarget = (uint32_t)std::atoi(s_co);
-                            bool matchPtr = tgt && fClosure == tgt;
-                            bool matchCo = coTarget != 0 && fClosure
-                                && fClosure->desc
-                                && fClosure->desc->codeOffset == coTarget;
-                            if (matchPtr || matchCo) {
-                                    std::fprintf(stderr,
-                                        "v3 RECYCLE-CALLSITE: fClosure=%p "
-                                        "desc=%p codeOff=%u nUp=%u fThunk=%p "
-                                        "fFlags=0x%x retVal-tag=%u\n",
-                                        (void *)fClosure,
-                                        (void *)(fClosure ? fClosure->desc : nullptr),
-                                        fClosure && fClosure->desc
-                                            ? fClosure->desc->codeOffset : 0,
-                                        fClosure ? (unsigned)fClosure->nUpvalues : 0,
-                                        (const void *)fThunk,
-                                        (unsigned)fFlags,
-                                        (unsigned)retVal.tag());
-                                    // Dump current frame stack (after pop).
-                                    std::fprintf(stderr,
-                                        "  frame stack post-pop (size=%zu):\n",
-                                        vm.frames.size());
-                                    size_t lim = vm.frames.size();
-                                    for (size_t fi = lim;
-                                         fi > 0 && fi + 6 > lim; --fi) {
-                                        const auto & frD = vm.frames[fi - 1];
-                                        const LambdaDescriptor * d2 = nullptr;
-                                        if (frD.thunk
-                                            && (frD.thunk->state == ThunkState::Suspended
-                                                || frD.thunk->state == ThunkState::Blackhole))
-                                            d2 = frD.thunk->suspended.desc;
-                                        else if (frD.closure) d2 = frD.closure->desc;
-                                        std::fprintf(stderr,
-                                            "    [%zu] name=%s codeOff=%u ip=%u flags=0x%x closure=%p thunk=%p\n",
-                                            fi - 1,
-                                            d2 && !d2->name.empty() ? d2->name.c_str() : "<?>",
-                                            d2 ? d2->codeOffset : 0,
-                                            frD.ip, (unsigned)frD.flags,
-                                            (const void *)frD.closure,
-                                            (const void *)frD.thunk);
-                                    }
-                            }
-                        }
-                        // Phase A5 FIX (RCA 2026-05-11): recycleFakeClo
-                        // self-rejects when fClosure isn't actually a
-                        // fakeClo (kFakeCloMagic sentinel check in
-                        // alloc.hh).  Safe to call unconditionally; a
-                        // tail-call-replaced cur.closure is a real
-                        // closure with _pad=0 and gets rejected.
-                        Alloc::recycleFakeClo(fClosure);
-                    }
-                }
+                // Phase D Step 12 (2026-05-21): closure-pool retired.
+                // Previously the just-popped fakeClo would be
+                // returned to a thread-local pool here for
+                // reuse on the next OP_FORCE Thunk dispatch (and
+                // similar).  Replaced by nursery-based allocation
+                // (Alloc::allocClosure → nurseryOrArena) — fresh
+                // Closures land in the nursery and get reclaimed by
+                // scavenge when no longer referenced.  V3_DBG_RECYCLE_*
+                // diagnostics removed along with the pool.
 
                 // WC-38: the legacy "return-chain push" -- eagerly
                 // forcing the next thunk if the outer's body returned
@@ -6200,18 +6132,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
             // Synthesize a closure-like view for OP_GET_UPVALUE: we set
-            // `closure` to a fake Closure pointer crafted from the thunk
-            // tail.  #558 Phase 4: prefer a recycled Closure from the
-            // thread-local pool over a fresh allocation; OP_RETURN's
-            // CFF_THUNK_RETURN handler puts the fakeClo back in the
-            // pool after the body completes.  Under THUNK_ALL this
-            // saves hundreds of millions of Boehm allocations per
-            // top-level eval.  Opt-out via NIX_V3_NO_CLOSURE_POOL=1.
-            static const bool s_noClosurePool =
-                std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
-            Closure * fakeClo = __builtin_expect(s_noClosurePool, 0)
-                ? Alloc::allocClosure(t->nUpvalues)
-                : Alloc::allocFakeClo(t->nUpvalues);
+            // `closure` to a fresh Closure crafted from the thunk
+            // tail.  Phase D Step 12 (2026-05-21): retired the
+            // fakeClo / closure-pool sentinel infrastructure.  Pool
+            // reuse saved a hand-rolled allocation, but the Cheney
+            // nursery (`NIX_V3_NURSERY=1`) provides real generational
+            // reclamation: fresh closures land in nursery, scavenge
+            // collects unreferenced ones at next cycle.  Pool was
+            // load-bearing only before nursery + Phase D landed.
+            Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
             // Phase A5 RCA: alarm when fakeClo's pre-overwrite desc is
             // a "real" closure body (i.e., codeOff != 0 and name not
             // empty).  A recycled-fakeClo pool would only set desc to a
@@ -11401,15 +11330,9 @@ Value forceValue(VMState & vm, Value v)
         if (__builtin_expect(nix::evalTrace::enabled(), 0))
             nix::evalTrace::enterForce(v3ThunkTracePos(t));
         hotForceCheck(t);
-        // #558 Phase 4: pull a fakeClo from the thread-local pool when
-        // available; OP_RETURN's CFF_THUNK_RETURN handler will recycle
-        // it after the body completes (the frame we push below has
-        // CFF_THUNK_RETURN set).
-        static const bool s_noClosurePool =
-            std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
-        Closure * fakeClo = __builtin_expect(s_noClosurePool, 0)
-            ? Alloc::allocClosure(t->nUpvalues)
-            : Alloc::allocFakeClo(t->nUpvalues);
+        // Phase D Step 12 (2026-05-21): retired the closure-pool —
+        // see the OP_FORCE Thunk dispatch site above for rationale.
+        Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
         fakeClo->desc = desc;
         fakeClo->nUpvalues = t->nUpvalues;
         fakeClo->capturedWiths = t->suspended.capturedWiths;
