@@ -31,11 +31,21 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 
 namespace nix::v3 {
 
 class Nursery;
 struct VMState;
+struct Value;
+
+/// #705 (2026-05-21): expose v3_call_flake's `g_cachedCallFlake`
+/// closureValue as a scavenger root.  The cached closure (produced
+/// by running call-flake.nix bytecode at process init) may have
+/// been allocated through the nursery; without this walk a scavenge
+/// after the first getFlake call leaves the cache holding a stale
+/// closure pointer.
+void walkCallFlakeRoot(const std::function<void(Value &)> & visit);
 
 /// Scavenge live nursery objects to tenured.  Walks roots from `vm`
 /// (valueStack / withStack / frames / partialBindingsRegistry),

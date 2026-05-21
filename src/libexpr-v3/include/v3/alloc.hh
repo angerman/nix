@@ -303,6 +303,27 @@ public:
     /// allocated.  Cheap to read; useful for the alloc-stats dump.
     size_t bytesAllocated() const noexcept { return totalBytes; }
 
+    /// #705 diagnostic accessor: iterate the arena's blocks for
+    /// brute-force scanning.  Returns (block_start, block_end_used).
+    /// `cur` is the bump pointer in the active block — we only scan
+    /// up to `cur` for that block, and the full block size for the
+    /// older blocks.
+    struct BlockRange { const char * begin; const char * end; };
+    std::vector<BlockRange> blockRanges() const
+    {
+        std::vector<BlockRange> r;
+        r.reserve(blocks.size());
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            const char * b = blocks[i];
+            const char * e = (b == (cur ? blocks.back() : nullptr) && i + 1 == blocks.size())
+                ? cur : b + kBlockSize;
+            // Defensive: if cur is null (no allocations yet), use full block.
+            if (!cur && i + 1 == blocks.size()) e = b + kBlockSize;
+            r.push_back({b, e});
+        }
+        return r;
+    }
+
 private:
     char *  cur        = nullptr;
     char *  end        = nullptr;

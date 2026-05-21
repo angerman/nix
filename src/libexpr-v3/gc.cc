@@ -40,6 +40,7 @@
 #include "v3/gc.hh"
 #include "v3/nursery.hh"
 #include "v3/alloc.hh"
+#include "v3/bytecode.hh"  // #705: AttrSelectIC roots
 #include "v3/closure.hh"
 #include "v3/primop.hh"  // #705: walkV3BridgeRoots
 #include "v3/bytecode_primops.hh"  // #705: walkBytecodePrimopRoots, walkBuiltinsRoot
@@ -107,6 +108,10 @@ struct Scavenger
     std::unordered_set<void *> & walked;
     /// queued objects to walk in `drain()`
     std::vector<Gray> & graylist;
+    /// #705 (2026-05-21): CUs whose attrSelectCache has been
+    /// walked.  Populated from every walkClosure / walkThunk so any
+    /// CU transitively reachable from a root is covered.
+    std::unordered_set<const CompilationUnit *> walkedCUs;
 
     // -- pointer forwarders (no recursion; just copy + queue) ----
 
@@ -278,14 +283,14 @@ ValuePair * Scavenger::fwdPair(ValuePair * p)
 {
     if (!p) return nullptr;
     if (n.contains(p)) std::abort();  // pairs are tenured (allocPair)
-    // Fast path — both members carry no v3-heap pointer.  Common
-    // for `Tag::App` / `Tag::PrimOpApp` pairs constructed by primops
-    // like genList where left is a (already-walked) Closure pointer
-    // applied to a leaf-typed argument: detecting the leaf side
-    // alone doesn't help (still need to forward the closure), but
-    // when BOTH sides are leaves we save the queue + drain.  Also
-    // skips the hash insert.
-    if (isLeafTag(p->left.tag()) && isLeafTag(p->right.tag())) return p;
+    // Fast path — left, right, AND evaluated all carry no v3-heap
+    // pointer.  `evaluated` (added 2026-05-18 for App memoisation)
+    // must be checked too: a forced Tag::App writes its WHNF result
+    // there, and a nursery payload in `evaluated` is a real root.
+    // #705 (2026-05-21): the missing `evaluated` check was the
+    // primary cause of hello.drvPath SIGSEGV under scavenge.
+    if (isLeafTag(p->left.tag()) && isLeafTag(p->right.tag())
+        && isLeafTag(p->evaluated.tag())) return p;
     if (walked.insert(p).second) graylist.push_back({p, GK_PAIR});
     return p;
 }
@@ -402,6 +407,13 @@ void Scavenger::walkPair(ValuePair * p)
 {
     visitValue(p->left);
     visitValue(p->right);
+    // #705 (2026-05-21): `evaluated` field added 2026-05-18 (commit
+    // d3e41c13d) for App-result memoization.  Holds the WHNF result
+    // of a previously-forced Tag::App — a nursery payload here
+    // (Closure/Thunk/Bindings/List) was the missing root that made
+    // hello.drvPath SIGSEGV under scavenge.  When `evaluated` is
+    // Tag::Uninitialized, visitValue is a no-op.
+    visitValue(p->evaluated);
 }
 
 void Scavenger::drain()
@@ -442,6 +454,25 @@ void Scavenger::run()
         if (f.thunk) {
             f.thunk = fwdThunk(f.thunk);
         }
+        // #705 (2026-05-21): forceWriteTarget is a Value*-pointer
+        // to a cell that an in-progress force will write its WHNF
+        // result into.  The cell pointer itself is tenured (always
+        // via Alloc::allocValue() or a Bindings entry slot), but
+        // its CURRENT content may carry a nursery payload that
+        // the audit's normal walks won't visit if the cell isn't
+        // otherwise reachable from valueStack/withStack/frames.
+        //
+        // Why this is a missed root: between OP_FORCE setting up
+        // writeback (flag bit + target pointer) and OP_RETURN /
+        // applyForceWriteback firing, the cell sits unreferenced
+        // by any visible Value EXCEPT through this frame field.
+        // If scavenge fires in that window, the cell's contents
+        // dangle.
+        //
+        // The fix: visit the cell's content as if it were on the
+        // value stack.  Safe even when the flag bit is clear —
+        // walking *cell is a no-op for tag::Uninitialized / leaf.
+        if (f.forceWriteTarget) visitValue(*f.forceWriteTarget);
     }
 
     // #705 (2026-05-20): bridge-table roots.  The TW->v3 bridge
@@ -454,6 +485,58 @@ void Scavenger::run()
     std::function<void(Value &)> rootVisit =
         [this](Value & v) { visitValue(v); };
     walkV3BridgeRoots(rootVisit);
+
+    // #705 (2026-05-21): per-CompilationUnit AttrSelectIC roots.
+    // The IC caches `(Bindings*, slot)` pairs for OP_ATTRS_SELECT —
+    // when the same call site re-fires with a previously-seen Bindings
+    // pointer, it skips the binary search and reads
+    // `bindings->entries[slot].value` directly.
+    //
+    // Critical missed-root: a Bindings cached here can be reachable
+    // ONLY via this cache (no live valueStack/frame reference at
+    // scavenge time).  Scavenge wouldn't walk its entries → entries
+    // with nursery payloads dangle → next OP_ATTRS_SELECT IC hit
+    // returns a stale Tag::Thunk → forceValue crashes on
+    // `t->suspended.desc`.
+    //
+    // Identified 2026-05-21 by V3_DBG_NURSERY_BRUTE which found
+    // 502K stale nursery pointers in tenured arena memory after a
+    // "clean" deep audit — only path that could keep them reachable
+    // without showing in the graph walk.
+    //
+    // Walk each CU referenced by any frame, dedupe via a local set.
+    {
+        std::unordered_set<const CompilationUnit *> walkedCUs;
+        auto walkOneCU = [&](const CompilationUnit * cu) {
+            if (!cu) return;
+            if (!walkedCUs.insert(cu).second) return;
+            for (const auto & ic : cu->attrSelectCache) {
+                for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                    if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
+                        fwdBindings(b);
+                }
+            }
+        };
+        for (CallFrame & f : vm.frames) walkOneCU(f.cu);
+        // Also walk via closures/thunks on the stack — they carry CU
+        // refs that may not be in any active frame.
+        for (Value & v : vm.valueStack) {
+            if (v.tag() == Tag::Closure && v.payload.closure)
+                walkOneCU(v.payload.closure->cu);
+            else if (v.tag() == Tag::Thunk && v.payload.thunk
+                     && (v.payload.thunk->state == ThunkState::Suspended
+                         || v.payload.thunk->state == ThunkState::Blackhole))
+                walkOneCU(v.payload.thunk->suspended.cu);
+        }
+        for (Value & v : vm.withStack) {
+            if (v.tag() == Tag::Closure && v.payload.closure)
+                walkOneCU(v.payload.closure->cu);
+            else if (v.tag() == Tag::Thunk && v.payload.thunk
+                     && (v.payload.thunk->state == ThunkState::Suspended
+                         || v.payload.thunk->state == ThunkState::Blackhole))
+                walkOneCU(v.payload.thunk->suspended.cu);
+        }
+    }
 
     // #705 (2026-05-21): bytecode-primop replacement roots.  Each
     // Value in `primopReplacementMap` may carry a nursery Closure
@@ -473,6 +556,16 @@ void Scavenger::run()
     // `b->entries[i].value = installed.rr.value`).  Those entries
     // can carry nursery Closures.  Walk so they're forwarded.
     walkBuiltinsRoot(rootVisit);
+
+    // #705 (2026-05-21): import-cache results.  Each entry holds a
+    // Value whose payload may carry nursery Closure/Bindings — a
+    // repeat builtins.import after scavenge would otherwise return
+    // a stale pointer.
+    walkImportCacheRoots(rootVisit);
+
+    // #705 (2026-05-21): cached call-flake closure.  Set once at
+    // first getFlake; closure may be nursery-allocated.
+    walkCallFlakeRoot(rootVisit);
 
     // #558 Phase 3.3: partialBindingsRegistry retired (no longer
     // referenced by vm.cc).  No scavenge work needed.
@@ -578,8 +671,9 @@ struct Auditor {
         if (!p) return;
         check(p, "ValuePair", site);
         if (!visited.insert(p).second) return;
-        visitValue(p->left,  "ValuePair.left");
-        visitValue(p->right, "ValuePair.right");
+        visitValue(p->left,      "ValuePair.left");
+        visitValue(p->right,     "ValuePair.right");
+        visitValue(p->evaluated, "ValuePair.evaluated");
     }
 };
 
@@ -632,6 +726,50 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
     std::fflush(stderr);
 }
 
+// #705 (2026-05-21): brute-force tenured-arena scan.
+//
+// Gated V3_DBG_NURSERY_BRUTE=1 (separate from AUDIT because it's
+// expensive — O(arena_size) per scavenge).  Walks every 8-byte
+// aligned word in every tenured arena block and checks whether the
+// word is a pointer into the nursery range.  Hits reveal exactly
+// which arena offset holds a stale nursery pointer that the deep
+// reachable-graph audit missed.
+//
+// This is the catch-all for missed roots: by definition every
+// tenured-to-nursery pointer SHOULD have been forwarded by scavenge.
+// If brute-scan finds any after scavenge, that's the missed root.
+void postScavengeBruteScan(const Nursery & n)
+{
+    Arena & arena = threadArena();
+    auto blocks = arena.blockRanges();
+    size_t hits = 0;
+    size_t cap = 16;  // dump first N hits
+    for (auto & blk : blocks) {
+        // Walk 8-byte aligned words.
+        const uintptr_t step = 8;
+        uintptr_t lo = reinterpret_cast<uintptr_t>(blk.begin);
+        uintptr_t hi = reinterpret_cast<uintptr_t>(blk.end);
+        lo = (lo + step - 1) & ~(step - 1);  // align up
+        for (uintptr_t p = lo; p + step <= hi; p += step) {
+            uintptr_t w = *reinterpret_cast<const uintptr_t *>(p);
+            if (w == 0) continue;
+            if (n.contains(reinterpret_cast<const void *>(w))) {
+                if (hits < cap) {
+                    std::fprintf(stderr,
+                        "v3 SCAVENGE BRUTE: arena word @ %p holds "
+                        "nursery pointer %p\n",
+                        (void*)p, (void*)w);
+                }
+                ++hits;
+            }
+        }
+    }
+    std::fprintf(stderr,
+        "v3 SCAVENGE BRUTE: %zu tenured words point into nursery "
+        "(first %zu dumped above)\n", hits, std::min(hits, cap));
+    std::fflush(stderr);
+}
+
 } // namespace
 
 void scavengeNursery(Nursery & n, VMState & vm) noexcept
@@ -645,6 +783,8 @@ void scavengeNursery(Nursery & n, VMState & vm) noexcept
     Scavenger sc{n, vm, buf.forward, buf.walked, buf.graylist};
     sc.run();
     if (__builtin_expect(s_audit, 0)) postScavengeAudit(n, vm);
+    static const bool s_brute = std::getenv("V3_DBG_NURSERY_BRUTE") != nullptr;
+    if (__builtin_expect(s_brute, 0)) postScavengeBruteScan(n);
     // V3_DBG_NURSERY=1 — print one line per scavenge with the
     // forward-map size + tenured-walk size so we can verify the
     // pass actually moved live data and how much it had to

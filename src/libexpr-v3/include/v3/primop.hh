@@ -112,6 +112,14 @@ namespace nix::v3 {
 /// Implemented in `primops.cc` where the bridge tables live.
 void walkV3BridgeRoots(const std::function<void(Value &)> & visit);
 
+/// #705 (2026-05-21): walk the import-cache results.  Each entry in
+/// `importCache().results` holds a Value whose payload may carry a
+/// nursery pointer — for instance, a freshly-imported module's
+/// closure or attrset.  Without this walk, a repeat
+/// `builtins.import` of the same path returns a stale pointer
+/// after scavenge.
+void walkImportCacheRoots(const std::function<void(Value &)> & visit);
+
 /// REVIEW §2.1: RAII guard for the thread-local fallback Expr pointer
 /// that primV3{CallBridge1,ForceAttr,ForceListElem} read on cycle
 /// detection.  Setting it via raw save/restore was leaking the prior

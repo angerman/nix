@@ -152,6 +152,21 @@ CachedCallFlake g_cachedCallFlake;
 
 } // namespace
 
+// #705 (2026-05-21): expose the cached call-flake closure as a
+// scavenger root.  The closureValue may carry a nursery Closure
+// payload (if call-flake.nix's bytecode was run while the nursery
+// was enabled).  Without walking, a getFlake call after scavenge
+// uses a stale closure pointer.
+void walkCallFlakeRoot(const std::function<void(Value &)> & visit)
+{
+    // Only walk if the once-flag has fired.  We can't safely call
+    // std::call_once's predicate here, so check the Value's tag
+    // — call_once initializes to Tag::Uninitialized (=0) by default
+    // and the post-init success path sets Tag::Closure.
+    if (g_cachedCallFlake.closureValue.tag() != Tag::Uninitialized)
+        visit(g_cachedCallFlake.closureValue);
+}
+
 // Forward declaration: defined in primops.cc.  Bridges a TW Value
 // (forced to WHNF inside) to a v3 Value (shallow per #662).
 extern Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);

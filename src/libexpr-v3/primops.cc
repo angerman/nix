@@ -3573,6 +3573,9 @@ static std::vector<BridgeListEntry,
 
 // #705 walkV3BridgeRoots lives below the anonymous-namespace close
 // so the linker can see it.  See the function-body comment there.
+// #705 walkImportCacheRoots_inAnon — moved after importCache()
+// definition (was here at line 3581 before forward-declare was
+// needed).
 
 /// #493: side-table mapping sentinel `nix::Env *` (held in
 /// `Value::lambda().env` of bridged TW lambdas) to the handle in
@@ -3675,6 +3678,9 @@ void walkV3BridgeRoots(const std::function<void(Value &)> & visit)
     for (auto & e : v3BridgeAttrs())    visit(e.v3Value);
     for (auto & e : v3BridgeLists())    visit(e.v3Value);
 }
+
+// (walkImportCacheRoots defined further down, after the
+// anonymous-namespace `importCache()` function body is visible.)
 
 int & bridge1DepthCounter() {
     static thread_local int d = 0;
@@ -6974,6 +6980,23 @@ inline ImportCache & importCache()
     static ImportCache c;
     return c;
 }
+
+} // anon ns
+
+// #705 (2026-05-21): walk import-cache results as scavenger roots.
+// Each entry holds a Value whose payload may carry a nursery
+// pointer (Closure/Bindings/etc.); without walking, a repeat
+// `builtins.import` returns a stale pointer after scavenge.
+void walkImportCacheRoots(const std::function<void(Value &)> & visit)
+{
+    auto & cache = importCache();
+    for (auto & [key, entry] : cache.results) {
+        (void)key;
+        visit(entry.result);
+    }
+}
+
+namespace {
 
 /// Stat a path and produce (mtime_ns, size).  Returns (0, -1) on
 /// failure -- the caller treats negative size as "uncacheable" and

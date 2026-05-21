@@ -10779,6 +10779,172 @@ Value forceValue(VMState & vm, Value v)
                 (void*)t, nu.contains(t) ? "YES" : "no",
                 vm.frames.size(), vm.valueStack.size(),
                 vm.withStack.size());
+            // #705 (2026-05-21): search the arena for every word
+            // equal to t.  That word is in a tenured Value's payload
+            // field — the missed-root container.  By printing the
+            // first few matches, we can identify the source of the
+            // stale pointer that scavenge failed to forward.
+            {
+                Arena & arena = threadArena();
+                auto blocks = arena.blockRanges();
+                uintptr_t target = reinterpret_cast<uintptr_t>(t);
+                size_t hits = 0;
+                size_t cap = 8;
+                uintptr_t firstHitArena = 0;
+                std::fprintf(stderr, "  arena references to stale t:\n");
+                for (auto & blk : blocks) {
+                    uintptr_t lo = reinterpret_cast<uintptr_t>(blk.begin);
+                    uintptr_t hi = reinterpret_cast<uintptr_t>(blk.end);
+                    lo = (lo + 7) & ~uintptr_t{7};
+                    for (uintptr_t p = lo; p + 8 <= hi; p += 8) {
+                        if (*reinterpret_cast<const uintptr_t *>(p) != target)
+                            continue;
+                        if (!firstHitArena) firstHitArena = p;
+                        if (hits++ < cap) {
+                            uint64_t tagWord = (p >= 8)
+                                ? *reinterpret_cast<const uint64_t *>(p - 8) : 0;
+                            std::fprintf(stderr,
+                                "    @ %p (preceding word: 0x%llx, tag=%d)\n",
+                                (void*)p, (unsigned long long)tagWord,
+                                (int)(tagWord & 0xff));
+                            // Dump 64 bytes before to inspect container header.
+                            std::fprintf(stderr, "    context [-64..-8]:");
+                            for (int off = -64; off < 0; off += 8) {
+                                uintptr_t cp = p + off;
+                                if (cp >= reinterpret_cast<uintptr_t>(blk.begin)) {
+                                    uint64_t w = *reinterpret_cast<const uint64_t *>(cp);
+                                    std::fprintf(stderr, " %llx", (unsigned long long)w);
+                                }
+                            }
+                            // Decode SymbolId from the Bindings::Entry
+                            // pattern: name is at (Value-tag-pos -8),
+                            // i.e. p - 16.  If this looks like a
+                            // Bindings entry, name is in low 4 bytes.
+                            uint32_t maybeName =
+                                (p >= 16) ? (uint32_t)*reinterpret_cast<const uint32_t *>(p - 16) : 0;
+                            const auto & symtab = ir::globalSymbolTable();
+                            const char * symName =
+                                (maybeName < symtab.size())
+                                    ? symtab[maybeName].c_str() : "<?>";
+                            std::fprintf(stderr,
+                                "    symbol-name guess: id=%u \"%s\"\n",
+                                maybeName, symName);
+                            std::fprintf(stderr, "    context [+8..+24]:");
+                            for (int off = 8; off <= 24; off += 8) {
+                                uintptr_t cp = p + off;
+                                if (cp + 8 <= reinterpret_cast<uintptr_t>(blk.end)) {
+                                    uint64_t w = *reinterpret_cast<const uint64_t *>(cp);
+                                    std::fprintf(stderr, " %llx", (unsigned long long)w);
+                                }
+                            }
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
+                std::fprintf(stderr, "  total arena refs to t: %zu\n", hits);
+
+                // Second pass: the missed-root Bindings is at (p - 48)
+                // per the layout decoded above.  Search the arena for
+                // pointers to it — those are the places holding the
+                // container that scavenge missed.  Uses the ARENA
+                // address of the first stale-pointer hit (not the
+                // nursery target address).
+                uintptr_t containerAddr = firstHitArena ? (firstHitArena - 48) : 0;
+                if (containerAddr) {
+                    std::fprintf(stderr,
+                        "  searching for refs to Bindings @ %p:\n",
+                        (void*)containerAddr);
+                    size_t chits = 0;
+                    for (auto & blk : blocks) {
+                        uintptr_t lo = reinterpret_cast<uintptr_t>(blk.begin);
+                        uintptr_t hi = reinterpret_cast<uintptr_t>(blk.end);
+                        lo = (lo + 7) & ~uintptr_t{7};
+                        for (uintptr_t p2 = lo; p2 + 8 <= hi; p2 += 8) {
+                            if (*reinterpret_cast<const uintptr_t *>(p2) != containerAddr)
+                                continue;
+                            if (chits++ < 8) {
+                                uint64_t prevWord = (p2 >= 8)
+                                    ? *reinterpret_cast<const uint64_t *>(p2 - 8) : 0;
+                                std::fprintf(stderr,
+                                    "    arena @ %p holds container ptr "
+                                    "(tag_payload word @ %p = 0x%llx tag=%d)\n",
+                                    (void*)p2, (void*)(p2 - 8),
+                                    (unsigned long long)prevWord,
+                                    (int)(prevWord & 0xff));
+                                // Dump 256 bytes before p2 to find
+                                // the container header.
+                                std::fprintf(stderr, "    context [-256..-16] (8B/word):\n     ");
+                                int wordCount = 0;
+                                for (int off = -256; off <= -16; off += 8) {
+                                    uintptr_t cp = p2 + off;
+                                    if (cp >= reinterpret_cast<uintptr_t>(blk.begin)) {
+                                        uint64_t w = *reinterpret_cast<const uint64_t *>(cp);
+                                        std::fprintf(stderr, " %llx",
+                                            (unsigned long long)w);
+                                        if (++wordCount % 4 == 0)
+                                            std::fprintf(stderr, "\n     ");
+                                    }
+                                }
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
+                    }
+                    std::fprintf(stderr, "  total refs to Bindings: %zu\n",
+                                 chits);
+
+                    // Chain up: the holder of the Bindings ref is a
+                    // Value{Attrs, ...} inside some container.  Try
+                    // to find what holds it — likely a ValuePair
+                    // (Tag::App), Bindings entry, Closure upvalue,
+                    // etc.  We search for the LIVE-VALUE address
+                    // (containerHolderAddr = arena pos of that Value).
+                    if (chits == 1) {
+                        // We have only one ref — find it again and
+                        // search upward.
+                        for (auto & blk : blocks) {
+                            uintptr_t lo = reinterpret_cast<uintptr_t>(blk.begin);
+                            uintptr_t hi = reinterpret_cast<uintptr_t>(blk.end);
+                            lo = (lo + 7) & ~uintptr_t{7};
+                            for (uintptr_t p2 = lo; p2 + 8 <= hi; p2 += 8) {
+                                if (*reinterpret_cast<const uintptr_t *>(p2) != containerAddr)
+                                    continue;
+                                // Our Value at (p2-8, p2).  Find
+                                // who points to the WHOLE PAIR
+                                // (which starts at p2-24 if this is
+                                // the right-Value of a Pair).
+                                uintptr_t pairAddr = p2 - 24;
+                                std::fprintf(stderr,
+                                    "  searching for refs to ValuePair @ %p:\n",
+                                    (void*)pairAddr);
+                                size_t phits = 0;
+                                for (auto & blk2 : blocks) {
+                                    uintptr_t lo2 = reinterpret_cast<uintptr_t>(blk2.begin);
+                                    uintptr_t hi2 = reinterpret_cast<uintptr_t>(blk2.end);
+                                    lo2 = (lo2 + 7) & ~uintptr_t{7};
+                                    for (uintptr_t p3 = lo2; p3 + 8 <= hi2; p3 += 8) {
+                                        if (*reinterpret_cast<const uintptr_t *>(p3) != pairAddr)
+                                            continue;
+                                        if (phits++ < 4) {
+                                            uint64_t prev = (p3 >= 8)
+                                                ? *reinterpret_cast<const uint64_t *>(p3 - 8) : 0;
+                                            std::fprintf(stderr,
+                                                "    arena @ %p holds pair ptr "
+                                                "(tag_payload @ %p = 0x%llx tag=%d)\n",
+                                                (void*)p3, (void*)(p3 - 8),
+                                                (unsigned long long)prev,
+                                                (int)(prev & 0xff));
+                                        }
+                                    }
+                                }
+                                std::fprintf(stderr,
+                                    "  total refs to ValuePair: %zu\n", phits);
+                                break;  // only do one chase
+                            }
+                            if (chits) break;
+                        }
+                    }
+                }
+            }
             std::fprintf(stderr, "  compressChain (chase predecessors), N=%d:\n",
                 compressCount);
             for (int ci = 0; ci < compressCount; ++ci) {
