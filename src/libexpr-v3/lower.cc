@@ -1715,16 +1715,25 @@ struct Lowerer
                     // thunk and only forcing it when pushDownProperties or
                     // a defn-collector actually demands it.
                     //
-                    // The remaining arithmetic ops (`__sub`/`__mul`/`__div`)
-                    // stay eager: their args are typically Int literals or
-                    // simple Var refs in hot paths (fib's `f (n - 1)`), so
-                    // the pre-#694 fast path's perf win still applies.  If
-                    // a future repro shows those triggering similar cycles,
-                    // narrow them too — `__lessThan` was the specific
-                    // operator that fired the module-cycle (operator-bisected
-                    // on the nylon-services repro: only `<`/`>`/`<=`/`>=`
-                    // failed, all parse to ExprCall(__lessThan, ...)).
-                    if (n == "__sub" || n == "__mul" || n == "__div")
+                    // The remaining arithmetic ops (`__sub`/`__mul`/`__div`
+                    // + `__add`, 2026-05-21 #737 Stage 4 v1) stay eager:
+                    // their args are typically Int literals or simple Var
+                    // refs in hot paths (fib's `f (n - 1)`, foldl' acc
+                    // accumulators), so the pre-#694 fast path's perf win
+                    // still applies.  If a future repro shows those
+                    // triggering similar cycles, narrow them too —
+                    // `__lessThan` was the specific operator that fired
+                    // the module-cycle (operator-bisected on the nylon-
+                    // services repro: only `<`/`>`/`<=`/`>=` failed, all
+                    // parse to ExprCall(__lessThan, ...)).
+                    //
+                    // `__add` overloads (Int+Int, Float+Float, String+
+                    // String, Path+anything).  The runtime dispatch
+                    // forces both args and picks the appropriate impl;
+                    // no rec-sibling-laziness violation that __sub/__mul/
+                    // __div didn't already have.
+                    if (n == "__sub" || n == "__mul" || n == "__div"
+                        || n == "__add")
                         return true;
                 }
             }
