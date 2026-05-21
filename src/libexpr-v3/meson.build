@@ -91,6 +91,8 @@ lib_sources = files(
   'fiber.cc',
   'bridge_yield.cc',
   'gc.cc',
+  # Phase D write-barriers (Stage 3 prereq): NURSERY_PHASE_D_DECISION_2026-05-21.md
+  'barrier.cc',
   'disasm.cc',
   'ffi.cc',
   'print.cc',

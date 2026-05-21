@@ -494,6 +494,7 @@ struct Alloc
         t->nUpvalues = nUpvalues;
         t->forces = 0;
         t->cell = nullptr;
+        t->cellContainer = nullptr;  // Phase D write-barrier metadata
         t->shapeCell = nullptr;
         // #558 Phase 1.5: pre-allocate shapeCell so the body can
         // publish in-progress state via *shapeCell, and forceValue
@@ -532,6 +533,7 @@ struct Alloc
         t->nUpvalues = 0;
         t->forces = 0;
         t->cell = nullptr;
+        t->cellContainer = nullptr;  // Phase D write-barrier metadata
         // Bridge thunks don't have a v3-side body; no shapeCell needed.
         t->shapeCell = nullptr;
         t->bridgeSrc = src;

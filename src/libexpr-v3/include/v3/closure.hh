@@ -128,6 +128,25 @@ struct Thunk
     /// write happens exactly once per cell-binding.
     Value * cell;
 
+    /// Phase D (Stage 3) write-barrier metadata, 2026-05-21.  If the
+    /// `cell` above points INTO a `Bindings::entries[i].value` slot,
+    /// `cellContainer` is the owning `Bindings *`.  At OP_RETURN's
+    /// cell-write, the write barrier appends `cellContainer` to the
+    /// thread-local dirty-container list (see `v3/barrier.hh`) so
+    /// the next scavenge walks the Bindings and forwards any
+    /// nursery payload the cell-write installed.
+    ///
+    /// nullptr when:
+    ///   - The cell is null (no in-place update planned), OR
+    ///   - The cell is a standalone `Alloc::allocValue()` cell
+    ///     that doesn't sit inside a Bindings.  In that case the
+    ///     barrier uses the thread-local standalone-cell registry
+    ///     (also in `v3/barrier.hh`) instead.
+    ///
+    /// Set at the same MAKE-thunk / publish sites that set `cell`;
+    /// cleared alongside `cell` at OP_RETURN.
+    Bindings * cellContainer;
+
     /// #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere: separate
     /// heap-stable Value* used for IN-PROGRESS shape publishing during
     /// body execution.  Distinct from `cell` (which is the
