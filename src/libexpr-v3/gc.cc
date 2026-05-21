@@ -1021,13 +1021,17 @@ struct Auditor {
         if (!visited.insert(b).second) return;
         // Phase D diagnostic: include the Bindings pointer + entry
         // index when a child value is nursery-resident — helps trace
-        // back to the construction site.
+        // back to the construction site.  Also pulls in the
+        // NIX_V3_DBG_BINDINGS_ORIGIN tag when enabled.
+        const BindingsOrigin * origin = lookupBindingsOrigin(b);
+        const char * originSrc = origin ? origin->source : "(no-origin)";
         for (uint32_t i = 0; i < b->size; ++i) {
             // Build a per-entry site string so the audit message
-            // identifies which Bindings + which entry.
-            char ebuf[80];
+            // identifies which Bindings + which entry + origin.
+            char ebuf[160];
             std::snprintf(ebuf, sizeof(ebuf),
-                "Bindings(%p).entries[%u].value", (const void *)b, i);
+                "Bindings(%p)[%s].entries[%u].value",
+                (const void *)b, originSrc, i);
             visitValue(b->entries[i].value, ebuf);
         }
     }
