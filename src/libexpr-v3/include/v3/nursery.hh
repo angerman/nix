@@ -107,6 +107,21 @@ public:
         uint64_t allocBytes;  // lifetime alloc bytes
         uint64_t overflowCount;
         uint64_t scavengeCount;
+        // #738 Phase E v0.1 (2026-05-21) survival telemetry.
+        // Aggregated across the process lifetime by `gc.cc`.
+        //   survivedBytes = cumulative bytes copied nursery -> tenured
+        //                   across all scavenges.
+        //   diedBytes     = cumulative bytes that were in the nursery
+        //                   pre-scavenge but were NOT copied out
+        //                   (= reclaimed on `resetBumpAfterScavenge`).
+        // ratio diedBytes / (diedBytes + survivedBytes) = young-gen
+        // mortality rate — the headline Rule 0 input for Phase E
+        // v0.2's two-region survivor-pool design.  When this rate is
+        // low (most allocs survive), Phase E won't help; when it's
+        // high (most allocs die in their first cycle), Phase E will
+        // recover those bytes.
+        uint64_t survivedBytes = 0;
+        uint64_t diedBytes     = 0;
     };
     Stats stats() const noexcept
     {
@@ -117,7 +132,21 @@ public:
             allocBytes,
             overflowCount,
             scavengeCount,
+            survivedBytes,
+            diedBytes,
         };
+    }
+    /// Phase E v0.1 — record survival bytes.  Called by gc.cc's
+    /// Scavenger after each scavenge run completes.  `surv` is the
+    /// number of bytes copied from nursery to tenured during this
+    /// scavenge; `pre.used` minus `surv` is the bytes that died.
+    void recordSurvival(uint64_t surv, uint64_t preUsed) noexcept
+    {
+        survivedBytes += surv;
+        // Defensive: preUsed should always be >= surv (you can't
+        // survive more bytes than were allocated), but clamp at 0
+        // to be safe under unusual measurement conditions.
+        diedBytes += (preUsed > surv) ? (preUsed - surv) : 0;
     }
 
     /// True iff `p` lies inside this nursery's backing buffer.
@@ -309,6 +338,11 @@ private:
     uint64_t allocBytes    = 0;
     uint64_t overflowCount = 0;
     uint64_t scavengeCount = 0;
+    // #738 Phase E v0.1 (2026-05-21) lifetime survival accumulators.
+    // See `recordSurvival` for the bump protocol; reported by
+    // `stats()` to run.cc's NIX_VM_STATS banner.
+    uint64_t survivedBytes = 0;
+    uint64_t diedBytes     = 0;
 };
 
 // GC_AUDIT_ROUND_2 N5 (LATENT, documented 2026-05-21):

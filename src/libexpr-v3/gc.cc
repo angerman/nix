@@ -168,6 +168,12 @@ struct Scavenger
     /// been replaced by their tenured forward at this point).
     /// Sorted-and-searched after drain() completes.
     std::vector<std::pair<uintptr_t, uintptr_t>> liveTenuredRanges;
+    /// #738 Phase E v0.1: bytes copied from nursery -> tenured this
+    /// scavenge.  Summed by each fwd* function on a successful copy.
+    /// Used by run() to call `Nursery::recordSurvival` at the end
+    /// so process-lifetime survivedBytes/diedBytes stats can be
+    /// reported by run.cc's NIX_VM_STATS path.
+    uint64_t bytesSurvived = 0;
     /// Record a tenured [start, end) byte range for the BRUTE
     /// reachability filter.  Called by walk* methods.  No-op if
     /// the pointer is in the nursery (means a nursery copy that
@@ -217,6 +223,7 @@ Closure * Scavenger::fwdClosure(Closure * c)
         std::memcpy(dst, c, bytes);
         forward.emplace(c, dst);
         graylist.push_back({dst, GK_CLOSURE});
+        bytesSurvived += bytes;  // #738 Phase E v0.1
         return static_cast<Closure *>(dst);
     }
     // Originally-tenured: under Phase D Step 7 gate, skip the
@@ -292,6 +299,7 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
         std::memcpy(dst, t, bytes);
         forward.emplace(t, dst);
         graylist.push_back({dst, GK_THUNK});
+        bytesSurvived += bytes;  // #738 Phase E v0.1
         return static_cast<Thunk *>(dst);
     }
     // Tenured Thunk fast paths — skip queuing entirely when the
@@ -349,6 +357,7 @@ ListVec * Scavenger::fwdList(ListVec * l)
         std::memcpy(dst, l, bytes);
         forward.emplace(l, dst);
         graylist.push_back({dst, GK_LIST});
+        bytesSurvived += bytes;  // #738 Phase E v0.1
         return static_cast<ListVec *>(dst);
     }
     // Phase D Step 7: skip queueing originally-tenured.  See fwdClosure.
@@ -1320,12 +1329,17 @@ void scavengeNursery(Nursery & n, VMState & vm) noexcept
 {
     static const bool s_dbg = std::getenv("V3_DBG_NURSERY") != nullptr;
     static const bool s_audit = std::getenv("V3_DBG_NURSERY_AUDIT") != nullptr;
-    Nursery::Stats pre{};
-    if (s_dbg) pre = n.stats();
+    // #738 Phase E v0.1: always capture pre-scavenge used bytes so
+    // `recordSurvival` can compute `diedBytes = preUsed - bytesSurvived`.
+    Nursery::Stats pre = n.stats();
     ScavengeBuffers & buf = threadScavengeBuffers();
     buf.clear();
     Scavenger sc{n, vm, buf.forward, buf.walked, buf.graylist};
     sc.run();
+    // #738 Phase E v0.1: record bytes-survived into Nursery so the
+    // process-lifetime totals are visible to run.cc's NIX_VM_STATS
+    // banner.  Cost: two adds + branch per scavenge.
+    n.recordSurvival(sc.bytesSurvived, static_cast<uint64_t>(pre.used));
     if (__builtin_expect(s_audit, 0)) postScavengeAudit(n, vm);
     static const bool s_brute = std::getenv("V3_DBG_NURSERY_BRUTE") != nullptr;
     if (__builtin_expect(s_brute, 0)) {
@@ -1341,12 +1355,21 @@ void scavengeNursery(Nursery & n, VMState & vm) noexcept
     // free of getenv calls.
     if (s_dbg) [[unlikely]] {
         Nursery::Stats post = n.stats();
+        // #738 add per-scavenge survival numbers so the trace line
+        // matches the NIX_VM_STATS banner format.
+        const uint64_t died = (pre.used > sc.bytesSurvived)
+            ? (pre.used - sc.bytesSurvived) : 0;
         std::fprintf(stderr,
             "[v3 nursery] scavenge#%llu  forwarded=%zu  walked=%zu  "
-            "used-pre=%zuB/%zuB\n",
+            "used-pre=%zuB/%zuB  survived=%lluB  died=%lluB  "
+            "mortality=%.1f%%\n",
             (unsigned long long)post.scavengeCount,
             sc.forward.size(), sc.walked.size(),
-            pre.used, pre.sizeBytes);
+            pre.used, pre.sizeBytes,
+            (unsigned long long)sc.bytesSurvived,
+            (unsigned long long)died,
+            pre.used > 0
+                ? (double(died) * 100.0 / double(pre.used)) : 0.0);
     }
 }
 

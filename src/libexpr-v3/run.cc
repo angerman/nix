@@ -300,6 +300,35 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // goes through `runRootExpr`) reports the same data without
         // depending on the CLI specifically.
         dumpPrimOpStats(stderr);
+        // #738 Phase E v0.1 (2026-05-21) survival-rate banner.
+        // Emit when ANY scavenge ran during this eval.  The
+        // headline number is the young-gen mortality rate:
+        //     died / (died + survived).
+        // High mortality (>50%) means most allocs are short-lived
+        // — Phase E's survivor-pool design would recover those
+        // bytes.  Low mortality (<10%) means most allocs survive
+        // forever — Phase E wouldn't help; objects would just sit
+        // in survivor pool instead of tenured.  This is the Rule 0
+        // input that drives the v0.2 architectural decision.
+        {
+            const auto & ns = threadNursery().stats();
+            if (ns.scavengeCount > 0
+                && (ns.survivedBytes > 0 || ns.diedBytes > 0))
+            {
+                const uint64_t total = ns.survivedBytes + ns.diedBytes;
+                const double mortality = total > 0
+                    ? (double(ns.diedBytes) * 100.0 / double(total))
+                    : 0.0;
+                std::fprintf(stderr,
+                    "v3-direct phase-e survival: scavenges=%llu "
+                    "survived=%.1fMB died=%.1fMB mortality=%.1f%% "
+                    "(Phase E v0.2 design driver: kill rate)\n",
+                    (unsigned long long)ns.scavengeCount,
+                    ns.survivedBytes / 1e6,
+                    ns.diedBytes     / 1e6,
+                    mortality);
+            }
+        }
         // #736 (2026-05-21) IFD-probe summary.  Per IFD_DEEP_DIVE
         // §8 step 1 falsifier: "dispatcher counts the probes;
         // counter > 0 on a haskell.nix run".  When ANY probe fired,
