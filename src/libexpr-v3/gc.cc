@@ -811,6 +811,20 @@ void Scavenger::run()
                 }
                 break;
             }
+            case DirtyKind::Closure: {
+                auto * c = static_cast<Closure *>(e.ptr);
+                if (walked.insert(c).second) {
+                    graylist.push_back({c, GK_CLOSURE});
+                }
+                break;
+            }
+            case DirtyKind::List: {
+                auto * l = static_cast<ListVec *>(e.ptr);
+                if (walked.insert(l).second) {
+                    graylist.push_back({l, GK_LIST});
+                }
+                break;
+            }
             }
         }
         // Clear retaining capacity — typical steady-state list size
@@ -1100,6 +1114,14 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
             case DirtyKind::Thunk:
                 if (a.visited.insert(e.ptr).second)
                     a.visitThunk(static_cast<Thunk *>(e.ptr), "dirty.Thunk");
+                break;
+            case DirtyKind::Closure:
+                if (a.visited.insert(e.ptr).second)
+                    a.visitClosure(static_cast<Closure *>(e.ptr), "dirty.Closure");
+                break;
+            case DirtyKind::List:
+                if (a.visited.insert(e.ptr).second)
+                    a.visitList(static_cast<ListVec *>(e.ptr), "dirty.List");
                 break;
             }
         }

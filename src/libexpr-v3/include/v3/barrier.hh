@@ -61,6 +61,8 @@ enum class DirtyKind : uint8_t {
     Bindings = 0,
     Pair     = 1,  ///< ValuePair (Tag::App memo target)
     Thunk    = 2,  ///< Thunk header (Thunk::evaluated or Thunk::tail mutation)
+    Closure  = 3,  ///< Closure (upvalues[] or capturedWiths mutation)
+    List     = 4,  ///< ListVec (elems[] mutation; mostly write-once at build)
 };
 
 /// One dirty-list entry: which kind + raw container pointer.
@@ -200,6 +202,107 @@ thunkSetEvaluated(Thunk * t, Value v) noexcept
         const Nursery & n = threadNursery();
         if (!n.contains(t) && isNurseryPayload(v, n))
             dirtyContainers().push_back({DirtyKind::Thunk, t});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Post-construction batch barriers
+// ---------------------------------------------------------------------------
+//
+// For Closure / Thunk / ListVec, individual element-write barriers
+// (à la `bindingsSetValue`) would be costly because:
+//   - Closure / Thunk / ListVec are often populated in tight loops
+//     (one write per FAM slot during construction).
+//   - Adding a check + dirty-list push per element write multiplies
+//     per-element cost ~5-10×.
+//   - Once constructed, these containers are largely write-once
+//     (Closure upvalues immutable post-MAKE; ListVec elems likewise;
+//     Thunk tail[] populated at MAKE_THUNK).
+//
+// Cleaner protocol: at the END of construction, scan the FAM array
+// once.  If the container is tenured AND any field carries a nursery
+// payload, push ONE DirtyEntry.  Cost: O(N) iteration + at most 1
+// push.  Same correctness as per-write barriers for the
+// write-once-then-immutable case.
+//
+// The mid-life mutations that DO happen post-construction
+// (Thunk::evaluated, Thunk::cell rewrites) are handled by the
+// per-write helpers above (`thunkSetEvaluated`, `cellWrite`).
+// Closure-pool recycling (`recycleFakeClo`) returns a Closure that
+// the caller IMMEDIATELY re-populates and re-walks; treat that as
+// a fresh construction and call the post-construct helper there too.
+
+/// Post-construct barrier for a Closure.  Iterates `upvalues[]` and
+/// `capturedWiths` once; if any holds a nursery payload AND the
+/// Closure is tenured, push one DirtyEntry.  Returns nothing; the
+/// caller's contract is to call this AFTER finishing construction
+/// of `c` (i.e., after writing all upvalues + setting capturedWiths
+/// + cu + desc).
+[[gnu::always_inline]] inline void
+closurePostConstructBarrier(Closure * c) noexcept
+{
+    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+        const Nursery & n = threadNursery();
+        if (n.contains(c)) return;  // nursery closure, no inter-gen
+        // Scan upvalues + capturedWiths.  Single break on first nursery
+        // payload — one push covers all entries since DirtyKind::Closure
+        // re-walks the whole container.
+        bool dirty = false;
+        for (uint16_t i = 0; i < c->nUpvalues; ++i) {
+            if (isNurseryPayload(c->upvalues[i], n)) { dirty = true; break; }
+        }
+        if (!dirty && c->capturedWiths && n.contains(c->capturedWiths))
+            dirty = true;
+        if (dirty) dirtyContainers().push_back({DirtyKind::Closure, c});
+    }
+}
+
+/// Post-construct barrier for a Thunk.  Iterates `tail[]` (Suspended
+/// state's captured upvalues) + `suspended.capturedWiths` and pushes
+/// a DirtyEntry if any nursery payload + tenured-thunk.  Per-state
+/// dispatch: only Suspended-class states have a meaningful FAM tail
+/// to walk; Evaluated state's `evaluated` slot is handled by the
+/// per-write `thunkSetEvaluated`; Bridge has no v3-payload tail
+/// (just bridgeSrc which is TW-side).
+[[gnu::always_inline]] inline void
+thunkPostConstructBarrier(Thunk * t) noexcept
+{
+    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+        const Nursery & n = threadNursery();
+        if (n.contains(t)) return;
+        bool dirty = false;
+        // tail[i] for Suspended / Native / Blackhole carries upvalues.
+        // Native / Blackhole are rare; iterating tail is harmless if
+        // nUpvalues == 0 (e.g. Bridge).
+        for (uint16_t i = 0; i < t->nUpvalues; ++i) {
+            if (isNurseryPayload(t->tail[i], n)) { dirty = true; break; }
+        }
+        // Suspended-capturedWiths.  Native / Bridge use the union for
+        // other purposes; check the state byte.
+        if (!dirty
+            && (t->state == ThunkState::Suspended
+                || t->state == ThunkState::Blackhole)
+            && t->suspended.capturedWiths
+            && n.contains(t->suspended.capturedWiths))
+            dirty = true;
+        if (dirty) dirtyContainers().push_back({DirtyKind::Thunk, t});
+    }
+}
+
+/// Post-construct barrier for a ListVec.  Iterates `elems[]` and
+/// pushes a DirtyEntry if any nursery payload + tenured list.
+[[gnu::always_inline]] inline void
+listPostConstructBarrier(ListVec * l) noexcept
+{
+    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+        const Nursery & n = threadNursery();
+        if (n.contains(l)) return;
+        for (uint32_t i = 0; i < l->size; ++i) {
+            if (isNurseryPayload(l->elems[i], n)) {
+                dirtyContainers().push_back({DirtyKind::List, l});
+                break;
+            }
+        }
     }
 }
 

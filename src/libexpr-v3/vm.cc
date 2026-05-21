@@ -1614,6 +1614,7 @@ inline ListVec * snapshotCurrentWiths(VMState & vm)
     ListVec * out = Alloc::allocList(n);
     for (uint32_t i = 0; i < n; ++i)
         out->elems[i] = vm.withStack[base + i];
+    listPostConstructBarrier(out);  // Phase D coverage
     return out;
 }
 
@@ -3005,6 +3006,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 ListVec * lws = Alloc::allocList(nWiths);
                 for (uint16_t i = nWiths; i > 0; --i)
                     lws->elems[i - 1] = pop(vm);
+                listPostConstructBarrier(lws);  // Phase D coverage
                 c->capturedWiths = lws;
             } else {
                 // No lexical `with` enclosing this lambda — fall back
@@ -3213,6 +3215,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 std::fflush(stderr);
             }
+            // Phase D coverage: post-construction barrier — if the new
+            // Closure is tenured (nursery overflow / opt-out) and ANY
+            // upvalue or capturedWiths is a nursery payload, this is
+            // an inter-gen edge.  Dirty-list it so the next scavenge
+            // walks it.  For nursery-resident closures, no-op.
+            closurePostConstructBarrier(c);
             Value v; v.mkClosure(c); push(vm, v);
             // Phase A5: trace OP_MAKE_CLOSURE results whose body codeOff
             // matches V3_DBG_MAKE_CLO_AT_CODEOFF.  This catches the
@@ -3403,6 +3411,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 ListVec * lws = Alloc::allocList(nWiths);
                 for (uint16_t i = nWiths; i > 0; --i)
                     lws->elems[i - 1] = pop(vm);
+                listPostConstructBarrier(lws);  // Phase D coverage
                 t->suspended.capturedWiths = lws;
             } else {
                 // No lexical with-chain at the creation site — fall
@@ -3545,6 +3554,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 std::fflush(stderr);
             }
+            // Phase D coverage: post-construction barrier for OP_MAKE_THUNK.
+            // If t is tenured (overflow / opt-out) AND tail[] or
+            // suspended.capturedWiths carries nursery payload, dirty-list.
+            thunkPostConstructBarrier(t);
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Thunk);
             v.payload.thunk = t;
@@ -6224,6 +6237,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             fakeClo->capturedWiths = t->suspended.capturedWiths;
             fakeClo->cu = t->suspended.cu;
             for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
+            // Phase D coverage: fakeClo's upvalues now mirror t->tail[].
+            // If the fakeClo itself is tenured (pool may return tenured)
+            // and t->tail[] carries nursery payloads, dirty-list.
+            closurePostConstructBarrier(fakeClo);
 
             ListVec * thunkWiths = t->suspended.capturedWiths;
             const CompilationUnit * thunkCu = t->suspended.cu ? t->suspended.cu : cu;
@@ -6378,6 +6395,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             ListVec * l = Alloc::allocList(n);
             allocStats().listsAllocated++;
             for (uint32_t i = n; i > 0; --i) l->elems[i - 1] = pop(vm);
+            listPostConstructBarrier(l);  // Phase D coverage (OP_LIST_INIT)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::List);
             v.payload.list = l;
@@ -6423,6 +6441,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             uint32_t k = 0;
             for (uint32_t i = 0; i < lhs.payload.list->size; ++i) out->elems[k++] = lhs.payload.list->elems[i];
             for (uint32_t i = 0; i < rhs.payload.list->size; ++i) out->elems[k++] = rhs.payload.list->elems[i];
+            listPostConstructBarrier(out);  // Phase D coverage (OP_LIST_CONCAT)
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::List);
             v.payload.list = out;
@@ -9313,6 +9332,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             allocStats().listsAllocated++;
             for (uint32_t i = 1; i < n; ++i)
                 out_l->elems[i - 1] = v.payload.list->elems[i];
+            listPostConstructBarrier(out_l);  // Phase D coverage (OP_TAIL)
             Value r;
             r.tag_payload = static_cast<uint64_t>(Tag::List);
             r.payload.list = out_l;
@@ -9874,6 +9894,7 @@ inline Value runOnExistingVm(VMState & vm,
         fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
         for (uint32_t i = 0; i < nUpvalues; ++i)
             fakeClo->upvalues[i] = upvalues[i];
+        closurePostConstructBarrier(fakeClo);  // Phase D coverage
     }
 
     // Frame-setup mirrors OP_CALL (vm.cc:2316+) for arg-bearing calls
@@ -10032,6 +10053,7 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
     fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
     for (uint32_t i = 0; i < nUpvalues; ++i)
         fakeClo->upvalues[i] = upvalues[i];
+    closurePostConstructBarrier(fakeClo);  // Phase D coverage
 
     VMState vm;
     vm.valueStack.reserve(64 * 1024);
@@ -10153,6 +10175,7 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
     fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
     for (uint32_t i = 0; i < nUpvalues; ++i)
         fakeClo->upvalues[i] = upvalues[i];
+    closurePostConstructBarrier(fakeClo);  // Phase D coverage
 
     VMState vm;
     vm.valueStack.reserve(64 * 1024);
@@ -11385,6 +11408,8 @@ Value forceValue(VMState & vm, Value v)
         fakeClo->capturedWiths = t->suspended.capturedWiths;
         fakeClo->cu = t->suspended.cu;
         for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
+        // Phase D coverage: same as the OP_FORCE fakeClo path above.
+        closurePostConstructBarrier(fakeClo);
         ListVec * thunkWiths = t->suspended.capturedWiths;
         const CompilationUnit * thunkCu = t->suspended.cu
             ? t->suspended.cu
