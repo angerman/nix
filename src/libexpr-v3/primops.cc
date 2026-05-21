@@ -9615,29 +9615,51 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
     //   v3-native:        8.05 s
     //   bridge (control): 7.44 s
     //
-    // Opt-OUT via `NIX_V3_NO_NATIVE_CALL_FLAKE=1` retained for
-    // emergency rollback during broader regression validation.
-    // Retirement criterion for the opt-out gate: once a full
-    // regression sweep across nixpkgs flakes shows zero divergence
-    // vs the bridge path, delete the gate body and the bridgeBuiltin
-    // fallback (DCE the bridge path entirely).
+    // 2026-05-22 #755 INTERIM ROLLBACK: v3-native callFlake is now
+    // OPT-IN again until the haskell.nix over-force is diagnosed
+    // and fixed.  Per the cardano-node M5 bisection
+    // (lode/CARDANO_NODE_M5_2026-05-21.md), v3-native callFlake
+    // blows past 4 GB on `.outputs.packages.<sys>` evaluation when
+    // the flake uses haskell.nix-style outputs.  The #700 default-on
+    // flip (511074ff6) was validated with `(getFlake X) ? outputs`
+    // — existence-check only — which never forces the offending
+    // attribute path.  The deeper M5 path was uncovered after
+    // 2026-05-21 when the new RSS watchdog (5af3dd1b1) made it safe
+    // to exercise.
+    //
+    // Gate semantics (post-rollback):
+    //   - `NIX_V3_NATIVE_CALL_FLAKE=1` → opt IN to the v3-native
+    //     path.  Faster (5.93 s on cardano-node `? outputs`) but
+    //     OOM-divergent on `.outputs.packages.<sys>` for
+    //     haskell.nix flakes.
+    //   - `NIX_V3_NO_NATIVE_CALL_FLAKE=1` → explicitly disable
+    //     (retained as a no-op since bridge is now default).
+    //   - default → bridge (`bridgeBuiltin<1>("getFlake", ...)`).
     //
     // ALSO falls back to the bridge when:
     //   - flakeSettings hasn't been wired (e.g., v3-eval standalone
     //     without libcmd → getFlakeSettings() returns nullptr).
     //   - s.nixEvalState is null (v3 invoked outside any TW context).
     // Both are degraded-mode safety nets, not perf-related.
+    //
+    // Retirement criterion: when #755 lands a fix for the over-
+    // forcing pathology, flip back to default-on and delete the
+    // NIX_V3_NATIVE_CALL_FLAKE opt-in gate (the NO_NATIVE opt-out
+    // becomes the final survivor, then itself goes once a full
+    // nixpkgs flake sweep shows zero divergence).
     static const bool s_disableNative =
         std::getenv("NIX_V3_NO_NATIVE_CALL_FLAKE") != nullptr;
+    static const bool s_enableNative =
+        std::getenv("NIX_V3_NATIVE_CALL_FLAKE") != nullptr;
     const nix::flake::Settings * flakeSettings = getFlakeSettings();
 
-    if (s_disableNative || !flakeSettings || !s.nixEvalState) {
+    if (s_disableNative || !s_enableNative || !flakeSettings || !s.nixEvalState) {
         bridgeBuiltin<1>("getFlake", s, a, o);
         return;
     }
     auto & ns = *s.nixEvalState;
 
-    // V3-native path (default; opt out via NIX_V3_NO_NATIVE_CALL_FLAKE=1).
+    // V3-native path (opt-in via NIX_V3_NATIVE_CALL_FLAKE=1).
 
     // (1) FFI leaves: parseFlakeRef + lockFlake.  Pure C functions
     //     (no Nix eval); per V3-NATIVE rule these stay in TW.

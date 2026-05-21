@@ -60,43 +60,46 @@ check_eq() {
   fi
 }
 
-# Post-#700-default-flip semantics:
-#   - Default is now v3-native (no env var needed).
-#   - Opt-OUT to the bridge via NIX_V3_NO_NATIVE_CALL_FLAKE=1.
+# Post-#755 interim-rollback semantics:
+#   - Default is the bridge (TW callFlake).  Pre-#700 behaviour.
+#   - Opt IN to v3-native via NIX_V3_NATIVE_CALL_FLAKE=1.
+#   - Opt OUT (no-op since bridge is now default) via NIX_V3_NO_NATIVE_CALL_FLAKE=1.
+# Reverted because v3-native callFlake over-forces haskell.nix outputs
+# on cardano-node M5; see lode/CARDANO_NODE_M5_2026-05-21.md.
 
-# v3-direct default (NOW v3-native by default)
+# v3-direct default (= bridge, post-#755 rollback)
 DEFAULT="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").smoke" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".smoke (default = v3-native)" "$DEFAULT" '"hello"'
+check_eq ".smoke (default = bridge)" "$DEFAULT" '"hello"'
 
-# v3-direct + opt-out to bridge (emergency-rollback path)
-BRIDGE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_NO_NATIVE_CALL_FLAKE=1 \
+# v3-native opt-in path
+NATIVE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_NATIVE_CALL_FLAKE=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").smoke" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".smoke (opt-out = bridge)" "$BRIDGE" '"hello"'
+check_eq ".smoke (opt-in = v3-native)" "$NATIVE" '"hello"'
 
-# Deeper traversal under v3-native (catches bridge / shallow-attrset issues)
+# Deeper traversal under default (= bridge).
 DEEP="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").a.b.c" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".a.b.c (default = v3-native)" "$DEEP" '"deep"'
+check_eq ".a.b.c (default = bridge)" "$DEEP" '"deep"'
 
-# Same query under opt-out — must agree.
-DEEP_BRIDGE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_NO_NATIVE_CALL_FLAKE=1 \
+# Same query under v3-native — must agree.
+DEEP_NATIVE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_NATIVE_CALL_FLAKE=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").a.b.c" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".a.b.c (v3-native vs bridge parity)" "$DEEP" "$DEEP_BRIDGE"
+check_eq ".a.b.c (bridge vs v3-native parity)" "$DEEP" "$DEEP_NATIVE"
 
-# int (42) under v3-native default
+# int (42) under default (= bridge)
 N="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").n" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".n (default = v3-native)" "$N" "42"
+check_eq ".n (default = bridge)" "$N" "42"
 
 if [[ "$fail" -eq 0 ]]; then
   echo
