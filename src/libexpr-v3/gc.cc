@@ -101,8 +101,8 @@ ScavengeBuffers & threadScavengeBuffers() noexcept
 /// Per-scavenge state — references into the thread-local
 /// `ScavengeBuffers` above so we don't allocate fresh containers
 /// on every call.  Lifetime is bounded by `scavengeNursery`.
-// Phase D Step 7 gate — process-wide.  When set, scavenger's fwd*()
-// helpers SKIP queueing originally-tenured pointers for the
+// Phase D Step 7 gate — process-wide.  When ACTIVE, scavenger's
+// fwd*() helpers SKIP queueing originally-tenured pointers for the
 // transitive walk.  Newly-forwarded copies (nursery → tenured) still
 // get queued so their fields' nursery pointers can be located and
 // forwarded.
@@ -114,20 +114,26 @@ ScavengeBuffers & threadScavengeBuffers() noexcept
 // nursery edge that the original Phase C transitive walk would have
 // found.
 //
-// Workflow: enable via `NIX_V3_PHASE_D=1` once all barrier coverage
-// has been validated (under STRESS=10/100/1000 + `--brute`).  Default
-// OFF; promote to default after multi-day stress runs without LIVE
-// BRUTE / AUDIT hits.  See `lode/NURSERY_PHASE_D_DECISION_2026-05-21.md`
-// §4 step 7 for the activation criterion.
+// 2026-05-21: promoted to DEFAULT-ON after `NIX_V3_PHASE_D=1` +
+// STRESS=1000 validation showed 15/15 PASS across synthetic +
+// nixpkgs workloads through firefox.name (see commit 780e419bf for
+// the milestone).  Opt out via `NIX_V3_NO_PHASE_D=1` if Phase C's
+// blanket walk is preferred for diagnostic comparison or in case a
+// regression appears.
+//
+// Note: this only matters when `NIX_V3_NURSERY=1` (without nursery
+// routing, scavenge never fires).  Production default
+// `NIX_V3_NURSERY=0` keeps Phase D inert.
 //
 // Cached once on first scavenge.  Cheap branch in fwd*() under
-// `__builtin_expect(gate, 0)` so OFF mode is one extra predicted-
-// not-taken branch.
+// `__builtin_expect(gate, 1)` so ON mode is the predicted path.
 inline bool phaseDStep7Active() noexcept
 {
     static const bool s_active = [] {
-        const char * v = std::getenv("NIX_V3_PHASE_D");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        const char * v = std::getenv("NIX_V3_NO_PHASE_D");
+        // Default ON unless explicitly opted out via
+        // NIX_V3_NO_PHASE_D=1.
+        return v == nullptr || v[0] == '\0' || v[0] == '0';
     }();
     return s_active;
 }
@@ -217,7 +223,7 @@ Closure * Scavenger::fwdClosure(Closure * c)
     // transitive walk — the dirty-list mechanism (barriers in
     // v3/barrier.hh) guarantees any nursery edge in this Closure
     // is recorded in dirtyContainers and walked separately.
-    if (__builtin_expect(phaseDStep7Active(), 0)) return c;
+    if (__builtin_expect(phaseDStep7Active(), 1)) return c;
     if (walked.insert(c).second) graylist.push_back({c, GK_CLOSURE});
     return c;
 }
@@ -327,7 +333,7 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
     // ALREADY skip queueing for trivially-no-pointer states; this
     // gate generalises the skip to ALL tenured states once barrier
     // coverage is validated.
-    if (__builtin_expect(phaseDStep7Active(), 0)) return t;
+    if (__builtin_expect(phaseDStep7Active(), 1)) return t;
     if (walked.insert(t).second) graylist.push_back({t, GK_THUNK});
     return t;
 }
@@ -346,7 +352,7 @@ ListVec * Scavenger::fwdList(ListVec * l)
         return static_cast<ListVec *>(dst);
     }
     // Phase D Step 7: skip queueing originally-tenured.  See fwdClosure.
-    if (__builtin_expect(phaseDStep7Active(), 0)) return l;
+    if (__builtin_expect(phaseDStep7Active(), 1)) return l;
     if (walked.insert(l).second) graylist.push_back({l, GK_LIST});
     return l;
 }
@@ -363,7 +369,7 @@ Bindings * Scavenger::fwdBindings(Bindings * b)
     // through `bindingsSetValue` which records dirty-list entries
     // for inter-gen edges; the dirty list catches what this walk
     // would have found.
-    if (__builtin_expect(phaseDStep7Active(), 0)) return b;
+    if (__builtin_expect(phaseDStep7Active(), 1)) return b;
     if (walked.insert(b).second) graylist.push_back({b, GK_BINDINGS});
     return b;
 }
@@ -382,7 +388,7 @@ ValuePair * Scavenger::fwdPair(ValuePair * p)
         && isLeafTag(p->evaluated.tag())) return p;
     // Phase D Step 7: same gate as the other fwd*().  Pair evaluated
     // writes go through `pairSetEvaluated`; the dirty list catches.
-    if (__builtin_expect(phaseDStep7Active(), 0)) return p;
+    if (__builtin_expect(phaseDStep7Active(), 1)) return p;
     if (walked.insert(p).second) graylist.push_back({p, GK_PAIR});
     return p;
 }
