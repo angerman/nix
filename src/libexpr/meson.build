@@ -95,12 +95,9 @@ cpuid = dependency('libcpuid', 'cpuid', required : false)
 configdata_priv.set('HAVE_LIBCPUID', cpuid.found().to_int())
 deps_private += cpuid
 
-# bytecode-disk-cache.cc uses sqlite3 directly for BLOB column reads
-# (the libnixstore SQLiteStmt::Use API exposes only TEXT/INT/blob-bind
-# but no blob-fetch helper).  Direct sqlite3 usage requires the
-# library on this target's link line.
-sqlite = dependency('sqlite3', 'sqlite', version : '>=3.6.19')
-deps_private += sqlite
+# sqlite3 dependency retired 2026-05-21 (#735) — only bytecode-disk-
+# cache.cc (VM v2 persistent cache) needed direct sqlite access; v3
+# uses libnixstore's SQLiteStmt API through nix::v3::disk_cache.
 
 config_priv_h = configure_file(
   configuration : configdata_priv,
@@ -164,15 +161,8 @@ endforeach
 sources = files(
   'attr-path.cc',
   'attr-set.cc',
-  'bytecode.cc',
-  'bytecode-compiler.cc',
-  'bytecode-disasm.cc',
-  'bytecode-disk-cache.cc',
-  'bytecode-serialize.cc',
-  'bytecode-thunk.cc',
-  'ir.cc',
-  'ir-emit.cc',
-  'vm.cc',
+  # VM v2 sources (bytecode-*, ir.cc, ir-emit.cc, vm.cc) retired
+  # 2026-05-21 (#735).  V3 evaluator lives in src/libexpr-v3/.
   'diagnose.cc',
   'eval-cache.cc',
   'eval-error.cc',

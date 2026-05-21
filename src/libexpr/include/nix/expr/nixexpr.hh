@@ -140,19 +140,9 @@ struct Expr
 
     static Counter nrExprs;
 
-    /// Set by ExprBytecodeThunk to avoid dynamic_cast in OP_FORCE hot path.
-    bool isBytecodeThunk = false;
-
-    /// Set by ExprLambdaBytecode to avoid dynamic_cast in OP_CALL_1 hot path.
-    /// When true, the ExprLambda* can be static_cast'd to ExprLambdaBytecode*.
-    bool isBytecodeProxy = false;
-
-    /// Set by libnixexprv3 when this Expr* has been registered in v3's
-    /// sub-Expr cache (CO-3).  Lets `EvalState::forceValue` skip the
-    /// hash-map lookup entirely when false — the vast majority of
-    /// thunked Exprs are not in v3's cache, so this flag turns 218k
-    /// cache misses on hello.name into 218k branch-predictable noops.
-    bool isV3CacheCandidate = false;
+    // (isBytecodeThunk / isBytecodeProxy / isV3CacheCandidate flags
+    // retired 2026-05-21 with the VM v2 evaluator — there are no
+    // remaining setters or readers in active code.)
 
     Expr()
     {

@@ -71,12 +71,6 @@ enum RepairFlag : bool;
 struct MemorySourceAccessor;
 struct MountedSourceAccessor;
 
-namespace bytecode {
-struct VMState;
-struct CompilationUnit;
-class BytecodeDiskCache;
-} // namespace bytecode
-
 namespace eval_cache {
 class EvalCache;
 }
@@ -391,56 +385,6 @@ public:
     PosTable positions;
 
     EvalMemory mem;
-
-    /// Bytecode VM state.  Lazily initialized on first bytecode execution.
-    /// Holds the value stack and call frame stack.  Declared as unique_ptr
-    /// to avoid pulling in vm.hh here.
-    std::unique_ptr<bytecode::VMState> vmState;
-
-    /// Cache of compiled bytecode keyed by Expr*.
-    std::unordered_map<Expr *, bytecode::CompilationUnit *> bytecodeCache;
-
-    /// Mapping from ExprLambda* to bytecoded body info.
-    /// Registered by OP_MAKE_CLOSURE; looked up by OP_CALL_1 trampoline.
-    /// Key: the ExprLambda* stored in the closure (unique per parse).
-    struct BytecodedBody {
-        bytecode::CompilationUnit * unit;
-        uint32_t thunkIdx;         ///< Body thunk (after prologue) for ExprBytecodeThunk
-        uint32_t prologueOffset;   ///< Code offset for formals-binding prologue (OP_CALL_1)
-    };
-    std::unordered_map<ExprLambda *, BytecodedBody> lambdaBodyCache;
-
-    /// Bytecode phase timing counters (microseconds).
-    uint64_t bytecodeCompileTimeUs = 0;
-    uint64_t bytecodeExecTimeUs = 0;
-    uint64_t nrBytecodeCompileCacheHits = 0;
-    uint64_t nrBytecodeCompileCacheMisses = 0;
-
-    /// Persistent (disk) bytecode cache (Phase 3.2-7).
-    /// Constructed lazily on first cache-miss when NIX_BYTECODE_DISK_CACHE=1.
-    std::unique_ptr<bytecode::BytecodeDiskCache> bytecodeDiskCache;
-    uint64_t nrBytecodeDiskCacheHits = 0;
-    uint64_t nrBytecodeDiskCacheMisses = 0;
-    uint64_t nrBytecodeDiskCacheInserts = 0;
-    uint64_t nrBytecodeDiskCacheSkipped = 0;
-    uint64_t nrBytecodeDiskCacheCorrupt = 0;
-
-    /// Detailed per-phase compile-time breakdown (microseconds).
-    /// Populated when NIX_VM_V2=1 and NIX_VM_COMPILE_PROFILE=1.
-    uint64_t compileLowerUs = 0;
-    uint64_t compileFreeVarsUs = 0;
-    uint64_t compileStrictnessUs = 0;
-    uint64_t compileEmitUs = 0;
-    uint64_t compilePreallocUs = 0;
-
-    /// Cumulative work-unit counters across all compilations.
-    uint64_t cuTotalBlocks = 0;
-    uint64_t cuTotalBindings = 0;
-    uint64_t cuTotalVarIds = 0;
-    uint64_t cuTotalThunks = 0;
-    uint64_t cuTotalLambdas = 0;
-    uint64_t cuTotalSymbols = 0;
-    uint64_t cuTotalInstructions = 0;
 
     /**
      * If set, force copying files to the Nix store even if they

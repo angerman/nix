@@ -10,14 +10,8 @@ config_pub_h = configure_file(
 headers = [ config_pub_h ] + files(
   'attr-path.hh',
   'attr-set.hh',
-  'bytecode.hh',
-  'bytecode-compiler.hh',
-  'bytecode-disk-cache.hh',
-  'bytecode-serialize.hh',
-  'bytecode-thunk.hh',
-  'ir.hh',
-  'ir-emit.hh',
-  'vm.hh',
+  # bytecode-*, ir, ir-emit, vm headers retired 2026-05-21 (#735)
+  # along with the VM v2 evaluator.
   'counter.hh',
   'diagnose.hh',
   'eval-cache.hh',
@@ -32,7 +26,6 @@ headers = [ config_pub_h ] + files(
   'gc-small-vector.hh',
   'get-drvs.hh',
   'json-to-value.hh',
-  'nix-word.hh',
   'nixexpr.hh',
   'parser-state.hh',
   'primops.hh',

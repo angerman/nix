@@ -47,7 +47,7 @@ config_priv_h = configure_file(
 subdir('nix-meson-build-support/common')
 
 sources = files(
-  'bytecode-vm.cc',
+  # bytecode-vm.cc retired 2026-05-21 (#735) along with VM v2.
   'derived-path.cc',
   'error_traces.cc',
   'eval.cc',

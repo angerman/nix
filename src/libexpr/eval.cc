@@ -1,12 +1,4 @@
 #include "nix/expr/eval.hh"
-#include "nix/expr/vm.hh"
-#include "nix/expr/bytecode.hh"
-#include "nix/expr/bytecode-compiler.hh"
-#include "nix/expr/bytecode-disk-cache.hh"
-#include "nix/expr/bytecode-serialize.hh"
-#include "nix/expr/bytecode-thunk.hh"
-#include "nix/expr/ir.hh"
-#include "nix/expr/ir-emit.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/primops.hh"
@@ -224,11 +216,6 @@ bool Value::isTrivial() const
 
     // Check the thunk's expression type.
     auto * expr = thunk().expr;
-
-    // For bytecoded thunks, check the original expression type stored
-    // in the ThunkDescriptor.
-    if (auto * bcThunk = dynamic_cast<ExprBytecodeThunk *>(expr))
-        expr = bcThunk->unit->thunks[bcThunk->thunkIdx].sourceExpr;
 
     return (dynamic_cast<ExprAttrs *>(expr) && ((ExprAttrs *) expr)->dynamicAttrs->empty())
         || dynamic_cast<ExprLambda *>(expr)
@@ -1223,187 +1210,11 @@ void EvalState::resetFileCache()
 
 void EvalState::eval(Expr * e, Value & v)
 {
-    // When NIX_VM_V2=1 is set, use the v2 IR pipeline:
-    //   AST -> IR (lower) -> bytecode (emitFromIR) -> vmExec.
-    // This is the new upvalue-based compilation path.
-    static bool useVMv2 = getEnv("NIX_VM_V2").value_or("") == "1";
-    static bool profileCompile = getEnv("NIX_VM_COMPILE_PROFILE").value_or("") == "1";
-    static bool useDiskCache = getEnv("NIX_BYTECODE_DISK_CACHE").value_or("") == "1";
-    if (useVMv2) {
-        auto it = bytecodeCache.find(e);
-        bytecode::CompilationUnit * unit;
-        if (it != bytecodeCache.end()) {
-            unit = it->second;
-            nrBytecodeCompileCacheHits++;
-        } else {
-            nrBytecodeCompileCacheMisses++;
-
-            // Phase 3.2-7: try disk cache before recompiling.
-            //
-            // Cache key derives from the SourcePath of the Expr's
-            // origin file.  Only AST nodes parsed from real files are
-            // cacheable; string-evaluated expressions (parseExprFromString)
-            // pass nullptr for sourcePath.  We extract the SourcePath
-            // via Pos::Origin lookup on the Expr's first PosIdx.
-            std::optional<bytecode::CacheKey> diskKey;
-            if (useDiskCache) {
-                PosIdx exprPos = e->getPos();
-                if (exprPos != noPos) {
-                    auto origin = positions.originOf(exprPos);
-                    if (auto * sp = std::get_if<SourcePath>(&origin)) {
-                        auto key = bytecode::computeCacheKey(*sp);
-                        if (!key.empty()) {
-                            diskKey = key;
-                            // Lazily construct the disk cache once per
-                            // EvalState (open the SQLite db).
-                            if (!bytecodeDiskCache)
-                                bytecodeDiskCache =
-                                    std::make_unique<bytecode::BytecodeDiskCache>();
-                            // M8: zero-copy lookup via consumer callback.
-                            // Skips a std::string copy of the SQLite blob;
-                            // deserializer reads directly from the locked
-                            // statement's blob view.
-                            bool corruptOrMissed = false;
-                            bool found = bytecodeDiskCache->lookupView(key,
-                                [&](std::string_view blob) {
-                                    try {
-                                        unit = bytecode::deserializeCU(blob, *this);
-                                    } catch (bytecode::SerializationError &) {
-                                        nrBytecodeDiskCacheCorrupt++;
-                                        unit = nullptr;
-                                        corruptOrMissed = true;
-                                    }
-                                });
-                            if (found && unit) {
-                                nrBytecodeDiskCacheHits++;
-                                bytecodeCache[e] = unit;
-                                auto tx0 = std::chrono::steady_clock::now();
-                                bytecode::vmExec(*this, *unit, 0, baseEnv, v);
-                                auto tx1 = std::chrono::steady_clock::now();
-                                bytecodeExecTimeUs += std::chrono::duration_cast<
-                                    std::chrono::microseconds>(tx1 - tx0).count();
-                                return;
-                            } else if (!found) {
-                                nrBytecodeDiskCacheMisses++;
-                            }
-                            // Corrupt entry: fall through to recompile.
-                        }
-                    }
-                }
-            }
-
-            // Optional fine-grained per-phase profiling.  When enabled,
-            // wraps lower() and emitFromIR() with thread-local observers
-            // that record core/freevars/strictness/emit/prealloc timings
-            // separately.  Adds <1us bookkeeping overhead per call.
-            ir::LowerPhaseTiming lpt;
-            bytecode::EmitPhaseTiming ept;
-            ir::LowerPhaseTiming * prevL = ir::lowerPhaseTiming;
-            bytecode::EmitPhaseTiming * prevE = bytecode::emitPhaseTiming;
-            if (profileCompile) {
-                ir::lowerPhaseTiming = &lpt;
-                bytecode::emitPhaseTiming = &ept;
-            }
-
-            auto t0 = std::chrono::steady_clock::now();
-            auto mod = ir::lower(*this, e);
-            auto tEmit0 = std::chrono::steady_clock::now();
-            unit = bytecode::emitFromIR(*this, mod);
-            auto t1 = std::chrono::steady_clock::now();
-            bytecodeCompileTimeUs += std::chrono::duration_cast<
-                std::chrono::microseconds>(t1 - t0).count();
-
-            // Phase 3.1f-1: Pin the IRModule to the CU when lazy
-            // body emission is enabled.  Without this the module is
-            // dropped at end-of-eval() and deferred bodies have
-            // nothing to re-emit from.  Default off — opt-in via
-            // NIX_VM_V2_LAZY_EMIT=1.
-            static bool lazyEmit =
-                getEnv("NIX_VM_V2_LAZY_EMIT").value_or("") == "1";
-            if (lazyEmit) {
-                unit->irModule = std::make_unique<ir::IRModule>(std::move(mod));
-            }
-
-            if (profileCompile) {
-                ir::lowerPhaseTiming = prevL;
-                bytecode::emitPhaseTiming = prevE;
-                compileLowerUs       += lpt.lowerCoreUs;
-                compileFreeVarsUs    += lpt.freeVarsUs + lpt.freeVarsRecomputeUs;
-                compileStrictnessUs  += lpt.strictnessUs;
-                compileEmitUs        += ept.emitCoreUs;
-                compilePreallocUs    += ept.preallocThunksUs + ept.preallocLambdasUs;
-                cuTotalBlocks        += lpt.numBlocks;
-                cuTotalBindings      += lpt.numBindings;
-                cuTotalVarIds        += lpt.numVarIds;
-                cuTotalThunks        += lpt.numThunks;
-                cuTotalLambdas       += lpt.numLambdas;
-                cuTotalInstructions  += ept.numInstructions;
-                (void)tEmit0; // currently unused; kept for future split
-            }
-            bytecodeCache[e] = unit;
-
-            // Phase 3.2-7: store in disk cache on miss.  Only if a key
-            // was derived AND the unit is cacheable.
-            if (diskKey && bytecode::isCacheable(*unit)) {
-                try {
-                    auto blob = bytecode::serializeCU(*unit, *this);
-                    PosIdx exprPos = e->getPos();
-                    std::string srcPath;
-                    if (exprPos != noPos) {
-                        auto origin = positions.originOf(exprPos);
-                        if (auto * sp = std::get_if<SourcePath>(&origin))
-                            srcPath = sp->path.abs();
-                    }
-                    bytecodeDiskCache->insert(*diskKey, blob, srcPath);
-                    nrBytecodeDiskCacheInserts++;
-                    // Periodic LRU sweep — cheap (counter-only on
-                    // most calls; full sweep at NIX_BYTECODE_CACHE_-
-                    // EVICT_INTERVAL = 1000 default).
-                    bytecodeDiskCache->maybeEvict();
-                } catch (bytecode::SerializationError &) {
-                    // Skip caching for this unit; proceed normally.
-                    nrBytecodeDiskCacheSkipped++;
-                }
-            } else if (diskKey) {
-                nrBytecodeDiskCacheSkipped++;
-            }
-        }
-
-        auto t0 = std::chrono::steady_clock::now();
-        bytecode::vmExec(*this, *unit, 0, baseEnv, v);
-        auto t1 = std::chrono::steady_clock::now();
-        bytecodeExecTimeUs += std::chrono::duration_cast<
-            std::chrono::microseconds>(t1 - t0).count();
-        return;
-    }
-
-    // When NIX_EVAL_BYTECODE=1 is set, compile to bytecode and execute
-    // via the v1 VM (env-chain based) instead of tree-walking.
-    static bool useBytecode = getEnv("NIX_EVAL_BYTECODE").value_or("") == "1";
-    if (useBytecode) {
-        auto it = bytecodeCache.find(e);
-        bytecode::CompilationUnit * unit;
-        if (it != bytecodeCache.end()) {
-            unit = it->second;
-            nrBytecodeCompileCacheHits++;
-        } else {
-            nrBytecodeCompileCacheMisses++;
-            auto t0 = std::chrono::steady_clock::now();
-            unit = bytecode::compile(*this, e);
-            auto t1 = std::chrono::steady_clock::now();
-            bytecodeCompileTimeUs += std::chrono::duration_cast<
-                std::chrono::microseconds>(t1 - t0).count();
-            bytecodeCache[e] = unit;
-        }
-
-        auto t0 = std::chrono::steady_clock::now();
-        bytecode::vmExec(*this, *unit, 0, baseEnv, v);
-        auto t1 = std::chrono::steady_clock::now();
-        bytecodeExecTimeUs += std::chrono::duration_cast<
-            std::chrono::microseconds>(t1 - t0).count();
-        return;
-    }
-
+    // VM v2 (NIX_VM_V2 / NIX_EVAL_BYTECODE / NIX_BYTECODE_DISK_CACHE)
+    // retired 2026-05-21 (#735).  The v3 evaluator is the live VM and
+    // is dispatched via nix::v3::runRootExpr from src/nix/eval.cc when
+    // NIX_V3_DIRECT_EVAL=1.  This entry point now only walks the AST
+    // directly (the cppnix tree-walker default).
     e->eval(*this, baseEnv, v);
 }
 
@@ -1783,41 +1594,8 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 
             ExprLambda & lambda(*vCur.lambda().fun);
 
-            // v2 closures (created by OP_MAKE_CLOSURE_V2) store upvalues
-            // INLINE in env.values[1..1+nUpvalues].  The tree-walker's
-            // env-chain body evaluation would interpret this carrier env
-            // as a normal scope and read garbage.  Intercept here:
-            // re-enter the VM for the v2 closure's body evaluation.
-            if (lambda.isBytecodeProxy) {
-                auto * bcLambda = static_cast<ExprLambdaBytecode *>(&lambda);
-                auto & bodyUnit = *bcLambda->unit;
-                auto & desc = bodyUnit.lambdas[bcLambda->lambdaIdx];
-                auto & thunkDesc = bodyUnit.thunks[desc.bodyThunkIdx];
-                uint32_t startOffset = thunkDesc.codeOffset;
-
-                Value ** upvalues = nullptr;
-                if (desc.nUpvalues > 0 && vCur.lambda().env)
-                    upvalues = &vCur.lambda().env->values[1];
-
-                Value callResult;
-                bytecode::vmExec(*this, bodyUnit, startOffset,
-                    vCur.lambda().env ? *vCur.lambda().env : baseEnv,
-                    callResult, upvalues, args[0]);
-                vCur = callResult;
-
-                // The bytecode VM's OP_RETURN does NOT force its return
-                // value (lazy by default); the tree-walker's lambda body
-                // eval DOES force via ExprVar::eval / ExprSelect::eval /
-                // etc.  callFunction's outer loop dispatches on vCur's
-                // type — a still-thunked vCur trips the "not a function"
-                // error a few iterations later (the recent RCALL1_R bug).
-                // Force here to match the tree-walker contract.
-                if (args.size() > 0)
-                    forceValue(vCur, pos);
-
-                args = args.subspan(1);
-                continue;
-            }
+            // (VM v2 ExprLambdaBytecode trampoline retired 2026-05-21
+            // along with the rest of the V2 evaluator.)
 
             auto size = (!lambda.arg ? 0 : 1) + (lambda.getFormals() ? lambda.getFormals()->formals.size() : 0);
             Env & env2(mem.allocEnv(size));
@@ -2083,8 +1861,8 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                 throw;
             }
             // Force the result so the next iteration of the loop can
-            // dispatch on its type.  The recursive callFunction may have
-            // taken the bytecoded v2 path which doesn't force its return.
+            // dispatch on its type.  (V2-related forcing rationale
+            // retired 2026-05-21 with the V2 evaluator.)
             if (args.size() > 1)
                 forceValue(vCur, pos);
             args = args.subspan(1);
@@ -3507,35 +3285,8 @@ void EvalState::printStatistics()
     topObj["nrPrimOpCalls"] = nrPrimOpCalls.load();
     topObj["nrFunctionCalls"] = nrFunctionCalls.load();
 
-    // Bytecode phase timings (only present when bytecode was used).
-    if (bytecodeCompileTimeUs > 0 || bytecodeExecTimeUs > 0) {
-        topObj["bytecode"] = {
-            {"compileTimeUs", bytecodeCompileTimeUs},
-            {"execTimeUs", bytecodeExecTimeUs},
-            {"compileCacheHits", nrBytecodeCompileCacheHits},
-            {"compileCacheMisses", nrBytecodeCompileCacheMisses},
-        };
-
-        // Detailed per-phase compile-time breakdown (NIX_VM_COMPILE_PROFILE=1).
-        if (compileLowerUs + compileFreeVarsUs + compileEmitUs > 0) {
-            topObj["bytecode"]["compilePhases"] = {
-                {"lowerCoreUs",   compileLowerUs},
-                {"freeVarsUs",    compileFreeVarsUs},
-                {"strictnessUs",  compileStrictnessUs},
-                {"emitUs",        compileEmitUs},
-                {"preallocUs",    compilePreallocUs},
-            };
-            topObj["bytecode"]["compileWorkUnits"] = {
-                {"blocks",       cuTotalBlocks},
-                {"bindings",     cuTotalBindings},
-                {"varIds",       cuTotalVarIds},
-                {"thunks",       cuTotalThunks},
-                {"lambdas",      cuTotalLambdas},
-                {"symbols",      symbols.size()},
-                {"instructions", cuTotalInstructions},
-            };
-        }
-    }
+    // (VM v2 bytecode phase timings + work-unit counters retired
+    // 2026-05-21 with the V2 evaluator itself.)
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
         {"heapSize", heapSize},
