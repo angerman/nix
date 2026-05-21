@@ -93,7 +93,52 @@ v3-direct bindings-attr: 16 distinct origins, 33422 total allocs,
 Same shape on a different workload — mergeBindings dominance is
 not a hello.drvPath artifact.
 
-## Secondary finding — mergeBindings over-allocation slack
+## CORRECTION (2026-05-21 follow-on)
+
+The "Secondary finding" below INITIALLY attributed the 387 MB gap
+to `mergeBindings` over-allocation.  That attribution was WRONG —
+falsified by post-fix measurement.
+
+After landing the mergeBindings two-pass fix (`5e0c06e5d`,
+**#747**), `bytesBindings` dropped only 0.6 MB (807.1 → 806.5).
+The dedup ratio on real `prev // overlay` patterns in nixpkgs is
+essentially zero — overlays add NEW keys, rarely override.
+
+The real slack lives in **primIntersectAttrs** (`primops.cc:1749`):
+1664 calls allocated 386.3 MB but kept only 0.1 MB live — 100%
+slack.  `builtins.intersectAttrs builtins x`-style patterns
+allocate `src->size` (thousands of entries) but keep only a
+handful (the few names in `keep`).  primRemoveAttrs had a smaller
+17.4% slack contribution (1.2 MB → 1.0 MB).
+
+The diagnostic refinement that revealed this (`6321ea0e5`) added
+per-origin alloc-time vs dump-time bytes side by side in the
+rollup.  Without that side-by-side view, the wrong site looked
+like the lever from the aggregate counter comparison alone.
+
+**Headline result after `#750` (`96aa6331c`):**
+
+| metric          | before     | after      | delta              |
+|-----------------|-----------|-----------|---------------------|
+| bytesBindings   | 807.1 MB  | 420.2 MB  | **-386.9 MB (-48%)**|
+| v3_arena        | 989.9 MB  | 604.0 MB  | **-385.9 MB (-39%)**|
+| total_alloc     | 959.6 MB  | 573.2 MB  | **-386.4 MB (-40%)**|
+| peak_rss        | 2183 MB   | 1934.9 MB | **-248 MB (-11%)**  |
+
+Post-fix attribution shows ALL 19 origins at 0.0% slack.
+
+**Operating rule** (codified going forward): per-allocation-site
+attribution must show alloc-time AND dump-time bytes side by
+side.  Comparing rollup totals vs aggregate counters is necessary
+but NOT sufficient — without per-origin breakdown the wrong site
+will look like the lever.
+
+The original section below is preserved as a Rule-0-history
+record.  The CORRECT story is in the CORRECTION above.
+
+---
+
+## Secondary finding — mergeBindings over-allocation slack (FALSIFIED — see correction above)
 
 `bytesBindings` total = 807 MB.  My rollup tracked 420 MB.  The 387
 MB gap is real and identifiable:
