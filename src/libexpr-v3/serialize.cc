@@ -64,6 +64,19 @@ struct Reader {
         pos += n;
         return s;
     }
+    // #777 (2026-05-23) zero-copy variant: returns a view into the
+    // input blob.  Caller MUST consume the view before the blob
+    // outlives — safe for sections used only for lookup (interning
+    // SymbolIds, resolving primop names by string).  Saves a malloc
+    // + memcpy per call vs. str().
+    std::string_view strv() {
+        uint32_t n = u32();
+        if (pos + n > buf.size())
+            throw SerializationError("v3 deserialize: truncated string");
+        std::string_view s(buf.data() + pos, n);
+        pos += n;
+        return s;
+    }
 };
 
 } // namespace
@@ -485,11 +498,23 @@ CompilationUnit deserializeCU(std::string_view blob)
         for (uint32_t i = 0; i < n; ++i) cu.stringConstants.push_back(r.str());
     }
 
-    // Section: symbolTable.
+    // Section: symbolTable.  #777 (2026-05-23): intern directly from
+    // the blob's bytes without materialising std::strings.  Audit
+    // shows cu.symbolTable is unused post-remap (cleared at end);
+    // its only consumer is the remap table built below.  Building
+    // that table by interning string_view ↦ SymbolId saves N malloc+
+    // memcpy pairs on hello.drvPath that previously dominated the
+    // deserialize cost.
+    std::vector<uint32_t> remap;
     {
         uint32_t n = r.u32();
-        cu.symbolTable.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) cu.symbolTable.push_back(r.str());
+        remap.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            std::string_view name = r.strv();
+            remap.push_back(name.empty()
+                ? uint32_t{0}
+                : ir::globalInternSymbol(name));
+        }
     }
 
     // Section: lambdas.
@@ -534,12 +559,14 @@ CompilationUnit deserializeCU(std::string_view blob)
         r.readBytes(cu.lambdaCodeOffsets.data(), n * sizeof(uint32_t));
     }
 
-    // Section: primops (resolve by name).
+    // Section: primops (resolve by name).  #777 (2026-05-23): zero-
+    // copy lookup — findPrimOp() accepts string_view, so no need to
+    // materialise a std::string per primop.
     {
         uint32_t n = r.u32();
         cu.primops.reserve(n);
         for (uint32_t i = 0; i < n; ++i) {
-            std::string name = r.str();
+            std::string_view name = r.strv();
             if (name.empty()) {
                 throw SerializationError(
                     "v3 deserialize: primop slot has empty name");
@@ -547,7 +574,8 @@ CompilationUnit deserializeCU(std::string_view blob)
             const PrimOp * po = findPrimOp(name);
             if (!po) {
                 throw SerializationError(
-                    "v3 deserialize: unknown primop '" + name + "'");
+                    "v3 deserialize: unknown primop '"
+                    + std::string(name) + "'");
             }
             cu.primops.push_back(po);
         }
@@ -566,39 +594,24 @@ CompilationUnit deserializeCU(std::string_view blob)
         throw SerializationError(
             "v3 deserialize: trailing bytes after end-of-stream");
 
-    // SymbolId remapping.  At serialize time, cu.symbolTable was a
-    // snapshot of the global table (cu.symbolTable[i] == name of
-    // global SymbolId i).  At deserialize, the global table may
-    // have a different layout — we re-resolve every name through
-    // globalInternSymbol() and walk the bytecode + lambdas to
-    // rewrite stale SymbolIds.
-    std::vector<uint32_t> remap;
-    remap.reserve(cu.symbolTable.size());
-    for (auto & name : cu.symbolTable) {
-        remap.push_back(name.empty()
-            ? uint32_t{0}  // sentinel for ""
-            : ir::globalInternSymbol(name));
-    }
+    // SymbolId remapping.  At serialize time, the symbolTable was a
+    // snapshot of the global table (entry i == name of global
+    // SymbolId i).  The remap table above was built directly from
+    // string_views into the blob — no intermediate std::strings
+    // materialised.  Walk the bytecode + lambdas to rewrite stale
+    // SymbolIds.
     remapSymbolsInBytecode(cu, remap);
     for (auto & l : cu.lambdas) {
         for (auto & f : l.formals) {
             if (f.name < remap.size()) f.name = remap[f.name];
         }
     }
-    // #770b/#770c (2026-05-22): drop the post-remap copy of
-    // ir::globalSymbolTable() into cu.symbolTable.  Audit
-    // (grep for cu.symbolTable[) shows ZERO callers index into
-    // this field after deserialize — every VM-side SymbolId
-    // lookup goes through ir::globalSymbolTable() directly
-    // (vm.cc:905, 1262, 1357, 1597, etc.).  The copy was
-    // defensive against a hypothetical future consumer that
-    // never materialised; on hello.drvPath it ran 269 times at
-    // ~1.7 ms each = ~460 ms = the dominant per-import disk-
-    // cache overhead.  Clear the now-unused remap-source data;
-    // serialize() will repopulate from globalSymbolTable on the
-    // way back out if this CU is ever re-cached.
-    cu.symbolTable.clear();
-    cu.symbolTable.shrink_to_fit();
+    // #770b/#770c (2026-05-22): cu.symbolTable was already kept
+    // empty (we never populated it on deserialize; the section is
+    // consumed directly into the remap table by zero-copy interning).
+    // Every VM-side SymbolId lookup goes through ir::globalSymbolTable()
+    // directly (vm.cc:905, 1262, 1357, 1597, etc.).  No clear/
+    // shrink_to_fit needed.
 
     return cu;
 }
