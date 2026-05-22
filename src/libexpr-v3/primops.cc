@@ -22,6 +22,7 @@
 
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/import_timing.hh"  // #769 per-import phase timing
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
 #include "v3/lower.hh"
 #include "v3/vm.hh"
@@ -7346,6 +7347,16 @@ void primImport(EvalState & state, Value * args, Value & out)
     static const bool s_dbg_import =
         std::getenv("V3_DBG_IMPORT") != nullptr;
 
+    // #769 per-phase timing (V3_TIMING-gated; zero overhead when off).
+    using ImpClock = std::chrono::steady_clock;
+    static const bool s_impTimingEn = importTimingEnabled();
+    auto impStamp = []() { return ImpClock::now(); };
+    auto impBumpNs = [&](uint64_t & accum, ImpClock::time_point start) {
+        if (!s_impTimingEn) return;
+        accum += static_cast<uint64_t>(std::chrono::duration_cast<
+            std::chrono::nanoseconds>(ImpClock::now() - start).count());
+    };
+
     auto & cache = importCache();
     if (auto it = cache.results.find(path); it != cache.results.end()) {
         // REVIEW §2.5: validate stat (mtime, size) hasn't changed
@@ -7358,6 +7369,7 @@ void primImport(EvalState & state, Value * args, Value & out)
                 std::fprintf(stderr, "v3 IMPORT-HIT[%llu]: %s\n",
                     (unsigned long long)seqHit.fetch_add(1), path.c_str());
             }
+            if (s_impTimingEn) ++importTimingTotals().resultCacheHits;
             out = it->second.result;
             return;
         }
@@ -7411,6 +7423,7 @@ void primImport(EvalState & state, Value * args, Value & out)
     // rather than the raw user input.  Without this the cache key
     // skipped invalidation on `dir/default.nix` rewriting (the raw
     // `path` for a directory import points at a non-file).
+    auto tParse = impStamp();
     nix::Expr * e = nullptr;
     nix::SourcePath resolvedSp{ns.rootFS, nix::CanonPath::root};
     bool haveResolved = false;
@@ -7432,6 +7445,7 @@ void primImport(EvalState & state, Value * args, Value & out)
         e = ns.parseExprFromFile(cp);
     }
     e->bindVars(ns, ns.staticBaseEnv);
+    impBumpNs(importTimingTotals().parseNs, tParse);
 
     // VM-4: try the disk cache before lower+compile.  primImport is
     // the ideal integration point — direct access to source path
@@ -7461,10 +7475,16 @@ void primImport(EvalState & state, Value * args, Value & out)
         }
     }
     if (diskCacheEnabled && !diskKey.empty()) {
-        if (auto blob = disk_cache::lookup(diskKey)) {
+        auto tLookup = impStamp();
+        auto blob = disk_cache::lookup(diskKey);
+        impBumpNs(importTimingTotals().diskLookupNs, tLookup);
+        if (blob) {
             try {
                 cache.cus.push_back(serialize::deserializeCU(*blob));
+                auto tRun = impStamp();
                 out = run(cache.cus.back());
+                impBumpNs(importTimingTotals().runNs, tRun);
+                if (s_impTimingEn) ++importTimingTotals().diskCacheHits;
                 auto [mt, sz] = importStat(path);
                 cache.results.emplace(path,
                     ImportCacheEntry{out, mt, sz});
@@ -7501,27 +7521,36 @@ void primImport(EvalState & state, Value * args, Value & out)
         "v3 IMPORT-PHASE before-lower RSS=%lluMB: %s\n",
         (unsigned long long)rssMBImp(), path.c_str());
     {
+        if (s_impTimingEn) ++importTimingTotals().calls;
+        auto tLower = impStamp();
         auto module = lowerNixExpr(e, ns.symbols, ns.positions);
+        impBumpNs(importTimingTotals().lowerNs, tLower);
         if (s_dbg_import) std::fprintf(stderr,
             "v3 IMPORT-PHASE after-lower RSS=%lluMB: %s\n",
             (unsigned long long)rssMBImp(), path.c_str());
+        auto tOpt = impStamp();
         nix::v3::ir::optimise(module);
         if (s_dbg_import) std::fprintf(stderr,
             "v3 IMPORT-PHASE after-optimise RSS=%lluMB: %s\n",
             (unsigned long long)rssMBImp(), path.c_str());
         nix::v3::ir::computeFreeVars(module);
+        impBumpNs(importTimingTotals().optimiseNs, tOpt);
         if (s_dbg_import) std::fprintf(stderr,
             "v3 IMPORT-PHASE after-freeVars RSS=%lluMB: %s\n",
             (unsigned long long)rssMBImp(), path.c_str());
+        auto tCompile = impStamp();
         cache.cus.push_back(compile(module));
+        impBumpNs(importTimingTotals().compileNs, tCompile);
         if (s_dbg_import) std::fprintf(stderr,
             "v3 IMPORT-PHASE after-compile RSS=%lluMB: %s\n",
             (unsigned long long)rssMBImp(), path.c_str());
         if (diskCacheEnabled && !diskKey.empty()
             && serialize::isCacheable(cache.cus.back())) {
             try {
+                auto tInsert = impStamp();
                 std::string blob = serialize::serializeCU(cache.cus.back());
                 disk_cache::insert(diskKey, blob);
+                impBumpNs(importTimingTotals().diskInsertNs, tInsert);
             } catch (...) { /* best-effort */ }
         }
         // `module` destructed here, freeing all IR-side vectors
@@ -7533,7 +7562,9 @@ void primImport(EvalState & state, Value * args, Value & out)
     // Each imported file is its own CompilationUnit; we re-enter the
     // VM to run it with its own top-level frame.  Keep the CU alive
     // (it's borrowed by closures returned from the eval).
+    auto tRun = impStamp();
     out = run(cache.cus.back());
+    impBumpNs(importTimingTotals().runNs, tRun);
     {
         auto [mt, sz] = importStat(path);
         cache.results.emplace(path, ImportCacheEntry{out, mt, sz});
@@ -9448,6 +9479,22 @@ BridgeStats & bridgeStats(BridgeKind k)
 bool bridgeTimingEnabled()
 {
     static const bool e = std::getenv("NIX_V3_BRIDGE_TIMING") != nullptr;
+    return e;
+}
+
+// #769 (2026-05-22) — primImport per-phase timing.  See
+// `include/v3/import_timing.hh` for the rationale.  Definitions live
+// here next to the bridge-timing precedent so they share the
+// V3_TIMING-gated style.
+ImportTimingTotals & importTimingTotals() noexcept
+{
+    static ImportTimingTotals t;
+    return t;
+}
+
+bool importTimingEnabled() noexcept
+{
+    static const bool e = std::getenv("V3_TIMING") != nullptr;
     return e;
 }
 

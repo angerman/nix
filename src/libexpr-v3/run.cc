@@ -15,6 +15,7 @@
 #include "v3/ir.hh"
 #include "v3/alloc.hh"
 #include "v3/bytecode_primops.hh"
+#include "v3/import_timing.hh"  // #769 per-import phase totals
 #include "v3/limits.hh"
 #include "v3/nursery.hh"
 #include "v3/barrier.hh"
@@ -77,6 +78,30 @@ struct PhaseTimer {
         // breakdown so we can see WHERE the TW time goes.
         if (bridgeTimingEnabled())
             dumpBridgeTelemetry(stderr);
+        // #769: per-import phase breakdown — splits the outer `run`
+        // bucket into work done inside primImport recursions.  Cheap
+        // (a handful of uint64_t accumulators bumped under the V3_TIMING
+        // gate).
+        const auto & it = importTimingTotals();
+        if (it.calls + it.resultCacheHits + it.contentCacheHits + it.diskCacheHits > 0) {
+            std::fprintf(stderr,
+                "v3-direct import timing (ms): calls=%llu (compile %.3f, miss path) | "
+                "cacheHits result=%llu content=%llu disk=%llu | "
+                "parse=%.3f lower=%.3f optimise=%.3f compile=%.3f "
+                "run=%.3f diskLookup=%.3f diskInsert=%.3f\n",
+                (unsigned long long)it.calls,
+                (it.parseNs + it.lowerNs + it.optimiseNs + it.compileNs) / 1e6,
+                (unsigned long long)it.resultCacheHits,
+                (unsigned long long)it.contentCacheHits,
+                (unsigned long long)it.diskCacheHits,
+                it.parseNs    / 1e6,
+                it.lowerNs    / 1e6,
+                it.optimiseNs / 1e6,
+                it.compileNs  / 1e6,
+                it.runNs      / 1e6,
+                it.diskLookupNs / 1e6,
+                it.diskInsertNs / 1e6);
+        }
     }
 private:
     static bool s_active()
