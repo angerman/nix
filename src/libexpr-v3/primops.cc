@@ -33,6 +33,7 @@
 #include <chrono>
 
 #include "nix/expr/eval.hh"
+#include "nix/store/path-references.hh"  // #757c: PathRefScanSink for primReadFile
 
 #include <sys/resource.h>
 #if defined(__APPLE__)
@@ -2261,11 +2262,28 @@ static Value cloneString(const char * s)
     return mkStringValueOwned(std::string(s ? s : ""));
 }
 
-void primUnsafeDiscardStringContext(EvalState &, Value * args, Value & out)
+void primUnsafeDiscardStringContext(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isString()) typeError("unsafeDiscardStringContext", "string");
-    // Allocate a fresh string buffer with no context entry.
-    out = cloneString(args[0].payload.str);
+    // #757c: mirror TW's prim_unsafeDiscardStringContext
+    // (libexpr/primops/context.cc:9-15) which uses `coerceToString`
+    // (NOT forceString) — accepts paths, derivations (via
+    // __toString / outPath), and other coercible values, dropping
+    // any context that the coercion would normally have attached.
+    // Pre-fix v3 rejected non-strings outright, diverging from TW
+    // on haskell-nix's `unsafeDiscardStringContext "${pkgs.X}"`
+    // pattern (where the inside isn't WHNF-string).
+    if (args[0].isString()) {
+        // Fast path: string in → string out, context-stripped.
+        out = cloneString(args[0].payload.str);
+        return;
+    }
+    // Slow path: coerce + drop context.
+    std::vector<std::string> ctx;
+    std::string s = toStringCoerceCtx(state, args[0], ctx,
+                                       /*copyPathsToStore=*/false);
+    out = mkStringValueOwned(std::move(s));
+    // Deliberately do NOT call setStringContextEntries — the whole
+    // point of unsafeDiscardStringContext is to drop context.
 }
 
 void primHasContext(EvalState &, Value * args, Value & out)
@@ -3366,17 +3384,50 @@ void primReadFile(EvalState & state, Value * args, Value & out)
     if (content.find('\0') != std::string::npos)
         throw std::runtime_error("v3 primop readFile: file contains NUL byte");
 
-    out = mkStringValueOwned(std::move(content));
+    out = mkStringValueOwned(content);
 
-    // §1.6: forward string-context.  When `path` was a Path Value with
-    // context (e.g. a `${drv}` interpolation result coerced to path),
-    // the returned string carries that context so downstream uses
-    // mark the original drv as a runtime dep.
-    if (args[0].isString() && args[0].payload.str) {
-        if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
-            std::vector<std::string> copy(raw->begin(), raw->end());
-            setStringContextEntries(out.payload.str, std::move(copy));
-        }
+    // #757c: mirror TW's prim_readFile (libexpr/primops.cc:2237).  TW
+    // attaches context derived from the file's STORE REFERENCES
+    // (filtered to those whose hash actually appears in the content),
+    // NOT from the input path-string's context.  The forwarding
+    // previously here (`copy from input string`) added the input
+    // drv's context to the file content, breaking downstream
+    // `builtins.fromJSON` / `builtins.hashString` / etc. that reject
+    // context-bearing strings.  haskell-nix's lib/spdx/licenses.nix
+    // hit this via `fromJSON (... readFile "${spdx-pkg}/licenses.json")`
+    // — under v3-native callFlake, the spdx-pkg context leaked into
+    // the JSON-string and fromJSON rejected it where TW does not.
+    //
+    // The new logic: if the path is in /nix/store, query its declared
+    // references AND filter via PathRefScanSink (i.e. keep only refs
+    // whose hash physically appears in the content).  Add those as
+    // Opaque context entries.  This matches TW byte-for-byte.
+    if (state.nixEvalState) {
+        auto & ns = *state.nixEvalState;
+        try {
+            if (ns.store->isInStore(path)) {
+                nix::StorePathSet refs;
+                try {
+                    auto [storePath, _sub] = ns.store->toStorePath(path);
+                    refs = ns.store->queryPathInfo(storePath)->references;
+                } catch (const nix::Error &) { /* unknown path; no refs */ }
+                if (!refs.empty()) {
+                    auto refsSink = nix::PathRefScanSink::fromPaths(refs);
+                    refsSink << content;
+                    refs = refsSink.getResultPaths();
+                }
+                if (!refs.empty()) {
+                    std::vector<std::string> ctx;
+                    ctx.reserve(refs.size());
+                    for (auto & p : refs) {
+                        nix::NixStringContextElem elem =
+                            nix::NixStringContextElem::Opaque{ .path = p };
+                        ctx.push_back(elem.to_string());
+                    }
+                    setStringContextEntries(out.payload.str, std::move(ctx));
+                }
+            }
+        } catch (...) { /* best-effort context attribution */ }
     }
 }
 

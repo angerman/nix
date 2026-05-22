@@ -2784,6 +2784,11 @@ static RegisterPrimOp primop_toJSON({
 /* Parse a JSON string to a value. */
 static void prim_fromJSON(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
+    static const bool s_dbgTwFromJson = std::getenv("TW_DBG_FROMJSON") != nullptr;
+    if (__builtin_expect(s_dbgTwFromJson, 0)) {
+        static std::atomic<uint64_t> seq{0};
+        std::fprintf(stderr, "tw FROMJSON[%llu]\n", (unsigned long long)seq.fetch_add(1));
+    }
     auto s = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.fromJSON");
     try {
         parseJSON(state, s, v);
