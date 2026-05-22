@@ -585,10 +585,20 @@ CompilationUnit deserializeCU(std::string_view blob)
             if (f.name < remap.size()) f.name = remap[f.name];
         }
     }
-    // Now overwrite cu.symbolTable with the global table so that
-    // any code that later looks up cu.symbolTable[id] (e.g. error
-    // messages) sees the correct names for the remapped IDs.
-    cu.symbolTable = ir::globalSymbolTable();
+    // #770b/#770c (2026-05-22): drop the post-remap copy of
+    // ir::globalSymbolTable() into cu.symbolTable.  Audit
+    // (grep for cu.symbolTable[) shows ZERO callers index into
+    // this field after deserialize — every VM-side SymbolId
+    // lookup goes through ir::globalSymbolTable() directly
+    // (vm.cc:905, 1262, 1357, 1597, etc.).  The copy was
+    // defensive against a hypothetical future consumer that
+    // never materialised; on hello.drvPath it ran 269 times at
+    // ~1.7 ms each = ~460 ms = the dominant per-import disk-
+    // cache overhead.  Clear the now-unused remap-source data;
+    // serialize() will repopulate from globalSymbolTable on the
+    // way back out if this CU is ever re-cached.
+    cu.symbolTable.clear();
+    cu.symbolTable.shrink_to_fit();
 
     return cu;
 }
