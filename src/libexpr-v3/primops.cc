@@ -9751,65 +9751,46 @@ void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("f
 // Note: primParseFlakeRef and primFlakeRefToString are already
 // implemented natively in v3 above (lines 7319 / 7380); only getFlake
 // needs the TW bridge here.
-// #698 Phase 3: v3-native getFlake.
+// #758: v3-native getFlake — sole implementation.
 // Forward-declare callFlakeV3 (defined in v3_call_flake.cc).
 Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake);
 
 void primGetFlake(EvalState & s, Value * a, Value & o) {
-    // #698/#700 status (2026-05-20):
-    // The v3-native path is **default-on** post-#700.  Phase 4
-    // (commit 88199c4a0) eliminated the bridge tax that previously
-    // made it slower than TW; v3-native is now 1.5× FASTER than TW
-    // on cardano-node `(getFlake X) ? outputs`:
-    //   TW alone:        12.16 s
-    //   v3-native:        8.05 s
-    //   bridge (control): 7.44 s
+    // History:
+    //   - 88199c4a0 / 511074ff6: first default-on attempt — REVERTED
+    //     by 6cb4ecdb7 (over-forcing on haskell.nix flakes).
+    //   - c25e9ccdb (#757)   : chase-limit raise — unblocked the
+    //     legitimate 4096-deep Slot chain through composeExtensions.
+    //   - 37f18b2f6 (#757b)  : primImport realisePath for strings
+    //     with context.
+    //   - 0c7c4f191 (#757c)  : primReadFile file-ref context source
+    //     + primUnsafeDiscardStringContext coerce semantics.
+    //   - (this commit, #758): v3-native callFlake is now the SOLE
+    //     getFlake implementation.  Both retired env-var gates
+    //     (NIX_V3_NATIVE_CALL_FLAKE, NIX_V3_NO_NATIVE_CALL_FLAKE) are
+    //     no-ops; the legacy TW-bridge code path is deleted.
+    //     `test/run-758-callflake-sweep.sh` proves byte-identical
+    //     parity between v3-native and the (pre-retirement) bridge
+    //     across 15 nixpkgs + cardano-node queries.
     //
-    // 2026-05-22 #755 INTERIM ROLLBACK: v3-native callFlake is now
-    // OPT-IN again until the haskell.nix over-force is diagnosed
-    // and fixed.  Per the cardano-node M5 bisection
-    // (lode/CARDANO_NODE_M5_2026-05-21.md), v3-native callFlake
-    // blows past 4 GB on `.outputs.packages.<sys>` evaluation when
-    // the flake uses haskell.nix-style outputs.  The #700 default-on
-    // flip (511074ff6) was validated with `(getFlake X) ? outputs`
-    // — existence-check only — which never forces the offending
-    // attribute path.  The deeper M5 path was uncovered after
-    // 2026-05-21 when the new RSS watchdog (5af3dd1b1) made it safe
-    // to exercise.
-    //
-    // Gate semantics (post-rollback):
-    //   - `NIX_V3_NATIVE_CALL_FLAKE=1` → opt IN to the v3-native
-    //     path.  Faster (5.93 s on cardano-node `? outputs`) but
-    //     OOM-divergent on `.outputs.packages.<sys>` for
-    //     haskell.nix flakes.
-    //   - `NIX_V3_NO_NATIVE_CALL_FLAKE=1` → explicitly disable
-    //     (retained as a no-op since bridge is now default).
-    //   - default → bridge (`bridgeBuiltin<1>("getFlake", ...)`).
-    //
-    // ALSO falls back to the bridge when:
-    //   - flakeSettings hasn't been wired (e.g., v3-eval standalone
-    //     without libcmd → getFlakeSettings() returns nullptr).
-    //   - s.nixEvalState is null (v3 invoked outside any TW context).
-    // Both are degraded-mode safety nets, not perf-related.
-    //
-    // Retirement criterion: when #755 lands a fix for the over-
-    // forcing pathology, flip back to default-on and delete the
-    // NIX_V3_NATIVE_CALL_FLAKE opt-in gate (the NO_NATIVE opt-out
-    // becomes the final survivor, then itself goes once a full
-    // nixpkgs flake sweep shows zero divergence).
-    static const bool s_disableNative =
-        std::getenv("NIX_V3_NO_NATIVE_CALL_FLAKE") != nullptr;
-    static const bool s_enableNative =
-        std::getenv("NIX_V3_NATIVE_CALL_FLAKE") != nullptr;
+    // Degraded-mode error reporting: callFlakeV3 requires the host
+    // TW EvalState (for parseFlakeRef + lockFlake + emitTreeAttrs FFI
+    // leaves) and flake::Settings (for lockFlake's options).  If
+    // either is missing we throw an informative error rather than
+    // silently falling back to a non-existent bridge.
     const nix::flake::Settings * flakeSettings = getFlakeSettings();
-
-    if (s_disableNative || !s_enableNative || !flakeSettings || !s.nixEvalState) {
-        bridgeBuiltin<1>("getFlake", s, a, o);
-        return;
-    }
+    if (!flakeSettings)
+        throw std::runtime_error(
+            "v3 builtins.getFlake: flake::Settings not wired — "
+            "this v3 host must call nix::v3::setFlakeSettings() at "
+            "startup (libcmd's common-eval-args.cc does this for the "
+            "`nix` CLI; v3-eval standalone needs it too)");
+    if (!s.nixEvalState)
+        throw std::runtime_error(
+            "v3 builtins.getFlake: no host TW EvalState available — "
+            "callFlakeV3 needs it for parseFlakeRef/lockFlake/"
+            "emitTreeAttrs FFI leaves");
     auto & ns = *s.nixEvalState;
-
-    // V3-native path (opt-in via NIX_V3_NATIVE_CALL_FLAKE=1).
 
     // (1) FFI leaves: parseFlakeRef + lockFlake.  Pure C functions
     //     (no Nix eval); per V3-NATIVE rule these stay in TW.

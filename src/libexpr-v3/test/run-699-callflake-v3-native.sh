@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
-# Regression test for #698 Phase 3 — `NIX_V3_NATIVE_CALL_FLAKE=1`
-# routes `builtins.getFlake` through v3's own compiled
-# call-flake.nix.
+# Regression test for #698 Phase 3 / #758 — `builtins.getFlake`
+# implemented natively in v3 via the compiled call-flake.nix.
+# Post-#758 (2026-05-22) this is the SOLE getFlake implementation;
+# the legacy TW-bridge code path is retired.  Both runs in this
+# test exercise the same v3-native code path — the historic
+# NIX_V3_NATIVE_CALL_FLAKE and NIX_V3_NO_NATIVE_CALL_FLAKE env vars
+# are no-ops.
 #
 # What's verified:
-#   1. Default (post-#697 bridge): trivial-flake `(getFlake X).smoke`
-#      returns "hello".  Regression guard for the proven-fast path.
-#   2. Opt-in v3-native: same expression returns "hello".  Verifies
-#      end-to-end the v3-side parse + lower + compile + run dispatch
-#      + TW args build + bridge + callClosure × 3 chain works on a
-#      minimal real flake.
-#   3. Deeper attribute access: `(getFlake X).a.b.c` returns "deep"
-#      under v3-native, verifying attrset traversal post-bridge.
-#   4. fallback semantics: with no flakeSettings wired (e.g. v3-eval
-#      standalone) the path silently falls back to the bridge.  We
-#      can't test this directly via the nix CLI (which always wires
-#      flakeSettings), so we trust the in-code null-check.
+#   1. Trivial-flake `(getFlake X).smoke` returns "hello".
+#   2. Deeper attribute access: `(getFlake X).a.b.c` returns "deep".
+#   3. Numeric attribute: `(getFlake X).n` returns 42.
+#   4. The retired env-var aliases are no-ops (results unchanged
+#      whether they are set or not — proves nothing routes through
+#      a hidden bridge fallback any more).
 #
-# This file does NOT test cardano-node because the v3-native path
-# currently has a perf gap there (~6× TW; see Phase 3 commit message).
-# That gap is the retirement criterion for the opt-in gate.
+# Cardano-node + nixpkgs coverage lives in
+# `run-758-callflake-sweep.sh`.
 #
 # Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 # Input Output Group.  SPDX-License-Identifier: Apache-2.0
@@ -60,46 +57,47 @@ check_eq() {
   fi
 }
 
-# Post-#755 interim-rollback semantics:
-#   - Default is the bridge (TW callFlake).  Pre-#700 behaviour.
-#   - Opt IN to v3-native via NIX_V3_NATIVE_CALL_FLAKE=1.
-#   - Opt OUT (no-op since bridge is now default) via NIX_V3_NO_NATIVE_CALL_FLAKE=1.
-# Reverted because v3-native callFlake over-forces haskell.nix outputs
-# on cardano-node M5; see lode/CARDANO_NODE_M5_2026-05-21.md.
+# Post-#758 (2026-05-22) semantics:
+#   - All getFlake calls route through v3-native callFlakeV3.
+#   - NIX_V3_NATIVE_CALL_FLAKE and NIX_V3_NO_NATIVE_CALL_FLAKE are
+#     no-op env vars retained only for backward-compat startup
+#     scripts; their presence does not change behavior.
+#   - Cross-eval verification (15 byte-identical queries spanning
+#     nixpkgs + cardano-node) lives in run-758-callflake-sweep.sh.
 
-# v3-direct default (= bridge, post-#755 rollback)
+# Default (= v3-native; the only impl).
 DEFAULT="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").smoke" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".smoke (default = bridge)" "$DEFAULT" '"hello"'
+check_eq ".smoke (default)" "$DEFAULT" '"hello"'
 
-# v3-native opt-in path
+# Retired NIX_V3_NATIVE_CALL_FLAKE — must be a no-op.
 NATIVE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_NATIVE_CALL_FLAKE=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").smoke" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".smoke (opt-in = v3-native)" "$NATIVE" '"hello"'
+check_eq ".smoke (retired NIX_V3_NATIVE_CALL_FLAKE=1 → no-op)" "$NATIVE" '"hello"'
 
-# Deeper traversal under default (= bridge).
+# Retired NIX_V3_NO_NATIVE_CALL_FLAKE — must be a no-op (no bridge any more).
+NO_NATIVE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_NO_NATIVE_CALL_FLAKE=1 \
+  NIX_V3_MAX_WALL_TIME=15s \
+  "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").smoke" 2>&1 \
+  | grep -v '^Failed\|^warning:' | tail -1)"
+check_eq ".smoke (retired NIX_V3_NO_NATIVE_CALL_FLAKE=1 → no-op)" "$NO_NATIVE" '"hello"'
+
+# Deeper traversal.
 DEEP="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").a.b.c" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".a.b.c (default = bridge)" "$DEEP" '"deep"'
+check_eq ".a.b.c (default)" "$DEEP" '"deep"'
 
-# Same query under v3-native — must agree.
-DEEP_NATIVE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_NATIVE_CALL_FLAKE=1 \
-  NIX_V3_MAX_WALL_TIME=15s \
-  "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").a.b.c" 2>&1 \
-  | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".a.b.c (bridge vs v3-native parity)" "$DEEP" "$DEEP_NATIVE"
-
-# int (42) under default (= bridge)
+# int (42) under default.
 N="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").n" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
-check_eq ".n (default = bridge)" "$N" "42"
+check_eq ".n (default)" "$N" "42"
 
 if [[ "$fail" -eq 0 ]]; then
   echo
