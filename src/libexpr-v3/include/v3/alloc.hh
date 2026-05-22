@@ -937,27 +937,38 @@ struct BindingsOrigin
     uint32_t     allocN;
 };
 
-inline bool bindingsOriginEnabled()
-{
-    // 2026-05-21 #746 spike: recording also auto-enables when the
-    // attribution rollup is requested, so users can ask for the dump
-    // with a single env var (NIX_V3_BINDINGS_ATTR=1) instead of two.
-    // Retirement criterion: when Bindings-attribution data has been
-    // captured and the next Bindings lever decision has landed, this
-    // OR'd second gate (and dumpBindingsAttribution) come out.
-    static const bool v = std::getenv("NIX_V3_DBG_BINDINGS_ORIGIN") != nullptr
-                       || std::getenv("NIX_V3_BINDINGS_ATTR") != nullptr;
-    return v;
-}
+// #768 (2026-05-22): namespace-scope `inline const bool` instead of
+// function-local `static const bool` so the compiler can hoist the
+// load and skip the magic-static guard byte the language requires
+// for function-local statics.  Same pattern as #767a phaseDActive.
+// `bindingsAllocSiteRecord` (called from EVERY `Alloc::allocBindings`,
+// ~200 K calls/hello.drvPath) reads this on entry.
+namespace detail {
+// 2026-05-21 #746 spike: recording also auto-enables when the
+// attribution rollup is requested, so users can ask for the dump
+// with a single env var (NIX_V3_BINDINGS_ATTR=1) instead of two.
+// Retirement criterion: when Bindings-attribution data has been
+// captured and the next Bindings lever decision has landed, this
+// OR'd second gate (and dumpBindingsAttribution) come out.
+inline const bool g_bindingsOriginEnabled =
+    std::getenv("NIX_V3_DBG_BINDINGS_ORIGIN") != nullptr
+ || std::getenv("NIX_V3_BINDINGS_ATTR") != nullptr;
 
 /// 2026-05-21 #746 spike gate: when set, dumpBindingsAttribution()
 /// rolls up the bindingsOriginTable at run-exit and prints the
-/// top-N construction sites by total bytes.  Retirement criterion:
-/// see bindingsOriginEnabled() comment above.
-inline bool bindingsAttrDumpEnabled() noexcept
+/// top-N construction sites by total bytes.
+inline const bool g_bindingsAttrDumpEnabled =
+    std::getenv("NIX_V3_BINDINGS_ATTR") != nullptr;
+}
+
+[[gnu::always_inline]] inline bool bindingsOriginEnabled() noexcept
 {
-    static const bool v = std::getenv("NIX_V3_BINDINGS_ATTR") != nullptr;
-    return v;
+    return detail::g_bindingsOriginEnabled;
+}
+
+[[gnu::always_inline]] inline bool bindingsAttrDumpEnabled() noexcept
+{
+    return detail::g_bindingsAttrDumpEnabled;
 }
 
 inline std::unordered_map<const Bindings *, BindingsOrigin> & bindingsOriginTable()
@@ -1014,16 +1025,25 @@ inline const BindingsOrigin * lookupBindingsOrigin(const Bindings * b)
 
 struct Thunk;  // forward decl — defined in closure.hh
 
-inline bool cellOwnEnabled()
-{
-    static const bool v = std::getenv("NIX_V3_DBG_CELL_OWN") != nullptr;
-    return v;
+// #768: namespace-scope `inline const bool` — same rationale as
+// bindingsOriginEnabled above.  `cellOwnTrack` / `checkSlot`
+// (cell-set / cell-write callers) hit these on entry; promoting
+// removes the magic-static guard byte from the per-call path.
+namespace detail {
+inline const bool g_cellOwnEnabled =
+    std::getenv("NIX_V3_DBG_CELL_OWN") != nullptr;
+inline const bool g_cellOwnAssertEnabled =
+    std::getenv("NIX_V3_ASSERT_CELL_OWN") != nullptr;
 }
 
-inline bool cellOwnAssertEnabled()
+[[gnu::always_inline]] inline bool cellOwnEnabled() noexcept
 {
-    static const bool v = std::getenv("NIX_V3_ASSERT_CELL_OWN") != nullptr;
-    return v;
+    return detail::g_cellOwnEnabled;
+}
+
+[[gnu::always_inline]] inline bool cellOwnAssertEnabled() noexcept
+{
+    return detail::g_cellOwnAssertEnabled;
 }
 
 inline std::unordered_map<const Value *, const Thunk *> & cellOwnerTable()
@@ -1087,10 +1107,18 @@ inline void cellOwnRecordSet(const Value * storage, const Thunk * t,
 // the I-CELL-1 ownership check.  Logs (storage, t, value-tag,
 // for-attrs-the-key-set) for each `*cell = v` that fires.  Used to
 // localize WHAT value lands at a given cell.
-inline bool cellTraceEnabled()
+// #768: namespace-scope `inline const bool` — same rationale as
+// the other alloc.hh debug gates.  Read at the entry of
+// `cellTraceWrite`, which `cellSet` / cellSet variants call on
+// every cell write.
+namespace detail {
+inline const bool g_cellTraceEnabled =
+    std::getenv("NIX_V3_DBG_CELL_TRACE") != nullptr;
+}
+
+[[gnu::always_inline]] inline bool cellTraceEnabled() noexcept
 {
-    static const bool v = std::getenv("NIX_V3_DBG_CELL_TRACE") != nullptr;
-    return v;
+    return detail::g_cellTraceEnabled;
 }
 
 // Minimal cell-write trace: prints (storage, thunk, tag, attrs-size,
