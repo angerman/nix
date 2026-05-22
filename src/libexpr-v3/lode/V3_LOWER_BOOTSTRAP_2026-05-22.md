@@ -2,10 +2,35 @@
 
 ## Status
 
-**Root cause LOCALIZED, fix DEFERRED to focused session.**  The
-interim default-rollback (`6cb4ecdb7`) makes cardano-node M5 work
-default-on; this memo records the deep RCA work that diagnostic
-instrumentation enabled.
+**RESOLVED in `d9d3eed85` (#756).**  Root cause: `lower.cc`'s
+`emitSelectChain` re-lowered the `defaultExpr` at every recursive
+path-step.  For an `or` chain of N alternatives with attr-path
+length M, work was M^N lowerExpr calls.  haskell-nix's bootstrap.nix
+has M=5, N=9 chains → 5^9 ≈ 2 million calls per chain, 4+ GB of
+libc-malloc'd IR storage (invisible to v3 accounting).
+
+Fix shape: `lowerSelect` calls `thunkifyForAttr(e->def)` ONCE
+producing a shared `ir::VarId`; `emitSelectChain` takes that VarId
+instead of the raw `Expr *` and emits `forceVal(defaultVal)` in
+each elseB.  M^N → M*N (linear).
+
+Validated:
+  * bootstrap.nix isolated import: 4 GB OOM → 533 ms.
+  * hello.drvPath: byte-identical to TW.
+  * 9/10 v3 core suite PASS.
+  * cardano-node M5 under `NIX_V3_NATIVE_CALL_FLAKE=1` now completes
+    lowering and reaches the eval phase; hits a separate eval-time
+    "infinite recursion" — tracked separately (#757; likely
+    #455-family env-shape mismatch).
+
+The interim default-rollback (`6cb4ecdb7`) keeping M5 on the bridge
+callFlake path remains in place pending #757; v3-native callFlake
+can re-enable default-on once that resolves.
+
+The below sections are preserved as the deep-dig RCA narrative
+that led to the fix.
+
+---
 
 ## The bug
 
