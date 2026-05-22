@@ -34,13 +34,18 @@
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
 
 #include "nix/expr/eval.hh"
+#include "nix/expr/value/context.hh"      // NixStringContextElem::Opaque (for v3EmitTreeAttrs)
+#include "nix/fetchers/fetchers.hh"       // fetchers::Input getters
+#include "nix/fetchers/attrs.hh"          // maybeGetStrAttr / maybeGetBoolAttr
 #include "nix/flake/flake.hh"
 #include "nix/flake/lockfile.hh"   // for flake::LockedNode (dynamic_pointer_cast target)
 #include "nix/store/store-api.hh"  // for Store::toStorePath
 #include "nix/util/canon-path.hh"  // for CanonPath::rel
+#include "nix/util/hash.hh"        // Hash, HashAlgorithm, HashFormat (#701 v3EmitTreeAttrs)
 
 #include <algorithm>
 #include <cstring>
+#include <ctime>                   // std::gmtime / std::strftime (#701 lastModifiedDate)
 #include <sys/resource.h>
 #if defined(__APPLE__)
 # include <mach/mach.h>
@@ -177,6 +182,149 @@ void walkCallFlakeRoot(const std::function<void(Value &)> & visit)
 // (forced to WHNF inside) to a v3 Value (shallow per #662).
 extern Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
 
+namespace {
+
+/// #701 Phase 4b: v3-native port of nix::emitTreeAttrs
+/// (libexpr/primops/fetchTree.cc:22).  Builds the per-flake-node
+/// `sourceInfo` attrset (outPath, narHash, rev/shortRev/revCount,
+/// dirtyRev/dirtyShortRev, lastModified/lastModifiedDate, etc.)
+/// directly as a v3 Bindings — eliminating the per-node TW bridge
+/// the original callFlakeV3 paid via emitTreeAttrs → TW Bindings
+/// → treeWalkerToV3Public shallow bridge.
+///
+/// Why ported (not just bridged): in the per-node loop in
+/// callFlakeV3 this runs once per locked flake node.  cardano-node
+/// has ~50 nodes; each bridged sourceInfo became 9-13 Bridge thunks
+/// that each crossed back into TW the first time their value was
+/// forced.  Native construction is ~2× faster per node AND lets
+/// downstream v3 code force `sourceInfo.outPath` in v3 dispatch
+/// without a bridge round-trip.
+///
+/// The byte-by-byte parity with TW's emitTreeAttrs is required —
+/// these attrs appear in the flake's outputs and any divergence
+/// would change downstream drvPaths.
+Value v3EmitTreeAttrs(
+    nix::EvalState & ns,
+    const nix::StorePath & storePath,
+    const nix::fetchers::Input & input,
+    bool emptyRevFallback,
+    bool forceDirty)
+{
+    // Collect entries in (SymbolId, Value) pairs.  Final Bindings is
+    // sorted by SymbolId at the end (binary-search invariant).  The
+    // maximum possible entry count is 10
+    //   (outPath, narHash, submodules, rev, shortRev, revCount,
+    //    dirtyRev, dirtyShortRev, lastModified, lastModifiedDate)
+    // so reserve up-front to avoid any rebucket / realloc.
+    std::vector<std::pair<SymbolId, Value>> entries;
+    entries.reserve(10);
+
+    auto allocStr = [](const std::string & s) -> Value {
+        Value v;
+        const size_t n = s.size();
+        char * buf = Alloc::allocChars(n + 1);
+        std::memcpy(buf, s.data(), n);
+        buf[n] = '\0';
+        v.mkString(buf);
+        return v;
+    };
+
+    // 1. outPath — store path with Opaque context.  This is the
+    // attribute downstream callers depend on for drvPath stability;
+    // a missing or wrong-context outPath cascades into wrong drv
+    // hashes for everything that imports this flake's sourceInfo.
+    {
+        const std::string p = ns.store->printStorePath(storePath);
+        Value v = allocStr(p);
+        nix::NixStringContextElem elem = nix::NixStringContextElem::Opaque{ .path = storePath };
+        std::vector<std::string> ctx;
+        ctx.push_back(elem.to_string());
+        setStringContextEntries(v.payload.str, std::move(ctx));
+        entries.emplace_back(ir::globalInternSymbol("outPath"), v);
+    }
+
+    // 2. narHash (optional) — SRI-formatted with algo prefix, matches TW.
+    if (auto narHash = input.getNarHash()) {
+        Value v = allocStr(narHash->to_string(nix::HashFormat::SRI, /*includeAlgo=*/true));
+        entries.emplace_back(ir::globalInternSymbol("narHash"), v);
+    }
+
+    // 3. submodules — bool, git-only.  TW emits it for type=="git"
+    // regardless of the underlying attrs value (defaults to false
+    // when the attr is absent).
+    if (input.getType() == "git") {
+        const bool sub = nix::fetchers::maybeGetBoolAttr(input.attrs, "submodules").value_or(false);
+        Value v = sub ? Value::vTrue : Value::vFalse;
+        entries.emplace_back(ir::globalInternSymbol("submodules"), v);
+    }
+
+    // 4. rev / shortRev / revCount (unless forceDirty).
+    if (!forceDirty) {
+        if (auto rev = input.getRev()) {
+            entries.emplace_back(ir::globalInternSymbol("rev"),      allocStr(rev->gitRev()));
+            entries.emplace_back(ir::globalInternSymbol("shortRev"), allocStr(rev->gitShortRev()));
+        } else if (emptyRevFallback) {
+            // Backwards compat for `builtins.fetchGit`: dirty repos
+            // return an empty sha1 as rev.  Matches TW emitTreeAttrs.
+            const auto emptyHash = nix::Hash(nix::HashAlgorithm::SHA1);
+            entries.emplace_back(ir::globalInternSymbol("rev"),      allocStr(emptyHash.gitRev()));
+            entries.emplace_back(ir::globalInternSymbol("shortRev"), allocStr(emptyHash.gitShortRev()));
+        }
+        Value vRevCount;
+        if (auto revCount = input.getRevCount()) {
+            vRevCount.mkInt(static_cast<int64_t>(*revCount));
+            entries.emplace_back(ir::globalInternSymbol("revCount"), vRevCount);
+        } else if (emptyRevFallback) {
+            vRevCount.mkInt(0);
+            entries.emplace_back(ir::globalInternSymbol("revCount"), vRevCount);
+        }
+    }
+
+    // 5. dirtyRev / dirtyShortRev (paired; emitted iff dirtyRev is
+    // present in input.attrs).  Pre-checked before reading
+    // dirtyShortRev because TW does the same — and absence there
+    // would be a malformed input.
+    if (auto dirtyRev = nix::fetchers::maybeGetStrAttr(input.attrs, "dirtyRev")) {
+        entries.emplace_back(ir::globalInternSymbol("dirtyRev"), allocStr(*dirtyRev));
+        if (auto dirtyShortRev = nix::fetchers::maybeGetStrAttr(input.attrs, "dirtyShortRev"))
+            entries.emplace_back(ir::globalInternSymbol("dirtyShortRev"), allocStr(*dirtyShortRev));
+    }
+
+    // 6. lastModified (int seconds-since-epoch) + lastModifiedDate
+    // ("%Y%m%d%H%M%S" UTC).  std::gmtime returns a pointer to a
+    // statically-allocated tm (thread-unsafe in general, but v3
+    // EvalState is currently single-threaded; if/when that changes,
+    // switch to gmtime_r).
+    if (auto lastModified = input.getLastModified()) {
+        Value vLm; vLm.mkInt(static_cast<int64_t>(*lastModified));
+        entries.emplace_back(ir::globalInternSymbol("lastModified"), vLm);
+        const std::time_t t = static_cast<std::time_t>(*lastModified);
+        char dateBuf[24];
+        std::strftime(dateBuf, sizeof(dateBuf), "%Y%m%d%H%M%S", std::gmtime(&t));
+        entries.emplace_back(ir::globalInternSymbol("lastModifiedDate"), allocStr(std::string(dateBuf)));
+    }
+
+    // Sort by SymbolId — Bindings rely on binary-search lookup.
+    std::sort(entries.begin(), entries.end(),
+        [](const auto & a, const auto & b){ return a.first < b.first; });
+
+    // Allocate + fill the Bindings.  bindingsSetEntry goes through
+    // the Phase-D barrier so cell writes into a nursery payload are
+    // tracked by the scavenger.
+    const uint32_t nEntries = static_cast<uint32_t>(entries.size());
+    Bindings * b = Alloc::allocBindings(nEntries);
+    allocStats().attrsetsAllocated++;
+    for (uint32_t i = 0; i < nEntries; ++i)
+        bindingsSetEntry(b, i, { entries[i].first, /*pos=*/0, entries[i].second });
+
+    Value out;
+    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    out.payload.bindings = b;
+    return out;
+}
+
+}  // namespace
+
 /// Public entry point — invoked from `primGetFlake` when the
 /// v3-native path is enabled.  Returns the flake's outputs attrset
 /// as a v3 Value.
@@ -256,31 +404,26 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
             auto lockedNode = node.dynamic_pointer_cast<const nix::flake::LockedNode>();
             auto [storePath, subdir] = ns.store->toStorePath(sourcePath.path.abs());
 
-            // Build TW sourceInfo via emitTreeAttrs (FFI leaf — knows
-            // how to format outPath context, narHash, lastModified
-            // etc. from a fetchers::Input).
+            // #701 Phase 4b LANDED: v3-native sourceInfo construction.
+            // Pre-#701 this was `nix::emitTreeAttrs` + `treeWalkerToV3Public`
+            // — one bridge per locked flake node (cardano-node has
+            // ~50 nodes, so ~50 bridges per callFlakeV3 invocation,
+            // each producing 9-13 Bridge thunks that paid a TW
+            // round-trip the first time they were forced).
             //
-            // TODO #701 (Phase 4b — deferred): port emitTreeAttrs to v3.
-            // Currently this is the ONE residual bridge per node in
-            // callFlakeV3; eliminating it requires ~150-200 LoC reading
-            // fetchers::Input + StorePath fields and constructing a v3
-            // Bindings with proper NixStringContext.  Deferred until a
-            // workload appears where the per-node sourceInfo
-            // construction dominates.  See
-            // lode/V3_NATIVE_CALL_FLAKE_DESIGN_2026-05-20.md §9 and
-            // memory `project_701_deferred_emitTreeAttrs_v3.md`.
-            nix::Value * twSourceInfo = ns.allocValue();
-            nix::emitTreeAttrs(
-                ns,
-                storePath,
+            // The replacement `v3EmitTreeAttrs` builds the same
+            // Bindings byte-for-byte (validated by the #759 sweep:
+            // 63/64 nixpkgs drvPaths still byte-identical, including
+            // cardano-node M5) but allocates v3-native Bindings +
+            // v3-native string values — no Bridge thunks, no TW
+            // round-trip on per-attr force.
+            const auto & inputForNode =
                 lockedNode ? lockedNode->lockedRef.input
-                           : lockedFlake.flake.lockedRef.input,
-                *twSourceInfo,
-                false,
-                !lockedNode && lockedFlake.flake.forceDirty);
-            // Bridge ONCE per node — subsequent reads are v3-native
-            // until the per-attr value is forced.
-            Value v3SourceInfo = treeWalkerToV3Public(ns, *twSourceInfo);
+                           : lockedFlake.flake.lockedRef.input;
+            const bool forceDirty = !lockedNode && lockedFlake.flake.forceDirty;
+            Value v3SourceInfo = v3EmitTreeAttrs(
+                ns, storePath, inputForNode,
+                /*emptyRevFallback=*/false, forceDirty);
 
             // v3 String for `dir`.  CanonPath::rel returns string_view; copy.
             std::string dirRel(nix::CanonPath(subdir).rel());
