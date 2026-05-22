@@ -62,35 +62,22 @@ USAGE.md §"Resource limits" documents the units (K/M/G for heap; s/m/h for time
 - SIGTERM from `timeout` skips v3's clean unwind and drops the alloc stats.
 - The v3-internal cap survives across re-entrant `runRootExpr` calls (bytecode-primop install path).
 
-### NIX_V3_SKIP_INSTALLABLE_PREEVAL is RETIRED (post-#760)
+### Skipping TW pre-eval is the v3-direct default (no env var needed)
 
-Historical note (2026-05-19 → 2026-05-22): for `nix eval --impure
---expr ...`, `NIX_V3_DIRECT_EVAL=1` alone used to be insufficient.
-The CLI's `parseInstallables` (libcmd/installables.cc) ran
-`state->eval(e, *vFile)` — full TW evaluation — UNLESS both
-`NIX_V3_DIRECT_EVAL=1` AND `NIX_V3_SKIP_INSTALLABLE_PREEVAL=1` were
-set.  Without `SKIP_PREEVAL`, TW pre-evaluated the entire expression
-first; results populated `*vFile` but were ignored by
-`runV3DirectEval`, **masking v3-only failures behind TW's working
-result**.
+For `nix eval --impure --expr ...`, `NIX_V3_DIRECT_EVAL=1` makes
+the CLI hand TW a `mkThunk(...)` only — TW parses but never
+pre-evaluates.  v3-direct then owns evaluation entirely.  This
+**skip-pre-eval** behavior is the permanent goal (more compute in
+v3, less in TW) and the default whenever `NIX_V3_DIRECT_EVAL=1`.
 
-That gate was retired in **#760 (2026-05-22)** — the Stage-2
-meta-kill criterion per ROADMAP_TO_VISION.  The underlying
-"memoization loop" that motivated SKIP_PREEVAL (parse.nix:61 /
-matchAttrs re-evaluating millions of thunks) was closed by the
-#757 chain + A12b iterative valueEqual.  Cross-eval verification
-(63/64 nixpkgs drvPaths byte-identical v3-direct vs TW; 15/15
-callFlake sweep) was the empirical foundation.
+The previous `NIX_V3_SKIP_INSTALLABLE_PREEVAL` env var that gated
+this behaviour was retired in **#760 (commit `3af813638`,
+2026-05-22)** and its remnants scrubbed in **#764**.  If you find
+the old name in scripts, drop it — `NIX_V3_DIRECT_EVAL=1` alone
+is the gate now.
 
-Post-#760: `NIX_V3_DIRECT_EVAL=1` ALONE is sufficient.  The CLI
-unconditionally `vFile->mkThunk(...)` for the v3-direct path —
-TW only parses, never pre-evaluates.  The
-`NIX_V3_SKIP_INSTALLABLE_PREEVAL` env var is a silent no-op if
-still set in existing scripts; it will be deleted entirely in a
-subsequent release.
-
-For the `v3-eval` binary directly, there is no preeval — it's
-already v3-only.  Same as before.
+For the `v3-eval` binary directly, there is no preeval at all —
+it's been v3-only from day one.
 
 ## Critical constraints (hard rules; load-bearing)
 

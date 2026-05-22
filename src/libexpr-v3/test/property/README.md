@@ -14,7 +14,7 @@ For each primop class (`head`, `tail`, `map`, `filter`, `foldl'`,
 1. Generates N random Nix expressions using a seeded PRNG (default
    seed `20260517`, default 10 cases per primop).
 2. Evaluates each expression on **both** the tree-walker (TW) and
-   v3-direct (`NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1`).
+   v3-direct (`NIX_V3_DIRECT_EVAL=1`; post-#760 the `SKIP_INSTALLABLE_PREEVAL` gate is unnecessary — v3-direct skips TW pre-eval unconditionally).
 3. Asserts parity:
    - **Success case**: byte-exact stdout match (after stripping
      transient warnings like "Git tree dirty" / "search path entry

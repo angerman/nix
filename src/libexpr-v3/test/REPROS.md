@@ -85,7 +85,7 @@ For the standalone `.nix` fixtures listed above, the simple recipe is:
 ```bash
 for f in src/libexpr-v3/test/repro-*.nix; do
   tw=$(build/src/nix/nix eval --impure -f "$f" 2>/dev/null)
-  v3=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  v3=$(NIX_V3_DIRECT_EVAL=1 \
        build/src/nix/nix eval --impure -f "$f" 2>/dev/null)
   printf "%-60s TW=%-30s v3=%s\n" "$(basename "$f")" "$tw" "$v3"
   if [[ "$tw" != "$v3" ]]; then echo "DIVERGE"; fi
