@@ -17,6 +17,7 @@
 #include "v3/bytecode_primops.hh"
 #include "v3/import_timing.hh"  // #769 per-import phase totals
 #include "v3/disk_cache.hh"     // #770 cache-hit/miss stats dump
+#include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/limits.hh"
 #include "v3/nursery.hh"
 #include "v3/barrier.hh"
@@ -222,6 +223,10 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // --expr '1'` — the closure's stale cu pointer made dispatchLoop
     // read garbage bytecode.
     RootResult out{std::make_unique<CompilationUnit>(compile(module)), Value{}};
+    // #772 spike: survey the OUTER expression's bytecode dedup too,
+    // so the survey reflects ALL compiled CUs, not just inner-import
+    // ones.  No-op when NIX_V3_DEDUP_SURVEY is unset.
+    surveyCUBytecodeDedup(*out.cu);
     pt.mark(pt.compile_ms);
 
     // Run.  STG-10 (vm.cc:5530) automatically routes through
@@ -361,6 +366,32 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     dc.lookups > 0
                         ? 100.0 * (double)dc.hits / (double)dc.lookups
                         : 0.0);
+            }
+        }
+        // #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
+        // Only printed when NIX_V3_DEDUP_SURVEY=1.  totalFunctions /
+        // uniqueHashes is the LOWER BOUND dedup ratio (real IR-level
+        // alpha-equivalent dedup can only be higher).  ≥5× justifies
+        // Stage 9 investment; <2× kills it.
+        {
+            const auto & sur = dedupSurvey();
+            if (sur.totalFunctions > 0) {
+                double fnRatio = sur.uniqueHashes > 0
+                    ? (double)sur.totalFunctions / (double)sur.uniqueHashes
+                    : 0.0;
+                double byteRatio = sur.uniqueBytes > 0
+                    ? (double)sur.totalBytes / (double)sur.uniqueBytes
+                    : 0.0;
+                std::fprintf(stderr,
+                    "v3-direct dedup_survey: totalFunctions=%llu "
+                    "uniqueHashes=%llu fn_dedup_lb=%.2fx "
+                    "totalBytes=%.1fKB uniqueBytes=%.1fKB byte_dedup_lb=%.2fx\n",
+                    (unsigned long long)sur.totalFunctions,
+                    (unsigned long long)sur.uniqueHashes,
+                    fnRatio,
+                    sur.totalBytes / 1024.0,
+                    sur.uniqueBytes / 1024.0,
+                    byteRatio);
             }
         }
         // #738 Phase E v0.1 (2026-05-21) survival-rate banner.

@@ -95,6 +95,8 @@ lib_sources = files(
   'gc.cc',
   # Phase D write-barriers (Stage 3 prereq): NURSERY_PHASE_D_DECISION_2026-05-21.md
   'barrier.cc',
+  # #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
+  'dedup_survey.cc',
   'disasm.cc',
   'ffi.cc',
   'print.cc',

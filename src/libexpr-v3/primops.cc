@@ -23,6 +23,7 @@
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
 #include "v3/import_timing.hh"  // #769 per-import phase timing
+#include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
 #include "v3/lower.hh"
 #include "v3/vm.hh"
@@ -7563,6 +7564,10 @@ void primImport(EvalState & state, Value * args, Value & out)
         auto tCompile = impStamp();
         cache.cus.push_back(compile(module));
         impBumpNs(importTimingTotals().compileNs, tCompile);
+        // #772 spike: survey bytecode dedup ratio (zero-cost when
+        // NIX_V3_DEDUP_SURVEY is unset).  Captures the LOWER BOUND
+        // on Stage 9 cell-level cache potential.
+        surveyCUBytecodeDedup(cache.cus.back());
         if (s_dbg_import) std::fprintf(stderr,
             "v3 IMPORT-PHASE after-compile RSS=%lluMB: %s\n",
             (unsigned long long)rssMBImp(), path.c_str());
