@@ -83,34 +83,92 @@ void walkDeepForceRoots(const std::function<void(Value &)> & visit)
 
 Value forceDeep(VMState & vm, Value v, std::set<const void *> & seen)
 {
-    v = forceValue(vm, v);
-    if (v.isList() && v.payload.list && v.payload.list->size > 0) {
-        if (seen.insert(v.payload.list).second) {
-            // Round 1 #7: read container fields through the root
-            // stack slot so they survive scavenge during the inner
-            // forceDeep call.
-            DeepForceGuard g(v);
-            for (uint32_t i = 0; i < g.ref().payload.list->size; ++i)
-                g.ref().payload.list->elems[i] =
-                    forceDeep(vm, g.ref().payload.list->elems[i], seen);
-            v = g.ref();
+    // A12b (2026-05-22): iterative tree walk via `tlDeepForceRoots`
+    // as the GC-protected work queue.  Pre-fix this function
+    // C-recursed at every nested list/attrset level, with one
+    // DeepForceGuard per recursion frame.  Deep nesting (e.g.
+    // `forceDeep (toJSON (... deeply structured ...))` on
+    // package-metadata graphs) could exhaust the C-stack.
+    //
+    // Iterative design: capture `baseIdx`; enqueue containers
+    // (push onto tlDeepForceRoots — already walked by the
+    // scavenger via walkDeepForceRoots); cursor through entries
+    // from baseIdx upward.  Each container is read via
+    // `tlDeepForceRoots[cur].payload.X` so a scavenge inside an
+    // inner forceValue that forwards the container updates the
+    // pointer we observe on the next access.  At the end we resize
+    // the stack back to baseIdx (popping all our enqueued entries
+    // at once).
+    //
+    // Semantics preserved:
+    //   * The whole transitive container graph is forced.
+    //   * Cycles are detected via the `seen` set (insert-then-
+    //     enqueue — cycles never re-enqueue).
+    //   * In-place writeback (elems[i] = forced; bindingsSetValue
+    //     for attrs) — downstream readers see the forced WHNF.
+    //   * Return value is the (possibly scavenge-updated) root.
+    Value root = forceValue(vm, v);
+
+    const size_t baseIdx = tlDeepForceRoots.size();
+    bool rootEnqueued = false;
+    size_t rootEnqIdx = 0;
+
+    auto maybeEnqueue = [&](Value cv) -> bool {
+        if (cv.isList() && cv.payload.list && cv.payload.list->size > 0
+            && seen.insert(cv.payload.list).second)
+        {
+            tlDeepForceRoots.push_back(cv);
+            return true;
         }
-    } else if (v.isAttrs() && v.payload.bindings) {
-        if (seen.insert(v.payload.bindings).second) {
-            // Round 1 #7: same protection for the Bindings entries[].
-            // Note: Bindings are tenured-only today, so the slot
-            // never actually moves, but the protection is uniform
-            // and zero-cost — and it future-proofs the path if
-            // Bindings ever become nursery-allocatable.
-            DeepForceGuard g(v);
-            for (uint32_t i = 0; i < g.ref().payload.bindings->size; ++i)
-                bindingsSetValue(  // Phase D barrier
-                    g.ref().payload.bindings, i,
-                    forceDeep(vm, g.ref().payload.bindings->entries[i].value, seen));
-            v = g.ref();
+        if (cv.isAttrs() && cv.payload.bindings
+            && cv.payload.bindings->size > 0
+            && seen.insert(cv.payload.bindings).second)
+        {
+            tlDeepForceRoots.push_back(cv);
+            return true;
         }
+        return false;
+    };
+
+    if (maybeEnqueue(root)) {
+        rootEnqueued = true;
+        rootEnqIdx = tlDeepForceRoots.size() - 1;
     }
-    return v;
+
+    size_t cur = baseIdx;
+    while (cur < tlDeepForceRoots.size()) {
+        // Always read parent's payload through tlDeepForceRoots[cur]
+        // — its pointer may have been forwarded by an inner
+        // forceValue scavenge.  Indices into the vector are stable
+        // across reallocations; pointers into it are not.
+        if (tlDeepForceRoots[cur].isList()) {
+            const uint32_t size =
+                tlDeepForceRoots[cur].payload.list->size;
+            for (uint32_t i = 0; i < size; ++i) {
+                Value child = forceValue(
+                    vm, tlDeepForceRoots[cur].payload.list->elems[i]);
+                tlDeepForceRoots[cur].payload.list->elems[i] = child;
+                maybeEnqueue(child);
+            }
+        } else if (tlDeepForceRoots[cur].isAttrs()) {
+            const uint32_t size =
+                tlDeepForceRoots[cur].payload.bindings->size;
+            for (uint32_t i = 0; i < size; ++i) {
+                Value child = forceValue(
+                    vm, tlDeepForceRoots[cur].payload.bindings->entries[i].value);
+                bindingsSetValue(  // Phase D barrier
+                    tlDeepForceRoots[cur].payload.bindings, i, child);
+                maybeEnqueue(child);
+            }
+        }
+        ++cur;
+    }
+
+    // Capture the (possibly-updated) root before popping the stack.
+    if (rootEnqueued)
+        root = tlDeepForceRoots[rootEnqIdx];
+    tlDeepForceRoots.resize(baseIdx);
+    return root;
 }
 
 Value forceDeep(VMState & vm, Value v)

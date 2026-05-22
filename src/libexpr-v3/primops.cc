@@ -423,97 +423,172 @@ std::mutex & registryMutex()
 // <value>` phrasing in place of the v3-internal typeError.
 static std::string expectedTypeButFound(const char * expected, const Value & v);
 
-inline bool valueEqual(VMState & vm, Value a, Value b)
+inline bool valueEqual(VMState & vm, Value a0, Value b0)
 {
-    // #558 Phase 2: inline WHNF tag check before forceValue
-    // function call.  Same rationale as vm.cc's valueEqual.
-    {
-        Tag at = a.tag();
-        if (__builtin_expect(at == Tag::Thunk
-                             || at == Tag::App
-                             || at == Tag::Slot, 0))
-            a = forceValue(vm, a);
-        Tag bt = b.tag();
-        if (__builtin_expect(bt == Tag::Thunk
-                             || bt == Tag::App
-                             || bt == Tag::Slot, 0))
-            b = forceValue(vm, b);
-    }
-    if (a.tag() != b.tag()) {
-        if (a.isInt() && b.isFloat()) return static_cast<double>(a.payload.i) == b.payload.f;
-        if (a.isFloat() && b.isInt()) return a.payload.f == static_cast<double>(b.payload.i);
-        return false;
-    }
-    switch (a.tag()) {
-    case Tag::Int:    return a.payload.i == b.payload.i;
-    case Tag::Float:  return a.payload.f == b.payload.f;
-    case Tag::Bool:   return a.payload.i == b.payload.i;
-    case Tag::Null:   return true;
-    case Tag::String: return std::string_view(a.payload.str) == std::string_view(b.payload.str);
-    case Tag::Path:   return std::string_view(a.payload.path) == std::string_view(b.payload.path);
-    case Tag::List: {
-        auto * la = a.payload.list; auto * lb = b.payload.list;
-        if (la == lb) return true;
-        uint32_t na = la ? la->size : 0; uint32_t nb = lb ? lb->size : 0;
-        if (na != nb) return false;
-        for (uint32_t i = 0; i < na; ++i)
-            if (!valueEqual(vm, la->elems[i], lb->elems[i])) return false;
-        return true;
-    }
-    case Tag::Attrs: {
-        auto * aa = a.payload.bindings; auto * bb = b.payload.bindings;
-        if (aa == bb) return true;
-        // 2026-05-19 #666: TW's eqValues (libexpr/eval.cc:3365)
-        // special-cases derivations: if both sides have `type =
-        // "derivation"`, compare ONLY their `outPath` (the canonical
-        // derivation identity).  Skipping this caused v3's
-        // `builtins.elem` / `lib.unique` to consider two references
-        // to the same derivation (e.g. `pkgs.python3` vs
-        // `pkgs.python3Packages.python`) as DIFFERENT when one had a
-        // slightly different attr-set shape — duplicates leaked into
-        // `requiredPythonModules` and propagated into the python3-env
-        // buildEnv's chosenOutputs JSON, diverging the drv hash.
-        static const SymbolId sType    = ir::globalInternSymbol("type");
-        static const SymbolId sOutPath = ir::globalInternSymbol("outPath");
-        auto isDerivation = [&](Bindings * b) -> bool {
-            if (!b) return false;
-            if (const Value * tv = b->lookup(sType)) {
-                Value f = forceValue(vm, *tv);
-                return f.isString() && f.payload.str
-                    && std::string_view(f.payload.str) == "derivation";
+    // A12b (2026-05-22): iterative valueEqual via explicit work
+    // stack.  Mirror of the vm.cc::valueEqual conversion (012c0e38f).
+    // Pre-fix this function C-recursed at every nested list/attrset
+    // level.  Deep nested containers (e.g. lib.unique on lists of
+    // packages, builtins.elem comparing nested attrset structures)
+    // could hit the C-stack limit through this path.  The vm.cc copy
+    // was converted first because it serves the `==` operator which
+    // is the more common entry; this primops.cc copy serves
+    // `builtins.filter` / `builtins.elem` / `builtins.all` /
+    // `primConcatMap` and was an equal-priority A12b case.
+    //
+    // Differences from vm.cc::valueEqual:
+    //   * No `insideContainer` parameter — primop equality always
+    //     returns false on closures/primops/primopapps regardless
+    //     of context.
+    //   * No writeback-force on container elements — this entry
+    //     point reads through pointer-by-value (la->elems[i]) and
+    //     doesn't have the lvalue handle that the vm.cc copy uses
+    //     for the writeback-force pattern.  If A12 writeback
+    //     memoization matters here, it's the caller's job (e.g.
+    //     primElem calls forceValue on the list element via the
+    //     writable lvalue BEFORE invoking valueEqual).
+    //
+    // Same shape preserved:
+    //   * Pointer-identity short-circuit on same list / attrset.
+    //   * Cross-type int↔float numeric equality.
+    //   * Derivation outPath short-circuit (#666 — TW's eqValues
+    //     parity required by `lib.unique` on package lists).
+    struct Task { Value a, b; };
+    std::vector<Task> stack;
+    stack.reserve(16);
+    stack.push_back({a0, b0});
+
+    static const SymbolId sType    = ir::globalInternSymbol("type");
+    static const SymbolId sOutPath = ir::globalInternSymbol("outPath");
+
+    while (!stack.empty()) {
+        Task t = stack.back();
+        stack.pop_back();
+        Value a = t.a, b = t.b;
+
+        // #558 Phase 2: inline WHNF tag check before forceValue
+        // function call.  Same rationale as vm.cc's valueEqual.
+        {
+            Tag at = a.tag();
+            if (__builtin_expect(at == Tag::Thunk
+                                 || at == Tag::App
+                                 || at == Tag::Slot, 0))
+                a = forceValue(vm, a);
+            Tag bt = b.tag();
+            if (__builtin_expect(bt == Tag::Thunk
+                                 || bt == Tag::App
+                                 || bt == Tag::Slot, 0))
+                b = forceValue(vm, b);
+        }
+        if (a.tag() != b.tag()) {
+            if (a.isInt() && b.isFloat()) {
+                if (static_cast<double>(a.payload.i) != b.payload.f) return false;
+                continue;
+            }
+            if (a.isFloat() && b.isInt()) {
+                if (a.payload.f != static_cast<double>(b.payload.i)) return false;
+                continue;
             }
             return false;
-        };
-        if (isDerivation(aa) && isDerivation(bb)) {
-            const Value * oa = aa->lookup(sOutPath);
-            const Value * ob = bb->lookup(sOutPath);
-            if (oa && ob) return valueEqual(vm, *oa, *ob);
         }
-        uint32_t na = aa ? aa->size : 0; uint32_t nb = bb ? bb->size : 0;
-        if (na != nb) return false;
-        for (uint32_t i = 0; i < na; ++i) {
-            if (aa->entries[i].name != bb->entries[i].name) return false;
-            if (!valueEqual(vm, aa->entries[i].value, bb->entries[i].value)) return false;
+        switch (a.tag()) {
+        case Tag::Int:
+            if (a.payload.i != b.payload.i) return false;
+            break;
+        case Tag::Float:
+            if (a.payload.f != b.payload.f) return false;
+            break;
+        case Tag::Bool:
+            if (a.payload.i != b.payload.i) return false;
+            break;
+        case Tag::Null:
+            break;
+        case Tag::String:
+            if (std::string_view(a.payload.str) != std::string_view(b.payload.str))
+                return false;
+            break;
+        case Tag::Path:
+            if (std::string_view(a.payload.path) != std::string_view(b.payload.path))
+                return false;
+            break;
+        case Tag::List: {
+            auto * la = a.payload.list; auto * lb = b.payload.list;
+            if (la == lb) break;
+            uint32_t na = la ? la->size : 0; uint32_t nb = lb ? lb->size : 0;
+            if (na != nb) return false;
+            // A12b: push pairs in REVERSE so index [0] sits on top
+            // of the stack — preserves left-to-right comparison
+            // order + short-circuit on first mismatch.
+            for (uint32_t i = na; i > 0; --i) {
+                uint32_t idx = i - 1;
+                stack.push_back({la->elems[idx], lb->elems[idx]});
+            }
+            break;
         }
-        return true;
+        case Tag::Attrs: {
+            auto * aa = a.payload.bindings; auto * bb = b.payload.bindings;
+            if (aa == bb) break;
+            // 2026-05-19 #666: TW's eqValues (libexpr/eval.cc:3365)
+            // special-cases derivations: if both sides have `type =
+            // "derivation"`, compare ONLY their `outPath` (the canonical
+            // derivation identity).  Skipping this caused v3's
+            // `builtins.elem` / `lib.unique` to consider two references
+            // to the same derivation (e.g. `pkgs.python3` vs
+            // `pkgs.python3Packages.python`) as DIFFERENT when one had a
+            // slightly different attr-set shape — duplicates leaked into
+            // `requiredPythonModules` and propagated into the python3-env
+            // buildEnv's chosenOutputs JSON, diverging the drv hash.
+            auto isDerivation = [&](Bindings * b) -> bool {
+                if (!b) return false;
+                if (const Value * tv = b->lookup(sType)) {
+                    Value f = forceValue(vm, *tv);
+                    return f.isString() && f.payload.str
+                        && std::string_view(f.payload.str) == "derivation";
+                }
+                return false;
+            };
+            if (isDerivation(aa) && isDerivation(bb)) {
+                const Value * oa = aa->lookup(sOutPath);
+                const Value * ob = bb->lookup(sOutPath);
+                if (oa && ob) {
+                    stack.push_back({*oa, *ob});
+                    break;
+                }
+            }
+            uint32_t na = aa ? aa->size : 0; uint32_t nb = bb ? bb->size : 0;
+            if (na != nb) return false;
+            // A12b: name-check inline (cheap), then push value-pair
+            // tasks in REVERSE for left-to-right processing.
+            for (uint32_t i = 0; i < na; ++i)
+                if (aa->entries[i].name != bb->entries[i].name) return false;
+            for (uint32_t i = na; i > 0; --i) {
+                uint32_t idx = i - 1;
+                stack.push_back({aa->entries[idx].value, bb->entries[idx].value});
+            }
+            break;
+        }
+        // Functions are never equal in Nix at the top level (`f == f`
+        // is false).  This helper is used from primops
+        // (filter/elem/etc.) which perform direct comparison —
+        // closures never compare equal here.  The vm.cc valueEqual
+        // has a separate code path for list/attr recursion that
+        // allows pointer-identity for closures.
+        case Tag::Closure:
+        case Tag::PrimOp:
+        case Tag::PrimOpApp:
+            return false;
+        case Tag::Uninitialized:
+        case Tag::Thunk:
+        case Tag::App:
+        case Tag::Blackhole:
+        case Tag::External:
+        case Tag::Slot:
+        default:
+            if (a.payload.raw != b.payload.raw) return false;
+            break;
+        }
     }
-    // Functions are never equal in Nix at the top level (`f == f` is
-    // false).  This helper is used from primops (filter/elem/etc.) which
-    // perform direct comparison — closures never compare equal here.
-    // The vm.cc valueEqual has a separate code path for list/attr
-    // recursion that allows pointer-identity for closures.
-    case Tag::Closure:
-    case Tag::PrimOp:
-    case Tag::PrimOpApp:
-        return false;
-    case Tag::Uninitialized:
-    case Tag::Thunk:
-    case Tag::App:
-    case Tag::Blackhole:
-    case Tag::External:
-    case Tag::Slot:
-    default:          return a.payload.raw == b.payload.raw;
-    }
+    return true;
 }
 
 // `toStr(Value &)` was a v3-only stringifier predating the proper
