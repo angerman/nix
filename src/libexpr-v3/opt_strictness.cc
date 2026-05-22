@@ -56,14 +56,152 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/primop.hh"
 
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nix::v3::ir {
 
 namespace {
+
+/// Primops whose body unconditionally writes a non-Thunk tag into the
+/// result Value (so the immediately-following `Force` is a no-op).
+/// Used by `producesWHNF` to elide Force on `PrimOpCall`.
+///
+/// Categories:
+///   - Type predicates / hasContext / hasAttr / pathExists / elem etc.
+///     (return Bool).
+///   - Length ops (Int).
+///   - Arithmetic, comparison (Int / Float / Bool).
+///   - String / Path / Hash builders (fresh String/Path tag).
+///   - List / Attrset constructors and transformers (fresh ListVec /
+///     Bindings — outer container is WHNF; entries may be thunks but
+///     the value itself is WHNF and the trailing Force is redundant).
+///   - tryEval (wraps result into Attrs).
+///
+/// Deliberately EXCLUDED — primops that return an arg or list-element
+/// verbatim, so the result tag depends on the caller's input:
+///   - `head`, `elemAt`         — return list[i] as-is.
+///   - `foldl'`                  — returns the accumulator as-is.
+///   - `seq`, `deepSeq`          — return args[1] verbatim.
+///   - `addErrorContext`         — returns args[1] verbatim.
+///   - `getAttr`                 — returns attrset[name] verbatim.
+///   - `import`, `scopedImport`  — return file top-level value verbatim.
+///   - `genericClosure`          — returns a list whose entries are
+///     forced via the op closure; entries may be thunks but the LIST
+///     IS WHNF — could be whitelisted but `genericClosure`'s output
+///     uses callbacks → keep conservative until reviewed.
+///
+/// Maintenance rule (mirrors opt_strict_call_unthunk pattern): when
+/// adding a new primop in primops.cc, audit its body — if it writes
+/// `Tag::X` for any X != Tag::Thunk regardless of args (including
+/// not assigning args[i] verbatim), add the name here.
+const std::unordered_set<std::string_view> & alwaysWHNFPrimOps()
+{
+    static const std::unordered_set<std::string_view> set = {
+        // Type predicates / Bool reducers.
+        "isAttrs", "isList", "isFunction", "isString", "isInt", "isBool",
+        "isNull", "isFloat", "isPath",
+        "__isAttrs", "__isList", "__isFunction", "__isString", "__isInt",
+        "__isBool", "__isNull", "__isFloat", "__isPath",
+        "hasContext",       "__hasContext",
+        "hasAttr",          "__hasAttr",
+        "pathExists",       "__pathExists",
+        "elem",  "__elem",
+        "all",   "__all",
+        "any",   "__any",
+        // Type query → String.
+        "typeOf",           "__typeOf",
+        // Length → Int.
+        "length",           "__length",
+        "stringLength",     "__stringLength",
+        // Arithmetic.
+        "add", "sub", "mul", "div",
+        "bitAnd", "bitOr", "bitXor",
+        "floor", "ceil", "parseInt",
+        "__add", "__sub", "__mul", "__div",
+        "__bitAnd", "__bitOr", "__bitXor",
+        "__floor", "__ceil",
+        // Comparison.
+        "lessThan",         "__lessThan",
+        "compareVersions",  "__compareVersions",
+        // String builders / path coercion / hashes.
+        "toString",         "__toString",
+        "substring",        "__substring",
+        "concatStringsSep", "__concatStringsSep",
+        "replaceStrings",   "__replaceStrings",
+        "stringReplace",
+        "hashString",       "__hashString",
+        "hashFile",         "__hashFile",
+        "convertHash",      "__convertHash",
+        "getEnv",           "__getEnv",
+        "placeholder",      "__placeholder",
+        "baseNameOf",       "__baseNameOf",
+        "dirOf",            "__dirOf",
+        "unsafeDiscardStringContext",
+        "__unsafeDiscardStringContext",
+        "unsafeDiscardOutputDependency",
+        "__unsafeDiscardOutputDependency",
+        "unsafeGetAttrPos", "__unsafeGetAttrPos",
+        "appendContext",    "__appendContext",
+        "addDrvOutputDependencies",
+        "__addDrvOutputDependencies",
+        "getContext",       "__getContext",
+        "splitString",      "__splitString",
+        // Constants / system info.
+        "currentSystem",    "__currentSystem",
+        "currentTime",      "__currentTime",
+        "langVersion",      "__langVersion",
+        "nixVersion",       "__nixVersion",
+        "storeDir",         "__storeDir",
+        "storePath",        "__storePath",
+        "toPath",           "__toPath",
+        // Serialization → String / Attrs.
+        "toJSON",           "__toJSON",
+        "toXML",            "__toXML",
+        "toFile",           "__toFile",
+        "fromJSON",         "__fromJSON",
+        "fromTOML",         "__fromTOML",
+        // Filesystem reads → String / Attrs.
+        "readFile",         "__readFile",
+        "readFileType",     "__readFileType",
+        "readDir",          "__readDir",
+        // List / Attrset constructors and transformers (Tag::List /
+        // Tag::Attrs by construction).
+        "tail",             "__tail",
+        "attrNames",        "__attrNames",
+        "attrValues",       "__attrValues",
+        "catAttrs",         "__catAttrs",
+        "intersectAttrs",   "__intersectAttrs",
+        "removeAttrs",      "__removeAttrs",
+        "listToAttrs",      "__listToAttrs",
+        "zipAttrsWith",     "__zipAttrsWith",
+        "concatLists",      "__concatLists",
+        "concatMap",        "__concatMap",
+        "filter",           "__filter",
+        "map",              "__map",
+        "mapAttrs",         "__mapAttrs",
+        "groupBy",          "__groupBy",
+        "partition",        "__partition",
+        "sort",             "__sort",
+        "genList",          "__genList",
+        "splitVersion",     "__splitVersion",
+        "parseDrvName",     "__parseDrvName",
+        "match",            "__match",
+        "split",            "__split",
+        "functionArgs",     "__functionArgs",
+        // tryEval wraps in Attrs.
+        "tryEval",          "__tryEval",
+        // FlakeRef ops return Attrs.
+        "parseFlakeRef",    "__parseFlakeRef",
+        "flakeRefToString", "__flakeRefToString",
+    };
+    return set;
+}
 
 /// True if `e` always evaluates to a WHNF value.  Whitelist; everything
 /// else returns false (conservative).  Force itself is whitelisted so
@@ -71,6 +209,12 @@ namespace {
 /// fold.
 bool producesWHNF(const Expr & e)
 {
+    // PrimOpCall: WHNF iff the primop is in the always-WHNF whitelist.
+    if (const auto * pc = std::get_if<PrimOpCall>(&e)) {
+        if (!pc->primop) return false;
+        const auto & set = alwaysWHNFPrimOps();
+        return set.find(pc->primop->name) != set.end();
+    }
     return std::holds_alternative<LitInt>(e)
         || std::holds_alternative<LitFloat>(e)
         || std::holds_alternative<LitBool>(e)
@@ -139,6 +283,60 @@ const Expr * resolve(VarId v, const BlockMap & m)
     return nullptr;
 }
 
+/// Cross-block WHNF: resolve the Block's TermReturn target to its
+/// defining Expr (chasing VarRef chains), then test WHNF.  Depth-
+/// capped to bound recursion through nested If/Assert/With.  Returns
+/// false on any opaque case (terminal references an upvalue, target
+/// VarId not found, etc.).
+bool blockTerminalIsWHNF(const Module & m, const Block & b, int depth);
+
+bool producesWHNFDeep(const Expr & e, const Module & m, int depth)
+{
+    if (producesWHNF(e)) return true;
+    if (depth <= 0) return false;
+    // Cross-block forms: every reachable sub-block's terminal must be
+    // WHNF for the carrier itself to be WHNF.
+    if (const auto * i = std::get_if<If>(&e)) {
+        if (i->thenBlock >= (BlockId)m.blocks.size()) return false;
+        if (i->elseBlock >= (BlockId)m.blocks.size()) return false;
+        return blockTerminalIsWHNF(m, m.blocks[i->thenBlock], depth - 1)
+            && blockTerminalIsWHNF(m, m.blocks[i->elseBlock], depth - 1);
+    }
+    if (const auto * a = std::get_if<Assert>(&e)) {
+        if (a->bodyBlock >= (BlockId)m.blocks.size()) return false;
+        return blockTerminalIsWHNF(m, m.blocks[a->bodyBlock], depth - 1);
+    }
+    if (const auto * w = std::get_if<With>(&e)) {
+        if (w->bodyBlock >= (BlockId)m.blocks.size()) return false;
+        return blockTerminalIsWHNF(m, m.blocks[w->bodyBlock], depth - 1);
+    }
+    return false;
+}
+
+bool blockTerminalIsWHNF(const Module & m, const Block & b, int depth)
+{
+    const auto * tr = std::get_if<TermReturn>(&b.terminal);
+    if (!tr || tr->value == kInvalid) return false;
+    // Resolve TermReturn target through VarRef chain in this block.
+    VarId target = tr->value;
+    size_t hops = 0;
+    const size_t cap = b.bindings.size() + 1;
+    while (hops++ < cap) {
+        const Expr * found = nullptr;
+        for (const auto & bind : b.bindings) {
+            if (bind.var == target) { found = &bind.expr; break; }
+        }
+        if (!found) return false; // terminal not defined in this block
+        if (auto * vr = std::get_if<VarRef>(found)) {
+            if (vr->var == kInvalid) return false;
+            target = vr->var;
+            continue;
+        }
+        return producesWHNFDeep(*found, m, depth);
+    }
+    return false;
+}
+
 } // namespace
 
 /// Eliminate redundant `Force{v}` bindings: if `v` (chasing local
@@ -151,8 +349,23 @@ size_t elimRedundantForce(Module & m)
         std::getenv("NIX_V3_NO_OPT_STRICT") != nullptr;
     if (disabled) return 0;
 
+    static const char * dbgRaw = std::getenv("NIX_V3_DBG_OPT_STRICT");
+    const int dbgLevel = dbgRaw ? std::atoi(dbgRaw) : 0;
+
+    // Depth cap for cross-block WHNF probing (If/Assert/With).  4 is
+    // deep enough to cover nested-If chains in nixpkgs (mkIf inside
+    // optionalAttrs inside Assert) without runaway recursion.
+    constexpr int kCrossBlockDepth = 4;
+
     size_t rewritten = 0;
     size_t forceTotal = 0;
+    // Bucket residue Forces by source kind so we can prioritise the
+    // next-WHNF-class extension.  Indexed by Expr::index() — variant
+    // order in ir.hh determines slot.
+    constexpr size_t kKindBuckets = 64;
+    size_t residueByKind[kKindBuckets] = {0};
+    size_t residueNullSrc = 0;
+    size_t residueInvalidThunk = 0;
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
         Block & block = m.blocks[bid];
         BlockMap bm = mapBlock(block);
@@ -160,10 +373,14 @@ size_t elimRedundantForce(Module & m)
             auto * f = std::get_if<Force>(&bind.expr);
             if (!f) continue;
             ++forceTotal;
-            if (f->thunk == kInvalid) continue;
+            if (f->thunk == kInvalid) { ++residueInvalidThunk; continue; }
             const Expr * src = resolve(f->thunk, bm);
-            if (!src) continue;
-            if (!producesWHNF(*src)) continue;
+            if (!src) { ++residueNullSrc; continue; }
+            if (!producesWHNFDeep(*src, m, kCrossBlockDepth)) {
+                size_t idx = src->index();
+                if (idx < kKindBuckets) ++residueByKind[idx];
+                continue;
+            }
             VarId aliasedTo = f->thunk;
             bind.expr = VarRef{aliasedTo};
             // Update the local map so a later Force in the same block
@@ -172,12 +389,20 @@ size_t elimRedundantForce(Module & m)
             ++rewritten;
         }
     }
-    static const bool debug =
-        std::getenv("NIX_V3_DBG_OPT_STRICT") != nullptr;
-    if (debug && forceTotal > 0) {
+    if (dbgLevel >= 1 && forceTotal > 0) {
         std::fprintf(stderr,
             "v3 opt strictness: %zu / %zu Force bindings rewritten\n",
             rewritten, forceTotal);
+    }
+    if (dbgLevel >= 2 && forceTotal > 0) {
+        std::fprintf(stderr,
+            "  residue: invalidThunk=%zu nullSrc=%zu byKind=[",
+            residueInvalidThunk, residueNullSrc);
+        for (size_t i = 0; i < kKindBuckets; ++i) {
+            if (residueByKind[i] > 0)
+                std::fprintf(stderr, "%zu:%zu ", i, residueByKind[i]);
+        }
+        std::fprintf(stderr, "]\n");
     }
     return rewritten;
 }
