@@ -606,6 +606,16 @@ size_t applyStrictnessAtCallSites(Module & m)
     size_t elidedSingleArg = 0;
     size_t elidedFormals   = 0;
     size_t consideredApps  = 0;
+    // #775 instrumentation: funnel breakdown to find WHY isInlinableMkThunk
+    // rejects most strict-hit candidates.  Goal: identify whether (a) the
+    // arg isn't a MkThunk in same block, (b) MkThunk has multiple uses, or
+    // (c) body isn't cloneable.  Each is a different remediation lane.
+    size_t failResolveLambda = 0;
+    size_t failStrictArgs    = 0;
+    size_t passedToInline    = 0;
+    size_t failNotMkThunk    = 0;
+    size_t failMultiUse      = 0;
+    size_t failNotCloneable  = 0;
 
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
         Block & blk = m.blocks[bid];
@@ -632,10 +642,10 @@ size_t applyStrictnessAtCallSites(Module & m)
             ++consideredApps;
 
             const Lambda * lam = resolveCalleeLambda(app->fun, m, defs);
-            if (!lam) continue;
-            if (lam->funcIdx >= (FuncId)m.functions.size()) continue;
+            if (!lam) { ++failResolveLambda; continue; }
+            if (lam->funcIdx >= (FuncId)m.functions.size()) { ++failResolveLambda; continue; }
             const Function & callee = m.functions[lam->funcIdx];
-            if (callee.strictArgs.empty()) continue;
+            if (callee.strictArgs.empty()) { ++failStrictArgs; continue; }
 
             // (A) Outer-thunk elision — applies to any callee
             // whose strictArgs[0] is true (the paramVar position).
@@ -645,6 +655,31 @@ size_t applyStrictnessAtCallSites(Module & m)
             // formals-style lambdas with strict formals trip this
             // branch too.
             if (callee.strictArgs[0]) {
+                ++passedToInline;
+                // Inline funnel diagnostic: replicate isInlinableMkThunk
+                // logic to see which of (not-MkThunk / multi-use /
+                // not-cloneable) blocks each candidate.
+                auto res = chaseInBlockResolved(app->arg, defs);
+                if (!res.expr || !std::get_if<MkThunk>(res.expr)) {
+                    ++failNotMkThunk;
+                } else {
+                    const MkThunk * mktDiag = std::get_if<MkThunk>(res.expr);
+                    if (uses.at(res.definer) != 1) {
+                        ++failMultiUse;
+                    } else if (mktDiag->funcIdx >= (FuncId)m.functions.size()) {
+                        ++failNotCloneable;
+                    } else {
+                        const Function & thunkFn = m.functions[mktDiag->funcIdx];
+                        if (thunkFn.entryBlock == kInvalidBlock
+                            || thunkFn.entryBlock >= (BlockId)m.blocks.size()) {
+                            ++failNotCloneable;
+                        } else {
+                            std::unordered_set<BlockId> visited;
+                            if (!bodyIsCloneable(m, thunkFn.entryBlock, visited))
+                                ++failNotCloneable;
+                        }
+                    }
+                }
                 VarId defVar = kInvalid;
                 const MkThunk * mkt = nullptr;
                 const Block * body = nullptr;
@@ -776,8 +811,14 @@ size_t applyStrictnessAtCallSites(Module & m)
     if (dbg) {
         std::fprintf(stderr,
             "v3 stage4 v4.1 strict-call-unthunk: elided=%zu "
-            "(single-arg=%zu formals=%zu) of %zu Apps considered\n",
-            elided, elidedSingleArg, elidedFormals, consideredApps);
+            "(single-arg=%zu formals=%zu) of %zu Apps considered "
+            "[funnel: failResolve=%zu failStrictArgs=%zu "
+            "passedToInline=%zu failNotMkThunk=%zu failMultiUse=%zu "
+            "failNotCloneable=%zu]\n",
+            elided, elidedSingleArg, elidedFormals, consideredApps,
+            failResolveLambda, failStrictArgs,
+            passedToInline, failNotMkThunk, failMultiUse,
+            failNotCloneable);
     }
 
     return elided;
