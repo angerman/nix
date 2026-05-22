@@ -150,7 +150,10 @@ collectReferencedSymbols(const CompilationUnit & cu)
          || op == OP_REC_BINDING_SLOT_REF) {
             bump(operand);
             // OP_ATTRS_SELECT has 1 IC follow-up word.
-            if (op == OP_ATTRS_SELECT) ++ip;
+            // #779 Schema 10: OP_REC_BINDING_SLOT_REF also has 1 IC
+            // follow-up word.
+            if (op == OP_ATTRS_SELECT
+             || op == OP_REC_BINDING_SLOT_REF) ++ip;
         } else if (op == OP_ATTRS_INIT) {
             uint32_t n = operand;
             for (uint32_t i = 0; i < n; ++i) {
@@ -389,6 +392,11 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
             // remap, every cached CU using `with rec` / lib.fix
             // resolved the wrong attribute after a process restart.
             word = encode(op, remapId(operand));
+            // #779 Schema 10: skip the IC follow-up word.  The IC
+            // entry is process-local state (Bindings* pointers
+            // change across processes); we leave the cache slot
+            // value alone since recSlotCache is re-zeroed on load.
+            ip++;
         } else if (op == OP_ATTRS_INIT) {
             // Names get remapped; runtime sorts on the fly so order
             // doesn't matter.
@@ -585,6 +593,9 @@ std::string serializeCU(const CompilationUnit & cu)
     // Section: attrSelectCache size (entries are zeroed on load).
     w.u32(static_cast<uint32_t>(cu.attrSelectCache.size()));
 
+    // Section: recSlotCache size (#779 Schema 10; entries zeroed on load).
+    w.u32(static_cast<uint32_t>(cu.recSlotCache.size()));
+
     // Section: entryOffset.
     w.u32(cu.entryOffset);
 
@@ -759,6 +770,12 @@ CompilationUnit deserializeCU(std::string_view blob)
     {
         uint32_t n = r.u32();
         cu.attrSelectCache.resize(n);
+    }
+
+    // Section: recSlotCache size (#779 Schema 10; zeroed on load).
+    {
+        uint32_t n = r.u32();
+        cu.recSlotCache.resize(n);
     }
 
     // Section: entryOffset.

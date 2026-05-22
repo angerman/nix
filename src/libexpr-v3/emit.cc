@@ -966,6 +966,14 @@ struct Emitter
         if (!tryFastPathUnary(e.attrs))
             emitVarRef(e.attrs);
         unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.name));
+        // #779 (2026-05-23) Schema 10: 1-word IC follow-up.  Each
+        // OP_REC_BINDING_SLOT_REF instance gets a fresh slot in
+        // unit.recSlotCache, indexed by the icIdx that we emit
+        // here.  Entries default-initialize to (bindings=null,
+        // slot=0); first miss installs.
+        uint32_t icIdx = static_cast<uint32_t>(unit.recSlotCache.size());
+        unit.recSlotCache.emplace_back();
+        unit.code.push_back(icIdx);
     }
     void emitOne(const ir::HasAttr & e)
     {
@@ -1358,6 +1366,12 @@ struct Emitter
             // attrs).
             emitVarRef(e.recAttrsVar);
             unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.recAttrsName));
+            // #779 Schema 10 IC follow-up (see emitOne(RecBindingSlotRef)).
+            {
+                uint32_t icIdx = static_cast<uint32_t>(unit.recSlotCache.size());
+                unit.recSlotCache.emplace_back();
+                unit.code.push_back(icIdx);
+            }
             unit.code.push_back(encode(OP_WITH_PUSH));
             emittedSlotRef = true;
         }

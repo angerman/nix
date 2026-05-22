@@ -131,6 +131,10 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
     // OP_ATTRS_SELECT consumes 1 word for the inline-cache slot index.
     case OP_ATTRS_SELECT:
         return 1;
+    // #779 Schema 10 (2026-05-23): OP_REC_BINDING_SLOT_REF gains a
+    // 1-word IC follow-up indexing CompilationUnit::recSlotCache.
+    case OP_REC_BINDING_SLOT_REF:
+        return 1;
     // OP_CALL_PRIMOP n: pops n args; 1 extra word: primop-table index.
     // (vm.cc:3203 reads `cu->code[ip++]` for poIdx).  Without this
     // entry, every disasm past the first OP_CALL_PRIMOP misaligned.

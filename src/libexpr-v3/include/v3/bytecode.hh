@@ -179,7 +179,14 @@ enum Op : uint8_t
     /// the slot, including the memoized resolved value once forceValue
     /// has run on the entry once.  Mirrors tree-walker's `Value *`
     /// slot pointer into the Env block.
-    OP_REC_BINDING_SLOT_REF = 0x84, // [sym:24]
+    ///
+    /// Schema 10 (#779, 2026-05-23): adds a 1-word IC follow-up
+    /// (`[ic_idx:32]`) indexing `CompilationUnit::recSlotCache`.  On
+    /// hit, the cached (Bindings*, slot) is used to skip the binary
+    /// search by SymbolId; on miss, the search runs and the cache is
+    /// installed.  Lifts ~30 ns / call on hello.drvPath (9.05 % of
+    /// 15 M dispatches).
+    OP_REC_BINDING_SLOT_REF = 0x84, // [sym:24], data: [ic_idx:32]
 
     /// STG-14b (#516/#517): pop a Tag::Thunk from the operand stack,
     /// allocate a heap-stable Value cell, store the thunk into the
@@ -472,6 +479,21 @@ struct CompilationUnit
         uint8_t evictIdx = 0;
     };
     mutable std::vector<AttrSelectIC> attrSelectCache;
+
+    /// #779 (2026-05-23) per-call-site IC for OP_REC_BINDING_SLOT_REF.
+    /// Monomorphic 1-way: LetRec sites are shape-stable (the same
+    /// rec attrset's Bindings* recurs across calls to the lambda
+    /// containing the slot ref).  Cached (Bindings*, slot) skips
+    /// the binary search by SymbolId on the hot path.  Entries are
+    /// zeroed on construction; first hit installs.  Cache size is
+    /// determined by the count of OP_REC_BINDING_SLOT_REF instances
+    /// in the bytecode, indexed via the 1-word follow-up after
+    /// each OP_REC_BINDING_SLOT_REF.
+    struct RecSlotIC {
+        const Bindings * bindings = nullptr;
+        uint32_t slot = 0;
+    };
+    mutable std::vector<RecSlotIC> recSlotCache;
 
     /// Top-level entry offset.
     uint32_t entryOffset = 0;

@@ -99,7 +99,13 @@ namespace nix::v3::serialize {
 /// builds a sparse remap (vector<uint32_t> sized maxOrigId+1).
 /// Bytecode operands still carry the same global IDs from
 /// serialize time; only unreferenced slots are dropped.
-constexpr uint32_t kSchemaVersion = 9;
+///
+/// 10: #779 (2026-05-23) OP_REC_BINDING_SLOT_REF gains a 1-word
+/// IC follow-up indexing CompilationUnit::recSlotCache.  Mirror of
+/// OP_ATTRS_SELECT's IC mechanism for the LetRec slot-ref hot
+/// path (9.05 % of dispatch on hello.drvPath; 1.4 M calls).
+/// Cache size is serialised; entries are zeroed on load.
+constexpr uint32_t kSchemaVersion = 10;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

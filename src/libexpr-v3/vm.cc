@@ -8406,16 +8406,43 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     "v3 OP_REC_BINDING_SLOT_REF: source is not a forced attrset");
             }
             SymbolId sym = static_cast<SymbolId>(operand);
-            // Binary search the sorted entries for `sym`.
+            // #779 Schema 10: per-call-site IC.  The icIdx follow-up
+            // word indexes cu->recSlotCache.  Bindings* identity is
+            // sufficient (entries[] is allocated as a FAM alongside
+            // Bindings; the pointer doesn't move).  Mutations come
+            // via OP_APPLY_OVERRIDES which produces a NEW Bindings*,
+            // so cache entries can't dangle to stale entries[].
+            uint32_t icIdx = cu->code[ip++];
             Bindings * b = attrs.payload.bindings;
-            uint32_t lo = 0, hi = b->size;
             Value * found = nullptr;
-            while (lo < hi) {
-                uint32_t mid = (lo + hi) >> 1;
-                SymbolId midName = b->entries[mid].name;
-                if (midName == sym) { found = &b->entries[mid].value; break; }
-                if (midName < sym) lo = mid + 1;
-                else               hi = mid;
+            {
+                auto & ic = cu->recSlotCache[icIdx];
+                if (__builtin_expect(ic.bindings == b, 1)) {
+                    // IC hit — direct entry access.  Bindings* match
+                    // implies sorted-name layout match; cached slot is
+                    // valid.
+                    found = &b->entries[ic.slot].value;
+                } else {
+                    // IC miss (cold or shape change).  Binary search
+                    // by SymbolId then install.
+                    uint32_t lo = 0, hi = b->size;
+                    uint32_t slotIdx = 0;
+                    while (lo < hi) {
+                        uint32_t mid = (lo + hi) >> 1;
+                        SymbolId midName = b->entries[mid].name;
+                        if (midName == sym) {
+                            found = &b->entries[mid].value;
+                            slotIdx = mid;
+                            break;
+                        }
+                        if (midName < sym) lo = mid + 1;
+                        else               hi = mid;
+                    }
+                    if (found) {
+                        ic.bindings = b;
+                        ic.slot     = slotIdx;
+                    }
+                }
             }
             if (!found) {
                 const auto & tbl = ir::globalSymbolTable();
