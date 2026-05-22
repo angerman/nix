@@ -354,12 +354,11 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // goes through `runRootExpr`) reports the same data without
         // depending on the CLI specifically.
         dumpPrimOpStats(stderr);
-        // #770 (2026-05-22): disk cache effectiveness.  Always print
-        // when any lookups happened (i.e. NIX_V3_DISK_CACHE was set
-        // and primImport ran).  hits/misses/inserts/failures lets the
-        // user see whether the cache is firing.  When NIX_V3_DISK_CACHE
-        // is unset (default), the disk_cache module is never touched
-        // and all counters stay 0.
+        // #770 / #777 promotion (2026-05-22 / 2026-05-23): disk
+        // cache effectiveness.  Now default-on; prints whenever
+        // primImport ran.  hits/misses/inserts/failures lets the
+        // user see whether the cache is firing.  Opt-out via
+        // NIX_V3_NO_DISK_CACHE=1 leaves all counters at zero.
         {
             const auto & dc = disk_cache::stats();
             if (dc.lookups + dc.inserts > 0) {

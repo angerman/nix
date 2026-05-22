@@ -7456,8 +7456,18 @@ void primImport(EvalState & state, Value * args, Value & out)
     // the ideal integration point — direct access to source path
     // and content; serialized CUs round-trip through the SymbolId
     // remap in serialize::deserializeCU.
+    //
+    // #777 promotion (2026-05-23): default-ON.  Hyperfine shows
+    // -174 ms / -13 % on hello.drvPath after #777's zero-copy
+    // symbolTable read; nixpkgs 64-package sweep -16 s (-10.7 %).
+    // Pre-#777 was within noise; the deserialize cost is now
+    // small enough that the compile savings dominate.  Retirement
+    // criterion: if a future commit regresses cache wall-clock to
+    // ≤ default + 1 σ on either hello.drvPath or the 64-pkg sweep,
+    // flip back to opt-in (gate name re-becomes NIX_V3_DISK_CACHE
+    // = enable; rename NIX_V3_NO_DISK_CACHE → drop).
     static const bool diskCacheEnabled =
-        std::getenv("NIX_V3_DISK_CACHE") != nullptr;
+        std::getenv("NIX_V3_NO_DISK_CACHE") == nullptr;
     // #495 follow-on: content-cache (in-memory) is default-on.  Compute
     // the content hash whenever EITHER cache is enabled.  Content
     // cache lets v3EvalEntry's later lookup with a fresh-parse Expr*
