@@ -18,6 +18,8 @@
 #include "v3/import_timing.hh"  // #769 per-import phase totals
 #include "v3/disk_cache.hh"     // #770 cache-hit/miss stats dump
 #include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
+#include "v3/disasm.hh"         // #778 opcount dumper — opName()
+#include "v3/bytecode.hh"
 #include "v3/limits.hh"
 #include "v3/nursery.hh"
 #include "v3/barrier.hh"
@@ -26,6 +28,7 @@
 
 #include "nix/expr/config.hh"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -454,6 +457,55 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                         yToTOvf / 1e6,
                         reclaimedFromS / 1e6);
                 }
+            }
+        }
+        // #778 (2026-05-23) opcount Top-N rollup — Stage 5 (shapes/
+        // PICs) decision input.  Emitted under NIX_VM_OPCOUNTS=1 only
+        // (the per-op increment is the same gate from vm.cc:2572).
+        // Shows the top 12 opcodes by count plus the AttrSelect /
+        // AttrSelectDyn / AttrsHas share — Stage 5 only makes sense
+        // if those sites are ≥10 % of dispatch.  Below that, the
+        // PIC's amortisation can't move wall clock.
+        {
+            const auto & a = allocStats();
+            uint64_t totalDispatch = 0;
+            for (size_t i = 0; i < 256; ++i) totalDispatch += a.opcodeCounts[i];
+            if (totalDispatch > 0) {
+                // Sort opcodes by count descending.
+                struct OpRow { uint8_t code; uint64_t count; };
+                OpRow rows[256];
+                size_t nz = 0;
+                for (size_t i = 0; i < 256; ++i) {
+                    if (a.opcodeCounts[i] > 0) {
+                        rows[nz++] = { (uint8_t)i, a.opcodeCounts[i] };
+                    }
+                }
+                std::sort(rows, rows + nz,
+                    [](const OpRow & x, const OpRow & y) {
+                        return x.count > y.count;
+                    });
+                std::fprintf(stderr,
+                    "v3-direct opcounts: total=%llu (top-12 + AttrSelect family):\n",
+                    (unsigned long long)totalDispatch);
+                const size_t topN = std::min<size_t>(12, nz);
+                for (size_t i = 0; i < topN; ++i) {
+                    std::fprintf(stderr,
+                        "  %-26s %12llu  %5.2f%%\n",
+                        opName(static_cast<Op>(rows[i].code)),
+                        (unsigned long long)rows[i].count,
+                        100.0 * rows[i].count / totalDispatch);
+                }
+                // AttrSelect-family share (Stage 5 input).
+                uint64_t selFam =
+                      a.opcodeCounts[OP_ATTRS_SELECT]
+                    + a.opcodeCounts[OP_ATTRS_SELECT_DYN]
+                    + a.opcodeCounts[OP_ATTRS_HAS]
+                    + a.opcodeCounts[OP_ATTRS_HAS_DYN];
+                std::fprintf(stderr,
+                    "  --AttrSelect family-- %12llu  %5.2f%% "
+                    "(Stage 5 PIC kill criterion: <10%%)\n",
+                    (unsigned long long)selFam,
+                    100.0 * selFam / totalDispatch);
             }
         }
         // #736 (2026-05-21) IFD-probe summary.  Per IFD_DEEP_DIVE
