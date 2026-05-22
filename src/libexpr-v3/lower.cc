@@ -2950,12 +2950,37 @@ struct Lowerer
         }
 
         ir::VarId v = lowerExpr(e->e);
-        return emitSelectChain(v, path, e->def, 0);
+        // #755 fix: hoist defaultExpr lowering OUTSIDE the recursive
+        // emitSelectChain.  The old recursive version called
+        // lowerExpr(defaultExpr) at EVERY pathIdx step — for an `or`
+        // chain like `x.a.b.c.d or y.e.f.g.h or z.i.j.k.l`, the
+        // attr-path length M and N alternatives multiply to M^N
+        // re-lowerings of the deepest default.  bootstrap.nix's
+        // 5-attr × 9-alternative `... or final.buildPackages.haskell
+        // .compiler.ghc<N>` chains hit 5^9 ≈ 2M lowerExpr calls
+        // each — totaling 4+ GB of libc-malloc growth invisible to
+        // v3's accounting.  Detected via V3_DBG_LOWER_BREAKDOWN:
+        // top-10 most-lowered Expr* showed 877k+ calls on a single
+        // ExprLambda/ExprVar pair from the OR chain.
+        //
+        // Fix: lower defaultExpr ONCE into a thunk (so its eval
+        // stays lazy — matching TW's `(*def)->maybeThunk(state, env)`
+        // in libexpr/eval.cc), then reuse the resulting VarId at
+        // every elseB step.  Pre-fix M^N → post-fix M*N (linear
+        // in chain length).
+        ir::VarId defaultVal = ir::kInvalid;
+        if (e->def) {
+            defaultVal = thunkifyForAttr(e->def);
+        }
+        return emitSelectChain(v, path, defaultVal, 0);
     }
 
+    /// Updated to take `defaultVal: ir::VarId` (a pre-lowered thunk)
+    /// instead of `defaultExpr: nix::Expr *`.  See lowerSelect comment
+    /// for rationale.
     ir::VarId emitSelectChain(ir::VarId attrs,
                               std::span<const nix::AttrName> path,
-                              nix::Expr * defaultExpr,
+                              ir::VarId defaultVal,
                               size_t pathIdx)
     {
         if (pathIdx == path.size()) return attrs;
@@ -2972,7 +2997,7 @@ struct Lowerer
         ir::VarId nameVar = ir::kInvalid;
         if (dyn) nameVar = lowerExpr(step.expr);
 
-        if (defaultExpr) {
+        if (defaultVal != ir::kInvalid) {
             ir::VarId hasIt = dyn
                 ? addBinding(ir::HasAttrDyn{attrs, nameVar})
                 : addBinding(ir::HasAttr{attrs, nm});
@@ -2983,12 +3008,15 @@ struct Lowerer
             ir::VarId got = dyn
                 ? addBinding(ir::AttrSelectDyn{attrs, nameVar})
                 : addBinding(ir::AttrSelect{attrs, nm});
-            ir::VarId rest = emitSelectChain(got, path, defaultExpr, pathIdx + 1);
+            ir::VarId rest = emitSelectChain(got, path, defaultVal, pathIdx + 1);
             setReturn(rest);
             blockStack.pop_back();
 
             blockStack.push_back(elseB);
-            ir::VarId defv = lowerExpr(defaultExpr);
+            // Use the pre-lowered default thunk.  Forcing it yields
+            // its value; tree-walker also forces here via
+            // `state.forceValue(*v, *def)`.
+            ir::VarId defv = forceVal(defaultVal);
             setReturn(defv);
             blockStack.pop_back();
 
@@ -2998,7 +3026,7 @@ struct Lowerer
         ir::VarId v = dyn
             ? addBinding(ir::AttrSelectDyn{attrs, nameVar})
             : addBinding(ir::AttrSelect{attrs, nm});
-        return emitSelectChain(v, path, nullptr, pathIdx + 1);
+        return emitSelectChain(v, path, ir::kInvalid, pathIdx + 1);
     }
 
     ir::VarId lowerHasAttr(nix::ExprOpHasAttr * e)
