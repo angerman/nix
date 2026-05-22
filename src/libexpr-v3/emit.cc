@@ -1709,11 +1709,17 @@ struct Emitter
 
     void emitAll()
     {
-        // Mirror the IR symbol table into the CompilationUnit so the VM
-        // can use SymbolId at runtime without round-tripping to strings.
-        // Copy the global symbol table so SymbolIds in this CU map to
-        // the same names that any other CU in the process uses.
-        unit.symbolTable = ir::globalSymbolTable();
+        // #781b (2026-05-23): no longer mirror the global table into
+        // unit.symbolTable.  Audit shows ZERO callers index into
+        // cu.symbolTable post-compile; serialize::serializeCU reads
+        // names directly from ir::globalSymbolTable() (with cu.
+        // symbolTable as a fallback only if it happens to be set
+        // by an older caller).  Dropping the copy saves ~1 MB of
+        // std::string allocations per CU on a process where the
+        // global table has grown to 50 K symbols — meaningful on
+        // hello.drvPath's 269 import compiles (~270 MB of compile-
+        // time alloc churn).  Keep the field for ABI compatibility
+        // with any code that constructs a CU outside emit.
 
         // Emit inner functions first so their descriptors and code are
         // available before the top-level (which references them via

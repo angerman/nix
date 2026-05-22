@@ -88,7 +88,18 @@ namespace nix::v3::serialize {
 /// 8: #558 (2026-05-10) introduce OP_ATTRS_UPDATE_TAIL (0x88).  IR
 /// `Update::isFunctionReturn` flag.  Old caches must reload because
 /// tail-position // expressions now emit a different opcode.
-constexpr uint32_t kSchemaVersion = 8;
+///
+/// 9: #781b (2026-05-23) sparse symbolTable.  Previously each CU
+/// serialised a copy of the ENTIRE global symbol table (~50 K
+/// entries by the 269th import on hello.drvPath), and deserialize
+/// interned every entry — 296 ms of 304 ms total deserialize cost.
+/// Schema 9 walks the CU's bytecode + formals at serialize time
+/// to collect just the SymbolIds actually referenced; writes
+/// (origId, name) pairs sorted by origId.  On load, deserialize
+/// builds a sparse remap (vector<uint32_t> sized maxOrigId+1).
+/// Bytecode operands still carry the same global IDs from
+/// serialize time; only unreferenced slots are dropped.
+constexpr uint32_t kSchemaVersion = 9;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.
@@ -124,5 +135,28 @@ std::string serializeCU(const CompilationUnit & cu);
 /// Primop names in the blob are resolved via findPrimOp() at load
 /// time; an unknown name throws SerializationError.
 CompilationUnit deserializeCU(std::string_view blob);
+
+/// #777b (2026-05-23) per-section timing breakdown for
+/// deserializeCU.  Only populated when V3_DBG_DESERIALIZE=1 is
+/// set (gated to avoid clock_gettime overhead in steady-state).
+/// Use the breakdown to identify which section dominates the
+/// deserialize budget; informs the next optimisation lever.
+struct DeserializeBreakdownSnapshot {
+    uint64_t headerNs;
+    uint64_t codeNs;
+    uint64_t intConstantsNs;
+    uint64_t floatConstantsNs;
+    uint64_t stringConstantsNs;
+    uint64_t symbolTableNs;
+    uint64_t lambdasNs;
+    uint64_t lambdaCodeOffsetsNs;
+    uint64_t primopsNs;
+    uint64_t miscNs;
+    uint64_t remapNs;
+    uint64_t calls;
+};
+
+DeserializeBreakdownSnapshot deserializeBreakdown();
+bool deserializeBreakdownEnabled();
 
 } // namespace nix::v3::serialize

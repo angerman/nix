@@ -10,6 +10,7 @@
 #include "v3/ir.hh"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,45 @@
 namespace nix::v3::serialize {
 
 namespace {
+
+/// #777b (2026-05-23) sub-section timing accumulator.  Per-section
+/// per-call breakdown printed at end-of-eval under V3_TIMING when
+/// `V3_DBG_DESERIALIZE=1` is also set.  Gated by env var so the
+/// `clock_gettime` overhead (~50 ns / call) doesn't bloat steady-
+/// state production.  Falsifier mechanism for "where inside the
+/// 334 ms deserialize budget does the time actually go?"
+struct DeserializeBreakdown {
+    uint64_t headerNs            = 0;
+    uint64_t codeNs              = 0;
+    uint64_t intConstantsNs      = 0;
+    uint64_t floatConstantsNs    = 0;
+    uint64_t stringConstantsNs   = 0;
+    uint64_t symbolTableNs       = 0;
+    uint64_t lambdasNs           = 0;
+    uint64_t lambdaCodeOffsetsNs = 0;
+    uint64_t primopsNs           = 0;
+    uint64_t miscNs              = 0;
+    uint64_t remapNs             = 0;
+    uint64_t calls               = 0;
+};
+
+DeserializeBreakdown & breakdown()
+{
+    thread_local DeserializeBreakdown bd;
+    return bd;
+}
+
+bool breakdownEnabled()
+{
+    static const bool s_e = std::getenv("V3_DBG_DESERIALIZE") != nullptr;
+    return s_e;
+}
+
+inline uint64_t nowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 /// Tiny streaming writer that appends to an std::string.
 struct Writer {
@@ -78,6 +118,85 @@ struct Reader {
         return s;
     }
 };
+
+/// #781b (2026-05-23) Schema 9: walk the CU's bytecode + lambdas
+/// and return the SORTED de-duplicated set of SymbolIds the CU
+/// actually references.  Mirrors the dispatch table in
+/// remapSymbolsInBytecode (anything that emits a SymbolId
+/// operand or trailing-data SymbolId must also be observed here).
+/// The serialized symbolTable section then carries only these
+/// entries; on load, deserialize builds a sparse remap.  Reduces
+/// the serialized section from `globalSymbolTable.size()` entries
+/// down to a CU-local fraction (typical: 100-500 of 50 000 by
+/// the time hello.drvPath's 269th import is compiled).
+std::vector<uint32_t>
+collectReferencedSymbols(const CompilationUnit & cu)
+{
+    std::vector<uint32_t> refs;
+    refs.reserve(256);
+
+    auto bump = [&](uint32_t id) { refs.push_back(id); };
+
+    const auto & code = cu.code;
+    for (size_t ip = 0; ip < code.size(); ) {
+        uint32_t word = code[ip];
+        Op op = decodeOp(word);
+        uint32_t operand = decodeOperand(word);
+        ++ip;
+
+        if (op == OP_ATTRS_HAS
+         || op == OP_WITH_LOOKUP
+         || op == OP_ATTRS_SELECT
+         || op == OP_REC_BINDING_SLOT_REF) {
+            bump(operand);
+            // OP_ATTRS_SELECT has 1 IC follow-up word.
+            if (op == OP_ATTRS_SELECT) ++ip;
+        } else if (op == OP_ATTRS_INIT) {
+            uint32_t n = operand;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (ip < code.size()) bump(code[ip]);
+                ip += 2;
+            }
+        } else if (op == OP_ATTRS_INIT_DYN) {
+            uint32_t nStatic = (operand >> 12) & 0xFFFu;
+            uint32_t nDyn    =  operand        & 0xFFFu;
+            for (uint32_t i = 0; i < nStatic; ++i) {
+                if (ip < code.size()) bump(code[ip]);
+                ip += 2;
+            }
+            ip += nDyn;
+        } else if (op == OP_ATTRS_REC_INIT
+                || op == OP_ATTRS_LET_REC_INIT
+                || op == OP_ATTRS_REC_INIT_TAIL) {
+            uint32_t n = operand;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (ip + 2 * i < code.size()) bump(code[ip + 2 * i]);
+            }
+            ip += 2 * n;
+        } else if (op == OP_CALL_PRIMOP) {
+            ++ip;  // primop-index follow-up
+        } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
+            ip += 2;  // nUpvalues + nWithTargets
+        }
+        // OP_ATTRS_REC_SET, OP_ATTRS_SELECT_DYN, OP_ATTRS_HAS_DYN,
+        // OP_REC_SLOT_PUBLISH, OP_APPLY_OVERRIDES — operand is not
+        // a SymbolId.  Other opcodes have no trailing data.
+    }
+
+    // Formals carry SymbolIds for parameter names.
+    for (const auto & l : cu.lambdas) {
+        for (const auto & f : l.formals) {
+            bump(f.name);
+        }
+    }
+
+    // Sort + dedup.  Both serialize side (writes pairs in this
+    // order) and deserialize side (builds the remap) depend on
+    // sorted order; consumers do a single pass over the result.
+    std::sort(refs.begin(), refs.end());
+    refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+    return refs;
+}
 
 } // namespace
 
@@ -381,9 +500,38 @@ std::string serializeCU(const CompilationUnit & cu)
     w.u32(static_cast<uint32_t>(cu.stringConstants.size()));
     for (auto & s : cu.stringConstants) w.str(s);
 
-    // Section: symbolTable.
-    w.u32(static_cast<uint32_t>(cu.symbolTable.size()));
-    for (auto & s : cu.symbolTable) w.str(s);
+    // Section: symbolTable.  Schema 9 (#781b): SPARSE — only entries
+    // for SymbolIds actually referenced by this CU's bytecode +
+    // formals.  Format:
+    //   count : u32
+    //   maxId : u32           # max origId across all entries
+    //   (origId : u32, name : str)*  # sorted by origId
+    // The unsorted-source `cu.symbolTable` may be either a copy of
+    // the global table (legacy emit path) or empty (post-#770c).
+    // In either case the names we serialize come from the global
+    // table directly, so the CU doesn't need its symbolTable copy.
+    {
+        const auto refs = collectReferencedSymbols(cu);
+        const auto & gst = ir::globalSymbolTable();
+        uint32_t maxId = 0;
+        for (auto id : refs) if (id > maxId) maxId = id;
+        w.u32(static_cast<uint32_t>(refs.size()));
+        w.u32(maxId);
+        for (auto id : refs) {
+            w.u32(id);
+            // Prefer the (likely up-to-date) cu.symbolTable if it
+            // was populated; fall back to the global table.  Both
+            // are SymbolId-indexed by the same source-of-truth.
+            std::string_view name;
+            if (id < cu.symbolTable.size()
+                && !cu.symbolTable[id].empty()) {
+                name = cu.symbolTable[id];
+            } else if (id < gst.size()) {
+                name = gst[id];
+            }
+            w.str(name);
+        }
+    }
 
     // Section: lambdas (LambdaDescriptor with Formal vector).
     w.u32(static_cast<uint32_t>(cu.lambdas.size()));
@@ -446,6 +594,9 @@ std::string serializeCU(const CompilationUnit & cu)
 CompilationUnit deserializeCU(std::string_view blob)
 {
     Reader r{blob};
+    const bool dbg = breakdownEnabled();
+    if (dbg) ++breakdown().calls;
+    uint64_t t0 = dbg ? nowNs() : 0;
 
     // Verify magic.
     char magic[sizeof(kMagic)];
@@ -469,6 +620,7 @@ CompilationUnit deserializeCU(std::string_view blob)
             "with a different opcode layout (rebuild required)");
 
     CompilationUnit cu;
+    if (dbg) { breakdown().headerNs += nowNs() - t0; t0 = nowNs(); }
 
     // Section: code.
     {
@@ -476,6 +628,7 @@ CompilationUnit deserializeCU(std::string_view blob)
         cu.code.resize(n);
         r.readBytes(cu.code.data(), n * sizeof(uint32_t));
     }
+    if (dbg) { breakdown().codeNs += nowNs() - t0; t0 = nowNs(); }
 
     // Section: intConstants.
     {
@@ -483,6 +636,7 @@ CompilationUnit deserializeCU(std::string_view blob)
         cu.intConstants.reserve(n);
         for (uint32_t i = 0; i < n; ++i) cu.intConstants.push_back(r.i64());
     }
+    if (dbg) { breakdown().intConstantsNs += nowNs() - t0; t0 = nowNs(); }
 
     // Section: floatConstants.
     {
@@ -490,6 +644,7 @@ CompilationUnit deserializeCU(std::string_view blob)
         cu.floatConstants.reserve(n);
         for (uint32_t i = 0; i < n; ++i) cu.floatConstants.push_back(r.f64());
     }
+    if (dbg) { breakdown().floatConstantsNs += nowNs() - t0; t0 = nowNs(); }
 
     // Section: stringConstants.
     {
@@ -497,25 +652,41 @@ CompilationUnit deserializeCU(std::string_view blob)
         cu.stringConstants.reserve(n);
         for (uint32_t i = 0; i < n; ++i) cu.stringConstants.push_back(r.str());
     }
+    if (dbg) { breakdown().stringConstantsNs += nowNs() - t0; t0 = nowNs(); }
 
-    // Section: symbolTable.  #777 (2026-05-23): intern directly from
-    // the blob's bytes without materialising std::strings.  Audit
-    // shows cu.symbolTable is unused post-remap (cleared at end);
-    // its only consumer is the remap table built below.  Building
-    // that table by interning string_view ↦ SymbolId saves N malloc+
-    // memcpy pairs on hello.drvPath that previously dominated the
-    // deserialize cost.
+    // Section: symbolTable.  Schema 9 (#781b): SPARSE.
+    //   count : u32
+    //   maxId : u32
+    //   (origId : u32, name : str)*  # sorted by origId
+    // Build a sparse remap[maxId+1] vector, filled with 0
+    // (kInvalidSymbol — empty string) by default.  Unreferenced
+    // slots default to 0; valid bytecode operands should never
+    // reach those slots, but the remap walk's bounds check
+    // (id < remap.size()) protects against corruption.
+    //
+    // The previous-schema dense format (one entry per global
+    // SymbolId at serialize time) caused 296 ms of 304 ms total
+    // deserialize cost on hello.drvPath — the entire global
+    // symbol table got interned for every CU even though most
+    // CUs only reference a few hundred symbols.  Schema 9
+    // serializes only the referenced subset.
     std::vector<uint32_t> remap;
     {
         uint32_t n = r.u32();
-        remap.reserve(n);
+        uint32_t maxId = r.u32();
+        remap.assign(maxId + 1, 0u);
         for (uint32_t i = 0; i < n; ++i) {
+            uint32_t origId = r.u32();
             std::string_view name = r.strv();
-            remap.push_back(name.empty()
+            if (origId > maxId)
+                throw SerializationError(
+                    "v3 deserialize: symbolTable entry origId > maxId");
+            remap[origId] = name.empty()
                 ? uint32_t{0}
-                : ir::globalInternSymbol(name));
+                : ir::globalInternSymbol(name);
         }
     }
+    if (dbg) { breakdown().symbolTableNs += nowNs() - t0; t0 = nowNs(); }
 
     // Section: lambdas.
     {
@@ -551,6 +722,7 @@ CompilationUnit deserializeCU(std::string_view blob)
             cu.lambdas.push_back(std::move(l));
         }
     }
+    if (dbg) { breakdown().lambdasNs += nowNs() - t0; t0 = nowNs(); }
 
     // Section: lambdaCodeOffsets.
     {
@@ -558,6 +730,7 @@ CompilationUnit deserializeCU(std::string_view blob)
         cu.lambdaCodeOffsets.resize(n);
         r.readBytes(cu.lambdaCodeOffsets.data(), n * sizeof(uint32_t));
     }
+    if (dbg) { breakdown().lambdaCodeOffsetsNs += nowNs() - t0; t0 = nowNs(); }
 
     // Section: primops (resolve by name).  #777 (2026-05-23): zero-
     // copy lookup — findPrimOp() accepts string_view, so no need to
@@ -580,6 +753,7 @@ CompilationUnit deserializeCU(std::string_view blob)
             cu.primops.push_back(po);
         }
     }
+    if (dbg) { breakdown().primopsNs += nowNs() - t0; t0 = nowNs(); }
 
     // Section: attrSelectCache size (zeroed entries on load).
     {
@@ -593,6 +767,7 @@ CompilationUnit deserializeCU(std::string_view blob)
     if (r.pos != blob.size())
         throw SerializationError(
             "v3 deserialize: trailing bytes after end-of-stream");
+    if (dbg) { breakdown().miscNs += nowNs() - t0; t0 = nowNs(); }
 
     // SymbolId remapping.  At serialize time, the symbolTable was a
     // snapshot of the global table (entry i == name of global
@@ -606,6 +781,7 @@ CompilationUnit deserializeCU(std::string_view blob)
             if (f.name < remap.size()) f.name = remap[f.name];
         }
     }
+    if (dbg) { breakdown().remapNs += nowNs() - t0; }
     // #770b/#770c (2026-05-22): cu.symbolTable was already kept
     // empty (we never populated it on deserialize; the section is
     // consumed directly into the remap table by zero-copy interning).
@@ -615,5 +791,18 @@ CompilationUnit deserializeCU(std::string_view blob)
 
     return cu;
 }
+
+DeserializeBreakdownSnapshot deserializeBreakdown()
+{
+    const auto & b = breakdown();
+    return {
+        b.headerNs, b.codeNs, b.intConstantsNs, b.floatConstantsNs,
+        b.stringConstantsNs, b.symbolTableNs, b.lambdasNs,
+        b.lambdaCodeOffsetsNs, b.primopsNs, b.miscNs, b.remapNs,
+        b.calls
+    };
+}
+
+bool deserializeBreakdownEnabled() { return breakdownEnabled(); }
 
 } // namespace nix::v3::serialize

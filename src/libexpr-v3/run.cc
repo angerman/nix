@@ -20,6 +20,7 @@
 #include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/disasm.hh"         // #778 opcount dumper — opName()
 #include "v3/bytecode.hh"
+#include "v3/serialize.hh"      // #777b deserialize per-section timing
 #include "v3/limits.hh"
 #include "v3/nursery.hh"
 #include "v3/barrier.hh"
@@ -357,6 +358,34 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // goes through `runRootExpr`) reports the same data without
         // depending on the CLI specifically.
         dumpPrimOpStats(stderr);
+        // #777b (2026-05-23) deserialize per-section breakdown.
+        // Only printed when V3_DBG_DESERIALIZE=1 (gated to avoid
+        // ~50 ns / clock_gettime overhead on every section in
+        // steady state).  Falsifier mechanism for "where inside
+        // the 334 ms deserialize budget does the time actually
+        // go?".
+        if (serialize::deserializeBreakdownEnabled()) {
+            const auto b = serialize::deserializeBreakdown();
+            if (b.calls > 0) {
+                std::fprintf(stderr,
+                    "v3-direct deserialize breakdown (ms, calls=%llu): "
+                    "header=%.3f code=%.3f intConsts=%.3f floatConsts=%.3f "
+                    "stringConsts=%.3f symbolTable=%.3f lambdas=%.3f "
+                    "lambdaCodeOffsets=%.3f primops=%.3f misc=%.3f remap=%.3f\n",
+                    (unsigned long long)b.calls,
+                    b.headerNs            / 1e6,
+                    b.codeNs              / 1e6,
+                    b.intConstantsNs      / 1e6,
+                    b.floatConstantsNs    / 1e6,
+                    b.stringConstantsNs   / 1e6,
+                    b.symbolTableNs       / 1e6,
+                    b.lambdasNs           / 1e6,
+                    b.lambdaCodeOffsetsNs / 1e6,
+                    b.primopsNs           / 1e6,
+                    b.miscNs              / 1e6,
+                    b.remapNs             / 1e6);
+            }
+        }
         // #770 / #777 promotion (2026-05-22 / 2026-05-23): disk
         // cache effectiveness.  Now default-on; prints whenever
         // primImport ran.  hits/misses/inserts/failures lets the
