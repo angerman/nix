@@ -881,7 +881,12 @@ inline void requireNoStringContextRuntime(const Value & v,
             display = elem.display(*ns->store);
         } catch (...) { /* keep raw fallback */ }
     }
-    (void)siteHint;
+    // V3_DBG_NOCTX_SITE: see matching site in primops.cc.  Cold path.
+    static const bool s_dbgNoCtxSite =
+        std::getenv("V3_DBG_NOCTX_SITE") != nullptr;
+    if (__builtin_expect(s_dbgNoCtxSite, 0))
+        std::fprintf(stderr, "v3 NOCTX-SITE: requireNoStringContextRuntime hint=%.*s\n",
+                     (int)siteHint.size(), siteHint.data());
     throw std::runtime_error(
         std::string("the string '") + v.payload.str
         + "' is not allowed to refer to a store path (such as '"

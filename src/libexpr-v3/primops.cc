@@ -383,7 +383,15 @@ static void requireNoStringContext(EvalState & state, const Value & v,
     }
     // Match TW's wording byte-for-byte (eval.cc:2832) so callers that
     // pattern-match the error string don't need a v3-specific branch.
-    (void)primopName;
+    // V3_DBG_NOCTX_SITE: identify which primop's forceStringNoCtx
+    // call rejected the context.  Cold path — only fires immediately
+    // before throwing.  Used to bisect v3-vs-TW force-order
+    // divergences (#757c).
+    static const bool s_dbgNoCtxSite =
+        std::getenv("V3_DBG_NOCTX_SITE") != nullptr;
+    if (__builtin_expect(s_dbgNoCtxSite, 0))
+        std::fprintf(stderr, "v3 NOCTX-SITE: requireNoStringContext primop=%.*s\n",
+                     (int)primopName.size(), primopName.data());
     std::string buf = "the string '";
     if (v.payload.str) buf.append(v.payload.str);
     buf += "' is not allowed to refer to a store path (such as '";
