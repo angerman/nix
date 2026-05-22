@@ -989,6 +989,27 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
     // pass 2 always agree by construction.
     const uint32_t na = a->size, nb = b->size;
 
+    // #748 (2026-05-22) zero-operand short-circuit.  `a // {}` and
+    // `{} // b` are common in nixpkgs (`pkgs // optionalAttrs cond
+    // {...}` where cond is false; lib.optionalAttrs returns {}).
+    // Both inputs are already WHNF and `mergeBindings` callers treat
+    // the result as immutable, so returning the non-empty operand
+    // directly is safe — no entries to merge, no allocation, no
+    // per-attr position rebuilding.
+    //
+    // Why this is safe with #752 inline PosIdx: positions are stored
+    // INSIDE Bindings::Entry rather than in a side-table keyed by
+    // (Bindings*, SymbolId), so a shared Bindings pointer carries its
+    // own positions inherently.  Pre-#752 this short-circuit was
+    // unsafe because the side-table would have given the wrong
+    // Bindings identity for position lookup.
+    //
+    // Empty-result `{} // {}` falls through to the (now trivial)
+    // two-pass which produces a size-0 Bindings — small enough that
+    // a special case here isn't worth its mental overhead.
+    if (na == 0 && nb > 0) return const_cast<Bindings *>(b);
+    if (nb == 0 && na > 0) return const_cast<Bindings *>(a);
+
     // Pass 1: count distinct keys.  Mirror of the branch logic
     // below; only reads `name` fields, no allocations, no copies,
     // no position lookups.
