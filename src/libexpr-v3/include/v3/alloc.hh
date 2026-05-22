@@ -424,6 +424,18 @@ inline Arena & threadArena() noexcept
 struct Bindings;
 void bindingsAllocSiteRecord(const Bindings * b, const char * file, uint32_t line) noexcept;
 
+// #768a (2026-05-22): namespace-scope env-var cache for allocator-
+// path debug gates whose call sites appear BEFORE the main detail::
+// block further down in this header (the gates referenced by
+// `recordBindingsOrigin` / `cellOwnTrack` / `cellTraceWrite` etc.
+// live in the later block).  The cellEverywhere gate is consulted
+// from `Alloc::allocThunkSuspended` — on every thunk allocation,
+// ~661 K times on hello.drvPath.
+namespace detail {
+inline const bool g_cellEverywhere =
+    std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
+}
+
 struct Alloc
 {
     /// #548c (2026-05-10) Cheney nursery routing.  When the
@@ -519,11 +531,14 @@ struct Alloc
         t->shapeCell = nullptr;
         // #558 Phase 1.5: pre-allocate shapeCell so the body can
         // publish in-progress state via *shapeCell, and forceValue
-        // Black can read it.  Gated NIX_V3_CELL_EVERYWHERE=1.  Cache
-        // the env var once at first call to avoid per-thunk getenv.
-        static const bool s_cellEverywhere =
-            std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
-        if (__builtin_expect(s_cellEverywhere, 0)) {
+        // Black can read it.  Gated NIX_V3_CELL_EVERYWHERE=1.
+        //
+        // #768a (2026-05-22): use the namespace-scope `inline const
+        // bool` defined below so the per-thunk-alloc fast path skips
+        // the magic-static guard-byte load.  allocThunkSuspended is
+        // hit ~661 K times on hello.drvPath; even the marginal load
+        // cost shows up in the i-cache.
+        if (__builtin_expect(detail::g_cellEverywhere, 0)) {
             Value * sc = allocValue();
             // Sentinel: Tag::Thunk(t) — "this thunk has not yet
             // published in-progress state."  Readers compare against
