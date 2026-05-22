@@ -605,7 +605,14 @@ size_t applyStrictnessAtCallSites(Module & m)
 
     size_t elidedSingleArg = 0;
     size_t elidedFormals   = 0;
+    size_t elidedForceMkt  = 0;  // #775 let-inline-strict via Force(MkThunk)
     size_t consideredApps  = 0;
+    size_t consideredForces= 0;
+    size_t passedToInlineForce = 0;
+    // #775 Case (C) sub-funnel: same buckets as App funnel.
+    size_t forceFailNotMkThunk   = 0;
+    size_t forceFailMultiUse     = 0;
+    size_t forceFailNotCloneable = 0;
     // #775 instrumentation: funnel breakdown to find WHY isInlinableMkThunk
     // rejects most strict-hit candidates.  Goal: identify whether (a) the
     // arg isn't a MkThunk in same block, (b) MkThunk has multiple uses, or
@@ -637,6 +644,47 @@ size_t applyStrictnessAtCallSites(Module & m)
         std::unordered_set<VarId> mkthunksToElide;
 
         for (const auto & bd : blk.bindings) {
+            // #775 Case (C): Force(MkThunk_binding) — let-inline-strict
+            // via syntactic Force.  Force is strict by definition;
+            // if its thunk argument is a single-use MkThunk in this
+            // block, inline the body (rewrite Force binding to a
+            // VarRef into the inlined body's tail).  Captures the
+            // `let x = e; in x + 1` pattern that resolveCalleeLambda-
+            // based elision misses (the strict-callee chain only
+            // fires at App sites, not at Force sites).
+            if (const auto * f = std::get_if<Force>(&bd.expr)) {
+                ++consideredForces;
+                // Inline funnel: figure out which leg of isInlinable*
+                // rejects.  We can't reuse the App's funnel because the
+                // resolveCalleeLambda step doesn't apply here — Force is
+                // strict by definition.
+                auto fres = chaseInBlockResolved(f->thunk, defs);
+                if (!fres.expr || !std::get_if<MkThunk>(fres.expr)) {
+                    ++forceFailNotMkThunk;
+                } else if (uses.at(fres.definer) != 1) {
+                    ++forceFailMultiUse;
+                } else {
+                    const MkThunk * mktDiag2 = std::get_if<MkThunk>(fres.expr);
+                    if (mktDiag2->funcIdx >= (FuncId)m.functions.size()) {
+                        ++forceFailNotCloneable;
+                    } else {
+                        const Function & thunkFn = m.functions[mktDiag2->funcIdx];
+                        if (thunkFn.entryBlock == kInvalidBlock
+                            || thunkFn.entryBlock >= (BlockId)m.blocks.size()) {
+                            ++forceFailNotCloneable;
+                        } else {
+                            std::unordered_set<BlockId> visited;
+                            if (!bodyIsCloneable(m, thunkFn.entryBlock, visited)) {
+                                ++forceFailNotCloneable;
+                            } else {
+                                ++passedToInlineForce;
+                                mkthunksToElide.insert(fres.definer);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             const App * app = std::get_if<App>(&bd.expr);
             if (!app) continue;
             ++consideredApps;
@@ -800,6 +848,19 @@ size_t applyStrictnessAtCallSites(Module & m)
                 out.push_back({bd.var, std::move(copy)});
                 continue;
             }
+            // #775 Case (C) rewrite: Force(b) where b was an elided
+            // MkThunk → VarRef(body_tail).  The body is already
+            // inlined; the forced value IS the body's TermReturn.
+            if (auto * f = std::get_if<Force>(&bd.expr)) {
+                auto it = elidedToInline.find(f->thunk);
+                if (it != elidedToInline.end()) {
+                    out.push_back({bd.var, VarRef{it->second}});
+                    ++elidedForceMkt;
+                    continue;
+                }
+                out.push_back(bd);
+                continue;
+            }
             // Default: emit as-is.
             out.push_back(bd);
         }
@@ -807,18 +868,22 @@ size_t applyStrictnessAtCallSites(Module & m)
         blk.bindings = std::move(out);
     }
 
-    const size_t elided = elidedSingleArg + elidedFormals;
+    const size_t elided = elidedSingleArg + elidedFormals + elidedForceMkt;
     if (dbg) {
         std::fprintf(stderr,
             "v3 stage4 v4.1 strict-call-unthunk: elided=%zu "
-            "(single-arg=%zu formals=%zu) of %zu Apps considered "
+            "(single-arg=%zu formals=%zu forceMkt=%zu) of %zu Apps considered "
             "[funnel: failResolve=%zu failStrictArgs=%zu "
             "passedToInline=%zu failNotMkThunk=%zu failMultiUse=%zu "
-            "failNotCloneable=%zu]\n",
-            elided, elidedSingleArg, elidedFormals, consideredApps,
+            "failNotCloneable=%zu | force-of-mkt: considered=%zu passed=%zu "
+            "fail{notMkt=%zu multiUse=%zu notClone=%zu}]\n",
+            elided, elidedSingleArg, elidedFormals, elidedForceMkt,
+            consideredApps,
             failResolveLambda, failStrictArgs,
             passedToInline, failNotMkThunk, failMultiUse,
-            failNotCloneable);
+            failNotCloneable,
+            consideredForces, passedToInlineForce,
+            forceFailNotMkThunk, forceFailMultiUse, forceFailNotCloneable);
     }
 
     return elided;
