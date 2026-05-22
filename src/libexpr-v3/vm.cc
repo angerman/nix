@@ -476,126 +476,200 @@ inline void push(VMState & vm, Value v)
 /// in-memory Value).  Top-level `f == f` always returns false because
 /// the OP_EQ stack-pop holds two distinct Value structs even when their
 /// payload pointer is identical.
-inline bool valueEqual(VMState & vm, Value a, Value b, bool insideContainer = false)
+inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 = false)
 {
-    // #558 Phase 2: inline WHNF check.  valueEqual is called from
-    // primop bodies (primElem, primAll, etc.) and primConcatMap;
-    // when both sides are already WHNF (common after a previous
-    // force), skip the forceValue function call.
-    {
-        Tag at = a.tag();
-        if (__builtin_expect(at == Tag::Thunk
-                             || at == Tag::App
-                             || at == Tag::Slot, 0))
-            a = forceValue(vm, a);
-        Tag bt = b.tag();
-        if (__builtin_expect(bt == Tag::Thunk
-                             || bt == Tag::App
-                             || bt == Tag::Slot, 0))
-            b = forceValue(vm, b);
-    }
-    if (a.tag() != b.tag()) {
-        if (a.isInt() && b.isFloat()) return static_cast<double>(a.payload.i) == b.payload.f;
-        if (a.isFloat() && b.isInt()) return a.payload.f == static_cast<double>(b.payload.i);
-        return false;
-    }
-    switch (a.tag()) {
-    case Tag::Int:    return a.payload.i == b.payload.i;
-    case Tag::Float:  return a.payload.f == b.payload.f;
-    case Tag::Bool:   return a.payload.i == b.payload.i;
-    case Tag::Null:   return true;
-    case Tag::String: return std::string_view(a.payload.str) == std::string_view(b.payload.str);
-    case Tag::Path:   return std::string_view(a.payload.path) == std::string_view(b.payload.path);
-    case Tag::List: {
-        auto * la = a.payload.list;
-        auto * lb = b.payload.list;
-        if (la == lb) return true;
-        uint32_t na = la ? la->size : 0;
-        uint32_t nb = lb ? lb->size : 0;
-        if (na != nb) return false;
-        // A12 (2026-05-17) writeback-force on each element: mirrors
-        // the primElem fix.  Forces list slots through the lvalue so
-        // resolved WHNFs persist in the source list, matching
-        // tree-walker's pointer-sharing semantics.  Without this,
-        // nested list comparisons re-evaluate Tag::App entries on
-        // every outer pass.  Test: test/repro-583-valueEqual-list.nix.
-        for (uint32_t i = 0; i < na; ++i) {
-            Value & ae = la->elems[i];
-            Value & be = lb->elems[i];
-            if (ae.tag() == Tag::App
-                || ae.tag() == Tag::Thunk
-                || ae.tag() == Tag::Slot)
-                ae = forceValue(vm, ae);
-            if (be.tag() == Tag::App
-                || be.tag() == Tag::Thunk
-                || be.tag() == Tag::Slot)
-                be = forceValue(vm, be);
-            if (!valueEqual(vm, ae, be, /*insideContainer=*/true)) return false;
+    // A12b (2026-05-22): iterative valueEqual via explicit work stack.
+    // Pre-fix, this function C-recursed at every nested list/attrset
+    // level (`valueEqual(vm, ae, be, true)` in the List and Attrs
+    // cases).  Deeply nested comparisons — e.g. cardano-node stdenv
+    // assertion chains, nested mkOption defaults — could blow the
+    // kMaxCallDepth=5000 guard or worse, overflow the C-stack outright.
+    // (Per RCA_FAMILY_DIVERGENCE_A7 + ROADMAP_PROGRESS_SNAPSHOT §6:
+    // "A12b depth=5000 — helper-level direct forceValue calls
+    // C-recurse to kMaxCallDepth".)
+    //
+    // The iterative shape uses a heap-allocated work stack of (a, b,
+    // insideContainer) triples.  Each pop processes ONE pair; nested
+    // container element pairs are pushed onto the stack instead of
+    // recursing.  Children are pushed in REVERSE order so left-to-
+    // right processing happens via LIFO pop.  Short-circuit on
+    // inequality returns immediately.
+    //
+    // Why not std::stack: small_vector-equivalent with explicit
+    // reserve(16) keeps allocation off the hot path for typical
+    // comparison shapes (single int / string / small list).
+    //
+    // Semantics preserved: writeback-force on container elements
+    // (#A12); derivation outPath short-circuit (eval-okay-eq-
+    // derivations); pointer-identity short-circuit on same list/
+    // attrset; closure pointer-equality inside containers.
+    struct Task { Value a, b; bool insideContainer; };
+    std::vector<Task> stack;
+    stack.reserve(16);
+    stack.push_back({a0, b0, insideContainer0});
+
+    static const SymbolId tyId = ir::globalInternSymbol("type");
+    static const SymbolId opId = ir::globalInternSymbol("outPath");
+
+    while (!stack.empty()) {
+        Task t = stack.back();
+        stack.pop_back();
+        Value a = t.a, b = t.b;
+        const bool insideContainer = t.insideContainer;
+
+        // #558 Phase 2: inline WHNF check.  valueEqual is called from
+        // primop bodies (primElem, primAll, etc.) and primConcatMap;
+        // when both sides are already WHNF (common after a previous
+        // force), skip the forceValue function call.
+        {
+            Tag at = a.tag();
+            if (__builtin_expect(at == Tag::Thunk
+                                 || at == Tag::App
+                                 || at == Tag::Slot, 0))
+                a = forceValue(vm, a);
+            Tag bt = b.tag();
+            if (__builtin_expect(bt == Tag::Thunk
+                                 || bt == Tag::App
+                                 || bt == Tag::Slot, 0))
+                b = forceValue(vm, b);
         }
-        return true;
-    }
-    case Tag::Attrs: {
-        auto * aa = a.payload.bindings;
-        auto * bb = b.payload.bindings;
-        if (aa == bb) return true;
-        // Special-case derivations: if both attrsets are derivations
-        // (have `type = "derivation"`), compare their `outPath` fields
-        // and ignore the rest.  Matches tree-walker semantics — required
-        // by `eval-okay-eq-derivations` (where `drv // { dummy = 1; }`
-        // still compares equal to the bare `drv`).
-        static const SymbolId tyId = ir::globalInternSymbol("type");
-        static const SymbolId opId = ir::globalInternSymbol("outPath");
-        auto isDrv = [&](const Bindings * b) {
-            if (!b) return false;
-            const Value * t = b->lookup(tyId);
-            if (!t) return false;
-            Value tf = forceValue(vm, *t);
-            return tf.isString() && std::string_view(tf.payload.str) == "derivation";
-        };
-        if (isDrv(aa) && isDrv(bb)) {
-            const Value * pa = aa->lookup(opId);
-            const Value * pb = bb->lookup(opId);
-            if (pa && pb) return valueEqual(vm, *pa, *pb, /*insideContainer=*/true);
+        if (a.tag() != b.tag()) {
+            if (a.isInt() && b.isFloat()) {
+                if (static_cast<double>(a.payload.i) != b.payload.f) return false;
+                continue;
+            }
+            if (a.isFloat() && b.isInt()) {
+                if (a.payload.f != static_cast<double>(b.payload.i)) return false;
+                continue;
+            }
+            return false;
         }
-        uint32_t na = aa ? aa->size : 0;
-        uint32_t nb = bb ? bb->size : 0;
-        if (na != nb) return false;
-        // A12 (2026-05-17) writeback-force on each entry value: see
-        // List case above.  Attrs entries built by primMapAttrs or
-        // lower.cc's lazy-binding lowering are Tag::App; without this,
-        // every valueEqual on the same attrset re-evaluates them.
-        for (uint32_t i = 0; i < na; ++i) {
-            if (aa->entries[i].name != bb->entries[i].name) return false;
-            Value & av = aa->entries[i].value;
-            Value & bv = bb->entries[i].value;
-            if (av.tag() == Tag::App
-                || av.tag() == Tag::Thunk
-                || av.tag() == Tag::Slot)
-                av = forceValue(vm, av);
-            if (bv.tag() == Tag::App
-                || bv.tag() == Tag::Thunk
-                || bv.tag() == Tag::Slot)
-                bv = forceValue(vm, bv);
-            if (!valueEqual(vm, av, bv, /*insideContainer=*/true)) return false;
+        switch (a.tag()) {
+        case Tag::Int:
+            if (a.payload.i != b.payload.i) return false;
+            break;
+        case Tag::Float:
+            if (a.payload.f != b.payload.f) return false;
+            break;
+        case Tag::Bool:
+            if (a.payload.i != b.payload.i) return false;
+            break;
+        case Tag::Null:
+            break;
+        case Tag::String:
+            if (std::string_view(a.payload.str) != std::string_view(b.payload.str))
+                return false;
+            break;
+        case Tag::Path:
+            if (std::string_view(a.payload.path) != std::string_view(b.payload.path))
+                return false;
+            break;
+        case Tag::List: {
+            auto * la = a.payload.list;
+            auto * lb = b.payload.list;
+            if (la == lb) break;
+            uint32_t na = la ? la->size : 0;
+            uint32_t nb = lb ? lb->size : 0;
+            if (na != nb) return false;
+            // A12 (2026-05-17) writeback-force on each element: mirrors
+            // the primElem fix.  Forces list slots through the lvalue so
+            // resolved WHNFs persist in the source list, matching
+            // tree-walker's pointer-sharing semantics.  Without this,
+            // nested list comparisons re-evaluate Tag::App entries on
+            // every outer pass.  Test: test/repro-583-valueEqual-list.nix.
+            //
+            // A12b: push pairs in REVERSE so index [0] sits on top
+            // of the stack and is processed first (left-to-right
+            // semantics + short-circuit on first mismatch).
+            for (uint32_t i = na; i > 0; --i) {
+                uint32_t idx = i - 1;
+                Value & ae = la->elems[idx];
+                Value & be = lb->elems[idx];
+                if (ae.tag() == Tag::App
+                    || ae.tag() == Tag::Thunk
+                    || ae.tag() == Tag::Slot)
+                    ae = forceValue(vm, ae);
+                if (be.tag() == Tag::App
+                    || be.tag() == Tag::Thunk
+                    || be.tag() == Tag::Slot)
+                    be = forceValue(vm, be);
+                stack.push_back({ae, be, /*insideContainer=*/true});
+            }
+            break;
         }
-        return true;
+        case Tag::Attrs: {
+            auto * aa = a.payload.bindings;
+            auto * bb = b.payload.bindings;
+            if (aa == bb) break;
+            // Special-case derivations: if both attrsets are derivations
+            // (have `type = "derivation"`), compare their `outPath` fields
+            // and ignore the rest.  Matches tree-walker semantics — required
+            // by `eval-okay-eq-derivations` (where `drv // { dummy = 1; }`
+            // still compares equal to the bare `drv`).
+            auto isDrv = [&](const Bindings * binds) {
+                if (!binds) return false;
+                const Value * tv = binds->lookup(tyId);
+                if (!tv) return false;
+                Value tf = forceValue(vm, *tv);
+                return tf.isString() && std::string_view(tf.payload.str) == "derivation";
+            };
+            if (isDrv(aa) && isDrv(bb)) {
+                const Value * pa = aa->lookup(opId);
+                const Value * pb = bb->lookup(opId);
+                if (pa && pb) {
+                    stack.push_back({*pa, *pb, /*insideContainer=*/true});
+                    break;
+                }
+            }
+            uint32_t na = aa ? aa->size : 0;
+            uint32_t nb = bb ? bb->size : 0;
+            if (na != nb) return false;
+            // A12 (2026-05-17) writeback-force on each entry value: see
+            // List case above.  Attrs entries built by primMapAttrs or
+            // lower.cc's lazy-binding lowering are Tag::App; without this,
+            // every valueEqual on the same attrset re-evaluates them.
+            //
+            // A12b: name-check inline (cheap), then push value-pair
+            // tasks in REVERSE for left-to-right processing.
+            for (uint32_t i = 0; i < na; ++i)
+                if (aa->entries[i].name != bb->entries[i].name) return false;
+            for (uint32_t i = na; i > 0; --i) {
+                uint32_t idx = i - 1;
+                Value & av = aa->entries[idx].value;
+                Value & bv = bb->entries[idx].value;
+                if (av.tag() == Tag::App
+                    || av.tag() == Tag::Thunk
+                    || av.tag() == Tag::Slot)
+                    av = forceValue(vm, av);
+                if (bv.tag() == Tag::App
+                    || bv.tag() == Tag::Thunk
+                    || bv.tag() == Tag::Slot)
+                    bv = forceValue(vm, bv);
+                stack.push_back({av, bv, /*insideContainer=*/true});
+            }
+            break;
+        }
+        case Tag::Closure:
+        case Tag::PrimOp:
+        case Tag::PrimOpApp:
+            // Direct comparison: never equal.  Inside a container: equal iff
+            // the underlying pointer matches (matches Nix's value-identity
+            // optimization for sibling list/attrset entries).
+            if (!insideContainer) return false;
+            if (a.payload.closure != b.payload.closure) return false;
+            break;
+        case Tag::Uninitialized:
+        case Tag::Thunk:
+        case Tag::App:
+        case Tag::Blackhole:
+        case Tag::External:
+        case Tag::Slot:
+        default:
+            if (a.payload.raw != b.payload.raw) return false;
+            break;
+        }
     }
-    case Tag::Closure:
-    case Tag::PrimOp:
-    case Tag::PrimOpApp:
-        // Direct comparison: never equal.  Inside a container: equal iff
-        // the underlying pointer matches (matches Nix's value-identity
-        // optimization for sibling list/attrset entries).
-        if (!insideContainer) return false;
-        return a.payload.closure == b.payload.closure;
-    case Tag::Uninitialized:
-    case Tag::Thunk:
-    case Tag::App:
-    case Tag::Blackhole:
-    case Tag::External:
-    case Tag::Slot:
-    default:          return a.payload.raw == b.payload.raw;
-    }
+    return true;
 }
 
 // Forward declaration — defined later in the file.
