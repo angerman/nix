@@ -49,6 +49,8 @@ struct ImportTimingTotals
     uint64_t runNs      = 0;  ///< run(*cu) — recursive eval of the imported file
     uint64_t diskLookupNs = 0; ///< disk_cache::lookup
     uint64_t diskInsertNs = 0; ///< disk_cache::insert + serialize
+    uint64_t keyComputeNs = 0; ///< readFile + BLAKE3 hash for cache key
+    uint64_t deserializeNs = 0; ///< serialize::deserializeCU on cache hit
 };
 
 /// Returns the process-wide accumulator.  Single-threaded VM, so

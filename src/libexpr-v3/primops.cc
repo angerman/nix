@@ -7423,18 +7423,24 @@ void primImport(EvalState & state, Value * args, Value & out)
     // rather than the raw user input.  Without this the cache key
     // skipped invalidation on `dir/default.nix` rewriting (the raw
     // `path` for a directory import points at a non-file).
-    auto tParse = impStamp();
-    nix::Expr * e = nullptr;
+    // #770b (2026-05-22): resolve the path and compute the cache key
+    // FIRST, parse only on cache miss.  Previously primImport always
+    // parsed before checking the disk cache; on a cache hit the parse
+    // output was discarded (the cached CU is used instead) yet the
+    // parse cost (~95 ms / 269 imports = 350 µs per file on
+    // hello.drvPath) was still paid.  Splitting resolve+keyCompute
+    // from parse lets cache hits skip parse entirely.
     nix::SourcePath resolvedSp{ns.rootFS, nix::CanonPath::root};
     bool haveResolved = false;
+    bool useCorepkgs = false;
+    std::string corepkgsPath;
     try {
         nix::SourcePath sp(ns.rootFS, nix::CanonPath(path));
         sp = nix::resolveExprPath(sp);
         resolvedSp = sp;
         haveResolved = true;
-        e = ns.parseExprFromFile(sp);
     } catch (...) {
-        std::string corepkgsPath = path;
+        corepkgsPath = path;
         if (!corepkgsPath.empty() && corepkgsPath.front() == '/')
             corepkgsPath = corepkgsPath.substr(1);
         nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(),
@@ -7442,10 +7448,8 @@ void primImport(EvalState & state, Value * args, Value & out)
         if (!cp.pathExists()) throw;
         resolvedSp = cp;
         haveResolved = true;
-        e = ns.parseExprFromFile(cp);
+        useCorepkgs = true;
     }
-    e->bindVars(ns, ns.staticBaseEnv);
-    impBumpNs(importTimingTotals().parseNs, tParse);
 
     // VM-4: try the disk cache before lower+compile.  primImport is
     // the ideal integration point — direct access to source path
@@ -7466,6 +7470,7 @@ void primImport(EvalState & state, Value * args, Value & out)
         // post-default.nix rewriting), not the raw input path.  Symlink
         // retargeting + dir/default.nix selection both invalidate
         // correctly because the read path changes the hash input.
+        auto tKey = impStamp();
         try {
             std::string content = resolvedSp.resolveSymlinks().readFile();
             diskKey = disk_cache::computeKeyForString(content);
@@ -7473,6 +7478,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             // Read failure -> empty key -> cache lookup is skipped,
             // and no insert happens later.  Same fallback as before.
         }
+        impBumpNs(importTimingTotals().keyComputeNs, tKey);
     }
     if (diskCacheEnabled && !diskKey.empty()) {
         auto tLookup = impStamp();
@@ -7480,7 +7486,9 @@ void primImport(EvalState & state, Value * args, Value & out)
         impBumpNs(importTimingTotals().diskLookupNs, tLookup);
         if (blob) {
             try {
+                auto tDes = impStamp();
                 cache.cus.push_back(serialize::deserializeCU(*blob));
+                impBumpNs(importTimingTotals().deserializeNs, tDes);
                 auto tRun = impStamp();
                 out = run(cache.cus.back());
                 impBumpNs(importTimingTotals().runNs, tRun);
@@ -7507,6 +7515,20 @@ void primImport(EvalState & state, Value * args, Value & out)
             }
         }
     }
+
+    // #770b: cache miss — parse the file now (we deferred parse past
+    // the disk-cache lookup so a hit could skip parse entirely).
+    auto tParse = impStamp();
+    nix::Expr * e = nullptr;
+    if (useCorepkgs) {
+        nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(),
+                           nix::CanonPath(corepkgsPath));
+        e = ns.parseExprFromFile(cp);
+    } else {
+        e = ns.parseExprFromFile(resolvedSp);
+    }
+    e->bindVars(ns, ns.staticBaseEnv);
+    impBumpNs(importTimingTotals().parseNs, tParse);
 
     // #755 fix: scope `module` tightly so its std::vector<Block> /
     // std::vector<Function> heap storage is freed BEFORE we recurse

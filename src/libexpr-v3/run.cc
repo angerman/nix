@@ -16,6 +16,7 @@
 #include "v3/alloc.hh"
 #include "v3/bytecode_primops.hh"
 #include "v3/import_timing.hh"  // #769 per-import phase totals
+#include "v3/disk_cache.hh"     // #770 cache-hit/miss stats dump
 #include "v3/limits.hh"
 #include "v3/nursery.hh"
 #include "v3/barrier.hh"
@@ -88,7 +89,7 @@ struct PhaseTimer {
                 "v3-direct import timing (ms): calls=%llu (compile %.3f, miss path) | "
                 "cacheHits result=%llu content=%llu disk=%llu | "
                 "parse=%.3f lower=%.3f optimise=%.3f compile=%.3f "
-                "run=%.3f diskLookup=%.3f diskInsert=%.3f\n",
+                "run=%.3f keyCompute=%.3f diskLookup=%.3f deserialize=%.3f diskInsert=%.3f\n",
                 (unsigned long long)it.calls,
                 (it.parseNs + it.lowerNs + it.optimiseNs + it.compileNs) / 1e6,
                 (unsigned long long)it.resultCacheHits,
@@ -99,7 +100,9 @@ struct PhaseTimer {
                 it.optimiseNs / 1e6,
                 it.compileNs  / 1e6,
                 it.runNs      / 1e6,
+                it.keyComputeNs / 1e6,
                 it.diskLookupNs / 1e6,
+                it.deserializeNs / 1e6,
                 it.diskInsertNs / 1e6);
         }
     }
@@ -338,6 +341,28 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // goes through `runRootExpr`) reports the same data without
         // depending on the CLI specifically.
         dumpPrimOpStats(stderr);
+        // #770 (2026-05-22): disk cache effectiveness.  Always print
+        // when any lookups happened (i.e. NIX_V3_DISK_CACHE was set
+        // and primImport ran).  hits/misses/inserts/failures lets the
+        // user see whether the cache is firing.  When NIX_V3_DISK_CACHE
+        // is unset (default), the disk_cache module is never touched
+        // and all counters stay 0.
+        {
+            const auto & dc = disk_cache::stats();
+            if (dc.lookups + dc.inserts > 0) {
+                std::fprintf(stderr,
+                    "v3-direct disk_cache: lookups=%llu hits=%llu misses=%llu "
+                    "inserts=%llu insertFailures=%llu hit_rate=%.1f%%\n",
+                    (unsigned long long)dc.lookups,
+                    (unsigned long long)dc.hits,
+                    (unsigned long long)dc.misses,
+                    (unsigned long long)dc.inserts,
+                    (unsigned long long)dc.insertFailures,
+                    dc.lookups > 0
+                        ? 100.0 * (double)dc.hits / (double)dc.lookups
+                        : 0.0);
+            }
+        }
         // #738 Phase E v0.1 (2026-05-21) survival-rate banner.
         // Emit when ANY scavenge ran during this eval.  The
         // headline number is the young-gen mortality rate:
