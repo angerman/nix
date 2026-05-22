@@ -130,16 +130,27 @@ namespace {
 ///
 /// Two distinct iteration bounds protect the VM:
 ///
-/// 1. `kMaxIndirectionChase` (4096): max depth of Tag::Slot →
+/// 1. `kMaxIndirectionChase` (100000): max depth of Tag::Slot →
 ///    Tag::Thunk(eval=Slot→…) indirection chains traversed by
 ///    forceValue and OP_FORCE.  Fires only on pathological
 ///    self-referential let-rec patterns (`let x = x; in x`,
 ///    `let x = y; y = x; in x`) — the Black-state check catches
 ///    direct recursion, but SECD-style indirection cycles can
-///    chase forever without re-entering the Black thunk.  Real
-///    workloads have ≤4 indirections (recref + thunkify + slot +
-///    memo) so 4096 is well above the practical maximum and
-///    triggers only when the chain is genuinely cyclic.
+///    chase forever without re-entering the Black thunk.
+///
+///    #757 (2026-05-22): raised from 4096 → 100000 after cardano-
+///    node M5 under v3-native callFlake hit the old limit on a
+///    LEGITIMATE 4096-deep `prev` slot chain through
+///    `lib.composeExtensions`'s `final: prev:` formals (each
+///    haskell-nix overlay layer adds one).  The "≤4 indirections"
+///    assumption that drove the original 4096 was a small-workload
+///    artifact; haskell-nix's `lib.fix (foldr composeExtensions ...)`
+///    legitimately stacks thousands of layers.  Diagnostic ring buffer
+///    + frame stack at the firing point is gated by `V3_DBG_CHASE=1`.
+///    A future optimization can replace this with slot-chain
+///    compression (write the resolved WHNF back to each visited slot)
+///    so subsequent forces hit in O(1) — see opForceCompress* for the
+///    analogous compression on Evaluated thunks.
 ///
 /// 2. `kMaxCallDepth` (5000): max number of CallFrame entries on
 ///    `vm.frames`.  Mirrors tree-walker's recursive C-stack guard.
@@ -156,7 +167,7 @@ namespace {
 /// before OP_CALL dispatches.  The asymmetry is intentional and
 /// noted here so future reviewers don't see "4096 here, 5000 there"
 /// and try to "fix" by unification.
-constexpr int    kMaxIndirectionChase = 4096;
+constexpr int    kMaxIndirectionChase = 100000;
 constexpr size_t kMaxCallDepth        = 5000;
 
 // V3_DBG_TRACE_THUNK_X — file-scope thunk-creation registry.  Bumped
@@ -5774,11 +5785,69 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             constexpr int kOpForceCompressMax = 16;
             Thunk * opForceCompressChain[kOpForceCompressMax];
             int opForceCompressCount = 0;
+            // #757 ring-buffer of recent chase steps for opcode-level
+            // diagnostic at the chase-iter limit firing.  Gated by
+            // V3_DBG_CHASE matching forceValue's ring.
+            static const bool s_dbg_opf_chase = std::getenv("V3_DBG_CHASE") != nullptr;
+            constexpr int kOpfRingSize = 32;
+            Tag opfRingTag[kOpfRingSize] = {};
+            void * opfRingPtr[kOpfRingSize] = {};
+            int opfRingState[kOpfRingSize] = {};
+            int opfRingIdx = 0;
             while (true) {
-                if (__builtin_expect(++forceChaseIters > kMaxIndirectionChase, 0))
+                if (__builtin_expect(s_dbg_opf_chase, 0)) {
+                    opfRingTag[opfRingIdx % kOpfRingSize] = v.tag();
+                    void * p = nullptr;
+                    int st = -1;
+                    if (v.tag() == Tag::Thunk) {
+                        p = v.payload.thunk;
+                        if (v.payload.thunk) st = (int)v.payload.thunk->state;
+                    } else if (v.tag() == Tag::Slot) p = v.payload.slot;
+                    else if (v.tag() == Tag::App)   p = v.payload.pair;
+                    opfRingPtr[opfRingIdx % kOpfRingSize] = p;
+                    opfRingState[opfRingIdx % kOpfRingSize] = st;
+                    opfRingIdx++;
+                }
+                if (__builtin_expect(++forceChaseIters > kMaxIndirectionChase, 0)) {
                     // #680 — match TW phrasing
                     // (libexpr/eval.cc:2594 InfiniteRecursionError).
+                    if (s_dbg_opf_chase) {
+                        std::fprintf(stderr, "v3 OP_FORCE chase-cycle limit %d hit; last %d steps:\n",
+                                     kMaxIndirectionChase, kOpfRingSize);
+                        int start = opfRingIdx > kOpfRingSize ? opfRingIdx - kOpfRingSize : 0;
+                        for (int i = start; i < opfRingIdx; ++i) {
+                            int slot = i % kOpfRingSize;
+                            std::fprintf(stderr,
+                                "  step[%d]: tag=%d ptr=%p", i,
+                                (int)opfRingTag[slot], opfRingPtr[slot]);
+                            if (opfRingTag[slot] == Tag::Thunk && opfRingPtr[slot]) {
+                                std::fprintf(stderr, " state=%d", opfRingState[slot]);
+                                if (opfRingState[slot] == (int)ThunkState::Evaluated) {
+                                    auto * t = static_cast<Thunk *>(opfRingPtr[slot]);
+                                    std::fprintf(stderr, " evaluated.tag=%d", (int)t->evaluated.tag());
+                                }
+                            }
+                            std::fprintf(stderr, "\n");
+                        }
+                        // Frame stack
+                        std::fprintf(stderr, "v3 frame stack (top 16):\n");
+                        size_t lim = vm.frames.size();
+                        for (size_t i = lim; i > 0 && i + 16 > lim; --i) {
+                            const auto & fr = vm.frames[i - 1];
+                            const LambdaDescriptor * d = nullptr;
+                            if (fr.thunk) d = fr.thunk->suspended.desc;
+                            else if (fr.closure) d = fr.closure->desc;
+                            const PosSnapshot * ps = d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                            std::fprintf(stderr, "  frame[%zu]: %s ip=%u thunk=%p pos=%s:%u:%u\n",
+                                i - 1,
+                                d && !d->name.empty() ? d->name.c_str() : "<anon>",
+                                fr.ip, (void*)fr.thunk,
+                                (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                                ps ? ps->line : 0u, ps ? ps->column : 0u);
+                        }
+                    }
                     throw std::runtime_error("infinite recursion encountered");
+                }
                 if (v.tag() == Tag::Slot) {
                     Value * p = v.payload.slot;
                     if (!p) throw std::runtime_error(
