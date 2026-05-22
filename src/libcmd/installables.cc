@@ -464,20 +464,31 @@ Installables SourceExprCommand::parseInstallables(ref<Store> store, std::vector<
         // v3-direct (NIX_V3_DIRECT_EVAL=1) parses cmd.expr / cmd.file
         // itself inside runV3DirectEval and never reads *vFile.
         //
-        // OPT-IN: NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 skips the TW
-        // pre-eval and lazy-thunks *vFile instead so the
-        // NIX_TRACE_EVAL output starts with v3's own events instead
-        // of 353k TW pre-eval lines.  Default OFF because a v3
-        // memoization-failure loop (parse.nix:61 / matchAttrs / ...)
-        // currently re-evaluates the same thunks millions of times
-        // on nixpkgs queries -- without the TW pre-eval to mask it,
-        // even `builtins.isAttrs (import <nixpkgs>{})` runs away to
-        // 50+s CPU at 89%.  Task A12 tracks the memoization fix;
-        // until that lands, the safe default keeps the TW pre-eval
-        // so basic nixpkgs queries complete.
+        // #760 (2026-05-22, Stage 2 binary exit): retired
+        // NIX_V3_SKIP_INSTALLABLE_PREEVAL.  Pre-#760 the gate was
+        // mandatory because v3-direct had a memoization-failure
+        // loop (parse.nix:61 / matchAttrs / ...) that re-evaluated
+        // the same thunks millions of times on nixpkgs queries;
+        // even `builtins.isAttrs (import <nixpkgs>{})` ran away to
+        // 50+ s CPU at 89%, so TW's pre-eval was needed to "warm"
+        // the values before v3 saw them.  The #757 chain
+        // (chase-limit + primReadFile + unsafeDiscardStringContext)
+        // and A12b iterative valueEqual closed that loop class —
+        // `builtins.isAttrs (import (getFlake nixpkgs) {})` now
+        // runs in ~1 s end-to-end via v3 alone with no pre-eval.
+        //
+        // Cross-eval verification (#759: 63/64 nixpkgs packages
+        // byte-identical v3-direct vs TW; #758: 15/15 callFlake
+        // sweep) was the empirical foundation for retiring the
+        // gate.  With v3-direct → mkThunk unconditionally, the
+        // installable hold-over path is uniformly lazy; TW only
+        // parses (no eval) and v3 owns evaluation entirely.
+        //
+        // The `NIX_V3_SKIP_INSTALLABLE_PREEVAL` env var is no
+        // longer read.  If set in existing scripts/CI it's a
+        // silent no-op (the gate it controlled is gone).
         static const bool s_v3DirectEval =
-            std::getenv("NIX_V3_DIRECT_EVAL") != nullptr
-            && std::getenv("NIX_V3_SKIP_INSTALLABLE_PREEVAL") != nullptr;
+            std::getenv("NIX_V3_DIRECT_EVAL") != nullptr;
 
         if (file == "-") {
             auto e = state->parseStdin();

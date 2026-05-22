@@ -87,7 +87,7 @@ run_one() {
     # Native (default).
     local out_native
     out_native=$(env \
-        NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+        NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_HEAP=8G NIX_V3_MAX_WALL_TIME=300s \
         "$NIX" eval --impure --raw --expr "$expr" 2>/dev/null)
     local rc_native=$?
@@ -95,7 +95,7 @@ run_one() {
     # Bridge (opt-out).
     local out_bridge
     out_bridge=$(env \
-        NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+        NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_NO_NATIVE_CALL_FLAKE=1 \
         NIX_V3_MAX_HEAP=8G NIX_V3_MAX_WALL_TIME=300s \
         "$NIX" eval --impure --raw --expr "$expr" 2>/dev/null)

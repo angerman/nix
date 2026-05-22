@@ -35,7 +35,7 @@ run_pair() {
   local tw v3
   tw="$("$NIX" eval --impure --expr "$expr" 2>&1 \
         | grep -v '^Failed\|^warning:' | head -1)"
-  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  v3="$(NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_WALL_TIME=15s \
         "$NIX" eval --impure --expr "$expr" 2>&1 \
         | grep -v '^Failed\|^warning:' | head -1)"

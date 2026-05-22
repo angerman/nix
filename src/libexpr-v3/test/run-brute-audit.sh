@@ -91,7 +91,7 @@ run_case() {
 # run_case_nix <name> <expected-stdout-substring> <expr>
 # Same as run_case but invokes the integrated `nix eval --impure`
 # path so nixpkgs / channel expressions resolve.  Requires
-# `NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1` to
+# `NIX_V3_DIRECT_EVAL=1` to
 # bypass the TW pre-eval at the installable layer (otherwise TW
 # evaluates first and v3 doesn't see the workload).
 # Wider budget (120 s wall, 4 G heap) because nixpkgs evals
@@ -113,7 +113,7 @@ run_case_nix() {
     if [[ -n "${V3_DBG_GC_STRESS:-}" && "${V3_DBG_GC_STRESS}" != "0" ]]; then
         wall_s=600
     fi
-    NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+    NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_WALL_TIME="${wall_s}s" NIX_V3_MAX_HEAP=4G \
         "$NIX" --extra-experimental-features nix-command \
         eval --impure --expr "$expr" \

@@ -42,6 +42,7 @@
 #endif
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/print.hh"
+#include "v3/print.hh"  // #760: v3 printNixValue for toStringCoerceCtx error text
 #include "nix/expr/value/context.hh"
 // #698 Phase 3: v3-native primGetFlake — needs FlakeRef parsing,
 // lockFlake, Settings member access, and LockedFlake type.
@@ -812,23 +813,27 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
                 Value forced = forceValue(*state.vm, *outV);
                 return toStringCoerceCtx(state, forced, ctx, copyPathsToStore);
             }
-            // Include keys in the error for diagnosability.
-            const auto & symTab = ir::globalSymbolTable();
-            std::string msg = "v3 toString: attrset has no outPath / "
-                              "__toString; keys=[";
-            uint32_t lim = std::min<uint32_t>(v.payload.bindings->size, 12u);
-            for (uint32_t i = 0; i < lim; ++i) {
-                SymbolId sid = v.payload.bindings->entries[i].name;
-                if (i) msg += ",";
-                msg += (sid < symTab.size())
-                    ? symTab[sid] : std::string("<sid?>");
-            }
-            if (v.payload.bindings->size > lim) msg += ",...";
-            msg += "]";
-            throw std::runtime_error(msg);
+            // #760 (2026-05-22): match TW's `EvalState::coerceToString`
+            // error byte-for-byte:
+            //   "cannot coerce a set to a string: { extra = "meta-info"; }"
+            // Pre-fix v3 emitted "v3 toString: attrset has no outPath /
+            // __toString; keys=[...]" — divergent prefix + keys-only
+            // diagnostic that masked the byte-equality check in
+            // derivation-parity.sh.  Surfaced when #760 retired
+            // SKIP_INSTALLABLE_PREEVAL (the gate that was hiding v3's
+            // own error behind TW's pre-eval).  Use v3 printNixValue
+            // (the simplified printer, same as TW's printAmbiguous)
+            // for the value-repr — printNixValueRich would mismatch
+            // because TW's coerceToString uses ValuePrinter with
+            // errorPrintOptions but the difference is irrelevant for
+            // small attrsets like passthru.
+            std::ostringstream os;
+            os << "cannot coerce a set to a string: ";
+            nix::v3::printNixValue(os, v, ir::globalSymbolTable());
+            throw std::runtime_error(os.str());
         }
         throw std::runtime_error(
-            "v3 toString: null-bindings attrset");
+            "cannot coerce a set to a string: { }");
     }
     case Tag::Thunk: {
         // #483 part 4: Bridge thunk wrapping a TW value -- force the

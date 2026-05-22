@@ -66,34 +66,34 @@ check_eq() {
 #     nixpkgs + cardano-node) lives in run-758-callflake-sweep.sh.
 
 # Default (= v3-native; the only impl).
-DEFAULT="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_MAX_WALL_TIME=15s \
+DEFAULT="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").smoke" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
 check_eq ".smoke (default)" "$DEFAULT" '"hello"'
 
 # Retired NIX_V3_NATIVE_CALL_FLAKE — must be a no-op.
-NATIVE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_NATIVE_CALL_FLAKE=1 \
+NATIVE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_NATIVE_CALL_FLAKE=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").smoke" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
 check_eq ".smoke (retired NIX_V3_NATIVE_CALL_FLAKE=1 → no-op)" "$NATIVE" '"hello"'
 
 # Retired NIX_V3_NO_NATIVE_CALL_FLAKE — must be a no-op (no bridge any more).
-NO_NATIVE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_NO_NATIVE_CALL_FLAKE=1 \
+NO_NATIVE="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_NATIVE_CALL_FLAKE=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").smoke" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
 check_eq ".smoke (retired NIX_V3_NO_NATIVE_CALL_FLAKE=1 → no-op)" "$NO_NATIVE" '"hello"'
 
 # Deeper traversal.
-DEEP="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+DEEP="$(NIX_V3_DIRECT_EVAL=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").a.b.c" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
 check_eq ".a.b.c (default)" "$DEEP" '"deep"'
 
 # int (42) under default.
-N="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+N="$(NIX_V3_DIRECT_EVAL=1 \
   NIX_V3_MAX_WALL_TIME=15s \
   "$NIX" eval --impure --expr "(builtins.getFlake \"$TRIVIAL\").n" 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"

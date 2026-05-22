@@ -32,7 +32,7 @@ NIX="${NIX:-$ROOT/build/src/nix/nix}"
 fail=0
 
 echo "===== Phase 2: v3-side compile of call-flake.nix ====="
-RESULT="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+RESULT="$(NIX_V3_DIRECT_EVAL=1 \
   NIX_V3_MAX_WALL_TIME=15s "$NIX" eval --impure --expr 'builtins.__v3CompileCallFlake null' 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
 
@@ -46,7 +46,7 @@ fi
 # Idempotency: call again to verify the std::call_once cache hits.
 echo
 echo "===== Phase 2 cache hit (second call is O(1)) ====="
-RESULT2="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+RESULT2="$(NIX_V3_DIRECT_EVAL=1 \
   NIX_V3_MAX_WALL_TIME=15s "$NIX" eval --impure --expr 'builtins.__v3CompileCallFlake null' 2>&1 \
   | grep -v '^Failed\|^warning:' | tail -1)"
 

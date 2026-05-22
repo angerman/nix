@@ -35,7 +35,7 @@ run_err_case() {
   local label="$1" expr="$2"
   local tw v3
   tw="$("$NIX" eval --impure --expr "$expr" 2>&1 | last_error_line)"
-  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  v3="$(NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_WALL_TIME=5s "$NIX" eval --impure --expr "$expr" 2>&1 | last_error_line)"
   tw="$(strip_ws "$tw")"
   v3="$(strip_ws "$v3")"
@@ -52,7 +52,7 @@ run_pos_case() {
   local label="$1" expr="$2" expected="$3"
   local tw v3
   tw="$("$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
-  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  v3="$(NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_WALL_TIME=5s "$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
   if [[ "$tw" == "$v3" && "$tw" == "$expected" ]]; then
     printf "  POS-OK   %-30s => %s\n" "$label" "$tw"

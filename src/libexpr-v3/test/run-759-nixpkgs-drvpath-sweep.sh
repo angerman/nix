@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # #759 — v3-direct vs TW drvPath byte-identical sweep, 60+ nixpkgs
 # packages.  This is the Stage 2 empirical foundation for deleting
-# NIX_V3_SKIP_INSTALLABLE_PREEVAL (per ROADMAP_PROGRESS_SNAPSHOT
+# Stage 2 binary-exit verification (post-#760, SKIP_PREEVAL retired)
 # §"Stage 2 needs to land", item 4: "cross-eval verification against
 # a representative sample of nixpkgs legacyPackages.<sys>").
 #
@@ -14,9 +14,9 @@
 # Modes compared per package, `.drvPath` only (no .outPath — see
 # rationale comment below):
 #   tw      — pure tree-walker (no v3 env vars)
-#   v3      — NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1
-#             (per CLAUDE.md §"NIX_V3_SKIP_INSTALLABLE_PREEVAL is
-#             mandatory for honest v3-direct testing")
+#   v3      — NIX_V3_DIRECT_EVAL=1
+#             (post-#760: SKIP_PREEVAL retired — v3-direct is
+#             lazy-thunk by default)
 #
 # Why drvPath, not outPath: drvPath is a pure function of the
 # derivation's input attrs (name + builder + args + env + outputs +
@@ -184,7 +184,7 @@ eval_one() {
                 --expr "$expr" 2>/dev/null
             ;;
         v3)
-            env NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+            env NIX_V3_DIRECT_EVAL=1 \
                 NIX_V3_MAX_HEAP=4G NIX_V3_MAX_WALL_TIME=120s \
                 "$NIX" eval --impure --raw \
                 --expr "$expr" 2>/dev/null

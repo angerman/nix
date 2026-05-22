@@ -14,7 +14,7 @@ run_v3() {
     local err_f=/tmp/bisect-${name}.err
     printf "\n=== v3 %s ===\n" "$name"
     /usr/bin/time -p env \
-        NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+        NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_HEAP=$CAP NIX_V3_MAX_WALL_TIME=$WALL \
         "$NIX" eval --impure --expr "$expr" >"$out_f" 2>"$err_f"
     local rc=$?

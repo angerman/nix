@@ -63,7 +63,7 @@ for f in "$TEST_DIR"/repro-*.nix; do
 
   # Try TW first; some fixtures need --extra-experimental-features.
   tw="$("$NIX" --extra-experimental-features "nix-command flakes" eval --impure -f "$f" 2>/dev/null || true)"
-  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  v3="$(NIX_V3_DIRECT_EVAL=1 \
         "$NIX" --extra-experimental-features "nix-command flakes" eval --impure -f "$f" 2>/dev/null || true)"
 
   if [[ -n "${SKIP_PARITY[$base]:-}" ]]; then

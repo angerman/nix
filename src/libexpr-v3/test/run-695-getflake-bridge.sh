@@ -34,7 +34,7 @@ run_pair() {
   local label="$1" expr="$2" timeout_s="${3:-30}"
   local tw v3
   tw="$(timeout $timeout_s "$NIX" eval --impure --expr "$expr" 2>&1 | grep -v '^Failed\|^warning:' | head -1)"
-  v3="$(timeout $timeout_s env NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  v3="$(timeout $timeout_s env NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_WALL_TIME=$((timeout_s-5))s NIX_V3_MAX_HEAP=8G \
         "$NIX" eval --impure --expr "$expr" 2>&1 | grep -v '^Failed\|^warning:' | head -1)"
   if [[ "$tw" == "$v3" ]]; then
@@ -52,7 +52,7 @@ echo "===== M3a: getFlake primop resolves (smoke) ====="
 echo 'builtins ? getFlake (TW only — sanity):'
 "$NIX" eval --impure --expr 'builtins ? getFlake' 2>&1 | grep -v '^Failed\|^warning:' | head -1
 echo 'builtins ? getFlake (v3-direct):'
-NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_MAX_WALL_TIME=5s \
+NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=5s \
   "$NIX" eval --impure --expr 'builtins ? getFlake' 2>&1 | grep -v '^Failed\|^warning:' | head -1
 
 echo
@@ -68,7 +68,7 @@ if [[ -n "$CN_PATH" ]]; then
   echo "===== M3b: getFlake cardano-node flake (long timeout, may be slow) ====="
   # Pre-#695: error: attribute 'getFlake' missing
   # Post-#695: bridge resolves; eval slow but functional
-  V3_OUT=$(timeout 120 env NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  V3_OUT=$(timeout 120 env NIX_V3_DIRECT_EVAL=1 \
     NIX_V3_MAX_WALL_TIME=115s NIX_V3_MAX_HEAP=8G \
     "$NIX" eval --impure --expr "(builtins.getFlake \"$CN_PATH\") ? outputs" 2>&1 | grep -v '^Failed\|^warning:' | head -1)
   if [[ "$V3_OUT" == *"missing"* ]]; then

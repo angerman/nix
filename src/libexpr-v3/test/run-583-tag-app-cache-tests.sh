@@ -32,7 +32,7 @@ check_parity() {
     local tw_out tw_traces v3_out v3_traces
 
     tw_out=$("$NIX_BIN" eval --impure --file "$file" 2>&1) || true
-    v3_out=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+    v3_out=$(NIX_V3_DIRECT_EVAL=1 \
         "$NIX_BIN" eval --impure --file "$file" 2>&1) || true
 
     # Strip trace lines for output comparison (traces go to stderr,
@@ -79,7 +79,7 @@ check_throws() {
     local tw_out v3_out
 
     tw_out=$("$NIX_BIN" eval --impure --file "$file" 2>&1) || true
-    v3_out=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+    v3_out=$(NIX_V3_DIRECT_EVAL=1 \
         "$NIX_BIN" eval --impure --file "$file" 2>&1) || true
 
     if ! printf "%s" "$tw_out" | grep -q "$expect_msg"; then

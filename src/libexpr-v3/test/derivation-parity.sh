@@ -32,8 +32,19 @@ failed_cases=()
 run() {
   local name="$1" expr="$2"
   local tw v3
-  tw=$("$NIX" eval --impure --expr "$expr" 2>&1 | tail -1)
-  v3=$(NIX_V3_DIRECT_EVAL=1 "$NIX" eval --impure --expr "$expr" 2>&1 | tail -1)
+  # #760: strip leading whitespace from the last line.  TW's
+  # error<TypeError>().debugThrow() formats errors with a 7-space
+  # indent (the nix CLI's trace-line prefix); v3 throws std::
+  # runtime_error which the CLI catches without that prefix.  The
+  # meaningful error TEXT is what we compare here, not the CLI's
+  # outer formatting.  Pre-#760 SKIP_PREEVAL=1 was implicit-off in
+  # this test which meant `tw=` AND `v3=` both captured TW's
+  # already-evaluated error and were trivially equal — masking the
+  # actual v3 error.  Post-#760 v3 IS engaged and produces its own
+  # error; the text now matches TW byte-for-byte (modulo this
+  # leading-whitespace difference).
+  tw=$("$NIX" eval --impure --expr "$expr" 2>&1 | tail -1 | sed 's/^[[:space:]]*//')
+  v3=$(NIX_V3_DIRECT_EVAL=1 "$NIX" eval --impure --expr "$expr" 2>&1 | tail -1 | sed 's/^[[:space:]]*//')
   total=$((total + 1))
   if [[ "$tw" == "$v3" ]]; then
     echo "OK    $name"

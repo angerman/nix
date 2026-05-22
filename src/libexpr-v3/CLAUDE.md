@@ -46,7 +46,6 @@ NIX_V3_MAX_WALL_TIME=30s   # or 60s for known-long evals
 NIX_V3_MAX_HEAP=2G          # tune per workload (Boehm grows past 1 GB on hello.drvPath)
 NIX_V3_MAX_CPU_TIME=60s     # CPU budget; useful when WALL_TIME may be too loose
 NIX_V3_DIRECT_EVAL=1
-NIX_V3_SKIP_INSTALLABLE_PREEVAL=1
 ```
 
 The limits are real (`limits.cc` / `initLimits()`, called from `runRootExpr`).
@@ -63,28 +62,35 @@ USAGE.md §"Resource limits" documents the units (K/M/G for heap; s/m/h for time
 - SIGTERM from `timeout` skips v3's clean unwind and drops the alloc stats.
 - The v3-internal cap survives across re-entrant `runRootExpr` calls (bytecode-primop install path).
 
-### NIX_V3_SKIP_INSTALLABLE_PREEVAL is mandatory for honest v3-direct testing
+### NIX_V3_SKIP_INSTALLABLE_PREEVAL is RETIRED (post-#760)
 
-For `nix eval --impure --expr ...`, `NIX_V3_DIRECT_EVAL=1` alone is **not enough**.
-The CLI's `parseInstallables` (libcmd/installables.cc:482-504) runs
-`state->eval(e, *vFile)` — full TW evaluation — UNLESS BOTH
-`NIX_V3_DIRECT_EVAL=1` AND `NIX_V3_SKIP_INSTALLABLE_PREEVAL=1` are set, in which
-case it uses `vFile->mkThunk(...)` (lazy, no TW eval).
+Historical note (2026-05-19 → 2026-05-22): for `nix eval --impure
+--expr ...`, `NIX_V3_DIRECT_EVAL=1` alone used to be insufficient.
+The CLI's `parseInstallables` (libcmd/installables.cc) ran
+`state->eval(e, *vFile)` — full TW evaluation — UNLESS both
+`NIX_V3_DIRECT_EVAL=1` AND `NIX_V3_SKIP_INSTALLABLE_PREEVAL=1` were
+set.  Without `SKIP_PREEVAL`, TW pre-evaluated the entire expression
+first; results populated `*vFile` but were ignored by
+`runV3DirectEval`, **masking v3-only failures behind TW's working
+result**.
 
-Without `SKIP_INSTALLABLE_PREEVAL`, TW evaluates the entire expression first; its
-result populates `*vFile` but is unused by `runV3DirectEval`. The user sees v3's
-output, but for working expressions both evaluators succeed and the answers
-agree — masking v3-only failures behind TW's working result. **A "v3 matches
-TW" finding from `nix eval --impure` is meaningless unless `SKIP_PREEVAL` is set.**
+That gate was retired in **#760 (2026-05-22)** — the Stage-2
+meta-kill criterion per ROADMAP_TO_VISION.  The underlying
+"memoization loop" that motivated SKIP_PREEVAL (parse.nix:61 /
+matchAttrs re-evaluating millions of thunks) was closed by the
+#757 chain + A12b iterative valueEqual.  Cross-eval verification
+(63/64 nixpkgs drvPaths byte-identical v3-direct vs TW; 15/15
+callFlake sweep) was the empirical foundation.
 
-This bit me on 2026-05-19 during #665/#666/#667: hello.drvPath etc. appeared to
-match TW even when v3-direct alone couldn't compute them — TW was carrying the
-load. Discovered when investigating `builtins.__derivCoerce` (v3-only primop)
-threw "missing" via `nix eval --impure --expr` even though `v3-eval` standalone
-worked: TW's preeval was raising before v3 could lower.
+Post-#760: `NIX_V3_DIRECT_EVAL=1` ALONE is sufficient.  The CLI
+unconditionally `vFile->mkThunk(...)` for the v3-direct path —
+TW only parses, never pre-evaluates.  The
+`NIX_V3_SKIP_INSTALLABLE_PREEVAL` env var is a silent no-op if
+still set in existing scripts; it will be deleted entirely in a
+subsequent release.
 
-For the `v3-eval` binary directly, there is no preeval — it's already
-v3-only. The gate is only needed in the `nix` CLI path.
+For the `v3-eval` binary directly, there is no preeval — it's
+already v3-only.  Same as before.
 
 ## Critical constraints (hard rules; load-bearing)
 

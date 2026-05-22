@@ -19,7 +19,7 @@ run_pos_case() {
   local label="$1" expr="$2" expected="$3"
   local tw v3
   tw="$("$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
-  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  v3="$(NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_WALL_TIME=60s NIX_V3_MAX_HEAP=2G \
         "$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
   if [[ "$tw" == "$v3" && "$tw" == "$expected" ]]; then
@@ -64,7 +64,7 @@ run_pos_case "makeExtensible-extend" \
 last_err_line() { grep -E "^[[:space:]]*error: " | tail -1; }
 type_err_expr='with (import <nixpkgs>{}).lib; (evalModules { modules = [{ options.x = mkOption { type = types.int; }; config.x = "not-an-int"; }]; }).config.x'
 tw_err=$("$NIX" eval --impure --expr "$type_err_expr" 2>&1 | last_err_line | sed 's/^[[:space:]]*//')
-v3_err=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_MAX_WALL_TIME=60s NIX_V3_MAX_HEAP=2G \
+v3_err=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s NIX_V3_MAX_HEAP=2G \
   "$NIX" eval --impure --expr "$type_err_expr" 2>&1 | last_err_line | sed 's/^[[:space:]]*//')
 if [[ "$tw_err" == "$v3_err"* || "$v3_err" == "$tw_err"* ]] && [[ -n "$v3_err" ]]; then
   printf "  ERR-OK   %-30s => %s\n" "type-error-module" "${v3_err:0:80}"

@@ -28,7 +28,7 @@ if [[ ! -f "$FIXTURE" ]]; then
     exit 2
 fi
 
-OUT=$(env NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+OUT=$(env NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_HEAP=2G NIX_V3_MAX_WALL_TIME=30s \
         "$NIX" eval --impure --file "$FIXTURE" 2>&1 \
        | grep -v '^Failed\|^v3 limits\|^warning')
