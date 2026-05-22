@@ -24,8 +24,10 @@ Outputs:
 
 Modes:
     tw          — pure tree-walker (no v3 env vars)
-    v3-bridge   — v3-direct with bridge callFlake (NIX_V3_NO_NATIVE_CALL_FLAKE=1)
-    v3-native   — v3-direct with v3-native callFlake (default since #700)
+    v3-native   — v3-direct (callFlake is v3-native; bridge retired in #758)
+    v3-bridge   — DEPRECATED alias for v3-native (the bridge no longer
+                  exists post-#758).  Kept so old `--mode tw,v3-bridge,
+                  v3-native` invocations don't error out.
 
 Rule 0 (PERF_TRACE_TOOL_DESIGN §"Rule 0 falsification anchor"):
     The first measurement on hello.drvPath kills or confirms
@@ -90,11 +92,18 @@ def mode_env(mode):
     if mode == "tw":
         return {}, "TW alone"
     if mode == "v3-bridge":
+        # #758: bridge retired.  This mode is a deprecated alias for
+        # v3-native — they execute the same code path.  Kept so old
+        # `--mode tw,v3-bridge,v3-native` invocations don't error.
+        print(
+            "perf-trace.py: WARNING: --mode v3-bridge is deprecated "
+            "(no-op since #758); treating as v3-native",
+            file=sys.stderr,
+        )
         return {
             "NIX_V3_DIRECT_EVAL": "1",
             "NIX_V3_SKIP_INSTALLABLE_PREEVAL": "1",
-            "NIX_V3_NO_NATIVE_CALL_FLAKE": "1",
-        }, "v3-direct + bridge"
+        }, "v3-direct (DEPRECATED v3-bridge → v3-native)"
     if mode == "v3-native":
         return {
             "NIX_V3_DIRECT_EVAL": "1",
