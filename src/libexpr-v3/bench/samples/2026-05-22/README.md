@@ -7,6 +7,13 @@ hello.drvPath + cardano-node M5.
 
   * `hello-drvpath-v3-direct.sample.txt.gz` — v3-direct, 1.4 s
     sample after 0.3 s startup; main-thread total = 692 samples.
+  * `hello-drvpath-v3-post766a.sample.txt.gz` — same workload AFTER
+    `#766a` (opt_strictness + opt_const_fold migrated to FlatBlockMap
+    scratch); main-thread total = 405 samples on-CPU.  Most of the
+    drop is the eliminated `std::__hash_table<VarId,Expr*>::emplace`
+    work (50 → 2 inclusive samples).  **Wall clock is identical to
+    pre-#766a (1.37 s ± 0.03 vs 1.38 s ± 0.01 hyperfine n=10) —
+    the saved CPU lands in idle time, not in faster eval.**
   * `hello-drvpath-tw.sample.txt.gz` — TW, 0.5 s sample; only 1
     main-thread sample (eval finishes faster than the sample
     window — TW eval on hello.drvPath is sub-half-second).

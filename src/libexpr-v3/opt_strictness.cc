@@ -56,12 +56,12 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/ir_scratch.hh"
 #include "v3/primop.hh"
 
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 
 namespace nix::v3::ir {
@@ -248,31 +248,20 @@ bool producesWHNF(const Expr & e)
         || std::holds_alternative<LitBuiltins>(e);
 }
 
-/// VarId -> Expr* for one block's bindings.  Pointers stay valid as
-/// long as the block's `bindings` vector isn't resized (the pass
-/// only mutates `expr` in place; never appends or removes bindings).
-using BlockMap = std::unordered_map<VarId, const Expr *>;
-
-BlockMap mapBlock(const Block & block)
-{
-    BlockMap m;
-    m.reserve(block.bindings.size());
-    for (const auto & b : block.bindings)
-        m.emplace(b.var, &b.expr);
-    return m;
-}
-
 /// Walk VarRef chain inside one block until we hit a non-VarRef Expr.
 /// Returns nullptr if the chain leaves the block (the source is an
 /// upvalue / param / cross-block reference -- opaque to us).
-const Expr * resolve(VarId v, const BlockMap & m)
+///
+/// #766: uses `FlatBlockMap` (sorted vector) instead of a per-call
+/// `std::unordered_map` so the per-block construction skips the
+/// per-node malloc that dominated #765 profile data.
+const Expr * resolve(VarId v, const FlatBlockMap & m)
 {
     size_t hops = 0;
     const auto cap = m.size() + 1;
     while (hops++ < cap) {
-        auto it = m.find(v);
-        if (it == m.end()) return nullptr;
-        const Expr * e = it->second;
+        const Expr * e = m.find(v);
+        if (!e) return nullptr;
         if (auto * vr = std::get_if<VarRef>(e)) {
             if (vr->var == kInvalid) return nullptr;
             v = vr->var;
@@ -366,9 +355,10 @@ size_t elimRedundantForce(Module & m)
     size_t residueByKind[kKindBuckets] = {0};
     size_t residueNullSrc = 0;
     size_t residueInvalidThunk = 0;
+    auto & bm = FlatBlockMap::scratch();
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
         Block & block = m.blocks[bid];
-        BlockMap bm = mapBlock(block);
+        bm.rebuild(block);
         for (auto & bind : block.bindings) {
             auto * f = std::get_if<Force>(&bind.expr);
             if (!f) continue;
@@ -381,11 +371,11 @@ size_t elimRedundantForce(Module & m)
                 if (idx < kKindBuckets) ++residueByKind[idx];
                 continue;
             }
-            VarId aliasedTo = f->thunk;
-            bind.expr = VarRef{aliasedTo};
-            // Update the local map so a later Force in the same block
-            // sees the rewrite immediately (idempotent within a pass).
-            bm[bind.var] = &bind.expr;
+            // Rewrite in-place.  The BlockMap's pointer (`&bind.expr`)
+            // remains valid — only the Expr's content changes.  A
+            // later resolve() in the same block deref's the same
+            // pointer and sees the new VarRef, so no map update needed.
+            bind.expr = VarRef{f->thunk};
             ++rewritten;
         }
     }

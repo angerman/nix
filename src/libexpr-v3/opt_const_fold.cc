@@ -25,12 +25,12 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/ir_scratch.hh"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <unordered_map>
 #include <unordered_set>
 
 namespace nix::v3::ir {
@@ -41,33 +41,22 @@ namespace {
 // Helpers — chase a VarId to its defining Expr inside one block.
 // ---------------------------------------------------------------------------
 
-/// Map VarId -> Expr* for every binding in `block`.  We store pointers
-/// into the live block's vector; the pass never resizes that vector,
-/// so the pointers stay valid for the duration of the visit.
-using BlockMap = std::unordered_map<VarId, const Expr *>;
-
-static BlockMap mapBlock(const Block & block)
-{
-    BlockMap m;
-    m.reserve(block.bindings.size());
-    for (const auto & b : block.bindings)
-        m.emplace(b.var, &b.expr);
-    return m;
-}
-
 /// Resolve `v` through any chain of `VarRef` bindings *within the same
 /// block*.  Returns the underlying Expr*, or nullptr if the var is
 /// defined in an outer scope (we only fold when both operands resolve
 /// inside this block).  Bounded by the map size to avoid pathological
 /// cycles -- v3 IR is acyclic by construction, but defence in depth.
-static const Expr * resolve(VarId v, const BlockMap & m)
+///
+/// #766: uses FlatBlockMap (sorted-vector scratch) instead of a
+/// per-call std::unordered_map to skip per-node malloc/free that
+/// profile data (#765) showed dominant in the IR pipeline.
+static const Expr * resolve(VarId v, const FlatBlockMap & m)
 {
     size_t hops = 0;
     const auto cap = m.size() + 1;
     while (hops++ < cap) {
-        auto it = m.find(v);
-        if (it == m.end()) return nullptr;
-        const Expr * e = it->second;
+        const Expr * e = m.find(v);
+        if (!e) return nullptr;
         if (auto * vr = std::get_if<VarRef>(e)) {
             v = vr->var;
             continue;
@@ -169,7 +158,7 @@ static bool foldLess(const Lit & a, const Lit & b, Expr & out)
 
 // --- Per-binding fold ------------------------------------------------------
 
-static bool tryFold(const Expr & in, const BlockMap & m, Expr & out)
+static bool tryFold(const Expr & in, const FlatBlockMap & m, Expr & out)
 {
     auto getLit = [&](VarId v, Lit & lit) {
         return extractLit(resolve(v, m), lit);
@@ -255,23 +244,22 @@ static bool tryFold(const Expr & in, const BlockMap & m, Expr & out)
 size_t constantFold(Module & m)
 {
     size_t folded = 0;
+    auto & map = FlatBlockMap::scratch();
     // blocks[0] is the kInvalidBlock sentinel and has no bindings.
     for (BlockId i = 1; i < (BlockId)m.blocks.size(); ++i) {
         Block & blk = m.blocks[i];
         if (blk.bindings.empty()) continue;
 
-        // Build the lookup map after each successful fold so resolve()
-        // can chase through freshly-created literal bindings.  Cheap:
-        // O(N) per block, and folds typically cluster.
-        BlockMap map = mapBlock(blk);
+        // Build the lookup map once per block.  Each `bind.expr =`
+        // mutation below updates the Expr in place (same address as
+        // the map already records) — no map rebuild required for
+        // downstream bindings in the same block to see the new RHS.
+        map.rebuild(blk);
 
         for (auto & bind : blk.bindings) {
             Expr replacement;
             if (tryFold(bind.expr, map, replacement)) {
                 bind.expr = std::move(replacement);
-                // Update the map entry to point at the new RHS so
-                // downstream bindings in the same block see the literal.
-                map[bind.var] = &bind.expr;
                 ++folded;
             }
         }
