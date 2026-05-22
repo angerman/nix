@@ -7101,7 +7101,37 @@ void primImport(EvalState & state, Value * args, Value & out)
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop import: no nix EvalState wired (run via v3-eval)");
     std::string path;
-    if (args[0].isString()) path = args[0].payload.str;
+    if (args[0].isString()) {
+        // #757b: if the string carries build context (Built or DrvDeep
+        // entries from `"${pkgs.X}/some/path"`), the path may not yet
+        // exist on disk — we must realise the context (build the
+        // referenced derivations) before reading.  Bridge to TW and
+        // route through realisePath, mirroring TW's `import` semantics
+        // at libexpr/primops.cc:436 (`state.realisePath(pos, v, ...)`).
+        //
+        // For plain strings without context (the common case — plain
+        // file paths), skip the bridge to keep the fast-path cheap.
+        auto * ctxEntries = lookupStringContextEntries(args[0].payload.str);
+        if (ctxEntries && !ctxEntries->empty()) {
+            auto & ns = *state.nixEvalState;
+            nix::Value * tw = v3ToTreeWalker(state, args[0]);
+            if (!tw) {
+                // Fall through to non-realised path; the missing-store-
+                // path error below will surface verbatim — same as TW
+                // when the bridge somehow can't translate.
+                path = args[0].payload.str;
+            } else {
+                try {
+                    auto resolved = ns.realisePath(nix::noPos, *tw);
+                    path = resolved.path.abs();
+                } catch (...) {
+                    throw;  // surface TW's error verbatim
+                }
+            }
+        } else {
+            path = args[0].payload.str;
+        }
+    }
     else if (args[0].isPath()) path = args[0].payload.path;
     else if (args[0].isAttrs()) {
         // #695 follow-on: IFD support.  When args[0] is a derivation
