@@ -39,6 +39,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/ir_call_resolve.hh"   // #745 v4.3 — resolveCalleeLambda
 #include "v3/primop.hh"
 
 #include <cstdio>
@@ -59,7 +60,30 @@ namespace {
 /// (App, MkThunk, AttrSet, ListExpr, LitFunction, etc.) is
 /// non-branching but contributes NO forced operands (we don't
 /// know).
-bool collectForced(const Expr & e, std::unordered_set<VarId> & forced)
+///
+/// #745 v4.3 — cross-fn telemetry counters.  Aggregated across
+/// modules to give a process-wide picture of how often cross-fn
+/// propagation fires + how often resolveCalleeLambda succeeds.
+struct CrossFnStats {
+    uint64_t appsSeen = 0;
+    uint64_t appsResolved = 0;
+    uint64_t appsStrictHit = 0;
+};
+inline CrossFnStats & crossFnStats() {
+    static CrossFnStats s;
+    return s;
+}
+
+/// #745 v4.3: extra args `m` + `defs` for cross-function strictness
+/// propagation.  When App's `fun` resolves to a statically-known
+/// Lambda whose callee's `strictArgs[0]` is set, the App's `arg`
+/// is also forced.  Inputs `m`/`defs` default-null for callers that
+/// don't have them (legacy non-propagating path); when null, App
+/// behaves as before (force `fun` only).
+bool collectForced(const Expr & e,
+                   std::unordered_set<VarId> & forced,
+                   const Module * m = nullptr,
+                   const std::unordered_map<VarId, const Expr *> * defs = nullptr)
 {
     return std::visit([&](const auto & x) -> bool {
         using T = std::decay_t<decltype(x)>;
@@ -127,9 +151,39 @@ bool collectForced(const Expr & e, std::unordered_set<VarId> & forced)
             return true;
         }
         else if constexpr (std::is_same_v<T, App>) {
-            // App forces the function (to dispatch on it).  The
-            // arg is NOT forced — Nix is lazy in arguments.
+            // App forces the function (to dispatch on it).  By
+            // default the arg is NOT forced — Nix is lazy in
+            // arguments.
             forced.insert(x.fun);
+            // #745 v4.3 — cross-function strictness propagation.
+            // When the callee is statically resolvable to a Lambda
+            // whose `strictArgs[0]` is set, the App's `arg` is
+            // unconditionally forced by the callee's body — so
+            // for the strictness analysis of THIS function, treat
+            // `arg` as forced.  This propagates strictness through
+            // call chains: if `f = x: g x` and `g` is strict in
+            // arg0, then `f` is strict in arg0 too.
+            //
+            // The fixed-point driver in `computeFunctionStrictness`
+            // re-runs analysis until strictArgs stabilizes —
+            // callees might have NEW strictArgs on later iterations
+            // that propagate to callers.
+            //
+            // Only fires when (`m`, `defs`) are provided (the v4.3
+            // path); pre-v4.3 callers pass defaults that skip this.
+            if (m && defs) {
+                crossFnStats().appsSeen++;
+                if (const Lambda * callee = resolveCalleeLambda(x.fun, *m, *defs)) {
+                    crossFnStats().appsResolved++;
+                    if (callee->funcIdx < (FuncId)m->functions.size()) {
+                        const Function & cf = m->functions[callee->funcIdx];
+                        if (!cf.strictArgs.empty() && cf.strictArgs[0]) {
+                            forced.insert(x.arg);
+                            crossFnStats().appsStrictHit++;
+                        }
+                    }
+                }
+            }
             return true;
         }
         else if constexpr (std::is_same_v<T, ConcatStrings>) {
@@ -174,12 +228,44 @@ void computeFunctionStrictness(Module & m)
         std::getenv("NIX_V3_DBG_STRICTNESS") != nullptr;
     static const bool s_disabled =
         std::getenv("NIX_V3_NO_FUNC_STRICTNESS") != nullptr;
+    // #745 v4.3: opt-out for cross-function propagation specifically,
+    // so we can A/B-measure the additional analysis cost vs. the
+    // baseline v3 + v4 result.
+    static const bool s_disableCrossFn =
+        std::getenv("NIX_V3_NO_CROSS_FN_STRICTNESS") != nullptr;
     if (s_disabled) return;
+
+    // #745 v4.3: build per-block (VarId → Expr*) maps ONCE before
+    // the fixed-point iteration.  defs is read-only inside the
+    // analysis; rebuilding per iteration would waste time.
+    std::unordered_map<BlockId, std::unordered_map<VarId, const Expr *>> blockDefs;
+    if (!s_disableCrossFn) {
+        for (BlockId bid = 0; bid < (BlockId)m.blocks.size(); ++bid) {
+            auto & defs = blockDefs[bid];
+            for (const auto & bd : m.blocks[bid].bindings) {
+                defs[bd.var] = &bd.expr;
+            }
+        }
+    }
+
+    // #745 v4.3: fixed-point iteration.  strictArgs is a monotone
+    // lattice (bits go 0 → 1, never back), so convergence is
+    // guaranteed.  Bound kMaxIters at 16 to cap pathological
+    // analysis cost on deep call chains; in practice nixpkgs
+    // converges in 2-5 iterations.
+    constexpr int kMaxIters = 16;
+    int iter = 0;
+    bool changed = true;
 
     size_t fnsTotal     = 0;
     size_t fnsWithArgs  = 0;
     size_t formalsTotal = 0;
     size_t formalsStrict = 0;
+
+    while (changed && iter < kMaxIters) {
+        changed = false;
+        ++iter;
+        fnsTotal = fnsWithArgs = formalsTotal = formalsStrict = 0;
 
     // #740 Stage 4 v3 (2026-05-21) — extend to formals-style lambdas.
     // For `{a, b}: body`, formal references in the body lower to
@@ -216,6 +302,11 @@ void computeFunctionStrictness(Module & m)
             }
         }
 
+        // #745 v4.3: snapshot the previous iteration's strictArgs
+        // so we can detect convergence at the end of the per-function
+        // recompute.  On iter 1 the snapshot is the freshly-zeroed
+        // vector from the constructor (or empty if argVars was empty).
+        const std::vector<bool> oldStrictArgs = f.strictArgs;
         f.strictArgs.assign(argVars.size(), false);
         ++fnsTotal;
         formalsTotal += argVars.size();
@@ -254,10 +345,22 @@ void computeFunctionStrictness(Module & m)
             }
         }
 
-        // Second pass: existing forced-set analysis.
+        // Second pass: existing forced-set analysis.  #745 v4.3 —
+        // pass the Module and this block's defs map so App-case
+        // can propagate strictness from statically-resolvable
+        // callees (callee.strictArgs[0] true → arg is forced).
+        // Falls back to the legacy non-propagating behavior when
+        // cross-fn is disabled.
+        const std::unordered_map<VarId, const Expr *> * blockDefsPtr = nullptr;
+        if (!s_disableCrossFn) {
+            auto it = blockDefs.find(f.entryBlock);
+            if (it != blockDefs.end()) blockDefsPtr = &it->second;
+        }
         std::unordered_set<VarId> forced;
         for (const auto & bind : b.bindings) {
-            if (!collectForced(bind.expr, forced)) break;
+            if (!collectForced(bind.expr, forced,
+                               s_disableCrossFn ? nullptr : &m,
+                               blockDefsPtr)) break;
         }
         // TermReturn: the returned value is NOT forced by the body
         // itself — the caller forces it.  Skip.
@@ -308,6 +411,28 @@ void computeFunctionStrictness(Module & m)
         }
         if (strictForFn > 0) ++fnsWithArgs;
         formalsStrict += strictForFn;
+
+        // #745 v4.3: change-detection for fixed-point iteration.
+        // strictArgs is monotone (bits only go 0 → 1), so any
+        // difference between old and new means a new bit became
+        // true — another iteration MIGHT propagate further.  On
+        // the first iter, oldStrictArgs is empty (or all-false),
+        // so changes are noted; on later iters, no-change means
+        // convergence.
+        if (oldStrictArgs != f.strictArgs) changed = true;
+    }
+    // End of per-function loop; while-loop test re-checks `changed`.
+    }  // end while
+
+    if (s_dbg) {
+        const auto & cs = crossFnStats();
+        std::fprintf(stderr,
+            "v3 stage4 strictness: converged after %d iter(s) "
+            "(cross-fn %s; total-Apps-seen=%llu resolved=%llu strict-hit=%llu)\n",
+            iter, s_disableCrossFn ? "disabled" : "enabled",
+            (unsigned long long)cs.appsSeen,
+            (unsigned long long)cs.appsResolved,
+            (unsigned long long)cs.appsStrictHit);
     }
 
     if (s_dbg) {
