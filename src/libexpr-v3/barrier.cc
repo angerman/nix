@@ -51,23 +51,25 @@ std::vector<Value *> & standaloneCellRoots() noexcept
     return tl_standaloneCells;
 }
 
-bool phaseDActive() noexcept
-{
-    // Cache the env-var read across the process lifetime.  The
-    // `static const bool` init runs exactly once on first call;
-    // every subsequent call is one load + one branch.
-    //
-    // Gating on NIX_V3_NURSERY (not NIX_V3_NURSERY_SCAVENGE) because
-    // the barrier must record inter-gen writes whenever ALLOCATIONS
-    // route through the nursery — independent of whether scavenge is
-    // enabled.  An allocation-only-no-scavenge run still wants the
-    // diagnostic correctness (BRUTE+AUDIT distinguish LIVE vs DEAD);
-    // gating on _SCAVENGE would silently lose dirty-list entries.
-    static const bool s_active = [] {
-        const char * v = std::getenv("NIX_V3_NURSERY");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return s_active;
+// #767 (2026-05-22): exposed as a namespace-scope `const bool` so
+// every barrier emit just loads a single byte instead of going
+// through the C++ magic-static guard the prior `static const bool`
+// inside a function required.  The barrier helper declarations in
+// `include/v3/barrier.hh` inline `phaseDActive()` as a direct read
+// of this variable, which the compiler can hoist across multiple
+// adjacent barrier writes.
+//
+// Gating on NIX_V3_NURSERY (not NIX_V3_NURSERY_SCAVENGE) because
+// the barrier must record inter-gen writes whenever ALLOCATIONS
+// route through the nursery — independent of whether scavenge is
+// enabled.  An allocation-only-no-scavenge run still wants the
+// diagnostic correctness (BRUTE+AUDIT distinguish LIVE vs DEAD);
+// gating on _SCAVENGE would silently lose dirty-list entries.
+namespace detail {
+const bool g_phaseDActive = [] {
+    const char * v = std::getenv("NIX_V3_NURSERY");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}();
 }
 
 } // namespace nix::v3

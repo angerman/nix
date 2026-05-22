@@ -95,10 +95,27 @@ std::vector<Value *> & standaloneCellRoots() noexcept;
 // ---------------------------------------------------------------------------
 
 /// Process-wide cached `NIX_V3_NURSERY != "0" && !empty()`.  Reads
-/// the env var once on first call.  When phase D is off, every
-/// barrier helper compiles to: do the write + branch on this bool +
-/// fall through.  Predicted-not-taken in production.
-bool phaseDActive() noexcept;
+/// the env var once at static-init time (before main).  When phase
+/// D is off (the default), every barrier helper compiles to: do
+/// the write + branch on this bool + fall through.  Predicted-not-
+/// taken in production.
+///
+/// #767 (2026-05-22): exposed as an `inline const bool` so the
+/// compiler can hoist the load across multiple barrier writes in
+/// the same caller (e.g. `bindingsSetEntry` followed immediately
+/// by another barrier emit).  The prior `static const bool`
+/// function-local form forced a magic-static guard load on every
+/// call.  Profile data (#765, hello.drvPath) showed the function
+/// at ~2% self-time despite being a flag check — the guard load
+/// was the cost.
+namespace detail {
+extern const bool g_phaseDActive;
+}
+
+[[gnu::always_inline]] inline bool phaseDActive() noexcept
+{
+    return detail::g_phaseDActive;
+}
 
 // ---------------------------------------------------------------------------
 // isNurseryPayload — does this Value's payload point into the nursery?
