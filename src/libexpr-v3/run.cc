@@ -188,6 +188,14 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // inlined VarRef aliases are already collapsed) and BEFORE
     // `computeFreeVars`.  Result is stored in
     // `ir::Function::strictArgs`.
+    //
+    // #774 (2026-05-23): kept on the outer expression only.
+    // Falsifier: moving these into `ir::optimise()` (so primImport
+    // also exercises them) measured 1 elision in 40 961 considered
+    // Apps on hello.drvPath at ~33 ms wall-clock cost.  The
+    // bottleneck is `isInlinableMkThunk`'s single-use + simple-body
+    // constraints, not strictness analysis coverage.  Opt-in to
+    // all-modules via `NIX_V3_STAGE4_ALL_MODULES=1`.
     ir::computeFunctionStrictness(module);
 
     // #742 Stage 4 v4 / #743 v4.1: caller-side use of strictness

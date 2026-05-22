@@ -422,6 +422,38 @@ void optimise(Module & m)
     } else {
         deadBindingElim(m);
     }
+
+    // #774 (2026-05-23): Stage 4 strictness analysis + call-site
+    // elision pass.  Gated by NIX_V3_STAGE4_ALL_MODULES=1.
+    //
+    // Default OFF after falsification (see commit body):
+    //   * 781 656 Apps analyzed across 281 modules on hello.drvPath
+    //   * 11 870 resolved (1.5 % resolveCalleeLambda hit rate)
+    //   * 2 338 strict-hits (0.3 %)
+    //   * **1 elision** out of 40 961 considered Apps
+    //   * Wall-clock cost: ~33 ms slower on hello.drvPath (1.407 s
+    //     vs 1.374 s, n=10 hyperfine)
+    //
+    // The bottleneck isn't strictness analysis depth — it's
+    // `isInlinableMkThunk`'s constraints (single-use binding +
+    // simple cloneable body).  Even with 100 % pipeline coverage
+    // (this commit's change) the elision rate stays at 0.0024 %.
+    // The pass remains opt-in for future investigation; future
+    // v4.4 work needs a different elision shape (relaxed
+    // single-use, larger body templates) before this is worth
+    // running on every module.
+    //
+    // The OUTER expression's Stage 4 still runs from run.cc as
+    // before (the wall-clock cost there is ~zero — outer Apps
+    // count is small).
+    static const bool stage4AllModules =
+        std::getenv("NIX_V3_STAGE4_ALL_MODULES") != nullptr;
+    if (__builtin_expect(stage4AllModules, 0)) {
+        computeFunctionStrictness(m);
+        for (int it = 0; it < 8; ++it) {
+            if (applyStrictnessAtCallSites(m) == 0) break;
+        }
+    }
 }
 
 } // namespace nix::v3::ir
