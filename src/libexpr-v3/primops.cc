@@ -6209,7 +6209,8 @@ static void buildAndWriteDrvNative(
     std::string v3DrvKey;
     bool v3DrvHit = false;
     if (value_serialize::drvHashCacheEnabled()
-        || value_serialize::drvHashCacheActiveEnabled()) {
+        || value_serialize::drvHashCacheActiveEnabled()
+        || value_serialize::drvHashCacheDiskEnabled()) {
         v3DrvKey = drvPathS;
         v3DrvHit = value_serialize::drvHashCacheLookup(v3DrvKey, v3DrvCached);
     }

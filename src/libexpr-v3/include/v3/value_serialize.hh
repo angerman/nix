@@ -267,6 +267,18 @@ DrvHashCacheStats & drvHashCacheStats() noexcept;
 /// (lookups still go through the same machinery).
 bool drvHashCacheActiveEnabled() noexcept;
 
+/// #741 Phase 5: when set, drvHashCache lookups/inserts also pass
+/// through the disk-backed `EvalResults` SQLite table (see
+/// disk_cache::lookupEvalResult / insertEvalResult).  Enables
+/// cross-process cache replay: a process that populates the cache
+/// inserts to disk; a later process loads from disk on first lookup.
+///
+/// Gate: NIX_V3_DRV_HASH_CACHE_DISK=1.  Combinable with SHADOW (Phase
+/// 5 SHADOW) or ACTIVE (Phase 5 ACTIVE — but in-process drvHashes
+/// replay is not yet implemented for cross-process warm hits; safe
+/// only in readOnlyMode + when the .drv file is preserved on disk).
+bool drvHashCacheDiskEnabled() noexcept;
+
 /// SHADOW-mode lookup by external key (e.g. drvPath string).  On hit,
 /// fills outResult with the deserialised cached value.  Caller is
 /// expected to verify outResult against just-computed in shadow mode.

@@ -88,6 +88,17 @@ create table if not exists CompilationUnits (
     size      integer not null
 );
 create index if not exists idx_lru on CompilationUnits(last_used);
+-- #741 Phase 5: eval-result cache (drvPath-keyed result attrset blobs).
+-- Mirrors the CompilationUnits shape but uses kEvalResultSchemaVersion
+-- so format changes to one cache don't invalidate the other.
+create table if not exists EvalResults (
+    key       blob primary key,
+    blob      blob not null,
+    schema    integer not null,
+    last_used integer not null,
+    size      integer not null
+);
+create index if not exists idx_eval_lru on EvalResults(last_used);
 )sql";
 
 /// Lazily-opened SQLite handle.  Wrapped in Sync<> so any thread can
@@ -100,6 +111,10 @@ struct DbState
     nix::SQLiteStmt insert;
     nix::SQLiteStmt lookup;
     nix::SQLiteStmt updateLastUsed;
+    // #741 Phase 5: parallel statements for the EvalResults table.
+    nix::SQLiteStmt evalInsert;
+    nix::SQLiteStmt evalLookup;
+    nix::SQLiteStmt evalUpdateLastUsed;
     bool initialised = false;
 };
 
@@ -151,6 +166,18 @@ bool ensureOpen()
         state->updateLastUsed.create(
             state->db,
             "update CompilationUnits set last_used = unixepoch() where key = ?");
+        // #741 Phase 5: EvalResults statements.
+        state->evalInsert.create(
+            state->db,
+            "insert or ignore into EvalResults "
+            "(key, blob, schema, last_used, size) "
+            "values (?, ?, ?, unixepoch(), ?)");
+        state->evalLookup.create(
+            state->db,
+            "select blob from EvalResults where key = ? and schema = ?");
+        state->evalUpdateLastUsed.create(
+            state->db,
+            "update EvalResults set last_used = unixepoch() where key = ?");
         state->initialised = true;
         return true;
     } catch (...) {
@@ -254,6 +281,72 @@ Stats & stats() noexcept
 {
     static Stats s;
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// #741 Phase 5 — EvalResults table.  Symmetric implementation to
+// lookup/insert above, parametrised on the parallel prepared
+// statements and the independent schema-version constant.
+// ---------------------------------------------------------------------------
+
+std::optional<std::string> lookupEvalResult(const CacheKey & key)
+{
+    auto & st = stats();
+    if (key.empty()) return std::nullopt;
+    if (!ensureOpen()) { st.evalMisses++; return std::nullopt; }
+    st.evalLookups++;
+    auto & h = dbHandle();
+    try {
+        auto state = h.state.lock();
+        sqlite3_stmt * raw = static_cast<sqlite3_stmt *>(state->evalLookup);
+        sqlite3_reset(raw);
+        sqlite3_bind_blob(raw, 1, key.bytes, sizeof key.bytes, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(raw, 2,
+            static_cast<int64_t>(kEvalResultSchemaVersion));
+        int rc = sqlite3_step(raw);
+        if (rc != SQLITE_ROW) { st.evalMisses++; return std::nullopt; }
+        const void * data = sqlite3_column_blob(raw, 0);
+        int len = sqlite3_column_bytes(raw, 0);
+        std::string blob(static_cast<const char *>(data),
+                         static_cast<size_t>(len));
+        try {
+            sqlite3_stmt * up = static_cast<sqlite3_stmt *>(state->evalUpdateLastUsed);
+            sqlite3_reset(up);
+            sqlite3_bind_blob(up, 1, key.bytes, sizeof key.bytes, SQLITE_TRANSIENT);
+            sqlite3_step(up);
+        } catch (...) { /* advisory */ }
+        st.evalHits++;
+        return blob;
+    } catch (...) {
+        h.failed.store(true, std::memory_order_relaxed);
+        st.evalMisses++;
+        return std::nullopt;
+    }
+}
+
+void insertEvalResult(const CacheKey & key, std::string_view blob)
+{
+    auto & st = stats();
+    if (key.empty() || blob.empty()) return;
+    if (!ensureOpen()) { st.evalInsertFailures++; return; }
+    auto & h = dbHandle();
+    try {
+        auto state = h.state.lock();
+        sqlite3_stmt * raw = static_cast<sqlite3_stmt *>(state->evalInsert);
+        sqlite3_reset(raw);
+        sqlite3_bind_blob(raw, 1, key.bytes, sizeof key.bytes, SQLITE_TRANSIENT);
+        sqlite3_bind_blob64(raw, 2, blob.data(),
+            static_cast<sqlite3_uint64>(blob.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(raw, 3,
+            static_cast<int64_t>(kEvalResultSchemaVersion));
+        sqlite3_bind_int64(raw, 4, static_cast<int64_t>(blob.size()));
+        int rc = sqlite3_step(raw);
+        if (rc != SQLITE_DONE) { st.evalInsertFailures++; return; }
+        st.evalInserts++;
+    } catch (...) {
+        h.failed.store(true, std::memory_order_relaxed);
+        st.evalInsertFailures++;
+    }
 }
 
 } // namespace nix::v3::disk_cache

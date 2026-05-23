@@ -16,6 +16,7 @@
 #include "v3/alloc.hh"
 #include "v3/barrier.hh"
 #include "v3/closure.hh"  // Thunk + ThunkState (for chaseToWHNF)
+#include "v3/disk_cache.hh"  // Phase 5: lookupEvalResult / insertEvalResult
 #include "v3/ir.hh"
 #include "v3/value.hh"
 
@@ -843,9 +844,20 @@ bool drvHashCacheActiveEnabled() noexcept
     return enabled;
 }
 
+bool drvHashCacheDiskEnabled() noexcept
+{
+    static const bool enabled = []() {
+        const char * e = std::getenv("NIX_V3_DRV_HASH_CACHE_DISK");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
 bool drvHashCacheLookup(const std::string & key, Value & outResult) noexcept
 {
-    if (!drvHashCacheEnabled() && !drvHashCacheActiveEnabled()) return false;
+    if (!drvHashCacheEnabled()
+        && !drvHashCacheActiveEnabled()
+        && !drvHashCacheDiskEnabled()) return false;
     if (key.empty()) return false;
     auto & stats = drvHashCacheStats();
     ++stats.lookups;
@@ -854,26 +866,54 @@ bool drvHashCacheLookup(const std::string & key, Value & outResult) noexcept
     auto it = cache.find(key);
     auto t1 = std::chrono::steady_clock::now();
     stats.totalLookupNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    if (it == cache.end()) {
-        ++stats.misses;
-        return false;
+    if (it != cache.end()) {
+        // In-memory hit.
+        try {
+            outResult = deserialize(it->second);
+        } catch (...) {
+            ++stats.deserErrors;
+            return false;
+        }
+        auto t2 = std::chrono::steady_clock::now();
+        stats.totalDeserNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        stats.bytesDelivered += it->second.size();
+        ++stats.hits;
+        return true;
     }
-    try {
-        outResult = deserialize(it->second);
-    } catch (...) {
-        ++stats.deserErrors;
-        return false;
+
+    // #741 Phase 5: in-memory miss — try the disk cache.  On disk
+    // hit, promote into the in-memory map so subsequent in-process
+    // lookups for the same drvPath are fast.
+    if (drvHashCacheDiskEnabled()) {
+        auto diskKey = disk_cache::computeKeyForString(key);
+        auto diskBlob = disk_cache::lookupEvalResult(diskKey);
+        if (diskBlob) {
+            try {
+                outResult = deserialize(*diskBlob);
+            } catch (...) {
+                ++stats.deserErrors;
+                ++stats.misses;
+                return false;
+            }
+            auto t2 = std::chrono::steady_clock::now();
+            stats.totalDeserNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+            stats.bytesDelivered += diskBlob->size();
+            // Promote into in-memory for fast subsequent hits.
+            cache.emplace(key, std::move(*diskBlob));
+            ++stats.hits;
+            return true;
+        }
     }
-    auto t2 = std::chrono::steady_clock::now();
-    stats.totalDeserNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
-    stats.bytesDelivered += it->second.size();
-    ++stats.hits;
-    return true;
+
+    ++stats.misses;
+    return false;
 }
 
 void drvHashCacheInsert(const std::string & key, const Value & result) noexcept
 {
-    if (!drvHashCacheEnabled() && !drvHashCacheActiveEnabled()) return;
+    if (!drvHashCacheEnabled()
+        && !drvHashCacheActiveEnabled()
+        && !drvHashCacheDiskEnabled()) return;
     if (key.empty()) return;
     auto & stats = drvHashCacheStats();
     std::string blob;
@@ -886,13 +926,21 @@ void drvHashCacheInsert(const std::string & key, const Value & result) noexcept
     auto t1 = std::chrono::steady_clock::now();
     stats.totalSerNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     stats.bytesCached += blob.size();
+    // #741 Phase 5: persist to disk first (best-effort), then move
+    // into in-memory.  string_view doesn't consume blob.
+    if (drvHashCacheDiskEnabled()) {
+        auto diskKey = disk_cache::computeKeyForString(key);
+        disk_cache::insertEvalResult(diskKey, blob);
+    }
     drvHashCacheMap().emplace(key, std::move(blob));
     ++stats.inserts;
 }
 
 void dumpDrvHashCacheStats(std::FILE * out)
 {
-    if (!drvHashCacheEnabled() && !drvHashCacheActiveEnabled()) return;
+    if (!drvHashCacheEnabled()
+        && !drvHashCacheActiveEnabled()
+        && !drvHashCacheDiskEnabled()) return;
     const auto & s = drvHashCacheStats();
     if (s.lookups == 0) return;
     auto safe = [](uint64_t n) -> uint64_t { return n ? n : 1; };
@@ -901,13 +949,14 @@ void dumpDrvHashCacheStats(std::FILE * out)
     double avgSerUs    = (s.totalSerNs    / 1000.0) / safe(s.inserts);
     double hitRate     = 100.0 * static_cast<double>(s.hits) / safe(s.lookups);
     const char * mode = drvHashCacheActiveEnabled() ? "ACTIVE" : "SHADOW";
+    const char * disk = drvHashCacheDiskEnabled() ? "+DISK" : "";
     std::fprintf(out,
-        "v3-direct drv-hash-cache (%s): lookups=%llu hits=%llu misses=%llu "
+        "v3-direct drv-hash-cache (%s%s): lookups=%llu hits=%llu misses=%llu "
         "inserts=%llu mismatch=%llu activeSkips=%llu hit_rate=%.1f%%\n"
         "  avg: lookup=%.2f us deser-on-hit=%.2f us ser-on-insert=%.2f us\n"
         "  bytes: cached=%.2f MB delivered=%.2f MB\n"
         "  errors: deser=%llu\n",
-        mode,
+        mode, disk,
         (unsigned long long)s.lookups, (unsigned long long)s.hits,
         (unsigned long long)s.misses, (unsigned long long)s.inserts,
         (unsigned long long)s.mismatchHits,
@@ -916,6 +965,18 @@ void dumpDrvHashCacheStats(std::FILE * out)
         s.bytesCached / (1024.0 * 1024.0),
         s.bytesDelivered / (1024.0 * 1024.0),
         (unsigned long long)s.deserErrors);
+    // Show disk-side stats from disk_cache namespace when DISK is on.
+    if (drvHashCacheDiskEnabled()) {
+        const auto & ds = disk_cache::stats();
+        std::fprintf(out,
+            "  disk: evalLookups=%llu evalHits=%llu evalMisses=%llu "
+            "evalInserts=%llu evalInsertFailures=%llu\n",
+            (unsigned long long)ds.evalLookups,
+            (unsigned long long)ds.evalHits,
+            (unsigned long long)ds.evalMisses,
+            (unsigned long long)ds.evalInserts,
+            (unsigned long long)ds.evalInsertFailures);
+    }
 }
 
 void dumpStats(std::FILE * out)

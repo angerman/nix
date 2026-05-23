@@ -62,12 +62,49 @@ void insert(const CacheKey & key, std::string_view blob);
 /// Process-wide stats counters.  Always populated; printed via
 /// NIX_VM_STATS so users can confirm the cache is firing.
 struct Stats {
+    // CompilationUnits table (the existing CU disk cache).
     uint64_t lookups = 0;
     uint64_t hits    = 0;
     uint64_t misses  = 0;
     uint64_t inserts = 0;
     uint64_t insertFailures = 0;
+    // EvalResults table (added by #741 Phase 5).
+    uint64_t evalLookups        = 0;
+    uint64_t evalHits           = 0;
+    uint64_t evalMisses         = 0;
+    uint64_t evalInserts        = 0;
+    uint64_t evalInsertFailures = 0;
 };
 Stats & stats() noexcept;
+
+// ---------------------------------------------------------------------------
+// #741 Phase 5 (2026-05-23) — disk-persisted eval-result cache.
+//
+// New table `EvalResults` in the same SQLite database.  Schema mirrors
+// CompilationUnits but uses an independent schema-version constant
+// (`kEvalResultSchemaVersion`) so format changes to one cache don't
+// invalidate the other.
+//
+// Cache key: SHA-256 over the drvPath string.  (drvPath IS the
+// canonical content hash of the constructed `drv` per libstore.)
+// Cache value: serialized v3 Value of the derivation result attrset,
+// produced by `value_serialize::serialize()`.
+//
+// Usage from `value_serialize::drvHashCache*`:
+//   * `drvHashCacheLookup` calls `lookupEvalResult` on in-memory miss
+//   * `drvHashCacheInsert` calls `insertEvalResult` after in-memory insert
+//
+// Phase 5 SHADOW (this commit): always run primop body even on hit;
+// just verify cached vs computed.  Phase 5 ACTIVE skip-on-hit
+// requires modulo-hash caching for `drvHashes` replay (next session).
+// ---------------------------------------------------------------------------
+
+/// Bumped on any breaking change to the EvalResults table's blob format
+/// (i.e. the value_serialize V3VR encoding).  Schema mismatches on
+/// load are silent misses; insertions overwrite via `insert or ignore`.
+constexpr uint32_t kEvalResultSchemaVersion = 1;
+
+std::optional<std::string> lookupEvalResult(const CacheKey & key);
+void insertEvalResult(const CacheKey & key, std::string_view blob);
 
 } // namespace nix::v3::disk_cache
