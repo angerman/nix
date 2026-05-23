@@ -133,16 +133,65 @@ Pre-conditions for default-on promotion:
   * ✓ Wall-positive on its target workload class (eval-heavy IFD)
   * ✓ Scoping fix prevents pathological cache-bloat on
     nixpkgs-internal imports
-  * ? Wall-neutral on workloads with no IFD (need confirmation —
-    `hello.drvPath`, `firefox.drvPath`, etc.)
+  * ✓ **Wall-neutral on no-IFD workloads** (validated this session;
+    see below)
   * ? Wall-neutral on workloads where T_eval ≈ T_deser
     (large literal-attr IFDs as in `ifd-huge.nix`)
+  * ? Real haskell.nix workload validation (requires bringing in
+    a representative cabal project — not in this session's scope)
 
-The next test in the validation track is to confirm the cache is
-wall-neutral (not wall-negative) on workloads without IFD imports
-— the cold-side cost of *checking-without-finding* must be cheap.
-That measurement governs whether Phase 4b can ship default-on or
-must stay opt-in for IFD-heavy workflows.
+### No-IFD wall-neutrality validation (2026-05-24)
+
+Two canonical no-IFD workloads tested in steady state (pre-warmed
+CU disk cache, no `--prepare` clauses).
+
+**hello.name** (n=10, warmup=2):
+
+  | Mode     | Wall     | σ       |
+  |----------|----------|---------|
+  | GATE-OFF | 264.9 ms | 6.0 ms  |
+  | GATE-ON  | 267.7 ms | 5.2 ms  |
+
+  Diff: +2.8 ms (0.5σ) — within noise.  `EvalResults` table remains
+  empty after the run (correctly scoped).  IFD probes:
+  `total=573 with-ctx=0` — i.e. no IFD candidates seen, so
+  cache-side code never executes.
+
+**hello.drvPath** (n=8, warmup=2):
+
+  | Mode     | Wall     | σ       |
+  |----------|----------|---------|
+  | GATE-OFF | 834.9 ms | 9.5 ms  |
+  | GATE-ON  | 839.2 ms | 10.7 ms |
+
+  Diff: +4.3 ms (0.4σ) — within noise.  `EvalResults=0`.
+
+This is the **decisive default-on test**: when the workload has
+no actual IFD events, enabling the cache costs nothing measurable.
+Combined with the wall-positive result on IFD-heavy workloads,
+Phase 4b would be a strict win as default-on.
+
+#### Methodology note (cache-warming pitfall)
+
+A first attempt at the no-IFD test used `--prepare "rm -rf <cache>"`
+on the GATE-ON benchmark, which inadvertently wiped the
+default-on CU disk cache (#770/#771) between every iteration.  The
+resulting 2.29× slowdown was a CU disk-cache cold-recompile artefact,
+not a Phase 4b cost.  Fix: pre-warm both caches to steady state and
+omit `--prepare` for steady-state measurements.
+
+Lesson logged: **when benchmarking Phase 4b with `--prepare`, only
+target the EvalResults table** (e.g. via `sqlite3 ... "delete from
+EvalResults"`), never the whole cache directory.
+
+### Aborted methodology — recorded for clarity
+
+The first measurement of GATE-ON on hello.name showed 2.29× slower
+than GATE-OFF (568 ms vs 248 ms).  This finding would have been
+catastrophic for default-on promotion.  RCA traced it to the
+`--prepare` clause wiping the CU disk cache, not a Phase 4b cost.
+The corrected steady-state measurement (above) shows wall-neutral
+behaviour.
 
 ### Real-world workload alignment
 
