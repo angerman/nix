@@ -97,6 +97,16 @@ Operationalisation:
 - **Cross-process bytecode mmap** (Stage 8 candidate) becomes
   transformative for multi-tenant scenarios once the cache is
   distributed.
+- **Eval-result-cache as sibling AOT artifact** (added 2026-05-23
+  per `EVAL_CACHE_ARCHITECTURE_2026-05-23.md`): the same delivery
+  story — Nix package built from offline batch evaluation, shipped
+  via cache.nixos.org, mmap'd at v3 startup — applies to a
+  `nixpkgs-eval-result-cache.mmap` artifact alongside the bytecode
+  cache. #741 Phase 5 measured 95-97 % cross-workload hit rate; on
+  a fresh CI box with both artifacts substituted, first-eval is
+  warm-eval at parse-AND-primop level. **The two compose
+  multiplicatively against TW**, which has neither layer and cannot
+  easily ship either.
 
 The strategic insight: **the team has been optimizing the
 workload-as-measured (single-process, cold-include-compile), but
@@ -1134,7 +1144,7 @@ Added 2026-05-17. The following are **candidates**, NOT committed stages. Their 
 
 | Candidate | What | Commits if measurement shows | Falsified if measurement shows |
 |---|---|---|---|
-| **Stage 10** (salsa) | Incremental result cache keyed `(cellHash, envHash) → resultBytes`; persistent across invocations; 10-100× warm-eval potential | >40% warm fraction on real Nix workloads | <20% warm OR prototype <2× |
+| **Stage 10** (salsa) — *partial subset implemented as #741 substrate 2026-05-23; full salsa may be unnecessary* | Incremental result cache keyed `(cellHash, envHash) → resultBytes`; persistent across invocations; 10-100× warm-eval potential | >40% warm fraction on real Nix workloads | <20% warm OR prototype <2× |
 | **Stage 11** (HAMT) | Polymorphic attrset (flat ≤32-64; HAMT/CHAMP above); targets nixpkgs overlay `//` patterns | >20% time in `//` AND skew toward large attrsets | Median size <64 AND `//` <5% of eval |
 | **Stage 12** (JIT decision) — *deferred-with-data 2026-05-23, see `JIT_CONFIDENCE_2026-05-23.md`* | Truffle (Java fork) / PyPy (RPython fork) / Cranelift (in-process JIT codegen); needed for >3× cold eval | Dispatch share > 40 % via OPCYCLES on cardano-node M5 AND remaining alternatives < 5 % wall to extract | OPCYCLES (#786) measured dispatch at ~5 % wall; #788 measured 3 derivation primops at 99 % of primop wall — JIT cannot reach primop bodies. Realistic upside ~10-15 % wall reduction for multi-year cost vs #741 IFD cache (Phase 1 landed) at 1-2 weeks |
 | **Stage 13** (multi-core capabilities) | GHC-style parallel evaluator: capabilities, sparks, work-stealing, atomic thunk state, parallel GC, FFI serialization. Intra-invocation parallel eval | Critical path <30% of total work on real workloads AND process-level alternatives are insufficient | Critical path >60% OR process-level alternatives capture the same benefit |
@@ -1144,6 +1154,36 @@ Added 2026-05-17. The following are **candidates**, NOT committed stages. Their 
 For Stage 13 (multi-core capabilities), self-correction recorded in `PARALLEL_EVAL_CAPABILITIES_2026-05-18.md` flagged several previous-turn overstatements: Nix's purity is not actually better than Haskell's; cost estimate revised from 6-12 months to 9-15 months; expected wins capped by Amdahl on the stdenv sequential chain; process-level parallelism (xargs -P, Hydra jobset-per-process) likely captures most of the benefit at zero v3 cost; I/O concurrency without full parallelism is the cheaper sub-option.
 
 **Therefore**: do NOT plan resource against any of these candidates. Plan against the measurement spike (Phase 1.5, extended to include parallel-potential trace analysis per `PARALLEL_EVAL_CAPABILITIES_2026-05-18.md` §8). After measurement, revisit.
+
+### Stage 10 partial-subset substrate landed 2026-05-23
+
+The #741 series (Phases 1-5, commits `23bb231d2` → `bff1f670f`) implemented a **narrower form of Stage 10**: derivation-primop-keyed eval-result cache, not full whole-graph salsa. The substrate is **over-validated by four independent signals**:
+
+| Signal | Result | Status |
+|---|---|---|
+| Correctness — byte-identical TW cross-process | 6 cold+warm runs, 0 mismatches | ✓ CONFIRMED |
+| Determinism — canonical Value hash stable | Phase 2 cross-process | ✓ CONFIRMED |
+| Cross-workload reuse — second workload hits first's cache | 95-97 % cold (gcc/python3 vs hello) | ✓ CONFIRMED |
+| Intra-process redundancy — same eval has duplicates | 34.1 % hello, 58.3 % firefox | ✓ CONFIRMED |
+| Wall savings at leaf primop scope (SQLite-backed L2) | −47 ms warm, −569 ms cold; STILL falsified at 58 % hit rate on firefox | ✗ FALSIFIED — structural |
+
+**The Phase 5 falsifier is structural to the L2 implementation, not to the cache concept.** Per-call SQLite lookup (~60 µs warm) exceeds per-call saved libstore-tail work (~30-50 µs) regardless of hit rate. `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` proposes the obvious next step: replace SQLite-backed L2 with mmap'd flat file (~150 ns/lookup, demand-paged, cross-process via OS page cache, no syscalls on hot path). **The mmap variant flips the wall sign positive** (expected +3-5 % wall on hello, +5-10 % on firefox; pre-committed thresholds in §7.2 of that doc).
+
+**Strategic implications for Stage 10 framing:**
+
+1. **The cache substrate Stage 10 needed already exists.** The Phase 1-5 substrate is reusable as the foundation; only the L2 storage layer needs replacement.
+2. **Full salsa machinery may be unnecessary.** The #741 substrate + mmap'd L2 + AOT distribution covers most of what Stage 10's "10-100× warm-eval potential" was reaching for, at a tiny fraction of full salsa's complexity. Rust-analyzer's 4× memory regression on smaller-than-nixpkgs graphs (the verification-agent concern from 2026-05-17) was always the load-bearing risk; the #741 narrower form sidesteps it by caching only at deterministic primop boundaries.
+3. **Stage 10 may evolve into "ship the mmap'd L2 + AOT distribution," not "build salsa."** Effort estimate revises from multi-month salsa engineering to 3-5 day spike + 1-2 week distribution infra + cross-team Nix-infra coordination.
+4. **Phase 4 (Class B IFD primops) remains the larger lever** even with mmap'd L2 at leaf scope. Per `IFD_DEEP_DIVE_2026-05-21.md` §11, IFD-boundary caching's per-hit savings are seconds (skipped nix-builds), not microseconds. The mmap'd cache substrate is the right Phase 4 substrate too — same format, larger Value payloads, same OS-page-cache sharing.
+
+**Next moves codified in `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §10:**
+1. 3-5 day mmap-L2 spike with pre-committed ship/revert thresholds
+2. Control measurement: re-run Phase 5 with L1-in-memory-only (no SQLite) on firefox
+3. Parallel-track: measure cardano-node M5 with existing Phase 5 substrate
+4. (Gated on success) AOT distribution spec — 1-2 weeks v3 work + cross-team coordination
+5. (Independent) Phase 4 planning continues; multi-second-savings lever holds regardless
+
+The Phase 1.5 measurement spike framing from 2026-05-17 is partially **subsumed by the #741 series data**: cache reach + redundancy rates are now measured, not hypothesised. What remains is the L2-implementation falsifier (mmap spike) and the deeper-graph workload measurement (cardano-node M5).
 
 ---
 
