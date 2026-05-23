@@ -18,6 +18,8 @@
 #include "v3/ir.hh"
 #include "v3/value.hh"
 
+#include "nix/util/hash.hh"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -544,6 +546,62 @@ void runRoundTripTest(const Value & result) noexcept
     stats.totalSerNs     += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     stats.totalDeserNs   += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
     stats.totalCompareNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
+}
+
+// ---------------------------------------------------------------------------
+// #741 Phase 2 — canonical Value hash.
+// ---------------------------------------------------------------------------
+
+void canonicalHash(const Value & v, uint8_t out[32])
+{
+    // Reuse the Phase 1 serialiser: it already emits attr names sorted
+    // by name-string and context entries in the order they were stored
+    // (which v3's encodeStringContext keeps sorted via the std::set
+    // backing NixStringContext).  SHA-256 over those bytes is therefore
+    // a process-independent function of the Value's structural content.
+    std::string buf;
+    serialize(v, buf);
+    nix::Hash h = nix::hashString(nix::HashAlgorithm::SHA256, buf);
+    // Defensive: HashAlgorithm::SHA256 implies hashSize == 32 per
+    // libutil/hash.hh's regularHashSize().  Memcpy is safe.
+    std::memcpy(out, h.hash, 32);
+}
+
+std::string canonicalHashHex(const Value & v)
+{
+    uint8_t bytes[32];
+    canonicalHash(v, bytes);
+    static const char kHex[] = "0123456789abcdef";
+    std::string out(64, '0');
+    for (int i = 0; i < 32; ++i) {
+        out[i * 2]     = kHex[(bytes[i] >> 4) & 0xF];
+        out[i * 2 + 1] = kHex[ bytes[i]       & 0xF];
+    }
+    return out;
+}
+
+bool canonicalHashTestModeEnabled() noexcept
+{
+    static const bool enabled = []() {
+        const char * e = std::getenv("NIX_V3_TEST_CANONICAL_HASH");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+void dumpCanonicalHashLine(const Value & v) noexcept
+{
+    if (!canonicalHashTestModeEnabled()) return;
+    try {
+        std::string hex = canonicalHashHex(v);
+        // Single line per derivation result.  Two processes' sorted
+        // dumps must diff to empty for the falsifier to pass.
+        std::fprintf(stderr, "V3-VAL-HASH: %s\n", hex.c_str());
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "V3-VAL-HASH-ERR: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "V3-VAL-HASH-ERR: unknown\n");
+    }
 }
 
 void dumpStats(std::FILE * out)

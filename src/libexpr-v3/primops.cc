@@ -6257,6 +6257,12 @@ static void buildAndWriteDrvNative(
     // Default-off; gate is a cached bool load.  No effect on the
     // result; pure observation.  Stats dumped under NIX_VM_STATS.
     value_serialize::runRoundTripTest(out);
+
+    // #741 Phase 2: canonical-hash determinism dump when
+    // NIX_V3_TEST_CANONICAL_HASH=1.  Per-result `V3-VAL-HASH: <hex>`
+    // to stderr; sort + diff across two process invocations should
+    // produce empty diff (the determinism falsifier).
+    value_serialize::dumpCanonicalHashLine(out);
 }
 
 // 2026-05-17 — Option 4 hybrid FFI leaf.

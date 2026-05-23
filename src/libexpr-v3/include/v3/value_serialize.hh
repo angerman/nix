@@ -103,4 +103,38 @@ void runRoundTripTest(const Value & result) noexcept;
 /// from run.cc under NIX_VM_STATS when testModeEnabled() is true.
 void dumpStats(std::FILE * out);
 
+// ---------------------------------------------------------------------------
+// #741 Phase 2 — canonical Value hash (cross-process determinism gate).
+//
+// canonicalHash(v) := SHA-256(serialize(v))
+//
+// serialize() already emits attr names sorted by NAME-STRING (not
+// SymbolId), and string-context entries are stored in a sorted vector
+// (NixStringContext is a `std::set`; v3's `encodeStringContext`
+// preserves set-iteration order).  Positions / GC addresses / SymbolIds
+// are not part of the encoded form.  Therefore serialize()'s output
+// is a deterministic function of the Value's structural content.
+// canonicalHash() is just SHA-256 over those bytes.
+//
+// Phase 2 falsifier: two processes computing canonicalHash() on the
+// same logical input must produce byte-identical 32-byte digests for
+// ≥99.9% of inputs.  Gate: NIX_V3_TEST_CANONICAL_HASH=1 emits a
+// `V3-VAL-HASH: <64-hex>` stderr line per derivation result.  Sort
+// + diff across two process invocations.
+// ---------------------------------------------------------------------------
+
+/// Compute the canonical 32-byte SHA-256 digest of `v`'s structural
+/// content.  Throws SerializeError on unsupported tags (Closure /
+/// Thunk / etc.) — caller's responsibility to pass a WHNF Value.
+void canonicalHash(const Value & v, uint8_t out[32]);
+
+/// Lowercase-hex form of canonicalHash (64 chars).
+std::string canonicalHashHex(const Value & v);
+
+bool canonicalHashTestModeEnabled() noexcept;
+
+/// When canonicalHashTestModeEnabled(), compute + emit
+/// `V3-VAL-HASH: <64-hex>` to stderr.  Cheap no-op otherwise.
+void dumpCanonicalHashLine(const Value & v) noexcept;
+
 } // namespace nix::v3::value_serialize
