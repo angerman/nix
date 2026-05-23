@@ -242,6 +242,8 @@ uint64_t opcodeTableFingerprint()
             {"OP_DUP",             OP_DUP},
             {"OP_POP",             OP_POP},
             {"OP_SWAP",            OP_SWAP},
+            {"OP_SET_LOCAL_KEEP",  OP_SET_LOCAL_KEEP},
+            {"OP_NOP",             OP_NOP},
             {"OP_ADD",             OP_ADD},
             {"OP_SUB",             OP_SUB},
             {"OP_MUL",             OP_MUL},

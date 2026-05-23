@@ -1544,6 +1544,93 @@ struct Emitter
         }
         unit.code.push_back(encode(fid == 0 ? OP_HALT : OP_RETURN));
 
+        // #785 (2026-05-23) Schema 11 post-emit peephole.  Fuse
+        // adjacent `SET_LOCAL n; GET_LOCAL n` (same slot, neither is
+        // a jump target) into `SET_LOCAL_KEEP n; NOP`.  Saves one
+        // dispatch + one push/pop per firing on the hottest bigram
+        // (#782 shows 7.19 % of dispatch is SET→GET, of which 27 %
+        // is same-slot per #783 subcounter = ~1.93 % of total).
+        //
+        // Opt-out: NIX_V3_NO_SET_GET_FUSION=1 disables the rewrite
+        // for A/B testing.  When disabled, emit produces the
+        // original SET_LOCAL/GET_LOCAL pair — but the opcode table
+        // still includes OP_SET_LOCAL_KEEP and OP_NOP, so the schema
+        // fingerprint matches whether the gate is set or not.  A/B
+        // comparison must use SEPARATE disk-cache directories
+        // (XDG_CACHE_HOME) because the cached blob differs.
+        {
+            static const bool s_noFuse =
+                std::getenv("NIX_V3_NO_SET_GET_FUSION") != nullptr;
+            if (!s_noFuse) {
+                const uint32_t funcStart = codeStart;
+                const uint32_t funcEnd = static_cast<uint32_t>(unit.code.size());
+
+                // Pass 1: collect all jump targets in this function.
+                // Targets are absolute byte offsets stored in the
+                // operand of branch/jump opcodes (per vm.cc OP_JUMP
+                // dispatch: `ip = operand`).
+                std::set<uint32_t> jumpTargets;
+                for (uint32_t ip = funcStart; ip < funcEnd; ) {
+                    const Instruction word = unit.code[ip];
+                    const Op op = decodeOp(word);
+                    const uint32_t operand = decodeOperand(word);
+                    if (op == OP_JUMP
+                     || op == OP_BRANCH_FALSE
+                     || op == OP_BRANCH_TRUE
+                     || op == OP_AND_BRANCH
+                     || op == OP_OR_BRANCH
+                     || op == OP_IMPL_BRANCH) {
+                        jumpTargets.insert(operand);
+                    }
+                    ip += 1 + opExtraWords(op, operand, unit, ip);
+                }
+
+                // Pass 2: find adjacent SET_LOCAL n / GET_LOCAL n
+                // (same slot, neither a jump target, both fixed
+                // single-word opcodes) and rewrite.
+                uint32_t fuseCount = 0;
+                for (uint32_t ip = funcStart; ip + 1 < funcEnd; ) {
+                    const Instruction wA = unit.code[ip];
+                    const Op opA = decodeOp(wA);
+                    const uint32_t opAOperand = decodeOperand(wA);
+                    const uint32_t extraA =
+                        opExtraWords(opA, opAOperand, unit, ip);
+                    const uint32_t nextIp = ip + 1 + extraA;
+                    // Eligible only if A is OP_SET_LOCAL (no extra)
+                    // and B (at nextIp) is OP_GET_LOCAL with matching
+                    // slot, neither is a jump target.
+                    if (opA == OP_SET_LOCAL && extraA == 0
+                        && nextIp < funcEnd) {
+                        const Instruction wB = unit.code[nextIp];
+                        const Op opB = decodeOp(wB);
+                        const uint32_t slotB = decodeOperand(wB);
+                        if (opB == OP_GET_LOCAL
+                            && slotB == opAOperand
+                            && jumpTargets.find(ip) == jumpTargets.end()
+                            && jumpTargets.find(nextIp) == jumpTargets.end())
+                        {
+                            unit.code[ip]     = encode(OP_SET_LOCAL_KEEP, opAOperand);
+                            unit.code[nextIp] = encode(OP_NOP);
+                            ++fuseCount;
+                        }
+                    }
+                    ip = nextIp;
+                }
+                // Optional diagnostic.
+                static const bool s_dbgFuse =
+                    std::getenv("V3_DBG_SET_GET_FUSION") != nullptr;
+                if (__builtin_expect(s_dbgFuse, 0)) [[unlikely]] {
+                    if (fuseCount > 0) {
+                        std::fprintf(stderr,
+                            "v3 #785 fusion: fid=%u funcStart=%u "
+                            "funcEnd=%u fused=%u\n",
+                            (unsigned)fid, funcStart, funcEnd,
+                            (unsigned)fuseCount);
+                    }
+                }
+            }
+        }
+
         if (unit.lambdas.size() <= fid)         unit.lambdas.resize(fid + 1);
         if (unit.lambdaCodeOffsets.size() <= fid) unit.lambdaCodeOffsets.resize(fid + 1);
         unit.lambdas[fid] = LambdaDescriptor{

@@ -25,6 +25,8 @@ const char * opName(Op op)
     case OP_LIT_NULL:          return "OP_LIT_NULL";
     case OP_GET_LOCAL:         return "OP_GET_LOCAL";
     case OP_SET_LOCAL:         return "OP_SET_LOCAL";
+    case OP_SET_LOCAL_KEEP:    return "OP_SET_LOCAL_KEEP";
+    case OP_NOP:               return "OP_NOP";
     case OP_GET_UPVALUE:       return "OP_GET_UPVALUE";
     case OP_DUP:               return "OP_DUP";
     case OP_POP:               return "OP_POP";
@@ -101,7 +103,7 @@ const char * opName(Op op)
 /// after the opcode word itself.  Conservative — when unknown,
 /// returns 0 (caller may end up dis-aligned but still gets useful
 /// info before that point).
-static uint32_t opExtraWords(Op op, uint32_t operand,
+uint32_t opExtraWords(Op op, uint32_t operand,
                              const CompilationUnit & cu, uint32_t ip)
 {
     (void)cu; (void)ip;
