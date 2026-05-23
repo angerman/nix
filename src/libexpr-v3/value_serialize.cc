@@ -15,6 +15,7 @@
 
 #include "v3/alloc.hh"
 #include "v3/barrier.hh"
+#include "v3/closure.hh"  // Thunk + ThunkState (for chaseToWHNF)
 #include "v3/ir.hh"
 #include "v3/value.hh"
 
@@ -130,10 +131,58 @@ private:
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
+// Thunk / App / Slot chasing — read evaluated state without mutating.
+//
+// #741 Phase 3b (2026-05-23): serializing INPUTS to derivation primops
+// requires walking past the Tag::Thunk / Tag::App / Tag::Slot
+// indirections that wrap evaluated values.  forceDeep MUTATES Bindings
+// via bindingsSetValue, which broke nixpkgs hello.drvPath (RCA in
+// Phase 3a commit).  This helper READS but never writes: follows
+// Thunk::evaluated when state == Evaluated, ValuePair::evaluated
+// when set, Slot pointer transitively.  Throws if the chain ends on
+// a non-WHNF (still-Suspended thunk, un-evaluated App, etc.) — caller
+// (canonicalHash via serializeOne) catches and bypasses the cache.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const Value & chaseToWHNF(const Value & v, int maxHops = 32)
+{
+    const Value * cur = &v;
+    for (int i = 0; i < maxHops; ++i) {
+        Tag t = cur->tag();
+        if (t == Tag::Thunk) {
+            Thunk * th = cur->payload.thunk;
+            if (!th || th->state != ThunkState::Evaluated)
+                throw SerializeError("Thunk not Evaluated; cannot canonical-hash");
+            cur = &th->evaluated;
+            continue;
+        }
+        if (t == Tag::App) {
+            ValuePair * p = cur->payload.pair;
+            if (!p || p->evaluated.tag() == Tag::Uninitialized)
+                throw SerializeError("App not yet evaluated");
+            cur = &p->evaluated;
+            continue;
+        }
+        if (t == Tag::Slot) {
+            if (!cur->payload.slot)
+                throw SerializeError("Slot null");
+            cur = cur->payload.slot;
+            continue;
+        }
+        return *cur;  // WHNF
+    }
+    throw SerializeError("chase chain exceeded max hops");
+}
+
+} // anonymous
+
+// ---------------------------------------------------------------------------
 // Serialise.
 // ---------------------------------------------------------------------------
 
-static void serializeOne(const Value & v, std::string & out);
+static void serializeOne(const Value & vIn, std::string & out);
 
 static void serializeString(const Value & v, std::string & out)
 {
@@ -202,8 +251,12 @@ static void serializeList(const Value & v, std::string & out)
         serializeOne(lv->elems[i], out);
 }
 
-static void serializeOne(const Value & v, std::string & out)
+static void serializeOne(const Value & vIn, std::string & out)
 {
+    // Phase 3b: chase Thunk/App/Slot to WHNF.  No-op on already-WHNF
+    // inputs (so Phase 1 round-trip + Phase 2 hash semantics are
+    // unchanged on derivation-result Values).
+    const Value & v = chaseToWHNF(vIn);
     Tag t = v.tag();
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wswitch-enum"
@@ -648,11 +701,28 @@ bool evalResultCacheLookup(const Value & input,
     auto & stats = evalResultCacheStats();
     ++stats.lookups;
 
-    // Compute hash.  Caller is responsible for ensuring `input` is
-    // deep-forced; otherwise canonicalHash will throw on Thunks.
+    // Compute hash.  Phase 3b: serializeOne chases Thunk/App/Slot
+    // indirections to their WHNF target when state == Evaluated, so
+    // already-evaluated entries hash transparently.  Suspended thunks
+    // and un-evaluated Apps still throw — those calls increment
+    // hashErrors and bypass the cache.
     auto t0 = std::chrono::steady_clock::now();
     try {
         outKey = canonicalHashHex(input);
+    } catch (const SerializeError & e) {
+        ++stats.hashErrors;
+        // Phase 3b diagnostic: per-cause bucket via NIX_V3_DBG_CACHE_HASH_ERR=1.
+        // Reveals whether hashErrors are dominated by un-evaluated
+        // Thunks, App memoisation gaps, Closure entries, etc.
+        static const bool dbg = std::getenv("NIX_V3_DBG_CACHE_HASH_ERR") != nullptr;
+        if (dbg) {
+            static thread_local uint64_t errCount = 0;
+            if (errCount++ < 16)
+                std::fprintf(stderr, "v3-cache hashErr#%llu: %s\n",
+                    (unsigned long long)errCount, e.what());
+        }
+        outKey.clear();
+        return false;
     } catch (...) {
         ++stats.hashErrors;
         outKey.clear();
