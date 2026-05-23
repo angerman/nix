@@ -291,6 +291,29 @@ struct AllocStats
     /// entries are zero, the workload triggered no IFD-class primops
     /// — the production-default expectation.
     uint64_t ifdProbeCount[16] = {};
+
+    /// #741 Phase 4 measurement spike (2026-05-23): per-kind counter
+    /// for IFD-class primop calls whose path argument has NON-EMPTY
+    /// NixStringContext.  This is the discriminator between literal-
+    /// path imports (~all of hello.drvPath's 951 import calls — they
+    /// import nixpkgs library files with empty context) and the
+    /// derivation-output-path imports that haskell.nix /
+    /// callCabalProjectToNix actually trigger.
+    ///
+    /// The "withCtx" count is a STRICT UPPER BOUND on real IFD events:
+    ///   * Context types: Opaque (no build needed) / DrvDeep (build
+    ///     dep closure) / Built (build a specific output).  Only the
+    ///     latter two trigger builds; Opaque just references already-
+    ///     realised paths.
+    ///   * `realisePath` only fires builds for un-realised outputs;
+    ///     if the output is already on disk, no build.
+    ///
+    /// Bumped from `primImport` / `primReadFile` / `primPathExists`
+    /// when the path argument has `!lookupStringContextEntries(...)->
+    /// empty()`.  If a workload's `withCtx_*` counts are zero, that
+    /// workload has NO IFD events and Phase 4 cache wouldn't apply.
+    /// If non-zero, those primop calls are Phase 4 cache candidates.
+    uint64_t ifdProbeWithCtx[16] = {};
 };
 
 inline AllocStats & allocStats()

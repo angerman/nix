@@ -2871,7 +2871,17 @@ void primDirOf(EvalState &, Value * args, Value & out)
 void primPathExists(EvalState & state, Value * args, Value & out)
 {
     std::string s;
-    if (args[0].isString()) s = args[0].payload.str;
+    if (args[0].isString()) {
+        // #741 Phase 4 measurement: path with non-empty context →
+        // potential IFD (path may resolve to a derivation output).
+        // TW's primPathExists doesn't realisePath, so v3 likely
+        // matches — but the context presence is still the right
+        // discriminator for "could need a build".
+        auto * ctxEntries = lookupStringContextEntries(args[0].payload.str);
+        if (ctxEntries && !ctxEntries->empty())
+            ++allocStats().ifdProbeWithCtx[kIfdPathExists];
+        s = args[0].payload.str;
+    }
     else if (args[0].isPath()) s = args[0].payload.path;
     else {
         // #692 — TW (libexpr/primops.cc:prim_pathExists) uses
@@ -3423,7 +3433,15 @@ void primStoreDir(EvalState & state, Value *, Value & out)
 void primReadFile(EvalState & state, Value * args, Value & out)
 {
     std::string path;
-    if (args[0].isString()) path = args[0].payload.str;
+    if (args[0].isString()) {
+        // #741 Phase 4 measurement: ctx-bearing readFile path goes
+        // through realisePath below (the TW-wired branch), which
+        // CAN trigger a build for un-realised DrvDeep/Built entries.
+        auto * ctxEntries = lookupStringContextEntries(args[0].payload.str);
+        if (ctxEntries && !ctxEntries->empty())
+            ++allocStats().ifdProbeWithCtx[kIfdReadFile];
+        path = args[0].payload.str;
+    }
     else if (args[0].isPath()) path = args[0].payload.path;
     else typeError("readFile", "string or path");
 
@@ -7393,6 +7411,13 @@ void primImport(EvalState & state, Value * args, Value & out)
         // file paths), skip the bridge to keep the fast-path cheap.
         auto * ctxEntries = lookupStringContextEntries(args[0].payload.str);
         if (ctxEntries && !ctxEntries->empty()) {
+            // #741 Phase 4 measurement: this is the discriminator for
+            // potentially-real-IFD imports.  Empty context = literal
+            // path = no IFD.  Non-empty context = the path mentions
+            // store-path-bearing values, which MAY trigger a build via
+            // realisePath below.  This counter is a strict upper bound
+            // on actual IFD events for the `import` primop kind.
+            ++allocStats().ifdProbeWithCtx[kIfdImport];
             auto & ns = *state.nixEvalState;
             nix::Value * tw = v3ToTreeWalker(state, args[0]);
             if (!tw) {
@@ -7414,6 +7439,10 @@ void primImport(EvalState & state, Value * args, Value & out)
     }
     else if (args[0].isPath()) path = args[0].payload.path;
     else if (args[0].isAttrs()) {
+        // #741 Phase 4 measurement: attrset arg (typically a
+        // derivation) → DEFINITELY goes through realisePath →
+        // potential IFD event.  Count under withCtx[kIfdImport].
+        ++allocStats().ifdProbeWithCtx[kIfdImport];
         // #695 follow-on: IFD support.  When args[0] is a derivation
         // attrset (or any attrset with `__toString` / `outPath`), bridge
         // to TW so its realisePath does the build-context dance.

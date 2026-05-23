@@ -743,6 +743,32 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                 }
                 std::fprintf(stderr, "\n");
             }
+            // #741 Phase 4 measurement spike: per-kind count of primop
+            // calls whose path argument had non-empty string context.
+            // Strict upper bound on potential IFD events (Phase 4
+            // cache candidates).  Zero on workloads that import only
+            // literal nixpkgs paths; non-zero on workloads that touch
+            // derivation outputs (haskell.nix's callCabalProjectToNix
+            // and similar).
+            uint64_t totalWithCtx = 0;
+            for (int k = 1; k < (int)kIfdProbeKindCount; ++k)
+                totalWithCtx += a.ifdProbeWithCtx[k];
+            if (totalWithCtx > 0) {
+                std::fprintf(stderr,
+                    "v3-direct ifd probes (with-ctx, potential IFD): total=%llu",
+                    (unsigned long long)totalWithCtx);
+                for (int k = 1; k < (int)kIfdProbeKindCount; ++k) {
+                    if (a.ifdProbeWithCtx[k] > 0)
+                        std::fprintf(stderr, " %s=%llu",
+                            ifdProbeKindName(static_cast<uint8_t>(k)),
+                            (unsigned long long)a.ifdProbeWithCtx[k]);
+                }
+                std::fprintf(stderr, "\n");
+            } else if (totalProbes > 0) {
+                std::fprintf(stderr,
+                    "v3-direct ifd probes (with-ctx, potential IFD): 0 — "
+                    "all probes were literal-path calls; no IFD candidates\n");
+            }
         }
         // #741 Phase 1 spike: derivation-result round-trip diagnostics.
         // Only emits when NIX_V3_TEST_DRV_RESULT_SERIALIZE=1; no output
