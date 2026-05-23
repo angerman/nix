@@ -2202,6 +2202,28 @@ namespace nix::v3 {
     thread_local VMState * tlCurrentDispatchVM = nullptr;
     VMState * currentDispatchVM() { return tlCurrentDispatchVM; }
 
+    // #790 (2026-05-23) OPCYCLES inter-dispatch-loop attribution fix.
+    // File-scope thread_locals so dispatchLoop entry/exit can save+
+    // restore the prev-op state across nested dispatch boundaries.
+    // The OPCYCLES sample code (vm.cc dispatch loop) reads/writes
+    // these directly.  Without this, an opcode that EXITS a dispatch
+    // loop (OP_RETURN at exitDepth) leaves `g_opcyclesPrevOp` set;
+    // the next dispatch in a different (later) dispatch loop credits
+    // ALL the inter-loop outer-C++ work to that opcode.  Per #787 RCA
+    // this was crediting ~360 ms to OP_RETURN on hello.drvPath that
+    // actually lived in primop continuations + callClosure cleanup.
+    //
+    // The fix: dispatchLoop entry saves the outer (g_opcyclesPrevOp,
+    // g_opcyclesPrevTs) to locals and resets them to (0xFF, 0).
+    // Exit restores them.  Nested opcodes' first dispatch sees
+    // prevOp=0xFF and skips credit (clean boundary).  The outer's
+    // NEXT sample after the nested loop exit sees prevOp=OUTER_OP
+    // with prevTs from BEFORE the nested call — correctly crediting
+    // the ENTIRE outer-case-body-including-nested time to the outer
+    // opcode.
+    thread_local uint8_t g_opcyclesPrevOp = 0xFF;
+    thread_local uint64_t g_opcyclesPrevTs = 0;
+
     // #705 (2026-05-21): thread-local stack of active VMStates.
     //
     // Without this, a nested runFunctionWithUpvalues / runFunction
@@ -2248,14 +2270,37 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
     // #705: register on the active-VM stack so nested scavenges
     // walk THIS vm's roots even when fired from another dispatch.
     pushActiveVMState(&vm);
+
+    // #790 (2026-05-23) OPCYCLES inter-dispatch-loop boundary.
+    // Save the OUTER prev-op/Ts before this nested loop runs.
+    // Reset to 0xFF so the first opcode of this loop doesn't get
+    // credited with whatever was on the outer frame.  Restore on
+    // exit (via destructor below) so the outer's NEXT sample
+    // correctly credits its OWN previous opcode with the time
+    // from BEFORE the nested call (entire outer-case-body cost
+    // attributed to the outer opcode).
+    const uint8_t  savedOpcyclesPrevOp = g_opcyclesPrevOp;
+    const uint64_t savedOpcyclesPrevTs = g_opcyclesPrevTs;
+    g_opcyclesPrevOp = 0xFF;
+    g_opcyclesPrevTs = 0;
+
     struct VMScope {
         VMState * prev;
         VMState * vm;
+        uint8_t   savedOpcyclesPrevOp;
+        uint64_t  savedOpcyclesPrevTs;
         ~VMScope() {
+            // Restore the outer prev-op/Ts so the outer's NEXT
+            // OPCYCLES sample credits the entire outer-case-body
+            // (including this nested loop's runtime) to the OUTER
+            // opcode — semantically correct: that's what the outer
+            // case body did.
+            g_opcyclesPrevOp = savedOpcyclesPrevOp;
+            g_opcyclesPrevTs = savedOpcyclesPrevTs;
             popActiveVMState(vm);
             tlCurrentDispatchVM = prev;
         }
-    } _vmScope{prevDispatchVM, &vm};
+    } _vmScope{prevDispatchVM, &vm, savedOpcyclesPrevOp, savedOpcyclesPrevTs};
 
     const CallFrame & topFrame = vm.frames.back();
     const CompilationUnit * cu = topFrame.cu;
@@ -2581,15 +2626,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         static const bool s_countOpCycles =
             std::getenv("NIX_VM_OPCYCLES") != nullptr;
         if (__builtin_expect(s_countOpCycles, 0)) [[unlikely]] {
-            static thread_local uint8_t s_prevOp = 0xFF;
-            static thread_local uint64_t s_prevTs = 0;
+            // #790: read/write the FILE-SCOPE thread_local so the
+            // dispatchLoop scope guard (see line ~2270) can save+
+            // restore across nested-loop boundaries.
             uint64_t ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (s_prevOp != 0xFF) {
-                allocStats().opcycleNs[s_prevOp] += (ts - s_prevTs);
+            if (g_opcyclesPrevOp != 0xFF) {
+                allocStats().opcycleNs[g_opcyclesPrevOp] += (ts - g_opcyclesPrevTs);
             }
-            s_prevOp = static_cast<uint8_t>(op);
-            s_prevTs = ts;
+            g_opcyclesPrevOp = static_cast<uint8_t>(op);
+            g_opcyclesPrevTs = ts;
         }
         if (__builtin_expect(s_countOpcodes, 0)) [[unlikely]] {
             allocStats().opcodeCounts[static_cast<uint8_t>(op)]++;
