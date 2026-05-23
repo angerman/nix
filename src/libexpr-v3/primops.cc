@@ -6543,20 +6543,32 @@ static void primDerivationStrictNative(
     Value v3CachedOut;
     bool v3CacheClaimed = false;
     if (value_serialize::evalResultCacheEnabled()) {
-        // #741 Phase 3a-RCA-A (2026-05-23): the original plan called
-        // forceDeep(*state.vm, args[0]) here to walk the input deeply
-        // so canonicalHash could hash all its Thunk-bound values.
-        // Falsified: forceDeep at primop entry triggers a downstream
-        // `v3 OP_ATTRS_SELECT: not an attrset` bytecode failure on
-        // nixpkgs hello.drvPath.  Hypothesised cause: forceDeep's
-        // bindingsSetValue writeback of Tag::Slot entries (let-rec
-        // slot indirections) mutates state the surrounding bytecode
-        // relies on.  RCA pending; for Phase 3a we skip forceDeep and
-        // accept partial coverage (canonicalHash throws on un-forced
-        // Thunk entries; those calls increment hashErrors and bypass
-        // the cache — no correctness impact).  Phase 3b will replace
-        // forceDeep with a Thunk-chasing walker that reads
-        // Thunk::evaluated without mutating Bindings.
+        // #741 Phase 3a-RCA-A + 3c-RCA-B (2026-05-23): two attempted
+        // deep-force approaches falsified.
+        //   * forceDeep (with bindingsSetValue writeback) → broke
+        //     hello.drvPath via Tag::Slot replacement.
+        //   * forceDeepReadOnly (no writeback) → STILL broke
+        //     hello.drvPath.  Root cause: forceValue itself fires
+        //     Thunk::shapeCell cell-updates during nested thunk
+        //     evaluation, which pollute outer thunks' shape state
+        //     when deep-forced from a primop entry context (see
+        //     lode/CELL_UPDATE_EVERYWHERE_2026-05-12.md:169 for the
+        //     known precedent).
+        //
+        // Architectural conclusion: input-hashing from a primop
+        // entry CANNOT deep-force its input safely.  The cache must
+        // either (a) accept partial coverage with un-evaluated
+        // hashErrors (current Phase 3a behaviour, ~11% hit rate),
+        // (b) defer hashing to AFTER the primop body has done its
+        // own forcing (no skip-on-hit possible), or (c) hash a
+        // derived canonical form (e.g. the constructed `drv`
+        // struct's content-hash) computed mid-body.
+        //
+        // For Phase 3a we keep (a): cache attempts lookup with the
+        // partially-forced args[0]; canonicalHash throws on
+        // un-evaluated indirections (now down to App / Suspended
+        // Thunk per Phase 3b's chaseToWHNF), those calls miss the
+        // cache and run the primop body normally.
         v3CacheClaimed =
             value_serialize::evalResultCacheLookup(args[0], v3CachedOut, v3CacheKey);
     }

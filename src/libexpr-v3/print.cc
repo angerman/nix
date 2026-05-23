@@ -177,6 +177,17 @@ Value forceDeep(VMState & vm, Value v)
     return forceDeep(vm, v, seen);
 }
 
+// #741 Phase 3c-RCA-B (2026-05-23): a `forceDeepReadOnly` variant was
+// added here (commit ##later-revert##) to test the hypothesis that
+// the explicit `bindingsSetValue` writeback in `forceDeep` was the
+// only mutation source breaking Phase 3a's eval-result cache hook.
+// Falsified — see commit body for the symptom (`forceValue` itself
+// fires `Thunk::shapeCell` cell-updates that pollute outer thunks
+// when deep-forced from a primop entry; see
+// `CELL_UPDATE_EVERYWHERE_2026-05-12.md:169` for the precedent).
+// Function reverted to keep the public API clean.  Architectural
+// conclusion: cache cannot deep-force at primop entry on any path.
+
 nlohmann::json toJsonValue(VMState & vm, Value v,
                             const std::vector<std::string> & symTab)
 {
