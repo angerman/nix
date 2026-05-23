@@ -9587,7 +9587,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             state.vm = &vm;
             state.nixEvalState = getNixEvalState();
             Value out;
+            // #788 (2026-05-23) per-primop wall-clock attribution.
+            // Gated by NIX_VM_PRIMOP_TIME=1; ~20 ns overhead per
+            // primop call when enabled.  Captures INCLUSIVE time
+            // (the primop body + any nested forceValue / callClosure
+            // dispatches).  Identifies which specific primop is
+            // the wall-clock lever within the ~11s OP_CALL_PRIMOP
+            // inclusive bucket exposed by #786/#790 OPCYCLES.
+            static const bool s_primopTime =
+                std::getenv("NIX_VM_PRIMOP_TIME") != nullptr;
+            uint64_t poStartNs = 0;
+            if (__builtin_expect(s_primopTime, 0)) [[unlikely]] {
+                poStartNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            }
             po->fn(state, args, out);
+            if (__builtin_expect(s_primopTime, 0)) [[unlikely]] {
+                uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                bumpPrimOpNanos(po, now - poStartNs);
+            }
             push(vm, out);
             break;
         }

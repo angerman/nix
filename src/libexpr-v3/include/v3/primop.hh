@@ -500,6 +500,14 @@ struct BridgeTimer {
 /// Print via `dumpPrimOpStats()` (called automatically under
 /// NIX_VM_STATS=1 from v3-eval / the cutover hook).
 void bumpPrimOpCallCount(const PrimOp * po);
+
+/// #788 (2026-05-23) — accumulate wall-clock time spent in a
+/// primop's body under NIX_VM_PRIMOP_TIME=1.  Caller passes the
+/// nanosecond delta measured around the primop's `fn(...)` call.
+/// Time is INCLUSIVE of nested forceValue / callClosure calls
+/// (per #790 OPCYCLES inclusive accounting model).
+void bumpPrimOpNanos(const PrimOp * po, uint64_t deltaNs);
+
 void dumpPrimOpStats(std::FILE * out);
 
 struct CompilationUnit;

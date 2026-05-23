@@ -8876,6 +8876,15 @@ ScopedActiveV3VM::~ScopedActiveV3VM() { tlActiveV3VMRef() = prev; }
 namespace {
 struct PrimOpCounter {
     std::unordered_map<std::string, uint64_t> counts;
+    // #788 (2026-05-23) per-primop wall-clock accumulator.  Gated by
+    // NIX_VM_PRIMOP_TIME=1.  Time is in nanoseconds for the primop's
+    // body execution INCLUDING any nested forceValue / callClosure
+    // calls (those re-enter the dispatch loop; per #790 the outer
+    // primop dispatch correctly inclusive-accounts that nested time).
+    // Independent gate from the count counter so the timing overhead
+    // (one chrono call per primop = ~10-20 ns) is paid only when the
+    // diagnostic is on.
+    std::unordered_map<std::string, uint64_t> nanos;
     std::mutex                                mtx;
 };
 PrimOpCounter & primOpCounter()
@@ -8908,6 +8917,20 @@ void bumpPrimOpCallCount(const PrimOp * po)
     auto & c = primOpCounter();
     std::lock_guard<std::mutex> g(c.mtx);
     c.counts[std::string(po->name)]++;
+}
+
+// #788 (2026-05-23) — per-primop wall-clock accumulator.  Called
+// from vm.cc OP_CALL_PRIMOP under NIX_VM_PRIMOP_TIME=1.  Adds the
+// elapsed body-time (chrono-measured by the caller) to the per-
+// name bucket.  Mutex-protected for cross-thread safety but on
+// the single-threaded VM the overhead is just one uncontended
+// lock per call (~20-30 ns).
+void bumpPrimOpNanos(const PrimOp * po, uint64_t deltaNs)
+{
+    if (!po) return;
+    auto & c = primOpCounter();
+    std::lock_guard<std::mutex> g(c.mtx);
+    c.nanos[std::string(po->name)] += deltaNs;
 }
 
 void dumpPrimOpStats(std::FILE * out)
@@ -8946,6 +8969,35 @@ void dumpPrimOpStats(std::FILE * out)
         std::fprintf(out, "  %8llu  %s\n",
                      (unsigned long long)rows[i].second,
                      rows[i].first.c_str());
+
+    // #788 per-primop wall-clock breakdown (only present when
+    // NIX_VM_PRIMOP_TIME=1 was set during eval).  Sorted by total
+    // nanos descending — the top of the list is the actual lever
+    // for primop-side optimisation.
+    if (!c.nanos.empty()) {
+        std::vector<std::pair<std::string, uint64_t>> trows(
+            c.nanos.begin(), c.nanos.end());
+        std::sort(trows.begin(), trows.end(),
+            [](const auto & a, const auto & b) { return a.second > b.second; });
+        uint64_t totalNs = 0;
+        for (auto & r : trows) totalNs += r.second;
+        std::fprintf(out,
+            "v3 primop wall-clock (top 15 of %zu; total %llu ns ≈ %.1f ms):\n",
+            trows.size(),
+            (unsigned long long)totalNs,
+            totalNs / 1e6);
+        for (size_t i = 0; i < trows.size() && i < 15; ++i) {
+            uint64_t cnt = 0;
+            auto cit = c.counts.find(trows[i].first);
+            if (cit != c.counts.end()) cnt = cit->second;
+            std::fprintf(out,
+                "  %12llu ns  count=%llu  avg=%.1f ns/call  %s\n",
+                (unsigned long long)trows[i].second,
+                (unsigned long long)cnt,
+                cnt > 0 ? (double)trows[i].second / cnt : 0.0,
+                trows[i].first.c_str());
+        }
+    }
 }
 
 void dumpHotDescriptors(std::FILE * out, size_t limit,
