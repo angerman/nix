@@ -68,24 +68,6 @@ enum Op : uint8_t
     OP_POP            = 0x14,
     OP_SWAP           = 0x15,
 
-    /// #785 (2026-05-23) Schema 11 super-instruction.  Write top-of-
-    /// stack to slot [slot:24] WITHOUT popping (i.e. the value stays
-    /// on the stack AND is written to the slot).  Emitted by the
-    /// post-emit-function peephole that recognises
-    /// `SET_LOCAL n; GET_LOCAL n` (adjacent, same slot, neither is a
-    /// jump target) — the original pair pops then re-pushes the same
-    /// value, which is pure waste.  The original GET_LOCAL n gets
-    /// rewritten to OP_NOP so jump-target offsets remain stable.
-    OP_SET_LOCAL_KEEP = 0x16,  // [slot:24]   write but don't pop
-
-    /// #785 (2026-05-23) Schema 11 explicit no-op.  Dispatched as
-    /// `break`; the byte exists so the peephole can preserve jump-
-    /// target offsets after fusing SET_LOCAL_KEEP.  NOT emitted in
-    /// any other context.  (The historical 0x00 OP_NOP was removed
-    /// in pre-schema-2 cleanup; this is the v11 replacement at a
-    /// distinct opcode value to keep the fingerprint clean.)
-    OP_NOP            = 0x17,
-
     // --- Arithmetic ------------------------------------------------------
     OP_ADD            = 0x20,
     OP_SUB            = 0x21,

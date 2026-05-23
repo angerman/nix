@@ -36,13 +36,4 @@ uint32_t disassembleOne(
 /// reporter (NIX_VM_OPCOUNTS) and any future profiling tools.
 const char * opName(Op op);
 
-/// Number of extra (post-opcode) data words consumed by `op`,
-/// possibly depending on the operand-encoded count.  `cu` and `ip`
-/// are passed in case future opcodes need to inspect upcoming
-/// data words for variable-length sections.  Returns 0 for fixed
-/// single-word opcodes.  Exported for emit-time / post-emit
-/// passes that walk the code linearly (#785 peephole).
-uint32_t opExtraWords(Op op, uint32_t operand,
-                      const CompilationUnit & cu, uint32_t ip);
-
 } // namespace nix::v3

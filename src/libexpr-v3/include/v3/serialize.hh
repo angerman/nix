@@ -105,16 +105,7 @@ namespace nix::v3::serialize {
 /// OP_ATTRS_SELECT's IC mechanism for the LetRec slot-ref hot
 /// path (9.05 % of dispatch on hello.drvPath; 1.4 M calls).
 /// Cache size is serialised; entries are zeroed on load.
-///
-/// 11: #785 (2026-05-23) OP_SET_LOCAL_KEEP + OP_NOP super-
-/// instruction pair.  Post-emit-function peephole rewrites
-/// `SET_LOCAL n; GET_LOCAL n` (adjacent, same slot, neither op
-/// is a jump target) → `SET_LOCAL_KEEP n; NOP`.  Saves one
-/// dispatch + one push/pop pair per fused firing.  Implementation
-/// test for #783 super-instruction hypothesis: ship if A/B wall
-/// delta ≥ 8 ms on hello.drvPath; revert otherwise.  Opt-out
-/// via NIX_V3_NO_SET_GET_FUSION=1.
-constexpr uint32_t kSchemaVersion = 11;
+constexpr uint32_t kSchemaVersion = 10;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

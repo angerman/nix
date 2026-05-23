@@ -2719,35 +2719,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             break;
         }
-        // #785 (2026-05-23) Schema 11 super-instruction.  Like
-        // OP_SET_LOCAL but DOES NOT pop the top-of-stack — the value
-        // is both written to the slot AND remains on top of the
-        // stack.  Emitted by the post-emit peephole that recognises
-        // `SET_LOCAL n; GET_LOCAL n` (adjacent, same slot, neither a
-        // jump target).  Mirrors SET_LOCAL's auto-grow defensive
-        // path; in practice the peephole only triggers when the slot
-        // was already valid (the original SET_LOCAL had already
-        // grown if needed and the GET_LOCAL n that followed read
-        // that slot, so it was reachable).
-        case OP_SET_LOCAL_KEEP: {
-            const size_t idx = stackBase + operand;
-            if (__builtin_expect(idx < vm.valueStack.size(), 1)) {
-                vm.valueStack[idx] = vm.valueStack.back();
-            } else {
-                Value v = vm.valueStack.back();
-                while (idx >= vm.valueStack.size())
-                    vm.valueStack.push_back(Value{});
-                vm.valueStack[idx] = v;
-            }
-            break;
-        }
-        // #785 explicit no-op.  Used by the post-emit peephole to
-        // preserve jump-target offsets after fusing SET_LOCAL_KEEP.
-        // NOT emitted in any other context.  Dispatched here (not in
-        // the default-abort branch) so the dispatch is a clean
-        // single-instruction branch+break in the common case.
-        case OP_NOP:
-            break;
         case OP_GET_UPVALUE: {
             if (!closure)
                 throw std::runtime_error("v3 OP_GET_UPVALUE: no closure context");
