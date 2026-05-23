@@ -7399,6 +7399,13 @@ void primImport(EvalState & state, Value * args, Value & out)
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop import: no nix EvalState wired (run via v3-eval)");
     std::string path;
+    // #741 Phase 4b RCA (2026-05-24): track whether this is an
+    // actual IFD-class call (string with context, or attrset arg)
+    // vs a literal-path import.  Used to scope the forceDeep +
+    // disk-cache-insert below — we MUST NOT forceDeep nixpkgs-
+    // internal lazy attrsets just because the user has the cache
+    // gate on; that explodes both wall and cache size.
+    bool isIfdImport = false;
     if (args[0].isString()) {
         // #757b: if the string carries build context (Built or DrvDeep
         // entries from `"${pkgs.X}/some/path"`), the path may not yet
@@ -7418,6 +7425,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             // realisePath below.  This counter is a strict upper bound
             // on actual IFD events for the `import` primop kind.
             ++allocStats().ifdProbeWithCtx[kIfdImport];
+            isIfdImport = true;
             auto & ns = *state.nixEvalState;
             nix::Value * tw = v3ToTreeWalker(state, args[0]);
             if (!tw) {
@@ -7443,6 +7451,7 @@ void primImport(EvalState & state, Value * args, Value & out)
         // derivation) → DEFINITELY goes through realisePath →
         // potential IFD event.  Count under withCtx[kIfdImport].
         ++allocStats().ifdProbeWithCtx[kIfdImport];
+        isIfdImport = true;
         // #695 follow-on: IFD support.  When args[0] is a derivation
         // attrset (or any attrset with `__toString` / `outPath`), bridge
         // to TW so its realisePath does the build-context dance.
@@ -7573,7 +7582,13 @@ void primImport(EvalState & state, Value * args, Value & out)
     // by libstore invariant).
     static const bool s_ifdImportDiskCache =
         std::getenv("NIX_V3_IFD_IMPORT_CACHE_DISK") != nullptr;
-    if (s_ifdImportDiskCache) {
+    // #741 Phase 4b RCA fix: only consult the disk cache for ACTUAL
+    // IFD imports (string-with-ctx or attrset arg).  Non-IFD imports
+    // are literal-path nixpkgs files — they're already handled
+    // efficiently by the in-memory `cache.results` map + the CU disk
+    // cache; disk-caching their full result Value adds nothing and
+    // explodes cache size + cold wall.
+    if (s_ifdImportDiskCache && isIfdImport) {
         std::string keyBytes;
         keyBytes.reserve(11 + path.size());
         keyBytes.append("ifd-import");
@@ -7842,8 +7857,12 @@ void primImport(EvalState & state, Value * args, Value & out)
     //     replaces Slot with WHNF safely.
     //
     // Gated by NIX_V3_IFD_IMPORT_CACHE_DISK so the cold-mode forceDeep
-    // cost only fires when the cache is wanted.
-    if (s_ifdImportDiskCache) {
+    // cost only fires when the cache is wanted.  Also gated on
+    // isIfdImport — RCA 2026-05-24: scoping this to ACTUAL IFD
+    // imports avoids forceDeep'ing every nixpkgs-internal lazy
+    // attrset (which were the source of the +78 % cold tax on
+    // ifd-large measurements).
+    if (s_ifdImportDiskCache && isIfdImport) {
         try {
             out = forceDeep(*state.vm, out);
         } catch (...) {
@@ -7861,7 +7880,8 @@ void primImport(EvalState & state, Value * args, Value & out)
     // #741 Phase 4 — also persist to disk-backed import cache.
     // Serialiser failures (closures, etc.) are silently skipped;
     // subsequent invocations just see a disk-cache miss + recompute.
-    if (s_ifdImportDiskCache) {
+    // Also gated on isIfdImport (RCA 2026-05-24).
+    if (s_ifdImportDiskCache && isIfdImport) {
         try {
             std::string keyBytes;
             keyBytes.reserve(11 + path.size());
