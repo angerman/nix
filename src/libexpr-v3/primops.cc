@@ -7823,6 +7823,37 @@ void primImport(EvalState & state, Value * args, Value & out)
     auto tRun = impStamp();
     out = run(cache.cus.back());
     impBumpNs(importTimingTotals().runNs, tRun);
+    // #741 Phase 4b (2026-05-23): force-deep the imported result
+    // BEFORE persisting to in-memory + disk cache.  Imported `rec {
+    // ... }` attrsets produce Bindings whose entries are Tag::Thunk
+    // or Tag::Slot indirections (let-rec machinery); the Phase 1
+    // serialiser is WHNF-only and throws on un-forced indirections.
+    //
+    // Safety analysis (vs. Phase 3a-RCA-A shapeCell concern):
+    //   * Phase 3a-RCA-A: forceDeep on args[0] of derivationStrict
+    //     mutated let-rec slots in the SURROUNDING eval scope —
+    //     bindingsSetValue replaced Slot entries that were still
+    //     in-use by the outer expression.
+    //   * Here at import-exit: the imported expression's let-rec
+    //     slots are finalized by the time `run()` returned (OP_RETURN
+    //     fired in the imported CU's dispatch).  The result attrset
+    //     is the SOLE consumer of those slots — it's the primop's
+    //     return value, not shared with surrounding state.  Writeback
+    //     replaces Slot with WHNF safely.
+    //
+    // Gated by NIX_V3_IFD_IMPORT_CACHE_DISK so the cold-mode forceDeep
+    // cost only fires when the cache is wanted.
+    if (s_ifdImportDiskCache) {
+        try {
+            out = forceDeep(*state.vm, out);
+        } catch (...) {
+            // forceDeep threw (e.g. a thunk inside the imported
+            // value raised).  Don't propagate — the user's later
+            // attribute access would hit the same error.  Leave
+            // out un-forced; serialise below will fail on it and
+            // skip the cache insert.
+        }
+    }
     {
         auto [mt, sz] = importStat(path);
         cache.results.emplace(path, ImportCacheEntry{out, mt, sz});
