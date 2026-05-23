@@ -2583,9 +2583,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 std::getenv("NIX_VM_BIGRAMS") != nullptr;
             if (__builtin_expect(s_countBigrams, 0)) [[unlikely]] {
                 static thread_local uint8_t prevOp = 0;
-                allocStats().bigramCounts
-                    [prevOp][static_cast<uint8_t>(op)]++;
-                prevOp = static_cast<uint8_t>(op);
+                static thread_local uint32_t prevSetSlot = ~0u;
+                uint8_t opi = static_cast<uint8_t>(op);
+                allocStats().bigramCounts[prevOp][opi]++;
+                // #783-measure: track the SAME-SLOT subset of
+                // SET_LOCAL -> GET_LOCAL.  Bigram counter tracks
+                // opcode pairs only; fusion requires operand match
+                // (write-then-read the same slot).  Decode operand
+                // inline (cheap; only paid under the gate).
+                uint32_t curOperand = decodeOperand(instr);
+                if (prevOp == static_cast<uint8_t>(OP_SET_LOCAL)
+                    && opi == static_cast<uint8_t>(OP_GET_LOCAL)
+                    && curOperand == prevSetSlot)
+                {
+                    allocStats().bigramSetGetSameSlot++;
+                }
+                if (opi == static_cast<uint8_t>(OP_SET_LOCAL))
+                    prevSetSlot = curOperand;
+                else
+                    prevSetSlot = ~0u;
+                prevOp = opi;
             }
         }
         uint32_t operand = decodeOperand(instr);

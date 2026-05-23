@@ -176,6 +176,14 @@ struct AllocStats
     /// register-VM rewrite.
     uint64_t bigramCounts[256][256] = {};
 
+    /// #783-measure (2026-05-23) refined bigram subcounters.  The
+    /// bigramCounts above are pair-of-opcode counts; for fusion
+    /// design we need to know what FRACTION are same-operand.
+    /// Currently tracking only the top-1 bigram (SET_LOCAL ->
+    /// GET_LOCAL) since that's the fusion candidate; if we widen
+    /// later, add more counters.
+    uint64_t bigramSetGetSameSlot = 0;
+
     /// Bindings allocation histogram by size.  Buckets:
     /// [0]=0, [1]=1, [2]=2, [3]=3-4, [4]=5-8, [5]=9-16, [6]=17-32,
     /// [7]=33-64, [8]=65-128, [9]=129+.  Used to size-tune the

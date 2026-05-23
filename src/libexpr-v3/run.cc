@@ -597,6 +597,23 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                         "(#780 register-VM kill criterion: top-20 < 30%% "
                         "→ stack motion is spread, not pair-fusible)\n",
                         100.0 * topSum / totalBigrams);
+                    // #783-measure: same-slot SET_LOCAL -> GET_LOCAL
+                    // (fusion candidate for OP_SET_LOCAL_KEEP).
+                    if (a.bigramSetGetSameSlot > 0) {
+                        std::fprintf(stderr,
+                            "  -- SET_LOCAL -> GET_LOCAL same-slot: %llu "
+                            "(%5.2f%% of all dispatch, "
+                            "%5.2f%% of bigram top-1; "
+                            "#783 OP_SET_LOCAL_KEEP fusion candidate; "
+                            "kill criterion: < 2%% of dispatch)\n",
+                            (unsigned long long)a.bigramSetGetSameSlot,
+                            100.0 * a.bigramSetGetSameSlot / totalDispatch,
+                            // top-1 bigram count = bigramCounts[OP_SET_LOCAL][OP_GET_LOCAL]
+                            (a.bigramCounts[OP_SET_LOCAL][OP_GET_LOCAL] > 0
+                                ? 100.0 * a.bigramSetGetSameSlot
+                                  / a.bigramCounts[OP_SET_LOCAL][OP_GET_LOCAL]
+                                : 0.0));
+                    }
                 }
             }
         }
