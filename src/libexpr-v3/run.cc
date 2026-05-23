@@ -21,6 +21,7 @@
 #include "v3/disasm.hh"         // #778 opcount dumper — opName()
 #include "v3/bytecode.hh"
 #include "v3/serialize.hh"      // #777b deserialize per-section timing
+#include "v3/value_serialize.hh" // #741 Phase 1 round-trip stats dump
 #include "v3/limits.hh"
 #include "v3/nursery.hh"
 #include "v3/barrier.hh"
@@ -727,6 +728,11 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                 std::fprintf(stderr, "\n");
             }
         }
+        // #741 Phase 1 spike: derivation-result round-trip diagnostics.
+        // Only emits when NIX_V3_TEST_DRV_RESULT_SERIALIZE=1; no output
+        // on the default path.  Validates the value-serialiser
+        // architecture for the multi-week IFD eval-result cache.
+        value_serialize::dumpStats(stderr);
         // #746 (2026-05-21) Bindings-attribution rollup.  Phase 1 of
         // the post-Stage-4-v4.2 plan: the dominant v3-arena consumer
         // on hello.drvPath is Bindings (84% / 956 MB).  Until we know

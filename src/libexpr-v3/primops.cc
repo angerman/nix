@@ -45,6 +45,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/print.hh"
 #include "v3/print.hh"  // #760: v3 printNixValue for toStringCoerceCtx error text
+#include "v3/value_serialize.hh"  // #741 Phase 1: derivation-result round-trip test
 #include "nix/expr/value/context.hh"
 // #698 Phase 3: v3-native primGetFlake — needs FlakeRef parsing,
 // lockFlake, Settings member access, and LockedFlake type.
@@ -6250,6 +6251,12 @@ static void buildAndWriteDrvNative(
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = resultB;
+
+    // #741 Phase 1: round-trip-test the result Value through the
+    // value-serialiser when NIX_V3_TEST_DRV_RESULT_SERIALIZE=1.
+    // Default-off; gate is a cached bool load.  No effect on the
+    // result; pure observation.  Stats dumped under NIX_VM_STATS.
+    value_serialize::runRoundTripTest(out);
 }
 
 // 2026-05-17 — Option 4 hybrid FFI leaf.

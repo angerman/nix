@@ -90,6 +90,11 @@ lib_sources = files(
   'opt_stream_fusion.cc',
   'serialize.cc',
   'disk_cache.cc',
+  # #741 Phase 1 spike: round-trip serialiser for derivation-result
+  # Values.  See lode/IFD_CACHE_DESIGN_2026-05-23.md.  Gated by
+  # NIX_V3_TEST_DRV_RESULT_SERIALIZE=1; default-off cost is one
+  # cached-bool load per primDerivationStrict call.
+  'value_serialize.cc',
   'fiber.cc',
   'bridge_yield.cc',
   'gc.cc',
