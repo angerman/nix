@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <unordered_map>
 #include <vector>
 
 namespace nix::v3::value_serialize {
@@ -602,6 +603,134 @@ void dumpCanonicalHashLine(const Value & v) noexcept
     } catch (...) {
         std::fprintf(stderr, "V3-VAL-HASH-ERR: unknown\n");
     }
+}
+
+// ---------------------------------------------------------------------------
+// #741 Phase 3a — in-memory SHADOW eval-result cache.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool evalResultCacheEnabledCached()
+{
+    static const bool enabled = []() {
+        const char * e = std::getenv("NIX_V3_EVAL_RESULT_CACHE");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+// Process-local cache.  Keyed on 64-char hex string (canonical SHA-256
+// hex form), value is the serialised result blob.
+std::unordered_map<std::string, std::string> & evalResultCacheMap()
+{
+    static std::unordered_map<std::string, std::string> m;
+    return m;
+}
+
+} // anonymous namespace
+
+EvalResultCacheStats & evalResultCacheStats() noexcept
+{
+    static EvalResultCacheStats s;
+    return s;
+}
+
+bool evalResultCacheEnabled() noexcept { return evalResultCacheEnabledCached(); }
+
+bool evalResultCacheLookup(const Value & input,
+                            Value & outResult,
+                            std::string & outKey) noexcept
+{
+    outKey.clear();
+    if (!evalResultCacheEnabled()) return false;
+
+    auto & stats = evalResultCacheStats();
+    ++stats.lookups;
+
+    // Compute hash.  Caller is responsible for ensuring `input` is
+    // deep-forced; otherwise canonicalHash will throw on Thunks.
+    auto t0 = std::chrono::steady_clock::now();
+    try {
+        outKey = canonicalHashHex(input);
+    } catch (...) {
+        ++stats.hashErrors;
+        outKey.clear();
+        return false;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    stats.totalHashNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+
+    auto & cache = evalResultCacheMap();
+    auto it = cache.find(outKey);
+    auto t2 = std::chrono::steady_clock::now();
+    stats.totalLookupNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+
+    if (it == cache.end()) {
+        ++stats.misses;
+        return false;
+    }
+
+    // Hit — deserialise.  Note: in SHADOW mode the caller IGNORES
+    // outResult (always recomputes from scratch), but we deserialise
+    // anyway so the verify-cached-against-computed comparison runs.
+    try {
+        outResult = deserialize(it->second);
+    } catch (...) {
+        ++stats.deserErrors;
+        return false;
+    }
+    auto t3 = std::chrono::steady_clock::now();
+    stats.totalDeserNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
+    stats.bytesDelivered += it->second.size();
+    ++stats.hits;
+    return true;
+}
+
+void evalResultCacheInsert(const std::string & key, const Value & result) noexcept
+{
+    if (!evalResultCacheEnabled()) return;
+    if (key.empty()) return;
+    auto & stats = evalResultCacheStats();
+    std::string blob;
+    auto t0 = std::chrono::steady_clock::now();
+    try {
+        serialize(result, blob);
+    } catch (...) {
+        return;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    stats.totalSerNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    stats.bytesCached += blob.size();
+    evalResultCacheMap().emplace(key, std::move(blob));
+    ++stats.inserts;
+}
+
+void dumpEvalResultCacheStats(std::FILE * out)
+{
+    if (!evalResultCacheEnabled()) return;
+    const auto & s = evalResultCacheStats();
+    if (s.lookups == 0) return;
+    auto safe = [](uint64_t n) -> uint64_t { return n ? n : 1; };
+    double avgHashUs   = (s.totalHashNs   / 1000.0) / safe(s.lookups);
+    double avgLookupUs = (s.totalLookupNs / 1000.0) / safe(s.lookups);
+    double avgDeserUs  = (s.totalDeserNs  / 1000.0) / safe(s.hits);
+    double avgSerUs    = (s.totalSerNs    / 1000.0) / safe(s.inserts);
+    double hitRate     = 100.0 * static_cast<double>(s.hits) / safe(s.lookups);
+    std::fprintf(out,
+        "v3-direct eval-result-cache (SHADOW): lookups=%llu hits=%llu misses=%llu "
+        "inserts=%llu mismatch=%llu hit_rate=%.1f%%\n"
+        "  avg: hash=%.2f us lookup=%.2f us deser-on-hit=%.2f us ser-on-insert=%.2f us\n"
+        "  bytes: cached=%.2f MB delivered=%.2f MB\n"
+        "  errors: hash=%llu deser=%llu\n",
+        (unsigned long long)s.lookups, (unsigned long long)s.hits,
+        (unsigned long long)s.misses, (unsigned long long)s.inserts,
+        (unsigned long long)s.mismatchHits,
+        hitRate, avgHashUs, avgLookupUs, avgDeserUs, avgSerUs,
+        s.bytesCached / (1024.0 * 1024.0),
+        s.bytesDelivered / (1024.0 * 1024.0),
+        (unsigned long long)s.hashErrors,
+        (unsigned long long)s.deserErrors);
 }
 
 void dumpStats(std::FILE * out)

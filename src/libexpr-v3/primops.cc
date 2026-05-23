@@ -6309,6 +6309,27 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
     }
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("__derivationFromPreprocessed", "attrset");
+
+    // #741 Phase 3a SHADOW cache — see primDerivationStrictNative for
+    // semantics.  Body always runs; hit just verifies.
+    std::string v3CacheKey;
+    Value v3CachedOut;
+    bool v3CacheClaimed = false;
+    if (value_serialize::evalResultCacheEnabled()) {
+        forceDeep(*state.vm, args[0]);
+        v3CacheClaimed =
+            value_serialize::evalResultCacheLookup(args[0], v3CachedOut, v3CacheKey);
+    }
+    auto v3CacheFinaliser = [&]() {
+        if (v3CacheKey.empty()) return;
+        if (v3CacheClaimed) {
+            if (!value_serialize::valuesEqual(v3CachedOut, out))
+                ++value_serialize::evalResultCacheStats().mismatchHits;
+        } else {
+            value_serialize::evalResultCacheInsert(v3CacheKey, out);
+        }
+    };
+
     auto * pp = args[0].payload.bindings;
 
     // Symbol IDs we'll look up.  Cache by static-local for reuse.
@@ -6504,6 +6525,8 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
                             contentAddressed, isImpure,
                             outputHashStr, outputHashAlgoStr, outputHashModeStr,
                             out);
+    // #741 Phase 3a SHADOW: verify hit, or insert on miss.
+    v3CacheFinaliser();
 }
 
 static void primDerivationStrictNative(
@@ -6512,6 +6535,47 @@ static void primDerivationStrictNative(
     auto & ns = *state.nixEvalState;
     auto * src = args[0].payload.bindings;
     const auto & sym = drvStrictSymbols();
+
+    // #741 Phase 3a SHADOW cache: deep-force input, hash, look up.
+    // ALWAYS continue body; on hit just verify at end.  Side effects
+    // (.drv file write, drvHashes) remain authoritative via body run.
+    std::string v3CacheKey;
+    Value v3CachedOut;
+    bool v3CacheClaimed = false;
+    if (value_serialize::evalResultCacheEnabled()) {
+        // #741 Phase 3a-RCA-A (2026-05-23): the original plan called
+        // forceDeep(*state.vm, args[0]) here to walk the input deeply
+        // so canonicalHash could hash all its Thunk-bound values.
+        // Falsified: forceDeep at primop entry triggers a downstream
+        // `v3 OP_ATTRS_SELECT: not an attrset` bytecode failure on
+        // nixpkgs hello.drvPath.  Hypothesised cause: forceDeep's
+        // bindingsSetValue writeback of Tag::Slot entries (let-rec
+        // slot indirections) mutates state the surrounding bytecode
+        // relies on.  RCA pending; for Phase 3a we skip forceDeep and
+        // accept partial coverage (canonicalHash throws on un-forced
+        // Thunk entries; those calls increment hashErrors and bypass
+        // the cache — no correctness impact).  Phase 3b will replace
+        // forceDeep with a Thunk-chasing walker that reads
+        // Thunk::evaluated without mutating Bindings.
+        v3CacheClaimed =
+            value_serialize::evalResultCacheLookup(args[0], v3CachedOut, v3CacheKey);
+    }
+    // RAII-style end-of-function action: verify on hit, insert on miss.
+    auto v3CacheFinaliser = [&]() {
+        if (v3CacheKey.empty()) return;
+        if (v3CacheClaimed) {
+            if (!value_serialize::valuesEqual(v3CachedOut, out))
+                ++value_serialize::evalResultCacheStats().mismatchHits;
+        } else {
+            value_serialize::evalResultCacheInsert(v3CacheKey, out);
+        }
+    };
+    // Use a guard so even early returns / throws don't skip the
+    // finaliser.  We only insert on successful body completion, so
+    // we run the finaliser AT THE END, not in a destructor (a
+    // destructor would also run on exception, but inserting a
+    // partial / never-computed `out` would be wrong).
+    // → defer to manual call at the end (no early returns in this body).
 
     // ---- name ----
     const Value * nameVRaw = src->lookup(sym.name);
@@ -6809,6 +6873,10 @@ static void primDerivationStrictNative(
         contentAddressed, isImpure,
         outputHashStr, outputHashAlgoStr, outputHashModeStr,
         out);
+    // #741 Phase 3a SHADOW: verify hit, or insert on miss.  Runs on
+    // normal completion only; exceptions (rethrown from any of the
+    // calls above) skip the cache update.
+    v3CacheFinaliser();
 }
 
 // Legacy inline phase-4-7 code from primDerivationStrictNative, kept as

@@ -137,4 +137,80 @@ bool canonicalHashTestModeEnabled() noexcept;
 /// `V3-VAL-HASH: <64-hex>` to stderr.  Cheap no-op otherwise.
 void dumpCanonicalHashLine(const Value & v) noexcept;
 
+// ---------------------------------------------------------------------------
+// #741 Phase 3a — in-memory SHADOW eval-result cache (intra-process).
+//
+// SHADOW mode: the primop body ALWAYS runs.  The cache lookup result
+// is used ONLY to verify the just-computed output matches the cached
+// one.  No primop body is skipped; correctness is preserved by
+// construction.
+//
+// Rationale: `buildAndWriteDrvNative` has a non-replayable side effect
+// (writes the .drv file via `store.writeDerivation`).  An active
+// skip-on-hit cache needs a side-effect-replay path for the .drv file
+// (and for `nix::drvHashes` memoisation, though that one is
+// recoverable via `pathDerivationModulo`'s lazy read fallback).  That
+// replay infrastructure is Phase 3b; Phase 3a validates the cache
+// pipeline architecture safely first.
+//
+// Phase 3a flow per primop call:
+//   - At entry: deep-force args[0], canonical-hash → key, look up.
+//     Stash (hit-flag, cachedValue) in the primop's locals.
+//   - The primop body ALWAYS runs.
+//   - At exit:
+//       * If hit: structurally compare cachedValue to `out`.  Mismatch
+//         bumps a counter (a Rule-0 falsifier — indicates a hash
+//         collision or determinism bug).
+//       * If miss: serialise(out) and insert (key, blob) for later
+//         calls in the same process.
+//
+// Gate: NIX_V3_EVAL_RESULT_CACHE=1 (independent of Phase 1/2 gates).
+//
+// Falsifier (Phase 3a): on hello.drvPath + gcc + python3, hit rate
+// should be ≥ 30% (matching the Phase 2 duplicate finding) and
+// `mismatchHits` should be 0 across all three workloads.
+// ---------------------------------------------------------------------------
+
+bool evalResultCacheEnabled() noexcept;
+
+struct EvalResultCacheStats {
+    uint64_t lookups          = 0;  // entry attempts (deep-force + hash + look up)
+    uint64_t hits             = 0;  // key found in cache; result deserialised
+    uint64_t misses           = 0;  // key not found; primop body must run + insert
+    uint64_t inserts          = 0;  // successful inserts on miss
+    uint64_t mismatchHits     = 0;  // hit's cached output ≠ just-computed — falsifier!
+    uint64_t deserErrors      = 0;  // deserialise threw on hit; fallback to compute
+    uint64_t hashErrors       = 0;  // canonicalHash threw; cache skipped
+    uint64_t bytesCached      = 0;  // sum of inserted blob sizes
+    uint64_t bytesDelivered   = 0;  // sum of blob sizes returned via hit
+    uint64_t totalHashNs      = 0;  // wall time in input-hash compute
+    uint64_t totalSerNs       = 0;  // wall time in insert-serialize
+    uint64_t totalLookupNs    = 0;  // wall time in unordered_map lookup
+    uint64_t totalDeserNs     = 0;  // wall time in deserialise-on-hit
+};
+
+EvalResultCacheStats & evalResultCacheStats() noexcept;
+
+/// Look up cached result for `input`.  Returns true if hit (and writes
+/// deserialised result into `outResult`).  Returns false on miss
+/// (caller continues normal primop; should later call
+/// `evalResultCacheInsert(input, computedResult)`).
+///
+/// `outKey` is filled with the hash key, used by the matching insert
+/// call to avoid recomputing the hash.  Empty `outKey` (size 0) means
+/// the cache is disabled or the key computation failed; the matching
+/// insert MUST be a no-op in that case.
+bool evalResultCacheLookup(const Value & input,
+                            Value & outResult,
+                            std::string & outKey) noexcept;
+
+/// Insert (key, serialise(result)) into the cache.  No-op when the
+/// cache is disabled, when `key` is empty, or when serialise fails.
+void evalResultCacheInsert(const std::string & key,
+                            const Value & result) noexcept;
+
+/// Dump cache stats line(s) to `out`.  Silent when cache is disabled
+/// or no lookups happened.
+void dumpEvalResultCacheStats(std::FILE * out);
+
 } // namespace nix::v3::value_serialize
