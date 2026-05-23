@@ -176,6 +176,17 @@ struct AllocStats
     /// register-VM rewrite.
     uint64_t bigramCounts[256][256] = {};
 
+    /// #786 (2026-05-23) per-opcode cycle accumulator.  Gated by
+    /// NIX_VM_OPCYCLES=1.  Records total CPU time spent dispatched
+    /// in each opcode's case body, divided by its count, to give
+    /// per-op cost in ns.  Used to verify or contradict the
+    /// pre-implementation per-op-ns estimates that drove the #780
+    /// and #783 estimate-based falsifiers (see PERF_AUDIT_2026-05-23
+    /// review).  Per-dispatch overhead: 1 mach_absolute_time call
+    /// = ~10 ns; tolerable under the gate, distorts but doesn't
+    /// invalidate relative comparisons across opcodes.
+    uint64_t opcycleNs[256] = {};
+
     /// #783-measure (2026-05-23) refined bigram subcounters.  The
     /// bigramCounts above are pair-of-opcode counts; for fusion
     /// design we need to know what FRACTION are same-operand.

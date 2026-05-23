@@ -2570,6 +2570,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // attributable to the workload, not the meter.
         static const bool s_countOpcodes =
             std::getenv("NIX_VM_OPCOUNTS") != nullptr;
+        // #786 OPCYCLES (2026-05-23) — per-opcode cycle accumulator.
+        // Gated by NIX_VM_OPCYCLES=1.  Samples clock at dispatch
+        // start; credits the elapsed time to the PREVIOUS opcode.
+        // Per-dispatch overhead ≈ 10-20 ns (clock + add); material
+        // but invariant per-op so relative comparisons across
+        // opcodes stay valid.  Used to verify the per-op-ns
+        // estimates that drove the prior #780 / #783 estimate-based
+        // falsifiers (see lode/PERF_AUDIT_2026-05-23.md review).
+        static const bool s_countOpCycles =
+            std::getenv("NIX_VM_OPCYCLES") != nullptr;
+        if (__builtin_expect(s_countOpCycles, 0)) [[unlikely]] {
+            static thread_local uint8_t s_prevOp = 0xFF;
+            static thread_local uint64_t s_prevTs = 0;
+            uint64_t ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (s_prevOp != 0xFF) {
+                allocStats().opcycleNs[s_prevOp] += (ts - s_prevTs);
+            }
+            s_prevOp = static_cast<uint8_t>(op);
+            s_prevTs = ts;
+        }
         if (__builtin_expect(s_countOpcodes, 0)) [[unlikely]] {
             allocStats().opcodeCounts[static_cast<uint8_t>(op)]++;
             // #782 bigram tracking — only when NIX_VM_BIGRAMS=1

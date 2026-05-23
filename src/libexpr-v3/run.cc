@@ -536,6 +536,52 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     (unsigned long long)selFam,
                     100.0 * selFam / totalDispatch);
 
+                // #786 OPCYCLES — observed per-op ns (avg) on this
+                // run.  Only present when NIX_VM_OPCYCLES=1 was set.
+                // Each row: opcode + total ns + count + ns/op.
+                // Note: measurement overhead per dispatch is ~10-20 ns
+                // (one steady_clock + add); subtract that from the
+                // reported ns/op to get the "real" per-op cost.
+                // Relative comparisons across opcodes are unaffected.
+                uint64_t totalCyc = 0;
+                for (size_t i = 0; i < 256; ++i) totalCyc += a.opcycleNs[i];
+                if (totalCyc > 0) {
+                    std::fprintf(stderr,
+                        "v3-direct opcycles (observed per-op ns; "
+                        "~10-20 ns measurement overhead per dispatch):\n");
+                    // Sort by total ns descending.
+                    struct CycRow { uint8_t code; uint64_t ns; uint64_t cnt; };
+                    CycRow crows[256];
+                    size_t nz = 0;
+                    for (size_t i = 0; i < 256; ++i) {
+                        if (a.opcycleNs[i] > 0 && a.opcodeCounts[i] > 0) {
+                            crows[nz++] = { (uint8_t)i,
+                                            a.opcycleNs[i],
+                                            a.opcodeCounts[i] };
+                        }
+                    }
+                    std::sort(crows, crows + nz,
+                        [](const CycRow & x, const CycRow & y) {
+                            return x.ns > y.ns;
+                        });
+                    const size_t topN = std::min<size_t>(12, nz);
+                    for (size_t i = 0; i < topN; ++i) {
+                        std::fprintf(stderr,
+                            "  %-26s total=%llu ns  count=%llu  "
+                            "avg=%6.1f ns/op\n",
+                            opName(static_cast<Op>(crows[i].code)),
+                            (unsigned long long)crows[i].ns,
+                            (unsigned long long)crows[i].cnt,
+                            (double)crows[i].ns / (double)crows[i].cnt);
+                    }
+                    std::fprintf(stderr,
+                        "  -- total measured: %llu ns over %llu ops "
+                        "(avg %.1f ns/op including measurement overhead)\n",
+                        (unsigned long long)totalCyc,
+                        (unsigned long long)totalDispatch,
+                        (double)totalCyc / (double)totalDispatch);
+                }
+
                 // #782 bigram top-20 (only when NIX_VM_BIGRAMS=1
                 // was set during eval — non-zero entries reveal
                 // common (prev, current) op-pairs.  Used as the
