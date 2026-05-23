@@ -65,6 +65,8 @@ const char * opName(Op op)
     case OP_ATTRS_HAS:         return "OP_ATTRS_HAS";
     case OP_ATTRS_HAS_DYN:     return "OP_ATTRS_HAS_DYN";
     case OP_ATTRS_UPDATE:      return "OP_ATTRS_UPDATE";
+    case OP_ATTRS_UPDATE_TAIL: return "OP_ATTRS_UPDATE_TAIL";
+    case OP_IFD_PROBE:         return "OP_IFD_PROBE";
     case OP_REC_BINDING_SLOT_REF: return "OP_REC_BINDING_SLOT_REF";
     case OP_REC_SLOT_PUBLISH:  return "OP_REC_SLOT_PUBLISH";
     case OP_THUNK_SET_LOCAL_THROUGH_CELL: return "OP_THUNK_SET_LOCAL_THROUGH_CELL";
