@@ -167,6 +167,15 @@ struct AllocStats
     /// driving where to focus VM-level optimisation work.
     uint64_t opcodeCounts[256] = {};
 
+    /// #782 (2026-05-23) bigram (prev_op, current_op) counts.  Gated
+    /// by NIX_VM_OPCOUNTS=1 with NIX_VM_BIGRAMS=1 to add the second
+    /// counter increment (~1 ns extra dispatch when both are on).
+    /// 256×256 × 8 B = 524 KB of zero-init memory; acceptable for
+    /// diagnostic-only.  Reports top-N bigrams to identify
+    /// super-instruction candidates before committing to #780
+    /// register-VM rewrite.
+    uint64_t bigramCounts[256][256] = {};
+
     /// Bindings allocation histogram by size.  Buckets:
     /// [0]=0, [1]=1, [2]=2, [3]=3-4, [4]=5-8, [5]=9-16, [6]=17-32,
     /// [7]=33-64, [8]=65-128, [9]=129+.  Used to size-tune the

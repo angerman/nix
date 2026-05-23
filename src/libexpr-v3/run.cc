@@ -535,6 +535,69 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     "(Stage 5 PIC kill criterion: <10%%)\n",
                     (unsigned long long)selFam,
                     100.0 * selFam / totalDispatch);
+
+                // #782 bigram top-20 (only when NIX_VM_BIGRAMS=1
+                // was set during eval — non-zero entries reveal
+                // common (prev, current) op-pairs.  Used as the
+                // measurement spike for #780: if >5 % of dispatch
+                // collapses to a handful of bigrams, super-
+                // instructions can capture that without a
+                // full register-VM rewrite.
+                uint64_t totalBigrams = 0;
+                for (size_t i = 0; i < 256; ++i)
+                    for (size_t j = 0; j < 256; ++j)
+                        totalBigrams += a.bigramCounts[i][j];
+                if (totalBigrams > 0) {
+                    struct BigramRow {
+                        uint8_t prev, curr;
+                        uint64_t count;
+                    };
+                    BigramRow brows[256];
+                    size_t bnz = 0;
+                    // Top-20 by count (single pass with insertion).
+                    // 256² = 65 K iterations; cheap.
+                    for (size_t i = 0; i < 256; ++i) {
+                        for (size_t j = 0; j < 256; ++j) {
+                            uint64_t c = a.bigramCounts[i][j];
+                            if (c == 0) continue;
+                            // Insert into sorted brows (keep top 20).
+                            if (bnz < 20) {
+                                brows[bnz++] = { (uint8_t)i, (uint8_t)j, c };
+                            } else {
+                                // Find min and replace if larger.
+                                size_t minIdx = 0;
+                                for (size_t k = 1; k < bnz; ++k)
+                                    if (brows[k].count < brows[minIdx].count)
+                                        minIdx = k;
+                                if (c > brows[minIdx].count)
+                                    brows[minIdx] = { (uint8_t)i, (uint8_t)j, c };
+                            }
+                        }
+                    }
+                    std::sort(brows, brows + bnz,
+                        [](const BigramRow & x, const BigramRow & y) {
+                            return x.count > y.count;
+                        });
+                    std::fprintf(stderr,
+                        "v3-direct bigrams: total=%llu "
+                        "(top-20; #780 super-instruction candidates):\n",
+                        (unsigned long long)totalBigrams);
+                    uint64_t topSum = 0;
+                    for (size_t i = 0; i < bnz; ++i) {
+                        std::fprintf(stderr,
+                            "  %-24s -> %-24s %12llu  %5.2f%%\n",
+                            opName(static_cast<Op>(brows[i].prev)),
+                            opName(static_cast<Op>(brows[i].curr)),
+                            (unsigned long long)brows[i].count,
+                            100.0 * brows[i].count / totalBigrams);
+                        topSum += brows[i].count;
+                    }
+                    std::fprintf(stderr,
+                        "  -- top-20 sum: %5.2f%% of all bigrams "
+                        "(#780 register-VM kill criterion: top-20 < 30%% "
+                        "→ stack motion is spread, not pair-fusible)\n",
+                        100.0 * topSum / totalBigrams);
+                }
             }
         }
         // #736 (2026-05-21) IFD-probe summary.  Per IFD_DEEP_DIVE

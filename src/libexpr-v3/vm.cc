@@ -2572,6 +2572,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             std::getenv("NIX_VM_OPCOUNTS") != nullptr;
         if (__builtin_expect(s_countOpcodes, 0)) [[unlikely]] {
             allocStats().opcodeCounts[static_cast<uint8_t>(op)]++;
+            // #782 bigram tracking — only when NIX_VM_BIGRAMS=1
+            // alongside NIX_VM_OPCOUNTS=1.  Identifies common
+            // (prev_op, current_op) sequences for super-instruction
+            // candidates.  Per-thread previous-op stored in
+            // a function-local static (single-threaded VM; the per-
+            // thread aliasing rules around static thread_local
+            // would add bookkeeping for no benefit).
+            static const bool s_countBigrams =
+                std::getenv("NIX_VM_BIGRAMS") != nullptr;
+            if (__builtin_expect(s_countBigrams, 0)) [[unlikely]] {
+                static thread_local uint8_t prevOp = 0;
+                allocStats().bigramCounts
+                    [prevOp][static_cast<uint8_t>(op)]++;
+                prevOp = static_cast<uint8_t>(op);
+            }
         }
         uint32_t operand = decodeOperand(instr);
 
