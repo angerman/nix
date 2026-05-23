@@ -248,8 +248,24 @@ struct DrvHashCacheStats {
     uint64_t totalSerNs       = 0;
     uint64_t totalDeserNs     = 0;
     uint64_t totalLookupNs    = 0;
+    // Phase 3e ACTIVE: incremented on each skip-on-hit (where the
+    // primop body's libstore tail was bypassed because the cache
+    // had the result).  Equals the wall-saving event count.
+    uint64_t activeSkips      = 0;
 };
 DrvHashCacheStats & drvHashCacheStats() noexcept;
+
+/// ACTIVE mode: on hit, skip the rest of `buildAndWriteDrvNative`
+/// (hashDerivationModulo + drvHashes insert + result attrset
+/// construction) and use the cached result directly.  In-process
+/// safe because cache hits always follow the populating miss
+/// (the miss populated drvHashes; subsequent libstore consumers see
+/// the entry).  In `nix eval --impure` (readOnlyMode), writeDerivation
+/// was a no-op anyway so no .drv-file concern.
+///
+/// Gate: NIX_V3_DRV_HASH_CACHE_ACTIVE=1.  ACTIVE implies SHADOW
+/// (lookups still go through the same machinery).
+bool drvHashCacheActiveEnabled() noexcept;
 
 /// SHADOW-mode lookup by external key (e.g. drvPath string).  On hit,
 /// fills outResult with the deserialised cached value.  Caller is

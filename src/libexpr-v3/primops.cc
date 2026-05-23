@@ -6199,19 +6199,36 @@ static void buildAndWriteDrvNative(
         : ns.store->writeDerivation(drv, ns.repair);
     std::string drvPathS = ns.store->printStorePath(drvPath);
 
-    // #741 Phase 3e SHADOW: drv-hash-keyed cache lookup.
+    // #741 Phase 3e SHADOW / ACTIVE: drv-hash-keyed cache lookup.
     // drvPath IS the canonical content hash of `drv` (libstore
     // semantics: same drvPath ⇒ same drv ⇒ same effective inputs).
-    // Two primop calls producing the same drvPath MUST produce
-    // identical result attrsets.
-    // Body always continues (writeDerivation, hashDerivationModulo,
-    // result attrset).  On hit, we verify cached vs computed below.
+    // Two primop calls producing the same drvPath produce identical
+    // result attrsets.  SHADOW: always continues body; ACTIVE: skips
+    // the remaining libstore tail on hit.
     Value v3DrvCached;
     std::string v3DrvKey;
     bool v3DrvHit = false;
-    if (value_serialize::drvHashCacheEnabled()) {
+    if (value_serialize::drvHashCacheEnabled()
+        || value_serialize::drvHashCacheActiveEnabled()) {
         v3DrvKey = drvPathS;
         v3DrvHit = value_serialize::drvHashCacheLookup(v3DrvKey, v3DrvCached);
+    }
+
+    // Phase 3e ACTIVE — skip-on-hit.  In-process safe because the
+    // populating miss already ran hashDerivationModulo +
+    // drvHashes.insert_or_assign(drvPath, h) (the libstore drvHashes
+    // map is process-global; subsequent pathDerivationModulo callers
+    // find drvPath via that earlier insert regardless of who put it
+    // there).  In `nix eval --impure` (readOnlyMode), writeDerivation
+    // was already a no-op so no .drv-file concern.
+    //
+    // NOT safe for cross-process replay (Phase 5): a freshly-loaded
+    // cache wouldn't have populated drvHashes.  Phase 5 must cache
+    // the modulo hash alongside the result and replay it on hit.
+    if (v3DrvHit && value_serialize::drvHashCacheActiveEnabled()) {
+        out = v3DrvCached;
+        ++value_serialize::drvHashCacheStats().activeSkips;
+        return;
     }
 
     {

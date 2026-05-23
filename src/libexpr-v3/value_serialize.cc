@@ -834,9 +834,18 @@ DrvHashCacheStats & drvHashCacheStats() noexcept
 
 bool drvHashCacheEnabled() noexcept { return drvHashCacheEnabledCached(); }
 
+bool drvHashCacheActiveEnabled() noexcept
+{
+    static const bool enabled = []() {
+        const char * e = std::getenv("NIX_V3_DRV_HASH_CACHE_ACTIVE");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
 bool drvHashCacheLookup(const std::string & key, Value & outResult) noexcept
 {
-    if (!drvHashCacheEnabled()) return false;
+    if (!drvHashCacheEnabled() && !drvHashCacheActiveEnabled()) return false;
     if (key.empty()) return false;
     auto & stats = drvHashCacheStats();
     ++stats.lookups;
@@ -864,7 +873,7 @@ bool drvHashCacheLookup(const std::string & key, Value & outResult) noexcept
 
 void drvHashCacheInsert(const std::string & key, const Value & result) noexcept
 {
-    if (!drvHashCacheEnabled()) return;
+    if (!drvHashCacheEnabled() && !drvHashCacheActiveEnabled()) return;
     if (key.empty()) return;
     auto & stats = drvHashCacheStats();
     std::string blob;
@@ -883,7 +892,7 @@ void drvHashCacheInsert(const std::string & key, const Value & result) noexcept
 
 void dumpDrvHashCacheStats(std::FILE * out)
 {
-    if (!drvHashCacheEnabled()) return;
+    if (!drvHashCacheEnabled() && !drvHashCacheActiveEnabled()) return;
     const auto & s = drvHashCacheStats();
     if (s.lookups == 0) return;
     auto safe = [](uint64_t n) -> uint64_t { return n ? n : 1; };
@@ -891,15 +900,18 @@ void dumpDrvHashCacheStats(std::FILE * out)
     double avgDeserUs  = (s.totalDeserNs  / 1000.0) / safe(s.hits);
     double avgSerUs    = (s.totalSerNs    / 1000.0) / safe(s.inserts);
     double hitRate     = 100.0 * static_cast<double>(s.hits) / safe(s.lookups);
+    const char * mode = drvHashCacheActiveEnabled() ? "ACTIVE" : "SHADOW";
     std::fprintf(out,
-        "v3-direct drv-hash-cache (SHADOW): lookups=%llu hits=%llu misses=%llu "
-        "inserts=%llu mismatch=%llu hit_rate=%.1f%%\n"
+        "v3-direct drv-hash-cache (%s): lookups=%llu hits=%llu misses=%llu "
+        "inserts=%llu mismatch=%llu activeSkips=%llu hit_rate=%.1f%%\n"
         "  avg: lookup=%.2f us deser-on-hit=%.2f us ser-on-insert=%.2f us\n"
         "  bytes: cached=%.2f MB delivered=%.2f MB\n"
         "  errors: deser=%llu\n",
+        mode,
         (unsigned long long)s.lookups, (unsigned long long)s.hits,
         (unsigned long long)s.misses, (unsigned long long)s.inserts,
         (unsigned long long)s.mismatchHits,
+        (unsigned long long)s.activeSkips,
         hitRate, avgLookupUs, avgDeserUs, avgSerUs,
         s.bytesCached / (1024.0 * 1024.0),
         s.bytesDelivered / (1024.0 * 1024.0),
