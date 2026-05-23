@@ -425,9 +425,13 @@ They share infrastructure, share the Nix-team coordination story, and compose: b
 
 ### 8.4 Implications for Phase 4 (Class B IFD primops)
 
-Phase 4 was always the bigger lever. The leaf-primop result is small even with the mmap fix (~3-10 % wall). Phase 4's per-hit savings are seconds, not microseconds, so any cache implementation wins there.
+**This section was originally written before commit `2103cdddb` (Phase 4 falsifier) and commit `cbb870174` (workload heterogeneity audit) landed. See §13 for the post-falsifier amendment — the Phase 4 audience claim is workload-conditional, not unconditional.**
 
-**Architecture handoff:** the mmap'd flat file IS the right Phase 4 substrate too. Same format, larger Value payloads, same OS-page-cache sharing properties. Phase 4 implementation is then "wire up the new IFD primop call sites to the existing mmap'd cache" — minimal architectural new code.
+Phase 4 *would be* the bigger lever where it fires. The leaf-primop result is small even with the mmap fix (~3-10 % wall). Phase 4's per-hit savings would be seconds, not microseconds, so any cache implementation wins there if there are candidates to cache.
+
+**Architecture handoff (still valid):** the mmap'd flat file IS the right Phase 4 substrate too. Same format, larger Value payloads, same OS-page-cache sharing properties. Phase 4 implementation is then "wire up the new IFD primop call sites to the existing mmap'd cache" — minimal architectural new code.
+
+**Conditional applicability:** see §13.
 
 ---
 
@@ -451,7 +455,8 @@ In priority order:
 2. **Re-run Phase 5 with L1-in-memory-only (no SQLite)** on firefox as an isolated control. 1-day spike. Expected: wall-positive driven by 58 % intra-process hit rate × in-memory cost. Confirms the SQLite-cost-isolation hypothesis even before mmap implementation.
 3. **Measure cardano-node M5 with existing Phase 5 substrate.** Higher hashDerivationModulo recursion + deeper graph means larger per-hit savings. Confirms whether the per-call ceiling extends to deeper-graph workloads or whether per-call savings scale with graph depth.
 4. **(Gated on 1 success) Spec the AOT distribution path** (§7.3) — design doc + Nix-team coordination, 1-2 weeks v3 work + cross-team.
-5. **(Independent) Continue Phase 4 (Class B IFD primops) planning** — the multi-second-savings lever stays valid regardless of leaf-scope outcome. The mmap'd cache substrate from §7.1 is the right Phase 4 substrate.
+5. **(Audience-gated, see §13) Phase 4 (Class B IFD primops) is INAPPLICABLE on the standard nixpkgs workload set** per commit `2103cdddb` measurement: 0 with-context IFD probes across 7 workloads. The Phase 4 lever requires committing to haskell.nix-shaped workloads as a benchmark target — substantial setup work that's a workload-strategy decision, not a v3-architecture decision. The mmap'd cache substrate from §7.1 IS the right Phase 4 substrate when/if the audience materialises; no architectural work needed today.
+6. **(New, identified by `cbb870174`) `.name`-class workload optimization** is a structurally separate lever — parser/lowerer-dominated, 0 derivation primop calls, top primops are __findFile / import / removeAttrs. Eval-cache architecture has nothing to say here. If `.name` perf matters (flake exploration, IDE hover, attr enumeration), the levers are parser / lowerer / module-system traversal — a separate audit.
 
 ---
 
@@ -462,6 +467,132 @@ In priority order:
 > **Implementation effort: 3-5 days for spike, measurable wall-positive expected.** Decision rules pre-committed (§7.2). If spike confirms, AOT distribution opens (1-2 weeks + Nix-team coord). If spike fails, the leaf-primop scope is structurally too cheap for any caching layer and Phase 4 becomes the primary lever (which it might be anyway).
 >
 > **Service / daemon architectures are scope-conditional:** wrong at leaf primop, right at Phase 4 if the team decides to ship cross-network or cross-eval-coordination features. Daemon-does-eval is a Stage 13-class commitment unrelated to this cache decision.
+
+---
+
+## 13. Post-Phase-4-falsifier amendment (added 2026-05-23, post-commit)
+
+Four commits landed within hours of this doc's first commit (`65c56a732`) that **substantially reframe §8.4 and §10**. Together they map both the audience question AND the wall-savings question for Phase 4. Documented here so future readers don't apply §8.4's original framing without the amendment.
+
+**Quick summary of the four commits:**
+- `cbb870174` — Workload heterogeneity audit. drvPath class homogeneous; .name class structurally separate.
+- `2103cdddb` — Phase 4 *audience* falsifier: 0 with-context IFD candidates across 7 nixpkgs workloads (literal-path imports are already cached at two layers above).
+- `88402090b` — Phase 4 disk-backed import-result cache IMPLEMENTED. Validated on synthetic IFD workload. Architecture correct.
+- `b248b0f8d` — Phase 4b: forceDeep at import-exit before serialisation. Enables disk-cache of lazy `rec { ... }` imported attrsets. **HYP-3 wall mostly falsified**: COLD +78 %, WARM +2.2 % (within noise).
+
+The team executed the full "audience + architecture + wall" cycle for Phase 4 in the same session — and the wall result is the same recurring pattern: architecture correct, lever bounded by what's skippable vs total eval. The §10 next-moves item 5 was outdated within hours of this doc's first commit.
+
+### 13.1 Phase 4 audience falsifier (commit `2103cdddb`)
+
+The team added `AllocStats::ifdProbeWithCtx[16]` — a counter that increments in `primImport`/`primReadFile`/`primPathExists` **only** when the path argument carries non-empty `NixStringContext` (the discriminator between literal-path imports, which are already TW-eval-cached + v3-disk-cached via #770, and derivation-output-path imports, which can trigger real builds via `realisePath`).
+
+**Cross-workload measurement:**
+
+| Workload | Total IFD probes | With-context (Phase 4 audience) |
+|---|---|---|
+| hello.name | 573 | **0** |
+| hello.drvPath | 983 | **0** |
+| hello.outPath | 983 | **0** |
+| gcc.drvPath | 1009 | **0** |
+| python3.drvPath | 1006 | **0** |
+| firefox.name | 618 | **0** |
+| firefox.drvPath | 3179 | **0** |
+
+**Every single `import` / `readFile` / `pathExists` call across these seven workloads has empty string context.** They are all literal-path imports — already cached at two layers above (TW eval-cache + v3 disk cache). **Phase 4 has NO AUDIENCE on the standard nixpkgs workload set.**
+
+### 13.2 Workload heterogeneity audit (commit `cbb870174`, `WORKLOAD_HETEROGENEITY_AUDIT_2026-05-23.md`)
+
+Nine workloads measured under `NIX_VM_STATS + NIX_VM_PRIMOP_TIME`. Two-part outcome:
+
+| Class | Insns | Memory | Drv calls | Top primops |
+|---|---|---|---|---|
+| `.name` | 2.3M | 195 MB | **0** | __findFile / import / removeAttrs |
+| `.drvPath` (hello/bash/coreutils/gcc/python3) | 12-15M | 666 MB | 12-17K | __derivation* / __derivCoerce |
+| firefox.drvPath | 60M | 1432 MB | 77K | same as drvPath class (= hello at 4-5× scale) |
+
+**The drvPath workload class is homogeneous; the .name class is structurally separate.**
+
+Confirms firefox.drvPath Phase 5 wall at 4-5× scale: 2575 ms OFF vs 2623 ms WARM ACTIVE+DISK = **1.02× slower** — i.e. the libstore-tail-too-small finding is invariant across the drvPath class, not specific to hello.
+
+### 13.3 What this jointly implies for this doc
+
+**Four concrete amendments:**
+
+**(a) §8.4's "Phase 4 remains the larger lever" framing is workload-conditional. The architecture is BUILT and validated; the wall lever still depends on workload mix.**
+
+The "haskell.nix-materialization-equivalent multi-second savings" framing in §8.4 (and in `IFD_CACHE_DESIGN_2026-05-23.md` and `IFD_DEEP_DIVE_2026-05-21.md` §11) was correct in PRINCIPLE. **Per `88402090b` + `b248b0f8d`, the Phase 4 architecture is now actually built**:
+
+- Disk-backed import-result cache hooked at `primImport`'s resolved-path check (line 7530-area)
+- Gate: `NIX_V3_IFD_IMPORT_CACHE_DISK=1`
+- Key: `SHA256("ifd-import\0" + path)`
+- Storage: existing Phase 5 EvalResults table
+- Phase 4b extends with `forceDeep` at import-exit before serialisation, enabling disk-cache of lazy `rec { ... }` imported attrsets
+
+**Validated on synthetic IFD workload** (constructed for this purpose since standard nixpkgs has zero with-context IFD candidates):
+- HYP-1 correctness ✓ confirmed (byte-identical TW)
+- HYP-2 architecture ✓ confirmed (IMPORT-DISK-HIT events on warm runs; cold inserts 737 KB blob for ifd-large's 1000-attr `rec { ... }` result)
+- HYP-3 wall MOSTLY FALSIFIED (COLD +78 % one-time tax; WARM +2.2 % within noise)
+
+The wall result follows the **same recurring pattern** as Phase 3e ACTIVE + Phase 5: architecture correct, lever bounded by what's skippable vs total eval. The IFD-result parse+eval is ~10 ms; total eval is dominated by nixpkgs-load (~700 ms). For Phase 4 wall savings to materialise, need workloads where IFD-result parse+eval **dominates** — haskell.nix's `callCabalProjectToNix`, flake outputs that import derivation result files, NixOS modules with IFD-generated configuration. Standard nixpkgs workloads (the audience falsifier) AND the synthetic IFD workload (the wall falsifier) both confirm: this lever fires only on workloads built around IFD.
+
+**(b) §10 next moves — replace "(parallel-track) Phase 4 planning" with the correct status.**
+
+Original §10 listed:
+> 5. (Independent) Continue Phase 4 (Class B IFD primops) planning — the multi-second-savings lever stays valid regardless of leaf-scope outcome.
+
+Corrected reading:
+
+> 5a. **Phase 4 architecture is BUILT** (commits `88402090b` + `b248b0f8d`). Disk-backed import-result cache with forceDeep at import-exit. Validated on synthetic IFD workload; same wall pattern as Phase 5 (architecture correct, lever bounded). NO further architectural work needed today.
+> 5b. **Phase 4 wall lever is workload-gated** on haskell.nix-class workloads where IFD-result parse+eval dominates total eval. Test target: `callCabalProjectToNix`, flake-input IFD imports, NixOS modules with IFD-generated config. This is a **workload-strategy decision** (commit to haskell.nix-shaped benchmark), not a v3-architecture decision.
+> 5c. **`.name`-class workload optimization path** is structurally separate — parser/lowerer-dominated, 0 derivation primop calls, eval-cache architecture has nothing to say. Separate audit if `.name` perf matters (flake exploration, IDE hover, attr enumeration).
+
+**(c) The drvPath workload class is homogeneous — the mmap-L2 spike (§7) result will generalise.**
+
+If the mmap'd L2 spike confirms wall-positive on hello.drvPath, the workload audit predicts it generalises across hello/bash/coreutils/gcc/python3/firefox at the same per-call savings (~30-50 µs × call count). firefox at 77 K drv calls = ~2.3-3.8 s potential lever — but bounded by the SAME per-call ceiling.
+
+**This actually strengthens the spike priority.** A 3-5 day investment with a known per-call ceiling that's structurally invariant across the workload class is exactly the kind of measure-twice spike the [[measure-twice-cut-once]] rule endorses. The downside is bounded; the upside scales with the workload size proportionally.
+
+**(d) The same wall pattern across Phase 3e ACTIVE + Phase 5 + Phase 4b is itself a strategic signal.**
+
+Three different cache placements (mid-body drv-hash, post-body SQLite-disk, import-exit forceDeep-then-disk) all show the same shape: **architecture correct + cache hits validated + wall savings either within noise or net-negative due to cache I/O cost.** This is now a documented pattern, not a single data point.
+
+The pattern says: **the per-skip savings target lives in the same order-of-magnitude as the cache overhead.** Both are µs-scale on hello-class workloads, both grow at similar rates across the workload class. The mmap'd L2 architecture (§4.3) is the design that breaks the symmetry by dropping cache lookup cost ~400× (60 µs → 150 ns) while keeping savings constant. That's why it's expected to flip the sign positive where SQLite couldn't.
+
+**If the mmap'd L2 spike also fails to flip the sign**, the pattern hardens further: the entire eval-result-cache concept at primop-call boundaries is structurally too cheap on drvPath-class workloads, and the lever must move up to coarser granularities (IR subtrees, lib.fix steps, module results) — which is exactly the Unison Item 1 / Item 2 direction. The mmap spike is therefore not just a cache-implementation question but **a falsifier for the eval-result-cache-at-primop-boundary thesis itself.**
+
+### 13.4 Updated #741 falsifier ledger (cumulative)
+
+**15 falsifiers total across the #741 arc:** 7 positive confirmations + 8 falsifications. Updated from the Phase 4 ledger to include Phase 4 architecture validation + Phase 4b wall falsifier:
+
+- Phase 1 round-trip ✓ PASSED (56× margin)
+- Phase 2 determinism ✓ PASSED
+- Phase 3a SHADOW correctness ✓ PASSED (11 % hit)
+- Phase 3a RCA-A forceDeep ✗ FALSIFIED
+- Phase 3b chase ✓ defensible
+- Phase 3c RCA-B forceDeepReadOnly ✗ FALSIFIED
+- Phase 3e SHADOW ✓ PASSED (33 % hit exact match)
+- Phase 3e ACTIVE wall ✗ FALSIFIED (1.00× ± 0.02)
+- Phase 5 cross-process correctness ✓ PASSED (100 % warm)
+- Phase 5 wall ✗ FALSIFIED (+71 % cold / +5.6 % warm)
+- Phase 5b batching ✗ FALSIFIED (variance 24×)
+- Workload heterogeneity audit ✓ drvPath class HOMOGENEOUS
+- Phase 4 audience ✗ FALSIFIED (0 across 7 nixpkgs workloads)
+- **Phase 4 architecture (`88402090b` + `b248b0f8d`)** ✓ PASSED (IMPORT-DISK-HIT validated on synthetic IFD workload, byte-identical TW)
+- **Phase 4b wall** ✗ FALSIFIED (COLD +78 %, WARM +2.2 %; ~10 ms saved below noise floor of ~700 ms total eval)
+
+**#741 is now CLOSED at "correct, no wall benefit at primop-call-boundary scope on any tested workload."** The strategic question is no longer "does the cache work" (it does — substrate is over-validated with Phase 4 architecture built and validated) but "is there a workload OR a cache implementation where the per-call ceiling allows a wall lever." Per §13.3, the candidates are:
+
+1. **mmap'd L2 at leaf primop scope** on the existing drvPath class — bounded by ~5 % wall ceiling (the §7 spike answers this in 3-5 days). Falsifier for the "cache-implementation cost is the binding constraint" hypothesis.
+2. **Phase 4 wall on haskell.nix-class workloads** — architecture is built; just needs commitment to the workload as a benchmark target. Falsifier for "IFD-result parse+eval becomes dominant on real IFD-heavy workloads."
+3. **`.name`-class optimization** — separate code-path audit, not eval-cache work.
+4. **Stage 4 v4 / let-floating work (#776)** — orthogonal to caching entirely.
+5. **Coarser-granularity caching** (Unison Item 1/2 territory) — only justifies if both (1) and (2) above also fail to deliver wall savings. The §7 spike is therefore a dual falsifier: it tests SQLite vs mmap AND (indirectly) tests the eval-result-cache-at-primop-boundary thesis itself.
+
+The strategic conclusion of this doc holds: **the SQLite-cost falsifier is structural; mmap'd L2 is the right next experiment; the substrate work was the right investment regardless of the specific scope.** What the Phase 4 + Phase 4b commits changed is the *certainty* that Phase 4 also follows the same wall pattern (it does, on the synthetic IFD workload), which strengthens the §13.3(d) reading: the cache-at-primop-boundary thesis itself may be too cheap a scope.
+
+### 13.5 ROADMAP integration follow-on (landed in same commit as this amendment)
+
+The ROADMAP_TO_VISION integration commit (`65c56a732`) added a "Stage 10 partial-subset substrate landed 2026-05-23" subsection that referenced Phase 4 as the larger lever. **That subsection has been amended** in the same commit as this §13 (item 4 and item 5 of the subsection both updated, plus the "Next moves" list refreshed). The amendment is purely additive (no claim retraction, just conditional scoping + acknowledging the architecture-is-built status).
 
 ---
 
