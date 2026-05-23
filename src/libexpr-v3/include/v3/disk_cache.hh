@@ -107,4 +107,32 @@ constexpr uint32_t kEvalResultSchemaVersion = 1;
 std::optional<std::string> lookupEvalResult(const CacheKey & key);
 void insertEvalResult(const CacheKey & key, std::string_view blob);
 
+// ---------------------------------------------------------------------------
+// #741 Phase 5b — batched-insert support.
+//
+// Without batching, each `insertEvalResult` runs as its own implicit
+// SQLite transaction (BEGIN → step → COMMIT).  Even with
+// synchronous=OFF + WAL, the per-commit overhead is ~1 ms.  On a
+// cold-cache eval of hello.drvPath this means 517 inserts × 1.1 ms
+// ≈ 569 ms wall — the dominant component of Phase 5's COLD +71%
+// slowdown finding.
+//
+// `beginEvalResultBatch` opens an explicit transaction; subsequent
+// `insertEvalResult` calls accumulate INTO the open transaction (no
+// per-call commit).  `commitEvalResultBatch` closes the transaction
+// with a single commit.  Amortises the per-insert sync cost.
+//
+// Re-entrancy: nested batch begins are no-ops (the outermost
+// brackets the entire batch).  Commit of a never-opened batch is
+// a no-op.  On exception or commit failure, the transaction is
+// rolled back implicitly when the connection closes.
+//
+// Hook site: typically at the start/end of `runRootExpr` — the
+// natural eval-scope boundary.  Each top-level eval gets its own
+// batch.
+// ---------------------------------------------------------------------------
+
+void beginEvalResultBatch() noexcept;
+void commitEvalResultBatch() noexcept;
+
 } // namespace nix::v3::disk_cache

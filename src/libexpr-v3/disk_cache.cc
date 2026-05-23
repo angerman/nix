@@ -116,6 +116,14 @@ struct DbState
     nix::SQLiteStmt evalLookup;
     nix::SQLiteStmt evalUpdateLastUsed;
     bool initialised = false;
+    // #741 Phase 5b: nest-counted transaction scope.  Tracks
+    // beginEvalResultBatch() / commitEvalResultBatch() pairs.  The
+    // OUTERMOST begin issues a real SQLite BEGIN; the OUTERMOST
+    // commit issues the COMMIT.  Inner calls just bump/decrement
+    // the depth — matters for recursive `runRootExpr` invocations
+    // (e.g. `import` re-entry from inside a primop).
+    bool inEvalBatch = false;
+    uint32_t evalBatchDepth = 0;
 };
 
 struct DbHandle
@@ -346,6 +354,61 @@ void insertEvalResult(const CacheKey & key, std::string_view blob)
     } catch (...) {
         h.failed.store(true, std::memory_order_relaxed);
         st.evalInsertFailures++;
+    }
+}
+
+// #741 Phase 5b — batched-insert transaction control.
+
+void beginEvalResultBatch() noexcept
+{
+    auto & h = dbHandle();
+    if (h.failed.load(std::memory_order_relaxed)) return;
+    if (!ensureOpen()) return;
+    try {
+        auto state = h.state.lock();
+        // Re-entrancy: nested begins just bump the depth counter.
+        // Only the outermost begin issues a real SQLite BEGIN.
+        if (state->inEvalBatch) {
+            ++state->evalBatchDepth;
+            return;
+        }
+        // synchronous=OFF + WAL keeps BEGIN cheap; the win is in
+        // amortising the per-insert commit's fsync/sync replacement
+        // (~1 ms) across all inserts of the eval scope.
+        state->db.exec("BEGIN");
+        state->inEvalBatch = true;
+        state->evalBatchDepth = 1;
+    } catch (...) {
+        // Don't poison h.failed; cache is advisory.  A failed BEGIN
+        // just means subsequent inserts each commit individually
+        // (the pre-batch behaviour).
+    }
+}
+
+void commitEvalResultBatch() noexcept
+{
+    auto & h = dbHandle();
+    if (h.failed.load(std::memory_order_relaxed)) return;
+    auto state = h.state.lock();
+    if (!state->initialised) return;
+    if (!state->inEvalBatch) return;
+    // Nested commit: just decrement; the outermost commit issues
+    // the real COMMIT.
+    if (state->evalBatchDepth > 1) {
+        --state->evalBatchDepth;
+        return;
+    }
+    try {
+        state->db.exec("COMMIT");
+        state->inEvalBatch = false;
+        state->evalBatchDepth = 0;
+    } catch (...) {
+        // If COMMIT fails, the transaction stays open until
+        // connection close (which rolls it back).  Flag the batch
+        // as closed so subsequent calls don't loop on a poisoned
+        // transaction.
+        state->inEvalBatch = false;
+        state->evalBatchDepth = 0;
     }
 }
 

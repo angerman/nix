@@ -138,6 +138,22 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // (one-time map fill) so per-call overhead is negligible.
     registerBuiltinPrimOps();
 
+    // #741 Phase 5b (2026-05-23): a per-eval `EvalResultBatchGuard`
+    // wrapped this body in `disk_cache::beginEvalResultBatch` /
+    // `commitEvalResultBatch` to amortise the ~1 ms / insert commit
+    // cost over a single COMMIT.  REMOVED — hyperfine measurement:
+    //   COLD ACTIVE+DISK (unbatched): 1429 ms ± 31 ms
+    //   COLD ACTIVE+DISK (batched):   1666 ms ± 764 ms
+    // Variance ballooned by 24× and the mean got WORSE, not better.
+    // Hypothesised cause: long-held transaction with ~256 KB of
+    // pending WAL data triggers SQLite's checkpoint behavior at
+    // COMMIT in non-deterministic ways (interaction with APFS /
+    // page-cache flushes).  The `disk_cache::beginEvalResultBatch` /
+    // `commitEvalResultBatch` helpers ARE kept in the disk_cache
+    // namespace as gated infrastructure (no callers in production)
+    // for future iteration — try smaller batches (e.g. every 50
+    // inserts) or explicit `PRAGMA wal_autocheckpoint=0` tuning.
+
     // Wire the global tlNixEvalState pointer so v3 primops that need
     // to reach back into TW (e.g. `import`, derivation strict-merge,
     // store-side path operations) can find it.  Caller is responsible
