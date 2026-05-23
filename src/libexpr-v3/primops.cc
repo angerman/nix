@@ -7553,6 +7553,59 @@ void primImport(EvalState & state, Value * args, Value & out)
                 "v3 IMPORT-INVAL: %s (mtime/size changed)\n", path.c_str());
         cache.results.erase(it);
     }
+
+    // #741 Phase 4 (2026-05-23) — disk-backed import-result cache.
+    // Layers ABOVE the in-memory cache.results map for cross-process
+    // replay.  On warm cache: deserialise the cached result Value,
+    // populate in-memory cache, return — skips parse + lower + run.
+    // Gate: NIX_V3_IFD_IMPORT_CACHE_DISK=1.
+    //
+    // Key derivation: SHA-256("ifd-import\0" + path).  The trailing
+    // null + namespace string keeps the key disjoint from
+    // disk_cache's drvHash cache namespace (also via the EvalResults
+    // table per Phase 5 substrate).
+    //
+    // Soundness: `path` is the resolved store-path-prefixed output
+    // (post-realisePath), which IS content-addressed.  Two evals
+    // producing the same path mean the same derivation's output is
+    // being imported → same file bytes → same parsed expression →
+    // same v3 Value.  No stat-check needed (store paths are immutable
+    // by libstore invariant).
+    static const bool s_ifdImportDiskCache =
+        std::getenv("NIX_V3_IFD_IMPORT_CACHE_DISK") != nullptr;
+    if (s_ifdImportDiskCache) {
+        std::string keyBytes;
+        keyBytes.reserve(11 + path.size());
+        keyBytes.append("ifd-import");
+        keyBytes.push_back('\0');
+        keyBytes.append(path);
+        auto diskKey = disk_cache::computeKeyForString(keyBytes);
+        auto blob = disk_cache::lookupEvalResult(diskKey);
+        if (blob) {
+            try {
+                out = value_serialize::deserialize(*blob);
+                // Populate in-memory cache so subsequent calls hit there.
+                auto [mt, sz] = importStat(path);
+                cache.results.emplace(path,
+                    ImportCacheEntry{out, mt, sz});
+                if (s_dbg_import) {
+                    std::fprintf(stderr, "v3 IMPORT-DISK-HIT: %s\n",
+                        path.c_str());
+                }
+                return;
+            } catch (...) {
+                // Deserialise failed (e.g. cached value uses tags we
+                // can't round-trip — closures, primops).  Fall through
+                // to fresh parse + eval.  The in-memory cache will
+                // still be populated; disk insert below will re-write
+                // (insert-or-ignore semantics in EvalResults).
+                if (s_dbg_import)
+                    std::fprintf(stderr,
+                        "v3 IMPORT-DISK-DESERR: %s — falling through\n",
+                        path.c_str());
+            }
+        }
+    }
     // #755 instrumentation: RSS-per-import to localize which file
     // dominates the cumulative memory cost.  Same trigger as
     // V3_DBG_IMPORT for combined output.  Cheap (one task_info /
@@ -7773,6 +7826,26 @@ void primImport(EvalState & state, Value * args, Value & out)
     {
         auto [mt, sz] = importStat(path);
         cache.results.emplace(path, ImportCacheEntry{out, mt, sz});
+    }
+    // #741 Phase 4 — also persist to disk-backed import cache.
+    // Serialiser failures (closures, etc.) are silently skipped;
+    // subsequent invocations just see a disk-cache miss + recompute.
+    if (s_ifdImportDiskCache) {
+        try {
+            std::string keyBytes;
+            keyBytes.reserve(11 + path.size());
+            keyBytes.append("ifd-import");
+            keyBytes.push_back('\0');
+            keyBytes.append(path);
+            auto diskKey = disk_cache::computeKeyForString(keyBytes);
+            std::string blob;
+            value_serialize::serialize(out, blob);
+            disk_cache::insertEvalResult(diskKey, blob);
+        } catch (...) {
+            // Result Value not serialisable (closure/function/etc.).
+            // Skip silently — the in-memory cache still has it for
+            // this process.
+        }
     }
     if (s_dbg_import) {
         std::fprintf(stderr, "v3 IMPORT-DONE RSS=%lluMB: %s\n",
