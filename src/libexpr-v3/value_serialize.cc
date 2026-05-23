@@ -803,6 +803,109 @@ void dumpEvalResultCacheStats(std::FILE * out)
         (unsigned long long)s.deserErrors);
 }
 
+// ---------------------------------------------------------------------------
+// #741 Phase 3e — mid-body drv-hash SHADOW cache.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool drvHashCacheEnabledCached()
+{
+    static const bool enabled = []() {
+        const char * e = std::getenv("NIX_V3_DRV_HASH_CACHE");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
+std::unordered_map<std::string, std::string> & drvHashCacheMap()
+{
+    static std::unordered_map<std::string, std::string> m;
+    return m;
+}
+
+} // anonymous
+
+DrvHashCacheStats & drvHashCacheStats() noexcept
+{
+    static DrvHashCacheStats s;
+    return s;
+}
+
+bool drvHashCacheEnabled() noexcept { return drvHashCacheEnabledCached(); }
+
+bool drvHashCacheLookup(const std::string & key, Value & outResult) noexcept
+{
+    if (!drvHashCacheEnabled()) return false;
+    if (key.empty()) return false;
+    auto & stats = drvHashCacheStats();
+    ++stats.lookups;
+    auto t0 = std::chrono::steady_clock::now();
+    auto & cache = drvHashCacheMap();
+    auto it = cache.find(key);
+    auto t1 = std::chrono::steady_clock::now();
+    stats.totalLookupNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    if (it == cache.end()) {
+        ++stats.misses;
+        return false;
+    }
+    try {
+        outResult = deserialize(it->second);
+    } catch (...) {
+        ++stats.deserErrors;
+        return false;
+    }
+    auto t2 = std::chrono::steady_clock::now();
+    stats.totalDeserNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+    stats.bytesDelivered += it->second.size();
+    ++stats.hits;
+    return true;
+}
+
+void drvHashCacheInsert(const std::string & key, const Value & result) noexcept
+{
+    if (!drvHashCacheEnabled()) return;
+    if (key.empty()) return;
+    auto & stats = drvHashCacheStats();
+    std::string blob;
+    auto t0 = std::chrono::steady_clock::now();
+    try {
+        serialize(result, blob);
+    } catch (...) {
+        return;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    stats.totalSerNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    stats.bytesCached += blob.size();
+    drvHashCacheMap().emplace(key, std::move(blob));
+    ++stats.inserts;
+}
+
+void dumpDrvHashCacheStats(std::FILE * out)
+{
+    if (!drvHashCacheEnabled()) return;
+    const auto & s = drvHashCacheStats();
+    if (s.lookups == 0) return;
+    auto safe = [](uint64_t n) -> uint64_t { return n ? n : 1; };
+    double avgLookupUs = (s.totalLookupNs / 1000.0) / safe(s.lookups);
+    double avgDeserUs  = (s.totalDeserNs  / 1000.0) / safe(s.hits);
+    double avgSerUs    = (s.totalSerNs    / 1000.0) / safe(s.inserts);
+    double hitRate     = 100.0 * static_cast<double>(s.hits) / safe(s.lookups);
+    std::fprintf(out,
+        "v3-direct drv-hash-cache (SHADOW): lookups=%llu hits=%llu misses=%llu "
+        "inserts=%llu mismatch=%llu hit_rate=%.1f%%\n"
+        "  avg: lookup=%.2f us deser-on-hit=%.2f us ser-on-insert=%.2f us\n"
+        "  bytes: cached=%.2f MB delivered=%.2f MB\n"
+        "  errors: deser=%llu\n",
+        (unsigned long long)s.lookups, (unsigned long long)s.hits,
+        (unsigned long long)s.misses, (unsigned long long)s.inserts,
+        (unsigned long long)s.mismatchHits,
+        hitRate, avgLookupUs, avgDeserUs, avgSerUs,
+        s.bytesCached / (1024.0 * 1024.0),
+        s.bytesDelivered / (1024.0 * 1024.0),
+        (unsigned long long)s.deserErrors);
+}
+
 void dumpStats(std::FILE * out)
 {
     if (!testModeEnabled()) return;

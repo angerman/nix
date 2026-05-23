@@ -6199,6 +6199,21 @@ static void buildAndWriteDrvNative(
         : ns.store->writeDerivation(drv, ns.repair);
     std::string drvPathS = ns.store->printStorePath(drvPath);
 
+    // #741 Phase 3e SHADOW: drv-hash-keyed cache lookup.
+    // drvPath IS the canonical content hash of `drv` (libstore
+    // semantics: same drvPath ⇒ same drv ⇒ same effective inputs).
+    // Two primop calls producing the same drvPath MUST produce
+    // identical result attrsets.
+    // Body always continues (writeDerivation, hashDerivationModulo,
+    // result attrset).  On hit, we verify cached vs computed below.
+    Value v3DrvCached;
+    std::string v3DrvKey;
+    bool v3DrvHit = false;
+    if (value_serialize::drvHashCacheEnabled()) {
+        v3DrvKey = drvPathS;
+        v3DrvHit = value_serialize::drvHashCacheLookup(v3DrvKey, v3DrvCached);
+    }
+
     {
         auto h = nix::hashDerivationModulo(*ns.store, drv, false);
         nix::drvHashes.insert_or_assign(drvPath, std::move(h));
@@ -6263,6 +6278,19 @@ static void buildAndWriteDrvNative(
     // to stderr; sort + diff across two process invocations should
     // produce empty diff (the determinism falsifier).
     value_serialize::dumpCanonicalHashLine(out);
+
+    // #741 Phase 3e SHADOW: verify hit or insert on miss.  Uses
+    // drvPath as the cache key (canonical content hash of drv per
+    // libstore).  mismatchHits > 0 falsifies either libstore
+    // content-addressing or our serialiser determinism.
+    if (!v3DrvKey.empty()) {
+        if (v3DrvHit) {
+            if (!value_serialize::valuesEqual(v3DrvCached, out))
+                ++value_serialize::drvHashCacheStats().mismatchHits;
+        } else {
+            value_serialize::drvHashCacheInsert(v3DrvKey, out);
+        }
+    }
 }
 
 // 2026-05-17 — Option 4 hybrid FFI leaf.

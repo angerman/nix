@@ -213,4 +213,52 @@ void evalResultCacheInsert(const std::string & key,
 /// or no lookups happened.
 void dumpEvalResultCacheStats(std::FILE * out);
 
+// ---------------------------------------------------------------------------
+// #741 Phase 3e — mid-body drv-hash SHADOW cache.
+//
+// At the call site in `buildAndWriteDrvNative`, the constructed
+// `nix::Derivation drv` has all the effective inputs flattened to
+// canonical libstore form (drv.env strings, inputDrvs / inputSrcs
+// derived from string context).  The drvPath (computed via
+// `computeStorePath`) IS the SHA-256 of `drv.unparse()` + store
+// metadata — i.e. the canonical content hash of all effective
+// inputs.
+//
+// Phase 3e uses the drvPath string as the cache key.  Cache value
+// is the result attrset (the v3 Value `out`).  SHADOW mode: body
+// ALWAYS runs; on hit, compare cached vs current.  Falsifier:
+// mismatch count must stay 0 (drvPath is a content hash; same
+// drvPath → same result by libstore semantics).
+//
+// Gate: NIX_V3_DRV_HASH_CACHE=1 (independent of Phase 3a's
+// NIX_V3_EVAL_RESULT_CACHE).  Stats kept separately.
+// ---------------------------------------------------------------------------
+
+bool drvHashCacheEnabled() noexcept;
+
+struct DrvHashCacheStats {
+    uint64_t lookups          = 0;
+    uint64_t hits             = 0;
+    uint64_t misses           = 0;
+    uint64_t inserts          = 0;
+    uint64_t mismatchHits     = 0;
+    uint64_t deserErrors      = 0;
+    uint64_t bytesCached      = 0;
+    uint64_t bytesDelivered   = 0;
+    uint64_t totalSerNs       = 0;
+    uint64_t totalDeserNs     = 0;
+    uint64_t totalLookupNs    = 0;
+};
+DrvHashCacheStats & drvHashCacheStats() noexcept;
+
+/// SHADOW-mode lookup by external key (e.g. drvPath string).  On hit,
+/// fills outResult with the deserialised cached value.  Caller is
+/// expected to verify outResult against just-computed in shadow mode.
+bool drvHashCacheLookup(const std::string & key, Value & outResult) noexcept;
+
+/// Insert (key, serialise(result)) into the drv-hash cache.
+void drvHashCacheInsert(const std::string & key, const Value & result) noexcept;
+
+void dumpDrvHashCacheStats(std::FILE * out);
+
 } // namespace nix::v3::value_serialize
