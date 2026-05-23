@@ -582,6 +582,47 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                         (double)totalCyc / (double)totalDispatch);
                 }
 
+                // #787 OP_RETURN per-phase breakdown — only present
+                // when NIX_V3_DBG_RETURN_BREAKDOWN=1.  Three phases:
+                // prePop (frame capture + resize + pop), thunkEval
+                // (CFF_THUNK_RETURN logic), postEval (push retVal +
+                // tail-call cleanup + break).  Per-phase counter for
+                // overhead estimate (~10-20 ns × 3 markers = ~50 ns
+                // total per return under the gate).
+                if (a.opReturnThunkCalls + a.opReturnCallCalls > 0) {
+                    uint64_t nT = a.opReturnThunkCalls;
+                    uint64_t nC = a.opReturnCallCalls;
+                    uint64_t nTot = nT + nC;
+                    std::fprintf(stderr,
+                        "v3-direct OP_RETURN breakdown (%llu thunk + %llu call = %llu returns):\n",
+                        (unsigned long long)nT,
+                        (unsigned long long)nC,
+                        (unsigned long long)nTot);
+                    std::fprintf(stderr,
+                        "  prePopNs     total=%llu  avg=%.1f ns/return\n",
+                        (unsigned long long)a.opReturnPrePopNs,
+                        nTot > 0 ? (double)a.opReturnPrePopNs / nTot : 0.0);
+                    std::fprintf(stderr,
+                        "  thunkEvalNs  total=%llu  avg/thunk-return=%.1f ns\n",
+                        (unsigned long long)a.opReturnThunkEvalNs,
+                        nT > 0 ? (double)a.opReturnThunkEvalNs / nT : 0.0);
+                    std::fprintf(stderr,
+                        "  postEvalNs   total=%llu  avg=%.1f ns/return\n",
+                        (unsigned long long)a.opReturnPostEvalNs,
+                        nTot > 0 ? (double)a.opReturnPostEvalNs / nTot : 0.0);
+                    uint64_t bdTotal = a.opReturnPrePopNs
+                                     + a.opReturnThunkEvalNs
+                                     + a.opReturnPostEvalNs;
+                    std::fprintf(stderr,
+                        "  -- breakdown total: %llu ns "
+                        "(subtract ~60 ns/return measurement overhead "
+                        "= ~%lld ns/return real)\n",
+                        (unsigned long long)bdTotal,
+                        nTot > 0
+                            ? (long long)((bdTotal / nTot) - 60)
+                            : 0LL);
+                }
+
                 // #782 bigram top-20 (only when NIX_VM_BIGRAMS=1
                 // was set during eval — non-zero entries reveal
                 // common (prev, current) op-pairs.  Used as the

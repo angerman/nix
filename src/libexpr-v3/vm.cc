@@ -5291,6 +5291,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_RETURN: {
+            // #787 (2026-05-23) per-phase breakdown for #786 OPCYCLES
+            // OP_RETURN-dominates finding.  Gated by env var; three
+            // markers (pre-pop / pre-thunk / post-everything) credit
+            // deltas to per-phase accumulators.  Per-marker overhead:
+            // ~10-20 ns clock read; total = 60 ns/return × 775K =
+            // ~46 ms overhead under the gate.
+            static const bool s_dbgRetBd =
+                std::getenv("NIX_V3_DBG_RETURN_BREAKDOWN") != nullptr;
+            uint64_t retBdT0 = 0;
+            if (__builtin_expect(s_dbgRetBd, 0)) [[unlikely]] {
+                retBdT0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            }
             // Reset the tail-call counter — once we return out of a
             // tail-recursive burst, subsequent tail calls in a
             // different chain start fresh.
@@ -5432,6 +5445,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             CallFrame fr;  // referenced by name later — only thunk + flags matter.
             fr.flags = fFlags;
             fr.thunk = fThunk;
+            // #787 breakdown mark T1: after frame state pop (pre-pop work).
+            uint64_t retBdT1 = 0;
+            if (__builtin_expect(s_dbgRetBd, 0)) [[unlikely]] {
+                retBdT1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                allocStats().opReturnPrePopNs += (retBdT1 - retBdT0);
+            }
             // NIX_TRACE_EVAL: W event for OP_RETURN of any
             // CFF_THUNK_RETURN frame.  Pairs with the F emitted at
             // OP_FORCE's or forceValue's frame push.  Uses the popped
@@ -5743,7 +5763,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // consumer's pull, and OP_RETURN's caller-resume path
                 // re-runs op_force_slow when CFF_FORCE_RETRY is set.
             }
+            // #787 breakdown mark T2: after CFF_THUNK_RETURN logic.
+            // Credit thunk-eval branch delta to thunkEvalNs; counter
+            // distinguishes thunk vs call returns so consumers can
+            // average correctly.
+            uint64_t retBdT2 = 0;
+            if (__builtin_expect(s_dbgRetBd, 0)) [[unlikely]] {
+                retBdT2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (fFlags & CFF_THUNK_RETURN) {
+                    allocStats().opReturnThunkEvalNs += (retBdT2 - retBdT1);
+                    allocStats().opReturnThunkCalls++;
+                } else {
+                    allocStats().opReturnCallCalls++;
+                }
+            }
             if (vm.frames.size() == exitDepth) {
+                // #787 breakdown — final-exit returns also bump
+                // postEvalNs for the small "frames-size-check + exit"
+                // path so the buckets sum cleanly.
+                if (__builtin_expect(s_dbgRetBd, 0)) [[unlikely]] {
+                    uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    allocStats().opReturnPostEvalNs += (now - retBdT2);
+                }
                 finalResult = retVal;
                 running = false;
                 break;
@@ -5893,6 +5936,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     retry = false;
                 if (retry)
                     goto op_force_slow;
+            }
+            // #787 breakdown mark T3: end of case (post-eval).
+            if (__builtin_expect(s_dbgRetBd, 0)) [[unlikely]] {
+                uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                allocStats().opReturnPostEvalNs += (now - retBdT2);
             }
             break;
         }

@@ -187,6 +187,25 @@ struct AllocStats
     /// invalidate relative comparisons across opcodes.
     uint64_t opcycleNs[256] = {};
 
+    /// #787 (2026-05-23) per-phase decomposition of OP_RETURN —
+    /// 51 % of eval wall on hello.drvPath per #786 OPCYCLES.
+    /// Gated by NIX_V3_DBG_RETURN_BREAKDOWN=1.  Three buckets:
+    ///   prePopNs: from case entry (after pop retVal) through
+    ///             frame-field capture + valueStack/withStack resize
+    ///             + frames.pop_back.
+    ///   thunkEvalNs: CFF_THUNK_RETURN branch — Evaluated chase,
+    ///             self-cycle detection, cell update,
+    ///             Phase D barrier propagation.
+    ///   postEvalNs: from end of thunk branch (or skip if non-thunk)
+    ///             through push retVal + tail-call cleanup + break.
+    /// Plus thunkReturns / callReturns counters to derive per-phase
+    /// averages for each return kind.
+    uint64_t opReturnPrePopNs    = 0;
+    uint64_t opReturnThunkEvalNs = 0;
+    uint64_t opReturnPostEvalNs  = 0;
+    uint64_t opReturnThunkCalls  = 0;
+    uint64_t opReturnCallCalls   = 0;
+
     /// #783-measure (2026-05-23) refined bigram subcounters.  The
     /// bigramCounts above are pair-of-opcode counts; for fusion
     /// design we need to know what FRACTION are same-operand.
