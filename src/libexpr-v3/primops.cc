@@ -888,6 +888,22 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
             }
             if (auto * outV = v.payload.bindings->lookup(sOutPath)) {
                 Value forced = forceValue(*state.vm, *outV);
+                // #791 (2026-05-23) fast path: outPath is typically
+                // a String for derivations (after __derivationStrictRaw
+                // populates it).  Skip the recursive call + std::string
+                // re-allocation by inlining the Tag::String case.  Same
+                // semantics: absorb the value's existing context, return
+                // its bytes.  Caller (primDerivCoerce / similar) then
+                // re-wraps via mkStringValueOwned.  Opt-out:
+                // NIX_V3_NO_DERIV_COERCE_SHORTCUT=1.
+                static const bool s_noShortcut =
+                    std::getenv("NIX_V3_NO_DERIV_COERCE_SHORTCUT") != nullptr;
+                if (!s_noShortcut && forced.isString()) {
+                    if (auto * raw = lookupStringContextEntries(forced.payload.str)) {
+                        ctx.insert(ctx.end(), raw->begin(), raw->end());
+                    }
+                    return std::string(forced.payload.str ? forced.payload.str : "");
+                }
                 return toStringCoerceCtx(state, forced, ctx, copyPathsToStore);
             }
             // #760 (2026-05-22): match TW's `EvalState::coerceToString`
