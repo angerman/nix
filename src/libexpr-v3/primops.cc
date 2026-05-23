@@ -3532,12 +3532,63 @@ void primReadFile(EvalState & state, Value * args, Value & out)
     }
 }
 
+// #793 (2026-05-24): forward declaration so primReadDir below can
+// bridge attrset/string-with-ctx args via TW realisePath, mirroring
+// TW's prim_readDir (libexpr/primops.cc:2542).  The real definition
+// lives at line ~5113 below; the bridge primops between this point
+// and the definition site share the same need.  The existing
+// forward decl at 3910 was after primReadDir's position.
+static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
+
 /// builtins.readDir path -> attrset of name -> "regular"|"directory"|"symlink"|"unknown".
 void primReadDir(EvalState & state, Value * args, Value & out)
 {
     std::string path;
-    if (args[0].isString()) path = args[0].payload.str;
+    if (args[0].isString()) {
+        // #793 (2026-05-24): mirror TW's prim_readDir (libexpr/primops.cc:2542),
+        // which routes args[0] through realisePath.  haskell.nix calls
+        // readDir on string-with-context (`"${pkg}/some/dir"`) — the path
+        // may reference a derivation output that must be realised before
+        // we can scandir it.  Empty context = literal path = fast path,
+        // matching primImport's discriminator.
+        auto * ctxEntries = lookupStringContextEntries(args[0].payload.str);
+        if (ctxEntries && !ctxEntries->empty() && state.nixEvalState) {
+            ++allocStats().ifdProbeWithCtx[kIfdReadDir];
+            auto & ns = *state.nixEvalState;
+            nix::Value * tw = v3ToTreeWalker(state, args[0]);
+            if (!tw) {
+                path = args[0].payload.str;
+            } else {
+                try {
+                    auto resolved = ns.realisePath(nix::noPos, *tw);
+                    path = resolved.path.abs();
+                } catch (...) {
+                    throw;  // surface TW's error verbatim
+                }
+            }
+        } else {
+            path = args[0].payload.str;
+        }
+    }
     else if (args[0].isPath()) path = args[0].payload.path;
+    else if (args[0].isAttrs()) {
+        // #793 (2026-05-24): derivation/attrset arg — mirror TW's
+        // prim_readDir, which uses realisePath to coerce + realise the
+        // path.  Surfaced in haskell.nix's haskell-nix-example via
+        // `builtins.readDir hello-plan-to-nix-pkgs` (an IFD output).
+        if (!state.nixEvalState)
+            typeError("readDir", "string or path");
+        ++allocStats().ifdProbeWithCtx[kIfdReadDir];
+        auto & ns = *state.nixEvalState;
+        nix::Value * tw = v3ToTreeWalker(state, args[0]);
+        if (!tw) typeError("readDir", "string or path");
+        try {
+            auto resolved = ns.realisePath(nix::noPos, *tw);
+            path = resolved.path.abs();
+        } catch (...) {
+            throw;  // surface TW's error verbatim
+        }
+    }
     else typeError("readDir", "string or path");
     std::vector<std::pair<SymbolId, Value>> entries;
     // #692 — match TW phrasing for missing paths (libexpr/primops.cc:
