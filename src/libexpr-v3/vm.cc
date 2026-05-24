@@ -4771,17 +4771,38 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                     static const bool s_dbgFormals =
                                         std::getenv("V3_DBG_FORMALS_DIAG") != nullptr;
                                     if (s_dbgFormals) {
-                                        // Resolve lambda's source position via posHandle
                                         const PosSnapshot * ps = resolvePosSnapshot(desc->posHandle);
+                                        // Find caller's frame for context.
+                                        const PosSnapshot * callerPs = nullptr;
+                                        std::string callerName = "?";
+                                        if (vm.frames.size() >= 1) {
+                                            CallFrame & cf = vm.frames.back();
+                                            if (cf.closure && cf.closure->desc) {
+                                                callerName = cf.closure->desc->name.empty()
+                                                    ? cf.closure->desc->contextualName
+                                                    : cf.closure->desc->name;
+                                                callerPs = resolvePosSnapshot(
+                                                    cf.closure->desc->posHandle);
+                                            }
+                                        }
                                         std::fprintf(stderr,
-                                            "v3 FORMALS-DIAG lambda='%s' "
-                                            "src=%s:%u:%u "
+                                            "v3 FORMALS-DIAG "
+                                            "callee=%p cu=%p name='%s' ctx='%s' "
+                                            "callee_src=%s:%u:%u "
+                                            "caller_name='%s' caller_src=%s:%u:%u "
                                             "unexpected='%s' ellipsis=0 "
                                             "passed_attrs=[",
-                                            lambdaName.c_str(),
+                                            (const void *)desc,
+                                            (const void *)(fun.payload.closure ? fun.payload.closure->cu : nullptr),
+                                            desc->name.c_str(),
+                                            desc->contextualName.c_str(),
                                             ps ? ps->file.c_str() : "?",
                                             ps ? ps->line : 0,
                                             ps ? ps->column : 0,
+                                            callerName.c_str(),
+                                            callerPs ? callerPs->file.c_str() : "?",
+                                            callerPs ? callerPs->line : 0,
+                                            callerPs ? callerPs->column : 0,
                                             nm.c_str());
                                         for (uint32_t k = 0; k < b->size && k < 24; ++k) {
                                             SymbolId sk = b->entries[k].name;
