@@ -5012,18 +5012,24 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // lazy list/attr bridge, that re-evaluates the source Expr
         // via tree-walker, giving tree-walker the original ExprLambda
         // to dispatch through its native formal-dispatch.
-        // #458 step 7: formals-closure refusal stays default-on as
-        // the safety net.  Slot-capture + RecBuildSlot fix the original
-        // fix-point Black scenario, but lifting the refusal lets some
-        // cardano-node-class workloads progress further into a deeper
-        // TW infinite-recursion.  Net effect on passing tests is
-        // neutral (lang + cutover-parity + chase + smoke unchanged
-        // with refusal off).  Keep the lift opt-OUT via
-        // NIX_V3_NO_REFUSE_FORMALS_BRIDGE=1 for users probing
-        // workloads where the refusal is the load-bearing block, not
-        // the deeper recursion.
+        // #792 (2026-05-24): refusal lifted as DEFAULT.  Empirically
+        // verified blocks haskell.nix entirely (every IFD pipeline
+        // hits a runtime-constructed formals closure at some point);
+        // with refusal lifted, primV3CallBridge1 dispatches the
+        // formals closure normally — `callClosure` already handles
+        // formals-attrset extraction natively.  The 9/10 core test
+        // pass + 143/143 lang + 58/10 property all unchanged
+        // (validated 2026-05-24).  Opt-OUT via
+        // NIX_V3_REFUSE_FORMALS_BRIDGE=1 for users probing
+        // cardano-node-class workloads where the historical refusal
+        // was the load-bearing block against a deeper TW infinite-
+        // recursion (#458 step 7 context).
+        //
+        // Retirement criterion: 30 days of nightly v3 CI on
+        // cardano-node + haskell.nix without regression, then remove
+        // the opt-out entirely.
         static const bool s_refuseFormals =
-            std::getenv("NIX_V3_NO_REFUSE_FORMALS_BRIDGE") == nullptr;
+            std::getenv("NIX_V3_REFUSE_FORMALS_BRIDGE") != nullptr;
         // #493: opt-in TW-lambda bridge for formals closures.  When
         // enabled, instead of refusing (which triggered fallback
         // cascades surfacing as `_internalCallByNamePackageFile
@@ -7618,7 +7624,15 @@ void primImport(EvalState & state, Value * args, Value & out)
     // Layers ABOVE the in-memory cache.results map for cross-process
     // replay.  On warm cache: deserialise the cached result Value,
     // populate in-memory cache, return — skips parse + lower + run.
-    // Gate: NIX_V3_IFD_IMPORT_CACHE_DISK=1.
+    //
+    // #741 Phase 4b: default-ON since 2026-05-24 (commit XXXXXXXXX).
+    // Validation: 1.91× wall-positive on multi-IFD-heavy synthetic,
+    // 1.82× on 1M-element single-IFD, wall-neutral on no-IFD
+    // workloads (hello.name, hello.drvPath both within 0.5σ).  True-
+    // COLD ≈ OFF (cold-tax is invisible at realistic IFD counts).
+    // Opt-OUT via NIX_V3_NO_IFD_IMPORT_CACHE_DISK=1.  Docs:
+    // lode/PHASE_4B_SCALE_TEST_2026-05-24.md +
+    // lode/PHASE_4B_MULTI_IFD_2026-05-24.md.
     //
     // Key derivation: SHA-256("ifd-import\0" + path).  The trailing
     // null + namespace string keeps the key disjoint from
@@ -7631,8 +7645,13 @@ void primImport(EvalState & state, Value * args, Value & out)
     // being imported → same file bytes → same parsed expression →
     // same v3 Value.  No stat-check needed (store paths are immutable
     // by libstore invariant).
+    //
+    // Retirement criterion: 30 days of nightly nixpkgs CI without
+    // regression on cardano-node M5 + haskell.nix smoke + standard
+    // hello.drvPath/firefox.name workloads, then delete the opt-out
+    // entirely.
     static const bool s_ifdImportDiskCache =
-        std::getenv("NIX_V3_IFD_IMPORT_CACHE_DISK") != nullptr;
+        std::getenv("NIX_V3_NO_IFD_IMPORT_CACHE_DISK") == nullptr;
     // #741 Phase 4b RCA fix: only consult the disk cache for ACTUAL
     // IFD imports (string-with-ctx or attrset arg).  Non-IFD imports
     // are literal-path nixpkgs files — they're already handled
