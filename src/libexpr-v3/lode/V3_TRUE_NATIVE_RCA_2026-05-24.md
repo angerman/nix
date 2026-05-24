@@ -8,6 +8,66 @@ Plan: `V3_TRUE_NATIVE_PLAN_2026-05-24.md`.
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 Input Output Group.  SPDX-License-Identifier: Apache-2.0.
 
+## 2026-05-25 update — H10 KILLED, #803 CLOSED
+
+**Rule-0 finding**: `nix eval .#packages.x86_64-linux.hello.drvPath
+--impure --no-eval-cache --option allow-import-from-derivation true`
+on `haskell-nix-example` completes successfully under v3-direct
+(`NIX_V3_DIRECT_EVAL=1`) and returns **byte-identical** drvPath to
+TW:
+
+  TW:  /nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv
+  v3:  /nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv
+
+No `unexpected argument 'git'` error.  No FORMALS-DIAG output.
+`V3_DBG_ATTRS_HAS_KEY=git` recorded zero `? git` queries during the
+full eval.
+
+### What killed H10
+
+The schema-11 bump (commit `5a5b50d90`) was the load-bearing fix.
+Schema 11 added `name` / `contextualName` / `posHandle` to
+serialised `LambdaDescriptor`s.  The on-disk format change
+invalidated pre-existing cached CUs at load (schema mismatch ->
+fresh re-compile from source).
+
+The previous-session bug pattern was:
+  - Old cached CU for some lambda carried a **stale formals list**
+  - functionArgs read those stale formals -> attrset shape A
+  - OP_CALL into the same lambda used a **freshly re-parsed CU**
+    (different schema / different cache key) with formals B
+  - Mismatch surfaced as "unexpected argument 'git'"
+
+This is consistent with the user's hypothesis ("`f` is the wrong
+function") — not literally a different lambda value, but the same
+lambda with **two different LambdaDescriptors** held by two caches
+that diverged across a source-file change at haskell.nix's pinned
+nixpkgs rev.
+
+### Why this is consistent with falsification, not handwave
+
+The H10 reproducer requires:
+  1. A previously-populated v3 bytecode disk cache (~/.cache/nix/v3-bytecode-v1.sqlite)
+  2. A subsequent source-file change at the cached path
+  3. A query (`functionArgs`) that reads from the cache
+  4. A call (OP_CALL) that re-parses from disk
+
+Schema 11 forces step 4 to re-use a freshly-parsed CU consistent
+with step 3; the divergence vanishes.
+
+This says nothing about whether v3's eval semantics over-force
+haskell.nix.  The CORRECTNESS bug is closed; the PERFORMANCE
+question (does v3-direct build the same drv set as TW?) remains
+open and is now a clean #806/#808 work item.
+
+### Operating rule going forward (cache-coherence)
+
+**Any schema field added to LambdaDescriptor must bump
+serialize.hh's kSchemaVersion in the same commit**, or pre-existing
+caches will silently load CUs that mix old serialised data with
+new code expectations.  Latent class of bug.  Codify in lode/
+LESSONS_LEARNED §4 next pass.
+
 ## Status: 2026-05-24 EOD (UPDATED)
 
   | Task | Status | Notes |
@@ -22,7 +82,7 @@ Input Output Group.  SPDX-License-Identifier: Apache-2.0.
   | #798 B3 (H3 derivStrict) | ⏸ requires code-gate add | |
   | #799 B4 (H4 callFlake) | ⏸ bridge retired in #758 | can't toggle |
   | #802 C (localise) | 🔄 partial | 17 IFD entries identified; trigger TBD |
-  | #803 D (fix) | ⏸ pending root cause | |
+  | #803 D (fix) | ✅ CLOSED 2026-05-25 | Schema-11 cache invalidation killed H10; v3 byte-identical to TW |
   | #804 E1 / 805 E2 / 806 E3 / 807 E4 | ⏸ pending D | |
   | #808 F (validation) | ⏸ pending E | |
 

@@ -8876,28 +8876,17 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
             bindingsSetValue(b, static_cast<uint32_t>(i),  // Phase D
                              std::get<1>(entries[i]));
         }
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
-        return;
-    }
-    if (v.tag() == Tag::PrimOp || v.tag() == Tag::PrimOpApp) {
-        // PrimOps don't have introspectable formals; return empty.
-        Bindings * b = Alloc::allocBindings(0);
-        allocStats().attrsetsAllocated++;
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
         // #803 H10 diag: log when functionArgs is called on a lambda
         // whose formals look like nix-prefetch-scripts (has git-lfs +
-        // pijul or similar VCS-tool signature).  Helps catch the
-        // haskell.nix-example failing call's site.  Gated under
-        // V3_DBG_FUNCTIONARGS_TRACE=1.
+        // pijul or similar VCS-tool signature).  Helps catch any future
+        // re-occurrence of the haskell.nix-example failing call.  Gated
+        // under V3_DBG_FUNCTIONARGS_TRACE=1.
         static const bool s_dbgFA =
             std::getenv("V3_DBG_FUNCTIONARGS_TRACE") != nullptr;
         if (__builtin_expect(s_dbgFA, 0)) {
-            const LambdaDescriptor * d = v.payload.closure->desc;
             bool hasGitLfs = false, hasPijul = false, hasGit = false;
             const auto & syms = ir::globalSymbolTable();
-            for (auto & f : d->formals) {
+            for (auto & f : desc->formals) {
                 SymbolId sid = f.name;
                 std::string_view n = sid < syms.size() ? std::string_view(syms[sid]) : "";
                 if (n == "git-lfs") hasGitLfs = true;
@@ -8908,11 +8897,22 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
                 std::fprintf(stderr,
                     "v3 FA-TRACE nix-prefetch-style desc=%p name='%s' "
                     "ctx='%s' formals.size=%zu hasGit=%d\n",
-                    (const void *)d, d->name.c_str(), d->contextualName.c_str(),
-                    d->formals.size(), hasGit);
+                    (const void *)desc, desc->name.c_str(),
+                    desc->contextualName.c_str(),
+                    desc->formals.size(), hasGit);
                 std::fflush(stderr);
             }
         }
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
+        return;
+    }
+    if (v.tag() == Tag::PrimOp || v.tag() == Tag::PrimOpApp) {
+        // PrimOps don't have introspectable formals; return empty.
+        Bindings * b = Alloc::allocBindings(0);
+        allocStats().attrsetsAllocated++;
+        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+        out.payload.bindings = b;
         return;
     }
     typeError("functionArgs", "lambda");
