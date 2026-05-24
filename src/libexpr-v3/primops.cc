@@ -7542,6 +7542,60 @@ void primImport(EvalState & state, Value * args, Value & out)
         // For non-IFD plain string/path, the fast-path above stays cheap;
         // we only pay the bridge tax when we'd otherwise typeError.
         auto & ns = *state.nixEvalState;
+        // #803 Phase D candidate (H7): bypass full bridge for attrset
+        // args.  Extract outPath v3-natively, build TW string with
+        // same context, call realisePath.  Avoids the
+        // primV3ForceAttr cascade where TW iterates ALL attrs (which
+        // forces legacyPackages etc. on haskell.nix flake outputs,
+        // triggering apple-sdk + python3 builds).
+        //
+        // Opt-OUT: NIX_V3_NO_NATIVE_IMPORT_ATTRSET=1 falls back to the
+        // legacy full-bridge code path below.
+        static const bool s_noNativeImportAttrset =
+            std::getenv("NIX_V3_NO_NATIVE_IMPORT_ATTRSET") != nullptr;
+        bool tookNativePath = false;
+        if (!s_noNativeImportAttrset) {
+            const Bindings * b = args[0].payload.bindings;
+            Value * outPathRef = nullptr;
+            if (b) {
+                static const SymbolId sOutPath = ir::globalInternSymbol("outPath");
+                // Bindings entries are sorted by SymbolId; linear scan
+                // fine for typical attrset sizes (< 32).
+                for (uint32_t i = 0; i < b->size; ++i) {
+                    if (b->entries[i].name == sOutPath) {
+                        outPathRef = const_cast<Value *>(&b->entries[i].value);
+                        break;
+                    }
+                }
+            }
+            if (outPathRef) {
+                try {
+                    Value forced = forceValue(*state.vm, *outPathRef);
+                    if (forced.isString() && forced.payload.str) {
+                        nix::Value twStr;
+                        if (auto * raw = lookupStringContextEntries(forced.payload.str)) {
+                            nix::NixStringContext ctx = decodeStringContext(*raw);
+                            twStr.mkString(forced.payload.str, ctx, ns.mem);
+                        } else {
+                            twStr.mkString(forced.payload.str, ns.mem);
+                        }
+                        auto resolved = ns.realisePath(nix::noPos, twStr);
+                        path = resolved.path.abs();
+                        tookNativePath = true;
+                        static const bool s_dbgH7 = std::getenv("V3_DBG_H7") != nullptr;
+                        if (s_dbgH7)
+                            std::fprintf(stderr,
+                                "v3 H7 native-import path=%s\n", path.c_str());
+                    }
+                } catch (...) {
+                    // Force or realise threw; fall through to bridge.
+                    tookNativePath = false;
+                }
+            }
+        }
+        if (tookNativePath) {
+            // Done — skip the bridge code below.
+        } else {
         ++allocStats().v3ToTwBySite[3];  // #795 primImport attrset arg
         // #795 Phase A2: trace IFD-class attrset imports.
         static const bool s_dbgIfdAttr = std::getenv("V3_DBG_IFD") != nullptr;
@@ -7572,6 +7626,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             // outputs, restricted-eval, etc.).
             throw;
         }
+        }  // #803 H7 close: tookNativePath fallback block
     }
     else {
         // #493 diag: when args[0] is a Bridge thunk, print the TW
