@@ -7490,6 +7490,21 @@ void primImport(EvalState & state, Value * args, Value & out)
             isIfdImport = true;
             auto & ns = *state.nixEvalState;
             ++allocStats().v3ToTwBySite[2];  // #795 primImport string-with-ctx
+            // #795 Phase A2: trace IFD-class imports (the calls that
+            // realisePath may build).  Gated under V3_DBG_IFD=1 because
+            // it fires per IFD event (expensive to log unconditionally).
+            static const bool s_dbgIfd = std::getenv("V3_DBG_IFD") != nullptr;
+            if (s_dbgIfd) {
+                std::fprintf(stderr, "v3 IFD-IMPORT-STR-CTX path=%s ctxN=%zu\n",
+                    args[0].payload.str, ctxEntries->size());
+                for (auto it = ctxEntries->begin();
+                     it != ctxEntries->end() && std::distance(ctxEntries->begin(), it) < 4;
+                     ++it)
+                    std::fprintf(stderr, "  ctx[%zu]=%s\n",
+                        (size_t)std::distance(ctxEntries->begin(), it),
+                        it->c_str());
+                std::fflush(stderr);
+            }
             nix::Value * tw = v3ToTreeWalker(state, args[0]);
             if (!tw) {
                 // Fall through to non-realised path; the missing-store-
@@ -7528,6 +7543,25 @@ void primImport(EvalState & state, Value * args, Value & out)
         // we only pay the bridge tax when we'd otherwise typeError.
         auto & ns = *state.nixEvalState;
         ++allocStats().v3ToTwBySite[3];  // #795 primImport attrset arg
+        // #795 Phase A2: trace IFD-class attrset imports.
+        static const bool s_dbgIfdAttr = std::getenv("V3_DBG_IFD") != nullptr;
+        if (s_dbgIfdAttr) {
+            // List attr names — helps identify what's being imported.
+            const Bindings * b = args[0].payload.bindings;
+            std::fprintf(stderr, "v3 IFD-IMPORT-ATTRSET nAttrs=%u attrs=[",
+                b ? b->size : 0);
+            if (b) {
+                const auto & syms = ir::globalSymbolTable();
+                for (uint32_t i = 0; i < b->size && i < 12; ++i) {
+                    SymbolId sid = b->entries[i].name;
+                    std::string_view n = sid < syms.size() ? std::string_view(syms[sid]) : "?";
+                    std::fprintf(stderr, "%s%.*s", i ? "," : "", (int)n.size(), n.data());
+                }
+                if (b->size > 12) std::fprintf(stderr, ",...+%u", b->size - 12);
+            }
+            std::fprintf(stderr, "]\n");
+            std::fflush(stderr);
+        }
         nix::Value * tw = v3ToTreeWalker(state, args[0]);
         if (!tw) typeError("import", "string or path");
         try {

@@ -8,19 +8,82 @@ Plan: `V3_TRUE_NATIVE_PLAN_2026-05-24.md`.
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 Input Output Group.  SPDX-License-Identifier: Apache-2.0.
 
-## Status: 2026-05-24 EOD
+## Status: 2026-05-24 EOD (UPDATED)
 
   | Task | Status | Notes |
   |------|--------|-------|
-  | #795 A1 (v3ToTW site counter) | ✅ LANDED `91a3abbd6` | 6 sites instrumented |
-  | #795 A2 (realisation trace) | ⏸ deferred | Skipped — see RCA below |
-  | #795 A3 (differential harness) | ⏸ depends on A2 | |
-  | #796 B1 (H1 bridge asymm.) | 🔄 partially confirmed | See data below |
-  | #797-801 B2-B6 (H2-H6) | ⏸ pending haskell-nix-example data | Multi-hour eval cycles |
-  | #802 C (localise) | ⏸ pending B-data | |
-  | #803 D (fix) | ⏸ pending C | |
+  | #795 A1 (v3ToTW site counter) | ✅ LANDED `91a3abbd6` | 7 sites instrumented |
+  | #795 A2 (IFD trace V3_DBG_IFD) | ✅ LANDED (this session) | Per-IFD-import path+ctx trace |
+  | #795 A3 (WallTime stats-catch) | ✅ LANDED (this session) | Emits ABORT counts on WallTimeExceeded |
+  | #796 B1 (H1 bridge asymm.) | ✅ KILLED | NIX_V3_EAGER_BRIDGE_MAX=0 no effect |
+  | #797 B2 (H2 Stage 4 strict) | ✅ KILLED | NIX_V3_NO_OPTIMISE=1 no effect |
+  | #800 B5 (H5 Phase D) | ✅ KILLED | NIX_V3_NO_PHASE_D=1 no effect |
+  | #801 B6 (H6 optimisations) | ✅ KILLED | NIX_V3_NO_OPTIMISE=1 no effect |
+  | #798 B3 (H3 derivStrict) | ⏸ requires code-gate add | |
+  | #799 B4 (H4 callFlake) | ⏸ bridge retired in #758 | can't toggle |
+  | #802 C (localise) | 🔄 partial | 17 IFD entries identified; trigger TBD |
+  | #803 D (fix) | ⏸ pending root cause | |
   | #804 E1 / 805 E2 / 806 E3 / 807 E4 | ⏸ pending D | |
   | #808 F (validation) | ⏸ pending E | |
+
+### Phase B triage outcome
+
+**All four testable hypotheses (H1, H2, H5, H6) killed** — the over-
+forcing is INVARIANT to:
+- Bridge mode (eager / lazy)
+- Stage 4 strictness analysis
+- Phase D write barriers
+- All optimisation passes
+
+The bridge crossings are IDENTICAL across all variants (73 v3ToTreeWalker
+calls, 18 IFD probes, same 17 IFD entries).  This means the over-
+forcing is INTRINSIC to v3's eval semantics, not driven by any optional
+feature.
+
+### Phase A2 IFD-trace data
+
+V3_DBG_IFD=1 reveals all 17 IFD bridge entries on haskell-nix-example:
+
+  | Order | Type   | Path / attrs |
+  |-------|--------|--------------|
+  | 1-2   | string-ctx | flake.nix x2 |
+  | 3     | attrset | 17-attr (outputs/outPath/inputs/sourceInfo/_type/narHash/rev/...,lib,legacyPackages,...) ← nixpkgs flake-outputs |
+  | 4-5   | string-ctx | flake.nix x2 |
+  | 6     | attrset | 10-attr (outputs/outPath/inputs/sourceInfo/_type/narHash/rev/...) |
+  | 7     | attrset | 17-attr (same shape as #3) |
+  | 8-10  | string-ctx | flake.nix x3 |
+  | 11-13 | attrset | 17-attr x3 (same shape) |
+  | 14-15 | string-ctx | index-state.nix x2 |
+  | 16    | attrset | **7-attr (outPath/sourceInfo/narHash/rev/shortRev/lastModified/lastModifiedDate)** |
+  | (next) | apple-sdk-11.3 building |
+
+**The 16th IFD entry is the over-forcing trigger.**  It is an attrset
+import with ONLY metadata attrs (no `outputs`, no `legacyPackages`).
+Right after this import returns from realisePath, apple-sdk-11.3 begins
+building.
+
+### Hypothesis H7 (new) — `import <flake-source>` over-realises context
+
+When haskell.nix's flake.nix evaluates `import inputs.foo`, the
+attrset `inputs.foo` has a context entry referencing the flake input's
+source storePath.  `realisePath` calls `coerceToString` which, on TW
+side, iterates the attrset's attrs to compute the string + context.
+If one of the iterated attrs is a thunk whose body forces
+`legacyPackages.aarch64-darwin.stdenv.cc`, v3's eager-side eval
+realises the full stdenv chain — including apple-sdk.
+
+TW's coerceToString may short-circuit on `outPath` attr earlier, only
+returning that string and skipping iteration.  If v3's bridge does NOT
+short-circuit (because it iterates via primV3ForceAttr per-attr lookup,
+which forces them lazily but the act of being a primOpApp may force the
+v3 attrset to compute them eagerly), the divergence emerges.
+
+**Test for H7**: in primImport's attrset branch, manually extract the
+attrset's `outPath` attr v3-NATIVELY before bridging, and pass that
+string directly to realisePath.  If apple-sdk builds disappear, H7 is
+confirmed.
+
+This is the most promising single fix.
 
 ## Phase A1 data (this session)
 

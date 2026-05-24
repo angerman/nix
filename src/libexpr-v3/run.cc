@@ -261,7 +261,58 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // Run.  STG-10 (vm.cc:5530) automatically routes through
     // `runOnExistingVm` if we're re-entered from another v3 dispatch
     // loop — so calling `runRootExpr` from inside a primop is safe.
-    out.value = run(*out.cu);
+    //
+    // #795 Phase A1+: emit stats even when run() throws (e.g.
+    // WallTimeExceededError on long-running haskell.nix evals).  Lets
+    // hypothesis-triage tests collect per-site bridge counts via a
+    // bounded-time probe rather than requiring the eval to complete.
+    // The static dump-stats gate below decides whether to emit; this
+    // catch only ensures the emission HAPPENS before re-throw.
+    try {
+        out.value = run(*out.cu);
+    } catch (...) {
+        static const bool s_dumpStatsOnThrow =
+            std::getenv("NIX_VM_STATS") != nullptr;
+        if (s_dumpStatsOnThrow) {
+            const auto & a = allocStats();
+            std::fprintf(stderr,
+                "v3-direct ABORT alloc: thunksForced=%llu insns=%llu\n",
+                (unsigned long long)a.thunksForced,
+                (unsigned long long)a.bytecodeInstructions);
+            uint64_t totalV3Tw = 0;
+            for (uint8_t i = 0; i < 16; ++i) totalV3Tw += a.v3ToTwBySite[i];
+            if (totalV3Tw > 0) {
+                static const char * kSiteNames[16] = {
+                    "primReadFile_string_ctx", "primReadDir_attrset",
+                    "primImport_string_ctx",   "primImport_attrset",
+                    "primReadDir_string_ctx",  "primPathExists_ctx",
+                    "primDerivationStrict_TWfb","primV3CallBridge1",
+                    "FFI_leaves(fetch/path)",  "v3ToTW_eager_struct",
+                    "primTrace",               "primV3ForceAttr_inner",
+                    "primV3ForceListElem_inner","site_13",
+                    "site_14",                 "unattributed_other",
+                };
+                std::fprintf(stderr,
+                    "v3-direct ABORT v3ToTreeWalker (total=%llu):",
+                    (unsigned long long)totalV3Tw);
+                for (uint8_t i = 0; i < 16; ++i) {
+                    if (a.v3ToTwBySite[i] == 0) continue;
+                    std::fprintf(stderr, " %s=%llu",
+                        kSiteNames[i],
+                        (unsigned long long)a.v3ToTwBySite[i]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+            uint64_t totalProbes = 0;
+            for (uint8_t i = 0; i < 16; ++i) totalProbes += a.ifdProbeWithCtx[i];
+            if (totalProbes > 0)
+                std::fprintf(stderr,
+                    "v3-direct ABORT ifd probes (with-ctx): total=%llu\n",
+                    (unsigned long long)totalProbes);
+            std::fflush(stderr);
+        }
+        throw;
+    }
     pt.mark(pt.run_ms);
 
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
