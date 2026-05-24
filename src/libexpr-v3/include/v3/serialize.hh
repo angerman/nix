@@ -113,7 +113,33 @@ namespace nix::v3::serialize {
 /// in errors.  Required to diagnose the haskell.nix
 /// 'unexpected argument git' divergence (see lode/
 /// V3_TRUE_NATIVE_RCA_2026-05-24.md).
-constexpr uint32_t kSchemaVersion = 11;
+///
+/// 12: #814 (2026-05-25) LambdaDescriptor now serialises
+/// `selectorSym` (uint32) + `identityLambda` (uint8) emit-time
+/// peephole flags.  These are NOT derivable from the bytecode
+/// alone at load time; they are eval-affecting because vm.cc's
+/// OP_CALL fast path takes selectorSym/identityLambda branches
+/// that SKIP body execution (and therefore skip the body's
+/// OP_GET_LOCAL_FORCE).  Without serialisation, cached CUs lose
+/// these flags, fall through to the slow path which forces the
+/// arg via OP_GET_LOCAL_FORCE, propagating string context that
+/// the fast path would have kept lazy.  Side effects on
+/// derivation inputDrvs surface as wrong drvPath for
+/// overlay-heavy workloads (firefox.drvPath was the reproducer;
+/// see RCA_DESERIALIZE_RT_2026-05-25.md).
+///
+/// 13: #814 follow-up (2026-05-25) deserialise now: (a) includes
+/// `selectorSym` in the sparse symbol-table collection, (b)
+/// remaps selectorSym at load via that sparse table, and (c)
+/// re-sorts each LambdaDescriptor.formals by post-remap name to
+/// restore the OP_CALL formals-validation pass's sorted
+/// invariant (writer's SymbolId order ≠ reader's after cross-
+/// process remap).  Existing schema-12 entries lack the
+/// selectorSym sparse-table marker; deserialising them under the
+/// new code path produces an unmapped selectorSym → fast-path
+/// "missing attr" on haskell.nix-class overlay workloads.
+/// Schema bump invalidates them.
+constexpr uint32_t kSchemaVersion = 13;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

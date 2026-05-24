@@ -192,6 +192,11 @@ collectReferencedSymbols(const CompilationUnit & cu)
         for (const auto & f : l.formals) {
             bump(f.name);
         }
+        // Schema 12 (#814): selectorSym is a SymbolId on
+        // LambdaDescriptor (eval-affecting via the OP_CALL peephole
+        // fast path).  Must be in the sparse table so the cross-
+        // process remap step has an entry to look up.
+        if (l.selectorSym != 0) bump(l.selectorSym);
     }
 
     // Sort + dedup.  Both serialize side (writes pairs in this
@@ -588,6 +593,10 @@ std::string serializeCU(const CompilationUnit & cu)
         } else {
             w.u8(0);
         }
+        // Schema 12 (#814): emit-time peephole flags.  See
+        // serialize.hh kSchemaVersion comment for rationale.
+        w.u32(l.selectorSym);
+        w.u8(l.identityLambda ? 1 : 0);
     }
 
     // Section: lambdaCodeOffsets.
@@ -759,6 +768,9 @@ CompilationUnit deserializeCU(std::string_view blob)
                 ps.column = r.u32();
                 l.posHandle = recordPosSnapshot(std::move(ps));
             }
+            // Schema 12 (#814): emit-time peephole flags.
+            l.selectorSym    = r.u32();
+            l.identityLambda = (r.u8() != 0);
             cu.lambdas.push_back(std::move(l));
         }
     }
@@ -826,6 +838,29 @@ CompilationUnit deserializeCU(std::string_view blob)
         for (auto & f : l.formals) {
             if (f.name < remap.size()) f.name = remap[f.name];
         }
+        // Schema 12 (#814): formals are sorted by SymbolId for the
+        // OP_CALL formals validation pass.  After cross-process
+        // remap the SymbolIds change, so the original sort may be
+        // invalidated.  Re-sort here to restore the invariant.
+        // hasDefault + pos travel with name; std::sort with a
+        // lambda comparing names handles the permutation.  In-
+        // process remap is identity, so this is a no-op cost on
+        // the common path.
+        if (l.formals.size() > 1) {
+            std::sort(l.formals.begin(), l.formals.end(),
+                [](const LambdaDescriptor::Formal & a,
+                   const LambdaDescriptor::Formal & b) {
+                    return a.name < b.name;
+                });
+        }
+        // Schema 12 (#814): selectorSym is a SymbolId stored on
+        // LambdaDescriptor (not in the bytecode), referenced by the
+        // emit-time peephole fast path in OP_CALL.  Without remap, a
+        // cross-process cache hit looks up the writer's SymbolId in
+        // the reader's attrset, producing "missing attr" errors on
+        // the firefox-class overlay workload.
+        if (l.selectorSym != 0 && l.selectorSym < remap.size())
+            l.selectorSym = remap[l.selectorSym];
     }
     if (dbg) { breakdown().remapNs += nowNs() - t0; }
     // #770b/#770c (2026-05-22): cu.symbolTable was already kept
