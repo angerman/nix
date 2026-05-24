@@ -552,13 +552,41 @@ If the mmap'd L2 spike confirms wall-positive on hello.drvPath, the workload aud
 
 **This actually strengthens the spike priority.** A 3-5 day investment with a known per-call ceiling that's structurally invariant across the workload class is exactly the kind of measure-twice spike the [[measure-twice-cut-once]] rule endorses. The downside is bounded; the upside scales with the workload size proportionally.
 
-**(d) The same wall pattern across Phase 3e ACTIVE + Phase 5 + Phase 4b is itself a strategic signal.**
+**(d) ~~The same wall pattern across Phase 3e ACTIVE + Phase 5 + Phase 4b is itself a strategic signal~~ — RETRACTED 2026-05-24 post-Phase-4b-RCA + cold-tax-artifact RCA.**
 
-Three different cache placements (mid-body drv-hash, post-body SQLite-disk, import-exit forceDeep-then-disk) all show the same shape: **architecture correct + cache hits validated + wall savings either within noise or net-negative due to cache I/O cost.** This is now a documented pattern, not a single data point.
+**The original §13.3(d) (preserved below for the record) claimed three cache placements showed the same structural wall pattern, suggesting the lever was too small at primop-call boundaries.** Two subsequent RCAs falsified that framing:
 
-The pattern says: **the per-skip savings target lives in the same order-of-magnitude as the cache overhead.** Both are µs-scale on hello-class workloads, both grow at similar rates across the workload class. The mmap'd L2 architecture (§4.3) is the design that breaks the symmetry by dropping cache lookup cost ~400× (60 µs → 150 ns) while keeping savings constant. That's why it's expected to flip the sign positive where SQLite couldn't.
+1. **Phase 4b cache scope RCA (`35564703f`, 2026-05-24).** The cache hook ran on every `import` including nixpkgs-internal lazy imports, not just IFD imports. Scope-fix → 1.10× faster on designed workload, 1.85× on 1M-element scale, 1.91× on multi-IFD heavy. **The "wall-neutral" result was scope bug, not structural.**
 
-**If the mmap'd L2 spike also fails to flip the sign**, the pattern hardens further: the entire eval-result-cache concept at primop-call boundaries is structurally too cheap on drvPath-class workloads, and the lever must move up to coarser granularities (IR subtrees, lib.fix steps, module results) — which is exactly the Unison Item 1 / Item 2 direction. The mmap spike is therefore not just a cache-implementation question but **a falsifier for the eval-result-cache-at-primop-boundary thesis itself.**
+2. **CU-disk-cache cold-tax artifact RCA (`fe678273a` + `297f900971`, 2026-05-24).** `hyperfine --prepare "rm -rf <cache>"` wiped the default-on CU disk cache; the +78 % cold tax was CU recompile cost, not Phase 4b. Correct methodology → COLD === OFF within noise. **The "cold tax scales with cache work" reading was measurement artifact, not structural.**
+
+**Original framing (now superseded):**
+
+> Three different cache placements (mid-body drv-hash, post-body
+> SQLite-disk, import-exit forceDeep-then-disk) all show the same
+> shape: architecture correct + cache hits validated + wall savings
+> either within noise or net-negative due to cache I/O cost. This is
+> now a documented pattern, not a single data point.
+>
+> The pattern says: the per-skip savings target lives in the same
+> order-of-magnitude as the cache overhead. Both are µs-scale on
+> hello-class workloads, both grow at similar rates across the
+> workload class.
+
+**Corrected reading (2026-05-24):**
+
+- The **two false-structural conclusions in one week** are themselves the actual strategic pattern, NOT a recurring wall-too-small finding. The pattern is about **methodology blind spots at the boundaries between instrumented systems** (see [`PROFILING_AUDIT_2026-05-24.md`](PROFILING_AUDIT_2026-05-24.md) §4).
+- **Phase 4b is wall-positive on its designed workload** (1.10-1.91× faster across single/scale/multi-IFD tests post-RCA). The "lever too small at primop boundary" thesis is FALSIFIED for the workload class Phase 4b targets.
+- The **mmap'd L2 priority drops** because Phase 4b proves SQLite-backed L2 IS sufficient at this scope when correctly scoped. The mmap'd L2 spike is no longer the dual-falsifier-for-cache-at-primop-boundary; it's now a smaller wall-positive opportunity (closing the residual SQLite-lookup-cost margin in already-validated cache).
+- The **Phase 3e / Phase 5 scope audit is now the highest-leverage open follow-up** (commit `35564703f` lesson 3 explicitly flagged this). The same scope-bug pattern that hid Phase 4b's wall lever may have hidden Phase 3e + Phase 5's. The audit needs T1.1 per-call-site cache-hook instrumentation per [`PROFILING_IMPROVEMENTS_2026-05-24.md`](PROFILING_IMPROVEMENTS_2026-05-24.md) (1-2 days) to surface call-site invocation patterns the existing aggregate instrumentation misses.
+
+**Strategic implication:** the path forward is NOT "build mmap'd L2 as dual falsifier." It's:
+1. **Add T1.1** per-call-site cache-hook instrumentation (1-2 d, see profiling-improvements doc)
+2. **Audit Phase 3e / Phase 5 scopes** with T1.1 active. Look for the same shape as Phase 4b's RCA.
+3. **If the same scope bug exists**, fix it. Wall-positive on drvPath class without architectural change.
+4. **If no scope bug**, the leaf-primop scope IS structurally too cheap on drvPath class. THEN reconsider mmap'd L2 OR coarser-scope work.
+
+The retracted framing is preserved here for the record because it shows how a documented pattern can be wrong-cause; the [`MEASURE_TWICE_CUT_ONCE_2026-05-23.md`](MEASURE_TWICE_CUT_ONCE_2026-05-23.md) §5.7 anti-pattern ("the measurement says A; therefore A is true") is operationalised on these RCAs.
 
 ### 13.4 Updated #741 falsifier ledger (cumulative)
 

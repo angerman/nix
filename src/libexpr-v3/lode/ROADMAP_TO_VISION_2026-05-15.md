@@ -107,6 +107,19 @@ Operationalisation:
   warm-eval at parse-AND-primop level. **The two compose
   multiplicatively against TW**, which has neither layer and cannot
   easily ship either.
+- **Profiling story audit + improvement plan** (added 2026-05-24 per
+  `PROFILING_AUDIT_2026-05-24.md` + `PROFILING_IMPROVEMENTS_2026-05-24.md`):
+  current instrumentation is competitive (per-op cycles via #786
+  OPCYCLES, per-primop wall via #788, per-alloc-site Bindings via
+  #746, RSS bucket decomposition via #702) but has cross-cut gaps.
+  Two false-structural conclusions in one week (Phase 4b cache
+  scope `35564703f`; CU-disk-cache cold-tax artifact `fe678273a`)
+  motivate Tier 1 closures: T1.1 per-call-site cache-hook
+  instrumentation (1-2 d, unblocks Phase 3e/5 scope audit),
+  T1.2 elsewhere RSS decomposition (1 d, closes
+  MEMORY_REDUCTION §3.3), T1.3 per-alloc-site for
+  Thunks/Closures/ListVecs (1-2 d, extends #746 pattern). Total
+  Tier 1 ~5 days, all infrastructure reuses existing patterns.
 
 The strategic insight: **the team has been optimizing the
 workload-as-measured (single-process, cold-include-compile), but
