@@ -4043,6 +4043,7 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
                               nix::Value ** args, nix::Value & out)
 {
     g_bridgeCallBridge1Calls.fetch_add(1, std::memory_order_relaxed);
+    ++allocStats().v3ToTwBySite[7];  // #806 primV3CallBridge1 entry (E3 retire data)
 
     // #466 nested-bridge-primop depth bound (orthogonal to bridge1's
     // own per-bridge1-cascade depth counter below).

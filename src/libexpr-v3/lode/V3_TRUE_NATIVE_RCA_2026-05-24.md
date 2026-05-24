@@ -83,6 +83,90 @@ LESSONS_LEARNED §4 next pass.
 Confirms #803 closure introduced no regressions on the standard
 correctness gate.
 
+## Post-#803 perf baseline (2026-05-25, hyperfine warm store)
+
+### hello.drvPath via `--expr (import (builtins.getFlake "nixpkgs") {}).hello.drvPath`
+
+  | Metric                    | TW            | v3-direct       | v3/TW |
+  |---------------------------|---------------|-----------------|-------|
+  | Wall (hyperfine, 10 runs) | 501 ± 20 ms   | 1277 ± 9 ms     | 2.55× |
+  | v3ToTreeWalker total      | n/a           | 1               | —     |
+  |   primImport_string_ctx   | n/a           | 1               | —     |
+  | disk_cache hits / total   | n/a           | 0 / 270         | 0%    |
+  | bridge sites [7,11,12]    | n/a           | 0 / 0 / 0       | —     |
+
+### haskell-nix-example x86_64-linux hello.drvPath via `--expr getFlake`
+
+  | Metric                    | TW            | v3-direct       | v3/TW |
+  |---------------------------|---------------|-----------------|-------|
+  | Wall (hyperfine, 5 runs)  | 5026 ± 502 ms | 7155 ± 573 ms   | 1.42× |
+  | Peak RSS (single)         | 569 MB        | 3003 MB         | 5.3×  |
+  | v3ToTreeWalker total      | n/a           | 74              | —     |
+  |   primReadDir_attrset     | n/a           | 3               | —     |
+  |   primImport_string_ctx   | n/a           | 10              | —     |
+  |   primReadDir_string_ctx  | n/a           | 2               | —     |
+  |   primV3CallBridge1       | n/a           | 8               | —     |
+  |   primV3ForceAttr_inner   | n/a           | 51              | —     |
+  |   primV3ForceListElem     | n/a           | **0**           | —     |
+  | TW→v3 bridge primop calls |               |                 |       |
+  |   __v3_call_bridge_1      | n/a           | 8               | —     |
+  |   __v3_force_attr         | n/a           | 51              | —     |
+  |   __v3_force_list_elem    | n/a           | **0**           | —     |
+  | disk_cache hits / total   | n/a           | 8 / 2449        | 0.3%  |
+  | v3_arena (Bindings)       | n/a           | 705 MB          | —     |
+  | v3_arena (Thunks)         | n/a           | 320 MB          | —     |
+  | v3_arena (Closures)       | n/a           | 272 MB          | —     |
+  | v3_arena (Pairs)          | n/a           | 125 MB          | —     |
+  | v3_arena (Lists)          | n/a           | 53 MB           | —     |
+  | v3_arena total            | n/a           | 1594 MB         | —     |
+  | elsewhere                 | n/a           | 1006 MB         | —     |
+  | Boehm heap (mostly free)  | n/a           | 403 MB          | —     |
+
+### Phase 1 target compliance
+
+  | Target                                  | Measured    | Status |
+  |-----------------------------------------|-------------|--------|
+  | hello.drvPath warm wall ≤2× TW          | 2.55× TW    | MISS  |
+  | haskell-nix-example warm wall ≤4× TW    | 1.42× TW    | MET   |
+  | haskell-nix-example correctness == TW   | byte-id     | MET   |
+
+Wall ratio is **dominated by deserialize + import I/O on hello**;
+amortises down on haskell-nix-example.  Memory is the remaining
+gap — peak RSS 5.3× TW on the haskell.nix workload.
+
+### #806 decision
+
+  | Primop                  | Site count haskell-nix | Decision    |
+  |-------------------------|------------------------|-------------|
+  | primV3ForceListElem     | 0                      | DEFER       |
+  | primV3ForceAttr         | 51                     | KEEP        |
+  | primV3CallBridge1       | 8                      | KEEP        |
+
+ForceAttr + CallBridge1 are **still load-bearing** on haskell.nix-class
+workloads — TW's flake-output construction reads back through v3-built
+Bindings via the lazy bridge.  Full #806 closure requires Stage-2-level
+work (eliminate the TW boundary on flake-output emission).
+
+ForceListElem has 0 entries on hello + haskell-nix-example.  Not yet
+proven 0 across all workloads (cardano-node, nixpkgs-config, etc.);
+deferring single-primop retire until a broader sweep validates [12]=0
+empirically across the full bridge-touching workload set.
+
+### Separate perf issues identified (follow-on tasks)
+
+  1. **disk_cache hit_rate ≈0%** across runs — keys differ each
+     invocation, or cache isn't persisting reads correctly.  Promise
+     of warm-start speedup not realised today.  Per-process SQLite
+     pool may need round-trip validation.
+  2. **v3 peak RSS = 5.3× TW** on haskell-nix-example.  Bindings is
+     the dominant lever (705 MB / 44% of v3_arena).  Stage-4
+     strictness + posSnapshotPool sharing + Bindings dedup are
+     candidate levers per memory-first-class operating rule.
+  3. **Wall 2.55× TW on hello.drvPath warm** — above the Phase 1 ≤2×
+     target.  Per #777b deserialize breakdown, ~334 ms (26%) of
+     v3 wall is deserialize cost on 270 cached CUs; symbolTable
+     and lambda sections dominate.
+
 ## Status: 2026-05-24 EOD (UPDATED)
 
   | Task | Status | Notes |
@@ -98,8 +182,11 @@ correctness gate.
   | #799 B4 (H4 callFlake) | ⏸ bridge retired in #758 | can't toggle |
   | #802 C (localise) | 🔄 partial | 17 IFD entries identified; trigger TBD |
   | #803 D (fix) | ✅ CLOSED 2026-05-25 | Schema-11 cache invalidation killed H10; v3 byte-identical to TW |
-  | #804 E1 / 805 E2 / 806 E3 / 807 E4 | ⏸ pending D | |
-  | #808 F (validation) | ⏸ pending E | |
+  | #804 E1 | ✅ closed | primReadDir+primImport attrset native bypass |
+  | #805 E2 | ✅ closed-as-design | eager bridge path retained per data |
+  | #806 E3 | 🔄 DEFERRED 2026-05-25 | ForceAttr=51, CallBridge1=8 still load-bearing; ForceListElem=0 awaits broader sweep |
+  | #807 E4 | ✅ closed | lode/FFI_AUDIT_2026-05-24.md |
+  | #808 F (validation) | 🔄 partial 2026-05-25 | hyperfine + bridge data captured; lang sweep pending |
 
 ### Phase B triage outcome
 
