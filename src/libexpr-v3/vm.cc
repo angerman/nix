@@ -89,7 +89,13 @@ namespace {
 
 struct V3SignalDiagInstaller {
     V3SignalDiagInstaller() {
-        if (!std::getenv("V3_DBG_SIGTRAP")) return;
+        // Cold path — constructor runs once at process init.  Cache
+        // the env-var probe in a static-const-bool to satisfy
+        // `test/lint-no-inline-getenv.sh` (which scans for inline
+        // getenv() calls regardless of cold/hot status).
+        static const bool s_enabled =
+            std::getenv("V3_DBG_SIGTRAP") != nullptr;
+        if (!s_enabled) return;
         struct sigaction sa = {};
         sa.sa_sigaction = v3SignalDiagHandler;
         sa.sa_flags = SA_SIGINFO;
