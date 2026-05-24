@@ -105,7 +105,15 @@ namespace nix::v3::serialize {
 /// OP_ATTRS_SELECT's IC mechanism for the LetRec slot-ref hot
 /// path (9.05 % of dispatch on hello.drvPath; 1.4 M calls).
 /// Cache size is serialised; entries are zeroed on load.
-constexpr uint32_t kSchemaVersion = 10;
+///
+/// 11: #803 (2026-05-24) LambdaDescriptor now serialises `name`,
+/// `contextualName`, and `posHandle` (resolved file/line/col via
+/// posSnapshotPool look-up).  Pre-11 cached CUs lose these
+/// diagnostic fields on load → "anonymous lambda" + src=?:0:0
+/// in errors.  Required to diagnose the haskell.nix
+/// 'unexpected argument git' divergence (see lode/
+/// V3_TRUE_NATIVE_RCA_2026-05-24.md).
+constexpr uint32_t kSchemaVersion = 11;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

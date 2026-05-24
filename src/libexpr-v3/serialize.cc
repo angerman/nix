@@ -8,6 +8,7 @@
 #include "v3/serialize.hh"
 #include "v3/primop.hh"
 #include "v3/ir.hh"
+#include "v3/alloc.hh"  // PosSnapshot, resolvePosSnapshot, recordPosSnapshot
 
 #include <algorithm>
 #include <chrono>
@@ -569,6 +570,24 @@ std::string serializeCU(const CompilationUnit & cu)
         w.u8(static_cast<uint8_t>(l.intrinsicVar0));  // signed int8 reinterpreted
         w.u8(static_cast<uint8_t>(l.intrinsicVar1));
         w.u8(static_cast<uint8_t>(l.intrinsicVar2));
+        // Schema 11 (#803): diagnostic metadata.  Without these, cache-
+        // loaded CUs show "anonymous lambda" + src=?:0:0 in error
+        // messages, hiding which source file the lambda came from.
+        // Required for the H10 RCA on haskell.nix-class workloads.
+        w.str(l.name);
+        w.str(l.contextualName);
+        // posHandle is an index into the process-static posSnapshotPool;
+        // we serialise the RESOLVED file/line/column so the load-time
+        // process can rebuild a fresh posHandle from its own pool.
+        const PosSnapshot * ps = resolvePosSnapshot(l.posHandle);
+        if (ps) {
+            w.u8(1);
+            w.str(ps->file);
+            w.u32(ps->line);
+            w.u32(ps->column);
+        } else {
+            w.u8(0);
+        }
     }
 
     // Section: lambdaCodeOffsets.
@@ -730,6 +749,16 @@ CompilationUnit deserializeCU(std::string_view blob)
             l.intrinsicVar0 = static_cast<int8_t>(r.u8());
             l.intrinsicVar1 = static_cast<int8_t>(r.u8());
             l.intrinsicVar2 = static_cast<int8_t>(r.u8());
+            // Schema 11 (#803): diagnostic metadata.
+            l.name           = std::string(r.strv());
+            l.contextualName = std::string(r.strv());
+            if (r.u8()) {
+                PosSnapshot ps;
+                ps.file   = std::string(r.strv());
+                ps.line   = r.u32();
+                ps.column = r.u32();
+                l.posHandle = recordPosSnapshot(std::move(ps));
+            }
             cu.lambdas.push_back(std::move(l));
         }
     }
