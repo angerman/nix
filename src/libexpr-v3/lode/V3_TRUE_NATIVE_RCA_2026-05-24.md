@@ -68,6 +68,21 @@ caches will silently load CUs that mix old serialised data with
 new code expectations.  Latent class of bug.  Codify in lode/
 LESSONS_LEARNED §4 next pass.
 
+### Post-#803 validation sweep (2026-05-25)
+
+  | Workload                              | TW                         | v3-direct                  | Status         |
+  |---------------------------------------|----------------------------|----------------------------|----------------|
+  | hello.drvPath                         | q6gaf5d...                 | q6gaf5d...                 | byte-identical |
+  | bash.drvPath                          | (sweep)                    | (sweep)                    | byte-identical |
+  | gcc.drvPath                           | (sweep)                    | (sweep)                    | byte-identical |
+  | python3.drvPath                       | (sweep)                    | (sweep)                    | byte-identical |
+  | firefox.drvPath                       | (sweep)                    | (sweep)                    | byte-identical |
+  | haskell-nix-example x86_64-linux hello.drvPath | aw7jri6n...       | aw7jri6n...                | byte-identical |
+  | v3 quick smoke (5 suites)             | n/a                        | 5/5 PASS                   | regression-free |
+
+Confirms #803 closure introduced no regressions on the standard
+correctness gate.
+
 ## Status: 2026-05-24 EOD (UPDATED)
 
   | Task | Status | Notes |
