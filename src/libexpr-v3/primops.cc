@@ -3555,6 +3555,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
         if (ctxEntries && !ctxEntries->empty() && state.nixEvalState) {
             ++allocStats().ifdProbeWithCtx[kIfdReadDir];
             auto & ns = *state.nixEvalState;
+            ++allocStats().v3ToTwBySite[4];  // #795 primReadDir string-with-ctx
             nix::Value * tw = v3ToTreeWalker(state, args[0]);
             if (!tw) {
                 path = args[0].payload.str;
@@ -3580,6 +3581,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
             typeError("readDir", "string or path");
         ++allocStats().ifdProbeWithCtx[kIfdReadDir];
         auto & ns = *state.nixEvalState;
+        ++allocStats().v3ToTwBySite[1];  // #795 primReadDir attrset arg
         nix::Value * tw = v3ToTreeWalker(state, args[0]);
         if (!tw) typeError("readDir", "string or path");
         try {
@@ -4488,6 +4490,7 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
     }
     nix::Symbol resolvedName = ns.symbols.create(name);
     try {
+        ++allocStats().v3ToTwBySite[11];  // #795 primV3ForceAttr re-bridge
         nix::Value * tmp = v3ToTreeWalker(v3state, *found);
         if (tmp) out = *tmp; else out.mkNull();
         return;
@@ -4648,6 +4651,7 @@ static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
     // WC-19: same safety net as primV3ForceAttr.
     // REVIEW_2026-05-04 F4 / §6.3: typed BlackholeError instead of strstr.
     try {
+        ++allocStats().v3ToTwBySite[12];  // #795 primV3ForceListElem re-bridge
         nix::Value * tmp = v3ToTreeWalker(v3state, l->elems[(uint32_t)idx]);
         if (tmp) out = *tmp; else out.mkNull();
         return;
@@ -5973,6 +5977,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     if (state.nixEvalState && args[0].isAttrs() && args[0].payload.bindings) {
         try {
             auto & ns = *state.nixEvalState;
+            ++allocStats().v3ToTwBySite[6];  // #795 derivationStrict TW fallback
             nix::Value * nargs = v3ToTreeWalker(state, args[0]);
             // Cache the derivationStrict primop pointer per-EvalState
             // — it's looked up by name on every call otherwise (one
@@ -7484,6 +7489,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             ++allocStats().ifdProbeWithCtx[kIfdImport];
             isIfdImport = true;
             auto & ns = *state.nixEvalState;
+            ++allocStats().v3ToTwBySite[2];  // #795 primImport string-with-ctx
             nix::Value * tw = v3ToTreeWalker(state, args[0]);
             if (!tw) {
                 // Fall through to non-realised path; the missing-store-
@@ -7521,6 +7527,7 @@ void primImport(EvalState & state, Value * args, Value & out)
         // For non-IFD plain string/path, the fast-path above stays cheap;
         // we only pay the bridge tax when we'd otherwise typeError.
         auto & ns = *state.nixEvalState;
+        ++allocStats().v3ToTwBySite[3];  // #795 primImport attrset arg
         nix::Value * tw = v3ToTreeWalker(state, args[0]);
         if (!tw) typeError("import", "string or path");
         try {

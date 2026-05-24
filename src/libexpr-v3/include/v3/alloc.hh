@@ -314,6 +314,32 @@ struct AllocStats
     /// workload has NO IFD events and Phase 4 cache wouldn't apply.
     /// If non-zero, those primop calls are Phase 4 cache candidates.
     uint64_t ifdProbeWithCtx[16] = {};
+
+    /// #795 (2026-05-24): per-call-site counter for v3ToTreeWalker
+    /// (the v3→TW bridge entry).  Each call site in primops.cc is
+    /// assigned a numeric ID below.  When NIX_VM_STATS, the dump
+    /// reports per-site counts so we can localize where v3 most
+    /// often crosses to TW (and therefore where the V3-NATIVE
+    /// elimination effort should focus).
+    ///
+    /// Site IDs (keep in sync with v3ToTreeWalker call-site comments):
+    ///   0  primReadDir / primReadFile (string-with-ctx via realisePath)
+    ///   1  primReadDir (attrset arg)
+    ///   2  primImport (string-with-ctx)
+    ///   3  primImport (attrset arg)
+    ///   4  primPathExists (string-with-ctx) — line 2981 site
+    ///   5  primReadFile (string-with-ctx) — line 3459 site
+    ///   6  primDerivationStrict TW fallback
+    ///   7  primV3CallBridge1 / primV3ForceAttr / primV3ForceListElem
+    ///   8  primPath / fetch* / fetchFinalTree (FFI leaves)
+    ///   9  v3ToTreeWalker eager bridge (small list/attrset structural)
+    ///  10  primTrace (diagnostic)
+    ///  11  primV3ForceAttr re-bridge inner (line 4491)
+    ///  12  primV3ForceListElem re-bridge inner (line 4651)
+    ///  13  reserved
+    ///  14  reserved
+    ///  15  other / unattributed
+    uint64_t v3ToTwBySite[16] = {};
 };
 
 inline AllocStats & allocStats()

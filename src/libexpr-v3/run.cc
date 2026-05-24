@@ -769,6 +769,41 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     "v3-direct ifd probes (with-ctx, potential IFD): 0 — "
                     "all probes were literal-path calls; no IFD candidates\n");
             }
+            // #795 (2026-05-24): per-call-site v3ToTreeWalker counter.
+            // Dumps which call sites cross to TW most often.  Read by the
+            // V3 true-native investigation (V3_TRUE_NATIVE_PLAN_2026-05-24.md).
+            uint64_t totalV3Tw = 0;
+            for (uint8_t i = 0; i < 16; ++i) totalV3Tw += a.v3ToTwBySite[i];
+            if (totalV3Tw > 0) {
+                static const char * kSiteNames[16] = {
+                    "primReadFile_string_ctx",  // 0
+                    "primReadDir_attrset",      // 1
+                    "primImport_string_ctx",    // 2
+                    "primImport_attrset",       // 3
+                    "primReadDir_string_ctx",   // 4
+                    "primPathExists_ctx",       // 5
+                    "primDerivationStrict_TWfb",// 6
+                    "primV3CallBridge1",        // 7
+                    "FFI_leaves(fetch/path)",   // 8
+                    "v3ToTW_eager_struct",      // 9
+                    "primTrace",                // 10
+                    "primV3ForceAttr_inner",    // 11
+                    "primV3ForceListElem_inner",// 12
+                    "site_13",                  // 13
+                    "site_14",                  // 14
+                    "unattributed_other",       // 15
+                };
+                std::fprintf(stderr,
+                    "v3-direct v3ToTreeWalker calls (total=%llu):",
+                    (unsigned long long)totalV3Tw);
+                for (uint8_t i = 0; i < 16; ++i) {
+                    if (a.v3ToTwBySite[i] == 0) continue;
+                    std::fprintf(stderr, " %s=%llu",
+                        kSiteNames[i],
+                        (unsigned long long)a.v3ToTwBySite[i]);
+                }
+                std::fprintf(stderr, "\n");
+            }
         }
         // #741 Phase 1 spike: derivation-result round-trip diagnostics.
         // Only emits when NIX_V3_TEST_DRV_RESULT_SERIALIZE=1; no output
