@@ -4743,8 +4743,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             : std::string("anonymous lambda");
                         const Bindings * b = forcedArg.payload.bindings;
                         const auto & tbl = ir::globalSymbolTable();
+                        // #809 (2026-05-24): diagnostic gate.  When
+                        // NIX_V3_PERMISSIVE_FORMALS=1, treat every
+                        // lambda as ellipsis=1 (accept extra args
+                        // silently).  Used to isolate whether the
+                        // strict extra-arg check is the load-bearing
+                        // blocker on haskell.nix-class workloads, or
+                        // whether downstream over-forcing persists
+                        // even after we let extra args through.
+                        // OFF-by-default; semantically incorrect when
+                        // ON (TW would also reject in pure strict
+                        // mode).
+                        static const bool s_permissiveFormals =
+                            std::getenv("NIX_V3_PERMISSIVE_FORMALS") != nullptr;
                         // (a) Extra-arg check for non-ellipsis lambdas.
-                        if (!desc->ellipsis) {
+                        if (!desc->ellipsis && !s_permissiveFormals) {
                             for (uint32_t i = 0; i < b->size; ++i) {
                                 SymbolId name = b->entries[i].name;
                                 bool found = false;
@@ -5222,7 +5235,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             : std::string("anonymous lambda");
                         const Bindings * b = forcedArg.payload.bindings;
                         const auto & tbl = ir::globalSymbolTable();
-                        if (!tcDesc->ellipsis) {
+                        // #809: same NIX_V3_PERMISSIVE_FORMALS gate as
+                        // the call-site path above.  Both OP_CALL and
+                        // OP_TAIL_CALL hit this check; both must obey
+                        // the gate or the diagnostic isn't honest.
+                        static const bool s_permissiveFormalsTC =
+                            std::getenv("NIX_V3_PERMISSIVE_FORMALS") != nullptr;
+                        if (!tcDesc->ellipsis && !s_permissiveFormalsTC) {
                             for (uint32_t i = 0; i < b->size; ++i) {
                                 SymbolId name = b->entries[i].name;
                                 bool found = false;
