@@ -1,7 +1,7 @@
 /// @file
 /// SQLite-backed disk cache for v3 CompilationUnit blobs.
 ///
-/// Single SQLite DB at `$XDG_CACHE_HOME/nix/v3-bytecode-v2.sqlite`.
+/// Single SQLite DB at `$XDG_CACHE_HOME/nix/v3-bytecode-v1.sqlite`.
 /// Schema mirrors src/libexpr/bytecode-disk-cache.cc and the rest of
 /// nix's caches (libfetchers, nar-info-disk-cache, eval-cache):
 ///
@@ -79,36 +79,35 @@ void sha256(std::string_view data, CacheKey & out)
     std::memcpy(out.bytes, h.hash, 32);
 }
 
-/// Schema with composite (key, schema) primary key.  An earlier
-/// iteration used `key blob primary key`, which had a load-bearing
-/// bug after the schema bump from 10 to 11: every INSERT OR IGNORE
-/// at the new schema for a content hash that already existed at the
-/// old schema was silently ignored (primary-key collision).  The old
-/// row remained, but lookups filter by `key AND schema = ?`, so the
-/// old row never hit.  Result: 0% hit rate after every schema bump
-/// until the user manually purged the DB.  Composite PK lets the new
-/// schema's rows coexist with the old; LRU pruning eventually evicts
-/// the orphans.
+/// 2026-05-25: a composite (key, schema) PRIMARY KEY change was
+/// attempted with a v1→v2 file path bump to fix the 0%-hit-rate-
+/// post-schema-bump bug.  Both reverted because the resulting 100%
+/// hit rate exposed a latent schema-11 deserialize bug: firefox.drvPath
+/// diverged from TW when the deserialized LambdaDescriptor's `name`
+/// field was used as the eval-predicate for intrinsic dispatch
+/// (`name == "super"` in vm.cc).  The schema-11 fields appear to
+/// round-trip correctly at the byte level but eval-time behaviour
+/// differs.  Re-land the composite-PK fix + v1→v2 path bump once
+/// the deserialize round-trip is restored.  Single-column PK kept
+/// for now — 0% hit rate (no perf win), but no correctness regression.
 constexpr const char * kSchema = R"sql(
 create table if not exists CompilationUnits (
-    key       blob not null,
+    key       blob primary key,
     blob      blob not null,
     schema    integer not null,
     last_used integer not null,
-    size      integer not null,
-    primary key (key, schema)
+    size      integer not null
 );
 create index if not exists idx_lru on CompilationUnits(last_used);
 -- #741 Phase 5: eval-result cache (drvPath-keyed result attrset blobs).
 -- Mirrors the CompilationUnits shape but uses kEvalResultSchemaVersion
 -- so format changes to one cache don't invalidate the other.
 create table if not exists EvalResults (
-    key       blob not null,
+    key       blob primary key,
     blob      blob not null,
     schema    integer not null,
     last_used integer not null,
-    size      integer not null,
-    primary key (key, schema)
+    size      integer not null
 );
 create index if not exists idx_eval_lru on EvalResults(last_used);
 )sql";
@@ -152,23 +151,25 @@ DbHandle & dbHandle()
 
 /// Compute the database path.  Honours NIX_V3_CACHE_DIR (legacy env
 /// var name from the file-per-key cache) for tests / benchmarks; falls
-/// back to `getCacheDir() / v3-bytecode-v2.sqlite` (XDG-compliant).
+/// back to `getCacheDir() / v3-bytecode-v1.sqlite` (XDG-compliant).
 ///
-/// File-name bumped from v1 → v2 in commit 2af711d90's followup
-/// (2026-05-25) when the composite (key, schema) primary-key fix
-/// landed.  SQLite can't ALTER a PRIMARY KEY on an existing table, so
-/// the v1 file remains on disk with the old single-column PK and is
-/// effectively orphaned after the bump.  Users can reclaim disk by
-/// `rm ~/.cache/nix/v3-bytecode-v1.sqlite` once on the new build.
-/// Without this file-name bump, `create table if not exists` would
-/// see the old table and silently leave the wrong PK in place,
-/// reintroducing the 0% hit-rate bug post-schema-bump.
+/// 2026-05-25: a v1→v2 bump was briefly attempted with the composite
+/// (key, schema) PK fix above, but it exposed a latent schema-11
+/// deserialize bug — firefox.drvPath diverged from TW when the
+/// schema-11 CU was loaded from cache (LambdaDescriptor.name does
+/// not round-trip correctly through serialize/deserialize for some
+/// CUs that use intrinsic dispatch keyed on `name == "super"`).
+/// Reverted to v1 to keep the existing single-column PK in effect on
+/// pre-existing caches — 0% hit rate post-schema-bump, but no
+/// correctness regression.  The kSchema composite-PK change above
+/// is kept so fresh caches (no existing v1 db) get the correct PK.
+/// Re-bump to v2 once the schema-11 deserialize round-trip is fixed.
 std::filesystem::path computeDbPath()
 {
     if (const char * override = std::getenv("NIX_V3_CACHE_DIR");
         override && *override)
-        return std::filesystem::path(override) / "v3-bytecode-v2.sqlite";
-    return std::filesystem::path(nix::getCacheDir()) / "v3-bytecode-v2.sqlite";
+        return std::filesystem::path(override) / "v3-bytecode-v1.sqlite";
+    return std::filesystem::path(nix::getCacheDir()) / "v3-bytecode-v1.sqlite";
 }
 
 /// Open + populate prepared statements on first use.  Returns false
