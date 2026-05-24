@@ -83,7 +83,72 @@ attrset's `outPath` attr v3-NATIVELY before bridging, and pass that
 string directly to realisePath.  If apple-sdk builds disappear, H7 is
 confirmed.
 
-This is the most promising single fix.
+## H7 RESULT — partial fix (commit `0319f953a`)
+
+H7 implemented + measured: PARTIAL.  Bridge crossings dropped 73→59
+(-14, -19%) — all 7 attrset imports now native (no bridge cascade).
+**BUT apple-sdk + python3 STILL BUILD.**  H7 was therefore not the
+full root cause.
+
+Per-kind IFD probe breakdown (added in run.cc):
+```
+v3-direct ABORT ifd probes (with-ctx): total=18 import=16 readDir=1 pathExists=1
+```
+
+So the 18 IFD probes split: 16 import + 1 readDir + 1 pathExists.
+The 16 imports are accounted for; the 1 readDir-attrset is still
+bridge-based; the 1 pathExists fires realisePath via mkString
+WITHOUT context (line 2971 — context lost on TW Value construction).
+
+## NEXT hypothesis H8 — outPath-context realises apple-sdk
+
+H7's TW string construction preserves the v3 string-context entries
+on `outPath`.  These context entries may include build-references
+(e.g. `Drv(apple-sdk.drv)`) added by haskell.nix's module-system
+when constructing the flake input's outPath.
+
+When realisePath sees a Drv context entry, it BUILDS the referenced
+derivation.  That's the apple-sdk trigger.
+
+TW would presumably do the same — unless TW takes a different code
+path (e.g. coerceToString without copyToStore context realisation).
+This requires deeper investigation of TW's coerceToString semantics
+vs realisePath context realisation.
+
+The HASKELL.NIX-INTERNAL semantic that adds these context entries is
+out of scope for this v3 investigation; the question is why v3's
+context realisation triggers builds TW doesn't.
+
+## Hypothesis H9 — nested eval after primImport over-forces
+
+primImport's tail (line 7682-area) parses + lowers + runs the
+imported file as a separate v3 CU.  That run() can do MORE IFD
+calls.  Each of these inner primImport's might also over-force.
+
+Counter: 18 IFD probes is the cumulative count across ALL eval
+contexts (process-static).  Inner evals contribute too.
+
+## Session boundary
+
+Investigation reached the limit of what's tractable without:
+  - Hours of wall-clock for haskell-nix-example completion runs
+  - Source-level analysis of haskell.nix's module-system semantics
+  - TW-side instrumentation to compare context realisation
+
+Remaining work (multi-day):
+  - Trace each realisePath's context entries (which Drv/Built refs?)
+  - Identify TW's exact handling for the same input
+  - Possibly fix at: context-aware lazy realisation, or
+    haskell.nix-side change, or some FFI-bypass for source paths.
+
+## Cumulative gains this arc
+
+  - +5 hypotheses killed (H1, H2, H5, H6, H7-as-full-fix)
+  - +1 partial fix landed (H7: -14 bridges, byte-identical preserved)
+  - +instrumentation: counters, IFD trace, WallTime stats catch,
+    per-kind probe breakdown
+  - +18 IFD probe = 16 import + 1 readDir + 1 pathExists attribution
+  - **No regressions**: 6/6 nixpkgs drvPath + multi-IFD heavy PASS
 
 ## Phase A1 data (this session)
 

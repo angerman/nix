@@ -305,10 +305,17 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             }
             uint64_t totalProbes = 0;
             for (uint8_t i = 0; i < 16; ++i) totalProbes += a.ifdProbeWithCtx[i];
-            if (totalProbes > 0)
+            if (totalProbes > 0) {
                 std::fprintf(stderr,
-                    "v3-direct ABORT ifd probes (with-ctx): total=%llu\n",
+                    "v3-direct ABORT ifd probes (with-ctx): total=%llu",
                     (unsigned long long)totalProbes);
+                for (uint8_t k = 1; k < 16; ++k)
+                    if (a.ifdProbeWithCtx[k] > 0)
+                        std::fprintf(stderr, " %s=%llu",
+                            ifdProbeKindName(static_cast<uint8_t>(k)),
+                            (unsigned long long)a.ifdProbeWithCtx[k]);
+                std::fprintf(stderr, "\n");
+            }
             std::fflush(stderr);
         }
         throw;
