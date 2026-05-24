@@ -4752,6 +4752,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                     if (f.name == name) { found = true; break; }
                                 if (!found) {
                                     std::string nm = (name < tbl.size()) ? tbl[name] : "?";
+                                    // #802 Phase C diag: dump formals +
+                                    // passed attrs to localize the haskell.nix
+                                    // unexpected-arg-'git' divergence.
+                                    static const bool s_dbgFormals =
+                                        std::getenv("V3_DBG_FORMALS_DIAG") != nullptr;
+                                    if (s_dbgFormals) {
+                                        std::fprintf(stderr,
+                                            "v3 FORMALS-DIAG lambda='%s' "
+                                            "unexpected='%s' ellipsis=0 "
+                                            "passed_attrs=[",
+                                            lambdaName.c_str(), nm.c_str());
+                                        for (uint32_t k = 0; k < b->size && k < 24; ++k) {
+                                            SymbolId sk = b->entries[k].name;
+                                            std::string_view sn = (sk < tbl.size()) ? std::string_view(tbl[sk]) : "?";
+                                            std::fprintf(stderr, "%s%.*s",
+                                                k ? "," : "", (int)sn.size(), sn.data());
+                                        }
+                                        std::fprintf(stderr, "] formals=[");
+                                        for (size_t k = 0; k < desc->formals.size() && k < 24; ++k) {
+                                            SymbolId sk = desc->formals[k].name;
+                                            std::string_view sn = (sk < tbl.size()) ? std::string_view(tbl[sk]) : "?";
+                                            std::fprintf(stderr, "%s%.*s",
+                                                k ? "," : "", (int)sn.size(), sn.data());
+                                        }
+                                        std::fprintf(stderr, "]\n");
+                                        std::fflush(stderr);
+                                    }
                                     throw std::runtime_error(
                                         "function '" + lambdaName
                                         + "' called with unexpected argument '"
