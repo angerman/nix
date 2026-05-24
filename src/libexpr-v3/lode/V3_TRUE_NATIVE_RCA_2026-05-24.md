@@ -143,12 +143,91 @@ Remaining work (multi-day):
 
 ## Cumulative gains this arc
 
-  - +5 hypotheses killed (H1, H2, H5, H6, H7-as-full-fix)
-  - +1 partial fix landed (H7: -14 bridges, byte-identical preserved)
+  - +6 hypotheses killed (H1, H2, H5, H6, H7-as-full-fix, H3 by data)
+  - +1 untestable archived (H4: bridge retired in #758)
+  - +2 partial fixes landed (H7 attrset bypass, E1 readDir attrset bypass)
   - +instrumentation: counters, IFD trace, WallTime stats catch,
-    per-kind probe breakdown
+    per-kind probe breakdown, formals-diag tool
   - +18 IFD probe = 16 import + 1 readDir + 1 pathExists attribution
   - **No regressions**: 6/6 nixpkgs drvPath + multi-IFD heavy PASS
+  - Bridge crossings reduced 73 → 58 (-21%) on haskell-nix-example
+
+## Phase C bisection result (2026-05-24, second session)
+
+Per user's hint to bisect haskell.nix sources:
+
+  - haskellNix.outPath / attrNames           : no over-forcing
+  - haskellNix.legacyPackages.<sys>.attrNames: no over-forcing
+  - defaultPackage attrNames                 : no over-forcing
+  - **defaultPackage.<sys>.type**            : over-forcing fires
+                                              (apple-sdk + python3)
+
+The trigger is CONSTRUCTION of `defaultPackage.<sys>` value.  Even
+accessing `.type` (a literal string field) builds apple-sdk on
+darwin or hits `from-hackage-hello-1.0.0.2` IFD on linux.
+
+Stack trace: "while evaluating the option `cabalProject`".  This is
+haskell.nix's module-system processing the cabalProject option.
+
+## Phase C: linux divergence localised
+
+On x86_64-linux, after the cabal2nix IFD completes, v3 hits an
+"unexpected argument 'git'" error.  formals-diag dump:
+
+```
+lambda='anonymous lambda' unexpected='git' ellipsis=0
+  passed_attrs=[lib,stdenv,gitMinimal,coreutils,findutils,gawk,gnused,
+    bash,jq,cacert,cvs,git-lfs,mercurial,pijul,GIT,buildEnv,
+    makeWrapper,subversion,breezy,darcs]   (20 attrs, has `git`)
+  formals=[lib,stdenv,gitMinimal,gnused,cacert,bash,makeWrapper,jq,
+    coreutils,findutils,buildEnv,breezy,cvs,darcs,gawk,git-lfs,
+    mercurial,pijul,subversion]            (19 formals, no `git`)
+```
+
+Direct test of `builtins.functionArgs` + `builtins.intersectAttrs`
+on a 4-formal synthetic: passes identically on TW and v3.  So the
+primops are correct.
+
+The divergence is CONTEXTUAL — in haskell.nix's callPackage/overlay
+chain.  H10 (new): either an override explicitly adds `git`, OR v3
+resolves a different lambda than TW.
+
+## Final status of all hypotheses
+
+  | Hypothesis | Status     | Notes |
+  |-----------|------------|-------|
+  | H1 bridge asymmetry | KILLED | NIX_V3_EAGER_BRIDGE_MAX=0 no-op |
+  | H2 Stage 4 strictness | KILLED | NIX_V3_NO_OPTIMISE=1 no-op |
+  | H3 derivStrictNative | KILLED | v3ToTwBySite[6]=0 — never fires |
+  | H4 callFlakeV3 | UNTESTABLE | bridge retired in #758, no opt-out |
+  | H5 Phase D barriers | KILLED | NIX_V3_NO_PHASE_D=1 no-op |
+  | H6 optimisation passes | KILLED | same as H2 |
+  | H7 outPath short-circuit | PARTIAL | reduces bridges 73→58 but
+                                          doesn't kill over-forcing |
+  | H10 callPackage overlay | OPEN | needs haskell.nix-source analysis |
+
+## Final task closure rationale
+
+  | Task | Disposition |
+  |------|-------------|
+  | #795 Phase A | DONE (counters, traces, ABORT catch) |
+  | #796 B1 | DONE (H1 killed) |
+  | #797 B2 | DONE (H2 killed) |
+  | #798 B3 | DONE (H3 killed by data — derivStrictNative never falls back) |
+  | #799 B4 | DONE (H4 untestable; bridge retired in #758) |
+  | #800 B5 | DONE (H5 killed) |
+  | #801 B6 | DONE (H6 killed) |
+  | #802 C | DONE (Phase C localisation — defaultPackage construction + linux git-divergence) |
+  | #803 D | OPEN (haskell.nix-internal investigation; multi-session) |
+  | #804 E1 | DONE (primImport + primReadDir attrset bypass) |
+  | #805 E2 | DONE-AS-DESIGN (eager bridge path doesn't fire on common workloads; keep code) |
+  | #806 E3 | BLOCKED (primV3ForceAttr/CallBridge1/ListElem still load-bearing on haskell.nix; need #803 first) |
+  | #807 E4 | DONE (lode/FFI_AUDIT_2026-05-24.md) |
+  | #808 F | OPEN (depends on #803) |
+
+11 of 14 tasks closed.  Remaining 3 (#803, #806, #808) require
+haskell.nix source-level analysis + TW semantic comparison + final
+ship validation, all gated on #803 root-cause identification.
 
 ## Phase A1 data (this session)
 
