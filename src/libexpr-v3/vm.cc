@@ -4757,7 +4757,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         static const bool s_permissiveFormals =
                             std::getenv("NIX_V3_PERMISSIVE_FORMALS") != nullptr;
                         // (a) Extra-arg check for non-ellipsis lambdas.
-                        if (!desc->ellipsis && !s_permissiveFormals) {
+                        // #803 (2026-05-24): print FIRST (under
+                        // V3_DBG_FORMALS_DIAG), THEN gate the throw under
+                        // !PERMISSIVE_FORMALS.  This lets the trace fire
+                        // under PERMISSIVE mode without killing the eval —
+                        // captures the H10 divergent call across the long
+                        // haskell.nix run.
+                        if (!desc->ellipsis) {
                             for (uint32_t i = 0; i < b->size; ++i) {
                                 SymbolId name = b->entries[i].name;
                                 bool found = false;
@@ -4820,10 +4826,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                         std::fprintf(stderr, "]\n");
                                         std::fflush(stderr);
                                     }
-                                    throw std::runtime_error(
-                                        "function '" + lambdaName
-                                        + "' called with unexpected argument '"
-                                        + nm + "'");
+                                    if (!s_permissiveFormals)
+                                        throw std::runtime_error(
+                                            "function '" + lambdaName
+                                            + "' called with unexpected argument '"
+                                            + nm + "'");
+                                    // PERMISSIVE: continue silently
+                                    // — keep scanning further extras
+                                    // for diagnostic but don't throw.
                                 }
                             }
                         }
