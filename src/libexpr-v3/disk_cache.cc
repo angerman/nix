@@ -1,7 +1,7 @@
 /// @file
 /// SQLite-backed disk cache for v3 CompilationUnit blobs.
 ///
-/// Single SQLite DB at `$XDG_CACHE_HOME/nix/v3-bytecode-v1.sqlite`.
+/// Single SQLite DB at `$XDG_CACHE_HOME/nix/v3-bytecode-v2.sqlite`.
 /// Schema mirrors src/libexpr/bytecode-disk-cache.cc and the rest of
 /// nix's caches (libfetchers, nar-info-disk-cache, eval-cache):
 ///
@@ -79,24 +79,36 @@ void sha256(std::string_view data, CacheKey & out)
     std::memcpy(out.bytes, h.hash, 32);
 }
 
+/// Schema with composite (key, schema) primary key.  An earlier
+/// iteration used `key blob primary key`, which had a load-bearing
+/// bug after the schema bump from 10 to 11: every INSERT OR IGNORE
+/// at the new schema for a content hash that already existed at the
+/// old schema was silently ignored (primary-key collision).  The old
+/// row remained, but lookups filter by `key AND schema = ?`, so the
+/// old row never hit.  Result: 0% hit rate after every schema bump
+/// until the user manually purged the DB.  Composite PK lets the new
+/// schema's rows coexist with the old; LRU pruning eventually evicts
+/// the orphans.
 constexpr const char * kSchema = R"sql(
 create table if not exists CompilationUnits (
-    key       blob primary key,
+    key       blob not null,
     blob      blob not null,
     schema    integer not null,
     last_used integer not null,
-    size      integer not null
+    size      integer not null,
+    primary key (key, schema)
 );
 create index if not exists idx_lru on CompilationUnits(last_used);
 -- #741 Phase 5: eval-result cache (drvPath-keyed result attrset blobs).
 -- Mirrors the CompilationUnits shape but uses kEvalResultSchemaVersion
 -- so format changes to one cache don't invalidate the other.
 create table if not exists EvalResults (
-    key       blob primary key,
+    key       blob not null,
     blob      blob not null,
     schema    integer not null,
     last_used integer not null,
-    size      integer not null
+    size      integer not null,
+    primary key (key, schema)
 );
 create index if not exists idx_eval_lru on EvalResults(last_used);
 )sql";
@@ -140,13 +152,23 @@ DbHandle & dbHandle()
 
 /// Compute the database path.  Honours NIX_V3_CACHE_DIR (legacy env
 /// var name from the file-per-key cache) for tests / benchmarks; falls
-/// back to `getCacheDir() / v3-bytecode-v1.sqlite` (XDG-compliant).
+/// back to `getCacheDir() / v3-bytecode-v2.sqlite` (XDG-compliant).
+///
+/// File-name bumped from v1 → v2 in commit 2af711d90's followup
+/// (2026-05-25) when the composite (key, schema) primary-key fix
+/// landed.  SQLite can't ALTER a PRIMARY KEY on an existing table, so
+/// the v1 file remains on disk with the old single-column PK and is
+/// effectively orphaned after the bump.  Users can reclaim disk by
+/// `rm ~/.cache/nix/v3-bytecode-v1.sqlite` once on the new build.
+/// Without this file-name bump, `create table if not exists` would
+/// see the old table and silently leave the wrong PK in place,
+/// reintroducing the 0% hit-rate bug post-schema-bump.
 std::filesystem::path computeDbPath()
 {
     if (const char * override = std::getenv("NIX_V3_CACHE_DIR");
         override && *override)
-        return std::filesystem::path(override) / "v3-bytecode-v1.sqlite";
-    return std::filesystem::path(nix::getCacheDir()) / "v3-bytecode-v1.sqlite";
+        return std::filesystem::path(override) / "v3-bytecode-v2.sqlite";
+    return std::filesystem::path(nix::getCacheDir()) / "v3-bytecode-v2.sqlite";
 }
 
 /// Open + populate prepared statements on first use.  Returns false
