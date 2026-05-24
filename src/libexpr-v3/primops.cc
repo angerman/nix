@@ -3581,14 +3581,55 @@ void primReadDir(EvalState & state, Value * args, Value & out)
             typeError("readDir", "string or path");
         ++allocStats().ifdProbeWithCtx[kIfdReadDir];
         auto & ns = *state.nixEvalState;
-        ++allocStats().v3ToTwBySite[1];  // #795 primReadDir attrset arg
-        nix::Value * tw = v3ToTreeWalker(state, args[0]);
-        if (!tw) typeError("readDir", "string or path");
-        try {
-            auto resolved = ns.realisePath(nix::noPos, *tw);
-            path = resolved.path.abs();
-        } catch (...) {
-            throw;  // surface TW's error verbatim
+        // #804 Phase E1: same v3-native outPath extraction as primImport
+        // (H7 fix).  Bypasses the v3ToTreeWalker bridge cascade for
+        // attrset args; preserves context for realisePath.
+        // Opt-OUT: NIX_V3_NO_NATIVE_READDIR_ATTRSET=1.
+        static const bool s_noNativeReadDirAttrset =
+            std::getenv("NIX_V3_NO_NATIVE_READDIR_ATTRSET") != nullptr;
+        bool tookNativeRDPath = false;
+        if (!s_noNativeReadDirAttrset) {
+            const Bindings * b = args[0].payload.bindings;
+            Value * outPathRef = nullptr;
+            if (b) {
+                static const SymbolId sOutPath = ir::globalInternSymbol("outPath");
+                for (uint32_t i = 0; i < b->size; ++i) {
+                    if (b->entries[i].name == sOutPath) {
+                        outPathRef = const_cast<Value *>(&b->entries[i].value);
+                        break;
+                    }
+                }
+            }
+            if (outPathRef) {
+                try {
+                    Value forced = forceValue(*state.vm, *outPathRef);
+                    if (forced.isString() && forced.payload.str) {
+                        nix::Value twStr;
+                        if (auto * raw = lookupStringContextEntries(forced.payload.str)) {
+                            nix::NixStringContext ctx = decodeStringContext(*raw);
+                            twStr.mkString(forced.payload.str, ctx, ns.mem);
+                        } else {
+                            twStr.mkString(forced.payload.str, ns.mem);
+                        }
+                        auto resolved = ns.realisePath(nix::noPos, twStr);
+                        path = resolved.path.abs();
+                        tookNativeRDPath = true;
+                    }
+                } catch (...) {
+                    tookNativeRDPath = false;
+                }
+            }
+        }
+        if (!tookNativeRDPath) {
+            ++allocStats().v3ToTwBySite[1];  // #795 primReadDir attrset bridge
+            nix::Value * tw = v3ToTreeWalker(state, args[0]);
+            if (!tw) typeError("readDir", "string or path");
+            try {
+                auto resolved = ns.realisePath(nix::noPos, *tw);
+                path = resolved.path.abs();
+            } catch (...) {
+                throw;  // surface TW's error verbatim
+            }
         }
     }
     else typeError("readDir", "string or path");
