@@ -154,18 +154,25 @@ empirically across the full bridge-touching workload set.
 
 ### Separate perf issues identified (follow-on tasks)
 
-  1. **disk_cache hit_rate ≈0%** across runs — keys differ each
-     invocation, or cache isn't persisting reads correctly.  Promise
-     of warm-start speedup not realised today.  Per-process SQLite
-     pool may need round-trip validation.
+  1. **disk_cache hit_rate ≈0%** across runs — root cause IDENTIFIED
+     (`PRIMARY KEY (key)` collides post-schema-bump, INSERT OR
+     IGNORE drops new-schema entries).  Fix prototype landed
+     in `9e09a7e4c` (composite `(key, schema)` PK + v1→v2 path
+     bump) and **showed 42% v3 wall reduction on hello.drvPath
+     warm (2.55× → 1.45× TW)**.  But REVERTED in `eabffba65`
+     because the resulting 100% hit rate exposed a latent
+     **schema-11 deserialize round-trip bug**: firefox.drvPath
+     byte-diverged from TW when v3 loaded a cached schema-11
+     CU.  Hello/bash/gcc/python3 all PASS — firefox-specific
+     CU shape exposes it.  Tracked as **#814**.  Both the PK
+     fix and the perf win re-land once #814 is closed.
   2. **v3 peak RSS = 5.3× TW** on haskell-nix-example.  Bindings is
      the dominant lever (705 MB / 44% of v3_arena).  Stage-4
      strictness + posSnapshotPool sharing + Bindings dedup are
      candidate levers per memory-first-class operating rule.
-  3. **Wall 2.55× TW on hello.drvPath warm** — above the Phase 1 ≤2×
-     target.  Per #777b deserialize breakdown, ~334 ms (26%) of
-     v3 wall is deserialize cost on 270 cached CUs; symbolTable
-     and lambda sections dominate.
+  3. **Wall 2.55× TW on hello.drvPath warm** — still measured today
+     (pending #814 closure).  Lower bound 1.45× achievable once
+     disk_cache works correctly.
 
 ## Status: 2026-05-24 EOD (UPDATED)
 
