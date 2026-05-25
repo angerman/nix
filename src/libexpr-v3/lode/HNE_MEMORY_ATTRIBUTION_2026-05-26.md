@@ -258,6 +258,52 @@ overlay chain depth + parent reuse pattern in actual haskell.nix.)
 
 ## Recommended follow-ups (in NEXT_STEPS terms)
 
+### A1b — pointer-keyed memoisation: **FALSIFIED 2026-05-26**
+
+Cheap precursor spike: thread-local 1024-bucket × 2-way associative
+cache keyed by `(parent_ptr, overlay_ptr)`.  Gated by
+`NIX_V3_MERGE_CACHE=1`.  Pre-committed falsifier: ≥10 % hit rate →
+ship cache; <5 % → fall through to A1a.
+
+Measured:
+
+| Workload | calls | hits | hit-rate | bytes saved |
+|---|---|---|---|---|
+| hello.drvPath | 22,482 | **0** | **0.0 %** | 0.0 MB |
+| HNE .hello.drvPath | 118,327 | **38** | **0.03 %** | 19.0 MB / 527.8 MB total |
+
+**Why it failed (post-hoc reasoning):**
+
+v3's evaluation model memoises thunk results.  When `prev // overlay`
+is evaluated inside a thunk, the FIRST force computes the merge once
+and OP_RETURN updates the thunk's `evaluated` field.  EVERY subsequent
+access to that thunk returns the memoised `Value` directly — without
+re-entering OP_ATTRS_UPDATE_TAIL.  So mergeBindings fires AT MOST
+ONCE per syntactic `//` location in the program.  The cache key
+`(a_ptr, b_ptr)` would need the SAME pointer pair to recur, but each
+re-entry into a `//` thunk produces FRESH pointers because each
+inner thunk body's value bindings are fresh.
+
+For pointer-keyed memoisation to work, we'd need either:
+1. Multiple syntactic `//` sites producing identical `(a_ptr, b_ptr)`
+   pairs.  Rare in nixpkgs / haskell.nix — most `//` sites are
+   distinct.
+2. A re-evaluation pattern that bypasses thunk memoisation.  Doesn't
+   exist in correct Nix.
+
+A **content-keyed** memo (hash by entries' (name, value) pairs) might
+work in principle but the hashing cost would dominate the merge cost
+itself — net negative.
+
+**Decision:** revert the cache implementation (the 48 KB thread-local
+storage + per-call branch + counters are pure overhead with this hit
+rate).  Keep the per-site call/byte counters from #821 — those remain
+useful for A1a.
+
+**ChainBindings (A1a) is now the only viable lever**, not an
+optional precursor.  Expected recovery range unchanged from initial
+estimate: 200 MB - 1 GB on HNE.
+
 ### A1a — ChainBindings spike (next session, 2-3 days)
 
 Per the per-site data above, the architectural pattern is justified.
