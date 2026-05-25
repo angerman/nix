@@ -8,8 +8,8 @@
 #    install or reverts the App-chain emit).
 set -euo pipefail
 
-NIX="${NIX:-./build/src/nix/nix}"
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+NIX="${NIX:-$ROOT/build/src/nix/nix}"
 FIXTURE="$(cd "$(dirname "$0")" && pwd)/repro-stream-fusion.nix"
 
 if [ ! -x "$NIX" ]; then

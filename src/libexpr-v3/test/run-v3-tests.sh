@@ -8,7 +8,8 @@
 
 set -u
 
-BUILD="${BUILD:-./build}"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+BUILD="${BUILD:-$ROOT/build}"
 V3="${V3:-$BUILD/src/libexpr-v3/v3-eval}"
 TW="${TW:-$BUILD/src/nix/nix}"
 

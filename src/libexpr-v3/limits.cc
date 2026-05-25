@@ -525,7 +525,7 @@ void initLimits()
                 // requested cap exceeds the inherited hard limit.
                 // The SIGALRM watchdog below covers both cases.
                 std::fprintf(stderr,
-                    "v3 limits: setrlimit(RLIMIT_AS, %llu) failed (%s); "
+                    "warning: v3 limits: setrlimit(RLIMIT_AS, %llu) failed (%s); "
                     "relying on SIGALRM watchdog\n",
                     (unsigned long long)rl.rlim_cur,
                     std::strerror(errno));
@@ -537,7 +537,7 @@ void initLimits()
             installRssWatchdog(*bytes);
         } else {
             std::fprintf(stderr,
-                "v3 limits: NIX_V3_MAX_HEAP='%s' is not a valid size "
+                "warning: v3 limits: NIX_V3_MAX_HEAP='%s' is not a valid size "
                 "(expected NUMBER[K|M|G][B]); cap disabled\n", v);
         }
     }
@@ -551,7 +551,7 @@ void initLimits()
             st.maxCpuTime = *d;
         } else {
             std::fprintf(stderr,
-                "v3 limits: NIX_V3_MAX_CPU_TIME='%s' is not a valid duration "
+                "warning: v3 limits: NIX_V3_MAX_CPU_TIME='%s' is not a valid duration "
                 "(expected NUMBER[s|m|h]); cap disabled\n", v);
         }
     }
@@ -564,7 +564,7 @@ void initLimits()
             st.maxWallTime = *d;
         } else {
             std::fprintf(stderr,
-                "v3 limits: NIX_V3_MAX_WALL_TIME='%s' is not a valid duration "
+                "warning: v3 limits: NIX_V3_MAX_WALL_TIME='%s' is not a valid duration "
                 "(expected NUMBER[s|m|h]); cap disabled\n", v);
         }
     }

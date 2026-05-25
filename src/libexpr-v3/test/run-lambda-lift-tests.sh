@@ -9,7 +9,8 @@
 #    actually fires.  We use v3-smoke-style alloc dump comparison.
 set -euo pipefail
 
-NIX="${NIX:-./build/src/nix/nix}"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+NIX="${NIX:-$ROOT/build/src/nix/nix}"
 FIXTURE="$(cd "$(dirname "$0")" && pwd)/repro-lambda-lift.nix"
 
 if [ ! -x "$NIX" ]; then
@@ -94,11 +95,11 @@ if env NIX_V3_DIRECT_EVAL=1 "$NIX" $NIX_FLAGS eval --impure \
     # is its own runRootExpr that emits a stats line of its own).
     on_closures=$(env NIX_V3_DIRECT_EVAL=1 NIX_VM_STATS=1 \
         "$NIX" $NIX_FLAGS eval --impure --expr "$expr" 2>&1 \
-        | grep -oE 'closures=[0-9]+' | tail -1 | sed 's/closures=//')
+        | grep -oE 'closures=[0-9]+ ' | tail -1 | sed 's/closures=//')
     off_closures=$(env NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_LAMBDA_LIFT=1 \
         NIX_VM_STATS=1 \
         "$NIX" $NIX_FLAGS eval --impure --expr "$expr" 2>&1 \
-        | grep -oE 'closures=[0-9]+' | tail -1 | sed 's/closures=//')
+        | grep -oE 'closures=[0-9]+ ' | tail -1 | sed 's/closures=//')
 
     if [ -z "$on_closures" ] || [ -z "$off_closures" ]; then
         echo "WARN: could not parse closures= from V3_DBG_ALLOC_DUMP output"
