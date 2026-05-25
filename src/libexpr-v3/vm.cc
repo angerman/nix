@@ -1085,9 +1085,15 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // they shift the workload.  Bucket via a small switch (5 cmps
     // avg) — negligible cost compared to the merge itself.
     if (siteId == MergeBindingsSite::AttrsUpdateTail) {
+        // #821 follow-on: split the 0..1 bucket into nb=0 (short-
+        // circuit) vs nb=1 (single-key patch).  The two have very
+        // different optimisation implications: nb=0 is already free
+        // (just return parent), while nb=1 is the canonical "single-
+        // attr override" pattern where a smart patched representation
+        // could amortise parent copy.
         auto bucket_of = [](uint32_t n) -> uint8_t {
-            if (n <= 1)   return 0;   // 0..1
-            if (n == 2)   return 1;
+            if (n == 0)   return 0;   // nb=0 — short-circuit
+            if (n == 1)   return 1;   // nb=1 — single-key patch
             if (n <= 4)   return 2;
             if (n <= 8)   return 3;
             if (n <= 16)  return 4;

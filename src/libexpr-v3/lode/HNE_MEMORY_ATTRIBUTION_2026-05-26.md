@@ -88,7 +88,66 @@ OP_ATTRS_UPDATE_TAIL instead.  Two implications:
 2. The 98.3 % site-1 concentration is real: there is no alternate
    path siphoning load off the bytecode UPDATE_TAIL today.
 
-### Input-size histograms for site 1 (UPDATE_TAIL)
+### Cross-workload confirmation (hello.drvPath)
+
+The 99 %-concentration pattern at site 1 replicates on the simpler
+hello.drvPath workload:
+
+```
+mergeBindings by site (25,689 calls, 363 MB):
+  [0] OP_ATTRS_UPDATE      (//)        2.3 MB    0.6 %
+  [1] OP_ATTRS_UPDATE_TAIL (//)      360.8 MB   99.4 %  ←
+```
+
+hello.drvPath na distribution (post-refinement: nb=0 and nb=1 split out
+of the original 0..1 bucket so short-circuit calls are distinguishable):
+
+```
+  na 0        =  676   (3.2 %)   ← short-circuit, no bytes
+  na 1        = 1064   (5.0 %)
+  na 2-4      = 2941   (13.8 %)
+  na 5-8      = 1843   (8.6 %)
+  na 9-16     = 1360   (6.4 %)
+  na 17-32    = 1865   (8.7 %)
+  na 33-64    = 5240   (24.6 %)   ← overlays on pkgs-subset
+  na 65-128   = 1233   (5.8 %)
+  na 129-256  =  226   (1.1 %)
+  na 257+     = 4895   (23.0 %)   ← MAIN MEMORY DRIVER
+```
+
+```
+  nb 0        = 1870   (8.8 %)
+  nb 1        = 7883   (37.0 %)   ← single-key overlays
+  nb 2-4      = 5439   (25.5 %)
+  nb 5-8      = 2574   (12.1 %)
+  nb 9-16     = 1011   (4.7 %)
+  nb 17-32    = 1612   (7.6 %)
+  nb 33-64    =  587   (2.8 %)
+  nb 65-128   =  132   (0.6 %)
+  nb 129-256  =   96   (0.5 %)
+  nb 257+     =  139   (0.7 %)
+```
+
+**Key cross-check insight**: 4,895 UPDATE_TAIL calls (23 %) have
+parent ≥ 257 entries.  If avg parent in that bucket is ~1,500 entries:
+
+  4,895 calls × 1,500 entries × 24 B/entry = ~177 MB
+
+That's the bulk of the 360.8 MB on hello.drvPath.  Plus the 1,233
+na=65-128 calls and 226 na=129-256, the large-parent tail explains
+≥ 200 MB of the site-1 footprint.
+
+ChainBindings would replace the per-merge parent copy (24 × na bytes)
+with a parent-pointer reference (8 B).  For the 4,895 na=257+ calls
+alone, savings:
+
+  4,895 × (1,500 entries × 24 B − 8 B pointer) ≈ 177 MB
+
+That alone is a 49 % cut in mergeBindings bytes on hello.drvPath.
+Apply to HNE's larger workload: 546.7 MB → an estimated ~280-350 MB
+recovery is plausible.  Falsifier band [200 MB, 1 GB] looks attainable.
+
+### Input-size histograms for site 1 (UPDATE_TAIL) — HNE workload
 
 The histograms below cover **all 104,521** UPDATE_TAIL calls (matches
 the call count exactly):

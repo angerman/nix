@@ -438,7 +438,7 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             }
             if (naTotal > 0 || nbTotal > 0) {
                 const char * labels[10] = {
-                    "0..1", "2", "3-4", "5-8", "9-16",
+                    "0", "1", "2-4", "5-8", "9-16",
                     "17-32", "33-64", "65-128", "129-256", "257+"};
                 std::fprintf(stderr,
                     "  (UPDATE_TAIL na histogram, total=%llu):\n",
