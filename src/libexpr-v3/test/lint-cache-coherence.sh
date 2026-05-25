@@ -129,17 +129,35 @@ schema_bumped_or_exempt() {
   if diff_cmd "$SERIALIZE_HH" \
      | grep -qE '^\+[[:space:]]*constexpr[[:space:]]+uint32_t[[:space:]]+kSchemaVersion[[:space:]]*=[[:space:]]*[0-9]+'
   then return 0; fi
-  # Any explicit "CACHE-COHERENCE-EXEMPT" marker anywhere in the diff
-  # (rare; refactor exemption).  We look in the entire diff, not just
-  # serialize.hh, since the marker would normally live in the commit
-  # message — but pre-commit hooks don't see the message yet, so we
-  # accept it inline as well (in a // comment line, for instance).
+  # Exempt marker.  Two acceptance patterns:
+  #   (a) commit log body contains a line starting with the marker
+  #       (CI mode, range given) — the developer explicitly opted out
+  #       in the commit message body.
+  #   (b) a NEWLY-ADDED line in the diff that starts with `//
+  #       CACHE-COHERENCE-EXEMPT:` (pre-commit mode) — placed in the
+  #       commit's own diff as a self-documenting marker, e.g., above
+  #       the refactor.
+  # The pattern is anchored against pre-existing text containing the
+  # string (e.g., this lint's own error message or doc comments that
+  # mention the marker as documentation).
   if [[ -n "$RANGE" ]]; then
-    git log "$RANGE" --format=%B 2>/dev/null | grep -q 'CACHE-COHERENCE-EXEMPT:' && return 0
-    git diff "$RANGE" 2>/dev/null | grep -q 'CACHE-COHERENCE-EXEMPT:' && return 0
+    if git log "$RANGE" --format=%B 2>/dev/null \
+       | grep -qE '^[[:space:]]*CACHE-COHERENCE-EXEMPT:'; then
+      return 0
+    fi
+    if git diff "$RANGE" 2>/dev/null \
+       | grep -qE '^\+[[:space:]]*(//[[:space:]]*)?CACHE-COHERENCE-EXEMPT:'; then
+      return 0
+    fi
   else
-    git diff --cached 2>/dev/null | grep -q 'CACHE-COHERENCE-EXEMPT:' && return 0
-    git diff         2>/dev/null | grep -q 'CACHE-COHERENCE-EXEMPT:' && return 0
+    if git diff --cached 2>/dev/null \
+       | grep -qE '^\+[[:space:]]*(//[[:space:]]*)?CACHE-COHERENCE-EXEMPT:'; then
+      return 0
+    fi
+    if git diff 2>/dev/null \
+       | grep -qE '^\+[[:space:]]*(//[[:space:]]*)?CACHE-COHERENCE-EXEMPT:'; then
+      return 0
+    fi
   fi
   return 1
 }
@@ -158,17 +176,65 @@ report_violation() {
 # LambdaDescriptor` body.  Heuristic: hunks whose @@ context line
 # mentions `LambdaDescriptor`, AND added/removed lines that look like
 # field declarations (a type token + identifier + `;`).
+#
+# Pair `+`/`-` lines and strip the trailing `// comment` portion before
+# comparing.  Lines that differ ONLY in the trailing comment (rephrasing,
+# adding context) are NOT considered field churn — the binary layout
+# is unaffected.  Pairing keeps Rule 1 actionable (false positives on
+# pure comment edits within a field line block were causing churn).
 ld_field_pattern='^[+-]([[:space:]]*(uint[0-9]+_t|int[0-9]+_t|bool|char|std::string|std::vector|mutable|uint8_t|uint16_t|uint32_t|uint64_t|int8_t|int16_t|int32_t|int64_t|size_t|PosIdx32|SymbolId|const)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*(=[^;]+)?;)|(^[+-][[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{[^;]*\}[[:space:]]*;)'
 
-ld_diff="$(diff_in_body "$CLOSURE_HH" "LambdaDescriptor" \
-            | grep -E "$ld_field_pattern" || true)"
+# Strip leading `+`/`-` and the trailing `// ...` (preserving the
+# code portion of the field declaration).  The trailing comment is
+# format-irrelevant: it doesn't change the on-disk byte layout.
+strip_code_portion() {
+  # `sed` is portable enough; awk would also do.
+  sed -E 's|^[+-]||; s|//.*$||; s|[[:space:]]+$||'
+}
 
-if [[ -n "$ld_diff" ]]; then
+# Filter `ld_field_pattern`-matching lines and ELIMINATE pairs that
+# differ only in trailing comments.  Implemented in awk: bucket each
+# pair by their code-portion, count `+`/`-`; a balanced pair (one `-`,
+# one `+` with the same code portion) is a comment-only change and
+# must NOT fire Rule 1.
+ld_diff_raw="$(diff_in_body "$CLOSURE_HH" "LambdaDescriptor" \
+                | grep -E "$ld_field_pattern" || true)"
+
+ld_diff_real=""
+if [[ -n "$ld_diff_raw" ]]; then
+  ld_diff_real="$(printf '%s\n' "$ld_diff_raw" \
+    | awk '
+      {
+        sign = substr($0, 1, 1)
+        rest = $0
+        sub(/^[+-]/, "", rest)
+        # Strip trailing `// ...` comment + trailing whitespace.
+        sub(/\/\/.*$/, "", rest)
+        sub(/[[:space:]]+$/, "", rest)
+        key = rest
+        if (sign == "+") plus[key]++
+        else if (sign == "-") minus[key]++
+        order[NR] = $0
+        idx[NR] = key
+        sign_of[NR] = sign
+      }
+      END {
+        for (i = 1; i <= NR; ++i) {
+          k = idx[i]
+          # Comment-only change: code portion exists on BOTH sides.
+          if (plus[k] > 0 && minus[k] > 0) continue
+          print order[i]
+        }
+      }
+    ')"
+fi
+
+if [[ -n "$ld_diff_real" ]]; then
   if ! schema_bumped_or_exempt; then
     report_violation "Rule 1" \
       "LambdaDescriptor body in closure.hh has added/removed field-like lines but the same diff does not bump kSchemaVersion in serialize.hh. If this is a pure refactor with no on-disk format change, add 'CACHE-COHERENCE-EXEMPT: <reason>' to the commit message body."
     echo "  Offending lines (sample):" >&2
-    echo "$ld_diff" | head -5 | sed 's/^/    /' >&2
+    echo "$ld_diff_real" | head -5 | sed 's/^/    /' >&2
   fi
 fi
 
