@@ -143,6 +143,7 @@ if [[ "$mode" == "core" || "$mode" == "full" || "$mode" == "brute" ]]; then
   SUITES+=( "property|58 primop categories × 10 cases|$PROPERTY_DIR/run-property-tests.sh" )
   SUITES+=( "let-rec-publish|#546 OP_ATTRS_REC_INIT split regression|NIX=$NIX $TEST_DIR/run-let-rec-publish-split-tests.sh" )
   SUITES+=( "583-tag-app-cache|mapAttrs-style App cache regression|$TEST_DIR/run-583-tag-app-cache-tests.sh" )
+  SUITES+=( "815-cross-workload-cache|#815 cross-workload disk-cache (path collision + formals round-trip)|NIX=$NIX $TEST_DIR/run-815-cross-workload-cache-tests.sh" )
   # broader-thunkify: NOT included in core — the test still uses the
   # retired NIX_USE_V3=1 cutover hook (deleted in e8d7c3885) and pins
   # the pre-#497 failure mode behind NIX_V3_NO_COMPLEX_FROM_THUNK=1, a
