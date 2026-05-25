@@ -7926,10 +7926,51 @@ void primImport(EvalState & state, Value * args, Value & out)
         // post-default.nix rewriting), not the raw input path.  Symlink
         // retargeting + dir/default.nix selection both invalidate
         // correctly because the read path changes the hash input.
+        //
+        // #815 RCA fix (Light variant, 2026-05-25): ALSO mix the resolved
+        // source PATH into the key.  Two store paths can hold identical
+        // file content (e.g., the same nixpkgs checkout copied into two
+        // /nix/store/<hash>-source entries — common when a workload
+        // pins nixpkgs via flake.lock and another workload uses a
+        // separate getFlake "nixpkgs" snapshot).  Path-literals in the
+        // source (`./foo.patch`) are RESOLVED AT COMPILE TIME against
+        // the containing file's directory and baked into the bytecode
+        // as absolute store paths.  Identical-content files at different
+        // directories therefore produce DIFFERENT BYTECODE — but with
+        // content-only keying they collide in the cache, and a cache
+        // HIT on one workload's CU is incorrect when loaded under the
+        // other workload's path resolution.
+        //
+        // The observed symptom (haskell-nix-example after a 5-pkg
+        // nixpkgs sweep) was a cache HIT on jq/package.nix producing
+        // path strings pointing at the sweep's nixpkgs store path
+        // (`/nix/store/77db...`) while HNE's evaluator expected the
+        // path-literals to resolve under HNE's nixpkgs store path
+        // (`/nix/store/lsdw...`).  The mismatch propagated into a
+        // call-site argument list and surfaced as "function called
+        // with unexpected argument 'git'" several files later.
+        //
+        // The cache itself is still content-addressed for the bulk
+        // of CUs (same path → same key); we only invalidate when the
+        // path differs.  This is the correct behaviour: bytecode is
+        // path-dependent today, so cache key must be too.
         auto tKey = impStamp();
         try {
             std::string content = resolvedSp.resolveSymlinks().readFile();
-            diskKey = disk_cache::computeKeyForString(content);
+            // Mix in the resolved source path's string representation
+            // (post-symlink-resolve, so a symlink retargeting still
+            // produces the same key as the symlink target).  We use a
+            // length-prefixed concatenation so distinct (path, content)
+            // pairs cannot alias into the same hash input.
+            std::string pathStr = resolvedSp.resolveSymlinks().path.abs();
+            std::string keyBytes;
+            keyBytes.reserve(pathStr.size() + content.size() + sizeof(uint64_t));
+            const uint64_t pathLen = pathStr.size();
+            keyBytes.append(reinterpret_cast<const char *>(&pathLen),
+                            sizeof(pathLen));
+            keyBytes.append(pathStr);
+            keyBytes.append(content);
+            diskKey = disk_cache::computeKeyForString(keyBytes);
         } catch (...) {
             // Read failure -> empty key -> cache lookup is skipped,
             // and no insert happens later.  Same fallback as before.
@@ -8025,23 +8066,107 @@ void primImport(EvalState & state, Value * args, Value & out)
                             // DIFFERENT named bindings, that's the bug.
                             size_t nameDiffs = 0;
                             size_t firstNameDiff = SIZE_MAX;
+                            // #815 follow-on: NAME equality is necessary
+                            // but NOT sufficient — many lambdas share
+                            // names ("<thunk>", "<formals>", etc.).  Two
+                            // cu.lambdas[K] entries with the same name
+                            // can differ in nUpvalues / nLocals /
+                            // hasFormals / ellipsis / formals.size() /
+                            // formals[].name — those are STRUCTURAL
+                            // mismatches that prove FuncIds map to
+                            // DIFFERENT source entities cross-process.
+                            // Track per-field diff counters.
+                            size_t sigDiffs = 0, formalCountDiffs = 0,
+                                   formalNameDiffs = 0, nUpvDiffs = 0,
+                                   nLocDiffs = 0, hasFormalsDiffs = 0,
+                                   ellipsisDiffs = 0;
+                            size_t firstSigDiff = SIZE_MAX;
                             size_t minLam = std::min(cu1.lambdas.size(),
                                                      cu2.lambdas.size());
+                            // #815: cu.symbolTable is left EMPTY post-#781b
+                            // (both serialize and emit no longer populate
+                            // it; runtime reads names from the v3 global
+                            // symbol table directly).  So resolve names
+                            // through the GLOBAL table — after remap on
+                            // the deserialize side, every SymbolId in
+                            // cu1's structures is a valid reader-process
+                            // global SymbolId.  cu2 (fresh compiled in the
+                            // same reader process) is likewise indexed
+                            // into the global table.
+                            const auto & gst = nix::v3::ir::globalSymbolTable();
+                            auto symName = [&](const v3::CompilationUnit & cu,
+                                               uint32_t sid) -> const char * {
+                                (void)cu;
+                                if (sid < gst.size())
+                                    return gst[sid].c_str();
+                                return "<oor>";
+                            };
                             for (size_t i = 0; i < minLam; ++i) {
-                                if (cu1.lambdas[i].name != cu2.lambdas[i].name) {
+                                const auto & la = cu1.lambdas[i];
+                                const auto & lb = cu2.lambdas[i];
+                                if (la.name != lb.name) {
                                     if (firstNameDiff == SIZE_MAX) firstNameDiff = i;
                                     nameDiffs++;
+                                }
+                                bool thisSigDiff = false;
+                                if (la.nUpvalues != lb.nUpvalues) { nUpvDiffs++; thisSigDiff = true; }
+                                if (la.nLocals != lb.nLocals)     { nLocDiffs++; thisSigDiff = true; }
+                                if (la.hasFormals != lb.hasFormals){ hasFormalsDiffs++; thisSigDiff = true; }
+                                if (la.ellipsis != lb.ellipsis)   { ellipsisDiffs++; thisSigDiff = true; }
+                                if (la.formals.size() != lb.formals.size()) {
+                                    formalCountDiffs++; thisSigDiff = true;
+                                } else {
+                                    // Same formal count — compare each formal name via
+                                    // the per-process symbolTable (NOT raw SymbolId,
+                                    // which is process-local).
+                                    bool posOrderDiff = false;
+                                    for (size_t fi = 0; fi < la.formals.size(); ++fi) {
+                                        const char * an = symName(cu1, la.formals[fi].name);
+                                        const char * bn = symName(cu2, lb.formals[fi].name);
+                                        if (std::strcmp(an, bn) != 0) {
+                                            posOrderDiff = true;
+                                            break;
+                                        }
+                                    }
+                                    if (posOrderDiff) {
+                                        // ORDER differs.  Check whether the SET still matches.
+                                        std::vector<std::string> aSet, bSet;
+                                        aSet.reserve(la.formals.size());
+                                        bSet.reserve(lb.formals.size());
+                                        for (auto & f : la.formals) aSet.emplace_back(symName(cu1, f.name));
+                                        for (auto & f : lb.formals) bSet.emplace_back(symName(cu2, f.name));
+                                        std::sort(aSet.begin(), aSet.end());
+                                        std::sort(bSet.begin(), bSet.end());
+                                        if (aSet != bSet) {
+                                            formalNameDiffs++; thisSigDiff = true;
+                                        }
+                                        // If set matches but order differs, it's
+                                        // benign (linear-search validation works).
+                                        // Still record as a SOFT diff for visibility.
+                                        else {
+                                            // ORDER-ONLY diff — log but don't count
+                                            // as a structural sig diff.
+                                        }
+                                    }
+                                }
+                                if (thisSigDiff) {
+                                    sigDiffs++;
+                                    if (firstSigDiff == SIZE_MAX) firstSigDiff = i;
                                 }
                             }
                             std::fprintf(vf, "VERIFY path=%s code=%s "
                                 "(cached=%zu fresh=%zu) lambdas=%s "
-                                "(cached=%zu fresh=%zu) name_diffs=%zu/%zu",
+                                "(cached=%zu fresh=%zu) name_diffs=%zu/%zu "
+                                "sig_diffs=%zu (nUpv=%zu nLoc=%zu hasFormals=%zu "
+                                "ellipsis=%zu formalCount=%zu formalName=%zu)",
                                 path.c_str(),
                                 sameCode ? "SAME" : "DIFF",
                                 cu1.code.size(), cu2.code.size(),
                                 sameLambdas ? "SAME" : "DIFF",
                                 cu1.lambdas.size(), cu2.lambdas.size(),
-                                nameDiffs, minLam);
+                                nameDiffs, minLam,
+                                sigDiffs, nUpvDiffs, nLocDiffs, hasFormalsDiffs,
+                                ellipsisDiffs, formalCountDiffs, formalNameDiffs);
                             if (firstNameDiff != SIZE_MAX) {
                                 std::fprintf(vf,
                                     " (first name diff at fid=%zu: cached='%s' fresh='%s')",
@@ -8049,10 +8174,79 @@ void primImport(EvalState & state, Value * args, Value & out)
                                     cu1.lambdas[firstNameDiff].name.c_str(),
                                     cu2.lambdas[firstNameDiff].name.c_str());
                             }
-                            std::fprintf(vf, " ints=%zu/%zu strs=%zu/%zu prims=%zu/%zu\n",
+                            if (firstSigDiff != SIZE_MAX) {
+                                const auto & la = cu1.lambdas[firstSigDiff];
+                                const auto & lb = cu2.lambdas[firstSigDiff];
+                                std::fprintf(vf,
+                                    " (first sig diff at fid=%zu name=cached'%s'/fresh'%s' "
+                                    "nUpv=%u/%u nLoc=%u/%u hasFormals=%u/%u "
+                                    "ellipsis=%u/%u formals=%zu/%zu)",
+                                    firstSigDiff,
+                                    la.name.c_str(), lb.name.c_str(),
+                                    (unsigned)la.nUpvalues, (unsigned)lb.nUpvalues,
+                                    (unsigned)la.nLocals,   (unsigned)lb.nLocals,
+                                    (unsigned)la.hasFormals,(unsigned)lb.hasFormals,
+                                    (unsigned)la.ellipsis,  (unsigned)lb.ellipsis,
+                                    la.formals.size(),      lb.formals.size());
+                                // If formal counts match, dump per-formal name diff.
+                                if (la.formals.size() == lb.formals.size()) {
+                                    for (size_t fi = 0; fi < la.formals.size(); ++fi) {
+                                        const char * an = symName(cu1, la.formals[fi].name);
+                                        const char * bn = symName(cu2, lb.formals[fi].name);
+                                        if (std::strcmp(an, bn) != 0) {
+                                            std::fprintf(vf,
+                                                " formal[%zu]: cached='%s' fresh='%s'",
+                                                fi, an, bn);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            // #815 deeper: compare CONTENTS (not just
+                            // counts) of constant pools.  Order matters
+                            // because OP_LIT_STR / OP_LIT_INT_BIG /
+                            // OP_LIT_FLOAT / OP_CALL_PRIMOP use the
+                            // index into the pool as the operand.  Pool
+                            // order is determined by emit-encounter
+                            // order; if any process-local data influences
+                            // the encounter order (Map iteration, etc.),
+                            // pools diverge.
+                            bool sameStrs = (cu1.stringConstants == cu2.stringConstants);
+                            bool sameInts = (cu1.intConstants == cu2.intConstants);
+                            bool sameFloats = (cu1.floatConstants == cu2.floatConstants);
+                            bool samePrims = (cu1.primops.size() == cu2.primops.size());
+                            if (samePrims) {
+                                for (size_t pi = 0; pi < cu1.primops.size(); ++pi) {
+                                    if (cu1.primops[pi] != cu2.primops[pi]) {
+                                        samePrims = false; break;
+                                    }
+                                }
+                            }
+                            std::fprintf(vf, " ints=%zu/%zu(%s) strs=%zu/%zu(%s) "
+                                "floats=%zu/%zu(%s) prims=%zu/%zu(%s)\n",
                                 cu1.intConstants.size(), cu2.intConstants.size(),
+                                sameInts ? "SAME" : "DIFF",
                                 cu1.stringConstants.size(), cu2.stringConstants.size(),
-                                cu1.primops.size(), cu2.primops.size());
+                                sameStrs ? "SAME" : "DIFF",
+                                cu1.floatConstants.size(), cu2.floatConstants.size(),
+                                sameFloats ? "SAME" : "DIFF",
+                                cu1.primops.size(), cu2.primops.size(),
+                                samePrims ? "SAME" : "DIFF");
+                            if (!sameStrs) {
+                                // Dump first stringConstant diff.
+                                size_t minS = std::min(cu1.stringConstants.size(),
+                                                       cu2.stringConstants.size());
+                                for (size_t si = 0; si < minS; ++si) {
+                                    if (cu1.stringConstants[si] != cu2.stringConstants[si]) {
+                                        std::fprintf(vf,
+                                            "  first string diff at idx=%zu: cached='%.80s' fresh='%.80s'\n",
+                                            si,
+                                            cu1.stringConstants[si].c_str(),
+                                            cu2.stringConstants[si].c_str());
+                                        break;
+                                    }
+                                }
+                            }
                             if (!sameCode) {
                                 size_t minN = std::min(cu1.code.size(), cu2.code.size());
                                 size_t firstDiff = SIZE_MAX;
@@ -8083,6 +8277,159 @@ void primImport(EvalState & state, Value * args, Value & out)
                                     disassembleWindow(vf, cu1, lo, hiC);
                                     std::fprintf(vf, "  fresh-disasm [%u..%u]:\n", lo, hiF);
                                     disassembleWindow(vf, cu2, lo, hiF);
+                                }
+                                // #815 deep walker: classify the diff bytes
+                                // as SymbolId-only (benign — global symbol
+                                // table permuted) vs SEMANTIC (different
+                                // names / operands at the same offset).
+                                // Walks both code streams in lock-step
+                                // through the same OP_* dispatcher used by
+                                // remapSymbolsInBytecode.
+                                if (cu1.code.size() == cu2.code.size()) {
+                                    size_t opDiffs = 0;        // opcode itself differs
+                                    size_t symIdDiffs = 0;     // SymbolId VALUES differ but string matches
+                                    size_t symStrDiffs = 0;    // SymbolId-resolved STRINGS differ
+                                    size_t otherDiffs = 0;     // non-SymbolId operand diffs
+                                    size_t firstSymStrDiff = SIZE_MAX;
+                                    uint32_t firstSymStrA = 0, firstSymStrB = 0;
+                                    auto resolve = [&](uint32_t sid) -> std::string {
+                                        if (sid < gst.size()) return gst[sid];
+                                        return std::string("<sid?") + std::to_string(sid) + ">";
+                                    };
+                                    auto compareSymOperand = [&](size_t ip, uint32_t a, uint32_t b) {
+                                        if (a == b) return;
+                                        std::string sa = resolve(a);
+                                        std::string sb = resolve(b);
+                                        if (sa != sb) {
+                                            ++symStrDiffs;
+                                            if (firstSymStrDiff == SIZE_MAX) {
+                                                firstSymStrDiff = ip;
+                                                firstSymStrA = a;
+                                                firstSymStrB = b;
+                                            }
+                                        } else {
+                                            ++symIdDiffs;
+                                        }
+                                    };
+                                    size_t ipA = 0, ipB = 0;
+                                    const size_t N = cu1.code.size();
+                                    size_t firstOpDiffIp = SIZE_MAX;
+                                    Op firstOpDiffA = OP_HALT, firstOpDiffB = OP_HALT;
+                                    while (ipA < N && ipB < N) {
+                                        uint32_t wA = cu1.code[ipA], wB = cu2.code[ipB];
+                                        Op opA = decodeOp(wA), opB = decodeOp(wB);
+                                        uint32_t arA = decodeOperand(wA), arB = decodeOperand(wB);
+                                        if (opA != opB) {
+                                            ++opDiffs;
+                                            firstOpDiffIp = ipA;
+                                            firstOpDiffA = opA; firstOpDiffB = opB;
+                                            // give up on this stream — opcodes
+                                            // diverged, can't continue lock-step.
+                                            break;
+                                        }
+                                        ipA++; ipB++;
+                                        // Mirror remapSymbolsInBytecode's logic
+                                        // for which operands are SymbolIds.
+                                        #pragma GCC diagnostic push
+                                        #pragma GCC diagnostic ignored "-Wswitch-enum"
+                                        switch (opA) {
+                                        case OP_ATTRS_HAS:
+                                        case OP_WITH_LOOKUP:
+                                            compareSymOperand(ipA - 1, arA, arB);
+                                            break;
+                                        case OP_ATTRS_SELECT:
+                                            compareSymOperand(ipA - 1, arA, arB);
+                                            ipA++; ipB++;  // IC follow-up
+                                            break;
+                                        case OP_REC_BINDING_SLOT_REF:
+                                            compareSymOperand(ipA - 1, arA, arB);
+                                            ipA++; ipB++;  // IC follow-up
+                                            break;
+                                        case OP_ATTRS_INIT: {
+                                            uint32_t n = arA;
+                                            for (uint32_t i = 0; i < n; ++i) {
+                                                if (ipA < N && ipB < N)
+                                                    compareSymOperand(ipA, cu1.code[ipA], cu2.code[ipB]);
+                                                // skip pos
+                                                if (ipA + 1 < N && ipB + 1 < N
+                                                    && cu1.code[ipA + 1] != cu2.code[ipB + 1])
+                                                    ++otherDiffs;
+                                                ipA += 2; ipB += 2;
+                                            }
+                                            break;
+                                        }
+                                        case OP_ATTRS_INIT_DYN: {
+                                            uint32_t nStatic = (arA >> 12) & 0xFFFu;
+                                            uint32_t nDyn    =  arA        & 0xFFFu;
+                                            for (uint32_t i = 0; i < nStatic; ++i) {
+                                                if (ipA < N && ipB < N)
+                                                    compareSymOperand(ipA, cu1.code[ipA], cu2.code[ipB]);
+                                                if (ipA + 1 < N && ipB + 1 < N
+                                                    && cu1.code[ipA + 1] != cu2.code[ipB + 1])
+                                                    ++otherDiffs;
+                                                ipA += 2; ipB += 2;
+                                            }
+                                            ipA += nDyn; ipB += nDyn;
+                                            break;
+                                        }
+                                        case OP_ATTRS_REC_INIT:
+                                        case OP_ATTRS_LET_REC_INIT:
+                                        case OP_ATTRS_REC_INIT_TAIL: {
+                                            uint32_t n = arA;
+                                            for (uint32_t i = 0; i < n; ++i) {
+                                                if (ipA < N && ipB < N)
+                                                    compareSymOperand(ipA, cu1.code[ipA], cu2.code[ipB]);
+                                                if (ipA + 1 < N && ipB + 1 < N
+                                                    && cu1.code[ipA + 1] != cu2.code[ipB + 1])
+                                                    ++otherDiffs;
+                                                ipA += 2; ipB += 2;
+                                            }
+                                            break;
+                                        }
+                                        case OP_POS: {
+                                            // PosIdx operand — process-local;
+                                            // not a SymbolId.  Track as benign.
+                                            if (arA != arB) ++otherDiffs;
+                                            break;
+                                        }
+                                        default:
+                                            if (arA != arB) ++otherDiffs;
+                                            break;
+                                        }
+                                        #pragma GCC diagnostic pop
+                                    }
+                                    std::fprintf(vf,
+                                        "  walk-result: opDiffs=%zu symStrDiffs=%zu "
+                                        "symIdDiffs=%zu otherDiffs=%zu",
+                                        opDiffs, symStrDiffs, symIdDiffs, otherDiffs);
+                                    if (firstSymStrDiff != SIZE_MAX) {
+                                        std::fprintf(vf,
+                                            " (first symStr diff at ip=%zu: cached='%s'(%u) fresh='%s'(%u))",
+                                            firstSymStrDiff,
+                                            resolve(firstSymStrA).c_str(), firstSymStrA,
+                                            resolve(firstSymStrB).c_str(), firstSymStrB);
+                                    }
+                                    if (firstOpDiffIp != SIZE_MAX) {
+                                        std::fprintf(vf,
+                                            " (first op diff at ip=%zu: cached=%s(0x%02x) fresh=%s(0x%02x))",
+                                            firstOpDiffIp,
+                                            opName(firstOpDiffA), (unsigned)firstOpDiffA,
+                                            opName(firstOpDiffB), (unsigned)firstOpDiffB);
+                                        // Dump a window around the op diff.
+                                        std::fprintf(vf, "\n  cached-disasm around op-diff [%zu..%zu]:\n",
+                                            firstOpDiffIp > 6 ? firstOpDiffIp - 6 : 0,
+                                            std::min<size_t>(cu1.code.size(), firstOpDiffIp + 8));
+                                        disassembleWindow(vf, cu1,
+                                            firstOpDiffIp > 6 ? (uint32_t)(firstOpDiffIp - 6) : 0,
+                                            (uint32_t)std::min<size_t>(cu1.code.size(), firstOpDiffIp + 8));
+                                        std::fprintf(vf, "  fresh-disasm around op-diff [%zu..%zu]:\n",
+                                            firstOpDiffIp > 6 ? firstOpDiffIp - 6 : 0,
+                                            std::min<size_t>(cu2.code.size(), firstOpDiffIp + 8));
+                                        disassembleWindow(vf, cu2,
+                                            firstOpDiffIp > 6 ? (uint32_t)(firstOpDiffIp - 6) : 0,
+                                            (uint32_t)std::min<size_t>(cu2.code.size(), firstOpDiffIp + 8));
+                                    }
+                                    std::fprintf(vf, "\n");
                                 }
                             }
                             std::fclose(vf);
@@ -8156,6 +8503,9 @@ skipDiskCacheLookup:
     {
         if (s_impTimingEn) ++importTimingTotals().calls;
         auto tLower = impStamp();
+        static const bool s_dbg815pp = std::getenv("V3_DBG_815_FUNCID") != nullptr;
+        if (s_dbg815pp) std::fprintf(stderr,
+            "v3 FUNCID --- begin import path=%s ---\n", path.c_str());
         auto module = lowerNixExpr(e, ns.symbols, ns.positions);
         impBumpNs(importTimingTotals().lowerNs, tLower);
         if (s_dbg_import) std::fprintf(stderr,

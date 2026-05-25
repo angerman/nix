@@ -620,3 +620,80 @@ and fix the remaining process-local-order leak.
   iterations (LetRec, Attrs, Dyn) and verify the canonical order
   is applied everywhere.
 - Once located, apply the same canonical-sort fix.
+
+---
+
+## RESOLUTION — Light Phase 3+4+5 (2026-05-25)
+
+### Final root cause: BOTH a cache-key collision AND emit-order leak
+
+The bug had TWO compounding causes, only one of which was visible
+in the earlier RCA notes:
+
+1. **Disk-cache key collided across two nixpkgs checkouts with
+   identical content but different store-path prefixes.**  The
+   key was `computeKeyForString(content)` — pure content hash.
+   Two `/nix/store/<hash>-source` directories holding byte-
+   identical nixpkgs (the common case when one workload pins
+   nixpkgs via flake.lock and another uses `getFlake "nixpkgs"`)
+   compute the same key.  Path-literals like `./musl.patch` in
+   the source resolve at compile-time against the containing
+   file's directory and are baked into bytecode as absolute
+   store paths.  Loading a CU compiled for store A under a
+   process that expects store B produces a value-shape
+   divergence that propagates several files later as the
+   `unexpected argument 'git'` site at customisation.nix:357:65.
+
+   **Fix** (primops.cc `~7920`): include the resolved
+   symlink-canonical source path in the cache-key hash input.
+   Length-prefixed concatenation of `pathStr ++ content` so no
+   `(path, content)` pair aliases.  The cache stays content-
+   addressed for the bulk of CUs (same path → same key); only
+   path-divergent collisions invalidate.
+
+2. **`lowerLambda` built `letRec.entries` for default-bearing
+   formals in TW-Symbol-VALUE order**, not canonical alphabetical
+   order.  emit.cc later re-sorts `e.entries` by v3-SymbolId
+   VALUE for the OP_ATTRS_LET_REC_INIT trailer + REC_SET slot
+   assignment.  Writer and reader produce DIFFERENT sortedOrders
+   because their v3 symbol tables intern names in different
+   orders — even with Phase 3's FuncId-allocation canonicalisation.
+
+   **Fix** (lower.cc lambda formals letRec construction): push
+   entries in `formalCanonIdx[c]` order, mirroring Phase 1's
+   lowerLetRec change.  This makes `e.entries[i]` index the same
+   logical entry across processes — i = 0 is the first
+   alphabetical formal name in BOTH writer and reader.
+
+### Validation
+
+- `/tmp/v3-815-bisect.sh ""` (no blocklist) → **PASS: built drvPath**
+  (`/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv`).
+- 5-pkg sweep then HNE reproducer: ec=0, drvPath emitted successfully.
+- `V3_DBG_DESERIALIZE_VERIFY` (with strengthened name/sig/code-walk
+  diagnostic) reports: 112 cache HITs across the workload, 0
+  opcode-level divergences, 0 SymbolId-resolved-string divergences,
+  0 string-pool-order divergences.  All remaining `code=DIFF`
+  entries are SymbolId VALUE permutations (process-local), confirmed
+  benign by the post-remap walker.
+- Same-workload round-trip (sweep × 2): 4644 cache HITs, 0
+  opDiffs, behaviour unchanged.
+- `run-lang-tests.sh`: 143/143 pass.
+
+### Lessons for the Full variant
+
+The Light variant landed two targeted patches.  A Full de Bruijn
+IR — where every variable reference is a (level, displ)
+intrinsic carrying no SymbolId VALUE — would also fix this
+class of bug structurally, plus eliminate the
+`symbolTable + remap-on-deserialise` round-trip overhead in
+serialize.cc.  Not necessary for the immediate
+haskell-nix-example unblock; revisit when broader gains
+(parallel eval, JIT, persistent IR) need globally addressable
+de Bruijn shapes anyway.
+
+The strengthened `V3_DBG_DESERIALIZE_VERIFY` diagnostic
+(name/sig/formal-set/string-pool/code-walk) stays in the tree
+gated by the env var — it's the proper fitness test for any
+future cross-process cache key change or symbol-table refactor.
+

@@ -1102,6 +1102,10 @@ struct Lowerer
     {
         m.functions.emplace_back();
         ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+        static const bool s_dbg815a = std::getenv("V3_DBG_815_FUNCID") != nullptr;
+        if (s_dbg815a) std::fprintf(stderr,
+            "v3 FUNCID fid=%u src=lowerLambda name=%s\n",
+            (unsigned)fid, e->arg ? std::string(symbols[e->arg]).c_str() : "<formals>");
         auto entry = m.freshBlock();
 
         ir::VarId param = m.freshVar();
@@ -1234,20 +1238,48 @@ struct Lowerer
             // default branch entirely.
 
             // Reserve sym + var for each formal.
+            //
+            // #815 RCA fix (Light variant): TW's `FormalsBuilder::formals`
+            // is sorted by TW-process-local Symbol VALUE (see
+            // libexpr/include/nix/expr/nixexpr.hh:531 @pre comment).
+            // Iterating natural order means FuncIds are assigned in
+            // TW-Symbol order, which differs cross-process for the
+            // same source.  Canonicalise here by sorting indices by
+            // the symbol STRING.  formalSyms / thunkFids /
+            // thunkEntries are still indexed BY TW-DISPL POSITION (i.e.,
+            // the natural `i` over `formals->formals`), so the downstream
+            // body-lowering loop and the recScope.byDispl / recAttrsNames
+            // setup (which depend on TW's `ExprVar::displ` semantics)
+            // continue to work — only the m.functions allocation order
+            // becomes canonical.
             const size_t nF = formals->formals.size();
-            std::vector<ir::SymbolId> formalSyms;
-            std::vector<ir::FuncId>   thunkFids;
-            std::vector<ir::BlockId>  thunkEntries;
-            formalSyms.reserve(nF); thunkFids.reserve(nF); thunkEntries.reserve(nF);
-            for (auto & f : formals->formals) {
-                formalSyms.push_back(internSym(f.name));
+            std::vector<size_t> formalCanonIdx(nF);
+            std::iota(formalCanonIdx.begin(), formalCanonIdx.end(), size_t{0});
+            std::stable_sort(formalCanonIdx.begin(), formalCanonIdx.end(),
+                [&](size_t a, size_t b) {
+                    return std::string_view(symbols[formals->formals[a].name])
+                         < std::string_view(symbols[formals->formals[b].name]);
+                });
+            std::vector<ir::SymbolId> formalSyms(nF);
+            std::vector<ir::FuncId>   thunkFids(nF);
+            std::vector<ir::BlockId>  thunkEntries(nF);
+            // First populate formalSyms in TW order (used by recScope below).
+            for (size_t i = 0; i < nF; ++i)
+                formalSyms[i] = internSym(formals->formals[i].name);
+            // Allocate FuncIds in CANONICAL (alphabetical) order.
+            for (size_t c = 0; c < nF; ++c) {
+                size_t i = formalCanonIdx[c];  // TW-displ position
                 m.functions.emplace_back();
                 ir::FuncId tfid = static_cast<ir::FuncId>(m.functions.size() - 1);
                 auto teb = m.freshBlock();
                 m.functions[tfid].entryBlock = teb;
-                m.functions[tfid].name = std::string(symbols[f.name]);
-                thunkFids.push_back(tfid);
-                thunkEntries.push_back(teb);
+                m.functions[tfid].name = std::string(symbols[formals->formals[i].name]);
+                static const bool s_dbg815ff = std::getenv("V3_DBG_815_FUNCID") != nullptr;
+                if (s_dbg815ff) std::fprintf(stderr,
+                    "v3 FUNCID fid=%u src=lambdaFormal name=%s\n",
+                    (unsigned)tfid, std::string(symbols[formals->formals[i].name]).c_str());
+                thunkFids[i]     = tfid;
+                thunkEntries[i]  = teb;
             }
 
             ir::VarId formalsRec = m.freshVar();
@@ -1335,7 +1367,24 @@ struct Lowerer
             // bug (CALLPACKAGE_BUG_2026-05-09.md).
             letRec.hasBody = true;
             letRec.entries.reserve(nF);
-            for (size_t i = 0; i < nF; ++i) {
+            // #815 RCA fix (Light variant, Phase 3+): push entries in
+            // CANONICAL (alphabetical-by-name) order.  Earlier code
+            // iterated 0..nF in TW-Symbol-VALUE order via formalSyms[i]
+            // / thunkFids[i].  emit.cc later re-sorts e.entries by
+            // v3-Symbol-VALUE (process-local) and assigns REC_SET slots
+            // by that sort.  Writer and reader produce DIFFERENT
+            // sortedOrders because their v3 symbol tables intern names
+            // in different orders — even with my Phase 3 FuncId-allocation
+            // fix.  Pushing entries canonically here makes the e.entries
+            // VECTOR INDICES match cross-process: index 0 = the first
+            // alphabetical name in BOTH processes.  emit.cc's sort still
+            // applies, but its OUTPUT permutation is now stable across
+            // processes because remapSymbolsInBytecode re-sorts cached's
+            // REC_INIT trailer by reader-v3-SymbolId VALUE — and reader
+            // fresh-compile produces the same v3-SymbolId-VALUE order
+            // for the same set of names.
+            for (size_t c = 0; c < nF; ++c) {
+                size_t i = formalCanonIdx[c];
                 ir::LetRec::Entry en;
                 en.name = formalSyms[i];
                 en.thunkBody = thunkFids[i];
@@ -1774,6 +1823,10 @@ struct Lowerer
     {
         m.functions.emplace_back();
         ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+        static const bool s_dbg815t = std::getenv("V3_DBG_815_FUNCID") != nullptr;
+        if (s_dbg815t) std::fprintf(stderr,
+            "v3 FUNCID fid=%u src=thunkify kind=%d\n",
+            (unsigned)fid, (int)e->exprKind);
         auto entry = m.freshBlock();
         m.functions[fid].entryBlock = entry;
         m.functions[fid].name = "<thunk>";
@@ -2741,6 +2794,10 @@ struct Lowerer
             m.functions[fid].entryBlock = eb;
             m.functions[fid].name = std::string(symbols[te.sym]);
             m.functions[fid].posHandle = te.posHandle;
+            static const bool s_dbg815l = std::getenv("V3_DBG_815_FUNCID") != nullptr;
+            if (s_dbg815l) std::fprintf(stderr,
+                "v3 FUNCID fid=%u src=letRec name=%s\n",
+                (unsigned)fid, std::string(symbols[te.sym]).c_str());
             // CO-3 + WC-11: register every Let/Attrs binding's def
             // expression, not just top-level ones.  Same rationale
             // as `thunkify` (above): Nix is purely lexical, so
