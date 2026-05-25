@@ -1778,6 +1778,38 @@ static std::string expectedTypeButFound(const char * expected,
         if (t == Tag::Path)   return v.payload.path ? std::string(v.payload.path) : "/";
         if (t == Tag::List)   return v.payload.list && v.payload.list->size > 0 ? "[ ... ]" : "[ ]";
         if (t == Tag::Attrs)  return v.payload.bindings && v.payload.bindings->size > 0 ? "{ ... }" : "{ }";
+        // #820 (2026-05-26): TW's printFunction emits `«lambda <name>? @
+        // <file>:<line>:<col>»` (eval.cc:1245 cites `ValuePrinter` which
+        // delegates to `printFunction` in libexpr/print.cc).  Mirror
+        // that here so error messages like "expected a set but found a
+        // function: «lambda @ p6b.nix:1:43»" match TW byte-for-byte.
+        // Without this match, run-inherit-from-laziness-tests' p6b
+        // assertion fails on cosmetic-but-load-bearing string equality.
+        if (t == Tag::Closure && v.payload.closure && v.payload.closure->desc) {
+            std::string tok = "«lambda";
+            const auto & d = *v.payload.closure->desc;
+            if (!d.contextualName.empty()) {
+                tok += ' ';
+                tok += d.contextualName;
+            }
+            if (auto * ps = nix::v3::resolvePosSnapshot(d.posHandle)) {
+                tok += " @ ";
+                if (ps->file.empty() || ps->file == "<string>")
+                    tok += "«string»";
+                else if (ps->file == "<stdin>")
+                    tok += "«stdin»";
+                else if (ps->file == "<unknown>")
+                    tok += "«none»";
+                else
+                    tok += ps->file;
+                tok += ':';
+                tok += std::to_string(ps->line);
+                tok += ':';
+                tok += std::to_string(ps->column);
+            }
+            tok += "»";
+            return tok;
+        }
         return "<value>";
     };
     std::string msg = "expected ";
