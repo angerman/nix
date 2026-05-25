@@ -230,7 +230,31 @@ Tier A + early Tier B = ~7 person-days, fits one week with parallel work; net ex
 
 ---
 
-### A4 — Cache-coherence CI lint (1 day) — codify the two new operating rules
+### A4 — Cache-coherence CI lint (1 day) — codify the two new operating rules ✅ LANDED 2026-05-25 (commits `521277ac9` + `7d14733c0`)
+
+Implementation summary (matches the original plan + two refinements):
+
+- `src/libexpr-v3/test/lint-cache-coherence.sh` — bash lint scoping
+  diffs by @@-context to `LambdaDescriptor` struct body and
+  `deserializeCU` body.
+- Rule 1: field add/remove/rename/reorder in LambdaDescriptor requires
+  `kSchemaVersion` bump in same diff.  Pure comment edits exempt via
+  code-portion pair-matching (strip `// ...` then compare).
+- Rule 2: any non-comment line change in `deserializeCU` body requires
+  schema bump.
+- Escape hatch: `// CACHE-COHERENCE-EXEMPT: <reason>` marker on a
+  newly-ADDED line allows refactors that don't change byte layout.
+  Marker check is line-anchored to avoid self-detection on the lint's
+  own doc text.
+- Wired into `all-v3-tests.sh` core suite (now 12 suites).
+
+Falsification-verified six-case matrix: (1) empty diff exit=0,
+(2) comment-only edit exit=0, (3) rename exit=1, (4) add no bump
+exit=1, (5) add+bump exit=0, (6) clean exit=0.
+
+Original plan (kept below as a record of the design):
+
+
 
 **Why now:** two cache-coherence operating rules codified this week (§2.6 above), both currently manual discipline. CI enforcement converts them from "burn-in once, hope nobody forgets" to "the linter prevents the next instance." Pattern precedent: `test/lint-no-inline-getenv.sh` enforces the env-var-gate-retirement rule.
 
