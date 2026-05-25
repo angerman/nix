@@ -91,12 +91,56 @@ struct Bindings
     /// 0 means "no position info."
     struct Entry { SymbolId name; PosIdx32 pos; Value value; };
 
-    uint32_t size;
-    uint32_t _pad;
-    Entry    entries[]; // FAM, sorted ascending by name
+    /// #823 / A1a Phase A (2026-05-26) — ChainBindings discriminator.
+    ///
+    /// Background.  HNE memory attribution (lode/HNE_MEMORY_
+    /// ATTRIBUTION_2026-05-26.md) found `mergeBindings` =
+    /// 584 MB / 82.9 % of v3-arena Bindings on the canonical haskell.
+    /// nix-example workload, concentrated 98.3 % at site 1
+    /// (OP_ATTRS_UPDATE_TAIL).  A pointer-keyed memo cache (A1b)
+    /// hit 0.0 % — falsified per #822.  The only remaining lever is
+    /// to AVOID materialising the merge: store
+    /// `(parent_ptr, overlay_delta)` instead of copying the
+    /// parent's entries on every merge.
+    ///
+    /// Layout.  When `kind == Sorted` (today's representation),
+    /// `parent` is `nullptr`, `size` is the entry count, and
+    /// `entries[]` is the full sorted attrset.  When `kind == Chain`,
+    /// `parent` points to another Bindings (Sorted or Chain), `size`
+    /// is the overlay-entry count, and `entries[]` is the sorted
+    /// overlay (shadowing whatever names parent has at those keys).
+    /// Chain bindings are NEVER stored on disk and NEVER serialised —
+    /// they are pure runtime representation; `serialize.cc` materialises
+    /// before emit if it ever sees a Chain (which it shouldn't, since
+    /// CUs hold bytecode not Bindings).
+    ///
+    /// Header grew from 8 B → 16 B.  On hello.drvPath this is
+    /// ~22 K Bindings × 8 B = +176 KB; on HNE ~1 M Bindings × 8 B =
+    /// +8 MB.  Both negligible against the 200 MB - 1 GB Chain
+    /// recovery target.
+    ///
+    /// This file (Phase A) defines the discriminator and chain-aware
+    /// lookup ONLY.  All consumers still ALWAYS construct Sorted
+    /// (mergeBindings unchanged; primops unchanged).  Phase B will
+    /// add a chain-aware `forEach` helper and convert iteration
+    /// sites.  Phase C enables Chain creation in mergeBindings under
+    /// `NIX_V3_CHAIN_BINDINGS=1`.  Phase D promotes to default after
+    /// the falsifier (≥ 200 MB recovered on HNE) is met.
+    enum class Kind : uint8_t { Sorted = 0, Chain = 1 };
 
-    /// Binary search.  Returns nullptr if not found.
-    const Value * lookup(SymbolId name) const noexcept
+    uint8_t  kind = uint8_t(Kind::Sorted);   // offset 0
+    uint8_t  _pad8[3] = {};                  // offset 1..3
+    uint32_t size;                           // offset 4 — Sorted: count of entries[]
+                                             //         — Chain:  count of overlay entries[]
+    const Bindings * parent = nullptr;       // offset 8 — nullptr for Sorted
+    Entry    entries[];                      // offset 16 — FAM, sorted ascending by name
+                                             //          (overlay-only for Chain)
+
+    bool isChain() const noexcept { return kind == uint8_t(Kind::Chain); }
+
+    /// Binary search the entries array of `this` (does NOT walk parent).
+    /// Internal helper used by `lookup` to factor the chain walk.
+    const Value * lookupLocal(SymbolId name) const noexcept
     {
         uint32_t lo = 0, hi = size;
         while (lo < hi) {
@@ -109,19 +153,43 @@ struct Bindings
         return nullptr;
     }
 
+    /// Chain-aware binary-search lookup.  Walks overlay then parent.
+    /// Returns nullptr if not found anywhere in the chain.  For
+    /// Sorted Bindings (parent == nullptr), this is equivalent to
+    /// the pre-#823 single-segment binary search.
+    const Value * lookup(SymbolId name) const noexcept
+    {
+        for (const Bindings * b = this; b; b = b->parent) {
+            const Value * v = b->lookupLocal(name);
+            if (v) return v;
+        }
+        return nullptr;
+    }
+
     /// Non-const overload — returns a writable pointer for callers that
     /// want to memoize lazy entries (e.g., resolving Tag::App in
     /// OP_ATTRS_SELECT_DYN and writing the WHNF result back into the
     /// slot).  Phase 13.3 mapAttrs memoization.
+    ///
+    /// Chain caveat: writes go to the OVERLAY entry if the name is
+    /// present in overlay; otherwise we fall through to the parent.
+    /// Returning a pointer into a shared parent's entry would let a
+    /// caller mutate state visible to other chains rooted at the same
+    /// parent — that's the same hazard the Phase 13.3 memo path
+    /// already accepts on Sorted bindings (the merged result is
+    /// shared, and writeback is idempotent).  The non-const overload
+    /// preserves that contract.
     Value * lookup(SymbolId name) noexcept
     {
-        uint32_t lo = 0, hi = size;
-        while (lo < hi) {
-            uint32_t mid = (lo + hi) >> 1;
-            SymbolId midName = entries[mid].name;
-            if (midName == name) return &entries[mid].value;
-            if (midName < name) lo = mid + 1;
-            else                hi = mid;
+        for (Bindings * b = this; b; b = const_cast<Bindings *>(b->parent)) {
+            uint32_t lo = 0, hi = b->size;
+            while (lo < hi) {
+                uint32_t mid = (lo + hi) >> 1;
+                SymbolId midName = b->entries[mid].name;
+                if (midName == name) return &b->entries[mid].value;
+                if (midName < name) lo = mid + 1;
+                else                hi = mid;
+            }
         }
         return nullptr;
     }

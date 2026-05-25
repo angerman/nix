@@ -16,7 +16,15 @@ namespace nix::v3 {
 // OP_ATTRS_INIT 0 / OP_LIST_INIT 0.  The trailing FAM `entries`/`elems`
 // arrays are zero-sized so no extra bytes are needed.
 namespace {
-Bindings sEmptyBindings = []{ Bindings b; b.size = 0; b._pad = 0; return b; }();
+Bindings sEmptyBindings = []{
+    // #823 / A1a Phase A: post-rename, the `_pad` slot is now `kind`
+    // (Sorted = 0 default) + `_pad8[3]`; default constructor handles
+    // both via in-class initialisers.  Only `size` (no default) must
+    // be set explicitly.  The new `parent` field defaults to nullptr.
+    Bindings b;
+    b.size = 0;
+    return b;
+}();
 ListVec  sEmptyList     = []{ ListVec l; l.size = 0; l._pad = 0; return l; }();
 } // anonymous namespace
 

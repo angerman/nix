@@ -24,12 +24,16 @@
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 using namespace nix::v3;
 
@@ -2293,6 +2297,113 @@ static int testOccurDceMatchesOldDce()
     return 0;
 }
 
+// #823 / A1a Phase A — ChainBindings discriminator + chain-aware lookup.
+//
+// Phase A is a no-functional-change scaffold (no consumer constructs a
+// Chain), so the lang-test suite alone cannot exercise the new
+// `lookupLocal` / `lookup`-walks-parent code paths.  This unit test
+// manually wires up a two-segment chain:
+//
+//   parent (Sorted):   { "a" -> 1, "b" -> 2 }
+//   child  (Chain  ):  overlay { "a" -> 10, "c" -> 3 },  parent = &parent
+//
+// and asserts the expected lookup semantics:
+//
+//   lookup("a") -> 10   (overlay shadows parent)
+//   lookup("b") ->  2   (parent fallback)
+//   lookup("c") ->  3   (overlay only)
+//   lookup("d") -> nullptr (absent everywhere)
+//   parent.lookup("a") -> 1   (standalone parent still observes its own entries)
+//
+// Phase B/C/D must keep this test green.  If the chain-walk loop in
+// `Bindings::lookup` (alloc.hh) is broken (early-exit, infinite loop,
+// wrong order), this test fires.
+static int testBindingsChainLookup()
+{
+    // Helper: allocate a Sorted Bindings of size n and populate entries.
+    auto makeSorted = [](std::initializer_list<std::pair<SymbolId, int64_t>> kvs) {
+        // Entries must be sorted ascending by name (binary-search invariant).
+        std::vector<std::pair<SymbolId, int64_t>> sorted(kvs.begin(), kvs.end());
+        std::sort(sorted.begin(), sorted.end(),
+            [](auto & a, auto & b) { return a.first < b.first; });
+        auto * b = Alloc::allocBindings(static_cast<uint32_t>(sorted.size()));
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            b->entries[i].name  = sorted[i].first;
+            b->entries[i].pos   = kNoPos;
+            b->entries[i].value.tag_payload = static_cast<uint64_t>(Tag::Int);
+            b->entries[i].value.payload.i = sorted[i].second;
+        }
+        return b;
+    };
+
+    // SymbolIds 1..4 stand in for the symbol table entries "a","b","c","d".
+    // The Phase A code never looks at the symbol table itself; it only
+    // compares SymbolId values, so opaque ints are fine.
+    Bindings * parent = makeSorted({{1, 1}, {2, 2}});
+    Bindings * child  = makeSorted({{1, 10}, {3, 3}});  // overlay
+    child->kind   = uint8_t(Bindings::Kind::Chain);
+    child->parent = parent;
+
+    if (!child->isChain()) {
+        std::fprintf(stderr, "testBindingsChainLookup: isChain() returned false\n");
+        return 1;
+    }
+
+    auto check = [&](const Bindings * b, SymbolId name, const char * what,
+                     bool expectHit, int64_t expectVal) {
+        const Value * v = b->lookup(name);
+        if (expectHit) {
+            if (!v) {
+                std::fprintf(stderr,
+                    "testBindingsChainLookup: %s expected hit, got nullptr\n", what);
+                return 1;
+            }
+            if (!v->isInt() || v->payload.i != expectVal) {
+                std::fprintf(stderr,
+                    "testBindingsChainLookup: %s expected Int(%lld), "
+                    "got tag=%d val=%lld\n",
+                    what, (long long)expectVal,
+                    (int)v->tag(), (long long)v->payload.i);
+                return 1;
+            }
+        } else {
+            if (v) {
+                std::fprintf(stderr,
+                    "testBindingsChainLookup: %s expected nullptr, got Int(%lld)\n",
+                    what, (long long)v->payload.i);
+                return 1;
+            }
+        }
+        return 0;
+    };
+
+    int rc = 0;
+    rc |= check(child,  1, "child.lookup(a)",     true,  10);  // overlay shadows
+    rc |= check(child,  2, "child.lookup(b)",     true,  2);   // parent fallback
+    rc |= check(child,  3, "child.lookup(c)",     true,  3);   // overlay only
+    rc |= check(child,  4, "child.lookup(d)",     false, 0);   // absent
+    rc |= check(parent, 1, "parent.lookup(a)",    true,  1);   // parent intact
+    rc |= check(parent, 3, "parent.lookup(c)",    false, 0);   // not in parent
+
+    // `lookupLocal` must NOT walk parent — verify by asking parent for "c".
+    if (parent->lookupLocal(3) != nullptr) {
+        std::fprintf(stderr,
+            "testBindingsChainLookup: parent->lookupLocal(c) walked parent (shouldn't)\n");
+        return 1;
+    }
+    // And child.lookupLocal(b) must miss (b only lives in parent).
+    if (child->lookupLocal(2) != nullptr) {
+        std::fprintf(stderr,
+            "testBindingsChainLookup: child->lookupLocal(b) walked parent (shouldn't)\n");
+        return 1;
+    }
+
+    if (rc == 0)
+        std::fprintf(stderr,
+            "testBindingsChainLookup: OK (overlay shadow + parent fallback + miss)\n");
+    return rc;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -2364,6 +2475,9 @@ int main()
     // OPT_OCCUR Phase B — deadBindingElimViaOccur (Phase 0.3/0.4)
     rc |= testOccurDceRemovesChainedDeadBinding();
     rc |= testOccurDceMatchesOldDce();
+
+    // #823 / A1a Phase A — ChainBindings discriminator unit test.
+    rc |= testBindingsChainLookup();
 
     auto & st = allocStats();
     std::fprintf(stderr,
