@@ -154,18 +154,21 @@ empirically across the full bridge-touching workload set.
 
 ### Separate perf issues identified (follow-on tasks)
 
-  1. **disk_cache hit_rate ≈0%** across runs — root cause IDENTIFIED
-     (`PRIMARY KEY (key)` collides post-schema-bump, INSERT OR
-     IGNORE drops new-schema entries).  Fix prototype landed
-     in `9e09a7e4c` (composite `(key, schema)` PK + v1→v2 path
-     bump) and **showed 42% v3 wall reduction on hello.drvPath
-     warm (2.55× → 1.45× TW)**.  But REVERTED in `eabffba65`
-     because the resulting 100% hit rate exposed a latent
-     **schema-11 deserialize round-trip bug**: firefox.drvPath
-     byte-diverged from TW when v3 loaded a cached schema-11
-     CU.  Hello/bash/gcc/python3 all PASS — firefox-specific
-     CU shape exposes it.  Tracked as **#814**.  Both the PK
-     fix and the perf win re-land once #814 is closed.
+  1. **disk_cache hit_rate ≈0%** across runs — **FULLY RESOLVED** in
+     `ed8fa0669` + `168940499` (2026-05-25).  Layered fix:
+     - composite `(key, schema)` PRIMARY KEY
+     - cache file-path v1→v2→v3 (initial-dev-phase: no backward
+       compat required per user)
+     - schema 12: serialise `selectorSym` + `identityLambda`
+       (eval-affecting peephole flags)
+     - schema 13: include `selectorSym` in sparse symbol-table
+       collection; remap it at deserialise; re-sort formals
+       post-remap.  Invalidates stale schema-12 entries from
+       intermediate-build cache poisoning (#815 root cause).
+     Result: 100% warm hit rate, 5/5 nixpkgs + haskell-nix-example
+     byte-identical to TW on both fresh AND production caches.
+     **Perf: hello.drvPath warm 1.67× TW (was 2.55× pre-fix);
+     Phase 1 ≤2× target MET.**
   2. **v3 peak RSS = 5.3× TW** on haskell-nix-example.  Bindings is
      the dominant lever (705 MB / 44% of v3_arena).  Stage-4
      strictness + posSnapshotPool sharing + Bindings dedup are
