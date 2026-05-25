@@ -3879,6 +3879,10 @@ struct BridgeAttrEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
 };
+struct BridgeListEntry {
+    Value v3Value;
+    nix::Expr * fallbackExpr = nullptr;
+};
 // CRIT-2 (table side): traceable storage so Boehm sees the inner
 // v3-Value payloads.
 static std::vector<BridgeAttrEntry,
@@ -3889,10 +3893,14 @@ static std::vector<BridgeAttrEntry,
     return tbl;
 }
 
-// #806a retire (2026-05-25): BridgeListEntry + v3BridgeLists()
-// deleted alongside the lazy-list bridge in v3ToTreeWalker.
-// The Tag::List path is now always-eager; primV3ForceListElem
-// + its supporting table are unreachable.
+/// Same idea for lists — each element bridged lazily on force.
+static std::vector<BridgeListEntry,
+    traceable_allocator<BridgeListEntry>> & v3BridgeLists()
+{
+    static std::vector<BridgeListEntry,
+        traceable_allocator<BridgeListEntry>> tbl;
+    return tbl;
+}
 
 // #705 walkV3BridgeRoots lives below the anonymous-namespace close
 // so the linker can see it.  See the function-body comment there.
@@ -3979,7 +3987,7 @@ namespace nix::v3 { namespace {
 // is the Phase D goal.
 std::atomic<uint64_t> g_bridgeCallBridge1Calls{0};
 std::atomic<uint64_t> g_bridgeForceAttrCalls{0};
-// #806a retire: g_bridgeForceListElemCalls removed (primV3ForceListElem gone).
+std::atomic<uint64_t> g_bridgeForceListElemCalls{0};
 
 // #458 step 2: shared depth counter and limit between
 // primV3CallBridge1 (the legacy TW primop) and tryDispatchBridge1Direct
@@ -3999,7 +4007,7 @@ void walkV3BridgeRoots(const std::function<void(Value &)> & visit)
 {
     for (auto & e : v3BridgeClosures()) visit(e.v3Value);
     for (auto & e : v3BridgeAttrs())    visit(e.v3Value);
-    // #806a retire: v3BridgeLists removed (lazy-list bridge gone).
+    for (auto & e : v3BridgeLists())    visit(e.v3Value);
 }
 
 // (walkImportCacheRoots defined further down, after the
@@ -4606,11 +4614,110 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
     }
 }
 
-// #806a (2026-05-25): primV3ForceListElem retired.  See the
-// v3ToTreeWalker Tag::List path for the retirement rationale —
-// bridge-site counter [12] was 0 across all observed real
-// workloads; the lazy-list path is now dead and the TW-side
-// primop registration is gone with it.
+/// WC-15: lazy list-element bridge.  Args: handle (Int), index (Int).
+static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
+                              nix::Value ** args, nix::Value & out);
+static void primV3ForceListElem(nix::EvalState & ns, const nix::PosIdx pos,
+                            nix::Value ** args, nix::Value & out)
+{
+    g_bridgeForceListElemCalls.fetch_add(1, std::memory_order_relaxed);
+    primV3ForceListElemInner(ns, pos, args, out);
+}
+static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
+                                 nix::Value ** args, nix::Value & out)
+{
+    // #466 nested-bridge-primop depth bound (see bridgePrimopDepth comment).
+    int kMax = bridgePrimopMaxDepth();
+    if (kMax > 0 && bridgePrimopDepth() >= kMax) {
+        ns.error<nix::EvalError>(
+            "v3 forceListElem: nested bridge-primop depth exceeded %1% "
+            "(structural cycle through fresh-VMState chain)",
+            std::to_string(kMax)).debugThrow();
+    }
+    BridgePrimopDepthGuard _bpdg(bridgePrimopDepth());
+
+    ns.forceValue(*args[0], pos);
+    if (args[0]->type() != nix::nInt)
+        ns.error<nix::EvalError>("v3 forceListElem: handle must be int").debugThrow();
+    int64_t h = args[0]->integer().value;
+    auto & tbl = v3BridgeLists();
+    if (h < 0 || (size_t)h >= tbl.size())
+        ns.error<nix::EvalError>("v3 forceListElem: invalid handle").debugThrow();
+    Value v3list = tbl[(size_t)h].v3Value;
+    nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
+    if (v3list.tag() != Tag::List || !v3list.payload.list)
+        ns.error<nix::EvalError>("v3 forceListElem: handle does not point to a List").debugThrow();
+
+    ns.forceValue(*args[1], pos);
+    if (args[1]->type() != nix::nInt)
+        ns.error<nix::EvalError>("v3 forceListElem: index must be int").debugThrow();
+    int64_t idx = args[1]->integer().value;
+    const ListVec * l = v3list.payload.list;
+    if (idx < 0 || (uint32_t)idx >= l->size)
+        ns.error<nix::EvalError>("v3 forceListElem: index out of range").debugThrow();
+
+    // #466 / #479 Phase 1: cross-primop force-chain detector.  This
+    // primop previously had no cycle detection (only the global
+    // bridgePrimopDepth bound), so a chain ending in a list-elem
+    // re-entry would only surface after 64 levels of C-stack growth.
+    // Throwing a BlackholeError here lets the catch route via fallback.
+    ForceChainGuard _fcg(ForceChainOp::ForceListElem,
+                         static_cast<uint64_t>(h),
+                         static_cast<uint64_t>(idx));
+    if (_fcg.isCycle()) {
+        throw BlackholeError(
+            _fcg.atDepthCeiling()
+            ? std::string("v3 forceListElem: force-chain depth ceiling reached")
+            : "v3 forceListElem: force-chain cycle on handle=" + std::to_string(h)
+              + " idx=" + std::to_string(idx));
+    }
+
+    ScopedNixEvalState _v3evalGuard(&ns);
+    EvalState v3state;
+    v3state.nixEvalState = &ns;
+    // REVIEW MED-16: stack-allocated.
+    // STG-10 (#498): re-use the active v3 VM if available (same
+    // rationale as primV3CallBridge1 / primV3ForceAttr).
+    VMState bridgeVmList;
+    VMState * listVm;
+    if (VMState * activeVm = activeV3VM()) {
+        listVm = activeVm;
+    } else {
+        bridgeVmList.valueStack.reserve(64 * 1024);
+        bridgeVmList.frames.reserve(4096);
+        bridgeVmList.withStack.reserve(64);
+        listVm = &bridgeVmList;
+    }
+    v3state.vm = listVm;
+
+    // WC-19: same safety net as primV3ForceAttr.
+    // REVIEW_2026-05-04 F4 / §6.3: typed BlackholeError instead of strstr.
+    try {
+        ++allocStats().v3ToTwBySite[12];  // #795 primV3ForceListElem re-bridge
+        nix::Value * tmp = v3ToTreeWalker(v3state, l->elems[(uint32_t)idx]);
+        if (tmp) out = *tmp; else out.mkNull();
+        return;
+    } catch (const std::exception & ex) {
+        if (!fallbackExpr || !dynamic_cast<const BlackholeError *>(&ex)) throw;
+        static const bool dbg = std::getenv("V3_DEBUG_HOOK") != nullptr;
+        if (dbg) std::fprintf(stderr,
+            "v3 forceListElem: bridge blackholed: %s — re-running outer Expr "
+            "via tree-walker for index %lld\n",
+            ex.what(), (long long)idx);
+        nix::Value tw;
+        fallbackExpr->eval(ns, ns.baseEnv, tw);
+        ns.forceValue(tw, pos);
+        if (tw.type() != nix::nList)
+            ns.error<nix::EvalError>(
+                "v3 forceListElem: tree-walker fallback returned non-list").debugThrow();
+        if (idx < 0 || (size_t)idx >= tw.listSize())
+            ns.error<nix::EvalError>(
+                "v3 forceListElem: tree-walker fallback list too short").debugThrow();
+        nix::Value * elem = tw.listView()[(size_t)idx];
+        ns.forceValue(*elem, pos);
+        out = *elem;
+    }
+}
 
 /// Recursively convert a v3 Value to a tree-walker nix::Value, allocated
 /// in the EvalState's GC arena.  Used by primDerivationStrict to bridge
@@ -4699,29 +4806,87 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         break;
     }
     case Tag::List: {
-        // #806a (2026-05-25) RETIRED lazy-list bridge: bridge-site
-        // counter [12] (primV3ForceListElem) was 0 across hello +
-        // 5-pkg sweep + haskell-nix-example.  The pre-retirement
-        // path bridged lists with n > kEagerListMax=4 via a
-        // PrimOpApp(__v3_force_list_elem, handle) thunk per element,
-        // re-entering v3 on each TW-side force.  All observed real
-        // workloads stayed under the eager threshold or didn't
-        // cross v3→TW with lists at all.  Always-eager simplifies
-        // the bridge, removes the static `lazyListPrim` + the
-        // v3BridgeLists side table, and makes the v3→TW boundary
-        // for lists fully synchronous.
+        // WC-15 lazy bridge: defer per-element conversion via App
+        // primop calls, so nixpkgs's huge / self-referential lists
+        // don't trigger eager-recursion cycles.  Gated by
+        // NIX_V3_NO_LAZY_BRIDGE for A/B testing and fallback.
+        // Lazy bridge for large lists (n > 4); small lists eager-bridge
+        // since the per-element thunk overhead exceeds the deferred-
+        // force win.  REVIEW-COMP §8.6: the prior NIX_V3_NO_LAZY_BRIDGE
+        // A/B gate is removed -- lazy bridging is the verified-correct
+        // default for all sizes above the cutoff.
         //
-        // The retirement is correct under the V3-NATIVE constraint:
-        // post-#758 (callFlake v3-native) + #804 (primReadDir/
-        // primImport attrset bypass), the only v3→TW list-bridge
-        // path was the lazy one.  With Stage 2 closed, no observed
-        // workload uses it.  See FFI_AUDIT_2026-05-24.md §"Phase E3".
+        // #455: same NIX_V3_EAGER_BRIDGE_MAX knob applies here.  The
+        // lazy bridge for lists has the same `__v3_force_list_elem`
+        // re-entry shape as Tag::Attrs and the same cycle potential.
         auto * lv = v.payload.list;
         uint32_t n = lv ? lv->size : 0;
-        auto lb = ns.buildList(n);
-        for (uint32_t i = 0; i < n; ++i)
-            lb[i] = v3ToTreeWalker(state, lv->elems[i], seen);
-        out->mkList(lb);
+        static const uint32_t kEagerListMax = []{
+            if (const char * v = std::getenv("NIX_V3_EAGER_BRIDGE_MAX"))
+                return (uint32_t)std::atoi(v);
+            return (uint32_t)4;
+        }();
+        if (n <= kEagerListMax) {
+            auto lb = ns.buildList(n);
+            for (uint32_t i = 0; i < n; ++i)
+                lb[i] = v3ToTreeWalker(state, lv->elems[i], seen);
+            out->mkList(lb);
+        } else {
+            // Register the v3 list value so the lazy primop can
+            // fetch elements by index.  Identity-stable across
+            // primop calls — lookup cost is O(1).
+            //
+            // WC-38 Phase 13: Boehm GC does NOT reliably scan static
+            // pointers that live in the dylib's data segment on macOS,
+            // so the underlying `nix::Value` was being collected mid-
+            // evaluation.  When a later allocValue() happened to return
+            // the same address, the contents were overwritten by a new
+            // mkApp/mkThunk — causing the resulting `tPrimOpApp` chain
+            // to walk down to a non-PrimOp leaf and trip tree-walker's
+            // assert in callFunction().  Fix: pin the pointer storage
+            // as a GC root explicitly.  Use bridgePrimOpRoot() which
+            // also handles thread-safe one-shot init.
+            static nix::Value * lazyListPrim = nullptr;
+            if (!lazyListPrim) {
+                auto * po = new nix::PrimOp{
+                    .name  = "__v3_force_list_elem",
+                    .args  = {"handle", "idx"},
+                    .arity = 2,
+                    .doc   = std::nullopt,
+                    .impl  = nix::fun<nix::PrimOpFun>{primV3ForceListElem},
+                };
+                nix::Value * pv = ns.allocValue();
+                pv->mkPrimOp(po);
+                // Register root BEFORE publishing the pointer.
+                // Otherwise a GC firing between the store and the
+                // GC_add_roots call could reclaim *pv -- the only
+                // reachability path is via the static, which isn't a
+                // root yet.  REVIEW MED-20.
+#if NIX_USE_BOEHMGC
+                GC_add_roots(&lazyListPrim, &lazyListPrim + 1);
+#endif
+                lazyListPrim = pv;
+            }
+            auto & tbl = v3BridgeLists();
+            size_t handle = tbl.size();
+            tbl.push_back({v, tlBridgeFallbackExpr});
+            nix::Value * vHandle = ns.allocValue();
+            vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
+            // PrimOpApp(__v3_force_list_elem, handle) is a 1-arg-of-2
+            // partial application; combining with idx (App) makes it
+            // fully applied.  Tree-walker forces App by callFunction.
+            nix::Value * vPartial = ns.allocValue();
+            vPartial->mkPrimOpApp(lazyListPrim, vHandle);
+            auto lb = ns.buildList(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                nix::Value * vIdx = ns.allocValue();
+                vIdx->mkInt(static_cast<nix::NixInt::Inner>(i));
+                nix::Value * vApp = ns.allocValue();
+                vApp->mkApp(vPartial, vIdx);
+                lb[i] = vApp;
+            }
+            out->mkList(lb);
+        }
         break;
     }
     case Tag::Attrs: {
@@ -9303,18 +9468,17 @@ void dumpPrimOpStats(std::FILE * out)
     // bridged eagerly across the v3<->TW boundary.
     uint64_t br1 = nix::v3::g_bridgeCallBridge1Calls.load(std::memory_order_relaxed);
     uint64_t bra = nix::v3::g_bridgeForceAttrCalls.load(std::memory_order_relaxed);
+    uint64_t brl = nix::v3::g_bridgeForceListElemCalls.load(std::memory_order_relaxed);
     // Always print: a zero on these is itself the kill-criterion signal
     // we need to retire the TW-side bridge primops (#660 / OPT #3).
     // Suppression-on-zero made "did the workload exercise this path?"
     // un-answerable from stats alone.
-    // #806a (2026-05-25): __v3_force_list_elem retired — bridge-site
-    // counter [12] was 0 across observed workloads, so the lazy-list
-    // path was dead code.  Removed from stats line.
     std::fprintf(out,
         "v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=%llu "
-        "__v3_force_attr=%llu\n",
+        "__v3_force_attr=%llu __v3_force_list_elem=%llu\n",
         (unsigned long long)br1,
-        (unsigned long long)bra);
+        (unsigned long long)bra,
+        (unsigned long long)brl);
 
     auto & c = primOpCounter();
     std::lock_guard<std::mutex> g(c.mtx);
