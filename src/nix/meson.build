@@ -188,12 +188,35 @@ endif
 
 include_dirs = [ include_directories('.') ]
 
+# Bump main-thread stack on darwin so deep nixpkgs eval doesn't
+# overflow the kernel-default 8 MiB pthread stack.  v3-direct's
+# residual C-recursion (forceValue → dispatchLoop, callClosure →
+# dispatchLoop) consumes ~14 KiB per recursive logical force; deep
+# stdenv.mkDerivation chains reach ~5000 vm.frames at peak.  64 MiB
+# provides 8× the default and covers observed workloads (hello.name
+# on nixpkgs completes in ~28 s).
+#
+# This is a backstop while the iterative-force conversion at v3
+# helper sites continues (see `lode/A12B_BYTECODE_PRIMOPS_2026-05-17.md`).
+# It's NOT a substitute for the architectural fix; it's a pragmatic
+# floor that prevents silent SIGSEGV on real workloads while the
+# refactor lands.
+#
+# Linux/BSD: the equivalent is `ulimit -s 65536` at shell launch,
+# OR a worker thread with pthread_attr_setstacksize.  We don't bake
+# anything in on those platforms because their default ulimit is
+# typically higher than darwin's and process-level configurable.
+nix_link_args = linker_export_flags
+if host_machine.system() == 'darwin'
+  nix_link_args += [ '-Wl,-stack_size,0x4000000' ]  # 64 MiB
+endif
+
 this_exe = executable(
   meson.project_name(),
   sources,
   dependencies : deps_private_subproject + deps_private + deps_other,
   include_directories : include_dirs,
-  link_args : linker_export_flags,
+  link_args : nix_link_args,
   install : true,
   cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
 )

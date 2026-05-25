@@ -62,8 +62,17 @@ void yieldForceTreeWalker(::nix::EvalState & state, ::nix::Value & v);
 /// it until done.  When the fiber yields ForceTreeWalker, force on
 /// the driver's stack and resume.  Returns the fiber's final v3
 /// Value (or rethrows the fiber's exception).
+///
+/// `stackSize` controls the fiber's stack (default: 16 MiB).  The
+/// main-eval wrapper passes a larger value (~128 MiB) because deep
+/// nixpkgs eval graphs (stdenv.mkDerivation × transitive deps) can
+/// generate ~5000 recursive forceValue/callClosure C-frames at ~14
+/// KiB each.  The fiber stack is dedicated and only allocated once
+/// per fiber lifetime, so the cost is a one-time mmap (no per-page
+/// faults during eval).
 Value runInFiber(::nix::EvalState & state,
-                 std::function<Value(Mailbox *)> body);
+                 std::function<Value(Mailbox *)> body,
+                 size_t stackSize = 0);  // 0 = use kDefaultFiberStack
 
 /// Pointer to the active fiber's Mailbox, or null if not in a fiber.
 extern thread_local Mailbox * currentMailbox;

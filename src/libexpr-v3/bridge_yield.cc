@@ -38,7 +38,8 @@ void yieldForceTreeWalker(::nix::EvalState & state, ::nix::Value & v)
 }
 
 Value runInFiber(::nix::EvalState & state,
-                 std::function<Value(Mailbox *)> body)
+                 std::function<Value(Mailbox *)> body,
+                 size_t stackSize)
 {
     Mailbox mb;
     auto entry = [&body, &mb](Fiber * /*self*/) {
@@ -53,7 +54,9 @@ Value runInFiber(::nix::EvalState & state,
         currentMailbox = saved;
     };
 
-    Fiber * fiber = fiberCreate(entry);
+    Fiber * fiber = stackSize > 0
+        ? fiberCreate(entry, stackSize)
+        : fiberCreate(entry);
     activeFiberDriverDepth++;
     try {
         for (;;) {
