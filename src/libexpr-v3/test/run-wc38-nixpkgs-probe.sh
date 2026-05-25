@@ -46,6 +46,22 @@ fi
 NIX_PATH="${NIX_PATH:-nixpkgs=/nix/store/yb2s3slqfb45942ln5z7m3ssmn7mnr4s-source}"
 export NIX_PATH
 
+# #820 (2026-05-26): the hardcoded bisected store path is environment-
+# specific and may have been GC-collected on developer machines.  Probe
+# its availability and SKIP cleanly if missing — this test is opt-in
+# (it documents a known-still-broken WC-38 surface and is gated by the
+# operator), so a missing nixpkgs source is a setup mismatch, not a
+# regression.  Setting NIX_PATH explicitly to a valid path overrides
+# the default and re-enables the probe.
+configured_nixpkgs="${NIX_PATH#nixpkgs=}"
+configured_nixpkgs="${configured_nixpkgs%%:*}"
+if [[ ! -e "$configured_nixpkgs" ]]; then
+  echo "SKIP: configured NIX_PATH='$NIX_PATH' resolves to non-existent" >&2
+  echo "       '$configured_nixpkgs' — set NIX_PATH to an extant nixpkgs source" >&2
+  echo "       to re-enable this probe.  WC-38 status remains DEFERRED." >&2
+  exit 0
+fi
+
 probes=(
   # Smallest failing case (no attr select; just forcing pkgs to WHNF):
   'builtins.isAttrs (import <nixpkgs>{})'
