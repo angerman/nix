@@ -458,6 +458,198 @@ Would require boundary elimination for ForceAttr (51 crossings on haskell-nix-ex
 
 ---
 
+## 6.5. Tier R — trigger-gated refactors and revivals
+
+Items NOT on the active week's plan but with **explicit pre-committed triggers** that should re-prioritise them when fired. Each item lists what fires it, what it costs, what it unlocks, and what it depends on. This section exists so the team has the trigger map in view when conditions change — preventing "we'll get to it later" drift on real architectural work.
+
+Several items here also surface in `ROADMAP_TO_VISION_2026-05-15.md`'s "Killed-stage revival triggers" table or candidate-future-stages table; this is the tactical mirror. When triggers fire, refer to the canonical strategic doc for full re-measurement procedure.
+
+### R1 — Full de Bruijn IR (Phase L1) — ~1 week / ~300 LoC
+
+**What:** refactor IR (`ir.hh` / `ir.cc`) to use de Bruijn `(level, index)` variable references instead of named `VarId`s. Mechanical rewrite touching every `opt_*.cc` pass; eliminates SymbolId VALUE in IR variable positions; eliminates the symbol-table-remap round-trip in `serialize.cc` for locals (attrset keys remain symbol-keyed).
+
+**Status:** the #815 RCA landed a **Light variant** (canonical alphabetical ordering at `lowerLetRec` + `lowerAttrs` boundaries) which fixes the specific symptom. **Full variant remains deferred.** See `RCA_815_CROSS_WORKLOAD_2026-05-25.md` §"Lessons for the Full variant" + `LINKING_DESIGN_2026-05-17.md` Phase L1.
+
+**Triggers (any one fires → re-prioritise):**
+- **T1.a:** a SECOND distinct #815-class bug appears at an emit site OTHER than `lowerLetRec` / `lowerAttrs` within 30 days. Signal that Light variant + A4 lint discipline is insufficient — the class needs structural fix.
+- **T1.b:** audit of `lower.cc` emit sites surfaces ≥ 3 other sites that build symbol-keyed containers without canonical ordering (would itself be a trigger for proactive R1 rather than reactive). This is also AR5 below — a near-term proactive audit task.
+- **T1.c:** Stage 9 revival trigger B fires (post-ABT IR-level dedup ≥ 2× re-measured). Per ROADMAP Killed-stage table line 1232.
+- **T1.d:** Unison Item 3 (hash-keyed eval cache at IR-subtree scope, beyond primop boundaries) becomes an active target. See `UNISON_IDEAS_2026-05-07.md` Item 3.
+- **T1.e:** Stage 13 (multi-core parallel eval) becomes an active target. Process-local SymbolIds + threads = same #815-class bug inside one process; R1 is a prerequisite for parallel-safe symbol semantics. See AR10 below.
+- **T1.f:** AOT distribution (C1) commits to schema-stability requirements. Per AR8: AOT artifacts shipped via cache.nixos.org must be cache-coherent cross-machine; Light variant's brittleness is harder to defend at distribution scale.
+- **T1.g:** symbol-table remap deserialize cost (was 297 ms pre-#781b, ~5 ms post-sparse) regresses to > 30 ms on a new workload class. Direct signal that local-symbol-remap is back on the critical path.
+
+**Unlocks:**
+- Stage 9 dedup re-measurement at IR-subtree granularity (trigger B path)
+- Unison Item 3 (cache at IR-subtree scope, not just primop)
+- Unison Item 4 (effect propagation — cleaner with content-addressed IR)
+- Stage 13 parallel eval safety (no process-local symbol semantics in IR)
+- AOT distribution artifact stability (cross-machine cache coherent)
+- Elimination of Light-variant brittleness across all emit sites
+- Plausible 10-30 % off cold-load wall via symbol-table size reduction
+- Cache-coherence rule 1 (LambdaDescriptor schema bump) becomes less critical because VarRef no longer encodes process-local SymbolId values
+
+**Prerequisites:**
+- None blocking; the team can start whenever triggered
+- BUT: should NOT begin mid-investigation arc (1-week refactor cadence is qualitatively different from the team's 3-5-commits/day kill-with-data work)
+
+**Cross-references:** `LINKING_DESIGN_2026-05-17.md` Phase L1 (original spec), `UNISON_IDEAS_2026-05-07.md` Item 2 (ABT motivation), `RCA_815_CROSS_WORKLOAD_2026-05-25.md` §"Lessons for the Full variant" (most recent rationale), `IFD_DEEP_DIVE_2026-05-21.md` (Item 2 NOT-landed flag from 2026-05-21)
+
+### R2 — Stages 5 / 6 (hidden classes + PICs) revival
+
+**Status:** killed `#778` (Stage 5) and `Stage 6` implicitly. Per ROADMAP `Killed-stage revival triggers` table.
+
+**Triggers** (verbatim from ROADMAP §"Killed-stage revival triggers"):
+- Stage 5 Trigger A: AttrSelect family ≥ 5 % of dispatch on a representative workload after a denominator-shifting VM change
+- Stage 5 Trigger B: user report of slower-than-expected workload AND profile identifies AttrSelect as hot category
+- Stage 5 Trigger C: ≥ 80 % of AttrSelect dispatch hits monomorphic call-sites AND wall savings would exceed 3 %
+- Stage 6 Trigger: Stage 5 revives (any trigger)
+
+**Re-measurement effort:** 1 day (re-run #778 opcount banner)
+
+**Probability of revival:** Low (per ROADMAP probabilities)
+
+**Cross-references:** `STAGE_5_6_KILLED_2026-05-23.md`, ROADMAP §"Killed-stage revival triggers"
+
+### R3 — Stage 9 (cell-level dedup) revival
+
+**Status:** killed `#772` Phase L0 spike. Per ROADMAP `Killed-stage revival triggers` table.
+
+**Triggers:**
+- Trigger A: coarser-granularity re-measurement (whole `ExprAttrs` / `ExprLet` bindings) shows byte-dedup ≥ 2×. Effort: 2 days (modify `dedup_survey.cc` to ExprAttrs level)
+- Trigger B: post-ABT IR-level dedup ≥ 2×. **Requires R1 first.** Effort: 1 day (replace bytecode hash with IR hash in `dedup_survey.cc`)
+
+**Probability of revival:** Moderate (Trigger A) / Low (Trigger B)
+
+**Cross-references:** `STAGE_9_KILLED_2026-05-22.md`, ROADMAP §"Killed-stage revival triggers"
+
+### R4 — Stage 12 (JIT) revival
+
+**Status:** deferred-with-data per `JIT_CONFIDENCE_2026-05-23.md`.
+
+**Trigger:** dispatch share of wall > 40 % via OPCYCLES (NOT opcount) on cardano-node M5 measured DIRECTLY **AND** remaining alternatives < 5 % wall to extract.
+
+**Probability of revival:** Low (per #786 OPCYCLES current dispatch ~5 % wall; #788 primop concentration; alternatives substantial)
+
+**Re-measurement effort:** 0 (data already on hand; would need fresh OPCYCLES run on M5)
+
+**Cross-references:** `JIT_CONFIDENCE_2026-05-23.md` §7
+
+### R5 — Stage 13 (multi-core parallel eval)
+
+**Status:** candidate stage per `PARALLEL_EVAL_CAPABILITIES_2026-05-18.md`. NOT committed.
+
+**Triggers** (per PARALLEL_EVAL self-correction):
+- Process-level parallelism (`xargs -P`, Hydra jobset-per-process) measured to capture < 30 % of theoretical parallel benefit on a representative workload
+- I/O concurrency alone (without full eval parallelism) measured to capture < 50 % of theoretical
+- Critical path on cardano-node M5 measured to be < 30 % of total work
+- OR a specific user-facing scenario (e.g., NixOS module eval at scale) demands intra-invocation parallelism
+
+**Effort:** 9-15 months (per PARALLEL_EVAL self-correction; original 6-12 estimate revised up)
+
+**Prerequisite: R1 Full de Bruijn IR** — process-local SymbolIds + threads = same class of bug as #815 inside one process. See AR10 below for the architectural argument.
+
+**Cross-references:** `PARALLEL_EVAL_CAPABILITIES_2026-05-18.md`
+
+### R6 — Stage 16 (Whippet GC) replacement of tenured Boehm
+
+**Status:** dormant candidate per `BOEHM_DEPENDENCY_2026-05-21.md`.
+
+**Trigger:** nursery default-on (B2) lands **AND** tenured Boehm scan time > 10 % of eval wall on a representative workload.
+
+**Probability of revival:** Low (per #702 falsifier, Boehm scan is NOT current bottleneck)
+
+**Prerequisite:** B2 nursery default-on must land first (Whippet replaces tenured Boehm; nursery must be primary allocator before tenured replacement makes sense)
+
+**Cross-references:** `BOEHM_DEPENDENCY_2026-05-21.md`, `GC_VS_TW_ANALYSIS_2026-05-23.md`
+
+### R7 — mmap'd L2 cache (EVAL_CACHE_ARCHITECTURE §7 spike)
+
+**Status:** priority DROPPED post-#815 RCA + Phase 4b validation. Per `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §13.3(d) RETRACTED.
+
+**Triggers:**
+- **T7.a:** B1 (Phase 3e/5 scope audit) finds NO scope bug AND drvPath-class wall stays neutral. Signals SQLite-backed L2 is the actual cost; mmap'd L2 reduces lookup ~400× → wall positive.
+- **T7.b:** AOT distribution (C1) commits AND mmap is selected as the SQLite-replacement L2 (compositional fit: shipped via cache.nixos.org, mmap'd at v3 startup).
+
+**Effort:** 3-5 days (per EVAL_CACHE §7)
+
+**Cross-references:** `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §4.3 + §7 + §13
+
+### R8 — AOT distribution (C1 from Tier C)
+
+**Status:** deferred cross-team. Tier C of this doc.
+
+**Triggers** (all four typically required):
+- Standard wall ratio competitive (≤ 1.5× TW on hello.drvPath; currently 1.67× — close)
+- Schema-bump rate decreased (< 1 schema bump per month) OR versioned-artifact distribution model accepted (cache.nixos.org URL includes schema version)
+- Nix-team coordination confirmed
+- v3-team has bandwidth (estimated 1-2 weeks v3-side + cross-team)
+
+**Effort:** 1-2 weeks v3-side + indefinite cross-team
+
+**Composes with:** R7 (mmap'd L2 is the natural distribution format)
+
+**Prerequisite consideration:** R1 (Full de Bruijn IR) reduces schema-bump frequency dramatically by eliminating one source of schema churn (LambdaDescriptor cold-field additions). Not strictly required, but recommended before AOT goes live.
+
+**Cross-references:** `WARM_EVAL_AND_INSTRUMENTATION_2026-05-23.md` §6.4, `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §4.4
+
+### R9 — `.name`-class workload optimization
+
+**Status:** deferred. Structurally separate optimization path (parser/lowerer/module-traversal-dominated).
+
+**Trigger:** `.name` eval becomes user-facing primary scenario:
+- Flake exploration (`nix flake show`)
+- IDE hover / attr enumeration
+- `nix search` workloads
+- LSP-style queries
+
+**Effort:** undetermined (separate audit needed)
+
+**Cross-references:** `WORKLOAD_HETEROGENEITY_AUDIT_2026-05-23.md`
+
+### R10 — Stage 4 v4 / let-floating (#776) resume
+
+**Status:** dormant. Cloning machinery complete; 0 elisions on real workloads.
+
+**Triggers:**
+- Cross-function strictness analysis depth gap closed (the limiting factor)
+- OR: parallel investment yields the necessary depth (e.g., per-LambdaCore aggregate-time profiling from `PROFILING_IMPROVEMENTS_2026-05-24.md` T4.1 surfaces cross-function call patterns)
+
+**Cross-references:** `[[stage4-v4-2-2026-05-21]]`, ROADMAP Stage 4
+
+### R11 — haskell.nix wall compression beyond 1.42× TW
+
+**Status:** deferred. Currently memory (5.3× RSS) is the binding constraint, not wall.
+
+**Triggers:**
+- A1 (haskell-nix-example memory attribution) lands AND memory gap closes to ≤ 2× TW
+- AND haskell.nix becomes user-facing primary AND 1.42× wall is the new limiter
+- Requires Stage-2-level boundary elimination for ForceAttr (51 crossings, still load-bearing)
+
+**Effort:** multi-week Stage-2-class work
+
+**Cross-references:** Tier C §C3, `V3_TRUE_NATIVE_RCA_2026-05-24.md`
+
+### Tier R summary
+
+| R# | Item | Effort | Prerequisite | Priority signal |
+|---|---|---|---|---|
+| R1 | Full de Bruijn IR | 1 wk / ~300 LoC | none blocking | second #815-class bug OR Stage 9 trig B OR Unison Item 3 active OR Stage 13 active OR AOT committed |
+| R2 | Stages 5/6 PIC revival | TBD (1 d re-measure first) | none | AttrSelect ≥ 5 % dispatch on rep workload |
+| R3 | Stage 9 dedup revival | 1-2 d re-measure + impl | R1 for Trigger B | coarser-grain dedup ≥ 2× OR post-ABT IR-level ≥ 2× |
+| R4 | Stage 12 JIT revival | 0 (data on hand) | none | dispatch > 40 % wall via OPCYCLES on M5 + alts < 5 % |
+| R5 | Stage 13 multi-core | 9-15 mo | R1 | process-parallelism < 30 % theoretical |
+| R6 | Whippet GC | TBD | B2 (nursery default-on) | tenured Boehm scan > 10 % eval wall |
+| R7 | mmap'd L2 cache | 3-5 d | none | B1 finds no scope bug AND wall stays neutral |
+| R8 | AOT distribution | 1-2 wk + cross-team | (R1 recommended) | wall ≤ 1.5× TW + schema stability + buy-in |
+| R9 | `.name`-class opt | TBD audit | none | `.name` eval becomes user-facing primary |
+| R10 | Stage 4 v4 resume | TBD | per-LambdaCore profiling helpful | strictness analysis depth gap closes |
+| R11 | haskell.nix wall < 1.42× | multi-week | A1 lands + memory ≤ 2× | wall becomes binding (not memory) |
+
+**Operational rule:** each item's trigger is the falsifier for "we should NOT start this." When a trigger fires, the item moves from Tier R into the active plan; re-prioritise within ≤ 1 week of trigger firing.
+
+---
+
 ## 7. Recommended week ordering
 
 **Day 1** (parallel start):
@@ -496,6 +688,11 @@ Would require boundary elimination for ForceAttr (51 crossings on haskell-nix-ex
 - haskell-nix-example: 1.42× wall / 5.3× RSS → 1.42× wall / 3.5-4× RSS (likely)
 - Permanent prevention infrastructure for the recurring methodology pattern
 - Path forward on standard-workload wall has either-or-clarity (mmap L2 priority drops further if B1 finds scope correct; rises if B1 finds nothing wrong AND wall stays neutral)
+
+**Ordering caveats** (see §8.5 architectural risks for full analysis):
+- **A2 implementation MUST preserve diagnostic-on-demand counters** (T1.1 sites, `ifdProbeWithCtx`, `v3ToTwBySite`, `V3_DBG_DESERIALIZE_VERIFY`). V3_RELEASE strips always-on instrumentation only; counters with their own env-gate must stay compileable. See AR1.
+- **A1 measurements may need re-validation post-B2** if nursery default-on flip changes steady-state memory landscape. Either run A1 twice (pre + post flip) OR delay A1 final analysis until B2 decision lands. See AR2.
+- **A1 measurements should isolate Phase 4b cache overhead** by running with and without `NIX_V3_NO_IFD_IMPORT_CACHE_DISK=1`. The EvalResults table can grow during eval on IFD-heavy workloads. See AR3.
 
 ---
 
@@ -562,6 +759,319 @@ The plan needs to handle non-best-case outcomes. Concrete branches:
 
 - Bump Tier B items into the week; potentially start C2 (Stage 4 v4 resume) by day 5
 - Don't pad with low-priority work; bank the time for next-week strategic items
+
+### 8.11 If A2 V3_RELEASE strips diagnostic counters (AR1 materialises)
+
+- Probable signal: B1 / A3 / future cache investigations fail to find data because instrumentation is `#ifdef`-removed
+- Mitigation: revise A2 implementation to keep diagnostic-on-demand counters compileable. Distinguish:
+  - "Always-on instrumentation" → strip under V3_RELEASE (per WARM_EVAL §6.1 intent)
+  - "Env-gated diagnostic instrumentation" (T1.1 sites, ifdProbeWithCtx, v3ToTwBySite, V3_DBG_*) → KEEP under V3_RELEASE, only payload-active when env-var is set
+- If discovered AFTER A2 lands and merged: small follow-on patch carving out the env-gated subset. Low risk.
+
+### 8.12 If A1 finds memory pattern that nursery default-on would moot
+
+- Concrete examples from MEMORY_REDUCTION_OPPORTUNITIES: `snapshotCurrentWiths` dies in nursery; mergeBindings slack auto-reclaimed; fakeClo memoization moot post-flip
+- Mitigation: defer A1's per-site optimisation landing until B2 decision is known. If B2 flips default-on, the A1-identified sites may be already-fixed structurally
+- Concrete sequence: A1 measurement → B2 decision → A1 implementation (only on sites that B2 didn't moot)
+- Alternative: land both A1 fixes and B2 flip in same week; measure compound impact
+
+### 8.13 If R1 (Full de Bruijn IR) trigger fires mid-week (AR5 audit surfaces other broken sites)
+
+- Probable signal: someone audits lower.cc for non-canonical container construction and finds 3+ unfixed sites
+- Mitigation: do NOT start R1 mid-arc. Document the audit findings; complete current week's Tier A/B work first; schedule R1 as dedicated next-week effort
+- Operational rule: 1-week refactor cadence is qualitatively different from the team's 3-5-commits/day tactical work — don't mix the modes
+- Stopgap if AR5 audit surfaces undefended sites: apply Light-variant canonical-ordering patches to each surfaced site WHILE R1 is being planned; treats it as defence-in-depth
+
+---
+
+## 8.5. Architectural risks and ordering concerns
+
+Systematic review (2026-05-26) of the current architectural state for risks that affect downstream steps. Each risk is named, scoped, mitigated, and tracked. **Risk = a downstream consequence that could surprise us if not anticipated**, NOT a defect.
+
+Risks are organized by horizon: this-week-plan, near-term brittleness, long-term architectural, methodology / measurement, boundary. Severity ordering within each category.
+
+### Category 1: This-week-plan ordering risks
+
+These risks affect the current Tier A + B sequencing. **Must be considered before Day 1.**
+
+#### AR1 — V3_RELEASE (A2) may strip diagnostic-on-demand counters
+
+**Concern:** A2 implementation `#ifdef`s out "always-on" instrumentation (per WARM_EVAL §6.1). Several diagnostic-on-demand counters are currently in the same compilation units:
+- T1.1 cache-hook probes (A3, when landed) — `CacheHookCallSite::fires/hits/misses/inserts/bytes/ns`
+- `ifdProbeWithCtx[16]` (from #2103cdddb, used for Phase 4 audience measurement)
+- `v3ToTwBySite[]` (from #4093696bf, used for V3-NATIVE bridge measurement)
+- `V3_DBG_DESERIALIZE_VERIFY` (from #9e1ddf3bb, used for cross-process cache integrity verification)
+- 95+ `V3_DBG_*` gates (per WARM_EVAL §3)
+
+If V3_RELEASE strips all of these uniformly, future cache / bridge / deserialise investigations become impossible on release builds — must rebuild non-release to investigate.
+
+**Affects:** A2, A3, B1, IFD-class investigations, any future cache investigation
+
+**Mitigation:** A2 implementation must distinguish two categories:
+- "Always-on" instrumentation that pays cost regardless of env-var state (per-category byte counters, `attrsetSizeBuckets[10]`, `Thunk::forces`, `Thunk::shapeCell`, LambdaDescriptor cold fields, `bigramCounts[256][256]`) → STRIP under V3_RELEASE
+- "Env-gated diagnostic" counters that pay zero cost when env-var is off → KEEP under V3_RELEASE (only payload-active when env-var is set; cost-when-off is one branch test)
+
+The distinction is detectable by checking: "does this counter increment unconditionally on the hot path, or only inside an `if (getenv(...))` block?" The latter category is safe to keep.
+
+**Tracking:** before A2 lands, list every counter currently in v3 by category. A2 PR review checks each is correctly classified. See PROFILING_AUDIT_2026-05-24 §2 / §3 for the catalogue.
+
+#### AR2 — B2 nursery default-on changes memory landscape; A1 measurements may not reflect post-flip state
+
+**Concern:** B2 flips Phase E v0.2 (or nursery generally) from opt-in to default-on. Per `GC_VS_TW_ANALYSIS_2026-05-23.md` §5 projections: 3-4× smaller working set, 10-50× faster allocation, 10-50× shorter pauses. Several memory patterns die in nursery (snapshotCurrentWiths, mergeBindings slack reclamation, fakeClo memoization moot).
+
+If A1 runs BEFORE B2 (per current week ordering Day 1-2 vs Day 4-5), A1's per-site memory data reflects pre-flip steady-state. Some surfaced sites may be ALREADY-FIXED by the flip; landing per-site patches on those sites becomes wasted work.
+
+**Affects:** A1 implementation phase (not measurement phase)
+
+**Mitigation:** sequence A1 in two phases:
+- A1a Day 1-2: MEASUREMENT — identify top-3 sites + slack% + RSS bucket decomposition
+- A1b post-B2: IMPLEMENTATION — only land per-site patches on sites that B2 didn't already moot
+
+Alternative: run A1 measurement BOTH pre-flip (current Day 1-2) AND post-flip (Day 5 evening). Compare. Land patches on the delta-positive sites.
+
+**Tracking:** A1 final write-up should explicitly call out which surfaced sites would be expected to die in nursery post-flip.
+
+#### AR3 — Phase 4b default-on grows EvalResults cache during A1 measurement
+
+**Concern:** Phase 4b is now default-on per `d22e1bfd3`. On haskell.nix-class workloads (where IFD audience > 0), `EvalResults` table grows during eval as cache entries land. Per `297f900971` true-COLD measurement: cache populates ~5 entries / 865 bytes on multi-IFD-heavy synthetic.
+
+For A1 measurement on haskell-nix-example, the 3 GB RSS figure includes whatever EvalResults table size accumulated. This may or may not be significant; without measurement, unknown.
+
+**Affects:** A1 RSS measurement accuracy
+
+**Mitigation:** A1 should run TWICE on haskell-nix-example:
+- Run 1: `NIX_V3_DIRECT_EVAL=1 NIX_VM_STATS=1 NIX_V3_BINDINGS_ATTR=1` (default behaviour, Phase 4b on)
+- Run 2: + `NIX_V3_NO_IFD_IMPORT_CACHE_DISK=1` (Phase 4b opted-out)
+- Diff identifies cache contribution to RSS
+
+**Tracking:** A1 write-up reports both measurements explicitly.
+
+#### AR4 — B1 outcome feeds back into EVAL_CACHE §13.3(d) interpretation
+
+**Concern:** B1 (Phase 3e/5 scope audit) has two possible outcomes (per §4 B1): scope-bug-found (~⅓ prob) or scope-confirmed-correct (~⅔ prob). Each outcome shapes:
+- The `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §13.3(d) retraction — needs partial un-retraction if scope is confirmed correct
+- mmap'd L2 (R7) priority — rises if scope correct AND wall stays neutral
+- Long-term scope of eval-cache work — confirms or refutes the leaf-primop-too-small thesis
+
+**Affects:** post-B1 strategic narrative; multiple downstream docs need amendment
+
+**Mitigation:** budget Day 5 evening for a B1 follow-on commit that updates:
+- `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §13.3(d) with the audit conclusion
+- This doc (NEXT_STEPS) Tier R7 trigger status
+- ROADMAP Stage 10 partial-subset subsection if outcome affects it
+
+**Tracking:** B1 commit body must explicitly state the §13.3(d) status update.
+
+### Category 2: Near-term brittleness risks
+
+These risks could fire any week and affect subsequent investigations.
+
+#### AR5 — Light canonical-ordering brittleness (other emit sites)
+
+**Concern:** the #815 RCA landed canonical alphabetical ordering at `lowerLetRec` + `lowerAttrs` ONLY. Other emit sites in `lower.cc` that build symbol-keyed containers may have the SAME bug class without canonical ordering. Audit needed to surface these proactively, OR each will fire as a new #815-class incident.
+
+Concrete candidates worth auditing:
+- Dynamic attr construction (`ExprAttrs::DynamicAttrDef` lowering)
+- With-shadowing scope construction
+- Primop arg construction with named keys
+- `ExprLet` (separate from ExprLetRec, may have same pattern)
+- Any new emit site added since #815
+
+**Affects:** future cross-process cache integrity
+
+**Mitigation:** add to AR audit task: scan `lower.cc` for `for (auto & kv : *)` over symbol-keyed maps; verify each is followed by canonical sort OR uses a `formalCanonIdx[c]`-equivalent ordering. Estimated effort: ~2-3 hours.
+
+If audit surfaces ≥ 3 undefended sites → trigger T1.b of R1 (Full de Bruijn IR) fires; consider scheduling R1.
+If audit surfaces 1-2 undefended sites → apply Light-variant canonical-ordering patches.
+If audit surfaces 0 undefended sites → Light variant + A4 lint is sufficient discipline.
+
+**Tracking:** the audit itself should be a 1-2 hour task. Worth surfacing as a Tier A item if not on the current plan; for now, recommend slotting into A4 follow-on day (Day 4).
+
+#### AR6 — Test coverage gap for broader cache-coherence patterns
+
+**Concern:** A4 lint catches the schema-bump pattern. The #815 regression test (`e99e2594e`) catches the SPECIFIC scenario. Neither catches:
+- New container types added to serialization without canonical order
+- Cache key collisions between same-content-different-path sources (the OTHER #815 fix)
+- Future cache-key compositional bugs
+- Cross-process Value-graph integrity beyond bytecode
+
+**Affects:** future cache-coherence bug class detection
+
+**Mitigation:** add a **property-test for cross-process cache integrity**:
+- Generate random AST (or use a corpus of known-good Nix files)
+- Serialize CU in process A, deserialize in process B
+- Compare: bytecode bytes, post-remap SymbolId-resolved strings, force result
+- Run as part of CI; fails on any divergence
+- This is a generalisation of `V3_DBG_DESERIALIZE_VERIFY` from per-call diagnostic to CI-enforced suite
+
+**Effort:** 2-3 days (infrastructure + corpus selection + CI integration)
+
+**Tracking:** worth adding as a Tier B item once Tier A is done. Or as A5 if AR5 audit surfaces multiple sites needing this.
+
+#### AR7 — Phase E v0.2 known stress-mode missed-root
+
+**Concern:** Phase E v0.2 has a documented missed-root in stress-mode (1 MB stress test). If B2 flips Phase E default-on without first resolving this, real workloads under memory pressure might hit the missed-root → silent corruption.
+
+Per `GC_VS_TW_ANALYSIS_2026-05-23.md` §4.2: "resolve Phase E v0.2 stress-mode missed-root (1-3 days)" listed as part of the flip path.
+
+**Affects:** B2 implementation; whether flip is safe at all
+
+**Mitigation:** B2 explicit sub-task: before flipping default-on, EITHER resolve the missed-root OR confirm via real-workload stress testing (e.g., haskell-nix-example under `NIX_V3_GC_STRESS=1000`) that the missed-root doesn't fire on production paths.
+
+**Tracking:** B2 ship criterion adds: "Phase E v0.2 stress-test PASS with `NIX_V3_GC_STRESS=1000` on hello.drvPath + firefox.drvPath + haskell-nix-example."
+
+### Category 3: Long-term architectural risks
+
+These risks affect strategic direction; not blocking any single week, but shaping the multi-month picture.
+
+#### AR8 — Schema versioning ratchet vs AOT distribution
+
+**Concern:** schema 11 → 12 → 13 in 3 days (per #803 / #807 / #814). Each schema bump invalidates older cached CUs. If AOT distribution (C1 / R8) ships, each schema bump invalidates the shipped artifacts. At current schema-bump rate, AOT distribution model is unstable.
+
+**Affects:** R8 AOT distribution feasibility
+
+**Mitigation:** before R8 can fire, EITHER:
+- Schema-bump rate must decrease (< 1 bump per month). This requires architectural stability that R1 (Full de Bruijn IR) partially provides.
+- OR: versioned-artifact distribution model accepted. cache.nixos.org URL includes schema version (e.g., `nixpkgs-eval-result-cache-v13.mmap`). Older versions stay available; clients fetch matching schema.
+- OR: forward-compat deserialiser. New binary can read N-1 schema. Currently doesn't (correct safety behavior); changing this is a separate architectural commitment.
+
+**Tracking:** R8 trigger explicitly includes schema-stability check. If 30 days pass without schema bump AND wall is competitive AND Nix-team buy-in: R8 fires.
+
+#### AR9 — Cross-process cache + Boehm conservative scan
+
+**Concern:** Boehm GC scans process memory looking for pointers. Cached CUs loaded from disk become live objects. If cache deserialization creates objects with stale process-local references (e.g., SymbolId values that meant something different in the original process), Boehm conservative scan may mishandle them as pointers — false-positive root retention, increased heap pressure, or worse.
+
+This is closely related to the #815 class of bug but at the GC level. Light variant doesn't directly defend; A4 lint doesn't catch it.
+
+**Affects:** memory accounting correctness; potential silent leaks on heavy cache use
+
+**Mitigation:** R1 (Full de Bruijn IR) structurally addresses this — no process-local references in cached IR. Until R1: cache hygiene observation runs (T1.2 elsewhere RSS decomposition from PROFILING_IMPROVEMENTS) should look for Boehm overhead correlating with cache hits.
+
+**Tracking:** if T1.2 surfaces Boehm overhead disproportionate to nursery + tenured live data, this risk is materializing; escalate AR9 to R1 trigger conditions.
+
+#### AR10 — Process-local SymbolId + parallel eval (Stage 13) = #815-class inside one process
+
+**Concern:** v3's symbol table interns names at runtime; each process's intern order is its own. Multiple processes have different SymbolId values for the same symbol name — this is the #815 root cause class. Stage 13 (multi-core parallel eval) introduces multiple THREADS within ONE process. If symbol interning is not strictly serialised across threads, the SAME bug class appears intra-process: thread A interns "name" as SymbolId=5, thread B interns it as SymbolId=12, both write to the same cache → divergence.
+
+**Affects:** R5 Stage 13 feasibility AND safety
+
+**Mitigation:** Stage 13 cannot land WITHOUT either:
+- Strictly serialised symbol interning (lock contention scales with parallelism)
+- OR: R1 (Full de Bruijn IR) so that IR carries no process-local SymbolId values; only attrset keys remain symbol-keyed, and those can use a deterministic naming scheme (e.g., name string directly)
+
+Per R5 prerequisites: R1 is explicit prerequisite for R5. This risk is the architectural reason.
+
+**Tracking:** R5 trigger pre-condition includes R1 landed.
+
+#### AR11 — Disk cache size growth over time (no vacuum / size-cap / LRU)
+
+**Concern:** Phase 4b default-on writes to EvalResults table. CU disk cache (#770/#771) also writes. Over time, these tables grow. No documented vacuum, size-cap, or LRU eviction policy exists.
+
+On long-running CI environments, the cache could grow to GB scale, fragmenting disk usage and slowing SQLite operations. Eventually causes operational pain.
+
+**Affects:** long-term operability; not blocking any single workload
+
+**Mitigation:**
+- Document expected size growth rate (measure on a CI farm over 30 days)
+- Add `NIX_V3_CACHE_MAX_SIZE_MB` env-var with documented default (e.g., 1 GB)
+- LRU eviction when size cap exceeded (cheap: SQLite query by last-access timestamp)
+- Periodic `VACUUM` (could be tied to size growth threshold)
+
+**Effort:** ~2 days infrastructure + cross-team conversation about default size
+
+**Tracking:** worth surfacing as Tier C item. Not urgent; becomes urgent if a CI environment reports disk-fill issues.
+
+### Category 4: Methodology / measurement risks
+
+#### AR12 — Bench dependency on `getFlake` semantics
+
+**Concern:** standard benchmark `(getFlake "nixpkgs").hello.drvPath` depends on Nix flake registry semantics + a particular nixpkgs revision + TW's flake-output construction (the 51 ForceAttr bridges on haskell.nix come from TW reading v3-built Bindings via lazy bridge during flake output construction).
+
+If flake semantics evolve in Nix (cross-team work), or registry changes default nixpkgs, bench numbers shift without v3 changes. Comparability across measurement sessions degrades.
+
+**Affects:** wall ratio measurements over time
+
+**Mitigation:**
+- Pin specific nixpkgs revision in benchmark scripts (`builtins.fetchTree { type = "github"; ... rev = "..."; }`)
+- Avoid impure flake lookups in measurement
+- Document the pinned revision in benchmark output
+
+**Tracking:** worth adding to bench scripts in `src/libexpr-v3/bench/`. Small task; ~30 min.
+
+#### AR13 — Strategic doc maintenance lag
+
+**Concern:** ROADMAP has Stage 1-9 + candidate 10-13. Reality:
+- Stage 2 closed
+- Stage 3 (nursery) not flipped default-on yet
+- Stage 4 v4 dormant (#776)
+- Stages 5 + 6 KILLED
+- Stage 9 KILLED
+- Stage 12 deferred-with-data per JIT_CONFIDENCE
+- Stage 13 candidate
+
+The post-Stage-2 sequence is fuzzy. The strategic-doc-set landed 2026-05-15; partial updates since then have kept it usable but stage ordering rationale may no longer match current reality.
+
+**Affects:** new-team-member onboarding; cross-doc consistency over time
+
+**Mitigation:** periodic "state snapshot" doc (e.g., `ROADMAP_PROGRESS_SNAPSHOT_2026-05-23.md` precedent). Recommend monthly cadence.
+
+**Tracking:** worth scheduling a snapshot after Tier A + B land (end of this week + next week).
+
+### Category 5: Boundary risks (V3 ↔ TW)
+
+#### AR14 — Formals bridge default-on (#792) creates haskell.nix orthogonal slow path
+
+**Concern:** per `d22e1bfd3`, v3ToTreeWalker's formals-closure refusal lifted as default. **Known orthogonal**: haskell-nix-example v3-direct completes >12 min where TW = ~2 min — v3 over-forces module-system option evaluation, triggers builds (python3, jq, apple-sdk) TW left lazy. Separate task track (#754/#757/#757c family).
+
+This is real production-relevant slowness on haskell.nix module-system traversal. NOT addressed by A1 / A2 / A3 / B1 / B2.
+
+**Affects:** haskell.nix-class workloads beyond `.hello.drvPath` — anything that traverses module options
+
+**Mitigation:** this is an explicit known issue tracked under #754/#757/#757c. Not on this week's plan because the immediate goal (`.hello.drvPath` byte-identical + 1.42× wall) is achieved. Bigger module-system workloads will surface this; when they do, the #754/#757/#757c track resumes.
+
+**Tracking:** explicitly note in current state snapshot §2.1 that `.hello.drvPath` is the bench, NOT full module-system traversal. The 1.42× wall is for the narrow scenario.
+
+#### AR15 — Bridge surface (51 ForceAttr) still load-bearing post #806a revert
+
+**Concern:** #806a (retire `primV3ForceListElem`) was implement-then-reverted in <3 hours because of breakage. ForceAttr (51 crossings on haskell-nix-example) + CallBridge1 (8) + Import-ctx (10) are still load-bearing.
+
+Future bridge-elimination work has the same risk pattern: looks dead from one workload's perspective, breaks on another. The #806a discipline (revert when broken, with measurement data) is the right response, but the cost is real.
+
+**Affects:** R11 (haskell.nix wall compression beyond 1.42×) and any future bridge-retirement work
+
+**Mitigation:** before retiring any bridge primop, sweep broader workload set:
+- 5+ standard nixpkgs workloads
+- haskell-nix-example (now in standard test set)
+- cardano-node M5 if available
+- Cross-process cache hits (could surface latent dependencies)
+
+Effort: ~1 day cross-workload sweep before each bridge retirement.
+
+**Tracking:** when R11 fires, this sweep is part of the pre-work.
+
+### AR summary table
+
+| AR# | Risk | Horizon | Affects | Mitigation priority |
+|---|---|---|---|---|
+| AR1 | V3_RELEASE strips diagnostic counters | This week | A2 → A3 / B1 / future investigations | Pre-A2 implementation |
+| AR2 | B2 nursery flip moots A1 sites | This week | A1 implementation | A1 staged in measurement + impl phases |
+| AR3 | Phase 4b default-on inflates A1 RSS | This week | A1 measurement accuracy | Run A1 twice (with/without cache) |
+| AR4 | B1 outcome feeds back into EVAL_CACHE §13.3(d) | This week | post-B1 docs | Budget Day 5 evening for write-up |
+| AR5 | Light canonical brittleness at other emit sites | Near-term | future #815-class bugs | 1-2h audit task, slot Day 4 |
+| AR6 | Test coverage gap for broader cache-coherence | Near-term | future bug classes | Property test ~2-3 d; Tier B if surfaced |
+| AR7 | Phase E v0.2 missed-root | B2 ship | B2 ship safety | Stress-test before flip |
+| AR8 | Schema ratchet vs AOT distribution | Long-term | R8 feasibility | R1 reduces; OR versioned artifacts |
+| AR9 | Cross-process cache + Boehm conservative | Long-term | memory accounting | T1.2 surfaces; R1 structurally fixes |
+| AR10 | Process-local SymbolId + parallel eval | Long-term | R5 Stage 13 | R1 is prereq |
+| AR11 | Disk cache size growth | Long-term | operability | Size-cap + LRU; ~2 d |
+| AR12 | Bench getFlake dependency | Measurement | wall ratio over time | Pin revision in bench scripts |
+| AR13 | Strategic doc maintenance lag | Measurement | onboarding + consistency | Monthly snapshot cadence |
+| AR14 | Formals bridge default-on slow path | Boundary | haskell.nix module-system | #754/#757/#757c track |
+| AR15 | Bridge surface retire risk | Boundary | R11 + future bridge work | Cross-workload sweep pre-retirement |
+
+### Architectural risk operating rule
+
+**Before any commit that affects an instrumented subsystem, multi-process semantics, or cache layer:** check this AR table for relevant risks. If a risk is materially affected, the commit body should acknowledge the risk and document mitigation. Pattern precedent: `35564703f` Phase 4b RCA explicitly documented the scope-bug pattern + how mitigation works.
 
 ---
 
@@ -662,12 +1172,18 @@ For convenience, all Tier A + B falsifiers in one place:
 
 | Rule | Source | Enforcement path |
 |---|---|---|
-| **Schema bump on LambdaDescriptor field add** | `e364f7695` (#803 H10 RCA) | A4 lint, then CI |
-| **Schema bump on deserialise-path change** | `455995138` (#815 RCA) | A4 lint, then CI |
-| **Methodology audit before structural conclusion** | [[measure-twice-cut-once]] §5.7 | Manual discipline + T2.3 methodology lint subset |
-| **Per-site instrumentation before declaring lever too small** | Phase 4b RCA + disk_cache PK RCA pattern | T1.1 (A3) becomes the standard tool |
+| **Schema bump on LambdaDescriptor field add** | `e364f7695` (#803 H10 RCA) | A4 lint LANDED (`521277ac9`) |
+| **Schema bump on deserialise-path change** | `455995138` (#815 RCA) | A4 lint LANDED (`521277ac9`) |
+| **Canonical alphabetical ordering at symbol-keyed container construction in lower.cc** | `1b7496844` (#815 Light variant) | Manual discipline; AR5 audit task pending; CI test would extend A4 lint |
+| **Cache-key includes resolved source path (not just content hash)** | `1b7496844` (#815 Light variant) | Implemented in `computeKeyForString` site; pattern to follow for any future cache layer |
+| **Methodology audit before structural conclusion** | [[measure-twice-cut-once]] §5.7 | Manual discipline + T2.3 methodology lint subset; FOUR instances of "RESOLVED → reopened → deeper cause" cycle this week reinforce |
+| **Per-site instrumentation before declaring lever too small** | Phase 4b RCA + disk_cache PK RCA pattern | T1.1 (A3) becomes the standard tool; team has built ad-hoc variants 4× now |
 | **Cross-workload measurement before generalising hello.drvPath findings** | Workload heterogeneity audit (`cbb870174`) | Existing `bench/workload-heterogeneity.sh` |
 | **Memory delta required alongside wall delta in every optimization claim** | [[memory-first-class]] | Convention; could be PR-template enforced |
+| **Diagnostic-on-demand counters use their own env-gate, NOT V3_RELEASE-stripped** | AR1 (this doc §8.5) | A2 PR review check; PROFILING_AUDIT §2/§3 catalogue is the audit basis |
+| **Cache schema bumps invalidate AOT artifacts; AOT requires schema stability OR versioned-artifact model** | AR8 (this doc §8.5) | R8 trigger pre-condition; informs when AOT can fire |
+| **Stage 13 (multi-core parallel eval) requires Full de Bruijn IR (R1) as prerequisite for symbol semantics safety** | AR10 (this doc §8.5) | R5 trigger pre-condition |
+| **Pre-retirement cross-workload sweep for any bridge primop** | AR15 (this doc §8.5) + #806a revert precedent | Convention; ~1 day per retirement |
 
 ---
 
@@ -700,9 +1216,30 @@ This doc operationalises and links:
 - [[memory-first-class]] — the rule that elevates A1 above wall optimization
 - [[falsification-rule]] — every Tier A + B item answers "what hypothesis does this kill"
 
+**Tier R cross-references:**
+- `LINKING_DESIGN_2026-05-17.md` Phase L1 (R1 Full de Bruijn IR specification)
+- `RCA_815_CROSS_WORKLOAD_2026-05-25.md` §"Lessons for the Full variant" (R1 most recent motivation)
+- `UNISON_IDEAS_2026-05-07.md` Item 2 (R1 ABT-shaped IR rationale)
+- `STAGE_5_6_KILLED_2026-05-23.md` (R2 background)
+- `STAGE_9_KILLED_2026-05-22.md` (R3 background; Trigger B requires R1)
+- `JIT_CONFIDENCE_2026-05-23.md` §7 (R4 revival trigger)
+- `PARALLEL_EVAL_CAPABILITIES_2026-05-18.md` (R5 background + self-correction; AR10 architectural reason)
+- `BOEHM_DEPENDENCY_2026-05-21.md` (R6 trigger basis)
+- `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §4.3 + §7 + §13 (R7 mmap'd L2 spike)
+- `WARM_EVAL_AND_INSTRUMENTATION_2026-05-23.md` §6.4 (R8 AOT distribution)
+- `WORKLOAD_HETEROGENEITY_AUDIT_2026-05-23.md` (R9 .name-class)
+- `IFD_DEEP_DIVE_2026-05-21.md` (Item 2 NOT-landed flag relevant to R1)
+- `V3_TRUE_NATIVE_RCA_2026-05-24.md` (AR14 #754/#757/#757c track)
+- `[[stage4-v4-2-2026-05-21]]` (R10 background)
+
 **Commits referenced:**
 - `ed8fa0669` #814 disk_cache schema-13 fix (39 % wall reduction)
-- `455995138` #815 RESOLVED (stale-cache poisoning RCA)
+- `1b7496844` #815 TRULY RESOLVED (two compounding causes; cache-key + lowerLambda canonical ordering)
+- `455995138` #815 (first close; later reopened — stale-cache surface explanation only)
+- `9e1ddf3bb` #815 opt-is-NOT-cause RCA (bytecode remap mis-permutes REC_SET)
+- `93da764fd` #815 RCA Light Phase 1+2 (canonical iteration in lowerLetRec + lowerAttrs)
+- `e99e2594e` #815 regression test
+- `521277ac9` + `7d14733c0` A4 cache-coherence CI lint (LANDED)
 - `e364f7695` #803 H10 killed via schema-11 (LambdaDescriptor schema rule)
 - `35564703f` Phase 4b cache scope RCA
 - `fe678273a` + `297f900971` CU-disk-cache cold-tax artifact RCA
@@ -711,6 +1248,8 @@ This doc operationalises and links:
 - `2af711d90` post-#803 perf + bridge baseline
 - `bb5eb80a4` Phase 4b 1M-element scale (1.85× faster)
 - `297f900971` Phase 4b multi-IFD heavy (1.91× faster, true COLD = OFF)
+- `d22e1bfd3` Phase 4b + formals-bridge default-on (AR14 origin)
+- `a5b0c152b` + `90f2ff840` #806a primV3ForceListElem retirement + revert (AR15 precedent)
 
 ---
 
