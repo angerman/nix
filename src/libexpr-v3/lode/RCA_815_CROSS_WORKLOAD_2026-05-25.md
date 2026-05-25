@@ -377,3 +377,90 @@ E. Disable `NIX_V3_DISK_CACHE` by default until the underlying
 as a permanent debugging tool.  Future "cache load differs from
 fresh" investigations can re-use the bisection methodology
 without code edits.
+
+## Falsification update 2026-05-25 (post-meta-bisection)
+
+### Critical: the LIMIT=5 PASS was a FALSE SIGNAL
+
+After more careful auditing: at LIMIT=5 the sweep stack-overflows
+on entry-expr eval, so the make-rust-platform.nix file never gets
+into the cache.  `LIMIT=5 PASS` simply means "no cache entry,
+nothing to bug-trigger" — NOT "passes 0-5 produce deterministic
+opt output."
+
+Verified by SQL: at LIMIT=5 the cache has 294 entries, none of
+which is the make-rust-platform.nix key
+(`cd66d8044dca7449ded42871e40f4f0c9e571624a6dd25157c3119517c46d9b3`).
+
+### Minimal repro: LIMIT=0 also fails
+
+New observation: I can populate the cache with make-rust-platform.
+nix at LIMIT=0 (no opt at all) via a small `builtins.functionArgs
+(import "...make-rust-platform.nix")` entry expression.  This
+SUCCEEDS at LIMIT=0 (small enough that no stack overflow).
+Cache contains the file at 11777 bytes (NO opt applied).
+
+Then HNE eval (with default full-opt) loads this 11777-byte blob.
+**HNE STILL fails with the `unexpected argument 'git'` error.**
+
+⇒ **Opt is NOT the cause of #815.**  The bug is in the
+parse / lower / emit / serialize / deserialize pipeline — even
+the no-opt blob is corrupting cross-process semantics.
+
+### Verifier diagnostic landed
+
+Added `V3_DBG_DESERIALIZE_VERIFY=path` to `primops.cc::primImport`.
+On every disk-cache HIT, ALSO fresh-compiles the same source file
+in the current process, then byte-compares
+`cu_cached.code == cu_fresh.code`.  Logs `SAME`/`DIFF` plus
+disassembly window around the first divergence.
+
+### The actual bytecode divergence (smoking gun)
+
+For `pkgs/build-support/rust/fetch-cargo-vendor.nix`:
+
+  first_diff_ip=30
+  cached={OP_ATTRS_REC_SET(0x78), arg=7}
+  fresh ={OP_ATTRS_REC_SET(0x78), arg=1}
+
+  cached-disasm [24..38]:
+    [25] OP_ATTRS_REC_SET       operand=0
+    [26] OP_GET_LOCAL           operand=0
+    [27] OP_MAKE_THUNK          operand=3  data=[1,0]
+    [30] OP_ATTRS_REC_SET       operand=7   ← !
+    [31] OP_GET_LOCAL           operand=0
+    [32] OP_MAKE_THUNK          operand=4  data=[1,0]
+    [35] OP_ATTRS_REC_SET       operand=1   ← !
+
+  fresh-disasm [24..38]:
+    [25] OP_ATTRS_REC_SET       operand=0
+    [26] OP_GET_LOCAL           operand=0
+    [27] OP_MAKE_THUNK          operand=3  data=[1,0]
+    [30] OP_ATTRS_REC_SET       operand=1
+    [31] OP_GET_LOCAL           operand=0
+    [32] OP_MAKE_THUNK          operand=4  data=[1,0]
+    [35] OP_ATTRS_REC_SET       operand=2
+
+Both have the same structure (REC_SET + GET_LOCAL + MAKE_THUNK
+triples).  But the **REC_SET slot operands differ**: cached writes
+to slots {0, 7, 1, ...}, fresh writes to slots {0, 1, 2, ...}.
+
+Same THUNK is computed (MAKE_THUNK funcIdx is the same), but it's
+written to a DIFFERENT slot.  Since `entries[k]` in a sorted
+Bindings has a different NAME per `k`, writing the thunk to slot
+7 vs slot 1 puts it under a different attribute name.
+
+This is the actual #815 bug.  After deserialize remap, the
+REC_SET slot operands are NOT being properly translated to
+reader-process sort positions.  Either:
+  (a) The remap's `pending` stack is depleted before the SET
+      fires (so `if (pending.empty()) { skip remap }`).
+  (b) The remap's `oldToNew` permutation is computing wrong
+      values.
+  (c) The emit sometimes produces REC_SETs that aren't account-
+      ed for by their preceding REC_INIT (slot index outside
+      `n`).
+
+Next step: instrument `remapSymbolsInBytecode` to log when a
+REC_SET is encountered and what its `pending` state is.  Find the
+specific REC_SET that goes wrong.

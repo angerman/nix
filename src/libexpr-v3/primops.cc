@@ -30,6 +30,7 @@
 #include "v3/bridge_yield.hh"
 #include "v3/ffi.hh"  // FFI plan migration step 1: surface declarations.
 #include "v3/errors.hh"
+#include "v3/disasm.hh"  // #815 RCA: cached-vs-fresh disassembly
 #include "v3/limits.hh"
 
 #include <chrono>
@@ -7987,6 +7988,94 @@ void primImport(EvalState & state, Value * args, Value & out)
                 auto tDes = impStamp();
                 cache.cus.push_back(serialize::deserializeCU(*blob));
                 impBumpNs(importTimingTotals().deserializeNs, tDes);
+
+                // #815 RCA: V3_DBG_DESERIALIZE_VERIFY=path forks a side
+                // path that ALSO fresh-compiles the same source in this
+                // process and compares the deserialized CU's bytecode
+                // to the fresh CU's bytecode byte-by-byte (post-remap).
+                // Any divergence reveals a non-deterministic shape that
+                // survives serialize+deserialize but produces different
+                // bytecode cross-process.  Output goes to <path> as one
+                // line per diverging entry: "DIFF path=X cached_size=N
+                // fresh_size=M first_diff_ip=K cached=0x... fresh=0x...".
+                static const char * s_verifyLog =
+                    std::getenv("V3_DBG_DESERIALIZE_VERIFY");
+                if (s_verifyLog) {
+                    try {
+                        nix::Expr * e2 = nullptr;
+                        if (useCorepkgs) {
+                            nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(),
+                                               nix::CanonPath(corepkgsPath));
+                            e2 = ns.parseExprFromFile(cp);
+                        } else {
+                            e2 = ns.parseExprFromFile(resolvedSp);
+                        }
+                        e2->bindVars(ns, ns.staticBaseEnv);
+                        auto module2 = lowerNixExpr(e2, ns.symbols, ns.positions);
+                        nix::v3::ir::optimise(module2);
+                        nix::v3::ir::computeFreeVars(module2);
+                        auto cu2 = compile(module2);
+                        auto & cu1 = cache.cus.back();
+                        FILE * vf = std::fopen(s_verifyLog, "a");
+                        if (vf) {
+                            bool sameCode = (cu1.code == cu2.code);
+                            bool sameLambdas = (cu1.lambdas.size() == cu2.lambdas.size());
+                            std::fprintf(vf, "VERIFY path=%s code=%s "
+                                "(cached=%zu fresh=%zu) lambdas=%s "
+                                "(cached=%zu fresh=%zu) ints=%zu/%zu "
+                                "strs=%zu/%zu prims=%zu/%zu\n",
+                                path.c_str(),
+                                sameCode ? "SAME" : "DIFF",
+                                cu1.code.size(), cu2.code.size(),
+                                sameLambdas ? "SAME" : "DIFF",
+                                cu1.lambdas.size(), cu2.lambdas.size(),
+                                cu1.intConstants.size(), cu2.intConstants.size(),
+                                cu1.stringConstants.size(), cu2.stringConstants.size(),
+                                cu1.primops.size(), cu2.primops.size());
+                            if (!sameCode) {
+                                size_t minN = std::min(cu1.code.size(), cu2.code.size());
+                                size_t firstDiff = SIZE_MAX;
+                                for (size_t i = 0; i < minN; ++i) {
+                                    if (cu1.code[i] != cu2.code[i]) {
+                                        firstDiff = i; break;
+                                    }
+                                }
+                                std::fprintf(vf, "  first_diff_ip=%zu",
+                                    firstDiff == SIZE_MAX ? minN : firstDiff);
+                                if (firstDiff != SIZE_MAX) {
+                                    Op opC = decodeOp(cu1.code[firstDiff]);
+                                    Op opF = decodeOp(cu2.code[firstDiff]);
+                                    uint32_t arC = decodeOperand(cu1.code[firstDiff]);
+                                    uint32_t arF = decodeOperand(cu2.code[firstDiff]);
+                                    std::fprintf(vf,
+                                        " cached={%s(0x%02x), arg=%u} fresh={%s(0x%02x), arg=%u}",
+                                        opName(opC), (unsigned)opC, arC,
+                                        opName(opF), (unsigned)opF, arF);
+                                }
+                                std::fprintf(vf, "\n");
+                                // Disassemble +-3 instructions around firstDiff in BOTH.
+                                if (firstDiff != SIZE_MAX) {
+                                    uint32_t lo = firstDiff > 6 ? (uint32_t)(firstDiff - 6) : 0;
+                                    uint32_t hiC = (uint32_t)std::min<size_t>(cu1.code.size(), firstDiff + 8);
+                                    uint32_t hiF = (uint32_t)std::min<size_t>(cu2.code.size(), firstDiff + 8);
+                                    std::fprintf(vf, "  cached-disasm [%u..%u]:\n", lo, hiC);
+                                    disassembleWindow(vf, cu1, lo, hiC);
+                                    std::fprintf(vf, "  fresh-disasm [%u..%u]:\n", lo, hiF);
+                                    disassembleWindow(vf, cu2, lo, hiF);
+                                }
+                            }
+                            std::fclose(vf);
+                        }
+                    } catch (const std::exception & ev) {
+                        FILE * vf = std::fopen(s_verifyLog, "a");
+                        if (vf) {
+                            std::fprintf(vf, "VERIFY-FAIL path=%s err=%s\n",
+                                path.c_str(), ev.what());
+                            std::fclose(vf);
+                        }
+                    }
+                }
+
                 auto tRun = impStamp();
                 out = run(cache.cus.back());
                 impBumpNs(importTimingTotals().runNs, tRun);
