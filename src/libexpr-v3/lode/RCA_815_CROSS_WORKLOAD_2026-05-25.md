@@ -553,3 +553,70 @@ non-determinism is fixed.
 Action item: introduce `NIX_V3_DISK_CACHE_DEFAULT_OFF=1` (or
 flip the gate's default) gated by a TODO entry referencing
 this RCA.
+
+## Light variant Phase 1 + 2 landed 2026-05-25
+
+### Fixes applied
+
+1. **lowerLetRec canonical iteration** (lower.cc:2643+): collect TW-
+   order entries into a `TwEntry` vector, then sort by symbol
+   STRING and allocate FuncIds + build pending in that canonical
+   order.  `recAttrsNames` / `byDispl` continue to be built in
+   TW order (preserves TW's `ExprVar::displ` semantics).
+
+2. **lowerAttrs canonical iteration** (lower.cc:2474+ and
+   lower.cc:2416+ for dyn): replaced the natural-order
+   `for (auto it = e->attrs->begin(); ...)` with a sort by
+   symbol string.  `thunkifyForAttr` thus allocates FuncIds in
+   canonical order.
+
+### Validation
+
+Added `name_diffs` field to `V3_DBG_DESERIALIZE_VERIFY`
+diagnostic: compares `cu_cached.lambdas[K].name` vs
+`cu_fresh.lambdas[K].name` for each FuncId.
+
+**Before Light fixes**: 22/162 files SAME (mostly empty CUs); 140/162
+have name_diffs.
+
+**After Light fixes (lowerLetRec + lowerAttrs)**: still 22 SAME,
+140 DIFF.  The fixes ARE taking effect (verified via
+`V3_DBG_815_CANONICAL` diagnostic showing canonical iteration in
+LetRec), but the bug still fires because some FuncId allocation
+path is still process-local.
+
+### Still leaking
+
+Inspection of `m.functions.emplace_back()` call sites in lower.cc:
+- 437 (top-level?)
+- 1103 (lowerLambda body) — single allocation, deterministic.
+- 1244 (lowerLambda formals) — vector iteration, source-order,
+  should be deterministic.
+- 1779 (thunkify) — single allocation per call.  Order depends on
+  CALLER's iteration order.
+- 2707 (lowerLetRec, canonical-sorted ✓)
+- 2916 (inheritFrom inside lowerLetRec — vector iter, OK)
+
+The fact that 140 files still have name_diffs suggests there's a
+remaining caller that iterates a TW-Symbol-keyed container and
+calls thunkify (or similar).  Candidates:
+- ExprWith bodies.
+- inherit-from cache resolution.
+- Some path in callPackages / nested overlay machinery.
+
+### Reproducer-level status
+
+The `unexpected argument 'git'` error in the sweep+HNE reproducer
+STILL fires after the Light Phase 1+2 fixes.  Need to identify
+and fix the remaining process-local-order leak.
+
+### Next steps for Light Phase 3
+
+- Add `V3_DBG_FUNCID_ALLOC=path` that logs every
+  `m.functions.emplace_back()` site (file:line + name + FuncId)
+  to a file.  Diff between sweep and HNE processes to find
+  diverging allocations.
+- Or: enable the `V3_DBG_815_CANONICAL` for ALL scope-type
+  iterations (LetRec, Attrs, Dyn) and verify the canonical order
+  is applied everywhere.
+- Once located, apply the same canonical-sort fix.

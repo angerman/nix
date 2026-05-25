@@ -8020,15 +8020,36 @@ void primImport(EvalState & state, Value * args, Value & out)
                         if (vf) {
                             bool sameCode = (cu1.code == cu2.code);
                             bool sameLambdas = (cu1.lambdas.size() == cu2.lambdas.size());
+                            // #815 RCA: also compare per-FuncId NAMES.
+                            // If writer and reader allocate FuncIds to
+                            // DIFFERENT named bindings, that's the bug.
+                            size_t nameDiffs = 0;
+                            size_t firstNameDiff = SIZE_MAX;
+                            size_t minLam = std::min(cu1.lambdas.size(),
+                                                     cu2.lambdas.size());
+                            for (size_t i = 0; i < minLam; ++i) {
+                                if (cu1.lambdas[i].name != cu2.lambdas[i].name) {
+                                    if (firstNameDiff == SIZE_MAX) firstNameDiff = i;
+                                    nameDiffs++;
+                                }
+                            }
                             std::fprintf(vf, "VERIFY path=%s code=%s "
                                 "(cached=%zu fresh=%zu) lambdas=%s "
-                                "(cached=%zu fresh=%zu) ints=%zu/%zu "
-                                "strs=%zu/%zu prims=%zu/%zu\n",
+                                "(cached=%zu fresh=%zu) name_diffs=%zu/%zu",
                                 path.c_str(),
                                 sameCode ? "SAME" : "DIFF",
                                 cu1.code.size(), cu2.code.size(),
                                 sameLambdas ? "SAME" : "DIFF",
                                 cu1.lambdas.size(), cu2.lambdas.size(),
+                                nameDiffs, minLam);
+                            if (firstNameDiff != SIZE_MAX) {
+                                std::fprintf(vf,
+                                    " (first name diff at fid=%zu: cached='%s' fresh='%s')",
+                                    firstNameDiff,
+                                    cu1.lambdas[firstNameDiff].name.c_str(),
+                                    cu2.lambdas[firstNameDiff].name.c_str());
+                            }
+                            std::fprintf(vf, " ints=%zu/%zu strs=%zu/%zu prims=%zu/%zu\n",
                                 cu1.intConstants.size(), cu2.intConstants.size(),
                                 cu1.stringConstants.size(), cu2.stringConstants.size(),
                                 cu1.primops.size(), cu2.primops.size());

@@ -30,8 +30,10 @@
 #include "nix/expr/symbol-table.hh"
 #include "nix/util/position.hh"
 
+#include <algorithm>
 #include <deque>
 #include <functional>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2411,7 +2413,19 @@ struct Lowerer
         if (hasDyn) {
             ir::AttrSetDyn dyn;
             dyn.statics.reserve(e->attrs->size());
-            for (auto & kv : *e->attrs) {
+            // #815 RCA fix (Light variant): canonical-order iteration.
+            // See lowerAttrs's non-rec branch for the rationale.
+            std::vector<decltype(e->attrs->begin())> sortedItsDyn;
+            sortedItsDyn.reserve(e->attrs->size());
+            for (auto it = e->attrs->begin(); it != e->attrs->end(); ++it)
+                sortedItsDyn.push_back(it);
+            std::stable_sort(sortedItsDyn.begin(), sortedItsDyn.end(),
+                [&](auto a, auto b) {
+                    return std::string_view(symbols[a->first])
+                         < std::string_view(symbols[b->first]);
+                });
+            for (auto it : sortedItsDyn) {
+                auto & kv = *it;
                 // Lazy attrset values: wrap each entry in a thunk so
                 // sibling attrs aren't eagerly evaluated when the
                 // attrset is built.  Skips trivial expressions (literal
@@ -2469,7 +2483,25 @@ struct Lowerer
         // inherit-from cache.  Pair = (entries[] index, AST kv pointer).
         std::vector<std::pair<size_t, decltype(e->attrs->begin())>>
             ifEntrySlots;
-        for (auto it = e->attrs->begin(); it != e->attrs->end(); ++it) {
+        // #815 RCA fix (Light variant): iterate the attrset in
+        // CANONICAL (alphabetical-by-symbol-string) order.  `e->attrs`
+        // is `std::map<nix::Symbol, AttrDef>` ordered by TW-process-
+        // local symbol IDs — iterating in natural order makes the
+        // FuncId allocations inside `thunkifyForAttr` depend on TW
+        // intern history, so cu.lambdas[K] in cached vs fresh refer
+        // to DIFFERENT named attrs cross-process.  Non-rec attrsets
+        // have no displ-based self-references, so the iteration order
+        // is free to be anything as long as it's deterministic.
+        std::vector<decltype(e->attrs->begin())> sortedIters;
+        sortedIters.reserve(e->attrs->size());
+        for (auto it = e->attrs->begin(); it != e->attrs->end(); ++it)
+            sortedIters.push_back(it);
+        std::stable_sort(sortedIters.begin(), sortedIters.end(),
+            [&](auto a, auto b) {
+                return std::string_view(symbols[a->first])
+                     < std::string_view(symbols[b->first]);
+            });
+        for (auto it : sortedIters) {
             const auto & sym = it->first;
             const auto & def = it->second;
             const bool isIF =
@@ -2640,13 +2672,75 @@ struct Lowerer
         std::vector<Pending> pending;
         pending.reserve(attrDefs.size());
 
-        for (auto & kv : attrDefs) {
+        // #815 RCA fix (Light variant): canonicalise FuncId allocation
+        // order to be process-stable.
+        //
+        // `attrDefs` is `std::pmr::map<nix::Symbol, AttrDef>` — `Symbol`
+        // is a TW-process-local uint32_t whose value depends on TW's
+        // intern history.  Iterating the map in natural order means
+        // FuncIds (`m.functions.emplace_back()`) and the IR's e.entries
+        // vector get assigned in TW-Symbol order, which DIFFERS across
+        // processes for the same source.  Cross-process cache load
+        // then mis-maps `cu.lambdas[K]` to a different named binding,
+        // even though the bytecode is internally consistent — which
+        // breaks any consumer that assumes cu.lambdas[K] refers to a
+        // specific source entity (e.g., a closure that escapes to
+        // another CU via callPackage / overlay machinery).
+        //
+        // Fix: collect attrDefs entries in TW order, then sort by
+        // symbol STRING (canonical) before allocating FuncIds and
+        // building the IR vectors.  TW's `ExprVar::displ` is the
+        // iteration position in `attrDefs` (TW-Symbol order); we
+        // preserve that by building `recAttrsNames` / `byDispl` in
+        // the ORIGINAL TW order — only the IR's e.entries (via
+        // pending) and m.functions ordering changes.
+        //
+        // Result: writer and reader assign the SAME FuncId to the
+        // SAME named binding, so cu.lambdas[K] is canonical.  Each
+        // entry's thunkBody, MAKE_THUNK sequence, and IR e.entries
+        // ordering becomes process-independent.  Bytecode bytes
+        // still differ cross-process due to per-process v3-SymbolId
+        // values in OP_ATTRS_REC_INIT trailers and REC_SET slot
+        // operands, but the existing serialize-time remap correctly
+        // translates those.
+        //
+        // The Full variant (deferred) would extend canonical
+        // de Bruijn indices to all variable references, eliminating
+        // displ entirely.  See lode/RCA_815_CROSS_WORKLOAD_2026-05-25.md.
+        struct TwEntry {
+            nix::Symbol sym;
+            nix::ExprAttrs::AttrDef::Kind kind;
+            nix::Expr * defE;
+            uint32_t posHandle;
+        };
+        std::vector<TwEntry> twEntries;
+        twEntries.reserve(attrDefs.size());
+        for (auto & kv : attrDefs)
+            twEntries.push_back({kv.first, kv.second.kind, kv.second.e,
+                                 posIdxToHandle(kv.second.pos)});
+
+        // Canonical permutation: canonicalIdx[c] = TW-displ of the
+        // c-th canonical (alphabetical by symbol string) entry.
+        // Stable sort so two entries with identical names (would be
+        // a duplicate-attr error at parse time, can't happen here)
+        // preserve their TW position relative ordering.
+        std::vector<size_t> canonicalIdx(twEntries.size());
+        std::iota(canonicalIdx.begin(), canonicalIdx.end(), size_t{0});
+        std::stable_sort(canonicalIdx.begin(), canonicalIdx.end(),
+            [&](size_t a, size_t b) {
+                return std::string_view(symbols[twEntries[a].sym])
+                     < std::string_view(symbols[twEntries[b].sym]);
+            });
+
+
+        for (size_t c = 0; c < canonicalIdx.size(); ++c) {
+            auto & te = twEntries[canonicalIdx[c]];
             m.functions.emplace_back();
             ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
             auto eb = m.freshBlock();
             m.functions[fid].entryBlock = eb;
-            m.functions[fid].name = std::string(symbols[kv.first]);
-            m.functions[fid].posHandle = posIdxToHandle(kv.second.pos);
+            m.functions[fid].name = std::string(symbols[te.sym]);
+            m.functions[fid].posHandle = te.posHandle;
             // CO-3 + WC-11: register every Let/Attrs binding's def
             // expression, not just top-level ones.  Same rationale
             // as `thunkify` (above): Nix is purely lexical, so
@@ -2705,12 +2799,12 @@ struct Lowerer
             // tandem with the slot-capture flag in this session.
             static const bool lambdaSkip =
                 std::getenv("NIX_V3_LAMBDA_SKIP") != nullptr;
-            const bool isLambda = kv.second.e
-                && kv.second.e->exprKind == nix::Expr::Kind::Lambda;
-            if (kv.second.e && !(lambdaSkip && isLambda))
-                m.subExprFuncs.push_back({static_cast<const void *>(kv.second.e), fid});
-            pending.push_back({kv.first, kv.second.kind, kv.second.e, fid, eb,
-                                posIdxToHandle(kv.second.pos)});
+            const bool isLambda = te.defE
+                && te.defE->exprKind == nix::Expr::Kind::Lambda;
+            if (te.defE && !(lambdaSkip && isLambda))
+                m.subExprFuncs.push_back({static_cast<const void *>(te.defE), fid});
+            pending.push_back({te.sym, te.kind, te.defE, fid, eb,
+                                te.posHandle});
         }
 
         Scope recScope;
@@ -2737,11 +2831,20 @@ struct Lowerer
         // referencing recSlotVar fall through varOrigins lookup with
         // no match.
         m.recSlotVarIds.push_back(recSlotVar);
-        recScope.recAttrsNames.reserve(pending.size());
-        for (auto & p : pending) {
-            recScope.recAttrsNames.push_back(internSym(p.sym));
+        // #815 RCA fix (Light variant): iterate `twEntries` (TW order)
+        // to build recScope's TW-displ-indexed lookup tables.  `pending`
+        // is in CANONICAL order after the sort above, but TW's
+        // `ExprVar::displ` is the iteration position in `attrDefs`
+        // (TW-Symbol order) — so `recAttrsNames[displ]` must mirror
+        // that order for the resolveVar path (lower.cc::resolveVar).
+        // The IR side (m.functions, pending, e.entries) is in
+        // canonical order; only the displ-indexed structures here
+        // stay in TW order.
+        recScope.recAttrsNames.reserve(twEntries.size());
+        for (auto & te : twEntries) {
+            recScope.recAttrsNames.push_back(internSym(te.sym));
             recScope.byDispl.push_back(ir::kInvalid);
-            recScope.byName.emplace(std::string(symbols[p.sym]), ir::kInvalid);
+            recScope.byName.emplace(std::string(symbols[te.sym]), ir::kInvalid);
         }
 
         // REVIEW HIGH-4 follow-up: hidden from-expr thunks built
