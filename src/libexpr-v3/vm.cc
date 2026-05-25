@@ -4830,6 +4830,37 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                                 k ? "," : "", (int)sn.size(), sn.data());
                                         }
                                         std::fprintf(stderr, "]\n");
+                                        // #815 full callstack dump — trace back
+                                        // to identify which expression is making
+                                        // the call.
+                                        std::fprintf(stderr,
+                                            "v3 FORMALS-DIAG-STACK (%zu frames):\n",
+                                            vm.frames.size());
+                                        for (size_t fi = vm.frames.size();
+                                             fi-- > 0 && fi >= (vm.frames.size() > 20
+                                                 ? vm.frames.size() - 20 : 0); ) {
+                                            const CallFrame & cfr = vm.frames[fi];
+                                            const LambdaDescriptor * fd = nullptr;
+                                            if (cfr.thunk
+                                                && (cfr.thunk->state == ThunkState::Suspended
+                                                    || cfr.thunk->state == ThunkState::Blackhole))
+                                                fd = cfr.thunk->suspended.desc;
+                                            else if (cfr.closure) fd = cfr.closure->desc;
+                                            const PosSnapshot * fps =
+                                                fd ? resolvePosSnapshot(fd->posHandle) : nullptr;
+                                            std::fprintf(stderr,
+                                                "  [%zu] name='%s' ctx='%s' src=%s:%u:%u ip=%u\n",
+                                                fi,
+                                                fd && !fd->name.empty()
+                                                    ? fd->name.c_str() : "<?>",
+                                                fd && !fd->contextualName.empty()
+                                                    ? fd->contextualName.c_str() : "<?>",
+                                                (fps && !fps->file.empty())
+                                                    ? fps->file.c_str() : "<no-pos>",
+                                                fps ? fps->line : 0u,
+                                                fps ? fps->column : 0u,
+                                                cfr.ip);
+                                        }
                                         std::fflush(stderr);
                                     }
                                     if (!s_permissiveFormals)
