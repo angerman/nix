@@ -50,12 +50,12 @@ fail=0
 # printer shows as `«primop foldl'»` — its typeOf is "lambda" in
 # either form, so we use isFunction instead which is stable).
 TW_TY="$("$NIX" eval --impure --expr 'builtins.typeOf builtins.foldl'"'"'' 2>&1 | tr -d '"')"
-V3_TY="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_MAX_WALL_TIME=10s \
+V3_TY="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=10s \
   "$NIX" eval --impure --expr 'builtins.typeOf builtins.foldl'"'"'' 2>&1 | tr -d '"')"
 
 # foldl' is callable from a v3-direct context (functional smoke).
 echo "===== Smoke: foldl' still callable post-#697 ====="
-RESULT="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_MAX_WALL_TIME=10s \
+RESULT="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=10s \
   "$NIX" eval --impure --expr 'builtins.foldl'"'"' (acc: x: acc + x) 0 [1 2 3 4 5]' 2>&1 \
   | grep -v '^Failed\|^warning:' | head -1)"
 if [[ "$RESULT" == "15" ]]; then
@@ -70,7 +70,7 @@ check() {
   local label="$1" expr="$2" expected="$3"
   local tw v3
   tw="$("$NIX" eval --impure --expr "$expr" 2>&1 | grep -v '^Failed\|^warning:' | head -1)"
-  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_MAX_WALL_TIME=10s \
+  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=10s \
     "$NIX" eval --impure --expr "$expr" 2>&1 | grep -v '^Failed\|^warning:' | head -1)"
   if [[ "$tw" == "$v3" && "$tw" == "$expected" ]]; then
     echo "  OK   $label => $v3"
@@ -90,7 +90,7 @@ check "concatMap dup [1 2]" 'builtins.concatMap (x: [x x]) [1 2]'     '[ 1 1 2 2
 # still be functionally correct).
 echo
 echo "===== Opt-in: NIX_V3_KEEP_TW_BUILTINS_MUTATION=1 still works ====="
-RESULT="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 NIX_V3_MAX_WALL_TIME=10s \
+RESULT="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=10s \
   NIX_V3_KEEP_TW_BUILTINS_MUTATION=1 \
   "$NIX" eval --impure --expr 'builtins.foldl'"'"' (acc: x: acc + x) 0 [1 2 3 4 5]' 2>&1 \
   | grep -v '^Failed\|^warning:' | head -1)"

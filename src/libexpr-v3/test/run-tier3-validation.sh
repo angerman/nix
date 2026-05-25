@@ -35,7 +35,7 @@ check_drv() {
   total=$((total + 1))
   local tw v3
   tw="$("$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
-  v3="$(NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  v3="$(NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_WALL_TIME=120s NIX_V3_MAX_HEAP=8G \
         "$NIX" eval --impure --expr "$expr" 2>/dev/null || true)"
   if [[ -z "$tw" ]]; then

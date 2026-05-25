@@ -27,7 +27,7 @@ run_pair() {
   local tw v3
   tw="$(timeout $timeout_s "$NIX" eval --impure --expr "$expr" 2>&1 \
         | grep -v '^Failed\|^warning:\|^building ' | head -1)"
-  v3="$(timeout $timeout_s env NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  v3="$(timeout $timeout_s env NIX_V3_DIRECT_EVAL=1 \
         NIX_V3_MAX_WALL_TIME=$((timeout_s-5))s NIX_V3_MAX_HEAP=8G \
         "$NIX" eval --impure --expr "$expr" 2>&1 \
         | grep -v '^Failed\|^warning:\|^building ' | head -1)"
