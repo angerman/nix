@@ -78,16 +78,26 @@ void ensureStackSizeAtLeast(size_t stackSize)
         auto requestedSize = std::min(static_cast<rlim_t>(stackSize), limit.rlim_max);
         limit.rlim_cur = requestedSize;
         if (setrlimit(RLIMIT_STACK, &limit) != 0) {
-            logger->log(
-                lvlError,
-                HintFmt(
-                    "Failed to increase stack size from %1% to %2% (desired: %3%, maximum allowed: %4%): %5%",
-                    savedStackSize,
-                    requestedSize,
-                    stackSize,
-                    limit.rlim_max,
-                    std::strerror(errno))
-                    .str());
+            // Mirror the gate on the matching `lvlWarn` line above:
+            // tests that explicitly opt into a clean stdout capture
+            // (`_NIX_TEST_NO_ENVIRONMENT_WARNINGS=1`) shouldn't see
+            // this stderr line either — it's the same diagnostic
+            // class as the preceding "hard limit too low" warning,
+            // and on darwin the `setrlimit(RLIMIT_STACK, ...)` call
+            // failing with EINVAL is expected (the kernel hard
+            // limit is well below the libstore-desired 64 MB).
+            if (getEnv("_NIX_TEST_NO_ENVIRONMENT_WARNINGS") != "1") {
+                logger->log(
+                    lvlError,
+                    HintFmt(
+                        "Failed to increase stack size from %1% to %2% (desired: %3%, maximum allowed: %4%): %5%",
+                        savedStackSize,
+                        requestedSize,
+                        stackSize,
+                        limit.rlim_max,
+                        std::strerror(errno))
+                        .str());
+            }
         }
     }
 }

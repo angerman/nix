@@ -65,6 +65,17 @@ esac
 # inherit the gates without rewriting the table.  The gates are pure
 # diagnostics; they don't change semantic correctness, only surface
 # missed-root bugs the gateless run would silently swallow.
+# #820 (2026-05-26): suppress the libutil stack-size warnings on darwin.
+# `setrlimit(RLIMIT_STACK, 64 MB)` returns EINVAL whenever the inherited
+# hard limit is below 64 MB — universally true on darwin without root.
+# The warning is informative for end-users but pure noise for the test
+# harness, where every `nix` invocation prints it onto stderr and (when
+# captured via `2>&1`) contaminates expected-vs-actual comparisons.
+# `_NIX_TEST_NO_ENVIRONMENT_WARNINGS=1` is the libutil-supported escape
+# hatch; this commit extends its scope to cover the "Failed to increase
+# stack size" lvlError print as well.  See current-process.cc.
+export _NIX_TEST_NO_ENVIRONMENT_WARNINGS=1
+
 if [[ "$mode" == "brute" ]]; then
   export NIX_V3_NURSERY=1
   export NIX_V3_NURSERY_SCAVENGE=1
