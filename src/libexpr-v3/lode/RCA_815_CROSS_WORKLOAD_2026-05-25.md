@@ -271,7 +271,109 @@ CU's bytecode drives, not in the value-of-functionArgs path.
 
 - `V3_DBG_DISK_CACHE_LOG`: lookup/insert tracing
 - `V3_DBG_DISK_CACHE_BLOCK`: force-fresh-compile for specific keys
+- `NIX_V3_OPT_PHASE_LIMIT=N`: run only the first N opt passes
 - `/tmp/v3-815-bisect.sh`: pass/fail oracle (FAIL = "git" error;
   PASS = eval proceeded past git-check into IFD-build phase)
 - `/tmp/v3-815-bisect-opt.sh`: same oracle, wrapped to test
   individual opt-pass env-var gates
+
+### Post-bisection update: inlineTrivialBindings is the trigger
+
+Added `NIX_V3_OPT_PHASE_LIMIT=N` to `opt_const_fold.cc::optimise()`.
+Each top-level pass in the pipeline counts as one phase; the env
+var lets bisection target a single pass without code edits.
+
+Pass numbering (0-based):
+
+  0 constantFold       6 fusePrimOpApps        12 ifThenFold (block)
+  1 betaReduce         7 primOpFold            13 genListUnroll
+  2 constantFold       8 constantFold          14 appSpineFold (block)
+  3 commonSubexprElim  9 inlineTrivialBindings 15 deadBindingElim
+  4 elimRedundantForce 10 streamFusion          16 Stage 4 (gated)
+  5 inlineTrivialBindings 11 ...
+
+Bisection (sweep + HNE reproducer):
+
+  LIMIT=0 → PASS (no opt anywhere)
+  LIMIT=3 → PASS (through constantFold ×2 + commonSubexprElim)
+  LIMIT=4 → PASS (+ elimRedundantForce)
+  LIMIT=5 → PASS (+ inlineTrivialBindings #1 omitted — wait, see below)
+  LIMIT=5 → PASS
+  LIMIT=6 → FAIL (+ inlineTrivialBindings #1)
+  LIMIT=7 → FAIL
+  LIMIT=15 → FAIL
+
+**LIMIT=5 passes, LIMIT=6 fails.  The 6th call into the pipeline
+is the first `inlineTrivialBindings(m)` invocation.**
+
+What `inlineTrivialBindings` does: it builds an
+`unordered_map<VarId, VarId> alias` of every `VarRef` binding,
+path-compresses it, then rewrites every operand VarId through the
+map and drops the alias bindings.  See `opt_inline.cc:203`.
+
+Why the bug fires: the cross-process compile diverges at this
+pass.  Two processes compiling the same Nix source produce
+semantically different bytecode after running `inlineTrivialBindings`.
+The mechanism is not yet fully proven — most likely:
+
+1. `unordered_map<VarId, VarId>` iteration order is sensitive to
+   process state (bucket layout, libstdc++ rehash thresholds).
+2. Path compression with `for (auto & [k, v] : alias)` then mutates
+   `v` based on the snapshot of `alias` at the start of the loop.
+   But other entries also mutate during the loop, which makes the
+   path-compression OUTPUT depend on iteration order, not just on
+   the initial alias map.
+
+Specifically: `alias[A] = B; alias[B] = C`.  If we iterate (A, B),
+we first set `alias[A] = C` (finds B → C), then set `alias[B] = C`
+(no change).  If we iterate (B, A), we first set `alias[B] = C` (no
+change), then `alias[A] = C` (finds B → C still).  In this example
+order doesn't matter — but with longer chains and ties, order CAN
+affect the compressed result.
+
+(Subsequent rewrite step then uses the compressed alias map to
+patch VarIds in every expression — emit then encodes the patched
+VarIds into bytecode.  If alias compression differs across
+processes, the emitted bytecode differs, and the SEMANTICS of the
+result CAN differ if the rewrite happens to point a VarRef at a
+DIFFERENT terminal var that lower.cc had used for a different
+purpose downstream.)
+
+### Fix candidates (not yet implemented)
+
+A. Replace `unordered_map<VarId, VarId>` with `std::map<VarId, VarId>`
+   in `inlineTrivialBindings`.  **Tested 2026-05-25: did NOT fix
+   the bug.**  The non-determinism is not in this specific
+   container.  Reverted.
+
+B. Inspect every earlier pass (constantFold, betaReduce,
+   commonSubexprElim, elimRedundantForce) for `unordered_map<>`
+   iteration over container state that influences semantics.  Each
+   one is a candidate; the bug only manifests after
+   `inlineTrivialBindings` because that pass renumbers/drops
+   VarIds and EXPOSES the upstream non-determinism in the emit
+   output.
+
+C. Direct byte-by-byte comparison of LIMIT=5 sweep blob vs
+   LIMIT=5 HNE blob for `make-rust-platform.nix`.  (Caveat:
+   LIMIT=5 stack-overflows the entry point because passes 6-15
+   are critical for correctness on hello.drvPath, so the cache
+   never gets populated.  Workaround: use a smaller entry-point
+   eval that survives LIMIT=5 while still loading
+   make-rust-platform.nix — e.g. a small synthetic that
+   `import`s the file but doesn't force its outputs.)
+
+D. Move opt to reader side (cache pre-opt CU).  Heavier but
+   removes the cross-process determinism requirement entirely.
+
+E. Disable `NIX_V3_DISK_CACHE` by default until the underlying
+   determinism is fixed.  Pragmatic stopgap (loses ~13% on
+   hello.drvPath but guarantees correctness across the
+   sweep+HNE pattern).
+
+### Diagnostic env var (left in tree)
+
+`NIX_V3_OPT_PHASE_LIMIT=N` is left in `opt_const_fold.cc::optimise()`
+as a permanent debugging tool.  Future "cache load differs from
+fresh" investigations can re-use the bisection methodology
+without code edits.

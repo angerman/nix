@@ -279,28 +279,43 @@ void optimise(Module & m)
     static const bool disabled = std::getenv("NIX_V3_NO_OPT") != nullptr;
     if (disabled) return;
 
-    constantFold(m);
+    // #815 RCA hook: NIX_V3_OPT_PHASE_LIMIT=N runs only the first N
+    // passes in this function (0 = no passes, 1 = constantFold only,
+    // 2 = +betaReduce, etc.).  Used to bisect non-deterministic opt
+    // output cross-process.
+    static const int s_phaseLimit = [](){
+        const char * e = std::getenv("NIX_V3_OPT_PHASE_LIMIT");
+        return e ? std::atoi(e) : -1;
+    }();
+    int phase = 0;
+    auto checkPhase = [&]() -> bool {
+        if (s_phaseLimit < 0) return true;
+        return phase++ < s_phaseLimit;
+    };
+    #define OPT_RUN(call) do { if (!checkPhase()) return; call; } while (0)
+
+    OPT_RUN(constantFold(m));
     // 2026-05-18 IR Phase A: beta-reduce App(VarRef→Lambda, arg)
     // patterns before constantFold runs again — inlining frequently
     // surfaces new literal-arithmetic shapes that constantFold can
     // collapse.  Runs BEFORE CSE so inlined bindings get the CSE
     // pass too (the inlined body may duplicate existing bindings
     // in the enclosing block).
-    betaReduce(m);
+    OPT_RUN(betaReduce(m));
     // Re-run constantFold to pick up the literal-arithmetic exposed
     // by beta-reduction (e.g. `(x: x + 1) 5` → `5 + 1` → `6`).
-    constantFold(m);
-    commonSubexprElim(m);
+    OPT_RUN(constantFold(m));
+    OPT_RUN(commonSubexprElim(m));
     // #423 runs after CSE (so duplicate Force operands collapse to a
     // single resolved root via the alias map) and before
     // inlineTrivialBindings (so the freshly-introduced VarRef aliases
     // get path-compressed in the same pipeline).
-    elimRedundantForce(m);
-    inlineTrivialBindings(m);
+    OPT_RUN(elimRedundantForce(m));
+    OPT_RUN(inlineTrivialBindings(m));
     // #429 runs after alias collapse (so VarRef chains are flattened
     // and LitPrimOp -> App pairings are observable in one block) and
     // before DCE (so the partial-App orphans get swept).
-    fusePrimOpApps(m);
+    OPT_RUN(fusePrimOpApps(m));
 
     // 2026-05-18 IR Phase B: pure-primop constant folding.  Runs
     // AFTER fusePrimOpApps so we see the canonical PrimOpCall shape
@@ -309,16 +324,16 @@ void optimise(Module & m)
     // we re-run constantFold + inlineTrivialBindings to propagate the
     // folded literals + collapse the VarRef aliases primOpFold
     // introduces (e.g. `head [a b c]` → VarRef(a)).
-    primOpFold(m);
-    constantFold(m);
-    inlineTrivialBindings(m);
+    OPT_RUN(primOpFold(m));
+    OPT_RUN(constantFold(m));
+    OPT_RUN(inlineTrivialBindings(m));
 
     // 2026-05-18 IR Phase C: stream fusion.  Recognises
     // `foldl'(op, init, map(f, xs))` and rewrites to a single
     // __foldlMap PrimOpCall.  Runs AFTER Phase B so any Phase-B
     // folding of `map` (none today, but future) doesn't break the
     // pattern match.
-    streamFusion(m);
+    OPT_RUN(streamFusion(m));
 
     // 2026-05-18 IR Phase G: pure if-then-else folding.  Recognises
     // `If(LitBool, then, else)` patterns and inlines the chosen
@@ -327,9 +342,10 @@ void optimise(Module & m)
     // then a else b`) has resolved to a literal.  Then re-run
     // constantFold + inlineTrivialBindings to propagate the inlined
     // VarRef chain through the surrounding bindings.
+    if (!checkPhase()) return;
     if (ifThenFold(m)) {
-        constantFold(m);
-        inlineTrivialBindings(m);
+        OPT_RUN(constantFold(m));
+        OPT_RUN(inlineTrivialBindings(m));
     }
 
     // 2026-05-18 IR Phase H: static genList unrolling.  Recognises
@@ -339,7 +355,7 @@ void optimise(Module & m)
     // `builtins.length [a b c d]`-style n-args fold to LitInt before
     // we examine them.  No follow-up cleanup pass — the unrolled
     // form is itself in canonical IR shape.
-    genListUnroll(m);
+    OPT_RUN(genListUnroll(m));
 
     // 2026-05-18 IR Phase F: static App-spine folding.  Collapses
     // curried multi-arg chains (`(x: y: z: x+y+z) 1 2 3` → `1+2+3`)
@@ -351,10 +367,11 @@ void optimise(Module & m)
     // Force-on-param-access wrappers that the cloned body inherits;
     // then constantFold can see arithmetic on literals; then
     // inlineTrivialBindings collapses the VarRef aliases).
+    if (!checkPhase()) return;
     if (appSpineFold(m)) {
-        elimRedundantForce(m);
-        constantFold(m);
-        inlineTrivialBindings(m);
+        OPT_RUN(elimRedundantForce(m));
+        OPT_RUN(constantFold(m));
+        OPT_RUN(inlineTrivialBindings(m));
     }
 
     // OPT_OCCUR Phase B: opt-in occurrence-info-driven DCE.  When both
@@ -373,6 +390,7 @@ void optimise(Module & m)
     static const bool occurDceValidate =
         std::getenv("NIX_V3_OCCUR_DCE_VALIDATE") != nullptr;
 
+    if (!checkPhase()) return;
     if (__builtin_expect(occurDceValidate, 0)) {
         // Snapshot pre-DCE binding set: a vector of (block, var) pairs
         // gives us an O(1) per-binding "did this survive" check.
@@ -446,6 +464,7 @@ void optimise(Module & m)
     // The OUTER expression's Stage 4 still runs from run.cc as
     // before (the wall-clock cost there is ~zero — outer Apps
     // count is small).
+    if (!checkPhase()) return;
     static const bool stage4AllModules =
         std::getenv("NIX_V3_STAGE4_ALL_MODULES") != nullptr;
     if (__builtin_expect(stage4AllModules, 0)) {
@@ -454,6 +473,7 @@ void optimise(Module & m)
             if (applyStrictnessAtCallSites(m) == 0) break;
         }
     }
+    #undef OPT_RUN
 }
 
 } // namespace nix::v3::ir
