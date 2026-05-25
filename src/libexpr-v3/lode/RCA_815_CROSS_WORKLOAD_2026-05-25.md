@@ -149,3 +149,129 @@ workloads, then check one-by-one which one drives the divergence.
 Investigating.  Re-opened after the schema-13 commit `ed8fa0669` was
 believed to resolve #815 but didn't — production cache happens to
 pass; fresh tmp + 5-pkg sweep + haskell-nix-example still fails.
+
+## Update 2026-05-25 (post-bisection)
+
+Added two diagnostic env vars to `primops.cc::primImport` (commit
+forthcoming):
+
+- `V3_DBG_DISK_CACHE_LOG=path` — append `HIT key=... path=...` /
+  `MISS .../INSERT .../BLOCK ...` lines for each lookup/insert.
+- `V3_DBG_DISK_CACHE_BLOCK=hex1,hex2,...` — force a `lookup` to skip
+  the disk cache for matching keys (falls through to fresh compile).
+
+### Cache-entry bisection
+
+Using the log + block env vars:
+
+1. 5-pkg sweep INSERTs 609 CUs; haskell-nix-example HITs 162.
+2. The intersection (HITs in HNE that 5-pkg INSERTed) is **52 keys**.
+3. **Binary chop on the 52 shared keys** found a single sufficient
+   polluter — blocking that key alone makes HNE pass:
+
+       cd66d8044dca7449ded42871e40f4f0c9e571624a6dd25157c3119517c46d9b3
+       → /nix/store/77dbgds155bbz3vd3qywq1sii07i5ljs-source/
+         pkgs/development/compilers/rust/make-rust-platform.nix
+
+### Cross-process compile is non-deterministic
+
+The same `make-rust-platform.nix` content produces DIFFERENT
+serialized CUs in different processes:
+
+- Sweep-warmed cache blob: **11497 bytes**.
+- HNE-warmed cache blob:    **11497 bytes** (same size — same
+  content + same set of references → same encoding shapes).
+- `cmp -l`:                 **2273 differing bytes** (out of 11497).
+
+Same size, different bytes — consistent with **process-local
+SymbolId values being baked into the bytecode**.  SymbolIds depend
+on the intern history of `ir::globalSymbolTable()`, which differs
+between the sweep eval (nixpkgs from `getFlake "nixpkgs"`) and the
+HNE eval (haskell.nix overlay chain).
+
+### Within-process the cache is consistent
+
+`HNE → HNE` on the same cache directory: both runs succeed.
+The bug ONLY fires on `sweep → HNE` (cross-workload).
+
+### Schema-13 remap is correct in principle but does not save us
+
+`serialize::deserializeCU`'s symbol-table remap converts writer
+SymbolIds to reader SymbolIds.  After the remap walk + the formals
+re-sort (schema 12) + the selectorSym remap (schema 12), the loaded
+CU's bytecode references the reader's global names.
+
+However: the writer's COMPILER may have made decisions that depend on
+the WRITER's SymbolId values (e.g. iteration order through
+`unordered_map<VarId, ...>` in opt passes; emit-time peepholes
+keyed on `selectorSym`).  Those decisions are baked into the
+bytecode and survive remap intact — at the cost of producing
+different bytecode for the same source in different processes.
+
+### Surfaces at runtime as
+
+The cached `make-rust-platform.nix` over-forces something that
+fresh-compile leaves lazy.  The over-force cascade reaches
+fetch-cargo-vendor.nix:25 where
+`nix-prefetch-git.override { git = gitMinimal; }` ends up dispatched
+against a lambda from haskell.nix's pinned **lsdw9m87** nixpkgs whose
+formals don't include `git`.
+
+functionArgs on that lambda correctly reports `hasGit=0` in BOTH the
+healthy and the broken path (verified via `V3_DBG_FUNCTIONARGS_TRACE`
++ FORMALS-DIAG callstack).  The IF condition's bool result is
+correct, but the broken eval still reaches the call site — i.e.
+the divergence is upstream, in the **evaluation-order** the cached
+CU's bytecode drives, not in the value-of-functionArgs path.
+
+### What does NOT explain it
+
+- **Not** the schema-12 selectorSym remap: schema 13's re-sort fix
+  is in place, and the formals-bridge isn't the trigger here (no
+  `s_twLambdaBridge`).
+- **Not** any single opt pass with a gate.  Disabling each of
+  `NIX_V3_NO_BETA_REDUCE`, `NIX_V3_NO_APP_SPINE_FOLD`,
+  `NIX_V3_NO_STRICT_CALL_UNTHUNK`, `NIX_V3_NO_PRIMOP_FOLD`,
+  `NIX_V3_NO_STREAM_FUSION`, `NIX_V3_NO_IF_FOLD`,
+  `NIX_V3_NO_GENLIST_UNROLL`, `NIX_V3_NO_FUNC_STRICTNESS`,
+  `NIX_V3_NO_OPT_STRICT` individually on the sweep still
+  reproduces the regression.
+
+  (Tested in this session, 2026-05-25.)
+
+  ⇒ The culprit is one of the **ungated** passes in
+  `optimise()`: `constantFold`, `commonSubexprElim`,
+  `elimRedundantForce`, `inlineTrivialBindings`, `fusePrimOpApps`,
+  `deadBindingElim` — OR emit-time peephole work in `emit.cc`.
+
+- **Not** the in-memory `ImportCache::results` path-keyed lookup:
+  77dbgds vs lsdw9m87 have different content hashes, so they
+  occupy disjoint cache entries.
+
+### Open work
+
+- Add per-pass binary chop (manual patching needed — most candidate
+  passes don't have env-var gates).  Goal: identify the precise
+  pass and decision that differs cross-process.
+- Once narrowed, fix is either:
+  (a) Make the pass deterministic (eliminate
+      `unordered_map<SymbolId|VarId|Hash>` iteration in
+      decision-bearing positions; replace with `std::map` or
+      sorted-first traversal).
+  (b) Promote pre-opt CU to the cache value and re-opt on load
+      (loses 5-15% perf benefit from cached opt; correctness wins).
+  (c) Include opt-output checksum in the cache KEY so writers
+      with different opt outputs occupy different cache slots.
+- Pragmatic stopgap until a proper fix lands: document
+  `NIX_V3_NO_DISK_CACHE=1` as a workaround for cross-workload
+  scenarios (haskell.nix + standalone nixpkgs in the same cache
+  directory).
+
+### Reproducer + diagnostic toolset (this session)
+
+- `V3_DBG_DISK_CACHE_LOG`: lookup/insert tracing
+- `V3_DBG_DISK_CACHE_BLOCK`: force-fresh-compile for specific keys
+- `/tmp/v3-815-bisect.sh`: pass/fail oracle (FAIL = "git" error;
+  PASS = eval proceeded past git-check into IFD-build phase)
+- `/tmp/v3-815-bisect-opt.sh`: same oracle, wrapped to test
+  individual opt-pass env-var gates

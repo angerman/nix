@@ -7935,11 +7935,54 @@ void primImport(EvalState & state, Value * args, Value & out)
         }
         impBumpNs(importTimingTotals().keyComputeNs, tKey);
     }
+    // #815 RCA diagnostic (2026-05-25): V3_DBG_DISK_CACHE_LOG=path
+    // logs each lookup (hit/miss) and insert with the source path.
+    // Used to identify shared CUs between two workloads when
+    // diagnosing the cross-workload cache regression.  Format:
+    // "HIT key=hex path=...\n" or "MISS key=hex path=...\n" or
+    // "INSERT key=hex path=...\n".  Append-mode so multiple
+    // processes don't clobber each other.
+    //
+    // V3_DBG_DISK_CACHE_BLOCK=hex1,hex2,...  blocks specific cache
+    // keys from being read (lookup returns nullopt, forcing fresh
+    // compile).  Used to bisect which cache entry triggers a
+    // cross-workload divergence.  Hex prefix matching (substring
+    // is acceptable; minimum 8 hex chars).
+    static const char * s_diskCacheLog = std::getenv("V3_DBG_DISK_CACHE_LOG");
+    static const char * s_diskCacheBlock = std::getenv("V3_DBG_DISK_CACHE_BLOCK");
+    auto logCacheEvent = [&](const char * tag, const disk_cache::CacheKey & k) {
+        if (!s_diskCacheLog) return;
+        FILE * f = std::fopen(s_diskCacheLog, "a");
+        if (!f) return;
+        std::fprintf(f, "%s key=%s path=%s\n", tag, k.hex().c_str(), path.c_str());
+        std::fclose(f);
+    };
+    auto isKeyBlocked = [&](const disk_cache::CacheKey & k) -> bool {
+        if (!s_diskCacheBlock || !*s_diskCacheBlock) return false;
+        std::string hex = k.hex();
+        const char * cur = s_diskCacheBlock;
+        while (*cur) {
+            const char * end = std::strchr(cur, ',');
+            size_t len = end ? size_t(end - cur) : std::strlen(cur);
+            if (len > 0 && len <= hex.size()
+                && std::strncmp(hex.c_str(), cur, len) == 0)
+                return true;
+            if (!end) break;
+            cur = end + 1;
+        }
+        return false;
+    };
     if (diskCacheEnabled && !diskKey.empty()) {
+        if (isKeyBlocked(diskKey)) {
+            logCacheEvent("BLOCK", diskKey);
+            // Fall through to fresh compile path.
+            goto skipDiskCacheLookup;
+        }
         auto tLookup = impStamp();
         auto blob = disk_cache::lookup(diskKey);
         impBumpNs(importTimingTotals().diskLookupNs, tLookup);
         if (blob) {
+            logCacheEvent("HIT", diskKey);
             try {
                 auto tDes = impStamp();
                 cache.cus.push_back(serialize::deserializeCU(*blob));
@@ -7968,8 +8011,11 @@ void primImport(EvalState & state, Value * args, Value & out)
                 }
                 // Fall through to fresh lower+compile.
             }
+        } else {
+            logCacheEvent("MISS", diskKey);
         }
     }
+skipDiskCacheLookup:
 
     // #770b: cache miss — parse the file now (we deferred parse past
     // the disk-cache lookup so a hit could skip parse entirely).
@@ -8032,6 +8078,7 @@ void primImport(EvalState & state, Value * args, Value & out)
                 std::string blob = serialize::serializeCU(cache.cus.back());
                 disk_cache::insert(diskKey, blob);
                 impBumpNs(importTimingTotals().diskInsertNs, tInsert);
+                logCacheEvent("INSERT", diskKey);
             } catch (...) { /* best-effort */ }
         }
         // `module` destructed here, freeing all IR-side vectors
