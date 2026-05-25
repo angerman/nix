@@ -110,6 +110,28 @@ These are not opinions. They are conclusions reached the hard way.
 
 The pattern: real wins are simple, measured, and provable. Speculative architectural reshuffling rarely pays.
 
+### 1.6 v3 uses Boehm conservative GC today; Cheney nursery is designed but OFF
+
+Despite the Cheney nursery design in `CHENEY_NURSERY_DESIGN.md` and the substantial discussion of "the nursery" in lode/ docs, **the operative allocator in v3 today is Boehm-Demers-Weiser conservative GC**, inherited from cppnix. Concretely:
+
+- Phase A (allocator) and Phase C (scavenge fast paths) of the nursery LANDED but are gated `NIX_V3_NURSERY=1` opt-in (default-OFF).
+- Phase D (write barriers) is unresolved per `78835a047` ("write-barrier insufficient alone").
+- Phase E (scavenge frequency policy) hasn't been scoped.
+- The closure-pool / fakeClo recycling pool sits ON TOP OF Boehm — it's a fast-path for one specific shape (Suspended-thunk frame closures), but underlying memory is Boehm-allocated.
+
+Operational consequences observed on real workloads (e.g. `hello.drvPath` per `EXTEND_DERIVATION_INVESTIGATION_2026-05-18.md`):
+
+- **Heap grows; doesn't shrink.** The 1GB Boehm arena watermark during long evals stays at the high-water mark even when 95% becomes free internally. Future allocations land in free regions; resident set stays high.
+- **Conservative scanning retains defensively.** Boehm sees `uintptr_t`-shaped words; anything that looks pointer-like keeps that heap region alive. Tagged Values (16-byte, tag+payload) sometimes have pointer-looking payloads, sometimes don't — Boehm errs toward keeping alive.
+- **No generational separation.** Short-lived intermediates (Tag::App entries, intermediate Bindings from bytecode primops, A-normal-form thunk-bindings) pay full mark-sweep cost. A nursery's whole value proposition (most objects die young; reclaim in O(survivors)) is unavailable.
+- **Scan cost grows with arena size.** Each GC trigger walks the full live region; with arena past 1 GB, each scan amortizes into every force.
+
+**Implication for the 200× force-rate gap on hello.drvPath**: the Boehm-scan-amortization factor contributes an estimated ~5-10× of the observed gap. It is NOT the whole story (other factors: dispatch ~10×, intermediate allocations ~2-5×, possible caching gap unknown), but it IS load-bearing. Closing this factor requires Stage 3 (nursery default-on with Phase D write barriers landing), not just optimization elsewhere.
+
+**Implication for new code**: when designing primops or IR transformations, be aware that allocation in v3 is currently cheap-to-emit but expensive-amortized via Boehm scans. Reducing allocation rate at the source (Stage 4 strictness analysis, fusion, etc.) helps almost as much as the nursery would, because Boehm scans less when there's less to scan. The two are complementary, not substitutive.
+
+Reference: `feedback_v3_nursery_cstack_safety.md` memory (existing); `project_force_rate_decomposition_2026-05-18.md` memory (added 2026-05-18).
+
 ### 1.5 Phase-letter cascades signal investigation-without-convergence
 
 **Rule**: If a workload has an open RCA letter, the next divergence on it is a sub-letter on the same root-cause track. STG-15 may not exist until STG-14b is closed or explicitly retired.
@@ -117,6 +139,42 @@ The pattern: real wins are simple, measured, and provable. Speculative architect
 **Origin**: `{family}` A1 → A2 → A3 → A4 (with REFUTED!) → A4-take-2 → A5 (real fix) → A7 (workaround) → A8 (scaffolding) → A9 → A12, all on hello.name + nixpkgs eval. STG-1 through STG-14b on `#498`/`#516`/`#558`. Each cascade burned 1-2 weeks; the underlying architecture didn't move.
 
 **Counter-pattern**: architectural commitment. If letters A1-A3 reveal a class of bug, commit to the architectural fix in A4. Do not keep RCA'ing the same workload from a fresh hypothesis each Monday.
+
+### 1.7 Make it work right before making it fast
+
+**Rule**: Correctness/parity work before performance work. Optimizing a system whose semantics are still moving produces fast-but-broken. Stage architectural perf investments (nursery, write barriers, hidden classes, PICs) only after the correctness foundation is stable.
+
+**Origin (the cautionary tale)**: Codified 2026-05-20 after a 5-day stretch where the author of these docs repeatedly framed "Stage 3 nursery is load-bearing for perf; the team keeps deferring it" as a structural concern. The team was correctly prioritizing correctness/parity bug fixes (#665 `nix-eval-impure` cascade; #666 derivation equality; #667 OP_ASSERT operand force; #668 Tag::Uninitialized in STR_CONCAT; #669 rich `nix eval` printer parity; **#670/#671 dangling string_view across symbol intern — root-cause UAF fix**; #672-#675 string-context preservation across `toJSON`/`baseNameOf`/`dirOf`/`toXML`). Each fix changed the GC reachability shape. Stage 3 nursery work done BEFORE these landed would have needed revisiting after every parity fix — partial rework of write-barrier sites, of cell-tracking, of FFI-bridge promotion points.
+
+**Why**:
+
+1. **Optimization needs a stable semantic target.** Each parity fix changes what's reachable, what's a context-bearing Value, what's equal, what's a root. Phase D write barriers built against today's semantics get invalidated by tomorrow's parity fix.
+
+2. **Bugs reveal architectural truths.** The cluster of string-context bugs (#672-#675) reveals what kinds of Values cross primop boundaries. The nursery design has to accommodate that. Building the nursery before the bugs are fixed means building against an incomplete model.
+
+3. **Pillar 2 (cardano-node) FFI bridge work is correctness, not perf.** Commits `c11bb7374` (shallow-bridge for nAttrs + nList) + the derivationStrict-scoping work look like "Pillar 2 prep" but are actually getting cross-VM-state semantics right. Prerequisite for *any* perf work crossing the boundary.
+
+4. **The v3-hook deprecation is the original case study of this rule.** We spent 7 months on the hybrid architecture (perf wasn't the issue — correctness was). Stage 3 deferral today applies the lesson: don't optimize a system whose semantics aren't pinned down. See LESSONS Part 0 + `cf12c1880` ("architectural mistake" memo).
+
+**How to apply**: when tempted to advocate for an architectural perf investment, first verify the correctness foundation:
+
+| Signal | Threshold for "correctness stable" |
+|---|---|
+| Parity-bug discovery rate | ≤ 1/week sustained |
+| C1-C8 silent-semantic-gap fixtures | all 8 green |
+| `nix eval --json` byte-exact match with TW | holds for 1 week on representative corpus |
+| cutover-parity test | 142/142 holding 5+ consecutive days, no regressions |
+| Property tests | 580/580 under randomized inputs holding |
+
+If <4 of these hold, perf investments are premature. Refocus on the missing signal first.
+
+**Anti-pattern**: chanting "Stage X is load-bearing for perf, why isn't anyone working on it?" without checking the correctness signals. Calling it "architectural debt deferred" when it's actually "architectural debt correctly deferred until foundation is stable." This is what I (Claude in past turns) did for 5 consecutive days; codifying so future sessions don't repeat.
+
+**Counter-counter-pattern**: don't use this rule to defer perf work *indefinitely*. The watch is "correctness signals converging," not "correctness signals perfect." When 4-of-5 hold for 5 days, perf work becomes the next priority. Don't let bug-fix work fill all available time.
+
+**Concrete corollary on observed velocity**: correctness-first doesn't materially delay the endpoint. Perf work on stable semantics is *faster* and doesn't get reworked. Yesterday's projection that pushing Stage 3 nursery to ~2026-06-03 (post-correctness-convergence) only slips full-ROADMAP-end-state by ~1-2 weeks vs starting it 2026-05-19 — because skipping rework saves roughly the same time the deferral spends.
+
+**Reference**: this rule is the engineering variant of "make it work, make it right, make it fast" (Kent Beck) — but more conservative: make it work *right* before making it fast, because the alternative is fast-but-broken.
 
 ---
 
@@ -278,6 +336,46 @@ A12 found: `builtins.isAttrs (import <nixpkgs>{})` runs 11.5M forces in v3-direc
 
 **Anti-pattern**: "I'll just rerun the full hello.name eval each time" — this is what produces 7-letter RCA cascades. The full eval is the symptom; the bisected repro is the unit you can falsify against.
 
+### 4.10 Sidestep > patch — the Path B / Option 4 hybrid pattern
+
+When a bug is localized to a specific gate or condition, there are two paths to a fix:
+
+(a) **Patch the gate**: modify the failing site directly.
+(b) **Sidestep the gate**: redesign the call site so the gate's pathological case is never reached.
+
+**Worked example (Phase 1 close, 2026-05-18)**: Path B's lower.cc gate was localized in commit `ad95edfd2` to one nixpkgs site (`all-packages.nix:7385` `inherit (libsForQt5.callPackage ../development/libraries/wt { }) wt4;`) and one gated thunkification rule in `lower.cc`. The natural (a)-style fix would patch the lower.cc heuristic.
+
+Instead, the actual Phase 1 closure came via the **Option 4 hybrid** wrapper (commit `7adc7e61f`), which wraps `builtins.derivationStrict` / `builtins.derivation` in a bytecode-level iteration via `builtins.foldl'`. The recursion that was blowing the C-stack moved onto v3's frame stack, where Phase 1.2's iterative-force protocol handles arbitrary depth. The lower.cc gate's pathological case (deep C-recursion through stdenv inputs) no longer fires because the recursion lives in v3 frames now.
+
+Why (b) was better here:
+- The lower.cc gate's underlying decision (when to thunkify inherit-from expressions) was correct in principle. Patching it would either over-thunkify (perf regression on other patterns) or under-thunkify (correctness elsewhere). The trade-off is fundamental to the eager-vs-lazy asymmetry (LESSONS §1.3).
+- The C-recursion blowing the stack was a symptom of TOO MUCH WORK happening per C-frame in the derivation pipeline. Redesigning the pipeline (Option 4) reduced the C-frames per derivation to a small constant; the gate's behavior was no longer load-bearing for stack safety.
+- Option 4 also produced an architectural benefit beyond fixing the bug: derivation iteration now runs entirely in bytecode, eliminating one whole class of "TW round-trip per attr" overhead.
+
+**Lesson**: when a gate is localized, evaluate both paths before patching. Sometimes the gate's failure mode is the symptom; the redesign of the call site is the fix. Particularly when the gate has a deep architectural reason to exist (e.g. eager-vs-lazy laziness decisions), patching it patches the wrong layer.
+
+**Anti-pattern warning**: sidestepping is not always available. Don't generalize "sidestep > patch" as a rule. The check is: does the sidestep produce a structurally cleaner state (Option 4 did — derivation runs in bytecode), or does it just paper over the bug elsewhere (an opt-in gate is the bad version of "sidestep")? Real sidesteps reduce total complexity; bad sidesteps add it.
+
+### 4.11 Bytecode-primop installation tradeoff: callback yes, non-callback no
+
+The T0-T17 bytecode-primop installation series (commits `5104a7270` → `537e06460` over 2026-05-17) installed several primops as v3 bytecode. The result, after T13-T17 were reverted in `231c5b393`:
+
+**Installed as v3 bytecode (callback-using; benefit)**:
+- `foldl'`, `map`, `filter`, `all`, `any`, `concatMap`, `partition`, `groupBy`.
+
+**Reverted to C implementation (non-callback; no benefit)**:
+- `catAttrs`, `concatLists`, `listToAttrs`, `removeAttrs`, `intersectAttrs`.
+
+**The pattern**: a primop benefits from bytecode installation iff:
+1. It takes a callback (lambda) that would otherwise round-trip from C-impl → TW eval → return → C-impl. Bytecode installation keeps the callback in v3 frames; eliminates the round-trip.
+2. It's hot enough that the round-trip cost dominates the primop body.
+
+Pure C transforms (no callback) get no benefit from bytecode installation — the bytecode wrapper just adds dispatch cost. The body is the same fixed C transform; there's no callback to keep local.
+
+**Lesson**: when considering installing a primop as bytecode, ask "does it have a callback?" If no, leave it in C. If yes, install if it's hot.
+
+**Caveat**: bytecode primops can interact with the per-op overhead factor of the 200× force-rate gap. Installing too many primops as bytecode may itself slow things down by increasing dispatch volume. Bench before scaling.
+
 ### 4.9 The debug story (mandatory infrastructure for a VM project)
 
 A bytecode VM that compares against an existing evaluator needs a debug story that's broader than "add a printf when needed." The full story:
@@ -286,7 +384,7 @@ A bytecode VM that compares against an existing evaluator needs a debug story th
 2. **Differential testing against TW as oracle.** Today: `run-cutover-parity-tests.sh`, `run-drv-parity.sh`, `bench-v3-vs-tw.sh` — but only on fixed test suites. Needed: arbitrary-input front door `v3-diff-eval <file.nix> [--mode=output|trace|deep]`. Output mode = string match (catches result bugs). Trace mode = NIX_TRACE_EVAL force-event diff (catches force-order divergence; A9 demonstrated that string match alone can hide 25M extra force events). Deep mode = all of the above plus value-shape diff.
 3. **Trace evaluation semantics.** Already: NIX_TRACE_EVAL (force order), `V3_DBG_HOT_FORCE` (per-position counts), `V3_DBG_ALLOC_DUMP` (top-N descriptors), `V3_DBG_HOT_CALLEE` (callCount + stack-dump). Gap: outputs are per-tool. Consolidation target: single `V3_DBG_TRACE=force,alloc,call` style category bitmask (action plan Phase 4).
 4. **Regression tests.** §4.8 + CLAUDE.md "every bug fix needs positive + negative + regression tests." Keep every bisected repro forever.
-5. **Profiling.** Already: `V3_TIMING` (vm_ms/bridge_ms split), `allocStats`, bench harness (`bench.py`). Gap: documented CPU-profile workflow. Need a `make profile-<workload>` target that wraps `perf record` (Linux) / `xctrace` (macOS) and emits a flamegraph. Stage 2's "CPU-profile `pkgs ? lib`" depends on this.
+5. **Profiling.** Already: `V3_TIMING` (vm_ms/bridge_ms split), `allocStats`, bench harness (`bench.py`). Gap (being closed, 2026-05-20): documented CPU-profile workflow. Design committed in `PERF_TRACE_TOOL_DESIGN_2026-05-20.md`: `make perf-trace WORKLOAD=...` runs TW + v3-direct under a `psutil` sidecar sampler (CPU% / RSS / process-tree) plus an in-process `GC_get_heap_size()` probe gated by `NIX_V3_HEAP_TRACE`, and emits SVG overlays + JSONL traces in `bench/samples/<date>/`. ~3 days to first measurement; orthogonal to (and not a replacement for) `samply` / `xctrace` flamegraph workflows, which remain the right tool for hot-function attribution. Stage 2's "CPU-profile `pkgs ? lib`" can use either; perf-trace is the cheaper default.
 6. **Differential fuzzing / randomized parity testing.** Generate random Nix expressions (grammar-based: `let`/`with`/`inherit`/`rec`/`if`/lambda/attrset, plus small primops), run TW and v3-direct, assert output and trace match. Structural shrinker on failure. Run hourly in CI once stable. Would have caught the eager-vs-lazy asymmetry cascade (#496-#498-#516-#548-#577) earlier than hand-written tests did. Initial implementation: 200-400 LoC of Python wrapping the Nix evaluators.
 7. **Property tests for VM invariants.** The invariants hand-written tests can't enumerate:
     - `forceValue(forceValue(x)) == forceValue(x)` (idempotence).

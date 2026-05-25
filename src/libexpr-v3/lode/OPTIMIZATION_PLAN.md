@@ -1,4 +1,10 @@
-# v3 Optimization Plan (post-parity, October 2026)
+# v3 Optimization Plan (post-parity, October 2026) — **SUPERSEDED 2026-05-18**
+
+> **SUPERSEDED 2026-05-18**: this 3 774-line chronological log is historical context only.
+> For current strategic direction, see `ROADMAP_TO_VISION_2026-05-15.md` (long-horizon stages) and
+> `IR_OPTIMIZATION_PLAN_2026-05-18.md` (active IR Phases A-H, in progress 2026-05-18).
+> For the immediate work plan, see `ACTION_PLAN_2026-05-15.md`. The four canonical strategic
+> docs (auto-loaded via CLAUDE.md) are the authoritative reference; this file kept for archaeology.
 
 > **Status update (2026-05-07):** chronological log; Phases 1-4 of the
 > WC-38 work landed pre-2026-05-05.  Phase 5 is now default-on (see

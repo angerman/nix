@@ -134,7 +134,7 @@ memoization issue in mapAttrs-style App-entry caching.
 
 ## Action plan status
 
-- [x] Phase 0 — Hygiene (incomplete on env-var inventory; deferred)
+- [x] Phase 0 — Hygiene (MET 2026-05-15 per ACTION_PLAN Appendix A; env-var inventory at `ENV_VAR_INVENTORY_2026-05-15.md` categorizes 167 gates KEEP=17 / RETIRE-NOW=3 / RETIRE-AFTER-X=147; the "deferred" note refers to the 3 RETIRE-NOW gates marked for post-Phase-0 follow-up, of which eager-bridge TLS was retired in commit `7c8cc6e2c`)
 - [x] **Phase 1 — Iterative forceValue** (CLOSED via Option 4)
 - [ ] Phase 1.5 — Workload measurement spike (no change this session)
 - [ ] Phase 2 — Cycle-handling architectural decision (next phase)

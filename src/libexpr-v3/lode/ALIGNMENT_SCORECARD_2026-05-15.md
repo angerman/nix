@@ -20,9 +20,9 @@ Legend: ✅ delivered · ⚠️ partial · ❌ missing · 🔻 drifted away from
 | 6 | V8 hidden classes / shapes      | Shape-tagged attrsets; same source → same shape                | ❌ not started                                                                                                                  | ❌      | Roadmap Stage 5    |
 | 7 | Polymorphic Inline Caches       | Site-local shape/type cache at SELECT and CALL                 | ❌ not started                                                                                                                  | ❌      | Roadmap Stage 6    |
 | 8 | Selector thunks                 | `inherit (a) b, c` shares the force of `a`                     | ❌ not started                                                                                                                  | ❌      | Roadmap Stage 7    |
-| 9 | Generational GC                 | Cheney nursery, write-barrier, default-on                      | Phase A (allocator) + Phase C (scavenge) landed; **Phase D (write barriers) deferred**; default-OFF; closure-pool fills gap | ⚠️     | Roadmap Stage 3    |
+| 9 | Generational GC                 | Cheney nursery, write-barrier, default-on                      | **Today's allocator is Boehm conservative GC inherited from cppnix.** Phase A (allocator) + Phase C (scavenge) of Cheney landed but default-OFF; Phase D (write barriers) deferred. Closure-pool / fakeClo sits ON TOP OF Boehm. The 1 GB Boehm arena watermark observed on `hello.drvPath` runs is load-bearing for ~5-10× of the 200× force-rate gap. **Stage 3 (nursery default-on) is urgent post-Phase-1, not preparatory.** | ⚠️     | Roadmap Stage 3 (urgent) |
 | 10| Thin FFI to nix-store           | Narrow FFI surface for **system boundaries** (store, paths, IFD, file I/O, eval-state parse, shared symbol interning). Pure data ops (list/attrset/string/arith) stay **v3-native primops** by design — marshalling v3 Values ↔ Boehm-managed TW Values is too expensive and crosses GC ownership. | `ffi.cc` is 385 LoC ✓. Bridge plumbing for system boundaries (target keep + thin). Bridge plumbing for v3-can't-do-it escape hatches: `bridge_yield.cc` + ~370 LoC in vm.cc (target retire). primops.cc 8 336 LoC: a mix of correct v3-native + some duplication; needs audit, not blanket shrinking. | ⚠️     | Roadmap Stage 2+8  |
-| 11| Pure bytecode evaluation        | v3-direct evaluates real workloads end-to-end                  | TW pre-eval default-ON (`NIX_V3_SKIP_INSTALLABLE_PREEVAL` is opt-out); v3-direct fails hello.name                              | 🔻     | Action P1-2 + R-S2 |
+| 11| Pure bytecode evaluation        | v3-direct evaluates real workloads end-to-end                  | **2026-05-18 update**: `hello.name` and 7 sibling attrs evaluate at parity (1.4×) in v3-direct via Option 4 hybrid (Phase 1 MET, commit `ecc99fd07`). `hello.drvPath` / `.outPath` ~30× slower (active floor; Phase 2+ work). TW pre-eval still default-ON via `NIX_V3_SKIP_INSTALLABLE_PREEVAL` opt-out. | ⚠️ (was 🔻) | Action P1-2 + R-S2 |
 | 12| Bytecode disk cache             | Lowered bytecode cached on disk                                | `disk_cache.cc` + `serialize.cc`; works                                                                                        | ✅      | n/a (done)         |
 
 ## Drift items (changes away from vision)
@@ -73,6 +73,18 @@ An alignment review re-asks: is the vision still right? Are stages still in the 
 - **Drifted**: 1 component in serious drift (11 — pure-bytecode eval), plus D-items D1, D2, D3, D4, D5, D6.
 
 **Summary**: roughly **30-35% of the architectural vision is shipped**. The rest is either staged-in-design (nursery), explicitly-not-started (V8-style shapes/PICs/selectors), or actively drifting away (TW pre-eval dependency, TW-bridge escape hatches in vm.cc, env-var sprawl). Note: large primops.cc is **not drift** — v3-native primops are architecturally correct because marshalling v3 Values to/from Boehm-managed TW Values would be both expensive (per-call copy/wrap) and unsafe (crossing GC ownership). The FFI exists for system boundaries, not for replacing pure data primops.
+
+## Updated verdict 2026-05-18 (post-Phase-1)
+
+Phase 1 MET in 3 days vs 10-day target. `hello.name` and 7 sibling queries at parity (1.4× slower). Component 11 (pure-bytecode eval) moved from 🔻 drifted to ⚠️ partial — the user-facing workload now completes in v3-direct, but the new floor (`hello.drvPath` / `.outPath` at ~30× slower) reveals that the deeper Stage 3 / Stage 4 / Stage 5-6 work is load-bearing for shipping, not just architectural cleanliness.
+
+The drvPath force-rate gap (200× per-op) decomposes into four factors (see `project_force_rate_decomposition_2026-05-18.md`):
+- ~5-10× per-op dispatch (Stages 5-6 + Phase 4)
+- ~5-10× Boehm-arena scan overhead (Stage 3)
+- ~2-5× extra intermediate allocations (Stage 4 strictness)
+- unknown× higher-level caching gap (Stage 10 candidate, pending Phase 1.5)
+
+Each factor maps cleanly to a roadmap stage. The composition is multiplicative; closing one factor alone doesn't close the gap. **The roadmap stages were correctly chosen; their priorities are now empirically motivated rather than speculative.**
 
 The action plan addresses immediate correctness and ~half the drift (D1, D2, partial D3). The roadmap addresses the missing components (6, 7, 8) and the rest of the drift (D3 finish, D4, D5). Orphan gaps remain orphaned by design — re-evaluate at quarterly re-scoring.
 

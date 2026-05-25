@@ -213,5 +213,7 @@ visible diagnostics gated by these env vars.
 
 ---
 
+**RESOLVED 2026-05-18**. The fakeClo closure-pool aliasing root cause was fixed in commit `1708d31bd` (A5 sentinel tag). The remaining downstream C-stack overflow was resolved in Phase 1.2 via iterative `forceValue` conversions and Phase 1's Option 4 hybrid architecture (commit `7adc7e61f`). See `OPTION_4_COMPLETE_2026-05-18.md` for Phase 1 exit criterion details.
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0

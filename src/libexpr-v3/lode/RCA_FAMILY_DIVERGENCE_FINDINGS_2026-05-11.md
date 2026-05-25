@@ -105,5 +105,7 @@ floors HONEST_ASSESSMENT.md flagged.
 
 ---
 
+**RESOLVED 2026-05-18** (rolled into the A-series resolution; see `RCA_FAMILY_DIVERGENCE_2026-05-11.md`).
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0

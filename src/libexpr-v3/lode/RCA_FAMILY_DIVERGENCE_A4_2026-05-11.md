@@ -171,5 +171,7 @@ exist.
 
 ---
 
+**RESOLVED 2026-05-18** (A-series closed). A4's "cell aliasing REFUTED" hypothesis stood; A5 (commit `1708d31bd`) landed the real fix via fakeClo sentinel tag. Phase 1 architectural fix (Option 4 hybrid, commit `7adc7e61f`) made the underlying gate non-load-bearing for hello.name.
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0

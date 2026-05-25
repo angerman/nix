@@ -62,7 +62,232 @@ Hygiene only. No new features. No new gates. No new investigations.
 
 ---
 
+### Phase 1.5 — Workload measurement spike (1-2 weeks, post-Phase-1)
+
+Added 2026-05-17 after a verification agent flagged that several candidate roadmap additions (incremental eval / salsa, persistent attrsets / HAMT) rest on **unmeasured** workload-distribution hypotheses. Per Rule 0, a hypothesis must be killed or confirmed by measurement before stage commitment.
+
+**Goal**: produce data that lets us decide whether to commit Stages 10 (salsa-style result cache) and 11 (HAMT attrsets) — or to skip them. See `PERF_STRATEGY_2026-05-17.md`.
+
+**TODOs**:
+- [ ] **Instrument `NIX_EVAL_REPEAT_PROFILE`** in v3: per-cell-hash force counts; cross-invocation cell-hash overlap; result-equality fraction.
+- [ ] **Measure three workloads, cold + warm**:
+  - `(import <nixpkgs> {}).hello.name` (small)
+  - cardano-node flake `.packages.<system>.cardano-node` (medium fix-point overlay)
+  - `nixos-rebuild dry-build` (large module-eval)
+- [ ] **Measure overlay-heavy workload**: haskellPackages with overrides; attrset-size histogram; `//`-update cost fraction.
+- [ ] **Add parallel-potential trace analysis** (per `PARALLEL_EVAL_CAPABILITIES_2026-05-18.md` §8): record (forced thunk, parent thunk, force duration) tuples; offline-compute critical path length, total parallel work, theoretical N-core speedup. Decides Stage 13 fate.
+- [ ] **NEW: drvPath/outPath force-rate decomposition profile**. After Phase 1 closure, the new floor is `hello.drvPath` / `.outPath` at ~30× slower than TW. Use the same trace infrastructure to decompose the 200× per-force gap into: (a) dispatch cost per opcode, (b) GC scan time per force (Boehm arena watermark progression), (c) intermediate allocation count per logical op, (d) Value-identity-sharing comparison TW vs v3 (does TW share `Value*` across positions where v3 produces fresh Tag::Slot results?). Output drives prioritization between Phase 2 (cycle handling), Stage 3 (nursery), Stage 4 (strictness analysis). Memory reference: `project_force_rate_decomposition_2026-05-18.md`.
+  - **Instrument for items (b) and (c)** (added 2026-05-20): `PERF_TRACE_TOOL_DESIGN_2026-05-20.md` specifies a sidecar `psutil` sampler + in-process `GC_get_heap_size()` probe gated by `NIX_V3_HEAP_TRACE`, producing SVG overlays of CPU% / RSS / Boehm-heap over time for TW vs v3 on identical workloads. ~3 days to first measurement. **The first measurement run is the Rule 0 falsifier** for the factor-2 dominance hypothesis (see §"Rule 0 falsification anchor" in that doc). Build the tool before continuing this TODO; otherwise factors (b) and (c) are unobservable.
+- [ ] **Produce `MEASUREMENT_SPIKE_2026-XX-XX.md`** with verdict on each candidate stage (10 salsa / 11 HAMT / 12 JIT / 13 multi-core) AND prioritization of Phase 2 / Stage 3 / Stage 4 given the drvPath profile.
+
+**Exit criterion**: a one-page report whose verdict is one of:
+- Salsa hypothesis CONFIRMED (>40% warm fraction → commit Stage 10).
+- Salsa hypothesis REFUTED (<20% warm → don't commit; PIC + linking are right).
+- Salsa hypothesis PARTIAL (commit narrower scope, e.g. flake-output level only).
+- Same for HAMT (commit / don't / narrow).
+
+**Kill criterion**: if the spike itself takes >3 weeks, the instrumentation is wrong, not the hypothesis. Re-scope.
+
+**Why this lands here, not later**: measurement comes before commitment, not after. The action plan's Rule 0 prohibits adding stages "to coexist with current plan" based on hypotheses; the spike either kills or confirms before stage commitment.
+
+---
+
+### Phase 1.6 — Resource limit enforcement: `NIX_V3_MAX_HEAP` + `NIX_V3_MAX_CPU_TIME` + `NIX_V3_MAX_WALL_TIME` (4-5 days; landing target 2026-05-22)
+
+Added 2026-05-18; expanded the same day to include CPU + wall-time caps (same category, same implementation pattern). Small enabling-infrastructure piece that unblocks both Phase 1.5 (measurement under controlled conditions) AND the cardano-node feasibility sprint (prevents silent OOM mid-evaluation + bounds runaway eval). Heap design lives in `MAX_HEAP_LIMIT_DESIGN_2026-05-18.md`; time caps follow the same hybrid (in-process poll + optional OS backstop) approach.
+
+**Why this lands before Phase 2 / cardano-node work**: cross-cuts both Pillar 1 (perf) and Pillar 2 (cardano-node). Without a memory cap, Phase 1.5's `hello.drvPath` measurement cannot distinguish "v3 working under normal conditions" from "Boehm growing arbitrarily" — the perf decomposition becomes ambiguous. Cardano-node likely allocates 10-50GB; without a cap, M5 fails as a SIGKILL or swap-thrash rather than a typed exception with diagnostic. The cap is the universal pre-pre-flight that makes the actual pre-flight (200× re-measurement) meaningful.
+
+**TODOs — heap cap**:
+- [ ] Implement `GC_set_max_heap_size(N)` + `GC_set_oom_fn(handler)` per `MAX_HEAP_LIMIT_DESIGN_2026-05-18.md` §2. (~1 day)
+- [ ] Add `v3::OutOfMemoryError : public EvalError` type with the existing exception-class hierarchy. Hook dispatch-loop catch. (~0.25 day)
+- [ ] Env-var parsing for `NIX_V3_MAX_HEAP=2G` / `512M` / `64K` size suffixes. (~0.25 day)
+- [ ] Diagnostic snapshot on OOM: top-N allocators (from existing `allocStats` machinery), nursery occupancy, GC counts, current Boehm heap size, actual RSS. (~0.5 day)
+- [ ] Optional periodic RSS verification (`NIX_V3_VERIFY_RSS=1`): Linux `/proc/self/status` + macOS `task_info()`. Both as one-syscall-per-N-opcodes polling. (~1 day)
+
+**TODOs — CPU/wall-time caps**:
+- [ ] Periodic `getrusage(RUSAGE_SELF)` poll in dispatch loop (every ~10 000 opcodes). Throw `v3::CpuTimeExceededError` if `ru_utime + ru_stime > NIX_V3_MAX_CPU_TIME`. (~0.5 day)
+- [ ] Periodic `std::chrono::steady_clock::now()` poll on the same cadence. Throw `v3::WallTimeExceededError` if `now - evalStart > NIX_V3_MAX_WALL_TIME`. (~0.25 day)
+- [ ] Optional `setrlimit(RLIMIT_CPU, hardLimit)` backstop — if periodic check misses (e.g., busy syscall), OS sends SIGXCPU at `NIX_V3_MAX_CPU_TIME + 30s` grace; signal handler sets atomic flag; dispatch loop checks flag at next safe point. (~0.25 day)
+- [ ] Add `v3::CpuTimeExceededError : public EvalError` and `v3::WallTimeExceededError : public EvalError`. (~0.25 day)
+- [ ] Env-var parsing for time suffixes: `60s` / `5m` / `1h`. (~0.25 day)
+- [ ] Diagnostic snapshot on time exceed: top-N allocators, recent opcodes, frame stack depth, IFD status (currently in a daemon call?), CPU vs wall ratio. (~0.5 day)
+
+**TODOs — shared**:
+- [ ] Each new env var gets Rule 0 retirement-criterion comment at first `getenv()` read site.
+- [ ] Bench harness (`bench/bench.py`) gains `--max-heap` + `--cpu-budget` + `--wall-budget` parameters; default `NIX_V3_MAX_HEAP=4G` / `NIX_V3_MAX_CPU_TIME=300` / `NIX_V3_MAX_WALL_TIME=600` for all benchmarks to catch "perf win that doubled memory or runtime" regressions.
+- [ ] Test fixtures: (a) synthetic that should OOM (`test/repro-max-heap-oom.nix`); (b) synthetic infinite-loop that should hit CPU cap (`test/repro-max-cpu-busyloop.nix`); (c) synthetic slow-IFD that should hit wall cap (`test/repro-max-wall-slow-ifd.nix`); (d) regression that lang-tests pass under `NIX_V3_MAX_HEAP=512M NIX_V3_MAX_CPU_TIME=60`.
+
+**Exit criteria**:
+- `NIX_V3_MAX_HEAP=128M v3-eval --file repro-large.nix` produces typed `OutOfMemoryError` with top-allocator diagnostic.
+- `NIX_V3_MAX_CPU_TIME=5 v3-eval --expr '(let f = x: f (x+1); in f 0)'` produces typed `CpuTimeExceededError` within ~5-6 CPU seconds.
+- `NIX_V3_MAX_WALL_TIME=10 v3-eval --file repro-slow-ifd.nix` produces typed `WallTimeExceededError` after ~10 wall seconds.
+- Lang test suite (142 tests) + cutover-parity (142 tests) both pass under `NIX_V3_MAX_HEAP=512M NIX_V3_MAX_CPU_TIME=300`.
+- Bench harness accepts the three new flags and emits caps as part of result metadata.
+- `USAGE.md` documents the three env vars.
+
+**Kill criterion**: if Boehm's `GC_set_max_heap_size` doesn't behave as documented on any platform we care about, OR if `getrusage()` polling adds >2% overhead to lang-test runtime, the in-process approach is wrong for that piece; pivot to external `ulimit -v` / `ulimit -t` / `timeout` wrapper. Wrapper is simpler but loses typed-exception diagnostic.
+
+**Rule 0 framing**: this commit kills three hypotheses simultaneously:
+- "v3 evaluations are bounded by available system memory in practice" — falsified by `NIX_V3_MAX_HEAP`.
+- "v3 evaluations can run forever without bound" — falsified by `NIX_V3_MAX_CPU_TIME`.
+- "v3 evaluations can hang on IFD without bound" — falsified by `NIX_V3_MAX_WALL_TIME`.
+
+Each cap gives the user a graceful "fail-fast with diagnostic" instead of SIGKILL / hang / OOM.
+
+---
+
+### Phase 1.7 — Stage 3 readiness: GC correctness gaps + diagnostic-in-CI (5-7 days; landing target 2026-05-28)
+
+Added 2026-05-21 after the two-round GC audit (`RCA_VALUEPAIR_EVALUATED_2026-05-21.md`
++ `GC_AUDIT_ROUND_2_2026-05-21.md`). Round 1 fixed the primary `ValuePair::evaluated`
+SIGSEGV; Round 2 surfaced 12 more findings ranging from real-but-narrow SIGSEGV paths
+to architectural correctness gaps. Stage 3 (`Nursery default-on`, weeks 15-20 in
+ROADMAP) cannot flip the default until these are closed — otherwise it ships with
+known SIGSEGV paths.
+
+**Why this lands before Stage 3, not inside it**: Stage 3's existing TODO list assumes
+Phase C scavenge is correctness-complete and focuses on Phase D write barriers + Phase E
+frequency policy + closure-pool retirement. Round 2 falsifies that assumption: at
+least three classes of missed roots remain reachable on default-on workloads. Pushing
+them into Stage 3 itself risks the 6-week budget exploding into 10+ weeks of
+correctness-and-perf intermixed work. Landing the correctness gaps as a focused
+sub-week here keeps Stage 3 itself on its perf-focused budget.
+
+**TODOs — close remaining missed roots (each <1 day)**:
+- [ ] **Walk `Thunk::shapeCell`** in `gc.cc:walkThunk` and `Auditor::visitThunk`.
+  Currently un-walked; gated by `NIX_V3_CELL_EVERYWHERE=1` so latent today, but
+  must close before either Stage 3 default-on or any future flip of CELL_EVERYWHERE.
+- [ ] **Forward `CallFrame::forceWriteTarget` pointer when it points into a
+  nursery ListVec** (round-1 #6; refined by round-2 N4). The deepForceList path
+  at `vm.cc:8930` stores `&list->elems[i]` where `list` may be nursery. Scavenger
+  visits `*forceWriteTarget` but doesn't update the pointer. Fix: either forward
+  the pointer alongside the visit, OR change the deepForce protocol so the target
+  is always tenured (e.g., copy the list to staging before deepForce).
+- [ ] **Walk Blackhole-state `tail[]` + `suspended.capturedWiths`** (round-2 N1).
+  `clearBlackMarksOnException` reverts Blackhole → Suspended; OP_FORCE then
+  re-reads tail. Treat Blackhole identically to Suspended in `walkThunk` and
+  `Auditor::visitThunk`. SIGSEGV path on exception-heavy workloads under scavenge.
+- [ ] **Mirror Auditor's walks to the Scavenger's** (round-1 #8). Either share
+  a visitor pattern, OR codify the rule that each new scavenger root walk gets a
+  matching auditor walk. The five missed mirrors today: bridge tables,
+  primopReplacementMap, vBuiltins, importCache, callFlake, AttrSelectIC,
+  `f.forceWriteTarget`. Without parity, `V3_DBG_NURSERY_AUDIT=1` gives false
+  confidence.
+- [ ] **Clear all `CFF_FORCE_WB*` flags + `forceWriteTarget = nullptr` in
+  `clearBlackMarksOnException`** (round-2 N8). Only `CFF_FORCE_RETRY` is cleared
+  today; the other writeback flags can survive across throws and trigger spurious
+  `applyForceWriteback` on re-used VMStates.
+- [ ] **Wire `Scavenger::walkedCUs` for transitive CU IC walking** (round-2 N3/N4).
+  Field is declared at `gc.cc:114` with comment claiming transitive coverage but
+  is never read or written. Populate from `walkClosure(c->cu)` and
+  `walkThunk(t->suspended.cu)`; drain the set walking each CU's `attrSelectCache`.
+  Closes the gap where bytecode-installed primop closures use `OP_ATTRS_SELECT_IC`
+  against attrsets with nursery entries.
+- [ ] **Track huge allocations and include in `Arena::blockRanges()`**
+  (round-2 N11). The brute-scanner misses any tenured allocation > 4 MB (the
+  `kHugeCutoff` path). Maintain a `vector<BlockRange> hugeBlocks;` and emit it
+  alongside `blocks` from `blockRanges()`.
+- [ ] **Zero `capturedWiths` in `recycleFakeClo`** (round-2 N9). Defensive
+  cleanup; matches existing upvalue zero pattern. Currently safe-by-construction
+  because every pool consumer immediately overwrites the field — but the
+  invariant is fragile.
+
+**TODOs — diagnostic-in-CI (highest leverage)**:
+- [ ] **Wire `V3_DBG_NURSERY_BRUTE=1` into the lang+property+derivation-parity
+  test runners**. The infrastructure already exists at `gc.cc:postScavengeBruteScan`
+  and would mechanically catch every Round 1 missed-root class plus most Round 2
+  issues. Today the gate is run manually on failing cases. Cost: ~2 days of test
+  plumbing. Concretely:
+  - Extend `run-nursery-tests.sh` p9-p12 to run with
+    `NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1 NIX_V3_NURSERY_SIZE=1 V3_DBG_NURSERY_AUDIT=1 V3_DBG_NURSERY_BRUTE=1`
+    against the existing bench-nursery workloads plus a curated nixpkgs slice.
+  - Parse stderr for `SCAVENGE AUDIT: ... reachable` and
+    `SCAVENGE BRUTE: N tenured words point into nursery` (N > 0); fail the test
+    on any hit.
+  - Register as a meson `test()` so `ninja test` runs it.
+  - Add a slower CI matrix entry that runs `--full` with these gates plus
+    `NIX_V3_NURSERY_SIZE=1` (1 MB aggressive scavenge) across lang-tests +
+    property-tests + derivation-parity. Non-default; nightly.
+
+**Exit criteria**:
+- All 8 sub-fixes landed and reverified via `V3_DBG_NURSERY_BRUTE=1` on the
+  bench-nursery workload set: 0 hits across all p1-p12 cases.
+- `run-nursery-tests.sh` p9-p12 in the default meson `test()` registry.
+- The slower full-suite BRUTE pass exists as a nightly CI matrix entry.
+- `RCA_VALUEPAIR_EVALUATED_2026-05-21.md` + `GC_AUDIT_ROUND_2_2026-05-21.md`
+  updated with a closing "status" line per finding.
+
+**Kill criterion**: if any sub-fix exceeds 2 days (against the <1-day estimate),
+the codebase has hidden coupling we didn't see in audit. Stop, write up the
+discovery as a follow-on RCA, and renegotiate the Phase 1.7 budget before
+continuing.
+
+**Rule 0 framing**: each sub-fix kills a specific missed-root hypothesis surfaced
+in Round 2's audit. The aggregate kills the broader hypothesis "Phase C scavenge
+is correctness-complete enough to default-on" — Round 2's BRUTE-based evidence
+says NO; this phase says "now it is, and the diagnostic infrastructure proves it
+on every CI run."
+
+**Pre-Stage 3 not Stage 3**: explicitly noted because the temptation is to fold
+these into Stage 3 itself. Don't — Stage 3 should land Phase D + Phase E on a
+known-clean correctness baseline, not interleave correctness-and-perf work.
+
+**Forbidden during Phase 1.6**: extending caps to per-thread / per-eval / per-import / daemon-mode granularity. Process-level only; deferrable. Don't gold-plate. No combined "memory-or-time-whichever-first" composite limit (users compose via setting both).
+
+**Dependency**: depends on nothing. Can land in parallel with IR Phase F + H.
+
+---
+
+### Phase 2 kickoff conditions (added 2026-05-18 after Phase 1 closure)
+
+Phase 1 closed early (3 days vs 10-day target). Phase 2 (cycle-handling decision) target was 2026-06-11 starting on Day 15. Given:
+
+1. Phase 1's actual close came via the Option 4 hybrid bytecode wrapper — which **sidesteps** the underlying cycle/eager-force class for `derivation` / `derivationStrict` rather than resolving it. The eager-vs-lazy asymmetry (LESSONS §1.3) is still present in lower.cc; it just doesn't fire on the hot path anymore.
+2. The new floor (`hello.drvPath` 30× slower) is NOT a cycle-handling problem. It's a per-op overhead + GC pressure + allocation-rate problem.
+3. Phase 1.5 measurement spike now covers the drvPath force-rate decomposition.
+
+**Phase 2 kickoff is conditional on Phase 1.5 returning verdict.** Three branches identified at planning time:
+
+- **(a) Phase 1.5 says "cycle handling is highest leverage"** → run Phase 2 as currently scoped (THUNK_ALL vs CELL_EVERYWHERE decision; `pkgs ? lib` profile).
+- **(b) Phase 1.5 says "GC pressure / allocation rate dominates the drvPath gap"** → pivot Phase 2 to "Phase 2′ — Stage 3 nursery default-on prep" (Phase D write barriers, scavenge frequency policy). Original Phase 2 work deferred.
+- **(c) Phase 1.5 says "per-op dispatch dominates"** → pivot Phase 2 to "Phase 2″ — Phase 4 vm.cc decomp + computed-goto dispatch" prep. Original Phase 2 work deferred.
+
+### Phase 2(R) — IR optimization passes A-H (CHOSEN BRANCH, in progress 2026-05-18)
+
+Late on 2026-05-18 the team selected branch (b∧c hybrid): attack the per-op dispatch AND intermediate-allocation factors of the 200× force-rate gap simultaneously via IR-level optimization passes. The detailed plan lives in `IR_OPTIMIZATION_PLAN_2026-05-18.md` (8 phases A-H, each Rule-0-compliant with own hypothesis/exit/dependency/effort/risk).
+
+**Justification for skipping formal Phase 1.5 on these factors**: the `EXTEND_DERIVATION_INVESTIGATION_2026-05-18.md` decomposition serves as the measurement (factors identified: ~5-10× dispatch, ~2-5× intermediate allocations). Each IR phase has its own measurable validation. Phase 1.5 measurement is still relevant for Stages 10-13 (salsa / HAMT / JIT / multi-core) which the IR plan does NOT address.
+
+**In-progress (2026-05-18 onwards)**:
+- Housekeeping: re-baseline `bench/baselines/` + add hello.name / hello.drvPath / derivation-chain workloads to `workloads.toml`.
+- Phase A: 1-shot beta reduction (capture-known lambdas), `opt_inline.cc` extension.
+- Phase B: pure primop constant folding, extend `constantFold` for known-pure primops on literal args.
+- Phase C: stream fusion (foldl'/map/filter chains → single loop).
+- Phases D-H: capture-free lambda lift, selector recognition, static App spine fold, If fold, small-N genList unroll.
+
+**Exit criteria (cumulative across A-H)**:
+- `attrset-build-1k` regression closed.
+- `fib33` from 1.6× → ≤1.4× TW.
+- Per-op overhead drops from ~200× to ~20-30× **conditional on Stage 3 nursery closing the GC factor in parallel**. Without Stage 3, post-A-H residual is ~20-30× due to Boehm scan amortization.
+
+**Kill criterion**: if Phase C (stream fusion) doesn't close `attrset-build-1k` to ≤30% over TW, the bytecode primop architecture has a structural issue beyond what IR fusion can fix; revisit.
+
+**What this branch does NOT close**:
+- The ~5-10× GC-scan factor — needs Stage 3 (nursery default-on with Phase D write barriers).
+- The unknown caching gap — needs Phase 1.5 measurement of TW's caching, then Stage 10 (salsa) commit/falsify.
+- Therefore: **even fully complete A-H + bench validation leaves the drvPath gap at ~20-30×, not the ≤3× target.** The team's stated ≤3× cumulative target assumes Stage 3 lands in parallel or shortly after.
+
+Rule 0 framing: each A-H phase has its own falsification commit; the strategic choice to attack per-op + allocations together is implicitly justified by the decomposition. Phase 1.5 measurement is being run "in pieces" — decomposition for per-op/allocations (done in EXTEND_DERIVATION_INVESTIGATION); separate measurement needed for caching/HAMT/JIT/multi-core (still pending).
+
+---
+
+---
+
 ### Phase 1 — Close the A-series with iterative forceValue (Days 4-14, 2026-05-18 → 2026-05-28)
+
+**Status: MET 2026-05-18 (3 days; closure commit `ecc99fd07`). See Appendix A for details. Section below retained as the original phase definition.**
+
 
 A8 scaffolding is already partial. Finish it before continuing fakeClo / cycle work. Without iterative `forceValue`, deep stdenv hits C-stack overflow regardless of correctness.
 
@@ -176,7 +401,54 @@ If we miss two or more of these by 2026-07-10, **the v3-direct-as-primary path i
   Follow-ups recorded: eager-bridge TLS deletion (post-Phase 0),
   Phase 4 prerequisite for NIX_V3_DEBUG=cat bitmask helper, Phase
   2 prerequisite for THUNK_ALL family collapse. Phase 1 starts now.
-- Phase 1: [pending, target 2026-05-28]
+- Phase 1: **2026-05-18 MET** (3 days vs 10-day target).
+  Exit criterion ("(import <nixpkgs> {}).hello.name evaluates to a string
+  under NIX_V3_DIRECT_EVAL=1 without C-stack overflow"): CLEARED.
+  Closure commit: `ecc99fd07` (Phase 1 exit MET document) backed by
+  `7adc7e61f` (Option 4 hybrid landing) and `d3e41c13d` (Tag::App
+  evaluated-result memoization).
+
+  Results on hello.name and 7 sibling queries:
+  ```
+  TW:        hello.name → "hello-2.12.3"   0.47s
+  v3-direct: hello.name → "hello-2.12.3"   0.58s   (+23%, within 1.4×)
+  .pname / .version / .meta.description / .outputs / .system / .type
+                                          all at parity
+  ```
+
+  Architectural wins landed in Phase 1 (16 commits over 3 days):
+  - Path B localization (`ad95edfd2`) — root cause pinned to one
+    nixpkgs site + one lower.cc gate (not patched directly; sidestepped
+    by item below).
+  - OP_CALL fun-force iterative (`7f5a392f4`, `830e3b66a`).
+  - OP_ATTRS_SELECT_IC iterative + memoizing writeback (`a499fc2b0`).
+  - Tag::App writeback for valueEqual/valueLess (`61f1ed96e`).
+  - **Option 4 hybrid** (`7adc7e61f`) — bytecode wrapper for
+    `derivation` / `derivationStrict`. Per-attr work runs as bytecode
+    opcodes, moving the per-input C-frame growth onto the v3 frame
+    stack where Phase 1.2's iterative-force handles arbitrary depth.
+    This is the architectural fix, not the lower.cc gate identified
+    in `ad95edfd2`.
+  - T0-T12 bytecode-primop installation series (`5104a7270` →
+    `537e06460`): foldl', map, filter, all, any, concatMap, partition,
+    groupBy installed as v3 bytecode. T13-T17 reverted (non-callback
+    primops stay as C; see LESSONS_LEARNED §4.11).
+  - Tag::App `evaluated` field for memoization (`d3e41c13d`) — 16B
+    per ValuePair; closed hello.name from 1.53s to 0.55s.
+
+  **NEW open issue (Phase 1.5 / Phase 2+ territory)**: `hello.drvPath`
+  and `hello.outPath` take 30-46s vs TW 1.3s (~30× slower). NOT a
+  C-stack issue; characterized in
+  `EXTEND_DERIVATION_INVESTIGATION_2026-05-18.md`. Force-rate
+  ~5K/s vs TW's ~1M/s (200× per-op gap), decomposing into per-op
+  dispatch (~10×) + GC scan overhead from Boehm 1GB+ arena (~5-10×)
+  + extra intermediate allocations (~2-5×) + possible higher-level
+  caching gap.
+
+  Phase 1 exit criterion was specifically "no C-stack overflow,"
+  which is met. The drvPath/outPath gap is Phase 2+ work mapped to
+  Stage 3 (nursery), Stage 4 (strictness), Stages 5-6 (PICs).
+  Memory: `project_force_rate_decomposition_2026-05-18.md`.
 - Phase 2: [pending, target 2026-06-11]
 - Phase 3: [pending, target 2026-06-18]
 - Phase 4: [pending, target 2026-07-03]

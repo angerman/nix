@@ -173,5 +173,7 @@ Defer until prioritised against perf and other v3-direct work.
 
 ---
 
+**RESOLVED 2026-05-18**. A7's C-stack-overflow workaround (depth-guard default-on, commit `3b59ed65d`) was rendered obsolete by Phase 1.2 iterative `forceValue` conversions (A8 series: `f6bf3fe8d`, `f82a2f725`, `5d9909d8c`, `f5804ea05`, `e1dfd98c2`). Depth-2000 abort removed in `377db9c16`. Phase 1 exit criterion (no C-stack overflow on hello.name) MET 2026-05-18 via Option 4 hybrid (commit `7adc7e61f`). See `OPTION_4_COMPLETE_2026-05-18.md`.
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0

@@ -142,5 +142,7 @@ v3's CELL mechanism (Phase 1.5 `shapeCell` + the existing REC_SET cell-wiring) a
 
 ---
 
+**RESOLVED 2026-05-18** (rolled into the A-series resolution; see `RCA_FAMILY_DIVERGENCE_2026-05-11.md` and `OPTION_4_COMPLETE_2026-05-18.md`). The deeper-cause hypotheses about Bindings-origin tracking were superseded by A5's actual root cause (fakeClo closure-pool aliasing) and ultimately sidestepped by Phase 1's Option 4 hybrid architecture.
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0

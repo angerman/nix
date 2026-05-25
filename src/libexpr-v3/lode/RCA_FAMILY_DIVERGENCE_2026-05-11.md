@@ -236,5 +236,7 @@ The data from A/B + C1 differential harness is the input to this decision.
 
 ---
 
+**RESOLVED 2026-05-18** (A-series closed). The {family} STR_CONCAT divergence was rooted in fakeClo closure-pool aliasing (A5, commit `1708d31bd`). The downstream C-stack overflow was resolved via Phase 1.2 iterative `forceValue` conversions (A8 series). Phase 1 exit criterion (hello.name evaluates without C-stack overflow) MET 2026-05-18 via Option 4 hybrid (commit `7adc7e61f` + `ecc99fd07`). See `OPTION_4_COMPLETE_2026-05-18.md`.
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
