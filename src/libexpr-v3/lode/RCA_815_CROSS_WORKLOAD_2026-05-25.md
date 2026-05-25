@@ -464,3 +464,92 @@ reader-process sort positions.  Either:
 Next step: instrument `remapSymbolsInBytecode` to log when a
 REC_SET is encountered and what its `pending` state is.  Find the
 specific REC_SET that goes wrong.
+
+## Root cause identified 2026-05-25 (post-disasm verifier)
+
+### lower.cc iterates `std::map<Symbol, AttrDef>` in TW-Symbol order
+
+`nix::ExprAttrs::AttrDefs = std::pmr::map<Symbol, AttrDef>` — and
+`Symbol` is a uint32_t TW-process-local symbol ID whose value
+depends on TW's intern history.  Across two processes evaluating
+the same source, iteration order over this map DIFFERS.
+
+`lower.cc::lowerLetRec` (line 2643) iterates `attrDefs` in that
+process-local order and assigns FuncIds in iteration order
+(`m.functions.emplace_back()`).  Result: writer's `cu.lambdas[K]`
+refers to a DIFFERENT named binding than reader's `cu.lambdas[K]`
+for the same source.
+
+When HNE deserialises the cached blob:
+- `cu.lambdas[K]` is whatever writer assigned (writer's K-th
+  iteration entry's thunkBody).
+- The bytecode in cached references functions by FuncId, all
+  internally consistent with writer's mapping.
+- Trailer + REC_SET remapping correctly translates to reader's
+  v3-Symbol sort positions.
+
+So the cached blob's bytecode IS internally consistent.  Each
+write goes to the correct named slot.
+
+### WHY does the bug fire then?
+
+This is still partially open.  The bytecode IS structurally
+different (verified by `V3_DBG_DESERIALIZE_VERIFY`) but ought
+to be SEMANTICALLY equivalent — each named entry receives its
+correct thunk, just via different FuncId indices.
+
+Hypothesis: there's an additional cross-process divergence we
+haven't identified yet that ALSO surfaces with the cached blob.
+Possibilities:
+- `freeVars` computation depends on iteration order indirectly.
+- VarId allocation order differs (m.freshVar() sequential
+  counter — but counts up in iteration order, so different
+  iter order → different VarId → identifier-positional
+  differences elsewhere).
+- A side-table (Module::recVarToSlotVar, Module::subExprFuncs,
+  computeFunctionStrictness output) that depends on iteration
+  order.
+
+### Attempted fix (REVERTED)
+
+Replaced lowerLetRec's iteration with canonical (symbol-string)
+order.  The fix BROKE evaluation with "OP_ATTRS_SELECT: not an
+attrset" because TW's `ExprVar::displ` indexes into the AttrDefs
+map in TW-Symbol order — v3's `recAttrsNames[displ]` lookup
+expects the SAME ordering.
+
+So we CAN'T simply change lowerLetRec's iteration order without
+also rewiring how `displ` is interpreted (or rebuilding the
+`displ` index post-iteration).
+
+### Open work
+
+1. **Identify the residual cross-process divergence** beyond
+   FuncId mapping.  The bytecode IS structurally different
+   (and verifiably so), but the *semantic* divergence cause
+   needs further investigation.
+2. **Architectural fix**: separate FuncId assignment from
+   iteration order.  Either:
+   - Lower in TW order, then RENUMBER FuncIds canonically
+     before serialise.
+   - Lower in canonical order AND adjust how `displ` is mapped
+     (build a separate displ→IR-position table).
+3. **Stopgap**: disable disk cache by default until the proper
+   fix lands.  Users would set `NIX_V3_DISK_CACHE=1` to opt in.
+
+### Pragmatic recommendation (this session)
+
+The repro is reliable and the diagnostic infrastructure
+(`V3_DBG_DESERIALIZE_VERIFY`, `V3_DBG_DISK_CACHE_LOG`,
+`V3_DBG_DISK_CACHE_BLOCK`, `NIX_V3_OPT_PHASE_LIMIT`) is in
+place to continue investigation in a follow-on session.
+
+Pragmatic stopgap: invert the disk-cache default so it's
+opt-in (`NIX_V3_DISK_CACHE=1`).  Loses the cached-load perf
+win (~13% on hello.drvPath per #777) but eliminates the
+cross-workload correctness hazard until the underlying
+non-determinism is fixed.
+
+Action item: introduce `NIX_V3_DISK_CACHE_DEFAULT_OFF=1` (or
+flip the gate's default) gated by a TODO entry referencing
+this RCA.
