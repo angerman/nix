@@ -381,6 +381,79 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             (unsigned long long)bk[4], (unsigned long long)bk[5],
             (unsigned long long)bk[6], (unsigned long long)bk[7],
             (unsigned long long)bk[8], (unsigned long long)bk[9]);
+        // #821 (2026-05-26): per-caller mergeBindings attribution.
+        // On HNE .hello.drvPath, mergeBindings owns ~584 MB of 705 MB
+        // Bindings allocation (82.9 %).  This per-site breakdown
+        // identifies WHICH of the 9 callers dominates so the per-site
+        // optimisation (ChainBindings overlay / lazy merge / etc.)
+        // targets the right path instead of re-architecting all
+        // 9 sites.  Suppressed when no merges occurred.
+        {
+            const char * site_name[AllocStats::kMergeBindingsSiteSlots] = {
+                "OP_ATTRS_UPDATE             (//)",
+                "OP_ATTRS_UPDATE_TAIL        (//)",
+                "OP_CALL ExtendsBody  prev//ov",
+                "OP_CALL ExtendsBody  prev//f",
+                "OP_CALL ComposeBody  fApp//gApp",
+                "OP_TAIL_CALL Extends prev//ov",
+                "OP_TAIL_CALL Extends prev//f",
+                "OP_TAIL_CALL Compose fApp//gApp",
+                "(spare 8)",  "(spare 9)",  "(spare 10)", "(spare 11)",
+                "(spare 12)", "(spare 13)", "(spare 14)", "(spare 15)",
+            };
+            uint64_t totalCalls = 0, totalBytes = 0;
+            for (uint8_t s = 0; s < AllocStats::kMergeBindingsSiteSlots; ++s) {
+                totalCalls += a.mergeBindingsCallsBySite[s];
+                totalBytes += a.mergeBindingsBytesBySite[s];
+            }
+            if (totalCalls > 0) {
+                std::fprintf(stderr,
+                    "v3-direct mergeBindings by site "
+                    "(total %llu calls, %.1f MB):\n",
+                    (unsigned long long)totalCalls,
+                    double(totalBytes) / (1024.0 * 1024.0));
+                for (uint8_t s = 0; s < AllocStats::kMergeBindingsSiteSlots; ++s) {
+                    uint64_t calls = a.mergeBindingsCallsBySite[s];
+                    uint64_t bytes = a.mergeBindingsBytesBySite[s];
+                    if (calls == 0 && bytes == 0) continue;
+                    std::fprintf(stderr,
+                        "  [%d] %-32s  calls=%-10llu bytes=%6.1f MB"
+                        " (%5.1f %% of total)\n",
+                        (int)s, site_name[s],
+                        (unsigned long long)calls,
+                        double(bytes) / (1024.0 * 1024.0),
+                        totalBytes > 0
+                            ? 100.0 * double(bytes) / double(totalBytes)
+                            : 0.0);
+                }
+            }
+            // #821 — (na, nb) histograms for site 1 (UPDATE_TAIL).
+            // If the overlay (nb) histogram is heavily skewed toward
+            // small buckets while parent (na) is large, ChainBindings
+            // is the right architectural lever.
+            uint64_t naTotal = 0, nbTotal = 0;
+            for (int i = 0; i < 10; ++i) {
+                naTotal += a.mergeBindingsNaHist[i];
+                nbTotal += a.mergeBindingsNbHist[i];
+            }
+            if (naTotal > 0 || nbTotal > 0) {
+                const char * labels[10] = {
+                    "0..1", "2", "3-4", "5-8", "9-16",
+                    "17-32", "33-64", "65-128", "129-256", "257+"};
+                std::fprintf(stderr,
+                    "  (UPDATE_TAIL na histogram, total=%llu):\n",
+                    (unsigned long long)naTotal);
+                for (int i = 0; i < 10; ++i)
+                    std::fprintf(stderr, "    na %-8s = %llu\n",
+                        labels[i], (unsigned long long)a.mergeBindingsNaHist[i]);
+                std::fprintf(stderr,
+                    "  (UPDATE_TAIL nb histogram, total=%llu):\n",
+                    (unsigned long long)nbTotal);
+                for (int i = 0; i < 10; ++i)
+                    std::fprintf(stderr, "    nb %-8s = %llu\n",
+                        labels[i], (unsigned long long)a.mergeBindingsNbHist[i]);
+            }
+        }
         // #719 (#702 falsifier chain, 2026-05-21): three-way RSS
         // decomposition.  v3's RSS minus (Boehm-heap + v3-arena) is
         // the "elsewhere" remainder — scratch buffers, libc malloc

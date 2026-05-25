@@ -255,6 +255,43 @@ struct AllocStats
     uint64_t intrinsicExtendsCalls = 0;
     uint64_t intrinsicComposeCalls = 0;
 
+    /// #821 (2026-05-26) per-caller attribution for `mergeBindings`.
+    /// On HNE `.hello.drvPath` the function alone accounts for 584 MB
+    /// of Bindings allocation (82.9 % of arena Bindings).  There are 9
+    /// in-VM call sites; this array buckets bytes + calls by site so
+    /// the per-site optimisation (ChainBindings / persistent overlay /
+    /// caller-specific short-circuit) can target the dominant caller
+    /// rather than re-architecting mergeBindings wholesale.
+    ///
+    /// Site IDs (see vm.cc enum MergeBindingsSite — exhaustive):
+    ///   0  vm.cc:8333  OP_ATTRS_UPDATE      (`a // b`)
+    ///   1  vm.cc:8405  OP_ATTRS_UPDATE_TAIL
+    ///   2  vm.cc:4490  OP_CALL ExtendsBody:  prev // overlay
+    ///   3  vm.cc:4538  OP_CALL ExtendsBody:  prev // overlay (2nd path)
+    ///   4  vm.cc:4551  OP_CALL ComposeBody:  fApplied // overlay
+    ///   5  vm.cc:12288 OP_TAIL_CALL ExtendsBody: prev // overlay
+    ///   6  vm.cc:12318 OP_TAIL_CALL ExtendsBody: prev // overlay (2nd)
+    ///   7  vm.cc:12329 OP_TAIL_CALL ComposeBody: fApplied // overlay
+    ///   8  primops.cc primIntersectAttrs's two-pass merge
+    /// Dumped under NIX_VM_STATS=1 alongside the per-alloc-site
+    /// breakdown when totalCalls > 0.
+    static constexpr uint8_t kMergeBindingsSiteSlots = 16;
+    uint64_t mergeBindingsCallsBySite[kMergeBindingsSiteSlots] = {};
+    uint64_t mergeBindingsBytesBySite[kMergeBindingsSiteSlots] = {};
+
+    /// #821 — input size (nb) histogram for the dominant call site.
+    /// To target a ChainBindings / persistent-overlay rewrite at the
+    /// 98 %-dominant OP_ATTRS_UPDATE_TAIL (site 1 on HNE), we need to
+    /// know whether the overlay (`b`) is small enough that
+    /// `parent + overlay_delta` is cheaper than the current
+    /// `parent ∪ overlay` materialisation.  Buckets:
+    ///   [0]=1   [1]=2  [2]=3-4   [3]=5-8   [4]=9-16
+    ///   [5]=17-32 [6]=33-64 [7]=65-128 [8]=129-256 [9]=257+
+    uint64_t mergeBindingsNbHist[10] = {};
+    /// Same buckets for parent (`a`) — together they tell us the
+    /// (parent, overlay) size pair distribution.
+    uint64_t mergeBindingsNaHist[10] = {};
+
     /// #702 / 2026-05-20: BYTES per allocation category.  Existing
     /// counts above were partly bumped by primop call sites
     /// (listsAllocated, attrsetsAllocated) and missed Alloc::*

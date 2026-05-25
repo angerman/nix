@@ -1043,8 +1043,64 @@ inline std::string coerceToString(const Value & v, bool forceString)
     }
 }
 
-inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
+/// #821 site IDs for per-caller mergeBindings attribution.  Exhaustive
+/// list of in-VM call sites is documented above the
+/// `mergeBindingsCallsBySite[]` field in alloc.hh; each integer below
+/// corresponds to the matching ID slot in that array.  Site 8 is
+/// reserved for primIntersectAttrs's two-pass merge in primops.cc; the
+/// remaining 7 slots in `kMergeBindingsSiteSlots=16` are spare for
+/// future call sites (no need to renumber when adding one).
+enum class MergeBindingsSite : uint8_t {
+    AttrsUpdate          = 0,
+    AttrsUpdateTail      = 1,
+    ExtendsCallPrev      = 2,
+    ExtendsCallPrevPrime = 3,
+    ComposeCallApplied   = 4,
+    ExtendsTailPrev      = 5,
+    ExtendsTailPrevPrime = 6,
+    ComposeTailApplied   = 7,
+    // 8+ reserved (primops.cc, future sites)
+};
+
+inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
+                                MergeBindingsSite siteId =
+                                    MergeBindingsSite::AttrsUpdate)
 {
+    // #821 per-site call counter — bumped at function entry so the
+    // empty-operand short-circuit (below) contributes to the call
+    // count even though it doesn't allocate; the BYTES counter is
+    // updated only after `Alloc::allocBindings` so its sum matches
+    // `bytesBindings` for the merge-attributed slice.
+    {
+        const uint8_t s = static_cast<uint8_t>(siteId);
+        if (s < AllocStats::kMergeBindingsSiteSlots)
+            ++allocStats().mergeBindingsCallsBySite[s];
+    }
+
+    // #821 — input-size histograms (na, nb).  Only sampled on
+    // site 1 (OP_ATTRS_UPDATE_TAIL) since that's the 98 %-dominant
+    // caller on HNE and we want to know whether `b` (the overlay)
+    // is small enough to justify a ChainBindings/persistent-overlay
+    // representation.  Other sites can be added later if data shows
+    // they shift the workload.  Bucket via a small switch (5 cmps
+    // avg) — negligible cost compared to the merge itself.
+    if (siteId == MergeBindingsSite::AttrsUpdateTail) {
+        auto bucket_of = [](uint32_t n) -> uint8_t {
+            if (n <= 1)   return 0;   // 0..1
+            if (n == 2)   return 1;
+            if (n <= 4)   return 2;
+            if (n <= 8)   return 3;
+            if (n <= 16)  return 4;
+            if (n <= 32)  return 5;
+            if (n <= 64)  return 6;
+            if (n <= 128) return 7;
+            if (n <= 256) return 8;
+            return 9;
+        };
+        ++allocStats().mergeBindingsNaHist[bucket_of(a ? a->size : 0)];
+        ++allocStats().mergeBindingsNbHist[bucket_of(b ? b->size : 0)];
+    }
+
     // Sorted-merge two attrsets (b wins on duplicate keys).  Per-attr
     // positions in attrPosTable are keyed by (Bindings*, SymbolId), so
     // when an entry is copied to the freshly-allocated `out`, we
@@ -1112,6 +1168,17 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b)
     // shared cell line, and on the empty-sentinel path a write to
     // shared read-only state).
     Bindings * out = Alloc::allocBindings(kExact);
+    // #821 per-site bytes attribution.  Bytes attributed = kExact
+    // entries (slack-free since #747's two-pass) × sizeof Entry
+    // (24 B post-#752 inline-pos).  Calls counter is bumped at
+    // function entry above; bytes counter accumulates only on the
+    // allocating path.
+    {
+        const uint8_t s = static_cast<uint8_t>(siteId);
+        if (s < AllocStats::kMergeBindingsSiteSlots)
+            allocStats().mergeBindingsBytesBySite[s]
+                += uint64_t(kExact) * sizeof(Bindings::Entry);
+    }
     uint32_t i = 0, j = 0, k = 0;
     // #752: bindingsSetEntry now copies the entire Entry struct
     // including the inline `pos` field, so the per-attr position is
@@ -4488,7 +4555,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         throw std::runtime_error(
                             "v3 intrinsic ExtendsBody: overlay final prev didn't reduce to attrs");
                     Bindings * merged = mergeBindings(prev.payload.bindings,
-                                                      overlay_result.payload.bindings);
+                                                      overlay_result.payload.bindings,
+                                                      MergeBindingsSite::ExtendsCallPrev);
                     Value res;
                     res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
                     res.payload.bindings = merged;
@@ -4536,7 +4604,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         throw std::runtime_error(
                             "v3 intrinsic ComposeBody: prev didn't reduce to attrs");
                     Bindings * prevPrimeB = mergeBindings(prevForced.payload.bindings,
-                                                          fApplied.payload.bindings);
+                                                          fApplied.payload.bindings,
+                                                          MergeBindingsSite::ExtendsCallPrevPrime);
                     Value prevPrime;
                     prevPrime.tag_payload = static_cast<uint64_t>(Tag::Attrs);
                     prevPrime.payload.bindings = prevPrimeB;
@@ -4549,7 +4618,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             "v3 intrinsic ComposeBody: g final prev' didn't reduce to attrs");
                     // result = fApplied // gApplied.
                     Bindings * merged = mergeBindings(fApplied.payload.bindings,
-                                                       gApplied.payload.bindings);
+                                                       gApplied.payload.bindings,
+                                                       MergeBindingsSite::ComposeCallApplied);
                     Value res;
                     res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
                     res.payload.bindings = merged;
@@ -8330,7 +8400,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // #558 Phase 3.3: Tag::Thunk Blackhole collapse retired.
             if (!lhs.isAttrs() || !rhs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_UPDATE: not attrsets");
-            Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings);
+            Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings,
+                                           MergeBindingsSite::AttrsUpdate);
             allocStats().attrsetsAllocated++;
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -8402,7 +8473,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 throw std::runtime_error("v3 OP_ATTRS_UPDATE_TAIL: not attrsets");
             }
-            Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings);
+            Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings,
+                                           MergeBindingsSite::AttrsUpdateTail);
             allocStats().attrsetsAllocated++;
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -12286,7 +12358,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 throw std::runtime_error(
                     "v3 callClosure intrinsic ExtendsBody: overlay-result not attrs");
             Bindings * merged = mergeBindings(prev.payload.bindings,
-                                               overlay_result.payload.bindings);
+                                               overlay_result.payload.bindings,
+                                               MergeBindingsSite::ExtendsTailPrev);
             Value res;
             res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             res.payload.bindings = merged;
@@ -12316,7 +12389,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 throw std::runtime_error(
                     "v3 callClosure intrinsic ComposeBody: prev not attrs");
             Bindings * prevPrimeB = mergeBindings(prevForced.payload.bindings,
-                                                   fApplied.payload.bindings);
+                                                   fApplied.payload.bindings,
+                                                   MergeBindingsSite::ExtendsTailPrevPrime);
             Value prevPrime;
             prevPrime.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             prevPrime.payload.bindings = prevPrimeB;
@@ -12327,7 +12401,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 throw std::runtime_error(
                     "v3 callClosure intrinsic ComposeBody: gApplied not attrs");
             Bindings * merged = mergeBindings(fApplied.payload.bindings,
-                                               gApplied.payload.bindings);
+                                               gApplied.payload.bindings,
+                                               MergeBindingsSite::ComposeTailApplied);
             Value res;
             res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             res.payload.bindings = merged;
