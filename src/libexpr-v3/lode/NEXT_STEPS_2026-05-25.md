@@ -182,7 +182,16 @@ Tier A + early Tier B = ~7 person-days, fits one week with parallel work; net ex
 
 ---
 
-### A3 — T1.1 per-call-site cache-hook instrumentation (1-2 days) — close the recurring blind spot
+### A3 — T1.1 per-call-site cache-hook instrumentation (1-2 days) ✅ LANDED 2026-05-26 (commit `20bd0dfcf`)
+
+**Outcome:** infrastructure shipped: `CacheHookCallSite` + auto-register-on-first-call + `CacheHookTimer` RAII + per-event helpers + `dumpCacheHookSites` under `NIX_VM_CACHE_SITES=1`.  Falsifier MET: probe fires on `hello.name`:
+- Cold cache → 157 inserts / 9.89 MB / 34.51 M ns at `primImport-cu-disk-insert`
+- Warm cache → 157 hits / 24.30 M ns at `primImport-cu-disk-lookup`
+- IFD sites correctly silent on `hello.name` (validates #803/#810 Phase 4b cache-scope RCA).
+
+Three instrumented sites in `primops.cc` (ifd-disk lookup/insert, cu-disk lookup/insert).  Follow-on instrumentation candidates documented in commit body + below.  Historical-bug verification at pre-`35564703f` deferred — infrastructure ready for future cache investigations.
+
+
 
 **Why now:** the methodology blind-spot pattern is at 3 instances in 3 days (audit §4.1 + §4.2 + the disk_cache PK collision from yesterday/this morning). Each instance cost hours of investigation. T1.1 (from PROFILING_IMPROVEMENTS) prevents the next one. **The team has independently validated the per-site-counter pattern works** (v3ToTwBySite in #795 Phase A1, `ifdProbeWithCtx[16]` in #2103cdddb). This task generalises the pattern into reusable infrastructure.
 
