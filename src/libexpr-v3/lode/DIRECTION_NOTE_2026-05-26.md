@@ -58,17 +58,27 @@ By standard engineering-team metrics (velocity + methodology + strategic clarity
 
 These are not problems. They're *under-named decisions* whose unresolved status creates ambient planning ambiguity. Each can be resolved in ≤ 1 day of dedicated attention.
 
-### 3.1 R1 (Full de Bruijn IR) — commit or defer
+### 3.1 R1 (Full de Bruijn IR) — commit or defer — **CLOSED 2026-05-26 (evening)**
 
-**Current status:** trigger-CONDITIONALLY-FIRED per `CR1_CR2_AUDIT_RESULTS_2026-05-26.md` §4. CR1 audit found 2 HIGH + 1 MEDIUM sites in `lower.cc`; ≥ 3 = AR5 trigger fires. The HIGH classification is conditional on residual non-canonical iteration post-Light variant.
+**Outcome:** **R1-trigger CLOSED unconditionally**; R1-Full deferred.
 
-**Verification path (≤ 1 day):** re-run `V3_DBG_DESERIALIZE_VERIFY` on the original 5-pkg sweep + haskell-nix-example reproducer (the original #815 trigger).
-- 0 residual divergent files → HIGH softens to LOW → defer R1
-- > 0 residual divergent files → R1 fires unconditionally (~1 week effort)
+**Closure path:** the verification proposed in §3.1 not only ran but also drove three structural landings that closed the trigger entirely. V3_DBG_DESERIALIZE_VERIFY DIFFs on warm hello.drvPath: **353 → 4 → 0**.
 
-**Why this matters:** R1 is a 1-week structural refactor touching every opt_*.cc pass. If R1 fires, other Tier B work (B1 / B2 / B3) shifts. If R1 defers, the same Tier B work proceeds normally. **The longer R1 stays "conditionally fired," the more ambient ambiguity in planning.**
+| state                                    | commit       | DIFFs |
+|------------------------------------------|--------------|-------|
+| pre-fix baseline                         | `dcfbae871`  | 353   |
+| Schema 14: sparse PosIdx remap           | `a7b41ddce`  | (subset) |
+| AttrSet entries canonical-string-sort    | `9543834cc`  | 4     |
+| AttrSet REC_SET canonical emit           | `b17ab3359`  | **0** |
 
-**Recommendation:** schedule the verification THIS WEEK (could be today). Decision follows in ≤ 1 day.
+Bytecode is now process-invariant across SymbolId / PosIdx / local-slot allocators. CU disk cache is cross-process byte-identical for everything measured. test/run-r1-trigger-verify.sh now asserts N_DIFF == 0 as the new regression guard.
+
+**R1-Full status:** deferred. The original 1-week structural refactor of IR is no longer urgent — R1-trigger closure removed the correctness motivation. R1-Full's remaining motivation is the cleaner architecture (Stage 13 parallel eval prereq, IR-subtree dedup). Triggers carried over to NEXT_STEPS §6.5 R1-Full section.
+
+**Downstream effects of R1-trigger closure:**
+- T1.f (AOT distribution schema-stability trigger): now **obsolete** — bytecode IS process-invariant at the level R8a needs. R8a Phase 1 spike can proceed without R1-Full as a prereq.
+- AR8 (schema-stability vs AOT distribution): R8a path no longer needs the "Full variant" hedge; R8b still benefits from R1-Full eventually.
+- The §6.5 R1 entry in NEXT_STEPS has been split into R1-trigger (closed) and R1-Full (deferred with carry-over triggers).
 
 ### 3.2 A1a Phase C — when does the actual memory recovery land?
 
@@ -144,10 +154,11 @@ The pattern this doc captures: **distinguish progress (work shipped) from direct
 
 ## 6. Recommended actions (concrete, this week)
 
-1. **Today/tomorrow:** run `V3_DBG_DESERIALIZE_VERIFY` re-run per `CR1_CR2_AUDIT_RESULTS_2026-05-26.md` §2.4(a). Settles R1 decision in ≤ 1 day.
-2. **Write Phase C trigger explicitly in NEXT_STEPS §3 Tier A.** Even if deferred, the trigger should be explicit ("Phase C scheduled after R1 decision" or similar).
-3. **Wire cardano-node M5 measurement into nightly bench cadence.** ~1 day script + cron integration. Becomes a passive guard against strategic-workload drift.
+1. ~~**Today/tomorrow:** run V3_DBG_DESERIALIZE_VERIFY re-run~~ — **DONE 2026-05-26 evening.** R1-trigger closed unconditionally; see §3.1 outcome.
+2. **Write Phase C trigger explicitly in NEXT_STEPS §3 Tier A.** Even if deferred, the trigger should be explicit ("Phase C scheduled after R1 decision" or similar). With R1 decision now made (decision #1 closed via trigger closure), Phase C scheduling is unblocked.
+3. **Wire cardano-node M5 measurement into nightly bench cadence.** ~1 day script + cron integration. Becomes a passive guard against strategic-workload drift. Now elevated to #1 open decision after #1 closure.
 4. **Land CR2 CI lint independently** (~30 LoC, ≤ 1 day). Already approved direction; can ship parallel to other work.
+5. **NEW (post-R1-trigger closure):** R8a Phase 1 spike Day 1-3 (NIX_V3_AOT_BUILD_MODE flag). Bytecode is now process-invariant; the strategic argument in `AOT_DISTRIBUTION_2026-05-26.md` §7.1 can begin its 2-3 week spike without R1-Full as a prereq.
 
 ---
 

@@ -530,36 +530,59 @@ Items NOT on the active week's plan but with **explicit pre-committed triggers**
 
 Several items here also surface in `ROADMAP_TO_VISION_2026-05-15.md`'s "Killed-stage revival triggers" table or candidate-future-stages table; this is the tactical mirror. When triggers fire, refer to the canonical strategic doc for full re-measurement procedure.
 
-### R1 — Full de Bruijn IR (Phase L1) — ~1 week / ~300 LoC
+### R1 — split into R1-trigger (CLOSED 2026-05-26) and R1-Full (DEFERRED)
+
+The original "R1 Full de Bruijn IR" item covered two distinct deliverables that have now diverged in status:
+
+#### R1-trigger — cross-process bytecode determinism — **CLOSED 2026-05-26**
+
+**What:** make CU bytecode byte-identical regardless of writer's vs reader's process-local SymbolId / PosIdx / local-slot allocator state. The symptom that fired R1 in the first place (cached CU disagrees with fresh compile → #815-class hazard).
+
+**Status:** **CLOSED via 3-landing chain on 2026-05-26.** V3_DBG_DESERIALIZE_VERIFY on warm hello.drvPath: 353 → 4 → 0 DIFFs.
+
+| state                                    | commit       | DIFFs / TOTAL |
+|------------------------------------------|--------------|---------------|
+| pre-fix baseline                         | `dcfbae871`  | 353 / 357     |
+| Schema 14: sparse PosIdx remap           | `a7b41ddce`  | (subset)      |
+| AttrSet entries canonical-string-sort    | `9543834cc`  | 4 / 357       |
+| AttrSet REC_SET canonical emit           | `b17ab3359`  | **0 / 357**   |
+
+Bytecode is now process-invariant across SymbolId / PosIdx / local-slot allocators. CU disk cache is **cross-process byte-identical** for everything we've measured. `test/run-r1-trigger-verify.sh` flipped to assert N_DIFF == 0 as the new regression guard.
+
+**Unlocked (effective immediately):**
+- AOT distribution artifact stability — cross-machine cache coherent at bytecode level (R8a no longer needs to mark this as future)
+- Cache-coherence rule 1 (LambdaDescriptor schema bump) — still load-bearing for LambdaDescriptor field changes but no longer needed against process-local SymbolId leaks
+- Elimination of Light-variant brittleness for the specific symbol-keyed container class (AttrSet entries are canonical at IR; emit decouples visit order from runtime slot order)
+
+**Falsified by closure:** the prior "closure requires Bindings::lookup string-search or canonical SymbolIds" hypothesis (`9543834cc` body) — both were heavy structural moves, and neither was needed. The actual fix was 4 lines decoupling emit visit order from REC_SET operand at one site.
+
+#### R1-Full — de Bruijn IR refactor — **DEFERRED** (~1 week / ~300 LoC)
 
 **What:** refactor IR (`ir.hh` / `ir.cc`) to use de Bruijn `(level, index)` variable references instead of named `VarId`s. Mechanical rewrite touching every `opt_*.cc` pass; eliminates SymbolId VALUE in IR variable positions; eliminates the symbol-table-remap round-trip in `serialize.cc` for locals (attrset keys remain symbol-keyed).
 
-**Status:** the #815 RCA landed a **Light variant** (canonical alphabetical ordering at `lowerLetRec` + `lowerAttrs` boundaries) which fixes the specific symptom. **Full variant remains deferred.** See `RCA_815_CROSS_WORKLOAD_2026-05-25.md` §"Lessons for the Full variant" + `LINKING_DESIGN_2026-05-17.md` Phase L1.
+**Status:** **deferred — no longer blocked by R1-trigger, but no longer the urgent path either.** R1-trigger closure removed the immediate correctness motivation; remaining motivation is the cleaner architecture (Stage 13 parallel eval prereq, IR-subtree dedup, schema-iteration cost reduction).
 
 **Triggers (any one fires → re-prioritise):**
-- **T1.a:** a SECOND distinct #815-class bug appears at an emit site OTHER than `lowerLetRec` / `lowerAttrs` within 30 days. Signal that Light variant + A4 lint discipline is insufficient — the class needs structural fix.
-- **T1.b:** audit of `lower.cc` emit sites surfaces ≥ 3 other sites that build symbol-keyed containers without canonical ordering (would itself be a trigger for proactive R1 rather than reactive). This is also AR5 below — a near-term proactive audit task.
+- **T1.a:** a SECOND distinct #815-class bug appears at an emit site within 30 days. Signal that the AttrSet+LetRec+emit-canonical-order discipline is insufficient — the class needs structural fix.
+- **T1.b:** audit of `lower.cc` emit sites surfaces ≥ 3 other sites that build symbol-keyed containers without canonical ordering (proactive R1-Full trigger). This is also AR5 — a near-term proactive audit task.
 - **T1.c:** Stage 9 revival trigger B fires (post-ABT IR-level dedup ≥ 2× re-measured). Per ROADMAP Killed-stage table line 1232.
 - **T1.d:** Unison Item 3 (hash-keyed eval cache at IR-subtree scope, beyond primop boundaries) becomes an active target. See `UNISON_IDEAS_2026-05-07.md` Item 3.
-- **T1.e:** Stage 13 (multi-core parallel eval) becomes an active target. Process-local SymbolIds + threads = same #815-class bug inside one process; R1 is a prerequisite for parallel-safe symbol semantics. See AR10 below.
-- **T1.f:** AOT distribution (C1) commits to schema-stability requirements. Per AR8: AOT artifacts shipped via cache.nixos.org must be cache-coherent cross-machine; Light variant's brittleness is harder to defend at distribution scale.
+- **T1.e:** Stage 13 (multi-core parallel eval) becomes an active target. Process-local SymbolIds + threads = correctness hazard inside one process; R1-Full is a prerequisite for parallel-safe symbol semantics. See AR10 below.
+- **T1.f:** ~~AOT distribution commits to schema stability~~ — **OBSOLETE post-R1-trigger closure.** Cross-machine cache coherence is now structurally enforced at the bytecode level. R1-Full's contribution would be reducing schema bumps for IR-level changes (still useful, not blocking).
 - **T1.g:** symbol-table remap deserialize cost (was 297 ms pre-#781b, ~5 ms post-sparse) regresses to > 30 ms on a new workload class. Direct signal that local-symbol-remap is back on the critical path.
 
-**Unlocks:**
+**Unlocks (R1-Full specifically; R1-trigger already shipped most):**
 - Stage 9 dedup re-measurement at IR-subtree granularity (trigger B path)
 - Unison Item 3 (cache at IR-subtree scope, not just primop)
 - Unison Item 4 (effect propagation — cleaner with content-addressed IR)
 - Stage 13 parallel eval safety (no process-local symbol semantics in IR)
-- AOT distribution artifact stability (cross-machine cache coherent)
-- Elimination of Light-variant brittleness across all emit sites
-- Plausible 10-30 % off cold-load wall via symbol-table size reduction
-- Cache-coherence rule 1 (LambdaDescriptor schema bump) becomes less critical because VarRef no longer encodes process-local SymbolId values
+- Plausible 10-30 % off cold-load wall via symbol-table size reduction (~~symbol-table is now sparse post-#781b; this estimate is stale; re-measure if pursued~~)
 
 **Prerequisites:**
 - None blocking; the team can start whenever triggered
 - BUT: should NOT begin mid-investigation arc (1-week refactor cadence is qualitatively different from the team's 3-5-commits/day kill-with-data work)
 
-**Cross-references:** `LINKING_DESIGN_2026-05-17.md` Phase L1 (original spec), `UNISON_IDEAS_2026-05-07.md` Item 2 (ABT motivation), `RCA_815_CROSS_WORKLOAD_2026-05-25.md` §"Lessons for the Full variant" (most recent rationale), `IFD_DEEP_DIVE_2026-05-21.md` (Item 2 NOT-landed flag from 2026-05-21)
+**Cross-references:** `LINKING_DESIGN_2026-05-17.md` Phase L1 (original spec), `UNISON_IDEAS_2026-05-07.md` Item 2 (ABT motivation), `RCA_815_CROSS_WORKLOAD_2026-05-25.md` §"Lessons for the Full variant" (most recent rationale), `[[r1-trigger-closed-2026-05-26]]` (memory entry — closure details + Falsified hypothesis)
 
 ### R2 — Stages 5 / 6 (hidden classes + PICs) revival
 

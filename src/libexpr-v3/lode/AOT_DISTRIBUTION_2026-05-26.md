@@ -101,7 +101,9 @@ On v3 startup:
 
 Per [`IDEAL_GC_DESIGN_2026-05-26.md`](IDEAL_GC_DESIGN_2026-05-26.md) §3.4: the mmap'd cache region is a GC-aware "shared read-only roots" region. Multiple processes mmap'ing the same file share physical pages via the OS page cache; no IPC, no daemon, no double-buffering.
 
-This **composes natively** with the planned R1 (Full de Bruijn IR) — once R1 lands, the cache is fully process-independent and the trust model is structurally enforced (no SymbolId process-locality residue).
+**Update 2026-05-26 (evening): R1-trigger CLOSED.** The cache is now process-independent at the bytecode level. V3_DBG_DESERIALIZE_VERIFY DIFFs went 353 → 0 across three landings ending at `b17ab3359`. Bytecode is process-invariant across SymbolId / PosIdx / local-slot allocators. The trust model is structurally enforced **as of today, not "once R1 lands"** — R8a Phase 1 spike no longer needs R1-Full as a prereq.
+
+R1-Full (the IR-level de Bruijn refactor) remains deferred; its motivation is now schema-iteration cost reduction + Stage 13 parallel-eval prereq, not AOT-distribution correctness.
 
 ### 3.5 Cache hierarchy (post-R8a)
 
@@ -125,7 +127,7 @@ Replaces the original R8 in `NEXT_STEPS_2026-05-25.md` §6.5:
 ### R8a — v3-team-owned AOT cache (~4-6 weeks v3-team-only)
 
 **Triggers (more permissive than R8b):**
-- v3 schema stable for 2+ weeks (current pace would need to slow; OR pin to release branches only)
+- ~~v3 schema stable for 2+ weeks~~ — partially superseded post-R1-trigger closure (`b17ab3359`, 2026-05-26): bytecode is now process-invariant. Schema bumps for LambdaDescriptor field changes still invalidate cache, but cross-machine coherence is structurally enforced
 - Phase 1 spike (§7 below) meets threshold ≥30 % warm-eval ratio improvement on haskell-nix-example
 - IOG infrastructure (Hydra / S3) confirmed available for distribution
 - v3-team bandwidth available (~1 person × 4-6 weeks)
