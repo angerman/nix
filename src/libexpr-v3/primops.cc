@@ -644,7 +644,7 @@ void primTail(EvalState &, Value * args, Value & out)
         throw std::runtime_error("'builtins.tail' called on an empty list");
     uint32_t n = v.payload.list->size;
     ListVec * out_l = Alloc::allocList(n - 1);
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (uint32_t i = 1; i < n; ++i)
         out_l->elems[i - 1] = v.payload.list->elems[i];
     listPostConstructBarrier(out_l);  // Phase D
@@ -673,7 +673,7 @@ void primAttrNames(EvalState &, Value * args, Value & out)
     if (!a.isAttrs() || !a.payload.bindings) typeError("attrNames", "attrset");
     uint32_t n = a.payload.bindings->size;
     ListVec * lv = Alloc::allocList(n);
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     auto & symTab = ir::globalSymbolTable();
     for (uint32_t i = 0; i < n; ++i) {
         SymbolId sid = a.payload.bindings->entries[i].name;
@@ -711,7 +711,7 @@ void primAttrValues(EvalState &, Value * args, Value & out)
     std::sort(pairs.begin(), pairs.end(),
         [](const auto & x, const auto & y) { return x.first < y.first; });
     ListVec * lv = Alloc::allocList(n);
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (uint32_t i = 0; i < n; ++i) lv->elems[i] = pairs[i].second;
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = lv;
@@ -1177,7 +1177,7 @@ void primConcatLists(EvalState & state, Value * args, Value & out)
         total += e.payload.list ? e.payload.list->size : 0;
     }
     ListVec * result = Alloc::allocList(total);
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     uint32_t k = 0;
     for (uint32_t i = 0; i < outer.payload.list->size; ++i) {
         const Value & el = outer.payload.list->elems[i];
@@ -1307,12 +1307,12 @@ void primMap(EvalState & state, Value * args, Value & out)
     if (!src || src->size == 0) {
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = Alloc::allocList(0);
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         return;
     }
     Value fun = args[0];
     ListVec * result = Alloc::allocList(src->size);
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (uint32_t i = 0; i < src->size; ++i) {
         // Build App(fun, elem) — lazy.
         ValuePair * pp = Alloc::allocPair();
@@ -1336,7 +1336,7 @@ void primFilter(EvalState & state, Value * args, Value & out)
     if (!src || src->size == 0) {
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = Alloc::allocList(0);
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         return;
     }
     Value pred = args[0];
@@ -1356,7 +1356,7 @@ void primFilter(EvalState & state, Value * args, Value & out)
         if (r.payload.i == 1) kept.push_back(src->elems[i]);
     }
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < kept.size(); ++i) result->elems[i] = kept[i];
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = result;
@@ -1449,7 +1449,7 @@ void primGenList(EvalState & state, Value * args, Value & out)
     if (n < 0) throw std::runtime_error("cannot create list of size " + std::to_string(n));
     Value gen = args[0];
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(n));
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (int64_t i = 0; i < n; ++i) {
         // Build App(gen, idx_int) — lazy.
         Value idx; idx.mkInt(i);
@@ -1624,7 +1624,7 @@ void primConcatMap(EvalState & state, Value * args, Value & out)
         }
     }
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(all.size()));
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < all.size(); ++i) result->elems[i] = all[i];
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = result;
@@ -1655,7 +1655,7 @@ void primPartition(EvalState & state, Value * args, Value & out)
     }
     auto mkList = [](std::vector<Value> & v) {
         ListVec * l = Alloc::allocList(static_cast<uint32_t>(v.size()));
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < v.size(); ++i) l->elems[i] = v[i];
         Value out;
         out.tag_payload = static_cast<uint64_t>(Tag::List);
@@ -1671,7 +1671,7 @@ void primPartition(EvalState & state, Value * args, Value & out)
     SymbolId sWrong = ir::globalInternSymbol("wrong");
 
     Bindings * b = Alloc::allocBindings(2);
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     if (sRight < sWrong) {
         bindingsSetEntry(b, 0, {sRight, 0, rightV});  // Phase D
         bindingsSetEntry(b, 1, {sWrong, 0, wrongV});
@@ -1705,7 +1705,7 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
     auto * src = args[0].payload.list;
     if (!src || src->size == 0) {
         Bindings * b = Alloc::allocBindings(0);
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         out.payload.bindings = b;
         return;
@@ -1743,7 +1743,7 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
         dedup.push_back(p);
     }
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(dedup.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < dedup.size(); ++i) {
         b->entries[i].name  = dedup[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), dedup[i].second);  // Phase D
@@ -1861,7 +1861,7 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
         if (toRemove.count(src->entries[i].name) == 0)
             ++kExact;
     Bindings * result = Alloc::allocBindings(kExact);
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     uint32_t k = 0;
     for (uint32_t i = 0; i < src->size; ++i) {
         if (toRemove.count(src->entries[i].name) == 0) {
@@ -1881,7 +1881,7 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
     auto * src  = args[1].payload.bindings;
     if (!keep || !src) {
         Bindings * b = Alloc::allocBindings(0);
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         out.payload.bindings = b;
         return;
@@ -1912,7 +1912,7 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
         }
     }
     Bindings * result = Alloc::allocBindings(kExact);
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     uint32_t k = 0;
     // Pass 2 keeps the original keep->lookup loop for code
     // simplicity; sorted-merge copy would also work but the lookup
@@ -1933,7 +1933,7 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     auto * src = args[1].payload.bindings;
     if (!src) { out = args[1]; return; }
     Bindings * result = Alloc::allocBindings(src->size);
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     recordBindingsOrigin(result, 0, "primMapAttrs");
     for (uint32_t i = 0; i < src->size; ++i) {
         SymbolId sym = src->entries[i].name;
@@ -2038,7 +2038,7 @@ void primCatAttrs(EvalState & state, Value * args, Value & out)
         }
     }
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < kept.size(); ++i) result->elems[i] = kept[i];
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = result;
@@ -2227,7 +2227,7 @@ void primUnsafeGetAttrPos(EvalState & state, Value * args, Value & out)
     SymbolId sLine   = vmIntern(state, "line");
     SymbolId sColumn = vmIntern(state, "column");
     Bindings * b = Alloc::allocBindings(3);
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     std::vector<std::pair<SymbolId, Value>> entries(3);
     Value vFile = mkStringValueOwned(snap->file);
     Value vLine; vLine.mkInt(snap->line);
@@ -2364,7 +2364,7 @@ void primSplitVersion(EvalState & state, Value * args, Value & out)
         parts.emplace_back(start, p - start);
     }
     ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < parts.size(); ++i)
         lv->elems[i] = mkStringValueOwned(std::string(parts[i]));
     out.tag_payload = static_cast<uint64_t>(Tag::List);
@@ -2459,7 +2459,7 @@ void primGetContext(EvalState & state, Value * args, Value & out)
         if (!g.outputs.empty()) {
             std::sort(g.outputs.begin(), g.outputs.end());
             ListVec * lv = Alloc::allocList(static_cast<uint32_t>(g.outputs.size()));
-            allocStats().listsAllocated++;
+            V3_STATS_INC(listsAllocated);
             for (size_t i = 0; i < g.outputs.size(); ++i)
                 lv->elems[i] = mkStringValueOwned(g.outputs[i]);
             Value lvVal;
@@ -2470,7 +2470,7 @@ void primGetContext(EvalState & state, Value * args, Value & out)
         std::sort(subEntries.begin(), subEntries.end(),
             [](auto & a, auto & b) { return a.first < b.first; });
         Bindings * sb = Alloc::allocBindings(static_cast<uint32_t>(subEntries.size()));
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         for (size_t i = 0; i < subEntries.size(); ++i) {
             sb->entries[i].name  = subEntries[i].first;
             bindingsSetValue(sb, static_cast<uint32_t>(i), subEntries[i].second);  // Phase D
@@ -2483,7 +2483,7 @@ void primGetContext(EvalState & state, Value * args, Value & out)
     std::sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
     Bindings * bb = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i) {
         bb->entries[i].name  = entries[i].first;
         bindingsSetValue(bb, static_cast<uint32_t>(i), entries[i].second);  // Phase D
@@ -2633,7 +2633,7 @@ void primNixPath(EvalState & state, Value *, Value & out)
     auto lookupPath = state.nixEvalState->getLookupPath();
     auto & lp = lookupPath.elements;
     ListVec * lv = Alloc::allocList(static_cast<uint32_t>(lp.size()));
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     SymbolId sPath   = vmIntern(state, "path");
     SymbolId sPrefix = vmIntern(state, "prefix");
     size_t i = 0;
@@ -2749,7 +2749,7 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         // Build the values list eagerly (cheap — just allocates the
         // ListVec; entries themselves stay lazy).
         ListVec * vl = Alloc::allocList(static_cast<uint32_t>(vs.size()));
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < vs.size(); ++i) vl->elems[i] = vs[i];
         Value lv;
         lv.tag_payload = static_cast<uint64_t>(Tag::List);
@@ -2775,7 +2775,7 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
     std::sort(entries.begin(), entries.end(),
         [](const auto & a, const auto & b) { return a.first < b.first; });
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i) {
         b->entries[i].name = entries[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
@@ -3059,7 +3059,7 @@ void primSplitString(EvalState &, Value * args, Value & out)
         }
     }
     ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = parts[i];
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = lv;
@@ -3162,7 +3162,7 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
     }
 
     ListVec * lv = Alloc::allocList(static_cast<uint32_t>(result.size()));
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < result.size(); ++i) lv->elems[i] = result[i];
     out.tag_payload = static_cast<uint64_t>(Tag::List);
     out.payload.list = lv;
@@ -3226,7 +3226,7 @@ void primMatch(EvalState & state, Value * args, Value & out)
         // m[0] is the entire match; captures are m[1..m.size()-1].
         size_t nGroups = m.size() > 0 ? m.size() - 1 : 0;
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(nGroups));
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < nGroups; ++i) {
             if (m[i + 1].matched)
                 lv->elems[i] = mkStringValueOwned(m[i + 1].str());
@@ -3274,7 +3274,7 @@ void primSplit(EvalState & state, Value * args, Value & out)
             // Add the captured groups as a list.
             size_t nGroups = match.size() > 0 ? match.size() - 1 : 0;
             ListVec * caps = Alloc::allocList(static_cast<uint32_t>(nGroups));
-            allocStats().listsAllocated++;
+            V3_STATS_INC(listsAllocated);
             for (size_t i = 0; i < nGroups; ++i) {
                 if (match[i + 1].matched)
                     caps->elems[i] = mkStringValueOwned(match[i + 1].str());
@@ -3291,7 +3291,7 @@ void primSplit(EvalState & state, Value * args, Value & out)
         parts.push_back(mkStringValueOwned(std::string(s.substr(pos))));
 
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = parts[i];
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = lv;
@@ -3688,7 +3688,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
     std::sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i) {
         b->entries[i].name  = entries[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
@@ -3728,7 +3728,7 @@ void primParseDrvName(EvalState & state, Value * args, Value & out)
     SymbolId sName    = vmIntern(state, "name");
     SymbolId sVersion = vmIntern(state, "version");
     Bindings * b = Alloc::allocBindings(2);
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     Value vn = mkStringValueOwned(name);
     Value vv = mkStringValueOwned(version);
     if (sName < sVersion) { bindingsSetEntry(b, 0, {sName, 0, vn}); bindingsSetEntry(b, 1, {sVersion, 0, vv}); }  // Phase D
@@ -3762,7 +3762,7 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
     entries.reserve(groups.size());
     for (auto & [name, items] : groups) {
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(items.size()));
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < items.size(); ++i) lv->elems[i] = items[i];
         Value lstV;
         lstV.tag_payload = static_cast<uint64_t>(Tag::List);
@@ -3772,7 +3772,7 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
     std::sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i) {
         b->entries[i].name  = entries[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
@@ -5404,7 +5404,7 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         if (auto it = seen.find(key); it != seen.end()) return it->second;
         size_t n = nv.listSize();
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(n));
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = lv;
         seen[key] = out;
@@ -5436,7 +5436,7 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
             // Wrap the TW element pointer in a Bridge thunk.  Forcing
             // the thunk calls treeWalkerToV3 on `*twElem` lazily.
             Thunk * t = Alloc::allocBridgeThunk(static_cast<void *>(twElem));
-            allocStats().thunksAllocated++;
+            V3_STATS_INC(thunksAllocated);
             Value entryVal;
             entryVal.tag_payload = static_cast<uint64_t>(Tag::Thunk);
             entryVal.payload.thunk = t;
@@ -5450,7 +5450,7 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
         const void * key = a; // Bindings pointer is stable & unique
         if (auto it = seen.find(key); it != seen.end()) return it->second;
         Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(a->size()));
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         out.payload.bindings = b;
         seen[key] = out;
@@ -5506,7 +5506,7 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
             // just-that-value when forced.
             Thunk * t = Alloc::allocBridgeThunk(
                 static_cast<void *>(it.value));
-            allocStats().thunksAllocated++;
+            V3_STATS_INC(thunksAllocated);
             Value entryVal;
             entryVal.tag_payload = static_cast<uint64_t>(Tag::Thunk);
             entryVal.payload.thunk = t;
@@ -6195,7 +6195,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     std::sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i) {
         b->entries[i].name  = entries[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
@@ -6432,7 +6432,7 @@ static void buildAndWriteDrvNative(
         [](auto & a, auto & b) { return a.first < b.first; });
 
     Bindings * resultB = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i) {
         resultB->entries[i].name  = entries[i].first;
         bindingsSetValue(resultB, static_cast<uint32_t>(i), entries[i].second);  // Phase D
@@ -7321,7 +7321,7 @@ static void primDerivationStrictNative_phases_4_7_legacy_ref(
         [](auto & a, auto & b) { return a.first < b.first; });
 
     Bindings * resultB = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i) {
         resultB->entries[i].name  = entries[i].first;
         bindingsSetValue(resultB, static_cast<uint32_t>(i), entries[i].second);  // Phase D
@@ -7394,7 +7394,7 @@ void primDerivation(EvalState & state, Value * args, Value & out)
         std::sort(oEntries.begin(), oEntries.end(),
             [](auto & a, auto & b) { return a.first < b.first; });
         Bindings * ob = Alloc::allocBindings(static_cast<uint32_t>(oEntries.size()));
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         for (size_t i = 0; i < oEntries.size(); ++i) {
             ob->entries[i].name  = oEntries[i].first;
             bindingsSetValue(ob, static_cast<uint32_t>(i), oEntries[i].second);  // Phase D
@@ -7433,7 +7433,7 @@ void primDerivation(EvalState & state, Value * args, Value & out)
     // self-contained.
     if (!allOutputs.empty()) {
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(allOutputs.size()));
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < allOutputs.size(); ++i)
             lv->elems[i] = allOutputs[i];
         Value vAll;
@@ -7450,7 +7450,7 @@ void primDerivation(EvalState & state, Value * args, Value & out)
         else dedup.push_back(p);
     }
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(dedup.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < dedup.size(); ++i) {
         b->entries[i].name  = dedup[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), dedup[i].second);  // Phase D
@@ -8848,7 +8848,7 @@ void primParseFlakeRef(EvalState & state, Value * args, Value & out)
     std::sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
     Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i)  // Phase D
         bindingsSetEntry(b, static_cast<uint32_t>(i), {entries[i].first, 0, entries[i].second});
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
@@ -8922,7 +8922,7 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
         std::sort(entries.begin(), entries.end(),
             [](auto & a, auto & b) { return a.first < b.first; });
         Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         for (size_t i = 0; i < entries.size(); ++i) {
             b->entries[i].name  = entries[i].first;
             bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
@@ -8934,7 +8934,7 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
     case toml::value_t::array: {
         auto & arr = t.as_array();
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(arr.size()));
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < arr.size(); ++i)
             lv->elems[i] = tomlToValue(state, arr[i]);
         v.tag_payload = static_cast<uint64_t>(Tag::List);
@@ -9001,7 +9001,7 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
         SymbolId sType = vmIntern(state, "_type");
         SymbolId sVal  = vmIntern(state, "value");
         Bindings * b = Alloc::allocBindings(2);
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         Value typeV = mkStringValueOwned("timestamp");
         Value valV  = mkStringValueOwned(str);
         if (sType < sVal) { bindingsSetEntry(b, 0, {sType, 0, typeV}); bindingsSetEntry(b, 1, {sVal, 0, valV}); }  // Phase D
@@ -9353,7 +9353,7 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
                 if (!twFormals) {
                     // Plain `x: ...` -- no formals attrset; return empty.
                     Bindings * b = Alloc::allocBindings(0);
-                    allocStats().attrsetsAllocated++;
+                    V3_STATS_INC(attrsetsAllocated);
                     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
                     out.payload.bindings = b;
                     return;
@@ -9369,7 +9369,7 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
                 std::sort(entries.begin(), entries.end(),
                     [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
                 Bindings * bb = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-                allocStats().attrsetsAllocated++;
+                V3_STATS_INC(attrsetsAllocated);
                 for (size_t i = 0; i < entries.size(); ++i) {
                     bb->entries[i].name  = std::get<0>(entries[i]);
                     bindingsSetValue(bb, static_cast<uint32_t>(i),  // Phase D
@@ -9382,7 +9382,7 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
             // Bridge wraps a non-lambda function (e.g., primOpApp).
             if (src->type() == nix::nFunction) {
                 Bindings * b = Alloc::allocBindings(0);
-                allocStats().attrsetsAllocated++;
+                V3_STATS_INC(attrsetsAllocated);
                 out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
                 out.payload.bindings = b;
                 return;
@@ -9393,7 +9393,7 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
         const LambdaDescriptor * desc = v.payload.closure->desc;
         if (!desc->hasFormals) {
             Bindings * b = Alloc::allocBindings(0);
-            allocStats().attrsetsAllocated++;
+            V3_STATS_INC(attrsetsAllocated);
             out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             out.payload.bindings = b;
             return;
@@ -9409,7 +9409,7 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
         std::sort(entries.begin(), entries.end(),
             [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
         Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         for (size_t i = 0; i < entries.size(); ++i) {
             b->entries[i].name = std::get<0>(entries[i]);
             b->entries[i].pos  = std::get<2>(entries[i]);  // #752 inline
@@ -9450,7 +9450,7 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
     if (v.tag() == Tag::PrimOp || v.tag() == Tag::PrimOpApp) {
         // PrimOps don't have introspectable formals; return empty.
         Bindings * b = Alloc::allocBindings(0);
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
         out.payload.bindings = b;
         return;
@@ -9488,7 +9488,7 @@ Value jsonToValue(EvalState & state, const nlohmann::json & j)
     }
     if (j.is_array()) {
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(j.size()));
-        allocStats().listsAllocated++;
+        V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < j.size(); ++i) lv->elems[i] = jsonToValue(state, j[i]);
         out.tag_payload = static_cast<uint64_t>(Tag::List);
         out.payload.list = lv;
@@ -9507,7 +9507,7 @@ Value jsonToValue(EvalState & state, const nlohmann::json & j)
         std::sort(entries.begin(), entries.end(),
             [](auto & a, auto & b) { return a.first < b.first; });
         Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         for (size_t i = 0; i < entries.size(); ++i) {
             b->entries[i].name = entries[i].first;
             bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
@@ -9731,7 +9731,7 @@ void primSort(EvalState & state, Value * args, Value & out)
     Value cmp = args[0];
     if (!src || src->size <= 1) { out = args[1]; return; }
     ListVec * result = Alloc::allocList(src->size);
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (uint32_t i = 0; i < src->size; ++i) result->elems[i] = src->elems[i];
     std::sort(result->elems, result->elems + src->size,
         [&](const Value & a, const Value & b) {
@@ -9820,7 +9820,7 @@ void primTryEval(EvalState & state, Value * args, Value & out)
         valueV = Value::vFalse;
     }
     Bindings * b = Alloc::allocBindings(2);
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     if (sSuccess < sValue) {
         bindingsSetEntry(b, 0, {sSuccess, 0, successV});  // Phase D
         bindingsSetEntry(b, 1, {sValue, 0, valueV});
@@ -9920,7 +9920,7 @@ Thunk * getOrAllocBridgeThunkCached(nix::Value * srcV)
     auto it = cache.find(srcV);
     if (it != cache.end()) return it->second;
     Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(srcV));
-    allocStats().thunksAllocated++;
+    V3_STATS_INC(thunksAllocated);
     cache.emplace(srcV, bridge);
     return bridge;
 }
@@ -10225,7 +10225,7 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
 
     Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(arg));
-    allocStats().thunksAllocated++;
+    V3_STATS_INC(thunksAllocated);
     Value v3Arg;
     v3Arg.tag_payload = static_cast<uint64_t>(Tag::Thunk);
     v3Arg.payload.thunk = bridge;
@@ -10336,7 +10336,7 @@ bool tryDispatchFormalsLambdaBridge(nix::EvalState & ns,
     // what it needs (the formal-attrset's specific entries via
     // OP_ATTRS_SELECT lazily resolved through the Bridge).
     Thunk * bridge = Alloc::allocBridgeThunk(static_cast<void *>(arg));
-    allocStats().thunksAllocated++;
+    V3_STATS_INC(thunksAllocated);
     Value v3Arg;
     v3Arg.tag_payload = static_cast<uint64_t>(Tag::Thunk);
     v3Arg.payload.thunk = bridge;

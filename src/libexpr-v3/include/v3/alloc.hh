@@ -44,6 +44,45 @@
 #  include <gc/gc.h>
 #endif
 
+// --------------------------------------------------------------------------
+// #824 / A2 (2026-05-26) — V3_RELEASE compile flag.
+//
+// `-DV3_RELEASE=1` (set by meson option `v3_release`) strips always-on
+// instrumentation from the v3 hot paths.  The two macros below are the
+// uniform escape hatch used wherever an unconditional counter or
+// diagnostic-side-table update fires from a hot path:
+//
+//   V3_STATS_BUMP(field, n)  — semantically `allocStats().field += (n)`,
+//                              elided to `((void)0)` under V3_RELEASE.
+//   V3_STATS_INC(field)      — semantically `++allocStats().field`,
+//                              elided to `((void)0)` under V3_RELEASE.
+//   V3_STATS_BLOCK { ... }   — multi-statement diagnostic side-effect
+//                              that should disappear entirely under
+//                              V3_RELEASE.  The braces produce a block;
+//                              under V3_RELEASE the macro expands to
+//                              `if (false)` which the compiler trivially
+//                              DCE's.  Use for the 10-branch attrset-
+//                              size cascade and the bindingsAllocSite
+//                              callback in `allocBindings`.
+//
+// Env-gated diagnostic counters (those guarded by `getenv("NIX_VM_*")`
+// or `V3_DBG_*`) do NOT use these macros — their cost-when-off is
+// already a single cached-bool branch, and they remain compileable.
+// See NEXT_STEPS_2026-05-25.md §1.0 A2 + §8.5 AR1 for the rationale.
+//
+// Readers of the counters (`run.cc` NIX_VM_STATS dump, `limits.cc`
+// resource-error message) tolerate zeroed counters and produce
+// honest-zero output under V3_RELEASE.
+#ifdef V3_RELEASE
+#  define V3_STATS_BUMP(field, n) ((void)(n))
+#  define V3_STATS_INC(field)     ((void)0)
+#  define V3_STATS_BLOCK          if (false)
+#else
+#  define V3_STATS_BUMP(field, n) (allocStats().field += (n))
+#  define V3_STATS_INC(field)     (++allocStats().field)
+#  define V3_STATS_BLOCK          if (true)
+#endif
+
 namespace nix::v3 {
 
 using SymbolId = uint32_t;
@@ -665,14 +704,14 @@ struct Alloc
 
     static Value * allocValue() noexcept
     {
-        allocStats().bytesValues += sizeof(Value);
+        V3_STATS_BUMP(bytesValues, sizeof(Value));
         return static_cast<Value *>(threadArena().alloc(sizeof(Value)));
     }
 
     static Closure * allocClosure(uint16_t nUpvalues) noexcept
     {
         const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
-        allocStats().bytesClosures += bytes;
+        V3_STATS_BUMP(bytesClosures, bytes);
         auto * c = static_cast<Closure *>(nurseryOrArena(bytes));
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
@@ -708,7 +747,7 @@ struct Alloc
     static Closure * allocClosureTenured(uint16_t nUpvalues) noexcept
     {
         const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
-        allocStats().bytesClosures += bytes;
+        V3_STATS_BUMP(bytesClosures, bytes);
         auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
@@ -722,7 +761,7 @@ struct Alloc
     static Thunk * allocThunkSuspended(uint16_t nUpvalues) noexcept
     {
         const size_t bytes = sizeof(Thunk) + sizeof(Value) * nUpvalues;
-        allocStats().bytesThunks += bytes;
+        V3_STATS_BUMP(bytesThunks, bytes);
         auto * t = static_cast<Thunk *>(nurseryOrArena(bytes));
         t->state = ThunkState::Suspended;
         t->nUpvalues = nUpvalues;
@@ -764,7 +803,7 @@ struct Alloc
     {
         // No upvalues / no FAM tail.
         const size_t bytes = sizeof(Thunk);
-        allocStats().bytesThunks += bytes;
+        V3_STATS_BUMP(bytesThunks, bytes);
         auto * t = static_cast<Thunk *>(threadArena().alloc(bytes));
         t->state = ThunkState::Bridge;
         t->nUpvalues = 0;
@@ -780,7 +819,7 @@ struct Alloc
     static Env * allocEnv(uint16_t nValues) noexcept
     {
         const size_t bytes = sizeof(Env) + sizeof(Value) * nValues;
-        allocStats().bytesEnvs += bytes;
+        V3_STATS_BUMP(bytesEnvs, bytes);
         auto * e = static_cast<Env *>(threadArena().alloc(bytes));
         e->parent = nullptr;
         e->isWithEnv = false;
@@ -791,7 +830,7 @@ struct Alloc
     static ListVec * allocList(uint32_t n) noexcept
     {
         const size_t bytes = sizeof(ListVec) + sizeof(Value) * n;
-        allocStats().bytesLists += bytes;
+        V3_STATS_BUMP(bytesLists, bytes);
         auto * l = static_cast<ListVec *>(nurseryOrArena(bytes));
         l->size = n;
         return l;
@@ -805,8 +844,8 @@ struct Alloc
     /// pairs sit inside a GC_add_roots-registered region (alloc.hh:225).
     static ValuePair * allocPair() noexcept
     {
-        ++allocStats().pairsAllocated;
-        allocStats().bytesPairs += sizeof(ValuePair);
+        V3_STATS_INC(pairsAllocated);
+        V3_STATS_BUMP(bytesPairs, sizeof(ValuePair));
         return static_cast<ValuePair *>(threadArena().alloc(sizeof(ValuePair)));
     }
 
@@ -825,7 +864,7 @@ struct Alloc
     /// existing call site -- this helper just replaces the std::malloc).
     static char * allocChars(size_t n) noexcept
     {
-        allocStats().bytesChars += n;
+        V3_STATS_BUMP(bytesChars, n);
         return static_cast<char *>(threadArena().alloc(n));
     }
 
@@ -866,7 +905,7 @@ struct Alloc
         // "alloc-site" if the env-var is on, then return the
         // shared sentinel — no arena allocation.
         if (n == 0) {
-            allocStats().attrsetSizeBuckets[0]++;
+            V3_STATS_INC(attrsetSizeBuckets[0]);
             // Don't bump bytesBindings — the shared sentinel doesn't
             // grow the arena.  Don't record per-Bindings origin
             // either (the sentinel is reused, so a per-pointer
@@ -874,7 +913,7 @@ struct Alloc
             return emptyBindingsSentinel();
         }
         const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * n;
-        allocStats().bytesBindings += bytes;
+        V3_STATS_BUMP(bytesBindings, bytes);
         // Tenured by design (Phase C v1): Bindings entries[] hold
         // long-lived Tag::Slot targets and `Thunk::cell` write-back
         // pointers that must stay pointer-stable across nursery
@@ -885,24 +924,33 @@ struct Alloc
         b->size = n;
         // Track size distribution for VM-2 sizing decisions.  Cheap
         // (one branch + one increment) — runs once per attrset.
-        auto & buckets = allocStats().attrsetSizeBuckets;
-        if      (n == 0)        buckets[0]++;
-        else if (n == 1)        buckets[1]++;
-        else if (n == 2)        buckets[2]++;
-        else if (n <= 4)        buckets[3]++;
-        else if (n <= 8)        buckets[4]++;
-        else if (n <= 16)       buckets[5]++;
-        else if (n <= 32)       buckets[6]++;
-        else if (n <= 64)       buckets[7]++;
-        else if (n <= 128)      buckets[8]++;
-        else                    buckets[9]++;
-        // Phase A1 default-recording (RCA 2026-05-11): tag every
-        // Bindings allocation with its C++ caller file:line when
-        // NIX_V3_DBG_BINDINGS_ORIGIN=1.  Routed through a forward-
-        // declared free helper that's defined further down (it needs
-        // <unordered_map> and the BindingsOrigin types, which appear
-        // later in this header).  Zero cost when the env-var is off.
-        bindingsAllocSiteRecord(b, file, line);
+        //
+        // #824 / A2: the 10-branch cascade + the bindingsAllocSiteRecord
+        // call below are both diagnostic-only.  Under V3_RELEASE the
+        // entire side-effect block is DCE'd by the compiler via the
+        // `if (false) { ... }` pattern in V3_STATS_BLOCK.
+        V3_STATS_BLOCK {
+            auto & buckets = allocStats().attrsetSizeBuckets;
+            if      (n == 0)        buckets[0]++;
+            else if (n == 1)        buckets[1]++;
+            else if (n == 2)        buckets[2]++;
+            else if (n <= 4)        buckets[3]++;
+            else if (n <= 8)        buckets[4]++;
+            else if (n <= 16)       buckets[5]++;
+            else if (n <= 32)       buckets[6]++;
+            else if (n <= 64)       buckets[7]++;
+            else if (n <= 128)      buckets[8]++;
+            else                    buckets[9]++;
+            // Phase A1 default-recording (RCA 2026-05-11): tag every
+            // Bindings allocation with its C++ caller file:line when
+            // NIX_V3_DBG_BINDINGS_ORIGIN=1.  Routed through a forward-
+            // declared free helper that's defined further down (it needs
+            // <unordered_map> and the BindingsOrigin types, which appear
+            // later in this header).  Zero cost when the env-var is off
+            // (early-return inside), but the call+return itself isn't
+            // free; eliding it under V3_RELEASE removes the call as well.
+            bindingsAllocSiteRecord(b, file, line);
+        }
         return b;
     }
 
@@ -1012,7 +1060,7 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
     // Pool miss: always arena (never nursery) so subsequent
     // recycle's pointer stability survives Cheney scavenges.
     const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
-    allocStats().bytesClosures += bytes;
+    V3_STATS_BUMP(bytesClosures, bytes);
     auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
     c->nUpvalues = nUpvalues;
     c->_pad = kFakeCloMagic;   // Mark as fakeClo for safe pooling.

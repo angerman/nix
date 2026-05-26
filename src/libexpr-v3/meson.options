@@ -1,0 +1,10 @@
+option(
+  'v3_release',
+  type : 'boolean',
+  value : false,
+  description : 'Strip always-on v3 instrumentation (per-alloc byte counters, attrset-size buckets, '
+              + 'bindings-origin call, per-thunk shapeCell preallocation gate, etc.). '
+              + 'Env-gated diagnostic counters (NIX_VM_OPCOUNTS, NIX_VM_OPCYCLES, V3_DBG_*) '
+              + 'remain compileable and behave normally when their env-var is set. '
+              + 'Pre-committed falsifier: ship if >=2%% wall reduction OR >=20 MB peak RSS reduction.',
+)

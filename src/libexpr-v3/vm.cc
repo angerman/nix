@@ -3325,7 +3325,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // (which can use the nursery) → SIGSEGV after the first
                 // scavenge.  See allocClosureTenured docstring.
                 Closure * c = Alloc::allocClosureTenured(0);
-                allocStats().closuresAllocated++;
+                V3_STATS_INC(closuresAllocated);
                 c->desc = &desc;
                 c->cu   = cu;
                 c->nUpvalues = 0;
@@ -3358,7 +3358,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
 
             Closure * c = Alloc::allocClosure(nUp);
-            allocStats().closuresAllocated++;
+            V3_STATS_INC(closuresAllocated);
             c->desc = &cu->lambdas[funcIdx];
             c->cu   = cu;
             c->nUpvalues = nUp;
@@ -3662,7 +3662,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // gate the writes (cross-cache-line; unconditional cost
             // ~1-2 ns per alloc on hot paths).
             if (__builtin_expect(dbgForceStatsActive(), 0)) {
-                allocStats().thunksAllocated++;
+                V3_STATS_INC(thunksAllocated);
                 ++cu->lambdas[funcIdx].allocCount;
             }
             if (__builtin_expect(g_dbgAllocDump, 0)) {
@@ -4281,7 +4281,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 if (outTwHeap->type<true>() == nix::nThunk) {
                     Thunk * bridge = Alloc::allocBridgeThunk(
                         static_cast<void *>(outTwHeap));
-                    allocStats().thunksAllocated++;
+                    V3_STATS_INC(thunksAllocated);
                     v3out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
                     v3out.payload.thunk = bridge;
                 } else {
@@ -6925,7 +6925,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 break;
             }
             ListVec * l = Alloc::allocList(n);
-            allocStats().listsAllocated++;
+            V3_STATS_INC(listsAllocated);
             for (uint32_t i = n; i > 0; --i) l->elems[i - 1] = pop(vm);
             listPostConstructBarrier(l);  // Phase D coverage (OP_LIST_INIT)
             Value v;
@@ -6969,7 +6969,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 throw std::runtime_error("v3 OP_LIST_CONCAT: not lists");
             uint32_t n = lhs.payload.list->size + rhs.payload.list->size;
             ListVec * out = Alloc::allocList(n);
-            allocStats().listsAllocated++;
+            V3_STATS_INC(listsAllocated);
             uint32_t k = 0;
             for (uint32_t i = 0; i < lhs.payload.list->size; ++i) out->elems[k++] = lhs.payload.list->elems[i];
             for (uint32_t i = 0; i < rhs.payload.list->size; ++i) out->elems[k++] = rhs.payload.list->elems[i];
@@ -7030,7 +7030,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
             Bindings * b = Alloc::allocBindings(n);
-            allocStats().attrsetsAllocated++;
+            V3_STATS_INC(attrsetsAllocated);
             for (uint32_t i = 0; i < n; ++i) {
                 b->entries[i].name = entries[i].name;
                 b->entries[i].pos  = entries[i].pos;  // #752 inline
@@ -7105,7 +7105,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
             Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
-            allocStats().attrsetsAllocated++;
+            V3_STATS_INC(attrsetsAllocated);
             for (size_t i = 0; i < entries.size(); ++i) {
                 b->entries[i].name = std::get<0>(entries[i]);
                 b->entries[i].pos  = std::get<2>(entries[i]);  // #752 inline
@@ -7175,7 +7175,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // position side-table.
             uint32_t n = operand;
             Bindings * b = Alloc::allocBindings(n);
-            allocStats().attrsetsAllocated++;
+            V3_STATS_INC(attrsetsAllocated);
             uint32_t firstPos = 0;
             for (uint32_t i = 0; i < n; ++i) {
                 SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
@@ -7260,7 +7260,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // CALLPACKAGE_BUG_2026-05-09.md for the full analysis.
             uint32_t n = operand;
             Bindings * b = Alloc::allocBindings(n);
-            allocStats().attrsetsAllocated++;
+            V3_STATS_INC(attrsetsAllocated);
             for (uint32_t i = 0; i < n; ++i) {
                 SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
                 uint32_t ps = cu->code[ip + 2 * i + 1];
@@ -7298,7 +7298,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // rationale.
             uint32_t n = operand;
             Bindings * b = Alloc::allocBindings(n);
-            allocStats().attrsetsAllocated++;
+            V3_STATS_INC(attrsetsAllocated);
             uint32_t firstPosTail = 0;
             for (uint32_t i = 0; i < n; ++i) {
                 SymbolId nm = static_cast<SymbolId>(cu->code[ip + 2 * i]);
@@ -7382,7 +7382,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             if (!toAdd.empty()) {
                 Bindings * grown = Alloc::allocBindings(dst->size + toAdd.size());
-                allocStats().attrsetsAllocated++;
+                V3_STATS_INC(attrsetsAllocated);
                 std::vector<std::pair<SymbolId, Value>> all;
                 all.reserve(dst->size + toAdd.size());
                 for (uint32_t i = 0; i < dst->size; ++i)
@@ -8408,7 +8408,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 throw std::runtime_error("v3 OP_ATTRS_UPDATE: not attrsets");
             Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings,
                                            MergeBindingsSite::AttrsUpdate);
-            allocStats().attrsetsAllocated++;
+            V3_STATS_INC(attrsetsAllocated);
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = out;
@@ -8481,7 +8481,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings,
                                            MergeBindingsSite::AttrsUpdateTail);
-            allocStats().attrsetsAllocated++;
+            V3_STATS_INC(attrsetsAllocated);
             Value v;
             v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
             v.payload.bindings = out;
@@ -9929,7 +9929,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     "'builtins.tail' called on an empty list");
             uint32_t n = v.payload.list->size;
             ListVec * out_l = Alloc::allocList(n - 1);
-            allocStats().listsAllocated++;
+            V3_STATS_INC(listsAllocated);
             for (uint32_t i = 1; i < n; ++i)
                 out_l->elems[i - 1] = v.payload.list->elems[i];
             listPostConstructBarrier(out_l);  // Phase D coverage (OP_TAIL)
@@ -12263,7 +12263,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             if (outTwHeap->type<true>() == nix::nThunk) {
                 Thunk * bridge = Alloc::allocBridgeThunk(
                     static_cast<void *>(outTwHeap));
-                allocStats().thunksAllocated++;
+                V3_STATS_INC(thunksAllocated);
                 Value v3out;
                 v3out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
                 v3out.payload.thunk = bridge;

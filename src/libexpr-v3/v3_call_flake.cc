@@ -313,7 +313,7 @@ Value v3EmitTreeAttrs(
     // tracked by the scavenger.
     const uint32_t nEntries = static_cast<uint32_t>(entries.size());
     Bindings * b = Alloc::allocBindings(nEntries);
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (uint32_t i = 0; i < nEntries; ++i)
         bindingsSetEntry(b, i, { entries[i].first, /*pos=*/0, entries[i].second });
 
@@ -394,7 +394,7 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
     {
         size_t N = lockedFlake.nodePaths.size();
         Bindings * outer = Alloc::allocBindings(static_cast<uint32_t>(N));
-        allocStats().attrsetsAllocated++;
+        V3_STATS_INC(attrsetsAllocated);
         // Pre-intern the inner attr keys (used N times each).
         SymbolId sidSourceInfo = ir::globalInternSymbol("sourceInfo");
         SymbolId sidDir        = ir::globalInternSymbol("dir");
@@ -438,7 +438,7 @@ Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake
 
             // Inner Bindings { sourceInfo; dir; } — sorted by SymbolId.
             Bindings * inner = Alloc::allocBindings(2);
-            allocStats().attrsetsAllocated++;
+            V3_STATS_INC(attrsetsAllocated);
             if (sidSourceInfo < sidDir) {
                 bindingsSetEntry(inner, 0, {sidSourceInfo, 0, v3SourceInfo});  // Phase D
                 bindingsSetEntry(inner, 1, {sidDir, 0, v3Dir});

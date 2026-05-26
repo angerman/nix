@@ -367,7 +367,7 @@ static Value deserializeList(Reader & r)
         return v;
     }
     ListVec * lv = Alloc::allocList(n);
-    allocStats().listsAllocated++;
+    V3_STATS_INC(listsAllocated);
     for (uint32_t i = 0; i < n; ++i)
         lv->elems[i] = deserializeOne(r);
     listPostConstructBarrier(lv);  // Phase D batch barrier.
@@ -400,7 +400,7 @@ static Value deserializeAttrs(Reader & r)
     std::sort(tmp.begin(), tmp.end(),
         [](const Tmp & a, const Tmp & b) { return a.sid < b.sid; });
     Bindings * b = Alloc::allocBindings(n);
-    allocStats().attrsetsAllocated++;
+    V3_STATS_INC(attrsetsAllocated);
     for (uint32_t i = 0; i < n; ++i) {
         bindingsSetEntry(b, i, {tmp[i].sid, 0, tmp[i].val});  // Phase D
     }

@@ -17,6 +17,27 @@ project(
 
 cxx = meson.get_compiler('cpp')
 
+# A2 (2026-05-26) — V3_RELEASE build mode strips always-on
+# instrumentation from the v3 evaluator's hot paths.  See
+# `meson.options` for what is removed and `WARM_EVAL_AND_
+# INSTRUMENTATION_2026-05-23.md` §6.1 for the rationale.
+#
+# Pre-committed ship-or-revert falsifier (per
+# `lode/NEXT_STEPS_2026-05-25.md` §1.0 A2 entry):
+#   - Ship if  >=2 % wall  reduction OR  >=20 MB peak-RSS reduction
+#                (n=10 hyperfine, sigma < 1 %).
+#   - Revert if <2 % wall AND <20 MB peak-RSS.
+#
+# Env-gated diagnostic counters (NIX_VM_OPCOUNTS, NIX_VM_OPCYCLES,
+# NIX_V3_DBG_*) remain compileable; only payload-active when the
+# env-var is set (cost when off is one cached-bool branch test).
+v3_release_args = []
+if get_option('v3_release')
+  v3_release_args += [ '-DV3_RELEASE=1' ]
+  message('v3: V3_RELEASE build — always-on instrumentation stripped')
+endif
+add_project_arguments(v3_release_args, language : 'cpp')
+
 subdir('nix-meson-build-support/deps-lists')
 
 deps_private_maybe_subproject = [
