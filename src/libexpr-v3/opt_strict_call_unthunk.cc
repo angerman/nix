@@ -613,6 +613,44 @@ size_t applyStrictnessAtCallSites(Module & m)
     size_t forceFailNotMkThunk   = 0;
     size_t forceFailMultiUse     = 0;
     size_t forceFailNotCloneable = 0;
+    // #776 measurement spike — when forceFailNotMkThunk fires (operand
+    // not resolvable in same block), classify what the operand WOULD
+    // resolve to under a module-wide chase.  Quantifies the upper
+    // bound of let-floating's payoff before we commit to the lift.
+    //
+    //   globalNotFound         — no def in any block (function param /
+    //                            RecBindingSlotRef target / unresolved).
+    //   globalMkThunkRemote    — chase finds MkThunk in a DIFFERENT block
+    //                            (the LIFT candidate population).
+    //   globalMkThunkRemoteOne — globalMkThunkRemote AND single-use
+    //                            module-wide (REALIST lift candidate).
+    //   globalOtherExpr        — chase finds something other than MkThunk
+    //                            (App, Force, AttrSelect, ...).
+    size_t globalNotFound          = 0;
+    size_t globalMkThunkRemote     = 0;
+    size_t globalMkThunkRemoteOne  = 0;
+    size_t globalOtherExpr         = 0;
+
+    // #776 measurement spike — module-wide var→Expr map for cross-block
+    // chasing of Force operands.  Gated by `dbg` (NIX_V3_DBG_STRICT_CALL_
+    // UNTHUNK) so production builds pay zero cost.  Falsified the
+    // let-floating premise on hello.drvPath:
+    //   379 modules / 64175 Apps / 12356 Force-of-MkThunk failures
+    //   globalMkThunkRemote = 0 / 12356  (zero lift candidates ANYWHERE)
+    //   globalNotFound      = 6332 (51.2% — operand is lambda param /
+    //                               formal / RecBindingSlotRef target)
+    //   globalOtherExpr     = 6024 (48.8% — operand chases to App /
+    //                               AttrSelect / Force / non-MkThunk)
+    // Kept as a re-run probe if upstream lowering ever changes shape.
+    std::unordered_map<VarId, const Expr *> globalDefs;
+    if (dbg) {
+        size_t total = 0;
+        for (const auto & b : m.blocks) total += b.bindings.size();
+        globalDefs.reserve(total);
+        for (const auto & b : m.blocks)
+            for (const auto & bd : b.bindings)
+                globalDefs.emplace(bd.var, &bd.expr);
+    }
     // #775 instrumentation: funnel breakdown to find WHY isInlinableMkThunk
     // rejects most strict-hit candidates.  Goal: identify whether (a) the
     // arg isn't a MkThunk in same block, (b) MkThunk has multiple uses, or
@@ -661,6 +699,19 @@ size_t applyStrictnessAtCallSites(Module & m)
                 auto fres = chaseInBlockResolved(f->thunk, defs);
                 if (!fres.expr || !std::get_if<MkThunk>(fres.expr)) {
                     ++forceFailNotMkThunk;
+                    // #776 spike — classify under module-wide chase.
+                    if (dbg) {
+                        auto gres = chaseInBlockResolved(f->thunk, globalDefs);
+                        if (!gres.expr) {
+                            ++globalNotFound;
+                        } else if (std::get_if<MkThunk>(gres.expr)) {
+                            ++globalMkThunkRemote;
+                            if (uses.at(gres.definer) == 1)
+                                ++globalMkThunkRemoteOne;
+                        } else {
+                            ++globalOtherExpr;
+                        }
+                    }
                 } else if (uses.at(fres.definer) != 1) {
                     ++forceFailMultiUse;
                 } else {
@@ -876,14 +927,18 @@ size_t applyStrictnessAtCallSites(Module & m)
             "[funnel: failResolve=%zu failStrictArgs=%zu "
             "passedToInline=%zu failNotMkThunk=%zu failMultiUse=%zu "
             "failNotCloneable=%zu | force-of-mkt: considered=%zu passed=%zu "
-            "fail{notMkt=%zu multiUse=%zu notClone=%zu}]\n",
+            "fail{notMkt=%zu multiUse=%zu notClone=%zu} | "
+            "#776 spike (notMkt classified globally): "
+            "notFound=%zu mktRemote=%zu mktRemoteOne=%zu other=%zu]\n",
             elided, elidedSingleArg, elidedFormals, elidedForceMkt,
             consideredApps,
             failResolveLambda, failStrictArgs,
             passedToInline, failNotMkThunk, failMultiUse,
             failNotCloneable,
             consideredForces, passedToInlineForce,
-            forceFailNotMkThunk, forceFailMultiUse, forceFailNotCloneable);
+            forceFailNotMkThunk, forceFailMultiUse, forceFailNotCloneable,
+            globalNotFound, globalMkThunkRemote,
+            globalMkThunkRemoteOne, globalOtherExpr);
     }
 
     return elided;
