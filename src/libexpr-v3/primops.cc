@@ -6385,8 +6385,19 @@ static void buildAndWriteDrvNative(
     if (value_serialize::drvHashCacheEnabled()
         || value_serialize::drvHashCacheActiveEnabled()
         || value_serialize::drvHashCacheDiskEnabled()) {
+        // #828 B1 audit: instrument the drvHash lookup site so we can
+        // see which call paths produce cache hits vs misses.  Helps
+        // verify Phase 3e ACTIVE's "skip-on-hit is sound" invariant
+        // (the assumption that two primDerivationStrict invocations
+        // producing the same drvPath produce identical result
+        // attrsets).
+        CACHE_HOOK_DEFINE_SITE(siteDrvHashLookup,
+            "primDerivationStrict-drvHash-lookup");
+        CacheHookTimer drvTimer(siteDrvHashLookup);
         v3DrvKey = drvPathS;
         v3DrvHit = value_serialize::drvHashCacheLookup(v3DrvKey, v3DrvCached);
+        if (v3DrvHit) cacheHookHit(siteDrvHashLookup);
+        else          cacheHookMiss(siteDrvHashLookup);
     }
 
     // Phase 3e ACTIVE — skip-on-hit.  In-process safe because the
@@ -6401,6 +6412,15 @@ static void buildAndWriteDrvNative(
     // cache wouldn't have populated drvHashes.  Phase 5 must cache
     // the modulo hash alongside the result and replay it on hit.
     if (v3DrvHit && value_serialize::drvHashCacheActiveEnabled()) {
+        // #828 B1 audit: count the actual ACTIVE skip-on-hit firings
+        // separately from the lookup hits.  drvHashCacheStats already
+        // tracks `activeSkips`; we mirror it here for the per-site
+        // dump so B1's audit can see exactly how often the
+        // skip-the-libstore-tail optimisation fires per call site.
+        CACHE_HOOK_DEFINE_SITE(siteDrvHashSkip,
+            "primDerivationStrict-drvHash-active-skip");
+        cacheHookFire(siteDrvHashSkip);
+        cacheHookHit(siteDrvHashSkip);
         out = v3DrvCached;
         ++value_serialize::drvHashCacheStats().activeSkips;
         return;

@@ -17,6 +17,7 @@
 #include "v3/barrier.hh"
 #include "v3/closure.hh"  // Thunk + ThunkState (for chaseToWHNF)
 #include "v3/disk_cache.hh"  // Phase 5: lookupEvalResult / insertEvalResult
+#include "v3/cache_probe.hh"  // #828 / A3 / B1 per-call-site cache-hook
 #include "v3/ir.hh"
 #include "v3/value.hh"
 
@@ -885,9 +886,13 @@ bool drvHashCacheLookup(const std::string & key, Value & outResult) noexcept
     // hit, promote into the in-memory map so subsequent in-process
     // lookups for the same drvPath are fast.
     if (drvHashCacheDiskEnabled()) {
+        CACHE_HOOK_DEFINE_SITE(siteDrvHashDisk,
+            "drvHashCache-disk-lookup");
+        CacheHookTimer dt(siteDrvHashDisk);
         auto diskKey = disk_cache::computeKeyForString(key);
         auto diskBlob = disk_cache::lookupEvalResult(diskKey);
         if (diskBlob) {
+            cacheHookHit(siteDrvHashDisk);
             try {
                 outResult = deserialize(*diskBlob);
             } catch (...) {
@@ -903,6 +908,7 @@ bool drvHashCacheLookup(const std::string & key, Value & outResult) noexcept
             ++stats.hits;
             return true;
         }
+        cacheHookMiss(siteDrvHashDisk);
     }
 
     ++stats.misses;
@@ -929,8 +935,12 @@ void drvHashCacheInsert(const std::string & key, const Value & result) noexcept
     // #741 Phase 5: persist to disk first (best-effort), then move
     // into in-memory.  string_view doesn't consume blob.
     if (drvHashCacheDiskEnabled()) {
+        CACHE_HOOK_DEFINE_SITE(siteDrvHashDiskInsert,
+            "drvHashCache-disk-insert");
+        CacheHookTimer it(siteDrvHashDiskInsert);
         auto diskKey = disk_cache::computeKeyForString(key);
         disk_cache::insertEvalResult(diskKey, blob);
+        cacheHookInsert(siteDrvHashDiskInsert, blob.size());
     }
     drvHashCacheMap().emplace(key, std::move(blob));
     ++stats.inserts;
