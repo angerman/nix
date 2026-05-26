@@ -466,13 +466,31 @@ HNE-class workloads (3 GB peak) may yet clear the threshold (nursery overhead is
 
 ## 5. Tier C — strategic infrastructure (deferred, cross-team scope)
 
-### C1 — AOT distribution spec (1-2 weeks, cross-team)
+### C1 — AOT distribution — SPLIT into C1a + C1b (2026-05-26)
 
-`nixpkgs-bytecode-cache` + `nixpkgs-eval-result-cache` as cache.nixos.org artifacts. Per [[warm-eval-instrumentation-2026-05-23]] §6.4 + [[eval-cache-architecture-2026-05-23]] §4.4. The v3 side is done (#777 disk cache + #781b sparse symbolTable + #741 Phase 1-5); the missing link is **infrastructure work in the broader Nix ecosystem**, not v3-VM work. Cross-team coordination story is non-trivial.
+Per [`AOT_DISTRIBUTION_2026-05-26.md`](AOT_DISTRIBUTION_2026-05-26.md), this item splits into a near-term v3-team-owned path (C1a / R8a) and a longer-term cache.nixos.org-coordinated path (C1b / R8b).
 
-**Strategic position:** the two artifacts compose multiplicatively against TW (parse residue + primop residue both eliminated). TW has neither layer and cannot easily ship either. **This is where v3 wins decisively over TW** — but the win is gated on Nix-team buy-in, which the v3 team doesn't control unilaterally.
+#### C1a — v3-team-owned AOT cache (4-6 weeks v3-only) — **NEAR-TERM RECOMMENDED**
 
-**Defer rationale:** larger scope than one week; coordination dependency. Worth surfacing in cross-team conversation when standard wall is competitive (post-B1 if it lands).
+Keyed on flake ref; distributed via v3-team infrastructure (IOG Hydra / S3 / GitHub releases); opt-in via `NIX_V3_AOT_CACHE_URL=...`. **Ships unilaterally; no Nix-team coordination required.**
+
+Effort: 4-6 weeks total = Phase 1 spike (2-3 wk; build cache for haskell-nix-example; pre-committed threshold ≥ 30 % warm-eval improvement) + Phase 2 generalisation (2-3 wk; N flake refs; CDN distribution).
+
+Strategic value: for the IOG context, this is the **single highest-leverage near-term opportunity**. Targets cardano-node + haskell.nix workloads where v3 + AOT cache could outperform any currently-deployed Nix evaluator. Provides a competitive position that TW structurally cannot match.
+
+Composes with: R7 (mmap'd L2 is distribution format; revived as R8a dependency); R1 (cleaner cross-process determinism); Phase 4b (cache contents include EvalResults).
+
+See AOT_DISTRIBUTION_2026-05-26.md §7 for the Phase 1 spike pre-committed thresholds. See §6.5 Tier R for R8a entry.
+
+#### C1b — cache.nixos.org integration (formerly C1; longer-term)
+
+`nixpkgs-bytecode-cache` + `nixpkgs-eval-result-cache` as cache.nixos.org artifacts. Per [[warm-eval-instrumentation-2026-05-23]] §6.4. **Gated on C1a proven value + schema stability + Nix-team coordination.**
+
+Effort: 1-2 weeks v3-side + indefinite cross-team.
+
+Composes with: C1a / R8a (proven value at scale); R7; R1 (de-risks schema stability commitment).
+
+**Defer rationale (revised):** C1a should ship first; C1b becomes the pitch to cache.nixos.org from a position of proven value rather than up-front commitment ask.
 
 ---
 
@@ -611,35 +629,51 @@ Several items here also surface in `ROADMAP_TO_VISION_2026-05-15.md`'s "Killed-s
 
 **Cross-references:** `BOEHM_DEPENDENCY_2026-05-21.md`, `GC_VS_TW_ANALYSIS_2026-05-23.md`
 
-### R7 — mmap'd L2 cache (EVAL_CACHE_ARCHITECTURE §7 spike)
+### R7 — mmap'd L2 cache (EVAL_CACHE_ARCHITECTURE §7 spike) — *REVIVED 2026-05-26 as R8a dependency*
 
-**Status:** priority DROPPED post-#815 RCA + Phase 4b validation. Per `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §13.3(d) RETRACTED.
+**Status:** **REVIVED** as AOT distribution format per [`AOT_DISTRIBUTION_2026-05-26.md`](AOT_DISTRIBUTION_2026-05-26.md) §5. Previously dropped post-Phase 4b validation; that finding stands for primop scope, but mmap is structurally the right format for AOT distribution (cross-process page-cache shared, demand-paged, snapshot semantics native).
 
-**Triggers:**
-- **T7.a:** B1 (Phase 3e/5 scope audit) finds NO scope bug AND drvPath-class wall stays neutral. Signals SQLite-backed L2 is the actual cost; mmap'd L2 reduces lookup ~400× → wall positive.
-- **T7.b:** AOT distribution (C1) commits AND mmap is selected as the SQLite-replacement L2 (compositional fit: shipped via cache.nixos.org, mmap'd at v3 startup).
+**Trigger:** R8a Phase 1 spike commits to mmap'd flat file as distribution format. Effectively: starts when R8a starts.
 
-**Effort:** 3-5 days (per EVAL_CACHE §7)
+**Effort:** 3-5 days standalone (per EVAL_CACHE §7) + 1-2 weeks integration with R8a build pipeline.
 
-**Cross-references:** `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §4.3 + §7 + §13
+**Cross-references:** `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §4.3 + §7 + §13; `AOT_DISTRIBUTION_2026-05-26.md` §5
 
-### R8 — AOT distribution (C1 from Tier C)
+### R8a — v3-team-owned AOT cache (formerly part of R8; split 2026-05-26)
 
-**Status:** deferred cross-team. Tier C of this doc.
+**Status:** **near-term recommended; ships unilaterally** per [`AOT_DISTRIBUTION_2026-05-26.md`](AOT_DISTRIBUTION_2026-05-26.md). Keyed on flake ref; distributed via v3-team infrastructure (IOG Hydra / S3 / GitHub releases); opt-in via `NIX_V3_AOT_CACHE_URL=...` env var.
 
-**Triggers** (all four typically required):
+**Triggers (permissive; v3-team-only):**
+- Phase 1 spike (2-3 wk) meets pre-committed threshold ≥ 30 % warm-eval improvement on haskell-nix-example
+- v3 schema stable for 2+ weeks (or pinned to release branches only)
+- IOG infrastructure available for distribution
+- v3-team bandwidth (~1 person × 4-6 weeks)
+
+**Effort:** 4-6 weeks total (Phase 1 spike 2-3 wk + Phase 2 generalisation 2-3 wk). All v3-team-controlled.
+
+**Strategic value:** for IOG context, this is the single highest-leverage near-term opportunity. cardano-node + haskell.nix workloads at IOG CI scale would see dramatic warm-eval improvement. **Provides a competitive position that TW structurally cannot match.**
+
+**Composes with:** R7 (mmap'd L2 is the distribution format); R1 (cleaner cross-process determinism); Phase 4b (already default-on; cache includes EvalResults).
+
+**Cross-references:** [`AOT_DISTRIBUTION_2026-05-26.md`](AOT_DISTRIBUTION_2026-05-26.md), `WARM_EVAL_AND_INSTRUMENTATION_2026-05-23.md` §6.4
+
+### R8b — cache.nixos.org integration (formerly R8; renamed 2026-05-26)
+
+**Status:** longer-term ambition; gated on R8a proven value + schema stability + cross-team coordination.
+
+**Triggers (stricter than R8a; all required):**
+- R8a shipped AND proved value at scale (≥ X CI runs/week using the cache; threshold TBD post-R8a)
+- Schema bump rate decreased to < 1/month OR versioned-artifact model accepted by Nix-team
+- Nix-team coordination commitment confirmed
 - Standard wall ratio competitive (≤ 1.5× TW on hello.drvPath; currently 1.67× — close)
-- Schema-bump rate decreased (< 1 schema bump per month) OR versioned-artifact distribution model accepted (cache.nixos.org URL includes schema version)
-- Nix-team coordination confirmed
-- v3-team has bandwidth (estimated 1-2 weeks v3-side + cross-team)
 
-**Effort:** 1-2 weeks v3-side + indefinite cross-team
+**Effort:** 1-2 weeks v3-side + indefinite cross-team.
 
-**Composes with:** R7 (mmap'd L2 is the natural distribution format)
+**Composes with:** R8a (proven value), R7 (mmap'd L2 distribution format).
 
-**Prerequisite consideration:** R1 (Full de Bruijn IR) reduces schema-bump frequency dramatically by eliminating one source of schema churn (LambdaDescriptor cold-field additions). Not strictly required, but recommended before AOT goes live.
+**Prerequisite consideration:** R1 (Full de Bruijn IR) reduces schema-bump frequency dramatically. Not strictly required for R8b but greatly de-risks the cross-team commitment.
 
-**Cross-references:** `WARM_EVAL_AND_INSTRUMENTATION_2026-05-23.md` §6.4, `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §4.4
+**Cross-references:** `WARM_EVAL_AND_INSTRUMENTATION_2026-05-23.md` §6.4, `EVAL_CACHE_ARCHITECTURE_2026-05-23.md` §4.4, `AOT_DISTRIBUTION_2026-05-26.md` §2 (R8a/R8b comparison)
 
 ### R9 — `.name`-class workload optimization
 
@@ -688,8 +722,9 @@ Several items here also surface in `ROADMAP_TO_VISION_2026-05-15.md`'s "Killed-s
 | R4 | Stage 12 JIT revival | 0 (data on hand) | none | dispatch > 40 % wall via OPCYCLES on M5 + alts < 5 % |
 | R5 | Stage 13 multi-core | 9-15 mo | R1 | process-parallelism < 30 % theoretical |
 | R6 | Whippet GC | TBD | B2 (nursery default-on) | tenured Boehm scan > 10 % eval wall |
-| R7 | mmap'd L2 cache | 3-5 d | none | B1 finds no scope bug AND wall stays neutral |
-| R8 | AOT distribution | 1-2 wk + cross-team | (R1 recommended) | wall ≤ 1.5× TW + schema stability + buy-in |
+| R7 | mmap'd L2 cache — **REVIVED 2026-05-26** | 3-5 d standalone + 1-2 wk R8a integration | (R8a) | AOT distribution format; trigger = R8a Phase 1 spike commits |
+| **R8a** (NEW 2026-05-26) | **v3-team-owned AOT cache** | **4-6 wk v3-only** | **(R7 + Phase 1 spike threshold)** | **Phase 1 spike ≥ 30 % warm-eval on HNE → ship Phase 2; v3-team-controlled; targets IOG priorities** |
+| R8b | cache.nixos.org integration (formerly R8) | 1-2 wk + cross-team | (R8a proven value + R1 recommended) | R8a shipped + schema stability + Nix-team buy-in + wall ≤ 1.5× TW |
 | R9 | `.name`-class opt | TBD audit | none | `.name` eval becomes user-facing primary |
 | R10 | Stage 4 v4 resume | TBD | per-LambdaCore profiling helpful | strictness analysis depth gap closes |
 | R11 | haskell.nix wall < 1.42× | multi-week | A1 lands + memory ≤ 2× | wall becomes binding (not memory) |
