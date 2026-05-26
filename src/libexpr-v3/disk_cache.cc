@@ -41,9 +41,12 @@
 #include <sqlite3.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -51,6 +54,108 @@
 #include <string_view>
 
 namespace nix::v3::disk_cache {
+
+// ---------------------------------------------------------------------------
+// R8a Phase 1 — AOT BUILD MODE manifest recorder (per
+// lode/AOT_DISTRIBUTION_2026-05-26.md §7.1 + lode/
+// DIRECTION_NOTE_2026-05-26.md §6 action #5).
+//
+// When NIX_V3_AOT_BUILD_MODE=<path> is set, every successful
+// disk_cache insert (CompilationUnits and EvalResults tables) appends
+// one line to <path>:
+//
+//   <unix_ts> <table> <key_hex> <blob_size>
+//
+// The manifest enumerates everything the AOT distribution snapshot
+// needs to include: this lets a downstream tool dump matching blobs
+// to an mmap'd flat file (per EVAL_CACHE_ARCHITECTURE §4.3 + §7).
+//
+// Cost when disabled: one TLS magic-static-flag check per insert
+// (negligible).  Cost when enabled: one fprintf per insert, no
+// fsync — best-effort logging.
+//
+// Retirement criterion: this manifest is the Phase 1 Day 1-3
+// deliverable.  Phase 1 success (≥30 % warm-eval improvement on
+// haskell-nix-example with the mmap'd cache) promotes this to a
+// permanent infrastructure; Phase 1 failure (<15 %) retires both
+// this and the manifest format.  See AOT_DISTRIBUTION §7.2 for
+// the kill criterion.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Manifest FILE* (lazily opened on first record).  Lifetime: process
+// lifetime; closed at exit via atexit handler installed alongside open.
+FILE * & aotManifest() noexcept
+{
+    static FILE * f = nullptr;
+    return f;
+}
+
+// Open the manifest if NIX_V3_AOT_BUILD_MODE is set and we haven't
+// opened it yet.  Returns the FILE* or nullptr if disabled / open
+// failed.  Magic-static gate keeps the env-var check off the hot
+// path after the first call.
+FILE * openAotManifestIfEnabled()
+{
+    static FILE * f = []() -> FILE * {
+        const char * path = std::getenv("NIX_V3_AOT_BUILD_MODE");
+        if (!path || !*path) return nullptr;
+        FILE * h = std::fopen(path, "a");
+        if (!h) {
+            // Failed to open — log to stderr once and disable.
+            std::fprintf(stderr,
+                "v3 NIX_V3_AOT_BUILD_MODE: failed to open '%s' (errno=%d); "
+                "AOT build manifest disabled for this process\n",
+                path, errno);
+            return nullptr;
+        }
+        // Header line so consumers can identify the file format
+        // version + know what columns to expect.  '#' prefix keeps
+        // it skippable by a downstream consumer that ignores
+        // comments.
+        std::fprintf(h,
+            "# v3 NIX_V3_AOT_BUILD_MODE manifest format v1\n"
+            "# columns: unix_ts table key_hex blob_size_bytes\n"
+            "# tables: CompilationUnits, EvalResults\n");
+        std::fflush(h);
+        // Install atexit to close the manifest cleanly.  We don't
+        // use the unsynchronised aotManifest() global here because
+        // we control the closure capture directly.
+        std::atexit([]() {
+            FILE * h = aotManifest();
+            if (h) {
+                std::fflush(h);
+                std::fclose(h);
+                aotManifest() = nullptr;
+            }
+        });
+        aotManifest() = h;
+        return h;
+    }();
+    return f;
+}
+
+// Record a single insert.  No-op when AOT build mode is disabled.
+void aotRecord(const char * table, const CacheKey & key, size_t blobSize) noexcept
+{
+    FILE * f = openAotManifestIfEnabled();
+    if (!f) return;
+    // Format: <unix_ts> <table> <key_hex> <size_bytes>\n
+    // We use std::time() not steady_clock — the manifest is
+    // human-debuggable and consumed by external tooling that wants
+    // wall-clock timestamps.
+    std::time_t now = std::time(nullptr);
+    try {
+        std::fprintf(f, "%lld %s %s %zu\n",
+            static_cast<long long>(now), table,
+            key.hex().c_str(), blobSize);
+    } catch (...) {
+        // Best-effort logging; never propagate.
+    }
+}
+
+} // namespace
 
 bool CacheKey::empty() const noexcept
 {
@@ -300,7 +405,11 @@ void insert(const CacheKey & key, std::string_view blob)
     } catch (...) {
         h.failed.store(true, std::memory_order_relaxed);
         st.insertFailures++;
+        return;
     }
+    // R8a Phase 1 manifest recorder — append AFTER successful insert
+    // so cancelled / failing inserts don't pollute the manifest.
+    aotRecord("CompilationUnits", key, blob.size());
 }
 
 Stats & stats() noexcept
@@ -372,7 +481,11 @@ void insertEvalResult(const CacheKey & key, std::string_view blob)
     } catch (...) {
         h.failed.store(true, std::memory_order_relaxed);
         st.evalInsertFailures++;
+        return;
     }
+    // R8a Phase 1 manifest recorder — same as insert() above; record
+    // only on successful EvalResults insert.
+    aotRecord("EvalResults", key, blob.size());
 }
 
 // #741 Phase 5b — batched-insert transaction control.
