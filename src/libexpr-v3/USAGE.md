@@ -163,6 +163,20 @@ Opt-in features (off by default unless noted):
     parse time.  Same correctness gate as OD on cardano-node.
   - `NIX_V3_DISK_CACHE=1`:  SQLite-backed CU cache.  Schema v3 with
     opcode-table fingerprint (caches invalidate on opcode renumbering).
+  - `NIX_V3_AOT_BUILD_MODE=<path>`:  manifest-recorder mode.  Every
+    successful disk_cache insert (CompilationUnits + EvalResults)
+    appends `<unix_ts> <table> <key_hex> <blob_size>` to the manifest
+    file.  Use during a cold eval to capture the working set; feed
+    the manifest into `bench/build-aot-cache.py` to produce a flat
+    file for AOT distribution.  See [`lode/AOT_PHASE1_DAY1-3_2026-05-26.md`].
+  - `NIX_V3_AOT_CACHE_FILE=<path>`:  load a pre-built AOT cache file
+    via `mmap(MAP_PRIVATE|PROT_READ)`.  Acts as L3 fast-path in
+    `disk_cache::lookup` (consulted BEFORE SQLite L2).  Default
+    behaviour unchanged when unset.  Day 13-15 measurement on HNE
+    warm: ~5 % wall improvement (1.03-1.07× faster than SQLite).
+    See [`lode/AOT_PHASE1_VERDICT_2026-05-27.md`] for SHIP verdict.
+  - `NIX_V3_AOT_QUIET=1`:  suppress the AOT init banner; useful for
+    benchmark scripts that should produce clean output.
   - `NIX_V3_BRIDGE1_DEPTH=N`:  cap nested `__v3_call_bridge_1` calls.
     Default 8.  Bounds pthread-stack burn on deep overlay chains.
   - `NIX_V3_BRIDGE_TIMING=1`:  enable per-bridge wall-time accumulation

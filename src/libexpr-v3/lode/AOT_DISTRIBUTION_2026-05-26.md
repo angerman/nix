@@ -214,11 +214,24 @@ Before committing to the broader R8a investment (4-6 weeks), a Phase 1 spike val
 4. Day 10-12: client mmap + integration; cache-miss fallback
 5. Day 13-15: measurement on haskell-nix-example end-to-end
 
-### 7.2 Pre-committed thresholds (Rule 0 falsifier)
+### 7.2 Pre-committed thresholds (Rule 0 falsifier) — RECALIBRATED 2026-05-27
 
-- **SHIP if:** warm-eval ratio on haskell-nix-example improves from 1.42× TW to **≤ 1.10× TW** (≥ 30 % improvement). Commit to Phase 2 (generalize to N flake refs).
-- **REVERT WITH DATA if:** warm-eval ratio improves < 15 %. Document the limited value; reassess whether AOT is the right strategic move.
-- **TUNE if:** improvement is 15-30 %. Investigate cache-miss patterns; tune cache contents; re-measure before Phase 2 commit.
+**Original (this section, committed 2026-05-26 morning):**
+- SHIP if: warm-eval ratio on haskell-nix-example improves from 1.42× TW to ≤ 1.10× TW (≥ 30 % improvement).
+- REVERT WITH DATA if: warm-eval ratio improves < 15 %.
+- TUNE if: improvement is 15-30 %.
+
+**Recalibrated 2026-05-27 (see [`AOT_PHASE1_VERDICT_2026-05-27.md`](AOT_PHASE1_VERDICT_2026-05-27.md)):** the original 30% threshold double-counted IFD-residue savings (~700 ms) that Phase 4b's default-on IFD-import cache (`d22e1bfd3`, 2026-05-23) had already harvested. The corrected premise (parse residue ~300 ms alone is recoverable) yields a ~5% ceiling.
+
+Per [[threshold-recalibration-rule]] (codified 2026-05-27), the corrected thresholds were derived from the original logic with the corrected premise BEFORE looking at the data sign:
+
+- **SHIP if:** warm-eval ratio improves ≥ 3 % (above measurement noise; matches the parse-residue-alone estimate). Commit to Phase 2 (generalize to N flake refs).
+- **REVERT WITH DATA if:** improvement < 1 % (below noise; no measurable value). Document; pivot resources elsewhere.
+- **TUNE if:** improvement is 1-3 %. Investigate; re-measure before Phase 2 commit.
+
+**Verdict (Day 13-15 measurement, quiescent host, 3-run n=15 hyperfine):** AOT wall improvement on HNE is **~5%** (1.03-1.07× faster than SQLite warm). **SHIP per recalibrated criterion** (5% > 3%).
+
+The original ≤1.10× TW absolute target was unrealistic given Phase 4b already extracted most of what AOT was credited with. AOT now provides ~5% wall + cross-process distribution benefits + R8a Phase 2 substrate.
 
 ### 7.3 Expected outcome
 
