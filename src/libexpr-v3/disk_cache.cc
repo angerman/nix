@@ -131,11 +131,6 @@ struct DbState
     // (e.g. `import` re-entry from inside a primop).
     bool inEvalBatch = false;
     uint32_t evalBatchDepth = 0;
-    // #741 Phase 5b' — sub-batched commit support.  Tracks the number
-    // of inserts accumulated into the CURRENT open transaction.  When
-    // it reaches `evalBatchSize()`, the transaction is committed and
-    // a fresh one is begun.  See disk_cache.hh comment block.
-    uint32_t evalBatchInsertsThisTxn = 0;
 };
 
 struct DbHandle
@@ -374,30 +369,6 @@ void insertEvalResult(const CacheKey & key, std::string_view blob)
         int rc = sqlite3_step(raw);
         if (rc != SQLITE_DONE) { st.evalInsertFailures++; return; }
         st.evalInserts++;
-        // #741 Phase 5b' — sub-batched commit.  Inside an open batch,
-        // count inserts; on threshold, COMMIT + BEGIN (state lock is
-        // already held).  We MUST be at the outermost depth — nested
-        // depths mean a callee opened a sub-batch we shouldn't break.
-        if (state->inEvalBatch && state->evalBatchDepth == 1) {
-            ++state->evalBatchInsertsThisTxn;
-            uint32_t target = evalBatchSize();
-            if (target > 0 && state->evalBatchInsertsThisTxn >= target) {
-                try {
-                    state->db.exec("COMMIT");
-                    state->db.exec("BEGIN");
-                    state->evalBatchInsertsThisTxn = 0;
-                    ++st.evalBatchFlushes;
-                } catch (...) {
-                    // On COMMIT/BEGIN failure, exit batch mode for the
-                    // rest of this eval.  Subsequent inserts will run
-                    // as implicit per-call transactions (pre-batch
-                    // behaviour) — slower but correct.
-                    state->inEvalBatch = false;
-                    state->evalBatchDepth = 0;
-                    state->evalBatchInsertsThisTxn = 0;
-                }
-            }
-        }
     } catch (...) {
         h.failed.store(true, std::memory_order_relaxed);
         st.evalInsertFailures++;
@@ -425,7 +396,6 @@ void beginEvalResultBatch() noexcept
         state->db.exec("BEGIN");
         state->inEvalBatch = true;
         state->evalBatchDepth = 1;
-        state->evalBatchInsertsThisTxn = 0;
     } catch (...) {
         // Don't poison h.failed; cache is advisory.  A failed BEGIN
         // just means subsequent inserts each commit individually
@@ -450,7 +420,6 @@ void commitEvalResultBatch() noexcept
         state->db.exec("COMMIT");
         state->inEvalBatch = false;
         state->evalBatchDepth = 0;
-        state->evalBatchInsertsThisTxn = 0;
     } catch (...) {
         // If COMMIT fails, the transaction stays open until
         // connection close (which rolls it back).  Flag the batch
@@ -458,47 +427,7 @@ void commitEvalResultBatch() noexcept
         // transaction.
         state->inEvalBatch = false;
         state->evalBatchDepth = 0;
-        state->evalBatchInsertsThisTxn = 0;
     }
-}
-
-// #741 Phase 5b' — sub-batched commit threshold.
-//
-// Cached once on first read; subsequent calls return the cached
-// value.  Honours `NIX_V3_DRV_HASH_CACHE_DISK_BATCH=N`.  N=0 (or
-// unset) disables sub-batching — each insert commits individually
-// (Phase 5 default).  N>0 enables: commit + re-begin every N
-// inserts within an open transaction.
-//
-// Recommended range based on Phase 5 cold-cache count (~517 inserts
-// on hello.drvPath):
-//   N=50  → ~10 commits/eval, each over ~25 KB WAL
-//   N=100 → ~5 commits/eval, each over ~50 KB WAL
-//   N=200 → ~3 commits/eval, each over ~100 KB WAL
-// Smaller N approaches per-insert commit cost; larger N approaches
-// full-batch checkpoint-storm behaviour.
-uint32_t evalBatchSize() noexcept
-{
-    static const uint32_t cached = []() -> uint32_t {
-        const char * env = std::getenv("NIX_V3_DRV_HASH_CACHE_DISK_BATCH");
-        if (!env || !*env) return 0;
-        char * endp = nullptr;
-        unsigned long v = std::strtoul(env, &endp, 10);
-        if (endp == env) return 0;
-        if (v > 100000u) return 100000u;  // sanity cap
-        return static_cast<uint32_t>(v);
-    }();
-    return cached;
-}
-
-// Public helper to flush the current sub-batch if it has crossed
-// the threshold.  Currently a no-op stub — flushing happens inline
-// in `insertEvalResult` to avoid an extra mutex acquisition.  Kept
-// in the interface for future callers (e.g. an explicit flush at
-// the end of a derivation-batch phase).
-void flushEvalResultBatchEvery() noexcept
-{
-    // Intentional no-op; see commentary above.
 }
 
 } // namespace nix::v3::disk_cache

@@ -74,11 +74,6 @@ struct Stats {
     uint64_t evalMisses         = 0;
     uint64_t evalInserts        = 0;
     uint64_t evalInsertFailures = 0;
-    // #741 Phase 5b' (2026-05-26) — sub-batched commit telemetry.
-    // Incremented when the in-progress transaction crosses the
-    // `NIX_V3_DRV_HASH_CACHE_DISK_BATCH=N` threshold and is committed
-    // + re-opened.  0 when sub-batching is disabled.
-    uint64_t evalBatchFlushes   = 0;
 };
 Stats & stats() noexcept;
 
@@ -139,35 +134,5 @@ void insertEvalResult(const CacheKey & key, std::string_view blob);
 
 void beginEvalResultBatch() noexcept;
 void commitEvalResultBatch() noexcept;
-
-// #741 Phase 5b' (2026-05-26) — sub-batched commit.
-//
-// Hyperfine on hello.drvPath showed FULL-eval-scope batching
-// regressed wall + ballooned variance 24× (commit bff1f670f):
-//
-//   COLD ACTIVE+DISK unbatched : 1429 ms ± 31 ms
-//   COLD ACTIVE+DISK full-batch: 1666 ms ± 764 ms
-//
-// Hypothesis: a long-held transaction with ~256 KB accumulated WAL
-// triggers SQLite's deferred checkpoint at COMMIT, interacting with
-// APFS / page-cache flushes non-deterministically.  The cure is to
-// commit periodically — keeping each transaction small enough that
-// COMMIT stays cheap, while still amortising the per-insert cost
-// across N inserts.
-//
-// `flushEvalResultBatchEvery` commits the current transaction and
-// opens a fresh one when `evalBatchDepth == 1` AND `N` inserts
-// have accumulated since the last open.  Called from
-// `insertEvalResult` after a successful step.  N is read from
-// `NIX_V3_DRV_HASH_CACHE_DISK_BATCH=N` once at process init;
-// 0 disables sub-batching (per-insert commits — current default).
-//
-// Hook site: same as `beginEvalResultBatch` / `commitEvalResultBatch`
-// — `runRootExpr` start/end.  Only the outermost begin opens the
-// transaction; nested begins inherit it.
-void flushEvalResultBatchEvery() noexcept;
-
-// Return the configured sub-batch size (0 = sub-batching disabled).
-uint32_t evalBatchSize() noexcept;
 
 } // namespace nix::v3::disk_cache
