@@ -1840,9 +1840,12 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
         throw std::runtime_error(expectedTypeButFound("a set", args[0]));
     if (!args[1].isList())
         throw std::runtime_error(expectedTypeButFound("a list", args[1]));
-    auto * src = args[0].payload.bindings;
+    const Bindings * src = args[0].payload.bindings;
     auto * names = args[1].payload.list;
     if (!src || !names || names->size == 0) { out = args[0]; return; }
+    // #825 Phase C SPIKE: iterating src->entries[] directly on a
+    // Chain would only see the overlay.  Materialise once at entry.
+    if (src->isChain()) src = src->materialize();
     std::unordered_set<SymbolId> toRemove;
     for (uint32_t i = 0; i < names->size; ++i) {
         // 2026-05-18: force each element to WHNF.  v3's lazy list
@@ -1887,8 +1890,8 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isAttrs() || !args[1].isAttrs())
         typeError("intersectAttrs", "two attrsets");
-    auto * keep = args[0].payload.bindings;
-    auto * src  = args[1].payload.bindings;
+    const Bindings * keep = args[0].payload.bindings;
+    const Bindings * src  = args[1].payload.bindings;
     if (!keep || !src) {
         Bindings * b = Alloc::allocBindings(0);
         V3_STATS_INC(attrsetsAllocated);
@@ -1896,6 +1899,11 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
         out.payload.bindings = b;
         return;
     }
+    // #825 Phase C SPIKE: the sorted-merge below indexes `keep->entries[]`
+    // and `src->entries[]` directly, which for a Chain Bindings sees
+    // only the overlay.  Materialise both inputs once at entry.
+    if (keep->isChain()) keep = keep->materialize();
+    if (src->isChain())  src  = src->materialize();
     // #747 two-pass to avoid arena slack: pass 1 counts the
     // intersection, pass 2 allocates exact and fills.  The single-
     // pass version was the dominant slack site on hello.drvPath —

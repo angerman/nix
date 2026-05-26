@@ -1107,6 +1107,18 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         ++allocStats().mergeBindingsNbHist[bucket_of(b ? b->size : 0)];
     }
 
+    // #825 Phase C SPIKE v2: materialise Chain inputs BEFORE the
+    // sorted-merge below.  Both the Pass-1 dedup count and the
+    // Pass-2 fill walk `a->entries[]` / `b->entries[]` linearly;
+    // for a Chain input that yields only the overlay.  Without
+    // this materialisation, `(base // {x}) // {y}` would lose
+    // `base`'s entries entirely because the second // would see
+    // only the chain's 1-entry overlay (heuristic na≥16 fails on
+    // a chain's overlay-size).  Materialising bounds chain depth
+    // to 1; deeper chains require Phase D's chain-aware merge.
+    if (a->isChain()) a = a->materialize();
+    if (b->isChain()) b = b->materialize();
+
     // Sorted-merge two attrsets (b wins on duplicate keys).  Per-attr
     // positions in attrPosTable are keyed by (Bindings*, SymbolId), so
     // when an entry is copied to the freshly-allocated `out`, we
@@ -1152,25 +1164,23 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     if (na == 0 && nb > 0) return const_cast<Bindings *>(b);
     if (nb == 0 && na > 0) return const_cast<Bindings *>(a);
 
-    // #825 / A1a Phase C SPIKE — reserved for ChainBindings
-    // construction (parent + overlay representation of `a // b`).
-    // Not landed in Phase B because the scavenger interaction needs
-    // resolution: under NIX_V3_NURSERY=1 + NIX_V3_CHAIN_BINDINGS=1,
-    // the brute-audit reports unforwarded nursery thunks reachable
-    // via Chain overlay entries on nixpkgs workloads (hello.name +
-    // 4 siblings).  Lang tests + v3-core PASS under the spike; the
-    // failure mode appears workload-specific (likely related to
-    // App-thunk writeback through Bindings entry slots — see
-    // OP_ATTRS_SELECT line ~7884 CFF_FORCE_WB_PTR_KEEP path that
-    // writes back through a Bindings entry pointer).  Phase D work:
-    //   * Audit walker (`Auditor::visitBindings`) walk Chain.parent
-    //   * Scavenger ensure all chain-reachable nursery payloads are
-    //     forwarded even when chain isn't dirty-listed
-    //   * Either retire the App-writeback-through-Bindings-entry
-    //     mutation, or extend bindingsSetEntry equivalents for it
-    // Phase B (this commit) ships the helpers + consumer-site
-    // readiness so Phase C can land cleanly when the scavenger work
-    // is complete.
+    // #825 / A1a Phase C SPIKE — chain construction reserved for
+    // a future session.  Two attempts in this session (v1 + v2)
+    // both regressed brute-audit on nixpkgs workloads even with
+    // (i) materialize() barrier fix in value.cc, (ii) consumer-site
+    // materialise fallbacks in OP_ATTRS_SELECT / primAttrNames /
+    // primAttrValues / primIntersectAttrs / primRemoveAttrs / formals
+    // destructure, (iii) walkBindings/fwdBindings chain handling,
+    // (iv) audit chain.parent walk.  v2 fixed the v1
+    // materialize-on-overlay-only bug by materialising both inputs
+    // upfront in mergeBindings (so chain construction sees the full
+    // parent size, not the chain's overlay-only `size`); lang+core
+    // PASS but nixpkgs hello.name still failed with
+    // "attribute 'buildPythonApplication' missing" on a 2-entry
+    // Bindings post-materialise — symptom of a still-unidentified
+    // chain interaction inside `lib.makeOverridable` or similar
+    // wrapper.  Phase D work captured in NEXT_STEPS_2026-05-25 §3
+    // A1 + this commit's body.
 
     // Pass 1: count distinct keys.  Mirror of the branch logic
     // below; only reads `name` fields, no allocations, no copies,
@@ -4844,6 +4854,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             ? desc->contextualName
                             : std::string("anonymous lambda");
                         const Bindings * b = forcedArg.payload.bindings;
+                        // #825 Phase C SPIKE: materialise Chain for the
+                        // formals destructure loops below — both the
+                        // extra-arg scan (a) and the missing-arg scan
+                        // (b) iterate `b->entries[]` directly, which
+                        // for Chain Bindings sees only the overlay.
+                        // Materialise once at entry; downstream code
+                        // operates on the Sorted view.
+                        if (b && b->isChain()) b = b->materialize();
                         const auto & tbl = ir::globalSymbolTable();
                         // #809 (2026-05-24): diagnostic gate.  When
                         // NIX_V3_PERMISSIVE_FORMALS=1, treat every
@@ -5405,6 +5423,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             ? tcDesc->contextualName
                             : std::string("anonymous lambda");
                         const Bindings * b = forcedArg.payload.bindings;
+                        // #825 Phase C SPIKE: materialise Chain — see
+                        // the matching note in the OP_CALL formals path
+                        // above (~line 4895).
+                        if (b && b->isChain()) b = b->materialize();
                         const auto & tbl = ir::globalSymbolTable();
                         // #809: same NIX_V3_PERMISSIVE_FORMALS gate as
                         // the call-site path above.  Both OP_CALL and

@@ -1241,46 +1241,16 @@ inline uint32_t Bindings::totalSize() const noexcept
     return distinct;
 }
 
-inline const Bindings * Bindings::materialize() const
-{
-    if (kind == uint8_t(Kind::Sorted)) return this;
-
-    // Walk the chain leaf-first (overlay-first); collect (level, entry)
-    // pairs into a flat vector; sort by (name, level); keep the first
-    // occurrence of each name (which is overlay-winning because lower
-    // level == closer to leaf == overlay).
-    struct LevelEntry { uint16_t level; Entry e; };
-    uint32_t cap = 0;
-    for (const Bindings * b = this; b; b = b->parent) cap += b->size;
-    std::vector<LevelEntry> all;
-    all.reserve(cap);
-    uint16_t lvl = 0;
-    for (const Bindings * b = this; b; b = b->parent, ++lvl) {
-        for (uint32_t i = 0; i < b->size; ++i) {
-            all.push_back({lvl, b->entries[i]});
-        }
-    }
-    // Stable-sort by (name, level): same-name group together with
-    // overlay-first within group.
-    std::sort(all.begin(), all.end(),
-        [](const LevelEntry & x, const LevelEntry & y) {
-            if (x.e.name != y.e.name) return x.e.name < y.e.name;
-            return x.level < y.level;
-        });
-
-    // Dedup: keep first occurrence per name.
-    std::vector<Entry> uniq;
-    uniq.reserve(all.size());
-    for (size_t i = 0; i < all.size();) {
-        uniq.push_back(all[i].e);
-        SymbolId n = all[i].e.name;
-        while (i < all.size() && all[i].e.name == n) ++i;
-    }
-
-    Bindings * out = Alloc::allocBindings(uint32_t(uniq.size()));
-    for (size_t i = 0; i < uniq.size(); ++i) out->entries[i] = uniq[i];
-    return out;
-}
+// `Bindings::materialize()` is defined out-of-line in `value.cc`.  The
+// reason: the body needs `bindingsPostConstructBarrier(out)` from
+// `barrier.hh` to mark the freshly-allocated result as dirty when any
+// of its entries holds a nursery payload (the entries are copies from
+// the chain, so they may hold pointers that the Phase D write
+// barriers won't fire on at materialise time — the writes go through
+// raw `entries[i] = uniq[i]` for speed, then we audit-scan once at
+// the end).  But `barrier.hh` includes `alloc.hh`, so including
+// `barrier.hh` here would be circular.  Moving the definition into
+// `value.cc` (which is allowed to include both) breaks the cycle.
 
 /// Read the per-attr position for entry `name` in Bindings `b`.
 /// Returns 0 ("no position") when not found.  Reads directly from
