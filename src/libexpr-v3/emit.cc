@@ -856,28 +856,45 @@ struct Emitter
             unit.code.push_back(en.name);
             unit.code.push_back(en.pos);
         }
-        // Emit per-entry value-push + REC_SET <sorted_slot>.  We emit
-        // in SORT order so values are pushed and consumed adjacently
-        // (no transient stack ordering issues).
+        // Emit per-entry value-push + REC_SET <slot>.
+        //
+        // R1 trigger fix (2026-05-26, post-Schema-14): DECOUPLE emit
+        // visit order from runtime slot order.
+        //
+        // Old approach: iterate `sortedIdx[k]` (SymbolId-sorted), emit
+        // REC_SET to k.  This made the EMIT VISIT ORDER process-local
+        // (SymbolId values vary cross-process), so `getOrAssignSlot`
+        // assigned different local slots to the same source binding —
+        // observable as OP_GET_LOCAL operand drift across the residual
+        // 4 R1 DIFFs (perl, all-packages, python-packages, lua-5).
+        //
+        // New approach: iterate `e.entries` in canonical (entries-
+        // vector, i.e. string-sorted post my lower.cc:2586 fix) order.
+        // The REC_SET operand is `symRank[i]` — the SymbolId-sort
+        // position of entries[i].  This keeps:
+        //   * Runtime invariant intact (REC_INIT trailer is still
+        //     SymbolId-sorted at line 854-858; Bindings::lookup's
+        //     binary search works as before).
+        //   * Cross-process emit order canonical (both writer and
+        //     reader walk the same canonical entries vector) → slot
+        //     allocations match → OP_GET_LOCAL operands match.
+        //   * Existing `remapSymbolsInBytecode` REC_SET permutation
+        //     logic still applies (it tracks `pending.oldToNew` over
+        //     setsRemaining=n REC_SETs, regardless of their emit
+        //     order).
         //
         // #558 emit-order restructure: entries with `isInheritFrom=true`
         // are SKIPPED here.  Their REC_SETs are emitted by a trailing
         // `AttrSetSetInheritFrom` binding lowered AFTER the from-expr
-        // cache + IF entry value bindings — see ir.hh `AttrSet` doc and
-        // lower.cc lowerAttrs (non-rec / non-dyn branch).  IF entries
-        // contribute their NAME + POS to the REC_INIT trailer so slot
-        // indexing remains contiguous; their slot stays default-init
-        // (vEmptyAttrs / placeholder) until the trailing IF SET binding
-        // populates it.  No code path reads an IF slot between the two
-        // bindings — the AttrSet is the parent block's terminal result,
-        // and intermediate from-expr bindings only do OP_WITH_LOOKUP /
-        // OP_ATTRS_SELECT on outer-scope vars and the cache_var, not on
-        // the AttrSet under construction.
-        for (uint32_t k = 0; k < n; ++k) {
-            const auto & en = e.entries[sortedIdx[k]];
+        // cache + IF entry value bindings.
+        std::vector<uint32_t> symRank(n);
+        for (uint32_t k = 0; k < n; ++k)
+            symRank[sortedIdx[k]] = k;
+        for (uint32_t i = 0; i < n; ++i) {
+            const auto & en = e.entries[i];  // canonical vector order
             if (en.isInheritFrom) continue;
             emitVarRef(en.value);
-            unit.code.push_back(encode(OP_ATTRS_REC_SET, k));
+            unit.code.push_back(encode(OP_ATTRS_REC_SET, symRank[i]));
         }
     }
 

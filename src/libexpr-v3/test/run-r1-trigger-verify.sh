@@ -5,18 +5,13 @@
 # What it tests
 # -------------
 # Runs the V3_DBG_DESERIALIZE_VERIFY infrastructure (primops.cc:8128) over
-# a warm-cache hello.drvPath eval and asserts the EXPECTED PROFILE of
-# CU-cached-vs-fresh-compiled bytecode divergence:
+# a warm-cache hello.drvPath eval and asserts that EVERY CU-cached-vs-
+# fresh-compiled bytecode comparison is byte-identical:
 #
-#   1. `code=DIFF` count > 0  (R1 trigger fires — Light variant did NOT
-#      close all cross-process bytecode determinism leaks).
-#   2. EVERY DIFF event has `opDiffs=0 symStrDiffs=0 symIdDiffs=0`
-#      (opcodes and symbol identity are CORRECTLY preserved; the leak is
-#      POSITIONAL, not structural).
-#   3. EVERY DIFF event has `otherDiffs > 0` (the residual diff is in
-#      raw bytecode trailer bytes — specifically the PosIdx halves of
-#      OP_ATTRS_LET_REC_INIT / OP_ATTRS_REC_INIT name/pos pairs,
-#      serialize.cc:436 reads pos as-is without remap).
+#   1. `code=DIFF` count == 0  (R1 trigger no longer fires — every
+#      cross-process bytecode determinism leak has been closed).
+#   2. EVERY walk-result has `opDiffs=0 symStrDiffs=0 symIdDiffs=0`
+#      (no #815-class symbol identity leak).
 #
 # Diff history
 # ------------
@@ -24,22 +19,29 @@
 #                                    POSITIONAL — PosIdx pool index
 #                                    drift in OP_ATTRS_LET_REC_INIT
 #                                    trailer (`name, pos` pairs).
-# 2026-05-26 (commit `Schema 14`)  : 4/357 DIFFs (1.1 %).  PosIdx
+# 2026-05-26 (Schema 14)           : 4/357 DIFFs (1.1 %).  PosIdx
 #                                    sparse table + remap closed the
-#                                    positional class.  Residual is
+#                                    positional class.  Residual:
 #                                    OP_GET_LOCAL operand drift —
-#                                    local-slot allocator iteration
-#                                    order non-determinism, a
-#                                    SEPARATE class from PosIdx /
-#                                    SymbolId.
+#                                    AttrSet REC_SET emit order was
+#                                    SymbolId-sort (process-local),
+#                                    leaking local-slot assignments.
+# 2026-05-26 (AttrSet canonical emit) : 0/357 DIFFs.  emit.cc:876
+#                                    decoupled visit order (canonical
+#                                    string-sort via entries vector)
+#                                    from REC_SET operand (SymbolId-
+#                                    rank for runtime trailer).
+#                                    R1 trigger FULLY CLOSED.
 #
-# Pass conditions (post-Schema 14 state)
-#   * ≥ 1 DIFF observed (residual local-slot drift still present)
-#   * 0 structural diffs (opDiffs / symStrDiffs / symIdDiffs all zero —
-#     no #815-class symbol identity leak)
+# Pass conditions (current state)
+#   * 0 DIFFs  (every cached CU byte-matches a fresh compile)
+#   * 0 structural diffs  (defensive — any nonzero is a #815-class
+#     regression)
 #
-# Future state (after local-slot-allocator determinism fix or R1)
-#   * 0 DIFFs — flip the assertion in §"Assertions" below.
+# Regression semantics
+#   * Any DIFF re-appearing means a fresh determinism leak has been
+#     introduced (emit-order dependence on process-local IDs, missed
+#     remap, or new opcode trailer not covered by remap walks).
 #
 # Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 # Input Output Group.  SPDX-License-Identifier: Apache-2.0
@@ -105,16 +107,24 @@ if [[ "$N_TOTAL" -lt 1 ]]; then
   exit 1
 fi
 
-# Assertion 1: DIFFs > 0 (R1 trigger fires).
-if [[ "$N_DIFF" -lt 1 ]]; then
-  echo "PROFILE CHANGED: 0 DIFF events observed.  R1 trigger NO LONGER fires." >&2
-  echo "                 If this is a PosIdx-remap or R1 landing, update this" >&2
-  echo "                 test to assert N_DIFF == 0." >&2
+# Assertion 1: zero DIFFs.  R1 trigger fully closed.
+if [[ "$N_DIFF" -gt 0 ]]; then
+  echo "FAIL: $N_DIFF DIFF events observed (expected 0)." >&2
+  echo "       A determinism leak has been re-introduced." >&2
+  echo "       Common causes:" >&2
+  echo "         * Emit-time iteration order depends on process-local" >&2
+  echo "           SymbolId / PosIdx (canonicalise to string / sparse)." >&2
+  echo "         * New opcode trailer not covered by" >&2
+  echo "           remapSymbolsInBytecode / remapPositionsInBytecode." >&2
+  echo "         * Pre-image of slot allocator visits IR in" >&2
+  echo "           process-local order." >&2
+  echo "       Sample DIFF events:" >&2
+  grep 'code=DIFF' "$LOG" | head -3 >&2
   exit 1
 fi
 
-# Assertion 2: no structural diffs.  Every walk-result must show
-# opDiffs=0 symStrDiffs=0 symIdDiffs=0.  Any nonzero is a regression.
+# Assertion 2: no structural diffs (defensive — any nonzero is a
+# #815-class regression).
 STRUCTURAL_DIFFS=$(grep 'walk-result' "$LOG" |
   grep -v 'opDiffs=0 symStrDiffs=0 symIdDiffs=0' | wc -l | tr -d ' ')
 
@@ -127,16 +137,15 @@ if [[ "$STRUCTURAL_DIFFS" -gt 0 ]]; then
   exit 1
 fi
 
-# Pass — current expected profile is intact.
+# Pass — R1 trigger fully closed.
 echo "  [step 3] profile intact:"
 printf "    VERIFY events  : %d\n"  "$N_TOTAL"
-printf "    DIFF (positional) : %d (%d%%)\n" \
-  "$N_DIFF" "$((N_DIFF * 100 / N_TOTAL))"
+printf "    DIFF            : %d  (must be 0)\n" "$N_DIFF"
 printf "    SAME            : %d (%d%%)\n" \
   "$N_SAME" "$((N_SAME * 100 / N_TOTAL))"
 printf "    structural diffs : %d  (must be 0)\n" "$STRUCTURAL_DIFFS"
 echo
-echo "  PASS: R1 trigger profile is positional-only as expected."
-echo "  (DIFFs persist due to PosIdx not being remapped on deserialize,"
-echo "   serialize.cc:436.  Targeted fix or R1 will flip these to SAME.)"
+echo "  PASS: R1 trigger fully closed — all $N_TOTAL cached CUs"
+echo "        byte-match a fresh compile.  Bytecode is now process-"
+echo "        invariant across SymbolId / PosIdx / local-slot allocators."
 exit 0
