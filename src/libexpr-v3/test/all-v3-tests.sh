@@ -164,6 +164,7 @@ if [[ "$mode" == "core" || "$mode" == "full" || "$mode" == "brute" ]]; then
   #SUITES+=( "broader-thunkify|#496-498 broader-thunkify upvalue bug|$TEST_DIR/run-broader-thunkify-tests.sh" )
   SUITES+=( "lint-no-inline-getenv|cached env-var lint|$TEST_DIR/lint-no-inline-getenv.sh" )
   SUITES+=( "lint-cache-coherence|#814/#815 schema-bump operating rules|$TEST_DIR/lint-cache-coherence.sh" )
+  SUITES+=( "lint-serialize-symbolid-coverage|CR2 serialize.cc collect/remap symmetry (AR24)|$TEST_DIR/lint-serialize-symbolid-coverage.sh" )
 fi
 
 # Full (~15 min) — every run-*.sh that exists.  Each script is responsible
