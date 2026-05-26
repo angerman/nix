@@ -31,6 +31,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/disk_cache.hh"
+#include "v3/aot_cache.hh"
 #include "v3/serialize.hh"
 #include "nix/util/hash.hh"
 #include "nix/util/sync.hh"
@@ -344,6 +345,19 @@ std::optional<std::string> lookup(const CacheKey & key)
 {
     auto & st = stats();
     if (key.empty()) return std::nullopt;
+    // R8a Phase 1 Day 10-12: consult the AOT mmap reader first
+    // (L3 in the cache hierarchy).  AOT cache is read-only, mmap'd
+    // once at init; lookups are O(log N) binary search and skip
+    // SQLite query overhead entirely.  Lazy init on first call when
+    // NIX_V3_AOT_CACHE_FILE is set.
+    if (auto sv = aot_cache::lookup(key, aot_cache::TBL_CU)) {
+        // Hit — increment the existing disk_cache stats so users
+        // see this as a cache hit (the AOT cache has its own
+        // sub-stats via aot_cache::stats() for the breakdown).
+        st.lookups++;
+        st.hits++;
+        return std::string(*sv);
+    }
     if (!ensureOpen()) { st.misses++; return std::nullopt; }
     st.lookups++;
     auto & h = dbHandle();
@@ -428,6 +442,15 @@ std::optional<std::string> lookupEvalResult(const CacheKey & key)
 {
     auto & st = stats();
     if (key.empty()) return std::nullopt;
+    // R8a Phase 1 Day 10-12: AOT mmap reader fast-path.  See lookup()
+    // above for the rationale.  The AOT cache may contain both
+    // CompilationUnits + EvalResults entries (different table_id);
+    // here we ask only for EvalResults.
+    if (auto sv = aot_cache::lookup(key, aot_cache::TBL_EVAL_RESULT)) {
+        st.evalLookups++;
+        st.evalHits++;
+        return std::string(*sv);
+    }
     if (!ensureOpen()) { st.evalMisses++; return std::nullopt; }
     st.evalLookups++;
     auto & h = dbHandle();

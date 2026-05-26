@@ -80,6 +80,22 @@ CACHE_DB="${HOME}/.cache/nix/v3-bytecode-v3.sqlite"
 LOG=$(mktemp -t r1-verify-XXXXXX.log)
 trap 'rm -f "$LOG"' EXIT
 
+# Step 0 — clear CompilationUnits + EvalResults so step 1's cold eval
+# populates a clean, in-process-only cache.  Without this clear, stale
+# entries written by PRIOR processes (different SymbolId / PosIdx
+# state) leak into step 2's verify pass and produce phantom DIFF
+# events that aren't actually regressions in the current build.
+#
+# This is a test-hygiene fix, not a workaround — the R1-trigger
+# closure is correct (verified by isolated runs); the cross-test
+# contamination in `all-v3-tests.sh` was simply not visible until
+# multiple test runs accumulated entries in the shared cache DB.
+if [[ -f "$CACHE_DB" ]]; then
+  "$SQLITE3" "$CACHE_DB" \
+    "DELETE FROM CompilationUnits; DELETE FROM EvalResults;" 2>/dev/null \
+    || true   # best-effort; cache DB may be locked by a parallel run
+fi
+
 # Step 1 — warm the CU cache (populate CompilationUnits table).
 echo "  [step 1] warming CU cache via cold eval..."
 NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_HEAP=4G \

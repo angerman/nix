@@ -111,6 +111,10 @@ lib_sources = files(
   'opt_stream_fusion.cc',
   'serialize.cc',
   'disk_cache.cc',
+  # R8a Phase 1 Day 10-12: AOT cache mmap reader.  Activated by
+  # NIX_V3_AOT_CACHE_FILE=<path>; consulted as L3 before SQLite
+  # disk_cache lookups.  See lode/AOT_PHASE1_DAY10-12_2026-05-26.md.
+  'aot_cache.cc',
   # #827 / A3 / T1.1 per-call-site cache-hook instrumentation.
   # See `include/v3/cache_probe.hh` for the design.  Gated by
   # NIX_VM_CACHE_SITES=1; default-off cost is one cached-bool
