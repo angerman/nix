@@ -1164,23 +1164,45 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     if (na == 0 && nb > 0) return const_cast<Bindings *>(b);
     if (nb == 0 && na > 0) return const_cast<Bindings *>(a);
 
-    // #825 / A1a Phase C SPIKE — chain construction reserved for
-    // a future session.  Two attempts in this session (v1 + v2)
-    // both regressed brute-audit on nixpkgs workloads even with
-    // (i) materialize() barrier fix in value.cc, (ii) consumer-site
-    // materialise fallbacks in OP_ATTRS_SELECT / primAttrNames /
-    // primAttrValues / primIntersectAttrs / primRemoveAttrs / formals
-    // destructure, (iii) walkBindings/fwdBindings chain handling,
-    // (iv) audit chain.parent walk.  v2 fixed the v1
-    // materialize-on-overlay-only bug by materialising both inputs
-    // upfront in mergeBindings (so chain construction sees the full
-    // parent size, not the chain's overlay-only `size`); lang+core
-    // PASS but nixpkgs hello.name still failed with
-    // "attribute 'buildPythonApplication' missing" on a 2-entry
-    // Bindings post-materialise — symptom of a still-unidentified
-    // chain interaction inside `lib.makeOverridable` or similar
-    // wrapper.  Phase D work captured in NEXT_STEPS_2026-05-25 §3
-    // A1 + this commit's body.
+    // #826 / A1a Phase C — FALSIFIED across three attempts this
+    // session (per measure-twice-cut-once §3.8 "three failed pivots
+    // = falsification").  Chain construction reserved for a future
+    // multi-session push that includes the full 208-site entries[]
+    // audit.  Falsification ledger:
+    //
+    // - v1 (6f8095cd5): missed Phase D barrier in materialize();
+    //   reverted.
+    // - v2 (2cf14fdce): fixed materialize() barrier + consumer-site
+    //   fallbacks + materialise mergeBindings inputs upfront.  Lang
+    //   + core PASS; nixpkgs hello.name FAILED with
+    //   `attribute 'buildPythonApplication' missing` on a 2-entry
+    //   Bindings.
+    // - v3 (this session, reverted in this commit): added
+    //   `serializeAttrs` + `valuesEqual` chain-materialise to fix
+    //   suspected Phase 5 cache corruption.  Brute audit clean;
+    //   nixpkgs hello.name STILL FAILED with the same
+    //   2-entry-Bindings error EVEN WITH the disk cache disabled
+    //   (`NIX_V3_NO_DISK_CACHE=1`).  Diagnostic with V3_DBG_CHAIN_
+    //   SELECT=1 confirmed: chain materialise IS firing correctly
+    //   (chain size=1-3 → materialised size=41-494), so the 2-
+    //   entry failure Bindings is a *Sorted* of overlay-only-shape,
+    //   not a Chain.  Hypothesis: the chain spike is causing some
+    //   Nix-level `f origArgs` to silently return `{}`, then
+    //   `{} // {override, overrideDerivation}` short-circuits to
+    //   the overlay (size=2).  Tracing requires reduced repro
+    //   isolating the `f origArgs` failure point.
+    //
+    // Phase C revival prerequisites (carry-forward to a multi-
+    // session task):
+    //   1. Build a Nix-level minimal repro that triggers the
+    //      `{} // overlay` collapse under chain spike.
+    //   2. Identify which value-flow within nixpkgs `lib.make-
+    //      Overridable` / `callPackageWith` / `python3.pkgs`
+    //      machinery silently returns `{}` under chain interaction.
+    //   3. Audit the 208 `entries[]` sites across the v3 tree.
+    //   4. Either convert all iteration sites to `forEach` /
+    //      `materialize()` OR keep chain construction gated on a
+    //      whitelist of confirmed-safe call patterns.
 
     // Pass 1: count distinct keys.  Mirror of the branch logic
     // below; only reads `name` fields, no allocations, no copies,

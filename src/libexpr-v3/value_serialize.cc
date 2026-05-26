@@ -213,6 +213,20 @@ static void serializeAttrs(const Value & v, std::string & out)
 {
     writeU8(out, kTagAttrs);
     const Bindings * b = v.payload.bindings;
+    // #826 / A1a Phase C v3 (2026-05-26): materialise Chain before
+    // serialise.  This was the v2 failure root cause: the chain
+    // spike in mergeBindings produced Chain Bindings whose
+    // `entries[]` covers only the overlay, but `serializeAttrs`
+    // writes `b->size` + `b->entries[i]` directly.  A chain was
+    // therefore being persisted to the Phase 5 drvHash disk cache as
+    // a Sorted-of-overlay-only blob; subsequent cache loads
+    // deserialised this corrupted form and returned the wrong
+    // attrset to the consumer (e.g. `{override, overrideDerivation}`
+    // instead of `result // {override, overrideDerivation}`).
+    // Materialising at entry costs one O(N log N) chain walk per
+    // attrset persisted; for the Phase 5 EvalResults cache this
+    // happens at most once per drvHash insert.
+    if (b && b->isChain()) b = b->materialize();
     uint32_t n = b ? b->size : 0;
     writeU32(out, n);
     if (!b) return;
@@ -518,6 +532,13 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
     case Tag::Attrs: {
         const Bindings * ba = a.payload.bindings;
         const Bindings * bb = b.payload.bindings;
+        // #826 / A1a Phase C v3: materialise Chain so positional walk
+        // sees full entry set (see serializeAttrs above for the same
+        // rationale).  Without this, two equal attrsets with one
+        // stored as Chain and the other as Sorted would compare
+        // unequal (different `size` from overlay-only vs full).
+        if (ba && ba->isChain()) ba = ba->materialize();
+        if (bb && bb->isChain()) bb = bb->materialize();
         uint32_t sa = ba ? ba->size : 0;
         uint32_t sb = bb ? bb->size : 0;
         if (sa != sb) return false;
