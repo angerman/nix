@@ -149,11 +149,29 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // Hypothesised cause: long-held transaction with ~256 KB of
     // pending WAL data triggers SQLite's checkpoint behavior at
     // COMMIT in non-deterministic ways (interaction with APFS /
-    // page-cache flushes).  The `disk_cache::beginEvalResultBatch` /
-    // `commitEvalResultBatch` helpers ARE kept in the disk_cache
-    // namespace as gated infrastructure (no callers in production)
-    // for future iteration — try smaller batches (e.g. every 50
-    // inserts) or explicit `PRAGMA wal_autocheckpoint=0` tuning.
+    // page-cache flushes).
+    //
+    // #741 Phase 5b' (2026-05-26): SUB-batched experiment.  Wraps
+    // runRootExpr only when NIX_V3_DRV_HASH_CACHE_DISK_BATCH=N (N>0)
+    // is set; commits + re-opens the transaction every N inserts
+    // inside insertEvalResult.  Idea is to amortise per-insert
+    // commit cost without holding a long transaction that fights
+    // SQLite's autocheckpoint heuristics.  Pre-committed thresholds:
+    // cold ACTIVE+DISK ≤ +10% of OFF baseline; warm ≤ +2%.  If the
+    // experiment fails, the guard's COMMIT will close the
+    // transaction without side effects (eval correctness depends
+    // only on inserts having been STAGED, not on transaction shape).
+    struct EvalResultSubBatchGuard {
+        bool active;
+        EvalResultSubBatchGuard() noexcept
+            : active(disk_cache::evalBatchSize() > 0)
+        {
+            if (active) disk_cache::beginEvalResultBatch();
+        }
+        ~EvalResultSubBatchGuard() {
+            if (active) disk_cache::commitEvalResultBatch();
+        }
+    } evalSubBatchGuard;
 
     // Wire the global tlNixEvalState pointer so v3 primops that need
     // to reach back into TW (e.g. `import`, derivation strict-merge,
