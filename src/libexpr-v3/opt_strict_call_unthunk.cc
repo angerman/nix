@@ -51,10 +51,13 @@
 
 #include "v3/ir.hh"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace nix::v3::ir {
 
@@ -509,7 +512,25 @@ const Lambda * resolveCalleeLambda(
         // happens, the conservative outcome (picking the first match
         // for a shadowed name) is "miss the strictness opportunity,"
         // not a correctness violation.
-        for (const auto & [varId, exprPtr] : defs) {
+        //
+        // R1 trigger follow-up (2026-05-26, after Schema 14 PosIdx
+        // remap landed): `defs` is `std::unordered_map<VarId, const
+        // Expr *>` — iteration order is per-process non-deterministic.
+        // Two compilations of the same source can pick DIFFERENT
+        // matching LetRecs, which then cascades into different
+        // downstream VarId / local-slot assignments and produces the
+        // OP_GET_LOCAL operand drift V3_DBG_DESERIALIZE_VERIFY catches
+        // post-Schema-14.  Sort by VarId first — VarIds are
+        // monotonically assigned during lowering, so sorted iteration
+        // is structurally deterministic.
+        std::vector<std::pair<VarId, const Expr *>> sortedDefs;
+        sortedDefs.reserve(defs.size());
+        for (const auto & kv : defs) sortedDefs.push_back(kv);
+        std::sort(sortedDefs.begin(), sortedDefs.end(),
+            [](const auto & a, const auto & b) {
+                return a.first < b.first;
+            });
+        for (const auto & [varId, exprPtr] : sortedDefs) {
             const auto * candidate = std::get_if<LetRec>(exprPtr);
             if (!candidate) continue;
             for (const auto & ent : candidate->entries) {
