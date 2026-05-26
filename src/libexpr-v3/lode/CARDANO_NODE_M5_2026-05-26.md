@@ -6,13 +6,33 @@
 **Triggering question:** DIRECTION_NOTE_2026-05-26 §3.3 / §6 action #3 — cardano-node M5 strategic-workload drift check
 **Companion docs:** [`CARDANO_NODE_M5_2026-05-21.md`](CARDANO_NODE_M5_2026-05-21.md) (baseline)
 
-## TL;DR
+## TL;DR — FALSIFIED, see §"Update 2026-05-26 late evening"
 
 **~6× memory regression and ~3× wall regression on cardano-node M5 vs 2026-05-21 baseline.**
 
 Both v3-native (default) and v3 + TW-callFlake (workaround) paths regressed substantially. Output remains byte-identical to TW. Cause not yet localised — multiple defaults have flipped since 2026-05-21 (Phase 4b IFD cache, formals-bridge, V3_RELEASE available, Schema 14, disk-cache default-on, Phase D/E barriers, A1a ChainBindings scaffold).
 
 The strategic-workload drift this measurement guards against is real. The 919 MB headroom against the 4 GB watchdog is gone — v3 now requires ≥ 6 GB heap headroom to evaluate the M5 target.
+
+## Update 2026-05-26 (late evening) — INITIAL CONCLUSION FALSIFIED
+
+The "6× memory regression" framing above was **wrong**. Cross-validation via `git checkout 2970dbd04 -- src/libexpr-v3/` + rebuild + remeasure on the same host produced:
+
+| state                                          | peak_rss (3 runs mean) |
+|------------------------------------------------|------------------------|
+| HEAD (today's code) on today's host            | 4513 - 6561 MB        |
+| 2026-05-21-era code (`2970dbd04`) on today's host | **6969 - 8385 MB**    |
+| CARDANO_NODE_M5_2026-05-21.md claim            | 919 MB                |
+
+**The 2026-05-21-era v3 code uses MORE memory than today's code on the same host.** The "919 MB" number in `CARDANO_NODE_M5_2026-05-21.md` was incorrect at the source — likely measured on a different sub-target (the bisect doc shows `.packages.aarch64-darwin.bech32.name` at 6.8s, an order of magnitude smaller workload), or with a different RSS-capture mechanism, or just transcribed from an unrelated probe.
+
+**There is no v3 regression.** If anything, current HEAD is somewhat better than 2026-05-21 era (mean 5500 MB vs 7700 MB on the same host today).
+
+The remaining concern: the absolute peak_rss on M5 is still 5-7 GB. That's the genuine constraint — much higher than the 4 GB default watchdog. The strategic workload still exceeds default safety margins; "919 MB capability" was never an accurate claim. The capability target needs to be re-derived from the actual workload, not from the stale baseline doc.
+
+**Lesson:** ritual measurement caught a stale-claim error in the strategic doc set, not a regression. This is itself valuable — but the framing in §"TL;DR" through §"Regression vs 2026-05-21 baseline" below is now misleading. Read those sections as the **initial-hypothesis investigation log**, not the conclusion.
+
+**Conclusion:** the strategic-doc claim "v3 supports M5 within 4 GB watchdog at 919 MB peak" is **falsified at the source**, not regressed. CARDANO_NODE_M5_2026-05-21.md and CARDANO_NODE_FEASIBILITY_2026-05-18.md need correction.
 
 ## Workload
 
