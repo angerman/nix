@@ -106,7 +106,7 @@ Tier A + early Tier B = ~7 person-days, fits one week with parallel work; net ex
 - **A1a Phase A LANDED** (commit `98ca953bb`): ChainBindings discriminator scaffold — `Bindings::Kind` enum + `parent` pointer (8 B → 16 B header) + chain-aware `lookup()` + unit test `testBindingsChainLookup`.  No consumer constructs Chain yet (Phase A is no-functional-change).
 - **A1a Phase B LANDED 2026-05-26** (commit `6f8095cd5`): iteration helpers (`materialize()`, `forEach(F)`, `isSorted/chainDepth/totalSize`) + consumer-site Chain-readiness in `OP_ATTRS_SELECT`, `primAttrNames`, `primAttrValues` (zero-cost `isChain()` branch when no chain exists).  `testBindingsForEachMaterialise` verifies the helpers.  143/143 lang + 12/12 v3-core + 15/15 brute PASS.
 - **A1a Phase C SPIKE TESTED + REVERTED 2026-05-26**: chain construction in `mergeBindings` (under `NIX_V3_CHAIN_BINDINGS=1`, AttrsUpdateTail site, `na≥16 && nb≤4`) PASSED 143 lang + 12 v3-core under both modes, but FAILED 5/15 brute-audit on nixpkgs workloads (hello.name + 4 siblings).  Synthetic chain-heavy tests PASS the audit — failure is workload-specific (App-thunk writeback through Bindings entry pointer at OP_ATTRS_SELECT line ~7884 `CFF_FORCE_WB_PTR_KEEP`).  Reverted per kill criterion + Rule 0; design captured inline in `vm.cc:mergeBindings` and `gc.cc:walkBindings` as `Phase C-prep` documentation.
-- **A1a Phase C/D pending (task #825):** Phase C revival needs (i) audit-walker chain.parent follow, (ii) `fwdBindings` Chain forced graylist push, (iii) App-writeback path that fires barrier on chain overlay slot mutation.  Then a Phase D measurement run against the ≥200 MB HNE peak_rss falsifier.
+- **A1a Phase C v3 FALSIFIED 2026-05-26 (commit `651d9efbd`)**: third attempt this session.  Added serializeAttrs/valuesEqual chain-materialise (suspecting Phase 5 cache corruption).  Brute audit clean.  Nixpkgs `hello.name` STILL failed with same 2-entry-Bindings error EVEN with `NIX_V3_NO_DISK_CACHE=1`.  Diagnostic (`V3_DBG_CHAIN_SELECT=1`) confirmed chain materialise IS firing correctly (chain size 1-3 → materialised 41-494) — so the failure Bindings is a *Sorted of size 2*, not a Chain.  Inference: chain spike triggers some Nix-level `f origArgs` to silently return `{}`, then `{} // {override, overrideDerivation}` short-circuits to the overlay.  Per measure-twice-cut-once §3.8 "three failed pivots = falsification", #826 closed as multi-session task; reduced-repro work required before next attempt.
 
 **Why now:** the 5.3× RSS gap (569 MB TW → 3 GB v3) is the binding constraint on haskell.nix-class scaling. Cardano-node M5 has 919 MB headroom under 4 GB watchdog, but haskell.nix workloads grow faster than cardano-node-class flakes. Per [[memory-first-class]] rule (`feedback_memory_first_class.md`), even wall-neutral memory wins ≥50 MB should ship.
 
@@ -365,7 +365,20 @@ Even in the ⅔ "scope correct" case, this audit is high value: it confirms the 
 
 ---
 
-### B2 — Nursery default-on spike + flip (~2 days)
+### B2 — Nursery default-on spike + flip (~2 days) ❌ FALSIFIED 2026-05-26 (commit `f2c254fd4`)
+
+**Outcome: peak_rss flat, wall regresses 2.3 %.**  Flipped nursery + scavenge defaults to ON, ran lang + v3-core + brute (all PASS), then hyperfine n=5 on hello.drvPath + firefox.drvPath:
+
+- hello.drvPath: peak_rss 689.1 → 689.0 MB (Δ -0.1 MB); wall 886.3 → 906.9 ms (+2.3 %)
+- firefox.drvPath: peak_rss 1460.5 → 1459.6 MB (Δ -0.9 MB); v3_arena -33.6 MB
+
+**Root cause**: nursery's 32 MB buffer offsets the ~34 MB arena reclaim almost exactly.  Smaller nursery sizes (NIX_V3_NURSERY_SIZE=8) show the same pattern.  Wall regresses because cache-locality benefit < eviction + scavenge overhead.
+
+Per measure-twice-cut-once (ship if ≥50 MB peak_rss OR ≥2 % wall reduction): REVERT — both thresholds missed.  Nursery stays opt-in (`NIX_V3_NURSERY=1`).
+
+HNE-class workloads (3 GB peak) may yet clear the threshold (nursery overhead is rounding error there), but the eval is multi-minute under v3-direct — out of single-session scope.  Decision-data preserved inline in `nursery.hh:initLazy` for the reattempt.
+
+
 
 **Why now:** per [[gc-vs-tw-analysis-2026-05-23]] T3.3 measurement is the gating spike. Pre-committed decision rules already exist. **Composes strongly with A1** — if A1 surfaces diffuse memory, B2 IS the lever; if A1 surfaces concentration, B2 compounds via reduced tenured promotion. Either way, B2 is high value.
 
