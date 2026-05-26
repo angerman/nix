@@ -2,9 +2,14 @@
 
 A detailed, ordered, step-by-step path from v3's current state (≈30-35% of the architectural vision shipped) to the stated end-state: an **STG-inspired, V8-influenced bytecode VM** for Nix with a custom generational GC, cppnix parser reuse, thin FFI, and pure-bytecode evaluation.
 
+> **Current-state lookup:** see [`ROADMAP_PROGRESS_SNAPSHOT_2026-05-26.md`](ROADMAP_PROGRESS_SNAPSHOT_2026-05-26.md) for the latest stage-by-stage status. This doc captures the original strategic plan + revisions; the snapshot doc captures point-in-time progress. Stage headers below are tagged with current status (✓ DONE / ◐ PARTIAL / ✗ KILLED / ◯ BLOCKED / ⊘ CANDIDATE).
+
 Companion docs:
 - `ACTION_PLAN_2026-05-15.md` — immediate 8-week corrective plan (Phases 0-4). Stage 1 below points to it.
 - `ALIGNMENT_SCORECARD_2026-05-15.md` — vision-vs-reality scorecard updated quarterly.
+- `ROADMAP_PROGRESS_SNAPSHOT_2026-05-26.md` — latest progress snapshot (point-in-time; the line above).
+- `NEXT_STEPS_2026-05-25.md` — tactical Tier A/B/C/D + Tier R + architectural risks (AR1-AR30). Operationalises this roadmap.
+- `ARCHITECTURE_CRITIQUE_2026-05-26.md` — cross-cutting architectural review; identified Tier R items + 15 architectural risks not captured in original roadmap.
 
 The roadmap covers Stages 1 through 8 (~44 weeks, target end ≈ 2027-Q1).
 
@@ -173,7 +178,7 @@ Diagram of dependencies (arrows = "must complete before"):
 
 ---
 
-## Stage 1 — Action plan completion (Weeks 1-8, prerequisite)
+## Stage 1 — Action plan completion (Weeks 1-8, prerequisite) — ✓ DONE 2026-05-22
 
 Out of scope here. Refer to `ACTION_PLAN_2026-05-15.md`.
 
@@ -188,7 +193,7 @@ Until these are met, **do not start Stage 2.**
 
 ---
 
-## Stage 2 — Achieve pure-bytecode evaluation (Weeks 9-14)
+## Stage 2 — Achieve pure-bytecode evaluation (Weeks 9-14) — ✓ DONE 2026-05-22 (#760 `3af813638`)
 
 > **2026-05-20 FFI audit context**: per `FFI_AUDIT_2026-05-20.md`, Stage 2 retires the single biggest 🔻 drift item on the scorecard. This is the largest TW dependency by share-of-work — closing it flips scorecard component #11 from 🔻 to ✅.
 
@@ -246,7 +251,7 @@ If after 6 weeks ≥3 workload categories still need TW pre-eval, the cycle-hand
 
 ---
 
-## Stage 3 — Nursery default-on, closure-pool retired (Weeks 15-20)
+## Stage 3 — Nursery default-on, closure-pool retired (Weeks 15-20) — ◐ PARTIAL (closure-pool retired ✓; nursery default-on FALSIFIED on hello/firefox `f2c254fd4`; selective untried)
 
 ### Goal
 
@@ -332,7 +337,7 @@ If Phase D write-barrier work exceeds 4 weeks, or measurements show no allocatio
 
 ---
 
-## Stage 4 — Uniform STG-shape (Weeks 21-28)
+## Stage 4 — Uniform STG-shape (Weeks 21-28) — ◐ PARTIAL (v3 strictness ✓; v4 caller-side + sub-block cloning landed; **let-floating R10 FALSIFIED `c4c3e7edb` 2026-05-26**)
 
 ### Goal
 
@@ -505,7 +510,7 @@ If PICs add <15% perf even at 85% hit rate, dispatch overhead in `vm.cc` is the 
 
 ---
 
-## Stage 7 — Selector thunks (Weeks 41-44)
+## Stage 7 — Selector thunks (Weeks 41-44) — ◯ BLOCKED (gated on killed Stage 5/6)
 
 ### Goal
 
@@ -585,7 +590,7 @@ See `LINKING_DESIGN_2026-05-17.md` for the complete design proposal:
 ### TODOs (5 phases, ~5 weeks; each falsifies a hypothesis per Rule 0)
 
 - [ ] **Phase L0** (1 wk, ~400 LoC): `structuralHash()` on IR nodes alongside `computeFreeVars()`. Falsifies "fragment hashing collides at acceptable rate." Verify via nixpkgs dedup ratio survey.
-- [ ] **Phase L1** (1 wk, ~300 LoC): de Bruijn ABT identity in IR. Falsifies "alpha-equivalence enables cell sharing." This is also a Stage 5 prerequisite.
+- [ ] **Phase L1** (1 wk, ~300 LoC): de Bruijn ABT identity in IR. Falsifies "alpha-equivalence enables cell sharing." This is also a Stage 5 prerequisite. **2026-05-26 status update:** even though parent Stage 9 was KILLED 2026-05-22 (#772), Phase L1 has been promoted independently as **Tier R1** in `NEXT_STEPS_2026-05-25.md` §6.5 because the #815 RCA + ARCHITECTURE_CRITIQUE surfaced cross-process determinism leaks that R1 structurally closes. **R1 trigger VERIFIED FIRED 2026-05-26** (`dcfbae871`); Schema 14 (`a7b41ddce`) closed positional-only DIFF class 353→4 ahead-of-time; remaining R1 effort may be narrower than original 1-week estimate.
 - [ ] **Phase L2** (2 wk, ~600 LoC): Schema bump to v9 — add `Cells` table, ModuleManifest in `Modules`. Falsifies "cells round-trip faithfully under concurrent insertion."
 - [ ] **Phase L3** (1 wk, ~300 LoC): Migrate `primImport` to manifest+cell flow behind `NIX_V3_LINK=1`; default-on after parity confirmed.
 - [ ] **Phase L4** (1 wk): `nix v3-inspect cell <hash>` CLI (UNISON_IDEAS Item 5).
@@ -606,7 +611,7 @@ Stage 9 can run in parallel with Stages 2-4. L1 (ABT refactor) should land befor
 
 ---
 
-## Stage 8 — Thin FFI surface + primops classification (parallel, Weeks 9-44)
+## Stage 8 — Thin FFI surface + primops classification (parallel, Weeks 9-44) — ◐ SUBSTANTIAL (V3-NATIVE arc #795-#808: 0 bridge crossings on standard workloads; haskell.nix 74 crossings remain)
 
 > **2026-05-20 audit landed**: see `FFI_AUDIT_2026-05-20.md` for the full inventory — 104 static `treeWalkerToV3`/`v3ToTreeWalker` call sites, 109 primop wrappers, 6 distinct TW dependency mechanisms. Identifies 4 tiers of migration: **Tier 0** (system-info primops as injected constants — ~1-2 days), **Tier 1** (Stage 2/3/9 architectural — sequenced here), **Tier 2** (bytecode-install more callback primops — ~1-2 weeks), **Tier 3** (opcode-ify pure arithmetic / string primops — ~1 week). Plus the **V3_DBG_TW_CROSS measurement spike** (~1 day) to convert static counts to dynamic per-eval counts — prerequisite for prioritizing Tier 2 vs Tier 3.
 
@@ -1230,10 +1235,11 @@ summary table.
 | **Stage 6** (PICs) | Stage 5 revives (any trigger), OR monomorphic-hot-attr workload emerges | Tied to Stage 5 revival | (tied to Stage 5) | Low |
 | **Stage 9** (cell-level dedup) — Trigger A | Coarser-granularity re-measurement (whole ExprAttrs / ExprLet bindings) shows byte-dedup ≥ 2 × | Materialization-retirement Phase 2 commits to content-addressed eval cache (`IFD_DEEP_DIVE_2026-05-21.md` §11) | 2 days (modify dedup_survey.cc to ExprAttrs level) | Moderate |
 | **Stage 9** — Trigger B | Post-ABT IR-level dedup ≥ 2 × | ABT refactor lands for any non-perf consumer (Unison Item 3, Item 4, or lint Phase 5) | 1 day (replace bytecode hash with IR hash in dedup_survey.cc) | Low |
-| **ABT refactor** (Unison Item 2) | Any of: Unison Item 3 (hash-keyed eval cache) starts; Unison Item 4 (effect propagation) starts; lint Phase 5 (Mode 2 IR-level) starts; Stage 9 Trigger A fires | Tied to the consumer's prioritisation | (not a measurement; an implementation prereq) | High (as means, not end) |
+| **ABT refactor** (Unison Item 2) — *promoted to Tier R1, TRIGGER FIRED 2026-05-26* | Any of: Unison Item 3 (hash-keyed eval cache) starts; Unison Item 4 (effect propagation) starts; lint Phase 5 (Mode 2 IR-level) starts; Stage 9 Trigger A fires; **#815-class cross-process determinism RCA per CR1 (CR1 fired 2026-05-26)** | Tied to consumer prioritisation | (not a measurement; an implementation prereq). **STATUS 2026-05-26**: R1 trigger VERIFIED FIRED via V3_DBG_DESERIALIZE_VERIFY (`dcfbae871`); Schema 14 (`a7b41ddce`) closed PosIdx DIFF class 353→4 ahead-of-time; remaining R1 effort may be narrower than 1-wk estimate. See `CR1_CR2_AUDIT_RESULTS_2026-05-26.md` + `NEXT_STEPS_2026-05-25.md` §6.5 R1 | High (as means, not end) — **FIRING** |
 | **Stage 12** (JIT) — Trigger A | Dispatch share > 40 % of wall via OPCYCLES (not opcount) on cardano-node M5 OR similar production workload | After #741 Phase 2-5 land + Tier 1 ICs + nursery default-on (the alternatives ship first) | 1 day (re-run #786 OPCYCLES on new baseline) | Low |
 | **Stage 12** — Trigger B | All easier alternatives (#741 cache, AOT distribution, Tier 1 ICs, TOS caching, nursery default-on) have shipped AND v3 still > 2× TW on a representative production workload | Each alternative landing is a natural checkpoint | 0 (data is already on hand by then) | Low-moderate |
 | **Stage 12** — Trigger C | Workload class shifts from derivation-heavy to dispatch-bound pure-Nix (lib.evalModules-only, module-system stress) AND that workload becomes user-facing primary | Workload-specific (user-driven; ecosystem shift) | Workload-specific | Speculative |
+| **Stage 4 v4 / let-floating (R10)** — *FALSIFIED 2026-05-26* | N/A (closed) | `c4c3e7edb` 2026-05-26: 0 lift candidates / 12356 fails. The "Force(MkThunk) in same block" 0-elision pattern from #775 has NO floatable population. Joins the Rule-0 kill pile. | 0 | Closed |
 
 ### Decision protocol
 
