@@ -778,6 +778,21 @@ void Scavenger::walkBindings(Bindings * b)
     }
     // Phase E v0.2 post-walk barrier — see walkList.
     if (n.isPhaseEActive()) bindingsPostConstructBarrier(b);
+    // #825 / A1a Phase C-prep: when ChainBindings construction is
+    // landed (currently reverted pending scavenger work), the
+    // `b->parent` reachability edge needs to be followed here:
+    //
+    //   if (b->isChain() && b->parent) {
+    //       Bindings * p = const_cast<Bindings *>(b->parent);
+    //       if (walked.insert(p).second)
+    //           graylist.push_back({p, GK_BINDINGS});
+    //   }
+    //
+    // Plus `fwdBindings` needs an explicit Chain branch that forces
+    // graylist push (the Phase D Step 7 "trust the dirty list" no-op
+    // doesn't cover the parent — parent wasn't mutated when chain
+    // was constructed).  Both edits are no-ops while no chain
+    // construction exists; landed alongside Phase C in a follow-on.
 }
 
 void Scavenger::walkPair(ValuePair * p)

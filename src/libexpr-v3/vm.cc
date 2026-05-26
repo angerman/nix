@@ -1152,6 +1152,26 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     if (na == 0 && nb > 0) return const_cast<Bindings *>(b);
     if (nb == 0 && na > 0) return const_cast<Bindings *>(a);
 
+    // #825 / A1a Phase C SPIKE — reserved for ChainBindings
+    // construction (parent + overlay representation of `a // b`).
+    // Not landed in Phase B because the scavenger interaction needs
+    // resolution: under NIX_V3_NURSERY=1 + NIX_V3_CHAIN_BINDINGS=1,
+    // the brute-audit reports unforwarded nursery thunks reachable
+    // via Chain overlay entries on nixpkgs workloads (hello.name +
+    // 4 siblings).  Lang tests + v3-core PASS under the spike; the
+    // failure mode appears workload-specific (likely related to
+    // App-thunk writeback through Bindings entry slots — see
+    // OP_ATTRS_SELECT line ~7884 CFF_FORCE_WB_PTR_KEEP path that
+    // writes back through a Bindings entry pointer).  Phase D work:
+    //   * Audit walker (`Auditor::visitBindings`) walk Chain.parent
+    //   * Scavenger ensure all chain-reachable nursery payloads are
+    //     forwarded even when chain isn't dirty-listed
+    //   * Either retire the App-writeback-through-Bindings-entry
+    //     mutation, or extend bindingsSetEntry equivalents for it
+    // Phase B (this commit) ships the helpers + consumer-site
+    // readiness so Phase C can land cleanly when the scavenger work
+    // is complete.
+
     // Pass 1: count distinct keys.  Mirror of the branch logic
     // below; only reads `name` fields, no allocations, no copies,
     // no position lookups.
@@ -7629,6 +7649,28 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // App(App(fn,name),val) entries that, without memoization,
             // re-apply the function on every access.
             auto * b = attrs.payload.bindings;
+
+            // #825 / A1a Phase C SPIKE — chain-aware bridge for
+            // OP_ATTRS_SELECT.  The IC fast path and the slow-path
+            // manual binary search below both assume Sorted: they
+            // index `b->entries[]` linearly under the assumption that
+            // every name in the attrset has a corresponding entry.
+            // For a Chain Bindings (constructed by mergeBindings under
+            // NIX_V3_CHAIN_BINDINGS=1), `b->entries[]` holds only the
+            // overlay; parent entries are reachable only via Phase A's
+            // chain-aware `Bindings::lookup`.  Materialising at entry
+            // converts Chain → Sorted for this site, restoring the
+            // existing IC + binary-search semantics at the cost of one
+            // O(N log N) walk per SELECT.  Materialisation is rare on
+            // the workloads the spike targets (most chains are passed
+            // through further `//` merges before terminal SELECT, and
+            // SELECT on a wide attrset is itself uncommon — see
+            // HNE_MEMORY_ATTRIBUTION_2026-05-26.md).  Phase D will
+            // refine OP_ATTRS_SELECT to walk the chain natively
+            // without materialisation.
+            if (__builtin_expect(b && b->isChain(), 0)) {
+                b = const_cast<Bindings *>(b->materialize());
+            }
             // V3_DBG_PREHOOK diagnostic: log every ATTRS_SELECT preHook
             // attempt with what value it returns.  Used to localize WC-37.
             static const bool s_dbg_prehook = std::getenv("V3_DBG_PREHOOK") != nullptr;

@@ -2404,6 +2404,138 @@ static int testBindingsChainLookup()
     return rc;
 }
 
+// #825 / A1a Phase B — verify materialize() + forEach() iteration helpers.
+//
+// Constructs a 2-segment chain (overlay shadows parent) and checks:
+//   1. isSorted() / chainDepth() report the right shape
+//   2. materialize() produces a Sorted Bindings with exactly the
+//      distinct names (overlay wins for shared names)
+//   3. forEach() visits every distinct name in ascending order,
+//      with overlay's value where names collide
+//   4. Sorted bindings are pass-through (materialize returns `this`,
+//      forEach iterates entries[] directly)
+//
+// Phase B's helpers are the prerequisite for Phase C's mergeBindings
+// Chain construction.  If this test goes red, the chain materialise
+// or iteration semantics are wrong.
+static int testBindingsForEachMaterialise()
+{
+    auto makeSorted = [](std::initializer_list<std::pair<SymbolId, int64_t>> kvs) {
+        std::vector<std::pair<SymbolId, int64_t>> sorted(kvs.begin(), kvs.end());
+        std::sort(sorted.begin(), sorted.end(),
+            [](auto & a, auto & b) { return a.first < b.first; });
+        auto * b = Alloc::allocBindings(static_cast<uint32_t>(sorted.size()));
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            b->entries[i].name  = sorted[i].first;
+            b->entries[i].pos   = kNoPos;
+            b->entries[i].value.tag_payload = static_cast<uint64_t>(Tag::Int);
+            b->entries[i].value.payload.i = sorted[i].second;
+        }
+        return b;
+    };
+
+    // Parent: a=1, b=2, c=3.  Overlay: a=10, d=4.  Expected merged:
+    //   a=10 (overlay), b=2 (parent), c=3 (parent), d=4 (overlay).
+    Bindings * parent  = makeSorted({{1, 1}, {2, 2}, {3, 3}});
+    Bindings * overlay = makeSorted({{1, 10}, {4, 4}});
+    overlay->kind   = uint8_t(Bindings::Kind::Chain);
+    overlay->parent = parent;
+
+    // Shape diagnostics.
+    if (overlay->isSorted() || !overlay->isChain()) {
+        std::fprintf(stderr, "testForEachMaterialise: chain isSorted/isChain wrong\n");
+        return 1;
+    }
+    if (overlay->chainDepth() != 2) {
+        std::fprintf(stderr, "testForEachMaterialise: chainDepth expected 2, got %u\n",
+            overlay->chainDepth());
+        return 1;
+    }
+    if (!parent->isSorted() || parent->chainDepth() != 1) {
+        std::fprintf(stderr, "testForEachMaterialise: parent shape wrong\n");
+        return 1;
+    }
+    if (overlay->totalSize() != 4) {
+        std::fprintf(stderr, "testForEachMaterialise: totalSize expected 4, got %u\n",
+            overlay->totalSize());
+        return 1;
+    }
+    if (parent->totalSize() != 3) {
+        std::fprintf(stderr, "testForEachMaterialise: parent totalSize expected 3\n");
+        return 1;
+    }
+
+    // materialize() should produce a Sorted result with all four names + correct shadowing.
+    const Bindings * mat = overlay->materialize();
+    if (mat == overlay) {
+        std::fprintf(stderr, "testForEachMaterialise: materialize() returned same chain\n");
+        return 1;
+    }
+    if (!mat->isSorted() || mat->size != 4) {
+        std::fprintf(stderr, "testForEachMaterialise: materialise produced wrong shape "
+                             "(isSorted=%d size=%u)\n",
+                             mat->isSorted() ? 1 : 0, mat->size);
+        return 1;
+    }
+    // Expected: name 1 -> 10 (overlay), 2 -> 2, 3 -> 3, 4 -> 4.
+    int64_t expected[] = {10, 2, 3, 4};
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (mat->entries[i].name != i + 1
+            || !mat->entries[i].value.isInt()
+            || mat->entries[i].value.payload.i != expected[i]) {
+            std::fprintf(stderr,
+                "testForEachMaterialise: entry[%u] expected (name=%u, val=%lld), "
+                "got (name=%u, val=%lld)\n",
+                i, i + 1, (long long)expected[i],
+                mat->entries[i].name, (long long)mat->entries[i].value.payload.i);
+            return 1;
+        }
+    }
+
+    // materialize() on a Sorted Bindings must return the same pointer (no copy).
+    const Bindings * matSorted = parent->materialize();
+    if (matSorted != parent) {
+        std::fprintf(stderr, "testForEachMaterialise: Sorted materialise should be identity\n");
+        return 1;
+    }
+
+    // forEach on Chain — collects all four entries in ascending name order.
+    std::vector<std::pair<SymbolId, int64_t>> seenChain;
+    overlay->forEach([&](const Bindings::Entry & e) {
+        seenChain.push_back({e.name, e.value.payload.i});
+    });
+    if (seenChain.size() != 4) {
+        std::fprintf(stderr,
+            "testForEachMaterialise: chain forEach expected 4 entries, got %zu\n",
+            seenChain.size());
+        return 1;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        if (seenChain[i].first != SymbolId(i + 1) || seenChain[i].second != expected[i]) {
+            std::fprintf(stderr,
+                "testForEachMaterialise: chain forEach[%zu] mismatch\n", i);
+            return 1;
+        }
+    }
+
+    // forEach on Sorted — identical semantics; no materialise needed.
+    std::vector<std::pair<SymbolId, int64_t>> seenSorted;
+    parent->forEach([&](const Bindings::Entry & e) {
+        seenSorted.push_back({e.name, e.value.payload.i});
+    });
+    if (seenSorted.size() != 3
+        || seenSorted[0] != std::pair<SymbolId, int64_t>(1, 1)
+        || seenSorted[1] != std::pair<SymbolId, int64_t>(2, 2)
+        || seenSorted[2] != std::pair<SymbolId, int64_t>(3, 3)) {
+        std::fprintf(stderr, "testForEachMaterialise: Sorted forEach mismatch\n");
+        return 1;
+    }
+
+    std::fprintf(stderr,
+        "testForEachMaterialise: OK (chain materialise + forEach + Sorted identity)\n");
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -2478,6 +2610,9 @@ int main()
 
     // #823 / A1a Phase A — ChainBindings discriminator unit test.
     rc |= testBindingsChainLookup();
+
+    // #825 / A1a Phase B — forEach + materialize iteration helpers.
+    rc |= testBindingsForEachMaterialise();
 
     auto & st = allocStats();
     std::fprintf(stderr,

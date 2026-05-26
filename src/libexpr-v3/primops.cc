@@ -671,12 +671,19 @@ void primAttrNames(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0];
     if (!a.isAttrs() || !a.payload.bindings) typeError("attrNames", "attrset");
-    uint32_t n = a.payload.bindings->size;
+    // #825 Phase C SPIKE: materialise Chain before iterating entries[].
+    // Phase A's Chain stores only the overlay in `entries[]`; the
+    // remaining names are reachable via the chain's parent.  This
+    // primop walks the whole attrset, so we materialise once and use
+    // the resulting Sorted view.  See alloc.hh:Bindings::materialize.
+    const Bindings * src = a.payload.bindings;
+    if (src->isChain()) src = src->materialize();
+    uint32_t n = src->size;
     ListVec * lv = Alloc::allocList(n);
     V3_STATS_INC(listsAllocated);
     auto & symTab = ir::globalSymbolTable();
     for (uint32_t i = 0; i < n; ++i) {
-        SymbolId sid = a.payload.bindings->entries[i].name;
+        SymbolId sid = src->entries[i].name;
         Value v = mkStringValueOwned(sid < symTab.size() ? symTab[sid] : std::to_string(sid));
         lv->elems[i] = v;
     }
@@ -698,15 +705,18 @@ void primAttrValues(EvalState &, Value * args, Value & out)
     // #693 — match TW phrasing (libexpr/primops.cc forceAttrs).
     if (!a.isAttrs() || !a.payload.bindings)
         throw std::runtime_error(expectedTypeButFound("a set", a));
-    uint32_t n = a.payload.bindings->size;
+    // #825 Phase C SPIKE: materialise Chain (see primAttrNames above).
+    const Bindings * src = a.payload.bindings;
+    if (src->isChain()) src = src->materialize();
+    uint32_t n = src->size;
     // Build (name, value) pairs, sort by name, then drop the name.
     auto & symTab = ir::globalSymbolTable();
     std::vector<std::pair<std::string_view, Value>> pairs;
     pairs.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
-        SymbolId sid = a.payload.bindings->entries[i].name;
+        SymbolId sid = src->entries[i].name;
         std::string_view nm = sid < symTab.size() ? std::string_view(symTab[sid]) : std::string_view("");
-        pairs.emplace_back(nm, a.payload.bindings->entries[i].value);
+        pairs.emplace_back(nm, src->entries[i].value);
     }
     std::sort(pairs.begin(), pairs.end(),
         [](const auto & x, const auto & y) { return x.first < y.first; });

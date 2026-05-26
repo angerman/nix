@@ -234,6 +234,66 @@ struct Bindings
     }
 
     bool has(SymbolId name) const noexcept { return lookup(name) != nullptr; }
+
+    // -----------------------------------------------------------------
+    // #825 / A1a Phase B (2026-05-26) — chain-aware iteration helpers.
+    //
+    // These helpers let callers iterate a Bindings without caring
+    // whether it's Sorted (today's representation) or Chain (Phase C
+    // opt-in via NIX_V3_CHAIN_BINDINGS=1).  The two patterns:
+    //
+    //   * `forEach(func)` — calls `func(entry)` once per distinct name
+    //     in the chain, in ascending name order.  Overlay shadows
+    //     parent.  Today's implementation always materialises for
+    //     Chain (correct but loses the memory benefit).  Phase C may
+    //     refine to streaming merge for chain-depth == 1.
+    //
+    //   * `materialize()` — returns `this` if already Sorted; for
+    //     Chain, walks the chain, dedups names (overlay wins), sorts,
+    //     and returns a freshly allocated Sorted Bindings.  Callers
+    //     that need indexed `entries[]` access (e.g. mutating writes,
+    //     binary-search-by-index, or hot iteration over a known-Sorted
+    //     result) call materialize() and then proceed unchanged.
+    //
+    //   * `isSorted()` / `chainDepth()` — diagnostics.
+    //
+    // Read-only iteration sites should prefer `forEach`.  Sites that
+    // must mutate `entries[]` (write-back paths, OP_ATTRS_UPDATE
+    // construction) should call `materialize()` first.
+    bool isSorted() const noexcept { return kind == uint8_t(Kind::Sorted); }
+
+    uint32_t chainDepth() const noexcept {
+        uint32_t d = 0;
+        for (const Bindings * b = this; b; b = b->parent) ++d;
+        return d;
+    }
+
+    /// Number of unique names visible by walking the chain (overlay
+    /// shadows parent).  For Sorted this is exactly `size`.  For Chain
+    /// it is the total count after dedup.  O(N log N) on Chain because
+    /// we sort + dedup; O(1) on Sorted.
+    uint32_t totalSize() const noexcept;
+
+    /// Materialise this Bindings.  Sorted: returns `this` unchanged.
+    /// Chain: allocates a fresh Sorted Bindings containing every
+    /// distinct (name, value) pair from the chain (overlay wins).
+    /// Out-of-line; defined further down in this header so it can
+    /// call `Alloc::allocBindings`.
+    const Bindings * materialize() const;
+
+    /// Walk the chain calling `func(const Entry &)` once per distinct
+    /// name in ascending order.  Overlay shadows parent.  Today's
+    /// implementation materialises first when `isChain()`; Phase C
+    /// may refine to streaming merge for chain-depth == 1.
+    template <typename F>
+    void forEach(F && func) const {
+        if (kind == uint8_t(Kind::Sorted)) {
+            for (uint32_t i = 0; i < size; ++i) func(entries[i]);
+            return;
+        }
+        const Bindings * m = materialize();
+        for (uint32_t i = 0; i < m->size; ++i) func(m->entries[i]);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1146,12 +1206,93 @@ inline void Alloc::recycleFakeClo(Closure * c) noexcept
 
 namespace nix::v3 {
 
+// ---------------------------------------------------------------------------
+// #825 / A1a Phase B — out-of-line Bindings::materialize / totalSize.
+//
+// These need Alloc::allocBindings (defined above) and <algorithm>+<vector>
+// (already pulled in via the header preamble), so we define them here
+// rather than inline in the Bindings struct.  Both are O(1) on Sorted
+// (the fast path), O(N log N) on Chain.  Hot iteration on Chain via
+// forEach pays one materialize() per call; Phase C may refine to a
+// streaming merge for chain-depth == 1.
+// ---------------------------------------------------------------------------
+
+inline uint32_t Bindings::totalSize() const noexcept
+{
+    if (kind == uint8_t(Kind::Sorted)) return size;
+    // Chain: count distinct names by walking + dedup.  We accept the
+    // O(N) walk because totalSize is rarely called outside diagnostic
+    // dumps; primops that need the count (attrNames, length) call
+    // forEach + count or materialise themselves.
+    std::vector<SymbolId> names;
+    uint32_t cap = 0;
+    for (const Bindings * b = this; b; b = b->parent) cap += b->size;
+    names.reserve(cap);
+    for (const Bindings * b = this; b; b = b->parent) {
+        for (uint32_t i = 0; i < b->size; ++i) names.push_back(b->entries[i].name);
+    }
+    std::sort(names.begin(), names.end());
+    uint32_t distinct = 0;
+    for (size_t i = 0; i < names.size();) {
+        ++distinct;
+        SymbolId n = names[i];
+        while (i < names.size() && names[i] == n) ++i;
+    }
+    return distinct;
+}
+
+inline const Bindings * Bindings::materialize() const
+{
+    if (kind == uint8_t(Kind::Sorted)) return this;
+
+    // Walk the chain leaf-first (overlay-first); collect (level, entry)
+    // pairs into a flat vector; sort by (name, level); keep the first
+    // occurrence of each name (which is overlay-winning because lower
+    // level == closer to leaf == overlay).
+    struct LevelEntry { uint16_t level; Entry e; };
+    uint32_t cap = 0;
+    for (const Bindings * b = this; b; b = b->parent) cap += b->size;
+    std::vector<LevelEntry> all;
+    all.reserve(cap);
+    uint16_t lvl = 0;
+    for (const Bindings * b = this; b; b = b->parent, ++lvl) {
+        for (uint32_t i = 0; i < b->size; ++i) {
+            all.push_back({lvl, b->entries[i]});
+        }
+    }
+    // Stable-sort by (name, level): same-name group together with
+    // overlay-first within group.
+    std::sort(all.begin(), all.end(),
+        [](const LevelEntry & x, const LevelEntry & y) {
+            if (x.e.name != y.e.name) return x.e.name < y.e.name;
+            return x.level < y.level;
+        });
+
+    // Dedup: keep first occurrence per name.
+    std::vector<Entry> uniq;
+    uniq.reserve(all.size());
+    for (size_t i = 0; i < all.size();) {
+        uniq.push_back(all[i].e);
+        SymbolId n = all[i].e.name;
+        while (i < all.size() && all[i].e.name == n) ++i;
+    }
+
+    Bindings * out = Alloc::allocBindings(uint32_t(uniq.size()));
+    for (size_t i = 0; i < uniq.size(); ++i) out->entries[i] = uniq[i];
+    return out;
+}
+
 /// Read the per-attr position for entry `name` in Bindings `b`.
 /// Returns 0 ("no position") when not found.  Reads directly from
 /// `entry.pos` after binary-searching for the entry — the side-
 /// table-style attrPosTable that this function used to consult was
 /// retired in #752 once every recordAttrPos call site was converted
 /// to write `b->entries[i].pos = ps` directly by index.
+///
+/// #825 / A1a Phase B caveat: this binary search assumes Sorted
+/// representation.  For Chain Bindings, callers should materialise
+/// first (or use `Bindings::lookup()` which is chain-aware, then
+/// route through `entries[idx].pos` only on the materialised result).
 inline uint32_t lookupAttrPos(const Bindings * b, SymbolId name)
 {
     if (!b || b->size == 0) return 0;
