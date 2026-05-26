@@ -2583,8 +2583,42 @@ struct Lowerer
         // Note: emit.cc historically also re-sorted at emit time via a
         // local sortedIdx — that's redundant once the IR is sorted, but
         // we keep it as a defensive idempotent sort in emitOne(AttrSet).
+        // R1 trigger fix (2026-05-26, post-Schema 14): split the sort
+        // into TWO concerns to fix the OP_GET_LOCAL operand drift
+        // V3_DBG_DESERIALIZE_VERIFY catches on the 4 large rec-attrset-
+        // heavy files (perl, all-packages, python-packages, lua-5).
+        //
+        // Previously this section sorted entries by SymbolId AND
+        // computed oldToNew (the IF-SET sortedSlot map) from the same
+        // sort.  SymbolId is process-local — two processes lowering
+        // the same source assign different SymbolIds, producing
+        // different `entries` vector orders in the IR.  Downstream
+        // emit walks entries via sortedIdx (also SymbolId-sorted), so
+        // REC_SETs land in the same SymbolId-sorted SLOTS in both
+        // processes, but the IR's entries vector ORDER diverged.  The
+        // cached blob's bytecode was emitted from the writer's IR
+        // ordering; the warm-verify fresh-compile uses the reader's
+        // IR ordering.  Subtle interactions in slot allocation
+        // produced the residual 4 DIFFs.
+        //
+        // The fix splits the concerns:
+        //   1. Compute SymbolId-rank for each entry (what emit + the
+        //      runtime Bindings actually require — Bindings::lookup
+        //      uses SymbolId binary search; runtime invariant must
+        //      stay SymbolId-sorted).  oldToNew[oldIdx] = SymbolId-rank.
+        //   2. Sort the entries vector by symbol STRING (canonical,
+        //      process-invariant) for the IR representation.  Emit's
+        //      sortedIdx maps from canonical string-sorted vector to
+        //      SymbolId-sort positions — same final REC_SET slots in
+        //      both writer and reader processes.
         std::vector<size_t> oldToNew(entries.size());
         {
+            const auto & gst = ir::globalSymbolTable();
+            auto sname = [&](ir::SymbolId id) -> std::string_view {
+                return id < gst.size() ? std::string_view(gst[id])
+                                       : std::string_view{};
+            };
+            // Step 1: SymbolId-rank for oldToNew (runtime-facing).
             std::vector<std::pair<ir::SymbolId, size_t>> idxOrder;
             idxOrder.reserve(entries.size());
             for (size_t i = 0; i < entries.size(); ++i)
@@ -2593,14 +2627,15 @@ struct Lowerer
                              [](const auto & a, const auto & b) {
                                  return a.first < b.first;
                              });
-            std::vector<ir::AttrSet::Entry> sorted;
-            sorted.reserve(entries.size());
             for (size_t newIdx = 0; newIdx < idxOrder.size(); ++newIdx) {
                 size_t oldIdx = idxOrder[newIdx].second;
                 oldToNew[oldIdx] = newIdx;
-                sorted.push_back(entries[oldIdx]);
             }
-            entries = std::move(sorted);
+            // Step 2: sort entries by symbol STRING (canonical IR).
+            std::stable_sort(entries.begin(), entries.end(),
+                             [&sname](const auto & a, const auto & b) {
+                                 return sname(a.name) < sname(b.name);
+                             });
         }
 
         // Phase 2: add the AttrSet binding NOW.  Its emit at runtime

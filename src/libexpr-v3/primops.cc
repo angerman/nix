@@ -92,6 +92,7 @@
 #include "v3/disk_cache.hh"
 #include "v3/cache_probe.hh"  // #827 / A3 per-call-site cache-hook
 #include "v3/ir.hh"
+#include "v3/ir_dump.hh"  // R1 trigger trace: V3_DBG_DUMP_IR_PATH
 #include "v3/bytecode.hh"
 
 #include "nix/fetchers/fetch-to-store.hh"
@@ -8137,10 +8138,40 @@ void primImport(EvalState & state, Value * args, Value & out)
                             e2 = ns.parseExprFromFile(resolvedSp);
                         }
                         e2->bindVars(ns, ns.staticBaseEnv);
+                        // R1 trigger trace: print a marker BEFORE verify-side
+                        // lowerNixExpr so V3_DBG_815_FUNCID traces from the
+                        // fresh recompile are attributable to a specific file.
+                        // The main-path "--- begin import" marker only fires
+                        // on cache MISSES; verify-side compile runs on cache
+                        // HITS and has no such marker by default.
+                        static const bool s_dbg815v =
+                            std::getenv("V3_DBG_815_FUNCID") != nullptr;
+                        if (s_dbg815v) std::fprintf(stderr,
+                            "v3 FUNCID --- begin verify path=%s ---\n",
+                            path.c_str());
                         auto module2 = lowerNixExpr(e2, ns.symbols, ns.positions);
                         nix::v3::ir::optimise(module2);
                         nix::v3::ir::computeFreeVars(module2);
+                        // R1 trigger trace mirror: see main-path dump above.
+                        {
+                            static const char * s_dumpPathV =
+                                std::getenv("V3_DBG_DUMP_IR_PATH");
+                            if (s_dumpPathV && *s_dumpPathV
+                                && path.size() >= std::strlen(s_dumpPathV)
+                                && path.compare(path.size() - std::strlen(s_dumpPathV),
+                                                std::strlen(s_dumpPathV), s_dumpPathV) == 0) {
+                                std::fprintf(stderr,
+                                    "v3 IR-DUMP --- verify path=%s ---\n%s"
+                                    "v3 IR-DUMP --- end verify path=%s ---\n",
+                                    path.c_str(),
+                                    nix::v3::ir::dumpModule(module2).c_str(),
+                                    path.c_str());
+                            }
+                        }
                         auto cu2 = compile(module2);
+                        if (s_dbg815v) std::fprintf(stderr,
+                            "v3 FUNCID --- end   verify path=%s ---\n",
+                            path.c_str());
                         auto & cu1 = cache.cus.back();
                         FILE * vf = std::fopen(s_verifyLog, "a");
                         if (vf) {
@@ -8607,6 +8638,26 @@ skipDiskCacheLookup:
         if (s_dbg_import) std::fprintf(stderr,
             "v3 IMPORT-PHASE after-freeVars RSS=%lluMB: %s\n",
             (unsigned long long)rssMBImp(), path.c_str());
+        // R1 trigger trace: V3_DBG_DUMP_IR_PATH=<path-suffix> dumps the
+        // post-lower+optimise+computeFreeVars IR for any primImport whose
+        // resolved path ends with the configured suffix.  Used to compare
+        // cold-lower vs warm-verify-lower IR for the 4 residual DIFF files
+        // (perl, all-packages, python-packages, lua-5).
+        {
+            static const char * s_dumpPath =
+                std::getenv("V3_DBG_DUMP_IR_PATH");
+            if (s_dumpPath && *s_dumpPath
+                && path.size() >= std::strlen(s_dumpPath)
+                && path.compare(path.size() - std::strlen(s_dumpPath),
+                                std::strlen(s_dumpPath), s_dumpPath) == 0) {
+                std::fprintf(stderr,
+                    "v3 IR-DUMP --- main path=%s ---\n%s"
+                    "v3 IR-DUMP --- end main path=%s ---\n",
+                    path.c_str(),
+                    nix::v3::ir::dumpModule(module).c_str(),
+                    path.c_str());
+            }
+        }
         auto tCompile = impStamp();
         cache.cus.push_back(compile(module));
         impBumpNs(importTimingTotals().compileNs, tCompile);
