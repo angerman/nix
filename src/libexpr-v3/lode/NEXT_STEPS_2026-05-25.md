@@ -309,7 +309,23 @@ Original plan (kept below as a record of the design):
 
 ## 4. Tier B — strategic unblocks (~5 days total, partial parallel with Tier A)
 
-### B1 — Phase 3e / Phase 5 scope audit (2 days, gated on A3)
+### B1 — Phase 3e / Phase 5 scope audit (2 days, gated on A3) ✅ LANDED 2026-05-26 (commit `6ec6016fe`)
+
+**Outcome: scopes ARE correct.**  B1 instrumented the Phase 3e drvHash lookup + active-skip + the Phase 5 disk lookup/insert sites with A3's `CACHE_HOOK_DEFINE_SITE` macro and ran `hello.drvPath` warm + cold.
+
+Probe data:
+
+- **Warm**: drvHash-lookup fires=785 hits=268 (34.1 %) misses=517; drvHash-active-skip fires=268 hits=268; CU-disk-lookup fires=269 hits=269 (100 %).
+- **Cold**: drvHash-lookup 785/268/517; drvHash-disk-lookup 517/0/517 (expected cold); drvHash-disk-insert 517/184 KB; CU-disk-lookup 269/1/268; CU-disk-insert 268/19 MB.
+
+Cross-validations:
+- 268 active-skips correlate 1:1 with 268 in-memory hits → Phase 3e invariant ("skip-on-hit only fires when lookup hits") HOLDS.
+- 0 with-ctx IFD probes on `hello.name` → Phase 4b cache-scope correctness (#803/#810 RCA) re-confirmed: ifd-disk cache silent on non-IFD imports.
+- drvHash 34.1 % in-memory hit rate reflects real workload (recursive overrideable derivations recompute same drvPath multiple times), NOT a scope violation.
+
+No bug to fix.  Methodology blind-spot mitigated: per-site probe data surfaces exact cache behavior where aggregate stats hid it.
+
+
 
 **Why now:** the deferred follow-up from `35564703f` lessons §3. If the same scope-bug pattern that hid Phase 4b's wall lever exists in Phase 3e + Phase 5, the **drvPath-class wall could flip positive without architectural change**. Highest theoretical wall payoff on the standard workload class.
 
