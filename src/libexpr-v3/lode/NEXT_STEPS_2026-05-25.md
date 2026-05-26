@@ -108,6 +108,17 @@ Tier A + early Tier B = ~7 person-days, fits one week with parallel work; net ex
 - **A1a Phase C SPIKE TESTED + REVERTED 2026-05-26**: chain construction in `mergeBindings` (under `NIX_V3_CHAIN_BINDINGS=1`, AttrsUpdateTail site, `na≥16 && nb≤4`) PASSED 143 lang + 12 v3-core under both modes, but FAILED 5/15 brute-audit on nixpkgs workloads (hello.name + 4 siblings).  Synthetic chain-heavy tests PASS the audit — failure is workload-specific (App-thunk writeback through Bindings entry pointer at OP_ATTRS_SELECT line ~7884 `CFF_FORCE_WB_PTR_KEEP`).  Reverted per kill criterion + Rule 0; design captured inline in `vm.cc:mergeBindings` and `gc.cc:walkBindings` as `Phase C-prep` documentation.
 - **A1a Phase C v3 FALSIFIED 2026-05-26 (commit `651d9efbd`)**: third attempt this session.  Added serializeAttrs/valuesEqual chain-materialise (suspecting Phase 5 cache corruption).  Brute audit clean.  Nixpkgs `hello.name` STILL failed with same 2-entry-Bindings error EVEN with `NIX_V3_NO_DISK_CACHE=1`.  Diagnostic (`V3_DBG_CHAIN_SELECT=1`) confirmed chain materialise IS firing correctly (chain size 1-3 → materialised 41-494) — so the failure Bindings is a *Sorted of size 2*, not a Chain.  Inference: chain spike triggers some Nix-level `f origArgs` to silently return `{}`, then `{} // {override, overrideDerivation}` short-circuits to the overlay.  Per measure-twice-cut-once §3.8 "three failed pivots = falsification", #826 closed as multi-session task; reduced-repro work required before next attempt.
 
+**Phase C explicit trigger (codified 2026-05-26 per DIRECTION_NOTE §3.2 / §6 action #2):**
+
+Phase C v4 (the next Phase C attempt that recovers the 200 MB - 1 GB target) is scheduled to fire when:
+
+- **(a)** A reduced reproducer for the 2-entry-Sorted-Bindings failure is captured under `NIX_V3_CHAIN_BINDINGS=1`. The current investigation knows the failure shape (`f origArgs → {}` → overlay short-circuit) but not the chain construction site that triggers it. The reduced repro is the entry condition for the next attempt.
+- **OR (b)** an alternative Phase C path emerges from `MEMORY_REDUCTION_AVENUES_2026-05-26.md` Cat 1 / Cat 2 measurement work that doesn't require the ChainBindings discriminator (e.g., lifetime-driven release of `mergeBindings` short-lived intermediates).
+
+**Until Phase C fires (either path), HNE 5.3× RSS gap is the unchanged memory-first-class headline.** Phase A+B infrastructure remains in place (no functional change, ChainBindings discriminator dormant). No mid-arc Phase C-prep work scheduled — the operating rule is "implementation gated on reduced repro, not on more design iterations."
+
+The trigger above is the answer DIRECTION_NOTE §3.2 asked for: Phase C scheduling is now explicit rather than implicit-deferred.
+
 **Why now:** the 5.3× RSS gap (569 MB TW → 3 GB v3) is the binding constraint on haskell.nix-class scaling. Cardano-node M5 has 919 MB headroom under 4 GB watchdog, but haskell.nix workloads grow faster than cardano-node-class flakes. Per [[memory-first-class]] rule (`feedback_memory_first_class.md`), even wall-neutral memory wins ≥50 MB should ship.
 
 **Concrete steps:**
