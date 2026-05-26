@@ -402,6 +402,29 @@ private:
         // re-entry from inside getenv (extremely unlikely but
         // defensible) doesn't recurse.
         inited = true;
+        // #829 / B2 (2026-05-26) — nursery stays opt-in.
+        //
+        // Attempted default-on flip in this session.  Measurement on
+        // hello.drvPath + firefox.drvPath (n=5 hyperfine):
+        //
+        //   peak_rss (ON vs OFF, mean):  689.0 vs 689.1 MB (hello),
+        //                                1459.6 vs 1460.5 MB (firefox)
+        //   wall     (ON vs OFF, mean):  906.9 ± 37.2 vs 886.3 ± 7.0 ms
+        //                                (ON 2.3 % slower, within σ)
+        //   v3_arena reclaim:            ~34 MB consistently
+        //   tests:                       12/12 v3-core + 15/15 brute
+        //                                PASS under default-on
+        //
+        // The nursery's 32 MB buffer offsets the ~34 MB arena reclaim
+        // exactly, leaving peak_rss flat and wall slightly negative
+        // (cache locality benefit < eviction + scavenge overhead).
+        //
+        // Per measure-twice-cut-once (ship if ≥50 MB peak_rss OR
+        // ≥2 % wall reduction): REVERT — no meaningful benefit on
+        // these workloads.  Kept opt-in (`NIX_V3_NURSERY=1`)
+        // until HNE-class measurement (3 GB peak) justifies the
+        // flip; HNE-class workloads may yet show enough absolute
+        // benefit to clear the threshold.
         const char * gate = std::getenv("NIX_V3_NURSERY");
         if (!gate || gate[0] == '0') {
             enabled = false;
