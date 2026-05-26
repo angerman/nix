@@ -18,28 +18,27 @@
 #      OP_ATTRS_LET_REC_INIT / OP_ATTRS_REC_INIT name/pos pairs,
 #      serialize.cc:436 reads pos as-is without remap).
 #
-# Why this profile matters
-# ------------------------
-# The DIRECTION_NOTE_2026-05-26 § "R1 verification path" said:
-#   "0 residual divergent files → defer R1; >0 → R1 fires"
-# Measurement on 2026-05-26 showed 353/357 CUs DIFF (99%), but the diff
-# is ENTIRELY POSITIONAL (PosIdx pool ordering varies between
-# compile-order-of-CUs).  This is a real determinism leak, but its impact
-# is BOUNDED to diagnostic positions (error-message file:line:col), not
-# to eval correctness (drvPath output remains byte-identical to TW).
+# Diff history
+# ------------
+# 2026-05-26 (commit `dcfbae871`)  : 353/357 DIFFs (99 %).  Class:
+#                                    POSITIONAL — PosIdx pool index
+#                                    drift in OP_ATTRS_LET_REC_INIT
+#                                    trailer (`name, pos` pairs).
+# 2026-05-26 (commit `Schema 14`)  : 4/357 DIFFs (1.1 %).  PosIdx
+#                                    sparse table + remap closed the
+#                                    positional class.  Residual is
+#                                    OP_GET_LOCAL operand drift —
+#                                    local-slot allocator iteration
+#                                    order non-determinism, a
+#                                    SEPARATE class from PosIdx /
+#                                    SymbolId.
 #
-# The minimal fix is a per-CU positional table + remap on deserialize
-# (mirrors the existing SymbolId remap in serialize.cc:remapSymbolsInBytecode).
-# The full fix is R1 (Full de Bruijn IR).  This test asserts the CURRENT
-# STATE so that any change to the diff profile (either reduction by a
-# targeted PosIdx fix, or expansion by a regression introducing
-# structural divergence) trips immediately.
+# Pass conditions (post-Schema 14 state)
+#   * ≥ 1 DIFF observed (residual local-slot drift still present)
+#   * 0 structural diffs (opDiffs / symStrDiffs / symIdDiffs all zero —
+#     no #815-class symbol identity leak)
 #
-# Pass conditions (current state)
-#   * ≥ 1 DIFF observed (positional leak still present)
-#   * 0 structural diffs (opDiffs / symStrDiffs / symIdDiffs all zero)
-#
-# Future state (after PosIdx fix or R1 lands)
+# Future state (after local-slot-allocator determinism fix or R1)
 #   * 0 DIFFs — flip the assertion in §"Assertions" below.
 #
 # Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,

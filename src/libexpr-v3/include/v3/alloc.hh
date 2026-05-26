@@ -1830,12 +1830,57 @@ inline std::vector<PosSnapshot> & posSnapshotPool()
     return pool;
 }
 
+/// Dedup index for `recordPosSnapshot`.  Maps `{file, line, column}`
+/// to the existing pool handle so repeated registrations of the same
+/// source position return the SAME PosIdx — required for cross-
+/// process determinism (Schema 14, R1 trigger fix 2026-05-26):
+/// `serialize::deserializeCU` calls `recordPosSnapshot` for every
+/// posTable entry, and the freshly-compiled bytecode in a later
+/// `lower → optimise → compile` cycle does the same for the SAME
+/// source.  Without dedup the two pathways assign different PosIdx
+/// values; `V3_DBG_DESERIALIZE_VERIFY` would observe drift even
+/// after the per-CU pos remap lands.
+///
+/// Key = `(file, line, column)`.  Custom hash uses XOR-combined
+/// hashes of the three components; file is the largest contributor.
+struct PosSnapshotKey {
+    std::string file;
+    uint32_t    line;
+    uint32_t    column;
+    bool operator==(const PosSnapshotKey & o) const noexcept {
+        return line == o.line && column == o.column && file == o.file;
+    }
+};
+struct PosSnapshotKeyHash {
+    size_t operator()(const PosSnapshotKey & k) const noexcept {
+        size_t h = std::hash<std::string>{}(k.file);
+        h ^= std::hash<uint32_t>{}(k.line) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>{}(k.column) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+inline std::unordered_map<PosSnapshotKey, uint32_t, PosSnapshotKeyHash> &
+posSnapshotIndex()
+{
+    static std::unordered_map<PosSnapshotKey, uint32_t, PosSnapshotKeyHash> idx;
+    return idx;
+}
+
 /// Push a snapshot into the pool and return its 1-based handle (0 = none).
+/// Dedup-aware (#R1 trigger fix, 2026-05-26): repeated calls with the
+/// same `(file, line, column)` return the SAME PosIdx.  Required for
+/// the Schema 14 deserialise→remap→fresh-compile pipeline to converge.
 inline uint32_t recordPosSnapshot(PosSnapshot s)
 {
+    PosSnapshotKey k{s.file, s.line, s.column};
+    auto & idx = posSnapshotIndex();
+    auto it = idx.find(k);
+    if (it != idx.end()) return it->second;
     auto & p = posSnapshotPool();
     p.push_back(std::move(s));
-    return static_cast<uint32_t>(p.size() - 1);
+    uint32_t h = static_cast<uint32_t>(p.size() - 1);
+    idx.emplace(std::move(k), h);
+    return h;
 }
 
 inline const PosSnapshot * resolvePosSnapshot(uint32_t handle)

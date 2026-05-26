@@ -139,7 +139,23 @@ namespace nix::v3::serialize {
 /// new code path produces an unmapped selectorSym → fast-path
 /// "missing attr" on haskell.nix-class overlay workloads.
 /// Schema bump invalidates them.
-constexpr uint32_t kSchemaVersion = 13;
+///
+/// 14: R1 trigger fix (2026-05-26) — adds sparse PosIdx remap to
+/// close the positional-only DIFF class identified by
+/// `V3_DBG_DESERIALIZE_VERIFY` (commit dcfbae871).  Schema 13
+/// stored in-bytecode PosIdx values (second word of each
+/// OP_ATTRS_(LET|REC)_INIT name/pos pair, Formal::pos) as raw
+/// integers indexed into the writer's `posSnapshotPool` — not
+/// portable across processes / compile orders.  Schema 14 adds a
+/// new sparse posTable section between symbolTable and lambdas,
+/// emitting `(origId, file, line, column)` for every PosIdx
+/// referenced in the bytecode (gathered by
+/// `collectReferencedPositions`).  Deserialise builds a remap by
+/// calling `recordPosSnapshot` for each entry and applies it via
+/// `remapPositionsInBytecode` + formals walk, mirroring the
+/// existing SymbolId remap.  Existing schema-13 entries lack the
+/// posTable section; schema bump invalidates them.
+constexpr uint32_t kSchemaVersion = 14;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

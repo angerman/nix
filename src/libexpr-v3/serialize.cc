@@ -207,6 +207,85 @@ collectReferencedSymbols(const CompilationUnit & cu)
     return refs;
 }
 
+/// Schema 14 (R1 trigger fix, 2026-05-26): mirror of
+/// `collectReferencedSymbols` but for PosIdx values.  Walks the
+/// bytecode and lambda metadata and returns the sorted-unique set
+/// of in-bytecode PosIdx values referenced by this CU.
+///
+/// Must stay in lockstep with `remapPositionsInBytecode` — anything
+/// observed here must also be patched there, and vice versa.  The
+/// trailer layouts mirror the SymbolId walker: PosIdx is the SECOND
+/// word of each (name, pos) pair in OP_ATTRS_INIT /
+/// OP_ATTRS_INIT_DYN static section / OP_ATTRS_(LET_)REC_INIT_*.
+/// Formal::pos is a per-lambda PosIdx.
+std::vector<uint32_t>
+collectReferencedPositions(const CompilationUnit & cu)
+{
+    std::vector<uint32_t> refs;
+    refs.reserve(256);
+    auto bump = [&](uint32_t id) { if (id != 0) refs.push_back(id); };
+
+    const auto & code = cu.code;
+    for (size_t ip = 0; ip < code.size(); ) {
+        uint32_t word = code[ip];
+        Op op = decodeOp(word);
+        uint32_t operand = decodeOperand(word);
+        ++ip;
+
+        if (op == OP_ATTRS_HAS
+         || op == OP_WITH_LOOKUP) {
+            // No trailer.
+        } else if (op == OP_ATTRS_SELECT
+                || op == OP_REC_BINDING_SLOT_REF) {
+            ++ip;  // 1 IC follow-up word
+        } else if (op == OP_ATTRS_INIT) {
+            uint32_t n = operand;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (ip + 1 < code.size()) bump(code[ip + 1]);  // pos
+                ip += 2;
+            }
+        } else if (op == OP_ATTRS_INIT_DYN) {
+            uint32_t nStatic = (operand >> 12) & 0xFFFu;
+            uint32_t nDyn    =  operand        & 0xFFFu;
+            for (uint32_t i = 0; i < nStatic; ++i) {
+                if (ip + 1 < code.size()) bump(code[ip + 1]);  // static pos
+                ip += 2;
+            }
+            // emit.cc:924 appends `nDyn` PosIdx words AFTER the static
+            // (name, pos) pairs — one per dyn entry, no name (the dyn
+            // names are pushed to the operand stack at runtime).  These
+            // must be collected, otherwise their per-process indices
+            // leak verbatim across the disk cache.
+            for (uint32_t i = 0; i < nDyn; ++i) {
+                if (ip < code.size()) bump(code[ip]);
+                ++ip;
+            }
+        } else if (op == OP_ATTRS_REC_INIT
+                || op == OP_ATTRS_LET_REC_INIT
+                || op == OP_ATTRS_REC_INIT_TAIL) {
+            uint32_t n = operand;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (ip + 2 * i + 1 < code.size())
+                    bump(code[ip + 2 * i + 1]);
+            }
+            ip += 2 * n;
+        } else if (op == OP_CALL_PRIMOP) {
+            ++ip;
+        } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
+            ip += 2;
+        }
+    }
+
+    // Formals carry PosIdx per parameter.
+    for (const auto & l : cu.lambdas) {
+        for (const auto & f : l.formals) bump(f.pos);
+    }
+
+    std::sort(refs.begin(), refs.end());
+    refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+    return refs;
+}
+
 } // namespace
 
 bool isCacheable(const CompilationUnit & /*cu*/)
@@ -478,6 +557,70 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
     }
 }
 
+/// Schema 14 (R1 trigger fix): rewrite in-bytecode PosIdx values
+/// using the load-time remap table.  Same opcode/trailer layout as
+/// `remapSymbolsInBytecode` but patches the SECOND of each (name,
+/// pos) pair instead of the FIRST.  No sort/propagate dance — PosIdx
+/// is not used as a key by runtime, so order is irrelevant.
+void remapPositionsInBytecode(CompilationUnit & cu,
+                              const std::vector<uint32_t> & posRemap)
+{
+    auto remapPos = [&](uint32_t id) -> uint32_t {
+        if (id == 0) return 0;  // 0 = "no pos"
+        return id < posRemap.size() ? posRemap[id] : id;
+    };
+    auto & code = cu.code;
+    for (size_t ip = 0; ip < code.size(); ) {
+        uint32_t word = code[ip];
+        Op op = decodeOp(word);
+        uint32_t operand = decodeOperand(word);
+        ++ip;
+
+        if (op == OP_ATTRS_HAS || op == OP_WITH_LOOKUP) {
+            // No PosIdx in trailer.
+        } else if (op == OP_ATTRS_SELECT
+                || op == OP_REC_BINDING_SLOT_REF) {
+            ++ip;  // IC follow-up
+        } else if (op == OP_ATTRS_INIT) {
+            uint32_t n = operand;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (ip + 1 < code.size())
+                    code[ip + 1] = remapPos(code[ip + 1]);
+                ip += 2;
+            }
+        } else if (op == OP_ATTRS_INIT_DYN) {
+            uint32_t nStatic = (operand >> 12) & 0xFFFu;
+            uint32_t nDyn    =  operand        & 0xFFFu;
+            for (uint32_t i = 0; i < nStatic; ++i) {
+                if (ip + 1 < code.size())
+                    code[ip + 1] = remapPos(code[ip + 1]);
+                ip += 2;
+            }
+            // emit.cc:924 — `nDyn` trailing PosIdx words (one per
+            // dyn entry, no name).  Same remap as static pos.
+            for (uint32_t i = 0; i < nDyn; ++i) {
+                if (ip < code.size())
+                    code[ip] = remapPos(code[ip]);
+                ++ip;
+            }
+        } else if (op == OP_ATTRS_REC_INIT
+                || op == OP_ATTRS_LET_REC_INIT
+                || op == OP_ATTRS_REC_INIT_TAIL) {
+            uint32_t n = operand;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (ip + 2 * i + 1 < code.size())
+                    code[ip + 2 * i + 1] =
+                        remapPos(code[ip + 2 * i + 1]);
+            }
+            ip += 2 * n;
+        } else if (op == OP_CALL_PRIMOP) {
+            ++ip;
+        } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
+            ip += 2;
+        }
+    }
+}
+
 } // namespace
 
 std::string serializeCU(const CompilationUnit & cu)
@@ -544,6 +687,34 @@ std::string serializeCU(const CompilationUnit & cu)
                 name = gst[id];
             }
             w.str(name);
+        }
+    }
+
+    // Schema 14 — Section: sparse posTable.  Mirrors the SymbolId
+    // sparse table.  Layout:
+    //   count : u32
+    //   maxId : u32
+    //   (origId : u32, present : u8, [file : str, line : u32, col : u32])*
+    // `present == 0` is a sentinel for an unresolved-pos entry
+    // (`resolvePosSnapshot` returned nullptr); deserialise leaves
+    // remap[origId] = 0 in that case.
+    {
+        const auto posRefs = collectReferencedPositions(cu);
+        uint32_t maxId = 0;
+        for (auto id : posRefs) if (id > maxId) maxId = id;
+        w.u32(static_cast<uint32_t>(posRefs.size()));
+        w.u32(maxId);
+        for (auto id : posRefs) {
+            w.u32(id);
+            const PosSnapshot * ps = resolvePosSnapshot(id);
+            if (ps) {
+                w.u8(1);
+                w.str(ps->file);
+                w.u32(ps->line);
+                w.u32(ps->column);
+            } else {
+                w.u8(0);
+            }
         }
     }
 
@@ -727,6 +898,33 @@ CompilationUnit deserializeCU(std::string_view blob)
     }
     if (dbg) { breakdown().symbolTableNs += nowNs() - t0; t0 = nowNs(); }
 
+    // Schema 14 — Section: sparse posTable.  Mirrors symbolTable.
+    // Build a `posRemap[maxId+1]` vector mapping writer-PosIdx →
+    // reader-PosIdx via `recordPosSnapshot`.  Entries with
+    // present=0 (writer's resolvePosSnapshot returned nullptr) map
+    // to 0 (the "no pos" sentinel).
+    std::vector<uint32_t> posRemap;
+    {
+        uint32_t n = r.u32();
+        uint32_t maxId = r.u32();
+        posRemap.assign(maxId + 1, 0u);
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t origId = r.u32();
+            uint8_t hasPS = r.u8();
+            if (origId > maxId)
+                throw SerializationError(
+                    "v3 deserialize: posTable entry origId > maxId");
+            if (hasPS) {
+                PosSnapshot ps;
+                ps.file = std::string(r.strv());
+                ps.line = r.u32();
+                ps.column = r.u32();
+                posRemap[origId] = recordPosSnapshot(std::move(ps));
+            }
+            // hasPS == 0 leaves posRemap[origId] == 0.
+        }
+    }
+
     // Section: lambdas.
     {
         uint32_t n = r.u32();
@@ -834,9 +1032,18 @@ CompilationUnit deserializeCU(std::string_view blob)
     // materialised.  Walk the bytecode + lambdas to rewrite stale
     // SymbolIds.
     remapSymbolsInBytecode(cu, remap);
+    // Schema 14 — apply the PosIdx remap to the in-bytecode trailers
+    // (paired with each name in OP_ATTRS_(LET_)REC_INIT and
+    // OP_ATTRS_INIT-class opcodes) AND to Formal::pos.  Without this
+    // step, cached PosIdx values point into the writer's
+    // posSnapshotPool order — meaningless in the reader process.
+    // Closes the positional-only DIFF class captured by
+    // run-r1-trigger-verify.sh (commit dcfbae871).
+    remapPositionsInBytecode(cu, posRemap);
     for (auto & l : cu.lambdas) {
         for (auto & f : l.formals) {
             if (f.name < remap.size()) f.name = remap[f.name];
+            if (f.pos < posRemap.size()) f.pos = posRemap[f.pos];
         }
         // Schema 12 (#814): formals are sorted by SymbolId for the
         // OP_CALL formals validation pass.  After cross-process
