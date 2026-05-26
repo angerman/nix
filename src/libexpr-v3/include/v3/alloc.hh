@@ -1870,8 +1870,23 @@ posSnapshotIndex()
 /// Dedup-aware (#R1 trigger fix, 2026-05-26): repeated calls with the
 /// same `(file, line, column)` return the SAME PosIdx.  Required for
 /// the Schema 14 deserialise→remap→fresh-compile pipeline to converge.
+///
+/// HNE refresh follow-up (2026-05-26 evening): `NIX_V3_NO_POS_DEDUP=1`
+/// disables the dedup hash lookup — caller always gets a fresh PosIdx.
+/// This BREAKS Schema 14's R1-trigger convergence (cold-vs-warm
+/// V3_DBG_DESERIALIZE_VERIFY would explode) but is safe for normal eval
+/// (PosIdx is only consumed by diagnostic-position lookup).  Used to
+/// isolate the dedup hash overhead's contribution to the HNE warm wall
+/// regression measured at +1700 ms post-Schema-14.
 inline uint32_t recordPosSnapshot(PosSnapshot s)
 {
+    static const bool s_noDedup =
+        std::getenv("NIX_V3_NO_POS_DEDUP") != nullptr;
+    if (s_noDedup) {
+        auto & p = posSnapshotPool();
+        p.push_back(std::move(s));
+        return static_cast<uint32_t>(p.size() - 1);
+    }
     PosSnapshotKey k{s.file, s.line, s.column};
     auto & idx = posSnapshotIndex();
     auto it = idx.find(k);
