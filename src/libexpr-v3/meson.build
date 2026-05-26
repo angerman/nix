@@ -111,6 +111,11 @@ lib_sources = files(
   'opt_stream_fusion.cc',
   'serialize.cc',
   'disk_cache.cc',
+  # #827 / A3 / T1.1 per-call-site cache-hook instrumentation.
+  # See `include/v3/cache_probe.hh` for the design.  Gated by
+  # NIX_VM_CACHE_SITES=1; default-off cost is one cached-bool
+  # branch test per cache-hook event.
+  'cache_probe.cc',
   # #741 Phase 1 spike: round-trip serialiser for derivation-result
   # Values.  See lode/IFD_CACHE_DESIGN_2026-05-23.md.  Gated by
   # NIX_V3_TEST_DRV_RESULT_SERIALIZE=1; default-off cost is one

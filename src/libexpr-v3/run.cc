@@ -17,6 +17,7 @@
 #include "v3/bytecode_primops.hh"
 #include "v3/import_timing.hh"  // #769 per-import phase totals
 #include "v3/disk_cache.hh"     // #770 cache-hit/miss stats dump
+#include "v3/cache_probe.hh"    // #827 / A3 per-call-site cache-hook dump
 #include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/disasm.hh"         // #778 opcount dumper — opName()
 #include "v3/bytecode.hh"
@@ -534,6 +535,14 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     b.remapNs             / 1e6);
             }
         }
+        // #827 / A3: per-call-site cache-hook dump.  Gated by
+        // NIX_VM_CACHE_SITES=1 inside `dumpCacheHookSites`; empty
+        // dump suppressed automatically (no probe activations).
+        // Provides a per-call-site breakdown of every instrumented
+        // cache check so investigations (Phase 4b cache scope, etc.)
+        // can localise which site fires with which hit profile.
+        dumpCacheHookSites(stderr);
+
         // #770 / #777 promotion (2026-05-22 / 2026-05-23): disk
         // cache effectiveness.  Now default-on; prints whenever
         // primImport ran.  hits/misses/inserts/failures lets the

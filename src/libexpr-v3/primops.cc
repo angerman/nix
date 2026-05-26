@@ -90,6 +90,7 @@
 #include "nix/util/serialise.hh"  // StringSource
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
+#include "v3/cache_probe.hh"  // #827 / A3 per-call-site cache-hook
 #include "v3/ir.hh"
 #include "v3/bytecode.hh"
 
@@ -7848,6 +7849,9 @@ void primImport(EvalState & state, Value * args, Value & out)
     // cache; disk-caching their full result Value adds nothing and
     // explodes cache size + cold wall.
     if (s_ifdImportDiskCache && isIfdImport) {
+        CACHE_HOOK_DEFINE_SITE(siteImportIfdLookup,
+            "primImport-ifd-disk-lookup");
+        CacheHookTimer timer(siteImportIfdLookup);
         std::string keyBytes;
         keyBytes.reserve(11 + path.size());
         keyBytes.append("ifd-import");
@@ -7856,6 +7860,7 @@ void primImport(EvalState & state, Value * args, Value & out)
         auto diskKey = disk_cache::computeKeyForString(keyBytes);
         auto blob = disk_cache::lookupEvalResult(diskKey);
         if (blob) {
+            cacheHookHit(siteImportIfdLookup);
             try {
                 out = value_serialize::deserialize(*blob);
                 // Populate in-memory cache so subsequent calls hit there.
@@ -7878,6 +7883,13 @@ void primImport(EvalState & state, Value * args, Value & out)
                         "v3 IMPORT-DISK-DESERR: %s — falling through\n",
                         path.c_str());
             }
+        } else {
+            // #827 A3: blob == nullopt — disk-cache miss for this IFD key.
+            // (The "hit then deserialise-fail" branch above also counts
+            // as a miss semantically, but we keep its existing
+            // fall-through behaviour — the eval re-runs and the new
+            // insert overwrites.)
+            cacheHookMiss(siteImportIfdLookup);
         }
     }
     // #755 instrumentation: RSS-per-import to localize which file
@@ -8070,10 +8082,13 @@ void primImport(EvalState & state, Value * args, Value & out)
             // Fall through to fresh compile path.
             goto skipDiskCacheLookup;
         }
+        CACHE_HOOK_DEFINE_SITE(siteCuLookup, "primImport-cu-disk-lookup");
+        CacheHookTimer cuTimer(siteCuLookup);
         auto tLookup = impStamp();
         auto blob = disk_cache::lookup(diskKey);
         impBumpNs(importTimingTotals().diskLookupNs, tLookup);
         if (blob) {
+            cacheHookHit(siteCuLookup);
             logCacheEvent("HIT", diskKey);
             try {
                 auto tDes = impStamp();
@@ -8520,6 +8535,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             }
         } else {
             logCacheEvent("MISS", diskKey);
+            cacheHookMiss(siteCuLookup);
         }
     }
 skipDiskCacheLookup:
@@ -8583,12 +8599,16 @@ skipDiskCacheLookup:
             (unsigned long long)rssMBImp(), path.c_str());
         if (diskCacheEnabled && !diskKey.empty()
             && serialize::isCacheable(cache.cus.back())) {
+            CACHE_HOOK_DEFINE_SITE(siteCuInsert,
+                "primImport-cu-disk-insert");
+            CacheHookTimer insTimer(siteCuInsert);
             try {
                 auto tInsert = impStamp();
                 std::string blob = serialize::serializeCU(cache.cus.back());
                 disk_cache::insert(diskKey, blob);
                 impBumpNs(importTimingTotals().diskInsertNs, tInsert);
                 logCacheEvent("INSERT", diskKey);
+                cacheHookInsert(siteCuInsert, blob.size());
             } catch (...) { /* best-effort */ }
         }
         // `module` destructed here, freeing all IR-side vectors
@@ -8647,6 +8667,9 @@ skipDiskCacheLookup:
     // subsequent invocations just see a disk-cache miss + recompute.
     // Also gated on isIfdImport (RCA 2026-05-24).
     if (s_ifdImportDiskCache && isIfdImport) {
+        CACHE_HOOK_DEFINE_SITE(siteImportIfdInsert,
+            "primImport-ifd-disk-insert");
+        CacheHookTimer timer(siteImportIfdInsert);
         try {
             std::string keyBytes;
             keyBytes.reserve(11 + path.size());
@@ -8657,6 +8680,7 @@ skipDiskCacheLookup:
             std::string blob;
             value_serialize::serialize(out, blob);
             disk_cache::insertEvalResult(diskKey, blob);
+            cacheHookInsert(siteImportIfdInsert, blob.size());
         } catch (...) {
             // Result Value not serialisable (closure/function/etc.).
             // Skip silently — the in-memory cache still has it for
