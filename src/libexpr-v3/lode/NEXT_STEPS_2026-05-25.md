@@ -725,13 +725,13 @@ Bytecode is now process-invariant across SymbolId / PosIdx / local-slot allocato
 
 ### R10 — Stage 4 v4 / let-floating (#776) resume
 
-**Status:** dormant. Cloning machinery complete; 0 elisions on real workloads.
+**Status:** FALSIFIED 2026-05-26 (commit `c4c3e7edb`, #830). Cloning machinery complete; **0 lift candidates / 12356 fails** on real workloads. Per the falsification rule §"3 failed pivots = falsification": #775 (lower-time MkThunk-inline) + #776 (let-floating) + caller-side strictness pass = three pivots on the lower-time-inline premise. R10 is falsified at the premise level, not just the implementation level.
 
-**Triggers:**
-- Cross-function strictness analysis depth gap closed (the limiting factor)
-- OR: parallel investment yields the necessary depth (e.g., per-LambdaCore aggregate-time profiling from `PROFILING_IMPROVEMENTS_2026-05-24.md` T4.1 surfaces cross-function call patterns)
+**Closes:** task #774 / #776 marked falsified. The `applyStrictnessAtCallSites` pass landed but has 0 elision rate on every workload measured. Resuming requires NEW premise (different than lower-time inline), not different implementation of the same premise.
 
-**Cross-references:** `[[stage4-v4-2-2026-05-21]]`, ROADMAP Stage 4
+**Carry-over (separate item, not R10):** the cross-function strictness analysis depth gap may itself unlock a different lever (e.g., R6 cell-aware strictness, R-future propagation). When that arrives, it would be a NEW task, not R10 resume.
+
+**Cross-references:** `[[stage4-v4-2-2026-05-21]]`, `[[776-let-floating-2026-05-23]]`, ROADMAP Stage 4, [[falsification-rule]]
 
 ### R11 — haskell.nix wall compression beyond 1.42× TW
 
@@ -745,6 +745,20 @@ Bytecode is now process-invariant across SymbolId / PosIdx / local-slot allocato
 **Effort:** multi-week Stage-2-class work
 
 **Cross-references:** Tier C §C3, `V3_TRUE_NATIVE_RCA_2026-05-24.md`
+
+### R12 — Per-process treeWalkerToV3 seen cache (#661) — **FALSIFIED 2026-05-26**
+
+**Status:** FALSIFIED via bridge-telemetry measurement spike.
+
+**Falsifier:** HNE bridge telemetry shows `tw->v3 full count=61 ns=675µs`. Out of 4797 ms total eval wall, TW→v3 conversion is 0.014 % of wall. A perfect seen cache (100 % hit rate) would save AT MOST 0.675 ms; a realistic 50 % hit rate would save 0.34 ms = **0.007 % wall**. Two orders of magnitude below the implementation-cost threshold per [[measure-twice-cut-once]].
+
+hello.drvPath: zero bridges. Cache contributes zero on standard nixpkgs workloads.
+
+**Decline pattern**: pre-Phase-4b ~5000+ bridges/eval; post current defaults (Phase 4b + v3-native callFlake + Phase E1+E2) ~60 bridges. The v3-NATIVE arc made #661 obsolete before it was implemented.
+
+**Closes:** task #661 marked falsified. Per [[falsification-rule]], no implementation work.
+
+**Cross-references:** [`BRIDGE_TELEMETRY_2026-05-26.md`](BRIDGE_TELEMETRY_2026-05-26.md), [[head-5-counter-trap]], [[same-host-bisect]]
 
 ### Tier R summary
 
@@ -1151,13 +1165,15 @@ This is real production-relevant slowness on haskell.nix module-system traversal
 
 **Tracking:** explicitly note in current state snapshot §2.1 that `.hello.drvPath` is the bench, NOT full module-system traversal. The 1.42× wall is for the narrow scenario.
 
-#### AR15 — Bridge surface (51 ForceAttr) still load-bearing post #806a revert
+#### AR15 — Bridge surface (51 ForceAttr) still load-bearing post #806a revert — **DOWNGRADED 2026-05-26**
 
 **Concern:** #806a (retire `primV3ForceListElem`) was implement-then-reverted in <3 hours because of breakage. ForceAttr (51 crossings on haskell-nix-example) + CallBridge1 (8) + Import-ctx (10) are still load-bearing.
 
 Future bridge-elimination work has the same risk pattern: looks dead from one workload's perspective, breaks on another. The #806a discipline (revert when broken, with measurement data) is the right response, but the cost is real.
 
-**Affects:** R11 (haskell.nix wall compression beyond 1.42×) and any future bridge-retirement work
+**Update 2026-05-26 (late evening):** the bridge surface is NUMERICALLY large (51 + 8 crossings) but **TIMING-NEGLIGIBLE**. Per `BRIDGE_TELEMETRY_2026-05-26.md`: HNE bridge time = 0.872 ms out of 4797 ms wall = **0.018 %**. Retiring the bridge primops is a structural-cleanliness goal, not a performance goal. AR15 risk is downgraded: not a load-bearing perf concern; a maintenance concern only.
+
+**Affects:** R11 (haskell.nix wall compression beyond 1.42×) — but the 51 ForceAttr crossings carry sub-ms wall cost, so R11's "Stage-2-class boundary elimination" claim should be re-derived; AND any future bridge-retirement work
 
 **Mitigation:** before retiring any bridge primop, sweep broader workload set:
 - 5+ standard nixpkgs workloads
@@ -1167,7 +1183,7 @@ Future bridge-elimination work has the same risk pattern: looks dead from one wo
 
 Effort: ~1 day cross-workload sweep before each bridge retirement.
 
-**Tracking:** when R11 fires, this sweep is part of the pre-work.
+**Tracking:** when R11 fires, this sweep is part of the pre-work. Today's bridge-telemetry measurement may itself falsify R11's load-bearing claim — re-measure during R11's trigger evaluation.
 
 ### AR summary table
 
