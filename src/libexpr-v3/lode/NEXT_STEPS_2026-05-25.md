@@ -98,7 +98,13 @@ Tier A + early Tier B = ~7 person-days, fits one week with parallel work; net ex
 
 ## 3. Tier A — same-day high-ROI work (~5 days total, parallelisable)
 
-### A1 — haskell-nix-example memory attribution (1-2 days) ⭐ HIGHEST LEVERAGE NOW
+### A1 — haskell-nix-example memory attribution (1-2 days) — PARTIAL LANDED
+
+**Status (2026-05-26):**
+- **A1 measurement spike LANDED** (commits `66b1061cd` + `0f24cda9e` from prior session): HNE peak_rss=3039.5 MB; v3_arena=1593.8 MB (Bindings=704.7 MB); mergeBindings=584 MB / 82.9 % of v3-arena Bindings; site 1 `OP_ATTRS_UPDATE_TAIL` = 98.3 % / 546.7 MB.  See `HNE_MEMORY_ATTRIBUTION_2026-05-26.md`.  **Concentrated case** verified (top-1 site = 82.9 %, falsifier exceeded by 33 pp).
+- **A1b falsified** (commit `920cda88c`): pointer-keyed merge memo cache hit 0.03 % on HNE.  v3's thunk memoization defeats pointer-recurrence caches.  Reverted; rationale captured in lode doc.
+- **A1a Phase A LANDED** (commit `98ca953bb`): ChainBindings discriminator scaffold — `Bindings::Kind` enum + `parent` pointer (8 B → 16 B header) + chain-aware `lookup()` + unit test `testBindingsChainLookup`.  No consumer constructs Chain yet (Phase A is no-functional-change).
+- **A1a Phase B/C/D pending (task #825):** Phase B audits ~208 `entries[]` iteration sites; Phase C enables Chain construction in `mergeBindings` under `NIX_V3_CHAIN_BINDINGS=1`; Phase D promotes to default after the ≥200 MB HNE peak_rss falsifier is met.
 
 **Why now:** the 5.3× RSS gap (569 MB TW → 3 GB v3) is the binding constraint on haskell.nix-class scaling. Cardano-node M5 has 919 MB headroom under 4 GB watchdog, but haskell.nix workloads grow faster than cardano-node-class flakes. Per [[memory-first-class]] rule (`feedback_memory_first_class.md`), even wall-neutral memory wins ≥50 MB should ship.
 
@@ -134,7 +140,9 @@ Tier A + early Tier B = ~7 person-days, fits one week with parallel work; net ex
 
 ---
 
-### A2 — V3_RELEASE compile flag (1 day) — quick mechanical win
+### A2 — V3_RELEASE compile flag (1 day) — quick mechanical win ✅ LANDED 2026-05-26 (commit `46ce47c8a`)
+
+**Outcome:** synthetic alloc-heavy bench shows **-8.4 % wall** (DEFAULT 160.5 ± 5.3 ms → RELEASE 147.1 ± 2.3 ms, n=10).  Falsifier ≥ 2 % wall criterion exceeded by ~4×.  Build mode: `-Dlibexpr-v3:v3_release=true` plumbs `-DV3_RELEASE=1` through `add_project_arguments`.  Three macros (`V3_STATS_BUMP`, `V3_STATS_INC`, `V3_STATS_BLOCK`) in `alloc.hh` provide the uniform escape hatch; converted ~85 unconditional bump sites across `alloc.hh`/`vm.cc`/`primops.cc`/`v3_call_flake.cc`/`value_serialize.cc`.  Env-gated diagnostic counters (NIX_VM_OPCOUNTS, NIX_VM_OPCYCLES, V3_DBG_*) remain compileable per §8.5 AR1 mitigation.  143/143 lang + 12/12 v3-core + 15/15 brute pass under both modes.
 
 **Why now:** sitting unfunded since 2026-05-23. ~3-4 % wall + 25-40 MB memory recovery at zero algorithmic risk. Pure `#ifdef`-out work. Falsifier already pre-committed in [[warm-eval-instrumentation-2026-05-23]] §6.1.
 
@@ -652,7 +660,10 @@ Several items here also surface in `ROADMAP_TO_VISION_2026-05-15.md`'s "Killed-s
 
 ## 7. Recommended week ordering
 
-**Day 1** (parallel start):
+**Day 1 — LANDED 2026-05-26:**
+- ✅ A1 + A1a Phase A + A2 all shipped in a single mega-session (commits `66b1061cd` → `46ce47c8a`).  See §1 / §3 for outcomes.
+
+**Day 1** (parallel start) — historical/reference:
 - A1 morning: kick off haskell-nix-example memory measurement runs (long; let them run in background)
 - A2 afternoon: V3_RELEASE compile flag implementation + first benchmark
 
