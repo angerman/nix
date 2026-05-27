@@ -616,6 +616,26 @@ public:
     /// block.
     static constexpr size_t kHugeCutoff = kBlockSize / 4;
 
+    /// Stage 6 Day 1 refactor (per STAGE_6_IMPLEMENTATION_GUIDE_2026-
+    /// 05-27.md §"Day 1"): group block storage into a `Region` so a
+    /// future commit can introduce a backup region + `swapRegions()`
+    /// for major-scavenge semispace mechanics.  Today: a single
+    /// active region used exactly as the pre-refactor flat members.
+    /// No behavior change — purely structural.
+    struct HugeBlock { char * begin; char * end; };
+
+    struct Region {
+        char *  cur        = nullptr;
+        char *  end        = nullptr;
+        /// Owning blocks; never freed in current single-region mode.
+        /// Future Stage 6 Day 2-3 will free the backup region's
+        /// blocks after a major scavenge.
+        std::vector<char *> blocks;
+        /// Oversized allocations (> kHugeCutoff), tracked separately.
+        std::vector<HugeBlock> hugeBlocks;
+        size_t  totalBytes = 0;
+    };
+
     void * alloc(size_t bytes) noexcept
     {
         // 16-byte align the request.
@@ -649,21 +669,21 @@ public:
             // with >170K entries at nixpkgs scale) is invisible to
             // BRUTE — false-clean diagnostic.
             if (blk) {
-                hugeBlocks.push_back({static_cast<char *>(blk),
+                active_.hugeBlocks.push_back({static_cast<char *>(blk),
                                        static_cast<char *>(blk) + bytes});
-                totalBytes += bytes;
+                active_.totalBytes += bytes;
             }
             return blk;
         }
-        if (cur + bytes > end) refill();
-        void * p = cur;
-        cur += bytes;
+        if (active_.cur + bytes > active_.end) refill();
+        void * p = active_.cur;
+        active_.cur += bytes;
         return p;
     }
 
     /// Total bytes pinned by all blocks the arena has ever
     /// allocated.  Cheap to read; useful for the alloc-stats dump.
-    size_t bytesAllocated() const noexcept { return totalBytes; }
+    size_t bytesAllocated() const noexcept { return active_.totalBytes; }
 
     /// #705 diagnostic accessor: iterate the arena's blocks for
     /// brute-force scanning.  Returns (block_start, block_end_used).
@@ -677,38 +697,42 @@ public:
     std::vector<BlockRange> blockRanges() const
     {
         std::vector<BlockRange> r;
-        r.reserve(blocks.size() + hugeBlocks.size());
-        for (size_t i = 0; i < blocks.size(); ++i) {
-            const char * b = blocks[i];
-            const char * e = (b == (cur ? blocks.back() : nullptr) && i + 1 == blocks.size())
-                ? cur : b + kBlockSize;
+        r.reserve(active_.blocks.size() + active_.hugeBlocks.size());
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            const char * b = active_.blocks[i];
+            const char * e = (b == (active_.cur ? active_.blocks.back() : nullptr) && i + 1 == active_.blocks.size())
+                ? active_.cur : b + kBlockSize;
             // Defensive: if cur is null (no allocations yet), use full block.
-            if (!cur && i + 1 == blocks.size()) e = b + kBlockSize;
+            if (!active_.cur && i + 1 == active_.blocks.size()) e = b + kBlockSize;
             r.push_back({b, e});
         }
         // Huge allocations: each is fully used (allocator does the
         // entire calloc'd region as one object), so begin..end is
         // the whole block.
-        for (const auto & h : hugeBlocks) {
+        for (const auto & h : active_.hugeBlocks) {
             r.push_back({h.begin, h.end});
         }
         return r;
     }
 
+    /// Stage 6 Day 1: stub for the future major-scavenge swap.
+    /// Currently a no-op (single-region mode).  Future Day 3 will
+    /// swap active_ with backup_ after MoveGCVisitor finishes
+    /// copying live cells.
+    void swapRegions() noexcept
+    {
+        // No-op until Day 2-3 introduces backup_ + the
+        // mark+copy machinery.  Documented entry point so the
+        // future commits can wire to a known API.
+    }
+
 private:
-    char *  cur        = nullptr;
-    char *  end        = nullptr;
-    /// Owning blocks; never freed in normal operation (they live
-    /// for the lifetime of the thread).
-    std::vector<char *> blocks;
-    /// N11/R10 (audit Round 2): track oversized allocations
-    /// (kHugeCutoff < bytes) so V3_DBG_NURSERY_BRUTE can scan them
-    /// for stale nursery pointers.  Without this list, allocations
-    /// > 4 MB (kHugeCutoff = kBlockSize / 4) bypass `blocks[]` and
-    /// `blockRanges()` returns an incomplete view.
-    struct HugeBlock { char * begin; char * end; };
-    std::vector<HugeBlock> hugeBlocks;
-    size_t  totalBytes = 0;
+    /// Stage 6 Day 1: single active region (no backup yet).
+    /// The active region is the only one used by alloc()/refill()
+    /// /blockRanges() — behavior identical to the pre-refactor
+    /// flat-member layout.  Day 2+ will introduce backup_ and the
+    /// mark+copy paths.
+    Region active_;
 
     void refill() noexcept
     {
@@ -720,10 +744,10 @@ private:
         // calloc gives us a zero page directly from the kernel —
         // cheaper than malloc + memset for fresh allocations.
         char * blk = static_cast<char *>(std::calloc(1, kBlockSize));
-        blocks.push_back(blk);
-        cur = blk;
-        end = blk + kBlockSize;
-        totalBytes += kBlockSize;
+        active_.blocks.push_back(blk);
+        active_.cur = blk;
+        active_.end = blk + kBlockSize;
+        active_.totalBytes += kBlockSize;
 #if NIX_USE_BOEHMGC
         // WC-13: tell Boehm to scan this block for pointers to GC
         // memory.  Bridge thunks store raw `nix::Value *`; without
