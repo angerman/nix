@@ -67,31 +67,48 @@ because of this specific known bug but because:
 
 ### Day 1 — Real-workload stress validation (~6 h)
 
-Run, with output capture, on the 3 anchor workloads:
+**Automated path** (recommended): use the harness script that
+mechanises all 3 workloads and produces a PASS / FAIL verdict
+against the SHIP gate:
 
 ```bash
-# hello.drvPath
+bench/phase-e-stress-validate.sh                # all 3 workloads under stress
+bench/phase-e-stress-validate.sh --workload hello   # single workload
+bench/phase-e-stress-validate.sh --no-stress    # baseline comparison
+```
+
+Outputs structured per-workload report:
+```
+  Workload    Verdict  Note
+  hello       PASS     byte-identical to TW; 0 BRUTE/AUDIT lines; rc=0
+  firefox     PASS     ...
+  hne         PASS     ...
+
+  SHIP gate: MET
+```
+
+Exit code 0 means all SHIP gates met; 1 means at least one failure;
+2 means harness error.  Logs at `/tmp/phase-e-validate-LOGS/`
+including per-workload `.out` (stdout) + `.err` (stderr) + the TW
+baseline `.tw.out` for diff inspection.
+
+**Manual path** (if needed for debugging a specific case):
+
+```bash
 NIX_V3_NURSERY=1 NIX_V3_PHASE_E=1 NIX_V3_GC_STRESS=1000 \
   NIX_VM_STATS=1 NIX_V3_DIRECT_EVAL=1 \
   NIX_V3_MAX_WALL_TIME=600s NIX_V3_MAX_HEAP=4G \
   ./build/src/nix/nix --extra-experimental-features nix-command \
   eval --impure --expr '(import <nixpkgs> {}).hello.drvPath'
-
-# firefox.drvPath
-... same shape, .expr = '(import <nixpkgs> {}).firefox.drvPath'
-
-# HNE
-... same shape, .expr = '(builtins.getFlake "/.../haskell-nix-example")
-                          .packages.x86_64-linux.hello.drvPath'
 ```
 
-For each run, verify:
-* **Output byte-identical** to TW baseline (the canonical correctness
+For each run, the script verifies:
+* **Output byte-identical** to TW baseline (canonical correctness
   gate; any divergence is a missed-root).
-* **No `v3 SCAVENGE BRUTE`** stderr line (the brute-audit canary).
+* **No `v3 SCAVENGE BRUTE`** stderr line (brute-audit canary).
 * **No `v3 SCAVENGE AUDIT: nursery ... reachable via`** stderr line
-  (a more specific missed-root detector).
-* **No SIGSEGV / SIGBUS** crash.
+  (specific missed-root detector).
+* **No SIGSEGV / SIGBUS** crash (rc == 0).
 
 If any workload fails: that's the bug to diagnose.
 
