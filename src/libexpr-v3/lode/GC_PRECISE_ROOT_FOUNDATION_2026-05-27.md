@@ -99,13 +99,48 @@ Cost: per-call macro overhead is ~10 ns. Applied to ~100 primop bodies + ~50 hel
 - TUNE if 100-200 MB reduction
 - REVERT if <100 MB reduction
 
+### Pre-commit measurement (2026-05-27) — SHIP-GREEN ahead of Stage 6 impl
+
+Stage 6 SPIKE landed in commit `f3491859f`: `live_trace.cc` is a
+transitive mark-from-roots tracer using Stage 3 infrastructure as the
+root provider.  Reports per-type LIVE-vs-ALLOCATED ratio + freeable
+bytes at end-of-run.
+
+End-of-run is a strict LOWER BOUND on what mid-eval precise GC could
+reclaim (v3 arena is bump-allocated and never frees during eval, so
+peak arena ≥ cumulative bytesAllocated; end-of-run live ≤ peak live;
+end-of-run freeable ≤ what continuous GC would reclaim).
+
+`hello.drvPath` v3-direct end-of-run:
+* 525 MB allocated → 286 MB live → **239 MB freeable** (LOWER BOUND)
+* peak_rss = 754 MB; v3_arena = 587 MB
+* Verdict: **SHIP-GREEN** (≥ 200 MB ship gate met)
+
+The bytes are there to reclaim.  Stages 4-6 are GREEN to proceed.
+
+Full data + cross-checks (hello.name, synthetic genList 200k):
+[`LIVE_FRACTION_SPIKE_2026-05-27.md`](LIVE_FRACTION_SPIKE_2026-05-27.md).
+
 ## Stage 7 — Future: moving/compacting GC
 
 Once precise roots are in place, the team can adopt Whippet (per `GC_BUILD_VS_BUY_2026-05-21.md`) or hand-roll a moving collector. That's a separate ~3-4 month project; precise roots are the prerequisite.
 
-## What this turn lands
+## What's landed (as of 2026-05-27)
 
-Stage 1 only: `tagIsPointer` predicate in value.hh. Build clean, all-v3-tests 14/14 PASS. The 8-stage plan above scopes the rest.
+* **Stage 1 ✓** — `tagIsPointer` predicate (commit `6f854fa2c`)
+* **Stage 3 ✓** — `walkAllV3Roots` + 7 root sources covered;
+  `walkGlobalV3Roots` extracted (commits `02c95eba0` + `e7639f837`
+  + `f3491859f`)
+* **Stage 6 SPIKE ✓** — `dumpV3LiveFraction` + SHIP-GREEN verdict
+  (commit `f3491859f`)
+
+Pending:
+* Stage 2 — walker migration audit (low-priority; may be moot)
+* Stage 4 — stack maps (audit-first — likely not needed if VM
+  invariant "valueStack[0..size()) has no stale pointers" holds)
+* Stage 5 — GC_ROOT macros for ~150 C++ helper sites
+* Stage 6 — production precise GC of v3 arena (SHIP-GREEN ahead)
+* Stage 7 — moving/compacting GC (separate ~3-4 mo project)
 
 ## Why this is "no-regret" foundation work
 
