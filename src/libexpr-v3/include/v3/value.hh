@@ -184,6 +184,101 @@ struct ValuePair { Value left; Value right; Value evaluated; };
 
 static_assert(sizeof(Value) == 16, "v3 Value must be exactly 16 bytes");
 
+/// Tag classification for precise-root scanning.
+///
+/// **The single source of truth** for "does this Tag's payload hold a
+/// v3-heap pointer the GC must trace?"  Every walker (nursery scavenger,
+/// auditor, BRUTE scanner, future precise-root infrastructure) MUST
+/// agree on this classification — without that agreement, missed
+/// pointers cause silent corruption (Phase D / Phase E missed-root
+/// bugs all traced to walker-vs-allocator-vs-emitter disagreement).
+///
+/// Tags producing v3-heap pointers in `payload`:
+///   Closure   → payload.closure   (Closure*)
+///   Thunk     → payload.thunk     (Thunk*)
+///   Attrs     → payload.bindings  (Bindings*)
+///   List      → payload.list      (ListVec*)
+///   App       → payload.pair      (ValuePair*)
+///   PrimOpApp → payload.pair      (ValuePair*)
+///   Slot      → payload.slot      (Value*; pointer into a tenured cell)
+///
+/// Tags with payload that is NOT a v3-heap pointer (scalar OR external
+/// pointer that the GC does NOT manage):
+///   Uninitialized / Int / Float / Bool / Null   — scalar or empty
+///   String / Path                                — const char* into
+///                                                  arena-allocated text
+///                                                  (immutable; tenured by
+///                                                  construction)
+///   PrimOp                                       — const PrimOp* to
+///                                                  static registration
+///   Blackhole                                    — transient marker
+///   External                                     — opaque void*
+///
+/// Codified 2026-05-27 as the foundation for the "ditch Boehm" precise-
+/// root infrastructure (`GC_PRECISE_ROOT_FOUNDATION_2026-05-27.md`).
+/// Replaces ad-hoc Tag dispatch tables previously duplicated in:
+///   gc.cc Scavenger::visitValue (the nursery walker)
+///   gc.cc postScavengeAudit
+///   gc.cc postScavengeBruteScan
+///   ir_dump.cc value-printing dispatch
+[[nodiscard]] constexpr bool tagIsPointer(Tag t) noexcept
+{
+    switch (t) {
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::Attrs:
+    case Tag::List:
+    case Tag::App:
+    case Tag::PrimOpApp:
+    case Tag::Slot:
+        return true;
+    case Tag::Uninitialized:
+    case Tag::Int:
+    case Tag::Float:
+    case Tag::Bool:
+    case Tag::Null:
+    case Tag::String:
+    case Tag::Path:
+    case Tag::PrimOp:
+    case Tag::Blackhole:
+    case Tag::External:
+        return false;
+    }
+    // -Werror=switch-enum should catch any missing case at compile
+    // time; the unreachable() here is defense-in-depth in case the
+    // compiler treats the switch as exhaustive (gcc) vs partial (other).
+    return false;
+}
+
+/// Convenience: same predicate against a Value.
+[[nodiscard]] inline bool valueHoldsPointer(const Value & v) noexcept
+{
+    return tagIsPointer(v.tag());
+}
+
+// Compile-time correctness gate for the classification — if any Tag's
+// payload semantic changes (e.g. Tag::PrimOp becomes a fully GC-managed
+// pointer instead of static), exactly one of these static_asserts will
+// fail and force a code review of the dispatch.  Cheap insurance
+// against silent walker drift.
+static_assert(!tagIsPointer(Tag::Uninitialized));
+static_assert(!tagIsPointer(Tag::Int));
+static_assert(!tagIsPointer(Tag::Float));
+static_assert(!tagIsPointer(Tag::Bool));
+static_assert(!tagIsPointer(Tag::Null));
+static_assert(!tagIsPointer(Tag::String));
+static_assert(!tagIsPointer(Tag::Path));
+static_assert( tagIsPointer(Tag::Attrs));
+static_assert( tagIsPointer(Tag::List));
+static_assert( tagIsPointer(Tag::Closure));
+static_assert( tagIsPointer(Tag::Thunk));
+static_assert(!tagIsPointer(Tag::PrimOp));
+static_assert( tagIsPointer(Tag::PrimOpApp));
+static_assert( tagIsPointer(Tag::App));
+static_assert(!tagIsPointer(Tag::Blackhole));
+static_assert(!tagIsPointer(Tag::External));
+static_assert( tagIsPointer(Tag::Slot));
+
 inline void Value::mkBool(bool b) noexcept
 {
     *this = b ? vTrue : vFalse;

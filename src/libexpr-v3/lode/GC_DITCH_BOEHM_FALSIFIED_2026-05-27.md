@@ -1,4 +1,15 @@
-# "Ditch Boehm" as a perf project — FALSIFIED — 2026-05-27
+# "Ditch Boehm" as a PERF project — FALSIFIED — 2026-05-27
+
+## REFRAMING 2026-05-27 (user clarification)
+
+The user's intent for GC work is **memory usage**, not wall time. This document falsified the WALL premise (Boehm GC = 0 ms on M5 + hello), which was the original IDEAL_GC_DESIGN motivator. With memory as the primary axis, the 400 MB Boehm-reserved heap IS the headline target — well above the `[[memory-first-class]]` 50 MB SHIP threshold. The "ditch Boehm" project remains live as a MEMORY project.
+
+The reframing changes nothing measurement-wise — Boehm still consumes 0 ms wall, the 400 MB heap is still 99.4% free at peak. But the project's SHIP gate is now `[[memory-first-class]]` peak-RSS reduction, not wall improvement.
+
+User chose precise-root foundation (~1-2 wk) as the next step. See `GC_PRECISE_ROOT_FOUNDATION_2026-05-27.md` for the survey + decomposition.
+
+---
+
 
 **Date:** 2026-05-27 (morning, after M5 cron + M5 primop profile)
 **Status:** FALSIFIED via measurement-first spike — wall-perf premise does not hold; memory + architectural cases remain but require different framing
