@@ -169,8 +169,22 @@ External flows through v3 only as a transient bridge intermediate;
 never materialized into arena-resident state.
 
 **Future session's action**: no External-specific work required.
-Update this audit's claim by re-running the probe on the workload
-under scrutiny:
+
+**Automated re-verification** (recommended):
+```bash
+bench/arena-dereg-audit.sh                          # all anchor workloads
+bench/arena-dereg-audit.sh --workload hello         # single workload
+bench/arena-dereg-audit.sh --workloads hello,firefox,hne,ackermann
+bench/arena-dereg-audit.sh --threshold-external 100 # tolerate small leaks
+```
+
+The harness probes each workload under `NIX_V3_LIVE_TRACE=1`,
+extracts the Tag::External / String / Path counts from the audit
+section, and reports PASS / FAIL against the External-clean
+criterion (default threshold: 0).  Exit 0 = clean; 1 = failure; 2
+= harness error.
+
+**Manual probe** (if needed for debugging):
 ```bash
 NIX_V3_LIVE_TRACE=1 ./build/src/nix/nix \
   --extra-experimental-features nix-command \
@@ -178,7 +192,8 @@ NIX_V3_LIVE_TRACE=1 ./build/src/nix/nix \
   | grep -A4 "Arena-dereg audit"
 ```
 If `Tag::External` is 0, the audit re-confirms; otherwise diagnose
-which cells store the new External payloads.
+which cells store the new External payloads (the audit section
+includes sample addresses for follow-up).
 
 ## 5. Implementation outline (~2 days code)
 
