@@ -28,6 +28,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_set>
 #include <vector>
 
@@ -58,6 +59,22 @@ struct LiveCounters
     size_t lists    = 0,   bytesLists    = 0;
     size_t pairs    = 0,   bytesPairs    = 0;
     size_t slotsDereffed = 0;  // edges followed via Tag::Slot
+
+    // Arena-dereg audit counters (per
+    // ARENA_DEREGISTRATION_DESIGN_2026-05-27 §4 §4.1-4.2):
+    // Tag::External / String / Path payloads in v3 cells are
+    // candidate Boehm-managed pointers that arena dereg must
+    // either register separately OR confirm absent.
+    // Sampled at every visited Value during the live-trace walk.
+    size_t externalCount = 0;
+    size_t stringCount   = 0;
+    size_t pathCount     = 0;
+    // First N pointer addresses per non-zero tag for follow-up
+    // audit; bounded so output stays small.
+    static constexpr size_t kAuditSampleCap = 16;
+    std::vector<void *> externalSamples;
+    std::vector<const char *> stringSamples;
+    std::vector<const char *> pathSamples;
 };
 
 /// Transitive mark-from-roots tracer.  Pull pointers from
@@ -82,8 +99,55 @@ public:
         // the Value at the cell may carry a payload we haven't seen.
         if (cellsWalked.insert(p).second) {
             ++counts.slotsDereffed;
-            visitValue(*p);
+            auditAndVisit(*p);
         }
+    }
+
+    /// Arena-dereg audit hook: count Tag::External / String / Path
+    /// payloads in any Value reached during the walk.  Tally goes
+    /// into LiveCounters.externalCount / stringCount / pathCount.
+    /// First N addresses per non-zero tag are stored for follow-up
+    /// investigation.
+    ///
+    /// Called from each walk* function instead of `visitValue`
+    /// directly.  Drops back to the base `visitValue` for the
+    /// pointer dispatch (the inspection is additive, not replacing).
+    void auditAndVisit(Value & v) noexcept
+    {
+        // -Werror=switch-enum: explicit no-op for every other Tag.
+        switch (v.tag()) {
+        case Tag::External:
+            ++counts.externalCount;
+            if (counts.externalSamples.size() < LiveCounters::kAuditSampleCap)
+                counts.externalSamples.push_back(v.payload.raw);
+            break;
+        case Tag::String:
+            ++counts.stringCount;
+            if (counts.stringSamples.size() < LiveCounters::kAuditSampleCap)
+                counts.stringSamples.push_back(v.payload.str);
+            break;
+        case Tag::Path:
+            ++counts.pathCount;
+            if (counts.pathSamples.size() < LiveCounters::kAuditSampleCap)
+                counts.pathSamples.push_back(v.payload.path);
+            break;
+        case Tag::Uninitialized:
+        case Tag::Int:
+        case Tag::Float:
+        case Tag::Bool:
+        case Tag::Null:
+        case Tag::Attrs:
+        case Tag::List:
+        case Tag::Closure:
+        case Tag::Thunk:
+        case Tag::PrimOp:
+        case Tag::PrimOpApp:
+        case Tag::App:
+        case Tag::Blackhole:
+        case Tag::Slot:
+            break;
+        }
+        visitValue(v);
     }
 
     /// Drain the worklist.  Each iteration pops one gray object and
@@ -128,7 +192,7 @@ private:
         if (c->capturedWiths)
             enqueue(c->capturedWiths, GK_LIST);
         for (uint16_t i = 0; i < c->nUpvalues; ++i)
-            visitValue(c->upvalues[i]);
+            auditAndVisit(c->upvalues[i]);
     }
 
     /// Walk a Thunk.  State-dependent: Suspended/Native/Blackhole have
@@ -157,9 +221,9 @@ private:
         // own enqueue.  But we DO walk through the cell content
         // because it may reach objects not otherwise rooted.
         if (t->cell && cellsWalked.insert(t->cell).second)
-            visitValue(*t->cell);
+            auditAndVisit(*t->cell);
         if (t->shapeCell && cellsWalked.insert(t->shapeCell).second)
-            visitValue(*t->shapeCell);
+            auditAndVisit(*t->shapeCell);
 
         switch (t->state) {
         case ThunkState::Suspended:
@@ -167,14 +231,14 @@ private:
             if (t->suspended.capturedWiths)
                 enqueue(t->suspended.capturedWiths, GK_LIST);
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
-                visitValue(t->tail[i]);
+                auditAndVisit(t->tail[i]);
             break;
         case ThunkState::Evaluated:
-            visitValue(t->evaluated);
+            auditAndVisit(t->evaluated);
             break;
         case ThunkState::Native:
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
-                visitValue(t->tail[i]);
+                auditAndVisit(t->tail[i]);
             break;
         case ThunkState::Bridge:
             // bridgeSrc is a TW nix::Value*, not v3 heap.  Skip.
@@ -188,7 +252,7 @@ private:
         counts.bytesBindings += sizeof(Bindings)
                               + sizeof(Bindings::Entry) * b->size;
         for (uint32_t i = 0; i < b->size; ++i)
-            visitValue(b->entries[i].value);
+            auditAndVisit(b->entries[i].value);
         // Chain bindings: walk parent.  Each segment of the chain
         // contributes its own bytes (overlay-only `size`); the
         // chain head sees overlay + parent transitively.  Sorted
@@ -202,16 +266,16 @@ private:
         ++counts.lists;
         counts.bytesLists += sizeof(ListVec) + sizeof(Value) * l->size;
         for (uint32_t i = 0; i < l->size; ++i)
-            visitValue(l->elems[i]);
+            auditAndVisit(l->elems[i]);
     }
 
     void walkPair(ValuePair * p)
     {
         ++counts.pairs;
         counts.bytesPairs += sizeof(ValuePair);
-        visitValue(p->left);
-        visitValue(p->right);
-        visitValue(p->evaluated);
+        auditAndVisit(p->left);
+        auditAndVisit(p->right);
+        auditAndVisit(p->evaluated);
     }
 };
 
@@ -365,9 +429,76 @@ void dumpV3LiveFraction() noexcept
         "\n"
         "  Slots followed: %zu\n"
         "  Freeable arena bytes (alloc - live): %s\n"
-        "  Verdict: %s (200 MB ship gate; <50 MB → pivot)\n"
-        "============================================================\n",
+        "  Verdict: %s (200 MB ship gate; <50 MB → pivot)\n",
         tr.counts.slotsDereffed, freeableB, verdict);
+
+    // Arena-dereg audit report (per ARENA_DEREGISTRATION_DESIGN
+    // §4.1 String/Path + §4.2 External audits).  These counts
+    // tell the future Arena dereg session whether external
+    // Boehm-managed pointers persist in v3 cells.  If all three
+    // counters are 0, arena dereg is safe wrt these tags.
+    std::fprintf(stderr,
+        "\n"
+        "  Arena-dereg audit (Tag classification of visited Values):\n"
+        "    Tag::External : %12zu reached\n"
+        "    Tag::String   : %12zu reached\n"
+        "    Tag::Path     : %12zu reached\n",
+        tr.counts.externalCount,
+        tr.counts.stringCount,
+        tr.counts.pathCount);
+    if (tr.counts.externalCount > 0 && !tr.counts.externalSamples.empty()) {
+        std::fprintf(stderr,
+            "    External samples (first %zu):\n",
+            tr.counts.externalSamples.size());
+        for (void * p : tr.counts.externalSamples) {
+            std::fprintf(stderr, "      payload.raw=%p\n", p);
+        }
+    }
+    if (tr.counts.stringCount > 0 && !tr.counts.stringSamples.empty()) {
+        // Strings + paths can be MASSIVELY duplicated (same `const
+        // char *` shared across many Values).  Print sample addresses
+        // + first ~24 chars for diagnostic.  De-duplicate addresses
+        // before printing so the same pointer isn't shown 16 times.
+        std::unordered_set<const char *> seenS;
+        size_t shown = 0;
+        std::fprintf(stderr,
+            "    String samples (first up to %zu unique addrs):\n",
+            tr.counts.stringSamples.size());
+        for (const char * p : tr.counts.stringSamples) {
+            if (!p || !seenS.insert(p).second) continue;
+            char preview[28] = {0};
+            std::snprintf(preview, sizeof(preview), "%s", p);
+            // Truncate for readability — show first 24 chars.
+            if (std::strlen(p) > 24) {
+                preview[24] = '.'; preview[25] = '.'; preview[26] = '.';
+                preview[27] = 0;
+            }
+            std::fprintf(stderr,
+                "      payload.str=%p  '%s'\n", (void *)p, preview);
+            if (++shown >= 8) break;
+        }
+    }
+    if (tr.counts.pathCount > 0 && !tr.counts.pathSamples.empty()) {
+        std::unordered_set<const char *> seenP;
+        size_t shown = 0;
+        std::fprintf(stderr,
+            "    Path samples (first up to %zu unique addrs):\n",
+            tr.counts.pathSamples.size());
+        for (const char * p : tr.counts.pathSamples) {
+            if (!p || !seenP.insert(p).second) continue;
+            char preview[28] = {0};
+            std::snprintf(preview, sizeof(preview), "%s", p);
+            if (std::strlen(p) > 24) {
+                preview[24] = '.'; preview[25] = '.'; preview[26] = '.';
+                preview[27] = 0;
+            }
+            std::fprintf(stderr,
+                "      payload.path=%p  '%s'\n", (void *)p, preview);
+            if (++shown >= 8) break;
+        }
+    }
+    std::fprintf(stderr,
+        "============================================================\n");
 }
 
 } // namespace nix::v3

@@ -94,7 +94,7 @@ target is reachable)?
 | Blackhole / Uninitialized   | sentinel         | NO                  | none |
 | **External**                | `void *`         | **POTENTIALLY YES** | see §4.2 below |
 
-### 4.1 String / Path audit
+### 4.1 String / Path audit — PROBE DATA AVAILABLE 2026-05-27
 
 Sources of `const char *` stored in v3 cells:
 
@@ -107,38 +107,78 @@ Sources of `const char *` stored in v3 cells:
    string ownership.  Could be Boehm-managed if TW uses Boehm for
    strings (libexpr's symbol table does).
 
-**Audit task for the future session**:
-* `grep -rn "mkString" src/libexpr-v3/*.cc` — find every site that
-  constructs a Tag::String Value.
-* For each, trace the `const char *` source.  Categorize as:
-  * Arena/libc (safe) — no action
-  * Boehm-managed — must register or convert to arena
+**Probe data (2026-05-27)** via `NIX_V3_LIVE_TRACE=1`:
+
+* hello.drvPath: 70 K String + 881 Path Values reached
+* HNE: 1.44 M String + 11 K Path Values reached
+
+Sample addresses span TWO distinct address ranges (illustrated on
+HNE):
+```
+  Range A:   0xb98c2f980  /  0xb9c7747e0       (arena-like)
+  Range B:   0x850400d00  /  0x850400d10       (smaller-pointer-range)
+```
+
+Range A's spacing + alignment matches arena addresses (e.g.,
+`0xb9c774620, 0xb9c7746e0` are 0xc0 = 192 B apart — consistent
+with per-Value `allocValue()` 192 B objects in arena).
+
+Range B's addresses are smaller pointers and probably libc / libexpr
+symbol-table-managed.  Their content (`'aarch64-darwin'`,
+`'/nix/store'`, `'flake:nixpkgs'`) suggests system-info-style
+interned strings.
+
+**Audit task for the future session** (now data-anchored):
+
+1. Run the probe (above command) on the target workload.
+2. Classify the SAMPLED addresses:
+   * Compare against `threadArena().blockRanges()` to identify
+     arena-managed addresses (safe — moves with arena).
+   * Identify libc-malloc'd ranges (typically `<= 0x6000_0000_0000`
+     on macOS aarch64).
+3. For each range NOT in arena AND that points to Boehm-managed
+   memory: register or convert.
 
 Expected: most v3-native string construction is arena-allocated via
 `allocChars` (search for `allocChars` callers).  TW-bridged strings
-are the risk.
+are the risk.  Range-A addresses are the safe arena majority;
+Range-B requires per-source identification.
 
-### 4.2 External tag audit
+### 4.2 External tag audit — DONE (2026-05-27 probe)
 
 `Value::payload.raw` of Tag::External is an opaque `void *`.  Origin:
 
 * TW's `nix::Value::External` (via `treeWalkerToV3`) — Boehm-managed
 * v3 never CREATES External (`value.cc` checked: no `mkExternal` defined)
 
-Conclusion: External-tag values in v3 cells point to TW-owned objects.
-Those objects ARE Boehm-managed (TW's `nix::ExternalValueBase`
-descendants typically are).
+**Cheap probe DONE 2026-05-27** via the extended live-trace audit
+(`NIX_V3_LIVE_TRACE=1` reaches every Value during transitive walk
+and tallies Tag::External / String / Path counts).
 
-**Action for the future session**:
-* Decide whether External-tag Values are commonly stored in v3 cells.
-* If yes: register every External-tag payload separately in the side-
-  table, OR forbid storing External in arena cells (force materialize).
-* If no (External flows through v3 only as a transient bridge):
-  no action needed for arena dereg.
+**Measurement** on the two anchor workloads:
+```
+                            hello.drvPath   HNE
+  Tag::External (reached):       0           0      ← clean!
+  Tag::String   (reached):  70,035    1,439,011
+  Tag::Path     (reached):      881       10,971
+```
 
-**Cheap probe**: under default v3-direct eval, count Tag::External
-Values placed in arena cells via a one-shot instrumentation pass.
-If zero, no special handling needed.
+**Conclusion**: Tag::External is NOT a concern for arena dereg.
+On both anchor workloads, NO v3 cells hold External-typed Values.
+External flows through v3 only as a transient bridge intermediate;
+never materialized into arena-resident state.
+
+**Future session's action**: no External-specific work required.
+Update this audit's claim by re-running the probe on the workload
+under scrutiny:
+```bash
+NIX_V3_LIVE_TRACE=1 ./build/src/nix/nix \
+  --extra-experimental-features nix-command \
+  eval --impure --expr '...your workload...' 2>&1 \
+  | grep -A4 "Arena-dereg audit"
+```
+If `Tag::External` is 0, the audit re-confirms; otherwise diagnose
+which cells store the new External payloads.
 
 ## 5. Implementation outline (~2 days code)
 
