@@ -109,10 +109,24 @@ public:
 private:
     Arena & arena_;
 
-    /// Old-pointer → new-pointer forwarding table.  Populated by
-    /// per-type fwd* helpers.  Consulted on every visit to avoid
-    /// double-copy + cycle traversal.
-    std::unordered_map<void *, void *> forwarding_;
+    /// Stage 6 Day 3 Step 1: typed forwarding tables.  Replaces
+    /// the Day-2.2 type-erased `forwarding_` with per-type maps
+    /// so post-drain slot resolution (per Day-3 analysis §"Step 3")
+    /// can iterate Bindings-only forwardings.
+    ///
+    /// Each fwd*(p) consults / inserts its typed map.  Cycle
+    /// traversal + double-copy elimination work identically to
+    /// Day 2.2.
+    std::unordered_map<Closure   *, Closure   *> forwardingClosure_;
+    std::unordered_map<Thunk     *, Thunk     *> forwardingThunk_;
+    std::unordered_map<Bindings  *, Bindings  *> forwardingBindings_;
+    std::unordered_map<ListVec   *, ListVec   *> forwardingList_;
+    std::unordered_map<ValuePair *, ValuePair *> forwardingPair_;
+
+    /// Stage 6 Day 3 Step 1: standalone-cell forwarding.  Populated
+    /// by Step 2's `walkStandaloneCells` (Day-3 follow-up).  Day-3
+    /// Step 1 leaves this empty; Step 2 wires it.
+    std::unordered_map<Value *,    Value *>    forwardingCell_;
 
     /// Worklist of copied cells whose fields need transitive
     /// forwarding.  Stored as (ptr, kind) pairs; the kind

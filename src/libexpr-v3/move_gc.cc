@@ -43,7 +43,14 @@ namespace nix::v3 {
 MajorScavenger::MajorScavenger(Arena & arena) noexcept
     : arena_(arena)
 {
-    forwarding_.reserve(1024);
+    // Day 3 Step 1: pre-reserve typed maps.  Conservative
+    // 1024-slot pre-size matches the Day-2.2 single-map default;
+    // grow naturally as the workload demands.
+    forwardingClosure_.reserve(1024);
+    forwardingThunk_.reserve(1024);
+    forwardingBindings_.reserve(1024);
+    forwardingList_.reserve(1024);
+    forwardingPair_.reserve(1024);
     worklist_.reserve(1024);
 }
 
@@ -60,26 +67,27 @@ Closure * MajorScavenger::fwdClosure(Closure * c)
 {
     if (!c) return nullptr;
     if (!arena_.inActive(c)) return c;  // External / Backup → leave
-    auto it = forwarding_.find(c);
-    if (it != forwarding_.end()) return static_cast<Closure *>(it->second);
+    auto it = forwardingClosure_.find(c);
+    if (it != forwardingClosure_.end()) return it->second;
 
     const size_t bytes = sizeof(Closure) + sizeof(Value) * c->nUpvalues;
     void * dst = arena_.allocInBackup(bytes);
     std::memcpy(dst, c, bytes);
-    forwarding_.emplace(c, dst);
-    worklist_.push_back({dst, KClosure});
+    Closure * newC = static_cast<Closure *>(dst);
+    forwardingClosure_.emplace(c, newC);
+    worklist_.push_back({newC, KClosure});
 
     ++stats_.closuresCopied;
     stats_.bytesCopied += bytes;
-    return static_cast<Closure *>(dst);
+    return newC;
 }
 
 Thunk * MajorScavenger::fwdThunk(Thunk * t)
 {
     if (!t) return nullptr;
     if (!arena_.inActive(t)) return t;
-    auto it = forwarding_.find(t);
-    if (it != forwarding_.end()) return static_cast<Thunk *>(it->second);
+    auto it = forwardingThunk_.find(t);
+    if (it != forwardingThunk_.end()) return it->second;
 
     // Size depends on state per closure.hh::Thunk layout.
     size_t bytes;
@@ -96,66 +104,70 @@ Thunk * MajorScavenger::fwdThunk(Thunk * t)
     }
     void * dst = arena_.allocInBackup(bytes);
     std::memcpy(dst, t, bytes);
-    forwarding_.emplace(t, dst);
-    worklist_.push_back({dst, KThunk});
+    Thunk * newT = static_cast<Thunk *>(dst);
+    forwardingThunk_.emplace(t, newT);
+    worklist_.push_back({newT, KThunk});
 
     ++stats_.thunksCopied;
     stats_.bytesCopied += bytes;
-    return static_cast<Thunk *>(dst);
+    return newT;
 }
 
 Bindings * MajorScavenger::fwdBindings(Bindings * b)
 {
     if (!b) return nullptr;
     if (!arena_.inActive(b)) return b;
-    auto it = forwarding_.find(b);
-    if (it != forwarding_.end()) return static_cast<Bindings *>(it->second);
+    auto it = forwardingBindings_.find(b);
+    if (it != forwardingBindings_.end()) return it->second;
 
     const size_t bytes = sizeof(Bindings) + sizeof(Bindings::Entry) * b->size;
     void * dst = arena_.allocInBackup(bytes);
     std::memcpy(dst, b, bytes);
-    forwarding_.emplace(b, dst);
-    worklist_.push_back({dst, KBindings});
+    Bindings * newB = static_cast<Bindings *>(dst);
+    forwardingBindings_.emplace(b, newB);
+    worklist_.push_back({newB, KBindings});
 
     ++stats_.bindingsCopied;
     stats_.bytesCopied += bytes;
-    return static_cast<Bindings *>(dst);
+    return newB;
 }
 
 ListVec * MajorScavenger::fwdList(ListVec * l)
 {
     if (!l) return nullptr;
     if (!arena_.inActive(l)) return l;
-    auto it = forwarding_.find(l);
-    if (it != forwarding_.end()) return static_cast<ListVec *>(it->second);
+    auto it = forwardingList_.find(l);
+    if (it != forwardingList_.end()) return it->second;
 
     const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
     void * dst = arena_.allocInBackup(bytes);
     std::memcpy(dst, l, bytes);
-    forwarding_.emplace(l, dst);
-    worklist_.push_back({dst, KList});
+    ListVec * newL = static_cast<ListVec *>(dst);
+    forwardingList_.emplace(l, newL);
+    worklist_.push_back({newL, KList});
 
     ++stats_.listsCopied;
     stats_.bytesCopied += bytes;
-    return static_cast<ListVec *>(dst);
+    return newL;
 }
 
 ValuePair * MajorScavenger::fwdPair(ValuePair * p)
 {
     if (!p) return nullptr;
     if (!arena_.inActive(p)) return p;
-    auto it = forwarding_.find(p);
-    if (it != forwarding_.end()) return static_cast<ValuePair *>(it->second);
+    auto it = forwardingPair_.find(p);
+    if (it != forwardingPair_.end()) return it->second;
 
     const size_t bytes = sizeof(ValuePair);
     void * dst = arena_.allocInBackup(bytes);
     std::memcpy(dst, p, bytes);
-    forwarding_.emplace(p, dst);
-    worklist_.push_back({dst, KPair});
+    ValuePair * newP = static_cast<ValuePair *>(dst);
+    forwardingPair_.emplace(p, newP);
+    worklist_.push_back({newP, KPair});
 
     ++stats_.pairsCopied;
     stats_.bytesCopied += bytes;
-    return static_cast<ValuePair *>(dst);
+    return newP;
 }
 
 // ---------------------------------------------------------------------------
