@@ -147,6 +147,12 @@ lib_sources = files(
   # `nix::Value *` from Thunk::bridgeSrc so Boehm sees them as roots
   # independently of arena registration.
   'bridge_root_registry.cc',
+  # Stage 6 Day 2.2 MajorScavenger — Cheney semispace over the v3
+  # tenured arena.  See lode/STAGE_6_PRECISE_GC_DESIGN_2026-05-27.md
+  # + lode/STAGE_6_IMPLEMENTATION_GUIDE_2026-05-27.md.  Caller-
+  # invoked only in this commit (no automatic dispatch trigger;
+  # that's Day 3).  Production code unaffected.
+  'move_gc.cc',
   # #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
   'dedup_survey.cc',
   'disasm.cc',

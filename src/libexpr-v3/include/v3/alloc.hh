@@ -715,19 +715,25 @@ public:
         return r;
     }
 
-    /// Stage 6 Day 3 (future): swap active_ with backup_ after
-    /// MoveGCVisitor finishes copying live cells.  Currently a
-    /// no-op (backup_ exists but is unused).  When wired:
-    ///   1. MoveGCVisitor walks roots, copies live cells from
-    ///      active_ to backup_ (recursively via worklist drain)
-    ///   2. swapRegions() exchanges the two — old active is now
-    ///      backup, holds garbage to be freed
-    ///   3. backup_.reset() frees the old-active blocks
+    /// Stage 6 Day 2.2: swap active_ ↔ backup_.  Mechanics:
+    ///   1. (Caller — MajorScavenger) walks roots, copies live
+    ///      cells from active_ to backup_ via allocInBackup, drains
+    ///      transitive worklist.
+    ///   2. swapRegions() exchanges active_ ↔ backup_ in place.
+    ///      Future allocs land in what was just backup (now the
+    ///      compacted live set).
+    ///   3. (Caller) freeBackupBlocks() releases the OLD active
+    ///      blocks (now backup_).
+    ///
+    /// This is the moment of TRUTH for Stage 6 — net peak RSS
+    /// drops by `old_active_total - live_size` after this swap +
+    /// free sequence.  Callers must guarantee no pointers into
+    /// active_ remain in any reachable Value before invoking this
+    /// (the MajorScavenger's role is to ensure this by rewriting
+    /// every reachable pointer).
     void swapRegions() noexcept
     {
-        // No-op until Day 3 wires the mark+copy machinery.
-        // Documented entry point so the future commits can wire
-        // to a known API.
+        std::swap(active_, backup_);
     }
 
     /// Stage 6 Day 2: pointer-classification enum.  Returned by
@@ -790,6 +796,62 @@ public:
         return regionOf(p) == RegionKind::Backup;
     }
 
+    /// Stage 6 Day 2.2: backup-region allocator.  Mirrors
+    /// `alloc()` but writes into `backup_` instead of `active_`.
+    /// Used by `MajorScavenger::fwd*` to deposit copied cells.
+    ///
+    /// Same huge-cutoff + 16-byte-align semantics as `alloc()`.
+    /// Boehm registration follows the same `NIX_V3_ARENA_NOROOT`
+    /// gate as the active region.
+    void * allocInBackup(size_t bytes) noexcept
+    {
+        bytes = (bytes + 15) & ~size_t{15};
+        if (bytes > kHugeCutoff) {
+            void * blk = std::calloc(1, bytes);
+#if NIX_USE_BOEHMGC
+            if (blk && !arenaNorootEnabled())
+                GC_add_roots(blk, static_cast<char *>(blk) + bytes);
+#endif
+            if (blk) {
+                backup_.hugeBlocks.push_back({static_cast<char *>(blk),
+                                              static_cast<char *>(blk) + bytes});
+                backup_.totalBytes += bytes;
+            }
+            return blk;
+        }
+        if (backup_.cur + bytes > backup_.end) refillBackup();
+        void * p = backup_.cur;
+        backup_.cur += bytes;
+        return p;
+    }
+
+    /// Free all blocks in the backup region.  Called by the
+    /// caller of `swapRegions()` after the swap: the OLD active
+    /// (now backup_) holds dead cells; freeing them is the
+    /// concrete reclamation Stage 6 delivers.
+    void freeBackupBlocks() noexcept
+    {
+        for (char * blk : backup_.blocks) {
+#if NIX_USE_BOEHMGC
+            if (!arenaNorootEnabled())
+                GC_remove_roots(blk, blk + kBlockSize);
+#endif
+            std::free(blk);
+        }
+        for (const auto & h : backup_.hugeBlocks) {
+#if NIX_USE_BOEHMGC
+            if (!arenaNorootEnabled())
+                GC_remove_roots(h.begin, h.end);
+#endif
+            std::free(h.begin);
+        }
+        backup_.blocks.clear();
+        backup_.hugeBlocks.clear();
+        backup_.cur = nullptr;
+        backup_.end = nullptr;
+        backup_.totalBytes = 0;
+    }
+
 private:
     /// Stage 6 Day 1: active region — the only region used by
     /// alloc()/refill()/blockRanges() in current single-region mode.
@@ -800,6 +862,21 @@ private:
     /// with zero blocks.  Lazy-allocated on first major scavenge
     /// (Day 3) so workloads without major GC pay no extra RSS.
     Region backup_;
+
+    /// Stage 6 Day 2.2: backup-region block refill.  Mirrors
+    /// `refill()` but writes to backup_.
+    void refillBackup() noexcept
+    {
+        char * blk = static_cast<char *>(std::calloc(1, kBlockSize));
+        backup_.blocks.push_back(blk);
+        backup_.cur = blk;
+        backup_.end = blk + kBlockSize;
+        backup_.totalBytes += kBlockSize;
+#if NIX_USE_BOEHMGC
+        if (!arenaNorootEnabled())
+            GC_add_roots(blk, blk + kBlockSize);
+#endif
+    }
 
     void refill() noexcept
     {
