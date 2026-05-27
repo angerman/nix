@@ -19,6 +19,7 @@
 #include "v3/disk_cache.hh"     // #770 cache-hit/miss stats dump
 #include "v3/cache_probe.hh"    // #827 / A3 per-call-site cache-hook dump
 #include "v3/precise_root.hh"   // 2026-05-27 Stage 3: dumpAllV3Roots diagnostic
+#include "v3/live_trace.hh"     // 2026-05-27 Stage 6 SPIKE: live-fraction trace
 #include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/disasm.hh"         // #778 opcount dumper — opName()
 #include "v3/bytecode.hh"
@@ -534,6 +535,15 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // set (one walk of the root sources).
         // See lode/GC_PRECISE_ROOT_FOUNDATION_2026-05-27.md.
         dumpAllV3Roots();
+        // 2026-05-27 Stage 6 SPIKE: live-fraction tracer.  Walks
+        // transitively from precise roots; counts unique reachable
+        // objects per type; reports LIVE-vs-ALLOCATED ratio per type
+        // + aggregate freeable-bytes verdict.  Gated NIX_V3_LIVE_TRACE=1
+        // (zero cost when unset).
+        //
+        // Retirement criterion: when Stage 6 lands the real precise GC
+        // of v3 arena, fold into NIX_VM_STATS and remove the gate.
+        dumpV3LiveFraction();
         // #660 verification: dump bridge-primop call counts.  v3-eval
         // already does this via its own NIX_VM_STATS path; mirror here
         // so the integrated `nix` CLI (and any future v3 driver that

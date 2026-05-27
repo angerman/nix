@@ -115,6 +115,10 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
         walkImportCacheRoots(adapter);
     }
 
+    // (Note: global root sources walked above are also reachable
+    //  via the standalone helper `walkGlobalV3Roots`, used by
+    //  end-of-run diagnostics that fire after VMState teardown.)
+
     // -- NOTE: cellOwnerTable ---------------------------------------
     // alloc.hh::cellOwnerTable() maps cells→owning-Thunk*.  Audit
     // concluded this is METADATA, not a unique root source: a Thunk
@@ -131,6 +135,26 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
     // pointers.  C++ std::string manages the bytes' lifetime; no
     // v3-heap pointer reaches into this cache.  NOT a precise-root
     // source.  Comment kept for the same reason as cellOwnerTable.
+}
+
+void walkGlobalV3Roots(RootVisitor & visitor) noexcept
+{
+    // Standalone cell roots — singletons + registered transient cells.
+    for (Value * cell : standaloneCellRoots()) {
+        if (cell) visitor.visitValue(*cell);
+    }
+    // FFI bridge tables — v3 Value handles indexed by TW.
+    {
+        std::function<void(Value &)> adapter =
+            [&visitor](Value & v) { visitor.visitValue(v); };
+        walkV3BridgeRoots(adapter);
+    }
+    // primImport result cache.
+    {
+        std::function<void(Value &)> adapter =
+            [&visitor](Value & v) { visitor.visitValue(v); };
+        walkImportCacheRoots(adapter);
+    }
 }
 
 namespace {
@@ -199,15 +223,7 @@ void dumpAllV3Roots() noexcept
     // singleton standalone cells + FFI bridge tables survive across
     // eval scopes and are a real component of the root set the
     // future precise GC must cover.
-    if (!walkedVm) {
-        for (Value * cell : standaloneCellRoots()) {
-            if (cell) dv.visitValue(*cell);
-        }
-        std::function<void(Value &)> adapter =
-            [&dv](Value & v) { dv.visitValue(v); };
-        walkV3BridgeRoots(adapter);
-        walkImportCacheRoots(adapter);
-    }
+    if (!walkedVm) walkGlobalV3Roots(dv);
 
     std::fprintf(stderr,
         "v3-direct precise-root dump (vm-active=%s):\n"

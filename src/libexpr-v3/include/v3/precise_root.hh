@@ -148,6 +148,21 @@ struct NopRootVisitor : RootVisitor
 /// a counting visitor does not).
 void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept;
 
+/// Walk ONLY the global root sources (standalone cells, bridge
+/// tables, import cache).  Does NOT walk any VMState — useful at
+/// end-of-run when no VMState is active but persistent global roots
+/// still hold the residual live set.
+///
+/// Subset of `walkAllV3Roots`'s coverage:
+///   * `standaloneCellRoots()`
+///   * `walkV3BridgeRoots()`
+///   * `walkImportCacheRoots()`
+///
+/// Mid-eval callers should prefer `walkAllV3Roots(vm, ...)` since it
+/// includes the active VMState's stacks + frames.  End-of-run callers
+/// (atexit, post-teardown) get an honest residual measurement here.
+void walkGlobalV3Roots(RootVisitor & visitor) noexcept;
+
 /// Diagnostic: under `V3_DBG_ROOT_DUMP=1`, called once at end of run
 /// to print the root set.  Useful for cross-checking against Boehm's
 /// view in subsequent V3_DBG_ROOT_PARITY work.

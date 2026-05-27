@@ -134,6 +134,10 @@ lib_sources = files(
   # See lode/GC_PRECISE_ROOT_FOUNDATION_2026-05-27.md.  Foundation for
   # replacing Boehm conservative scan of the v3 arena.
   'precise_root.cc',
+  # Stage 6 SPIKE: live-fraction tracer.  Cheap directional proxy for the
+  # ditch-Boehm load-bearing claim BEFORE committing to Stages 5-6.
+  # NIX_V3_LIVE_TRACE=1 reports the LIVE-vs-ALLOCATED ratio per type.
+  'live_trace.cc',
   # #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
   'dedup_survey.cc',
   'disasm.cc',
