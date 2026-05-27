@@ -715,24 +715,91 @@ public:
         return r;
     }
 
-    /// Stage 6 Day 1: stub for the future major-scavenge swap.
-    /// Currently a no-op (single-region mode).  Future Day 3 will
-    /// swap active_ with backup_ after MoveGCVisitor finishes
-    /// copying live cells.
+    /// Stage 6 Day 3 (future): swap active_ with backup_ after
+    /// MoveGCVisitor finishes copying live cells.  Currently a
+    /// no-op (backup_ exists but is unused).  When wired:
+    ///   1. MoveGCVisitor walks roots, copies live cells from
+    ///      active_ to backup_ (recursively via worklist drain)
+    ///   2. swapRegions() exchanges the two — old active is now
+    ///      backup, holds garbage to be freed
+    ///   3. backup_.reset() frees the old-active blocks
     void swapRegions() noexcept
     {
-        // No-op until Day 2-3 introduces backup_ + the
-        // mark+copy machinery.  Documented entry point so the
-        // future commits can wire to a known API.
+        // No-op until Day 3 wires the mark+copy machinery.
+        // Documented entry point so the future commits can wire
+        // to a known API.
+    }
+
+    /// Stage 6 Day 2: pointer-classification enum.  Returned by
+    /// `regionOf(p)` to indicate whether a raw pointer falls in:
+    ///   * Active: a live cell in the current active region;
+    ///     MoveGCVisitor will copy it to backup_ during major
+    ///     scavenge
+    ///   * Backup: an already-copied cell in backup_; MoveGCVisitor
+    ///     should not re-visit (forwarding-table lookup catches
+    ///     these too, but the classification is the cheap pre-check)
+    ///   * External: not in any arena region — could be libc-malloc
+    ///     (CompilationUnit), Boehm (TW nix::Value*), nursery, or
+    ///     a stack address.  MoveGCVisitor skips.
+    enum class RegionKind : uint8_t {
+        External = 0,
+        Active   = 1,
+        Backup   = 2,
+    };
+
+    /// Classify `p` against the arena's region boundaries.  Cheap
+    /// per-pointer test: linear walks the blocks vectors (O(N) in
+    /// block count, ~N is small — 16 MB blocks, 587 MB arena = ~36
+    /// blocks max on the canonical workloads).
+    ///
+    /// Called from MoveGCVisitor for each pointer the major
+    /// scavenge visits.  When the workload's block count gets
+    /// large, this can be upgraded to a sorted-vector + binary
+    /// search; for now O(N) is well under the per-collect budget
+    /// since each scavenge processes the entire reachable set
+    /// anyway.
+    RegionKind regionOf(const void * p) const noexcept
+    {
+        if (!p) return RegionKind::External;
+        const char * cp = static_cast<const char *>(p);
+        // Active region first — most cells live here, so check
+        // hot-path first.
+        for (const char * blk : active_.blocks) {
+            if (cp >= blk && cp < blk + kBlockSize) return RegionKind::Active;
+        }
+        for (const auto & h : active_.hugeBlocks) {
+            if (cp >= h.begin && cp < h.end) return RegionKind::Active;
+        }
+        for (const char * blk : backup_.blocks) {
+            if (cp >= blk && cp < blk + kBlockSize) return RegionKind::Backup;
+        }
+        for (const auto & h : backup_.hugeBlocks) {
+            if (cp >= h.begin && cp < h.end) return RegionKind::Backup;
+        }
+        return RegionKind::External;
+    }
+
+    /// Convenience checks for the common pattern: "is `p` an arena
+    /// cell that the major scavenger should move?"
+    bool inActive(const void * p) const noexcept
+    {
+        return regionOf(p) == RegionKind::Active;
+    }
+    bool inBackup(const void * p) const noexcept
+    {
+        return regionOf(p) == RegionKind::Backup;
     }
 
 private:
-    /// Stage 6 Day 1: single active region (no backup yet).
-    /// The active region is the only one used by alloc()/refill()
-    /// /blockRanges() — behavior identical to the pre-refactor
-    /// flat-member layout.  Day 2+ will introduce backup_ and the
-    /// mark+copy paths.
+    /// Stage 6 Day 1: active region — the only region used by
+    /// alloc()/refill()/blockRanges() in current single-region mode.
     Region active_;
+
+    /// Stage 6 Day 2: backup region — destination for the future
+    /// major-scavenge mark+copy.  Currently UNUSED — empty Region
+    /// with zero blocks.  Lazy-allocated on first major scavenge
+    /// (Day 3) so workloads without major GC pay no extra RSS.
+    Region backup_;
 
     void refill() noexcept
     {
