@@ -955,6 +955,14 @@ struct Alloc
     /// touch entries[]).  Audited 2026-05-20.
     static Bindings * emptyBindingsSentinel() noexcept;
 
+    // (Phase C `allocChainBindings` helper intentionally NOT
+    //  added — Phase C is FALSIFIED across three pivots per
+    //  vm.cc:1167-1206 in-code memo.  Adding a constructor here
+    //  without callers is an "optimization carcass" anti-pattern
+    //  per [[measure-twice-cut-once]] §3.7.  The Phase C revival
+    //  prerequisites in the vm.cc comment are multi-session work;
+    //  not in scope for this turn.)
+
     static Bindings * allocBindings(uint32_t n,
                                      const char * file = __builtin_FILE(),
                                      uint32_t     line = __builtin_LINE()) noexcept
