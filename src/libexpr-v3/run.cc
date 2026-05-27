@@ -472,8 +472,29 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // (libc malloc, mmap).  Stage 3 Phase D shape (a/b/c) depends
         // on which one dominates.
 #if NIX_USE_BOEHMGC
+        // 2026-05-27 §6.2 spike: NIX_V3_BOEHM_FORCE_UNMAP=1 fires
+        // `GC_gcollect_and_unmap()` once before reading heap stats,
+        // letting us observe whether Boehm's munmap is functional on
+        // this build/platform (some builds skip USE_MUNMAP).  If the
+        // mechanism works, the reported boehm_heap drops and the
+        // boehm_unmapped grows by the same delta.  Sequel: fire from
+        // checkLimits() periodically to reduce peak_rss mid-eval.
+        // Retirement: when periodic-unmap is wired into checkLimits
+        // OR when Boehm is downscoped to FFI-only, drop the gate.
+        static const bool s_forceUnmap =
+            std::getenv("NIX_V3_BOEHM_FORCE_UNMAP") != nullptr;
+        if (s_forceUnmap) {
+            // Boehm's `force_unmap_on_gcollect` flag is the actual
+            // switch — `GC_gcollect_and_unmap()` is documented to
+            // unmap unconditionally, but in practice on macOS the
+            // unmap depends on this flag being set.  Enable it
+            // alongside the explicit collect call to be sure.
+            GC_set_force_unmap_on_gcollect(1);
+            GC_gcollect_and_unmap();
+        }
         size_t boehmHeap = GC_get_heap_size();
         size_t boehmFree = GC_get_free_bytes();
+        size_t boehmUnmapped = GC_get_unmapped_bytes();
         // 2026-05-27: Boehm GC time/count instrumentation — falsifier
         // gate for "ditch Boehm" perf claims.  GC_get_gc_no() counts
         // collections; GC_get_full_gc_total_time() returns total time
@@ -491,6 +512,7 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
 #else
         size_t boehmHeap = 0;
         size_t boehmFree = 0;
+        size_t boehmUnmapped = 0;
         GC_word boehmGcNo = 0;
         unsigned long boehmGcMs = 0;
 #endif
@@ -513,12 +535,14 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             ? rssBytes - boehmHeap - arenaPin : 0;
         std::fprintf(stderr,
             "v3-direct memory: peak_rss=%.1fMB boehm_heap=%.1fMB "
-            "boehm_free=%.1fMB v3_arena=%.1fMB elsewhere=%.1fMB\n",
-            rssBytes   / 1e6,
-            boehmHeap  / 1e6,
-            boehmFree  / 1e6,
-            arenaPin   / 1e6,
-            elsewhere  / 1e6);
+            "boehm_free=%.1fMB boehm_unmapped=%.1fMB v3_arena=%.1fMB "
+            "elsewhere=%.1fMB\n",
+            rssBytes      / 1e6,
+            boehmHeap     / 1e6,
+            boehmFree     / 1e6,
+            boehmUnmapped / 1e6,
+            arenaPin      / 1e6,
+            elsewhere     / 1e6);
         // 2026-05-27: Boehm GC time/count line — input to the
         // "ditch Boehm" decision per IDEAL_GC_DESIGN_2026-05-26.md.
         // If boehm_gc_ms is sub-1 % of overall wall, the wall case

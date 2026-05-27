@@ -569,6 +569,49 @@ void initLimits()
         }
     }
 
+    // gate: NIX_V3_BOEHM_FREE_DIV — Boehm's free-space divisor.
+    // Boehm aims for ≥ 1/N of heap free; default 3 (target 33 % free).
+    // hello.drvPath observation: boehm_heap=403 MB with 99.9 % free,
+    // suggesting Boehm is over-conservative on its watermark — large
+    // working-set spike during eval then heap stays at peak forever.
+    // Higher N → smaller free target → more aggressive GC + smaller
+    // arena watermark.
+    //
+    // Suggested values per IDEAL_GC_DESIGN_2026-05-26.md §6.2:
+    //   N=3  (default)  — current behaviour
+    //   N=10            — moderate aggressive (~10 % free target)
+    //   N=30            — aggressive (~3 % free target)
+    //   N=100           — very aggressive; may cost wall time
+    //
+    // Retirement criterion: when v3 owns its own arena/nursery
+    // allocator end-to-end (precise GC of v3 cells per Stage 6) and
+    // Boehm is downscoped to FFI-only objects, Boehm's heap
+    // watermark stops mattering — drop the gate.
+    if (const char * v = std::getenv("NIX_V3_BOEHM_FREE_DIV")) {
+        char * endp = nullptr;
+        long n = std::strtol(v, &endp, 10);
+        if (endp && *endp == '\0' && n > 0 && n <= 1000) {
+            GC_set_free_space_divisor(static_cast<GC_word>(n));
+            std::fprintf(stderr,
+                "v3 boehm-tune: GC_set_free_space_divisor(%ld) — "
+                "target ≈ 1/%ld free\n", n, n);
+        } else {
+            std::fprintf(stderr,
+                "warning: v3 limits: NIX_V3_BOEHM_FREE_DIV='%s' is not a "
+                "valid integer in [1, 1000]; gate ignored\n", v);
+        }
+    }
+
+    // (Removed: NIX_V3_BOEHM_UNMAP_THRESHOLD — Boehm 8.2.8's public
+    //  API doesn't expose `GC_set_unmap_threshold` as a setter.  The
+    //  build-time `GC_UNMAP_THRESHOLD` macro controls this in the
+    //  collector itself; runtime tuning would need a Boehm patch.
+    //  The Boehm-internal default of 6 is in effect.  If the
+    //  measurement spike shows headroom from forced unmap, we can
+    //  call `GC_gcollect_and_unmap()` periodically from checkLimits
+    //  — but that's a separate gate.  Removing the unsupported gate
+    //  per [[falsification-rule]] — don't add gates that don't fire.)
+
     st.evalStart = std::chrono::steady_clock::now();
 
     _limitsActiveGlobal = (st.maxHeapBytes > 0)
