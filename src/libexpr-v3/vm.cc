@@ -26,6 +26,7 @@
 #include "v3/bytecode_primops.hh"
 #include "v3/limits.hh"
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
+#include "v3/major_scavenge.hh"  // Stage 6 runMajorScavenge dispatch trigger
 
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
@@ -2685,6 +2686,72 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
         }
         skip_scavenge:;
+        // Stage 6 Day 3 Step 7 — major-scavenge trigger.
+        //
+        // Per STAGE_6_IMPLEMENTATION_GUIDE_2026-05-27.md §"Day 3"
+        // + the analysis in STAGE_6_DAY_3_CELL_FORWARDING_ANALYSIS:
+        //
+        // Gate: NIX_V3_MAJOR_GC=1 (default OFF).  When enabled,
+        // fires runMajorScavenge when arena's active region grows
+        // past NIX_V3_MAJOR_GC_THRESHOLD_MB (default 256 MB).
+        //
+        // Nested-VMState defer mirrors nursery scavenger logic:
+        // major scavenge has the SAME safe-point constraint
+        // (C-locals in primop bodies that hold arena pointers
+        // would dangle if scavenge moved their referent cells).
+        //
+        // Steps 1+2+3+5 ensure correctness on common pointer
+        // paths (typed forwarding tables, standalone cells,
+        // Thunk::cell + shapeCell, Tag::Slot Bindings-resident).
+        // Step 6 (Closure/Thunk-internal slot targets) remains
+        // a Day-4 follow-up; rare let-rec patterns may surface
+        // bugs.
+        //
+        // Independent of nursery state — major scavenge operates
+        // on the tenured arena, which exists whether or not the
+        // nursery is enabled.
+        static const bool s_majorGcEnabled =
+            std::getenv("NIX_V3_MAJOR_GC") != nullptr;
+        if (__builtin_expect(s_majorGcEnabled, 0)) [[unlikely]] {
+            static const size_t s_majorGcThresholdBytes = [] {
+                const char * v =
+                    std::getenv("NIX_V3_MAJOR_GC_THRESHOLD_MB");
+                long mb = 256;
+                if (v) {
+                    long parsed = std::strtol(v, nullptr, 10);
+                    if (parsed >= 16 && parsed <= 32768) mb = parsed;
+                }
+                return static_cast<size_t>(mb) << 20;
+            }();
+            Arena & arena = threadArena();
+            if (arena.bytesAllocated() >= s_majorGcThresholdBytes
+                && exitDepth == 0)
+            {
+                // Nested-VMState defer (same as nursery).
+                bool nestedDistinct = false;
+                for (VMState * vmp : activeVMStack()) {
+                    if (vmp && vmp != &vm) {
+                        nestedDistinct = true;
+                        break;
+                    }
+                }
+                if (!nestedDistinct) {
+                    // Sync ip into the frame so the scavenger
+                    // walks a consistent VM state.
+                    if (!vm.frames.empty()) vm.frames.back().ip = ip;
+                    runMajorScavenge(vm);
+                    // Frame pointers may have been forwarded.
+                    // Re-read dispatch locals.
+                    if (!vm.frames.empty()) {
+                        auto & f = vm.frames.back();
+                        cu        = f.cu;
+                        closure   = f.closure;
+                        stackBase = f.stackBaseOffset;
+                        ip        = f.ip;
+                    }
+                }
+            }
+        }
         // V3_DBG_TRACE_THUNK_BODY: print this instruction if the current
         // frame is a thunk frame matching the configured codeOffset/nUp.
         // Profile (sample on fib38) showed this branch alone consumed

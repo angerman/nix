@@ -56,9 +56,21 @@ inline void walkOneVMState(VMState & vm, RootVisitor & visitor) noexcept
             visitor.visitThunk(f.thunk);
         }
         if (f.forceWriteTarget) {
-            // The cell pointer itself is tenured (allocValue), but its
-            // CONTENT may carry a payload to visit.  Walk through.
-            visitor.visitValue(*f.forceWriteTarget);
+            // Stage 6 Day 3 Step 7: forward the cell-pointer ITSELF
+            // first (via visitSlot).  If the cell is a standalone
+            // allocValue registered in standaloneCellRoots() and the
+            // scavenger's walkStandaloneCells has already moved it,
+            // visitSlot rewrites f.forceWriteTarget to the new
+            // backup-resident address.  Then walk through to the
+            // cell's content payload.
+            //
+            // For nursery scavenges (gc.cc has its own walker — does
+            // not call walkOneVMState) tenured cells aren't moved, so
+            // this is a no-op there.  For non-moving visitors
+            // (NoOp default + auditor) visitSlot is also a no-op.
+            visitor.visitSlot(f.forceWriteTarget);
+            if (f.forceWriteTarget)
+                visitor.visitValue(*f.forceWriteTarget);
         }
     }
 }
