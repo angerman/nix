@@ -255,14 +255,36 @@ public:
     /// the fill threshold and a scavenge should run.  Cheap branch
     /// in the dispatch hot path; the actual scavenge cost is paid
     /// only when this fires.
+    ///
+    /// Threshold default: 75 % fill.  Per `PHASE_E_V02_DAY2_
+    /// FALSIFIED_2026-05-27.md` Path A + B: the 75 % threshold
+    /// allows opcode bodies that allocate-many-objects-in-succession
+    /// to overflow within a single opcode, bypassing the scavenger
+    /// trigger (which only fires at dispatch-loop top, between
+    /// opcodes).  Path B measured hit rate 19-31 % on HNE / hello —
+    /// the architectural safe-point model + 75 % threshold leaves
+    /// 81 % / 69 % of allocations bypassing the nursery.
+    ///
+    /// `NIX_V3_NURSERY_TRIGGER_PCT=N` (1..99) overrides the default
+    /// to fire scavenge at N % fill.  Lower N → more frequent scavenge
+    /// → less per-opcode overflow → higher hit rate.  But each
+    /// scavenge has fixed cost (root walk + copy survivors); more
+    /// scavenges = more cumulative wall cost.  Pre-committed for
+    /// the Path A iteration:
+    ///   N = 75 (default): hit rate 19-31 %, RSS regression 100+ MB
+    ///   N = 50: expected hit rate ~50 %, wall regression ?
+    ///   N = 25: expected hit rate ~75 %, more wall cost ?
+    /// Measure each step against the SHIP gate (RSS Δ ≤ 50 MB).
     bool shouldScavenge() const noexcept
     {
         if (!enabled || !base) return false;
-        // 75% fill: leaves headroom so a single opcode that
-        // allocates several objects in succession doesn't get
-        // half-way through and overflow before the next loop top
-        // can call maybeScavenge.
-        size_t threshold = sizeBytes - (sizeBytes >> 2);
+        // `triggerPct` is set in initLazy from
+        // NIX_V3_NURSERY_TRIGGER_PCT (default 75).  Threshold =
+        // sizeBytes * triggerPct / 100.  size_t arithmetic; the
+        // intermediate sizeBytes * 100 doesn't overflow for any
+        // sane nursery size (< 100 MB), and the multiply-then-
+        // divide avoids floating-point on the hot path.
+        size_t threshold = (sizeBytes * triggerPct) / 100;
         return size_t(next - base) >= threshold;
     }
 
@@ -443,6 +465,12 @@ private:
             if (v > 0 && v < 4096) mb = static_cast<size_t>(v);
         }
         sizeBytes = mb * (size_t(1) << 20);
+        // Path A (2026-05-27) trigger-percent env-override.  Clamped
+        // to [1, 99] to keep the shouldScavenge() arithmetic sane.
+        if (const char * tp = std::getenv("NIX_V3_NURSERY_TRIGGER_PCT")) {
+            long v = std::strtol(tp, nullptr, 10);
+            if (v >= 1 && v <= 99) triggerPct = static_cast<uint32_t>(v);
+        }
         // calloc gives zero-filled pages; matches arena behaviour
         // (zero-fill avoids stale ptr-shaped bytes that would
         // confuse Boehm's conservative scan if the nursery's
@@ -542,6 +570,13 @@ private:
     char *   next    = nullptr;
     char *   end     = nullptr;
     size_t   sizeBytes = 0;
+    // Path A (2026-05-27, per PHASE_E_V02_DAY2_FALSIFIED_2026-05-27):
+    // scavenge-fire threshold as percent of nursery size.
+    // Default 75 % (legacy behaviour).  Env-overridable via
+    // `NIX_V3_NURSERY_TRIGGER_PCT=N` for N in [1, 99].  Lower N →
+    // scavenge fires sooner → higher hit rate at cost of more
+    // scavenge cycles.  Set in initLazy().
+    uint32_t triggerPct = 75;
     uint64_t allocCount    = 0;
     uint64_t allocBytes    = 0;
     uint64_t overflowCount = 0;
