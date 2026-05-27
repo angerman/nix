@@ -18,6 +18,7 @@
 #include "v3/import_timing.hh"  // #769 per-import phase totals
 #include "v3/disk_cache.hh"     // #770 cache-hit/miss stats dump
 #include "v3/cache_probe.hh"    // #827 / A3 per-call-site cache-hook dump
+#include "v3/precise_root.hh"   // 2026-05-27 Stage 3: dumpAllV3Roots diagnostic
 #include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/disasm.hh"         // #778 opcount dumper — opName()
 #include "v3/bytecode.hh"
@@ -527,6 +528,12 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             "(time spent in full collections during process lifetime)\n",
             (unsigned long long)boehmGcNo,
             (unsigned long)boehmGcMs);
+        // 2026-05-27 Stage 3 precise-root foundation: opt-in dump
+        // (V3_DBG_ROOT_DUMP=1) of every reachable v3-heap root
+        // pointer.  No-op when env-var unset; near-zero cost when
+        // set (one walk of the root sources).
+        // See lode/GC_PRECISE_ROOT_FOUNDATION_2026-05-27.md.
+        dumpAllV3Roots();
         // #660 verification: dump bridge-primop call counts.  v3-eval
         // already does this via its own NIX_VM_STATS path; mirror here
         // so the integrated `nix` CLI (and any future v3 driver that

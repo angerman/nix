@@ -130,6 +130,10 @@ lib_sources = files(
   'gc.cc',
   # Phase D write-barriers (Stage 3 prereq): NURSERY_PHASE_D_DECISION_2026-05-21.md
   'barrier.cc',
+  # Stage 3 of precise-root foundation: walkAllV3Roots(VMState &, RootVisitor &).
+  # See lode/GC_PRECISE_ROOT_FOUNDATION_2026-05-27.md.  Foundation for
+  # replacing Boehm conservative scan of the v3 arena.
+  'precise_root.cc',
   # #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
   'dedup_survey.cc',
   'disasm.cc',
