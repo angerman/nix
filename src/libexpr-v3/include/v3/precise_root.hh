@@ -22,16 +22,18 @@
 ///                                    nested runFunctionWithUpvalues)
 ///   5. `standaloneCellRoots()`     — manually-registered Values
 ///                                    (singletons, transient cells)
-///   6. FFI bridge tables (TODO)    — TW handles into v3 lists/
-///                                    attrsets; currently scanned
-///                                    conservatively via Boehm
-///   7. `cellOwnerTable()` (TODO)   — Value-cell → owning-Thunk map
-///   8. `drvHashCacheMap()` (TODO)  — in-memory derivation eval
-///                                    result cache
+///   6. `walkV3BridgeRoots()`       — v3BridgeClosures / Attrs /
+///                                    Lists FFI handle tables
+///   7. `walkImportCacheRoots()`    — in-memory primImport result
+///                                    cache
 ///
-/// Sources 6-8 are TODOs because they require API exposure from
-/// primops.cc / value_serialize.cc; subsequent Stage-3 sub-commits
-/// will add the bridge-table walker etc.
+/// NOT root sources (audited and intentionally excluded):
+///   * `cellOwnerTable()` — METADATA only; every Thunk* in the
+///     table is also reachable via the owning cell (sources 1, 5,
+///     dirty list).  Walking would double-count.
+///   * `drvHashCacheMap()` — holds SERIALIZED BYTES (std::string),
+///     not live v3 Value pointers.  No v3-heap pointer reaches the
+///     cache.
 ///
 /// Visitor pattern: subclasses override the per-pointer-type
 /// callbacks for type-specific logic (e.g., moving GC uses different
@@ -131,17 +133,14 @@ struct NopRootVisitor : RootVisitor
 
 /// Walk every v3-heap root reachable from a root source.
 ///
-/// Stage 3 coverage (this commit):
+/// Stage 3 coverage (complete as of 2026-05-27):
 ///   * `vm.frames`       — closure, thunk, forceWriteTarget
 ///   * `vm.valueStack`
 ///   * `vm.withStack`
 ///   * `activeVMStack()` — other VMStates
 ///   * `standaloneCellRoots()` — registered Value cells
-///
-/// Future coverage (subsequent Stage-3 sub-commits):
-///   * v3BridgeLists / v3BridgeAttrsets (FFI handle tables)
-///   * cellOwnerTable
-///   * drvHashCacheMap
+///   * `walkV3BridgeRoots()` — FFI bridge tables (closures + attrs + lists)
+///   * `walkImportCacheRoots()` — primImport result cache
 ///
 /// The visitor receives every pointer slot — including null pointers,
 /// which it can ignore.  No transitive walk: the visitor decides

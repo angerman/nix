@@ -19,9 +19,11 @@
 #include "v3/precise_root.hh"
 #include "v3/vm.hh"
 #include "v3/barrier.hh"
+#include "v3/primop.hh"   // walkV3BridgeRoots, walkImportCacheRoots
 
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <unordered_set>
 
 namespace nix::v3 {
@@ -86,22 +88,49 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
         if (cell) visitor.visitValue(*cell);
     }
 
-    // -- TODO: FFI bridge tables (v3BridgeLists / v3BridgeAttrsets)
-    // These hold v3 Value handles that TW indexes into.  Currently
-    // kept alive via Boehm conservative scan.  Subsequent Stage-3
-    // sub-commit will expose the iterator surface in primops.cc and
-    // wire it here.
+    // -- FFI bridge tables (Stage 3 sub-source 6) -------------------
+    // v3BridgeClosures / v3BridgeAttrs / v3BridgeLists hold v3 Value
+    // handles that TW indexes into via the bridge primops.  Each
+    // entry stores a Value at a stable address; the entry can carry
+    // any payload tag, so we route via visitValue's tag dispatch.
+    //
+    // primops.cc already exposes `walkV3BridgeRoots` (declared in
+    // primop.hh) — used by the nursery scavenger and the auditor.
+    // Reuse it here with a std::function adapter so the Stage 3
+    // walker doesn't duplicate the table-iteration logic.
+    {
+        std::function<void(Value &)> adapter =
+            [&visitor](Value & v) { visitor.visitValue(v); };
+        walkV3BridgeRoots(adapter);
+    }
 
-    // -- TODO: cellOwnerTable --------------------------------------
-    // alloc.hh keeps a Value*→Thunk* map for cell ownership.  Some
-    // entries are reachable from the dirty-list / frames already
-    // walked; others (e.g., owned by code that's exited the frame
-    // but whose cell is still live) need explicit walking.  Audit
-    // pending.
+    // -- Import cache roots (Stage 3 sub-source 7) -----------------
+    // primImport caches results in an in-memory map.  Entries hold
+    // v3 Value payloads (typically Tag::Attrs for imported nixpkgs
+    // modules) that survive across primImport calls.  Same adapter
+    // pattern as the bridge tables.
+    {
+        std::function<void(Value &)> adapter =
+            [&visitor](Value & v) { visitor.visitValue(v); };
+        walkImportCacheRoots(adapter);
+    }
 
-    // -- TODO: drvHashCacheMap -------------------------------------
-    // In-memory Value cache for derivation eval results.  Survives
-    // across primDerivationStrict calls within a process.
+    // -- NOTE: cellOwnerTable ---------------------------------------
+    // alloc.hh::cellOwnerTable() maps cells→owning-Thunk*.  Audit
+    // concluded this is METADATA, not a unique root source: a Thunk
+    // present in cellOwnerTable is always also reachable via the
+    // owning cell (which IS walked through standalone roots / dirty
+    // list / frames).  Walking the table separately would
+    // double-count.  Left out by design — comment kept so future
+    // audits don't reopen this question.
+
+    // -- NOTE: drvHashCacheMap --------------------------------------
+    // value_serialize.cc::drvHashCacheMap() is a `std::string →
+    // std::string` map of drvPath → SERIALIZED-BYTES.  The values
+    // are BYTES (a v3 Value blob's wire format), not live v3 Value
+    // pointers.  C++ std::string manages the bytes' lifetime; no
+    // v3-heap pointer reaches into this cache.  NOT a precise-root
+    // source.  Comment kept for the same reason as cellOwnerTable.
 }
 
 namespace {
@@ -167,13 +196,17 @@ void dumpAllV3Roots() noexcept
         walkedVm = true;
     }
     // Even when no VMState is active, walk the global roots: the
-    // singleton standalone cells survive across eval scopes and are
-    // a real component of the root set the future precise GC must
-    // cover.
+    // singleton standalone cells + FFI bridge tables survive across
+    // eval scopes and are a real component of the root set the
+    // future precise GC must cover.
     if (!walkedVm) {
         for (Value * cell : standaloneCellRoots()) {
             if (cell) dv.visitValue(*cell);
         }
+        std::function<void(Value &)> adapter =
+            [&dv](Value & v) { dv.visitValue(v); };
+        walkV3BridgeRoots(adapter);
+        walkImportCacheRoots(adapter);
     }
 
     std::fprintf(stderr,
