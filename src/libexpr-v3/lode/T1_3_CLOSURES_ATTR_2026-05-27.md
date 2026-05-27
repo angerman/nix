@@ -35,24 +35,52 @@ at OP_RETURN.
 
 * **144 MB on HNE is VM-internal overhead**, not user-visible
   allocation.
-* avg-nUp for fakeClo sites is 2.16 / 1.91 — well within the pool's
-  per-bucket range (kPoolMaxBuckets=16).
-* Yet 2.3 M fresh allocations were recorded, suggesting the existing
-  pool (kPoolPerBucket=128 × kPoolMaxBuckets=16 = 2048 slots total)
-  isn't catching enough recycles.
+* avg-nUp for fakeClo sites is 2.16 / 1.91 — well within historical
+  pool's per-bucket range (kPoolMaxBuckets=16).
 
-Three possible mechanisms for the leak:
-1. **Pool size too small for HNE concurrency** — bursts of
-   simultaneous thunk forces overflow the 128-slot per-bucket
-   limit; spillover allocates fresh.
-2. **Recycle gate too narrow** — recycle path may have early-out
-   conditions (per the alloc.hh comments, "fakeClos eligible for
-   pooling; OP_CALL frames' closures... not pooled").
-3. **Exception unwind paths skip recycle** — if a thunk body throws,
-   the OP_RETURN-side recycle doesn't fire, and the fakeClo leaks
-   to (effective) tenured arena.
+## Root cause — the fakeClo pool was RETIRED, nursery hasn't replaced it by default
 
-Each is a focused 1-day debugging task with measurable yield.
+Followed up on 2026-05-27 by checking the existing `alloc.hh:1069-
+1230` fakeClo pool's hit rate (added counters, ran HNE).  Result:
+**hits=0, misses=0, recycles=0** — the pool is DEAD CODE.
+
+Source: `vm.cc:6803` comment block (Phase D Step 12, 2026-05-21):
+
+> Phase D Step 12 (2026-05-21): retired the fakeClo / closure-pool
+> sentinel infrastructure.  Pool reuse saved a hand-rolled allocation,
+> but the Cheney nursery (NIX_V3_NURSERY=1) provides real generational
+> reclamation: fresh closures land in nursery, scavenge collects
+> unreferenced ones at next cycle.  Pool was load-bearing only before
+> nursery + Phase D landed.
+
+In production code, `vm.cc:6803` + `vm.cc:12085` call
+`Alloc::allocClosure(t->nUpvalues)` directly — bypassing the pool
+entirely.  `Alloc::allocFakeClo` and `Alloc::recycleFakeClo` have ZERO
+callers anywhere in the codebase.  The infrastructure sits in
+`alloc.hh:1069-1230` as dormant code.
+
+**The 144 MB overhead exists BECAUSE**:
+* Pool retired Phase D Step 12
+* Nursery (its replacement) is opt-in via `NIX_V3_NURSERY=1`,
+  default-OFF per CLAUDE.md §6.3 "Phase E v0.2 stress-mode missed-
+  root resolution" — known blocker
+
+## The actual remaining levers
+
+1. **Resolve Phase E v0.2 stress-mode missed-root, default-on nursery**
+   (~1-3 days per CLAUDE.md §6.3) — gives the closures generational
+   reclamation; recovers the 144 MB on HNE; aligned with architectural
+   direction.
+2. **Revive the pool as a fallback when nursery is off** (~1 day)
+   — call `Alloc::allocFakeClo` from `vm.cc:6803` + `vm.cc:12085`,
+   call `Alloc::recycleFakeClo` at the OP_RETURN cleanup site.
+   The infrastructure is intact; just needs callers re-wired.
+   Recovers 144 MB until (1) lands.
+3. **Make the closure smaller per-instance** — orthogonal; touches
+   the `Closure` struct shape rather than the lifecycle.
+
+Either (1) or (2) closes the lever.  (1) is preferred (architectural
+direction).  (2) is a tactical mitigation while (1) is in flight.
 
 ## Cross-comparison: Thunks (T1_3_THUNKS) vs Closures (this doc)
 
