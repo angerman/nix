@@ -2574,4 +2574,168 @@ inline void dumpListsAttribution(std::FILE * out, size_t topN = 20) noexcept
     }
 }
 
+// ---------------------------------------------------------------------------
+// T1.3 unified cross-type allocation attribution dump (2026-05-27).
+// Aggregates the top allocation sites across Closures + Thunks + Pairs
+// + Lists into a single sorted-by-bytes table.  Useful for "where is
+// the memory going" overview without scanning four separate dumps.
+//
+// Gate: `NIX_V3_ALLOC_ATTR=1` is the master switch.  When set, the
+// individual NIX_V3_*_ATTR gates above must ALSO be set to populate
+// their respective tables.  For convenience, this dump function
+// internally reads from whichever tables are populated.
+//
+// Each table is keyed differently (Closure*, Thunk*, ValuePair*,
+// ListVec*) but all converge to per-(file, line) Rollup entries.
+// We emit a "Type" column so users can identify which Tag a site
+// allocates.
+// ---------------------------------------------------------------------------
+
+inline void dumpAllocAttribution(std::FILE * out, size_t topN = 30) noexcept
+{
+    static const bool s_enabled =
+        std::getenv("NIX_V3_ALLOC_ATTR") != nullptr;
+    if (!s_enabled) return;
+
+    struct Row {
+        const char * type;     // "Closure" / "Thunk" / "Pair" / "List"
+        const char * file;
+        uint32_t     line;
+        uint64_t     allocCount;
+        uint64_t     totalBytes;
+    };
+    std::vector<Row> rows;
+    rows.reserve(256);
+
+    // -- Closures --------------------------------------------------
+    {
+        struct Key { const char * file; uint32_t line; };
+        struct KeyHash { size_t operator()(const Key & k) const noexcept {
+            return reinterpret_cast<size_t>(k.file) * 1000003u + size_t(k.line); } };
+        struct KeyEq { bool operator()(const Key & a, const Key & b) const noexcept {
+            return a.file == b.file && a.line == b.line; } };
+        std::unordered_map<Key, Row, KeyHash, KeyEq> agg;
+        for (const auto & kv : closureOriginTable()) {
+            const Closure * c = kv.first;
+            const ClosureOrigin & o = kv.second;
+            if (!c || !o.file) continue;
+            Key k{o.file, o.line};
+            auto & r = agg[k];
+            r.type = "Closure"; r.file = o.file; r.line = o.line;
+            ++r.allocCount;
+            r.totalBytes += sizeof(Closure) + sizeof(Value) * uint64_t(o.nUpvalues);
+        }
+        for (auto & kv : agg) rows.push_back(kv.second);
+    }
+
+    // -- Thunks ----------------------------------------------------
+    {
+        struct Key { const char * file; uint32_t line; };
+        struct KeyHash { size_t operator()(const Key & k) const noexcept {
+            return reinterpret_cast<size_t>(k.file) * 1000003u + size_t(k.line); } };
+        struct KeyEq { bool operator()(const Key & a, const Key & b) const noexcept {
+            return a.file == b.file && a.line == b.line; } };
+        std::unordered_map<Key, Row, KeyHash, KeyEq> agg;
+        for (const auto & kv : thunkOriginTable()) {
+            const Thunk * t = kv.first;
+            const ThunkOrigin & o = kv.second;
+            if (!t || !o.file) continue;
+            Key k{o.file, o.line};
+            auto & r = agg[k];
+            r.type = "Thunk"; r.file = o.file; r.line = o.line;
+            ++r.allocCount;
+            r.totalBytes += sizeof(Thunk) + sizeof(Value) * uint64_t(o.nUpvalues);
+        }
+        for (auto & kv : agg) rows.push_back(kv.second);
+    }
+
+    // -- Pairs -----------------------------------------------------
+    {
+        struct Key { const char * file; uint32_t line; };
+        struct KeyHash { size_t operator()(const Key & k) const noexcept {
+            return reinterpret_cast<size_t>(k.file) * 1000003u + size_t(k.line); } };
+        struct KeyEq { bool operator()(const Key & a, const Key & b) const noexcept {
+            return a.file == b.file && a.line == b.line; } };
+        std::unordered_map<Key, Row, KeyHash, KeyEq> agg;
+        for (const auto & kv : pairOriginTable()) {
+            const ValuePair * p = kv.first;
+            const PairOrigin & o = kv.second;
+            if (!p || !o.file) continue;
+            Key k{o.file, o.line};
+            auto & r = agg[k];
+            r.type = "Pair"; r.file = o.file; r.line = o.line;
+            ++r.allocCount;
+            r.totalBytes += sizeof(ValuePair);
+        }
+        for (auto & kv : agg) rows.push_back(kv.second);
+    }
+
+    // -- Lists -----------------------------------------------------
+    {
+        struct Key { const char * file; uint32_t line; };
+        struct KeyHash { size_t operator()(const Key & k) const noexcept {
+            return reinterpret_cast<size_t>(k.file) * 1000003u + size_t(k.line); } };
+        struct KeyEq { bool operator()(const Key & a, const Key & b) const noexcept {
+            return a.file == b.file && a.line == b.line; } };
+        std::unordered_map<Key, Row, KeyHash, KeyEq> agg;
+        for (const auto & kv : listOriginTable()) {
+            const ListVec * l = kv.first;
+            const ListOrigin & o = kv.second;
+            if (!l || !o.file) continue;
+            Key k{o.file, o.line};
+            auto & r = agg[k];
+            r.type = "List"; r.file = o.file; r.line = o.line;
+            ++r.allocCount;
+            r.totalBytes += sizeof(ListVec) + sizeof(Value) * uint64_t(o.size);
+        }
+        for (auto & kv : agg) rows.push_back(kv.second);
+    }
+
+    if (rows.empty()) {
+        std::fprintf(out,
+            "v3-direct alloc-attr: empty (NIX_V3_ALLOC_ATTR=1 set but no\n"
+            "  per-type recording gates — set at least one of\n"
+            "  NIX_V3_CLOSURES_ATTR / NIX_V3_THUNKS_ATTR /\n"
+            "  NIX_V3_PAIRS_ATTR / NIX_V3_LISTS_ATTR)\n");
+        return;
+    }
+
+    std::sort(rows.begin(), rows.end(),
+        [](const Row & a, const Row & b) {
+            if (a.totalBytes != b.totalBytes) return a.totalBytes > b.totalBytes;
+            return a.allocCount > b.allocCount;
+        });
+
+    uint64_t grandBytes = 0, grandAllocs = 0;
+    for (const auto & r : rows) {
+        grandBytes  += r.totalBytes;
+        grandAllocs += r.allocCount;
+    }
+    const size_t n = std::min(rows.size(), topN);
+    std::fprintf(out,
+        "\nv3-direct alloc-attr unified: %zu sites tracked, %llu total allocs, "
+        "%.1f MB cross-type (top %zu):\n",
+        rows.size(),
+        (unsigned long long)grandAllocs,
+        double(grandBytes) / (1024.0 * 1024.0),
+        n);
+    std::fprintf(out,
+        "  %-8s %-50s %12s %10s   %5s\n",
+        "Type", "Origin (file:line)", "allocs", "MB", "%cumul");
+    uint64_t cumBytes = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const auto & r = rows[i];
+        cumBytes += r.totalBytes;
+        const double mb = double(r.totalBytes) / (1024.0 * 1024.0);
+        const double cumPct = grandBytes > 0
+            ? 100.0 * double(cumBytes) / double(grandBytes) : 0.0;
+        char buf[80];
+        std::snprintf(buf, sizeof(buf), "%s:%u",
+            r.file ? r.file : "<null>", r.line);
+        std::fprintf(out,
+            "  %-8s %-50s %12llu  %8.2f  %5.1f%%\n",
+            r.type, buf, (unsigned long long)r.allocCount, mb, cumPct);
+    }
+}
+
 } // namespace nix::v3

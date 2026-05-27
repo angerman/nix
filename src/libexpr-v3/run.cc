@@ -1055,6 +1055,13 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // No-op when NIX_V3_PAIRS_ATTR / NIX_V3_LISTS_ATTR unset.
         dumpPairsAttribution(stderr);
         dumpListsAttribution(stderr);
+        // T1.3 (2026-05-27) unified cross-type allocation attribution.
+        // Master gate: NIX_V3_ALLOC_ATTR=1.  Aggregates the top sites
+        // across Closures + Thunks + Pairs + Lists into a single
+        // sorted-by-bytes table with a Type column.  Useful overview
+        // of "where the memory is going" without scanning four
+        // separate dumps.
+        dumpAllocAttribution(stderr);
         // #751 (2026-05-21) "elsewhere" attribution.  After #750 the
         // v3_arena dropped 386 MB but peak_rss dropped only 248 MB;
         // the "elsewhere" share (RSS - boehm_heap - v3_arena) grew
