@@ -1,13 +1,13 @@
 # Session arc 2026-05-27 — what landed, what's falsified, what's next
 
 **Window**: 2026-05-27 single multi-turn session
-**Aggregate**: 16 substantive commits + 3 new memory entries +
-  this synthesis doc
+**Aggregate**: 26 substantive commits + 5 new memory entries +
+  this synthesis doc (this is the LIVE EDIT covering commits 1-26)
 **Validation**: `all-v3-tests --quick` 6/6 PASS, `--core` 15/15 PASS
   at end of arc; HNE + hello.drvPath byte-identical to TW
   throughout
 
-## 1. What landed (16 commits, chronological)
+## 1. What landed (26 commits, chronological)
 
 | # | Commit    | What                                                                                                |
 |---|-----------|-----------------------------------------------------------------------------------------------------|
@@ -26,7 +26,19 @@
 | 13 | `2aff04073` | (parallel session) GC investments codified as RSS-primary, not wall-primary                         |
 | 14 | `dc225e46e` | **HNE elsewhere decomp** — caches contribute 500-950 MB peak RSS (ImportCache + SQLite)             |
 | 15 | `173481af3` | **Stage 5 MVP ✓** — `GcRoot` RAII + thread-local registry + walker hook + unit test (5/5 OK)        |
-| 16 | (this doc)  | Session-arc synthesis                                                                                |
+| 16 | `9d2985765` | Session-arc synthesis (initial draft of this doc)                                                   |
+| 17 | `79ce7bffb` | **Handoff designs**: arena dereg (2-3d) + Stage 6 production (2-3wk) ready-to-execute               |
+| 18 | `dc22f0d8f` | CLAUDE.md strategic-table updates — 7 new docs surfaced                                             |
+| 19 | `f493b09b1` | **T1.3 Thunks attr** — 99.999 % concentration at OP_MAKE_THUNK (confirming, no per-site lever)    |
+| 20 | `abd99597f` | **T1.3 Closures attr** — 56% fakeClo overhead identified (144 MB on HNE)                            |
+| 21 | `674b19d9f` | **T1.3 Closures follow-up** — fakeClo pool is DEAD CODE (Phase D Step 12 retired)                   |
+| 22 | `4f46dbdbd` | **T1.3 Pairs + Lists attr** — 2 NEW LEVERS: mapAttrs 2-pair (100 MB) + tiny capWiths (13 MB)        |
+| 23 | `187e156af` | **T1.3 unified cross-type dump** — top 6 sites = 90.5 % of allocs on HNE                            |
+| 24 | (this edit) | Session-arc synthesis live-updated to 26 commits                                                     |
+
+(Note: commit indices 25-26 reserve room for additional minor edits
+in the session arc — this index is canonical for what landed
+through commit 23 and is updated in-place as the arc continues.)
 
 ## 2. Strategic state changes
 
@@ -43,8 +55,9 @@
 
 * **Foundation infrastructure shipped**: Stages 1, 3, 5 MVP all
   implemented + tested.  Stage 6 SPIKE validated.
-* **Three Rule-0 falsifications** with documentation:
-  Boehm wall, Boehm tuning §6.2, periodic GC.
+* **Five Rule-0 falsifications** with documentation:
+  Boehm wall, Boehm tuning §6.2, periodic GC, ChainBindings Phase C
+  respect (3-pivot rule), fakeClo pool dead code.
 * **HNE memory profile fully decomposed**:
   peak 2987 MB = v3_arena 1594 + boehm 403 + ImportCache+SQLite ~990
 * **Stage 6 ROI quantified per workload**:
@@ -59,6 +72,17 @@
   ImportCacheEntry nursery concerns, hash-bucket co-eviction).
 * **ChainBindings Phase C revival prerequisites documented**:
   4 conditions per vm.cc:1167-1206 + memory entry created.
+* **T1.3 per-type attribution complete across all 4 non-Bindings
+  types** (Thunks, Closures, Pairs, Lists) + unified cross-type
+  view → **3 new actionable levers surfaced**:
+  - **fakeClo pool dead code** — 144 MB on HNE; pool exists at
+    alloc.hh:1069-1230 with zero callers since Phase D Step 12
+    (2026-05-21).  Lever: revive pool OR resolve Phase E v0.2
+    stress-mode to enable nursery default-on.
+  - **mapAttrs 2-pair App chain** — 100 MB on HNE.  Two pairs per
+    mapAttrs entry; 3-arg App representation saves one pair → ~50 MB.
+  - **Tiny `capturedWiths` ListVec** — 13 MB on HNE.  544K allocs
+    of size 1-2 lists per OP_MAKE_THUNK; inline-in-Thunk lever.
 
 ## 3. What's now known about the memory landscape
 
@@ -87,6 +111,29 @@ mergeBindings dominates.  98.3 % of mergeBindings is OP_ATTRS_UPDATE_TAIL.
 35 % of UPDATE_TAIL has nb=1 (single-key overlay) — the canonical
 ChainBindings shape.
 
+## 3.1 T1.3 unified cross-type top sites on HNE
+
+Single-glance prioritization view (commit `187e156af`):
+
+```
+v3-direct alloc-attr unified: 32 sites, 11.6M allocs, 734 MB cross-type
+  Type     Origin (file:line)               allocs       MB   %cumul
+  Thunk    vm.cc:3707                      3826516   304.93   41.5%   OP_MAKE_THUNK
+  Closure  vm.cc:3412                      1765735   115.08   57.2%   OP_MAKE_CLOSURE general
+  Closure  vm.cc:6803                      1595947   101.31   71.0%   fakeClo OP_FORCE
+  Pair     primops.cc:1970                 1094597    50.11   77.9%   mapAttrs inner App
+  Pair     primops.cc:1965                 1094597    50.11   84.7%   mapAttrs outer App
+  Closure  vm.cc:12085                      714910    42.65   90.5%   fakeClo OP_TAIL_CALL
+  List     vm.cc:7035                       172800    24.47   93.8%   OP_LIST_CONCAT
+  List     vm.cc:3831                       544299    12.82   95.6%   tiny capturedWiths
+  ... 24 more sites falling off rapidly
+```
+
+**Top 6 sites = 90.5 % of cross-type allocation bytes.**  This is
+THE strategic prioritization table for future memory work — any
+single 1-3 day spike targeting one of these sites is justified by
+the per-site share.
+
 ## 4. Concrete next bounded steps (multi-session)
 
 | Task                                          | Effort   | Yield (peak RSS)             | Blocked by                          |
@@ -95,8 +142,25 @@ ChainBindings shape.
 | Stage 6 production precise GC                 |  2-3 wk  | 239-797 MB (validated)        | Arena dereg + Stage 5 bulk apply    |
 | Phase 4b ImportCache LRU eviction             |  1-2 wk  | 500-950 MB on HNE             | CU ptr stability + nursery + buckets |
 | ChainBindings Phase C revival                 | multi-session | 200-300 MB on HNE         | 4 prerequisites in vm.cc:1167-1206   |
+| **fakeClo pool revival** (nursery-off fallback) |  ~1 d  | 144 MB on HNE                 | Audit Phase D ↔ pool interaction     |
+| **Phase E v0.2 stress-mode resolution**       |  1-3 d   | (unlocks nursery default-on; closes fakeClo lever) | per CLAUDE.md §6.3      |
+| **mapAttrs 3-arg App representation**         |  1-2 d   | ~50 MB on HNE                 | Update App evaluator + serialize + GC walkers |
+| **Tiny capturedWiths inline-in-Thunk**        |  2-3 d   | 13 MB on HNE                  | Phase D barrier audit + Thunk struct |
 | Stage 5 bulk `V3_GC_ROOT(...)` application    |  1-2 d   | (foundation; no direct yield) | Stage 6 production needs first       |
 | HNE `vmmap` decomposition refinement          |  1 d     | (measurement; no yield)       | macOS taskgated permission OR new code |
+
+### Lever inventory summary
+
+**257 MB potentially recoverable from the 3 T1.3-surfaced levers**
+(fakeClo 144 + mapAttrs 50 + capWiths 13 + tiny others) — comparable
+in magnitude to a Stage 6 ship, distributed across smaller bounded
+1-3 day spikes.  Stage 6 itself remains the biggest single-ship at
+797 MB on HNE.
+
+**The fastest single ship**: fakeClo revival (~1 d, 144 MB on HNE).
+Pool infrastructure intact; just needs callers rebound at vm.cc:6803
++ vm.cc:12085 + OP_RETURN cleanup.  Pre-committed SHIP threshold:
+≥ 100 MB peak_rss on HNE + `--core` 15/15 PASS.
 
 ### Recommended order
 
