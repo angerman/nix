@@ -1,8 +1,8 @@
 # Session arc 2026-05-27 — what landed, what's falsified, what's next
 
 **Window**: 2026-05-27 single multi-turn session
-**Aggregate**: 31 substantive commits + 5 new memory entries +
-  this synthesis doc (LIVE-UPDATED, covering commits 1-31)
+**Aggregate**: 35 substantive commits + 5 new memory entries +
+  this synthesis doc (LIVE-UPDATED, covering commits 1-35)
 **Validation**: `all-v3-tests --quick` 6/6 PASS, `--core` 15/15 PASS
   at end of arc; HNE + hello.drvPath byte-identical to TW
   throughout
@@ -41,7 +41,33 @@
 | 28 | `d77be72ab` | **`bench/phase-e-stress-validate.sh`** — Day-1 stress validation harness for Phase E v0.2            |
 | 29 | `1efa7c886` | **Live-trace arena-dereg audit** — Tag::External=0 confirmed on hello.drvPath + HNE                  |
 | 30 | `b1fdec503` | **`bench/arena-dereg-audit.sh`** — Day-1 audit harness for arena dereg                               |
-| 31 | (this edit) | Live-update of synthesis + cross-workload External-clean confirmation                              |
+| 31 | `008cc4a05` | Live-update of synthesis + cross-workload External-clean confirmation                              |
+| 32 | `c21026070` | **Phase E v0.2 Day-1 PASS** (correctness) **+ Day-2 FALSIFIED** (RSS regression — DO NOT FLIP)        |
+| 33 | `7bf8986b4` | **Path B nursery-routing diagnostic** — 19% hit rate on HNE / 31% on hello (bypass = THE issue)         |
+| 34 | `d55065889` | **Path A FALSIFIED** — scavenge-trigger tuning bounded by dispatch-loop safe-point cadence              |
+| 35 | `98a372614` | **STAGE_6_IMPLEMENTATION_GUIDE** — day-by-day execution playbook (15-day plan for the next sessions)    |
+
+**Phase E v0.2 thoroughly characterized (commits 32-34)**:
+After the Stage 6 SPIKE confirmed SHIP-GREEN, the architecturally-
+cheaper Phase E v0.2 default-on alternative was systematically
+tested + falsified:
+* **Day-1 stress validation PASSED** on hello/firefox/HNE under
+  `NIX_V3_GC_STRESS=1000` (`bench/phase-e-stress-validate.sh`).
+  AR7 empirically closed.
+* **Day-2 mortality measurement FAILED** the RSS SHIP gate:
+  +129 MB on hello (mortality 56.9%) + +252 MB on HNE (mortality
+  38.3%).  Cheney 2× space overhead exceeds scavenge benefit.
+* **Path B routing data**: nursery hit rate 19% (HNE) / 31%
+  (hello) — 81%/69% of allocations bypass to arena because
+  nursery is FULL.  Real lever is hit rate, not mortality.
+* **Path A trigger tuning FALSIFIED**: lowering 75% threshold to
+  50%/25% doesn't increase scavenge count.  Dispatch-loop
+  safe-point cadence is the bound, not the threshold.
+
+Strategic implication: Phase E v0.2 default-on is architecturally
+constrained.  **Stage 6 production precise GC** is the answer —
+its mark-sweep/compacting over arena doesn't depend on
+dispatch-loop safe-points for arena reclamation.
 
 **Cross-workload External-clean confirmation (commit 31 measurement)**:
 Running `bench/arena-dereg-audit.sh` against the full default set
@@ -75,9 +101,11 @@ for production-class workload patterns.
 
 * **Foundation infrastructure shipped**: Stages 1, 3, 5 MVP all
   implemented + tested.  Stage 6 SPIKE validated.
-* **Five Rule-0 falsifications** with documentation:
+* **Eight Rule-0 falsifications** with documentation:
   Boehm wall, Boehm tuning §6.2, periodic GC, ChainBindings Phase C
-  respect (3-pivot rule), fakeClo pool dead code.
+  respect (3-pivot rule), fakeClo pool dead code, Phase E v0.2
+  default-on flip (Day-2 RSS), Path A trigger tuning, fakeClo pool
+  revival (user pushback — would reverse Phase D Step 12).
 * **HNE memory profile fully decomposed**:
   peak 2987 MB = v3_arena 1594 + boehm 403 + ImportCache+SQLite ~990
 * **Stage 6 ROI quantified per workload**:
@@ -182,24 +210,38 @@ Pool infrastructure intact; just needs callers rebound at vm.cc:6803
 + vm.cc:12085 + OP_RETURN cleanup.  Pre-committed SHIP threshold:
 ≥ 100 MB peak_rss on HNE + `--core` 15/15 PASS.
 
-### Recommended order (per user 2026-05-27 framing)
+### Recommended order (REVISED 2026-05-27 evening after Phase E falsifications)
 
-1. **HNE workaround documented today**: `NIX_V3_NO_DISK_CACHE=1`
+The "Phase E v0.2 default-on" path has been thoroughly tested +
+falsified across Day-1 (PASS), Day-2 (FAIL on RSS), Path B
+(diagnostic), and Path A (FAIL on trigger tuning).  The
+architecturally-aligned path is now direct to Stage 6.
+
+1. **HNE workaround available today**: `NIX_V3_NO_DISK_CACHE=1`
    gives 500-950 MB peak RSS reduction immediately at the cost of
    wall-time on warm-cache scenarios.  Production CI-style evals
    should use this gate.
-2. **First new session — "architecture alignment"**: Phase E v0.2
-   stress resolution per
-   [`PHASE_E_V02_STRESS_DESIGN_2026-05-27.md`](PHASE_E_V02_STRESS_DESIGN_2026-05-27.md).
-   1-3 days.  Closes AR7 + obviates the 144 MB fakeClo lever
-   automatically + aligns Stage 6's semi-space mechanics with
-   what the codebase already exercises.
-3. **Second new session — arena dereg** per
+
+2. **Arena deregistration** (2-3 d) per
    [`ARENA_DEREGISTRATION_DESIGN_2026-05-27.md`](ARENA_DEREGISTRATION_DESIGN_2026-05-27.md).
-   2-3 days.  Unblocks Stage 6 + tests collection-cost.
-4. **Third new session(s) — Stage 6 production** per
-   [`STAGE_6_PRECISE_GC_DESIGN_2026-05-27.md`](STAGE_6_PRECISE_GC_DESIGN_2026-05-27.md).
-   2-3 weeks.  Delivers ≥239 MB hello.drvPath, ≥797 MB HNE.
+   External-tag audit DONE (4-workload PASS via
+   `bench/arena-dereg-audit.sh`).  Independent track; unblocks
+   Stage 6 collection-cost work.
+
+3. **Stage 6 production GC** (2-3 wk = 15-day playbook) per
+   [`STAGE_6_PRECISE_GC_DESIGN_2026-05-27.md`](STAGE_6_PRECISE_GC_DESIGN_2026-05-27.md)
+   + [`STAGE_6_IMPLEMENTATION_GUIDE_2026-05-27.md`](STAGE_6_IMPLEMENTATION_GUIDE_2026-05-27.md).
+   Delivers ≥239 MB hello.drvPath, ≥797 MB HNE (per LIVE_FRACTION
+   SPIKE).  ALSO automatically closes the 144 MB fakeClo lever
+   (the symptom-path Phase E couldn't deliver).
+
+4. **(DEFERRED)** Phase E v0.2 ship-readiness — per Path A + Path
+   B falsifications, architecturally bounded.  Could be revisited
+   AFTER Stage 6 ships if Stage 6 reveals further bottlenecks
+   that Phase E variants could address.  Not on the critical path.
+
+5. **(MULTI-SESSION)** ChainBindings Phase C revival — only when
+   the 4 prerequisites in vm.cc:1167-1206 are met.
 2. **Arena deregistration spike** — 2-3 days, unblocks Stage 6 + tests
    the Boehm-internal collection-cost hypothesis.
 3. **Stage 6 production precise GC** — given the spike is GREEN,
