@@ -279,18 +279,52 @@ void MajorScavenger::walkClosure(Closure * c) noexcept
 
 void MajorScavenger::walkThunk(Thunk * t) noexcept
 {
-    // Thunk's slot pointers (cell + shapeCell) point INTO other
-    // cells in active_ — those cells get copied separately; we
-    // can't rewrite the cell pointer itself (it'd point at the
-    // OLD cell address).  Instead, the cells those pointers
-    // address get visited via Tag::Slot from their owning
-    // Bindings::entries[].  For Day 2.2 safety: leave cell +
-    // shapeCell as-is; they may dangle after swap.  This is a
-    // KNOWN LIMITATION documented for Day 3+ to address via cell
-    // forwarding logic.
+    // Day 3 Step 5: forward Thunk::cell + Thunk::shapeCell.
     //
-    // cellContainer is a Bindings* — that we CAN forward.
+    // Two cases per the Day-3 analysis:
+    //  (a) cellContainer != null — cell points INSIDE a Bindings::
+    //      entries[i].value.  Offset-forward: compute offset within
+    //      the OLD Bindings, look up the new Bindings via
+    //      forwardingBindings_, compute new cell = new Bindings +
+    //      offset.
+    //  (b) cellContainer == null — cell is a standalone allocValue
+    //      cell.  Direct lookup in forwardingCell_ (populated by
+    //      Step 2's walkStandaloneCells).
+    //
+    // We MUST forward cellContainer FIRST so case (a) uses the
+    // up-to-date new Bindings address.
+    Bindings * oldCellContainer = t->cellContainer;
     if (t->cellContainer) t->cellContainer = fwdBindings(t->cellContainer);
+
+    auto forwardCellPtr = [&](Value * & cellSlot) {
+        if (!cellSlot) return;
+        if (oldCellContainer) {
+            // Case (a): offset-forward via cellContainer.
+            auto it = forwardingBindings_.find(oldCellContainer);
+            if (it != forwardingBindings_.end()) {
+                Bindings * newB = it->second;
+                ptrdiff_t offset =
+                    reinterpret_cast<char *>(cellSlot)
+                    - reinterpret_cast<char *>(oldCellContainer);
+                cellSlot = reinterpret_cast<Value *>(
+                    reinterpret_cast<char *>(newB) + offset);
+            }
+            // else: cellContainer wasn't in active (already moved
+            // or external) — leave cell as-is.  Should be rare;
+            // implies the Thunk's cellContainer was external while
+            // its cell pointed into active — inconsistent state.
+        } else {
+            // Case (b): standalone — direct forwarding lookup.
+            auto it = forwardingCell_.find(cellSlot);
+            if (it != forwardingCell_.end())
+                cellSlot = it->second;
+            // else: cell wasn't in active OR Step 2 didn't move
+            // it (cell wasn't in standaloneCellRoots, e.g.,
+            // ephemeral non-registered Values).  Document risk.
+        }
+    };
+    forwardCellPtr(t->cell);
+    forwardCellPtr(t->shapeCell);
 
     switch (t->state) {
     case ThunkState::Suspended:
