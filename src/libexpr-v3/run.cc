@@ -472,9 +472,25 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
 #if NIX_USE_BOEHMGC
         size_t boehmHeap = GC_get_heap_size();
         size_t boehmFree = GC_get_free_bytes();
+        // 2026-05-27: Boehm GC time/count instrumentation — falsifier
+        // gate for "ditch Boehm" perf claims.  GC_get_gc_no() counts
+        // collections; GC_get_full_gc_total_time() returns total time
+        // spent in full collections (milliseconds, accumulates across
+        // process lifetime).  Both APIs are zero-cost reads (atomic
+        // loads of stat counters maintained by the collector).
+        //
+        // If Boehm GC time is sub-1 % of wall, ditching Boehm cannot
+        // deliver wall improvement; the memory-RSS case (~400 MB
+        // peak) becomes the sole motivation, which is bounded by
+        // precise-root infrastructure work (~1-2 weeks) per
+        // IDEAL_GC_DESIGN_2026-05-26.md "no-regret foundations".
+        GC_word boehmGcNo = GC_get_gc_no();
+        unsigned long boehmGcMs = GC_get_full_gc_total_time();
 #else
         size_t boehmHeap = 0;
         size_t boehmFree = 0;
+        GC_word boehmGcNo = 0;
+        unsigned long boehmGcMs = 0;
 #endif
         size_t rssBytes = 0;
         {
@@ -501,6 +517,16 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             boehmFree  / 1e6,
             arenaPin   / 1e6,
             elsewhere  / 1e6);
+        // 2026-05-27: Boehm GC time/count line — input to the
+        // "ditch Boehm" decision per IDEAL_GC_DESIGN_2026-05-26.md.
+        // If boehm_gc_ms is sub-1 % of overall wall, the wall case
+        // for replacement is weak; the memory-peak case (~400 MB
+        // reserved heap) becomes the sole driver.
+        std::fprintf(stderr,
+            "v3-direct boehm: gc_count=%llu gc_total_ms=%lu "
+            "(time spent in full collections during process lifetime)\n",
+            (unsigned long long)boehmGcNo,
+            (unsigned long)boehmGcMs);
         // #660 verification: dump bridge-primop call counts.  v3-eval
         // already does this via its own NIX_VM_STATS path; mirror here
         // so the integrated `nix` CLI (and any future v3 driver that
