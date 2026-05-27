@@ -724,6 +724,13 @@ inline Arena & threadArena() noexcept
 struct Bindings;
 void bindingsAllocSiteRecord(const Bindings * b, const char * file, uint32_t line) noexcept;
 
+// T1.3 (2026-05-27) — forward declaration for the per-Thunk attribution
+// table.  Called from `Alloc::allocThunkSuspended` when
+// NIX_V3_THUNKS_ATTR=1.  Templated from the BINDINGS_ATTR pattern.
+struct Thunk;
+void thunkAllocSiteRecord(const Thunk * t, const char * file,
+                          uint32_t line, uint16_t nUp) noexcept;
+
 // #768a (2026-05-22): namespace-scope env-var cache for allocator-
 // path debug gates whose call sites appear BEFORE the main detail::
 // block further down in this header (the gates referenced by
@@ -818,7 +825,13 @@ struct Alloc
 
     /// Allocate a Suspended thunk with `nUpvalues` captured upvalues
     /// stored in the FAM tail.
-    static Thunk * allocThunkSuspended(uint16_t nUpvalues) noexcept
+    ///
+    /// `file` / `line` default to the caller's site via `__builtin_FILE`
+    /// + `__builtin_LINE`.  Used by T1.3 per-Thunk attribution
+    /// (NIX_V3_THUNKS_ATTR=1).  Zero cost when the gate is off.
+    static Thunk * allocThunkSuspended(uint16_t nUpvalues,
+                                        const char * file = __builtin_FILE(),
+                                        uint32_t     line = __builtin_LINE()) noexcept
     {
         const size_t bytes = sizeof(Thunk) + sizeof(Value) * nUpvalues;
         V3_STATS_BUMP(bytesThunks, bytes);
@@ -849,6 +862,11 @@ struct Alloc
         }
         t->suspended.capturedWiths = nullptr;
         t->suspended.cu = nullptr;
+        // T1.3: record allocation origin under NIX_V3_THUNKS_ATTR=1.
+        // Forward declaration: thunkAllocSiteRecord is defined further
+        // down in this header (needs <unordered_map>); the call site
+        // here resolves to the inline noexcept body at compile time.
+        thunkAllocSiteRecord(t, file, line, nUpvalues);
         return t;
     }
 
@@ -1378,6 +1396,53 @@ inline const BindingsOrigin * lookupBindingsOrigin(const Bindings * b)
     auto & tbl = bindingsOriginTable();
     auto it = tbl.find(b);
     return it == tbl.end() ? nullptr : &it->second;
+}
+
+// ---------------------------------------------------------------------------
+// T1.3 per-Thunk attribution table (2026-05-27).  Templated from #746
+// BINDINGS_ATTR.  Tracks Thunk allocation origins so dump-time rollup
+// can identify which call sites are responsible for the per-workload
+// Thunk bytes (320 MB on HNE per HNE_BUCKET_DECOMP_2026-05-27).
+//
+// Gate: NIX_V3_THUNKS_ATTR=1 enables both recording AND end-of-run
+// dump.  Default: off; zero cost when not enabled (one cached-bool
+// read per allocThunkSuspended).
+//
+// Retirement criterion: when Thunk-attribution data has informed a
+// concrete fix (analogous to #748/#750/#752 for Bindings), the gate
+// + dump function can be retired.  Until then, this is the canonical
+// per-Thunk-site instrumentation.
+// ---------------------------------------------------------------------------
+
+struct ThunkOrigin
+{
+    const char * file;
+    uint32_t     line;
+    uint32_t     nUpvalues;  // captured for per-site nUpvalues distribution
+};
+
+namespace detail {
+inline const bool g_thunksAttrEnabled =
+    std::getenv("NIX_V3_THUNKS_ATTR") != nullptr;
+}
+
+[[gnu::always_inline]] inline bool thunksAttrEnabled() noexcept
+{
+    return detail::g_thunksAttrEnabled;
+}
+
+inline std::unordered_map<const Thunk *, ThunkOrigin> & thunkOriginTable()
+{
+    static std::unordered_map<const Thunk *, ThunkOrigin> tbl;
+    return tbl;
+}
+
+inline void thunkAllocSiteRecord(const Thunk * t, const char * file,
+                                  uint32_t line, uint16_t nUp) noexcept
+{
+    if (!t || !thunksAttrEnabled()) return;
+    auto & tbl = thunkOriginTable();
+    tbl[t] = {file, line, nUp};
 }
 
 // ---------------------------------------------------------------------------
@@ -1968,6 +2033,122 @@ inline void dropStringContextEntries(const char * buf)
 inline void clearStringContextSideTable()
 {
     stringContextSideTable().clear();
+}
+
+// ---------------------------------------------------------------------------
+// T1.3 — Thunk attribution dump (2026-05-27).
+//
+// Templated from `dumpBindingsAttribution`.  Rolls up per-file:line
+// allocation sites + reports top-N by total bytes.  Each Thunk's bytes
+// are sizeof(Thunk) + nUpvalues * sizeof(Value).
+//
+// Gate: NIX_V3_THUNKS_ATTR=1 enables recording AND dump.  Caller
+// should fire `dumpThunksAttribution(stderr)` at end-of-run after
+// the main NIX_VM_STATS dump.
+//
+// Origin keying: by (file *, line) pair — file pointers from
+// `__builtin_FILE` are deduplicated by the compiler / linker so
+// pointer equality is a valid key.
+// ---------------------------------------------------------------------------
+
+struct ThunkAttrRollup {
+    const char * file;
+    uint32_t     line;
+    uint64_t     allocCount;
+    uint64_t     totalBytes;
+    uint32_t     nUpvaluesSum;  // sum across all instances; lets us
+                                 // report avg nUpvalues per site
+    uint32_t     nUpvaluesMax;
+};
+
+inline void dumpThunksAttribution(std::FILE * out, size_t topN = 20) noexcept
+{
+    if (!thunksAttrEnabled()) return;
+    auto & tbl = thunkOriginTable();
+    if (tbl.empty()) {
+        std::fprintf(out,
+            "v3-direct thunks-attr: empty (NIX_V3_THUNKS_ATTR=1 "
+            "set but no Thunks allocated yet at this dump)\n");
+        return;
+    }
+    // Aggregate by (file*, line).  File pointers from
+    // __builtin_FILE are stable string literals so pointer-equal.
+    // Compose a uint64 key from (file_ptr_bits >> 4 << 32) | line.
+    // file_ptr fits in 48 bits typically; collisions unlikely at
+    // the dump granularity.  Simpler: use string-format key.
+    struct Key { const char * file; uint32_t line; };
+    struct KeyHash {
+        size_t operator()(const Key & k) const noexcept
+        {
+            return reinterpret_cast<size_t>(k.file) * 1000003u
+                 + size_t(k.line);
+        }
+    };
+    struct KeyEq {
+        bool operator()(const Key & a, const Key & b) const noexcept
+        {
+            return a.file == b.file && a.line == b.line;
+        }
+    };
+    std::unordered_map<Key, ThunkAttrRollup, KeyHash, KeyEq> agg;
+    agg.reserve(256);
+    for (const auto & kv : tbl) {
+        const Thunk * t = kv.first;
+        const ThunkOrigin & o = kv.second;
+        if (!t || !o.file) continue;
+        Key k{o.file, o.line};
+        auto & r = agg[k];
+        r.file = o.file;
+        r.line = o.line;
+        ++r.allocCount;
+        const uint64_t bytes = sizeof(Thunk)
+                             + sizeof(Value) * uint64_t(o.nUpvalues);
+        r.totalBytes += bytes;
+        r.nUpvaluesSum += o.nUpvalues;
+        if (o.nUpvalues > r.nUpvaluesMax) r.nUpvaluesMax = o.nUpvalues;
+    }
+    std::vector<ThunkAttrRollup> sorted;
+    sorted.reserve(agg.size());
+    for (auto & kv : agg) sorted.push_back(kv.second);
+    std::sort(sorted.begin(), sorted.end(),
+        [](const ThunkAttrRollup & a, const ThunkAttrRollup & b) {
+            if (a.totalBytes != b.totalBytes)
+                return a.totalBytes > b.totalBytes;
+            if (a.allocCount != b.allocCount)
+                return a.allocCount > b.allocCount;
+            return std::less<const char *>{}(a.file, b.file);
+        });
+    uint64_t grandBytes = 0, grandAllocs = 0;
+    for (const auto & r : sorted) {
+        grandBytes  += r.totalBytes;
+        grandAllocs += r.allocCount;
+    }
+    std::fprintf(out,
+        "v3-direct thunks-attr: %zu distinct origins, %llu total allocs, "
+        "%.1f MB tracked  (top %zu by alloc-bytes):\n",
+        sorted.size(),
+        (unsigned long long)grandAllocs,
+        double(grandBytes) / (1024.0 * 1024.0),
+        std::min(sorted.size(), topN));
+    std::fprintf(out,
+        "  %-60s %10s %10s %8s %8s\n",
+        "origin (file:line)", "allocs", "MB", "avg-nUp", "max-nUp");
+    size_t n = std::min(sorted.size(), topN);
+    for (size_t i = 0; i < n; ++i) {
+        const auto & r = sorted[i];
+        const double mb = double(r.totalBytes) / (1024.0 * 1024.0);
+        const double avg = r.allocCount > 0
+            ? double(r.nUpvaluesSum) / double(r.allocCount)
+            : 0.0;
+        char buf[80];
+        std::snprintf(buf, sizeof(buf), "%s:%u",
+            r.file ? r.file : "<null>", r.line);
+        std::fprintf(out,
+            "  %-60s %10llu  %8.2f  %7.2f  %7u\n",
+            buf,
+            (unsigned long long)r.allocCount,
+            mb, avg, r.nUpvaluesMax);
+    }
 }
 
 } // namespace nix::v3

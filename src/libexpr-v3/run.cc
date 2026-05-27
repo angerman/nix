@@ -1034,6 +1034,14 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // NIX_V3_BINDINGS_ATTR is unset; when set, the recording
         // gate also auto-enables via bindingsOriginEnabled().
         dumpBindingsAttribution(stderr);
+        // T1.3 (2026-05-27) per-Thunk attribution.  No-op when
+        // NIX_V3_THUNKS_ATTR is unset.  Templated from #746 BINDINGS_ATTR
+        // pattern to identify Thunk allocation hot sites — Thunks are
+        // the second-largest v3_arena bucket on HNE (320 MB / 320 MB-of-
+        // 1594 MB total, per HNE_BUCKET_DECOMP_2026-05-27.md §"v3_arena
+        // decomposition").  Without per-site data Thunks remain the
+        // largest un-attributed bucket after Bindings.
+        dumpThunksAttribution(stderr);
         // #751 (2026-05-21) "elsewhere" attribution.  After #750 the
         // v3_arena dropped 386 MB but peak_rss dropped only 248 MB;
         // the "elsewhere" share (RSS - boehm_heap - v3_arena) grew
