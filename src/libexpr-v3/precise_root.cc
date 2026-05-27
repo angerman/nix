@@ -20,6 +20,7 @@
 #include "v3/vm.hh"
 #include "v3/barrier.hh"
 #include "v3/primop.hh"   // walkV3BridgeRoots, walkImportCacheRoots
+#include "v3/gc_root.hh"  // Stage 5: walkCppStackRoots
 
 #include <cstdio>
 #include <cstdlib>
@@ -115,6 +116,16 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
         walkImportCacheRoots(adapter);
     }
 
+    // -- Stage 5: C++-stack roots (sub-source 8) -------------------
+    // Values held in C++ helper frames + registered via the GcRoot
+    // RAII helper.  Forward-looking for Stage 6 production precise
+    // GC where the safe-point model permits mid-primop collection.
+    // Today's nursery scavenger (Phase D/E) does NOT fire from
+    // primop bodies, so this list is typically empty in normal
+    // operation — non-zero entries appear only during the brief
+    // window between `GcRoot` construct + destruct.
+    walkCppStackRoots(visitor);
+
     // (Note: global root sources walked above are also reachable
     //  via the standalone helper `walkGlobalV3Roots`, used by
     //  end-of-run diagnostics that fire after VMState teardown.)
@@ -143,6 +154,8 @@ void walkGlobalV3Roots(RootVisitor & visitor) noexcept
     for (Value * cell : standaloneCellRoots()) {
         if (cell) visitor.visitValue(*cell);
     }
+    // Stage 5: C++-stack roots (RAII-registered via `GcRoot`).
+    walkCppStackRoots(visitor);
     // FFI bridge tables — v3 Value handles indexed by TW.
     {
         std::function<void(Value &)> adapter =

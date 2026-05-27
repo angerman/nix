@@ -133,13 +133,22 @@ Once precise roots are in place, the team can adopt Whippet (per `GC_BUILD_VS_BU
   + `f3491859f`)
 * **Stage 6 SPIKE ✓** — `dumpV3LiveFraction` + SHIP-GREEN verdict
   (commit `f3491859f`)
+* **Stage 5 MVP ✓** — `GcRoot` RAII helper + `gcRootStack()` thread-
+  local registry + `walkCppStackRoots` walker integration.
+  Infrastructure landed; bulk-application to ~150 primop sites is
+  follow-on work that subsequent sessions can do incrementally as
+  Stage 6 production needs it.
 
 Pending:
 * Stage 2 — walker migration audit (low-priority; may be moot)
 * Stage 4 — stack maps (audit-first — likely not needed if VM
   invariant "valueStack[0..size()) has no stale pointers" holds)
-* Stage 5 — GC_ROOT macros for ~150 C++ helper sites
-* Stage 6 — production precise GC of v3 arena (SHIP-GREEN ahead)
+* Stage 5 — bulk `V3_GC_ROOT(...)` application to ~150 C++ helper
+  sites (Stage 5 MVP infrastructure is landed; application is
+  mechanical follow-up driven by Stage 6 production needs)
+* Stage 6 — production precise GC of v3 arena (SHIP-GREEN ahead;
+  arena deregistration from Boehm is the concrete sub-task per
+  BOEHM_TUNING_FALSIFIED_2026-05-27.md follow-up)
 * Stage 7 — moving/compacting GC (separate ~3-4 mo project)
 
 ## Why this is "no-regret" foundation work

@@ -131,6 +131,7 @@ declare -a SUITES=()
 SUITES+=( "smoke|v3-smoke|NIX_V3_CACHE_DIR=$logdir/cache $ROOT/build/src/libexpr-v3/v3-smoke" )
 SUITES+=( "drv-preflight|libnixstore drvPath validation|$ROOT/build/src/libexpr-v3/v3-drv-preflight" )
 SUITES+=( "evalscope|EvalScope handle invalidation|$ROOT/build/src/libexpr-v3/v3-evalscope-handles" )
+SUITES+=( "gc-root-handles|Stage 5 GcRoot RAII + registry + walker|$ROOT/build/src/libexpr-v3/v3-gc-root-handles" )
 SUITES+=( "iterative-force|deep let/curry/app-spine|NIX=$NIX $TEST_DIR/iterative-force-depth.sh" )
 SUITES+=( "derivation-parity|drvPath byte-equal vs TW|$TEST_DIR/derivation-parity.sh" )
 

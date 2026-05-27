@@ -138,6 +138,10 @@ lib_sources = files(
   # ditch-Boehm load-bearing claim BEFORE committing to Stages 5-6.
   # NIX_V3_LIVE_TRACE=1 reports the LIVE-vs-ALLOCATED ratio per type.
   'live_trace.cc',
+  # Stage 5 of precise-root foundation: RAII GcRoot helper + thread-local
+  # registry for C++-stack roots.  See lode/GC_PRECISE_ROOT_FOUNDATION_
+  # 2026-05-27.md.  Forward-looking infrastructure for Stage 6 production.
+  'gc_root.cc',
   # #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
   'dedup_survey.cc',
   'disasm.cc',
@@ -277,6 +281,27 @@ v3_drv_preflight = executable(
 test(
   'v3-drv-preflight',
   v3_drv_preflight,
+)
+
+# Stage 5 unit test — `GcRoot` RAII + thread-local registry +
+# `walkCppStackRoots` walker integration.  See lode/
+# GC_PRECISE_ROOT_FOUNDATION_2026-05-27.md.  Pure in-memory API
+# check; no nixpkgs / eval-state / disk-cache dependency.
+v3_gc_root_handles = executable(
+  'v3-gc-root-handles',
+  'test/gc-root-handles.cc',
+  dependencies : deps_public + deps_private + deps_other + [
+    declare_dependency(
+      link_with : this_library,
+      include_directories : include_dirs,
+    ),
+  ],
+  install : false,
+)
+
+test(
+  'v3-gc-root-handles',
+  v3_gc_root_handles,
 )
 
 # #485: behavioural tests for EvalScope handle invalidation.
