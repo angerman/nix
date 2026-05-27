@@ -1042,6 +1042,13 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // decomposition").  Without per-site data Thunks remain the
         // largest un-attributed bucket after Bindings.
         dumpThunksAttribution(stderr);
+        // T1.3 (2026-05-27) per-Closure attribution.  No-op when
+        // NIX_V3_CLOSURES_ATTR is unset.  Unlike Thunks (single dominant
+        // site at OP_MAKE_THUNK), Closures are dispersed across ~7 vm.cc
+        // sites — per-site rollup distinguishes "user lambda creation"
+        // from "VM-internal fakeClo wrapping" (the latter is overhead
+        // with potential elision targets).
+        dumpClosuresAttribution(stderr);
         // #751 (2026-05-21) "elsewhere" attribution.  After #750 the
         // v3_arena dropped 386 MB but peak_rss dropped only 248 MB;
         // the "elsewhere" share (RSS - boehm_heap - v3_arena) grew

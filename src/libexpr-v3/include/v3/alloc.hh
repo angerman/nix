@@ -731,6 +731,16 @@ struct Thunk;
 void thunkAllocSiteRecord(const Thunk * t, const char * file,
                           uint32_t line, uint16_t nUp) noexcept;
 
+// T1.3 (2026-05-27) — forward declaration for the per-Closure
+// attribution table.  Called from `Alloc::allocClosure` +
+// `allocClosureTenured` when NIX_V3_CLOSURES_ATTR=1.  Closures are
+// dispersed across ~7 vm.cc sites (unlike Thunks; see
+// T1_3_THUNKS_ATTR_2026-05-27.md), so per-site rollup is genuinely
+// informative.
+struct Closure;
+void closureAllocSiteRecord(const Closure * c, const char * file,
+                             uint32_t line, uint16_t nUp) noexcept;
+
 // #768a (2026-05-22): namespace-scope env-var cache for allocator-
 // path debug gates whose call sites appear BEFORE the main detail::
 // block further down in this header (the gates referenced by
@@ -775,7 +785,17 @@ struct Alloc
         return static_cast<Value *>(threadArena().alloc(sizeof(Value)));
     }
 
-    static Closure * allocClosure(uint16_t nUpvalues) noexcept
+    /// `file` / `line` default to the caller's site via `__builtin_FILE`
+    /// + `__builtin_LINE`.  Used by T1.3 per-Closure attribution
+    /// (NIX_V3_CLOSURES_ATTR=1).  Zero cost when the gate is off.
+    /// Closures have ~7 distinct allocation sites on hot paths
+    /// (OP_MAKE_CLOSURE general + singleton + multiple fakeClo paths
+    /// in OP_FORCE / OP_TAIL_CALL primop wrappers), so per-site
+    /// attribution is genuinely informative — unlike Thunks (single
+    /// dominant site at OP_MAKE_THUNK per T1_3_THUNKS_ATTR_2026-05-27).
+    static Closure * allocClosure(uint16_t nUpvalues,
+                                   const char * file = __builtin_FILE(),
+                                   uint32_t     line = __builtin_LINE()) noexcept
     {
         const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
         V3_STATS_BUMP(bytesClosures, bytes);
@@ -784,6 +804,7 @@ struct Alloc
         c->_pad = 0;
         c->capturedWiths = nullptr;
         c->cu = nullptr;
+        closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
     }
 
@@ -811,7 +832,10 @@ struct Alloc
     /// Safety: identical layout to `allocClosure`; only the alloc
     /// backend differs.  No nursery slack lost (the singleton path
     /// is rare).
-    static Closure * allocClosureTenured(uint16_t nUpvalues) noexcept
+    /// T1.3: same file/line attribution as `allocClosure`.
+    static Closure * allocClosureTenured(uint16_t nUpvalues,
+                                          const char * file = __builtin_FILE(),
+                                          uint32_t     line = __builtin_LINE()) noexcept
     {
         const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
         V3_STATS_BUMP(bytesClosures, bytes);
@@ -820,6 +844,7 @@ struct Alloc
         c->_pad = 0;
         c->capturedWiths = nullptr;
         c->cu = nullptr;
+        closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
     }
 
@@ -1443,6 +1468,46 @@ inline void thunkAllocSiteRecord(const Thunk * t, const char * file,
     if (!t || !thunksAttrEnabled()) return;
     auto & tbl = thunkOriginTable();
     tbl[t] = {file, line, nUp};
+}
+
+// ---------------------------------------------------------------------------
+// T1.3 per-Closure attribution (2026-05-27).  Same shape as Thunks
+// but Closures are dispersed across ~7 distinct vm.cc sites
+// (OP_MAKE_CLOSURE general + singleton + various fakeClo paths
+// in OP_FORCE / OP_TAIL_CALL bodies + intrinsic dispatch).  Per-site
+// rollup distinguishes "user lambda creation" from "VM-internal
+// fakeClo wrapping" — the latter is purely overhead.
+// ---------------------------------------------------------------------------
+
+struct ClosureOrigin
+{
+    const char * file;
+    uint32_t     line;
+    uint32_t     nUpvalues;
+};
+
+namespace detail {
+inline const bool g_closuresAttrEnabled =
+    std::getenv("NIX_V3_CLOSURES_ATTR") != nullptr;
+}
+
+[[gnu::always_inline]] inline bool closuresAttrEnabled() noexcept
+{
+    return detail::g_closuresAttrEnabled;
+}
+
+inline std::unordered_map<const Closure *, ClosureOrigin> & closureOriginTable()
+{
+    static std::unordered_map<const Closure *, ClosureOrigin> tbl;
+    return tbl;
+}
+
+inline void closureAllocSiteRecord(const Closure * c, const char * file,
+                                    uint32_t line, uint16_t nUp) noexcept
+{
+    if (!c || !closuresAttrEnabled()) return;
+    auto & tbl = closureOriginTable();
+    tbl[c] = {file, line, nUp};
 }
 
 // ---------------------------------------------------------------------------
@@ -2125,6 +2190,101 @@ inline void dumpThunksAttribution(std::FILE * out, size_t topN = 20) noexcept
     }
     std::fprintf(out,
         "v3-direct thunks-attr: %zu distinct origins, %llu total allocs, "
+        "%.1f MB tracked  (top %zu by alloc-bytes):\n",
+        sorted.size(),
+        (unsigned long long)grandAllocs,
+        double(grandBytes) / (1024.0 * 1024.0),
+        std::min(sorted.size(), topN));
+    std::fprintf(out,
+        "  %-60s %10s %10s %8s %8s\n",
+        "origin (file:line)", "allocs", "MB", "avg-nUp", "max-nUp");
+    size_t n = std::min(sorted.size(), topN);
+    for (size_t i = 0; i < n; ++i) {
+        const auto & r = sorted[i];
+        const double mb = double(r.totalBytes) / (1024.0 * 1024.0);
+        const double avg = r.allocCount > 0
+            ? double(r.nUpvaluesSum) / double(r.allocCount)
+            : 0.0;
+        char buf[80];
+        std::snprintf(buf, sizeof(buf), "%s:%u",
+            r.file ? r.file : "<null>", r.line);
+        std::fprintf(out,
+            "  %-60s %10llu  %8.2f  %7.2f  %7u\n",
+            buf,
+            (unsigned long long)r.allocCount,
+            mb, avg, r.nUpvaluesMax);
+    }
+}
+
+// T1.3 — Closure attribution dump.  Mirrors `dumpThunksAttribution`.
+// Closures are dispersed across ~7 vm.cc sites — per-site rollup
+// distinguishes "user lambda creation" from "VM-internal fakeClo
+// wrapping" (the latter is overhead with potential elision targets).
+inline void dumpClosuresAttribution(std::FILE * out, size_t topN = 20) noexcept
+{
+    if (!closuresAttrEnabled()) return;
+    auto & tbl = closureOriginTable();
+    if (tbl.empty()) {
+        std::fprintf(out,
+            "v3-direct closures-attr: empty (NIX_V3_CLOSURES_ATTR=1 "
+            "set but no Closures allocated yet at this dump)\n");
+        return;
+    }
+    struct Key { const char * file; uint32_t line; };
+    struct KeyHash {
+        size_t operator()(const Key & k) const noexcept
+        {
+            return reinterpret_cast<size_t>(k.file) * 1000003u
+                 + size_t(k.line);
+        }
+    };
+    struct KeyEq {
+        bool operator()(const Key & a, const Key & b) const noexcept
+        {
+            return a.file == b.file && a.line == b.line;
+        }
+    };
+    struct Rollup {
+        const char * file = nullptr;
+        uint32_t     line = 0;
+        uint64_t     allocCount = 0;
+        uint64_t     totalBytes = 0;
+        uint32_t     nUpvaluesSum = 0;
+        uint32_t     nUpvaluesMax = 0;
+    };
+    std::unordered_map<Key, Rollup, KeyHash, KeyEq> agg;
+    agg.reserve(64);
+    for (const auto & kv : tbl) {
+        const Closure * c = kv.first;
+        const ClosureOrigin & o = kv.second;
+        if (!c || !o.file) continue;
+        Key k{o.file, o.line};
+        auto & r = agg[k];
+        r.file = o.file;
+        r.line = o.line;
+        ++r.allocCount;
+        const uint64_t bytes = sizeof(Closure)
+                             + sizeof(Value) * uint64_t(o.nUpvalues);
+        r.totalBytes += bytes;
+        r.nUpvaluesSum += o.nUpvalues;
+        if (o.nUpvalues > r.nUpvaluesMax) r.nUpvaluesMax = o.nUpvalues;
+    }
+    std::vector<Rollup> sorted;
+    sorted.reserve(agg.size());
+    for (auto & kv : agg) sorted.push_back(kv.second);
+    std::sort(sorted.begin(), sorted.end(),
+        [](const Rollup & a, const Rollup & b) {
+            if (a.totalBytes != b.totalBytes)
+                return a.totalBytes > b.totalBytes;
+            return a.allocCount > b.allocCount;
+        });
+    uint64_t grandBytes = 0, grandAllocs = 0;
+    for (const auto & r : sorted) {
+        grandBytes  += r.totalBytes;
+        grandAllocs += r.allocCount;
+    }
+    std::fprintf(out,
+        "v3-direct closures-attr: %zu distinct origins, %llu total allocs, "
         "%.1f MB tracked  (top %zu by alloc-bytes):\n",
         sorted.size(),
         (unsigned long long)grandAllocs,
