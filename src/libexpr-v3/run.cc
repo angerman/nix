@@ -1049,6 +1049,12 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // from "VM-internal fakeClo wrapping" (the latter is overhead
         // with potential elision targets).
         dumpClosuresAttribution(stderr);
+        // T1.3 (2026-05-27) per-Pair + per-List attribution.  Both
+        // have many distinct primops.cc sites; per-site rollup may
+        // surface concrete levers analogous to fakeClo for Closures.
+        // No-op when NIX_V3_PAIRS_ATTR / NIX_V3_LISTS_ATTR unset.
+        dumpPairsAttribution(stderr);
+        dumpListsAttribution(stderr);
         // #751 (2026-05-21) "elsewhere" attribution.  After #750 the
         // v3_arena dropped 386 MB but peak_rss dropped only 248 MB;
         // the "elsewhere" share (RSS - boehm_heap - v3_arena) grew

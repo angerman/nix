@@ -741,6 +741,17 @@ struct Closure;
 void closureAllocSiteRecord(const Closure * c, const char * file,
                              uint32_t line, uint16_t nUp) noexcept;
 
+// T1.3 (2026-05-27) — forward decls for Pair + ListVec attribution.
+// Both have many allocation sites (>20 each across primops.cc +
+// vm.cc), so per-site rollup is informative.
+struct ValuePair;
+void pairAllocSiteRecord(const ValuePair * p, const char * file,
+                          uint32_t line) noexcept;
+
+struct ListVec;
+void listAllocSiteRecord(const ListVec * l, const char * file,
+                          uint32_t line, uint32_t size) noexcept;
+
 // #768a (2026-05-22): namespace-scope env-var cache for allocator-
 // path debug gates whose call sites appear BEFORE the main detail::
 // block further down in this header (the gates referenced by
@@ -930,12 +941,18 @@ struct Alloc
         return e;
     }
 
-    static ListVec * allocList(uint32_t n) noexcept
+    /// T1.3 (2026-05-27): file/line attribution via `__builtin_FILE` /
+    /// `__builtin_LINE` default args.  NIX_V3_LISTS_ATTR=1 enables
+    /// dump; zero cost when off.
+    static ListVec * allocList(uint32_t n,
+                                const char * file = __builtin_FILE(),
+                                uint32_t     line = __builtin_LINE()) noexcept
     {
         const size_t bytes = sizeof(ListVec) + sizeof(Value) * n;
         V3_STATS_BUMP(bytesLists, bytes);
         auto * l = static_cast<ListVec *>(nurseryOrArena(bytes));
         l->size = n;
+        listAllocSiteRecord(l, file, line, n);
         return l;
     }
 
@@ -945,11 +962,19 @@ struct Alloc
     /// prior std::malloc'd storage was invisible to Boehm so the
     /// inner payloads could be reclaimed under load.  Arena-allocated
     /// pairs sit inside a GC_add_roots-registered region (alloc.hh:225).
-    static ValuePair * allocPair() noexcept
+    ///
+    /// T1.3 (2026-05-27): file/line attribution.  NIX_V3_PAIRS_ATTR=1
+    /// enables dump.  Pairs are 125 MB on HNE — third-largest non-
+    /// Bindings bucket.
+    static ValuePair * allocPair(const char * file = __builtin_FILE(),
+                                  uint32_t     line = __builtin_LINE()) noexcept
     {
         V3_STATS_INC(pairsAllocated);
         V3_STATS_BUMP(bytesPairs, sizeof(ValuePair));
-        return static_cast<ValuePair *>(threadArena().alloc(sizeof(ValuePair)));
+        auto * p = static_cast<ValuePair *>(
+            threadArena().alloc(sizeof(ValuePair)));
+        pairAllocSiteRecord(p, file, line);
+        return p;
     }
 
     /// REVIEW CRIT-4: long-lived character buffer allocation routed
@@ -1508,6 +1533,79 @@ inline void closureAllocSiteRecord(const Closure * c, const char * file,
     if (!c || !closuresAttrEnabled()) return;
     auto & tbl = closureOriginTable();
     tbl[c] = {file, line, nUp};
+}
+
+// ---------------------------------------------------------------------------
+// T1.3 per-ValuePair attribution (2026-05-27).  Same shape as Closures.
+// Pairs are 125 MB on HNE; allocated by 4-5+ distinct sites including
+// Tag::App memoization, primMap intermediate, primFilter, etc.
+// ---------------------------------------------------------------------------
+
+struct PairOrigin
+{
+    const char * file;
+    uint32_t     line;
+};
+
+namespace detail {
+inline const bool g_pairsAttrEnabled =
+    std::getenv("NIX_V3_PAIRS_ATTR") != nullptr;
+}
+
+[[gnu::always_inline]] inline bool pairsAttrEnabled() noexcept
+{
+    return detail::g_pairsAttrEnabled;
+}
+
+inline std::unordered_map<const ValuePair *, PairOrigin> & pairOriginTable()
+{
+    static std::unordered_map<const ValuePair *, PairOrigin> tbl;
+    return tbl;
+}
+
+inline void pairAllocSiteRecord(const ValuePair * p, const char * file,
+                                 uint32_t line) noexcept
+{
+    if (!p || !pairsAttrEnabled()) return;
+    auto & tbl = pairOriginTable();
+    tbl[p] = {file, line};
+}
+
+// ---------------------------------------------------------------------------
+// T1.3 per-ListVec attribution (2026-05-27).  Same shape; tracks `size`
+// per allocation since lists have variable FAM tail length and the
+// per-site size distribution matters.
+// ---------------------------------------------------------------------------
+
+struct ListOrigin
+{
+    const char * file;
+    uint32_t     line;
+    uint32_t     size;
+};
+
+namespace detail {
+inline const bool g_listsAttrEnabled =
+    std::getenv("NIX_V3_LISTS_ATTR") != nullptr;
+}
+
+[[gnu::always_inline]] inline bool listsAttrEnabled() noexcept
+{
+    return detail::g_listsAttrEnabled;
+}
+
+inline std::unordered_map<const ListVec *, ListOrigin> & listOriginTable()
+{
+    static std::unordered_map<const ListVec *, ListOrigin> tbl;
+    return tbl;
+}
+
+inline void listAllocSiteRecord(const ListVec * l, const char * file,
+                                 uint32_t line, uint32_t size) noexcept
+{
+    if (!l || !listsAttrEnabled()) return;
+    auto & tbl = listOriginTable();
+    tbl[l] = {file, line, size};
 }
 
 // ---------------------------------------------------------------------------
@@ -2308,6 +2406,171 @@ inline void dumpClosuresAttribution(std::FILE * out, size_t topN = 20) noexcept
             buf,
             (unsigned long long)r.allocCount,
             mb, avg, r.nUpvaluesMax);
+    }
+}
+
+// T1.3 — ValuePair attribution dump.
+inline void dumpPairsAttribution(std::FILE * out, size_t topN = 20) noexcept
+{
+    if (!pairsAttrEnabled()) return;
+    auto & tbl = pairOriginTable();
+    if (tbl.empty()) {
+        std::fprintf(out,
+            "v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 "
+            "set but no Pairs allocated yet)\n");
+        return;
+    }
+    struct Key { const char * file; uint32_t line; };
+    struct KeyHash {
+        size_t operator()(const Key & k) const noexcept
+        {
+            return reinterpret_cast<size_t>(k.file) * 1000003u
+                 + size_t(k.line);
+        }
+    };
+    struct KeyEq {
+        bool operator()(const Key & a, const Key & b) const noexcept
+        {
+            return a.file == b.file && a.line == b.line;
+        }
+    };
+    struct Rollup { const char * file = nullptr; uint32_t line = 0;
+                    uint64_t allocCount = 0; };
+    std::unordered_map<Key, Rollup, KeyHash, KeyEq> agg;
+    agg.reserve(64);
+    for (const auto & kv : tbl) {
+        const ValuePair * p = kv.first;
+        const PairOrigin & o = kv.second;
+        if (!p || !o.file) continue;
+        Key k{o.file, o.line};
+        auto & r = agg[k];
+        r.file = o.file;
+        r.line = o.line;
+        ++r.allocCount;
+    }
+    std::vector<Rollup> sorted;
+    sorted.reserve(agg.size());
+    for (auto & kv : agg) sorted.push_back(kv.second);
+    std::sort(sorted.begin(), sorted.end(),
+        [](const Rollup & a, const Rollup & b) {
+            return a.allocCount > b.allocCount;
+        });
+    uint64_t grandAllocs = 0;
+    for (const auto & r : sorted) grandAllocs += r.allocCount;
+    const uint64_t bytesPerPair = sizeof(ValuePair);
+    std::fprintf(out,
+        "v3-direct pairs-attr: %zu distinct origins, %llu total allocs, "
+        "%.1f MB tracked (sizeof(ValuePair)=%llu)  (top %zu):\n",
+        sorted.size(),
+        (unsigned long long)grandAllocs,
+        double(grandAllocs * bytesPerPair) / (1024.0 * 1024.0),
+        (unsigned long long)bytesPerPair,
+        std::min(sorted.size(), topN));
+    std::fprintf(out,
+        "  %-60s %12s %10s\n",
+        "origin (file:line)", "allocs", "MB");
+    size_t n = std::min(sorted.size(), topN);
+    for (size_t i = 0; i < n; ++i) {
+        const auto & r = sorted[i];
+        const double mb =
+            double(r.allocCount * bytesPerPair) / (1024.0 * 1024.0);
+        char buf[80];
+        std::snprintf(buf, sizeof(buf), "%s:%u",
+            r.file ? r.file : "<null>", r.line);
+        std::fprintf(out,
+            "  %-60s %12llu  %8.2f\n",
+            buf, (unsigned long long)r.allocCount, mb);
+    }
+}
+
+// T1.3 — ListVec attribution dump.  Lists have variable FAM tail
+// (size varies per alloc); rollup tracks total bytes per site, not
+// just count.
+inline void dumpListsAttribution(std::FILE * out, size_t topN = 20) noexcept
+{
+    if (!listsAttrEnabled()) return;
+    auto & tbl = listOriginTable();
+    if (tbl.empty()) {
+        std::fprintf(out,
+            "v3-direct lists-attr: empty (NIX_V3_LISTS_ATTR=1 "
+            "set but no Lists allocated yet)\n");
+        return;
+    }
+    struct Key { const char * file; uint32_t line; };
+    struct KeyHash {
+        size_t operator()(const Key & k) const noexcept
+        {
+            return reinterpret_cast<size_t>(k.file) * 1000003u
+                 + size_t(k.line);
+        }
+    };
+    struct KeyEq {
+        bool operator()(const Key & a, const Key & b) const noexcept
+        {
+            return a.file == b.file && a.line == b.line;
+        }
+    };
+    struct Rollup {
+        const char * file = nullptr;
+        uint32_t line = 0;
+        uint64_t allocCount = 0;
+        uint64_t totalBytes = 0;
+        uint64_t totalElems = 0;
+        uint32_t maxSize = 0;
+    };
+    std::unordered_map<Key, Rollup, KeyHash, KeyEq> agg;
+    agg.reserve(64);
+    for (const auto & kv : tbl) {
+        const ListVec * l = kv.first;
+        const ListOrigin & o = kv.second;
+        if (!l || !o.file) continue;
+        Key k{o.file, o.line};
+        auto & r = agg[k];
+        r.file = o.file;
+        r.line = o.line;
+        ++r.allocCount;
+        const uint64_t bytes = sizeof(ListVec)
+                             + sizeof(Value) * uint64_t(o.size);
+        r.totalBytes += bytes;
+        r.totalElems += o.size;
+        if (o.size > r.maxSize) r.maxSize = o.size;
+    }
+    std::vector<Rollup> sorted;
+    sorted.reserve(agg.size());
+    for (auto & kv : agg) sorted.push_back(kv.second);
+    std::sort(sorted.begin(), sorted.end(),
+        [](const Rollup & a, const Rollup & b) {
+            if (a.totalBytes != b.totalBytes)
+                return a.totalBytes > b.totalBytes;
+            return a.allocCount > b.allocCount;
+        });
+    uint64_t grandAllocs = 0, grandBytes = 0;
+    for (const auto & r : sorted) {
+        grandAllocs += r.allocCount;
+        grandBytes  += r.totalBytes;
+    }
+    std::fprintf(out,
+        "v3-direct lists-attr: %zu distinct origins, %llu total allocs, "
+        "%.1f MB tracked  (top %zu by bytes):\n",
+        sorted.size(),
+        (unsigned long long)grandAllocs,
+        double(grandBytes) / (1024.0 * 1024.0),
+        std::min(sorted.size(), topN));
+    std::fprintf(out,
+        "  %-60s %12s %10s %8s %8s\n",
+        "origin (file:line)", "allocs", "MB", "avg-size", "max-size");
+    size_t n = std::min(sorted.size(), topN);
+    for (size_t i = 0; i < n; ++i) {
+        const auto & r = sorted[i];
+        const double mb = double(r.totalBytes) / (1024.0 * 1024.0);
+        const double avg = r.allocCount > 0
+            ? double(r.totalElems) / double(r.allocCount) : 0.0;
+        char buf[80];
+        std::snprintf(buf, sizeof(buf), "%s:%u",
+            r.file ? r.file : "<null>", r.line);
+        std::fprintf(out,
+            "  %-60s %12llu  %8.2f  %7.2f  %7u\n",
+            buf, (unsigned long long)r.allocCount, mb, avg, r.maxSize);
     }
 }
 
