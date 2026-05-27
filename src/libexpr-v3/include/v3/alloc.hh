@@ -20,6 +20,7 @@
 #include "v3/value.hh"
 #include "v3/closure.hh"
 #include "v3/nursery.hh"
+#include "v3/bridge_root_registry.hh"  // Arena dereg side-table
 
 #include <algorithm>
 #include <atomic>
@@ -575,6 +576,24 @@ inline AllocStats & allocStats()
 // `malloc`-and-leak strategy.
 // ---------------------------------------------------------------------------
 
+namespace detail {
+/// Arena deregistration gate.  Read once at first call;
+/// thereafter a cached load.  NIX_V3_ARENA_NOROOT=1 opts out of
+/// arena Boehm-root registration; see ARENA_DEREGISTRATION_DESIGN
+/// _2026-05-27.md.  Default OFF (status quo arena-registered)
+/// for safety until the bridge-root registry has soaked.
+inline bool arenaNorootEnabledImpl() noexcept
+{
+    static const bool s_v =
+        std::getenv("NIX_V3_ARENA_NOROOT") != nullptr;
+    return s_v;
+}
+}
+[[gnu::always_inline]] inline bool arenaNorootEnabled() noexcept
+{
+    return detail::arenaNorootEnabledImpl();
+}
+
 class Arena
 {
 public:
@@ -612,7 +631,17 @@ public:
             // patterns don't pin objects.
             void * blk = std::calloc(1, bytes);
 #if NIX_USE_BOEHMGC
-            if (blk) GC_add_roots(blk, static_cast<char *>(blk) + bytes);
+            // Arena deregistration gate (per ARENA_DEREGISTRATION_
+            // DESIGN_2026-05-27): NIX_V3_ARENA_NOROOT=1 opts out
+            // of registering arena blocks with Boehm.  Bridge
+            // sources (the only documented Boehm-managed pointer
+            // in arena cells per WC-13 + Tag::External audit)
+            // are tracked separately via the bridge-root registry.
+            //
+            // Default: ON (status quo).  Future flip to default
+            // OFF when the bridge-root registry has soaked.
+            if (blk && !arenaNorootEnabled())
+                GC_add_roots(blk, static_cast<char *>(blk) + bytes);
 #endif
             // N11/R10 (audit Round 2): track huge allocations so
             // V3_DBG_NURSERY_BRUTE's scan covers them.  Without this,
@@ -703,7 +732,16 @@ private:
         // GC_add_roots is idempotent over overlapping regions and
         // safe to call concurrently — the underlying mutex is held
         // for a short string of pointer arithmetic.
-        GC_add_roots(blk, blk + kBlockSize);
+        //
+        // Arena deregistration gate (per ARENA_DEREGISTRATION_DESIGN
+        // _2026-05-27): NIX_V3_ARENA_NOROOT=1 skips this call.
+        // Bridge sources are tracked separately via the bridge-root
+        // registry; see allocBridgeThunk + bridge_root_registry.hh.
+        // Tag::External audit (bench/arena-dereg-audit.sh PASS on
+        // hello + firefox + HNE + ackermann) confirms no other
+        // Boehm-managed pointers persist in arena cells.
+        if (!arenaNorootEnabled())
+            GC_add_roots(blk, blk + kBlockSize);
 #endif
     }
 };
@@ -927,6 +965,15 @@ struct Alloc
         // Bridge thunks don't have a v3-side body; no shapeCell needed.
         t->shapeCell = nullptr;
         t->bridgeSrc = src;
+        // Arena deregistration (per ARENA_DEREGISTRATION_DESIGN_2026-
+        // 05-27): register `src` (a Boehm-managed `nix::Value *`)
+        // in the bridge-root side-table so Boehm sees it as a root
+        // regardless of whether the arena itself is GC-registered.
+        // Always-on (even when NIX_V3_ARENA_NOROOT is unset) so the
+        // gate flip is safe — the side-table is a NO-OVERHEAD
+        // duplicate of the arena-scan path when arena registration
+        // is also active.
+        pushBridgeRoot(src);
         return t;
     }
 

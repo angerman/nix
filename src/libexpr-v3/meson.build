@@ -142,6 +142,11 @@ lib_sources = files(
   # registry for C++-stack roots.  See lode/GC_PRECISE_ROOT_FOUNDATION_
   # 2026-05-27.md.  Forward-looking infrastructure for Stage 6 production.
   'gc_root.cc',
+  # Arena deregistration side-table: per-thread bridge-source registry.
+  # See lode/ARENA_DEREGISTRATION_DESIGN_2026-05-27.md.  Tracks
+  # `nix::Value *` from Thunk::bridgeSrc so Boehm sees them as roots
+  # independently of arena registration.
+  'bridge_root_registry.cc',
   # #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
   'dedup_survey.cc',
   'disasm.cc',
