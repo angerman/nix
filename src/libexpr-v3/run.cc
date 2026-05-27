@@ -685,6 +685,41 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     ns.survivedBytes / 1e6,
                     ns.diedBytes     / 1e6,
                     mortality);
+                // Path B (2026-05-27, per PHASE_E_V02_DAY2_FALSIFIED):
+                // Bypass / overflow diagnostic — the Day-2 measurement
+                // showed a 10× gap between expected mortality savings
+                // and observed (334 MB ideal vs 33.6 MB actual on
+                // hello).  Likely cause: most allocations bypass the
+                // nursery via overflow → tenured-arena fallback.  This
+                // ratio tells the next session whether the bypass
+                // policy is the bottleneck.
+                //
+                // nursery_hits  = ns.allocCount (allocations that
+                //                  landed in the nursery)
+                // nursery_misses = ns.overflowCount (fell through to
+                //                  arena because nursery was full)
+                //
+                // If misses >> hits → nursery is too small for the
+                // workload's allocation rate → larger nursery OR
+                // more aggressive scavenge trigger.
+                // If hits >> misses → bypass isn't the issue; the
+                // low mortality is intrinsic to the workload.
+                {
+                    const uint64_t hits   = ns.allocCount;
+                    const uint64_t misses = ns.overflowCount;
+                    const uint64_t total  = hits + misses;
+                    const double hitPct = total > 0
+                        ? (double(hits) * 100.0 / double(total))
+                        : 0.0;
+                    std::fprintf(stderr,
+                        "v3-direct nursery routing: hits=%llu misses=%llu "
+                        "hit_rate=%.1f%% allocBytes=%.1fMB "
+                        "(Path B audit: bypass = arena fallback on full)\n",
+                        (unsigned long long)hits,
+                        (unsigned long long)misses,
+                        hitPct,
+                        ns.allocBytes / 1e6);
+                }
                 // #738 Phase E v0.2: when active, show per-region
                 // promotion breakdown.  yToS is age-1 survivors
                 // (kept in survivor pool, not tenured); sToT is

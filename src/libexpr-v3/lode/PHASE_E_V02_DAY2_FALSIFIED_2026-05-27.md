@@ -119,14 +119,40 @@ mortality.  Test:
 * If mortality rises above 50 % at acceptable wall, re-measure
   RSS budget
 
-### Path B — Audit what bypasses nursery (~1 d)
+### Path B — Audit what bypasses nursery (~1 d) — DONE 2026-05-27
 
-Add instrumentation to count allocations routed to nursery vs
-arena (Phase A's nurseryOrArena decision).  If most allocations
-bypass nursery → the bypass policy is too conservative; widening
-it may improve mortality+savings.  The Day-2 measurement
-discrepancy (~334 MB ideal savings vs 33.6 MB observed) suggests
-this is THE root cause to investigate.
+Instrumentation landed: `v3-direct nursery routing` line in
+NIX_VM_STATS dump (run.cc commit 2026-05-27 evening).  Counts
+`tryAlloc` hits (allocation landed in nursery) vs `overflowCount`
+(nursery was full → fell through to arena).
+
+**Measurement**:
+
+| Workload      | nursery hits | nursery misses | hit rate | nursery allocBytes |
+|---------------|--------------|----------------|----------|--------------------|
+| hello.drvPath |    481,557   |    1,065,184   |  31.1 %  |    33.6 MB         |
+| HNE           |  1,721,818   |    7,269,995   |  19.1 %  |   126.4 MB         |
+
+**Result**: nursery is STRUCTURALLY UNDERSIZED on these workloads.
+The 38.3 % mortality on HNE is measured on the 19 % of allocations
+that actually entered the nursery; 81 % bypass to arena because
+the nursery is FULL.  The 10× ideal-vs-observed savings gap from
+the Day-2 banner is EXPLAINED by the bypass rate.
+
+**Implication**: the real lever is **increasing the hit rate**,
+not increasing per-scavenge mortality.  Three sub-paths:
+
+* Larger nursery — more space before overflow → higher hit rate.
+  Already tested at 8 MB (hello): mortality dropped to 28.3 %
+  → smaller nursery is the WRONG direction.  Larger nursery is
+  worth a measurement spike, but the to-space overhead scales
+  with size (Cheney 2×) so RSS budget may bind.
+* More frequent scavenge — scavenge BEFORE nursery fills →
+  reclaim space → next allocs land in nursery → cumulative hit
+  rate rises.  This is the right architectural lever IF the
+  per-scavenge cost stays bounded.
+* Adaptive scavenge trigger — fire at X% full instead of 100%
+  full.  X = 50-75% is a reasonable starting point.
 
 ### EXPLICITLY NOT RECOMMENDED — fakeClo pool revival
 
