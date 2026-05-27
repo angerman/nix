@@ -94,6 +94,19 @@ public:
     /// new active→backup edges get forwarded the same way.
     void drain() noexcept;
 
+    /// Stage 6 Day 3 Step 2: forward standalone allocValue cells.
+    /// Mutates `standaloneCellRoots()` so each entry pointing into
+    /// active_ is moved to backup_ and the registry entry updated
+    /// to the new address.  Populates `forwardingCell_` so
+    /// subsequent visitSlot calls can resolve Tag::Slot pointers
+    /// that aimed at the moved cells.
+    ///
+    /// Must be called BEFORE `walkAllV3Roots(vm, mv)` so the
+    /// subsequent root walk dereferences the NEW cell addresses
+    /// directly.  Cells' payloads are visited via the standard
+    /// root walk (visitor.visitValue(*newCell)).
+    void walkStandaloneCells() noexcept;
+
     /// Statistics, captured during the scavenge.
     struct Stats {
         uint64_t closuresCopied = 0;

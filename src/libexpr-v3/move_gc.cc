@@ -34,6 +34,7 @@
 #include "v3/precise_root.hh"
 #include "v3/vm.hh"
 #include "v3/closure.hh"
+#include "v3/barrier.hh"  // standaloneCellRoots()
 
 #include <cstdio>
 #include <cstring>
@@ -202,19 +203,56 @@ void MajorScavenger::visitPair(ValuePair * & slot)
 
 void MajorScavenger::visitSlot(Value * & slot)
 {
-    // Tag::Slot dereferences a pointer to a Value in another cell.
-    // The slot pointer itself doesn't move (it's into an arena cell
-    // which IS being moved — but the cell's MEMBER address is what
-    // changes; we rely on the recursive walk to update the cell's
-    // internal slot pointers).  What we DO is walk through the
-    // pointed-to Value's payload to potentially forward THAT.
+    // Day 3 Step 2/3: Tag::Slot slot pointer may need rewriting.
     //
-    // Dedup so multiple Tag::Slot Values aliasing the same cell
-    // don't re-walk.
+    // Case 1 — slot points at a standalone cell that we already
+    // moved (Step 2): forward via cellForwarding_ table.
+    //
+    // Case 2 — slot points INSIDE a Bindings::entries[].value
+    // (the common let-rec slot pattern): defer to Step 3's
+    // post-drain resolution.  Day-3 Step 2 leaves this with the
+    // OLD pointer; the slot is broken if Bindings moves but
+    // Step 3 isn't yet implemented.  Production must wait for
+    // Step 3 — runMajorScavenge stays caller-invoked only.
+    //
+    // Case 3 — slot points at backup (already forwarded) or
+    // external: leave as-is.
+    if (!slot) return;
+    auto it = forwardingCell_.find(slot);
+    if (it != forwardingCell_.end()) {
+        // Case 1: standalone cell moved.  Update slot to new addr.
+        slot = it->second;
+    }
+    // For all cases: dedup-walk the pointed-to Value's payload to
+    // potentially forward THAT cell's contents.
     if (!slot) return;
     if (!cellsFollowed_.insert(slot).second) return;
     ++stats_.slotsFollowed;
     visitValue(*slot);
+}
+
+void MajorScavenger::walkStandaloneCells() noexcept
+{
+    auto & roots = standaloneCellRoots();
+    for (size_t i = 0; i < roots.size(); ++i) {
+        Value * oldCell = roots[i];
+        if (!oldCell) continue;
+        if (!arena_.inActive(oldCell)) continue;
+        // Allocate a new Value cell in backup_, copy the contents.
+        // sizeof(Value) is the canonical cell size; allocValue's
+        // arena alignment is 16-byte so allocInBackup matches.
+        Value * newCell = static_cast<Value *>(
+            arena_.allocInBackup(sizeof(Value)));
+        *newCell = *oldCell;
+        forwardingCell_.emplace(oldCell, newCell);
+        roots[i] = newCell;
+        // The new cell's payload may itself carry an arena pointer
+        // that needs forwarding.  Visit it via the standard
+        // dispatch — visitValue will route to the correct fwd*.
+        // This produces transitive worklist additions which drain
+        // processes later.
+        visitValue(*newCell);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +366,15 @@ void runMajorScavenge(VMState & vm) noexcept
 {
     Arena & arena = threadArena();
     MajorScavenger mv(arena);
+    // Day 3 Step 2: move standalone cells FIRST so subsequent
+    // visitSlot lookups find the forwarding entries.  Mutates
+    // standaloneCellRoots() in place.
+    mv.walkStandaloneCells();
+    // Step 3 (deferred): pre-walk Bindings to record entry
+    // addresses for post-drain pending-slot resolution.  Until
+    // Step 3 lands, Tag::Slot pointers into Bindings entries may
+    // dangle after swap.  runMajorScavenge stays caller-invoked
+    // only — see major_scavenge.hh class docstring.
     walkAllV3Roots(vm, mv);
     mv.drain();
     arena.swapRegions();
