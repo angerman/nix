@@ -1,5 +1,10 @@
 # `opt_occur.cc` — Implementation Plan (2026-05-08)
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 Status: PLAN (not implemented)
 Related: `OPTIMIZER_REPORT_2026-05-07.md` §4.1 (foundational analyses),
 `REVIEW_2026-05-08.md` recommendation #8.

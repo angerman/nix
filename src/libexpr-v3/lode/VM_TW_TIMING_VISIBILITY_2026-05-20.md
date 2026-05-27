@@ -1,5 +1,10 @@
 # VM / TW timing visibility — design note (2026-05-20)
 
+> **SUPERSEDED 2026-05-27**: Visibility addressed in profiling improvements. See [`PROFILING_IMPROVEMENTS_2026-05-24.md`](PROFILING_IMPROVEMENTS_2026-05-24.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 **Problem**: it's currently too hard to see how much wall time a v3
 eval spends inside the VM vs. inside TW callbacks reached via bridge.
 The infrastructure exists but is triple-gated and prints zero by

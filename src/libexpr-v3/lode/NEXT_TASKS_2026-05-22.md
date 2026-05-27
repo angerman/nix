@@ -1,5 +1,10 @@
 # Next Tasks — Spec (2026-05-22)
 
+> **SUPERSEDED 2026-05-27**: Newer tactical plan supersedes old task list. See [`NEXT_STEPS_2026-05-25.md`](NEXT_STEPS_2026-05-25.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 ## Premise
 
 The architectural goal is a **pure bytecode VM that is faster and

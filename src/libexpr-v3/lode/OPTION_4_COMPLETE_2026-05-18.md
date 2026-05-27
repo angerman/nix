@@ -1,5 +1,10 @@
 ## Option 4 hybrid complete — 2026-05-18
 
+> **SUPERSEDED 2026-05-27**: Completion captured in V3_TRUE_NATIVE arc + ROADMAP Stage 2 closure. See [`V3_TRUE_NATIVE_RCA_2026-05-24.md`](V3_TRUE_NATIVE_RCA_2026-05-24.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 This doc closes the action plan's Phase 1 ("Close the A-series with
 iterative forceValue").  Phase 1 exit criterion was:
 

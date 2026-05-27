@@ -1,5 +1,10 @@
 # Test infrastructure audit (2026-05-08)
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 A walk-through of the v3 test suite in `src/libexpr-v3/test/`, focused
 on the question: **do we use the regular nix evaluator (tree-walker)
 as oracle?**  Short answer: yes, in three modes, layered.  The cutover-

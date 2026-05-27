@@ -1,5 +1,10 @@
 # STG-8 Cell-Update Mechanism Audit (2026-05-08)
 
+> **SUPERSEDED 2026-05-27**: Audit findings codified into invariants doc. See [`CELL_INVARIANTS.md`](CELL_INVARIANTS.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 Static read-only audit of every Thunk allocation site and the cell
 field's set-and-fire behaviour.  Triggered by the observation that
 under `NIX_V3_STG_KEEP_HOOKS=1`, `(import <nixpkgs> {}).lib` still

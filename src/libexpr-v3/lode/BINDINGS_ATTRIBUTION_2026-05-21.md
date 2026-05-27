@@ -1,5 +1,10 @@
 # Bindings allocation attribution — Phase 1 spike (#746)
 
+> **SUPERSEDED 2026-05-27**: Newer HNE-specific attribution supersedes. See [`HNE_MEMORY_ATTRIBUTION_2026-05-26.md`](HNE_MEMORY_ATTRIBUTION_2026-05-26.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 **Date**: 2026-05-21
 **Author**: Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group
 **Status**: SPIKE LANDED — data captured; lever decision queued

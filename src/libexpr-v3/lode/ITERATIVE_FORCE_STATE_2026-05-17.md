@@ -1,5 +1,10 @@
 ## Iterative-force status — 2026-05-17
 
+> **SUPERSEDED 2026-05-27**: State doc absorbed into V3-NATIVE arc. See [`V3_TRUE_NATIVE_RCA_2026-05-24.md`](V3_TRUE_NATIVE_RCA_2026-05-24.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 **Hypothesis under test**: the audit's Phase 1.2 closure was sufficient
 for hello.name. **FALSIFIED today**.
 

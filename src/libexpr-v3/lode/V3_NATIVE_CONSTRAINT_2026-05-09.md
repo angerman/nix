@@ -1,5 +1,10 @@
 # V3 EVAL IS V3-NATIVE — TW IS FFI-LEAF ONLY
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 **Status: load-bearing architectural invariant.  Future fixes that
 violate it should be rejected at review.**
 

@@ -1,5 +1,10 @@
 # `with` — analysis and prior art (2026-05-07)
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 `with E; body` is the feature JavaScript banned in strict mode for the same
 reasons it makes Nix's evaluator hard.  This memo surveys the comparable
 features in other languages, why most of them are tractable, and what

@@ -1,5 +1,10 @@
 # Cell-Update Everywhere — Design Plan for #558 Architectural Fix
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 **Date:** 2026-05-12
 **Status:** Design + Phase 1 prototype
 **Goal:** Replace v3's partial-Bindings registry + STG WHNF recovery + chain-peek triad (S2 / S3 / S5 in COMPREHENSIVE_REPORT) with a per-thunk cell-update protocol.

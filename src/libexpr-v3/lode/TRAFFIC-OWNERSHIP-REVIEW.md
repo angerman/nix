@@ -1,5 +1,10 @@
 # v3 Eval-Traffic Ownership — A Critical Review
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 *2026-05-04. Companion to `GC-REVIEW.md`. Synthesises a code audit of
 `libexpr-v3/` (BENCH, OPTIMIZATION_PLAN, REVIEW, vm.cc, lower.cc, primops.cc,
 v3_hook.cc, fiber.cc) against VM literature on the primitive-vs-opcode

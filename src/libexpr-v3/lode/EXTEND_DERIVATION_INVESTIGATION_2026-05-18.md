@@ -1,5 +1,10 @@
 ## extendDerivation wall-time investigation — 2026-05-18
 
+> **SUPERSEDED 2026-05-27**: Bridge telemetry confirmed 0.014 % wall; investigation closed. See [`BRIDGE_TELEMETRY_2026-05-26.md`](BRIDGE_TELEMETRY_2026-05-26.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 User asked: "carefully investigate the extendDerivation issue."
 
 ### Setup

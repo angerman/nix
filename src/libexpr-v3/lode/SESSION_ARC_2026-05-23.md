@@ -1,5 +1,10 @@
 # V3 Perf Methodology Arc — 2026-05-23 mega-session
 
+> **SUPERSEDED 2026-05-27**: Session-arc state captured in snapshot series. See [`ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md`](ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 ## Purpose
 
 This document captures the methodology corrections + measurement

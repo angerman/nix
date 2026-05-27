@@ -1,3 +1,7 @@
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
 warning: Nix search path entry '/nix/var/nix/profiles/per-user/root/channels' does not exist, ignoring
 v3 OP_WITH_LOOKUP cycle: name='libsForQt5' base=0 top=1 vm=0x16fa31aa0 frames=94 pos=/nix/store/h2byxp60bh6pwjhm62mcgb6360w2kjfk-source/pkgs/top-level/stage.nix:150:7
   with[0] tag=16 -> SLOT(0xe84a13d90)=tag=10(thunk=0xe84a13db0 state=1)

@@ -1,5 +1,10 @@
 # v3 Optimizer — Comprehensive Report (2026-05-07)
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 A study of the existing optimization pipeline in
 `src/libexpr-v3/`, cross-referenced with the published literature on
 optimization for lazy functional bytecode VMs (STG, V8, Zinc, PyPy

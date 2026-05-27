@@ -1,5 +1,10 @@
 # v3 Env-Var Inventory — 2026-05-15
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 Per action plan Phase 0.16. Pre-condition for Phase 4 env-var
 consolidation.
 

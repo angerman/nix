@@ -1,5 +1,10 @@
 # Cardano-node M5 — bisection findings 2026-05-21
 
+> **SUPERSEDED 2026-05-27**: 919 MB baseline was WRONG at source; corrected version supersedes. See [`CARDANO_NODE_M5_2026-05-26.md`](CARDANO_NODE_M5_2026-05-26.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 > **CORRECTION 2026-05-26**: the "wall 10.2s, peak_rss 919 MB" headline in §"Headline" is **not reproducible** from the named commit (`2970dbd04`) on the original host. Same-host bisect (`git checkout 2970dbd04 -- src/libexpr-v3/` + rebuild) on 2026-05-26 produced 6969-8385 MB peak_rss. The 919 MB number was likely transcribed from a different sub-target (the bisect table below lists bech32.name at 6.8s — a much smaller workload). The "M5 within 4 GB watchdog" capability claim derived from this number is **falsified at source**. See [`CARDANO_NODE_M5_2026-05-26.md`](CARDANO_NODE_M5_2026-05-26.md) §"Update 2026-05-26 (late evening)" + memory `[[m5-regression-2026-05-26]]`. The bisect TABLE (target-by-target outcomes) below is still informative for v3-native callFlake's bug surface; the HEADLINE NUMBERS below it should not be trusted.
 
 ## Status: M5 COMPLETES today with `NIX_V3_NO_NATIVE_CALL_FLAKE=1`

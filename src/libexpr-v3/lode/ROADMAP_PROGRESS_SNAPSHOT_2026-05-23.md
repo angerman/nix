@@ -1,5 +1,10 @@
 # Roadmap Progress Snapshot — 2026-05-23 (Week 1 day 8)
 
+> **SUPERSEDED 2026-05-27**: Newer snapshot supersedes. See [`ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md`](ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 Snapshot of progress against `ROADMAP_TO_VISION_2026-05-15.md`, captured
 8 days after the roadmap was authored. Supersedes `ROADMAP_PROGRESS_SNAPSHOT_2026-05-22.md`
 which is now historically interesting but obsolete on Stage 2 / Stage 9.

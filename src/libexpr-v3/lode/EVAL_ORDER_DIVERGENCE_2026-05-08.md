@@ -1,5 +1,10 @@
 # Eval-order divergence: `(import <nixpkgs> {}).lib` under STG_KEEP_HOOKS=1
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 **Date**: 2026-05-08
 **Repro**: `NIX_USE_V3=1 NIX_V3_STG=1 NIX_V3_STG_KEEP_HOOKS=1 nix eval --impure --expr 'builtins.length (builtins.attrNames (import <nixpkgs> {}).lib)'` HANGS;
 without `STG_KEEP_HOOKS=1` returns `494`.

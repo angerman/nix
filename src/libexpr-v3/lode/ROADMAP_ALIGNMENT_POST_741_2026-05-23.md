@@ -1,5 +1,10 @@
 # ROADMAP alignment — post-#741 arc, 2026-05-23
 
+> **SUPERSEDED 2026-05-27**: Alignment captured in snapshot series. See [`ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md`](ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 After the full #741 IFD content-addressed eval-result cache
 architectural arc landed (11 commits, 11 Rule-0 falsifiers, full
 cross-process persistence + 95% cross-workload reuse + 0 wall

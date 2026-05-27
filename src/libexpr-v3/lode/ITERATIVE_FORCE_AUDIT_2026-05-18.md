@@ -1,5 +1,10 @@
 # Iterative ForceValue Audit — 2026-05-18
 
+> **SUPERSEDED 2026-05-27**: Audit absorbed into V3-NATIVE arc. See [`V3_TRUE_NATIVE_RCA_2026-05-24.md`](V3_TRUE_NATIVE_RCA_2026-05-24.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 Per action plan Phase 1.1. Pre-condition for the Phase 1.2 conversion
 of the highest-priority recursive site.
 

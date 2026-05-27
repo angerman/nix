@@ -1,5 +1,10 @@
 # v3 Codebase Cleanup Audit (2026-05-09)
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 Six parallel agents audited the v3 evaluator at `src/libexpr-v3/` for
 cleanup potential across six domains:
 1. Bytecode opcodes — `bytecode.hh`, `vm.cc` dispatch, `emit.cc`, `disasm.cc`.

@@ -1,5 +1,10 @@
 # Memory & GC Strategy in Nix v3 — A Critical Review
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 > **Status update (2026-05-07):** Phase 0 (CRIT-2/3/4 arena
 > correctness) closed via #432.  Phase 1+ (runtime GC redesign)
 > recommendations in this doc still useful as research, not yet

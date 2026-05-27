@@ -1,4 +1,9 @@
 # RCA Deeper Findings: cpuName thunk produces `{family}` without going through SELECT
+
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
 ## (continued from RCA_FAMILY_DIVERGENCE_FINDINGS_2026-05-11.md)
 
 **Date:** 2026-05-11 (late evening)

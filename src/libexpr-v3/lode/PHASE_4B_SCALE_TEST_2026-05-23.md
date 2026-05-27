@@ -1,5 +1,10 @@
 # Phase 4b scale test — decisive measurement, 2026-05-23
 
+> **SUPERSEDED 2026-05-27**: Post-RCA scale test supersedes (adds RCA + scope-bug fix + wall-positive). See [`PHASE_4B_SCALE_TEST_2026-05-24.md`](PHASE_4B_SCALE_TEST_2026-05-24.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 After `b248b0f8d` landed Phase 4b (forceDeep at import-exit + serialise
 for cross-process replay), this doc records the scale test on a
 **10000-attr synthetic IFD workload** to determine whether wall

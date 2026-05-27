@@ -1,5 +1,10 @@
 # Roadmap progress snapshot — 2026-05-26
 
+> **SUPERSEDED 2026-05-27**: Newer snapshot supersedes. See [`ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md`](ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 **Date:** 2026-05-26 (evening)
 **Author:** session synthesis
 **Status:** snapshot — point-in-time state of v3 vs `ROADMAP_TO_VISION_2026-05-15.md`

@@ -1,5 +1,10 @@
 # Roadmap alignment — 2026-05-23 post-#792 / pre-#741
 
+> **SUPERSEDED 2026-05-27**: Alignment captured in snapshot series. See [`ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md`](ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 A short alignment note linking today's mega-session work to the
 strategic doc set + the post-kill roadmap state.  Companion to
 `SESSION_ARC_2026-05-23.md` (the methodology arc) and

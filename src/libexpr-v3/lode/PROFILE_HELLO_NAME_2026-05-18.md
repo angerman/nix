@@ -1,5 +1,10 @@
 # Sample-driven cross-section: TW vs v3-direct on hello.name (2026-05-18)
 
+> **SUPERSEDED 2026-05-27**: Newer per-workload attribution. See [`HNE_MEMORY_ATTRIBUTION_2026-05-26.md`](HNE_MEMORY_ATTRIBUTION_2026-05-26.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 After Phase 1.6 landed, used `sample(1)` to profile the v3-vs-TW gap
 on the same workload that had regressed 2× since Phase-1-MET.  Data
 captured at HEAD `f045e3185`; sample tables archived under

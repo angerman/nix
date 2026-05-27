@@ -1,5 +1,10 @@
 # v3 / TW Time Measurement (2026-05-09)
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 The pure-v3 inversion goal needs a way to validate that "TW only for
 leaf store/IO callbacks" is *actually* the case during a real
 evaluation — not just on paper.  Without a percentage breakdown,

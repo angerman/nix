@@ -1,5 +1,10 @@
 # v3 Optimization Plan (post-parity, October 2026) — **SUPERSEDED 2026-05-18**
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 > **SUPERSEDED 2026-05-18**: this 3 774-line chronological log is historical context only.
 > For current strategic direction, see `ROADMAP_TO_VISION_2026-05-15.md` (long-horizon stages) and
 > `IR_OPTIMIZATION_PLAN_2026-05-18.md` (active IR Phases A-H, in progress 2026-05-18).

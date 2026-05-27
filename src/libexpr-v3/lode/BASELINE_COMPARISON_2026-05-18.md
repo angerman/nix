@@ -1,5 +1,10 @@
 # Baseline comparison: post-Option-4 → post-Phases-A-H (2026-05-18)
 
+> **SUPERSEDED 2026-05-27**: Baseline captured in snapshot. See [`ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md`](ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 ## Setup
 
 - **Pre-Phase-A baseline**: `2026-05-18-post-option4.json` (commit

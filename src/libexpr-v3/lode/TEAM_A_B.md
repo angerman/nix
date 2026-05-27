@@ -1,5 +1,10 @@
 # Team A / Team B split — feasibility (2026-05-07)
 
+> **ARCHIVED-IN-PLACE 2026-05-27**: This doc is historical (pre-strategic-doc-set or one-off RCA). Preserved here because it is still referenced from one or more KEEP docs. See [`LODE_CLEANUP_REVIEW_2026-05-27.md`](LODE_CLEANUP_REVIEW_2026-05-27.md) for the archival rationale.
+
+---
+
+
 Can two teams work in parallel on v3 — one finishing the FFI /
 runtime / "move everything into the VM" track, the other on the
 optimizer / IR / shape / hidden-class track? This report assesses

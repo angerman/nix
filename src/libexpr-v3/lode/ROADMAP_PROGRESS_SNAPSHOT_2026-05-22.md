@@ -1,5 +1,10 @@
 # Roadmap Progress Snapshot — 2026-05-22 (Week 1 of 44-week plan)
 
+> **SUPERSEDED 2026-05-27**: Newer snapshot supersedes. See [`ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md`](ROADMAP_PROGRESS_SNAPSHOT_2026-05-27.md). Preserved here for historical reference + back-link integrity.
+
+---
+
+
 > **⚠️ SUPERSEDED 2026-05-23 — see `ROADMAP_PROGRESS_SNAPSHOT_2026-05-23.md`**
 >
 > This snapshot was captured 2026-05-22 around 10am. In the ~12 hours
