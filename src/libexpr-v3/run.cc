@@ -568,6 +568,10 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // Retirement criterion: when Stage 6 lands the real precise GC
         // of v3 arena, fold into NIX_VM_STATS and remove the gate.
         dumpV3LiveFraction();
+        // Day 5 2026-05-28: per-block fill probe.  Decision data for
+        // Stage 6 generational tenured collector (GHC-RTS style).
+        // Gated NIX_V3_BLOCK_PROBE=1; zero cost otherwise.
+        dumpV3LiveBlockProbe();
         // #660 verification: dump bridge-primop call counts.  v3-eval
         // already does this via its own NIX_VM_STATS path; mirror here
         // so the integrated `nix` CLI (and any future v3 driver that

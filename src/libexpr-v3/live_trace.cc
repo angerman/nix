@@ -501,4 +501,370 @@ void dumpV3LiveFraction() noexcept
         "============================================================\n");
 }
 
+// ============================================================================
+// Day 5 2026-05-28: Per-block live-bytes probe.
+//
+// Decision-quality data for Stage 6 generational tenured collector
+// (per lode/STAGE_6_CHENEY_FALSIFIED_2026-05-27.md alt #2).
+//
+// Walks roots transitively (same shape as LiveTracer above), marks
+// reached cells PER TYPE so we know cell sizes, then attributes each
+// marked cell's bytes to the arena BLOCK containing it.  Reports:
+//   * Total arena bytes, total live bytes, freeable bytes
+//   * Per-block fill histogram (empty / <25% / <50% / <75% / 75%+)
+//   * Fully-dead block count + bytes (block-aware sweep recoverable)
+//
+// Pre-committed SHIP threshold for generational mark+sweep:
+//   ≥ 30% of arena recoverable via fully-dead block freeing.
+//
+// Below that, block-aware sweep doesn't justify the implementation
+// cost; need mark-compact or a different layout.  Above, generational
+// mark-sweep is viable.
+// ============================================================================
+namespace {
+
+class BlockProbe : public RootVisitor
+{
+public:
+    explicit BlockProbe(Arena & arena) noexcept : arena_(arena) {}
+
+    void visitClosure (Closure   * & p) override
+    {
+        if (!p || !arena_.inActive(p)) return;
+        if (!markedClosures_.insert(p).second) return;
+        worklist_.push_back({p, GK_CLOSURE});
+    }
+    void visitThunk(Thunk * & p) override
+    {
+        if (!p || !arena_.inActive(p)) return;
+        if (!markedThunks_.insert(p).second) return;
+        worklist_.push_back({p, GK_THUNK});
+    }
+    void visitBindings(Bindings * & p) override
+    {
+        if (!p || !arena_.inActive(p)) return;
+        if (!markedBindings_.insert(p).second) return;
+        worklist_.push_back({p, GK_BINDINGS});
+    }
+    void visitList(ListVec * & p) override
+    {
+        if (!p || !arena_.inActive(p)) return;
+        if (!markedLists_.insert(p).second) return;
+        worklist_.push_back({p, GK_LIST});
+    }
+    void visitPair(ValuePair * & p) override
+    {
+        if (!p || !arena_.inActive(p)) return;
+        if (!markedPairs_.insert(p).second) return;
+        worklist_.push_back({p, GK_PAIR});
+    }
+    void visitSlot(Value * & p) override
+    {
+        if (!p) return;
+        if (!markedCells_.insert(p).second) return;
+        // Walk the cell's content; the slot's TARGET (a Value)
+        // may carry pointers we haven't otherwise marked.
+        visitValue(*p);
+    }
+    void visitString(const char * & s) noexcept override
+    {
+        if (!s) return;
+        if (!arena_.inActive(const_cast<char *>(s))) return;
+        markedChars_.insert(s);
+    }
+    void visitPath(const char * & s) noexcept override
+    {
+        if (!s) return;
+        if (!arena_.inActive(const_cast<char *>(s))) return;
+        markedChars_.insert(s);
+    }
+
+    void drain() noexcept
+    {
+        while (!worklist_.empty()) {
+            Gray g = worklist_.back();
+            worklist_.pop_back();
+            switch (g.kind) {
+            case GK_CLOSURE:  walkClosure (static_cast<Closure   *>(g.ptr)); break;
+            case GK_THUNK:    walkThunk   (static_cast<Thunk     *>(g.ptr)); break;
+            case GK_BINDINGS: walkBindings(static_cast<Bindings  *>(g.ptr)); break;
+            case GK_LIST:     walkList    (static_cast<ListVec   *>(g.ptr)); break;
+            case GK_PAIR:     walkPair    (static_cast<ValuePair *>(g.ptr)); break;
+            }
+        }
+    }
+
+    void reportBlocks() noexcept
+    {
+        // Build per-block live-bytes map.  Block is identified by its
+        // begin pointer (Arena::blockRanges convention).
+        std::unordered_map<const char *, size_t> blockLive;
+        const auto ranges = arena_.blockRanges();
+
+        // Cache ranges sorted by begin for binary lookup.
+        // arena.blockRanges builds the vector each call; the call is
+        // O(N) and we credit M cells, so M log N total.
+        auto findBlock = [&](const void * cellPtr) -> const char * {
+            // Linear scan acceptable for first measurement (N ~ 100
+            // blocks on HNE).  Future: sorted-binary search per
+            // hypothesis ranking.
+            for (const auto & r : ranges) {
+                if (cellPtr >= (const void *)r.begin
+                    && cellPtr < (const void *)r.end)
+                    return r.begin;
+            }
+            return nullptr;  // External / huge-block / not in main blocks
+        };
+
+        size_t hugeBlockBytes = 0;
+        size_t hugeBlockLive = 0;
+
+        auto credit = [&](const void * cellPtr, size_t cellBytes) {
+            const char * blk = findBlock(cellPtr);
+            if (blk) {
+                blockLive[blk] += cellBytes;
+            } else {
+                // Could be huge or external.  Approximate: charge to
+                // hugeBlockLive (huge blocks aren't candidates for
+                // sweep since each is its own allocation).
+                hugeBlockLive += cellBytes;
+            }
+        };
+
+        for (Closure   * c : markedClosures_)
+            credit(c, sizeof(Closure) + sizeof(Value) * c->nUpvalues);
+        for (Thunk     * t : markedThunks_) {
+            size_t bytes = (t->state == ThunkState::Suspended
+                         || t->state == ThunkState::Native
+                         || t->state == ThunkState::Blackhole)
+                ? sizeof(Thunk) + sizeof(Value) * t->nUpvalues
+                : sizeof(Thunk);
+            credit(t, bytes);
+        }
+        for (Bindings  * b : markedBindings_)
+            credit(b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+        for (ListVec   * l : markedLists_)
+            credit(l, sizeof(ListVec) + sizeof(Value) * l->size);
+        for (ValuePair * p : markedPairs_)
+            credit(p, sizeof(ValuePair));
+        for (Value     * c : markedCells_)
+            credit(c, sizeof(Value));  // standalone allocValue cells
+        for (const char * s : markedChars_) {
+            const size_t n = std::strlen(s) + 1;
+            credit(s, n);
+        }
+
+        // Classify blocks by fill ratio.  kBlockSize is 16 MB
+        // (alloc.hh:613).  Huge blocks are reported separately.
+        constexpr size_t kBlockSize = Arena::kBlockSize;
+
+        size_t totalBlocks = 0;
+        size_t totalArenaBytes = 0;
+        size_t totalLiveBytes = 0;
+        size_t fullyDeadBlocks = 0;
+        size_t fullyDeadBytes  = 0;
+
+        // Histogram bins (live fraction within block).
+        size_t binEmpty = 0, binVeryLow = 0, binLow = 0,
+               binMid   = 0, binHigh   = 0, binFull = 0;
+
+        // Use a set of "regular" block begins (non-huge) for the
+        // classification.  Huge blocks are tracked separately.
+        // Arena::blockRanges enumerates BOTH; we mimic the boundary
+        // check by checking if the range's size equals kBlockSize.
+        for (const auto & r : ranges) {
+            const size_t rangeBytes =
+                static_cast<size_t>(r.end - r.begin);
+            const bool isHuge =
+                rangeBytes != kBlockSize
+                && r.end - r.begin != static_cast<ptrdiff_t>(kBlockSize);
+            if (isHuge) {
+                hugeBlockBytes += rangeBytes;
+                continue;
+            }
+            ++totalBlocks;
+            totalArenaBytes += rangeBytes;
+            auto it = blockLive.find(r.begin);
+            size_t live = (it == blockLive.end()) ? 0 : it->second;
+            totalLiveBytes += live;
+            if (live == 0) {
+                ++fullyDeadBlocks;
+                fullyDeadBytes += rangeBytes;
+            }
+            const double fill = double(live) / double(rangeBytes);
+            if (fill < 0.01)      ++binEmpty;
+            else if (fill < 0.10) ++binVeryLow;
+            else if (fill < 0.25) ++binLow;
+            else if (fill < 0.50) ++binMid;
+            else if (fill < 0.75) ++binHigh;
+            else                  ++binFull;
+        }
+
+        std::fprintf(stderr,
+            "\n=================== v3 LIVE-BLOCK PROBE ===================\n"
+            "Decision data for Stage 6 generational tenured collector\n"
+            "(per lode/STAGE_6_CHENEY_FALSIFIED_2026-05-27.md alt #2).\n"
+            "\n"
+            "Reachable: closures=%zu thunks=%zu bindings=%zu lists=%zu\n"
+            "           pairs=%zu cells=%zu chars=%zu\n",
+            markedClosures_.size(), markedThunks_.size(),
+            markedBindings_.size(), markedLists_.size(),
+            markedPairs_.size(), markedCells_.size(),
+            markedChars_.size());
+
+        const double fillRatio = totalArenaBytes
+            ? double(totalLiveBytes) / double(totalArenaBytes) : 0.0;
+        const double sweepablePct = totalArenaBytes
+            ? 100.0 * double(fullyDeadBytes) / double(totalArenaBytes) : 0.0;
+
+        std::fprintf(stderr,
+            "\n"
+            "Regular blocks (kBlockSize=%zu MB):\n"
+            "  total           %zu  (%.1f MB)\n"
+            "  live-bytes-sum     %.1f MB  (avg fill = %.1f%%)\n"
+            "  fully-dead         %zu  (%.1f%% of blocks)\n"
+            "  fully-dead-bytes   %.1f MB  (%.1f%% of arena -- SWEEPABLE)\n"
+            "\n"
+            "Fill histogram (per-block live fraction):\n"
+            "  empty (0%%)        %zu\n"
+            "  very-low (<10%%)   %zu\n"
+            "  low (<25%%)        %zu\n"
+            "  mid (<50%%)        %zu\n"
+            "  high (<75%%)       %zu\n"
+            "  full (75%%+)       %zu\n"
+            "\n"
+            "Huge blocks (oversized allocations):\n"
+            "  total-bytes        %.1f MB\n"
+            "  live-bytes         %.1f MB  (live fraction = %.1f%%)\n",
+            kBlockSize >> 20,
+            totalBlocks, totalArenaBytes / 1e6,
+            totalLiveBytes / 1e6, 100.0 * fillRatio,
+            fullyDeadBlocks,
+            100.0 * double(fullyDeadBlocks) /
+                std::max<size_t>(1, totalBlocks),
+            fullyDeadBytes / 1e6, sweepablePct,
+            binEmpty, binVeryLow, binLow, binMid, binHigh, binFull,
+            hugeBlockBytes / 1e6, hugeBlockLive / 1e6,
+            hugeBlockBytes ?
+                100.0 * double(hugeBlockLive) / double(hugeBlockBytes) :
+                0.0);
+
+        // Pre-committed SHIP threshold from STAGE_6_CHENEY_FALSIFIED:
+        // ≥ 30% of arena recoverable via fully-dead-block sweep.
+        const double shipThresholdPct = 30.0;
+        std::fprintf(stderr,
+            "\n"
+            "VERDICT (pre-committed threshold: >=%.0f%% sweepable):\n"
+            "  measured: %.1f%% sweepable -> %s\n"
+            "============================================================\n",
+            shipThresholdPct,
+            sweepablePct,
+            sweepablePct >= shipThresholdPct
+                ? "PASS: generational mark+sweep is VIABLE"
+                : "FAIL: blocks too uniformly populated; reconsider design");
+    }
+
+private:
+    Arena & arena_;
+    enum GrayKindLocal : uint8_t {
+        GK_CLOSURE = 0, GK_THUNK, GK_BINDINGS, GK_LIST, GK_PAIR
+    };
+    struct Gray { void * ptr; GrayKindLocal kind; };
+    std::vector<Gray> worklist_;
+
+    std::unordered_set<Closure   *> markedClosures_;
+    std::unordered_set<Thunk     *> markedThunks_;
+    std::unordered_set<Bindings  *> markedBindings_;
+    std::unordered_set<ListVec   *> markedLists_;
+    std::unordered_set<ValuePair *> markedPairs_;
+    std::unordered_set<Value     *> markedCells_;
+    std::unordered_set<const char *> markedChars_;
+
+    void walkClosure(Closure * c) noexcept
+    {
+        if (c->capturedWiths) visitList(c->capturedWiths);
+        for (uint16_t i = 0; i < c->nUpvalues; ++i)
+            visitValue(c->upvalues[i]);
+    }
+    void walkThunk(Thunk * t) noexcept
+    {
+        if (t->cell)      visitSlot(t->cell);
+        if (t->shapeCell) visitSlot(t->shapeCell);
+        switch (t->state) {
+        case ThunkState::Suspended:
+        case ThunkState::Blackhole:
+            if (t->suspended.capturedWiths)
+                visitList(t->suspended.capturedWiths);
+            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                visitValue(t->tail[i]);
+            break;
+        case ThunkState::Evaluated:
+            visitValue(t->evaluated);
+            break;
+        case ThunkState::Native:
+            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                visitValue(t->tail[i]);
+            break;
+        case ThunkState::Bridge:
+            // bridgeSrc is TW nix::Value*; not v3 heap.
+            break;
+        }
+    }
+    void walkBindings(Bindings * b) noexcept
+    {
+        for (uint32_t i = 0; i < b->size; ++i)
+            visitValue(b->entries[i].value);
+        if (b->parent)
+            visitBindings(const_cast<Bindings *&>(b->parent));
+    }
+    void walkList(ListVec * l) noexcept
+    {
+        for (uint32_t i = 0; i < l->size; ++i)
+            visitValue(l->elems[i]);
+    }
+    void walkPair(ValuePair * p) noexcept
+    {
+        visitValue(p->left);
+        visitValue(p->right);
+        visitValue(p->evaluated);
+    }
+};
+
+} // namespace
+
+void dumpV3LiveBlockProbe() noexcept
+{
+    static const bool s_enabled =
+        std::getenv("NIX_V3_BLOCK_PROBE") != nullptr;
+    if (!s_enabled) return;
+
+    // Fire once per process (mirrors dumpV3LiveFraction's gate).
+    static std::atomic<size_t> s_lastArena{0};
+    Arena & arena = threadArena();
+    const size_t curArena = arena.bytesAllocated();
+    if (curArena < s_lastArena.load(std::memory_order_relaxed) + (1 << 16))
+        return;
+    s_lastArena.store(curArena, std::memory_order_relaxed);
+
+    BlockProbe pr(arena);
+
+    bool walkedActiveVM = false;
+    const auto & stack = activeVMStack();
+    if (!stack.empty() && stack.back()) {
+        walkAllV3Roots(*stack.back(), pr);
+        walkedActiveVM = true;
+    } else {
+        walkGlobalV3Roots(pr);
+    }
+    pr.drain();
+
+    if (!walkedActiveVM) {
+        std::fprintf(stderr,
+            "\n[NIX_V3_BLOCK_PROBE: VMState already torn down — "
+            "results are a LOWER BOUND (only global persistent roots "
+            "reachable)]\n");
+    }
+    pr.reportBlocks();
+}
+
 } // namespace nix::v3

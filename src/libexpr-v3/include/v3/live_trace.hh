@@ -63,4 +63,21 @@ namespace nix::v3 {
 /// scripts (see `bench/m5-cron.sh` for the ledger convention).
 void dumpV3LiveFraction() noexcept;
 
+/// Day 5 2026-05-28: per-block live-bytes probe for the Stage 6
+/// generational tenured collector decision (per
+/// `lode/STAGE_6_CHENEY_FALSIFIED_2026-05-27.md` alternative #2).
+///
+/// GHC RTS-style block-aware sweep can only free arena blocks that
+/// are FULLY DEAD.  This probe walks all precise roots, marks
+/// reached cells, attributes their bytes to containing arena blocks,
+/// and reports the histogram of per-block fill ratios + the
+/// freeable-block fraction.
+///
+/// Pre-committed SHIP threshold: ≥30% of arena bytes recoverable via
+/// fully-dead block freeing.  If the measurement falls below this,
+/// reconsider design (mark-compact instead of mark-sweep).
+///
+/// No-op unless `NIX_V3_BLOCK_PROBE=1`.
+void dumpV3LiveBlockProbe() noexcept;
+
 } // namespace nix::v3
