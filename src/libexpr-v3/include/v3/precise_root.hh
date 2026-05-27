@@ -75,6 +75,20 @@ struct RootVisitor
     /// pointed-to Value may carry its own payload that needs walking.
     virtual void visitSlot     (Value     * & slot) = 0;
 
+    /// Stage 6 Day 4: arena-allocated raw bytes (Alloc::allocChars).
+    /// Tag::String + Tag::Path carry a `const char *` to a buffer in
+    /// the v3 arena.  For non-moving visitors these are no-ops;
+    /// MajorScavenger forwards each buffer to its NEW backup-resident
+    /// address (with string-context side-table re-keying).
+    ///
+    /// Default no-op so existing visitors (LiveTracer, DumpVisitor,
+    /// TagCountVisitor, etc.) need no change — they don't care
+    /// about string forwarding.  Pure virtual would force every
+    /// visitor to implement; default-impl trades pure-virtual safety
+    /// for migration simplicity.
+    virtual void visitString   (const char * & s) noexcept { (void)s; }
+    virtual void visitPath     (const char * & s) noexcept { (void)s; }
+
     /// Convenience: visit a Value slot.  Dispatches on `tag()` and
     /// calls the appropriate typed callback.  Scalar tags are
     /// no-ops.  Non-virtual to give the compiler full visibility for
@@ -101,14 +115,18 @@ struct RootVisitor
         case Tag::Slot:
             visitSlot(v.payload.slot);
             break;
+        case Tag::String:
+            visitString(v.payload.str);
+            break;
+        case Tag::Path:
+            visitPath(v.payload.path);
+            break;
         // Scalar / external tags: no v3-heap pointer to walk.
         case Tag::Uninitialized:
         case Tag::Int:
         case Tag::Float:
         case Tag::Bool:
         case Tag::Null:
-        case Tag::String:
-        case Tag::Path:
         case Tag::PrimOp:
         case Tag::Blackhole:
         case Tag::External:

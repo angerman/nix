@@ -36,6 +36,7 @@
 #include "v3/closure.hh"
 #include "v3/barrier.hh"  // standaloneCellRoots()
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -171,6 +172,71 @@ ValuePair * MajorScavenger::fwdPair(ValuePair * p)
     return newP;
 }
 
+Value * MajorScavenger::fwdCell(Value * c) noexcept
+{
+    if (!c) return nullptr;
+    if (!arena_.inActive(c)) return c;  // External / backup → leave
+    auto it = forwardingCell_.find(c);
+    if (it != forwardingCell_.end()) return it->second;
+
+    Value * newC = static_cast<Value *>(
+        arena_.allocInBackup(sizeof(Value)));
+    *newC = *c;  // memcpy-equivalent; Value is trivially copyable
+    forwardingCell_.emplace(c, newC);
+    // Walk the cell's content INLINE.  No gray-work optimisation
+    // for cells (sizeof(Value) — too small to amortise queueing).
+    // visitValue may add gray Closure/Thunk/etc. work (drained
+    // by the caller's fixed-point loop) or more pendingSlots_
+    // (processed by subsequent resolvePendingSlots iterations).
+    visitValue(*newC);
+    return newC;
+}
+
+const char * MajorScavenger::fwdChars(const char * p) noexcept
+{
+    if (!p) return nullptr;
+    // arena_.inActive takes a non-const void *; const_cast is safe
+    // because inActive only reads (block range checks).
+    if (!arena_.inActive(const_cast<char *>(p))) return p;
+    auto it = forwardingChars_.find(p);
+    if (it != forwardingChars_.end()) return it->second;
+
+    // Length via strlen — allocChars's contract is null-terminated
+    // (alloc.hh:1205-1207).  Include the terminating null byte in
+    // the copy so callers that rely on string_view(p) (no explicit
+    // length) continue to work.
+    const size_t n = std::strlen(p);
+    char * newP = static_cast<char *>(arena_.allocInBackup(n + 1));
+    std::memcpy(newP, p, n + 1);
+    forwardingChars_.emplace(p, newP);
+
+    // String context side-table re-key.  stringContextSideTable
+    // (alloc.hh:2374) is `unordered_map<const char *, vector<string>>`
+    // keyed by the buffer address; after forwarding we need the
+    // NEW address to retrieve the context.  Move the entry; the
+    // OLD key will be unreachable post swap+free.
+    auto & tbl = stringContextSideTable();
+    auto cIt = tbl.find(p);
+    if (cIt != tbl.end()) {
+        tbl[newP] = std::move(cIt->second);
+        tbl.erase(cIt);
+    }
+
+    ++stats_.charsCopied;
+    stats_.bytesCopied += n + 1;
+    return newP;
+}
+
+void MajorScavenger::visitString(const char * & s) noexcept
+{
+    s = fwdChars(s);
+}
+
+void MajorScavenger::visitPath(const char * & s) noexcept
+{
+    s = fwdChars(s);
+}
+
 // ---------------------------------------------------------------------------
 // RootVisitor interface — each visit rewrites the slot to the
 // forwarded address (if active) or leaves it (if external/backup).
@@ -203,38 +269,34 @@ void MajorScavenger::visitPair(ValuePair * & slot)
 
 void MajorScavenger::visitSlot(Value * & slot)
 {
-    // Day 3 Step 2/3: Tag::Slot slot pointer may need rewriting.
+    // Day 3 Steps 2/3/6: rewrite a Tag::Slot pointer to its NEW
+    // post-scavenge target address.  Three cases:
     //
-    // Case 1 — slot points at a standalone cell that we already
-    // moved (Step 2): forward via forwardingCell_ table.
+    // Case 1 — slot already forwarded (we've copied the cell in a
+    // prior visitSlot or fwdCell call): direct lookup, rewrite.
     //
-    // Case 2 — slot points INSIDE a Bindings::entries[].value
-    // (the common let-rec slot pattern): defer to Step 3's
-    // post-drain resolution via pendingSlots_.  The slot's owner
-    // (which Bindings) is unknown at visit time; needs all
-    // Bindings to be forwarded first.
+    // Case 2 — slot points into active_ but not yet forwarded.
+    // Per Tag::Slot design (vm.cc:4618 / 8783 / 8823; emit.cc:968,
+    // 1091, 1356; lower.cc:390 / 2889), the target is either
+    // inside a Bindings::entries[i].value or a standalone
+    // allocValue cell.  We can't reliably classify here at visit
+    // time because some Bindings may not yet be forwarded.  Defer
+    // both shapes to post-drain `resolvePendingSlots`.
     //
-    // Case 3 — slot points at backup (already forwarded) or
-    // external: leave as-is.
+    // Case 3 — slot points at backup or external memory: leave.
     if (!slot) return;
     auto it = forwardingCell_.find(slot);
     if (it != forwardingCell_.end()) {
-        // Case 1: standalone cell moved.  Update slot to new addr.
+        // Case 1: already-forwarded standalone cell.
         slot = it->second;
     } else if (arena_.inActive(slot)) {
-        // Case 2: slot points into active_ but isn't standalone.
-        // Must be inside a Bindings (the only other arena-resident
-        // Value carrier per the Tag::Slot usage semantics).  Queue
-        // for post-drain resolution.
+        // Case 2: defer classification + rewrite to post-drain.
         pendingSlots_.push_back(&slot);
-        // Don't recurse-walk via *slot here — the slot may still
-        // point at OLD active memory which will be invalid after
-        // swap.  But we DO need to walk the slot's contents to
-        // forward any nested arena pointers.  Two options:
-        //   (a) walk *slot now (OLD address, pre-resolve)
-        //   (b) walk after resolution (NEW address)
-        // (a) is safer because the OLD memory is still readable
-        // and the resolve step is purely a pointer rewrite.
+        // Walk the OLD cell's content now while it's still
+        // readable — forwards any nested arena pointers
+        // (typed cells like Closure/Thunk reached through this
+        // slot's payload).  The OLD address is valid until
+        // arena.freeBackupBlocks fires after swapRegions.
         if (!cellsFollowed_.insert(slot).second) return;
         ++stats_.slotsFollowed;
         visitValue(*slot);
@@ -247,50 +309,129 @@ void MajorScavenger::visitSlot(Value * & slot)
     visitValue(*slot);
 }
 
+// Day 4: rebuild sortedBindings_ index from forwardingBindings_.
+// Called by resolvePendingSlots at the start of each iteration if
+// forwardingBindings_ has grown since the last sort.  Sorted by
+// OLD pointer so binary search can locate the owning Bindings in
+// O(log B) instead of the naive O(B) linear scan that hung HNE.
+void MajorScavenger::rebuildSortedBindings() noexcept
+{
+    sortedBindings_.clear();
+    sortedBindings_.reserve(forwardingBindings_.size());
+    for (auto & kv : forwardingBindings_) {
+        Bindings * oldB = kv.first;
+        Bindings * newB = kv.second;
+        const size_t bytes = sizeof(Bindings)
+            + sizeof(Bindings::Entry) * oldB->size;
+        sortedBindings_.push_back({oldB, newB, static_cast<uint32_t>(bytes)});
+    }
+    std::sort(sortedBindings_.begin(), sortedBindings_.end(),
+        [](const BindingsRange & a, const BindingsRange & b) {
+            return reinterpret_cast<uintptr_t>(a.oldP)
+                 < reinterpret_cast<uintptr_t>(b.oldP);
+        });
+}
+
 void MajorScavenger::resolvePendingSlots() noexcept
 {
-    // Day 3 Step 3: each pending slot points into an OLD Bindings
-    // (active_-resident at visit time, now in backup_ since the
-    // OLD active is the post-copy backup).  Find the owning OLD
-    // Bindings by byte-range search through forwardingBindings_,
-    // then offset-forward to the NEW Bindings' corresponding entry.
-    for (Value ** slotAddr : pendingSlots_) {
-        if (!slotAddr) continue;
-        Value * oldSlot = *slotAddr;
-        if (!oldSlot) continue;
-        // Already forwarded (e.g., to a standalone cell in
-        // forwardingCell_)?  Skip.
-        if (forwardingCell_.count(oldSlot)) continue;
-
-        // Linear scan forwardingBindings_ — find owning OLD
-        // Bindings.  We need oldB->size (still readable since
-        // freeBackupBlocks hasn't fired yet).
-        const char * slotCp = reinterpret_cast<const char *>(oldSlot);
-        for (auto & [oldP, newP] : forwardingBindings_) {
-            Bindings * oldB = oldP;
-            const char * oldBcp = reinterpret_cast<const char *>(oldB);
-            const size_t oldBytes = sizeof(Bindings)
-                + sizeof(Bindings::Entry) * oldB->size;
-            if (slotCp >= oldBcp && slotCp < oldBcp + oldBytes) {
-                // Found owner.  Offset-forward.
-                ptrdiff_t offset = slotCp - oldBcp;
-                Bindings * newB = newP;
-                *slotAddr = reinterpret_cast<Value *>(
-                    reinterpret_cast<char *>(newB) + offset);
-                break;
-            }
+    // Day 3 Step 3 + Step 6: each pending slot points at a Value
+    // cell in active_.  Per Tag::Slot design semantics (vm.cc:4618 /
+    // 8783 / 8823; emit.cc:968 / 1091 / 1356; lower.cc:390 / 2889),
+    // the target is one of exactly two shapes:
+    //
+    //   (a) Inside `Bindings::entries[i].value` — produced by
+    //       OP_REC_BINDING_SLOT_REF for rec-attrset entries.
+    //   (b) A standalone `Alloc::allocValue()` cell — produced by
+    //       OP_REC_SLOT_PUBLISH and OP_THUNK_SET_LOCAL_THROUGH_CELL.
+    //
+    // Resolution:
+    //   (a) → byte-range search through forwardingBindings_,
+    //         offset-forward to the NEW Bindings' entry.
+    //   (b) → fwdCell (discover + copy + register).
+    //
+    // Why not a per-type byte-range search for Closure / Thunk
+    // (the Day-4 evening attempt): cells do NOT live inside
+    // Closure::upvalues[] or Thunk::tail[].  Closure / Thunk fields
+    // are walked by their own walk*() and reached transitively via
+    // fwd*() — they are never Tag::Slot targets.  Adding such
+    // searches risks false-positive matches against memory
+    // coincidences (a Value-sized region inside a Closure header
+    // happening to coincide with a slot's byte offset), which on
+    // HNE hung the major scavenge.  Falsified 2026-05-27.
+    //
+    // fwdCell's visitValue may add gray work (transitively reached
+    // typed cells) or new pendingSlots_ (Tag::Slot inside the copied
+    // cell).  Outer loop drains both per iteration; terminates
+    // because forwardingCell_/forwardingBindings_/etc. dedup ensures
+    // each arena cell is processed at most once.
+    while (!pendingSlots_.empty()) {
+        // Day 4: rebuild sorted index if forwardingBindings_ has
+        // grown since the last sort (cheap O(B log B) re-sort once
+        // per outer iteration; replaces O(P × B) linear scan
+        // per slot per iteration).
+        if (forwardingBindings_.size() != sortedBindingsCount_) {
+            rebuildSortedBindings();
+            sortedBindingsCount_ = forwardingBindings_.size();
         }
-        // If no owner found: slot pointed at active_ but not into
-        // a forwarded Bindings.  This could indicate:
-        //   - A pointer into a Closure upvalues / Thunk tail
-        //     (Step 6 follow-up; rarer let-rec pattern)
-        //   - An external pointer that regionOf misclassified
-        //     (shouldn't happen)
-        // Day-3 leaves the slot pointing at OLD address; after
-        // swap+free it dangles.  Caller-invoked-only safety
-        // remains until Step 6.
+
+        std::vector<Value **> current = std::move(pendingSlots_);
+        pendingSlots_.clear();
+        bool didDiscover = false;
+
+        for (Value ** slotAddr : current) {
+            if (!slotAddr) continue;
+            Value * oldSlot = *slotAddr;
+            if (!oldSlot) continue;
+
+            // Case (a-prime): already-forwarded standalone cell.
+            // (A previous iteration may have moved it via fwdCell.)
+            auto fIt = forwardingCell_.find(oldSlot);
+            if (fIt != forwardingCell_.end()) {
+                *slotAddr = fIt->second;
+                continue;
+            }
+
+            // Case (a): Bindings-resident slot.  Binary search
+            // (sorted by OLD pointer) for the owning Bindings.
+            const char * slotCp = reinterpret_cast<const char *>(oldSlot);
+            bool resolved = false;
+            // upper_bound finds the first range with oldP > slotCp.
+            // We want the range with oldP <= slotCp (and slotCp <
+            // oldP + bytes), so back up one.
+            auto upper = std::upper_bound(
+                sortedBindings_.begin(), sortedBindings_.end(),
+                slotCp,
+                [](const char * cp, const BindingsRange & r) {
+                    return cp < reinterpret_cast<const char *>(r.oldP);
+                });
+            if (upper != sortedBindings_.begin()) {
+                auto & r = *(upper - 1);
+                const char * oldBcp =
+                    reinterpret_cast<const char *>(r.oldP);
+                if (slotCp >= oldBcp && slotCp < oldBcp + r.bytes) {
+                    ptrdiff_t offset = slotCp - oldBcp;
+                    *slotAddr = reinterpret_cast<Value *>(
+                        reinterpret_cast<char *>(r.newP) + offset);
+                    resolved = true;
+                }
+            }
+            if (resolved) continue;
+
+            // Case (b): standalone allocValue cell — fwdCell.
+            if (arena_.inActive(oldSlot)) {
+                *slotAddr = fwdCell(oldSlot);
+                didDiscover = true;
+            }
+            // else: external pointer (regionOf misclassification
+            // would be a bug elsewhere; leave as-is).
+        }
+
+        // visitValue calls inside fwdCell may have enqueued gray
+        // work (Closure / Thunk / Bindings / List / Pair) — drain.
+        if (didDiscover) drain();
+        // pendingSlots_ may have grown during this iteration's
+        // fwdCell→visitValue chain; the outer while-loop handles it.
     }
-    pendingSlots_.clear();
 }
 
 void MajorScavenger::walkStandaloneCells() noexcept
@@ -376,13 +517,19 @@ void MajorScavenger::walkThunk(Thunk * t) noexcept
             // implies the Thunk's cellContainer was external while
             // its cell pointed into active — inconsistent state.
         } else {
-            // Case (b): standalone — direct forwarding lookup.
-            auto it = forwardingCell_.find(cellSlot);
-            if (it != forwardingCell_.end())
-                cellSlot = it->second;
-            // else: cell wasn't in active OR Step 2 didn't move
-            // it (cell wasn't in standaloneCellRoots, e.g.,
-            // ephemeral non-registered Values).  Document risk.
+            // Case (b): standalone — discover-and-copy.
+            //
+            // Day 3 Step 6 fix: previously this looked up only the
+            // forwardingCell_ table populated by Step 2's
+            // walkStandaloneCells.  But `Alloc::allocValue()`
+            // (alloc.hh:999) doesn't push to `standaloneCellRoots()`
+            // — the registry is empty in production.  Cells from
+            // OP_THUNK_SET_LOCAL_THROUGH_CELL (vm.cc:8823) attached
+            // via cellOwnRecordSet are reachable only via the
+            // Thunk::cell pointer here.  Use fwdCell to copy on
+            // discovery; subsequent fwdCell calls see the forwarding
+            // entry and dedup.
+            cellSlot = fwdCell(cellSlot);
         }
     };
     forwardCellPtr(t->cell);
@@ -483,12 +630,14 @@ void runMajorScavenge(VMState & vm) noexcept
         const auto & s = mv.stats();
         std::fprintf(stderr,
             "v3-direct major-scavenge: closures=%llu thunks=%llu bindings=%llu "
-            "lists=%llu pairs=%llu bytesCopied=%.1fMB slotsFollowed=%llu\n",
+            "lists=%llu pairs=%llu chars=%llu bytesCopied=%.1fMB "
+            "slotsFollowed=%llu\n",
             (unsigned long long)s.closuresCopied,
             (unsigned long long)s.thunksCopied,
             (unsigned long long)s.bindingsCopied,
             (unsigned long long)s.listsCopied,
             (unsigned long long)s.pairsCopied,
+            (unsigned long long)s.charsCopied,
             s.bytesCopied / 1e6,
             (unsigned long long)s.slotsFollowed);
     }

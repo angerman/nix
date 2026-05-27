@@ -2713,7 +2713,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         static const bool s_majorGcEnabled =
             std::getenv("NIX_V3_MAJOR_GC") != nullptr;
         if (__builtin_expect(s_majorGcEnabled, 0)) [[unlikely]] {
-            static const size_t s_majorGcThresholdBytes = [] {
+            static const size_t s_majorGcInitialThresholdBytes = [] {
                 const char * v =
                     std::getenv("NIX_V3_MAJOR_GC_THRESHOLD_MB");
                 long mb = 256;
@@ -2722,6 +2722,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (parsed >= 16 && parsed <= 32768) mb = parsed;
                 }
                 return static_cast<size_t>(mb) << 20;
+            }();
+            // Dynamic threshold: starts at initial; after each scavenge
+            // raises to `max(initial, post_scavenge_arena * growth)` so
+            // a scavenge whose live-set ALONE exceeds the initial
+            // threshold doesn't re-fire on the very next iteration.
+            //
+            // Failure mode this prevents (observed on HNE 2026-05-27):
+            // live set ~474 MB, initial threshold 256 MB → every
+            // dispatch tick after scavenge re-fires, copying the same
+            // 474 MB live set over and over.  CPU pegged, no eval
+            // progress.
+            //
+            // growth=2 is a conservative starting point — wait until
+            // arena DOUBLES post-scavenge before next collection.
+            // Tunable via NIX_V3_MAJOR_GC_GROWTH (float, 1.5-8.0).
+            static thread_local size_t s_majorGcThresholdBytes =
+                s_majorGcInitialThresholdBytes;
+            static const double s_majorGcGrowth = [] {
+                const char * v =
+                    std::getenv("NIX_V3_MAJOR_GC_GROWTH");
+                if (v) {
+                    double d = std::strtod(v, nullptr);
+                    if (d >= 1.5 && d <= 8.0) return d;
+                }
+                return 2.0;
             }();
             Arena & arena = threadArena();
             if (arena.bytesAllocated() >= s_majorGcThresholdBytes
@@ -2749,6 +2774,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         stackBase = f.stackBaseOffset;
                         ip        = f.ip;
                     }
+                    // Raise threshold: don't re-fire until arena
+                    // grows by `growth-factor × live_set`.
+                    size_t liveSet = arena.bytesAllocated();
+                    size_t nextThreshold =
+                        static_cast<size_t>(liveSet * s_majorGcGrowth);
+                    if (nextThreshold < s_majorGcInitialThresholdBytes)
+                        nextThreshold = s_majorGcInitialThresholdBytes;
+                    s_majorGcThresholdBytes = nextThreshold;
                 }
             }
         }

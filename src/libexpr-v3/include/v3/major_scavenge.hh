@@ -88,6 +88,8 @@ public:
     void visitList    (ListVec   * & slot) override;
     void visitPair    (ValuePair * & slot) override;
     void visitSlot    (Value     * & slot) override;
+    void visitString  (const char * & s) noexcept override;
+    void visitPath    (const char * & s) noexcept override;
 
     /// After the root walk, drain the worklist of copied cells.
     /// Each copied cell's pointer fields are visited transitively;
@@ -107,27 +109,30 @@ public:
     /// root walk (visitor.visitValue(*newCell)).
     void walkStandaloneCells() noexcept;
 
-    /// Stage 6 Day 3 Step 3: resolve pending Tag::Slot pointers
-    /// that point inside a Bindings::entries[i].value.  During
-    /// the walk, visitSlot can't find the owning Bindings cheaply
-    /// (the slot is a Value*, the owning Bindings could be any
-    /// of N copied Bindings).  So we defer to a post-drain pass:
-    ///   1. visitSlot records non-standalone active slots in
-    ///      `pendingSlots_`.
-    ///   2. After drain (all Bindings forwarded), this method
-    ///      scans `forwardingBindings_` for each pending slot's
-    ///      owning Bindings via byte-range check, then offset-
-    ///      forwards.
+    /// Stage 6 Day 3 Steps 3 + 6: resolve pending Tag::Slot
+    /// pointers deferred at visit time.  Two target shapes per
+    /// Tag::Slot design:
     ///
-    /// Must be called AFTER drain so forwardingBindings_ is
-    /// complete, and BEFORE swapRegions so oldBindings remain
-    /// readable (we need oldB->size for the byte-range check).
+    ///   (a) Inside `Bindings::entries[i].value` — owning Bindings
+    ///       found by byte-range search through forwardingBindings_,
+    ///       then offset-forward.
+    ///   (b) Standalone `Alloc::allocValue()` cell — copied on
+    ///       discovery via `fwdCell`, registered in forwardingCell_.
+    ///       `fwdCell`'s `visitValue(*newCell)` may add gray work
+    ///       (transitively reached cells) or more pendingSlots_;
+    ///       the method's outer while-loop drains both per iteration
+    ///       and terminates when no new work is generated.
     ///
-    /// O(pending_slots × forwardingBindings_count) worst case.
-    /// On hello.drvPath: ~hundred pending × ~thousand Bindings =
-    /// O(100K) compares; bounded.  HNE: ~thousand × ~million =
-    /// O(1B) — needs optimization (sorted byte ranges) if
-    /// production cadence requires.
+    /// Must be called AFTER an initial drain so forwardingBindings_
+    /// is complete for case (a), and BEFORE swapRegions so the OLD
+    /// container memory is still readable for byte-range probing.
+    ///
+    /// O(pending_slots × forwardingBindings_count) worst case for
+    /// case (a) per iteration.  Standalone (b) is O(1) per call.
+    /// Total bounded by total Tag::Slot uses × per-slot cost; on
+    /// hello.drvPath ~hundred slots, HNE ~thousand.  Sorted byte-
+    /// range search is a future optimization if production
+    /// cadence requires.
     void resolvePendingSlots() noexcept;
 
     /// Statistics, captured during the scavenge.
@@ -137,6 +142,7 @@ public:
         uint64_t bindingsCopied = 0;
         uint64_t listsCopied    = 0;
         uint64_t pairsCopied    = 0;
+        uint64_t charsCopied    = 0;  // Day 4: strings + paths
         uint64_t bytesCopied    = 0;
         uint64_t slotsFollowed  = 0;
     };
@@ -160,9 +166,19 @@ private:
     std::unordered_map<ValuePair *, ValuePair *> forwardingPair_;
 
     /// Stage 6 Day 3 Step 1: standalone-cell forwarding.  Populated
-    /// by Step 2's `walkStandaloneCells` (Day-3 follow-up).  Day-3
-    /// Step 1 leaves this empty; Step 2 wires it.
+    /// by Step 2's `walkStandaloneCells` AND Step 6's fwdCell
+    /// discovery (resolvePendingSlots fallback for unregistered
+    /// allocValue cells).
     std::unordered_map<Value *,    Value *>    forwardingCell_;
+
+    /// Stage 6 Day 4: string/path buffer forwarding.  Tag::String
+    /// + Tag::Path carry `const char *` buffers from
+    /// `Alloc::allocChars` (alloc.hh:1208), allocated in the v3
+    /// arena alongside typed cells.  Without forwarding, the
+    /// buffers dangle after swap+free.  `fwdChars` copies on
+    /// discovery and re-keys `stringContextSideTable()` entries
+    /// (alloc.hh:2374) to the NEW buffer pointer.
+    std::unordered_map<const char *, const char *> forwardingChars_;
 
     /// Worklist of copied cells whose fields need transitive
     /// forwarding.  Stored as (ptr, kind) pairs; the kind
@@ -189,6 +205,20 @@ private:
     /// offset-forwards the slot value.
     std::vector<Value **> pendingSlots_;
 
+    /// Day 4: sorted index of forwardingBindings_ entries (by OLD
+    /// address) for O(log B) byte-range lookup during
+    /// resolvePendingSlots.  Naive O(P × B) linear scan hangs on
+    /// HNE-shape workloads (B ~ 500K, P ~ million, scan dominates
+    /// the sample profile entirely).  Rebuilt whenever
+    /// forwardingBindings_ grows.
+    struct BindingsRange {
+        Bindings * oldP;
+        Bindings * newP;
+        uint32_t   bytes;  // sizeof(Bindings) + size*sizeof(Entry)
+    };
+    std::vector<BindingsRange> sortedBindings_;
+    size_t                     sortedBindingsCount_ = 0;
+
     Stats stats_;
 
     // -- per-type forwarders (no recursion; just copy + queue) ----
@@ -197,6 +227,35 @@ private:
     Bindings  * fwdBindings(Bindings  * b);
     ListVec   * fwdList    (ListVec   * l);
     ValuePair * fwdPair    (ValuePair * p);
+
+    /// Day 3 Step 6: discover-and-copy a standalone allocValue cell.
+    /// Used when a Tag::Slot pointer targets a Value cell that is
+    /// NOT inside any forwarded Bindings (the only other arena-resident
+    /// Value-slot carrier per the Tag::Slot design semantics) and is
+    /// NOT registered in `standaloneCellRoots()` (the registry is in
+    /// fact unused in production — `Alloc::allocValue()` does not
+    /// push to it).
+    ///
+    /// Unlike per-type fwd* (which enqueue gray work for `drain()` to
+    /// process later), `fwdCell` walks the cell's content INLINE via
+    /// `visitValue(*newCell)` since cells are sized exactly
+    /// `sizeof(Value)` — the gray-work optimisation buys nothing.  The
+    /// inline walk may add more gray work (transitively reached cells)
+    /// or more pending slots; the caller (`resolvePendingSlots`'s
+    /// fixed-point loop) handles that.
+    Value     * fwdCell    (Value     * c) noexcept;
+
+    /// Stage 6 Day 4: forward an arena-allocated string/path buffer.
+    /// Returns the NEW backup-resident address for `p`; nullptr if
+    /// `p` is null; `p` unchanged if not in active_ (external /
+    /// already-backup).  Uses `strlen` for length — v3's allocChars
+    /// convention is null-terminated (alloc.hh:1205-1207).  Moves
+    /// the matching `stringContextSideTable()` entry (if any) to
+    /// the new key.
+    const char * fwdChars  (const char * p) noexcept;
+
+    /// Day 4: rebuild sortedBindings_ index from forwardingBindings_.
+    void rebuildSortedBindings() noexcept;
 
     // -- per-type field walkers (called from drain) --------------
     void walkClosure (Closure   * c) noexcept;
