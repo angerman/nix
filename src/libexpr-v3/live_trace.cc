@@ -25,10 +25,13 @@
 #include "v3/closure.hh"
 #include "v3/vm.hh"           // activeVMStack()
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -764,6 +767,171 @@ public:
                 : "FAIL: blocks too uniformly populated; reconsider design");
     }
 
+    // Day 5 follow-up: per-alloc-site live-ratio report.  Requires
+    // NIX_V3_BINDINGS_ORIGIN=1 + NIX_V3_THUNKS_ATTR=1 to populate the
+    // origin tables.  Tests the hypothesis: are there alloc sites
+    // whose live-ratio is so low that ROUTING THOSE SITES to a
+    // dedicated "young" allocator region would produce free-on-return
+    // dead blocks naturally?
+    //
+    // Reports top-N sites by allocated bytes; per site shows allocated
+    // bytes, live bytes, and live fraction.  Sites with live fraction
+    // <10% are candidates for ephemeral-routing.
+    void reportAllocSites() noexcept
+    {
+        struct Site {
+            std::string label;
+            size_t allocBytes = 0;
+            size_t liveBytes = 0;
+            uint64_t allocCount = 0;
+            uint64_t liveCount = 0;
+        };
+        std::unordered_map<std::string, Site> sites;
+
+        // -- Bindings (NIX_V3_BINDINGS_ORIGIN=1) ----------------------
+        {
+            auto & tbl = bindingsOriginTable();
+            for (const auto & [b, origin] : tbl) {
+                std::string key;
+                if (origin.source) key = origin.source;
+                key += ":pos=" + std::to_string(origin.posHandle);
+                auto & s = sites[key];
+                s.label = key + " [Bindings]";
+                size_t bytes = sizeof(Bindings)
+                    + sizeof(Bindings::Entry) * origin.allocN;
+                s.allocBytes += bytes;
+                ++s.allocCount;
+                if (markedBindings_.count(const_cast<Bindings *>(b))) {
+                    s.liveBytes += sizeof(Bindings)
+                        + sizeof(Bindings::Entry) *
+                          const_cast<Bindings *>(b)->size;
+                    ++s.liveCount;
+                }
+            }
+        }
+        // -- Thunks (NIX_V3_THUNKS_ATTR=1) ----------------------------
+        {
+            auto & tbl = thunkOriginTable();
+            for (const auto & [t, origin] : tbl) {
+                std::string key;
+                if (origin.file) key = origin.file;
+                key += ":line=" + std::to_string(origin.line);
+                auto & s = sites[key];
+                s.label = key + " [Thunk]";
+                size_t bytes = sizeof(Thunk)
+                    + sizeof(Value) * origin.nUpvalues;
+                s.allocBytes += bytes;
+                ++s.allocCount;
+                if (markedThunks_.count(const_cast<Thunk *>(t))) {
+                    Thunk * tnc = const_cast<Thunk *>(t);
+                    size_t lbytes = (tnc->state == ThunkState::Suspended
+                                  || tnc->state == ThunkState::Native
+                                  || tnc->state == ThunkState::Blackhole)
+                        ? sizeof(Thunk) + sizeof(Value) * tnc->nUpvalues
+                        : sizeof(Thunk);
+                    s.liveBytes += lbytes;
+                    ++s.liveCount;
+                }
+            }
+        }
+
+        if (sites.empty()) {
+            std::fprintf(stderr,
+                "\n[alloc-site probe: origin tables empty -- need\n"
+                " NIX_V3_BINDINGS_ORIGIN=1 + NIX_V3_THUNKS_ATTR=1 to\n"
+                " populate them at allocation time]\n");
+            return;
+        }
+
+        // Sort sites by allocBytes desc.
+        std::vector<Site> sorted;
+        sorted.reserve(sites.size());
+        for (auto & kv : sites) sorted.push_back(std::move(kv.second));
+        std::sort(sorted.begin(), sorted.end(),
+            [](const Site & a, const Site & b) {
+                return a.allocBytes > b.allocBytes;
+            });
+
+        // Bucket by live-ratio band.
+        size_t ephemeralCount = 0;  // <10% live
+        size_t midCount       = 0;  // 10-50% live
+        size_t persistentCount = 0; // >=50% live
+        size_t ephemeralAllocBytes = 0;
+        size_t totalAllocBytes = 0;
+        for (const auto & s : sorted) {
+            totalAllocBytes += s.allocBytes;
+            double liveRatio = s.allocBytes
+                ? double(s.liveBytes) / double(s.allocBytes) : 0.0;
+            if (liveRatio < 0.10) {
+                ++ephemeralCount;
+                ephemeralAllocBytes += s.allocBytes;
+            } else if (liveRatio < 0.50) {
+                ++midCount;
+            } else {
+                ++persistentCount;
+            }
+        }
+
+        std::fprintf(stderr,
+            "\n=================== v3 ALLOC-SITE PROBE ===================\n"
+            "Per-call-site live-vs-allocated ratio (Bindings+Thunks).\n"
+            "Tests hypothesis: would routing low-live-ratio sites to a\n"
+            "dedicated young region produce dead-block-friendly\n"
+            "distributions at end of primop calls?\n"
+            "\n"
+            "Sites tracked: %zu\n"
+            "  ephemeral (<10%% live): %zu sites, %.1f MB allocated\n"
+            "  mid       (10-50%% live): %zu sites\n"
+            "  persistent (>=50%% live): %zu sites\n"
+            "\n"
+            "Routing-candidate ratio: %.1f%% of allocated bytes come from\n"
+            "ephemeral sites (-> would land in a young allocator region).\n",
+            sorted.size(),
+            ephemeralCount,
+            ephemeralAllocBytes / 1e6,
+            midCount,
+            persistentCount,
+            totalAllocBytes
+                ? 100.0 * double(ephemeralAllocBytes)
+                          / double(totalAllocBytes)
+                : 0.0);
+
+        std::fprintf(stderr,
+            "\nTop-15 sites by allocated bytes:\n"
+            "%-72s %10s %10s %6s %10s\n",
+            "site", "alloc_MB", "live_MB", "live%%", "alloc_n");
+        for (size_t i = 0; i < std::min<size_t>(15, sorted.size()); ++i) {
+            const auto & s = sorted[i];
+            double liveRatio = s.allocBytes
+                ? 100.0 * double(s.liveBytes) / double(s.allocBytes) : 0.0;
+            std::fprintf(stderr,
+                "  %-70s %10.1f %10.1f %6.1f %10llu\n",
+                s.label.c_str(),
+                s.allocBytes / 1e6,
+                s.liveBytes / 1e6,
+                liveRatio,
+                (unsigned long long)s.allocCount);
+        }
+
+        // Pre-committed: if >=50% of allocated bytes are ephemeral
+        // (<10% live), allocation-time routing IS viable.  Else,
+        // routing alone won't solve the distribution problem.
+        const double routingShipPct = 50.0;
+        double measuredPct = totalAllocBytes
+            ? 100.0 * double(ephemeralAllocBytes) / double(totalAllocBytes)
+            : 0.0;
+        std::fprintf(stderr,
+            "\n"
+            "VERDICT (pre-committed: >=%.0f%% ephemeral-site bytes):\n"
+            "  measured %.1f%% -> %s\n"
+            "============================================================\n",
+            routingShipPct,
+            measuredPct,
+            measuredPct >= routingShipPct
+                ? "PASS: alloc-time routing is VIABLE"
+                : "FAIL: not enough ephemeral concentration; need runtime compaction");
+    }
+
 private:
     Arena & arena_;
     enum GrayKindLocal : uint8_t {
@@ -865,6 +1033,7 @@ void dumpV3LiveBlockProbe() noexcept
             "reachable)]\n");
     }
     pr.reportBlocks();
+    pr.reportAllocSites();
 }
 
 } // namespace nix::v3
