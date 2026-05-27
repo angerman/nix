@@ -1,8 +1,10 @@
 # Session arc 2026-05-27 — what landed, what's falsified, what's next
 
 **Window**: 2026-05-27 single multi-turn session
-**Aggregate**: 35 substantive commits + 5 new memory entries +
-  this synthesis doc (LIVE-UPDATED, covering commits 1-35)
+**Aggregate**: 39 substantive commits + 5 new memory entries +
+  this synthesis doc (LIVE-UPDATED, covering commits 1-39).
+  Stage 6 implementation track INITIATED in this arc (Days 1 + 2.1
+  committed; Days 2.2-15 in focused future sessions).
 **Validation**: `all-v3-tests --quick` 6/6 PASS, `--core` 15/15 PASS
   at end of arc; HNE + hello.drvPath byte-identical to TW
   throughout
@@ -46,6 +48,54 @@
 | 33 | `7bf8986b4` | **Path B nursery-routing diagnostic** — 19% hit rate on HNE / 31% on hello (bypass = THE issue)         |
 | 34 | `d55065889` | **Path A FALSIFIED** — scavenge-trigger tuning bounded by dispatch-loop safe-point cadence              |
 | 35 | `98a372614` | **STAGE_6_IMPLEMENTATION_GUIDE** — day-by-day execution playbook (15-day plan for the next sessions)    |
+| 36 | `fde095959` | Session-arc live-update to commit 35                                                                |
+| 37 | `bad371821` | **Arena dereg infrastructure** + **STANDALONE HYPOTHESIS FALSIFIED** (0-1 MB delta < FALSIFY 50 MB) |
+| 38 | `40e779601` | **Stage 6 Day 1 ✓** — dual-region Arena MVP (structural refactor, Region inner struct)               |
+| 39 | `07bd31771` | **Stage 6 Day 2.1 ✓** — backup_ region + regionOf classification (Active/Backup/External)            |
+| 40 | (this edit) | Live-update to commits 37-39 + Stage 6 progress framing                                              |
+
+## 3.2 Stage 6 implementation progress (commits 38-39)
+
+The Stage 6 production GC track is now ACTIVELY IMPLEMENTING per
+`STAGE_6_IMPLEMENTATION_GUIDE_2026-05-27.md`:
+
+* **Day 1 ✓ COMMITTED** (`40e779601`) — Arena `Region` inner
+  struct + single `active_` member.  Pure structural refactor,
+  zero behavior change.  All `cur/end/blocks/hugeBlocks/totalBytes`
+  references go through `active_.*`.  `swapRegions()` stub for
+  Day 3 wiring.
+
+* **Day 2.1 ✓ COMMITTED** (`07bd31771`) — `backup_` Region member
+  (empty, lazy-allocated on first major scavenge) + `regionOf(p)`
+  3-way classification (Active / Backup / External) + inActive /
+  inBackup helpers.  The infrastructure the MoveGCVisitor needs;
+  no allocator behavior change yet.
+
+* **Day 2.2 — QUEUED** for focused fresh session.  The MoveGCVisitor
+  class implementation requires 5 mutually-recursive typed
+  visitors (Closure/Thunk/Bindings/List/Pair) each with:
+  - Per-type copy-size knowledge (Closure: variable nUp; Bindings:
+    variable size; ListVec: variable size)
+  - Forwarding-table lookup + register pattern
+  - Worklist drain for transitive walk
+  - Per-field pointer rewriting via visitor recursion
+  
+  Skeleton-only stubs would be "carcass behind gate" per
+  [[measure-twice-cut-once]] §3.7.  Day 2.2 needs full focus on
+  forwarding-pointer encoding + transitive-walk correctness +
+  per-type copy semantics.  Estimated 4-6 hours focused work.
+
+* **Days 3-15** — sequential per implementation guide.
+
+### Day 1 + 2.1 acceptance gates (all met)
+
+* `all-v3-tests --quick` 6/6 PASS at commits 38 + 39
+* `all-v3-tests --core` 15/15 PASS at HEAD
+* hello.drvPath byte-identical to TW
+* HNE byte-identical to TW
+* `bench/arena-dereg-audit.sh` PASS on all 4 workloads
+* No new RSS (backup_ region empty + zero blocks)
+* No public API breakage
 
 **Phase E v0.2 thoroughly characterized (commits 32-34)**:
 After the Stage 6 SPIKE confirmed SHIP-GREEN, the architecturally-
@@ -101,11 +151,12 @@ for production-class workload patterns.
 
 * **Foundation infrastructure shipped**: Stages 1, 3, 5 MVP all
   implemented + tested.  Stage 6 SPIKE validated.
-* **Eight Rule-0 falsifications** with documentation:
+* **Nine Rule-0 falsifications** with documentation:
   Boehm wall, Boehm tuning §6.2, periodic GC, ChainBindings Phase C
   respect (3-pivot rule), fakeClo pool dead code, Phase E v0.2
   default-on flip (Day-2 RSS), Path A trigger tuning, fakeClo pool
-  revival (user pushback — would reverse Phase D Step 12).
+  revival (user pushback), standalone arena dereg (commit 37 —
+  Boehm uses heap-growth pressure not per-collect cost).
 * **HNE memory profile fully decomposed**:
   peak 2987 MB = v3_arena 1594 + boehm 403 + ImportCache+SQLite ~990
 * **Stage 6 ROI quantified per workload**:
