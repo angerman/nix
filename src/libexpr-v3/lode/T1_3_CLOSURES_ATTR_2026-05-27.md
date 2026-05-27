@@ -67,20 +67,37 @@ callers anywhere in the codebase.  The infrastructure sits in
 
 ## The actual remaining levers
 
-1. **Resolve Phase E v0.2 stress-mode missed-root, default-on nursery**
-   (~1-3 days per CLAUDE.md §6.3) — gives the closures generational
-   reclamation; recovers the 144 MB on HNE; aligned with architectural
-   direction.
-2. **Revive the pool as a fallback when nursery is off** (~1 day)
-   — call `Alloc::allocFakeClo` from `vm.cc:6803` + `vm.cc:12085`,
-   call `Alloc::recycleFakeClo` at the OP_RETURN cleanup site.
-   The infrastructure is intact; just needs callers re-wired.
-   Recovers 144 MB until (1) lands.
-3. **Make the closure smaller per-instance** — orthogonal; touches
-   the `Closure` struct shape rather than the lifecycle.
+(Updated 2026-05-27 after Day-2 mortality measurement + user
+pushback on fakeClo revival.  Original draft proposed pool
+revival as a tactical mitigation; user correctly rejected this
+as reversing Phase D Step 12's intentional architectural
+retirement.)
 
-Either (1) or (2) closes the lever.  (1) is preferred (architectural
-direction).  (2) is a tactical mitigation while (1) is in flight.
+1. **Resolve Phase E v0.2 ship-readiness** (multi-session per
+   `PHASE_E_V02_DAY2_FALSIFIED_2026-05-27.md` Paths A + B) —
+   architectural direction.  Day-1 stress validation PASSED on
+   all 3 anchor workloads; Day-2 mortality measurement showed
+   the simple "flip default-on" path does NOT meet the SHIP gate
+   (peak RSS +129-252 MB regression on hello/HNE).  Iteration
+   paths: tune scavenge trigger (Path A) + audit what bypasses
+   nursery (Path B).  When Phase E v0.2 ships at acceptable
+   wall+RSS, the 144 MB fakeClo overhead closes automatically.
+
+2. **Stage 6 production precise GC** (2-3 wk per
+   `STAGE_6_PRECISE_GC_DESIGN_2026-05-27.md`) — the next
+   architectural step if Phase E v0.2 cannot reach ship-readiness
+   after Paths A + B.
+
+3. **Make the closure smaller per-instance** — orthogonal to GC
+   strategy; modest yield independent of (1) + (2).
+
+**EXPLICITLY NOT a lever** (per user pushback 2026-05-27):
+reviving `Alloc::allocFakeClo` / `recycleFakeClo` to bypass
+nursery.  This would reverse Phase D Step 12's intentional
+retirement of hand-rolled pools in favor of generational
+reclamation.  The 144 MB is a SYMPTOM of Phase E not shipping,
+not a problem to route around with hand-rolled pools.  Fix the
+architecture (Phase E ship-readiness), don't patch over it.
 
 ## Cross-comparison: Thunks (T1_3_THUNKS) vs Closures (this doc)
 

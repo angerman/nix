@@ -1,8 +1,8 @@
 # Session arc 2026-05-27 — what landed, what's falsified, what's next
 
 **Window**: 2026-05-27 single multi-turn session
-**Aggregate**: 26 substantive commits + 5 new memory entries +
-  this synthesis doc (this is the LIVE EDIT covering commits 1-26)
+**Aggregate**: 31 substantive commits + 5 new memory entries +
+  this synthesis doc (LIVE-UPDATED, covering commits 1-31)
 **Validation**: `all-v3-tests --quick` 6/6 PASS, `--core` 15/15 PASS
   at end of arc; HNE + hello.drvPath byte-identical to TW
   throughout
@@ -34,11 +34,31 @@
 | 21 | `674b19d9f` | **T1.3 Closures follow-up** — fakeClo pool is DEAD CODE (Phase D Step 12 retired)                   |
 | 22 | `4f46dbdbd` | **T1.3 Pairs + Lists attr** — 2 NEW LEVERS: mapAttrs 2-pair (100 MB) + tiny capWiths (13 MB)        |
 | 23 | `187e156af` | **T1.3 unified cross-type dump** — top 6 sites = 90.5 % of allocs on HNE                            |
-| 24 | (this edit) | Session-arc synthesis live-updated to 26 commits                                                     |
+| 24 | `008cc4a05` | Session-arc synthesis live-updated to 26 commits                                                    |
+| 25 | (n/a) | (parallel ChainBindings work — not in this session's arc but in nearby branch)                              |
+| 26 | (n/a) | (parallel ChainBindings work — not in this session's arc but in nearby branch)                              |
+| 27 | `62cc61239` | **PHASE_E_V02_STRESS_DESIGN** + Stage 6 prereq update — "architecture alignment" handoff             |
+| 28 | `d77be72ab` | **`bench/phase-e-stress-validate.sh`** — Day-1 stress validation harness for Phase E v0.2            |
+| 29 | `1efa7c886` | **Live-trace arena-dereg audit** — Tag::External=0 confirmed on hello.drvPath + HNE                  |
+| 30 | `b1fdec503` | **`bench/arena-dereg-audit.sh`** — Day-1 audit harness for arena dereg                               |
+| 31 | (this edit) | Live-update of synthesis + cross-workload External-clean confirmation                              |
 
-(Note: commit indices 25-26 reserve room for additional minor edits
-in the session arc — this index is canonical for what landed
-through commit 23 and is updated in-place as the arc continues.)
+**Cross-workload External-clean confirmation (commit 31 measurement)**:
+Running `bench/arena-dereg-audit.sh` against the full default set
+returns AUDIT VERDICT: PASS on all 4 workloads:
+
+```
+  Workload    Verdict      External        String          Path
+  hello       PASS              0         70035           881
+  firefox     PASS              0         70408          1054
+  hne         PASS              0       1439011         10971
+  ackermann   PASS              0             0             0
+```
+
+The External-clean claim now holds across two real nixpkgs paths
+(hello + firefox), one haskell.nix-style flake (HNE), and one
+purely-arithmetic synthetic.  Arena dereg's §4.2 audit is closed
+for production-class workload patterns.
 
 ## 2. Strategic state changes
 
