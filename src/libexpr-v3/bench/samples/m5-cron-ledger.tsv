@@ -1,0 +1,6 @@
+# v3 cardano-node M5 cron ledger
+# tab-separated: timestamp git_hash mode wall_s peak_rss_mb output_drvPath
+# Append-only; do not edit historical entries.
+2026-05-27T09:33:16+0900	580d0999a2	warm	33.964	4125	cardano-node-exe-cardano-node-10.6.1
+2026-05-27T09:34:05+0900	580d0999a2	warm	27.818	4694	cardano-node-exe-cardano-node-10.6.1
+2026-05-27T09:34:33+0900	580d0999a2	warm	27.836	4953	cardano-node-exe-cardano-node-10.6.1
