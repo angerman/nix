@@ -7,10 +7,22 @@
   1. Stage 1 (`tagIsPointer`) ✓ commit `6f854fa2c`
   2. Stage 3 (`walkAllV3Roots`) ✓ commits `02c95eba0` + `e7639f837`
   3. Stage 5 MVP (`GcRoot` RAII) ✓ commit `173481af3`
-  4. **Arena deregistration spike** (per
+  4. **Architecture alignment**: Phase E v0.2 stress resolution +
+     nursery default-on (per
+     [`PHASE_E_V02_STRESS_DESIGN_2026-05-27.md`](PHASE_E_V02_STRESS_DESIGN_2026-05-27.md))
+  5. **Arena deregistration spike** (per
      [`ARENA_DEREGISTRATION_DESIGN_2026-05-27.md`](ARENA_DEREGISTRATION_DESIGN_2026-05-27.md))
-  5. Stage 5 bulk apply to ~150 primop C++ helper sites
-  6. This document
+  6. Stage 5 bulk apply to ~150 primop C++ helper sites
+  7. This document
+
+Note on prerequisite 4: Phase E v0.2 default-on is the
+**architectural alignment** that puts the nursery scavenger's
+Cheney semi-space pattern in production.  Once that's live,
+Option A (Cheney semi-space for tenured) below uses a code path
+the codebase ALREADY exercises — reducing implementation risk
+significantly.  Without prerequisite 4, Stage 6's tenured
+semi-space introduces both NEW MACHINERY AND a NEW SAFE-POINT
+model simultaneously — riskier.
 **Validated by**: Stage 6 SPIKE (commit `f3491859f`) — 239 MB freeable
   on hello.drvPath, 797 MB freeable on HNE (4× SHIP threshold).
 

@@ -138,12 +138,12 @@ the per-site share.
 
 | Task                                          | Effort   | Yield (peak RSS)             | Blocked by                          |
 |-----------------------------------------------|----------|-------------------------------|--------------------------------------|
+| **Phase E v0.2 stress-mode resolution** (architecture alignment) | 1-3 d | 144 MB on HNE (auto via fakeClo) + Stage 6 alignment | none — handoff doc ready |
 | Arena deregistration from Boehm               |  2-3 d   | 100-400 MB on HNE indirect    | External-tag audit + bridge side-table |
-| Stage 6 production precise GC                 |  2-3 wk  | 239-797 MB (validated)        | Arena dereg + Stage 5 bulk apply    |
+| Stage 6 production precise GC                 |  2-3 wk  | 239-797 MB (validated)        | Phase E default-on + arena dereg + Stage 5 bulk apply |
 | Phase 4b ImportCache LRU eviction             |  1-2 wk  | 500-950 MB on HNE             | CU ptr stability + nursery + buckets |
 | ChainBindings Phase C revival                 | multi-session | 200-300 MB on HNE         | 4 prerequisites in vm.cc:1167-1206   |
-| **fakeClo pool revival** (nursery-off fallback) |  ~1 d  | 144 MB on HNE                 | Audit Phase D ↔ pool interaction     |
-| **Phase E v0.2 stress-mode resolution**       |  1-3 d   | (unlocks nursery default-on; closes fakeClo lever) | per CLAUDE.md §6.3      |
+| **fakeClo pool revival** (alternative to Phase E) | ~1 d | 144 MB on HNE                | Audit Phase D ↔ pool interaction; obviated if Phase E flips |
 | **mapAttrs 3-arg App representation**         |  1-2 d   | ~50 MB on HNE                 | Update App evaluator + serialize + GC walkers |
 | **Tiny capturedWiths inline-in-Thunk**        |  2-3 d   | 13 MB on HNE                  | Phase D barrier audit + Thunk struct |
 | Stage 5 bulk `V3_GC_ROOT(...)` application    |  1-2 d   | (foundation; no direct yield) | Stage 6 production needs first       |
@@ -162,12 +162,24 @@ Pool infrastructure intact; just needs callers rebound at vm.cc:6803
 + vm.cc:12085 + OP_RETURN cleanup.  Pre-committed SHIP threshold:
 ≥ 100 MB peak_rss on HNE + `--core` 15/15 PASS.
 
-### Recommended order
+### Recommended order (per user 2026-05-27 framing)
 
 1. **HNE workaround documented today**: `NIX_V3_NO_DISK_CACHE=1`
    gives 500-950 MB peak RSS reduction immediately at the cost of
    wall-time on warm-cache scenarios.  Production CI-style evals
    should use this gate.
+2. **First new session — "architecture alignment"**: Phase E v0.2
+   stress resolution per
+   [`PHASE_E_V02_STRESS_DESIGN_2026-05-27.md`](PHASE_E_V02_STRESS_DESIGN_2026-05-27.md).
+   1-3 days.  Closes AR7 + obviates the 144 MB fakeClo lever
+   automatically + aligns Stage 6's semi-space mechanics with
+   what the codebase already exercises.
+3. **Second new session — arena dereg** per
+   [`ARENA_DEREGISTRATION_DESIGN_2026-05-27.md`](ARENA_DEREGISTRATION_DESIGN_2026-05-27.md).
+   2-3 days.  Unblocks Stage 6 + tests collection-cost.
+4. **Third new session(s) — Stage 6 production** per
+   [`STAGE_6_PRECISE_GC_DESIGN_2026-05-27.md`](STAGE_6_PRECISE_GC_DESIGN_2026-05-27.md).
+   2-3 weeks.  Delivers ≥239 MB hello.drvPath, ≥797 MB HNE.
 2. **Arena deregistration spike** — 2-3 days, unblocks Stage 6 + tests
    the Boehm-internal collection-cost hypothesis.
 3. **Stage 6 production precise GC** — given the spike is GREEN,
