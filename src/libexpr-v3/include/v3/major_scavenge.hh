@@ -107,6 +107,29 @@ public:
     /// root walk (visitor.visitValue(*newCell)).
     void walkStandaloneCells() noexcept;
 
+    /// Stage 6 Day 3 Step 3: resolve pending Tag::Slot pointers
+    /// that point inside a Bindings::entries[i].value.  During
+    /// the walk, visitSlot can't find the owning Bindings cheaply
+    /// (the slot is a Value*, the owning Bindings could be any
+    /// of N copied Bindings).  So we defer to a post-drain pass:
+    ///   1. visitSlot records non-standalone active slots in
+    ///      `pendingSlots_`.
+    ///   2. After drain (all Bindings forwarded), this method
+    ///      scans `forwardingBindings_` for each pending slot's
+    ///      owning Bindings via byte-range check, then offset-
+    ///      forwards.
+    ///
+    /// Must be called AFTER drain so forwardingBindings_ is
+    /// complete, and BEFORE swapRegions so oldBindings remain
+    /// readable (we need oldB->size for the byte-range check).
+    ///
+    /// O(pending_slots × forwardingBindings_count) worst case.
+    /// On hello.drvPath: ~hundred pending × ~thousand Bindings =
+    /// O(100K) compares; bounded.  HNE: ~thousand × ~million =
+    /// O(1B) — needs optimization (sorted byte ranges) if
+    /// production cadence requires.
+    void resolvePendingSlots() noexcept;
+
     /// Statistics, captured during the scavenge.
     struct Stats {
         uint64_t closuresCopied = 0;
@@ -157,6 +180,14 @@ private:
     /// Cells whose Tag::Slot deref we've followed; dedup against
     /// multiple Tag::Slot Values aliasing the same Value cell.
     std::unordered_set<Value *> cellsFollowed_;
+
+    /// Day 3 Step 3: pending Tag::Slot pointers awaiting post-
+    /// drain Bindings-owner resolution.  Each entry is the ADDRESS
+    /// of a slot field inside a copied (backup_-resident) cell.
+    /// resolvePendingSlots iterates this, finds the owning OLD
+    /// Bindings via byte-range search in forwardingBindings_, and
+    /// offset-forwards the slot value.
+    std::vector<Value **> pendingSlots_;
 
     Stats stats_;
 

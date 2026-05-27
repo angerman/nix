@@ -206,14 +206,13 @@ void MajorScavenger::visitSlot(Value * & slot)
     // Day 3 Step 2/3: Tag::Slot slot pointer may need rewriting.
     //
     // Case 1 — slot points at a standalone cell that we already
-    // moved (Step 2): forward via cellForwarding_ table.
+    // moved (Step 2): forward via forwardingCell_ table.
     //
     // Case 2 — slot points INSIDE a Bindings::entries[].value
     // (the common let-rec slot pattern): defer to Step 3's
-    // post-drain resolution.  Day-3 Step 2 leaves this with the
-    // OLD pointer; the slot is broken if Bindings moves but
-    // Step 3 isn't yet implemented.  Production must wait for
-    // Step 3 — runMajorScavenge stays caller-invoked only.
+    // post-drain resolution via pendingSlots_.  The slot's owner
+    // (which Bindings) is unknown at visit time; needs all
+    // Bindings to be forwarded first.
     //
     // Case 3 — slot points at backup (already forwarded) or
     // external: leave as-is.
@@ -222,13 +221,76 @@ void MajorScavenger::visitSlot(Value * & slot)
     if (it != forwardingCell_.end()) {
         // Case 1: standalone cell moved.  Update slot to new addr.
         slot = it->second;
+    } else if (arena_.inActive(slot)) {
+        // Case 2: slot points into active_ but isn't standalone.
+        // Must be inside a Bindings (the only other arena-resident
+        // Value carrier per the Tag::Slot usage semantics).  Queue
+        // for post-drain resolution.
+        pendingSlots_.push_back(&slot);
+        // Don't recurse-walk via *slot here — the slot may still
+        // point at OLD active memory which will be invalid after
+        // swap.  But we DO need to walk the slot's contents to
+        // forward any nested arena pointers.  Two options:
+        //   (a) walk *slot now (OLD address, pre-resolve)
+        //   (b) walk after resolution (NEW address)
+        // (a) is safer because the OLD memory is still readable
+        // and the resolve step is purely a pointer rewrite.
+        if (!cellsFollowed_.insert(slot).second) return;
+        ++stats_.slotsFollowed;
+        visitValue(*slot);
+        return;
     }
-    // For all cases: dedup-walk the pointed-to Value's payload to
-    // potentially forward THAT cell's contents.
+    // For all other cases (Case 3 plus Case 1's post-forward): walk.
     if (!slot) return;
     if (!cellsFollowed_.insert(slot).second) return;
     ++stats_.slotsFollowed;
     visitValue(*slot);
+}
+
+void MajorScavenger::resolvePendingSlots() noexcept
+{
+    // Day 3 Step 3: each pending slot points into an OLD Bindings
+    // (active_-resident at visit time, now in backup_ since the
+    // OLD active is the post-copy backup).  Find the owning OLD
+    // Bindings by byte-range search through forwardingBindings_,
+    // then offset-forward to the NEW Bindings' corresponding entry.
+    for (Value ** slotAddr : pendingSlots_) {
+        if (!slotAddr) continue;
+        Value * oldSlot = *slotAddr;
+        if (!oldSlot) continue;
+        // Already forwarded (e.g., to a standalone cell in
+        // forwardingCell_)?  Skip.
+        if (forwardingCell_.count(oldSlot)) continue;
+
+        // Linear scan forwardingBindings_ — find owning OLD
+        // Bindings.  We need oldB->size (still readable since
+        // freeBackupBlocks hasn't fired yet).
+        const char * slotCp = reinterpret_cast<const char *>(oldSlot);
+        for (auto & [oldP, newP] : forwardingBindings_) {
+            Bindings * oldB = oldP;
+            const char * oldBcp = reinterpret_cast<const char *>(oldB);
+            const size_t oldBytes = sizeof(Bindings)
+                + sizeof(Bindings::Entry) * oldB->size;
+            if (slotCp >= oldBcp && slotCp < oldBcp + oldBytes) {
+                // Found owner.  Offset-forward.
+                ptrdiff_t offset = slotCp - oldBcp;
+                Bindings * newB = newP;
+                *slotAddr = reinterpret_cast<Value *>(
+                    reinterpret_cast<char *>(newB) + offset);
+                break;
+            }
+        }
+        // If no owner found: slot pointed at active_ but not into
+        // a forwarded Bindings.  This could indicate:
+        //   - A pointer into a Closure upvalues / Thunk tail
+        //     (Step 6 follow-up; rarer let-rec pattern)
+        //   - An external pointer that regionOf misclassified
+        //     (shouldn't happen)
+        // Day-3 leaves the slot pointing at OLD address; after
+        // swap+free it dangles.  Caller-invoked-only safety
+        // remains until Step 6.
+    }
+    pendingSlots_.clear();
 }
 
 void MajorScavenger::walkStandaloneCells() noexcept
@@ -404,13 +466,14 @@ void runMajorScavenge(VMState & vm) noexcept
     // visitSlot lookups find the forwarding entries.  Mutates
     // standaloneCellRoots() in place.
     mv.walkStandaloneCells();
-    // Step 3 (deferred): pre-walk Bindings to record entry
-    // addresses for post-drain pending-slot resolution.  Until
-    // Step 3 lands, Tag::Slot pointers into Bindings entries may
-    // dangle after swap.  runMajorScavenge stays caller-invoked
-    // only — see major_scavenge.hh class docstring.
+    // Day 3 Step 3 wired: post-drain pending-slot resolution.
+    // Tag::Slot pointers into Bindings::entries[i].value are now
+    // forwarded via byte-range search + offset arithmetic.  Must
+    // run BEFORE swapRegions+freeBackupBlocks so oldBindings
+    // remain readable (we read oldB->size for the byte-range).
     walkAllV3Roots(vm, mv);
     mv.drain();
+    mv.resolvePendingSlots();
     arena.swapRegions();
     arena.freeBackupBlocks();
 
