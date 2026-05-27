@@ -135,7 +135,80 @@ OP_ATTRS_INIT_DYN                                        19291        4.7 MB ( 0
 Top-3 = 92.5 % of all Bindings bytes.  mergeBindings alone = 82 %.
 After that, vm.cc:7326 (which is REC_INIT internals) at 6.3 %.
 
-## Where the 990 MB "elsewhere" likely lives (HYPOTHESIS)
+## Differential measurement — the 990 MB "elsewhere" decomposed
+
+After the initial decomposition, ran HNE in three configurations to
+attribute the elsewhere bucket to specific subsystems.  Important
+caveat: **cache state survives between processes via `~/.cache/nix/`
+disk cache, so single-run RSS measurements vary by ~400 MB depending
+on cache warmth**.  The numbers below are single runs each — directional
+but not reproducible to within MB.
+
+```
+Configuration                                peak_rss   v3_arena   boehm   elsewhere
+default (cold cache, first run)              2987 MB    1594 MB   403 MB   991 MB
+default (warm cache replay)                  2565 MB    1594 MB   403 MB   568 MB
+NIX_V3_NO_CONTENT_CACHE=1                    2311 MB    1594 MB   403 MB   314 MB
+NIX_V3_NO_DISK_CACHE=1                       2037 MB    1594 MB   403 MB    40 MB
+both NO_DISK + NO_CONTENT                    2128 MB    1594 MB   403 MB   131 MB
+```
+
+### Key observations
+
+* **`v3_arena = 1594 MB` is stable across all configurations** —
+  cache state doesn't affect arena.  Stage 6's 797 MB freeable
+  pertains to this bucket exclusively.
+* **`NIX_V3_NO_DISK_CACHE=1` saves 950 MB peak RSS** vs cold-cache
+  baseline (528 MB vs warm-cache baseline).  This is the biggest
+  single-flag memory lever available today.
+* **The disk cache itself is 312 MB on disk** (`~/.cache/nix/
+  v3-bytecode-v3.sqlite`, May 27 timestamp).  In-memory cost is
+  multiple-of-300 MB — SQLite page cache + mmap'd file + in-
+  memory deserialized CUs.
+* **Content cache (in-memory) contributes 200-700 MB depending on
+  warmth state** — this is the `ImportCache::cus` `std::deque` +
+  `results` map (`primops.cc:7521-7530`) that grows monotonically
+  with imports.
+
+### Mechanism
+
+The v3 import cache architecture (`primops.cc:7510-7534`):
+```cpp
+struct ImportCache {
+    std::deque<CompilationUnit> cus;
+    std::unordered_map<std::string, ImportCacheEntry> results;
+};
+```
+
+* `cus` deque holds every imported `.nix` file's compiled bytecode
+  + constant pools + LambdaDescriptors + AttrSelectIC tables.
+  Stable addresses (deque doesn't realloc) because Closures hold
+  raw pointers into the CU.
+* `results` map memoizes the Value WHNF of each import path.
+
+Neither structure has eviction.  On HNE: ~thousands of imports
+× hundreds of KB per CU = ~hundreds of MB in `cus`.
+
+### Why this matters and what's next
+
+This is **the lever the avenues doc Category 5 documented as "Phase
+4b EvalResults size cap + LRU — 1-2 d — cache grows monotonically;
+HNE cache size during eval = unknown."**  Now it's known:
+**~700 MB on HNE under default settings**.
+
+Implementation prerequisites (multi-session, not this turn):
+1. CU eviction is BLOCKED by Closures holding raw CU pointers.
+   Either reference-count CUs OR weak-reference + relocate.
+2. ImportCacheEntry::result has nursery-pointer concerns post-
+   Phase D/E — eviction must coordinate with the GC walker.
+3. Hash bucket maps need to evict alongside the deque to recover
+   the bucket overhead.
+
+Workaround available today: **`NIX_V3_NO_DISK_CACHE=1`** for
+memory-pressured single-shot evals (e.g., CI).  Costs wall time
+on warm-cache scenarios; gives ~500-950 MB peak RSS reduction.
+
+## Where the 990 MB "elsewhere" likely lives (HYPOTHESIS — superseded)
 
 The probed 138 MB does not account for:
 
