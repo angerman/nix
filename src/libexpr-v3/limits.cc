@@ -642,6 +642,27 @@ void checkLimits()
         throw OutOfMemoryError(msg);
     }
 
+    // gate: NIX_V3_BOEHM_PERIODIC_GC — fire GC_gcollect() once per
+    // checkLimits invocation (checkLimits fires every kLimitsPoll
+    // opcodes, default 256 — see vm.cc).  Useful when the workload
+    // briefly spikes Boehm heap to peak then frees, but without
+    // forced collection Boehm only collects once and keeps the
+    // watermark.  Combined with `GC_set_force_unmap_on_gcollect(1)`
+    // (set at init below if this gate is on), the periodic collect
+    // also tries to unmap.  Costs CPU (each gcollect is ~10 ms
+    // per current observation); enable only for memory-bounded
+    // workloads.  Retirement: replaced by Stage 6 precise GC.
+    {
+        static const bool s_periodicGc =
+            std::getenv("NIX_V3_BOEHM_PERIODIC_GC") != nullptr;
+        if (s_periodicGc) {
+            // We rely on the caller dispatching at modest frequency.
+            // No counter here — every checkLimits invocation fires
+            // one collection.  Limit-poll rate dictates GC rate.
+            GC_gcollect();
+        }
+    }
+
     // #753 in-dispatch RSS check.  The SIGALRM watchdog calls
     // _exit() when RSS exceeds the cap from ANY thread of
     // execution (TW callbacks, libexpr code, etc.), but doing so

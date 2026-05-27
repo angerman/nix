@@ -81,6 +81,50 @@ What's removed:
   Boehm" suggestions need to first demonstrate `boehm_unmapped`
   moves off zero on macOS aarch64.
 
+## Follow-up probe: periodic `GC_gcollect()` from `checkLimits`
+
+Added `NIX_V3_BOEHM_PERIODIC_GC=1` to fire one explicit `GC_gcollect()`
+per `checkLimits()` poll.  Confirms the mechanism but the gate is
+not viable for production:
+
+```
+                                             boehm_heap  boehm_unmapped  peak_rss  gc_count  wall
+BASELINE                                       402.9 MB        0.0 MB    753.8 MB     1     1.31 s
+PERIODIC_GC=1                                    1.4 MB      401.5 MB    767.6 MB  1500    11.82 s
+```
+
+**Mechanism confirmed**: Boehm DOES unmap pages when collection is
+forced.  `boehm_unmapped=401.5 MB` is real release back to the OS.
+
+**But peak_rss got WORSE**: the watermark was already hit before
+the first GC could fire; subsequent collections only released
+back AFTER peak.  Plus +14 MB on peak from GC's own working set.
+
+**And wall regressed 9×**: 1.31 s → 11.82 s.  64.5 s of total GC
+time per run.  Each collection scans 587 MB of arena (every
+threadArena block is registered as a Boehm root via
+`alloc.hh:706`), making per-collection cost ~40 ms × 1500
+collections ≈ 60 s.
+
+### What this teaches about Stage 6 design
+
+The fundamental issue: **the arena being registered with Boehm
+makes Boehm collection prohibitively expensive**.  Boehm chooses
+to grow rather than collect because each collection is 40 ms.
+
+Stage 6's architectural fix MUST include arena deregistration —
+remove the `GC_add_roots(blk, blk + kBlockSize)` call from
+`refill()`.  Then Boehm has only its own heap to scan (cheap)
+and auto-collection becomes viable.
+
+Required for arena deregistration: a side-table of every
+`nix::Value*` (bridge thunks etc.) stored in arena cells.  That
+side-table becomes Boehm's root view of the v3-arena content.
+~1-2 days of careful work.
+
+This is now a **concrete Stage 6 sub-task** (was previously
+hand-waved as "Boehm continues to manage TW-side").
+
 ## What this turn LANDS regardless
 
 The instrumentation is no-regret:
@@ -92,8 +136,12 @@ The instrumentation is no-regret:
   newer Boehm versions where the mechanism might differ.
 * `NIX_V3_BOEHM_FORCE_UNMAP` env-gate remains as the diagnostic
   switch — falsifies any reopening of the §6.2 hypothesis.
+* `NIX_V3_BOEHM_PERIODIC_GC` env-gate — confirms the unmap
+  mechanism + measures the per-collect cost.  Catastrophic
+  9× wall regression rules out production default-on; valuable
+  as a Stage 6 design probe.
 
-Both gates carry inline retirement criteria.
+All gates carry inline retirement criteria.
 
 ## Cross-references
 
