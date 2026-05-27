@@ -16,13 +16,22 @@ Companion docs:
 
 ## 1. Position (TL;DR)
 
-**The ideal hand-rolled v3 GC would be a generational compacting precise-root GC with Nix-specific extensions** (Bindings interning, cross-process snapshot semantics, Thunk-aware collection). Total engineering: ~6 months.
+> **Framing rule (codified 2026-05-27 per `63c69536f`):** GC investments in v3 are **RSS-primary, not wall-primary**. Boehm consumes ~0 ms wall on real workloads (1 GC cycle / 0 ms total on hello.drvPath AND cardano-node M5). The wall case for replacing Boehm is dead. **The only load-bearing motivation for GC work is peak RSS reduction**, validated by direct measurement of the workload's freeable-memory ceiling.
 
-**But Whippet exists and covers ~80 % of the design.** Whippet is a hand-rolled GC by Andy Wingo, designed for dynamic-language interpreters; its design space overlaps almost entirely with what v3 needs. Pragmatic answer: **Whippet + v3-specific extensions (~3-4 months total)**.
+**The ideal hand-rolled v3 GC would be a generational compacting precise-root GC with Nix-specific extensions** (Bindings interning, cross-process snapshot semantics, Thunk-aware collection). Total engineering: ~6 months. **Motivation: RSS reduction only — wall is not a target.**
+
+**But Whippet exists and covers ~80 % of the design.** Whippet is a hand-rolled GC by Andy Wingo, designed for dynamic-language interpreters; its design space overlaps almost entirely with what v3 needs. Pragmatic answer: **Whippet + v3-specific extensions (~3-4 months total)** — gated on whether the RSS lever is large enough to justify the investment.
 
 **Either path requires precise-root infrastructure as prerequisite.** That's 1-2 weeks of foundation work the team could start NOW without committing to custom-roll or Whippet. It's a no-regret investment.
 
-**Concrete recommendation:** Boehm-tuning spike this week (1 day) + Phase E v0.2 stress-mode missed-root fix (1-3 days) + start precise-root infrastructure foundation (1-2 weeks). That's ~3 weeks of work delivering immediate memory wins AND preparing for whichever long-term GC decision the team eventually commits to.
+**Concrete recommendation (updated 2026-05-27 post-spike):**
+- ~~Boehm-tuning spike (1 day)~~ — **FALSIFIED on macOS aarch64** (`1285de2fe`); Boehm tuning didn't yield meaningful RSS on that platform
+- Phase E v0.2 stress-mode missed-root fix (1-3 days) — still relevant
+- Precise-root infrastructure foundation (1-2 weeks) — **LARGELY LANDED** (`6f854fa2c` + `02c95eba0` + `e7639f837`) in hours, not weeks
+- **NEW: deregister arena blocks from Boehm (1-2 days)** — per `5865b807c`, this is the keystone enabling automatic Boehm GC and unlocking ~200+ MB peak RSS reduction
+- Live-trace measurement landed (`f3491859f`): **239 MB freeable on hello.drvPath** measured directly — this is the validated lower-bound on RSS reduction
+
+The new sequence is **measure → arena-deregister → automatic-collection → measure → commit-to-broader-GC-if-RSS-warrants**, NOT "ship Whippet for wall improvements that aren't there."
 
 ---
 
@@ -32,7 +41,7 @@ Companion docs:
 
 | Trait | Evidence | GC implication |
 |---|---|---|
-| **High allocation rate** | hello.drvPath: 6.5 M total; 25 K mergeBindings + 1.6 M Thunks + 350 K Closures | Allocation throughput matters (bump-pointer not malloc) |
+| **High allocation rate** | hello.drvPath: 6.5 M total; 25 K mergeBindings + 1.6 M Thunks + 350 K Closures | Allocation throughput is NOT the lever — v3 uses `threadArena()` (per-thread bump) and Boehm consumes 0 ms wall (`63c69536f`). **The high allocation rate matters for RSS (working set), not for wall.** |
 | **High mortality** | Phase E v0.2: 42-57 % mortality on real workloads | Generational with young/old split is correct architecture |
 | Mixed sizes | 16 B Values, 24 B Bindings::Entry, variable-FAM Bindings/Closures, multi-KB CU bytecode | Need both fixed-size + variable allocation paths |
 | Deep object graphs | cardano-node 4096+ overlay layers; HNE deep callPackage; module-system fix-points | Mark phase must handle deep recursion without stack overflow |
@@ -40,7 +49,7 @@ Companion docs:
 | **Cycles common** | lib.fix, mutually recursive let, module fix-points | Tracing GC (mark-sweep / mark-compact) handles cycles natively; RC does not |
 | **Cross-process determinism required** | Per #815 RCA | Disk cache loads must produce identical in-memory layouts |
 | **Boehm 99.9 % free pages** | Per #702 (2026-05-21) | Conservative GC over-allocates; compacting + page release wins big |
-| **Boehm scan 38 MB/s** | Per #702 vs TW's 181 MB/s | Precise scan would be 5-10× faster |
+| ~~**Boehm scan 38 MB/s**~~ FALSIFIED 2026-05-27 (`63c69536f`) | Boehm consumes 0 ms across full eval lifetime; scan rate is irrelevant when scan never runs | **Removed as a motivation.** Boehm-replacement-for-scan-rate is dead. |
 | Single-threaded today | Stage 13 R5 considers parallel | Design for single-thread first; allow parallel as future extension |
 
 ### 2.2 Pain points in current stack

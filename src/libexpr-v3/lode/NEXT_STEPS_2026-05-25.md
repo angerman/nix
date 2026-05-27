@@ -653,15 +653,18 @@ Bytecode is now process-invariant across SymbolId / PosIdx / local-slot allocato
 
 ### R6 — Stage 16 (Whippet GC) replacement of tenured Boehm
 
-**Status:** dormant candidate per `BOEHM_DEPENDENCY_2026-05-21.md`.
+**Status:** dormant candidate per `BOEHM_DEPENDENCY_2026-05-21.md`. **Trigger reframed 2026-05-27 to be RSS-primary, NOT wall-based** — `63c69536f` falsified the wall premise (Boehm consumes 0 ms wall on real workloads).
 
-**Trigger:** nursery default-on (B2) lands **AND** tenured Boehm scan time > 10 % of eval wall on a representative workload.
+**Trigger (revised 2026-05-27):** RSS-primary, not wall-based.
+- **Trigger A (RSS-primary):** arena-deregistration from Boehm lands (the keystone per `5865b807c`); automatic Boehm collection becomes viable; **peak RSS reduction post-deregistration < 200 MB on cardano-node M5 AND remaining v3-arena freeable fraction > 30 %** → Whippet investigation justified for the residual arena reclamation gap
+- **Trigger B (capability blocker):** cardano-node M5 still exceeds 4 GB watchdog AFTER Boehm-deregister + Phase E v0.2 + targeted memory work; Whippet is the remaining structural lever
+- ~~Trigger original: "tenured Boehm scan time > 10 % of eval wall"~~ — **FALSIFIED 2026-05-27**; Boehm wall is 0 ms. Removed.
 
-**Probability of revival:** Low (per #702 falsifier, Boehm scan is NOT current bottleneck)
+**Probability of revival:** Moderate-Low (was Low; the RSS-primary reframing makes it more likely than wall-based framing did — `f3491859f` measured 239 MB freeable on hello.drvPath, suggesting precise-GC has a real lever; whether Whippet specifically vs Boehm-deregister-then-tune is the right form depends on post-deregister measurement).
 
-**Prerequisite:** B2 nursery default-on must land first (Whippet replaces tenured Boehm; nursery must be primary allocator before tenured replacement makes sense)
+**Prerequisite:** arena-deregistration from Boehm + B2-or-selective-nursery default-on. Once Boehm scans only its own heap (not the 587 MB arena), Boehm's incremental collector becomes viable; Whippet's case is then specifically about reclaiming the freeable v3-arena memory (~200+ MB by `f3491859f` lower bound).
 
-**Cross-references:** `BOEHM_DEPENDENCY_2026-05-21.md`, `GC_VS_TW_ANALYSIS_2026-05-23.md`
+**Cross-references:** `BOEHM_DEPENDENCY_2026-05-21.md`, `GC_VS_TW_ANALYSIS_2026-05-23.md`, `IDEAL_GC_DESIGN_2026-05-26.md` §1 framing rule (RSS-primary).
 
 ### R7 — mmap'd L2 cache (EVAL_CACHE_ARCHITECTURE §7 spike) — *REVIVED 2026-05-26 as R8a dependency*
 
@@ -769,7 +772,7 @@ hello.drvPath: zero bridges. Cache contributes zero on standard nixpkgs workload
 | R3 | Stage 9 dedup revival | 1-2 d re-measure + impl | R1 for Trigger B | coarser-grain dedup ≥ 2× OR post-ABT IR-level ≥ 2× |
 | R4 | Stage 12 JIT revival | 0 (data on hand) | none | dispatch > 40 % wall via OPCYCLES on M5 + alts < 5 % |
 | R5 | Stage 13 multi-core | 9-15 mo | R1 | process-parallelism < 30 % theoretical |
-| R6 | Whippet GC | TBD | B2 (nursery default-on) | tenured Boehm scan > 10 % eval wall |
+| R6 | Whippet GC — **REFRAMED RSS-PRIMARY 2026-05-27** | TBD | arena-deregister + B2-or-selective-nursery | RSS lever measured > 200 MB post-Boehm-deregister OR M5 still exceeds watchdog. **NOT wall-based** (`63c69536f` falsified) |
 | R7 | mmap'd L2 cache — **REVIVED 2026-05-26** | 3-5 d standalone + 1-2 wk R8a integration | (R8a) | AOT distribution format; trigger = R8a Phase 1 spike commits |
 | **R8a** (NEW 2026-05-26) | **v3-team-owned AOT cache** | **4-6 wk v3-only** | **(R7 + Phase 1 spike threshold)** | **Phase 1 spike ≥ 30 % warm-eval on HNE → ship Phase 2; v3-team-controlled; targets IOG priorities** |
 | R8b | cache.nixos.org integration (formerly R8) | 1-2 wk + cross-team | (R8a proven value + R1 recommended) | R8a shipped + schema stability + Nix-team buy-in + wall ≤ 1.5× TW |
@@ -1320,6 +1323,7 @@ For convenience, all Tier A + B falsifiers in one place:
 | **Cache schema bumps invalidate AOT artifacts; AOT requires schema stability OR versioned-artifact model** | AR8 (this doc §8.5) | R8 trigger pre-condition; informs when AOT can fire |
 | **Stage 13 (multi-core parallel eval) requires Full de Bruijn IR (R1) as prerequisite for symbol semantics safety** | AR10 (this doc §8.5) | R5 trigger pre-condition |
 | **Pre-retirement cross-workload sweep for any bridge primop** | AR15 (this doc §8.5) + #806a revert precedent | Convention; ~1 day per retirement |
+| **GC investments are RSS-primary, NOT wall-primary** | `63c69536f` (2026-05-27) falsified the "ditch Boehm for wall" premise — Boehm consumes 0 ms wall on real workloads. The only load-bearing motivation for any future GC work is peak RSS reduction, validated by direct freeable-memory measurement (e.g., `f3491859f` 239 MB on hello.drvPath). | Convention; codified in `IDEAL_GC_DESIGN_2026-05-26.md` §1 framing rule; R6 Whippet trigger reframed RSS-primary 2026-05-27 |
 
 ---
 
