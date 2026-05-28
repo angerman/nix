@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -597,6 +598,23 @@ public:
         }
     }
 
+    // Day 6: public accessors so dumpV3LiveBlockProbe can compute
+    // live bytes for the sweep-cost projection (Falsifier #2).
+    const std::unordered_set<Closure   *> & markedClosuresPub() const noexcept
+        { return markedClosures_; }
+    const std::unordered_set<Thunk     *> & markedThunksPub()   const noexcept
+        { return markedThunks_; }
+    const std::unordered_set<Bindings  *> & markedBindingsPub() const noexcept
+        { return markedBindings_; }
+    const std::unordered_set<ListVec   *> & markedListsPub()    const noexcept
+        { return markedLists_; }
+    const std::unordered_set<ValuePair *> & markedPairsPub()    const noexcept
+        { return markedPairs_; }
+    const std::unordered_set<Value     *> & markedCellsPub()    const noexcept
+        { return markedCells_; }
+    const std::unordered_set<const char *> & markedCharsPub()  const noexcept
+        { return markedChars_; }
+
     void reportBlocks() noexcept
     {
         // Build per-block live-bytes map.  Block is identified by its
@@ -767,6 +785,257 @@ public:
                 : "FAIL: blocks too uniformly populated; reconsider design");
     }
 
+    // Day 6 (2026-05-28): Falsifier #2 from GC_DESIGN_POST_CHENEY §5.2.
+    //
+    // Question: does flat mark-sweep's wall cost dominate eval time
+    // at v3's high live-fraction?
+    //
+    // Method: time the mark + scan phase using wall clocks.  Mark walks
+    // every reachable cell from precise roots (drain phase).  Scan
+    // walks the marked sets once for size accounting.  Together these
+    // approximate the per-cycle cost of MS's "walk live cells, populate
+    // free lists in their gaps" step (the closest analog without
+    // actually implementing the sweep).
+    //
+    // Pre-committed threshold: <5% of eval wall on hello.drvPath ->
+    // OK to ship.  5-10% -> marginal; revisit Immix.  >10% -> sweep
+    // cost dominates; abort flat MS, switch to Immix or other.
+    void reportSweepCost(double markMs, size_t totalLiveBytes) noexcept
+    {
+        // We extrapolate from the mark cost: in flat MS, sweep is
+        // roughly walking the marked set in address order + computing
+        // gap sizes between consecutive marked cells.  That's O(N_live)
+        // per cycle.  Mark itself is also O(N_live) (transitive
+        // closure of pointer follows).
+        //
+        // For HNE-scale workloads, expect mark + sweep per cycle to
+        // approximate 2x mark cost.  Project across N major GCs per
+        // eval at the default threshold cadence.
+        const double markMsPerByte = totalLiveBytes
+            ? markMs / double(totalLiveBytes) : 0.0;
+        const double projectedSweepMs = markMs;  // O(N_live) too
+        std::fprintf(stderr,
+            "\n=== Mark+sweep cost projection ===\n"
+            "  mark wall (this drain): %.2f ms\n"
+            "  live bytes processed:   %.1f MB\n"
+            "  mark cost / live byte:  %.3f ns\n"
+            "  projected sweep wall:   %.2f ms (O(N_live) walk)\n"
+            "  per-cycle total:        %.2f ms\n"
+            "\n"
+            "  At default trigger cadence (arena 256 MB -> reclaim live):\n"
+            "  if eval runs 10 cycles, sweep budget = %.0f ms\n"
+            "  if eval runs 50 cycles, sweep budget = %.0f ms\n",
+            markMs,
+            totalLiveBytes / 1e6,
+            markMsPerByte * 1e6,
+            projectedSweepMs,
+            markMs + projectedSweepMs,
+            10.0 * (markMs + projectedSweepMs),
+            50.0 * (markMs + projectedSweepMs));
+    }
+
+    // Day 6 (2026-05-28): Falsifier #1 from GC_DESIGN_POST_CHENEY §5.1.
+    //
+    // Question: does Immix's mark-region bump-realloc deliver enough
+    // space-savings vs flat mark-sweep to justify the +2 KLoC?
+    //
+    // Method: partition each arena block into LINES of `lineSize` bytes.
+    // For each marked cell, mark every line its byte range touches.
+    // After all cells marked, count lines with NO marked cell.
+    //
+    // Lines fully dead are the bytes Immix can reclaim via bump-realloc
+    // within partially-live blocks (its main advantage over flat MS).
+    // Lines partially live are pinned by Immix (a partially-live line
+    // can't be bump-realloced into).
+    //
+    // Pre-committed threshold: >=30% lines fully dead per cycle ->
+    // Immix path. <30% -> flat MS path.
+    //
+    // Reports at multiple line sizes (64, 128, 256, 512) so the
+    // sensitivity to line granularity is visible.
+    void reportLines() noexcept
+    {
+        // Default Immix line size = 128 B; sweep 64/128/256/512.
+        for (size_t lineSize : {size_t(64), size_t(128),
+                                size_t(256), size_t(512)}) {
+            reportLinesAtSize(lineSize);
+        }
+    }
+
+private:
+    void reportLinesAtSize(size_t lineSize) noexcept
+    {
+        // Pre-compute block-by-block layout.  We iterate
+        // `arena_.blockRanges()` once and store the range list locally
+        // since each `markRange` call would otherwise re-allocate.
+        const auto ranges = arena_.blockRanges();
+
+        // For each regular block, allocate a per-line bitmap.  Huge
+        // blocks (single-allocation, non-kBlockSize) are tracked
+        // separately as fully-alive (an Immix line-reclaim doesn't
+        // apply since the whole huge block is one allocation).
+        struct BlockEntry {
+            const char * begin;
+            const char * end;
+            std::vector<uint8_t> lineMarked;  // bool per line
+        };
+        std::vector<BlockEntry> blocks;
+        size_t hugeBytes = 0;
+        size_t hugeLiveBytes = 0;
+        for (const auto & r : ranges) {
+            const size_t rangeBytes =
+                static_cast<size_t>(r.end - r.begin);
+            if (rangeBytes != Arena::kBlockSize) {
+                hugeBytes += rangeBytes;
+                continue;
+            }
+            BlockEntry e;
+            e.begin = r.begin;
+            e.end = r.end;
+            const size_t nLines =
+                (rangeBytes + lineSize - 1) / lineSize;
+            e.lineMarked.assign(nLines, 0);
+            blocks.push_back(std::move(e));
+        }
+
+        // Sort blocks by begin for binary lookup.
+        std::sort(blocks.begin(), blocks.end(),
+            [](const BlockEntry & a, const BlockEntry & b) {
+                return a.begin < b.begin;
+            });
+
+        auto findBlock = [&](const void * cellPtr) -> BlockEntry * {
+            // Binary search by begin; check end after.
+            auto it = std::upper_bound(blocks.begin(), blocks.end(),
+                cellPtr,
+                [](const void * cp, const BlockEntry & b) {
+                    return cp < (const void *)b.begin;
+                });
+            if (it == blocks.begin()) return nullptr;
+            --it;
+            if (cellPtr >= (const void *)it->begin
+                && cellPtr < (const void *)it->end)
+                return &*it;
+            return nullptr;
+        };
+
+        auto markRange = [&](const void * cellPtr, size_t cellBytes) {
+            BlockEntry * blk = findBlock(cellPtr);
+            if (!blk) {
+                // Huge block (or external).  Charge as huge-live.
+                hugeLiveBytes += cellBytes;
+                return;
+            }
+            size_t offset = (const char *)cellPtr - blk->begin;
+            if (offset + cellBytes > Arena::kBlockSize) {
+                // Cell straddles end-of-block (shouldn't normally
+                // happen since allocator refills on overflow, but
+                // defensive).
+                cellBytes = Arena::kBlockSize - offset;
+            }
+            size_t firstLine = offset / lineSize;
+            size_t lastLine  = (offset + cellBytes - 1) / lineSize;
+            for (size_t i = firstLine;
+                 i <= lastLine && i < blk->lineMarked.size(); ++i)
+            {
+                blk->lineMarked[i] = 1;
+            }
+        };
+
+        // Walk every marked set; mark lines.
+        for (Closure * c : markedClosures_)
+            markRange(c,
+                sizeof(Closure) + sizeof(Value) * c->nUpvalues);
+        for (Thunk * t : markedThunks_) {
+            size_t bytes = (t->state == ThunkState::Suspended
+                         || t->state == ThunkState::Native
+                         || t->state == ThunkState::Blackhole)
+                ? sizeof(Thunk) + sizeof(Value) * t->nUpvalues
+                : sizeof(Thunk);
+            markRange(t, bytes);
+        }
+        for (Bindings * b : markedBindings_)
+            markRange(b,
+                sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+        for (ListVec * l : markedLists_)
+            markRange(l, sizeof(ListVec) + sizeof(Value) * l->size);
+        for (ValuePair * p : markedPairs_)
+            markRange(p, sizeof(ValuePair));
+        for (Value * c : markedCells_)
+            markRange(c, sizeof(Value));
+        for (const char * s : markedChars_)
+            markRange(s, std::strlen(s) + 1);
+
+        // Aggregate per-block + global.
+        size_t totalLines = 0, deadLines = 0;
+        size_t pinnedBytes = 0;   // lines with >=1 marked cell
+        size_t reclaimedBytes = 0; // lines fully dead
+        // Per-block dead-line histogram (for grouping detection).
+        size_t blocksAllDead = 0, blocksMostlyDead = 0,
+               blocksMixed = 0,  blocksMostlyLive = 0,
+               blocksAllLive = 0;
+        size_t maxLinesAnyBlock = 0;
+        for (auto & blk : blocks) {
+            size_t blockTotal = blk.lineMarked.size();
+            maxLinesAnyBlock = std::max(maxLinesAnyBlock, blockTotal);
+            size_t blockMarked = 0;
+            for (uint8_t b : blk.lineMarked)
+                if (b) ++blockMarked;
+            size_t blockDead = blockTotal - blockMarked;
+            totalLines += blockTotal;
+            deadLines  += blockDead;
+            pinnedBytes    += blockMarked * lineSize;
+            reclaimedBytes += blockDead   * lineSize;
+            double deadFrac = double(blockDead) / double(blockTotal);
+            if (deadFrac > 0.99)      ++blocksAllDead;
+            else if (deadFrac > 0.75) ++blocksMostlyDead;
+            else if (deadFrac > 0.25) ++blocksMixed;
+            else if (deadFrac > 0.01) ++blocksMostlyLive;
+            else                      ++blocksAllLive;
+        }
+
+        const double deadLinePct = totalLines
+            ? 100.0 * double(deadLines) / double(totalLines) : 0.0;
+        const double arenaBytes =
+            double(totalLines * lineSize);
+        const double reclaimablePct = arenaBytes
+            ? 100.0 * double(reclaimedBytes) / arenaBytes : 0.0;
+
+        // Pre-committed threshold per GC_DESIGN_POST_CHENEY §5.1.
+        const double immixThresholdPct = 30.0;
+
+        std::fprintf(stderr,
+            "\n=== Immix line-occupancy probe @ line_size=%zu B ===\n"
+            "  blocks            %zu (block_size=16 MB)\n"
+            "  total lines       %zu (= %.1f MB)\n"
+            "  pinned (live)     %zu lines  (= %.1f MB)\n"
+            "  fully-dead        %zu lines  (= %.1f%% of lines, %.1f MB)\n"
+            "  bump-realloc-recoverable: %.1f%% of arena bytes\n"
+            "  blocks all-dead=%zu mostly-dead=%zu mixed=%zu "
+            "mostly-live=%zu all-live=%zu\n"
+            "  VERDICT (>=%.0f%% lines dead -> Immix viable):\n"
+            "    %s\n",
+            lineSize,
+            blocks.size(),
+            totalLines, arenaBytes / 1e6,
+            totalLines - deadLines, pinnedBytes / 1e6,
+            deadLines, deadLinePct, reclaimedBytes / 1e6,
+            reclaimablePct,
+            blocksAllDead, blocksMostlyDead, blocksMixed,
+            blocksMostlyLive, blocksAllLive,
+            immixThresholdPct,
+            deadLinePct >= immixThresholdPct
+                ? "PASS: Immix bump-realloc worth the +2 KLoC complexity"
+                : "FAIL: too many lines partially-live; flat MS dominates");
+
+        if (hugeBytes) {
+            std::fprintf(stderr,
+                "  (huge blocks: %.1f MB total, %.1f MB live)\n",
+                hugeBytes / 1e6, hugeLiveBytes / 1e6);
+        }
+    }
+
+public:
     // Day 5 follow-up: per-alloc-site live-ratio report.  Requires
     // NIX_V3_BINDINGS_ORIGIN=1 + NIX_V3_THUNKS_ATTR=1 to populate the
     // origin tables.  Tests the hypothesis: are there alloc sites
@@ -1016,6 +1285,10 @@ void dumpV3LiveBlockProbe() noexcept
 
     BlockProbe pr(arena);
 
+    // Day 6: time the mark phase for Falsifier #2 (sweep cost projection).
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+
     bool walkedActiveVM = false;
     const auto & stack = activeVMStack();
     if (!stack.empty() && stack.back()) {
@@ -1026,6 +1299,10 @@ void dumpV3LiveBlockProbe() noexcept
     }
     pr.drain();
 
+    const auto t1 = clock::now();
+    const double markMs =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+
     if (!walkedActiveVM) {
         std::fprintf(stderr,
             "\n[NIX_V3_BLOCK_PROBE: VMState already torn down — "
@@ -1033,6 +1310,31 @@ void dumpV3LiveBlockProbe() noexcept
             "reachable)]\n");
     }
     pr.reportBlocks();
+    pr.reportLines();
+    // Approximate live bytes from the per-block live-bytes computed
+    // during reportBlocks; we just re-aggregate from sets here cheaply.
+    size_t liveBytesApprox = 0;
+    for (Closure * c : pr.markedClosuresPub())
+        liveBytesApprox += sizeof(Closure) + sizeof(Value) * c->nUpvalues;
+    for (Thunk * t : pr.markedThunksPub()) {
+        size_t b = (t->state == ThunkState::Suspended
+                 || t->state == ThunkState::Native
+                 || t->state == ThunkState::Blackhole)
+            ? sizeof(Thunk) + sizeof(Value) * t->nUpvalues
+            : sizeof(Thunk);
+        liveBytesApprox += b;
+    }
+    for (Bindings * b : pr.markedBindingsPub())
+        liveBytesApprox += sizeof(Bindings) + sizeof(Bindings::Entry) * b->size;
+    for (ListVec * l : pr.markedListsPub())
+        liveBytesApprox += sizeof(ListVec) + sizeof(Value) * l->size;
+    for ([[maybe_unused]] ValuePair * p : pr.markedPairsPub())
+        liveBytesApprox += sizeof(ValuePair);
+    for ([[maybe_unused]] Value * c : pr.markedCellsPub())
+        liveBytesApprox += sizeof(Value);
+    for (const char * s : pr.markedCharsPub())
+        liveBytesApprox += std::strlen(s) + 1;
+    pr.reportSweepCost(markMs, liveBytesApprox);
     pr.reportAllocSites();
 }
 
