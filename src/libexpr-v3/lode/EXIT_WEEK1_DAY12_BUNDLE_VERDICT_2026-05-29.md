@@ -1,7 +1,9 @@
 # EXIT Week 1 Day 12 — Bundle SHIP gate verdict
 
 **Date:** 2026-05-29
-**Status:** **PASS on HNE** (definitive, σ=0.35 MB at N=10).  **PASS on M5** at N=10 with -519 MB peak Δ (1.2σ signal) and -806 MB arena Δ (deterministic).  Watchdog goal (4096 MB) cleared by ~50 MB on the trim-2 mean.
+**Status: SUPERSEDED by Week 1 retrospective 2026-05-29 evening.**  This Day 12 verdict's measurements used the bench script's default `NIX_BIN=$ROOT/build/src/nix/nix` — a separate stripped build whose mtime is older than the Day 6-8 commit.  The honest re-measurement on `builddir/` with App3 rolled back (see [`EXIT_WEEK1_RETROSPECTIVE_2026-05-29.md`](EXIT_WEEK1_RETROSPECTIVE_2026-05-29.md)) shows the bundle is real (-105 MB HNE / -822 MB M5 arena) BUT M5 trim-2 mean = 4343 MB is **247 MB OVER** the watchdog target, not 50 MB under as claimed below.  Bundle SHIPS on both workloads; watchdog NOT closed by Week 1 alone.  Original status preserved below for historical context.
+
+**Original status:** **PASS on HNE** (definitive, σ=0.35 MB at N=10).  **PASS on M5** at N=10 with -519 MB peak Δ (1.2σ signal) and -806 MB arena Δ (deterministic).  Watchdog goal (4096 MB) cleared by ~50 MB on the trim-2 mean.
 **Task:** #864
 **Plan reference:** [`EXIT_GC_SPIRAL_PLAN_2026-05-29.md`](EXIT_GC_SPIRAL_PLAN_2026-05-29.md) §4.3
 

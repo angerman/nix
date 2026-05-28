@@ -1,7 +1,9 @@
 # EXIT Week 1 Day 9-11 — mapAttrs 2-pair → Tag::App3
 
 **Date:** 2026-05-29
-**Status:** IMPLEMENTATION LANDED — Tag::App3 wired end-to-end across forceValue / OP_FORCE / GC / serialize / repr; parity preserved on hello + nixpkgs corpus; HNE/M5 peak measurement pending (baselines running)
+**Status: ROLLED BACK 2026-05-29 evening** (commit `a9912f0fb`).  Day 13-15 measurement audit discovered Tag::App3 caused a NET REGRESSION (3× allocations on HNE, +1.6 GB arena, 4× wall) due to lost App-result memoization (#696).  The "retain, peak-neutral" decision below was based on a measurement against a stale `build/` binary that didn't contain Tag::App3.  Site-level revert at primops.cc primMapAttrs + primZipAttrsWith restores the 2-pair encoding's memoization sink.  Tag::App3 dispatch + enum + switch coverage stay as dead code.  See [`EXIT_WEEK1_RETROSPECTIVE_2026-05-29.md`](EXIT_WEEK1_RETROSPECTIVE_2026-05-29.md) §4.2 for the regression measurement.  Sections below describe the ORIGINAL Day 9-11 implementation and (now-invalidated) "peak-neutral" reading; preserved for historical context.
+
+**Original status:** IMPLEMENTATION LANDED — Tag::App3 wired end-to-end across forceValue / OP_FORCE / GC / serialize / repr; parity preserved on hello + nixpkgs corpus; HNE/M5 peak measurement pending (baselines running)
 **Task:** #863
 **Plan reference:** [`EXIT_GC_SPIRAL_PLAN_2026-05-29.md`](EXIT_GC_SPIRAL_PLAN_2026-05-29.md) §4.4 + [`EXIT_DAY3-5_DECISION_2026-05-29.md`](EXIT_DAY3-5_DECISION_2026-05-29.md) §3.2
 
