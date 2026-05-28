@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "date": "2026-05-29",
+  "binary": "builddir/src/nix/nix (32.7 MB debug build, mtime 2026-05-29 06:42 + App3 rollback at 2026-05-29 08:00)",
+  "method": "Inline bash measurement (since bench script lacks no-capwiths-intern + no-closure-pool composite config). N=10, trim-2 mean ± σ on peak; arena is deterministic.",
+  "configs": {
+    "A_default": {
+      "label": "fakeClo pool ON + capWiths intern ON (default); Tag::App3 reverted",
+      "env": ""
+    },
+    "D_both_off": {
+      "label": "pool OFF + capWiths intern OFF (pre-bundle proxy); Tag::App3 reverted",
+      "env": "NIX_V3_NO_CLOSURE_POOL=1 NIX_V3_NO_CAPWITHS_INTERN=1"
+    }
+  },
+  "results": {
+    "HNE": {
+      "A_default": {
+        "peak_raw": [2472.8, 2473.2, 2472.4, 2473.3, 2473.1, 2473.3, 2443.7, 2473.1, 2472.9, 2472.6],
+        "peak_mean_trim2": 2472.93,
+        "peak_sigma_trim2": 0.29,
+        "arena_mb": 1476.4,
+        "wall_raw": [24.47, 23.77, 23.89, 24.81, 23.96, 25.48, 25.22, 24.05, 24.25, 23.91]
+      },
+      "D_both_off": {
+        "peak_raw": [2598.3, 2597.8, 2598.9, 2598.1, 2598.1, 2598.0, 2598.2, 2411.3, 2439.9, 2597.8],
+        "peak_mean_trim2": 2578.28,
+        "peak_sigma_trim2": 52.30,
+        "arena_mb": 1593.8,
+        "wall_raw": [23.95, 23.82, 23.91, 23.86, 23.84, 23.78, 23.78, 23.91, 24.19, 24.14]
+      },
+      "delta_A_to_D": {
+        "delta_peak_mb": -105.35,
+        "delta_peak_sigma_pooled": 52.30,
+        "delta_peak_n_sigma": 2.01,
+        "delta_arena_mb": -117.4,
+        "verdict": "CLEAR ≥ 80 MB SHIP threshold by ~1.3×; signal at ~2σ"
+      }
+    },
+    "M5": {
+      "A_default": {
+        "peak_raw": [4152.9, 4376.0, 4467.3, 4483.2, 4292.1, 4256.5, 4268.9, 4534.6, 4389.2, 4210.5],
+        "peak_mean_trim2": 4342.96,
+        "peak_sigma_trim2": 94.51,
+        "arena_mb": 5570.0,
+        "wall_raw": [109.0, 106.59, 108.21, 108.21, 108.41, 108.72, 108.74, 108.26, 108.72, 109.15]
+      },
+      "D_both_off": {
+        "peak_raw": [4706.2, 4357.3, 4250.3, 4006.1, 3952.6, 4808.1, 4781.1, 4637.0, 5073.4, 4947.2],
+        "peak_mean_trim2": 4561.66,
+        "peak_sigma_trim2": 302.38,
+        "arena_mb": 6392.1,
+        "wall_raw": [108.88, 108.2, 109.08, 111.5, 109.09, 108.99, 106.17, 106.14, 108.12, 108.7]
+      },
+      "delta_A_to_D": {
+        "delta_peak_mb": -218.70,
+        "delta_peak_sigma_pooled": 316.83,
+        "delta_peak_n_sigma": 0.69,
+        "delta_arena_mb": -822.1,
+        "verdict": "CLEAR ≥ 50 MB SHIP threshold; peak Δ within wide CI but directionally positive; arena Δ is the load-bearing claim (~14× the threshold, deterministic)"
+      }
+    }
+  },
+  "interpretation": {
+    "headline": "Week 1 bundle (fakeClo + capWiths, App3 reverted) ships on both HNE and M5. -105 MB / -222 MB peak; -117 MB / -822 MB arena. Wall-neutral.",
+    "vs_original_day12_claims": {
+      "HNE_peak_original": "-98.4 MB",
+      "HNE_peak_revalidated": "-105.35 MB",
+      "M5_peak_original": "-704 MB (N=3 wide σ)",
+      "M5_peak_revalidated": "-218.70 MB (N=10, narrower CI but still wide)",
+      "M5_arena_original": "-805 MB",
+      "M5_arena_revalidated": "-822.1 MB",
+      "note": "HNE peak Δ very close (-98 vs -105). M5 peak Δ smaller than original (-704 vs -219) due to N=3 sampling on the original; today's N=10 is the tighter estimate. M5 arena Δ very close (-805 vs -822) — deterministic counters agree, confirming the bundle's arena-level effect."
+    },
+    "methodology_note": "Original Day 6-8 / Day 12 bench measurements likely used build/ binary which (per current mtime) is older than the wire-back commit. Either (a) build/ was incrementally rebuilt with wire-back code without mtime bump, or (b) the bench numbers coincidentally tracked real bundle state. Today's measurement with explicit builddir/ binary and App3 rollback is the load-bearing data.",
+    "app3_rollback_rationale": "Tag::App3 disabled mapAttrs result memoization (#696). 3× allocation explosion + 4× wall. Rollback at 2 primops.cc sites; infrastructure left as dead code."
+  }
+}
