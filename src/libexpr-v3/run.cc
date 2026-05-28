@@ -457,6 +457,28 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                         labels[i], (unsigned long long)a.mergeBindingsNbHist[i]);
             }
         }
+        // EXIT_GC_SPIRAL Day 13-15 (2026-05-29): singleton-capturedWiths
+        // intern-cache hit rate.  Hit rate near 100 % means the cache
+        // is doing its job (most 1-element capturedWiths reuse a
+        // shared ListVec).  Low hit rate + high evicts means either
+        // many unique with-targets (workload-specific) or hash
+        // collisions thrashing — bump kCapWithsCacheBuckets if so.
+        {
+            uint64_t h = getCapWithsHits();
+            uint64_t m = getCapWithsMisses();
+            uint64_t e = getCapWithsEvicts();
+            if (h + m > 0) {
+                double hitRate = 100.0 * (double)h / (double)(h + m);
+                std::fprintf(stderr,
+                    "v3-direct capWiths-intern: hits=%llu misses=%llu "
+                    "evicts=%llu hitRate=%.1f%% (estimated savings ~%.1f MB "
+                    "@ 32 B/hit)\n",
+                    (unsigned long long)h, (unsigned long long)m,
+                    (unsigned long long)e,
+                    hitRate,
+                    h * 32.0 / 1e6);
+            }
+        }
         // #719 (#702 falsifier chain, 2026-05-21): three-way RSS
         // decomposition.  v3's RSS minus (Boehm-heap + v3-arena) is
         // the "elsewhere" remainder — scratch buffers, libc malloc

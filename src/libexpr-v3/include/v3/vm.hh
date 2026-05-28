@@ -195,4 +195,12 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
                 const Value * upvalues, uint32_t nUpvalues,
                 ListVec * capturedWiths = nullptr);
 
+/// EXIT_GC_SPIRAL Day 13-15 (2026-05-29): singleton interning pool for
+/// 1-element capturedWiths ListVecs.  Exposed for NIX_VM_STATS dump.
+/// Hits/Misses counter the cache hit-rate; Evicts counts collisions
+/// (entry overwritten by a different key — a fresh alloc-+-install).
+uint64_t getCapWithsHits()   noexcept;
+uint64_t getCapWithsMisses() noexcept;
+uint64_t getCapWithsEvicts() noexcept;
+
 } // namespace nix::v3

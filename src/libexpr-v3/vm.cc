@@ -1917,6 +1917,114 @@ inline Value withLookup(VMState & vm, SymbolId name)
     throw std::runtime_error("undefined variable '" + nm + "'");
 }
 
+// ---------------------------------------------------------------------------
+// EXIT_GC_SPIRAL Week 2 Day 13-15 (2026-05-29): singleton interning pool
+// for 1-element capturedWiths ListVecs.
+//
+// T1_3_PAIRS_LISTS_ATTR_2026-05-27 measured 544 K MAKE_THUNK allocs on HNE
+// with avg-size 1.04, max 2 — overwhelmingly nWiths==1.  Each 1-element
+// ListVec is 32 B (16 B header + 16 B element).  Interning shares one
+// tenured-arena ListVec across all Thunks/Closures capturing the same
+// with-target, eliminating ~95% of the per-call alloc cost.
+//
+// Correctness model:
+//   * ListVec is set-once at MAKE time and read-only thereafter.
+//     pushCapturedWiths only READS via ->size / ->elems[i].  Sharing
+//     is therefore safe — no inter-thunk mutation.
+//   * Allocated arena-resident (Alloc::allocList).  Arena pointers
+//     are stable for the process lifetime (no compaction).
+//   * Phase D / nursery generational correctness: first miss installs
+//     the ListVec and calls listPostConstructBarrier() — if the
+//     with-target was a nursery Value, the ListVec lands on
+//     dirtyContainers and the next scavenge forwards the embedded
+//     payload.  Subsequent cache hits return the SAME pointer, whose
+//     elems[0] has already been forwarded (or will be by the pending
+//     scavenge).  No additional barriers required.
+//   * Cache orphans: when a Value is forwarded by scavenge, ALL live
+//     references to it are updated (it's a root walk).  Cache KEYS
+//     (uint64 copies) are NOT updated; orphaned entries have stale
+//     keys.  No correctness issue (next lookup with the new key
+//     misses → allocates fresh).  Orphan footprint is bounded by
+//     the fixed bucket count.
+//
+// Memory footprint of the cache itself: 4096 buckets * 24 B = 96 KB.
+//
+// Gate: NIX_V3_NO_CAPWITHS_INTERN=1 reverts every call to a fresh
+// allocList for A/B measurement.
+//
+// Retirement criterion (Rule 0): retire the cache when (a) Phase E
+// v0.2 default-on makes nursery-allocated ListVecs cheap enough to
+// drop the per-call cost, OR (b) Stage 6 production GC reclaims
+// per-call ListVecs unaided.  Until then, keep the cache.
+
+namespace {
+
+constexpr size_t kCapWithsCacheBuckets = 4096;
+
+struct CapWithsCacheEntry {
+    uint64_t key_tag_payload;
+    uint64_t key_payload_raw;
+    ListVec * value;  // nullptr → empty entry
+};
+
+static CapWithsCacheEntry s_capWithsCache[kCapWithsCacheBuckets] = {};
+static uint64_t s_capWithsHits     = 0;
+static uint64_t s_capWithsMisses   = 0;
+static uint64_t s_capWithsEvicts   = 0;
+
+inline size_t hashCapWithsKey(uint64_t tp, uint64_t pr) noexcept
+{
+    uint64_t h = tp * 0x9e3779b97f4a7c15ull;
+    h ^= pr * 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 27;
+    return static_cast<size_t>(h) & (kCapWithsCacheBuckets - 1);
+}
+
+/// Intern-or-allocate a 1-element ListVec capturing `v`.  Hit returns
+/// the existing arena pointer in O(1); miss allocates fresh, installs
+/// (overwriting any colliding entry — collisions are cheaper than
+/// chaining at this scale).
+inline ListVec * internOrAllocSingletonCapWiths(const Value & v) noexcept
+{
+    static const bool s_disabled =
+        std::getenv("NIX_V3_NO_CAPWITHS_INTERN") != nullptr;
+    if (__builtin_expect(s_disabled, 0)) {
+        ListVec * lws = Alloc::allocList(1);
+        lws->elems[0] = v;
+        listPostConstructBarrier(lws);
+        return lws;
+    }
+    const uint64_t tp = v.tag_payload;
+    const uint64_t pr = reinterpret_cast<uint64_t>(v.payload.raw);
+    const size_t idx = hashCapWithsKey(tp, pr);
+    CapWithsCacheEntry & e = s_capWithsCache[idx];
+    if (e.value
+        && e.key_tag_payload == tp
+        && e.key_payload_raw == pr)
+    {
+        ++s_capWithsHits;
+        return e.value;
+    }
+    ++s_capWithsMisses;
+    if (e.value) ++s_capWithsEvicts;  // collision: prior entry replaced
+    ListVec * lws = Alloc::allocList(1);
+    lws->elems[0] = v;
+    listPostConstructBarrier(lws);
+    e.key_tag_payload = tp;
+    e.key_payload_raw = pr;
+    e.value = lws;
+    return lws;
+}
+
+// File-scope accessors require external linkage so run.cc can call
+// them.  The statics they read live in the unnamed inner namespace
+// above (internal linkage, but visible within this TU).
+inline uint64_t internalCapWithsHits()    noexcept { return s_capWithsHits; }
+inline uint64_t internalCapWithsMisses()  noexcept { return s_capWithsMisses; }
+inline uint64_t internalCapWithsEvicts()  noexcept { return s_capWithsEvicts; }
+
+} // anonymous
+
 /// Snapshot the current frame's visible with-stack (entries from
 /// `withStackBase` to top) into a fresh ListVec.  Returns nullptr when
 /// no withs are currently in scope (cheap fast-path for the common case
@@ -1927,6 +2035,16 @@ inline ListVec * snapshotCurrentWiths(VMState & vm)
     size_t top  = vm.withStack.size();
     if (top <= base) return nullptr;
     uint32_t n = static_cast<uint32_t>(top - base);
+    // Day 13-15 (2026-05-29): intern the 1-element case via the
+    // singleton pool — same correctness model as the OP_MAKE_THUNK
+    // path (see internOrAllocSingletonCapWiths above).  Larger
+    // sizes fall through to per-call alloc.  snapshotCurrentWiths
+    // is the secondary T1.3 site (vm.cc:6991 in the 2026-05-27
+    // numbering, 5.13 MB on HNE, avg-size 1.38 max 339): some
+    // fraction will hit the size-1 fast path.
+    if (n == 1) {
+        return internOrAllocSingletonCapWiths(vm.withStack[base]);
+    }
     ListVec * out = Alloc::allocList(n);
     for (uint32_t i = 0; i < n; ++i)
         out->elems[i] = vm.withStack[base + i];
@@ -2337,6 +2455,14 @@ static inline void hotForceCheck(const Thunk * t)
 // wall-time / cpu-time / heap-cap abort.  Cheap (one thread-local
 // store on entry/exit, no per-instruction cost).
 namespace nix::v3 {
+    // EXIT_GC_SPIRAL Day 13-15 (2026-05-29): external-linkage wrappers
+    // around the internal capWiths stats.  The implementations live in
+    // an anonymous namespace at the top of this TU; these wrappers
+    // export them so run.cc's NIX_VM_STATS dump can read the counters.
+    uint64_t getCapWithsHits()   noexcept { return internalCapWithsHits(); }
+    uint64_t getCapWithsMisses() noexcept { return internalCapWithsMisses(); }
+    uint64_t getCapWithsEvicts() noexcept { return internalCapWithsEvicts(); }
+
     thread_local VMState * tlCurrentDispatchVM = nullptr;
     VMState * currentDispatchVM() { return tlCurrentDispatchVM; }
 
@@ -3555,7 +3681,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // the with-target block beneath.  Build capturedWiths
             // outermost-first by filling reverse into the ListVec.
             for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
-            if (nWiths > 0) {
+            if (nWiths == 1) {
+                // Day 13-15 (2026-05-29): singleton interning for the
+                // overwhelmingly-dominant 1-element case (avg 1.04 on
+                // HNE per T1_3_PAIRS_LISTS).  See helper at vm.cc top.
+                Value w = pop(vm);
+                c->capturedWiths = internOrAllocSingletonCapWiths(w);
+            } else if (nWiths > 0) {
                 ListVec * lws = Alloc::allocList(nWiths);
                 for (uint16_t i = nWiths; i > 0; --i)
                     lws->elems[i - 1] = pop(vm);
@@ -3964,7 +4096,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
             }
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
-            if (nWiths > 0) {
+            if (nWiths == 1) {
+                // Day 13-15 (2026-05-29): singleton interning — this
+                // is the HEADLINE site per T1_3 (vm.cc:3831 in the
+                // 05-27 numbering): 544 K allocs / 12.8 MB on HNE,
+                // avg-size 1.04.  Almost all hit the singleton path.
+                Value w = pop(vm);
+                t->suspended.capturedWiths = internOrAllocSingletonCapWiths(w);
+            } else if (nWiths > 0) {
                 ListVec * lws = Alloc::allocList(nWiths);
                 for (uint16_t i = nWiths; i > 0; --i)
                     lws->elems[i - 1] = pop(vm);
