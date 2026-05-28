@@ -82,12 +82,45 @@ fi
 # Repo root + nix binary discovery.
 # ----------------------------------------------------------------------
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-NIX_BIN="${NIX_BIN:-$ROOT/build/src/nix/nix}"
+
+# Auto-pick the newer of build/ and builddir/ unless NIX_BIN is set
+# explicitly.  Per `[[bench-binary-fingerprint]]` (2026-05-29): the
+# original default `$ROOT/build/src/nix/nix` was stale relative to
+# the active meson build at builddir/.  Pre-fix, Day 6-8 / Day 9-11
+# / Day 12 bench measurements all ran against pre-Week-1 binary
+# without detection.
+if [[ -z "${NIX_BIN:-}" ]]; then
+    declare -a CANDIDATES=()
+    [[ -x "$ROOT/builddir/src/nix/nix" ]] && CANDIDATES+=("$ROOT/builddir/src/nix/nix")
+    [[ -x "$ROOT/build/src/nix/nix"    ]] && CANDIDATES+=("$ROOT/build/src/nix/nix")
+    if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+        echo "Error: no nix binary found at build/ or builddir/ — build first" >&2
+        echo "Or set NIX_BIN=<path>" >&2
+        exit 2
+    fi
+    # Pick the most-recently-modified candidate.
+    NIX_BIN=""
+    NIX_BIN_MTIME=0
+    for c in "${CANDIDATES[@]}"; do
+        local_mtime=$(python3 -c "import os; print(int(os.path.getmtime('$c')))")
+        if [[ "$local_mtime" -gt "$NIX_BIN_MTIME" ]]; then
+            NIX_BIN="$c"
+            NIX_BIN_MTIME="$local_mtime"
+        fi
+    done
+    echo "[noise-floor] auto-selected NIX_BIN=$NIX_BIN (mtime=$NIX_BIN_MTIME)" >&2
+    # Warn if HEAD commit is newer than the chosen binary.
+    HEAD_MTIME=$(git -C "$ROOT" log -1 --format=%ct HEAD 2>/dev/null || echo 0)
+    if [[ "$HEAD_MTIME" -gt "$NIX_BIN_MTIME" ]]; then
+        echo "[noise-floor] WARNING: HEAD commit (mtime $HEAD_MTIME) is NEWER than $NIX_BIN (mtime $NIX_BIN_MTIME) — rebuild before measuring" >&2
+    fi
+fi
 
 if [[ ! -x "$NIX_BIN" ]]; then
     {
         echo "Error: nix binary not found or not executable: $NIX_BIN"
-        echo "Build first via: ninja -C build src/nix/nix"
+        echo "Build first via: ninja -C build src/nix/nix  (release build)"
+        echo "             or: ninja -C builddir src/nix/nix  (debug build, common)"
         echo "Or set NIX_BIN=<path>"
     } >&2
     exit 2
