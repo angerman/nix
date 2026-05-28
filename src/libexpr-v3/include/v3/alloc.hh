@@ -2446,15 +2446,28 @@ inline Closure * Alloc::tryPopFakeClo(uint16_t nUpvalues) noexcept
 
 inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
 {
-    if (Closure * c = tryPopFakeClo(nUpvalues)) {
-        // Pool hit — closure was previously stamped with the fakeClo
-        // magic at allocFakeClo time, and the magic survived through
-        // recycleFakeClo (which doesn't touch _pad).  Caller is about
-        // to overwrite desc/cu/capturedWiths/upvalues; magic stays.
-        return c;
+    // EXIT_GC_SPIRAL Day 6-8 wire-back (2026-05-29): the pool gate
+    // `NIX_V3_NO_CLOSURE_POOL=1` opts OUT of pool reuse.  When set,
+    // every call falls through to a fresh arena allocation (still
+    // arena-backed; preserves the fakeClo magic so recycleFakeClo
+    // would still classify it correctly, just never hits the pool).
+    //
+    // Retirement (per Rule 0): "Delete the gate when EXIT_WEEK1
+    // bundle SHIP-gate clears AND the pool is confirmed correct
+    // across nixpkgs flake matrix."
+    static const bool s_poolDisabled =
+        std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
+    if (__builtin_expect(!s_poolDisabled, 1)) {
+        if (Closure * c = tryPopFakeClo(nUpvalues)) {
+            // Pool hit — closure was previously stamped with the fakeClo
+            // magic at allocFakeClo time, and the magic survived through
+            // recycleFakeClo (which doesn't touch _pad).  Caller is about
+            // to overwrite desc/cu/capturedWiths/upvalues; magic stays.
+            return c;
+        }
     }
-    // Pool miss: always arena (never nursery) so subsequent
-    // recycle's pointer stability survives Cheney scavenges.
+    // Pool miss (or pool disabled): always arena (never nursery) so
+    // subsequent recycle's pointer stability survives Cheney scavenges.
     const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
     V3_STATS_BUMP(bytesClosures, bytes);
     auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
@@ -2468,6 +2481,12 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
 inline void Alloc::recycleFakeClo(Closure * c) noexcept
 {
     if (!c) return;
+    // EXIT_GC_SPIRAL Day 6-8 wire-back: if pool disabled, recycling
+    // is a no-op — the closure is just left for arena GC to reclaim
+    // (or stays resident if no GC fires).  Pool gate same as alloc.
+    static const bool s_poolDisabled =
+        std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
+    if (__builtin_expect(s_poolDisabled, 0)) return;
     // Phase A5 FIX (RCA 2026-05-11): only recycle when the closure
     // carries the fakeClo magic in _pad.  Real closures produced by
     // OP_MAKE_CLOSURE have _pad=0; recycling them would let allocFakeClo

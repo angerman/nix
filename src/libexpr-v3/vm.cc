@@ -5905,6 +5905,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         : std::string("<no-pos>");
                 nix::evalTrace::leaveWhnf(posStr, v3ValueTypeName(retVal));
             }
+            // EXIT_GC_SPIRAL Day 6-8 wire-back (2026-05-29): recycle
+            // the popped fakeClo back to the closure pool.  Only
+            // CFF_THUNK_RETURN frames synthesized fakeClos via
+            // `allocFakeClo` (with kFakeCloMagic in _pad);
+            // `recycleFakeClo` rejects non-magic closures, so a stray
+            // non-fakeClo closure here is a safe no-op.
+            //
+            // Must happen AFTER fClosure->desc is last read (above
+            // trace block); recycleFakeClo zeros upvalues + sets
+            // capturedWiths=nullptr, leaving desc/cu stale until next
+            // pop.  fClosure is unused beyond this point in OP_RETURN.
+            if ((fFlags & CFF_THUNK_RETURN) && fClosure) {
+                Alloc::recycleFakeClo(fClosure);
+            }
             if (fFlags & CFF_THUNK_RETURN) {
                 // Chase Evaluated chains so the thunk caches the
                 // ultimate WHNF and not an intermediate thunk.
@@ -6930,7 +6944,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // reclamation: fresh closures land in nursery, scavenge
             // collects unreferenced ones at next cycle.  Pool was
             // load-bearing only before nursery + Phase D landed.
-            Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
+            // EXIT_GC_SPIRAL Day 6-8 wire-back (2026-05-29): use the
+            // fakeClo pool (`allocFakeClo`) instead of fresh
+            // `allocClosure`.  The pool is gated by
+            // `NIX_V3_NO_CLOSURE_POOL=1` (opt-OUT; pool default-on).
+            Closure * fakeClo = Alloc::allocFakeClo(t->nUpvalues);
             // Phase A5 RCA: alarm when fakeClo's pre-overwrite desc is
             // a "real" closure body (i.e., codeOff != 0 and name not
             // empty).  A recycled-fakeClo pool would only set desc to a
@@ -10703,7 +10721,8 @@ inline Value runOnExistingVm(VMState & vm,
         // Even arg-only frames (no upvalues) need a Closure so the
         // dispatch loop's `closure` register has a valid descriptor
         // to query (e.g. for capturedWiths or selector fast-paths).
-        fakeClo = Alloc::allocClosure(nUpvalues);
+        // EXIT_GC_SPIRAL Day 6-8: use pool.
+        fakeClo = Alloc::allocFakeClo(static_cast<uint16_t>(nUpvalues));
         fakeClo->desc = &desc;
         fakeClo->cu   = &cu;
         fakeClo->capturedWiths = capturedWiths;
@@ -10859,7 +10878,7 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
                                 capturedWiths, /*arg*/nullptr);
     }
 
-    Closure * fakeClo = Alloc::allocClosure(nUpvalues);
+    Closure * fakeClo = Alloc::allocFakeClo(static_cast<uint16_t>(nUpvalues));
     fakeClo->desc = &desc;
     fakeClo->cu   = &cu;
     // #416: also publish the captured chain on the closure so any
@@ -10984,7 +11003,7 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
                                 capturedWiths, /*arg*/&arg);
     }
 
-    Closure * fakeClo = Alloc::allocClosure(nUpvalues);
+    Closure * fakeClo = Alloc::allocFakeClo(static_cast<uint16_t>(nUpvalues));
     fakeClo->desc = &desc;
     fakeClo->cu   = &cu;
     fakeClo->capturedWiths = capturedWiths;
@@ -12212,7 +12231,7 @@ Value forceValue(VMState & vm, Value v)
         hotForceCheck(t);
         // Phase D Step 12 (2026-05-21): retired the closure-pool —
         // see the OP_FORCE Thunk dispatch site above for rationale.
-        Closure * fakeClo = Alloc::allocClosure(t->nUpvalues);
+        Closure * fakeClo = Alloc::allocFakeClo(t->nUpvalues);
         fakeClo->desc = desc;
         fakeClo->nUpvalues = t->nUpvalues;
         fakeClo->capturedWiths = t->suspended.capturedWiths;
