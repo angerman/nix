@@ -444,6 +444,14 @@ private:
         // so the cell payload is walked transitively.
         if (t->cell)      visitSlot(t->cell);
         if (t->shapeCell) visitSlot(t->shapeCell);
+        // Phase 3.5 safety: walk cellContainer precisely.  When cell
+        // is Bindings-resident, cellContainer is the owning Bindings.
+        // visitSlot above already triggers interior-owner walk for
+        // cell, but doing visitBindings here is cheap insurance + the
+        // explicit precise walk catches all Bindings entries (not
+        // just conservatively).
+        if (t->cellContainer)
+            visitBindings(t->cellContainer);
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Blackhole:
