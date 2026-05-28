@@ -1,0 +1,329 @@
+Failed to increase stack size from 8372224 to 62914560 (desired: 62914560, maximum allowed: 67092480): Invalid argument
+warning: v3 limits: setrlimit(RLIMIT_AS, 8858370048) failed (Invalid argument); relying on SIGALRM watchdog
+v3-direct alloc: values=0 closures=1 thunks=0 lists=0 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=2
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=0 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=0 129+=0
+v3-direct memory: peak_rss=30.6MB boehm_heap=402.9MB boehm_free=402.9MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: empty (NIX_V3_LISTS_ATTR=1 set but no Lists allocated yet)
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               10  ~   0.0 MB  (capacity=16)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable              9  ~   0.0 MB  (capacity=16, stringBytes=20)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=2 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=4
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.0MB boehm_heap=402.9MB boehm_free=402.9MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               17  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            137  ~   0.0 MB  (capacity=256, stringBytes=1171)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=3 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=6
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.1MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               19  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            139  ~   0.0 MB  (capacity=256, stringBytes=1183)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=4 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=8
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.1MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               24  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            140  ~   0.0 MB  (capacity=256, stringBytes=1187)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=5 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=10
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.1MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               26  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            141  ~   0.0 MB  (capacity=256, stringBytes=1188)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=6 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=12
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.2MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               27  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            141  ~   0.0 MB  (capacity=256, stringBytes=1188)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=7 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=14
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.2MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               31  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            143  ~   0.0 MB  (capacity=256, stringBytes=1195)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=8 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=16
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.2MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               42  ~   0.0 MB  (capacity=64)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            145  ~   0.0 MB  (capacity=256, stringBytes=1205)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=9 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=18
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.2MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               42  ~   0.0 MB  (capacity=64)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            145  ~   0.0 MB  (capacity=256, stringBytes=1205)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=10 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=20
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.6MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               99  ~   0.0 MB  (capacity=128)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            187  ~   0.0 MB  (capacity=256, stringBytes=1620)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+v3-direct alloc: values=0 closures=11 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=22
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.6MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct pairs-attr: empty (NIX_V3_PAIRS_ATTR=1 set but no Pairs allocated yet)
+v3-direct lists-attr: 1 distinct origins, 1 total allocs, 0.0 MB tracked  (top 1 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/primops.cc:2655                                       1      0.00     2.00        2
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool              121  ~   0.0 MB  (capacity=128)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            198  ~   0.0 MB  (capacity=256, stringBytes=1706)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~0.0 MB -----
+warning: input 'crane' has an override for a non-existent input 'nixpkgs'
+warning: input 'rust-overlay' has an override for a non-existent input 'flake-utils'
+warning: Nix search path entry '/nix/var/nix/profiles/per-user/root/channels' does not exist, ignoring
+v3-direct alloc: values=0 closures=1768463 thunks=3826564 lists=524839 attrsets=1113897 pairs=2597189 thunksForced=1595947 bridge=8 insns=83518146
+v3-direct bytes (in arena/nursery): values=8.2MB closures=271.7MB thunks=319.7MB envs=0.0MB lists=53.5MB bindings=713.2MB pairs=124.7MB chars=37.3MB total_alloc=1528.3MB arena_pinned=1593.8MB
+v3-direct bindings size hist: 0=27999 1=331931 2=335992 3-4=153156 5-8=115322 9-16=58995 17-32=25039 33-64=33160 65-128=4055 129+=1894
+v3-direct mergeBindings by site (total 153579 calls, 556.4 MB):
+  [0] OP_ATTRS_UPDATE             (//)  calls=49058      bytes=   9.7 MB (  1.7 % of total)
+  [1] OP_ATTRS_UPDATE_TAIL        (//)  calls=104521     bytes= 546.7 MB ( 98.3 % of total)
+  (UPDATE_TAIL na histogram, total=104521):
+    na 0        = 4626
+    na 1        = 3566
+    na 2-4      = 31116
+    na 5-8      = 20116
+    na 9-16     = 10462
+    na 17-32    = 8337
+    na 33-64    = 23249
+    na 65-128   = 1785
+    na 129-256  = 225
+    na 257+     = 1039
+  (UPDATE_TAIL nb histogram, total=104521):
+    nb 0        = 12949
+    nb 1        = 36675
+    nb 2-4      = 22691
+    nb 5-8      = 17568
+    nb 9-16     = 6972
+    nb 17-32    = 6158
+    nb 33-64    = 831
+    nb 65-128   = 214
+    nb 129-256  = 130
+    nb 257+     = 333
+v3-direct memory: peak_rss=2782.0MB boehm_heap=402.9MB boehm_free=402.7MB boehm_unmapped=0.0MB v3_arena=1593.8MB elsewhere=785.2MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=8 __v3_force_attr=51 __v3_force_list_elem=0
+v3 primop call counts (top 30 of 83):
+    122334  elem
+     78859  genList
+     57313  __elemAt
+     56045  __derivCoerce
+     52728  length
+     44066  match
+     43533  isAttrs
+     22054  __head
+     21384  __genList
+     20939  __addErrorContext
+     20365  toString
+     19500  removeAttrs
+     19074  __attrNames
+     15271  mapAttrs
+     13239  unsafeGetAttrPos
+     11018  __isString
+      8077  concatStringsSep
+      7961  __length
+      7798  __elem
+      6336  listToAttrs
+      5839  hasAttr
+      5315  __listToAttrs
+      4965  __replaceStrings
+      4726  intersectAttrs
+      4603  import
+      4402  toJSON
+      4050  __isBool
+      3792  __tryEval
+      3599  functionArgs
+      3123  stringLength
+v3-direct disk_cache: lookups=2449 hits=2449 misses=0 inserts=0 insertFailures=0 hit_rate=100.0%
+v3-direct ifd probes: total=4875 import=4603 readFile=20 readDir=67 pathExists=74 findFile=111
+v3-direct ifd probes (with-ctx, potential IFD): total=38 import=17 readFile=12 readDir=5 pathExists=4
+v3-direct v3ToTreeWalker calls (total=74): primReadDir_attrset=3 primImport_string_ctx=10 primReadDir_string_ctx=2 primV3CallBridge1=8 primV3ForceAttr_inner=51
+v3-direct pairs-attr: 6 distinct origins, 2597189 total allocs, 118.9 MB tracked (sizeof(ValuePair)=48)  (top 6):
+  origin (file:line)                                                 allocs         MB
+  ../src/libexpr-v3/primops.cc:1970                                 1094597     50.11
+  ../src/libexpr-v3/primops.cc:1965                                 1094597     50.11
+  ../src/libexpr-v3/primops.cc:1468                                  185814      8.51
+  ../src/libexpr-v3/vm.cc:4140                                       176099      8.06
+  ../src/libexpr-v3/primops.cc:2783                                   23041      1.05
+  ../src/libexpr-v3/primops.cc:2788                                   23041      1.05
+v3-direct lists-attr: 21 distinct origins, 1088705 total allocs, 51.1 MB tracked  (top 20 by bytes):
+  origin (file:line)                                                 allocs         MB avg-size max-size
+  ../src/libexpr-v3/vm.cc:7035                                       172800     24.47     8.78      261
+  ../src/libexpr-v3/vm.cc:3831                                       544299     12.82     1.04        2
+  ../src/libexpr-v3/vm.cc:6991                                       178852      5.13     1.38      339
+  ../src/libexpr-v3/primops.cc:1463                                  100243      3.60     1.85     3633
+  ../src/libexpr-v3/primops.cc:684                                    21450      3.14     9.08     3894
+  ../src/libexpr-v3/primops.cc:2771                                   23041      0.56     1.11        7
+  ../src/libexpr-v3/vm.cc:3422                                        18238      0.47     1.19        2
+  ../src/libexpr-v3/primops.cc:725                                      995      0.25    15.87     3633
+  ../src/libexpr-v3/primops.cc:9603                                    4870      0.24     2.71      699
+  ../src/libexpr-v3/primops.cc:3248                                   16560      0.14     0.05        2
+  ../src/libexpr-v3/primops.cc:1191                                    3115      0.08     1.21      214
+  ../src/libexpr-v3/vm.cc:1925                                         1329      0.04     1.32        2
+  ../src/libexpr-v3/primops.cc:2060                                    1516      0.03     0.94       20
+  ../src/libexpr-v3/vm.cc:10017                                          42      0.03    47.29       67
+  ../src/libexpr-v3/primops.cc:3184                                     103      0.02    13.71       22
+  ../src/libexpr-v3/primops.cc:648                                      697      0.02     1.49        3
+  ../src/libexpr-v3/primops.cc:2386                                     199      0.01     2.97        3
+  ../src/libexpr-v3/primops.cc:3313                                     137      0.01     2.55        5
+  ../src/libexpr-v3/primops.cc:2655                                     112      0.00     2.00        2
+  ../src/libexpr-v3/primops.cc:3296                                     106      0.00     0.00        0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide          19419  ~   3.8 MB  (buckets=25717, strings=27625, body=1573030 B)
+  posSnapshotPool           753468  ~  63.7 MB  (capacity=1048576)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable          70814  ~   7.1 MB  (capacity=131072, stringBytes=809562)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  ----- elsewhere-probe sum: ~74.6 MB -----

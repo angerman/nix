@@ -746,6 +746,38 @@ inline ImmixAllocStats & immixAllocStats()
     return stats;
 }
 
+// ---------------------------------------------------------------------------
+// ImmixRecycleStats — Step 13′ block recycle policy (2026-05-29).
+//
+// Per `GC_DECISION_2026-05-29 §3 New Step 13′`: blocks with
+// dead-line fraction below `NIX_V3_IMMIX_RECYCLE_PCT` are SKIPPED
+// from the freeSpans rebuild → allocator concentrates new
+// allocations into the recyclable subset.
+//
+// Reset to zero at the start of each `rebuildFreeSpansFromLineMarks`
+// call (cycle-fresh stats; latest GC's recycling activity).
+// ---------------------------------------------------------------------------
+
+struct ImmixRecycleStats
+{
+    /// Blocks with dead-line% >= threshold (allocator targets them).
+    uint64_t blocksRecyclable = 0;
+    /// Blocks with dead-line% < threshold (allocator skips them).
+    uint64_t blocksSkipped = 0;
+    /// Sum of dead bytes in recyclable blocks (potential reclaim).
+    uint64_t recyclableDeadBytes = 0;
+    /// Sum of dead bytes in skipped blocks (NOT reclaimable this cycle).
+    uint64_t skippedDeadBytes = 0;
+};
+
+/// Per-cycle stats — written by `rebuildFreeSpansFromLineMarks()`,
+/// read by `mark_sweep.cc` post-rebuild banner.  Reset at the start
+/// of each rebuild (not cumulative across cycles).
+inline ImmixRecycleStats & immixRecycleStats() {
+    static ImmixRecycleStats stats;
+    return stats;
+}
+
 /// Map a byte size to its log2-bin.  bin 0 covers [16, 32); each bin
 /// is one power of two wider.  Saturates at kNumBins-1 for the catchall.
 inline size_t sizeToFreeListBin(size_t bytes) noexcept
@@ -1280,6 +1312,32 @@ public:
         active_.freeSpans.clear();
         active_.freeSpans.resize(nBlocks);
         if (nBlocks > active_.lineMarks.size()) return;
+
+        // Step 13′ (Immix recycle policy, 2026-05-29).
+        // Per `GC_DECISION_2026-05-29 §3 New Step 13′`: blocks with
+        // dead-line fraction below the threshold are SKIPPED — the
+        // allocator treats them as "too live to bother."  This
+        // concentrates new allocations into a subset of recyclable
+        // blocks, increasing the chance that other blocks become
+        // fully dead and Phase 3.8 `freeWholeBlock` reclaims them.
+        //
+        // Gate: NIX_V3_IMMIX_RECYCLE_PCT=N (default 0; range 0-100).
+        //   0  = recycle all (Step 12′ behavior, no skip)
+        //  30  = skip blocks with <30% dead lines
+        //
+        // Retirement (per Rule 0): "delete the env when Step 14′
+        // SHIP gate is met; recycle policy fixed at the empirically-
+        // best X."
+        static const long s_recyclePctThreshold = []() -> long {
+            const char * v = std::getenv("NIX_V3_IMMIX_RECYCLE_PCT");
+            long pct = 0;
+            if (v) {
+                long parsed = std::strtol(v, nullptr, 10);
+                if (parsed >= 0 && parsed <= 100) pct = parsed;
+            }
+            return pct;
+        }();
+        immixRecycleStats() = ImmixRecycleStats{};  // reset per-cycle
         // Step 12′ correctness fix (2026-05-29): the ACTIVE block's
         // reserve tail (`active_.cur` .. `active_.end`) holds no cells
         // — those bytes are reserved for the bump allocator's NEXT
@@ -1325,6 +1383,30 @@ public:
             char * blkBase = active_.blocks[bi];
             const size_t nWords = bits.size();
             if (nWords == 0) continue;
+
+            // Step 13′ recycle policy: compute dead-line fraction
+            // first; skip block if below threshold.  When skipped,
+            // the block's freeSpans stays empty and the allocator
+            // bypasses it.
+            if (s_recyclePctThreshold > 0) {
+                size_t liveBits = 0;
+                for (uint64_t w : bits) liveBits += __builtin_popcountll(w);
+                const size_t totalBits = nWords * 64;
+                const size_t deadBits = totalBits - liveBits;
+                const double deadPct = totalBits > 0
+                    ? 100.0 * double(deadBits) / double(totalBits) : 0.0;
+                if (deadPct < double(s_recyclePctThreshold)) {
+                    ++immixRecycleStats().blocksSkipped;
+                    immixRecycleStats().skippedDeadBytes +=
+                        deadBits * kLineBytes;
+                    continue;
+                }
+                ++immixRecycleStats().blocksRecyclable;
+                immixRecycleStats().recyclableDeadBytes +=
+                    deadBits * kLineBytes;
+            } else {
+                ++immixRecycleStats().blocksRecyclable;
+            }
             // Walk bit-by-bit at outer level for clarity (the inner
             // word-level fast paths can be added later if perf bad).
             size_t lineIdx = 0;

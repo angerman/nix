@@ -1,0 +1,8 @@
+v3-direct immix-alloc: allocs=22 spanHits=0 spanAdvances=0 bumpFresh=22
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3 free-spans: blocks=46 spans=21630 spanBytes=205.4MB
+v3 recycle-policy: recyclable=32 skipped=14 recyclableDeadMB=205.4 skippedDeadMB=62.9
+v3-direct memory: peak_rss=2938.9MB boehm_heap=402.9MB boehm_free=402.7MB boehm_unmapped=0.0MB v3_arena=1476.4MB elsewhere=1059.6MB
+v3-direct immix-alloc: allocs=14687822 spanHits=1230897 spanAdvances=4714 bumpFresh=13452211
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+"/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"

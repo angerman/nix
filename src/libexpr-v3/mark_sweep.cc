@@ -945,6 +945,19 @@ void runMajorMarkSweep(VMState & vm) noexcept
                 arena.freeSpansForBlocks().size(),
                 spanCount, spanBytes / 1e6);
         }
+        // Step 13′ (Immix recycle policy, 2026-05-29): per-cycle
+        // skipped-vs-recyclable block counts.  Reflects whether the
+        // NIX_V3_IMMIX_RECYCLE_PCT threshold filtered any blocks.
+        {
+            const auto & rs = immixRecycleStats();
+            std::fprintf(stderr,
+                "v3 recycle-policy: recyclable=%llu skipped=%llu "
+                "recyclableDeadMB=%.1f skippedDeadMB=%.1f\n",
+                (unsigned long long)rs.blocksRecyclable,
+                (unsigned long long)rs.blocksSkipped,
+                double(rs.recyclableDeadBytes) / 1e6,
+                double(rs.skippedDeadBytes) / 1e6);
+        }
     }
 }
 
