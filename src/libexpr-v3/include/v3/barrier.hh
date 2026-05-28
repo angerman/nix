@@ -146,6 +146,7 @@ extern const bool g_phaseDActive;
     case Tag::Attrs:     return n.contains(v.payload.bindings);
     case Tag::List:      return n.contains(v.payload.list);
     case Tag::App:       return n.contains(v.payload.pair);
+    case Tag::App3:      return n.contains(v.payload.pair);
     case Tag::PrimOpApp: return n.contains(v.payload.pair);
     case Tag::Slot:      return n.contains(v.payload.slot);
     // Non-pointer payloads: scalar / interned-elsewhere / no-payload.

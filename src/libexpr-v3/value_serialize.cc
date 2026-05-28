@@ -167,6 +167,12 @@ const Value & chaseToWHNF(const Value & v, int maxHops = 32)
             cur = &p->evaluated;
             continue;
         }
+        if (t == Tag::App3) {
+            // EXIT_GC_SPIRAL Day 9-11 (2026-05-29): Tag::App3 carries
+            // arg2 in the `evaluated` slot (NOT a memoized result),
+            // so there is no chase target.  Callers must force first.
+            throw SerializeError("App3 not yet evaluated; force before serialise");
+        }
         if (t == Tag::Slot) {
             if (!cur->payload.slot)
                 throw SerializeError("Slot null");

@@ -367,7 +367,7 @@ inline void dbgLogForceInsideX(VMState & vm, const Value * forcing)
     Value chased = *forcing;
     if (chased.tag() == Tag::Slot && chased.payload.slot)
         chased = *chased.payload.slot;
-    if (chased.tag() != Tag::Thunk && chased.tag() != Tag::App)
+    if (chased.tag() != Tag::Thunk && !chased.isAppLike())
         return;
     // Filter: only log Suspended thunks (the FIRST force that flips
     // state to Blackhole).  Already-Evaluated thunks are harmless
@@ -532,12 +532,12 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
         {
             Tag at = a.tag();
             if (__builtin_expect(at == Tag::Thunk
-                                 || at == Tag::App
+                                 || at == Tag::App || at == Tag::App3
                                  || at == Tag::Slot, 0))
                 a = forceValue(vm, a);
             Tag bt = b.tag();
             if (__builtin_expect(bt == Tag::Thunk
-                                 || bt == Tag::App
+                                 || bt == Tag::App || bt == Tag::App3
                                  || bt == Tag::Slot, 0))
                 b = forceValue(vm, b);
         }
@@ -593,11 +593,11 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
                 uint32_t idx = i - 1;
                 Value & ae = la->elems[idx];
                 Value & be = lb->elems[idx];
-                if (ae.tag() == Tag::App
+                if (ae.isAppLike()
                     || ae.tag() == Tag::Thunk
                     || ae.tag() == Tag::Slot)
                     ae = forceValue(vm, ae);
-                if (be.tag() == Tag::App
+                if (be.isAppLike()
                     || be.tag() == Tag::Thunk
                     || be.tag() == Tag::Slot)
                     be = forceValue(vm, be);
@@ -645,11 +645,11 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
                 uint32_t idx = i - 1;
                 Value & av = aa->entries[idx].value;
                 Value & bv = bb->entries[idx].value;
-                if (av.tag() == Tag::App
+                if (av.isAppLike()
                     || av.tag() == Tag::Thunk
                     || av.tag() == Tag::Slot)
                     av = forceValue(vm, av);
-                if (bv.tag() == Tag::App
+                if (bv.isAppLike()
                     || bv.tag() == Tag::Thunk
                     || bv.tag() == Tag::Slot)
                     bv = forceValue(vm, bv);
@@ -669,6 +669,7 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
         case Tag::Uninitialized:
         case Tag::Thunk:
         case Tag::App:
+        case Tag::App3:
         case Tag::Blackhole:
         case Tag::External:
         case Tag::Slot:
@@ -706,10 +707,10 @@ inline bool valueLess(VMState & vm, const Value & a, const Value & b)
         for (uint32_t i = 0; i < n; ++i) {
             Value & ai = a.payload.list->elems[i];
             Value & bi = b.payload.list->elems[i];
-            if (ai.tag() == Tag::Thunk || ai.tag() == Tag::App
+            if (ai.tag() == Tag::Thunk || ai.isAppLike()
                 || ai.tag() == Tag::Slot)
                 ai = forceValue(vm, ai);
-            if (bi.tag() == Tag::Thunk || bi.tag() == Tag::App
+            if (bi.tag() == Tag::Thunk || bi.isAppLike()
                 || bi.tag() == Tag::Slot)
                 bi = forceValue(vm, bi);
             if (valueLess(vm, ai, bi)) return true;
@@ -936,6 +937,7 @@ inline std::string valueRepr(const Value & v, int depth)
     if (t == Tag::PrimOpApp) return "«partially applied primop»";
     if (t == Tag::Thunk)     return "«unforced thunk»";
     if (t == Tag::App)       return "«unforced app»";
+    if (t == Tag::App3)      return "«unforced app3»";
     if (t == Tag::Blackhole) return "«potential infinite recursion»";
     if (t == Tag::Slot)      return "«slot»";
     return "«value»";
@@ -989,7 +991,7 @@ inline std::string coerceToString(const Value & v, bool forceString)
         if (t == Tag::Attrs) return {"a",  "set"};
         if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
             return {"a", "function"};
-        if (t == Tag::Thunk || t == Tag::App)
+        if (t == Tag::Thunk || t == Tag::App || t == Tag::App3)
             return {"a", "thunk"};
         return {"a", "value"};
     };
@@ -1036,6 +1038,7 @@ inline std::string coerceToString(const Value & v, bool forceString)
     case Tag::PrimOpApp:
     case Tag::Thunk:
     case Tag::App:
+    case Tag::App3:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
@@ -1356,7 +1359,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 // Pre-fix behaviour: one deref; if result is also a
                 // Slot or non-attrset, skip this with-entry.
                 Value derefed = *p;
-                if (derefed.isThunk() || derefed.tag() == Tag::App) {
+                if (derefed.isThunk() || derefed.isAppLike()) {
                     try { derefed = forceValue(vm, derefed); }
                     catch (const BlackholeError &) { anyBlackholed = true; continue; }
                 }
@@ -1427,7 +1430,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
             // analog that lets `with self;` find sibling entries
             // during a rec-attrset's mid-construction.  No force, no
             // blackhole error: just a Bindings::lookup on the
-            if (derefed.isThunk() || derefed.tag() == Tag::App) {
+            if (derefed.isThunk() || derefed.isAppLike()) {
                 try {
                     derefed = forceValue(vm, derefed);
                 } catch (const BlackholeError &) {
@@ -1440,7 +1443,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 return autoCallArity0(vm, *v);
             continue;
         }
-        if (w.isThunk() || w.tag() == Tag::App) {
+        if (w.isThunk() || w.isAppLike()) {
             // #458 step A.2 (slot-threading for fix-point args):
             // before forcing the whole TW Bridge thunk, try a per-
             // attribute lookup that observes a partially-constructed
@@ -2126,7 +2129,8 @@ inline bool applyForceWriteback(VMState & vm)
         needTop("CFF_FORCE_WB_PTR_KEEP");
         Value top = vm.valueStack.back();
         Tag t = top.tag();
-        if (t == Tag::Thunk || t == Tag::App || t == Tag::Slot)
+        if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
+            || t == Tag::Slot)
             return false;
         // Phase D coverage: forceWriteTarget can point into a
         // Bindings entry (OP_ATTRS_SELECT_DYN / IC path) or into a
@@ -2203,6 +2207,7 @@ static inline std::string v3ValueTypeName(Value v)
     case Tag::PrimOpApp: return "Lambda";
     case Tag::Thunk:     return "Thunk";
     case Tag::App:       return "App";
+    case Tag::App3:      return "App3";
     case Tag::Blackhole: return "Blackhole";
     case Tag::External:  return "External";
     case Tag::Slot:      return "Slot";
@@ -2987,7 +2992,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // fast-path bails out.
             const Value & v = vm.valueStack[stackBase + operand];
             Tag t = v.tag();
-            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
+            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::App3
+                                 && t != Tag::Slot, 1)) {
                 push(vm, v);
                 break;
             }
@@ -3189,7 +3195,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // they don't pay the load + branch on every iteration.
             const Value & v = closure->upvalues[operand];
             Tag t = v.tag();
-            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::Slot, 1)) {
+            if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::App3
+                                 && t != Tag::Slot, 1)) {
                 push(vm, v);
                 break;
             }
@@ -3394,7 +3401,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
         case OP_NOT: {
             Value & top = vm.valueStack.back();
-            if (top.isThunk() || top.tag() == Tag::App
+            if (top.isThunk() || top.isAppLike()
                 || top.tag() == Tag::Slot)
             {
                 ip = ip - 1;
@@ -3409,7 +3416,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_AND_BRANCH: {
             // peek; if false -> jump (keep false); if true -> pop and fall through
             Value & v = vm.valueStack.back();
-            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot) {
+            if (v.isThunk() || v.isAppLike() || v.tag() == Tag::Slot) {
                 ip = ip - 1;
                 vm.frames.back().flags |= CFF_FORCE_RETRY;
                 goto op_force_slow;
@@ -3420,7 +3427,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_OR_BRANCH: {
             Value & v = vm.valueStack.back();
-            if (v.isThunk() || v.tag() == Tag::App || v.tag() == Tag::Slot) {
+            if (v.isThunk() || v.isAppLike() || v.tag() == Tag::Slot) {
                 ip = ip - 1;
                 vm.frames.back().flags |= CFF_FORCE_RETRY;
                 goto op_force_slow;
@@ -3432,7 +3439,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_IMPL_BRANCH: {
             // If lhs false -> result is true; jump.  If lhs true -> pop, fall through.
             Value & top = vm.valueStack.back();
-            if (top.isThunk() || top.tag() == Tag::App
+            if (top.isThunk() || top.isAppLike()
                 || top.tag() == Tag::Slot)
             {
                 ip = ip - 1;
@@ -3447,7 +3454,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         case OP_JUMP: ip = operand; break;
         case OP_BRANCH_FALSE: {
             Value & top = vm.valueStack.back();
-            if (top.isThunk() || top.tag() == Tag::App
+            if (top.isThunk() || top.isAppLike()
                 || top.tag() == Tag::Slot)
             {
                 ip = ip - 1;
@@ -4222,7 +4229,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // If the evaluated value itself is in WHNF (the
                     // common case for rec-attr-thunk-of-Closure), we're
                     // done.  Else fall through to iterative force.
-                    if (eT != Tag::Thunk && eT != Tag::App && eT != Tag::Slot) {
+                    if (eT != Tag::Thunk && eT != Tag::App && eT != Tag::App3
+                        && eT != Tag::Slot) {
                         fun = e;
                     } else {
                         goto op_call_iter_force;
@@ -4230,7 +4238,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 } else {
                     goto op_call_iter_force;
                 }
-            } else if (fT == Tag::App || fT == Tag::Slot) {
+            } else if (fT == Tag::App || fT == Tag::App3 || fT == Tag::Slot) {
                 goto op_call_iter_force;
             }
             goto op_call_have_fun;
@@ -4306,7 +4314,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (po->lazyArgs & (1u << i)) continue;
                     Tag at = buf[i].tag();
                     if (__builtin_expect(at == Tag::Thunk
-                                         || at == Tag::App
+                                         || at == Tag::App || at == Tag::App3
                                          || at == Tag::Slot, 0))
                         buf[i] = forceValue(vm, buf[i]);
                 }
@@ -4614,8 +4622,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                 }
                             }
                             std::fprintf(stderr, "\n");
-                        } else if (p->tag() == Tag::App) {
-                            std::fprintf(stderr, " app\n");
+                        } else if (p->isAppLike()) {
+                            std::fprintf(stderr,
+                                p->tag() == Tag::App3 ? " app3\n" : " app\n");
                         } else {
                             std::fprintf(stderr, "\n");
                         }
@@ -4832,7 +4841,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (__builtin_expect(desc->selectorSym != 0, 0)) {
                 allocStats().selectorLambdaCalls++;
                 Value sArg = arg;
-                if (sArg.isThunk() || sArg.tag() == Tag::App
+                if (sArg.isThunk() || sArg.isAppLike()
                     || sArg.tag() == Tag::Slot) {
                     vm.frames.back().ip = ip;
                     sArg = forceValue(vm, sArg);
@@ -5458,7 +5467,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // #680 — pre-force type check (mirror of OP_CALL site).
                 if (arg.tag() != Tag::Attrs
                     && arg.tag() != Tag::Thunk
-                    && arg.tag() != Tag::App
+                    && !arg.isAppLike()
                     && arg.tag() != Tag::Slot)
                 {
                     auto typeWord = [](const Value & v) -> std::pair<const char *, const char *> {
@@ -6284,7 +6293,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     && caller.thunk
                     && caller.thunk->state == ThunkState::Blackhole
                     && retVal.tag() != Tag::Thunk
-                    && retVal.tag() != Tag::App
+                    && !retVal.isAppLike()
                     && retVal.tag() != Tag::Blackhole)
                 {
                     caller.thunk->state = ThunkState::Evaluated;
@@ -6293,7 +6302,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
                 bool retry = (caller.flags & CFF_FORCE_RETRY)
                     && (retVal.tag() == Tag::Thunk
-                        || retVal.tag() == Tag::App
+                        || retVal.isAppLike()
                         || retVal.tag() == Tag::Slot);
                 // Clear the retry flag — it's a one-shot per
                 // OP_FORCE.  The next OP_FORCE will re-set it.
@@ -6406,7 +6415,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             {
                 Value & topRef = vm.valueStack.back();
                 Tag t = topRef.tag();
-                if (t != Tag::Thunk && t != Tag::App && t != Tag::Slot) break;
+                if (t != Tag::Thunk && t != Tag::App && t != Tag::App3
+                    && t != Tag::Slot) break;
             }
             // V3_DBG_FORCE_SITE trace; see dbgLogForceSite().
             dbgLogForceSite(cu, ip - 1,
@@ -6456,7 +6466,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         p = v.payload.thunk;
                         if (v.payload.thunk) st = (int)v.payload.thunk->state;
                     } else if (v.tag() == Tag::Slot) p = v.payload.slot;
-                    else if (v.tag() == Tag::App)   p = v.payload.pair;
+                    else if (v.isAppLike())         p = v.payload.pair;
                     opfRingPtr[opfRingIdx % kOpfRingSize] = p;
                     opfRingState[opfRingIdx % kOpfRingSize] = st;
                     opfRingIdx++;
@@ -6508,7 +6518,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     v = *p;
                     continue;
                 }
-                if (v.tag() == Tag::App) {
+                if (v.isAppLike()) {
                     // REVIEW MED-18: walk the App spine iteratively
                     // to find the leaf function + collected args.
                     // Pre-fix recursed through forceValue per App level
@@ -6524,8 +6534,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // matching comment in forceValue's Tag::App handler
                     // (~line 9257).  Memo-hit fast path returns the
                     // cached result; cold path computes + stores back.
-                    ValuePair * outerPair = v.payload.pair;
-                    if (__builtin_expect(outerPair
+                    //
+                    // 2026-05-29 (EXIT_GC_SPIRAL Day 9-11): Tag::App3
+                    // is the 3-arg App variant (single ValuePair carries
+                    // fn + 2 args).  Memoization is gated to Tag::App
+                    // only — App3 uses its `evaluated` field for arg2.
+                    bool outerIsApp = (v.tag() == Tag::App);
+                    ValuePair * outerPair = outerIsApp ? v.payload.pair : nullptr;
+                    if (__builtin_expect(outerIsApp
+                        && outerPair
                         && outerPair->evaluated.tag() != Tag::Uninitialized, 1))
                     {
                         v = outerPair->evaluated;
@@ -6533,14 +6550,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     }
                     std::vector<Value> rights;
                     rights.reserve(8);
-                    while (v.tag() == Tag::App) {
-                        rights.push_back(v.payload.pair->right);
-                        v = v.payload.pair->left;
+                    while (v.isAppLike()) {
+                        ValuePair * p = v.payload.pair;
+                        if (v.tag() == Tag::App3)
+                            rights.push_back(p->evaluated);
+                        rights.push_back(p->right);
+                        v = p->left;
                     }
                     vm.frames.back().ip = ip;
                     if (v.tag() == Tag::Slot
                         || v.tag() == Tag::Thunk
-                        || v.tag() == Tag::App)
+                        || v.isAppLike())
                         v = forceValue(vm, v);
                     // Apply rights in source order (we collected
                     // outermost-first while walking; reverse on apply).
@@ -6568,10 +6588,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     }
                     // 2026-05-18: App-result memoization writeback.
                     // See forceValue's matching code at ~line 9285 for
-                    // rationale.
-                    if (outerPair) {
+                    // rationale.  Only Tag::App outer pairs memoize —
+                    // App3's `evaluated` field carries arg2.
+                    if (outerIsApp && outerPair) {
                         Tag rt = v.tag();
-                        if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::Slot
+                        if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::App3
+                            && rt != Tag::Slot
                             && rt != Tag::Uninitialized && rt != Tag::Blackhole)
                             pairSetEvaluated(outerPair, v);  // Phase D barrier
                     }
@@ -6592,7 +6614,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (opForceCompressCount > 0
                 && v.tag() != Tag::Thunk
                 && v.tag() != Tag::Slot
-                && v.tag() != Tag::App
+                && !v.isAppLike()
                 && v.tag() != Tag::Blackhole)
             {
                 for (int i = 0; i < opForceCompressCount; ++i)
@@ -7156,13 +7178,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 size_t topIdx = vm.valueStack.size() - 1;
                 Value & rhsRef = vm.valueStack[topIdx];
                 Value & lhsRef = vm.valueStack[topIdx - 1];
-                if (rhsRef.tag() == Tag::App || rhsRef.tag() == Tag::Thunk
+                if (rhsRef.isAppLike() || rhsRef.tag() == Tag::Thunk
                     || rhsRef.tag() == Tag::Slot) {
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
                 }
-                if (lhsRef.tag() == Tag::App || lhsRef.tag() == Tag::Thunk
+                if (lhsRef.isAppLike() || lhsRef.tag() == Tag::Thunk
                     || lhsRef.tag() == Tag::Slot) {
                     uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
                     if (__builtin_expect(off > 0xFFFFu, 0))
@@ -7635,7 +7657,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // C-recursive `attrs = forceValue(vm, attrs)` below.
             {
                 Value & topRef = vm.valueStack.back();
-                if (topRef.tag() == Tag::App
+                if (topRef.isAppLike()
                     || topRef.tag() == Tag::Thunk
                     || topRef.tag() == Tag::Slot)
                 {
@@ -8042,7 +8064,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // (no extra C-recursion); on WHNF, applyForceWriteback
                 // memoizes slot=forced and leaves the value on the stack
                 // for the IC handler's natural continuation.
-                if (__builtin_expect(slot.tag() == Tag::App, 0)) {
+                if (__builtin_expect(slot.isAppLike(), 0)) {
                     push(vm, slot);
                     CallFrame & f = vm.frames.back();
                     f.forceWriteTarget = &slot;
@@ -8219,7 +8241,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // 2026-05-17: iterative force + memoizing writeback
                 // (IC install path).  Mirror of the IC HIT path above —
                 // see comment there for rationale.
-                if (__builtin_expect(slot.tag() == Tag::App, 0)) {
+                if (__builtin_expect(slot.isAppLike(), 0)) {
                     push(vm, slot);
                     CallFrame & f = vm.frames.back();
                     f.forceWriteTarget = &slot;
@@ -8461,11 +8483,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // `formal.cpu` (now lazy via mapAttrs Tag::App entries) was
             // landing in OP_ATTRS_SELECT_DYN with name still in App form
             // and tripping `not a string`.
-            if (name.tag() == Tag::App || name.tag() == Tag::Thunk || name.tag() == Tag::Slot) {
+            if (name.isAppLike() || name.tag() == Tag::Thunk || name.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 name = forceValue(vm, name);
             }
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
+            if (attrs.isAppLike() || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
@@ -8491,7 +8513,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // OP_ATTRS_SELECT_IC's site (vm.cc:6075-ish) for protocol
             // details.  Was C-recursive forceValue here; now iterative
             // via op_force_slow + slot writeback.
-            if (__builtin_expect(found->tag() == Tag::App, 0)) {
+            if (__builtin_expect(found->isAppLike(), 0)) {
                 push(vm, *found);
                 CallFrame & f = vm.frames.back();
                 f.forceWriteTarget = found;
@@ -8521,7 +8543,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 }
                 // Indeterminate: src still thunk-shaped, fall through.
             }
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
+            if (attrs.isAppLike() || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
@@ -8572,7 +8594,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_HAS_DYN: {
             Value name = pop(vm), attrs = pop(vm);
-            if (name.tag() == Tag::App || name.tag() == Tag::Thunk || name.tag() == Tag::Slot) {
+            if (name.isAppLike() || name.tag() == Tag::Thunk || name.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 name = forceValue(vm, name);
             }
@@ -8593,7 +8615,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     break;
                 }
             }
-            if (attrs.tag() == Tag::App || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
+            if (attrs.isAppLike() || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
@@ -8616,13 +8638,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 size_t topIdx = vm.valueStack.size() - 1;
                 Value & rhsRef = vm.valueStack[topIdx];
                 Value & lhsRef = vm.valueStack[topIdx - 1];
-                if (rhsRef.tag() == Tag::App || rhsRef.tag() == Tag::Thunk
+                if (rhsRef.isAppLike() || rhsRef.tag() == Tag::Thunk
                     || rhsRef.tag() == Tag::Slot) {
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
                 }
-                if (lhsRef.tag() == Tag::App || lhsRef.tag() == Tag::Thunk
+                if (lhsRef.isAppLike() || lhsRef.tag() == Tag::Thunk
                     || lhsRef.tag() == Tag::Slot) {
                     uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
                     if (__builtin_expect(off > 0xFFFFu, 0))
@@ -8667,13 +8689,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 size_t topIdx = vm.valueStack.size() - 1;
                 Value & rhsRef = vm.valueStack[topIdx];
                 Value & lhsRef = vm.valueStack[topIdx - 1];
-                if (rhsRef.tag() == Tag::App || rhsRef.tag() == Tag::Thunk
+                if (rhsRef.isAppLike() || rhsRef.tag() == Tag::Thunk
                     || rhsRef.tag() == Tag::Slot) {
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
                 }
-                if (lhsRef.tag() == Tag::App || lhsRef.tag() == Tag::Thunk
+                if (lhsRef.isAppLike() || lhsRef.tag() == Tag::Thunk
                     || lhsRef.tag() == Tag::Slot) {
                     uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
                     if (__builtin_expect(off > 0xFFFFu, 0))
@@ -8936,7 +8958,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // A8: iterative force at case entry.
             {
                 Value & topRef = vm.valueStack.back();
-                if (topRef.tag() == Tag::App
+                if (topRef.isAppLike()
                     || topRef.tag() == Tag::Thunk
                     || topRef.tag() == Tag::Slot)
                 {
@@ -9276,7 +9298,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 for (uint32_t k = 0; k < n; ++k) {
                     Value & p = vm.valueStack[argBase + k];
                     Tag t = p.tag();
-                    if (t == Tag::App || t == Tag::Thunk) {
+                    if (t == Tag::App || t == Tag::App3 || t == Tag::Thunk) {
                         uint32_t off = static_cast<uint32_t>((argBase + k) - stackBase);
                         if (__builtin_expect(off > 0xFFFFu, 0))
                             throw std::runtime_error(
@@ -9820,7 +9842,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // CFF_FORCE_RETRY iterative-force protocol; OP_ASSERT was
             // simply missed.
             Value & top = vm.valueStack.back();
-            if (top.isThunk() || top.tag() == Tag::App
+            if (top.isThunk() || top.isAppLike()
                 || top.tag() == Tag::Slot)
             {
                 ip = ip - 1;
@@ -9911,7 +9933,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (po->lazyArgs & (1u << k)) continue;
                     Value & a = vm.valueStack[argBase + k];
                     Tag t = a.tag();
-                    if (t == Tag::Thunk || t == Tag::App || t == Tag::Slot) {
+                    if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
+                        || t == Tag::Slot) {
                         // Set up writeback: duplicate the unforced
                         // value to top-of-stack, encode the original
                         // slot's offset (relative to stackBase) in the
@@ -9988,7 +10011,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         for (uint32_t i = 0; i < list->size; ++i) {
                             Value & e = list->elems[i];
                             Tag t = e.tag();
-                            if (t == Tag::Thunk || t == Tag::App
+                            if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
                                 || t == Tag::Slot) {
                                 push(vm, e);
                                 CallFrame & frame = vm.frames.back();
@@ -10086,7 +10109,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         #define V3_IS_OP(op_name, predExpr) \
             case op_name: { \
                 Value & topRef = vm.valueStack.back(); \
-                if (topRef.isThunk() || topRef.tag() == Tag::App \
+                if (topRef.isThunk() || topRef.isAppLike() \
                     || topRef.tag() == Tag::Slot) { \
                     ip = ip - 1; \
                     vm.frames.back().flags |= CFF_FORCE_RETRY; \
@@ -10123,7 +10146,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // A8: iterative force.
             {
                 Value & topRef = vm.valueStack.back();
-                if (topRef.isThunk() || topRef.tag() == Tag::App
+                if (topRef.isThunk() || topRef.isAppLike()
                     || topRef.tag() == Tag::Slot) {
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
@@ -10149,7 +10172,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // A8: iterative force.
             {
                 Value & topRef = vm.valueStack.back();
-                if (topRef.isThunk() || topRef.tag() == Tag::App
+                if (topRef.isThunk() || topRef.isAppLike()
                     || topRef.tag() == Tag::Slot) {
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
@@ -10180,7 +10203,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // A8: iterative force.
             {
                 Value & topRef = vm.valueStack.back();
-                if (topRef.isThunk() || topRef.tag() == Tag::App
+                if (topRef.isThunk() || topRef.isAppLike()
                     || topRef.tag() == Tag::Slot) {
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
@@ -10226,13 +10249,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 size_t topIdx = vm.valueStack.size() - 1;
                 Value & idxRef = vm.valueStack[topIdx];
                 Value & lstRef = vm.valueStack[topIdx - 1];
-                if (idxRef.isThunk() || idxRef.tag() == Tag::App
+                if (idxRef.isThunk() || idxRef.isAppLike()
                     || idxRef.tag() == Tag::Slot) {
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
                 }
-                if (lstRef.isThunk() || lstRef.tag() == Tag::App
+                if (lstRef.isThunk() || lstRef.isAppLike()
                     || lstRef.tag() == Tag::Slot) {
                     // Writeback for the deeper slot.  Slot offset =
                     // (topIdx - 1) - stackBase.
@@ -10440,7 +10463,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // safety net rather than a hot path.  REVIEW MED-3.
             finalResult = pop(vm);
             if (finalResult.tag() == Tag::Thunk
-                || finalResult.tag() == Tag::App
+                || finalResult.isAppLike()
                 || finalResult.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 finalResult = forceValue(vm, finalResult);
@@ -10959,7 +10982,7 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
         // (potentially throwaway) VMState's frames.  Mirror what the
         // main dispatchLoop does below.
         Value sArg = arg;
-        if (sArg.isThunk() || sArg.tag() == Tag::App
+        if (sArg.isThunk() || sArg.isAppLike()
             || sArg.tag() == Tag::Slot) {
             if (VMState * activeVm = activeV3VM()) {
                 size_t exitDepth = activeVm->frames.size();
@@ -11382,7 +11405,7 @@ Value forceValue(VMState & vm, Value v)
             void * p = nullptr;
             if (v.tag() == Tag::Thunk) p = v.payload.thunk;
             else if (v.tag() == Tag::Slot) p = v.payload.slot;
-            else if (v.tag() == Tag::App) p = v.payload.pair;
+            else if (v.isAppLike()) p = v.payload.pair;
             ringPtr[ringIdx % kRingSize] = p;
             ringIdx++;
         }
@@ -11463,18 +11486,31 @@ Value forceValue(VMState & vm, Value v)
         // the cached result directly without re-running the lambda.
         // Closes the H3 memoization gap (extendDerivation outputsList
         // at customisation.nix:409 forced 64K times pre-fix).
-        if (v.tag() == Tag::App) {
+        if (v.isAppLike()) {
+            // EXIT_GC_SPIRAL Week 1 Day 9-11 (2026-05-29):
+            // Tag::App3 = 3-arg App stored as ONE ValuePair (saves
+            // one 32 B Pair vs the legacy 2-pair encoding for
+            // mapAttrs / zipAttrsWith).  In the spine walk the App3
+            // pair contributes TWO rights: arg2 (`evaluated`) and
+            // arg1 (`right`).  Memoization is disabled for App3
+            // (single-shot pattern by construction in mapAttrs /
+            // zipAttrsWith — no re-entry); only Tag::App memoizes.
+            //
             // gate: NIX_V3_NO_APP_MEMO — disables the App-result memo
             // for A/B measurement.  Retire when the memo is stable
             // (parity + non-regression demonstrated across the bench
             // corpus + cardano-node nixpkgs eval).
             static const bool s_noAppMemo =
                 std::getenv("NIX_V3_NO_APP_MEMO") != nullptr;
-            ValuePair * outerPair = v.payload.pair;
+            bool outerIsApp = (v.tag() == Tag::App);
+            ValuePair * outerPair = outerIsApp ? v.payload.pair : nullptr;
             // Memo-hit fast path: outerPair->evaluated holds the
             // previously-resolved result.  Tag::Uninitialized (== 0)
-            // is the sentinel meaning "not yet resolved".
+            // is the sentinel meaning "not yet resolved".  Only Tag::App
+            // memoizes — Tag::App3's `evaluated` field holds arg2, not
+            // a memo result.
             if (__builtin_expect(!s_noAppMemo
+                && outerIsApp
                 && outerPair
                 && outerPair->evaluated.tag() != Tag::Uninitialized, 1))
             {
@@ -11483,13 +11519,21 @@ Value forceValue(VMState & vm, Value v)
             }
             std::vector<Value> rights;
             rights.reserve(8);
-            while (v.tag() == Tag::App) {
-                rights.push_back(v.payload.pair->right);
-                v = v.payload.pair->left;
+            // Spine-walk: descend the left chain, pushing rights so
+            // that the apply-loop below (rights.size()-1 down to 0)
+            // applies them in source order.  App3 pushes arg2 first,
+            // then arg1, so arg1 is applied before arg2 (the curried
+            // semantics).
+            while (v.isAppLike()) {
+                ValuePair * p = v.payload.pair;
+                if (v.tag() == Tag::App3)
+                    rights.push_back(p->evaluated);
+                rights.push_back(p->right);
+                v = p->left;
             }
             if (v.tag() == Tag::Slot
                 || v.tag() == Tag::Thunk
-                || v.tag() == Tag::App)
+                || v.isAppLike())
                 v = forceValue(vm, v);
             for (size_t i = rights.size(); i > 0; --i)
                 v = callClosure(vm, v, rights[i - 1]);
@@ -11498,10 +11542,13 @@ Value forceValue(VMState & vm, Value v)
             // pointer short-circuits.  Defensive: avoid writing
             // back a non-WHNF result (which can happen if the
             // callClosure chain leaves a Thunk/App/Slot on the
-            // stack).  The next force will re-attempt.
-            if (!s_noAppMemo && outerPair) {
+            // stack).  The next force will re-attempt.  App3 does
+            // not memoize (its `evaluated` field is occupied by
+            // arg2; the pattern is single-shot anyway).
+            if (!s_noAppMemo && outerIsApp && outerPair) {
                 Tag rt = v.tag();
-                if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::Slot
+                if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::App3
+                    && rt != Tag::Slot
                     && rt != Tag::Uninitialized && rt != Tag::Blackhole)
                     pairSetEvaluated(outerPair, v);  // Phase D barrier
             }
@@ -12190,7 +12237,7 @@ Value forceValue(VMState & vm, Value v)
                     : sv.tag() == Tag::Closure ? (const void*)sv.payload.closure
                     : sv.tag() == Tag::Attrs   ? (const void*)sv.payload.bindings
                     : sv.tag() == Tag::List    ? (const void*)sv.payload.list
-                    : sv.tag() == Tag::App || sv.tag() == Tag::PrimOpApp
+                    : sv.isAppLike() || sv.tag() == Tag::PrimOpApp
                                               ? (const void*)sv.payload.pair
                     : sv.tag() == Tag::Slot   ? (const void*)sv.payload.slot
                     : nullptr;
@@ -12351,7 +12398,7 @@ Value forceValue(VMState & vm, Value v)
     if (compressCount > 0
         && v.tag() != Tag::Thunk
         && v.tag() != Tag::Slot
-        && v.tag() != Tag::App
+        && !v.isAppLike()
         && v.tag() != Tag::Blackhole)
     {
         for (int i = 0; i < compressCount; ++i)
@@ -12375,7 +12422,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     {
         Tag ft = fun.tag();
         if (__builtin_expect(ft == Tag::Thunk
-                             || ft == Tag::App
+                             || ft == Tag::App || ft == Tag::App3
                              || ft == Tag::Slot, 0))
             fun = forceValue(vm, fun);
     }
@@ -12442,7 +12489,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             if (po->lazyArgs & (1u << i)) continue;
             Tag at = buf[i].tag();
             if (__builtin_expect(at == Tag::Thunk
-                                 || at == Tag::App
+                                 || at == Tag::App || at == Tag::App3
                                  || at == Tag::Slot, 0))
                 buf[i] = forceValue(vm, buf[i]);
         }
@@ -12658,7 +12705,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     if (__builtin_expect(desc->selectorSym != 0, 0)) {
         allocStats().selectorLambdaCalls++;
         Value sArg = arg;
-        if (sArg.isThunk() || sArg.tag() == Tag::App
+        if (sArg.isThunk() || sArg.isAppLike()
             || sArg.tag() == Tag::Slot) {
             sArg = forceValue(vm, sArg);
         }

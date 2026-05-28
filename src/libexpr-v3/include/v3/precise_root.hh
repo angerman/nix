@@ -109,6 +109,7 @@ struct RootVisitor
             visitList(v.payload.list);
             break;
         case Tag::App:
+        case Tag::App3:
         case Tag::PrimOpApp:
             visitPair(v.payload.pair);
             break;

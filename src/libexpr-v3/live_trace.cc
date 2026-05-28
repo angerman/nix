@@ -148,6 +148,7 @@ public:
         case Tag::PrimOp:
         case Tag::PrimOpApp:
         case Tag::App:
+        case Tag::App3:
         case Tag::Blackhole:
         case Tag::Slot:
             break;

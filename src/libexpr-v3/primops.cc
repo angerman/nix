@@ -477,12 +477,12 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
         {
             Tag at = a.tag();
             if (__builtin_expect(at == Tag::Thunk
-                                 || at == Tag::App
+                                 || at == Tag::App || at == Tag::App3
                                  || at == Tag::Slot, 0))
                 a = forceValue(vm, a);
             Tag bt = b.tag();
             if (__builtin_expect(bt == Tag::Thunk
-                                 || bt == Tag::App
+                                 || bt == Tag::App || bt == Tag::App3
                                  || bt == Tag::Slot, 0))
                 b = forceValue(vm, b);
         }
@@ -586,6 +586,7 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
         case Tag::Uninitialized:
         case Tag::Thunk:
         case Tag::App:
+        case Tag::App3:
         case Tag::Blackhole:
         case Tag::External:
         case Tag::Slot:
@@ -958,6 +959,7 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
     case Tag::PrimOp:
     case Tag::PrimOpApp:
     case Tag::App:
+    case Tag::App3:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
@@ -1057,6 +1059,7 @@ void primTypeOf(EvalState &, Value * args, Value & out)
     case Tag::Thunk:  t = "thunk"; break;
     case Tag::Uninitialized:
     case Tag::App:
+    case Tag::App3:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
@@ -1182,7 +1185,7 @@ void primConcatLists(EvalState & state, Value * args, Value & out)
         Value & e = outer.payload.list->elems[i];
         Tag et = e.tag();
         if (__builtin_expect(et == Tag::Thunk
-                             || et == Tag::App
+                             || et == Tag::App || et == Tag::App3
                              || et == Tag::Slot, 0))
             e = forceValue(*state.vm, e);
         if (!e.isList()) typeError("concatLists", "list of lists");
@@ -1234,7 +1237,7 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
         Value el = list->elems[i];
         Tag et = el.tag();
         if (__builtin_expect(et == Tag::Thunk
-                             || et == Tag::App
+                             || et == Tag::App || et == Tag::App3
                              || et == Tag::Slot, 0))
             el = forceValue(*state.vm, el);
         // 2026-05-19 #666: TW's prim_concatStringsSep
@@ -1312,7 +1315,7 @@ void primMap(EvalState & state, Value * args, Value & out)
     // Force the second arg to list shape (so we can read its size /
     // elems), then emit App entries.
     Value lst = args[1];
-    if (lst.tag() == Tag::App || lst.tag() == Tag::Thunk || lst.tag() == Tag::Slot)
+    if (lst.isAppLike() || lst.tag() == Tag::Thunk || lst.tag() == Tag::Slot)
         lst = forceValue(*state.vm, lst);
     if (!lst.isList()) typeError("map", "list");
     auto * src = lst.payload.list;
@@ -1360,7 +1363,7 @@ void primFilter(EvalState & state, Value * args, Value & out)
         {
             Tag rt = r.tag();
             if (__builtin_expect(rt == Tag::Thunk
-                                 || rt == Tag::App
+                                 || rt == Tag::App || rt == Tag::App3
                                  || rt == Tag::Slot, 0))
                 r = forceValue(*state.vm, r);
         }
@@ -1394,7 +1397,7 @@ void primFoldl(EvalState & state, Value * args, Value & out)
             Value step1 = callClosure(*state.vm, op, acc);
             acc = callClosure(*state.vm, step1, src->elems[i]);
             if (__builtin_expect(acc.tag() == Tag::Thunk
-                                 || acc.tag() == Tag::App
+                                 || acc.isAppLike()
                                  || acc.tag() == Tag::Slot, 0))
                 acc = forceValue(*state.vm, acc);
         }
@@ -1432,14 +1435,14 @@ void primFoldlMap(EvalState & state, Value * args, Value & out)
             // Compute f(elem); force the result before passing to op.
             Value fx = callClosure(*state.vm, f, src->elems[i]);
             if (__builtin_expect(fx.tag() == Tag::Thunk
-                                 || fx.tag() == Tag::App
+                                 || fx.isAppLike()
                                  || fx.tag() == Tag::Slot, 0))
                 fx = forceValue(*state.vm, fx);
             // Apply op acc fx — same curried sequence as primFoldl'.
             Value step1 = callClosure(*state.vm, op, acc);
             acc = callClosure(*state.vm, step1, fx);
             if (__builtin_expect(acc.tag() == Tag::Thunk
-                                 || acc.tag() == Tag::App
+                                 || acc.isAppLike()
                                  || acc.tag() == Tag::Slot, 0))
                 acc = forceValue(*state.vm, acc);
         }
@@ -1453,7 +1456,7 @@ void primGenList(EvalState & state, Value * args, Value & out)
     // `App(gen, idx_value)`, lazy.  v3 was eager (callClosure per i).
     // Same root pattern as zipAttrsWith / map.
     Value len = args[1];
-    if (len.tag() == Tag::App || len.tag() == Tag::Thunk || len.tag() == Tag::Slot)
+    if (len.isAppLike() || len.tag() == Tag::Thunk || len.tag() == Tag::Slot)
         len = forceValue(*state.vm, len);
     if (!len.isInt()) typeError("genList", "int length");
     int64_t n = len.payload.i;
@@ -1490,7 +1493,7 @@ void primAll(EvalState & state, Value * args, Value & out)
             {
                 Tag rt = r.tag();
                 if (__builtin_expect(rt == Tag::Thunk
-                                     || rt == Tag::App
+                                     || rt == Tag::App || rt == Tag::App3
                                      || rt == Tag::Slot, 0))
                     r = forceValue(*state.vm, r);
             }
@@ -1513,7 +1516,7 @@ void primAny(EvalState & state, Value * args, Value & out)
             {
                 Tag rt = r.tag();
                 if (__builtin_expect(rt == Tag::Thunk
-                                     || rt == Tag::App
+                                     || rt == Tag::App || rt == Tag::App3
                                      || rt == Tag::Slot, 0))
                     r = forceValue(*state.vm, r);
             }
@@ -1606,7 +1609,7 @@ void primCompareVersions(EvalState & state, Value * args, Value & out)
 void primConcatMap(EvalState & state, Value * args, Value & out)
 {
     Value lst = args[1];
-    if (lst.tag() == Tag::App || lst.tag() == Tag::Thunk || lst.tag() == Tag::Slot)
+    if (lst.isAppLike() || lst.tag() == Tag::Thunk || lst.tag() == Tag::Slot)
         lst = forceValue(*state.vm, lst);
     if (!lst.isList()) typeError("concatMap", "list");
     auto * src = lst.payload.list;
@@ -1625,7 +1628,7 @@ void primConcatMap(EvalState & state, Value * args, Value & out)
             {
                 Tag rt = r.tag();
                 if (__builtin_expect(rt == Tag::Thunk
-                                     || rt == Tag::App
+                                     || rt == Tag::App || rt == Tag::App3
                                      || rt == Tag::Slot, 0))
                     r = forceValue(*state.vm, r);
             }
@@ -1656,7 +1659,7 @@ void primPartition(EvalState & state, Value * args, Value & out)
             {
                 Tag rt = r.tag();
                 if (__builtin_expect(rt == Tag::Thunk
-                                     || rt == Tag::App
+                                     || rt == Tag::App || rt == Tag::App3
                                      || rt == Tag::Slot, 0))
                     r = forceValue(*state.vm, r);
             }
@@ -1857,7 +1860,7 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
         // expects Tag::String.  Mirror primAttrNames' force pattern.
         Value el = names->elems[i];
         if (__builtin_expect(el.tag() == Tag::Thunk
-                             || el.tag() == Tag::App
+                             || el.isAppLike()
                              || el.tag() == Tag::Slot, 0))
             el = forceValue(*state.vm, el);
         if (!el.isString()) typeError("removeAttrs", "list of strings");
@@ -1958,22 +1961,25 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     for (uint32_t i = 0; i < src->size; ++i) {
         SymbolId sym = src->entries[i].name;
         Value nameStr = mkStringValueOwned(std::string(vmSymName(state, sym)));
-        // Build a Tag::App chain that, when forced, applies
-        // `fn name value`.  This keeps mapAttrs lazy: `mapAttrs throw
-        // attrs` only fires the throw on the entries actually demanded
-        // by callers, matching tree-walker.
-        ValuePair * pp1 = Alloc::allocPair();
-        pp1->left  = fn;
-        pp1->right = nameStr;
-        pairPostConstructBarrier(pp1);  // Phase D
-        Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
-        ValuePair * pp2 = Alloc::allocPair();
-        pp2->left  = step1;
-        pp2->right = src->entries[i].value;
-        pairPostConstructBarrier(pp2);  // Phase D
-        Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
+        // EXIT_GC_SPIRAL Week 1 Day 9-11 (2026-05-29): pack the
+        // 3-argument apply `fn name value` into a single ValuePair
+        // tagged Tag::App3 (saves one 32 B ValuePair per entry vs
+        // the legacy 2-pair encoding).  Layout:
+        //   left      = fn
+        //   right     = nameStr   (arg1 — applied first by forceValue)
+        //   evaluated = entryVal  (arg2 — applied second)
+        // forceValue + OP_FORCE's spine walk recognise Tag::App3 and
+        // push BOTH right + evaluated into the rights buffer so the
+        // semantics are identical to the old 2-pair chain.  Laziness
+        // preserved: only forced if a consumer demands the entry.
+        ValuePair * pp = Alloc::allocPair();
+        pp->left      = fn;
+        pp->right     = nameStr;
+        pp->evaluated = src->entries[i].value;
+        pairPostConstructBarrier(pp);  // Phase D
+        Value step; step.tag_payload = static_cast<uint64_t>(Tag::App3); step.payload.pair = pp;
         result->entries[i].name  = sym;
-        bindingsSetValue(result, i, step2);  // Phase D
+        bindingsSetValue(result, i, step);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = result;
@@ -2002,7 +2008,7 @@ void primElem(EvalState & state, Value * args, Value & out)
             // generic but the probe used trivial lambda bodies that
             // hid the cost.  See PATH_B_INVESTIGATION_2026-05-16.md.
             Value & el = src->elems[i];
-            if (el.tag() == Tag::App
+            if (el.isAppLike()
                 || el.tag() == Tag::Thunk
                 || el.tag() == Tag::Slot)
                 el = forceValue(*state.vm, el);
@@ -2777,20 +2783,18 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         // Build name string.
         std::string nm = sid < symTab.size() ? symTab[sid] : std::to_string(sid);
         Value nameV = mkStringValueOwned(nm);
-        // Build App(App(fn, nameV), lv) — a deferred call that resolves
-        // when something forces the entry.  Mirrors mapAttrs' lazy
-        // entry construction.
-        ValuePair * pp1 = Alloc::allocPair();
-        pp1->left  = fn;
-        pp1->right = nameV;
-        pairPostConstructBarrier(pp1);  // Phase D
-        Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
-        ValuePair * pp2 = Alloc::allocPair();
-        pp2->left  = step1;
-        pp2->right = lv;
-        pairPostConstructBarrier(pp2);  // Phase D
-        Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
-        entries.emplace_back(sid, step2);
+        // EXIT_GC_SPIRAL Week 1 Day 9-11 (2026-05-29): single
+        // Tag::App3 ValuePair instead of the legacy 2-pair chain.
+        // Layout {fn, nameV (arg1), lv (arg2)} matches the forceValue
+        // spine walk's expectation.  Saves one 32 B ValuePair per
+        // zipped attribute name — mirror of the mapAttrs change above.
+        ValuePair * pp = Alloc::allocPair();
+        pp->left      = fn;
+        pp->right     = nameV;
+        pp->evaluated = lv;
+        pairPostConstructBarrier(pp);  // Phase D
+        Value step; step.tag_payload = static_cast<uint64_t>(Tag::App3); step.payload.pair = pp;
+        entries.emplace_back(sid, step);
     }
     std::sort(entries.begin(), entries.end(),
         [](const auto & a, const auto & b) { return a.first < b.first; });
@@ -3169,7 +3173,7 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
         // unforced too — TW callers force at the consumer side.  Match
         // that: force here before the shape check.
         if (__builtin_expect(next.tag() == Tag::Thunk
-                             || next.tag() == Tag::App
+                             || next.isAppLike()
                              || next.tag() == Tag::Slot, 0))
             next = forceValue(*state.vm, next);
         if (!next.isList())
@@ -3771,7 +3775,7 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
             // string (see genericClosure rationale at #624) — force to
             // WHNF before the shape check.
             if (__builtin_expect(k.tag() == Tag::Thunk
-                                 || k.tag() == Tag::App
+                                 || k.isAppLike()
                                  || k.tag() == Tag::Slot, 0))
                 k = forceValue(*state.vm, k);
             if (!k.isString()) typeError("groupBy", "key fn returning string");
@@ -4408,6 +4412,7 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         case Tag::PrimOp:
         case Tag::PrimOpApp:
         case Tag::App:
+        case Tag::App3:
         case Tag::Blackhole:
         case Tag::External:
         case Tag::Slot: {
@@ -5209,6 +5214,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
     case Tag::Uninitialized:
     case Tag::Thunk:
     case Tag::App:
+    case Tag::App3:
     case Tag::External:
     case Tag::Slot:
     default: {
@@ -8868,6 +8874,7 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
     case Tag::Uninitialized:
     case Tag::Thunk:
     case Tag::App:
+    case Tag::App3:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
@@ -9698,6 +9705,7 @@ nlohmann::json valueToJson(EvalState & state, const Value & vRaw)
     case Tag::PrimOpApp:
     case Tag::Thunk:
     case Tag::App:
+    case Tag::App3:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
@@ -9824,6 +9832,7 @@ nlohmann::json valueToJsonWithContext(
     case Tag::Uninitialized:
     case Tag::Thunk:
     case Tag::App:
+    case Tag::App3:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
@@ -9853,7 +9862,7 @@ void primSort(EvalState & state, Value * args, Value & out)
             // Bytecode-closure comparator can return Tag::Thunk wrapping
             // a bool — force to WHNF before the shape check.
             if (__builtin_expect(r.tag() == Tag::Thunk
-                                 || r.tag() == Tag::App
+                                 || r.isAppLike()
                                  || r.tag() == Tag::Slot, 0))
                 r = forceValue(*state.vm, r);
             if (!r.isBool()) typeError("sort", "comparator returning bool");

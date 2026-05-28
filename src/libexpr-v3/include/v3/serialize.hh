@@ -155,7 +155,14 @@ namespace nix::v3::serialize {
 /// `remapPositionsInBytecode` + formals walk, mirroring the
 /// existing SymbolId remap.  Existing schema-13 entries lack the
 /// posTable section; schema bump invalidates them.
-constexpr uint32_t kSchemaVersion = 14;
+///
+/// Schema 15 (2026-05-29, EXIT_GC_SPIRAL Day 9-11): introduces
+/// Tag::App3 (= 17) as a 3-arg App variant for mapAttrs /
+/// zipAttrsWith.  Old caches that serialized values with the legacy
+/// 2-pair App-chain encoding remain decodable, but cache entries
+/// produced by the new mapAttrs/zipAttrsWith use the App3 layout —
+/// invalidate the disk cache to force re-emit.
+constexpr uint32_t kSchemaVersion = 15;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

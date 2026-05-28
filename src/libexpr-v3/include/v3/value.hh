@@ -57,6 +57,21 @@ enum class Tag : uint8_t {
     /// observing the slot at use time see the up-to-date value
     /// rather than a stale snapshot.
     Slot          = 16,
+    /// 3-arg deferred application.  Reuses ValuePair: left = fn,
+    /// right = arg1, evaluated = arg2 (NOT a memo cache — App3 is
+    /// not memoized).  Created by mapAttrs / zipAttrsWith / similar
+    /// "build a curried lazy entry per attribute" patterns to save
+    /// one ValuePair allocation per entry (1 pair vs current 2).
+    ///
+    /// Forcing a Tag::App3: applies fn to arg1, then applies the
+    /// result to arg2.  No memoization — single-reference use cases
+    /// only.  Sharing an App3 pair across multiple Value slots is
+    /// safe but each Force recomputes; for shared apps prefer the
+    /// 2-pair Tag::App pattern with its `evaluated` memo.
+    ///
+    /// EXIT_GC_SPIRAL Week 1 Day 9-11 (2026-05-29) — per
+    /// `EXIT_DAY3-5_DECISION §3.2`, ~50 MB savings on HNE.
+    App3          = 17,
 };
 
 /// Two-word Value (16 bytes on 64-bit).
@@ -106,12 +121,26 @@ struct Value
     // isApp / isSlot helpers removed -- 0 callers, dispatch sites all
     // use `tag() == Tag::App` / `Tag::Slot` directly so the explicit
     // tag check is closer to the dispatch in vm.cc and forceValue.
+    //
+    // EXIT_GC_SPIRAL Week 1 Day 9-11 (2026-05-29): re-introducing
+    // `isAppLike()` because Tag::App3 (the new 3-arg variant)
+    // behaves identically to Tag::App in almost every dispatch
+    // outside `forceValue`'s force handler.  Touch sites change
+    // from `tag() == Tag::App` to `isAppLike()` when they want to
+    // treat 2-arg and 3-arg apps the same.
+    [[gnu::always_inline]] inline bool isAppLike() const noexcept
+    {
+        Tag t = tag();
+        return t == Tag::App || t == Tag::App3;
+    }
 
     /// Forced = not a thunk, not an unevaluated app, not a slot indirection.
+    /// Tag::App3 added 2026-05-29 (EXIT Week 1 Day 9-11) — same
+    /// unforced semantics as Tag::App.
     [[gnu::always_inline]] inline bool isForced() const noexcept
     {
         Tag t = tag();
-        return t != Tag::Thunk && t != Tag::App && t != Tag::Slot;
+        return t != Tag::Thunk && t != Tag::App && t != Tag::App3 && t != Tag::Slot;
     }
 
     /// In-place initialisers (no allocation).
@@ -229,6 +258,7 @@ static_assert(sizeof(Value) == 16, "v3 Value must be exactly 16 bytes");
     case Tag::Attrs:
     case Tag::List:
     case Tag::App:
+    case Tag::App3:
     case Tag::PrimOpApp:
     case Tag::Slot:
         return true;
@@ -275,6 +305,7 @@ static_assert( tagIsPointer(Tag::Thunk));
 static_assert(!tagIsPointer(Tag::PrimOp));
 static_assert( tagIsPointer(Tag::PrimOpApp));
 static_assert( tagIsPointer(Tag::App));
+static_assert( tagIsPointer(Tag::App3));
 static_assert(!tagIsPointer(Tag::Blackhole));
 static_assert(!tagIsPointer(Tag::External));
 static_assert( tagIsPointer(Tag::Slot));

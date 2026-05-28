@@ -281,6 +281,7 @@ nlohmann::json toJsonValue(VMState & vm, Value v,
         return json("<thunk>");
     case Tag::Uninitialized:
     case Tag::App:
+    case Tag::App3:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
@@ -415,6 +416,7 @@ void printNixValue(std::ostream & out, const Value & v,
     case Tag::PrimOpApp:out << "<PRIMOP-APP>"; return;
     case Tag::Thunk:    out << "<thunk>"; return;
     case Tag::App:      out << "<APP>"; return;
+    case Tag::App3:     out << "<APP3>"; return;
     case Tag::Blackhole:out << "<BLACKHOLE>"; return;
     case Tag::External: out << "<EXTERNAL>"; return;
     case Tag::Slot:     out << "<SLOT>"; return;
@@ -607,6 +609,7 @@ void printNixValueRich(std::ostream & out, const Value & v,
     }
     case Tag::Thunk:    out << "«thunk»"; return;
     case Tag::App:      out << "«thunk»"; return;  // TW prints both Thunk + App as «thunk»
+    case Tag::App3:     out << "«thunk»"; return;  // App3 = lazy curried apply
     // TW's printThunk emits the explanatory phrasing for Blackhole — see
     // libexpr/print.cc:489-500.  The phrasing is intentionally hedged
     // ("potential") because a blackhole-in-context might still resolve

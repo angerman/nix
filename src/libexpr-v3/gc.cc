@@ -322,6 +322,7 @@ Closure * Scavenger::fwdClosure(Closure * c)
     case Tag::Attrs:
     case Tag::List:
     case Tag::App:
+    case Tag::App3:
     case Tag::PrimOpApp:
     case Tag::Slot:
         return false;
@@ -586,6 +587,7 @@ void Scavenger::visitValue(Value & v)
         v.payload.list = fwdList(v.payload.list);
         break;
     case Tag::App:
+    case Tag::App3:
     case Tag::PrimOpApp:
         v.payload.pair = fwdPair(v.payload.pair);
         break;
@@ -1300,6 +1302,7 @@ void Auditor::visitValue(const Value & v, const char * site)
     case Tag::Attrs:    visitBindings(v.payload.bindings, site); break;
     case Tag::List:     visitList   (v.payload.list,      site); break;
     case Tag::App:
+    case Tag::App3:
     case Tag::PrimOpApp: visitPair  (v.payload.pair,      site); break;
     case Tag::Slot:
         if (v.payload.slot) visitValue(*v.payload.slot, "Slot.cell");
