@@ -1,0 +1,4 @@
+v3 major-mark-sweep: closures=12470 thunks=214155 bindings=31362 lists=129579 pairs=574814 cells=202944 chars=319110 cons=95884 consW=1247649 markedCells=1578202 blocks=34 hugeMarked=2116 markMs=308.36 sweepMs=45.90
+v3 sweep: blocksScanned=34 liveCells=1362452 deadCells=1475891 liveBytes=424.9MB deadBytes=145.5MB reclaim%=25.5% freelist_entries=1475891 blocksFreed=0 bytesFreed=0.0MB
+v3 line-marks: blocks=35 totalLines=4587520 deadLines=1178790 deadPct=25.70% (Immix acceptance ≥30%)
+"/nix/store/r77jznkw60xvqjzs3jvd1dn54pxcqs68-hello-2.12.3.drv"

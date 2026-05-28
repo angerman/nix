@@ -777,6 +777,20 @@ public:
     /// block.
     static constexpr size_t kHugeCutoff = kBlockSize / 4;
 
+    /// Step 11′ (Immix, 2026-05-29): line size for the per-block
+    /// line-mark bitmap.  Canonical Immix-line-size per
+    /// `GC_DECISION_2026-05-29.md §3 New Step 11′` + the F1
+    /// empirical measurement at `IMMIX_LINE_OCCUPANCY_2026-05-29.md`
+    /// (46.5% fully-dead at 128 B on hello, 50.5% on HNE).
+    static constexpr size_t kLineBytes = 128;
+
+    /// Lines per regular 16 MB block = 131,072.
+    static constexpr size_t kLinesPerBlock = kBlockSize / kLineBytes;
+
+    /// u64 words to cover one block's lines = 2,048 (16 KB per
+    /// block).
+    static constexpr size_t kLineU64sPerBlock = kLinesPerBlock / 64;
+
     /// Stage 6 Day 1 refactor (per STAGE_6_IMPLEMENTATION_GUIDE_2026-
     /// 05-27.md §"Day 1"): group block storage into a `Region` so a
     /// the Cheney semispace experiment introduced a backup region;
@@ -808,6 +822,28 @@ public:
         /// via Arena::s_majorGcEnabled).  Cost when gate OFF: zero
         /// memory, single branch in alloc().
         std::vector<std::vector<uint64_t>> cellStarts;
+
+        /// Step 11′ (Immix, 2026-05-29 per GC_DECISION_2026-05-29.md):
+        /// per-block 128 B line-mark bitmap.  Parallel to `blocks`
+        /// (lineMarks[i] is the line-mark bitmap for blocks[i]).  One
+        /// bit per 128 B line of the block; bit set means "at least
+        /// one byte of this line is live."
+        ///
+        /// Cleared at start of each mark phase by
+        /// `Arena::clearAllLineMarks()`; populated by
+        /// `Arena::markLinesForCell()` (called from each MarkVisitor
+        /// walk function with the cell's address + size); read by the
+        /// future Immix line-region allocator (Step 12′).
+        ///
+        /// Per-block size = (kBlockSize / kLineBytes) / 64 u64 words
+        ///                = (16 MB / 128 B) / 64
+        ///                = 131,072 lines / 64
+        ///                = 2,048 u64 words = 16 KB.
+        ///
+        /// Maintained only when `NIX_V3_MAJOR_GC=1` (cached at startup
+        /// via Arena::s_majorGcEnabled).  Cost when gate OFF: zero
+        /// memory (vector stays empty), single branch in refill().
+        std::vector<std::vector<uint64_t>> lineMarks;
     };
 
     void * alloc(size_t bytes) noexcept
@@ -951,6 +987,119 @@ public:
     /// Stage 6 Phase 2: accessor for sweep to enumerate cell starts.
     const std::vector<std::vector<uint64_t>> & cellStartBitmaps() const noexcept
         { return active_.cellStarts; }
+
+    // ============================================================
+    // Step 11′ — Immix line-mark bitmap API (2026-05-29).
+    //
+    // Per `GC_DECISION_2026-05-29.md §3 New Step 11′`: maintain a
+    // per-block 128 B line-mark bitmap.  Mark phase populates;
+    // future Immix allocator (Step 12′) reads.
+    //
+    // Zero-cost when major-GC gate OFF.  Gate-ON cost:
+    //   * memory: 16 KB per 16 MB block = 0.1% of arena
+    //   * mark wall: O(reachable cells) markLinesForCell calls,
+    //     each O(blocks-linear-search) + O(lines-in-cell)
+    //   * clear at start of mark: O(total lineMark u64s)
+    //     ≈ 2048 × n_blocks ≈ 200 KB memset for HNE — ~50 µs.
+    // ============================================================
+
+    /// Clear all line-mark bitmaps.  Called at start of each mark
+    /// phase by runMajorMarkSweep.  No-op when gate OFF (vector
+    /// stays empty) or when no blocks allocated yet.
+    void clearAllLineMarks() noexcept
+    {
+        if (!majorGcEnabled()) return;
+        for (auto & bits : active_.lineMarks)
+            std::fill(bits.begin(), bits.end(), 0ULL);
+    }
+
+    /// Mark every 128 B line that the cell at [`addr`, `addr`+`bytes`)
+    /// overlaps.  Called from each MarkVisitor walk* function with
+    /// the cell's known size.  No-op when gate OFF, when `addr` is
+    /// null, or when `addr` is not in active arena (huge-block /
+    /// external).
+    ///
+    /// `bytes` is the LOGICAL cell size (e.g., sizeof(Closure) +
+    /// nUpvalues*sizeof(Value)).  Not 16-byte-aligned by this
+    /// function; the line-bit set OR's across whatever range the
+    /// cell spans.
+    void markLinesForCell(const void * addr, size_t bytes) noexcept
+    {
+        if (!majorGcEnabled() || !addr || bytes == 0) return;
+        const char * cp = static_cast<const char *>(addr);
+        // Linear scan to find the containing block.  Same convention
+        // as inActive / isCellStart / findContainingCellStart.
+        // Locality optimisation: recent allocations are in the last
+        // block; check last-first.
+        const size_t nBlocks = active_.blocks.size();
+        if (nBlocks == 0 || nBlocks > active_.lineMarks.size()) return;
+        for (size_t ii = 0; ii < nBlocks; ++ii) {
+            // Iterate last-block-first.
+            const size_t i = nBlocks - 1 - ii;
+            const char * blk = active_.blocks[i];
+            if (cp < blk || cp >= blk + kBlockSize) continue;
+            const size_t offset = static_cast<size_t>(cp - blk);
+            const size_t end = offset + bytes;
+            // Clamp end-of-cell to end-of-block (defensive; cells
+            // should never straddle block boundaries given allocator
+            // refills on overflow).
+            const size_t clampedEnd = (end > kBlockSize) ? kBlockSize : end;
+            const size_t firstLine = offset / kLineBytes;
+            const size_t lastLine  = (clampedEnd - 1) / kLineBytes;
+            auto & bits = active_.lineMarks[i];
+            for (size_t L = firstLine; L <= lastLine && L < kLinesPerBlock; ++L) {
+                bits[L >> 6] |= 1ULL << (L & 63);
+            }
+            return;
+        }
+        // Not in any active block.  Could be huge or external; skip.
+    }
+
+    /// Query whether the line containing `addr` is marked.  Used by
+    /// the Step 12′ Immix allocator (predeclared here; not used in
+    /// Step 11′).  Returns false if `addr` is null, not in active
+    /// arena, or gate OFF.
+    bool isLineMarked(const void * addr) const noexcept
+    {
+        if (!majorGcEnabled() || !addr) return false;
+        const char * cp = static_cast<const char *>(addr);
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            const char * blk = active_.blocks[i];
+            if (cp < blk || cp >= blk + kBlockSize) continue;
+            if (i >= active_.lineMarks.size()) return false;
+            const size_t offset = static_cast<size_t>(cp - blk);
+            const size_t line = offset / kLineBytes;
+            const size_t word = line / 64;
+            if (word >= active_.lineMarks[i].size()) return false;
+            return (active_.lineMarks[i][word] >> (line & 63)) & 1ULL;
+        }
+        return false;
+    }
+
+    /// Accessor for diagnostic + future Step 12′ allocator.
+    const std::vector<std::vector<uint64_t>> & lineMarkBitmaps() const noexcept
+        { return active_.lineMarks; }
+
+    /// Aggregate count of fully-dead (zero) line bits across all
+    /// regular blocks' lineMarks bitmaps.  Used by mark_sweep.cc to
+    /// report the per-cycle line-occupancy alongside sweep stats.
+    /// Returns (totalLines, fullyDeadLines).
+    std::pair<size_t, size_t> countLineMarks() const noexcept
+    {
+        size_t total = 0;
+        size_t deadLines = 0;
+        for (const auto & bits : active_.lineMarks) {
+            total += bits.size() * 64;
+            for (uint64_t w : bits)
+                deadLines += 64 - __builtin_popcountll(w);
+        }
+        // Lines beyond the block's allocated range are NOT
+        // necessarily zero (we don't track block-used-bytes here).
+        // For the purpose of "fully dead lines in tracked region"
+        // this is close enough; precise accounting is reportSweepCost
+        // / live_trace.cc.
+        return {total, deadLines};
+    }
 
     /// Stage 6 Phase 3.5: backward search for the cell-start at or
     /// below `p`.  Used by conservative C-stack scan to locate the
@@ -1171,9 +1320,13 @@ public:
 #endif
         std::free(const_cast<char *>(blockStart));
 
-        // 4. Remove from active_.blocks + parallel cellStarts.
+        // 4. Remove from active_.blocks + parallel cellStarts +
+        //    parallel lineMarks (Step 11′ Immix, 2026-05-29).
         active_.blocks.erase(active_.blocks.begin() + idx);
         active_.cellStarts.erase(active_.cellStarts.begin() + idx);
+        if (idx < active_.lineMarks.size()) {
+            active_.lineMarks.erase(active_.lineMarks.begin() + idx);
+        }
 
         // 5. Update totalBytes + cur/end if we freed the current
         //    block.  After freeing, the next alloc will refill (since
@@ -1330,9 +1483,15 @@ private:
         // Stage 6 Phase 2: extend cell-start bitmap if major-GC gate
         // is on.  Per-block bitmap = (kBlockSize / 16 / 64) uint64s
         // = 16384 words = 128 KB per 16 MB block.
+        // Step 11′ (Immix, 2026-05-29): in parallel, extend the
+        // line-mark bitmap by kLineU64sPerBlock words (2048 = 16 KB
+        // per 16 MB block).  Cleared at start of each mark phase by
+        // Arena::clearAllLineMarks().
         if (majorGcEnabled()) {
             active_.cellStarts.emplace_back(
                 kBlockSize / 16 / 64, 0ULL);
+            active_.lineMarks.emplace_back(
+                kLineU64sPerBlock, 0ULL);
         }
 #if NIX_USE_BOEHMGC
         // WC-13: tell Boehm to scan this block for pointers to GC

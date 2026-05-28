@@ -1,0 +1,4 @@
+v3 major-mark-sweep: closures=11574 thunks=496438 bindings=21658 lists=383996 pairs=1866132 cells=474337 chars=955622 cons=146992 consW=2940360 markedCells=4294161 blocks=45 hugeMarked=62588 markMs=614.76 sweepMs=55.58
+v3 sweep: blocksScanned=45 liveCells=3785442 deadCells=1020419 liveBytes=483.4MB deadBytes=271.5MB reclaim%=36.0% freelist_entries=1020419 blocksFreed=0 bytesFreed=0.0MB
+v3 line-marks: blocks=46 totalLines=6029312 deadLines=2118064 deadPct=35.13% (Immix acceptance ≥30%)
+"/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"

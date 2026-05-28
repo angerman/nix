@@ -278,6 +278,15 @@ public:
         if (!p) return;
         if (marker_.tryMark(p)) {
             ++statsCells_;
+            // Step 11′ (Immix): mark the line covering this Value
+            // cell.  Standalone cells are 16 B (one cell-aligned
+            // unit); Bindings-resident cells are 16 B but live
+            // INSIDE a larger Bindings span — the Bindings's own
+            // walkBindings line-mark covers them.  Either way,
+            // marking 16 B at `p` is the minimal correct coverage.
+            if (arenaSetForSlot_) {
+                arenaSetForSlot_->markLinesForCell(p, sizeof(Value));
+            }
             // Walk through the cell's content to mark transitively
             // reached pointers.  No type info at the slot target, so
             // visitValue dispatches on the tag.
@@ -313,12 +322,24 @@ public:
         // char-pool boundary identifies the string head.  Length
         // discovered via strlen at sweep time (allocChars guarantees
         // null-termination per alloc.hh:1205-1207).
-        if (marker_.tryMark(s)) ++statsChars_;
+        if (marker_.tryMark(s)) {
+            ++statsChars_;
+            // Step 11′ (Immix, 2026-05-29): mark the lines covering
+            // the string payload.  Length = strlen(s) + 1 (null term).
+            if (arenaSetForSlot_) {
+                arenaSetForSlot_->markLinesForCell(s, std::strlen(s) + 1);
+            }
+        }
     }
     void visitPath(const char * & s) noexcept override
     {
         if (!s) return;
-        if (marker_.tryMark(s)) ++statsChars_;
+        if (marker_.tryMark(s)) {
+            ++statsChars_;
+            if (arenaSetForSlot_) {
+                arenaSetForSlot_->markLinesForCell(s, std::strlen(s) + 1);
+            }
+        }
     }
 
     /// Drain the worklist.  Each entry's outgoing pointer fields are
@@ -350,6 +371,27 @@ public:
         if (marker_.tryMark(p)) {
             conservativeRoots_.push_back(p);
             ++statsConservative_;
+            // Step 11′ (Immix): derive the cell's size from the
+            // cell-start bitmap and line-mark the cell's full span.
+            // For interior pointers, find the containing cell start;
+            // for cell-start pointers, that's `p` itself.  Without
+            // this, Immix could allocate over a conservatively-live
+            // cell's tail bytes if they happen to fall in a "dead"
+            // line per a precise-walk-only line-mark.  Conservative
+            // overmark is the safe direction.
+            if (arenaSetForSlot_) {
+                const char * cellStart =
+                    arenaSetForSlot_->findContainingCellStart(p);
+                if (cellStart) {
+                    const char * cellEnd =
+                        arenaSetForSlot_->findNextCellStartOrBlockEnd(cellStart);
+                    if (cellEnd && cellEnd > cellStart) {
+                        arenaSetForSlot_->markLinesForCell(
+                            cellStart,
+                            static_cast<size_t>(cellEnd - cellStart));
+                    }
+                }
+            }
             return true;
         }
         return false;
@@ -432,6 +474,12 @@ private:
 
     void walkClosure(Closure * c) noexcept
     {
+        // Step 11′ (Immix, 2026-05-29): mark the lines this Closure
+        // occupies.  Cell size = sizeof(Closure) + nUpvalues * sizeof(Value).
+        if (arenaSetForSlot_) {
+            arenaSetForSlot_->markLinesForCell(
+                c, sizeof(Closure) + sizeof(Value) * c->nUpvalues);
+        }
         if (c->capturedWiths)
             visitList(c->capturedWiths);
         for (uint16_t i = 0; i < c->nUpvalues; ++i)
@@ -439,6 +487,18 @@ private:
     }
     void walkThunk(Thunk * t) noexcept
     {
+        // Step 11′ (Immix): mark lines for the Thunk.  Size depends
+        // on state (Suspended/Native/Blackhole have FAM trailers;
+        // Evaluated/Bridge are header-only).
+        if (arenaSetForSlot_) {
+            const size_t bytes =
+                (t->state == ThunkState::Suspended ||
+                 t->state == ThunkState::Native    ||
+                 t->state == ThunkState::Blackhole)
+                ? sizeof(Thunk) + sizeof(Value) * t->nUpvalues
+                : sizeof(Thunk);
+            arenaSetForSlot_->markLinesForCell(t, bytes);
+        }
         // Thunk::cell + shapeCell point at Value cells (Bindings-
         // resident OR standalone allocValue).  Mark them via visitSlot
         // so the cell payload is walked transitively.
@@ -475,6 +535,11 @@ private:
     }
     void walkBindings(Bindings * b) noexcept
     {
+        // Step 11′: line-mark the Bindings cell (header + FAM entries).
+        if (arenaSetForSlot_) {
+            arenaSetForSlot_->markLinesForCell(
+                b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+        }
         for (uint32_t i = 0; i < b->size; ++i)
             visitValue(b->entries[i].value);
         if (b->parent)
@@ -482,11 +547,20 @@ private:
     }
     void walkList(ListVec * l) noexcept
     {
+        // Step 11′: line-mark the ListVec cell (header + elems FAM).
+        if (arenaSetForSlot_) {
+            arenaSetForSlot_->markLinesForCell(
+                l, sizeof(ListVec) + sizeof(Value) * l->size);
+        }
         for (uint32_t i = 0; i < l->size; ++i)
             visitValue(l->elems[i]);
     }
     void walkPair(ValuePair * p) noexcept
     {
+        // Step 11′: line-mark the Pair (uniform 48 B).
+        if (arenaSetForSlot_) {
+            arenaSetForSlot_->markLinesForCell(p, sizeof(ValuePair));
+        }
         visitValue(p->left);
         visitValue(p->right);
         visitValue(p->evaluated);
@@ -705,6 +779,11 @@ void runMajorMarkSweep(VMState & vm) noexcept
     Arena & arena = threadArena();
 
     // -- Phase 1: precise mark --------------------------------------
+    // Step 11′ (Immix, 2026-05-29): clear per-block line-mark
+    // bitmap before mark walk populates it.  Zero-cost when major-GC
+    // gate OFF (vector stays empty); ~50-200 µs for HNE's 94 blocks
+    // when ON (memset of 94 × 16 KB = 1.5 MB).
+    arena.clearAllLineMarks();
     BitmapMarker marker(arena);
     MarkVisitor visitor(marker);
     visitor.setArena(arena);  // for visitSlot interior-owner discovery
@@ -823,6 +902,28 @@ void runMajorMarkSweep(VMState & vm) noexcept
             arena.freeListEntryCount(),
             sweep.blocksFreed,
             sweep.bytesFreed / 1e6);
+        // Step 11′ (Immix, 2026-05-29): line-mark bitmap summary.
+        // Each block has 131,072 lines of 128 B; a line is "live"
+        // if any byte of any marked cell falls in it.  Dead-line
+        // fraction is the upper bound on bytes Immix's bump-realloc
+        // could reclaim within blocks.
+        //
+        // Acceptance criterion (per GC_DECISION_2026-05-29 New Step
+        // 11′): ≥30% lines fully dead.  Below that means the line-
+        // mark scheme has bugged or Immix can't deliver on this
+        // workload.  Empirical baseline from IMMIX_LINE_OCCUPANCY
+        // measurement: 46.5% hello, 50.5% HNE.
+        {
+            const auto [totalLines, deadLines] = arena.countLineMarks();
+            const double deadPct = totalLines > 0
+                ? 100.0 * double(deadLines) / double(totalLines) : 0.0;
+            std::fprintf(stderr,
+                "v3 line-marks: blocks=%zu totalLines=%zu "
+                "deadLines=%zu deadPct=%.2f%% "
+                "(Immix acceptance ≥30%%)\n",
+                arena.lineMarkBitmaps().size(),
+                totalLines, deadLines, deadPct);
+        }
     }
 }
 
