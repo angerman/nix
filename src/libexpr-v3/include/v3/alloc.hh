@@ -783,6 +783,130 @@ public:
     const std::vector<std::vector<uint64_t>> & cellStartBitmaps() const noexcept
         { return active_.cellStarts; }
 
+    /// Stage 6 Phase 3.5: backward search for the cell-start at or
+    /// below `p`.  Used by conservative C-stack scan to locate the
+    /// owning cell of an arbitrary arena address.  Returns nullptr
+    /// if `p` is not in active arena or no cell-start exists at or
+    /// before `p` within its block.
+    const char * findContainingCellStart(const void * p) const noexcept
+    {
+        if (!majorGcEnabled() || !p) return nullptr;
+        const char * cp = static_cast<const char *>(p);
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            const char * blk = active_.blocks[i];
+            if (cp >= blk && cp < blk + kBlockSize) {
+                const size_t offset = static_cast<size_t>(cp - blk);
+                size_t bit = offset / 16;
+                // Scan backward word-by-word.
+                size_t word = bit / 64;
+                const auto & bits = active_.cellStarts[i];
+                if (word >= bits.size()) return nullptr;
+                // Check the current word from bit position downward.
+                {
+                    const size_t bitInWord = bit % 64;
+                    uint64_t mask = (bitInWord == 63)
+                        ? uint64_t(-1)
+                        : ((uint64_t(1) << (bitInWord + 1)) - 1);
+                    uint64_t masked = bits[word] & mask;
+                    if (masked) {
+                        // Highest set bit at-or-below bitInWord
+                        int hi = 63 - __builtin_clzll(masked);
+                        size_t foundBit = word * 64 + size_t(hi);
+                        return blk + (foundBit * 16);
+                    }
+                }
+                // Scan earlier words.
+                if (word == 0) return nullptr;
+                for (size_t w = word; w-- > 0;) {
+                    if (bits[w] == 0) continue;
+                    int hi = 63 - __builtin_clzll(bits[w]);
+                    size_t foundBit = w * 64 + size_t(hi);
+                    return blk + (foundBit * 16);
+                }
+                return nullptr;
+            }
+        }
+        // Huge: cell-start is at h.begin.
+        for (const auto & h : active_.hugeBlocks) {
+            if (cp >= h.begin && cp < h.end) return h.begin;
+        }
+        return nullptr;
+    }
+
+    /// Stage 6 Phase 3.5: forward search for the next cell-start
+    /// strictly AFTER `cellStart`.  Returns the next cell-start
+    /// address, or the block end if no more cell-starts exist.
+    /// Used by conservative cell-walk to determine cell size.
+    const char * findNextCellStartOrBlockEnd(const char * cellStart) const noexcept
+    {
+        if (!cellStart) return nullptr;
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            const char * blk = active_.blocks[i];
+            if (cellStart >= blk && cellStart < blk + kBlockSize) {
+                const size_t startOffset =
+                    static_cast<size_t>(cellStart - blk);
+                size_t bit = startOffset / 16 + 1;  // search AFTER
+                size_t word = bit / 64;
+                const auto & bits = active_.cellStarts[i];
+                // Check current word from bitInWord upward.
+                if (word < bits.size()) {
+                    const size_t bitInWord = bit % 64;
+                    uint64_t mask = (bitInWord == 0)
+                        ? uint64_t(-1)
+                        : ~((uint64_t(1) << bitInWord) - 1);
+                    uint64_t masked = bits[word] & mask;
+                    if (masked) {
+                        int lo = __builtin_ctzll(masked);
+                        size_t foundBit = word * 64 + size_t(lo);
+                        return blk + (foundBit * 16);
+                    }
+                }
+                // Scan later words.
+                for (size_t w = word + 1; w < bits.size(); ++w) {
+                    if (bits[w] == 0) continue;
+                    int lo = __builtin_ctzll(bits[w]);
+                    size_t foundBit = w * 64 + size_t(lo);
+                    return blk + (foundBit * 16);
+                }
+                // Past last cell-start: cell extends to block end
+                // (active.cur for current block, kBlockSize for older).
+                if (i + 1 == active_.blocks.size() && active_.cur)
+                    return active_.cur;
+                return blk + kBlockSize;
+            }
+        }
+        // Huge: extends to its end.
+        for (const auto & h : active_.hugeBlocks) {
+            if (cellStart >= h.begin && cellStart < h.end) return h.end;
+        }
+        return nullptr;
+    }
+
+    /// Stage 6 Phase 3.5: arena bounds for fast filtering during
+    /// conservative C-stack scan.  Returns [min, max) covering all
+    /// active blocks + huge blocks; caller can range-check candidates
+    /// before doing the precise `inActive` walk.
+    void activeBounds(uintptr_t & minOut,
+                      uintptr_t & maxOut) const noexcept
+    {
+        uintptr_t mn = UINTPTR_MAX;
+        uintptr_t mx = 0;
+        for (const char * blk : active_.blocks) {
+            uintptr_t b = reinterpret_cast<uintptr_t>(blk);
+            if (b < mn) mn = b;
+            if (b + kBlockSize > mx) mx = b + kBlockSize;
+        }
+        for (const auto & h : active_.hugeBlocks) {
+            uintptr_t b = reinterpret_cast<uintptr_t>(h.begin);
+            uintptr_t e = reinterpret_cast<uintptr_t>(h.end);
+            if (b < mn) mn = b;
+            if (e > mx) mx = e;
+        }
+        if (mn == UINTPTR_MAX) { mn = 0; mx = 0; }
+        minOut = mn;
+        maxOut = mx;
+    }
+
     /// Stage 6 Phase 3: per-exact-size free list, populated by sweep
     /// + popped by `alloc()` slow path.  Keyed by exact byte size
     /// (16-byte-aligned) — sweep records the precise size of each

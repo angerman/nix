@@ -48,6 +48,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <csetjmp>
+#include <pthread.h>
 #include <unordered_set>
 #include <vector>
 
@@ -281,7 +283,28 @@ public:
             // visitValue dispatches on the tag.
             visitValue(*p);
         }
+        // Phase 3.5: if the slot's target is INTERIOR of a larger
+        // container (e.g., a Bindings's entries[i].value), mark the
+        // owning container so drainConservative walks its bytes.
+        // Without this the OTHER pointer-bearing entries in the
+        // container don't get transitively marked — sweep would
+        // free them, and the container's other fields would dangle.
+        if (arenaSetForSlot_ && arenaSetForSlot_->inActive(p)
+            && !arenaSetForSlot_->isCellStart(p))
+        {
+            const char * owner =
+                arenaSetForSlot_->findContainingCellStart(p);
+            if (owner) {
+                markConservative(
+                    const_cast<char *>(owner));
+            }
+        }
     }
+
+    /// Phase 3.5: set the Arena reference used by visitSlot to
+    /// identify interior slot targets.  Must be called BEFORE the
+    /// root walk.
+    void setArena(Arena & a) noexcept { arenaSetForSlot_ = &a; }
     void visitString(const char * & s) noexcept override
     {
         if (!s) return;
@@ -315,6 +338,67 @@ public:
         }
     }
 
+    /// Phase 3.5: conservative mark.  Sets the mark bit at `p` without
+    /// enqueueing for transitive walk (we don't know `p`'s type since
+    /// it came from a stack scan or byte-walk).  Subsequent
+    /// `anyMarkInRange` in sweep keeps the containing cell alive.
+    /// Records `p` in the conservative worklist so a follow-up
+    /// `drainConservative` pass can walk its bytes if requested.
+    bool markConservative(void * p) noexcept
+    {
+        if (!p) return false;
+        if (marker_.tryMark(p)) {
+            conservativeRoots_.push_back(p);
+            ++statsConservative_;
+            return true;
+        }
+        return false;
+    }
+
+    /// Phase 3.5: conservatively walk bytes of every conservatively-
+    /// marked cell.  For each cell (containing-cell start determined
+    /// via cell-start bitmap backward search), walk its bytes 8-byte
+    /// at a time; for each word that falls in arena bounds, attempt
+    /// to mark it.  Iterates to a fixed-point.
+    ///
+    /// `arena` is provided so we can resolve container starts +
+    /// pre-compute arena bounds for fast filtering.
+    void drainConservative(Arena & arena,
+                           uintptr_t arenaMin,
+                           uintptr_t arenaMax) noexcept
+    {
+        // Snapshot — drainConservative_ may grow during the walk.
+        while (!conservativeRoots_.empty()) {
+            void * p = conservativeRoots_.back();
+            conservativeRoots_.pop_back();
+            // Find the containing cell start.  `p` may be at a
+            // cell-start OR an interior offset; backward scan finds
+            // the nearest cell-start at or below `p`.
+            const char * cellStart = arena.findContainingCellStart(p);
+            if (!cellStart) continue;
+            const char * cellEnd =
+                arena.findNextCellStartOrBlockEnd(cellStart);
+            if (!cellEnd || cellEnd <= cellStart) continue;
+            const size_t cellSize = static_cast<size_t>(cellEnd - cellStart);
+            // Walk bytes 8-aligned (v3 cells are 16-aligned; pointers
+            // are 8-byte).  Conservative: every 8-byte word is a
+            // potential pointer.
+            for (size_t off = 0; off + sizeof(void *) <= cellSize;
+                 off += sizeof(void *))
+            {
+                const uintptr_t val = *reinterpret_cast<const uintptr_t *>(
+                    cellStart + off);
+                if (val < arenaMin || val >= arenaMax) continue;
+                // Range check passed; precise check + mark.
+                void * candidate = reinterpret_cast<void *>(val);
+                if (arena.inActive(candidate)) {
+                    markConservative(candidate);
+                    ++statsConservativeWalks_;
+                }
+            }
+        }
+    }
+
     // Stats getters
     size_t statsClosures() const noexcept { return statsClosures_; }
     size_t statsThunks()   const noexcept { return statsThunks_; }
@@ -323,6 +407,8 @@ public:
     size_t statsPairs()    const noexcept { return statsPairs_; }
     size_t statsCells()    const noexcept { return statsCells_; }
     size_t statsChars()    const noexcept { return statsChars_; }
+    size_t statsConservative()      const noexcept { return statsConservative_; }
+    size_t statsConservativeWalks() const noexcept { return statsConservativeWalks_; }
 
 private:
     BitmapMarker & marker_;
@@ -339,6 +425,10 @@ private:
     size_t statsPairs_    = 0;
     size_t statsCells_    = 0;
     size_t statsChars_    = 0;
+    size_t statsConservative_      = 0;
+    size_t statsConservativeWalks_ = 0;
+    std::vector<void *> conservativeRoots_;
+    Arena * arenaSetForSlot_ = nullptr;
 
     void walkClosure(Closure * c) noexcept
     {
@@ -394,6 +484,109 @@ private:
         visitValue(p->evaluated);
     }
 };
+
+/// Phase 3.5: Conservative C-stack scan (Boehm-style).
+///
+/// Walks the current thread's C-stack from current SP to the stack
+/// base, plus a `jmp_buf` (spills callee-saved registers).  For each
+/// pointer-sized word, fast-filters against arena bounds; if within
+/// range, runs a precise `arena.inActive` check; if confirmed, marks
+/// the cell + enqueues for conservative byte-walk.
+///
+/// `outerSp` is the SP of the caller of runMajorMarkSweep — captured
+/// via a local anchor in runMajorMarkSweep.  We pass it in (rather
+/// than re-capture inside walkCStack) so the scan covers the
+/// dispatch-loop's locals + all caller frames.
+///
+/// Why this is safe (vs precise-only mark):
+///   * Conservative false positives keep dead cells alive (memory
+///     overhead) — never a correctness issue.
+///   * False negatives are impossible if the live pointer is on the
+///     stack or in a callee-saved register (captured via setjmp).
+///   * Caller-saved registers are spilled to the stack by the
+///     compiler at every call boundary, so they're seen by the scan
+///     before crossing into runMajorMarkSweep.
+///   * Conservative byte-walk of marked cells handles transitive
+///     reachability via X.upvalues[0] → Y where Y's pointer might
+///     not be on the stack.
+__attribute__((noinline))
+static void walkCStackConservative(
+    MarkVisitor & v,
+    Arena & arena,
+    const void * outerSp) noexcept
+{
+    // Spill callee-saved registers to stack-resident jmp_buf.
+    // setjmp returns 0 on direct call; never longjmp back here.
+    jmp_buf regsBuf;
+    (void)setjmp(regsBuf);
+
+    // Determine the SP region to scan.  We want everything from
+    // `outerSp` (deepest caller frame's SP, passed by caller) UP TO
+    // the stack base (high address).
+    pthread_t self = pthread_self();
+    const char * stackHi;
+#ifdef __APPLE__
+    stackHi = static_cast<const char *>(pthread_get_stackaddr_np(self));
+#elif defined(__linux__)
+    pthread_attr_t attr;
+    void * sb;
+    size_t ss;
+    if (pthread_getattr_np(self, &attr) == 0
+        && pthread_attr_getstack(&attr, &sb, &ss) == 0)
+    {
+        stackHi = static_cast<const char *>(sb) + ss;
+        pthread_attr_destroy(&attr);
+    } else {
+        stackHi = nullptr;
+    }
+#else
+    stackHi = nullptr;
+    (void)self;
+#endif
+    if (!stackHi) return;
+
+    const char * stackLo = static_cast<const char *>(outerSp);
+    // Align stackLo down to pointer alignment.
+    uintptr_t loU = reinterpret_cast<uintptr_t>(stackLo)
+                    & ~(uintptr_t(sizeof(void *)) - 1);
+    uintptr_t hiU = reinterpret_cast<uintptr_t>(stackHi)
+                    & ~(uintptr_t(sizeof(void *)) - 1);
+    if (loU > hiU) std::swap(loU, hiU);
+
+    // Pre-compute arena bounds for fast filter.
+    uintptr_t arenaMin, arenaMax;
+    arena.activeBounds(arenaMin, arenaMax);
+    if (arenaMin >= arenaMax) return;  // no active blocks
+
+    // Walk stack.
+    for (uintptr_t p = loU; p < hiU; p += sizeof(void *)) {
+        const uintptr_t val =
+            *reinterpret_cast<const uintptr_t *>(p);
+        if (val < arenaMin || val >= arenaMax) continue;
+        // Range hit; precise check.
+        void * candidate = reinterpret_cast<void *>(val);
+        if (arena.inActive(candidate)) {
+            v.markConservative(candidate);
+        }
+    }
+
+    // Also walk the jmp_buf (callee-saved registers).
+    const uintptr_t bufLo =
+        reinterpret_cast<uintptr_t>(&regsBuf);
+    const uintptr_t bufHi = bufLo + sizeof(regsBuf);
+    for (uintptr_t p = bufLo; p < bufHi; p += sizeof(void *)) {
+        const uintptr_t val =
+            *reinterpret_cast<const uintptr_t *>(p);
+        if (val < arenaMin || val >= arenaMax) continue;
+        void * candidate = reinterpret_cast<void *>(val);
+        if (arena.inActive(candidate)) {
+            v.markConservative(candidate);
+        }
+    }
+
+    // Iterate the conservative cell-walk to a fixed-point.
+    v.drainConservative(arena, arenaMin, arenaMax);
+}
 
 } // namespace
 
@@ -483,11 +676,33 @@ void runMajorMarkSweep(VMState & vm) noexcept
 
     Arena & arena = threadArena();
 
-    // -- Phase 1: mark ----------------------------------------------
+    // -- Phase 1: precise mark --------------------------------------
     BitmapMarker marker(arena);
     MarkVisitor visitor(marker);
+    visitor.setArena(arena);  // for visitSlot interior-owner discovery
     walkAllV3Roots(vm, visitor);
     visitor.drain();
+
+    // Phase 3.5 follow-up: drain conservative roots accumulated from
+    // visitSlot's interior-owner discovery during precise mark.
+    {
+        uintptr_t arenaMin, arenaMax;
+        arena.activeBounds(arenaMin, arenaMax);
+        visitor.drainConservative(arena, arenaMin, arenaMax);
+    }
+
+    // -- Phase 3.5: conservative C-stack scan -----------------------
+    // After precise marks finish, do a conservative scan of the
+    // current thread's stack + callee-saved registers (via setjmp
+    // spill).  Catches Value/cell pointers held in C-locals of
+    // primop bodies that the precise walker can't see.  Anchor SP
+    // here so the scan covers everything from our caller's frame
+    // (dispatch-loop) up to the stack base.
+    {
+        char anchor;
+        const void * sp = &anchor;
+        walkCStackConservative(visitor, arena, sp);
+    }
 
     const auto tMarkEnd = clock::now();
 
@@ -535,13 +750,15 @@ void runMajorMarkSweep(VMState & vm) noexcept
     if (s_stats) {
         std::fprintf(stderr,
             "v3 major-mark-sweep: closures=%zu thunks=%zu bindings=%zu "
-            "lists=%zu pairs=%zu cells=%zu chars=%zu "
+            "lists=%zu pairs=%zu cells=%zu chars=%zu cons=%zu consW=%zu "
             "markedCells=%zu blocks=%zu hugeMarked=%zu "
             "markMs=%.2f sweepMs=%.2f\n",
             visitor.statsClosures(), visitor.statsThunks(),
             visitor.statsBindings(), visitor.statsLists(),
             visitor.statsPairs(), visitor.statsCells(),
             visitor.statsChars(),
+            visitor.statsConservative(),
+            visitor.statsConservativeWalks(),
             marker.markedCells(),
             marker.blocksCovered(),
             marker.hugeBlocksMarked(),
