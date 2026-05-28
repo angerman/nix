@@ -147,12 +147,16 @@ lib_sources = files(
   # `nix::Value *` from Thunk::bridgeSrc so Boehm sees them as roots
   # independently of arena registration.
   'bridge_root_registry.cc',
-  # Stage 6 Day 2.2 MajorScavenger — Cheney semispace over the v3
-  # tenured arena.  See lode/STAGE_6_PRECISE_GC_DESIGN_2026-05-27.md
-  # + lode/STAGE_6_IMPLEMENTATION_GUIDE_2026-05-27.md.  Caller-
-  # invoked only in this commit (no automatic dispatch trigger;
-  # that's Day 3).  Production code unaffected.
-  'move_gc.cc',
+  # Stage 6 production GC — flat mark-sweep over the v3 tenured arena.
+  # Replaces the Cheney MajorScavenger (move_gc.cc) which was falsified
+  # at commit eda44711a + 9bf527714.  See:
+  #   lode/GC_DESIGN_POST_CHENEY_2026-05-28.md (the design)
+  #   lode/STAGE_6_FALSIFIERS_DAY6_2026-05-28.md (F#1/F#2 data)
+  #   lode/STAGE_6_CHENEY_FALSIFIED_2026-05-27.md (the falsification)
+  # Phase 0: runMajorMarkSweep is a no-op stub; vm.cc dispatch-loop
+  # wires the call path so subsequent phases (1-3) can drop in mark +
+  # sweep + free-list-allocator without touching the trigger.
+  'mark_sweep.cc',
   # #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
   'dedup_survey.cc',
   'disasm.cc',

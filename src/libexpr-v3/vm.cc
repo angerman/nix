@@ -26,7 +26,7 @@
 #include "v3/bytecode_primops.hh"
 #include "v3/limits.hh"
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
-#include "v3/major_scavenge.hh"  // Stage 6 runMajorScavenge dispatch trigger
+#include "v3/mark_sweep.hh"      // Stage 6 runMajorMarkSweep dispatch trigger
 
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
@@ -2686,30 +2686,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
         }
         skip_scavenge:;
-        // Stage 6 Day 3 Step 7 — major-scavenge trigger.
+        // Stage 6 Day 6 — major mark-sweep trigger (replaces Day 3
+        // Cheney scavenger per STAGE_6_CHENEY_FALSIFIED_2026-05-27
+        // + GC_DESIGN_POST_CHENEY_2026-05-28).
         //
-        // Per STAGE_6_IMPLEMENTATION_GUIDE_2026-05-27.md §"Day 3"
-        // + the analysis in STAGE_6_DAY_3_CELL_FORWARDING_ANALYSIS:
+        // Gate: NIX_V3_MAJOR_GC=1 (default OFF).  When enabled, fires
+        // runMajorMarkSweep when arena's active region grows past
+        // NIX_V3_MAJOR_GC_THRESHOLD_MB (default 256 MB).
         //
-        // Gate: NIX_V3_MAJOR_GC=1 (default OFF).  When enabled,
-        // fires runMajorScavenge when arena's active region grows
-        // past NIX_V3_MAJOR_GC_THRESHOLD_MB (default 256 MB).
+        // Nested-VMState defer mirrors nursery scavenger logic: major
+        // GC has the same safe-point constraint (C-locals in primop
+        // bodies holding arena pointers would dangle if cells moved).
+        // Flat MS does NOT move cells, so the dangling-C-local risk
+        // is null — but the structural defer is retained for safety +
+        // to ensure mark sees a consistent VM state.
         //
-        // Nested-VMState defer mirrors nursery scavenger logic:
-        // major scavenge has the SAME safe-point constraint
-        // (C-locals in primop bodies that hold arena pointers
-        // would dangle if scavenge moved their referent cells).
-        //
-        // Steps 1+2+3+5 ensure correctness on common pointer
-        // paths (typed forwarding tables, standalone cells,
-        // Thunk::cell + shapeCell, Tag::Slot Bindings-resident).
-        // Step 6 (Closure/Thunk-internal slot targets) remains
-        // a Day-4 follow-up; rare let-rec patterns may surface
-        // bugs.
-        //
-        // Independent of nursery state — major scavenge operates
-        // on the tenured arena, which exists whether or not the
-        // nursery is enabled.
+        // Trigger logic + dynamic threshold + nested-VMState defer
+        // retained from Day 4 Cheney work (per GC_DESIGN_POST_CHENEY
+        // §4.6 "what survives from the Cheney work").
         static const bool s_majorGcEnabled =
             std::getenv("NIX_V3_MAJOR_GC") != nullptr;
         if (__builtin_expect(s_majorGcEnabled, 0)) [[unlikely]] {
@@ -2764,7 +2758,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // Sync ip into the frame so the scavenger
                     // walks a consistent VM state.
                     if (!vm.frames.empty()) vm.frames.back().ip = ip;
-                    runMajorScavenge(vm);
+                    runMajorMarkSweep(vm);
                     // Frame pointers may have been forwarded.
                     // Re-read dispatch locals.
                     if (!vm.frames.empty()) {

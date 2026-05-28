@@ -618,10 +618,9 @@ public:
 
     /// Stage 6 Day 1 refactor (per STAGE_6_IMPLEMENTATION_GUIDE_2026-
     /// 05-27.md §"Day 1"): group block storage into a `Region` so a
-    /// future commit can introduce a backup region + `swapRegions()`
-    /// for major-scavenge semispace mechanics.  Today: a single
-    /// active region used exactly as the pre-refactor flat members.
-    /// No behavior change — purely structural.
+    /// the Cheney semispace experiment introduced a backup region;
+    /// retired 2026-05-28 with the Cheney scavenger.  Today flat MS
+    /// uses only the active region (cells stay in place).
     struct HugeBlock { char * begin; char * end; };
 
     struct Region {
@@ -715,168 +714,50 @@ public:
         return r;
     }
 
-    /// Stage 6 Day 2.2: swap active_ ↔ backup_.  Mechanics:
-    ///   1. (Caller — MajorScavenger) walks roots, copies live
-    ///      cells from active_ to backup_ via allocInBackup, drains
-    ///      transitive worklist.
-    ///   2. swapRegions() exchanges active_ ↔ backup_ in place.
-    ///      Future allocs land in what was just backup (now the
-    ///      compacted live set).
-    ///   3. (Caller) freeBackupBlocks() releases the OLD active
-    ///      blocks (now backup_).
-    ///
-    /// This is the moment of TRUTH for Stage 6 — net peak RSS
-    /// drops by `old_active_total - live_size` after this swap +
-    /// free sequence.  Callers must guarantee no pointers into
-    /// active_ remain in any reachable Value before invoking this
-    /// (the MajorScavenger's role is to ensure this by rewriting
-    /// every reachable pointer).
-    void swapRegions() noexcept
-    {
-        std::swap(active_, backup_);
-    }
-
-    /// Stage 6 Day 2: pointer-classification enum.  Returned by
+    /// Stage 6 Day 6: pointer-classification enum.  Returned by
     /// `regionOf(p)` to indicate whether a raw pointer falls in:
-    ///   * Active: a live cell in the current active region;
-    ///     MoveGCVisitor will copy it to backup_ during major
-    ///     scavenge
-    ///   * Backup: an already-copied cell in backup_; MoveGCVisitor
-    ///     should not re-visit (forwarding-table lookup catches
-    ///     these too, but the classification is the cheap pre-check)
-    ///   * External: not in any arena region — could be libc-malloc
+    ///   * Active: a live cell in the arena
+    ///   * External: not in the arena — could be libc-malloc
     ///     (CompilationUnit), Boehm (TW nix::Value*), nursery, or
-    ///     a stack address.  MoveGCVisitor skips.
+    ///     a stack address.  GC skips.
+    ///
+    /// 2026-05-28: Backup region retired with the Cheney scavenger
+    /// (per GC_DESIGN_POST_CHENEY_2026-05-28.md §4.6 + §6.1).  Flat
+    /// MS doesn't move cells, so a separate destination region is
+    /// unneeded.  Two-state enum (External/Active) kept for ABI
+    /// compatibility with callers that switch on RegionKind.
     enum class RegionKind : uint8_t {
         External = 0,
         Active   = 1,
-        Backup   = 2,
     };
 
     /// Classify `p` against the arena's region boundaries.  Cheap
     /// per-pointer test: linear walks the blocks vectors (O(N) in
     /// block count, ~N is small — 16 MB blocks, 587 MB arena = ~36
     /// blocks max on the canonical workloads).
-    ///
-    /// Called from MoveGCVisitor for each pointer the major
-    /// scavenge visits.  When the workload's block count gets
-    /// large, this can be upgraded to a sorted-vector + binary
-    /// search; for now O(N) is well under the per-collect budget
-    /// since each scavenge processes the entire reachable set
-    /// anyway.
     RegionKind regionOf(const void * p) const noexcept
     {
         if (!p) return RegionKind::External;
         const char * cp = static_cast<const char *>(p);
-        // Active region first — most cells live here, so check
-        // hot-path first.
         for (const char * blk : active_.blocks) {
             if (cp >= blk && cp < blk + kBlockSize) return RegionKind::Active;
         }
         for (const auto & h : active_.hugeBlocks) {
             if (cp >= h.begin && cp < h.end) return RegionKind::Active;
         }
-        for (const char * blk : backup_.blocks) {
-            if (cp >= blk && cp < blk + kBlockSize) return RegionKind::Backup;
-        }
-        for (const auto & h : backup_.hugeBlocks) {
-            if (cp >= h.begin && cp < h.end) return RegionKind::Backup;
-        }
         return RegionKind::External;
     }
 
-    /// Convenience checks for the common pattern: "is `p` an arena
-    /// cell that the major scavenger should move?"
+    /// Convenience check: "is `p` an arena-resident cell?"
     bool inActive(const void * p) const noexcept
     {
         return regionOf(p) == RegionKind::Active;
-    }
-    bool inBackup(const void * p) const noexcept
-    {
-        return regionOf(p) == RegionKind::Backup;
-    }
-
-    /// Stage 6 Day 2.2: backup-region allocator.  Mirrors
-    /// `alloc()` but writes into `backup_` instead of `active_`.
-    /// Used by `MajorScavenger::fwd*` to deposit copied cells.
-    ///
-    /// Same huge-cutoff + 16-byte-align semantics as `alloc()`.
-    /// Boehm registration follows the same `NIX_V3_ARENA_NOROOT`
-    /// gate as the active region.
-    void * allocInBackup(size_t bytes) noexcept
-    {
-        bytes = (bytes + 15) & ~size_t{15};
-        if (bytes > kHugeCutoff) {
-            void * blk = std::calloc(1, bytes);
-#if NIX_USE_BOEHMGC
-            if (blk && !arenaNorootEnabled())
-                GC_add_roots(blk, static_cast<char *>(blk) + bytes);
-#endif
-            if (blk) {
-                backup_.hugeBlocks.push_back({static_cast<char *>(blk),
-                                              static_cast<char *>(blk) + bytes});
-                backup_.totalBytes += bytes;
-            }
-            return blk;
-        }
-        if (backup_.cur + bytes > backup_.end) refillBackup();
-        void * p = backup_.cur;
-        backup_.cur += bytes;
-        return p;
-    }
-
-    /// Free all blocks in the backup region.  Called by the
-    /// caller of `swapRegions()` after the swap: the OLD active
-    /// (now backup_) holds dead cells; freeing them is the
-    /// concrete reclamation Stage 6 delivers.
-    void freeBackupBlocks() noexcept
-    {
-        for (char * blk : backup_.blocks) {
-#if NIX_USE_BOEHMGC
-            if (!arenaNorootEnabled())
-                GC_remove_roots(blk, blk + kBlockSize);
-#endif
-            std::free(blk);
-        }
-        for (const auto & h : backup_.hugeBlocks) {
-#if NIX_USE_BOEHMGC
-            if (!arenaNorootEnabled())
-                GC_remove_roots(h.begin, h.end);
-#endif
-            std::free(h.begin);
-        }
-        backup_.blocks.clear();
-        backup_.hugeBlocks.clear();
-        backup_.cur = nullptr;
-        backup_.end = nullptr;
-        backup_.totalBytes = 0;
     }
 
 private:
     /// Stage 6 Day 1: active region — the only region used by
     /// alloc()/refill()/blockRanges() in current single-region mode.
     Region active_;
-
-    /// Stage 6 Day 2: backup region — destination for the future
-    /// major-scavenge mark+copy.  Currently UNUSED — empty Region
-    /// with zero blocks.  Lazy-allocated on first major scavenge
-    /// (Day 3) so workloads without major GC pay no extra RSS.
-    Region backup_;
-
-    /// Stage 6 Day 2.2: backup-region block refill.  Mirrors
-    /// `refill()` but writes to backup_.
-    void refillBackup() noexcept
-    {
-        char * blk = static_cast<char *>(std::calloc(1, kBlockSize));
-        backup_.blocks.push_back(blk);
-        backup_.cur = blk;
-        backup_.end = blk + kBlockSize;
-        backup_.totalBytes += kBlockSize;
-#if NIX_USE_BOEHMGC
-        if (!arenaNorootEnabled())
-            GC_add_roots(blk, blk + kBlockSize);
-#endif
-    }
 
     void refill() noexcept
     {
