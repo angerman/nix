@@ -27,6 +27,7 @@
 #include "v3/limits.hh"
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
 #include "v3/mark_sweep.hh"      // Stage 6 runMajorMarkSweep dispatch trigger
+#include "v3/live_trace.hh"      // Step 4 periodic L(t) trace dispatch hook
 
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
@@ -2776,6 +2777,34 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (nextThreshold < s_majorGcInitialThresholdBytes)
                         nextThreshold = s_majorGcInitialThresholdBytes;
                     s_majorGcThresholdBytes = nextThreshold;
+                }
+            }
+        }
+        // Step 4 of post-Phase-3.8 plan (2026-05-29): periodic L(t)
+        // live-fraction trace.  Gated NIX_V3_LIVE_TRACE_PERIODIC=<K>
+        // (default OFF).  Same safepoint constraint as major-GC; runs
+        // a transitive walk + records one CSV row each time arena
+        // crosses the next K-MB boundary.
+        //
+        // Independent of major-GC gate: this measures L(t) for the
+        // current code path, gate-OFF OR gate-ON.  Per
+        // L_MEASUREMENT_GAP_2026-05-28 §5: closes the "L_end is the
+        // only data point" methodology hole.
+        //
+        // Retirement: when L(t) is integrated into the bench harness
+        // as a default-OFF metric, remove this hook + the env-gate.
+        if (__builtin_expect(periodicLiveTraceEnabled(), 0)) [[unlikely]] {
+            if (exitDepth == 0) {
+                bool nestedDistinct = false;
+                for (VMState * vmp : activeVMStack()) {
+                    if (vmp && vmp != &vm) {
+                        nestedDistinct = true;
+                        break;
+                    }
+                }
+                if (!nestedDistinct) {
+                    if (!vm.frames.empty()) vm.frames.back().ip = ip;
+                    maybeSamplePeriodicLiveFraction(vm);
                 }
             }
         }

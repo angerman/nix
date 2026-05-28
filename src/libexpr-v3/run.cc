@@ -572,6 +572,12 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // Stage 6 generational tenured collector (GHC-RTS style).
         // Gated NIX_V3_BLOCK_PROBE=1; zero cost otherwise.
         dumpV3LiveBlockProbe();
+        // Step 4 of post-Phase-3.8 plan (2026-05-29): periodic L(t)
+        // trace flush.  If NIX_V3_LIVE_TRACE_PERIODIC=<K> was set,
+        // writes the per-sample CSV at NIX_V3_LIVE_TRACE_PERIODIC_OUT
+        // (or default /tmp/v3-live-periodic-<pid>.csv) + emits a
+        // summary banner.  Per L_MEASUREMENT_GAP_2026-05-28 §5.
+        flushPeriodicLiveTraceCsv();
         // #660 verification: dump bridge-primop call counts.  v3-eval
         // already does this via its own NIX_VM_STATS path; mirror here
         // so the integrated `nix` CLI (and any future v3 driver that

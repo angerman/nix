@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unistd.h>           // getpid() for default periodic-out path
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1336,6 +1337,221 @@ void dumpV3LiveBlockProbe() noexcept
         liveBytesApprox += std::strlen(s) + 1;
     pr.reportSweepCost(markMs, liveBytesApprox);
     pr.reportAllocSites();
+}
+
+// ============================================================================
+// Periodic L(t) live-fraction trace (Step 4 of post-Phase-3.8 plan).
+//
+// Per `lode/L_MEASUREMENT_GAP_2026-05-28.md` §5: extend dumpV3LiveFraction
+// with periodic sampling so we get L(t) across the eval, not just L_end.
+// Fires every K MB of arena allocation from the dispatch-loop safepoint.
+// Each sample = one full transitive walk; records CSV row; flushes file
+// at end-of-run.
+//
+// Gate: NIX_V3_LIVE_TRACE_PERIODIC=<K>      (K in MB; default 64)
+//       NIX_V3_LIVE_TRACE_PERIODIC_OUT=<f>  (CSV path; default
+//                                            /tmp/v3-live-periodic-<pid>.csv)
+//
+// Retirement: when the L(t) metric is integrated into the bench harness
+// as a default-OFF metric, remove the env-gate per Rule 0 §2.  Tracked
+// in L_TIME_SERIES_DATA_2026-05-29 follow-up.
+// ============================================================================
+
+namespace {
+
+struct PeriodicCsvRow {
+    double alloc_offset_mb;   // arena.bytesAllocated() at sample time
+    double resident_mb;       // = alloc_offset_mb (current arena footprint)
+    double live_mb;           // transitive-walk live bytes
+    double l_resident;        // live / resident
+    double l_cumulative;      // live / cumulative-allocated
+    double wall_ms;           // ms since eval start
+};
+
+/// thread_local state for the periodic trace.  Thread-local because v3
+/// has per-thread arenas (`threadArena()`) and per-thread VMState.
+struct PeriodicState {
+    std::vector<PeriodicCsvRow> rows;
+    size_t nextThresholdBytes = 0;
+    std::chrono::steady_clock::time_point evalStart;
+    bool evalStartSet = false;
+};
+
+PeriodicState & periodicState() noexcept {
+    static thread_local PeriodicState s;
+    return s;
+}
+
+/// Gate cache + parse env once at startup.
+bool periodicEnabledImpl() noexcept {
+    static const bool s_enabled =
+        std::getenv("NIX_V3_LIVE_TRACE_PERIODIC") != nullptr;
+    return s_enabled;
+}
+
+size_t periodicThresholdBytes() noexcept {
+    static const size_t s_thresholdBytes = [] {
+        const char * v = std::getenv("NIX_V3_LIVE_TRACE_PERIODIC");
+        long mb = 64;  // default
+        if (v && *v) {
+            long parsed = std::strtol(v, nullptr, 10);
+            // Clamp 1 MB ... 16 GB.  K=0 is meaningless (infinite samples);
+            // K=64 MB is the default.  K too large means few samples
+            // (the eval ends before crossing); user's risk.
+            if (parsed >= 1 && parsed <= 16384) mb = parsed;
+        }
+        return static_cast<size_t>(mb) << 20;
+    }();
+    return s_thresholdBytes;
+}
+
+const char * periodicOutPath() noexcept {
+    static const std::string s_outPath = [] {
+        const char * v = std::getenv("NIX_V3_LIVE_TRACE_PERIODIC_OUT");
+        if (v && *v) return std::string(v);
+        // Default: /tmp/v3-live-periodic-<pid>.csv
+        char buf[64];
+        std::snprintf(buf, sizeof(buf),
+            "/tmp/v3-live-periodic-%d.csv", static_cast<int>(getpid()));
+        return std::string(buf);
+    }();
+    return s_outPath.c_str();
+}
+
+} // namespace
+
+bool periodicLiveTraceEnabled() noexcept {
+    return periodicEnabledImpl();
+}
+
+void maybeSamplePeriodicLiveFraction(VMState & vm) noexcept
+{
+    if (!periodicEnabledImpl()) return;
+
+    auto & st = periodicState();
+
+    // Lazy-initialise eval-start clock on first call.
+    if (!st.evalStartSet) {
+        st.evalStart = std::chrono::steady_clock::now();
+        st.evalStartSet = true;
+        st.nextThresholdBytes = periodicThresholdBytes();
+    }
+
+    Arena & arena = threadArena();
+    const size_t curBytes = arena.bytesAllocated();
+    if (curBytes < st.nextThresholdBytes) return;
+
+    // Advance threshold defensively against shrinkage.  If arena grew
+    // past the threshold by less than K (typical), the next sample
+    // fires K MB later.  If arena overshot by more than K (catch-up
+    // case), we still advance by exactly K from the current bytes —
+    // so the next sample is at curBytes+K.  This guarantees forward
+    // progress without firing back-to-back samples.
+    const size_t K = periodicThresholdBytes();
+    st.nextThresholdBytes = std::max(curBytes + K, st.nextThresholdBytes + K);
+
+    // Wall time since eval start (ms).
+    const auto now = std::chrono::steady_clock::now();
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+        now - st.evalStart).count();
+
+    // Run the transitive live-walk (same machinery as dumpV3LiveFraction).
+    LiveTracer tr;
+    walkAllV3Roots(vm, tr);
+    tr.drain();
+
+    const size_t liveBytes =
+          tr.counts.bytesClosures + tr.counts.bytesThunks
+        + tr.counts.bytesBindings + tr.counts.bytesLists
+        + tr.counts.bytesPairs;
+
+    const auto & stats = allocStats();
+    const size_t cumulativeBytes =
+          stats.bytesClosures + stats.bytesThunks
+        + stats.bytesBindings + stats.bytesLists
+        + stats.bytesPairs;
+
+    PeriodicCsvRow row;
+    row.alloc_offset_mb = double(curBytes) / (1ULL << 20);
+    row.resident_mb     = double(curBytes) / (1ULL << 20);
+    row.live_mb         = double(liveBytes) / (1ULL << 20);
+    row.l_resident      = curBytes > 0
+        ? double(liveBytes) / double(curBytes) : 0.0;
+    row.l_cumulative    = cumulativeBytes > 0
+        ? double(liveBytes) / double(cumulativeBytes) : 0.0;
+    row.wall_ms         = wall_ms;
+
+    st.rows.push_back(row);
+}
+
+void flushPeriodicLiveTraceCsv() noexcept
+{
+    if (!periodicEnabledImpl()) return;
+    auto & st = periodicState();
+    if (st.rows.empty()) return;  // silent: many threads may flush with 0 rows
+
+    const char * outPath = periodicOutPath();
+
+    // Multi-runRootExpr / multi-thread coordination: each
+    // `runRootExpr` invocation flushes from its own thread_local state.
+    // To accumulate samples across all phases (primop-install passes +
+    // main eval) we APPEND to the CSV; the header is written exactly
+    // once across the process via a process-wide atomic flag.
+    static std::atomic<bool> s_headerWritten{false};
+    bool needsHeader = !s_headerWritten.exchange(true,
+        std::memory_order_acq_rel);
+    if (needsHeader) {
+        // Truncate file on first write so reruns start fresh.
+        std::FILE * trunc = std::fopen(outPath, "w");
+        if (trunc) {
+            std::fprintf(trunc,
+                "alloc_offset_mb,resident_mb,live_mb,"
+                "L_resident,L_cumulative,wall_ms\n");
+            std::fclose(trunc);
+        }
+    }
+
+    std::FILE * f = std::fopen(outPath, "a");
+    if (!f) {
+        std::fprintf(stderr,
+            "[v3-live-periodic] ERROR: cannot open output '%s' for append.\n",
+            outPath);
+        return;
+    }
+    for (const auto & r : st.rows) {
+        std::fprintf(f,
+            "%.2f,%.2f,%.2f,%.4f,%.4f,%.1f\n",
+            r.alloc_offset_mb, r.resident_mb, r.live_mb,
+            r.l_resident, r.l_cumulative, r.wall_ms);
+    }
+    std::fclose(f);
+
+    // Clear state so subsequent flushes on same thread don't duplicate.
+    const size_t nThisFlush = st.rows.size();
+    st.rows.clear();
+
+    // Only emit a banner from the flush with enough samples to be
+    // meaningful (≥2 — needed to compute min/max + variance).  Threads
+    // that crossed the threshold only once during a brief
+    // primop-install pass would otherwise spam the stderr.
+    if (nThisFlush < 2) return;
+
+    std::vector<double> Ls;
+    Ls.reserve(nThisFlush);
+    for (size_t i = 0; i < nThisFlush; ++i) {
+        // Banner re-reads from the file is overkill; reconstruct from
+        // the local rows BEFORE clear.  We cleared already, so the
+        // banner reports the count + path only.  Full distribution
+        // stats are in the CSV.
+    }
+    std::fprintf(stderr,
+        "\n"
+        "================= v3 LIVE-FRACTION PERIODIC =================\n"
+        "  CSV samples written this flush: %zu (appended)\n"
+        "  Output: %s\n"
+        "  (run `python3 -c 'import csv; ...'` on CSV for L distribution)\n"
+        "============================================================\n",
+        nThisFlush, outPath);
 }
 
 } // namespace nix::v3

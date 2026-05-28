@@ -54,6 +54,8 @@
 
 namespace nix::v3 {
 
+struct VMState;  // forward decl for maybeSamplePeriodicLiveFraction
+
 /// Called at end of run (between dumpAllV3Roots and the final stats
 /// flush in run.cc).  No-op unless `NIX_V3_LIVE_TRACE=1`.
 ///
@@ -79,5 +81,47 @@ void dumpV3LiveFraction() noexcept;
 ///
 /// No-op unless `NIX_V3_BLOCK_PROBE=1`.
 void dumpV3LiveBlockProbe() noexcept;
+
+// ----------------------------------------------------------------------
+// Periodic live-trace — L(t) time-series sampling.
+// ----------------------------------------------------------------------
+//
+// Step 4 of the post-Phase-3.8 plan (2026-05-29).  Per
+// `lode/L_MEASUREMENT_GAP_2026-05-28.md` §5: every "v3 has structurally
+// high L" claim rests on ONE end-of-eval sample.  This API adds a
+// time-series sample: walk the precise-root graph every K MB of
+// arena allocation, record L(t) per sample, write CSV at end.
+//
+// Each periodic sample IS a full transitive walk (same machinery as
+// dumpV3LiveFraction), so per-sample cost = O(reachable).  Gated
+// default-OFF: each enabled run pays ~5-15% wall overhead per the
+// L_MEASUREMENT_GAP §5.2 projection.
+//
+// Gate: NIX_V3_LIVE_TRACE_PERIODIC=<K>     (K in MB; default 64)
+//       NIX_V3_LIVE_TRACE_PERIODIC_OUT=<f> (CSV path; default
+//                                          /tmp/v3-live-periodic-<pid>.csv)
+//
+// Retirement criterion (per Rule 0 §2): delete the env-gate when
+// the L(t) measurement is integrated into the bench harness as a
+// default-OFF metric.  Removal tracked in the
+// L_TIME_SERIES_DATA_2026-05-29 follow-up doc + Step 5 in
+// post-Phase-3.8 plan.
+
+/// True if NIX_V3_LIVE_TRACE_PERIODIC is set (cached at startup).
+bool periodicLiveTraceEnabled() noexcept;
+
+/// Dispatch-loop safepoint hook.  No-op unless gate enabled.  If the
+/// arena's `bytesAllocated()` has crossed the next K-multiple since
+/// the last sample, walks the precise-root transitive closure and
+/// records one CSV row (alloc_offset_mb, resident_mb, live_mb,
+/// L_resident, L_cumulative, wall_ms).  Called from vm.cc at
+/// exitDepth==0 safepoints, next to the major-GC trigger.
+void maybeSamplePeriodicLiveFraction(VMState & vm) noexcept;
+
+/// End-of-run hook.  Writes accumulated CSV samples to
+/// NIX_V3_LIVE_TRACE_PERIODIC_OUT (or default path).  No-op unless
+/// gate enabled.  Called from run.cc after eval completes (alongside
+/// dumpV3LiveFraction).
+void flushPeriodicLiveTraceCsv() noexcept;
 
 } // namespace nix::v3
