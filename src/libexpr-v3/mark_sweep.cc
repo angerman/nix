@@ -147,6 +147,46 @@ public:
     const std::vector<BlockBitmap> & blockBitmaps() const noexcept
         { return blockBitmaps_; }
 
+    /// Phase 3 correctness: check whether ANY mark bit is set in the
+    /// byte range `[startOffset, endOffset)` within the block starting
+    /// at `blockBegin`.  Used by sweep to conservatively classify a
+    /// cell as ALIVE if any of its 16-byte slots was marked (which
+    /// includes interior slot-target marks from `visitSlot`).  This
+    /// covers the case where the owning container (e.g., a Bindings)
+    /// was reached ONLY via a Tag::Slot pointer to its entries[i]
+    /// interior — without this check sweep would treat the container
+    /// as dead and free it, dangling the slot.
+    bool anyMarkInRange(const char * blockBegin,
+                        size_t startOffset,
+                        size_t endOffset) const noexcept
+    {
+        const BlockBitmap * blk = findBlockConst(blockBegin);
+        if (!blk) return false;
+        const size_t startBit = startOffset / kAlign;
+        const size_t endBit   = (endOffset + kAlign - 1) / kAlign;
+        const size_t startWord = startBit / kBitsPerWord;
+        const size_t endWord   =
+            std::min<size_t>((endBit + kBitsPerWord - 1) / kBitsPerWord,
+                             blk->bits.size());
+        for (size_t w = startWord; w < endWord; ++w) {
+            uint64_t word = blk->bits[w];
+            if (word == 0) continue;
+            // Mask only bits within [startBit, endBit) of this word.
+            const size_t wStartBit = w * kBitsPerWord;
+            const size_t wEndBit   = (w + 1) * kBitsPerWord;
+            const size_t lo =
+                (startBit > wStartBit) ? (startBit - wStartBit) : 0;
+            const size_t hi =
+                (endBit < wEndBit) ? (endBit - wStartBit) : kBitsPerWord;
+            // Bits [lo, hi) within this word.
+            const uint64_t mask = (hi - lo >= kBitsPerWord)
+                ? uint64_t(-1)
+                : (((uint64_t(1) << (hi - lo)) - 1) << lo);
+            if (word & mask) return true;
+        }
+        return false;
+    }
+
 private:
     Arena &                  arena_;
     std::vector<BlockBitmap> blockBitmaps_;  // sorted by blockStart
@@ -371,9 +411,12 @@ struct SweepStats {
 /// order; for each cell, computes size from the distance to the next
 /// cell-start; checks the mark bitmap; classifies as live or dead.
 ///
-/// Phase 2 step 2: dead cells are counted but NOT yet freed (no
-/// free-list pop in allocator).  Phase 3 will wire the free list.
+/// Phase 3: dead cells are added to the per-exact-size free-list in
+/// the arena.  Their cell-start bits are cleared (they no longer
+/// represent live cells).  Subsequent allocations check the free
+/// list first; arena growth is capped at peak-live + slack.
 static void sweepOneBlock(
+    Arena &                       arena,
     const char *                  blockStart,
     size_t                        blockUsedBytes,
     const std::vector<uint64_t> & cellStartBits,
@@ -413,12 +456,22 @@ static void sweepOneBlock(
         const size_t cellSize = endOffset - offset;
         const void * cellAddr =
             static_cast<const void *>(blockStart + offset);
-        if (marker.isMarked(cellAddr)) {
+        // Phase 3 correctness: a cell is ALIVE if any mark bit in its
+        // byte range is set (covers Bindings reached only via a slot
+        // pointer into its entries[i]).  Strict cell-start check
+        // alone misses the owning container.
+        if (marker.anyMarkInRange(blockStart, offset, offset + cellSize)) {
             ++stats.liveCells;
             stats.liveBytes += cellSize;
         } else {
             ++stats.deadCells;
             stats.deadBytes += cellSize;
+            // Phase 3: route dead cell to the per-exact-size free
+            // list and clear its cell-start bit.  Subsequent allocs
+            // of this size will reuse the freed slot.
+            arena.freeListAdd(
+                const_cast<void *>(cellAddr), cellSize);
+            arena.clearCellStartBitFor(cellAddr);
         }
     }
 }
@@ -456,6 +509,7 @@ void runMajorMarkSweep(VMState & vm) noexcept
         const size_t usedBytes =
             static_cast<size_t>(r.end - r.begin);
         sweepOneBlock(
+            arena,
             r.begin,
             usedBytes,
             cellStarts[regularBlockIdx],
@@ -494,7 +548,8 @@ void runMajorMarkSweep(VMState & vm) noexcept
             markMs, sweepMs);
         std::fprintf(stderr,
             "v3 sweep: blocksScanned=%zu liveCells=%zu deadCells=%zu "
-            "liveBytes=%.1fMB deadBytes=%.1fMB reclaim%%=%.1f%%\n",
+            "liveBytes=%.1fMB deadBytes=%.1fMB reclaim%%=%.1f%% "
+            "freelist_entries=%zu\n",
             sweep.blocksScanned,
             sweep.liveCells, sweep.deadCells,
             sweep.liveBytes / 1e6,
@@ -502,7 +557,8 @@ void runMajorMarkSweep(VMState & vm) noexcept
             (sweep.liveBytes + sweep.deadBytes) > 0
                 ? 100.0 * double(sweep.deadBytes)
                           / double(sweep.liveBytes + sweep.deadBytes)
-                : 0.0);
+                : 0.0,
+            arena.freeListEntryCount());
     }
 }
 

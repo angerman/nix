@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 #include <new>
 
@@ -703,11 +704,34 @@ public:
             }
             return blk;
         }
+        // Stage 6 Phase 3: free-list reuse.  Opt-in via
+        // V3_DBG_FREELIST_REUSE=1 because mark phase does NOT scan
+        // the C-stack — primop bodies' local Value/cell pointers are
+        // invisible to mark, so cells reused via the free list MAY
+        // dangle a C-local that still references the previous
+        // occupant.  HNE crashes with SIGBUS under reuse-on due to
+        // this gap; hello.drvPath does not (smaller workload, fewer
+        // primop-mid-flight states).
+        //
+        // Reuse-correct path requires either:
+        //   * C-stack conservative scan (Boehm-style; ~1-2 d)
+        //   * Stricter trigger (only at outermost OP_RETURN; ~0.5 d)
+        // Deferred to a follow-up commit; opt-in gate preserves the
+        // mechanism for measurement.
+        static const bool s_reuseOn =
+            std::getenv("V3_DBG_FREELIST_REUSE") != nullptr;
+        if (__builtin_expect(majorGcEnabled() && s_reuseOn, 0)) {
+            if (void * p = freeListTryPop(bytes)) {
+                // free-list pop re-sets the cell-start bit
+                // internally; no further bookkeeping needed.
+                return p;
+            }
+        }
         if (active_.cur + bytes > active_.end) refill();
         void * p = active_.cur;
         active_.cur += bytes;
         // Stage 6 Phase 2: record cell-start bit for sweep.  Gated on
-        // s_majorGcEnabled (cached at startup); zero cost when gate
+        // majorGcEnabled() (cached at startup); zero cost when gate
         // OFF.  Hot path: branch is well-predicted (single fixed bool
         // per process).
         if (__builtin_expect(majorGcEnabled(), 0)) {
@@ -758,6 +782,62 @@ public:
     /// Stage 6 Phase 2: accessor for sweep to enumerate cell starts.
     const std::vector<std::vector<uint64_t>> & cellStartBitmaps() const noexcept
         { return active_.cellStarts; }
+
+    /// Stage 6 Phase 3: per-exact-size free list, populated by sweep
+    /// + popped by `alloc()` slow path.  Keyed by exact byte size
+    /// (16-byte-aligned) — sweep records the precise size of each
+    /// dead cell (computed from cell-start bitmap gaps); allocator
+    /// looks up by request size for exact-fit reuse.
+    ///
+    /// Bytes added to the free list stay PHYSICALLY in their original
+    /// arena block.  Reuse pops a `void *` and the alloc returns it
+    /// (re-setting the cell-start bit at that offset).  No block
+    /// freeing happens here — the arena's totalBytes counter stays
+    /// the same; what changes is that future allocs draw from the
+    /// free list instead of bumping cur forward.
+    ///
+    /// Lifetime: persistent across GC cycles.  Each sweep adds dead
+    /// cells; each alloc that hits the free list removes them.
+    void freeListAdd(void * p, size_t bytes) noexcept
+    {
+        freeListBins_[bytes].push_back(p);
+        ++freeListEntries_;
+    }
+    void * freeListTryPop(size_t bytes) noexcept
+    {
+        auto it = freeListBins_.find(bytes);
+        if (it == freeListBins_.end() || it->second.empty()) return nullptr;
+        void * p = it->second.back();
+        it->second.pop_back();
+        --freeListEntries_;
+        // Re-set the cell-start bit at this address (sweep cleared
+        // it when adding to free list).  Slow path: linear-scan
+        // blocks to find owner.  Only called on free-list pop,
+        // which is rare relative to bump-allocations.
+        setCellStartBitFor(p);
+        return p;
+    }
+    size_t freeListEntryCount() const noexcept { return freeListEntries_; }
+
+    /// Stage 6 Phase 3: sweep helper — clear a cell-start bit (when
+    /// a dead cell is added to the free list, the slot is no longer
+    /// a cell-start until reused).
+    void clearCellStartBitFor(const void * p) noexcept
+    {
+        if (!p) return;
+        const char * cp = static_cast<const char *>(p);
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            const char * blk = active_.blocks[i];
+            if (cp >= blk && cp < blk + kBlockSize) {
+                const size_t offset = static_cast<size_t>(cp - blk);
+                const size_t bit  = offset >> 4;
+                const size_t word = bit >> 6;
+                if (word < active_.cellStarts[i].size())
+                    active_.cellStarts[i][word] &= ~(1ULL << (bit & 63));
+                return;
+            }
+        }
+    }
 
     /// Total bytes pinned by all blocks the arena has ever
     /// allocated.  Cheap to read; useful for the alloc-stats dump.
@@ -837,6 +917,31 @@ private:
     /// Stage 6 Day 1: active region — the only region used by
     /// alloc()/refill()/blockRanges() in current single-region mode.
     Region active_;
+
+    /// Stage 6 Phase 3: free-list bins keyed by exact (16-byte-
+    /// aligned) byte size.  Populated by sweep; popped by
+    /// alloc()'s slow path.  Lifetime: persistent across GC cycles.
+    std::unordered_map<size_t, std::vector<void *>> freeListBins_;
+    size_t freeListEntries_ = 0;
+
+    /// Slow-path helper used on free-list pop to re-set the cell-
+    /// start bit at `p`'s offset.
+    void setCellStartBitFor(const void * p) noexcept
+    {
+        if (!p) return;
+        const char * cp = static_cast<const char *>(p);
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            const char * blk = active_.blocks[i];
+            if (cp >= blk && cp < blk + kBlockSize) {
+                const size_t offset = static_cast<size_t>(cp - blk);
+                const size_t bit  = offset >> 4;
+                const size_t word = bit >> 6;
+                if (word < active_.cellStarts[i].size())
+                    active_.cellStarts[i][word] |= 1ULL << (bit & 63);
+                return;
+            }
+        }
+    }
 
     void refill() noexcept
     {
