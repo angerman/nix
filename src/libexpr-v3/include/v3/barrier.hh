@@ -90,6 +90,12 @@ std::vector<DirtyEntry> & dirtyContainers() noexcept;
 /// drain.
 std::vector<Value *> & standaloneCellRoots() noexcept;
 
+/// Stage 6 Phase 3.7: registry of LambdaDescriptor::cachedSingletonClosure
+/// pointers (libc-resident locations holding arena Closure pointers).
+/// Mark phase walks this to keep cached singleton closures alive
+/// across arena sweeps.
+std::vector<Closure **> & singletonClosureRegistry() noexcept;
+
 // ---------------------------------------------------------------------------
 // Fast-path gate
 // ---------------------------------------------------------------------------

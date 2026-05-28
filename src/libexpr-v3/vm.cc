@@ -3487,6 +3487,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // lowerer to be with-independent.
                 c->capturedWiths = nullptr;
                 desc.cachedSingletonClosure = c;
+                // Phase 3.7 (2026-05-28): register the cached pointer
+                // so v3 mark phase keeps the closure alive across
+                // arena sweeps.  Without this, the libc-resident
+                // LambdaDescriptor field is invisible to the v3
+                // walker; the closure gets freed; the next call to
+                // this lambda reads a stale cached pointer → SIGSEGV.
+                singletonClosureRegistry().push_back(&desc.cachedSingletonClosure);
 
                 static const bool s_dbg =
                     std::getenv("V3_DBG_LAMBDA_LIFT") != nullptr;

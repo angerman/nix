@@ -39,6 +39,15 @@ thread_local std::vector<DirtyEntry> tl_dirty;
 
 thread_local std::vector<Value *> tl_standaloneCells;
 
+/// Stage 6 Phase 3.7 (2026-05-28): registry of lifted-singleton Closure
+/// pointers cached on libc-resident LambdaDescriptors.  Each entry is
+/// the ADDRESS of a `LambdaDescriptor::cachedSingletonClosure` field;
+/// mark walks each address to keep the cached closure alive across
+/// arena sweeps.  Without this, the closure is freed (mark doesn't
+/// see the libc→arena pointer) and the next OP_MAKE_CLOSURE call to
+/// the same lambda reads a stale cached pointer.
+thread_local std::vector<Closure **> tl_singletonClosureRegistry;
+
 } // anonymous
 
 std::vector<DirtyEntry> & dirtyContainers() noexcept
@@ -49,6 +58,11 @@ std::vector<DirtyEntry> & dirtyContainers() noexcept
 std::vector<Value *> & standaloneCellRoots() noexcept
 {
     return tl_standaloneCells;
+}
+
+std::vector<Closure **> & singletonClosureRegistry() noexcept
+{
+    return tl_singletonClosureRegistry;
 }
 
 // #767 (2026-05-22): exposed as a namespace-scope `const bool` so

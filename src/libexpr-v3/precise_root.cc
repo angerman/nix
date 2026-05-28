@@ -101,6 +101,18 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
         if (cell) visitor.visitValue(*cell);
     }
 
+    // -- Singleton closure registry (Phase 3.7, 2026-05-28) ---------
+    // Each entry is the address of a LambdaDescriptor::
+    // cachedSingletonClosure field (libc-resident slot holding an
+    // arena Closure pointer).  Mark walks each slot so the cached
+    // closure survives Phase 3 mark+sweep cycles.  Without this, the
+    // libc→arena cross-boundary pointer is invisible to the walker;
+    // the closure gets swept; subsequent lambda calls dereference a
+    // stale cached pointer.
+    for (Closure ** slot : singletonClosureRegistry()) {
+        if (slot && *slot) visitor.visitClosure(*slot);
+    }
+
     // -- FFI bridge tables (Stage 3 sub-source 6) -------------------
     // v3BridgeClosures / v3BridgeAttrs / v3BridgeLists hold v3 Value
     // handles that TW indexes into via the bridge primops.  Each
