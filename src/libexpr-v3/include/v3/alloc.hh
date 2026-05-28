@@ -589,6 +589,13 @@ namespace detail {
 inline const bool g_freeListStatsEnabled =
     std::getenv("NIX_V3_FREE_LIST_STATS") != nullptr;
 
+/// Step 18 (2026-05-29) — per-allocChars-site attribution.
+/// Gate: NIX_V3_STRINGS_ATTR=1
+/// Retirement (per Rule 0): "Delete when string dedup decision
+/// commits in lode/STRING_DEDUP_DECISION_*.md".
+inline const bool g_stringsAttrEnabled =
+    std::getenv("NIX_V3_STRINGS_ATTR") != nullptr;
+
 } // namespace detail
 
 struct FreeListStats
@@ -625,6 +632,57 @@ inline FreeListStats & freeListStats()
 {
     static FreeListStats stats;
     return stats;
+}
+
+// ---------------------------------------------------------------------------
+// AllocChars site attribution (Step 18, 2026-05-29).
+//
+// Per-call-site count + bytes for `Alloc::allocChars`.  Mirrors T1.3
+// #746 origin tables but for character buffers (Tag::String / Tag::Path
+// payloads).  Gate-guarded; zero cost when OFF.
+//
+// Pre-committed thresholds (per `STRING_DEDUP_AUDIT_2026-05-28.md`):
+// total dedup-able-bytes (estimated downstream after duplication scan):
+//   <  50 MB → no lever
+//    50-100 → marginal
+//   100-200 → moderate
+//   > 200   → significant
+//
+// THIS spike provides per-site attribution only.  Duplication-rate
+// estimate is a follow-on (would require hashing every allocChars
+// content; defer until per-site data justifies).
+// ---------------------------------------------------------------------------
+
+struct AllocCharsSite
+{
+    const char * file = nullptr;  // pointer into program rodata (stable)
+    uint32_t     line = 0;
+    uint64_t     count = 0;        // # calls from this site
+    uint64_t     bytes = 0;        // sum of n across all calls
+};
+
+inline std::vector<AllocCharsSite> & allocCharsSites()
+{
+    static std::vector<AllocCharsSite> sites;
+    return sites;
+}
+
+inline void recordAllocCharsSite(const char * file,
+                                  uint32_t     line,
+                                  size_t       n) noexcept
+{
+    auto & sites = allocCharsSites();
+    // Linear search keyed by (file, line).  N call sites in v3 is
+    // small (currently ~18 per grep); linear is faster than a hash
+    // map at this scale.  When this grows past ~50, swap to unordered_map.
+    for (auto & s : sites) {
+        if (s.file == file && s.line == line) {
+            ++s.count;
+            s.bytes += n;
+            return;
+        }
+    }
+    sites.push_back({file, line, 1, n});
 }
 
 /// Map a byte size to its log2-bin.  bin 0 covers [16, 32); each bin
@@ -1589,9 +1647,19 @@ struct Alloc
     /// Caller is responsible for null-terminating if a C string is
     /// expected (the caller already does buf[n] = '\0' in every
     /// existing call site -- this helper just replaces the std::malloc).
-    static char * allocChars(size_t n) noexcept
+    /// Step 18 of post-Phase-3.8 plan (2026-05-29): per-call-site
+    /// attribution.  Defaulted file/line via __builtin_FILE/__builtin_LINE
+    /// — zero cost when gate OFF (compile-time constants discarded).
+    /// Mirrors the T1.3 #746 pattern used for Bindings origin.
+    static char * allocChars(size_t n,
+                             const char * file = __builtin_FILE(),
+                             uint32_t     line = __builtin_LINE()) noexcept
     {
         V3_STATS_BUMP(bytesChars, n);
+        // Per-call-site attribution when NIX_V3_STRINGS_ATTR=1.
+        if (__builtin_expect(detail::g_stringsAttrEnabled, 0)) {
+            recordAllocCharsSite(file, line, n);
+        }
         return static_cast<char *>(threadArena().alloc(n));
     }
 

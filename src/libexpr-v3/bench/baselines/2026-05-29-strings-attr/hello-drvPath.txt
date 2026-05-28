@@ -1,0 +1,25 @@
+    na 2-4      = 2780
+    na 5-8      = 1628
+    na 9-16     = 1357
+    na 17-32    = 1858
+    na 33-64    = 5237
+    na 65-128   = 1224
+    na 129-256  = 224
+    na 257+     = 4904
+  (UPDATE_TAIL nb histogram, total=20943):
+    nb 0        = 1866
+    nb 1        = 7715
+    nb 2-4      = 5224
+    nb 5-8      = 2570
+    nb 9-16     = 1008
+    nb 17-32    = 1598
+    nb 33-64    = 584
+    nb 65-128   = 147
+--
+v3-direct allocChars site attribution (Step 18, NIX_V3_STRINGS_ATTR=1):
+  total: 390398 calls / 7.23 MB across 3 unique sites
+  rank  file:line                                          calls       MB    %cum
+    1   ../src/libexpr-v3/primops.cc                    :608       375052     4.90   67.8%
+    2   ../src/libexpr-v3/vm.cc                         :9769       15343     2.33  100.0%
+    3   ../src/libexpr-v3/primops.cc                    :2721           3     0.00  100.0%
+"/nix/store/r77jznkw60xvqjzs3jvd1dn54pxcqs68-hello-2.12.3.drv"

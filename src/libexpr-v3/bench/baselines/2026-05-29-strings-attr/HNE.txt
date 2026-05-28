@@ -1,0 +1,25 @@
+  (UPDATE_TAIL na histogram, total=104521):
+    na 0        = 4626
+    na 1        = 3566
+    na 2-4      = 31116
+    na 5-8      = 20116
+    na 9-16     = 10462
+    na 17-32    = 8337
+    na 33-64    = 23249
+    na 65-128   = 1785
+    na 129-256  = 225
+    na 257+     = 1039
+  (UPDATE_TAIL nb histogram, total=104521):
+    nb 0        = 12949
+--
+v3-direct allocChars site attribution (Step 18, NIX_V3_STRINGS_ATTR=1):
+  total: 1525580 calls / 35.53 MB across 7 unique sites
+  rank  file:line                                          calls       MB    %cum
+    1   ../src/libexpr-v3/primops.cc                    :608      1473112    25.32   71.3%
+    2   ../src/libexpr-v3/vm.cc                         :9769       52340    10.18   99.9%
+    3   ../src/libexpr-v3/v3_call_flake.cc              :385            1     0.03  100.0%
+    4   ../src/libexpr-v3/primops.cc                    :2721         111     0.00  100.0%
+    5   ../src/libexpr-v3/v3_call_flake.cc              :225            8     0.00  100.0%
+    6   ../src/libexpr-v3/value_serialize.cc            :344            6     0.00  100.0%
+    7   ../src/libexpr-v3/v3_call_flake.cc              :433            2     0.00  100.0%
+"/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"

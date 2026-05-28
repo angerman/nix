@@ -1279,6 +1279,48 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             std::fprintf(stderr,
                 "  ----- free-list verdict: %s\n", verdict);
         }
+        // Step 18 of post-Phase-3.8 plan (2026-05-29): per-site
+        // allocChars attribution dump.  Only emitted under
+        // NIX_V3_STRINGS_ATTR=1.
+        if (std::getenv("NIX_V3_STRINGS_ATTR") != nullptr) {
+            auto & sites = allocCharsSites();
+            // Sort by bytes descending.
+            std::sort(sites.begin(), sites.end(),
+                [](const AllocCharsSite & a, const AllocCharsSite & b) {
+                    return a.bytes > b.bytes;
+                });
+            uint64_t totalCalls = 0, totalBytes = 0;
+            for (const auto & s : sites) {
+                totalCalls += s.count;
+                totalBytes += s.bytes;
+            }
+            std::fprintf(stderr,
+                "v3-direct allocChars site attribution (Step 18, "
+                "NIX_V3_STRINGS_ATTR=1):\n"
+                "  total: %llu calls / %.2f MB across %zu unique sites\n"
+                "  rank  file:line                                          "
+                "calls       MB    %%cum\n",
+                (unsigned long long)totalCalls,
+                double(totalBytes) / (1ULL << 20),
+                sites.size());
+            uint64_t cumBytes = 0;
+            for (size_t i = 0; i < sites.size() && i < 20; ++i) {
+                const auto & s = sites[i];
+                cumBytes += s.bytes;
+                const double cumPct = totalBytes > 0
+                    ? 100.0 * double(cumBytes) / double(totalBytes) : 0.0;
+                // Truncate file to last 48 chars for readability.
+                const char * f = s.file ? s.file : "?";
+                const size_t flen = std::strlen(f);
+                const char * fshort = flen > 48 ? (f + flen - 48) : f;
+                std::fprintf(stderr,
+                    "  %3zu   %-48s:%-5u %10llu  %7.2f  %5.1f%%\n",
+                    i + 1, fshort, s.line,
+                    (unsigned long long)s.count,
+                    double(s.bytes) / (1ULL << 20),
+                    cumPct);
+            }
+        }
     }
     return out;
 }
