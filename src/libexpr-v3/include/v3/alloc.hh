@@ -594,9 +594,24 @@ inline bool arenaNorootEnabledImpl() noexcept
     return detail::arenaNorootEnabledImpl();
 }
 
+namespace detail {
+/// Stage 6 Phase 2: cache `NIX_V3_MAJOR_GC=1` gate.  Read once at
+/// startup; thereafter a cached `static const bool`.  Allocator's
+/// cell-start bookkeeping is conditional on this; when gate OFF,
+/// no bitmap memory + no per-alloc branch overhead beyond the
+/// well-predicted single read.
+inline const bool g_majorGcEnabled =
+    std::getenv("NIX_V3_MAJOR_GC") != nullptr;
+} // namespace detail
+
 class Arena
 {
 public:
+    /// Cached env-gate accessor (alloc-hot-path friendly).  Reads
+    /// the `static const bool` initialised at startup; the call
+    /// inlines to a load + branch that the predictor optimises away.
+    static bool majorGcEnabled() noexcept { return detail::g_majorGcEnabled; }
+
     /// 16 MB blocks: each block holds many thousands of typical
     /// allocations and a long-running eval doesn't accumulate too
     /// many block tails.  The 16 MB choice (audit §2.7 correction
@@ -633,6 +648,20 @@ public:
         /// Oversized allocations (> kHugeCutoff), tracked separately.
         std::vector<HugeBlock> hugeBlocks;
         size_t  totalBytes = 0;
+        /// Stage 6 Phase 2 (2026-05-28): per-block cell-start bitmap.
+        /// Parallel to `blocks` (cellStarts[i] is the bitmap for
+        /// blocks[i]).  One bit per 16-byte slot of the block; bit
+        /// set means "a cell starts here" (set by `alloc()` on every
+        /// allocation).
+        ///
+        /// Used by the flat MS sweep (mark_sweep.cc) to enumerate
+        /// cell starts in address order; cell SIZE inferred from the
+        /// distance to the next set bit (or block end).
+        ///
+        /// Maintained only when `NIX_V3_MAJOR_GC=1` (cached at startup
+        /// via Arena::s_majorGcEnabled).  Cost when gate OFF: zero
+        /// memory, single branch in alloc().
+        std::vector<std::vector<uint64_t>> cellStarts;
     };
 
     void * alloc(size_t bytes) noexcept
@@ -677,8 +706,58 @@ public:
         if (active_.cur + bytes > active_.end) refill();
         void * p = active_.cur;
         active_.cur += bytes;
+        // Stage 6 Phase 2: record cell-start bit for sweep.  Gated on
+        // s_majorGcEnabled (cached at startup); zero cost when gate
+        // OFF.  Hot path: branch is well-predicted (single fixed bool
+        // per process).
+        if (__builtin_expect(majorGcEnabled(), 0)) {
+            const size_t offset = static_cast<size_t>(
+                static_cast<char *>(p) - active_.blocks.back());
+            const size_t bit  = offset >> 4;           // /16
+            const size_t word = bit >> 6;              // /64
+            active_.cellStarts.back()[word] |=
+                1ULL << (bit & 63);
+        }
         return p;
     }
+
+    /// Stage 6 Phase 2: query whether `p` is a recorded cell-start.
+    /// Used by mark phase to distinguish slot targets that are
+    /// standalone cells (need marking) from slot targets that point
+    /// INSIDE a larger container like a Bindings entry (don't mark;
+    /// the container's mark covers them).
+    ///
+    /// Returns false if `p` is null, not in active arena, or no
+    /// cell-start bit is set there (in which case `p` is either
+    /// interior of a larger cell, or the gate was OFF when the cell
+    /// was allocated).
+    bool isCellStart(const void * p) const noexcept
+    {
+        if (!majorGcEnabled()) return false;
+        if (!p) return false;
+        const char * cp = static_cast<const char *>(p);
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            const char * blk = active_.blocks[i];
+            if (cp >= blk && cp < blk + kBlockSize) {
+                const size_t offset = static_cast<size_t>(cp - blk);
+                if ((offset & 15) != 0) return false;  // not aligned
+                const size_t bit  = offset >> 4;
+                const size_t word = bit >> 6;
+                if (word >= active_.cellStarts[i].size()) return false;
+                return (active_.cellStarts[i][word]
+                        & (1ULL << (bit & 63))) != 0;
+            }
+        }
+        // Huge blocks: each is one allocation starting at .begin.
+        for (const auto & h : active_.hugeBlocks) {
+            if (cp == h.begin) return true;
+        }
+        return false;
+    }
+
+    /// Stage 6 Phase 2: accessor for sweep to enumerate cell starts.
+    const std::vector<std::vector<uint64_t>> & cellStartBitmaps() const noexcept
+        { return active_.cellStarts; }
 
     /// Total bytes pinned by all blocks the arena has ever
     /// allocated.  Cheap to read; useful for the alloc-stats dump.
@@ -773,6 +852,13 @@ private:
         active_.cur = blk;
         active_.end = blk + kBlockSize;
         active_.totalBytes += kBlockSize;
+        // Stage 6 Phase 2: extend cell-start bitmap if major-GC gate
+        // is on.  Per-block bitmap = (kBlockSize / 16 / 64) uint64s
+        // = 16384 words = 128 KB per 16 MB block.
+        if (majorGcEnabled()) {
+            active_.cellStarts.emplace_back(
+                kBlockSize / 16 / 64, 0ULL);
+        }
 #if NIX_USE_BOEHMGC
         // WC-13: tell Boehm to scan this block for pointers to GC
         // memory.  Bridge thunks store raw `nix::Value *`; without

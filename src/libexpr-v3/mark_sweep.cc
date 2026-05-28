@@ -357,6 +357,72 @@ private:
 
 } // namespace
 
+/// Stage 6 Phase 2: sweep stats.  Computed by the sweep loop;
+/// reported under NIX_VM_STATS=1.
+struct SweepStats {
+    size_t deadCells     = 0;
+    size_t liveCells     = 0;
+    size_t deadBytes     = 0;
+    size_t liveBytes     = 0;
+    size_t blocksScanned = 0;
+};
+
+/// Sweep one arena block.  Walks the cell-start bitmap in address
+/// order; for each cell, computes size from the distance to the next
+/// cell-start; checks the mark bitmap; classifies as live or dead.
+///
+/// Phase 2 step 2: dead cells are counted but NOT yet freed (no
+/// free-list pop in allocator).  Phase 3 will wire the free list.
+static void sweepOneBlock(
+    const char *                  blockStart,
+    size_t                        blockUsedBytes,
+    const std::vector<uint64_t> & cellStartBits,
+    const BitmapMarker &          marker,
+    SweepStats &                  stats) noexcept
+{
+    // Collect cell-start offsets in this block, in address order.
+    // Pre-allocate to avoid per-cell std::vector growth.
+    std::vector<size_t> starts;
+    starts.reserve(blockUsedBytes / 32);  // rough estimate
+    const size_t maxWord =
+        std::min(cellStartBits.size(),
+                 (blockUsedBytes + kBytesPerWord - 1) / kBytesPerWord);
+    for (size_t w = 0; w < maxWord; ++w) {
+        uint64_t bits = cellStartBits[w];
+        while (bits) {
+            // count trailing zeros of bits → bit index within word
+            const int b = __builtin_ctzll(bits);
+            const size_t offset =
+                (w * kBitsPerWord + size_t(b)) * kAlign;
+            if (offset < blockUsedBytes)
+                starts.push_back(offset);
+            bits &= bits - 1;  // clear lowest set bit
+        }
+    }
+
+    if (starts.empty()) return;  // no allocations in this block
+
+    // Walk consecutive starts; size = next.offset - this.offset.
+    // Last cell extends to blockUsedBytes.
+    ++stats.blocksScanned;
+    for (size_t i = 0; i < starts.size(); ++i) {
+        const size_t offset    = starts[i];
+        const size_t endOffset = (i + 1 < starts.size())
+            ? starts[i + 1]
+            : blockUsedBytes;
+        const size_t cellSize = endOffset - offset;
+        const void * cellAddr =
+            static_cast<const void *>(blockStart + offset);
+        if (marker.isMarked(cellAddr)) {
+            ++stats.liveCells;
+            stats.liveBytes += cellSize;
+        } else {
+            ++stats.deadCells;
+            stats.deadBytes += cellSize;
+        }
+    }
+}
+
 void runMajorMarkSweep(VMState & vm) noexcept
 {
     using clock = std::chrono::steady_clock;
@@ -364,24 +430,52 @@ void runMajorMarkSweep(VMState & vm) noexcept
 
     Arena & arena = threadArena();
 
-    // Phase 1: mark.
+    // -- Phase 1: mark ----------------------------------------------
     BitmapMarker marker(arena);
     MarkVisitor visitor(marker);
     walkAllV3Roots(vm, visitor);
     visitor.drain();
 
     const auto tMarkEnd = clock::now();
+
+    // -- Phase 2 step 2: sweep (measurement-only; no free yet) ------
+    SweepStats sweep;
+    const auto & cellStarts = arena.cellStartBitmaps();
+    const auto ranges = arena.blockRanges();
+
+    // Filter regular blocks (skip huge); compute per-block used-bytes.
+    size_t regularBlockIdx = 0;
+    for (const auto & r : ranges) {
+        const size_t rangeBytes =
+            static_cast<size_t>(r.end - r.begin);
+        if (rangeBytes != Arena::kBlockSize) continue;  // huge
+        if (regularBlockIdx >= cellStarts.size()) break;
+        // blockUsedBytes: for the LAST block (current bump cursor),
+        // we sweep up to the current bump; for older blocks, up to
+        // kBlockSize.  `r.end` from blockRanges already encodes this.
+        const size_t usedBytes =
+            static_cast<size_t>(r.end - r.begin);
+        sweepOneBlock(
+            r.begin,
+            usedBytes,
+            cellStarts[regularBlockIdx],
+            marker,
+            sweep);
+        ++regularBlockIdx;
+    }
+
+    const auto tSweepEnd = clock::now();
     const double markMs =
         std::chrono::duration<double, std::milli>(tMarkEnd - tStart)
             .count();
+    const double sweepMs =
+        std::chrono::duration<double, std::milli>(tSweepEnd - tMarkEnd)
+            .count();
 
-    // Phase 2 (TODO): sweep + populate free lists.
-    // Phase 3 (TODO): allocator slow path uses free lists.
-    //
-    // For now the bitmap is computed but cells are NOT freed.  This
-    // commit's GC is a no-op from the workload's perspective (no
-    // behaviour change); only the mark statistics are observable
-    // under NIX_VM_STATS=1.
+    // Phase 3 (TODO): allocator slow path uses the free lists computed
+    // here.  Phase 2 step 2 only MEASURES; cells are not actually
+    // returned to free lists or the OS.  Workload behaviour under
+    // gate-ON is identical to gate-OFF.
 
     static const bool s_stats = std::getenv("NIX_VM_STATS") != nullptr;
     if (s_stats) {
@@ -389,7 +483,7 @@ void runMajorMarkSweep(VMState & vm) noexcept
             "v3 major-mark-sweep: closures=%zu thunks=%zu bindings=%zu "
             "lists=%zu pairs=%zu cells=%zu chars=%zu "
             "markedCells=%zu blocks=%zu hugeMarked=%zu "
-            "markMs=%.2f\n",
+            "markMs=%.2f sweepMs=%.2f\n",
             visitor.statsClosures(), visitor.statsThunks(),
             visitor.statsBindings(), visitor.statsLists(),
             visitor.statsPairs(), visitor.statsCells(),
@@ -397,7 +491,18 @@ void runMajorMarkSweep(VMState & vm) noexcept
             marker.markedCells(),
             marker.blocksCovered(),
             marker.hugeBlocksMarked(),
-            markMs);
+            markMs, sweepMs);
+        std::fprintf(stderr,
+            "v3 sweep: blocksScanned=%zu liveCells=%zu deadCells=%zu "
+            "liveBytes=%.1fMB deadBytes=%.1fMB reclaim%%=%.1f%%\n",
+            sweep.blocksScanned,
+            sweep.liveCells, sweep.deadCells,
+            sweep.liveBytes / 1e6,
+            sweep.deadBytes / 1e6,
+            (sweep.liveBytes + sweep.deadBytes) > 0
+                ? 100.0 * double(sweep.deadBytes)
+                          / double(sweep.liveBytes + sweep.deadBytes)
+                : 0.0);
     }
 }
 
