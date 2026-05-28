@@ -1,0 +1,80 @@
+Huge blocks (oversized allocations):
+  total-bytes        1.3 MB
+  live-bytes         0.0 MB  (live fraction = 0.0%)
+
+VERDICT (pre-committed threshold: >=30% sweepable):
+  measured: 2.9% sweepable -> FAIL: blocks too uniformly populated; reconsider design
+============================================================
+
+=== Immix line-occupancy probe @ line_size=64 B ===
+  blocks            34 (block_size=16 MB)
+  total lines       8912896 (= 570.4 MB)
+  pinned (live)     4745050 lines  (= 303.7 MB)
+  fully-dead        4167846 lines  (= 46.8% of lines, 266.7 MB)
+  bump-realloc-recoverable: 46.8% of arena bytes
+  blocks all-dead=13 mostly-dead=3 mixed=0 mostly-live=9 all-live=9
+  VERDICT (>=30% lines dead -> Immix viable):
+    PASS: Immix bump-realloc worth the +2 KLoC complexity
+  (huge blocks: 1.3 MB total, 0.0 MB live)
+
+=== Immix line-occupancy probe @ line_size=128 B ===
+  blocks            34 (block_size=16 MB)
+  total lines       4456448 (= 570.4 MB)
+  pinned (live)     2384443 lines  (= 305.2 MB)
+  fully-dead        2072005 lines  (= 46.5% of lines, 265.2 MB)
+  bump-realloc-recoverable: 46.5% of arena bytes
+  blocks all-dead=13 mostly-dead=3 mixed=0 mostly-live=5 all-live=13
+  VERDICT (>=30% lines dead -> Immix viable):
+    PASS: Immix bump-realloc worth the +2 KLoC complexity
+  (huge blocks: 1.3 MB total, 0.0 MB live)
+
+=== Immix line-occupancy probe @ line_size=256 B ===
+  blocks            34 (block_size=16 MB)
+  total lines       2228224 (= 570.4 MB)
+  pinned (live)     1197645 lines  (= 306.6 MB)
+  fully-dead        1030579 lines  (= 46.3% of lines, 263.8 MB)
+  bump-realloc-recoverable: 46.3% of arena bytes
+  blocks all-dead=13 mostly-dead=3 mixed=0 mostly-live=3 all-live=15
+  VERDICT (>=30% lines dead -> Immix viable):
+    PASS: Immix bump-realloc worth the +2 KLoC complexity
+  (huge blocks: 1.3 MB total, 0.0 MB live)
+
+=== Immix line-occupancy probe @ line_size=512 B ===
+  blocks            34 (block_size=16 MB)
+  total lines       1114112 (= 570.4 MB)
+  pinned (live)     601051 lines  (= 307.7 MB)
+  fully-dead        513061 lines  (= 46.1% of lines, 262.7 MB)
+  bump-realloc-recoverable: 46.1% of arena bytes
+  blocks all-dead=12 mostly-dead=3 mixed=1 mostly-live=2 all-live=16
+  VERDICT (>=30% lines dead -> Immix viable):
+    PASS: Immix bump-realloc worth the +2 KLoC complexity
+  (huge blocks: 1.3 MB total, 0.0 MB live)
+
+=== Mark+sweep cost projection ===
+  mark wall (this drain): 266.42 ms
+  live bytes processed:   301.5 MB
+  mark cost / live byte:  0.884 ns
+  projected sweep wall:   266.42 ms (O(N_live) walk)
+  per-cycle total:        532.84 ms
+
+  At default trigger cadence (arena 256 MB -> reclaim live):
+  if eval runs 10 cycles, sweep budget = 5328 ms
+  if eval runs 50 cycles, sweep budget = 26642 ms
+
+[alloc-site probe: origin tables empty -- need
+ NIX_V3_BINDINGS_ORIGIN=1 + NIX_V3_THUNKS_ATTR=1 to
+ populate them at allocation time]
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3 primop call counts (top 30 of 71):
+     32973  elem
+     18259  isAttrs
+     15439  __derivCoerce
+      8554  toString
+      7170  genList
+      6408  __elem
+      5920  __attrNames
+      4243  __isString
+      3619  removeAttrs
+      2743  isList
+      2722  mapAttrs
+      2438  isFunction

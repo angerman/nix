@@ -1,0 +1,50 @@
+  fully-dead        13095795 lines  (= 53.1% of lines, 838.1 MB)
+  bump-realloc-recoverable: 53.1% of arena bytes
+  blocks all-dead=0 mostly-dead=20 mixed=73 mostly-live=1 all-live=0
+  VERDICT (>=30% lines dead -> Immix viable):
+    PASS: Immix bump-realloc worth the +2 KLoC complexity
+  (huge blocks: 16.0 MB total, 2.4 MB live)
+
+=== Immix line-occupancy probe @ line_size=128 B ===
+  blocks            94 (block_size=16 MB)
+  total lines       12320768 (= 1577.1 MB)
+  pinned (live)     6100066 lines  (= 780.8 MB)
+  fully-dead        6220702 lines  (= 50.5% of lines, 796.2 MB)
+  bump-realloc-recoverable: 50.5% of arena bytes
+  blocks all-dead=0 mostly-dead=4 mixed=89 mostly-live=1 all-live=0
+  VERDICT (>=30% lines dead -> Immix viable):
+    PASS: Immix bump-realloc worth the +2 KLoC complexity
+  (huge blocks: 16.0 MB total, 2.4 MB live)
+
+=== Immix line-occupancy probe @ line_size=256 B ===
+  blocks            94 (block_size=16 MB)
+  total lines       6160384 (= 1577.1 MB)
+  pinned (live)     3276312 lines  (= 838.7 MB)
+  fully-dead        2884072 lines  (= 46.8% of lines, 738.3 MB)
+  bump-realloc-recoverable: 46.8% of arena bytes
+  blocks all-dead=0 mostly-dead=1 mixed=90 mostly-live=3 all-live=0
+  VERDICT (>=30% lines dead -> Immix viable):
+    PASS: Immix bump-realloc worth the +2 KLoC complexity
+  (huge blocks: 16.0 MB total, 2.4 MB live)
+
+=== Immix line-occupancy probe @ line_size=512 B ===
+  blocks            94 (block_size=16 MB)
+  total lines       3080192 (= 1577.1 MB)
+  pinned (live)     1788337 lines  (= 915.6 MB)
+  fully-dead        1291855 lines  (= 41.9% of lines, 661.4 MB)
+  bump-realloc-recoverable: 41.9% of arena bytes
+  blocks all-dead=0 mostly-dead=0 mixed=89 mostly-live=5 all-live=0
+  VERDICT (>=30% lines dead -> Immix viable):
+    PASS: Immix bump-realloc worth the +2 KLoC complexity
+  (huge blocks: 16.0 MB total, 2.4 MB live)
+
+=== Mark+sweep cost projection ===
+  mark wall (this drain): 2791.61 ms
+  live bytes processed:   684.0 MB
+  mark cost / live byte:  4.081 ns
+  projected sweep wall:   2791.61 ms (O(N_live) walk)
+  per-cycle total:        5583.22 ms
+
+  At default trigger cadence (arena 256 MB -> reclaim live):
+  if eval runs 10 cycles, sweep budget = 55832 ms
+  if eval runs 50 cycles, sweep budget = 279161 ms
