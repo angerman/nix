@@ -1231,6 +1231,54 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                 freeListCount,      freeListEst   / 1e6,
                 sumEst / 1e6);
         }
+        // Step 6 of post-Phase-3.8 plan: free-list hit-rate summary.
+        // Only emitted under NIX_V3_FREE_LIST_STATS=1; otherwise the
+        // counters stayed zero (gate at allocation site).
+        if (std::getenv("NIX_V3_FREE_LIST_STATS") != nullptr) {
+            const auto & fl = freeListStats();
+            const double hitPct = fl.allocCount > 0
+                ? 100.0 * double(fl.hitCount) / double(fl.allocCount)
+                : 0.0;
+            std::fprintf(stderr,
+                "v3-direct free-list stats: "
+                "allocs=%llu hits=%llu hit_rate=%.2f%%\n"
+                "  bin   range_bytes        requests           hits    hit%%\n",
+                (unsigned long long)fl.allocCount,
+                (unsigned long long)fl.hitCount, hitPct);
+            for (size_t b = 0; b < FreeListStats::kNumBins; ++b) {
+                const size_t lo = size_t(16) << b;
+                const size_t hi = size_t(16) << (b + 1);
+                const uint64_t req = fl.requestsByBin[b];
+                const uint64_t hit = fl.hitsByBin[b];
+                if (req == 0 && hit == 0) continue;
+                const double binPct = req > 0
+                    ? 100.0 * double(hit) / double(req) : 0.0;
+                if (b + 1 < FreeListStats::kNumBins) {
+                    std::fprintf(stderr,
+                        "  %2zu   [%6zu,%7zu) %12llu %14llu  %6.2f%%\n",
+                        b, lo, hi,
+                        (unsigned long long)req,
+                        (unsigned long long)hit, binPct);
+                } else {
+                    std::fprintf(stderr,
+                        "  %2zu   [%6zu,    inf) %12llu %14llu  %6.2f%%\n",
+                        b, lo,
+                        (unsigned long long)req,
+                        (unsigned long long)hit, binPct);
+                }
+            }
+            // Pre-committed verdict per task #842 / Step 6 thresholds.
+            const char * verdict;
+            if (hitPct >= 50.0) {
+                verdict = "PER-EXACT-SIZE BINS OK (>=50% — Step 11 NOT justified)";
+            } else if (hitPct < 20.0) {
+                verdict = "PER-EXACT-SIZE BOTTLENECK (<20% — Step 11 fires)";
+            } else {
+                verdict = "JUDGMENT CALL (20-50% — see Step 9 synthesis)";
+            }
+            std::fprintf(stderr,
+                "  ----- free-list verdict: %s\n", verdict);
+        }
     }
     return out;
 }

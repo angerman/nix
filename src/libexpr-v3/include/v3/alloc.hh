@@ -555,6 +555,93 @@ inline AllocStats & allocStats()
 }
 
 // ---------------------------------------------------------------------------
+// FreeListStats — Step 6 of post-Phase-3.8 plan (2026-05-29).
+//
+// Per `lode/PHASE_4_PRELIM_FALSIFIED_2026-05-29.md` §2.3: HNE arena
+// shrinks 1593 → 1510 MB under reuse-on (sweep finds dead cells) but
+// peak_rss doesn't reduce.  Hypothesis: per-exact-size bins (line
+// ~1125 freeListBins_ unordered_map<size_t, ...>) MISS too often
+// against variable-size Bindings allocation, so freed cells aren't
+// reused, leaving the arena resident even though logically freeable.
+//
+// This instrumentation quantifies the hit rate so Step 11 (log-spaced
+// size-class bins) has a measurement to justify it vs. a guess.
+//
+// Gate: NIX_V3_FREE_LIST_STATS=1 — instrument every Arena::alloc
+//       call with per-bin hit/miss counts.  Zero cost when gate OFF.
+//
+// Retirement criterion (per Rule 0 §2): delete when log-spaced
+// size-class bins (Step 11) land AND hit-rate ≥70% on HNE is
+// confirmed in production.
+//
+// Pre-committed decision threshold (per measure-twice §3 + the
+// Step 6 task description):
+//   * hit rate ≥50% on HNE → bins are fine; Step 11 NOT justified
+//   * hit rate <20%        → per-exact-size IS the bottleneck;
+//                            Step 11 fires
+//   * 20-50% → judgment call documented in Step 9 synthesis
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/// Cached at startup so the hot-path read is a single comparison
+/// against a bool constant (well-predicted; zero cost when OFF).
+inline const bool g_freeListStatsEnabled =
+    std::getenv("NIX_V3_FREE_LIST_STATS") != nullptr;
+
+} // namespace detail
+
+struct FreeListStats
+{
+    /// Total calls to Arena::alloc (NOT counting huge-block path,
+    /// which bypasses the free list).
+    uint64_t allocCount = 0;
+
+    /// Total free-list hits — i.e., calls to freeListTryPop that
+    /// returned a non-null slot.  Only nonzero when both stats gate
+    /// AND V3_DBG_FREELIST_REUSE are enabled.
+    uint64_t hitCount = 0;
+
+    /// Per-bin request + hit histogram.  Bin i covers byte range
+    /// `[16 << i, 16 << (i+1))`:
+    ///   bin 0: [16,    32)      single Value / smallest cells
+    ///   bin 1: [32,    64)      Pair, small Closure
+    ///   bin 2: [64,    128)     Closure, small Bindings
+    ///   bin 3: [128,   256)     Bindings 4-9 entries
+    ///   bin 4: [256,   512)     Bindings 10-20 entries
+    ///   bin 5: [512,   1024)    Bindings 21-41 entries
+    ///   bin 6: [1024,  2048)    Bindings 42-84 entries
+    ///   bin 7: [2048,  4096)    Bindings 85-169 entries
+    ///   bin 8: [4096,  8192)    Bindings 170-340 entries
+    ///   bin 9: [8192,  16384)   Bindings ~340-680 entries
+    ///   bin 10: [16384, 32768)  Bindings ~680-1360 entries
+    ///   bin 11: [32768, ∞)      everything larger (catchall)
+    static constexpr size_t kNumBins = 12;
+    uint64_t requestsByBin[kNumBins] = {};
+    uint64_t hitsByBin[kNumBins]     = {};
+};
+
+inline FreeListStats & freeListStats()
+{
+    static FreeListStats stats;
+    return stats;
+}
+
+/// Map a byte size to its log2-bin.  bin 0 covers [16, 32); each bin
+/// is one power of two wider.  Saturates at kNumBins-1 for the catchall.
+inline size_t sizeToFreeListBin(size_t bytes) noexcept
+{
+    if (bytes < 16) return 0;
+    size_t v = bytes >> 4;  // bytes / 16, so v ≥ 1
+    size_t b = 0;
+    while (v > 1 && b + 1 < FreeListStats::kNumBins) {
+        v >>= 1;
+        ++b;
+    }
+    return b;
+}
+
+// ---------------------------------------------------------------------------
 // VM-3: bump-pointer arena allocator.
 //
 // All v3 runtime allocations (Bindings, Closure, Thunk, Env, ListVec,
@@ -718,10 +805,34 @@ public:
         //   * Stricter trigger (only at outermost OP_RETURN; ~0.5 d)
         // Deferred to a follow-up commit; opt-in gate preserves the
         // mechanism for measurement.
+        // Step 6 of post-Phase-3.8 plan: free-list stats per-call
+        // tracking.  Zero cost when NIX_V3_FREE_LIST_STATS unset
+        // (cached bool comparison; well-predicted false branch).
+        // Single reference binding (avoids inline-static ODR concerns).
+        if (__builtin_expect(detail::g_freeListStatsEnabled, 0)) {
+            auto & fls = freeListStats();
+            ++fls.allocCount;
+            const size_t bin = sizeToFreeListBin(bytes);
+            if (bin < FreeListStats::kNumBins) {
+                ++fls.requestsByBin[bin];
+            }
+        }
         static const bool s_reuseOn =
             std::getenv("V3_DBG_FREELIST_REUSE") != nullptr;
         if (__builtin_expect(majorGcEnabled() && s_reuseOn, 0)) {
             if (void * p = freeListTryPop(bytes)) {
+                // Step 6: count the hit.  Bin is the requested size's
+                // bin, NOT the popped slot's actual bin (per-exact-size
+                // map means they're identical today; with Step 11
+                // log-spaced bins they could differ).
+                if (__builtin_expect(detail::g_freeListStatsEnabled, 0)) {
+                    auto & fls = freeListStats();
+                    ++fls.hitCount;
+                    const size_t bin = sizeToFreeListBin(bytes);
+                    if (bin < FreeListStats::kNumBins) {
+                        ++fls.hitsByBin[bin];
+                    }
+                }
                 // free-list pop re-sets the cell-start bit
                 // internally; no further bookkeeping needed.
                 return p;
