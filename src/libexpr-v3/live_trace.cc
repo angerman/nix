@@ -1441,21 +1441,19 @@ void maybeSamplePeriodicLiveFraction(VMState & vm) noexcept
     const size_t curBytes = arena.bytesAllocated();
     if (curBytes < st.nextThresholdBytes) return;
 
-    // Advance threshold defensively against shrinkage.  If arena grew
-    // past the threshold by less than K (typical), the next sample
-    // fires K MB later.  If arena overshot by more than K (catch-up
-    // case), we still advance by exactly K from the current bytes —
-    // so the next sample is at curBytes+K.  This guarantees forward
-    // progress without firing back-to-back samples.
     const size_t K = periodicThresholdBytes();
-    st.nextThresholdBytes = std::max(curBytes + K, st.nextThresholdBytes + K);
 
-    // Wall time since eval start (ms).
+    // Wall time since eval start (ms) — captured BEFORE the walk
+    // so wall_ms reflects when this K-crossing was observed.
     const auto now = std::chrono::steady_clock::now();
     const double wall_ms = std::chrono::duration<double, std::milli>(
         now - st.evalStart).count();
 
-    // Run the transitive live-walk (same machinery as dumpV3LiveFraction).
+    // Single transitive live-walk per safepoint visit.  No catch-up
+    // duplication: even if multiple K-multiples were crossed between
+    // safepoints, we emit ONE row.  This honestly reports observable
+    // L values — between safepoints L is unknown.  Advance threshold
+    // PAST the current bytes so the next sample fires K MB later.
     LiveTracer tr;
     walkAllV3Roots(vm, tr);
     tr.drain();
@@ -1480,8 +1478,12 @@ void maybeSamplePeriodicLiveFraction(VMState & vm) noexcept
     row.l_cumulative    = cumulativeBytes > 0
         ? double(liveBytes) / double(cumulativeBytes) : 0.0;
     row.wall_ms         = wall_ms;
-
     st.rows.push_back(row);
+
+    // Advance threshold past current bytes by the next K-multiple
+    // (so duplicate sampling at the same safepoint is avoided, while
+    // forward progress is guaranteed).
+    st.nextThresholdBytes = curBytes + K;
 }
 
 void flushPeriodicLiveTraceCsv() noexcept
