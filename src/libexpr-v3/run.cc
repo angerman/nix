@@ -1163,6 +1163,24 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                                 + gst.size() * (24 + 4 + 2 * sizeof(void*));
             const size_t dirtyEst      = dirty.capacity() * sizeof(void *) * 2;
             const size_t standaloneEst = standalone.capacity() * sizeof(void *);
+            // Phase 3 attribution (2026-05-28): account for the
+            // mark-sweep infrastructure that lives outside arena/Boehm.
+            const auto & singletonReg = singletonClosureRegistry();
+            const size_t singletonRegEst =
+                singletonReg.capacity() * sizeof(Closure **);
+            // Arena-side cell-start bitmap.  Per-block bitmap, 128 KB
+            // each.  Lives as long as the arena.
+            size_t cellStartsEst = 0;
+            for (const auto & v : threadArena().cellStartBitmaps())
+                cellStartsEst += v.capacity() * sizeof(uint64_t);
+            // Free list.  Per-bin vector<void*>; many bins for distinct
+            // cell sizes.  Approximate via outer + per-bin capacities.
+            // We don't have public accessors; use a best-effort fixed
+            // estimate based on freeListEntryCount() and assume avg
+            // 8 bytes per entry plus map overhead.
+            const size_t freeListCount = threadArena().freeListEntryCount();
+            const size_t freeListEst =
+                freeListCount * sizeof(void *) * 2;  // entries + map overhead
             // Nursery: young + (when Phase E active) two survivor
             // buffers of equal size.  When Phase E is off the
             // single nursery is just `sizeBytes`.
@@ -1172,7 +1190,8 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
 
             const size_t sumEst = sctEst + ppsEst + ppsStringBytes
                                 + botEst + cotEst + gstEst + dirtyEst
-                                + standaloneEst + nurseryBytes;
+                                + standaloneEst + nurseryBytes
+                                + singletonRegEst + cellStartsEst + freeListEst;
             std::fprintf(stderr,
                 "v3-direct elsewhere-probe (entries / est_MB):\n"
                 "  stringContextSide   %12zu  ~%6.1f MB  (buckets=%zu, "
@@ -1185,6 +1204,9 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                 "  dirtyContainers     %12zu  ~%6.1f MB  (capacity=%zu)\n"
                 "  standaloneCellRoots %12zu  ~%6.1f MB  (capacity=%zu)\n"
                 "  nursery (Y+S buffs) %12s  ~%6.1f MB\n"
+                "  singletonClosureReg %12zu  ~%6.1f MB  (capacity=%zu)\n"
+                "  arena.cellStarts    %12s  ~%6.1f MB  (per-block 128 KB)\n"
+                "  arena.freeList      %12zu  ~%6.1f MB  (live entries)\n"
                 "  ----- elsewhere-probe sum: ~%.1f MB -----\n",
                 sct.size(),         sctEst        / 1e6, sct.bucket_count(),
                 (unsigned long long)sctEntryStrings,
@@ -1198,6 +1220,9 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                 dirty.size(),       dirtyEst      / 1e6, dirty.capacity(),
                 standalone.size(),  standaloneEst / 1e6, standalone.capacity(),
                 "<mmap>",           nurseryBytes  / 1e6,
+                singletonReg.size(), singletonRegEst / 1e6, singletonReg.capacity(),
+                "<phase3>",         cellStartsEst / 1e6,
+                freeListCount,      freeListEst   / 1e6,
                 sumEst / 1e6);
         }
     }

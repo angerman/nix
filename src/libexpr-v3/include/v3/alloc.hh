@@ -953,6 +953,73 @@ public:
     }
     size_t freeListEntryCount() const noexcept { return freeListEntries_; }
 
+    /// Phase 3.8 (2026-05-28): free a fully-dead arena block back to
+    /// libc.  Called by sweep when a block has zero live cells.
+    /// Returns the block's bytes that were returned to libc (kBlockSize).
+    ///
+    /// Removes the block from `active_.blocks`, its corresponding
+    /// `cellStarts` bitmap entry, and any pending free-list entries
+    /// that point into the block.  Updates `totalBytes` accordingly.
+    ///
+    /// Pre-condition: caller has verified no live cells nor any mark
+    /// bits in the block (no Tag::Slot targets, etc.).  Sweep must
+    /// have removed all cell-start bits from this block before
+    /// calling.
+    ///
+    /// O(blocks) due to the linear-scan for the block index + an
+    /// O(freeList) pass to filter out entries.  Called once per
+    /// freeable block per GC, so amortised cost is low.
+    size_t freeWholeBlock(const char * blockStart) noexcept
+    {
+        // 1. Find block index.
+        size_t idx = active_.blocks.size();
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            if (active_.blocks[i] == blockStart) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx == active_.blocks.size()) return 0;  // not found
+
+        // 2. Remove free-list entries that point into this block.
+        for (auto & [sz, vec] : freeListBins_) {
+            auto newEnd = std::remove_if(vec.begin(), vec.end(),
+                [blockStart](void * p) {
+                    const char * cp = static_cast<const char *>(p);
+                    return cp >= blockStart
+                        && cp < blockStart + kBlockSize;
+                });
+            const size_t removed = static_cast<size_t>(vec.end() - newEnd);
+            vec.erase(newEnd, vec.end());
+            freeListEntries_ -= removed;
+        }
+
+        // 3. GC_remove_roots + std::free the block bytes.
+#if NIX_USE_BOEHMGC
+        if (!arenaNorootEnabled())
+            GC_remove_roots(const_cast<char *>(blockStart),
+                            const_cast<char *>(blockStart) + kBlockSize);
+#endif
+        std::free(const_cast<char *>(blockStart));
+
+        // 4. Remove from active_.blocks + parallel cellStarts.
+        active_.blocks.erase(active_.blocks.begin() + idx);
+        active_.cellStarts.erase(active_.cellStarts.begin() + idx);
+
+        // 5. Update totalBytes + cur/end if we freed the current
+        //    block.  After freeing, the next alloc will refill (since
+        //    cur points to a now-invalid address).
+        active_.totalBytes -= kBlockSize;
+        if (active_.cur >= blockStart
+            && active_.cur < blockStart + kBlockSize)
+        {
+            active_.cur = nullptr;
+            active_.end = nullptr;
+        }
+
+        return kBlockSize;
+    }
+
     /// Stage 6 Phase 3: sweep helper — clear a cell-start bit (when
     /// a dead cell is added to the free list, the slot is no longer
     /// a cell-start until reused).

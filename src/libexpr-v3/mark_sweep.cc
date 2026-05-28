@@ -606,6 +606,8 @@ struct SweepStats {
     size_t deadBytes     = 0;
     size_t liveBytes     = 0;
     size_t blocksScanned = 0;
+    size_t blocksFreed   = 0;
+    size_t bytesFreed    = 0;
 };
 
 /// Sweep one arena block.  Walks the cell-start bitmap in address
@@ -616,7 +618,10 @@ struct SweepStats {
 /// the arena.  Their cell-start bits are cleared (they no longer
 /// represent live cells).  Subsequent allocations check the free
 /// list first; arena growth is capped at peak-live + slack.
-static void sweepOneBlock(
+/// Returns true if this block ended up FULLY DEAD (no live cells
+/// found during sweep + no marker bits at all in the block's byte
+/// range).  Caller may then `freeWholeBlock()` it.
+static bool sweepOneBlock(
     Arena &                       arena,
     const char *                  blockStart,
     size_t                        blockUsedBytes,
@@ -644,11 +649,18 @@ static void sweepOneBlock(
         }
     }
 
-    if (starts.empty()) return;  // no allocations in this block
+    if (starts.empty()) {
+        // No allocations recorded.  If no mark bits either, this
+        // block is fully dead (nothing references its contents).
+        // Phase 3.8: signal caller to free the block.
+        ++stats.blocksScanned;
+        return !marker.anyMarkInRange(blockStart, 0, blockUsedBytes);
+    }
 
     // Walk consecutive starts; size = next.offset - this.offset.
     // Last cell extends to blockUsedBytes.
     ++stats.blocksScanned;
+    size_t blockLiveCells = 0;
     for (size_t i = 0; i < starts.size(); ++i) {
         const size_t offset    = starts[i];
         const size_t endOffset = (i + 1 < starts.size())
@@ -663,6 +675,7 @@ static void sweepOneBlock(
         // alone misses the owning container.
         if (marker.anyMarkInRange(blockStart, offset, offset + cellSize)) {
             ++stats.liveCells;
+            ++blockLiveCells;
             stats.liveBytes += cellSize;
         } else {
             ++stats.deadCells;
@@ -675,6 +688,13 @@ static void sweepOneBlock(
             arena.clearCellStartBitFor(cellAddr);
         }
     }
+    // Phase 3.8: block is fully dead if no live cells AND no marker
+    // bits in any byte range of the block.  The cell-level
+    // classifications above only cover known cell-starts; we must
+    // also verify NO interior marks (e.g., from Tag::Slot targets
+    // pointing into other cells) are present.
+    return blockLiveCells == 0
+        && !marker.anyMarkInRange(blockStart, 0, blockUsedBytes);
 }
 
 void runMajorMarkSweep(VMState & vm) noexcept
@@ -720,6 +740,10 @@ void runMajorMarkSweep(VMState & vm) noexcept
     const auto ranges = arena.blockRanges();
 
     // Filter regular blocks (skip huge); compute per-block used-bytes.
+    // Phase 3.8: collect blocks that sweep classified fully-dead
+    // first, then free them in a second pass (avoid invalidating
+    // `ranges` mid-iteration).
+    std::vector<const char *> blocksToFree;
     size_t regularBlockIdx = 0;
     for (const auto & r : ranges) {
         const size_t rangeBytes =
@@ -731,14 +755,27 @@ void runMajorMarkSweep(VMState & vm) noexcept
         // kBlockSize.  `r.end` from blockRanges already encodes this.
         const size_t usedBytes =
             static_cast<size_t>(r.end - r.begin);
-        sweepOneBlock(
+        const bool fullyDead = sweepOneBlock(
             arena,
             r.begin,
             usedBytes,
             cellStarts[regularBlockIdx],
             marker,
             sweep);
+        if (fullyDead) blocksToFree.push_back(r.begin);
         ++regularBlockIdx;
+    }
+
+    // Phase 3.8: free fully-dead blocks back to libc.  Done as a
+    // second pass so we don't mutate active_.blocks during the sweep
+    // iteration.  Each freeWholeBlock removes the block from arena
+    // metadata + filters its free-list entries.
+    for (const char * blk : blocksToFree) {
+        const size_t freed = arena.freeWholeBlock(blk);
+        if (freed > 0) {
+            ++sweep.blocksFreed;
+            sweep.bytesFreed += freed;
+        }
     }
 
     const auto tSweepEnd = clock::now();
@@ -774,7 +811,7 @@ void runMajorMarkSweep(VMState & vm) noexcept
         std::fprintf(stderr,
             "v3 sweep: blocksScanned=%zu liveCells=%zu deadCells=%zu "
             "liveBytes=%.1fMB deadBytes=%.1fMB reclaim%%=%.1f%% "
-            "freelist_entries=%zu\n",
+            "freelist_entries=%zu blocksFreed=%zu bytesFreed=%.1fMB\n",
             sweep.blocksScanned,
             sweep.liveCells, sweep.deadCells,
             sweep.liveBytes / 1e6,
@@ -783,7 +820,9 @@ void runMajorMarkSweep(VMState & vm) noexcept
                 ? 100.0 * double(sweep.deadBytes)
                           / double(sweep.liveBytes + sweep.deadBytes)
                 : 0.0,
-            arena.freeListEntryCount());
+            arena.freeListEntryCount(),
+            sweep.blocksFreed,
+            sweep.bytesFreed / 1e6);
     }
 }
 
