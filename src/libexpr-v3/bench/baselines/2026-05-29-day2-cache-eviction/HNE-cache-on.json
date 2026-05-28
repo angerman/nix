@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-05-28T08:47:11.424277+00:00",
+  "workload": "HNE",
+  "config": "gate-off",
+  "expr": "(builtins.getFlake \"/Users/angerman/Projects/iohk/haskell-nix-example\").packages.x86_64-linux.hello.drvPath",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "gate_env": "",
+  "extra_env": "",
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 2565.55,
+      "sigma": 0.169,
+      "min": 2565.3,
+      "max": 2565.8,
+      "raw": [
+        2565.7,
+        2565.5,
+        2565.3,
+        2565.7,
+        2565.5,
+        2565.4,
+        2565.3,
+        2566.1,
+        2565.5,
+        2565.8
+      ]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 1593.8,
+      "sigma": 0.0,
+      "min": 1593.8,
+      "max": 1593.8,
+      "raw": [
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8
+      ]
+    },
+    "elsewhere_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 568.8,
+      "sigma": 0.177,
+      "min": 568.6,
+      "max": 569.1,
+      "raw": [
+        569.0,
+        568.7,
+        568.6,
+        568.9,
+        568.7,
+        568.7,
+        568.5,
+        569.4,
+        568.7,
+        569.1
+      ]
+    },
+    "wall_s": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 5.1,
+      "sigma": 0.215,
+      "min": 4.926,
+      "max": 5.439,
+      "raw": [
+        5.614,
+        5.365,
+        4.949,
+        4.986,
+        4.941,
+        5.252,
+        4.922,
+        5.439,
+        4.944,
+        4.926
+      ]
+    }
+  }
+}

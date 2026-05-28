@@ -103,6 +103,7 @@ mkdir -p "$(dirname "$OUT")"
 # Workload registry.
 # ----------------------------------------------------------------------
 HNE_PATH="${HNE_PATH:-/Users/angerman/Projects/iohk/haskell-nix-example}"
+CN_PATH="${CN_PATH:-/Users/angerman/Projects/iohk/cardano-node}"
 
 declare -a EXTRA_ENV=()
 case "$WORKLOAD" in
@@ -125,14 +126,23 @@ case "$WORKLOAD" in
         EXPR='(builtins.getFlake "'"$HNE_PATH"'").packages.x86_64-linux.hello.drvPath'
         WALL_BUDGET=900
         HEAP_BUDGET=8G
-        # HNE convention (per HNE_BUCKET_DECOMP_2026-05-27.md):
-        # disable v3 disk cache so we measure honest in-process arena
-        # behaviour, not the cache-hit fast path.
-        EXTRA_ENV+=(NIX_V3_NO_DISK_CACHE=1)
+        # Note (2026-05-29 Day 2 EXIT_GC_SPIRAL): previously this
+        # auto-added NIX_V3_NO_DISK_CACHE=1.  Day 2 requires
+        # measuring HNE WITHOUT that override to establish the
+        # cache-on baseline; use the `gate-off-cache-off` config
+        # for the explicit cache-disabled comparison.
+        ;;
+    M5)
+        # cardano-node M5 (Pillar 2 strategic workload).  Per
+        # bench/m5-cron.sh: cardano-node-exe-cardano-node-* drvPath
+        # via `cardano-node.name`.
+        EXPR='(builtins.getFlake "'"$CN_PATH"'").outputs.packages.x86_64-linux.cardano-node.name'
+        WALL_BUDGET=1800
+        HEAP_BUDGET=8G
         ;;
     *)
         echo "Error: unknown workload '$WORKLOAD'" >&2
-        echo "Workloads: hello.name | hello.drvPath | firefox.name | HNE" >&2
+        echo "Workloads: hello.name | hello.drvPath | firefox.name | HNE | M5" >&2
         exit 2
         ;;
 esac
@@ -154,9 +164,15 @@ case "$CONFIG" in
     gate-on-reuse-on-stress)
         GATE_ENV=(NIX_V3_MAJOR_GC=1 V3_DBG_FREELIST_REUSE=1 V3_DBG_GC_STRESS=1000)
         ;;
+    gate-off-cache-off)
+        # Day 2 of EXIT_GC_SPIRAL_PLAN: cache-eviction PoC.
+        # Disables the v3 disk cache (SQLite-backed bytecode shadow
+        # per HNE_BUCKET_DECOMP §3); approximates Phase 4b LRU yield.
+        GATE_ENV=(NIX_V3_NO_DISK_CACHE=1)
+        ;;
     *)
         echo "Error: unknown config '$CONFIG'" >&2
-        echo "Configs: gate-off | gate-on-reuse-off | gate-on-reuse-on | gate-on-reuse-on-stress" >&2
+        echo "Configs: gate-off | gate-on-reuse-off | gate-on-reuse-on | gate-on-reuse-on-stress | gate-off-cache-off" >&2
         exit 2
         ;;
 esac
@@ -167,6 +183,15 @@ if [[ "$WORKLOAD" == "HNE" && ! -d "$HNE_PATH" ]]; then
         echo "Error: HNE workload requires the haskell-nix-example flake at:"
         echo "  $HNE_PATH"
         echo "Set HNE_PATH=<path> or check out the flake first."
+    } >&2
+    exit 2
+fi
+# Workload prereq: M5 = cardano-node flake must be checked out.
+if [[ "$WORKLOAD" == "M5" && ! -d "$CN_PATH" ]]; then
+    {
+        echo "Error: M5 workload requires the cardano-node flake at:"
+        echo "  $CN_PATH"
+        echo "Set CN_PATH=<path> or check out the flake first."
     } >&2
     exit 2
 fi

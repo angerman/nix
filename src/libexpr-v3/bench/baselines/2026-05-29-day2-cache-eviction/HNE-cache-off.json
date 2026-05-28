@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-05-28T08:48:47.263751+00:00",
+  "workload": "HNE",
+  "config": "gate-off-cache-off",
+  "expr": "(builtins.getFlake \"/Users/angerman/Projects/iohk/haskell-nix-example\").packages.x86_64-linux.hello.drvPath",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "gate_env": "NIX_V3_NO_DISK_CACHE=1",
+  "extra_env": "",
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 3028.012,
+      "sigma": 1.783,
+      "min": 3025.7,
+      "max": 3030.1,
+      "raw": [
+        3030.1,
+        2987.3,
+        3067.4,
+        3026.3,
+        3025.7,
+        3027.1,
+        3030.0,
+        3030.0,
+        3027.1,
+        3027.8
+      ]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 1593.8,
+      "sigma": 0.0,
+      "min": 1593.8,
+      "max": 1593.8,
+      "raw": [
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8,
+        1593.8
+      ]
+    },
+    "elsewhere_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 1031.225,
+      "sigma": 1.8,
+      "min": 1028.9,
+      "max": 1033.4,
+      "raw": [
+        1033.4,
+        990.5,
+        1070.7,
+        1029.5,
+        1028.9,
+        1030.3,
+        1033.2,
+        1033.2,
+        1030.3,
+        1031.0
+      ]
+    },
+    "wall_s": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 8.543,
+      "sigma": 0.062,
+      "min": 8.463,
+      "max": 8.63,
+      "raw": [
+        8.505,
+        8.525,
+        8.528,
+        8.63,
+        8.571,
+        8.463,
+        9.253,
+        8.628,
+        8.491,
+        8.439
+      ]
+    }
+  }
+}
