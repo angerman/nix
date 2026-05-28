@@ -1961,25 +1961,41 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     for (uint32_t i = 0; i < src->size; ++i) {
         SymbolId sym = src->entries[i].name;
         Value nameStr = mkStringValueOwned(std::string(vmSymName(state, sym)));
-        // EXIT_GC_SPIRAL Week 1 Day 9-11 (2026-05-29): pack the
-        // 3-argument apply `fn name value` into a single ValuePair
-        // tagged Tag::App3 (saves one 32 B ValuePair per entry vs
-        // the legacy 2-pair encoding).  Layout:
-        //   left      = fn
-        //   right     = nameStr   (arg1 — applied first by forceValue)
-        //   evaluated = entryVal  (arg2 — applied second)
-        // forceValue + OP_FORCE's spine walk recognise Tag::App3 and
-        // push BOTH right + evaluated into the rights buffer so the
-        // semantics are identical to the old 2-pair chain.  Laziness
-        // preserved: only forced if a consumer demands the entry.
-        ValuePair * pp = Alloc::allocPair();
-        pp->left      = fn;
-        pp->right     = nameStr;
-        pp->evaluated = src->entries[i].value;
-        pairPostConstructBarrier(pp);  // Phase D
-        Value step; step.tag_payload = static_cast<uint64_t>(Tag::App3); step.payload.pair = pp;
+        // 2026-05-29 ROLLBACK of Day 9-11 Tag::App3 optimisation.
+        //
+        // Day 9-11 packed `fn name value` into one Tag::App3 ValuePair
+        // (saves one 32 B ValuePair vs the legacy `App(App(fn,k),v)`
+        // 2-pair chain).  Re-validation found a NET REGRESSION on HNE:
+        // wall 11.9 s → 49.4 s, arena 1493 MB → 3137 MB, attrsets
+        // 1.11 M → 3.91 M, thunks 3.83 M → 11.4 M.  Root cause: the
+        // old 2-pair encoding's outer `Tag::App` `pair->evaluated`
+        // slot was the App-result MEMOIZATION sink (#696 fix that
+        // closed the "extendDerivation outputsList forced 64K times"
+        // regression).  Tag::App3 overloads `evaluated` to hold
+        // arg2, so memoization is LOST — every demand of a mapAttrs
+        // entry re-runs the body's allocations.  Day 9-11's
+        // assumption "mapAttrs entries are single-shot" is falsified
+        // empirically.
+        //
+        // Mitigation: revert to the 2-pair encoding here (the headline
+        // mapAttrs site).  Tag::App3 dispatch + Force-path
+        // infrastructure stays in vm.cc as dead code — no allocator
+        // overhead from the unused tag, and the dispatch is needed
+        // only if someone re-enables construction in a future
+        // experiment.  See lode/EXIT_WEEK1_RETROSPECTIVE_2026-05-29.md
+        // for the regression measurement and rationale.
+        ValuePair * pp1 = Alloc::allocPair();
+        pp1->left  = fn;
+        pp1->right = nameStr;
+        pairPostConstructBarrier(pp1);  // Phase D
+        Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
+        ValuePair * pp2 = Alloc::allocPair();
+        pp2->left  = step1;
+        pp2->right = src->entries[i].value;
+        pairPostConstructBarrier(pp2);  // Phase D
+        Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
         result->entries[i].name  = sym;
-        bindingsSetValue(result, i, step);  // Phase D
+        bindingsSetValue(result, i, step2);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = result;
@@ -2783,18 +2799,22 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         // Build name string.
         std::string nm = sid < symTab.size() ? symTab[sid] : std::to_string(sid);
         Value nameV = mkStringValueOwned(nm);
-        // EXIT_GC_SPIRAL Week 1 Day 9-11 (2026-05-29): single
-        // Tag::App3 ValuePair instead of the legacy 2-pair chain.
-        // Layout {fn, nameV (arg1), lv (arg2)} matches the forceValue
-        // spine walk's expectation.  Saves one 32 B ValuePair per
-        // zipped attribute name — mirror of the mapAttrs change above.
-        ValuePair * pp = Alloc::allocPair();
-        pp->left      = fn;
-        pp->right     = nameV;
-        pp->evaluated = lv;
-        pairPostConstructBarrier(pp);  // Phase D
-        Value step; step.tag_payload = static_cast<uint64_t>(Tag::App3); step.payload.pair = pp;
-        entries.emplace_back(sid, step);
+        // 2026-05-29 ROLLBACK of Day 9-11 Tag::App3 optimisation —
+        // see primMapAttrs above for the regression measurement and
+        // rationale.  Restore 2-pair `App(App(fn, nameV), lv)`
+        // encoding so the outer App's `pair->evaluated` slot resumes
+        // its role as the App-result memoization sink (#696).
+        ValuePair * pp1 = Alloc::allocPair();
+        pp1->left  = fn;
+        pp1->right = nameV;
+        pairPostConstructBarrier(pp1);  // Phase D
+        Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
+        ValuePair * pp2 = Alloc::allocPair();
+        pp2->left  = step1;
+        pp2->right = lv;
+        pairPostConstructBarrier(pp2);  // Phase D
+        Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
+        entries.emplace_back(sid, step2);
     }
     std::sort(entries.begin(), entries.end(),
         [](const auto & a, const auto & b) { return a.first < b.first; });
