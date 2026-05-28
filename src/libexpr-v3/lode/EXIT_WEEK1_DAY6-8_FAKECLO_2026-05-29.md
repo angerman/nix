@@ -15,6 +15,8 @@
 
 Retirement criterion inline: "Delete the gate when EXIT_WEEK1 bundle SHIP-gate clears AND the pool is confirmed correct across nixpkgs flake matrix."
 
+**Amended 2026-05-29 evening (user decision):** retain the pool indefinitely; revise retirement criterion to be GC-architecture-conditional, not SHIP-gate-conditional.  The pool MAY be retired AFTER the rest of v3's GC reaches a state where it reclaims the 144 MB unaided — i.e. Phase E v0.2 ships default-on OR Stage 6 production precise GC lands.  Until then, pool stays default-on; `NIX_V3_NO_CLOSURE_POOL=1` stays as A/B opt-out.  Cross-ref: `EXIT_GC_SPIRAL_PLAN_2026-05-29.md §4.3` amendment + `ROADMAP_TO_VISION_2026-05-15.md` deferred retirement note.
+
 ### 1.2 Five fakeClo sites switched (vm.cc)
 
 Before — all 5 used `Alloc::allocClosure(N)` (fresh arena alloc):

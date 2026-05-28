@@ -2452,9 +2452,17 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
     // arena-backed; preserves the fakeClo magic so recycleFakeClo
     // would still classify it correctly, just never hits the pool).
     //
-    // Retirement (per Rule 0): "Delete the gate when EXIT_WEEK1
-    // bundle SHIP-gate clears AND the pool is confirmed correct
-    // across nixpkgs flake matrix."
+    // Retirement (amended 2026-05-29 evening, supersedes prior
+    // "delete gate when SHIP-gate clears" criterion):
+    //   The pool + sentinel infrastructure (kFakeCloMagic / _pad /
+    //   NIX_V3_NO_CLOSURE_POOL gate) MAY be retired AFTER the rest
+    //   of v3's GC reaches a state where it reclaims the 144 MB
+    //   unaided — concretely, when Phase E v0.2 ships default-on at
+    //   acceptable wall+RSS, OR Stage 6 production precise GC lands.
+    //   Until then the pool stays default-on; the gate stays as an
+    //   A/B opt-out.  Cross-ref: lode/EXIT_GC_SPIRAL_PLAN_2026-05-29
+    //   §4.3 amendment + lode/ROADMAP_TO_VISION_2026-05-15 deferred
+    //   retirement note.
     static const bool s_poolDisabled =
         std::getenv("NIX_V3_NO_CLOSURE_POOL") != nullptr;
     if (__builtin_expect(!s_poolDisabled, 1)) {

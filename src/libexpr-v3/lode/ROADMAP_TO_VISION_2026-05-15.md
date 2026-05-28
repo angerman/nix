@@ -296,6 +296,12 @@ Doing this before Stage 4 matters because: Stage 4 will push allocation rate up 
   Decide based on Stage 2 bench numbers + α-vs-β micro-bench. Default: choose α unless β shows ≥5% on canonical bench.
 - [ ] **Flip default**: rename `NIX_V3_NURSERY` to `NIX_V3_NO_NURSERY`; default-OFF (i.e. nursery default-on).
 - [ ] **Retire `_pad = 0xFA5E`, `CFF_FAKECLO_TAINTED`, `kFakeCloMagic`** and related sentinel infrastructure.
+  - **DEFERRED 2026-05-29** per `EXIT_GC_SPIRAL_PLAN_2026-05-29 §4.3` amendment.
+    The pool was wire-backed in commit `40e6abbdb` (Day 6-8) for a measured
+    -98.4 MB HNE / -704 MB M5 yield.  Retirement is conditional on
+    Phase E v0.2 shipping default-on OR Stage 6 production precise GC
+    landing — i.e. when the rest of v3's GC reclaims the 144 MB unaided,
+    delete the pool then.  Until then, leave the pool default-on.
 - [ ] **Add property-test**: under `V3_DBG_GC_STRESS`, run randomized expression evaluation and assert (a) no crash, (b) result matches non-stressed run. (3 days.) This is the property-test framework that the scorecard called out as an orphan; landing it here lets it cover all subsequent stages.
 - [ ] **Add differential-under-stress test mode** (added 2026-05-21 from round-2 R4):
   for each lang/eval-okay-*.nix + repro-*.nix + property-test case, run baseline
