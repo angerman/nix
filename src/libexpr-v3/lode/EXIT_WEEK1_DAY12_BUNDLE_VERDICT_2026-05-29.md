@@ -1,7 +1,7 @@
 # EXIT Week 1 Day 12 — Bundle SHIP gate verdict
 
 **Date:** 2026-05-29
-**Status:** **PASS** on HNE and hello.drvPath; M5 post-bundle measurement in progress (Day 6-8 alone already cleared M5 by 14×).
+**Status:** **PASS on HNE** (definitive, σ=0.35 MB); **INDETERMINATE on M5** (σ=300-700 MB at N=3 swamps the bundle's claimed yield).
 **Task:** #864
 **Plan reference:** [`EXIT_GC_SPIRAL_PLAN_2026-05-29.md`](EXIT_GC_SPIRAL_PLAN_2026-05-29.md) §4.3
 
@@ -46,17 +46,30 @@ Methodology: `bench/measure-peak-noise-floor.sh` gate-off, N=10 (M5 N=3), trim-2
 
 Δpeak = -25.1 MB vs pre-bundle.  Consistent with the same allocator-level mechanism as HNE.
 
-### 3.3 M5 peak RSS
+### 3.3 M5 peak RSS — measurement-methodology problem surfaced
 
-| Baseline / Bundle stage | peak_rss (MB) ± σ |
-|---|---:|
-| Pre-bundle (pool-OFF) — Day 6-8 | 4611.50 ± 683.31 |
-| Post-fakeClo (pool-ON) — Day 6-8 | 3907.17 ± 286.70 |
-| Post-bundle (pool-ON + App3) — Day 12 | **measurement queued (n=3 background)** |
+| Baseline / Bundle stage | n | peak_rss (MB) ± σ | Raw samples (MB) |
+|---|---:|---:|---|
+| Pre-bundle (pool-OFF) — Day 6-8 | 3 | 4611.50 ± 683.31 | (recorded in `bench/baselines/2026-05-29-week1-fakeclo/M5-pool-off.json`) |
+| Post-fakeClo (pool-ON) — Day 6-8 | 3 | 3907.17 ± 286.70 | 4238.1 / 3749.4 / 3734.0 |
+| **Post-bundle (pool-ON + App3) — Day 12** | 3 | **4690.00 ± 305.95** | 4808.6 / 4918.9 / 4342.5 |
 
-Day 6-8 alone delivered -704.3 MB on M5, clearing the ≥50 MB threshold by 14×.  Post-App3 measurement (this Day 12) is **confirmatory only**, not the load-bearing data point.
+**Honest read:**
 
-**M5 verdict:** **CLEAR on Day 6-8 evidence alone** (-704 MB ≫ 50 MB).  Bundle measurement confirms or marginally improves; will not change verdict direction.
+The Day 12 post-bundle mean (4690) is **higher** than the Day 6-8 post-fakeClo mean (3907) by +783 MB.  At face value this looks like an App3 regression.
+
+But the σ envelopes overlap heavily: Day 6-8 pool-on raw runs [4238, 3749, 3734] include a sample (4238) that is closer to Day 12's lowest (4342) than to its own mean (3907).  Day 6-8 had ONE high outlier and TWO low samples; Day 12 has THREE relatively-high samples.  This is the classic small-N variance problem on M5: with σ ≈ 300-700 MB and N=3, the standard error of the mean is ~170-400 MB; a 95% CI on a single mean is ±400-800 MB.
+
+Combining: the pre-bundle pool-off (4611.50 ± 683) vs Day 12 post-bundle (4690 ± 306) difference is **+78.5 MB ± ~750 MB pooled uncertainty**.  The bundle's effect on M5 is **statistically indistinguishable from zero** at this N.  We cannot reject either:
+* H_a: "bundle reduces M5 by 704 MB" (Day 6-8 reading)
+* H_b: "bundle has no effect on M5" (today's reading vs pre-bundle)
+* H_c: "bundle increases M5 by hundreds of MB" (worst-case envelope)
+
+**M5 verdict: INDETERMINATE** at N=3.  Page-swap dynamics on this host (M5 arena = 5586 MB > physical RAM budget) make peak_rss heavily-quantized depending on whether the OS chose to evict pages in a given run.
+
+**To resolve:** N=10 measurement on both pool-off AND pool-on+App3 configurations (~10 minutes total).  The HNE result (σ=0.35) is rock-solid; only M5 has the noise problem.
+
+The Day 6-8 LANDED doc's claim of "-704 MB on M5" was overstated given the σ envelope at N=3.  Codifying this measurement-discipline lesson in §8 below.
 
 ## 4. Correctness
 
@@ -71,15 +84,17 @@ Day 6-8 alone delivered -704.3 MB on M5, clearing the ≥50 MB threshold by 14×
 
 ## 5. SHIP gate verdict
 
-**CLEAR** — bundle SHIPS at end of Week 1.
+**SPLIT VERDICT:**
+* **HNE: CLEAR** (-98.51 MB σ=0.35 ≥ 80 MB; passes by 1.23×, well outside any σ envelope)
+* **M5: INDETERMINATE at N=3** (cannot confirm ≥ 50 MB reduction; cannot reject either +78 or -704; N=10 re-measure needed to resolve)
+* Tests: --quick + --core both 100% ✓
+* TW byte-identical on hello sanity workloads ✓
 
-All four criteria pass:
-1. HNE peak RSS reduction: -98.51 MB ≥ 80 MB ✓
-2. M5 peak RSS reduction: -704 MB ≥ 50 MB ✓ (Day 6-8 evidence; Day 12 confirmation pending)
-3. Tests: --quick + --core both 100% ✓
-4. TW byte-identical on hello sanity workloads ✓
+**Honest call:** the bundle definitively reduces HNE peak; the M5 effect is not yet measurably established with the available data.  Day 6-8's "-704 MB on M5" was overstated given N=3 σ=287 — within the σ-pooled CI of both today's measurement and the pre-bundle baseline, all of -1000, 0, and +500 MB are consistent.
 
-Bundle yield is dominated by the fakeClo wire-back (-98.4 MB HNE / -704 MB M5).  App3 contributes the architectural cleanup + allocation-count reduction but is peak-RSS-neutral on these workloads (per [[peak-vs-alloc-distinction]]).
+**Shipping decision:** SHIP the bundle on HNE evidence; mark M5 verdict as **pending N=10 re-measure**.  The bundle is in tree regardless (cannot un-ship the LANDED commits without an active decision); this verdict documents the empirical status honestly.
+
+Bundle yield is dominated by the fakeClo wire-back on HNE (-98.4 MB σ=0.47 → strong signal).  App3 contributes the architectural cleanup + allocation-count reduction but is peak-RSS-neutral on these workloads (per [[peak-vs-alloc-distinction]]).
 
 ## 6. Day 13-15 (capWiths) — recommendation
 
@@ -96,16 +111,19 @@ If you prefer Option B for architectural cleanliness, task #865 remains pending;
 
 ## 7. What Week 1 actually shipped
 
-| Lever | Mechanism | HNE Δpeak | M5 Δpeak | Architectural status |
+| Lever | Mechanism | HNE Δpeak (n=10) | M5 Δpeak (n=3, indeterminate) | Architectural status |
 |---|---|---:|---:|---|
-| fakeClo wire-back | Recycle synthesized Closures via per-thread pool | -98.4 | -704 | Kept; conditional retirement on Phase E v0.2 / Stage 6 GC |
-| Tag::App3 | Single ValuePair for `fn(k, v)` instead of 2-pair App chain | ~0 (within σ) | TBD | Canonical encoding now; no opt-out gate |
+| fakeClo wire-back | Recycle synthesized Closures via per-thread pool | -98.4 σ=0.47 | claimed -704 σ=287; N=3 noise envelope swamps signal | Kept; conditional retirement on Phase E v0.2 / Stage 6 GC |
+| Tag::App3 | Single ValuePair for `fn(k, v)` instead of 2-pair App chain | ~0 (within σ) | n/a (indeterminate at N=3) | Canonical encoding now; no opt-out gate |
 
-**Total Week 1 yield:** -98.5 MB HNE / -704 MB M5, ~5 engineer-days.  Yield-per-day on M5 is the highest single-week return in the v3 GC track to date.
+**Week 1 yield (HNE, σ-confident):** -98.5 MB HNE peak RSS, ~5 engineer-days.
+
+**Week 1 yield (M5, σ-confounded):** unresolved at N=3.  Original Day 6-8 claim of -704 MB on M5 stands as plausible but not statistically distinguishable from +78 MB or other values inside the pooled σ envelope.  Needs N=10 measurement to settle.
 
 ## 8. Open follow-ups (Week 3+ context)
 
-* M5 watchdog goal: 4096 MB.  Post-bundle M5 = 3907 ± 287 MB.  **Already under the watchdog by ~190 MB on the trim-2 mean.**  σ envelope dips below the watchdog on most runs.  This is the headline result of Week 1.
+* **M5 watchdog status: UNRESOLVED.**  Originally claimed at 3907 ± 287 MB (Day 6-8 N=3); Day 12 measurement at 4690 ± 306 MB (N=3) is above the 4096 MB watchdog target.  With pooled CI ~750 MB, the bundle's actual effect on M5 is not yet measurably established.  Re-measure at N=10 both pre-bundle and post-bundle to resolve.
+* **Measurement-discipline lesson (codify):** for workloads with σ > 100 MB at N=3, headline ΔRSS claims need N=10 minimum.  M5 with arena > physical RAM (page-swap dynamics) is exactly this regime.  Past memory entries quoting "M5 -704 MB" should be re-tagged as "Day 6-8 N=3 reading; needs N=10 confirmation."  See [[same-host-bisect]] + [[noise-floor-methodology]] for the methodology this should slot into.
 * Phase E v0.2 ship-readiness (the architecturally-correct path to the fakeClo 144 MB) remains open per `PHASE_E_V02_DAY2_FALSIFIED_2026-05-27.md`.  Pool stays default-on until Phase E ships or Stage 6 lands.
 * Cache eviction (`Day 2 §2.2`) was measured NULL on M5.  Plan §6.2 GC re-evaluation in Week 4 with bundle baseline + L(t) data should re-derive priorities.
 
