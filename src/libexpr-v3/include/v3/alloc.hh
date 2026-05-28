@@ -939,6 +939,16 @@ public:
         // blocks to find owner.  Only called on free-list pop,
         // which is rare relative to bump-allocations.
         setCellStartBitFor(p);
+        // Phase 3 reuse-safety (2026-05-28): zero the cell so it
+        // matches the calloc-zero-init guarantee of bump-allocated
+        // fresh cells.  Without this, popped cells carry STALE bytes
+        // from prior use — allocClosure/allocBindings/etc. only write
+        // a few header fields (size/state/nUpvalues), expecting other
+        // fields (kind, parent, cell, shapeCell, upvalues[], entries[])
+        // to be zero from calloc.  With reuse those would be garbage,
+        // causing spurious chain walks (Bindings::Kind::Chain from
+        // stale `kind` byte), bogus thunk states, bad slot pointers.
+        std::memset(p, 0, bytes);
         return p;
     }
     size_t freeListEntryCount() const noexcept { return freeListEntries_; }
@@ -1468,7 +1478,21 @@ struct Alloc
         // dominate nursery pressure (then we'd need a remembered
         // set / cell registry).
         auto * b = static_cast<Bindings *>(threadArena().alloc(bytes));
+        // Phase 3 reuse-safety (2026-05-28): allocBindings used to
+        // rely on calloc-zero-init of fresh arena blocks to give us
+        // kind=Sorted (=0) + _pad8=0 + parent=nullptr.  With free-list
+        // reuse, popped cells have STALE bytes — kind could be
+        // Kind::Chain, parent could be a garbage pointer.  lookup()
+        // then walks the spurious chain via b->parent and SIGSEGVs.
+        //
+        // Initialize the header explicitly so the Bindings is in a
+        // known-good state regardless of underlying memory's prior
+        // history.  Entries[] are still NOT initialized — callers
+        // MUST fill all n entries (existing contract).
+        b->kind = uint8_t(Bindings::Kind::Sorted);
+        b->_pad8[0] = b->_pad8[1] = b->_pad8[2] = 0;
         b->size = n;
+        b->parent = nullptr;
         // Track size distribution for VM-2 sizing decisions.  Cheap
         // (one branch + one increment) — runs once per attrset.
         //
