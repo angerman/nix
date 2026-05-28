@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-05-28T04:54:28.501253+00:00",
+  "workload": "firefox.name",
+  "config": "gate-on-reuse-on-stress",
+  "expr": "(import <nixpkgs> { }).firefox.name",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "gate_env": "NIX_V3_MAJOR_GC=1 V3_DBG_FREELIST_REUSE=1 V3_DBG_GC_STRESS=1000",
+  "extra_env": "",
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 239.112,
+      "sigma": 0.064,
+      "min": 239.0,
+      "max": 239.2,
+      "raw": [
+        239.1,
+        239.1,
+        239.1,
+        239.3,
+        239.0,
+        239.1,
+        239.2,
+        239.1,
+        239.2,
+        239.0
+      ]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 134.2,
+      "sigma": 0.0,
+      "min": 134.2,
+      "max": 134.2,
+      "raw": [
+        134.2,
+        134.2,
+        134.2,
+        134.2,
+        134.2,
+        134.2,
+        134.2,
+        134.2,
+        134.2,
+        134.2
+      ]
+    },
+    "elsewhere_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 0.0,
+      "sigma": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "raw": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "wall_s": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 0.29,
+      "sigma": 0.011,
+      "min": 0.281,
+      "max": 0.312,
+      "raw": [
+        0.301,
+        0.292,
+        0.329,
+        0.289,
+        0.312,
+        0.281,
+        0.281,
+        0.282,
+        0.281,
+        0.278
+      ]
+    }
+  }
+}

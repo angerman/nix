@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-05-28T04:54:11.545219+00:00",
+  "workload": "hello.drvPath",
+  "config": "gate-on-reuse-on-stress",
+  "expr": "(import <nixpkgs> { }).hello.drvPath",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "gate_env": "NIX_V3_MAJOR_GC=1 V3_DBG_FREELIST_REUSE=1 V3_DBG_GC_STRESS=1000",
+  "extra_env": "",
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 775.288,
+      "sigma": 0.064,
+      "min": 775.2,
+      "max": 775.4,
+      "raw": [
+        775.3,
+        775.2,
+        775.3,
+        775.2,
+        775.3,
+        775.3,
+        775.3,
+        774.4,
+        775.4,
+        775.7
+      ]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 587.2,
+      "sigma": 0.0,
+      "min": 587.2,
+      "max": 587.2,
+      "raw": [
+        587.2,
+        587.2,
+        587.2,
+        587.2,
+        587.2,
+        587.2,
+        587.2,
+        587.2,
+        587.2,
+        587.2
+      ]
+    },
+    "elsewhere_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 0.0,
+      "sigma": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "raw": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "wall_s": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 1.354,
+      "sigma": 0.028,
+      "min": 1.325,
+      "max": 1.4,
+      "raw": [
+        1.319,
+        1.4,
+        1.349,
+        1.345,
+        1.335,
+        1.337,
+        1.344,
+        1.47,
+        1.325,
+        1.393
+      ]
+    }
+  }
+}
