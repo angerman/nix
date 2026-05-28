@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-05-28T11:49:44.997546+00:00",
+  "workload": "M5",
+  "config": "gate-off",
+  "expr": "(builtins.getFlake \"/Users/angerman/Projects/iohk/cardano-node\").outputs.packages.x86_64-linux.cardano-node.name",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "gate_env": "",
+  "extra_env": "",
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 4045.875,
+      "sigma": 280.99,
+      "min": 3425.3,
+      "max": 4264.1,
+      "raw": [
+        3425.3,
+        4218.7,
+        4077.2,
+        4703.3,
+        4246.7,
+        4146.7,
+        4123.1,
+        4264.1,
+        2951.1,
+        3865.2
+      ]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 5586.8,
+      "sigma": 0.0,
+      "min": 5586.8,
+      "max": 5586.8,
+      "raw": [
+        5586.8,
+        5586.8,
+        5586.8,
+        5586.8,
+        5586.8,
+        5586.8,
+        5586.8,
+        5586.8,
+        5586.8,
+        5586.8
+      ]
+    },
+    "elsewhere_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 0.0,
+      "sigma": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "raw": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "wall_s": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 27.604,
+      "sigma": 0.603,
+      "min": 26.754,
+      "max": 28.455,
+      "raw": [
+        29.437,
+        27.526,
+        28.114,
+        26.388,
+        26.754,
+        28.193,
+        26.963,
+        27.365,
+        28.455,
+        27.464
+      ]
+    }
+  }
+}

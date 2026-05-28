@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-05-28T21:00:00+00:00",
+  "workload": "M5",
+  "config": "pool-off-app3-on",
+  "expr": "(builtins.getFlake \"/Users/angerman/Projects/iohk/cardano-node\").outputs.packages.x86_64-linux.cardano-node.name",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "gate_env": "NIX_V3_NO_CLOSURE_POOL=1",
+  "extra_env": "",
+  "notes": "Day 12 N=10 pool-off baseline for the SHIP-gate verdict. Run inline via nix CLI (not bench/measure-peak-noise-floor.sh — that script has no pool-off config). Pre-warm included. Trim-2 means drop max+min.",
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 4564.86,
+      "sigma": 336.79,
+      "min": 4021.5,
+      "max": 5021.4,
+      "raw": [2703.0, 4021.5, 4307.6, 4455.5, 5021.4, 4781.2, 4819.0, 5248.8, 4229.2, 4883.5]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10,
+      "n_used": 10,
+      "mean": 6392.1,
+      "sigma": 0.0,
+      "min": 6392.1,
+      "max": 6392.1,
+      "raw": [6392.1, 6392.1, 6392.1, 6392.1, 6392.1, 6392.1, 6392.1, 6392.1, 6392.1, 6392.1]
+    }
+  },
+  "comparison": {
+    "pool_on_app3_on_n10": {
+      "ref": "m5-gate-off-n10.json",
+      "peak_mb_mean": 4045.88,
+      "peak_mb_sigma": 280.99,
+      "arena_mb_mean": 5586.8,
+      "arena_mb_sigma": 0.0
+    },
+    "delta_peak_mb": -518.98,
+    "delta_peak_sigma_pooled": 437.36,
+    "delta_arena_mb": -805.30,
+    "delta_arena_sigma_pooled": 0.0,
+    "interpretation": "peak Δ = 1.2σ signal (likely real, wide CI); arena Δ = deterministic, replicates Day 6-8 reading exactly."
+  }
+}
