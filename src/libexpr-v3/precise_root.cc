@@ -95,10 +95,22 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
 
     // -- Standalone cell roots --------------------------------------
     // Registered global Values (singletons, transient cells).  The
-    // cell pointers themselves are tenured; we walk through to their
-    // contents.
+    // cell pointers themselves are tenured; both the CELL (16-byte
+    // Value at `cell`) AND its CONTENTS must be visited.
+    //
+    // Step 12′ (Immix, 2026-05-29) fix: previously this only called
+    // `visitValue(*cell)` which walks pointee contents but does NOT
+    // mark the cell itself.  Under flat MS this was tolerated because
+    // most standalone-cell allocators DON'T-FREE (registry is small).
+    // Under Immix's line-region allocator, the unmarked cell's line
+    // would be classified as DEAD by the free-span rebuild → the
+    // allocator overwrites the registered Value → corruption.
+    //
+    // `visitSlot(cell)` does tryMark + line-mark (Step 11′) +
+    // visitValue(*cell) internally, so the cell and its contents
+    // are walked correctly.
     for (Value * cell : standaloneCellRoots()) {
-        if (cell) visitor.visitValue(*cell);
+        if (cell) visitor.visitSlot(cell);
     }
 
     // -- Singleton closure registry (Phase 3.7, 2026-05-28) ---------
@@ -175,8 +187,11 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
 void walkGlobalV3Roots(RootVisitor & visitor) noexcept
 {
     // Standalone cell roots — singletons + registered transient cells.
+    // Step 12′ Immix fix: use visitSlot (line-marks the cell) instead
+    // of visitValue (only walks contents).  See walkAllV3Roots § for
+    // full reasoning.
     for (Value * cell : standaloneCellRoots()) {
-        if (cell) visitor.visitValue(*cell);
+        if (cell) visitor.visitSlot(cell);
     }
     // Stage 5: C++-stack roots (RAII-registered via `GcRoot`).
     walkCppStackRoots(visitor);

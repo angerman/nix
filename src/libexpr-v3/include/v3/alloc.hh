@@ -596,6 +596,20 @@ inline const bool g_freeListStatsEnabled =
 inline const bool g_stringsAttrEnabled =
     std::getenv("NIX_V3_STRINGS_ATTR") != nullptr;
 
+/// Step 12′ (Immix, 2026-05-29) — line-region allocator gate.
+/// When enabled (and NIX_V3_MAJOR_GC=1), allocations come from
+/// `Arena::freeSpans` rebuilt after each major GC.  Supersedes
+/// `V3_DBG_FREELIST_REUSE`: when both are set, Immix wins.  When
+/// IMMIX_ALLOC=0 and FREELIST_REUSE=1, falls back to per-exact-size
+/// free-list bins (legacy path, scheduled for retirement post-
+/// Step 12′ validation).
+///
+/// Retirement criterion (per Rule 0 §2): "Delete the gate (and
+/// `freeListBins_` legacy path) when Step 14′ honest re-measurement
+/// confirms Immix path meets SHIP gate."
+inline const bool g_immixAllocEnabled =
+    std::getenv("V3_DBG_IMMIX_ALLOC") != nullptr;
+
 } // namespace detail
 
 struct FreeListStats
@@ -683,6 +697,53 @@ inline void recordAllocCharsSite(const char * file,
         }
     }
     sites.push_back({file, line, 1, n});
+}
+
+// ---------------------------------------------------------------------------
+// ImmixAllocStats — Step 12′ Immix line-region allocator (2026-05-29).
+//
+// Per `GC_DECISION_2026-05-29 §3 New Step 12′`: hit rate ≥70% on
+// HNE is the acceptance gate.  This struct tracks the three event
+// classes for that measurement.
+//
+// Gate: `NIX_V3_FREE_LIST_STATS=1` (reused) reports these alongside
+// the per-bin free-list stats (which become 0 under Immix since
+// the legacy bin path is bypassed when `V3_DBG_IMMIX_ALLOC=1`).
+// ---------------------------------------------------------------------------
+
+struct ImmixAllocStats
+{
+    /// Total `Arena::alloc()` calls when Immix path is active
+    /// (gate on + non-huge byte size).  Equal to the sum of the
+    /// three event counters below.
+    uint64_t allocs = 0;
+
+    /// Alloc served from the CURRENT span without advancing
+    /// (`immixCur_ + bytes <= immixEnd_`).  The fast path.
+    uint64_t spanHits = 0;
+
+    /// Alloc that required advancing to one or more next-spans
+    /// (current span too small or exhausted).  Slower path but
+    /// still serves from reclaimed lines.
+    uint64_t spanAdvances = 0;
+
+    /// Alloc that exhausted all freeSpans and fell through to
+    /// `refill()` for a fresh block bump.  Represents "could not
+    /// reuse" — the inverse of hit rate.
+    uint64_t bumpFresh = 0;
+
+    /// Cumulative bytes served from spans (spanHits + spanAdvances
+    /// allocs).  Used to compute byte-weighted hit rate.
+    uint64_t bytesFromSpans = 0;
+
+    /// Cumulative bytes served from fresh-block bump (bumpFresh).
+    uint64_t bytesFromBump  = 0;
+};
+
+inline ImmixAllocStats & immixAllocStats()
+{
+    static ImmixAllocStats stats;
+    return stats;
 }
 
 /// Map a byte size to its log2-bin.  bin 0 covers [16, 32); each bin
@@ -798,6 +859,12 @@ public:
     /// uses only the active region (cells stay in place).
     struct HugeBlock { char * begin; char * end; };
 
+    /// Step 12′ (Immix, 2026-05-29): contiguous zero-mark line
+    /// range within a single arena block.  `begin` + `end` are
+    /// kLineBytes-aligned byte pointers; alloc bumps within
+    /// [begin, end).
+    struct FreeSpan { char * begin; char * end; };
+
     struct Region {
         char *  cur        = nullptr;
         char *  end        = nullptr;
@@ -844,6 +911,28 @@ public:
         /// via Arena::s_majorGcEnabled).  Cost when gate OFF: zero
         /// memory (vector stays empty), single branch in refill().
         std::vector<std::vector<uint64_t>> lineMarks;
+
+        /// Step 12′ (Immix line-region allocator, 2026-05-29):
+        /// per-block list of free spans (contiguous zero-mark line
+        /// ranges) rebuilt after each major GC.  Parallel to
+        /// `blocks` (freeSpans[i] is the span list for blocks[i]).
+        ///
+        /// Each `FreeSpan` is a [begin, end) byte range aligned to
+        /// kLineBytes (128 B) on both ends.  The allocator bump-
+        /// allocates within a span until it's exhausted, then
+        /// advances to the next span in the same block (or next
+        /// block).  Cells smaller than the line size still consume
+        /// only their bytes, not a full line — the line bookkeeping
+        /// is page-level for span construction; the allocator
+        /// internally fragments by cell granularity.
+        ///
+        /// Lifetime: rebuilt by `rebuildFreeSpansFromLineMarks()`
+        /// at end of each `runMajorMarkSweep`; consumed by
+        /// `Arena::alloc()` until next major GC.
+        ///
+        /// Maintained only when `NIX_V3_MAJOR_GC=1` AND
+        /// `V3_DBG_IMMIX_ALLOC=1`.  Zero memory cost otherwise.
+        std::vector<std::vector<FreeSpan>> freeSpans;
     };
 
     void * alloc(size_t bytes) noexcept
@@ -911,9 +1000,63 @@ public:
                 ++fls.requestsByBin[bin];
             }
         }
+
+        // Step 12′ (Immix, 2026-05-29): line-region allocator path.
+        // When gate ON, try the current free span first (fast path:
+        // 1 cmp + 1 bump), advancing to next span if exhausted.
+        // Bypasses the legacy `freeListBins_` path entirely.
+        //
+        // Acceptance gate (per task #848): hit rate (allocs served
+        // from spans / total allocs) ≥70% on HNE.
+        if (__builtin_expect(majorGcEnabled() && detail::g_immixAllocEnabled, 0)) {
+            auto & is = immixAllocStats();
+            ++is.allocs;
+            // Fast path: current span has room.
+            if (immixCur_ && immixCur_ + bytes <= immixEnd_) {
+                void * p = immixCur_;
+                immixCur_ += bytes;
+                setCellStartBitInBlock(p, immixCurBlockIdx_);
+                // Phase 3.6 reuse-safety (carried over for Immix):
+                // span bytes hold STALE data from previously-live
+                // cells.  Allocators (allocBindings/allocClosure/...)
+                // only write a few header fields and expect zero-init
+                // for the rest (calloc convention).  Without memset
+                // here, stale `kind` bytes cause Bindings::lookup to
+                // chase a garbage `parent` chain → SIGSEGV.
+                std::memset(p, 0, bytes);
+                ++is.spanHits;
+                is.bytesFromSpans += bytes;
+                return p;
+            }
+            // Slow path: advance through spans until one fits.
+            while (immixAdvanceToNextSpan()) {
+                if (immixCur_ + bytes <= immixEnd_) {
+                    void * p = immixCur_;
+                    immixCur_ += bytes;
+                    setCellStartBitInBlock(p, immixCurBlockIdx_);
+                    std::memset(p, 0, bytes);  // Phase 3.6 reuse-safety
+                    ++is.spanAdvances;
+                    is.bytesFromSpans += bytes;
+                    return p;
+                }
+                // Current span too small for this alloc; immixAdvance
+                // continues iterating until exhaustion or fit.
+            }
+            // All spans exhausted; fall through to fresh-block bump.
+            ++is.bumpFresh;
+            is.bytesFromBump += bytes;
+            // Fall through to bump path below — do NOT return here.
+        }
+
         static const bool s_reuseOn =
             std::getenv("V3_DBG_FREELIST_REUSE") != nullptr;
-        if (__builtin_expect(majorGcEnabled() && s_reuseOn, 0)) {
+        // Step 12′: legacy freeListBins_ path active ONLY when
+        // V3_DBG_IMMIX_ALLOC=0.  When Immix is on, the bin path is
+        // bypassed (its hits/misses would be wrong against the Immix
+        // line-region state).  See GC_DECISION §6 — this entire
+        // section retires when Step 14′ SHIP gate clears.
+        if (__builtin_expect(majorGcEnabled() && s_reuseOn
+                             && !detail::g_immixAllocEnabled, 0)) {
             if (void * p = freeListTryPop(bytes)) {
                 // Step 6: count the hit.  Bin is the requested size's
                 // bin, NOT the popped slot's actual bin (per-exact-size
@@ -1099,6 +1242,183 @@ public:
         // this is close enough; precise accounting is reportSweepCost
         // / live_trace.cc.
         return {total, deadLines};
+    }
+
+    // ============================================================
+    // Step 12′ — Immix line-region allocator API (2026-05-29).
+    //
+    // Per `GC_DECISION_2026-05-29.md §3 New Step 12′`: after each
+    // major GC, scan the per-block line-mark bitmap and build a
+    // list of contiguous zero-bit (free-line) ranges per block.
+    // Allocator bumps within these ranges instead of consuming a
+    // fresh block bump pointer.
+    //
+    // Gate: V3_DBG_IMMIX_ALLOC=1 (must be ON together with
+    // NIX_V3_MAJOR_GC=1).  Zero cost when OFF.
+    //
+    // Retirement (per Rule 0): "Delete `freeListBins_` + the env
+    // gate once Step 14′ honest re-measurement confirms Immix path
+    // meets SHIP gate."
+    // ============================================================
+
+    /// Walk `active_.lineMarks` per-block, identify contiguous runs
+    /// of zero bits (= "fully dead lines"), and build `active_.freeSpans`.
+    /// Resets `immixCur_/Idx_` state so next alloc starts at the
+    /// first span of the first block with non-empty spans.
+    ///
+    /// Called by `runMajorMarkSweep` AFTER sweep completes.
+    /// No-op when major-GC gate OFF.
+    ///
+    /// Span construction algorithm: word-by-word scan of bits.
+    /// * word == 0          → entire 64 lines are dead; extend run
+    /// * word == ~0ULL      → all 64 lines live; close any open run
+    /// * mixed              → walk bits within word
+    void rebuildFreeSpansFromLineMarks() noexcept
+    {
+        if (!majorGcEnabled()) return;
+        const size_t nBlocks = active_.blocks.size();
+        active_.freeSpans.clear();
+        active_.freeSpans.resize(nBlocks);
+        if (nBlocks > active_.lineMarks.size()) return;
+        // Step 12′ correctness fix (2026-05-29): the ACTIVE block's
+        // reserve tail (`active_.cur` .. `active_.end`) holds no cells
+        // — those bytes are reserved for the bump allocator's NEXT
+        // allocation.  Their lineMarks bits are 0 (no live cell there),
+        // so a naive freeSpans rebuild would include them in spans.
+        // Immix would then allocate from those bytes WHILE bump also
+        // hands them out — same bytes returned twice → corruption.
+        //
+        // Mark the reserve-tail lines as "live" (set bits) before
+        // span construction, so they're excluded from freeSpans.
+        // The non-active blocks have no bump pointer (fully populated
+        // before refill moved on), so this only applies to the LAST
+        // block when active_.cur is valid.
+        if (active_.cur && active_.end && !active_.blocks.empty()) {
+            const size_t lastIdx = active_.blocks.size() - 1;
+            const char * lastBlk = active_.blocks[lastIdx];
+            // Verify active_.cur is in the last block.
+            if (active_.cur >= lastBlk &&
+                active_.cur <  lastBlk + kBlockSize &&
+                lastIdx < active_.lineMarks.size())
+            {
+                const size_t curOffset =
+                    static_cast<size_t>(active_.cur - lastBlk);
+                // First line at or after cur is reserved.  If cur
+                // lands MID-line (line contains both live cells before
+                // cur and reserve bytes after), the partially-live
+                // case is already covered by the live cell's mark; we
+                // only need to RESERVE lines fully past cur.
+                const size_t firstReserveLine =
+                    (curOffset + kLineBytes - 1) / kLineBytes;
+                auto & bits = active_.lineMarks[lastIdx];
+                for (size_t L = firstReserveLine;
+                     L < kLinesPerBlock && (L >> 6) < bits.size();
+                     ++L)
+                {
+                    bits[L >> 6] |= 1ULL << (L & 63);
+                }
+            }
+        }
+        for (size_t bi = 0; bi < nBlocks; ++bi) {
+            auto & blockSpans = active_.freeSpans[bi];
+            const auto & bits = active_.lineMarks[bi];
+            char * blkBase = active_.blocks[bi];
+            const size_t nWords = bits.size();
+            if (nWords == 0) continue;
+            // Walk bit-by-bit at outer level for clarity (the inner
+            // word-level fast paths can be added later if perf bad).
+            size_t lineIdx = 0;
+            while (lineIdx < kLinesPerBlock) {
+                // Skip leading live lines.
+                while (lineIdx < kLinesPerBlock &&
+                       (bits[lineIdx >> 6] >> (lineIdx & 63)) & 1ULL) {
+                    ++lineIdx;
+                }
+                if (lineIdx >= kLinesPerBlock) break;
+                const size_t spanStart = lineIdx;
+                // Skip dead lines (the span body).
+                while (lineIdx < kLinesPerBlock &&
+                       !((bits[lineIdx >> 6] >> (lineIdx & 63)) & 1ULL)) {
+                    ++lineIdx;
+                }
+                const size_t spanEnd = lineIdx;
+                blockSpans.push_back({
+                    blkBase + spanStart * kLineBytes,
+                    blkBase + spanEnd   * kLineBytes
+                });
+            }
+        }
+        // Reset allocator state to start fresh in span 0 of block 0.
+        immixCurBlockIdx_ = 0;
+        immixCurSpanIdx_  = 0;
+        immixCur_         = nullptr;
+        immixEnd_         = nullptr;
+        immixAdvanceToNextSpan();
+    }
+
+    /// Advance allocator to the next available free span.  Returns
+    /// true if a span was found (immixCur_/End_ are now valid for
+    /// bumping); false if all spans across all blocks exhausted.
+    ///
+    /// Empty spans (begin == end) are skipped.
+    bool immixAdvanceToNextSpan() noexcept
+    {
+        while (immixCurBlockIdx_ < active_.freeSpans.size()) {
+            auto & blockSpans = active_.freeSpans[immixCurBlockIdx_];
+            while (immixCurSpanIdx_ < blockSpans.size()) {
+                const FreeSpan & span = blockSpans[immixCurSpanIdx_];
+                ++immixCurSpanIdx_;
+                if (span.begin < span.end) {
+                    immixCur_ = span.begin;
+                    immixEnd_ = span.end;
+                    return true;
+                }
+            }
+            ++immixCurBlockIdx_;
+            immixCurSpanIdx_ = 0;
+        }
+        immixCur_ = nullptr;
+        immixEnd_ = nullptr;
+        return false;
+    }
+
+    /// Step 12′ helper: set the cell-start bit for an address known
+    /// to be in `blocks[blockIdx]`.  Used by the Immix alloc path
+    /// where the block index is already known from `immixCurBlockIdx_`,
+    /// avoiding the linear-scan in `setCellStartBitFor()`.
+    void setCellStartBitInBlock(const void * p, size_t blockIdx) noexcept
+    {
+        if (!majorGcEnabled() || !p) return;
+        if (blockIdx >= active_.cellStarts.size()) return;
+        const char * blk = active_.blocks[blockIdx];
+        const size_t offset =
+            static_cast<size_t>(static_cast<const char *>(p) - blk);
+        const size_t bit = offset >> 4;
+        const size_t word = bit >> 6;
+        auto & bits = active_.cellStarts[blockIdx];
+        if (word < bits.size()) {
+            bits[word] |= 1ULL << (bit & 63);
+        }
+    }
+
+    /// Accessor for diagnostic + downstream Step 13′ recycle policy.
+    const std::vector<std::vector<FreeSpan>> & freeSpansForBlocks() const noexcept
+        { return active_.freeSpans; }
+
+    /// Aggregate (total bytes in spans, span count) across all
+    /// blocks.  Used by sweep stats banner to verify the rebuilt
+    /// spans match the line-mark dead-line count.
+    std::pair<size_t, size_t> countFreeSpanBytes() const noexcept
+    {
+        size_t totalBytes = 0;
+        size_t totalSpans = 0;
+        for (const auto & blockSpans : active_.freeSpans) {
+            totalSpans += blockSpans.size();
+            for (const auto & s : blockSpans) {
+                totalBytes += static_cast<size_t>(s.end - s.begin);
+            }
+        }
+        return {totalBytes, totalSpans};
     }
 
     /// Stage 6 Phase 3.5: backward search for the cell-start at or
@@ -1444,8 +1764,26 @@ private:
     /// Stage 6 Phase 3: free-list bins keyed by exact (16-byte-
     /// aligned) byte size.  Populated by sweep; popped by
     /// alloc()'s slow path.  Lifetime: persistent across GC cycles.
+    ///
+    /// SCHEDULED FOR RETIREMENT after Step 12′ Immix path validates
+    /// (see GC_DECISION_2026-05-29 §6 + IMMIX_LINE_MARK_2026-05-29).
+    /// Kept for one validation cycle so V3_DBG_IMMIX_ALLOC=0 falls
+    /// back gracefully.
     std::unordered_map<size_t, std::vector<void *>> freeListBins_;
     size_t freeListEntries_ = 0;
+
+    /// Step 12′ (Immix, 2026-05-29) — line-region allocator state.
+    /// Updated by `Arena::alloc()` to track the current bump pointer
+    /// within the active free span; reset by
+    /// `rebuildFreeSpansFromLineMarks()` at end of each major GC.
+    ///
+    /// All four fields are nullptr/0 when Immix path is unused
+    /// (V3_DBG_IMMIX_ALLOC unset OR major-GC gate off OR no GC
+    /// fired yet).
+    size_t immixCurBlockIdx_ = 0;
+    size_t immixCurSpanIdx_  = 0;
+    char * immixCur_         = nullptr;
+    char * immixEnd_         = nullptr;
 
     /// Slow-path helper used on free-list pop to re-set the cell-
     /// start bit at `p`'s offset.

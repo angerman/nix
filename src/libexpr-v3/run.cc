@@ -1279,6 +1279,46 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             std::fprintf(stderr,
                 "  ----- free-list verdict: %s\n", verdict);
         }
+        // Step 12′ of post-Phase-3.8 plan (2026-05-29): Immix
+        // allocator hit-rate stats.  Only emitted under
+        // V3_DBG_IMMIX_ALLOC=1.  Pre-committed acceptance per
+        // task #848: hit rate ≥70% on HNE.
+        if (std::getenv("V3_DBG_IMMIX_ALLOC") != nullptr) {
+            const auto & is = immixAllocStats();
+            const uint64_t served = is.spanHits + is.spanAdvances;
+            const double allocPct = is.allocs > 0
+                ? 100.0 * double(served) / double(is.allocs)
+                : 0.0;
+            const uint64_t totalBytes = is.bytesFromSpans + is.bytesFromBump;
+            const double bytePct = totalBytes > 0
+                ? 100.0 * double(is.bytesFromSpans) / double(totalBytes)
+                : 0.0;
+            std::fprintf(stderr,
+                "v3-direct immix-alloc: "
+                "allocs=%llu spanHits=%llu spanAdvances=%llu "
+                "bumpFresh=%llu\n"
+                "  served-from-spans: %llu (%.2f%% of allocs)\n"
+                "  bytes-from-spans:  %.2f MB (%.2f%% of %.2f MB total)\n",
+                (unsigned long long)is.allocs,
+                (unsigned long long)is.spanHits,
+                (unsigned long long)is.spanAdvances,
+                (unsigned long long)is.bumpFresh,
+                (unsigned long long)served, allocPct,
+                double(is.bytesFromSpans) / (1ULL << 20), bytePct,
+                double(totalBytes) / (1ULL << 20));
+            // Pre-committed verdict per task #848.
+            const char * verdict;
+            if (allocPct >= 70.0) {
+                verdict = "PASS (hit rate ≥70% — Step 12′ acceptance MET)";
+            } else if (allocPct < 30.0) {
+                verdict = "FAIL (hit rate <30% — Step 12′ acceptance MISSED)";
+            } else {
+                verdict = "MARGINAL (30-70% — judgment call)";
+            }
+            std::fprintf(stderr,
+                "  ----- immix-alloc verdict: %s\n", verdict);
+        }
+
         // Step 18 of post-Phase-3.8 plan (2026-05-29): per-site
         // allocChars attribution dump.  Only emitted under
         // NIX_V3_STRINGS_ATTR=1.

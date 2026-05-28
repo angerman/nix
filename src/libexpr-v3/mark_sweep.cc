@@ -857,6 +857,17 @@ void runMajorMarkSweep(VMState & vm) noexcept
         }
     }
 
+    // Step 12′ (Immix, 2026-05-29): rebuild free-line spans from the
+    // post-mark line-mark bitmap.  Spans drive `Arena::alloc()` until
+    // the next major GC.  Resets the immix bump-pointer state so
+    // next alloc starts at span 0 of block 0.
+    //
+    // Must happen AFTER blocksToFree (freeWholeBlock removes
+    // entries from lineMarks; this rebuild walks the surviving set).
+    // No-op when V3_DBG_IMMIX_ALLOC=0 (the Arena alloc path skips
+    // the Immix branch and the rebuilt freeSpans are unused).
+    arena.rebuildFreeSpansFromLineMarks();
+
     const auto tSweepEnd = clock::now();
     const double markMs =
         std::chrono::duration<double, std::milli>(tMarkEnd - tStart)
@@ -923,6 +934,16 @@ void runMajorMarkSweep(VMState & vm) noexcept
                 "(Immix acceptance ≥30%%)\n",
                 arena.lineMarkBitmaps().size(),
                 totalLines, deadLines, deadPct);
+        }
+        // Step 12′ (Immix, 2026-05-29): free-spans summary alongside
+        // line-marks.  After rebuild, these spans drive the Immix
+        // allocator until the next GC.
+        {
+            const auto [spanBytes, spanCount] = arena.countFreeSpanBytes();
+            std::fprintf(stderr,
+                "v3 free-spans: blocks=%zu spans=%zu spanBytes=%.1fMB\n",
+                arena.freeSpansForBlocks().size(),
+                spanCount, spanBytes / 1e6);
         }
     }
 }

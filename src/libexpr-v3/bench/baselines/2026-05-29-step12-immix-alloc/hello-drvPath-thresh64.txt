@@ -1,0 +1,346 @@
+warning: Git tree '/Users/angerman/Projects/iohk/nix' is dirty
+Failed to increase stack size from 8372224 to 62914560 (desired: 62914560, maximum allowed: 67092480): Invalid argument
+v3-direct alloc: values=0 closures=1 thunks=0 lists=0 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=2
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=0 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=0 129+=0
+v3-direct memory: peak_rss=30.9MB boehm_heap=402.9MB boehm_free=402.9MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               10  ~   0.0 MB  (capacity=16)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable              9  ~   0.0 MB  (capacity=16, stringBytes=20)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg            1  ~   0.0 MB  (capacity=1)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.1 MB -----
+v3-direct immix-alloc: allocs=1 spanHits=0 spanAdvances=0 bumpFresh=1
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=2 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=4
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.2MB boehm_heap=402.9MB boehm_free=402.9MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               17  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            137  ~   0.0 MB  (capacity=256, stringBytes=1171)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg            2  ~   0.0 MB  (capacity=2)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.1 MB -----
+v3-direct immix-alloc: allocs=13 spanHits=0 spanAdvances=0 bumpFresh=13
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=3 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=6
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.2MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               19  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            139  ~   0.0 MB  (capacity=256, stringBytes=1183)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg            3  ~   0.0 MB  (capacity=4)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.1 MB -----
+v3-direct immix-alloc: allocs=14 spanHits=0 spanAdvances=0 bumpFresh=14
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=4 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=8
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.3MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               24  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            140  ~   0.0 MB  (capacity=256, stringBytes=1187)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg            4  ~   0.0 MB  (capacity=4)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.1 MB -----
+v3-direct immix-alloc: allocs=15 spanHits=0 spanAdvances=0 bumpFresh=15
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=5 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=10
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.3MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               26  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            141  ~   0.0 MB  (capacity=256, stringBytes=1188)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg            5  ~   0.0 MB  (capacity=8)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.1 MB -----
+v3-direct immix-alloc: allocs=16 spanHits=0 spanAdvances=0 bumpFresh=16
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=6 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=12
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.3MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               27  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            141  ~   0.0 MB  (capacity=256, stringBytes=1188)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg            6  ~   0.0 MB  (capacity=8)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.1 MB -----
+v3-direct immix-alloc: allocs=17 spanHits=0 spanAdvances=0 bumpFresh=17
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=7 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=14
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.3MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               31  ~   0.0 MB  (capacity=32)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            143  ~   0.0 MB  (capacity=256, stringBytes=1195)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg            7  ~   0.0 MB  (capacity=8)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.1 MB -----
+v3-direct immix-alloc: allocs=18 spanHits=0 spanAdvances=0 bumpFresh=18
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=8 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=16
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.3MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               42  ~   0.0 MB  (capacity=64)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            145  ~   0.0 MB  (capacity=256, stringBytes=1205)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg            8  ~   0.0 MB  (capacity=8)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.1 MB -----
+v3-direct immix-alloc: allocs=19 spanHits=0 spanAdvances=0 bumpFresh=19
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=9 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=18
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.3MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               42  ~   0.0 MB  (capacity=64)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            145  ~   0.0 MB  (capacity=256, stringBytes=1205)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg            9  ~   0.0 MB  (capacity=16)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.1 MB -----
+v3-direct immix-alloc: allocs=20 spanHits=0 spanAdvances=0 bumpFresh=20
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=10 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=20
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.6MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool               99  ~   0.0 MB  (capacity=128)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            187  ~   0.0 MB  (capacity=256, stringBytes=1620)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg           10  ~   0.0 MB  (capacity=16)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.2 MB -----
+v3-direct immix-alloc: allocs=21 spanHits=0 spanAdvances=0 bumpFresh=21
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+v3-direct alloc: values=0 closures=11 thunks=0 lists=1 attrsets=0 pairs=0 thunksForced=0 bridge=0 insns=22
+v3-direct bytes (in arena/nursery): values=0.0MB closures=0.0MB thunks=0.0MB envs=0.0MB lists=0.0MB bindings=0.0MB pairs=0.0MB chars=0.0MB total_alloc=0.0MB arena_pinned=16.8MB
+v3-direct bindings size hist: 0=0 1=0 2=2 3-4=0 5-8=0 9-16=0 17-32=0 33-64=0 65-128=1 129+=0
+v3-direct memory: peak_rss=31.6MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=16.8MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide              0  ~   0.0 MB  (buckets=0, strings=0, body=0 B)
+  posSnapshotPool              121  ~   0.0 MB  (capacity=128)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable            198  ~   0.0 MB  (capacity=256, stringBytes=1706)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg           11  ~   0.0 MB  (capacity=16)
+  arena.cellStarts        <phase3>  ~   0.1 MB  (per-block 128 KB)
+  arena.freeList                 0  ~   0.0 MB  (live entries)
+  ----- elsewhere-probe sum: ~0.2 MB -----
+v3-direct immix-alloc: allocs=22 spanHits=0 spanAdvances=0 bumpFresh=22
+  served-from-spans: 0 (0.00% of allocs)
+  bytes-from-spans:  0.00 MB (0.00% of 0.00 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+warning: Nix search path entry '/nix/var/nix/profiles/per-user/root/channels' does not exist, ignoring
+v3 major-mark-sweep: closures=4725 thunks=113026 bindings=5852 lists=78359 pairs=442221 cells=107181 chars=243171 cons=42924 consW=915045 markedCells=1033113 blocks=7 hugeMarked=4346 markMs=49.78 sweepMs=8.64
+v3 sweep: blocksScanned=7 liveCells=915246 deadCells=170074 liveBytes=80.4MB deadBytes=37.0MB reclaim%=31.5% freelist_entries=170074 blocksFreed=0 bytesFreed=0.0MB
+v3 line-marks: blocks=8 totalLines=1048576 deadLines=269756 deadPct=25.73% (Immix acceptance ≥30%)
+v3 free-spans: blocks=8 spans=12826 spanBytes=34.5MB
+v3 major-mark-sweep: closures=12470 thunks=214155 bindings=31362 lists=129579 pairs=574814 cells=202944 chars=319110 cons=140934 consW=23307529 markedCells=1621772 blocks=33 hugeMarked=3596 markMs=580.15 sweepMs=46.71
+v3 sweep: blocksScanned=33 liveCells=1369019 deadCells=1287360 liveBytes=448.2MB deadBytes=105.4MB reclaim%=19.0% freelist_entries=1457434 blocksFreed=0 bytesFreed=0.0MB
+v3 line-marks: blocks=34 totalLines=4456448 deadLines=840446 deadPct=18.86% (Immix acceptance ≥30%)
+v3 free-spans: blocks=34 spans=56565 spanBytes=107.6MB
+v3-direct alloc: values=0 closures=247538 thunks=655059 lists=98831 attrsets=198453 pairs=625024 thunksForced=294519 bridge=0 insns=14759033
+v3-direct bytes (in arena/nursery): values=1.6MB closures=44.9MB thunks=54.3MB envs=0.0MB lists=12.4MB bindings=408.2MB pairs=30.0MB chars=7.6MB total_alloc=559.1MB arena_pinned=570.4MB
+v3-direct bindings size hist: 0=3323 1=63228 2=71564 3-4=15224 5-8=15221 9-16=5368 17-32=6484 33-64=7683 65-128=2004 129+=5417
+v3-direct mergeBindings by site (total 25275 calls, 364.2 MB):
+  [0] OP_ATTRS_UPDATE             (//)  calls=4332       bytes=   2.3 MB (  0.6 % of total)
+  [1] OP_ATTRS_UPDATE_TAIL        (//)  calls=20943      bytes= 362.0 MB ( 99.4 % of total)
+  (UPDATE_TAIL na histogram, total=20943):
+    na 0        = 671
+    na 1        = 1060
+    na 2-4      = 2780
+    na 5-8      = 1628
+    na 9-16     = 1357
+    na 17-32    = 1858
+    na 33-64    = 5237
+    na 65-128   = 1224
+    na 129-256  = 224
+    na 257+     = 4904
+  (UPDATE_TAIL nb histogram, total=20943):
+    nb 0        = 1866
+    nb 1        = 7715
+    nb 2-4      = 5224
+    nb 5-8      = 2570
+    nb 9-16     = 1008
+    nb 17-32    = 1598
+    nb 33-64    = 584
+    nb 65-128   = 147
+    nb 129-256  = 91
+    nb 257+     = 140
+v3-direct memory: peak_rss=827.7MB boehm_heap=402.9MB boehm_free=402.8MB boehm_unmapped=0.0MB v3_arena=570.4MB elsewhere=0.0MB
+v3-direct boehm: gc_count=1 gc_total_ms=0 (time spent in full collections during process lifetime)
+v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=0 __v3_force_attr=0 __v3_force_list_elem=0
+v3 primop call counts (top 30 of 71):
+     32973  elem
+     18259  isAttrs
+     15439  __derivCoerce
+      8554  toString
+      7170  genList
+      6408  __elem
+      5920  __attrNames
+      4243  __isString
+      3619  removeAttrs
+      2743  isList
+      2722  mapAttrs
+      2438  isFunction
+      2081  concatStringsSep
+      1681  length
+      1650  match
+      1591  __concatLists
+      1548  __intersectAttrs
+      1502  __elemAt
+      1442  listToAttrs
+      1249  __head
+      1213  replaceStrings
+      1102  __listToAttrs
+      1098  stringLength
+      1008  __isBool
+       952  import
+       892  __isInt
+       809  readDir
+       771  unsafeDiscardStringContext
+       760  __replaceStrings
+       661  __isPath
+v3-direct ifd probes: total=983 import=952 readFile=3 readDir=19 pathExists=5 findFile=4
+v3-direct ifd probes (with-ctx, potential IFD): 0 — all probes were literal-path calls; no IFD candidates
+v3-direct elsewhere-probe (entries / est_MB):
+  stringContextSide           6814  ~   1.4 MB  (buckets=12853, strings=9560, body=545036 B)
+  posSnapshotPool           151807  ~  14.5 MB  (capacity=262144)
+  bindingsOriginTable            0  ~   0.0 MB  (buckets=0)
+  cellOwnerTable                 0  ~   0.0 MB  (buckets=0)
+  globalSymbolTable          55393  ~   4.6 MB  (capacity=65536, stringBytes=566166)
+  dirtyContainers                0  ~   0.0 MB  (capacity=0)
+  standaloneCellRoots            0  ~   0.0 MB  (capacity=0)
+  nursery (Y+S buffs)       <mmap>  ~   0.0 MB
+  singletonClosureReg          440  ~   0.0 MB  (capacity=512)
+  arena.cellStarts        <phase3>  ~   4.5 MB  (per-block 128 KB)
+  arena.freeList           1457434  ~  23.3 MB  (live entries)
+  ----- elsewhere-probe sum: ~48.2 MB -----
+v3-direct immix-alloc: allocs=2854579 spanHits=149955 spanAdvances=2724 bumpFresh=2701900
+  served-from-spans: 152679 (5.35% of allocs)
+  bytes-from-spans:  15.18 MB (2.79% of 543.42 MB total)
+  ----- immix-alloc verdict: FAIL (hit rate <30% — Step 12′ acceptance MISSED)
+"/nix/store/r77jznkw60xvqjzs3jvd1dn54pxcqs68-hello-2.12.3.drv"
