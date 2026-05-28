@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "workload": "HNE",
+  "config": "intern-off",
+  "expr": "(builtins.getFlake \"/Users/angerman/Projects/iohk/haskell-nix-example\").packages.x86_64-linux.hello.drvPath",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "gate_env": "NIX_V3_NO_CAPWITHS_INTERN=1",
+  "binary": "builddir/src/nix/nix (32.7 MB debug build, mtime 2026-05-28T21:42:00Z)",
+  "notes": "Inline measurement (bench script lacks a no-capwiths-intern config). Trim-2 drop max+min. Pair to hne-gate-off.json (intern-on via bench script).",
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 3875.71,
+      "sigma": 234.99,
+      "min": 3349.6,
+      "max": 4169.5,
+      "raw": [3579.8, 3640.7, 4133.0, 4169.3, 3901.8, 3672.1, 3349.6, 3740.0, 4169.5, 4169.0]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10, "n_used": 10, "mean": 3154.1, "sigma": 0.0,
+      "min": 3154.1, "max": 3154.1
+    }
+  },
+  "comparison": {
+    "vs_hne_gate_off_intern_on": {
+      "ref": "hne-gate-off.json",
+      "peak_mb_mean": 3914.32,
+      "peak_mb_sigma": 422.96,
+      "arena_mb_mean": 3137.3,
+      "arena_mb_sigma": 0.0
+    },
+    "delta_peak_mb_intern_minus_baseline": 38.61,
+    "delta_peak_sigma_pooled": 483.2,
+    "delta_arena_mb": -16.8,
+    "delta_arena_sigma_pooled": 0.0,
+    "interpretation": "Δarena = -16.8 MB deterministic (intern wins); Δpeak = +38.6 MB at 0.08σ pooled (no signal). T1.3 projection ~13 MB arena saving — measurement matches at 17 MB."
+  }
+}
