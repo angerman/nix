@@ -188,6 +188,42 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // (zero overhead) when V3_TIMING is unset.
     PhaseTimer pt;
 
+    // DIAG-4 (2026-05-29 evening, per DIAGNOSTIC_AUDIT §6.4 + user
+    // directive on "elsewhere is ominous"): per-phase ALLOCATION
+    // accounting.  Captures arena.bytesAllocated() + per-Tag byte
+    // totals at each phase boundary so we can attribute v3 arena
+    // growth to lower/optimise/compile/run.
+    //
+    // No per-allocator modification needed — snapshots at boundaries
+    // give us delta per phase.  Cost: 6 × small struct copy.
+    //
+    // Dumped under NIX_VM_STATS at the end of runRootExpr.
+    struct PhaseAllocSnap {
+        size_t arenaBytes;
+        uint64_t bytesValues;
+        uint64_t bytesClosures;
+        uint64_t bytesThunks;
+        uint64_t bytesBindings;
+        uint64_t bytesLists;
+        uint64_t bytesPairs;
+        uint64_t bytesChars;
+        uint64_t bytesEnvs;
+    };
+    auto takePhaseSnap = []() -> PhaseAllocSnap {
+        const auto & a = allocStats();
+        return {
+            threadArena().bytesAllocated(),
+            a.bytesValues, a.bytesClosures, a.bytesThunks,
+            a.bytesBindings, a.bytesLists, a.bytesPairs,
+            a.bytesChars, a.bytesEnvs,
+        };
+    };
+    PhaseAllocSnap snapStart = takePhaseSnap();
+    PhaseAllocSnap snapAfterLower = snapStart;
+    PhaseAllocSnap snapAfterOptimise = snapStart;
+    PhaseAllocSnap snapAfterCompile = snapStart;
+    PhaseAllocSnap snapAfterRun = snapStart;
+
     // Lower the AST → IR → bytecode.  `lowerNixExpr` requires `e` to
     // have had `bindVars` applied; the caller's contract.
     auto module = lowerNixExpr(e, state.symbols, state.positions);
@@ -204,8 +240,10 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // the runRootExpr path silently skipped it before this fix.
     static const bool s_noOptimise =
         std::getenv("NIX_V3_NO_OPTIMISE") != nullptr;
+    snapAfterLower = takePhaseSnap();  // DIAG-4
     if (!s_noOptimise) ir::optimise(module);
     pt.mark(pt.optimise_ms);
+    snapAfterOptimise = takePhaseSnap();  // DIAG-4
 
     // #737 Stage 4 v2: per-Function strictness inference.  Runs
     // AFTER `optimise` (so any DCE-removed dead bindings and any
@@ -260,6 +298,7 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // ones.  No-op when NIX_V3_DEDUP_SURVEY is unset.
     surveyCUBytecodeDedup(*out.cu);
     pt.mark(pt.compile_ms);
+    snapAfterCompile = takePhaseSnap();  // DIAG-4
 
     // Run.  STG-10 (vm.cc:5530) automatically routes through
     // `runOnExistingVm` if we're re-entered from another v3 dispatch
@@ -324,6 +363,7 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         throw;
     }
     pt.mark(pt.run_ms);
+    snapAfterRun = takePhaseSnap();  // DIAG-4
 
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
     // attribute alloc explosions to thunks vs closures vs Bindings
@@ -331,6 +371,44 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     static const bool s_dumpStats =
         std::getenv("NIX_VM_STATS") != nullptr;
     if (__builtin_expect(s_dumpStats, 0)) {
+        // DIAG-4 (2026-05-29 evening, per DIAGNOSTIC_AUDIT §6.4 +
+        // user "elsewhere is ominous" directive): per-phase byte
+        // attribution.  Δarena per phase = upper-bound on what that
+        // phase contributed to the arena footprint.  Attributes the
+        // hitherto-ominous "elsewhere" bucket by phase.
+        auto deltaArenaMB = [&](const PhaseAllocSnap & a,
+                                const PhaseAllocSnap & b) {
+            return (b.arenaBytes > a.arenaBytes
+                    ? double(b.arenaBytes - a.arenaBytes) / 1e6 : 0.0);
+        };
+        auto deltaTagBytes = [](uint64_t a, uint64_t b) -> double {
+            return b > a ? double(b - a) / 1e6 : 0.0;
+        };
+        const double dLow  = deltaArenaMB(snapStart,         snapAfterLower);
+        const double dOpt  = deltaArenaMB(snapAfterLower,    snapAfterOptimise);
+        const double dCmp  = deltaArenaMB(snapAfterOptimise, snapAfterCompile);
+        const double dRun  = deltaArenaMB(snapAfterCompile,  snapAfterRun);
+        const double dTot  = deltaArenaMB(snapStart,         snapAfterRun);
+        std::fprintf(stderr,
+            "v3-direct phase arena bytes (MB): "
+            "lower=%.2f optimise=%.2f compile=%.2f run=%.2f total=%.2f\n",
+            dLow, dOpt, dCmp, dRun, dTot);
+        // Per-Tag breakdown for the RUN phase only (the dominant
+        // phase by far; per audit it owns ~98 % of arena growth).
+        // Other phases are aggregated above; per-Tag dump here helps
+        // see what RUN is allocating.
+        std::fprintf(stderr,
+            "v3-direct run-phase per-tag bytes (MB): "
+            "values=%.2f closures=%.2f thunks=%.2f bindings=%.2f "
+            "lists=%.2f pairs=%.2f chars=%.2f envs=%.2f\n",
+            deltaTagBytes(snapAfterCompile.bytesValues,   snapAfterRun.bytesValues),
+            deltaTagBytes(snapAfterCompile.bytesClosures, snapAfterRun.bytesClosures),
+            deltaTagBytes(snapAfterCompile.bytesThunks,   snapAfterRun.bytesThunks),
+            deltaTagBytes(snapAfterCompile.bytesBindings, snapAfterRun.bytesBindings),
+            deltaTagBytes(snapAfterCompile.bytesLists,    snapAfterRun.bytesLists),
+            deltaTagBytes(snapAfterCompile.bytesPairs,    snapAfterRun.bytesPairs),
+            deltaTagBytes(snapAfterCompile.bytesChars,    snapAfterRun.bytesChars),
+            deltaTagBytes(snapAfterCompile.bytesEnvs,     snapAfterRun.bytesEnvs));
         const auto & a = allocStats();
         std::fprintf(stderr,
             "v3-direct alloc: values=%llu closures=%llu thunks=%llu "
