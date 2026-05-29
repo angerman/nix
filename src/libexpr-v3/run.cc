@@ -310,6 +310,17 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     // bounded-time probe rather than requiring the eval to complete.
     // The static dump-stats gate below decides whether to emit; this
     // catch only ensures the emission HAPPENS before re-throw.
+    //
+    // #875 Stage 1.5 (2026-05-29): tried setting the root Expr as
+    // the default fallback for bridges created during this eval.
+    // No effect — bridges created downstream inside primV3CallBridge1
+    // / primV3ForceAttr / primV3ForceListElem are wrapped by inner
+    // `ScopedBridgeFallbackExpr` guards that overwrite tl to the
+    // per-call fallback (typically nullptr today).  The runRootExpr-
+    // level guard is shadowed.  Stage 1.5 proper requires either an
+    // API refactor (v3ToTreeWalker takes Expr*) or per-bridge-
+    // creation-site Scoped guards.  See
+    // WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md.
     try {
         out.value = run(*out.cu);
     } catch (...) {

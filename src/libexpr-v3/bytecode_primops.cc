@@ -209,6 +209,18 @@ void installBytecodePrimop(
     //   - v3 dispatch (OP_CALL on the bridged value) unwraps via
     //     `tryUnwrapBridge1Closure` (vm.cc:2920) and dispatches the
     //     underlying closure on the same VM — no fresh dispatchLoop.
+    //
+    // #875 Stage 1.5 (2026-05-29): I tried wrapping this call with
+    // `ScopedBridgeFallbackExpr{expr}` so install-time bridges
+    // capture the bytecode-primop's source Expr.  HNE under stress
+    // (NIX_V3_WEAK_BRIDGES=1 SWEEP=1 AGE=0) produced a divergent
+    // drvPath after reEvalsAfterEviction=1, indicating the fallback
+    // re-eval doesn't reproduce the install-time bridge's value
+    // exactly — likely because the bytecode-installed primops have
+    // recursive self-references that resolve differently after
+    // install vs at re-eval time.  Reverted; see
+    // WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md for the proper
+    // bridge-creation-site-specific Expr capture work that remains.
     nix::Value * bridged = v3ToTreeWalkerPublic(state, installed.rr.value);
     if (!bridged) {
         throw std::runtime_error(
