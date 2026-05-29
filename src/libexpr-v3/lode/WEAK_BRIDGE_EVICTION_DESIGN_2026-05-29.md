@@ -141,6 +141,23 @@ Each stage has its own SHIP gate.  Falsification → STOP, revert, document.
   - HNE + M5 + hello.drvPath
 - **Decision input** (not gate): if ≥ 30 % of total bridge bytes live in entries accessed ≤ 2 times → proceed to Stage 1.  Otherwise STOP — eviction's expected ROI is below threshold.
 
+### Stage 1.5 — falsification record (2026-05-29 evening)
+
+Two cheap "wrap an existing entry point" approaches were tried and falsified:
+
+**Attempt 1** — wrap `installBytecodePrimop`'s `v3ToTreeWalkerPublic` with `ScopedBridgeFallbackExpr{expr}`.  Result: 100 % evictable on hello.drvPath + HNE.  Under stress, HNE produced a DIVERGENT drvPath (`/nix/store/v93jw14...` instead of `/nix/store/aw7jri6...`).  The install-time bytecode-primop source as fallback does not reproduce the installed closure exactly — install-replaced TW builtins introduce recursive self-references that re-eval differently.
+
+**Attempt 2** — wrap `runRootExpr`'s `run(*out.cu)` with `ScopedBridgeFallbackExpr{e}` (the root Expr).  Result: 0 % evictable.  The inner `ScopedBridgeFallbackExpr fbGuard{fallbackExpr}` guards in primV3CallBridge1 / primV3ForceAttr / primV3ForceListElem shadow the root-level guard, restoring `tlBridgeFallbackExpr` to nullptr.  The root-level capture never reaches the bridge-creation sites.
+
+**Conclusion**: Stage 1.5 needs a proper design.  Two viable paths:
+
+1. **API refactor**: pass `nix::Expr *` to `v3ToTreeWalker` explicitly; retire `tlBridgeFallbackExpr`.  Each caller decides what fallback applies.  ~15+ call sites to touch (vm.cc + primops.cc).
+2. **"Preserve outer when local is nullptr"**: change ScopedBridgeFallbackExpr semantics so a nullptr `e` doesn't overwrite an existing outer value.  Minimal LoC.  Restores the runRootExpr-level capture; bridges that DO have inner per-call fallback (cycle-recovery path) keep using it.
+
+Both are larger changes than the original 1-2 d Stage 1 estimate.  Re-scope to 3-5 d.  Pre-committed SHIP unchanged from Stage 1: ≥ 200 MB HNE peak RSS reduction.
+
+Commit `2daee57c0` records the falsified attempts (comments at both reverted call sites).
+
 ### Stage 1 — TW-only re-eval (1-2 d)
 
 - **Code**: ~100 LoC.  Add eviction trigger; modify bridge dispatch to fall through to TW path when v3Value cleared.
