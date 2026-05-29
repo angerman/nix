@@ -1,0 +1,97 @@
+# V3-NATIVE primop migrations — next-session plan
+
+**Date:** 2026-05-29 evening
+**Status:** PLAN, not implementation.  Tasks #877-#884 capture the work for the next session.  This doc is the durable strategic record so the plan survives independent of the task system.
+
+---
+
+## 1. Scope
+
+User directive (2026-05-29 evening, end of bridge-retention session): execute Tier 0 + Tier 2a-2d from `FFI_AUDIT_2026-05-20.md` §5.
+
+**Not in scope** for this batch: Tier 3 (opcode-ify pure arithmetic) — that's a separate ~1 week's work for next-next session.  Tier 4 (FromJSON / Hash* / ToXML / Match) deferred per audit recommendation.
+
+## 2. Pre-investigation findings (from current code-read)
+
+Before estimating effort, current state of each candidate verified:
+
+| Tier | Primop | Current state (primops.cc:line) | Migration shape |
+|---|---|---|---|
+| 0 | currentSystem, nixVersion, langVersion, storeDir, nixPath, currentTime | 0-arity primops at lines 11562-11599 + __-aliases at 11745-11755 | Inject as v3-init constants (not primops); 1-2 d |
+| 2a | primSort | v3-native at 10011; uses std::sort + callClosure-per-compare | Nix-source mergesort?  Win uncertain since std::sort is iterative C++ |
+| 2b | primGenericClosure | v3-native at 3114; BFS deque + unordered_set | Nix-source worklist via foldl' (already bytecode); semantics tricky |
+| 2c | primZipAttrsWith | v3-native at 2753; uses Tag::App per entry (App3 rolled back recently); already lazy | Nix-source via genAttrs + catAttrs |
+| 2d-i | primFunctionArgs | v3-native at 9617; reads desc->formals; only Bridge-thunk-TW-lambda edge crosses TW | AUDIT only — already native for common case |
+| 2d-ii | catAttrs | v3-native at 2067 (forces + bindings->lookup) | AUDIT only — pure data; zero TW |
+
+**Key insight (per code-read 2026-05-29 evening):** all three Tier 2 "callback-using" candidates (Sort, GenericClosure, ZipAttrsWith) are ALREADY v3-native in implementation.  Migration would replace `callClosure` (C-recursive dispatch) with bytecode `OP_CALL` (iterative).  That's a C-stack-safety + dispatch-cost win, NOT an FFI-reduction win.
+
+**Empirical risk:** M5's hot-30 primop dispatch list does NOT show primSort / primGenericClosure / primZipAttrsWith.  Their callback-cost contribution may be sub-1 % of wall.  Migration could be a NULL lever.
+
+→ Pre-migration measurement (task #878) gates the per-primop ship decision.
+
+## 3. Task dependency graph
+
+```
+#877 Tier 0 system-info constants    (independent; ~1-2 d; LOW risk)
+                       │
+                       ▼
+              #884 acceptance gate
+
+#878 measurement spike  ──┬──>  #879 Tier 2a primSort     (CONDITIONAL)
+   (~half day)            ├──>  #880 Tier 2b primGenericClosure
+                          ├──>  #881 Tier 2c primZipAttrsWith
+                          │
+                          └──>  #884 (gate)
+
+#882 Tier 2d-i FunctionArgs audit    (independent; ~0.5 d; AUDIT only)
+                       │
+                       ▼
+              #884 acceptance gate
+
+#883 Tier 2d-ii catAttrs audit       (independent; ~0.5 d; AUDIT only)
+                       │
+                       ▼
+              #884 acceptance gate
+```
+
+## 4. Pre-committed per-primop SHIP gate
+
+Per `[[measure-twice-cut-once]]`:
+
+* **Tier 0**: No threshold — trivial cleanup; ship if --quick + --core PASS + parity preserved.
+* **Tier 2a-c**: Migrate IF #878 measures the primop ≥1 % of wall on M5 or HNE.  Otherwise DEFER (mark task completed with "deprioritized per measurement").
+* **Tier 2d-i, 2d-ii**: Audit-only; ship updated `FFI_AUDIT_2026-05-24.md` documenting native status.
+
+## 5. Recommended sequencing (next session opening)
+
+1. **Day 1**: #877 Tier 0 — trivial, immediate ship.  Sets up the "constants as v3-init values" pattern for future work.
+2. **Day 1 (parallel)**: #882 + #883 audit primFunctionArgs + catAttrs.  Likely closes as "already done."
+3. **Day 1 (afternoon)**: #878 measurement spike.  Half-day run.
+4. **Day 2 onwards**: Based on #878 results, sequence #879/880/881.  If all three deprioritize → only Tier 0 + 2d audits land + #884 gate.
+
+Estimated total wall: 1-5 days depending on measurement outcomes.
+
+## 6. References
+
+* [`FFI_AUDIT_2026-05-20.md`](FFI_AUDIT_2026-05-20.md) §5.0-5.2 — original tier definitions
+* [`FFI_AUDIT_2026-05-24.md`](FFI_AUDIT_2026-05-24.md) — updated empirical state (zero bridge crossings on standard workloads)
+* `bytecode_primops.cc:381` — foldl' bytecode-install pattern (canonical reference)
+* `bytecode_primops.cc:443` — concatMap bytecode-install pattern (closest analog for primGenericClosure)
+* `lode/BRIDGES_HOLD_RETENTION_2026-05-29.md` — context for why Tier 2 migration is NOT the bridge-retention lever (separate concern; #875 weak-bridges is the bridge-lifecycle lever)
+* `lode/SESSION_END_SYNTHESIS_2026-05-29.md` — broader session arc + lever ladder
+
+## 7. Tasks (also tracked in task system)
+
+* **#877** Tier 0: inject 6 system-info primops as v3-init constants
+* **#878** Pre-Tier-2 measurement spike
+* **#879** Tier 2a primSort (blocked by #878)
+* **#880** Tier 2b primGenericClosure (blocked by #878)
+* **#881** Tier 2c primZipAttrsWith (blocked by #878)
+* **#882** Tier 2d-i primFunctionArgs verify
+* **#883** Tier 2d-ii catAttrs verify
+* **#884** Cross-migration acceptance gate (blocked by #877, #878, #882, #883)
+
+---
+
+*Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group. SPDX-License-Identifier: Apache-2.0.*
