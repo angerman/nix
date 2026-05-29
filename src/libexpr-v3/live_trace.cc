@@ -56,6 +56,19 @@ struct Gray { void * ptr; GrayKind kind; };
 
 /// Per-type live counters.  Two-axis: COUNT (unique objects reached)
 /// and BYTES (sum of object sizes, FAM-aware).
+// DIAG-2 (2026-05-29 evening, per DIAGNOSTIC_AUDIT §6.2 +
+// NIX_MEMORY_PROFILER_DESIGN §5.1): per-source-position live-bytes
+// rollup.  Aggregates bytes by posHandle during walkBindings +
+// walkThunk so we can answer "lib/fixed-points.nix:95 retains 85 MB"
+// rather than the Tag-level "84 % Bindings".
+struct LivePosEntry
+{
+    uint64_t bindingsBytes = 0;
+    uint64_t thunksBytes = 0;
+    uint32_t bindingsCount = 0;
+    uint32_t thunksCount = 0;
+};
+
 struct LiveCounters
 {
     size_t closures = 0,   bytesClosures = 0;
@@ -64,6 +77,9 @@ struct LiveCounters
     size_t lists    = 0,   bytesLists    = 0;
     size_t pairs    = 0,   bytesPairs    = 0;
     size_t slotsDereffed = 0;  // edges followed via Tag::Slot
+    // DIAG-2: per-posHandle aggregation (allocated only when
+    // NIX_V3_LIVE_POS_ATTR=1 — empty in the default case).
+    std::unordered_map<uint32_t, LivePosEntry> liveByPos;
 
     // Arena-dereg audit counters (per
     // ARENA_DEREGISTRATION_DESIGN_2026-05-27 §4 §4.1-4.2):
@@ -89,6 +105,12 @@ class LiveTracer : public RootVisitor
 {
 public:
     LiveCounters counts;
+
+    // DIAG-2: per-posHandle live-bytes aggregation gate.  Read once
+    // per process via inline-const-bool (mirrors bindingsOriginEnabled
+    // pattern at alloc.hh:2702 — magic-static-guard-free hot path).
+    inline static const bool livePosAttrEnabled =
+        std::getenv("NIX_V3_LIVE_POS_ATTR") != nullptr;
 
     void visitClosure(Closure   * & p) override { enqueue(p, GK_CLOSURE); }
     void visitThunk  (Thunk     * & p) override { enqueue(p, GK_THUNK); }
@@ -220,6 +242,19 @@ private:
             break;
         }
         counts.bytesThunks += bytes;
+        // DIAG-2: per-posHandle attribution.  Only Suspended/Blackhole
+        // have a valid suspended.desc->posHandle; Evaluated/Native/Bridge
+        // get attributed to posHandle=0 (unknown).
+        if (livePosAttrEnabled) {
+            uint32_t ph = 0;
+            if ((t->state == ThunkState::Suspended
+                 || t->state == ThunkState::Blackhole)
+                && t->suspended.desc)
+                ph = t->suspended.desc->posHandle;
+            auto & e = counts.liveByPos[ph];
+            e.thunksBytes += bytes;
+            ++e.thunksCount;
+        }
 
         // cell / shapeCell point INTO another allocation (Bindings
         // entry, standalone cell).  We don't count them here; the
@@ -255,8 +290,25 @@ private:
     void walkBindings(Bindings * b)
     {
         ++counts.bindings;
-        counts.bytesBindings += sizeof(Bindings)
-                              + sizeof(Bindings::Entry) * b->size;
+        const size_t bytes = sizeof(Bindings)
+                           + sizeof(Bindings::Entry) * b->size;
+        counts.bytesBindings += bytes;
+        // DIAG-2: per-posHandle attribution.  Look up the Bindings'
+        // construction posHandle from bindingsOriginTable (already
+        // populated by recordBindingsOrigin / bindingsAllocSiteRecord
+        // at every Alloc::allocBindings under NIX_V3_BINDINGS_ATTR=1
+        // OR NIX_V3_DBG_BINDINGS_ORIGIN=1 — the gate is set externally).
+        // If origin wasn't recorded (gate unset, or non-tracked alloc),
+        // attribute to posHandle=0 ("unknown") so total still sums.
+        if (livePosAttrEnabled) {
+            uint32_t ph = 0;
+            auto & tbl = bindingsOriginTable();
+            auto it = tbl.find(b);
+            if (it != tbl.end()) ph = it->second.posHandle;
+            auto & e = counts.liveByPos[ph];
+            e.bindingsBytes += bytes;
+            ++e.bindingsCount;
+        }
         for (uint32_t i = 0; i < b->size; ++i)
             auditAndVisit(b->entries[i].value);
         // Chain bindings: walk parent.  Each segment of the chain
@@ -437,6 +489,73 @@ void dumpV3LiveFraction() noexcept
         "  Freeable arena bytes (alloc - live): %s\n"
         "  Verdict: %s (200 MB ship gate; <50 MB → pivot)\n",
         tr.counts.slotsDereffed, freeableB, verdict);
+
+    // DIAG-2 (2026-05-29 evening, per DIAGNOSTIC_AUDIT §6.2 +
+    // NIX_MEMORY_PROFILER_DESIGN §5.1): per-PosIdx live-bytes
+    // top-N retainers.  Converts "84 % Bindings" from a Tag-level
+    // pattern-match into "lib/fixed-points.nix:95 retains 85 MB"
+    // (source-level).
+    //
+    // Sets the aggregator gate from `LiveTracer::livePosAttrEnabled`
+    // (NIX_V3_LIVE_POS_ATTR=1); when unset, the map is empty and
+    // this dump skips.
+    if (!tr.counts.liveByPos.empty()) {
+        // Pull entries into a sortable vector.
+        struct Row {
+            uint32_t posHandle;
+            uint64_t totalBytes;
+            uint64_t bindingsBytes;
+            uint64_t thunksBytes;
+            uint32_t bindingsCount;
+            uint32_t thunksCount;
+        };
+        std::vector<Row> rows;
+        rows.reserve(tr.counts.liveByPos.size());
+        uint64_t grandTotal = 0;
+        for (auto & [ph, e] : tr.counts.liveByPos) {
+            const uint64_t tot = e.bindingsBytes + e.thunksBytes;
+            grandTotal += tot;
+            rows.push_back({ph, tot,
+                e.bindingsBytes, e.thunksBytes,
+                e.bindingsCount, e.thunksCount});
+        }
+        std::sort(rows.begin(), rows.end(),
+            [](const Row & a, const Row & b) {
+                return a.totalBytes > b.totalBytes;
+            });
+        const size_t N = std::min<size_t>(20, rows.size());
+        std::fprintf(stderr,
+            "\n"
+            "  Per-PosIdx live-bytes top-%zu (of %zu unique posHandles, "
+            "grandTotal=%.1f MB):\n"
+            "                bytes   pct  binds(N)   thunks(N)  source\n",
+            N, rows.size(), double(grandTotal) / 1e6);
+        for (size_t i = 0; i < N; ++i) {
+            const Row & r = rows[i];
+            const double pct = grandTotal > 0
+                ? 100.0 * double(r.totalBytes) / double(grandTotal)
+                : 0.0;
+            const PosSnapshot * ps = resolvePosSnapshot(r.posHandle);
+            char buf[32];
+            fmtBytes(r.totalBytes, buf, sizeof(buf));
+            if (ps && !ps->file.empty()) {
+                std::fprintf(stderr,
+                    "    %12s %5.1f%%  %5u(%6u)  %5u(%6u)  %s:%u:%u\n",
+                    buf, pct,
+                    (unsigned)(r.bindingsBytes / 1024), r.bindingsCount,
+                    (unsigned)(r.thunksBytes / 1024), r.thunksCount,
+                    ps->file.c_str(), ps->line, ps->column);
+            } else {
+                std::fprintf(stderr,
+                    "    %12s %5.1f%%  %5u(%6u)  %5u(%6u)  <posHandle=%u %s>\n",
+                    buf, pct,
+                    (unsigned)(r.bindingsBytes / 1024), r.bindingsCount,
+                    (unsigned)(r.thunksBytes / 1024), r.thunksCount,
+                    r.posHandle,
+                    r.posHandle == 0 ? "unknown" : "no-snapshot");
+            }
+        }
+    }
 
     // Arena-dereg audit report (per ARENA_DEREGISTRATION_DESIGN
     // §4.1 String/Path + §4.2 External audits).  These counts
