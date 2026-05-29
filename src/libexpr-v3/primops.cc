@@ -4100,6 +4100,19 @@ void clearV3BridgesForDiag() noexcept
     v3BridgeLists().clear();
 }
 
+// 2026-05-29 evening (DIAG analysis): expose bridge-table sizes
+// so the periodic L(t) sampler and NIX_VM_STATS dump can report
+// the bridge growth curve.  Returns triple (closures, attrs,
+// lists) entry counts.  Each entry is 24 B (Value + Expr*).
+std::array<size_t, 3> v3BridgeTableSizes() noexcept
+{
+    return {
+        v3BridgeClosures().size(),
+        v3BridgeAttrs().size(),
+        v3BridgeLists().size(),
+    };
+}
+
 // (walkImportCacheRoots defined further down, after the
 // anonymous-namespace `importCache()` function body is visible.)
 

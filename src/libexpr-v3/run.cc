@@ -558,6 +558,20 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                         labels[i], (unsigned long long)a.mergeBindingsNbHist[i]);
             }
         }
+        // 2026-05-29 evening (DIAG analysis): bridge-table sizes.
+        // Per BRIDGES_HOLD_RETENTION_2026-05-29.md, bridges retain
+        // 99.8-99.9 % of v3 arena bytes at end-of-eval.  Dumping the
+        // sizes here shows the magnitude of bridge growth.
+        {
+            const auto sizes = nix::v3::v3BridgeTableSizes();
+            const size_t total = sizes[0] + sizes[1] + sizes[2];
+            const double mb = double(total) * 24.0 / 1e6;  // 24 B/entry
+            std::fprintf(stderr,
+                "v3-direct bridge tables: closures=%zu attrs=%zu lists=%zu "
+                "total=%zu entries (~%.2f MB vector storage; transitive "
+                "retention is much larger — see BRIDGES_HOLD_RETENTION)\n",
+                sizes[0], sizes[1], sizes[2], total, mb);
+        }
         // EXIT_GC_SPIRAL Day 13-15 (2026-05-29): singleton-capturedWiths
         // intern-cache hit rate.  Hit rate near 100 % means the cache
         // is doing its job (most 1-element capturedWiths reuse a

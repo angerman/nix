@@ -24,6 +24,7 @@
 #include "v3/value.hh"
 #include "v3/closure.hh"
 #include "v3/vm.hh"           // activeVMStack()
+#include "v3/primop.hh"       // v3BridgeTableSizes()
 
 #include <algorithm>
 #include <atomic>
@@ -1517,6 +1518,13 @@ struct PeriodicCsvRow {
     double live_bindings_mb;
     double live_lists_mb;
     double live_pairs_mb;
+    // 2026-05-29 evening (DIAG bridge analysis): bridge-table sizes.
+    // Entry counts at sample time; each entry is 24 B vector
+    // storage + transitive v3-heap retention (the load-bearing
+    // portion, much larger than 24 B).
+    size_t bridge_closures = 0;
+    size_t bridge_attrs    = 0;
+    size_t bridge_lists    = 0;
 };
 
 /// thread_local state for the periodic trace.  Thread-local because v3
@@ -1636,6 +1644,15 @@ void maybeSamplePeriodicLiveFraction(VMState & vm) noexcept
     row.live_bindings_mb = double(tr.counts.bytesBindings) * MB;
     row.live_lists_mb    = double(tr.counts.bytesLists)    * MB;
     row.live_pairs_mb    = double(tr.counts.bytesPairs)    * MB;
+    // 2026-05-29 evening (DIAG bridge analysis): bridge-table sizes
+    // sampled at the same cadence as L(t).  Reveals when bridges
+    // grow during eval — informs LRU design.
+    {
+        const auto bsz = v3BridgeTableSizes();
+        row.bridge_closures = bsz[0];
+        row.bridge_attrs    = bsz[1];
+        row.bridge_lists    = bsz[2];
+    }
     st.rows.push_back(row);
 
     // Advance threshold past current bytes by the next K-multiple
@@ -1668,7 +1685,8 @@ void flushPeriodicLiveTraceCsv() noexcept
                 "alloc_offset_mb,resident_mb,live_mb,"
                 "L_resident,L_cumulative,wall_ms,"
                 "live_closures_mb,live_thunks_mb,"
-                "live_bindings_mb,live_lists_mb,live_pairs_mb\n");
+                "live_bindings_mb,live_lists_mb,live_pairs_mb,"
+                "bridge_closures,bridge_attrs,bridge_lists\n");
             std::fclose(trunc);
         }
     }
@@ -1683,11 +1701,13 @@ void flushPeriodicLiveTraceCsv() noexcept
     for (const auto & r : st.rows) {
         std::fprintf(f,
             "%.2f,%.2f,%.2f,%.4f,%.4f,%.1f,"
-            "%.2f,%.2f,%.2f,%.2f,%.2f\n",
+            "%.2f,%.2f,%.2f,%.2f,%.2f,"
+            "%zu,%zu,%zu\n",
             r.alloc_offset_mb, r.resident_mb, r.live_mb,
             r.l_resident, r.l_cumulative, r.wall_ms,
             r.live_closures_mb, r.live_thunks_mb,
-            r.live_bindings_mb, r.live_lists_mb, r.live_pairs_mb);
+            r.live_bindings_mb, r.live_lists_mb, r.live_pairs_mb,
+            r.bridge_closures, r.bridge_attrs, r.bridge_lists);
     }
     std::fclose(f);
 

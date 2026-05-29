@@ -19,6 +19,7 @@
 
 #include "v3/value.hh"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -132,6 +133,12 @@ void clearImportCacheResultsForDiag() noexcept;
 /// NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1.  UNSAFE if TW callbacks
 /// fire subsequently.
 void clearV3BridgesForDiag() noexcept;
+
+/// 2026-05-29 evening (DIAG analysis): bridge-table sizes for
+/// periodic L(t) sampling + NIX_VM_STATS dump.  Returns
+/// (closures, attrs, lists) entry counts.  Each entry = 24 B
+/// (Value + Expr* fallback) + transitive v3-heap retention.
+std::array<size_t, 3> v3BridgeTableSizes() noexcept;
 
 /// REVIEW §2.1: RAII guard for the thread-local fallback Expr pointer
 /// that primV3{CallBridge1,ForceAttr,ForceListElem} read on cycle
