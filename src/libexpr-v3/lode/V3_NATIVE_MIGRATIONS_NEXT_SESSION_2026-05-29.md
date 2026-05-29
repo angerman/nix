@@ -1,7 +1,52 @@
-# V3-NATIVE primop migrations — next-session plan
+# V3-NATIVE primop migrations — execution record
 
-**Date:** 2026-05-29 evening
-**Status:** PLAN, not implementation.  Tasks #877-#884 capture the work for the next session.  This doc is the durable strategic record so the plan survives independent of the task system.
+**Date:** 2026-05-29 evening → 2026-05-29 (executed same session)
+**Status:** EXECUTED.  Tier 0 + Tier 2d audits confirmed; Tier 2a/b/c DEFERRED per pre-committed measurement gate.
+
+## Execution outcome (2026-05-29)
+
+| Task | Outcome | Rationale |
+|---|---|---|
+| #877 Tier 0 (6 system-info primops) | **COMPLETE via existing code** | `vm.cc:10788-10805` (2026-05-18 vBuiltins lazy-init) + `lower.cc:828/3140` (emit-time pre-call) already inject all 6 as v3-init constants.  Empirical: 30 accesses across all 6 in 1 process → **0 primop dispatches**; within-process `currentTime` is stable across accesses.  No new code needed; the audit's "FFI dispatch per access" premise was outdated. |
+| #882 Tier 2d-i (primFunctionArgs) | **AUDIT-ONLY: keep as-is** | Common case (Tag::Closure → desc->formals) is pure v3-native at `primops.cc:9676+`.  Bridge case at lines 9619-9669 (Tag::Thunk + ThunkState::Bridge wrapping TW ExprLambda) is a true FFI leaf for the v3FormalsLambdaBridges sentinel — not a migration candidate. |
+| #883 Tier 2d-ii (catAttrs) | **AUDIT-ONLY: keep as-is** | `primops.cc:2067` is pure v3-native: forceValue + bindings->lookup + allocList.  Zero TW crossings. |
+| #878 measurement spike | **EXECUTED** | `NIX_VM_PRIMOP_TIME=1` on hello.drvPath + HNE.  Top 15 wall on both is dominated by derivation-class FFI primops: `__derivationFromPreprocessed` 50-58%, `__derivCoerce` 26-34%, `import` 7-8%.  primSort/primGenericClosure/primZipAttrsWith **do not appear in top 15 wall or top 30 call counts** on either workload (< 1 % wall). |
+| #879 Tier 2a (primSort) | **DEFERRED** | < 1 % wall per #878.  Existing v3-native impl correct + off-hot-path.  Reopen if any future workload shows ≥ 1 %. |
+| #880 Tier 2b (primGenericClosure) | **DEFERRED** | < 1 % wall per #878.  Same rationale as #879. |
+| #881 Tier 2c (primZipAttrsWith) | **DEFERRED** | < 1 % wall per #878.  Same rationale as #879. |
+| #884 acceptance gate | **CLEARED — no code changed** | Tier 0 + Tier 2d are zero-code outcomes (already complete or audit-only); Tier 2a/b/c deferred without implementation.  No regressions possible. |
+
+### Key empirical numbers (2026-05-29)
+
+**hello.drvPath, NIX_VM_PRIMOP_TIME=1** (107.7 s total primop wall):
+
+```
+   53909 ms  __derivationFromPreprocessed
+   36084 ms  __derivCoerce
+    8882 ms  __derivationStrictRaw
+    8586 ms  import
+   (everything else  ≤ 56 ms total)
+```
+
+**HNE, NIX_VM_PRIMOP_TIME=1** (171.2 s total primop wall):
+
+```
+   98778 ms  __derivationFromPreprocessed   (57.7 %)
+   44416 ms  __derivCoerce                  (25.9 %)
+   12152 ms  import                         ( 7.1 %)
+    8870 ms  __tryEval                      ( 5.2 %)
+    2882 ms  __derivationStrictRaw          ( 1.7 %)
+   2397 ms  getFlake                        ( 1.4 %)
+   (everything else  ≤ 0.4 % each)
+```
+
+**Strategic implication:** the actual primop perf lever IS on the V3-NATIVE FFI boundary (`__derivationFromPreprocessed` + `__derivCoerce` + `import`).  These touch the store and are explicitly permitted at FFI leaves.  Bytecode-installing them would violate the V3-NATIVE rule (TW only at store/path/derivation/I/O leaves).  → The Tier 2 plan was attacking the wrong bucket.
+
+The lever IS NOT "more native primops" — by the numbers, v3 is already as native as the V3-NATIVE rule allows.  The lever is reducing PER-CALL cost in the FFI-leaf primops themselves (a derivation-bridge optimization task, separate strategic track), or reducing the COUNT of FFI calls (e.g. caching derivCoerce results across siblings, IFD probe S4 eval-result cache).
+
+---
+
+
 
 ---
 
