@@ -566,11 +566,23 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // `callClosure` per item; bytecode uses list-based work-queue
         // + attrset-based seen-set + native OP_CALL for `operator it`.
         //
-        // Key dedup: typeOf-prefixed string ("S"+s / "I"+toStr / etc.)
-        // so e.g. int 1 and string "1" don't collide.  Mixed-type
-        // detection: track firstType; throw on mismatch — matches the
-        // C eval-fail-genericClosure-keys-incompatible-types contract.
+        // Key dedup: per-type stringification (raw for strings, toString
+        // for int/float/path, "true"/"false" for bool).  Cross-type
+        // collision (e.g. int 1 vs string "1") is impossible because
+        // the firstType check throws on mixed types — matches the C
+        // version's `firstKeyTag` rejection (and the
+        // eval-fail-genericClosure-keys-incompatible-types contract).
         // NaN float keys are rejected via `k != k` (IEEE).
+        //
+        // 2026-05-29: initial version prefixed strings with "S"/"I"/...
+        // for extra safety.  That propagated `k`'s string context into
+        // the prefixed result (Nix string `+` unions context); under
+        // SHADOW cache's deep-force pass on derivation inputs the
+        // prefixed string surfaced as a context-bearing value whose
+        // body started with "S" — libstore then rejected it as not
+        // matching any valid store-path.  Dropping the prefix matches
+        // the C version exactly (raw key string) and eliminates the
+        // context-propagation hazard.
         //
         // Asymptotic: O(M²) where M = final result size (per-step
         // tail+head+concat are O(M)).  C is O(M) via deque/set.  For
@@ -584,13 +596,13 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "    operator = arg.operator; "
                 "    keyToStr = k: "
                 "      let t = builtins.typeOf k; in "
-                "      if t == \"string\" then \"S\" + k "
-                "      else if t == \"int\" then \"I\" + builtins.toString k "
+                "      if t == \"string\" then k "
+                "      else if t == \"int\" then builtins.toString k "
                 "      else if t == \"float\" then "
                 "        (if k != k then throw \"NaN key is not orderable\" "
-                "         else \"F\" + builtins.toString k) "
-                "      else if t == \"path\" then \"P\" + toString k "
-                "      else if t == \"bool\" then (if k then \"BTrue\" else \"BFalse\") "
+                "         else builtins.toString k) "
+                "      else if t == \"path\" then toString k "
+                "      else if t == \"bool\" then (if k then \"true\" else \"false\") "
                 "      else throw \"'key' must be string / int / float / path / bool\"; "
                 "    go = work: result: seen: firstType: "
                 "      if work == [] then result "
@@ -604,13 +616,26 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "            if firstType == null then curType "
                 "            else if firstType == curType then firstType "
                 "            else throw \"cannot compare keys of incompatible types\"; "
-                "          ks      = keyToStr k; "
+                // unsafeDiscardStringContext: when k is a string with
+                // store-path context (common in nixpkgs derivation
+                // attrs), Nix's dynamic-attr-key opcodes preserve
+                // context on the intermediate `ks` value.  Under
+                // SHADOW-cache forceDeep, that context can leak into
+                // downstream derivation env entries with a string body
+                // that doesn't match the context's store path —
+                // libstore then rejects "string not allowed to refer
+                // to a store path".  Stripping context here matches
+                // the C primGenericClosure exactly (it copies
+                // k.payload.str into a std::string, dropping context).
+                "          ks      = builtins.unsafeDiscardStringContext (keyToStr k); "
                 "        in "
-                "          if seen ? ${ks} "
-                "          then go rest result seen newType "
-                "          else "
-                "            let next = operator it; in "
-                "            go (rest ++ next) (result ++ [it]) (seen // { ${ks} = null; }) newType; "
+                "          builtins.seq newType ( "
+                "            if seen ? ${ks} "
+                "            then go rest result seen newType "
+                "            else "
+                "              let next = operator it; in "
+                "              go (rest ++ next) (result ++ [it]) (seen // { ${ks} = null; }) newType "
+                "          ); "
                 "  in go startSet [] {} null");
 
         // T20 — zipAttrsWith (Tier 2c, 2026-05-29).  Combine list of
