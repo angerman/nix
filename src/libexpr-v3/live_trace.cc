@@ -386,6 +386,95 @@ void fmtPct(size_t live, size_t total, char * out, size_t out_sz)
 
 } // namespace
 
+// 2026-05-29 evening (DIAG bridge analysis): per-bridge transitive
+// retention dump.  For each bridge-table entry, walk transitively
+// from that single entry's v3Value and count bytes reached.  No
+// cross-entry dedup — if two entries share a subgraph, both count
+// the shared bytes (this is the right view of "what this entry
+// HOLDS").
+//
+// Reports top-N by retained bytes.  For M5 with 10K+ entries,
+// emits histogram + top-20.  For HNE with 30 entries, emits all.
+//
+// Gate: NIX_V3_DUMP_BRIDGE_RETENTION=1.  Cost: 30-10K transitive
+// walks; on M5 this can be slow.  Diagnostic-only.
+void dumpV3BridgeRetention() noexcept
+{
+    static const bool s_enabled =
+        std::getenv("NIX_V3_DUMP_BRIDGE_RETENTION") != nullptr;
+    if (!s_enabled) return;
+
+    auto walkOne = [](const Value & v) -> size_t {
+        LiveTracer tr;
+        // We can't enqueue a Value directly; use visitValue on a copy.
+        Value vc = v;
+        tr.visitValue(vc);
+        tr.drain();
+        return tr.counts.bytesClosures + tr.counts.bytesThunks
+             + tr.counts.bytesBindings + tr.counts.bytesLists
+             + tr.counts.bytesPairs;
+    };
+
+    struct Row { size_t bytes; const char * kind; size_t idx; };
+    std::vector<Row> rows;
+    const auto sz = v3BridgeTableSizes();
+    rows.reserve(sz[0] + sz[1] + sz[2]);
+
+    forEachV3BridgeEntry([&](const Value & v, const char * kind, size_t idx) {
+        rows.push_back({walkOne(v), kind, idx});
+    });
+
+    std::sort(rows.begin(), rows.end(),
+        [](const Row & a, const Row & b) { return a.bytes > b.bytes; });
+
+    size_t grandTotal = 0;
+    for (auto & r : rows) grandTotal += r.bytes;
+
+    std::fprintf(stderr,
+        "\n=================== v3 BRIDGE RETENTION ===================\n"
+        "Per-bridge-entry transitive walk.  No cross-entry dedup; each\n"
+        "row is the FULL retained subgraph from that entry's v3Value.\n"
+        "Shared subgraphs are counted by each referencing entry.\n"
+        "\n"
+        "  Total entries: %zu (grand-total-with-overcount: %.1f MB)\n"
+        "  Top entries by retention:\n",
+        rows.size(), double(grandTotal) / 1e6);
+
+    const size_t N = std::min<size_t>(20, rows.size());
+    for (size_t i = 0; i < N; ++i) {
+        const Row & r = rows[i];
+        std::fprintf(stderr,
+            "  #%-3zu  %10.2f MB  %s#%zu\n",
+            i, double(r.bytes) / 1e6, r.kind, r.idx);
+    }
+
+    // Histogram by magnitude bucket.
+    int buckets[10] = {0};
+    const size_t kBoundaries[10] = {
+        0, 1ULL<<10, 1ULL<<14, 1ULL<<18,
+        1ULL<<20, 1ULL<<22, 1ULL<<24, 1ULL<<26,
+        1ULL<<28, SIZE_MAX
+    };
+    static const char * kLabels[10] = {
+        "0",        "<1 KB",      "<16 KB",  "<256 KB",
+        "<1 MB",    "<4 MB",      "<16 MB",  "<64 MB",
+        "<256 MB",  "≥256 MB",
+    };
+    for (auto & r : rows) {
+        for (int b = 0; b < 10; ++b) {
+            if (r.bytes <= kBoundaries[b]) { ++buckets[b]; break; }
+        }
+    }
+    std::fprintf(stderr, "\n  Retention distribution (histogram):\n");
+    for (int b = 0; b < 10; ++b) {
+        if (buckets[b] == 0) continue;
+        std::fprintf(stderr, "    %-10s : %5d entries\n",
+            kLabels[b], buckets[b]);
+    }
+    std::fprintf(stderr,
+        "===========================================================\n");
+}
+
 void dumpV3LiveFraction() noexcept
 {
     static const bool s_enabled =

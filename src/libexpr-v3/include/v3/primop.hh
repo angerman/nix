@@ -140,6 +140,12 @@ void clearV3BridgesForDiag() noexcept;
 /// (Value + Expr* fallback) + transitive v3-heap retention.
 std::array<size_t, 3> v3BridgeTableSizes() noexcept;
 
+/// Iterate every v3 ↔ TW bridge entry; calls cb(v3Value, kind, idx)
+/// for each.  Used by dumpV3BridgeRetention to compute per-entry
+/// transitive retention without exposing the bridge-entry types.
+void forEachV3BridgeEntry(
+    const std::function<void(const Value &, const char *, size_t)> & cb) noexcept;
+
 /// REVIEW §2.1: RAII guard for the thread-local fallback Expr pointer
 /// that primV3{CallBridge1,ForceAttr,ForceListElem} read on cycle
 /// detection.  Setting it via raw save/restore was leaking the prior

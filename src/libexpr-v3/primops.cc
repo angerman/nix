@@ -4113,6 +4113,22 @@ std::array<size_t, 3> v3BridgeTableSizes() noexcept
     };
 }
 
+// 2026-05-29 evening (DIAG bridge analysis): per-bridge-entry
+// iterator.  Calls `cb(v3Value, kind_label, idx)` for every entry
+// in all three tables.  Used by live_trace.cc's
+// dumpV3BridgeRetention to compute per-entry transitive retention
+// without exposing the BridgeXEntry types (which are anon-ns).
+void forEachV3BridgeEntry(
+    const std::function<void(const Value &, const char *, size_t)> & cb) noexcept
+{
+    for (size_t i = 0; i < v3BridgeClosures().size(); ++i)
+        cb(v3BridgeClosures()[i].v3Value, "closure", i);
+    for (size_t i = 0; i < v3BridgeAttrs().size(); ++i)
+        cb(v3BridgeAttrs()[i].v3Value, "attrs", i);
+    for (size_t i = 0; i < v3BridgeLists().size(); ++i)
+        cb(v3BridgeLists()[i].v3Value, "list", i);
+}
+
 // (walkImportCacheRoots defined further down, after the
 // anonymous-namespace `importCache()` function body is visible.)
 

@@ -705,6 +705,12 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         // Retirement criterion: when Stage 6 lands the real precise GC
         // of v3 arena, fold into NIX_VM_STATS and remove the gate.
         dumpV3LiveFraction();
+        // 2026-05-29 evening: per-bridge-entry retention.  Gated by
+        // NIX_V3_DUMP_BRIDGE_RETENTION=1; runs transitive walk per
+        // bridge entry.  Informs cohort-vs-LRU-vs-weak-bridge
+        // architectural choice.  Fires AFTER dumpV3LiveFraction so
+        // the live-fraction headline lands first.
+        dumpV3BridgeRetention();
         // Day 5 2026-05-28: per-block fill probe.  Decision data for
         // Stage 6 generational tenured collector (GHC-RTS style).
         // Gated NIX_V3_BLOCK_PROBE=1; zero cost otherwise.
