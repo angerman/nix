@@ -298,13 +298,35 @@ private:
         // populated by recordBindingsOrigin / bindingsAllocSiteRecord
         // at every Alloc::allocBindings under NIX_V3_BINDINGS_ATTR=1
         // OR NIX_V3_DBG_BINDINGS_ORIGIN=1 — the gate is set externally).
-        // If origin wasn't recorded (gate unset, or non-tracked alloc),
-        // attribute to posHandle=0 ("unknown") so total still sums.
+        //
+        // Phase 2 (2026-05-29 evening): if origin table has posHandle=0
+        // OR no entry, FALL BACK to the FIRST ENTRY's posHandle.
+        // Per-entry pos is populated by emit.cc for every attrset
+        // op (#752 inline-pos in Bindings::Entry); even unrecorded
+        // mergeBindings allocs end up with per-entry positions from
+        // the merged sources.  This converts the 82.8 % unknown
+        // bucket into source-attributed bytes whenever entries[0]
+        // has a non-zero pos.
         if (livePosAttrEnabled) {
             uint32_t ph = 0;
             auto & tbl = bindingsOriginTable();
             auto it = tbl.find(b);
             if (it != tbl.end()) ph = it->second.posHandle;
+            // Fallback A: first entry's pos.
+            if (ph == 0 && b->size > 0) ph = b->entries[0].pos;
+            // Fallback B: scan entries for ANY non-zero pos.  Some
+            // entries have pos=0 (e.g., compiler-generated names);
+            // scan the first few to catch the first real source pos.
+            if (ph == 0 && b->size > 0) {
+                const uint32_t scanLimit =
+                    b->size < 8 ? b->size : 8;
+                for (uint32_t i = 1; i < scanLimit; ++i) {
+                    if (b->entries[i].pos != 0) {
+                        ph = b->entries[i].pos;
+                        break;
+                    }
+                }
+            }
             auto & e = counts.liveByPos[ph];
             e.bindingsBytes += bytes;
             ++e.bindingsCount;
