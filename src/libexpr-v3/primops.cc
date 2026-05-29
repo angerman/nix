@@ -4113,6 +4113,30 @@ std::array<size_t, 3> v3BridgeTableSizes() noexcept
     };
 }
 
+// 2026-05-29 evening (DIAG bridge attribution): unique v3-pointer
+// count in each bridge table.  If unique << total, many entries
+// share the same v3Value (duplicate handles), which means dedup-
+// on-push could collapse the table.  Per
+// `lode/BRIDGES_HOLD_RETENTION_2026-05-29.md`, M5 has 10042
+// closure bridges; this measures how many unique closures they
+// reference.
+std::array<size_t, 3> v3BridgeUniquePtrCounts() noexcept
+{
+    auto uniqueOf = [](const auto & tbl) -> size_t {
+        std::unordered_set<const void *> seen;
+        for (const auto & e : tbl) {
+            const Value & v = e.v3Value;
+            seen.insert(v.payload.raw);
+        }
+        return seen.size();
+    };
+    return {
+        uniqueOf(v3BridgeClosures()),
+        uniqueOf(v3BridgeAttrs()),
+        uniqueOf(v3BridgeLists()),
+    };
+}
+
 // 2026-05-29 evening (DIAG bridge analysis): per-bridge-entry
 // iterator.  Calls `cb(v3Value, kind_label, idx)` for every entry
 // in all three tables.  Used by live_trace.cc's
