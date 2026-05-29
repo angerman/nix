@@ -771,12 +771,85 @@ static bool sweepOneBlock(
         && !marker.anyMarkInRange(blockStart, 0, blockUsedBytes);
 }
 
+/// DIAG-1 (2026-05-29 evening, per DIAGNOSTIC_AUDIT §6.1):
+/// per-cycle GC CSV.  When `NIX_V3_GC_CYCLE_CSV=path` is set,
+/// each runMajorMarkSweep invocation appends one CSV row.
+///
+/// Columns:
+///   cycleIdx      — 0-based, per-process
+///   trigger       — "arena_threshold" today (single trigger mechanism)
+///   markMs        — real measured (mark_sweep.cc:872-874)
+///   sweepMs       — real measured (mark_sweep.cc:875-877)
+///   blocksScanned — sweep.blocksScanned
+///   blocksFreed   — sweep.blocksFreed (whole-block-free wins)
+///   liveCells     — sweep.liveCells
+///   deadCells     — sweep.deadCells
+///   liveBytes     — sweep.liveBytes
+///   deadBytes     — sweep.deadBytes
+///   bytesFreed    — sweep.bytesFreed
+///   freeListEntries — arena.freeListEntryCount()
+///   arenaBytesBefore — bytes_allocated at cycle entry
+///   arenaBytesAfter  — bytes_allocated at cycle exit (after freelist install)
+///   allocSincePrev   — arenaBytesBefore − arenaBytesPrev (or arenaBytesBefore for cycle 0)
+///   wallSincePrev_ms — wall (ms) since prev cycle start (or process-start for cycle 0)
+///   totalLines       — Step 11′ line-marks
+///   deadLines        — Step 11′ line-marks
+///   deadLinePct      — Step 11′ line-marks dead %
+///
+/// Pre-committed acceptance: a single hello.drvPath run under
+/// NIX_V3_MAJOR_GC=1 + NIX_V3_GC_CYCLE_CSV=/tmp/gc.csv writes ≥1 row;
+/// columns sum/agree per-row with the existing stderr banner.
+namespace {
+
+struct GcCycleCsvState {
+    FILE * fp = nullptr;
+    uint64_t cycleIdx = 0;
+    size_t   arenaBytesPrev = 0;
+    std::chrono::steady_clock::time_point tPrevStart =
+        std::chrono::steady_clock::now();
+    bool headerWritten = false;
+};
+
+inline GcCycleCsvState & gcCsvState() noexcept
+{
+    static GcCycleCsvState s;
+    return s;
+}
+
+inline FILE * openGcCsvIfRequested() noexcept
+{
+    static const char * s_path = std::getenv("NIX_V3_GC_CYCLE_CSV");
+    if (!s_path || !*s_path) return nullptr;
+    auto & st = gcCsvState();
+    if (!st.fp) {
+        st.fp = std::fopen(s_path, "a");
+        if (!st.fp) return nullptr;
+        // Write header once per process (idempotent across appends —
+        // a tail | head -1 will catch the first run's header).
+        if (!st.headerWritten) {
+            std::fprintf(st.fp,
+                "cycleIdx,trigger,markMs,sweepMs,"
+                "blocksScanned,blocksFreed,"
+                "liveCells,deadCells,liveBytes,deadBytes,bytesFreed,"
+                "freeListEntries,"
+                "arenaBytesBefore,arenaBytesAfter,allocSincePrev,"
+                "wallSincePrev_ms,"
+                "totalLines,deadLines,deadLinePct\n");
+            st.headerWritten = true;
+        }
+    }
+    return st.fp;
+}
+
+} // anonymous
+
 void runMajorMarkSweep(VMState & vm) noexcept
 {
     using clock = std::chrono::steady_clock;
     const auto tStart = clock::now();
 
     Arena & arena = threadArena();
+    const size_t arenaBytesBefore = arena.bytesAllocated();
 
     // -- Phase 1: precise mark --------------------------------------
     // Step 11′ (Immix, 2026-05-29): clear per-block line-mark
@@ -958,6 +1031,49 @@ void runMajorMarkSweep(VMState & vm) noexcept
                 double(rs.recyclableDeadBytes) / 1e6,
                 double(rs.skippedDeadBytes) / 1e6);
         }
+    }
+
+    // DIAG-1 (2026-05-29): per-cycle CSV row.  Independent of
+    // NIX_VM_STATS — fires whenever NIX_V3_GC_CYCLE_CSV=path is set.
+    if (FILE * fp = openGcCsvIfRequested()) {
+        auto & st = gcCsvState();
+        const size_t arenaBytesAfter = arena.bytesAllocated();
+        const size_t allocSincePrev = (arenaBytesBefore >= st.arenaBytesPrev)
+            ? (arenaBytesBefore - st.arenaBytesPrev)
+            : 0;  // arena shrunk between cycles (whole-block-free); count 0
+        // For cycle 0: state's tPrevStart was set when gcCsvState() was
+        // first called (which happens AFTER tStart captured at function
+        // entry) — would yield a negative value.  Report 0 for cycle 0
+        // (meaningful CYCLE-TO-CYCLE time starts at cycle 1).
+        const double wallSincePrevMs = (st.cycleIdx == 0)
+            ? 0.0
+            : std::chrono::duration<double, std::milli>(
+                tStart - st.tPrevStart).count();
+        const auto [totalLines, deadLines] = arena.countLineMarks();
+        const double deadLinePct = totalLines > 0
+            ? 100.0 * double(deadLines) / double(totalLines) : 0.0;
+        std::fprintf(fp,
+            "%llu,arena_threshold,%.3f,%.3f,"
+            "%zu,%zu,"
+            "%zu,%zu,%zu,%zu,%zu,"
+            "%zu,"
+            "%zu,%zu,%zu,"
+            "%.3f,"
+            "%zu,%zu,%.3f\n",
+            (unsigned long long)st.cycleIdx,
+            markMs, sweepMs,
+            sweep.blocksScanned, sweep.blocksFreed,
+            sweep.liveCells, sweep.deadCells,
+            (size_t)sweep.liveBytes, (size_t)sweep.deadBytes,
+            (size_t)sweep.bytesFreed,
+            arena.freeListEntryCount(),
+            arenaBytesBefore, arenaBytesAfter, allocSincePrev,
+            wallSincePrevMs,
+            totalLines, deadLines, deadLinePct);
+        std::fflush(fp);
+        ++st.cycleIdx;
+        st.arenaBytesPrev = arenaBytesAfter;
+        st.tPrevStart = tStart;
     }
 }
 
