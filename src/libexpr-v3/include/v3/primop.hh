@@ -120,6 +120,13 @@ void walkV3BridgeRoots(const std::function<void(Value &)> & visit);
 /// after scavenge.
 void walkImportCacheRoots(const std::function<void(Value &)> & visit);
 
+/// 2026-05-29 evening (DIAG analysis spike): clear in-memory import
+/// cache result set so a subsequent LiveTracer / GC walk sees the
+/// nixpkgs evaluation graph as freeable.  Safe to call AFTER run()
+/// returns; UNSAFE mid-eval (orphans in-flight imports).  Gated
+/// via NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1 in run.cc.
+void clearImportCacheResultsForDiag() noexcept;
+
 /// REVIEW §2.1: RAII guard for the thread-local fallback Expr pointer
 /// that primV3{CallBridge1,ForceAttr,ForceListElem} read on cycle
 /// detection.  Setting it via raw save/restore was leaking the prior
