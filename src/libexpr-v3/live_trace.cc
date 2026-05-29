@@ -418,9 +418,33 @@ void dumpV3BridgeRetention() noexcept
     struct Row { size_t bytes; const char * kind; size_t idx; };
     std::vector<Row> rows;
     const auto sz = v3BridgeTableSizes();
-    rows.reserve(sz[0] + sz[1] + sz[2]);
+    const size_t total = sz[0] + sz[1] + sz[2];
+    rows.reserve(total);
 
+    // Sampling control: NIX_V3_BRIDGE_RETENTION_SAMPLE=N walks at most
+    // N entries (uniform stride).  Default unlimited (good for HNE-
+    // scale 30 entries; M5 with 10K entries takes 40+ min unlimited,
+    // so set this to e.g. 100 for fast probe).
+    size_t sampleMax = SIZE_MAX;
+    if (const char * v = std::getenv("NIX_V3_BRIDGE_RETENTION_SAMPLE")) {
+        long n = std::strtol(v, nullptr, 10);
+        if (n > 0) sampleMax = static_cast<size_t>(n);
+    }
+    const size_t stride = (total > sampleMax)
+        ? (total + sampleMax - 1) / sampleMax  // ceil(total/sampleMax)
+        : 1;
+    if (stride > 1) {
+        std::fprintf(stderr,
+            "[bridge-retention] sampling: walking 1-in-%zu entries "
+            "(%zu of %zu) — set NIX_V3_BRIDGE_RETENTION_SAMPLE=0 for "
+            "full walk\n", stride, total / stride + 1, total);
+    }
+
+    size_t walked = 0;
+    size_t i = 0;
     forEachV3BridgeEntry([&](const Value & v, const char * kind, size_t idx) {
+        if (i++ % stride != 0) return;
+        ++walked;
         rows.push_back({walkOne(v), kind, idx});
     });
 
