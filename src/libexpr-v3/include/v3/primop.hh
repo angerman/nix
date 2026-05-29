@@ -146,6 +146,27 @@ std::array<size_t, 3> v3BridgeTableSizes() noexcept;
 void forEachV3BridgeEntry(
     const std::function<void(const Value &, const char *, size_t)> & cb) noexcept;
 
+/// 2026-05-29 evening (production end-of-eval clear): drop bridges +
+/// import-cache results at the end of `nix eval`'s render phase to
+/// release the transitive evaluation graph to GC / process exit.
+///
+/// Per `lode/BRIDGES_HOLD_RETENTION_2026-05-29.md`: bridge tables
+/// retain 99.8-99.9 % of arena bytes at end-of-eval on both HNE
+/// and M5.  Clearing them allows the eval graph to become
+/// unreachable from globals; combined with import-cache clear,
+/// near-total reclamation is possible.
+///
+/// SAFETY: callers MUST sequence this AFTER all rendering /
+/// `forceValue` calls complete + BEFORE any further TW callbacks
+/// could fire.  `src/nix/eval.cc::run()` is the canonical call
+/// site (last action before `return true`).  DO NOT CALL from
+/// `nix repl` or chained-eval CLIs.
+///
+/// Opt-out: NIX_V3_KEEP_GLOBAL_ROOTS=1.
+///
+/// Reports stats under NIX_VM_STATS=1.
+void clearPostEvalGlobalRoots() noexcept;
+
 /// REVIEW §2.1: RAII guard for the thread-local fallback Expr pointer
 /// that primV3{CallBridge1,ForceAttr,ForceListElem} read on cycle
 /// detection.  Setting it via raw save/restore was leaking the prior

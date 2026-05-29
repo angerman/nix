@@ -223,6 +223,17 @@ static bool runV3DirectEval(
         logger->cout("%s", os.str());
     }
 
+    // 2026-05-29 evening: production end-of-eval bridge + import-cache
+    // clear.  Per `lode/BRIDGES_HOLD_RETENTION_2026-05-29.md`, v3 ↔ TW
+    // bridge tables retain 99.8-99.9 % of arena bytes at end-of-eval.
+    // Now that rendering is complete and no further TW callbacks are
+    // expected (the v3-direct path is single-shot per `nix eval`
+    // invocation; `nix repl` does NOT route through this function),
+    // drop the global-root retention so the OS can reclaim arena
+    // pages on process exit.  Default-on; opt out via
+    // NIX_V3_KEEP_GLOBAL_ROOTS=1.
+    v3::clearPostEvalGlobalRoots();
+
     return true;
 }
 

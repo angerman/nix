@@ -4129,6 +4129,9 @@ void forEachV3BridgeEntry(
         cb(v3BridgeLists()[i].v3Value, "list", i);
 }
 
+// (clearPostEvalGlobalRoots defined further down, after importCache()
+// becomes visible — see ~line 7600.)
+
 // (walkImportCacheRoots defined further down, after the
 // anonymous-namespace `importCache()` function body is visible.)
 
@@ -7622,6 +7625,59 @@ void clearImportCacheResultsForDiag() noexcept
 {
     auto & cache = importCache();
     cache.results.clear();
+}
+
+// 2026-05-29 evening (production end-of-eval clear).  Promotes the
+// DIAG spikes (clearV3BridgesForDiag + clearImportCacheResultsForDiag)
+// to a single public entry point for the `nix eval` CLI to call
+// AFTER rendering completes.
+//
+// Mechanism: drop the global-root retention sources that pin the
+// transitive evaluation graph at end-of-eval.  Per
+// `lode/BRIDGES_HOLD_RETENTION_2026-05-29.md`, bridges hold 99.8-
+// 99.9 % of arena live bytes; clearing them makes the entire eval
+// graph unreachable from globals.  Combined with import-cache
+// clear (1 MB additional residual), the live set drops to near
+// zero, allowing subsequent free-list reclamation OR process-exit
+// page reclaim to proceed unencumbered.
+//
+// SAFETY: ONLY safe to call when no further TW callbacks into v3
+// are expected.  Callers are responsible for sequencing:
+//   * src/nix/eval.cc::run() — call AFTER rendering completes;
+//     no further v3 calls expected before process exit
+//   * `nix repl` and other interactive contexts — DO NOT CALL;
+//     subsequent expressions need the bridges
+//
+// Opt-out: NIX_V3_KEEP_GLOBAL_ROOTS=1 — useful for benchmarking
+// against the pre-clear baseline, or for users who chain multiple
+// evals in-process.
+//
+// Reports # of bridge entries cleared to stderr when NIX_VM_STATS=1.
+void clearPostEvalGlobalRoots() noexcept
+{
+    static const bool s_keep =
+        std::getenv("NIX_V3_KEEP_GLOBAL_ROOTS") != nullptr;
+    if (s_keep) return;
+
+    const size_t nClosures = v3BridgeClosures().size();
+    const size_t nAttrs    = v3BridgeAttrs().size();
+    const size_t nLists    = v3BridgeLists().size();
+    const size_t nImports  = importCache().results.size();
+
+    v3BridgeClosures().clear();
+    v3BridgeAttrs().clear();
+    v3BridgeLists().clear();
+    importCache().results.clear();
+
+    static const bool s_stats = std::getenv("NIX_VM_STATS") != nullptr;
+    if (s_stats) {
+        const size_t totalBridges = nClosures + nAttrs + nLists;
+        std::fprintf(stderr,
+            "v3-direct post-eval clear: dropped %zu bridge entries "
+            "(%zu closures, %zu attrs, %zu lists) + %zu import-cache "
+            "results.  Eval graph now unreachable from global roots.\n",
+            totalBridges, nClosures, nAttrs, nLists, nImports);
+    }
 }
 
 // #705 (2026-05-21): walk import-cache results as scavenger roots.
