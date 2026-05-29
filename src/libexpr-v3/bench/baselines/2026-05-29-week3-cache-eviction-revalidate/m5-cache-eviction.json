@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "date": "2026-05-29",
+  "workload": "M5",
+  "binary": "builddir/src/nix/nix (post-App3-rollback, post-capWiths)",
+  "method": "Inline bash measurement; N=10 each config back-to-back; trim-2 mean ± σ; warmup before each config.",
+  "configs": {
+    "M5_cache_on": {
+      "label": "default (disk cache enabled)",
+      "env": ""
+    },
+    "M5_cache_off": {
+      "label": "NIX_V3_NO_DISK_CACHE=1 (proxy for cache eviction)",
+      "env": "NIX_V3_NO_DISK_CACHE=1"
+    }
+  },
+  "results": {
+    "M5_cache_on": {
+      "peak_raw": [4362.6, 4027.1, 3488.2, 3533.5, 4445.7, 3921.0, 3357.3, 3916.7, 3832.6, 3196.3],
+      "peak_mean_trim2": 3804.88,
+      "peak_sigma_trim2": 308.51,
+      "arena_mb": 5570.0,
+      "elsewhere_mb": 0.0
+    },
+    "M5_cache_off": {
+      "peak_raw": [4240.5, 4340.9, 4775.3, 3521.1, 3070.6, 3929.7, 3864.2, 3685.1, 2613.0, 2927.8],
+      "peak_mean_trim2": 3697.49,
+      "peak_sigma_trim2": 475.29,
+      "arena_mb": 5570.0,
+      "elsewhere_mb": 0.0
+    }
+  },
+  "delta": {
+    "delta_peak_mb_cache_off_minus_cache_on": -107.39,
+    "delta_peak_sigma_pooled": 566.21,
+    "delta_peak_n_sigma": 0.19,
+    "delta_arena_mb": 0.0
+  },
+  "interpretation": {
+    "verdict": "NULL on M5 — cache eviction is not a viable Week 3 lever.",
+    "detail": "Nominal -107 MB direction matches the original Day 2 reading on stale build/ binary. Signal at 0.19σ pooled is indistinguishable from environmental noise; 95% CI ~ ±1100 MB. Both runs hit identical v3_arena (5570 MB deterministic) confirming v3-level state is invariant; the peak variance is OS-level page-eviction noise.",
+    "elsewhere_anomaly": "Both configs show elsewhere=0 MB. HNE_BUCKET_DECOMP claimed ~990 MB elsewhere on HNE; today's builddir/ shows 0 across HNE + M5. The elsewhere-counter may be broken in current builddir/, OR the bucket genuinely shrank between binaries. Separate investigation; not blocking Week 3 decision."
+  }
+}
