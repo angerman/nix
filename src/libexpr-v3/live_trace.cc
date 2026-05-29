@@ -1367,6 +1367,15 @@ struct PeriodicCsvRow {
     double l_resident;        // live / resident
     double l_cumulative;      // live / cumulative-allocated
     double wall_ms;           // ms since eval start
+    // DIAG-3 (2026-05-29 evening, per DIAGNOSTIC_AUDIT §6.3):
+    // per-Tag live-bytes breakdown.  Same liveBytes sum as `live_mb`,
+    // decomposed.  LiveTracer already separates per-Tag internally
+    // (counts.bytesClosures, bytesThunks, etc.); just plumb through.
+    double live_closures_mb;
+    double live_thunks_mb;
+    double live_bindings_mb;
+    double live_lists_mb;
+    double live_pairs_mb;
 };
 
 /// thread_local state for the periodic trace.  Thread-local because v3
@@ -1479,6 +1488,13 @@ void maybeSamplePeriodicLiveFraction(VMState & vm) noexcept
     row.l_cumulative    = cumulativeBytes > 0
         ? double(liveBytes) / double(cumulativeBytes) : 0.0;
     row.wall_ms         = wall_ms;
+    // DIAG-3 per-Tag plumbing.
+    constexpr double MB = 1.0 / double(1ULL << 20);
+    row.live_closures_mb = double(tr.counts.bytesClosures) * MB;
+    row.live_thunks_mb   = double(tr.counts.bytesThunks)   * MB;
+    row.live_bindings_mb = double(tr.counts.bytesBindings) * MB;
+    row.live_lists_mb    = double(tr.counts.bytesLists)    * MB;
+    row.live_pairs_mb    = double(tr.counts.bytesPairs)    * MB;
     st.rows.push_back(row);
 
     // Advance threshold past current bytes by the next K-multiple
@@ -1509,7 +1525,9 @@ void flushPeriodicLiveTraceCsv() noexcept
         if (trunc) {
             std::fprintf(trunc,
                 "alloc_offset_mb,resident_mb,live_mb,"
-                "L_resident,L_cumulative,wall_ms\n");
+                "L_resident,L_cumulative,wall_ms,"
+                "live_closures_mb,live_thunks_mb,"
+                "live_bindings_mb,live_lists_mb,live_pairs_mb\n");
             std::fclose(trunc);
         }
     }
@@ -1523,9 +1541,12 @@ void flushPeriodicLiveTraceCsv() noexcept
     }
     for (const auto & r : st.rows) {
         std::fprintf(f,
-            "%.2f,%.2f,%.2f,%.4f,%.4f,%.1f\n",
+            "%.2f,%.2f,%.2f,%.4f,%.4f,%.1f,"
+            "%.2f,%.2f,%.2f,%.2f,%.2f\n",
             r.alloc_offset_mb, r.resident_mb, r.live_mb,
-            r.l_resident, r.l_cumulative, r.wall_ms);
+            r.l_resident, r.l_cumulative, r.wall_ms,
+            r.live_closures_mb, r.live_thunks_mb,
+            r.live_bindings_mb, r.live_lists_mb, r.live_pairs_mb);
     }
     std::fclose(f);
 
