@@ -11,10 +11,22 @@
 | #882 Tier 2d-i (primFunctionArgs) | **AUDIT-ONLY: keep as-is** | Common case (Tag::Closure → desc->formals) is pure v3-native at `primops.cc:9676+`.  Bridge case at lines 9619-9669 (Tag::Thunk + ThunkState::Bridge wrapping TW ExprLambda) is a true FFI leaf for the v3FormalsLambdaBridges sentinel — not a migration candidate. |
 | #883 Tier 2d-ii (catAttrs) | **AUDIT-ONLY: keep as-is** | `primops.cc:2067` is pure v3-native: forceValue + bindings->lookup + allocList.  Zero TW crossings. |
 | #878 measurement spike | **EXECUTED** | `NIX_VM_PRIMOP_TIME=1` on hello.drvPath + HNE.  Top 15 wall on both is dominated by derivation-class FFI primops: `__derivationFromPreprocessed` 50-58%, `__derivCoerce` 26-34%, `import` 7-8%.  primSort/primGenericClosure/primZipAttrsWith **do not appear in top 15 wall or top 30 call counts** on either workload (< 1 % wall). |
-| #879 Tier 2a (primSort) | **DEFERRED** | < 1 % wall per #878.  Existing v3-native impl correct + off-hot-path.  Reopen if any future workload shows ≥ 1 %. |
-| #880 Tier 2b (primGenericClosure) | **DEFERRED** | < 1 % wall per #878.  Same rationale as #879. |
-| #881 Tier 2c (primZipAttrsWith) | **DEFERRED** | < 1 % wall per #878.  Same rationale as #879. |
-| #884 acceptance gate | **CLEARED — no code changed** | Tier 0 + Tier 2d are zero-code outcomes (already complete or audit-only); Tier 2a/b/c deferred without implementation.  No regressions possible. |
+| #879 Tier 2a (primSort) | **SHIPPED 2026-05-29 (commit `1243c158b`)** | Per user override after #878 DEFER verdict: ship for architectural consistency + C-stack-safety + V3-NATIVE-family completeness, not wall-percent.  Stable insertion sort via foldl'; passes `eval-okay-sort.exp` repeated-key stability test.  Gate: `NIX_V3_NO_BC_SORT=1`. |
+| #880 Tier 2b (primGenericClosure) | **SHIPPED 2026-05-29 (commit `1243c158b`)** | Per user override.  BFS via list-queue + attrset-seen + OP_CALL for `operator`.  Type-prefixed key dedup + firstType tracking + NaN reject.  Gate: `NIX_V3_NO_BC_GENERIC_CLOSURE=1`. |
+| #881 Tier 2c (primZipAttrsWith) | **SHIPPED 2026-05-29 (commit `1243c158b`)** | Per user override.  Name-union via `foldl' a // b` + `listToAttrs (map ... allNames)` with lazy per-entry thunks.  Laziness matches the C Tag::App entries (WC-35 fix preserved).  Gate: `NIX_V3_NO_BC_ZIP_ATTRS_WITH=1`. |
+| #884 acceptance gate | **CLEARED — Tier 0/2d zero-code, Tier 2a/b/c shipped via #1243c158b** | Validation: --quick 6/6, --core 15/15 (143-lang + 58-property), --brute pre-existing failures only (verified with opt-outs ON), 5 nixpkgs paths byte-equal vs TW. |
+
+### Override note (2026-05-29 user redirect)
+
+The initial Tier 2a/b/c DEFER verdict (above) was based purely on the `NIX_VM_PRIMOP_TIME=1` <1%-wall measurement on hello.drvPath + HNE.  User directive: ship Tier 2a/b/c despite the null perf lever.  Rationale codified:
+
+* **C-stack safety:** the primSort / primGenericClosure / primZipAttrsWith C bodies hold per-element loops that call `callClosure` per element.  C-stack depth per dispatch is constant (the callback runs through the VM dispatchLoop, not C-recursion), so the latent risk is small — but the bytecode-installed versions move the outer loop into VM-managed iteration via `foldl'` + `OP_TAIL_CALL`, eliminating even that small surface.
+* **V3-NATIVE family consistency:** every other callback-using v3-native primop (foldl', map, filter, concatMap, partition, groupBy, all, any) is bytecode-installed.  These three were the outliers.  Closing the gap simplifies reasoning about which path a primop's outer loop runs through.
+* **Future workload coverage:** hello.drvPath + HNE don't exercise these heavily.  Other workloads (module-system-heavy, lib-only evals, attrset-heavy folds) might.  Covering the migration eagerly avoids re-investigation when a workload surfaces a hot site.
+
+The pre-committed #878 gate's "DEFER" verdict ranked these as null perf levers.  That ranking is STILL TRUE on the measured workloads.  The user's override correctly recognises that null-lever ≠ null-value when the value being captured is non-perf.
+
+The asymptotic regressions (O(N²) vs O(N log N) for sort; O(M²) vs O(M) for genericClosure; O(N × M) vs O(N × K) for zipAttrsWith) are intentional and bounded — typical nixpkgs uses involve N/M/K in the 10-100 range where dispatch cost dominates the asymptotic.  If a workload surfaces where bytecode regression dominates, the per-primop `NIX_V3_NO_BC_*` opt-out reverts cleanly.
 
 ### Key empirical numbers (2026-05-29)
 
