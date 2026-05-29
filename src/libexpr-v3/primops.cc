@@ -3926,11 +3926,18 @@ void primDerivation(EvalState & state, Value * args, Value & out);
 /// tryDispatchBridge1Direct).  Cost: 12 B/entry × ~10K M5 bridges =
 /// ~120 KB total — negligible against the bridge tables' multi-GB
 /// transitive retention.  See `lode/WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md`.
+///
+/// #875 Stage 1 (2026-05-29): `evicted` flag.  When set, the entry's
+/// `v3Value` has been reset to Value{} (zero-default; releases
+/// transitive retention to Boehm GC).  Dispatch routes through the
+/// existing BlackholeError fallback path which re-runs `fallbackExpr`
+/// via tree-walker.  Eviction is opt-in via `NIX_V3_WEAK_BRIDGES=1`.
 struct BridgeClosureEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
     uint64_t lastAccessGen = 0;   // monotonic; 0 = never dispatched
     uint32_t accessCount = 0;     // saturating
+    bool evicted = false;         // Stage 1: v3Value cleared, must re-eval
 };
 // CRIT-2 (table side): the static bridge tables hold v3 Values whose
 // payloads (Closure*, Bindings*, Thunk*, ListVec*) live in the v3
@@ -3965,16 +3972,18 @@ static std::vector<BridgeClosureEntry,
 struct BridgeAttrEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
-    // #875 Stage 0 — see BridgeClosureEntry above.
+    // #875 Stage 0 / Stage 1 — see BridgeClosureEntry above.
     uint64_t lastAccessGen = 0;
     uint32_t accessCount = 0;
+    bool evicted = false;
 };
 struct BridgeListEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
-    // #875 Stage 0 — see BridgeClosureEntry above.
+    // #875 Stage 0 / Stage 1 — see BridgeClosureEntry above.
     uint64_t lastAccessGen = 0;
     uint32_t accessCount = 0;
+    bool evicted = false;
 };
 
 // #875 Stage 0 (2026-05-29): monotonic counter bumped at every bridge
@@ -3985,12 +3994,116 @@ struct BridgeListEntry {
 // lastAccessGen gives the LRU order needed by Stage 1's eviction policy.
 static std::atomic<uint64_t> g_bridgeAccessGen{0};
 
+// #875 Stage 1 (2026-05-29): eviction counters for the weak-bridge
+// design.  All atomic-relaxed; v3 is single-threaded today but the
+// instrumentation must stay race-free.
+static std::atomic<uint64_t> g_bridgeEvictions{0};       // entries cleared
+static std::atomic<uint64_t> g_bridgeReEvalsAfterEviction{0};  // re-eval after eviction
+static std::atomic<uint64_t> g_bridgeEvictionSweeps{0};  // sweep invocations
+
+// Forward decls — the table accessors are defined later in the file
+// (BridgeAttrEntry / BridgeListEntry structs interleave their tables
+// before vs after this section, so the symbols aren't visible yet).
+static std::vector<BridgeAttrEntry,
+    traceable_allocator<BridgeAttrEntry>> & v3BridgeAttrs();
+static std::vector<BridgeListEntry,
+    traceable_allocator<BridgeListEntry>> & v3BridgeLists();
+
+// Stage 1 gates: cached at first access.
+static bool weakBridgesEnabled() noexcept
+{
+    static const bool v = std::getenv("NIX_V3_WEAK_BRIDGES") != nullptr;
+    return v;
+}
+// For stress testing: set NIX_V3_WEAK_BRIDGE_SWEEP=1 + NIX_V3_WEAK_BRIDGE_AGE=0.
+// Combined effect: every dispatch triggers a sweep that evicts every entry
+// whose lastAccessGen is older than currentGen — i.e. every other entry.
+// The just-bumped entry survives because its lastAccessGen == currentGen.
+static uint64_t weakBridgeSweepInterval() noexcept
+{
+    static const uint64_t v = []() -> uint64_t {
+        if (const char * s = std::getenv("NIX_V3_WEAK_BRIDGE_SWEEP")) {
+            long n = std::strtol(s, nullptr, 10);
+            if (n > 0) return static_cast<uint64_t>(n);
+        }
+        return 1000;  // sweep every 1000 dispatches by default
+    }();
+    return v;
+}
+static uint64_t weakBridgeAge() noexcept
+{
+    static const uint64_t v = []() -> uint64_t {
+        if (const char * s = std::getenv("NIX_V3_WEAK_BRIDGE_AGE")) {
+            long n = std::strtol(s, nullptr, 10);
+            if (n >= 0) return static_cast<uint64_t>(n);
+        }
+        return 100;  // evict if (gen - lastAccessGen) > 100
+    }();
+    return v;
+}
+
+// Evict a single entry: clear v3Value to release transitive retention,
+// flag for re-eval on next dispatch.  fallbackExpr is retained — it's
+// the rescue path.  Entries without a fallbackExpr cannot be evicted
+// (no recovery would be possible).
+template <typename Entry>
+static inline void evictBridgeEntry(Entry & e) noexcept
+{
+    if (e.evicted) return;          // already evicted
+    if (!e.fallbackExpr) return;    // no recovery path; keep
+    e.v3Value = Value{};            // Tag::Uninitialized; releases payload
+    e.evicted = true;
+    g_bridgeEvictions.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Sweep the three bridge tables once.  Evict any entry whose
+// (currentGen - lastAccessGen) exceeds the age threshold and that
+// hasn't yet been evicted.  Entries with lastAccessGen == 0
+// (never dispatched) are evicted unconditionally (the age threshold
+// is satisfied trivially since currentGen > 0).
+static void sweepBridgeEvictions(uint64_t currentGen) noexcept
+{
+    const uint64_t age = weakBridgeAge();
+    auto sweepOne = [&](auto & tbl) {
+        for (auto & e : tbl) {
+            if (e.evicted) continue;
+            // Never-accessed: lastAccessGen == 0; treat as ancient.
+            // Stale: currentGen - lastAccessGen > age.
+            if (e.lastAccessGen == 0 || currentGen - e.lastAccessGen > age)
+                evictBridgeEntry(e);
+        }
+    };
+    sweepOne(v3BridgeClosures());
+    sweepOne(v3BridgeAttrs());
+    sweepOne(v3BridgeLists());
+    g_bridgeEvictionSweeps.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Conditional sweep check called from bumpBridgeAccess hot path.
+// Cheap branch (one static-cached bool + one uint64 subtraction) when
+// weak bridges are disabled.
+static thread_local uint64_t tlsLastSweepGen = 0;
+static inline void maybeSweepBridges(uint64_t currentGen) noexcept
+{
+    if (currentGen - tlsLastSweepGen < weakBridgeSweepInterval()) return;
+    tlsLastSweepGen = currentGen;
+    sweepBridgeEvictions(currentGen);
+}
+
 template <typename Entry>
 static inline void bumpBridgeAccess(Entry & e) noexcept
 {
-    e.lastAccessGen =
+    uint64_t gen =
         g_bridgeAccessGen.fetch_add(1, std::memory_order_relaxed) + 1;
+    e.lastAccessGen = gen;
     if (e.accessCount < UINT32_MAX) ++e.accessCount;
+    // #875 Stage 1: maybe-sweep is the only side-effect when weak
+    // bridges are enabled.  Sweep evicts entries whose lastAccessGen
+    // is OLDER than (currentGen - age).  The current entry's
+    // lastAccessGen equals currentGen so it's protected.
+    if (__builtin_expect(weakBridgesEnabled(), 0)) {
+        maybeSweepBridges(gen);
+    }
 }
 // CRIT-2 (table side): traceable storage so Boehm sees the inner
 // v3-Value payloads.
@@ -4256,6 +4369,40 @@ void dumpBridgeAccessDistribution(std::FILE * out) noexcept
         "%s Stage 1 ROI decision\n",
         coldCum, total, coldPct,
         coldPct >= 30.0 ? "ABOVE 30% threshold:" : "below 30% threshold:");
+    // #875 Stage 1 (always-on, cheap): report how many entries have
+    // fallbackExpr — i.e. how many are EVICTION-CAPABLE.  Stage 1 can
+    // only evict entries with a fallbackExpr present; if this number
+    // is much smaller than `total`, Stage 1's memory ROI is capped at
+    // (evictableEntries / total) regardless of access patterns.
+    size_t evictable[3] = {0, 0, 0};
+    for (auto & e : v3BridgeClosures()) if (e.fallbackExpr) ++evictable[0];
+    for (auto & e : v3BridgeAttrs())    if (e.fallbackExpr) ++evictable[1];
+    for (auto & e : v3BridgeLists())    if (e.fallbackExpr) ++evictable[2];
+    size_t evictableTotal = evictable[0] + evictable[1] + evictable[2];
+    double evictablePct = total ? 100.0 * double(evictableTotal) / double(total) : 0.0;
+    std::fprintf(out,
+        "  evictable (fallbackExpr present): %zu/%zu entries (%.1f%%) — "
+        "%s Stage 1 max-reclaim\n",
+        evictableTotal, total, evictablePct,
+        evictablePct >= 30.0 ? "ABOVE 30%:" : "BELOW 30% — "
+        "extend ScopedBridgeFallbackExpr coverage for Stage 1.5");
+    // Eviction-firing stats.  Only emit if policy is engaged.
+    const uint64_t evictions = g_bridgeEvictions.load(std::memory_order_relaxed);
+    const uint64_t reEvals = g_bridgeReEvalsAfterEviction.load(std::memory_order_relaxed);
+    const uint64_t sweeps = g_bridgeEvictionSweeps.load(std::memory_order_relaxed);
+    if (evictions || reEvals || sweeps) {
+        size_t evictedCount = 0;
+        for (auto & e : v3BridgeClosures()) if (e.evicted) ++evictedCount;
+        for (auto & e : v3BridgeAttrs())    if (e.evicted) ++evictedCount;
+        for (auto & e : v3BridgeLists())    if (e.evicted) ++evictedCount;
+        std::fprintf(out,
+            "  Stage 1: evictions=%llu reEvalsAfterEviction=%llu sweeps=%llu "
+            "currentlyEvicted=%zu\n",
+            (unsigned long long)evictions,
+            (unsigned long long)reEvals,
+            (unsigned long long)sweeps,
+            evictedCount);
+    }
 }
 
 // (clearPostEvalGlobalRoots defined further down, after importCache()
@@ -4356,9 +4503,13 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 bridge1: invalid handle").debugThrow();
-    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
+    // #875 Stage 0+1: snapshot state BEFORE bump (bumpBridgeAccess may
+    // sweep + evict OTHER entries; the current entry's lastAccessGen
+    // is set to currentGen so it's protected).
     Value v3fn = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
+    const bool v3HandleEvicted = tbl[(size_t)h].evicted;
+    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
 
     ScopedNixEvalState _v3evalGuard(&ns);
     // #455: eager-force gate.  Tree-walker's regular callFunction does
@@ -4504,6 +4655,23 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
             return;
         }
     }
+    // #875 Stage 1: handle evicted? Route through fallback unconditionally.
+    // The cached v3Value was cleared by sweepBridgeEvictions; only the
+    // fallbackExpr is available.  Reuses the same code path that the
+    // existing BlackholeError catch invokes — see fallbackToTreeWalker
+    // above.
+    if (__builtin_expect(v3HandleEvicted, 0)) {
+        g_bridgeReEvalsAfterEviction.fetch_add(1, std::memory_order_relaxed);
+        if (!fallbackExpr)
+            ns.error<nix::EvalError>(
+                "v3 bridge1: evicted handle has no fallbackExpr").debugThrow();
+        nix::Value tw;
+        fallbackExpr->eval(ns, ns.baseEnv, tw);
+        ns.forceValue(tw, pos);
+        ns.callFunction(tw, *args[1], out, pos);
+        return;
+    }
+
     Value fn;
     try {
         if (useFiber && activeFiberDriverDepth == 0) {
@@ -4674,16 +4842,44 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeAttrs();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 forceAttr: invalid handle").debugThrow();
-    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
+    // #875 Stage 0+1: snapshot before bump (see primV3CallBridge1 above).
     Value v3attrs = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
-    if (v3attrs.tag() != Tag::Attrs || !v3attrs.payload.bindings)
+    const bool v3HandleEvicted = tbl[(size_t)h].evicted;
+    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
+    // For evicted handles, defer the type-check on v3attrs (it's the
+    // zero-default Value{} after eviction; fallback supplies the real
+    // attrset from fallbackExpr->eval).
+    if (!v3HandleEvicted && (v3attrs.tag() != Tag::Attrs || !v3attrs.payload.bindings))
         ns.error<nix::EvalError>("v3 forceAttr: handle does not point to an Attrs").debugThrow();
 
     ns.forceValue(*args[1], pos);
     if (args[1]->type() != nix::nString)
         ns.error<nix::EvalError>("v3 forceAttr: name must be string").debugThrow();
     std::string_view name(args[1]->string_view());
+
+    // #875 Stage 1: handle evicted? Re-eval via TW and look up attr.
+    if (__builtin_expect(v3HandleEvicted, 0)) {
+        g_bridgeReEvalsAfterEviction.fetch_add(1, std::memory_order_relaxed);
+        if (!fallbackExpr)
+            ns.error<nix::EvalError>(
+                "v3 forceAttr: evicted handle has no fallbackExpr").debugThrow();
+        nix::Value tw;
+        fallbackExpr->eval(ns, ns.baseEnv, tw);
+        ns.forceValue(tw, pos);
+        if (tw.type() != nix::nAttrs)
+            ns.error<nix::EvalError>(
+                "v3 forceAttr: tree-walker fallback returned non-attrs").debugThrow();
+        nix::Symbol resolvedName = ns.symbols.create(name);
+        auto * a = tw.attrs()->get(resolvedName);
+        if (!a)
+            ns.error<nix::EvalError>(
+                "v3 forceAttr: tree-walker fallback missing attr '%1%'",
+                std::string(name)).debugThrow();
+        ns.forceValue(*a->value, pos);
+        out = *a->value;
+        return;
+    }
 
     // v3 Bindings are sorted by SymbolId.  We have a string name —
     // resolve through v3's symbol table.
@@ -4897,16 +5093,41 @@ static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeLists();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 forceListElem: invalid handle").debugThrow();
-    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
+    // #875 Stage 0+1: snapshot before bump.
     Value v3list = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
-    if (v3list.tag() != Tag::List || !v3list.payload.list)
+    const bool v3HandleEvicted = tbl[(size_t)h].evicted;
+    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
+    // For evicted handles, defer the type-check.
+    if (!v3HandleEvicted && (v3list.tag() != Tag::List || !v3list.payload.list))
         ns.error<nix::EvalError>("v3 forceListElem: handle does not point to a List").debugThrow();
 
     ns.forceValue(*args[1], pos);
     if (args[1]->type() != nix::nInt)
         ns.error<nix::EvalError>("v3 forceListElem: index must be int").debugThrow();
     int64_t idx = args[1]->integer().value;
+
+    // #875 Stage 1: handle evicted? Re-eval via TW and look up index.
+    if (__builtin_expect(v3HandleEvicted, 0)) {
+        g_bridgeReEvalsAfterEviction.fetch_add(1, std::memory_order_relaxed);
+        if (!fallbackExpr)
+            ns.error<nix::EvalError>(
+                "v3 forceListElem: evicted handle has no fallbackExpr").debugThrow();
+        nix::Value tw;
+        fallbackExpr->eval(ns, ns.baseEnv, tw);
+        ns.forceValue(tw, pos);
+        if (tw.type() != nix::nList)
+            ns.error<nix::EvalError>(
+                "v3 forceListElem: tree-walker fallback returned non-list").debugThrow();
+        auto view = tw.listView();
+        if (idx < 0 || (size_t)idx >= view.size())
+            ns.error<nix::EvalError>(
+                "v3 forceListElem: tree-walker fallback list index out of range").debugThrow();
+        ns.forceValue(*view[idx], pos);
+        out = *view[idx];
+        return;
+    }
+
     const ListVec * l = v3list.payload.list;
     if (idx < 0 || (uint32_t)idx >= l->size)
         ns.error<nix::EvalError>("v3 forceListElem: index out of range").debugThrow();
@@ -10581,6 +10802,10 @@ bool tryUnwrapBridge1Closure(const nix::Value & funTw, Value & outV3Fn)
     int64_t h = vHandle->integer().value;
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size()) return false;
+    // #875 Stage 1: decline the v3-side shortcut for evicted handles —
+    // caller falls through to the TW primop-dispatch path, which has
+    // the eviction-recovery code (primV3CallBridge1).
+    if (tbl[(size_t)h].evicted) return false;
     bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
     outV3Fn = tbl[(size_t)h].v3Value;
     return true;
@@ -10631,6 +10856,10 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
     int64_t h = vHandle->integer().value;
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size()) return false;
+    // #875 Stage 1: decline the direct-dispatch shortcut for evicted
+    // handles; caller falls through to TW dispatch → primV3CallBridge1
+    // → eviction-recovery code.
+    if (tbl[(size_t)h].evicted) return false;
     bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
 
     // Got a valid bridge1 invocation.  Dispatch via v3 directly:
