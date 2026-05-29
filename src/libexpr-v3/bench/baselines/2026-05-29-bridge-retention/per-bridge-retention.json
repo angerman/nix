@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "date": "2026-05-29-evening",
+  "method": "dumpV3BridgeRetention() — per-bridge-entry transitive LiveTracer walk. NIX_V3_DUMP_BRIDGE_RETENTION=1 unlimited (HNE); =20 sampled (M5).",
+  "results": {
+    "HNE": {
+      "total_entries": 30,
+      "walked": 30,
+      "sample_stride": 1,
+      "heavy_entries": [
+        {"rank": 0, "kind": "attrs", "idx": 9, "retained_MB": 636.30},
+        {"rank": 1, "kind": "attrs", "idx": 8, "retained_MB": 636.30},
+        {"rank": 2, "kind": "attrs", "idx": 7, "retained_MB": 636.30}
+      ],
+      "histogram": {
+        "<1 KB": 27,
+        ">=256 MB": 3
+      },
+      "interpretation": "Three latest attrs entries (likely nixpkgs root chain) each hold 636 MB transitively, sharing the same subgraph. 27 closure-bridges from intermediate calls hold essentially nothing. Lever: drop the 3 heavy entries."
+    },
+    "M5": {
+      "total_entries": 10056,
+      "walked": 20,
+      "sample_stride": 503,
+      "heavy_entries_sampled": [
+        {"rank": 0, "kind": "closure", "idx": 503, "retained_MB": 952.92},
+        {"rank": 18, "kind": "closure", "idx": 9557, "retained_MB": 952.92}
+      ],
+      "histogram_sample": {
+        "<1 KB": 1,
+        ">=256 MB": 19
+      },
+      "interpretation": "Sampled at 1-in-503 stride: closure#0 holds nothing; ALL others (closures 503-9557) each hold 952.92 MB transitively. They share the same evaluation subgraph (cardano-node flake outputs). Lever: bulk eviction; can't drop individual entries because survivors still pin the graph."
+    }
+  },
+  "cross_workload_pattern": {
+    "common": "Bridges hold ~99% retention at end-of-eval. Clearing all bridges → ~1 MB live.",
+    "different": {
+      "HNE": "few heavy + many light (sparse heavy pattern)",
+      "M5": "many heavy sharing same subgraph (dense heavy pattern)"
+    },
+    "implication": "Weak-bridge eviction is easy on HNE (target 3 heavy), challenging on M5 (must drop all heavy together). End-of-eval bulk clear works on both."
+  }
+}
