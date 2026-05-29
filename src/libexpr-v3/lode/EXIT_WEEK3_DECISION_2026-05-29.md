@@ -116,7 +116,7 @@ Day 18-19 onward depends on Day 17 outcome.
 
 Two anomalies to investigate (separate from the Immix gate):
 
-1. **elsewhere=0 in builddir/.**  HNE_BUCKET_DECOMP claimed ~990 MB elsewhere on HNE; today's builddir/ measurements show 0 across both HNE + M5 + with-cache + without-cache.  Either the elsewhere counter is broken in current builddir/, OR the bucket genuinely vanished between binaries.  If elsewhere truly is 0, the HNE_BUCKET_DECOMP attribution is invalid and the 500-950 MB cache eviction projection is too.  Worth ~1 hour to investigate.
+1. **elsewhere=0 in builddir/ — RESOLVED.**  Re-investigation showed the counter is correct; the formula is `max(0, peak_rss - boehm_heap - v3_arena)`.  On M5 arena (5570) > peak (3800) due to page-eviction, so elsewhere clamps to 0 as expected.  On HNE a single-shot single-shot today: peak 2153 / arena 1476 / boehm 403 → elsewhere = 273 MB (matches formula).  Variable across sessions: Day 13-15 HNE showed ~454 MB; Day 12 verdict showed ~561 MB.  My retrospective inline-bash script just didn't capture elsewhere into JSON (only peak + arena).  Bucket is real but smaller than HNE_BUCKET_DECOMP's 990 MB — environmental.
 
 2. **M5 peak σ is environmental.**  Morning M5 measurement σ=95, afternoon σ=308 — same code, same N=10.  The watchdog "247 MB OVER" claim may be within noise envelope.  Multiple sessions worth of M5 measurement may give a more honest distribution.
 
