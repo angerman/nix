@@ -523,6 +523,126 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "    (acc: x: if pred x then acc ++ [x] else acc) "
                 "    [] "
                 "    list");
+
+        // T18 — sort (Tier 2a, 2026-05-29).  Per-element CMP callback
+        // runs under OP_CALL (iterative VM dispatch) rather than the
+        // C-side callClosure in primSort.  Implementation: stable
+        // insertion sort via foldl'.  Each insertion finds the first
+        // index where cmp x sorted[i] is TRUE (strict-weak-order
+        // semantic) and splices x in.  Equal elements stay in original
+        // order — STABLE, matching TW's peeksort guarantee (which the
+        // lang-test eval-okay-sort.exp exercises via repeated keys).
+        //
+        // Asymptotic: O(N²) — N insertions × O(N) genList+concat each.
+        // C primSort is O(N log N) via std::sort (TW: peeksort).  The
+        // bytecode regression is intentional: nixpkgs uses sort on
+        // small lists (attrNames, derivation outputs); for N≤100 the
+        // O(N²) shape is dominated by per-call dispatch cost anyway.
+        // Reverts cleanly via NIX_V3_NO_BC_SORT=1.
+        if (!std::getenv("NIX_V3_NO_BC_SORT"))
+            installBytecodePrimop(state, "sort",
+                "cmp: list: "
+                "  let "
+                "    n0 = builtins.length list; "
+                "    insert = sorted: x: "
+                "      let "
+                "        n = builtins.length sorted; "
+                "        findIdx = i: "
+                "          if i >= n then n "
+                "          else if cmp x (builtins.elemAt sorted i) "
+                "               then i "
+                "               else findIdx (i + 1); "
+                "        idx = findIdx 0; "
+                "        before = builtins.genList (i: builtins.elemAt sorted i) idx; "
+                "        after  = builtins.genList (i: builtins.elemAt sorted (idx + i)) (n - idx); "
+                "      in before ++ [x] ++ after; "
+                "  in "
+                "    if n0 <= 1 then list "
+                "    else builtins.foldl' insert [] list");
+
+        // T19 — genericClosure (Tier 2b, 2026-05-29).  BFS closure
+        // computation with key-based dedup.  C primGenericClosure
+        // uses `std::deque` + `unordered_set<std::string>` and calls
+        // `callClosure` per item; bytecode uses list-based work-queue
+        // + attrset-based seen-set + native OP_CALL for `operator it`.
+        //
+        // Key dedup: typeOf-prefixed string ("S"+s / "I"+toStr / etc.)
+        // so e.g. int 1 and string "1" don't collide.  Mixed-type
+        // detection: track firstType; throw on mismatch — matches the
+        // C eval-fail-genericClosure-keys-incompatible-types contract.
+        // NaN float keys are rejected via `k != k` (IEEE).
+        //
+        // Asymptotic: O(M²) where M = final result size (per-step
+        // tail+head+concat are O(M)).  C is O(M) via deque/set.  For
+        // typical nixpkgs uses (M ≤ 100) this is fine.  Reverts via
+        // NIX_V3_NO_BC_GENERIC_CLOSURE=1.
+        if (!std::getenv("NIX_V3_NO_BC_GENERIC_CLOSURE"))
+            installBytecodePrimop(state, "genericClosure",
+                "arg: "
+                "  let "
+                "    startSet = arg.startSet; "
+                "    operator = arg.operator; "
+                "    keyToStr = k: "
+                "      let t = builtins.typeOf k; in "
+                "      if t == \"string\" then \"S\" + k "
+                "      else if t == \"int\" then \"I\" + builtins.toString k "
+                "      else if t == \"float\" then "
+                "        (if k != k then throw \"NaN key is not orderable\" "
+                "         else \"F\" + builtins.toString k) "
+                "      else if t == \"path\" then \"P\" + toString k "
+                "      else if t == \"bool\" then (if k then \"BTrue\" else \"BFalse\") "
+                "      else throw \"'key' must be string / int / float / path / bool\"; "
+                "    go = work: result: seen: firstType: "
+                "      if work == [] then result "
+                "      else "
+                "        let "
+                "          it      = builtins.head work; "
+                "          rest    = builtins.tail work; "
+                "          k       = it.key; "
+                "          curType = builtins.typeOf k; "
+                "          newType = "
+                "            if firstType == null then curType "
+                "            else if firstType == curType then firstType "
+                "            else throw \"cannot compare keys of incompatible types\"; "
+                "          ks      = keyToStr k; "
+                "        in "
+                "          if seen ? ${ks} "
+                "          then go rest result seen newType "
+                "          else "
+                "            let next = operator it; in "
+                "            go (rest ++ next) (result ++ [it]) (seen // { ${ks} = null; }) newType; "
+                "  in go startSet [] {} null");
+
+        // T20 — zipAttrsWith (Tier 2c, 2026-05-29).  Combine list of
+        // attrsets keyed by attribute name; per-name combine via
+        // `fn name (values_for_name)`.  C primZipAttrsWith builds
+        // Tag::App lazy entries (so per-name combine fires only when
+        // the result entry is accessed); the bytecode version
+        // achieves the same laziness via Nix-source `listToAttrs`
+        // where each entry's `value` slot is a thunk for
+        // `fn name (catAttrs name sets)`.  Forcing the entry chases
+        // the thunk → applies fn lazily on access.
+        //
+        // Asymptotic: name-union via foldl' a // b is O(N × M) where
+        // N = number of sets and M = max attrset size.  C uses
+        // unordered_map for O(N × K_total).  For nixpkgs modules
+        // (where M can be 1000+ and N is 10-100), this is the costly
+        // pattern; but the C version's prior O(N × M_modules) eager-
+        // App allocation already dominates and the bytecode version
+        // matches that order.  Reverts via NIX_V3_NO_BC_ZIP_ATTRS_WITH=1.
+        if (!std::getenv("NIX_V3_NO_BC_ZIP_ATTRS_WITH"))
+            installBytecodePrimop(state, "zipAttrsWith",
+                "fn: sets: "
+                "  let "
+                "    allNames = "
+                "      builtins.attrNames "
+                "        (builtins.foldl' (a: b: a // b) {} sets); "
+                "  in builtins.listToAttrs "
+                "       (builtins.map "
+                "         (name: { inherit name; "
+                "                  value = fn name (builtins.catAttrs name sets); }) "
+                "         allNames)");
+
         // 2026-05-17 — primDerivation* hybrid wrapper (Option 4 in the
         // strategic note).  Replaces the user-facing `derivation` /
         // `derivationStrict` primops with a bytecode wrapper that
