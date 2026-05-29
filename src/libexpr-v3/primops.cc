@@ -3918,9 +3918,19 @@ void primDerivation(EvalState & state, Value * args, Value & out);
 /// WC-19+: closure bridge mirrors attr/list bridges — also stores
 /// a fallback Expr so primV3CallBridge1/2 can re-run the outer
 /// Expr through tree-walker on a v3-only blackhole.
+///
+/// #875 Stage 0 (2026-05-29): per-entry access tracking for the
+/// weak-bridge-eviction measurement spike.  `lastAccessGen` /
+/// `accessCount` are bumped at every dispatch site (primV3CallBridge1,
+/// primV3ForceAttr, primV3ForceListElem, tryUnwrapBridge1Closure,
+/// tryDispatchBridge1Direct).  Cost: 12 B/entry × ~10K M5 bridges =
+/// ~120 KB total — negligible against the bridge tables' multi-GB
+/// transitive retention.  See `lode/WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md`.
 struct BridgeClosureEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
+    uint64_t lastAccessGen = 0;   // monotonic; 0 = never dispatched
+    uint32_t accessCount = 0;     // saturating
 };
 // CRIT-2 (table side): the static bridge tables hold v3 Values whose
 // payloads (Closure*, Bindings*, Thunk*, ListVec*) live in the v3
@@ -3955,11 +3965,33 @@ static std::vector<BridgeClosureEntry,
 struct BridgeAttrEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
+    // #875 Stage 0 — see BridgeClosureEntry above.
+    uint64_t lastAccessGen = 0;
+    uint32_t accessCount = 0;
 };
 struct BridgeListEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
+    // #875 Stage 0 — see BridgeClosureEntry above.
+    uint64_t lastAccessGen = 0;
+    uint32_t accessCount = 0;
 };
+
+// #875 Stage 0 (2026-05-29): monotonic counter bumped at every bridge
+// dispatch.  Atomic for safety even though v3 is single-threaded today —
+// the relaxed fetch_add is essentially free and prevents UB if a future
+// concurrency-experiment hits this path.  The per-entry lastAccessGen
+// captures the gen at the dispatch moment; sorting entries by
+// lastAccessGen gives the LRU order needed by Stage 1's eviction policy.
+static std::atomic<uint64_t> g_bridgeAccessGen{0};
+
+template <typename Entry>
+static inline void bumpBridgeAccess(Entry & e) noexcept
+{
+    e.lastAccessGen =
+        g_bridgeAccessGen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (e.accessCount < UINT32_MAX) ++e.accessCount;
+}
 // CRIT-2 (table side): traceable storage so Boehm sees the inner
 // v3-Value payloads.
 static std::vector<BridgeAttrEntry,
@@ -4153,6 +4185,79 @@ void forEachV3BridgeEntry(
         cb(v3BridgeLists()[i].v3Value, "list", i);
 }
 
+// #875 Stage 0 (2026-05-29): bridge-access distribution dump for the
+// weak-bridge-eviction measurement spike.  Reports the count of bridge
+// entries per access-count bucket, separated by table.  Decision input
+// for Stage 1 SHIP gate per `lode/WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md`:
+// "if ≥ 30 % of total bridge bytes live in entries accessed ≤ 2 times,
+//  proceed to Stage 1.  Otherwise STOP."
+//
+// This dump shows ENTRY counts per bucket.  Combined with the existing
+// `v3BridgeTableSizes` byte estimate (24 B + transitive) and the
+// optional `NIX_V3_DUMP_BRIDGE_RETENTION=1` per-entry transitive walk,
+// the operator can cross-reference access frequency vs retention bytes
+// to make the Stage 1 decision.
+//
+// Cost: one linear walk over the three bridge tables.  Bucketing is
+// O(n) per table.  Total: under 1 ms for the largest observed table
+// (M5 ~10K closures).  Always-on under NIX_VM_STATS=1; idle cost
+// outside of NIX_VM_STATS is zero (the function isn't called).
+void dumpBridgeAccessDistribution(std::FILE * out) noexcept
+{
+    // Bucket boundaries (inclusive UPPER bound for the bucket).
+    // 0 = "never dispatched" — the entry was added but no TW callback
+    // ever re-entered v3 through it.  Stage 1 evicts these aggressively.
+    static constexpr uint32_t bucketsUpper[] = {0, 1, 2, 5, 10, 100, 1000, UINT32_MAX};
+    static constexpr const char * bucketLabel[] = {
+        "  =0", "  =1", "  =2", "3-5 ", "6-10", "11-100", "101-1k", "  >1k"};
+    static constexpr size_t nBuckets = sizeof(bucketsUpper) / sizeof(bucketsUpper[0]);
+
+    auto bucketFor = [](uint32_t n) -> size_t {
+        for (size_t i = 0; i < nBuckets; ++i)
+            if (n <= bucketsUpper[i]) return i;
+        return nBuckets - 1;
+    };
+
+    // Per-table counts; rows = bucket, cols = {closures, attrs, lists}.
+    size_t counts[nBuckets][3] = {};
+
+    for (auto & e : v3BridgeClosures()) ++counts[bucketFor(e.accessCount)][0];
+    for (auto & e : v3BridgeAttrs())    ++counts[bucketFor(e.accessCount)][1];
+    for (auto & e : v3BridgeLists())    ++counts[bucketFor(e.accessCount)][2];
+
+    size_t totals[3] = {
+        v3BridgeClosures().size(),
+        v3BridgeAttrs().size(),
+        v3BridgeLists().size()
+    };
+    size_t total = totals[0] + totals[1] + totals[2];
+    if (total == 0) return;
+
+    std::fprintf(out,
+        "v3-direct bridge-access distribution (#875 Stage 0): "
+        "global gen=%llu\n"
+        "  bucket    closures    attrs    lists    total   total%%\n",
+        (unsigned long long)g_bridgeAccessGen.load(std::memory_order_relaxed));
+    size_t coldCum = 0;  // entries with accessCount <= 2 (Stage 1 candidates)
+    for (size_t i = 0; i < nBuckets; ++i) {
+        size_t rowTotal = counts[i][0] + counts[i][1] + counts[i][2];
+        if (rowTotal == 0) continue;
+        double pct = total ? 100.0 * double(rowTotal) / double(total) : 0.0;
+        std::fprintf(out,
+            "  %s    %8zu  %8zu  %8zu  %8zu  %6.1f%%\n",
+            bucketLabel[i],
+            counts[i][0], counts[i][1], counts[i][2],
+            rowTotal, pct);
+        if (bucketsUpper[i] <= 2) coldCum += rowTotal;
+    }
+    double coldPct = total ? 100.0 * double(coldCum) / double(total) : 0.0;
+    std::fprintf(out,
+        "  cold (accessCount <= 2): %zu / %zu entries (%.1f%%) — "
+        "%s Stage 1 ROI decision\n",
+        coldCum, total, coldPct,
+        coldPct >= 30.0 ? "ABOVE 30% threshold:" : "below 30% threshold:");
+}
+
 // (clearPostEvalGlobalRoots defined further down, after importCache()
 // becomes visible — see ~line 7600.)
 
@@ -4251,6 +4356,7 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 bridge1: invalid handle").debugThrow();
+    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
     Value v3fn = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
 
@@ -4568,6 +4674,7 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeAttrs();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 forceAttr: invalid handle").debugThrow();
+    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
     Value v3attrs = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
     if (v3attrs.tag() != Tag::Attrs || !v3attrs.payload.bindings)
@@ -4790,6 +4897,7 @@ static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeLists();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 forceListElem: invalid handle").debugThrow();
+    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
     Value v3list = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
     if (v3list.tag() != Tag::List || !v3list.payload.list)
@@ -10473,6 +10581,7 @@ bool tryUnwrapBridge1Closure(const nix::Value & funTw, Value & outV3Fn)
     int64_t h = vHandle->integer().value;
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size()) return false;
+    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
     outV3Fn = tbl[(size_t)h].v3Value;
     return true;
 }
@@ -10522,6 +10631,7 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
     int64_t h = vHandle->integer().value;
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size()) return false;
+    bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
 
     // Got a valid bridge1 invocation.  Dispatch via v3 directly:
     //  1. Wrap the TW arg as a v3 Bridge thunk (lazy -- mirrors what

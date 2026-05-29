@@ -580,6 +580,10 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     "(%.1fx duplicates) — dedup-on-push could collapse the table\n",
                     double(total) / double(totalUniq));
             }
+            // #875 Stage 0 (2026-05-29): bridge-access distribution.
+            // Decision input for Stage 1 weak-bridge eviction.  See
+            // `lode/WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md`.
+            nix::v3::dumpBridgeAccessDistribution(stderr);
         }
         // EXIT_GC_SPIRAL Day 13-15 (2026-05-29): singleton-capturedWiths
         // intern-cache hit rate.  Hit rate near 100 % means the cache

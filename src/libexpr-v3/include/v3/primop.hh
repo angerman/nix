@@ -151,6 +151,17 @@ std::array<size_t, 3> v3BridgeUniquePtrCounts() noexcept;
 void forEachV3BridgeEntry(
     const std::function<void(const Value &, const char *, size_t)> & cb) noexcept;
 
+/// #875 Stage 0 (2026-05-29): dump per-access-count-bucket distribution
+/// of bridge entries to `out`.  Decision input for Stage 1 (weak-bridge
+/// eviction) SHIP gate.  See
+/// `lode/WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md`.
+///
+/// No-op when all bridge tables are empty.  Always-on under
+/// NIX_VM_STATS=1; idle cost outside NIX_VM_STATS is zero (function
+/// isn't called).  Per-dispatch instrumentation cost is constant
+/// (one relaxed atomic fetch_add + a non-atomic uint32 increment).
+void dumpBridgeAccessDistribution(std::FILE * out) noexcept;
+
 /// 2026-05-29 evening (production end-of-eval clear): drop bridges +
 /// import-cache results at the end of `nix eval`'s render phase to
 /// release the transitive evaluation graph to GC / process exit.
