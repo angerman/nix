@@ -1,9 +1,9 @@
 # Session arc 2026-05-29 — what landed, what's falsified, what's next
 
 **Window:** 2026-05-29 multi-turn session, continuing from prior context summary
-**Aggregate:** 16 substantive commits + 3 new memory entries + DIAG suite (4 builds + Phase 2) + 6 strategic docs in `lode/`
+**Aggregate:** 19 substantive commits + 4 new memory entries + DIAG suite (4 builds + Phase 2 + 2 spikes) + 7 strategic docs in `lode/`
 **Validation throughout:** `all-v3-tests --quick` 6/6, `--core` 15/15, hello byte-identical to TW
-**Headline:** chased Week 2 capWiths → discovered methodology errors → rolled back App3 (3× regression) → re-validated Week 1 → pivoted to diagnostic infrastructure per user directive → built distribution-shaped DIAG suite → discovered retention is CONCENTRATED (not dispersed), reopening BiBOP-lite
+**Headline arc:** chased Week 2 capWiths → discovered methodology errors → rolled back App3 (3× regression) → re-validated Week 1 → pivoted to diagnostic infrastructure per user directive → built distribution-shaped DIAG suite → found concentrated retention (62.8 % at all-packages.nix:9112) → **CHASE THE CONCENTRATION → bridges hold 99.8 % of retention** → **STRATEGIC REFRAME**: the whole GC variant track was looking at the wrong layer; the lever is bridge lifecycle management
 
 ---
 
@@ -73,21 +73,37 @@ Plus follow-on commits from earlier in this session (pre-context-summary): `bd4e
 
 Day 12 verdict claimed "trim-2 mean 50 MB under watchdog."  Re-validation on builddir/ shows M5 mean = 4343 ± 95 MB vs 4096 target — **247 MB OVER** on this morning's measurement; afternoon environmental σ moved to 308 → wider envelope.  Honest: edge-of-watchdog, not safely under.
 
+## 4.5 The bridge-retention finding (the most important result of the session)
+
+Post-Phase-2 deeper investigation tested two hypotheses about WHY all-packages.nix:9112 retains 311 MB.  Spike chain (HNE end-of-eval, `dumpV3LiveFraction` global roots only):
+
+| Clear config | Live MB | Bindings MB |
+|---|---:|---:|
+| Baseline | 519 | 400 |
+| ImportCache only (`NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1`) | 519 | 400 (no change) |
+| **Bridges only (`NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1`)** | **0.9** | **0.6** (99.8 % drop) |
+| Both | 0 | 0 |
+
+**v3 ↔ TW bridge tables hold 99.8 % of live bytes at end-of-eval.**  The 311 MB at all-packages.nix:9112 is bridge-held; the "concentration" finding from Phase 2 was a side-effect of bridge retention.
+
+Reframes the entire GC track:
+* L=0.74 on HNE is HIGH because bridges retain ~95 % of arena (NOT because workload semantically retains).
+* Six GC falsifications (Cheney, flat MS, Immix, etc.) were chasing arena-side per-cell reclamation, but bridge-held bytes look LIVE to any precise GC — no GC can free them.
+* Lever shifts: **bridge lifecycle management** > GC variants.
+
+Detail in [`BRIDGES_HOLD_RETENTION_2026-05-29.md`](BRIDGES_HOLD_RETENTION_2026-05-29.md).
+
 ## 5. What's next (pre-committed options)
 
-Per `DIAG_CONCENTRATED_RETENTION_2026-05-29 §6`, four candidate next moves:
+**RE-RANKED post-bridge-retention finding:**
 
-1. **End-of-eval GC spike** (~half day) — RECOMMENDED.  Add `NIX_V3_END_OF_EVAL_GC=1` gate; fire one MS pass after `run()` returns; measure HNE Δpeak.  Pre-committed acceptance:
-   * ≥200 MB drop → trigger-policy ships (1-2 wk project)
-   * 50-200 MB → stack with BiBOP-lite
-   * <50 MB → revisit timing assumption
-   * **Blocker:** Immix OP_REC_BINDING_SLOT_REF crash on HNE — debug needed (~1 day) before running this spike, since runMajorMarkSweep currently has the same correctness bug under NIX_V3_MAJOR_GC=1.
+1. **Production-ize end-of-eval bridge clear** (~1 day) — NEW priority 1.  Production version of the `clearV3BridgesForDiag` spike, default-ON for single-shot CLI evals (gated OFF for `nix repl`).  Immediate peak-RSS win at eval-return.  Pre-committed acceptance: HNE post-clear arena drops ≥ 200 MB; M5 drops ≥ 1 GB (subject to M5-side confirmation).
 
-2. **DIAG-5: fix flat MS `clearCellStartBitFor` quadratic** (~1 day, audit §6.5) — combined with DIAG-1 data may rescue flat MS as a viable GC family without 4-6 wk Immix detour.
+2. **M5-side DIAG-2 Phase 2 + bridge-clear spike** (~15 min) — confirms the bridge-retention pattern generalizes to cardano-node.  Trivial extension; ~15 min wall.  Decides whether bridge lifecycle work targets BOTH HNE + M5 or just HNE.
 
-3. **Non-arena attribution** (~1-2 days) — mallinfo / malloc_zone_statistics for the "elsewhere" bucket the user flagged as "ominous."  HNE elsewhere = 273 MB single-shot, 454 MB Day 13-15, 561 MB Day 12.  Variable.  Phase decomposition would attribute.
+3. **Bridge LRU design** (~3-5 days design + impl) — mid-eval bridge eviction so peak RSS during eval drops, not just at eval-end.  Three designs in `BRIDGES_HOLD_RETENTION §4`: ref-counting (correct, Boehm finalizer risk), LRU (simpler, grace-period sizing), end-of-primop sweep (sweeps orphans after each primop returns).  Pick after measurement spike.
 
-4. **Immix OP_REC_BINDING_SLOT_REF crash debug** (~1 day) — blocking option (1) above + any future Immix work.  Latent correctness bug in Steps 11′-13′ infrastructure.
+4. **(All previous GC variant work)** — DOWN-PRIORITIZED until bridges have a release path.  Flat MS quadratic fix, Immix bug debug, end-of-eval GC hook — all still potentially useful but smaller-impact than bridge lifecycle.
 
 ## 6. Strategic context (for next session)
 
