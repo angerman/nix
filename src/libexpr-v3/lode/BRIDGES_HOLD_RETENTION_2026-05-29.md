@@ -1,10 +1,32 @@
 # Bridges hold retention — the real lever for v3 memory
 
 **Date:** 2026-05-29 evening (post-DIAG spike chain)
-**Status:** **STRATEGIC FINDING** — bridge tables (v3 ↔ TW interop) hold 99.8 % of "live" bytes at end-of-eval on HNE.  Recontextualizes the entire GC track: it was chasing the wrong problem.
-**Companion:** [`DIAG_CONCENTRATED_RETENTION_2026-05-29.md`](DIAG_CONCENTRATED_RETENTION_2026-05-29.md) — the finding this supersedes / explains
+**Status:** **STRATEGIC FINDING** — bridge tables hold 99.8-99.9 % of "live" bytes at end-of-eval on BOTH HNE and M5.  Recontextualizes the entire GC track: it was chasing the wrong problem.
+**Companion:** [`DIAG_CONCENTRATED_RETENTION_2026-05-29.md`](DIAG_CONCENTRATED_RETENTION_2026-05-29.md)
+
+**Refinement 2026-05-29 (post-instrumentation)** — bridge ENTRY COUNT differs significantly between workloads (HNE = 30 entries, M5 = 10056), but TRANSITIVE retention is the dominant mechanism in BOTH.  The "bridges grow monotonically with eval depth" framing in the initial draft was HNE-specific; M5 shows true growth.  Per-entry retention varies: HNE 17 MB/entry (heavy), M5 73 KB/entry (light).  In both cases the entries TRANSITIVELY pin nixpkgs-root-sized graphs.
 
 ---
+
+## 0. Workload-specific bridge growth
+
+Mid-eval periodic samples (NIX_V3_LIVE_TRACE_PERIODIC + bridge-size columns):
+
+| Workload | Sample | alloc MB | bridge closures | bridge attrs | bridge lists |
+|---|---|---:|---:|---:|---:|
+| HNE | 1 | 720 | 11 | 5 | 0 |
+| HNE | 2 | 1072 | 14 | 11 | 0 |
+| HNE | 3 (end) | 1408 | 19 | 11 | 0 |
+| M5 | 1 | 1600 | 8791 | 9 | 0 |
+| M5 | 2 (end) | 5312 | 10042 | 14 | 0 |
+
+HNE bridges stay tiny (O(10s) of entries).  M5 bridges grow to O(10K) entries — cardano-node has a much deeper / wider cross-bridge call pattern (likely from `lib.fix`/`lib.extends` traversals through haskell.nix overlays).
+
+Per-entry transitive retention:
+* HNE: 519 MB / 30 entries ≈ 17 MB / entry (each holds a heavy attrset)
+* M5:  731 MB / 10056 entries ≈ 73 KB / entry (many lighter closures, shared transitive state)
+
+Either way, the **TOTAL ARENA HELD VIA BRIDGES** is dominant on both workloads.
 
 ## 1. The empirical spike chain (HNE, post-bundle, post-App3-rollback)
 
