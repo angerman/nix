@@ -379,6 +379,14 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
             "v3-direct DIAG spike: cleared in-memory ImportCache "
             "results (NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1)\n");
     }
+    static const bool s_clearBridges =
+        std::getenv("NIX_V3_END_OF_EVAL_CLEAR_BRIDGES") != nullptr;
+    if (__builtin_expect(s_clearBridges, 0)) {
+        clearV3BridgesForDiag();
+        std::fprintf(stderr,
+            "v3-direct DIAG spike: cleared v3 ↔ TW bridge tables "
+            "(NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1)\n");
+    }
 
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
     // attribute alloc explosions to thunks vs closures vs Bindings

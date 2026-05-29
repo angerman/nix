@@ -4087,6 +4087,19 @@ void walkV3BridgeRoots(const std::function<void(Value &)> & visit)
     for (auto & e : v3BridgeLists())    visit(e.v3Value);
 }
 
+// 2026-05-29 evening (DIAG analysis spike): clear bridge tables.
+// Companion to clearImportCacheResultsForDiag().  Tests whether
+// the 311 MB at all-packages.nix:9112 is held by TW bridge tables
+// (v3 ↔ TW interop).  UNSAFE if any TW code runs subsequently;
+// safe for one-shot end-of-eval before dump.  Gated via
+// NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1.
+void clearV3BridgesForDiag() noexcept
+{
+    v3BridgeClosures().clear();
+    v3BridgeAttrs().clear();
+    v3BridgeLists().clear();
+}
+
 // (walkImportCacheRoots defined further down, after the
 // anonymous-namespace `importCache()` function body is visible.)
 

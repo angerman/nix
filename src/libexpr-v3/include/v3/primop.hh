@@ -127,6 +127,12 @@ void walkImportCacheRoots(const std::function<void(Value &)> & visit);
 /// via NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1 in run.cc.
 void clearImportCacheResultsForDiag() noexcept;
 
+/// 2026-05-29 evening: clear bridge tables (v3 ↔ TW handles).
+/// Companion to clearImportCacheResultsForDiag.  Gated via
+/// NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1.  UNSAFE if TW callbacks
+/// fire subsequently.
+void clearV3BridgesForDiag() noexcept;
+
 /// REVIEW §2.1: RAII guard for the thread-local fallback Expr pointer
 /// that primV3{CallBridge1,ForceAttr,ForceListElem} read on cycle
 /// detection.  Setting it via raw save/restore was leaking the prior
