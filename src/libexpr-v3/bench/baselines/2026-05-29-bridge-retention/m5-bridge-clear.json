@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "date": "2026-05-29-evening",
+  "method": "Single-shot HNE + M5 evaluation with NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1, dumpV3LiveFraction walks global roots only after VMState teardown.",
+  "results": {
+    "HNE": {
+      "baseline_live_mb": 519,
+      "baseline_bindings_mb": 400,
+      "bridges_cleared_live_mb": 0.9,
+      "bridges_cleared_bindings_mb": 0.6,
+      "drop_pct": 99.8,
+      "binary": "builddir/src/nix/nix",
+      "top_retainer_baseline": "pkgs/top-level/all-packages.nix:9112:3 (311 MB / 62.8%)"
+    },
+    "M5": {
+      "baseline_live_mb": 731,
+      "baseline_bindings_mb": 384.87,
+      "baseline_thunks_mb": 318.84,
+      "baseline_closures_mb": 27.32,
+      "bridges_cleared_live_mb": 1.0,
+      "bridges_cleared_bindings_mb": 0.585,
+      "bridges_cleared_thunks_mb": 0.246,
+      "bridges_cleared_closures_mb": 0.161,
+      "drop_pct": 99.9,
+      "binary": "builddir/src/nix/nix",
+      "top_retainer_baseline": "<posHandle=0 unknown> 27.2% — M5 has more unattributed (DIAG-2 coverage gap on M5 paths)"
+    }
+  },
+  "interpretation": {
+    "headline": "Bridge tables (v3BridgeAttrs/Closures/Lists) retain 99.8-99.9% of v3 arena bytes at end-of-eval on BOTH HNE and M5.",
+    "implication": "GC variant chase (Cheney/flat MS/Immix) was looking at the wrong layer. No precise GC can reclaim bridge-held bytes — they're reachable from global roots. The lever is bridge lifecycle management (ref counting / LRU / end-of-eval clear).",
+    "m5_projection": "If bridges + precise GC at end-of-eval: M5 peak could drop from ~4300 MB to ~1.5 GB (Boehm 400 + small live + arena overhead). Trivially closes 4096 MB watchdog with 2.5 GB margin."
+  }
+}
