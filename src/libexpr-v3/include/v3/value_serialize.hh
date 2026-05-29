@@ -173,6 +173,28 @@ void dumpCanonicalHashLine(const Value & v) noexcept;
 
 bool evalResultCacheEnabled() noexcept;
 
+/// #885 (2026-05-29) — PRODUCTION mode for the Phase 3a eval-result
+/// cache.  When enabled, primop call sites that hit the cache
+/// short-circuit: assign the cached value to `out` and return
+/// without running the primop body.  Implies SHADOW (lookup still
+/// runs through the same machinery).  Gate:
+/// `NIX_V3_EVAL_RESULT_CACHE_PRODUCTION=1`.
+///
+/// Pre-condition for ship: shadow-mode `mismatchHits == 0` across
+/// representative workloads (verified on hello.drvPath 188 hits and
+/// HNE 411 hits, 2026-05-29).  Cache hit implies cached-output ==
+/// body-output by construction; PRODUCTION just trusts the
+/// equivalence instead of re-deriving it.
+///
+/// Side-effect safety: the cached primop body's side effects
+/// (writeDerivation, drvHashes.insert_or_assign, etc.) are
+/// process-global and idempotent.  The FIRST call in a process is
+/// always a miss → body runs → side effects happen.  Subsequent
+/// hits skip the body, but the side effects from that first call
+/// remain visible to all downstream consumers.  Across processes
+/// the cache is empty so the first call always populates.
+bool evalResultCacheProductionEnabled() noexcept;
+
 struct EvalResultCacheStats {
     uint64_t lookups          = 0;  // entry attempts (deep-force + hash + look up)
     uint64_t hits             = 0;  // key found in cache; result deserialised
@@ -187,6 +209,11 @@ struct EvalResultCacheStats {
     uint64_t totalSerNs       = 0;  // wall time in insert-serialize
     uint64_t totalLookupNs    = 0;  // wall time in unordered_map lookup
     uint64_t totalDeserNs     = 0;  // wall time in deserialise-on-hit
+    // #885 (2026-05-29): PRODUCTION mode — incremented on each
+    // skip-on-hit (primop body bypassed because the cache had the
+    // result).  Equals the wall-saving event count.  Mirrors
+    // DrvHashCacheStats::activeSkips.  Zero in SHADOW mode.
+    uint64_t activeSkips      = 0;
 };
 
 EvalResultCacheStats & evalResultCacheStats() noexcept;

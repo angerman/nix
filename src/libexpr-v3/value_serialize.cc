@@ -720,6 +720,24 @@ EvalResultCacheStats & evalResultCacheStats() noexcept
 
 bool evalResultCacheEnabled() noexcept { return evalResultCacheEnabledCached(); }
 
+// #885 (2026-05-29) — PRODUCTION mode gate.  Cached once at first
+// read; lifetime-of-process.  When NIX_V3_EVAL_RESULT_CACHE_PRODUCTION
+// is set AND NIX_V3_EVAL_RESULT_CACHE is set, primDerivationStrict
+// / primDerivationFromPreprocessed short-circuit on cache hit (skip
+// body).  Independent of NIX_V3_EVAL_RESULT_CACHE itself so callers
+// can A/B by toggling production alone with the shadow infrastructure
+// intact.  Mirrors `drvHashCacheActiveEnabled` for the Phase 3e
+// mid-body cache.
+bool evalResultCacheProductionEnabled() noexcept
+{
+    static const bool enabled = []() {
+        if (!evalResultCacheEnabledCached()) return false;
+        const char * e = std::getenv("NIX_V3_EVAL_RESULT_CACHE_PRODUCTION");
+        return e && *e && *e != '0';
+    }();
+    return enabled;
+}
+
 bool evalResultCacheLookup(const Value & input,
                             Value & outResult,
                             std::string & outKey) noexcept
@@ -816,16 +834,20 @@ void dumpEvalResultCacheStats(std::FILE * out)
     double avgDeserUs  = (s.totalDeserNs  / 1000.0) / safe(s.hits);
     double avgSerUs    = (s.totalSerNs    / 1000.0) / safe(s.inserts);
     double hitRate     = 100.0 * static_cast<double>(s.hits) / safe(s.lookups);
+    const char * mode = evalResultCacheProductionEnabled() ? "PRODUCTION" : "SHADOW";
     std::fprintf(out,
-        "v3-direct eval-result-cache (SHADOW): lookups=%llu hits=%llu misses=%llu "
-        "inserts=%llu mismatch=%llu hit_rate=%.1f%%\n"
+        "v3-direct eval-result-cache (%s): lookups=%llu hits=%llu misses=%llu "
+        "inserts=%llu mismatch=%llu hit_rate=%.1f%% activeSkips=%llu\n"
         "  avg: hash=%.2f us lookup=%.2f us deser-on-hit=%.2f us ser-on-insert=%.2f us\n"
         "  bytes: cached=%.2f MB delivered=%.2f MB\n"
         "  errors: hash=%llu deser=%llu\n",
+        mode,
         (unsigned long long)s.lookups, (unsigned long long)s.hits,
         (unsigned long long)s.misses, (unsigned long long)s.inserts,
         (unsigned long long)s.mismatchHits,
-        hitRate, avgHashUs, avgLookupUs, avgDeserUs, avgSerUs,
+        hitRate,
+        (unsigned long long)s.activeSkips,
+        avgHashUs, avgLookupUs, avgDeserUs, avgSerUs,
         s.bytesCached / (1024.0 * 1024.0),
         s.bytesDelivered / (1024.0 * 1024.0),
         (unsigned long long)s.hashErrors,

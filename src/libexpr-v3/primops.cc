@@ -6646,8 +6646,12 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("__derivationFromPreprocessed", "attrset");
 
-    // #741 Phase 3a SHADOW cache — see primDerivationStrictNative for
-    // semantics.  Body always runs; hit just verifies.
+    // #741 Phase 3a SHADOW / #885 PRODUCTION cache.  SHADOW: body
+    // always runs; hit just verifies.  PRODUCTION (`NIX_V3_EVAL_RESULT_
+    // CACHE_PRODUCTION=1`): on hit, assign cached value to `out` and
+    // return immediately, skipping the entire body.  See
+    // value_serialize.hh::evalResultCacheProductionEnabled for the
+    // safety argument (idempotent side effects + first-call-populates).
     std::string v3CacheKey;
     Value v3CachedOut;
     bool v3CacheClaimed = false;
@@ -6655,6 +6659,16 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
         forceDeep(*state.vm, args[0]);
         v3CacheClaimed =
             value_serialize::evalResultCacheLookup(args[0], v3CachedOut, v3CacheKey);
+    }
+    // PRODUCTION skip-on-hit.  Cache hit implies the body's output
+    // would equal cached (verified in SHADOW with mismatch=0 across
+    // hello.drvPath + HNE, 2026-05-29).  Skipping the body is safe
+    // because side effects (writeDerivation, drvHashes.insert) are
+    // idempotent and the first miss in this process populated them.
+    if (v3CacheClaimed && value_serialize::evalResultCacheProductionEnabled()) {
+        out = v3CachedOut;
+        ++value_serialize::evalResultCacheStats().activeSkips;
+        return;
     }
     auto v3CacheFinaliser = [&]() {
         if (v3CacheKey.empty()) return;
@@ -6907,6 +6921,16 @@ static void primDerivationStrictNative(
         // cache and run the primop body normally.
         v3CacheClaimed =
             value_serialize::evalResultCacheLookup(args[0], v3CachedOut, v3CacheKey);
+    }
+    // #885 PRODUCTION skip-on-hit.  See primDerivationFromPreprocessed
+    // for the safety argument.  On hit, assign cached → `out` and
+    // return; the body's side effects (writeDerivation, drvHashes
+    // populate, .drv file write) are idempotent and were already
+    // performed by the populating MISS earlier in this process.
+    if (v3CacheClaimed && value_serialize::evalResultCacheProductionEnabled()) {
+        out = v3CachedOut;
+        ++value_serialize::evalResultCacheStats().activeSkips;
+        return;
     }
     // RAII-style end-of-function action: verify on hit, insert on miss.
     auto v3CacheFinaliser = [&]() {
