@@ -28,7 +28,41 @@ For peak_rss to drop, the arena needs to:
 
 ### Path A: Lightweight ref-count + madvise
 
-Minimal change to alloc.hh:
+**REVISED 2026-05-29 evening:** when I started Path A's implementation, the "Track per-block live cell count + onCellFreed hook" turned out to require per-cell size tracking that doesn't exist outside the `NIX_V3_MAJOR_GC=1` mark-sweep path.  Bindings/Closure/Thunk cells in the arena are variable-sized; their sizes are recoverable today only via the `cellStarts` bitmap (Stage 6 infrastructure, gated `NIX_V3_MAJOR_GC=1`).
+
+The clean Path A design — `Arena::onCellFreed(cell, bytes)` — needs the CALLER to know `bytes`.  Bridge eviction has the v3Value handle but not the inline size; computing it requires walking the transitive payload (CPU-expensive) or consulting the cellStarts bitmap (only present under `NIX_V3_MAJOR_GC`).
+
+Net: Path A is NOT cheaper than Stage 6.  Either:
+* Run with `NIX_V3_MAJOR_GC=1` to get the cellStarts infrastructure, hook eviction into a partial sweep that madvises whole-empty blocks.  This is essentially a *subset* of Stage 6's flat-MS sweep with a different trigger source.
+* OR proceed to full Stage 6 (Path B).
+
+Path A re-scoped to ~1 wk (was 2-3 d) — requires reusing Stage 6 cell-bookkeeping.  Pre-committed SHIP unchanged: ≥ 200 MB HNE.
+
+Original Path A sketch (keeping for design reference, even though implementation needs Stage 6 prereqs):
+
+```cpp
+class Arena {
+    struct Block {
+        char * data;
+        uint64_t bytesAllocated = 0;   // running total from refill
+        uint64_t bytesLive = 0;        // updated by external eviction
+    };
+    std::vector<Block> blocks_;
+
+    void onCellFreed(void * cell, size_t bytes) noexcept {
+        size_t blockIdx = findBlock(cell);
+        if (blockIdx == SIZE_MAX) return;
+        auto & b = blocks_[blockIdx];
+        b.bytesLive -= bytes;
+        if (b.bytesLive == 0 && blockIdx != activeBlockIdx_) {
+            madvise(b.data, kBlockSize, MADV_DONTNEED);
+            // Boehm scan over zero pages is fast + correct.
+        }
+    }
+};
+```
+
+Original Path A design block continues below:
 
 ```cpp
 class Arena {
