@@ -4026,6 +4026,25 @@ static bool weakBridgesEnabled() noexcept
     static const bool v = std::getenv("NIX_V3_WEAK_BRIDGES") != nullptr;
     return v;
 }
+// #875 Stage 2b (2026-05-29): pre-evict at bridge CREATION so the
+// transitive payload is unreferenced from the bridge from the very
+// first instant.  Without pre-eviction, sweep-eviction can only fire
+// after the heavy bridges have been built — by which point the arena
+// has already grown to peak.  Pre-eviction caps the arena's
+// high-water mark to the largest single bridge's transient cost
+// rather than the SUM of all heavy bridges.  Implies weakBridges.
+static bool preEvictBridgesEnabled() noexcept
+{
+    static const bool v = []() {
+        if (!weakBridgesEnabled()) return false;
+        const char * e = std::getenv("NIX_V3_WEAK_BRIDGES_PRE_EVICT");
+        return e != nullptr && *e && *e != '0';
+    }();
+    return v;
+}
+// Pre-eviction counters.
+static std::atomic<uint64_t> g_bridgePreEvictions{0};        // entries serialized at creation
+static std::atomic<uint64_t> g_bridgePreEvictSerFail{0};     // serialize failed (Closure etc.)
 // For stress testing: set NIX_V3_WEAK_BRIDGE_SWEEP=1 + NIX_V3_WEAK_BRIDGE_AGE=0.
 // Combined effect: every dispatch triggers a sweep that evicts every entry
 // whose lastAccessGen is older than currentGen — i.e. every other entry.
@@ -4085,6 +4104,39 @@ static inline void evictBridgeEntry(Entry & e) noexcept
     e.v3Value = Value{};            // Tag::Uninitialized; releases payload
     e.evicted = true;
     g_bridgeEvictions.fetch_add(1, std::memory_order_relaxed);
+}
+
+// #875 Stage 2b (2026-05-29): construct a bridge entry, optionally
+// in pre-evicted state.  Always returns by value (vector push_back
+// moves it in).  When pre-eviction is enabled AND serialize succeeds,
+// the returned entry has `evicted=true`, `v3Value=Value{}`, blob
+// populated — the bridge holds NO reference to the transitive payload.
+// When serialize fails or pre-eviction is off, returns a live entry.
+template <typename Entry>
+static inline Entry makeBridgeEntry(Value v, nix::Expr * fb) noexcept
+{
+    Entry e;
+    e.fallbackExpr = fb;
+    if (__builtin_expect(preEvictBridgesEnabled(), 0)) {
+        try {
+            value_serialize::serialize(v, e.serializedBlob);
+            // Success: pre-evict — drop the live v3Value reference.
+            e.v3Value = Value{};
+            e.evicted = true;
+            g_bridgePreEvictions.fetch_add(1, std::memory_order_relaxed);
+            g_bridgeBytesSerialized.fetch_add(e.serializedBlob.size(),
+                                               std::memory_order_relaxed);
+            return e;
+        } catch (...) {
+            // Serialize failed (Closure/Thunk/etc.); fall through to
+            // live entry — pre-eviction is best-effort.
+            e.serializedBlob.clear();
+            g_bridgePreEvictSerFail.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    e.v3Value = v;
+    e.evicted = false;
+    return e;
 }
 
 // #875 Stage 2: revive an evicted entry by deserializing its blob.
@@ -5415,7 +5467,8 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             }
             auto & tbl = v3BridgeLists();
             size_t handle = tbl.size();
-            tbl.push_back({v, tlBridgeFallbackExpr});
+            // #875 Stage 2b: pre-evict-aware construction.
+            tbl.push_back(makeBridgeEntry<BridgeListEntry>(v, tlBridgeFallbackExpr));
             nix::Value * vHandle = ns.allocValue();
             vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
             // PrimOpApp(__v3_force_list_elem, handle) is a 1-arg-of-2
@@ -5515,7 +5568,8 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             }
             auto & tbl = v3BridgeAttrs();
             size_t handle = tbl.size();
-            tbl.push_back({v, tlBridgeFallbackExpr});
+            // #875 Stage 2b: pre-evict-aware construction.
+            tbl.push_back(makeBridgeEntry<BridgeAttrEntry>(v, tlBridgeFallbackExpr));
             nix::Value * vHandle = ns.allocValue();
             vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
             nix::Value * vPartial = ns.allocValue();
@@ -5654,7 +5708,9 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
 
                 auto & closureTbl = v3BridgeClosures();
                 size_t handle = closureTbl.size();
-                closureTbl.push_back({v, tlBridgeFallbackExpr});
+                // #875 Stage 2b: pre-evict-aware construction.  Closure
+                // serialization typically fails — entry falls back to live.
+                closureTbl.push_back(makeBridgeEntry<BridgeClosureEntry>(v, tlBridgeFallbackExpr));
                 v3FormalsLambdaBridges()[&sentinelEnv] = handle;
 
                 if (s_dbg) std::fprintf(stderr,
@@ -5680,7 +5736,9 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         }
         auto & tbl = v3BridgeClosures();
         size_t handle = tbl.size();
-        tbl.push_back({v, tlBridgeFallbackExpr});
+        // #875 Stage 2b: pre-evict-aware construction.  Closure typically
+        // not serializable; falls back to live entry.
+        tbl.push_back(makeBridgeEntry<BridgeClosureEntry>(v, tlBridgeFallbackExpr));
         nix::Value * vHandle = ns.allocValue();
         vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
         out->mkPrimOpApp(bridgePrimOp1, vHandle);
