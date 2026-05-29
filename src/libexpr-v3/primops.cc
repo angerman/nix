@@ -3938,6 +3938,11 @@ struct BridgeClosureEntry {
     uint64_t lastAccessGen = 0;   // monotonic; 0 = never dispatched
     uint32_t accessCount = 0;     // saturating
     bool evicted = false;         // Stage 1: v3Value cleared, must re-eval
+    // #875 Stage 2 (2026-05-29): serialized v3 Value blob captured at
+    // eviction time.  Reusing `value_serialize` (the cache infrastructure
+    // already in production for #885 eval-result cache).  Deserialized
+    // on dispatch to revive the entry.  Empty when evicted=false.
+    std::string serializedBlob;
 };
 // CRIT-2 (table side): the static bridge tables hold v3 Values whose
 // payloads (Closure*, Bindings*, Thunk*, ListVec*) live in the v3
@@ -3972,18 +3977,20 @@ static std::vector<BridgeClosureEntry,
 struct BridgeAttrEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
-    // #875 Stage 0 / Stage 1 — see BridgeClosureEntry above.
+    // #875 Stage 0 / Stage 1 / Stage 2 — see BridgeClosureEntry above.
     uint64_t lastAccessGen = 0;
     uint32_t accessCount = 0;
     bool evicted = false;
+    std::string serializedBlob;
 };
 struct BridgeListEntry {
     Value v3Value;
     nix::Expr * fallbackExpr = nullptr;
-    // #875 Stage 0 / Stage 1 — see BridgeClosureEntry above.
+    // #875 Stage 0 / Stage 1 / Stage 2 — see BridgeClosureEntry above.
     uint64_t lastAccessGen = 0;
     uint32_t accessCount = 0;
     bool evicted = false;
+    std::string serializedBlob;
 };
 
 // #875 Stage 0 (2026-05-29): monotonic counter bumped at every bridge
@@ -3998,8 +4005,12 @@ static std::atomic<uint64_t> g_bridgeAccessGen{0};
 // design.  All atomic-relaxed; v3 is single-threaded today but the
 // instrumentation must stay race-free.
 static std::atomic<uint64_t> g_bridgeEvictions{0};       // entries cleared
-static std::atomic<uint64_t> g_bridgeReEvalsAfterEviction{0};  // re-eval after eviction
+static std::atomic<uint64_t> g_bridgeReEvalsAfterEviction{0};  // dispatch after eviction (revived)
 static std::atomic<uint64_t> g_bridgeEvictionSweeps{0};  // sweep invocations
+// #875 Stage 2 counters:
+static std::atomic<uint64_t> g_bridgeEvictionSerializeFail{0};  // serialize threw, entry NOT evicted
+static std::atomic<uint64_t> g_bridgeRevivalDeserializeFail{0}; // deserialize threw on revive
+static std::atomic<uint64_t> g_bridgeBytesSerialized{0};        // total blob bytes (peak indicator)
 
 // Forward decls — the table accessors are defined later in the file
 // (BridgeAttrEntry / BridgeListEntry structs interleave their tables
@@ -4042,18 +4053,61 @@ static uint64_t weakBridgeAge() noexcept
     return v;
 }
 
-// Evict a single entry: clear v3Value to release transitive retention,
-// flag for re-eval on next dispatch.  fallbackExpr is retained — it's
-// the rescue path.  Entries without a fallbackExpr cannot be evicted
-// (no recovery would be possible).
+// Evict a single entry.  #875 Stage 2 (2026-05-29): serialize the
+// v3Value into the entry's blob first; if serialize throws
+// (Closure/Thunk/other unsupported tag), skip eviction — we have no
+// other safe recovery path for that entry today.  On success: clear
+// v3Value, mark evicted.  Subsequent dispatch deserializes the blob.
+//
+// Note: fallbackExpr-based recovery (Stage 1 design) stays as a
+// secondary path if deserialize ever fails at dispatch time — but
+// since serialize/deserialize round-trip is verified by the same
+// machinery used in #885 PRODUCTION cache, that secondary path
+// should never fire on normal workloads.
 template <typename Entry>
 static inline void evictBridgeEntry(Entry & e) noexcept
 {
     if (e.evicted) return;          // already evicted
-    if (!e.fallbackExpr) return;    // no recovery path; keep
+    if (e.v3Value.tag() == Tag::Uninitialized) return;  // already cleared
+    // Stage 2 — serialize before clearing.
+    try {
+        e.serializedBlob.clear();
+        value_serialize::serialize(e.v3Value, e.serializedBlob);
+    } catch (...) {
+        // Tag::Closure / Tag::Thunk / etc. — can't serialize.  Leave
+        // the entry intact; Stage 2 cannot evict it.
+        e.serializedBlob.clear();
+        g_bridgeEvictionSerializeFail.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_bridgeBytesSerialized.fetch_add(e.serializedBlob.size(),
+                                       std::memory_order_relaxed);
     e.v3Value = Value{};            // Tag::Uninitialized; releases payload
     e.evicted = true;
     g_bridgeEvictions.fetch_add(1, std::memory_order_relaxed);
+}
+
+// #875 Stage 2: revive an evicted entry by deserializing its blob.
+// Returns true on success (entry.v3Value populated, blob cleared,
+// evicted flag reset).  Returns false on deserialize failure — caller
+// should fall back to fallbackExpr re-eval (Stage 1) or error.
+template <typename Entry>
+static inline bool reviveBridgeEntry(Entry & e) noexcept
+{
+    if (!e.evicted) return true;    // already live
+    if (e.serializedBlob.empty()) return false;
+    try {
+        Value revived = value_serialize::deserialize(e.serializedBlob);
+        e.v3Value = revived;
+        e.serializedBlob.clear();   // reclaim blob memory immediately
+        e.serializedBlob.shrink_to_fit();
+        e.evicted = false;
+        g_bridgeReEvalsAfterEviction.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    } catch (...) {
+        g_bridgeRevivalDeserializeFail.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 }
 
 // Sweep the three bridge tables once.  Evict any entry whose
@@ -4503,9 +4557,17 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 bridge1: invalid handle").debugThrow();
-    // #875 Stage 0+1: snapshot state BEFORE bump (bumpBridgeAccess may
-    // sweep + evict OTHER entries; the current entry's lastAccessGen
-    // is set to currentGen so it's protected).
+    // #875 Stage 2 (2026-05-29): if evicted, revive from serialized
+    // blob BEFORE snapshot.  Falls through to Stage 1 fallbackExpr
+    // path only if revive fails.
+    if (__builtin_expect(tbl[(size_t)h].evicted, 0)) {
+        reviveBridgeEntry(tbl[(size_t)h]);
+        // If revive failed, v3HandleEvicted stays true; Stage 1
+        // fallbackExpr path catches it below.
+    }
+    // Snapshot state BEFORE bump (bumpBridgeAccess may sweep + evict
+    // OTHER entries; the current entry's lastAccessGen is set to
+    // currentGen so it's protected).
     Value v3fn = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
     const bool v3HandleEvicted = tbl[(size_t)h].evicted;
@@ -4842,7 +4904,11 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeAttrs();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 forceAttr: invalid handle").debugThrow();
-    // #875 Stage 0+1: snapshot before bump (see primV3CallBridge1 above).
+    // #875 Stage 2: revive from blob if evicted.
+    if (__builtin_expect(tbl[(size_t)h].evicted, 0)) {
+        reviveBridgeEntry(tbl[(size_t)h]);
+    }
+    // Snapshot before bump (see primV3CallBridge1 above).
     Value v3attrs = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
     const bool v3HandleEvicted = tbl[(size_t)h].evicted;
@@ -5093,7 +5159,11 @@ static void primV3ForceListElemInner(nix::EvalState & ns, const nix::PosIdx pos,
     auto & tbl = v3BridgeLists();
     if (h < 0 || (size_t)h >= tbl.size())
         ns.error<nix::EvalError>("v3 forceListElem: invalid handle").debugThrow();
-    // #875 Stage 0+1: snapshot before bump.
+    // #875 Stage 2: revive from blob if evicted.
+    if (__builtin_expect(tbl[(size_t)h].evicted, 0)) {
+        reviveBridgeEntry(tbl[(size_t)h]);
+    }
+    // Snapshot before bump.
     Value v3list = tbl[(size_t)h].v3Value;
     nix::Expr * fallbackExpr = tbl[(size_t)h].fallbackExpr;
     const bool v3HandleEvicted = tbl[(size_t)h].evicted;
@@ -10802,10 +10872,12 @@ bool tryUnwrapBridge1Closure(const nix::Value & funTw, Value & outV3Fn)
     int64_t h = vHandle->integer().value;
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size()) return false;
-    // #875 Stage 1: decline the v3-side shortcut for evicted handles —
-    // caller falls through to the TW primop-dispatch path, which has
-    // the eviction-recovery code (primV3CallBridge1).
-    if (tbl[(size_t)h].evicted) return false;
+    // #875 Stage 2: revive evicted entries via deserialization.  If
+    // revive fails (deserialize threw), decline so the caller falls
+    // through to TW dispatch + Stage 1 fallbackExpr path.
+    if (__builtin_expect(tbl[(size_t)h].evicted, 0)) {
+        if (!reviveBridgeEntry(tbl[(size_t)h])) return false;
+    }
     bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
     outV3Fn = tbl[(size_t)h].v3Value;
     return true;
@@ -10856,10 +10928,10 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
     int64_t h = vHandle->integer().value;
     auto & tbl = v3BridgeClosures();
     if (h < 0 || (size_t)h >= tbl.size()) return false;
-    // #875 Stage 1: decline the direct-dispatch shortcut for evicted
-    // handles; caller falls through to TW dispatch → primV3CallBridge1
-    // → eviction-recovery code.
-    if (tbl[(size_t)h].evicted) return false;
+    // #875 Stage 2: revive evicted entries; decline only if revive fails.
+    if (__builtin_expect(tbl[(size_t)h].evicted, 0)) {
+        if (!reviveBridgeEntry(tbl[(size_t)h])) return false;
+    }
     bumpBridgeAccess(tbl[(size_t)h]);  // #875 Stage 0
 
     // Got a valid bridge1 invocation.  Dispatch via v3 directly:
