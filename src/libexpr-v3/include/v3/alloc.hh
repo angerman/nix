@@ -2209,6 +2209,20 @@ struct Alloc
         V3_STATS_BUMP(bytesPairs, sizeof(ValuePair));
         auto * p = static_cast<ValuePair *>(
             threadArena().alloc(sizeof(ValuePair)));
+        // 2026-05-30: explicitly zero-init `evaluated` and `third`
+        // slots.  Many callers (App, PrimOpApp) set only `left` and
+        // `right`, relying on the other slots being Tag::Uninitialized.
+        // That worked while arena allocs always came from calloc'd
+        // fresh blocks; once free-list / recycle reuses cells (Step
+        // 13′ / brute-mode scavenge stress), reused cells may contain
+        // garbage in unwritten slots.  Garbage in `third` causes
+        // walkers/auditors to dereference random pointers → SIGSEGV.
+        // Zero-init costs ~2 ns per pair (16 B write to evaluated +
+        // 16 B to third).
+        p->evaluated.tag_payload = 0;  // Tag::Uninitialized
+        p->evaluated.payload.i = 0;
+        p->third.tag_payload = 0;
+        p->third.payload.i = 0;
         pairAllocSiteRecord(p, file, line);
         return p;
     }

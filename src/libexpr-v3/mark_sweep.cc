@@ -557,13 +557,14 @@ private:
     }
     void walkPair(ValuePair * p) noexcept
     {
-        // Step 11′: line-mark the Pair (uniform 48 B).
+        // Step 11′: line-mark the Pair (uniform 64 B post-Tag::App3).
         if (arenaSetForSlot_) {
             arenaSetForSlot_->markLinesForCell(p, sizeof(ValuePair));
         }
         visitValue(p->left);
         visitValue(p->right);
         visitValue(p->evaluated);
+        visitValue(p->third);  // 2026-05-30 Tag::App3 arg2
     }
 };
 
