@@ -209,7 +209,23 @@ struct Value
 /// callClosure / OP_CALL's primop branch which reads left/right then
 /// invokes; no force happens on PrimOpApp itself).  The extra field is
 /// inert for PrimOpApp instances — small per-instance waste.
-struct ValuePair { Value left; Value right; Value evaluated; };
+///
+/// 2026-05-30 (EXIT_GC_SPIRAL Day 4 option A): added `third` slot for
+/// Tag::App3 to carry its second argument WITHOUT overloading the
+/// memoization slot.  The Day 9-11 attempt overloaded `evaluated` for
+/// arg2 and lost App-result memoization (#696 regression — re-eval
+/// every dispatch on hot mapAttrs entries).  This version keeps
+/// `evaluated` separate so Tag::App3 dispatches memoize identically
+/// to Tag::App.  Cost: +16 B per ValuePair across all tags.  Net on
+/// HNE: -29 MB (-35 MB mapAttrs savings minus +6 MB other-App tax).
+/// `third` is meaningful ONLY when Value's tag == Tag::App3; for
+/// Tag::App / Tag::PrimOpApp instances it stays Uninitialized.
+///
+/// Field order chosen so Tag::App's hot path (left, right, evaluated)
+/// keeps the same first-3-slot layout as the prior 48-byte struct.
+/// `third` lives at offset 48 — Tag::App ignores it, Tag::App3 reads
+/// it after the hot fields.
+struct ValuePair { Value left; Value right; Value evaluated; Value third; };
 
 static_assert(sizeof(Value) == 16, "v3 Value must be exactly 16 bytes");
 

@@ -6674,13 +6674,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // (~line 9257).  Memo-hit fast path returns the
                     // cached result; cold path computes + stores back.
                     //
-                    // 2026-05-29 (EXIT_GC_SPIRAL Day 9-11): Tag::App3
-                    // is the 3-arg App variant (single ValuePair carries
-                    // fn + 2 args).  Memoization is gated to Tag::App
-                    // only — App3 uses its `evaluated` field for arg2.
-                    bool outerIsApp = (v.tag() == Tag::App);
-                    ValuePair * outerPair = outerIsApp ? v.payload.pair : nullptr;
-                    if (__builtin_expect(outerIsApp
+                    // 2026-05-30 (EXIT_GC_SPIRAL Day 4 option A): the
+                    // 3-arg variant Tag::App3 now uses `pair->third` for
+                    // arg2 and KEEPS `pair->evaluated` as the memoization
+                    // sink — same shape as Tag::App.  Both pair tags
+                    // therefore memoize identically; the prior Day 9-11
+                    // attempt that overloaded `evaluated` for arg2 lost
+                    // memoization and caused HNE +1644 MB / +4× wall
+                    // regression (#696 pattern).  Separating the slots
+                    // preserves App-result memo on hot mapAttrs entries.
+                    bool outerIsAppLike = v.isAppLike();
+                    ValuePair * outerPair = outerIsAppLike ? v.payload.pair : nullptr;
+                    if (__builtin_expect(outerIsAppLike
                         && outerPair
                         && outerPair->evaluated.tag() != Tag::Uninitialized, 1))
                     {
@@ -6692,7 +6697,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     while (v.isAppLike()) {
                         ValuePair * p = v.payload.pair;
                         if (v.tag() == Tag::App3)
-                            rights.push_back(p->evaluated);
+                            rights.push_back(p->third);   // arg2 lives in `third` now
                         rights.push_back(p->right);
                         v = p->left;
                     }
@@ -6725,11 +6730,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         }
                         v = callClosure(vm, v, rights[i - 1]);
                     }
-                    // 2026-05-18: App-result memoization writeback.
-                    // See forceValue's matching code at ~line 9285 for
-                    // rationale.  Only Tag::App outer pairs memoize —
-                    // App3's `evaluated` field carries arg2.
-                    if (outerIsApp && outerPair) {
+                    // 2026-05-30: App-result memoization writeback for
+                    // both Tag::App AND Tag::App3 (since App3 now has a
+                    // separate `third` slot for arg2 and `evaluated`
+                    // stays as the memo sink).
+                    if (outerIsAppLike && outerPair) {
                         Tag rt = v.tag();
                         if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::App3
                             && rt != Tag::Slot
@@ -11641,15 +11646,16 @@ Value forceValue(VMState & vm, Value v)
             // corpus + cardano-node nixpkgs eval).
             static const bool s_noAppMemo =
                 std::getenv("NIX_V3_NO_APP_MEMO") != nullptr;
-            bool outerIsApp = (v.tag() == Tag::App);
-            ValuePair * outerPair = outerIsApp ? v.payload.pair : nullptr;
+            bool outerIsAppLike = v.isAppLike();
+            ValuePair * outerPair = outerIsAppLike ? v.payload.pair : nullptr;
             // Memo-hit fast path: outerPair->evaluated holds the
             // previously-resolved result.  Tag::Uninitialized (== 0)
-            // is the sentinel meaning "not yet resolved".  Only Tag::App
-            // memoizes — Tag::App3's `evaluated` field holds arg2, not
-            // a memo result.
+            // is the sentinel meaning "not yet resolved".  2026-05-30:
+            // Tag::App3 also memoizes — it now uses `pair->third` for
+            // arg2 (separate from `evaluated`), so the memo slot is
+            // available for both pair tags.
             if (__builtin_expect(!s_noAppMemo
-                && outerIsApp
+                && outerIsAppLike
                 && outerPair
                 && outerPair->evaluated.tag() != Tag::Uninitialized, 1))
             {
@@ -11666,7 +11672,7 @@ Value forceValue(VMState & vm, Value v)
             while (v.isAppLike()) {
                 ValuePair * p = v.payload.pair;
                 if (v.tag() == Tag::App3)
-                    rights.push_back(p->evaluated);
+                    rights.push_back(p->third);   // arg2 (separate slot from `evaluated`)
                 rights.push_back(p->right);
                 v = p->left;
             }
@@ -11676,15 +11682,10 @@ Value forceValue(VMState & vm, Value v)
                 v = forceValue(vm, v);
             for (size_t i = rights.size(); i > 0; --i)
                 v = callClosure(vm, v, rights[i - 1]);
-            // Memoize: store the result in the outermost App's
-            // evaluated field so the next force of this exact App
-            // pointer short-circuits.  Defensive: avoid writing
-            // back a non-WHNF result (which can happen if the
-            // callClosure chain leaves a Thunk/App/Slot on the
-            // stack).  The next force will re-attempt.  App3 does
-            // not memoize (its `evaluated` field is occupied by
-            // arg2; the pattern is single-shot anyway).
-            if (!s_noAppMemo && outerIsApp && outerPair) {
+            // Memoize: store the result in the outermost App / App3
+            // pair's evaluated field so the next force short-circuits.
+            // Defensive: avoid writing back a non-WHNF result.
+            if (!s_noAppMemo && outerIsAppLike && outerPair) {
                 Tag rt = v.tag();
                 if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::App3
                     && rt != Tag::Slot

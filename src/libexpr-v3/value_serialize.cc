@@ -168,10 +168,15 @@ const Value & chaseToWHNF(const Value & v, int maxHops = 32)
             continue;
         }
         if (t == Tag::App3) {
-            // EXIT_GC_SPIRAL Day 9-11 (2026-05-29): Tag::App3 carries
-            // arg2 in the `evaluated` slot (NOT a memoized result),
-            // so there is no chase target.  Callers must force first.
-            throw SerializeError("App3 not yet evaluated; force before serialise");
+            // 2026-05-30: Tag::App3 now has a separate `third` slot for
+            // arg2 and `evaluated` is preserved as memoization sink
+            // (same shape as Tag::App).  Chase through evaluated when
+            // populated.
+            ValuePair * p = cur->payload.pair;
+            if (!p || p->evaluated.tag() == Tag::Uninitialized)
+                throw SerializeError("App3 not yet evaluated; force before serialise");
+            cur = &p->evaluated;
+            continue;
         }
         if (t == Tag::Slot) {
             if (!cur->payload.slot)

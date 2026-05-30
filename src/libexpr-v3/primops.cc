@@ -1961,41 +1961,35 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     for (uint32_t i = 0; i < src->size; ++i) {
         SymbolId sym = src->entries[i].name;
         Value nameStr = mkStringValueOwned(std::string(vmSymName(state, sym)));
-        // 2026-05-29 ROLLBACK of Day 9-11 Tag::App3 optimisation.
+        // 2026-05-30 RESTORATION of Tag::App3 with separate memo slot.
         //
-        // Day 9-11 packed `fn name value` into one Tag::App3 ValuePair
-        // (saves one 32 B ValuePair vs the legacy `App(App(fn,k),v)`
-        // 2-pair chain).  Re-validation found a NET REGRESSION on HNE:
-        // wall 11.9 s → 49.4 s, arena 1493 MB → 3137 MB, attrsets
-        // 1.11 M → 3.91 M, thunks 3.83 M → 11.4 M.  Root cause: the
-        // old 2-pair encoding's outer `Tag::App` `pair->evaluated`
-        // slot was the App-result MEMOIZATION sink (#696 fix that
-        // closed the "extendDerivation outputsList forced 64K times"
-        // regression).  Tag::App3 overloads `evaluated` to hold
-        // arg2, so memoization is LOST — every demand of a mapAttrs
-        // entry re-runs the body's allocations.  Day 9-11's
-        // assumption "mapAttrs entries are single-shot" is falsified
-        // empirically.
+        // Day 9-11 (2026-05-29) attempt packed `fn name value` into
+        // one Tag::App3 ValuePair (saves 1 ValuePair vs the legacy
+        // `App(App(fn,k),v)` 2-pair chain).  That attempt overloaded
+        // `pair->evaluated` to hold arg2, LOSING App-result memoization
+        // (#696 sink).  HNE regressed wall 11.9 s → 49.4 s, arena
+        // +1644 MB.  Rolled back commit a9912f0fb.
         //
-        // Mitigation: revert to the 2-pair encoding here (the headline
-        // mapAttrs site).  Tag::App3 dispatch + Force-path
-        // infrastructure stays in vm.cc as dead code — no allocator
-        // overhead from the unused tag, and the dispatch is needed
-        // only if someone re-enables construction in a future
-        // experiment.  See lode/EXIT_WEEK1_RETROSPECTIVE_2026-05-29.md
-        // for the regression measurement and rationale.
-        ValuePair * pp1 = Alloc::allocPair();
-        pp1->left  = fn;
-        pp1->right = nameStr;
-        pairPostConstructBarrier(pp1);  // Phase D
-        Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
-        ValuePair * pp2 = Alloc::allocPair();
-        pp2->left  = step1;
-        pp2->right = src->entries[i].value;
-        pairPostConstructBarrier(pp2);  // Phase D
-        Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
-        result->entries[i].name  = sym;
-        bindingsSetValue(result, i, step2);  // Phase D
+        // 2026-05-30 (EXIT_GC_SPIRAL Day 4 option A): ValuePair now has
+        // a SEPARATE `third` slot for Tag::App3's arg2.  `evaluated`
+        // stays as the memoization sink — same memo behavior as
+        // Tag::App.  The regression of the prior attempt is structurally
+        // impossible: memo writes to `evaluated` no longer collide
+        // with arg2 storage.
+        //
+        // Net memory: 1 ValuePair per entry (64 B) vs 2 ValuePairs
+        // (96 B); savings = 32 B × N_entries.  Other-App pairs pay
+        // +16 B each.  Projected net on HNE: ~ -29 MB.
+        ValuePair * pp = Alloc::allocPair();
+        pp->left   = fn;
+        pp->right  = nameStr;
+        pp->third  = src->entries[i].value;
+        // `evaluated` stays Tag::Uninitialized (default-constructed)
+        // — populated by App3 force-path memoization on first demand.
+        pairPostConstructBarrier(pp);  // Phase D
+        Value app3; app3.tag_payload = static_cast<uint64_t>(Tag::App3); app3.payload.pair = pp;
+        result->entries[i].name = sym;
+        bindingsSetValue(result, i, app3);  // Phase D
     }
     out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     out.payload.bindings = result;
@@ -2799,22 +2793,23 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         // Build name string.
         std::string nm = sid < symTab.size() ? symTab[sid] : std::to_string(sid);
         Value nameV = mkStringValueOwned(nm);
-        // 2026-05-29 ROLLBACK of Day 9-11 Tag::App3 optimisation —
-        // see primMapAttrs above for the regression measurement and
-        // rationale.  Restore 2-pair `App(App(fn, nameV), lv)`
-        // encoding so the outer App's `pair->evaluated` slot resumes
-        // its role as the App-result memoization sink (#696).
-        ValuePair * pp1 = Alloc::allocPair();
-        pp1->left  = fn;
-        pp1->right = nameV;
-        pairPostConstructBarrier(pp1);  // Phase D
-        Value step1; step1.tag_payload = static_cast<uint64_t>(Tag::App); step1.payload.pair = pp1;
-        ValuePair * pp2 = Alloc::allocPair();
-        pp2->left  = step1;
-        pp2->right = lv;
-        pairPostConstructBarrier(pp2);  // Phase D
-        Value step2; step2.tag_payload = static_cast<uint64_t>(Tag::App); step2.payload.pair = pp2;
-        entries.emplace_back(sid, step2);
+        // 2026-05-30 RESTORATION of Tag::App3 with separate memo slot
+        // — see primMapAttrs above for the design rationale.  Pack
+        // `fn name list` into a single ValuePair (left=fn, right=name,
+        // third=list, evaluated=memo sink).  The original Day 9-11
+        // regression cause (memo collision with arg2) is fixed by the
+        // separate `third` slot.
+        //
+        // Note: this is the C fallback for zipAttrsWith.  The default
+        // is the bytecode-installed version per commit 1243c158b
+        // (Tier 2c); this site fires only with NIX_V3_NO_BC_ZIP_ATTRS_WITH=1.
+        ValuePair * pp = Alloc::allocPair();
+        pp->left   = fn;
+        pp->right  = nameV;
+        pp->third  = lv;
+        pairPostConstructBarrier(pp);  // Phase D
+        Value app3; app3.tag_payload = static_cast<uint64_t>(Tag::App3); app3.payload.pair = pp;
+        entries.emplace_back(sid, app3);
     }
     std::sort(entries.begin(), entries.end(),
         [](const auto & a, const auto & b) { return a.first < b.first; });

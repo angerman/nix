@@ -357,6 +357,7 @@ private:
         auditAndVisit(p->left);
         auditAndVisit(p->right);
         auditAndVisit(p->evaluated);
+        auditAndVisit(p->third);  // 2026-05-30 Tag::App3 arg2
     }
 };
 
@@ -1521,6 +1522,7 @@ private:
         visitValue(p->left);
         visitValue(p->right);
         visitValue(p->evaluated);
+        visitValue(p->third);  // 2026-05-30 Tag::App3 arg2
     }
 };
 

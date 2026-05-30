@@ -551,8 +551,12 @@ ValuePair * Scavenger::fwdPair(ValuePair * p)
     // there, and a nursery payload in `evaluated` is a real root.
     // #705 (2026-05-21): the missing `evaluated` check was the
     // primary cause of hello.drvPath SIGSEGV under scavenge.
+    // 2026-05-30: include `third` slot (Tag::App3 arg2).  For
+    // Tag::App / Tag::PrimOpApp `third` stays Uninitialized
+    // (isLeafTag true) so the fast path is preserved.
     if (isLeafTag(p->left.tag()) && isLeafTag(p->right.tag())
-        && isLeafTag(p->evaluated.tag())) return p;
+        && isLeafTag(p->evaluated.tag())
+        && isLeafTag(p->third.tag())) return p;
     // #738 Phase E v0.2 force-walk tenured Pair — see fwdBindings.
     if (n.isPhaseEActive()) {
         if (walked.insert(p).second) graylist.push_back({p, GK_PAIR});
@@ -794,6 +798,9 @@ void Scavenger::walkPair(ValuePair * p)
     // hello.drvPath SIGSEGV under scavenge.  When `evaluated` is
     // Tag::Uninitialized, visitValue is a no-op.
     visitValue(p->evaluated);
+    // 2026-05-30: `third` slot for Tag::App3 arg2.  Uninitialized
+    // for Tag::App / Tag::PrimOpApp; visitValue no-ops.
+    visitValue(p->third);
     // Phase E v0.2 post-walk barrier — see walkList.
     if (n.isPhaseEActive()) pairPostConstructBarrier(p);
 }
@@ -1291,6 +1298,7 @@ struct Auditor {
         visitValue(p->left,      "ValuePair.left");
         visitValue(p->right,     "ValuePair.right");
         visitValue(p->evaluated, "ValuePair.evaluated");
+        visitValue(p->third,     "ValuePair.third");  // 2026-05-30 Tag::App3 arg2
     }
 };
 

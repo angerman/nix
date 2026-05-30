@@ -365,9 +365,11 @@ pairPostConstructBarrier(ValuePair * p) noexcept
         // ValuePair always tenured by design (Alloc::allocPair
         // calls threadArena directly); defensive double-check.
         if (n.contains(p)) return;
+        // 2026-05-30: include `third` slot (Tag::App3 arg2).
         if (isNurseryPayload(p->left, n)
             || isNurseryPayload(p->right, n)
-            || isNurseryPayload(p->evaluated, n))
+            || isNurseryPayload(p->evaluated, n)
+            || isNurseryPayload(p->third, n))
         {
             dirtyContainers().push_back({DirtyKind::Pair, p});
         }
