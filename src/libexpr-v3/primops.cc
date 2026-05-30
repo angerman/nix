@@ -8098,16 +8098,90 @@ struct ImportCacheEntry {
     Value result;
     int64_t mtimeNs = 0;
     int64_t size    = 0;
+    // Phase 4b LRU (2026-05-30, EXIT_GC_SPIRAL §4.1): per-entry last
+    // access generation.  Bumped at every cache hit + on insert.
+    // Sorting by lastAccessGen ascending gives LRU eviction order.
+    // 0 = never accessed (entry was inserted but never re-hit; rare —
+    // see HIT path below which bumps on read).
+    uint64_t lastAccessGen = 0;
 };
 struct ImportCache
 {
     std::deque<CompilationUnit> cus;       // stable addresses (deque doesn't reallocate)
     std::unordered_map<std::string, ImportCacheEntry> results;
+    // Phase 4b LRU access counter.  Monotonic; not thread-safe (v3 is
+    // single-threaded by design).  Bumped on every cache hit + insert.
+    uint64_t accessCounter = 0;
 };
 inline ImportCache & importCache()
 {
     static ImportCache c;
     return c;
+}
+
+// Phase 4b LRU (2026-05-30): eviction gate.  Default 0 = no eviction
+// (preserves status quo).  When > 0, evict oldest entries when
+// `results.size()` exceeds the threshold.  Opt-in via
+// `NIX_V3_IMPORT_CACHE_MAX_ENTRIES=N`.
+static size_t importCacheMaxEntries() noexcept
+{
+    static const size_t v = []() -> size_t {
+        if (const char * s = std::getenv("NIX_V3_IMPORT_CACHE_MAX_ENTRIES")) {
+            long n = std::strtol(s, nullptr, 10);
+            if (n > 0) return static_cast<size_t>(n);
+        }
+        return 0;  // default: no eviction
+    }();
+    return v;
+}
+
+// Phase 4b LRU counters (always-on, cheap atomic relaxed).
+static std::atomic<uint64_t> g_importCacheLruEvictions{0};
+static std::atomic<uint64_t> g_importCacheLruSweeps{0};
+
+// Mark an entry as just-accessed.  Caller is the cache hit path.
+static inline void bumpImportEntry(ImportCacheEntry & e, ImportCache & c) noexcept
+{
+    e.lastAccessGen = ++c.accessCounter;
+}
+
+// LRU eviction: when results.size() > maxEntries, drop the oldest 25%.
+// Called only after an insert (when growth can push us over the limit).
+// Cost: O(N log N) sort of pointers; sorting + erasing 25% amortises to
+// O(N) per insertion across N inserts.
+static void maybeEvictOldImportEntries(ImportCache & c) noexcept
+{
+    const size_t maxEntries = importCacheMaxEntries();
+    if (maxEntries == 0) return;
+    if (c.results.size() <= maxEntries) return;
+
+    g_importCacheLruSweeps.fetch_add(1, std::memory_order_relaxed);
+
+    // Collect iterator + generation pairs.  Sort ascending by gen,
+    // evict the oldest 25 % of entries.  Erasing from an unordered_map
+    // is O(1) per erase; collecting + sorting is the dominant cost.
+    std::vector<std::pair<uint64_t, std::string>> candidates;
+    candidates.reserve(c.results.size());
+    for (const auto & kv : c.results)
+        candidates.emplace_back(kv.second.lastAccessGen, kv.first);
+
+    // Number to evict: bring `results.size()` down to `maxEntries * 3/4`
+    // so we evict a chunk, not just one entry at a time.  Smooths
+    // the cost over multiple inserts.
+    const size_t targetSize = (maxEntries * 3) / 4;
+    const size_t toEvict = candidates.size() > targetSize
+        ? candidates.size() - targetSize
+        : 0;
+    if (toEvict == 0) return;
+
+    std::nth_element(candidates.begin(), candidates.begin() + toEvict,
+                     candidates.end(),
+                     [](const auto & a, const auto & b) {
+                         return a.first < b.first;  // ascending: oldest first
+                     });
+    for (size_t i = 0; i < toEvict; ++i)
+        c.results.erase(candidates[i].second);
+    g_importCacheLruEvictions.fetch_add(toEvict, std::memory_order_relaxed);
 }
 
 } // anon ns
@@ -8465,6 +8539,8 @@ void primImport(EvalState & state, Value * args, Value & out)
                     (unsigned long long)seqHit.fetch_add(1), path.c_str());
             }
             if (s_impTimingEn) ++importTimingTotals().resultCacheHits;
+            // Phase 4b LRU (2026-05-30): mark this entry as recently used.
+            bumpImportEntry(it->second, cache);
             out = it->second.result;
             return;
         }
@@ -8535,8 +8611,12 @@ void primImport(EvalState & state, Value * args, Value & out)
                 out = value_serialize::deserialize(*blob);
                 // Populate in-memory cache so subsequent calls hit there.
                 auto [mt, sz] = importStat(path);
-                cache.results.emplace(path,
-                    ImportCacheEntry{out, mt, sz});
+                {
+                    auto [iter, inserted] = cache.results.emplace(path,
+                        ImportCacheEntry{out, mt, sz, 0});
+                    if (inserted) bumpImportEntry(iter->second, cache);  // Phase 4b LRU
+                }
+                maybeEvictOldImportEntries(cache);  // Phase 4b LRU
                 if (s_dbg_import) {
                     std::fprintf(stderr, "v3 IMPORT-DISK-HIT: %s\n",
                         path.c_str());
@@ -9214,8 +9294,12 @@ void primImport(EvalState & state, Value * args, Value & out)
                 impBumpNs(importTimingTotals().runNs, tRun);
                 if (s_impTimingEn) ++importTimingTotals().diskCacheHits;
                 auto [mt, sz] = importStat(path);
-                cache.results.emplace(path,
-                    ImportCacheEntry{out, mt, sz});
+                {
+                    auto [iter, inserted] = cache.results.emplace(path,
+                        ImportCacheEntry{out, mt, sz, 0});
+                    if (inserted) bumpImportEntry(iter->second, cache);  // Phase 4b LRU
+                }
+                maybeEvictOldImportEntries(cache);  // Phase 4b LRU
                 return;
             } catch (const std::exception & ex) {
                 cache.cus.pop_back();
@@ -9380,8 +9464,11 @@ skipDiskCacheLookup:
     }
     {
         auto [mt, sz] = importStat(path);
-        cache.results.emplace(path, ImportCacheEntry{out, mt, sz});
+        auto [iter, inserted] = cache.results.emplace(path,
+            ImportCacheEntry{out, mt, sz, 0});
+        if (inserted) bumpImportEntry(iter->second, cache);  // Phase 4b LRU
     }
+    maybeEvictOldImportEntries(cache);  // Phase 4b LRU
     // #741 Phase 4 — also persist to disk-backed import cache.
     // Serialiser failures (closures, etc.) are silently skipped;
     // subsequent invocations just see a disk-cache miss + recompute.
