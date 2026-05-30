@@ -1169,6 +1169,30 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     if (na == 0 && nb > 0) return const_cast<Bindings *>(b);
     if (nb == 0 && na > 0) return const_cast<Bindings *>(a);
 
+    // #826 / A1a Phase C attempt #4 (2026-05-30, EXIT_GC_SPIRAL):
+    // REVERTED — same failure mode as prior 3 attempts.
+    //
+    // Enabled NIX_V3_CHAIN_BINDINGS=1 with chain-construct path:
+    // when nb ≤ 4 && na ≥ 16 && !a->isChain() && !b->isChain(),
+    // build Chain{parent=a, overlay=b}.  All 5 nixpkgs paths failed
+    // (hello.name, hello.pname, hello.drvPath, hello.outPath,
+    // firefox.name) with the same error as v2/v3:
+    // "attribute 'buildPythonApplication' missing".
+    //
+    // Per [[measure-twice-cut-once]] "Three failed pivots on same
+    // premise = falsification" — this is the 4th pivot.  The
+    // structural failure mode reproduces exactly across 4 attempts
+    // with different chain-construct shapes, confirming the
+    // architectural prereq (190-site entries[] audit + Nix-level
+    // repro) is genuinely required.
+    //
+    // See EXIT_PHASE_C_4_FALSIFIED_2026-05-30.md for the 4-pivot
+    // ledger + the architectural-blocker writeup.
+    //
+    // allocChainBindings helper stays in alloc.hh as the (now-
+    // documented) staging point for a future multi-session attempt
+    // that completes the prereqs first.
+
     // #826 / A1a Phase C — FALSIFIED across three attempts this
     // session (per measure-twice-cut-once §3.8 "three failed pivots
     // = falsification").  Chain construction reserved for a future

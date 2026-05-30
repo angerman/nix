@@ -2283,13 +2283,45 @@ struct Alloc
     /// touch entries[]).  Audited 2026-05-20.
     static Bindings * emptyBindingsSentinel() noexcept;
 
-    // (Phase C `allocChainBindings` helper intentionally NOT
-    //  added — Phase C is FALSIFIED across three pivots per
-    //  vm.cc:1167-1206 in-code memo.  Adding a constructor here
-    //  without callers is an "optimization carcass" anti-pattern
-    //  per [[measure-twice-cut-once]] §3.7.  The Phase C revival
-    //  prerequisites in the vm.cc comment are multi-session work;
-    //  not in scope for this turn.)
+    // Phase C revival attempt #4 (2026-05-30): per explicit user
+    // direction "Continue Phase C", added `allocChainBindings`
+    // helper with caller wired in mergeBindings (gated
+    // NIX_V3_CHAIN_BINDINGS=1, default OFF).  Prior 3 attempts
+    // falsified per vm.cc:1167-1210 inline ledger.  This attempt
+    // adds diagnostic instrumentation (NIX_V3_CHAIN_DBG=1 logs every
+    // chain construction + every iteration-site that hits a Chain
+    // without materialize) to narrow the failing pattern.
+    static Bindings * allocChainBindings(const Bindings * parent,
+                                          uint32_t overlaySize,
+                                          const char * file = __builtin_FILE(),
+                                          uint32_t     line = __builtin_LINE()) noexcept
+    {
+        V3_STATS_INC(attrsetsAllocated);
+        size_t bytes = sizeof(Bindings) + overlaySize * sizeof(Bindings::Entry);
+        V3_STATS_BUMP(bytesBindings, bytes);
+        auto * b = static_cast<Bindings *>(threadArena().alloc(bytes));
+        b->kind = uint8_t(Bindings::Kind::Chain);
+        b->_pad8[0] = b->_pad8[1] = b->_pad8[2] = 0;
+        b->size = overlaySize;
+        b->parent = parent;
+        // Histogram bucketing same as Sorted.
+        V3_STATS_BLOCK {
+            auto & buckets = allocStats().attrsetSizeBuckets;
+            uint32_t n = overlaySize;
+            if      (n == 0)        buckets[0]++;
+            else if (n == 1)        buckets[1]++;
+            else if (n == 2)        buckets[2]++;
+            else if (n <= 4)        buckets[3]++;
+            else if (n <= 8)        buckets[4]++;
+            else if (n <= 16)       buckets[5]++;
+            else if (n <= 32)       buckets[6]++;
+            else if (n <= 64)       buckets[7]++;
+            else if (n <= 128)      buckets[8]++;
+            else                    buckets[9]++;
+            bindingsAllocSiteRecord(b, file, line);
+        }
+        return b;
+    }
 
     static Bindings * allocBindings(uint32_t n,
                                      const char * file = __builtin_FILE(),
