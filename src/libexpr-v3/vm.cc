@@ -1169,7 +1169,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     if (na == 0 && nb > 0) return const_cast<Bindings *>(b);
     if (nb == 0 && na > 0) return const_cast<Bindings *>(a);
 
-    // #826 / A1a Phase C attempt #4 (2026-05-30, EXIT_GC_SPIRAL):
+    // #826 / A1a Phase C attempt #4 + #5 (2026-05-30, EXIT_GC_SPIRAL):
     // REVERTED — same failure mode as prior 3 attempts.
     //
     // Enabled NIX_V3_CHAIN_BINDINGS=1 with chain-construct path:
