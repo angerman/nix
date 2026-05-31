@@ -1110,12 +1110,17 @@ public:
     // Immix path. <30% -> flat MS path.
     //
     // Reports at multiple line sizes (64, 128, 256, 512) so the
-    // sensitivity to line granularity is visible.
+    // sensitivity to line granularity is visible.  4096 + 16384 added
+    // 2026-06-01 to measure page-level madvise viability (#875 Path A
+    // refined-granularity spike following whole-block falsification at
+    // EXIT_PATH_A_FALSIFIED_2026-05-31).
     void reportLines() noexcept
     {
         // Default Immix line size = 128 B; sweep 64/128/256/512.
+        // 4096 = OS page size on macOS aarch64; 16384 = 4-page bundle.
         for (size_t lineSize : {size_t(64), size_t(128),
-                                size_t(256), size_t(512)}) {
+                                size_t(256), size_t(512),
+                                size_t(4096), size_t(16384)}) {
             reportLinesAtSize(lineSize);
         }
     }
