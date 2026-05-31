@@ -1,0 +1,116 @@
+=== Post-App3 combined baseline: m5, N=10 ===
+git: 42543abc0
+binary: /Users/angerman/Projects/iohk/nix/builddir/src/nix/nix
+expr: (builtins.getFlake "/Users/angerman/Projects/iohk/cardano-node").outputs.packages.aarch64-darwin.cardano-node.name
+
+[1] wall=136.45s peak=4775.9MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+[2] wall=140.41s peak=3588.7MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+[3] wall=139.82s peak=3457.4MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+[4] wall=140.32s peak=3299.1MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+[5] wall=138.10s peak=3875.1MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+[6] wall=137.08s peak=4235.5MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+[7] wall=137.75s peak=3719.6MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+[8] wall=135.94s peak=3996.7MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+[9] wall=135.93s peak=4457.7MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+[10] wall=137.92s peak=3363.9MB arena=5838.5MB elsewhere=0.0MB drv=no-drv
+{
+  "schema_version": 1,
+  "date": "2026-05-31",
+  "workload": "M5",
+  "binary": "/Users/angerman/Projects/iohk/nix/builddir/src/nix/nix",
+  "git": "42543abc0",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "method": "Inline bash measurement; N=10 back-to-back; trim-2 mean \u00b1 \u03c3 (drop min+max).",
+  "lever_state": {
+    "fakeclo_wire_back": true,
+    "tag_app3": true,
+    "capwiths_intern": true,
+    "phase_4b_lru": false,
+    "chain_phase_c": false
+  },
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 3836.82,
+      "sigma": 380.67,
+      "min": 3299.1,
+      "max": 4775.9,
+      "raw": [
+        4775.9,
+        3588.7,
+        3457.4,
+        3299.1,
+        3875.1,
+        4235.5,
+        3719.6,
+        3996.7,
+        4457.7,
+        3363.9
+      ]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 5838.5,
+      "sigma": 0.0,
+      "min": 5838.5,
+      "max": 5838.5,
+      "raw": [
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5
+      ]
+    },
+    "elsewhere_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 0.0,
+      "sigma": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "raw": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "wall_s": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 137.92,
+      "sigma": 1.52,
+      "min": 135.931327,
+      "max": 140.407978,
+      "raw": [
+        136.447942,
+        140.407978,
+        139.821127,
+        140.324685,
+        138.095385,
+        137.077316,
+        137.745592,
+        135.944815,
+        135.931327,
+        137.920455
+      ]
+    }
+  }
+}
+
+Saved: /Users/angerman/Projects/iohk/nix/src/libexpr-v3/bench/baselines/2026-05-31-post-app3-combined/m5.json

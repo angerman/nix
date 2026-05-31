@@ -1,0 +1,116 @@
+=== Post-App3 combined baseline: hne, N=10 ===
+git: 42543abc0
+binary: /Users/angerman/Projects/iohk/nix/builddir/src/nix/nix
+expr: (builtins.getFlake "/Users/angerman/Projects/iohk/haskell-nix-example").packages.x86_64-linux.hello.drvPath
+
+[1] wall=58.55s peak=2929.6MB arena=1476.4MB elsewhere=1050.3MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+[2] wall=57.63s peak=2927.3MB arena=1476.4MB elsewhere=1048.0MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+[3] wall=58.73s peak=2925.3MB arena=1476.4MB elsewhere=1046.0MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+[4] wall=59.80s peak=2928.2MB arena=1476.4MB elsewhere=1048.9MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+[5] wall=58.25s peak=2928.8MB arena=1476.4MB elsewhere=1049.5MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+[6] wall=57.88s peak=2929.2MB arena=1476.4MB elsewhere=1049.9MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+[7] wall=58.11s peak=2929.5MB arena=1476.4MB elsewhere=1050.1MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+[8] wall=57.83s peak=2928.7MB arena=1476.4MB elsewhere=1049.4MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+[9] wall=57.90s peak=2923.4MB arena=1476.4MB elsewhere=1044.1MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+[10] wall=57.92s peak=2927.2MB arena=1476.4MB elsewhere=1047.9MB drv="/nix/store/aw7jri6nvkksf2956w0x1y1kha8qnvwv-hello-exe-hello-1.0.0.2.drv"
+{
+  "schema_version": 1,
+  "date": "2026-05-31",
+  "workload": "HNE",
+  "binary": "/Users/angerman/Projects/iohk/nix/builddir/src/nix/nix",
+  "git": "42543abc0",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "method": "Inline bash measurement; N=10 back-to-back; trim-2 mean \u00b1 \u03c3 (drop min+max).",
+  "lever_state": {
+    "fakeclo_wire_back": true,
+    "tag_app3": true,
+    "capwiths_intern": true,
+    "phase_4b_lru": false,
+    "chain_phase_c": false
+  },
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 2928.03,
+      "sigma": 1.38,
+      "min": 2923.4,
+      "max": 2929.6,
+      "raw": [
+        2929.6,
+        2927.3,
+        2925.3,
+        2928.2,
+        2928.8,
+        2929.2,
+        2929.5,
+        2928.7,
+        2923.4,
+        2927.2
+      ]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 1476.4,
+      "sigma": 0.0,
+      "min": 1476.4,
+      "max": 1476.4,
+      "raw": [
+        1476.4,
+        1476.4,
+        1476.4,
+        1476.4,
+        1476.4,
+        1476.4,
+        1476.4,
+        1476.4,
+        1476.4,
+        1476.4
+      ]
+    },
+    "elsewhere_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 1048.71,
+      "sigma": 1.36,
+      "min": 1044.1,
+      "max": 1050.3,
+      "raw": [
+        1050.3,
+        1048.0,
+        1046.0,
+        1048.9,
+        1049.5,
+        1049.9,
+        1050.1,
+        1049.4,
+        1044.1,
+        1047.9
+      ]
+    },
+    "wall_s": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 58.15,
+      "sigma": 0.34,
+      "min": 57.62974,
+      "max": 59.798373,
+      "raw": [
+        58.552067,
+        57.62974,
+        58.732761,
+        59.798373,
+        58.250037,
+        57.878117,
+        58.105621,
+        57.831122,
+        57.90243,
+        57.922071
+      ]
+    }
+  }
+}
+
+Saved: /Users/angerman/Projects/iohk/nix/src/libexpr-v3/bench/baselines/2026-05-31-post-app3-combined/hne.json

@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "date": "2026-05-31",
+  "workload": "M5",
+  "binary": "/Users/angerman/Projects/iohk/nix/builddir/src/nix/nix",
+  "git": "42543abc0",
+  "n_requested": 10,
+  "n_succeeded": 10,
+  "method": "Inline bash measurement; N=10 back-to-back; trim-2 mean \u00b1 \u03c3 (drop min+max).",
+  "lever_state": {
+    "fakeclo_wire_back": true,
+    "tag_app3": true,
+    "capwiths_intern": true,
+    "phase_4b_lru": false,
+    "chain_phase_c": false
+  },
+  "stats": {
+    "peak_rss_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 3836.82,
+      "sigma": 380.67,
+      "min": 3299.1,
+      "max": 4775.9,
+      "raw": [
+        4775.9,
+        3588.7,
+        3457.4,
+        3299.1,
+        3875.1,
+        4235.5,
+        3719.6,
+        3996.7,
+        4457.7,
+        3363.9
+      ]
+    },
+    "v3_arena_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 5838.5,
+      "sigma": 0.0,
+      "min": 5838.5,
+      "max": 5838.5,
+      "raw": [
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5,
+        5838.5
+      ]
+    },
+    "elsewhere_mb": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 0.0,
+      "sigma": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "raw": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "wall_s": {
+      "n_raw": 10,
+      "n_used": 8,
+      "mean": 137.92,
+      "sigma": 1.52,
+      "min": 135.931327,
+      "max": 140.407978,
+      "raw": [
+        136.447942,
+        140.407978,
+        139.821127,
+        140.324685,
+        138.095385,
+        137.077316,
+        137.745592,
+        135.944815,
+        135.931327,
+        137.920455
+      ]
+    }
+  }
+}
