@@ -38,8 +38,24 @@
 
 namespace nix::v3 {
 
+inline bool canLowerV3(const nix::v3::ast::Node * n);
+
+/// Attrset / let bindings are lowerable iff all are plain (no inherit /
+/// inherit-from — Phase 4), no dynamic keys (Phase 4), and every value
+/// lowers.  Shared by the Let + Attrs gates.
+inline bool canLowerAttrDefs(const nix::v3::ast::Attrs * at)
+{
+    namespace a = nix::v3::ast;
+    if (!at->inheritFromExprs.empty() || !at->dynamicAttrs.empty()) return false;
+    for (auto & d : at->attrs) {
+        if (d.kind != a::Attrs::AttrKind::Plain) return false;
+        if (!canLowerV3(d.value)) return false;
+    }
+    return true;
+}
+
 /// Whole-program gate: true iff `n`'s entire subtree uses only
-/// Phase-1-supported constructs (so the native lowerer handles it; else
+/// natively-supported constructs (so the native lowerer handles it; else
 /// the caller falls back to the bridge).  Conservative by construction.
 inline bool canLowerV3(const nix::v3::ast::Node * n)
 {
@@ -64,29 +80,32 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
         // Phase 2b: plain bindings only (no inherit / inherit-from /
         // dynamic keys → bridge those).
         auto * let = static_cast<const a::Let *>(n);
-        auto * at = let->attrs;
-        if (!at->inheritFromExprs.empty() || !at->dynamicAttrs.empty()) return false;
-        for (auto & d : at->attrs) {
-            if (d.kind != a::Attrs::AttrKind::Plain) return false;
-            if (!canLowerV3(d.value)) return false;
-        }
-        return canLowerV3(let->body);
+        return canLowerAttrDefs(let->attrs) && canLowerV3(let->body);
+    }
+    case a::Kind::Attrs:
+        // Phase 3a: rec + non-rec, plain bindings only.
+        return canLowerAttrDefs(static_cast<const a::Attrs *>(n));
+    case a::Kind::Select: {
+        auto * s = static_cast<const a::Select *>(n);
+        if (!canLowerV3(s->e)) return false;
+        if (s->def && !canLowerV3(s->def)) return false;
+        for (auto & p : s->path)
+            if (p.expr && !canLowerV3(p.expr)) return false;  // dynamic ${} key
+        return true;
+    }
+    case a::Kind::OpHasAttr: {
+        auto * h = static_cast<const a::OpHasAttr *>(n);
+        if (!canLowerV3(h->e)) return false;
+        for (auto & p : h->path)
+            if (p.expr && !canLowerV3(p.expr)) return false;
+        return true;
     }
     case a::Kind::Call: {
+        // Args are thunked for laziness (lowerCall::thunkifyForAttr), so
+        // any lowerable arg is fine — no triviality restriction.
         auto * c = static_cast<const a::Call *>(n);
         if (!canLowerV3(c->fun)) return false;
-        for (auto * arg : c->args) {
-            if (!canLowerV3(arg)) return false;
-            // Trivial-for-lazy: a non-thunked arg must be a literal /
-            // var / lambda / primop-call (no control flow that would
-            // need a lazy thunk).  Phase 2b lifts this once thunkify
-            // lands.
-            switch (arg->kind) {
-            case a::Kind::Int: case a::Kind::Float: case a::Kind::String:
-            case a::Kind::Var: case a::Kind::Lambda: case a::Kind::Call: break;
-            default: return false;
-            }
-        }
+        for (auto * arg : c->args) if (!canLowerV3(arg)) return false;
         return true;
     }
     case a::Kind::If: {
@@ -198,14 +217,22 @@ struct LowererV3 {
             return lowerLambda(static_cast<const a::Lambda *>(n));
         case a::Kind::Let:
             return lowerLet(static_cast<const a::Let *>(n));
+        case a::Kind::Attrs:
+            return lowerAttrs(static_cast<const a::Attrs *>(n));
+        case a::Kind::Select:
+            return lowerSelect(static_cast<const a::Select *>(n));
+        case a::Kind::OpHasAttr:
+            return lowerHasAttr(static_cast<const a::OpHasAttr *>(n));
 
         case a::Kind::Call: {
             auto * c = static_cast<const a::Call *>(n);
             // App-chain (handles primops via LitPrimOp + OP_CALL).  Args
-            // are Phase-1-trivial (canLowerV3 guarantees), so no thunk.
+            // are thunked for laziness (thunkifyForAttr — thunk unless
+            // a trivial literal/var/lambda) so e.g. `tryEval <x>` /
+            // `const 1 (throw "y")` don't fire the arg eagerly.
             ir::VarId f = lowerExpr(c->fun);
             for (auto * arg : c->args)
-                f = addBinding(ir::App{f, lowerExpr(arg)});
+                f = addBinding(ir::App{f, thunkifyForAttr(arg)});
             return f;
         }
         case a::Kind::If: {
@@ -354,32 +381,59 @@ struct LowererV3 {
         return addBinding(ir::Lambda{fid, {}, {}});
     }
 
-    /// Phase 2b: `let … in body` (plain bindings only — canLowerV3
-    /// rejects inherit / inherit-from / dynamic).  Nix `let` is
-    /// mutually recursive: each binding becomes a thunk Function lowered
-    /// in the rec scope; siblings resolve via RecBindingSlotRef on the
-    /// rec attrset.  Emits ir::LetRec (emit + computeFreeVars handle the
-    /// rec-slot wiring + outerUpvalues).  Mirrors lower.cc::lowerLetRec.
-    ir::VarId lowerLet(const nix::v3::ast::Let * let)
+    /// Trivial-for-value: cheap exprs that need no lazy thunk wrapper
+    /// as an attr/list value (mirrors lower.cc isTrivialForLazy forValue
+    /// — literals/lambda/var; NOT arithmetic, which is lazy for values).
+    static bool isTrivialForValue(const nix::v3::ast::Node * n)
     {
-        const auto & defs = let->attrs->attrs;
-        // Canonical (by-name) order for stable FuncId allocation (#815).
+        namespace a = nix::v3::ast;
+        switch (n->kind) {
+        case a::Kind::Int: case a::Kind::Float: case a::Kind::String:
+        case a::Kind::Path: case a::Kind::Var: case a::Kind::Lambda:
+            return true;
+        default: return false;
+        }
+    }
+
+    /// Wrap `e` in a thunk Function (lowered in the CURRENT scopes, so it
+    /// captures outer vars as upvalues — emit computes them).  Mirrors
+    /// lower.cc::thunkify.
+    ir::VarId thunkify(const nix::v3::ast::Node * e)
+    {
+        m.functions.emplace_back();
+        ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+        auto eb = m.freshBlock();
+        m.functions[fid].entryBlock = eb;
+        m.functions[fid].name = "<thunk>";
+        blockStack.push_back(eb);
+        setReturn(lowerExpr(e));
+        blockStack.pop_back();
+        return addBinding(ir::MkThunk{fid, /*freeVars*/ {}, /*lexicalWiths*/ {}});
+    }
+    ir::VarId thunkifyForAttr(const nix::v3::ast::Node * e)
+    {
+        return isTrivialForValue(e) ? lowerExpr(e) : thunkify(e);
+    }
+
+    /// Shared rec-attrset / let-rec lowering (lower.cc::lowerLetRec).
+    /// `hasBody` true → `let … in body` (returns body value); false →
+    /// `rec { … }` (returns the rec attrset).  Plain bindings only —
+    /// inherit / inherit-from / dynamic are Phase 4 (canLowerV3 rejects).
+    ir::VarId lowerLetRec(const nix::v3::ast::Attrs * at, bool hasBody,
+                          const nix::v3::ast::Node * body)
+    {
         std::vector<const nix::v3::ast::Attrs::AttrDef *> bs;
-        bs.reserve(defs.size());
-        for (auto & d : defs) bs.push_back(&d);
+        bs.reserve(at->attrs.size());
+        for (auto & d : at->attrs) bs.push_back(&d);
         std::stable_sort(bs.begin(), bs.end(),
             [](const auto * a, const auto * b) { return a->name < b->name; });
 
         ir::VarId recVar = m.freshVar();
         m.recVarIds.push_back(recVar);
-
-        // Build the rec scope (names resolve to rec-slots on recVar).
         Scope recScope;
         recScope.recVar = recVar;
         for (auto * d : bs) recScope.byName.emplace(d->name, ir::kInvalid);
 
-        // Lower each binding's def into its own thunk Function, in the
-        // rec scope (so sibling refs resolve via RecBindingSlotRef).
         std::vector<ir::FuncId> fids;
         fids.reserve(bs.size());
         for (auto * d : bs) {
@@ -398,7 +452,7 @@ struct LowererV3 {
 
         ir::LetRec lr;
         lr.recVar = recVar;
-        lr.hasBody = true;
+        lr.hasBody = hasBody;
         lr.entries.reserve(bs.size());
         for (size_t i = 0; i < bs.size(); ++i) {
             ir::LetRec::Entry en;
@@ -406,14 +460,112 @@ struct LowererV3 {
             en.thunkBody = fids[i];
             lr.entries.push_back(std::move(en));
         }
-        // The LetRec binds recVar in the current block (before the body).
         m.blocks[blockStack.back()].bindings.push_back({recVar, std::move(lr)});
 
-        // Lower the body in the rec scope.
+        if (!hasBody) return addBinding(ir::VarRef{recVar});
         scopes.push_back(recScope);
-        ir::VarId rv = lowerExpr(let->body);
+        ir::VarId rv = lowerExpr(body);
         scopes.pop_back();
         return addBinding(ir::VarRef{rv});
+    }
+
+    ir::VarId lowerLet(const nix::v3::ast::Let * let)
+    {
+        return lowerLetRec(let->attrs, /*hasBody=*/true, let->body);
+    }
+
+    /// Phase 3a: attrset.  rec → lowerLetRec (returns the rec attrset);
+    /// non-rec → ir::AttrSet with thunkified (lazy) values.  Plain
+    /// bindings only (inherit / inherit-from / dynamic → Phase 4).
+    ir::VarId lowerAttrs(const nix::v3::ast::Attrs * e)
+    {
+        if (e->recursive)
+            return lowerLetRec(e, /*hasBody=*/false, /*body=*/nullptr);
+        ir::AttrSet as;
+        as.entries.reserve(e->attrs.size());
+        for (auto & d : e->attrs) {
+            ir::AttrSet::Entry en;
+            en.name = m.internSymbol(d.name);
+            en.value = thunkifyForAttr(d.value);
+            as.entries.push_back(std::move(en));
+        }
+        return addBinding(std::move(as));
+    }
+
+    /// Phase 3a: `e.a.b.c [or default]` — AttrSelect chain (static or
+    /// `${dyn}` keys), default thunkified once (lower.cc #755).
+    ir::VarId lowerSelect(const nix::v3::ast::Select * e)
+    {
+        // `builtins.<primop>` → the primop value directly.
+        if (!e->def && e->path.size() == 1 && e->path[0].expr == nullptr
+            && e->e->kind == nix::v3::ast::Kind::Var
+            && static_cast<const nix::v3::ast::Var *>(e->e)->name == "builtins")
+        {
+            if (const PrimOp * po = findPrimOp(e->path[0].symbol)) {
+                if (po->arity == 0) return addBinding(ir::PrimOpCall{po, {}});
+                return addBinding(ir::LitPrimOp{po});
+            }
+        }
+        ir::VarId v = lowerExpr(e->e);
+        ir::VarId def = e->def ? thunkifyForAttr(e->def) : ir::kInvalid;
+        return emitSelectChain(v, e->path, def, 0);
+    }
+
+    ir::VarId emitSelectChain(ir::VarId attrs,
+                              const std::vector<nix::v3::ast::AttrName> & path,
+                              ir::VarId defaultVal, size_t idx)
+    {
+        if (idx == path.size()) return attrs;
+        const auto & step = path[idx];
+        bool dyn = step.expr != nullptr;
+        ir::SymbolId nm = dyn ? 0 : m.internSymbol(step.symbol);
+        ir::VarId nameVar = dyn ? lowerExpr(step.expr) : ir::kInvalid;
+        if (defaultVal != ir::kInvalid) {
+            ir::VarId hasIt = dyn ? addBinding(ir::HasAttrDyn{attrs, nameVar})
+                                  : addBinding(ir::HasAttr{attrs, nm});
+            auto thenB = m.freshBlock();
+            auto elseB = m.freshBlock();
+            blockStack.push_back(thenB);
+            ir::VarId got = dyn ? addBinding(ir::AttrSelectDyn{attrs, nameVar})
+                                : addBinding(ir::AttrSelect{attrs, nm});
+            setReturn(emitSelectChain(got, path, defaultVal, idx + 1));
+            blockStack.pop_back();
+            blockStack.push_back(elseB);
+            setReturn(forceVal(defaultVal));
+            blockStack.pop_back();
+            return addBinding(ir::If{hasIt, thenB, elseB});
+        }
+        ir::VarId v = dyn ? addBinding(ir::AttrSelectDyn{attrs, nameVar})
+                          : addBinding(ir::AttrSelect{attrs, nm});
+        return emitSelectChain(v, path, ir::kInvalid, idx + 1);
+    }
+
+    /// Phase 3a: `e ? a.b.c` — chain of HasAttr; short-circuit to false.
+    ir::VarId lowerHasAttr(const nix::v3::ast::OpHasAttr * e)
+    {
+        ir::VarId attrs = lowerExpr(e->e);
+        return hasAttrStep(attrs, e->path, 0);
+    }
+    ir::VarId hasAttrStep(ir::VarId cur, const std::vector<nix::v3::ast::AttrName> & path, size_t idx)
+    {
+        const auto & an = path[idx];
+        bool dyn = an.expr != nullptr;
+        ir::VarId nameVar = dyn ? lowerExpr(an.expr) : ir::kInvalid;
+        ir::SymbolId nm = dyn ? 0 : m.internSymbol(an.symbol);
+        ir::VarId hasIt = dyn ? addBinding(ir::HasAttrDyn{cur, nameVar})
+                              : addBinding(ir::HasAttr{cur, nm});
+        if (idx + 1 == path.size()) return hasIt;
+        auto thenB = m.freshBlock();
+        auto elseB = m.freshBlock();
+        blockStack.push_back(thenB);
+        ir::VarId got = dyn ? addBinding(ir::AttrSelectDyn{cur, nameVar})
+                            : addBinding(ir::AttrSelect{cur, nm});
+        setReturn(hasAttrStep(got, path, idx + 1));
+        blockStack.pop_back();
+        blockStack.push_back(elseB);
+        setReturn(addBinding(ir::LitBool{false}));
+        blockStack.pop_back();
+        return addBinding(ir::If{hasIt, thenB, elseB});
     }
 
     ir::Module run(const nix::v3::ast::Node * e)
