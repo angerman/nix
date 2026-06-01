@@ -29,10 +29,14 @@
 #include "v3/mark_sweep.hh"      // Stage 6 runMajorMarkSweep dispatch trigger
 #include "v3/live_trace.hh"      // Step 4 periodic L(t) trace dispatch hook
 
-#include "nix/expr/eval.hh"
-#include "nix/store/store-api.hh"
-#include "nix/util/canon-path.hh"
-#include "nix/util/eval-trace.hh"
+// FFI consolidation (audit Phase 2/3): vm.cc's only tree-walker touchpoints
+// are COLD FFI-leaf paths — store/path coercion + the TW-bridge call round-
+// trip.  The v3-native hot dispatch path (OP_FORCE, GET_LOCAL, native
+// OP_CALL) uses NONE of eval.hh/store-api.hh/canon-path.hh (verified by the
+// 2026-06-02 eval.hh-removal probe).  Those cold uses now route through
+// v3/ffi.hh shims; `nix::evalTrace::*` (hot guards) is re-exported INLINE by
+// ffi.hh as a Layer-0 util, so the dispatch loop stays zero-cost.
+#include "v3/ffi.hh"
 
 #include <algorithm>
 #include <atomic>
@@ -959,12 +963,8 @@ inline void requireNoStringContextRuntime(const Value & v,
     auto * raw = lookupStringContextEntries(v.payload.str);
     if (!raw || raw->empty()) return;
     std::string display = raw->front();
-    if (auto * ns = getNixEvalState()) {
-        try {
-            auto elem = nix::NixStringContextElem::parse(raw->front());
-            display = elem.display(*ns->store);
-        } catch (...) { /* keep raw fallback */ }
-    }
+    if (auto * ns = getNixEvalState())
+        display = ffi::displayContextElem(*ns, raw->front());
     // V3_DBG_NOCTX_SITE: see matching site in primops.cc.  Cold path.
     static const bool s_dbgNoCtxSite =
         std::getenv("V3_DBG_NOCTX_SITE") != nullptr;
@@ -1019,10 +1019,7 @@ inline std::string coerceToString(const Value & v, bool forceString)
                 // should match.  Note for the caller: this string carries
                 // an Opaque context entry for `storePath`; the caller is
                 // responsible for recording it (see OP_STR_CONCAT below).
-                nix::NixStringContext ctx;
-                nix::SourcePath sp(ns->rootFS, nix::CanonPath(p));
-                auto storePath = ns->copyPathToStore(ctx, sp);
-                return ns->store->printStorePath(storePath);
+                return ffi::coercePathToStore(*ns, p);
             }
         }
         return p;
@@ -4539,7 +4536,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // detect the re-entry and refuse cycle-prone paths
                 // (lambda-skip's body_fid invocation in particular).
                 ScopedActiveV3VM _activeV3VM(&vm);
-                ns->forceValue(*funTw, nix::noPos);
+                ffi::forceValue(*ns, *funTw);
 
                 // #466 OP_CALL Bridge round-trip elimination.
                 //
@@ -4599,8 +4596,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 static const bool s_dbg =
                     std::getenv("V3_DBG_OPCALL_BRIDGE") != nullptr;
                 if (s_dbg) {
-                    int twType = funTw->isValid()
-                        ? (int)funTw->type<true>() : -1;
+                    int twType = (int)ffi::valueType(funTw);
                     const LambdaDescriptor * d = nullptr;
                     if (vm.frames.back().closure)
                         d = vm.frames.back().closure->desc;
@@ -4628,10 +4624,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // snapshot copy.  Heap-allocate from the start; the
                 // address we hand off is the SAME one TW will
                 // update in place.
-                nix::Value * outTwHeap = ns->allocValue();
-                ns->callFunction(*funTw, *argTw, *outTwHeap, nix::noPos);
+                nix::Value * outTwHeap = ffi::allocValue(*ns);
+                ffi::callFunction(*ns, *funTw, *argTw, *outTwHeap);
                 Value v3out;
-                if (outTwHeap->type<true>() == nix::nThunk) {
+                if (ffi::valueType(outTwHeap) == ffi::TwType::Thunk) {
                     Thunk * bridge = Alloc::allocBridgeThunk(
                         static_cast<void *>(outTwHeap));
                     V3_STATS_INC(thunksAllocated);
@@ -9947,13 +9943,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // NixStringContextElem::to_string()/parse roundtrip.
                     // Exceptions propagate: tree-walker raises on missing
                     // paths during interpolation, so v3 must too.
-                    if (auto * ns = getNixEvalState()) {
-                        nix::NixStringContext tmp;
-                        nix::SourcePath sp(ns->rootFS,
-                                            nix::CanonPath(p.payload.path ? p.payload.path : ""));
-                        auto storePath = ns->copyPathToStore(tmp, sp);
-                        ctxAccum.push_back(std::string(storePath.to_string()));
-                    }
+                    if (auto * ns = getNixEvalState())
+                        ctxAccum.push_back(ffi::coercePathToStoreName(
+                            *ns, p.payload.path ? p.payload.path : ""));
                 }
                 out.append(coerceToString(p, forceStr));
             }
@@ -10266,7 +10258,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     try { \
                         auto * src = static_cast<nix::Value *>( \
                             (v).payload.thunk->bridgeSrc); \
-                        nix::ValueType tt = src->type(); \
+                        ffi::TwType tt = ffi::valueType(src); \
                         return (twTypePred); \
                     } catch (...) { return (fallback); } \
                   }()) \
@@ -10288,23 +10280,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 break; \
             }
         V3_IS_OP(OP_IS_NULL,
-            V3_BRIDGE_PEEK_OR(v, tt == nix::nNull,    v.isNull()))
+            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Null,    v.isNull()))
         V3_IS_OP(OP_IS_BOOL,
-            V3_BRIDGE_PEEK_OR(v, tt == nix::nBool,    v.isBool()))
+            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Bool,    v.isBool()))
         V3_IS_OP(OP_IS_INT,
-            V3_BRIDGE_PEEK_OR(v, tt == nix::nInt,     v.isInt()))
+            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Int,     v.isInt()))
         V3_IS_OP(OP_IS_FLOAT,
-            V3_BRIDGE_PEEK_OR(v, tt == nix::nFloat,   v.isFloat()))
+            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Float,   v.isFloat()))
         V3_IS_OP(OP_IS_STRING,
-            V3_BRIDGE_PEEK_OR(v, tt == nix::nString,  v.isString()))
+            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::String,  v.isString()))
         V3_IS_OP(OP_IS_PATH,
-            V3_BRIDGE_PEEK_OR(v, tt == nix::nPath,    v.isPath()))
+            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Path,    v.isPath()))
         V3_IS_OP(OP_IS_LIST,
-            V3_BRIDGE_PEEK_OR(v, tt == nix::nList,    v.isList()))
+            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::List,    v.isList()))
         V3_IS_OP(OP_IS_ATTRS,
-            V3_BRIDGE_PEEK_OR(v, tt == nix::nAttrs,   v.isAttrs()))
+            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Attrs,   v.isAttrs()))
         V3_IS_OP(OP_IS_FUNCTION,
-            V3_BRIDGE_PEEK_OR(v, tt == nix::nFunction,
+            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Function,
                 v.isClosure() || v.isPrimOp() || v.tag() == Tag::PrimOpApp))
         #undef V3_IS_OP
         #undef V3_BRIDGE_PEEK_OR
@@ -12689,7 +12681,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         if (auto * ns = getNixEvalState()) {
             auto * funTw = static_cast<nix::Value *>(
                 fun.payload.thunk->bridgeSrc);
-            ns->forceValue(*funTw, nix::noPos);
+            ffi::forceValue(*ns, *funTw);
             // Try the bridge1 shortcut to keep work on this vm.
             Value v3Fn;
             static const bool s_disabled =
@@ -12704,9 +12696,9 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             // #484 STG-style address identity: heap-allocate outTw
             // (see OP_CALL Bridge handler comment).  Preserves TW's
             // in-place thunk update across the bridge.
-            nix::Value * outTwHeap = ns->allocValue();
-            ns->callFunction(*funTw, *argTw, *outTwHeap, nix::noPos);
-            if (outTwHeap->type<true>() == nix::nThunk) {
+            nix::Value * outTwHeap = ffi::allocValue(*ns);
+            ffi::callFunction(*ns, *funTw, *argTw, *outTwHeap);
+            if (ffi::valueType(outTwHeap) == ffi::TwType::Thunk) {
                 Thunk * bridge = Alloc::allocBridgeThunk(
                     static_cast<void *>(outTwHeap));
                 V3_STATS_INC(thunksAllocated);

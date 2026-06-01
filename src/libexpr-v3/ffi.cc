@@ -35,7 +35,10 @@
 #include "nix/util/source-path.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/error.hh"
+#include "nix/util/canon-path.hh"          // CanonPath (coercePathToStore)
 #include "nix/expr/eval.hh"   // EvalState — ffi.cc is the one TU that wraps it
+#include "nix/expr/value/context.hh"       // NixStringContext(Elem) (path/ctx shims)
+#include "nix/store/store-api.hh"          // Store::printStorePath
 
 #include <atomic>
 #include <cstring>
@@ -60,6 +63,69 @@ void setTreeWalkerBuiltin(nix::EvalState & state, const std::string & name, nix:
 
 const nix::SymbolTable & symbols(nix::EvalState & state) { return state.symbols; }
 nix::PosTable &          positions(nix::EvalState & state) { return state.positions; }
+
+// --- TW value-graph probe + bridge round-trip (audit Phase 2/3) ---------
+
+TwType valueType(const nix::Value * v)
+{
+    // type<true>(): an invalid/blackholed cell maps to nThunk instead of
+    // asserting — matches the `type<true>()` call sites we replaced in vm.cc.
+    switch (v->type<true>()) {
+        case nix::nNull:     return TwType::Null;
+        case nix::nBool:     return TwType::Bool;
+        case nix::nInt:      return TwType::Int;
+        case nix::nFloat:    return TwType::Float;
+        case nix::nString:   return TwType::String;
+        case nix::nPath:     return TwType::Path;
+        case nix::nList:     return TwType::List;
+        case nix::nAttrs:    return TwType::Attrs;
+        case nix::nFunction: return TwType::Function;
+        case nix::nThunk:    return TwType::Thunk;
+        case nix::nExternal: return TwType::External;
+        case nix::nFailed:   return TwType::Other;  // evaluation-failed sentinel
+    }
+    return TwType::Other;  // unreachable; satisfies the non-void contract.
+}
+
+nix::Value * allocValue(nix::EvalState & state)
+{
+    return state.allocValue();
+}
+
+void callFunction(nix::EvalState & state, nix::Value & fun, nix::Value & arg, nix::Value & out)
+{
+    state.callFunction(fun, arg, out, nix::noPos);
+}
+
+std::string coercePathToStore(nix::EvalState & state, const std::string & path)
+{
+    // The local context is filled by copyPathToStore but discarded here;
+    // the v3 caller re-records the Opaque entry keyed on the store path
+    // (see vm.cc OP_STR_CONCAT).  Let exceptions propagate — TW raises on
+    // a missing path during interpolation and v3 must match.
+    nix::NixStringContext ctx;
+    nix::SourcePath sp(state.rootFS, nix::CanonPath(path));
+    auto storePath = state.copyPathToStore(ctx, sp);
+    return state.store->printStorePath(storePath);
+}
+
+std::string coercePathToStoreName(nix::EvalState & state, const std::string & path)
+{
+    nix::NixStringContext ctx;
+    nix::SourcePath sp(state.rootFS, nix::CanonPath(path));
+    auto storePath = state.copyPathToStore(ctx, sp);
+    return std::string(storePath.to_string());
+}
+
+std::string displayContextElem(nix::EvalState & state, const std::string & raw)
+{
+    try {
+        auto elem = nix::NixStringContextElem::parse(raw);
+        return elem.display(*state.store);
+    } catch (...) {
+        return raw;  // keep the raw form on a parse failure.
+    }
+}
 
 }  // namespace ffi
 

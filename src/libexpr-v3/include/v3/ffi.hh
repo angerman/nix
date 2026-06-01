@@ -65,6 +65,15 @@
 #include "nix/util/source-path.hh"
 #include "nix/util/hash.hh"        // Hash / HashAlgorithm — shared store/drv domain type
 #include "nix/store/path.hh"
+// Layer-0 util re-export: eval-trace.hh is a STANDALONE tracing facility
+// (it #includes only <cstdio>/<atomic>/<string>/… — zero coupling to the
+// tree-walker evaluator).  Re-exporting it here lets v3 TUs reach
+// `nix::evalTrace::{enabled,enterForce,leaveWhnf,formatPos,…}` INLINE
+// (the hot force/dispatch guards stay zero-cost) without each TU carrying
+// a direct `nix/util/eval-trace.hh` include the FFI lint would flag.  This
+// is the same pattern as hash.hh above — a shared Layer-0 util, NOT an
+// evaluator coupling, so it is not "include laundering".
+#include "nix/util/eval-trace.hh"
 
 // Forward declarations for types where opaque-by-pointer is sufficient.
 namespace nix {
@@ -113,6 +122,55 @@ void setTreeWalkerBuiltin(nix::EvalState & state, const std::string & name, nix:
 /// (once per eval), so out-of-line is perf-fine.
 const nix::SymbolTable & symbols(nix::EvalState & state);
 nix::PosTable &          positions(nix::EvalState & state);
+
+// -------------------------------------------------------------------------
+// TW value-graph probe + bridge round-trip primitives (audit Phase 2/3).
+//
+// These wrap the `nix::EvalState` / `nix::Value` operations vm.cc performs
+// ONLY on the FFI-leaf bridge paths (calling a tree-walker-bridged closure
+// from v3) and on store/path coercion.  The v3-native hot dispatch path
+// (OP_FORCE, GET_LOCAL, native OP_CALL) touches NONE of these — verified by
+// the eval.hh-removal probe (2026-06-02): all 9 nix::EvalState uses in
+// vm.cc are cold store-coercion or TW-bridge sites.  Each shim wraps an
+// already-expensive TW operation, so the out-of-line call is noise.
+// -------------------------------------------------------------------------
+
+/// v3-owned mirror of `nix::ValueType` so a consumer can branch on a TW
+/// value's type without naming `nix::ValueType` / the `nix::n*` enumerators
+/// (which live in value.hh).  `Other` covers invalid / external / unknown.
+enum class TwType { Null, Bool, Int, Float, String, Path, List, Attrs, Function, Thunk, External, Other };
+
+/// Type of a (possibly-unforced) TW value, via `Value::type<true>()` so an
+/// invalid/blackholed cell maps to `Thunk` rather than asserting.  Cold —
+/// only the v3↔TW bridge inspects TW value types.
+TwType valueType(const nix::Value * v);
+
+/// `state.allocValue()` — a heap TW value cell (the bridge needs a stable
+/// heap address TW updates in place; see vm.cc #484).  Cold/bridge only.
+nix::Value * allocValue(nix::EvalState & state);
+
+/// `state.callFunction(fun, arg, out, nix::noPos)` — invoke a TW function
+/// value.  Cold/bridge only (a v3 closure call never routes here).
+void callFunction(nix::EvalState & state, nix::Value & fun, nix::Value & arg, nix::Value & out);
+
+/// Coerce a filesystem path into the store and return its printed store
+/// path: `printStorePath(copyPathToStore(SourcePath(rootFS, CanonPath(p))))`.
+/// Keeps NixStringContext / SourcePath / CanonPath inside ffi.cc.  Cold —
+/// string-interpolation of a path literal (FFI leaf: store).
+std::string coercePathToStore(nix::EvalState & state, const std::string & path);
+
+/// Same store copy, but return the StorePath's `to_string()` basename
+/// (`<hash>-<name>`) — the encoded form an Opaque string-context entry
+/// uses (NixStringContextElem round-trips it).  Used by OP_STR_CONCAT to
+/// record the context for an interpolated path literal.  Cold (FFI leaf:
+/// store).
+std::string coercePathToStoreName(nix::EvalState & state, const std::string & path);
+
+/// Render a single raw string-context entry for an error message:
+/// `NixStringContextElem::parse(raw).display(*store)`.  Falls back to `raw`
+/// on a parse failure.  Cold — only the "not allowed to refer to a store
+/// path" diagnostic uses it.
+std::string displayContextElem(nix::EvalState & state, const std::string & raw);
 
 }  // namespace ffi
 

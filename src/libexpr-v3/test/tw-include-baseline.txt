@@ -18,6 +18,5 @@
 
 # --- Category C/D pinch: eval.hh / value.hh / shared types (Phase 2/3) ---
 primops.cc
-vm.cc
 v3_call_flake.cc
 cli/v3-eval.cc
