@@ -26,8 +26,8 @@
 
 %skeleton "lalr1.cc"
 %require "3.0"
-%define api.namespace { nix::v3::spike }
-%define api.parser.class { SpikeParser }
+%define api.namespace { nix::v3::parser }
+%define api.parser.class { Parser }
 %define api.value.type variant
 %define parse.error detailed
 %parse-param { void * scanner }
@@ -50,8 +50,8 @@
 }
 
 %code {
-  #include "v3-spike-tab.hh"
-  int yylex(nix::v3::spike::SpikeParser::value_type * yylval, yyscan_t scanner);
+  #include "v3-parser-tab.hh"
+  int yylex(nix::v3::parser::Parser::value_type * yylval, yyscan_t scanner);
   using namespace nix::v3::ast;
 }
 
@@ -421,7 +421,7 @@ string_attr
 
 %%
 
-void nix::v3::spike::SpikeParser::error(const std::string & msg)
+void nix::v3::parser::Parser::error(const std::string & msg)
 {
     throw nix::v3::ast::ParseError("v3 parse error: " + msg, 0);
 }

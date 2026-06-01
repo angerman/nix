@@ -371,29 +371,29 @@ test(
 )
 
 # Parser project Stage 1.3 (PARSER_PROJECT_PLAN_2026-06-01) — bison/flex
-# toolchain spike.  Minimal arithmetic grammar (parser/v3-spike.{y,l})
+# grammar (parser/v3-parser.{y,l})
 # emitting v3 AST, to de-risk the bison/flex -> v3 build integration
 # BEFORE the full parser.y action rewrite (Stage 1.4).  Mirrors the
 # libexpr custom_target wiring; unity=off because unity builds break
 # the recursive flex/bison generated-header dependency (libexpr
 # meson.build:238).
-v3_spike_tab = custom_target(
-  'v3-spike-tab',
-  input : 'parser/v3-spike.y',
-  output : ['v3-spike-tab.cc', 'v3-spike-tab.hh'],
+v3_parser_tab = custom_target(
+  'v3-parser-tab',
+  input : 'parser/v3-parser.y',
+  output : ['v3-parser-tab.cc', 'v3-parser-tab.hh'],
   command : ['bison', '-o', '@OUTPUT0@', '@INPUT@', '-d'],
 )
-v3_spike_lex = custom_target(
-  'v3-spike-lex',
-  input : ['parser/v3-spike.l', v3_spike_tab],
-  output : ['v3-spike-lex.cc', 'v3-spike-lex.hh'],
+v3_parser_lex = custom_target(
+  'v3-parser-lex',
+  input : ['parser/v3-parser.l', v3_parser_tab],
+  output : ['v3-parser-lex.cc', 'v3-parser-lex.hh'],
   command : ['flex', '--outfile', '@OUTPUT0@', '--header-file=@OUTPUT1@', '@INPUT0@'],
 )
-v3_parser_spike_test = executable(
-  'v3-parser-spike-test',
-  'test/parser-spike-test.cc',
-  v3_spike_tab,
-  v3_spike_lex,
+v3_parser_test = executable(
+  'v3-parser-test',
+  'test/parser-test.cc',
+  v3_parser_tab,
+  v3_parser_lex,
   include_directories : [include_dirs, include_directories('parser')],
   override_options : ['unity=off'],
   install : false,
@@ -404,15 +404,15 @@ v3_parser_spike_test = executable(
 v3_parse = executable(
   'v3-parse',
   'cli/v3-parse.cc',
-  v3_spike_tab,
-  v3_spike_lex,
+  v3_parser_tab,
+  v3_parser_lex,
   include_directories : [include_dirs, include_directories('parser')],
   override_options : ['unity=off'],
   install : false,
 )
 test(
-  'v3-parser-spike-test',
-  v3_parser_spike_test,
+  'v3-parser-test',
+  v3_parser_test,
   # Sweep the precedence + tier3 fixture batteries (Stage 1.4
   # validation): the test parses each fixture .nix via the v3 parser
   # and byte-compares show() to the committed .exp golden.

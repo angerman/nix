@@ -1,6 +1,6 @@
 /* v3 parser Stage 1.4 — Tier-1 lexer (expression core).
  *
- * Reentrant flex scanner for the Tier-1 grammar (v3-spike.y): integer +
+ * Reentrant flex scanner for the Tier-1 grammar (v3-parser.y): integer +
  * float literals, identifiers, the if/then/else + or keywords, the
  * operator tokens, parens, and `:`/`.`/`?`.  Token rules transcribed
  * from lexer.l's DEFAULT state (keywords lexer.l:127-136, operators
@@ -32,9 +32,9 @@
 %x INPATH_SLASH
 
 %top {
-  // Brings in v3-spike-tab.hh + defines YYSTYPE (the parser variant
+  // Brings in v3-parser-tab.hh + defines YYSTYPE (the parser variant
   // value_type) which the bison-bridge scanner references for yylval.
-  #include "v3-spike-decls.hh"
+  #include "v3-parser-decls.hh"
 }
 
 %{
@@ -92,40 +92,40 @@ URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~
 %%
 
   /* keywords (before ID; see header note) */
-"if"        { return nix::v3::spike::SpikeParser::token::IF; }
-"then"      { return nix::v3::spike::SpikeParser::token::THEN; }
-"else"      { return nix::v3::spike::SpikeParser::token::ELSE; }
-"assert"    { return nix::v3::spike::SpikeParser::token::ASSERT; }
-"with"      { return nix::v3::spike::SpikeParser::token::WITH; }
-"let"       { return nix::v3::spike::SpikeParser::token::LET; }
-"in"        { return nix::v3::spike::SpikeParser::token::IN_KW; }
-"rec"       { return nix::v3::spike::SpikeParser::token::REC; }
-"inherit"   { return nix::v3::spike::SpikeParser::token::INHERIT; }
-"or"        { return nix::v3::spike::SpikeParser::token::OR_KW; }
+"if"        { return nix::v3::parser::Parser::token::IF; }
+"then"      { return nix::v3::parser::Parser::token::THEN; }
+"else"      { return nix::v3::parser::Parser::token::ELSE; }
+"assert"    { return nix::v3::parser::Parser::token::ASSERT; }
+"with"      { return nix::v3::parser::Parser::token::WITH; }
+"let"       { return nix::v3::parser::Parser::token::LET; }
+"in"        { return nix::v3::parser::Parser::token::IN_KW; }
+"rec"       { return nix::v3::parser::Parser::token::REC; }
+"inherit"   { return nix::v3::parser::Parser::token::INHERIT; }
+"or"        { return nix::v3::parser::Parser::token::OR_KW; }
 
   /* multi-char operators (before single-char so they win) */
-"=="        { return nix::v3::spike::SpikeParser::token::EQ; }
-"!="        { return nix::v3::spike::SpikeParser::token::NEQ; }
-"<="        { return nix::v3::spike::SpikeParser::token::LEQ; }
-">="        { return nix::v3::spike::SpikeParser::token::GEQ; }
-"&&"        { return nix::v3::spike::SpikeParser::token::AND; }
-"||"        { return nix::v3::spike::SpikeParser::token::OR; }
-"->"        { return nix::v3::spike::SpikeParser::token::IMPL; }
-"//"        { return nix::v3::spike::SpikeParser::token::UPDATE; }
-"++"        { return nix::v3::spike::SpikeParser::token::CONCAT; }
-"..."       { return nix::v3::spike::SpikeParser::token::ELLIPSIS; }  /* formals (lexer.l:137) */
+"=="        { return nix::v3::parser::Parser::token::EQ; }
+"!="        { return nix::v3::parser::Parser::token::NEQ; }
+"<="        { return nix::v3::parser::Parser::token::LEQ; }
+">="        { return nix::v3::parser::Parser::token::GEQ; }
+"&&"        { return nix::v3::parser::Parser::token::AND; }
+"||"        { return nix::v3::parser::Parser::token::OR; }
+"->"        { return nix::v3::parser::Parser::token::IMPL; }
+"//"        { return nix::v3::parser::Parser::token::UPDATE; }
+"++"        { return nix::v3::parser::Parser::token::CONCAT; }
+"..."       { return nix::v3::parser::Parser::token::ELLIPSIS; }  /* formals (lexer.l:137) */
   /* pipe operators (lexer.l:148-153).  TW gates these on the
    * `pipe-operators` experimental feature; the spike does not gate
    * (feature policy is an integration concern, not a parse concern). */
-"<|"        { return nix::v3::spike::SpikeParser::token::PIPE_FROM; }
-"|>"        { return nix::v3::spike::SpikeParser::token::PIPE_INTO; }
+"<|"        { return nix::v3::parser::Parser::token::PIPE_FROM; }
+"|>"        { return nix::v3::parser::Parser::token::PIPE_INTO; }
 
 {ID}        { yylval->emplace<std::string>(yytext, (size_t) yyleng);
-              return nix::v3::spike::SpikeParser::token::ID; }
+              return nix::v3::parser::Parser::token::ID; }
 {INT}       { yylval->emplace<int64_t>(std::strtoll(yytext, nullptr, 10));
-              return nix::v3::spike::SpikeParser::token::INT_LIT; }
+              return nix::v3::parser::Parser::token::INT_LIT; }
 {FLOAT}     { yylval->emplace<double>(std::strtod(yytext, nullptr));
-              return nix::v3::spike::SpikeParser::token::FLOAT_LIT; }
+              return nix::v3::parser::Parser::token::FLOAT_LIT; }
 
   /* String literals (mirrors lexer.l:190-200).  `"` opens the STRING
    * exclusive state; `${` inside opens DEFAULT for the embedded expr;
@@ -136,9 +136,9 @@ URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~
 <STRING>([^\$\"\\]|\$[^\{\"\\]|\\{ANY}|\$\\{ANY})*\$/\" |
 <STRING>([^\$\"\\]|\$[^\{\"\\]|\\{ANY}|\$\\{ANY})+ {
               yylval->emplace<std::string>(v3UnescapeStr(yytext, (size_t) yyleng));
-              return nix::v3::spike::SpikeParser::token::STR;
+              return nix::v3::parser::Parser::token::STR;
             }
-<STRING>\$\{  { PUSH_STATE(DEFAULT); return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY; }
+<STRING>\$\{  { PUSH_STATE(DEFAULT); return nix::v3::parser::Parser::token::DOLLAR_CURLY; }
 <STRING>\"    { POP_STATE(); return '"'; }
 
   /* Indented strings `''…''` (mirrors lexer.l:209-232).  IND_STRING_OPEN
@@ -148,25 +148,25 @@ URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~
    * `''$`/`$` -> literal `$`, `'''` -> `''`, `''\x` -> unescaped x, lone
    * `'` -> `'` all set false.  `${` opens an antiquotation (push DEFAULT);
    * `''` closes (pop). */
-\'\'(\ *\n)?  { PUSH_STATE(IND_STRING); return nix::v3::spike::SpikeParser::token::IND_STRING_OPEN; }
+\'\'(\ *\n)?  { PUSH_STATE(IND_STRING); return nix::v3::parser::Parser::token::IND_STRING_OPEN; }
 <IND_STRING>([^\$\']|\$[^\{\']|\'[^\'\$])+ {
                 yylval->emplace<nix::v3::ast::IndStr>(
                     nix::v3::ast::IndStr{std::string(yytext, (size_t) yyleng), /*hasIndentation=*/true});
-                return nix::v3::spike::SpikeParser::token::IND_STR;
+                return nix::v3::parser::Parser::token::IND_STR;
               }
 <IND_STRING>\'\'\$ |
 <IND_STRING>\$  { yylval->emplace<nix::v3::ast::IndStr>(nix::v3::ast::IndStr{std::string("$"), false});
-                return nix::v3::spike::SpikeParser::token::IND_STR; }
+                return nix::v3::parser::Parser::token::IND_STR; }
 <IND_STRING>\'\'\' { yylval->emplace<nix::v3::ast::IndStr>(nix::v3::ast::IndStr{std::string("''"), false});
-                return nix::v3::spike::SpikeParser::token::IND_STR; }
+                return nix::v3::parser::Parser::token::IND_STR; }
 <IND_STRING>\'\'\\{ANY} {
                 yylval->emplace<nix::v3::ast::IndStr>(
                     nix::v3::ast::IndStr{v3UnescapeStr(yytext + 2, (size_t) yyleng - 2), false});
-                return nix::v3::spike::SpikeParser::token::IND_STR; }
-<IND_STRING>\$\{ { PUSH_STATE(DEFAULT); return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY; }
-<IND_STRING>\'\' { POP_STATE(); return nix::v3::spike::SpikeParser::token::IND_STRING_CLOSE; }
+                return nix::v3::parser::Parser::token::IND_STR; }
+<IND_STRING>\$\{ { PUSH_STATE(DEFAULT); return nix::v3::parser::Parser::token::DOLLAR_CURLY; }
+<IND_STRING>\'\' { POP_STATE(); return nix::v3::parser::Parser::token::IND_STRING_CLOSE; }
 <IND_STRING>\'  { yylval->emplace<nix::v3::ast::IndStr>(nix::v3::ast::IndStr{std::string("'"), false});
-                return nix::v3::spike::SpikeParser::token::IND_STR; }
+                return nix::v3::parser::Parser::token::IND_STR; }
 
   /* Paths (mirrors lexer.l:235-315).  Three states: PATH_START handles a
    * path that STARTS with an antiquotation segment (`./${x}`, `~/${x}`)
@@ -182,12 +182,12 @@ URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~
 <PATH_START>{PATH_SEG} {
                 POP_STATE(); PUSH_STATE(INPATH_SLASH);
                 yylval->emplace<std::string>(yytext, (size_t) yyleng);
-                return nix::v3::spike::SpikeParser::token::PATH;
+                return nix::v3::parser::Parser::token::PATH;
               }
 <PATH_START>{HPATH_START} {
                 POP_STATE(); PUSH_STATE(INPATH_SLASH);
                 yylval->emplace<std::string>(yytext, (size_t) yyleng);
-                return nix::v3::spike::SpikeParser::token::HPATH;
+                return nix::v3::parser::Parser::token::HPATH;
               }
 <PATH_START>{ANY} |
 <PATH_START><<EOF>> {
@@ -199,31 +199,31 @@ URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~
                 if (yytext[yyleng-1] == '/') PUSH_STATE(INPATH_SLASH);
                 else                         PUSH_STATE(INPATH);
                 yylval->emplace<std::string>(yytext, (size_t) yyleng);
-                return nix::v3::spike::SpikeParser::token::PATH;
+                return nix::v3::parser::Parser::token::PATH;
               }
 {HPATH} {
                 if (yytext[yyleng-1] == '/') PUSH_STATE(INPATH_SLASH);
                 else                         PUSH_STATE(INPATH);
                 yylval->emplace<std::string>(yytext, (size_t) yyleng);
-                return nix::v3::spike::SpikeParser::token::HPATH;
+                return nix::v3::parser::Parser::token::HPATH;
               }
 <INPATH,INPATH_SLASH>\$\{ {
                 POP_STATE(); PUSH_STATE(INPATH); PUSH_STATE(DEFAULT);
-                return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY;
+                return nix::v3::parser::Parser::token::DOLLAR_CURLY;
               }
 <INPATH,INPATH_SLASH>{PATH}|{PATH_SEG}|{PATH_CHAR}+ {
                 POP_STATE();
                 if (yytext[yyleng-1] == '/') PUSH_STATE(INPATH_SLASH);
                 else                         PUSH_STATE(INPATH);
                 yylval->emplace<std::string>(yytext, (size_t) yyleng);
-                return nix::v3::spike::SpikeParser::token::STR;
+                return nix::v3::parser::Parser::token::STR;
               }
 <INPATH>{ANY} |
 <INPATH><<EOF>> {
                 /* non-path char ends the path: emit PATH_END + re-parse
                  * the char in the default context (lexer.l:296-305). */
                 POP_STATE(); yyless(0);
-                return nix::v3::spike::SpikeParser::token::PATH_END;
+                return nix::v3::parser::Parser::token::PATH_END;
               }
 <INPATH_SLASH>{ANY} |
 <INPATH_SLASH><<EOF>> {
@@ -231,13 +231,13 @@ URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~
               }
 {SPATH} {
                 yylval->emplace<std::string>(yytext, (size_t) yyleng);
-                return nix::v3::spike::SpikeParser::token::SPATH;
+                return nix::v3::parser::Parser::token::SPATH;
               }
 {URI} {
                 // URL literal (lexer.l:316) -> a string (parser.y:372);
                 // the deprecation lint is omitted (diagnostic only).
                 yylval->emplace<std::string>(yytext, (size_t) yyleng);
-                return nix::v3::spike::SpikeParser::token::URI;
+                return nix::v3::parser::Parser::token::URI;
               }
 
   /* `${` in the default context = a dynamic attr key / select / has-attr
@@ -247,7 +247,7 @@ URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~
    * STRING-state `${` is handled by the <STRING> rule above; this one
    * is for `${` OUTSIDE a string literal.)  2-char match beats the
    * `$` fall-through by flex longest-match. */
-\$\{        { PUSH_STATE(DEFAULT); return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY; }
+\$\{        { PUSH_STATE(DEFAULT); return nix::v3::parser::Parser::token::DOLLAR_CURLY; }
 
   /* state-managed braces (mirrors lexer.l:184-188): `{` pushes DEFAULT
    * so the contents lex with the inclusive-state rules; `}` pops

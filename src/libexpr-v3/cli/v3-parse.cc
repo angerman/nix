@@ -19,8 +19,8 @@
 
 #include "v3/ast/expr.hh"
 #include "parser-state.hh"
-#include "v3-spike-decls.hh"  // v3-spike-tab.hh + YYSTYPE
-#include "v3-spike-lex.hh"    // flex reentrant decls (needs YYSTYPE)
+#include "v3-parser-decls.hh"  // v3-parser-tab.hh + YYSTYPE
+#include "v3-parser-lex.hh"    // flex reentrant decls (needs YYSTYPE)
 
 #include <cstdio>
 #include <cstdlib>
@@ -38,7 +38,7 @@ static Node * v3parse(ParserState & st, const std::string & text)
     yyscan_t scanner;
     yylex_init(&scanner);
     YY_BUFFER_STATE buf = yy_scan_string(text.c_str(), scanner);
-    nix::v3::spike::SpikeParser parser(scanner, &st);
+    nix::v3::parser::Parser parser(scanner, &st);
     parser.parse();
     yy_delete_buffer(buf, scanner);
     yylex_destroy(scanner);

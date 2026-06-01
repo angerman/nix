@@ -1,7 +1,18 @@
 # v3-native parser (in-progress)
 
 **Project plan:** [`../lode/PARSER_PROJECT_PLAN_2026-06-01.md`](../lode/PARSER_PROJECT_PLAN_2026-06-01.md)
-**Status:** SCAFFOLDING — files copied from upstream as Stage 1 starting point.  Action rewrite NOT yet begun.
+**Status:** **Stage 1 COMPLETE.** `parser/v3-parser.{y,l}` is the real
+v3-native parser (renamed from the `v3-spike` toolchain probe).  Full
+Nix grammar (all 27 AST kinds, all 7 flex states, all ParserState
+helpers); `show()` byte-equal to `nix-instantiate --parse` on
+**151/151** synthetic fixtures, **260/273** lang files (0 parse
+divergences), and **547/547** nixpkgs `lib/` + `build-support/` files
+(0 divergences) — every non-match is bindVars (Stage 2).  See the
+per-tier sections below; the historical scaffolding notes that follow
+describe the original plan and are kept for context.
+
+Remaining: **Stage 2** — bindVars (variable→De-Bruijn) + collapse the
+v3 AST to IR (replacing `lower.cc`'s `nix::Expr` path) + wire into eval.
 
 ## Files
 
@@ -142,23 +153,23 @@ today — a Stage 1.4 integration decision).
 
 ### Stage 1.3 status — bison/flex toolchain WIRED (spike green)
 
-The bison/flex → v3 build integration is proven.  `parser/v3-spike.{y,l}`
+The bison/flex → v3 build integration is proven.  `parser/v3-parser.{y,l}`
 is a minimal arithmetic grammar (same lalr1.cc skeleton +
 `api.value.type variant` as the real parser.y, minus locations)
-emitting v3 AST; `test/parser-spike-test.cc` parses it and asserts
+emitting v3 AST; `test/parser-test.cc` parses it and asserts
 `show()` byte-equal to `nix-instantiate --parse` (**6/6**: `1 + 2 * 3`
 → `(1 + (__mul 2 3))`, etc.).  Wired via meson custom_target
-(`v3-spike-tab`, `v3-spike-lex`) mirroring libexpr, `unity=off`.
+(`v3-parser-tab`, `v3-parser-lex`) mirroring libexpr, `unity=off`.
 
 This retires the #1 project risk — the toolchain path (bison/flex in
 devshell → meson → generated C++ compiles → flex/bison glue
-[`v3-spike-decls.hh` YYSTYPE] → links → runs → v3 AST) all works.
+[`v3-parser-decls.hh` YYSTYPE] → links → runs → v3 AST) all works.
 Integration gotchas locked: `-Wswitch-enum` pragma in `%code requires`
 (matches parser.y:17), `unity=off`, and the YYSTYPE glue header.
 
 ### Stage 1.4 status — Tier 1 (expression core) LANDED
 
-`parser/v3-spike.{y,l}` grew from the arithmetic toolchain spike into
+`parser/v3-parser.{y,l}` grew from the arithmetic toolchain spike into
 the real parser's **expression core**, transcribing parser.y's
 productions + precedence VERBATIM (so `%expect 0` holds) and rewriting
 only the actions to emit v3 AST.
@@ -169,7 +180,7 @@ and unary `-` → `__sub 0` desugarings), application (flattened via
 `makeCall`), select (`.` + `or`), has-attr (`?`), simple lambda
 (`x: body`), and `if/then/else`.
 
-Validated by `test/parser-spike-test.cc` (**54/54**): 5 arithmetic
+Validated by `test/parser-test.cc` (**54/54**): 5 arithmetic
 sanity + a sweep of all **49 operator-precedence fixtures**
 (test/parser-ti/fixtures/precedence) byte-equal to `nix-instantiate
 --parse`.  No bison conflicts (faithful transcription preserved
@@ -177,18 +188,18 @@ parser.y's `%expect 0`).
 
 ### Stage 1.4 Tier 3-lite — lists, attrsets, let/with/assert LANDED
 
-`v3-spike.{y,l}` gained: lists (`[ ... ]`), attrsets (`{ attrpath =
+`v3-parser.{y,l}` gained: lists (`[ ... ]`), attrsets (`{ attrpath =
 expr; }`, `rec`, empty) wiring the proven `addAttr` (so `{ a.b=1;
 a.c=2; }` → nested merge works through the grammar), `let ... in`,
 `with`, `assert`.  No new lexer states (DEFAULT-state tokens +
 let/in/with/assert/rec keywords + `{ } [ ] ; = ,`).  Still `%expect 0`.
 
 Validated by the new tier3 battery (test/parser-ti/fixtures/tier3, 13
-fixtures) — total parser-spike-test now **67/67** byte-equal to TW.
+fixtures) — total parser-test now **67/67** byte-equal to TW.
 
 ### Stage 1.4 Tier 2 — strings + antiquotation LANDED
 
-`v3-spike.{y,l}` gained string literals + interpolation: the flex
+`v3-parser.{y,l}` gained string literals + interpolation: the flex
 `STRING` exclusive state (`%option stack`), `${...}` antiquotation
 push/pop (`${` pushes DEFAULT, `}` pops), the two content rules
 (general + trailing-`$`), `v3UnescapeStr` (port of lexer.l:48-75), and
@@ -196,7 +207,7 @@ the `string_parts`/`string_parts_interpolated` grammar (interpolation
 → `ConcatStrings` with `forceString=true`).  `{`/`}` are now
 state-managed (mirror lexer.l).  Still `%expect 0`.
 
-Validated by the tier2 battery (12 fixtures) — total parser-spike-test
+Validated by the tier2 battery (12 fixtures) — total parser-test
 now **79/79** byte-equal to TW: plain/empty strings, `\n`/`\"`/`\$`
 escapes, mid/start/only/multi interpolation, strings in lists + attrs.
 
@@ -210,7 +221,7 @@ parser.y:477-535 (incl. the `binds`-not-`binds1` accumulator on the
 INHERIT productions so `{ inherit a; }` parses via empty-binds).  Still
 `%expect 0`.
 
-Validated by the tier3b battery (9 fixtures) — total parser-spike-test
+Validated by the tier3b battery (9 fixtures) — total parser-test
 now **88/88** byte-equal to TW: `inherit a;`, `inherit a b;`,
 `inherit (x) a b;`, combined inherit + inherit-from in one set,
 empty `inherit;` (→ `{ }`), inherit-in-`let`, inherit-in-`rec`, and the
@@ -233,7 +244,7 @@ non-identifiers — `{ "foo" = 1; }` shows as `{ foo = 1; }` but
 stay quoted.  Routed through `showBindings` (plain + inherit names) and
 `showAttrPath` (select/has-attr static symbols).
 
-Validated by the tier3c battery (12 fixtures) — total parser-spike-test
+Validated by the tier3c battery (12 fixtures) — total parser-test
 now **100/100** byte-equal to TW: static string keys (ident-collapse +
 quoted), `${e}` dynamic keys, nested + mixed static/dynamic paths,
 interpolated keys (`"pre${x}"` → `"${("pre" + x)}"`), and dynamic/string
@@ -250,7 +261,7 @@ the proven `ParserState::validateFormals` (dup-arg + `@`-collision) and a
 and `@`.  **`%expect 0` survives the `{`-attrset-vs-formal-set
 disambiguation** in the subset grammar — the chief formals risk, cleared.
 
-Validated by the tier4 battery (14 fixtures) — total parser-spike-test
+Validated by the tier4 battery (14 fixtures) — total parser-test
 now **114/114** byte-equal to TW: single/multi formals, defaults (incl.
 default referencing another formal), ellipsis (`...` / `a, ...`), empty
 `{ }` (→ two-space `{  }`), `@`-binding both positions (TW normalizes
@@ -270,7 +281,7 @@ lone `'`→`'` set false; `${` opens an antiquotation, `''` closes.  The
 `pos` into the `forceString` arg slot; now explicit `forceString=true`,
 matching parser-state.hh.upstream:428).  Still `%expect 0`.
 
-Validated by the tier4b battery (9 fixtures) — total parser-spike-test
+Validated by the tier4b battery (9 fixtures) — total parser-test
 now **123/123** byte-equal to TW: `''foo''`, empty `''''`, multiline
 dedent (uneven indent), the `''$`/`'''` escapes, `${x}` interpolation
 (single + multiline).  This completes the strings story (plain +
@@ -294,7 +305,7 @@ productions (`path_start PATH_END`, interpolated, SPATH→`__findFile`).
   as literals — verified no-crash) but their RESOLUTION is DEFERRED to
   integration, where a real file supplies basePath.
 
-Validated by the tier4c battery (9 fixtures) — total parser-spike-test
+Validated by the tier4c battery (9 fixtures) — total parser-test
 now **132/132** byte-equal to TW: abs simple/multi/deep, CanonPath
 `.`/`..` collapse, `<nixpkgs>`/`<a/b>`, abs-interpolated `/foo/${x}`,
 path-as-application-arg.  The trailing-slash cases `/foo/` + `/a//b` are
@@ -311,7 +322,7 @@ The remaining expr-grammar warts:
   (AST/show() identical).
 * `let { … }` (parser.y:386) — desugars to `(rec { … }).body`.
 
-Validated by the tier4d battery (9 fixtures) — total parser-spike-test
+Validated by the tier4d battery (9 fixtures) — total parser-test
 now **141/141** byte-equal to TW: `a |> b`→`(b a)`, `a <| b`→`(a b)`,
 pipe chains both directions, `f or`→`(f or)`, `let { body = 1; }`→
 `(rec { body = 1; }).body`.  **The expr grammar surface is now complete**
@@ -334,7 +345,7 @@ rejected** (the 2 remainders are bindVars too).
 
 The sweep surfaced + fixed **6 parser correctness gaps** the synthetic
 fixtures never exercised — all now regression-guarded by the tier5
-battery (**parser-spike-test = 151/151**):
+battery (**parser-test = 151/151**):
 1. **block comments** `/* … */` (incl. `/** doc */`) — lexer.l:343
 2. **URL literals** `http://…` → string — the `URI` token (lexer.l:316)
 3. **string-keyed inherit** `inherit (e) "x"` / `${"x"}` — `attrs
@@ -350,11 +361,11 @@ battery (**parser-spike-test = 151/151**):
 ### Remaining (Stage 2)
 
 bindVars (variable→De-Bruijn resolution) + collapse the v3 AST to IR
-(replacing lower.cc's `nix::Expr` path); rename v3-spike → v3-parser;
+(replacing lower.cc's `nix::Expr` path); rename v3-parser → v3-parser;
 optional opt-in via `NIX_V3_NATIVE_PARSER=1` in v3-eval.
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;
   validate the 68 fixtures + 263-file sweep + 143 lang tests; rename
-  v3-spike → v3-parser; retire the throwaway arithmetic framing.
+  v3-parser → v3-parser; retire the throwaway arithmetic framing.
 
 ## How to inspect upstream actions
 
