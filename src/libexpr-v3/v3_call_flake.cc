@@ -35,7 +35,7 @@
 // PARSER_PROJECT_PLAN §5.3 site 4: native parse+lower of call-flake.nix.
 #include "v3-parse-api.hh"   // nix::v3::parser::parseString
 #include "lower_v3.hh"       // canLowerV3 + lowerV3Ast
-#include "v3-to-nixexpr.hh"  // toNixExpr (bridge fallback) + twBaseEnvGlobals
+#include "v3/tw_baseenv.hh"  // twBaseEnvGlobals (free-name resolution)
 #include "nix/util/users.hh" // getHome()
 
 #include "nix/expr/eval.hh"
@@ -143,18 +143,17 @@ struct CachedCallFlake {
             bool useNativeLower = false;
             nix::v3::ast::ParserState v3st;
             std::optional<nix::PosTable::Origin> nativeOrigin;
-            if (s_nativeParser) {
+            if (s_nativeParser && s_nativeLower) {
                 v3st.homePath = s_homePath;
                 nix::v3::parser::parseString(v3st, std::string(callFlakeSource));
-                auto src = nix::make_ref<std::string>(callFlakeSource);
-                auto origin = ns.positions.addOrigin(
-                    nix::Pos::String{.source = src}, src->size());
-                if (s_nativeLower && nix::v3::canLowerV3(v3st.result)) {
+                if (nix::v3::canLowerV3(v3st.result)) {
                     useNativeLower = true;
-                    nativeOrigin.emplace(origin);
-                } else {
-                    e = nix::v3::toNixExpr(ns, v3st.result, origin);
-                }
+                    auto src = nix::make_ref<std::string>(callFlakeSource);
+                    nativeOrigin.emplace(ns.positions.addOrigin(
+                        nix::Pos::String{.source = src}, src->size()));
+                } else  // native lowering can't handle it → TW re-parse
+                    e = ns.parseExprFromString(
+                        callFlakeSource, ns.rootPath("/«v3-call-flake»"));
             } else {
                 e = ns.parseExprFromString(
                     callFlakeSource, ns.rootPath("/«v3-call-flake»"));

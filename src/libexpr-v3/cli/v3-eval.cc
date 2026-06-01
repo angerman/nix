@@ -54,7 +54,7 @@
 #include "v3/ast/expr.hh"
 #include "parser-state.hh"
 #include "v3-parse-api.hh"     // nix::v3::parser::parseString (shared glue)
-#include "v3-to-nixexpr.hh"
+#include "v3/tw_baseenv.hh"    // twBaseEnvGlobals (free-name resolution)
 #include "lower_v3.hh"         // native v3 AST -> IR lowering (Stage 2)
 
 #include <nlohmann/json.hpp>
@@ -303,14 +303,17 @@ int main(int argc, char ** argv)
                 v3st.basePath = abs.parent_path().string();
                 v3st.homePath = homePath;
                 v3ParseInto(v3st, text);
-                // Same origin TW uses (Pos::Origin(path)) so attr/formal
-                // positions (unsafeGetAttrPos) match byte-for-byte.
-                auto po = state.positions.addOrigin(nix::Pos::Origin(sp), text.size());
-                if (s_nativeLower && !parseOnly && nix::v3::canLowerV3(v3st.result)) {
+                // --parse shows the native AST directly (below).  For eval:
+                // native-lower when supported, else TW re-parse (ground
+                // truth) → lowerNixExpr — NO AST→nix::Expr bridge.
+                if (!parseOnly && s_nativeLower && nix::v3::canLowerV3(v3st.result)) {
                     useNativeLower = true;
-                    nativeOrigin.emplace(po);
-                } else
-                    e = nix::v3::toNixExpr(state, v3st.result, po);
+                    // Same origin TW uses (Pos::Origin(sp)) so attr/formal
+                    // positions (unsafeGetAttrPos) match byte-for-byte.
+                    nativeOrigin.emplace(state.positions.addOrigin(
+                        nix::Pos::Origin(sp), text.size()));
+                } else if (!parseOnly)
+                    e = state.parseExprFromFile(sp);
             } else
                 e = state.parseExprFromFile(sp);
         } else {
@@ -326,33 +329,30 @@ int main(int argc, char ** argv)
                 v3st.basePath = cwd;
                 v3st.homePath = homePath;
                 v3ParseInto(v3st, expr);
-                auto po = state.positions.addOrigin(
-                    nix::Pos::String{.source = nix::make_ref<std::string>(expr)}, expr.size());
-                if (s_nativeLower && !parseOnly && nix::v3::canLowerV3(v3st.result)) {
+                if (!parseOnly && s_nativeLower && nix::v3::canLowerV3(v3st.result)) {
                     useNativeLower = true;
-                    nativeOrigin.emplace(po);
-                } else
-                    e = nix::v3::toNixExpr(state, v3st.result, po);
+                    nativeOrigin.emplace(state.positions.addOrigin(
+                        nix::Pos::String{.source = nix::make_ref<std::string>(expr)},
+                        expr.size()));
+                } else if (!parseOnly)
+                    e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath(cwd)));
             } else
                 e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath(cwd)));
         }
-        // bindVars + the --parse path apply only to the nix::Expr path.
-        if (!useNativeLower)
-            e->bindVars(state, state.staticBaseEnv);
 
         // TI.2: --parse prints the AST and exits (before any lowering /
-        // eval).  Matches `nix-instantiate --parse` byte-for-byte:
-        // `e->show(symbols, cout)` + trailing newline.  This is the
-        // validation surface for the parser-TI precedence battery.
-        //
-        // Today `e` is a TW nix::Expr (TW parser).  When the v3-native
-        // parser lands, `e` becomes the v3 AST and this same code path
-        // prints it — the fixtures' goldens stay the contract.
+        // eval).  Matches `nix-instantiate --parse` byte-for-byte.  Under
+        // the native parser we print the v3 AST directly (its show() is
+        // byte-equal to TW — the Stage 1 contract); else the TW nix::Expr.
         if (parseOnly) {
-            e->show(state.symbols, std::cout);
+            if (s_nativeParser) v3st.result->show(std::cout);
+            else                e->show(state.symbols, std::cout);
             std::cout << "\n";
             return 0;
         }
+
+        // bindVars applies only to the TW (lowerNixExpr) path.
+        if (e) e->bindVars(state, state.staticBaseEnv);
 
         nix::v3::registerBuiltinPrimOps();
         nix::v3::setNixEvalState(&state);

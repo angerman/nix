@@ -31,7 +31,7 @@
 // per-file canLowerV3 fallback to the proven bridge / TW path.
 #include "v3-parse-api.hh"   // nix::v3::parser::parseString
 #include "lower_v3.hh"       // canLowerV3 + lowerV3Ast (native AST→IR)
-#include "v3-to-nixexpr.hh"  // toNixExpr (bridge fallback)
+#include "v3/tw_baseenv.hh"  // twBaseEnvGlobals (free-name resolution)
 #include "nix/util/users.hh" // getHome() for the parser's ~/x resolution
 #include "v3/vm.hh"
 #include "v3/bridge_yield.hh"
@@ -9245,35 +9245,36 @@ skipDiskCacheLookup:
     {
         // -- parse --------------------------------------------------
         auto tParse = impStamp();
-        nix::Expr * e = nullptr;                  // bridge / TW path
+        nix::Expr * e = nullptr;                  // TW (lowerNixExpr) path
         bool useNativeLower = false;              // native AST→IR path
         nix::v3::ast::ParserState v3st;           // owns the native AST
         std::optional<nix::PosTable::Origin> nativeOrigin;
 
-        if (s_nativeParser && !useCorepkgs) {
+        if (s_nativeParser && s_nativeLower && !useCorepkgs) {
             // PARSER_PROJECT_PLAN §5.3: parse with the v3-native parser.
             // Relative (`./x`) / home (`~/x`) path literals resolve against
             // the file's directory + $HOME, exactly as TW's
             // parseExprFromFile does (basePath = dirname; homePath =
-            // getHome()).  corepkgs (virtual accessor) stays on the TW
-            // path for now.
+            // getHome()).  corepkgs (virtual accessor) stays on the TW path.
             std::string text = resolvedSp.resolveSymlinks().readFile();
             if (auto par = resolvedSp.path.parent())
                 v3st.basePath = par->abs();
             v3st.homePath = s_homePath;
             nix::v3::parser::parseString(v3st, text);
-            // Same PosTable::Origin TW uses (Pos::Origin(resolvedSp)) so
-            // attr/formal + __curPos positions match byte-for-byte.
-            auto origin = ns.positions.addOrigin(nix::Pos::Origin(resolvedSp), text.size());
-            if (s_nativeLower && nix::v3::canLowerV3(v3st.result)) {
+            if (nix::v3::canLowerV3(v3st.result)) {
                 useNativeLower = true;
-                nativeOrigin.emplace(origin);
+                // Same PosTable::Origin TW uses (Pos::Origin(resolvedSp)) so
+                // attr/formal + __curPos positions match byte-for-byte.
+                nativeOrigin.emplace(ns.positions.addOrigin(
+                    nix::Pos::Origin(resolvedSp), text.size()));
                 ++importTimingTotals().nativeLowered;  // §5.3 coverage proof
             } else {
-                // Whole-program canLowerV3 rejected something (or native
-                // lower is off): bridge to nix::Expr → the proven path.
-                e = nix::v3::toNixExpr(ns, v3st.result, origin);
-                ++importTimingTotals().nativeBridged;
+                // Native lowering can't handle this file: re-parse with TW
+                // (ground truth) → the proven lowerNixExpr path.  Dead for
+                // real nixpkgs (canLowerV3 accepts every file observed);
+                // kept as a robust safety net (no AST→nix::Expr bridge).
+                e = ns.parseExprFromFile(resolvedSp);
+                ++importTimingTotals().nativeBridged;  // = TW-reparse fallback
             }
         } else if (useCorepkgs) {
             nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(),
@@ -9287,7 +9288,7 @@ skipDiskCacheLookup:
 
         if (s_dbg_import) std::fprintf(stderr,
             "v3 IMPORT-PHASE before-lower [%s] RSS=%lluMB: %s\n",
-            useNativeLower ? "native" : (s_nativeParser && !useCorepkgs ? "bridge" : "tw"),
+            useNativeLower ? "native" : "tw",
             (unsigned long long)rssMBImp(), path.c_str());
 
         // -- lower --------------------------------------------------
@@ -10120,17 +10121,17 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     bool siNativeLower = false;
     nix::v3::ast::ParserState siSt;
     std::optional<nix::PosTable::Origin> siOrigin;
-    if (s_siNativeParser) {
+    if (s_siNativeParser && s_siNativeLower) {
         if (auto par = sp.path.parent()) siSt.basePath = par->abs();  // file's dir
         siSt.homePath = s_siHome;
         nix::v3::parser::parseString(siSt, wrapped);
-        auto srcRef = nix::make_ref<std::string>(wrapped);
-        auto origin = ns.positions.addOrigin(nix::Pos::String{.source = srcRef}, srcRef->size());
-        if (s_siNativeLower && nix::v3::canLowerV3(siSt.result)) {
+        if (nix::v3::canLowerV3(siSt.result)) {
             siNativeLower = true;
-            siOrigin.emplace(origin);
-        } else
-            wrapper = nix::v3::toNixExpr(ns, siSt.result, origin);
+            auto srcRef = nix::make_ref<std::string>(wrapped);
+            siOrigin.emplace(ns.positions.addOrigin(
+                nix::Pos::String{.source = srcRef}, srcRef->size()));
+        } else  // native lowering can't handle it → TW re-parse (ground truth)
+            wrapper = ns.parseExprFromString(wrapped, sp.parent());
     } else
         wrapper = ns.parseExprFromString(wrapped, sp.parent());
     if (wrapper) wrapper->bindVars(ns, ns.staticBaseEnv);
