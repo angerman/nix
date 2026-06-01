@@ -64,6 +64,7 @@
 %token IF "'if'" THEN "'then'" ELSE "'else'"
 %token ASSERT "'assert'" WITH "'with'" LET "'let'" IN_KW "'in'" REC "'rec'"
 %token INHERIT "'inherit'"
+%token ELLIPSIS "'...'"
 %token OR_KW "'or'"
 %token EQ "'=='" NEQ "'!='" LEQ "'<='" GEQ "'>='"
 %token UPDATE "'//'" CONCAT "'++'" AND "'&&'" OR "'||'" IMPL "'->'"
@@ -77,6 +78,8 @@
 %type <std::vector<nix::v3::ast::AttrName>> attrpath
 %type <std::vector<std::string>> attrs
 %type <std::string> attr
+%type <nix::v3::ast::FormalsBuilder> formals formal_set
+%type <nix::v3::ast::FormalsBuilder::PFormal> formal
 
 /* Precedence — transcribed verbatim from parser.y:208-219. */
 %right IMPL
@@ -104,10 +107,45 @@ expr
 
 expr_function
   : ID ':' expr_function { $$ = state->add<Lambda>($1, $3); }
+  | formal_set ':' expr_function {
+      state->validateFormals($1);
+      $$ = state->add<Lambda>(state->buildFormals($1), $1.ellipsis, std::string(""), $3);
+    }
+  | formal_set '@' ID ':' expr_function {
+      state->validateFormals($1, 0, $3);
+      $$ = state->add<Lambda>(state->buildFormals($1), $1.ellipsis, $3, $5);
+    }
+  | ID '@' formal_set ':' expr_function {
+      state->validateFormals($3, 0, $1);
+      $$ = state->add<Lambda>(state->buildFormals($3), $3.ellipsis, $1, $5);
+    }
   | ASSERT expr ';' expr_function { $$ = state->add<Assert>($2, $4); }
   | WITH expr ';' expr_function   { $$ = state->add<With>($2, $4); }
   | LET binds IN_KW expr_function { $$ = state->add<Let>($2, $4); }
   | expr_if
+  ;
+
+/* formals (parser.y:586-612).  `formal_set` is the `{ … }` argument
+ * pattern; the `{`-attrset-vs-formal-set disambiguation is resolved by
+ * LALR(1) lookahead (the `:`/`@` after `}` for the empty case; `=`/`.`
+ * vs `,`/`?`/`}` after the first ID otherwise) — transcribed verbatim
+ * so `%expect 0` is preserved. */
+formal_set
+  : '{' formals ',' ELLIPSIS '}' { $$ = std::move($2); $$.ellipsis = true; }
+  | '{' ELLIPSIS '}'             { $$ = FormalsBuilder{}; $$.ellipsis = true; }
+  | '{' formals ',' '}'          { $$ = std::move($2); $$.ellipsis = false; }
+  | '{' formals '}'              { $$ = std::move($2); $$.ellipsis = false; }
+  | '{' '}'                       { $$ = FormalsBuilder{}; }
+  ;
+
+formals
+  : formals ',' formal { $$ = std::move($1); $$.formals.push_back(std::move($3)); }
+  | formal             { $$ = FormalsBuilder{}; $$.formals.push_back(std::move($1)); }
+  ;
+
+formal
+  : ID          { $$ = FormalsBuilder::PFormal{$1, 0, nullptr}; }
+  | ID '?' expr { $$ = FormalsBuilder::PFormal{$1, 0, $3}; }
   ;
 
 expr_if

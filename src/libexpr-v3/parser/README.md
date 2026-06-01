@@ -239,10 +239,28 @@ quoted), `${e}` dynamic keys, nested + mixed static/dynamic paths,
 interpolated keys (`"pre${x}"` → `"${("pre" + x)}"`), and dynamic/string
 keys in select + has-attr.
 
-**Tier 4 + paths (remaining Stage 1.4):**
+### Stage 1.4 Tier 4a — formals LANDED
+
+`{ a, b ? d, ... } @ args: body` argument patterns — the most common
+nixpkgs construct.  Three expr_function productions (`formal_set ':'`,
+`formal_set '@' ID ':'`, `ID '@' formal_set ':'`) + `formal_set` /
+`formals` / `formal`, transcribed verbatim from parser.y:586-612, wiring
+the proven `ParserState::validateFormals` (dup-arg + `@`-collision) and a
+`buildFormals` PFormal→Formal converter.  Lexer gained `...` (ELLIPSIS)
+and `@`.  **`%expect 0` survives the `{`-attrset-vs-formal-set
+disambiguation** in the subset grammar — the chief formals risk, cleared.
+
+Validated by the tier4 battery (14 fixtures) — total parser-spike-test
+now **114/114** byte-equal to TW: single/multi formals, defaults (incl.
+default referencing another formal), ellipsis (`...` / `a, ...`), empty
+`{ }` (→ two-space `{  }`), `@`-binding both positions (TW normalizes
+`args@{…}` → `{…} @ args`), lexicographic formal sorting, nested formal
+lambdas, formal-lambda application.
+
+**Tier 4 remainder + paths (remaining Stage 1.4):**
 * paths (`./foo`, `/abs`, `<nixpkgs>`, `~/x`) — lexer PATH states
-* Tier 4 — formals (via `validateFormals`), indented strings (via
-  `stripIndentation`), pipe operators, cursed-or, `let { }` form
+* indented strings (`''…''`) — IND_STRING lexer state + `stripIndentation`
+* pipe operators (`|>` / `<|`), cursed-or, `let { }` form
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;
   validate the 68 fixtures + 263-file sweep + 143 lang tests; rename
   v3-spike → v3-parser; retire the throwaway arithmetic framing.

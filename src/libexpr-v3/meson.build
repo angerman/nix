@@ -410,6 +410,7 @@ test(
     meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier2',
     meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier3b',
     meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier3c',
+    meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier4',
   ],
 )
 

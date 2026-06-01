@@ -100,6 +100,7 @@ ANY   .|\n
 "->"        { return nix::v3::spike::SpikeParser::token::IMPL; }
 "//"        { return nix::v3::spike::SpikeParser::token::UPDATE; }
 "++"        { return nix::v3::spike::SpikeParser::token::CONCAT; }
+"..."       { return nix::v3::spike::SpikeParser::token::ELLIPSIS; }  /* formals (lexer.l:137) */
 
 {ID}        { yylval->emplace<std::string>(yytext, (size_t) yyleng);
               return nix::v3::spike::SpikeParser::token::ID; }
@@ -137,9 +138,10 @@ ANY   .|\n
 \{          { PUSH_STATE(DEFAULT); return '{'; }
 \}          { if (YY_START != INITIAL) POP_STATE(); return '}'; }
 
-  /* other single-char tokens returned as their char code */
-[<>+\-*/!?.:()] { return yytext[0]; }
-[\[\];=,]       { return yytext[0]; }
+  /* other single-char tokens returned as their char code.  `@` is the
+   * formal-set @-binding separator (`args@{…}` / `{…}@args`). */
+[<>+\-*/!?.:()@] { return yytext[0]; }
+[\[\];=,]        { return yytext[0]; }
 
 [ \t\r\n]+  { /* skip whitespace */ }
 "#"[^\n]*   { /* skip line comment */ }

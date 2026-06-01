@@ -50,7 +50,7 @@ struct ParseError : std::runtime_error {
 /// diagnostics; the AST Lambda::Formal (name + def) is built from it
 /// after validation.
 struct FormalsBuilder {
-    struct PFormal { std::string name; Pos pos; Node * def = nullptr; };
+    struct PFormal { std::string name; Pos pos = noPos; Node * def = nullptr; };
     std::vector<PFormal> formals;
     bool ellipsis = false;
     bool has(const std::string & name) const {
@@ -104,6 +104,17 @@ struct ParserState {
         if (!argName.empty() && fb.has(argName))
             throw ParseError(
                 "duplicate formal function argument '" + argName + "'", argPos);
+    }
+
+    /// Convert a (validated) FormalsBuilder into the AST Lambda's
+    /// `std::vector<Formal>` (name + default).  Per-formal positions are
+    /// only needed for the duplicate diagnostic, so they are dropped
+    /// here; Lambda::show re-sorts lexicographically regardless of order.
+    std::vector<Formal> buildFormals(const FormalsBuilder & fb) {
+        std::vector<Formal> out;
+        out.reserve(fb.formals.size());
+        for (auto & pf : fb.formals) out.push_back(Formal{pf.name, pf.def});
+        return out;
     }
 
     // -- string / dynamic attr keys --------------------------------
