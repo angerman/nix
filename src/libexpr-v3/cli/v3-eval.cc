@@ -127,7 +127,7 @@ static void usage(const char * argv0)
 // `homePath` is $HOME.  Falls through to the existing bindVars + lower
 // pipeline, so the only thing that changes vs the default is WHO parses.
 static nix::Expr * v3NativeParse(
-    nix::EvalState & state, const std::string & text,
+    nix::EvalState & state, const std::string & text, const nix::Pos::Origin & origin,
     const std::string & basePath, const std::string & homePath)
 {
     nix::v3::ast::ParserState st;
@@ -142,7 +142,10 @@ static nix::Expr * v3NativeParse(
     yylex_destroy(scanner);
     if (!st.result)
         throw nix::Error("v3-native parser produced no expression");
-    return nix::v3::toNixExpr(state, st.result);
+    // Register the source origin so the AST's byte offsets become PosIdx
+    // that resolve to the right file/line/column (same origin TW uses).
+    auto po = state.positions.addOrigin(origin, text.size());
+    return nix::v3::toNixExpr(state, st.result, po);
 }
 
 // IR dump mode: which point in the pipeline to dump from.
@@ -299,14 +302,18 @@ int main(int argc, char ** argv)
         nix::Expr * e;
         if (!path.empty() && path != "-") {
             std::filesystem::path abs = std::filesystem::absolute(path);
+            nix::SourcePath sp(state.rootFS, nix::CanonPath(abs.string()));
             if (s_nativeParser) {
                 std::string text = slurp(path);
-                e = v3NativeParse(state, text, abs.parent_path().string(), homePath);
+                // Same origin TW uses (parseExprFromFile -> Pos::Origin(path))
+                // so unsafeGetAttrPos' `file` field matches byte-for-byte.
+                e = v3NativeParse(state, text, nix::Pos::Origin(sp),
+                                  abs.parent_path().string(), homePath);
             } else
                 // Use parseExprFromFile so relative imports inside the file
                 // resolve against the file's own directory, matching
                 // tree-walker behaviour.
-                e = state.parseExprFromFile(nix::SourcePath(state.rootFS, nix::CanonPath(abs.string())));
+                e = state.parseExprFromFile(sp);
         } else {
             if (path == "-") {
                 try { expr = slurp(path); }
@@ -320,7 +327,8 @@ int main(int argc, char ** argv)
             // behaviour).  Without this, `./foo` lowers to `/foo`.
             std::string cwd = std::filesystem::current_path().string();
             if (s_nativeParser)
-                e = v3NativeParse(state, expr, cwd, homePath);
+                e = v3NativeParse(state, expr, nix::Pos::String{.source = nix::make_ref<std::string>(expr)},
+                                  cwd, homePath);
             else
                 e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath(cwd)));
         }

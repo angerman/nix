@@ -11,15 +11,21 @@ divergences), and **547/547** nixpkgs `lib/` + `build-support/` files
 per-tier sections below; the historical scaffolding notes that follow
 describe the original plan and are kept for context.
 
-**Stage 2 integration (in progress):** `NIX_V3_NATIVE_PARSER=1 v3-eval`
-parses natively, bridges the v3 AST → `nix::Expr` (`cli/v3-to-nixexpr.hh`),
-then the EXISTING `bindVars` + `lowerNixExpr` pipeline evaluates it.
-Validated: bridge `--parse` 157/157 byte-equal to TW; **eval 139/143**
-lang tests (the 4 failures are all position-introspection — `__curPos`
-/ `unsafeGetAttrPos` — because the bridge uses `noPos`; see below).
+**Stage 2 integration — EVAL PARITY (143/143):** `NIX_V3_NATIVE_PARSER=1
+v3-eval` parses natively, bridges the v3 AST → `nix::Expr`
+(`cli/v3-to-nixexpr.hh`), then the EXISTING `bindVars` + `lowerNixExpr`
+pipeline evaluates it.  **143/143 lang tests** under the native parser
+(== the default TW path), bridge `--parse` 157/157 byte-equal.
 
-Remaining: **file-local positions** (closes the last 4 eval tests) +
-a fully-native AST→IR lowering (delete `lower.cc`'s `nix::Expr` path).
+File-local **positions** are tracked (bison `%locations` + a byte-offset
+`ParserLoc` + flex `YY_USER_ACTION` offset accumulation; `PosExpr` /
+attr-defs / formals carry offsets; the bridge maps them to `PosIdx` via
+the source's `PosTable::Origin`).  `__curPos` + `builtins.unsafeGetAttrPos`
+(on attrs AND function args) resolve byte-identical to TW.
+
+Remaining: a fully-native AST→IR lowering (delete `lower.cc`'s
+`nix::Expr` path) — an optimization to retire the bridge; the parser is
+functionally complete (parses + evaluates + positions, 143/143).
 
 ## Files
 

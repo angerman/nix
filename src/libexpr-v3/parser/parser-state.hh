@@ -45,6 +45,18 @@ struct ParseError : std::runtime_error {
         : std::runtime_error(std::move(msg)), pos(pos) {}
 };
 
+/// bison location type — byte offsets only (mirrors TW's
+/// ParserLocation, parser-state.hh.upstream:29).  `stash`/`unstash`
+/// support the path-lexer `yyless(0)` rewind (restore the offset of the
+/// pushed-back text).  The file-local offset is the v3 determinism win
+/// vs TW's global PosIdx; the bridge maps it to a PosIdx at eval time.
+struct ParserLoc {
+    uint32_t beginOffset = 0, endOffset = 0;
+    uint32_t stashedBegin = 0, stashedEnd = 0;
+    void stash()   { stashedBegin = beginOffset; stashedEnd = endOffset; }
+    void unstash() { beginOffset = stashedBegin; endOffset = stashedEnd; }
+};
+
 /// IND_STR token payload (mirrors TW's StringToken's hasIndentation
 /// flag).  An indented-string body chunk plus whether it participates
 /// in dedent: the general content rule sets hasIndentation=true; the
@@ -130,7 +142,7 @@ struct ParserState {
     std::vector<Formal> buildFormals(const FormalsBuilder & fb) {
         std::vector<Formal> out;
         out.reserve(fb.formals.size());
-        for (auto & pf : fb.formals) out.push_back(Formal{pf.name, pf.def});
+        for (auto & pf : fb.formals) out.push_back(Formal{pf.name, pf.def, pf.pos});
         return out;
     }
 
@@ -252,6 +264,7 @@ struct ParserState {
         if (findAny(attrs, name))
             throw ParseError("attribute '" + name + "' already defined", pos);
         attrs->attrs.emplace_back(name);  // Inherited ctor
+        attrs->attrs.back().pos = pos;
     }
 
     /// `inherit (e) name;` — add an InheritedFrom def referencing
@@ -261,6 +274,7 @@ struct ParserState {
         if (findAny(attrs, name))
             throw ParseError("attribute '" + name + "' already defined", pos);
         attrs->attrs.emplace_back(name, fromIdx);  // InheritedFrom ctor
+        attrs->attrs.back().pos = pos;
     }
 
     /// Leaf insert-or-merge.  Mirrors the 2-arg `ParserState::addAttr`
@@ -424,8 +438,10 @@ struct ParserState {
         // Insert the leaf.
         size_t leaf = path.size() - 1;
         if (!path[leaf].expr) {
+            Attrs::AttrDef leafDef(path[leaf].symbol, e);
+            leafDef.pos = pos;   // byte offset of the attr name (unsafeGetAttrPos)
             addAttrLeaf(attrs, path, leaf, path[leaf].symbol,
-                        Attrs::AttrDef(path[leaf].symbol, e), pos);
+                        std::move(leafDef), pos);
         } else {
             attrs->dynamicAttrs.push_back({path[leaf].expr, e});
         }

@@ -237,6 +237,7 @@ struct OpHasAttr : Node {
 struct Formal {
     std::string name;
     Node * def = nullptr;   // `? default`, or null
+    Pos pos = noPos;        // byte offset of the formal name (unsafeGetAttrPos on functionArgs)
 };
 struct Lambda : Node {
     std::string arg;            // simple-arg or @-binding name; "" if none
@@ -296,6 +297,7 @@ struct Attrs : Node {
         std::string name;
         Node * value = nullptr;   // Plain only
         int fromIdx = -1;         // InheritedFrom: index into inheritFromExprs
+        Pos pos = noPos;          // byte offset of the attr name (for unsafeGetAttrPos)
         AttrDef(std::string n, Node * v)
             : kind(AttrKind::Plain), name(std::move(n)), value(v) {}
         AttrDef(std::string n)

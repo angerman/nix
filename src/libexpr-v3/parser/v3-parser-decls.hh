@@ -19,3 +19,7 @@
 // as Parser::value_type (no YYSTYPE macro); the flex bison-bridge
 // scanner needs YYSTYPE.  (Same shape as parser-scanner-decls.hh.)
 using YYSTYPE = ::nix::v3::parser::Parser::value_type;
+
+// With %locations the bison-bridge scanner also references YYLTYPE
+// (the location type) in yylex / yyget_lloc declarations.
+using YYLTYPE = ::nix::v3::parser::Parser::location_type;

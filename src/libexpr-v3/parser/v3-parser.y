@@ -29,6 +29,8 @@
 %define api.namespace { nix::v3::parser }
 %define api.parser.class { Parser }
 %define api.value.type variant
+%define api.location.type { nix::v3::ast::ParserLoc }
+%locations
 %define parse.error detailed
 %parse-param { void * scanner }
 %parse-param { nix::v3::ast::ParserState * state }
@@ -47,11 +49,25 @@
   #include <vector>
   #include <string>
   typedef void * yyscan_t;
+
+  // Track byte offsets only (parser.y:43-56); line/column are derived
+  // lazily by the PosTable at eval time.  @$ spans @1..@N.
+  # define YYLLOC_DEFAULT(Current, Rhs, N)                          \
+      do                                                            \
+        if (N) {                                                    \
+          (Current).beginOffset = YYRHSLOC(Rhs, 1).beginOffset;     \
+          (Current).endOffset   = YYRHSLOC(Rhs, N).endOffset;       \
+        } else {                                                    \
+          (Current).beginOffset = (Current).endOffset =             \
+            YYRHSLOC(Rhs, 0).endOffset;                             \
+        }                                                           \
+      while (0)
 }
 
 %code {
   #include "v3-parser-tab.hh"
-  int yylex(nix::v3::parser::Parser::value_type * yylval, yyscan_t scanner);
+  int yylex(nix::v3::parser::Parser::value_type * yylval,
+            nix::v3::parser::Parser::location_type * yylloc, yyscan_t scanner);
   using namespace nix::v3::ast;
 }
 
@@ -87,7 +103,7 @@
 %type <std::vector<nix::v3::ast::Node *>> string_parts_interpolated
 %type <std::vector<nix::v3::ast::ParserState::IndStringSegment>> ind_string_parts
 %type <std::vector<nix::v3::ast::AttrName>> attrpath
-%type <std::vector<std::string>> attrs
+%type <std::vector<std::pair<std::string, nix::v3::ast::Pos>>> attrs
 %type <std::string> attr
 %type <nix::v3::ast::FormalsBuilder> formals formal_set
 %type <nix::v3::ast::FormalsBuilder::PFormal> formal
@@ -162,8 +178,8 @@ formals
   ;
 
 formal
-  : ID          { $$ = FormalsBuilder::PFormal{$1, 0, nullptr}; }
-  | ID '?' expr { $$ = FormalsBuilder::PFormal{$1, 0, $3}; }
+  : ID          { $$ = FormalsBuilder::PFormal{$1, @1.beginOffset, nullptr}; }
+  | ID '?' expr { $$ = FormalsBuilder::PFormal{$1, @1.beginOffset, $3}; }
   ;
 
 expr_if
@@ -257,7 +273,7 @@ expr_select
 
 expr_simple
   : ID {
-      if ($1 == "__curPos") $$ = state->add<PosExpr>();
+      if ($1 == "__curPos") $$ = state->add<PosExpr>(@1.beginOffset);
       else                  $$ = state->add<Var>($1);
     }
   | INT_LIT      { $$ = state->add<Int>($1); }
@@ -315,19 +331,19 @@ binds
 
 binds1
   : binds1 attrpath '=' expr ';'
-    { $$ = $1; state->addAttr($1, std::move($2), $4, 0); }
+    { $$ = $1; state->addAttr($1, std::move($2), $4, @2.beginOffset); }
   | binds INHERIT attrs ';'
     { $$ = $1;
-      for (auto & name : $3) state->addInherit($1, name, 0);
+      for (auto & [name, p] : $3) state->addInherit($1, name, p);
     }
   | binds INHERIT '(' expr ')' attrs ';'
     { $$ = $1;
       int idx = (int) $1->inheritFromExprs.size();
       $1->inheritFromExprs.push_back($4);
-      for (auto & name : $6) state->addInheritFrom($1, name, idx, 0);
+      for (auto & [name, p] : $6) state->addInheritFrom($1, name, idx, p);
     }
   | attrpath '=' expr ';'
-    { $$ = state->add<Attrs>(false); state->addAttr($$, std::move($1), $3, 0); }
+    { $$ = state->add<Attrs>(false); state->addAttr($$, std::move($1), $3, @1.beginOffset); }
   ;
 
 /* inherit name-list (parser.y:520-535).  `attr` = ID/OR_KW names;
@@ -335,15 +351,15 @@ binds1
  * a plain String literal contributes a STATIC name, anything dynamic
  * is a TW parse error ("dynamic attributes not allowed in inherit"). */
 attrs
-  : attrs attr { $$ = std::move($1); $$.push_back($2); }
+  : attrs attr { $$ = std::move($1); $$.emplace_back($2, @2.beginOffset); }
   | attrs string_attr {
       $$ = std::move($1);
       if ($2->kind == Kind::String)
-          $$.push_back(static_cast<String *>($2)->s);
+          $$.emplace_back(static_cast<String *>($2)->s, @2.beginOffset);
       else
-          throw ParseError("dynamic attributes not allowed in inherit", 0);
+          throw ParseError("dynamic attributes not allowed in inherit", @2.beginOffset);
     }
-  | /* empty */ { $$ = std::vector<std::string>{}; }
+  | /* empty */ { $$ = std::vector<std::pair<std::string, Pos>>{}; }
   ;
 
 list
@@ -421,7 +437,8 @@ string_attr
 
 %%
 
-void nix::v3::parser::Parser::error(const std::string & msg)
+// With %locations the error callback takes the location (parser.y:124).
+void nix::v3::parser::Parser::error(const location_type & loc, const std::string & msg)
 {
-    throw nix::v3::ast::ParseError("v3 parse error: " + msg, 0);
+    throw nix::v3::ast::ParseError("v3 parse error: " + msg, loc.beginOffset);
 }

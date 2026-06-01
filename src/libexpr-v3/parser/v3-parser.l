@@ -17,7 +17,7 @@
  */
 
 %option 8bit
-%option reentrant bison-bridge
+%option reentrant bison-bridge bison-locations
 %option noyywrap
 %option never-interactive
 %option nodefault
@@ -42,6 +42,18 @@
   #include "parser-state.hh"
   #include <cstdlib>
   #include <string>
+
+  // Byte-offset location tracking (mirrors lexer.l:95-96 + adjustLoc).
+  // YY_USER_ACTION runs before every rule action (incl. skips): stash
+  // the current span, then advance beginOffset->prev end, endOffset+=len.
+  // The path-lexer yyless(0) rules call yylloc->unstash() to restore.
+  using YYLTYPE = nix::v3::parser::Parser::location_type;
+  // Brace blocks (NOT do/while): flex emits YY_USER_ACTION inline
+  // immediately before the rule's `{ action }`, with no trailing `;`.
+  #define YY_USER_INIT   { yylloc->beginOffset = yylloc->endOffset = 0; }
+  #define YY_USER_ACTION { yylloc->stash();                                 \
+                           yylloc->beginOffset = yylloc->endOffset;          \
+                           yylloc->endOffset += (uint32_t) yyleng; }
 
   // State stack management (mirrors lexer.l:98).  `%s DEFAULT` is an
   // inclusive state so unprefixed rules (keywords/operators/...) are
