@@ -58,6 +58,9 @@
 /* Token value types (mirror parser.y). */
 %token <std::string> ID   "identifier"
 %token <std::string> STR  "string"
+%token <nix::v3::ast::IndStr> IND_STR "indented string"
+%token IND_STRING_OPEN "start of an indented string"
+%token IND_STRING_CLOSE "end of an indented string"
 %token <int64_t>     INT_LIT   "integer"
 %token <double>      FLOAT_LIT "float"
 %token DOLLAR_CURLY "'${'"
@@ -75,6 +78,7 @@
 %type <std::vector<nix::v3::ast::Node *>> list
 %type <nix::v3::ast::Node *> string_parts string_attr
 %type <std::vector<nix::v3::ast::Node *>> string_parts_interpolated
+%type <std::vector<nix::v3::ast::ParserState::IndStringSegment>> ind_string_parts
 %type <std::vector<nix::v3::ast::AttrName>> attrpath
 %type <std::vector<std::string>> attrs
 %type <std::string> attr
@@ -225,6 +229,8 @@ expr_simple
   | INT_LIT      { $$ = state->add<Int>($1); }
   | FLOAT_LIT    { $$ = state->add<Float>($1); }
   | '"' string_parts '"' { $$ = $2; }
+  | IND_STRING_OPEN ind_string_parts IND_STRING_CLOSE
+    { $$ = state->stripIndentation($2, 0); }
   | '(' expr ')' { $$ = $2; }
   | REC '{' binds '}' { $3->recursive = true; $$ = $3; }
   | '{' binds1 '}'    { $$ = $2; }
@@ -300,6 +306,21 @@ string_parts_interpolated
 /* attrpath (parser.y:537-553): dotted path of static `attr`s and/or
  * string/dynamic `string_attr`s.  A `string_attr` becomes a static key
  * iff it is a plain string literal (strAttrName decides). */
+/* indented-string body (parser.y:471-474): a sequence of IND_STR chunks
+ * and `${expr}` antiquotations, assembled into the IndStringSegments
+ * that ParserState::stripIndentation dedents. */
+ind_string_parts
+  : ind_string_parts IND_STR
+    { $$ = std::move($1);
+      $$.push_back(ParserState::IndStringSegment{
+        /*isString=*/true, $2.s, $2.hasIndentation, nullptr}); }
+  | ind_string_parts DOLLAR_CURLY expr '}'
+    { $$ = std::move($1);
+      $$.push_back(ParserState::IndStringSegment{
+        /*isString=*/false, std::string(""), false, $3}); }
+  | /* empty */ { $$ = std::vector<ParserState::IndStringSegment>{}; }
+  ;
+
 attrpath
   : attrpath '.' attr        { $$ = std::move($1); $$.emplace_back($3); }
   | attrpath '.' string_attr { $$ = std::move($1); $$.push_back(state->strAttrName($3)); }

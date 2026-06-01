@@ -26,6 +26,7 @@
 
 %s DEFAULT
 %x STRING
+%x IND_STRING
 
 %top {
   // Brings in v3-spike-tab.hh + defines YYSTYPE (the parser variant
@@ -122,6 +123,33 @@ ANY   .|\n
             }
 <STRING>\$\{  { PUSH_STATE(DEFAULT); return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY; }
 <STRING>\"    { POP_STATE(); return '"'; }
+
+  /* Indented strings `''…''` (mirrors lexer.l:209-232).  IND_STRING_OPEN
+   * `''` optionally swallows the trailing ` *\n` of the opening line;
+   * stripIndentation (ParserState) does the dedent.  Content vs escapes:
+   * the general rule sets hasIndentation=true (participates in dedent);
+   * `''$`/`$` -> literal `$`, `'''` -> `''`, `''\x` -> unescaped x, lone
+   * `'` -> `'` all set false.  `${` opens an antiquotation (push DEFAULT);
+   * `''` closes (pop). */
+\'\'(\ *\n)?  { PUSH_STATE(IND_STRING); return nix::v3::spike::SpikeParser::token::IND_STRING_OPEN; }
+<IND_STRING>([^\$\']|\$[^\{\']|\'[^\'\$])+ {
+                yylval->emplace<nix::v3::ast::IndStr>(
+                    nix::v3::ast::IndStr{std::string(yytext, (size_t) yyleng), /*hasIndentation=*/true});
+                return nix::v3::spike::SpikeParser::token::IND_STR;
+              }
+<IND_STRING>\'\'\$ |
+<IND_STRING>\$  { yylval->emplace<nix::v3::ast::IndStr>(nix::v3::ast::IndStr{std::string("$"), false});
+                return nix::v3::spike::SpikeParser::token::IND_STR; }
+<IND_STRING>\'\'\' { yylval->emplace<nix::v3::ast::IndStr>(nix::v3::ast::IndStr{std::string("''"), false});
+                return nix::v3::spike::SpikeParser::token::IND_STR; }
+<IND_STRING>\'\'\\{ANY} {
+                yylval->emplace<nix::v3::ast::IndStr>(
+                    nix::v3::ast::IndStr{v3UnescapeStr(yytext + 2, (size_t) yyleng - 2), false});
+                return nix::v3::spike::SpikeParser::token::IND_STR; }
+<IND_STRING>\$\{ { PUSH_STATE(DEFAULT); return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY; }
+<IND_STRING>\'\' { POP_STATE(); return nix::v3::spike::SpikeParser::token::IND_STRING_CLOSE; }
+<IND_STRING>\'  { yylval->emplace<nix::v3::ast::IndStr>(nix::v3::ast::IndStr{std::string("'"), false});
+                return nix::v3::spike::SpikeParser::token::IND_STR; }
 
   /* `${` in the default context = a dynamic attr key / select / has-attr
    * (`{ ${e} = …; }`, `x.${e}`, `x ? ${e}`).  Mirrors lexer.l's

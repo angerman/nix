@@ -45,6 +45,13 @@ struct ParseError : std::runtime_error {
         : std::runtime_error(std::move(msg)), pos(pos) {}
 };
 
+/// IND_STR token payload (mirrors TW's StringToken's hasIndentation
+/// flag).  An indented-string body chunk plus whether it participates
+/// in dedent: the general content rule sets hasIndentation=true; the
+/// escape rules (`''$`, `'''`, `''\x`, lone `'`) set false — they are
+/// mid-line literals with no leading indentation to strip.
+struct IndStr { std::string s; bool hasIndentation = false; };
+
 /// Parser-side formal-argument accumulator (mirrors TW's
 /// FormalsBuilder).  Carries per-formal positions for duplicate
 /// diagnostics; the AST Lambda::Formal (name + def) is built from it
@@ -321,7 +328,9 @@ struct ParserState {
 
         if (es2.empty()) return add<String>(std::string(""), pos);
         if (es2.size() == 1 && es2[0]->kind == Kind::String) return es2[0];
-        return add<ConcatStrings>(std::move(es2), pos);
+        // forceString=true (parser-state.hh.upstream:428): an indented
+        // string coerces interpolated parts to strings, like `"…"`.
+        return add<ConcatStrings>(std::move(es2), /*forceString=*/true, pos);
     }
 
     /// Full attrpath insert.  Mirrors the 5-arg `ParserState::addAttr`

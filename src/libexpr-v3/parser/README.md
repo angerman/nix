@@ -257,10 +257,30 @@ default referencing another formal), ellipsis (`...` / `a, ...`), empty
 `args@{…}` → `{…} @ args`), lexicographic formal sorting, nested formal
 lambdas, formal-lambda application.
 
-**Tier 4 remainder + paths (remaining Stage 1.4):**
+### Stage 1.4 Tier 4b — indented strings LANDED
+
+`''…''` strings — the IND_STRING exclusive lexer state (transcribed from
+lexer.l:209-232) + the now-wired `ParserState::stripIndentation`.
+IND_STRING_OPEN `''` optionally swallows the opening line's trailing
+` *\n`; the general content rule sets `hasIndentation=true` (dedent
+participant); the escapes `''$`/`$`→`$`, `'''`→`''`, `''\x`→unescaped,
+lone `'`→`'` set false; `${` opens an antiquotation, `''` closes.  The
+`ind_string_parts` grammar assembles `IndStringSegment`s and calls
+`stripIndentation`.  Fixed a latent `stripIndentation` bug (it passed
+`pos` into the `forceString` arg slot; now explicit `forceString=true`,
+matching parser-state.hh.upstream:428).  Still `%expect 0`.
+
+Validated by the tier4b battery (9 fixtures) — total parser-spike-test
+now **123/123** byte-equal to TW: `''foo''`, empty `''''`, multiline
+dedent (uneven indent), the `''$`/`'''` escapes, `${x}` interpolation
+(single + multiline).  This completes the strings story (plain +
+interpolated + indented) and wires the LAST unwired proven helper.
+
+**Paths + pipe (remaining Stage 1.4):**
 * paths (`./foo`, `/abs`, `<nixpkgs>`, `~/x`) — lexer PATH states
-* indented strings (`''…''`) — IND_STRING lexer state + `stripIndentation`
 * pipe operators (`|>` / `<|`), cursed-or, `let { }` form
+* then wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1` +
+  full 263-file + 143 lang validation; rename v3-spike → v3-parser.
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;
   validate the 68 fixtures + 263-file sweep + 143 lang tests; rename
   v3-spike → v3-parser; retire the throwaway arithmetic framing.
