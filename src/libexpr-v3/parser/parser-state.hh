@@ -176,6 +176,84 @@ struct ParserState {
         }
     }
 
+    // -- indented strings (port of stripIndentation) ---------------
+
+    /// One segment of an indented-string body.  Either a (lexer-
+    /// unescaped) string chunk that participates in dedent
+    /// (`hasIndentation`), or an antiquotation `${expr}` (opaque to
+    /// dedent — it ends start-of-line whitespace).
+    struct IndStringSegment {
+        bool   isString;
+        std::string str;        // valid when isString
+        bool   hasIndentation;  // only when isString
+        Node * expr = nullptr;  // valid when !isString
+    };
+
+    /// Strip the common leading indentation from an indented string,
+    /// matching `ParserState::stripIndentation`
+    /// (parser-state.hh.upstream:324).  Two passes: find the minimum
+    /// indent (whitespace-only final/empty lines excluded), then drop
+    /// that many leading spaces per line; the trailing whitespace-only
+    /// line of the last string segment is removed.  Returns a String
+    /// (single chunk) or ConcatStrings (interpolated).
+    Node * stripIndentation(const std::vector<IndStringSegment> & es, Pos pos) {
+        if (es.empty()) return add<String>(std::string(""), pos);
+
+        // Pass 1: minimum indentation.
+        bool atStartOfLine = true;
+        size_t minIndent = 1000000, curIndent = 0;
+        for (auto & seg : es) {
+            if (!seg.isString || !seg.hasIndentation) {
+                if (atStartOfLine) { atStartOfLine = false; minIndent = std::min(minIndent, curIndent); }
+                continue;
+            }
+            for (char c : seg.str) {
+                if (atStartOfLine) {
+                    if (c == ' ') curIndent++;
+                    else if (c == '\n') curIndent = 0;          // empty line
+                    else { atStartOfLine = false; minIndent = std::min(minIndent, curIndent); }
+                } else if (c == '\n') { atStartOfLine = true; curIndent = 0; }
+            }
+        }
+
+        // Pass 2: strip.
+        std::vector<Node *> es2;
+        atStartOfLine = true;
+        size_t curDropped = 0;
+        size_t remaining = es.size();
+        for (auto & seg : es) {
+            if (!seg.isString) {            // antiquotation
+                atStartOfLine = false; curDropped = 0;
+                es2.push_back(seg.expr);
+            } else {
+                std::string s2;
+                for (char c : seg.str) {
+                    if (atStartOfLine) {
+                        if (c == ' ') { if (curDropped++ >= minIndent) s2 += c; }
+                        else if (c == '\n') { curDropped = 0; s2 += c; }
+                        else { atStartOfLine = false; curDropped = 0; s2 += c; }
+                    } else {
+                        s2 += c;
+                        if (c == '\n') atStartOfLine = true;
+                    }
+                }
+                // Remove a trailing whitespace-only last line (only on
+                // the last segment — `remaining == 1`).
+                if (remaining == 1) {
+                    auto p = s2.find_last_of('\n');
+                    if (p != std::string::npos && s2.find_first_not_of(' ', p + 1) == std::string::npos)
+                        s2 = s2.substr(0, p + 1);
+                }
+                if (!s2.empty()) es2.push_back(add<String>(std::move(s2), pos));
+            }
+            --remaining;
+        }
+
+        if (es2.empty()) return add<String>(std::string(""), pos);
+        if (es2.size() == 1 && es2[0]->kind == Kind::String) return es2[0];
+        return add<ConcatStrings>(std::move(es2), pos);
+    }
+
     /// Full attrpath insert.  Mirrors the 5-arg `ParserState::addAttr`
     /// (parser-state.hh.upstream:195): walk the non-leaf path elements
     /// creating/descending nested attrsets, then insert the leaf.

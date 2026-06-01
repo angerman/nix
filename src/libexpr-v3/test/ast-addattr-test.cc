@@ -163,6 +163,28 @@ int main()
     checkThrows("dup-leaf",  dupLeaf,  "attribute 'a.b' already defined");
     checkThrows("dup-plain", dupPlain, "attribute 'a' already defined");
 
+    // --- stripIndentation (indented strings, no-escape cases) ---
+    // The IND_STR segment content is what the LEXER passes, i.e. AFTER
+    // the IND_STRING_OPEN rule `''( *\n)?` (lexer.l:209) has consumed
+    // the optional leading spaces+newline immediately after `''`.  So
+    // `''\n  foo\n  bar\n''` yields content `  foo\n  bar\n` (no
+    // leading newline).  hasIndentation=true.  This both validates the
+    // dedent AND documents the lexer-open contract for Stage 1.3.
+    auto indCheck = [&](const char * name, const char * content, const char * golden) {
+        ++checks;
+        ParserState st;
+        std::vector<ParserState::IndStringSegment> segs{
+            { true, std::string(content), true, nullptr } };
+        std::string got = showToString(st.stripIndentation(segs, 0));
+        if (got == golden) std::printf("  ok   %-22s %s\n", name, got.c_str());
+        else { ++failures; std::printf("  FAIL %-22s\n    golden: %s\n    got:    %s\n",
+                                       name, golden, got.c_str()); }
+    };
+    indCheck("ind-two-lines",   "  foo\n  bar\n",     "\"foo\\nbar\\n\"");
+    indCheck("ind-single-word", "foo",               "\"foo\"");
+    indCheck("ind-mixed",       "  a\n    b\n  c\n",  "\"a\\n  b\\nc\\n\"");
+    indCheck("ind-blank-mid",   "  a\n\n  b\n",       "\"a\\n\\nb\\n\"");
+
     // --- validateFormals ---
     // positive: distinct formals validate without throwing
     {

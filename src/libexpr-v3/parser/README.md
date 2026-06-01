@@ -124,10 +124,22 @@ nested-path creation, two-path merge, merge-into-set, deep-merge,
 two-attrset merge, dynamic-key path, + duplicate-definition detection
 (`{ a.b=1; a.b=2; }` throws "attribute 'a.b' already defined").
 
-Stage 1.2 follow-ups: `stripIndentation` (indented strings),
-`validateFormals` (dup-arg detection), symbol interning (names are
-inline std::string today).  Then 1.3 (build wiring: bison/flex →
-libnixexprv3) → 1.4 (action rewrite targeting the v3 AST).
+### Stage 1.2 — self-contained helpers DONE (addAttr, validateFormals, stripIndentation)
+
+`parser-state.hh` now hosts all three semantic helpers, validated by
+`test/ast-addattr-test.cc` (**19/19** vs TW):
+* `addAttr` — attrset-merge + dup detection (8 + 2 checks)
+* `validateFormals` — dup-arg + @-binding collision (5 checks)
+* `stripIndentation` — indented-string dedent (4 checks)
+
+The `stripIndentation` tests also document the **IND_STRING_OPEN
+lexer contract** (lexer.l:209 `''( *\n)?` consumes the leading
+spaces+newline after `''`, so the token content has no leading
+newline) — a Stage 1.3 lexer requirement.
+
+Stage 1.2 remaining: symbol interning (names are inline std::string
+today — a Stage 1.4 integration decision).  Then 1.3 (build wiring:
+bison/flex → libnixexprv3) → 1.4 (action rewrite targeting the v3 AST).
 
 ## How to inspect upstream actions
 
