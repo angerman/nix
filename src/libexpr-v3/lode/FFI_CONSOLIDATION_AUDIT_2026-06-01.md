@@ -51,6 +51,29 @@ audit.
   fail on any NEW offender; report files that became clean) rather than
   the strict end-state lint, since Phases 2-4 are still pending.  Verified
   it bites (injecting a TW include into a non-baselined file → exit 1).
+- **§2.4 #4 (config.hh) — DONE** (`4e8b0fe72`): `NIX_USE_BOEHMGC` (a
+  build macro, not eval-state) centralized behind the v3-owned
+  `include/v3/gc-config.hh` (includes the generated header — value still
+  derived from `bdw_gc.found()`, no hardcoding, non-Boehm fallback
+  preserved).  alloc.hh / nursery.hh / bridge_root_registry.cc became
+  TW-include-free.  **Ratchet baseline: 21 → 19** TW-touching files.
+
+**Remaining baseline (19), categorized for the Phase 2/3 follow-up:**
+- *Permanent leaves / exemptions* (7): ffi.hh, ffi.cc, disk_cache.cc,
+  parser/v3-parse-api.cc, cli/lower_v3.hh + tw_baseenv.hh (the native-
+  lowerer translation boundary), gc-config.hh.
+- *Test harnesses* (2): test/drv-preflight.cc, test/evalscope-handles.cc
+  (construct a TW EvalState to drive v3 tests — not the library surface;
+  candidates for a structural test/ exemption).
+- *Genuine library consolidation targets* (10) — the Phase 2/3 core:
+  primops.cc, vm.cc, v3_call_flake.cc, run.cc, cli/v3-eval.cc,
+  bridge_yield.cc, bytecode_primops.cc, value_serialize.cc, run.hh, vm.hh.
+  These need the eval.hh/value.hh opacity layer (forceValue/allocValue/
+  callFunction/realisePath/… + field accessors) + the value-graph
+  marshallers — perf-gated (R1/R4: inline-forceValue → ffi-inline.h +
+  hyperfine ≤2%/phase).  value_serialize.cc (hash.hh only) + run.hh
+  (pos-table.hh only) are the lightest, but route SHARED domain types
+  (Hash, PosTable::Origin), so they need a re-export-vs-opacify decision.
 
 **Audit correction:** §2.4 #5 ("`vm.hh:11` includes `eval-gc.hh`, could
 move to .cc-only") is **FALSE** — `vm.hh` uses `traceable_allocator`
