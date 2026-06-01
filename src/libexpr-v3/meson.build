@@ -407,6 +407,7 @@ test(
   args : [
     meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'precedence',
     meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier3',
+    meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier2',
   ],
 )
 

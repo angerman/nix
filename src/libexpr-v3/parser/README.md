@@ -186,10 +186,24 @@ let/in/with/assert/rec keywords + `{ } [ ] ; = ,`).  Still `%expect 0`.
 Validated by the new tier3 battery (test/parser-ti/fixtures/tier3, 13
 fixtures) — total parser-spike-test now **67/67** byte-equal to TW.
 
-**Tier 2 + Tier 3b + Tier 4 (remaining Stage 1.4):**
-* Tier 2 — strings + antiquotation, paths (lexer STRING/PATH states)
+### Stage 1.4 Tier 2 — strings + antiquotation LANDED
+
+`v3-spike.{y,l}` gained string literals + interpolation: the flex
+`STRING` exclusive state (`%option stack`), `${...}` antiquotation
+push/pop (`${` pushes DEFAULT, `}` pops), the two content rules
+(general + trailing-`$`), `v3UnescapeStr` (port of lexer.l:48-75), and
+the `string_parts`/`string_parts_interpolated` grammar (interpolation
+→ `ConcatStrings` with `forceString=true`).  `{`/`}` are now
+state-managed (mirror lexer.l).  Still `%expect 0`.
+
+Validated by the tier2 battery (12 fixtures) — total parser-spike-test
+now **79/79** byte-equal to TW: plain/empty strings, `\n`/`\"`/`\$`
+escapes, mid/start/only/multi interpolation, strings in lists + attrs.
+
+**Tier 3b + Tier 4 + paths (remaining Stage 1.4):**
+* paths (`./foo`, `/abs`, `<nixpkgs>`, `~/x`) — lexer PATH states
 * Tier 3b — `inherit` / `inherit (e)` in binds; string + dynamic attr
-  keys (needs the STRING state)
+  keys (the STRING state is now available)
 * Tier 4 — formals (via `validateFormals`), indented strings (via
   `stripIndentation`), pipe operators, cursed-or, `let { }` form
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;

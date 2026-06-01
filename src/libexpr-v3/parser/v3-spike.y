@@ -57,8 +57,10 @@
 
 /* Token value types (mirror parser.y). */
 %token <std::string> ID   "identifier"
+%token <std::string> STR  "string"
 %token <int64_t>     INT_LIT   "integer"
 %token <double>      FLOAT_LIT "float"
+%token DOLLAR_CURLY "'${'"
 %token IF "'if'" THEN "'then'" ELSE "'else'"
 %token ASSERT "'assert'" WITH "'with'" LET "'let'" IN_KW "'in'" REC "'rec'"
 %token OR_KW "'or'"
@@ -69,6 +71,8 @@
 %type <nix::v3::ast::Node *> expr_app expr_select expr_simple
 %type <nix::v3::ast::Attrs *> binds binds1
 %type <std::vector<nix::v3::ast::Node *>> list
+%type <nix::v3::ast::Node *> string_parts
+%type <std::vector<nix::v3::ast::Node *>> string_parts_interpolated
 %type <std::vector<nix::v3::ast::AttrName>> attrpath
 %type <std::string> attr
 
@@ -180,6 +184,7 @@ expr_simple
     }
   | INT_LIT      { $$ = state->add<Int>($1); }
   | FLOAT_LIT    { $$ = state->add<Float>($1); }
+  | '"' string_parts '"' { $$ = $2; }
   | '(' expr ')' { $$ = $2; }
   | REC '{' binds '}' { $3->recursive = true; $$ = $3; }
   | '{' binds1 '}'    { $$ = $2; }
@@ -205,6 +210,27 @@ binds1
 list
   : list expr_select { $$ = std::move($1); $$.push_back($2); }
   | /* empty */      { $$ = std::vector<nix::v3::ast::Node *>{}; }
+  ;
+
+/* string literals + interpolation (parser.y:397-412).  A plain string
+ * is a single String; an interpolated one is a ConcatStrings with
+ * forceString=true. */
+string_parts
+  : STR { $$ = state->add<String>($1); }
+  | string_parts_interpolated
+    { $$ = state->add<ConcatStrings>(std::move($1), /*forceString=*/true); }
+  | /* empty */ { $$ = state->add<String>(std::string("")); }
+  ;
+
+string_parts_interpolated
+  : string_parts_interpolated STR
+    { $$ = std::move($1); $$.push_back(state->add<String>($2)); }
+  | string_parts_interpolated DOLLAR_CURLY expr '}'
+    { $$ = std::move($1); $$.push_back($3); }
+  | DOLLAR_CURLY expr '}'
+    { $$ = std::vector<nix::v3::ast::Node *>{ $2 }; }
+  | STR DOLLAR_CURLY expr '}'
+    { $$ = std::vector<nix::v3::ast::Node *>{ state->add<String>($1), $3 }; }
   ;
 
 attrpath

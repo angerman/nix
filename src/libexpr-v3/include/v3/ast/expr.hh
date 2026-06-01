@@ -416,11 +416,18 @@ struct PosExpr : Node {
     void show(std::ostream & str) const override { str << "__curPos"; }
 };
 
-// --- ConcatStrings (`+`) -- '(' e1 ' + ' e2 ' + ' ... ')'  nixexpr.cc:245
+// --- ConcatStrings (`+` operator AND string interpolation) --------
+//   show: '(' e1 ' + ' e2 ' + ' ... ')'   (nixexpr.cc:245)
+//   `forceString` distinguishes string interpolation ("${e}", true)
+//   from the `+` operator (false).  It's an EVAL/lowering concern
+//   (string coercion); show() ignores it (matches TW).
 struct ConcatStrings : Node {
     std::vector<Node *> es;
-    explicit ConcatStrings(std::vector<Node *> es, Pos p = noPos)
-        : Node(Kind::ConcatStrings, p), es(std::move(es)) {}
+    bool forceString;
+    explicit ConcatStrings(std::vector<Node *> es, bool forceString = false,
+                           Pos p = noPos)
+        : Node(Kind::ConcatStrings, p), es(std::move(es)),
+          forceString(forceString) {}
     void show(std::ostream & str) const override {
         str << "(";
         bool first = true;

@@ -22,6 +22,10 @@
 %option never-interactive
 %option nodefault
 %option nounput noinput
+%option stack
+
+%s DEFAULT
+%x STRING
 
 %top {
   // Brings in v3-spike-tab.hh + defines YYSTYPE (the parser variant
@@ -34,11 +38,43 @@
   #include "parser-state.hh"
   #include <cstdlib>
   #include <string>
+
+  // State stack management (mirrors lexer.l:98).  `%s DEFAULT` is an
+  // inclusive state so unprefixed rules (keywords/operators/...) are
+  // active in INITIAL + DEFAULT; `${` and `{` push DEFAULT so the
+  // embedded expression is lexed with those rules; `}` pops back.
+  #define PUSH_STATE(s) yy_push_state(s, yyscanner)
+  #define POP_STATE()   yy_pop_state(yyscanner)
+
+  // Port of lexer.l:48-75 unescapeStr: unescape a string-literal chunk
+  // (\\n \\r \\t \\" \\\\ \\$ ...) + normalise CR / CRLF to LF, in place.
+  // Returns the unescaped std::string.
+  static std::string v3UnescapeStr(const char * s, size_t length) {
+      std::string out;
+      out.reserve(length);
+      for (size_t i = 0; i < length; ) {
+          char c = s[i++];
+          if (c == '\\') {
+              char e = s[i++];
+              if      (e == 'n') out += '\n';
+              else if (e == 'r') out += '\r';
+              else if (e == 't') out += '\t';
+              else               out += e;
+          } else if (c == '\r') {
+              out += '\n';
+              if (i < length && s[i] == '\n') ++i;  // cr/lf -> lf
+          } else {
+              out += c;
+          }
+      }
+      return out;
+  }
 %}
 
 ID    [a-zA-Z_][a-zA-Z0-9_'\-]*
 INT   [0-9]+
 FLOAT (([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+))([Ee][+-]?[0-9]+)?
+ANY   .|\n
 
 %%
 
@@ -71,9 +107,29 @@ FLOAT (([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+))([Ee][+-]?[0-9]+)?
 {FLOAT}     { yylval->emplace<double>(std::strtod(yytext, nullptr));
               return nix::v3::spike::SpikeParser::token::FLOAT_LIT; }
 
-  /* single-char tokens returned as their char code */
+  /* String literals (mirrors lexer.l:190-200).  `"` opens the STRING
+   * exclusive state; `${` inside opens DEFAULT for the embedded expr;
+   * `}` pops back; `"` closes.  Content is unescaped via v3UnescapeStr.
+   * The two content rules handle a string ending in `$` (trailing
+   * context) vs the general case. */
+\"          { PUSH_STATE(STRING); return '"'; }
+<STRING>([^\$\"\\]|\$[^\{\"\\]|\\{ANY}|\$\\{ANY})*\$/\" |
+<STRING>([^\$\"\\]|\$[^\{\"\\]|\\{ANY}|\$\\{ANY})+ {
+              yylval->emplace<std::string>(v3UnescapeStr(yytext, (size_t) yyleng));
+              return nix::v3::spike::SpikeParser::token::STR;
+            }
+<STRING>\$\{  { PUSH_STATE(DEFAULT); return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY; }
+<STRING>\"    { POP_STATE(); return '"'; }
+
+  /* state-managed braces (mirrors lexer.l:184-188): `{` pushes DEFAULT
+   * so the contents lex with the inclusive-state rules; `}` pops
+   * (no-op pop at INITIAL — the stack-bottom marker). */
+\{          { PUSH_STATE(DEFAULT); return '{'; }
+\}          { if (YY_START != INITIAL) POP_STATE(); return '}'; }
+
+  /* other single-char tokens returned as their char code */
 [<>+\-*/!?.:()] { return yytext[0]; }
-[{}\[\];=,]     { return yytext[0]; }
+[\[\];=,]       { return yytext[0]; }
 
 [ \t\r\n]+  { /* skip whitespace */ }
 "#"[^\n]*   { /* skip line comment */ }
