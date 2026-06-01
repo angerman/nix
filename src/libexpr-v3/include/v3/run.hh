@@ -25,6 +25,7 @@ class EvalState;
 }
 
 namespace nix::v3 {
+namespace ir { struct Module; }
 
 /// Lower, compile, and run an already-parsed Expr through v3.
 ///
@@ -62,5 +63,11 @@ struct RootResult {
     Value value;
 };
 RootResult runRootExpr(EvalState & state, Expr * e);
+
+/// Run an already-LOWERED v3 IR module (the native path: lowerV3Ast →
+/// here, with no nix::Expr).  Same side-effects + lifetime contract as
+/// runRootExpr.  registerBuiltinPrimOps() must have run before lowering
+/// (lower-time findPrimOp); this repeats the idempotent setup.
+RootResult runRootExprModule(EvalState & state, ir::Module module);
 
 } // namespace nix::v3

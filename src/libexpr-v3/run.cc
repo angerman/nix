@@ -137,7 +137,7 @@ bool keepLibAlive()
     return true;
 }
 
-RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
+RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
 {
     // Idempotent: register the builtin primop table on first call.
     // Safe to call per-invocation — the underlying registry is global
@@ -228,9 +228,8 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
     PhaseAllocSnap snapAfterCompile = snapStart;
     PhaseAllocSnap snapAfterRun = snapStart;
 
-    // Lower the AST → IR → bytecode.  `lowerNixExpr` requires `e` to
-    // have had `bindVars` applied; the caller's contract.
-    auto module = lowerNixExpr(e, state.symbols, state.positions);
+    // `module` is the already-lowered IR (native lowerV3Ast OR the TW
+    // lowerNixExpr path via the runRootExpr(Expr*) wrapper below).
     pt.mark(pt.lower_ms);
 
     // #538: run the IR optimization pipeline (constant fold, CSE,
@@ -1534,6 +1533,19 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
         }
     }
     return out;
+}
+
+// Back-compat wrapper for the TW (nix::Expr) lowering path: lower via
+// lowerNixExpr, then run the module.  registerBuiltinPrimOps() must run
+// BEFORE lowering (lower-time findPrimOp resolution); runRootExprModule
+// repeats the full idempotent setup.  Native callers skip this and call
+// runRootExprModule(state, lowerV3Ast(...)) directly — that path no longer
+// touches nix::Expr.  This wrapper retires once every parse site is native
+// (then lowerNixExpr + lower.cc's nix::Expr path are deleted).
+RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
+{
+    registerBuiltinPrimOps();
+    return runRootExprModule(state, lowerNixExpr(e, state.symbols, state.positions));
 }
 
 } // namespace nix::v3
