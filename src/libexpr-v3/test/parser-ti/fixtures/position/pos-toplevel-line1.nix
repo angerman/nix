@@ -1,0 +1,1 @@
+let p = builtins.unsafeGetAttrPos "x" { x = 1; }; in { inherit (p) column line; }

@@ -108,7 +108,7 @@ static std::string slurp(const std::string & path)
 static void usage(const char * argv0)
 {
     std::fprintf(stderr,
-        "usage: %s [--file PATH | --expr EXPR] [--json] [--strict]\n"
+        "usage: %s [--file PATH | --expr EXPR] [--json] [--strict] [--parse]\n"
         "       %s EXPR\n",
         argv0, argv0);
 }
@@ -124,6 +124,14 @@ int main(int argc, char ** argv)
 {
     std::string path, expr;
     bool jsonOut = false, strict = false;
+    // TI.2 (PARSER_PROJECT_PLAN_2026-06-01 §4): --parse prints the
+    // parsed AST and exits, mirroring `nix-instantiate --parse`.
+    // TODAY this uses TW's parser (the only parser); when the v3-native
+    // parser lands behind NIX_V3_NATIVE_PARSER=1 (Stage 1.4+), the same
+    // flag will print the v3 AST.  The parser-TI fixture batteries
+    // (test/parser-ti/fixtures/precedence) compare this output against
+    // committed goldens.
+    bool parseOnly = false;
     // IR-CHECK MVP (2026-05-18): IR dump mode + opt control.
     IrDumpMode irDumpMode = IrDumpMode::None;
     bool noOpt = false;  // --no-opt: skip optimise() entirely
@@ -148,6 +156,7 @@ int main(int argc, char ** argv)
         else if (a == "--expr" && i + 1 < argc) expr = argv[++i];
         else if (a == "--json")     jsonOut = true;
         else if (a == "--strict")   strict = true;
+        else if (a == "--parse" || a == "--parse-only") parseOnly = true;
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else if (a == "-I" && i + 1 < argc)
             extraSearchPath.emplace_back(argv[++i]);
@@ -268,6 +277,20 @@ int main(int argc, char ** argv)
             e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath(cwd)));
         }
         e->bindVars(state, state.staticBaseEnv);
+
+        // TI.2: --parse prints the AST and exits (before any lowering /
+        // eval).  Matches `nix-instantiate --parse` byte-for-byte:
+        // `e->show(symbols, cout)` + trailing newline.  This is the
+        // validation surface for the parser-TI precedence battery.
+        //
+        // Today `e` is a TW nix::Expr (TW parser).  When the v3-native
+        // parser lands, `e` becomes the v3 AST and this same code path
+        // prints it — the fixtures' goldens stay the contract.
+        if (parseOnly) {
+            e->show(state.symbols, std::cout);
+            std::cout << "\n";
+            return 0;
+        }
 
         nix::v3::registerBuiltinPrimOps();
         nix::v3::setNixEvalState(&state);
