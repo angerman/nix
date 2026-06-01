@@ -74,6 +74,8 @@ namespace nix {
     class  Logger;
     struct Value;       // TW value (distinct from nix::v3::Value)
     class  EvalState;   // host evaluator — opacity Level 1 (methods only)
+    class  SymbolTable;
+    class  PosTable;
 }
 
 namespace nix::v3 {
@@ -104,6 +106,13 @@ void forceValue(nix::EvalState & state, nix::Value & v);
 /// Throws (like `state.getBuiltin`) when `name` isn't a registered
 /// builtin.  Startup-only / cold.
 void setTreeWalkerBuiltin(nix::EvalState & state, const std::string & name, nix::Value * value);
+
+/// Field accessors for the host's symbol + position tables (opacity
+/// Level 1 — v3 reaches these via accessors, never the raw fields).  Used
+/// by the parse→lower→run entry to feed lowerV3Ast / addOrigin.  Cold
+/// (once per eval), so out-of-line is perf-fine.
+const nix::SymbolTable & symbols(nix::EvalState & state);
+nix::PosTable &          positions(nix::EvalState & state);
 
 }  // namespace ffi
 

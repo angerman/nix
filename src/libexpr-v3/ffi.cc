@@ -58,6 +58,9 @@ void setTreeWalkerBuiltin(nix::EvalState & state, const std::string & name, nix:
     state.getBuiltin(name) = *value;  // throws if `name` isn't a builtin
 }
 
+const nix::SymbolTable & symbols(nix::EvalState & state) { return state.symbols; }
+nix::PosTable &          positions(nix::EvalState & state) { return state.positions; }
+
 }  // namespace ffi
 
 // ---------------------------------------------------------------------------

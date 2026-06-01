@@ -28,7 +28,7 @@
 #include "v3/nursery.hh"
 #include "v3/barrier.hh"
 
-#include "nix/expr/eval.hh"
+#include "v3/ffi.hh"  // ffi::symbols/positions + EvalState fwd — no direct eval.hh
 
 #include "v3/gc-config.hh"  // NIX_USE_BOEHMGC (v3-owned indirection)
 
@@ -1559,7 +1559,7 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
     nix::v3::parser::parseString(st, source);
     if (!canLowerV3(st.result))
         throw nix::Error("v3: native lowering cannot handle this expression");
-    auto module = lowerV3Ast(state.symbols, st.result, &state.positions, origin,
+    auto module = lowerV3Ast(ffi::symbols(state), st.result, &ffi::positions(state), origin,
                              &twBaseEnvGlobals(state));
     return runRootExprModule(state, std::move(module));
 }
@@ -1569,7 +1569,7 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
 // eval.hh / parser / position headers.
 RootResult runRootExprFromString(nix::EvalState & state, const std::string & source)
 {
-    auto origin = state.positions.addOrigin(
+    auto origin = ffi::positions(state).addOrigin(
         nix::Pos::String{.source = nix::make_ref<std::string>(source)}, source.size());
     return runRootExprFromString(state, source, /*basePath*/ "", /*homePath*/ "", origin);
 }
