@@ -87,6 +87,7 @@ PATH_SEG    {PATH_CHAR}*\/
 HPATH       \~(\/{PATH_CHAR}+)+\/?
 HPATH_START \~\/
 SPATH       \<{PATH_CHAR}+(\/{PATH_CHAR}+)*\>
+URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~\*\']+
 
 %%
 
@@ -192,7 +193,7 @@ SPATH       \<{PATH_CHAR}+(\/{PATH_CHAR}+)*\>
 <PATH_START><<EOF>> {
                 /* unreachable: PATH_START is entered only after the
                  * yyless(0) rewind of a {PATH_SEG}/{HPATH_START} match. */
-                POP_STATE(); return yytext[0];
+                POP_STATE(); return (unsigned char) yytext[0];
               }
 {PATH} {
                 if (yytext[yyleng-1] == '/') PUSH_STATE(INPATH_SLASH);
@@ -232,6 +233,12 @@ SPATH       \<{PATH_CHAR}+(\/{PATH_CHAR}+)*\>
                 yylval->emplace<std::string>(yytext, (size_t) yyleng);
                 return nix::v3::spike::SpikeParser::token::SPATH;
               }
+{URI} {
+                // URL literal (lexer.l:316) -> a string (parser.y:372);
+                // the deprecation lint is omitted (diagnostic only).
+                yylval->emplace<std::string>(yytext, (size_t) yyleng);
+                return nix::v3::spike::SpikeParser::token::URI;
+              }
 
   /* `${` in the default context = a dynamic attr key / select / has-attr
    * (`{ ${e} = …; }`, `x.${e}`, `x ? ${e}`).  Mirrors lexer.l's
@@ -249,13 +256,20 @@ SPATH       \<{PATH_CHAR}+(\/{PATH_CHAR}+)*\>
 \}          { if (YY_START != INITIAL) POP_STATE(); return '}'; }
 
   /* other single-char tokens returned as their char code.  `@` is the
-   * formal-set @-binding separator (`args@{…}` / `{…}@args`). */
-[<>+\-*/!?.:()@] { return yytext[0]; }
-[\[\];=,]        { return yytext[0]; }
+   * formal-set @-binding separator (`args@{…}` / `{…}@args`).  Cast to
+   * unsigned char (lexer.l:348) so high bytes don't become negative
+   * token values (which bison would treat as EOF). */
+[<>+\-*/!?.:()@] { return (unsigned char) yytext[0]; }
+[\[\];=,]        { return (unsigned char) yytext[0]; }
 
 [ \t\r\n]+  { /* skip whitespace */ }
-"#"[^\n]*   { /* skip line comment */ }
+\#[^\r\n]*  { /* skip line comment (lexer.l:342) */ }
+  /* block comments `/* … *​/` incl. `/** … *​/` doc comments (the long-
+   * comment regex, lexer.l:343): non-nesting; `*`s only end the comment
+   * when immediately followed by `/`.  Beats `{PATH}` / `/` by longest
+   * match. */
+\/\*([^*]|\*+[^*/])*\*+\/  { /* skip block comment */ }
 
-.           { return yytext[0]; }   /* let the parser reject */
+.           { return (unsigned char) yytext[0]; }   /* let the parser reject (unsigned: lexer.l:348) */
 
 %%

@@ -317,11 +317,41 @@ pipe chains both directions, `f or`→`(f or)`, `let { body = 1; }`→
 `(rec { body = 1; }).body`.  **The expr grammar surface is now complete**
 (all 27 AST node kinds + all 7 flex states + all 3 ParserState helpers).
 
-### Remaining: INTEGRATION (Stage 1.5)
+### Stage 1.5 — INTEGRATION (real-file validation) LANDED
 
-Wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1` (a real file
-supplies basePath → unblocks relative/home path validation) + full
-263-file + 143 lang validation; rename v3-spike → v3-parser.
+`cli/v3-parse.cc` parses a real .nix FILE with the v3-native parser and
+prints `show()`, byte-comparable to `nix-instantiate --parse`.  Parsing
+a file supplies the source-file `basePath` (+ `$HOME`), so RELATIVE
+(`./foo`) and HOME (`~/foo`) path literals now resolve byte-equal to TW
+(the piece Tier 4c deferred).  `ParserState` gained `basePath`/`homePath`
+and `makePath` resolves against them.
+
+`test/run-parser-sweep.sh` sweeps the lang corpus: **MATCH 260 / DIFF 0 /
+V3-FAIL 0** over the 273 parseable files (the 5 TW-FAIL + 2 parse-fail
+residuals are all `undefined variable` = bindVars, which `v3-parse` does
+not run — that is Stage 2 / lowering); **39/41 parse-fail correctly
+rejected** (the 2 remainders are bindVars too).
+
+The sweep surfaced + fixed **6 parser correctness gaps** the synthetic
+fixtures never exercised — all now regression-guarded by the tier5
+battery (**parser-spike-test = 151/151**):
+1. **block comments** `/* … */` (incl. `/** doc */`) — lexer.l:343
+2. **URL literals** `http://…` → string — the `URI` token (lexer.l:316)
+3. **string-keyed inherit** `inherit (e) "x"` / `${"x"}` — `attrs
+   string_attr` (static→name, dynamic→TW's "not allowed in inherit")
+4. **inherit-from merge** — the InheritedFrom `fromIdx` shift on attrset
+   merge (`{ m={inherit(y)d;}; m={inherit(x)c;}; }` keeps the two
+   sources distinct)
+5. **non-ASCII bytes** — `return (unsigned char) yytext[0]` (lexer.l:348)
+   so high bytes aren't negative token values bison reads as EOF
+6. **dynamic-in-let** — `${e}` in `let` is a TW parse error
+   (parser.y:270); `${"a"}` (static) stays allowed
+
+### Remaining (Stage 2)
+
+bindVars (variable→De-Bruijn resolution) + collapse the v3 AST to IR
+(replacing lower.cc's `nix::Expr` path); rename v3-spike → v3-parser;
+optional opt-in via `NIX_V3_NATIVE_PARSER=1` in v3-eval.
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;
   validate the 68 fixtures + 263-file sweep + 143 lang tests; rename
   v3-spike → v3-parser; retire the throwaway arithmetic framing.

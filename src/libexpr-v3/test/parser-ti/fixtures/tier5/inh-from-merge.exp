@@ -1,0 +1,1 @@
+(let x = { c = 1; }; y = { d = 2; }; in { m = { inherit (y) d; inherit (x) c; }; })

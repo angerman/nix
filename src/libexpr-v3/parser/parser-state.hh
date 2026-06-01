@@ -72,6 +72,16 @@ struct ParserState {
     /// production).  Mirrors TW's `ParserState::result`.
     Node * result = nullptr;
 
+    /// Source-file directory, for resolving RELATIVE path literals
+    /// (`./foo`) — mirrors TW's `state->basePath.path`.  Empty in the
+    /// string-buffer spike (relative paths then store the literal,
+    /// deferred); set by the file-parsing entry (cli/v3-parse) to the
+    /// absolute canonical dirname of the source file.
+    std::string basePath;
+    /// `$HOME` for resolving HOME path literals (`~/foo`) — mirrors TW's
+    /// `getHome()`.  Empty in the spike (home paths store the literal).
+    std::string homePath;
+
     template <typename T, typename... Args>
     T * add(Args &&... a) { return pool.add<T>(std::forward<Args>(a)...); }
 
@@ -165,8 +175,19 @@ struct ParserState {
             if (literal.size() > 1 && literal.back() == '/' && p != "/") p += '/';
             return add<Path>(std::move(p), pos);
         }
-        // relative / home: resolution DEFERRED (no basePath in the spike).
-        return add<Path>(std::string(literal), pos);
+        if (!literal.empty() && literal.front() == '~') {
+            // HOME path (parser.y:457): getHome() + literal[1:], NO
+            // canonicalisation (TW concatenates directly).  Deferred to
+            // literal when homePath is unset (the spike).
+            if (homePath.empty()) return add<Path>(std::string(literal), pos);
+            return add<Path>(homePath + std::string(literal.substr(1)), pos);
+        }
+        // RELATIVE path (parser.y:438): CanonPath(literal, basePath).abs().
+        // Deferred to literal when basePath is unset (the spike).
+        if (basePath.empty()) return add<Path>(std::string(literal), pos);
+        std::string p = canonAbs(basePath + "/" + std::string(literal));
+        if (literal.size() > 1 && literal.back() == '/' && p != "/") p += '/';
+        return add<Path>(std::move(p), pos);
     }
 
     // -- string / dynamic attr keys --------------------------------
@@ -260,33 +281,31 @@ struct ParserState {
                 // nested attrsets).  N.B. as upstream notes, any `rec`
                 // marker on `ae` is discarded — a long-standing wart
                 // (NixOS/nix#9020) we reproduce for parity.
+                //
+                // `ae`'s InheritedFrom defs carry a fromIdx into ae's OWN
+                // inheritFromExprs; once ae's exprs are appended to
+                // jAttrs (at offset fromBase), those copied defs must
+                // shift fromIdx by fromBase so each inherited name keeps
+                // pointing at its own source attrset.  Compute fromBase
+                // BEFORE the append.
+                int fromBase = static_cast<int>(jAttrs->inheritFromExprs.size());
                 for (auto & ad : ae->attrs) {
                     if (ad.kind == Attrs::AttrKind::Plain) {
                         path.emplace_back(ad.name);
                         addAttrLeaf(jAttrs, path, path.size() - 1, ad.name, ad, pos);
                         path.pop_back();
-                    } else {
-                        // Inherited / InheritedFrom in a merge: rare;
-                        // push directly (inheritFrom source-index fixup
-                        // handled below via inheritFromExprs append).
+                    } else if (ad.kind == Attrs::AttrKind::InheritedFrom) {
+                        Attrs::AttrDef nd = ad;
+                        nd.fromIdx = ad.fromIdx + fromBase;
+                        jAttrs->attrs.push_back(nd);
+                    } else {  // Inherited (no source index)
                         jAttrs->attrs.push_back(ad);
                     }
                 }
                 for (auto & d : ae->dynamicAttrs)
                     jAttrs->dynamicAttrs.push_back(d);
-                // InheritedFrom indices in merged attrs refer to ae's
-                // inheritFromExprs; shift by jAttrs's current count,
-                // then append.  (Matches upstream displ fixup.)
-                if (!ae->inheritFromExprs.empty()) {
-                    int base = static_cast<int>(jAttrs->inheritFromExprs.size());
-                    for (auto & d : jAttrs->attrs)
-                        if (d.kind == Attrs::AttrKind::InheritedFrom && d.fromIdx >= 0
-                            && d.fromIdx < static_cast<int>(ae->inheritFromExprs.size()))
-                            ; // (only newly-merged InheritedFrom need shift; see note)
-                    for (auto & f : ae->inheritFromExprs)
-                        jAttrs->inheritFromExprs.push_back(f);
-                    (void) base;
-                }
+                for (auto & f : ae->inheritFromExprs)
+                    jAttrs->inheritFromExprs.push_back(f);
                 ae->attrs.clear();
                 ae->dynamicAttrs.clear();
                 ae->inheritFromExprs.clear();

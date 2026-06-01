@@ -64,6 +64,7 @@
 %token <std::string> PATH "path"
 %token <std::string> HPATH "'~/…' path"
 %token <std::string> SPATH "'<…>' path"
+%token <std::string> URI "URI"
 %token PATH_END "end of path"
 %token <int64_t>     INT_LIT   "integer"
 %token <double>      FLOAT_LIT "float"
@@ -131,7 +132,14 @@ expr_function
     }
   | ASSERT expr ';' expr_function { $$ = state->add<Assert>($2, $4); }
   | WITH expr ';' expr_function   { $$ = state->add<With>($2, $4); }
-  | LET binds IN_KW expr_function { $$ = state->add<Let>($2, $4); }
+  | LET binds IN_KW expr_function {
+      // TW rejects truly-dynamic keys in `let` at parse time
+      // (parser.y:270).  `${"a"}` (plain string) is static and allowed;
+      // `${"a" + ""}` / `${e}` land in dynamicAttrs and are rejected.
+      if (!$2->dynamicAttrs.empty())
+          throw ParseError("dynamic attributes not allowed in let", 0);
+      $$ = state->add<Let>($2, $4);
+    }
   | expr_if
   ;
 
@@ -274,6 +282,11 @@ expr_simple
              std::vector<Node *>{ state->add<Var>(std::string("__nixPath")),
                                   state->add<String>(std::move(inner)) });
     }
+  | URI {
+      // URL literal (parser.y:372) -> a plain string.  The deprecation
+      // lint is omitted (diagnostic only).
+      $$ = state->add<String>($1);
+    }
   | '(' expr ')' { $$ = $2; }
   | REC '{' binds '}' { $3->recursive = true; $$ = $3; }
   | LET '{' binds '}' {
@@ -317,11 +330,19 @@ binds1
     { $$ = state->add<Attrs>(false); state->addAttr($$, std::move($1), $3, 0); }
   ;
 
-/* inherit name-list (parser.y:520-535).  ID names only for Tier 3b;
- * string-keyed inherit (`inherit "a";`) is deferred, dynamic-keyed
- * inherit is a TW parse error. */
+/* inherit name-list (parser.y:520-535).  `attr` = ID/OR_KW names;
+ * `string_attr` = a string key (`inherit "a"; ` / `inherit ${"a"};`):
+ * a plain String literal contributes a STATIC name, anything dynamic
+ * is a TW parse error ("dynamic attributes not allowed in inherit"). */
 attrs
   : attrs attr { $$ = std::move($1); $$.push_back($2); }
+  | attrs string_attr {
+      $$ = std::move($1);
+      if ($2->kind == Kind::String)
+          $$.push_back(static_cast<String *>($2)->s);
+      else
+          throw ParseError("dynamic attributes not allowed in inherit", 0);
+    }
   | /* empty */ { $$ = std::vector<std::string>{}; }
   ;
 

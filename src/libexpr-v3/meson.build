@@ -398,6 +398,18 @@ v3_parser_spike_test = executable(
   override_options : ['unity=off'],
   install : false,
 )
+# v3-parse — Stage 1.5 integration CLI: parses a real FILE (-> basePath)
+# with the v3-native parser and prints show(), for byte-comparison vs
+# `nix-instantiate --parse` over a real-file corpus (parse-only; no eval).
+v3_parse = executable(
+  'v3-parse',
+  'cli/v3-parse.cc',
+  v3_spike_tab,
+  v3_spike_lex,
+  include_directories : [include_dirs, include_directories('parser')],
+  override_options : ['unity=off'],
+  install : false,
+)
 test(
   'v3-parser-spike-test',
   v3_parser_spike_test,
@@ -414,6 +426,7 @@ test(
     meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier4b',
     meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier4c',
     meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier4d',
+    meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'tier5',
   ],
 )
 

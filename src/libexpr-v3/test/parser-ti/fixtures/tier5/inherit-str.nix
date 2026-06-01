@@ -1,0 +1,1 @@
+let e = { x = 1; }; in { inherit (e) "x"; }
