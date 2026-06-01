@@ -29,6 +29,7 @@
 #include "v3/ir.hh"
 #include "v3/primop.hh"
 
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <stdexcept>
@@ -51,10 +52,22 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
     case a::Kind::Var:
         return true;
     case a::Kind::Lambda: {
-        // Phase 2a: single-arg only.  Formals (Phase 2b) → bridge.
+        // Phase 2a: single-arg only.  Formals (Phase 2b+) → bridge.
         auto * lam = static_cast<const a::Lambda *>(n);
         if (lam->hasFormals) return false;
         return canLowerV3(lam->body);
+    }
+    case a::Kind::Let: {
+        // Phase 2b: plain bindings only (no inherit / inherit-from /
+        // dynamic keys → bridge those).
+        auto * let = static_cast<const a::Let *>(n);
+        auto * at = let->attrs;
+        if (!at->inheritFromExprs.empty() || !at->dynamicAttrs.empty()) return false;
+        for (auto & d : at->attrs) {
+            if (d.kind != a::Attrs::AttrKind::Plain) return false;
+            if (!canLowerV3(d.value)) return false;
+        }
+        return canLowerV3(let->body);
     }
     case a::Kind::Call: {
         auto * c = static_cast<const a::Call *>(n);
@@ -107,7 +120,13 @@ struct LowererV3 {
     /// resolves against this (innermost-first); cross-function refs become
     /// upvalues — emit's computeFreeVars derives those from the IR, so the
     /// lowerer only needs correct VarRefs (freeVars passed empty).
-    struct Scope { std::map<std::string, ir::VarId> byName; };
+    /// A scope is either regular (byName → a real param/binding VarId)
+    /// or rec (`recVar` set → its names resolve to RecBindingSlotRef on
+    /// the rec attrset; byName values are placeholders).
+    struct Scope {
+        std::map<std::string, ir::VarId> byName;
+        ir::VarId recVar = ir::kInvalid;
+    };
     std::vector<Scope> scopes;
 
     explicit LowererV3(const nix::SymbolTable & symbols) : symbols(symbols) {}
@@ -129,7 +148,12 @@ struct LowererV3 {
         const std::string & name = v->name;
         for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
             auto f = it->byName.find(name);
-            if (f != it->byName.end()) return addBinding(ir::VarRef{f->second});
+            if (f == it->byName.end()) continue;
+            if (it->recVar != ir::kInvalid)
+                // rec binding → heap-stable slot ref (lower.cc thunkify
+                // uses RecBindingSlotRef; strict contexts force it).
+                return addBinding(ir::RecBindingSlotRef{it->recVar, m.internSymbol(name)});
+            return addBinding(ir::VarRef{f->second});
         }
         if (name == "true")  return addBinding(ir::LitBool{true});
         if (name == "false") return addBinding(ir::LitBool{false});
@@ -167,6 +191,8 @@ struct LowererV3 {
             return lowerVar(static_cast<const a::Var *>(n));
         case a::Kind::Lambda:
             return lowerLambda(static_cast<const a::Lambda *>(n));
+        case a::Kind::Let:
+            return lowerLet(static_cast<const a::Let *>(n));
 
         case a::Kind::Call: {
             auto * c = static_cast<const a::Call *>(n);
@@ -242,6 +268,68 @@ struct LowererV3 {
         scopes.pop_back();
 
         return addBinding(ir::Lambda{fid, /*freeVars*/ {}, /*lexicalWiths*/ {}});
+    }
+
+    /// Phase 2b: `let … in body` (plain bindings only — canLowerV3
+    /// rejects inherit / inherit-from / dynamic).  Nix `let` is
+    /// mutually recursive: each binding becomes a thunk Function lowered
+    /// in the rec scope; siblings resolve via RecBindingSlotRef on the
+    /// rec attrset.  Emits ir::LetRec (emit + computeFreeVars handle the
+    /// rec-slot wiring + outerUpvalues).  Mirrors lower.cc::lowerLetRec.
+    ir::VarId lowerLet(const nix::v3::ast::Let * let)
+    {
+        const auto & defs = let->attrs->attrs;
+        // Canonical (by-name) order for stable FuncId allocation (#815).
+        std::vector<const nix::v3::ast::Attrs::AttrDef *> bs;
+        bs.reserve(defs.size());
+        for (auto & d : defs) bs.push_back(&d);
+        std::stable_sort(bs.begin(), bs.end(),
+            [](const auto * a, const auto * b) { return a->name < b->name; });
+
+        ir::VarId recVar = m.freshVar();
+        m.recVarIds.push_back(recVar);
+
+        // Build the rec scope (names resolve to rec-slots on recVar).
+        Scope recScope;
+        recScope.recVar = recVar;
+        for (auto * d : bs) recScope.byName.emplace(d->name, ir::kInvalid);
+
+        // Lower each binding's def into its own thunk Function, in the
+        // rec scope (so sibling refs resolve via RecBindingSlotRef).
+        std::vector<ir::FuncId> fids;
+        fids.reserve(bs.size());
+        for (auto * d : bs) {
+            m.functions.emplace_back();
+            ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+            auto eb = m.freshBlock();
+            m.functions[fid].entryBlock = eb;
+            m.functions[fid].name = d->name;
+            fids.push_back(fid);
+            blockStack.push_back(eb);
+            scopes.push_back(recScope);
+            setReturn(lowerExpr(d->value));
+            scopes.pop_back();
+            blockStack.pop_back();
+        }
+
+        ir::LetRec lr;
+        lr.recVar = recVar;
+        lr.hasBody = true;
+        lr.entries.reserve(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            ir::LetRec::Entry en;
+            en.name = m.internSymbol(bs[i]->name);
+            en.thunkBody = fids[i];
+            lr.entries.push_back(std::move(en));
+        }
+        // The LetRec binds recVar in the current block (before the body).
+        m.blocks[blockStack.back()].bindings.push_back({recVar, std::move(lr)});
+
+        // Lower the body in the rec scope.
+        scopes.push_back(recScope);
+        ir::VarId rv = lowerExpr(let->body);
+        scopes.pop_back();
+        return addBinding(ir::VarRef{rv});
     }
 
     ir::Module run(const nix::v3::ast::Node * e)
