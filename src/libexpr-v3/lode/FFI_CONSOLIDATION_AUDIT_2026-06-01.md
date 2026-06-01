@@ -63,26 +63,35 @@ audit.
   gc-config.hh) are now PATH-PATTERN EXEMPT (audit §5.1); the baseline file
   holds ONLY genuine library migration targets and shrinks to EMPTY at the
   end state.
-- **Phase 2 first slice — DONE** (`f537593c0`): added the §3.4
-  `nix::v3::ffi::forceValue(EvalState&, Value&)` shim (Option A, impl in
-  ffi.cc — the one TU that includes eval.hh) and migrated `bridge_yield.cc`
-  fully behind ffi.hh — its two cold/bridge forceValue calls route through
-  the shim, dropping `eval.hh` + `pos-idx.hh` (the shim's noPos default
-  removes the PosIdx need too).  **Baseline: 10 → 9.**
+- **Phase 2 migrations — DONE** (`f537593c0`, `c30623c50`, `9e4933ad1`,
+  `1fafc421e`): added the ffi shim surface — `nix::v3::ffi::forceValue`
+  (§3.4), `ffi::setTreeWalkerBuiltin`, and the synthetic-source
+  `runRootExprFromString(state, source)` entry (in run.cc, the parse+lower+
+  run owner) — plus broadened `gc-config.hh` to be the single Boehm/GC
+  indirection (NIX_USE_BOEHMGC + traceable_allocator + initGC, via
+  eval-gc.hh) and added `nix/util/hash.hh` to ffi.hh's Layer-0.  Migrated
+  fully behind ffi.hh (all validated lang 143/143 + drvPath byte-equal):
+  `bridge_yield.cc` (cold forceValue), `bytecode_primops.cc` (the wrapper
+  installer → runRootExprFromString + setTreeWalkerBuiltin), `vm.hh`
+  (traceable_allocator), `value_serialize.cc` (Hash).  **Baseline: 10 → 6.**
 
-**Remaining baseline = 9 genuine library targets** (the Phase 2/3 core):
-primops.cc, vm.cc, v3_call_flake.cc, run.cc, cli/v3-eval.cc,
-bytecode_primops.cc, value_serialize.cc, run.hh, vm.hh.  These need the
-eval.hh/value.hh opacity layer (forceValue/allocValue/callFunction/
-realisePath/… + FIELD accessors `state.symbols`/`positions`/`store`/
-`rootFS`) + the value-graph marshallers (treeWalkerToV3 / v3ToTreeWalker
-in primops.cc).  PERF-GATED (R1/R4): the HOT-path forceValue sites in
-vm.cc / primops.cc need the `ffi-inline.h` private-header trick + hyperfine
-≤2%/phase BEFORE adoption — the `ffi::forceValue` shim is now the
-foundation.  Lightest remaining: value_serialize.cc (hash.hh only) + run.hh
-(pos-table.hh only), but both route SHARED domain types (Hash,
-PosTable::Origin) → need a re-export-vs-opacify decision + the ffi.hh
-structure work (§3.6).
+**Remaining baseline = 6 genuine library targets** — the genuinely-hard /
+blocked core:
+- **primops.cc, vm.cc** — HOT-path `eval.hh` (forceValue/allocValue/
+  callFunction/realisePath/…) + the value-graph marshallers
+  (treeWalkerToV3 / v3ToTreeWalker in primops.cc).  **PERF-GATED (R1/R4):
+  the out-of-line shim is only safe on cold paths; the hot sites need the
+  `ffi-inline.h` private-header trick + a hyperfine ≤2% gate on a
+  release+LTO build — which this `-O0`/no-LTO debug tree CANNOT measure.
+  `ffi::forceValue` is the foundation; adoption waits for a release build.**
+- **v3_call_flake.cc, cli/v3-eval.cc** — carry genuine Category-A leaves
+  (flake/fetcher/store/settings + CLI-main env setup); the audit's Phase 4
+  moves the bridge marshallers + these calls into ffi.cc (multi-day).
+- **run.cc** — the parse→lower→run orchestrator (EvalState field access +
+  the setup pipeline); like ffi.cc, a boundary file.
+- **include/v3/run.hh** — `PosTable::Origin` in the public
+  runRootExprFromString signature (a position-boundary type; needs the
+  Level-2 PosIdx/Origin mirror or a run-entry exemption).
 
 **Audit correction:** §2.4 #5 ("`vm.hh:11` includes `eval-gc.hh`, could
 move to .cc-only") is **FALSE** — `vm.hh` uses `traceable_allocator`
