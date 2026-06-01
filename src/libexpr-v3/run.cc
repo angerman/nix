@@ -233,8 +233,8 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     PhaseAllocSnap snapAfterCompile = snapStart;
     PhaseAllocSnap snapAfterRun = snapStart;
 
-    // `module` is the already-lowered IR (native lowerV3Ast OR the TW
-    // lowerNixExpr path via the runRootExpr(Expr*) wrapper below).
+    // `module` is the already-lowered IR (from lowerV3Ast — the native
+    // parse+lower path; there is no longer a nix::Expr lowering path).
     pt.mark(pt.lower_ms);
 
     // #538: run the IR optimization pipeline (constant fold, CSE,

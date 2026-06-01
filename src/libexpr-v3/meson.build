@@ -278,10 +278,9 @@ endif
 v3_eval = executable(
   'v3-eval',
   'cli/v3-eval.cc',
-  # Stage 2: the v3-native parser comes in via `this_library` (which now
-  # links v3_parser_lib) — NIX_V3_NATIVE_PARSER=1 parses natively, then
-  # either lowers natively (NIX_V3_NATIVE_LOWER=1) or bridges to nix::Expr
-  # (cli/v3-to-nixexpr.hh).
+  # Stage 2 (complete): the v3-native parser comes in via `this_library`
+  # (which links v3_parser_lib); v3-eval always parses natively and lowers
+  # the v3 AST → IR directly (lowerV3Ast) — no nix::Expr.
   dependencies : deps_public + deps_private + deps_other + [
     declare_dependency(
       link_with : this_library,
