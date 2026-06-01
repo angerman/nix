@@ -299,6 +299,7 @@ int main(int argc, char ** argv)
         // v3 AST owner — must outlive lowering when native-lowering.
         nix::v3::ast::ParserState v3st;
         bool useNativeLower = false;  // lower v3st.result → IR directly
+        std::optional<nix::PosTable::Origin> nativeOrigin;  // for native attr/formal positions
 
         nix::Expr * e = nullptr;
         if (!path.empty() && path != "-") {
@@ -309,14 +310,14 @@ int main(int argc, char ** argv)
                 v3st.basePath = abs.parent_path().string();
                 v3st.homePath = homePath;
                 v3ParseInto(v3st, text);
-                if (s_nativeLower && !parseOnly && nix::v3::canLowerV3(v3st.result))
+                // Same origin TW uses (Pos::Origin(path)) so attr/formal
+                // positions (unsafeGetAttrPos) match byte-for-byte.
+                auto po = state.positions.addOrigin(nix::Pos::Origin(sp), text.size());
+                if (s_nativeLower && !parseOnly && nix::v3::canLowerV3(v3st.result)) {
                     useNativeLower = true;
-                else {
-                    // Bridge: same origin TW uses (Pos::Origin(path)) so
-                    // unsafeGetAttrPos' `file` matches byte-for-byte.
-                    auto po = state.positions.addOrigin(nix::Pos::Origin(sp), text.size());
+                    nativeOrigin.emplace(po);
+                } else
                     e = nix::v3::toNixExpr(state, v3st.result, po);
-                }
             } else
                 e = state.parseExprFromFile(sp);
         } else {
@@ -332,13 +333,13 @@ int main(int argc, char ** argv)
                 v3st.basePath = cwd;
                 v3st.homePath = homePath;
                 v3ParseInto(v3st, expr);
-                if (s_nativeLower && !parseOnly && nix::v3::canLowerV3(v3st.result))
+                auto po = state.positions.addOrigin(
+                    nix::Pos::String{.source = nix::make_ref<std::string>(expr)}, expr.size());
+                if (s_nativeLower && !parseOnly && nix::v3::canLowerV3(v3st.result)) {
                     useNativeLower = true;
-                else {
-                    auto po = state.positions.addOrigin(
-                        nix::Pos::String{.source = nix::make_ref<std::string>(expr)}, expr.size());
+                    nativeOrigin.emplace(po);
+                } else
                     e = nix::v3::toNixExpr(state, v3st.result, po);
-                }
             } else
                 e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath(cwd)));
         }
@@ -385,7 +386,7 @@ int main(int argc, char ** argv)
         // Native lowering (Stage 2) when gated + supported; else the
         // bridge's nix::Expr through the existing lowerNixExpr.
         auto m = useNativeLower
-            ? nix::v3::lowerV3Ast(state.symbols, v3st.result)
+            ? nix::v3::lowerV3Ast(state.symbols, v3st.result, &state.positions, *nativeOrigin)
             : nix::v3::lowerNixExpr(e, state.symbols, state.positions);
 
         // IR-CHECK MVP path: when --emit-ir / --emit-ir-raw is set,

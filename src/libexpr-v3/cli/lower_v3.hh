@@ -28,10 +28,13 @@
 #include "v3/ast/expr.hh"
 #include "v3/ir.hh"
 #include "v3/primop.hh"
+#include "v3/alloc.hh"            // recordPosSnapshot
+#include "nix/util/pos-table.hh"  // PosTable + Pos::Origin
 
 #include <algorithm>
 #include <deque>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -46,13 +49,13 @@ inline bool canLowerV3(const nix::v3::ast::Node * n);
 inline bool canLowerAttrDefs(const nix::v3::ast::Attrs * at)
 {
     namespace a = nix::v3::ast;
-    // Phase 4a: Plain + Inherited.  InheritedFrom (→ inheritFromExprs)
-    // is Phase 4b; dynamic keys are Phase 4c → bridge those.
-    if (!at->inheritFromExprs.empty() || !at->dynamicAttrs.empty()) return false;
-    for (auto & d : at->attrs) {
-        if (d.kind == a::Attrs::AttrKind::InheritedFrom) return false;
+    // Phase 4a/4b: Plain + Inherited + InheritedFrom.  Dynamic keys are
+    // Phase 4c → bridge those.
+    if (!at->dynamicAttrs.empty()) return false;
+    for (auto * e : at->inheritFromExprs)
+        if (!canLowerV3(e)) return false;
+    for (auto & d : at->attrs)
         if (d.kind == a::Attrs::AttrKind::Plain && !canLowerV3(d.value)) return false;
-    }
     return true;
 }
 
@@ -142,7 +145,28 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
 struct LowererV3 {
     ir::Module m = ir::makeModule();
     const nix::SymbolTable & symbols;  // unused (names are inline in the v3 AST)
+    nix::PosTable * positions = nullptr;            // for attr/formal positions
+    std::optional<nix::PosTable::Origin> posOrigin; // the source's registered origin
     std::vector<ir::BlockId> blockStack;
+
+    /// v3 byte-offset → IR pos-handle (mirrors lower.cc::posIdxToHandle:
+    /// resolve to a {file,line,column} snapshot, intern in the global
+    /// pool).  Drives builtins.unsafeGetAttrPos / functionArgs.  0 (no
+    /// position) → handle 0.
+    uint32_t posHandle(nix::v3::ast::Pos offset)
+    {
+        if (!positions || !posOrigin || offset == nix::v3::ast::noPos) return 0;
+        nix::PosIdx pi = positions->add(*posOrigin, offset);
+        if (!pi) return 0;
+        nix::Pos pos = (*positions)[pi];
+        std::string file;
+        if (auto * s = std::get_if<nix::SourcePath>(&pos.origin)) file = s->path.abs();
+        else if (std::holds_alternative<nix::Pos::Stdin>(pos.origin)) file = "<stdin>";
+        else if (std::holds_alternative<nix::Pos::String>(pos.origin)) file = "<string>";
+        else file = "<unknown>";
+        return nix::v3::recordPosSnapshot(
+            {std::move(file), static_cast<uint32_t>(pos.line), static_cast<uint32_t>(pos.column)});
+    }
 
     /// Lexical scope stack (innermost at the back), name → VarId.  A Var
     /// resolves against this (innermost-first); cross-function refs become
@@ -341,6 +365,7 @@ struct LowererV3 {
             ir::Formal ifm;
             ifm.name = m.internSymbol(f.name);
             ifm.hasDefault = f.def != nullptr;
+            ifm.pos = posHandle(f.pos);
             m.functions[fid].formals.push_back(ifm);
         }
         ir::VarId formalsRec = m.freshVar();
@@ -454,6 +479,25 @@ struct LowererV3 {
         return isTrivialForValue(e) ? lowerExpr(e) : thunkify(e);
     }
 
+    /// Thunk whose body is built by `bodyBuilder()` (returns the body
+    /// VarId) — for synthetic bodies not backed by a v3 AST node (e.g.
+    /// an `inherit (e) name` → AttrSelect(sharedSrc, name)).
+    template<class F>
+    ir::VarId thunkifyIR(F bodyBuilder)
+    {
+        m.functions.emplace_back();
+        ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+        auto eb = m.freshBlock();
+        m.functions[fid].entryBlock = eb;
+        m.functions[fid].name = "<thunk>";
+        blockStack.push_back(eb);
+        setReturn(bodyBuilder());
+        blockStack.pop_back();
+        std::vector<ir::VarId> lws = collectLexicalWiths();
+        m.functions[fid].nWithTargets = static_cast<uint16_t>(lws.size());
+        return addBinding(ir::MkThunk{fid, /*freeVars*/ {}, std::move(lws)});
+    }
+
     /// Shared rec-attrset / let-rec lowering (lower.cc::lowerLetRec).
     /// `hasBody` true → `let … in body` (returns body value); false →
     /// `rec { … }` (returns the rec attrset).  Plain bindings only —
@@ -473,6 +517,26 @@ struct LowererV3 {
         recScope.recVar = recVar;
         for (auto * d : bs) recScope.byName.emplace(d->name, ir::kInvalid);
 
+        // inherit-from sources: one shared hidden thunk per inheritFromExprs
+        // entry, lowered in the rec scope (it may reference siblings), so
+        // each `inherit (e) a b;` forces `e` once (LetRec.hiddenEntries).
+        std::vector<ir::VarId>  hiddenVars(at->inheritFromExprs.size(), ir::kInvalid);
+        std::vector<ir::FuncId> hiddenFids(at->inheritFromExprs.size(), 0);
+        for (size_t idx = 0; idx < at->inheritFromExprs.size(); ++idx) {
+            m.functions.emplace_back();
+            ir::FuncId hfid = static_cast<ir::FuncId>(m.functions.size() - 1);
+            auto heb = m.freshBlock();
+            m.functions[hfid].entryBlock = heb;
+            m.functions[hfid].name = "<inherit-from>";
+            blockStack.push_back(heb);
+            scopes.push_back(recScope);
+            setReturn(lowerExpr(at->inheritFromExprs[idx]));
+            scopes.pop_back();
+            blockStack.pop_back();
+            hiddenVars[idx] = m.freshVar();
+            hiddenFids[idx] = hfid;
+        }
+
         std::vector<ir::FuncId> fids;
         fids.reserve(bs.size());
         for (auto * d : bs) {
@@ -487,7 +551,11 @@ struct LowererV3 {
                 // `inherit x;` binds x to the PARENT-scope x (not the rec
                 // slot) — lower the var WITHOUT the rec scope pushed.
                 setReturn(lowerVarByName(d->name));
-            } else {  // Plain (InheritedFrom is Phase 4b)
+            } else if (d->kind == nix::v3::ast::Attrs::AttrKind::InheritedFrom) {
+                // `inherit (e) x;` → e.x, sharing the hidden source thunk.
+                ir::VarId src = addBinding(ir::VarRef{hiddenVars[d->fromIdx]});
+                setReturn(addBinding(ir::AttrSelect{src, m.internSymbol(d->name)}));
+            } else {  // Plain
                 scopes.push_back(recScope);
                 setReturn(lowerExpr(d->value));
                 scopes.pop_back();
@@ -504,9 +572,18 @@ struct LowererV3 {
             ir::LetRec::Entry en;
             en.name = m.internSymbol(bs[i]->name);
             en.thunkBody = fids[i];
+            en.pos = posHandle(bs[i]->pos);
             en.lexicalWiths = lws;
             m.functions[fids[i]].nWithTargets = static_cast<uint16_t>(lws.size());
             lr.entries.push_back(std::move(en));
+        }
+        for (size_t idx = 0; idx < hiddenVars.size(); ++idx) {
+            ir::LetRec::HiddenEntry he;
+            he.hiddenVar = hiddenVars[idx];
+            he.thunkBody = hiddenFids[idx];
+            he.lexicalWiths = lws;
+            m.functions[hiddenFids[idx]].nWithTargets = static_cast<uint16_t>(lws.size());
+            lr.hiddenEntries.push_back(std::move(he));
         }
         m.blocks[blockStack.back()].bindings.push_back({recVar, std::move(lr)});
 
@@ -527,17 +604,34 @@ struct LowererV3 {
     /// bindings only (inherit / inherit-from / dynamic → Phase 4).
     ir::VarId lowerAttrs(const nix::v3::ast::Attrs * e)
     {
+        namespace a = nix::v3::ast;
         if (e->recursive)
             return lowerLetRec(e, /*hasBody=*/false, /*body=*/nullptr);
+        // inherit-from sources: one shared thunk per inheritFromExprs
+        // entry (parent scope — non-rec doesn't see siblings), so each
+        // `inherit (e) a b;` forces `e` once.
+        std::vector<ir::VarId> srcVars(e->inheritFromExprs.size(), ir::kInvalid);
+        for (size_t i = 0; i < e->inheritFromExprs.size(); ++i)
+            srcVars[i] = thunkify(e->inheritFromExprs[i]);
         ir::AttrSet as;
         as.entries.reserve(e->attrs.size());
         for (auto & d : e->attrs) {
             ir::AttrSet::Entry en;
             en.name = m.internSymbol(d.name);
-            // `inherit x;` (non-rec) → the parent-scope x, eager (a ref).
-            en.value = (d.kind == nix::v3::ast::Attrs::AttrKind::Inherited)
-                ? lowerVarByName(d.name)
-                : thunkifyForAttr(d.value);
+            en.pos = posHandle(d.pos);
+            if (d.kind == a::Attrs::AttrKind::Inherited) {
+                // `inherit x;` → parent-scope x, eager (a ref).
+                en.value = lowerVarByName(d.name);
+            } else if (d.kind == a::Attrs::AttrKind::InheritedFrom) {
+                // `inherit (e) x;` → x = e.x, sharing the source thunk.
+                ir::SymbolId sym = m.internSymbol(d.name);
+                ir::VarId src = srcVars[d.fromIdx];
+                en.value = thunkifyIR([&] {
+                    return addBinding(ir::AttrSelect{addBinding(ir::VarRef{src}), sym});
+                });
+            } else {
+                en.value = thunkifyForAttr(d.value);
+            }
             as.entries.push_back(std::move(en));
         }
         return addBinding(std::move(as));
@@ -653,10 +747,15 @@ struct LowererV3 {
 };
 
 /// Lower a v3 AST root to IR natively (no nix::Expr).  Precondition:
-/// canLowerV3(e) is true.
-inline ir::Module lowerV3Ast(const nix::SymbolTable & symbols, const nix::v3::ast::Node * e)
+/// canLowerV3(e) is true.  `positions`/`origin` supply attr/formal
+/// source positions (for unsafeGetAttrPos / functionArgs); pass a null
+/// positions to omit them.
+inline ir::Module lowerV3Ast(const nix::SymbolTable & symbols, const nix::v3::ast::Node * e,
+                             nix::PosTable * positions, nix::PosTable::Origin origin)
 {
     LowererV3 L(symbols);
+    L.positions = positions;
+    if (positions) L.posOrigin.emplace(origin);
     return L.run(e);
 }
 
