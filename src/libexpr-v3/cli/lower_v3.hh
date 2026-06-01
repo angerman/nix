@@ -35,6 +35,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -164,7 +165,24 @@ struct LowererV3 {
     const nix::SymbolTable & symbols;  // unused (names are inline in the v3 AST)
     nix::PosTable * positions = nullptr;            // for attr/formal positions
     std::optional<nix::PosTable::Origin> posOrigin; // the source's registered origin
+    /// TW's bare base-env global names (twBaseEnvGlobals).  A free name
+    /// resolves to a primop ONLY if it is in this set — else it falls
+    /// through to the `with`-chain, matching TW's bindVars (so nixpkgs'
+    /// bare `fetchurl` becomes the with-bound FOD, NOT builtins.fetchurl).
+    /// nullptr → unfiltered (every registered primop counts; used only by
+    /// callers that don't have a TW EvalState — kept for back-compat).
+    const std::set<std::string> * baseEnvNames = nullptr;
     std::vector<ir::BlockId> blockStack;
+
+    /// Is `name` a TW base-env primop (resolvable as a bare global)?
+    /// Mirrors lower.cc's reliance on bindVars: a name is a base-env
+    /// primop iff it's a registered primop AND (when the TW base-env set
+    /// is known) one of TW's actual bare globals.
+    bool isBaseEnvPrimop(const std::string & name) const
+    {
+        if (!findPrimOp(name)) return false;
+        return !baseEnvNames || baseEnvNames->count(name) != 0;
+    }
 
     /// Stable backing store for runtime-derived strings (paths, __curPos
     /// `file`).  Mirrors lower.cc's stringPool / interpStr — a deque never
@@ -283,9 +301,13 @@ struct LowererV3 {
             m.litBuiltinsVarIds.push_back(bv);
             return bv;
         }
-        if (name == "__curPos")
-            throw std::runtime_error("v3 native lower: __curPos unsupported in Phase 1");
-        if (const PrimOp * po = findPrimOp(name)) {
+        // Base-env primop — ONLY if `name` is a genuine TW bare global
+        // (isBaseEnvPrimop).  A registered primop that is NOT a TW global
+        // (e.g. bare `fetchurl`, `head`, `foldl`) must fall through to the
+        // with-chain so it resolves to the with-bound binding TW would
+        // pick — matching bindVars exactly.
+        if (isBaseEnvPrimop(name)) {
+            const PrimOp * po = findPrimOp(name);
             if (po->arity == 0) return addBinding(ir::PrimOpCall{po, {}});
             return addBinding(ir::LitPrimOp{po});
         }
@@ -542,7 +564,7 @@ struct LowererV3 {
             if (it->byName.count(name)) return false;        // lexical / rec slot
         if (name == "true" || name == "false" || name == "null"
             || name == "builtins" || name == "__curPos") return false;  // base-env consts
-        if (findPrimOp(name)) return false;                   // base-env primop
+        if (isBaseEnvPrimop(name)) return false;              // genuine TW base-env primop
         for (auto it = scopes.rbegin(); it != scopes.rend(); ++it)
             if (it->withTargetVar != ir::kInvalid) return true;  // falls through to with
         return false;  // unbound (lowering will error) — not a with-lookup
@@ -909,13 +931,18 @@ struct LowererV3 {
 /// Lower a v3 AST root to IR natively (no nix::Expr).  Precondition:
 /// canLowerV3(e) is true.  `positions`/`origin` supply attr/formal
 /// source positions (for unsafeGetAttrPos / functionArgs); pass a null
-/// positions to omit them.
+/// positions to omit them.  `baseEnvNames` (twBaseEnvGlobals) is TW's
+/// bare base-env global set — required for correct free-name resolution
+/// (a name not in it falls through to `with`, matching bindVars); pass
+/// nullptr only when no TW EvalState is available.
 inline ir::Module lowerV3Ast(const nix::SymbolTable & symbols, const nix::v3::ast::Node * e,
-                             nix::PosTable * positions, nix::PosTable::Origin origin)
+                             nix::PosTable * positions, nix::PosTable::Origin origin,
+                             const std::set<std::string> * baseEnvNames = nullptr)
 {
     LowererV3 L(symbols);
     L.positions = positions;
     if (positions) L.posOrigin.emplace(origin);
+    L.baseEnvNames = baseEnvNames;
     return L.run(e);
 }
 

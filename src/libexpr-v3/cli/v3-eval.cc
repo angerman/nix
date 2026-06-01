@@ -379,7 +379,8 @@ int main(int argc, char ** argv)
         // Native lowering (Stage 2) when gated + supported; else the
         // bridge's nix::Expr through the existing lowerNixExpr.
         auto m = useNativeLower
-            ? nix::v3::lowerV3Ast(state.symbols, v3st.result, &state.positions, *nativeOrigin)
+            ? nix::v3::lowerV3Ast(state.symbols, v3st.result, &state.positions, *nativeOrigin,
+                                  &nix::v3::twBaseEnvGlobals(state))
             : nix::v3::lowerNixExpr(e, state.symbols, state.positions);
 
         // IR-CHECK MVP path: when --emit-ir / --emit-ir-raw is set,

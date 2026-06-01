@@ -9291,7 +9291,8 @@ skipDiskCacheLookup:
         if (s_dbg815pp) std::fprintf(stderr,
             "v3 FUNCID --- begin import path=%s ---\n", path.c_str());
         auto module = useNativeLower
-            ? nix::v3::lowerV3Ast(ns.symbols, v3st.result, &ns.positions, *nativeOrigin)
+            ? nix::v3::lowerV3Ast(ns.symbols, v3st.result, &ns.positions, *nativeOrigin,
+                                  &nix::v3::twBaseEnvGlobals(ns))
             : lowerNixExpr(e, ns.symbols, ns.positions);
         impBumpNs(importTimingTotals().lowerNs, tLower);
         if (s_dbg_import) std::fprintf(stderr,

@@ -34,6 +34,7 @@
 #include "nix/expr/eval.hh"
 
 #include <memory>
+#include <set>
 #include <span>
 #include <utility>
 #include <vector>
@@ -249,6 +250,30 @@ inline nix::Expr * toNixExpr(nix::EvalState & es, const nix::v3::ast::Node * n,
 {
     Bridge b{es, po};
     return b.expr(n);
+}
+
+/// The set of names TW exposes as BARE base-env globals (its
+/// `staticBaseEnv` — `builtins`, `true`/`false`/`null`, `import`,
+/// `derivation`, `map`, `throw`, … — NOT the `__`-prefixed builtins-only
+/// primops).  The native lowerer resolves a free name to a primop ONLY if
+/// it is in this set; otherwise it falls through to the `with`-chain,
+/// exactly as TW's bindVars classifies it.  Without this filter the
+/// native lowerer would shortcut nixpkgs' bare `fetchurl` (the
+/// `with pkgs`-bound FOD) to the `builtins.fetchurl` primop — a
+/// store-path-affecting divergence (firefox.drvPath).
+///
+/// Built once per process (single TW EvalState).  Authoritative by
+/// construction: it IS TW's base env, walked including the `up` chain.
+inline const std::set<std::string> & twBaseEnvGlobals(const nix::EvalState & es)
+{
+    static const std::set<std::string> s = [&] {
+        std::set<std::string> out;
+        for (const auto * env = es.staticBaseEnv.get(); env; env = env->up.get())
+            for (const auto & v : env->vars)
+                out.insert(std::string(es.symbols[v.first]));
+        return out;
+    }();
+    return s;
 }
 
 } // namespace nix::v3
