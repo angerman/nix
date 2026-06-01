@@ -8,7 +8,7 @@
 #include "v3/bytecode.hh"
 #include "v3/value.hh"
 #include "v3/closure.hh"
-#include "nix/expr/eval-gc.hh"  // traceable_allocator (Boehm) — used below
+#include "v3/gc-config.hh"  // traceable_allocator (Boehm) — via the v3 GC indirection
 
 #include <vector>
 #include <cstdint>

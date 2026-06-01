@@ -24,4 +24,3 @@ run.cc
 cli/v3-eval.cc
 value_serialize.cc
 include/v3/run.hh
-include/v3/vm.hh
