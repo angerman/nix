@@ -8182,7 +8182,11 @@ void primImport(EvalState & state, Value * args, Value & out)
             ++allocStats().ifdProbeWithCtx[kIfdImport];
             isIfdImport = true;
             auto & ns = *state.nixEvalState;
-            ++allocStats().v3ToTwBySite[2];  // #795 primImport string-with-ctx
+            // FFI_KILL_TODO T1.4 (2026-06-01): v3ToTwBySite[2] counter
+            // retired alongside the v3ToTreeWalker call that previously
+            // marshalled this string.  The inline-TW-Value-alloc path
+            // below is a strict leaf — no v3ToTreeWalker recursion,
+            // no bridge-table push, no cycle map.
             // #795 Phase A2: trace IFD-class imports (the calls that
             // realisePath may build).  Gated under V3_DBG_IFD=1 because
             // it fires per IFD event (expensive to log unconditionally).
@@ -8198,19 +8202,29 @@ void primImport(EvalState & state, Value * args, Value & out)
                         it->c_str());
                 std::fflush(stderr);
             }
-            nix::Value * tw = v3ToTreeWalker(state, args[0]);
-            if (!tw) {
-                // Fall through to non-realised path; the missing-store-
-                // path error below will surface verbatim — same as TW
-                // when the bridge somehow can't translate.
-                path = args[0].payload.str;
+            // FFI_KILL_TODO T1.4 (2026-06-01): inline the TW Value
+            // construction for Tag::String case.  Avoids the full
+            // v3ToTreeWalker function call (cycle-protection map,
+            // seen-map lookup, Bridge thunk short-circuit) when we
+            // KNOW the value is a string-with-context.  This is the
+            // "strict leaf" pattern: v3 has already resolved the
+            // string + context; we only need TW's realisePath to
+            // take a TW string Value.
+            //
+            // Pre-existing branch already verified args[0].isString()
+            // at line 8164.  Context is in ctxEntries (decoded above).
+            nix::Value * tw = ns.allocValue();
+            if (ctxEntries && !ctxEntries->empty()) {
+                nix::NixStringContext twCtx = decodeStringContext(*ctxEntries);
+                tw->mkString(args[0].payload.str, twCtx, ns.mem);
             } else {
-                try {
-                    auto resolved = ns.realisePath(nix::noPos, *tw);
-                    path = resolved.path.abs();
-                } catch (...) {
-                    throw;  // surface TW's error verbatim
-                }
+                tw->mkString(args[0].payload.str, ns.mem);
+            }
+            try {
+                auto resolved = ns.realisePath(nix::noPos, *tw);
+                path = resolved.path.abs();
+            } catch (...) {
+                throw;  // surface TW's error verbatim
             }
         } else {
             path = args[0].payload.str;
