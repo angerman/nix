@@ -175,11 +175,23 @@ sanity + a sweep of all **49 operator-precedence fixtures**
 --parse`.  No bison conflicts (faithful transcription preserved
 parser.y's `%expect 0`).
 
-**Tier 2+ (remaining Stage 1.4):**
+### Stage 1.4 Tier 3-lite — lists, attrsets, let/with/assert LANDED
+
+`v3-spike.{y,l}` gained: lists (`[ ... ]`), attrsets (`{ attrpath =
+expr; }`, `rec`, empty) wiring the proven `addAttr` (so `{ a.b=1;
+a.c=2; }` → nested merge works through the grammar), `let ... in`,
+`with`, `assert`.  No new lexer states (DEFAULT-state tokens +
+let/in/with/assert/rec keywords + `{ } [ ] ; = ,`).  Still `%expect 0`.
+
+Validated by the new tier3 battery (test/parser-ti/fixtures/tier3, 13
+fixtures) — total parser-spike-test now **67/67** byte-equal to TW.
+
+**Tier 2 + Tier 3b + Tier 4 (remaining Stage 1.4):**
 * Tier 2 — strings + antiquotation, paths (lexer STRING/PATH states)
-* Tier 3 — attrsets/binds (via `addAttr`), lists, let/with/assert
+* Tier 3b — `inherit` / `inherit (e)` in binds; string + dynamic attr
+  keys (needs the STRING state)
 * Tier 4 — formals (via `validateFormals`), indented strings (via
-  `stripIndentation`), dynamic attr keys, pipe operators, cursed-or
+  `stripIndentation`), pipe operators, cursed-or, `let { }` form
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;
   validate the 68 fixtures + 263-file sweep + 143 lang tests; rename
   v3-spike → v3-parser; retire the throwaway arithmetic framing.

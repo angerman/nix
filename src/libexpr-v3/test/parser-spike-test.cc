@@ -83,10 +83,12 @@ int main(int argc, char ** argv) {
     check("1 + 2 * 3",    "(1 + (__mul 2 3))");
     check("(1 + 2) * 3",  "(__mul (1 + 2) 3)");
 
-    // Stage 1.4: sweep the operator-precedence battery if a dir is given.
-    if (argc > 1) {
-        std::filesystem::path dir(argv[1]);
-        std::printf("\n=== precedence battery sweep (%s) ===\n", argv[1]);
+    // Stage 1.4: sweep each fixture dir given (precedence battery,
+    // tier3 battery, ...): parse every .nix via the v3 parser and
+    // byte-compare show() to the committed .exp golden.
+    for (int a = 1; a < argc; ++a) {
+        std::filesystem::path dir(argv[a]);
+        std::printf("\n=== fixture sweep (%s) ===\n", argv[a]);
         std::vector<std::filesystem::path> nixFiles;
         if (std::filesystem::is_directory(dir))
             for (auto & e : std::filesystem::directory_iterator(dir))

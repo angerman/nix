@@ -1,0 +1,1 @@
+(a: (let xs = [ (a) (a) ]; in { first = a; }))

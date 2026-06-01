@@ -46,6 +46,11 @@ FLOAT (([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+))([Ee][+-]?[0-9]+)?
 "if"        { return nix::v3::spike::SpikeParser::token::IF; }
 "then"      { return nix::v3::spike::SpikeParser::token::THEN; }
 "else"      { return nix::v3::spike::SpikeParser::token::ELSE; }
+"assert"    { return nix::v3::spike::SpikeParser::token::ASSERT; }
+"with"      { return nix::v3::spike::SpikeParser::token::WITH; }
+"let"       { return nix::v3::spike::SpikeParser::token::LET; }
+"in"        { return nix::v3::spike::SpikeParser::token::IN_KW; }
+"rec"       { return nix::v3::spike::SpikeParser::token::REC; }
 "or"        { return nix::v3::spike::SpikeParser::token::OR_KW; }
 
   /* multi-char operators (before single-char so they win) */
@@ -68,6 +73,7 @@ FLOAT (([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+))([Ee][+-]?[0-9]+)?
 
   /* single-char tokens returned as their char code */
 [<>+\-*/!?.:()] { return yytext[0]; }
+[{}\[\];=,]     { return yytext[0]; }
 
 [ \t\r\n]+  { /* skip whitespace */ }
 "#"[^\n]*   { /* skip line comment */ }
