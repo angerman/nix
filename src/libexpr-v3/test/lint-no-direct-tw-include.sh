@@ -28,15 +28,33 @@ BASELINE="$V3DIR/test/tw-include-baseline.txt"
 if [[ ! -d "$V3DIR" ]]; then echo "lint-no-direct-tw-include: $V3DIR missing" >&2; exit 2; fi
 if [[ ! -f "$BASELINE" ]]; then echo "lint-no-direct-tw-include: baseline $BASELINE missing" >&2; exit 2; fi
 
-# Allowlist (baseline) — strip comments/blanks, sort.
+# PERMANENT structural exemptions (audit §5.1, §8) — the documented FFI
+# surface + tooling + translation boundary that may include `nix/...`
+# forever.  Path-pattern matched (NOT in the shrinking baseline):
+#   ffi.hh/ffi.cc          — the FFI surface itself
+#   disk_cache.cc          — SQLite IS the storage impl
+#   parser/                — bison/flex + parse-API tooling
+#   test/                  — test harnesses (construct TW EvalState to
+#                            drive v3 tests; not the library surface)
+#   cli/lower_v3.hh,
+#   include/v3/tw_baseenv.hh,
+#   include/v3/gc-config.hh — the native-lowerer translation boundary +
+#                            the centralized build-macro leaf
+EXEMPT='^(ffi\.cc|disk_cache\.cc|parser/|test/|include/v3/ffi\.hh|cli/lower_v3\.hh|include/v3/tw_baseenv\.hh|include/v3/gc-config\.hh)'
+
+# Baseline (the SHRINKING set of genuine library migration targets — empty
+# at the audit's end state).  Strip comments/blanks, sort.
 allow=$(grep -vE '^\s*#|^\s*$' "$BASELINE" | sed 's/[[:space:]]*$//' | sort -u)
 
 # Current offenders: v3 .cc/.hh files (excluding generated / build / the
-# verbatim upstream parser snapshots) with a direct `#include "nix/`.
+# verbatim upstream parser snapshots AND the permanent exemptions) with a
+# direct `#include "nix/`.
 current=$(grep -rln '#include "nix/' "$V3DIR" 2>/dev/null \
     | grep -E '\.(cc|hh)$' \
     | grep -vE '\.gen\.hh|/builddir/|\.upstream$|v3-parser-tab|v3-parser-lex' \
-    | sed "s#^$V3DIR/##" | sort -u)
+    | sed "s#^$V3DIR/##" \
+    | grep -vE "$EXEMPT" \
+    | sort -u)
 
 # (1) Regression: in `current` but not in `allow`.
 new_offenders=$(comm -23 <(echo "$current") <(echo "$allow"))
@@ -63,6 +81,6 @@ fi
 
 if [[ "$rc" -eq 0 && -z "$cleaned" ]]; then
     n=$(echo "$current" | grep -c . )
-    echo "lint-no-direct-tw-include: clean ($n baselined files with TW includes; no regression)"
+    echo "lint-no-direct-tw-include: clean ($n library files pending migration behind ffi.hh; no regression)"
 fi
 exit "$rc"

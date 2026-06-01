@@ -1,43 +1,29 @@
-# Baseline allowlist for lint-no-direct-tw-include.sh (FFI consolidation
-# ratchet, FFI_CONSOLIDATION_AUDIT_2026-06-01 §5.1 / Phase 6).
+# Baseline for lint-no-direct-tw-include.sh — the SHRINKING set of genuine
+# v3-LIBRARY files that still carry a direct `#include "nix/...` and are
+# slated to migrate behind include/v3/ffi.hh (FFI_CONSOLIDATION_AUDIT_
+# 2026-06-01 Phase 2/3/4).  EMPTY at the audit's end state.
 #
-# Each line is a src/libexpr-v3/-relative path that currently contains at
-# least one direct `#include "nix/...`.  The lint FAILS if any file NOT
-# listed here gains a TW include (regression — the V3-NATIVE discipline
-# slipped).  As the consolidation migrates a file behind ffi.hh and it
-# drops all TW includes, REMOVE it from this list (the ratchet tightens;
-# the lint then guards against re-introduction).
+# Permanent FFI leaves / tooling / translation boundary (ffi.{hh,cc},
+# disk_cache.cc, parser/, test/, lower_v3.hh, tw_baseenv.hh, gc-config.hh)
+# are NOT listed here — they are path-pattern EXEMPT in the lint itself
+# (audit §5.1, §8).
 #
-# End-state target (audit §5): only ffi.hh / ffi.cc / disk_cache.cc /
-# parser/ + the lower_v3.hh translation boundary remain.  Everything else
-# routes through ffi.hh.
+# The lint FAILS if a file that is neither EXEMPT nor listed here gains a
+# TW include (V3-NATIVE regression).  As a target migrates behind ffi.hh
+# and drops all TW includes, REMOVE it from this list — the ratchet
+# tightens; re-introduction then fails the lint.
 #
-# Generated 2026-06-02 (post-parser-completion; lower.cc retired).
+# Generated 2026-06-02 (post-parser; post gc-config consolidation).
 # Lines starting with '#' and blank lines are ignored.
 
-# --- FFI surface + documented exemptions (audit §5, §8) ---
-include/v3/ffi.hh
-ffi.cc
-disk_cache.cc
-parser/v3-parse-api.cc
-
-# --- translation boundary (native lowerer; replaces lower.cc's exemption) ---
-cli/lower_v3.hh
-include/v3/tw_baseenv.hh
-
-# --- centralized build-macro leaf (NIX_USE_BOEHMGC; §2.4 #4) ---
-include/v3/gc-config.hh
-
-# --- Category A FFI leaves + Category C/D pinch (consolidation targets) ---
+# --- Category C/D pinch: eval.hh / value.hh / shared types (Phase 2/3) ---
+primops.cc
+vm.cc
+v3_call_flake.cc
+run.cc
+cli/v3-eval.cc
 bridge_yield.cc
 bytecode_primops.cc
-cli/v3-eval.cc
+value_serialize.cc
 include/v3/run.hh
 include/v3/vm.hh
-primops.cc
-run.cc
-test/drv-preflight.cc
-test/evalscope-handles.cc
-v3_call_flake.cc
-value_serialize.cc
-vm.cc
