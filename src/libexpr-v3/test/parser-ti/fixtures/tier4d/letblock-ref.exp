@@ -1,0 +1,1 @@
+(rec { body = x; x = 1; }).body

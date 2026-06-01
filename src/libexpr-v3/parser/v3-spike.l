@@ -113,6 +113,11 @@ SPATH       \<{PATH_CHAR}+(\/{PATH_CHAR}+)*\>
 "//"        { return nix::v3::spike::SpikeParser::token::UPDATE; }
 "++"        { return nix::v3::spike::SpikeParser::token::CONCAT; }
 "..."       { return nix::v3::spike::SpikeParser::token::ELLIPSIS; }  /* formals (lexer.l:137) */
+  /* pipe operators (lexer.l:148-153).  TW gates these on the
+   * `pipe-operators` experimental feature; the spike does not gate
+   * (feature policy is an integration concern, not a parse concern). */
+"<|"        { return nix::v3::spike::SpikeParser::token::PIPE_FROM; }
+"|>"        { return nix::v3::spike::SpikeParser::token::PIPE_INTO; }
 
 {ID}        { yylval->emplace<std::string>(yytext, (size_t) yyleng);
               return nix::v3::spike::SpikeParser::token::ID; }

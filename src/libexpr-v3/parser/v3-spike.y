@@ -75,9 +75,11 @@
 %token OR_KW "'or'"
 %token EQ "'=='" NEQ "'!='" LEQ "'<='" GEQ "'>='"
 %token UPDATE "'//'" CONCAT "'++'" AND "'&&'" OR "'||'" IMPL "'->'"
+%token PIPE_FROM "'<|'" PIPE_INTO "'|>'"
 
 %type <nix::v3::ast::Node *> expr expr_function expr_if expr_op
 %type <nix::v3::ast::Node *> expr_app expr_select expr_simple
+%type <nix::v3::ast::Node *> expr_pipe_from expr_pipe_into
 %type <nix::v3::ast::Attrs *> binds binds1
 %type <std::vector<nix::v3::ast::Node *>> list
 %type <nix::v3::ast::Node *> string_parts string_attr path_start
@@ -158,7 +160,21 @@ formal
 
 expr_if
   : IF expr THEN expr ELSE expr { $$ = state->add<If>($2, $4, $6); }
+  | expr_pipe_from
+  | expr_pipe_into
   | expr_op
+  ;
+
+/* pipe operators (parser.y:287-294).  `a <| b` -> apply a to b
+ * (makeCall(a,b)); `a |> b` -> apply b to a (makeCall(b,a)). */
+expr_pipe_from
+  : expr_op PIPE_FROM expr_pipe_from { $$ = state->makeCall($1, $3); }
+  | expr_op PIPE_FROM expr_op        { $$ = state->makeCall($1, $3); }
+  ;
+
+expr_pipe_into
+  : expr_pipe_into PIPE_INTO expr_op { $$ = state->makeCall($3, $1); }
+  | expr_op        PIPE_INTO expr_op { $$ = state->makeCall($3, $1); }
   ;
 
 expr_op
@@ -222,6 +238,12 @@ expr_select
     { $$ = state->add<Select>($1, $3, nullptr); }
   | expr_simple '.' attrpath OR_KW expr_select
     { $$ = state->add<Select>($1, $3, $5); }
+  | expr_simple OR_KW
+    { // cursed-or wart (parser.y:341, NixOS/nix#11118): `f or` parses as
+      // `f` applied to a variable named `or`.  The parse-time ambiguity
+      // WARNING is a diagnostic only (doesn't affect the AST/show()), so
+      // it is omitted; the structure Call(f, [Var("or")]) matches TW.
+      $$ = state->add<Call>($1, std::vector<Node *>{ state->add<Var>(std::string("or")) }); }
   | expr_simple
   ;
 
@@ -254,6 +276,11 @@ expr_simple
     }
   | '(' expr ')' { $$ = $2; }
   | REC '{' binds '}' { $3->recursive = true; $$ = $3; }
+  | LET '{' binds '}' {
+      // `let { body = …; … }` desugars to `(rec { … }).body` (parser.y:386).
+      $3->recursive = true;
+      $$ = state->add<Select>($3, std::vector<AttrName>{ AttrName(std::string("body")) }, nullptr);
+    }
   | '{' binds1 '}'    { $$ = $2; }
   | '{' '}'           { $$ = state->add<Attrs>(false); }
   | '[' list ']'      { $$ = state->add<List>(std::move($2)); }

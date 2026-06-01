@@ -300,12 +300,28 @@ now **132/132** byte-equal to TW: abs simple/multi/deep, CanonPath
 path-as-application-arg.  The trailing-slash cases `/foo/` + `/a//b` are
 TW parse errors — the INPATH_SLASH rule reproduces that rejection.
 
-**Remaining Stage 1.4:**
-* pipe operators (`|>` / `<|`), cursed-or, `let { }` form (minor)
-* then INTEGRATION: wire into `v3-eval --parse` behind
-  `NIX_V3_NATIVE_PARSER=1` (gives basePath → relative/home path
-  validation) + full 263-file + 143 lang validation; rename
-  v3-spike → v3-parser.
+### Stage 1.4 Tier 4d — pipe / cursed-or / let{} LANDED (grammar COMPLETE)
+
+The remaining expr-grammar warts:
+* pipe operators `|>` / `<|` (parser.y:287-294) — `a |> b` = `b a`,
+  `a <| b` = `a b`, via `makeCall`.  Lexer emits PIPE_INTO/PIPE_FROM
+  ungated (feature policy is an integration concern).
+* cursed-or (parser.y:341, NixOS/nix#11118) — `expr_simple OR_KW` →
+  `Call(f, [Var("or")])`; the ambiguity WARNING is a diagnostic, omitted
+  (AST/show() identical).
+* `let { … }` (parser.y:386) — desugars to `(rec { … }).body`.
+
+Validated by the tier4d battery (9 fixtures) — total parser-spike-test
+now **141/141** byte-equal to TW: `a |> b`→`(b a)`, `a <| b`→`(a b)`,
+pipe chains both directions, `f or`→`(f or)`, `let { body = 1; }`→
+`(rec { body = 1; }).body`.  **The expr grammar surface is now complete**
+(all 27 AST node kinds + all 7 flex states + all 3 ParserState helpers).
+
+### Remaining: INTEGRATION (Stage 1.5)
+
+Wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1` (a real file
+supplies basePath → unblocks relative/home path validation) + full
+263-file + 143 lang validation; rename v3-spike → v3-parser.
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;
   validate the 68 fixtures + 263-file sweep + 143 lang tests; rename
   v3-spike → v3-parser; retire the throwaway arithmetic framing.
