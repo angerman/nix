@@ -63,6 +63,7 @@
 %token DOLLAR_CURLY "'${'"
 %token IF "'if'" THEN "'then'" ELSE "'else'"
 %token ASSERT "'assert'" WITH "'with'" LET "'let'" IN_KW "'in'" REC "'rec'"
+%token INHERIT "'inherit'"
 %token OR_KW "'or'"
 %token EQ "'=='" NEQ "'!='" LEQ "'<='" GEQ "'>='"
 %token UPDATE "'//'" CONCAT "'++'" AND "'&&'" OR "'||'" IMPL "'->'"
@@ -74,6 +75,7 @@
 %type <nix::v3::ast::Node *> string_parts
 %type <std::vector<nix::v3::ast::Node *>> string_parts_interpolated
 %type <std::vector<nix::v3::ast::AttrName>> attrpath
+%type <std::vector<std::string>> attrs
 %type <std::string> attr
 
 /* Precedence — transcribed verbatim from parser.y:208-219. */
@@ -192,9 +194,15 @@ expr_simple
   | '[' list ']'      { $$ = state->add<List>(std::move($2)); }
   ;
 
-/* attrset bindings.  Tier 3-lite: `attrpath = expr;` only (wires the
- * proven ParserState::addAttr).  inherit / inherit-from / dynamic keys
- * are Tier 3b/Tier 2 (the latter needs the STRING lexer state). */
+/* attrset bindings (parser.y:477-535).  Tier 3-lite: `attrpath = expr;`
+ * (wires ParserState::addAttr).  Tier 3b adds `inherit` / `inherit (e)`
+ * (wires addInherit / addInheritFrom).  Dynamic + string keys in the
+ * inherit name-list are deferred (TW rejects dynamic-in-inherit anyway;
+ * string keys need Tier 3b string_attr).
+ *
+ * N.B. the accumulator is `binds1` for `attrpath =` but `binds` (= maybe
+ * empty) for the INHERIT productions — transcribed exactly from parser.y
+ * so `{ inherit a; }` (no prior bind) parses via empty-binds. */
 binds
   : binds1
   | /* empty */ { $$ = state->add<Attrs>(false); }
@@ -203,8 +211,26 @@ binds
 binds1
   : binds1 attrpath '=' expr ';'
     { $$ = $1; state->addAttr($1, std::move($2), $4, 0); }
+  | binds INHERIT attrs ';'
+    { $$ = $1;
+      for (auto & name : $3) state->addInherit($1, name, 0);
+    }
+  | binds INHERIT '(' expr ')' attrs ';'
+    { $$ = $1;
+      int idx = (int) $1->inheritFromExprs.size();
+      $1->inheritFromExprs.push_back($4);
+      for (auto & name : $6) state->addInheritFrom($1, name, idx, 0);
+    }
   | attrpath '=' expr ';'
     { $$ = state->add<Attrs>(false); state->addAttr($$, std::move($1), $3, 0); }
+  ;
+
+/* inherit name-list (parser.y:520-535).  ID names only for Tier 3b;
+ * string-keyed inherit (`inherit "a";`) is deferred, dynamic-keyed
+ * inherit is a TW parse error. */
+attrs
+  : attrs attr { $$ = std::move($1); $$.push_back($2); }
+  | /* empty */ { $$ = std::vector<std::string>{}; }
   ;
 
 list

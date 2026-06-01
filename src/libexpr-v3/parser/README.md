@@ -200,10 +200,26 @@ Validated by the tier2 battery (12 fixtures) — total parser-spike-test
 now **79/79** byte-equal to TW: plain/empty strings, `\n`/`\"`/`\$`
 escapes, mid/start/only/multi interpolation, strings in lists + attrs.
 
-**Tier 3b + Tier 4 + paths (remaining Stage 1.4):**
+### Stage 1.4 Tier 3b — inherit / inherit-from LANDED
+
+`binds1` gained `inherit a b;` (→ `Inherited` AttrDefs, wiring
+`ParserState::addInherit`) and `inherit (e) x y;` (→ `InheritedFrom`,
+wiring `addInheritFrom` + the `inheritFromExprs` source list), plus the
+`attrs` name-list production — all transcribed verbatim from
+parser.y:477-535 (incl. the `binds`-not-`binds1` accumulator on the
+INHERIT productions so `{ inherit a; }` parses via empty-binds).  Still
+`%expect 0`.
+
+Validated by the tier3b battery (9 fixtures) — total parser-spike-test
+now **88/88** byte-equal to TW: `inherit a;`, `inherit a b;`,
+`inherit (x) a b;`, combined inherit + inherit-from in one set,
+empty `inherit;` (→ `{ }`), inherit-in-`let`, inherit-in-`rec`, and the
+inherit-before-plain show ordering.
+
+**Tier 4 + paths + string/dynamic keys (remaining Stage 1.4):**
 * paths (`./foo`, `/abs`, `<nixpkgs>`, `~/x`) — lexer PATH states
-* Tier 3b — `inherit` / `inherit (e)` in binds; string + dynamic attr
-  keys (the STRING state is now available)
+* string + dynamic attr keys (`{ "a" = …; ${e} = …; }`; the STRING
+  state is available — needs the `string_attr` / dynamic-attr grammar)
 * Tier 4 — formals (via `validateFormals`), indented strings (via
   `stripIndentation`), pipe operators, cursed-or, `let { }` form
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;

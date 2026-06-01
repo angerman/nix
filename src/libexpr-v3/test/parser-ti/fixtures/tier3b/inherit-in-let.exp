@@ -1,0 +1,1 @@
+(a: (let inherit a; in a))

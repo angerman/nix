@@ -87,6 +87,7 @@ ANY   .|\n
 "let"       { return nix::v3::spike::SpikeParser::token::LET; }
 "in"        { return nix::v3::spike::SpikeParser::token::IN_KW; }
 "rec"       { return nix::v3::spike::SpikeParser::token::REC; }
+"inherit"   { return nix::v3::spike::SpikeParser::token::INHERIT; }
 "or"        { return nix::v3::spike::SpikeParser::token::OR_KW; }
 
   /* multi-char operators (before single-char so they win) */

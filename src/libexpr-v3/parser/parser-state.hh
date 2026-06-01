@@ -134,6 +134,37 @@ struct ParserState {
         throw ParseError("attribute '" + dottedPath(path, upto) + "' already defined", pos);
     }
 
+    // -- inherit (port of the binds1 INHERIT productions) -----------
+
+    /// Any AttrDef (Plain/Inherited/InheritedFrom) named `name`, or null.
+    /// `inherit` collides with ANY prior definition — TW checks the
+    /// symbol map (`$accum->attrs->find`, parser.y:490), which is keyed
+    /// by symbol regardless of kind.
+    static Attrs::AttrDef * findAny(Attrs * attrs, const std::string & name) {
+        for (auto & d : attrs->attrs)
+            if (d.name == name) return &d;
+        return nullptr;
+    }
+
+    /// `inherit name;` — add an Inherited def, dup-checking against any
+    /// prior def (parser.y:487-496).  The name binds to whatever `name`
+    /// resolves to in the surrounding scope (a lowering concern; show()
+    /// only needs the name, so the Inherited AttrDef stores just that).
+    void addInherit(Attrs * attrs, const std::string & name, Pos pos) {
+        if (findAny(attrs, name))
+            throw ParseError("attribute '" + name + "' already defined", pos);
+        attrs->attrs.emplace_back(name);  // Inherited ctor
+    }
+
+    /// `inherit (e) name;` — add an InheritedFrom def referencing
+    /// `fromIdx` (an index the caller appended into inheritFromExprs).
+    /// Mirrors parser.y:497-512.
+    void addInheritFrom(Attrs * attrs, const std::string & name, int fromIdx, Pos pos) {
+        if (findAny(attrs, name))
+            throw ParseError("attribute '" + name + "' already defined", pos);
+        attrs->attrs.emplace_back(name, fromIdx);  // InheritedFrom ctor
+    }
+
     /// Leaf insert-or-merge.  Mirrors the 2-arg `ParserState::addAttr`
     /// (parser-state.hh.upstream:248): if `symbol` already exists and
     /// BOTH the existing value and the new value are attrsets, merge

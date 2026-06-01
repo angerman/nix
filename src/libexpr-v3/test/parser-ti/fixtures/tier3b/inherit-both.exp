@@ -1,0 +1,1 @@
+(a: (x: { inherit a; inherit (x) b c; }))

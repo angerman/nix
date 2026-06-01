@@ -1,0 +1,1 @@
+a: { inherit a; c = 1; }
