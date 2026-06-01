@@ -1,12 +1,14 @@
 /// @file
-/// Stage 1.2 unit test — v3 ParserState::addAttr attrset-merge.
+/// Stage 1.2 unit test — v3 ParserState helpers (addAttr, validateFormals).
 ///
 /// PARSER_PROJECT_PLAN_2026-06-01.md §2 (Stage 1.2).  Drives
 /// `ParserState::addAttr` with the (attrpath, value) sequences the
 /// parser actions produce, then asserts the resulting Attrs show()
 /// matches TW `nix-instantiate --parse` BYTE-FOR-BYTE — covering the
 /// attrset-merge construction (`{ a.b = 1; a.c = 2; }` → nested) and
-/// duplicate-definition detection.
+/// duplicate-definition detection.  Also exercises
+/// `ParserState::validateFormals` (duplicate formal-arg + @-binding
+/// collision detection).
 ///
 /// Standalone: includes only the header-only ParserState + AST.
 /// Build: `c++ -std=c++23 -I include -I parser test/ast-addattr-test.cc`.
@@ -69,6 +71,16 @@ static void dupPlain() {
     st.addAttr(a, P({"a"}), st.add<Int>(1), 0);
     st.addAttr(a, P({"a"}), st.add<Int>(2), 0);        // dup a
 }
+// validateFormals negative cases
+static FormalsBuilder fbOf(std::initializer_list<const char *> names) {
+    FormalsBuilder fb;
+    Pos p = 1;
+    for (auto * n : names) fb.formals.push_back({std::string(n), p++, nullptr});
+    return fb;
+}
+static void dupFormal()    { ParserState st; auto fb = fbOf({"a", "a"});       st.validateFormals(fb); }
+static void dupThree()     { ParserState st; auto fb = fbOf({"a", "b", "a"});  st.validateFormals(fb); }
+static void atArgCollide() { ParserState st; auto fb = fbOf({"a", "b"});       st.validateFormals(fb, 9, "a"); }
 
 int main()
 {
@@ -150,6 +162,36 @@ int main()
     // --- duplicate-definition detection (negative) ---
     checkThrows("dup-leaf",  dupLeaf,  "attribute 'a.b' already defined");
     checkThrows("dup-plain", dupPlain, "attribute 'a' already defined");
+
+    // --- validateFormals ---
+    // positive: distinct formals validate without throwing
+    {
+        ++checks;
+        try {
+            ParserState st; auto fb = fbOf({"a", "b"});
+            st.validateFormals(fb);
+            std::printf("  ok   %-22s validates\n", "formals-distinct");
+        } catch (const ParseError & e) {
+            ++failures;
+            std::printf("  FAIL %-22s unexpected throw: %s\n", "formals-distinct", e.what());
+        }
+    }
+    // positive: @-binding distinct from formals
+    {
+        ++checks;
+        try {
+            ParserState st; auto fb = fbOf({"a", "b"});
+            st.validateFormals(fb, 9, "c");
+            std::printf("  ok   %-22s validates\n", "formals-atarg-ok");
+        } catch (const ParseError & e) {
+            ++failures;
+            std::printf("  FAIL %-22s unexpected throw: %s\n", "formals-atarg-ok", e.what());
+        }
+    }
+    // negative: duplicates + @-binding collision
+    checkThrows("formals-dup",     dupFormal,    "duplicate formal function argument 'a'");
+    checkThrows("formals-dup3",    dupThree,     "duplicate formal function argument 'a'");
+    checkThrows("formals-atarg",   atArgCollide, "duplicate formal function argument 'a'");
 
     std::printf("\n=== %d/%d checks passed ===\n", checks - failures, checks);
     return failures == 0 ? 0 : 1;

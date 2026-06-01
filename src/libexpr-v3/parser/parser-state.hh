@@ -27,8 +27,11 @@
 
 #include "v3/ast/expr.hh"
 
+#include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace nix::v3::ast {
@@ -42,11 +45,52 @@ struct ParseError : std::runtime_error {
         : std::runtime_error(std::move(msg)), pos(pos) {}
 };
 
+/// Parser-side formal-argument accumulator (mirrors TW's
+/// FormalsBuilder).  Carries per-formal positions for duplicate
+/// diagnostics; the AST Lambda::Formal (name + def) is built from it
+/// after validation.
+struct FormalsBuilder {
+    struct PFormal { std::string name; Pos pos; Node * def = nullptr; };
+    std::vector<PFormal> formals;
+    bool ellipsis = false;
+    bool has(const std::string & name) const {
+        for (auto & f : formals) if (f.name == name) return true;
+        return false;
+    }
+};
+
 struct ParserState {
     Pool pool;
 
     template <typename T, typename... Args>
     T * add(Args &&... a) { return pool.add<T>(std::forward<Args>(a)...); }
+
+    // -- formal-argument validation (port of validateFormals) -------
+
+    /// Detect duplicate formal arguments (`{ a, a }: ...`) and a
+    /// collision between the `@`-binding and a formal (`{ a }@a: ...`).
+    /// Mirrors ParserState::validateFormals (parser-state.hh.upstream:300):
+    /// sort by (name, pos), report the lexicographically-min duplicate.
+    /// Throws ParseError on violation.  `argName` empty => no @-binding.
+    void validateFormals(FormalsBuilder & fb, Pos argPos = noPos,
+                         const std::string & argName = "") {
+        std::sort(fb.formals.begin(), fb.formals.end(),
+            [](const FormalsBuilder::PFormal & a, const FormalsBuilder::PFormal & b) {
+                return std::tie(a.name, a.pos) < std::tie(b.name, b.pos);
+            });
+        std::optional<std::pair<std::string, Pos>> dup;
+        for (size_t i = 0; i + 1 < fb.formals.size(); ++i) {
+            if (fb.formals[i].name != fb.formals[i + 1].name) continue;
+            std::pair<std::string, Pos> thisDup{fb.formals[i].name, fb.formals[i + 1].pos};
+            dup = std::min(thisDup, dup.value_or(thisDup));
+        }
+        if (dup)
+            throw ParseError(
+                "duplicate formal function argument '" + dup->first + "'", dup->second);
+        if (!argName.empty() && fb.has(argName))
+            throw ParseError(
+                "duplicate formal function argument '" + argName + "'", argPos);
+    }
 
     // -- attrset construction (port of ParserState::addAttr) --------
 
