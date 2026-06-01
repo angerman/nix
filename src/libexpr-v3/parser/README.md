@@ -114,8 +114,20 @@ actions (Stage 1.4) must emit the SAME desugarings.
 ### Stage 1.1 remaining — DONE (all node kinds landed)
 
 All show()-producing node kinds are implemented + tested (32/32).
-Remaining project work is Stage 1.2 (ParserState symbol interning) →
-1.3 (build wiring) → 1.4 (action rewrite).
+
+### Stage 1.2 status — ParserState `addAttr` landed
+
+`parser-state.hh` (the v3 ParserState) hosts the attrset-merge
+construction `addAttr` (port of parser-state.hh.upstream:195/248),
+validated by `test/ast-addattr-test.cc` (**10/10** vs TW `--parse`):
+nested-path creation, two-path merge, merge-into-set, deep-merge,
+two-attrset merge, dynamic-key path, + duplicate-definition detection
+(`{ a.b=1; a.b=2; }` throws "attribute 'a.b' already defined").
+
+Stage 1.2 follow-ups: `stripIndentation` (indented strings),
+`validateFormals` (dup-arg detection), symbol interning (names are
+inline std::string today).  Then 1.3 (build wiring: bison/flex →
+libnixexprv3) → 1.4 (action rewrite targeting the v3 AST).
 
 ## How to inspect upstream actions
 

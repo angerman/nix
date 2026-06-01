@@ -354,6 +354,22 @@ test(
   v3_ast_show_test,
 )
 
+# Parser project Stage 1.2 (PARSER_PROJECT_PLAN_2026-06-01) — v3
+# ParserState::addAttr attrset-merge + dup-detection vs TW.  Standalone
+# (header-only ParserState + AST; needs the parser/ dir on the include
+# path for parser-state.hh).
+v3_ast_addattr_test = executable(
+  'v3-ast-addattr-test',
+  'test/ast-addattr-test.cc',
+  include_directories : [include_dirs, include_directories('parser')],
+  install : false,
+)
+
+test(
+  'v3-ast-addattr-test',
+  v3_ast_addattr_test,
+)
+
 # #545: bench-harness self-tests.  Pure Python; loads workloads.toml,
 # exercises filtering / stats / JSON / baseline-diff, and runs a tiny
 # `nix eval` smoke test under TW + v3-direct.  Validates the
