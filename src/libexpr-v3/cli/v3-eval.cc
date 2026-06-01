@@ -56,6 +56,7 @@
 #include "v3-parser-decls.hh"  // v3-parser-tab.hh + YYSTYPE
 #include "v3-parser-lex.hh"    // flex reentrant decls (needs YYSTYPE)
 #include "v3-to-nixexpr.hh"
+#include "lower_v3.hh"         // native v3 AST -> IR lowering (Stage 2)
 
 #include <nlohmann/json.hpp>
 
@@ -121,18 +122,11 @@ static void usage(const char * argv0)
         argv0, argv0);
 }
 
-// NIX_V3_NATIVE_PARSER=1: parse `text` with the v3-native parser and
-// bridge the v3 AST to a nix::Expr (Stage 2 integration).  `basePath` is
-// the source-file directory (resolves relative/home path literals);
-// `homePath` is $HOME.  Falls through to the existing bindVars + lower
-// pipeline, so the only thing that changes vs the default is WHO parses.
-static nix::Expr * v3NativeParse(
-    nix::EvalState & state, const std::string & text, const nix::Pos::Origin & origin,
-    const std::string & basePath, const std::string & homePath)
+// Parse `text` with the v3-native parser into the caller-owned
+// ParserState `st` (which owns the v3 AST Pool — must outlive any
+// subsequent lowering).  `st.basePath`/`st.homePath` set by the caller.
+static nix::v3::ast::Node * v3ParseInto(nix::v3::ast::ParserState & st, const std::string & text)
 {
-    nix::v3::ast::ParserState st;
-    st.basePath = basePath;
-    st.homePath = homePath;
     yyscan_t scanner;
     yylex_init(&scanner);
     YY_BUFFER_STATE buf = yy_scan_string(text.c_str(), scanner);
@@ -142,10 +136,7 @@ static nix::Expr * v3NativeParse(
     yylex_destroy(scanner);
     if (!st.result)
         throw nix::Error("v3-native parser produced no expression");
-    // Register the source origin so the AST's byte offsets become PosIdx
-    // that resolve to the right file/line/column (same origin TW uses).
-    auto po = state.positions.addOrigin(origin, text.size());
-    return nix::v3::toNixExpr(state, st.result, po);
+    return st.result;
 }
 
 // IR dump mode: which point in the pipeline to dump from.
@@ -296,23 +287,37 @@ int main(int argc, char ** argv)
         // (TW parser) until the SHIP gate + soak (PARSER_PROJECT_PLAN §6).
         static const bool s_nativeParser =
             std::getenv("NIX_V3_NATIVE_PARSER") != nullptr;
+        // NIX_V3_NATIVE_LOWER=1 (requires the native parser): lower the
+        // v3 AST → IR DIRECTLY (no nix::Expr bridge) when the whole tree
+        // is natively-supported (canLowerV3); else fall back to the
+        // bridge.  Stage 2, NATIVE_LOWERING_PLAN_2026-06-01.md.
+        static const bool s_nativeLower =
+            std::getenv("NIX_V3_NATIVE_LOWER") != nullptr;
         const char * homeEnv = std::getenv("HOME");
         std::string homePath = homeEnv ? homeEnv : "";
 
-        nix::Expr * e;
+        // v3 AST owner — must outlive lowering when native-lowering.
+        nix::v3::ast::ParserState v3st;
+        bool useNativeLower = false;  // lower v3st.result → IR directly
+
+        nix::Expr * e = nullptr;
         if (!path.empty() && path != "-") {
             std::filesystem::path abs = std::filesystem::absolute(path);
             nix::SourcePath sp(state.rootFS, nix::CanonPath(abs.string()));
             if (s_nativeParser) {
                 std::string text = slurp(path);
-                // Same origin TW uses (parseExprFromFile -> Pos::Origin(path))
-                // so unsafeGetAttrPos' `file` field matches byte-for-byte.
-                e = v3NativeParse(state, text, nix::Pos::Origin(sp),
-                                  abs.parent_path().string(), homePath);
+                v3st.basePath = abs.parent_path().string();
+                v3st.homePath = homePath;
+                v3ParseInto(v3st, text);
+                if (s_nativeLower && !parseOnly && nix::v3::canLowerV3(v3st.result))
+                    useNativeLower = true;
+                else {
+                    // Bridge: same origin TW uses (Pos::Origin(path)) so
+                    // unsafeGetAttrPos' `file` matches byte-for-byte.
+                    auto po = state.positions.addOrigin(nix::Pos::Origin(sp), text.size());
+                    e = nix::v3::toNixExpr(state, v3st.result, po);
+                }
             } else
-                // Use parseExprFromFile so relative imports inside the file
-                // resolve against the file's own directory, matching
-                // tree-walker behaviour.
                 e = state.parseExprFromFile(sp);
         } else {
             if (path == "-") {
@@ -322,17 +327,24 @@ int main(int argc, char ** argv)
                     return 1;
                 }
             }
-            // Anchor relative paths inside the expression to the current
-            // working directory (matching `nix-instantiate --eval --expr`
-            // behaviour).  Without this, `./foo` lowers to `/foo`.
             std::string cwd = std::filesystem::current_path().string();
-            if (s_nativeParser)
-                e = v3NativeParse(state, expr, nix::Pos::String{.source = nix::make_ref<std::string>(expr)},
-                                  cwd, homePath);
-            else
+            if (s_nativeParser) {
+                v3st.basePath = cwd;
+                v3st.homePath = homePath;
+                v3ParseInto(v3st, expr);
+                if (s_nativeLower && !parseOnly && nix::v3::canLowerV3(v3st.result))
+                    useNativeLower = true;
+                else {
+                    auto po = state.positions.addOrigin(
+                        nix::Pos::String{.source = nix::make_ref<std::string>(expr)}, expr.size());
+                    e = nix::v3::toNixExpr(state, v3st.result, po);
+                }
+            } else
                 e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath(cwd)));
         }
-        e->bindVars(state, state.staticBaseEnv);
+        // bindVars + the --parse path apply only to the nix::Expr path.
+        if (!useNativeLower)
+            e->bindVars(state, state.staticBaseEnv);
 
         // TI.2: --parse prints the AST and exits (before any lowering /
         // eval).  Matches `nix-instantiate --parse` byte-for-byte:
@@ -370,7 +382,11 @@ int main(int argc, char ** argv)
         if (!s_noBytecodePrimops)
             nix::v3::installAllBytecodePrimops(state);
 
-        auto m = nix::v3::lowerNixExpr(e, state.symbols, state.positions);
+        // Native lowering (Stage 2) when gated + supported; else the
+        // bridge's nix::Expr through the existing lowerNixExpr.
+        auto m = useNativeLower
+            ? nix::v3::lowerV3Ast(state.symbols, v3st.result)
+            : nix::v3::lowerNixExpr(e, state.symbols, state.positions);
 
         // IR-CHECK MVP path: when --emit-ir / --emit-ir-raw is set,
         // dump the IR at the requested phase and exit BEFORE compile.
