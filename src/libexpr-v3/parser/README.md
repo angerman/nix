@@ -11,8 +11,15 @@ divergences), and **547/547** nixpkgs `lib/` + `build-support/` files
 per-tier sections below; the historical scaffolding notes that follow
 describe the original plan and are kept for context.
 
-Remaining: **Stage 2** — bindVars (variable→De-Bruijn) + collapse the
-v3 AST to IR (replacing `lower.cc`'s `nix::Expr` path) + wire into eval.
+**Stage 2 integration (in progress):** `NIX_V3_NATIVE_PARSER=1 v3-eval`
+parses natively, bridges the v3 AST → `nix::Expr` (`cli/v3-to-nixexpr.hh`),
+then the EXISTING `bindVars` + `lowerNixExpr` pipeline evaluates it.
+Validated: bridge `--parse` 157/157 byte-equal to TW; **eval 139/143**
+lang tests (the 4 failures are all position-introspection — `__curPos`
+/ `unsafeGetAttrPos` — because the bridge uses `noPos`; see below).
+
+Remaining: **file-local positions** (closes the last 4 eval tests) +
+a fully-native AST→IR lowering (delete `lower.cc`'s `nix::Expr` path).
 
 ## Files
 

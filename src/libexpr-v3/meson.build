@@ -228,16 +228,39 @@ if host_machine.system() == 'darwin'
   v3_eval_link_args += [ '-Wl,-stack_size,0x4000000' ]  # 64 MiB
 endif
 
+# v3-native parser bison/flex outputs (parser/v3-parser.{y,l}).  Defined
+# here (before v3-eval) so v3-eval can link them for NIX_V3_NATIVE_PARSER.
+# unity=off because unity builds break the recursive flex/bison
+# generated-header dependency (libexpr meson.build:238).
+v3_parser_tab = custom_target(
+  'v3-parser-tab',
+  input : 'parser/v3-parser.y',
+  output : ['v3-parser-tab.cc', 'v3-parser-tab.hh'],
+  command : ['bison', '-o', '@OUTPUT0@', '@INPUT@', '-d'],
+)
+v3_parser_lex = custom_target(
+  'v3-parser-lex',
+  input : ['parser/v3-parser.l', v3_parser_tab],
+  output : ['v3-parser-lex.cc', 'v3-parser-lex.hh'],
+  command : ['flex', '--outfile', '@OUTPUT0@', '--header-file=@OUTPUT1@', '@INPUT0@'],
+)
+
 v3_eval = executable(
   'v3-eval',
   'cli/v3-eval.cc',
+  # Stage 2: link the v3-native parser so NIX_V3_NATIVE_PARSER=1 can
+  # parse natively + bridge to nix::Expr (cli/v3-to-nixexpr.hh).
+  v3_parser_tab,
+  v3_parser_lex,
   dependencies : deps_public + deps_private + deps_other + [
     declare_dependency(
       link_with : this_library,
       include_directories : include_dirs,
     ),
   ],
+  include_directories : include_directories('parser', 'cli'),
   link_args : v3_eval_link_args,
+  override_options : ['unity=off'],
   install : true,
 )
 
@@ -370,25 +393,10 @@ test(
   v3_ast_addattr_test,
 )
 
-# Parser project Stage 1.3 (PARSER_PROJECT_PLAN_2026-06-01) — bison/flex
-# grammar (parser/v3-parser.{y,l})
-# emitting v3 AST, to de-risk the bison/flex -> v3 build integration
-# BEFORE the full parser.y action rewrite (Stage 1.4).  Mirrors the
-# libexpr custom_target wiring; unity=off because unity builds break
-# the recursive flex/bison generated-header dependency (libexpr
-# meson.build:238).
-v3_parser_tab = custom_target(
-  'v3-parser-tab',
-  input : 'parser/v3-parser.y',
-  output : ['v3-parser-tab.cc', 'v3-parser-tab.hh'],
-  command : ['bison', '-o', '@OUTPUT0@', '@INPUT@', '-d'],
-)
-v3_parser_lex = custom_target(
-  'v3-parser-lex',
-  input : ['parser/v3-parser.l', v3_parser_tab],
-  output : ['v3-parser-lex.cc', 'v3-parser-lex.hh'],
-  command : ['flex', '--outfile', '@OUTPUT0@', '--header-file=@OUTPUT1@', '@INPUT0@'],
-)
+# Parser project (PARSER_PROJECT_PLAN_2026-06-01) — bison/flex grammar
+# (parser/v3-parser.{y,l}); the v3_parser_tab/v3_parser_lex custom_targets
+# are defined above (before v3-eval, which links them for the native
+# parser).  The test + standalone v3-parse CLI reuse them here.
 v3_parser_test = executable(
   'v3-parser-test',
   'test/parser-test.cc',

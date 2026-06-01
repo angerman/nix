@@ -49,6 +49,14 @@
 #include "nix/main/shared.hh"
 #include "nix/util/canon-path.hh"
 
+// v3-native parser (Stage 1) + the AST->nix::Expr bridge (Stage 2),
+// used behind NIX_V3_NATIVE_PARSER=1.
+#include "v3/ast/expr.hh"
+#include "parser-state.hh"
+#include "v3-parser-decls.hh"  // v3-parser-tab.hh + YYSTYPE
+#include "v3-parser-lex.hh"    // flex reentrant decls (needs YYSTYPE)
+#include "v3-to-nixexpr.hh"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -111,6 +119,30 @@ static void usage(const char * argv0)
         "usage: %s [--file PATH | --expr EXPR] [--json] [--strict] [--parse]\n"
         "       %s EXPR\n",
         argv0, argv0);
+}
+
+// NIX_V3_NATIVE_PARSER=1: parse `text` with the v3-native parser and
+// bridge the v3 AST to a nix::Expr (Stage 2 integration).  `basePath` is
+// the source-file directory (resolves relative/home path literals);
+// `homePath` is $HOME.  Falls through to the existing bindVars + lower
+// pipeline, so the only thing that changes vs the default is WHO parses.
+static nix::Expr * v3NativeParse(
+    nix::EvalState & state, const std::string & text,
+    const std::string & basePath, const std::string & homePath)
+{
+    nix::v3::ast::ParserState st;
+    st.basePath = basePath;
+    st.homePath = homePath;
+    yyscan_t scanner;
+    yylex_init(&scanner);
+    YY_BUFFER_STATE buf = yy_scan_string(text.c_str(), scanner);
+    nix::v3::parser::Parser parser(scanner, &st);
+    parser.parse();
+    yy_delete_buffer(buf, scanner);
+    yylex_destroy(scanner);
+    if (!st.result)
+        throw nix::Error("v3-native parser produced no expression");
+    return nix::v3::toNixExpr(state, st.result);
 }
 
 // IR dump mode: which point in the pipeline to dump from.
@@ -255,13 +287,26 @@ int main(int argc, char ** argv)
 
         nix::EvalState state(lookupPath, store, fetchSettings, evalSettings, nullptr);
 
+        // NIX_V3_NATIVE_PARSER=1 routes parsing through the v3-native
+        // parser (Stage 2 integration): v3 parse -> v3 AST -> nix::Expr
+        // bridge, then the SAME bindVars + lower pipeline.  Default off
+        // (TW parser) until the SHIP gate + soak (PARSER_PROJECT_PLAN §6).
+        static const bool s_nativeParser =
+            std::getenv("NIX_V3_NATIVE_PARSER") != nullptr;
+        const char * homeEnv = std::getenv("HOME");
+        std::string homePath = homeEnv ? homeEnv : "";
+
         nix::Expr * e;
         if (!path.empty() && path != "-") {
-            // Use parseExprFromFile so relative imports inside the file
-            // resolve against the file's own directory, matching
-            // tree-walker behaviour.
             std::filesystem::path abs = std::filesystem::absolute(path);
-            e = state.parseExprFromFile(nix::SourcePath(state.rootFS, nix::CanonPath(abs.string())));
+            if (s_nativeParser) {
+                std::string text = slurp(path);
+                e = v3NativeParse(state, text, abs.parent_path().string(), homePath);
+            } else
+                // Use parseExprFromFile so relative imports inside the file
+                // resolve against the file's own directory, matching
+                // tree-walker behaviour.
+                e = state.parseExprFromFile(nix::SourcePath(state.rootFS, nix::CanonPath(abs.string())));
         } else {
             if (path == "-") {
                 try { expr = slurp(path); }
@@ -274,7 +319,10 @@ int main(int argc, char ** argv)
             // working directory (matching `nix-instantiate --eval --expr`
             // behaviour).  Without this, `./foo` lowers to `/foo`.
             std::string cwd = std::filesystem::current_path().string();
-            e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath(cwd)));
+            if (s_nativeParser)
+                e = v3NativeParse(state, expr, cwd, homePath);
+            else
+                e = state.parseExprFromString(expr, state.rootPath(nix::CanonPath(cwd)));
         }
         e->bindVars(state, state.staticBaseEnv);
 
