@@ -70,6 +70,8 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
     case a::Kind::Int:
     case a::Kind::Float:
     case a::Kind::String:
+    case a::Kind::Path:   // parser pre-resolved the path string
+    case a::Kind::Pos:    // __curPos (resolved from the node's offset)
     case a::Kind::Var:
         return true;
     case a::Kind::Lambda: {
@@ -122,9 +124,15 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
         return canLowerV3(i->cond) && canLowerV3(i->then_) && canLowerV3(i->else_);
     }
     case a::Kind::OpEq: case a::Kind::OpNEq:
-    case a::Kind::OpUpdate: case a::Kind::OpConcatLists: {
+    case a::Kind::OpUpdate: case a::Kind::OpConcatLists:
+    case a::Kind::OpAnd: case a::Kind::OpOr: case a::Kind::OpImpl: {
         auto * b = static_cast<const a::BinOp *>(n);
         return canLowerV3(b->lhs) && canLowerV3(b->rhs);
+    }
+    case a::Kind::List: {
+        auto * l = static_cast<const a::List *>(n);
+        for (auto * el : l->elems) if (!canLowerV3(el)) return false;
+        return true;
     }
     case a::Kind::OpNot:
         return canLowerV3(static_cast<const a::OpNot *>(n)->e);
@@ -138,7 +146,7 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
         return canLowerV3(as->cond) && canLowerV3(as->body);
     }
     default:
-        return false;  // Lambda/Let/Attrs/Select/With/Path/List/&&/||/->/... -> bridge
+        return false;  // InheritFrom/BlackHole + dynamic keys (4c) + #495 (4d) -> bridge
     }
 }
 
@@ -149,23 +157,59 @@ struct LowererV3 {
     std::optional<nix::PosTable::Origin> posOrigin; // the source's registered origin
     std::vector<ir::BlockId> blockStack;
 
-    /// v3 byte-offset → IR pos-handle (mirrors lower.cc::posIdxToHandle:
-    /// resolve to a {file,line,column} snapshot, intern in the global
-    /// pool).  Drives builtins.unsafeGetAttrPos / functionArgs.  0 (no
-    /// position) → handle 0.
-    uint32_t posHandle(nix::v3::ast::Pos offset)
+    /// Stable backing store for runtime-derived strings (paths, __curPos
+    /// `file`).  Mirrors lower.cc's stringPool / interpStr — a deque never
+    /// invalidates the string_views the IR holds.
+    std::string_view internStr(const std::string & s)
     {
-        if (!positions || !posOrigin || offset == nix::v3::ast::noPos) return 0;
+        static std::deque<std::string> pool;
+        pool.emplace_back(s);
+        return pool.back();
+    }
+
+    /// Resolve a v3 byte-offset → {file,line,column} against the source's
+    /// registered PosTable::Origin (mirrors lower.cc::posIdxToHandle /
+    /// lowerPosAttrs' resolution).  nullopt when no position is known.
+    struct ResolvedPos { std::string file; uint32_t line; uint32_t column; };
+    std::optional<ResolvedPos> resolvePos(nix::v3::ast::Pos offset)
+    {
+        if (!positions || !posOrigin || offset == nix::v3::ast::noPos) return std::nullopt;
         nix::PosIdx pi = positions->add(*posOrigin, offset);
-        if (!pi) return 0;
+        if (!pi) return std::nullopt;
         nix::Pos pos = (*positions)[pi];
         std::string file;
         if (auto * s = std::get_if<nix::SourcePath>(&pos.origin)) file = s->path.abs();
         else if (std::holds_alternative<nix::Pos::Stdin>(pos.origin)) file = "<stdin>";
         else if (std::holds_alternative<nix::Pos::String>(pos.origin)) file = "<string>";
         else file = "<unknown>";
-        return nix::v3::recordPosSnapshot(
-            {std::move(file), static_cast<uint32_t>(pos.line), static_cast<uint32_t>(pos.column)});
+        return ResolvedPos{std::move(file), static_cast<uint32_t>(pos.line),
+                           static_cast<uint32_t>(pos.column)};
+    }
+
+    /// v3 byte-offset → IR pos-handle (snapshot interned in the global
+    /// pool).  Drives builtins.unsafeGetAttrPos / functionArgs.  0 (no
+    /// position) → handle 0.
+    uint32_t posHandle(nix::v3::ast::Pos offset)
+    {
+        auto rp = resolvePos(offset);
+        if (!rp) return 0;
+        return nix::v3::recordPosSnapshot({std::move(rp->file), rp->line, rp->column});
+    }
+
+    /// `__curPos` → `{ file; line; column; }` (mirrors lower.cc::lowerPosAttrs).
+    /// `null` when no position is known.
+    ir::VarId lowerPosAttrs(nix::v3::ast::Pos offset)
+    {
+        auto rp = resolvePos(offset);
+        if (!rp) return addBinding(ir::LitNull{});
+        ir::VarId fileV   = addBinding(ir::LitString{internStr(rp->file)});
+        ir::VarId lineV   = addBinding(ir::LitInt{static_cast<int64_t>(rp->line)});
+        ir::VarId columnV = addBinding(ir::LitInt{static_cast<int64_t>(rp->column)});
+        std::vector<ir::AttrSet::Entry> entries;
+        entries.push_back({m.internSymbol("file"),   fileV});
+        entries.push_back({m.internSymbol("line"),   lineV});
+        entries.push_back({m.internSymbol("column"), columnV});
+        return addBinding(ir::AttrSet{std::move(entries)});
     }
 
     /// Lexical scope stack (innermost at the back), name → VarId.  A Var
@@ -319,8 +363,39 @@ struct LowererV3 {
             blockStack.push_back(bodyB); setReturn(lowerExpr(as->body)); blockStack.pop_back();
             return addBinding(ir::Assert{cond, bodyB});
         }
+        case a::Kind::List: {
+            // Lazy elements — each non-trivial element thunked so building
+            // the list fires no unused side-effects (`head [42 (throw "x")]`
+            // → 42).  Mirrors lower.cc::lowerList.
+            auto * l = static_cast<const a::List *>(n);
+            std::vector<ir::VarId> elems;
+            elems.reserve(l->elems.size());
+            for (auto * el : l->elems) elems.push_back(thunkifyForAttr(el));
+            return addBinding(ir::ListExpr{std::move(elems)});
+        }
+        case a::Kind::Path: {
+            // The parser already resolved the path string (abs / SPATH /
+            // relative-to-basePath).  accessor=nullptr → default root FS,
+            // matching lower.cc::lowerPath.
+            return addBinding(ir::LitPath{internStr(static_cast<const a::Path *>(n)->p), nullptr});
+        }
+        case a::Kind::OpAnd: case a::Kind::OpOr: case a::Kind::OpImpl: {
+            // Short-circuit: lhs in the current block, rhs in a fresh block
+            // entered only when lhs's value demands it (the VM's And/Or/Impl
+            // op forces lhs).  Mirrors lower.cc::lowerShortCircuit.
+            auto * b = static_cast<const a::BinOp *>(n);
+            ir::VarId lhs = lowerExpr(b->lhs);
+            auto rhsB = m.freshBlock();
+            blockStack.push_back(rhsB); setReturn(lowerExpr(b->rhs)); blockStack.pop_back();
+            if (n->kind == a::Kind::OpAnd) return addBinding(ir::And{lhs, rhsB});
+            if (n->kind == a::Kind::OpOr)  return addBinding(ir::Or{lhs, rhsB});
+            return addBinding(ir::Impl{lhs, rhsB});
+        }
+        case a::Kind::Pos:
+            // `__curPos` → `{ file; line; column; }` from this node's offset.
+            return lowerPosAttrs(n->pos);
         default:
-            throw std::runtime_error("v3 native lower: Phase-1-unsupported kind "
+            throw std::runtime_error("v3 native lower: unsupported kind "
                                      + std::to_string((int) n->kind));
         }
     }
@@ -446,13 +521,37 @@ struct LowererV3 {
     /// Trivial-for-value: cheap exprs that need no lazy thunk wrapper
     /// as an attr/list value (mirrors lower.cc isTrivialForLazy forValue
     /// — literals/lambda/var; NOT arithmetic, which is lazy for values).
-    static bool isTrivialForValue(const nix::v3::ast::Node * n)
+    /// Would the name resolve through the `with`-chain (i.e. NOT lexically
+    /// and NOT a base-env name)?  Mirrors lowerVarByName's resolution order
+    /// WITHOUT emitting.  A with-resolved Var compiles to a runtime
+    /// OP_WITH_LOOKUP that forces the with-target — so it is NOT trivial
+    /// and must be thunked in lazy positions (the "delayed with" cycle:
+    /// `with pkgs; { a = b; }` where pkgs is part of the same fixed point).
+    bool resolvesViaWith(const std::string & name) const
+    {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it)
+            if (it->byName.count(name)) return false;        // lexical / rec slot
+        if (name == "true" || name == "false" || name == "null"
+            || name == "builtins" || name == "__curPos") return false;  // base-env consts
+        if (findPrimOp(name)) return false;                   // base-env primop
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it)
+            if (it->withTargetVar != ir::kInvalid) return true;  // falls through to with
+        return false;  // unbound (lowering will error) — not a with-lookup
+    }
+
+    /// Trivial-for-lazy (mirrors lower.cc::isTrivialForLazy): values whose
+    /// "thunk" can be skipped because constructing them is side-effect-free
+    /// and cheap.  A Var is trivial UNLESS it resolves via `with` (see
+    /// resolvesViaWith).  Non-static: the Var case consults the scope stack.
+    bool isTrivialForValue(const nix::v3::ast::Node * n) const
     {
         namespace a = nix::v3::ast;
         switch (n->kind) {
         case a::Kind::Int: case a::Kind::Float: case a::Kind::String:
-        case a::Kind::Path: case a::Kind::Var: case a::Kind::Lambda:
+        case a::Kind::Path: case a::Kind::Lambda:
             return true;
+        case a::Kind::Var:
+            return !resolvesViaWith(static_cast<const a::Var *>(n)->name);
         default: return false;
         }
     }
@@ -620,8 +719,13 @@ struct LowererV3 {
             en.name = m.internSymbol(d.name);
             en.pos = posHandle(d.pos);
             if (d.kind == a::Attrs::AttrKind::Inherited) {
-                // `inherit x;` → parent-scope x, eager (a ref).
-                en.value = lowerVarByName(d.name);
+                // `inherit x;` → parent-scope x.  Lazy iff x resolves via
+                // `with` (eager OP_WITH_LOOKUP at construction blackholes
+                // delayed-with cycles); else a direct ref.  Mirrors
+                // lower.cc routing `inherit x` through thunkifyForAttr(Var).
+                en.value = resolvesViaWith(d.name)
+                    ? thunkifyIR([&] { return lowerVarByName(d.name); })
+                    : lowerVarByName(d.name);
             } else if (d.kind == a::Attrs::AttrKind::InheritedFrom) {
                 // `inherit (e) x;` → x = e.x, sharing the source thunk.
                 ir::SymbolId sym = m.internSymbol(d.name);
