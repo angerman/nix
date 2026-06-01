@@ -25,13 +25,13 @@ parser/v3-parse-api.cc
 cli/lower_v3.hh
 include/v3/tw_baseenv.hh
 
+# --- centralized build-macro leaf (NIX_USE_BOEHMGC; §2.4 #4) ---
+include/v3/gc-config.hh
+
 # --- Category A FFI leaves + Category C/D pinch (consolidation targets) ---
-bridge_root_registry.cc
 bridge_yield.cc
 bytecode_primops.cc
 cli/v3-eval.cc
-include/v3/alloc.hh
-include/v3/nursery.hh
 include/v3/run.hh
 include/v3/vm.hh
 primops.cc

@@ -20,13 +20,13 @@
 #include <cstdlib>
 #include <cstring>
 
-// Match alloc.hh's NIX_USE_BOEHMGC sourcing (it pulls
-// nix/expr/config.hh).  Done unconditionally so the gate macro is
-// defined before any -Wundef-sensitive use site.  Currently the
-// nursery doesn't depend on Boehm directly (the buffer is plain
-// malloc'd); the include is for forward-compatibility with
-// Phase D's optional GC integration.
-#include "nix/expr/config.hh"
+// Match alloc.hh's NIX_USE_BOEHMGC sourcing (via the v3-owned
+// gc-config header — no direct TW include).  Done unconditionally so the
+// gate macro is defined before any -Wundef-sensitive use site.  Currently
+// the nursery doesn't depend on Boehm directly (the buffer is plain
+// malloc'd); the include is for forward-compatibility with Phase D's
+// optional GC integration.
+#include "v3/gc-config.hh"
 #if NIX_USE_BOEHMGC
 #include <gc/gc.h>
 #endif

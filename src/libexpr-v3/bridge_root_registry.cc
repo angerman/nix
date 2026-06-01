@@ -9,7 +9,7 @@
 
 #include "v3/bridge_root_registry.hh"
 
-#include "nix/expr/config.hh"
+#include "v3/gc-config.hh"  // NIX_USE_BOEHMGC (v3-owned indirection)
 #if NIX_USE_BOEHMGC
 #  include <gc/gc.h>
 #endif

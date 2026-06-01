@@ -30,7 +30,7 @@
 
 #include "nix/expr/eval.hh"
 
-#include "nix/expr/config.hh"
+#include "v3/gc-config.hh"  // NIX_USE_BOEHMGC (v3-owned indirection)
 
 // PARSER_PROJECT_PLAN §5.3: the native parse+lower+run entry, so the
 // `nix` binary's CLI (src/nix/eval.cc) needn't pull parser/cli headers.

@@ -251,6 +251,7 @@ install_headers(
     'include/v3/ir.hh',
     'include/v3/disk_cache.hh',
     'include/v3/gc.hh',
+    'include/v3/gc-config.hh',
     'include/v3/limits.hh',
     'include/v3/primop.hh',
     'include/v3/print.hh',

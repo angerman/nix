@@ -39,9 +39,10 @@
 // Without this, the v3 arena is invisible to Boehm's mark phase and
 // values pointed to only from there are reclaimed mid-evaluation.
 //
-// Pulled in only when NIX_USE_BOEHMGC is defined; otherwise the
-// arena uses plain malloc and there's no GC to integrate with.
-#include "nix/expr/config.hh"
+// NIX_USE_BOEHMGC gates Boehm vs plain-malloc arena (no GC to integrate
+// with otherwise).  Routed through the v3-owned gc-config header so this
+// file carries no direct TW include (FFI consolidation §2.4 #4).
+#include "v3/gc-config.hh"
 #if NIX_USE_BOEHMGC
 #  include <gc/gc.h>
 #endif
