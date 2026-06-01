@@ -401,6 +401,10 @@ v3_parser_spike_test = executable(
 test(
   'v3-parser-spike-test',
   v3_parser_spike_test,
+  # Sweep the operator-precedence battery (Stage 1.4 validation): the
+  # test parses each fixture .nix via the v3 parser and byte-compares
+  # show() to the committed .exp golden.
+  args : [meson.current_source_dir() / 'test' / 'parser-ti' / 'fixtures' / 'precedence'],
 )
 
 # #545: bench-harness self-tests.  Pure Python; loads workloads.toml,

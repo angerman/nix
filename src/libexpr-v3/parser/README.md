@@ -156,12 +156,33 @@ devshell → meson → generated C++ compiles → flex/bison glue
 Integration gotchas locked: `-Wswitch-enum` pragma in `%code requires`
 (matches parser.y:17), `unity=off`, and the YYSTYPE glue header.
 
-Stage 1.4 GROWS this seed: swap the minimal grammar for parser.y's
-full productions + rewrite the actions to call `state.add<ast::X>`,
-`state.addAttr`, `state.validateFormals`, `state.stripIndentation`
-(all proven), port lexer.l's 7 states (honoring the IND_STRING_OPEN
-contract), then validate against the 68 fixtures + 263-file sweep via
-`NIX_V3_NATIVE_PARSER=1`.
+### Stage 1.4 status — Tier 1 (expression core) LANDED
+
+`parser/v3-spike.{y,l}` grew from the arithmetic toolchain spike into
+the real parser's **expression core**, transcribing parser.y's
+productions + precedence VERBATIM (so `%expect 0` holds) and rewriting
+only the actions to emit v3 AST.
+
+Tier 1 covers: integer/float literals, variables (+ `__curPos`), the
+full operator precedence tier (incl. `<`/`>`/`<=`/`>=` → `__lessThan`
+and unary `-` → `__sub 0` desugarings), application (flattened via
+`makeCall`), select (`.` + `or`), has-attr (`?`), simple lambda
+(`x: body`), and `if/then/else`.
+
+Validated by `test/parser-spike-test.cc` (**54/54**): 5 arithmetic
+sanity + a sweep of all **49 operator-precedence fixtures**
+(test/parser-ti/fixtures/precedence) byte-equal to `nix-instantiate
+--parse`.  No bison conflicts (faithful transcription preserved
+parser.y's `%expect 0`).
+
+**Tier 2+ (remaining Stage 1.4):**
+* Tier 2 — strings + antiquotation, paths (lexer STRING/PATH states)
+* Tier 3 — attrsets/binds (via `addAttr`), lists, let/with/assert
+* Tier 4 — formals (via `validateFormals`), indented strings (via
+  `stripIndentation`), dynamic attr keys, pipe operators, cursed-or
+* Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;
+  validate the 68 fixtures + 263-file sweep + 143 lang tests; rename
+  v3-spike → v3-parser; retire the throwaway arithmetic framing.
 
 ## How to inspect upstream actions
 

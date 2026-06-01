@@ -1,17 +1,23 @@
-/* v3 parser Stage 1.3 — bison/flex toolchain spike.
+/* v3 parser Stage 1.4 — grammar grow (Tier 1: expression core).
  *
- * PARSER_PROJECT_PLAN_2026-06-01.md §2 (Stage 1.3).  Minimal grammar
- * that de-risks the bison/flex -> v3 build integration: same lalr1.cc
- * C++ skeleton + api.value.type variant as the real parser.y, emitting
- * the v3 AST (include/v3/ast/expr.hh) via the v3 ParserState
- * (parser/parser-state.hh).  Locations are omitted for the spike
- * (positions = noPos); the real parser.y adds them in Stage 1.4.
+ * PARSER_PROJECT_PLAN_2026-06-01.md §2 (Stage 1.4).  Grows the Stage 1.3
+ * toolchain spike into the real parser by transcribing parser.y's
+ * expression-core productions VERBATIM (same precedence declarations,
+ * same productions) and rewriting only the action bodies to emit the v3
+ * AST via the v3 ParserState.  Keeping the grammar structure identical
+ * preserves parser.y's `%expect 0` conflict-freedom.
  *
- * Grammar: arithmetic over integer literals + parens with the standard
- * precedence (+ looser than *, both left-assoc), enough to prove the
- * whole toolchain path compiles, links, runs, and produces v3 AST that
- * `show()`s byte-equal to `nix-instantiate --parse`.  Stage 1.4 swaps
- * this for the full parser.y grammar + rewritten actions.
+ * Tier 1 coverage: integer/float literals, variables, the full operator
+ * precedence tier (incl. the `<`/`>`/`<=`/`>=` -> __lessThan and unary
+ * `-` -> `__sub 0` desugarings), function application (flattened via
+ * makeCall), attribute selection (`.` + `or` default), has-attr (`?`),
+ * simple lambda (`x: body`), and `if/then/else`.  This validates against
+ * the 49-fixture operator-precedence battery
+ * (test/parser-ti/fixtures/precedence).
+ *
+ * Tier 2+ (subsequent commits) add: strings + antiquotation, paths,
+ * indented strings, attrsets/binds (via addAttr), lists, let/with/assert,
+ * formals (via validateFormals), pipe operators, dynamic attr keys.
  *
  * Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
  *   Input Output Group.
@@ -31,27 +37,51 @@
 
 %code requires {
   // bison emits switch statements over the full symbol-kind enum with a
-  // default: case; silence -Wswitch-enum for the generated code (same as
-  // the real parser.y:17-19).  Pushed without pop — applies to the
-  // generated header + the .cc that includes it.
+  // default: case; silence -Wswitch-enum for the generated code (matches
+  // the real parser.y:17-19).  Push without pop.
   #pragma GCC diagnostic push
   #pragma GCC diagnostic ignored "-Wswitch-enum"
 
   #include "v3/ast/expr.hh"
   #include "parser-state.hh"
+  #include <vector>
+  #include <string>
   typedef void * yyscan_t;
 }
 
 %code {
   #include "v3-spike-tab.hh"
-  // Flex reentrant + bison-bridge scanner entry (matches lexer.l's
-  // YY_DECL shape, minus locations).
   int yylex(nix::v3::spike::SpikeParser::value_type * yylval, yyscan_t scanner);
   using namespace nix::v3::ast;
 }
 
-%token <int64_t> INT
-%type <nix::v3::ast::Node *> expr term factor
+/* Token value types (mirror parser.y). */
+%token <std::string> ID   "identifier"
+%token <int64_t>     INT_LIT   "integer"
+%token <double>      FLOAT_LIT "float"
+%token IF "'if'" THEN "'then'" ELSE "'else'"
+%token OR_KW "'or'"
+%token EQ "'=='" NEQ "'!='" LEQ "'<='" GEQ "'>='"
+%token UPDATE "'//'" CONCAT "'++'" AND "'&&'" OR "'||'" IMPL "'->'"
+
+%type <nix::v3::ast::Node *> expr expr_function expr_if expr_op
+%type <nix::v3::ast::Node *> expr_app expr_select expr_simple
+%type <std::vector<nix::v3::ast::AttrName>> attrpath
+%type <std::string> attr
+
+/* Precedence — transcribed verbatim from parser.y:208-219. */
+%right IMPL
+%left OR
+%left AND
+%nonassoc EQ NEQ
+%nonassoc '<' '>' LEQ GEQ
+%right UPDATE
+%left NOT
+%left '+' '-'
+%left '*' '/'
+%right CONCAT
+%nonassoc '?'
+%nonassoc NEGATE
 
 %%
 
@@ -60,32 +90,106 @@ start
   ;
 
 expr
-  : expr '+' term {
-      // `+` desugars to a 2-element ConcatStrings (left-assoc), matching
-      // parser.y; `1 + 2 + 3` -> ((1 + 2) + 3).
-      $$ = state->add<ConcatStrings>(std::vector<Node *>{ $1, $3 });
-    }
-  | term { $$ = $1; }
+  : expr_function
   ;
 
-term
-  : term '*' factor {
-      // `*` desugars to `__mul a b` (parser.y:308 makeCall pattern).
-      $$ = state->add<Call>(
-             state->add<Var>(std::string("__mul")),
+expr_function
+  : ID ':' expr_function { $$ = state->add<Lambda>($1, $3); }
+  | expr_if
+  ;
+
+expr_if
+  : IF expr THEN expr ELSE expr { $$ = state->add<If>($2, $4, $6); }
+  | expr_op
+  ;
+
+expr_op
+  : '!' expr_op %prec NOT { $$ = state->add<OpNot>($2); }
+  | '-' expr_op %prec NEGATE {
+      $$ = state->add<Call>(state->add<Var>(std::string("__sub")),
+             std::vector<Node *>{ state->add<Int>(0), $2 });
+    }
+  | expr_op EQ expr_op    { $$ = state->add<BinOp>(Kind::OpEq,  "==", $1, $3); }
+  | expr_op NEQ expr_op   { $$ = state->add<BinOp>(Kind::OpNEq, "!=", $1, $3); }
+  | expr_op '<' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__lessThan")),
              std::vector<Node *>{ $1, $3 });
     }
-  | factor { $$ = $1; }
+  | expr_op LEQ expr_op {
+      $$ = state->add<OpNot>(
+             state->add<Call>(state->add<Var>(std::string("__lessThan")),
+               std::vector<Node *>{ $3, $1 }));
+    }
+  | expr_op '>' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__lessThan")),
+             std::vector<Node *>{ $3, $1 });
+    }
+  | expr_op GEQ expr_op {
+      $$ = state->add<OpNot>(
+             state->add<Call>(state->add<Var>(std::string("__lessThan")),
+               std::vector<Node *>{ $1, $3 }));
+    }
+  | expr_op AND expr_op    { $$ = state->add<BinOp>(Kind::OpAnd,  "&&", $1, $3); }
+  | expr_op OR expr_op     { $$ = state->add<BinOp>(Kind::OpOr,   "||", $1, $3); }
+  | expr_op IMPL expr_op   { $$ = state->add<BinOp>(Kind::OpImpl, "->", $1, $3); }
+  | expr_op UPDATE expr_op { $$ = state->add<BinOp>(Kind::OpUpdate, "//", $1, $3); }
+  | expr_op '?' attrpath   { $$ = state->add<OpHasAttr>($1, $3); }
+  | expr_op '+' expr_op {
+      // `+` -> 2-element ConcatStrings (parser.y:311).
+      $$ = state->add<ConcatStrings>(std::vector<Node *>{ $1, $3 });
+    }
+  | expr_op '-' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__sub")),
+             std::vector<Node *>{ $1, $3 });
+    }
+  | expr_op '*' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__mul")),
+             std::vector<Node *>{ $1, $3 });
+    }
+  | expr_op '/' expr_op {
+      $$ = state->add<Call>(state->add<Var>(std::string("__div")),
+             std::vector<Node *>{ $1, $3 });
+    }
+  | expr_op CONCAT expr_op { $$ = state->add<BinOp>(Kind::OpConcatLists, "++", $1, $3); }
+  | expr_app
   ;
 
-factor
-  : INT          { $$ = state->add<Int>($1); }
+expr_app
+  : expr_app expr_select { $$ = state->makeCall($1, $2); }
+  | expr_select          { $$ = $1; }
+  ;
+
+expr_select
+  : expr_simple '.' attrpath
+    { $$ = state->add<Select>($1, $3, nullptr); }
+  | expr_simple '.' attrpath OR_KW expr_select
+    { $$ = state->add<Select>($1, $3, $5); }
+  | expr_simple
+  ;
+
+expr_simple
+  : ID {
+      if ($1 == "__curPos") $$ = state->add<PosExpr>();
+      else                  $$ = state->add<Var>($1);
+    }
+  | INT_LIT      { $$ = state->add<Int>($1); }
+  | FLOAT_LIT    { $$ = state->add<Float>($1); }
   | '(' expr ')' { $$ = $2; }
+  ;
+
+attrpath
+  : attrpath '.' attr { $$ = std::move($1); $$.emplace_back($3); }
+  | attr              { $$ = std::vector<AttrName>{ AttrName($1) }; }
+  ;
+
+attr
+  : ID    { $$ = $1; }
+  | OR_KW { $$ = std::string("or"); }
   ;
 
 %%
 
 void nix::v3::spike::SpikeParser::error(const std::string & msg)
 {
-    throw nix::v3::ast::ParseError("v3 spike parse error: " + msg, 0);
+    throw nix::v3::ast::ParseError("v3 parse error: " + msg, 0);
 }

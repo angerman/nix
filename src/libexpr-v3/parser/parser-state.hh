@@ -68,6 +68,17 @@ struct ParserState {
     template <typename T, typename... Args>
     T * add(Args &&... a) { return pool.add<T>(std::forward<Args>(a)...); }
 
+    /// Application builder (port of parser.y:144 makeCall): if `fn` is
+    /// already a Call, append `arg` to its args (so `f a b` flattens to
+    /// one Call with [a, b]); otherwise make a fresh Call(fn, [arg]).
+    Node * makeCall(Node * fn, Node * arg) {
+        if (fn->kind == Kind::Call) {
+            static_cast<Call *>(fn)->args.push_back(arg);
+            return fn;
+        }
+        return add<Call>(fn, std::vector<Node *>{ arg });
+    }
+
     // -- formal-argument validation (port of validateFormals) -------
 
     /// Detect duplicate formal arguments (`{ a, a }: ...`) and a

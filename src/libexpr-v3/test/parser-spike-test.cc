@@ -1,18 +1,19 @@
 /// @file
-/// Stage 1.3 toolchain spike test — bison/flex → v3 AST end-to-end.
+/// Stage 1.3/1.4 parser test — bison/flex → v3 AST end-to-end.
 ///
-/// PARSER_PROJECT_PLAN_2026-06-01.md §2 (Stage 1.3).  Drives the
-/// minimal bison/flex parser (parser/v3-spike.{y,l}) and asserts the
-/// resulting v3 AST `show()`s byte-equal to `nix-instantiate --parse`
-/// for arithmetic expressions — proving the WHOLE toolchain path:
-/// bison + flex in the devshell → meson custom_target → generated C++
-/// compiles → flex/bison glue links → parser runs → v3 AST out.
+/// PARSER_PROJECT_PLAN_2026-06-01.md §2.  Drives the v3 bison/flex
+/// parser (parser/v3-spike.{y,l}) and asserts the resulting v3 AST
+/// `show()`s byte-equal to `nix-instantiate --parse`.
 ///
-/// Once this is green, Stage 1.4 grows the grammar from this seed
-/// (swap in parser.y's full productions + rewritten actions).
+/// Two layers:
+///   1. hardcoded arithmetic sanity (Stage 1.3 toolchain proof);
+///   2. if argv[1] is a fixtures dir, sweep every *.nix in it and
+///      byte-compare show() output vs the committed *.exp golden
+///      (Stage 1.4 validation against the operator-precedence battery,
+///      test/parser-ti/fixtures/precedence — 49 fixtures).
 ///
-/// Per [[falsification-rule]]: kills "bison/flex can't be wired into
-/// the v3 build to produce a runnable v3-AST-emitting parser".
+/// Per [[falsification-rule]]: kills "the v3 parser can't reproduce
+/// TW's AST for the operator/lambda/select/app/has-attr core".
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 ///   Input Output Group.
@@ -23,19 +24,25 @@
 #include "v3-spike-decls.hh"  // v3-spike-tab.hh + YYSTYPE
 #include "v3-spike-lex.hh"    // flex reentrant decls (needs YYSTYPE)
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
+#include <vector>
 
 using namespace nix::v3::ast;
 
 static int failures = 0, checks = 0;
 
-/// Parse `text` through the spike bison/flex parser into v3 AST.
-/// The ParserState owns the AST (Pool); caller shows it while alive.
-static Node * spikeParse(ParserState & st, const char * text) {
+/// Parse `text` through the v3 bison/flex parser into v3 AST.  The
+/// ParserState owns the AST (Pool); caller shows it while alive.
+static Node * v3parse(ParserState & st, const std::string & text) {
     yyscan_t scanner;
     yylex_init(&scanner);
-    YY_BUFFER_STATE buf = yy_scan_string(text, scanner);
+    // yy_scan_string copies; the buffer is freed by yy_delete_buffer.
+    YY_BUFFER_STATE buf = yy_scan_string(text.c_str(), scanner);
     nix::v3::spike::SpikeParser parser(scanner, &st);
     parser.parse();
     yy_delete_buffer(buf, scanner);
@@ -43,31 +50,55 @@ static Node * spikeParse(ParserState & st, const char * text) {
     return st.result;
 }
 
-static void check(const char * src, const char * golden) {
+static void check(const std::string & src, const std::string & golden) {
     ++checks;
     ParserState st;
     std::string got;
     try {
-        got = showToString(spikeParse(st, src));
+        got = showToString(v3parse(st, src));
     } catch (const std::exception & e) {
         ++failures;
-        std::printf("  FAIL %-14s threw: %s\n", src, e.what());
+        std::printf("  FAIL %-20s threw: %s\n", src.c_str(), e.what());
         return;
     }
-    if (got == golden) std::printf("  ok   %-14s %s\n", src, got.c_str());
-    else { ++failures; std::printf("  FAIL %-14s\n    golden: %s\n    got:    %s\n",
-                                   src, golden, got.c_str()); }
+    if (got == golden) std::printf("  ok   %-20s %s\n", src.c_str(), got.c_str());
+    else { ++failures; std::printf("  FAIL %-20s\n    golden: %s\n    got:    %s\n",
+                                   src.c_str(), golden.c_str(), got.c_str()); }
 }
 
-int main() {
-    std::printf("=== Stage 1.3 bison/flex spike → v3 AST vs TW --parse ===\n");
-    // Goldens captured from `nix-instantiate --parse`.
+static std::string slurp(const std::filesystem::path & p) {
+    std::ifstream f(p);
+    std::ostringstream ss; ss << f.rdbuf();
+    std::string s = ss.str();
+    // trim trailing newline(s) so file content + golden compare cleanly
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    return s;
+}
+
+int main(int argc, char ** argv) {
+    std::printf("=== bison/flex spike → v3 AST: arithmetic sanity ===\n");
     check("1 + 2",        "(1 + 2)");
     check("1 + 2 + 3",    "((1 + 2) + 3)");
     check("2 * 3",        "(__mul 2 3)");
     check("1 + 2 * 3",    "(1 + (__mul 2 3))");
     check("(1 + 2) * 3",  "(__mul (1 + 2) 3)");
-    check("1 * 2 * 3",    "(__mul (__mul 1 2) 3)");
+
+    // Stage 1.4: sweep the operator-precedence battery if a dir is given.
+    if (argc > 1) {
+        std::filesystem::path dir(argv[1]);
+        std::printf("\n=== precedence battery sweep (%s) ===\n", argv[1]);
+        std::vector<std::filesystem::path> nixFiles;
+        if (std::filesystem::is_directory(dir))
+            for (auto & e : std::filesystem::directory_iterator(dir))
+                if (e.path().extension() == ".nix") nixFiles.push_back(e.path());
+        std::sort(nixFiles.begin(), nixFiles.end());
+        for (auto & nf : nixFiles) {
+            auto exp = nf; exp.replace_extension(".exp");
+            if (!std::filesystem::exists(exp)) continue;
+            check(slurp(nf), slurp(exp));
+        }
+    }
+
     std::printf("\n=== %d/%d checks passed ===\n", checks - failures, checks);
     return failures == 0 ? 0 : 1;
 }
