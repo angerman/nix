@@ -16,7 +16,6 @@
 /// SPDX-License-Identifier: Apache-2.0
 #include "v3/value.hh"
 #include "v3/bytecode.hh"
-#include "nix/util/pos-table.hh"  // PosTable::Origin (runRootExprFromString)
 
 #include <memory>
 #include <string>
@@ -24,6 +23,7 @@
 namespace nix {
 struct Expr;
 class EvalState;
+struct SourcePath;  // for runRootExprFromString's origin (by pointer)
 }
 
 namespace nix::v3 {
@@ -72,13 +72,15 @@ RootResult runRootExprModule(EvalState & state, ir::Module module);
 
 /// Native parse+lower+run from raw `.nix` source (no nix::Expr) — the
 /// top-level entry for the CLI + any caller that has source text.
-/// `basePath`/`homePath` resolve relative / `~` path literals; `origin`
-/// is the source's PosTable::Origin (from state.positions.addOrigin) so
-/// positions match TW.  Throws on a (provably-impossible for parsed
-/// source) canLowerV3 miss.
+/// `basePath`/`homePath` resolve relative / `~` path literals.
+/// `originPath` selects the source's position origin: non-null → a file
+/// (`Pos::Origin(*originPath)`); null → an in-memory string
+/// (`Pos::String`).  Positions then match TW.  Throws on a (provably-
+/// impossible for parsed source) canLowerV3 miss.  (Takes the SourcePath
+/// by pointer so run.hh needs no `nix/...` position header.)
 RootResult runRootExprFromString(EvalState & state, const std::string & source,
                                  const std::string & basePath, const std::string & homePath,
-                                 PosTable::Origin origin);
+                                 const nix::SourcePath * originPath);
 
 /// Convenience overload for SYNTHETIC sources (no relative/`~` path
 /// literals) — e.g. the bytecode-primop wrapper installer.  Builds a

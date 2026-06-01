@@ -89,31 +89,27 @@ static bool runV3DirectEval(
     // access is resolved against the static type at the call site).
     std::string attrPath = installable.what();  // e.g. "lib.fix" or "" for root.
 
-    // PARSER_PROJECT_PLAN §5.3: acquire the raw `.nix` source + its
-    // PosTable::Origin, then native parse+lower+run — NO nix::Expr.
-    // Relative (`./x`) / home (`~/x`) path literals resolve against the
-    // file's dir / $HOME (as TW's parseExprFromFile/String does); the
-    // origin makes positions byte-match TW.
+    // PARSER_PROJECT_PLAN §5.3: acquire the raw `.nix` source, then native
+    // parse+lower+run — NO nix::Expr.  Relative (`./x`) / home (`~/x`) path
+    // literals resolve against the file's dir / $HOME; the position origin
+    // (file vs in-memory string) is built inside runRootExprFromString from
+    // `v3file` so this site needs no `nix/...` position type.
     std::string v3src, v3base;
-    std::optional<nix::PosTable::Origin> v3origin;  // const members → no copy-assign
+    std::optional<nix::SourcePath> v3file;  // set for a real file; null → string/stdin
     if (cmd.file) {
         if (*cmd.file == "-") {
             v3src = nix::drainFD(STDIN_FILENO);
             v3base = absPath(cmd.getCommandBaseDir()).string();
-            v3origin.emplace(state.positions.addOrigin(
-                nix::Pos::Stdin{.source = nix::make_ref<std::string>(v3src)}, v3src.size()));
         } else {
             auto dir = absPath(cmd.getCommandBaseDir());
             nix::SourcePath sp = lookupFileArg(state, cmd.file->string(), &dir);
             v3src = sp.resolveSymlinks().readFile();
             if (auto par = sp.path.parent()) v3base = par->abs();
-            v3origin.emplace(state.positions.addOrigin(nix::Pos::Origin(sp), v3src.size()));
+            v3file.emplace(sp);
         }
     } else {
         v3base = absPath(cmd.getCommandBaseDir()).string();
         v3src = *cmd.expr;
-        v3origin.emplace(state.positions.addOrigin(
-            nix::Pos::String{.source = nix::make_ref<std::string>(v3src)}, v3src.size()));
     }
 
     // Run v3 pipeline.  Returns (cu, value) — keep cu alive for the
@@ -123,7 +119,7 @@ static bool runV3DirectEval(
     // back via the global pointer.
     nix::evalTrace::mark("eval.cc:100 runRootExprFromString(root)");
     auto rootResult = v3::runRootExprFromString(
-        state, v3src, v3base, nix::getHome().string(), *v3origin);
+        state, v3src, v3base, nix::getHome().string(), v3file ? &*v3file : nullptr);
     v3::Value r = rootResult.value;
 
     // Set up a VMState for further forcing / callClosure work.  STG-10
@@ -178,11 +174,10 @@ static bool runV3DirectEval(
     std::optional<v3::RootResult> applyResult;
     if (apply) {
         auto dir = absPath(cmd.getCommandBaseDir());
-        auto applyOrigin = state.positions.addOrigin(
-            nix::Pos::String{.source = nix::make_ref<std::string>(*apply)}, apply->size());
+        // In-memory expr string → null originPath selects Pos::String.
         nix::evalTrace::mark("eval.cc:156 runRootExprFromString(--apply)");
         applyResult.emplace(v3::runRootExprFromString(
-            state, *apply, dir.string(), nix::getHome().string(), applyOrigin));
+            state, *apply, dir.string(), nix::getHome().string(), nullptr));
         nix::evalTrace::mark("eval.cc:157 forceValue(--apply fn)");
         v3::Value applyV = v3::forceValue(vm, applyResult->value);
         r = v3::callClosure(vm, applyV, r);

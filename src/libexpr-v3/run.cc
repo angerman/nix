@@ -1550,7 +1550,7 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
 // the throw is a should-never-fire guard.
 RootResult runRootExprFromString(nix::EvalState & state, const std::string & source,
                                  const std::string & basePath, const std::string & homePath,
-                                 nix::PosTable::Origin origin)
+                                 const nix::SourcePath * originPath)
 {
     registerBuiltinPrimOps();  // before lowering (lower-time findPrimOp)
     nix::v3::ast::ParserState st;
@@ -1559,19 +1559,26 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
     nix::v3::parser::parseString(st, source);
     if (!canLowerV3(st.result))
         throw nix::Error("v3: native lowering cannot handle this expression");
+    // Build the position origin: a file (Pos::Origin(*originPath)) when
+    // given, else an in-memory string.  Done here so run.hh's signature
+    // carries no `nix/...` position type.
+    auto origin = originPath
+        ? ffi::positions(state).addOrigin(nix::Pos::Origin(*originPath), source.size())
+        : ffi::positions(state).addOrigin(
+              nix::Pos::String{.source = nix::make_ref<std::string>(source)}, source.size());
     auto module = lowerV3Ast(ffi::symbols(state), st.result, &ffi::positions(state), origin,
                              &twBaseEnvGlobals(state));
     return runRootExprModule(state, std::move(module));
 }
 
-// Synthetic-source overload (no path literals): build a Pos::String
-// origin here so callers (the bytecode-primop installer) needn't touch
-// eval.hh / parser / position headers.
+// Synthetic-source overload (no path literals): builds a Pos::String
+// origin (originPath = null) + empty base/home so callers (the
+// bytecode-primop installer) needn't touch eval.hh / parser / position
+// headers.
 RootResult runRootExprFromString(nix::EvalState & state, const std::string & source)
 {
-    auto origin = ffi::positions(state).addOrigin(
-        nix::Pos::String{.source = nix::make_ref<std::string>(source)}, source.size());
-    return runRootExprFromString(state, source, /*basePath*/ "", /*homePath*/ "", origin);
+    return runRootExprFromString(state, source, /*basePath*/ "", /*homePath*/ "",
+                                 /*originPath*/ nullptr);
 }
 
 } // namespace nix::v3
