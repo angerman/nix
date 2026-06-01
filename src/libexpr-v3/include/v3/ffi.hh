@@ -63,6 +63,7 @@
 #include "nix/util/pos-idx.hh"
 #include "nix/util/experimental-features.hh"
 #include "nix/util/source-path.hh"
+#include "nix/util/hash.hh"        // Hash / HashAlgorithm — shared store/drv domain type
 #include "nix/store/path.hh"
 
 // Forward declarations for types where opaque-by-pointer is sufficient.

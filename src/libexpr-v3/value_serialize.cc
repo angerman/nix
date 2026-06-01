@@ -20,8 +20,7 @@
 #include "v3/cache_probe.hh"  // #828 / A3 / B1 per-call-site cache-hook
 #include "v3/ir.hh"
 #include "v3/value.hh"
-
-#include "nix/util/hash.hh"
+#include "v3/ffi.hh"  // nix::Hash / HashAlgorithm via the FFI surface (no direct TW include)
 
 #include <algorithm>
 #include <chrono>

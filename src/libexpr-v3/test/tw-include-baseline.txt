@@ -22,5 +22,4 @@ vm.cc
 v3_call_flake.cc
 run.cc
 cli/v3-eval.cc
-value_serialize.cc
 include/v3/run.hh
