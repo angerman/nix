@@ -41,6 +41,14 @@ struct ImportTimingTotals
     /// (deserializeCU, skips parse + lower + compile).
     uint64_t diskCacheHits = 0;
 
+    /// PARSER_PROJECT_PLAN §5.3 coverage proof: of the parse/lower-path
+    /// imports (calls), how many lowered NATIVELY (v3 AST → IR directly)
+    /// vs fell back to the AST→nix::Expr bridge (whole-program canLowerV3
+    /// rejected something).  Both are 0 unless NIX_V3_NATIVE_PARSER=1.
+    /// nativeLowered additionally needs NIX_V3_NATIVE_LOWER=1.
+    uint64_t nativeLowered = 0;
+    uint64_t nativeBridged = 0;
+
     /// Nanoseconds accumulated PER PHASE across all imports.
     uint64_t parseNs    = 0;  ///< parseExprFromFile / parseExprFromString
     uint64_t lowerNs    = 0;  ///< lowerNixExpr → ir::Module

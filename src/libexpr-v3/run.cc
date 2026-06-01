@@ -93,14 +93,18 @@ struct PhaseTimer {
         // (a handful of uint64_t accumulators bumped under the V3_TIMING
         // gate).
         const auto & it = importTimingTotals();
-        if (it.calls + it.resultCacheHits + it.contentCacheHits + it.diskCacheHits > 0) {
+        if (it.calls + it.resultCacheHits + it.contentCacheHits + it.diskCacheHits
+                + it.nativeLowered + it.nativeBridged > 0) {
             std::fprintf(stderr,
                 "v3-direct import timing (ms): calls=%llu (compile %.3f, miss path) | "
+                "nativeLower=%llu bridged=%llu | "
                 "cacheHits result=%llu content=%llu disk=%llu | "
                 "parse=%.3f lower=%.3f optimise=%.3f compile=%.3f "
                 "run=%.3f keyCompute=%.3f diskLookup=%.3f deserialize=%.3f diskInsert=%.3f\n",
                 (unsigned long long)it.calls,
                 (it.parseNs + it.lowerNs + it.optimiseNs + it.compileNs) / 1e6,
+                (unsigned long long)it.nativeLowered,
+                (unsigned long long)it.nativeBridged,
                 (unsigned long long)it.resultCacheHits,
                 (unsigned long long)it.contentCacheHits,
                 (unsigned long long)it.diskCacheHits,

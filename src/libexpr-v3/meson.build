@@ -208,7 +208,12 @@ this_library = library(
   lib_sources,
   generated_headers,  # #698: call-flake.nix.gen.hh
   dependencies : deps_public + deps_private + deps_other,
-  include_directories : [ include_dirs, include_directories('parser') ],
+  # 'parser' → parse-API + ParserState; 'cli' → the native lowerer
+  # (lower_v3.hh) + the AST→nix::Expr bridge (v3-to-nixexpr.hh), which the
+  # native import path in primops.cc consumes.  (These header-only pieces
+  # relocate into include/v3/ when the bridge + lower.cc nix::Expr path are
+  # deleted at the end of Stage 2.)
+  include_directories : [ include_dirs, include_directories('parser', 'cli') ],
   # link_whole (not link_with): pull the ENTIRE parser static lib into the
   # dylib so parseString + the flex/bison glue are exported even before
   # the in-library import-path call sites reference them (otherwise the
