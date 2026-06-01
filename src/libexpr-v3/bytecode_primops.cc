@@ -202,6 +202,23 @@ void installBytecodePrimop(
     installedPrimops().push_back(std::move(holder));
     auto & installed = *installedPtr;
 
+    // FFI_KILL_TODO (2026-06-01): skip the v3→TW bridge construction
+    // when path 1 (TW builtins mutation) is disabled.  Per the
+    // comments below, path 1 has been default-off since #697; the
+    // bridged Value was being created but never used, leaving 14+
+    // bridge entries in v3BridgeClosures for the process lifetime.
+    //
+    // Now: only call v3ToTreeWalkerPublic when
+    // NIX_V3_KEEP_TW_BUILTINS_MUTATION=1 is set (path 1 enabled).
+    // Eliminates 14 install-time bridge entries in the default
+    // config — a STRUCTURAL FFI surface reduction that applies to
+    // every v3-direct eval regardless of workload.
+    //
+    // What this kills: "install-time bridges are unconditionally
+    // required for bytecode primop registration" — KILLED.  Only
+    // path 1 needed the bridge; paths 2+3 use the v3 Closure
+    // directly via primopReplacementMap + vBuiltins patching.
+    //
     // Bridge the (PATCHED) v3 Closure to a TW Value
     // (`mkPrimOpApp(__v3_call_bridge_1, handle)`) so that:
     //   - TW dispatch (`callFunction` from primops or top-level CLI)
@@ -221,11 +238,16 @@ void installBytecodePrimop(
     // install vs at re-eval time.  Reverted; see
     // WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md for the proper
     // bridge-creation-site-specific Expr capture work that remains.
-    nix::Value * bridged = v3ToTreeWalkerPublic(state, installed.rr.value);
-    if (!bridged) {
-        throw std::runtime_error(
-            "installBytecodePrimop: v3ToTreeWalkerPublic returned null "
-            "for '" + primopName + "'");
+    static const bool s_needBridge =
+        std::getenv("NIX_V3_KEEP_TW_BUILTINS_MUTATION") != nullptr;
+    nix::Value * bridged = nullptr;
+    if (s_needBridge) {
+        bridged = v3ToTreeWalkerPublic(state, installed.rr.value);
+        if (!bridged) {
+            throw std::runtime_error(
+                "installBytecodePrimop: v3ToTreeWalkerPublic returned null "
+                "for '" + primopName + "'");
+        }
     }
 
     // Install path 1: mutate the Value in TW's builtins attrset so
@@ -259,25 +281,21 @@ void installBytecodePrimop(
     //   - TW alone:                    6.77s
     //   - v3-direct (default, post-#697): ~7.16s
     //   - v3-direct (default, pre-#697):  >110s (16× slowdown)
-    {
-        static const bool s_keepTWMut =
-            std::getenv("NIX_V3_KEEP_TW_BUILTINS_MUTATION") != nullptr;
-        if (s_keepTWMut) {
-            // 2026-05-18 history: try/catch — some primops are
-            // registered only in v3 (e.g. __foldlMap from IR Phase C).
-            // getBuiltin throws on missing names.  Falling through to
-            // path 2 + path 3 still installs the v3-side replacement,
-            // which is all v3-direct needs.
-            try {
-                nix::Value & target = state.getBuiltin(primopName);
-                target = *bridged;
-            } catch (const std::exception & e) {
-                if (dbgEnabled())
-                    std::fprintf(stderr,
-                        "v3 bytecode-primop install: '%s' not in TW builtins "
-                        "(%s) — skipping path 1, continuing with v3-side install\n",
-                        primopName.c_str(), e.what());
-            }
+    if (s_needBridge && bridged) {
+        // 2026-05-18 history: try/catch — some primops are
+        // registered only in v3 (e.g. __foldlMap from IR Phase C).
+        // getBuiltin throws on missing names.  Falling through to
+        // path 2 + path 3 still installs the v3-side replacement,
+        // which is all v3-direct needs.
+        try {
+            nix::Value & target = state.getBuiltin(primopName);
+            target = *bridged;
+        } catch (const std::exception & e) {
+            if (dbgEnabled())
+                std::fprintf(stderr,
+                    "v3 bytecode-primop install: '%s' not in TW builtins "
+                    "(%s) — skipping path 1, continuing with v3-side install\n",
+                    primopName.c_str(), e.what());
         }
     }
     (void)bridged;  // unused when path 1 is skipped (default post-#697)
