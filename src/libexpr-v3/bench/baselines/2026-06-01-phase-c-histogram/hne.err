@@ -1,0 +1,6 @@
+Failed to increase stack size from 8372224 to 62914560 (desired: 62914560, maximum allowed: 67092480): Invalid argument
+warning: v3 limits: setrlimit(RLIMIT_AS, 4563402752) failed (Invalid argument); relying on SIGALRM watchdog
+warning: input 'crane' has an override for a non-existent input 'nixpkgs'
+warning: input 'rust-overlay' has an override for a non-existent input 'flake-utils'
+warning: Nix search path entry '/nix/var/nix/profiles/per-user/root/channels' does not exist, ignoring
+shutting down[K

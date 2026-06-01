@@ -6452,11 +6452,31 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
             + "` and V3_DRV_NO_BRIDGE=1; check V3_DRV_DEBUG output for "
               "the underlying error");
     }
-    // If a tree-walker EvalState is wired, delegate to its real
-    // `builtins.derivationStrict` so we get content-addressed
-    // /nix/store paths.  Falls back to the v3 fake-store path on any
-    // bridge failure (e.g. converting a closure value).
-    if (state.nixEvalState && args[0].isAttrs() && args[0].payload.bindings) {
+    // FFI_KILL_PLAN Phase C6 (2026-06-01): TW-bridge fallback retired
+    // by default.  Per Phase C0 measurement across 5 workloads
+    // (hello/firefox/python3/HNE/M5): 2414 derivationStrict native
+    // calls, 0 fallbacks.  The native path handles every shape
+    // these workloads produce; the TW bridge was dead code.
+    //
+    // Bridge retention impact: this was the largest bridge entry
+    // class per FFI_BRIDGE_INVENTORY_2026-05-31 §3.1 — its retirement
+    // removes the bridge-table source for derivation inputs.
+    //
+    // Soak escape hatch: V3_DRV_KEEP_BRIDGE=1 opts back into the
+    // bridge fallback (un-retires this code path) for one session,
+    // per plan §4.7.  If any unmeasured workload trips a native
+    // throw, set the gate and bridge fallback re-activates.
+    //
+    // Retirement criterion (per Rule 0): "delete `V3_DRV_KEEP_BRIDGE`
+    // + this entire block when a second session reports `native=N
+    // fallback=0` across the same workload matrix + at least one
+    // additional cross-architecture build".
+    static const bool s_keepBridge =
+        std::getenv("V3_DRV_KEEP_BRIDGE") != nullptr;
+    if (__builtin_expect(s_keepBridge, 0)
+        && state.nixEvalState
+        && args[0].isAttrs() && args[0].payload.bindings)
+    {
         try {
             auto & ns = *state.nixEvalState;
             ++allocStats().v3ToTwBySite[6];  // #795 derivationStrict TW fallback
