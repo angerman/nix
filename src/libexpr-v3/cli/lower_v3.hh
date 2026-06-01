@@ -43,19 +43,18 @@ namespace nix::v3 {
 
 inline bool canLowerV3(const nix::v3::ast::Node * n);
 
-/// Attrset / let bindings are lowerable iff all are plain (no inherit /
-/// inherit-from — Phase 4), no dynamic keys (Phase 4), and every value
-/// lowers.  Shared by the Let + Attrs gates.
+/// Attrset / let bindings are lowerable iff every value lowers.
+/// Shared by the Let + Attrs gates.  Plain + Inherited + InheritedFrom
+/// (4a/4b) + dynamic keys (4c).
 inline bool canLowerAttrDefs(const nix::v3::ast::Attrs * at)
 {
     namespace a = nix::v3::ast;
-    // Phase 4a/4b: Plain + Inherited + InheritedFrom.  Dynamic keys are
-    // Phase 4c → bridge those.
-    if (!at->dynamicAttrs.empty()) return false;
     for (auto * e : at->inheritFromExprs)
         if (!canLowerV3(e)) return false;
     for (auto & d : at->attrs)
         if (d.kind == a::Attrs::AttrKind::Plain && !canLowerV3(d.value)) return false;
+    for (auto & da : at->dynamicAttrs)            // 4c: `${e} = v;`
+        if (!canLowerV3(da.nameExpr) || !canLowerV3(da.valueExpr)) return false;
     return true;
 }
 
@@ -686,11 +685,34 @@ struct LowererV3 {
         }
         m.blocks[blockStack.back()].bindings.push_back({recVar, std::move(lr)});
 
-        if (!hasBody) return addBinding(ir::VarRef{recVar});
-        scopes.push_back(recScope);
-        ir::VarId rv = lowerExpr(body);
-        scopes.pop_back();
-        return addBinding(ir::VarRef{rv});
+        if (hasBody) {  // `let … in body` — `let` never carries dynamics
+            scopes.push_back(recScope);
+            ir::VarId rv = lowerExpr(body);
+            scopes.pop_back();
+            return addBinding(ir::VarRef{rv});
+        }
+
+        // `rec { … }` — the value is the rec attrset itself.
+        ir::VarId recValV = addBinding(ir::VarRef{recVar});
+
+        // rec + dynamic keys (`rec { ${e} = v; ... }`): lower the dynamics
+        // in the rec scope (they may reference siblings) into an AttrSetDyn
+        // carrying ONLY the dynamics (statics already live in the rec
+        // attrset), then merge via Update (dyn overrides rec).  Mirrors
+        // lower.cc's rec+dyn branch.
+        if (!at->dynamicAttrs.empty()) {
+            scopes.push_back(recScope);
+            ir::AttrSetDyn dyn;
+            dyn.dynamics.reserve(at->dynamicAttrs.size());
+            for (auto & da : at->dynamicAttrs) {
+                ir::VarId nameV = forceVal(lowerExpr(da.nameExpr));
+                ir::VarId valV  = thunkifyForAttr(da.valueExpr);
+                dyn.dynamics.push_back({nameV, valV, /*pos*/ 0});
+            }
+            scopes.pop_back();
+            recValV = addBinding(ir::Update{recValV, addBinding(std::move(dyn))});
+        }
+        return recValV;
     }
 
     ir::VarId lowerLet(const nix::v3::ast::Let * let)
@@ -698,9 +720,32 @@ struct LowererV3 {
         return lowerLetRec(let->attrs, /*hasBody=*/true, let->body);
     }
 
-    /// Phase 3a: attrset.  rec → lowerLetRec (returns the rec attrset);
-    /// non-rec → ir::AttrSet with thunkified (lazy) values.  Plain
-    /// bindings only (inherit / inherit-from / dynamic → Phase 4).
+    /// Lower one static (non-dynamic) attr def's VALUE (shared by AttrSet
+    /// + AttrSetDyn statics): Plain → lazy thunk; `inherit x` → parent x
+    /// (with-aware lazy; see the delayed-with note); `inherit (e) x` →
+    /// `e.x` over the shared source thunk `srcVars[fromIdx]`.
+    ir::VarId lowerStaticAttrValue(const nix::v3::ast::Attrs::AttrDef & d,
+                                   const std::vector<ir::VarId> & srcVars)
+    {
+        namespace a = nix::v3::ast;
+        if (d.kind == a::Attrs::AttrKind::Inherited)
+            return resolvesViaWith(d.name)
+                ? thunkifyIR([&] { return lowerVarByName(d.name); })
+                : lowerVarByName(d.name);
+        if (d.kind == a::Attrs::AttrKind::InheritedFrom) {
+            ir::SymbolId sym = m.internSymbol(d.name);
+            ir::VarId src = srcVars[d.fromIdx];
+            return thunkifyIR([&] {
+                return addBinding(ir::AttrSelect{addBinding(ir::VarRef{src}), sym});
+            });
+        }
+        return thunkifyForAttr(d.value);  // Plain
+    }
+
+    /// Phase 3a/4c: attrset.  rec → lowerLetRec (handles rec + dynamics);
+    /// non-rec → ir::AttrSet (static keys) or ir::AttrSetDyn (`${e}` keys).
+    /// Values are lazy (thunkified); dynamic NAMES are forced (must be a
+    /// string; `null` drops the entry — the VM's AttrSetDyn op handles it).
     ir::VarId lowerAttrs(const nix::v3::ast::Attrs * e)
     {
         namespace a = nix::v3::ast;
@@ -712,30 +757,31 @@ struct LowererV3 {
         std::vector<ir::VarId> srcVars(e->inheritFromExprs.size(), ir::kInvalid);
         for (size_t i = 0; i < e->inheritFromExprs.size(); ++i)
             srcVars[i] = thunkify(e->inheritFromExprs[i]);
+
+        if (!e->dynamicAttrs.empty()) {
+            // 4c: at least one `${expr} = v;` — emit an AttrSetDyn carrying
+            // the statics + the dynamics (mirrors lower.cc's non-rec dyn).
+            ir::AttrSetDyn dyn;
+            dyn.statics.reserve(e->attrs.size());
+            for (auto & d : e->attrs)
+                dyn.statics.push_back({m.internSymbol(d.name),
+                                       lowerStaticAttrValue(d, srcVars), posHandle(d.pos)});
+            dyn.dynamics.reserve(e->dynamicAttrs.size());
+            for (auto & da : e->dynamicAttrs) {
+                ir::VarId nameV = forceVal(lowerExpr(da.nameExpr));  // string (or null → drop)
+                ir::VarId valV  = thunkifyForAttr(da.valueExpr);     // lazy
+                dyn.dynamics.push_back({nameV, valV, /*pos*/ 0});
+            }
+            return addBinding(std::move(dyn));
+        }
+
         ir::AttrSet as;
         as.entries.reserve(e->attrs.size());
         for (auto & d : e->attrs) {
             ir::AttrSet::Entry en;
             en.name = m.internSymbol(d.name);
             en.pos = posHandle(d.pos);
-            if (d.kind == a::Attrs::AttrKind::Inherited) {
-                // `inherit x;` → parent-scope x.  Lazy iff x resolves via
-                // `with` (eager OP_WITH_LOOKUP at construction blackholes
-                // delayed-with cycles); else a direct ref.  Mirrors
-                // lower.cc routing `inherit x` through thunkifyForAttr(Var).
-                en.value = resolvesViaWith(d.name)
-                    ? thunkifyIR([&] { return lowerVarByName(d.name); })
-                    : lowerVarByName(d.name);
-            } else if (d.kind == a::Attrs::AttrKind::InheritedFrom) {
-                // `inherit (e) x;` → x = e.x, sharing the source thunk.
-                ir::SymbolId sym = m.internSymbol(d.name);
-                ir::VarId src = srcVars[d.fromIdx];
-                en.value = thunkifyIR([&] {
-                    return addBinding(ir::AttrSelect{addBinding(ir::VarRef{src}), sym});
-                });
-            } else {
-                en.value = thunkifyForAttr(d.value);
-            }
+            en.value = lowerStaticAttrValue(d, srcVars);
             as.entries.push_back(std::move(en));
         }
         return addBinding(std::move(as));
