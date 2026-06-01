@@ -47,12 +47,25 @@
 
 `src/libexpr-v3/meson.build` adds `custom_target` rules mirroring `src/libexpr/meson.build` for the bison + flex outputs.  Both Bison and Flex tools come from the existing flake.nix devShell.
 
-## Stage 1.1 status — v3 AST (operator core landed)
+## Stage 1.1 status — v3 AST COMPLETE (show())
 
-`include/v3/ast/expr.hh` holds the v3-owned AST.  First cut (commit
-landing this) implements the OPERATOR CORE + literals + lambda /
-call / select / hasattr, validated by `test/ast-show-test.cc`
-(16/16 show() checks byte-equal to the precedence-battery goldens).
+`include/v3/ast/expr.hh` holds the v3-owned AST.  ALL 27 `nix::Expr`
+Kinds are implemented except the two non-parsed ones (InheritFrom —
+a TW-internal pseudo-var that never appears in show() output;
+BlackHole — a runtime sentinel).  ConcatLists folds into BinOp("++").
+
+Validated by `test/ast-show-test.cc` (**32/32** show() checks
+byte-equal to TW), wired as the `v3-ast-show-test` meson test.
+Coverage: Int, Float, String (+ printLiteralString port), Path, Var,
+Call, Select (static + dynamic `${}` keys), OpHasAttr, Lambda (simple
++ formals lexicographic), List, Attrs (plain/rec/inherit/inheritFrom/
+dynamic/empty + showBindings), Let, With, If, Assert, OpNot,
+ConcatStrings, Pos, and all 7 BinOps (==,!=,&&,||,->,//,++).
+
+The remaining Stage 1.1 → Stage 1.4 work is now: 1.2 ParserState
+(symbol interning — names are inline std::string today), 1.3 build
+wiring (bison/flex → libnixexprv3), 1.4 action rewrite (target THIS
+AST instead of nix::Expr).
 
 ### The `show()` contract (from `nixexpr.cc:26-262` + MakeBinOp)
 
@@ -98,14 +111,11 @@ Every node's `show()` must reproduce TW byte-for-byte.  Reference:
 These come from `parser.y` actions (lines 298-313).  The v3 parser
 actions (Stage 1.4) must emit the SAME desugarings.
 
-### Stage 1.1 remaining (follow-ups before action rewrite)
+### Stage 1.1 remaining — DONE (all node kinds landed)
 
-Node kinds still to add to `expr.hh` + `ast-show-test.cc`:
-Float, String (+ printLiteralString), Path, InheritFrom, Attrs
-(+ showBindings — the most complex: sorted, inherit groups, dynamic
-attrs), List, Let, With, If, Assert, Pos, OpConcatLists already
-covered by BinOp.  Plus the symbol-table interning decision
-(Stage 1.2 ParserState) — currently names are inline std::string.
+All show()-producing node kinds are implemented + tested (32/32).
+Remaining project work is Stage 1.2 (ParserState symbol interning) →
+1.3 (build wiring) → 1.4 (action rewrite).
 
 ## How to inspect upstream actions
 

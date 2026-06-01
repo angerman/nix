@@ -15,23 +15,21 @@
 ///   * `show()` reproduces `nix::Expr::show()` BYTE-FOR-BYTE
 ///     (nixexpr.cc:26-262 + the MakeBinOp macro nixexpr.hh:804).
 ///     This is the validation contract checked by the parser-TI
-///     precedence battery (test/parser-ti/fixtures/precedence).
+///     batteries (test/parser-ti/fixtures) + ast-show-test.cc.
 ///   * Positions are FILE-LOCAL `uint32_t` offsets (the determinism
 ///     win — NATIVE_PARSER_FEASIBILITY §4.1), NOT TW PosIdx.
 ///   * Identifier names are stored inline as `std::string` for this
 ///     first cut; Stage 1.2 (ParserState) interns them into v3's
 ///     globalSymbolTable.  show() prints the inline string.
 ///
-/// THIS FIRST CUT covers the OPERATOR CORE + literals + lambda/call/
-/// select/hasattr exercised by the precedence battery.  Remaining
-/// kinds (Float/String/Path/Attrs/List/Let/With/If/Assert/Inherit/
-/// Pos/ConcatLists) are queued for Stage 1.1 follow-ups; their
-/// show() formats are documented in parser/README.md.
+/// Coverage: ALL 27 nix::Expr Kinds except InheritFrom (a TW-internal
+/// pseudo-var that never appears in show() output — the inherit-from
+/// SOURCE expr is stored directly in Attrs::inheritFromExprs) and
+/// BlackHole (a runtime sentinel, never parsed).  ConcatLists is
+/// folded into BinOp("++").
 ///
-/// Header-only + inline show() so the Stage 1.1 unit test
-/// (test/ast-show-test.cc) compiles standalone — no libnixexprv3
-/// link, no symbol-table dependency.  This keeps the architectural
-/// core unit-testable in isolation per the falsification rule.
+/// Header-only + inline show() so the Stage 1.1 unit test compiles
+/// standalone — no libnixexprv3 link, no symbol-table dependency.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 ///   Input Output Group.
@@ -40,6 +38,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <ostream>
 #include <sstream>
@@ -48,44 +47,18 @@
 
 namespace nix::v3::ast {
 
-/// Mirrors `nix::Expr::Kind` (nixexpr.hh:109-138).  Stage 1.1 first
-/// cut implements the subset marked (✓); the rest are declared so the
-/// enum is stable across follow-ups.
+/// Mirrors `nix::Expr::Kind` (nixexpr.hh:109-138).
 enum class Kind : uint8_t {
     Unknown = 0,
-    Int,            // ✓
-    Float,          // (queued)
-    String,         // (queued)
-    Path,           // (queued)
-    Var,            // ✓
-    InheritFrom,    // (queued)
-    Select,         // ✓
-    OpHasAttr,      // ✓
-    Attrs,          // (queued)
-    List,           // (queued)
-    Lambda,         // ✓
-    Call,           // ✓
-    Let,            // (queued)
-    With,           // (queued)
-    If,             // (queued)
-    Assert,         // (queued)
-    OpNot,          // ✓
-    OpUpdate,       // ✓ (binary)
-    ConcatStrings,  // ✓
-    Pos,            // (queued)
-    BlackHole,      // (queued)
-    OpEq,           // ✓ (binary)
-    OpNEq,          // ✓ (binary)
-    OpAnd,          // ✓ (binary)
-    OpOr,           // ✓ (binary)
-    OpImpl,         // ✓ (binary)
-    OpConcatLists,  // ✓ (binary)
+    Int, Float, String, Path,
+    Var, InheritFrom, Select, OpHasAttr,
+    Attrs, List, Lambda, Call, Let, With, If, Assert,
+    OpNot, OpUpdate, ConcatStrings, Pos, BlackHole,
+    OpEq, OpNEq, OpAnd, OpOr, OpImpl, OpConcatLists,
 };
 
-/// File-local source position.  0 = unknown.  This is the
-/// content-addressable replacement for TW PosIdx — a byte offset
-/// (or line/col) relative to the file start, stable across import
-/// orderings (NATIVE_PARSER_FEASIBILITY §4.1).
+/// File-local source position.  0 = unknown.  Content-addressable
+/// replacement for TW PosIdx (NATIVE_PARSER_FEASIBILITY §4.1).
 using Pos = uint32_t;
 constexpr Pos noPos = 0;
 
@@ -98,12 +71,71 @@ struct Node {
     virtual void show(std::ostream & str) const = 0;
 };
 
+/// Port of `printLiteralString` (print.cc:32-63): quote + escape a
+/// string value exactly as TW does for `--parse` output.
+inline void printLiteralString(std::ostream & str, std::string_view s) {
+    str << '"';
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '"' || c == '\\') str << '\\' << c;
+        else if (c == '\n')        str << "\\n";
+        else if (c == '\r')        str << "\\r";
+        else if (c == '\t')        str << "\\t";
+        else if (c == '$' && i + 1 < s.size() && s[i + 1] == '{') str << "\\$";
+        else                       str << c;
+    }
+    str << '"';
+}
+
+/// One component of a select / has-attr path.  Static symbol XOR a
+/// dynamic `${expr}` key (mirrors nix::AttrName).
+struct AttrName {
+    std::string symbol;   // non-empty => static key
+    Node * expr = nullptr; // non-null => dynamic ${expr} key
+    AttrName(std::string s) : symbol(std::move(s)) {}
+    AttrName(Node * e) : expr(e) {}
+};
+
+/// Port of `showAttrSelectionPath` (nixexpr.cc:264): dotted path with
+/// dynamic keys rendered as `"${e}"`.
+inline void showAttrPath(std::ostream & str, const std::vector<AttrName> & path) {
+    bool first = true;
+    for (auto & a : path) {
+        if (!first) str << '.';
+        first = false;
+        if (a.expr) { str << "\"${"; a.expr->show(str); str << "}\""; }
+        else        str << a.symbol;
+    }
+}
+
 // --- literals -------------------------------------------------------
 
 struct Int : Node {
     int64_t n;
     explicit Int(int64_t n, Pos p = noPos) : Node(Kind::Int, p), n(n) {}
     void show(std::ostream & str) const override { str << n; }
+};
+
+struct Float : Node {
+    double f;
+    explicit Float(double f, Pos p = noPos) : Node(Kind::Float, p), f(f) {}
+    // TW: `str << v.fpoint()` — default ostream double formatting
+    // (2.0 -> "2", 1e10 -> "1e+10", 1.5 -> "1.5").  C++ default matches.
+    void show(std::ostream & str) const override { str << f; }
+};
+
+struct String : Node {
+    std::string s;
+    explicit String(std::string s, Pos p = noPos)
+        : Node(Kind::String, p), s(std::move(s)) {}
+    void show(std::ostream & str) const override { printLiteralString(str, s); }
+};
+
+struct Path : Node {
+    std::string p;   // resolved path string view
+    explicit Path(std::string p, Pos pp = noPos)
+        : Node(Kind::Path, pp), p(std::move(p)) {}
+    void show(std::ostream & str) const override { str << p; }
 };
 
 // --- variable -------------------------------------------------------
@@ -115,8 +147,7 @@ struct Var : Node {
     void show(std::ostream & str) const override { str << name; }
 };
 
-// --- application (ExprCall) ----------------------------------------
-//   show: '(' fun ' ' arg1 ' ' arg2 ... ')'   (nixexpr.cc:190)
+// --- application (ExprCall) -- '(' fun ' ' arg... ')'  nixexpr.cc:190
 struct Call : Node {
     Node * fun;
     std::vector<Node *> args;
@@ -130,62 +161,65 @@ struct Call : Node {
     }
 };
 
-// --- select (a.b.c or default) -------------------------------------
-//   show: '(' e ').' path [ ' or (' def ')' ]   (nixexpr.cc:56)
-//   First-cut: static keys only (the precedence battery uses no
-//   dynamic ${} keys in select paths).
+// --- select (a.b.c or default) -- '(' e ').' path [' or (' def ')']
+//   nixexpr.cc:56
 struct Select : Node {
     Node * e;
-    std::vector<std::string> path;   // static attr names
-    Node * def = nullptr;            // `or` default, or null
-    Select(Node * e, std::vector<std::string> path, Node * def = nullptr,
+    std::vector<AttrName> path;
+    Node * def = nullptr;
+    Select(Node * e, std::vector<AttrName> path, Node * def = nullptr,
            Pos p = noPos)
         : Node(Kind::Select, p), e(e), path(std::move(path)), def(def) {}
+    // convenience: all-static path
+    Select(Node * e, std::vector<std::string> staticPath, Node * def = nullptr,
+           Pos p = noPos)
+        : Node(Kind::Select, p), e(e), def(def) {
+        for (auto & s : staticPath) path.emplace_back(s);
+    }
     void show(std::ostream & str) const override {
         str << "(";
         e->show(str);
         str << ").";
-        bool first = true;
-        for (auto & k : path) { if (!first) str << '.'; first = false; str << k; }
+        showAttrPath(str, path);
         if (def) { str << " or ("; def->show(str); str << ")"; }
     }
 };
 
-// --- has-attr (e ? path) -------------------------------------------
-//   show: '((' e ') ? ' path ')'   (nixexpr.cc:68)
+// --- has-attr -- '((' e ') ? ' path ')'  nixexpr.cc:68
 struct OpHasAttr : Node {
     Node * e;
-    std::vector<std::string> path;
-    OpHasAttr(Node * e, std::vector<std::string> path, Pos p = noPos)
+    std::vector<AttrName> path;
+    OpHasAttr(Node * e, std::vector<AttrName> path, Pos p = noPos)
         : Node(Kind::OpHasAttr, p), e(e), path(std::move(path)) {}
+    OpHasAttr(Node * e, std::vector<std::string> staticPath, Pos p = noPos)
+        : Node(Kind::OpHasAttr, p), e(e) {
+        for (auto & s : staticPath) path.emplace_back(s);
+    }
     void show(std::ostream & str) const override {
         str << "((";
         e->show(str);
         str << ") ? ";
-        bool first = true;
-        for (auto & k : path) { if (!first) str << '.'; first = false; str << k; }
+        showAttrPath(str, path);
         str << ")";
     }
 };
 
 // --- lambda --------------------------------------------------------
-//   simple:  '(' arg ': ' body ')'                       (nixexpr.cc:154)
+//   simple:  '(' arg ': ' body ')'                       nixexpr.cc:154
 //   formals: '({ a, b ? d, ... }' [' @ ' arg] ': ' body ')'
-//   Formals are printed in LEXICOGRAPHIC order (nixexpr.cc:163).
+//   Formals printed in LEXICOGRAPHIC order (nixexpr.cc:163).
 struct Formal {
     std::string name;
     Node * def = nullptr;   // `? default`, or null
 };
 struct Lambda : Node {
-    std::string arg;            // simple-arg name, or @-binding name; "" if none
+    std::string arg;            // simple-arg or @-binding name; "" if none
     bool hasFormals = false;
     std::vector<Formal> formals;
     bool ellipsis = false;
     Node * body;
-    // simple lambda: arg + body
     Lambda(std::string arg, Node * body, Pos p = noPos)
         : Node(Kind::Lambda, p), arg(std::move(arg)), body(body) {}
-    // formals lambda
     Lambda(std::vector<Formal> formals, bool ellipsis, std::string atArg,
            Node * body, Pos p = noPos)
         : Node(Kind::Lambda, p), arg(std::move(atArg)), hasFormals(true),
@@ -194,7 +228,6 @@ struct Lambda : Node {
         str << "(";
         if (hasFormals) {
             str << "{ ";
-            // lexicographic order by name (nixexpr.cc:163).
             std::vector<const Formal *> sorted;
             for (auto & f : formals) sorted.push_back(&f);
             std::sort(sorted.begin(), sorted.end(),
@@ -216,8 +249,159 @@ struct Lambda : Node {
     }
 };
 
-// --- prefix ! (ExprOpNot) ------------------------------------------
-//   show: '(! ' e ')'   (nixexpr.cc:238)
+// --- list -- '[ ' '(' e ') ' ... ']'   nixexpr.cc:143
+struct List : Node {
+    std::vector<Node *> elems;
+    explicit List(std::vector<Node *> elems, Pos p = noPos)
+        : Node(Kind::List, p), elems(std::move(elems)) {}
+    void show(std::ostream & str) const override {
+        str << "[ ";
+        for (auto * e : elems) { str << "("; e->show(str); str << ") "; }
+        str << "]";
+    }
+};
+
+// --- attribute set (+ showBindings) -- nixexpr.cc:75-141
+//   '[rec ]{ ' <inherit group> <inheritFrom groups> <plain> <dynamic> '}'
+struct Attrs : Node {
+    enum class AttrKind { Plain, Inherited, InheritedFrom };
+    struct AttrDef {
+        AttrKind kind;
+        std::string name;
+        Node * value = nullptr;   // Plain only
+        int fromIdx = -1;         // InheritedFrom: index into inheritFromExprs
+        AttrDef(std::string n, Node * v)
+            : kind(AttrKind::Plain), name(std::move(n)), value(v) {}
+        AttrDef(std::string n)
+            : kind(AttrKind::Inherited), name(std::move(n)) {}
+        AttrDef(std::string n, int idx)
+            : kind(AttrKind::InheritedFrom), name(std::move(n)), fromIdx(idx) {}
+    };
+    struct DynamicAttrDef { Node * nameExpr; Node * valueExpr; };
+
+    bool recursive = false;
+    std::vector<AttrDef> attrs;
+    std::vector<Node *> inheritFromExprs;
+    std::vector<DynamicAttrDef> dynamicAttrs;
+
+    Attrs(bool recursive = false, Pos p = noPos)
+        : Node(Kind::Attrs, p), recursive(recursive) {}
+
+    void showBindings(std::ostream & str) const {
+        // Sort attrs by name (nixexpr.cc:81) — proxy for parse order.
+        std::vector<const AttrDef *> sorted;
+        for (auto & a : attrs) sorted.push_back(&a);
+        std::sort(sorted.begin(), sorted.end(),
+            [](const AttrDef * a, const AttrDef * b) { return a->name < b->name; });
+
+        // 1. plain `inherit a b;`
+        std::vector<std::string> inherits;
+        // 2. `inherit (e) x y;` grouped by source index (map => idx order)
+        std::map<int, std::vector<std::string>> inheritsFrom;
+        for (auto * a : sorted) {
+            switch (a->kind) {
+            case AttrKind::Plain: break;
+            case AttrKind::Inherited: inherits.push_back(a->name); break;
+            case AttrKind::InheritedFrom: inheritsFrom[a->fromIdx].push_back(a->name); break;
+            }
+        }
+        if (!inherits.empty()) {
+            str << "inherit";
+            for (auto & s : inherits) str << " " << s;
+            str << "; ";
+        }
+        for (auto & [idx, syms] : inheritsFrom) {
+            str << "inherit (";
+            inheritFromExprs[idx]->show(str);
+            str << ")";
+            for (auto & s : syms) str << " " << s;
+            str << "; ";
+        }
+        // 3. plain `k = v;` (sorted)
+        for (auto * a : sorted) {
+            if (a->kind == AttrKind::Plain) {
+                str << a->name << " = ";
+                a->value->show(str);
+                str << "; ";
+            }
+        }
+        // 4. dynamic `"${e}" = v;`
+        for (auto & d : dynamicAttrs) {
+            str << "\"${";
+            d.nameExpr->show(str);
+            str << "}\" = ";
+            d.valueExpr->show(str);
+            str << "; ";
+        }
+    }
+    void show(std::ostream & str) const override {
+        if (recursive) str << "rec ";
+        str << "{ ";
+        showBindings(str);
+        str << "}";
+    }
+};
+
+// --- let -- '(let ' <bindings> 'in ' body ')'   nixexpr.cc:201
+struct Let : Node {
+    Attrs * attrs;
+    Node * body;
+    Let(Attrs * attrs, Node * body, Pos p = noPos)
+        : Node(Kind::Let, p), attrs(attrs), body(body) {}
+    void show(std::ostream & str) const override {
+        str << "(let ";
+        attrs->showBindings(str);
+        str << "in ";
+        body->show(str);
+        str << ")";
+    }
+};
+
+// --- with -- '(with ' attrs '; ' body ')'   nixexpr.cc:210
+struct With : Node {
+    Node * attrs;
+    Node * body;
+    With(Node * attrs, Node * body, Pos p = noPos)
+        : Node(Kind::With, p), attrs(attrs), body(body) {}
+    void show(std::ostream & str) const override {
+        str << "(with ";
+        attrs->show(str);
+        str << "; ";
+        body->show(str);
+        str << ")";
+    }
+};
+
+// --- if -- '(if ' c ' then ' t ' else ' e ')'   nixexpr.cc:219
+struct If : Node {
+    Node * cond; Node * then_; Node * else_;
+    If(Node * cond, Node * then_, Node * else_, Pos p = noPos)
+        : Node(Kind::If, p), cond(cond), then_(then_), else_(else_) {}
+    void show(std::ostream & str) const override {
+        str << "(if ";
+        cond->show(str);
+        str << " then ";
+        then_->show(str);
+        str << " else ";
+        else_->show(str);
+        str << ")";
+    }
+};
+
+// --- assert -- 'assert ' c '; ' body   (NO outer parens)  nixexpr.cc:230
+struct Assert : Node {
+    Node * cond; Node * body;
+    Assert(Node * cond, Node * body, Pos p = noPos)
+        : Node(Kind::Assert, p), cond(cond), body(body) {}
+    void show(std::ostream & str) const override {
+        str << "assert ";
+        cond->show(str);
+        str << "; ";
+        body->show(str);
+    }
+};
+
+// --- prefix ! -- '(! ' e ')'   nixexpr.cc:238
 struct OpNot : Node {
     Node * e;
     explicit OpNot(Node * e, Pos p = noPos) : Node(Kind::OpNot, p), e(e) {}
@@ -226,8 +410,13 @@ struct OpNot : Node {
     }
 };
 
-// --- ConcatStrings (the `+` operator + string interpolation) -------
-//   show: '(' e1 ' + ' e2 ' + ' ... ')'   (nixexpr.cc:245)
+// --- __curPos -- 'curPos'   nixexpr.cc:259
+struct PosExpr : Node {
+    explicit PosExpr(Pos p = noPos) : Node(Kind::Pos, p) {}
+    void show(std::ostream & str) const override { str << "__curPos"; }
+};
+
+// --- ConcatStrings (`+`) -- '(' e1 ' + ' e2 ' + ' ... ')'  nixexpr.cc:245
 struct ConcatStrings : Node {
     std::vector<Node *> es;
     explicit ConcatStrings(std::vector<Node *> es, Pos p = noPos)
@@ -241,12 +430,10 @@ struct ConcatStrings : Node {
 };
 
 // --- binary operators (MakeBinOp, nixexpr.hh:804) ------------------
-//   show: '(' e1 ' ' OP ' ' e2 ')'
-//   Covers ==, !=, &&, ||, ->, //, ++.
+//   '(' e1 ' ' OP ' ' e2 ')'  for ==, !=, &&, ||, ->, //, ++
 struct BinOp : Node {
-    const char * op;   // "==", "!=", "&&", "||", "->", "//", "++"
-    Node * lhs;
-    Node * rhs;
+    const char * op;
+    Node * lhs; Node * rhs;
     BinOp(Kind k, const char * op, Node * lhs, Node * rhs, Pos p = noPos)
         : Node(k, p), op(op), lhs(lhs), rhs(rhs) {}
     void show(std::ostream & str) const override {
@@ -260,8 +447,7 @@ struct BinOp : Node {
 
 /// Owns all AST nodes for one parse; freed wholesale (the v3-owned
 /// arena that replaces TW's mem.exprs).  `std::deque` gives stable
-/// node addresses without per-node heap churn beyond the deque's
-/// block allocation.  Stage 1.4 wires the parser actions to `add<>`.
+/// node addresses.  Stage 1.4 wires the parser actions to `add<>`.
 struct Pool {
     std::deque<std::unique_ptr<Node>> nodes;
     template <typename T, typename... Args>
@@ -273,9 +459,8 @@ struct Pool {
     }
 };
 
-/// Render a node to a string, matching `nix-instantiate --parse`
-/// (which prints `e->show()` + trailing newline — the newline is the
-/// caller's responsibility, as in v3-eval --parse).
+/// Render a node to a string (the `e->show()` half of
+/// `nix-instantiate --parse`; caller adds the trailing newline).
 inline std::string showToString(const Node * n) {
     std::ostringstream oss;
     n->show(oss);

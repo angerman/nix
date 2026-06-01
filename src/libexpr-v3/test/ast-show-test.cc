@@ -185,6 +185,98 @@ int main()
             })),
         "(a: (__sub 0 (a).b))");
 
+    // ---- Stage 1.1 batch 2: remaining node kinds ----
+
+    // float-1.5:  1.5  ->  1.5
+    check("float-1.5", m.add<Float>(1.5), "1.5");
+    // float-2.0:  2.0  ->  2   (default double formatting)
+    check("float-2.0", m.add<Float>(2.0), "2");
+
+    // string-simple:  "hello"  ->  "hello"
+    check("string-simple", m.add<String>(std::string("hello")), "\"hello\"");
+    // string-escape:  value a"b\c  ->  "a\"b\\c"
+    check("string-escape", m.add<String>(std::string("a\"b\\c")),
+        "\"a\\\"b\\\\c\"");
+
+    // list:  a: b: [ a b 1 ]  ->  (a: (b: [ (a) (b) (1) ]))
+    check("list",
+        L("a", L("b",
+            m.add<List>(std::vector<Node *>{V("a"), V("b"), m.add<Int>(1)}))),
+        "(a: (b: [ (a) (b) (1) ]))");
+
+    // if:  a: b: c: if a then b else c  ->  (a: (b: (c: (if a then b else c))))
+    check("if",
+        L("a", L("b", L("c",
+            m.add<If>(V("a"), V("b"), V("c"))))),
+        "(a: (b: (c: (if a then b else c))))");
+
+    // with:  a: b: with a; b  ->  (a: (b: (with a; b)))
+    check("with",
+        L("a", L("b", m.add<With>(V("a"), V("b")))),
+        "(a: (b: (with a; b)))");
+
+    // assert:  a: b: assert a; b  ->  (a: (b: assert a; b))   [no inner parens]
+    check("assert",
+        L("a", L("b", m.add<Assert>(V("a"), V("b")))),
+        "(a: (b: assert a; b))");
+
+    // let:  let x = 1; y = 2; in x  ->  (let x = 1; y = 2; in x)
+    {
+        auto * at = m.add<Attrs>(false);
+        at->attrs.emplace_back(std::string("x"), m.add<Int>(1));
+        at->attrs.emplace_back(std::string("y"), m.add<Int>(2));
+        check("let", m.add<Let>(at, V("x")), "(let x = 1; y = 2; in x)");
+    }
+
+    // attrs-plain (sorted):  { b = 1; a = 2; }  ->  { a = 2; b = 1; }
+    {
+        auto * at = m.add<Attrs>(false);
+        at->attrs.emplace_back(std::string("b"), m.add<Int>(1));
+        at->attrs.emplace_back(std::string("a"), m.add<Int>(2));
+        check("attrs-plain", at, "{ a = 2; b = 1; }");
+    }
+
+    // attrs-rec:  rec { a = 1; b = a; }
+    {
+        auto * at = m.add<Attrs>(true);
+        at->attrs.emplace_back(std::string("a"), m.add<Int>(1));
+        at->attrs.emplace_back(std::string("b"), V("a"));
+        check("attrs-rec", at, "rec { a = 1; b = a; }");
+    }
+
+    // attrs-empty:  { }
+    check("attrs-empty", m.add<Attrs>(false), "{ }");
+
+    // attrs-inherit:  a: { inherit a; }  ->  (a: { inherit a; })
+    {
+        auto * at = m.add<Attrs>(false);
+        at->attrs.emplace_back(std::string("a"));   // Inherited
+        check("attrs-inherit", L("a", at), "(a: { inherit a; })");
+    }
+
+    // attrs-inheritfrom:  a: { inherit (a) x y; }  ->  (a: { inherit (a) x y; })
+    {
+        auto * at = m.add<Attrs>(false);
+        at->inheritFromExprs.push_back(V("a"));
+        int idx0 = 0;
+        at->attrs.emplace_back(std::string("x"), idx0);   // InheritedFrom src 0
+        at->attrs.emplace_back(std::string("y"), idx0);
+        check("attrs-inheritfrom", L("a", at), "(a: { inherit (a) x y; })");
+    }
+
+    // attrs-dynamic:  a: { ${a} = 1; }  ->  (a: { "${a}" = 1; })
+    {
+        auto * at = m.add<Attrs>(false);
+        at->dynamicAttrs.push_back({V("a"), m.add<Int>(1)});
+        check("attrs-dynamic", L("a", at), "(a: { \"${a}\" = 1; })");
+    }
+
+    // select-dynamic:  a: b: a.${b}  ->  (a: (b: (a)."${b}"))
+    check("select-dynamic",
+        L("a", L("b",
+            m.add<Select>(V("a"), std::vector<AttrName>{ AttrName(V("b")) }))),
+        "(a: (b: (a).\"${b}\"))");
+
     std::printf("\n=== %d/%d checks passed ===\n", checks - failures, checks);
     return failures == 0 ? 0 : 1;
 }
