@@ -87,6 +87,32 @@ inline void printLiteralString(std::ostream & str, std::string_view s) {
     str << '"';
 }
 
+/// Port of `printIdentifier` (print.cc:90-111): render a symbol name as
+/// TW does for `--parse` output.  A name is shown bare only if it is a
+/// valid identifier — non-empty, not a reserved keyword, first char in
+/// [A-Za-z_], rest in [A-Za-z0-9_'-].  Otherwise it is quoted+escaped
+/// via printLiteralString (empty => `""`, reserved => `"kw"`).  TW
+/// routes both plain attr names AND inherit names through this (via the
+/// `SymbolStr operator<<`, nixexpr.cc:19-23), as does the attr-selection
+/// path renderer (nixexpr.cc:265).
+inline void printIdentifier(std::ostream & str, const std::string & s) {
+    static const char * reserved[] =
+        {"if", "then", "else", "assert", "with", "let", "in", "rec", "inherit"};
+    if (s.empty()) { str << "\"\""; return; }
+    for (auto * k : reserved)
+        if (s == k) { str << '"' << s << '"'; return; }
+    char c = s[0];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_')) {
+        printLiteralString(str, s); return;
+    }
+    for (char ch : s)
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+              || (ch >= '0' && ch <= '9') || ch == '_' || ch == '\'' || ch == '-')) {
+            printLiteralString(str, s); return;
+        }
+    str << s;
+}
+
 /// One component of a select / has-attr path.  Static symbol XOR a
 /// dynamic `${expr}` key (mirrors nix::AttrName).
 struct AttrName {
@@ -104,7 +130,7 @@ inline void showAttrPath(std::ostream & str, const std::vector<AttrName> & path)
         if (!first) str << '.';
         first = false;
         if (a.expr) { str << "\"${"; a.expr->show(str); str << "}\""; }
-        else        str << a.symbol;
+        else        printIdentifier(str, a.symbol);
     }
 }
 
@@ -307,20 +333,21 @@ struct Attrs : Node {
         }
         if (!inherits.empty()) {
             str << "inherit";
-            for (auto & s : inherits) str << " " << s;
+            for (auto & s : inherits) { str << " "; printIdentifier(str, s); }
             str << "; ";
         }
         for (auto & [idx, syms] : inheritsFrom) {
             str << "inherit (";
             inheritFromExprs[idx]->show(str);
             str << ")";
-            for (auto & s : syms) str << " " << s;
+            for (auto & s : syms) { str << " "; printIdentifier(str, s); }
             str << "; ";
         }
         // 3. plain `k = v;` (sorted)
         for (auto * a : sorted) {
             if (a->kind == AttrKind::Plain) {
-                str << a->name << " = ";
+                printIdentifier(str, a->name);
+                str << " = ";
                 a->value->show(str);
                 str << "; ";
             }

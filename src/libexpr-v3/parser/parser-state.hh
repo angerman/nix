@@ -106,6 +106,20 @@ struct ParserState {
                 "duplicate formal function argument '" + argName + "'", argPos);
     }
 
+    // -- string / dynamic attr keys --------------------------------
+
+    /// Turn a `string_attr`'s expr into an AttrName.  A plain string
+    /// literal (`"foo"` => a String node) becomes a STATIC symbol key;
+    /// an interpolated string (`"${e}"` => ConcatStrings) or a bare
+    /// `${e}` (any other expr) becomes a DYNAMIC key.  Mirrors parser.y
+    /// attrpath's string_attr visit (nixexpr.cc: static string_view vs
+    /// dynamic Expr*).
+    static AttrName strAttrName(Node * n) {
+        if (n->kind == Kind::String)
+            return AttrName(static_cast<String *>(n)->s);
+        return AttrName(n);
+    }
+
     // -- attrset construction (port of ParserState::addAttr) --------
 
     /// The Plain AttrDef named `name` in `attrs`, or null.  (v3 Attrs

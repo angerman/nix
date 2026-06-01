@@ -216,10 +216,31 @@ now **88/88** byte-equal to TW: `inherit a;`, `inherit a b;`,
 empty `inherit;` (→ `{ }`), inherit-in-`let`, inherit-in-`rec`, and the
 inherit-before-plain show ordering.
 
-**Tier 4 + paths + string/dynamic keys (remaining Stage 1.4):**
+### Stage 1.4 Tier 3c — string / dynamic attr keys LANDED
+
+`string_attr` (`"…"` reusing `string_parts`, or bare `${e}`) wired into
+`attrpath` (all 4 parser.y alternatives) for keys + selects + has-attr.
+A `string_attr` is a STATIC symbol key iff it is a plain `String`
+literal (`ParserState::strAttrName` decides — String⇒static, else
+dynamic).  The lexer gained a default-context `${` → `DOLLAR_CURLY`
+rule (mirrors lexer.l's INITIAL/INSIDE_DOLLAR_CURLY) so `${e}` lexes
+OUTSIDE string literals (dynamic keys / `x.${e}`).
+
+Crucially this needed `printIdentifier` (port of print.cc:90-111):
+TW quotes attr/inherit/path names that are empty, reserved keywords, or
+non-identifiers — `{ "foo" = 1; }` shows as `{ foo = 1; }` but
+`{ "a b" = 1; }` / `{ "if" = 1; }` / `{ "" = 1; }` / `{ "foo.bar" = 1; }`
+stay quoted.  Routed through `showBindings` (plain + inherit names) and
+`showAttrPath` (select/has-attr static symbols).
+
+Validated by the tier3c battery (12 fixtures) — total parser-spike-test
+now **100/100** byte-equal to TW: static string keys (ident-collapse +
+quoted), `${e}` dynamic keys, nested + mixed static/dynamic paths,
+interpolated keys (`"pre${x}"` → `"${("pre" + x)}"`), and dynamic/string
+keys in select + has-attr.
+
+**Tier 4 + paths (remaining Stage 1.4):**
 * paths (`./foo`, `/abs`, `<nixpkgs>`, `~/x`) — lexer PATH states
-* string + dynamic attr keys (`{ "a" = …; ${e} = …; }`; the STRING
-  state is available — needs the `string_attr` / dynamic-attr grammar)
 * Tier 4 — formals (via `validateFormals`), indented strings (via
   `stripIndentation`), pipe operators, cursed-or, `let { }` form
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;

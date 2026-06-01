@@ -122,6 +122,15 @@ ANY   .|\n
 <STRING>\$\{  { PUSH_STATE(DEFAULT); return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY; }
 <STRING>\"    { POP_STATE(); return '"'; }
 
+  /* `${` in the default context = a dynamic attr key / select / has-attr
+   * (`{ ${e} = …; }`, `x.${e}`, `x ? ${e}`).  Mirrors lexer.l's
+   * INITIAL/INSIDE_DOLLAR_CURLY `\$\{` rule: emit DOLLAR_CURLY + push
+   * DEFAULT so the embedded expr lexes; the matching `}` pops.  (The
+   * STRING-state `${` is handled by the <STRING> rule above; this one
+   * is for `${` OUTSIDE a string literal.)  2-char match beats the
+   * `$` fall-through by flex longest-match. */
+\$\{        { PUSH_STATE(DEFAULT); return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY; }
+
   /* state-managed braces (mirrors lexer.l:184-188): `{` pushes DEFAULT
    * so the contents lex with the inclusive-state rules; `}` pops
    * (no-op pop at INITIAL — the stack-bottom marker). */

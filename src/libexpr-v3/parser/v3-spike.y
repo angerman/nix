@@ -72,7 +72,7 @@
 %type <nix::v3::ast::Node *> expr_app expr_select expr_simple
 %type <nix::v3::ast::Attrs *> binds binds1
 %type <std::vector<nix::v3::ast::Node *>> list
-%type <nix::v3::ast::Node *> string_parts
+%type <nix::v3::ast::Node *> string_parts string_attr
 %type <std::vector<nix::v3::ast::Node *>> string_parts_interpolated
 %type <std::vector<nix::v3::ast::AttrName>> attrpath
 %type <std::vector<std::string>> attrs
@@ -259,14 +259,28 @@ string_parts_interpolated
     { $$ = std::vector<nix::v3::ast::Node *>{ state->add<String>($1), $3 }; }
   ;
 
+/* attrpath (parser.y:537-553): dotted path of static `attr`s and/or
+ * string/dynamic `string_attr`s.  A `string_attr` becomes a static key
+ * iff it is a plain string literal (strAttrName decides). */
 attrpath
-  : attrpath '.' attr { $$ = std::move($1); $$.emplace_back($3); }
-  | attr              { $$ = std::vector<AttrName>{ AttrName($1) }; }
+  : attrpath '.' attr        { $$ = std::move($1); $$.emplace_back($3); }
+  | attrpath '.' string_attr { $$ = std::move($1); $$.push_back(state->strAttrName($3)); }
+  | attr                     { $$ = std::vector<AttrName>{ AttrName($1) }; }
+  | string_attr              { $$ = std::vector<AttrName>{ state->strAttrName($1) }; }
   ;
 
 attr
   : ID    { $$ = $1; }
   | OR_KW { $$ = std::string("or"); }
+  ;
+
+/* string-valued attr key (parser.y:560-563).  `"…"` reuses string_parts
+ * (so `"foo"` => String, `"${e}"` => ConcatStrings); `${e}` is a bare
+ * dynamic key.  strAttrName (in attrpath) maps String=>static,
+ * everything else=>dynamic. */
+string_attr
+  : '"' string_parts '"' { $$ = $2; }
+  | DOLLAR_CURLY expr '}' { $$ = $2; }
   ;
 
 %%
