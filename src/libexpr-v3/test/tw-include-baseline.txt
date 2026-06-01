@@ -1,0 +1,43 @@
+# Baseline allowlist for lint-no-direct-tw-include.sh (FFI consolidation
+# ratchet, FFI_CONSOLIDATION_AUDIT_2026-06-01 §5.1 / Phase 6).
+#
+# Each line is a src/libexpr-v3/-relative path that currently contains at
+# least one direct `#include "nix/...`.  The lint FAILS if any file NOT
+# listed here gains a TW include (regression — the V3-NATIVE discipline
+# slipped).  As the consolidation migrates a file behind ffi.hh and it
+# drops all TW includes, REMOVE it from this list (the ratchet tightens;
+# the lint then guards against re-introduction).
+#
+# End-state target (audit §5): only ffi.hh / ffi.cc / disk_cache.cc /
+# parser/ + the lower_v3.hh translation boundary remain.  Everything else
+# routes through ffi.hh.
+#
+# Generated 2026-06-02 (post-parser-completion; lower.cc retired).
+# Lines starting with '#' and blank lines are ignored.
+
+# --- FFI surface + documented exemptions (audit §5, §8) ---
+include/v3/ffi.hh
+ffi.cc
+disk_cache.cc
+parser/v3-parse-api.cc
+
+# --- translation boundary (native lowerer; replaces lower.cc's exemption) ---
+cli/lower_v3.hh
+include/v3/tw_baseenv.hh
+
+# --- Category A FFI leaves + Category C/D pinch (consolidation targets) ---
+bridge_root_registry.cc
+bridge_yield.cc
+bytecode_primops.cc
+cli/v3-eval.cc
+include/v3/alloc.hh
+include/v3/nursery.hh
+include/v3/run.hh
+include/v3/vm.hh
+primops.cc
+run.cc
+test/drv-preflight.cc
+test/evalscope-handles.cc
+v3_call_flake.cc
+value_serialize.cc
+vm.cc

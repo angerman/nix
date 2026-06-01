@@ -492,6 +492,18 @@ if python3.found()
     timeout : 30,
   )
 
+  # FFI consolidation (FFI_CONSOLIDATION_AUDIT_2026-06-01 §5.1 / Phase 6):
+  # ratchet lint that mechanically enforces the V3-NATIVE constraint at the
+  # header surface — no v3 file may gain a direct `#include "nix/...` unless
+  # baselined (test/tw-include-baseline.txt).  The baseline shrinks as files
+  # migrate behind ffi.hh.
+  test(
+    'v3-lint-no-direct-tw-include',
+    find_program('bash'),
+    args : [files('test/lint-no-direct-tw-include.sh')],
+    timeout : 30,
+  )
+
   # #546: regression suite for the OP_ATTRS_REC_INIT vs
   # OP_ATTRS_LET_REC_INIT split.  Verifies rec-attrs self-reference
   # (publish path) still works AND let-in-body / formals-default paths
