@@ -138,8 +138,30 @@ spaces+newline after `''`, so the token content has no leading
 newline) — a Stage 1.3 lexer requirement.
 
 Stage 1.2 remaining: symbol interning (names are inline std::string
-today — a Stage 1.4 integration decision).  Then 1.3 (build wiring:
-bison/flex → libnixexprv3) → 1.4 (action rewrite targeting the v3 AST).
+today — a Stage 1.4 integration decision).
+
+### Stage 1.3 status — bison/flex toolchain WIRED (spike green)
+
+The bison/flex → v3 build integration is proven.  `parser/v3-spike.{y,l}`
+is a minimal arithmetic grammar (same lalr1.cc skeleton +
+`api.value.type variant` as the real parser.y, minus locations)
+emitting v3 AST; `test/parser-spike-test.cc` parses it and asserts
+`show()` byte-equal to `nix-instantiate --parse` (**6/6**: `1 + 2 * 3`
+→ `(1 + (__mul 2 3))`, etc.).  Wired via meson custom_target
+(`v3-spike-tab`, `v3-spike-lex`) mirroring libexpr, `unity=off`.
+
+This retires the #1 project risk — the toolchain path (bison/flex in
+devshell → meson → generated C++ compiles → flex/bison glue
+[`v3-spike-decls.hh` YYSTYPE] → links → runs → v3 AST) all works.
+Integration gotchas locked: `-Wswitch-enum` pragma in `%code requires`
+(matches parser.y:17), `unity=off`, and the YYSTYPE glue header.
+
+Stage 1.4 GROWS this seed: swap the minimal grammar for parser.y's
+full productions + rewrite the actions to call `state.add<ast::X>`,
+`state.addAttr`, `state.validateFormals`, `state.stripIndentation`
+(all proven), port lexer.l's 7 states (honoring the IND_STRING_OPEN
+contract), then validate against the 68 fixtures + 263-file sweep via
+`NIX_V3_NATIVE_PARSER=1`.
 
 ## How to inspect upstream actions
 

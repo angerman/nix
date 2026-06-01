@@ -370,6 +370,39 @@ test(
   v3_ast_addattr_test,
 )
 
+# Parser project Stage 1.3 (PARSER_PROJECT_PLAN_2026-06-01) — bison/flex
+# toolchain spike.  Minimal arithmetic grammar (parser/v3-spike.{y,l})
+# emitting v3 AST, to de-risk the bison/flex -> v3 build integration
+# BEFORE the full parser.y action rewrite (Stage 1.4).  Mirrors the
+# libexpr custom_target wiring; unity=off because unity builds break
+# the recursive flex/bison generated-header dependency (libexpr
+# meson.build:238).
+v3_spike_tab = custom_target(
+  'v3-spike-tab',
+  input : 'parser/v3-spike.y',
+  output : ['v3-spike-tab.cc', 'v3-spike-tab.hh'],
+  command : ['bison', '-o', '@OUTPUT0@', '@INPUT@', '-d'],
+)
+v3_spike_lex = custom_target(
+  'v3-spike-lex',
+  input : ['parser/v3-spike.l', v3_spike_tab],
+  output : ['v3-spike-lex.cc', 'v3-spike-lex.hh'],
+  command : ['flex', '--outfile', '@OUTPUT0@', '--header-file=@OUTPUT1@', '@INPUT0@'],
+)
+v3_parser_spike_test = executable(
+  'v3-parser-spike-test',
+  'test/parser-spike-test.cc',
+  v3_spike_tab,
+  v3_spike_lex,
+  include_directories : [include_dirs, include_directories('parser')],
+  override_options : ['unity=off'],
+  install : false,
+)
+test(
+  'v3-parser-spike-test',
+  v3_parser_spike_test,
+)
+
 # #545: bench-harness self-tests.  Pure Python; loads workloads.toml,
 # exercises filtering / stats / JSON / baseline-diff, and runs a tiny
 # `nix eval` smoke test under TW + v3-direct.  Validates the

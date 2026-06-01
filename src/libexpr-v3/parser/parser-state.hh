@@ -61,6 +61,9 @@ struct FormalsBuilder {
 
 struct ParserState {
     Pool pool;
+    /// The parsed top-level expression (set by the grammar's `start`
+    /// production).  Mirrors TW's `ParserState::result`.
+    Node * result = nullptr;
 
     template <typename T, typename... Args>
     T * add(Args &&... a) { return pool.add<T>(std::forward<Args>(a)...); }
