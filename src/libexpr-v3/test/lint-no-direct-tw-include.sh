@@ -40,7 +40,24 @@ if [[ ! -f "$BASELINE" ]]; then echo "lint-no-direct-tw-include: baseline $BASEL
 #   include/v3/tw_baseenv.hh,
 #   include/v3/gc-config.hh — the native-lowerer translation boundary +
 #                            the centralized build-macro leaf
-EXEMPT='^(ffi\.cc|disk_cache\.cc|parser/|test/|include/v3/ffi\.hh|cli/lower_v3\.hh|include/v3/tw_baseenv\.hh|include/v3/gc-config\.hh)'
+#   cli/v3-eval.cc         — the standalone v3-eval BINARY's main(): a
+#                            CONSUMER of libnixexprv3 (a separate
+#                            `executable()`, NOT part of the .dylib — see
+#                            meson.build:279), i.e. the embedding host that
+#                            constructs `nix::EvalState`, opens the store
+#                            and inits GC/settings before handing source to
+#                            the v3-native parse→lower→run pipeline.  This
+#                            is the audit's anticipated "run-entry
+#                            exemption" (FFI_CONSOLIDATION_AUDIT §"v3_call_
+#                            flake.cc, cli/v3-eval.cc … a run-entry
+#                            exemption", line ~94).  It does ZERO eval
+#                            routing through TW (V3-NATIVE preserved); the
+#                            library-decoupling goal ("libnixexprv3 links
+#                            libstore+parser, not full libexpr") is about
+#                            the .dylib's TUs, which a consumer binary's
+#                            includes do not affect — exactly the role of
+#                            the un-linted `src/nix/eval.cc` host.
+EXEMPT='^(ffi\.cc|disk_cache\.cc|parser/|test/|include/v3/ffi\.hh|cli/lower_v3\.hh|cli/v3-eval\.cc|include/v3/tw_baseenv\.hh|include/v3/gc-config\.hh)'
 
 # Baseline (the SHRINKING set of genuine library migration targets — empty
 # at the audit's end state).  Strip comments/blanks, sort.
