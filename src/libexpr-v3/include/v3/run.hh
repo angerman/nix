@@ -64,8 +64,6 @@ struct RootResult {
     std::unique_ptr<CompilationUnit> cu;
     Value value;
 };
-RootResult runRootExpr(EvalState & state, Expr * e);
-
 /// Run an already-LOWERED v3 IR module (the native path: lowerV3Ast →
 /// here, with no nix::Expr).  Same side-effects + lifetime contract as
 /// runRootExpr.  registerBuiltinPrimOps() must have run before lowering

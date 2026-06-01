@@ -9,7 +9,6 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/run.hh"
-#include "v3/lower.hh"
 #include "v3/vm.hh"
 #include "v3/primop.hh"
 #include "v3/ir.hh"
@@ -1539,19 +1538,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         }
     }
     return out;
-}
-
-// Back-compat wrapper for the TW (nix::Expr) lowering path: lower via
-// lowerNixExpr, then run the module.  registerBuiltinPrimOps() must run
-// BEFORE lowering (lower-time findPrimOp resolution); runRootExprModule
-// repeats the full idempotent setup.  Native callers skip this and call
-// runRootExprModule(state, lowerV3Ast(...)) directly — that path no longer
-// touches nix::Expr.  This wrapper retires once every parse site is native
-// (then lowerNixExpr + lower.cc's nix::Expr path are deleted).
-RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
-{
-    registerBuiltinPrimOps();
-    return runRootExprModule(state, lowerNixExpr(e, state.symbols, state.positions));
 }
 
 // PARSER_PROJECT_PLAN §5.3: native parse+lower+run from raw `.nix` source

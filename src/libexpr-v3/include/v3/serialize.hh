@@ -162,7 +162,13 @@ namespace nix::v3::serialize {
 /// 2-pair App-chain encoding remain decodable, but cache entries
 /// produced by the new mapAttrs/zipAttrsWith use the App3 layout —
 /// invalidate the disk cache to force re-emit.
-constexpr uint32_t kSchemaVersion = 15;
+/// 16 (2026-06-01): the import/CLI path now lowers natively (v3-native
+/// parser → lowerV3Ast), which numbers VarIds / orders bindings
+/// differently than the retired lower.cc nix::Expr path.  Native CUs are
+/// bytecode-incompatible with old (lower.cc) cache entries — bump to
+/// invalidate them.  OPERATING RULE: bump on any incompatible native-
+/// lowering change (the rule that previously covered lower.cc edits).
+constexpr uint32_t kSchemaVersion = 16;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

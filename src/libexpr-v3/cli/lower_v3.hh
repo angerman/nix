@@ -29,7 +29,13 @@
 #include "v3/ir.hh"
 #include "v3/primop.hh"
 #include "v3/alloc.hh"            // recordPosSnapshot
-#include "nix/util/pos-table.hh"  // PosTable + Pos::Origin
+#include "nix/util/pos-table.hh"  // PosTable + Pos::Origin (+ SourcePath via position.hh)
+
+// nix::SymbolTable is used only by reference (the SymbolTable& member +
+// the lowerV3Ast param), so a forward declaration suffices — keeps this
+// header self-sufficient regardless of include order (it formerly relied
+// on the now-deleted v3/lower.hh for this forward-decl).
+namespace nix { class SymbolTable; }
 
 #include <algorithm>
 #include <deque>

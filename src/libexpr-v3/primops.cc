@@ -25,7 +25,6 @@
 #include "v3/import_timing.hh"  // #769 per-import phase timing
 #include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
-#include "v3/lower.hh"
 // PARSER_PROJECT_PLAN §5.3: native parse + lower for the import path,
 // behind NIX_V3_NATIVE_PARSER=1 (+ NIX_V3_NATIVE_LOWER=1), with a
 // per-file canLowerV3 fallback to the proven bridge / TW path.
@@ -8165,17 +8164,10 @@ void primImport(EvalState & state, Value * args, Value & out)
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop import: no nix EvalState wired (run via v3-eval)");
 
-    // PARSER_PROJECT_PLAN §5.3: parse the imported file with the v3-native
-    // parser (NIX_V3_NATIVE_PARSER=1) and, when the whole file lowers
-    // natively (NIX_V3_NATIVE_LOWER=1 + canLowerV3), lower it directly to
-    // IR — else fall back to the proven AST→nix::Expr bridge / TW path.
-    // Cached reads (lint-no-inline-getenv).  RETIREMENT: both gates + the
-    // bridge/TW branch are deleted when the native path becomes the
-    // default at the end of Stage 2 (bridge + lower.cc nix::Expr path go).
-    static const bool s_nativeParser = std::getenv("NIX_V3_NATIVE_PARSER") != nullptr;
-    static const bool s_nativeLower  = std::getenv("NIX_V3_NATIVE_LOWER") != nullptr;
-    // Home dir for the v3 parser's `~/x` resolution — same source TW's
-    // parser uses (getHome()), cached once.
+    // PARSER_PROJECT_PLAN §5.3: the imported file is parsed by the
+    // v3-native parser and lowered directly to IR (no nix::Expr / no gate
+    // — native is the only path now).  Home dir for the parser's `~/x`
+    // resolution — same source TW's parser uses (getHome()), cached once.
     static const std::string s_homePath = nix::getHome().string();
     std::string path;
     // #741 Phase 4b RCA (2026-05-24): track whether this is an
@@ -8675,21 +8667,15 @@ void primImport(EvalState & state, Value * args, Value & out)
                             sizeof(pathLen));
             keyBytes.append(pathStr);
             keyBytes.append(content);
-            // PARSER_PROJECT_PLAN §5.3: the on-disk CU cache key is the
-            // SOURCE content + path — it does NOT encode the lowerer
-            // version.  The native lowerer is an evolving dev feature, so a
-            // CU lowered by a buggy native lowerer would otherwise be
-            // restored by a later (fixed) native run — a stale silent-
-            // wrong-CU (observed: a pre-fetchurl-fix CU made qtbase.drvPath
-            // diverge on a warm cache).  So we DISABLE the CU disk cache
-            // entirely under native-lower (empty key ⇒ no lookup, no
-            // insert).  Correctness over warm-eval speed for the opt-in
-            // dev path; the SHIP-gate validation runs cold-cache anyway.
-            // RETIREMENT: re-enable with a lowerer-version component in the
-            // key when the native lowerer stabilises + becomes default.
-            if (!(s_nativeParser && s_nativeLower))
-                diskKey = disk_cache::computeKeyForString(keyBytes);
-            // else: leave diskKey empty ⇒ CU disk cache disabled.
+            // PARSER_PROJECT_PLAN §5.3: native lowering is now the ONLY
+            // path, so the CU disk cache is consistent again (all CUs are
+            // native-lowered) and re-enabled.  The key is SOURCE content +
+            // path; the lowerer "version" is carried by
+            // serialize::kSchemaVersion — BUMP IT on any incompatible
+            // native-lowering change (the operating rule that previously
+            // covered lower.cc), else a stale CU from an older lowerer
+            // could be restored (the qtbase.drvPath warm-cache divergence).
+            diskKey = disk_cache::computeKeyForString(keyBytes);
         } catch (...) {
             // Read failure -> empty key -> cache lookup is skipped,
             // and no insert happens later.  Same fallback as before.
@@ -8765,27 +8751,34 @@ void primImport(EvalState & state, Value * args, Value & out)
                     std::getenv("V3_DBG_DESERIALIZE_VERIFY");
                 if (s_verifyLog) {
                     try {
-                        nix::Expr * e2 = nullptr;
+                        // Fresh re-compile via the SAME native path the
+                        // cached CU was produced by (so the byte-compare is
+                        // apples-to-apples post-Stage-2 flip).
+                        nix::v3::ast::ParserState v3st2;
+                        std::string text2;
+                        std::optional<nix::PosTable::Origin> origin2;
                         if (useCorepkgs) {
                             nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(),
                                                nix::CanonPath(corepkgsPath));
-                            e2 = ns.parseExprFromFile(cp);
+                            text2 = cp.resolveSymlinks().readFile();
+                            if (auto par = cp.path.parent()) v3st2.basePath = par->abs();
+                            v3st2.homePath = s_homePath;
+                            nix::v3::parser::parseString(v3st2, text2);
+                            origin2.emplace(ns.positions.addOrigin(nix::Pos::Origin(cp), text2.size()));
                         } else {
-                            e2 = ns.parseExprFromFile(resolvedSp);
+                            text2 = resolvedSp.resolveSymlinks().readFile();
+                            if (auto par = resolvedSp.path.parent()) v3st2.basePath = par->abs();
+                            v3st2.homePath = s_homePath;
+                            nix::v3::parser::parseString(v3st2, text2);
+                            origin2.emplace(ns.positions.addOrigin(nix::Pos::Origin(resolvedSp), text2.size()));
                         }
-                        e2->bindVars(ns, ns.staticBaseEnv);
-                        // R1 trigger trace: print a marker BEFORE verify-side
-                        // lowerNixExpr so V3_DBG_815_FUNCID traces from the
-                        // fresh recompile are attributable to a specific file.
-                        // The main-path "--- begin import" marker only fires
-                        // on cache MISSES; verify-side compile runs on cache
-                        // HITS and has no such marker by default.
                         static const bool s_dbg815v =
                             std::getenv("V3_DBG_815_FUNCID") != nullptr;
                         if (s_dbg815v) std::fprintf(stderr,
                             "v3 FUNCID --- begin verify path=%s ---\n",
                             path.c_str());
-                        auto module2 = lowerNixExpr(e2, ns.symbols, ns.positions);
+                        auto module2 = nix::v3::lowerV3Ast(ns.symbols, v3st2.result,
+                            &ns.positions, *origin2, &nix::v3::twBaseEnvGlobals(ns));
                         nix::v3::ir::optimise(module2);
                         nix::v3::ir::computeFreeVars(module2);
                         // R1 trigger trace mirror: see main-path dump above.
@@ -9243,64 +9236,48 @@ skipDiskCacheLookup:
     // (#770b: deferred past the disk-cache lookup so a hit skips it) so
     // the native AST arena (v3st) is freed alongside the IR, before run().
     {
-        // -- parse --------------------------------------------------
+        // -- parse + lower (always native; PARSER_PROJECT_PLAN §5.3) --
+        // The imported file is parsed by the v3-native parser and lowered
+        // directly to IR — no nix::Expr.  Relative (`./x`) / home (`~/x`)
+        // path literals resolve against the file's dir / $HOME, exactly as
+        // TW's parseExprFromFile does; the PosTable::Origin makes
+        // attr/formal + __curPos positions byte-match TW.  canLowerV3 is
+        // total for parser-produced ASTs (the throw is a should-never-fire
+        // guard).  corepkgs reads from the virtual corepkgsFS accessor.
         auto tParse = impStamp();
-        nix::Expr * e = nullptr;                  // TW (lowerNixExpr) path
-        bool useNativeLower = false;              // native AST→IR path
         nix::v3::ast::ParserState v3st;           // owns the native AST
+        std::string text;
         std::optional<nix::PosTable::Origin> nativeOrigin;
-
-        if (s_nativeParser && s_nativeLower && !useCorepkgs) {
-            // PARSER_PROJECT_PLAN §5.3: parse with the v3-native parser.
-            // Relative (`./x`) / home (`~/x`) path literals resolve against
-            // the file's directory + $HOME, exactly as TW's
-            // parseExprFromFile does (basePath = dirname; homePath =
-            // getHome()).  corepkgs (virtual accessor) stays on the TW path.
-            std::string text = resolvedSp.resolveSymlinks().readFile();
-            if (auto par = resolvedSp.path.parent())
-                v3st.basePath = par->abs();
-            v3st.homePath = s_homePath;
-            nix::v3::parser::parseString(v3st, text);
-            if (nix::v3::canLowerV3(v3st.result)) {
-                useNativeLower = true;
-                // Same PosTable::Origin TW uses (Pos::Origin(resolvedSp)) so
-                // attr/formal + __curPos positions match byte-for-byte.
-                nativeOrigin.emplace(ns.positions.addOrigin(
-                    nix::Pos::Origin(resolvedSp), text.size()));
-                ++importTimingTotals().nativeLowered;  // §5.3 coverage proof
-            } else {
-                // Native lowering can't handle this file: re-parse with TW
-                // (ground truth) → the proven lowerNixExpr path.  Dead for
-                // real nixpkgs (canLowerV3 accepts every file observed);
-                // kept as a robust safety net (no AST→nix::Expr bridge).
-                e = ns.parseExprFromFile(resolvedSp);
-                ++importTimingTotals().nativeBridged;  // = TW-reparse fallback
-            }
-        } else if (useCorepkgs) {
+        if (useCorepkgs) {
             nix::SourcePath cp(ns.corepkgsFS.cast<nix::SourceAccessor>(),
                                nix::CanonPath(corepkgsPath));
-            e = ns.parseExprFromFile(cp);
+            text = cp.resolveSymlinks().readFile();
+            if (auto par = cp.path.parent()) v3st.basePath = par->abs();
+            v3st.homePath = s_homePath;
+            nix::v3::parser::parseString(v3st, text);
+            nativeOrigin.emplace(ns.positions.addOrigin(nix::Pos::Origin(cp), text.size()));
         } else {
-            e = ns.parseExprFromFile(resolvedSp);
+            text = resolvedSp.resolveSymlinks().readFile();
+            if (auto par = resolvedSp.path.parent()) v3st.basePath = par->abs();
+            v3st.homePath = s_homePath;
+            nix::v3::parser::parseString(v3st, text);
+            nativeOrigin.emplace(ns.positions.addOrigin(
+                nix::Pos::Origin(resolvedSp), text.size()));
         }
-        if (e) e->bindVars(ns, ns.staticBaseEnv);
+        if (!nix::v3::canLowerV3(v3st.result))
+            throw nix::Error("v3 import: native lowering cannot handle " + path);
+        ++importTimingTotals().nativeLowered;
         impBumpNs(importTimingTotals().parseNs, tParse);
 
         if (s_dbg_import) std::fprintf(stderr,
-            "v3 IMPORT-PHASE before-lower [%s] RSS=%lluMB: %s\n",
-            useNativeLower ? "native" : "tw",
+            "v3 IMPORT-PHASE before-lower [native] RSS=%lluMB: %s\n",
             (unsigned long long)rssMBImp(), path.c_str());
 
         // -- lower --------------------------------------------------
         if (s_impTimingEn) ++importTimingTotals().calls;
         auto tLower = impStamp();
-        static const bool s_dbg815pp = std::getenv("V3_DBG_815_FUNCID") != nullptr;
-        if (s_dbg815pp) std::fprintf(stderr,
-            "v3 FUNCID --- begin import path=%s ---\n", path.c_str());
-        auto module = useNativeLower
-            ? nix::v3::lowerV3Ast(ns.symbols, v3st.result, &ns.positions, *nativeOrigin,
-                                  &nix::v3::twBaseEnvGlobals(ns))
-            : lowerNixExpr(e, ns.symbols, ns.positions);
+        auto module = nix::v3::lowerV3Ast(ns.symbols, v3st.result, &ns.positions,
+                                          *nativeOrigin, &nix::v3::twBaseEnvGlobals(ns));
         impBumpNs(importTimingTotals().lowerNs, tLower);
         if (s_dbg_import) std::fprintf(stderr,
             "v3 IMPORT-PHASE after-lower RSS=%lluMB: %s\n",
@@ -10111,35 +10088,23 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     wrapped += "in (\n" + src + "\n)";
 
     // PARSER_PROJECT_PLAN §5.3 site 3: native-parse+lower the synthetic
-    // scopedImport wrapper when gated (canLowerV3 bridge fallback).  The
+    // scopedImport wrapper (the only path now — no nix::Expr).  The
     // wrapper's relative-path literals (inside `src`) resolve against the
-    // imported file's directory, matching parseExprFromString(.., sp.parent()).
-    static const bool s_siNativeParser = std::getenv("NIX_V3_NATIVE_PARSER") != nullptr;
-    static const bool s_siNativeLower  = std::getenv("NIX_V3_NATIVE_LOWER") != nullptr;
-    static const std::string s_siHome  = nix::getHome().string();
-    nix::Expr * wrapper = nullptr;
-    bool siNativeLower = false;
+    // imported file's dir, matching parseExprFromString(.., sp.parent()).
+    // canLowerV3 is total for parsed source (throw = should-never-fire).
+    static const std::string s_siHome = nix::getHome().string();
     nix::v3::ast::ParserState siSt;
-    std::optional<nix::PosTable::Origin> siOrigin;
-    if (s_siNativeParser && s_siNativeLower) {
-        if (auto par = sp.path.parent()) siSt.basePath = par->abs();  // file's dir
-        siSt.homePath = s_siHome;
-        nix::v3::parser::parseString(siSt, wrapped);
-        if (nix::v3::canLowerV3(siSt.result)) {
-            siNativeLower = true;
-            auto srcRef = nix::make_ref<std::string>(wrapped);
-            siOrigin.emplace(ns.positions.addOrigin(
-                nix::Pos::String{.source = srcRef}, srcRef->size()));
-        } else  // native lowering can't handle it → TW re-parse (ground truth)
-            wrapper = ns.parseExprFromString(wrapped, sp.parent());
-    } else
-        wrapper = ns.parseExprFromString(wrapped, sp.parent());
-    if (wrapper) wrapper->bindVars(ns, ns.staticBaseEnv);
+    if (auto par = sp.path.parent()) siSt.basePath = par->abs();  // file's dir
+    siSt.homePath = s_siHome;
+    nix::v3::parser::parseString(siSt, wrapped);
+    if (!nix::v3::canLowerV3(siSt.result))
+        throw nix::Error("v3 scopedImport: native lowering cannot handle " + path);
+    auto siSrcRef = nix::make_ref<std::string>(wrapped);
+    auto siOrigin = ns.positions.addOrigin(
+        nix::Pos::String{.source = siSrcRef}, siSrcRef->size());
 
-    auto module = siNativeLower
-        ? nix::v3::lowerV3Ast(ns.symbols, siSt.result, &ns.positions, *siOrigin,
-                              &nix::v3::twBaseEnvGlobals(ns))
-        : lowerNixExpr(wrapper, ns.symbols, ns.positions);
+    auto module = nix::v3::lowerV3Ast(ns.symbols, siSt.result, &ns.positions, siOrigin,
+                                      &nix::v3::twBaseEnvGlobals(ns));
     nix::v3::ir::optimise(module);
     nix::v3::ir::computeFreeVars(module);
     auto & cache = importCache();

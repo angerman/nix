@@ -26,7 +26,6 @@
 
 #include "v3/primop.hh"
 #include "v3/closure.hh"
-#include "v3/lower.hh"
 #include "v3/ir.hh"
 #include "v3/vm.hh"
 #include "v3/value.hh"
@@ -131,40 +130,24 @@ struct CachedCallFlake {
             // does its own outPath plumbing) point at a clearly-
             // synthetic location.
             // PARSER_PROJECT_PLAN §5.3 site 4: native-parse+lower
-            // call-flake.nix when gated (canLowerV3 fallback to the bridge
-            // / TW path).  call-flake.nix uses no relative/home paths, so
-            // basePath is left empty; positions resolve against a stable
-            // heap source for the Pos::String origin.  Cached gate reads.
-            static const bool s_nativeParser = std::getenv("NIX_V3_NATIVE_PARSER") != nullptr;
-            static const bool s_nativeLower  = std::getenv("NIX_V3_NATIVE_LOWER") != nullptr;
+            // call-flake.nix (the only path now — no nix::Expr).  It uses
+            // no relative/home paths, so basePath is empty; positions
+            // resolve against a stable heap source for the Pos::String
+            // origin.  canLowerV3 is total for parsed source (the throw is
+            // a should-never-fire guard).
             static const std::string s_homePath = nix::getHome().string();
 
-            nix::Expr * e = nullptr;
-            bool useNativeLower = false;
             nix::v3::ast::ParserState v3st;
-            std::optional<nix::PosTable::Origin> nativeOrigin;
-            if (s_nativeParser && s_nativeLower) {
-                v3st.homePath = s_homePath;
-                nix::v3::parser::parseString(v3st, std::string(callFlakeSource));
-                if (nix::v3::canLowerV3(v3st.result)) {
-                    useNativeLower = true;
-                    auto src = nix::make_ref<std::string>(callFlakeSource);
-                    nativeOrigin.emplace(ns.positions.addOrigin(
-                        nix::Pos::String{.source = src}, src->size()));
-                } else  // native lowering can't handle it → TW re-parse
-                    e = ns.parseExprFromString(
-                        callFlakeSource, ns.rootPath("/«v3-call-flake»"));
-            } else {
-                e = ns.parseExprFromString(
-                    callFlakeSource, ns.rootPath("/«v3-call-flake»"));
-            }
-            if (e) e->bindVars(ns, ns.staticBaseEnv);
+            v3st.homePath = s_homePath;
+            nix::v3::parser::parseString(v3st, std::string(callFlakeSource));
+            if (!nix::v3::canLowerV3(v3st.result))
+                throw nix::Error("v3 callFlake: native lowering cannot handle call-flake.nix");
+            auto src = nix::make_ref<std::string>(callFlakeSource);
+            auto origin = ns.positions.addOrigin(nix::Pos::String{.source = src}, src->size());
 
             // (2) Lower into v3 IR.  Same pipeline as primImport.
-            auto module = useNativeLower
-                ? nix::v3::lowerV3Ast(ns.symbols, v3st.result, &ns.positions,
-                                      *nativeOrigin, &nix::v3::twBaseEnvGlobals(ns))
-                : lowerNixExpr(e, ns.symbols, ns.positions);
+            auto module = nix::v3::lowerV3Ast(ns.symbols, v3st.result, &ns.positions,
+                                              origin, &nix::v3::twBaseEnvGlobals(ns));
             ir::optimise(module);
             ir::computeFreeVars(module);
 

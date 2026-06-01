@@ -93,7 +93,9 @@ lib_sources = files(
   'primops.cc',
   'bytecode_primops.cc',
   'limits.cc',
-  'lower.cc',
+  # lower.cc (nix::Expr → IR) RETIRED 2026-06-01: the parser project
+  # made every parse site native (v3-native parser → lowerV3Ast), so the
+  # TW nix::Expr lowering path has no callers.  See cli/lower_v3.hh.
   'opt_beta_reduce.cc',
   'opt_const_fold.cc',
   'opt_cse.cc',
@@ -250,7 +252,6 @@ install_headers(
     'include/v3/disk_cache.hh',
     'include/v3/gc.hh',
     'include/v3/limits.hh',
-    'include/v3/lower.hh',
     'include/v3/primop.hh',
     'include/v3/print.hh',
     'include/v3/run.hh',
