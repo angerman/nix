@@ -6,8 +6,7 @@
 
 #include "v3/bridge_yield.hh"
 
-#include "nix/expr/eval.hh"  // EvalState::forceValue + (transitively) nix::Value
-#include "nix/util/pos-idx.hh"
+#include "v3/ffi.hh"  // ffi::forceValue — no direct TW include (FFI consolidation)
 
 namespace nix::v3 {
 
@@ -26,7 +25,7 @@ void yieldForceTreeWalker(::nix::EvalState & state, ::nix::Value & v)
     Fiber * f = currentFiber;
     if (!f || !currentMailbox) {
         // Not in a fiber — force directly.  Same semantics.
-        state.forceValue(v, ::nix::noPos);
+        ffi::forceValue(state, v);
         return;
     }
     Mailbox * mb = currentMailbox;
@@ -64,7 +63,7 @@ Value runInFiber(::nix::EvalState & state,
             switch (mb.kind) {
             case YieldKind::ForceTreeWalker: {
                 if (mb.twValueToForce)
-                    state.forceValue(*mb.twValueToForce, ::nix::noPos);
+                    ffi::forceValue(state, *mb.twValueToForce);
                 mb.kind = YieldKind::None;
                 mb.twValueToForce = nullptr;
                 break;

@@ -71,11 +71,34 @@ namespace nix {
     struct StaticEnv;
     class  Store;
     class  Logger;
+    struct Value;       // TW value (distinct from nix::v3::Value)
+    class  EvalState;   // host evaluator — opacity Level 1 (methods only)
 }
 
 namespace nix::v3 {
 
 struct Value; // v3 16-byte tagged value (declared in value.hh)
+
+// =========================================================================
+// EvalState shims (Option A — typed link-time; audit §3.3/§3.4)
+// =========================================================================
+//
+// Thin non-template wrappers over the `nix::EvalState` methods v3's FFI
+// leaves call, so a consumer can forward-declare `nix::EvalState` /
+// `nix::Value` and route through these instead of pulling the heavy
+// `nix/expr/eval.hh` (+ its inline bodies).  Implemented in ffi.cc (the
+// one TU that legitimately includes eval.hh).
+//
+// PERF (audit R1/R4): these are out-of-line, so the inline-`forceValue`
+// fast path is lost — only adopt them on COLD/bridge paths until the
+// `ffi-inline.h` private-header trick lands for the hot sites.
+namespace ffi {
+
+/// Force a TW value to WHNF via the host evaluator (at noPos).  Cold/
+/// bridge-path convenience over `state.forceValue(v, nix::noPos)`.
+void forceValue(nix::EvalState & state, nix::Value & v);
+
+}  // namespace ffi
 
 // =========================================================================
 // Framework: lifetime + error + latency-class wrappers

@@ -22,7 +22,6 @@ vm.cc
 v3_call_flake.cc
 run.cc
 cli/v3-eval.cc
-bridge_yield.cc
 bytecode_primops.cc
 value_serialize.cc
 include/v3/run.hh

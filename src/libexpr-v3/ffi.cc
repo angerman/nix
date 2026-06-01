@@ -35,6 +35,7 @@
 #include "nix/util/source-path.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/error.hh"
+#include "nix/expr/eval.hh"   // EvalState — ffi.cc is the one TU that wraps it
 
 #include <atomic>
 #include <cstring>
@@ -43,6 +44,16 @@
 #include <vector>
 
 namespace nix::v3 {
+
+// EvalState shims (audit §3.4) — out-of-line wrappers; see ffi.hh.
+namespace ffi {
+
+void forceValue(nix::EvalState & state, nix::Value & v)
+{
+    state.forceValue(v, nix::noPos);
+}
+
+}  // namespace ffi
 
 // ---------------------------------------------------------------------------
 // Evaluator
