@@ -52,9 +52,12 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
     case a::Kind::Var:
         return true;
     case a::Kind::Lambda: {
-        // Phase 2a: single-arg only.  Formals (Phase 2b+) → bridge.
+        // Phase 2a single-arg + Phase 2c formals (defaults may reference
+        // sibling formals; all default exprs + the body must lower).
         auto * lam = static_cast<const a::Lambda *>(n);
-        if (lam->hasFormals) return false;
+        if (lam->hasFormals)
+            for (auto & f : lam->formals)
+                if (f.def && !canLowerV3(f.def)) return false;
         return canLowerV3(lam->body);
     }
     case a::Kind::Let: {
@@ -149,11 +152,13 @@ struct LowererV3 {
         for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
             auto f = it->byName.find(name);
             if (f == it->byName.end()) continue;
-            if (it->recVar != ir::kInvalid)
-                // rec binding → heap-stable slot ref (lower.cc thunkify
-                // uses RecBindingSlotRef; strict contexts force it).
-                return addBinding(ir::RecBindingSlotRef{it->recVar, m.internSymbol(name)});
-            return addBinding(ir::VarRef{f->second});
+            // A real VarId (lambda param / @-arg) → VarRef; a kInvalid
+            // entry is a rec slot → heap-stable RecBindingSlotRef on the
+            // scope's rec attrset (lower.cc's verified-correct default;
+            // strict contexts force it).
+            if (f->second != ir::kInvalid)
+                return addBinding(ir::VarRef{f->second});
+            return addBinding(ir::RecBindingSlotRef{it->recVar, m.internSymbol(name)});
         }
         if (name == "true")  return addBinding(ir::LitBool{true});
         if (name == "false") return addBinding(ir::LitBool{false});
@@ -242,11 +247,13 @@ struct LowererV3 {
         }
     }
 
-    /// Phase 2a: single-arg lambda (no formals — canLowerV3 rejects
-    /// those).  Sub-func with the param bound by name; body lowered in
-    /// its own scope/block; emit computes upvalues.  No intrinsics
-    /// (Phase 4) — a single-arg lambda with no `let`/attrs body can't
-    /// form a Fix/Extends/Compose shape, so intrinsicKind=0 is correct.
+    /// Phase 2a/2c: lambda.  Single-arg `x: body` (param bound by name)
+    /// OR formals `{ a, b ? d, ... }[@arg]: body` (each formal is a
+    /// thunk `if param?X then param.X else default` in a synthetic
+    /// rec scope, so defaults can reference sibling formals; the body
+    /// resolves formals via the rec attrset).  Mirrors lower.cc::
+    /// lowerLambda.  No intrinsic recognition yet (Phase 4) — the
+    /// fast-path is an optimization, intrinsicKind=0 is correct.
     ir::VarId lowerLambda(const nix::v3::ast::Lambda * lam)
     {
         m.functions.emplace_back();
@@ -255,19 +262,96 @@ struct LowererV3 {
         ir::VarId param = m.freshVar();
         m.functions[fid].entryBlock = entry;
         m.functions[fid].paramVar   = param;
-        m.functions[fid].argName    = m.internSymbol(lam->arg);
-        m.functions[fid].name       = lam->arg;
+        m.functions[fid].argName    = lam->arg.empty() ? ir::kInvalidSymbol : m.internSymbol(lam->arg);
+        m.functions[fid].name       = lam->arg.empty() ? "<formals>" : lam->arg;
 
-        Scope inner;
-        inner.byName.emplace(lam->arg, param);
-        scopes.push_back(std::move(inner));
+        if (!lam->hasFormals) {
+            Scope inner;
+            inner.byName.emplace(lam->arg, param);
+            scopes.push_back(std::move(inner));
+            blockStack.push_back(entry);
+            setReturn(lowerExpr(lam->body));
+            blockStack.pop_back();
+            scopes.pop_back();
+            return addBinding(ir::Lambda{fid, {}, {}});
+        }
+
+        // Formals.  Record metadata for builtins.functionArgs.
+        m.functions[fid].hasFormals = true;
+        m.functions[fid].ellipsis   = lam->ellipsis;
+        for (auto & f : lam->formals) {
+            ir::Formal ifm;
+            ifm.name = m.internSymbol(f.name);
+            ifm.hasDefault = f.def != nullptr;
+            m.functions[fid].formals.push_back(ifm);
+        }
+        ir::VarId formalsRec = m.freshVar();
+        m.functions[fid].formalsRecVar = formalsRec;
+        m.recVarIds.push_back(formalsRec);
+
+        // Rec scope: @-arg → the attrset (regular VarRef); each formal
+        // → a rec slot (kInvalid) on formalsRec.
+        Scope recScope;
+        recScope.recVar = formalsRec;
+        if (!lam->arg.empty()) recScope.byName.emplace(lam->arg, param);
+        for (auto & f : lam->formals) recScope.byName.emplace(f.name, ir::kInvalid);
+
+        // Canonical (by-name) order for FuncId stability (#815).
+        std::vector<const nix::v3::ast::Formal *> fs;
+        fs.reserve(lam->formals.size());
+        for (auto & f : lam->formals) fs.push_back(&f);
+        std::stable_sort(fs.begin(), fs.end(),
+            [](const auto * a, const auto * b) { return a->name < b->name; });
+
         blockStack.push_back(entry);
-        ir::VarId rv = lowerExpr(lam->body);
-        setReturn(rv);
-        blockStack.pop_back();
-        scopes.pop_back();
+        ir::LetRec lr;
+        lr.recVar = formalsRec;
+        lr.hasBody = true;
+        lr.entries.reserve(fs.size());
+        for (auto * f : fs) {
+            ir::SymbolId sym = m.internSymbol(f->name);
+            m.functions.emplace_back();
+            ir::FuncId tfid = static_cast<ir::FuncId>(m.functions.size() - 1);
+            auto teb = m.freshBlock();
+            m.functions[tfid].entryBlock = teb;
+            m.functions[tfid].name = f->name;
+            // Thunk body: `if param ? X then param.X else <default>`
+            // (or `param.X` when no default), lowered in the rec scope.
+            blockStack.push_back(teb);
+            scopes.push_back(recScope);
+            ir::VarId paramForced = forceVal(addBinding(ir::VarRef{param}));
+            ir::VarId rv;
+            if (f->def) {
+                ir::VarId hasIt = addBinding(ir::HasAttr{paramForced, sym});
+                auto thenB = m.freshBlock();
+                auto elseB = m.freshBlock();
+                blockStack.push_back(thenB);
+                setReturn(addBinding(ir::AttrSelect{paramForced, sym}));
+                blockStack.pop_back();
+                blockStack.push_back(elseB);
+                setReturn(lowerExpr(f->def));
+                blockStack.pop_back();
+                rv = addBinding(ir::If{hasIt, thenB, elseB});
+            } else
+                rv = addBinding(ir::AttrSelect{paramForced, sym});
+            setReturn(rv);
+            scopes.pop_back();
+            blockStack.pop_back();
 
-        return addBinding(ir::Lambda{fid, /*freeVars*/ {}, /*lexicalWiths*/ {}});
+            ir::LetRec::Entry en;
+            en.name = sym;
+            en.thunkBody = tfid;
+            lr.entries.push_back(std::move(en));
+        }
+        m.blocks[blockStack.back()].bindings.push_back({formalsRec, std::move(lr)});
+
+        // Body in the rec scope (formals resolve via the rec attrset).
+        scopes.push_back(recScope);
+        setReturn(lowerExpr(lam->body));
+        scopes.pop_back();
+        blockStack.pop_back();
+
+        return addBinding(ir::Lambda{fid, {}, {}});
     }
 
     /// Phase 2b: `let … in body` (plain bindings only — canLowerV3
