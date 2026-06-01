@@ -58,22 +58,31 @@ audit.
   preserved).  alloc.hh / nursery.hh / bridge_root_registry.cc became
   TW-include-free.  **Ratchet baseline: 21 → 19** TW-touching files.
 
-**Remaining baseline (19), categorized for the Phase 2/3 follow-up:**
-- *Permanent leaves / exemptions* (7): ffi.hh, ffi.cc, disk_cache.cc,
-  parser/v3-parse-api.cc, cli/lower_v3.hh + tw_baseenv.hh (the native-
-  lowerer translation boundary), gc-config.hh.
-- *Test harnesses* (2): test/drv-preflight.cc, test/evalscope-handles.cc
-  (construct a TW EvalState to drive v3 tests — not the library surface;
-  candidates for a structural test/ exemption).
-- *Genuine library consolidation targets* (10) — the Phase 2/3 core:
-  primops.cc, vm.cc, v3_call_flake.cc, run.cc, cli/v3-eval.cc,
-  bridge_yield.cc, bytecode_primops.cc, value_serialize.cc, run.hh, vm.hh.
-  These need the eval.hh/value.hh opacity layer (forceValue/allocValue/
-  callFunction/realisePath/… + field accessors) + the value-graph
-  marshallers — perf-gated (R1/R4: inline-forceValue → ffi-inline.h +
-  hyperfine ≤2%/phase).  value_serialize.cc (hash.hh only) + run.hh
-  (pos-table.hh only) are the lightest, but route SHARED domain types
-  (Hash, PosTable::Origin), so they need a re-export-vs-opacify decision.
+- **Lint refactored** (`5906eeeb3`): permanent leaves/exemptions
+  (ffi.{hh,cc}, disk_cache.cc, parser/, test/, lower_v3.hh, tw_baseenv.hh,
+  gc-config.hh) are now PATH-PATTERN EXEMPT (audit §5.1); the baseline file
+  holds ONLY genuine library migration targets and shrinks to EMPTY at the
+  end state.
+- **Phase 2 first slice — DONE** (`f537593c0`): added the §3.4
+  `nix::v3::ffi::forceValue(EvalState&, Value&)` shim (Option A, impl in
+  ffi.cc — the one TU that includes eval.hh) and migrated `bridge_yield.cc`
+  fully behind ffi.hh — its two cold/bridge forceValue calls route through
+  the shim, dropping `eval.hh` + `pos-idx.hh` (the shim's noPos default
+  removes the PosIdx need too).  **Baseline: 10 → 9.**
+
+**Remaining baseline = 9 genuine library targets** (the Phase 2/3 core):
+primops.cc, vm.cc, v3_call_flake.cc, run.cc, cli/v3-eval.cc,
+bytecode_primops.cc, value_serialize.cc, run.hh, vm.hh.  These need the
+eval.hh/value.hh opacity layer (forceValue/allocValue/callFunction/
+realisePath/… + FIELD accessors `state.symbols`/`positions`/`store`/
+`rootFS`) + the value-graph marshallers (treeWalkerToV3 / v3ToTreeWalker
+in primops.cc).  PERF-GATED (R1/R4): the HOT-path forceValue sites in
+vm.cc / primops.cc need the `ffi-inline.h` private-header trick + hyperfine
+≤2%/phase BEFORE adoption — the `ffi::forceValue` shim is now the
+foundation.  Lightest remaining: value_serialize.cc (hash.hh only) + run.hh
+(pos-table.hh only), but both route SHARED domain types (Hash,
+PosTable::Origin) → need a re-export-vs-opacify decision + the ffi.hh
+structure work (§3.6).
 
 **Audit correction:** §2.4 #5 ("`vm.hh:11` includes `eval-gc.hh`, could
 move to .cc-only") is **FALSE** — `vm.hh` uses `traceable_allocator`
