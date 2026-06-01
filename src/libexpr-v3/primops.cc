@@ -8675,15 +8675,21 @@ void primImport(EvalState & state, Value * args, Value & out)
                             sizeof(pathLen));
             keyBytes.append(pathStr);
             keyBytes.append(content);
-            // PARSER_PROJECT_PLAN §5.3: native-lowered CUs have different
-            // VarId numbering / bytecode than the bridge/TW path, so their
-            // disk keys MUST be namespaced — otherwise a CU written by one
-            // path could be restored by the other (silent-wrong-CU, the
-            // worst bug class).  Coarse (by flag, not per-file canLowerV3):
-            // under native-lower mode every CU — native OR bridged — uses
-            // this namespace; the only cost is a cache miss across modes.
-            if (s_nativeParser && s_nativeLower) keyBytes.append("\x01v3nl", 5);
-            diskKey = disk_cache::computeKeyForString(keyBytes);
+            // PARSER_PROJECT_PLAN §5.3: the on-disk CU cache key is the
+            // SOURCE content + path — it does NOT encode the lowerer
+            // version.  The native lowerer is an evolving dev feature, so a
+            // CU lowered by a buggy native lowerer would otherwise be
+            // restored by a later (fixed) native run — a stale silent-
+            // wrong-CU (observed: a pre-fetchurl-fix CU made qtbase.drvPath
+            // diverge on a warm cache).  So we DISABLE the CU disk cache
+            // entirely under native-lower (empty key ⇒ no lookup, no
+            // insert).  Correctness over warm-eval speed for the opt-in
+            // dev path; the SHIP-gate validation runs cold-cache anyway.
+            // RETIREMENT: re-enable with a lowerer-version component in the
+            // key when the native lowerer stabilises + becomes default.
+            if (!(s_nativeParser && s_nativeLower))
+                diskKey = disk_cache::computeKeyForString(keyBytes);
+            // else: leave diskKey empty ⇒ CU disk cache disabled.
         } catch (...) {
             // Read failure -> empty key -> cache lookup is skipped,
             // and no insert happens later.  Same fallback as before.
