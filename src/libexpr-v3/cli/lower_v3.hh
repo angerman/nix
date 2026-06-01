@@ -30,6 +30,7 @@
 #include "v3/primop.hh"
 
 #include <deque>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -49,17 +50,24 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
     case a::Kind::String:
     case a::Kind::Var:
         return true;
+    case a::Kind::Lambda: {
+        // Phase 2a: single-arg only.  Formals (Phase 2b) → bridge.
+        auto * lam = static_cast<const a::Lambda *>(n);
+        if (lam->hasFormals) return false;
+        return canLowerV3(lam->body);
+    }
     case a::Kind::Call: {
         auto * c = static_cast<const a::Call *>(n);
         if (!canLowerV3(c->fun)) return false;
         for (auto * arg : c->args) {
             if (!canLowerV3(arg)) return false;
             // Trivial-for-lazy: a non-thunked arg must be a literal /
-            // var / primop-call (no control flow that would need a
-            // lazy thunk).  Phase 2 lifts this once thunkify lands.
+            // var / lambda / primop-call (no control flow that would
+            // need a lazy thunk).  Phase 2b lifts this once thunkify
+            // lands.
             switch (arg->kind) {
             case a::Kind::Int: case a::Kind::Float: case a::Kind::String:
-            case a::Kind::Var: case a::Kind::Call: break;
+            case a::Kind::Var: case a::Kind::Lambda: case a::Kind::Call: break;
             default: return false;
             }
         }
@@ -92,8 +100,15 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
 
 struct LowererV3 {
     ir::Module m = ir::makeModule();
-    const nix::SymbolTable & symbols;  // unused in Phase 1 (names are inline in the v3 AST)
+    const nix::SymbolTable & symbols;  // unused (names are inline in the v3 AST)
     std::vector<ir::BlockId> blockStack;
+
+    /// Lexical scope stack (innermost at the back), name → VarId.  A Var
+    /// resolves against this (innermost-first); cross-function refs become
+    /// upvalues — emit's computeFreeVars derives those from the IR, so the
+    /// lowerer only needs correct VarRefs (freeVars passed empty).
+    struct Scope { std::map<std::string, ir::VarId> byName; };
+    std::vector<Scope> scopes;
 
     explicit LowererV3(const nix::SymbolTable & symbols) : symbols(symbols) {}
 
@@ -106,12 +121,16 @@ struct LowererV3 {
     void setReturn(ir::VarId v) { m.blocks[blockStack.back()].terminal = ir::TermReturn{v}; }
     ir::VarId forceVal(ir::VarId v) { return addBinding(ir::Force{v}); }
 
-    /// Phase 1 base-env Var: no lexical scope, no `with` — resolve to a
-    /// literal const / primop / builtins, else unbound error (mirrors
-    /// lower.cc::lowerVar's base-env path).
+    /// Resolve a Var: lexical scope (innermost-first) → VarRef; else the
+    /// base env (literal const / primop / builtins); else unbound error
+    /// (mirrors lower.cc::lowerVar).
     ir::VarId lowerVar(const nix::v3::ast::Var * v)
     {
         const std::string & name = v->name;
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            auto f = it->byName.find(name);
+            if (f != it->byName.end()) return addBinding(ir::VarRef{f->second});
+        }
         if (name == "true")  return addBinding(ir::LitBool{true});
         if (name == "false") return addBinding(ir::LitBool{false});
         if (name == "null")  return addBinding(ir::LitNull{});
@@ -146,6 +165,8 @@ struct LowererV3 {
         }
         case a::Kind::Var:
             return lowerVar(static_cast<const a::Var *>(n));
+        case a::Kind::Lambda:
+            return lowerLambda(static_cast<const a::Lambda *>(n));
 
         case a::Kind::Call: {
             auto * c = static_cast<const a::Call *>(n);
@@ -193,6 +214,34 @@ struct LowererV3 {
             throw std::runtime_error("v3 native lower: Phase-1-unsupported kind "
                                      + std::to_string((int) n->kind));
         }
+    }
+
+    /// Phase 2a: single-arg lambda (no formals — canLowerV3 rejects
+    /// those).  Sub-func with the param bound by name; body lowered in
+    /// its own scope/block; emit computes upvalues.  No intrinsics
+    /// (Phase 4) — a single-arg lambda with no `let`/attrs body can't
+    /// form a Fix/Extends/Compose shape, so intrinsicKind=0 is correct.
+    ir::VarId lowerLambda(const nix::v3::ast::Lambda * lam)
+    {
+        m.functions.emplace_back();
+        ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
+        auto entry = m.freshBlock();
+        ir::VarId param = m.freshVar();
+        m.functions[fid].entryBlock = entry;
+        m.functions[fid].paramVar   = param;
+        m.functions[fid].argName    = m.internSymbol(lam->arg);
+        m.functions[fid].name       = lam->arg;
+
+        Scope inner;
+        inner.byName.emplace(lam->arg, param);
+        scopes.push_back(std::move(inner));
+        blockStack.push_back(entry);
+        ir::VarId rv = lowerExpr(lam->body);
+        setReturn(rv);
+        blockStack.pop_back();
+        scopes.pop_back();
+
+        return addBinding(ir::Lambda{fid, /*freeVars*/ {}, /*lexicalWiths*/ {}});
     }
 
     ir::Module run(const nix::v3::ast::Node * e)
