@@ -46,10 +46,12 @@ inline bool canLowerV3(const nix::v3::ast::Node * n);
 inline bool canLowerAttrDefs(const nix::v3::ast::Attrs * at)
 {
     namespace a = nix::v3::ast;
+    // Phase 4a: Plain + Inherited.  InheritedFrom (→ inheritFromExprs)
+    // is Phase 4b; dynamic keys are Phase 4c → bridge those.
     if (!at->inheritFromExprs.empty() || !at->dynamicAttrs.empty()) return false;
     for (auto & d : at->attrs) {
-        if (d.kind != a::Attrs::AttrKind::Plain) return false;
-        if (!canLowerV3(d.value)) return false;
+        if (d.kind == a::Attrs::AttrKind::InheritedFrom) return false;
+        if (d.kind == a::Attrs::AttrKind::Plain && !canLowerV3(d.value)) return false;
     }
     return true;
 }
@@ -181,9 +183,10 @@ struct LowererV3 {
     /// Resolve a Var: lexical scope (innermost-first) → VarRef; else the
     /// base env (literal const / primop / builtins); else unbound error
     /// (mirrors lower.cc::lowerVar).
-    ir::VarId lowerVar(const nix::v3::ast::Var * v)
+    ir::VarId lowerVar(const nix::v3::ast::Var * v) { return lowerVarByName(v->name); }
+
+    ir::VarId lowerVarByName(const std::string & name)
     {
-        const std::string & name = v->name;
         for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
             auto f = it->byName.find(name);
             if (f == it->byName.end()) continue;
@@ -480,9 +483,15 @@ struct LowererV3 {
             m.functions[fid].name = d->name;
             fids.push_back(fid);
             blockStack.push_back(eb);
-            scopes.push_back(recScope);
-            setReturn(lowerExpr(d->value));
-            scopes.pop_back();
+            if (d->kind == nix::v3::ast::Attrs::AttrKind::Inherited) {
+                // `inherit x;` binds x to the PARENT-scope x (not the rec
+                // slot) — lower the var WITHOUT the rec scope pushed.
+                setReturn(lowerVarByName(d->name));
+            } else {  // Plain (InheritedFrom is Phase 4b)
+                scopes.push_back(recScope);
+                setReturn(lowerExpr(d->value));
+                scopes.pop_back();
+            }
             blockStack.pop_back();
         }
 
@@ -525,7 +534,10 @@ struct LowererV3 {
         for (auto & d : e->attrs) {
             ir::AttrSet::Entry en;
             en.name = m.internSymbol(d.name);
-            en.value = thunkifyForAttr(d.value);
+            // `inherit x;` (non-rec) → the parent-scope x, eager (a ref).
+            en.value = (d.kind == nix::v3::ast::Attrs::AttrKind::Inherited)
+                ? lowerVarByName(d.name)
+                : thunkifyForAttr(d.value);
             as.entries.push_back(std::move(en));
         }
         return addBinding(std::move(as));
