@@ -337,6 +337,23 @@ test(
   v3_evalscope_handles,
 )
 
+# Parser project Stage 1.1 (PARSER_PROJECT_PLAN_2026-06-01) — v3 AST
+# show() byte-equality with TW.  Standalone (header-only AST; no
+# libnixexprv3 link needed) — only the include dir is required.
+# Asserts the v3 AST reproduces nix::Expr::show() for the operator
+# core, locked to the parser-TI precedence-battery goldens.
+v3_ast_show_test = executable(
+  'v3-ast-show-test',
+  'test/ast-show-test.cc',
+  include_directories : include_dirs,
+  install : false,
+)
+
+test(
+  'v3-ast-show-test',
+  v3_ast_show_test,
+)
+
 # #545: bench-harness self-tests.  Pure Python; loads workloads.toml,
 # exercises filtering / stats / JSON / baseline-diff, and runs a tiny
 # `nix eval` smoke test under TW + v3-direct.  Validates the

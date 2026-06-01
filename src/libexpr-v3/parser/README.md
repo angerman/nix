@@ -47,6 +47,66 @@
 
 `src/libexpr-v3/meson.build` adds `custom_target` rules mirroring `src/libexpr/meson.build` for the bison + flex outputs.  Both Bison and Flex tools come from the existing flake.nix devShell.
 
+## Stage 1.1 status — v3 AST (operator core landed)
+
+`include/v3/ast/expr.hh` holds the v3-owned AST.  First cut (commit
+landing this) implements the OPERATOR CORE + literals + lambda /
+call / select / hasattr, validated by `test/ast-show-test.cc`
+(16/16 show() checks byte-equal to the precedence-battery goldens).
+
+### The `show()` contract (from `nixexpr.cc:26-262` + MakeBinOp)
+
+Every node's `show()` must reproduce TW byte-for-byte.  Reference:
+
+| Node | show() format |
+|---|---|
+| `Int` | `<n>` |
+| `Float` | `<f>` (default ostream double — verify formatting) |
+| `String` | `printLiteralString` (escaped, quoted) |
+| `Path` | `<pathStrView>` |
+| `Var` | `<name>` |
+| `Select` | `(<e>).<path>` then ` or (<def>)` if default |
+| `OpHasAttr` | `((<e>) ? <path>)` |
+| `Attrs` | `[rec ]{ <bindings> }` — bindings sorted by symbol; `inherit`/`inherit (e)` groups first, then `k = v; `, then dynamic `"${e}" = v; ` |
+| `List` | `[ (<e1>) (<e2>) ... ]` (each elem parenthesized) |
+| `Lambda` simple | `(<arg>: <body>)` |
+| `Lambda` formals | `({ a, b ? d, ... }[ @ arg]: <body>)` — formals LEXICOGRAPHIC |
+| `Call` | `(<fun> <a1> <a2> ...)` |
+| `Let` | `(let <bindings>in <body>)` |
+| `With` | `(with <attrs>; <body>)` |
+| `If` | `(if <c> then <t> else <e>)` |
+| `Assert` | `assert <c>; <body>` (NOTE: no outer parens) |
+| `OpNot` | `(! <e>)` |
+| `ConcatStrings` (`+`) | `(<e1> + <e2> + ...)` |
+| `BinOp` (==,!=,&&,\|\|,->,//,++) | `(<e1> <op> <e2>)` |
+| `Pos` (`__curPos`) | `__curPos` |
+
+### Parser-action desugarings (locked by the precedence battery)
+
+| Surface | AST |
+|---|---|
+| `a * b` | `Call(Var "__mul", [a, b])` |
+| `a / b` | `Call(Var "__div", [a, b])` |
+| `a - b` | `Call(Var "__sub", [a, b])` |
+| `-a` | `Call(Var "__sub", [Int 0, a])` |
+| `a < b` | `Call(Var "__lessThan", [a, b])` |
+| `a > b` | `Call(Var "__lessThan", [b, a])` (swapped) |
+| `a <= b` | `OpNot(Call(Var "__lessThan", [b, a]))` |
+| `a >= b` | `OpNot(Call(Var "__lessThan", [a, b]))` |
+| `a + b` | `ConcatStrings([a, b])` |
+
+These come from `parser.y` actions (lines 298-313).  The v3 parser
+actions (Stage 1.4) must emit the SAME desugarings.
+
+### Stage 1.1 remaining (follow-ups before action rewrite)
+
+Node kinds still to add to `expr.hh` + `ast-show-test.cc`:
+Float, String (+ printLiteralString), Path, InheritFrom, Attrs
+(+ showBindings — the most complex: sorted, inherit groups, dynamic
+attrs), List, Let, With, If, Assert, Pos, OpConcatLists already
+covered by BinOp.  Plus the symbol-table interning decision
+(Stage 1.2 ParserState) — currently names are inline std::string.
+
 ## How to inspect upstream actions
 
 Look at `parser.y` lines 222-680 — every production has a `{ ... }` action block.  Each action does some combination of:
