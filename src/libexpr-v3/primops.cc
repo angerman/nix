@@ -10109,9 +10109,36 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     }
     wrapped += "in (\n" + src + "\n)";
 
-    nix::Expr * wrapper = ns.parseExprFromString(wrapped, sp.parent());
+    // PARSER_PROJECT_PLAN §5.3 site 3: native-parse+lower the synthetic
+    // scopedImport wrapper when gated (canLowerV3 bridge fallback).  The
+    // wrapper's relative-path literals (inside `src`) resolve against the
+    // imported file's directory, matching parseExprFromString(.., sp.parent()).
+    static const bool s_siNativeParser = std::getenv("NIX_V3_NATIVE_PARSER") != nullptr;
+    static const bool s_siNativeLower  = std::getenv("NIX_V3_NATIVE_LOWER") != nullptr;
+    static const std::string s_siHome  = nix::getHome().string();
+    nix::Expr * wrapper = nullptr;
+    bool siNativeLower = false;
+    nix::v3::ast::ParserState siSt;
+    std::optional<nix::PosTable::Origin> siOrigin;
+    if (s_siNativeParser) {
+        if (auto par = sp.path.parent()) siSt.basePath = par->abs();  // file's dir
+        siSt.homePath = s_siHome;
+        nix::v3::parser::parseString(siSt, wrapped);
+        auto srcRef = nix::make_ref<std::string>(wrapped);
+        auto origin = ns.positions.addOrigin(nix::Pos::String{.source = srcRef}, srcRef->size());
+        if (s_siNativeLower && nix::v3::canLowerV3(siSt.result)) {
+            siNativeLower = true;
+            siOrigin.emplace(origin);
+        } else
+            wrapper = nix::v3::toNixExpr(ns, siSt.result, origin);
+    } else
+        wrapper = ns.parseExprFromString(wrapped, sp.parent());
+    if (wrapper) wrapper->bindVars(ns, ns.staticBaseEnv);
 
-    auto module = lowerNixExpr(wrapper, ns.symbols, ns.positions);
+    auto module = siNativeLower
+        ? nix::v3::lowerV3Ast(ns.symbols, siSt.result, &ns.positions, *siOrigin,
+                              &nix::v3::twBaseEnvGlobals(ns))
+        : lowerNixExpr(wrapper, ns.symbols, ns.positions);
     nix::v3::ir::optimise(module);
     nix::v3::ir::computeFreeVars(module);
     auto & cache = importCache();
