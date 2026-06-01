@@ -1564,4 +1564,14 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
     return runRootExprModule(state, std::move(module));
 }
 
+// Synthetic-source overload (no path literals): build a Pos::String
+// origin here so callers (the bytecode-primop installer) needn't touch
+// eval.hh / parser / position headers.
+RootResult runRootExprFromString(nix::EvalState & state, const std::string & source)
+{
+    auto origin = state.positions.addOrigin(
+        nix::Pos::String{.source = nix::make_ref<std::string>(source)}, source.size());
+    return runRootExprFromString(state, source, /*basePath*/ "", /*homePath*/ "", origin);
+}
+
 } // namespace nix::v3

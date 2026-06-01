@@ -13,16 +13,12 @@
 #include "v3/primop.hh"
 #include "v3/ir.hh"
 #include "v3/alloc.hh"
-
-#include "nix/expr/eval.hh"
-#include "nix/util/source-path.hh"
-
-// PARSER_PROJECT_PLAN §5.3 site 5: native parse+lower the bytecode-primop
-// wrapper sources (so lowerNixExpr can be retired).  After the nix headers
-// — lower_v3.hh needs nix::SymbolTable.
-#include "v3-parse-api.hh"   // nix::v3::parser::parseString
-#include "lower_v3.hh"       // canLowerV3 + lowerV3Ast
-#include "v3/tw_baseenv.hh"  // twBaseEnvGlobals
+// PARSER_PROJECT_PLAN §5.3 site 5: the wrapper sources are parsed+lowered+
+// run via runRootExprFromString (run.hh), and the TW-builtin install goes
+// through ffi::setTreeWalkerBuiltin — so no direct TW / parser / position
+// headers here.  ffi.hh provides the ffi shims + the nix::Value /
+// nix::EvalState forward-decls (for the v3ToTreeWalkerPublic decl + param).
+#include "v3/ffi.hh"
 
 // Forward declaration: defined in vm.cc.
 namespace nix::v3 {
@@ -172,28 +168,16 @@ void installBytecodePrimop(
         std::fprintf(stderr, "v3 bytecode-primop install: %s\n",
                      primopName.c_str());
 
-    // §5.3 site 5: native-parse + lower the wrapper source (no nix::Expr).
-    // These sources are fixed internal expressions (lambdas + `builtins.X`)
-    // — canLowerV3 accepts them; they carry no relative/home path literals.
-    // Run via the v3 pipeline.  The inner `installAllBytecodePrimops` call
-    // would re-enter here, so we guard with `tl_installInProgress`.
-    nix::v3::ast::ParserState v3st;
-    nix::v3::parser::parseString(v3st, nixSource);
-    if (!nix::v3::canLowerV3(v3st.result))
-        throw std::runtime_error(
-            "installBytecodePrimop: native lowering rejected source for '"
-            + primopName + "'");
-    nix::v3::registerBuiltinPrimOps();  // before lowering (lower-time findPrimOp)
-    auto module = nix::v3::lowerV3Ast(state.symbols, v3st.result,
-        &state.positions,
-        state.positions.addOrigin(
-            nix::Pos::String{.source = nix::make_ref<std::string>(nixSource)},
-            nixSource.size()),
-        &nix::v3::twBaseEnvGlobals(state));
-
+    // §5.3 site 5: native parse+lower+run the wrapper source (no nix::Expr).
+    // These are fixed internal expressions (lambdas + `builtins.X`, no path
+    // literals) — routed through the single synthetic-source entry
+    // `runRootExprFromString`, which owns the parse + canLowerV3 + lower
+    // plumbing, so this file needs no TW / parser / position headers.
+    // The inner `installAllBytecodePrimops` call would re-enter here, so we
+    // guard with `tl_installInProgress`.
     bool wasInProgress = tl_installInProgress;
     tl_installInProgress = true;
-    RootResult rr = runRootExprModule(state, std::move(module));
+    RootResult rr = runRootExprFromString(state, nixSource);
     tl_installInProgress = wasInProgress;
 
     // The compiled top-level expression must be a Closure (the lambda
@@ -305,8 +289,7 @@ void installBytecodePrimop(
         // path 2 + path 3 still installs the v3-side replacement,
         // which is all v3-direct needs.
         try {
-            nix::Value & target = state.getBuiltin(primopName);
-            target = *bridged;
+            nix::v3::ffi::setTreeWalkerBuiltin(state, primopName, bridged);
         } catch (const std::exception & e) {
             if (dbgEnabled())
                 std::fprintf(stderr,

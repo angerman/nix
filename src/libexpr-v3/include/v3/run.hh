@@ -80,4 +80,10 @@ RootResult runRootExprFromString(EvalState & state, const std::string & source,
                                  const std::string & basePath, const std::string & homePath,
                                  PosTable::Origin origin);
 
+/// Convenience overload for SYNTHETIC sources (no relative/`~` path
+/// literals) — e.g. the bytecode-primop wrapper installer.  Builds a
+/// Pos::String origin internally + empty base/home, so the caller needs
+/// no eval.hh / parser / position headers — just run.hh.
+RootResult runRootExprFromString(EvalState & state, const std::string & source);
+
 } // namespace nix::v3

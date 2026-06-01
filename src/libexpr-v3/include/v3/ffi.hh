@@ -98,6 +98,12 @@ namespace ffi {
 /// bridge-path convenience over `state.forceValue(v, nix::noPos)`.
 void forceValue(nix::EvalState & state, nix::Value & v);
 
+/// Overwrite the host `builtins.<name>` slot with `*value` (the
+/// bytecode-primop installer's path-1: make TW dispatch see v3's wrapper).
+/// Throws (like `state.getBuiltin`) when `name` isn't a registered
+/// builtin.  Startup-only / cold.
+void setTreeWalkerBuiltin(nix::EvalState & state, const std::string & name, nix::Value * value);
+
 }  // namespace ffi
 
 // =========================================================================

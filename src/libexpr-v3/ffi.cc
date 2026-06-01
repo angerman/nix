@@ -53,6 +53,11 @@ void forceValue(nix::EvalState & state, nix::Value & v)
     state.forceValue(v, nix::noPos);
 }
 
+void setTreeWalkerBuiltin(nix::EvalState & state, const std::string & name, nix::Value * value)
+{
+    state.getBuiltin(name) = *value;  // throws if `name` isn't a builtin
+}
+
 }  // namespace ffi
 
 // ---------------------------------------------------------------------------
