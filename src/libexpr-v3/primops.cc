@@ -2839,35 +2839,36 @@ void primTrace(EvalState & state, Value * args, Value & out)
     else if (v.isBool()) std::fprintf(stderr, "trace: %s\n", v.payload.i == 1 ? "true" : "false");
     else if (v.isNull()) std::fprintf(stderr, "trace: null\n");
     else if (v.isPath()) std::fprintf(stderr, "trace: %s\n", v.payload.path);
-    else if (state.nixEvalState) {
-        // §1.6 follow-up: route through tree-walker's ValuePrinter so
-        // trace output matches TW byte-for-byte (preserves «thunk» /
-        // <LAMBDA> / <PRIMOP> shape markers + cycle detection that
-        // valueToJson loses by force-everything-deeply).
+    else {
+        // FFI_KILL_TODO T1.3 (2026-06-01): v3-native trace printer.
+        //
+        // Was: routed through `v3ToTreeWalkerPublic` + `nix::ValuePrinter`
+        // for shape-preserving output (preserves «thunk» / <LAMBDA> /
+        // <PRIMOP> markers + cycle detection).
+        //
+        // Now: v3 has `printNixValueRich` (print.cc:514+) which produces
+        // byte-equal output to TW's ValuePrinter — same shape markers,
+        // same cycle handling, same derivation compact form.  Eliminates
+        // the v3→TW bridge for trace.
+        //
+        // Falls back to valueToJson if rich printer throws (unexpected;
+        // rich printer is non-throwing by design but defensive).
         try {
-            nix::Value * tw = v3ToTreeWalkerPublic(*state.nixEvalState, v);
-            if (tw) {
-                std::stringstream ss;
-                ss << nix::ValuePrinter(*state.nixEvalState, *tw);
-                std::fprintf(stderr, "trace: %s\n", ss.str().c_str());
-            } else {
-                std::fprintf(stderr, "trace: <complex value>\n");
-            }
+            std::stringstream ss;
+            auto & symTab = ir::globalSymbolTable();
+            std::set<const void *> seen;
+            // Use the no-VM overload (Closure/Thunk print as <LAMBDA>/
+            // «thunk» tokens without forcing — same as TW's lazy print).
+            printNixValueRich(ss, v, symTab, seen);
+            std::fprintf(stderr, "trace: %s\n", ss.str().c_str());
         } catch (...) {
-            // Fallback: best-effort JSON dump if the bridge fails.
+            // Fallback: best-effort JSON dump if the rich printer fails.
             try {
                 auto j = valueToJson(state, v);
                 std::fprintf(stderr, "trace: %s\n", j.dump().c_str());
             } catch (...) {
                 std::fprintf(stderr, "trace: <complex value>\n");
             }
-        }
-    } else {
-        try {
-            auto j = valueToJson(state, v);
-            std::fprintf(stderr, "trace: %s\n", j.dump().c_str());
-        } catch (...) {
-            std::fprintf(stderr, "trace: <complex value>\n");
         }
     }
     out = args[1];
@@ -3627,17 +3628,20 @@ void primReadDir(EvalState & state, Value * args, Value & out)
         if (ctxEntries && !ctxEntries->empty() && state.nixEvalState) {
             ++allocStats().ifdProbeWithCtx[kIfdReadDir];
             auto & ns = *state.nixEvalState;
-            ++allocStats().v3ToTwBySite[4];  // #795 primReadDir string-with-ctx
-            nix::Value * tw = v3ToTreeWalker(state, args[0]);
-            if (!tw) {
-                path = args[0].payload.str;
-            } else {
-                try {
-                    auto resolved = ns.realisePath(nix::noPos, *tw);
-                    path = resolved.path.abs();
-                } catch (...) {
-                    throw;  // surface TW's error verbatim
-                }
+            // FFI_KILL_TODO T1.3-class strict-leaf (2026-06-01): inline
+            // TW Value alloc + mkString for the string-with-ctx case.
+            // Avoids v3ToTreeWalker full-recursion when we know the
+            // value is a string + decoded context.  See primImport's
+            // identical pattern at primops.cc:~8200 + the v3-native
+            // outPath path right below for primReadDir attrset case.
+            nix::Value * tw = ns.allocValue();
+            nix::NixStringContext twCtx = decodeStringContext(*ctxEntries);
+            tw->mkString(args[0].payload.str, twCtx, ns.mem);
+            try {
+                auto resolved = ns.realisePath(nix::noPos, *tw);
+                path = resolved.path.abs();
+            } catch (...) {
+                throw;  // surface TW's error verbatim
             }
         } else {
             path = args[0].payload.str;
