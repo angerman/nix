@@ -19,8 +19,9 @@
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
 #include "v3/ir.hh"
-#include "v3/lower.hh"
 #include "v3/vm.hh"
+#include "nix/util/users.hh"            // getHome() for the parser's ~/x
+#include "nix/util/file-descriptor.hh"  // drainFD (stdin)
 
 #include <nlohmann/json.hpp>
 
@@ -88,31 +89,41 @@ static bool runV3DirectEval(
     // access is resolved against the static type at the call site).
     std::string attrPath = installable.what();  // e.g. "lib.fix" or "" for root.
 
-    // Re-parse the expression directly.  Same logic as
-    // libcmd/installables.cc:464-474 but writing to a v3 path instead
-    // of `state.eval`.
-    Expr * e;
+    // PARSER_PROJECT_PLAN §5.3: acquire the raw `.nix` source + its
+    // PosTable::Origin, then native parse+lower+run — NO nix::Expr.
+    // Relative (`./x`) / home (`~/x`) path literals resolve against the
+    // file's dir / $HOME (as TW's parseExprFromFile/String does); the
+    // origin makes positions byte-match TW.
+    std::string v3src, v3base;
+    std::optional<nix::PosTable::Origin> v3origin;  // const members → no copy-assign
     if (cmd.file) {
         if (*cmd.file == "-") {
-            e = state.parseStdin();
+            v3src = nix::drainFD(STDIN_FILENO);
+            v3base = absPath(cmd.getCommandBaseDir()).string();
+            v3origin.emplace(state.positions.addOrigin(
+                nix::Pos::Stdin{.source = nix::make_ref<std::string>(v3src)}, v3src.size()));
         } else {
             auto dir = absPath(cmd.getCommandBaseDir());
-            e = state.parseExprFromFile(
-                lookupFileArg(state, cmd.file->string(), &dir));
+            nix::SourcePath sp = lookupFileArg(state, cmd.file->string(), &dir);
+            v3src = sp.resolveSymlinks().readFile();
+            if (auto par = sp.path.parent()) v3base = par->abs();
+            v3origin.emplace(state.positions.addOrigin(nix::Pos::Origin(sp), v3src.size()));
         }
     } else {
-        auto dir = absPath(cmd.getCommandBaseDir());
-        e = state.parseExprFromString(*cmd.expr, state.rootPath(dir.string()));
+        v3base = absPath(cmd.getCommandBaseDir()).string();
+        v3src = *cmd.expr;
+        v3origin.emplace(state.positions.addOrigin(
+            nix::Pos::String{.source = nix::make_ref<std::string>(v3src)}, v3src.size()));
     }
-    e->bindVars(state, state.staticBaseEnv);
 
     // Run v3 pipeline.  Returns (cu, value) — keep cu alive for the
     // lifetime of the value (string / path payloads point into
     // cu->stringConstants).  setNixEvalState is wired internally;
     // primops that need TW (import, derivation strict-merge) reach
     // back via the global pointer.
-    nix::evalTrace::mark("eval.cc:100 runRootExpr(root)");
-    auto rootResult = v3::runRootExpr(state, e);
+    nix::evalTrace::mark("eval.cc:100 runRootExprFromString(root)");
+    auto rootResult = v3::runRootExprFromString(
+        state, v3src, v3base, nix::getHome().string(), *v3origin);
     v3::Value r = rootResult.value;
 
     // Set up a VMState for further forcing / callClosure work.  STG-10
@@ -167,11 +178,11 @@ static bool runV3DirectEval(
     std::optional<v3::RootResult> applyResult;
     if (apply) {
         auto dir = absPath(cmd.getCommandBaseDir());
-        Expr * applyE = state.parseExprFromString(
-            *apply, state.rootPath(dir.string()));
-        applyE->bindVars(state, state.staticBaseEnv);
-        nix::evalTrace::mark("eval.cc:156 runRootExpr(--apply)");
-        applyResult.emplace(v3::runRootExpr(state, applyE));
+        auto applyOrigin = state.positions.addOrigin(
+            nix::Pos::String{.source = nix::make_ref<std::string>(*apply)}, apply->size());
+        nix::evalTrace::mark("eval.cc:156 runRootExprFromString(--apply)");
+        applyResult.emplace(v3::runRootExprFromString(
+            state, *apply, dir.string(), nix::getHome().string(), applyOrigin));
         nix::evalTrace::mark("eval.cc:157 forceValue(--apply fn)");
         v3::Value applyV = v3::forceValue(vm, applyResult->value);
         r = v3::callClosure(vm, applyV, r);

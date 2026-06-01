@@ -18,6 +18,13 @@
 #include "nix/expr/nixexpr.hh"
 #include "nix/util/source-path.hh"
 
+// PARSER_PROJECT_PLAN §5.3 site 5: native parse+lower the bytecode-primop
+// wrapper sources (so lowerNixExpr can be retired).  After the nix headers
+// — lower_v3.hh needs nix::SymbolTable.
+#include "v3-parse-api.hh"   // nix::v3::parser::parseString
+#include "lower_v3.hh"       // canLowerV3 + lowerV3Ast
+#include "v3/tw_baseenv.hh"  // twBaseEnvGlobals
+
 // Forward declaration: defined in vm.cc.
 namespace nix::v3 {
 Value getBuiltinsValue() noexcept;
@@ -166,17 +173,28 @@ void installBytecodePrimop(
         std::fprintf(stderr, "v3 bytecode-primop install: %s\n",
                      primopName.c_str());
 
-    // Parse + bind-vars (parseExprFromString applies bindVars against
-    // staticBaseEnv automatically, so `builtins.length` etc. in the
-    // source resolves correctly to TW's pre-registered primops).
-    nix::Expr * expr = state.parseExprFromString(
-        nixSource, state.rootPath("."));
+    // §5.3 site 5: native-parse + lower the wrapper source (no nix::Expr).
+    // These sources are fixed internal expressions (lambdas + `builtins.X`)
+    // — canLowerV3 accepts them; they carry no relative/home path literals.
+    // Run via the v3 pipeline.  The inner `installAllBytecodePrimops` call
+    // would re-enter here, so we guard with `tl_installInProgress`.
+    nix::v3::ast::ParserState v3st;
+    nix::v3::parser::parseString(v3st, nixSource);
+    if (!nix::v3::canLowerV3(v3st.result))
+        throw std::runtime_error(
+            "installBytecodePrimop: native lowering rejected source for '"
+            + primopName + "'");
+    nix::v3::registerBuiltinPrimOps();  // before lowering (lower-time findPrimOp)
+    auto module = nix::v3::lowerV3Ast(state.symbols, v3st.result,
+        &state.positions,
+        state.positions.addOrigin(
+            nix::Pos::String{.source = nix::make_ref<std::string>(nixSource)},
+            nixSource.size()),
+        &nix::v3::twBaseEnvGlobals(state));
 
-    // Run via the v3 pipeline.  The inner `installAllBytecodePrimops`
-    // call would re-enter here, so we guard with `tl_installInProgress`.
     bool wasInProgress = tl_installInProgress;
     tl_installInProgress = true;
-    RootResult rr = runRootExpr(state, expr);
+    RootResult rr = runRootExprModule(state, std::move(module));
     tl_installInProgress = wasInProgress;
 
     // The compiled top-level expression must be a Closure (the lambda

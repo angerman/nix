@@ -33,6 +33,12 @@
 
 #include "nix/expr/config.hh"
 
+// PARSER_PROJECT_PLAN §5.3: the native parse+lower+run entry, so the
+// `nix` binary's CLI (src/nix/eval.cc) needn't pull parser/cli headers.
+#include "v3-parse-api.hh"   // nix::v3::parser::parseString
+#include "lower_v3.hh"       // canLowerV3 + lowerV3Ast
+#include "v3/tw_baseenv.hh"  // twBaseEnvGlobals
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -1546,6 +1552,30 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
 {
     registerBuiltinPrimOps();
     return runRootExprModule(state, lowerNixExpr(e, state.symbols, state.positions));
+}
+
+// PARSER_PROJECT_PLAN §5.3: native parse+lower+run from raw `.nix` source
+// — NO nix::Expr.  The single library entry the CLI (src/nix/eval.cc) and
+// any other top-level caller use, so they needn't pull the parser/cli
+// headers.  `basePath`/`homePath` resolve relative/`~` path literals (as
+// TW's parseExprFromFile/String does); `origin` is the source's
+// PosTable::Origin (Pos::Origin(sp) / Pos::String / Pos::Stdin) so
+// positions match TW.  canLowerV3 is total for parser-produced ASTs, so
+// the throw is a should-never-fire guard.
+RootResult runRootExprFromString(nix::EvalState & state, const std::string & source,
+                                 const std::string & basePath, const std::string & homePath,
+                                 nix::PosTable::Origin origin)
+{
+    registerBuiltinPrimOps();  // before lowering (lower-time findPrimOp)
+    nix::v3::ast::ParserState st;
+    st.basePath = basePath;
+    st.homePath = homePath;
+    nix::v3::parser::parseString(st, source);
+    if (!canLowerV3(st.result))
+        throw nix::Error("v3: native lowering cannot handle this expression");
+    auto module = lowerV3Ast(state.symbols, st.result, &state.positions, origin,
+                             &twBaseEnvGlobals(state));
+    return runRootExprModule(state, std::move(module));
 }
 
 } // namespace nix::v3

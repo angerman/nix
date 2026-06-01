@@ -16,8 +16,10 @@
 /// SPDX-License-Identifier: Apache-2.0
 #include "v3/value.hh"
 #include "v3/bytecode.hh"
+#include "nix/util/pos-table.hh"  // PosTable::Origin (runRootExprFromString)
 
 #include <memory>
+#include <string>
 
 namespace nix {
 struct Expr;
@@ -69,5 +71,15 @@ RootResult runRootExpr(EvalState & state, Expr * e);
 /// runRootExpr.  registerBuiltinPrimOps() must have run before lowering
 /// (lower-time findPrimOp); this repeats the idempotent setup.
 RootResult runRootExprModule(EvalState & state, ir::Module module);
+
+/// Native parse+lower+run from raw `.nix` source (no nix::Expr) — the
+/// top-level entry for the CLI + any caller that has source text.
+/// `basePath`/`homePath` resolve relative / `~` path literals; `origin`
+/// is the source's PosTable::Origin (from state.positions.addOrigin) so
+/// positions match TW.  Throws on a (provably-impossible for parsed
+/// source) canLowerV3 miss.
+RootResult runRootExprFromString(EvalState & state, const std::string & source,
+                                 const std::string & basePath, const std::string & homePath,
+                                 PosTable::Origin origin);
 
 } // namespace nix::v3
