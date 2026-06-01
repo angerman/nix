@@ -342,7 +342,7 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     "primDerivationStrict_TWfb","primV3CallBridge1",
                     "FFI_leaves(fetch/path)",  "v3ToTW_eager_struct",
                     "primTrace",               "primV3ForceAttr_inner",
-                    "primV3ForceListElem_inner","site_13",
+                    "dead_slot_12_was_BP3_force_list_elem","site_13",
                     "site_14",                 "unattributed_other",
                 };
                 std::fprintf(stderr,
@@ -1207,7 +1207,7 @@ RootResult runRootExpr(nix::EvalState & state, nix::Expr * e)
                     "v3ToTW_eager_struct",      // 9
                     "primTrace",                // 10
                     "primV3ForceAttr_inner",    // 11
-                    "primV3ForceListElem_inner",// 12
+                    "dead_slot_12_was_BP3_force_list_elem",// 12
                     "site_13",                  // 13
                     "site_14",                  // 14
                     "unattributed_other",       // 15
