@@ -15,7 +15,6 @@
 #include "v3/alloc.hh"
 
 #include "nix/expr/eval.hh"
-#include "nix/expr/nixexpr.hh"
 #include "nix/util/source-path.hh"
 
 // PARSER_PROJECT_PLAN §5.3 site 5: native parse+lower the bytecode-primop

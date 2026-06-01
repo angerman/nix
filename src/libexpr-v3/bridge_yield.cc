@@ -6,8 +6,7 @@
 
 #include "v3/bridge_yield.hh"
 
-#include "nix/expr/eval.hh"
-#include "nix/expr/value.hh"
+#include "nix/expr/eval.hh"  // EvalState::forceValue + (transitively) nix::Value
 #include "nix/util/pos-idx.hh"
 
 namespace nix::v3 {

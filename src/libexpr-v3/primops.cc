@@ -50,7 +50,6 @@
 # include <mach/task.h>
 #endif
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/print.hh"
 #include "v3/print.hh"  // #760: v3 printNixValue for toStringCoerceCtx error text
 #include "v3/value_serialize.hh"  // #741 Phase 1: derivation-result round-trip test
 #include "nix/expr/value/context.hh"
