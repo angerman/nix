@@ -39,6 +39,16 @@
 #include <string>
 #include <vector>
 
+// The Kind-dispatch switches below intentionally use `default:` for the
+// internal/never-in-source kinds (Unknown/InheritFrom/BlackHole) and the
+// not-yet-native kinds.  Silence -Wswitch-enum (we keep -Wswitch) so this
+// header is self-sufficient when included outside the parser TU (e.g. the
+// native import path in primops.cc, which doesn't pull in the bison
+// header that previously suppressed this project-wide).  Balanced pop at
+// end of file.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
+
 namespace nix::v3 {
 
 inline bool canLowerV3(const nix::v3::ast::Node * n);
@@ -910,3 +920,5 @@ inline ir::Module lowerV3Ast(const nix::SymbolTable & symbols, const nix::v3::as
 }
 
 } // namespace nix::v3
+
+#pragma GCC diagnostic pop  // -Wswitch-enum (balanced with push at top)

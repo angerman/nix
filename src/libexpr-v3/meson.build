@@ -169,12 +169,51 @@ lib_sources = files(
   'heap_trace.cc',
 )
 
+# v3-native parser bison/flex outputs (parser/v3-parser.{y,l}).  Defined
+# BEFORE this_library so the library can link the parser (PARSER_PROJECT_
+# PLAN §5.3 — the import/flake parse sites in primops.cc / v3_call_flake.cc
+# / bytecode_primops.cc parse `.nix` natively).
+v3_parser_tab = custom_target(
+  'v3-parser-tab',
+  input : 'parser/v3-parser.y',
+  output : ['v3-parser-tab.cc', 'v3-parser-tab.hh'],
+  command : ['bison', '-o', '@OUTPUT0@', '@INPUT@', '-d'],
+)
+v3_parser_lex = custom_target(
+  'v3-parser-lex',
+  input : ['parser/v3-parser.l', v3_parser_tab],
+  output : ['v3-parser-lex.cc', 'v3-parser-lex.hh'],
+  command : ['flex', '--outfile', '@OUTPUT0@', '--header-file=@OUTPUT1@', '@INPUT0@'],
+)
+
+# Standalone parser library: the generated flex/bison sources + the
+# public parse-API (parser/v3-parse-api.cc).  unity=off because unity
+# builds break the recursive flex/bison generated-header dependency
+# (mirrors src/libexpr meson.build).  Linked into both this_library (for
+# the native import path) and the parser CLIs (v3-eval / v3-parse /
+# v3-parser-test) — one copy of the glue, no duplicate symbols.
+v3_parser_lib = static_library(
+  'v3-parser',
+  'parser/v3-parse-api.cc',
+  v3_parser_tab,
+  v3_parser_lex,
+  dependencies : deps_public + deps_private + deps_other,
+  include_directories : [ include_dirs, include_directories('parser') ],
+  override_options : ['unity=off'],
+  install : false,
+)
+
 this_library = library(
   'nixexprv3',
   lib_sources,
   generated_headers,  # #698: call-flake.nix.gen.hh
   dependencies : deps_public + deps_private + deps_other,
-  include_directories : include_dirs,
+  include_directories : [ include_dirs, include_directories('parser') ],
+  # link_whole (not link_with): pull the ENTIRE parser static lib into the
+  # dylib so parseString + the flex/bison glue are exported even before
+  # the in-library import-path call sites reference them (otherwise the
+  # static-into-shared link dead-strips the as-yet-unreferenced symbols).
+  link_whole : v3_parser_lib,  # native import-path parsing (§5.3)
   install : true,
   prelink : true,  # Pull static initializers into the final binary.
 )
@@ -228,30 +267,13 @@ if host_machine.system() == 'darwin'
   v3_eval_link_args += [ '-Wl,-stack_size,0x4000000' ]  # 64 MiB
 endif
 
-# v3-native parser bison/flex outputs (parser/v3-parser.{y,l}).  Defined
-# here (before v3-eval) so v3-eval can link them for NIX_V3_NATIVE_PARSER.
-# unity=off because unity builds break the recursive flex/bison
-# generated-header dependency (libexpr meson.build:238).
-v3_parser_tab = custom_target(
-  'v3-parser-tab',
-  input : 'parser/v3-parser.y',
-  output : ['v3-parser-tab.cc', 'v3-parser-tab.hh'],
-  command : ['bison', '-o', '@OUTPUT0@', '@INPUT@', '-d'],
-)
-v3_parser_lex = custom_target(
-  'v3-parser-lex',
-  input : ['parser/v3-parser.l', v3_parser_tab],
-  output : ['v3-parser-lex.cc', 'v3-parser-lex.hh'],
-  command : ['flex', '--outfile', '@OUTPUT0@', '--header-file=@OUTPUT1@', '@INPUT0@'],
-)
-
 v3_eval = executable(
   'v3-eval',
   'cli/v3-eval.cc',
-  # Stage 2: link the v3-native parser so NIX_V3_NATIVE_PARSER=1 can
-  # parse natively + bridge to nix::Expr (cli/v3-to-nixexpr.hh).
-  v3_parser_tab,
-  v3_parser_lex,
+  # Stage 2: the v3-native parser comes in via `this_library` (which now
+  # links v3_parser_lib) — NIX_V3_NATIVE_PARSER=1 parses natively, then
+  # either lowers natively (NIX_V3_NATIVE_LOWER=1) or bridges to nix::Expr
+  # (cli/v3-to-nixexpr.hh).
   dependencies : deps_public + deps_private + deps_other + [
     declare_dependency(
       link_with : this_library,

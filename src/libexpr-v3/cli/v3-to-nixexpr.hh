@@ -38,6 +38,12 @@
 #include <utility>
 #include <vector>
 
+// The Kind-dispatch switch uses `default:` for internal/never-in-source
+// kinds; silence -Wswitch-enum (keep -Wswitch) so the header is
+// self-sufficient outside the parser TU.  Balanced pop at end of file.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
+
 namespace nix::v3 {
 
 /// Stateful converter: holds the EvalState + the PosTable origin for the
@@ -246,3 +252,5 @@ inline nix::Expr * toNixExpr(nix::EvalState & es, const nix::v3::ast::Node * n,
 }
 
 } // namespace nix::v3
+
+#pragma GCC diagnostic pop  // -Wswitch-enum (balanced with push at top)

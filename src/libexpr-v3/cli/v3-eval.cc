@@ -53,8 +53,7 @@
 // used behind NIX_V3_NATIVE_PARSER=1.
 #include "v3/ast/expr.hh"
 #include "parser-state.hh"
-#include "v3-parser-decls.hh"  // v3-parser-tab.hh + YYSTYPE
-#include "v3-parser-lex.hh"    // flex reentrant decls (needs YYSTYPE)
+#include "v3-parse-api.hh"     // nix::v3::parser::parseString (shared glue)
 #include "v3-to-nixexpr.hh"
 #include "lower_v3.hh"         // native v3 AST -> IR lowering (Stage 2)
 
@@ -127,16 +126,10 @@ static void usage(const char * argv0)
 // subsequent lowering).  `st.basePath`/`st.homePath` set by the caller.
 static nix::v3::ast::Node * v3ParseInto(nix::v3::ast::ParserState & st, const std::string & text)
 {
-    yyscan_t scanner;
-    yylex_init(&scanner);
-    YY_BUFFER_STATE buf = yy_scan_string(text.c_str(), scanner);
-    nix::v3::parser::Parser parser(scanner, &st);
-    parser.parse();
-    yy_delete_buffer(buf, scanner);
-    yylex_destroy(scanner);
-    if (!st.result)
-        throw nix::Error("v3-native parser produced no expression");
-    return st.result;
+    // The flex/bison glue now lives in the v3-parser library
+    // (parser/v3-parse-api.cc) so the import/flake parse sites can share
+    // it (PARSER_PROJECT_PLAN §5.3).
+    return nix::v3::parser::parseString(st, text);
 }
 
 // IR dump mode: which point in the pipeline to dump from.
