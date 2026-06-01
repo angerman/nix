@@ -100,6 +100,10 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
             if (p.expr && !canLowerV3(p.expr)) return false;
         return true;
     }
+    case a::Kind::With: {
+        auto * w = static_cast<const a::With *>(n);
+        return canLowerV3(w->attrs) && canLowerV3(w->body);
+    }
     case a::Kind::Call: {
         // Args are thunked for laziness (lowerCall::thunkifyForAttr), so
         // any lowerable arg is fine — no triviality restriction.
@@ -148,8 +152,20 @@ struct LowererV3 {
     struct Scope {
         std::map<std::string, ir::VarId> byName;
         ir::VarId recVar = ir::kInvalid;
+        ir::VarId withTargetVar = ir::kInvalid;  // set → a `with` scope
     };
     std::vector<Scope> scopes;
+
+    /// Outermost-first VarIds of every enclosing `with` (the #530
+    /// lexical with-chain), attached to thunks/lambdas/letrec entries so
+    /// OP_WITH_LOOKUP inside them can scan the right targets.
+    std::vector<ir::VarId> collectLexicalWiths() const
+    {
+        std::vector<ir::VarId> out;
+        for (const Scope & s : scopes)
+            if (s.withTargetVar != ir::kInvalid) out.push_back(s.withTargetVar);
+        return out;
+    }
 
     explicit LowererV3(const nix::SymbolTable & symbols) : symbols(symbols) {}
 
@@ -193,6 +209,12 @@ struct LowererV3 {
             if (po->arity == 0) return addBinding(ir::PrimOpCall{po, {}});
             return addBinding(ir::LitPrimOp{po});
         }
+        // Not lexical, not base-env: if under any enclosing `with`, the
+        // name resolves dynamically (WithLookup scans the with-chain at
+        // runtime).  Nix order: lexical → base-env → with → error.
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it)
+            if (it->withTargetVar != ir::kInvalid)
+                return addBinding(ir::WithLookup{m.internSymbol(name)});
         throw std::runtime_error("v3 native lower: unbound variable '" + name + "'");
     }
 
@@ -223,6 +245,8 @@ struct LowererV3 {
             return lowerSelect(static_cast<const a::Select *>(n));
         case a::Kind::OpHasAttr:
             return lowerHasAttr(static_cast<const a::OpHasAttr *>(n));
+        case a::Kind::With:
+            return lowerWith(static_cast<const a::With *>(n));
 
         case a::Kind::Call: {
             auto * c = static_cast<const a::Call *>(n);
@@ -300,7 +324,11 @@ struct LowererV3 {
             setReturn(lowerExpr(lam->body));
             blockStack.pop_back();
             scopes.pop_back();
-            return addBinding(ir::Lambda{fid, {}, {}});
+            {
+            std::vector<ir::VarId> lws = collectLexicalWiths();
+            m.functions[fid].nWithTargets = static_cast<uint16_t>(lws.size());
+            return addBinding(ir::Lambda{fid, /*freeVars*/ {}, std::move(lws)});
+        }
         }
 
         // Formals.  Record metadata for builtins.functionArgs.
@@ -368,6 +396,8 @@ struct LowererV3 {
             ir::LetRec::Entry en;
             en.name = sym;
             en.thunkBody = tfid;
+            en.lexicalWiths = collectLexicalWiths();  // #530 with-chain
+            m.functions[tfid].nWithTargets = static_cast<uint16_t>(en.lexicalWiths.size());
             lr.entries.push_back(std::move(en));
         }
         m.blocks[blockStack.back()].bindings.push_back({formalsRec, std::move(lr)});
@@ -378,7 +408,11 @@ struct LowererV3 {
         scopes.pop_back();
         blockStack.pop_back();
 
-        return addBinding(ir::Lambda{fid, {}, {}});
+        {
+            std::vector<ir::VarId> lws = collectLexicalWiths();
+            m.functions[fid].nWithTargets = static_cast<uint16_t>(lws.size());
+            return addBinding(ir::Lambda{fid, /*freeVars*/ {}, std::move(lws)});
+        }
     }
 
     /// Trivial-for-value: cheap exprs that need no lazy thunk wrapper
@@ -408,7 +442,9 @@ struct LowererV3 {
         blockStack.push_back(eb);
         setReturn(lowerExpr(e));
         blockStack.pop_back();
-        return addBinding(ir::MkThunk{fid, /*freeVars*/ {}, /*lexicalWiths*/ {}});
+        std::vector<ir::VarId> lws = collectLexicalWiths();
+        m.functions[fid].nWithTargets = static_cast<uint16_t>(lws.size());
+        return addBinding(ir::MkThunk{fid, /*freeVars*/ {}, std::move(lws)});
     }
     ir::VarId thunkifyForAttr(const nix::v3::ast::Node * e)
     {
@@ -454,10 +490,13 @@ struct LowererV3 {
         lr.recVar = recVar;
         lr.hasBody = hasBody;
         lr.entries.reserve(bs.size());
+        std::vector<ir::VarId> lws = collectLexicalWiths();  // #530 with-chain
         for (size_t i = 0; i < bs.size(); ++i) {
             ir::LetRec::Entry en;
             en.name = m.internSymbol(bs[i]->name);
             en.thunkBody = fids[i];
+            en.lexicalWiths = lws;
+            m.functions[fids[i]].nWithTargets = static_cast<uint16_t>(lws.size());
             lr.entries.push_back(std::move(en));
         }
         m.blocks[blockStack.back()].bindings.push_back({recVar, std::move(lr)});
@@ -566,6 +605,28 @@ struct LowererV3 {
         setReturn(addBinding(ir::LitBool{false}));
         blockStack.pop_back();
         return addBinding(ir::If{hasIt, thenB, elseB});
+    }
+
+    /// Phase 3b: `with attrs; body`.  The attrs is thunked (lazy — TW
+    /// only forces it when a WithLookup scans it; `with (throw "x"); 1`
+    /// must return 1).  A `with` scope is pushed so unresolved names in
+    /// body lower to WithLookup; the body runs in its own block.
+    /// Mirrors lower.cc::lowerWith (minus the rec-slot optimization —
+    /// a rec-bound with-target already lowers to RecBindingSlotRef via
+    /// lowerVar, so the slot semantics hold naturally).
+    ir::VarId lowerWith(const nix::v3::ast::With * e)
+    {
+        ir::VarId attrs = thunkifyForAttr(e->attrs);
+        auto bodyB = m.freshBlock();
+        blockStack.push_back(bodyB);
+        Scope withScope;
+        withScope.withTargetVar = attrs;
+        scopes.push_back(withScope);
+        ir::VarId rv = lowerExpr(e->body);
+        scopes.pop_back();
+        setReturn(rv);
+        blockStack.pop_back();
+        return addBinding(ir::With{attrs, bodyB, ir::kInvalid, ir::kInvalidSymbol});
     }
 
     ir::Module run(const nix::v3::ast::Node * e)
