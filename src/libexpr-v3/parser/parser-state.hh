@@ -124,6 +124,51 @@ struct ParserState {
         return out;
     }
 
+    // -- paths (port of the path_start productions) ----------------
+
+    /// Minimal CanonPath for ABSOLUTE path literals (parser.y:419).
+    /// Canonicalises `/a/./b//c/..` -> `/a/b`: split on '/', drop empty
+    /// and `.` segments, pop on `..`, rejoin with a leading '/'.  The
+    /// trailing slash is re-added by makePath per the literal
+    /// (parser.y:431).  Empty result is root "/".
+    static std::string canonAbs(std::string_view literal) {
+        std::vector<std::string_view> segs;
+        size_t i = 0;
+        while (i < literal.size()) {
+            while (i < literal.size() && literal[i] == '/') ++i;
+            size_t j = i;
+            while (j < literal.size() && literal[j] != '/') ++j;
+            if (j > i) {
+                std::string_view seg = literal.substr(i, j - i);
+                if (seg == ".") { /* skip */ }
+                else if (seg == "..") { if (!segs.empty()) segs.pop_back(); }
+                else segs.push_back(seg);
+            }
+            i = j;
+        }
+        std::string out;
+        for (auto & s : segs) { out += '/'; out.append(s); }
+        return out.empty() ? std::string("/") : out;
+    }
+
+    /// Build a Path node from a PATH/HPATH literal (port of path_start,
+    /// parser.y:414-462).  ABSOLUTE paths (`/foo`) are canonicalised
+    /// here and are deterministic (no basePath needed).  RELATIVE
+    /// (`./foo`) and HOME (`~/foo`) paths need the source-file basePath
+    /// / $HOME, which the string-buffer spike does NOT have, so their
+    /// RESOLUTION is deferred to integration: the spike stores the
+    /// literal as a placeholder (it lexes + parses, but show() will not
+    /// match TW until basePath is wired).
+    Node * makePath(std::string_view literal, Pos pos) {
+        if (!literal.empty() && literal.front() == '/') {
+            std::string p = canonAbs(literal);
+            if (literal.size() > 1 && literal.back() == '/' && p != "/") p += '/';
+            return add<Path>(std::move(p), pos);
+        }
+        // relative / home: resolution DEFERRED (no basePath in the spike).
+        return add<Path>(std::string(literal), pos);
+    }
+
     // -- string / dynamic attr keys --------------------------------
 
     /// Turn a `string_attr`'s expr into an AttrName.  A plain string

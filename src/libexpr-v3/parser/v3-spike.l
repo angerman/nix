@@ -27,6 +27,9 @@
 %s DEFAULT
 %x STRING
 %x IND_STRING
+%x PATH_START
+%x INPATH
+%x INPATH_SLASH
 
 %top {
   // Brings in v3-spike-tab.hh + defines YYSTYPE (the parser variant
@@ -76,6 +79,14 @@ ID    [a-zA-Z_][a-zA-Z0-9_'\-]*
 INT   [0-9]+
 FLOAT (([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+))([Ee][+-]?[0-9]+)?
 ANY   .|\n
+
+  /* path char-classes (lexer.l:108-113), transcribed verbatim. */
+PATH_CHAR   [a-zA-Z0-9\.\_\-\+]
+PATH        {PATH_CHAR}*(\/{PATH_CHAR}+)+\/?
+PATH_SEG    {PATH_CHAR}*\/
+HPATH       \~(\/{PATH_CHAR}+)+\/?
+HPATH_START \~\/
+SPATH       \<{PATH_CHAR}+(\/{PATH_CHAR}+)*\>
 
 %%
 
@@ -150,6 +161,72 @@ ANY   .|\n
 <IND_STRING>\'\' { POP_STATE(); return nix::v3::spike::SpikeParser::token::IND_STRING_CLOSE; }
 <IND_STRING>\'  { yylval->emplace<nix::v3::ast::IndStr>(nix::v3::ast::IndStr{std::string("'"), false});
                 return nix::v3::spike::SpikeParser::token::IND_STR; }
+
+  /* Paths (mirrors lexer.l:235-315).  Three states: PATH_START handles a
+   * path that STARTS with an antiquotation segment (`./${x}`, `~/${x}`)
+   * via a yyless(0) rewind; INPATH/INPATH_SLASH carry the continuation.
+   * The `yylloc->unstash()` location bookkeeping is omitted (the spike
+   * tracks no positions).  Resolution (the PATH/HPATH grammar actions)
+   * is deterministic for ABSOLUTE paths + <spath>; relative/home need a
+   * source-file basePath the string-buffer spike lacks (deferred). */
+{PATH_SEG}\$\{ |
+{HPATH_START}\$\{ {
+                PUSH_STATE(PATH_START); yyless(0);
+              }
+<PATH_START>{PATH_SEG} {
+                POP_STATE(); PUSH_STATE(INPATH_SLASH);
+                yylval->emplace<std::string>(yytext, (size_t) yyleng);
+                return nix::v3::spike::SpikeParser::token::PATH;
+              }
+<PATH_START>{HPATH_START} {
+                POP_STATE(); PUSH_STATE(INPATH_SLASH);
+                yylval->emplace<std::string>(yytext, (size_t) yyleng);
+                return nix::v3::spike::SpikeParser::token::HPATH;
+              }
+<PATH_START>{ANY} |
+<PATH_START><<EOF>> {
+                /* unreachable: PATH_START is entered only after the
+                 * yyless(0) rewind of a {PATH_SEG}/{HPATH_START} match. */
+                POP_STATE(); return yytext[0];
+              }
+{PATH} {
+                if (yytext[yyleng-1] == '/') PUSH_STATE(INPATH_SLASH);
+                else                         PUSH_STATE(INPATH);
+                yylval->emplace<std::string>(yytext, (size_t) yyleng);
+                return nix::v3::spike::SpikeParser::token::PATH;
+              }
+{HPATH} {
+                if (yytext[yyleng-1] == '/') PUSH_STATE(INPATH_SLASH);
+                else                         PUSH_STATE(INPATH);
+                yylval->emplace<std::string>(yytext, (size_t) yyleng);
+                return nix::v3::spike::SpikeParser::token::HPATH;
+              }
+<INPATH,INPATH_SLASH>\$\{ {
+                POP_STATE(); PUSH_STATE(INPATH); PUSH_STATE(DEFAULT);
+                return nix::v3::spike::SpikeParser::token::DOLLAR_CURLY;
+              }
+<INPATH,INPATH_SLASH>{PATH}|{PATH_SEG}|{PATH_CHAR}+ {
+                POP_STATE();
+                if (yytext[yyleng-1] == '/') PUSH_STATE(INPATH_SLASH);
+                else                         PUSH_STATE(INPATH);
+                yylval->emplace<std::string>(yytext, (size_t) yyleng);
+                return nix::v3::spike::SpikeParser::token::STR;
+              }
+<INPATH>{ANY} |
+<INPATH><<EOF>> {
+                /* non-path char ends the path: emit PATH_END + re-parse
+                 * the char in the default context (lexer.l:296-305). */
+                POP_STATE(); yyless(0);
+                return nix::v3::spike::SpikeParser::token::PATH_END;
+              }
+<INPATH_SLASH>{ANY} |
+<INPATH_SLASH><<EOF>> {
+                throw nix::v3::ast::ParseError("path has a trailing slash", 0);
+              }
+{SPATH} {
+                yylval->emplace<std::string>(yytext, (size_t) yyleng);
+                return nix::v3::spike::SpikeParser::token::SPATH;
+              }
 
   /* `${` in the default context = a dynamic attr key / select / has-attr
    * (`{ ${e} = …; }`, `x.${e}`, `x ? ${e}`).  Mirrors lexer.l's

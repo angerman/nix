@@ -276,11 +276,36 @@ dedent (uneven indent), the `''$`/`'''` escapes, `${x}` interpolation
 (single + multiline).  This completes the strings story (plain +
 interpolated + indented) and wires the LAST unwired proven helper.
 
-**Paths + pipe (remaining Stage 1.4):**
-* paths (`./foo`, `/abs`, `<nixpkgs>`, `~/x`) — lexer PATH states
-* pipe operators (`|>` / `<|`), cursed-or, `let { }` form
-* then wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1` +
-  full 263-file + 143 lang validation; rename v3-spike → v3-parser.
+### Stage 1.4 Tier 4c — paths LANDED (deterministic subset)
+
+`./foo` / `/abs` / `~/x` / `<spath>` / interpolated `./a/${x}` — the last
+3 flex states (PATH_START / INPATH / INPATH_SLASH), transcribed verbatim
+from lexer.l:235-315 (the `yyless(0)` interpolated-path-start rewind +
+the `PATH_END` re-parse on the path-terminating char + the trailing-slash
+error).  Grammar: `path_start` (PATH/HPATH) + the 3 expr_simple path
+productions (`path_start PATH_END`, interpolated, SPATH→`__findFile`).
+
+**Resolution split** (a string-buffer spike has no source-file basePath
+/ $HOME — per the agreed design):
+* ABSOLUTE paths (`/foo`) + `<spath>` resolve deterministically NOW —
+  `makePath`/`canonAbs` (CanonPath: `/a/./b`→`/a/b`, `/a/b/../c`→`/a/c`)
+  and SPATH→`(__findFile __nixPath "…")`, golden-tested vs TW.
+* RELATIVE (`./foo`) + HOME (`~/x`) paths LEX + PARSE correctly (stored
+  as literals — verified no-crash) but their RESOLUTION is DEFERRED to
+  integration, where a real file supplies basePath.
+
+Validated by the tier4c battery (9 fixtures) — total parser-spike-test
+now **132/132** byte-equal to TW: abs simple/multi/deep, CanonPath
+`.`/`..` collapse, `<nixpkgs>`/`<a/b>`, abs-interpolated `/foo/${x}`,
+path-as-application-arg.  The trailing-slash cases `/foo/` + `/a//b` are
+TW parse errors — the INPATH_SLASH rule reproduces that rejection.
+
+**Remaining Stage 1.4:**
+* pipe operators (`|>` / `<|`), cursed-or, `let { }` form (minor)
+* then INTEGRATION: wire into `v3-eval --parse` behind
+  `NIX_V3_NATIVE_PARSER=1` (gives basePath → relative/home path
+  validation) + full 263-file + 143 lang validation; rename
+  v3-spike → v3-parser.
 * Then: wire into `v3-eval --parse` behind `NIX_V3_NATIVE_PARSER=1`;
   validate the 68 fixtures + 263-file sweep + 143 lang tests; rename
   v3-spike → v3-parser; retire the throwaway arithmetic framing.

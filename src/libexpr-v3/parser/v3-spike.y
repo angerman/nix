@@ -61,6 +61,10 @@
 %token <nix::v3::ast::IndStr> IND_STR "indented string"
 %token IND_STRING_OPEN "start of an indented string"
 %token IND_STRING_CLOSE "end of an indented string"
+%token <std::string> PATH "path"
+%token <std::string> HPATH "'~/…' path"
+%token <std::string> SPATH "'<…>' path"
+%token PATH_END "end of path"
 %token <int64_t>     INT_LIT   "integer"
 %token <double>      FLOAT_LIT "float"
 %token DOLLAR_CURLY "'${'"
@@ -76,7 +80,7 @@
 %type <nix::v3::ast::Node *> expr_app expr_select expr_simple
 %type <nix::v3::ast::Attrs *> binds binds1
 %type <std::vector<nix::v3::ast::Node *>> list
-%type <nix::v3::ast::Node *> string_parts string_attr
+%type <nix::v3::ast::Node *> string_parts string_attr path_start
 %type <std::vector<nix::v3::ast::Node *>> string_parts_interpolated
 %type <std::vector<nix::v3::ast::ParserState::IndStringSegment>> ind_string_parts
 %type <std::vector<nix::v3::ast::AttrName>> attrpath
@@ -231,6 +235,23 @@ expr_simple
   | '"' string_parts '"' { $$ = $2; }
   | IND_STRING_OPEN ind_string_parts IND_STRING_CLOSE
     { $$ = state->stripIndentation($2, 0); }
+  | path_start PATH_END { $$ = $1; }
+  | path_start string_parts_interpolated PATH_END {
+      // interpolated path (parser.y:361): ConcatStrings of the path_start
+      // prefix + the interpolated parts.  forceString=false (paths, not
+      // strings — parser.y:363).
+      std::vector<Node *> es;
+      es.push_back($1);
+      for (auto * e : $2) es.push_back(e);
+      $$ = state->add<ConcatStrings>(std::move(es), /*forceString=*/false);
+    }
+  | SPATH {
+      // <nixpkgs> -> (__findFile __nixPath "nixpkgs")  (parser.y:365-371)
+      std::string inner = $1.substr(1, $1.size() - 2);  // strip the < >
+      $$ = state->add<Call>(state->add<Var>(std::string("__findFile")),
+             std::vector<Node *>{ state->add<Var>(std::string("__nixPath")),
+                                  state->add<String>(std::move(inner)) });
+    }
   | '(' expr ')' { $$ = $2; }
   | REC '{' binds '}' { $3->recursive = true; $$ = $3; }
   | '{' binds1 '}'    { $$ = $2; }
@@ -306,6 +327,14 @@ string_parts_interpolated
 /* attrpath (parser.y:537-553): dotted path of static `attr`s and/or
  * string/dynamic `string_attr`s.  A `string_attr` becomes a static key
  * iff it is a plain string literal (strAttrName decides). */
+/* path_start (parser.y:414-462): a leading PATH (absolute or relative)
+ * or HPATH (`~/…`).  makePath resolves ABSOLUTE paths (CanonPath) and
+ * defers relative/home resolution (no basePath in the spike). */
+path_start
+  : PATH  { $$ = state->makePath($1, 0); }
+  | HPATH { $$ = state->makePath($1, 0); }
+  ;
+
 /* indented-string body (parser.y:471-474): a sequence of IND_STR chunks
  * and `${expr}` antiquotations, assembled into the IndStringSegments
  * that ParserState::stripIndentation dedents. */
