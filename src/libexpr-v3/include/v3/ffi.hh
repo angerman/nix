@@ -234,6 +234,24 @@ LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlake
 /// in-memory call-flake.nix source.  Cold (once, lazily).
 std::string homeDir();
 
+// -------------------------------------------------------------------------
+// Settings reads (audit Phase 2 — Category I).  v3 reads a few host
+// settings at FFI-leaf primops; these shims keep `nix::settings` /
+// `EvalSettings` out of the consumer TU.
+// -------------------------------------------------------------------------
+
+/// `nix::settings.readOnlyMode` — when set, store paths are COMPUTED via
+/// the derivation-hash protocol rather than written (derivationStrict /
+/// builtins.path / fetchToStore branch on it).  Cold.
+bool readOnlyMode();
+
+/// `state.settings.pureEval` — the pure-eval gate (getFlake locking).
+bool pureEval(nix::EvalState & state);
+
+/// `nix::nixVersion` — the host Nix version string (builtins.nixVersion;
+/// nixpkgs compares it against a minimum).  Cold.
+std::string nixVersion();
+
 }  // namespace ffi
 
 // =========================================================================

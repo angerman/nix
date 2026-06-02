@@ -31,7 +31,6 @@
 #include "v3-parse-api.hh"   // nix::v3::parser::parseString
 #include "lower_v3.hh"       // canLowerV3 + lowerV3Ast (native AST→IR)
 #include "v3/tw_baseenv.hh"  // twBaseEnvGlobals (free-name resolution)
-#include "nix/util/users.hh" // getHome() for the parser's ~/x resolution
 #include "v3/vm.hh"
 #include "v3/bridge_yield.hh"
 #include "v3/ffi.hh"  // FFI plan migration step 1: surface declarations.
@@ -49,7 +48,6 @@
 # include <mach/mach.h>
 # include <mach/task.h>
 #endif
-#include "nix/expr/eval-settings.hh"
 #include "v3/print.hh"  // #760: v3 printNixValue for toStringCoerceCtx error text
 #include "v3/value_serialize.hh"  // #741 Phase 1: derivation-result round-trip test
 #include "nix/expr/value/context.hh"
@@ -59,8 +57,8 @@
 #include "nix/flake/flakeref.hh"
 #include "nix/flake/settings.hh"
 #include "nix/util/canon-path.hh"
-#include "nix/util/experimental-features.hh"
-#include "nix/util/hash.hh"
+// experimental-features.hh + hash.hh are re-exported by v3/ffi.hh (Layer-0
+// shared domain types) — no direct include needed (audit Phase 0/2).
 
 #include <nlohmann/json.hpp>
 #include <toml.hpp>
@@ -90,7 +88,6 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/derived-path.hh"
 #include "nix/store/derivations.hh"  // hashPlaceholder
-#include "nix/store/globals.hh"
 #include "nix/store/content-address.hh"  // ContentAddressMethod
 #include "nix/util/serialise.hh"  // StringSource
 #include "v3/serialize.hh"
@@ -3474,7 +3471,7 @@ void primNixVersion(EvalState &, Value *, Value & out)
     // version string the tree-walker would.  Returning "v3-0.1"
     // (the previous v3 marker) caused nixpkgs to claim Nix 2.35 was
     // too old.
-    out = mkStringValueOwned(nix::nixVersion.c_str());
+    out = mkStringValueOwned(ffi::nixVersion());
 }
 
 /// builtins.langVersion (REVIEW_2026-05-04 §6.1).  Mirrors tree-
@@ -6785,7 +6782,7 @@ static void buildAndWriteDrvNative(
     }
 
     // Materialise + cache + build result attrset.
-    nix::StorePath drvPath = nix::settings.readOnlyMode
+    nix::StorePath drvPath = ffi::readOnlyMode()
         ? nix::computeStorePath(*ns.store, drv)
         : ns.store->writeDerivation(drv, ns.repair);
     std::string drvPathS = ns.store->printStorePath(drvPath);
@@ -7730,7 +7727,7 @@ static void primDerivationStrictNative_phases_4_7_legacy_ref(
     // Materialise the drv: in readOnlyMode (the v3-eval default;
     // also typical for `nix-instantiate --eval`) compute the path
     // without writing.  Otherwise actually write to the store.
-    nix::StorePath drvPath = nix::settings.readOnlyMode
+    nix::StorePath drvPath = ffi::readOnlyMode()
         ? nix::computeStorePath(*ns.store, drv)
         : ns.store->writeDerivation(drv, ns.repair);
     std::string drvPathS = ns.store->printStorePath(drvPath);
@@ -8167,7 +8164,7 @@ void primImport(EvalState & state, Value * args, Value & out)
     // v3-native parser and lowered directly to IR (no nix::Expr / no gate
     // — native is the only path now).  Home dir for the parser's `~/x`
     // resolution — same source TW's parser uses (getHome()), cached once.
-    static const std::string s_homePath = nix::getHome().string();
+    static const std::string s_homePath = ffi::homeDir();
     std::string path;
     // #741 Phase 4b RCA (2026-05-24): track whether this is an
     // actual IFD-class call (string with context, or attrset arg)
@@ -9999,7 +9996,7 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
         ns.fetchSettings,
         *ns.store,
         path.resolveSymlinks(),
-        nix::settings.readOnlyMode ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
+        ffi::readOnlyMode() ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
         name,
         method,
         nullptr,
@@ -10091,7 +10088,7 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     // wrapper's relative-path literals (inside `src`) resolve against the
     // imported file's dir, matching parseExprFromString(.., sp.parent()).
     // canLowerV3 is total for parsed source (throw = should-never-fire).
-    static const std::string s_siHome = nix::getHome().string();
+    static const std::string s_siHome = ffi::homeDir();
     nix::v3::ast::ParserState siSt;
     if (auto par = sp.path.parent()) siSt.basePath = par->abs();  // file's dir
     siSt.homePath = s_siHome;
@@ -11634,7 +11631,7 @@ void primStorePath(EvalState & state, Value * args, Value & out)
         throw std::runtime_error("v3 storePath: path '" + path.abs() +
                                   "' is not in the Nix store");
     auto path2 = ns->store->toStorePath(path.abs()).first;
-    if (!nix::settings.readOnlyMode)
+    if (!ffi::readOnlyMode())
         ns->store->ensurePath(path2);
     nix::NixStringContext context;
     context.insert(nix::NixStringContextElem::Opaque{.path = path2});
@@ -11684,7 +11681,7 @@ void primToFile(EvalState & state, Value * args, Value & out)
             }
         }
     }
-    auto storePath = nix::settings.readOnlyMode
+    auto storePath = ffi::readOnlyMode()
         ? ns->store->makeFixedOutputPathFromCA(
             name,
             nix::TextInfo{
@@ -11881,7 +11878,7 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
     if (!a[0].isString()) typeError("getFlake", "string");
     std::string flakeRefS = a[0].payload.str;
     auto flakeRef = nix::parseFlakeRef(ns.fetchSettings, flakeRefS, {}, true);
-    if (ns.settings.pureEval && !flakeRef.input.isLocked(ns.fetchSettings))
+    if (ffi::pureEval(ns) && !flakeRef.input.isLocked(ns.fetchSettings))
         throw nix::Error(
             "cannot call 'getFlake' on unlocked flake reference '%s' (use --impure to override)",
             flakeRefS);
@@ -11915,8 +11912,8 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
         nix::flake::LockFlags{
             .updateLockFile = false,
             .writeLockFile = false,
-            .useRegistries = !ns.settings.pureEval && flakeSettings->useRegistries,
-            .allowUnlocked = !ns.settings.pureEval,
+            .useRegistries = !ffi::pureEval(ns) && flakeSettings->useRegistries,
+            .allowUnlocked = !ffi::pureEval(ns),
         });
     if (s_dbgGetFlakeRss)
         std::fprintf(stderr,

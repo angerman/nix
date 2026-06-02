@@ -41,6 +41,7 @@
 #include "nix/expr/eval.hh"   // EvalState — ffi.cc is the one TU that wraps it
 #include "nix/expr/value/context.hh"       // NixStringContext(Elem) (path/ctx shims)
 #include "nix/store/store-api.hh"          // Store::printStorePath / toStorePath
+#include "nix/store/globals.hh"            // nix::settings.readOnlyMode
 #include "nix/fetchers/fetchers.hh"        // fetchers::Input getters (readLockedFlake)
 #include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
 #include "nix/flake/flake.hh"              // flake::LockedFlake
@@ -138,6 +139,21 @@ std::string displayContextElem(nix::EvalState & state, const std::string & raw)
 std::string homeDir()
 {
     return nix::getHome().string();
+}
+
+bool readOnlyMode()
+{
+    return nix::settings.readOnlyMode;
+}
+
+bool pureEval(nix::EvalState & state)
+{
+    return state.settings.pureEval;
+}
+
+std::string nixVersion()
+{
+    return nix::nixVersion;
 }
 
 namespace {
