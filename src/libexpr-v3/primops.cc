@@ -11717,38 +11717,10 @@ void primOutputOf(EvalState & state, Value * args, Value & out)
 // Same bridge pattern as BR-4's `primPath` fall-through (primops.cc:4457).
 // ---------------------------------------------------------------------------
 
-/// Generic bridge: convert v3 args to tree-walker, look up
-/// `builtins.<name>` (or the same with `__` prefix), call it,
-/// bridge the result back.
-template <int Arity>
-static void bridgeBuiltin(const char * name, EvalState & state,
-                          Value * args, Value & out)
-{
-    if (!state.nixEvalState)
-        throw std::runtime_error(std::string("v3 ") + name +
-            ": no tree-walker state available");
-    auto & ns = *state.nixEvalState;
-    nix::Value * nargs[Arity];
-    for (int i = 0; i < Arity; ++i) nargs[i] = v3ToTreeWalker(state, args[i]);
-    nix::Value & blt = ns.getBuiltins();
-    ns.forceAttrs(blt, nix::noPos, "v3 fetch primop bridge");
-    auto * pAttr = blt.attrs()->get(ns.symbols.create(name));
-    if (!pAttr || !pAttr->value) {
-        // Try __-prefixed alias (some fetch primops use that).
-        std::string alt = std::string("__") + name;
-        pAttr = blt.attrs()->get(ns.symbols.create(alt));
-        if (!pAttr || !pAttr->value)
-            throw std::runtime_error(std::string("v3 ") + name +
-                ": tree-walker builtins.<name> not found");
-    }
-    nix::Value cur = *pAttr->value;
-    for (int i = 0; i < Arity; ++i) {
-        nix::Value next;
-        ffi::callFunction(ns, cur, *nargs[i], next, nix::noPos);
-        cur = next;
-    }
-    out = treeWalkerToV3(state, cur);
-}
+// (TW-VALUE ERADICATION: the generic `bridgeBuiltin<N>` round-trip — which
+// did `v3ToTreeWalker(args) → callFunction(builtins.<name>) → treeWalkerToV3`
+// for the 8 fetchers — is GONE.  Every fetcher is now V3-NATIVE; bridgeBuiltin
+// had zero remaining callers, so it's deleted along with its bridge uses.)
 
 // TW-VALUE ERADICATION F1/F2 (TW_VALUE_ERADICATION_GOAL §4): build the
 // plain-data ffi::FetchTreeInput from the v3 arg, reproducing TW's fetchTree
