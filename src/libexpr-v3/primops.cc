@@ -11650,9 +11650,13 @@ void primToFile(EvalState & state, Value * args, Value & out)
             }
         }
     }
-    // Store add + bridge behind the FFI leaf (StringSource /
-    // FileSerialisationMethod / TextInfo live in ffi.cc; audit Phase 4).
-    out = ffi::addTextToStore(*ns, name, contents, std::move(refs), ffi::readOnlyMode());
+    // Store add behind the FFI leaf (StringSource / FileSerialisationMethod
+    // / TextInfo live in ffi.cc); build the result string V3-NATIVE from the
+    // returned path + Opaque context (no treeWalkerToV3 bridge).
+    ffi::FetchUrlResult r = ffi::addTextToStore(*ns, name, contents, std::move(refs), ffi::readOnlyMode());
+    out = mkStringValueOwned(r.printedStorePath);
+    std::vector<std::string> ctx{ r.opaqueContextElem };
+    setStringContextEntries(out.payload.str, std::move(ctx));
 }
 
 /// builtins.__outputOf drvRef outputName → input placeholder for that

@@ -73,11 +73,9 @@
 
 namespace nix::v3 {
 
-// Defined in primops.cc — the v3↔TW value bridge.  ffi shims that build a
-// TW value and hand it back to v3 (addTextToStore) call it here; forward-
-// declared rather than headered (it's part of the not-yet-relocated bridge
-// subsystem) — same pattern v3_call_flake.cc used pre-decoupling.
-Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
+// (ffi.cc no longer bridges any TW value — every shim returns plain data or
+// a printed store path + Opaque context for the v3 caller to build natively.
+// The former `treeWalkerToV3Public` forward-decl is gone.)
 
 // EvalState shims (audit §3.4) — out-of-line wrappers; see ffi.hh.
 namespace ffi {
@@ -613,9 +611,9 @@ nix::StorePath pathFetchToStore(nix::EvalState & state,
         state.repair);
 }
 
-Value addTextToStore(nix::EvalState & state, const std::string & name,
-                     const std::string & contents,
-                     nix::StorePathSet refs, bool readOnly)
+FetchUrlResult addTextToStore(nix::EvalState & state, const std::string & name,
+                              const std::string & contents,
+                              nix::StorePathSet refs, bool readOnly)
 {
     auto storePath = readOnly
         ? state.store->makeFixedOutputPathFromCA(
@@ -632,9 +630,12 @@ Value addTextToStore(nix::EvalState & state, const std::string & name,
                 nix::ContentAddressMethod::Raw::Text,
                 nix::HashAlgorithm::SHA256, refs, state.repair);
         });
-    nix::Value tw;
-    state.allowAndSetStorePathString(storePath, tw);
-    return nix::v3::treeWalkerToV3Public(state, tw);
+    // allowAndSetStorePathString = allowPath + mkStorePathString; do the
+    // allow here, return the printed path + Opaque ctx for the v3 caller to
+    // build the result string V3-NATIVE (no treeWalkerToV3 bridge).
+    state.allowPath(storePath);
+    return {state.store->printStorePath(storePath),
+            nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = storePath}}.to_string()};
 }
 
 LockedFlakeInfo lockFlakeAndRead(nix::EvalState & state,

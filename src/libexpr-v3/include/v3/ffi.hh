@@ -359,12 +359,13 @@ nix::StorePath pathFetchToStore(nix::EvalState & state,
 /// builtins.toFile's store add: under `readOnly` compute the path via
 /// `makeFixedOutputPathFromCA(TextInfo{sha256(contents), refs})`, else
 /// `addToStoreFromDump(StringSource, Flat, Raw::Text, sha256)`; then
-/// `allowAndSetStorePathString` + bridge the resulting store-path string to
-/// a v3 Value.  Keeps StringSource / FileSerialisationMethod / TextInfo in
-/// ffi.cc.  `refs` is taken by value (moved into TextInfo).  Cold.
-Value addTextToStore(nix::EvalState & state, const std::string & name,
-                     const std::string & contents,
-                     nix::StorePathSet refs, bool readOnly);
+/// allowPath + return the printed store path + its Opaque context (the v3
+/// caller builds the result string V3-NATIVE — no bridge).  Keeps
+/// StringSource / FileSerialisationMethod / TextInfo in ffi.cc.  `refs` is
+/// taken by value (moved into TextInfo).  Cold.
+FetchUrlResult addTextToStore(nix::EvalState & state, const std::string & name,
+                              const std::string & contents,
+                              nix::StorePathSet refs, bool readOnly);
 
 /// builtins.getFlake's full flake-loading FFI leaf in one call: parseFlakeRef
 /// + the unlocked-in-pure-eval guard + lockFlake (no lockfile write/update,
