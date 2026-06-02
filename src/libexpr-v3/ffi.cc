@@ -43,6 +43,7 @@
 #include "nix/store/store-api.hh"          // Store::printStorePath / toStorePath
 #include "nix/store/globals.hh"            // nix::settings.readOnlyMode
 #include "nix/store/path-references.hh"    // PathRefScanSink (storeRefsContextFor)
+#include "nix/store/derived-path.hh"       // SingleDerivedPath (outputOf)
 #include "nix/store/content-address.hh"    // ContentAddressMethod / TextInfo
 #include "nix/fetchers/fetch-to-store.hh"  // fetchToStore / FetchMode (pathFetchToStore)
 #include "nix/util/serialise.hh"           // StringSource / FileSerialisationMethod (addTextToStore)
@@ -721,6 +722,46 @@ FetchUrlResult addTextToStore(nix::EvalState & state, const std::string & name,
     state.allowPath(storePath);
     return {state.store->printStorePath(storePath),
             nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = storePath}}.to_string()};
+}
+
+StringWithContext outputOf(nix::EvalState & state,
+    const std::string & drvRef,
+    const std::vector<std::string> & drvRefContext,
+    const std::string & outputName)
+{
+    // Build the drvRef as a TW string carrying its v3-side context, coerce
+    // it to a SingleDerivedPath, then mkSingleDerivedPathString(Built{...})
+    // — the same sequence TW's prim_outputOf uses.  The result is read back
+    // out as plain data (value + context elems); no nix::Value crosses.
+    nix::Value tw0;
+    nix::NixStringContext ctx;
+    for (auto & e : drvRefContext) {
+        try { ctx.insert(nix::NixStringContextElem::parse(e)); }
+        catch (...) { /* skip un-parseable, mirroring primOutputOf */ }
+    }
+    if (ctx.empty())
+        tw0.mkString(drvRef, state.mem);
+    else
+        tw0.mkString(drvRef, ctx, state.mem);
+
+    nix::SingleDerivedPath drvPath = state.coerceToSingleDerivedPath(
+        nix::noPos, tw0,
+        "while evaluating the first argument to builtins.outputOf");
+
+    nix::Value tw;
+    state.mkSingleDerivedPathString(
+        nix::SingleDerivedPath::Built{
+            .drvPath = nix::make_ref<nix::SingleDerivedPath>(drvPath),
+            .output = outputName,
+        },
+        tw);
+
+    StringWithContext r;
+    r.value = std::string(tw.string_view());
+    if (auto * c = tw.context()) {
+        for (auto & e : *c) r.contextElems.push_back(std::string((*e).c_str()));
+    }
+    return r;
 }
 
 LockedFlakeInfo lockFlakeAndRead(nix::EvalState & state,

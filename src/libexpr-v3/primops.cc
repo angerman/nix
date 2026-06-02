@@ -11648,43 +11648,28 @@ void primOutputOf(EvalState & state, Value * args, Value & out)
 {
     if (!state.nixEvalState)
         throw std::runtime_error("v3 outputOf: no tree-walker state available");
-    auto * ns = state.nixEvalState;
-    // Convert args[0] (drvRef) and args[1] (outputName) to tree-walker
-    // values, delegate to tree-walker's coerceToSingleDerivedPath +
-    // mkSingleDerivedPathString, bridge the result back.
-    nix::Value tw0;
-    {
-        std::string drvRef = args[0].isString() && args[0].payload.str
-            ? std::string(args[0].payload.str) : std::string();
-        // §3: build a NixStringContext from the v3-side entries (if any)
-        // before calling mkString -- mkString takes &context by ref.
-        nix::NixStringContext ctx;
-        if (args[0].isString() && args[0].payload.str) {
-            if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
-                for (auto & e : *raw) {
-                    try { ctx.insert(nix::NixStringContextElem::parse(e)); }
-                    catch (...) { /* skip un-parseable */ }
-                }
-            }
-        }
-        if (ctx.empty())
-            tw0.mkString(drvRef, ns->mem);
-        else
-            tw0.mkString(drvRef, ctx, ns->mem);
+    // TW_VALUE_ERADICATION: the coerceToSingleDerivedPath +
+    // mkSingleDerivedPathString sequence (SingleDerivedPath / derived-path
+    // live in ffi.cc) runs behind ffi::outputOf, returning the placeholder
+    // string + its (Built) context as plain data; the v3 result is built
+    // V3-NATIVE (mkString + setStringContextEntries) — no treeWalkerToV3
+    // bridge.  Equivalent to the old bridge because that just copied the
+    // string value + context too (see treeWalkerToV3 nString case).
+    Value drvRefV = forceValue(*state.vm, args[0]);
+    Value outNameV = forceValue(*state.vm, args[1]);
+    if (!outNameV.isString()) typeError("outputOf", "string output name");
+    std::string drvRef = drvRefV.isString() && drvRefV.payload.str
+        ? std::string(drvRefV.payload.str) : std::string();
+    std::vector<std::string> drvRefCtx;
+    if (drvRefV.isString() && drvRefV.payload.str) {
+        if (auto * raw = lookupStringContextEntries(drvRefV.payload.str))
+            drvRefCtx = *raw;
     }
-    if (!args[1].isString()) typeError("outputOf", "string output name");
-    nix::SingleDerivedPath drvPath = ns->coerceToSingleDerivedPath(
-        nix::noPos, tw0,
-        "while evaluating the first argument to builtins.outputOf");
-    std::string outputName(args[1].payload.str);
-    nix::Value tw;
-    ns->mkSingleDerivedPathString(
-        nix::SingleDerivedPath::Built{
-            .drvPath = nix::make_ref<nix::SingleDerivedPath>(drvPath),
-            .output = outputName,
-        },
-        tw);
-    out = treeWalkerToV3Public(*ns, tw);
+    ffi::StringWithContext r = ffi::outputOf(
+        *state.nixEvalState, drvRef, drvRefCtx, std::string(outNameV.payload.str));
+    out = mkStringValueOwned(r.value);
+    if (!r.contextElems.empty())
+        setStringContextEntries(out.payload.str, std::move(r.contextElems));
 }
 
 // ---------------------------------------------------------------------------

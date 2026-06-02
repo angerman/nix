@@ -293,6 +293,27 @@ struct FetchUrlResult
     std::string opaqueContextElem;
 };
 
+/// A string VALUE + its string-context entries (each a
+/// `NixStringContextElem::to_string()`), as plain data — so the v3 caller
+/// rebuilds the v3 string V3-NATIVE (mkString + setStringContextEntries)
+/// instead of bridging a `nix::Value`.
+struct StringWithContext
+{
+    std::string value;
+    std::vector<std::string> contextElems;
+};
+
+/// builtins.outputOf (dynamic-derivations) FFI leaf: coerce the drvRef
+/// string (+ its context) to a SingleDerivedPath, then
+/// mkSingleDerivedPathString(Built{drvPath, output}) — returning the
+/// resulting placeholder string value + its (Built) context as plain data.
+/// Keeps SingleDerivedPath / coerceToSingleDerivedPath / derived-path in
+/// ffi.cc; the v3 caller builds the result natively (no treeWalkerToV3).
+StringWithContext outputOf(nix::EvalState & state,
+    const std::string & drvRef,
+    const std::vector<std::string> & drvRefContext,
+    const std::string & outputName);
+
 /// THE fetchurl/fetchTarball FFI leaf (eradicates the bridgeBuiltin round-
 /// trip).  Mirrors TW's `fetch` helper (fetchTree.cc:416-507): pseudo-url
 /// resolve (tarball) + checkURI + name default + checkName + pure-eval
