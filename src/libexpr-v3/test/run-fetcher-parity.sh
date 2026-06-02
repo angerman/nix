@@ -97,6 +97,20 @@ if command -v tar >/dev/null 2>&1 && tar -czf "$F/t.tar.gz" -C "$F" src 2>/dev/n
 fi
 rm -rf "$F"
 
+# --- builtins.fetchMercurial on a local hg repo (if hg is available) ---
+if command -v hg >/dev/null 2>&1; then
+  M=$(cd "$(mktemp -d)" && pwd -P)
+  (
+    cd "$M" && hg init -q
+    printf 'hgcontent\n' > f.txt
+    hg add f.txt >/dev/null 2>&1
+    HGUSER="parity <parity@example.com>" hg commit -qm init
+  )
+  check "fetchMercurial-attrs" \
+    "let r = builtins.fetchMercurial { url = \"$M\"; }; in { op = r.outPath; inherit (r) rev shortRev branch; sa = builtins.attrNames r; }"
+  rm -rf "$M"
+fi
+
 echo "fetcher-parity: $pass passed, $fail failed"
 if (( fail > 0 )); then
   printf '  FAIL: %s\n' "${failed[@]}" >&2

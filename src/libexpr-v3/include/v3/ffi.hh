@@ -295,6 +295,26 @@ FetchUrlResult fetchUrl(nix::EvalState & state, const std::string & url,
                         const std::optional<std::string> & sha256,
                         std::string name, bool unpack, const std::string & who);
 
+/// Result of builtins.fetchMercurial (its OWN attrset shape — distinct from
+/// emitTreeAttrs: branch + 12-char shortRev, no narHash/lastModified).
+struct FetchMercurialResult
+{
+    std::string                outPath;            ///< printed store path
+    std::string                opaqueContextElem;  ///< Opaque{outPath}
+    std::optional<std::string> branch;             ///< input.getRef()
+    std::string                rev;                ///< gitRev (empty-sha1 if dirty)
+    std::optional<int64_t>     revCount;
+};
+
+/// THE fetchMercurial FFI leaf (eradicates its bridgeBuiltin round-trip).
+/// Mirrors prim_fetchMercurial (fetchMercurial.cc): build the hg input
+/// (type=hg, url with file:// prefix, name, ref/rev — `revOrRef` is regex-
+/// classified here into rev-vs-ref), `Input::fromAttrs` + `fetchToStore`,
+/// then read outPath/branch/rev/revCount + allowPath.  No `nix::Value`.
+FetchMercurialResult fetchMercurial(nix::EvalState & state, const std::string & url,
+                                    const std::optional<std::string> & revOrRef,
+                                    const std::string & name);
+
 /// Read a `nix::flake::LockedFlake` (passed opaquely as `const void *`;
 /// ffi.cc casts it back) into plain data: the lockfile text + per-node
 /// store-path / fetcher-input fields.  Performs `lockFile.to_string`, the

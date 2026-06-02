@@ -11953,7 +11953,77 @@ void primFetchTree   (EvalState & s, Value * a, Value & o) {
 void primFetchGit    (EvalState & s, Value * a, Value & o) {
     v3FetchTree(s, a, o, "fetchGit",  /*isFetchGit=*/true,  /*allowName=*/true,  /*emptyRevFallback=*/true);
 }
-void primFetchMercurial(EvalState & s, Value * a, Value & o){ bridgeBuiltin<1>("fetchMercurial", s, a, o); }
+// F2 (eradication): native fetchMercurial — extract url/rev/name V3-NATIVE,
+// ffi::fetchMercurial (libfetchers hg input + fetchToStore), build the
+// result attrset { outPath; branch?; rev; shortRev; revCount?; } v3-native.
+// Note: fetchMercurial's result shape ≠ emitTreeAttrs (branch + 12-char
+// shortRev, no narHash/lastModified), so it has its own builder.
+void primFetchMercurial(EvalState & s, Value * a, Value & o) {
+    if (!s.nixEvalState)
+        throw std::runtime_error("v3 fetchMercurial: no tree-walker state available");
+    auto & ns = *s.nixEvalState;
+
+    Value arg = forceValue(*s.vm, a[0]);
+    auto readUrl = [&](const Value & v, const char * what) -> std::string {
+        if (v.tag() == Tag::String) return std::string(v.payload.str ? v.payload.str : "");
+        if (v.tag() == Tag::Path)   return std::string(v.payload.path ? v.payload.path : "");
+        throw std::runtime_error(std::string(what) + ": expected a string or path");
+    };
+    std::string url;
+    std::optional<std::string> revOrRef;
+    std::string name = "source";
+
+    if (arg.isAttrs() && arg.payload.bindings) {
+        const Bindings * b = arg.payload.bindings;
+        if (b->isChain()) b = b->materialize();
+        auto & symTab = ir::globalSymbolTable();
+        for (uint32_t i = 0; i < b->size; ++i) {
+            const SymbolId nid = b->entries[i].name;
+            std::string n(nid < symTab.size() ? symTab[nid] : std::to_string(nid));
+            if (n == "url")
+                url = readUrl(forceValue(*s.vm, b->entries[i].value),
+                              "while evaluating the `url` attribute passed to builtins.fetchMercurial");
+            else if (n == "rev")
+                revOrRef = v3ForceStringNoCtx(s, b->entries[i].value,
+                              "while evaluating the `rev` attribute passed to builtins.fetchMercurial");
+            else if (n == "name")
+                name = v3ForceStringNoCtx(s, b->entries[i].value,
+                              "while evaluating the `name` attribute passed to builtins.fetchMercurial");
+            else
+                throw std::runtime_error("unsupported argument '" + n + "' to 'fetchMercurial'");
+        }
+        if (url.empty())
+            throw std::runtime_error("'url' argument required");
+    } else {
+        url = readUrl(arg, "while evaluating the first argument passed to builtins.fetchMercurial");
+    }
+
+    ffi::FetchMercurialResult r = ffi::fetchMercurial(ns, url, revOrRef, name);
+
+    std::vector<std::pair<SymbolId, Value>> entries;
+    {
+        Value v = mkStringValueOwned(r.outPath);
+        std::vector<std::string> c{ r.opaqueContextElem };
+        setStringContextEntries(v.payload.str, std::move(c));
+        entries.emplace_back(ir::globalInternSymbol("outPath"), v);
+    }
+    if (r.branch)
+        entries.emplace_back(ir::globalInternSymbol("branch"), mkStringValueOwned(*r.branch));
+    entries.emplace_back(ir::globalInternSymbol("rev"), mkStringValueOwned(r.rev));
+    entries.emplace_back(ir::globalInternSymbol("shortRev"), mkStringValueOwned(r.rev.substr(0, 12)));
+    if (r.revCount) {
+        Value vc; vc.mkInt(*r.revCount);
+        entries.emplace_back(ir::globalInternSymbol("revCount"), vc);
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const auto & x, const auto & y) { return x.first < y.first; });
+    Bindings * bb = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+    V3_STATS_INC(attrsetsAllocated);
+    for (size_t i = 0; i < entries.size(); ++i)
+        bindingsSetEntry(bb, static_cast<uint32_t>(i), {entries[i].first, 0, entries[i].second});
+    o.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+    o.payload.bindings = bb;
+}
 void primFetchClosure(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchClosure", s, a, o); }
 void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("filterSource", s, a, o); }
 // Path B M3: getFlake is registered into TW via evalSettings.extraPrimOps

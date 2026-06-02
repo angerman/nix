@@ -51,6 +51,7 @@
 #include "nix/fetchers/input-cache.hh"     // InputCache::getAccessor (fetchTree)
 #include "nix/util/logging.hh"             // warn (fetchTree pure-eval narHash path)
 #include "nix/util/url.hh"                 // fixGitURL
+#include "nix/util/url-parts.hh"           // revRegex (fetchMercurial rev/ref classify)
 #include "nix/util/file-system.hh"         // baseNameOf (fetchUrl name default)
 #include "nix/fetchers/tarball.hh"         // downloadFile / downloadTarball (fetchUrl)
 #include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
@@ -64,6 +65,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <regex>
 
 namespace nix::v3 {
 
@@ -271,6 +273,46 @@ TreeAttrsInfo readTreeAttrs(nix::EvalState & state,
 std::string fixGitURL(const std::string & url)
 {
     return nix::fixGitURL(url).to_string();
+}
+
+FetchMercurialResult fetchMercurial(nix::EvalState & state, const std::string & url,
+                                    const std::optional<std::string> & revOrRef,
+                                    const std::string & name)
+{
+    std::optional<nix::Hash> rev;
+    std::optional<std::string> ref;
+    if (revOrRef) {
+        // Like prim_fetchMercurial: a 40-hex value is a rev, else a ref.
+        if (std::regex_match(revOrRef->begin(), revOrRef->end(), nix::revRegex))
+            rev = nix::Hash::parseAny(*revOrRef, nix::HashAlgorithm::SHA1);
+        else
+            ref = *revOrRef;
+    }
+
+    state.checkURI(url);
+    if (state.settings.pureEval && !rev)
+        throw nix::Error("in pure evaluation mode, 'fetchMercurial' requires a Mercurial revision");
+
+    nix::fetchers::Attrs attrs;
+    attrs.insert_or_assign("type", std::string("hg"));
+    attrs.insert_or_assign("url", url.find("://") != std::string::npos ? url : "file://" + url);
+    attrs.insert_or_assign("name", name);
+    if (ref) attrs.insert_or_assign("ref", *ref);
+    if (rev) attrs.insert_or_assign("rev", rev->gitRev());
+    auto input = nix::fetchers::Input::fromAttrs(state.fetchSettings, std::move(attrs));
+
+    auto [storePath, input2] = input.fetchToStore(state.fetchSettings, *state.store);
+    state.allowPath(storePath);
+
+    FetchMercurialResult r;
+    r.outPath = state.store->printStorePath(storePath);
+    r.opaqueContextElem =
+        nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = storePath}}.to_string();
+    if (input2.getRef()) r.branch = *input2.getRef();
+    // Backward-compat: dirty tree → 0000…0000 sha1 rev (matches TW).
+    r.rev = input2.getRev().value_or(nix::Hash(nix::HashAlgorithm::SHA1)).gitRev();
+    if (auto rc = input2.getRevCount()) r.revCount = static_cast<int64_t>(*rc);
+    return r;
 }
 
 FetchUrlResult fetchUrl(nix::EvalState & state, const std::string & urlArg,
