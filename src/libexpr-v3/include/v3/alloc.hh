@@ -846,6 +846,29 @@ inline const bool g_majorGcEnabled =
     std::getenv("NIX_V3_MAJOR_GC") != nullptr;
 } // namespace detail
 
+/// R2.1′ (2026-06-03): per-cell TYPE metadata for Nofl-style evacuation.
+/// v3 cells carry no self-identifying header — a cell's type is otherwise
+/// known only from the Tag of the Value pointing at it.  The mover needs
+/// the type at an arbitrary cell-start to (a) content-walk it (forward its
+/// pointer fields) and (b) resolve interior-pointer owners (Bindings reached
+/// via Tag::Slot).  We record it in a gated side-table (parallel to the
+/// cell-start bitmap), stamped at allocation by the typed allocators.  A
+/// MISSED stamp is SAFE: it leaves the cell `None`, the mover declines to
+/// move it, and verify-before-free pins its block (yield loss, never a
+/// dangle).  Values fit the existing 16-byte granule; one byte per
+/// cell-start suffices.
+enum class CellType : uint8_t {
+    None     = 0,  ///< not stamped (interior, free, or pre-gate alloc)
+    Value    = 1,  ///< standalone Value cell (allocValue)
+    Closure  = 2,
+    Thunk    = 3,
+    Bindings = 4,
+    List     = 5,
+    Pair     = 6,  ///< ValuePair (App / App3 / PrimOpApp)
+    Env      = 7,
+    Chars    = 8,  ///< allocChars string/path buffer
+};
+
 class Arena
 {
 public:
@@ -925,6 +948,15 @@ public:
         /// memory, single branch in alloc().
         std::vector<std::vector<uint64_t>> cellStarts;
 
+        /// R2.1′ (2026-06-03): per-cell-start TYPE byte, parallel to
+        /// `blocks` (cellTypes[i] is block i's type array).  One byte per
+        /// 16-byte granule; nonzero == a cell of that CellType starts
+        /// here.  Stamped by `alloc(bytes, type)` when major-GC is on;
+        /// read by the evacuation mover to content-walk + move any cell
+        /// (esp. Bindings, which the cell-start-only nursery scavenger
+        /// cannot move).  Gate-OFF: vector stays empty, zero cost.
+        std::vector<std::vector<uint8_t>> cellTypes;
+
         /// Step 11′ (Immix, 2026-05-29 per GC_DECISION_2026-05-29.md):
         /// per-block 128 B line-mark bitmap.  Parallel to `blocks`
         /// (lineMarks[i] is the line-mark bitmap for blocks[i]).  One
@@ -970,7 +1002,7 @@ public:
         std::vector<std::vector<FreeSpan>> freeSpans;
     };
 
-    void * alloc(size_t bytes) noexcept
+    void * alloc(size_t bytes, CellType type = CellType::None) noexcept
     {
         // 16-byte align the request.
         bytes = (bytes + 15) & ~size_t{15};
@@ -1124,6 +1156,12 @@ public:
             const size_t word = bit >> 6;              // /64
             active_.cellStarts.back()[word] |=
                 1ULL << (bit & 63);
+            // R2.1′: stamp the cell type at this granule (bump path —
+            // the default under NIX_V3_MAJOR_GC; immix-span/freelist/huge
+            // paths leave None, pinning those cells, which is safe).
+            if (type != CellType::None
+                && bit < active_.cellTypes.back().size())
+                active_.cellTypes.back()[bit] = static_cast<uint8_t>(type);
         }
         return p;
     }
@@ -1165,6 +1203,35 @@ public:
     /// Stage 6 Phase 2: accessor for sweep to enumerate cell starts.
     const std::vector<std::vector<uint64_t>> & cellStartBitmaps() const noexcept
         { return active_.cellStarts; }
+
+    /// R2.1′ (2026-06-03): cell type stamped at `p`'s granule, or
+    /// CellType::None if `p` isn't a stamped cell-start (interior, free,
+    /// huge, or allocated via a non-bump path).  O(active blocks) — used
+    /// by the evacuation mover at GC time, not on the alloc hot path.
+    CellType cellTypeAt(const void * p) const noexcept
+    {
+        if (!majorGcEnabled() || !p) return CellType::None;
+        const char * cp = static_cast<const char *>(p);
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            const char * blk = active_.blocks[i];
+            if (cp >= blk && cp < blk + kBlockSize) {
+                const size_t offset = static_cast<size_t>(cp - blk);
+                if ((offset & 15) != 0) return CellType::None;
+                const size_t bit = offset >> 4;
+                if (i >= active_.cellTypes.size()
+                    || bit >= active_.cellTypes[i].size())
+                    return CellType::None;
+                return static_cast<CellType>(active_.cellTypes[i][bit]);
+            }
+        }
+        return CellType::None;
+    }
+
+    /// R2.1′: type-array accessor (parallel to cellStartBitmaps), so the
+    /// sweep/mover can iterate types block-indexed without the O(blocks)
+    /// address lookup.
+    const std::vector<std::vector<uint8_t>> & cellTypeArrays() const noexcept
+        { return active_.cellTypes; }
 
     // ============================================================
     // Step 11′ — Immix line-mark bitmap API (2026-05-29).
@@ -1941,6 +2008,9 @@ private:
                 kBlockSize / 16 / 64, 0ULL);
             active_.lineMarks.emplace_back(
                 kLineU64sPerBlock, 0ULL);
+            // R2.1′: one type byte per 16-byte granule of the block.
+            active_.cellTypes.emplace_back(
+                kBlockSize / 16, uint8_t(CellType::None));
         }
 #if NIX_USE_BOEHMGC
         // WC-13: tell Boehm to scan this block for pointers to GC
@@ -2040,16 +2110,17 @@ struct Alloc
     /// D will revisit if Bindings turns out to dominate nursery
     /// pressure.
     [[gnu::always_inline]]
-    static void * nurseryOrArena(size_t bytes) noexcept
+    static void * nurseryOrArena(size_t bytes, CellType type = CellType::None) noexcept
     {
         if (void * p = threadNursery().tryAlloc(bytes)) return p;
-        return threadArena().alloc(bytes);
+        return threadArena().alloc(bytes, type);
     }
 
     static Value * allocValue() noexcept
     {
         V3_STATS_BUMP(bytesValues, sizeof(Value));
-        return static_cast<Value *>(threadArena().alloc(sizeof(Value)));
+        return static_cast<Value *>(
+            threadArena().alloc(sizeof(Value), CellType::Value));
     }
 
     /// `file` / `line` default to the caller's site via `__builtin_FILE`
@@ -2066,7 +2137,7 @@ struct Alloc
     {
         const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
         V3_STATS_BUMP(bytesClosures, bytes);
-        auto * c = static_cast<Closure *>(nurseryOrArena(bytes));
+        auto * c = static_cast<Closure *>(nurseryOrArena(bytes, CellType::Closure));
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
         c->capturedWiths = nullptr;
@@ -2106,7 +2177,8 @@ struct Alloc
     {
         const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
         V3_STATS_BUMP(bytesClosures, bytes);
-        auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
+        auto * c = static_cast<Closure *>(
+            threadArena().alloc(bytes, CellType::Closure));
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
         c->capturedWiths = nullptr;
@@ -2127,7 +2199,7 @@ struct Alloc
     {
         const size_t bytes = sizeof(Thunk) + sizeof(Value) * nUpvalues;
         V3_STATS_BUMP(bytesThunks, bytes);
-        auto * t = static_cast<Thunk *>(nurseryOrArena(bytes));
+        auto * t = static_cast<Thunk *>(nurseryOrArena(bytes, CellType::Thunk));
         t->state = ThunkState::Suspended;
         t->nUpvalues = nUpvalues;
         t->forces = 0;
@@ -2168,7 +2240,7 @@ struct Alloc
     {
         const size_t bytes = sizeof(Env) + sizeof(Value) * nValues;
         V3_STATS_BUMP(bytesEnvs, bytes);
-        auto * e = static_cast<Env *>(threadArena().alloc(bytes));
+        auto * e = static_cast<Env *>(threadArena().alloc(bytes, CellType::Env));
         e->parent = nullptr;
         e->isWithEnv = false;
         e->nValues = nValues;
@@ -2184,7 +2256,7 @@ struct Alloc
     {
         const size_t bytes = sizeof(ListVec) + sizeof(Value) * n;
         V3_STATS_BUMP(bytesLists, bytes);
-        auto * l = static_cast<ListVec *>(nurseryOrArena(bytes));
+        auto * l = static_cast<ListVec *>(nurseryOrArena(bytes, CellType::List));
         l->size = n;
         listAllocSiteRecord(l, file, line, n);
         return l;
@@ -2206,7 +2278,7 @@ struct Alloc
         V3_STATS_INC(pairsAllocated);
         V3_STATS_BUMP(bytesPairs, sizeof(ValuePair));
         auto * p = static_cast<ValuePair *>(
-            threadArena().alloc(sizeof(ValuePair)));
+            threadArena().alloc(sizeof(ValuePair), CellType::Pair));
         // 2026-05-30: explicitly zero-init `evaluated` and `third`
         // slots.  Many callers (App, PrimOpApp) set only `left` and
         // `right`, relying on the other slots being Tag::Uninitialized.
@@ -2251,7 +2323,7 @@ struct Alloc
         if (__builtin_expect(detail::g_stringsAttrEnabled, 0)) {
             recordAllocCharsSite(file, line, n);
         }
-        return static_cast<char *>(threadArena().alloc(n));
+        return static_cast<char *>(threadArena().alloc(n, CellType::Chars));
     }
 
     // Phase A1 (RCA 2026-05-11): record the C++ source location of every
@@ -2297,7 +2369,8 @@ struct Alloc
         V3_STATS_INC(attrsetsAllocated);
         size_t bytes = sizeof(Bindings) + overlaySize * sizeof(Bindings::Entry);
         V3_STATS_BUMP(bytesBindings, bytes);
-        auto * b = static_cast<Bindings *>(threadArena().alloc(bytes));
+        auto * b = static_cast<Bindings *>(
+            threadArena().alloc(bytes, CellType::Bindings));
         b->kind = uint8_t(Bindings::Kind::Chain);
         b->_pad8[0] = b->_pad8[1] = b->_pad8[2] = 0;
         b->size = overlaySize;
@@ -2346,7 +2419,8 @@ struct Alloc
         // scavenges.  Phase D may revisit if Bindings turns out to
         // dominate nursery pressure (then we'd need a remembered
         // set / cell registry).
-        auto * b = static_cast<Bindings *>(threadArena().alloc(bytes));
+        auto * b = static_cast<Bindings *>(
+            threadArena().alloc(bytes, CellType::Bindings));
         // Phase 3 reuse-safety (2026-05-28): allocBindings used to
         // rely on calloc-zero-init of fresh arena blocks to give us
         // kind=Sorted (=0) + _pad8=0 + parent=nullptr.  With free-list
@@ -2522,7 +2596,8 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
     // subsequent recycle's pointer stability survives Cheney scavenges.
     const size_t bytes = sizeof(Closure) + sizeof(Value) * nUpvalues;
     V3_STATS_BUMP(bytesClosures, bytes);
-    auto * c = static_cast<Closure *>(threadArena().alloc(bytes));
+    auto * c = static_cast<Closure *>(
+        threadArena().alloc(bytes, CellType::Closure));
     c->nUpvalues = nUpvalues;
     c->_pad = kFakeCloMagic;   // Mark as fakeClo for safe pooling.
     c->capturedWiths = nullptr;

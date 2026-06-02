@@ -692,6 +692,13 @@ struct SweepStats {
     size_t densityHist[5]  = {0, 0, 0, 0, 0};
     size_t sparseBlocks    = 0;  // < 25% live = good evacuation candidates
     size_t sparseLiveBytes = 0;  // live bytes in sparse blocks = copy cost
+
+    // R2.1′ (2026-06-03): live-cell tally by CellType (index = CellType
+    // value 0..8).  Validates the per-cell type stamping AND shows how
+    // much of the live set is now typed (movable by the metadata-aware
+    // mover) vs None (unstamped → pinned).  None (index 0) counts
+    // interior/huge/non-bump cells the mover can't directly type.
+    size_t cellTypeHist[9] = {0,0,0,0,0,0,0,0,0};
 };
 
 /// Sweep one arena block.  Walks the cell-start bitmap in address
@@ -710,6 +717,7 @@ static bool sweepOneBlock(
     const char *                  blockStart,
     size_t                        blockUsedBytes,
     const std::vector<uint64_t> & cellStartBits,
+    const std::vector<uint8_t> &  cellTypeBytes,   // R2.1′: per-granule type
     const BitmapMarker &          marker,
     SweepStats &                  stats) noexcept
 {
@@ -763,6 +771,11 @@ static bool sweepOneBlock(
             ++blockLiveCells;
             blockLiveBytes += cellSize;
             stats.liveBytes += cellSize;
+            // R2.1′: tally the live cell by its stamped type.
+            const size_t gran = offset >> 4;
+            const uint8_t ty = gran < cellTypeBytes.size()
+                ? cellTypeBytes[gran] : 0;
+            stats.cellTypeHist[ty < 9 ? ty : 0]++;
         } else {
             ++stats.deadCells;
             stats.deadBytes += cellSize;
@@ -926,7 +939,9 @@ void runMajorMarkSweep(VMState & vm) noexcept
     // -- Phase 2 step 2: sweep (measurement-only; no free yet) ------
     SweepStats sweep;
     const auto & cellStarts = arena.cellStartBitmaps();
+    const auto & cellTypes  = arena.cellTypeArrays();  // R2.1′
     const auto ranges = arena.blockRanges();
+    static const std::vector<uint8_t> emptyTypes;
 
     // Filter regular blocks (skip huge); compute per-block used-bytes.
     // Phase 3.8: collect blocks that sweep classified fully-dead
@@ -949,6 +964,8 @@ void runMajorMarkSweep(VMState & vm) noexcept
             r.begin,
             usedBytes,
             cellStarts[regularBlockIdx],
+            regularBlockIdx < cellTypes.size()
+                ? cellTypes[regularBlockIdx] : emptyTypes,
             marker,
             sweep);
         if (fullyDead) blocksToFree.push_back(r.begin);
@@ -1048,6 +1065,19 @@ void runMajorMarkSweep(VMState & vm) noexcept
                 ? 100.0 * double(conservativeOnlyCells)
                           / double(preciseMarkedCells + conservativeOnlyCells)
                 : 0.0);
+        // R2.1′: live-cell tally by stamped CellType — validates the
+        // per-cell type metadata + shows the typed (movable) fraction.
+        {
+            const size_t * h = sweep.cellTypeHist;
+            const size_t typed = h[1]+h[2]+h[3]+h[4]+h[5]+h[6]+h[7]+h[8];
+            std::fprintf(stderr,
+                "v3 evac-celltypes: None=%zu Value=%zu Closure=%zu Thunk=%zu "
+                "Bindings=%zu List=%zu Pair=%zu Env=%zu Chars=%zu "
+                "(typed/movable=%.1f%%)\n",
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8],
+                (typed + h[0]) > 0 ? 100.0 * double(typed)
+                                     / double(typed + h[0]) : 0.0);
+        }
         // Step 11′ (Immix, 2026-05-29): line-mark bitmap summary.
         // Each block has 131,072 lines of 128 B; a line is "live"
         // if any byte of any marked cell falls in it.  Dead-line
