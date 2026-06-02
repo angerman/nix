@@ -11862,13 +11862,14 @@ static ffi::FetchTreeInput extractFetchTreeInput(
 // F1/F2: native fetchTree-family entry (replaces the bridgeBuiltin round-trip).
 static void v3FetchTree(EvalState & s, Value * a, Value & o,
                         const char * fetcher, bool isFetchGit,
-                        bool allowNameArgument, bool emptyRevFallback)
+                        bool allowNameArgument, bool emptyRevFallback,
+                        bool isFinal = false)
 {
     if (!s.nixEvalState)
         throw std::runtime_error(std::string("v3 ") + fetcher + ": no tree-walker state available");
     auto & ns = *s.nixEvalState;
     auto in = extractFetchTreeInput(s, a[0], fetcher, isFetchGit, allowNameArgument);
-    ffi::TreeAttrsInfo info = ffi::fetchTree(ns, in, emptyRevFallback, /*isFinal=*/false);
+    ffi::TreeAttrsInfo info = ffi::fetchTree(ns, in, emptyRevFallback, isFinal);
     o = v3EmitTreeAttrs(info);
 }
 
@@ -11936,18 +11937,12 @@ void primFetchurl    (EvalState & s, Value * a, Value & o) { v3Fetch(s, a, o, "f
 // `bridgeBuiltin` (which looks up `builtins.<name>`).  This wrapper looks
 // up the TW primop in internalPrimOps directly + dispatches the FFI fetch
 // + bridges the result.  Registered as `__fetchFinalTree` for v3.
+// F2 (eradication): fetchFinalTree = fetchTree with isFinal=true
+// (prim_fetchFinalTree, fetchTree.cc:363).  Native — no internalPrimOps
+// callFunction, no TW Value round-trip.
 void primFetchFinalTree(EvalState & s, Value * a, Value & o) {
-    if (!s.nixEvalState)
-        throw std::runtime_error("v3 __fetchFinalTree: no TW state");
-    auto & ns = *s.nixEvalState;
-    auto pPrim = nix::get(ns.internalPrimOps, "fetchFinalTree");
-    if (!pPrim || !*pPrim)
-        throw std::runtime_error(
-            "v3 __fetchFinalTree: state.internalPrimOps['fetchFinalTree'] missing");
-    nix::Value * narg = v3ToTreeWalker(s, a[0]);
-    nix::Value twResult;
-    ffi::callFunction(ns, **pPrim, *narg, twResult, nix::noPos);
-    o = treeWalkerToV3Public(ns, twResult);
+    v3FetchTree(s, a, o, "fetchTree", /*isFetchGit=*/false, /*allowName=*/false,
+                /*emptyRevFallback=*/false, /*isFinal=*/true);
 }
 void primFetchTarball(EvalState & s, Value * a, Value & o) { v3Fetch(s, a, o, "fetchTarball", true,  "source"); }
 // F1/F2 (TW-value eradication): native plain-data path — no bridgeBuiltin.
