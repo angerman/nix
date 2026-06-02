@@ -527,10 +527,6 @@ private:
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                 visitValue(t->tail[i]);
             break;
-        case ThunkState::Bridge:
-            // bridgeSrc is a TW nix::Value*; tracked via
-            // bridge_root_registry, not via arena pointers.
-            break;
         }
     }
     void walkBindings(Bindings * b) noexcept

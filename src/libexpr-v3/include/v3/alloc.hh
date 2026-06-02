@@ -2134,38 +2134,7 @@ struct Alloc
         return t;
     }
 
-    /// WC-10: Allocate a Bridge thunk that, when OP_FORCE'd, calls
-    /// back into tree-walker for the given nix::Value*.  Used by
-    /// the rec-attrset materialisation: each entry of the
-    /// synthesised Bindings* is one of these thunks, so only
-    /// entries the v3 thunk body actually accesses pay the bridge
-    /// cost.  `src` is a `nix::Value *` (cast to void* here so
-    /// alloc.hh stays decoupled from nix:: types).
-    static Thunk * allocBridgeThunk(void * src) noexcept
-    {
-        // No upvalues / no FAM tail.
-        const size_t bytes = sizeof(Thunk);
-        V3_STATS_BUMP(bytesThunks, bytes);
-        auto * t = static_cast<Thunk *>(threadArena().alloc(bytes));
-        t->state = ThunkState::Bridge;
-        t->nUpvalues = 0;
-        t->forces = 0;
-        t->cell = nullptr;
-        t->cellContainer = nullptr;  // Phase D write-barrier metadata
-        // Bridge thunks don't have a v3-side body; no shapeCell needed.
-        t->shapeCell = nullptr;
-        t->bridgeSrc = src;
-        // Arena deregistration (per ARENA_DEREGISTRATION_DESIGN_2026-
-        // 05-27): register `src` (a Boehm-managed `nix::Value *`)
-        // in the bridge-root side-table so Boehm sees it as a root
-        // regardless of whether the arena itself is GC-registered.
-        // Always-on (even when NIX_V3_ARENA_NOROOT is unset) so the
-        // gate flip is safe — the side-table is a NO-OVERHEAD
-        // duplicate of the arena-scan path when arena registration
-        // is also active.
-        pushBridgeRoot(src);
-        return t;
-    }
+    // (allocBridgeThunk retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
 
     static Env * allocEnv(uint16_t nValues) noexcept
     {

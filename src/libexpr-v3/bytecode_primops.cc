@@ -36,13 +36,6 @@ Value * peekBuiltinsValue() noexcept;  // #705
 #include <unordered_map>
 #include <vector>
 
-// Forward declaration: defined in primops.cc.  Bridges a v3 Value into
-// a TW Value (wrapping closures as `mkPrimOpApp(__v3_call_bridge_1, h)`
-// so TW can dispatch them and v3 can unwrap them via
-// tryUnwrapBridge1Closure in OP_CALL).
-namespace nix::v3 {
-nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
-}
 
 namespace nix::v3 {
 
@@ -203,102 +196,13 @@ void installBytecodePrimop(
     installedPrimops().push_back(std::move(holder));
     auto & installed = *installedPtr;
 
-    // FFI_KILL_TODO (2026-06-01): skip the v3→TW bridge construction
-    // when path 1 (TW builtins mutation) is disabled.  Per the
-    // comments below, path 1 has been default-off since #697; the
-    // bridged Value was being created but never used, leaving 14+
-    // bridge entries in v3BridgeClosures for the process lifetime.
-    //
-    // Now: only call v3ToTreeWalkerPublic when
-    // NIX_V3_KEEP_TW_BUILTINS_MUTATION=1 is set (path 1 enabled).
-    // Eliminates 14 install-time bridge entries in the default
-    // config — a STRUCTURAL FFI surface reduction that applies to
-    // every v3-direct eval regardless of workload.
-    //
-    // What this kills: "install-time bridges are unconditionally
-    // required for bytecode primop registration" — KILLED.  Only
-    // path 1 needed the bridge; paths 2+3 use the v3 Closure
-    // directly via primopReplacementMap + vBuiltins patching.
-    //
-    // Bridge the (PATCHED) v3 Closure to a TW Value
-    // (`mkPrimOpApp(__v3_call_bridge_1, handle)`) so that:
-    //   - TW dispatch (`callFunction` from primops or top-level CLI)
-    //     routes back into v3 via primV3CallBridge1.
-    //   - v3 dispatch (OP_CALL on the bridged value) unwraps via
-    //     `tryUnwrapBridge1Closure` (vm.cc:2920) and dispatches the
-    //     underlying closure on the same VM — no fresh dispatchLoop.
-    //
-    // #875 Stage 1.5 (2026-05-29): I tried wrapping this call with
-    // `ScopedBridgeFallbackExpr{expr}` so install-time bridges
-    // capture the bytecode-primop's source Expr.  HNE under stress
-    // (NIX_V3_WEAK_BRIDGES=1 SWEEP=1 AGE=0) produced a divergent
-    // drvPath after reEvalsAfterEviction=1, indicating the fallback
-    // re-eval doesn't reproduce the install-time bridge's value
-    // exactly — likely because the bytecode-installed primops have
-    // recursive self-references that resolve differently after
-    // install vs at re-eval time.  Reverted; see
-    // WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md for the proper
-    // bridge-creation-site-specific Expr capture work that remains.
-    static const bool s_needBridge =
-        std::getenv("NIX_V3_KEEP_TW_BUILTINS_MUTATION") != nullptr;
-    nix::Value * bridged = nullptr;
-    if (s_needBridge) {
-        bridged = v3ToTreeWalkerPublic(state, installed.rr.value);
-        if (!bridged) {
-            throw std::runtime_error(
-                "installBytecodePrimop: v3ToTreeWalkerPublic returned null "
-                "for '" + primopName + "'");
-        }
-    }
-
-    // Install path 1: mutate the Value in TW's builtins attrset so
-    // TW-side dispatch (and any code reading TW's baseEnv) sees the
-    // bytecode closure.
-    //
-    // 2026-05-20 #697 RCA — Path 1 caused a 16× slowdown on
-    // cardano-node `builtins.getFlake`.  When the bridge enters TW's
-    // `prim_getFlake` → `callFlake` → `call-flake.nix`, TW's evaluator
-    // runs Nix code that calls `builtins.foldl'`, `builtins.filter`,
-    // etc.  Pre-#697 those builtins-attr lookups returned the v3
-    // bridge wrapper (because Path 1 had mutated them), so each call
-    // bounced TW → v3 wrapper → TW (forcing each `op`-arg lambda) →
-    // v3 → TW — N times per list element.  On cardano-node's heavy
-    // callFlake (lots of attrset merging, listToAttrs, foldl'), the
-    // ping-pong dominated wall time.
-    //
-    // **Fix**: skip Path 1 by default.  TW's builtins.X stays the
-    // original C primop, so TW's internal evaluations (callFlake,
-    // imported .nix files) run at TW-native speed.  v3-side dispatch
-    // is unaffected — Path 2 (primopReplacementMap) is what v3's
-    // OP_LIT_PRIMOP / lower.cc consult, and Path 3 patches v3's
-    // vBuiltins for dynamic `with builtins; foldl' ...` patterns.
-    //
-    // **Opt-in restore**: NIX_V3_KEEP_TW_BUILTINS_MUTATION=1 brings
-    // back the pre-#697 behaviour for A/B measurement.  Retirement
-    // criterion: once a regression suite proves no semantic
-    // difference for any workload, drop the gate.
-    //
-    // Measured on cardano-node `(builtins.getFlake X) ? outputs`:
-    //   - TW alone:                    6.77s
-    //   - v3-direct (default, post-#697): ~7.16s
-    //   - v3-direct (default, pre-#697):  >110s (16× slowdown)
-    if (s_needBridge && bridged) {
-        // 2026-05-18 history: try/catch — some primops are
-        // registered only in v3 (e.g. __foldlMap from IR Phase C).
-        // getBuiltin throws on missing names.  Falling through to
-        // path 2 + path 3 still installs the v3-side replacement,
-        // which is all v3-direct needs.
-        try {
-            nix::v3::ffi::setTreeWalkerBuiltin(state, primopName, bridged);
-        } catch (const std::exception & e) {
-            if (dbgEnabled())
-                std::fprintf(stderr,
-                    "v3 bytecode-primop install: '%s' not in TW builtins "
-                    "(%s) — skipping path 1, continuing with v3-side install\n",
-                    primopName.c_str(), e.what());
-        }
-    }
-    (void)bridged;  // unused when path 1 is skipped (default post-#697)
+    // TW_VALUE_ERADICATION F4 (2026-06-02): install "path 1" — mutating the
+    // bytecode closure into TW's builtins via a v3ToTreeWalkerPublic bridge,
+    // gated NIX_V3_KEEP_TW_BUILTINS_MUTATION — is DELETED with the bridge
+    // apparatus.  It was default-off since #697 (it caused a 16× cardano-node
+    // slowdown).  v3-direct dispatch never needed it: path 2
+    // (primopReplacementMap, read by OP_LIT_PRIMOP / lower.cc) + path 3
+    // (vBuiltins patch) carry the bytecode replacement entirely.
 
     // Install path 2: register in v3's side-table keyed by v3 PrimOp
     // pointer.  This is what makes v3's OP_LIT_PRIMOP / OP_CALL_PRIMOP

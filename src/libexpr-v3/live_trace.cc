@@ -238,7 +238,6 @@ private:
             bytes = sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
             break;
         case ThunkState::Evaluated:
-        case ThunkState::Bridge:
             bytes = sizeof(Thunk);
             break;
         }
@@ -281,9 +280,6 @@ private:
         case ThunkState::Native:
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                 auditAndVisit(t->tail[i]);
-            break;
-        case ThunkState::Bridge:
-            // bridgeSrc is a TW nix::Value*, not v3 heap.  Skip.
             break;
         }
     }
@@ -1504,9 +1500,6 @@ private:
         case ThunkState::Native:
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                 visitValue(t->tail[i]);
-            break;
-        case ThunkState::Bridge:
-            // bridgeSrc is TW nix::Value*; not v3 heap.
             break;
         }
     }

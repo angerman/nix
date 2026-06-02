@@ -120,8 +120,6 @@ static V3SignalDiagInstaller _v3_signal_diag_installer;
 
 // #456 fix: forward decls for the bridge entry points used in
 // OP_CALL's Bridge-thunk branch.  Defined in primops.cc.
-nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
-Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
 
 // #483 part 4 → 2026-05-18: the shallow-TW-attrs RAII helpers retired
 // when treeWalkerToV3 became always-shallow for both nAttrs AND
@@ -134,7 +132,6 @@ Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
 // WC-10: forward declaration at namespace scope so the `extern` use sites
 // inside the anonymous namespaces below resolve to nix::v3::forceBridgeThunk
 // (defined in primops.cc) rather than to a phantom anonymous-namespace symbol.
-Value forceBridgeThunk(Thunk * t);
 
 namespace {
 
@@ -1472,17 +1469,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
             // Cardano-node `with self;` over `extends overlay self`
             // shape: the partial Bindings already has the entries we
             // need; only the OUTER thunk is mid-blackhole.
-            if (w.isThunk() && w.payload.thunk
-                && w.payload.thunk->state == ThunkState::Bridge) {
-                if (auto v = tryBridgeAttrLookup(w.payload.thunk, name))
-                    return *v;
-                // not found in this scope's partial bindings, OR src
-                // not yet attrset-shaped.  Don't fall through to the
-                // wholesale force below in the latter case (still-thunk
-                // means "not yet resolvable here, try outer scope").
-                anyBlackholed = true;
-                continue;
-            }
+            // (#458 with-stack Bridge attr-lookup retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
             try {
                 w = forceValue(vm, w);
             } catch (const BlackholeError &) {
@@ -2372,9 +2359,6 @@ static inline std::string v3ThunkTracePos(const Thunk * t)
             "<no-pos:%s t=%p st=%d>", label, (void *)t, (int)t->state);
         return std::string(buf);
     };
-    // For Bridge thunks, suspended.desc reads the wrong union member;
-    // their position info isn't useful.  Tag them as bridge.
-    if (t->state == ThunkState::Bridge) return formatNoPos("bridge");
     if (t->state == ThunkState::Evaluated) return formatNoPos("evald");
     if (t->state == ThunkState::Native) return formatNoPos("native");
     const LambdaDescriptor * d = t->suspended.desc;
@@ -4501,146 +4485,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 break;
             }
 
-            // #456 fix: callee is a Bridge thunk wrapping a TW
-            // lambda.  v3 can't directly execute TW lambda bytecode,
-            // so route the call back through TW's callFunction.
-            // Mirrors the OP_CALL flow for v3 closures, but at the
-            // boundary: bridge fun + arg to TW, call, bridge result
-            // back to v3.
-            //
-            // Without this, an OP_CALL on a Bridge thunk falls into
-            // the "not a closure" error below.  This case arises
-            // whenever v3 evaluates a body that calls a function
-            // captured from TW (e.g. lib.foldl' under cardano-node /
-            // hello.name flake-eval shapes).
-            //
-            // Wrap in try/catch: a TW BlackHole here means the
-            // surrounding v3 evaluation tripped a fix-point cycle.
-            // Propagate the exception so the OP_CALL Bridge-thunk
-            // outer catch handles it (was previously routed through
-            // v3CallFunctionEntry's blacklist machinery in v3_hook.cc;
-            // that path is gone — the exception now flows normally).
-            // Catch generic exceptions so we don't silently corrupt
-            // the BridgeShimVm's frame state.
-            if (fun.isThunk() && fun.payload.thunk
-                && fun.payload.thunk->state == ThunkState::Bridge
-                && fun.payload.thunk->bridgeSrc) {
-                if (!getNixEvalState())
-                    throw std::runtime_error(
-                        "v3 OP_CALL: bridge-thunk call needs a TW EvalState");
-                auto * ns = getNixEvalState();
-                auto * funTw = static_cast<nix::Value *>(
-                    fun.payload.thunk->bridgeSrc);
-                // #466 active-v3-vm tracking: announce that this vm is
-                // bridging out, so any TW callback into v3 hooks can
-                // detect the re-entry and refuse cycle-prone paths
-                // (lambda-skip's body_fid invocation in particular).
-                ScopedActiveV3VM _activeV3VM(&vm);
-                ffi::forceValue(*ns, *funTw);
-
-                // #466 OP_CALL Bridge round-trip elimination.
-                //
-                // After forcing funTw, check if it's actually a v3
-                // closure that was bridged TO TW via v3ToTreeWalker —
-                // shape `mkPrimOpApp(__v3_call_bridge_1, vHandle)`.
-                // If so, dispatch directly via callClosure on THIS
-                // vm, skipping ns->callFunction entirely.
-                //
-                // Why this matters: the previous path created a fresh
-                // VMState (via ns->callFunction → v3 hook → bridge1
-                // shortcut → fresh VMState).  When the OUTER thunk's
-                // body was Black-marked on this vm's frames, the
-                // fresh VMState's force on that thunk saw Black and
-                // threw — the cross-VMState force scenario at the
-                // root of the lambda-skip cycle (#466 memory).
-                // Staying on this vm preserves the Black ancestry so
-                // the cycle is detected locally and unwinds cleanly.
-                Value v3Fn;
-                static const bool s_disabled =
-                    std::getenv("NIX_V3_NO_OP_CALL_BRIDGE_SHORTCUT") != nullptr;
-                if (!s_disabled && tryUnwrapBridge1Closure(*funTw, v3Fn)) {
-                    // #466 / #479 Phase 1: participate in the cross-
-                    // primop force chain.  The shortcut keeps work on
-                    // THIS vm (good for cycle locality), but a chain
-                    // of Bridge thunks each unwrapping to a different
-                    // closure can still grow C-stack unboundedly.  Key
-                    // by funTw pointer -- the same TW closure value
-                    // re-appearing on the chain IS the cycle.
-                    ForceChainGuard _fcg(
-                        ForceChainOp::OpCallBridge,
-                        reinterpret_cast<uint64_t>(funTw));
-                    if (_fcg.isCycle()) {
-                        throw BlackholeError(
-                            _fcg.atDepthCeiling()
-                            ? std::string("v3 OP_CALL bridge: force-chain depth ceiling reached")
-                            : std::string("v3 OP_CALL bridge: force-chain cycle"));
-                    }
-                    // Local v3 dispatch on this vm.  No TW round-trip,
-                    // no fresh VMState.
-                    Value out = callClosure(vm, v3Fn, arg);
-                    push(vm, out);
-                    break;
-                }
-
-                // Hook-removal 2026-05-13: tryDispatchTWLambdaInV3
-                // was tied to v3_hook.cc's per-Lambda subCache (gone
-                // with the hook).  TW handles the lambda call normally.
-
-                // Bridge arg back to TW.  v3->TW preserves identity
-                // for Bridge thunks (unwraps to original) and converts
-                // scalars / composites otherwise.
-                nix::Value * argTw = v3ToTreeWalkerPublic(*ns, arg);
-                if (!argTw)
-                    throw std::runtime_error(
-                        "v3 OP_CALL: bridge-thunk arg failed v3->TW bridge");
-                static const bool s_dbg =
-                    std::getenv("V3_DBG_OPCALL_BRIDGE") != nullptr;
-                if (s_dbg) {
-                    int twType = (int)ffi::valueType(funTw);
-                    const LambdaDescriptor * d = nullptr;
-                    if (vm.frames.back().closure)
-                        d = vm.frames.back().closure->desc;
-                    else if (vm.frames.back().thunk)
-                        d = vm.frames.back().thunk->suspended.desc;
-                    std::fprintf(stderr,
-                        "v3 OP_CALL bridge: tw.type=%d top=%s ip=%u\n",
-                        twType,
-                        d && !d->name.empty() ? d->name.c_str() : "<?>",
-                        vm.frames.back().ip);
-                }
-                // #484 STG-style address identity: outTw must be HEAP-
-                // allocated, NOT stack.  TW updates value cells in
-                // place when forcing thunks (the classic STG knot-tying
-                // discipline); any v3 Bridge thunk we build below
-                // points at outTw via `&` -- if outTw is a stack
-                // local, the address dies with our frame and later
-                // forces get garbage.  More subtly, even a temporary
-                // heap COPY (the prior #483 part 2 approach inside
-                // treeWalkerToV3) breaks address identity: TW's
-                // update of the ORIGINAL thunk doesn't propagate to
-                // our snapshot.  Manifested as nixpkgs by-name-
-                // overlay.nix:54 `self._internalCallByNamePackageFile
-                // missing` -- captured `self` was a pre-fix-point
-                // snapshot copy.  Heap-allocate from the start; the
-                // address we hand off is the SAME one TW will
-                // update in place.
-                nix::Value * outTwHeap = ffi::allocValue(*ns);
-                ffi::callFunction(*ns, *funTw, *argTw, *outTwHeap);
-                Value v3out;
-                if (ffi::valueType(outTwHeap) == ffi::TwType::Thunk) {
-                    Thunk * bridge = Alloc::allocBridgeThunk(
-                        static_cast<void *>(outTwHeap));
-                    V3_STATS_INC(thunksAllocated);
-                    v3out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
-                    v3out.payload.thunk = bridge;
-                } else {
-                    // 2026-05-18: tlsShallowTWAttrsBridge push/pop
-                    // retired — treeWalkerToV3 is now always shallow.
-                    v3out = treeWalkerToV3Public(*ns, *outTwHeap);
-                }
-                push(vm, v3out);
-                break;
-            }
+            // (OP_CALL Bridge-thunk handler retired with the bridge
+            //  apparatus — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
             // __functor: applying an attrset that has a `__functor`
             // attribute calls `__functor self arg` per the standard
@@ -4824,14 +4670,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // lambdas can't handle a v3 Tag::Slot as an arg.
                     // Fall through to the regular bytecode dispatch
                     // which already knows how to bridge across.
-                    Value forcedArg = arg;
-                    if (forcedArg.tag() == Tag::Thunk
-                        && forcedArg.payload.thunk
-                        && forcedArg.payload.thunk->state == ThunkState::Bridge)
-                    {
-                        // Skip intrinsic; fall through to bytecode path.
-                        goto skip_intrinsic_fix_op_call;
-                    }
+                    // (Bridge-thunk arg guard retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
                     allocStats().intrinsicFixCalls++;
                     static const bool s_dbg =
                         std::getenv("V3_DBG_INTRINSIC") != nullptr;
@@ -4988,7 +4827,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // Step 1's recogniseIntrinsic only sets Fix; future
                 // commits add the rest.
             }
-            skip_intrinsic_fix_op_call:;
 
             // #424: selector-lambda fast path for `\x: x.f`.  Skips
             // frame allocation + dispatch -- force arg, project the
@@ -6888,72 +6726,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 // (libexpr/eval.cc:2594 InfiniteRecursionError).
                 throw BlackholeError("infinite recursion encountered");
             }
-            // WC-10: Bridge thunk — call into tree-walker for the
-            // single nix::Value*, then bridge the already-forced
-            // result.  Defined in primops.cc so vm.cc stays free of
-            // nix:: includes.
-            if (t->state == ThunkState::Bridge) {
-                // #733: gate bridge-force stats (see dbgForceStatsActive).
-                if (__builtin_expect(dbgForceStatsActive(), 0)) {
-                    ++t->forces;
-                    ++allocStats().bridgeThunksForced;
-                }
-                // #466 / STG-7 (#498): forceBridgeThunk reaches into TW
-                // (ns->forceValue), and TW may re-enter v3 via the eval
-                // hook on whatever Expr it ends up driving.  Without
-                // ScopedActiveV3VM here the re-entry guard
-                // (v3EvalEntry's `activeV3VM() != nullptr` check) stays
-                // inactive, so the inner v3 call spawns a fresh VMState
-                // that black-marks v3 thunks already mid-flight on this
-                // outer vm — exactly the cross-VMState fresh-VMState
-                // cycle that surfaces under STG-mode + KEEP_HOOKS=1.
-                // Mirror the forceValue Bridge handler at line 5539.
-                ScopedActiveV3VM _activeV3VM(&vm);
-                Value resolved = forceBridgeThunk(t);
-                // Self-Bridge guard (#520): forceBridgeThunk goes
-                // through getOrAllocBridgeThunkCached, which is
-                // pointer-keyed on `nix::Value *` (== bridgeSrc).
-                // When bridgeSrc is an nFunction TW value, the
-                // treeWalkerToV3 nFunction case calls
-                // getOrAllocBridgeThunkCached(&nv) and the cache
-                // hits — returning Tag::Thunk{t} (the SAME bridge
-                // back).  If we then `t->state = Evaluated;
-                // t->evaluated = Tag::Thunk{t}`, the chase loop's
-                // Evaluated branch follows t->evaluated → t →
-                // t->evaluated → ... ad infinitum.  Treat the
-                // self-Bridge as canonical WHNF (a Bridge wrapping a
-                // Function IS the v3 representation; consumers
-                // unwrap via v3ToTreeWalker to recover the TW
-                // lambda).  Leave state == Bridge so future forces
-                // re-resolve harmlessly and the cache still hits.
-                if (resolved.tag() == Tag::Thunk
-                    && resolved.payload.thunk == t) {
-                    push(vm, resolved);
-                    applyForceWriteback(vm);
-                    break;
-                }
-                t->state = ThunkState::Evaluated;
-                thunkSetEvaluated(t, resolved);  // Phase D barrier
-                // STG-14b option (a): cell update protocol on Bridge
-                // thunks.  Mirrors STG-8's OP_RETURN cell-update for
-                // Suspended thunks.  When prepHookUpvaluesAndWiths
-                // builds a per-Bindings-entry Bridge with
-                // bridge->cell = &entries[i].value, this single write
-                // propagates the resolved TW value into every consumer
-                // observing entries[i].value (inner+outer call-hook
-                // entries that share the recBuildCache Bindings).
-                if (Value * cell = t->cell) {
-                    cellOwnRecordWrite(cell, t, "OP_FORCE-Bridge");
-                    cellTraceWrite(cell, t, resolved, "OP_FORCE-Bridge");
-                    // Phase D Step 3 batch D.
-                    cellWrite(cell, resolved, t->cellContainer);
-                    t->cell = nullptr;
-                    t->cellContainer = nullptr;  // Phase D Step 4
-                }
-                push(vm, resolved);
-                applyForceWriteback(vm);
-                break;
-            }
+            // (WC-10 OP_FORCE Bridge-thunk handler retired with the bridge
+            //  apparatus — TW_VALUE_ERADICATION F4, 2026-06-02.)
             // Suspended: blackhole and run.
             // We treat suspended.desc as a LambdaDescriptor* (see OP_MAKE_THUNK).
             const LambdaDescriptor * desc = t->suspended.desc;
@@ -7798,24 +7572,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             break;
         }
         case OP_ATTRS_SELECT: {
-            // A8: bridge-thunk peek BEFORE the iterative force — the
-            // peek is cheap (no force) and breaks the common case of
-            // a TW-bridged attrset getting opened one attr at a time.
-            {
-                Value & topRef = vm.valueStack.back();
-                if (topRef.isThunk() && topRef.payload.thunk
-                    && topRef.payload.thunk->state == ThunkState::Bridge) {
-                    if (auto v = tryBridgeAttrLookup(
-                            topRef.payload.thunk,
-                            static_cast<SymbolId>(operand))) {
-                        vm.valueStack.pop_back();
-                        push(vm, *v);
-                        ip++;  // skip icIdx
-                        break;
-                    }
-                    // Bridge peek didn't resolve; fall through to force.
-                }
-            }
+            // (A8 Bridge attr peek retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
             // A8: iterative force — when top is non-WHNF, rewind to
             // OP_ATTRS_SELECT and goto op_force_slow.  Replaces the
             // C-recursive `attrs = forceValue(vm, attrs)` below.
@@ -8690,23 +8447,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         }
         case OP_ATTRS_HAS: {
             Value attrs = pop(vm);
-            // #458 step A.4: per-attr peek for the Bridge thunk case.
-            // Cheaper than tryBridgeAttrLookup -- no bridge of the value
-            // is needed, just an existence check on the partial Bindings.
-            if (attrs.isThunk() && attrs.payload.thunk
-                && attrs.payload.thunk->state == ThunkState::Bridge) {
-                auto r = tryBridgeAttrHas(
-                    attrs.payload.thunk, static_cast<SymbolId>(operand));
-                if (r == BridgeAttrHasResult::Present) {
-                    push(vm, Value::vTrue);
-                    break;
-                }
-                if (r == BridgeAttrHasResult::Absent) {
-                    push(vm, Value::vFalse);
-                    break;
-                }
-                // Indeterminate: src still thunk-shaped, fall through.
-            }
+            // (#458 A.4 Bridge attr-has peek retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
             if (attrs.isAppLike() || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
@@ -8762,23 +8503,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 vm.frames.back().ip = ip;
                 name = forceValue(vm, name);
             }
-            // #458 step A.4: same per-attr peek for the dyn variant.
-            // The name was forced above; if it's a string, intern and
-            // try the bridge-has shortcut on the partial bindings.
-            if (name.isString()
-                && attrs.isThunk() && attrs.payload.thunk
-                && attrs.payload.thunk->state == ThunkState::Bridge) {
-                SymbolId id = ir::globalInternSymbol(name.payload.str);
-                auto r = tryBridgeAttrHas(attrs.payload.thunk, id);
-                if (r == BridgeAttrHasResult::Present) {
-                    push(vm, Value::vTrue);
-                    break;
-                }
-                if (r == BridgeAttrHasResult::Absent) {
-                    push(vm, Value::vFalse);
-                    break;
-                }
-            }
+            // (#458 A.4 dyn Bridge attr-has peek retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
             if (attrs.isAppLike() || attrs.tag() == Tag::Thunk || attrs.tag() == Tag::Slot) {
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
@@ -9144,9 +8869,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     ++total;
                     Tag at = attrs.tag();
                     if ((unsigned)at < 16) byTag[(unsigned)at]++;
-                    bool isBridge = (at == Tag::Thunk
-                        && attrs.payload.thunk
-                        && attrs.payload.thunk->state == ThunkState::Bridge);
+                    bool isBridge = false;  // (TW_VALUE_ERADICATION F4, 2026-06-02)
                     if (isBridge) ++bridgeFires;
                     // Print first 5 cases & every power of 10 thereafter.
                     if (logged < 5
@@ -10250,19 +9973,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // `if isFunction m then ... else import m` to import.  Peek
         // through Bridge thunks for the TW ValueType.  Cheap; only
         // fires on the Bridge case.
-        #define V3_BRIDGE_PEEK_OR(v, twTypePred, fallback) \
-            (((v).tag() == Tag::Thunk && (v).payload.thunk \
-                && (v).payload.thunk->state == ThunkState::Bridge \
-                && (v).payload.thunk->bridgeSrc) \
-                ? ([&]() -> bool { \
-                    try { \
-                        auto * src = static_cast<nix::Value *>( \
-                            (v).payload.thunk->bridgeSrc); \
-                        ffi::TwType tt = ffi::valueType(src); \
-                        return (twTypePred); \
-                    } catch (...) { return (fallback); } \
-                  }()) \
-                : (fallback))
+        // (TW_VALUE_ERADICATION F4, 2026-06-02): no Bridge thunks → always fallback.
+        #define V3_BRIDGE_PEEK_OR(v, twTypePred, fallback) (fallback)
         // A8: iterative force.  On non-WHNF top, rewind ip, set
         // CFF_FORCE_RETRY, and goto op_force_slow — the opcode re-enters
         // with WHNF on top.  No C-recursion through forceValue.
@@ -12085,64 +11797,8 @@ Value forceValue(VMState & vm, Value v)
             // #680 — match TW phrasing (libexpr/eval.cc:2594).
             throw BlackholeError("infinite recursion encountered");
         }
-        if (t->state == ThunkState::Bridge) {
-            // #466 active-v3-vm tracking: forceBridgeThunk goes
-            // through TW (treeWalkerToV3 → ns->forceValue), so any v3
-            // hook re-entered from that TW work sees this vm as the
-            // active outer.  Lets v3CallFunctionEntry refuse cycle-
-            // prone re-entries (lambda-skip's body_fid).
-            ScopedActiveV3VM _activeV3VM(&vm);
-            v = forceBridgeThunk(t);
-            // Self-Bridge guard (#520): see OP_FORCE Bridge handler
-            // above.  Returns Tag::Thunk{t} (cache hit on same
-            // nix::Value*) when bridgeSrc is an nFunction; setting
-            // t->evaluated = Tag::Thunk{t} would make the chase loop
-            // (state=Evaluated → evaluated → self) infinite.  Leave
-            // state == Bridge and let the break below catch us as a
-            // Bridge-wrapping-Function WHNF.
-            if (v.tag() == Tag::Thunk && v.payload.thunk == t) {
-                break;
-            }
-            t->state = ThunkState::Evaluated;
-            thunkSetEvaluated(t, v);  // Phase D barrier
-            // STG-14b option (a): cell update protocol on Bridge
-            // thunks (mirror of OP_FORCE Bridge handler above).
-            // When the Bridge was built with a cell pointing at a
-            // Bindings entry slot, this write propagates the resolved
-            // TW value into all observers of that entry.
-            if (Value * cell = t->cell) {
-                cellOwnRecordWrite(cell, t, "forceValue-Bridge");
-                cellTraceWrite(cell, t, v, "forceValue-Bridge");
-                // Phase D Step 3 batch D.
-                cellWrite(cell, v, t->cellContainer);
-                t->cell = nullptr;
-                t->cellContainer = nullptr;  // Phase D Step 4
-            }
-            // #456 fix: treat a TW-Function-bridged Thunk as WHNF.
-            // forceBridgeThunk -> treeWalkerToV3 wraps an nFunction
-            // TW Value as ANOTHER Bridge thunk (Tag::Thunk in Bridge
-            // state) for round-trip identity preservation
-            // (primops.cc treeWalkerToV3 nFunction case).  Without
-            // this break, the chase loop forces the new Bridge,
-            // forceBridgeThunk allocates ANOTHER Bridge for the
-            // same TW Value, set t->evaluated = newer Bridge, repeat
-            // ad infinitum.  Each iteration allocates a fresh Thunk
-            // pointer; the chain extends forever; kMaxIndirectionChase
-            // limit fires.  V3_DBG_CHASE confirms the pattern: every
-            // step is a Thunk in state=Evaluated whose evaluated.tag
-            // is Thunk again, ending at the freshly-allocated state=
-            // Bridge thunk (the next round's seed).
-            //
-            // The Bridge-thunk-wrapping-Function IS canonical WHNF
-            // from v3's perspective: there's nothing to reduce.  The
-            // consumer (TW caller via v3ToTreeWalker) will unwrap
-            // the Bridge to recover the original TW lambda for a
-            // call.  Break out so this Bridge thunk IS the result.
-            if (v.tag() == Tag::Thunk && v.payload.thunk
-                && v.payload.thunk->state == ThunkState::Bridge)
-                break;
-            continue;
-        }
+        // (forceValue Bridge-thunk handler retired with the bridge
+        //  apparatus — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
         const LambdaDescriptor * desc = t->suspended.desc;
         // #705 (2026-05-20): diagnostic — if we got here with a null
@@ -12665,53 +12321,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         }
     }
 
-    // #483 part 3: Bridge thunk callee.  Per the #456 fix, forceValue
-    // can RETURN a Tag::Thunk in Bridge state (when forceBridgeThunk's
-    // result is itself a Bridge thunk wrapping a TW Function/List for
-    // round-trip identity preservation).  Without handling here,
-    // callClosure throws "not callable" on a perfectly valid bridged
-    // TW function.  Mirror OP_CALL's Bridge branch: call TW's
-    // callFunction with the original TW value, then bridge the result
-    // back to v3.  Surfaces under lambda-skip when v3 invokes a TW
-    // function passed in as an arg (e.g. via the imap1+dfold pattern
-    // in pkgs/stdenv/booter.nix).
-    if (fun.isThunk() && fun.payload.thunk
-        && fun.payload.thunk->state == ThunkState::Bridge
-        && fun.payload.thunk->bridgeSrc) {
-        if (auto * ns = getNixEvalState()) {
-            auto * funTw = static_cast<nix::Value *>(
-                fun.payload.thunk->bridgeSrc);
-            ffi::forceValue(*ns, *funTw);
-            // Try the bridge1 shortcut to keep work on this vm.
-            Value v3Fn;
-            static const bool s_disabled =
-                std::getenv("NIX_V3_NO_OP_CALL_BRIDGE_SHORTCUT") != nullptr;
-            if (!s_disabled && tryUnwrapBridge1Closure(*funTw, v3Fn))
-                return callClosure(vm, v3Fn, arg);
-            // Hook-removal 2026-05-13: tryDispatchTWLambdaInV3 retired.
-            nix::Value * argTw = v3ToTreeWalkerPublic(*ns, arg);
-            if (!argTw)
-                throw std::runtime_error(
-                    "v3 callClosure: bridge-thunk arg failed v3->TW bridge");
-            // #484 STG-style address identity: heap-allocate outTw
-            // (see OP_CALL Bridge handler comment).  Preserves TW's
-            // in-place thunk update across the bridge.
-            nix::Value * outTwHeap = ffi::allocValue(*ns);
-            ffi::callFunction(*ns, *funTw, *argTw, *outTwHeap);
-            if (ffi::valueType(outTwHeap) == ffi::TwType::Thunk) {
-                Thunk * bridge = Alloc::allocBridgeThunk(
-                    static_cast<void *>(outTwHeap));
-                V3_STATS_INC(thunksAllocated);
-                Value v3out;
-                v3out.tag_payload = static_cast<uint64_t>(Tag::Thunk);
-                v3out.payload.thunk = bridge;
-                return v3out;
-            }
-            // 2026-05-18: tlsShallowTWAttrsBridge push/pop retired —
-            // treeWalkerToV3 is now always shallow.
-            return treeWalkerToV3Public(*ns, *outTwHeap);
-        }
-    }
+    // (#483 part 3 callClosure Bridge-thunk callee handler retired with the
+    //  bridge apparatus — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
     if (!fun.isClosure()) {
         static const bool dbg = std::getenv("V3_DBG_CALL") != nullptr;
@@ -12751,12 +12362,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     if (s_intrinsicEnable && __builtin_expect(
             desc->intrinsicKind != LambdaDescriptor::Intrinsic::None, 0)) {
         if (desc->intrinsicKind == LambdaDescriptor::Intrinsic::Fix) {
-            // Refuse native dispatch when the user's `f` is a Bridge
-            // thunk -- TW lambdas can't handle v3 Tag::Slot.  Fall
-            // through to bytecode which knows the bridge dance.
-            bool argIsBridge = arg.tag() == Tag::Thunk
-                && arg.payload.thunk
-                && arg.payload.thunk->state == ThunkState::Bridge;
+            // (Bridge-thunk arg guard retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
+            bool argIsBridge = false;
             if (!argIsBridge) {
                 allocStats().intrinsicFixCalls++;
                 static const bool s_dbg =

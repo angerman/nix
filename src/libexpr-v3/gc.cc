@@ -343,7 +343,6 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
         case ThunkState::Blackhole:
             return sizeof(Thunk) + sizeof(Value) * tk->nUpvalues;
         case ThunkState::Evaluated:
-        case ThunkState::Bridge:
             return sizeof(Thunk);
         }
         return sizeof(Thunk);
@@ -403,9 +402,6 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
         // those carry no v3-heap pointer to walk.  Suspended/Native/
         // Blackhole DO carry pointers; walk them under Phase E.
         switch (t->state) {
-        case ThunkState::Bridge:
-            if (!t->cell) return t;
-            break;
         case ThunkState::Evaluated:
             if (isLeafTag(t->evaluated.tag()) && !t->cell) return t;
             break;
@@ -440,7 +436,6 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
     // Evaluated with leaf tag: `evaluated` payload has no
     // forwardable pointer.  Cell included in the gate.
     switch (t->state) {
-    case ThunkState::Bridge:
     case ThunkState::Blackhole:
         if (!t->cell) return t;  // truly nothing to walk
         break;                   // fall through to queue if cell set
@@ -665,7 +660,6 @@ void Scavenger::walkThunk(Thunk * t)
             bytes = sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
             break;
         case ThunkState::Evaluated:
-        case ThunkState::Bridge:
             bytes = sizeof(Thunk);
             break;
         }
@@ -709,10 +703,6 @@ void Scavenger::walkThunk(Thunk * t)
         for (uint16_t i = 0; i < t->nUpvalues; ++i) {
             visitValue(t->tail[i]);
         }
-        break;
-    case ThunkState::Bridge:
-        // bridgeSrc is a `nix::Value *` from the tree-walker heap;
-        // not a v3 nursery pointer, so nothing to forward here.
         break;
     case ThunkState::Blackhole:
         // Mirror Suspended: walk CU's AttrSelectIC (R9) too.
@@ -1241,8 +1231,6 @@ struct Auditor {
             break;
         case ThunkState::Evaluated:
             visitValue(t->evaluated, "Thunk.evaluated");
-            break;
-        case ThunkState::Bridge:
             break;
         case ThunkState::Blackhole:
             // #705 / N1: mirror scavenger's Blackhole walk — tail and
