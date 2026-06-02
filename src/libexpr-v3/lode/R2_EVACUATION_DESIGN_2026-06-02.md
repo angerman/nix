@@ -97,11 +97,46 @@ A missed slot → after `munmap`, that slot dangles → deref → SIGSEGV, or
   forward char buffers too (with string-context side-table re-keying), or
   exclude string-bearing blocks from candidates in the first cut.
 
+## 4a. R2.4a RESULT — evacuation is SAFE (precise walk reaches ~100%)
+
+Implemented (commit `703cff5ed`): the sweep now reports precise-reachable
+vs conservative-only marked cells. **HNE: conservativeOnly = 19-213 of
+3-6 MILLION precise (0.0% pinned).** ⇒ the precise-root walk reaches
+essentially every live cell, so evacuation can move ~all sparse-block live
+cells and rewrite their references; only a handful of C-stack-pinned cells
+exist (their blocks excluded from candidates). The Stage 1/3/5 precise-root
+foundation is effectively COMPLETE post-F4. **Green-light for the mover.**
+
 ## 5. Phasing (each step gated NIX_V3_MAJOR_GC + own sub-gate, validated)
 
-- **R2.4a** EvacVisitor skeleton + candidate selection + forward map; NO
-  actual move yet (dry-run: count what WOULD move, assert against the R2.1
-  histogram). Validates selection + walk completeness. drvPath byte-equal.
+- **R2.4a DONE** (`703cff5ed`): evac-movability measure → 0.0% pinned, safe.
+
+### R2.4b mover — refined plan (the next build, gated `NIX_V3_EVAC=1` OFF)
+Requires NIX_V3_MAJOR_GC. Default-OFF so it's isolated from default/GC/CI
+paths until validated (goal §5 "default-OFF gate during bring-up"; retire
+the gate when the SHIP gate clears). Concrete decisions:
+1. **Candidate blocks**: sparse (<EVAC_PCT, default 25% live) blocks,
+   recorded as [start,end) ranges after sweep. EXCLUDE any block with a
+   conservative-only mark (R2.4a says ~0, but exclude for safety).
+2. **Mover = a tenured `EvacScavenger`** structurally mirroring the proven
+   `gc.cc::Scavenger` (forward map old→new, graylist, per-type fwd+walk,
+   drain), with the source predicate `n.contains(p)` replaced by
+   `inCandidateBlock(p)`.
+3. **Destination**: copy live candidate cells into FRESH dest blocks (mmap'd,
+   appended non-candidate, own bump pointer) — dense by construction. (A
+   later refinement can bump into dense-block free-list holes to avoid new
+   blocks; fresh-dest is simpler + correct first.)
+4. **VERIFY-BEFORE-FREE**: after the rewrite walk, re-scan each candidate
+   block; munmap ONLY if it has zero remaining marks/live cells. A block
+   that isn't fully evacuated (unexpected un-forwarded cell) is PINNED, not
+   freed — makes a missed-pointer a leak (safe) not a dangle (corruption).
+5. **Safepoint**: evacuate only at exitDepth==0 (already where major-GC
+   fires) so the C-stack is shallow (minimal conservative pins).
+6. Validation BEFORE any default-on: hello+HNE drvPath byte-equal under
+   `NIX_V3_EVAC=1`; brute audit clean; `NIX_V3_GC_STRESS=1000`; RSS drops
+   (HNE peak below the 2434 baseline). First cut may restrict candidates to
+   blocks containing only fixed-size types (Pair/List) if the all-type fwd
+   proves intricate; widen in R2.4c.
 - **R2.4b** Real copy+forward+rewrite for the SIMPLEST cell types first
   (ValuePair, ListVec — fixed-size, no char buffers), candidate blocks
   restricted to those containing only such cells. munmap emptied blocks.
