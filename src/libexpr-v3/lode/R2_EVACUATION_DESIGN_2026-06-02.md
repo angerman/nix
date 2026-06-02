@@ -149,6 +149,55 @@ SHIP gate (per the goal): M5 peak < 4096; hello/HNE below post-F4 baseline;
 wall ≤10%/15%; drvPath byte-equal on all three; --quick 6/6 + --core 19/19
 + brute under stress.
 
+## 5b. CRITICAL FINDINGS (2026-06-03) — what shapes the mover
+
+Reading the nursery `Scavenger` + cell structs surfaced two hard
+constraints that reshape R2.4b (and explain why the design doc's "mirror
+the Scavenger" was incomplete):
+
+**Finding A — v3 cells are NOT self-describing.** There is no per-cell type
+header. A cell's type is known ONLY from the `Tag` of the `Value` that
+points to it (Bindings has just a Sorted/Chain `kind`, not a cell-type
+tag). ⇒ given an arbitrary cell-start address you cannot know its type, so
+you cannot content-walk (forward its pointer fields) without a typed
+pointer to it.
+
+**Finding B — interior pointers pin Bindings/Pairs.** `Tag::Slot` and
+`Thunk::cell` point INTO `Bindings::entries[]` (let-rec slots, `with`
+resolution, upvalue capture). The nursery `Scavenger` `std::abort()`s
+rather than move a Bindings/Pair precisely because a cell-start-keyed
+forward map can't fix up interior pointers. Bindings are ~84% of the
+arena, so a cell-start-only mover would pin ~all of the interesting bytes.
+
+**Consequences for the mover:**
+- Moving a Bindings needs BOTH (i) its TYPED `Tag::Attrs` pointer (to
+  content-walk with known type) AND (ii) interior-pointer rewrite to
+  `forward[owner] + (p − owner)` for every `Tag::Slot`/`cell` into it.
+  Owner lookup uses the existing `findContainingCellStart` (cellStarts
+  bitmap). Cell COPY size is type-agnostic (span to next cell-start, as
+  the sweep computes), so copying needs no type; only content-walk does.
+- A cell reached ONLY via an interior pointer (never via a typed pointer)
+  gets copied but not content-walked → its pointees may not be forwarded.
+
+**THE LINCHPIN — verify-before-free via re-mark makes this SAFE regardless.**
+After the rewrite walk, re-mark from roots (rewritten pointers now point
+to dest). For each candidate block, `munmap` ONLY if it has zero marks.
+Any un-rewritten / dangling-into pointer re-marks the old block → it stays
+mapped (a safe leak), never a dangle. So the mover is SAFE even when
+content-walk is incomplete; incompleteness only costs YIELD (pinned
+blocks), never correctness. This is the key that lets R2.4b ship safely
+before the full Nofl per-granule metadata byte (which would add cell-type
+self-description and remove the typed-pointer dependency — a later R2.1′).
+
+**Revised R2.4b mover:** (1) candidate = sparse blocks; (2) walk roots
+transitively with EvacVisitor — typed pointers → fwd(copy+content-walk)+
+rewrite; interior Slot/cell → fwd owner (copy, span size)+rewrite to
+owner'+offset; (3) re-mark verify; (4) munmap only zero-mark candidates.
+Gated `NIX_V3_EVAC=1` OFF. Validate byte-equal + brute + GC_STRESS + RSS
+drop. First measurement: realized yield (fully-clean candidate blocks) vs
+the R2.1 opportunity — tells us if metadata-byte (R2.1′) is needed for
+M5<4096 or if the verify-clean subset already clears it.
+
 ## 6. Evacuation opportunity data (R2.1 histogram)
 
 | workload | cycle | sparseBlocks(<25%) | evacuable_RSS | copy_cost | ratio |
