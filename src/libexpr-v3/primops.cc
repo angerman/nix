@@ -3675,12 +3675,18 @@ void primReadDir(EvalState & state, Value * args, Value & out)
             }
         }
         if (!tookNativeRDPath) {
-            ++allocStats().v3ToTwBySite[1];  // #795 primReadDir attrset bridge
-            nix::Value * tw = v3ToTreeWalker(state, args[0]);
-            if (!tw) typeError("readDir", "string or path");
+            // V3-NATIVE realise (no v3ToTreeWalker bridge), as in primImport.
+            Value a0 = forceValue(*state.vm, args[0]);
+            std::string rpath; std::vector<std::string> rctx;
+            if (a0.tag() == Tag::String) {
+                rpath = a0.payload.str ? a0.payload.str : "";
+                if (auto * raw = lookupStringContextEntries(a0.payload.str)) rctx = *raw;
+            } else if (a0.tag() == Tag::Path) {
+                rpath = a0.payload.path ? a0.payload.path : "";
+            } else
+                typeError("readDir", "string or path");
             try {
-                auto resolved = ns.realisePath(nix::noPos, *tw);
-                path = resolved.path.abs();
+                path = ffi::realisePath(ns, rpath, rctx);
             } catch (...) {
                 throw;  // surface TW's error verbatim
             }
@@ -8311,11 +8317,19 @@ void primImport(EvalState & state, Value * args, Value & out)
             std::fprintf(stderr, "]\n");
             std::fflush(stderr);
         }
-        nix::Value * tw = v3ToTreeWalker(state, args[0]);
-        if (!tw) typeError("import", "string or path");
+        // V3-NATIVE: extract the path string + its context (store-path/drv
+        // refs) and realise via the FFI leaf — no v3ToTreeWalker bridge.
+        Value a0 = forceValue(*state.vm, args[0]);
+        std::string ipath; std::vector<std::string> ictx;
+        if (a0.tag() == Tag::String) {
+            ipath = a0.payload.str ? a0.payload.str : "";
+            if (auto * raw = lookupStringContextEntries(a0.payload.str)) ictx = *raw;
+        } else if (a0.tag() == Tag::Path) {
+            ipath = a0.payload.path ? a0.payload.path : "";
+        } else
+            typeError("import", "string or path");
         try {
-            auto resolved = ns.realisePath(nix::noPos, *tw);
-            path = resolved.path.abs();
+            path = ffi::realisePath(ns, ipath, ictx);
         } catch (...) {
             // Surface TW's error verbatim (build failures, missing
             // outputs, restricted-eval, etc.).

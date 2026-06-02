@@ -181,6 +181,15 @@ std::string coercePathToStoreName(nix::EvalState & state, const std::string & pa
 /// path" diagnostic uses it.
 std::string displayContextElem(nix::EvalState & state, const std::string & raw);
 
+/// Realise a path string with its string-context (store-path / drv refs →
+/// builds the IFD derivations the context names) to its resolved absolute
+/// store path.  Plain-data in: the path + its context-elem strings (a TW
+/// string is built from them INTERNALLY and realised — this is NOT a
+/// v3-graph bridge / no bridge-table entry).  THE realisePath FFI leaf
+/// (builtins.import / builtins.readDir).
+std::string realisePath(nix::EvalState & state, const std::string & path,
+                        const std::vector<std::string> & contextElems);
+
 /// builtins.readFile store-ref context attribution: if `path` is in the
 /// store, return the Opaque string-context entries for the declared
 /// references (`queryPathInfo`) whose hash physically appears in `content`

@@ -166,6 +166,18 @@ std::string displayContextElem(nix::EvalState & state, const std::string & raw)
     }
 }
 
+std::string realisePath(nix::EvalState & state, const std::string & path,
+                        const std::vector<std::string> & contextElems)
+{
+    nix::NixStringContext ctx;
+    for (auto & c : contextElems)
+        ctx.insert(nix::NixStringContextElem::parse(c));
+    nix::Value tw;
+    tw.mkString(path, ctx, state.mem);            // plain data → TW string (not a bridge)
+    auto resolved = state.realisePath(nix::noPos, tw);
+    return resolved.path.abs();
+}
+
 std::vector<std::string> storeRefsContextFor(nix::EvalState & state,
                                              const std::string & path,
                                              const std::string & content)
