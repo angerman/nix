@@ -41,7 +41,6 @@
 #include <chrono>
 
 #include "nix/expr/eval.hh"
-#include "nix/store/path-references.hh"  // #757c: PathRefScanSink for primReadFile
 
 #include <sys/resource.h>
 #if defined(__APPLE__)
@@ -3577,31 +3576,12 @@ void primReadFile(EvalState & state, Value * args, Value & out)
     // whose hash physically appears in the content).  Add those as
     // Opaque context entries.  This matches TW byte-for-byte.
     if (state.nixEvalState) {
-        auto & ns = *state.nixEvalState;
-        try {
-            if (ns.store->isInStore(path)) {
-                nix::StorePathSet refs;
-                try {
-                    auto [storePath, _sub] = ns.store->toStorePath(path);
-                    refs = ns.store->queryPathInfo(storePath)->references;
-                } catch (const nix::Error &) { /* unknown path; no refs */ }
-                if (!refs.empty()) {
-                    auto refsSink = nix::PathRefScanSink::fromPaths(refs);
-                    refsSink << content;
-                    refs = refsSink.getResultPaths();
-                }
-                if (!refs.empty()) {
-                    std::vector<std::string> ctx;
-                    ctx.reserve(refs.size());
-                    for (auto & p : refs) {
-                        nix::NixStringContextElem elem =
-                            nix::NixStringContextElem::Opaque{ .path = p };
-                        ctx.push_back(elem.to_string());
-                    }
-                    setStringContextEntries(out.payload.str, std::move(ctx));
-                }
-            }
-        } catch (...) { /* best-effort context attribution */ }
+        // Store-ref context attribution behind the FFI leaf (PathRefScanSink
+        // + queryPathInfo live in ffi.cc; this TU stays out of
+        // path-references.hh).  Returns the Opaque context-elem strings.
+        auto ctx = ffi::storeRefsContextFor(*state.nixEvalState, path, content);
+        if (!ctx.empty())
+            setStringContextEntries(out.payload.str, std::move(ctx));
     }
 }
 

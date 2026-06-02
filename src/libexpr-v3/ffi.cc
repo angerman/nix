@@ -42,6 +42,7 @@
 #include "nix/expr/value/context.hh"       // NixStringContext(Elem) (path/ctx shims)
 #include "nix/store/store-api.hh"          // Store::printStorePath / toStorePath
 #include "nix/store/globals.hh"            // nix::settings.readOnlyMode
+#include "nix/store/path-references.hh"    // PathRefScanSink (storeRefsContextFor)
 #include "nix/fetchers/fetchers.hh"        // fetchers::Input getters (readLockedFlake)
 #include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
 #include "nix/flake/flake.hh"              // flake::LockedFlake / lockFlake / LockFlags
@@ -144,6 +145,33 @@ std::string displayContextElem(nix::EvalState & state, const std::string & raw)
     } catch (...) {
         return raw;  // keep the raw form on a parse failure.
     }
+}
+
+std::vector<std::string> storeRefsContextFor(nix::EvalState & state,
+                                             const std::string & path,
+                                             const std::string & content)
+{
+    std::vector<std::string> ctx;
+    try {
+        if (state.store->isInStore(path)) {
+            nix::StorePathSet refs;
+            try {
+                auto [storePath, _sub] = state.store->toStorePath(path);
+                refs = state.store->queryPathInfo(storePath)->references;
+            } catch (const nix::Error &) { /* unknown path; no refs */ }
+            if (!refs.empty()) {
+                auto refsSink = nix::PathRefScanSink::fromPaths(refs);
+                refsSink << content;
+                refs = refsSink.getResultPaths();
+            }
+            ctx.reserve(refs.size());
+            for (auto & p : refs) {
+                nix::NixStringContextElem elem = nix::NixStringContextElem::Opaque{ .path = p };
+                ctx.push_back(elem.to_string());
+            }
+        }
+    } catch (...) { /* best-effort context attribution */ }
+    return ctx;
 }
 
 // --- Flake / fetcher marshalling (audit Phase 4) ------------------------

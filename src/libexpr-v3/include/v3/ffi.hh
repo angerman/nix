@@ -180,6 +180,16 @@ std::string coercePathToStoreName(nix::EvalState & state, const std::string & pa
 /// path" diagnostic uses it.
 std::string displayContextElem(nix::EvalState & state, const std::string & raw);
 
+/// builtins.readFile store-ref context attribution: if `path` is in the
+/// store, return the Opaque string-context entries for the declared
+/// references (`queryPathInfo`) whose hash physically appears in `content`
+/// (filtered via PathRefScanSink) — byte-for-byte matching TW.  Returns
+/// empty when `path` isn't in the store or has no matching refs.  Keeps
+/// PathRefScanSink / queryPathInfo inside ffi.cc.  Cold.
+std::vector<std::string> storeRefsContextFor(nix::EvalState & state,
+                                             const std::string & path,
+                                             const std::string & content);
+
 // -------------------------------------------------------------------------
 // Flake / fetcher marshalling (audit Phase 4 — Category D, the flake-
 // loading FFI leaf).
