@@ -36,9 +36,15 @@
 #include "nix/util/source-accessor.hh"
 #include "nix/util/error.hh"
 #include "nix/util/canon-path.hh"          // CanonPath (coercePathToStore)
+#include "nix/util/users.hh"               // getHome (homeDir)
+#include "nix/util/hash.hh"                // HashFormat / Hash (narHash SRI)
 #include "nix/expr/eval.hh"   // EvalState — ffi.cc is the one TU that wraps it
 #include "nix/expr/value/context.hh"       // NixStringContext(Elem) (path/ctx shims)
-#include "nix/store/store-api.hh"          // Store::printStorePath
+#include "nix/store/store-api.hh"          // Store::printStorePath / toStorePath
+#include "nix/fetchers/fetchers.hh"        // fetchers::Input getters (readLockedFlake)
+#include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
+#include "nix/flake/flake.hh"              // flake::LockedFlake
+#include "nix/flake/lockfile.hh"           // flake::LockedNode
 
 #include <atomic>
 #include <cstring>
@@ -125,6 +131,95 @@ std::string displayContextElem(nix::EvalState & state, const std::string & raw)
     } catch (...) {
         return raw;  // keep the raw form on a parse failure.
     }
+}
+
+// --- Flake / fetcher marshalling (audit Phase 4) ------------------------
+
+std::string homeDir()
+{
+    return nix::getHome().string();
+}
+
+namespace {
+
+/// Read one `fetchers::Input` + its `StorePath` into a plain TreeAttrsInfo.
+/// This is the EXACT field-for-field set of reads the pre-extraction
+/// `v3EmitTreeAttrs` performed (callFlakeV3 always passed
+/// emptyRevFallback=false, so that fallback branch is intentionally
+/// dropped — it never executed in the flake path).
+TreeAttrsInfo readTreeAttrs(nix::EvalState & state,
+                            const nix::StorePath & storePath,
+                            const nix::fetchers::Input & input,
+                            bool forceDirty)
+{
+    TreeAttrsInfo info;
+
+    info.printedStorePath = state.store->printStorePath(storePath);
+    nix::NixStringContextElem elem = nix::NixStringContextElem::Opaque{ .path = storePath };
+    info.opaqueContextElem = elem.to_string();
+
+    if (auto narHash = input.getNarHash())
+        info.narHash = narHash->to_string(nix::HashFormat::SRI, /*includeAlgo=*/true);
+
+    info.isGit = input.getType() == "git";
+    if (info.isGit)
+        info.submodules = nix::fetchers::maybeGetBoolAttr(input.attrs, "submodules").value_or(false);
+
+    if (!forceDirty) {
+        if (auto rev = input.getRev()) {
+            info.rev      = rev->gitRev();
+            info.shortRev = rev->gitShortRev();
+        }
+        if (auto revCount = input.getRevCount())
+            info.revCount = static_cast<int64_t>(*revCount);
+    }
+
+    if (auto dirtyRev = nix::fetchers::maybeGetStrAttr(input.attrs, "dirtyRev")) {
+        info.dirtyRev = *dirtyRev;
+        if (auto dirtyShortRev = nix::fetchers::maybeGetStrAttr(input.attrs, "dirtyShortRev"))
+            info.dirtyShortRev = *dirtyShortRev;
+    }
+
+    if (auto lastModified = input.getLastModified())
+        info.lastModified = static_cast<int64_t>(*lastModified);
+
+    return info;
+}
+
+}  // namespace
+
+LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlakePtr)
+{
+    const auto & lockedFlake =
+        *static_cast<const nix::flake::LockedFlake *>(lockedFlakePtr);
+
+    LockedFlakeInfo out;
+    auto [lockFileStr, keyMap] = lockedFlake.lockFile.to_string();
+    out.lockFileStr = std::move(lockFileStr);
+
+    out.nodes.reserve(lockedFlake.nodePaths.size());
+    for (auto & [node, sourcePath] : lockedFlake.nodePaths) {
+        auto lockedNode = node.dynamic_pointer_cast<const nix::flake::LockedNode>();
+        auto [storePath, subdir] = state.store->toStorePath(sourcePath.path.abs());
+
+        const auto & inputForNode =
+            lockedNode ? lockedNode->lockedRef.input
+                       : lockedFlake.flake.lockedRef.input;
+        const bool forceDirty = !lockedNode && lockedFlake.flake.forceDirty;
+
+        FlakeNodeInfo n;
+        n.sourceInfo = readTreeAttrs(state, storePath, inputForNode, forceDirty);
+        n.dir = std::string(nix::CanonPath(subdir).rel());
+
+        auto key = keyMap.find(node);
+        if (key == keyMap.end())
+            throw std::runtime_error(
+                "v3::readLockedFlake: node missing from lockfile keyMap");
+        n.key = key->second;
+
+        out.nodes.push_back(std::move(n));
+    }
+    return out;
 }
 
 }  // namespace ffi

@@ -172,6 +172,68 @@ std::string coercePathToStoreName(nix::EvalState & state, const std::string & pa
 /// path" diagnostic uses it.
 std::string displayContextElem(nix::EvalState & state, const std::string & raw);
 
+// -------------------------------------------------------------------------
+// Flake / fetcher marshalling (audit Phase 4 — Category D, the flake-
+// loading FFI leaf).
+//
+// `v3_call_flake.cc` builds the `getFlake` result V3-NATIVE (v3 Bindings /
+// strings, run on the v3 VM), but the INPUTS it reads — the locked-flake's
+// per-node `fetchers::Input` + store paths + lockfile text — are
+// libflake / libfetchers / libstore types.  These plain-data structs +
+// `readLockedFlake()` keep ALL of that type access inside ffi.cc, so
+// v3_call_flake.cc names no `nix/...` flake/fetcher type and the v3 LIBRARY
+// stops pulling libflake/libfetchers headers.  The extracted fields mirror
+// the pre-extraction inline reads (callFlakeV3 + v3EmitTreeAttrs) field-
+// for-field — the sourceInfo attrs feed downstream drvPaths, so byte parity
+// is mandatory.
+// -------------------------------------------------------------------------
+
+/// Per-node `sourceInfo` source data, pre-read from a `fetchers::Input` +
+/// `StorePath` (emitTreeAttrs's inputs).  `std::nullopt` ⇒ the attr is
+/// absent (v3 side omits it).  `emptyRevFallback` is fixed false in the
+/// flake path, so the dirty-fetchGit fallback is not represented here.
+struct TreeAttrsInfo
+{
+    std::string                printedStorePath;   ///< store->printStorePath(sp)
+    std::string                opaqueContextElem;  ///< Opaque{path=sp}.to_string()
+    std::optional<std::string> narHash;            ///< getNarHash()→SRI(+algo)
+    bool                       isGit = false;      ///< getType()=="git" (gates `submodules`)
+    bool                       submodules = false; ///< maybeGetBoolAttr(attrs,"submodules")
+    std::optional<std::string> rev;                ///< getRev()→gitRev()
+    std::optional<std::string> shortRev;           ///< getRev()→gitShortRev()
+    std::optional<int64_t>     revCount;           ///< getRevCount()
+    std::optional<std::string> dirtyRev;           ///< attrs["dirtyRev"]
+    std::optional<std::string> dirtyShortRev;      ///< attrs["dirtyShortRev"]
+    std::optional<int64_t>     lastModified;       ///< getLastModified()
+};
+
+/// One locked-flake node, ready for callFlakeV3's `overrides` attrset.
+struct FlakeNodeInfo
+{
+    std::string   key;          ///< lockfile keyMap entry for this node
+    std::string   dir;          ///< CanonPath(subdir).rel()
+    TreeAttrsInfo sourceInfo;
+};
+
+/// Everything callFlakeV3 reads out of a `nix::flake::LockedFlake`.
+struct LockedFlakeInfo
+{
+    std::string                lockFileStr;   ///< lockFile.to_string().first
+    std::vector<FlakeNodeInfo> nodes;         ///< nodePaths order (v3 side re-sorts)
+};
+
+/// Read a `nix::flake::LockedFlake` (passed opaquely as `const void *`;
+/// ffi.cc casts it back) into plain data: the lockfile text + per-node
+/// store-path / fetcher-input fields.  Performs `lockFile.to_string`, the
+/// per-node `store->toStorePath` + `dynamic_pointer_cast<LockedNode>` +
+/// `emitTreeAttrs`-equivalent field reads (emptyRevFallback = false,
+/// forceDirty per node).  THE flake-loading FFI leaf.
+LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlakePtr);
+
+/// `nix::getHome().string()` — the synthetic homePath for parsing the
+/// in-memory call-flake.nix source.  Cold (once, lazily).
+std::string homeDir();
+
 }  // namespace ffi
 
 // =========================================================================

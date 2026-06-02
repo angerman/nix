@@ -11833,8 +11833,11 @@ void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("f
 // implemented natively in v3 above (lines 7319 / 7380); only getFlake
 // needs the TW bridge here.
 // #758: v3-native getFlake — sole implementation.
-// Forward-declare callFlakeV3 (defined in v3_call_flake.cc).
-Value callFlakeV3(EvalState & state, const nix::flake::LockedFlake & lockedFlake);
+// Forward-declare callFlakeV3 (defined in v3_call_flake.cc).  Audit Phase 4:
+// callFlakeV3 now takes plain data (ffi::LockedFlakeInfo) so v3_call_flake.cc
+// names no libflake type; the LockedFlake → plain-data read happens here via
+// ffi::readLockedFlake (this TU legitimately holds the libflake types).
+Value callFlakeV3(EvalState & state, const ffi::LockedFlakeInfo & flakeInfo);
 
 void primGetFlake(EvalState & s, Value * a, Value & o) {
     // History:
@@ -11921,10 +11924,12 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
             (unsigned long long)dbgRssMB(),
             lockedFlake.nodePaths.size());
 
-    // (2) v3-native call-flake.nix evaluation.  callFlakeV3 builds
-    //     TW args, bridges to v3, applies the cached closure × 3,
-    //     returns a v3 Value.
-    o = callFlakeV3(s, lockedFlake);
+    // (2) v3-native call-flake.nix evaluation.  Read the locked flake into
+    //     plain data here (the FFI leaf — this TU holds the libflake types),
+    //     then callFlakeV3 builds the args V3-NATIVE + applies the cached
+    //     closure × 3, returning a v3 Value.
+    auto flakeInfo = ffi::readLockedFlake(ns, &lockedFlake);
+    o = callFlakeV3(s, flakeInfo);
 }
 
 void registerPrimOp(const PrimOp & op)
