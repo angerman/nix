@@ -65,14 +65,7 @@ struct VMState;  // forward decl for maybeSamplePeriodicLiveFraction
 /// scripts (see `bench/m5-cron.sh` for the ledger convention).
 void dumpV3LiveFraction() noexcept;
 
-/// 2026-05-29 evening (DIAG bridge analysis): per-bridge-entry
-/// transitive retention dump.  Gated NIX_V3_DUMP_BRIDGE_RETENTION=1.
-/// For each bridge entry, walks transitively from that entry's
-/// v3Value and counts bytes reached.  Emits top-20 + histogram.
-/// No cross-entry dedup (each row is "what THIS entry holds").
-/// Cost: N transitive walks (~hundreds of ms for HNE; minutes for
-/// M5 at 10K+ entries).  Diagnostic-only.
-void dumpV3BridgeRetention() noexcept;
+// (dumpV3BridgeRetention retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
 /// Day 5 2026-05-28: per-block live-bytes probe for the Stage 6
 /// generational tenured collector decision (per

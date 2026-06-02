@@ -95,23 +95,6 @@ namespace nix {
 
 namespace nix::v3 {
 
-/// #705 (2026-05-20): walk the v3 bridge-table roots for the
-/// scavenger.  Each Value held in `v3BridgeClosures()` /
-/// `v3BridgeAttrs()` / `v3BridgeLists()` carries a potential
-/// nursery pointer (Closure / Bindings / ListVec) in its payload.
-/// Without this walk, a TW->v3 bridge handle's underlying v3 Value
-/// can be left pointing into freed nursery memory after a scavenge.
-///
-/// Symptom: hello.drvPath SIGSEGVed after scavenge#1 even when
-/// `forwarded=0` (no objects were reachable via the standard roots
-/// — vm.valueStack / vm.withStack / vm.frames — yet the dispatch
-/// loop later dereferenced a nursery pointer obtained via a bridge
-/// table lookup).
-///
-/// The callback receives each `Value &` in turn; it should forward
-/// the payload (e.g. by calling the scavenger's `visitValue`).
-/// Implemented in `primops.cc` where the bridge tables live.
-void walkV3BridgeRoots(const std::function<void(Value &)> & visit);
 
 /// #705 (2026-05-21): walk the import-cache results.  Each entry in
 /// `importCache().results` holds a Value whose payload may carry a
@@ -128,39 +111,10 @@ void walkImportCacheRoots(const std::function<void(Value &)> & visit);
 /// via NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1 in run.cc.
 void clearImportCacheResultsForDiag() noexcept;
 
-/// 2026-05-29 evening: clear bridge tables (v3 ↔ TW handles).
-/// Companion to clearImportCacheResultsForDiag.  Gated via
-/// NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1.  UNSAFE if TW callbacks
-/// fire subsequently.
-void clearV3BridgesForDiag() noexcept;
 
-/// 2026-05-29 evening (DIAG analysis): bridge-table sizes for
-/// periodic L(t) sampling + NIX_VM_STATS dump.  Returns
-/// (closures, attrs, lists) entry counts.  Each entry = 24 B
-/// (Value + Expr* fallback) + transitive v3-heap retention.
-std::array<size_t, 3> v3BridgeTableSizes() noexcept;
 
-/// Unique v3-pointer counts within bridge tables.  If unique <<
-/// table size, many entries duplicate the same v3Value (dedup-on-
-/// push could collapse).  Returns (closures, attrs, lists).
-std::array<size_t, 3> v3BridgeUniquePtrCounts() noexcept;
 
-/// Iterate every v3 ↔ TW bridge entry; calls cb(v3Value, kind, idx)
-/// for each.  Used by dumpV3BridgeRetention to compute per-entry
-/// transitive retention without exposing the bridge-entry types.
-void forEachV3BridgeEntry(
-    const std::function<void(const Value &, const char *, size_t)> & cb) noexcept;
 
-/// #875 Stage 0 (2026-05-29): dump per-access-count-bucket distribution
-/// of bridge entries to `out`.  Decision input for Stage 1 (weak-bridge
-/// eviction) SHIP gate.  See
-/// `lode/WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md`.
-///
-/// No-op when all bridge tables are empty.  Always-on under
-/// NIX_VM_STATS=1; idle cost outside NIX_VM_STATS is zero (function
-/// isn't called).  Per-dispatch instrumentation cost is constant
-/// (one relaxed atomic fetch_add + a non-atomic uint32 increment).
-void dumpBridgeAccessDistribution(std::FILE * out) noexcept;
 
 /// 2026-05-29 evening (production end-of-eval clear): drop bridges +
 /// import-cache results at the end of `nix eval`'s render phase to
@@ -183,74 +137,9 @@ void dumpBridgeAccessDistribution(std::FILE * out) noexcept;
 /// Reports stats under NIX_VM_STATS=1.
 void clearPostEvalGlobalRoots() noexcept;
 
-/// REVIEW §2.1: RAII guard for the thread-local fallback Expr pointer
-/// that primV3{CallBridge1,ForceAttr,ForceListElem} read on cycle
-/// detection.  Setting it via raw save/restore was leaking the prior
-/// outer Expr's fallback into the catch path on some throw shapes,
-/// routing a subsequent re-entry's cycle-fallback to the wrong Expr.
-/// Use `ScopedBridgeFallbackExpr` to bind for an RAII scope; pop on
-/// every exit including throws.
-struct ScopedBridgeFallbackExpr {
-    nix::Expr * saved;
-    ScopedBridgeFallbackExpr(nix::Expr * e);
-    ~ScopedBridgeFallbackExpr();
-};
 
-/// #458 step 2: when TW is about to dispatch a `__v3_call_bridge_1`
-/// PrimOpApp, route the call directly through v3's callClosure
-/// instead of going through TW's primop dispatch (which fires bridge1
-/// and forces args eagerly, the cardano-node #455 cycle source).
-///
-/// `funValue` must be a Value of v3 internal type bound to the bridge1
-/// PrimOp; `arg` is the TW Value passed in (unforced -- v3 will force
-/// on demand inside the closure body via the Bridge thunk).
-/// `out` receives the result, bridged back to a TW Value.
-///
-/// Returns true if the value was dispatched directly via v3.
-/// Returns false if the value isn't a bridge1 PrimOpApp or the
-/// handle is invalid (caller should then fall through to TW's
-/// regular primop dispatch).
-bool tryDispatchBridge1Direct(nix::EvalState & ns,
-                              const nix::Value & funValue,
-                              nix::Value * arg,
-                              nix::Value & out,
-                              const nix::PosIdx pos);
 
-/// #493: dispatch helper for the TW-lambda formals-closure bridge.
-///
-/// When `v3ToTreeWalker` bridges a v3 Tag::Closure with hasFormals=true
-/// to TW, it produces a `Tag::tLambda` Value whose `lambda.env` is a
-/// sentinel keyed in `v3FormalsLambdaBridges()` to the underlying v3
-/// Closure (with captured upvalues).  TW's `autoCallFunction` introspects
-/// formals via `lambda.fun` (the original ExprLambda) and dispatches via
-/// `callFunction`; this helper detects the sentinel env, recovers the
-/// v3 Closure from the side-table, and runs the body in v3 with the
-/// captured upvalues.
-///
-/// Returns true if the value was dispatched directly via v3.  Returns
-/// false if `funValue` is NOT a TW lambda whose `lambda.env` is in the
-/// bridge side-table (caller falls through to the regular call hook
-/// logic).
-bool tryDispatchFormalsLambdaBridge(nix::EvalState & ns,
-                                    const nix::Value & funValue,
-                                    nix::Value * arg,
-                                    nix::Value & out,
-                                    const nix::PosIdx pos);
 
-/// #466 OP_CALL Bridge round-trip elimination.
-///
-/// If `funTw` is a forced TW Value of the shape
-/// `mkPrimOpApp(__v3_call_bridge_1, vHandle)` — i.e., a v3 closure
-/// that was bridged TO TW via v3ToTreeWalker — return the original v3
-/// closure Value.  Returns an unset Value (tag=Uninitialized) for any
-/// other shape.
-///
-/// Lets the OP_CALL Bridge handler skip the ns->callFunction round-
-/// trip and dispatch the v3 closure directly via callClosure on the
-/// caller's VMState — eliminating the cross-VMState force scenario
-/// that motivates the lambda-skip cycle (#466).  Caller must have
-/// forced `funTw` first; this function performs no forcing.
-bool tryUnwrapBridge1Closure(const nix::Value & funTw, Value & outV3Fn);
 
 /// STG-14a (#509/#515): direct v3-side dispatch for a TW lambda whose
 /// body has been pre-lowered to v3 IR (i.e. lambda.fun is in
@@ -360,31 +249,7 @@ struct ScopedActiveV3VM {
 /// that need to force from C++).
 Value forceValue(VMState & vm, Value v);
 
-/// #458 step A.2: per-attribute lookup against a Bridge thunk's TW
-/// Value source WITHOUT forcing the whole TW Value.  Used by
-/// OP_WITH_LOOKUP to resolve names against a partially-constructed
-/// fix-point attrset (cardano-node #455 shape: `with self;` over
-/// `extends overlay self` where `self` is mid-construction).
-///
-/// Returns nullopt when the lookup can't be made safely (src still
-/// thunk-shaped, not an attrset, name absent, entry itself mid-
-/// blackhole).  Returns the bridged v3 Value otherwise -- itself
-/// possibly a fresh Bridge thunk if the attr's body is still a TW
-/// thunk, preserving laziness one more level.
-std::optional<Value> tryBridgeAttrLookup(Thunk * t, uint32_t v3name);
 
-/// #458 step B (canonicalization): scalar fast-path for TW->v3
-/// bridging.  When `nv` is an already-forced scalar (Int / Float /
-/// Bool / Null), inline-write the equivalent v3::Value into `out`
-/// and return true -- skipping the heavyweight `treeWalkerToV3Public`
-/// path (VMState allocation + depth check + fiber yield + the type
-/// switch).  Returns false if `nv` is not a known scalar; caller
-/// must use the regular bridge path.
-///
-/// This reduces TW reliance: every scalar arg / attr / element
-/// previously cost a Bridge-thunk alloc + future treeWalkerToV3
-/// callback; now zero TW work after the fast bridge.
-bool tryFastBridgeScalarTwToV3(const nix::Value & nv, Value & out);
 
 /// STG-14b (#516): get-or-create a v3 Bridge thunk for a TW Value*.
 /// Returns the SAME `Thunk*` for repeated calls with the same `srcV`,
@@ -401,21 +266,8 @@ bool tryFastBridgeScalarTwToV3(const nix::Value & nv, Value & out);
 /// accept that small staleness window over breaking the
 /// blackhole-identity invariant.
 struct Thunk;
-Thunk * getOrAllocBridgeThunkCached(nix::Value * srcV);
 
 
-/// #458 step A.4: existence check sibling to tryBridgeAttrLookup,
-/// for the `attrs ? name` operator (OP_ATTRS_HAS).  Returns:
-///   - 0: src not in a state where we can answer (still thunk-shaped,
-///        not an attrset).  Caller should fall back to wholesale force.
-///   - 1: name is present in the partial bindings.
-///   - 2: src is an attrset, name is NOT present.
-/// Distinguishes 0 from 2 because for `has`, "not present in partial
-/// bindings" is the authoritative answer if the OUTER thunk is already
-/// nAttrs (Bindings is published, even if entries are still thunks --
-/// no entry will be added later).
-enum class BridgeAttrHasResult : uint8_t { Indeterminate = 0, Present = 1, Absent = 2 };
-BridgeAttrHasResult tryBridgeAttrHas(Thunk * t, uint32_t v3name);
 
 /// Function pointer signature.  The primop is given a span of forced
 /// argument Values (the dispatcher arranges forcing) and writes its
@@ -503,57 +355,10 @@ void registerPrimOp(const PrimOp & op);
 /// Idempotent; call during EvalState init.
 void registerBuiltinPrimOps();
 
-/// #458 step B: bridge telemetry.  Track every v3<->TW value bridging
-/// site so we can see (a) how often each direction fires and (b) how
-/// much wall-time we spend in each.  The user directive: minimise
-/// v3->tw->v3 round-trips.  The telemetry is the ground truth that
-/// tells us where to attack next.
-///
-/// Counters are atomic uint64_t and always-on (~1 ns per call).
-/// Timings are atomic uint64_t nanoseconds, gated by
-/// NIX_V3_BRIDGE_TIMING=1 because steady_clock::now() is ~10-30 ns
-/// per call and would dominate the bridges we're measuring.
-///
-/// Six bridge sites are instrumented:
-///   - twToV3_full:   `treeWalkerToV3Public` whole-value bridge.
-///   - twToV3_scalar: scalar fast-path hits.
-///   - twToV3_attr:   `tryBridgeAttrLookup` per-attr peek (success).
-///   - twToV3_has:    `tryBridgeAttrHas` per-attr existence (success).
-///   - v3ToTw:        `v3ToTreeWalkerPublic` whole-value bridge.
-///   - twForce:       TW state.forceValue calls from v3 hooks (force
-///                    cycles that route TW->v3->TW->v3).
-enum class BridgeKind : uint8_t {
-    TwToV3Full = 0,
-    TwToV3Scalar,
-    TwToV3Attr,
-    TwToV3Has,
-    V3ToTw,
-    TwForce,
-    Count
-};
 
-void bridgeTelemetryBump(BridgeKind k, uint64_t ns);
-void dumpBridgeTelemetry(std::FILE * out);
 
-/// Sum nanoseconds accumulated across all bridge kinds.  Only
-/// populated when NIX_V3_BRIDGE_TIMING=1.  Used by run.cc's
-/// PhaseTimer to split run_ms into vm_ms (pure v3 dispatch) and
-/// bridge_ms (TW-side time reached via the bridge).  Returns 0 when
-/// timing is disabled, so callers can unconditionally subtract.
-uint64_t bridgeTotalNs();
 
-/// Whether NIX_V3_BRIDGE_TIMING=1 was set at process start.
-bool bridgeTimingEnabled();
 
-/// RAII timer that bumps the per-kind counter and (when timing is
-/// enabled) accumulates wall time.  Use:
-///   { BridgeTimer t(BridgeKind::TwToV3Full); ... heavy work ... }
-struct BridgeTimer {
-    BridgeKind kind;
-    uint64_t startNs;
-    BridgeTimer(BridgeKind k);
-    ~BridgeTimer();
-};
 
 /// Per-primop call counter.  Bumped on every OP_CALL_PRIMOP.  Used
 /// for profiling — invaluable for working out which primops are hot
