@@ -3526,68 +3526,35 @@ void primReadDir(EvalState & state, Value * args, Value & out)
     else if (args[0].isPath()) path = args[0].payload.path;
     else if (args[0].isAttrs()) {
         // #793 (2026-05-24): derivation/attrset arg — mirror TW's
-        // prim_readDir, which uses realisePath to coerce + realise the
-        // path.  Surfaced in haskell.nix's haskell-nix-example via
-        // `builtins.readDir hello-plan-to-nix-pkgs` (an IFD output).
+        // prim_readDir, which routes the arg through realisePath →
+        // coerceToPath → coerceToString.  Surfaced in haskell.nix's
+        // haskell-nix-example via `builtins.readDir <cleanSourceWith>`
+        // where the arg is `{ outPath = <derivation-attrs>; filterPath; }`
+        // — i.e. `outPath` is ITSELF an attrset (a derivation), so the
+        // coercion must recurse (outPath → its outPath → … → store-path
+        // string) and may also go via `__toString`.
+        //
+        // TW_VALUE_ERADICATION (2026-06-02): the deleted #875 bridge
+        // previously provided this RECURSIVE coercion via TW's
+        // coerceToString.  The prior native handler only resolved a
+        // single-level STRING `outPath`, so an attrset-valued outPath
+        // (the haskell.nix shape) fell through to a type error — an F4
+        // regression on HNE.  `toStringCoerceCtx` is the V3-NATIVE
+        // equivalent of TW's coerceToString: it tries `__toString`
+        // (calling the v3 closure on `self`) first, then `outPath`,
+        // recursing, and threads the string context needed for the IFD
+        // realise.  This is the same coercion `builtins.toString` uses.
         if (!state.nixEvalState)
             typeError("readDir", "string or path");
         ++allocStats().ifdProbeWithCtx[kIfdReadDir];
         auto & ns = *state.nixEvalState;
-        // #804 Phase E1: same v3-native outPath extraction as primImport
-        // (H7 fix).  Bypasses the v3ToTreeWalker bridge cascade for
-        // attrset args; preserves context for realisePath.
-        // Opt-OUT: NIX_V3_NO_NATIVE_READDIR_ATTRSET=1.
-        static const bool s_noNativeReadDirAttrset =
-            std::getenv("NIX_V3_NO_NATIVE_READDIR_ATTRSET") != nullptr;
-        bool tookNativeRDPath = false;
-        if (!s_noNativeReadDirAttrset) {
-            const Bindings * b = args[0].payload.bindings;
-            Value * outPathRef = nullptr;
-            if (b) {
-                static const SymbolId sOutPath = ir::globalInternSymbol("outPath");
-                for (uint32_t i = 0; i < b->size; ++i) {
-                    if (b->entries[i].name == sOutPath) {
-                        outPathRef = const_cast<Value *>(&b->entries[i].value);
-                        break;
-                    }
-                }
-            }
-            if (outPathRef) {
-                try {
-                    Value forced = forceValue(*state.vm, *outPathRef);
-                    if (forced.isString() && forced.payload.str) {
-                        nix::Value twStr;
-                        if (auto * raw = lookupStringContextEntries(forced.payload.str)) {
-                            nix::NixStringContext ctx = decodeStringContext(*raw);
-                            twStr.mkString(forced.payload.str, ctx, ns.mem);
-                        } else {
-                            twStr.mkString(forced.payload.str, ns.mem);
-                        }
-                        auto resolved = ns.realisePath(nix::noPos, twStr);
-                        path = resolved.path.abs();
-                        tookNativeRDPath = true;
-                    }
-                } catch (...) {
-                    tookNativeRDPath = false;
-                }
-            }
-        }
-        if (!tookNativeRDPath) {
-            // V3-NATIVE realise (no v3ToTreeWalker bridge), as in primImport.
-            Value a0 = forceValue(*state.vm, args[0]);
-            std::string rpath; std::vector<std::string> rctx;
-            if (a0.tag() == Tag::String) {
-                rpath = a0.payload.str ? a0.payload.str : "";
-                if (auto * raw = lookupStringContextEntries(a0.payload.str)) rctx = *raw;
-            } else if (a0.tag() == Tag::Path) {
-                rpath = a0.payload.path ? a0.payload.path : "";
-            } else
-                typeError("readDir", "string or path");
-            try {
-                path = ffi::realisePath(ns, rpath, rctx);
-            } catch (...) {
-                throw;  // surface TW's error verbatim
-            }
+        std::vector<std::string> rctx;
+        std::string coerced =
+            toStringCoerceCtx(state, args[0], rctx, /*copyPathsToStore=*/false);
+        try {
+            path = ffi::realisePath(ns, coerced, rctx);
+        } catch (...) {
+            throw;  // surface TW's error verbatim
         }
     }
     else typeError("readDir", "string or path");
@@ -6156,99 +6123,29 @@ void primImport(EvalState & state, Value * args, Value & out)
         // For non-IFD plain string/path, the fast-path above stays cheap;
         // we only pay the bridge tax when we'd otherwise typeError.
         auto & ns = *state.nixEvalState;
-        // #803 Phase D candidate (H7): bypass full bridge for attrset
-        // args.  Extract outPath v3-natively, build TW string with
-        // same context, call realisePath.  Avoids the
-        // primV3ForceAttr cascade where TW iterates ALL attrs (which
-        // forces legacyPackages etc. on haskell.nix flake outputs,
-        // triggering apple-sdk + python3 builds).
-        //
-        // Opt-OUT: NIX_V3_NO_NATIVE_IMPORT_ATTRSET=1 falls back to the
-        // legacy full-bridge code path below.
-        static const bool s_noNativeImportAttrset =
-            std::getenv("NIX_V3_NO_NATIVE_IMPORT_ATTRSET") != nullptr;
-        bool tookNativePath = false;
-        if (!s_noNativeImportAttrset) {
-            const Bindings * b = args[0].payload.bindings;
-            Value * outPathRef = nullptr;
-            if (b) {
-                static const SymbolId sOutPath = ir::globalInternSymbol("outPath");
-                // Bindings entries are sorted by SymbolId; linear scan
-                // fine for typical attrset sizes (< 32).
-                for (uint32_t i = 0; i < b->size; ++i) {
-                    if (b->entries[i].name == sOutPath) {
-                        outPathRef = const_cast<Value *>(&b->entries[i].value);
-                        break;
-                    }
-                }
-            }
-            if (outPathRef) {
-                try {
-                    Value forced = forceValue(*state.vm, *outPathRef);
-                    if (forced.isString() && forced.payload.str) {
-                        nix::Value twStr;
-                        if (auto * raw = lookupStringContextEntries(forced.payload.str)) {
-                            nix::NixStringContext ctx = decodeStringContext(*raw);
-                            twStr.mkString(forced.payload.str, ctx, ns.mem);
-                        } else {
-                            twStr.mkString(forced.payload.str, ns.mem);
-                        }
-                        auto resolved = ns.realisePath(nix::noPos, twStr);
-                        path = resolved.path.abs();
-                        tookNativePath = true;
-                        static const bool s_dbgH7 = std::getenv("V3_DBG_H7") != nullptr;
-                        if (s_dbgH7)
-                            std::fprintf(stderr,
-                                "v3 H7 native-import path=%s\n", path.c_str());
-                    }
-                } catch (...) {
-                    // Force or realise threw; fall through to bridge.
-                    tookNativePath = false;
-                }
-            }
-        }
-        if (tookNativePath) {
-            // Done — skip the bridge code below.
-        } else {
-        ++allocStats().v3ToTwBySite[3];  // #795 primImport attrset arg
-        // #795 Phase A2: trace IFD-class attrset imports.
-        static const bool s_dbgIfdAttr = std::getenv("V3_DBG_IFD") != nullptr;
-        if (s_dbgIfdAttr) {
-            // List attr names — helps identify what's being imported.
-            const Bindings * b = args[0].payload.bindings;
-            std::fprintf(stderr, "v3 IFD-IMPORT-ATTRSET nAttrs=%u attrs=[",
-                b ? b->size : 0);
-            if (b) {
-                const auto & syms = ir::globalSymbolTable();
-                for (uint32_t i = 0; i < b->size && i < 12; ++i) {
-                    SymbolId sid = b->entries[i].name;
-                    std::string_view n = sid < syms.size() ? std::string_view(syms[sid]) : "?";
-                    std::fprintf(stderr, "%s%.*s", i ? "," : "", (int)n.size(), n.data());
-                }
-                if (b->size > 12) std::fprintf(stderr, ",...+%u", b->size - 12);
-            }
-            std::fprintf(stderr, "]\n");
-            std::fflush(stderr);
-        }
-        // V3-NATIVE: extract the path string + its context (store-path/drv
-        // refs) and realise via the FFI leaf — no v3ToTreeWalker bridge.
-        Value a0 = forceValue(*state.vm, args[0]);
-        std::string ipath; std::vector<std::string> ictx;
-        if (a0.tag() == Tag::String) {
-            ipath = a0.payload.str ? a0.payload.str : "";
-            if (auto * raw = lookupStringContextEntries(a0.payload.str)) ictx = *raw;
-        } else if (a0.tag() == Tag::Path) {
-            ipath = a0.payload.path ? a0.payload.path : "";
-        } else
-            typeError("import", "string or path");
+        // TW_VALUE_ERADICATION (2026-06-02): mirror TW's `import`
+        // (libexpr/primops.cc:434) → realisePath → coerceToPath →
+        // coerceToString.  An attrset arg (a derivation, or
+        // haskell.nix's `{ outPath = <drv-attrs>; … }` where `outPath`
+        // is ITSELF an attrset) must coerce RECURSIVELY via `__toString`
+        // (called on `self`) then `outPath`, threading the build/store
+        // context (DrvDeep / Opaque) so realisePath can perform the IFD
+        // build.  The deleted #875 bridge provided this via TW's
+        // coerceToString; `toStringCoerceCtx` is the V3-NATIVE
+        // equivalent.  The prior native handler resolved only a
+        // single-level STRING `outPath`, so an attrset-valued outPath
+        // (the haskell.nix shape) fell through to a type error — the
+        // same F4 regression class fixed in primReadDir.
+        std::vector<std::string> ictx;
+        std::string coerced =
+            toStringCoerceCtx(state, args[0], ictx, /*copyPathsToStore=*/false);
         try {
-            path = ffi::realisePath(ns, ipath, ictx);
+            path = ffi::realisePath(ns, coerced, ictx);
         } catch (...) {
             // Surface TW's error verbatim (build failures, missing
             // outputs, restricted-eval, etc.).
             throw;
         }
-        }  // #803 H7 close: tookNativePath fallback block
     }
     else {
         // #493 diag: when args[0] is a Bridge thunk, print the TW
