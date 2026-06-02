@@ -275,6 +275,26 @@ TreeAttrsInfo fetchTree(nix::EvalState & state, const FetchTreeInput & in,
 /// `nix/util/url.hh` in ffi.cc).  Cold (once per fetchGit call).
 std::string fixGitURL(const std::string & url);
 
+/// Result of a fetchurl/fetchTarball fetch: the printed store path + its
+/// Opaque string-context entry (so v3 builds the result string V3-NATIVE,
+/// matching TW's `mkStorePathString` = printStorePath + Opaque-context).
+struct FetchUrlResult
+{
+    std::string printedStorePath;
+    std::string opaqueContextElem;
+};
+
+/// THE fetchurl/fetchTarball FFI leaf (eradicates the bridgeBuiltin round-
+/// trip).  Mirrors TW's `fetch` helper (fetchTree.cc:416-507): pseudo-url
+/// resolve (tarball) + checkURI + name default + checkName + pure-eval
+/// sha256 requirement + makeFixedOutputPath substitute early-exit +
+/// downloadFile / downloadTarball+fetchToStore + hash-mismatch check +
+/// allowPath.  `name` may be empty ("" → baseNameOf(url)); `unpack` selects
+/// tarball.  No `nix::Value` crosses.
+FetchUrlResult fetchUrl(nix::EvalState & state, const std::string & url,
+                        const std::optional<std::string> & sha256,
+                        std::string name, bool unpack, const std::string & who);
+
 /// Read a `nix::flake::LockedFlake` (passed opaquely as `const void *`;
 /// ffi.cc casts it back) into plain data: the lockfile text + per-node
 /// store-path / fetcher-input fields.  Performs `lockFile.to_string`, the

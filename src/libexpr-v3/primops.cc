@@ -11872,7 +11872,64 @@ static void v3FetchTree(EvalState & s, Value * a, Value & o,
     o = v3EmitTreeAttrs(info);
 }
 
-void primFetchurl    (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchurl",    s, a, o); }
+// forceStringNoCtx for a v3 value: force, require String, reject context
+// (matches TW state.forceStringNoCtx).  Used by the fetchurl/fetchTarball
+// arg extraction.
+static std::string v3ForceStringNoCtx(EvalState & state, const Value & vIn, const char * what)
+{
+    Value v = forceValue(*state.vm, vIn);
+    if (v.tag() != Tag::String || !v.payload.str)
+        throw std::runtime_error(std::string(what) + ": expected a string");
+    if (auto * raw = lookupStringContextEntries(v.payload.str); raw && !raw->empty())
+        throw std::runtime_error(
+            std::string(what) + ": the string is not allowed to refer to a store path");
+    return std::string(v.payload.str);
+}
+
+// TW-VALUE ERADICATION F2: native fetchurl/fetchTarball (the `fetch()`
+// family).  Extracts url/sha256/name V3-NATIVE (TW fetchTree.cc:389-414),
+// calls ffi::fetchUrl (the libfetchers leaf — downloadFile/downloadTarball),
+// builds the store-path string V3-NATIVE with Opaque context.  No bridge.
+static void v3Fetch(EvalState & s, Value * a, Value & o,
+                    const char * who, bool unpack, const char * defaultName)
+{
+    if (!s.nixEvalState)
+        throw std::runtime_error(std::string("v3 ") + who + ": no tree-walker state available");
+    auto & ns = *s.nixEvalState;
+
+    Value arg = forceValue(*s.vm, a[0]);
+    std::optional<std::string> url, sha256;
+    std::string name = defaultName;
+
+    if (arg.isAttrs() && arg.payload.bindings) {
+        const Bindings * b = arg.payload.bindings;
+        if (b->isChain()) b = b->materialize();
+        auto & symTab = ir::globalSymbolTable();
+        for (uint32_t i = 0; i < b->size; ++i) {
+            const SymbolId nid = b->entries[i].name;
+            std::string n(nid < symTab.size() ? symTab[nid] : std::to_string(nid));
+            if (n == "url")
+                url = v3ForceStringNoCtx(s, b->entries[i].value, "while evaluating the url we should fetch");
+            else if (n == "sha256")
+                sha256 = v3ForceStringNoCtx(s, b->entries[i].value, "while evaluating the sha256 of the content we should fetch");
+            else if (n == "name")
+                name = v3ForceStringNoCtx(s, b->entries[i].value, "while evaluating the name of the content we should fetch");
+            else
+                throw std::runtime_error("unsupported argument '" + n + "' to '" + std::string(who) + "'");
+        }
+        if (!url)
+            throw std::runtime_error("'url' argument required");
+    } else {
+        url = v3ForceStringNoCtx(s, arg, "while evaluating the url we should fetch");
+    }
+
+    ffi::FetchUrlResult r = ffi::fetchUrl(ns, *url, sha256, name, unpack, who);
+    o = mkStringValueOwned(r.printedStorePath);
+    std::vector<std::string> ctx{ r.opaqueContextElem };
+    setStringContextEntries(o.payload.str, std::move(ctx));
+}
+
+void primFetchurl    (EvalState & s, Value * a, Value & o) { v3Fetch(s, a, o, "fetchurl",     false, ""); }
 // #700/step 3: v3-side wrapper for TW's `internalPrimOps["fetchFinalTree"]`.
 // Unlike `builtins.fetchTree` (in TW's builtins attrset), fetchFinalTree
 // is registered in TW's `internalPrimOps` map and isn't reachable via
@@ -11892,7 +11949,7 @@ void primFetchFinalTree(EvalState & s, Value * a, Value & o) {
     ffi::callFunction(ns, **pPrim, *narg, twResult, nix::noPos);
     o = treeWalkerToV3Public(ns, twResult);
 }
-void primFetchTarball(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchTarball", s, a, o); }
+void primFetchTarball(EvalState & s, Value * a, Value & o) { v3Fetch(s, a, o, "fetchTarball", true,  "source"); }
 // F1/F2 (TW-value eradication): native plain-data path — no bridgeBuiltin.
 // Params mirror TW prim_fetchTree / prim_fetchGit (fetchTree.cc:230/586).
 void primFetchTree   (EvalState & s, Value * a, Value & o) {

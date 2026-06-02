@@ -51,6 +51,8 @@
 #include "nix/fetchers/input-cache.hh"     // InputCache::getAccessor (fetchTree)
 #include "nix/util/logging.hh"             // warn (fetchTree pure-eval narHash path)
 #include "nix/util/url.hh"                 // fixGitURL
+#include "nix/util/file-system.hh"         // baseNameOf (fetchUrl name default)
+#include "nix/fetchers/tarball.hh"         // downloadFile / downloadTarball (fetchUrl)
 #include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
 #include "nix/flake/flake.hh"              // flake::LockedFlake / lockFlake / LockFlags
 #include "nix/flake/flakeref.hh"           // parseFlakeRef (lockFlakeAndRead)
@@ -269,6 +271,70 @@ TreeAttrsInfo readTreeAttrs(nix::EvalState & state,
 std::string fixGitURL(const std::string & url)
 {
     return nix::fixGitURL(url).to_string();
+}
+
+FetchUrlResult fetchUrl(nix::EvalState & state, const std::string & urlArg,
+                        const std::optional<std::string> & sha256,
+                        std::string name, bool unpack, const std::string & who)
+{
+    std::string url = urlArg;
+    std::optional<nix::Hash> expectedHash;
+    if (sha256)
+        expectedHash = nix::newHashAllowEmpty(*sha256, nix::HashAlgorithm::SHA256);
+
+    if (who == "fetchTarball")
+        url = state.settings.resolvePseudoUrl(url);
+
+    state.checkURI(url);
+
+    if (name.empty())
+        name = std::string(nix::baseNameOf(url));
+    nix::checkName(name);  // throws BadStorePathName on an invalid store name
+
+    if (state.settings.pureEval && !expectedHash)
+        throw nix::Error("in pure evaluation mode, '%s' requires a 'sha256' argument", who);
+
+    auto opaque = [&](const nix::StorePath & p) -> FetchUrlResult {
+        return {state.store->printStorePath(p),
+                nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = p}}.to_string()};
+    };
+
+    // Early exit if pinned + already substitutable.
+    if (expectedHash && expectedHash->algo == nix::HashAlgorithm::SHA256) {
+        auto expectedPath = state.store->makeFixedOutputPath(
+            name,
+            nix::FixedOutputInfo{
+                .method = unpack ? nix::FileIngestionMethod::NixArchive : nix::FileIngestionMethod::Flat,
+                .hash = *expectedHash,
+                .references = {}});
+        try {
+            state.store->ensurePath(expectedPath);
+            state.allowPath(expectedPath);
+            return opaque(expectedPath);
+        } catch (nix::Error &) { /* fall through to download */ }
+    }
+
+    nix::StorePath storePath = unpack
+        ? nix::fetchToStore(
+              state.fetchSettings, *state.store,
+              nix::fetchers::downloadTarball(*state.store, state.fetchSettings, url),
+              nix::FetchMode::Copy, name)
+        : nix::fetchers::downloadFile(*state.store, state.fetchSettings, url, name).storePath;
+
+    if (expectedHash) {
+        auto hash = unpack
+            ? state.store->queryPathInfo(storePath)->narHash
+            : nix::hashPath({state.store->requireStoreObjectAccessor(storePath)},
+                            nix::FileSerialisationMethod::Flat, nix::HashAlgorithm::SHA256).hash;
+        if (hash != *expectedHash)
+            throw nix::Error(
+                "hash mismatch in file downloaded from '%s':\n  specified: %s\n  got:       %s",
+                url, expectedHash->to_string(nix::HashFormat::Nix32, true),
+                hash.to_string(nix::HashFormat::Nix32, true));
+    }
+
+    state.allowPath(storePath);
+    return opaque(storePath);
 }
 
 TreeAttrsInfo fetchTree(nix::EvalState & state, const FetchTreeInput & in,

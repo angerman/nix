@@ -83,6 +83,20 @@ check "fetchTree-path-url" \
   "(builtins.fetchTree \"path:$P\").outPath"
 rm -rf "$P"
 
+# --- builtins.fetchurl / fetchTarball via file:// (the fetch() family) ---
+F=$(cd "$(mktemp -d)" && pwd -P)
+printf 'urlcontent\n' > "$F/x.txt"
+check "fetchurl-string" \
+  "builtins.fetchurl \"file://$F/x.txt\""
+check "fetchurl-attrs-name" \
+  "builtins.fetchurl { url = \"file://$F/x.txt\"; name = \"renamed\"; }"
+mkdir -p "$F/src"; printf 'tree\n' > "$F/src/f"
+if command -v tar >/dev/null 2>&1 && tar -czf "$F/t.tar.gz" -C "$F" src 2>/dev/null; then
+  check "fetchTarball-string" \
+    "builtins.fetchTarball \"file://$F/t.tar.gz\""
+fi
+rm -rf "$F"
+
 echo "fetcher-parity: $pass passed, $fail failed"
 if (( fail > 0 )); then
   printf '  FAIL: %s\n' "${failed[@]}" >&2
