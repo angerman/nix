@@ -111,6 +111,21 @@ if command -v hg >/dev/null 2>&1; then
   rm -rf "$M"
 fi
 
+# --- builtins.fetchClosure (content-addressed, via a local file:// cache) ---
+# Self-contained: add a CA path, push its closure to a file:// cache, then
+# fetchClosure it back.  Needs the fetch-closure feature + _NIX_IN_TEST=1
+# (file:// fromStore is gated on that).
+C=$(cd "$(mktemp -d)" && pwd -P)
+mkdir -p "$C/src"; printf 'closure\n' > "$C/src/f.txt"
+SP=$("$NIX" "${EXF[@]}" store add-path "$C/src" --name fc-parity 2>/dev/null || true)
+if [[ -n "$SP" ]] && "$NIX" "${EXF[@]}" copy --to "file://$C/cache" "$SP" >/dev/null 2>&1; then
+  FCQ="builtins.fetchClosure { fromStore = \"file://$C/cache\"; fromPath = \"$SP\"; }"
+  fctw=$(_NIX_IN_TEST=1 "$NIX" "${EXF[@]}" --extra-experimental-features fetch-closure eval --impure --raw --expr "$FCQ" 2>/dev/null)
+  fcv3=$(_NIX_IN_TEST=1 NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s "$NIX" "${EXF[@]}" --extra-experimental-features fetch-closure eval --impure --raw --expr "$FCQ" 2>/dev/null)
+  if [[ -n "$fctw" && "$fctw" == "$fcv3" ]]; then pass=$((pass+1)); else fail=$((fail+1)); failed+=("fetchClosure-ca (TW=$fctw v3=$fcv3)"); fi
+fi
+rm -rf "$C"
+
 # --- builtins.filterSource (F3: filter closure re-enters v3's VM per entry) ---
 S=$(cd "$(mktemp -d)" && pwd -P)
 printf 'a\n' > "$S/keep.txt"; printf 'b\n' > "$S/drop.log"; mkdir "$S/sub"; printf 'c\n' > "$S/sub/x"

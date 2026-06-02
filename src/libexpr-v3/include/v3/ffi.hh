@@ -315,6 +315,17 @@ FetchMercurialResult fetchMercurial(nix::EvalState & state, const std::string & 
                                     const std::optional<std::string> & revOrRef,
                                     const std::string & name);
 
+/// THE fetchClosure FFI leaf.  Mirrors prim_fetchClosure (fetchClosure.cc):
+/// validate the fromStore URL (http(s), or file:// under _NIX_IN_TEST),
+/// openStore, then dispatch — `toPath` present → rewrite via
+/// makeContentAddressed; `inputAddressed` → copyClosure + require input-
+/// addressed; else → copyClosure + require content-addressed.  allowClosure
+/// + return the printed result path + Opaque context.  `toPath` nullopt =
+/// absent; "" = gap ("report the CA path"); else a store-path string.
+FetchUrlResult fetchClosure(nix::EvalState & state, const std::string & fromStoreUrl,
+    const std::string & fromPathStr, const std::optional<std::string> & toPath,
+    bool inputAddressed);
+
 /// THE filtered-path-copy FFI leaf (builtins.filterSource — F3: VM re-entry).
 /// Mirrors TW addPath's no-refs path (primops.cc:2961): builds a libstore
 /// PathFilter that, per entry, lstats it for the file-type string and calls

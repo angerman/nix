@@ -12024,7 +12024,60 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
     o.tag_payload = static_cast<uint64_t>(Tag::Attrs);
     o.payload.bindings = bb;
 }
-void primFetchClosure(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchClosure", s, a, o); }
+// F2 (eradication): native fetchClosure — extract the 4 args V3-NATIVE,
+// ffi::fetchClosure (openStore + copyClosure/makeContentAddressed dispatch),
+// build the result store-path string v3-native with Opaque context.
+void primFetchClosure(EvalState & s, Value * a, Value & o) {
+    if (!s.nixEvalState)
+        throw std::runtime_error("v3 fetchClosure: no tree-walker state available");
+    auto & ns = *s.nixEvalState;
+
+    Value arg = forceValue(*s.vm, a[0]);
+    if (!arg.isAttrs() || !arg.payload.bindings)
+        throw std::runtime_error(
+            "while evaluating the argument passed to builtins.fetchClosure: expected an attribute set");
+    const Bindings * b = arg.payload.bindings;
+    if (b->isChain()) b = b->materialize();
+    auto & symTab = ir::globalSymbolTable();
+
+    auto strOf = [&](const Value & vIn) -> std::string {
+        Value fv = forceValue(*s.vm, vIn);
+        if (fv.tag() == Tag::String) return std::string(fv.payload.str ? fv.payload.str : "");
+        if (fv.tag() == Tag::Path)   return std::string(fv.payload.path ? fv.payload.path : "");
+        throw std::runtime_error("fetchClosure: expected a string or path attribute");
+    };
+
+    std::optional<std::string> fromStore, fromPath, toPath;
+    std::optional<bool> inputAddressed;
+    for (uint32_t i = 0; i < b->size; ++i) {
+        const SymbolId nid = b->entries[i].name;
+        std::string n(nid < symTab.size() ? symTab[nid] : std::to_string(nid));
+        if (n == "fromStore")
+            fromStore = v3ForceStringNoCtx(s, b->entries[i].value,
+                          "while evaluating the 'fromStore' attribute passed to builtins.fetchClosure");
+        else if (n == "fromPath")
+            fromPath = strOf(b->entries[i].value);       // coerceToStorePath (ffi parses)
+        else if (n == "toPath")
+            toPath = strOf(b->entries[i].value);         // "" ⇒ gap
+        else if (n == "inputAddressed") {
+            Value fv = forceValue(*s.vm, b->entries[i].value);
+            if (fv.tag() != Tag::Bool)
+                throw std::runtime_error("fetchClosure: 'inputAddressed' must be a Boolean");
+            inputAddressed = (fv.payload.i == 1);
+        } else
+            throw std::runtime_error("attribute '" + n + "' isn't supported in call to 'fetchClosure'");
+    }
+    if (!fromPath)
+        throw std::runtime_error("attribute 'fromPath' is missing in call to 'fetchClosure'");
+    if (!fromStore)
+        throw std::runtime_error("attribute 'fromStore' is missing in call to 'fetchClosure'");
+
+    ffi::FetchUrlResult r = ffi::fetchClosure(ns, *fromStore, *fromPath, toPath,
+                                              inputAddressed.value_or(false));
+    o = mkStringValueOwned(r.printedStorePath);
+    std::vector<std::string> ctx{ r.opaqueContextElem };
+    setStringContextEntries(o.payload.str, std::move(ctx));
+}
 // F3 (eradication): native filterSource — copy the path to the store with a
 // PathFilter that RE-ENTERS v3's VM (callClosure) per directory entry.  No
 // bridge: the filter stays a v3 closure; ffi::addPathFiltered drives the

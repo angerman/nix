@@ -54,6 +54,10 @@
 #include "nix/util/url-parts.hh"           // revRegex (fetchMercurial rev/ref classify)
 #include "nix/util/file-system.hh"         // baseNameOf (fetchUrl name default)
 #include "nix/fetchers/tarball.hh"         // downloadFile / downloadTarball (fetchUrl)
+#include "nix/store/store-open.hh"         // openStore (fetchClosure)
+#include "nix/store/store-reference.hh"    // StoreReference (fetchClosure)
+#include "nix/store/make-content-addressed.hh"  // makeContentAddressed (fetchClosure)
+// copyClosure / RealisedPath come from store-api.hh (above).
 #include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
 #include "nix/flake/flake.hh"              // flake::LockedFlake / lockFlake / LockFlags
 #include "nix/flake/flakeref.hh"           // parseFlakeRef (lockFlakeAndRead)
@@ -313,6 +317,89 @@ FetchMercurialResult fetchMercurial(nix::EvalState & state, const std::string & 
     r.rev = input2.getRev().value_or(nix::Hash(nix::HashAlgorithm::SHA1)).gitRev();
     if (auto rc = input2.getRevCount()) r.revCount = static_cast<int64_t>(*rc);
     return r;
+}
+
+FetchUrlResult fetchClosure(nix::EvalState & state, const std::string & fromStoreUrl,
+    const std::string & fromPathStr, const std::optional<std::string> & toPath,
+    bool inputAddressed)
+{
+    auto fromPath = state.store->toStorePath(fromPathStr).first;
+
+    const bool toPathPresent = toPath.has_value();
+    std::optional<nix::StorePath> toMaybe;        // nullopt = gap (toPath == "")
+    if (toPath && !toPath->empty())
+        toMaybe = state.store->toStorePath(*toPath).first;
+
+    if (inputAddressed && toPathPresent)
+        throw nix::Error("attribute 'inputAddressed' is set to true, but 'toPath' is also set. Please remove one of them");
+
+    // fromStore URL must be http(s) (or file:// under _NIX_IN_TEST).
+    auto storeRef = nix::StoreReference::parse(fromStoreUrl);
+    {
+        auto * spec = std::get_if<nix::StoreReference::Specified>(&storeRef.variant);
+        bool ok = spec && (spec->scheme == "http" || spec->scheme == "https"
+                  || (nix::getEnv("_NIX_IN_TEST").has_value() && spec->scheme == "file"));
+        if (!ok)
+            throw nix::Error("'fetchClosure' only supports http:// and https:// stores");
+    }
+    if (!storeRef.params.empty())
+        throw nix::Error("'fetchClosure' does not support URL query parameters (in '%s')", fromStoreUrl);
+    auto fromStore = nix::openStore(std::move(storeRef));
+
+    auto opaque = [&](const nix::StorePath & p) -> FetchUrlResult {
+        return {state.store->printStorePath(p),
+                nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = p}}.to_string()};
+    };
+
+    if (toPathPresent) {  // runFetchClosureWithRewrite
+        if (!toMaybe || !state.store->isValidPath(*toMaybe)) {
+            auto rewritten = nix::makeContentAddressed(*fromStore, *state.store, fromPath);
+            if (toMaybe && *toMaybe != rewritten)
+                throw nix::Error(
+                    "rewriting '%s' to content-addressed form yielded '%s', while '%s' was expected",
+                    state.store->printStorePath(fromPath), state.store->printStorePath(rewritten),
+                    state.store->printStorePath(*toMaybe));
+            if (!toMaybe)
+                throw nix::Error(
+                    "rewriting '%s' to content-addressed form yielded '%s'\n"
+                    "Use this value for the 'toPath' attribute passed to 'fetchClosure'",
+                    state.store->printStorePath(fromPath), state.store->printStorePath(rewritten));
+        }
+        const auto & toPathFinal = *toMaybe;
+        auto resultInfo = state.store->queryPathInfo(toPathFinal);
+        if (!resultInfo->isContentAddressed(*state.store))
+            throw nix::Error(
+                "The 'toPath' value '%s' is input-addressed, so it can't possibly be the result of rewriting to a content-addressed path.\n\n"
+                "Set 'toPath' to an empty string to make Nix report the correct content-addressed path.",
+                state.store->printStorePath(toPathFinal));
+        state.allowClosure(toPathFinal);
+        return opaque(toPathFinal);
+    } else if (inputAddressed) {  // runFetchClosureWithInputAddressedPath
+        if (!state.store->isValidPath(fromPath))
+            nix::copyClosure(*fromStore, *state.store, nix::RealisedPath::Set{fromPath});
+        auto info = state.store->queryPathInfo(fromPath);
+        if (info->isContentAddressed(*state.store))
+            throw nix::Error(
+                "The store object referred to by 'fromPath' at '%s' is not input-addressed, but 'inputAddressed' is set to 'true'.\n\n"
+                "Remove the 'inputAddressed' attribute (it defaults to 'false') to expect 'fromPath' to be content-addressed",
+                state.store->printStorePath(fromPath));
+        state.allowClosure(fromPath);
+        return opaque(fromPath);
+    } else {  // runFetchClosureWithContentAddressedPath
+        if (!state.store->isValidPath(fromPath))
+            nix::copyClosure(*fromStore, *state.store, nix::RealisedPath::Set{fromPath});
+        auto info = state.store->queryPathInfo(fromPath);
+        if (!info->isContentAddressed(*state.store))
+            throw nix::Error(
+                "The 'fromPath' value '%s' is input-addressed, but 'inputAddressed' is set to 'false' (default).\n\n"
+                "If you do intend to fetch an input-addressed store path, add\n\n"
+                "    inputAddressed = true;\n\n"
+                "to the 'fetchClosure' arguments.\n\n"
+                "Note that to ensure authenticity input-addressed store paths, users must configure a trusted binary cache public key on their systems. This is not needed for content-addressed paths.",
+                state.store->printStorePath(fromPath));
+        state.allowClosure(fromPath);
+        return opaque(fromPath);
+    }
 }
 
 FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPath,
