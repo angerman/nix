@@ -72,6 +72,17 @@ check "fetchGit-ref" \
 
 rm -rf "$G"
 
+# --- builtins.fetchTree {type=path} (the non-git fromAttrs + fromURL paths) ---
+# realpath the dir: some platforms symlink the mktemp root (e.g. macOS
+# /tmp -> /private/tmp), which fetchTree rejects ("path is a symlink").
+P=$(cd "$(mktemp -d)" && pwd -P)
+printf 'tree\n' > "$P/data.txt"
+check "fetchTree-path-attrs" \
+  "let r = builtins.fetchTree { type = \"path\"; path = \"$P\"; }; in { op = r.outPath; nh = r.narHash; sa = builtins.attrNames r; }"
+check "fetchTree-path-url" \
+  "(builtins.fetchTree \"path:$P\").outPath"
+rm -rf "$P"
+
 echo "fetcher-parity: $pass passed, $fail failed"
 if (( fail > 0 )); then
   printf '  FAIL: %s\n' "${failed[@]}" >&2
