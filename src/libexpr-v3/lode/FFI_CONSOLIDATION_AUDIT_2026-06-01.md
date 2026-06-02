@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-01
 **Author:** session synthesis (3-agent: include inventory + ffi.h design + migration plan + critical review)
-**Status:** STRATEGIC AUDIT — single-FFI-surface goal is ~98% achievable; ~70% can ship without depending on the parser project
+**Status:** IN PROGRESS (NOT complete — an 8–10 week effort).  As of 2026-06-02 the lint baseline is **1 of the original 21 library targets** (only `primops.cc`, at 8 of its 19 includes); see **§0b** for the current state + the completion blueprint.  The remaining work is the coordinated multi-day relocation of the coupled derivationStrict / #875-bridge / value-graph core.
 **Triggering question:** "Do we still #include any foreign (TW) stuff? Can we get rid of all of those and replace them with one `ffi.h`?"
 
 Companion docs:
@@ -110,6 +110,89 @@ coerceToString/copyPathToStore/…) plus FIELD access (`state.symbols`,
 is Level-2 (accessor functions), broader than the §3.4 "4 functions."
 Fully cleaning even a cold single-method file (e.g. `bridge_yield.cc`,
 `forceValue` only) also needs a `nix/util/pos-idx.hh` mirror (`noPos`).
+
+---
+
+## 0b. PROGRESS UPDATE 2 (2026-06-02, later session) — baseline 6 → 1
+
+Continued the migration. **Lint baseline is now 1 (only `primops.cc`).**
+Corrections to §0 above + the session arc:
+
+**§0's "vm.cc is HOT-path eval.hh, PERF-GATED" was FALSIFIED.** An
+eval.hh-removal probe enumerated vm.cc's *entire* TW surface: all 9
+`nix::EvalState` + every `nix::Value` member access are COLD FFI-leaf
+(store/path coercion + the TW-bridge call round-trip on *bridged* TW
+values).  The v3-native hot dispatch path touches none.  `nix::evalTrace::*`
+(the only hot include) is stdlib-only Layer-0 → re-exported INLINE from
+ffi.hh (zero perf impact, no release/LTO build needed).  vm.cc migrated
+(`36cd0fcae`).  So the R1/R4 perf-gate did NOT block vm.cc.
+
+**Landed (each validated: lang 143/143 + core 17/17 + hello.drvPath/toFile/
+path/readFile-context byte-equal vs TW):**
+- `run.cc`/`run.hh` (`36b41cb91`,`388e9b5b0`): field accessors + the
+  `runRootExprFromString` origin taken by `const SourcePath*` (run.hh drops
+  pos-table.hh). **6 → 4.**
+- `vm.cc` (`36cd0fcae`): cold store-coerce + bridge shims (`ffi::TwType`/
+  `valueType`/`allocValue`/`callFunction`/`coercePathToStore[Name]`/
+  `displayContextElem`) + eval-trace re-export. **4 → 3.**
+- `cli/v3-eval.cc` (`6ac6c60ba`): reclassified as the **run-entry
+  exemption** the audit anticipated — it's a separate `executable()`
+  (meson.build:279), a consumer/embedding-host `main()` that constructs
+  `EvalState`, NOT part of libnixexprv3.dylib; analogous to the un-linted
+  `src/nix/eval.cc`.  Added to the lint's path-pattern EXEMPT set. **3 → 2.**
+- `v3_call_flake.cc` (`440697036`): the flake-loading FFI leaf — libflake/
+  libfetchers reading extracted behind `ffi::readLockedFlake` → plain-data
+  `ffi::LockedFlakeInfo`/`TreeAttrsInfo`; `v3EmitTreeAttrs`/`callFlakeV3`
+  consume plain data.  New permanent test `run-flake-sourceinfo-parity.sh`
+  (non-git + git). **2 → 1.**
+
+**`primops.cc` (the last target): 19 → 8 direct includes** (`220054e03`,
+`ff72b702e`, `5d29d96e6`, `a9925aebf`, `b74e089f6`, `6edfa71cd`).  Removed
+ALL separable + ALL localized includes:
+- separable: `users.hh`/`hash.hh`/`experimental-features.hh`/
+  `eval-settings.hh`/`globals.hh` (getHome/readOnlyMode/pureEval/nixVersion
+  shims; hash+xp re-exported); `flake.hh`/`flakeref.hh`/`settings.hh`
+  (`ffi::lockFlakeAndRead`).
+- localized store-leaves: `path-references.hh` (`ffi::storeRefsContextFor`),
+  `fetch-to-store.hh` (`ffi::pathFetchToStore`), `serialise.hh`
+  (`ffi::addTextToStore`).
+- eval.hh-site migration STARTED: all 40 TW `ns.{allocValue,forceValue,
+  callFunction}` sites → `ffi::*(ns,…)` (by-ref EvalState, incomplete-OK).
+
+**THE REMAINING 8 = the irreducibly-coupled core** (eval.hh ~197 sites,
+store-api.hh 44, value/context.hh 86, content-address.hh ~21, canon-path.hh
+16, derivations.hh + derived-path.hh, memory-source-accessor.hh).  Probed
+exhaustively — **no single-include slice remains**; each header is multi-
+site and interlocked inside derivationStrict, the #875 bridge subsystem
+(`v3BridgeClosures` table + eviction/revival/timers + the shim pointer),
+and the corepkgs/parse/value-graph marshalling (e.g. `corepkgsFS` feeds
+`Pos::Origin`; `realisePath` takes/returns TW values+SourcePaths).
+
+**Completion blueprint (the coordinated multi-day relocation):**
+1. Relocate the **#875 bridge subsystem** (`v3ToTreeWalkerPublic` /
+   `treeWalkerToV3Public` / `tryUnwrapBridge1Closure` + the closure table +
+   eviction/revival/timers + shim) as a cohesive unit into an exempt
+   `ffi_bridge.cc`.  Removes the 112 `nix::Value` uses + decouples
+   value/context.  (Validate: full nixpkgs eval — the bridge fires on every
+   callPackage.)
+2. Relocate the remaining **EvalState-method** uses via the proven shim
+   template (symbols-intern, positions/addOrigin, error, realisePath,
+   forceAttrs/getBuiltins, store-ops, mem/rootFS/baseEnv/corepkgsFS) — each
+   a whole-operation shim returning plain-data / v3-bridgeable values.
+3. Relocate the **store/derivation primops** (readFile/readDir/pathExists/
+   path/import-corepkgs) as whole ops (the `storeRefsContextFor`/
+   `pathFetchToStore`/`addTextToStore` pattern, already proven).
+4. **derivationStrict LAST** — the store-path-HASH core; the strongest
+   drvPath-byte-equality oracle gates it.
+5. eval.hh + store-api + value/context + content-address + canon-path +
+   derivations + derived-path + memory-source-accessor all fall out once
+   their last use is relocated → baseline 0; flip the ratchet to the strict
+   end-state lint.
+
+**Effort:** the bulk of the audit's own 8–10 week estimate, on the most
+correctness-critical code in the tree.  NOT to be rushed (measure-twice +
+store-path-bug-is-most-serious).  The per-operation relocation template +
+the full per-primop oracle set are proven; this is execution, not design.
 
 ---
 
