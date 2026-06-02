@@ -110,6 +110,10 @@ namespace ffi {
 /// bridge-path convenience over `state.forceValue(v, nix::noPos)`.
 void forceValue(nix::EvalState & state, nix::Value & v);
 
+/// As above, threading an explicit position for error attribution
+/// (`state.forceValue(v, pos)`).  Cold (FFI-leaf primop arg forcing).
+void forceValue(nix::EvalState & state, nix::Value & v, nix::PosIdx pos);
+
 /// Overwrite the host `builtins.<name>` slot with `*value` (the
 /// bytecode-primop installer's path-1: make TW dispatch see v3's wrapper).
 /// Throws (like `state.getBuiltin`) when `name` isn't a registered
@@ -152,6 +156,10 @@ nix::Value * allocValue(nix::EvalState & state);
 /// `state.callFunction(fun, arg, out, nix::noPos)` — invoke a TW function
 /// value.  Cold/bridge only (a v3 closure call never routes here).
 void callFunction(nix::EvalState & state, nix::Value & fun, nix::Value & arg, nix::Value & out);
+
+/// As above with an explicit position (`state.callFunction(fun, arg, out,
+/// pos)`).  Cold (FFI-leaf primop bridging to a TW function).
+void callFunction(nix::EvalState & state, nix::Value & fun, nix::Value & arg, nix::Value & out, nix::PosIdx pos);
 
 /// Coerce a filesystem path into the store and return its printed store
 /// path: `printStorePath(copyPathToStore(SourcePath(rootFS, CanonPath(p))))`.

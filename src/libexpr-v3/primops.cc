@@ -940,7 +940,7 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
             auto & ns = *state.nixEvalState;
             auto * srcV = static_cast<nix::Value *>(
                 v.payload.thunk->bridgeSrc);
-            ns.forceValue(*srcV, nix::noPos);
+            ffi::forceValue(ns, *srcV, nix::noPos);
             // Use TW's coerceToString directly; it handles all the
             // shape variants and accumulates context into a fresh
             // NixStringContext that we transfer to v3's ctx accumulator.
@@ -3634,7 +3634,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
             // value is a string + decoded context.  See primImport's
             // identical pattern at primops.cc:~8200 + the v3-native
             // outPath path right below for primReadDir attrset case.
-            nix::Value * tw = ns.allocValue();
+            nix::Value * tw = ffi::allocValue(ns);
             nix::NixStringContext twCtx = decodeStringContext(*ctxEntries);
             tw->mkString(args[0].payload.str, twCtx, ns.mem);
             try {
@@ -4577,7 +4577,7 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     int kBridge1MaxDepth = bridge1MaxDepth();
     if (kBridge1MaxDepth > 0 && s_bridge1Depth >= kBridge1MaxDepth) {
         // Resolve handle (still need it for the fallback Expr lookup).
-        ns.forceValue(*args[0], pos);
+        ffi::forceValue(ns, *args[0], pos);
         if (args[0]->type() == nix::nInt) {
             int64_t h = args[0]->integer().value;
             auto & tbl = v3BridgeClosures();
@@ -4586,8 +4586,8 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
                 if (fb) {
                     nix::Value tw;
                     fb->eval(ns, ns.baseEnv, tw);
-                    ns.forceValue(tw, pos);
-                    ns.callFunction(tw, *args[1], out, pos);
+                    ffi::forceValue(ns, tw, pos);
+                    ffi::callFunction(ns, tw, *args[1], out, pos);
                     return;
                 }
             }
@@ -4601,7 +4601,7 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
         ~Bridge1DepthGuard() { --d; }
     } _b1dGuard(s_bridge1Depth);
 
-    ns.forceValue(*args[0], pos);
+    ffi::forceValue(ns, *args[0], pos);
     if (args[0]->type() != nix::nInt)
         ns.error<nix::EvalError>("v3 bridge1: handle must be int").debugThrow();
     int64_t h = args[0]->integer().value;
@@ -4640,7 +4640,7 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
     static const bool lazyBridgeArg =
         std::getenv("NIX_V3_LAZY_BRIDGE_ARG") != nullptr;
     if (!lazyBridgeArg)
-        ns.forceValue(*args[1], pos);
+        ffi::forceValue(ns, *args[1], pos);
 
     // WC-18.3: run the v3 closure body in a fiber.  treeWalkerToV3
     // and forceBridgeThunk yield to the driver for tree-walker forces,
@@ -4674,7 +4674,7 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
             "via tree-walker\n", ex.what());
         nix::Value tw;
         fallbackExpr->eval(ns, ns.baseEnv, tw);
-        ns.forceValue(tw, pos);
+        ffi::forceValue(ns, tw, pos);
         // tw should be a function; call it with args[1].
         static const bool s_dbg =
             std::getenv("V3_DBG_BRIDGE1_FALLBACK") != nullptr;
@@ -4685,7 +4685,7 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
                 twType, (long long)h);
             std::fflush(stderr);
         }
-        ns.callFunction(tw, *args[1], out, pos);
+        ffi::callFunction(ns, tw, *args[1], out, pos);
     };
 
     // #455: cycle detection -- mirrors primV3ForceAttr's protection.
@@ -4780,8 +4780,8 @@ static void primV3CallBridge1(nix::EvalState & ns, const nix::PosIdx pos,
                 "v3 bridge1: evicted handle has no fallbackExpr").debugThrow();
         nix::Value tw;
         fallbackExpr->eval(ns, ns.baseEnv, tw);
-        ns.forceValue(tw, pos);
-        ns.callFunction(tw, *args[1], out, pos);
+        ffi::forceValue(ns, tw, pos);
+        ffi::callFunction(ns, tw, *args[1], out, pos);
         return;
     }
 
@@ -4948,7 +4948,7 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
     }
     BridgePrimopDepthGuard _bpdg(bridgePrimopDepth());
 
-    ns.forceValue(*args[0], pos);
+    ffi::forceValue(ns, *args[0], pos);
     if (args[0]->type() != nix::nInt)
         ns.error<nix::EvalError>("v3 forceAttr: handle must be int").debugThrow();
     int64_t h = args[0]->integer().value;
@@ -4970,7 +4970,7 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
     if (!v3HandleEvicted && (v3attrs.tag() != Tag::Attrs || !v3attrs.payload.bindings))
         ns.error<nix::EvalError>("v3 forceAttr: handle does not point to an Attrs").debugThrow();
 
-    ns.forceValue(*args[1], pos);
+    ffi::forceValue(ns, *args[1], pos);
     if (args[1]->type() != nix::nString)
         ns.error<nix::EvalError>("v3 forceAttr: name must be string").debugThrow();
     std::string_view name(args[1]->string_view());
@@ -4983,7 +4983,7 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
                 "v3 forceAttr: evicted handle has no fallbackExpr").debugThrow();
         nix::Value tw;
         fallbackExpr->eval(ns, ns.baseEnv, tw);
-        ns.forceValue(tw, pos);
+        ffi::forceValue(ns, tw, pos);
         if (tw.type() != nix::nAttrs)
             ns.error<nix::EvalError>(
                 "v3 forceAttr: tree-walker fallback returned non-attrs").debugThrow();
@@ -4993,7 +4993,7 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
             ns.error<nix::EvalError>(
                 "v3 forceAttr: tree-walker fallback missing attr '%1%'",
                 std::string(name)).debugThrow();
-        ns.forceValue(*a->value, pos);
+        ffi::forceValue(ns, *a->value, pos);
         out = *a->value;
         return;
     }
@@ -5194,7 +5194,7 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
         }
         nix::Value tw;
         fallbackExpr->eval(ns, ns.baseEnv, tw);
-        ns.forceValue(tw, pos);
+        ffi::forceValue(ns, tw, pos);
         if (tw.type() != nix::nAttrs)
             ns.error<nix::EvalError>(
                 "v3 forceAttr: tree-walker fallback returned non-attrs").debugThrow();
@@ -5203,7 +5203,7 @@ static void primV3ForceAttrInner(nix::EvalState & ns, const nix::PosIdx pos,
             ns.error<nix::EvalError>(
                 "v3 forceAttr: tree-walker fallback missing attr '%1%'",
                 std::string(name)).debugThrow();
-        ns.forceValue(*a->value, pos);
+        ffi::forceValue(ns, *a->value, pos);
         out = *a->value;
     }
 }
@@ -5268,7 +5268,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         && v.payload.thunk->state == ThunkState::Bridge
         && v.payload.thunk->bridgeSrc) {
         nix::Value * orig = static_cast<nix::Value *>(v.payload.thunk->bridgeSrc);
-        ns.forceValue(*orig, nix::noPos);
+        ffi::forceValue(ns, *orig, nix::noPos);
         return orig;
     }
     // Cycle protection: if we've already started converting this
@@ -5281,7 +5281,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
     if (cycleKey) {
         if (auto it = seen.find(cycleKey); it != seen.end()) return it->second;
     }
-    nix::Value * out = ns.allocValue();
+    nix::Value * out = ffi::allocValue(ns);
     if (cycleKey) seen[cycleKey] = out;
     switch (v.tag()) {
     case Tag::Int:    out->mkInt(v.payload.i); break;
@@ -5397,7 +5397,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                     .doc   = std::nullopt,
                     .impl  = nix::fun<nix::PrimOpFun>{primV3ForceAttr},
                 };
-                nix::Value * pv = ns.allocValue();
+                nix::Value * pv = ffi::allocValue(ns);
                 pv->mkPrimOp(po);
                 // Root BEFORE publish; see lazyListPrim / REVIEW MED-20.
 #if NIX_USE_BOEHMGC
@@ -5409,9 +5409,9 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
             size_t handle = tbl.size();
             // #875 Stage 2b: pre-evict-aware construction.
             tbl.push_back(makeBridgeEntry<BridgeAttrEntry>(v, tlBridgeFallbackExpr));
-            nix::Value * vHandle = ns.allocValue();
+            nix::Value * vHandle = ffi::allocValue(ns);
             vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
-            nix::Value * vPartial = ns.allocValue();
+            nix::Value * vPartial = ffi::allocValue(ns);
             vPartial->mkPrimOpApp(lazyAttrPrim, vHandle);
             for (uint32_t i = 0; i < b->size; ++i) {
                 SymbolId sid = b->entries[i].name;
@@ -5431,9 +5431,9 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 std::string_view n = sid < symTab.size()
                     ? std::string_view(symTab[sid])
                     : std::string_view{};
-                nix::Value * vName = ns.allocValue();
+                nix::Value * vName = ffi::allocValue(ns);
                 vName->mkString(n, ns.mem);
-                nix::Value * vApp = ns.allocValue();
+                nix::Value * vApp = ffi::allocValue(ns);
                 vApp->mkApp(vPartial, vName);
                 bb.insert(resolved, vApp);
             }
@@ -5472,7 +5472,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
                 .doc   = std::nullopt,
                 .impl  = nix::fun<nix::PrimOpFun>{primV3CallBridge1},
             };
-            nix::Value * vp = ns.allocValue();
+            nix::Value * vp = ffi::allocValue(ns);
             vp->mkPrimOp(po);
             // Root BEFORE publish; see lazyListPrim / REVIEW MED-20.
 #if NIX_USE_BOEHMGC
@@ -5578,7 +5578,7 @@ static nix::Value * v3ToTreeWalker(EvalState & state, Value v,
         // #875 Stage 2b: pre-evict-aware construction.  Closure typically
         // not serializable; falls back to live entry.
         tbl.push_back(makeBridgeEntry<BridgeClosureEntry>(v, tlBridgeFallbackExpr));
-        nix::Value * vHandle = ns.allocValue();
+        nix::Value * vHandle = ffi::allocValue(ns);
         vHandle->mkInt(static_cast<nix::NixInt::Inner>(handle));
         out->mkPrimOpApp(bridgePrimOp1, vHandle);
         break;
@@ -5667,7 +5667,7 @@ struct V3ToTreeWalkerShimInit {
 /// copy would freeze a pre-update view).  Therefore callers MUST pass an
 /// `nv` whose lifetime + address are stable for the lifetime of the
 /// resulting Bridge thunk:
-///   - GC-allocated via `ns.allocValue()` (preferred -- live-tracked by
+///   - GC-allocated via `ffi::allocValue(ns)` (preferred -- live-tracked by
 ///     Boehm; outlives any caller frame).
 ///   - A heap-allocated `nix::Value` the caller pins.
 ///   - A TW `Env::values[]` slot whose Env outlives the Bridge thunk.
@@ -6510,8 +6510,8 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
                 // thunk treeWalkerToV3 may install (TW updates value
                 // cells in place; the bridge thunk must observe the
                 // post-update value, not a snapshot).
-                nix::Value * result = ns.allocValue();
-                ns.callFunction(*cachedDrvStrict, *nargs, *result, nix::noPos);
+                nix::Value * result = ffi::allocValue(ns);
+                ffi::callFunction(ns, *cachedDrvStrict, *nargs, *result, nix::noPos);
                 out = treeWalkerToV3(state, *result);
                 return;
             }
@@ -8223,7 +8223,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             //
             // Pre-existing branch already verified args[0].isString()
             // at line 8164.  Context is in ctxEntries (decoded above).
-            nix::Value * tw = ns.allocValue();
+            nix::Value * tw = ffi::allocValue(ns);
             if (ctxEntries && !ctxEntries->empty()) {
                 nix::NixStringContext twCtx = decodeStringContext(*ctxEntries);
                 tw->mkString(args[0].payload.str, twCtx, ns.mem);
@@ -9856,8 +9856,8 @@ void primPath(EvalState & state, Value * args, Value & out)
             auto * pAttr = blt.attrs()->get(ns.symbols.create("path"));
             if (pAttr && pAttr->value) {
                 // #484 STG-style address identity: see derivationStrict.
-                nix::Value * result = ns.allocValue();
-                ns.callFunction(*pAttr->value, *nargs, *result, nix::noPos);
+                nix::Value * result = ffi::allocValue(ns);
+                ffi::callFunction(ns, *pAttr->value, *nargs, *result, nix::noPos);
                 out = treeWalkerToV3(state, *result);
                 return;
             }
@@ -10998,7 +10998,7 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
     // Extract the handle from the immediate right-side arg.
     const nix::Value * vHandle = funValue.primOpApp().right;
     if (!vHandle) return false;
-    ns.forceValue(*const_cast<nix::Value *>(vHandle), pos);
+    ffi::forceValue(ns, *const_cast<nix::Value *>(vHandle), pos);
     if (vHandle->type() != nix::nInt) return false;
     int64_t h = vHandle->integer().value;
     auto & tbl = v3BridgeClosures();
@@ -11066,8 +11066,8 @@ bool tryDispatchBridge1Direct(nix::EvalState & ns,
             nix::Value tw;
             try {
                 fallbackExpr->eval(ns, ns.baseEnv, tw);
-                ns.forceValue(tw, pos);
-                ns.callFunction(tw, *arg, out, pos);
+                ffi::forceValue(ns, tw, pos);
+                ffi::callFunction(ns, tw, *arg, out, pos);
                 return true;
             } catch (...) {
                 return false;  // give up; let TW dispatch handle it
@@ -11167,8 +11167,8 @@ bool tryDispatchFormalsLambdaBridge(nix::EvalState & ns,
             nix::Value tw;
             try {
                 fallbackExpr->eval(ns, ns.baseEnv, tw);
-                ns.forceValue(tw, pos);
-                ns.callFunction(tw, *arg, out, pos);
+                ffi::forceValue(ns, tw, pos);
+                ffi::callFunction(ns, tw, *arg, out, pos);
                 return true;
             } catch (...) {
                 return false;
@@ -11785,7 +11785,7 @@ static void bridgeBuiltin(const char * name, EvalState & state,
     nix::Value cur = *pAttr->value;
     for (int i = 0; i < Arity; ++i) {
         nix::Value next;
-        ns.callFunction(cur, *nargs[i], next, nix::noPos);
+        ffi::callFunction(ns, cur, *nargs[i], next, nix::noPos);
         cur = next;
     }
     out = treeWalkerToV3(state, cur);
@@ -11808,7 +11808,7 @@ void primFetchFinalTree(EvalState & s, Value * a, Value & o) {
             "v3 __fetchFinalTree: state.internalPrimOps['fetchFinalTree'] missing");
     nix::Value * narg = v3ToTreeWalker(s, a[0]);
     nix::Value twResult;
-    ns.callFunction(**pPrim, *narg, twResult, nix::noPos);
+    ffi::callFunction(ns, **pPrim, *narg, twResult, nix::noPos);
     o = treeWalkerToV3Public(ns, twResult);
 }
 void primFetchTarball(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchTarball", s, a, o); }

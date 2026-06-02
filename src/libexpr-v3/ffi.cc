@@ -65,6 +65,11 @@ void forceValue(nix::EvalState & state, nix::Value & v)
     state.forceValue(v, nix::noPos);
 }
 
+void forceValue(nix::EvalState & state, nix::Value & v, nix::PosIdx pos)
+{
+    state.forceValue(v, pos);
+}
+
 void setTreeWalkerBuiltin(nix::EvalState & state, const std::string & name, nix::Value * value)
 {
     state.getBuiltin(name) = *value;  // throws if `name` isn't a builtin
@@ -104,6 +109,11 @@ nix::Value * allocValue(nix::EvalState & state)
 void callFunction(nix::EvalState & state, nix::Value & fun, nix::Value & arg, nix::Value & out)
 {
     state.callFunction(fun, arg, out, nix::noPos);
+}
+
+void callFunction(nix::EvalState & state, nix::Value & fun, nix::Value & arg, nix::Value & out, nix::PosIdx pos)
+{
+    state.callFunction(fun, arg, out, pos);
 }
 
 std::string coercePathToStore(nix::EvalState & state, const std::string & path)
