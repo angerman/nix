@@ -905,16 +905,11 @@ void Scavenger::run()
         }
     }
 
-    // #705 (2026-05-20): bridge-table roots.  The TW->v3 bridge
-    // tables (v3BridgeClosures / v3BridgeAttrs / v3BridgeLists)
-    // hold v3 Values keyed by handle; each Value's payload may
-    // point at a nursery-allocated Closure / Bindings / ListVec.
-    // Without forwarding these, hello.drvPath SIGSEGVs on the
-    // first scavenge — TW-side bridge primops dereference stale
-    // pointers post-memset.
+    // (bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02;
+    //  the v3BridgeClosures/Attrs/Lists tables are deleted.  rootVisit
+    //  below is still used by the remaining root walks.)
     std::function<void(Value &)> rootVisit =
         [this](Value & v) { visitValue(v); };
-    walkV3BridgeRoots(rootVisit);
 
     // #705 (2026-05-21): per-CompilationUnit AttrSelectIC roots.
     // The IC caches `(Bindings*, slot)` pairs for OP_ATTRS_SELECT —
@@ -1354,12 +1349,7 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
         walkVm("otherVm", other);
     }
 
-    // 2. Bridge tables — v3BridgeClosures / Attrs / Lists (primops.cc)
-    {
-        std::function<void(Value &)> visit =
-            [&](Value & v) { a.visitValue(v, "v3BridgeRoots"); };
-        walkV3BridgeRoots(visit);
-    }
+    // (2. bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
     // 3. Bytecode-primop replacement map (bytecode_primops.cc).
     {

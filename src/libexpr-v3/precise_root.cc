@@ -135,11 +135,7 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
     // primop.hh) — used by the nursery scavenger and the auditor.
     // Reuse it here with a std::function adapter so the Stage 3
     // walker doesn't duplicate the table-iteration logic.
-    {
-        std::function<void(Value &)> adapter =
-            [&visitor](Value & v) { visitor.visitValue(v); };
-        walkV3BridgeRoots(adapter);
-    }
+    // (bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
     // -- Import cache roots (Stage 3 sub-source 7) -----------------
     // primImport caches results in an in-memory map.  Entries hold
@@ -196,11 +192,7 @@ void walkGlobalV3Roots(RootVisitor & visitor) noexcept
     // Stage 5: C++-stack roots (RAII-registered via `GcRoot`).
     walkCppStackRoots(visitor);
     // FFI bridge tables — v3 Value handles indexed by TW.
-    {
-        std::function<void(Value &)> adapter =
-            [&visitor](Value & v) { visitor.visitValue(v); };
-        walkV3BridgeRoots(adapter);
-    }
+    // (bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
     // primImport result cache.
     {
         std::function<void(Value &)> adapter =

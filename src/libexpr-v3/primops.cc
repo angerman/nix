@@ -3847,12 +3847,7 @@ void primDerivation(EvalState & state, Value * args, Value & out);
 /// non-traceable but values are size_t, not pointers, so no roots
 /// needed for the values; the keys (Env*) are held by the bridged TW
 /// lambda Value which is itself rooted by its consumer.
-static std::unordered_map<const nix::Env *, size_t> &
-v3FormalsLambdaBridges()
-{
-    static std::unordered_map<const nix::Env *, size_t> tbl;
-    return tbl;
-}
+// (v3FormalsLambdaBridges side-table retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
 // (treeWalkerToV3 forward-decls retired — TW_VALUE_ERADICATION F4.)
 
@@ -3894,9 +3889,7 @@ namespace nix::v3 { namespace {
 // via the bridge primops registered in TW's primop table.  Hot
 // counts here mean v3 is leaking across the cutover; reducing them
 // is the Phase D goal.
-std::atomic<uint64_t> g_bridgeCallBridge1Calls{0};
-std::atomic<uint64_t> g_bridgeForceAttrCalls{0};
-// g_bridgeForceListElemCalls retired (FFI_KILL_PLAN Phase A1 2026-06-01).
+// (g_bridgeCallBridge1Calls/g_bridgeForceAttrCalls counters retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
 // #458 step 2: shared depth counter and limit between
 // primV3CallBridge1 (the legacy TW primop) and tryDispatchBridge1Direct
@@ -3907,106 +3900,7 @@ std::atomic<uint64_t> g_bridgeForceAttrCalls{0};
 // regardless of which path is currently executing.
 } // close anon ns
 
-// #705 (2026-05-20): scavenge-roots accessor.  Must live at
-// namespace-nix::v3 scope (not inside the anon ns above) so the
-// linker can resolve it from gc.cc.  Reaches into the
-// file-static bridge tables defined in the anon ns above —
-// `static` (internal linkage) lookup is fine within the same TU.
-void walkV3BridgeRoots(const std::function<void(Value &)> & visit)
-{
-    (void)visit;  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02) — no roots to walk
-}
-
-// 2026-05-29 evening (DIAG analysis spike): clear bridge tables.
-// Companion to clearImportCacheResultsForDiag().  Tests whether
-// the 311 MB at all-packages.nix:9112 is held by TW bridge tables
-// (v3 ↔ TW interop).  UNSAFE if any TW code runs subsequently;
-// safe for one-shot end-of-eval before dump.  Gated via
-// NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1.
-void clearV3BridgesForDiag() noexcept
-{
-    // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02) — nothing to clear
-}
-
-// 2026-05-29 evening (DIAG analysis): expose bridge-table sizes
-// so the periodic L(t) sampler and NIX_VM_STATS dump can report
-// the bridge growth curve.  Returns triple (closures, attrs,
-// lists) entry counts.  Each entry is 24 B (Value + Expr*).
-std::array<size_t, 3> v3BridgeTableSizes() noexcept
-{
-    return {0, 0, 0};  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02)
-}
-
-// 2026-05-29 evening (DIAG bridge attribution): unique v3-pointer
-// count in each bridge table.  If unique << total, many entries
-// share the same v3Value (duplicate handles), which means dedup-
-// on-push could collapse the table.  Per
-// `lode/BRIDGES_HOLD_RETENTION_2026-05-29.md`, M5 has 10042
-// closure bridges; this measures how many unique closures they
-// reference.
-std::array<size_t, 3> v3BridgeUniquePtrCounts() noexcept
-{
-    return {0, 0, 0};  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02)
-}
-
-// 2026-05-29 evening (DIAG bridge analysis): per-bridge-entry
-// iterator.  Calls `cb(v3Value, kind_label, idx)` for every entry
-// in all three tables.  Used by live_trace.cc's
-// dumpV3BridgeRetention to compute per-entry transitive retention
-// without exposing the BridgeXEntry types (which are anon-ns).
-void forEachV3BridgeEntry(
-    const std::function<void(const Value &, const char *, size_t)> & cb) noexcept
-{
-    (void)cb;  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02) — no entries
-}
-
-// #875 Stage 0 (2026-05-29): bridge-access distribution dump for the
-// weak-bridge-eviction measurement spike.  Reports the count of bridge
-// entries per access-count bucket, separated by table.  Decision input
-// for Stage 1 SHIP gate per `lode/WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md`:
-// "if ≥ 30 % of total bridge bytes live in entries accessed ≤ 2 times,
-//  proceed to Stage 1.  Otherwise STOP."
-//
-// This dump shows ENTRY counts per bucket.  Combined with the existing
-// `v3BridgeTableSizes` byte estimate (24 B + transitive) and the
-// optional `NIX_V3_DUMP_BRIDGE_RETENTION=1` per-entry transitive walk,
-// the operator can cross-reference access frequency vs retention bytes
-// to make the Stage 1 decision.
-//
-// Cost: one linear walk over the three bridge tables.  Bucketing is
-// O(n) per table.  Total: under 1 ms for the largest observed table
-// (M5 ~10K closures).  Always-on under NIX_VM_STATS=1; idle cost
-// outside of NIX_VM_STATS is zero (the function isn't called).
-void dumpBridgeAccessDistribution(std::FILE * out) noexcept
-{
-    (void)out;  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02)
-}
-
-// (clearPostEvalGlobalRoots defined further down, after importCache()
-// becomes visible — see ~line 7600.)
-
-// (walkImportCacheRoots defined further down, after the
-// anonymous-namespace `importCache()` function body is visible.)
-
-int & bridge1DepthCounter() {
-    static thread_local int d = 0;
-    return d;
-}
-int bridge1MaxDepth() {
-    static const int k = []{
-        if (const char * v = std::getenv("NIX_V3_BRIDGE1_DEPTH"))
-            return std::max(0, std::atoi(v));
-        // REVIEW_2026-05-06b PR1: bumped 8 → 16.  cardano-node hits the
-        // limit ≈10–18 times per eval at depth=8, paying ≈5 ms per
-        // fallback (~50–90 ms wasted).  Each extra frame costs ~50 µs
-        // worth of stack/local setup; doubling the headroom is
-        // essentially free and eliminates the bulk of the spurious
-        // depth-fallbacks.  Real cycles still surface (the depth is
-        // still bounded; cycles go infinite, not gradual).
-        return 16;
-    }();
-    return k;
-}
+// (walkV3BridgeRoots/clearV3BridgesForDiag/v3BridgeTableSizes/v3BridgeUniquePtrCounts/forEachV3BridgeEntry/dumpBridgeAccessDistribution/bridge1DepthCounter/bridge1MaxDepth retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 namespace {
 
     // (primV3CallBridge1 / primV3ForceAttr(Inner) / v3ToTreeWalker /
@@ -8717,24 +8611,8 @@ void bumpPrimOpNanos(const PrimOp * po, uint64_t deltaNs)
 
 void dumpPrimOpStats(std::FILE * out)
 {
-    // #453 Phase D: bridge primop counters (TW->v3 callbacks).  Print
-    // before the v3-side primop counts because they're the actual
-    // cutover-cost signal; high counts here mean v3 result values
-    // bridged eagerly across the v3<->TW boundary.
-    uint64_t br1 = nix::v3::g_bridgeCallBridge1Calls.load(std::memory_order_relaxed);
-    uint64_t bra = nix::v3::g_bridgeForceAttrCalls.load(std::memory_order_relaxed);
-    // BP3 (`__v3_force_list_elem`) retired in FFI_KILL_PLAN Phase A1
-    // (2026-06-01) — 0 calls everywhere measured; no counter anymore.
-    // Always print: a zero on these is itself the kill-criterion signal
-    // we need to retire the TW-side bridge primops (#660 / OPT #3).
-    // Suppression-on-zero made "did the workload exercise this path?"
-    // un-answerable from stats alone.
-    std::fprintf(out,
-        "v3 bridge-primop calls (TW->v3): __v3_call_bridge_1=%llu "
-        "__v3_force_attr=%llu\n",
-        (unsigned long long)br1,
-        (unsigned long long)bra);
-
+    // (bridge-primop call counters retired with the bridge apparatus —
+    //  TW_VALUE_ERADICATION F4, 2026-06-02.)
     auto & c = primOpCounter();
     std::lock_guard<std::mutex> g(c.mtx);
     if (c.counts.empty()) return;
@@ -8840,25 +8718,9 @@ void dumpHotDescriptors(std::FILE * out, size_t limit,
 //  forceBridgeThunk / tryBridgeAttrLookup / tryFastBridgeScalarTwToV3
 //  retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
-/// #458 step B: bridge telemetry storage + accessors.  See header
-/// for full design.  Always-on counts; opt-in timings.
-namespace {
-struct BridgeStats {
-    std::atomic<uint64_t> count{0};
-    std::atomic<uint64_t> nsTotal{0};
-};
-BridgeStats & bridgeStats(BridgeKind k)
-{
-    static BridgeStats arr[(size_t)BridgeKind::Count];
-    return arr[(size_t)k];
-}
-} // anon ns
+// (BridgeStats bridge telemetry retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
-bool bridgeTimingEnabled()
-{
-    static const bool e = std::getenv("NIX_V3_BRIDGE_TIMING") != nullptr;
-    return e;
-}
+// (bridgeTimingEnabled bridge telemetry retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
 // #769 (2026-05-22) — primImport per-phase timing.  See
 // `include/v3/import_timing.hh` for the rationale.  Definitions live
@@ -8876,90 +8738,13 @@ bool importTimingEnabled() noexcept
     return e;
 }
 
-uint64_t bridgeTotalNs()
-{
-    uint64_t total = 0;
-    for (size_t i = 0; i < (size_t)BridgeKind::Count; ++i)
-        total += bridgeStats((BridgeKind)i).nsTotal.load(std::memory_order_relaxed);
-    return total;
-}
+// (bridgeTotalNs bridge telemetry retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
-void bridgeTelemetryBump(BridgeKind k, uint64_t ns)
-{
-    auto & s = bridgeStats(k);
-    s.count.fetch_add(1, std::memory_order_relaxed);
-    if (ns) s.nsTotal.fetch_add(ns, std::memory_order_relaxed);
-}
+// (bridgeTelemetryBump bridge telemetry retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
-BridgeTimer::BridgeTimer(BridgeKind k) : kind(k), startNs(0)
-{
-    if (bridgeTimingEnabled()) {
-        auto t = std::chrono::steady_clock::now();
-        startNs = (uint64_t)std::chrono::duration_cast<
-            std::chrono::nanoseconds>(t.time_since_epoch()).count();
-    }
-}
-BridgeTimer::~BridgeTimer()
-{
-    uint64_t ns = 0;
-    if (startNs) {
-        auto t = std::chrono::steady_clock::now();
-        uint64_t now = (uint64_t)std::chrono::duration_cast<
-            std::chrono::nanoseconds>(t.time_since_epoch()).count();
-        ns = now - startNs;
-    }
-    bridgeTelemetryBump(kind, ns);
-}
+// (BridgeTimer:: bridge telemetry retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
-void dumpBridgeTelemetry(std::FILE * out)
-{
-    static const char * labels[(size_t)BridgeKind::Count] = {
-        "tw->v3 full ",
-        "tw->v3 scalar",
-        "tw->v3 attr  ",
-        "tw->v3 has   ",
-        "v3->tw       ",
-        "tw force     ",
-    };
-    bool any = false;
-    for (size_t i = 0; i < (size_t)BridgeKind::Count; ++i) {
-        if (bridgeStats((BridgeKind)i).count.load(std::memory_order_relaxed)) {
-            any = true; break;
-        }
-    }
-    if (!any) return;
-    std::fprintf(out, "v3 bridge telemetry%s:\n",
-        bridgeTimingEnabled() ? " (count + nsTotal)" : " (count only -- "
-        "set NIX_V3_BRIDGE_TIMING=1 for timings)");
-    uint64_t totalCount = 0, totalNs = 0;
-    for (size_t i = 0; i < (size_t)BridgeKind::Count; ++i) {
-        uint64_t c = bridgeStats((BridgeKind)i).count.load(std::memory_order_relaxed);
-        uint64_t n = bridgeStats((BridgeKind)i).nsTotal.load(std::memory_order_relaxed);
-        totalCount += c;
-        totalNs    += n;
-        if (c == 0) continue;
-        if (bridgeTimingEnabled() && n) {
-            double ms = n / 1e6;
-            double avgNs = (double)n / c;
-            std::fprintf(out,
-                "  %s  count=%-12llu ns=%-15llu (%.3f ms total, %.0f ns avg)\n",
-                labels[i], (unsigned long long)c, (unsigned long long)n, ms, avgNs);
-        } else {
-            std::fprintf(out, "  %s  count=%llu\n", labels[i],
-                (unsigned long long)c);
-        }
-    }
-    if (totalCount) {
-        if (bridgeTimingEnabled() && totalNs) {
-            std::fprintf(out, "  %-13s  count=%-12llu ns=%-15llu (%.3f ms total)\n",
-                "TOTAL", (unsigned long long)totalCount,
-                (unsigned long long)totalNs, totalNs / 1e6);
-        } else {
-            std::fprintf(out, "  %-13s  count=%llu\n", "TOTAL",
-                (unsigned long long)totalCount);
-        }
-    }
-}
+// (dumpBridgeTelemetry bridge telemetry retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
 // (#458 A.4 tryBridgeAttrHas retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 

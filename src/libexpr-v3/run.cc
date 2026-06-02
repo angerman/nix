@@ -75,24 +75,12 @@ struct PhaseTimer {
     ~PhaseTimer()
     {
         if (!active) return;
-        // Sum bridge time (TW-side) from the per-kind telemetry so
-        // we can report the v3-VM / TW split.  Returns 0 unless
-        // NIX_V3_BRIDGE_TIMING=1 was set; in that case the bridge
-        // callbacks accumulate wall-time at each call site.
-        double bridge_ms = bridgeTotalNs() / 1e6;
-        // VM-time is run_ms minus bridge_ms (the time spent inside
-        // TW callbacks reached from v3, otherwise accounted under
-        // run).  Clamp negative (clock granularity) to 0.
-        double vm_ms = run_ms - bridge_ms;
-        if (vm_ms < 0) vm_ms = 0;
+        // (bridge timing/telemetry retired — TW_VALUE_ERADICATION F4,
+        //  2026-06-02; the bridge executes nowhere, so vm == run.)
         std::fprintf(stderr,
             "v3-direct timing (ms): lower=%.3f optimise=%.3f compile=%.3f "
-            "run=%.3f vm=%.3f bridge=%.3f\n",
-            lower_ms, optimise_ms, compile_ms, run_ms, vm_ms, bridge_ms);
-        // If bridge timing is enabled, also dump the per-kind
-        // breakdown so we can see WHERE the TW time goes.
-        if (bridgeTimingEnabled())
-            dumpBridgeTelemetry(stderr);
+            "run=%.3f\n",
+            lower_ms, optimise_ms, compile_ms, run_ms);
         // #769: per-import phase breakdown — splits the outer `run`
         // bucket into work done inside primImport recursions.  Cheap
         // (a handful of uint64_t accumulators bumped under the V3_TIMING
@@ -398,14 +386,7 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             "v3-direct DIAG spike: cleared in-memory ImportCache "
             "results (NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1)\n");
     }
-    static const bool s_clearBridges =
-        std::getenv("NIX_V3_END_OF_EVAL_CLEAR_BRIDGES") != nullptr;
-    if (__builtin_expect(s_clearBridges, 0)) {
-        clearV3BridgesForDiag();
-        std::fprintf(stderr,
-            "v3-direct DIAG spike: cleared v3 ↔ TW bridge tables "
-            "(NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1)\n");
-    }
+    // (bridge-table DIAG clear retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
     // attribute alloc explosions to thunks vs closures vs Bindings
@@ -577,33 +558,8 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                         labels[i], (unsigned long long)a.mergeBindingsNbHist[i]);
             }
         }
-        // 2026-05-29 evening (DIAG analysis): bridge-table sizes.
-        // Per BRIDGES_HOLD_RETENTION_2026-05-29.md, bridges retain
-        // 99.8-99.9 % of v3 arena bytes at end-of-eval.  Dumping the
-        // sizes here shows the magnitude of bridge growth.
-        {
-            const auto sizes = nix::v3::v3BridgeTableSizes();
-            const auto uniq  = nix::v3::v3BridgeUniquePtrCounts();
-            const size_t total = sizes[0] + sizes[1] + sizes[2];
-            const size_t totalUniq = uniq[0] + uniq[1] + uniq[2];
-            const double mb = double(total) * 24.0 / 1e6;  // 24 B/entry
-            std::fprintf(stderr,
-                "v3-direct bridge tables: closures=%zu (uniq=%zu) attrs=%zu (uniq=%zu) "
-                "lists=%zu (uniq=%zu) total=%zu (uniq=%zu) entries (~%.2f MB "
-                "vector storage)\n",
-                sizes[0], uniq[0], sizes[1], uniq[1], sizes[2], uniq[2],
-                total, totalUniq, mb);
-            if (total > 0 && totalUniq * 4 < total) {
-                std::fprintf(stderr,
-                    "v3-direct bridge tables: HIGH duplication "
-                    "(%.1fx duplicates) — dedup-on-push could collapse the table\n",
-                    double(total) / double(totalUniq));
-            }
-            // #875 Stage 0 (2026-05-29): bridge-access distribution.
-            // Decision input for Stage 1 weak-bridge eviction.  See
-            // `lode/WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md`.
-            nix::v3::dumpBridgeAccessDistribution(stderr);
-        }
+        // (bridge-table size/distribution dump retired —
+        //  TW_VALUE_ERADICATION F4, 2026-06-02; the tables are deleted.)
         // EXIT_GC_SPIRAL Day 13-15 (2026-05-29): singleton-capturedWiths
         // intern-cache hit rate.  Hit rate near 100 % means the cache
         // is doing its job (most 1-element capturedWiths reuse a
@@ -737,12 +693,7 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         // Retirement criterion: when Stage 6 lands the real precise GC
         // of v3 arena, fold into NIX_VM_STATS and remove the gate.
         dumpV3LiveFraction();
-        // 2026-05-29 evening: per-bridge-entry retention.  Gated by
-        // NIX_V3_DUMP_BRIDGE_RETENTION=1; runs transitive walk per
-        // bridge entry.  Informs cohort-vs-LRU-vs-weak-bridge
-        // architectural choice.  Fires AFTER dumpV3LiveFraction so
-        // the live-fraction headline lands first.
-        dumpV3BridgeRetention();
+        // (per-bridge-entry retention dump retired — TW_VALUE_ERADICATION F4.)
         // Day 5 2026-05-28: per-block fill probe.  Decision data for
         // Stage 6 generational tenured collector (GHC-RTS style).
         // Gated NIX_V3_BLOCK_PROBE=1; zero cost otherwise.
