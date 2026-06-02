@@ -47,6 +47,10 @@
 #include "nix/fetchers/fetch-to-store.hh"  // fetchToStore / FetchMode (pathFetchToStore)
 #include "nix/util/serialise.hh"           // StringSource / FileSerialisationMethod (addTextToStore)
 #include "nix/fetchers/fetchers.hh"        // fetchers::Input getters (readLockedFlake)
+#include "nix/fetchers/registry.hh"        // lookupInRegistries (fetchTree)
+#include "nix/fetchers/input-cache.hh"     // InputCache::getAccessor (fetchTree)
+#include "nix/util/logging.hh"             // warn (fetchTree pure-eval narHash path)
+#include "nix/util/url.hh"                 // fixGitURL
 #include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
 #include "nix/flake/flake.hh"              // flake::LockedFlake / lockFlake / LockFlags
 #include "nix/flake/flakeref.hh"           // parseFlakeRef (lockFlakeAndRead)
@@ -215,7 +219,8 @@ namespace {
 TreeAttrsInfo readTreeAttrs(nix::EvalState & state,
                             const nix::StorePath & storePath,
                             const nix::fetchers::Input & input,
-                            bool forceDirty)
+                            bool forceDirty,
+                            bool emptyRevFallback)
 {
     TreeAttrsInfo info;
 
@@ -234,9 +239,17 @@ TreeAttrsInfo readTreeAttrs(nix::EvalState & state,
         if (auto rev = input.getRev()) {
             info.rev      = rev->gitRev();
             info.shortRev = rev->gitShortRev();
+        } else if (emptyRevFallback) {
+            // Backwards-compat for builtins.fetchGit on a dirty repo: TW's
+            // emitTreeAttrs emits an empty sha1 as rev (fetchTree.cc).
+            const auto emptyHash = nix::Hash(nix::HashAlgorithm::SHA1);
+            info.rev      = emptyHash.gitRev();
+            info.shortRev = emptyHash.gitShortRev();
         }
         if (auto revCount = input.getRevCount())
             info.revCount = static_cast<int64_t>(*revCount);
+        else if (emptyRevFallback)
+            info.revCount = 0;
     }
 
     if (auto dirtyRev = nix::fetchers::maybeGetStrAttr(input.attrs, "dirtyRev")) {
@@ -252,6 +265,67 @@ TreeAttrsInfo readTreeAttrs(nix::EvalState & state,
 }
 
 }  // namespace
+
+std::string fixGitURL(const std::string & url)
+{
+    return nix::fixGitURL(url).to_string();
+}
+
+TreeAttrsInfo fetchTree(nix::EvalState & state, const FetchTreeInput & in,
+                        bool emptyRevFallback, bool isFinal)
+{
+    // (a) Build the fetchers::Input from plain data (mirrors fetchTree.cc's
+    //     fromURL / fromAttrs split; the v3 caller already did the per-
+    //     builtin arg normalization).
+    nix::fetchers::Input input{};
+    if (in.url) {
+        input = nix::fetchers::Input::fromURL(state.fetchSettings, *in.url);
+    } else {
+        nix::fetchers::Attrs attrs;
+        for (auto & a : in.attrs) {
+            if (std::holds_alternative<std::string>(a.value))
+                attrs.emplace(a.name, std::get<std::string>(a.value));
+            else if (std::holds_alternative<int64_t>(a.value))
+                attrs.emplace(a.name, uint64_t(std::get<int64_t>(a.value)));
+            else
+                attrs.emplace(a.name, nix::Explicit<bool>{std::get<bool>(a.value)});
+        }
+        input = nix::fetchers::Input::fromAttrs(state.fetchSettings, std::move(attrs));
+    }
+
+    // (b) registry / pure-eval / checkURI / __final — verbatim from TW's
+    //     fetchTree helper (fetchTree.cc:196-220).
+    if (!state.settings.pureEval && !input.isDirect()
+        && nix::experimentalFeatureSettings.isEnabled(nix::Xp::Flakes))
+        input = nix::fetchers::lookupInRegistries(state.fetchSettings, *state.store, input,
+                    nix::fetchers::UseRegistries::Limited).first;
+
+    if (state.settings.pureEval && !input.isLocked(state.fetchSettings)) {
+        if (input.getNarHash())
+            nix::warn(
+                "Input '%s' is unlocked (e.g. lacks a Git revision) but is checked by NAR hash. "
+                "This is not reproducible and will break after garbage collection or when shared.",
+                input.to_string());
+        else
+            throw nix::Error(
+                "in pure evaluation mode, '%s' doesn't fetch unlocked input '%s'",
+                in.fetcherName, input.to_string());
+    }
+
+    state.checkURI(input.toURLString());
+
+    if (isFinal)
+        input.attrs.insert_or_assign("__final", nix::Explicit<bool>(true));
+    else if (input.isFinal())
+        throw nix::Error("input '%s' is not allowed to use the '__final' attribute", input.to_string());
+
+    // (c) the actual fetch + path mount, then read the result V3-NATIVE.
+    auto cachedInput = state.inputCache->getAccessor(
+        state.fetchSettings, *state.store, input, nix::fetchers::UseRegistries::No);
+    auto storePath = state.mountInput(cachedInput.lockedInput, input, cachedInput.accessor);
+    return readTreeAttrs(state, storePath, cachedInput.lockedInput,
+                         /*forceDirty=*/false, emptyRevFallback);
+}
 
 LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlakePtr)
 {
@@ -273,7 +347,8 @@ LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlake
         const bool forceDirty = !lockedNode && lockedFlake.flake.forceDirty;
 
         FlakeNodeInfo n;
-        n.sourceInfo = readTreeAttrs(state, storePath, inputForNode, forceDirty);
+        n.sourceInfo = readTreeAttrs(state, storePath, inputForNode, forceDirty,
+                                     /*emptyRevFallback=*/false);
         n.dir = std::string(nix::CanonPath(subdir).rel());
 
         auto key = keyMap.find(node);

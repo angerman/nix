@@ -241,6 +241,40 @@ struct LockedFlakeInfo
     std::vector<FlakeNodeInfo> nodes;         ///< nodePaths order (v3 side re-sorts)
 };
 
+/// One fetcher input attribute, extracted v3-native (string/int/bool), to
+/// be rebuilt into `fetchers::Attrs` inside ffi.cc (audit Phase 4 / TW-value
+/// eradication F1: keeps fetchers types out of the consumer TU).
+struct FetchAttr
+{
+    std::string                                 name;
+    std::variant<std::string, int64_t, bool>    value;
+};
+
+/// A fetcher invocation, plain-data: either a URL (→ `Input::fromURL`, the
+/// fetchTree string form) or an attrs list (→ `Input::fromAttrs`).  The v3
+/// caller does the arg normalization (type/url-fix/defaults) per TW's
+/// fetchTree helper; ffi.cc does the fetch.
+struct FetchTreeInput
+{
+    std::optional<std::string> url;    ///< set ⇒ fromURL; else fromAttrs(attrs)
+    std::vector<FetchAttr>     attrs;
+    std::string                fetcherName;  ///< "fetchGit"/"fetchTree" (error text)
+};
+
+/// THE fetcher FFI leaf (eradicates the `v3ToTreeWalker → callFunction(
+/// builtins.fetchTree) → treeWalkerToV3` round-trip).  Mirrors TW's
+/// `fetchTree` helper tail (fetchTree.cc:196-227): registry lookup +
+/// pure-eval unlocked gating + checkURI + `__final` + inputCache getAccessor
+/// + mountInput, then `readTreeAttrs` → plain `TreeAttrsInfo` for v3-native
+/// `v3EmitTreeAttrs`.  No `nix::Value` crosses.  `emptyRevFallback` matches
+/// the per-builtin flag (true for fetchGit).
+TreeAttrsInfo fetchTree(nix::EvalState & state, const FetchTreeInput & in,
+                        bool emptyRevFallback, bool isFinal);
+
+/// `nix::fixGitURL(url).to_string()` — the fetchGit URL normalization (keeps
+/// `nix/util/url.hh` in ffi.cc).  Cold (once per fetchGit call).
+std::string fixGitURL(const std::string & url);
+
 /// Read a `nix::flake::LockedFlake` (passed opaquely as `const void *`;
 /// ffi.cc casts it back) into plain data: the lockfile text + per-node
 /// store-path / fetcher-input fields.  Performs `lockFile.to_string`, the

@@ -198,8 +198,9 @@ void walkCallFlakeRoot(const std::function<void(Value &)> & visit)
 // forward-decl is gone — sourceInfo is now built v3-native from plain
 // ffi::TreeAttrsInfo, so this TU no longer bridges TW values.)
 
-namespace {
-
+// v3EmitTreeAttrs is nix::v3-scope (not anonymous) so primops.cc's fetcher
+// eradication (F1/F2) can build fetcher results with the SAME byte-for-byte
+// path the flake sourceInfo uses.  Forward-declared by its consumers.
 /// #701 Phase 4b: v3-native port of nix::emitTreeAttrs
 /// (libexpr/primops/fetchTree.cc:22).  Builds the per-flake-node
 /// `sourceInfo` attrset (outPath, narHash, rev/shortRev/revCount,
@@ -318,8 +319,6 @@ Value v3EmitTreeAttrs(const ffi::TreeAttrsInfo & info)
     out.payload.bindings = b;
     return out;
 }
-
-}  // namespace
 
 /// Public entry point — invoked from `primGetFlake` when the
 /// v3-native path is enabled.  Returns the flake's outputs attrset

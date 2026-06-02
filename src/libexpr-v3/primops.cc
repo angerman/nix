@@ -11746,6 +11746,132 @@ static void bridgeBuiltin(const char * name, EvalState & state,
     out = treeWalkerToV3(state, cur);
 }
 
+// TW-VALUE ERADICATION F1/F2 (TW_VALUE_ERADICATION_GOAL §4): build the
+// plain-data ffi::FetchTreeInput from the v3 arg, reproducing TW's fetchTree
+// helper arg-normalization (fetchTree.cc:92-194) V3-NATIVE — no
+// v3ToTreeWalker, no callFunction, no TW Value.  Then ffi::fetchTree does
+// the fetch (library call) + v3EmitTreeAttrs builds the result attrset.
+Value v3EmitTreeAttrs(const ffi::TreeAttrsInfo & info);   // v3_call_flake.cc
+
+static ffi::FetchTreeInput extractFetchTreeInput(
+    EvalState & state, Value & arg, const char * fetcher,
+    bool isFetchGit, bool allowNameArgument)
+{
+    auto & symTab = ir::globalSymbolTable();
+    ffi::FetchTreeInput in;
+    in.fetcherName = fetcher;
+
+    Value a = forceValue(*state.vm, arg);
+    std::optional<std::string> type;
+    if (isFetchGit) type = "git";
+
+    auto has = [&](const char * n) {
+        for (auto & x : in.attrs) if (x.name == n) return true;
+        return false;
+    };
+    auto boolVal = [&](const char * n) -> bool {
+        for (auto & x : in.attrs)
+            if (x.name == n && std::holds_alternative<bool>(x.value)) return std::get<bool>(x.value);
+        return false;
+    };
+
+    if (a.isAttrs() && a.payload.bindings) {
+        // Materialise Chain overlays so we iterate the FULL attrset (matches
+        // TW's flat `for (auto & attr : *args[0]->attrs())`; see primAttrNames).
+        const Bindings * b = a.payload.bindings;
+        if (b->isChain()) b = b->materialize();
+        static const SymbolId sidType = ir::globalInternSymbol("type");
+
+        if (const Value * tv = b->lookup(sidType)) {
+            if (type)
+                throw std::runtime_error("unexpected argument 'type'");
+            Value t = forceValue(*state.vm, *tv);
+            if (t.tag() != Tag::String || !t.payload.str)
+                throw std::runtime_error(std::string(
+                    "while evaluating the `type` argument passed to '") + fetcher + "': expected a string");
+            if (auto * raw = lookupStringContextEntries(t.payload.str); raw && !raw->empty())
+                throw std::runtime_error(std::string(
+                    "the string argument passed as `type` to '") + fetcher + "' is not allowed to refer to a store path");
+            type = std::string(t.payload.str);
+        } else if (!type)
+            throw std::runtime_error(std::string("argument 'type' is missing in call to '") + fetcher + "'");
+
+        in.attrs.push_back({"type", *type});
+
+        for (uint32_t i = 0; i < b->size; ++i) {
+            const SymbolId nameId = b->entries[i].name;
+            if (nameId == sidType) continue;
+            std::string name(nameId < symTab.size() ? symTab[nameId] : std::to_string(nameId));
+            Value v = forceValue(*state.vm, b->entries[i].value);
+            Tag t = v.tag();
+            if (t == Tag::String || t == Tag::Path) {
+                std::string s = (t == Tag::String)
+                    ? std::string(v.payload.str ? v.payload.str : "")
+                    : std::string(v.payload.path ? v.payload.path : "");
+                if (isFetchGit && name == "url") s = ffi::fixGitURL(s);
+                in.attrs.push_back({name, std::move(s)});
+            } else if (t == Tag::Bool) {
+                in.attrs.push_back({name, v.payload.i == 1});
+            } else if (t == Tag::Int) {
+                int64_t iv = v.payload.i;
+                if (iv < 0)
+                    throw std::runtime_error(
+                        "negative value given for '" + std::string(fetcher) + "' argument '" + name
+                        + "': " + std::to_string(iv));
+                in.attrs.push_back({name, iv});
+            } else if (name == "publicKeys") {
+                nix::experimentalFeatureSettings.require(nix::Xp::VerifiedFetches);
+                in.attrs.push_back({name, toJsonValue(*state.vm, v, symTab).dump()});
+            } else {
+                throw std::runtime_error(
+                    "argument '" + name + "' to '" + std::string(fetcher)
+                    + "' is the wrong type (a string, Boolean or integer is expected)");
+            }
+        }
+
+        // fetchGit exportIgnore default + fetchTree shallow default + name gating.
+        if (isFetchGit && !has("exportIgnore") && (!has("submodules") || !boolVal("submodules")))
+            in.attrs.push_back({"exportIgnore", true});
+        if (type == "git" && !isFetchGit && !has("shallow"))
+            in.attrs.push_back({"shallow", true});
+        if (!allowNameArgument && has("name"))
+            throw std::runtime_error(std::string("argument 'name' isn’t supported in call to '") + fetcher + "'");
+    } else {
+        // string / URL form.
+        if (a.tag() != Tag::String && a.tag() != Tag::Path)
+            throw std::runtime_error(std::string(
+                "while evaluating the first argument passed to '") + fetcher + "': expected a string or attrset");
+        std::string url = (a.tag() == Tag::String)
+            ? std::string(a.payload.str ? a.payload.str : "")
+            : std::string(a.payload.path ? a.payload.path : "");
+        if (isFetchGit) {
+            in.attrs.push_back({"type", std::string("git")});
+            in.attrs.push_back({"url", ffi::fixGitURL(url)});
+            in.attrs.push_back({"exportIgnore", true});
+        } else {
+            if (!nix::experimentalFeatureSettings.isEnabled(nix::Xp::Flakes))
+                throw std::runtime_error(std::string(
+                    "passing a string argument to '") + fetcher
+                    + "' requires the 'flakes' experimental feature");
+            in.url = url;
+        }
+    }
+    return in;
+}
+
+// F1/F2: native fetchTree-family entry (replaces the bridgeBuiltin round-trip).
+static void v3FetchTree(EvalState & s, Value * a, Value & o,
+                        const char * fetcher, bool isFetchGit,
+                        bool allowNameArgument, bool emptyRevFallback)
+{
+    if (!s.nixEvalState)
+        throw std::runtime_error(std::string("v3 ") + fetcher + ": no tree-walker state available");
+    auto & ns = *s.nixEvalState;
+    auto in = extractFetchTreeInput(s, a[0], fetcher, isFetchGit, allowNameArgument);
+    ffi::TreeAttrsInfo info = ffi::fetchTree(ns, in, emptyRevFallback, /*isFinal=*/false);
+    o = v3EmitTreeAttrs(info);
+}
+
 void primFetchurl    (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchurl",    s, a, o); }
 // #700/step 3: v3-side wrapper for TW's `internalPrimOps["fetchFinalTree"]`.
 // Unlike `builtins.fetchTree` (in TW's builtins attrset), fetchFinalTree
@@ -11767,8 +11893,14 @@ void primFetchFinalTree(EvalState & s, Value * a, Value & o) {
     o = treeWalkerToV3Public(ns, twResult);
 }
 void primFetchTarball(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchTarball", s, a, o); }
-void primFetchTree   (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchTree",   s, a, o); }
-void primFetchGit    (EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchGit",    s, a, o); }
+// F1/F2 (TW-value eradication): native plain-data path — no bridgeBuiltin.
+// Params mirror TW prim_fetchTree / prim_fetchGit (fetchTree.cc:230/586).
+void primFetchTree   (EvalState & s, Value * a, Value & o) {
+    v3FetchTree(s, a, o, "fetchTree", /*isFetchGit=*/false, /*allowName=*/false, /*emptyRevFallback=*/false);
+}
+void primFetchGit    (EvalState & s, Value * a, Value & o) {
+    v3FetchTree(s, a, o, "fetchGit",  /*isFetchGit=*/true,  /*allowName=*/true,  /*emptyRevFallback=*/true);
+}
 void primFetchMercurial(EvalState & s, Value * a, Value & o){ bridgeBuiltin<1>("fetchMercurial", s, a, o); }
 void primFetchClosure(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchClosure", s, a, o); }
 void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("filterSource", s, a, o); }
