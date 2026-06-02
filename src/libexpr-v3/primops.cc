@@ -11602,12 +11602,12 @@ void primStorePath(EvalState & state, Value * args, Value & out)
     auto path2 = ns->store->toStorePath(path.abs()).first;
     if (!ffi::readOnlyMode())
         ns->store->ensurePath(path2);
-    nix::NixStringContext context;
-    context.insert(nix::NixStringContextElem::Opaque{.path = path2});
-    nix::Value tw;
-    tw.mkString(path.abs(), context, ns->mem);
-    Value result = treeWalkerToV3Public(*ns, tw);
-    out = result;
+    // Build the result string V3-NATIVE (path string + Opaque context) — no
+    // treeWalkerToV3 bridge (toward F4).
+    out = mkStringValueOwned(path.abs());
+    std::vector<std::string> ctx{
+        nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = path2}}.to_string()};
+    setStringContextEntries(out.payload.str, std::move(ctx));
 }
 
 /// builtins.__toFile name s → write s to store, return path.
