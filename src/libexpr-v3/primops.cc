@@ -6440,75 +6440,17 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
             + "` and V3_DRV_NO_BRIDGE=1; check V3_DRV_DEBUG output for "
               "the underlying error");
     }
-    // FFI_KILL_PLAN Phase C6 (2026-06-01): TW-bridge fallback retired
-    // by default.  Per Phase C0 measurement across 5 workloads
-    // (hello/firefox/python3/HNE/M5): 2414 derivationStrict native
-    // calls, 0 fallbacks.  The native path handles every shape
-    // these workloads produce; the TW bridge was dead code.
-    //
-    // Bridge retention impact: this was the largest bridge entry
-    // class per FFI_BRIDGE_INVENTORY_2026-05-31 §3.1 — its retirement
-    // removes the bridge-table source for derivation inputs.
-    //
-    // Soak escape hatch: V3_DRV_KEEP_BRIDGE=1 opts back into the
-    // bridge fallback (un-retires this code path) for one session,
-    // per plan §4.7.  If any unmeasured workload trips a native
-    // throw, set the gate and bridge fallback re-activates.
-    //
-    // Retirement criterion (per Rule 0): "delete `V3_DRV_KEEP_BRIDGE`
-    // + this entire block when a second session reports `native=N
-    // fallback=0` across the same workload matrix + at least one
-    // additional cross-architecture build".
-    static const bool s_keepBridge =
-        std::getenv("V3_DRV_KEEP_BRIDGE") != nullptr;
-    if (__builtin_expect(s_keepBridge, 0)
-        && state.nixEvalState
-        && args[0].isAttrs() && args[0].payload.bindings)
-    {
-        try {
-            auto & ns = *state.nixEvalState;
-            ++allocStats().v3ToTwBySite[6];  // #795 derivationStrict TW fallback
-            nix::Value * nargs = v3ToTreeWalker(state, args[0]);
-            // Cache the derivationStrict primop pointer per-EvalState
-            // — it's looked up by name on every call otherwise (one
-            // forceAttrs + one symbol-table lookup per derivation,
-            // which on a 25k-pkg nixpkgs scan is meaningful).
-            //
-            // Threading: nixEvalState pointer is stable for the
-            // lifetime of the eval; the static vBuiltins is process-
-            // wide because there is at most one tree-walker EvalState
-            // attached to the v3 runtime at any time.
-            static thread_local nix::Value * cachedDrvStrict = nullptr;
-            static thread_local nix::EvalState * cachedFor = nullptr;
-            if (cachedFor != &ns) {
-                cachedFor = &ns;
-                cachedDrvStrict = nullptr;
-                nix::Value & blt = ns.getBuiltins();
-                ns.forceAttrs(blt, nix::noPos, "v3 derivationStrict bridge");
-                auto * dsAttr = blt.attrs()->get(ns.symbols.create("derivationStrict"));
-                if (dsAttr && dsAttr->value) cachedDrvStrict = dsAttr->value;
-            }
-            if (cachedDrvStrict) {
-                // #484 STG-style address identity: heap-allocate so
-                // `&result` is a stable address for any v3 Bridge
-                // thunk treeWalkerToV3 may install (TW updates value
-                // cells in place; the bridge thunk must observe the
-                // post-update value, not a snapshot).
-                nix::Value * result = ffi::allocValue(ns);
-                ffi::callFunction(ns, *cachedDrvStrict, *nargs, *result, nix::noPos);
-                out = treeWalkerToV3(state, *result);
-                return;
-            }
-        } catch (const std::exception & e) {
-            // Reuses s_drvDebug from above (visible via function-
-            // static lookup on retry).
-            static const bool s_drvDebugCatch =
-                std::getenv("V3_DRV_DEBUG") != nullptr;
-            if (__builtin_expect(s_drvDebugCatch, 0))
-                std::fprintf(stderr, "v3 derivationStrict bridge fell back: %s\n", e.what());
-            // fall through to fake-store path
-        }
-    }
+    // FFI_KILL_PLAN Phase C6 + TW_VALUE_ERADICATION F5 (2026-06-02): the
+    // derivationStrict TW-bridge fallback (V3_DRV_KEEP_BRIDGE) is DELETED.
+    // It was default-off since 2026-06-01 (Phase C0: 2414 native / 0
+    // fallback across hello/firefox/python3/HNE/M5); this session's sweep
+    // re-confirmed native=byte-equal / 0-fallback across hello/git/python3/
+    // coreutils/stdenv/M5 (the 2nd-session 0-fallback retirement criterion).
+    // It was the LAST v3ToTreeWalker entry site outside the bridge apparatus
+    // itself; removing it makes the #875 subsystem dead code (deleted in the
+    // same arc).  Native-path errors now propagate / reach the no-store path
+    // below exactly as they already did by default (the gate never fired by
+    // default, so this is a zero-default-behavior-change deletion).
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("derivationStrict", "attrset");
     const auto & sym = drvStrictSymbols();
