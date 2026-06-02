@@ -79,6 +79,7 @@
 namespace nix {
     struct Pos;
     struct StaticEnv;
+    struct ContentAddressMethod;   // store/content-address.hh (by-ref shim param)
     class  Store;
     class  Logger;
     struct Value;       // TW value (distinct from nix::v3::Value)
@@ -247,6 +248,17 @@ struct LockedFlakeInfo
 /// `emitTreeAttrs`-equivalent field reads (emptyRevFallback = false,
 /// forceDirty per node).  THE flake-loading FFI leaf.
 LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlakePtr);
+
+/// builtins.path's store fetch: `fetchToStore(path.resolveSymlinks(), name,
+/// method)` under DryRun (when `readOnly`) else Copy, with no path filter
+/// (the v3 caller bails to the bridge when a filter is present).  Returns
+/// the resulting StorePath.  Keeps `fetchToStore` + `FetchMode` in ffi.cc.
+/// Cold (FFI leaf: store).
+nix::StorePath pathFetchToStore(nix::EvalState & state,
+                                const nix::SourcePath & path,
+                                const std::string & name,
+                                const nix::ContentAddressMethod & method,
+                                bool readOnly);
 
 /// builtins.getFlake's full flake-loading FFI leaf in one call: parseFlakeRef
 /// + the unlocked-in-pure-eval guard + lockFlake (no lockfile write/update,

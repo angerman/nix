@@ -43,6 +43,8 @@
 #include "nix/store/store-api.hh"          // Store::printStorePath / toStorePath
 #include "nix/store/globals.hh"            // nix::settings.readOnlyMode
 #include "nix/store/path-references.hh"    // PathRefScanSink (storeRefsContextFor)
+#include "nix/store/content-address.hh"    // ContentAddressMethod (pathFetchToStore param)
+#include "nix/fetchers/fetch-to-store.hh"  // fetchToStore / FetchMode (pathFetchToStore)
 #include "nix/fetchers/fetchers.hh"        // fetchers::Input getters (readLockedFlake)
 #include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
 #include "nix/flake/flake.hh"              // flake::LockedFlake / lockFlake / LockFlags
@@ -276,6 +278,23 @@ LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlake
         out.nodes.push_back(std::move(n));
     }
     return out;
+}
+
+nix::StorePath pathFetchToStore(nix::EvalState & state,
+                                const nix::SourcePath & path,
+                                const std::string & name,
+                                const nix::ContentAddressMethod & method,
+                                bool readOnly)
+{
+    return nix::fetchToStore(
+        state.fetchSettings,
+        *state.store,
+        path.resolveSymlinks(),
+        readOnly ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
+        name,
+        method,
+        nullptr,
+        state.repair);
 }
 
 LockedFlakeInfo lockFlakeAndRead(nix::EvalState & state,

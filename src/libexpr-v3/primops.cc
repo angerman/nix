@@ -94,7 +94,6 @@
 #include "v3/ir_dump.hh"  // R1 trigger trace: V3_DBG_DUMP_IR_PATH
 #include "v3/bytecode.hh"
 
-#include "nix/fetchers/fetch-to-store.hh"
 
 #include <boost/unordered/concurrent_flat_map.hpp>
 
@@ -9969,16 +9968,9 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
     }
 
     // Fetch (DryRun under readOnlyMode just computes the path).  No
-    // filter: the gate above bailed when one was present.
-    nix::StorePath dst = nix::fetchToStore(
-        ns.fetchSettings,
-        *ns.store,
-        path.resolveSymlinks(),
-        ffi::readOnlyMode() ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
-        name,
-        method,
-        nullptr,
-        ns.repair);
+    // filter: the gate above bailed when one was present.  fetchToStore +
+    // FetchMode live behind the ffi leaf (audit Phase 4).
+    nix::StorePath dst = ffi::pathFetchToStore(ns, path, name, method, ffi::readOnlyMode());
 
     if (expectedHash) {
         nix::StorePath expected = ns.store->makeFixedOutputPathFromCA(
