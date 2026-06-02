@@ -168,26 +168,49 @@ site and interlocked inside derivationStrict, the #875 bridge subsystem
 and the corepkgs/parse/value-graph marshalling (e.g. `corepkgsFS` feeds
 `Pos::Origin`; `realisePath` takes/returns TW values+SourcePaths).
 
-**Completion blueprint (the coordinated multi-day relocation):**
-1. Relocate the **#875 bridge subsystem** (`v3ToTreeWalkerPublic` /
-   `treeWalkerToV3Public` / `tryUnwrapBridge1Closure` + the closure table +
-   eviction/revival/timers + shim) as a cohesive unit into an exempt
-   `ffi_bridge.cc`.  Removes the 112 `nix::Value` uses + decouples
-   value/context.  (Validate: full nixpkgs eval — the bridge fires on every
-   callPackage.)
-2. Relocate the remaining **EvalState-method** uses via the proven shim
-   template (symbols-intern, positions/addOrigin, error, realisePath,
-   forceAttrs/getBuiltins, store-ops, mem/rootFS/baseEnv/corepkgsFS) — each
-   a whole-operation shim returning plain-data / v3-bridgeable values.
-3. Relocate the **store/derivation primops** (readFile/readDir/pathExists/
-   path/import-corepkgs) as whole ops (the `storeRefsContextFor`/
-   `pathFetchToStore`/`addTextToStore` pattern, already proven).
-4. **derivationStrict LAST** — the store-path-HASH core; the strongest
-   drvPath-byte-equality oracle gates it.
-5. eval.hh + store-api + value/context + content-address + canon-path +
-   derivations + derived-path + memory-source-accessor all fall out once
-   their last use is relocated → baseline 0; flip the ratchet to the strict
-   end-state lint.
+**Completion blueprint — UNIFIED with `TW_VALUE_ERADICATION_GOAL_2026-06-02.md`
+(2026-06-02 correction).**  The two tracks are ONE effort on two axes:
+header-consolidation = compile-time coupling (which TUs see TW types);
+value-eradication = runtime coupling (whether `nix::Value` graphs cross).
+The #875 bridge subsystem is where both converge — and F0 (2026-06-02,
+`NIX_VM_STATS=1 NIX_V3_DUMP_BRIDGE_RETENTION=1`) measured **0 bridge entries
+on hello.drvPath**: post-native-flake + post-native-derivationStrict, the
+bridge's SOLE feeder is the fetcher `bridgeBuiltin<N>` path.
+
+**KEY CORRECTION to the prior draft:** do NOT *relocate* the bridge
+subsystem to `ffi_bridge.cc` — **DELETE it**, by converting its feeder.
+The bridge apparatus is dead code once no TW value enters; relocating dead
+code is waste.  The 112 `nix::Value` uses + value/context.hh + the
+`forceValue`/`forceAttrs`-on-TW eval.hh surface + the `fallbackExpr`/baseEnv
+#875 safety nets all *delete* (not move) when the feeder is gone.
+
+Sequence (mirrors the eradication doc's F0–F5; share the fetcher work):
+1. **F1 — `fetchTree` → `ffi::fetchTree` plain-data** (the keystone): the
+   `v3ToTreeWalker → callFunction(builtins.fetchTree) → treeWalkerToV3`
+   pattern (`primops.cc:11768 bridgeBuiltin<N>`) → extract plain args, call
+   `fetchers::Input::fetchToStore` directly, build the result attrset
+   V3-NATIVE (the `v3EmitTreeAttrs`/`ffi::lockFlakeAndRead` pattern, proven).
+2. **F2** — remaining fetchers (fetchurl/fetchGit/Mercurial/Tarball/Closure/
+   filterSource/fetchFinalTree), one at a time, drvPath-gated.
+3. **F3** — builtins.path filter: re-enter v3's VM per dir-entry instead of
+   `callFunction(builtins.path)`.
+4. **F4 — DELETE the apparatus** (BP1/2/3, Bridge-thunk OP_CALL paths,
+   `v3ToTreeWalker`/`treeWalkerToV3`, the three tables, the fallbackExpr
+   nets) ⇒ **value/context.hh + the nix::Value/forceValue-on-TW eval.hh
+   uses + memory-source-accessor drop from primops.cc**.
+5. **Then the irreducible leaves** (NOT bridge-fed): the derivation-build
+   leaf (store-api/content-address/derivations/derived-path — native
+   `writeDerivation`) + the parse/path leaf (canon-path/positions/
+   corepkgsFS/SourcePath) get the proven plain-data shim treatment
+   (`storeRefsContextFor`/`pathFetchToStore`/`addTextToStore`) or stand as
+   documented library/parse leaves (per eradication §6).  **derivationStrict
+   LAST** (store-path-HASH core; strongest drvPath oracle gates it).
+6. eval.hh falls out once its last use is relocated → baseline 0; flip the
+   ratchet to the strict end-state lint.  F5 retires the derivationStrict
+   TW fallback (already default-off).
+
+See `TW_VALUE_ERADICATION_GOAL_2026-06-02.md` §4–§5 for the per-fetcher
+shim shape + the cascade; this doc's Phase 4 IS that work.
 
 **Effort:** the bulk of the audit's own 8–10 week estimate, on the most
 correctness-critical code in the tree.  NOT to be rushed (measure-twice +
