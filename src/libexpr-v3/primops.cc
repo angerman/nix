@@ -51,11 +51,9 @@
 #include "v3/print.hh"  // #760: v3 printNixValue for toStringCoerceCtx error text
 #include "v3/value_serialize.hh"  // #741 Phase 1: derivation-result round-trip test
 #include "nix/expr/value/context.hh"
-// #698 Phase 3: v3-native primGetFlake — needs FlakeRef parsing,
-// lockFlake, Settings member access, and LockedFlake type.
-#include "nix/flake/flake.hh"
-#include "nix/flake/flakeref.hh"
-#include "nix/flake/settings.hh"
+// v3-native primGetFlake's flake-loading FFI leaf (parseFlakeRef / lockFlake
+// / LockFlags / flake::Settings) now lives behind ffi::lockFlakeAndRead, so
+// the flake headers are no longer needed here (audit Phase 4).
 #include "nix/util/canon-path.hh"
 // experimental-features.hh + hash.hh are re-exported by v3/ffi.hh (Layer-0
 // shared domain types) — no direct include needed (audit Phase 0/2).
@@ -11854,78 +11852,26 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
     //     parity between v3-native and the (pre-retirement) bridge
     //     across 15 nixpkgs + cardano-node queries.
     //
-    // Degraded-mode error reporting: callFlakeV3 requires the host
-    // TW EvalState (for parseFlakeRef + lockFlake + emitTreeAttrs FFI
-    // leaves) and flake::Settings (for lockFlake's options).  If
-    // either is missing we throw an informative error rather than
-    // silently falling back to a non-existent bridge.
-    const nix::flake::Settings * flakeSettings = getFlakeSettings();
-    if (!flakeSettings)
-        throw std::runtime_error(
-            "v3 builtins.getFlake: flake::Settings not wired — "
-            "this v3 host must call nix::v3::setFlakeSettings() at "
-            "startup (libcmd's common-eval-args.cc does this for the "
-            "`nix` CLI; v3-eval standalone needs it too)");
+    // callFlakeV3 requires the host TW EvalState (the lockFlake +
+    // emitTreeAttrs FFI leaves reach back into it).  If it's missing we
+    // throw an informative error rather than silently misbehaving.
     if (!s.nixEvalState)
         throw std::runtime_error(
             "v3 builtins.getFlake: no host TW EvalState available — "
-            "callFlakeV3 needs it for parseFlakeRef/lockFlake/"
-            "emitTreeAttrs FFI leaves");
+            "callFlakeV3 needs it for the lockFlake/emitTreeAttrs FFI leaves");
     auto & ns = *s.nixEvalState;
 
-    // (1) FFI leaves: parseFlakeRef + lockFlake.  Pure C functions
-    //     (no Nix eval); per V3-NATIVE rule these stay in TW.
     if (!a[0].isString()) typeError("getFlake", "string");
     std::string flakeRefS = a[0].payload.str;
-    auto flakeRef = nix::parseFlakeRef(ns.fetchSettings, flakeRefS, {}, true);
-    if (ffi::pureEval(ns) && !flakeRef.input.isLocked(ns.fetchSettings))
-        throw nix::Error(
-            "cannot call 'getFlake' on unlocked flake reference '%s' (use --impure to override)",
-            flakeRefS);
-    // #755 instrumentation: RSS checkpoint around lockFlake to
-    // localize the over-allocation that #754 bisection traced to
-    // v3-native callFlake on haskell.nix flakes.  When
-    // V3_DBG_GETFLAKE_RSS=1, prints RSS in MB before/after the
-    // lockFlake call.  Cheap (one task_info / getrusage per call).
-    static const bool s_dbgGetFlakeRss =
-        std::getenv("V3_DBG_GETFLAKE_RSS") != nullptr;
-    auto dbgRssMB = [&]() -> uint64_t {
-#if defined(__APPLE__)
-        mach_task_basic_info_data_t info;
-        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                      (task_info_t)&info, &count) == KERN_SUCCESS)
-            return info.resident_size / (1024 * 1024);
-#else
-        struct rusage ru;
-        if (getrusage(RUSAGE_SELF, &ru) == 0)
-            return (uint64_t)ru.ru_maxrss / 1024;
-#endif
-        return 0;
-    };
-    if (s_dbgGetFlakeRss)
-        std::fprintf(stderr,
-            "v3 getFlake: RSS=%llu MB before lockFlake('%s')\n",
-            (unsigned long long)dbgRssMB(), flakeRefS.c_str());
-    auto lockedFlake = nix::flake::lockFlake(
-        *flakeSettings, ns, flakeRef,
-        nix::flake::LockFlags{
-            .updateLockFile = false,
-            .writeLockFile = false,
-            .useRegistries = !ffi::pureEval(ns) && flakeSettings->useRegistries,
-            .allowUnlocked = !ffi::pureEval(ns),
-        });
-    if (s_dbgGetFlakeRss)
-        std::fprintf(stderr,
-            "v3 getFlake: RSS=%llu MB after lockFlake (nodes=%zu)\n",
-            (unsigned long long)dbgRssMB(),
-            lockedFlake.nodePaths.size());
 
-    // (2) v3-native call-flake.nix evaluation.  Read the locked flake into
-    //     plain data here (the FFI leaf — this TU holds the libflake types),
-    //     then callFlakeV3 builds the args V3-NATIVE + applies the cached
-    //     closure × 3, returning a v3 Value.
-    auto flakeInfo = ffi::readLockedFlake(ns, &lockedFlake);
+    // (1) FFI leaf: parseFlakeRef + the unlocked-in-pure-eval guard +
+    //     lockFlake + read the locked flake into plain data — all behind
+    //     ffi::lockFlakeAndRead (audit Phase 4: keeps FlakeRef / LockFlags /
+    //     lockFlake / flake::Settings out of this TU).
+    auto flakeInfo = ffi::lockFlakeAndRead(ns, flakeRefS, ffi::pureEval(ns));
+
+    // (2) v3-native call-flake.nix evaluation: callFlakeV3 builds the args
+    //     V3-NATIVE from the plain data + applies the cached closure × 3.
     o = callFlakeV3(s, flakeInfo);
 }
 

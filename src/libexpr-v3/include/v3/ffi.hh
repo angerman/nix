@@ -230,6 +230,15 @@ struct LockedFlakeInfo
 /// forceDirty per node).  THE flake-loading FFI leaf.
 LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlakePtr);
 
+/// builtins.getFlake's full flake-loading FFI leaf in one call: parseFlakeRef
+/// + the unlocked-in-pure-eval guard + lockFlake (no lockfile write/update,
+/// registries gated on !pureEval) + readLockedFlake.  Uses the process flake
+/// Settings wired via setFlakeSettings (throws if unset).  Keeps FlakeRef /
+/// LockFlags / lockFlake / flake::Settings entirely inside ffi.cc.
+LockedFlakeInfo lockFlakeAndRead(nix::EvalState & state,
+                                 const std::string & flakeRefStr,
+                                 bool pureEval);
+
 /// `nix::getHome().string()` — the synthetic homePath for parsing the
 /// in-memory call-flake.nix source.  Cold (once, lazily).
 std::string homeDir();

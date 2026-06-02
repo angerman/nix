@@ -44,7 +44,9 @@
 #include "nix/store/globals.hh"            // nix::settings.readOnlyMode
 #include "nix/fetchers/fetchers.hh"        // fetchers::Input getters (readLockedFlake)
 #include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
-#include "nix/flake/flake.hh"              // flake::LockedFlake
+#include "nix/flake/flake.hh"              // flake::LockedFlake / lockFlake / LockFlags
+#include "nix/flake/flakeref.hh"           // parseFlakeRef (lockFlakeAndRead)
+#include "nix/flake/settings.hh"           // flake::Settings::useRegistries
 #include "nix/flake/lockfile.hh"           // flake::LockedNode
 
 #include <atomic>
@@ -236,6 +238,34 @@ LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlake
         out.nodes.push_back(std::move(n));
     }
     return out;
+}
+
+LockedFlakeInfo lockFlakeAndRead(nix::EvalState & state,
+                                 const std::string & flakeRefStr,
+                                 bool pureEval)
+{
+    const nix::flake::Settings * flakeSettings = nix::v3::getFlakeSettings();
+    if (!flakeSettings)
+        throw std::runtime_error(
+            "v3 builtins.getFlake: flake::Settings not wired — the v3 host "
+            "must call nix::v3::setFlakeSettings() at startup (libcmd's "
+            "common-eval-args.cc does this for the `nix` CLI; v3-eval too)");
+
+    auto flakeRef = nix::parseFlakeRef(state.fetchSettings, flakeRefStr, {}, true);
+    if (pureEval && !flakeRef.input.isLocked(state.fetchSettings))
+        throw nix::Error(
+            "cannot call 'getFlake' on unlocked flake reference '%s' (use --impure to override)",
+            flakeRefStr);
+
+    auto lockedFlake = nix::flake::lockFlake(
+        *flakeSettings, state, flakeRef,
+        nix::flake::LockFlags{
+            .updateLockFile = false,
+            .writeLockFile  = false,
+            .useRegistries  = !pureEval && flakeSettings->useRegistries,
+            .allowUnlocked  = !pureEval,
+        });
+    return readLockedFlake(state, &lockedFlake);
 }
 
 }  // namespace ffi
