@@ -105,22 +105,7 @@ namespace nix::v3 {
 // short-circuit a fresh-parse.  Neither is reachable from v3-direct.
 // primImport's call sites below are no-ops.
 
-/// WC-19: TLS pointer to the outer Expr the v3 hook is currently
-/// processing.  Now unused (hook removed) but kept as an extern
-/// definition because primops.cc references it.
-thread_local nix::Expr * tlBridgeFallbackExpr = nullptr;
-
-// (v3ToTreeWalkerPublic forward-decl retired — TW_VALUE_ERADICATION F4.)
-
-ScopedBridgeFallbackExpr::ScopedBridgeFallbackExpr(nix::Expr * e)
-    : saved(tlBridgeFallbackExpr)
-{
-    tlBridgeFallbackExpr = e;
-}
-ScopedBridgeFallbackExpr::~ScopedBridgeFallbackExpr()
-{
-    tlBridgeFallbackExpr = saved;
-}
+// (ScopedBridgeFallbackExpr + tlBridgeFallbackExpr retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
 namespace {
 
@@ -146,43 +131,7 @@ inline VMState *& tlActiveV3VMRef()
     return p;
 }
 
-/// #466 nested-bridge-primop depth bound.
-///
-/// Tracks how deeply we've nested calls into the v3 bridge primops
-/// (primV3CallBridge1 / primV3ForceAttr / primV3ForceListElem) on
-/// this thread.  Each level allocates a fresh VMState; in lambda-skip
-/// + rec-attrset-fix-point patterns the chain re-enters each primop
-/// across different (handle, sid) pairs, defeating the per-primop
-/// (handle, sid) cycle detector and the per-thunk (vm, t) recovery
-/// counter (each layer has a fresh vm).  C-stack growth is real and
-/// SIGSEGV is the eventual outcome.
-///
-/// Bound the depth at a hard limit so a structural cycle surfaces as
-/// a proper error after `kBridgePrimopMaxDepth` iterations rather
-/// than running until C-stack overflows.  When a primop hits the
-/// limit, throw a NON-Blackhole error so the catch path's
-/// fallbackToTreeWalker (which gates on dynamic_cast<BlackholeError>)
-/// does NOT trigger — the fallback would just re-enter the same
-/// chain.  Default 64; tunable via NIX_V3_BRIDGE_PRIMOP_DEPTH.
-inline int & bridgePrimopDepth()
-{
-    thread_local int d = 0;
-    return d;
-}
-inline int bridgePrimopMaxDepth()
-{
-    static const int k = []{
-        if (const char * v = std::getenv("NIX_V3_BRIDGE_PRIMOP_DEPTH"))
-            return std::max(0, std::atoi(v));
-        return 64;
-    }();
-    return k;
-}
-struct BridgePrimopDepthGuard {
-    int & d;
-    BridgePrimopDepthGuard(int & d_) : d(d_) { ++d; }
-    ~BridgePrimopDepthGuard() { --d; }
-};
+// (bridge-primop depth-guard machinery retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
 // ---------------------------------------------------------------------------
 // #466 / #479 Phase 1: cross-primop force-chain cycle detector.
@@ -733,12 +682,7 @@ void primIsList    (EvalState &, Value * args, Value & out) { out = args[0].isLi
 /// bridged TW Function/Attrset/List/etc. answers correctly without
 /// forcing (which would re-wrap as another Bridge per the #456
 /// chase break).  No state changes; pure peek.
-inline std::optional<nix::ValueType> peekBridgeTwType(const Value &)
-{
-    // (Bridge thunks retired — TW_VALUE_ERADICATION F4, 2026-06-02; there is
-    //  no TW value to peek, so the primIs* callers use the v3-native check.)
-    return std::nullopt;
-}
+// (peekBridgeTwType retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
 void primIsFunction(EvalState &, Value * args, Value & out)
 {
@@ -750,14 +694,6 @@ void primIsFunction(EvalState &, Value * args, Value & out)
     // "v3 primop import: expected string or path".
     static const bool s_dbg =
         std::getenv("V3_DBG_IS_FUNCTION") != nullptr;
-    if (auto tt = peekBridgeTwType(args[0])) {
-        if (s_dbg) std::fprintf(stderr,
-            "v3 primIsFunction: Bridge tag=%d twType=%d → %s\n",
-            (int)args[0].tag(), (int)*tt,
-            (*tt == nix::nFunction) ? "true" : "false");
-        out = (*tt == nix::nFunction) ? Value::vTrue : Value::vFalse;
-        return;
-    }
     bool isfn = (args[0].isClosure() || args[0].isPrimOp() || args[0].tag() == Tag::PrimOpApp);
     if (s_dbg) std::fprintf(stderr,
         "v3 primIsFunction: tag=%d → %s\n",
