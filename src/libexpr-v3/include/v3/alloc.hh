@@ -20,7 +20,6 @@
 #include "v3/value.hh"
 #include "v3/closure.hh"
 #include "v3/nursery.hh"
-#include "v3/bridge_root_registry.hh"  // Arena dereg side-table
 
 #include <algorithm>
 #include <atomic>

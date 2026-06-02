@@ -128,7 +128,6 @@ lib_sources = files(
   # cached-bool load per primDerivationStrict call.
   'value_serialize.cc',
   'fiber.cc',
-  'bridge_yield.cc',
   'gc.cc',
   # Phase D write-barriers (Stage 3 prereq): NURSERY_PHASE_D_DECISION_2026-05-21.md
   'barrier.cc',
@@ -148,7 +147,6 @@ lib_sources = files(
   # See lode/ARENA_DEREGISTRATION_DESIGN_2026-05-27.md.  Tracks
   # `nix::Value *` from Thunk::bridgeSrc so Boehm sees them as roots
   # independently of arena registration.
-  'bridge_root_registry.cc',
   # Stage 6 production GC — flat mark-sweep over the v3 tenured arena.
   # Replaces the Cheney MajorScavenger (move_gc.cc) which was falsified
   # at commit eda44711a + 9bf527714.  See:

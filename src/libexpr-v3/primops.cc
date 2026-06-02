@@ -32,7 +32,6 @@
 #include "lower_v3.hh"       // canLowerV3 + lowerV3Ast (native AST→IR)
 #include "v3/tw_baseenv.hh"  // twBaseEnvGlobals (free-name resolution)
 #include "v3/vm.hh"
-#include "v3/bridge_yield.hh"
 #include "v3/ffi.hh"  // FFI plan migration step 1: surface declarations.
 #include "v3/errors.hh"
 #include "v3/disasm.hh"  // #815 RCA: cached-vs-fresh disassembly
