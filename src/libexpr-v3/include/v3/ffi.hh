@@ -315,6 +315,17 @@ FetchMercurialResult fetchMercurial(nix::EvalState & state, const std::string & 
                                     const std::optional<std::string> & revOrRef,
                                     const std::string & name);
 
+/// THE filtered-path-copy FFI leaf (builtins.filterSource — F3: VM re-entry).
+/// Mirrors TW addPath's no-refs path (primops.cc:2961): builds a libstore
+/// PathFilter that, per entry, lstats it for the file-type string and calls
+/// back into v3 via `v3filter(absPath, type) -> keep?`, then
+/// `fetchToStore(resolveSymlinks, Copy, baseName, NixArchive, filter)` +
+/// allowPath.  `name` defaults to the source path's baseName.  Returns the
+/// printed store path + Opaque context.  No `nix::Value` crosses (the filter
+/// is a plain C++ callback the v3 caller wires to callClosure).
+FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPath,
+    const std::function<bool(const std::string & absPath, const std::string & type)> & v3filter);
+
 /// Read a `nix::flake::LockedFlake` (passed opaquely as `const void *`;
 /// ffi.cc casts it back) into plain data: the lockfile text + per-node
 /// store-path / fetcher-input fields.  Performs `lockFile.to_string`, the

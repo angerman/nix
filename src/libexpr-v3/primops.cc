@@ -12025,7 +12025,46 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
     o.payload.bindings = bb;
 }
 void primFetchClosure(EvalState & s, Value * a, Value & o) { bridgeBuiltin<1>("fetchClosure", s, a, o); }
-void primFilterSource(EvalState & s, Value * a, Value & o) { bridgeBuiltin<2>("filterSource", s, a, o); }
+// F3 (eradication): native filterSource — copy the path to the store with a
+// PathFilter that RE-ENTERS v3's VM (callClosure) per directory entry.  No
+// bridge: the filter stays a v3 closure; ffi::addPathFiltered drives the
+// libstore copy + calls back via the v3filter lambda below.
+void primFilterSource(EvalState & s, Value * a, Value & o) {
+    if (!s.nixEvalState)
+        throw std::runtime_error("v3 filterSource: no tree-walker state available");
+    auto & ns = *s.nixEvalState;
+
+    // args[0] = filter function, args[1] = path (coerceToPath).
+    Value pathV = forceValue(*s.vm, a[1]);
+    std::string pathStr;
+    if (pathV.tag() == Tag::Path)
+        pathStr = pathV.payload.path ? pathV.payload.path : "";
+    else if (pathV.tag() == Tag::String)
+        pathStr = pathV.payload.str ? pathV.payload.str : "";
+    else
+        throw std::runtime_error(
+            "while evaluating the second argument (the path to filter) passed to "
+            "'builtins.filterSource': expected a path");
+    Value filterFn = forceValue(*s.vm, a[0]);  // forceFunction (callable checked at callClosure)
+
+    // Per-entry filter: callClosure(filterFn, absPath)(type) -> Bool.  Runs
+    // inside fetchToStore (nested v3 eval on the same VMState — STG-10).
+    auto v3filter = [&](const std::string & p, const std::string & type) -> bool {
+        Value r1 = callClosure(*s.vm, filterFn, mkStringValueOwned(p));
+        Value r2 = callClosure(*s.vm, r1, mkStringValueOwned(type));
+        r2 = forceValue(*s.vm, r2);
+        if (r2.tag() != Tag::Bool)
+            throw std::runtime_error(
+                "while evaluating the return value of the path filter function: "
+                "expected a Boolean");
+        return r2.payload.i == 1;
+    };
+
+    ffi::FetchUrlResult r = ffi::addPathFiltered(ns, pathStr, v3filter);
+    o = mkStringValueOwned(r.printedStorePath);
+    std::vector<std::string> ctx{ r.opaqueContextElem };
+    setStringContextEntries(o.payload.str, std::move(ctx));
+}
 // Path B M3: getFlake is registered into TW via evalSettings.extraPrimOps
 // (libflake/settings.cc:14).  bridgeBuiltin resolves it by name from
 // TW's builtins attrset at call time — so the lazy registration order

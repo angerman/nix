@@ -315,6 +315,45 @@ FetchMercurialResult fetchMercurial(nix::EvalState & state, const std::string & 
     return r;
 }
 
+FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPath,
+    const std::function<bool(const std::string &, const std::string &)> & v3filter)
+{
+    nix::SourcePath sp(state.rootFS, nix::CanonPath(srcPath));
+
+    auto fileType = [](nix::SourceAccessor::Type t) -> const char * {
+        using T = nix::SourceAccessor::Type;
+        switch (t) {
+            case T::tRegular:   return "regular";
+            case T::tDirectory: return "directory";
+            case T::tSymlink:   return "symlink";
+            case T::tChar:      return "unknown";
+            case T::tBlock:     return "unknown";
+            case T::tSocket:    return "unknown";
+            case T::tFifo:      return "unknown";
+            case T::tUnknown:   return "unknown";
+        }
+        return "unknown";
+    };
+
+    // PathFilter: per entry, lstat for the type string (matches TW's
+    // callPathFilter), then call back into v3.  Runs inside fetchToStore.
+    nix::PathFilter filter = [&](const std::string & p) -> bool {
+        auto st = nix::SourcePath(sp.accessor, nix::CanonPath(p)).lstat();
+        return v3filter(p, fileType(st.type));
+    };
+
+    auto storePath = nix::fetchToStore(
+        state.fetchSettings, *state.store, sp.resolveSymlinks(),
+        nix::settings.readOnlyMode ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
+        std::string(sp.baseName()),
+        nix::ContentAddressMethod::Raw::NixArchive,
+        &filter, state.repair);
+    state.allowPath(storePath);
+
+    return {state.store->printStorePath(storePath),
+            nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = storePath}}.to_string()};
+}
+
 FetchUrlResult fetchUrl(nix::EvalState & state, const std::string & urlArg,
                         const std::optional<std::string> & sha256,
                         std::string name, bool unpack, const std::string & who)

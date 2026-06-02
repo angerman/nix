@@ -111,6 +111,15 @@ if command -v hg >/dev/null 2>&1; then
   rm -rf "$M"
 fi
 
+# --- builtins.filterSource (F3: filter closure re-enters v3's VM per entry) ---
+S=$(cd "$(mktemp -d)" && pwd -P)
+printf 'a\n' > "$S/keep.txt"; printf 'b\n' > "$S/drop.log"; mkdir "$S/sub"; printf 'c\n' > "$S/sub/x"
+check "filterSource-filtered" \
+  "builtins.filterSource (path: type: (type == \"directory\") || (builtins.match \".*\\\\.txt\" (baseNameOf path) != null)) $S"
+check "filterSource-keep-all" \
+  "builtins.filterSource (path: type: true) $S"
+rm -rf "$S"
+
 echo "fetcher-parity: $pass passed, $fail failed"
 if (( fail > 0 )); then
   printf '  FAIL: %s\n' "${failed[@]}" >&2
