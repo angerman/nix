@@ -3878,303 +3878,10 @@ void primDerivation(EvalState & state, Value * args, Value & out);
 /// transitive retention to Boehm GC).  Dispatch routes through the
 /// existing BlackholeError fallback path which re-runs `fallbackExpr`
 /// via tree-walker.  Eviction is opt-in via `NIX_V3_WEAK_BRIDGES=1`.
-struct BridgeClosureEntry {
-    Value v3Value;
-    nix::Expr * fallbackExpr = nullptr;
-    uint64_t lastAccessGen = 0;   // monotonic; 0 = never dispatched
-    uint32_t accessCount = 0;     // saturating
-    bool evicted = false;         // Stage 1: v3Value cleared, must re-eval
-    // #875 Stage 2 (2026-05-29): serialized v3 Value blob captured at
-    // eviction time.  Reusing `value_serialize` (the cache infrastructure
-    // already in production for #885 eval-result cache).  Deserialized
-    // on dispatch to revive the entry.  Empty when evicted=false.
-    std::string serializedBlob;
-};
-// CRIT-2 (table side): the static bridge tables hold v3 Values whose
-// payloads (Closure*, Bindings*, Thunk*, ListVec*) live in the v3
-// arena.  std::allocator's malloc'd vector storage is invisible to
-// Boehm; traceable_allocator routes the storage into a Boehm-scanned
-// region so the inner payloads stay reachable across collections.
-// The vectors themselves still grow unboundedly across a process
-// lifetime -- that's MED-14 bounding work, separate from the GC
-// reachability fix here.
-static std::vector<BridgeClosureEntry,
-    traceable_allocator<BridgeClosureEntry>> & v3BridgeClosures()
-{
-    static std::vector<BridgeClosureEntry,
-        traceable_allocator<BridgeClosureEntry>> tbl;
-    return tbl;
-}
+// (#875 bridge tables [v3BridgeClosures/Attrs/Lists] + entry structs +
+//  eviction/revive/sweep + access counters + gates retired —
+//  TW_VALUE_ERADICATION F4, 2026-06-02; tables never populated post-F4.)
 
-/// WC-14.5 lazy attr bridge: stores v3 Tag::Attrs Values keyed by
-/// integer handle.  When tree-walker forces a particular attr's
-/// value (which we bridged as a deferred App primop call), the
-/// __v3_force_attr primop looks up the original v3 attrset and
-/// bridges the single requested attr's value.  Avoids the eager-
-/// recursion cycle that nixpkgs's lib.makeExtensible self-references
-/// trigger on the full attrset structural traversal.
-///
-/// WC-19: also stores a fallback `nix::Expr *`.  When v3's blackhole
-/// detector trips during the deferred force (an eval-order cycle
-/// v3 sees but tree-walker would resolve), primV3ForceAttr re-runs
-/// the recorded outer Expr through tree-walker and looks up the
-/// requested attr in the result.  TLS-set by the v3 hook just
-/// before invoking v3ToTreeWalkerPublic.
-struct BridgeAttrEntry {
-    Value v3Value;
-    nix::Expr * fallbackExpr = nullptr;
-    // #875 Stage 0 / Stage 1 / Stage 2 — see BridgeClosureEntry above.
-    uint64_t lastAccessGen = 0;
-    uint32_t accessCount = 0;
-    bool evicted = false;
-    std::string serializedBlob;
-};
-struct BridgeListEntry {
-    Value v3Value;
-    nix::Expr * fallbackExpr = nullptr;
-    // #875 Stage 0 / Stage 1 / Stage 2 — see BridgeClosureEntry above.
-    uint64_t lastAccessGen = 0;
-    uint32_t accessCount = 0;
-    bool evicted = false;
-    std::string serializedBlob;
-};
-
-// #875 Stage 0 (2026-05-29): monotonic counter bumped at every bridge
-// dispatch.  Atomic for safety even though v3 is single-threaded today —
-// the relaxed fetch_add is essentially free and prevents UB if a future
-// concurrency-experiment hits this path.  The per-entry lastAccessGen
-// captures the gen at the dispatch moment; sorting entries by
-// lastAccessGen gives the LRU order needed by Stage 1's eviction policy.
-static std::atomic<uint64_t> g_bridgeAccessGen{0};
-
-// #875 Stage 1 (2026-05-29): eviction counters for the weak-bridge
-// design.  All atomic-relaxed; v3 is single-threaded today but the
-// instrumentation must stay race-free.
-static std::atomic<uint64_t> g_bridgeEvictions{0};       // entries cleared
-static std::atomic<uint64_t> g_bridgeReEvalsAfterEviction{0};  // dispatch after eviction (revived)
-static std::atomic<uint64_t> g_bridgeEvictionSweeps{0};  // sweep invocations
-// #875 Stage 2 counters:
-static std::atomic<uint64_t> g_bridgeEvictionSerializeFail{0};  // serialize threw, entry NOT evicted
-static std::atomic<uint64_t> g_bridgeRevivalDeserializeFail{0}; // deserialize threw on revive
-static std::atomic<uint64_t> g_bridgeBytesSerialized{0};        // total blob bytes (peak indicator)
-
-// Forward decls — the table accessors are defined later in the file
-// (BridgeAttrEntry / BridgeListEntry structs interleave their tables
-// before vs after this section, so the symbols aren't visible yet).
-static std::vector<BridgeAttrEntry,
-    traceable_allocator<BridgeAttrEntry>> & v3BridgeAttrs();
-static std::vector<BridgeListEntry,
-    traceable_allocator<BridgeListEntry>> & v3BridgeLists();
-
-// Stage 1 gates: cached at first access.
-static bool weakBridgesEnabled() noexcept
-{
-    static const bool v = std::getenv("NIX_V3_WEAK_BRIDGES") != nullptr;
-    return v;
-}
-// #875 Stage 2b (2026-05-29): pre-evict at bridge CREATION so the
-// transitive payload is unreferenced from the bridge from the very
-// first instant.  Without pre-eviction, sweep-eviction can only fire
-// after the heavy bridges have been built — by which point the arena
-// has already grown to peak.  Pre-eviction caps the arena's
-// high-water mark to the largest single bridge's transient cost
-// rather than the SUM of all heavy bridges.  Implies weakBridges.
-static bool preEvictBridgesEnabled() noexcept
-{
-    static const bool v = []() {
-        if (!weakBridgesEnabled()) return false;
-        const char * e = std::getenv("NIX_V3_WEAK_BRIDGES_PRE_EVICT");
-        return e != nullptr && *e && *e != '0';
-    }();
-    return v;
-}
-// Pre-eviction counters.
-static std::atomic<uint64_t> g_bridgePreEvictions{0};        // entries serialized at creation
-static std::atomic<uint64_t> g_bridgePreEvictSerFail{0};     // serialize failed (Closure etc.)
-// For stress testing: set NIX_V3_WEAK_BRIDGE_SWEEP=1 + NIX_V3_WEAK_BRIDGE_AGE=0.
-// Combined effect: every dispatch triggers a sweep that evicts every entry
-// whose lastAccessGen is older than currentGen — i.e. every other entry.
-// The just-bumped entry survives because its lastAccessGen == currentGen.
-static uint64_t weakBridgeSweepInterval() noexcept
-{
-    static const uint64_t v = []() -> uint64_t {
-        if (const char * s = std::getenv("NIX_V3_WEAK_BRIDGE_SWEEP")) {
-            long n = std::strtol(s, nullptr, 10);
-            if (n > 0) return static_cast<uint64_t>(n);
-        }
-        return 1000;  // sweep every 1000 dispatches by default
-    }();
-    return v;
-}
-static uint64_t weakBridgeAge() noexcept
-{
-    static const uint64_t v = []() -> uint64_t {
-        if (const char * s = std::getenv("NIX_V3_WEAK_BRIDGE_AGE")) {
-            long n = std::strtol(s, nullptr, 10);
-            if (n >= 0) return static_cast<uint64_t>(n);
-        }
-        return 100;  // evict if (gen - lastAccessGen) > 100
-    }();
-    return v;
-}
-
-// Evict a single entry.  #875 Stage 2 (2026-05-29): serialize the
-// v3Value into the entry's blob first; if serialize throws
-// (Closure/Thunk/other unsupported tag), skip eviction — we have no
-// other safe recovery path for that entry today.  On success: clear
-// v3Value, mark evicted.  Subsequent dispatch deserializes the blob.
-//
-// Note: fallbackExpr-based recovery (Stage 1 design) stays as a
-// secondary path if deserialize ever fails at dispatch time — but
-// since serialize/deserialize round-trip is verified by the same
-// machinery used in #885 PRODUCTION cache, that secondary path
-// should never fire on normal workloads.
-template <typename Entry>
-static inline void evictBridgeEntry(Entry & e) noexcept
-{
-    if (e.evicted) return;          // already evicted
-    if (e.v3Value.tag() == Tag::Uninitialized) return;  // already cleared
-    // Stage 2 — serialize before clearing.
-    try {
-        e.serializedBlob.clear();
-        value_serialize::serialize(e.v3Value, e.serializedBlob);
-    } catch (...) {
-        // Tag::Closure / Tag::Thunk / etc. — can't serialize.  Leave
-        // the entry intact; Stage 2 cannot evict it.
-        e.serializedBlob.clear();
-        g_bridgeEvictionSerializeFail.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    g_bridgeBytesSerialized.fetch_add(e.serializedBlob.size(),
-                                       std::memory_order_relaxed);
-    e.v3Value = Value{};            // Tag::Uninitialized; releases payload
-    e.evicted = true;
-    g_bridgeEvictions.fetch_add(1, std::memory_order_relaxed);
-}
-
-// #875 Stage 2b (2026-05-29): construct a bridge entry, optionally
-// in pre-evicted state.  Always returns by value (vector push_back
-// moves it in).  When pre-eviction is enabled AND serialize succeeds,
-// the returned entry has `evicted=true`, `v3Value=Value{}`, blob
-// populated — the bridge holds NO reference to the transitive payload.
-// When serialize fails or pre-eviction is off, returns a live entry.
-template <typename Entry>
-static inline Entry makeBridgeEntry(Value v, nix::Expr * fb) noexcept
-{
-    Entry e;
-    e.fallbackExpr = fb;
-    if (__builtin_expect(preEvictBridgesEnabled(), 0)) {
-        try {
-            value_serialize::serialize(v, e.serializedBlob);
-            // Success: pre-evict — drop the live v3Value reference.
-            e.v3Value = Value{};
-            e.evicted = true;
-            g_bridgePreEvictions.fetch_add(1, std::memory_order_relaxed);
-            g_bridgeBytesSerialized.fetch_add(e.serializedBlob.size(),
-                                               std::memory_order_relaxed);
-            return e;
-        } catch (...) {
-            // Serialize failed (Closure/Thunk/etc.); fall through to
-            // live entry — pre-eviction is best-effort.
-            e.serializedBlob.clear();
-            g_bridgePreEvictSerFail.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    e.v3Value = v;
-    e.evicted = false;
-    return e;
-}
-
-// #875 Stage 2: revive an evicted entry by deserializing its blob.
-// Returns true on success (entry.v3Value populated, blob cleared,
-// evicted flag reset).  Returns false on deserialize failure — caller
-// should fall back to fallbackExpr re-eval (Stage 1) or error.
-template <typename Entry>
-static inline bool reviveBridgeEntry(Entry & e) noexcept
-{
-    if (!e.evicted) return true;    // already live
-    if (e.serializedBlob.empty()) return false;
-    try {
-        Value revived = value_serialize::deserialize(e.serializedBlob);
-        e.v3Value = revived;
-        e.serializedBlob.clear();   // reclaim blob memory immediately
-        e.serializedBlob.shrink_to_fit();
-        e.evicted = false;
-        g_bridgeReEvalsAfterEviction.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    } catch (...) {
-        g_bridgeRevivalDeserializeFail.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-}
-
-// Sweep the three bridge tables once.  Evict any entry whose
-// (currentGen - lastAccessGen) exceeds the age threshold and that
-// hasn't yet been evicted.  Entries with lastAccessGen == 0
-// (never dispatched) are evicted unconditionally (the age threshold
-// is satisfied trivially since currentGen > 0).
-static void sweepBridgeEvictions(uint64_t currentGen) noexcept
-{
-    const uint64_t age = weakBridgeAge();
-    auto sweepOne = [&](auto & tbl) {
-        for (auto & e : tbl) {
-            if (e.evicted) continue;
-            // Never-accessed: lastAccessGen == 0; treat as ancient.
-            // Stale: currentGen - lastAccessGen > age.
-            if (e.lastAccessGen == 0 || currentGen - e.lastAccessGen > age)
-                evictBridgeEntry(e);
-        }
-    };
-    sweepOne(v3BridgeClosures());
-    sweepOne(v3BridgeAttrs());
-    sweepOne(v3BridgeLists());
-    g_bridgeEvictionSweeps.fetch_add(1, std::memory_order_relaxed);
-}
-
-// Conditional sweep check called from bumpBridgeAccess hot path.
-// Cheap branch (one static-cached bool + one uint64 subtraction) when
-// weak bridges are disabled.
-static thread_local uint64_t tlsLastSweepGen = 0;
-static inline void maybeSweepBridges(uint64_t currentGen) noexcept
-{
-    if (currentGen - tlsLastSweepGen < weakBridgeSweepInterval()) return;
-    tlsLastSweepGen = currentGen;
-    sweepBridgeEvictions(currentGen);
-}
-
-template <typename Entry>
-static inline void bumpBridgeAccess(Entry & e) noexcept
-{
-    uint64_t gen =
-        g_bridgeAccessGen.fetch_add(1, std::memory_order_relaxed) + 1;
-    e.lastAccessGen = gen;
-    if (e.accessCount < UINT32_MAX) ++e.accessCount;
-    // #875 Stage 1: maybe-sweep is the only side-effect when weak
-    // bridges are enabled.  Sweep evicts entries whose lastAccessGen
-    // is OLDER than (currentGen - age).  The current entry's
-    // lastAccessGen equals currentGen so it's protected.
-    if (__builtin_expect(weakBridgesEnabled(), 0)) {
-        maybeSweepBridges(gen);
-    }
-}
-// CRIT-2 (table side): traceable storage so Boehm sees the inner
-// v3-Value payloads.
-static std::vector<BridgeAttrEntry,
-    traceable_allocator<BridgeAttrEntry>> & v3BridgeAttrs()
-{
-    static std::vector<BridgeAttrEntry,
-        traceable_allocator<BridgeAttrEntry>> tbl;
-    return tbl;
-}
-
-/// Same idea for lists — each element bridged lazily on force.
-static std::vector<BridgeListEntry,
-    traceable_allocator<BridgeListEntry>> & v3BridgeLists()
-{
-    static std::vector<BridgeListEntry,
-        traceable_allocator<BridgeListEntry>> tbl;
-    return tbl;
-}
 
 // #705 walkV3BridgeRoots lives below the anonymous-namespace close
 // so the linker can see it.  See the function-body comment there.
@@ -4271,9 +3978,7 @@ std::atomic<uint64_t> g_bridgeForceAttrCalls{0};
 // `static` (internal linkage) lookup is fine within the same TU.
 void walkV3BridgeRoots(const std::function<void(Value &)> & visit)
 {
-    for (auto & e : v3BridgeClosures()) visit(e.v3Value);
-    for (auto & e : v3BridgeAttrs())    visit(e.v3Value);
-    for (auto & e : v3BridgeLists())    visit(e.v3Value);
+    (void)visit;  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02) — no roots to walk
 }
 
 // 2026-05-29 evening (DIAG analysis spike): clear bridge tables.
@@ -4284,9 +3989,7 @@ void walkV3BridgeRoots(const std::function<void(Value &)> & visit)
 // NIX_V3_END_OF_EVAL_CLEAR_BRIDGES=1.
 void clearV3BridgesForDiag() noexcept
 {
-    v3BridgeClosures().clear();
-    v3BridgeAttrs().clear();
-    v3BridgeLists().clear();
+    // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02) — nothing to clear
 }
 
 // 2026-05-29 evening (DIAG analysis): expose bridge-table sizes
@@ -4295,11 +3998,7 @@ void clearV3BridgesForDiag() noexcept
 // lists) entry counts.  Each entry is 24 B (Value + Expr*).
 std::array<size_t, 3> v3BridgeTableSizes() noexcept
 {
-    return {
-        v3BridgeClosures().size(),
-        v3BridgeAttrs().size(),
-        v3BridgeLists().size(),
-    };
+    return {0, 0, 0};  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02)
 }
 
 // 2026-05-29 evening (DIAG bridge attribution): unique v3-pointer
@@ -4311,19 +4010,7 @@ std::array<size_t, 3> v3BridgeTableSizes() noexcept
 // reference.
 std::array<size_t, 3> v3BridgeUniquePtrCounts() noexcept
 {
-    auto uniqueOf = [](const auto & tbl) -> size_t {
-        std::unordered_set<const void *> seen;
-        for (const auto & e : tbl) {
-            const Value & v = e.v3Value;
-            seen.insert(v.payload.raw);
-        }
-        return seen.size();
-    };
-    return {
-        uniqueOf(v3BridgeClosures()),
-        uniqueOf(v3BridgeAttrs()),
-        uniqueOf(v3BridgeLists()),
-    };
+    return {0, 0, 0};  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02)
 }
 
 // 2026-05-29 evening (DIAG bridge analysis): per-bridge-entry
@@ -4334,12 +4021,7 @@ std::array<size_t, 3> v3BridgeUniquePtrCounts() noexcept
 void forEachV3BridgeEntry(
     const std::function<void(const Value &, const char *, size_t)> & cb) noexcept
 {
-    for (size_t i = 0; i < v3BridgeClosures().size(); ++i)
-        cb(v3BridgeClosures()[i].v3Value, "closure", i);
-    for (size_t i = 0; i < v3BridgeAttrs().size(); ++i)
-        cb(v3BridgeAttrs()[i].v3Value, "attrs", i);
-    for (size_t i = 0; i < v3BridgeLists().size(); ++i)
-        cb(v3BridgeLists()[i].v3Value, "list", i);
+    (void)cb;  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02) — no entries
 }
 
 // #875 Stage 0 (2026-05-29): bridge-access distribution dump for the
@@ -4361,92 +4043,7 @@ void forEachV3BridgeEntry(
 // outside of NIX_VM_STATS is zero (the function isn't called).
 void dumpBridgeAccessDistribution(std::FILE * out) noexcept
 {
-    // Bucket boundaries (inclusive UPPER bound for the bucket).
-    // 0 = "never dispatched" — the entry was added but no TW callback
-    // ever re-entered v3 through it.  Stage 1 evicts these aggressively.
-    static constexpr uint32_t bucketsUpper[] = {0, 1, 2, 5, 10, 100, 1000, UINT32_MAX};
-    static constexpr const char * bucketLabel[] = {
-        "  =0", "  =1", "  =2", "3-5 ", "6-10", "11-100", "101-1k", "  >1k"};
-    static constexpr size_t nBuckets = sizeof(bucketsUpper) / sizeof(bucketsUpper[0]);
-
-    auto bucketFor = [](uint32_t n) -> size_t {
-        for (size_t i = 0; i < nBuckets; ++i)
-            if (n <= bucketsUpper[i]) return i;
-        return nBuckets - 1;
-    };
-
-    // Per-table counts; rows = bucket, cols = {closures, attrs, lists}.
-    size_t counts[nBuckets][3] = {};
-
-    for (auto & e : v3BridgeClosures()) ++counts[bucketFor(e.accessCount)][0];
-    for (auto & e : v3BridgeAttrs())    ++counts[bucketFor(e.accessCount)][1];
-    for (auto & e : v3BridgeLists())    ++counts[bucketFor(e.accessCount)][2];
-
-    size_t totals[3] = {
-        v3BridgeClosures().size(),
-        v3BridgeAttrs().size(),
-        v3BridgeLists().size()
-    };
-    size_t total = totals[0] + totals[1] + totals[2];
-    if (total == 0) return;
-
-    std::fprintf(out,
-        "v3-direct bridge-access distribution (#875 Stage 0): "
-        "global gen=%llu\n"
-        "  bucket    closures    attrs    lists    total   total%%\n",
-        (unsigned long long)g_bridgeAccessGen.load(std::memory_order_relaxed));
-    size_t coldCum = 0;  // entries with accessCount <= 2 (Stage 1 candidates)
-    for (size_t i = 0; i < nBuckets; ++i) {
-        size_t rowTotal = counts[i][0] + counts[i][1] + counts[i][2];
-        if (rowTotal == 0) continue;
-        double pct = total ? 100.0 * double(rowTotal) / double(total) : 0.0;
-        std::fprintf(out,
-            "  %s    %8zu  %8zu  %8zu  %8zu  %6.1f%%\n",
-            bucketLabel[i],
-            counts[i][0], counts[i][1], counts[i][2],
-            rowTotal, pct);
-        if (bucketsUpper[i] <= 2) coldCum += rowTotal;
-    }
-    double coldPct = total ? 100.0 * double(coldCum) / double(total) : 0.0;
-    std::fprintf(out,
-        "  cold (accessCount <= 2): %zu / %zu entries (%.1f%%) — "
-        "%s Stage 1 ROI decision\n",
-        coldCum, total, coldPct,
-        coldPct >= 30.0 ? "ABOVE 30% threshold:" : "below 30% threshold:");
-    // #875 Stage 1 (always-on, cheap): report how many entries have
-    // fallbackExpr — i.e. how many are EVICTION-CAPABLE.  Stage 1 can
-    // only evict entries with a fallbackExpr present; if this number
-    // is much smaller than `total`, Stage 1's memory ROI is capped at
-    // (evictableEntries / total) regardless of access patterns.
-    size_t evictable[3] = {0, 0, 0};
-    for (auto & e : v3BridgeClosures()) if (e.fallbackExpr) ++evictable[0];
-    for (auto & e : v3BridgeAttrs())    if (e.fallbackExpr) ++evictable[1];
-    for (auto & e : v3BridgeLists())    if (e.fallbackExpr) ++evictable[2];
-    size_t evictableTotal = evictable[0] + evictable[1] + evictable[2];
-    double evictablePct = total ? 100.0 * double(evictableTotal) / double(total) : 0.0;
-    std::fprintf(out,
-        "  evictable (fallbackExpr present): %zu/%zu entries (%.1f%%) — "
-        "%s Stage 1 max-reclaim\n",
-        evictableTotal, total, evictablePct,
-        evictablePct >= 30.0 ? "ABOVE 30%:" : "BELOW 30% — "
-        "extend ScopedBridgeFallbackExpr coverage for Stage 1.5");
-    // Eviction-firing stats.  Only emit if policy is engaged.
-    const uint64_t evictions = g_bridgeEvictions.load(std::memory_order_relaxed);
-    const uint64_t reEvals = g_bridgeReEvalsAfterEviction.load(std::memory_order_relaxed);
-    const uint64_t sweeps = g_bridgeEvictionSweeps.load(std::memory_order_relaxed);
-    if (evictions || reEvals || sweeps) {
-        size_t evictedCount = 0;
-        for (auto & e : v3BridgeClosures()) if (e.evicted) ++evictedCount;
-        for (auto & e : v3BridgeAttrs())    if (e.evicted) ++evictedCount;
-        for (auto & e : v3BridgeLists())    if (e.evicted) ++evictedCount;
-        std::fprintf(out,
-            "  Stage 1: evictions=%llu reEvalsAfterEviction=%llu sweeps=%llu "
-            "currentlyEvicted=%zu\n",
-            (unsigned long long)evictions,
-            (unsigned long long)reEvals,
-            (unsigned long long)sweeps,
-            evictedCount);
-    }
+    (void)out;  // bridge tables retired (TW_VALUE_ERADICATION F4, 2026-06-02)
 }
 
 // (clearPostEvalGlobalRoots defined further down, after importCache()
@@ -6575,24 +6172,17 @@ void clearPostEvalGlobalRoots() noexcept
         std::getenv("NIX_V3_KEEP_GLOBAL_ROOTS") != nullptr;
     if (s_keep) return;
 
-    const size_t nClosures = v3BridgeClosures().size();
-    const size_t nAttrs    = v3BridgeAttrs().size();
-    const size_t nLists    = v3BridgeLists().size();
+    // (#875 bridge tables retired — TW_VALUE_ERADICATION F4, 2026-06-02;
+    //  nothing to clear there.  The import cache remains a global root.)
     const size_t nImports  = importCache().results.size();
-
-    v3BridgeClosures().clear();
-    v3BridgeAttrs().clear();
-    v3BridgeLists().clear();
     importCache().results.clear();
 
     static const bool s_stats = std::getenv("NIX_VM_STATS") != nullptr;
     if (s_stats) {
-        const size_t totalBridges = nClosures + nAttrs + nLists;
         std::fprintf(stderr,
-            "v3-direct post-eval clear: dropped %zu bridge entries "
-            "(%zu closures, %zu attrs, %zu lists) + %zu import-cache "
-            "results.  Eval graph now unreachable from global roots.\n",
-            totalBridges, nClosures, nAttrs, nLists, nImports);
+            "v3-direct post-eval clear: dropped %zu import-cache results.  "
+            "Eval graph now unreachable from global roots.\n",
+            nImports);
     }
 }
 
