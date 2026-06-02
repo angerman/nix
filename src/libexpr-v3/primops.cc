@@ -110,9 +110,7 @@ namespace nix::v3 {
 /// definition because primops.cc references it.
 thread_local nix::Expr * tlBridgeFallbackExpr = nullptr;
 
-/// Forward decl so primTrace (which is defined earlier in this file)
-/// can use the v3->TW bridge.  Definition at the bottom of the file.
-nix::Value * v3ToTreeWalkerPublic(nix::EvalState & nixState, Value v);
+// (v3ToTreeWalkerPublic forward-decl retired — TW_VALUE_ERADICATION F4.)
 
 ScopedBridgeFallbackExpr::ScopedBridgeFallbackExpr(nix::Expr * e)
     : saved(tlBridgeFallbackExpr)
@@ -3554,13 +3552,7 @@ void primReadFile(EvalState & state, Value * args, Value & out)
     }
 }
 
-// #793 (2026-05-24): forward declaration so primReadDir below can
-// bridge attrset/string-with-ctx args via TW realisePath, mirroring
-// TW's prim_readDir (libexpr/primops.cc:2542).  The real definition
-// lives at line ~5113 below; the bridge primops between this point
-// and the definition site share the same need.  The existing
-// forward decl at 3910 was after primReadDir's position.
-static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
+// (v3ToTreeWalker forward-decl retired — TW_VALUE_ERADICATION F4.)
 
 /// builtins.readDir path -> attrset of name -> "regular"|"directory"|"symlink"|"unknown".
 void primReadDir(EvalState & state, Value * args, Value & out)
@@ -4219,14 +4211,7 @@ v3FormalsLambdaBridges()
     return tbl;
 }
 
-/// Recursively convert a tree-walker nix::Value to a v3 Value.  Forces
-/// thunks via tree-walker's evaluator before reading the type.
-/// Per-call cycle table prevents infinite recursion on self-referential
-/// attrsets (e.g. tree-walker's derivation result has `drvAttrs` that
-/// refers back).
-static Value treeWalkerToV3(EvalState & state, nix::Value & nv,
-                            std::unordered_map<const void *, Value> & seen);
-static Value treeWalkerToV3(EvalState & state, nix::Value & nv);
+// (treeWalkerToV3 forward-decls retired — TW_VALUE_ERADICATION F4.)
 
 // Phase 1.6 poll counter for native-C++ helpers that recurse outside
 // the dispatch loop.  Bumped by the helper entries; periodic
@@ -4239,8 +4224,7 @@ static Value treeWalkerToV3(EvalState & state, nix::Value & nv);
 // set — the VM dispatch loop is stalled inside the FFI helper and
 // can't reach its own poll.
 
-// Forward declaration so primV3CallBridge1 can use it.
-static nix::Value * v3ToTreeWalker(EvalState & state, Value v);
+// (v3ToTreeWalker forward-decl retired — TW_VALUE_ERADICATION F4.)
 
 /// #455: anon-namespace forwarder so v3ToTreeWalker inside this
 /// anonymous namespace can read the eager-bridge thread-local.  The
