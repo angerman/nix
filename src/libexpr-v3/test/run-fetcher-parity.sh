@@ -135,6 +135,26 @@ check "filterSource-keep-all" \
   "builtins.filterSource (path: type: true) $S"
 rm -rf "$S"
 
+# --- builtins.path { filter } (F3 keystone: native filtered path-copy) ---
+# THIS is the cardano-node hot path: haskell.nix copies source trees with
+# cleanSourceWith-style `path: type:` filters via builtins.path.  Pre-fix,
+# v3 bridged the filter closure into TW (v3ToTreeWalker) and TW's dumpPath
+# NAR walk dispatched it once per fs entry — 20034 __v3_call_bridge_1 /
+# 10033 bridged closures on cardano-node (see TW_VALUE_ERADICATION_GOAL).
+# primPathFilteredNative now drives fetchToStore directly with a per-entry
+# callClosure callback.  Byte-equality pins that the native filtered copy
+# yields the same content-addressed store path as TW's bridged builtins.path.
+BP=$(cd "$(mktemp -d)" && pwd -P)
+printf 'a\n' > "$BP/keep.txt"; printf 'b\n' > "$BP/drop.log"
+mkdir "$BP/sub"; printf 'c\n' > "$BP/sub/x.txt"; printf 'd\n' > "$BP/sub/y.log"
+check "path-filter-txt-only" \
+  "builtins.path { path = \"$BP\"; name = \"src\"; filter = (p: t: (t == \"directory\") || (builtins.match \".*\\\\.txt\" (baseNameOf p) != null)); }"
+check "path-filter-keep-all" \
+  "builtins.path { path = \"$BP\"; filter = (p: t: true); }"
+check "path-filter-nonrecursive-file" \
+  "builtins.path { path = \"$BP/keep.txt\"; recursive = false; filter = (p: t: true); }"
+rm -rf "$BP"
+
 echo "fetcher-parity: $pass passed, $fail failed"
 if (( fail > 0 )); then
   printf '  FAIL: %s\n' "${failed[@]}" >&2

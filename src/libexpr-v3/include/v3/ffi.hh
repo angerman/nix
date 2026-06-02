@@ -335,15 +335,28 @@ FetchUrlResult fetchClosure(nix::EvalState & state, const std::string & fromStor
     const std::string & fromPathStr, const std::optional<std::string> & toPath,
     bool inputAddressed);
 
-/// THE filtered-path-copy FFI leaf (builtins.filterSource — F3: VM re-entry).
-/// Mirrors TW addPath's no-refs path (primops.cc:2961): builds a libstore
-/// PathFilter that, per entry, lstats it for the file-type string and calls
-/// back into v3 via `v3filter(absPath, type) -> keep?`, then
-/// `fetchToStore(resolveSymlinks, Copy, baseName, NixArchive, filter)` +
-/// allowPath.  `name` defaults to the source path's baseName.  Returns the
-/// printed store path + Opaque context.  No `nix::Value` crosses (the filter
-/// is a plain C++ callback the v3 caller wires to callClosure).
+/// THE filtered-path-copy FFI leaf (builtins.filterSource AND builtins.path's
+/// `filter` branch — F3: VM re-entry).  Mirrors TW addPath's no-refs path
+/// (primops.cc:2961): builds a libstore PathFilter that, per entry, lstats it
+/// for the file-type string and calls back into v3 via
+/// `v3filter(absPath, type) -> keep?`, then `fetchToStore(resolveSymlinks,
+/// Copy, name, method, filter)` + allowPath.
+///
+///   - `name`      — store-path name; `""` defaults to the source baseName.
+///   - `recursive` — true → NixArchive (recursive dump), false → Flat.
+///   - `sha256`    — optional expected content hash.  When present, the
+///                   expected fixed-output path is computed first and the
+///                   fetch is SKIPPED if already valid (matches TW addPath's
+///                   expectedStorePath optimisation, so the filter is not
+///                   invoked in that case — identical to TW); otherwise the
+///                   produced path is verified against the expected one.
+///
+/// Returns the printed store path + Opaque context.  No `nix::Value` crosses
+/// (the filter is a plain C++ callback the v3 caller wires to callClosure).
 FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPath,
+    const std::string & name,
+    bool recursive,
+    const std::optional<std::string> & sha256,
     const std::function<bool(const std::string & absPath, const std::string & type)> & v3filter);
 
 /// Read a `nix::flake::LockedFlake` (passed opaquely as `const void *`;

@@ -413,9 +413,37 @@ FetchUrlResult fetchClosure(nix::EvalState & state, const std::string & fromStor
 }
 
 FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPath,
+    const std::string & name,
+    bool recursive,
+    const std::optional<std::string> & sha256,
     const std::function<bool(const std::string &, const std::string &)> & v3filter)
 {
     nix::SourcePath sp(state.rootFS, nix::CanonPath(srcPath));
+
+    std::string storeName = name.empty() ? std::string(sp.baseName()) : name;
+    nix::ContentAddressMethod method = recursive
+        ? nix::ContentAddressMethod::Raw::NixArchive
+        : nix::ContentAddressMethod::Raw::Flat;
+
+    auto opaqueResult = [&](const nix::StorePath & p) -> FetchUrlResult {
+        return {state.store->printStorePath(p),
+                nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = p}}.to_string()};
+    };
+
+    // sha256 → expected fixed-output path.  TW's addPath skips the dump
+    // entirely when the expected path is already valid, so the filter is
+    // never invoked in that case — reproduce that exactly for byte-equality.
+    std::optional<nix::Hash> expectedHash;
+    if (sha256) {
+        expectedHash = nix::newHashAllowEmpty(*sha256, nix::HashAlgorithm::SHA256);
+        nix::StorePath expected = state.store->makeFixedOutputPathFromCA(
+            storeName,
+            nix::ContentAddressWithReferences::fromParts(method, *expectedHash, {}));
+        if (state.store->isValidPath(expected)) {
+            state.allowPath(expected);
+            return opaqueResult(expected);
+        }
+    }
 
     auto fileType = [](nix::SourceAccessor::Type t) -> const char * {
         using T = nix::SourceAccessor::Type;
@@ -442,13 +470,22 @@ FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPa
     auto storePath = nix::fetchToStore(
         state.fetchSettings, *state.store, sp.resolveSymlinks(),
         nix::settings.readOnlyMode ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
-        std::string(sp.baseName()),
-        nix::ContentAddressMethod::Raw::NixArchive,
+        storeName,
+        method,
         &filter, state.repair);
     state.allowPath(storePath);
 
-    return {state.store->printStorePath(storePath),
-            nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = storePath}}.to_string()};
+    // Verify against the expected path when sha256 was supplied (mirrors
+    // primPathNative / TW addPath's post-fetch check).
+    if (expectedHash) {
+        nix::StorePath expected = state.store->makeFixedOutputPathFromCA(
+            storeName,
+            nix::ContentAddressWithReferences::fromParts(method, *expectedHash, {}));
+        if (expected != storePath)
+            throw nix::Error("store path mismatch in path added from '%s'", srcPath);
+    }
+
+    return opaqueResult(storePath);
 }
 
 FetchUrlResult fetchUrl(nix::EvalState & state, const std::string & urlArg,

@@ -9802,6 +9802,12 @@ void primFromTOML(EvalState & state, Value * args, Value & out)
 // falls through to the existing bridge.
 static void primPathNative(EvalState & state, Value * args, Value & out);
 
+/// builtins.path with a `filter` closure — native (no TW bridge).  Extracts
+/// path/name/recursive/sha256 like primPathNative, but drives the libstore
+/// copy through ffi::addPathFiltered with a per-entry callClosure callback so
+/// the v3 filter closure never crosses into TW.  See primPath's dispatch.
+static void primPathFilteredNative(EvalState & state, Value * args, Value & out);
+
 /// builtins.path { path; name?; filter?; recursive?; sha256?; }:
 /// add a path to the v3 store and return its store-path string with
 /// Opaque NixStringContext.  Mirrors tree-walker's prim_path.
@@ -9818,21 +9824,31 @@ void primPath(EvalState & state, Value * args, Value & out)
     static const bool nativeDisabled =
         std::getenv("V3_PATH_NO_NATIVE") != nullptr;
     if (!nativeDisabled && state.nixEvalState) {
-        // Filter present → bail to bridge (closure re-entry not yet
-        // wired from this code path).
+        // F3 / TW_VALUE_ERADICATION keystone: handle BOTH the no-filter
+        // and the filter case natively.  Previously a `filter` closure
+        // forced a bail to the TW bridge (`v3ToTreeWalker(args[0])`),
+        // whose dumpPath NAR walk then dispatched the bridged closure
+        // once per filesystem entry — the cardano-node hot path
+        // (20034 __v3_call_bridge_1 / 10033 bridged closures, all
+        // haskell.nix cleanSourceWith-style `builtins.path { filter; }`).
+        // primPathFilteredNative drives fetchToStore directly and calls
+        // the v3 filter closure per entry via callClosure (no Value
+        // crosses the boundary).
         SymbolId sFilter = ir::globalInternSymbol("filter");
-        if (!args[0].payload.bindings->lookup(sFilter)) {
-            try {
+        const Value * filterV = args[0].payload.bindings->lookup(sFilter);
+        try {
+            if (!filterV)
                 primPathNative(state, args, out);
-                return;
-            } catch (const std::exception & e) {
-                static const bool s_drvDebugPathNative =
-                    std::getenv("V3_DRV_DEBUG") != nullptr;
-                if (__builtin_expect(s_drvDebugPathNative, 0))
-                    std::fprintf(stderr,
-                        "v3 builtins.path native fell back: %s\n", e.what());
-                // fall through.
-            }
+            else
+                primPathFilteredNative(state, args, out);
+            return;
+        } catch (const std::exception & e) {
+            static const bool s_drvDebugPathNative =
+                std::getenv("V3_DRV_DEBUG") != nullptr;
+            if (__builtin_expect(s_drvDebugPathNative, 0))
+                std::fprintf(stderr,
+                    "v3 builtins.path native fell back: %s\n", e.what());
+            // fall through to the defensive bridge below.
         }
     }
     // Bridge to tree-walker's `builtins.path` so we get a proper
@@ -10002,6 +10018,94 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
     outCtx.insert(nix::NixStringContextElem{
         nix::NixStringContextElem::Opaque{.path = dst}});
     setStringContext(v3Out.payload.str, outCtx);
+    out = v3Out;
+}
+
+// builtins.path with a `filter` closure, driven natively.  Mirrors
+// primPathNative's path/name/recursive/sha256 extraction (so the no-filter
+// and filter cases agree byte-for-byte on store-path computation), but the
+// libstore copy runs through ffi::addPathFiltered with a PathFilter that
+// RE-ENTERS v3's VM per directory entry via callClosure — exactly the
+// primFilterSource pattern.  No nix::Value crosses to TW: this retires the
+// 20034-dispatch builtins.path bridge feeder on cardano-node.
+static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
+{
+    auto & ns = *state.nixEvalState;
+    auto * src = args[0].payload.bindings;
+
+    static const SymbolId sPath      = ir::globalInternSymbol("path");
+    static const SymbolId sName      = ir::globalInternSymbol("name");
+    static const SymbolId sFilter    = ir::globalInternSymbol("filter");
+    static const SymbolId sRecursive = ir::globalInternSymbol("recursive");
+    static const SymbolId sSha256    = ir::globalInternSymbol("sha256");
+
+    // path (required) — Tag::Path or Tag::String.
+    const Value * pathRaw = src->lookup(sPath);
+    if (!pathRaw)
+        throw std::runtime_error(
+            "v3 builtins.path (filtered): missing required `path` attribute");
+    Value pathV = forceValue(*state.vm, *pathRaw);
+    std::string pathStr;
+    if (pathV.isPath())        pathStr = pathV.payload.path ? pathV.payload.path : "";
+    else if (pathV.isString()) pathStr = pathV.payload.str ? pathV.payload.str : "";
+    else throw std::runtime_error(
+        "v3 builtins.path (filtered): `path` is not a path or string");
+
+    // name (optional → baseName, resolved inside ffi::addPathFiltered when "").
+    std::string name;
+    if (auto * nameV = src->lookup(sName)) {
+        Value f = forceValue(*state.vm, *nameV);
+        if (!f.isString())
+            throw std::runtime_error(
+                "v3 builtins.path (filtered): `name` is not a string");
+        name = f.payload.str ? f.payload.str : "";
+    }
+
+    // recursive (optional, default true → NixArchive).
+    bool recursive = true;
+    if (auto * rV = src->lookup(sRecursive)) {
+        Value f = forceValue(*state.vm, *rV);
+        if (!f.isBool())
+            throw std::runtime_error(
+                "v3 builtins.path (filtered): `recursive` is not a bool");
+        recursive = (f.payload.i == 1);
+    }
+
+    // sha256 (optional).
+    std::optional<std::string> sha256;
+    if (auto * shaV = src->lookup(sSha256)) {
+        Value f = forceValue(*state.vm, *shaV);
+        if (!f.isString())
+            throw std::runtime_error(
+                "v3 builtins.path (filtered): `sha256` is not a string");
+        sha256 = std::string(f.payload.str ? f.payload.str : "");
+    }
+
+    // filter (required here — caller only routes us when present).
+    const Value * filterRaw = src->lookup(sFilter);
+    if (!filterRaw)
+        throw std::runtime_error(
+            "v3 builtins.path (filtered): missing `filter` (internal dispatch bug)");
+    Value filterFn = forceValue(*state.vm, *filterRaw);
+
+    // Per-entry predicate: callClosure(filter, absPath)(type) -> Bool.  Runs
+    // inside fetchToStore (nested v3 eval on the same VMState — STG-10).
+    auto v3filter = [&](const std::string & p, const std::string & type) -> bool {
+        Value r1 = callClosure(*state.vm, filterFn, mkStringValueOwned(p));
+        Value r2 = callClosure(*state.vm, r1, mkStringValueOwned(type));
+        r2 = forceValue(*state.vm, r2);
+        if (r2.tag() != Tag::Bool)
+            throw std::runtime_error(
+                "while evaluating the return value of the path filter function: "
+                "expected a Boolean");
+        return r2.payload.i == 1;
+    };
+
+    ffi::FetchUrlResult r =
+        ffi::addPathFiltered(ns, pathStr, name, recursive, sha256, v3filter);
+    Value v3Out = mkStringValueOwned(r.printedStorePath);
+    std::vector<std::string> ctx{ r.opaqueContextElem };
+    setStringContextEntries(v3Out.payload.str, std::move(ctx));
     out = v3Out;
 }
 
@@ -12103,7 +12207,10 @@ void primFilterSource(EvalState & s, Value * a, Value & o) {
         return r2.payload.i == 1;
     };
 
-    ffi::FetchUrlResult r = ffi::addPathFiltered(ns, pathStr, v3filter);
+    // filterSource: name defaults to baseName, recursive (NixArchive), no sha256.
+    ffi::FetchUrlResult r =
+        ffi::addPathFiltered(ns, pathStr, /*name=*/"", /*recursive=*/true,
+                             /*sha256=*/std::nullopt, v3filter);
     o = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
     setStringContextEntries(o.payload.str, std::move(ctx));
