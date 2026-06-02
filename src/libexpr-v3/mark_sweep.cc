@@ -679,6 +679,19 @@ struct SweepStats {
     size_t blocksScanned = 0;
     size_t blocksFreed   = 0;
     size_t bytesFreed    = 0;
+
+    // R2.1 (2026-06-02): per-block live-density histogram — the
+    // evacuation-OPPORTUNITY measurement (measure-twice before the
+    // risky moving-GC build).  whole-block-free finds 0 blocks at
+    // mid-eval trigger points because live cells are SCATTERED across
+    // every block; evacuation must MOVE the few live cells out of
+    // sparse blocks to empty them.  This histogram quantifies how many
+    // blocks are sparse (cheap to evacuate, big RSS win) vs dense
+    // (not worth moving), and the live-byte copy cost.
+    //   bins by live-byte fraction: [0-10) [10-25) [25-50) [50-75) [75-100]%
+    size_t densityHist[5]  = {0, 0, 0, 0, 0};
+    size_t sparseBlocks    = 0;  // < 25% live = good evacuation candidates
+    size_t sparseLiveBytes = 0;  // live bytes in sparse blocks = copy cost
 };
 
 /// Sweep one arena block.  Walks the cell-start bitmap in address
@@ -732,6 +745,7 @@ static bool sweepOneBlock(
     // Last cell extends to blockUsedBytes.
     ++stats.blocksScanned;
     size_t blockLiveCells = 0;
+    size_t blockLiveBytes = 0;
     for (size_t i = 0; i < starts.size(); ++i) {
         const size_t offset    = starts[i];
         const size_t endOffset = (i + 1 < starts.size())
@@ -747,6 +761,7 @@ static bool sweepOneBlock(
         if (marker.anyMarkInRange(blockStart, offset, offset + cellSize)) {
             ++stats.liveCells;
             ++blockLiveCells;
+            blockLiveBytes += cellSize;
             stats.liveBytes += cellSize;
         } else {
             ++stats.deadCells;
@@ -757,6 +772,17 @@ static bool sweepOneBlock(
             arena.freeListAdd(
                 const_cast<void *>(cellAddr), cellSize);
             arena.clearCellStartBitFor(cellAddr);
+        }
+    }
+    // R2.1: bin this block's live-byte density (evacuation opportunity).
+    if (blockUsedBytes > 0) {
+        const double dens = double(blockLiveBytes) / double(blockUsedBytes);
+        const int bin = dens < 0.10 ? 0 : dens < 0.25 ? 1
+                      : dens < 0.50 ? 2 : dens < 0.75 ? 3 : 4;
+        ++stats.densityHist[bin];
+        if (dens < 0.25) {            // sparse → worth evacuating
+            ++stats.sparseBlocks;
+            stats.sparseLiveBytes += blockLiveBytes;
         }
     }
     // Phase 3.8: block is fully dead if no live cells AND no marker
@@ -983,6 +1009,20 @@ void runMajorMarkSweep(VMState & vm) noexcept
             arena.freeListEntryCount(),
             sweep.blocksFreed,
             sweep.bytesFreed / 1e6);
+        // R2.1 (2026-06-02): evacuation-opportunity histogram.  Sparse
+        // blocks (<25% live) are the evacuation candidates — moving
+        // their few live bytes into dense blocks empties them for
+        // munmap.  evacuable_RSS = sparseBlocks * 16 MB (RSS evacuation
+        // could free this cycle); copy_cost = live bytes to relocate.
+        std::fprintf(stderr,
+            "v3 evac-opportunity: density[0-10|10-25|25-50|50-75|75-100]%%="
+            "%zu|%zu|%zu|%zu|%zu  sparseBlocks=%zu(<25%%live) "
+            "evacuable_RSS=%.1fMB copy_cost=%.1fMB\n",
+            sweep.densityHist[0], sweep.densityHist[1], sweep.densityHist[2],
+            sweep.densityHist[3], sweep.densityHist[4],
+            sweep.sparseBlocks,
+            double(sweep.sparseBlocks) * double(Arena::kBlockSize) / 1e6,
+            double(sweep.sparseLiveBytes) / 1e6);
         // Step 11′ (Immix, 2026-05-29): line-mark bitmap summary.
         // Each block has 131,072 lines of 128 B; a line is "live"
         // if any byte of any marked cell falls in it.  Dead-line
