@@ -43,8 +43,9 @@
 #include "nix/store/store-api.hh"          // Store::printStorePath / toStorePath
 #include "nix/store/globals.hh"            // nix::settings.readOnlyMode
 #include "nix/store/path-references.hh"    // PathRefScanSink (storeRefsContextFor)
-#include "nix/store/content-address.hh"    // ContentAddressMethod (pathFetchToStore param)
+#include "nix/store/content-address.hh"    // ContentAddressMethod / TextInfo
 #include "nix/fetchers/fetch-to-store.hh"  // fetchToStore / FetchMode (pathFetchToStore)
+#include "nix/util/serialise.hh"           // StringSource / FileSerialisationMethod (addTextToStore)
 #include "nix/fetchers/fetchers.hh"        // fetchers::Input getters (readLockedFlake)
 #include "nix/fetchers/attrs.hh"           // maybeGetStrAttr / maybeGetBoolAttr
 #include "nix/flake/flake.hh"              // flake::LockedFlake / lockFlake / LockFlags
@@ -59,6 +60,12 @@
 #include <vector>
 
 namespace nix::v3 {
+
+// Defined in primops.cc — the v3↔TW value bridge.  ffi shims that build a
+// TW value and hand it back to v3 (addTextToStore) call it here; forward-
+// declared rather than headered (it's part of the not-yet-relocated bridge
+// subsystem) — same pattern v3_call_flake.cc used pre-decoupling.
+Value treeWalkerToV3Public(nix::EvalState & nixState, nix::Value & nv);
 
 // EvalState shims (audit §3.4) — out-of-line wrappers; see ffi.hh.
 namespace ffi {
@@ -295,6 +302,30 @@ nix::StorePath pathFetchToStore(nix::EvalState & state,
         method,
         nullptr,
         state.repair);
+}
+
+Value addTextToStore(nix::EvalState & state, const std::string & name,
+                     const std::string & contents,
+                     nix::StorePathSet refs, bool readOnly)
+{
+    auto storePath = readOnly
+        ? state.store->makeFixedOutputPathFromCA(
+            name,
+            nix::TextInfo{
+                .hash = nix::hashString(nix::HashAlgorithm::SHA256, contents),
+                .references = std::move(refs),
+            })
+        : ({
+            nix::StringSource s{contents};
+            state.store->addToStoreFromDump(
+                s, name,
+                nix::FileSerialisationMethod::Flat,
+                nix::ContentAddressMethod::Raw::Text,
+                nix::HashAlgorithm::SHA256, refs, state.repair);
+        });
+    nix::Value tw;
+    state.allowAndSetStorePathString(storePath, tw);
+    return nix::v3::treeWalkerToV3Public(state, tw);
 }
 
 LockedFlakeInfo lockFlakeAndRead(nix::EvalState & state,

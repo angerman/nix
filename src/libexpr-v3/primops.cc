@@ -86,7 +86,6 @@
 #include "nix/store/derived-path.hh"
 #include "nix/store/derivations.hh"  // hashPlaceholder
 #include "nix/store/content-address.hh"  // ContentAddressMethod
-#include "nix/util/serialise.hh"  // StringSource
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
 #include "v3/cache_probe.hh"  // #827 / A3 per-call-site cache-hook
@@ -11651,25 +11650,9 @@ void primToFile(EvalState & state, Value * args, Value & out)
             }
         }
     }
-    auto storePath = ffi::readOnlyMode()
-        ? ns->store->makeFixedOutputPathFromCA(
-            name,
-            nix::TextInfo{
-                .hash = nix::hashString(nix::HashAlgorithm::SHA256, contents),
-                .references = std::move(refs),
-            })
-        : ({
-            nix::StringSource s{contents};
-            ns->store->addToStoreFromDump(
-                s, name,
-                nix::FileSerialisationMethod::Flat,
-                nix::ContentAddressMethod::Raw::Text,
-                nix::HashAlgorithm::SHA256, refs, ns->repair);
-        });
-    nix::Value tw;
-    ns->allowAndSetStorePathString(storePath, tw);
-    Value result = treeWalkerToV3Public(*ns, tw);
-    out = result;
+    // Store add + bridge behind the FFI leaf (StringSource /
+    // FileSerialisationMethod / TextInfo live in ffi.cc; audit Phase 4).
+    out = ffi::addTextToStore(*ns, name, contents, std::move(refs), ffi::readOnlyMode());
 }
 
 /// builtins.__outputOf drvRef outputName → input placeholder for that
