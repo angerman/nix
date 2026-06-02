@@ -31,6 +31,9 @@
 #include <unordered_map>
 #include <vector>
 #include <new>
+#include <sys/mman.h>   // R2.0 (2026-06-02): mmap/munmap block lifecycle —
+                        // the page-release primitive R1 proved is the ONLY
+                        // one that returns RSS on macOS (std::free does not).
 
 // WC-13: optionally register arena blocks as Boehm GC roots so any
 // raw `nix::Value *` (or other GC-managed pointer) stored inside a
@@ -1714,13 +1717,17 @@ public:
             freeListEntries_ -= removed;
         }
 
-        // 3. GC_remove_roots + std::free the block bytes.
+        // 3. GC_remove_roots + munmap the block bytes.  R2.0: munmap
+        //    (NOT std::free) is the only primitive that returns the
+        //    bytes to RSS on macOS (R1 spike).  freeWholeBlock only
+        //    runs under the major-GC gate, where refill() mmap'd the
+        //    block, so munmap is always the correct inverse here.
 #if NIX_USE_BOEHMGC
         if (!arenaNorootEnabled())
             GC_remove_roots(const_cast<char *>(blockStart),
                             const_cast<char *>(blockStart) + kBlockSize);
 #endif
-        std::free(const_cast<char *>(blockStart));
+        unmapArenaBlock(const_cast<char *>(blockStart), kBlockSize);
 
         // 4. Remove from active_.blocks + parallel cellStarts +
         //    parallel lineMarks (Step 11′ Immix, 2026-05-29).
@@ -1886,6 +1893,26 @@ private:
         }
     }
 
+    // R2.0 (2026-06-02): block-level page-release primitive.  R1
+    // (bench/page-release-spike.cc) proved that on macOS aarch64 ONLY
+    // munmap returns freed bytes to RSS — std::free of a calloc'd 16 MB
+    // block returns 0% (libmalloc caches large frees in its magazines)
+    // and madvise(MADV_DONTNEED/FREE) is a no-op for anonymous RSS.  So
+    // under the major-GC gate the arena allocates regular blocks via
+    // mmap (page-aligned, zero-filled like calloc) and `freeWholeBlock`
+    // releases them via munmap.  Gated on majorGcEnabled() so the
+    // default (no-GC) path is byte-for-byte the prior calloc behaviour.
+    static char * mapArenaBlock(size_t bytes) noexcept
+    {
+        void * p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANON, -1, 0);
+        return (p == MAP_FAILED) ? nullptr : static_cast<char *>(p);
+    }
+    static void unmapArenaBlock(void * p, size_t bytes) noexcept
+    {
+        if (p) ::munmap(p, bytes);
+    }
+
     void refill() noexcept
     {
         // Phase-13 review HIGH-6 fix: zero-fill the block before
@@ -1893,9 +1920,11 @@ private:
         // region; OS-recycled garbage often contains pointer-shaped
         // bit patterns that pin Boehm-managed objects until process
         // exit (phantom retention scaling with arena lifetime).
-        // calloc gives us a zero page directly from the kernel —
-        // cheaper than malloc + memset for fresh allocations.
-        char * blk = static_cast<char *>(std::calloc(1, kBlockSize));
+        // mmap(MAP_ANON) (GC path) and calloc (default path) both hand
+        // back zero pages directly from the kernel.
+        char * blk = majorGcEnabled()
+            ? mapArenaBlock(kBlockSize)
+            : static_cast<char *>(std::calloc(1, kBlockSize));
         active_.blocks.push_back(blk);
         active_.cur = blk;
         active_.end = blk + kBlockSize;
