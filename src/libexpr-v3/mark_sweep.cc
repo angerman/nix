@@ -894,6 +894,17 @@ void runMajorMarkSweep(VMState & vm) noexcept
         visitor.drainConservative(arena, arenaMin, arenaMax);
     }
 
+    // R2.4a (2026-06-02): evacuation safety precondition.  Cells
+    // reachable by the PRECISE walk (above) hold rewritable slots, so
+    // evacuation can move them and fix up the references.  Cells
+    // reachable ONLY by the conservative C-stack scan (below) are
+    // pinned by an un-rewritable C-local pointer — moving them would
+    // dangle that pointer.  The delta (conservative-only marked cells)
+    // is the un-evacuatable set; their containing blocks must be
+    // PINNED, not evacuated.  Small delta => evacuation can move ~all
+    // sparse-block live cells; large delta => yield shrinks.
+    const size_t preciseMarkedCells = marker.markedCells();
+
     // -- Phase 3.5: conservative C-stack scan -----------------------
     // After precise marks finish, do a conservative scan of the
     // current thread's stack + callee-saved registers (via setjmp
@@ -906,6 +917,9 @@ void runMajorMarkSweep(VMState & vm) noexcept
         const void * sp = &anchor;
         walkCStackConservative(visitor, arena, sp);
     }
+
+    const size_t conservativeOnlyCells =
+        marker.markedCells() - preciseMarkedCells;
 
     const auto tMarkEnd = clock::now();
 
@@ -1023,6 +1037,17 @@ void runMajorMarkSweep(VMState & vm) noexcept
             sweep.sparseBlocks,
             double(sweep.sparseBlocks) * double(Arena::kBlockSize) / 1e6,
             double(sweep.sparseLiveBytes) / 1e6);
+        // R2.4a: evacuation movability — precise-reachable (rewritable,
+        // movable) vs conservative-only (pinned).  conservativePct high
+        // => many cells can't be moved => evacuation pins their blocks.
+        std::fprintf(stderr,
+            "v3 evac-movability: preciseMarked=%zu conservativeOnly=%zu "
+            "(%.1f%% pinned by C-stack)\n",
+            preciseMarkedCells, conservativeOnlyCells,
+            (preciseMarkedCells + conservativeOnlyCells) > 0
+                ? 100.0 * double(conservativeOnlyCells)
+                          / double(preciseMarkedCells + conservativeOnlyCells)
+                : 0.0);
         // Step 11′ (Immix, 2026-05-29): line-mark bitmap summary.
         // Each block has 131,072 lines of 128 B; a line is "live"
         // if any byte of any marked cell falls in it.  Dead-line
