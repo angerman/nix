@@ -359,6 +359,30 @@ FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPa
     const std::optional<std::string> & sha256,
     const std::function<bool(const std::string & absPath, const std::string & type)> & v3filter);
 
+/// THE complete builtins.path store leaf — a faithful transcription of TW's
+/// `addPath` (libexpr/primops.cc:2961), so v3's builtins.path is byte-for-byte
+/// identical to TW's WITHOUT bridging the arg attrset.  The caller (primops.cc)
+/// has already coerced the `path` attribute to a store/abs path STRING and
+/// collected its string context (the v3-native encoding, one entry per
+/// `NixStringContextElem::to_string()`); this shim handles the rest:
+///   - parse `contextElems` → NixStringContext;
+///   - if the path is in-store with non-empty context: `realiseContext`
+///     (build/rewrite CA-drv placeholders) + `rewriteStrings` + collect the
+///     referenced store path's `references` (the refs branch — `addToStore`
+///     with refs instead of `fetchToStore`);
+///   - optional per-entry `v3filter` (null = no filter) re-enters v3's VM;
+///   - optional `sha256` expected fixed-output-path skip + post-add verify.
+/// `name` defaults to the path baseName when "".  Returns printed store path +
+/// Opaque context.  No `nix::Value` crosses — the only callback is the plain
+/// C++ filter the v3 caller wires to callClosure.
+FetchUrlResult addPathFull(nix::EvalState & state,
+    const std::string & pathStr,
+    const std::vector<std::string> & contextElems,
+    const std::string & name,
+    bool recursive,
+    const std::optional<std::string> & sha256,
+    const std::function<bool(const std::string & absPath, const std::string & type)> * v3filter);
+
 /// Read a `nix::flake::LockedFlake` (passed opaquely as `const void *`;
 /// ffi.cc casts it back) into plain data: the lockfile text + per-node
 /// store-path / fetcher-input fields.  Performs `lockFile.to_string`, the

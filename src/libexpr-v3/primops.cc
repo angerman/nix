@@ -9820,62 +9820,27 @@ void primPath(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isAttrs() || !args[0].payload.bindings)
         typeError("path", "attrset");
-    // BR-4 native fast path.
-    static const bool nativeDisabled =
-        std::getenv("V3_PATH_NO_NATIVE") != nullptr;
-    if (!nativeDisabled && state.nixEvalState) {
-        // F3 / TW_VALUE_ERADICATION keystone: handle BOTH the no-filter
-        // and the filter case natively.  Previously a `filter` closure
-        // forced a bail to the TW bridge (`v3ToTreeWalker(args[0])`),
-        // whose dumpPath NAR walk then dispatched the bridged closure
-        // once per filesystem entry — the cardano-node hot path
-        // (20034 __v3_call_bridge_1 / 10033 bridged closures, all
-        // haskell.nix cleanSourceWith-style `builtins.path { filter; }`).
-        // primPathFilteredNative drives fetchToStore directly and calls
-        // the v3 filter closure per entry via callClosure (no Value
-        // crosses the boundary).
-        SymbolId sFilter = ir::globalInternSymbol("filter");
-        const Value * filterV = args[0].payload.bindings->lookup(sFilter);
-        try {
-            if (!filterV)
-                primPathNative(state, args, out);
-            else
-                primPathFilteredNative(state, args, out);
-            return;
-        } catch (const std::exception & e) {
-            static const bool s_drvDebugPathNative =
-                std::getenv("V3_DRV_DEBUG") != nullptr;
-            if (__builtin_expect(s_drvDebugPathNative, 0))
-                std::fprintf(stderr,
-                    "v3 builtins.path native fell back: %s\n", e.what());
-            // fall through to the defensive bridge below.
-        }
-    }
-    // Bridge to tree-walker's `builtins.path` so we get a proper
-    // content-addressed `/nix/store/<32-char-hash>-name` result.
-    // (settings.readOnlyMode means the store path is *computed* from
-    // the file's NAR hash, not actually written.)
+    // V3-NATIVE builtins.path (TW_VALUE_ERADICATION F3/F4): primPathNative /
+    // primPathFilteredNative fully transcribe TW's prim_path + addPath
+    // (coercion of the `path` arg + the in-store-context refs branch + the
+    // per-entry `filter` closure + `sha256`) via ffi::addPathFull — byte-
+    // identical to TW with NO v3->TW marshalling.  Errors propagate (TW
+    // throws too).  The former TW-bridge fallback (v3ToTreeWalker →
+    // callFunction(builtins.path) → treeWalkerToV3) was the LAST builtins.path
+    // bridge feeder; it is DELETED here, along with the V3_PATH_NO_NATIVE A/B
+    // gate it backed.  Validated byte-equal across derivation (refs branch),
+    // toFile (context), attrset outPath/__toString, plain path, and the
+    // filter cases — all with bridge tables = 0.
     if (state.nixEvalState) {
-        try {
-            auto & ns = *state.nixEvalState;
-            nix::Value * nargs = v3ToTreeWalker(state, args[0]);
-            nix::Value & blt = ns.getBuiltins();
-            ns.forceAttrs(blt, nix::noPos, "v3 builtins.path bridge");
-            auto * pAttr = blt.attrs()->get(ns.symbols.create("path"));
-            if (pAttr && pAttr->value) {
-                // #484 STG-style address identity: see derivationStrict.
-                nix::Value * result = ffi::allocValue(ns);
-                ffi::callFunction(ns, *pAttr->value, *nargs, *result, nix::noPos);
-                out = treeWalkerToV3(state, *result);
-                return;
-            }
-        } catch (const std::exception & e) {
-            static const bool s_drvDebugPathBridge =
-                std::getenv("V3_DRV_DEBUG") != nullptr;
-            if (__builtin_expect(s_drvDebugPathBridge, 0))
-                std::fprintf(stderr, "v3 builtins.path bridge fell back: %s\n", e.what());
-        }
+        SymbolId sFilter = ir::globalInternSymbol("filter");
+        if (!args[0].payload.bindings->lookup(sFilter))
+            primPathNative(state, args, out);
+        else
+            primPathFilteredNative(state, args, out);
+        return;
     }
+    // Standalone v3-eval (no host store wired): compute a placeholder path
+    // so pure AST evaluation still proceeds without a store.
     SymbolId sPath = vmIntern(state, "path");
     SymbolId sName = vmIntern(state, "name");
     auto * src = args[0].payload.bindings;
@@ -9922,24 +9887,20 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
     static const SymbolId sRecursive = ir::globalInternSymbol("recursive");
     static const SymbolId sSha256    = ir::globalInternSymbol("sha256");
 
-    // Read `path` (required).  Accept Tag::Path or Tag::String.
+    // Read `path` (required).  Coerce like TW's coerceToPath (copyToStore=
+    // false): string (with its context) / path / derivation / attrset with
+    // outPath|__toString.  Collect the resulting string context so the
+    // refs branch in ffi::addPathFull can realise it (the in-store-path-
+    // with-references case that addToStore-CA-hashes the refs in).
     const Value * pathRaw = src->lookup(sPath);
     if (!pathRaw)
         throw std::runtime_error(
             "v3 BR-4 native: missing required `path` attribute");
-    Value pathV = forceValue(*state.vm, *pathRaw);
-    std::string pathStr;
-    if (pathV.isPath()) {
-        pathStr = pathV.payload.path ? pathV.payload.path : "";
-    } else if (pathV.isString()) {
-        pathStr = pathV.payload.str ? pathV.payload.str : "";
-    } else {
-        throw std::runtime_error(
-            "v3 BR-4 native: `path` is not a path or string");
-    }
-    nix::SourcePath path(ns.rootFS, nix::CanonPath(pathStr));
+    std::vector<std::string> pathCtx;
+    std::string pathStr =
+        toStringCoerceCtx(state, *pathRaw, pathCtx, /*copyPathsToStore=*/false);
 
-    // Read `name` (optional, defaults to basename).
+    // Read `name` (optional; "" → ffi::addPathFull defaults to baseName).
     std::string name;
     if (auto * nameV = src->lookup(sName)) {
         Value f = forceValue(*state.vm, *nameV);
@@ -9948,76 +9909,32 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
                 "v3 BR-4 native: `name` is not a string");
         name = f.payload.str ? f.payload.str : "";
     }
-    if (name.empty()) {
-        name = path.baseName();
-    }
 
     // Read `recursive` (optional, default true → NixArchive).
-    nix::ContentAddressMethod method = nix::ContentAddressMethod::Raw::NixArchive;
+    bool recursive = true;
     if (auto * rV = src->lookup(sRecursive)) {
         Value f = forceValue(*state.vm, *rV);
         if (!f.isBool())
             throw std::runtime_error(
                 "v3 BR-4 native: `recursive` is not a bool");
-        method = (f.payload.i == 1)
-            ? nix::ContentAddressMethod::Raw::NixArchive
-            : nix::ContentAddressMethod::Raw::Flat;
+        recursive = (f.payload.i == 1);
     }
 
-    // Read `sha256` (optional).  Tree-walker uses this for verification
-    // post-fetch — if mismatched, errors.
-    std::optional<nix::Hash> expectedHash;
+    // Read `sha256` (optional).
+    std::optional<std::string> sha256;
     if (auto * shaV = src->lookup(sSha256)) {
         Value f = forceValue(*state.vm, *shaV);
         if (!f.isString())
             throw std::runtime_error(
                 "v3 BR-4 native: `sha256` is not a string");
-        expectedHash = nix::newHashAllowEmpty(
-            f.payload.str ? f.payload.str : "", nix::HashAlgorithm::SHA256);
+        sha256 = std::string(f.payload.str ? f.payload.str : "");
     }
 
-    // Compute the expected store path (when sha256 is provided) and
-    // skip the actual fetch if the path already exists in the store.
-    // Mirrors addPath's expectedStorePath optimisation.
-    if (expectedHash) {
-        nix::StorePath expected = ns.store->makeFixedOutputPathFromCA(
-            name,
-            nix::ContentAddressWithReferences::fromParts(
-                method, *expectedHash, {}));
-        if (ns.store->isValidPath(expected)) {
-            std::string outPath = ns.store->printStorePath(expected);
-            Value v3Out = mkStringValueOwned(outPath);
-            nix::NixStringContext outCtx;
-            outCtx.insert(nix::NixStringContextElem{
-                nix::NixStringContextElem::Opaque{.path = expected}});
-            setStringContext(v3Out.payload.str, outCtx);
-            out = v3Out;
-            return;
-        }
-    }
-
-    // Fetch (DryRun under readOnlyMode just computes the path).  No
-    // filter: the gate above bailed when one was present.  fetchToStore +
-    // FetchMode live behind the ffi leaf (audit Phase 4).
-    nix::StorePath dst = ffi::pathFetchToStore(ns, path, name, method, ffi::readOnlyMode());
-
-    if (expectedHash) {
-        nix::StorePath expected = ns.store->makeFixedOutputPathFromCA(
-            name,
-            nix::ContentAddressWithReferences::fromParts(
-                method, *expectedHash, {}));
-        if (expected != dst)
-            throw std::runtime_error(
-                "v3 BR-4 native: store path mismatch in path added "
-                "from '" + pathStr + "'");
-    }
-
-    std::string outPath = ns.store->printStorePath(dst);
-    Value v3Out = mkStringValueOwned(outPath);
-    nix::NixStringContext outCtx;
-    outCtx.insert(nix::NixStringContextElem{
-        nix::NixStringContextElem::Opaque{.path = dst}});
-    setStringContext(v3Out.payload.str, outCtx);
+    ffi::FetchUrlResult r = ffi::addPathFull(
+        ns, pathStr, pathCtx, name, recursive, sha256, /*v3filter=*/nullptr);
+    Value v3Out = mkStringValueOwned(r.printedStorePath);
+    std::vector<std::string> ctx{ r.opaqueContextElem };
+    setStringContextEntries(v3Out.payload.str, std::move(ctx));
     out = v3Out;
 }
 
@@ -10039,19 +9956,17 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
     static const SymbolId sRecursive = ir::globalInternSymbol("recursive");
     static const SymbolId sSha256    = ir::globalInternSymbol("sha256");
 
-    // path (required) — Tag::Path or Tag::String.
+    // path (required) — coerced like primPathNative (copyToStore=false),
+    // collecting context for the refs branch.
     const Value * pathRaw = src->lookup(sPath);
     if (!pathRaw)
         throw std::runtime_error(
             "v3 builtins.path (filtered): missing required `path` attribute");
-    Value pathV = forceValue(*state.vm, *pathRaw);
-    std::string pathStr;
-    if (pathV.isPath())        pathStr = pathV.payload.path ? pathV.payload.path : "";
-    else if (pathV.isString()) pathStr = pathV.payload.str ? pathV.payload.str : "";
-    else throw std::runtime_error(
-        "v3 builtins.path (filtered): `path` is not a path or string");
+    std::vector<std::string> pathCtx;
+    std::string pathStr =
+        toStringCoerceCtx(state, *pathRaw, pathCtx, /*copyPathsToStore=*/false);
 
-    // name (optional → baseName, resolved inside ffi::addPathFiltered when "").
+    // name (optional → baseName, resolved inside ffi::addPathFull when "").
     std::string name;
     if (auto * nameV = src->lookup(sName)) {
         Value f = forceValue(*state.vm, *nameV);
@@ -10090,7 +10005,9 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
 
     // Per-entry predicate: callClosure(filter, absPath)(type) -> Bool.  Runs
     // inside fetchToStore (nested v3 eval on the same VMState — STG-10).
-    auto v3filter = [&](const std::string & p, const std::string & type) -> bool {
+    // std::function (not auto) so its address binds to addPathFull's param.
+    std::function<bool(const std::string &, const std::string &)> v3filter =
+        [&](const std::string & p, const std::string & type) -> bool {
         Value r1 = callClosure(*state.vm, filterFn, mkStringValueOwned(p));
         Value r2 = callClosure(*state.vm, r1, mkStringValueOwned(type));
         r2 = forceValue(*state.vm, r2);
@@ -10102,7 +10019,7 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
     };
 
     ffi::FetchUrlResult r =
-        ffi::addPathFiltered(ns, pathStr, name, recursive, sha256, v3filter);
+        ffi::addPathFull(ns, pathStr, pathCtx, name, recursive, sha256, &v3filter);
     Value v3Out = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
     setStringContextEntries(v3Out.payload.str, std::move(ctx));

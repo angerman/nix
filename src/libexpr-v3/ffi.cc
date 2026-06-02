@@ -52,7 +52,8 @@
 #include "nix/util/logging.hh"             // warn (fetchTree pure-eval narHash path)
 #include "nix/util/url.hh"                 // fixGitURL
 #include "nix/util/url-parts.hh"           // revRegex (fetchMercurial rev/ref classify)
-#include "nix/util/file-system.hh"         // baseNameOf (fetchUrl name default)
+#include "nix/util/file-system.hh"         // baseNameOf (fetchUrl name default) + defaultPathFilter
+#include "nix/util/util.hh"                // rewriteStrings (addPathFull refs branch)
 #include "nix/fetchers/tarball.hh"         // downloadFile / downloadTarball (fetchUrl)
 #include "nix/store/store-open.hh"         // openStore (fetchClosure)
 #include "nix/store/store-reference.hh"    // StoreReference (fetchClosure)
@@ -412,36 +413,51 @@ FetchUrlResult fetchClosure(nix::EvalState & state, const std::string & fromStor
     }
 }
 
-FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPath,
+FetchUrlResult addPathFull(nix::EvalState & state,
+    const std::string & pathStr,
+    const std::vector<std::string> & contextElems,
     const std::string & name,
     bool recursive,
     const std::optional<std::string> & sha256,
-    const std::function<bool(const std::string &, const std::string &)> & v3filter)
+    const std::function<bool(const std::string &, const std::string &)> * v3filter)
 {
-    nix::SourcePath sp(state.rootFS, nix::CanonPath(srcPath));
-
-    std::string storeName = name.empty() ? std::string(sp.baseName()) : name;
+    // Verbatim transcription of TW's addPath (libexpr/primops.cc:2961) so the
+    // result is byte-for-byte identical, but driven entirely from plain data
+    // (no v3->TW value marshalling).  The `path` arg has already been coerced
+    // to a string + its context collected by the v3 caller.
+    nix::SourcePath path(state.rootFS, nix::CanonPath(pathStr));
+    std::string storeName = name.empty() ? std::string(path.baseName()) : name;
     nix::ContentAddressMethod method = recursive
         ? nix::ContentAddressMethod::Raw::NixArchive
         : nix::ContentAddressMethod::Raw::Flat;
+
+    nix::NixStringContext context;
+    for (auto & c : contextElems)
+        context.insert(nix::NixStringContextElem::parse(c));
+
+    std::optional<nix::Hash> expectedHash;
+    if (sha256)
+        expectedHash = nix::newHashAllowEmpty(*sha256, nix::HashAlgorithm::SHA256);
 
     auto opaqueResult = [&](const nix::StorePath & p) -> FetchUrlResult {
         return {state.store->printStorePath(p),
                 nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = p}}.to_string()};
     };
 
-    // sha256 → expected fixed-output path.  TW's addPath skips the dump
-    // entirely when the expected path is already valid, so the filter is
-    // never invoked in that case — reproduce that exactly for byte-equality.
-    std::optional<nix::Hash> expectedHash;
-    if (sha256) {
-        expectedHash = nix::newHashAllowEmpty(*sha256, nix::HashAlgorithm::SHA256);
-        nix::StorePath expected = state.store->makeFixedOutputPathFromCA(
-            storeName,
-            nix::ContentAddressWithReferences::fromParts(method, *expectedHash, {}));
-        if (state.store->isValidPath(expected)) {
-            state.allowPath(expected);
-            return opaqueResult(expected);
+    // The refs branch: an in-store path carrying context must have its
+    // context realised (build/rewrite CA-drv placeholders), then the
+    // referenced store path's references are recorded so addToStore CA-hashes
+    // them in (a different store path than a refs-less fetchToStore).
+    nix::StorePathSet refs;
+    if (path.accessor == state.rootFS
+        && state.store->isInStore(path.path.abs())
+        && !context.empty()) {
+        auto rewrites = state.realiseContext(context, nullptr, true, nix::noPos);
+        path = {path.accessor, nix::CanonPath(nix::rewriteStrings(path.path.abs(), rewrites))};
+        auto storePath = state.store->toStorePath(path.path.abs()).first;
+        try {
+            refs = state.store->queryPathInfo(storePath)->references;
+        } catch (nix::Error &) { // FIXME: should be InvalidPathError (matches TW)
         }
     }
 
@@ -460,32 +476,52 @@ FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPa
         return "unknown";
     };
 
-    // PathFilter: per entry, lstat for the type string (matches TW's
-    // callPathFilter), then call back into v3.  Runs inside fetchToStore.
-    nix::PathFilter filter = [&](const std::string & p) -> bool {
-        auto st = nix::SourcePath(sp.accessor, nix::CanonPath(p)).lstat();
-        return v3filter(p, fileType(st.type));
-    };
-
-    auto storePath = nix::fetchToStore(
-        state.fetchSettings, *state.store, sp.resolveSymlinks(),
-        nix::settings.readOnlyMode ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
-        storeName,
-        method,
-        &filter, state.repair);
-    state.allowPath(storePath);
-
-    // Verify against the expected path when sha256 was supplied (mirrors
-    // primPathNative / TW addPath's post-fetch check).
-    if (expectedHash) {
-        nix::StorePath expected = state.store->makeFixedOutputPathFromCA(
-            storeName,
-            nix::ContentAddressWithReferences::fromParts(method, *expectedHash, {}));
-        if (expected != storePath)
-            throw nix::Error("store path mismatch in path added from '%s'", srcPath);
+    // Per-entry PathFilter (null when no v3 filter): lstat for the type
+    // string (matches TW's callPathFilter), then call back into v3.
+    std::optional<nix::PathFilter> filter;
+    if (v3filter) {
+        filter.emplace([&](const std::string & p) -> bool {
+            auto st = nix::SourcePath(path.accessor, nix::CanonPath(p)).lstat();
+            return (*v3filter)(p, fileType(st.type));
+        });
     }
 
-    return opaqueResult(storePath);
+    std::optional<nix::StorePath> expectedStorePath;
+    if (expectedHash)
+        expectedStorePath = state.store->makeFixedOutputPathFromCA(
+            storeName,
+            nix::ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
+
+    nix::StorePath dstPath = [&]() -> nix::StorePath {
+        if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
+            // FIXME: support refs in fetchToStore() (matches TW comment).
+            nix::StorePath p = refs.empty()
+                ? nix::fetchToStore(
+                      state.fetchSettings, *state.store, path.resolveSymlinks(),
+                      nix::settings.readOnlyMode ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
+                      storeName, method, filter ? &*filter : nullptr, state.repair)
+                : state.store->addToStore(
+                      storeName, path.resolveSymlinks(), method, nix::HashAlgorithm::SHA256,
+                      refs, filter ? *filter : nix::defaultPathFilter, state.repair);
+            if (expectedHash && expectedStorePath != p)
+                throw nix::Error("store path mismatch in (possibly filtered) path added from '%s'", pathStr);
+            return p;
+        }
+        return *expectedStorePath;
+    }();
+
+    state.allowPath(dstPath);
+    return opaqueResult(dstPath);
+}
+
+// filterSource leaf: no context, with filter.  Delegates to addPathFull.
+FetchUrlResult addPathFiltered(nix::EvalState & state, const std::string & srcPath,
+    const std::string & name,
+    bool recursive,
+    const std::optional<std::string> & sha256,
+    const std::function<bool(const std::string &, const std::string &)> & v3filter)
+{
+    return addPathFull(state, srcPath, /*contextElems=*/{}, name, recursive, sha256, &v3filter);
 }
 
 FetchUrlResult fetchUrl(nix::EvalState & state, const std::string & urlArg,
