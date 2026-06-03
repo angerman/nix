@@ -1452,15 +1452,21 @@ static void runEvacuation(VMState & vm, Arena & arena,
         //                     matches the crash — e.g. Closure.capturedWiths
         //                     — is the corroborating signal.)
         size_t liveDangling = 0, unmarkedDangling = 0;
+        size_t markedMoved = 0, markedSurvivor = 0;  // MARKED holder: forward-key (stale moved-from copy) vs genuine survivor
         std::unordered_map<const char *, size_t> fieldHist, fieldHistUnmarked;
         auto note = [&](const char * field, const void * cell) {
             const bool marked = vmark.isMarked(cell);
+            const bool moved = ev.forward.count(const_cast<void *>(cell)) != 0;
             size_t n;
-            if (marked) { n = ++liveDangling; ++fieldHist[field]; }
+            if (marked) {
+                n = ++liveDangling; ++fieldHist[field];
+                if (moved) ++markedMoved; else ++markedSurvivor;
+            }
             else        { n = ++unmarkedDangling; ++fieldHistUnmarked[field]; }
             if (n <= 16)
-                std::fprintf(stderr, "  evac-brute %s dangle %zu: %s @cell %p\n",
-                             marked ? "MARKED" : "UNMARKED", n, field, cell);
+                std::fprintf(stderr, "  evac-brute %s%s dangle %zu: %s @cell %p\n",
+                             marked ? "MARKED" : "UNMARKED",
+                             (marked && moved) ? "(moved-from)" : "", n, field, cell);
         };
         const auto & csb = arena.cellStartBitmaps();
         auto ranges = arena.blockRanges();
@@ -1532,8 +1538,9 @@ static void runEvacuation(VMState & vm, Arena & arena,
             }
         }
         std::fprintf(stderr,
-            "v3 evac-brute TYPED: MARKED(walk-gap)=%zu  UNMARKED(missing-root)=%zu\n",
-            liveDangling, unmarkedDangling);
+            "v3 evac-brute TYPED: MARKED(live-dangle)=%zu [moved-from=%zu survivor=%zu]  "
+            "UNMARKED(missing-root/dead)=%zu\n",
+            liveDangling, markedMoved, markedSurvivor, unmarkedDangling);
         std::fprintf(stderr, "  -- MARKED holders (walk gap) --\n");
         for (auto & [k, c] : fieldHist)
             std::fprintf(stderr, "    %-26s %zu\n", k, c);
