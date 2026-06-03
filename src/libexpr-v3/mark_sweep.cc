@@ -1381,11 +1381,14 @@ static void runEvacuation(VMState & vm, Arena & arena,
     vverify.setTypedInteriorOwners(true);
     walkAllV3Roots(vm, vverify);
     vverify.drain();
-    // NOTE: no drainConservative here.  With Tag::Slot pointers rewritten
-    // by evac, every interior reference now targets a dest cell that the
-    // precise walk already covers via its typed pointer; the conservative
-    // interior-owner byte-scan would only re-chase the (now-unreferenced)
-    // old graph — the source of the 98 s verify + false candidate pins.
+    // NOTE: no drainConservative here.  TESTED 2026-06-03: draining it
+    // makes MARKED dangles WORSE (5418 -> 21157/70262), because the
+    // limiting factor is EVAC's *rewriting* coverage, not the verify's
+    // *marking* — every extra cell the verify reaches that EVAC did NOT
+    // rewrite becomes another dangle.  The real fix is on the EVAC side
+    // (pin transitively-conservative cells instead of moving them), not
+    // here.  With Tag::Slot pointers rewritten by evac the precise +
+    // typed-interior-owner walk already covers the rewritten graph.
     auto tc2 = eclock::now();
 
     // BRUTE AUDIT (R2.4d, NIX_V3_EVAC_BRUTE=1): before freeing, scan every
