@@ -1355,7 +1355,14 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // old graph — the source of the 98 s verify + false candidate pins.
     auto tc2 = eclock::now();
 
+    // DIAGNOSTIC (R2.4d): NIX_V3_EVAC_NO_FREE=1 does move+rewrite but skips
+    // the munmap.  If a workload is correct under NO_FREE but wrong with
+    // freeing, the bug is a munmap-dangle (a still-referenced block freed =
+    // missed root the precise verify didn't catch); if wrong under both,
+    // the bug is in the move/rewrite (data corruption).  Isolates M5's bug.
+    static const bool s_evacNoFree = std::getenv("NIX_V3_EVAC_NO_FREE") != nullptr;
     size_t freedBlocks = 0;
+    if (!s_evacNoFree)
     for (auto & [start, end] : cands) {
         if (!vmark.anyMarkInRange(start, 0, Arena::kBlockSize)) {
             if (arena.freeWholeBlock(start) > 0) ++freedBlocks;
