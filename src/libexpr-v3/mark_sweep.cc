@@ -305,8 +305,36 @@ public:
             const char * owner =
                 arenaSetForSlot_->findContainingCellStart(p);
             if (owner) {
-                markConservative(
-                    const_cast<char *>(owner));
+                char * o = const_cast<char *>(owner);
+                // Lever 3 (R2.4d): if the owner's type is known (R2.1'
+                // metadata), mark+walk it PRECISELY at its exact pointer
+                // fields (via the typed worklist) instead of the O(bytes)
+                // conservative byte-scan in drainConservative — which was
+                // 153 s / 4.3 B words on HNE cycle2 (byte-scanning huge
+                // Bindings reached via interior Tag::Slot pointers).  This
+                // is ALSO more precise (no false-positive marks).  Fall
+                // back to conservative only for unstamped owners.
+                //
+                // ONLY for the SWEEP's mark (typedInteriorOwners_=true):
+                // the evac VERIFY must NOT owner-walk — it already pins a
+                // candidate via the slot-TARGET mark above; owner-walking
+                // there marks the owner's other entries and falsely pins
+                // candidates (blocksFreed→0).  Verify keeps the deferred-
+                // conservative path (a no-op there since verify doesn't
+                // call drainConservative).
+                if (!typedInteriorOwners_) markConservative(o);
+                else switch (arenaSetForSlot_->cellTypeAt(owner)) {
+                case CellType::Bindings: { Bindings * b = reinterpret_cast<Bindings *>(o); visitBindings(b); break; }
+                case CellType::Closure:  { Closure  * c = reinterpret_cast<Closure  *>(o); visitClosure(c);  break; }
+                case CellType::Thunk:    { Thunk    * t = reinterpret_cast<Thunk    *>(o); visitThunk(t);    break; }
+                case CellType::List:     { ListVec  * l = reinterpret_cast<ListVec  *>(o); visitList(l);     break; }
+                case CellType::Pair:     { ValuePair * pr = reinterpret_cast<ValuePair *>(o); visitPair(pr); break; }
+                case CellType::Value:
+                case CellType::Env:
+                case CellType::Chars:
+                case CellType::None:
+                    markConservative(o); break;  // unstamped → fallback
+                }
             }
         }
     }
@@ -315,6 +343,8 @@ public:
     /// identify interior slot targets.  Must be called BEFORE the
     /// root walk.
     void setArena(Arena & a) noexcept { arenaSetForSlot_ = &a; }
+    // Lever 3 (R2.4d): enable typed interior-owner walk (mark only).
+    void setTypedInteriorOwners(bool b) noexcept { typedInteriorOwners_ = b; }
     void visitString(const char * & s) noexcept override
     {
         if (!s) return;
@@ -472,6 +502,7 @@ private:
     size_t statsConservativeWalks_ = 0;
     std::vector<void *> conservativeRoots_;
     Arena * arenaSetForSlot_ = nullptr;
+    bool typedInteriorOwners_ = false;  // Lever 3: mark-only typed walk
 
     void walkClosure(Closure * c) noexcept
     {
@@ -1345,8 +1376,11 @@ void runMajorMarkSweep(VMState & vm) noexcept
     BitmapMarker marker(arena);
     MarkVisitor visitor(marker);
     visitor.setArena(arena);  // for visitSlot interior-owner discovery
+    visitor.setTypedInteriorOwners(true);  // Lever 3: fast mark (not verify)
+    const auto tm0 = clock::now();
     walkAllV3Roots(vm, visitor);
     visitor.drain();
+    const auto tm1 = clock::now();
 
     // Phase 3.5 follow-up: drain conservative roots accumulated from
     // visitSlot's interior-owner discovery during precise mark.
@@ -1355,6 +1389,7 @@ void runMajorMarkSweep(VMState & vm) noexcept
         arena.activeBounds(arenaMin, arenaMax);
         visitor.drainConservative(arena, arenaMin, arenaMax);
     }
+    const auto tm2 = clock::now();
 
     // R2.4a (2026-06-02): evacuation safety precondition.  Cells
     // reachable by the PRECISE walk (above) hold rewritable slots, so
@@ -1384,6 +1419,15 @@ void runMajorMarkSweep(VMState & vm) noexcept
         marker.markedCells() - preciseMarkedCells;
 
     const auto tMarkEnd = clock::now();
+    {
+        auto ms = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::fprintf(stderr,
+            "v3 mark-split: preciseWalk=%.0fms drainConservative=%.0fms "
+            "cStackConservative=%.0fms\n",
+            ms(tm0, tm1), ms(tm1, tm2), ms(tm2, tMarkEnd));
+    }
 
     // -- Phase 2 step 2: sweep (measurement-only; no free yet) ------
     SweepStats sweep;
