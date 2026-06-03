@@ -1428,15 +1428,29 @@ static void runEvacuation(VMState & vm, Arena & arena,
             }
             return false;
         };
-        // TYPED scan: only LIVE (verify-marked) cells, only their KNOWN
-        // pointer fields → pinpoints the exact un-rewritten field.
-        size_t liveDangling = 0;
-        std::unordered_map<const char *, size_t> fieldHist;
+        // TYPED scan over ALL cells (marked AND unmarked) in surviving
+        // blocks, only their KNOWN pointer fields → pinpoints the exact
+        // un-rewritten field AND classifies the holder:
+        //   MARKED holder   = verify reached it, but the mark/move walk of
+        //                     that type missed a field (a WALK GAP).
+        //   UNMARKED holder = the holder is live via a root absent from
+        //                     walkAllV3Roots (a MISSING ROOT) — it survives
+        //                     only because its block is non-candidate; the
+        //                     verify never marked it so its referenced
+        //                     candidate got freed.  (Some unmarked holders
+        //                     are genuine dead garbage; a field type that
+        //                     matches the crash — e.g. Closure.capturedWiths
+        //                     — is the corroborating signal.)
+        size_t liveDangling = 0, unmarkedDangling = 0;
+        std::unordered_map<const char *, size_t> fieldHist, fieldHistUnmarked;
         auto note = [&](const char * field, const void * cell) {
-            ++liveDangling; ++fieldHist[field];
-            if (liveDangling <= 16)
-                std::fprintf(stderr, "  evac-brute LIVE dangle %zu: %s @cell %p\n",
-                             liveDangling, field, cell);
+            const bool marked = vmark.isMarked(cell);
+            size_t n;
+            if (marked) { n = ++liveDangling; ++fieldHist[field]; }
+            else        { n = ++unmarkedDangling; ++fieldHistUnmarked[field]; }
+            if (n <= 16)
+                std::fprintf(stderr, "  evac-brute %s dangle %zu: %s @cell %p\n",
+                             marked ? "MARKED" : "UNMARKED", n, field, cell);
         };
         const auto & csb = arena.cellStartBitmaps();
         auto ranges = arena.blockRanges();
@@ -1452,7 +1466,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
                     const size_t off = (wi * 64 + size_t(bit)) * 16;
                     if (off >= used) continue;
                     const char * cs = b + off;
-                    if (!vmark.isMarked(cs)) continue;  // LIVE cells only
+                    // NB: scan marked AND unmarked (note() classifies).
                     switch (arena.cellTypeAt(cs)) {
                     case CellType::Bindings: {
                         auto * bn = reinterpret_cast<const Bindings *>(cs);
@@ -1508,8 +1522,13 @@ static void runEvacuation(VMState & vm, Arena & arena,
             }
         }
         std::fprintf(stderr,
-            "v3 evac-brute TYPED: liveCellsWithDanglingField=%zu\n", liveDangling);
+            "v3 evac-brute TYPED: MARKED(walk-gap)=%zu  UNMARKED(missing-root)=%zu\n",
+            liveDangling, unmarkedDangling);
+        std::fprintf(stderr, "  -- MARKED holders (walk gap) --\n");
         for (auto & [k, c] : fieldHist)
+            std::fprintf(stderr, "    %-26s %zu\n", k, c);
+        std::fprintf(stderr, "  -- UNMARKED holders (missing root / dead) --\n");
+        for (auto & [k, c] : fieldHistUnmarked)
             std::fprintf(stderr, "    %-26s %zu\n", k, c);
     }
 
