@@ -819,15 +819,20 @@ inline size_t sizeToFreeListBin(size_t bytes) noexcept
 // ---------------------------------------------------------------------------
 
 namespace detail {
-/// Arena deregistration gate.  Read once at first call;
-/// thereafter a cached load.  NIX_V3_ARENA_NOROOT=1 opts out of
-/// arena Boehm-root registration; see ARENA_DEREGISTRATION_DESIGN
-/// _2026-05-27.md.  Default OFF (status quo arena-registered)
-/// for safety until the bridge-root registry has soaked.
+/// Arena deregistration gate.  Read once at first call; thereafter a
+/// cached load.  DEFAULT-ON 2026-06-04 (no-Boehm goal): the arena is NOT
+/// registered as a Boehm root region — v3 cells are collected by v3's own
+/// major GC, not Boehm, and no arena cell holds the SOLE reference to a
+/// Boehm object (F4 deleted the bridge apparatus; v3 creates no Tag::
+/// External arena cells; TW-side nix::Value stays alive via TW's own Boehm
+/// roots).  Empirically safe: hello/HNE/M5 byte-equal under
+/// MAJOR_GC + ARENA_NOROOT.  Opt OUT (re-register with Boehm) via
+/// NIX_V3_ARENA_ROOT=1.  RETIREMENT: drop the opt-out once a daemon-soak
+/// confirms no arena->Boehm sole-reference regresses across a release.
 inline bool arenaNorootEnabledImpl() noexcept
 {
     static const bool s_v =
-        std::getenv("NIX_V3_ARENA_NOROOT") != nullptr;
+        std::getenv("NIX_V3_ARENA_ROOT") == nullptr;
     return s_v;
 }
 }
@@ -837,13 +842,20 @@ inline bool arenaNorootEnabledImpl() noexcept
 }
 
 namespace detail {
-/// Stage 6 Phase 2: cache `NIX_V3_MAJOR_GC=1` gate.  Read once at
-/// startup; thereafter a cached `static const bool`.  Allocator's
-/// cell-start bookkeeping is conditional on this; when gate OFF,
-/// no bitmap memory + no per-alloc branch overhead beyond the
-/// well-predicted single read.
+/// Stage 6 Phase 2: major-GC gate.  Read once at startup; thereafter a
+/// cached `static const bool`.  Allocator's cell-start + cell-type + line
+/// bookkeeping is conditional on this.  DEFAULT-ON 2026-06-04 (no-Boehm
+/// goal): v3 self-collects its arena via the non-moving major mark-sweep
+/// (5 precise global roots + huge-cell typing + conservative C-stack net)
+/// — CORRECT + fast on hello/HNE/M5 (M5 mark 11.6 s, byte-equal).  This is
+/// the v3-owned replacement for relying on Boehm to bound v3-cell growth.
+/// Opt OUT via NIX_V3_NO_MAJOR_GC=1 (reverts to no v3 collection — arena
+/// grows unbounded, as before).  Cost when ON: per-alloc cell-start bit +
+/// type stamp + per-block bitmap memory; the mark/sweep pause at the
+/// NIX_V3_MAJOR_GC_THRESHOLD_MB (256 MB default) boundary.  RETIREMENT:
+/// remove the opt-out once default-ON has soaked across a release.
 inline const bool g_majorGcEnabled =
-    std::getenv("NIX_V3_MAJOR_GC") != nullptr;
+    std::getenv("NIX_V3_NO_MAJOR_GC") == nullptr;
 } // namespace detail
 
 /// R2.1′ (2026-06-03): per-cell TYPE metadata for Nofl-style evacuation.

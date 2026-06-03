@@ -2841,9 +2841,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         // Trigger logic + dynamic threshold + nested-VMState defer
         // retained from Day 4 Cheney work (per GC_DESIGN_POST_CHENEY
         // §4.6 "what survives from the Cheney work").
-        static const bool s_majorGcEnabled =
-            std::getenv("NIX_V3_MAJOR_GC") != nullptr;
-        if (__builtin_expect(s_majorGcEnabled, 0)) [[unlikely]] {
+        // Single source of truth: the centralized major-GC gate
+        // (alloc.hh g_majorGcEnabled) — DEFAULT-ON 2026-06-04 (no-Boehm).
+        // Previously a separate getenv here left the bookkeeping ON but
+        // the TRIGGER OFF when only alloc.hh's default flipped.
+        const bool s_majorGcEnabled = Arena::majorGcEnabled();
+        if (s_majorGcEnabled) {
             static const size_t s_majorGcInitialThresholdBytes = [] {
                 const char * v =
                     std::getenv("NIX_V3_MAJOR_GC_THRESHOLD_MB");

@@ -440,8 +440,12 @@ public:
                            uintptr_t arenaMin,
                            uintptr_t arenaMax) noexcept
     {
-        // Snapshot — drainConservative_ may grow during the walk.
-        while (!conservativeRoots_.empty()) {
+        // Fixed-point over BOTH the typed worklist and the conservative
+        // roots: a typed-walk below pushes children to worklist_, and a
+        // byte-scan pushes more conservativeRoots_.
+        for (;;) {
+            drain();  // typed worklist (precise walks)
+            if (conservativeRoots_.empty()) break;
             void * p = conservativeRoots_.back();
             conservativeRoots_.pop_back();
             // Find the containing cell start.  `p` may be at a
@@ -449,6 +453,28 @@ public:
             // the nearest cell-start at or below `p`.
             const char * cellStart = arena.findContainingCellStart(p);
             if (!cellStart) continue;
+            // R2.4d (2026-06-04): if the owning cell is TYPED (R2.1'
+            // metadata — now including huge ≥4 MB cells), TYPED-walk its
+            // exact pointer fields instead of an O(bytes) conservative
+            // byte-scan.  Byte-scanning a huge (>4 MB, 170k-entry)
+            // Bindings reached via a C-stack pointer was the conservative
+            // drain's 2236 s / 7.4e9-word blow-up on M5 (flaky multi-
+            // minute mark pauses → wall-time timeouts under default-ON GC).
+            // Only genuinely-untyped cells (Value/Env/Chars/None) still
+            // need the byte-scan; those are small.
+            char * cs = const_cast<char *>(cellStart);
+            switch (arena.cellTypeAt(cellStart)) {
+            case CellType::Bindings: walkBindings(reinterpret_cast<Bindings *>(cs)); continue;
+            case CellType::Closure:  walkClosure(reinterpret_cast<Closure *>(cs));   continue;
+            case CellType::Thunk:    walkThunk(reinterpret_cast<Thunk *>(cs));       continue;
+            case CellType::List:     walkList(reinterpret_cast<ListVec *>(cs));      continue;
+            case CellType::Pair:     walkPair(reinterpret_cast<ValuePair *>(cs));    continue;
+            case CellType::Value:
+            case CellType::Env:
+            case CellType::Chars:
+            case CellType::None:
+                break;  // unknown layout → conservative byte-scan below
+            }
             const char * cellEnd =
                 arena.findNextCellStartOrBlockEnd(cellStart);
             if (!cellEnd || cellEnd <= cellStart) continue;
