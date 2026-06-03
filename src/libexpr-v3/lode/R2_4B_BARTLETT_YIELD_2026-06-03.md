@@ -39,7 +39,10 @@ chasing old graph (98s verify); unmoved Chars pinning every block.
 |---|---|---|---|---|---|
 | hello.drvPath | pct=0.25 | 4 blocks / **67 MB** (1 cycle) | 824 (peak neutral — single cycle, free AFTER peak) | 712 baseline | byte-equal ✓ |
 | git.drvPath | pct=0.25 | (frees) | — | — | byte-equal ✓ |
-| HNE | pct=0.25 | cycle2: 23 blocks / **386 MB** | **2135** | **2434 → −300 MB (−12%)** | (timed out — wall) |
+| HNE | pct=0.25 | cycle2: 25 blocks / **419 MB** (move 2.3s) | **2151** | **2434 → −283 MB (−12%)** | **byte-equal ✓** (completed) |
+
+(An earlier HNE evac run timed out at 270s — variance/contention; with a
+larger budget it completes in minutes, byte-identical, arena 1660→1325 MB.)
 
 **Evacuation yields real RSS reduction on multi-cycle workloads**: HNE peak
 2434 → 2135 MB (−12%), freeing 386 MB (23 sparse blocks) in one cycle for
