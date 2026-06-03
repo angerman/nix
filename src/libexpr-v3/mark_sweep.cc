@@ -1318,13 +1318,58 @@ static void runEvacuation(VMState & vm, Arena & arena,
         return it != pins.end() && it->first < b + Arena::kBlockSize;
     };
 
+    // TRANSITIVE CONSERVATIVE PIN (R2.4d soundness, 2026-06-03).
+    // The C-stack direct pins are AMBIGUOUS roots: their pointers live in
+    // C-locals/registers we cannot rewrite.  Per mostly-copying GC
+    // correctness, NO cell reachable from an ambiguous root may be moved
+    // OR freed — moving it would dangle the un-rewritable C-pointer, and
+    // freeing a cell it transitively reaches dangles a pointer a C-local
+    // still needs across the GC (this is M5's bug: tcCallee->capturedWiths
+    // — tcCallee is a dispatchLoop C-local, capturedWiths reached via its
+    // precise field, freed because nothing in the PRECISE verify marked
+    // it).  Mark the TRANSITIVE closure of the direct pins (typed walk via
+    // R2.1' metadata) and exclude every block holding a conservatively-
+    // reachable cell from the candidate set.  EVAC then moves ONLY cells
+    // reachable purely via precise VM roots — all of whose references it
+    // CAN rewrite — which is the sound subset.  Cost: yield (more blocks
+    // pinned); correctness first.
+    BitmapMarker consMark(arena);
+    MarkVisitor consWalk(consMark);
+    consWalk.setArena(arena);
+    consWalk.setTypedInteriorOwners(true);
+    for (auto & [owner, ty] : pins) {
+        char * o = const_cast<char *>(owner);
+        switch (ty) {
+        case CellType::Closure:  { Closure   * c = reinterpret_cast<Closure   *>(o); consWalk.visitClosure(c);  break; }
+        case CellType::Thunk:    { Thunk     * t = reinterpret_cast<Thunk     *>(o); consWalk.visitThunk(t);    break; }
+        case CellType::Bindings: { Bindings  * b = reinterpret_cast<Bindings  *>(o); consWalk.visitBindings(b); break; }
+        case CellType::List:     { ListVec   * l = reinterpret_cast<ListVec   *>(o); consWalk.visitList(l);     break; }
+        case CellType::Pair:     { ValuePair * p = reinterpret_cast<ValuePair *>(o); consWalk.visitPair(p);     break; }
+        case CellType::Value:    { Value     * v = reinterpret_cast<Value     *>(o); consWalk.visitSlot(v);     break; }
+        case CellType::None:
+        case CellType::Env:
+        case CellType::Chars:
+            // Unknown layout: we can't typed-walk it.  Its block is still
+            // excluded via blockHasPin (it holds a direct pin); we just
+            // cannot follow its fields.  Conservative byte-scan would be
+            // needed for full soundness on None-typed pinned owners; M5's
+            // pinned owners are typed (huge cells aren't C-stack pinned).
+            break;
+        }
+    }
+    consWalk.drain();
+
     // Candidate set = sparse regular blocks (< s_evacPct live) with no
-    // directly-pinned cell, as sorted [start, start+kBlockSize) ranges.
+    // directly-pinned cell AND no conservatively-reachable cell, as sorted
+    // [start, start+kBlockSize) ranges.
     std::vector<std::pair<const char *, const char *>> cands;
-    size_t pinnedByCStack = 0;
+    size_t pinnedByCStack = 0, pinnedByConsClosure = 0;
     for (auto & [blk, dens] : sweep.blockDensities) {
         if (dens >= s_evacPct) continue;
         if (blockHasPin(blk)) { ++pinnedByCStack; continue; }
+        if (consMark.anyMarkInRange(blk, 0, Arena::kBlockSize)) {
+            ++pinnedByConsClosure; continue;  // transitive conservative pin
+        }
         cands.emplace_back(blk, blk + Arena::kBlockSize);
     }
     if (cands.empty()) {
@@ -1608,10 +1653,11 @@ static void runEvacuation(VMState & vm, Arena & arena,
     };
 
     std::fprintf(stderr,
-        "v3 evac: candidates=%zu pins=%zu pinnedBlocks=%zu movedCells=%zu "
-        "movedBytes=%.1fMB blocksFreed=%zu freedRSS=%.1fMB "
+        "v3 evac: candidates=%zu pins=%zu pinnedBlocks=%zu consClosureBlocks=%zu "
+        "movedCells=%zu movedBytes=%.1fMB blocksFreed=%zu freedRSS=%.1fMB "
         "[move=%.0fms verify=%.0fms munmap=%.0fms]\n",
-        cands.size(), pins.size(), pinnedByCStack, ev.movedCells,
+        cands.size(), pins.size(), pinnedByCStack, pinnedByConsClosure,
+        ev.movedCells,
         double(ev.movedBytes) / 1e6, freedBlocks,
         double(freedBlocks) * double(Arena::kBlockSize) / 1e6,
         ms(tc0, tc1), ms(tc1, tc2), ms(tc2, tc3));
