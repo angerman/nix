@@ -1304,10 +1304,23 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // new copy.  This is the standard conservative-stack moving technique
     // (Bartlett 1988); the R2.1′ type metadata lets us typed-walk the
     // pinned cells to rewrite their fields.
+    // EXPERIMENT (R2.4d, 2026-06-03): NIX_V3_EVAC_PRECISE_ONLY=1 skips ALL
+    // conservative C-stack pinning.  The major GC fires only at
+    // exitDepth==0 with nested-VMState defer, and the dispatch loop syncs
+    // cu/closure/ip to the frame + re-reads them after GC — so at the
+    // safepoint the working set MAY be fully covered by the precise roots
+    // (walkAllV3Roots).  If so, pure-precise evacuation is sound AND
+    // full-yield (no conservative over-pinning).  This gate tests that
+    // hypothesis: correct under PRECISE_ONLY => drop the conservative scan;
+    // crash => genuine conservative-only refs exist at the safepoint.
+    static const bool s_preciseOnly =
+        std::getenv("NIX_V3_EVAC_PRECISE_ONLY") != nullptr;
     std::vector<std::pair<const char *, CellType>> pins;
-    { char anchor = 0; collectCStackDirectPins(arena, &anchor, pins); }
-    std::sort(pins.begin(), pins.end());
-    pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
+    if (!s_preciseOnly) {
+        char anchor = 0; collectCStackDirectPins(arena, &anchor, pins);
+        std::sort(pins.begin(), pins.end());
+        pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
+    }
 
     // A candidate block must contain NO directly-pinned cell.  pins are
     // sorted by address; lower_bound finds the first pin >= block start.
@@ -1334,41 +1347,46 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // CAN rewrite — which is the sound subset.  Cost: yield (more blocks
     // pinned); correctness first.
     BitmapMarker consMark(arena);
-    MarkVisitor consWalk(consMark);
-    consWalk.setArena(arena);
-    consWalk.setTypedInteriorOwners(true);
-    for (auto & [owner, ty] : pins) {
-        char * o = const_cast<char *>(owner);
-        switch (ty) {
-        case CellType::Closure:  { Closure   * c = reinterpret_cast<Closure   *>(o); consWalk.visitClosure(c);  break; }
-        case CellType::Thunk:    { Thunk     * t = reinterpret_cast<Thunk     *>(o); consWalk.visitThunk(t);    break; }
-        case CellType::Bindings: { Bindings  * b = reinterpret_cast<Bindings  *>(o); consWalk.visitBindings(b); break; }
-        case CellType::List:     { ListVec   * l = reinterpret_cast<ListVec   *>(o); consWalk.visitList(l);     break; }
-        case CellType::Pair:     { ValuePair * p = reinterpret_cast<ValuePair *>(o); consWalk.visitPair(p);     break; }
-        case CellType::Value:    { Value     * v = reinterpret_cast<Value     *>(o); consWalk.visitSlot(v);     break; }
-        case CellType::None:
-        case CellType::Env:
-        case CellType::Chars:
-            // Unknown layout: we can't typed-walk it.  Its block is still
-            // excluded via blockHasPin (it holds a direct pin); we just
-            // cannot follow its fields.  Conservative byte-scan would be
-            // needed for full soundness on None-typed pinned owners; M5's
-            // pinned owners are typed (huge cells aren't C-stack pinned).
-            break;
+    if (!s_preciseOnly) {
+        MarkVisitor consWalk(consMark);
+        consWalk.setArena(arena);
+        consWalk.setTypedInteriorOwners(true);
+        for (auto & [owner, ty] : pins) {
+            char * o = const_cast<char *>(owner);
+            switch (ty) {
+            case CellType::Closure:  { Closure   * c = reinterpret_cast<Closure   *>(o); consWalk.visitClosure(c);  break; }
+            case CellType::Thunk:    { Thunk     * t = reinterpret_cast<Thunk     *>(o); consWalk.visitThunk(t);    break; }
+            case CellType::Bindings: { Bindings  * b = reinterpret_cast<Bindings  *>(o); consWalk.visitBindings(b); break; }
+            case CellType::List:     { ListVec   * l = reinterpret_cast<ListVec   *>(o); consWalk.visitList(l);     break; }
+            case CellType::Pair:     { ValuePair * p = reinterpret_cast<ValuePair *>(o); consWalk.visitPair(p);     break; }
+            case CellType::Value:    { Value     * v = reinterpret_cast<Value     *>(o); consWalk.visitSlot(v);     break; }
+            case CellType::None:
+            case CellType::Env:
+            case CellType::Chars:
+                // Unknown layout: we can't typed-walk it.  Its block is still
+                // excluded via blockHasPin (it holds a direct pin); we just
+                // cannot follow its fields.  Conservative byte-scan would be
+                // needed for full soundness on None-typed pinned owners; M5's
+                // pinned owners are typed (huge cells aren't C-stack pinned).
+                break;
+            }
         }
+        consWalk.drain();
     }
-    consWalk.drain();
 
     // Candidate set = sparse regular blocks (< s_evacPct live) with no
     // directly-pinned cell AND no conservatively-reachable cell, as sorted
-    // [start, start+kBlockSize) ranges.
+    // [start, start+kBlockSize) ranges.  Under PRECISE_ONLY both checks are
+    // skipped (no pins, empty consMark) → every sparse block is a candidate.
     std::vector<std::pair<const char *, const char *>> cands;
     size_t pinnedByCStack = 0, pinnedByConsClosure = 0;
     for (auto & [blk, dens] : sweep.blockDensities) {
         if (dens >= s_evacPct) continue;
-        if (blockHasPin(blk)) { ++pinnedByCStack; continue; }
-        if (consMark.anyMarkInRange(blk, 0, Arena::kBlockSize)) {
-            ++pinnedByConsClosure; continue;  // transitive conservative pin
+        if (!s_preciseOnly) {
+            if (blockHasPin(blk)) { ++pinnedByCStack; continue; }
+            if (consMark.anyMarkInRange(blk, 0, Arena::kBlockSize)) {
+                ++pinnedByConsClosure; continue;  // transitive conservative pin
+            }
         }
         cands.emplace_back(blk, blk + Arena::kBlockSize);
     }
