@@ -20,7 +20,9 @@
 #include "v3/vm.hh"
 #include "v3/barrier.hh"
 #include "v3/primop.hh"            // walkV3BridgeRoots, walkImportCacheRoots
-#include "v3/bytecode_primops.hh"  // #705: walkBytecodePrimopRoots
+#include "v3/bytecode_primops.hh"  // #705: walkBytecodePrimopRoots, walkBuiltinsRoot
+#include "v3/gc.hh"                // walkCallFlakeRoot
+#include "v3/print.hh"             // walkDeepForceRoots
 #include "v3/gc_root.hh"           // Stage 5: walkCppStackRoots
 
 #include <cstdio>
@@ -149,19 +151,24 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
         walkImportCacheRoots(adapter);
     }
 
-    // -- Bytecode-primop replacement map (#705) --------------------
-    // primopReplacementMap (bytecode_primops.cc) holds a live Value per
-    // replaced primop (e.g. addErrorContext) — typically a Closure with
-    // its own capturedWiths + upvalues.  The NURSERY scavenger already
-    // walks this (gc.cc); the MAJOR-GC precise walk did NOT — so under
-    // evacuation those closures' captured-with ListVecs were moved/freed
-    // with nothing rewriting the map's stale pointer, dangling at the next
-    // primop dispatch (M5: the tcCallee->capturedWiths SIGSEGV under
-    // builtins.addErrorContext — a replaced primop).  Walk it here too.
+    // -- Global root sources the NURSERY walks but the MAJOR GC did NOT --
+    // (parity audit 2026-06-03).  Each holds live v3 Value handles that
+    // survive across collections; without walking them the major GC's
+    // mark would sweep them (non-moving) or evacuation would relocate
+    // their referents without rewriting the holder (moving) → dangle.
+    //   * walkBytecodePrimopRoots — primopReplacementMap closures (e.g.
+    //     addErrorContext); the M5 tcCallee->capturedWiths SIGSEGV.
+    //   * walkBuiltinsRoot        — the `builtins` attrset root.
+    //   * walkCallFlakeRoot       — callFlake intermediate Values
+    //     (DIRECTLY relevant to M5 = getFlake cardano-node).
+    //   * walkDeepForceRoots      — deepForce traversal temporaries.
     {
         std::function<void(Value &)> adapter =
             [&visitor](Value & v) { visitor.visitValue(v); };
         walkBytecodePrimopRoots(adapter);
+        walkBuiltinsRoot(adapter);
+        walkCallFlakeRoot(adapter);
+        walkDeepForceRoots(adapter);
     }
 
     // -- Stage 5: C++-stack roots (sub-source 8) -------------------
@@ -209,12 +216,16 @@ void walkGlobalV3Roots(RootVisitor & visitor) noexcept
     walkCppStackRoots(visitor);
     // FFI bridge tables — v3 Value handles indexed by TW.
     // (bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
-    // primImport result cache + bytecode-primop replacement map (#705).
+    // primImport cache + the global root sources the nursery walks
+    // (parity with walkAllV3Roots; see there for rationale).
     {
         std::function<void(Value &)> adapter =
             [&visitor](Value & v) { visitor.visitValue(v); };
         walkImportCacheRoots(adapter);
         walkBytecodePrimopRoots(adapter);
+        walkBuiltinsRoot(adapter);
+        walkCallFlakeRoot(adapter);
+        walkDeepForceRoots(adapter);
     }
 }
 

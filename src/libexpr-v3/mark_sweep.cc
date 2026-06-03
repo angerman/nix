@@ -1113,10 +1113,18 @@ public:
             work_.push_back({cell, ty});
     }
 
+    /// Per-cell pin: mark `cell` as unmovable (fwdRaw will refuse to
+    /// relocate it).  Used in cell-pin mode where blocks are NOT excluded
+    /// from candidates — only the individual C-referenced cells are held,
+    /// so their sibling cells still evacuate.  Pair with pin() to also
+    /// walk the held cell's fields.
+    void addPin(const void * cell) { if (cell) pinnedSet_.insert(cell); }
+
 private:
     Arena & arena_;
     std::vector<std::pair<const char *, const char *>> & candidates_;
     std::unordered_set<void *> walked_;
+    std::unordered_set<const void *> pinnedSet_;  // per-cell pins (don't move)
     std::vector<std::pair<void *, CellType>> work_;
     std::unordered_map<const char *, char *> charForward_;  // moved char buffers
     std::unordered_set<const void *> clearedCUs_;            // IC-invalidated CUs
@@ -1153,6 +1161,13 @@ private:
     /// walk.  Returns the dest (or nullptr if `ty` is unmovable).
     void * fwdRaw(void * owner, CellType ty)
     {
+        // Per-cell pin: a directly-C-stack-referenced cell must NOT move
+        // (the C-local can't be rewritten), but — unlike whole-block
+        // exclusion — only THIS cell is held; siblings in its block still
+        // evacuate.  Return nullptr (= "unmovable") so visitCell leaves the
+        // pointer at the pinned cell; ev.pin(owner) separately walks its
+        // fields so its referents follow the moves.
+        if (!pinnedSet_.empty() && pinnedSet_.count(owner)) return nullptr;
         const size_t sz = evacCellSize(owner, ty);
         if (sz == 0) return nullptr;
         auto it = forward.find(owner);
@@ -1315,12 +1330,27 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // crash => genuine conservative-only refs exist at the safepoint.
     static const bool s_preciseOnly =
         std::getenv("NIX_V3_EVAC_PRECISE_ONLY") != nullptr;
+    // PER-CELL PIN mode (R2.4d, 2026-06-03): correct Bartlett.  Pin ONLY
+    // the individual directly-C-referenced cells (don't move them), but do
+    // NOT exclude their blocks from candidates — so sibling cells in those
+    // blocks still evacuate.  The verify marks the pins so their blocks
+    // survive (not freed).  Only the ~N blocks holding a C-pinned cell stay
+    // un-reclaimed; every other sparse block evacuates → yield WITHOUT the
+    // transitive over-pin.  Sound iff the direct C-scan catches every
+    // ambiguous root (the open question the transitive pin sidesteps).
+    static const bool s_cellPin =
+        std::getenv("NIX_V3_EVAC_CELLPIN") != nullptr;
+    const bool noBlockExclude = s_preciseOnly || s_cellPin;
+    // Always collect the direct C-stack pins.  Under !preciseOnly they
+    // drive the (transitive) conservative pin; under preciseOnly they are
+    // NOT used for exclusion, but the post-EVAC "which pins did we move?"
+    // report (below) names the EXACT missing precise roots — the C-locals
+    // pointing at cells EVAC relocated, i.e. the cells we must register as
+    // precise roots to make pure-precise evacuation sound.
     std::vector<std::pair<const char *, CellType>> pins;
-    if (!s_preciseOnly) {
-        char anchor = 0; collectCStackDirectPins(arena, &anchor, pins);
-        std::sort(pins.begin(), pins.end());
-        pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
-    }
+    { char anchor = 0; collectCStackDirectPins(arena, &anchor, pins); }
+    std::sort(pins.begin(), pins.end());
+    pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
 
     // A candidate block must contain NO directly-pinned cell.  pins are
     // sorted by address; lower_bound finds the first pin >= block start.
@@ -1347,7 +1377,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // CAN rewrite — which is the sound subset.  Cost: yield (more blocks
     // pinned); correctness first.
     BitmapMarker consMark(arena);
-    if (!s_preciseOnly) {
+    if (!noBlockExclude) {
         MarkVisitor consWalk(consMark);
         consWalk.setArena(arena);
         consWalk.setTypedInteriorOwners(true);
@@ -1382,7 +1412,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
     size_t pinnedByCStack = 0, pinnedByConsClosure = 0;
     for (auto & [blk, dens] : sweep.blockDensities) {
         if (dens >= s_evacPct) continue;
-        if (!s_preciseOnly) {
+        if (!noBlockExclude) {
             if (blockHasPin(blk)) { ++pinnedByCStack; continue; }
             if (consMark.anyMarkInRange(blk, 0, Arena::kBlockSize)) {
                 ++pinnedByConsClosure; continue;  // transitive conservative pin
@@ -1410,6 +1440,12 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // cells); then walk the precise roots (moves candidate cells +
     // rewrites every precise reference).
     EvacVisitor ev(arena, cands);
+    // Cell-pin mode: mark each direct C-cell as unmovable (fwdRaw refuses
+    // to relocate it) so it stays put for its un-rewritable C-pointer,
+    // while its block's siblings still evacuate.  pin() (below) walks its
+    // fields so its referents follow the moves.
+    if (s_cellPin)
+        for (auto & [owner, ty] : pins) ev.addPin(owner);
     for (auto & [owner, ty] : pins) ev.pin(const_cast<char *>(owner), ty);
     walkAllV3Roots(vm, ev);
     ev.drain();
@@ -1443,6 +1479,24 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // false pin: the owner's referents are genuinely live.)
     vverify.setTypedInteriorOwners(true);
     walkAllV3Roots(vm, vverify);
+    // Cell-pin mode: the per-cell pins are NOT precise roots, so the
+    // precise verify won't mark them — yet they stayed put (unmovable) and
+    // their blocks must NOT be freed.  Mark + walk each pin so its block
+    // survives and its (post-evac, rewritten) referents are marked too.
+    if (s_cellPin) {
+        for (auto & [owner, ty] : pins) {
+            char * o = const_cast<char *>(owner);
+            switch (ty) {
+            case CellType::Closure:  { Closure   * c = reinterpret_cast<Closure   *>(o); vverify.visitClosure(c);  break; }
+            case CellType::Thunk:    { Thunk     * t = reinterpret_cast<Thunk     *>(o); vverify.visitThunk(t);    break; }
+            case CellType::Bindings: { Bindings  * b = reinterpret_cast<Bindings  *>(o); vverify.visitBindings(b); break; }
+            case CellType::List:     { ListVec   * l = reinterpret_cast<ListVec   *>(o); vverify.visitList(l);     break; }
+            case CellType::Pair:     { ValuePair * p = reinterpret_cast<ValuePair *>(o); vverify.visitPair(p);     break; }
+            case CellType::Value:    { Value     * v = reinterpret_cast<Value     *>(o); vverify.visitSlot(v);     break; }
+            case CellType::None: case CellType::Env: case CellType::Chars: break;
+            }
+        }
+    }
     vverify.drain();
     // NOTE: no drainConservative here.  TESTED 2026-06-03: draining it
     // makes MARKED dangles WORSE (5418 -> 21157/70262), because the
