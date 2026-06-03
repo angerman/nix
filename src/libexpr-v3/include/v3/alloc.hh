@@ -1181,9 +1181,11 @@ public:
         if (!majorGcEnabled()) return false;
         if (!p) return false;
         const char * cp = static_cast<const char *>(p);
-        for (size_t i = 0; i < active_.blocks.size(); ++i) {
-            const char * blk = active_.blocks[i];
-            if (cp >= blk && cp < blk + kBlockSize) {
+        {
+            const long bi = blockIndexContaining(cp);  // Lever 1: O(log blocks)
+            if (bi >= 0) {
+                const size_t i = static_cast<size_t>(bi);
+                const char * blk = active_.blocks[i];
                 const size_t offset = static_cast<size_t>(cp - blk);
                 if ((offset & 15) != 0) return false;  // not aligned
                 const size_t bit  = offset >> 4;
@@ -1212,17 +1214,17 @@ public:
     {
         if (!majorGcEnabled() || !p) return CellType::None;
         const char * cp = static_cast<const char *>(p);
-        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+        const long bi = blockIndexContaining(cp);  // Lever 1: O(log blocks)
+        if (bi >= 0) {
+            const size_t i = static_cast<size_t>(bi);
             const char * blk = active_.blocks[i];
-            if (cp >= blk && cp < blk + kBlockSize) {
-                const size_t offset = static_cast<size_t>(cp - blk);
-                if ((offset & 15) != 0) return CellType::None;
-                const size_t bit = offset >> 4;
-                if (i >= active_.cellTypes.size()
-                    || bit >= active_.cellTypes[i].size())
-                    return CellType::None;
-                return static_cast<CellType>(active_.cellTypes[i][bit]);
-            }
+            const size_t offset = static_cast<size_t>(cp - blk);
+            if ((offset & 15) != 0) return CellType::None;
+            const size_t bit = offset >> 4;
+            if (i >= active_.cellTypes.size()
+                || bit >= active_.cellTypes[i].size())
+                return CellType::None;
+            return static_cast<CellType>(active_.cellTypes[i][bit]);
         }
         return CellType::None;
     }
@@ -1578,13 +1580,54 @@ public:
     /// owning cell of an arbitrary arena address.  Returns nullptr
     /// if `p` is not in active arena or no cell-start exists at or
     /// before `p` within its block.
+    // ===== Lever 1 (R2.4d): O(log blocks) block lookup =====
+    // findContainingCellStart / findNextCellStartOrBlockEnd / isCellStart /
+    // cellTypeAt all need the active_.blocks index of the block containing
+    // a pointer.  A linear scan is O(blocks) and dominates the evacuation
+    // GC's mark+move+verify on M5 (424 blocks).  Maintain a sorted
+    // (start,index) side-index; rebuild lazily on the first lookup after
+    // any block add/free (refill / freeWholeBlock set the dirty flag).
+    // mmap block addresses are non-monotonic, so active_.blocks itself
+    // can't be binary-searched — hence the parallel sorted index.
+    mutable std::vector<std::pair<const char *, size_t>> sortedBlocks_;
+    mutable bool sortedBlocksDirty_ = true;
+
+    void rebuildSortedBlocks() const noexcept
+    {
+        sortedBlocks_.clear();
+        sortedBlocks_.reserve(active_.blocks.size());
+        for (size_t i = 0; i < active_.blocks.size(); ++i)
+            sortedBlocks_.emplace_back(active_.blocks[i], i);
+        std::sort(sortedBlocks_.begin(), sortedBlocks_.end());
+        sortedBlocksDirty_ = false;
+    }
+
+    /// Index into active_.blocks of the regular block containing `cp`,
+    /// or -1.  O(log blocks) after an amortised rebuild.
+    long blockIndexContaining(const char * cp) const noexcept
+    {
+        if (sortedBlocksDirty_) rebuildSortedBlocks();
+        auto it = std::upper_bound(
+            sortedBlocks_.begin(), sortedBlocks_.end(), cp,
+            [](const char * v, const std::pair<const char *, size_t> & e) {
+                return v < e.first;
+            });
+        if (it == sortedBlocks_.begin()) return -1;
+        --it;
+        if (cp >= it->first && cp < it->first + kBlockSize)
+            return static_cast<long>(it->second);
+        return -1;
+    }
+
     const char * findContainingCellStart(const void * p) const noexcept
     {
         if (!majorGcEnabled() || !p) return nullptr;
         const char * cp = static_cast<const char *>(p);
-        for (size_t i = 0; i < active_.blocks.size(); ++i) {
-            const char * blk = active_.blocks[i];
-            if (cp >= blk && cp < blk + kBlockSize) {
+        {
+            const long bi = blockIndexContaining(cp);
+            if (bi >= 0) {
+                const size_t i = static_cast<size_t>(bi);
+                const char * blk = active_.blocks[i];
                 const size_t offset = static_cast<size_t>(cp - blk);
                 size_t bit = offset / 16;
                 // Scan backward word-by-word.
@@ -1630,9 +1673,11 @@ public:
     const char * findNextCellStartOrBlockEnd(const char * cellStart) const noexcept
     {
         if (!cellStart) return nullptr;
-        for (size_t i = 0; i < active_.blocks.size(); ++i) {
-            const char * blk = active_.blocks[i];
-            if (cellStart >= blk && cellStart < blk + kBlockSize) {
+        {
+            const long bi = blockIndexContaining(cellStart);
+            if (bi >= 0) {
+                const size_t i = static_cast<size_t>(bi);
+                const char * blk = active_.blocks[i];
                 const size_t startOffset =
                     static_cast<size_t>(cellStart - blk);
                 size_t bit = startOffset / 16 + 1;  // search AFTER
@@ -1807,6 +1852,7 @@ public:
         if (idx < active_.cellTypes.size()) {
             active_.cellTypes.erase(active_.cellTypes.begin() + idx);
         }
+        sortedBlocksDirty_ = true;  // Lever 1: block set changed (indices shifted)
 
         // 5. Update totalBytes + cur/end if we freed the current
         //    block.  After freeing, the next alloc will refill (since
@@ -2006,6 +2052,7 @@ private:
             ? mapArenaBlock(kBlockSize)
             : static_cast<char *>(std::calloc(1, kBlockSize));
         active_.blocks.push_back(blk);
+        sortedBlocksDirty_ = true;  // Lever 1: block set changed
         active_.cur = blk;
         active_.end = blk + kBlockSize;
         active_.totalBytes += kBlockSize;
