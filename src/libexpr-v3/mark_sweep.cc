@@ -50,6 +50,7 @@
 #include <cstring>
 #include <csetjmp>
 #include <pthread.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -699,6 +700,11 @@ struct SweepStats {
     // mover) vs None (unstamped → pinned).  None (index 0) counts
     // interior/huge/non-bump cells the mover can't directly type.
     size_t cellTypeHist[9] = {0,0,0,0,0,0,0,0,0};
+
+    // R2.4b: per regular-block (start, live-byte fraction).  The
+    // evacuator filters this to the sparse candidate set.  Populated
+    // in sweepOneBlock's density section.
+    std::vector<std::pair<const char *, double>> blockDensities;
 };
 
 /// Sweep one arena block.  Walks the cell-start bitmap in address
@@ -797,6 +803,7 @@ static bool sweepOneBlock(
             ++stats.sparseBlocks;
             stats.sparseLiveBytes += blockLiveBytes;
         }
+        stats.blockDensities.emplace_back(blockStart, dens);  // R2.4b
     }
     // Phase 3.8: block is fully dead if no live cells AND no marker
     // bits in any byte range of the block.  The cell-level
@@ -875,6 +882,448 @@ inline FILE * openGcCsvIfRequested() noexcept
         }
     }
     return st.fp;
+}
+
+// ============================================================
+// R2.4b — metadata-aware EVACUATION (the moving GC).
+//
+// Gated NIX_V3_EVAC=1 (requires NIX_V3_MAJOR_GC).  Runs at the end of
+// runMajorMarkSweep: relocates live cells out of SPARSE candidate blocks
+// into fresh dest blocks, rewrites every pointer to them (cell-start via
+// the forward map; interior Tag::Slot/cell via owner-resolution +
+// offset), then VERIFIES (re-mark from roots) and munmaps only candidate
+// blocks that re-mark leaves empty.  Verify-before-free is the safety
+// net: any un-rewritten / dangling-into pointer keeps its block mapped
+// (safe leak), so field-walk incompleteness costs yield, never
+// correctness.  Per-cell type (R2.1′ metadata) lets us move + content-
+// walk ANY cell type, incl. Bindings (84% of arena).  Types we don't yet
+// move (None/Env/Chars) are simply left → their blocks pin via verify.
+// ============================================================
+
+/// Exact cell byte size by type (mirrors the allocators).  0 = a type
+/// this cut does not move (None/Env/Chars) → caller leaves the cell.
+static size_t evacCellSize(const void * p, CellType t) noexcept
+{
+    switch (t) {
+    case CellType::Value:    return sizeof(Value);
+    case CellType::Closure:
+        return sizeof(Closure)
+             + sizeof(Value) * static_cast<const Closure *>(p)->nUpvalues;
+    case CellType::Thunk: {
+        auto * tk = static_cast<const Thunk *>(p);
+        return (tk->state == ThunkState::Suspended
+             || tk->state == ThunkState::Native
+             || tk->state == ThunkState::Blackhole)
+            ? sizeof(Thunk) + sizeof(Value) * tk->nUpvalues
+            : sizeof(Thunk);
+    }
+    case CellType::Bindings:
+        return sizeof(Bindings)
+             + sizeof(Bindings::Entry) * static_cast<const Bindings *>(p)->size;
+    case CellType::List:
+        return sizeof(ListVec)
+             + sizeof(Value) * static_cast<const ListVec *>(p)->size;
+    case CellType::Pair:     return sizeof(ValuePair);
+    case CellType::None:
+    case CellType::Env:
+    case CellType::Chars:    return 0;  // not moved this cut
+    }
+    return 0;
+}
+
+class EvacVisitor : public RootVisitor {
+public:
+    EvacVisitor(Arena & a,
+                std::vector<std::pair<const char *, const char *>> & sortedCands) noexcept
+        : arena_(a), candidates_(sortedCands) {}
+
+    std::unordered_map<void *, void *> forward;
+    size_t movedCells = 0, movedBytes = 0, pinnedCells = 0;
+
+    /// O(log candidates) — sorted [start,end) ranges.
+    bool inCandidate(const void * p) const noexcept
+    {
+        const char * cp = static_cast<const char *>(p);
+        size_t lo = 0, hi = candidates_.size();
+        while (lo < hi) {
+            size_t mid = (lo + hi) >> 1;
+            if (cp < candidates_[mid].first)       hi = mid;
+            else if (cp >= candidates_[mid].second) lo = mid + 1;
+            else return true;
+        }
+        return false;
+    }
+
+    void visitClosure (Closure   * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::Closure); }
+    void visitThunk   (Thunk     * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::Thunk); }
+    void visitBindings(Bindings  * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::Bindings); }
+    void visitList    (ListVec   * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::List); }
+    void visitPair    (ValuePair * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::Pair); }
+
+    void visitSlot(Value * & p) override
+    {
+        if (!p) return;
+        if (inCandidate(p)) {
+            const char * owner = arena_.isCellStart(p)
+                ? reinterpret_cast<const char *>(p)
+                : arena_.findContainingCellStart(p);
+            if (owner) {
+                const CellType ot = arena_.cellTypeAt(owner);
+                const size_t off = reinterpret_cast<const char *>(p) - owner;
+                if (void * np = fwdRaw(const_cast<char *>(owner), ot)) {
+                    p = reinterpret_cast<Value *>(static_cast<char *>(np) + off);
+                    return;
+                }
+                ++pinnedCells;  // unmovable type → leave; verify pins block
+                return;
+            }
+        }
+        // Non-candidate slot target: walk its content so deeper pointers
+        // INTO candidates get rewritten.
+        if (walked_.insert(p).second) visitValue(*p);
+    }
+
+    void visitValue(Value & v) noexcept
+    {
+        switch (v.tag()) {
+        case Tag::Closure:   visitClosure(v.payload.closure); break;
+        case Tag::Thunk:     visitThunk(v.payload.thunk);     break;
+        case Tag::Attrs:     visitBindings(v.payload.bindings); break;
+        case Tag::List:      visitList(v.payload.list);       break;
+        case Tag::App:
+        case Tag::App3:
+        case Tag::PrimOpApp: visitPair(v.payload.pair);       break;
+        case Tag::Slot:
+            // MUST go through visitSlot so the slot POINTER itself is
+            // rewritten when it targets (the interior of) a candidate
+            // cell — not merely walk the pointee's content.  Missing this
+            // left Tag::Slot pointers dangling at old cells (blocksFreed=0
+            // + the verify's conservative scan chased them into the old
+            // graph → 82 s).
+            visitSlot(v.payload.slot);
+            break;
+        // String/Path carry a char buffer (allocChars) that lives in the
+        // arena and may be in a candidate block — move it too, else its
+        // block stays pinned (Chars are numerous + scattered).
+        case Tag::String: visitString(v.payload.str); break;
+        case Tag::Path:   visitPath(v.payload.path);  break;
+        case Tag::Uninitialized:
+        case Tag::Int:
+        case Tag::Float:
+        case Tag::Bool:
+        case Tag::Null:
+        case Tag::PrimOp:
+        case Tag::Blackhole:
+        case Tag::External:
+            break;
+        }
+    }
+
+    /// Move an arena char buffer (allocChars) out of a candidate block.
+    /// Copies the NUL-terminated bytes into a fresh Chars cell, re-keys
+    /// its string-context side-table entry to the new address, and
+    /// rewrites the reference.  Deduped via charForward_.
+    void evacChars(const char * & s)
+    {
+        if (!s || !inCandidate(s)) return;
+        auto it = charForward_.find(s);
+        if (it != charForward_.end()) { s = it->second; return; }
+        const size_t n = std::strlen(s) + 1;
+        char * dst = static_cast<char *>(threadArena().alloc(n, CellType::Chars));
+        std::memcpy(dst, s, n);
+        if (auto * ctx = lookupStringContextEntries(s))
+            setStringContextEntries(dst, *ctx);
+        charForward_.emplace(s, dst);
+        ++movedCells; movedBytes += n;
+        s = dst;
+    }
+    void visitString(const char * & s) noexcept override { evacChars(s); }
+    void visitPath  (const char * & s) noexcept override { evacChars(s); }
+
+    void drain()
+    {
+        while (!work_.empty()) {
+            auto [cell, ty] = work_.back();
+            work_.pop_back();
+            walkFields(cell, ty);
+        }
+    }
+
+    /// Bartlett: enqueue a PINNED cell (directly C-stack-referenced, in a
+    /// non-candidate block) for a field-rewrite walk.  The cell itself is
+    /// NOT moved (its block is excluded from candidates), but its pointer
+    /// fields must be rewritten so they follow cells we DO move.  Safe to
+    /// call before the root walk; dedups via `walked_`.
+    void pin(void * cell, CellType ty)
+    {
+        if (cell && ty != CellType::None && walked_.insert(cell).second)
+            work_.push_back({cell, ty});
+    }
+
+private:
+    Arena & arena_;
+    std::vector<std::pair<const char *, const char *>> & candidates_;
+    std::unordered_set<void *> walked_;
+    std::vector<std::pair<void *, CellType>> work_;
+    std::unordered_map<const char *, char *> charForward_;  // moved char buffers
+
+    void visitCell(void * & p, CellType ty)
+    {
+        if (!p) return;
+        if (inCandidate(p)) {
+            if (void * np = fwdRaw(p, ty)) p = np;
+            else ++pinnedCells;  // None/Env/Chars: leave; verify pins block
+        } else if (walked_.insert(p).second) {
+            work_.push_back({p, ty});  // walk in place (rewrite its fields)
+        }
+    }
+
+    /// Copy `owner` (a candidate cell-start of type `ty`) into a fresh
+    /// dest block, register the forward, enqueue the dest for content-
+    /// walk.  Returns the dest (or nullptr if `ty` is unmovable).
+    void * fwdRaw(void * owner, CellType ty)
+    {
+        const size_t sz = evacCellSize(owner, ty);
+        if (sz == 0) return nullptr;
+        auto it = forward.find(owner);
+        if (it != forward.end()) return it->second;
+        void * dest = threadArena().alloc(sz, ty);
+        std::memcpy(dest, owner, sz);
+        forward.emplace(owner, dest);
+        walked_.insert(dest);
+        work_.push_back({dest, ty});
+        ++movedCells;
+        movedBytes += sz;
+        return dest;
+    }
+
+    /// Walk a cell's pointer fields (layout mirrors MarkVisitor::walk*).
+    void walkFields(void * cell, CellType ty)
+    {
+        switch (ty) {
+        case CellType::Closure: {
+            auto * c = static_cast<Closure *>(cell);
+            if (c->capturedWiths) visitList(c->capturedWiths);
+            for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
+            break;
+        }
+        case CellType::Thunk: {
+            auto * t = static_cast<Thunk *>(cell);
+            if (t->cell)          visitSlot(t->cell);
+            if (t->shapeCell)     visitSlot(t->shapeCell);
+            if (t->cellContainer) visitBindings(t->cellContainer);
+            switch (t->state) {
+            case ThunkState::Suspended:
+            case ThunkState::Blackhole:
+                if (t->suspended.capturedWiths) visitList(t->suspended.capturedWiths);
+                for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
+                break;
+            case ThunkState::Evaluated: visitValue(t->evaluated); break;
+            case ThunkState::Native:
+                for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
+                break;
+            }
+            break;
+        }
+        case CellType::Bindings: {
+            auto * b = static_cast<Bindings *>(cell);
+            for (uint32_t i = 0; i < b->size; ++i) visitValue(b->entries[i].value);
+            if (b->parent) visitBindings(const_cast<Bindings * &>(b->parent));
+            break;
+        }
+        case CellType::List: {
+            auto * l = static_cast<ListVec *>(cell);
+            for (uint32_t i = 0; i < l->size; ++i) visitValue(l->elems[i]);
+            break;
+        }
+        case CellType::Pair: {
+            auto * p = static_cast<ValuePair *>(cell);
+            visitValue(p->left); visitValue(p->right);
+            visitValue(p->evaluated); visitValue(p->third);
+            break;
+        }
+        case CellType::Value: visitValue(*static_cast<Value *>(cell)); break;
+        case CellType::None:
+        case CellType::Env:
+        case CellType::Chars:
+            break;  // not moved this cut (never enqueued)
+        }
+    }
+};
+
+/// Drive one evacuation pass.  Selects sparse candidate blocks from the
+/// sweep's per-block densities, relocates+rewrites, then verify-before-
+/// frees.  No-op if NIX_V3_EVAC unset or no candidates.
+/// Bartlett direct-pin scan: walk the C-stack + spilled registers and,
+/// for each word that points into the arena, record the OWNING cell-start
+/// (the cell physically referenced by a C-local).  NON-transitive — unlike
+/// walkCStackConservative it does NOT follow the cell's fields.  These are
+/// exactly the cells that must not move (the C-local can't be rewritten);
+/// everything else — including cells reachable only THROUGH a pinned cell's
+/// fields — is movable, because we rewrite the pinned cell's fields in
+/// place.  Duplicates allowed (caller dedups).
+__attribute__((noinline))
+static void collectCStackDirectPins(
+    Arena & arena, const void * outerSp,
+    std::vector<std::pair<const char *, CellType>> & pins) noexcept
+{
+    jmp_buf regsBuf;
+    (void)setjmp(regsBuf);
+    pthread_t self = pthread_self();
+    const char * stackHi = nullptr;
+#ifdef __APPLE__
+    stackHi = static_cast<const char *>(pthread_get_stackaddr_np(self));
+#elif defined(__linux__)
+    pthread_attr_t attr; void * sb; size_t ss;
+    if (pthread_getattr_np(self, &attr) == 0
+        && pthread_attr_getstack(&attr, &sb, &ss) == 0) {
+        stackHi = static_cast<const char *>(sb) + ss;
+        pthread_attr_destroy(&attr);
+    }
+#else
+    (void)self;
+#endif
+    if (!stackHi) return;
+    uintptr_t loU = reinterpret_cast<uintptr_t>(outerSp)
+                    & ~(uintptr_t(sizeof(void *)) - 1);
+    uintptr_t hiU = reinterpret_cast<uintptr_t>(stackHi)
+                    & ~(uintptr_t(sizeof(void *)) - 1);
+    if (loU > hiU) std::swap(loU, hiU);
+    uintptr_t arenaMin, arenaMax;
+    arena.activeBounds(arenaMin, arenaMax);
+    if (arenaMin >= arenaMax) return;
+
+    auto consider = [&](uintptr_t val) {
+        if (val < arenaMin || val >= arenaMax) return;
+        void * cand = reinterpret_cast<void *>(val);
+        if (!arena.inActive(cand)) return;
+        const char * owner = arena.isCellStart(cand)
+            ? reinterpret_cast<const char *>(cand)
+            : arena.findContainingCellStart(cand);
+        if (!owner) return;
+        pins.emplace_back(owner, arena.cellTypeAt(owner));
+    };
+    for (uintptr_t p = loU; p < hiU; p += sizeof(void *))
+        consider(*reinterpret_cast<const uintptr_t *>(p));
+    const uintptr_t bufLo = reinterpret_cast<uintptr_t>(&regsBuf);
+    const uintptr_t bufHi = bufLo + sizeof(regsBuf);
+    for (uintptr_t p = bufLo; p < bufHi; p += sizeof(void *))
+        consider(*reinterpret_cast<const uintptr_t *>(p));
+    // NO drainConservative — Bartlett pins only the DIRECT references.
+}
+
+static void runEvacuation(VMState & vm, Arena & arena,
+                          SweepStats & sweep) noexcept
+{
+    static const bool s_evacEnabled = std::getenv("NIX_V3_EVAC") != nullptr;
+    if (!s_evacEnabled) return;
+    static const double s_evacPct = []{
+        const char * e = std::getenv("NIX_V3_EVAC_PCT");
+        return e ? std::atof(e) : 0.25;
+    }();
+
+    // BARTLETT mostly-copying.  Pin ONLY the cells whose pointer is
+    // physically in a C-stack/register slot (direct conservative hits).
+    // Those cells can't move (the C-local can't be rewritten), so their
+    // blocks are excluded from candidates and their fields are rewritten
+    // in place.  Cells reachable only THROUGH a pinned cell's fields —
+    // and everything else C-unreferenced — ARE moved; their references
+    // (precise, plus the rewritten pinned-cell fields) all follow to the
+    // new copy.  This is the standard conservative-stack moving technique
+    // (Bartlett 1988); the R2.1′ type metadata lets us typed-walk the
+    // pinned cells to rewrite their fields.
+    std::vector<std::pair<const char *, CellType>> pins;
+    { char anchor = 0; collectCStackDirectPins(arena, &anchor, pins); }
+    std::sort(pins.begin(), pins.end());
+    pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
+
+    // A candidate block must contain NO directly-pinned cell.  pins are
+    // sorted by address; lower_bound finds the first pin >= block start.
+    auto blockHasPin = [&](const char * b) -> bool {
+        auto it = std::lower_bound(
+            pins.begin(), pins.end(),
+            std::make_pair(b, CellType::None));
+        return it != pins.end() && it->first < b + Arena::kBlockSize;
+    };
+
+    // Candidate set = sparse regular blocks (< s_evacPct live) with no
+    // directly-pinned cell, as sorted [start, start+kBlockSize) ranges.
+    std::vector<std::pair<const char *, const char *>> cands;
+    size_t pinnedByCStack = 0;
+    for (auto & [blk, dens] : sweep.blockDensities) {
+        if (dens >= s_evacPct) continue;
+        if (blockHasPin(blk)) { ++pinnedByCStack; continue; }
+        cands.emplace_back(blk, blk + Arena::kBlockSize);
+    }
+    if (cands.empty()) {
+        std::fprintf(stderr,
+            "v3 evac: candidates=0 (pins=%zu pinnedBlocks=%zu) — nothing "
+            "C-free to evacuate this cycle\n", pins.size(), pinnedByCStack);
+        return;
+    }
+    std::sort(cands.begin(), cands.end());
+    using eclock = std::chrono::steady_clock;
+    auto tc0 = eclock::now();
+
+    // Dest copies must NOT land in a candidate block (that would keep it
+    // live → unfreeable).  Force a fresh active block so all dest allocs
+    // go into brand-new, non-candidate blocks.
+    arena.forceFreshBlock();
+
+    // Relocate + rewrite.  First enqueue the pinned cells for a field-
+    // rewrite walk (they stay put but their fields must follow moved
+    // cells); then walk the precise roots (moves candidate cells +
+    // rewrites every precise reference).
+    EvacVisitor ev(arena, cands);
+    for (auto & [owner, ty] : pins) ev.pin(const_cast<char *>(owner), ty);
+    walkAllV3Roots(vm, ev);
+    ev.drain();
+    auto tc1 = eclock::now();
+
+    // VERIFY (PRECISE only): re-mark from precise roots (pointers now
+    // point at dest copies) + the precise interior-owner drain.  A
+    // candidate block with zero PRECISE marks is unreferenced → munmap.
+    //
+    // We deliberately do NOT re-run the conservative C-stack scan here:
+    // Bartlett already pinned every DIRECT C-reference BEFORE evac (those
+    // blocks aren't candidates), and all references to moved cells are
+    // rewritten — so no real reference into a candidate remains.  Re-
+    // scanning the C-stack post-evac would instead pick up STALE residue
+    // pointers the evac walk's own (now-returned) frames left on the
+    // stack, falsely pinning every moved block (this was the blocksFreed=0
+    // cause).  The precise walk is the sound emptiness check.
+    arena.clearAllLineMarks();
+    BitmapMarker vmark(arena);
+    MarkVisitor vverify(vmark);
+    vverify.setArena(arena);
+    walkAllV3Roots(vm, vverify);
+    vverify.drain();
+    // NOTE: no drainConservative here.  With Tag::Slot pointers rewritten
+    // by evac, every interior reference now targets a dest cell that the
+    // precise walk already covers via its typed pointer; the conservative
+    // interior-owner byte-scan would only re-chase the (now-unreferenced)
+    // old graph — the source of the 98 s verify + false candidate pins.
+    auto tc2 = eclock::now();
+
+    size_t freedBlocks = 0;
+    for (auto & [start, end] : cands) {
+        if (!vmark.anyMarkInRange(start, 0, Arena::kBlockSize)) {
+            if (arena.freeWholeBlock(start) > 0) ++freedBlocks;
+        }
+    }
+    auto tc3 = eclock::now();
+    auto ms = [](eclock::time_point a, eclock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    std::fprintf(stderr,
+        "v3 evac: candidates=%zu pins=%zu pinnedBlocks=%zu movedCells=%zu "
+        "movedBytes=%.1fMB blocksFreed=%zu freedRSS=%.1fMB "
+        "[move=%.0fms verify=%.0fms munmap=%.0fms]\n",
+        cands.size(), pins.size(), pinnedByCStack, ev.movedCells,
+        double(ev.movedBytes) / 1e6, freedBlocks,
+        double(freedBlocks) * double(Arena::kBlockSize) / 1e6,
+        ms(tc0, tc1), ms(tc1, tc2), ms(tc2, tc3));
 }
 
 } // anonymous
@@ -983,6 +1432,13 @@ void runMajorMarkSweep(VMState & vm) noexcept
             sweep.bytesFreed += freed;
         }
     }
+
+    // R2.4b: metadata-aware evacuation of sparse candidate blocks (the
+    // moving GC that actually returns RSS for v3's scattered dead).
+    // No-op unless NIX_V3_EVAC=1.  Runs AFTER whole-block-free (those
+    // blocks are gone) and BEFORE the free-span rebuild (which then
+    // reflects the post-evac live set).
+    runEvacuation(vm, arena, sweep);
 
     // Step 12′ (Immix, 2026-05-29): rebuild free-line spans from the
     // post-mark line-mark bitmap.  Spans drive `Arena::alloc()` until

@@ -1803,6 +1803,10 @@ public:
         if (idx < active_.lineMarks.size()) {
             active_.lineMarks.erase(active_.lineMarks.begin() + idx);
         }
+        // R2.1′: keep the parallel cellTypes array in sync with blocks.
+        if (idx < active_.cellTypes.size()) {
+            active_.cellTypes.erase(active_.cellTypes.begin() + idx);
+        }
 
         // 5. Update totalBytes + cur/end if we freed the current
         //    block.  After freeing, the next alloc will refill (since
@@ -1980,6 +1984,15 @@ private:
         if (p) ::munmap(p, bytes);
     }
 
+public:
+    /// R2.4b: force the next allocation to start a fresh block.  Used by
+    /// evacuation so dest copies never bump into a candidate (sparse,
+    /// about-to-be-freed) block — they go into a brand-new block that is
+    /// not in the candidate set.  Cheap: one refill (wastes the current
+    /// block's tail, reclaimed by a later GC).
+    void forceFreshBlock() noexcept { refill(); }
+
+private:
     void refill() noexcept
     {
         // Phase-13 review HIGH-6 fix: zero-fill the block before
