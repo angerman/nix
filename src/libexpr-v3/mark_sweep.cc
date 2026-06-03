@@ -1009,9 +1009,24 @@ public:
                 return;
             }
         }
-        // Non-candidate slot target: walk its content so deeper pointers
-        // INTO candidates get rewritten.
+        // Non-candidate slot target.  Walk its pointee content so deeper
+        // pointers INTO candidates get rewritten...
         if (walked_.insert(p).second) visitValue(*p);
+        // ...AND enqueue the OWNER cell.  An interior Tag::Slot (e.g. a
+        // let-rec env: a Thunk's tail[] holds &recBindings.entries[i]) may
+        // be the ONLY reference to that owner Bindings — there is no typed
+        // Tag::Attrs pointer to it.  Walking just the pointee leaves the
+        // owner's OTHER entries[].value unrewritten; after we munmap the
+        // candidate blocks those siblings dangle (M5: 1320 Bindings.entry +
+        // 2546 cascading Thunk.tail, found via the NIX_V3_EVAC_BRUTE typed
+        // audit).  The owner is non-candidate (same block as p, which is
+        // non-candidate), so it is NOT moved — we only rewrite its fields
+        // in place.  walked_ dedups, so this terminates.
+        if (!arena_.isCellStart(p)) {
+            const char * owner = arena_.findContainingCellStart(p);
+            if (owner && walked_.insert(const_cast<char *>(owner)).second)
+                work_.push_back({const_cast<char *>(owner), arena_.cellTypeAt(owner)});
+        }
     }
 
     void visitValue(Value & v) noexcept
@@ -1062,8 +1077,15 @@ public:
         const size_t n = std::strlen(s) + 1;
         char * dst = static_cast<char *>(threadArena().alloc(n, CellType::Chars));
         std::memcpy(dst, s, n);
-        if (auto * ctx = lookupStringContextEntries(s))
-            setStringContextEntries(dst, *ctx);
+        if (auto * ctx = lookupStringContextEntries(s)) {
+            setStringContextEntries(dst, *ctx);  // *ctx copied by value first
+            // MOVE the entry: the context belongs to the relocated string,
+            // not the old address.  s's block may be munmapped (dangle) or,
+            // if it survives, s's line may be recycled for a fresh string —
+            // either way a stale entry at s would mis-attach this context to
+            // an unrelated future string.
+            dropStringContextEntries(s);
+        }
         charForward_.emplace(s, dst);
         ++movedCells; movedBytes += n;
         s = dst;
@@ -1346,6 +1368,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
     BitmapMarker vmark(arena);
     MarkVisitor vverify(vmark);
     vverify.setArena(arena);
+    // Safety: the verify must WALK interior-owners (typed, via R2.1'
     walkAllV3Roots(vm, vverify);
     vverify.drain();
     // NOTE: no drainConservative here.  With Tag::Slot pointers rewritten
@@ -1381,35 +1404,113 @@ static void runEvacuation(VMState & vm, Arena & arena,
             --it;
             return cp >= it->first && cp < it->second;
         };
-        size_t hits = 0, srcHist[9] = {0};
-        size_t srcVerifyReached = 0, srcNotReached = 0;
-        for (auto & r : arena.blockRanges()) {
-            if (inFreeable(reinterpret_cast<uintptr_t>(r.begin))) continue; // skip the candidates
-            for (const char * w = r.begin; w + sizeof(void *) <= r.end; w += sizeof(void *)) {
-                const uintptr_t v = *reinterpret_cast<const uintptr_t *>(w);
-                if (!inFreeable(v)) continue;
-                ++hits;
-                const char * srcOwner = arena.findContainingCellStart(w);
-                const CellType st = srcOwner ? arena.cellTypeAt(srcOwner) : CellType::None;
-                if (uint8_t(st) < 9) ++srcHist[uint8_t(st)];
-                const bool reached = srcOwner && vmark.isMarked(srcOwner);
-                if (reached) ++srcVerifyReached; else ++srcNotReached;
-                if (hits <= 12)
-                    std::fprintf(stderr,
-                        "  evac-brute hit %zu: src=%p srcCell=%p srcType=%d "
-                        "verifyReached=%d -> freedCand@%p tgtType=%d\n",
-                        hits, (const void *)w, (const void *)srcOwner,
-                        int(st), int(reached), (const void *)v,
-                        int(arena.cellTypeAt((const void *)v)));
+        // Does a Value's pointer payload land in an about-to-free candidate?
+        auto refCand = [&](const Value & v) -> bool {
+            switch (v.tag()) {
+            case Tag::Attrs:   return v.payload.bindings && inFreeable(reinterpret_cast<uintptr_t>(v.payload.bindings));
+            case Tag::Closure: return v.payload.closure && inFreeable(reinterpret_cast<uintptr_t>(v.payload.closure));
+            case Tag::Thunk:   return v.payload.thunk && inFreeable(reinterpret_cast<uintptr_t>(v.payload.thunk));
+            case Tag::List:    return v.payload.list && inFreeable(reinterpret_cast<uintptr_t>(v.payload.list));
+            case Tag::App: case Tag::App3: case Tag::PrimOpApp:
+                               return v.payload.pair && inFreeable(reinterpret_cast<uintptr_t>(v.payload.pair));
+            case Tag::Slot:    return v.payload.slot && inFreeable(reinterpret_cast<uintptr_t>(v.payload.slot));
+            case Tag::String:  return v.payload.str && inFreeable(reinterpret_cast<uintptr_t>(v.payload.str));
+            case Tag::Path:    return v.payload.path && inFreeable(reinterpret_cast<uintptr_t>(v.payload.path));
+            case Tag::Uninitialized:
+            case Tag::Int:
+            case Tag::Float:
+            case Tag::Bool:
+            case Tag::Null:
+            case Tag::PrimOp:
+            case Tag::Blackhole:
+            case Tag::External:
+                return false;
+            }
+            return false;
+        };
+        // TYPED scan: only LIVE (verify-marked) cells, only their KNOWN
+        // pointer fields → pinpoints the exact un-rewritten field.
+        size_t liveDangling = 0;
+        std::unordered_map<const char *, size_t> fieldHist;
+        auto note = [&](const char * field, const void * cell) {
+            ++liveDangling; ++fieldHist[field];
+            if (liveDangling <= 16)
+                std::fprintf(stderr, "  evac-brute LIVE dangle %zu: %s @cell %p\n",
+                             liveDangling, field, cell);
+        };
+        const auto & csb = arena.cellStartBitmaps();
+        auto ranges = arena.blockRanges();
+        for (size_t bi = 0; bi < csb.size() && bi < ranges.size(); ++bi) {
+            const char * b = ranges[bi].begin;
+            if (inFreeable(reinterpret_cast<uintptr_t>(b))) continue;  // skip candidates
+            const size_t used = static_cast<size_t>(ranges[bi].end - b);
+            const auto & bits = csb[bi];
+            for (size_t wi = 0; wi < bits.size(); ++wi) {
+                uint64_t word = bits[wi];
+                while (word) {
+                    const int bit = __builtin_ctzll(word); word &= word - 1;
+                    const size_t off = (wi * 64 + size_t(bit)) * 16;
+                    if (off >= used) continue;
+                    const char * cs = b + off;
+                    if (!vmark.isMarked(cs)) continue;  // LIVE cells only
+                    switch (arena.cellTypeAt(cs)) {
+                    case CellType::Bindings: {
+                        auto * bn = reinterpret_cast<const Bindings *>(cs);
+                        for (uint32_t i = 0; i < bn->size; ++i)
+                            if (refCand(bn->entries[i].value)) { note("Bindings.entry", cs); break; }
+                        if (bn->parent && inFreeable(reinterpret_cast<uintptr_t>(bn->parent))) note("Bindings.parent", cs);
+                        break; }
+                    case CellType::Closure: {
+                        auto * c = reinterpret_cast<const Closure *>(cs);
+                        if (c->capturedWiths && inFreeable(reinterpret_cast<uintptr_t>(c->capturedWiths))) note("Closure.capturedWiths", cs);
+                        for (uint16_t i = 0; i < c->nUpvalues; ++i)
+                            if (refCand(c->upvalues[i])) { note("Closure.upvalue", cs); break; }
+                        break; }
+                    case CellType::Thunk: {
+                        auto * t = reinterpret_cast<const Thunk *>(cs);
+                        if (t->cell && inFreeable(reinterpret_cast<uintptr_t>(t->cell))) note("Thunk.cell", cs);
+                        if (t->shapeCell && inFreeable(reinterpret_cast<uintptr_t>(t->shapeCell))) note("Thunk.shapeCell", cs);
+                        if (t->cellContainer && inFreeable(reinterpret_cast<uintptr_t>(t->cellContainer))) note("Thunk.cellContainer", cs);
+                        switch (t->state) {
+                        case ThunkState::Suspended:
+                        case ThunkState::Blackhole:
+                        case ThunkState::Native:
+                            if (t->suspended.capturedWiths && inFreeable(reinterpret_cast<uintptr_t>(t->suspended.capturedWiths))) note("Thunk.capturedWiths", cs);
+                            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                                if (refCand(t->tail[i])) { note("Thunk.tail", cs); break; }
+                            break;
+                        case ThunkState::Evaluated:
+                            if (refCand(t->evaluated)) note("Thunk.evaluated", cs);
+                            break;
+                        }
+                        break; }
+                    case CellType::Pair: {
+                        auto * p = reinterpret_cast<const ValuePair *>(cs);
+                        if (refCand(p->left)) note("Pair.left", cs);
+                        if (refCand(p->right)) note("Pair.right", cs);
+                        if (refCand(p->evaluated)) note("Pair.evaluated", cs);
+                        if (refCand(p->third)) note("Pair.third", cs);
+                        break; }
+                    case CellType::List: {
+                        auto * l = reinterpret_cast<const ListVec *>(cs);
+                        for (uint32_t i = 0; i < l->size; ++i)
+                            if (refCand(l->elems[i])) { note("List.elem", cs); break; }
+                        break; }
+                    case CellType::Value:
+                        if (refCand(*reinterpret_cast<const Value *>(cs))) note("Value", cs);
+                        break;
+                    case CellType::None:
+                    case CellType::Env:
+                    case CellType::Chars:
+                        break;
+                    }
+                }
             }
         }
         std::fprintf(stderr,
-            "v3 evac-brute: danglingRefs=%zu (verifyReached-src=%zu "
-            "notReached-src=%zu) srcType[None|Val|Clo|Thk|Bnd|Lst|Pair|Env|Chr]="
-            "%zu|%zu|%zu|%zu|%zu|%zu|%zu|%zu|%zu\n",
-            hits, srcVerifyReached, srcNotReached,
-            srcHist[0],srcHist[1],srcHist[2],srcHist[3],srcHist[4],
-            srcHist[5],srcHist[6],srcHist[7],srcHist[8]);
+            "v3 evac-brute TYPED: liveCellsWithDanglingField=%zu\n", liveDangling);
+        for (auto & [k, c] : fieldHist)
+            std::fprintf(stderr, "    %-26s %zu\n", k, c);
     }
 
     // DIAGNOSTIC (R2.4d): NIX_V3_EVAC_NO_FREE=1 does move+rewrite but skips
@@ -1419,10 +1520,47 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // the bug is in the move/rewrite (data corruption).  Isolates M5's bug.
     static const bool s_evacNoFree = std::getenv("NIX_V3_EVAC_NO_FREE") != nullptr;
     size_t freedBlocks = 0;
+    std::vector<std::pair<uintptr_t, uintptr_t>> freedRanges;
     if (!s_evacNoFree)
     for (auto & [start, end] : cands) {
         if (!vmark.anyMarkInRange(start, 0, Arena::kBlockSize)) {
-            if (arena.freeWholeBlock(start) > 0) ++freedBlocks;
+            if (arena.freeWholeBlock(start) > 0) {
+                ++freedBlocks;
+                freedRanges.emplace_back(
+                    reinterpret_cast<uintptr_t>(start),
+                    reinterpret_cast<uintptr_t>(start) + Arena::kBlockSize);
+            }
+        }
+    }
+
+    // Sweep stale string-context entries whose key lived in a now-freed
+    // block.  The side-table is keyed by char-buffer pointer; dead char
+    // buffers (the bulk of the freed bytes — M5: 17.7M dead cells) keep
+    // their entries after munmap.  When the arena later remaps/recycles
+    // that virtual address for a fresh string, lookupStringContextEntries
+    // would return the STALE context — e.g. attaching a glibc.drv store-
+    // path context to an unrelated literal ("flags"), which then throws
+    // "not allowed to refer to a store path".  This was M5's empty-result
+    // bug: the typed brute showed 0 cell-field dangles, yet M5 threw on a
+    // phantom context — the dangle was in this side-table, not in a cell.
+    if (!freedRanges.empty()) {
+        std::sort(freedRanges.begin(), freedRanges.end());
+        auto & tbl = stringContextSideTable();
+        for (auto it = tbl.begin(); it != tbl.end(); ) {
+            const uintptr_t k = reinterpret_cast<uintptr_t>(it->first);
+            // last freed range whose start <= k, then test k < its end.
+            auto rit = std::upper_bound(
+                freedRanges.begin(), freedRanges.end(), k,
+                [](uintptr_t key, const std::pair<uintptr_t, uintptr_t> & r) {
+                    return key < r.first;
+                });
+            bool inFreed = false;
+            if (rit != freedRanges.begin()) {
+                --rit;
+                inFreed = (k < rit->second);
+            }
+            if (inFreed) it = tbl.erase(it);
+            else ++it;
         }
     }
     auto tc3 = eclock::now();
