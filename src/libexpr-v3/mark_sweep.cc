@@ -1097,6 +1097,23 @@ private:
     std::unordered_set<void *> walked_;
     std::vector<std::pair<void *, CellType>> work_;
     std::unordered_map<const char *, char *> charForward_;  // moved char buffers
+    std::unordered_set<const void *> clearedCUs_;            // IC-invalidated CUs
+
+    /// Invalidate a CompilationUnit's attrSelect inline cache.  The IC
+    /// entries hold Bindings* that evac MOVES (and whose old blocks evac
+    /// munmaps); the cache is not otherwise rewritten, so a post-evac IC
+    /// hit would dereference a freed/relocated cell (this broke M5, whose
+    /// deep attrsets use the IC heavily — latent until Levers 1+3 let M5
+    /// complete under evac).  Clearing is the safe fix: the IC repopulates
+    /// on the next lookup (cold-cache perf cost, correctness preserved).
+    /// `attrSelectCache` is `mutable`, so this works through `const cu`.
+    void clearCU(const CompilationUnit * cu) noexcept
+    {
+        if (!cu || !clearedCUs_.insert(cu).second) return;
+        for (auto & ic : cu->attrSelectCache)
+            for (auto & e : ic.entries)
+                e.bindings = nullptr;
+    }
 
     void visitCell(void * & p, CellType ty)
     {
@@ -1134,6 +1151,7 @@ private:
         switch (ty) {
         case CellType::Closure: {
             auto * c = static_cast<Closure *>(cell);
+            clearCU(c->cu);  // evac moves IC'd Bindings → invalidate the IC
             if (c->capturedWiths) visitList(c->capturedWiths);
             for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
             break;
@@ -1146,6 +1164,7 @@ private:
             switch (t->state) {
             case ThunkState::Suspended:
             case ThunkState::Blackhole:
+                clearCU(t->suspended.cu);  // evac moves IC'd Bindings
                 if (t->suspended.capturedWiths) visitList(t->suspended.capturedWiths);
                 for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
                 break;
