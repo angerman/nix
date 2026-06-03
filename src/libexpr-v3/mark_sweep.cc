@@ -1368,7 +1368,17 @@ static void runEvacuation(VMState & vm, Arena & arena,
     BitmapMarker vmark(arena);
     MarkVisitor vverify(vmark);
     vverify.setArena(arena);
-    // Safety: the verify must WALK interior-owners (typed, via R2.1'
+    // SOUNDNESS (R2.4d): the verify MUST mark every cell the eval can
+    // reach, INCLUDING cells reachable only via an interior-owner field
+    // (a Tag::Slot into a Bindings/Thunk/etc).  Without this it under-
+    // marks: a block referenced only through an interior-owner's OTHER
+    // fields gets no mark → freed → the live holder's field dangles
+    // (M5: 16098 such MARKED dangles via the typed brute; HNE: 0).
+    // The typed interior-owner walk (R2.1' metadata) marks the owner AND
+    // pushes it to the worklist so drain() walks its fields — sound, and
+    // far cheaper than drainConservative's byte-scan.  (This is NOT a
+    // false pin: the owner's referents are genuinely live.)
+    vverify.setTypedInteriorOwners(true);
     walkAllV3Roots(vm, vverify);
     vverify.drain();
     // NOTE: no drainConservative here.  With Tag::Slot pointers rewritten
