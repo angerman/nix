@@ -1355,6 +1355,63 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // old graph — the source of the 98 s verify + false candidate pins.
     auto tc2 = eclock::now();
 
+    // BRUTE AUDIT (R2.4d, NIX_V3_EVAC_BRUTE=1): before freeing, scan every
+    // word of all SURVIVING blocks (non-candidate regular + dest + huge)
+    // for a pointer landing in an about-to-free candidate.  Such a hit is
+    // a MISSED ROOT — a live reference the precise verify didn't catch, so
+    // munmap would dangle it.  Reports the SOURCE cell's type + whether the
+    // verify reached it: verify-reached source => the mark/move walk of
+    // that type misses a pointer field (walk gap); NOT verify-reached =>
+    // the source is live via a root absent from walkAllV3Roots (missing
+    // root source).  This is the analog of the nursery scavenger's BRUTE.
+    static const bool s_evacBrute = std::getenv("NIX_V3_EVAC_BRUTE") != nullptr;
+    if (s_evacBrute) {
+        std::vector<std::pair<const char *, const char *>> freeable;
+        for (auto & [s, e] : cands)
+            if (!vmark.anyMarkInRange(s, 0, Arena::kBlockSize))
+                freeable.emplace_back(s, s + Arena::kBlockSize);
+        std::sort(freeable.begin(), freeable.end());
+        auto inFreeable = [&](uintptr_t v) -> bool {
+            const char * cp = reinterpret_cast<const char *>(v);
+            auto it = std::upper_bound(freeable.begin(), freeable.end(), cp,
+                [](const char * a, const std::pair<const char *, const char *> & p) {
+                    return a < p.first;
+                });
+            if (it == freeable.begin()) return false;
+            --it;
+            return cp >= it->first && cp < it->second;
+        };
+        size_t hits = 0, srcHist[9] = {0};
+        size_t srcVerifyReached = 0, srcNotReached = 0;
+        for (auto & r : arena.blockRanges()) {
+            if (inFreeable(reinterpret_cast<uintptr_t>(r.begin))) continue; // skip the candidates
+            for (const char * w = r.begin; w + sizeof(void *) <= r.end; w += sizeof(void *)) {
+                const uintptr_t v = *reinterpret_cast<const uintptr_t *>(w);
+                if (!inFreeable(v)) continue;
+                ++hits;
+                const char * srcOwner = arena.findContainingCellStart(w);
+                const CellType st = srcOwner ? arena.cellTypeAt(srcOwner) : CellType::None;
+                if (uint8_t(st) < 9) ++srcHist[uint8_t(st)];
+                const bool reached = srcOwner && vmark.isMarked(srcOwner);
+                if (reached) ++srcVerifyReached; else ++srcNotReached;
+                if (hits <= 12)
+                    std::fprintf(stderr,
+                        "  evac-brute hit %zu: src=%p srcCell=%p srcType=%d "
+                        "verifyReached=%d -> freedCand@%p tgtType=%d\n",
+                        hits, (const void *)w, (const void *)srcOwner,
+                        int(st), int(reached), (const void *)v,
+                        int(arena.cellTypeAt((const void *)v)));
+            }
+        }
+        std::fprintf(stderr,
+            "v3 evac-brute: danglingRefs=%zu (verifyReached-src=%zu "
+            "notReached-src=%zu) srcType[None|Val|Clo|Thk|Bnd|Lst|Pair|Env|Chr]="
+            "%zu|%zu|%zu|%zu|%zu|%zu|%zu|%zu|%zu\n",
+            hits, srcVerifyReached, srcNotReached,
+            srcHist[0],srcHist[1],srcHist[2],srcHist[3],srcHist[4],
+            srcHist[5],srcHist[6],srcHist[7],srcHist[8]);
+    }
+
     // DIAGNOSTIC (R2.4d): NIX_V3_EVAC_NO_FREE=1 does move+rewrite but skips
     // the munmap.  If a workload is correct under NO_FREE but wrong with
     // freeing, the bug is a munmap-dangle (a still-referenced block freed =
