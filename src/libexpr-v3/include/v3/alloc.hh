@@ -915,7 +915,14 @@ public:
     /// the Cheney semispace experiment introduced a backup region;
     /// retired 2026-05-28 with the Cheney scavenger.  Today flat MS
     /// uses only the active region (cells stay in place).
-    struct HugeBlock { char * begin; char * end; };
+    // R2.4d (2026-06-03): carry the CellType so cellTypeAt can TYPE a
+    // huge cell (≥ kHugeCutoff).  Without it huge cells are CellType::None
+    // → the mark's interior-owner walk falls back to drainConservative's
+    // O(bytes) byte-scan, which on M5's huge (>4 MB, 170k-entry) Bindings
+    // reached via interior Tag::Slot pointers cost a 445 s mark cycle
+    // (consW = 1.6 billion).  Typed huge cells let the mark typed-walk
+    // them (their exact pointer fields) instead.
+    struct HugeBlock { char * begin; char * end; CellType type; };
 
     /// Step 12′ (Immix, 2026-05-29): contiguous zero-mark line
     /// range within a single arena block.  `begin` + `end` are
@@ -1036,7 +1043,8 @@ public:
             // BRUTE — false-clean diagnostic.
             if (blk) {
                 active_.hugeBlocks.push_back({static_cast<char *>(blk),
-                                       static_cast<char *>(blk) + bytes});
+                                       static_cast<char *>(blk) + bytes,
+                                       type});  // R2.4d: stamp type for cellTypeAt
                 active_.totalBytes += bytes;
             }
             return blk;
@@ -1225,6 +1233,13 @@ public:
                 || bit >= active_.cellTypes[i].size())
                 return CellType::None;
             return static_cast<CellType>(active_.cellTypes[i][bit]);
+        }
+        // R2.4d: huge cells (≥ kHugeCutoff) live outside the regular
+        // block index; the cell-start is the block begin.  Return the
+        // stamped type so the mark can typed-walk it (avoids the O(bytes)
+        // conservative byte-scan on huge Bindings).
+        for (const auto & h : active_.hugeBlocks) {
+            if (cp == h.begin) return h.type;
         }
         return CellType::None;
     }
