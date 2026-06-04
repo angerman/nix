@@ -281,6 +281,20 @@ struct LowererV3 {
     void setReturn(ir::VarId v) { m.blocks[blockStack.back()].terminal = ir::TermReturn{v}; }
     ir::VarId forceVal(ir::VarId v) { return addBinding(ir::Force{v}); }
 
+    /// If `v` is the most-recent binding in the current block and that
+    /// binding is a `LitPrimOp`, return the primop; else nullptr.  Used to
+    /// recognise a saturated primop call (e.g. `seq a b`) at its call site —
+    /// `builtins.seq` / `__seq` / bare `seq` all lower the callee to exactly
+    /// one `LitPrimOp` binding, which `lowerExpr(c->fun)` just appended.
+    const v3::PrimOp * primopOfRecentBinding(ir::VarId v) const
+    {
+        const auto & bs = m.blocks[blockStack.back()].bindings;
+        if (!bs.empty() && bs.back().var == v)
+            if (auto * lp = std::get_if<ir::LitPrimOp>(&bs.back().expr))
+                return lp->primop;
+        return nullptr;
+    }
+
     /// Resolve a Var: lexical scope (innermost-first) → VarRef; else the
     /// base env (literal const / primop / builtins); else unbound error
     /// (mirrors lower.cc::lowerVar).
@@ -363,6 +377,27 @@ struct LowererV3 {
             // a trivial literal/var/lambda) so e.g. `tryEval <x>` /
             // `const 1 (throw "y")` don't fire the arg eagerly.
             ir::VarId f = lowerExpr(c->fun);
+            // `seq a b`  →  Force(a); return b  (b still lazy).  `seq` forces
+            // its 1st arg to WHNF and returns the 2nd UNFORCED, so lowering it
+            // as a Force on a plus the unchanged (thunked) b is semantically
+            // identical — and drops the seq primop machinery (a LitPrimOp +
+            // the partial-app closure for `seq a` + the saturating OP_CALL/
+            // CALL_PRIMOP) in favour of one OP_FORCE.  b's laziness is
+            // preserved (thunkifyForAttr, same as the generic arg path), so
+            // this is safe in lazy contexts.  deepSeq is excluded (it deep-
+            // forces, which a shallow Force does not implement).
+            // Retirement: drop the NIX_V3_NO_SEQ_FORCE opt-out once this has
+            // shipped byte-identical on --core + a nixpkgs sample across ≥10
+            // runs (it is a pure local rewrite; the gate exists only as a
+            // bisect handle during rollout).
+            static const bool noSeqForce = std::getenv("NIX_V3_NO_SEQ_FORCE") != nullptr;
+            if (!noSeqForce && c->args.size() == 2) {
+                if (const v3::PrimOp * po = primopOfRecentBinding(f);
+                    po && po->name == "seq") {
+                    forceVal(lowerExpr(c->args[0]));     // force a (seq's effect)
+                    return thunkifyForAttr(c->args[1]);  // return b, still lazy
+                }
+            }
             for (auto * arg : c->args)
                 f = addBinding(ir::App{f, thunkifyForAttr(arg)});
             return f;
