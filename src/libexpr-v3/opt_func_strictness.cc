@@ -291,6 +291,13 @@ void computeFunctionStrictness(Module & m)
             paramSlot = argVars.size();
             argVars.push_back(f.paramVar);
         }
+        // eval/apply (#3): the collapsed extra params of an arity-N lambda are
+        // positional args 1..N-1 (right after paramVar).  Their strictArgs
+        // bits let applyStrictnessAtCallSites unthunk a saturated call's args
+        // (e.g. `go (i+1) next` where `go` forces `i` via `if i>=n`).  Empty
+        // unless NIX_V3_EVAL_APPLY collapsed a curried chain.
+        const size_t extraParamsStart = argVars.size();
+        for (VarId ep : f.extraParams) argVars.push_back(ep);
         if (hasFormals) {
             // We use kInvalid as a placeholder here; the actual
             // VarId discovery happens by walking the body for
@@ -371,6 +378,17 @@ void computeFunctionStrictness(Module & m)
             if (forced.count(f.paramVar)) {
                 f.strictArgs[paramSlot] = true;
                 ++strictForFn;
+            }
+        }
+        // eval/apply (#3): extra-param slots — a collapsed positional arg is
+        // strict iff its VarId is unconditionally forced before any branch.
+        for (size_t i = 0; i < f.extraParams.size(); ++i) {
+            if (forced.count(f.extraParams[i])) {
+                const size_t slot = extraParamsStart + i;
+                if (slot < f.strictArgs.size() && !f.strictArgs[slot]) {
+                    f.strictArgs[slot] = true;
+                    ++strictForFn;
+                }
             }
         }
         // formals[i] slots.

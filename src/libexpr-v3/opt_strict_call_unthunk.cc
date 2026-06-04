@@ -613,6 +613,43 @@ static bool isInlinableMkThunk(VarId argVar, const Module & m,
     return true;
 }
 
+/// Resolve a LetRec entry `name` to the funcIdx of the Lambda its thunk body
+/// returns (mirrors resolveCalleeLambda's entry→Lambda chase, yielding a
+/// pointer-STABLE FuncId).  Returns m.functions.size() when it doesn't resolve
+/// to a Lambda.  Used to pre-resolve SELF-RECURSIVE callees before the pass
+/// rebuilds block-binding vectors.
+static FuncId resolveLetRecEntryFuncIdx(const Module & m, const LetRec & lr,
+                                        SymbolId name)
+{
+    const FuncId none = (FuncId)m.functions.size();
+    for (const auto & ent : lr.entries) {
+        if (ent.name != name) continue;
+        if (ent.thunkBody >= none) return none;
+        const Function & entryFn = m.functions[ent.thunkBody];
+        if (entryFn.entryBlock == kInvalidBlock
+            || entryFn.entryBlock >= (BlockId)m.blocks.size()) return none;
+        const Block & entryBlk = m.blocks[entryFn.entryBlock];
+        const auto * tr = std::get_if<TermReturn>(&entryBlk.terminal);
+        if (!tr || tr->value == kInvalid) return none;
+        VarId target = tr->value;
+        for (size_t hops = 0; hops < entryBlk.bindings.size() + 1; ++hops) {
+            bool advanced = false;
+            for (const auto & bd : entryBlk.bindings) {
+                if (bd.var != target) continue;
+                if (const auto * vr = std::get_if<VarRef>(&bd.expr)) {
+                    target = vr->var; advanced = true; break;
+                }
+                if (const auto * lam = std::get_if<Lambda>(&bd.expr))
+                    return lam->funcIdx;
+                return none;
+            }
+            if (!advanced) break;
+        }
+        return none;
+    }
+    return none;
+}
+
 size_t applyStrictnessAtCallSites(Module & m)
 {
     static const bool disabled =
@@ -694,6 +731,35 @@ size_t applyStrictnessAtCallSites(Module & m)
     size_t failNotMkThunk    = 0;
     size_t failMultiUse      = 0;
     size_t failNotCloneable  = 0;
+    size_t elidedRecursive   = 0;
+
+    // #3(B) strictArgs through recursion: a self-recursive `go (i+1) next`
+    // references `go` via a RecBindingSlotRef whose LetRec is in an ENCLOSING
+    // block, which the per-block `defs` resolveCalleeLambda consults never sees
+    // — so the recursive call failed to resolve and its (now arity-N, eval/
+    // apply) strictArgs were never applied.  Pre-resolve (recVar|slotVar,
+    // entryName) → callee FuncId on the UN-mutated module: store FuncIds
+    // (stable), never Expr*, so the per-block rebuilds below can't dangle them.
+    // rb->attrs may be the recVar OR its Tag::Slot companion → key both.
+    // Retirement: fold into resolveCalleeLambda (drop NIX_V3_NO_REC_UNTHUNK)
+    // once shipped byte-identical on --core + a nixpkgs sample.
+    static const bool noRecUnthunk =
+        std::getenv("NIX_V3_NO_REC_UNTHUNK") != nullptr;
+    std::unordered_map<VarId, std::unordered_map<SymbolId, FuncId>> recCallTarget;
+    if (!noRecUnthunk) {
+        for (const auto & b : m.blocks)
+            for (const auto & bd : b.bindings)
+                if (const auto * lr = std::get_if<LetRec>(&bd.expr)) {
+                    std::vector<VarId> keys{lr->recVar};
+                    auto sv = m.recVarToSlotVar.find(lr->recVar);
+                    if (sv != m.recVarToSlotVar.end()) keys.push_back(sv->second);
+                    for (const auto & ent : lr->entries) {
+                        FuncId fi = resolveLetRecEntryFuncIdx(m, *lr, ent.name);
+                        if (fi < (FuncId)m.functions.size())
+                            for (VarId k : keys) recCallTarget[k][ent.name] = fi;
+                    }
+                }
+    }
 
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
         Block & blk = m.blocks[bid];
@@ -782,10 +848,29 @@ size_t applyStrictnessAtCallSites(Module & m)
             ++consideredApps;
 
             const Lambda * lam = resolveCalleeLambda(app->fun, m, defs);
-            if (!lam) { ++failResolveLambda; continue; }
-            if (lam->funcIdx >= (FuncId)m.functions.size()) { ++failResolveLambda; continue; }
-            const Function & callee = m.functions[lam->funcIdx];
+            FuncId calleeFid = (lam && lam->funcIdx < (FuncId)m.functions.size())
+                ? lam->funcIdx : (FuncId)m.functions.size();
+            // #3(B) self-recursive fallback: resolveCalleeLambda misses a callee
+            // whose LetRec is in an enclosing block (the recursive self-call,
+            // e.g. `go (i+1)`).  Recover via the pre-resolved, pointer-stable map.
+            bool viaRec = false;
+            if (calleeFid >= (FuncId)m.functions.size() && !noRecUnthunk) {
+                if (const Expr * fe = chaseInBlock(app->fun, defs))
+                    if (const auto * rb = std::get_if<RecBindingSlotRef>(fe)) {
+                        auto it = recCallTarget.find(rb->attrs);
+                        if (it != recCallTarget.end()) {
+                            auto jt = it->second.find(rb->name);
+                            if (jt != it->second.end()) {
+                                calleeFid = jt->second; viaRec = true;
+                            }
+                        }
+                    }
+            }
+            if (calleeFid >= (FuncId)m.functions.size()) { ++failResolveLambda; continue; }
+            const Function & callee = m.functions[calleeFid];
             if (callee.strictArgs.empty()) { ++failStrictArgs; continue; }
+            if (viaRec && !callee.strictArgs.empty() && callee.strictArgs[0])
+                ++elidedRecursive;
 
             // (A) Outer-thunk elision — applies to any callee
             // whose strictArgs[0] is true (the paramVar position).
@@ -990,7 +1075,8 @@ size_t applyStrictnessAtCallSites(Module & m)
             "failNotCloneable=%zu | force-of-mkt: considered=%zu passed=%zu "
             "fail{notMkt=%zu multiUse=%zu notClone=%zu} | "
             "#776 spike (notMkt classified globally): "
-            "notFound=%zu mktRemote=%zu mktRemoteOne=%zu other=%zu]\n",
+            "notFound=%zu mktRemote=%zu mktRemoteOne=%zu other=%zu | "
+            "#3(B) recursive-callee-resolved=%zu]\n",
             elided, elidedSingleArg, elidedFormals, elidedForceMkt,
             consideredApps,
             failResolveLambda, failStrictArgs,
@@ -999,8 +1085,10 @@ size_t applyStrictnessAtCallSites(Module & m)
             consideredForces, passedToInlineForce,
             forceFailNotMkThunk, forceFailMultiUse, forceFailNotCloneable,
             globalNotFound, globalMkThunkRemote,
-            globalMkThunkRemoteOne, globalOtherExpr);
+            globalMkThunkRemoteOne, globalOtherExpr,
+            elidedRecursive);
     }
+    (void)elidedRecursive;
 
     return elided;
 }
