@@ -119,7 +119,7 @@ nix run nixpkgs#hyperfine -- --warmup 3 --runs 15 \
   -n v3-warm "env NIX_V3_DIRECT_EVAL=1 NIX_V3_CACHE_DIR=/tmp/cw NIX_V3_MAX_HEAP=6G ./build/src/nix/nix eval --impure --expr '(import <nixpkgs> {}).hello.drvPath'"
 ```
 
-## 5. `fold-add-1M` 17× root cause (2026-06-04) — per-element curried-capture allocation
+## 5. `fold-add-1M` 17× root cause (2026-06-04) — the curried calling convention
 
 `builtins.foldl' (a: b: a + b) 0 (builtins.genList (x: x) 1000000)` — for 1M
 elements v3 executes **107M instructions** and allocates **1 GB** (2M closures,
@@ -135,43 +135,61 @@ elements v3 executes **107M instructions** and allocates **1 GB** (2M closures,
 **Conclusions:**
 - **genList is NOT the problem** (47 insns; builds the lazy spine, 0 allocs/elem).
 - **The `+` is minor** (+1M pairs, +17M insns).
-- **It is per-element ALLOCATION in `foldl''s` per-element machinery** — even a
-  *no-op* lambda allocates ~2 closures + **1 attrset** + 4 thunks + 2 pairs +
-  ~90 insns per element.
-- **The attrset is the tell:** `NIX_V3_BINDINGS_ATTR` attributes 100001/100000
-  elements to **`vm.cc:7500` = `OP_ATTRS_LET_REC_INIT`, a size-1 `let…in`
-  rec-attrset.** `(a:b:a)` has no `let` — it is a **v3 lowering artifact**: the
-  curried lambda's inner `b: a` captures the outer param `a`, and v3 boxes that
-  captured param in a per-call size-1 let-rec cell. **fib proves native
-  `OP_CALL` does NOT do this** (param `n` isn't captured by a nested closure →
-  0 attrsets/call); only the captured-curried-param path (and the C++-primop
-  `callClosure` re-entry that drives it) pays it.
+- **It is per-element ALLOCATION** — even a *no-op* lambda allocates ~2 closures
+  + **1 attrset** + 4 thunks + 2 pairs + ~90 insns per element.
 
-**Why `callClosure` (the "FFI helper") is involved at all:** `foldl'`/`map`/
-`genList` are **C++ primops** (inherited from cppnix), not bytecode. To invoke
-the user's bytecode lambda each element, the C++ primop re-enters the VM via
-`callClosure` (frame push + nested `dispatchLoop` + result marshalling) — TWICE
-per element for a curried 2-arg op (`op acc` → partial closure + let-rec, then
-`· elem`). TW re-enters too (its C++ `foldl'` → `callFunction`), so re-entry per
-se isn't the gap; **v3's re-entry allocates ~9 objects/element where TW
-allocates ~1 Env.**
+**Root cause — the curried (one-arg-at-a-time) calling convention** (confirmed
+by an A/B/C per-call experiment, 3000 calls each):
 
-### Fix directions (ranked; each needs its own measured implementation)
-1. **Don't box captured scalar params in a per-call let-rec** — capture
-   immutable params by value into the closure's upvalue array. Removes the 1M
-   attrsets and likely a closure/element. Highest-leverage + broad (helps every
-   curried/capturing lambda), but a correctness-sensitive lowering change
-   (`lower_v3.cc`; mind the OP_ATTRS_LET_REC_INIT publish semantics at vm.cc:7475).
-2. **2-arg call path for `foldl'`** — apply `op acc elem` in one VM entry so the
-   intermediate partial-app closure + its let-rec never materialize; halves the
-   per-element re-entries.
-3. **Bytecode-compile hot HOFs** (`foldl'`/`map`/`filter`) to loops that call the
-   lambda via native `OP_CALL` (proven ~alloc-free/call by fib) — the genuinely
-   v3-native answer; largest scope.
+| call | closures/call | attrsets/call | thunks/call |
+|---|---|---|---|
+| **C** 1-arg native (`go n`) | 0 | 0 | 1 |
+| **A** 2-arg native (`g n n`) | **1** | **0** | 1 |
+| **B** 2-arg via `foldl'`/`callClosure` | **2** | **1** | 4 |
 
-Pre-committed gate for any fix: byte-identical results on the matrix + `--quick`/
-`--core` green + hyperfine wall on `fold-add-1M` (target: close a large fraction
-of the 17×), reported with the alloc-count delta.
+The per-call `let-rec` attrset (`vm.cc:7500 OP_ATTRS_LET_REC_INIT`, size-1) is
+**NOT inherent to 2-arg currying** — the native 2-arg call (A) does not allocate
+it. It appears **only** on the `callClosure` path (B). Mechanism: a 2-arg apply
+`op acc elem` must build the partial application `op acc` as a heap closure.
+- **Native (A):** the partial stays *inside* the VM, immediately applied → `acc`
+  captured **by value**, no cell. Cost: 1 closure.
+- **callClosure (B):** `foldl'` applies in two steps (`step1 = callClosure(op,
+  acc)`, then `callClosure(step1, elem)`); the partial **escapes the VM into
+  C++** between the re-entries, so v3 makes it heap-stable → **boxes `acc` in a
+  `let-rec` cell** + an extra closure/thunks.
+
+Both A and B are symptoms of the SAME thing: **there is no "apply N args at once"
+calling convention.** Every multi-arg call manufactures (and on the C++ path,
+heap-escapes) an intermediate partial closure. `foldl'`/`map`/`genList` being
+C++ primops that re-enter via `callClosure` is what turns A's cheap in-VM partial
+into B's escaping, heap-boxed one.
+
+### The fundamentally correct fix: arity-aware uncurried calling (eval/apply)
+
+**Adopt a multi-argument, arity-aware calling convention** (GHC "Making a Fast
+Curry" / eval-apply): compile `a: b: body` as ONE arity-2 function; a function of
+arity N applied to N args is called **once**, one frame holding all N params, the
+uncurried body, **zero** intermediate closures/cells (A's 1 → 0; B's 2+attrset
+→ 0). Only a genuine *partial* application (< N args) builds a closure. The same
+convention serves BOTH `OP_CALL` and the `callClosure` primop-entry, so a lambda
+called from `foldl'` costs what one called from bytecode costs. v3 already has
+*fragments* (`Tag::App3`, the compile-time App-spine fold `opt_app_spine_fold.cc`
+— which is exactly why A < B); the fix **completes them into a real runtime
+arity-aware convention** instead of a compile-time-only half-measure.
+
+**Why the alternatives are patches, not the root:**
+- *2-arg `foldl'` path* — this IS the fix, applied to ONE primop; every other HOF
+  needs the same. Right idea, wrong scope.
+- *Capture-by-value lowering* — secondary (how a genuinely-escaping closure boxes
+  captures); doesn't stop the partial being manufactured + escaping for
+  fully-applied calls.
+- *Bytecode-compile HOFs* — removes the C++ re-entry but the bytecode loop still
+  curries (stays case A, 1 closure/call); treats the symptom, not the convention.
+
+Pre-committed gate for the fix (scoped spike: arity-2 fast path in `OP_CALL` +
+`callClosure` first, then generalize): byte-identical on the matrix + `--quick`/
+`--core` green + hyperfine wall on `fold-add-1M` + fib/ackermann, target A→~0 and
+B→~A, reported with the alloc-count delta.
 
 ## 6. Cross-references
 - [[memory-first]] — peak-RSS is the higher-slope axis (confirmed: 4–6× gap)
