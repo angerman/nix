@@ -191,6 +191,62 @@ Pre-committed gate for the fix (scoped spike: arity-2 fast path in `OP_CALL` +
 `--core` green + hyperfine wall on `fold-add-1M` + fib/ackermann, target A→~0 and
 B→~A, reported with the alloc-count delta.
 
+### 5.1 Progress + corrected understanding (2026-06-04, this session)
+
+**Shipped optimizations (all byte-identical: --quick 9/9, --core 19/19):**
+| opt | commit | effect on fold-add-1M |
+|---|---|---|
+| non-recursive `let` demotion (lowering) | `cd1da2577` | per-elem attrsets 1M→1; 107M→94M insns |
+| `seq a b → Force(a); b` (lowering) | `72e85e2d9` | drops seq primop App-spine; 94M→87M insns; 12.76→11.18× TW |
+| eager-forced-let (multi-use, eval-path) | `c62e05f2f` | `next` thunk gone, MAKE_THUNK 4→3/elem; 87M→83M insns |
+| **combined** | | **fold-add 13.67× → 9.52× TW (~30%), insns 107M→83M** |
+
+**Corrected root-cause weighting:** §5 framed the cause as "the curried calling
+convention." A later measurement refined it: the C++ `primFoldl` (`primops.cc:1281`,
+**v3-native**) is **2.43× TW** vs the bytecode foldl''s 9.52× — so the bytecode
+LOOP INTERPRETATION (not just currying) is the dominant residual. **Directive
+(user, 2026-06-04): make the bytecode-native VM fast — do NOT switch hot primops
+to C++ (that masks the goal). Build the VM optimizations: eval/apply, LICM,
+strictness analysis, specialization.** So the §5 "fundamentally correct fix"
+(eval/apply) is confirmed as the path; the C++-primFoldl shortcut is explicitly
+rejected.
+
+**Why eval/apply is still the next lever (per-elem opcode profile after the 3 opts,
+~83/elem):** GET_UPVALUE 21 + GET_LOCAL 15 + SET_LOCAL 12 + RETURN 6 + CALL 5 +
+MAKE_THUNK 3 + LIT_PRIMOP 2 + CALL_PRIMOP 3 + TAIL_CALL 3 + ELEM_AT 3 +
+**MAKE_CLOSURE 2 (the partial-app closures)**. eval/apply removes the 2
+partial-app MAKE_CLOSURE/elem AND gives the recursive `go` a COMBINED `strictArgs`
+[i:strict, acc:lazy] — which then unthunks `i+1` (the curry-split that blocked the
+reverted #2(A) recursive-callee resolution).
+
+### 5.2 eval/apply implementation plan (the next major effort — multi-session)
+
+Large, multi-component change to lowering + emit + the hottest VM opcode + a PAP
+representation; a half-done state risks silent miscompiles, so land it in gated,
+byte-identical increments:
+
+1. **Multi-arity lambda lowering** (`cli/lower_v3.hh lowerLambda`): collapse a
+   curried chain `x: y: … : body` of simple single-param lambdas (no formals, no
+   intervening non-lambda) into ONE Function with `arity=N` and N param VarIds,
+   body lowered with all N in scope. Gate `NIX_V3_EVAL_APPLY`. Keep the curried
+   form when the gate is off.
+2. **PAP (partial application) in the VM** (`closure.hh` + `OP_CALL`): a closure of
+   arity N applied to k<N args becomes a PAP{fn, k captured args}; a PAP applied to
+   more args accumulates until N, then enters the combined body. This keeps
+   single-arg `OP_CALL` + binary `App` working (consistency) — byte-identical, no
+   win yet (foundation).
+3. **Multi-arg call at emit** (`emit.cc`): recognise the N-deep `App`-spine on an
+   arity-N callee and emit `OP_CALL_N` (apply N args in one frame) — bypasses the
+   PAP for saturated calls. THIS is the win (removes MAKE_CLOSURE/elem). Over-app
+   (m>N): enter with N, then continue applying. Under-app (m<N): build a PAP.
+4. **Combined strictArgs** (`opt_func_strictness.cc`): an arity-N Function's
+   `strictArgs` now spans all N params (i forced via `if i>=n` → strictArgs[i]
+   set), so `applyStrictnessAtCallSites` unthunks the saturated-call args (i+1).
+5. Validate each increment: byte-identical matrix + --quick/--core + hyperfine
+   fold-add/fib/ackermann; FileCheck `(x:y:x+y) a b` → no intermediate partial-app
+   closure (a `--emit-bytecode` check, since the calling convention is a
+   bytecode-level property).
+
 ## 6. Cross-references
 - [[memory-first]] — peak-RSS is the higher-slope axis (confirmed: 4–6× gap)
 - [[dispatch-lever-falsified]] / BYTECODE_NGRAM_ANALYSIS §9 — why eval-CPU
