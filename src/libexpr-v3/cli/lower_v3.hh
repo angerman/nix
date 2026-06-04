@@ -675,6 +675,10 @@ struct LowererV3 {
 
         std::vector<ir::FuncId> fids;
         fids.reserve(bs.size());
+        // First block index belonging to the entry thunks (used by the
+        // non-recursive demotion below to scan ONLY the entries' IR for
+        // sibling references — the body isn't lowered yet).
+        ir::BlockId entryBlockStart = static_cast<ir::BlockId>(m.blocks.size());
         for (auto * d : bs) {
             m.functions.emplace_back();
             ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
@@ -697,6 +701,63 @@ struct LowererV3 {
                 scopes.pop_back();
             }
             blockStack.pop_back();
+        }
+
+        // opt_letrec_demote (at-lowering, the clean fix): a NON-recursive
+        // `let … in body` needs no rec-attrset.  Every `let … in …` lowers to
+        // a LetRec (OP_ATTRS_LET_REC_INIT heap cell + per-binding thunk
+        // function + RecBindingSlotRef slot lookups) — overhead only mutual
+        // recursion needs.  For a non-recursive group we instead bind each
+        // value as a plain lazy thunk and lower the body in a NON-rec scope,
+        // so references become VarRef.  This is the fold-add-1M 17× root cause
+        // (the bytecode foldl''s `let next = op acc elem; in …` allocated a
+        // rec-attrset per iteration) and taxes EVERY non-recursive let in
+        // nixpkgs.  Verified by test/ir-fixtures/letrecDemote-nonrec-pos.nix.
+        //
+        // Eligibility (conservative — any doubt keeps the LetRec):
+        //   - hasBody (the `let … in body` shape; `rec { … }` must stay a
+        //     Bindings value),
+        //   - all entries Plain (no inherit / inherit-from),  no dynamics,
+        //   - NON-recursive: no entry's lowered body references recVar via
+        //     RecBindingSlotRef (a sibling/self reference) — scanned over the
+        //     entry blocks only (the body isn't lowered yet).
+        // Gate: NIX_V3_NO_LETREC_DEMOTE=1 (regression bisection / A-B).
+        // RETIREMENT: fold into a shared helper if the TW-side lowerer ever
+        // produces v3 IR, or delete if measurement falsifies the win.
+        {
+            static const bool noDemote =
+                std::getenv("NIX_V3_NO_LETREC_DEMOTE") != nullptr;
+            bool eligible = hasBody && !noDemote
+                && at->inheritFromExprs.empty() && at->dynamicAttrs.empty();
+            for (auto * d : bs)
+                if (d->kind != nix::v3::ast::Attrs::AttrKind::Plain)
+                    eligible = false;
+            if (eligible) {
+                bool recursive = false;
+                for (ir::BlockId b = entryBlockStart;
+                     b < (ir::BlockId)m.blocks.size() && !recursive; ++b)
+                    for (auto & bd : m.blocks[b].bindings) {
+                        auto * sr = std::get_if<ir::RecBindingSlotRef>(&bd.expr);
+                        if (sr && sr->attrs == recVar) { recursive = true; break; }
+                    }
+                if (!recursive) {
+                    std::vector<ir::VarId> lws = collectLexicalWiths();
+                    Scope plainScope;
+                    for (size_t i = 0; i < bs.size(); ++i) {
+                        m.functions[fids[i]].nWithTargets =
+                            static_cast<uint16_t>(lws.size());
+                        ir::VarId vid =
+                            addBinding(ir::MkThunk{fids[i], /*freeVars*/ {}, lws});
+                        plainScope.byName[bs[i]->name] = vid;
+                    }
+                    // recVar was reserved (recVarIds) but is now unused — leave
+                    // it; emit/computeFreeVars tolerate an unreferenced recVar.
+                    scopes.push_back(std::move(plainScope));
+                    ir::VarId rv = lowerExpr(body);
+                    scopes.pop_back();
+                    return addBinding(ir::VarRef{rv});
+                }
+            }
         }
 
         ir::LetRec lr;
