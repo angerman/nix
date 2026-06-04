@@ -1,12 +1,15 @@
 # Static bytecode opcode + n-gram analysis — register-VM / superinstruction decision input
 
 **Date:** 2026-06-04
-**Status:** MEASUREMENT + DECISION INPUT. Static opcode-frequency and
-bi/tri/4-gram analysis of the compiled v3 bytecode across three real
-workloads, to inform whether a register-VM rework and/or targeted
-superinstructions are worth building (the largest open wall-time lever
-post Stage-5/6 kill). Includes the tooling, the data, the verdict, and a
-measure-first `/goal` (§7).
+**Status:** CLOSED — dispatch lever **FALSIFIED** on wall (2026-06-04).
+Static opcode-frequency and bi/tri/4-gram analysis (§1-6) → measure-first
+`/goal` (§7) → Step-1 dynamic trigram confirmation **PASSED** (§8, gate
+cleared 2×) → Step-2 `SET_LOCAL_KEEP` superinstruction spike **wall-neutral
+(≤1%, within σ)** → Step-3 **REVERT + falsify** (§9): the ~49% stack-motion
+pattern is fusible and a fusion is correct (byte-identical), but the wall
+doesn't care — bounded to a ~0.16% ceiling by dispatch ≈ 5% of wall. Do NOT
+open the register-VM arc to chase wall; memory/GC remains the higher-slope
+axis. Kept: Step-1 trigram counter + static tooling (general measurement).
 **Author:** session synthesis (code-grounded; tooling at `emit.cc` +
 `bench/analyze-bytecode.py`, validated 0 decode errors over 13.2M insns).
 
@@ -274,16 +277,97 @@ grep -oE 'trigrams: total=[0-9]+' /tmp/tg.txt | sort -t= -k2 -n | tail -1
 
 ---
 
-## 9. Cross-references
+## 9. Step 2 RESULT + Step 3 DECISION (2026-06-04) — dispatch lever **FALSIFIED**, reverted
+
+Step 1 (§8) picked the strongest clean candidate the dynamic data offered:
+**`OP_SET_LOCAL_KEEP`** — fuse an adjacent same-slot `SET_LOCAL n; GET_LOCAL n`
+(store top into the slot WITHOUT popping; the elided GET would have
+re-pushed it). This is the **dominant** clean fusion: the same-slot subset
+is **3.09–3.36% of all dispatch** across hello/HNE/M5 (#783 counter) — 2× the
+static §4 candidate #1 ceiling, and a *dynamic* property invisible to the
+static n-gram tool. (Static candidate #3 was already falsified in §8; #1 at
+1.56% is weaker.) The §7 menu said candidate #1-or-#3, but the goal is to
+test whether capturing dispatch moves WALL — so the spike tests the BEST
+clean fusion. Implemented as an emit-time peephole (record at `emitVarRef`,
+elide + compact at function end, re-base jumps) + one dispatch arm; no
+register-VM rework. ~165 LoC in emit.cc, default-ON, `NIX_V3_NO_FUSE_SETGET=1`
+to disable for clean same-binary A/B.
+
+**Correctness: PASS.** `hello.drvPath` and `HNE.drvPath` BYTE-IDENTICAL with
+fusion ON vs OFF (and vs the §8 TW-correct hashes). `--quick` 9/9.
+`OP_SET_LOCAL_KEEP` emits (75× in the hello prelude) and dispatches; the
+disassembler shows contiguous post-compaction offsets.
+
+**Wall: FALSIFIED.** Hyperfine (≥12 runs, no concurrent build):
+
+| measurement | fusion-ON | fusion-OFF | verdict |
+|---|---|---|---|
+| hello.drvPath, **cold** cache (compile+run) | 2.08 s ± 0.18 | 2.06 s ± 0.10 | ON 1.01× **slower** |
+| hello.drvPath, **warm** cache (runtime-isolated, separate cache dirs) | 1.362 s ± 0.024 | 1.376 s ± 0.031 | ON 1.01× faster — **Δ (1.0%) < σ → statistically zero** |
+| HNE.drvPath, cold cache | 23.8 s ± 2.1 | 18.5 s ± 7.4 | **unusable** (σ=40%, 38.8 s outlier) |
+
+Pre-committed gate (§7 Step 2): **KEEP ≥ 3%, REVERT < 1%.** Measured **≤ 1%,
+statistically indistinguishable from zero.** REVERT.
+
+**Why 3% is structurally unreachable for ANY single superinstruction here.**
+The win is bounded by `(dispatch fraction captured) × (dispatch share of
+wall)`. Even the dominant pattern captures only **3.19%** of dispatch, and
+`POST_PURE_PIPELINE_OPTS §6` puts dispatch at **~5% of wall** → ceiling
+**~0.16%** of wall. To reach 3% wall you would need to eliminate ~60% of ALL
+dispatch — no peephole on a single n-gram does that. The warm-cache number
+(~1% at the σ edge) is the most generous reading and still 3× under the gate.
+
+### Step 3 — the dispatch lever is FALSIFIED (the Rule-0 kill)
+
+**Hypothesis killed:** "capturing v3's ~49% stack-motion dispatch traffic via
+superinstructions moves WALL meaningfully (≥3%)." The pattern is **fusible**
+(Step 1 proved it, ~49–50% stack motion, top-16 bigrams 57–59%) and a fusion
+is **correct** (byte-identical) — but the **wall does not care**: the best
+single clean fusion is wall-neutral, and the arithmetic caps the whole class
+at sub-1%. Per §7 Step 3, the dispatch lever is **below the wall noise floor
+on these workloads**.
+
+**Consequence for the register VM.** The register VM is the *general* form of
+this same lever — it captures more push/copy WORK across all push→consumer
+pairs, but its win is bounded by the SAME `dispatch-share-of-wall ≈ 5%`
+envelope (it removes dispatch + stack-motion work, not the eval work that is
+the other 95%). The cheap spike measured the per-fused-pair WORK saving
+(SET_LOCAL_KEEP elides the GET's Value copy too) at **~1% for 3.19% of pairs**
+→ extrapolating the full stack-motion set stays well inside the interpreter
+ceiling and does not justify a multi-week register-VM arc **on wall grounds**.
+**Do not open the register-VM arc to chase wall.** [[memory-first]] — the GC /
+peak-RSS axis remains the higher-slope lever (§6 and the SESSION_ARC GC docs).
+
+**Reverted** (commit deletes `OP_SET_LOCAL_KEEP` + the emit peephole +
+compaction + dispatch arm; opcode 0x58 left reserved against intermediate
+disk caches). **Named kept pieces:** the Step-1 trigram counter
+(`alloc.hh::trigramCounts`, `NIX_VM_TRIGRAMS`) and the static tooling
+(`NIX_V3_EMIT_BYTECODE`, `analyze-bytecode.py`) stay — they are general
+measurement surface, not part of the falsified lever.
+
+**Anti-spiral note.** This is one decisive spike, not an ambiguous 1–3% that
+invites a second variant: theory (0.16% ceiling) AND measurement (≤1%, within
+σ) agree the result is structurally sub-gate. The §7 "three failed spikes =
+falsification" clause is for the ambiguous case; here one spike + the
+arithmetic closes it. A future register-VM proposal must clear a FRESH,
+pre-committed wall gate that confronts the 5%-dispatch-of-wall ceiling head-on.
+
+---
+
+## 10. Cross-references
 - [[observability-audit-2026-06-03]] — measurement surface (this extends it)
 - [[post-pure-pipeline-opts-2026-06-02]] §6 — dispatch ~5% of wall (the bound)
 - [[v3-vm-state-2026-06-02]] §5.7 — register-VM as biggest post-5/6 lever; #778/#780/#782
 - [[measure-twice-cut-once]] — Step 2's cap+pre-commit variant
 - [[falsification-rule]] — Step 3 exit
-- Code: `emit.cc::compile` (NIX_V3_EMIT_BYTECODE), `bench/analyze-bytecode.py`,
-  `disasm.cc::opExtraWords` (the width table), `alloc.hh::bigramCounts` +
-  `alloc.hh::trigramCounts` (Step-1, built 2026-06-04) + `vm.cc` dispatch
-  block (NIX_VM_TRIGRAMS) + dumps in `run.cc` / `cli/v3-eval.cc`
+- Code (KEPT — general measurement surface): `emit.cc::compile`
+  (NIX_V3_EMIT_BYTECODE), `bench/analyze-bytecode.py`,
+  `disasm.cc::opExtraWords` (width table), `alloc.hh::bigramCounts` +
+  `alloc.hh::trigramCounts` (Step-1) + `vm.cc` dispatch block
+  (NIX_VM_TRIGRAMS) + dumps in `run.cc` / `cli/v3-eval.cc`
+- Code (REVERTED — the falsified Step-2 fusion): `OP_SET_LOCAL_KEEP` (0x58,
+  now reserved) + the emit-time peephole/compaction in `emit.cc` + the
+  `vm.cc` dispatch arm + `NIX_V3_NO_FUSE_SETGET`. Deleted 2026-06-04; see §9.
 
 ---
 

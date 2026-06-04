@@ -116,6 +116,13 @@ enum Op : uint8_t
     /// callee's eventual OP_RETURN pops the (modified) current frame
     /// so the result lands at our caller.
     OP_TAIL_CALL      = 0x57,
+    // 0x58 was OP_SET_LOCAL_KEEP — a Step-2 superinstruction spike
+    // (BYTECODE_NGRAM_ANALYSIS §7) that fused adjacent same-slot
+    // SET_LOCAL;GET_LOCAL.  FALSIFIED + reverted 2026-06-04: the fusion
+    // was correct (drvPath byte-identical) but wall-neutral (≤1%, within
+    // σ), structurally bounded to a ~0.16% ceiling.  See §10 of that doc.
+    // Reserved — don't reuse 0x58 until a disk-cache schema bump, in case
+    // an intermediate cache built during the spike is still around.
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list
