@@ -52,6 +52,7 @@ const char * opName(Op op)
     case OP_GET_LOCAL_FORCE:   return "OP_GET_LOCAL_FORCE";
     case OP_GET_UPVALUE_FORCE: return "OP_GET_UPVALUE_FORCE";
     case OP_TAIL_CALL:         return "OP_TAIL_CALL";
+    case OP_SET_LOCAL_KEEP:    return "OP_SET_LOCAL_KEEP";
     case OP_LIST_INIT:         return "OP_LIST_INIT";
     case OP_LIST_CONCAT:       return "OP_LIST_CONCAT";
     case OP_ATTRS_INIT:        return "OP_ATTRS_INIT";

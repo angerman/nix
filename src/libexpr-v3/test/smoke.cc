@@ -2019,7 +2019,13 @@ static int testDeferSkipsManyUseBinding()
     auto entry = m.freshBlock();
     funcOf(m, 0).entryBlock = entry;
     // x = 5; x + x  → x is Many (used twice).  Must SET to a slot
-    // because deferring "consumes" the value off the stack.
+    // because deferring "consumes" the value off the stack.  The first
+    // use is adjacent to the SET, so the SET_LOCAL_KEEP fusion
+    // (BYTECODE_NGRAM_ANALYSIS §7) collapses `SET_LOCAL x; GET_LOCAL x`
+    // into `SET_LOCAL_KEEP x` — which STILL stores the slot (the test's
+    // intent: a Many binding gets a real slot store, not a defer), so
+    // the second read still loads from the slot.  Expected shape:
+    //   LIT_INT 5; SET_LOCAL_KEEP 0; GET_LOCAL 0; ADD.
     auto x   = addBinding(m, entry, ir::LitInt{5});
     auto sum = addBinding(m, entry, ir::Add{x, x});
     setReturn(m, entry, sum);
@@ -2029,8 +2035,7 @@ static int testDeferSkipsManyUseBinding()
 
     const char * expected = R"(
         ; CHECK: OP_LIT_INT
-        ; CHECK: OP_SET_LOCAL
-        ; CHECK: OP_GET_LOCAL
+        ; CHECK: OP_SET_LOCAL_KEEP
         ; CHECK: OP_GET_LOCAL
         ; CHECK: OP_ADD
     )";
@@ -2049,7 +2054,8 @@ static int testDeferSkipsManyUseBinding()
         return 1;
     }
     std::fprintf(stderr,
-        "testDeferSkipsManyUseBinding: OK (Many binding gets SET, value=10)\n");
+        "testDeferSkipsManyUseBinding: OK (Many binding gets slot store via "
+        "SET_LOCAL_KEEP fusion, value=10)\n");
     return 0;
 }
 

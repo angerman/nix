@@ -350,6 +350,7 @@ uint64_t opcodeTableFingerprint()
             {"OP_GET_LOCAL_FORCE", OP_GET_LOCAL_FORCE},
             {"OP_GET_UPVALUE_FORCE", OP_GET_UPVALUE_FORCE},
             {"OP_TAIL_CALL",       OP_TAIL_CALL},
+            {"OP_SET_LOCAL_KEEP",  OP_SET_LOCAL_KEEP},
             {"OP_LIST_INIT",       OP_LIST_INIT},
             {"OP_LIST_CONCAT",     OP_LIST_CONCAT},
             {"OP_ATTRS_INIT",      OP_ATTRS_INIT},

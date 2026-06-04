@@ -116,13 +116,16 @@ enum Op : uint8_t
     /// callee's eventual OP_RETURN pops the (modified) current frame
     /// so the result lands at our caller.
     OP_TAIL_CALL      = 0x57,
-    // 0x58 was OP_SET_LOCAL_KEEP — a Step-2 superinstruction spike
-    // (BYTECODE_NGRAM_ANALYSIS §7) that fused adjacent same-slot
-    // SET_LOCAL;GET_LOCAL.  FALSIFIED + reverted 2026-06-04: the fusion
-    // was correct (drvPath byte-identical) but wall-neutral (≤1%, within
-    // σ), structurally bounded to a ~0.16% ceiling.  See §10 of that doc.
-    // Reserved — don't reuse 0x58 until a disk-cache schema bump, in case
-    // an intermediate cache built during the spike is still around.
+    /// Superinstruction (BYTECODE_NGRAM_ANALYSIS §7, shipped 2026-06-04):
+    /// fuse an OP_SET_LOCAL immediately followed by a same-slot
+    /// OP_GET_LOCAL.  Stores the operand-stack top into the slot WITHOUT
+    /// popping (the elided GET would have re-pushed it) — net stack effect
+    /// identical to SET_LOCAL;GET_LOCAL, one fewer dispatch + one fewer
+    /// Value copy/pop.  The emit-time peephole only fuses RESERVED locals
+    /// (slot < nLocals), which sit strictly below the top, so no auto-grow
+    /// path is needed (unlike OP_SET_LOCAL).  Measured +1.4% wall on
+    /// hello.drvPath (warm+cold), +2.4% on dispatch-heavy compute.
+    OP_SET_LOCAL_KEEP = 0x58,  // [slot:24]   store top into slot, keep on stack
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

@@ -122,6 +122,18 @@ struct Emitter
     };
     FuncCtx * ctx = nullptr;
 
+    // SET_LOCAL_KEEP fusion (BYTECODE_NGRAM_ANALYSIS §7).  Per-function
+    // bookkeeping for the adjacent same-slot `SET_LOCAL n; GET_LOCAL n` →
+    // `SET_LOCAL_KEEP n` peephole; emitFunction is non-re-entrant (flat
+    // loop in compile()), so plain members suffice.  Every jump is created
+    // via emitJumpPlaceholder()+patchJump(); hooking those captures the
+    // complete jump structure (insn positions + targets) with zero
+    // bytecode scanning, so compactFuseSetGet() can re-base operands and
+    // skip eliding a GET that is a branch-join target.
+    std::vector<uint32_t>        fuseGetPositions_;
+    std::vector<uint32_t>        jumpInsnPositions_;
+    std::unordered_set<uint32_t> jumpTargetPositions_;
+
     /// #548c (2026-05-10): set by emitBlock when emitting the
     /// terminal-return binding of the function's entry block.  Non-
     /// rec AttrSets in this position become OP_ATTRS_REC_INIT
@@ -259,6 +271,30 @@ struct Emitter
         return s;
     }
 
+    /// Emit OP_GET_LOCAL, recording a SET_LOCAL_KEEP fusion candidate when
+    /// the previous instruction is a same-slot SET_LOCAL (reserved local).
+    /// Elision is deferred to compactFuseSetGet() at function end, where
+    /// the complete jump-target set is known.  See BYTECODE_NGRAM_ANALYSIS §7.
+    ///
+    /// NIX_V3_NO_FUSE_SETGET=1 disables the fusion (mirrors NIX_V3_NO_DEFER):
+    /// a regression-bisection / A-B switch, default-ON.  RETIREMENT: drop the
+    /// switch once the fusion is subsumed by a future register-VM operand-fold
+    /// pass, or if it is ever shown net-negative on wall (revert the whole
+    /// peephole, not just the switch).
+    void emitGetLocal(uint16_t slot)
+    {
+        static const bool noFuse =
+            std::getenv("NIX_V3_NO_FUSE_SETGET") != nullptr;
+        if (!noFuse && !unit.code.empty()
+            && unit.code.back() == encode(OP_SET_LOCAL, slot)
+            && slot < ctx->nLocals)
+        {
+            fuseGetPositions_.push_back(
+                static_cast<uint32_t>(unit.code.size()));
+        }
+        unit.code.push_back(encode(OP_GET_LOCAL, slot));
+    }
+
     void emitVarRef(ir::VarId v)
     {
         // #542 deferring discipline: emitVarRef ALWAYS flushes any
@@ -278,7 +314,7 @@ struct Emitter
         // matching the no-deferring baseline.
         flushAllDeferred();
         if (auto it = ctx->slot.find(v); it != ctx->slot.end()) {
-            unit.code.push_back(encode(OP_GET_LOCAL, it->second));
+            emitGetLocal(it->second);   // Step-2 fusion: records SET;GET candidates
             return;
         }
         if (auto uit = ctx->upvalue.find(v); uit != ctx->upvalue.end()) {
@@ -320,8 +356,10 @@ struct Emitter
     /// (so the caller can patch in the absolute target later).
     uint32_t emitJumpPlaceholder(Op op)
     {
+        uint32_t at = static_cast<uint32_t>(unit.code.size());
         unit.code.push_back(encode(op, 0));
-        return static_cast<uint32_t>(unit.code.size() - 1);
+        jumpInsnPositions_.push_back(at);   // Step-2 fusion: for operand re-base
+        return at;
     }
 
     void patchJump(uint32_t at, uint32_t target)
@@ -329,6 +367,7 @@ struct Emitter
         // Preserve the opcode byte; replace the 24-bit operand.
         Instruction prev = unit.code[at];
         unit.code[at] = (prev & 0xFF000000u) | (target & 0x00FFFFFFu);
+        jumpTargetPositions_.insert(target);  // Step-2 fusion: never elide a GET here
     }
 
     /// Record `(bytecode-offset, site-string)` for a force-flavoured
@@ -1452,6 +1491,65 @@ struct Emitter
         return s;
     }
 
+    /// Step-2 fusion: collapse adjacent same-slot SET_LOCAL;GET_LOCAL in
+    /// [codeStart, end) into SET_LOCAL_KEEP.  In-place compaction over
+    /// THIS function's body only (O(function), prefix untouched); re-bases
+    /// this function's jump operands + diagnostic force-emit offsets.
+    /// Skips any GET that is a branch-join target (jumpTargetPositions_).
+    void compactFuseSetGet(uint32_t codeStart)
+    {
+        if (fuseGetPositions_.empty()) return;
+
+        std::vector<uint32_t> rem;
+        rem.reserve(fuseGetPositions_.size());
+        for (uint32_t getPos : fuseGetPositions_) {
+            if (jumpTargetPositions_.count(getPos)) continue;
+            if (getPos == 0 || getPos >= unit.code.size()) continue;
+            Instruction setI = unit.code[getPos - 1];
+            Instruction getI = unit.code[getPos];
+            if (decodeOp(setI) != OP_SET_LOCAL) continue;
+            if (decodeOp(getI) != OP_GET_LOCAL) continue;
+            if (decodeOperand(setI) != decodeOperand(getI)) continue;
+            rem.push_back(getPos);
+        }
+        if (rem.empty()) return;
+        std::sort(rem.begin(), rem.end());
+
+        const uint32_t end = static_cast<uint32_t>(unit.code.size());
+        auto shift = [&](uint32_t o) -> uint32_t {
+            return static_cast<uint32_t>(
+                std::lower_bound(rem.begin(), rem.end(), o) - rem.begin());
+        };
+
+        for (uint32_t getPos : rem) {
+            Instruction setI = unit.code[getPos - 1];
+            unit.code[getPos - 1] =
+                encode(OP_SET_LOCAL_KEEP, decodeOperand(setI));
+        }
+
+        // In-place compact [codeStart, end): slide survivors down.
+        size_t w = codeStart;
+        size_t ri = 0;
+        for (uint32_t o = codeStart; o < end; ++o) {
+            if (ri < rem.size() && o == rem[ri]) { ++ri; continue; }
+            unit.code[w++] = unit.code[o];
+        }
+        unit.code.resize(w);
+
+        // Re-base this function's jump operands.
+        for (uint32_t at : jumpInsnPositions_) {
+            uint32_t newAt = at - shift(at);
+            Instruction ins = unit.code[newAt];
+            unit.code[newAt] = encode(decodeOp(ins),
+                                decodeOperand(ins) - shift(decodeOperand(ins)));
+        }
+
+        // Re-base this function's force-emit-site offsets (contiguous tail).
+        for (auto it = unit.forceEmitSites.rbegin();
+             it != unit.forceEmitSites.rend() && it->first >= codeStart; ++it)
+            it->first -= shift(it->first);
+    }
+
     void emitFunction(ir::FuncId fid)
     {
         const ir::Function & f = m.functions[fid];
@@ -1487,10 +1585,19 @@ struct Emitter
         ctx = &fc;
         uint32_t codeStart = static_cast<uint32_t>(unit.code.size());
 
+        // Step-2 fusion: reset per-function bookkeeping.
+        fuseGetPositions_.clear();
+        jumpInsnPositions_.clear();
+        jumpTargetPositions_.clear();
+
         if (f.entryBlock != ir::kInvalidBlock)
             emitBlock(f.entryBlock);
         else
             unit.code.push_back(encode(OP_LIT_NULL));
+
+        // Step-2 fusion: compact adjacent same-slot SET;GET (before the
+        // tail-call / selector peepholes; no-op when no safe candidate).
+        compactFuseSetGet(codeStart);
 
         // #498: dump bytecode + slot map for any function named "final"
         // or "prev" (extends's `final:` lambda + its inner LetRec thunk).

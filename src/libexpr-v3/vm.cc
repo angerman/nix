@@ -3235,6 +3235,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             }
             break;
         }
+        case OP_SET_LOCAL_KEEP: {
+            // Step-2 superinstruction: fused SET_LOCAL + adjacent same-slot
+            // GET_LOCAL.  Store top into the slot WITHOUT popping (the
+            // elided GET would have re-pushed it).  Only emitted for
+            // reserved locals (slot < nLocals), always in range + below top.
+            vm.valueStack[stackBase + operand] = vm.valueStack.back();
+            break;
+        }
         case OP_GET_UPVALUE: {
             if (!closure)
                 throw std::runtime_error("v3 OP_GET_UPVALUE: no closure context");

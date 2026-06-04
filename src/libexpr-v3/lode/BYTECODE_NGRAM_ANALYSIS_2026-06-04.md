@@ -1,15 +1,17 @@
 # Static bytecode opcode + n-gram analysis — register-VM / superinstruction decision input
 
 **Date:** 2026-06-04
-**Status:** CLOSED — dispatch lever **FALSIFIED** on wall (2026-06-04).
-Static opcode-frequency and bi/tri/4-gram analysis (§1-6) → measure-first
-`/goal` (§7) → Step-1 dynamic trigram confirmation **PASSED** (§8, gate
-cleared 2×) → Step-2 `SET_LOCAL_KEEP` superinstruction spike **wall-neutral
-(≤1%, within σ)** → Step-3 **REVERT + falsify** (§9): the ~49% stack-motion
-pattern is fusible and a fusion is correct (byte-identical), but the wall
-doesn't care — bounded to a ~0.16% ceiling by dispatch ≈ 5% of wall. Do NOT
-open the register-VM arc to chase wall; memory/GC remains the higher-slope
-axis. Kept: Step-1 trigram counter + static tooling (general measurement).
+**Status:** CLOSED — `SET_LOCAL_KEEP` superinstruction **SHIPPED** (2026-06-04).
+Static opcode-frequency + bi/tri/4-gram analysis (§1-6) → measure-first `/goal`
+(§7) → Step-1 dynamic trigram confirmation **PASSED** (§8) → Step-2
+`SET_LOCAL_KEEP` (fuse adjacent same-slot SET;GET) → Step-3 **SHIP** (§9):
+**real, correct +1.4% wall on real workloads** (+2.4% dispatch-heavy compute),
+byte-identical, negligible compile cost. NOTE: an initial *imprecise* (noisy,
+non-quiet-host) measurement wrongly read it "wall-neutral" and reverted; a
+**precise re-measurement** (quiet host, n≥40, amplified microbench) corrected
+that and shipped it. The single peephole ships; the multi-week **register-VM**
+arc is still NOT justified on wall (~1.4% is modest; memory/GC remains the
+higher-slope axis). See §9 for the methodology lesson.
 **Author:** session synthesis (code-grounded; tooling at `emit.cc` +
 `bench/analyze-bytecode.py`, validated 0 decode errors over 13.2M insns).
 
@@ -277,80 +279,87 @@ grep -oE 'trigrams: total=[0-9]+' /tmp/tg.txt | sort -t= -k2 -n | tail -1
 
 ---
 
-## 9. Step 2 RESULT + Step 3 DECISION (2026-06-04) — dispatch lever **FALSIFIED**, reverted
+## 9. Step 2 RESULT + Step 3 DECISION (2026-06-04) — `SET_LOCAL_KEEP` **SHIPPED** (real +1.4% wall)
 
 Step 1 (§8) picked the strongest clean candidate the dynamic data offered:
 **`OP_SET_LOCAL_KEEP`** — fuse an adjacent same-slot `SET_LOCAL n; GET_LOCAL n`
-(store top into the slot WITHOUT popping; the elided GET would have
-re-pushed it). This is the **dominant** clean fusion: the same-slot subset
-is **3.09–3.36% of all dispatch** across hello/HNE/M5 (#783 counter) — 2× the
-static §4 candidate #1 ceiling, and a *dynamic* property invisible to the
-static n-gram tool. (Static candidate #3 was already falsified in §8; #1 at
-1.56% is weaker.) The §7 menu said candidate #1-or-#3, but the goal is to
-test whether capturing dispatch moves WALL — so the spike tests the BEST
-clean fusion. Implemented as an emit-time peephole (record at `emitVarRef`,
-elide + compact at function end, re-base jumps) + one dispatch arm; no
-register-VM rework. ~165 LoC in emit.cc, default-ON, `NIX_V3_NO_FUSE_SETGET=1`
-to disable for clean same-binary A/B.
+(store top into the slot WITHOUT popping; the elided GET would have re-pushed
+it). The same-slot subset is **3.09–3.36% of all dispatch** across hello/HNE/M5
+(#783 counter) — a *dynamic* property invisible to the static n-gram tool.
+Implemented as an emit-time peephole (record at `emitVarRef`, elide + in-place
+O(per-function) compaction at function end, re-base this function's jump
+operands) + one dispatch arm; no register-VM rework. ~165 LoC in emit.cc,
+default-ON, `NIX_V3_NO_FUSE_SETGET=1` disable switch (mirrors NIX_V3_NO_DEFER).
 
-**Correctness: PASS.** `hello.drvPath` and `HNE.drvPath` BYTE-IDENTICAL with
-fusion ON vs OFF (and vs the §8 TW-correct hashes). `--quick` 9/9.
-`OP_SET_LOCAL_KEEP` emits (75× in the hello prelude) and dispatches; the
-disassembler shows contiguous post-compaction offsets.
+**Correctness: PASS.** `hello.drvPath` + `HNE.drvPath` BYTE-IDENTICAL fusion ON
+vs OFF (and vs the §8 TW-correct hashes). `--quick` 9/9, `--core` 19/19 (one
+golden, `testDeferSkipsManyUseBinding`, updated to the fused shape with intent
+preserved). Only fuses RESERVED locals (slot < nLocals → always in range +
+below top), so the dispatch arm needs no bounds-grow path.
 
-**Wall: FALSIFIED.** Hyperfine (≥12 runs, no concurrent build):
+### The measurement was done TWICE — the first read was wrong
 
-| measurement | fusion-ON | fusion-OFF | verdict |
-|---|---|---|---|
-| hello.drvPath, **cold** cache (compile+run) | 2.08 s ± 0.18 | 2.06 s ± 0.10 | ON 1.01× **slower** |
-| hello.drvPath, **warm** cache (runtime-isolated, separate cache dirs) | 1.362 s ± 0.024 | 1.376 s ± 0.031 | ON 1.01× faster — **Δ (1.0%) < σ → statistically zero** |
-| HNE.drvPath, cold cache | 23.8 s ± 2.1 | 18.5 s ± 7.4 | **unusable** (σ=40%, 38.8 s outlier) |
+**Round 1 (imprecise) → mistakenly REVERTED.** Whole-eval hyperfine (12 runs)
+*while a concurrent memory-instrumentation workload ran on the same host*. It
+showed hello cold "ON 1.01× slower", warm "ON 1.01× faster (Δ<σ)", HNE
+unusable (σ=40%). Read as "wall-neutral / ≤1% / statistically zero" and
+reverted with a **`~0.16%` ceiling argument that was wrong** (it counted
+*dispatch only* at ~5% of wall and ignored that the fusion also elides the
+Value **copy + pop**, and that dispatch-share-of-wall varies hugely by
+workload). The noise floor (σ ≈ 2%, HNE 40%) was *larger than the effect*, so
+Round 1 could not resolve it — it could only exclude ≥3%.
 
-Pre-committed gate (§7 Step 2): **KEEP ≥ 3%, REVERT < 1%.** Measured **≤ 1%,
-statistically indistinguishable from zero.** REVERT.
+**Round 2 (precise) → SHIP.** Re-measured on a **quiet host**, same-binary A/B
+via the disable switch, **n = 40–50**, plus an **amplified pure-compute
+microbench** (dispatch-dominated, F = 2.68% KEEP, escapes hello's GC/mark
+jitter):
 
-**Why 3% is structurally unreachable for ANY single superinstruction here.**
-The win is bounded by `(dispatch fraction captured) × (dispatch share of
-wall)`. Even the dominant pattern captures only **3.19%** of dispatch, and
-`POST_PURE_PIPELINE_OPTS §6` puts dispatch at **~5% of wall** → ceiling
-**~0.16%** of wall. To reach 3% wall you would need to eliminate ~60% of ALL
-dispatch — no peephole on a single n-gram does that. The warm-cache number
-(~1% at the σ edge) is the most generous reading and still 3× under the gate.
+| measurement | ON | OFF | Δ (ON faster) | 95% CI | sig? |
+|---|---|---|---|---|---|
+| hello.drvPath **cold** (compile+run) | 1.978 s ± .068 | 1.999 s ± .047 | **+1.05%** | [−0.3%, +2.4%] | n.s. |
+| hello.drvPath **warm** (runtime) | 1.311 s ± .037 | 1.330 s ± .036 | **+1.4%** | [+0.2%, +2.7%] | marginal |
+| pure-compute loop (dispatch-dominated) | 1.491 s ± .031 | 1.527 s ± .050 | **+2.4%** | [+1.3%, +3.4%] | **yes (t≈4.3)** |
 
-### Step 3 — the dispatch lever is FALSIFIED (the Rule-0 kill)
+All three show ON **faster**, consistently, at both cache states. The compile
+cost of the (O(per-function)) compaction is **negligible** (cold ≈ warm — the
+Round-1 "cold slower" was concurrent-workload noise). So the fusion is a
+**real, correct ~1.4% wall win on real workloads** (~2.4% on dispatch-heavy
+compute), not the "wall-neutral" of Round 1.
 
-**Hypothesis killed:** "capturing v3's ~49% stack-motion dispatch traffic via
-superinstructions moves WALL meaningfully (≥3%)." The pattern is **fusible**
-(Step 1 proved it, ~49–50% stack motion, top-16 bigrams 57–59%) and a fusion
-is **correct** (byte-identical) — but the **wall does not care**: the best
-single clean fusion is wall-neutral, and the arithmetic caps the whole class
-at sub-1%. Per §7 Step 3, the dispatch lever is **below the wall noise floor
-on these workloads**.
+### Decision: SHIP (gray-zone, user call)
 
-**Consequence for the register VM.** The register VM is the *general* form of
-this same lever — it captures more push/copy WORK across all push→consumer
-pairs, but its win is bounded by the SAME `dispatch-share-of-wall ≈ 5%`
-envelope (it removes dispatch + stack-motion work, not the eval work that is
-the other 95%). The cheap spike measured the per-fused-pair WORK saving
-(SET_LOCAL_KEEP elides the GET's Value copy too) at **~1% for 3.19% of pairs**
-→ extrapolating the full stack-motion set stays well inside the interpreter
-ceiling and does not justify a multi-week register-VM arc **on wall grounds**.
-**Do not open the register-VM arc to chase wall.** [[memory-first]] — the GC /
-peak-RSS axis remains the higher-slope lever (§6 and the SESSION_ARC GC docs).
+Pre-committed gate (§7 Step 2): KEEP ≥ 3%, REVERT < 1%. The precise **~1.4%**
+(real workloads) sits in the **gray zone** the contract left undefined (above
+the 1% revert floor, below the 3% keep bar). With the Round-1 revert rationale
+(0.16% ceiling / wall-neutral) **falsified by Round 2**, and the win real +
+correct + free in steady state with negligible compile cost, the call was to
+**SHIP** the single peephole.
 
-**Reverted** (commit deletes `OP_SET_LOCAL_KEEP` + the emit peephole +
-compaction + dispatch arm; opcode 0x58 left reserved against intermediate
-disk caches). **Named kept pieces:** the Step-1 trigram counter
-(`alloc.hh::trigramCounts`, `NIX_VM_TRIGRAMS`) and the static tooling
-(`NIX_V3_EMIT_BYTECODE`, `analyze-bytecode.py`) stay — they are general
-measurement surface, not part of the falsified lever.
+**Two hypotheses killed:**
+1. "The dispatch lever is wall-neutral / its ceiling is ~0.16%" (my Round-1
+   read) — **FALSIFIED** by Round 2: the effect is real (+1.4%/+2.4%, CIs
+   exclude 0) because the fusion removes copy/pop **work**, not just dispatch,
+   and dispatch-share-of-wall is workload-dependent (pure compute nearly hits
+   the 3% bar).
+2. "A single superinstruction clears the 3% gate / justifies the multi-week
+   **register-VM** rewrite **on wall grounds**" — **NOT supported**: the
+   dominant clean fusion yields ~1.4% on real workloads. The register VM is the
+   general form; a few % is plausible but does not justify a multi-week arc
+   when [[memory-first]] (peak-RSS) remains the higher-slope axis. **Do not open
+   the register-VM arc to chase wall** — but the per-pattern lever is *real and
+   shippable*, which is why this peephole ships and the register VM does not.
 
-**Anti-spiral note.** This is one decisive spike, not an ambiguous 1–3% that
-invites a second variant: theory (0.16% ceiling) AND measurement (≤1%, within
-σ) agree the result is structurally sub-gate. The §7 "three failed spikes =
-falsification" clause is for the ambiguous case; here one spike + the
-arithmetic closes it. A future register-VM proposal must clear a FRESH,
-pre-committed wall gate that confronts the 5%-dispatch-of-wall ceiling head-on.
+### Methodology lesson (the load-bearing one)
+
+Round 1 mis-concluded because (a) the host was not quiet, (b) whole-eval
+hyperfine's noise floor (~2%) exceeded the effect, and (c) the ceiling estimate
+double-counted "dispatch-only." Round 2 fixed all three: quiet host + n≥40 +
+an **amplified microbench** that lifts the signal above the noise + the
+realization that **arithmetic operands are FORCED** (`a+a` → `GET_LOCAL_FORCE`,
+already a superinstruction), so the *plain*-GET fusable pattern is intrinsically
+~3% and cannot be amplified beyond ~mid-single-digits even in dense code. When
+the effect is below the whole-eval noise floor, **amplify it (microbench) or
+measure the mechanism directly — do not infer "zero" from a noisy null**.
 
 ---
 
@@ -360,14 +369,16 @@ pre-committed wall gate that confronts the 5%-dispatch-of-wall ceiling head-on.
 - [[v3-vm-state-2026-06-02]] §5.7 — register-VM as biggest post-5/6 lever; #778/#780/#782
 - [[measure-twice-cut-once]] — Step 2's cap+pre-commit variant
 - [[falsification-rule]] — Step 3 exit
-- Code (KEPT — general measurement surface): `emit.cc::compile`
-  (NIX_V3_EMIT_BYTECODE), `bench/analyze-bytecode.py`,
-  `disasm.cc::opExtraWords` (width table), `alloc.hh::bigramCounts` +
-  `alloc.hh::trigramCounts` (Step-1) + `vm.cc` dispatch block
-  (NIX_VM_TRIGRAMS) + dumps in `run.cc` / `cli/v3-eval.cc`
-- Code (REVERTED — the falsified Step-2 fusion): `OP_SET_LOCAL_KEEP` (0x58,
-  now reserved) + the emit-time peephole/compaction in `emit.cc` + the
-  `vm.cc` dispatch arm + `NIX_V3_NO_FUSE_SETGET`. Deleted 2026-06-04; see §9.
+- Code (measurement surface): `emit.cc::compile` (NIX_V3_EMIT_BYTECODE),
+  `bench/analyze-bytecode.py`, `disasm.cc::opExtraWords` (width table),
+  `alloc.hh::bigramCounts` + `alloc.hh::trigramCounts` (Step-1) + `vm.cc`
+  dispatch block (NIX_VM_TRIGRAMS) + dumps in `run.cc` / `cli/v3-eval.cc`
+- Code (SHIPPED — the Step-2 fusion): `OP_SET_LOCAL_KEEP` (0x58) +
+  `emit.cc::emitGetLocal` + `compactFuseSetGet` (emit-time peephole + in-place
+  per-function compaction + jump re-base) + the `vm.cc` dispatch arm +
+  `NIX_V3_NO_FUSE_SETGET` disable switch + the `serialize.cc` opcode
+  fingerprint entry. Golden `test/smoke.cc::testDeferSkipsManyUseBinding`
+  updated to the fused shape.
 
 ---
 
