@@ -1377,6 +1377,20 @@ static void runEvacuation(VMState & vm, Arena & arena,
     { char anchor = 0; collectCStackDirectPins(arena, &anchor, pins); }
     std::sort(pins.begin(), pins.end());
     pins.erase(std::unique(pins.begin(), pins.end()), pins.end());
+    // DIAGNOSTIC: what ARE the direct C-stack pins?  Their transitive
+    // closure = the conservative-pinned set; if they are few + root-ish
+    // (e.g. the dispatch-loop closure), making THOSE precise unlocks
+    // pure-precise evacuation.  Gated by NIX_V3_EVAC_BRUTE.
+    if (std::getenv("NIX_V3_EVAC_BRUTE")) {
+        size_t byTy[16] = {0};
+        for (auto & [o, ty] : pins) byTy[static_cast<int>(ty) & 15]++;
+        std::fprintf(stderr, "v3 evac-pins: total=%zu Closure=%zu Thunk=%zu "
+            "Bindings=%zu List=%zu Pair=%zu Value=%zu None=%zu\n",
+            pins.size(), byTy[(int)CellType::Closure], byTy[(int)CellType::Thunk],
+            byTy[(int)CellType::Bindings], byTy[(int)CellType::List],
+            byTy[(int)CellType::Pair], byTy[(int)CellType::Value],
+            byTy[(int)CellType::None]);
+    }
 
     // A candidate block must contain NO directly-pinned cell.  pins are
     // sorted by address; lower_bound finds the first pin >= block start.
