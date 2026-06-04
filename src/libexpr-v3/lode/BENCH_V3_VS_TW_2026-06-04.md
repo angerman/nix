@@ -248,6 +248,24 @@ needs a representation; two options, both investigated:
 Then: combined `strictArgs` (step 4) + OP_CALL_N emit spine-fold (the win).
 Recommend a focused session — these are entangled hot paths (force/call/eq/GC).
 
+**The PAP convention must be CONSISTENT across THREE apply sites** (this is why
+it's a focused effort, not a one-spot edit — they must all agree on
+"under-applied arity-N closure ⇒ accumulate, don't enter"):
+1. **`OP_CALL`** (bytecode apply) — the PrimOpApp partial-app block at
+   `vm.cc:4476-4508` is the exact template (walk chain → depth vs arity →
+   extend-or-saturate). Add the closure variant after it; saturated entry
+   mirrors `5240-5390` but writes N slots; force-skip a closure-PAP at `4451`.
+2. **`callClosure`** (C++ primop apply path — map/filter/etc. applying a
+   user fn) — must build/accumulate the same Tag::App PAP for arity-N callees.
+3. **`op_force_slow` App-apply** (`vm.cc:6584-6656`) — when forcing a Tag::App
+   chain whose leaf is an arity-N closure with fewer collected args than the
+   arity, it is WHNF: return the original App, do NOT `callClosure` it.
+Scoped validation (foldl'/fib/ackermann, pure bytecode) exercises only site 1;
+gate-on `--core`/nixpkgs exercises 2+3 too, so all three are needed before
+default-on.  Reusing Tag::App means `==` (587-714) already traverses these as
+app-like (correct: PAPs compare like functions — not equal); double-check the
+`isAppLike` equality path treats an under-applied closure-PAP as a function.
+
 Original increment outline (kept for reference):
 
 1. **Multi-arity lambda lowering** (`cli/lower_v3.hh lowerLambda`): collapse a
