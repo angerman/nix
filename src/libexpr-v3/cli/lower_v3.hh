@@ -513,8 +513,16 @@ struct LowererV3 {
                 std::getenv("NIX_V3_EVAL_APPLY") != nullptr;
             const nix::v3::ast::Node * bodyToLower = lam->body;
             if (s_evalApply && !lam->arg.empty()) {
+                // Cap arity at 16 (1 paramVar + ≤15 extraParams): the VM's
+                // PAP saturate gathers into a fixed argbuf[16] and the
+                // LambdaDescriptor::arity field is uint8_t.  Beyond the cap the
+                // remaining lambdas stay curried (separate arity-1 Functions),
+                // so a pathological N-ary lambda (e.g. the curry-apply-5000
+                // test) degrades to the classic curried path rather than
+                // overflowing.  Real multi-arg functions are far under 16.
                 const nix::v3::ast::Node * b = lam->body;
-                while (b->kind == nix::v3::ast::Kind::Lambda) {
+                while (b->kind == nix::v3::ast::Kind::Lambda
+                       && m.functions[fid].extraParams.size() < 15) {
                     auto * il = static_cast<const nix::v3::ast::Lambda *>(b);
                     if (il->hasFormals || il->arg.empty()) break;
                     ir::VarId ep = m.freshVar();

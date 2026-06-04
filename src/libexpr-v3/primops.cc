@@ -694,6 +694,16 @@ void primIsFunction(EvalState &, Value * args, Value & out)
     static const bool s_dbg =
         std::getenv("V3_DBG_IS_FUNCTION") != nullptr;
     bool isfn = (args[0].isClosure() || args[0].isPrimOp() || args[0].tag() == Tag::PrimOpApp);
+    // eval/apply (#3): a closure-PAP — an under-applied arity-N closure
+    // represented as a Tag::App chain whose leaf is a Closure — is a function.
+    // The arg is already WHNF here (isFunction forces it), and a WHNF Tag::App
+    // can only be such a PAP (ordinary lazy apps force to their result).
+    if (!isfn && args[0].tag() == Tag::App) {
+        const Value * cur = &args[0];
+        while (cur->tag() == Tag::App && cur->payload.pair)
+            cur = &cur->payload.pair->left;
+        isfn = (cur->tag() == Tag::Closure);
+    }
     if (s_dbg) std::fprintf(stderr,
         "v3 primIsFunction: tag=%d → %s\n",
         (int)args[0].tag(), isfn ? "true" : "false");

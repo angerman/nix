@@ -5587,53 +5587,75 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         funThunkState, thunkName);
                 }
             }
-            // eval/apply (#3, gate-on only): a saturating TAIL call of a
-            // multi-arity closure-PAP.  `fun` is a Tag::App chain (e.g.
-            // `go (i+1)`) and `arg` saturates it.  Reuse the current frame
-            // (preserving O(1) tail recursion — the op_call_dispatch fallback
-            // below would PUSH a frame and overflow deep folds).  Mirrors the
-            // in-place retarget below (withStack reset + captured-withs).
-            // Gate-off inert: arity>1 closures don't exist.
-            if (fun.tag() == Tag::App && fun.payload.pair) {
-                const Value * c0 = &fun; size_t papDepth = 0;
-                while (c0->tag() == Tag::App && c0->payload.pair) {
-                    ++papDepth; c0 = &c0->payload.pair->left;
-                }
-                if (c0->tag() == Tag::Closure && c0->payload.closure
-                    && c0->payload.closure->desc
-                    && c0->payload.closure->desc->arity > 1) {
-                    const Closure * base = c0->payload.closure;
-                    const uint8_t A = base->desc->arity;
-                    const size_t total = papDepth + 1;
-                    if (total == A) {
-                        if (A > 16) throw std::runtime_error("v3 OP_TAIL_CALL: arity > 16");
-                        Value argbuf[16];
-                        argbuf[total - 1] = arg;
-                        Value chain = fun;
-                        for (size_t i = total - 1; i > 0; --i) {
-                            argbuf[i - 1] = chain.payload.pair->right;
-                            chain = chain.payload.pair->left;
-                        }
-                        const LambdaDescriptor * d = base->desc;
-                        const CompilationUnit * baseCu = base->cu ? base->cu : cu;
-                        vm.valueStack.resize(stackBase + d->nLocals);
-                        for (size_t i = 0; i < A; ++i)
-                            vm.valueStack[stackBase + i] = argbuf[i];
-                        CallFrame & cur = vm.frames.back();
-                        cur.cu = baseCu;
-                        cur.closure = base;
-                        cur.ip = d->codeOffset;
-                        if (vm.withStack.size() > cur.withStackBase)
-                            vm.withStack.resize(cur.withStackBase);
-                        cur.withStackBase = static_cast<uint32_t>(vm.withStack.size());
-                        pushCapturedWiths(vm, base->capturedWiths);
-                        ip = d->codeOffset;
-                        cu = baseCu;
-                        closure = base;
-                        break;
+            // eval/apply (#3, gate-on only): a TAIL call of a multi-arity
+            // closure or closure-PAP.  Resolve the leaf closure + collected-
+            // arg depth for BOTH a bare arity-N closure (`(a:b:…) x` in tail
+            // position — depth 0) and a Tag::App PAP chain (`go (i+1) next` —
+            // depth ≥ 1).  Gate-off inert (arity>1 closures don't exist).
+            {
+                const Closure * tcBase = nullptr; size_t papDepth = 0;
+                if (fun.tag() == Tag::Closure && fun.payload.closure) {
+                    tcBase = fun.payload.closure;
+                } else if (fun.tag() == Tag::App && fun.payload.pair) {
+                    const Value * c0 = &fun;
+                    while (c0->tag() == Tag::App && c0->payload.pair) {
+                        ++papDepth; c0 = &c0->payload.pair->left;
                     }
-                    // total < A (under-applied tail result): rare; fall
-                    // through to op_call_dispatch.
+                    if (c0->tag() == Tag::Closure && c0->payload.closure)
+                        tcBase = c0->payload.closure;
+                }
+                if (tcBase && tcBase->desc && tcBase->desc->arity > 1) {
+                    const uint8_t A = tcBase->desc->arity;
+                    const size_t total = papDepth + 1;
+                    if (total < A) {
+                        // Under-applied in tail position: the result is a PAP
+                        // (a value, NOT a tail call).  Build it, push it, and
+                        // fall through to the OP_RETURN the tail-call peephole
+                        // left right after this OP_TAIL_CALL (it rewrote the
+                        // OP_CALL in place), which returns the PAP to the
+                        // caller.  Without this, the frame would wrongly enter
+                        // the arity-N body with too few args (leaving the
+                        // unfilled param slots Uninitialized).
+                        ValuePair * vp = Alloc::allocPair();
+                        vp->left = fun; vp->right = arg;
+                        pairPostConstructBarrier(vp);
+                        Value v;
+                        v.tag_payload = static_cast<uint64_t>(Tag::App);
+                        v.payload.pair = vp;
+                        push(vm, v);
+                        break;  // ip already points at the trailing OP_RETURN
+                    }
+                    // Saturated (total == A — fun is a Tag::App PAP here, since
+                    // a bare arity>1 closure with 1 arg is under-applied above):
+                    // reuse the current frame (preserving O(1) tail recursion;
+                    // the op_call_dispatch fallback below would PUSH a frame
+                    // and overflow deep folds).  Mirrors the in-place retarget
+                    // below (withStack reset + captured-withs).
+                    if (A > 16) throw std::runtime_error("v3 OP_TAIL_CALL: arity > 16");
+                    Value argbuf[16];
+                    argbuf[total - 1] = arg;
+                    Value chain = fun;
+                    for (size_t i = total - 1; i > 0; --i) {
+                        argbuf[i - 1] = chain.payload.pair->right;
+                        chain = chain.payload.pair->left;
+                    }
+                    const LambdaDescriptor * d = tcBase->desc;
+                    const CompilationUnit * baseCu = tcBase->cu ? tcBase->cu : cu;
+                    vm.valueStack.resize(stackBase + d->nLocals);
+                    for (size_t i = 0; i < A; ++i)
+                        vm.valueStack[stackBase + i] = argbuf[i];
+                    CallFrame & cur = vm.frames.back();
+                    cur.cu = baseCu;
+                    cur.closure = tcBase;
+                    cur.ip = d->codeOffset;
+                    if (vm.withStack.size() > cur.withStackBase)
+                        vm.withStack.resize(cur.withStackBase);
+                    cur.withStackBase = static_cast<uint32_t>(vm.withStack.size());
+                    pushCapturedWiths(vm, tcBase->capturedWiths);
+                    ip = d->codeOffset;
+                    cu = baseCu;
+                    closure = tcBase;
+                    break;
                 }
             }
             if (!fun.isClosure()) {
