@@ -1562,6 +1562,11 @@ struct Emitter
         if (f.paramVar != ir::kInvalid &&
             (f.argName != ir::kInvalidSymbol || f.hasFormals))
             (void)getOrAssignSlot(fc, f.paramVar);
+        // eval/apply (#3): extra params of an uncurried arity-N function
+        // occupy slots 1..N-1, right after paramVar (slot 0).  A saturated
+        // OP_CALL_N writes the N args into these slots before entering.
+        for (ir::VarId ep : f.extraParams)
+            (void)getOrAssignSlot(fc, ep);
         // Upvalue order = freeVars.
         for (uint16_t i = 0; i < f.freeVars.size(); ++i)
             fc.upvalue[f.freeVars[i]] = i;
@@ -1675,7 +1680,7 @@ struct Emitter
             .prologueOffset = codeStart,
             .nUpvalues      = static_cast<uint16_t>(f.freeVars.size()),
             .nLocals        = fc.nLocals,
-            .arity          = static_cast<uint8_t>(f.argName != ir::kInvalidSymbol ? 1 : (f.hasFormals ? 1 : 0)),
+            .arity          = static_cast<uint8_t>((f.argName != ir::kInvalidSymbol ? 1 : (f.hasFormals ? 1 : 0)) + f.extraParams.size()),
             .hasFormals     = static_cast<uint8_t>(f.hasFormals ? 1 : 0),
             .ellipsis       = static_cast<uint8_t>(f.ellipsis ? 1 : 0),
             // #530 lexical-with chain — mirror the count from
