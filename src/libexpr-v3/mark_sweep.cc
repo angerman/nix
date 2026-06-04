@@ -1034,6 +1034,17 @@ public:
                 ++pinnedCells;  // unmovable type → leave; verify pins block
                 return;
             }
+            // Review #9: owner == null — an interior pointer into a
+            // candidate block with no resolvable cell-start at/below it.
+            // We cannot relocate it, so leave p as-is.  Do NOT fall
+            // through to visitValue(*p): *p lives in a candidate block
+            // about to be munmapped.  The block stays mapped because the
+            // VERIFY's MarkVisitor::visitSlot does tryMark(p) on the
+            // target granule (independent of cell-start), so
+            // anyMarkInRange pins the block → freeWholeBlock skips it and
+            // p remains valid.
+            ++pinnedCells;
+            return;
         }
         // Non-candidate slot target.  Walk its pointee content so deeper
         // pointers INTO candidates get rewritten...
@@ -1098,6 +1109,16 @@ public:
     void evacChars(const char * & s)
     {
         if (!s || !inCandidate(s)) return;
+        // Review #12: only relocate a char buffer when `s` is its START
+        // (an allocChars cell-start).  An interior char pointer (a
+        // substring/suffix sharing a larger buffer) would be strlen'd to
+        // the tail only → truncated copy, and its string-context entry
+        // (keyed at the buffer start) would be missed.  Leave interior
+        // pointers in place; the verify's visitString does tryMark(s),
+        // pinning the block so it is not freed.  (v3 allocChars per
+        // string, so interior char pointers are not expected — this is a
+        // correctness guard against truncation if one ever arises.)
+        if (!arena_.isCellStart(s)) { ++pinnedCells; return; }
         auto it = charForward_.find(s);
         if (it != charForward_.end()) { s = it->second; return; }
         const size_t n = std::strlen(s) + 1;
@@ -1323,6 +1344,36 @@ static void collectCStackDirectPins(
     for (uintptr_t p = bufLo; p < bufHi; p += sizeof(void *))
         consider(*reinterpret_cast<const uintptr_t *>(p));
     // NO drainConservative — Bartlett pins only the DIRECT references.
+}
+
+/// Review #2: erase string-context side-table entries whose char-buffer
+/// key lives in a now-freed (munmapped) block range.  The side-table is
+/// keyed by char-buffer pointer; without this, a later alloc at a
+/// recycled virtual address inherits the stale context → e.g. a glibc.drv
+/// store-path context attaches to an unrelated literal ("flags") →
+/// "not allowed to refer to a store path".  Shared by BOTH the
+/// whole-block-free / huge-reclaim path (runMajorMarkSweep) and the
+/// evacuation free path; previously only evac swept its own ranges, so
+/// blocks freed by the default whole-block-free path leaked stale context.
+/// `freedRanges` is sorted in place.
+static void sweepStringContextRanges(
+    std::vector<std::pair<uintptr_t, uintptr_t>> & freedRanges) noexcept
+{
+    if (freedRanges.empty()) return;
+    std::sort(freedRanges.begin(), freedRanges.end());
+    auto & tbl = stringContextSideTable();
+    for (auto it = tbl.begin(); it != tbl.end(); ) {
+        const uintptr_t k = reinterpret_cast<uintptr_t>(it->first);
+        auto rit = std::upper_bound(
+            freedRanges.begin(), freedRanges.end(), k,
+            [](uintptr_t key, const std::pair<uintptr_t, uintptr_t> & r) {
+                return key < r.first;
+            });
+        bool inFreed = false;
+        if (rit != freedRanges.begin()) { --rit; inFreed = (k < rit->second); }
+        if (inFreed) it = tbl.erase(it);
+        else ++it;
+    }
 }
 
 static void runEvacuation(VMState & vm, Arena & arena,
@@ -1729,36 +1780,10 @@ static void runEvacuation(VMState & vm, Arena & arena,
         }
     }
 
-    // Sweep stale string-context entries whose key lived in a now-freed
-    // block.  The side-table is keyed by char-buffer pointer; dead char
-    // buffers (the bulk of the freed bytes — M5: 17.7M dead cells) keep
-    // their entries after munmap.  When the arena later remaps/recycles
-    // that virtual address for a fresh string, lookupStringContextEntries
-    // would return the STALE context — e.g. attaching a glibc.drv store-
-    // path context to an unrelated literal ("flags"), which then throws
-    // "not allowed to refer to a store path".  This was M5's empty-result
-    // bug: the typed brute showed 0 cell-field dangles, yet M5 threw on a
-    // phantom context — the dangle was in this side-table, not in a cell.
-    if (!freedRanges.empty()) {
-        std::sort(freedRanges.begin(), freedRanges.end());
-        auto & tbl = stringContextSideTable();
-        for (auto it = tbl.begin(); it != tbl.end(); ) {
-            const uintptr_t k = reinterpret_cast<uintptr_t>(it->first);
-            // last freed range whose start <= k, then test k < its end.
-            auto rit = std::upper_bound(
-                freedRanges.begin(), freedRanges.end(), k,
-                [](uintptr_t key, const std::pair<uintptr_t, uintptr_t> & r) {
-                    return key < r.first;
-                });
-            bool inFreed = false;
-            if (rit != freedRanges.begin()) {
-                --rit;
-                inFreed = (k < rit->second);
-            }
-            if (inFreed) it = tbl.erase(it);
-            else ++it;
-        }
-    }
+    // Sweep stale string-context entries for the evac-freed ranges (the
+    // dead char buffers in candidate blocks we just munmapped) — see
+    // sweepStringContextRanges for the full rationale.
+    sweepStringContextRanges(freedRanges);
     auto tc3 = eclock::now();
     auto ms = [](eclock::time_point a, eclock::time_point b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -1887,13 +1912,45 @@ void runMajorMarkSweep(VMState & vm) noexcept
     // second pass so we don't mutate active_.blocks during the sweep
     // iteration.  Each freeWholeBlock removes the block from arena
     // metadata + filters its free-list entries.
+    // Collect the freed (begin,end) ranges so we can sweep the string-
+    // context side-table for them too (review #2): the previous code only
+    // swept the EVAC-freed ranges, leaking stale context for blocks freed
+    // by this default whole-block-free path.
+    std::vector<std::pair<uintptr_t, uintptr_t>> freedRanges;
     for (const char * blk : blocksToFree) {
         const size_t freed = arena.freeWholeBlock(blk);
         if (freed > 0) {
             ++sweep.blocksFreed;
             sweep.bytesFreed += freed;
+            freedRanges.emplace_back(
+                reinterpret_cast<uintptr_t>(blk),
+                reinterpret_cast<uintptr_t>(blk) + Arena::kBlockSize);
         }
     }
+
+    // Review #4: reclaim DEAD huge blocks (>4 MB, e.g. M5's 170k-entry
+    // Bindings).  A huge block IS a single cell; if its begin address was
+    // not marked, it is unreachable.  munmap returns its RSS (the alloc
+    // path mmaps huge blocks under the major-GC gate).  Without this, huge
+    // blocks accumulated for the whole eval (unbounded RSS) — the dominant
+    // cost on M5 and directly counter to the no-Boehm / peak-RSS goal.
+    // Iterate a snapshot (freeHugeBlock mutates the live vector).
+    for (auto & [hbeg, hsz] : arena.hugeBlockRanges()) {
+        if (!marker.isMarked(hbeg)) {
+            const size_t freed = arena.freeHugeBlock(hbeg);
+            if (freed > 0) {
+                ++sweep.blocksFreed;
+                sweep.bytesFreed += freed;
+                freedRanges.emplace_back(
+                    reinterpret_cast<uintptr_t>(hbeg),
+                    reinterpret_cast<uintptr_t>(hbeg) + freed);
+            }
+        }
+    }
+
+    // Review #2: sweep stale string-context entries for the whole-block +
+    // huge freed ranges (the evac path sweeps its own ranges separately).
+    sweepStringContextRanges(freedRanges);
 
     // R2.4b: metadata-aware evacuation of sparse candidate blocks (the
     // moving GC that actually returns RSS for v3's scattered dead).

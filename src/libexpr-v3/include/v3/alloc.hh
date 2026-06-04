@@ -1026,39 +1026,38 @@ public:
         // 16-byte align the request.
         bytes = (bytes + 15) & ~size_t{15};
         if (bytes > kHugeCutoff) {
-            // Oversized: dedicated allocation outside the regular
-            // block churn.  REVIEW CRIT-4 critic: register the block
-            // with Boehm so any Value pointers stored inside it are
-            // visible to the GC.  Pre-fix used std::malloc which left
-            // the storage invisible; payloads inside (Closure*,
-            // Bindings*, ...) were reachable only via the conservative
-            // C-stack scan.  std::calloc zero-fills so stale bit
-            // patterns don't pin objects.
-            void * blk = std::calloc(1, bytes);
-#if NIX_USE_BOEHMGC
-            // Arena deregistration gate (per ARENA_DEREGISTRATION_
-            // DESIGN_2026-05-27): NIX_V3_ARENA_NOROOT=1 opts out
-            // of registering arena blocks with Boehm.  Bridge
-            // sources (the only documented Boehm-managed pointer
-            // in arena cells per WC-13 + Tag::External audit)
-            // are tracked separately via the bridge-root registry.
-            //
-            // Default: ON (status quo).  Future flip to default
-            // OFF when the bridge-root registry has soaked.
-            if (blk && !arenaNorootEnabled())
-                GC_add_roots(blk, static_cast<char *>(blk) + bytes);
-#endif
-            // N11/R10 (audit Round 2): track huge allocations so
-            // V3_DBG_NURSERY_BRUTE's scan covers them.  Without this,
-            // a stale-pointer hit inside a huge Bindings (e.g. one
-            // with >170K entries at nixpkgs scale) is invisible to
-            // BRUTE — false-clean diagnostic.
-            if (blk) {
-                active_.hugeBlocks.push_back({static_cast<char *>(blk),
-                                       static_cast<char *>(blk) + bytes,
-                                       type});  // R2.4d: stamp type for cellTypeAt
-                active_.totalBytes += bytes;
+            // Oversized: dedicated allocation outside the regular block
+            // churn.  Review #4: under the major-GC gate, mmap (so a dead
+            // huge block can be munmap'd → RSS return on macOS, per R1)
+            // instead of calloc (std::free of a large calloc returns 0%
+            // RSS).  Default no-GC path keeps calloc.  Both zero-fill, so
+            // allocators relying on zero-init are unaffected.  The
+            // alloc-vs-free primitive is keyed on the same process-wide
+            // majorGcEnabled() gate, so freeHugeBlock picks the matching
+            // inverse — no per-block flag needed.
+            const bool gc = majorGcEnabled();
+            void * blk = gc ? static_cast<void *>(mapArenaBlock(bytes))
+                            : std::calloc(1, bytes);
+            // Review #3: OOM backstop — never push a null huge block.
+            if (__builtin_expect(!blk, 0)) {
+                std::fprintf(stderr,
+                    "v3 fatal: huge arena allocation failed (%zu MB) "
+                    "— out of memory\n", bytes >> 20);
+                std::abort();
             }
+#if NIX_USE_BOEHMGC
+            // NIX_V3_ARENA_NOROOT (default-ON 2026-06-04) opts out of
+            // registering arena blocks with Boehm.
+            if (!arenaNorootEnabled())
+                GC_add_roots(static_cast<char *>(blk),
+                             static_cast<char *>(blk) + bytes);
+#endif
+            // R2.4d: stamp the type so cellTypeAt can typed-walk a huge
+            // cell (e.g. a >4 MB / 170k-entry Bindings) instead of the
+            // O(bytes) conservative byte-scan.
+            active_.hugeBlocks.push_back({static_cast<char *>(blk),
+                                   static_cast<char *>(blk) + bytes, type});
+            active_.totalBytes += bytes;
             return blk;
         }
         // Stage 6 Phase 3: free-list reuse.  Opt-in via
@@ -1103,6 +1102,7 @@ public:
                 void * p = immixCur_;
                 immixCur_ += bytes;
                 setCellStartBitInBlock(p, immixCurBlockIdx_);
+                setCellTypeInBlock(p, immixCurBlockIdx_, type);  // review #13
                 // Phase 3.6 reuse-safety (carried over for Immix):
                 // span bytes hold STALE data from previously-live
                 // cells.  Allocators (allocBindings/allocClosure/...)
@@ -1121,6 +1121,7 @@ public:
                     void * p = immixCur_;
                     immixCur_ += bytes;
                     setCellStartBitInBlock(p, immixCurBlockIdx_);
+                    setCellTypeInBlock(p, immixCurBlockIdx_, type);  // review #13
                     std::memset(p, 0, bytes);  // Phase 3.6 reuse-safety
                     ++is.spanAdvances;
                     is.bytesFromSpans += bytes;
@@ -1158,7 +1159,9 @@ public:
                     }
                 }
                 // free-list pop re-sets the cell-start bit
-                // internally; no further bookkeeping needed.
+                // internally; stamp the (new) type too so the reused
+                // granule doesn't keep the prior occupant's type (#13).
+                setCellTypeFor(p, type);
                 return p;
             }
         }
@@ -1582,6 +1585,24 @@ public:
         }
     }
 
+    /// Review #13: stamp the CellType for a cell allocated via the immix
+    /// span path (parallel to setCellStartBitInBlock).  Stamps
+    /// UNCONDITIONALLY — including CellType::None — because a reused
+    /// granule still carries the PRIOR occupant's type byte; skipping
+    /// None (as the bump path does for fresh None-init cells) would leave
+    /// that stale type, so cellTypeAt lies and the typed mark/evac walk
+    /// reinterpret_casts the wrong layout (heap corruption / SIGSEGV).
+    void setCellTypeInBlock(const void * p, size_t blockIdx, CellType type) noexcept
+    {
+        if (!majorGcEnabled() || !p) return;
+        if (blockIdx >= active_.cellTypes.size()) return;
+        const char * blk = active_.blocks[blockIdx];
+        const size_t bit =
+            (static_cast<size_t>(static_cast<const char *>(p) - blk)) >> 4;
+        auto & types = active_.cellTypes[blockIdx];
+        if (bit < types.size()) types[bit] = static_cast<uint8_t>(type);
+    }
+
     /// Accessor for diagnostic + downstream Step 13′ recycle policy.
     const std::vector<std::vector<FreeSpan>> & freeSpansForBlocks() const noexcept
         { return active_.freeSpans; }
@@ -1879,6 +1900,20 @@ public:
         if (idx < active_.cellTypes.size()) {
             active_.cellTypes.erase(active_.cellTypes.begin() + idx);
         }
+        // Review #14: freeSpans is ALSO parallel to blocks (freeSpans[i] is
+        // blocks[i]'s span list).  Erasing the block without erasing here
+        // length-skews freeSpans so freeSpans[i] no longer matches
+        // blocks[i]; the Immix span allocator (immixAdvanceToNextSpan) would
+        // then read spans pointing into this now-munmapped block -> wild
+        // write / SIGSEGV before the next rebuildFreeSpansFromLineMarks.
+        if (idx < active_.freeSpans.size()) {
+            active_.freeSpans.erase(active_.freeSpans.begin() + idx);
+        }
+        // The Immix cursor may index a block at/after `idx`; invalidate it
+        // so a stale (now-shifted) immixCurBlockIdx_ can't bump into the
+        // wrong / freed block before the post-GC span rebuild.
+        immixCur_ = nullptr;
+        immixEnd_ = nullptr;
         sortedBlocksDirty_ = true;  // Lever 1: block set changed (indices shifted)
 
         // 5. Update totalBytes + cur/end if we freed the current
@@ -1893,6 +1928,45 @@ public:
         }
 
         return kBlockSize;
+    }
+
+    /// Review #4: snapshot of (begin, byte-size) for every huge block, so
+    /// the major GC can check marks + reclaim the dead ones.  Returns a
+    /// COPY (freeHugeBlock mutates the live vector).
+    std::vector<std::pair<const char *, size_t>> hugeBlockRanges() const
+    {
+        std::vector<std::pair<const char *, size_t>> r;
+        r.reserve(active_.hugeBlocks.size());
+        for (const auto & h : active_.hugeBlocks)
+            r.emplace_back(h.begin, static_cast<size_t>(h.end - h.begin));
+        return r;
+    }
+
+    /// Review #4: free a dead huge block.  Uses the inverse of the alloc
+    /// primitive keyed on the SAME process-wide majorGcEnabled() gate
+    /// (munmap for the mmap'd GC path → RSS return; std::free otherwise),
+    /// GC_remove_roots if registered, and drops it from hugeBlocks.
+    /// Returns bytes freed (0 if `begin` is not a current huge block).
+    size_t freeHugeBlock(const char * begin) noexcept
+    {
+        for (size_t i = 0; i < active_.hugeBlocks.size(); ++i) {
+            if (active_.hugeBlocks[i].begin != begin) continue;
+            const size_t sz = static_cast<size_t>(
+                active_.hugeBlocks[i].end - active_.hugeBlocks[i].begin);
+#if NIX_USE_BOEHMGC
+            if (!arenaNorootEnabled())
+                GC_remove_roots(const_cast<char *>(begin),
+                                const_cast<char *>(begin) + sz);
+#endif
+            if (majorGcEnabled())
+                unmapArenaBlock(const_cast<char *>(begin), sz);
+            else
+                std::free(const_cast<char *>(begin));
+            active_.totalBytes -= sz;
+            active_.hugeBlocks.erase(active_.hugeBlocks.begin() + i);
+            return sz;
+        }
+        return 0;
     }
 
     /// Stage 6 Phase 3: sweep helper — clear a cell-start bit (when
@@ -2037,6 +2111,26 @@ private:
         }
     }
 
+    /// Review #13: stamp the CellType for a cell handed out by the
+    /// free-list reuse path (linear-scan sibling of setCellStartBitFor).
+    /// Stamps unconditionally (incl. None) to overwrite the prior
+    /// occupant's stale type on the reused granule.
+    void setCellTypeFor(const void * p, CellType type) noexcept
+    {
+        if (!majorGcEnabled() || !p) return;
+        const char * cp = static_cast<const char *>(p);
+        for (size_t i = 0; i < active_.blocks.size(); ++i) {
+            const char * blk = active_.blocks[i];
+            if (cp >= blk && cp < blk + kBlockSize) {
+                if (i >= active_.cellTypes.size()) return;
+                const size_t bit = static_cast<size_t>(cp - blk) >> 4;
+                auto & types = active_.cellTypes[i];
+                if (bit < types.size()) types[bit] = static_cast<uint8_t>(type);
+                return;
+            }
+        }
+    }
+
     // R2.0 (2026-06-02): block-level page-release primitive.  R1
     // (bench/page-release-spike.cc) proved that on macOS aarch64 ONLY
     // munmap returns freed bytes to RSS — std::free of a calloc'd 16 MB
@@ -2063,7 +2157,20 @@ public:
     /// about-to-be-freed) block — they go into a brand-new block that is
     /// not in the candidate set.  Cheap: one refill (wastes the current
     /// block's tail, reclaimed by a later GC).
-    void forceFreshBlock() noexcept { refill(); }
+    void forceFreshBlock() noexcept
+    {
+        refill();
+        // Review #15: refill() resets only the BUMP cursor; the Immix
+        // span cursor (immixCur_/immixEnd_) is left pointing into a
+        // SURVIVING block's leftover span from the previous GC's rebuild.
+        // Since alloc() tries the immix path FIRST, evac dest copies would
+        // otherwise land in that surviving block, violating the "dest is
+        // always a brand-new non-candidate block" invariant evac relies on.
+        // Null the cursor so the next alloc falls through to the fresh
+        // bump block; rebuildFreeSpansFromLineMarks repopulates it post-GC.
+        immixCur_ = nullptr;
+        immixEnd_ = nullptr;
+    }
 
 private:
     void refill() noexcept
@@ -2078,6 +2185,20 @@ private:
         char * blk = majorGcEnabled()
             ? mapArenaBlock(kBlockSize)
             : static_cast<char *>(std::calloc(1, kBlockSize));
+        // Review #3: mapArenaBlock (mmap) / calloc return nullptr on OOM /
+        // address-space exhaustion.  refill() is noexcept and MUST NOT set
+        // the bump cursor to a null base — the next alloc would bump from
+        // ~0 and write through it (SIGSEGV in low memory) and the null
+        // would propagate into sortedBlocks_ / cellTypeAt indexing.  Fail
+        // loudly + cleanly (the higher-level NIX_V3_MAX_HEAP guard normally
+        // trips first; this is the last-resort allocator backstop).
+        if (__builtin_expect(!blk, 0)) {
+            std::fprintf(stderr,
+                "v3 fatal: arena block allocation failed (%zu MB request) "
+                "— out of memory / address space exhausted\n",
+                size_t(kBlockSize) >> 20);
+            std::abort();
+        }
         active_.blocks.push_back(blk);
         sortedBlocksDirty_ = true;  // Lever 1: block set changed
         active_.cur = blk;

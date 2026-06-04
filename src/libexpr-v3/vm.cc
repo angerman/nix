@@ -2898,6 +2898,28 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     // Sync ip into the frame so the scavenger
                     // walks a consistent VM state.
                     if (!vm.frames.empty()) vm.frames.back().ip = ip;
+                    // R2.4d (2026-06-04) INLINE-CACHE INVALIDATION before
+                    // the major GC.  attrSelectCache + recSlotCache hold
+                    // raw Bindings* per call site; walkAllV3Roots does NOT
+                    // walk them (the libc-resident CU slots are invisible
+                    // to the precise walk + the C-stack scan), so a
+                    // Bindings reachable ONLY via an IC would be swept (or
+                    // its block munmapped) while the IC still points at it
+                    // → use-after-free on the next IC hit (the #705 class;
+                    // code-review findings #1/#6/#7/#8).  The caches are
+                    // transient: clearing is always sound (they repopulate
+                    // on the next lookup) AND lets the GC reclaim
+                    // IC-pinned-only Bindings.  Simpler + safer than
+                    // walking them as roots; fires only at the (infrequent)
+                    // major-GC safepoint so the cold-cache cost is bounded.
+                    // (attrSelectCache/recSlotCache are `mutable`, so this
+                    // works through the registry's `const CompilationUnit*`.)
+                    for (const CompilationUnit * icu : cuRegistry()) {
+                        if (!icu) continue;
+                        for (auto & ic : icu->attrSelectCache)
+                            for (auto & e : ic.entries) e.bindings = nullptr;
+                        for (auto & rc : icu->recSlotCache) rc.bindings = nullptr;
+                    }
                     runMajorMarkSweep(vm);
                     // Frame pointers may have been forwarded.
                     // Re-read dispatch locals.
