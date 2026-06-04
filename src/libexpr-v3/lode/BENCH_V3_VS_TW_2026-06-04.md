@@ -221,9 +221,34 @@ reverted #2(A) recursive-callee resolution).
 
 ### 5.2 eval/apply implementation plan (the next major effort — multi-session)
 
-Large, multi-component change to lowering + emit + the hottest VM opcode + a PAP
-representation; a half-done state risks silent miscompiles, so land it in gated,
-byte-identical increments:
+**Status (2026-06-04): increments 1+2 LANDED, gate-off byte-identical.**
+- (1/N) `28598fd78` — `ir::Function::extraParams` + `computeFreeVars` subtract +
+  `lowerLambda` curried-chain collapse, gated `NIX_V3_EVAL_APPLY`.
+- (2/N) `e9241d936` — emit assigns slots 1..N-1 to extraParams + sets
+  `LambdaDescriptor::arity = 1 + extraParams.size()`.
+- Gate OFF → extraParams always empty → fully inert (--quick 9/9). Gate ON is
+  INCOMPLETE until the VM half (below) lands. **Safety invariant: PAP values are
+  only created gate-on (arity-N closures only exist gate-on), so the entire VM
+  half never executes by default — the gate fully contains its risk.**
+
+**VM half (3/N, the remaining substantial piece — precisely scoped):** the
+single-arg entry is `vm.cc:5250-5252` (`valueStack[newBase+0]=arg`) + frame push
+`5376`; a saturated arity-N call writes N args into slots 0..N-1 there. The PAP
+needs a representation; two options, both investigated:
+- **New `Tag::PartialApp{fn, args[]}`** — clean semantics but ~10 GC/trace/print
+  sites must learn it: `gc.cc` (320/576/1291), `mark_sweep.cc` (1072/1632),
+  `precise_root.hh:130`, `barrier.hh:144`, `live_trace.cc:179`, `value.hh:272`,
+  `print.cc:274`. Any missed site = silent corruption (gate-on).
+- **Reuse `Tag::App` ValuePair chain** — ZERO new GC sites (App is already traced
+  everywhere), but force-of-App (`vm.cc:1034`, ~1380/1451) and `==` (587-714) must
+  become arity-aware (under-applied arity-N closure ⇒ WHNF, return self). Only
+  triggers when left is an arity-N closure (gate-on), so gate-off is unaffected.
+  **Recommended** (lower GC-corruption surface; risk localized to dispatch/force,
+  which gate-on tests catch).
+Then: combined `strictArgs` (step 4) + OP_CALL_N emit spine-fold (the win).
+Recommend a focused session — these are entangled hot paths (force/call/eq/GC).
+
+Original increment outline (kept for reference):
 
 1. **Multi-arity lambda lowering** (`cli/lower_v3.hh lowerLambda`): collapse a
    curried chain `x: y: … : body` of simple single-param lambdas (no formals, no
