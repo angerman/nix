@@ -469,6 +469,18 @@ struct Function {
     /// `arg` VarId in the body's scope (if argName is set).
     VarId    paramVar   = kInvalid;
 
+    /// eval/apply (#3): params beyond the first, for an uncurried multi-arity
+    /// function formed by collapsing a curried chain `x: y: … : body`.  Empty
+    /// for the common arity-0/1 case.  When non-empty the function has arity
+    /// 1 + extraParams.size(); the body is lowered with paramVar + every
+    /// extraParam in scope, and a saturated N-arg call enters once with the
+    /// args in local slots 0..N-1 (no per-arg partial-application closure).
+    /// Populated by the curried-chain collapse in lowerLambda, gated by
+    /// NIX_V3_EVAL_APPLY.  These VarIds are PARAMETERS (bound), so
+    /// computeFreeVars subtracts them from the body's freeVars exactly like
+    /// paramVar.
+    std::vector<VarId> extraParams;
+
     /// Formals (`{ a ? def, b }: body`).  Empty if no formals.
     std::vector<Formal> formals;
     bool                hasFormals = false;

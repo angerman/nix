@@ -492,10 +492,41 @@ struct LowererV3 {
 
         if (!lam->hasFormals) {
             Scope inner;
-            inner.byName.emplace(lam->arg, param);
+            inner.byName[lam->arg] = param;
+            // eval/apply (#3): collapse a curried chain `x: y: … : body` of
+            // SIMPLE single-param lambdas (no formals, named arg) into ONE
+            // arity-N Function — paramVar + extraParams[] all in scope, body
+            // lowered once.  A later inner lambda's name shadows an outer one
+            // (operator[] overwrites; the shadowed param still occupies its
+            // slot, just unreferenced).  Gated; off → classic one-lambda-per-
+            // arrow lowering (byte-identical).  The VM's OP_CALL_N + PAP make
+            // partial/saturated/over-application of the arity-N function all
+            // behave like the curried original.
+            // WIP: this is the lowering half of eval/apply (bench doc §5.2).
+            // Until the emit (multi-slot params + OP_CALL_N) and VM (PAP +
+            // arity-match) halves land, NIX_V3_EVAL_APPLY=1 is INCOMPLETE —
+            // keep it OFF (default) for correct results.
+            // Retirement: once eval/apply is default-on (byte-identical on
+            // --core + a nixpkgs sample + wall-positive on fold-add), drop the
+            // gate and remove the curried fallback.
+            static const bool s_evalApply =
+                std::getenv("NIX_V3_EVAL_APPLY") != nullptr;
+            const nix::v3::ast::Node * bodyToLower = lam->body;
+            if (s_evalApply && !lam->arg.empty()) {
+                const nix::v3::ast::Node * b = lam->body;
+                while (b->kind == nix::v3::ast::Kind::Lambda) {
+                    auto * il = static_cast<const nix::v3::ast::Lambda *>(b);
+                    if (il->hasFormals || il->arg.empty()) break;
+                    ir::VarId ep = m.freshVar();
+                    m.functions[fid].extraParams.push_back(ep);
+                    inner.byName[il->arg] = ep;
+                    b = il->body;
+                }
+                bodyToLower = b;
+            }
             scopes.push_back(std::move(inner));
             blockStack.push_back(entry);
-            setReturn(lowerExpr(lam->body));
+            setReturn(lowerExpr(bodyToLower));
             blockStack.pop_back();
             scopes.pop_back();
             {

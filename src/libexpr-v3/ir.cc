@@ -328,6 +328,9 @@ void computeFreeVars(Module & m)
         if (f.paramVar != kInvalid &&
             (f.argName != kInvalidSymbol || f.hasFormals))
             refs.erase(f.paramVar);
+        // eval/apply (#3): extraParams are bound parameters too (slots
+        // 1..N-1), not free variables — subtract them like paramVar.
+        for (VarId ep : f.extraParams) refs.erase(ep);
         std::vector<VarId> fv(refs.begin(), refs.end());
         std::sort(fv.begin(), fv.end());
         return fv;
