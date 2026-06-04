@@ -594,6 +594,60 @@ int main(int argc, char ** argv)
                             (unsigned long long)rows[i].first, pct);
                     }
                 }
+
+                // Step-1 (2026-06-04, BYTECODE_NGRAM_ANALYSIS §7)
+                // trigram top-20 — mirrors the run.cc atexit dumper so
+                // the v3-eval CLI can confirm execution-weighted n-grams
+                // on synthetic micro-workloads (the real hello/HNE/M5
+                // measurement still goes through `nix eval` → run.cc,
+                // since v3-eval can't resolve flake-<nixpkgs>).  Only
+                // non-empty when NIX_VM_TRIGRAMS=1 was set during eval.
+                {
+                    const auto & tg = a.trigramCounts;
+                    uint64_t totalTrigrams = 0;
+                    for (const auto & kv : tg) totalTrigrams += kv.second;
+                    if (totalTrigrams > 0) {
+                        struct TrigramRow {
+                            uint8_t a, b, c;
+                            uint64_t count;
+                        };
+                        std::vector<TrigramRow> trows;
+                        trows.reserve(tg.size());
+                        for (const auto & kv : tg)
+                            trows.push_back({
+                                (uint8_t)((kv.first >> 16) & 0xFF),
+                                (uint8_t)((kv.first >> 8)  & 0xFF),
+                                (uint8_t)( kv.first        & 0xFF),
+                                kv.second });
+                        std::sort(trows.begin(), trows.end(),
+                            [](const TrigramRow & x, const TrigramRow & y) {
+                                return x.count > y.count;
+                            });
+                        std::fprintf(stderr,
+                            "v3 trigram profile (total=%llu distinct=%zu, "
+                            "top 20; Step-1 #780 candidates):\n",
+                            (unsigned long long)totalTrigrams, tg.size());
+                        size_t shown = std::min<size_t>(trows.size(), 20);
+                        uint64_t topSum = 0;
+                        for (size_t i = 0; i < shown; ++i) {
+                            double pct = 100.0 * double(trows[i].count)
+                                       / double(totalTrigrams);
+                            std::fprintf(stderr,
+                                "  %-24s -> %-24s -> %-24s %12llu (%5.2f%%)\n",
+                                nix::v3::opName(static_cast<nix::v3::Op>(trows[i].a)),
+                                nix::v3::opName(static_cast<nix::v3::Op>(trows[i].b)),
+                                nix::v3::opName(static_cast<nix::v3::Op>(trows[i].c)),
+                                (unsigned long long)trows[i].count, pct);
+                            topSum += trows[i].count;
+                        }
+                        std::fprintf(stderr,
+                            "  -- top-20 sum: %5.2f%% of all trigrams "
+                            "(Step-1 gate: proceed to spike only if dynamic "
+                            "top-10 OVERLAP static §4 AND bigram top-20 "
+                            ">= 30%%)\n",
+                            100.0 * double(topSum) / double(totalTrigrams));
+                    }
+                }
             }
         }
         return rc;

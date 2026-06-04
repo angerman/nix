@@ -3086,6 +3086,39 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     prevSetSlot = ~0u;
                 prevOp = opi;
             }
+            // Step-1 (2026-06-04, BYTECODE_NGRAM_ANALYSIS §7) trigram
+            // tracking — only when NIX_VM_TRIGRAMS=1 alongside
+            // NIX_VM_OPCOUNTS=1.  Extends the bigram counter above to
+            // (prevPrev, prev, curr) triples so the STATIC top n-gram
+            // candidates (§4) can be confirmed under EXECUTION weighting
+            // before any super-instruction / register-VM work.
+            // Independent of NIX_VM_BIGRAMS so the heavier (hash-map)
+            // trigram cost is only paid when explicitly requested.
+            // Rolling state uses 0xFF sentinels so the first two
+            // dispatches don't fabricate a triple; like the bigram
+            // counter it does NOT reset at nested-dispatchLoop / RETURN
+            // boundaries (the static tool breaks at OP_RETURN/OP_HALT,
+            // but the dominant intra-function triples — GET_UPVALUE
+            // REC_BINDING_SLOT_REF SET_LOCAL, GET_LOCAL ATTRS_REC_SET …
+            // — dominate regardless of the small cross-frame noise, and
+            // keeping the convention identical to the shipped bigram
+            // counter keeps the static-vs-dynamic overlap comparison
+            // apples-to-apples).
+            static const bool s_countTrigrams =
+                std::getenv("NIX_VM_TRIGRAMS") != nullptr;
+            if (__builtin_expect(s_countTrigrams, 0)) [[unlikely]] {
+                static thread_local uint8_t tgPrevPrev = 0xFF;
+                static thread_local uint8_t tgPrev     = 0xFF;
+                uint8_t opi = static_cast<uint8_t>(op);
+                if (tgPrevPrev != 0xFF && tgPrev != 0xFF) {
+                    uint32_t key = (uint32_t(tgPrevPrev) << 16)
+                                 | (uint32_t(tgPrev) << 8)
+                                 | uint32_t(opi);
+                    allocStats().trigramCounts[key]++;
+                }
+                tgPrevPrev = tgPrev;
+                tgPrev = opi;
+            }
         }
         uint32_t operand = decodeOperand(instr);
 

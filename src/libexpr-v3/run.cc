@@ -1097,6 +1097,72 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                                 : 0.0));
                     }
                 }
+
+                // Step-1 (2026-06-04, BYTECODE_NGRAM_ANALYSIS §7)
+                // trigram top-20 — only non-empty when NIX_VM_TRIGRAMS=1
+                // was set during eval.  Execution-weighted confirmation
+                // of the STATIC top n-gram candidates (§4).  THE STEP-1
+                // GATE: proceed to a super-instruction spike (Step 2)
+                // only if the dynamic top-10 trigrams OVERLAP the static
+                // §4 candidates AND the bigram top-20 (printed above) is
+                // ≥ 30%.  Iterates the sparse map (low-thousands of
+                // distinct triples) and keeps the top-20 via the same
+                // insertion scan as the bigram dump.
+                {
+                    const auto & tg = a.trigramCounts;
+                    uint64_t totalTrigrams = 0;
+                    for (const auto & kv : tg) totalTrigrams += kv.second;
+                    if (totalTrigrams > 0) {
+                        struct TrigramRow {
+                            uint8_t a, b, c;
+                            uint64_t count;
+                        };
+                        TrigramRow trows[20];
+                        size_t tnz = 0;
+                        for (const auto & kv : tg) {
+                            uint64_t cnt = kv.second;
+                            uint8_t pa = (uint8_t)((kv.first >> 16) & 0xFF);
+                            uint8_t pb = (uint8_t)((kv.first >> 8)  & 0xFF);
+                            uint8_t pc = (uint8_t)( kv.first        & 0xFF);
+                            if (tnz < 20) {
+                                trows[tnz++] = { pa, pb, pc, cnt };
+                            } else {
+                                size_t minIdx = 0;
+                                for (size_t k = 1; k < tnz; ++k)
+                                    if (trows[k].count < trows[minIdx].count)
+                                        minIdx = k;
+                                if (cnt > trows[minIdx].count)
+                                    trows[minIdx] = { pa, pb, pc, cnt };
+                            }
+                        }
+                        std::sort(trows, trows + tnz,
+                            [](const TrigramRow & x, const TrigramRow & y) {
+                                return x.count > y.count;
+                            });
+                        std::fprintf(stderr,
+                            "v3-direct trigrams: total=%llu distinct=%zu "
+                            "(top-20; Step-1 execution-weighted "
+                            "#780 candidates):\n",
+                            (unsigned long long)totalTrigrams, tg.size());
+                        uint64_t topSum = 0;
+                        for (size_t i = 0; i < tnz; ++i) {
+                            std::fprintf(stderr,
+                                "  %-24s -> %-24s -> %-24s %12llu  %5.2f%%\n",
+                                opName(static_cast<Op>(trows[i].a)),
+                                opName(static_cast<Op>(trows[i].b)),
+                                opName(static_cast<Op>(trows[i].c)),
+                                (unsigned long long)trows[i].count,
+                                100.0 * trows[i].count / totalTrigrams);
+                            topSum += trows[i].count;
+                        }
+                        std::fprintf(stderr,
+                            "  -- top-20 sum: %5.2f%% of all trigrams "
+                            "(Step-1 gate: proceed to super-instruction "
+                            "spike only if dynamic top-10 OVERLAP static "
+                            "§4 candidates AND bigram top-20 >= 30%%)\n",
+                            100.0 * topSum / totalTrigrams);
+                    }
+                }
             }
         }
         // #736 (2026-05-21) IFD-probe summary.  Per IFD_DEEP_DIVE
