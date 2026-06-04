@@ -4449,6 +4449,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     goto op_call_iter_force;
                 }
             } else if (fT == Tag::App || fT == Tag::App3 || fT == Tag::Slot) {
+                // eval/apply (#3, gate-on only): an under-applied arity-N
+                // closure represented as a Tag::App chain is already WHNF (a
+                // partial application).  Do NOT iter-force it (that would try
+                // to evaluate it as a deferred call and loop) — handle the
+                // arg accumulation at op_call_have_fun.  Gate-off this never
+                // fires: arity>1 closures exist only when NIX_V3_EVAL_APPLY
+                // collapsed a curried chain, so `arity > depth` is false for
+                // every ordinary single-arg-closure lazy-app.
+                if (fT == Tag::App && fun.payload.pair) {
+                    const Value * cur = &fun; size_t d = 0;
+                    while (cur->tag() == Tag::App && cur->payload.pair) {
+                        ++d; cur = &cur->payload.pair->left;
+                    }
+                    if (cur->tag() == Tag::Closure && cur->payload.closure
+                        && cur->payload.closure->desc
+                        && cur->payload.closure->desc->arity > d)
+                        goto op_call_have_fun;
+                }
                 goto op_call_iter_force;
             }
             goto op_call_have_fun;
@@ -4553,6 +4571,81 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
             // (OP_CALL Bridge-thunk handler retired with the bridge
             //  apparatus — TW_VALUE_ERADICATION F4, 2026-06-02.)
+
+            // eval/apply (#3, gate-on only): arity-N closure application via
+            // Tag::App PAP accumulation — the closure analogue of the
+            // PrimOpApp block above.  arity>1 closures exist ONLY when
+            // NIX_V3_EVAL_APPLY collapsed a curried chain, so every branch
+            // here is inert by default (papBase->desc->arity is 0/1).  A bare
+            // arity-1 closure falls through to the normal single-arg entry.
+            {
+                const Closure * papBase = nullptr;
+                size_t papDepth = 0;
+                if (fun.tag() == Tag::Closure && fun.payload.closure) {
+                    papBase = fun.payload.closure;
+                } else if (fun.tag() == Tag::App && fun.payload.pair) {
+                    const Value * cur = &fun;
+                    while (cur->tag() == Tag::App && cur->payload.pair) {
+                        ++papDepth; cur = &cur->payload.pair->left;
+                    }
+                    if (cur->tag() == Tag::Closure && cur->payload.closure)
+                        papBase = cur->payload.closure;
+                }
+                if (papBase && papBase->desc && papBase->desc->arity > 1) {
+                    const uint8_t A = papBase->desc->arity;
+                    const size_t total = papDepth + 1;
+                    if (total < A) {
+                        // Under-applied: extend the Tag::App PAP chain.
+                        ValuePair * vp = Alloc::allocPair();
+                        vp->left = fun; vp->right = arg;
+                        pairPostConstructBarrier(vp);
+                        Value v;
+                        v.tag_payload = static_cast<uint64_t>(Tag::App);
+                        v.payload.pair = vp;
+                        push(vm, v);
+                        break;
+                    }
+                    // Saturated (total == A — binary OP_CALL can't overshoot):
+                    // gather [a0..a_{A-2}, arg] and enter with them in the
+                    // callee's slots 0..A-1.
+                    if (A > 16) throw std::runtime_error("v3 OP_CALL: arity > 16");
+                    Value argbuf[16];
+                    argbuf[total - 1] = arg;
+                    Value chain = fun;
+                    for (size_t i = total - 1; i > 0; --i) {
+                        argbuf[i - 1] = chain.payload.pair->right;
+                        chain = chain.payload.pair->left;
+                    }
+                    const LambdaDescriptor * d = papBase->desc;
+                    if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
+                        throw std::runtime_error(
+                            "v3 OP_CALL: stack overflow; call depth exceeded "
+                            + std::to_string(kMaxCallDepth));
+                    vm.frames.back().ip = ip;
+                    size_t newBase = vm.valueStack.size();
+                    vm.valueStack.resize(newBase + d->nLocals);
+                    for (size_t i = 0; i < A; ++i)
+                        vm.valueStack[newBase + i] = argbuf[i];
+                    uint32_t newWithBase =
+                        static_cast<uint32_t>(vm.withStack.size());
+                    const CompilationUnit * calleeCu = papBase->cu ? papBase->cu : cu;
+                    vm.frames.push_back(CallFrame{
+                        .cu = calleeCu,
+                        .closure = papBase,
+                        .thunk = nullptr,
+                        .ip = d->codeOffset,
+                        .stackBaseOffset = static_cast<uint32_t>(newBase),
+                        .withStackBase = newWithBase,
+                        .flags = 0,
+                    });
+                    pushCapturedWiths(vm, papBase->capturedWiths);
+                    ip = d->codeOffset;
+                    cu  = calleeCu;
+                    closure = papBase;
+                    stackBase = newBase;
+                    break;
+                }
+            }
 
             // __functor: applying an attrset that has a `__functor`
             // attribute calls `__functor self arg` per the standard
