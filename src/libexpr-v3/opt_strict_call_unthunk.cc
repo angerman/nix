@@ -620,6 +620,18 @@ size_t applyStrictnessAtCallSites(Module & m)
     if (disabled) return 0;
     static const bool dbg =
         std::getenv("NIX_V3_DBG_STRICT_CALL_UNTHUNK") != nullptr;
+    // #2(B) eager-forced-let: a MkThunk that is unconditionally Force'd in
+    // its block is eager-ized (body inlined at the binding site, x kept as
+    // the value).  Unlike the single-use elide, this is MULTI-use-safe — the
+    // Force is unconditional, so x is forced regardless of its other uses, so
+    // evaluating it eagerly forces nothing the program wouldn't have.  The
+    // bytecode foldl''s `let next = op acc elem; in seq next (go (i+1) next)`
+    // (next: forced by seq, also captured by the go-call thunk) is the
+    // motivating shape.  Retirement: fold into the unconditional eager path
+    // (drop NIX_V3_NO_EAGER_FORCED_LET) once shipped byte-identical on --core
+    // + a nixpkgs sample across ≥10 runs.
+    static const bool noEagerLet =
+        std::getenv("NIX_V3_NO_EAGER_FORCED_LET") != nullptr;
 
     // Module-wide use count for the "MkThunk has one use" safety check.
     UseCounter uses = countModuleUses(m);
@@ -701,6 +713,7 @@ size_t applyStrictnessAtCallSites(Module & m)
         //               matching entry whose value is a MkThunk,
         //               mark for elision.
         std::unordered_set<VarId> mkthunksToElide;
+        std::unordered_set<VarId> mkthunksToEager;  // #2(B) eager-keep
 
         for (const auto & bd : blk.bindings) {
             // #775 Case (C): Force(MkThunk_binding) — let-inline-strict
@@ -733,26 +746,33 @@ size_t applyStrictnessAtCallSites(Module & m)
                             ++globalOtherExpr;
                         }
                     }
-                } else if (uses.at(fres.definer) != 1) {
-                    ++forceFailMultiUse;
                 } else {
+                    // Forced MkThunk in same block.  Cloneability gate first,
+                    // then: single-use → ELIDE (inline at use, drop binding);
+                    // multi-use → EAGER-KEEP (#2(B): inline the body at the
+                    // binding site, keep x as the value so the other uses —
+                    // incl. lazy freeVar captures — still resolve).  Multi-use
+                    // is safe because this Force is unconditional in the block.
                     const MkThunk * mktDiag2 = std::get_if<MkThunk>(fres.expr);
-                    if (mktDiag2->funcIdx >= (FuncId)m.functions.size()) {
-                        ++forceFailNotCloneable;
-                    } else {
+                    bool cloneable = false;
+                    if (mktDiag2->funcIdx < (FuncId)m.functions.size()) {
                         const Function & thunkFn = m.functions[mktDiag2->funcIdx];
-                        if (thunkFn.entryBlock == kInvalidBlock
-                            || thunkFn.entryBlock >= (BlockId)m.blocks.size()) {
-                            ++forceFailNotCloneable;
-                        } else {
+                        if (thunkFn.entryBlock != kInvalidBlock
+                            && thunkFn.entryBlock < (BlockId)m.blocks.size()) {
                             std::unordered_set<BlockId> visited;
-                            if (!bodyIsCloneable(m, thunkFn.entryBlock, visited)) {
-                                ++forceFailNotCloneable;
-                            } else {
-                                ++passedToInlineForce;
-                                mkthunksToElide.insert(fres.definer);
-                            }
+                            cloneable = bodyIsCloneable(m, thunkFn.entryBlock, visited);
                         }
+                    }
+                    if (!cloneable) {
+                        ++forceFailNotCloneable;
+                    } else if (uses.at(fres.definer) == 1) {
+                        ++passedToInlineForce;
+                        mkthunksToElide.insert(fres.definer);
+                    } else if (noEagerLet) {
+                        ++forceFailMultiUse;
+                    } else {
+                        ++passedToInlineForce;
+                        mkthunksToEager.insert(fres.definer);
                     }
                 }
                 continue;
@@ -856,6 +876,26 @@ size_t applyStrictnessAtCallSites(Module & m)
         out.reserve(blk.bindings.size() * 2);
 
         for (const auto & bd : blk.bindings) {
+            // #2(B) eager-keep: inline a forced multi-use MkThunk's body at
+            // its binding site and KEEP x bound to the eager value, so its
+            // other (possibly lazy-captured) uses still resolve.  No
+            // elidedToInline entry — uses of x are left intact and read the
+            // now-eager x.  The Force(x) that triggered this becomes a Force
+            // on a WHNF value (a no-op) and is harmless.
+            if (mkthunksToEager.count(bd.var)) {
+                const auto * mkt = std::get_if<MkThunk>(&bd.expr);
+                if (mkt && mkt->funcIdx < (FuncId)m.functions.size()) {
+                    VarId tail = inlineThunkBody(
+                        m, m.functions[mkt->funcIdx].entryBlock, out);
+                    if (tail != kInvalid) {
+                        out.push_back({bd.var, VarRef{tail}});
+                        ++elidedForceMkt;
+                        continue;
+                    }
+                }
+                out.push_back(bd);  // defensive: keep original on failure
+                continue;
+            }
             // Elide MkThunk binding by inlining its body.
             if (mkthunksToElide.count(bd.var)) {
                 const auto * mkt = std::get_if<MkThunk>(&bd.expr);
