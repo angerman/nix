@@ -199,7 +199,31 @@ B→~A, reported with the alloc-count delta.
 | non-recursive `let` demotion (lowering) | `cd1da2577` | per-elem attrsets 1M→1; 107M→94M insns |
 | `seq a b → Force(a); b` (lowering) | `72e85e2d9` | drops seq primop App-spine; 94M→87M insns; 12.76→11.18× TW |
 | eager-forced-let (multi-use, eval-path) | `c62e05f2f` | `next` thunk gone, MAKE_THUNK 4→3/elem; 87M→83M insns |
-| **combined** | | **fold-add 13.67× → 9.52× TW (~30%), insns 107M→83M** |
+| eval/apply (arity-aware calling, **default-on**) | `28598fd78`…`a3f751d87` | MAKE_CLOSURE 2M→14; 83M→74M; 9.50→8.70× TW |
+| combined strictArgs (unthunk i+1, recursion) | `341f0f76e` | MAKE_THUNK 3M→2M; 74M→69M; 8.70→7.97× TW |
+| **combined** | | **fold-add 13.67× → 7.97× TW (~42%), insns 107M→69M** |
+
+**LICM (#4) — measure-twice FALSIFIED for v3 (low real-world value).** v3 does
+recompute loop invariants (synthetic `acc + (foldl' (+) 0 big)` is 69× the
+let-hoisted form), BUT: (a) the high-value case is an EAGER App-chain (unsafe to
+float — would eval at closure-creation even if never called); (b) the
+idiomatic `let s = …; in … s` form is EAGER-IZED by #2B (eager-forced-let)
+BEFORE a float pass sees it, so the safe lazy-only float (MkThunk/Lambda) can't
+reach it; (c) idiomatic Nix self-hoists invariants via `let`.  A safe lazy-only
+full-laziness pass was implemented + measured byte-identical but **−0.06% on
+hello.drvPath** → reverted (near-carcass).  The real win needs full GHC-style
+let-float (thunk-wrap eager invariant clusters + hoist, ordered before #2B) —
+high-cost + space-leak-prone for low real value.  Deferred unless a real
+workload shows un-hoisted invariants.
+
+**Specialization (#6) — register-VM / superinstruction territory (modest).**
+The fold-add residual (69 insns/elem) is dominated by STACK MOTION (GET_LOCAL
+14 + SET_LOCAL 12 + GET_UPVALUE 9 + SET_LOCAL_KEEP/GET_LOCAL_FORCE ≈ 43/elem),
+not a polymorphic dispatch.  More superinstructions (the SET_LOCAL_KEEP family)
+measured ~1.4% wall — modest, the deprioritised register-VM lever.  The
+high-value structural specialization is a list-iterator opcode / fold-shaped
+loop (the bytecode-native analogue of C++ primFoldl's direct ListVec walk,
+closing the elemAt-per-element gap) — a separate large effort.
 
 **Corrected root-cause weighting:** §5 framed the cause as "the curried calling
 convention." A later measurement refined it: the C++ `primFoldl` (`primops.cc:1281`,
