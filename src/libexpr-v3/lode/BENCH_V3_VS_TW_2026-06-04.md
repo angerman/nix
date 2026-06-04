@@ -221,7 +221,19 @@ reverted #2(A) recursive-callee resolution).
 
 ### 5.2 eval/apply implementation plan (the next major effort — multi-session)
 
-**Status (2026-06-04): increments 1+2 LANDED, gate-off byte-identical.**
+**Status (2026-06-04): eval/apply IMPLEMENTED + gate-on GREEN (7 increments).**
+`NIX_V3_EVAL_APPLY=1`: --quick 9/9, --core 19/19 byte-identical (drvPath+lang+IR),
+6 nixpkgs pkgs byte-identical (hello/cowsay/jq/ripgrep/python3/gnumake). WIN:
+fold-add-1M MAKE_CLOSURE 2,000,020 → 14, insns 83M→74M; hello.drvPath insns
+-4.1%; all partial-app shapes (stored/inline/3-arg/map/isFunction) correct.
+Lowering collapses curried chains → arity-N Function (cap 16); PAPs reuse
+Tag::App (0 new GC sites); 3 apply sites agree (OP_CALL + OP_TAIL_CALL
+frame-reuse-or-fallthrough-to-RETURN + callClosure); force-of-PAP=WHNF;
+isFunction(PAP)=true; opt passes skip extraParams.  Test: opt-eval-apply-test.sh.
+Gate OFF (default) inert: --quick 9/9, --core 19/19.  NEXT toward default-on:
+quiet-host wall + broader nixpkgs sweep; then combined strictArgs (i+1 unthunk).
+
+**Earlier increment notes (1+2 of 7):**
 - (1/N) `28598fd78` — `ir::Function::extraParams` + `computeFreeVars` subtract +
   `lowerLambda` curried-chain collapse, gated `NIX_V3_EVAL_APPLY`.
 - (2/N) `e9241d936` — emit assigns slots 1..N-1 to extraParams + sets
