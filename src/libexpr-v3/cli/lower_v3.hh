@@ -502,15 +502,14 @@ struct LowererV3 {
             // arrow lowering (byte-identical).  The VM's OP_CALL_N + PAP make
             // partial/saturated/over-application of the arity-N function all
             // behave like the curried original.
-            // WIP: this is the lowering half of eval/apply (bench doc §5.2).
-            // Until the emit (multi-slot params + OP_CALL_N) and VM (PAP +
-            // arity-match) halves land, NIX_V3_EVAL_APPLY=1 is INCOMPLETE —
-            // keep it OFF (default) for correct results.
-            // Retirement: once eval/apply is default-on (byte-identical on
-            // --core + a nixpkgs sample + wall-positive on fold-add), drop the
-            // gate and remove the curried fallback.
+            // DEFAULT-ON (2026-06-05): eval/apply is validated byte-identical
+            // (--core 19/19 both ways, 15 nixpkgs pkgs) and faster (fold-add
+            // 13.67×→7.97× TW with the strictArgs companion).  Gate is now
+            // opt-OUT NIX_V3_NO_EVAL_APPLY=1 (bisect handle).  Retirement:
+            // remove the gate + the curried fallback once it has soaked on the
+            // broader cutover-parity corpus + M5/HNE.
             static const bool s_evalApply =
-                std::getenv("NIX_V3_EVAL_APPLY") != nullptr;
+                std::getenv("NIX_V3_NO_EVAL_APPLY") == nullptr;
             const nix::v3::ast::Node * bodyToLower = lam->body;
             if (s_evalApply && !lam->arg.empty()) {
                 // Cap arity at 16 (1 paramVar + ≤15 extraParams): the VM's

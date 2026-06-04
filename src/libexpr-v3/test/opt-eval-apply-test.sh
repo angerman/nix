@@ -27,8 +27,9 @@ makeclosures() { grep -E "OP_MAKE_CLOSURE +[0-9]+" "/tmp/eatest.$$.err" | awk '{
 
 echo "== opt #3 eval/apply regression =="
 
-res_on=$(run NIX_V3_EVAL_APPLY=1) ; mc_on=$(makeclosures)
-res_off=$(run)                    ; mc_off=$(makeclosures)
+# eval/apply is DEFAULT-ON; opt out with NIX_V3_NO_EVAL_APPLY=1.
+res_on=$(run)                       ; mc_on=$(makeclosures)
+res_off=$(run NIX_V3_NO_EVAL_APPLY=1) ; mc_off=$(makeclosures)
 rm -f "/tmp/eatest.$$.err"
 
 # 1. correctness — identical result
@@ -49,7 +50,7 @@ echo "  OP_MAKE_CLOSURE ON=$mc_on << OFF=$mc_off  [OK]"
 # 3. partial-application correctness (stored / inline / isFunction)
 check() { # expr expected
     local got
-    got=$(env NIX_V3_EVAL_APPLY=1 NIX_V3_DIRECT_EVAL=1 "$V3EVAL" --expr "$1" 2>/dev/null | tail -1)
+    got=$(env NIX_V3_DIRECT_EVAL=1 "$V3EVAL" --expr "$1" 2>/dev/null | tail -1)
     if [ "$got" != "$2" ]; then echo "FAIL: '$1' = '$got' (expected '$2')"; exit 1; fi
     echo "  '$1' = $got  [OK]"
 }
