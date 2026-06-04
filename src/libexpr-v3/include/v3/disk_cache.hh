@@ -77,6 +77,17 @@ struct Stats {
 };
 Stats & stats() noexcept;
 
+/// Memory-bucket accounting (2026-06-04): approximate in-process
+/// resident bytes held by the bytecode SQLite DB — the page cache +
+/// schema + prepared-statement memory for THIS connection, via
+/// `sqlite3_db_status`.  Returns 0 if the DB was never opened (no
+/// cacheable imports this run).  This is the "BC cache" bucket: it is
+/// NOT the on-disk `.sqlite` file size (that is disk-resident, shared
+/// via the OS page cache, and not charged to the process the way the
+/// watchdog counts).  The mmap'd AOT L3 region, if any, is accounted
+/// separately and not included here.
+uint64_t approxResidentBytes() noexcept;
+
 // ---------------------------------------------------------------------------
 // #741 Phase 5 (2026-05-23) — disk-persisted eval-result cache.
 //

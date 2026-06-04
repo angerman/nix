@@ -52,6 +52,29 @@ namespace nix::v3 {
 
 struct VMState;
 
+/// Memory-bucket classification of a root source.  `walkAllV3Roots`
+/// announces, via `RootVisitor::enterRootSource`, which class of root
+/// it is about to enumerate.  A *bucketing* visitor (the memory-bucket
+/// accounting in live_trace.cc) uses this to attribute each
+/// first-touch-marked cell to a live-bytes bucket:
+///
+///   * `Eval`    — the genuine working set: VMState stacks/frames,
+///                 `with` scopes, standalone cells, builtins, callFlake
+///                 + deepForce temporaries, C++-stack GcRoots.
+///   * `CuCache` — Values pinned by the in-memory `import` result cache
+///                 (the bytecode + eval-result cache for imported
+///                 `.nix` files; see primops.cc ImportCache).
+///   * `Ffi`     — Values held by FFI bridge tables.  Retired post-F4
+///                 (TW_VALUE_ERADICATION_GOAL_2026-06-02) — currently
+///                 emitted by no walk, kept for completeness / future
+///                 FFI-leaf root sources.
+///
+/// The eval-first ordering (`Eval` before `CuCache`) makes a cell that
+/// is reachable from BOTH eval and a cache attribute to `Eval`, so a
+/// cache's bucket reports only the bytes it pins *beyond* the working
+/// set (marginal-retention semantics).
+enum class RootSource { Eval, CuCache, Ffi };
+
 /// Visitor base class for `walkAllV3Roots`.  Each callback receives
 /// a REFERENCE to the slot containing the pointer so a moving-GC
 /// visitor can rewrite the slot in place.
@@ -62,6 +85,14 @@ struct VMState;
 struct RootVisitor
 {
     virtual ~RootVisitor() = default;
+
+    /// Announced by `walkAllV3Roots` immediately before it enumerates
+    /// each class of root source.  Default no-op: marking / scavenging
+    /// / counting visitors (MarkVisitor, Scavenger, DumpVisitor, …) are
+    /// unaffected and pay nothing.  Only the memory-bucket tracer
+    /// overrides this — to drain the worklist under the OLD source label
+    /// then switch, giving exact eval-first first-touch attribution.
+    virtual void enterRootSource(RootSource) noexcept {}
 
     // Per-pointer-type callbacks.  Pure virtual to force the consumer
     // to think about each pointer type.  No-op implementations are

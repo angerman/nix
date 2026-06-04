@@ -341,6 +341,35 @@ CacheKey computeKeyForString(std::string_view content)
     return k;
 }
 
+uint64_t approxResidentBytes() noexcept
+{
+    // Best-effort: 0 when the DB was never opened (e.g. a string-eval
+    // run with no cacheable imports), so this never forces the cache
+    // open just to measure it.  `dbHandle()` / `DbState` live in the
+    // anon namespace above but are TU-visible here.
+    auto & h = dbHandle();
+    if (h.failed.load(std::memory_order_relaxed)) return 0;
+    auto state = h.state.lock();
+    if (!state->initialised) return 0;
+    sqlite3 * db = state->db;   // nix::SQLite::operator sqlite3 *()
+    if (!db) return 0;
+
+    uint64_t total = 0;
+    int cur = 0, hi = 0;
+    // The three connection-local memory pools SQLite reports.  CACHE_USED
+    // is the page cache (dominant); SCHEMA_USED holds parsed schema;
+    // STMT_USED is the prepared-statement working memory.  All are
+    // current (not high-water) bytes for THIS connection only — so this
+    // excludes libstore's separate store DB connection.
+    if (sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_USED, &cur, &hi, 0) == SQLITE_OK && cur > 0)
+        total += static_cast<uint64_t>(cur);
+    if (sqlite3_db_status(db, SQLITE_DBSTATUS_SCHEMA_USED, &cur, &hi, 0) == SQLITE_OK && cur > 0)
+        total += static_cast<uint64_t>(cur);
+    if (sqlite3_db_status(db, SQLITE_DBSTATUS_STMT_USED, &cur, &hi, 0) == SQLITE_OK && cur > 0)
+        total += static_cast<uint64_t>(cur);
+    return total;
+}
+
 std::optional<std::string> lookup(const CacheKey & key)
 {
     auto & st = stats();

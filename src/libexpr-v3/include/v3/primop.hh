@@ -104,6 +104,15 @@ namespace nix::v3 {
 /// after scavenge.
 void walkImportCacheRoots(const std::function<void(Value &)> & visit);
 
+/// Memory-bucket accounting (2026-06-04): size the "CU cache".
+///   * `importCacheBytecodeBytes` — libc-malloc'd CompilationUnit
+///     bytecode bytes (NOT in the arena; invisible to the arena mark).
+///   * `importCacheCuCount`       — cached CompilationUnits (one/file).
+///   * `importCacheResultCount`   — cached eval-result Values.
+size_t importCacheBytecodeBytes() noexcept;
+size_t importCacheCuCount() noexcept;
+size_t importCacheResultCount() noexcept;
+
 /// 2026-05-29 evening (DIAG analysis spike): clear in-memory import
 /// cache result set so a subsequent LiveTracer / GC walk sees the
 /// nixpkgs evaluation graph as freeable.  Safe to call AFTER run()

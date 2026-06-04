@@ -693,6 +693,14 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         // Retirement criterion: when Stage 6 lands the real precise GC
         // of v3 arena, fold into NIX_VM_STATS and remove the gate.
         dumpV3LiveFraction();
+        // 2026-06-04: LIVE MEMORY BUCKETS — the honest, GHC-style
+        // resident decomposition the user asked for (CU cache / BC
+        // cache / eval-live / FFI-live).  Replaces the misleading
+        // cumulative-vs-peak headline formula with a same-instant
+        // resident split.  Gated NIX_V3_MEM_BUCKETS=1 (zero cost unset).
+        // Retirement: fold into NIX_VM_STATS when the precise GC ships
+        // default-on and v3_arena becomes a live-bytes proxy.
+        dumpV3MemoryBuckets();
         // (per-bridge-entry retention dump retired — TW_VALUE_ERADICATION F4.)
         // Day 5 2026-05-28: per-block fill probe.  Decision data for
         // Stage 6 generational tenured collector (GHC-RTS style).

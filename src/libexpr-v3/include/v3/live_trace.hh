@@ -65,6 +65,22 @@ struct VMState;  // forward decl for maybeSamplePeriodicLiveFraction
 /// scripts (see `bench/m5-cron.sh` for the ledger convention).
 void dumpV3LiveFraction() noexcept;
 
+/// 2026-06-04: LIVE MEMORY BUCKETS — the GHC-style resident
+/// decomposition.  Walks the precise-root graph eval-first and splits
+/// arena LIVE bytes into EVAL working set vs CU-cache marginal
+/// retention, then adds the non-arena buckets: CU-cache bytecode (libc
+/// CompilationUnits), FFI/Boehm-live (heap−free), and the BC-cache
+/// SQLite page cache — decomposed against CURRENT resident RSS (never
+/// peak ru_maxrss, never the arena's cumulative bump counter).
+///
+/// Answers "are we counting wrong?": prints the arena LIVE total beside
+/// the OLD cumulative `v3_arena` number and their delta (dead cells the
+/// bump allocator never reclaimed).  No-op unless NIX_V3_MEM_BUCKETS=1.
+///
+/// Retirement criterion: when the precise GC ships default-on and the
+/// arena counter becomes a live-bytes proxy, fold into NIX_VM_STATS.
+void dumpV3MemoryBuckets() noexcept;
+
 // (dumpV3BridgeRetention retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
 /// Day 5 2026-05-28: per-block live-bytes probe for the Stage 6

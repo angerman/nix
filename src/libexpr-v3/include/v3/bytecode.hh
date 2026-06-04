@@ -523,6 +523,40 @@ struct CompilationUnit
     /// The string pointer is a `const char *` to a string literal;
     /// no ownership / lifetime concerns.
     std::vector<std::pair<uint32_t, const char *>> forceEmitSites;
+
+    /// Approximate in-memory byte footprint of this CU's owned
+    /// containers.  These live in libc-malloc'd `std::vector`s (NOT the
+    /// v3 arena), so they are invisible to the arena's `bytesAllocated`
+    /// counter AND to the precise arena mark — yet the `import` cache
+    /// retains one CU per imported `.nix` file for the whole process,
+    /// which is a material slice of resident RSS on nixpkgs-scale evals
+    /// (~700 MB on HNE per HNE_BUCKET_DECOMP_2026-05-27).  This accessor
+    /// lets the memory-bucket report size the "CU cache (bytecode)"
+    /// bucket honestly.
+    ///
+    /// Counts `capacity()` (the resident allocation), not `size()`, plus
+    /// the string bodies of the two string-bearing pools.  Inline
+    /// caches (attrSelect / recSlot) are sized at compile time, so their
+    /// `capacity()` is the live footprint.
+    size_t approxBytesUsed() const noexcept
+    {
+        size_t b = sizeof(CompilationUnit);
+        b += code.capacity()           * sizeof(Instruction);
+        b += intConstants.capacity()   * sizeof(int64_t);
+        b += floatConstants.capacity() * sizeof(double);
+        b += stringConstants.capacity() * sizeof(std::string);
+        for (const auto & s : stringConstants) b += s.capacity();
+        b += symbolTable.capacity()    * sizeof(std::string);
+        for (const auto & s : symbolTable) b += s.capacity();
+        b += lambdas.capacity()           * sizeof(LambdaDescriptor);
+        b += lambdaCodeOffsets.capacity() * sizeof(uint32_t);
+        b += primops.capacity()           * sizeof(const PrimOp *);
+        b += attrSelectCache.capacity()   * sizeof(AttrSelectIC);
+        b += recSlotCache.capacity()      * sizeof(RecSlotIC);
+        b += forceEmitSites.capacity()
+             * sizeof(std::pair<uint32_t, const char *>);
+        return b;
+    }
 };
 
 } // namespace nix::v3

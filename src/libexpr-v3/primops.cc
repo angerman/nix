@@ -5916,6 +5916,42 @@ static void maybeEvictOldImportEntries(ImportCache & c) noexcept
 
 } // anon ns
 
+// ----------------------------------------------------------------------
+// Import-cache size accessors (memory-bucket accounting, 2026-06-04).
+//
+// The `import` cache (anon-namespace `importCache()`) is the largest
+// "CU cache" contributor: one parsed CompilationUnit + one cached
+// eval-result Value per imported `.nix` file, retained for the process
+// lifetime.  The cached Value *payloads* live in the v3 arena (counted
+// by the precise mark under RootSource::CuCache); the CompilationUnit
+// bytecode lives in libc-malloc'd vectors (invisible to the arena).
+// These accessors expose both so live_trace.cc can size the bucket.
+// Defined outside the anon namespace for external linkage; they still
+// see `importCache()` (anon-namespace names are TU-visible).
+// ----------------------------------------------------------------------
+
+/// Sum of every cached CompilationUnit's libc-malloc'd container bytes
+/// (the parsed bytecode the import cache retains).  NOT in the arena.
+size_t importCacheBytecodeBytes() noexcept
+{
+    size_t total = 0;
+    for (const CompilationUnit & cu : importCache().cus)
+        total += cu.approxBytesUsed();
+    return total;
+}
+
+/// Number of cached CompilationUnits (one per imported file).
+size_t importCacheCuCount() noexcept
+{
+    return importCache().cus.size();
+}
+
+/// Number of cached eval-result entries (the Value cache).
+size_t importCacheResultCount() noexcept
+{
+    return importCache().results.size();
+}
+
 // 2026-05-29 evening (DIAG analysis spike): clear in-memory import
 // cache result set.  Used by run.cc's end-of-eval hook to test
 // whether the LiveTracer's "concentrated retention" finding

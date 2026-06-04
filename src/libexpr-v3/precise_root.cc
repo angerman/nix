@@ -82,6 +82,14 @@ inline void walkOneVMState(VMState & vm, RootVisitor & visitor) noexcept
 
 void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
 {
+    // -- Eval working set (the genuine root set) --------------------
+    // Announce the bucket so a bucketing visitor attributes everything
+    // reachable from here (transitively) to the EVAL working set.  The
+    // eval-first ordering is load-bearing: cells later reachable from a
+    // cache are already EVAL-attributed, so each cache reports only its
+    // marginal retention.  Default no-op for non-bucketing visitors.
+    visitor.enterRootSource(RootSource::Eval);
+
     // -- Primary VMState --------------------------------------------
     walkOneVMState(vm, visitor);
 
@@ -145,6 +153,11 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
     // v3 Value payloads (typically Tag::Attrs for imported nixpkgs
     // modules) that survive across primImport calls.  Same adapter
     // pattern as the bridge tables.
+    //
+    // This is the CU-cache bucket: a bucketing visitor drains the EVAL
+    // worklist (above) under the EVAL label first, then attributes
+    // whatever NEW cells the import cache reaches to CuCache.
+    visitor.enterRootSource(RootSource::CuCache);
     {
         std::function<void(Value &)> adapter =
             [&visitor](Value & v) { visitor.visitValue(v); };
@@ -162,6 +175,9 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
     //   * walkCallFlakeRoot       — callFlake intermediate Values
     //     (DIRECTLY relevant to M5 = getFlake cardano-node).
     //   * walkDeepForceRoots      — deepForce traversal temporaries.
+    // These are eval infrastructure (builtins, flake/deepForce
+    // temporaries), not a cache — back to the EVAL bucket.
+    visitor.enterRootSource(RootSource::Eval);
     {
         std::function<void(Value &)> adapter =
             [&visitor](Value & v) { visitor.visitValue(v); };
@@ -209,6 +225,7 @@ void walkGlobalV3Roots(RootVisitor & visitor) noexcept
     // Step 12′ Immix fix: use visitSlot (line-marks the cell) instead
     // of visitValue (only walks contents).  See walkAllV3Roots § for
     // full reasoning.
+    visitor.enterRootSource(RootSource::Eval);
     for (Value * cell : standaloneCellRoots()) {
         if (cell) visitor.visitSlot(cell);
     }
@@ -216,12 +233,16 @@ void walkGlobalV3Roots(RootVisitor & visitor) noexcept
     walkCppStackRoots(visitor);
     // FFI bridge tables — v3 Value handles indexed by TW.
     // (bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
-    // primImport cache + the global root sources the nursery walks
-    // (parity with walkAllV3Roots; see there for rationale).
     {
         std::function<void(Value &)> adapter =
             [&visitor](Value & v) { visitor.visitValue(v); };
+        // primImport cache → CuCache bucket (split out for the
+        // bucketing visitor; same eval-first reasoning as walkAllV3Roots).
+        visitor.enterRootSource(RootSource::CuCache);
         walkImportCacheRoots(adapter);
+        // The global root sources the nursery walks — eval infrastructure
+        // (parity with walkAllV3Roots; see there for rationale).
+        visitor.enterRootSource(RootSource::Eval);
         walkBytecodePrimopRoots(adapter);
         walkBuiltinsRoot(adapter);
         walkCallFlakeRoot(adapter);

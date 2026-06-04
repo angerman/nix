@@ -24,7 +24,10 @@
 #include "v3/value.hh"
 #include "v3/closure.hh"
 #include "v3/vm.hh"           // activeVMStack()
-#include "v3/primop.hh"       // v3BridgeTableSizes()
+#include "v3/primop.hh"       // importCacheBytecodeBytes / CuCount / ResultCount
+#include "v3/disk_cache.hh"   // disk_cache::approxResidentBytes (BC-cache bucket)
+
+#include <gc/gc.h>            // GC_get_heap_size / GC_get_free_bytes (Boehm-live)
 
 #include <algorithm>
 #include <atomic>
@@ -37,6 +40,13 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+// Resident-RSS read for the memory-bucket report (decomposes RESIDENT
+// RSS, never peak ru_maxrss).  Self-contained per the heap_trace.cc
+// precedent (limits.cc::currentRssBytes is anon-namespace, not linkable).
+#if defined(__APPLE__)
+#  include <mach/mach.h>      // task_info / MACH_TASK_BASIC_INFO
+#endif
 
 namespace nix::v3 {
 
@@ -646,6 +656,308 @@ void dumpV3LiveFraction() noexcept
     }
     std::fprintf(stderr,
         "============================================================\n");
+}
+
+// ============================================================================
+// 2026-06-04: LIVE MEMORY BUCKETS — the honest, GHC-style decomposition.
+//
+// User directive: "GHC allocates 1 TB of virtual memory but counts LIVE
+// bytes.  We must break this down into buckets: CU cache, BC cache,
+// actual live bytes during eval, FFI live bytes."
+//
+// The headline `v3-direct memory:` line (run.cc) is misleading: it
+// reports `v3_arena = bytesAllocated()` — the CUMULATIVE bump counter
+// (every byte ever allocated, never decremented on cell death; ~1.5×
+// resident on M5) — subtracted from PEAK `ru_maxrss`, with the
+// remainder clamped at 0.  This report instead decomposes CURRENT
+// RESIDENT RSS into LIVE buckets:
+//
+//   * EVAL working set  — arena cells reachable from the VM root set
+//     (the genuine live graph; what a precise GC bounds the arena to).
+//   * CU cache          — (a) cached eval-result Value graphs in the
+//     arena, pinned by the import cache BEYOND the working set; plus
+//     (b) the parsed bytecode (libc-malloc'd CompilationUnits).
+//   * FFI / Boehm-live  — Boehm heap−free (TW-interop + FFI-leaf values).
+//   * BC cache          — the bytecode SQLite connection's page cache.
+//
+// Attribution is EVAL-FIRST first-touch (see RootSource): a cell
+// reachable from both eval and a cache counts as EVAL, so each cache
+// shows only its MARGINAL retention.  Gated NIX_V3_MEM_BUCKETS=1.
+//
+// Retirement criterion: when the precise GC ships default-on and the
+// arena's `bytesAllocated()` becomes a live-bytes proxy (whole-block
+// free decrements it), fold this into NIX_VM_STATS and drop the gate.
+// ============================================================================
+namespace {
+
+/// Current resident-set bytes (mach phys_footprint-class `resident_size`
+/// on macOS; /proc/self/statm RSS on Linux).  NOT peak `ru_maxrss`, NOT
+/// the arena's cumulative bump counter.  Mirrors limits.cc and
+/// heap_trace.cc (both replicate this rather than cross-TU call).
+size_t bucketCurrentRssBytes() noexcept
+{
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS)
+        return static_cast<size_t>(info.resident_size);
+    return 0;
+#else
+    long pages = 0, dummy = 0;
+    std::FILE * f = std::fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    int rc = std::fscanf(f, "%ld %ld", &dummy, &pages);
+    std::fclose(f);
+    if (rc < 2 || pages <= 0) return 0;
+    long pgsize = sysconf(_SC_PAGESIZE);
+    return static_cast<size_t>(pages) * static_cast<size_t>(pgsize);
+#endif
+}
+
+/// Eval-first bucketing tracer.  Same transitive-mark machinery as
+/// LiveTracer, but it tracks the CURRENT root-source bucket and drains
+/// the worklist at each source boundary under the OLD label (see
+/// enterRootSource), so each first-touch-marked cell is attributed to
+/// whichever bucket REACHED it first.  Because walkAllV3Roots announces
+/// EVAL before CuCache, a cell shared by eval and a cache lands in EVAL
+/// and the cache bucket reflects only marginal retention.
+///
+/// Strings/paths (Tag::String/Path arena buffers) are intentionally not
+/// counted — ~1.2% of arena per STRINGS_ATTR_SPIKE_2026-05-29; folded
+/// into the residual.  Standalone cells (16 B) are walked-through but
+/// not size-counted (their pointee contents ARE counted via typed walks).
+class BucketTracer : public RootVisitor
+{
+public:
+    // Indexed by (int)RootSource: 0=Eval, 1=CuCache, 2=Ffi.
+    size_t bytesBy[3] = {0, 0, 0};
+    size_t objsBy [3] = {0, 0, 0};
+
+    void enterRootSource(RootSource rs) noexcept override
+    {
+        drain();                          // finish previous phase, OLD label
+        cur_ = static_cast<int>(rs);      // then switch buckets
+    }
+
+    void visitClosure (Closure   * & p) override { enqueue(p, GK_CLOSURE);  }
+    void visitThunk   (Thunk     * & p) override { enqueue(p, GK_THUNK);    }
+    void visitBindings(Bindings  * & p) override { enqueue(p, GK_BINDINGS); }
+    void visitList    (ListVec   * & p) override { enqueue(p, GK_LIST);     }
+    void visitPair    (ValuePair * & p) override { enqueue(p, GK_PAIR);     }
+    void visitSlot    (Value     * & p) override
+    {
+        if (!p) return;
+        if (cells_.insert(p).second) visitValue(*p);
+    }
+
+    void drain() noexcept
+    {
+        while (!work_.empty()) {
+            Gray g = work_.back();
+            work_.pop_back();
+            switch (g.kind) {
+            case GK_CLOSURE:  walkClosure (static_cast<Closure   *>(g.ptr)); break;
+            case GK_THUNK:    walkThunk   (static_cast<Thunk     *>(g.ptr)); break;
+            case GK_BINDINGS: walkBindings(static_cast<Bindings  *>(g.ptr)); break;
+            case GK_LIST:     walkList    (static_cast<ListVec   *>(g.ptr)); break;
+            case GK_PAIR:     walkPair    (static_cast<ValuePair *>(g.ptr)); break;
+            }
+        }
+    }
+
+private:
+    int cur_ = 0;  // current bucket == RootSource::Eval until announced
+    std::unordered_set<void *> seen_;
+    std::unordered_set<void *> cells_;
+    std::vector<Gray> work_;
+
+    template <typename P> void enqueue(P * p, GrayKind k)
+    {
+        if (!p) return;
+        if (!seen_.insert(p).second) return;  // first-touch dedup
+        work_.push_back({static_cast<void *>(p), k});
+    }
+
+    void account(size_t bytes) noexcept { bytesBy[cur_] += bytes; ++objsBy[cur_]; }
+
+    void walkClosure(Closure * c)
+    {
+        account(sizeof(Closure) + size_t(c->nUpvalues) * sizeof(Value));
+        if (c->capturedWiths) enqueue(c->capturedWiths, GK_LIST);
+        for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
+    }
+    void walkThunk(Thunk * t)
+    {
+        // Evaluated thunks dropped their tail; the rest keep nUpvalues.
+        const size_t bytes = (t->state == ThunkState::Evaluated)
+            ? sizeof(Thunk)
+            : sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
+        account(bytes);
+        if (t->cell && cells_.insert(t->cell).second) visitValue(*t->cell);
+        if (t->shapeCell && cells_.insert(t->shapeCell).second) visitValue(*t->shapeCell);
+        switch (t->state) {
+        case ThunkState::Suspended:
+        case ThunkState::Blackhole:
+            if (t->suspended.capturedWiths) enqueue(t->suspended.capturedWiths, GK_LIST);
+            for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
+            break;
+        case ThunkState::Evaluated:
+            visitValue(t->evaluated);
+            break;
+        case ThunkState::Native:
+            for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
+            break;
+        }
+    }
+    void walkBindings(Bindings * b)
+    {
+        account(sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+        for (uint32_t i = 0; i < b->size; ++i) visitValue(b->entries[i].value);
+        if (b->parent) enqueue(const_cast<Bindings *>(b->parent), GK_BINDINGS);
+    }
+    void walkList(ListVec * l)
+    {
+        account(sizeof(ListVec) + sizeof(Value) * l->size);
+        for (uint32_t i = 0; i < l->size; ++i) visitValue(l->elems[i]);
+    }
+    void walkPair(ValuePair * p)
+    {
+        account(sizeof(ValuePair));
+        visitValue(p->left);
+        visitValue(p->right);
+        visitValue(p->evaluated);
+        visitValue(p->third);  // Tag::App3 arg2 (2026-05-30)
+    }
+};
+
+} // namespace
+
+void dumpV3MemoryBuckets() noexcept
+{
+    static const bool s_enabled =
+        std::getenv("NIX_V3_MEM_BUCKETS") != nullptr;
+    if (!s_enabled) return;
+
+    // Multi-pass guard: run.cc may re-enter via bytecode-primop install
+    // passes (each a tiny eval).  Report only once allocation crosses a
+    // floor + only when it has grown since the last report — so the
+    // install passes (~tens of objects) are filtered and the real
+    // workload pass prints.  Uses cumulative OBJECT COUNTS, NOT the
+    // `bytes*` counters: those are gated (V3_STATS_BUMP) and read 0 in
+    // default / NIX_VM_STATS builds, which is why the byte-based guard
+    // dumpV3LiveFraction inherited never fires.  Counts are always
+    // maintained under NIX_VM_STATS (the gate this report lives behind).
+    static std::atomic<size_t> s_lastObjs{0};
+    const auto & st = allocStats();
+    const size_t curObjs = st.closuresAllocated + st.thunksAllocated
+        + st.attrsetsAllocated + st.listsAllocated + st.pairsAllocated;
+    if (curObjs < 1024) return;  // floor: skip trivial / install passes
+    if (curObjs < s_lastObjs.load(std::memory_order_relaxed) + 1024)
+        return;
+    s_lastObjs.store(curObjs, std::memory_order_relaxed);
+
+    BucketTracer tr;
+    bool fullVm = false;
+    const auto & stack = activeVMStack();
+    if (!stack.empty() && stack.back()) {
+        walkAllV3Roots(*stack.back(), tr);
+        fullVm = true;
+    } else {
+        walkGlobalV3Roots(tr);
+    }
+    tr.drain();  // final phase (the EVAL infra announced last)
+
+    // -- Arena live, split by bucket (eval-first first-touch) ----------
+    const size_t evalArena    = tr.bytesBy[static_cast<int>(RootSource::Eval)];
+    const size_t cuCacheArena = tr.bytesBy[static_cast<int>(RootSource::CuCache)];
+    const size_t ffiArena     = tr.bytesBy[static_cast<int>(RootSource::Ffi)];
+    const size_t arenaLive    = evalArena + cuCacheArena + ffiArena;
+
+    // -- CU cache: parsed bytecode (libc-malloc'd, not in the arena) ---
+    const size_t cuBytecode  = importCacheBytecodeBytes();
+    const size_t cuCount     = importCacheCuCount();
+    const size_t resultCount = importCacheResultCount();
+
+    // -- FFI / Boehm-live: heap − free (TW interop + FFI-leaf values) --
+    const size_t boehmHeap = GC_get_heap_size();
+    const size_t boehmFree = GC_get_free_bytes();
+    const size_t boehmLive = boehmHeap > boehmFree ? boehmHeap - boehmFree : 0;
+
+    // -- BC cache: bytecode SQLite connection's page cache -------------
+    const size_t bcCache = static_cast<size_t>(disk_cache::approxResidentBytes());
+
+    // -- Base + residual -----------------------------------------------
+    const size_t resident = bucketCurrentRssBytes();
+    const size_t accounted = arenaLive + cuBytecode + boehmLive + bcCache;
+    const size_t residual  = resident > accounted ? resident - accounted : 0;
+    // The "1 TB virtual" analog: the arena's cumulative bump counter —
+    // every byte ever bump-allocated (+ unused tail of reserved 16 MB
+    // blocks), never decremented on cell death.  This is the OLD
+    // `v3_arena` headline number; the overcount vs arena LIVE is the
+    // counting-correction the user asked for.
+    const size_t arenaCumulative = threadArena().bytesAllocated();
+    const size_t overcount =
+        arenaCumulative > arenaLive ? arenaCumulative - arenaLive : 0;
+
+    char b1[32], b2[32], b3[32], b4[32], b5[32], b6[32], b7[32], b8[32];
+    char bArenaLive[32], bCumul[32], bOver[32];
+    fmtBytes(evalArena,    b1, sizeof(b1));
+    fmtBytes(cuCacheArena, b2, sizeof(b2));
+    fmtBytes(cuBytecode,   b3, sizeof(b3));
+    fmtBytes(boehmLive,    b4, sizeof(b4));
+    fmtBytes(bcCache,      b5, sizeof(b5));
+    fmtBytes(accounted,    b6, sizeof(b6));
+    fmtBytes(resident,     b7, sizeof(b7));
+    fmtBytes(residual,     b8, sizeof(b8));
+    fmtBytes(arenaLive,      bArenaLive, sizeof(bArenaLive));
+    fmtBytes(arenaCumulative, bCumul, sizeof(bCumul));
+    fmtBytes(overcount,      bOver,  sizeof(bOver));
+
+    // Compact "pretty" layout: resident decomposition, no verbose
+    // preamble / separator rules.  The scope line is kept (one line) —
+    // it is load-bearing: under "residual" the EVAL bucket is a lower
+    // bound (VMState already unwound), not the peak working set.
+    std::fprintf(stderr,
+        "\n"
+        "=========== v3 LIVE MEMORY BUCKETS — resident decomposition ===========\n"
+        "  eval-first first-touch · resident (not bump-cumulative, not peak); "
+        "scope: %s\n"
+        "\n"
+        "  bucket                          LIVE bytes   detail\n"
+        "  eval working set (arena)      %12s   %zu objs\n"
+        "  CU cache — result graph (arena) %10s   pinned beyond eval (%zu results)\n"
+        "  CU cache — bytecode (libc)    %12s   %zu CUs (parsed bytecode)\n"
+        "  FFI / Boehm-live              %12s   heap-free\n"
+        "  BC cache (SQLite page cache)  %12s   sqlite3_db_status\n",
+        fullVm ? "FULL (active VMState + global)"
+               : "RESIDUAL lower-bound (VMState torn down)",
+        b1, tr.objsBy[static_cast<int>(RootSource::Eval)],
+        b2, resultCount,
+        b3, cuCount,
+        b4,
+        b5);
+
+    if (ffiArena > 0) {
+        char bf[32];
+        fmtBytes(ffiArena, bf, sizeof(bf));
+        std::fprintf(stderr,
+            "  FFI bridge graph (arena)      %12s   %zu objs\n",
+            bf, tr.objsBy[static_cast<int>(RootSource::Ffi)]);
+    }
+
+    std::fprintf(stderr,
+        "  accounted live                %12s\n"
+        "  resident RSS (now)            %12s\n"
+        "  residual (RSS - accounted)    %12s   libstore/stdlib/AOT/unattributed\n"
+        "\n"
+        "  memo (the counting-correction):\n"
+        "    arena LIVE  (eval + CU graph) %10s   <- honest working set\n"
+        "    arena RESERVED (bump counter) %10s   <- the OLD v3_arena number\n"
+        "    not-live    (reserved - live) %10s   <- dead cells + unused block tail\n"
+        "=======================================================================\n",
+        b6, b7, b8,
+        bArenaLive, bCumul, bOver);
 }
 
 // ============================================================================

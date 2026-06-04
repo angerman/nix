@@ -31,6 +31,8 @@
 #include "v3/vm.hh"
 #include "v3/primop.hh"
 #include "v3/alloc.hh"
+#include "v3/barrier.hh"       // standaloneCellRoots (root the result for the bucket walk)
+#include "v3/live_trace.hh"    // dumpV3MemoryBuckets (NIX_V3_MEM_BUCKETS)
 #include "v3/bytecode_primops.hh"
 #include "v3/disasm.hh"
 #include "v3/ir.hh"
@@ -488,6 +490,21 @@ int main(int argc, char ** argv)
         // attribute names from imported CUs that the top-level CU's
         // (frozen-at-compile-time) snapshot wouldn't see.
         int rc = printValue(vm, r, jsonOut, nix::v3::ir::globalSymbolTable());
+        // LIVE MEMORY BUCKETS (NIX_V3_MEM_BUCKETS): v3-eval runs the main
+        // expression via run() directly, not runRootExpr, so the run.cc
+        // dump path is never hit for the workload.  Fire it here.  The
+        // VMState is unwound by now, so root the result `r` as a
+        // standalone cell first — that attributes its live graph to the
+        // EVAL bucket (walkGlobalV3Roots walks standaloneCellRoots);
+        // without it the walk would be global-only / residual.  Gated
+        // internally by NIX_V3_MEM_BUCKETS; the alloc+root is cheap and
+        // only happens when measuring.
+        if (std::getenv("NIX_V3_MEM_BUCKETS")) {
+            Value * resultRoot = nix::v3::Alloc::allocValue();
+            *resultRoot = r;
+            nix::v3::standaloneCellRoots().push_back(resultRoot);
+            nix::v3::dumpV3MemoryBuckets();
+        }
         if (std::getenv("NIX_VM_STATS")) {
             nix::v3::dumpPrimOpStats(stderr);
             auto & a = nix::v3::allocStats();
