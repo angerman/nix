@@ -413,6 +413,12 @@ size_t betaReduce(Module & m)
             const Function & f = m.functions[lam->funcIdx];
             if (f.argName == kInvalidSymbol) { out.push_back(bd); continue; }
             if (f.hasFormals)                 { out.push_back(bd); continue; }
+            // eval/apply (#3): an uncurried multi-arity Function (collapsed
+            // curried chain) has params beyond paramVar.  Beta-reducing it by
+            // a SINGLE arg would substitute paramVar and leave the extraParams
+            // dangling as free vars.  Skip — the runtime PAP handles arity-N
+            // application.  (extraParams is empty unless NIX_V3_EVAL_APPLY.)
+            if (!f.extraParams.empty())       { out.push_back(bd); continue; }
             if (f.intrinsicKind != 0)         { out.push_back(bd); continue; }
             if (f.entryBlock == kInvalidBlock
                 || f.entryBlock >= m.blocks.size()) {

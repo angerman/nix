@@ -179,6 +179,26 @@ namespace {
 constexpr int    kMaxIndirectionChase = 100000;
 constexpr size_t kMaxCallDepth        = 5000;
 
+/// eval/apply (#3): is `v` an under-applied multi-arity closure — a Tag::App
+/// chain App(…App(closure, a0)…, a_{d-1}) whose leaf is a Closure of arity A
+/// with d < A?  Such a value is WHNF: a partial application, a function still
+/// awaiting (A − d) args.  The force paths must NOT try to evaluate it as a
+/// deferred call (that would enter the arity-A body with too few args).
+/// Gate-on only: arity>1 closures exist only when NIX_V3_EVAL_APPLY collapsed
+/// a curried chain, so this returns false everywhere by default.
+[[gnu::always_inline]] inline bool isUnderappliedClosurePap(const Value & v)
+{
+    if (v.tag() != Tag::App) return false;
+    const Value * cur = &v;
+    size_t depth = 0;
+    while (cur->tag() == Tag::App && cur->payload.pair) {
+        ++depth; cur = &cur->payload.pair->left;
+    }
+    return cur->tag() == Tag::Closure && cur->payload.closure
+        && cur->payload.closure->desc
+        && cur->payload.closure->desc->arity > depth;
+}
+
 // V3_DBG_TRACE_THUNK_X — file-scope thunk-creation registry.  Bumped
 // at every OP_MAKE_THUNK; consulted by the OP_WITH_LOOKUP cycle dump
 // so we can compare each frame's *current* `t->suspended.desc`
@@ -4442,6 +4462,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     if (eT != Tag::Thunk && eT != Tag::App && eT != Tag::App3
                         && eT != Tag::Slot) {
                         fun = e;
+                    } else if (eT == Tag::App && isUnderappliedClosurePap(e)) {
+                        // eval/apply: a thunk that evaluated to an under-
+                        // applied closure-PAP is WHNF — apply the next arg at
+                        // op_call_have_fun rather than iter-forcing it.
+                        fun = e;
+                        goto op_call_have_fun;
                     } else {
                         goto op_call_iter_force;
                     }
@@ -6724,6 +6750,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     continue;
                 }
                 if (v.isAppLike()) {
+                    // eval/apply (#3): an under-applied closure-PAP is WHNF —
+                    // a partial application, NOT a deferred call.  Stop the
+                    // chase here with v as the result (don't walk+apply it,
+                    // which would enter the arity-N body with too few args).
+                    if (isUnderappliedClosurePap(v)) break;
                     // REVIEW MED-18: walk the App spine iteratively
                     // to find the leaf function + collected args.
                     // Pre-fix recursed through forceValue per App level
@@ -11567,6 +11598,10 @@ Value forceValue(VMState & vm, Value v)
         // Closes the H3 memoization gap (extendDerivation outputsList
         // at customisation.nix:409 forced 64K times pre-fix).
         if (v.isAppLike()) {
+            // eval/apply (#3): an under-applied closure-PAP is WHNF (a partial
+            // application) — return it as-is rather than evaluating it as a
+            // deferred call (which would enter the arity-N body short of args).
+            if (isUnderappliedClosurePap(v)) return v;
             // EXIT_GC_SPIRAL Week 1 Day 9-11 (2026-05-29):
             // Tag::App3 = 3-arg App stored as ONE ValuePair (saves
             // one 32 B Pair vs the legacy 2-pair encoding for

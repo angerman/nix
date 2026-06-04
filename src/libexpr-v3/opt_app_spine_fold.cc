@@ -162,6 +162,12 @@ walkCurriedChain(const Module & m, FuncId startFid, size_t needDepth)
         if (f.argName == kInvalidSymbol) return std::nullopt;
         if (f.hasFormals)                return std::nullopt;
         if (f.intrinsicKind != 0)        return std::nullopt;
+        // eval/apply (#3): a collapsed uncurried multi-arity Function carries
+        // its later params in extraParams (not as nested Lambda bodies).  The
+        // curried-chain fold would substitute only paramVar and leave the
+        // extraParams dangling — skip and let the runtime PAP apply it.
+        // (extraParams is empty unless NIX_V3_EVAL_APPLY.)
+        if (!f.extraParams.empty())      return std::nullopt;
         if (f.entryBlock == kInvalidBlock
             || f.entryBlock >= m.blocks.size()) return std::nullopt;
 
