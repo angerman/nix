@@ -12554,6 +12554,69 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         return out;
     }
 
+    // eval/apply (#3, gate-on only): arity-N closure / Tag::App PAP — the
+    // closure analogue of the PrimOpApp block above, mirroring OP_CALL.  This
+    // is the C++-apply path (App-spine force-apply + primops applying a user
+    // fn), so it must agree with OP_CALL on the PAP convention.  Under-
+    // application returns a PAP; saturation enters the callee with all N args
+    // in slots 0..N-1 and runs it via dispatchLoop.  Gate-off inert:
+    // papBase->desc->arity is 0/1.
+    {
+        const Closure * papBase = nullptr;
+        size_t papDepth = 0;
+        if (fun.tag() == Tag::Closure && fun.payload.closure) {
+            papBase = fun.payload.closure;
+        } else if (fun.tag() == Tag::App && fun.payload.pair) {
+            const Value * cur = &fun;
+            while (cur->tag() == Tag::App && cur->payload.pair) {
+                ++papDepth; cur = &cur->payload.pair->left;
+            }
+            if (cur->tag() == Tag::Closure && cur->payload.closure)
+                papBase = cur->payload.closure;
+        }
+        if (papBase && papBase->desc && papBase->desc->arity > 1) {
+            const uint8_t A = papBase->desc->arity;
+            const size_t total = papDepth + 1;
+            if (total < A) {
+                ValuePair * vp = Alloc::allocPair();
+                vp->left = fun; vp->right = arg;
+                pairPostConstructBarrier(vp);
+                Value v;
+                v.tag_payload = static_cast<uint64_t>(Tag::App);
+                v.payload.pair = vp;
+                return v;
+            }
+            if (A > 16) throw std::runtime_error("v3 callClosure: arity > 16");
+            Value argbuf[16];
+            argbuf[total - 1] = arg;
+            Value chain = fun;
+            for (size_t i = total - 1; i > 0; --i) {
+                argbuf[i - 1] = chain.payload.pair->right;
+                chain = chain.payload.pair->left;
+            }
+            const LambdaDescriptor * d = papBase->desc;
+            const CompilationUnit * ccu =
+                papBase->cu ? papBase->cu : vm.frames.back().cu;
+            size_t exitDepth = vm.frames.size();
+            size_t newBase = vm.valueStack.size();
+            vm.valueStack.resize(newBase + d->nLocals);
+            for (size_t i = 0; i < A; ++i)
+                vm.valueStack[newBase + i] = argbuf[i];
+            uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+            vm.frames.push_back(CallFrame{
+                .cu = ccu,
+                .closure = papBase,
+                .thunk = nullptr,
+                .ip = d->codeOffset,
+                .stackBaseOffset = static_cast<uint32_t>(newBase),
+                .withStackBase = newWithBase,
+                .flags = 0,
+            });
+            pushCapturedWiths(vm, papBase->capturedWiths);
+            return dispatchLoop(vm, exitDepth);
+        }
+    }
+
     // Attrset with __functor: apply functor self arg.
     if (fun.isAttrs() && fun.payload.bindings) {
         static const SymbolId functorId = ir::globalInternSymbol("__functor");
