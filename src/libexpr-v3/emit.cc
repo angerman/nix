@@ -1767,6 +1767,31 @@ CompilationUnit compile(const ir::Module & m)
 {
     Emitter e(m);
     e.emitAll();
+
+    // Observability: full-CU bytecode disassembly dump for STATIC opcode /
+    // n-gram analysis (consumed by `bench/analyze-bytecode.py`).  Gated by
+    // NIX_V3_EMIT_BYTECODE; optional NIX_V3_EMIT_BYTECODE_OUT=<path> appends
+    // to a file (default stderr).  This is the single chokepoint every CU
+    // passes through — top-level AND each imported module — so one hook
+    // covers the whole compiled corpus.  For full static coverage run with
+    // NIX_V3_NO_DISK_CACHE=1, since a warm cache deserializes CUs and skips
+    // compile() entirely.  Reuses disassembleWindow (which advances by the
+    // correct per-opcode instruction width via disasm.cc::opExtraWords).
+    // Retirement criterion: remove when a first-class `v3-eval
+    // --emit-bytecode` CLI flag supersedes this env gate.
+    if (std::getenv("NIX_V3_EMIT_BYTECODE")) {
+        std::FILE * out = stderr;
+        bool closeOut = false;
+        if (const char * p = std::getenv("NIX_V3_EMIT_BYTECODE_OUT")) {
+            if (std::FILE * f = std::fopen(p, "a")) { out = f; closeOut = true; }
+        }
+        std::fprintf(out, "=== v3-bytecode CU functions=%zu code=%zu ===\n",
+                     e.unit.lambdas.size(), e.unit.code.size());
+        disassembleWindow(out, e.unit, 0,
+                          static_cast<uint32_t>(e.unit.code.size()));
+        if (closeOut) std::fclose(out);
+    }
+
     return std::move(e.unit);
 }
 
