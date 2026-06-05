@@ -6,7 +6,8 @@ The correction and the meta-fix it implies are the load-bearing content;
 the codegen levers and strategic read follow.
 
 **Anchors (current HEAD, same-binary same-host wall vs cppnix TW):**
-`fib33` ≈ 2.0× (3.30s / 1.62s) — the interpreter ceiling. `fold-add-1M` ≈
+`fib33` ≈ 2.0× (3.30s / 1.62s) — v3-vs-TW, **both interpreters**, so this is an
+under-performance with headroom, NOT a ceiling (see §3). `fold-add-1M` ≈
 4.3× (0.60s / 0.14s). Peak RSS ≈ 4.4–5.3× — the larger remaining gap.
 
 ---
@@ -163,19 +164,38 @@ over-reserved slots/fn without the full register VM.
 
 ---
 
-## 3. Strategic read: pure-recursion wall is essentially done
+## 3. Strategic read: the CONTAINED-codegen wall is done; the structural lever is untapped
 
-`fib33` at **2.0×** is the interpreter ceiling (~1.5–2×, per the architecture
-review). The §2(a–c) peepholes might take it to ~1.5× and help `fold`
-(4.3×) similarly — **bounded, worth doing, diminishing.** Past that, wall
-returns shrink fast.
+**Framing correction (2026-06-05).** Earlier wording here called `fib33`'s
+2.0× "the interpreter ceiling." That conflated two different comparisons:
+- the architecture review's **~1.5–2× ceiling is v3-vs-_native_** — an
+  interpreter can't close the last gap to compiled code without a JIT;
+- the **2.0× is v3-vs-TW**, and TW is *also* an interpreter — a tree-walker.
 
-The bigger gap is **memory: 4.4–5.3× peak RSS** — and per
-[[memory-first-class]], memory has higher slope per engineering-day. The GC
-track is paused (`GC_PAUSE_2026-05-29`, after Immix projected below SHIP),
-but with wall approaching the floor the wall-vs-memory tradeoff should be
-re-evaluated now. **Recommendation:** harvest §2(a–c) (≈1–2 wk of contained
-codegen wins), then **pivot back to memory**, where the remaining slope is.
+A bytecode VM is supposed to **beat** a tree-walker (dense dispatch, no
+per-node AST pointer-chase, compile-time opt). So v3 being 2× *slower* than
+TW is an **under-performance with headroom, NOT a ceiling** — there is no law
+that stops v3 going **below 1× (faster than TW)**. The cause is measured: the
+51% stack-motion is bytecode plumbing (`GET/SET_LOCAL`/`GET_UPVALUE`) that TW
+has **no analog for** (TW reads the `Env` inline as it walks); v3's A-normal-
+form lowering emits ~2× the ops TW does, and that bloat eats the bytecode
+advantage v3 was built to capture.
+
+**What is done:** the **contained-codegen** wall floor — the §2(a–c) peepholes
++ the #2 DAG demotion are wall-neutral on real corpora (UPDATE blocks below).
+**What is NOT done:** the **structural** wall lever — the register VM (§4) —
+which attacks the 51% stack-motion directly and whose upside is *v3 beats TW*,
+a far bigger prize than the discarded "approach a ceiling" framing implied.
+(Not guaranteed: v3 also carries overheads TW lacks — 16-byte tagged `Value`,
+GC barriers, FFI, asserts-on — that could keep it near TW even after; the
+register VM is the *test* of whether v3 can claim its intended advantage.)
+
+The OTHER big gap is **memory: 4.4–5.3× peak RSS** — per [[memory-first-class]]
+the higher slope per engineering-day in the *near term*, and the GC track is
+paused (`GC_PAUSE_2026-05-29`). **Recommendation (revised):** memory is the
+right *near-term* slope, but the register VM is now a **larger long-term wall
+prize** than the ceiling framing suggested — the §4 gate must weigh
+"v3-beats-TW", not "approach a 1.5–2× ceiling."
 
 > **UPDATE 2026-06-05.** §2(a–c) are harvested (SHIPPED block in §2; real-
 > corpus-neutral for (a)/(b), so the wall floor barely moved on real
@@ -199,23 +219,31 @@ codegen wins), then **pivot back to memory**, where the remaining slope is.
 > workloads** — exactly the QUANTIFICATION's prediction that the *only* wall
 > lever is the structural #1 register VM (§4, gated). The DAG demotion's
 > value is **allocation churn** (−8.6% attrsets, less GC pressure), a memory-
-> adjacent win. **Conclusion: the contained codegen track is harvested and
-> the real-workload wall floor is reached.** The remaining slope is **memory**
-> (per [[memory-first-class]]) — the pivot is now the clear next direction;
-> the register VM (§4) stays gated unless the §3 tradeoff flips back to wall.
+> adjacent win. **Conclusion: the contained codegen track is harvested and the
+> _contained-codegen_ wall floor is reached** — NOT a fundamental floor: the
+> structural register-VM lever (§4) is untapped, and per the §3 framing
+> correction 2×-vs-TW is an under-performance (a bytecode VM should beat a
+> tree-walker), not a ceiling. The near-term slope is **memory**
+> ([[memory-first-class]]); the register VM (§4) stays gated, but its upside
+> is now understood as *v3-beats-TW*, which re-weights that gate upward.
 
 ---
 
 ## 4. The register-VM decision — gate it, don't start it
 
-The stack-motion ceiling (§2d) is the only thing blocking sub-1.5× wall, and
-a register VM is the only structural fix — but it's a multi-KLoC investment
-against a hard ~1.5–2× interpreter ceiling. `analyze-operands.py` D1 already
-informs it: all adjacent `GET_LOCAL;GET_LOCAL` are *different-slot* (→ an
-operand-parameterized 2-slot push, i.e. the register direction, not a DUP
-peephole). **Gate:** don't begin the register VM until (a) §2 peepholes are
-harvested and re-measured, and (b) the §3 tradeoff still says wall > memory.
-If memory wins (likely), the register VM waits.
+The 51% stack-motion (§2d) is the structural residue blocking v3 from its
+intended bytecode advantage, and a register VM is the only fix — a multi-KLoC
+investment. Its upside is **NOT** "approach a ~1.5–2× ceiling" (that ceiling
+is v3-vs-_native_; §3): against TW (a tree-walker) a bytecode VM should win,
+so the target is **below 1× — v3 faster than TW**. `analyze-operands.py` D1
+informs the design: all adjacent `GET_LOCAL;GET_LOCAL` are *different-slot*
+(→ an operand-parameterized 2-slot push, i.e. the register direction, not a
+DUP peephole). **Gate:** don't begin the register VM until (a) §2 peepholes
+are harvested and re-measured (done), and (b) the §3 tradeoff is re-weighed
+with the corrected upside. Memory is the better *near-term* slope, but the
+register VM is a larger *long-term* wall prize than the ceiling framing
+implied — it is the test of whether v3 can beat TW, not merely approach a
+floor.
 
 ---
 

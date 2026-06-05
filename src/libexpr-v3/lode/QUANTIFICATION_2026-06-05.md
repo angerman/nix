@@ -121,6 +121,18 @@ data leaves a clean two-item ranking.
    pressure-vs-nLocals gap (1.8 slots/fn) also bounds a cheaper interim win:
    a slot-reuse / liveness-based allocator that shrinks frames without going
    full register-VM.
+
+   > **Framing correction (2026-06-05).** "Structural" here is v3-vs-**TW**,
+   > both interpreters — a bytecode VM should *beat* a tree-walker, so 51%
+   > stack-motion is an **under-performance with headroom (target: below 1×),
+   > NOT the interpreter ceiling** (that ~1.5–2× ceiling is v3-vs-_native_, a
+   > different comparison). **BUT** a later result (WALL_OPTIMIZATION_PLAN §7):
+   > the `GET_LOCAL2` fusion cut `GET_LOCAL` 55% / dispatch −5.6% and was
+   > **wall-neutral** → v3's wall cost is the per-op **`Value`-copy / force /
+   > GC, not dispatch count.** A register VM *can* remove operand-stack copies
+   > (unlike `GET_LOCAL2`), so its payoff is open — but the data now points the
+   > v3-vs-TW wall lever at the **`Value` representation / per-op copy**;
+   > measure that before any register-VM commitment.
 2. **Rec-binding machinery (9.2%) is the contained #2 lever.** The DAG-
    orderable `let`/formals demotion (survey finding H) turns
    `REC_BINDING_SLOT_REF` indirection into direct `GET_LOCAL`, drops the

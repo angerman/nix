@@ -10,10 +10,12 @@ in [[NEXT_STEPS_2026-06-05]] §2 for *what to build next on wall*.
 
 ## 0. Executive summary
 
-Pure-recursion wall is at the interpreter ceiling (`fib33` ≈ 2.0× TW);
-`fold-add-1M` ≈ 4.3×; peak RSS ≈ 4.4–5.3×. Execution-weighted measurement on
-real evals (hello + firefox, production path) gives **one dominant wall lever
-and one contained second**, and **kills three tempting dead ends**:
+`fib33` ≈ 2.0× TW; `fold-add-1M` ≈ 4.3×; peak RSS ≈ 4.4–5.3×. **The 2.0× is
+v3-vs-TW, both interpreters — an under-performance, NOT a ceiling** (a bytecode
+VM should beat a tree-walker; the ~1.5–2× "interpreter ceiling" is v3-vs-_native_,
+a different comparison — see §1). Execution-weighted measurement on real evals
+(hello + firefox, production path) gives **one dominant wall lever and one
+contained second**, and **kills three tempting dead ends**:
 
 | Rank | Lever | Dynamic weight | Effort | What it is |
 |---|---|---|---|---|
@@ -33,13 +35,23 @@ almost certainly cardano-node / M5.
 
 ## 1. State & strategic frame
 
-- `fib33` 2.0× = the interpreter ceiling (~1.5–2×, per the architecture
-  review). Pure compute wall is essentially done.
-- The only remaining *wall* lever above the floor is **stack-motion (51%)**,
-  which is structural — no peephole touches it materially (constant-spill, the
-  obvious candidate, is 0.0% on real code).
-- **Memory (4.4–5.3× RSS) has more slope per engineering-day** ([[memory-first-class]]).
-  Recommended arc: harvest Levers 1+2 (wall), then pivot to memory.
+- **`fib33` 2.0× is v3-vs-TW — both interpreters.** TW is a tree-walker; v3 a
+  bytecode VM, which is *supposed to be faster*. So 2× slower is an
+  **under-performance with headroom**, not a ceiling. The architecture
+  review's ~1.5–2× ceiling is v3-vs-**native** (the interpreter→compiled gap)
+  — a different comparison that was wrongly applied here. Against TW there is
+  **no ceiling**: the target is **below 1× (v3 faster than TW)**.
+- The cause is measured: **stack-motion (51%)** is bytecode plumbing
+  (`GET/SET_LOCAL`/`GET_UPVALUE`) that TW has **no analog for** — it reads the
+  `Env` inline as it walks. v3's A-normal-form lowering emits ~2× the ops TW
+  does; that bloat eats the bytecode advantage. The **contained-codegen** wall
+  is done (peepholes wall-neutral on real code); the **structural** lever
+  (register VM, §4) is untapped — no peephole touches the 51%.
+- **Memory (4.4–5.3× RSS)** is the higher *near-term* slope
+  ([[memory-first-class]]). But the register VM is a larger *long-term* wall
+  prize than the (incorrect) ceiling framing implied. Recommended arc: harvest
+  Lever 2, then re-weigh wall (register VM, with the corrected *v3-beats-TW*
+  upside) vs the memory pivot — see §7.
 
 ---
 
@@ -203,7 +215,10 @@ attack and a stepping-stone to 1C.
 ### Phase 1C — full register VM *(GATED — only if 1A+1B-lite plateau AND wall still > memory)*
 **Idea.** Replace the stack calling convention with a register file: operands
 name registers; ops are 2/3-address (`ADD rd, ra, rb`). This structurally
-removes the operand-load dispatches that 1A/1B chip at.
+removes the operand-load dispatches that 1A/1B chip at — the 51% stack-motion
+that has **no tree-walker analog**. **Upside is v3 beating TW (below 1×)** —
+the bytecode-VM advantage v3 was built for — NOT "approaching a ~1.5–2×
+ceiling" (that ceiling is v3-vs-_native_; see §1).
 
 **Sizing (from §2):** a **fixed 8–16-register file + memory spill** covers
 99.4–99.8% of functions; mean pressure 1.78. Register allocation is
@@ -218,9 +233,13 @@ support; (6) extensive parity validation.
 
 **Gating contract.** Do NOT start 1C until: (a) 1A and 1B-lite are landed and
 re-measured, and (b) the wall-vs-memory decision (`§"Memory"` in
-[[ROADMAP_TO_VISION]] + [[memory-first-class]]) still ranks wall above memory.
-A register VM is multi-KLoC against a hard ~1.5–2× ceiling; do not spend it if
-1A+1B already land near the floor or if memory is the bigger gap.
+[[ROADMAP_TO_VISION]] + [[memory-first-class]]) ranks wall above memory.
+A register VM is multi-KLoC; its prize is **v3 beats TW** (not a ~1.5–2×
+ceiling — that is v3-vs-native). Caveat: v3 carries overheads TW lacks
+(16-byte `Value`, GC barriers, FFI, asserts-on), so beating TW is the
+*hypothesis the register VM tests*, not a certainty — size the bet against
+that. Defer only if memory is the better near-term ROI, not because wall is
+"near a floor" (it isn't, vs TW).
 
 ---
 
@@ -275,11 +294,13 @@ repros. **Bonus:** also reduces thunks (memory) — feeds Lever 3.
 
 ## 6. LEVER 3 — pivot to memory (after 1+2)
 
-With wall near the floor, peak RSS (4.4–5.3×) is the larger gap and has more
-slope. The GC track is paused (`GC_PAUSE_2026-05-29`, Immix projected below
-SHIP); re-evaluate per `EXIT_GC_SPIRAL_PLAN` once Levers 1+2 land. Levers 1A
-(fewer slots) and 2 (fewer thunks) already shave memory — measure peak-RSS
-deltas there first; they may move the GC decision.
+With the contained-codegen wall harvested and the structural register-VM lever
+gated (§4/§7 — deferred on *unproven payoff*, not foreclosed by a ceiling),
+peak RSS (4.4–5.3×) is the larger *near-term* gap and slope. The GC track is
+paused (`GC_PAUSE_2026-05-29`, Immix projected below SHIP); re-evaluate per
+`EXIT_GC_SPIRAL_PLAN`. Levers 1A (fewer slots) and 2 (fewer thunks/attrsets)
+already shave memory — measure peak-RSS deltas there first; they may move the
+GC decision.
 
 ---
 
@@ -299,15 +320,25 @@ deltas there first; they may move the GC decision.
 >    `GET_LOCAL;GET_LOCAL`. hello `GET_LOCAL` 22.22%→10.63% (**−55%**, 625K
 >    pairs), ~−5.6% total dispatch; fib27 −7.7%. `--core` 19/19 (incl. cache
 >    round-trip). The biggest dispatch cut of any lever — yet **wall-neutral**.
-> 4. **DECISION POINT → Lever 3 (memory).** All three contained levers are
->    **wall-neutral on real workloads** (fib30 1.01×; hello overhead-
->    dominated): a dispatch cut of a *cheap* op (GET/SET) saves loop overhead
->    but keeps the value-copy, so wall doesn't move — the QUANTIFICATION's
->    thesis confirmed. **1A+1B plateaued at the floor AND memory (4.4–5.3×;
->    hello 765 MB = 520 MB arena + 403 MB Boehm) is the bigger gap** — BOTH
->    of §4's anti-1C conditions hold, so the **register VM (1C) stays GATED
->    (do NOT start)**. The slope is **memory (Lever 3 / `EXIT_GC_SPIRAL_PLAN`)**
->    — a separate track. The WALL plan's actionable wall work is COMPLETE.
+> 4. **DECISION POINT → memory near-term; register VM GATED on an UNPROVEN
+>    payoff (NOT a ceiling).** All three contained levers are **wall-neutral on
+>    real workloads** (fib30 1.01×; hello overhead-dominated). Key finding:
+>    §1B-lite cut `GET_LOCAL` 55% / total dispatch −5.6% — the biggest dispatch
+>    cut of any lever — **yet wall didn't move.** So v3's wall cost is **per-op
+>    real work (the 16-byte `Value` copy / force / GC), NOT dispatch count.**
+>    This *sharpens* the framing correction (§1, §3): 2×-vs-TW is not a ceiling,
+>    but the route to beating TW is **not cutting dispatch — it's cutting the
+>    per-op value-copy.** The register VM differs from `GET_LOCAL2` (which kept
+>    the operand-stack copy) in that it *can* operate slot-to-slot and remove
+>    those copies — so its wall-neutrality is **not** established by the
+>    `GET_LOCAL2` result; but neither is its win. It is an **unproven multi-KLoC
+>    bet** whose payoff now rests on the value-copy, not dispatch. With memory
+>    the clearer near-term gap (4.4–5.3×; hello 765 MB = 520 arena + 403 Boehm),
+>    **1C stays GATED — deferred on unproven-payoff + better near-term ROI, NOT
+>    because wall is at a floor (it isn't, vs TW).** Near-term slope: **memory
+>    (Lever 3 / `EXIT_GC_SPIRAL_PLAN`).** The data now implicates a *different*
+>    wall lever than the register VM: the **`Value` representation / per-op copy
+>    cost** — worth a measurement spike before any register-VM commitment.
 
 1. **Lever 2 first** (DAG `let`/formals demotion) — ~1 wk, contained, clear
    9.2% target, and it de-risks/feeds Lever 1 (fewer slots & thunks). Gate:
