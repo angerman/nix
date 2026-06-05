@@ -189,6 +189,20 @@ codegen wins), then **pivot back to memory**, where the remaining slope is.
 > building; it feeds #1 (less stack motion) AND memory (fewer of the 650K
 > thunks). After it, the §1 wall floor is reached on real workloads and the
 > **memory pivot** is the slope.
+>
+> **UPDATE 2026-06-05 (later) — #2 SHIPPED (`2d752453c`); CODEGEN TRACK
+> EXHAUSTED.** The DAG demotion landed (~70% of recursive lets demote;
+> `--core` 19/19). Real-corpus (hello): **attrset allocations −8.6%**,
+> `ATTRS_REC_SET` −13.3% — but the RBSR indirection is *traded* for direct
+> upvalue access (≈net-neutral dispatch), so **wall + peak-RSS are neutral**.
+> So all three contained levers (§2a, §2b, #2) are **wall-neutral on real
+> workloads** — exactly the QUANTIFICATION's prediction that the *only* wall
+> lever is the structural #1 register VM (§4, gated). The DAG demotion's
+> value is **allocation churn** (−8.6% attrsets, less GC pressure), a memory-
+> adjacent win. **Conclusion: the contained codegen track is harvested and
+> the real-workload wall floor is reached.** The remaining slope is **memory**
+> (per [[memory-first-class]]) — the pivot is now the clear next direction;
+> the register VM (§4) stays gated unless the §3 tradeoff flips back to wall.
 
 ---
 
