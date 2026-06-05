@@ -35,32 +35,62 @@ through the production pipeline.
 ## 1. META-FIX (do this FIRST): one measurement path that equals production
 
 This is the highest-leverage item — it is *why* a careful review went wrong
-and it will keep going wrong. There are three divergent pipelines, and only
-one is real:
+and it will keep going wrong. The divergent pipelines, and which are real:
 
 | Path | `optimise()` | `applyStrictnessPasses` | `NIX_VM_STATS` | `V3_TIMING` |
 |---|---|---|---|---|
-| `v3-eval --expr` | ✗ (skipped by design) | ✗ | ✓ dumps | ✓ but `run=` mis-brackets |
-| `v3-eval --emit-bytecode` | ✓ | ✓ (just fixed) | n/a (no run) | n/a |
-| **`nix eval` + `NIX_V3_DIRECT_EVAL` (PRODUCTION)** | ✓ | ✓ | ✗ not dumped | ✗ |
+| `v3-eval --expr` | ✗ (skipped by design) | ✗ | ✓ dumps (but pre-opt counts) | ✓ but `run=` mis-brackets¹ |
+| `v3-eval --emit-bytecode` | ✓ | ✓ (fixed `55e108a87`) | n/a (no run) | n/a |
+| **`v3-eval --optimize`** (added with this doc) | ✓ | ✓ | ✓ dumps | ✓ accurate |
+| **`nix eval` + `NIX_V3_DIRECT_EVAL` (PRODUCTION)** | ✓ | ✓ | ✓ dumps | ✓ accurate |
 
-So today you **cannot get a production-faithful alloc count or timing from
-one command**: `--expr` over-counts (no opt), `nix eval` under-instruments.
+> ¹ The `run=` mis-bracket is real **only on the `--expr` path** (no
+> eval/apply de-thunk → the re-entrant primop timing it referred to). On the
+> production / `--optimize` paths it does **not** reproduce — see the
+> correction below.
 
-**Actions:**
-1. Add a `v3-eval` mode that runs the *exact* `run.cc` sequence
-   (`optimise → applyStrictnessPasses → computeFreeVars → compile → run`)
-   AND dumps `NIX_VM_STATS` + `V3_TIMING`. (Implemented alongside this doc as
-   `v3-eval --optimize`; validate fib's thunk count drops 635621 → ~0.)
-2. Fix **`V3_TIMING`'s `max(run=)` mis-bracket** — it showed `run=0.6ms` for
-   a 0.82s fold; the re-entrant primop path escapes the timer, so the
-   eval-hot column lies post-eval/apply.
-3. Wire **`NIX_VM_STATS` into the `nix eval` / `runRootExpr` path** (today it
-   only dumps from the `v3-eval` binary).
+**Done (the meta-fix landed):** the `v3-eval --optimize` mode (`v3-eval.cc:440`)
+runs the *exact* production sequence (`optimise → applyStrictnessPasses →
+computeFreeVars → compile → run`) and dumps `NIX_VM_STATS` + `V3_TIMING`.
+Validated: fib27 thunk count drops `635621 → 1` (vs `--expr`'s 635621).
+There is now **one production-faithful measurement command**, and the
+standing rule below makes it the only sanctioned one.
 
-**Standing rule until this exists:** validate every bytecode/alloc claim
-through `--emit-bytecode` (now strictness-complete) or the production runner
-— **never `--expr`** (it skips `optimise()`).
+### Correction (same day) — Actions 2 & 3 were themselves mis-premised
+
+This is the part most worth reading, because **the original Actions 2 and 3
+repeated the exact failure this doc exists to prevent**: they were written
+from the reviewer's table, not re-measured on the production path. When
+re-measured, both evaporate:
+
+- **`NIX_VM_STATS` is already dumped on `nix eval`.** The table cell "✗ not
+  dumped" was wrong. Measured: `nix eval` (production, `NIX_V3_DIRECT_EVAL=1`)
+  on fib27 reports `thunks=0` — the production de-thunked count, not 635621.
+  So the original Action 3 ("wire it into `runRootExpr`") is **already
+  satisfied**; do not build it. Residue: `nix eval` reports `thunks=0` where
+  `--optimize` reports `thunks=1` (the top-level `fib` binding). A **1-thunk
+  reconcile** so the two faithful paths agree exactly is the only real work
+  here — low priority.
+- **`V3_TIMING`'s `run=` is accurate on the production path.** Measured:
+  `nix eval` fib27 → `run=219.978ms` inside `wall=0.35s` (the ~130 ms balance
+  is startup + print). That is *not* a mis-bracket — `run=` is the eval time.
+  The mis-bracket the reviewer saw was the `--expr` path (footnote ¹). So the
+  original Action 2 ("fix the `max(run=)` mis-bracket") is **a no-op on
+  production**; verify-then-skip. If anyone reproduces a `run=` lie, first
+  confirm it is not the unoptimised `--expr` path (now superseded by
+  `--optimize`).
+
+**Net:** the meta-fix goal — *one command that equals production, so nobody
+re-measures a non-production path* — is **met** by `--optimize` plus the
+already-faithful `nix eval`. Phase 1 is done bar the 1-thunk reconcile. The
+broader lesson: an Action list derived from a review's table, not from the
+production runner, is the [[measure-twice-cut-once]] failure one level up —
+re-measure before you build.
+
+**Standing rule:** validate every bytecode/alloc/timing claim through
+`v3-eval --optimize`, `--emit-bytecode` (strictness-complete), or the
+production runner (`nix eval` + `NIX_V3_DIRECT_EVAL`) — **never `--expr`**
+(it skips `optimise()` and over-counts by construction).
 
 ---
 
