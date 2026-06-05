@@ -285,6 +285,27 @@ uint32_t disassembleOne(std::FILE * out,
         // surface the count so a bare `operand=3` reads as "3 args".
         std::fprintf(out, "   ; %u arg%s", operand, operand == 1 ? "" : "s");
         break;
+    case OP_LIST_INIT:
+        // operand = element count (emit.cc: e.elems.size()).
+        std::fprintf(out, "   ; %u elem%s", operand, operand == 1 ? "" : "s");
+        break;
+    case OP_STR_CONCAT: {
+        // operand packs (nParts << 1) | forceString (emit.cc), so the raw
+        // value is misleading on its own (operand=4 is *2* parts) — decode.
+        uint32_t nParts = operand >> 1;
+        std::fprintf(out, "   ; %u part%s%s", nParts,
+                     nParts == 1 ? "" : "s", (operand & 1u) ? ", force" : "");
+        break;
+    }
+    case OP_ATTRS_INIT_DYN: {
+        // operand packs (nStatic << 12) | nDyn (mirrors opExtraWords); the
+        // packed value is opaque, and unlike OP_ATTRS_INIT/REC_INIT this op
+        // was previously un-annotated — decode for consistency.
+        uint32_t nStatic = (operand >> 12) & 0xFFF;
+        uint32_t nDyn = operand & 0xFFF;
+        std::fprintf(out, "   ; %u static + %u dyn", nStatic, nDyn);
+        break;
+    }
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:
         if (operand < cu.lambdas.size()) {
