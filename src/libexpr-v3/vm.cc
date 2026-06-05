@@ -3188,6 +3188,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, vm.valueStack[stackBase + operand]);
             break;
         }
+        case OP_GET_LOCAL2: {
+            // Lever 1B-lite: fused two-slot push (operand = a<<12 | b).  Copy
+            // both values BEFORE pushing — the first push() may reallocate
+            // valueStack, invalidating a held reference to slot b.
+            Value va = vm.valueStack[stackBase + (operand >> 12)];
+            Value vb = vm.valueStack[stackBase + (operand & 0xFFF)];
+            push(vm, va);
+            push(vm, vb);
+            break;
+        }
         case OP_GET_LOCAL_FORCE: {
             // Superinstruction: GET_LOCAL + FORCE.  Push the slot value
             // and apply the FORCE fast path inline.  Hot path:

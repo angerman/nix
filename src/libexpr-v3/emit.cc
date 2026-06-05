@@ -1689,9 +1689,21 @@ struct Emitter
     /// Skips any GET that is a branch-join target (jumpTargetPositions_).
     void compactFuseSetGet(uint32_t codeStart)
     {
-        if (fuseGetPositions_.empty()) return;
+        // Two compacting peepholes in ONE slide+rebase pass:
+        //   (A) SET_LOCAL n; GET_LOCAL n (same slot) → SET_LOCAL_KEEP n + drop
+        //       the GET  (the original #542 / BYTECODE_NGRAM_ANALYSIS §7 fuse).
+        //   (B) Lever 1B-lite: GET_LOCAL a; GET_LOCAL b (adjacent, slots < 4096)
+        //       → OP_GET_LOCAL2 (a,b) + drop the second GET.
+        // Both rewrite a SURVIVING instruction (the one BEFORE the dropped op)
+        // and add the dropped op's position to `rem`; a single slide removes
+        // all dropped positions and one rebase fixes jump operands.  Only the
+        // DROPPED position may not be a jump target (a jump to the kept first
+        // op still executes identically).
+        static const bool s_noGet2 =
+            std::getenv("NIX_V3_NO_GET_LOCAL2") != nullptr;
 
         std::vector<uint32_t> rem;
+        std::unordered_set<uint32_t> keepInvolved;  // positions (A) touches
         rem.reserve(fuseGetPositions_.size());
         for (uint32_t getPos : fuseGetPositions_) {
             if (jumpTargetPositions_.count(getPos)) continue;
@@ -1702,7 +1714,36 @@ struct Emitter
             if (decodeOp(getI) != OP_GET_LOCAL) continue;
             if (decodeOperand(setI) != decodeOperand(getI)) continue;
             rem.push_back(getPos);
+            keepInvolved.insert(getPos - 1);
+            keepInvolved.insert(getPos);
         }
+
+        // (B) GET_LOCAL a; GET_LOCAL b → OP_GET_LOCAL2.  Scan left-to-right,
+        // advancing past a consumed pair so triples (`GL GL GL`) fuse the
+        // first pair only.  Skip pairs overlapping an (A) site.
+        if (!s_noGet2 && unit.code.size() > codeStart + 1) {
+            for (uint32_t pos = codeStart + 1;
+                 pos < static_cast<uint32_t>(unit.code.size()); ) {
+                if (jumpTargetPositions_.count(pos)
+                    || keepInvolved.count(pos) || keepInvolved.count(pos - 1)) {
+                    ++pos; continue;
+                }
+                Instruction a = unit.code[pos - 1];
+                Instruction b = unit.code[pos];
+                if (decodeOp(a) == OP_GET_LOCAL && decodeOp(b) == OP_GET_LOCAL) {
+                    uint32_t sa = decodeOperand(a), sb = decodeOperand(b);
+                    if (sa < 4096 && sb < 4096) {
+                        unit.code[pos - 1] =
+                            encode(OP_GET_LOCAL2, (sa << 12) | sb);
+                        rem.push_back(pos);
+                        pos += 2;  // skip the consumed pair
+                        continue;
+                    }
+                }
+                ++pos;
+            }
+        }
+
         if (rem.empty()) return;
         std::sort(rem.begin(), rem.end());
 
@@ -1712,8 +1753,12 @@ struct Emitter
                 std::lower_bound(rem.begin(), rem.end(), o) - rem.begin());
         };
 
+        // (A) sites only: rewrite the kept SET_LOCAL → SET_LOCAL_KEEP.  (B)
+        // sites already have OP_GET_LOCAL2 at getPos-1 (rewritten inline) —
+        // the SET_LOCAL guard leaves them untouched.
         for (uint32_t getPos : rem) {
             Instruction setI = unit.code[getPos - 1];
+            if (decodeOp(setI) != OP_SET_LOCAL) continue;
             unit.code[getPos - 1] =
                 encode(OP_SET_LOCAL_KEEP, decodeOperand(setI));
         }

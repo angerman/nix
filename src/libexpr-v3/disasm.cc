@@ -48,6 +48,7 @@ const char * opName(Op op)
     case OP_LIT_FALSE:         return "OP_LIT_FALSE";
     case OP_LIT_NULL:          return "OP_LIT_NULL";
     case OP_GET_LOCAL:         return "OP_GET_LOCAL";
+    case OP_GET_LOCAL2:        return "OP_GET_LOCAL2";
     case OP_SET_LOCAL:         return "OP_SET_LOCAL";
     case OP_GET_UPVALUE:       return "OP_GET_UPVALUE";
     case OP_DUP:               return "OP_DUP";
@@ -310,6 +311,10 @@ uint32_t disassembleOne(std::FILE * out,
         std::fprintf(out, "   ; %u static + %u dyn", nStatic, nDyn);
         break;
     }
+    case OP_GET_LOCAL2:
+        // Lever 1B-lite: operand packs two 12-bit slot indices.
+        std::fprintf(out, "   ; locals %u, %u", operand >> 12, operand & 0xFFF);
+        break;
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:
         if (operand < cu.lambdas.size()) {

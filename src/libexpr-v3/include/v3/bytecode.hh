@@ -150,6 +150,14 @@ enum Op : uint8_t
     /// recSlotCache IC lookup and pushes the Tag::Slot.  Encoding:
     ///   [sym:24]; data: [upvalIdx:32, icIdx:32]
     OP_GET_UPVALUE_REC_BINDING = 0x5b,
+    /// Lever 1B-lite (WALL_OPTIMIZATION_PLAN §4): operand-folding super-
+    /// instruction.  Fuses two adjacent different-slot `OP_GET_LOCAL a;
+    /// OP_GET_LOCAL b` (the D1-confirmed dominant `GET_LOCAL;GET_LOCAL`
+    /// bigram — prefix of `GL GL CALL_PRIMOP`, `GL GL MAKE_THUNK`, …) into a
+    /// single dispatch that pushes slots a then b.  Encoding: operand 24-bit
+    /// = (a << 12) | b — two 12-bit slot indices (slots ≥ 4096 fall back to
+    /// the unfused pair; register-pressure p99 = 7, so this covers ~all).
+    OP_GET_LOCAL2     = 0x5c,  // [a:12|b:12]  push local a, then local b
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list
