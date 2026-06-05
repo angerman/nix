@@ -107,6 +107,7 @@ const char * opName(Op op)
     case OP_ASSERT:            return "OP_ASSERT";
     case OP_POS:               return "OP_POS";
     case OP_CALL_PRIMOP:       return "OP_CALL_PRIMOP";
+    case OP_R_PRIMOP2:         return "OP_R_PRIMOP2";
     case OP_LIT_PRIMOP:        return "OP_LIT_PRIMOP";
     case OP_LIT_BUILTINS:      return "OP_LIT_BUILTINS";
     case OP_IS_NULL:           return "OP_IS_NULL";
@@ -161,6 +162,8 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
         return 2;                       // §2(b): [upvalIdx, icIdx]
     case OP_CALL_PRIMOP:
         return 1;                       // primop-table index (poIdx)
+    case OP_R_PRIMOP2:
+        return 2;                       // reg-VM: [dst, (descA<<16|descB)]
     default:
         return 0;
     }
@@ -281,6 +284,24 @@ uint32_t disassembleOne(std::FILE * out,
                 (int)cu.primops[poIdx]->name.size(),
                 cu.primops[poIdx]->name.data(),
                 operand, operand == 1 ? "" : "s");
+        break;
+    }
+    case OP_R_PRIMOP2: {
+        // operand = poIdx; data[0] = dst slot; data[1] = (descA<<16|descB),
+        // each desc = bit15 immediate-flag | 15-bit slot/int.
+        uint32_t dst = dataAt(0), descAB = dataAt(1);
+        const char * nm = (operand < cu.primops.size() && cu.primops[operand])
+            ? cu.primops[operand]->name.data() : "?";
+        int nl = (operand < cu.primops.size() && cu.primops[operand])
+            ? (int)cu.primops[operand]->name.size() : 1;
+        auto fmt = [](uint32_t d, char * buf) {
+            if (d & 0x8000u) { int32_t v = d & 0x7FFFu; if (v & 0x4000) v -= 0x8000;
+                std::snprintf(buf, 24, "#%d", v); }
+            else std::snprintf(buf, 24, "r%u", d & 0x7FFFu);
+        };
+        char a[24], b[24];
+        fmt(descAB >> 16, a); fmt(descAB & 0xFFFFu, b);
+        std::fprintf(out, "   ; %.*s r%u = %s, %s", nl, nm, dst, a, b);
         break;
     }
     case OP_CALL_N:

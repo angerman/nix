@@ -10399,6 +10399,63 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, out);
             break;
         }
+        case OP_R_PRIMOP2: {
+            // Register VM Phase 1: 3-address binary primop.  regs[dst] =
+            // po(arg0, arg1), operands read directly from slots (or inline
+            // immediates), result written to a dst slot — no operand stack.
+            // Strict non-WHNF slot args are forced via A8 writeback-to-slot,
+            // mirroring OP_CALL_PRIMOP (peek follow-up words; advance only
+            // once all strict args are WHNF so a force-rewind re-enters
+            // cleanly).
+            const PrimOp * po = cu->primops[operand];
+            uint32_t dst    = cu->code[ip];        // peek word1
+            uint32_t descAB = cu->code[ip + 1];    // peek word2
+            uint32_t desc[2] = { descAB >> 16, descAB & 0xFFFFu };
+            // Force scan over strict slot args.
+            for (uint32_t k = 0; k < 2; ++k) {
+                if (desc[k] & 0x8000u) continue;           // inline immediate
+                if (po->lazyArgs & (1u << k)) continue;    // lazy arg
+                uint32_t slot = desc[k] & 0x7FFFu;
+                Value & a = vm.valueStack[stackBase + slot];
+                Tag t = a.tag();
+                if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
+                    || t == Tag::Slot) {
+                    push(vm, a);
+                    CallFrame & frame = vm.frames.back();
+                    setForceWriteback(frame, static_cast<uint16_t>(slot));
+                    frame.flags |= CFF_FORCE_RETRY;
+                    ip = ip - 1;  // rewind to the OP_R_PRIMOP2 word
+                    goto op_force_slow;
+                }
+            }
+            // All strict args WHNF.  Advance past word1, word2 and call.
+            ip += 2;
+            bumpPrimOpCallCount(po);
+            Value args[2];
+            for (uint32_t k = 0; k < 2; ++k) {
+                if (desc[k] & 0x8000u) {
+                    int32_t v = static_cast<int32_t>(desc[k] & 0x7FFFu);
+                    if (v & 0x4000) v -= 0x8000;          // sign-extend 15-bit
+                    args[k].mkInt(v);
+                } else {
+                    args[k] = vm.valueStack[stackBase + (desc[k] & 0x7FFFu)];
+                }
+            }
+            vm.frames.back().ip = ip;
+            EvalState state;
+            state.vm = &vm;
+            state.nixEvalState = getNixEvalState();
+            Value out;
+            po->fn(state, args, out);
+            // Write result to dst slot (auto-grow, mirrors OP_SET_LOCAL).
+            {
+                size_t idx = stackBase + dst;
+                while (idx >= vm.valueStack.size())
+                    vm.valueStack.push_back(Value{});
+                vm.valueStack[idx] = out;
+            }
+            break;
+        }
 
         // ---- #428 fast-path primop opcodes ----------------------------
         // Each opcode is a bug-compatible inline of the corresponding C

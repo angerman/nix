@@ -158,6 +158,17 @@ enum Op : uint8_t
     /// = (a << 12) | b — two 12-bit slot indices (slots ≥ 4096 fall back to
     /// the unfused pair; register-pressure p99 = 7, so this covers ~all).
     OP_GET_LOCAL2     = 0x5c,  // [a:12|b:12]  push local a, then local b
+    /// Register VM Phase 1 (REGISTER_VM_DESIGN_2026-06-05): 3-address binary
+    /// primop call.  `regs[dst] = po(arg0, arg1)` reading operands directly
+    /// from local slots (or inline immediates) and writing the result to a
+    /// dst slot — NO operand-stack round-trip; collapses
+    /// `GET a; GET b; CALL_PRIMOP po; SET dst` (5 dispatches) to ONE.
+    /// Encoding: `operand = poIdx`; word1 = `dst` (24-bit slot); word2 =
+    /// `(descA << 16) | descB`, each desc = bit15 immediate-flag |
+    /// 15-bit value (slot index, or signed int when immediate).  Strict
+    /// non-WHNF slot args are forced via A8 writeback-to-slot, exactly like
+    /// OP_CALL_PRIMOP.  Emitted only for primops with no deep-force-list arg.
+    OP_R_PRIMOP2      = 0x5d,
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

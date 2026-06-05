@@ -381,6 +381,45 @@ struct Emitter
         return true;
     }
 
+    /// Register VM Phase 1 (REGISTER_VM_DESIGN_2026-06-05): try to emit a
+    /// 3-address `OP_R_PRIMOP2` for a binary PrimOpCall binding whose operands
+    /// are slot-resident (or small-int immediates) and whose result goes to a
+    /// slot — collapsing `GET a; GET b; CALL_PRIMOP; SET v` to one dispatch
+    /// with no operand-stack traffic.  CONSERVATIVE for Phase 1: fires only
+    /// when no value is deferred (pendingDefer empty → arg slots are
+    /// materialised and there is no stack state to preserve), both args are
+    /// local slots / remat small-int consts (not upvalues, not deferred), and
+    /// the primop has no deep-force-list arg.  Returns true iff emitted (the
+    /// caller then skips the normal expr-emit + SET for this binding).
+    bool tryEmitRPrimop2(const ir::Binding & bd)
+    {
+        static const bool s_noRegPrimop2 =
+            std::getenv("NIX_V3_NO_REG_PRIMOP2") != nullptr;
+        if (s_noRegPrimop2) return false;
+        auto * pc = std::get_if<ir::PrimOpCall>(&bd.expr);
+        if (!pc || pc->args.size() != 2) return false;
+        if (!pc->primop || pc->primop->deepForceList != 0) return false;
+        if (!ctx->pendingDefer.empty()) return false;
+        uint32_t desc[2];
+        for (int k = 0; k < 2; ++k) {
+            ir::VarId av = pc->args[k];
+            if (auto cit = constRemat_.find(av); cit != constRemat_.end()) {
+                auto * li = std::get_if<ir::LitInt>(cit->second);
+                if (!li || li->value < -16384 || li->value > 16383) return false;
+                desc[k] = 0x8000u | (static_cast<uint32_t>(li->value) & 0x7FFFu);
+                continue;
+            }
+            auto sit = ctx->slot.find(av);
+            if (sit == ctx->slot.end() || sit->second > 0x7FFFu) return false;
+            desc[k] = sit->second & 0x7FFFu;          // bit15 clear ⇒ slot
+        }
+        uint16_t dst = getOrAssignSlot(bd.var);
+        unit.code.push_back(encode(OP_R_PRIMOP2, internPrimOp(pc->primop)));
+        unit.code.push_back(dst);
+        unit.code.push_back((desc[0] << 16) | desc[1]);
+        return true;
+    }
+
     uint32_t addIntConst(int64_t n)
     {
         unit.intConstants.push_back(n);
@@ -612,6 +651,14 @@ struct Emitter
             // re-emitted by the terminal.  (Consts are Lits, never Apps, so
             // they never collide with the spine head/inner logic.)
             if (constRemat_.count(bd.var)) continue;
+
+            // Register VM Phase 1: a binary primop with slot/const operands
+            // and a slot result → one 3-address OP_R_PRIMOP2 (no stack
+            // traffic).  Skip the tail binding (its value must land on the
+            // operand stack for the return; R_PRIMOP2 writes a slot, so the
+            // terminal's emitVarRef GETs it instead — handled by tailLast not
+            // covering this path: we only fire for non-tail bindings).
+            if (!isTail && tryEmitRPrimop2(bd)) continue;
 
             if (auto sh = spineHead.find(bd.var); sh != spineHead.end()) {
                 emitVarRef(sh->second.first);                  // base

@@ -183,6 +183,8 @@ collectReferencedSymbols(const CompilationUnit & cu)
             ip += 2 * n;
         } else if (op == OP_CALL_PRIMOP) {
             ++ip;  // primop-index follow-up
+        } else if (op == OP_R_PRIMOP2) {
+            ip += 2;  // reg-VM: dst + (descA<<16|descB); no SymbolId operand
         } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
             ip += 2;  // nUpvalues + nWithTargets
         }
@@ -277,6 +279,8 @@ collectReferencedPositions(const CompilationUnit & cu)
             ip += 2 * n;
         } else if (op == OP_CALL_PRIMOP) {
             ++ip;
+        } else if (op == OP_R_PRIMOP2) {
+            ip += 2;  // reg-VM: dst + descAB
         } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
             ip += 2;
         }
@@ -565,6 +569,8 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
             // No trailing data.
         } else if (op == OP_CALL_PRIMOP) {
             ip++;  // primop-index follow-up
+        } else if (op == OP_R_PRIMOP2) {
+            ip += 2;  // reg-VM: dst + (descA<<16|descB); no SymbolId operand
         } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
             ip += 2;  // nUpvalues + nWithTargets (#530)
         }
@@ -633,6 +639,8 @@ void remapPositionsInBytecode(CompilationUnit & cu,
             ip += 2 * n;
         } else if (op == OP_CALL_PRIMOP) {
             ++ip;
+        } else if (op == OP_R_PRIMOP2) {
+            ip += 2;  // reg-VM: dst + descAB
         } else if (op == OP_MAKE_CLOSURE || op == OP_MAKE_THUNK) {
             ip += 2;
         }
