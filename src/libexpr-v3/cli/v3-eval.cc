@@ -393,16 +393,20 @@ int main(int argc, char ** argv)
             return 0;
         }
 
-        // --emit-bytecode: optimise (unless --no-opt) + compile + disassemble
-        // the CU, then exit BEFORE run().  One stage later than --emit-ir
-        // (CU not IR module); like --emit-ir PostOpt it runs ir::optimise by
-        // default so the dump reflects what production (runRootExpr) executes,
-        // and --no-opt gives the raw lowering.  This is a dedicated branch
-        // because the normal eval path below intentionally skips optimise()
-        // (see the --emit-ir note above) — we don't perturb that default.
+        // --emit-bytecode: run the SAME compile pipeline production
+        // (run.cc::runRootExpr) runs — optimise + the caller-side strictness
+        // passes + computeFreeVars + compile — then disassemble and exit
+        // BEFORE run().  The strictness passes (ir::applyStrictnessPasses) are
+        // essential: without them the disassembly shows a PRE-strictness form
+        // (recursive-call / strict-arg thunks still present) that does NOT
+        // match what eval executes — a divergence that previously misled a
+        // bytecode review into thinking those thunks were unreachable.
+        // --no-opt gives the raw lowering (no optimise, no strictness).
         if (emitBytecode) {
-            if (!noOpt)
+            if (!noOpt) {
                 nix::v3::ir::optimise(m);
+                nix::v3::ir::applyStrictnessPasses(m);
+            }
             nix::v3::ir::computeFreeVars(m);
             auto cu = nix::v3::compile(m);
             nix::v3::disassembleModule(stdout, cu);

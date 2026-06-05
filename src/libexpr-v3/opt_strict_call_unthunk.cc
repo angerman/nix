@@ -1093,4 +1093,17 @@ size_t applyStrictnessAtCallSites(Module & m)
     return elided;
 }
 
+// Shared strictness sequence — see ir.hh.  The production eval path (run.cc)
+// and the `--emit-bytecode` dump BOTH call this so the disassembly reflects
+// the form that actually runs (a divergence here caused a bytecode review to
+// miss that recursive-call args are de-thunked at eval time).  The 8-round
+// cap matches run.cc: compound shapes (an outer MkThunk over an AttrSet whose
+// entries are themselves thunked) need a pass per nesting level.
+void applyStrictnessPasses(Module & m)
+{
+    computeFunctionStrictness(m);
+    for (int it = 0; it < 8; ++it)
+        if (applyStrictnessAtCallSites(m) == 0) break;
+}
+
 } // namespace nix::v3::ir

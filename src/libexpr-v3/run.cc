@@ -254,20 +254,12 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // bottleneck is `isInlinableMkThunk`'s single-use + simple-body
     // constraints, not strictness analysis coverage.  Opt-in to
     // all-modules via `NIX_V3_STAGE4_ALL_MODULES=1`.
-    ir::computeFunctionStrictness(module);
-
-    // #742 Stage 4 v4 / #743 v4.1: caller-side use of strictness
-    // signature.  Each pass elides single-use MkThunk wraps at
-    // strict positions where the callee is statically known.  We
-    // iterate up to 8× to handle compound shapes: e.g. `f { a =
-    // [1 2 3]; }` has both an outer MkThunk wrapping the AttrSet
-    // AND inner MkThunk wraps on the entries' values.  Pass 1
-    // elides the outer wrap (exposing the AttrSet directly); pass
-    // 2 sees the AttrSet and elides the strict-formal entries'
-    // wraps.  Iteration terminates when a pass returns 0 elisions.
-    for (int it = 0; it < 8; ++it) {
-        if (ir::applyStrictnessAtCallSites(module) == 0) break;
-    }
+    // #742/#743 caller-side strictness: computeFunctionStrictness then
+    // applyStrictnessAtCallSites to a fixpoint (compound shapes — an outer
+    // MkThunk over an AttrSet whose entries are themselves thunked — need a
+    // pass per nesting level).  Factored into ir::applyStrictnessPasses so the
+    // `--emit-bytecode` dump runs the IDENTICAL sequence (see ir.hh).
+    ir::applyStrictnessPasses(module);
 
     // computeFreeVars: populates each `ir::Function::freeVars` from
     // `Function::vars`.  Required before `compile` so the emitter

@@ -979,6 +979,15 @@ void computeFunctionStrictness(Module & m);
 /// elision count.
 size_t applyStrictnessAtCallSites(Module & m);
 
+/// Run the caller-side strictness passes as a unit: computeFunctionStrictness
+/// followed by applyStrictnessAtCallSites iterated to a fixpoint (max 8).
+/// This is the EXACT sequence the production eval path (run.cc) runs after
+/// `optimise`, factored out so the `--emit-bytecode` dump runs the SAME
+/// passes — otherwise the disassembly shows a pre-strictness form (with the
+/// arg-thunks still present) that does NOT match what eval executes, which
+/// has misled bytecode review.  Defined in opt_strict_call_unthunk.cc.
+void applyStrictnessPasses(Module & m);
+
 // ---------------------------------------------------------------------------
 // #540: occurrence analysis (per lode/OPT_OCCUR_PLAN_2026-05-08.md)
 // ---------------------------------------------------------------------------
