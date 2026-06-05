@@ -106,6 +106,31 @@ production runner (`nix eval` + `NIX_V3_DIRECT_EVAL`) — **never `--expr`**
 > **<1.55% dynamic** (falsified for wall). The genuinely-open #2 is the
 > rec-binding machinery (9.2% dynamic) via DAG-`let`/formals demotion.
 
+> **SHIPPED 2026-06-05 (disposition after the QUANTIFICATION).** All of §2
+> was implemented and validated (`--core` 19/19 byte-identical, IR-checks
+> 28/28, smoke green). The real-corpus measurement landed *during* the work,
+> so the framing is corrected here but the commits are KEPT (correct +
+> real-neutral — no regression):
+> - **(c) `46f57e490`** — post-strictness dead-function sweep. Real CU-size /
+>   compile-time hygiene (fib 81→71 B; 22% of funcs cleared on a synthetic).
+>   Uncontested win.
+> - **(a) `68bd198de`** — constant rematerialization. fib −16.3% ops / ~7%
+>   wall, but **real-corpus 0.0% (neutral on hello, σ±0.02)** — a fib/tight-
+>   arithmetic micro-win, NOT a general lever. Kept (correct, dormant on real
+>   workloads); `NIX_V3_NO_CONST_REMAT=1` opts out.
+> - **(b) `9eaf666e0`** — `OP_GET_UPVALUE_REC_BINDING` superinstruction.
+>   fib −4.88% ops / ~1% wall; touches a **real 5.12% of dispatch** (RBSR is
+>   real on real corpora) but wall-marginal (cheap ops; hello is overhead-
+>   dominated so unmeasurable there). Kept; `NIX_V3_NO_FUSE_RECBIND=1` opts
+>   out. NOTE: this is the *dispatch-fusion* take on the rec-binding hole; the
+>   bigger #2 lever below (DAG-`let`/formals demotion) is complementary.
+>
+> **Lesson:** §2(a)/(b) were measured on **fib** (eval-dominated but
+> unrepresentative — tight arithmetic recursion); the QUANTIFICATION's
+> real-corpus opcode-mix is the discipline-correct basis and supersedes the
+> fib wall numbers. fib over-stated both. The next lever (#2) is chosen from
+> the real-corpus ranking, not fib.
+
 With thunks off the table, fib's `func 2` (~7M× in fib33) still wastes work:
 
 **(a) Constant spill-and-reload — ~~biggest, and general~~ FALSIFIED.** On
@@ -151,6 +176,19 @@ track is paused (`GC_PAUSE_2026-05-29`, after Immix projected below SHIP),
 but with wall approaching the floor the wall-vs-memory tradeoff should be
 re-evaluated now. **Recommendation:** harvest §2(a–c) (≈1–2 wk of contained
 codegen wins), then **pivot back to memory**, where the remaining slope is.
+
+> **UPDATE 2026-06-05.** §2(a–c) are harvested (SHIPPED block in §2; real-
+> corpus-neutral for (a)/(b), so the wall floor barely moved on real
+> workloads — as the QUANTIFICATION predicted). The remaining *codegen*
+> lever per the real-corpus ranking is the **#2 rec-binding machinery (9.2%)
+> via DAG-`let`/formals demotion** — `let`/formals whose bindings form an
+> acyclic dependency DAG don't need the synthetic rec-attrset +
+> `REC_BINDING_SLOT_REF` indirection + per-binding thunks; demote to direct
+> `GET_LOCAL`s (extends the shipped non-rec-`let` demotion to the acyclic-
+> multi-binding case). This is the one §2 lever the real corpus says is worth
+> building; it feeds #1 (less stack motion) AND memory (fewer of the 650K
+> thunks). After it, the §1 wall floor is reached on real workloads and the
+> **memory pivot** is the slope.
 
 ---
 
