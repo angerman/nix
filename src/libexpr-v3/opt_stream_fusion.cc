@@ -94,15 +94,9 @@ std::unordered_map<VarId, const Expr *> mapBlockDefs(const Block & b)
 }
 
 // ---------------------------------------------------------------------------
-// Lookup the __foldlMap PrimOp by name.  Cached after first call —
-// the v3 PrimOp registry doesn't change at runtime.
+// (foldlMapPrimOp() retired 2026-06-05 — the fused primops are now resolved
+//  per-rule from the kRules table in streamFusion via findPrimOp.)
 // ---------------------------------------------------------------------------
-
-const PrimOp * foldlMapPrimOp()
-{
-    static const PrimOp * cached = findPrimOp("__foldlMap");
-    return cached;
-}
 
 // Recognise a "primop call with N args" at VarId `v`, accepting both:
 //   - The canonical PrimOpCall(p, [args]) shape  (opt_primop_fuse output)
@@ -342,8 +336,59 @@ size_t streamFusion(Module & m)
         std::getenv("NIX_V3_NO_STREAM_FUSION") != nullptr;
     if (s_disabled) return 0;
 
-    const PrimOp * foldlMap = foldlMapPrimOp();
-    if (!foldlMap) return 0;  // __foldlMap not registered — skip
+    // RULES fusion table (§2.7 GHC_PASSES_FOR_NIX): declarative,
+    // intermediate-eliminating rewrites.  `outer(… inner(…) …)` where the
+    // inner call's result is the outer's `listArgIdx`-th arg AND is used
+    // EXACTLY ONCE fuses to `fusedName`, dropping the intermediate list.
+    // The fused args are (outer args minus listArgIdx) ++ (inner args).
+    // ONLY length-preserving, intermediate-eliminating fusions belong here —
+    // PRODUCER fusion (e.g. foldl'∘genList) was measured a CPU REGRESSION
+    // (genList's C array-build + tight force beats a bytecode generate-loop);
+    // these rules eliminate a separately-allocated intermediate, which is the
+    // win __foldlMap already showed on hello.name.
+    struct FusionRule {
+        std::string_view outerName, outerAlt; size_t outerArity, listArgIdx;
+        std::string_view innerName, innerAlt; size_t innerArity;
+        std::string_view fusedName;
+    };
+    // The rule registry.  A rule earns a slot here ONLY when measurement
+    // shows it pays (mirrors GHC's RULES: a rewrite ships when it's a win,
+    // not because it's expressible).  The framework is arity-generic
+    // (outerArity / listArgIdx / innerArity drive arg-remapping), so adding
+    // a validated rule is one line + one bytecode primop.
+    //
+    //   CANDIDATE REGISTRY (measured 2026-06-05, 1M synthetic):
+    //   ┌─────────────────┬──────────────────────────────────────────────┐
+    //   │ foldl'∘map       │ SHIP. Eliminates intermediate list AND output │
+    //   │  → __foldlMap    │ list (fold returns a scalar). Helped hello.   │
+    //   ├─────────────────┼──────────────────────────────────────────────┤
+    //   │ map∘map          │ NEUTRAL — NOT shipped. Eliminates only the    │
+    //   │  → __mapMap       │ transient intermediate spine; lazy elements   │
+    //   │                  │ are forced exactly once either way, and the   │
+    //   │                  │ intermediate ListVec is GC-reclaimed as forc- │
+    //   │                  │ ing proceeds (insns 54000117 vs 54000115;     │
+    //   │                  │ peak RSS 791 vs 791 MB). No win at peak.      │
+    //   ├─────────────────┼──────────────────────────────────────────────┤
+    //   │ *∘genList         │ CPU REGRESSION (1.21×) — NOT a rule. genList's│
+    //   │  (producer)      │ C array-build + tight force beats a bytecode  │
+    //   │                  │ generate-loop. Producer fusion never wins.    │
+    //   └─────────────────┴──────────────────────────────────────────────┘
+    //   The winning shape is "eliminates the OUTPUT list too" (folds: all∘
+    //   map / any∘map are foldl'∘map-class candidates — add when bytecode-
+    //   installed). Pure structure-preserving intermediate elimination
+    //   (map∘map / filter∘map) is neutral; producer fusion loses.
+    static const FusionRule kRules[] = {
+        // foldl' op nul (map f xs)  →  __foldlMap op nul f xs
+        { "foldl'", "__foldl'", 3, 2, "map", "__map", 2, "__foldlMap" },
+    };
+    constexpr size_t kNumRules = sizeof(kRules) / sizeof(kRules[0]);
+    const PrimOp * fusedOf[kNumRules];
+    bool anyRule = false;
+    for (size_t i = 0; i < kNumRules; ++i) {
+        fusedOf[i] = findPrimOp(kRules[i].fusedName);
+        if (fusedOf[i]) anyRule = true;
+    }
+    if (!anyRule) return 0;  // no fused primop registered — skip
 
     UseCounter uses = countModuleUses(m);
 
@@ -410,38 +455,51 @@ size_t streamFusion(Module & m)
             // through the same-block defs.
             auto outer = recogniseCall(bd.var, m, defs);
             if (!outer || !outer->primop) { out.push_back(bd); continue; }
-            std::string_view name = outer->primop->name;
+            std::string_view oname = outer->primop->name;
             if (s_dbg) std::fprintf(stderr,
                 "v3 stream-fusion: scan call %.*s argc=%zu\n",
-                (int)name.size(), name.data(), outer->args.size());
-            if (name != "foldl'" && name != "__foldl'") { out.push_back(bd); continue; }
-            if (outer->args.size() != 3) { out.push_back(bd); continue; }
+                (int)oname.size(), oname.data(), outer->args.size());
 
-            // Recognise the INNER map call — same machinery.
-            auto inner = recogniseCall(outer->args[2], m, defs);
+            // Find a fusion rule whose OUTER matches (name + arity).
+            const FusionRule * rule = nullptr; const PrimOp * fusedOp = nullptr;
+            for (size_t ri = 0; ri < kNumRules; ++ri) {
+                const FusionRule & r = kRules[ri];
+                if (fusedOf[ri]
+                    && (oname == r.outerName || oname == r.outerAlt)
+                    && outer->args.size() == r.outerArity) {
+                    rule = &r; fusedOp = fusedOf[ri]; break;
+                }
+            }
+            if (!rule) { out.push_back(bd); continue; }
+            const VarId listArg = outer->args[rule->listArgIdx];
+
+            // Recognise the INNER call at the rule's list-arg position.
+            auto inner = recogniseCall(listArg, m, defs);
             if (!inner || !inner->primop) {
                 if (s_dbg) std::fprintf(stderr,
-                    "  → skip: arg[2] (var %u) is not a recognisable call\n",
-                    (unsigned)outer->args[2]);
+                    "  → skip: list arg (var %u) is not a recognisable call\n",
+                    (unsigned)listArg);
                 out.push_back(bd); continue;
             }
-            std::string_view innerName = inner->primop->name;
-            if (innerName != "map" && innerName != "__map") {
+            std::string_view iname = inner->primop->name;
+            if (!((iname == rule->innerName || iname == rule->innerAlt)
+                  && inner->args.size() == rule->innerArity)) {
                 if (s_dbg) std::fprintf(stderr,
-                    "  → skip: inner call is %.*s (expected map)\n",
-                    (int)innerName.size(), innerName.data());
+                    "  → skip: inner call is %.*s (rule wants %.*s)\n",
+                    (int)iname.size(), iname.data(),
+                    (int)rule->innerName.size(), rule->innerName.data());
                 out.push_back(bd); continue;
             }
-            if (inner->args.size() != 2) { out.push_back(bd); continue; }
             if (s_dbg) std::fprintf(stderr,
-                "  → candidate: inner is map(f=%u, xs=%u)\n",
-                (unsigned)inner->args[0], (unsigned)inner->args[1]);
+                "  → candidate: %.*s∘%.*s\n",
+                (int)oname.size(), oname.data(),
+                (int)iname.size(), iname.data());
 
-            // Use-once safety: the map's result VarId must be used
-            // exactly once — only by this foldl' invocation.  Walk
-            // VarRef chain to find the actual map-binding VarId and
-            // check its module-wide use count.
-            VarId mapBindingVar = outer->args[2];
+            // Use-once safety: the inner call's result (= outer's list arg)
+            // must be used EXACTLY ONCE — only by this outer call; else the
+            // intermediate is shared and can't be eliminated.  Walk the
+            // VarRef chain to the actual binding + check module-wide uses.
+            VarId mapBindingVar = listArg;
             while (true) {
                 auto it = defs.find(mapBindingVar);
                 if (it == defs.end()) break;
@@ -504,8 +562,8 @@ size_t streamFusion(Module & m)
                     e = it->second;
                 }
             };
-            hoistChain(outer->args[2]);
-            hoistChain(inner->args[1]);  // xs may itself be a thunk
+            hoistChain(listArg);                  // the inner call (thunked)
+            hoistChain(inner->args.back());        // inner's list arg (xs)
 
             // 2026-05-18 BUGFIX: splice hoisted bindings inline at the
             // CURRENT position in `out`, BEFORE the fused App-chain we
@@ -543,27 +601,35 @@ size_t streamFusion(Module & m)
             // C-recursive `primFoldlMap` body — measured 60x slower
             // on N=200K (15s vs 0.24s; commit message in this batch).
             //
-            // Shape:
-            //   v_lp = LitPrimOp{__foldlMap}    // → bytecode closure
-            //   v_a0 = App(v_lp, op)
-            //   v_a1 = App(v_a0, init)
-            //   v_a2 = App(v_a1, f)
-            //   bd.var = App(v_a2, xs)
-            VarId v_lp = m.freshVar();
-            VarId v_a0 = m.freshVar();
-            VarId v_a1 = m.freshVar();
-            VarId v_a2 = m.freshVar();
-            LitPrimOp lp;  lp.primop = foldlMap;
-            out.push_back({ v_lp, lp });
-            out.push_back({ v_a0, App{ v_lp, outer->args[0] } });
-            out.push_back({ v_a1, App{ v_a0, outer->args[1] } });
-            out.push_back({ v_a2, App{ v_a1, inner->args[0] } });
-            bd.expr = App{ v_a2, inner->args[1] };
+            // Fused args = (outer args minus the listArgIdx) ++ (inner args).
+            //   foldl'∘map: [op,nul,LIST] ⊖2 ++ [f,xs]  = [op,nul,f,xs]
+            //   map∘map:    [f,LIST]      ⊖1 ++ [g,xs]  = [f,g,xs]
+            // Emitted as LitPrimOp{fused} + an App-chain (NOT PrimOpCall — the
+            // fused primop has a bytecode-closure replacement; OP_LIT_PRIMOP
+            // redirects to it, the OP_CALL chain dispatches iteratively,
+            // matching the fast path; PrimOpCall would hit the slow C body).
+            std::vector<VarId> fa;
+            fa.reserve(outer->args.size() - 1 + inner->args.size());
+            for (size_t k = 0; k < outer->args.size(); ++k)
+                if (k != rule->listArgIdx) fa.push_back(outer->args[k]);
+            for (VarId a : inner->args) fa.push_back(a);
+
+            VarId fn = m.freshVar();
+            LitPrimOp lp;  lp.primop = fusedOp;
+            out.push_back({ fn, lp });
+            for (size_t k = 0; k + 1 < fa.size(); ++k) {
+                VarId nx = m.freshVar();
+                out.push_back({ nx, App{ fn, fa[k] } });
+                fn = nx;
+            }
+            bd.expr = App{ fn, fa.back() };
             out.push_back(bd);
             ++fused;
             if (s_dbg) std::fprintf(stderr,
-                "  → FUSE: binding %u rewritten to __foldlMap App-chain "
-                "(hoisted %zu bindings)\n",
+                "  → FUSE %.*s∘%.*s → %.*s (binding %u, hoisted %zu)\n",
+                (int)rule->outerName.size(), rule->outerName.data(),
+                (int)rule->innerName.size(), rule->innerName.data(),
+                (int)rule->fusedName.size(), rule->fusedName.data(),
                 (unsigned)bd.var, hoisted.size());
         }
 

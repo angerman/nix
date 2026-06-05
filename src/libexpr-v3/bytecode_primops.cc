@@ -341,6 +341,16 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "          in builtins.seq next (go (i + 1) next); "
                 "  in go 0 nul");
 
+        // NOTE: a __mapMap (map∘map) fusion target was prototyped here and
+        // FALSIFIED 2026-06-05 — measured NEUTRAL (insns 54000117 vs
+        // 54000115; peak RSS 791 vs 791 MB on a 1M chain).  map∘map
+        // eliminates only the transient intermediate spine; lazy elements
+        // are forced exactly once either way and the intermediate ListVec is
+        // GC-reclaimed as forcing proceeds, so there is no win at peak.  The
+        // winning fusion shape eliminates the OUTPUT list too (foldl'∘map →
+        // __foldlMap above).  Candidate registry + verdicts live in the
+        // kRules table comment in opt_stream_fusion.cc.
+
         // T2 — map: lazy list mapping.  Preserves TW's primMap
         // laziness (each result entry is forced on demand) by
         // expressing map in terms of genList — which itself is a
