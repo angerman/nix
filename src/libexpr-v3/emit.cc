@@ -1887,10 +1887,12 @@ CompilationUnit compile(const ir::Module & m)
     // passes through — top-level AND each imported module — so one hook
     // covers the whole compiled corpus.  For full static coverage run with
     // NIX_V3_NO_DISK_CACHE=1, since a warm cache deserializes CUs and skips
-    // compile() entirely.  Reuses disassembleWindow (which advances by the
-    // correct per-opcode instruction width via disasm.cc::opExtraWords).
-    // Retirement criterion: remove when a first-class `v3-eval
-    // --emit-bytecode` CLI flag supersedes this env gate.
+    // compile() entirely.  The `=== v3-bytecode CU ... ===` delimiter line
+    // is the CU boundary `bench/analyze-bytecode.py` keys on (CU_RE) — keep
+    // its exact format.  `disassembleModule` then emits the per-function
+    // framing + resolved operands + jump labels (its extra `; func` / `L:` /
+    // `; module` lines don't match the analyzer's INSN/CU regexes, so they
+    // are skipped).  `v3-eval --emit-bytecode` shares disassembleModule.
     if (std::getenv("NIX_V3_EMIT_BYTECODE")) {
         std::FILE * out = stderr;
         bool closeOut = false;
@@ -1899,8 +1901,7 @@ CompilationUnit compile(const ir::Module & m)
         }
         std::fprintf(out, "=== v3-bytecode CU functions=%zu code=%zu ===\n",
                      e.unit.lambdas.size(), e.unit.code.size());
-        disassembleWindow(out, e.unit, 0,
-                          static_cast<uint32_t>(e.unit.code.size()));
+        disassembleModule(out, e.unit);
         if (closeOut) std::fclose(out);
     }
 

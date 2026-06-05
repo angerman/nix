@@ -20,6 +20,9 @@
 ///   --emit-ir        dump POST-optimisation IR to stdout and exit
 ///                    (suppresses normal evaluation + value print)
 ///   --emit-ir-raw    dump PRE-optimisation (lowered, no opt passes) IR
+///   --emit-bytecode  dump the compiled CU disassembly (per-function
+///                    framed, operands resolved, jump labels) and exit;
+///                    POST-optimisation by default, --no-opt for raw
 ///   --no-opt         alias for emit/eval without running optimise()
 ///
 /// See lode/IR_CHECK_INFRASTRUCTURE_PLAN_2026-05-18.md for the
@@ -118,7 +121,9 @@ static void usage(const char * argv0)
 {
     std::fprintf(stderr,
         "usage: %s [--file PATH | --expr EXPR] [--json] [--strict] [--parse]\n"
-        "       %s EXPR\n",
+        "       %s EXPR\n"
+        "  dump modes (suppress eval): --emit-ir | --emit-ir-raw |\n"
+        "       --emit-bytecode [--no-opt]\n",
         argv0, argv0);
 }
 
@@ -155,6 +160,11 @@ int main(int argc, char ** argv)
     // IR-CHECK MVP (2026-05-18): IR dump mode + opt control.
     IrDumpMode irDumpMode = IrDumpMode::None;
     bool noOpt = false;  // --no-opt: skip optimise() entirely
+    // --emit-bytecode: disassemble the compiled CU (post-optimise, post-
+    // compile) to stdout and exit.  Parallel to --emit-ir but one stage
+    // later in the pipeline (CU rather than IR module).  Shares
+    // disassembleModule with the NIX_V3_EMIT_BYTECODE env gate.
+    bool emitBytecode = false;
     // Extra search-path entries (each is either "PATH" or "NAME=PATH").
     // Mirrors `nix-instantiate -I` so the lang test runner's per-test
     // .flags files (which reference `-I lang/dir1` etc.) work.
@@ -212,6 +222,7 @@ int main(int argc, char ** argv)
         // IR-CHECK MVP (2026-05-18).
         else if (a == "--emit-ir")        irDumpMode = IrDumpMode::PostOpt;
         else if (a == "--emit-ir-raw")    irDumpMode = IrDumpMode::PreOpt;
+        else if (a == "--emit-bytecode")  emitBytecode = true;
         else if (a == "--no-opt")         noOpt = true;
         else if (!a.empty() && a[0] == '-') {
             // Unknown flag — quietly ignore so test runners can pass
@@ -379,6 +390,22 @@ int main(int argc, char ** argv)
             // apart from capture-free ones).
             nix::v3::ir::computeFreeVars(m);
             std::cout << nix::v3::ir::dumpModule(m);
+            return 0;
+        }
+
+        // --emit-bytecode: optimise (unless --no-opt) + compile + disassemble
+        // the CU, then exit BEFORE run().  One stage later than --emit-ir
+        // (CU not IR module); like --emit-ir PostOpt it runs ir::optimise by
+        // default so the dump reflects what production (runRootExpr) executes,
+        // and --no-opt gives the raw lowering.  This is a dedicated branch
+        // because the normal eval path below intentionally skips optimise()
+        // (see the --emit-ir note above) — we don't perturb that default.
+        if (emitBytecode) {
+            if (!noOpt)
+                nix::v3::ir::optimise(m);
+            nix::v3::ir::computeFreeVars(m);
+            auto cu = nix::v3::compile(m);
+            nix::v3::disassembleModule(stdout, cu);
             return 0;
         }
 

@@ -1,7 +1,9 @@
 #pragma once
 /// @file
-/// WC-32: Minimal v3 bytecode disassembler.  Used to investigate
-/// eval-order divergences between v3 and tree-walker.
+/// v3 bytecode disassembler.  Originally "WC-32 minimal" (eval-order
+/// divergence debugging); upgraded 2026-06-05 to high-quality:
+/// per-function framing + operand resolution + symbolic jump labels.
+/// See disasm.cc for the full format.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
@@ -25,11 +27,27 @@ uint32_t disassembleWindow(
     uint32_t endIp);
 
 /// Disassemble a single instruction at `ip`.  Returns the ip after
-/// (advances past data words).  Useful for cycle-trace integration.
+/// (advances past data words).  Self-contained: resolves the operand
+/// against `cu` (literals→values, primops→names, MAKE_*→func names,
+/// attr ops→symbols, branches→`-> Lk`, OP_POS→file:line:col).  Useful
+/// for cycle-trace + crash-context integration.
 uint32_t disassembleOne(
     std::FILE * out,
     const CompilationUnit & cu,
     uint32_t ip);
+
+/// Disassemble a WHOLE compilation unit, framed per function:
+///   ; module functions=N code=M entry=E
+///   ; func K "name" arity=A nUp=U nLocals=L entry=E
+///   L<off>:                       (branch-target leader labels)
+///     [ip] OP_... operand=N  ; <resolved>
+/// Functions are segmented via `lambdaCodeOffsets`; a module-wide
+/// pre-pass labels branch targets (absolute offsets).  Readable +
+/// `v3-check` CHECK-LABEL-friendly; used by `NIX_V3_EMIT_BYTECODE`
+/// and `v3-eval --emit-bytecode`.
+void disassembleModule(
+    std::FILE * out,
+    const CompilationUnit & cu);
 
 /// Map an Op code to its `OP_*` mnemonic string.  Returns "OP_???"
 /// for unknown codes.  Used by the per-opcode dispatch counter
