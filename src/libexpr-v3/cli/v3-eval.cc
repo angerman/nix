@@ -25,8 +25,16 @@
 ///                    POST-optimisation by default, --no-opt for raw
 ///   --no-opt         alias for emit/eval without running optimise()
 ///
+/// Eval mode:
+///   --optimize       run the FULL production pipeline (optimise +
+///                    applyStrictnessPasses) before eval, so NIX_VM_STATS /
+///                    V3_TIMING match `nix eval` (NIX_V3_DIRECT_EVAL).  The
+///                    default --expr path is a raw fast-runner that skips
+///                    optimise — its alloc counts are NOT production.
+///
 /// See lode/IR_CHECK_INFRASTRUCTURE_PLAN_2026-05-18.md for the
-/// IR-CHECK design that consumes these flags.
+/// IR-CHECK design that consumes these flags, and
+/// lode/NEXT_STEPS_2026-06-05.md §1 for why --optimize exists.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
@@ -123,7 +131,9 @@ static void usage(const char * argv0)
         "usage: %s [--file PATH | --expr EXPR] [--json] [--strict] [--parse]\n"
         "       %s EXPR\n"
         "  dump modes (suppress eval): --emit-ir | --emit-ir-raw |\n"
-        "       --emit-bytecode [--no-opt]\n",
+        "       --emit-bytecode [--no-opt]\n"
+        "  --optimize : run production pipeline before eval (faithful\n"
+        "       NIX_VM_STATS / V3_TIMING; default --expr skips optimise)\n",
         argv0, argv0);
 }
 
@@ -165,6 +175,14 @@ int main(int argc, char ** argv)
     // later in the pipeline (CU rather than IR module).  Shares
     // disassembleModule with the NIX_V3_EMIT_BYTECODE env gate.
     bool emitBytecode = false;
+    // --optimize: run the FULL production pipeline (optimise +
+    // applyStrictnessPasses) before eval, instead of v3-eval's default raw
+    // compile-and-run.  Required for production-faithful measurement: with
+    // NIX_VM_STATS=1 the alloc counts then match what `nix eval`
+    // (NIX_V3_DIRECT_EVAL) actually allocates.  Without it `--expr` reports
+    // UNOPTIMISED counts (e.g. fib's strict-arg thunks that production
+    // elides).  See lode/NEXT_STEPS_2026-06-05.md §1.
+    bool optimizeEval = false;
     // Extra search-path entries (each is either "PATH" or "NAME=PATH").
     // Mirrors `nix-instantiate -I` so the lang test runner's per-test
     // .flags files (which reference `-I lang/dir1` etc.) work.
@@ -223,6 +241,7 @@ int main(int argc, char ** argv)
         else if (a == "--emit-ir")        irDumpMode = IrDumpMode::PostOpt;
         else if (a == "--emit-ir-raw")    irDumpMode = IrDumpMode::PreOpt;
         else if (a == "--emit-bytecode")  emitBytecode = true;
+        else if (a == "--optimize")       optimizeEval = true;
         else if (a == "--no-opt")         noOpt = true;
         else if (!a.empty() && a[0] == '-') {
             // Unknown flag — quietly ignore so test runners can pass
@@ -413,6 +432,15 @@ int main(int argc, char ** argv)
             return 0;
         }
 
+        // --optimize: replicate run.cc's production pipeline so a subsequent
+        // NIX_VM_STATS / V3_TIMING reading is faithful to `nix eval`.  The
+        // default (raw) path below intentionally skips this — see the
+        // --emit-ir note above; this opt-in restores fidelity for measurement
+        // without changing the default fast-runner behaviour.
+        if (optimizeEval) {
+            nix::v3::ir::optimise(m);
+            nix::v3::ir::applyStrictnessPasses(m);
+        }
         nix::v3::ir::computeFreeVars(m);
         auto cu = nix::v3::compile(m);
         Value r = nix::v3::run(cu);
