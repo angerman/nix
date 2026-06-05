@@ -6114,6 +6114,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, f);
             break;
         }
+        case OP_R_RETURN:   // reg-VM Phase 5: retVal from a slot (see below)
         case OP_RETURN: {
             // #787 (2026-05-23) per-phase breakdown for #786 OPCYCLES
             // OP_RETURN-dominates finding.  Gated by env var; three
@@ -6132,7 +6133,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // tail-recursive burst, subsequent tail calls in a
             // different chain start fresh.
             vm.tailCallCount = 0;
-            Value retVal = pop(vm);
+            // reg-VM Phase 5: OP_R_RETURN reads the result from slot `operand`
+            // (no GET_LOCAL + pop); OP_RETURN pops it off the operand stack.
+            // Everything below is shared — retVal is copied before the frame
+            // teardown (resize(fStackBase)) drops the slot region.
+            Value retVal = (op == OP_R_RETURN)
+                ? vm.valueStack[stackBase + operand]
+                : pop(vm);
             // Phase A5: trace EVERY OP_RETURN whose frame's codeOff
             // matches V3_DBG_RETURN_AT_CODEOFF.  Logs retVal's tag +
             // (for closures) the closure-body codeOff so we can see

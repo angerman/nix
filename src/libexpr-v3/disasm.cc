@@ -73,6 +73,7 @@ const char * opName(Op op)
     case OP_MAKE_THUNK:        return "OP_MAKE_THUNK";
     case OP_CALL:              return "OP_CALL";
     case OP_RETURN:            return "OP_RETURN";
+    case OP_R_RETURN:          return "OP_R_RETURN";
     case OP_FORCE:             return "OP_FORCE";
     case OP_GET_LOCAL_FORCE:   return "OP_GET_LOCAL_FORCE";
     case OP_GET_UPVALUE_FORCE: return "OP_GET_UPVALUE_FORCE";
@@ -335,6 +336,9 @@ uint32_t disassembleOne(std::FILE * out,
     case OP_GET_LOCAL2:
         // Lever 1B-lite: operand packs two 12-bit slot indices.
         std::fprintf(out, "   ; locals %u, %u", operand >> 12, operand & 0xFFF);
+        break;
+    case OP_R_RETURN:
+        std::fprintf(out, "   ; return r%u", operand);
         break;
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:

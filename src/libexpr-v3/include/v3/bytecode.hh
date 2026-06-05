@@ -169,6 +169,16 @@ enum Op : uint8_t
     /// non-WHNF slot args are forced via A8 writeback-to-slot, exactly like
     /// OP_CALL_PRIMOP.  Emitted only for primops with no deep-force-list arg.
     OP_R_PRIMOP2      = 0x5d,
+    /// Register VM Phase 5 (REGISTER_VM_DESIGN_2026-06-05): return a register.
+    /// `return regs[operand]` — reads the result directly from a local slot,
+    /// dropping the `GET_LOCAL s; OP_RETURN` operand-stack round-trip.  Shares
+    /// OP_RETURN's teardown (only the retVal source differs).  Emitted (post-
+    /// RETURN peephole) only when no branch targets the RETURN — i.e. the
+    /// return value is unconditionally in slot s, not left on the stack by a
+    /// branch (the straight-line case; branchy functions need full register
+    /// mode).  The first op that lets a whole (straight-line) function run
+    /// with NO operand-stack traffic.
+    OP_R_RETURN       = 0x5e,  // [slot:24]  return regs[slot]
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

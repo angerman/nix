@@ -658,13 +658,18 @@ struct Emitter
             // they never collide with the spine head/inner logic.)
             if (constRemat_.count(bd.var)) continue;
 
-            // Register VM Phase 1: a binary primop with slot/const operands
-            // and a slot result → one 3-address OP_R_PRIMOP2 (no stack
-            // traffic).  Skip the tail binding (its value must land on the
-            // operand stack for the return; R_PRIMOP2 writes a slot, so the
-            // terminal's emitVarRef GETs it instead — handled by tailLast not
-            // covering this path: we only fire for non-tail bindings).
-            if (!isTail && tryEmitRPrimop2(bd)) continue;
+            // Register VM Phase 1 + 5: a binary primop with slot/const
+            // operands and a slot result → one 3-address OP_R_PRIMOP2 (no
+            // stack traffic; writes slot v).  For the TAIL binding, follow
+            // with GET_LOCAL v so the value is on the operand stack for the
+            // function RETURN — the Phase-5 R_RETURN peephole then fuses
+            // `GET_LOCAL v; RETURN` → `R_RETURN v`, so a straight-line
+            // arithmetic function (e.g. `map (x: x - 1)`'s lambda) runs with
+            // ZERO operand-stack traffic (R_PRIMOP2; R_RETURN).
+            if (tryEmitRPrimop2(bd)) {
+                if (isTail) emitGetLocal(getOrAssignSlot(bd.var));
+                continue;
+            }
 
             if (auto sh = spineHead.find(bd.var); sh != spineHead.end()) {
                 emitVarRef(sh->second.first);                  // base
@@ -1974,6 +1979,37 @@ struct Emitter
             }
         }
         unit.code.push_back(encode(fid == 0 ? OP_HALT : OP_RETURN));
+
+        // reg-VM Phase 5: if the function ends `GET_LOCAL s; OP_RETURN` and NO
+        // branch targets the OP_RETURN, the return value is unconditionally in
+        // slot s (not left on the operand stack by a branch) → fuse to
+        // OP_R_RETURN s.  A straight-line function then runs with NO operand-
+        // stack traffic.  A branch to the GET_LOCAL is fine (R_RETURN s returns
+        // slot s identically); only a branch to the RETURN (a path that left
+        // its value on the stack) blocks the rewrite.  Gate NIX_V3_NO_R_RETURN.
+        {
+            static const bool s_noRReturn =
+                std::getenv("NIX_V3_NO_R_RETURN") != nullptr;
+            uint32_t retPos = static_cast<uint32_t>(unit.code.size()) - 1;
+            if (!s_noRReturn && fid != 0 && retPos >= codeStart + 1
+                && decodeOp(unit.code[retPos]) == OP_RETURN
+                && decodeOp(unit.code[retPos - 1]) == OP_GET_LOCAL) {
+                bool retIsTarget = false;
+                for (uint32_t ip = codeStart; ip < retPos && !retIsTarget; ++ip) {
+                    Op cop = decodeOp(unit.code[ip]);
+                    if ((cop == OP_JUMP || cop == OP_BRANCH_FALSE
+                         || cop == OP_BRANCH_TRUE || cop == OP_AND_BRANCH
+                         || cop == OP_OR_BRANCH || cop == OP_IMPL_BRANCH)
+                        && decodeOperand(unit.code[ip]) == retPos)
+                        retIsTarget = true;
+                }
+                if (!retIsTarget) {
+                    unit.code[retPos - 1] =
+                        encode(OP_R_RETURN, decodeOperand(unit.code[retPos - 1]));
+                    unit.code.pop_back();   // drop the now-redundant OP_RETURN
+                }
+            }
+        }
 
         if (unit.lambdas.size() <= fid)         unit.lambdas.resize(fid + 1);
         if (unit.lambdaCodeOffsets.size() <= fid) unit.lambdaCodeOffsets.resize(fid + 1);
