@@ -142,6 +142,14 @@ enum Op : uint8_t
     /// (O(1) tail recursion, no PAP), else falls back to building the value
     /// and returning it.  See OP_TAIL_CALL.
     OP_TAIL_CALL_N    = 0x5a,  // [n:24]   saturated n-arg tail call
+    /// §2(b) superinstruction (NEXT_STEPS_2026-06-05): fuse the common
+    /// `OP_GET_UPVALUE idx ; OP_REC_BINDING_SLOT_REF sym ; <icIdx>` sequence
+    /// (a recursive self-reference resolved through a captured rec-attrset)
+    /// into one dispatch.  Reads the upvalue directly (no intermediate
+    /// push/pop), forces it to WHNF if needed, then does the same
+    /// recSlotCache IC lookup and pushes the Tag::Slot.  Encoding:
+    ///   [sym:24]; data: [upvalIdx:32, icIdx:32]
+    OP_GET_UPVALUE_REC_BINDING = 0x5b,
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

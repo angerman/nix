@@ -95,6 +95,7 @@ const char * opName(Op op)
     case OP_ATTRS_UPDATE_TAIL: return "OP_ATTRS_UPDATE_TAIL";
     case OP_IFD_PROBE:         return "OP_IFD_PROBE";
     case OP_REC_BINDING_SLOT_REF: return "OP_REC_BINDING_SLOT_REF";
+    case OP_GET_UPVALUE_REC_BINDING: return "OP_GET_UPVALUE_REC_BINDING";
     case OP_REC_SLOT_PUBLISH:  return "OP_REC_SLOT_PUBLISH";
     case OP_THUNK_SET_LOCAL_THROUGH_CELL: return "OP_THUNK_SET_LOCAL_THROUGH_CELL";
     case OP_APPLY_OVERRIDES:   return "OP_APPLY_OVERRIDES";
@@ -155,6 +156,8 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
         return 1;                       // inline-cache slot index
     case OP_REC_BINDING_SLOT_REF:
         return 1;                       // #779 Schema-10 IC follow-up
+    case OP_GET_UPVALUE_REC_BINDING:
+        return 2;                       // §2(b): [upvalIdx, icIdx]
     case OP_CALL_PRIMOP:
         return 1;                       // primop-table index (poIdx)
     default:
@@ -320,6 +323,7 @@ uint32_t disassembleOne(std::FILE * out,
     case OP_ATTRS_HAS:
     case OP_ATTRS_HAS_DYN:
     case OP_REC_BINDING_SLOT_REF:
+    case OP_GET_UPVALUE_REC_BINDING:
     case OP_WITH_LOOKUP:
         std::fprintf(out, "   ; %s", symName(operand));
         break;

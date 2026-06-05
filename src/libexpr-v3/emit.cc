@@ -1159,6 +1159,34 @@ struct Emitter
     /// the OP_REC_BINDING_SLOT_REF handler.
     void emitOne(const ir::RecBindingSlotRef & e)
     {
+        // §2(b) superinstruction (NEXT_STEPS_2026-06-05): the recursive
+        // self-reference resolves the rec-attrset through a CAPTURED upvalue
+        // (the common shape — e.g. fib resolving `fib` twice per call), so
+        // the source is `OP_GET_UPVALUE idx`.  Fuse `GET_UPVALUE ; RBSR` into
+        // OP_GET_UPVALUE_REC_BINDING: read the upvalue directly, dropping one
+        // dispatch and the intermediate push/pop, while keeping the same IC.
+        // Only fires when the source is a plain upvalue that the #542 defer
+        // pipeline didn't capture (pending top) — upvalues are never deferred
+        // (defer is for OnceLinear bindings), so this is the steady case.
+        // NIX_V3_NO_FUSE_RECBIND=1 disables it (default-ON A/B bisect switch,
+        // mirrors NO_DEFER/NO_CALL_N; retire once shipped byte-identical on
+        // --core + a nixpkgs sample, or revert the feature if net-negative).
+        static const bool s_noFuseRecBind =
+            std::getenv("NIX_V3_NO_FUSE_RECBIND") != nullptr;
+        if (!s_noFuseRecBind
+            && (ctx->pendingDefer.empty() || ctx->pendingDefer.back() != e.attrs)
+            && ctx->slot.find(e.attrs) == ctx->slot.end()) {
+            if (auto uit = ctx->upvalue.find(e.attrs); uit != ctx->upvalue.end()) {
+                flushAllDeferred();  // match emitVarRef discipline
+                uint32_t icIdx = static_cast<uint32_t>(unit.recSlotCache.size());
+                unit.recSlotCache.emplace_back();
+                unit.code.push_back(encode(OP_GET_UPVALUE_REC_BINDING, e.name));
+                unit.code.push_back(uit->second);   // upvalIdx
+                unit.code.push_back(icIdx);
+                return;
+            }
+        }
+
         // #542 unary fast path.
         if (!tryFastPathUnary(e.attrs))
             emitVarRef(e.attrs);

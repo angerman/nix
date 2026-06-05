@@ -6901,6 +6901,13 @@ void primImport(EvalState & state, Value * args, Value & out)
                                             compareSymOperand(ipA - 1, arA, arB);
                                             ipA++; ipB++;  // IC follow-up
                                             break;
+                                        case OP_GET_UPVALUE_REC_BINDING:
+                                            // §2(b): operand is the SymbolId
+                                            // (compare like RBSR); trailer is
+                                            // [upvalIdx, icIdx] — skip both.
+                                            compareSymOperand(ipA - 1, arA, arB);
+                                            ipA += 2; ipB += 2;
+                                            break;
                                         case OP_ATTRS_INIT: {
                                             uint32_t n = arA;
                                             for (uint32_t i = 0; i < n; ++i) {
