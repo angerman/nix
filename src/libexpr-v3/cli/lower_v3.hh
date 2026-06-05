@@ -767,7 +767,13 @@ struct LowererV3 {
         // non-recursive demotion below to scan ONLY the entries' IR for
         // sibling references — the body isn't lowered yet).
         ir::BlockId entryBlockStart = static_cast<ir::BlockId>(m.blocks.size());
+        // Per-entry block ranges (entries lower sequentially, blocks appended
+        // in order) — used by the #2 DAG-classification probe to attribute a
+        // RecBindingSlotRef to the entry whose thunk body contains it.
+        std::vector<ir::BlockId> entryBlkStart;
+        entryBlkStart.reserve(bs.size());
         for (auto * d : bs) {
+            entryBlkStart.push_back(static_cast<ir::BlockId>(m.blocks.size()));
             m.functions.emplace_back();
             ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
             auto eb = m.freshBlock();
@@ -789,6 +795,98 @@ struct LowererV3 {
                 scopes.pop_back();
             }
             blockStack.pop_back();
+        }
+
+        // #2 DAG-demotion SIZING PROBE (V3_DBG_LETREC_CLASS=1) — count-only,
+        // no behavior change.  Classifies each eligible-shape `let … in body`
+        // by its sibling-dependency graph: non-rec (no sibling refs — already
+        // demoted below), acyclic-DAG (sibling refs, no cycle — the #2 lever's
+        // target: topologically order + demote to direct GET_LOCALs), or
+        // cyclic (mutual recursion / fix — must keep the rec-attrset).  Sizes
+        // the demotable fraction of the 5.12%-dynamic REC_BINDING_SLOT_REF
+        // before building the (correctness-critical) demotion.  Counters dump
+        // at process exit via a function-local static destructor.
+        if (hasBody) {
+            static const bool s_classify =
+                std::getenv("V3_DBG_LETREC_CLASS") != nullptr;
+            if (s_classify) {
+                static struct Stats {
+                    uint64_t nonrec = 0, dag = 0, cyclic = 0, ineligible = 0;
+                    uint64_t dagEntries = 0, cyclicEntries = 0;
+                    ~Stats() {
+                        std::fprintf(stderr,
+                            "v3 letrec-class: non-rec=%llu acyclic-DAG=%llu "
+                            "cyclic=%llu ineligible-shape=%llu | "
+                            "DAG-entries=%llu cyclic-entries=%llu\n",
+                            (unsigned long long) nonrec, (unsigned long long) dag,
+                            (unsigned long long) cyclic,
+                            (unsigned long long) ineligible,
+                            (unsigned long long) dagEntries,
+                            (unsigned long long) cyclicEntries);
+                    }
+                } s;
+                bool eligibleShape =
+                    at->inheritFromExprs.empty() && at->dynamicAttrs.empty();
+                for (auto * d : bs)
+                    if (d->kind != nix::v3::ast::Attrs::AttrKind::Plain)
+                        eligibleShape = false;
+                if (!eligibleShape) {
+                    ++s.ineligible;
+                } else {
+                    const size_t n = bs.size();
+                    std::unordered_map<ir::SymbolId, size_t> idx;
+                    for (size_t i = 0; i < n; ++i)
+                        idx[m.internSymbol(bs[i]->name)] = i;
+                    std::vector<std::vector<size_t>> deps(n);
+                    bool anyDep = false;
+                    for (size_t i = 0; i < n; ++i) {
+                        ir::BlockId lo = entryBlkStart[i];
+                        ir::BlockId hi = (i + 1 < n)
+                            ? entryBlkStart[i + 1]
+                            : static_cast<ir::BlockId>(m.blocks.size());
+                        for (ir::BlockId b = lo; b < hi; ++b)
+                            for (auto & bd : m.blocks[b].bindings) {
+                                auto * sr =
+                                    std::get_if<ir::RecBindingSlotRef>(&bd.expr);
+                                if (sr && sr->attrs == recVar) {
+                                    auto it = idx.find(sr->name);
+                                    if (it != idx.end()) {
+                                        deps[i].push_back(it->second);
+                                        anyDep = true;
+                                    }
+                                }
+                            }
+                    }
+                    if (!anyDep) {
+                        ++s.nonrec;
+                    } else {
+                        // Kahn topo-removal cycle detection (self-dep node
+                        // never reaches in-degree 0 → counted cyclic).
+                        std::vector<size_t> remaining(n);
+                        std::vector<std::vector<size_t>> rev(n);
+                        for (size_t i = 0; i < n; ++i) {
+                            std::sort(deps[i].begin(), deps[i].end());
+                            deps[i].erase(
+                                std::unique(deps[i].begin(), deps[i].end()),
+                                deps[i].end());
+                            remaining[i] = deps[i].size();
+                            for (size_t j : deps[i])
+                                if (j != i) rev[j].push_back(i);
+                        }
+                        std::vector<size_t> q;
+                        for (size_t i = 0; i < n; ++i)
+                            if (remaining[i] == 0) q.push_back(i);
+                        size_t removed = 0;
+                        while (!q.empty()) {
+                            size_t u = q.back(); q.pop_back(); ++removed;
+                            for (size_t w : rev[u])
+                                if (--remaining[w] == 0) q.push_back(w);
+                        }
+                        if (removed < n) { ++s.cyclic; s.cyclicEntries += n; }
+                        else             { ++s.dag;    s.dagEntries += n; }
+                    }
+                }
+            }
         }
 
         // opt_letrec_demote (at-lowering, the clean fix): a NON-recursive
