@@ -268,6 +268,99 @@ size_t constantFold(Module & m)
 }
 
 // ---------------------------------------------------------------------------
+// Dead-function elimination (2026-06-05).
+//
+// After constant-folding / spine-inlining rewrites a PrimOpCall/App to a
+// literal, the MkThunk/Lambda binding that fed it becomes dead and is swept
+// by deadBindingElim — but the FUNCTION it pointed at lingers in m.functions
+// with its now-orphaned body (e.g. `length [1 2 3]` folds to LitInt 3, yet
+// the list thunk's ListExpr body survives in an unreferenced function).
+//
+// This pass clears the entry block of every function unreachable from the
+// program entry (f0).  It deliberately does NOT renumber funcIdx — that would
+// have to track Lambda + MkThunk + LetRec Entry/HiddenEntry thunkBodies AND
+// the VarOrigin/RecVarOrigin/SubExprEntry side-tables, and a single miss
+// corrupts the IR.  Instead every funcIdx stays valid, pointing at a now-
+// trivial `return null` body; emit produces a tiny dead stub.  Reachability
+// scans the in-block funcIdx carriers (Lambda, MkThunk, LetRec entry/hidden
+// thunkBodies), following If-branch blocks (Terminal is always TermReturn).
+//
+// Safety: if reachability ever UNDER-approximates (marks a live function
+// dead) the clear would break evaluation — caught immediately by the --core
+// byte-identity suite.  The carrier set above is exhaustive for in-block
+// references, so this is sound.
+size_t deadFunctionElim(Module & m)
+{
+    const size_t nf = m.functions.size();
+    if (nf == 0) return 0;
+    std::vector<bool> reachable(nf, false);
+    std::vector<bool> seenBlock(m.blocks.size(), false);
+    std::vector<FuncId> work;
+    auto markFunc = [&](FuncId f) {
+        if (f < nf && !reachable[f]) { reachable[f] = true; work.push_back(f); }
+    };
+    markFunc(0);  // the entry function is always live
+    while (!work.empty()) {
+        FuncId f = work.back(); work.pop_back();
+        std::vector<BlockId> bw;
+        if (m.functions[f].entryBlock != kInvalidBlock)
+            bw.push_back(m.functions[f].entryBlock);
+        while (!bw.empty()) {
+            BlockId b = bw.back(); bw.pop_back();
+            if (b == kInvalidBlock || b >= (BlockId)m.blocks.size() || seenBlock[b])
+                continue;
+            seenBlock[b] = true;
+            for (const auto & bd : m.blocks[b].bindings) {
+                std::visit([&](const auto & e) {
+                    using T = std::decay_t<decltype(e)>;
+                    // funcIdx carriers — mark the referenced function live.
+                    if constexpr (std::is_same_v<T, Lambda>)
+                        markFunc(e.funcIdx);
+                    else if constexpr (std::is_same_v<T, MkThunk>)
+                        markFunc(e.funcIdx);
+                    else if constexpr (std::is_same_v<T, LetRec>) {
+                        for (const auto & en : e.entries)       markFunc(en.thunkBody);
+                        for (const auto & he : e.hiddenEntries) markFunc(he.thunkBody);
+                    }
+                    // BlockId carriers — follow the sub-block (it may itself
+                    // contain funcIdx carriers).  Terminal is always
+                    // TermReturn, so these Exprs are the ONLY intra-function
+                    // block edges: If, With, Assert, And/Or/Impl.
+                    else if constexpr (std::is_same_v<T, If>) {
+                        bw.push_back(e.thenBlock);
+                        bw.push_back(e.elseBlock);
+                    }
+                    else if constexpr (std::is_same_v<T, With>)
+                        bw.push_back(e.bodyBlock);
+                    else if constexpr (std::is_same_v<T, Assert>)
+                        bw.push_back(e.bodyBlock);
+                    else if constexpr (std::is_same_v<T, And>)
+                        bw.push_back(e.rhsBlock);
+                    else if constexpr (std::is_same_v<T, Or>)
+                        bw.push_back(e.rhsBlock);
+                    else if constexpr (std::is_same_v<T, Impl>)
+                        bw.push_back(e.rhsBlock);
+                }, bd.expr);
+            }
+        }
+    }
+    size_t cleared = 0;
+    for (FuncId f = 0; f < (FuncId)nf; ++f) {
+        if (reachable[f]) continue;
+        BlockId eb = m.functions[f].entryBlock;
+        if (eb == kInvalidBlock || eb >= (BlockId)m.blocks.size()) continue;
+        Block & blk = m.blocks[eb];
+        if (blk.bindings.empty()) continue;  // already trivial
+        VarId nullVar = m.freshVar();
+        blk.bindings.clear();
+        blk.bindings.push_back(Binding{ nullVar, LitNull{} });
+        blk.terminal = TermReturn{ nullVar };
+        ++cleared;
+    }
+    return cleared;
+}
+
+// ---------------------------------------------------------------------------
 // Public entry: optimise (pipeline driver)
 // ---------------------------------------------------------------------------
 
@@ -446,6 +539,13 @@ void optimise(Module & m)
     } else {
         deadBindingElim(m);
     }
+
+    // Sweep the bodies of functions left unreachable by the folds/inlines
+    // above (e.g. `length [1 2 3]`'s now-orphaned list thunk).  Runs AFTER
+    // deadBindingElim so the dead MkThunk/Lambda bindings are already gone,
+    // leaving their functions unreferenced.
+    if (!checkPhase()) return;
+    deadFunctionElim(m);
 
     // #774 (2026-05-23): Stage 4 strictness analysis + call-site
     // elision pass.  Gated by NIX_V3_STAGE4_ALL_MODULES=1.
