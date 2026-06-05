@@ -96,19 +96,23 @@ production runner (`nix eval` + `NIX_V3_DIRECT_EVAL`) — **never `--expr`**
 
 ## 2. The genuinely-open codegen holes (production-accurate, from fib's body)
 
-With thunks off the table, fib's `func 2` (~7M× in fib33) still wastes work,
-in priority order:
+> **QUANTIFIED 2026-06-05 — see [[QUANTIFICATION_2026-06-05]].** The
+> measure-first step below was done on real workloads (hello + firefox,
+> production path) and **reordered this list**. Headline corrections:
+> (a) constant-spill is **FALSIFIED as a general lever** (0.0% of the real
+> corpus — a fib-only artifact); (d) stack-motion is the real #1 at **51%
+> dynamic** and is structural (register VM, ideal file 8–16 regs); and the
+> separately-surveyed WITH_LOOKUP-IC and APPLY_OVERRIDES levers are both
+> **<1.55% dynamic** (falsified for wall). The genuinely-open #2 is the
+> rec-binding machinery (9.2% dynamic) via DAG-`let`/formals demotion.
 
-**(a) Constant spill-and-reload — biggest, and general.** Every literal is
-`LIT_INT k; SET_LOCAL s; … GET_LOCAL s` instead of pushed where needed. fib
-does this 3× per call (`2` for `n<2`, `1` for `n-1`, `2` for `n-2`) →
-~6 wasted ops/call. Not fib-specific: it's how the A-normal-form lowering
-emits *every* literal operand. Peephole: a `SET_LOCAL` whose only use is a
-`GET_LOCAL` of the same slot with no stack-clobbering op between → drop both,
-keep the value on the stack. **Measure-first:** dump 3–4 workloads via
-`--emit-bytecode`, count `LIT*;SET_LOCAL;…;GET_LOCAL` statically (extend
-`analyze-operands.py` D2), confirm via `NIX_VM_OPCOUNTS`, pre-commit a
-threshold before writing the pass.
+With thunks off the table, fib's `func 2` (~7M× in fib33) still wastes work:
+
+**(a) Constant spill-and-reload — ~~biggest, and general~~ FALSIFIED.** On
+fib it looked big (`LIT_INT k; SET_LOCAL s; … GET_LOCAL s`, ~6 ops/call).
+**Measured on real corpora it is 0.0%** (125 candidates / 250 ops in 996K
+instructions) — a tight-arithmetic-loop artifact, not general. Do NOT build
+the peephole as a wall lever. (See QUANTIFICATION §3.)
 
 **(b) Redundant rec-binding resolution.** fib resolves `fib` twice per call
 (`GET_UPVALUE; REC_BINDING_SLOT_REF`). CSE across the intervening `CALL` —
@@ -119,9 +123,15 @@ instructions).
 thunk bodies but left the now-unreferenced thunk functions in the module —
 `deadFunctionElim` isn't sweeping post-de-thunk residue. One-time, easy.
 
-**(d) General stack motion (the ceiling).** `nLocals=15`, pervasive
-`SET_LOCAL`/`GET_LOCAL` round-trips. This is the ~48% stack-motion only a
-register VM / wider-operand superinstructions structurally remove — see §4.
+**(d) General stack motion (the ceiling) — the real #1, MEASURED 51%.**
+Pervasive `SET_LOCAL`/`GET_LOCAL`/`GET_UPVALUE` round-trips from A-normal-
+form lowering. **51.4% of dynamic dispatch on hello, 51.2% on firefox**
+(49.4% static both) — workload-invariant. Only a register VM / wider-operand
+superinstructions structurally remove it (§4). Register-pressure sizing
+(QUANTIFICATION §2): ideal file is **8–16 registers** (99.4–99.8% of
+functions never spill; mean pressure 1.78 vs declared nLocals 3.5). A
+cheaper interim: a slot-reuse/liveness allocator that reclaims the ~1.8
+over-reserved slots/fn without the full register VM.
 
 **Verified non-holes (do NOT chase):** `+` → `OP_STR_CONCAT` already has a
 2-int fast path; fib's arg thunks (already de-thunked).

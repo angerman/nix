@@ -301,6 +301,57 @@ def b_branches(funcs):
     return b1, b2, b0
 
 
+# ============================ R-series ====================================
+# Register pressure (register-VM sizing).  A register VM replaces the
+# SET_LOCAL/GET_LOCAL slot traffic (≈half of dispatch) with operands that
+# name slots directly.  The "ideal register count" for a function is its
+# register PRESSURE — the max number of slot-values simultaneously live —
+# not its declared nLocals (the A-normal-form allocator rarely reuses
+# slots, so nLocals over-counts).  We estimate pressure with LINEAR live
+# intervals: each SET opens a value in that slot, GETs extend its last-read,
+# the next SET to the slot (or function end) closes it; pressure = max
+# overlap of all [def, last_read] intervals.  A GET with no prior SET is a
+# parameter/preset slot, live from function entry.  Linear ⇒ exact for
+# straight-line bodies (most v3 funcs), an over-estimate where a value is
+# used on only one branch.
+import bisect
+
+
+def r1_register_pressure(funcs):
+    """Return list of (pressure, fn).  See section header for the model."""
+    out = []
+    for fn in funcs:
+        open_val = {}          # slot -> [def_ip, last_read_ip]
+        intervals = []         # (def_ip, last_read_ip)
+        for ins in fn.insns:
+            if ins.op in ("OP_SET_LOCAL", "OP_SET_LOCAL_KEEP"):
+                s = ins.operand
+                if s in open_val:
+                    intervals.append(tuple(open_val[s]))
+                open_val[s] = [ins.ip, ins.ip]
+            elif ins.op in ("OP_GET_LOCAL", "OP_GET_LOCAL_FORCE"):
+                s = ins.operand
+                if s in open_val:
+                    open_val[s][1] = ins.ip
+                else:                       # param / preset slot
+                    open_val[s] = [fn.entry, ins.ip]
+        for v in open_val.values():
+            intervals.append(tuple(v))
+        # Sweep line: +1 at each def, -1 just past each last-read.
+        events = []
+        for d, lr in intervals:
+            events.append((d, 1))
+            events.append((lr + 1, -1))
+        events.sort()
+        cur = peak = 0
+        for _, delta in events:
+            cur += delta
+            if cur > peak:
+                peak = cur
+        out.append((peak, fn))
+    return out
+
+
 # ============================ report ======================================
 def main():
     ap = argparse.ArgumentParser(
@@ -434,6 +485,34 @@ def main():
         print("\n## B0  INTEGRITY: branch target matching no instruction ip")
         for op, c in b0.most_common():
             print(f"  {op:<20}{c:>6}  ← width-table desync? investigate")
+
+    # ---- R-series: register pressure / register-VM sizing -------------
+    rp = r1_register_pressure(funcs)
+    pressures = sorted(p for p, _ in rp)
+    nlocals = sorted(fn.nLocals for fn in funcs)
+
+    def quant(sl, q):
+        if not sl:
+            return 0
+        return sl[min(len(sl) - 1, int(q * (len(sl) - 1)))]
+
+    print("\n## R1  register pressure  (max simultaneously-live local slots;"
+          " linear est.)")
+    print(f"  functions: {len(funcs)}")
+    print(f"  {'pct':<6}{'reg-pressure':>13}{'declared nLocals':>18}")
+    for lbl, q in (("p50", 0.50), ("p90", 0.90), ("p99", 0.99),
+                   ("max", 1.00)):
+        print(f"  {lbl:<6}{quant(pressures, q):>13}{quant(nlocals, q):>18}")
+    print("  register-file sizing (% of functions that never spill):")
+    for rf in (4, 8, 16, 32):
+        cov = bisect.bisect_right(pressures, rf)
+        print(f"    {rf:>2} regs → {100.0 * cov / len(pressures):5.1f}%"
+              f"   (declared-nLocals coverage: "
+              f"{100.0 * bisect.bisect_right(nlocals, rf) / len(nlocals):5.1f}%)")
+    mean_p = sum(pressures) / len(pressures)
+    mean_n = sum(nlocals) / len(nlocals)
+    print(f"  mean pressure {mean_p:.2f} vs mean declared nLocals {mean_n:.2f}"
+          f"  ({mean_n - mean_p:.2f} slots/fn the allocator over-reserves)")
 
     # ---- caveat -------------------------------------------------------
     print("\n## Caveat")
