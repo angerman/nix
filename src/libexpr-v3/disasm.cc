@@ -76,6 +76,8 @@ const char * opName(Op op)
     case OP_GET_LOCAL_FORCE:   return "OP_GET_LOCAL_FORCE";
     case OP_GET_UPVALUE_FORCE: return "OP_GET_UPVALUE_FORCE";
     case OP_TAIL_CALL:         return "OP_TAIL_CALL";
+    case OP_CALL_N:            return "OP_CALL_N";
+    case OP_TAIL_CALL_N:       return "OP_TAIL_CALL_N";
     case OP_SET_LOCAL_KEEP:    return "OP_SET_LOCAL_KEEP";
     case OP_LIST_INIT:         return "OP_LIST_INIT";
     case OP_LIST_CONCAT:       return "OP_LIST_CONCAT";
@@ -276,6 +278,13 @@ uint32_t disassembleOne(std::FILE * out,
                 operand, operand == 1 ? "" : "s");
         break;
     }
+    case OP_CALL_N:
+    case OP_TAIL_CALL_N:
+        // operand = saturated arg count; args are already on the stack and
+        // the callee closure is dynamic, so there is no name to resolve —
+        // surface the count so a bare `operand=3` reads as "3 args".
+        std::fprintf(out, "   ; %u arg%s", operand, operand == 1 ? "" : "s");
+        break;
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:
         if (operand < cu.lambdas.size()) {
