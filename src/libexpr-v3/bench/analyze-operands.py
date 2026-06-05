@@ -1,37 +1,41 @@
 #!/usr/bin/env python3
-"""analyze-operands.py — OPERAND-SENSITIVE static scan of v3 bytecode.
+"""analyze-operands.py — OPERAND- and STRUCTURE-sensitive static scan of
+v3 bytecode.
 
-Companion to analyze-bytecode.py.  That tool is deliberately opcode-only
-(it discards operands), so its n-grams cannot distinguish e.g. "load the
-SAME local twice" (a redundant-load / DUP candidate) from "load two
-DIFFERENT locals" (a normal two-arg push).  This tool parses the
-`; resolved` operand annotations the high-quality disassembler now emits
-(`v3-eval --emit-bytecode`, disasm.cc::disassembleModule) and reports
-optimisation candidates that ONLY become visible with operands.
+Companion to analyze-bytecode.py, which is deliberately opcode-only (it
+discards operands AND function structure, so its n-grams cannot tell
+"load the SAME local twice" from "load two DIFFERENT locals", nor reason
+about per-function shape or control flow).  This tool parses the
+per-function framing + `; resolved` operand annotations + `L<off>:` jump
+labels the high-quality disassembler now emits (`v3-eval --emit-bytecode`,
+disasm.cc::disassembleModule) and runs three families of detector:
 
-Input: a NIX_V3_EMIT_BYTECODE dump (same format analyze-bytecode.py reads).
+  OPERAND adjacency (D-series)
+    D1  same-slot adjacent  GET_LOCAL n ; GET_LOCAL n   (DUP candidate)
+    D2  same-slot  SET_LOCAL n ; GET_LOCAL n            (KEEP residual)
+    D3  generic OP_CALL attributed to nearest LIT_PRIMOP (callee guess)
 
-Detectors (each a HYPOTHESIS to triage against NIX_VM_OPCOUNTS/BIGRAMS —
-static counts are a generator, not decision-grade):
+  PER-FUNCTION structural (S-series)
+    S1  single-reference functions     (one MAKE_CLOSURE/THUNK site → inline)
+    S2  slot slack                     (declared nLocals ≫ max slot touched)
+    S3  leaf functions                 (no call-family op; +MAKE_THUNK sub)
 
-  D1  same-slot adjacent  GET_LOCAL n ; GET_LOCAL n
-        → the local is pushed twice in a row; the 2nd load is a DUP
-          (cheaper than re-reading the frame).  Opcode n-grams lump these
-          in with the different-slot case; D1 splits them so the DUP
-          ceiling is the SAME-slot count, not the raw bigram count.
+  BRANCH structure (B-series)
+    B1  branch-to-fallthrough          (target == next ip → dead/degenerate)
+    B2  branch-to-jump                 (target is itself a JUMP → threadable)
+    B0  (integrity) branch target that matches no instruction ip
 
-  D2  same-slot  SET_LOCAL n ; GET_LOCAL n  NOT already SET_LOCAL_KEEP
-        → SET_LOCAL_KEEP (#shipped) fuses the adjacent same-slot store+load.
-          Any residual same-slot SET;GET that the emitter left unfused is a
-          MISS by that pass (worth auditing the lowering site).
+Every result is a HYPOTHESIS to triage against the execution-weighted
+counters (NIX_VM_OPCOUNTS / NIX_VM_BIGRAMS) — static counts generate
+candidates, they don't decide (the SET_LOCAL_KEEP measure-twice lesson).
 
-  D3  primop reached via generic OP_CALL  (LIT_PRIMOP <p> … OP_CALL)
-        → a builtin loaded as a value and called through the generic
-          closure-call path instead of OP_CALL_PRIMOP.  Counts per primop.
+Input: a NIX_V3_EMIT_BYTECODE / `--emit-bytecode` dump.
 
-Boundaries: runs break at OP_RETURN / OP_HALT, CU delimiters, AND label
-leaders (`L<off>:`) — a label is a jump target, so the linear predecessor
-is not the guaranteed dynamic one; adjacency detectors must not span it.
+NOTE on scope: `v3-eval` runs installAllBytecodePrimops at startup, so a
+whole-process dump is DOMINATED by the fixed bytecode-primop wrappers
+(derivation/foldl'/…) — those CUs are identical across user expressions
+(empirically ~96% of a small-expr dump).  Use `--cu N` / `--cu last` to
+isolate one CU (the user expression is typically the last `; module`).
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 Input Output Group.  SPDX-License-Identifier: Apache-2.0
@@ -42,145 +46,338 @@ import re
 import sys
 from collections import Counter
 
-CU_RE    = re.compile(r"^=== v3-bytecode CU functions=(\d+) code=(\d+) ===")
+# --- line shapes emitted by disasm.cc --------------------------------------
+MODULE_RE = re.compile(r"^;\s*module\s+functions=(\d+)")
+FUNC_RE = re.compile(
+    r'^;\s*func\s+(\d+)(?:\s+"([^"]*)")?\s+arity=(\d+)\s+nUp=(\d+)'
+    r"\s+nLocals=(\d+)\s+entry=(\d+)")
 LABEL_RE = re.compile(r"^L(\d+):\s*$")
-# Instruction with operand + optional resolved suffix, e.g.
-#   "  [54] OP_LIT_PRIMOP            operand=2   ; primop foldl'"
-INSN_RE  = re.compile(
-    r"^\s*\[(\d+)\]\s+(OP_[A-Z0-9_]+)\s+operand=(-?\d+)(?:\s+data=\[[^\]]*\])?"
-    r"(?:\s*;\s*(.*))?$")
+INSN_RE = re.compile(
+    r"^\s*\[(\d+)\]\s+(OP_[A-Z0-9_]+)\s+operand=(-?\d+)"
+    r"(?:\s+data=\[[^\]]*\])?(?:\s*;\s*(.*))?$")
 
+# --- opcode families (names exactly as opName() emits them) ----------------
+BRANCH_OPS = {"OP_JUMP", "OP_BRANCH_FALSE", "OP_BRANCH_TRUE",
+              "OP_AND_BRANCH", "OP_OR_BRANCH", "OP_IMPL_BRANCH"}
+CALL_OPS = {"OP_CALL", "OP_CALL_N", "OP_CALL_PRIMOP", "OP_TAIL_CALL",
+            "OP_TAIL_CALL_N", "OP_APPLY_OVERRIDES"}
+SLOT_OPS = {"OP_GET_LOCAL", "OP_SET_LOCAL", "OP_SET_LOCAL_KEEP",
+            "OP_GET_LOCAL_FORCE"}
+CLOSURE_REF_OPS = {"OP_MAKE_CLOSURE", "OP_MAKE_THUNK"}  # operand = lambda id
 RUN_BREAK = {"OP_RETURN", "OP_HALT"}
 
 
 class Insn:
-    __slots__ = ("ip", "op", "operand", "resolved")
+    __slots__ = ("ip", "op", "operand", "target", "resolved")
+
     def __init__(self, ip, op, operand, resolved):
-        self.ip = ip; self.op = op; self.operand = operand
+        self.ip = ip
+        self.op = op
+        self.operand = operand
+        # For branch ops the operand IS the absolute target offset
+        # (disasm.cc: isBranchOp ⇒ isTarget[operand]).
+        self.target = operand if op in BRANCH_OPS else None
         self.resolved = resolved or ""
 
 
-def parse_runs(path):
-    """Yield runs (lists of Insn) broken at RETURN/HALT/CU/label."""
-    runs, cur = [], []
-    def flush():
-        nonlocal cur
-        if cur:
-            runs.append(cur); cur = []
+class Func:
+    __slots__ = ("cu", "fid", "name", "arity", "nUp", "nLocals",
+                 "entry", "insns", "labels")
+
+    def __init__(self, cu, fid, name, arity, nUp, nLocals, entry):
+        self.cu = cu
+        self.fid = fid
+        self.name = name or ""
+        self.arity = arity
+        self.nUp = nUp
+        self.nLocals = nLocals
+        self.entry = entry
+        self.insns = []          # list[Insn] in ip order
+        self.labels = set()      # set[int] of ips that are jump targets
+
+    def blocks(self):
+        """Split insns into basic blocks at label leaders and RUN_BREAK so
+        adjacency detectors don't span a jump target or a function exit."""
+        block = []
+        for ins in self.insns:
+            if ins.ip in self.labels and block:
+                yield block
+                block = []
+            block.append(ins)
+            if ins.op in RUN_BREAK:
+                yield block
+                block = []
+        if block:
+            yield block
+
+
+def parse_module(path):
+    """Return (funcs, refs) where funcs is list[Func] and refs is a
+    Counter keyed (cu_index, lambda_id) of MAKE_CLOSURE/MAKE_THUNK sites."""
+    funcs = []
+    refs = Counter()
+    cu = -1
+    cur = None
+    pending_label = None  # an L<ip>: seen; attach to the next insn's func
     with open(path, errors="replace") as f:
         for line in f:
-            if CU_RE.match(line) or LABEL_RE.match(line):
-                flush(); continue
-            m = INSN_RE.match(line)
-            if not m:
+            if MODULE_RE.match(line):
+                cu += 1
+                cur = None
                 continue
-            ip, op, operand, resolved = m.groups()
-            cur.append(Insn(int(ip), op, int(operand), resolved))
-            if op in RUN_BREAK:
-                flush()
-    flush()
-    return runs
+            fm = FUNC_RE.match(line)
+            if fm:
+                fid, name, arity, nUp, nLocals, entry = fm.groups()
+                cur = Func(cu, int(fid), name, int(arity), int(nUp),
+                           int(nLocals), int(entry))
+                funcs.append(cur)
+                continue
+            lm = LABEL_RE.match(line)
+            if lm:
+                pending_label = int(lm.group(1))
+                continue
+            im = INSN_RE.match(line)
+            if not im or cur is None:
+                continue
+            ip, op, operand, resolved = im.groups()
+            ins = Insn(int(ip), op, int(operand), resolved)
+            if pending_label is not None:
+                cur.labels.add(ins.ip)
+                pending_label = None
+            cur.insns.append(ins)
+            if op in CLOSURE_REF_OPS:
+                refs[(cur.cu, ins.operand)] += 1
+    return funcs, refs
 
 
-def d1_same_slot_get_get(runs):
-    """GET_LOCAL n ; GET_LOCAL n  — same vs different slot."""
+# ============================ D-series ====================================
+def d_adjacent(funcs, op_a, op_b):
+    """Count same- vs different-operand adjacent (op_a, op_b) pairs,
+    within basic blocks only."""
     same = diff = 0
-    for run in runs:
-        for a, b in zip(run, run[1:]):
-            if a.op == "OP_GET_LOCAL" and b.op == "OP_GET_LOCAL":
-                if a.operand == b.operand:
-                    same += 1
-                else:
-                    diff += 1
+    for fn in funcs:
+        for block in fn.blocks():
+            for a, b in zip(block, block[1:]):
+                if a.op == op_a and b.op == op_b:
+                    if a.operand == b.operand:
+                        same += 1
+                    else:
+                        diff += 1
     return same, diff
 
 
-def d2_set_then_get(runs):
-    """SET_LOCAL n ; GET_LOCAL n  — same-slot residual not caught by KEEP."""
-    same = diff = 0
-    for run in runs:
-        for a, b in zip(run, run[1:]):
-            if a.op == "OP_SET_LOCAL" and b.op == "OP_GET_LOCAL":
-                if a.operand == b.operand:
-                    same += 1
-                else:
-                    diff += 1
-    return same, diff
-
-
-def d3_primop_via_generic_call(runs):
-    """Attribute each generic OP_CALL to the nearest preceding LIT_PRIMOP in
-    the same run (reset on OP_CALL/OP_CALL_PRIMOP, since that consumes the
-    callee).  This is a heuristic proxy for "this generic call dispatches
-    this builtin"; it is NOT precise data-flow (args intervene), but it is
-    far tighter than run-level co-occurrence."""
+def d3_primop_via_generic_call(funcs):
     by_primop = Counter()
-    generic_calls = attributed = 0
-    for run in runs:
-        last_primop = None
-        for i in run:
-            if i.op == "OP_LIT_PRIMOP":
-                last_primop = i.resolved.replace("primop ", "")
-            elif i.op == "OP_CALL":
-                generic_calls += 1
-                if last_primop is not None:
-                    by_primop[last_primop] += 1
-                    attributed += 1
-                last_primop = None      # callee consumed
-            elif i.op == "OP_CALL_PRIMOP":
-                last_primop = None
-    return by_primop, generic_calls, attributed
+    gcalls = attributed = 0
+    for fn in funcs:
+        for block in fn.blocks():
+            last_primop = None
+            for i in block:
+                if i.op == "OP_LIT_PRIMOP":
+                    last_primop = i.resolved.replace("primop ", "")
+                elif i.op == "OP_CALL":
+                    gcalls += 1
+                    if last_primop is not None:
+                        by_primop[last_primop] += 1
+                        attributed += 1
+                    last_primop = None
+                elif i.op == "OP_CALL_PRIMOP":
+                    last_primop = None
+    return by_primop, gcalls, attributed
 
 
+# ============================ S-series ====================================
+def s1_single_reference(funcs, refs):
+    """Non-top-level functions created at exactly one MAKE_CLOSURE/THUNK
+    site → single call-site → inline / lambda-lift-back candidates."""
+    out = []
+    for fn in funcs:
+        if fn.fid == 0:
+            continue
+        n = refs.get((fn.cu, fn.fid), 0)
+        if n == 1:
+            out.append(fn)
+    return out
+
+
+def s2_slot_slack(funcs):
+    """Per function: nLocals declared vs (max slot index touched + 1)."""
+    rows = []
+    total_slack = 0
+    for fn in funcs:
+        used = -1
+        for ins in fn.insns:
+            if ins.op in SLOT_OPS and ins.operand > used:
+                used = ins.operand
+        touched = used + 1
+        slack = fn.nLocals - touched
+        if slack > 0:
+            rows.append((slack, fn, touched))
+            total_slack += slack
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return rows, total_slack
+
+
+def s3_leaf(funcs):
+    """Functions with no call-family op (pure straight-line + branches).
+    Sub-flag those that still build thunks (MAKE_THUNK)."""
+    leaves = []
+    leaf_thunkers = []
+    for fn in funcs:
+        if any(ins.op in CALL_OPS for ins in fn.insns):
+            continue
+        leaves.append(fn)
+        if any(ins.op == "OP_MAKE_THUNK" for ins in fn.insns):
+            leaf_thunkers.append(fn)
+    return leaves, leaf_thunkers
+
+
+# ============================ B-series ====================================
+def b_branches(funcs):
+    """Return (b1 dead/degenerate, b2 threadable, b0 bad-target) counters,
+    keyed by branch opcode."""
+    b1 = Counter()  # target == fallthrough ip
+    b2 = Counter()  # target is itself a JUMP
+    b0 = Counter()  # target matches no instruction ip (integrity)
+    for fn in funcs:
+        ipmap = {ins.ip: ins for ins in fn.insns}
+        for idx, ins in enumerate(fn.insns):
+            if ins.target is None:
+                continue
+            nxt = fn.insns[idx + 1].ip if idx + 1 < len(fn.insns) else None
+            if ins.target == nxt:
+                b1[ins.op] += 1
+            tgt = ipmap.get(ins.target)
+            if tgt is None:
+                b0[ins.op] += 1
+            elif tgt.op == "OP_JUMP" and ins.op != "OP_JUMP":
+                b2[ins.op] += 1
+            elif tgt.op == "OP_JUMP" and ins.op == "OP_JUMP":
+                b2[ins.op] += 1
+    return b1, b2, b0
+
+
+# ============================ report ======================================
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("dump", help="NIX_V3_EMIT_BYTECODE dump file")
+    ap.add_argument("dump", help="NIX_V3_EMIT_BYTECODE / --emit-bytecode dump")
     ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--cu", default=None,
+                    help="analyze only CU index N (0-based) or 'last' "
+                         "(usually the user expression); default: all CUs")
     args = ap.parse_args()
 
-    runs = parse_runs(args.dump)
-    total = sum(len(r) for r in runs)
-    if total == 0:
-        print("analyze-operands: no operand-bearing instructions parsed "
-              f"from {args.dump}", file=sys.stderr)
+    funcs, refs = parse_module(args.dump)
+
+    if args.cu is not None:
+        all_cus = sorted({f.cu for f in funcs})
+        target = all_cus[-1] if args.cu == "last" else int(args.cu)
+        funcs = [f for f in funcs if f.cu == target]
+        if not funcs:
+            print(f"analyze-operands: no functions in CU {target} "
+                  f"(CUs present: {all_cus})", file=sys.stderr)
+            sys.exit(1)
+        print(f"[scope: CU {target} only — refs/counts restricted to it]")
+    n_insn = sum(len(f.insns) for f in funcs)
+    if not funcs or n_insn == 0:
+        print(f"analyze-operands: no framed functions parsed from "
+              f"{args.dump} (need `--emit-bytecode` / disassembleModule "
+              f"output, not the old flat dump)", file=sys.stderr)
         sys.exit(1)
 
+    n_cu = len({f.cu for f in funcs})
     print("=" * 70)
-    print(f"v3 OPERAND-SENSITIVE scan — {args.dump}")
-    print(f"  runs: {len(runs)}   operand-bearing instructions: {total}")
+    print(f"v3 OPERAND + STRUCTURE scan — {args.dump}")
+    print(f"  CUs: {n_cu}   functions: {len(funcs)}   instructions: {n_insn}")
     print("=" * 70)
 
-    s, d = d1_same_slot_get_get(runs)
+    # ---- D-series -----------------------------------------------------
+    s, d = d_adjacent(funcs, "OP_GET_LOCAL", "OP_GET_LOCAL")
     tot = s + d
     print("\n## D1  GET_LOCAL n ; GET_LOCAL n   (same vs different slot)")
-    print(f"  same-slot (DUP candidate): {s}")
-    print(f"  different-slot (normal)  : {d}")
+    print(f"  same-slot (DUP candidate): {s}    different-slot (normal): {d}")
     if tot:
-        print(f"  → {100.0*s/tot:.1f}% of adjacent GET;GET pairs are the SAME"
-              f" slot; opcode-only n-grams count all {tot} together.")
+        print(f"  → {100.0*s/tot:.1f}% same-slot; opcode-only n-grams lump all "
+              f"{tot} together.")
 
-    s, d = d2_set_then_get(runs)
-    tot = s + d
+    s, d = d_adjacent(funcs, "OP_SET_LOCAL", "OP_GET_LOCAL")
     print("\n## D2  SET_LOCAL n ; GET_LOCAL n   (SET_LOCAL_KEEP residual)")
-    print(f"  same-slot (KEEP MISS): {s}")
-    print(f"  different-slot       : {d}")
-    if s == 0:
-        print("  → 0 same-slot residual: SET_LOCAL_KEEP caught the adjacent"
-              " cases (expected).")
-    else:
-        print(f"  → {s} adjacent same-slot SET;GET the KEEP pass left unfused"
-              " — audit the emit site.")
+    print(f"  same-slot (KEEP MISS): {s}    different-slot: {d}")
+    print("  → SET_LOCAL_KEEP is complete iff same-slot == 0."
+          if s == 0 else
+          f"  → {s} same-slot residual — audit the emit site.")
 
-    by_primop, gcalls, attr = d3_primop_via_generic_call(runs)
+    by_primop, gcalls, attr = d3_primop_via_generic_call(funcs)
     print("\n## D3  generic OP_CALL attributed to nearest preceding LIT_PRIMOP")
-    print(f"  total generic OP_CALL: {gcalls}   "
-          f"attributed to a primop: {attr}")
+    print(f"  generic OP_CALL: {gcalls}   attributed to a primop: {attr}"
+          "   (rest are user-closure calls)")
     print(f"  {'primop (likely callee)':<24}{'generic-CALL sites':>20}")
     for nm, c in by_primop.most_common(args.top):
         print(f"  {nm:<24}{c:>20}")
 
+    # ---- S-series -----------------------------------------------------
+    single = s1_single_reference(funcs, refs)
+    nonzero = [f for f in funcs if f.fid != 0]
+    print("\n## S1  single-reference functions  (one MAKE_* site → inline)")
+    print(f"  {len(single)} of {len(nonzero)} non-top-level functions are "
+          f"created at exactly one site.")
+    print(f"  {'cu/fid':<10}{'name':<22}{'arity':>6}{'insns':>7}")
+    for fn in sorted(single, key=lambda f: len(f.insns))[:args.top]:
+        print(f"  {f'{fn.cu}/{fn.fid}':<10}{(fn.name or '<anon>'):<22}"
+              f"{fn.arity:>6}{len(fn.insns):>7}")
+
+    rows, total_slack = s2_slot_slack(funcs)
+    print("\n## S2  slot slack  (declared nLocals − max slot index touched − 1)")
+    print(f"  {total_slack} declared-but-untouched slots across "
+          f"{len(rows)} functions.")
+    print(f"  {'cu/fid':<10}{'name':<22}{'nLocals':>8}{'touched':>8}{'slack':>7}")
+    for slack, fn, touched in rows[:args.top]:
+        print(f"  {f'{fn.cu}/{fn.fid}':<10}{(fn.name or '<anon>'):<22}"
+              f"{fn.nLocals:>8}{touched:>8}{slack:>7}")
+    print("  → hint only: high slots may be reserved scratch; confirm before"
+          " shrinking frames.")
+
+    leaves, leaf_thunkers = s3_leaf(funcs)
+    print("\n## S3  leaf functions  (no call-family op)")
+    print(f"  {len(leaves)} of {len(funcs)} functions are leaf "
+          f"(straight-line + branches only);")
+    print(f"  {len(leaf_thunkers)} of those still MAKE_THUNK — thunk-elision /"
+          " strictness candidates.")
+    print(f"  {'cu/fid':<10}{'name':<22}{'arity':>6}{'thunks':>7}")
+    for fn in sorted(leaf_thunkers,
+                     key=lambda f: sum(1 for i in f.insns
+                                       if i.op == "OP_MAKE_THUNK"),
+                     reverse=True)[:args.top]:
+        nthunk = sum(1 for i in fn.insns if i.op == "OP_MAKE_THUNK")
+        print(f"  {f'{fn.cu}/{fn.fid}':<10}{(fn.name or '<anon>'):<22}"
+              f"{fn.arity:>6}{nthunk:>7}")
+
+    # ---- B-series -----------------------------------------------------
+    b1, b2, b0 = b_branches(funcs)
+    print("\n## B1  branch-to-fallthrough  (target == next ip)")
+    if sum(b1.values()) == 0:
+        print("  none — no branch jumps to its own fallthrough.")
+    else:
+        for op, c in b1.most_common():
+            kind = ("dead unconditional jump" if op == "OP_JUMP"
+                    else "no-op conditional (both paths fall through)")
+            print(f"  {op:<20}{c:>6}  ({kind})")
+
+    print("\n## B2  branch-to-jump  (target is itself a JUMP → threadable)")
+    if sum(b2.values()) == 0:
+        print("  none — no jump-to-jump threading opportunity.")
+    else:
+        for op, c in b2.most_common():
+            print(f"  {op:<20}{c:>6}")
+
+    if sum(b0.values()):
+        print("\n## B0  INTEGRITY: branch target matching no instruction ip")
+        for op, c in b0.most_common():
+            print(f"  {op:<20}{c:>6}  ← width-table desync? investigate")
+
+    # ---- caveat -------------------------------------------------------
     print("\n## Caveat")
     print("  STATIC. Confirm any candidate execution-weighted (NIX_VM_OPCOUNTS")
     print("  / NIX_VM_BIGRAMS) before implementing — a hot-loop pattern can")
