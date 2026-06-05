@@ -186,6 +186,50 @@ def d3_primop_via_generic_call(funcs):
     return by_primop, gcalls, attributed
 
 
+# ============================ C-series ====================================
+# Constant spill-and-reload (NEXT_STEPS_2026-06-05 §2(a)).  A-normal-form
+# lowering names every literal operand, so the emitter materializes a pure
+# constant into a slot — `LIT_* k ; SET_LOCAL s ; … ; GET_LOCAL s` — instead
+# of pushing it where used.  For a write-once slot s holding a constant,
+# rematerializing the LIT at each use site is order-independent and saves
+# exactly 2 ops per constant (the early LIT + the SET; each GET→LIT is the
+# same width).  This detector counts those candidates and the ops saveable.
+LIT_OPS = {"OP_LIT_INT", "OP_LIT_FLOAT", "OP_LIT_BOOL", "OP_LIT_NULL",
+           "OP_LIT_TRUE", "OP_LIT_FALSE"}
+
+
+def c1_const_spill(funcs):
+    """Per function, find `LIT_* ; SET_LOCAL s` where slot s is written
+    exactly once (so the SET defines a single constant binding) and read at
+    least once.  Returns (n_candidates, ops_saveable, by_litop, rows)."""
+    n = 0
+    saveable = 0
+    by_litop = Counter()
+    rows = []  # (fn, count_in_fn)
+    for fn in funcs:
+        # write/read tallies per slot within this function
+        writes = Counter()
+        reads = Counter()
+        for ins in fn.insns:
+            if ins.op == "OP_SET_LOCAL" or ins.op == "OP_SET_LOCAL_KEEP":
+                writes[ins.operand] += 1
+            elif ins.op == "OP_GET_LOCAL" or ins.op == "OP_GET_LOCAL_FORCE":
+                reads[ins.operand] += 1
+        fn_count = 0
+        for a, b in zip(fn.insns, fn.insns[1:]):
+            if a.op in LIT_OPS and b.op == "OP_SET_LOCAL":
+                s = b.operand
+                if writes[s] == 1 and reads[s] >= 1:
+                    n += 1
+                    saveable += 2          # early LIT + SET removed
+                    by_litop[a.op] += 1
+                    fn_count += 1
+        if fn_count:
+            rows.append((fn_count, fn))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return n, saveable, by_litop, rows
+
+
 # ============================ S-series ====================================
 def s1_single_reference(funcs, refs):
     """Non-top-level functions created at exactly one MAKE_CLOSURE/THUNK
@@ -316,6 +360,20 @@ def main():
     print(f"  {'primop (likely callee)':<24}{'generic-CALL sites':>20}")
     for nm, c in by_primop.most_common(args.top):
         print(f"  {nm:<24}{c:>20}")
+
+    # ---- C-series -----------------------------------------------------
+    cn, csave, cby, crows = c1_const_spill(funcs)
+    print("\n## C1  constant spill-and-reload  (LIT_* ; SET_LOCAL s, s write-once)")
+    print(f"  {cn} const-spill bindings → {csave} ops saveable by remat "
+          f"({100.0*csave/n_insn:.1f}% of {n_insn} static insns).")
+    if cn:
+        print("  by literal op: " +
+              ", ".join(f"{op.replace('OP_LIT_','')}={c}"
+                        for op, c in cby.most_common()))
+        print(f"  {'cu/fid':<10}{'name':<22}{'const-spills':>13}")
+        for cnt, fn in crows[:args.top]:
+            print(f"  {f'{fn.cu}/{fn.fid}':<10}{(fn.name or '<anon>'):<22}"
+                  f"{cnt:>13}")
 
     # ---- S-series -----------------------------------------------------
     single = s1_single_reference(funcs, refs)

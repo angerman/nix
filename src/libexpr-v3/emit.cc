@@ -134,6 +134,46 @@ struct Emitter
     std::vector<uint32_t>        jumpInsnPositions_;
     std::unordered_set<uint32_t> jumpTargetPositions_;
 
+    // §2(a) constant rematerialization (NEXT_STEPS_2026-06-05).  A-normal-
+    // form lowering names every literal operand, so the emitter would spill
+    // a pure immediate into a slot (`LIT_* ; SET_LOCAL s ; … ; GET_LOCAL s`)
+    // instead of pushing it where used.  For immediates (LitInt/Float/Bool/
+    // Null), re-emitting the LIT at each use site is order-independent and
+    // ≤ the spill cost regardless of use count (LIT and GET are the same
+    // width, and we drop the SET), so we never give them a slot — they are
+    // rematerialized in emitVarRef.  constRemat_ is rebuilt per function in
+    // preassignSlotsInBlock; it maps the binding's VarId to its Lit Expr
+    // (stable: the module is not mutated during emit).  Vars captured as a
+    // nested function's freeVar are EXCLUDED (the closure reads them from a
+    // parent slot at MAKE_CLOSURE time) — see capturedFreeVars_.
+    std::unordered_map<ir::VarId, const ir::Expr *> constRemat_;
+    std::unordered_set<ir::VarId>                   capturedFreeVars_;
+    bool                                            capturedFreeVarsBuilt_ = false;
+
+    /// An immediate constant safe to rematerialize at each use: re-emitting
+    /// the LIT is free (no heap, no context) and width-equal to a GET_LOCAL.
+    /// LitString is deliberately excluded — re-emit would append a duplicate
+    /// string-pool entry per use; strings are also not the hot operand.
+    static bool isRematConst(const ir::Expr & e)
+    {
+        return std::holds_alternative<ir::LitInt>(e)
+            || std::holds_alternative<ir::LitFloat>(e)
+            || std::holds_alternative<ir::LitBool>(e)
+            || std::holds_alternative<ir::LitNull>(e);
+    }
+
+    /// Module-wide union of every function's freeVars — the set of VarIds
+    /// that some nested closure captures (and therefore must live in a
+    /// parent slot).  Built once, lazily; the module is immutable here.
+    void ensureCapturedFreeVars()
+    {
+        if (capturedFreeVarsBuilt_) return;
+        capturedFreeVarsBuilt_ = true;
+        for (const auto & fn : m.functions)
+            for (ir::VarId fv : fn.freeVars)
+                capturedFreeVars_.insert(fv);
+    }
+
     /// #548c (2026-05-10): set by emitBlock when emitting the
     /// terminal-return binding of the function's entry block.  Non-
     /// rec AttrSets in this position become OP_ATTRS_REC_INIT
@@ -313,6 +353,13 @@ struct Emitter
         // we degrade gracefully to the standard flush+GET pattern,
         // matching the no-deferring baseline.
         flushAllDeferred();
+        // §2(a): an immediate-constant binding has no slot — re-emit the LIT
+        // here instead of GET_LOCAL.  A LIT pushes exactly one value (like a
+        // GET), so the post-flush stack discipline is unchanged.
+        if (auto cit = constRemat_.find(v); cit != constRemat_.end()) {
+            emitExpr(*cit->second);
+            return;
+        }
         if (auto it = ctx->slot.find(v); it != ctx->slot.end()) {
             emitGetLocal(it->second);   // Step-2 fusion: records SET;GET candidates
             return;
@@ -485,7 +532,11 @@ struct Emitter
         // beneath it that would conflict with sub-block-exit
         // invariants).
         const size_t nBd = b.bindings.size();
-        bool tailLast = nBd > 0 && b.bindings.back().var == ret.value;
+        // §2(a): a const-remat var carries no slot and emits nothing here, so
+        // it can't be the "value already on top" tail — exclude it so the
+        // terminal below rematerialises ret.value via emitVarRef instead.
+        bool tailLast = nBd > 0 && b.bindings.back().var == ret.value
+                        && !constRemat_.count(b.bindings.back().var);
 
         // --- App-spine coalescing (eval/apply call-site, lever B) --------
         // Recognise maximal application spines App(App(…App(base,a0)…),
@@ -554,6 +605,13 @@ struct Emitter
             // node is OnceLinear and never the block's tail, so skipping it
             // affects neither slots nor the return value.)
             if (spineInner.count(bd.var)) continue;
+
+            // §2(a): immediate-constant bindings are rematerialised at each
+            // use (emitVarRef) and never spilled — emit nothing for them
+            // here.  Excluded from tailLast above, so a const ret.value is
+            // re-emitted by the terminal.  (Consts are Lits, never Apps, so
+            // they never collide with the spine head/inner logic.)
+            if (constRemat_.count(bd.var)) continue;
 
             if (auto sh = spineHead.find(bd.var); sh != spineHead.end()) {
                 emitVarRef(sh->second.first);                  // base
@@ -747,6 +805,17 @@ struct Emitter
 #define V3_EMIT_BINARY(IRType, OP) \
     void emitOne(const ir::IRType & e) { \
         if (tryFastPathBinary(e.lhs, e.rhs)) { \
+            unit.code.push_back(encode(OP)); \
+            return; \
+        } \
+        /* §2(a): cooperate with const-remat.  When lhs is deferred (pending */ \
+        /* top) and rhs is a remat-const, the two-operand fast path above */ \
+        /* can't fire (the const was never deferred), which would force lhs */ \
+        /* to flush+reload.  Instead consume lhs from pending and emit the */ \
+        /* const inline — preserving the no-SET shape `<lhs>; LIT; OP`. */ \
+        if (auto cit = constRemat_.find(e.rhs); \
+            cit != constRemat_.end() && tryFastPathUnary(e.lhs)) { \
+            emitExpr(*cit->second); \
             unit.code.push_back(encode(OP)); \
             return; \
         } \
@@ -1531,10 +1600,32 @@ struct Emitter
     void preassignSlotsInBlock(FuncCtx & fc, ir::BlockId bid,
                                std::unordered_set<ir::BlockId> & visited)
     {
+        // §2(a) A/B bisect switch — default-ON.  NIX_V3_NO_CONST_REMAT=1
+        // disables constant rematerialization so a regression can be
+        // bisected to "v3 const-remat" vs everything else (mirrors
+        // NIX_V3_NO_DEFER / NIX_V3_NO_CALL_N / NIX_V3_NO_FUSE_SETGET).
+        // RETIREMENT: drop the switch once const-remat ships byte-identical
+        // on --core + a nixpkgs sample over ≥10 runs, or if it is ever shown
+        // net-negative on wall (then revert the whole feature, not the gate).
+        static const bool s_noConstRemat =
+            std::getenv("NIX_V3_NO_CONST_REMAT") != nullptr;
+
         if (!visited.insert(bid).second) return;
         const ir::Block & b = m.blocks[bid];
         for (auto & bd : b.bindings) {
-            (void)getOrAssignSlot(fc, bd.var);
+            // §2(a): single-use immediate constants get no slot — recorded
+            // for remat at use.  Restricted to OnceLinear: a multi-use const
+            // is left on the normal materialize path (LIT;SET_LOCAL_KEEP) so
+            // the defer mechanism's many-use contract is unchanged, and the
+            // win (all hot recursion/loop literals are single-use) is kept.
+            // Vars captured by a nested closure are excluded (they must live
+            // in a parent slot for MAKE_CLOSURE) and fall through to a slot.
+            if (!s_noConstRemat && isRematConst(bd.expr)
+                && !capturedFreeVars_.count(bd.var)
+                && occ.lookup(bd.var).kind == ir::OccKind::OnceLinear)
+                constRemat_[bd.var] = &bd.expr;
+            else
+                (void)getOrAssignSlot(fc, bd.var);
             std::vector<ir::BlockId> subs;
             std::visit([&](auto const & e) {
                 using T = std::decay_t<decltype(e)>;
@@ -1651,6 +1742,12 @@ struct Emitter
             for (auto fv : f.freeVars) std::fprintf(stderr, "%u,", (unsigned)fv);
             std::fprintf(stderr, "]\n");
         }
+        // §2(a): build the per-function const-remat set (needs the module-
+        // wide captured-freeVar set) BEFORE slot pre-assignment, which both
+        // populates constRemat_ and skips slots for its members.
+        ensureCapturedFreeVars();
+        constRemat_.clear();
+
         // Pre-assign slots for every VarId reachable from the entry
         // block (including in sub-blocks: if-branches, with bodies, etc.)
         // so forward references resolve at emit time.
