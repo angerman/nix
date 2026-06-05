@@ -1104,6 +1104,16 @@ void applyStrictnessPasses(Module & m)
     computeFunctionStrictness(m);
     for (int it = 0; it < 8; ++it)
         if (applyStrictnessAtCallSites(m) == 0) break;
+
+    // Sweep strictness's OWN residue.  De-thunking a strict call arg inlines
+    // the thunk body at the call site and drops the MkThunk binding, but the
+    // thunk *function* it referenced is now unreachable dead code (e.g. fib's
+    // (n-1)/(n-2) `__sub` thunks).  `deadFunctionElim` inside `optimise()`
+    // runs BEFORE this, so it cannot see the orphans — clear them here.  This
+    // is the only place that observes the post-de-thunk shape, and because
+    // every production caller (run.cc, --emit-bytecode, --optimize) routes
+    // through this function, the sweep can't drift from the eval path.
+    deadFunctionElim(m);
 }
 
 } // namespace nix::v3::ir

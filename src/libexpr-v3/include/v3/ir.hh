@@ -809,6 +809,19 @@ size_t constantFold(Module & m);
 /// removed across all iterations.
 size_t deadBindingElim(Module & m);
 
+/// Body-clear functions unreachable from the entry function (func 0).
+/// Reachability follows every in-block funcIdx carrier (Lambda, MkThunk,
+/// LetRec entry/hidden thunkBodies) and every intra-function block edge
+/// (If/With/Assert/And/Or/Impl sub-blocks).  An unreachable function's
+/// entry block is replaced with a trivial `return null` stub; the function
+/// is NOT removed from `m.functions`, so every existing FuncId stays valid.
+/// Idempotent — safe to run more than once.  Returns the count cleared.
+///
+/// Runs inside `optimise()`, but ALSO after `applyStrictnessPasses` (which
+/// de-thunks strict call args and orphans their thunk bodies — residue the
+/// in-`optimise` sweep, running before strictness, cannot see).
+size_t deadFunctionElim(Module & m);
+
 /// OPT_OCCUR Phase B variant of deadBindingElim.  Consults the OccMap
 /// produced by `analyseOccurrence` instead of re-walking the reference
 /// graph each iteration.  Two passes (per OPT_OCCUR_PLAN_2026-05-08.md
