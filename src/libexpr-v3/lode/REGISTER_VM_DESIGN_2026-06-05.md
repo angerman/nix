@@ -83,6 +83,51 @@ measure-twice input for whether to make it. Resume here (Phase 5, per-function
 register-mode hybrid for incremental validation) when that investment is
 authorized.
 
+## Phase 5 — AUTHORIZED + UNDERWAY (2026-06-06)
+
+**Approach (no mode flag):** a function runs stack-free when its emit produces
+only register-form ops; add the ops one at a time, each `--core` byte-identical,
+growing the stack-free-eligible function set. **Foundation infra LANDED:**
+`getLocalPositions_` makes the multi-word-op emit scans robust (`02db677b1`).
+
+**Landed so far:**
+- `R_PRIMOP2` (`1010108ee`/`0f99dce3a`) — binary primops, slot→slot.
+- `R_RETURN` (`03f304e90`) — return a slot. With R_PRIMOP2-on-tail, a
+  **straight-line arithmetic function is now FULLY stack-free**:
+  `map (x: x-1)`'s lambda = `OP_R_PRIMOP2 __sub r1=r0,#1; OP_R_RETURN r1` —
+  zero operand-stack ops. Proven.
+
+**Remaining ops to make BRANCHY+RECURSIVE functions (fib) stack-free** (each
+its own `--core`-validated commit; the `getLocalPositions_` fix makes the
+follow-up-word ops safe):
+1. **`R_BRANCH_FALSE` target, cond_slot** — branch on `regs[cond_slot]`
+   (force-writeback-to-slot if non-WHNF). `operand=target` (24-bit, so the
+   existing compactFuseSetGet jump rebase works) + 1 follow-up `cond_slot`.
+   Needs: `isBranchOp`+`opExtraWords(+1)` (disasm), serialize skip-1 (×4) +
+   verifier, dispatch. Drops the If's `GET_LOCAL cond`.
+2. **Register-mode `If` emit (branch-result-to-slot)** — allocate a result
+   slot R for the If; each branch's tail writes R (R_PRIMOP2 dst=R, or a
+   `R_MOVE src→R`); the merge/return reads R via R_RETURN. This is what lets a
+   branchy function avoid leaving the value on the stack — the key coordinated
+   emit change.
+3. **`R_STR_CONCAT2` d, a, b** — fib's `+`. Synchronous like R_PRIMOP2 (force
+   both slots, 2-int fast path else general concat, write d). Messy (string
+   coercion/context, byte-identity-critical).
+4. **`R_CALL` dst, callee_slot, arg_slot** — the crux (fib's recursion, async).
+   Read callee+arg from slots; set up the callee frame; on return write the
+   result to caller slot `dst` by REUSING the A8 force-writeback (the caller
+   frame already supports "write the returned value to a slot offset" —
+   `setForceWriteback`), with a non-re-entrant variant (don't re-scan after).
+   This is the calling-convention change; the writeback machinery already
+   exists, which is what makes it tractable rather than a full rewrite.
+5. **`R_GET_UPVALUE_REC_BINDING` → slot** (fib resolves `fib`) and **`R_FORCE`
+   slot** (force in place) — the remaining fib-body ops.
+
+When 1–5 land, fib's `func "n"` emits entirely register-form ops → executes
+with the operand stack dropped → the v3-beats-TW compute target. Order:
+3 + 1 (tractable, synchronous/branch) → 2 (the coordinated If emit) → 4/5
+(the calling-convention crux).
+
 ## Phases (each lands `--core` 19/19 byte-identical + IR-checks + r1 cache)
 
 - **Phase 1 — `OP_R_CALL_PRIMOP` (register-addressed primop call).** The
