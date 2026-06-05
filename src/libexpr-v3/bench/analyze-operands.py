@@ -230,6 +230,42 @@ def c1_const_spill(funcs):
     return n, saveable, by_litop, rows
 
 
+# Lever 1A residual (WALL_OPTIMIZATION_PLAN §4 Phase 1A): generalises C1 from
+# literal sources to ANY single-use spill.  A slot written EXACTLY once
+# (plain SET_LOCAL, not KEEP) and read EXACTLY once is a single-use
+# intermediate the emitter spilled-and-reloaded — the #542 defer mechanism +
+# SET_LOCAL_KEEP already elide the cases where the GET is the adjacent next
+# op (D2 == 0), so what this counts is the RESIDUAL the defer pass missed
+# (flushed across an intervening op / branch / block boundary).  Each is a
+# SET+GET pair (2 ops) a stack-scheduler could remove.  Reports the residual
+# as a fraction of total SET_LOCAL+GET_LOCAL — the Lever-1A headroom for the
+# pre-committed >=10% gate.
+def c2_single_use_spill(funcs):
+    cand = 0
+    set_get_total = 0
+    adjacent = 0          # SET n immediately followed by GET n (defer/KEEP should have caught)
+    for fn in funcs:
+        writes = Counter()
+        reads = Counter()
+        keep = Counter()
+        for ins in fn.insns:
+            if ins.op == "OP_SET_LOCAL":
+                writes[ins.operand] += 1; set_get_total += 1
+            elif ins.op == "OP_SET_LOCAL_KEEP":
+                keep[ins.operand] += 1; set_get_total += 1
+            elif ins.op in ("OP_GET_LOCAL", "OP_GET_LOCAL_FORCE"):
+                reads[ins.operand] += 1; set_get_total += 1
+        for a, b in zip(fn.insns, fn.insns[1:]):
+            if a.op == "OP_SET_LOCAL":
+                s = a.operand
+                if writes[s] == 1 and keep[s] == 0 and reads[s] == 1:
+                    cand += 1
+                    if b.op in ("OP_GET_LOCAL", "OP_GET_LOCAL_FORCE") \
+                       and b.operand == s:
+                        adjacent += 1
+    return cand, set_get_total, adjacent
+
+
 # ============================ S-series ====================================
 def s1_single_reference(funcs, refs):
     """Non-top-level functions created at exactly one MAKE_CLOSURE/THUNK
@@ -425,6 +461,17 @@ def main():
         for cnt, fn in crows[:args.top]:
             print(f"  {f'{fn.cu}/{fn.fid}':<10}{(fn.name or '<anon>'):<22}"
                   f"{cnt:>13}")
+
+    # ---- C2: Lever 1A residual single-use spill -----------------------
+    c2cand, c2sg, c2adj = c2_single_use_spill(funcs)
+    print("\n## C2  single-use spill residual  (write-once+read-once SET_LOCAL; "
+          "Lever 1A headroom)")
+    print(f"  {c2cand} single-use spills → {2*c2cand} SET+GET ops removable")
+    if c2sg:
+        print(f"  total SET_LOCAL+GET_LOCAL(+KEEP/FORCE) = {c2sg}; removable "
+              f"pairs = {100.0*2*c2cand/c2sg:.1f}% of that traffic (STATIC).")
+    print(f"  of those, {c2adj} have an ADJACENT GET (defer/KEEP gap); "
+          f"{c2cand-c2adj} are non-adjacent (the genuine scheduler target).")
 
     # ---- S-series -----------------------------------------------------
     single = s1_single_reference(funcs, refs)

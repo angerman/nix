@@ -116,6 +116,25 @@ phases, **measuring between each** — stop when wall returns drop below the
 memory track's slope.
 
 ### Phase 1A — Stack-oriented lowering for single-use intermediates *(do first)*
+
+> **MEASURED 2026-06-05 — Phase 1A is ALREADY SUBSTANTIALLY SHIPPED (the #542
+> defer mechanism), and the residual is Phase-1C territory.** The emit-time
+> stack scheduler this phase describes already exists in `emit.cc` (#542
+> `pendingDefer`): it keeps single-use (OnceLinear) values on the operand
+> stack and the SET_LOCAL_KEEP peephole fuses adjacent `SET;GET`. Verified on
+> hello.drvPath (production): stack-motion (`SET_LOCAL`+`GET_LOCAL`+`KEEP`)
+> defer-ON **3.80M** vs `NIX_V3_NO_DEFER=1` **4.55M** → defer already removes
+> **−16.5%**; the adjacent `SET_LOCAL n; GET_LOCAL n` count (`analyze-operands.py`
+> D2) is **0** — fully elided. The C2 detector finds **82.2% of static SET/GET
+> are write-once+read-once single-use**, but **154,828 are NON-adjacent**: the
+> consumer isn't the next op, so the value is *buried* on the stack and must
+> spill. Keeping those on the stack requires **reordering** (blocked by Nix's
+> strict force order) or **register allocation** — i.e. **Phase 1C**, not an
+> incremental scheduler. Per this phase's own kill criterion, the
+> incremental-1A-beyond-defer headroom is below threshold → **go to 1B-lite**
+> (and 1C is the structural endgame for the non-adjacent residual). `C2`
+> detector added to `analyze-operands.py`.
+
 **Idea.** A subexpression whose value is used exactly once, by an instruction
 that consumes it from the top of the operand stack with nothing clobbering the
 stack in between, does not need a slot — leave it on the stack. This removes
