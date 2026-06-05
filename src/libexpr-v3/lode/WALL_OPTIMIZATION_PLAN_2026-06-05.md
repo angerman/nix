@@ -285,6 +285,30 @@ deltas there first; they may move the GC decision.
 
 ## 7. Recommended sequence + decision gates
 
+> **EXECUTED 2026-06-05 — all in-scope wall levers landed; the decision point
+> routes to memory, NOT the register VM.**
+> 1. **Lever 2 — DONE.** DAG `let` demotion (`2d752453c`) + independent
+>    formals demotion (`885752d2d`). Real-corpus (hello): REC_BINDING −40%,
+>    ATTRS_REC_SET −27%, **attrsets −13.5%**; net dispatch −3.45% (just under
+>    the ≥4% guideline, kept on the −13.5% memory-churn win). `--core` 19/19.
+> 2. **Lever 1A — MEASURED ALREADY-SHIPPED (`2b84410da`).** The #542 defer
+>    mechanism IS this phase's stack scheduler (−16.5% stack-motion already;
+>    D2 adjacent SET;GET = 0). The non-adjacent single-use residual (154K) is
+>    register-allocation territory = Phase 1C, not an incremental scheduler.
+> 3. **Lever 1B-lite — DONE (`89d770b66`).** `OP_GET_LOCAL2` fuses adjacent
+>    `GET_LOCAL;GET_LOCAL`. hello `GET_LOCAL` 22.22%→10.63% (**−55%**, 625K
+>    pairs), ~−5.6% total dispatch; fib27 −7.7%. `--core` 19/19 (incl. cache
+>    round-trip). The biggest dispatch cut of any lever — yet **wall-neutral**.
+> 4. **DECISION POINT → Lever 3 (memory).** All three contained levers are
+>    **wall-neutral on real workloads** (fib30 1.01×; hello overhead-
+>    dominated): a dispatch cut of a *cheap* op (GET/SET) saves loop overhead
+>    but keeps the value-copy, so wall doesn't move — the QUANTIFICATION's
+>    thesis confirmed. **1A+1B plateaued at the floor AND memory (4.4–5.3×;
+>    hello 765 MB = 520 MB arena + 403 MB Boehm) is the bigger gap** — BOTH
+>    of §4's anti-1C conditions hold, so the **register VM (1C) stays GATED
+>    (do NOT start)**. The slope is **memory (Lever 3 / `EXIT_GC_SPIRAL_PLAN`)**
+>    — a separate track. The WALL plan's actionable wall work is COMPLETE.
+
 1. **Lever 2 first** (DAG `let`/formals demotion) — ~1 wk, contained, clear
    9.2% target, and it de-risks/feeds Lever 1 (fewer slots & thunks). Gate:
    ≥4% dynamic dispatch drop + byte-identical.
