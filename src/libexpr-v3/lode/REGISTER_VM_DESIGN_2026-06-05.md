@@ -28,6 +28,34 @@ writeback to the arg's slot offset, rewind to the op, `goto op_force_slow`;
 on re-entry the slot holds the forced value and the op re-scans. The HOT path
 (args already WHNF — the common case after strictness) touches no stack.
 
+## Phase 1 RESULT (2026-06-05) + the real-code ceiling
+
+`OP_R_PRIMOP2` (binary primop, fixed-arity-2 — the dominant case) is LANDED
+(`1010108ee` + relaxed `0f99dce3a`), `--core` 19/19 byte-identical (incl. r1
+cache). fib's three binary primops are register-addressed
+(`__lessThan r1=r0,#2`, `__sub r4=r0,#1`, `__sub r8=r0,#2`); **fib27 total
+dispatch −22.2%** (11.44M→8.90M, CALL_PRIMOP 1.27M→0). Wall is noise-bound on
+this host but user-CPU is directionally lower.
+
+**Real-code finding (load-bearing for the remaining phases).** R_PRIMOP2
+fires **~0 on hello** (real nixpkgs): binary-primop operands there are almost
+always **deferred** — the #542 mechanism keeps OnceLinear values on the
+operand stack and consumes them via fast paths, so they are NOT in slots, and
+register-addressing (slot reads) does not apply. The register-form synchronous
+ops (R_PRIMOP2, and R_STR_CONCAT etc. to follow) therefore help **slotted**
+operands (params / Many-use) — fib/compute's pattern — but the real-nixpkgs
+operand mix is defer-resident, so per-op register forms are largely a
+fib/compute win. **The real-code prize is structural: Phase 4 (a register
+allocator that slots everything and supersedes the stack/defer model) + Phase
+5 (drop the operand stack)** — not the op-by-op hybrid. Until then the
+register layer compounds on compute-heavy / fib-like evals (the v3-beats-TW
+target there), and is dormant-but-correct on real nixpkgs.
+
+`OP_CALL` is the next big fib lever (14.3% post-Phase-1) but is **async** (the
+callee runs in a new frame; the result returns via OP_RETURN), so a register
+form must thread the dst slot through the return — a calling-convention change
+(part of Phase 3/4), unlike the synchronous R_PRIMOP2.
+
 ## Phases (each lands `--core` 19/19 byte-identical + IR-checks + r1 cache)
 
 - **Phase 1 — `OP_R_CALL_PRIMOP` (register-addressed primop call).** The
