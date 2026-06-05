@@ -11,16 +11,21 @@
 
 (x: x * 2) 21
 
-# Pre-opt: the unfolded App-of-Lambda + the body's Mul are present.
+# Pre-opt: the unfolded App-of-Lambda + the body's `*` are present.
+# NOTE (2026-06-05): operator `*` lowers to an App-chain over a
+# LitPrimOp("__mul"), NOT an ir::Mul node (the lowerer never builds Mul/Add/…
+# for operator syntax); fusePrimOpApps only later collapses it to a
+# PrimOpCall, so the RAW (pre-opt) form shows LitPrimOp + Apps.
 # RAW-LABEL: B1:
 # RAW: v{{[0-9]+}} = Lambda f1
 # RAW: v{{[0-9]+}} = LitInt 21
 # RAW: v{{[0-9]+}} = App
 # RAW: B2:
-# RAW: v{{[0-9]+}} = Mul
+# RAW: v{{[0-9]+}} = LitPrimOp "__mul"
 
-# Post-opt: B1 just produces the folded LitInt 42 — no App, no Mul,
-# no Lambda binding in the entry block.
+# Post-opt: B1 just produces the folded LitInt 42 — no Lambda, no App
+# (the partial-app __mul residue is swept by the under-applied-App DCE),
+# no Mul.  21*2 folds via primOpFold's arithmetic rule.
 # OPT-LABEL: B1:
 # OPT-NOT: Lambda
 # OPT-NOT: App

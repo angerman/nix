@@ -48,7 +48,9 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/primop.hh"
 
+#include <unordered_map>
 #include <unordered_set>
 
 namespace nix::v3::ir {
@@ -122,10 +124,50 @@ void collectModuleRefs(const Module & m, std::unordered_set<VarId> & refs)
 // Public entry: deadBindingElim
 // ---------------------------------------------------------------------------
 
+// Pre-identify UNDER-APPLIED primop applications: a 1-arg `App` whose
+// callee resolves to a `LitPrimOp` of arity > 1 is a partial application — a
+// pure PrimOpApp VALUE with no force/effect — so it is safe to DCE when dead.
+// This sweeps the partial-App residue fusePrimOpApps leaves behind on every
+// fused primop call (e.g. `(x: x*2) 21` folds to LitInt 42 but the inlined
+// `App(__mul, 21)` lingers).  We compute the set ONCE (structural property,
+// stable across DCE rounds) so the move-compaction loop below can consult it
+// without re-resolving defs through moved-from slots.
+static void collectUnderAppliedPrimOpApps(const Module & m,
+                                          std::unordered_set<VarId> & out)
+{
+    for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
+        const Block & b = m.blocks[bid];
+        std::unordered_map<VarId, const Expr *> defs;
+        defs.reserve(b.bindings.size());
+        for (const auto & bd : b.bindings) defs.emplace(bd.var, &bd.expr);
+        for (const auto & bd : b.bindings) {
+            const App * a = std::get_if<App>(&bd.expr);
+            if (!a) continue;
+            // Resolve the callee through VarRef aliases.
+            const Expr * fe = nullptr;
+            if (auto it = defs.find(a->fun); it != defs.end()) fe = it->second;
+            while (fe) {
+                const VarRef * vr = std::get_if<VarRef>(fe);
+                if (!vr) break;
+                auto it = defs.find(vr->var);
+                fe = it != defs.end() ? it->second : nullptr;
+            }
+            if (!fe) continue;
+            // A 1-arg App of a multi-arg primop is under-applied → pure value.
+            if (const LitPrimOp * lp = std::get_if<LitPrimOp>(fe))
+                if (lp->primop && lp->primop->arity > 1)
+                    out.insert(bd.var);
+        }
+    }
+}
+
 size_t deadBindingElim(Module & m)
 {
     std::unordered_set<VarId> refs;
     collectModuleRefs(m, refs);
+
+    std::unordered_set<VarId> underAppliedApps;
+    collectUnderAppliedPrimOpApps(m, underAppliedApps);
 
     // Iterate to a fixed point: removing one binding can make its
     // RHS-referenced VarIds no longer used elsewhere.  In practice
@@ -141,7 +183,9 @@ size_t deadBindingElim(Module & m)
             auto src = b.bindings.begin();
             auto dst = b.bindings.begin();
             for (; src != b.bindings.end(); ++src) {
-                if (refs.find(src->var) == refs.end() && exprIsPure(src->expr)) {
+                if (refs.find(src->var) == refs.end()
+                    && (exprIsPure(src->expr)
+                        || underAppliedApps.count(src->var))) {
                     ++removed;
                     continue; // skip -- erase by not copying
                 }

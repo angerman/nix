@@ -16,17 +16,24 @@
 
 let z = "hi"; in z
 
+# NOTE (2026-06-05): non-recursive `let` no longer lowers via a rec-attrset
+# (RecBindingSlotRef) — the letrec-demote optimisation (cd1da2577) binds the
+# value as a plain MkThunk and lowers the body in a non-rec scope.  The shape
+# this fixture verifies is unchanged (binding source + VarRef hop chain + one
+# Force, collapsing to a single Force after opt); only the source node is now
+# MkThunk instead of RecBindingSlotRef.
+#
 # RAW form — every variable hop produces a VarRef + Force pair, even
 # when the source is already a known literal in scope.
-# RAW: v{{[0-9]+}} = RecBindingSlotRef v{{[0-9]+}} "z"
+# RAW: v{{[0-9]+}} = MkThunk f{{[0-9]+}}
 # RAW: v{{[0-9]+}} = VarRef v{{[0-9]+}}
 # RAW: v{{[0-9]+}} = VarRef v{{[0-9]+}}
 # RAW: v{{[0-9]+}} = Force v{{[0-9]+}}
 
 # OPT form — the VarRef chain collapses; only one Force remains on
-# the RecBindingSlotRef directly.
+# the binding source directly.
 # OPT-LABEL: B1:
-# OPT: v{{[0-9]+}} = RecBindingSlotRef v{{[0-9]+}} "z"
+# OPT: v{{[0-9]+}} = MkThunk f{{[0-9]+}}
 # OPT-NEXT: v{{[0-9]+}} = Force v{{[0-9]+}}
 # OPT-NEXT: return v{{[0-9]+}}
 # OPT-NOT: VarRef

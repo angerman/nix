@@ -1,10 +1,18 @@
-# RUN: v3-eval --file %s --emit-ir | v3-check %s
+# RUN: NIX_V3_NO_EVAL_APPLY=1 v3-eval --file %s --emit-ir | v3-check %s
 #
 # Phase A negative fixture: betaReduce MUST NOT fire when the
 # lambda's body itself contains a nested Lambda or MkThunk binding.
 # Inlining such a body into the call site would either duplicate
 # captured-state machinery or break sharing of the inner
 # lambda/thunk's closure.
+#
+# NOTE (2026-06-05): this fixture's scenario is the CURRIED lowering
+# (`x:` returns a nested `y:` Lambda).  Since eval/apply is default-on,
+# curried lambdas are COLLAPSED into one arity-N Function at lowering, so
+# `(x: y: x + y)` would have no nested Lambda f2.  We run with
+# NIX_V3_NO_EVAL_APPLY=1 to exercise the curried form this negative case is
+# about — betaReduce's refusal to inline a nested-Lambda body.  (The
+# collapsed form is covered by the appSpineFold fixtures.)
 #
 # Plan reference: IR_OPTIMIZATION_PLAN_2026-05-18.md §2.5 + §9 #3
 # ("negative fixtures are harder than positive ones... per-pass
