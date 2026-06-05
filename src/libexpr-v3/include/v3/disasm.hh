@@ -27,14 +27,21 @@ uint32_t disassembleWindow(
     uint32_t endIp);
 
 /// Disassemble a single instruction at `ip`.  Returns the ip after
-/// (advances past data words).  Self-contained: resolves the operand
-/// against `cu` (literals→values, primops→names, MAKE_*→func names,
-/// attr ops→symbols, branches→`-> Lk`, OP_POS→file:line:col).  Useful
-/// for cycle-trace + crash-context integration.
+/// (advances past data words).  Resolves the operand against `cu`
+/// (literals→values, primops→names, MAKE_*→func names, attr ops→symbols,
+/// branches→`-> Lk`, OP_POS→file:line:col).  Useful for cycle-trace +
+/// crash-context integration.
+///
+/// `recInitIp` (optional) is the ip of the OP_ATTRS_REC_INIT governing an
+/// OP_ATTRS_REC_SET, so the set's sorted-rank operand can be resolved to
+/// the attr name.  disassembleModule supplies it (it tracks the current
+/// init per function); standalone callers leave it unset (UINT32_MAX) and
+/// REC_SET stays bare.  Resolution is bounds-guarded — never a wrong name.
 uint32_t disassembleOne(
     std::FILE * out,
     const CompilationUnit & cu,
-    uint32_t ip);
+    uint32_t ip,
+    uint32_t recInitIp = UINT32_MAX);
 
 /// Disassemble a WHOLE compilation unit, framed per function:
 ///   ; module functions=N code=M entry=E

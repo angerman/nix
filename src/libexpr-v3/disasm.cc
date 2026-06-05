@@ -203,7 +203,8 @@ void printStrLit(std::FILE * out, const std::string & s, char q)
 
 uint32_t disassembleOne(std::FILE * out,
                         const CompilationUnit & cu,
-                        uint32_t ip)
+                        uint32_t ip,
+                        uint32_t recInitIp)
 {
     if (ip >= cu.code.size()) {
         std::fprintf(out, "  [%u] <out-of-range>\n", ip);
@@ -334,6 +335,23 @@ uint32_t disassembleOne(std::FILE * out,
         }
         std::fprintf(out, "}");
         break;
+    case OP_ATTRS_REC_SET:
+        // operand = sorted rank into the governing REC_INIT's symbol list
+        // (emit.cc: symRank[i]); the init's trailer is SymbolId-sorted, so
+        // the symbol at rank r is data[2*r].  disassembleModule supplies the
+        // governing init's ip (`recInitIp`) — per-function and sequential,
+        // because nested attrsets are deferred to thunk functions, so an
+        // init is never interleaved with another init's REC_SETs in the same
+        // function.  Bounds-guarded: if recInitIp is unset (e.g. standalone
+        // disassembleOne / windowed view) or the rank is out of range, the
+        // operand stays bare rather than risk a wrong name.
+        if (recInitIp != UINT32_MAX && recInitIp < cu.code.size()) {
+            uint32_t nInit = decodeOperand(cu.code[recInitIp]);
+            uint32_t symPos = recInitIp + 1 + 2 * operand;
+            if (operand < nInit && symPos < cu.code.size())
+                std::fprintf(out, "   ; %s", symName(cu.code[symPos]));
+        }
+        break;
     case OP_JUMP:
     case OP_BRANCH_FALSE:
     case OP_BRANCH_TRUE:
@@ -418,9 +436,19 @@ void disassembleModule(std::FILE * out, const CompilationUnit & cu)
             ld.name.empty() ? "" : "\"",
             (unsigned)ld.arity, (unsigned)ld.nUpvalues, (unsigned)ld.nLocals,
             start, fid == 0 ? "  (top-level)" : "");
+        // Track the governing REC_INIT for this function's REC_SETs.  Reset
+        // per function; updated on each (let-)rec-init.  Sequential within a
+        // function (nested attrsets are thunked into other functions), so a
+        // single "most recent init" is the correct context for the REC_SETs
+        // that follow it.
+        uint32_t curRecInit = UINT32_MAX;
         for (uint32_t ip = start; ip < end && ip < cu.code.size();) {
             if (isTarget[ip]) std::fprintf(out, "L%u:\n", ip);
-            ip = disassembleOne(out, cu, ip);
+            Op op = decodeOp(cu.code[ip]);
+            if (op == OP_ATTRS_REC_INIT || op == OP_ATTRS_LET_REC_INIT
+                || op == OP_ATTRS_REC_INIT_TAIL)
+                curRecInit = ip;
+            ip = disassembleOne(out, cu, ip, curRecInit);
         }
     }
 }
