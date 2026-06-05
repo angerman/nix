@@ -943,6 +943,100 @@ struct LowererV3 {
                     scopes.pop_back();
                     return addBinding(ir::VarRef{rv});
                 }
+
+                // #2 DAG demotion (NEXT_STEPS §2/§3, QUANTIFICATION #2): the
+                // group references siblings, but if the dependency graph is
+                // ACYCLIC the rec-attrset is still unnecessary — topologically
+                // order the entries and RE-LOWER each `value` in a plain scope
+                // that accumulates the already-demoted deps, so a sibling ref
+                // resolves to that dep's plain thunk (VarRef → GET_LOCAL /
+                // upvalue) instead of REC_BINDING_SLOT_REF.  The original
+                // recScope-lowered thunk functions (fids[]) are left orphaned
+                // (they carry RBSR{recVar}); they are unreachable and cleared
+                // by deadFunctionElim before compile.  Lazy thunks closing
+                // over earlier-in-topo-order thunks are acyclic by
+                // construction — no blackhole / rec slot needed.  Measured
+                // ~70% of recursive lets are acyclic-DAG (V3_DBG_LETREC_CLASS).
+                // Gate: NIX_V3_NO_DAG_DEMOTE=1 (A/B bisect, default-ON).
+                static const bool noDagDemote =
+                    std::getenv("NIX_V3_NO_DAG_DEMOTE") != nullptr;
+                if (!noDagDemote) {
+                    const size_t n = bs.size();
+                    // sibling name → entry index
+                    std::unordered_map<ir::SymbolId, size_t> nameIdx;
+                    for (size_t i = 0; i < n; ++i)
+                        nameIdx[m.internSymbol(bs[i]->name)] = i;
+                    // per-entry sibling deps (incl. self-ref, which forces a
+                    // cycle below) from RecBindingSlotRef{recVar, name}.
+                    std::vector<std::vector<size_t>> deps(n);
+                    for (size_t i = 0; i < n; ++i) {
+                        ir::BlockId lo = entryBlkStart[i];
+                        ir::BlockId hi = (i + 1 < n)
+                            ? entryBlkStart[i + 1]
+                            : static_cast<ir::BlockId>(m.blocks.size());
+                        for (ir::BlockId b = lo; b < hi; ++b)
+                            for (auto & bd : m.blocks[b].bindings) {
+                                auto * sr =
+                                    std::get_if<ir::RecBindingSlotRef>(&bd.expr);
+                                if (sr && sr->attrs == recVar) {
+                                    auto it = nameIdx.find(sr->name);
+                                    if (it != nameIdx.end())
+                                        deps[i].push_back(it->second);
+                                }
+                            }
+                    }
+                    // Kahn topological order (deps before dependents); a cycle
+                    // (incl. self-dep) leaves some node with remaining > 0.
+                    std::vector<size_t> remaining(n);
+                    std::vector<std::vector<size_t>> rev(n);
+                    for (size_t i = 0; i < n; ++i) {
+                        std::sort(deps[i].begin(), deps[i].end());
+                        deps[i].erase(
+                            std::unique(deps[i].begin(), deps[i].end()),
+                            deps[i].end());
+                        remaining[i] = deps[i].size();
+                        for (size_t j : deps[i])
+                            if (j != i) rev[j].push_back(i);
+                    }
+                    std::vector<size_t> order;
+                    order.reserve(n);
+                    std::vector<size_t> q;
+                    for (size_t i = 0; i < n; ++i)
+                        if (remaining[i] == 0) q.push_back(i);
+                    while (!q.empty()) {
+                        size_t u = q.back(); q.pop_back();
+                        order.push_back(u);
+                        for (size_t w : rev[u])
+                            if (--remaining[w] == 0) q.push_back(w);
+                    }
+                    if (order.size() == n) {  // acyclic → demote
+                        std::vector<ir::VarId> lws = collectLexicalWiths();
+                        Scope plainScope;
+                        for (size_t k = 0; k < n; ++k) {
+                            size_t i = order[k];
+                            m.functions.emplace_back();
+                            ir::FuncId fid =
+                                static_cast<ir::FuncId>(m.functions.size() - 1);
+                            ir::BlockId eb = m.freshBlock();
+                            m.functions[fid].entryBlock = eb;
+                            m.functions[fid].name = bs[i]->name;
+                            m.functions[fid].nWithTargets =
+                                static_cast<uint16_t>(lws.size());
+                            blockStack.push_back(eb);
+                            scopes.push_back(plainScope);  // deps so far
+                            setReturn(lowerExpr(bs[i]->value));
+                            scopes.pop_back();
+                            blockStack.pop_back();
+                            ir::VarId vid =
+                                addBinding(ir::MkThunk{fid, /*freeVars*/ {}, lws});
+                            plainScope.byName[bs[i]->name] = vid;
+                        }
+                        scopes.push_back(std::move(plainScope));
+                        ir::VarId rv = lowerExpr(body);
+                        scopes.pop_back();
+                        return addBinding(ir::VarRef{rv});
+                    }
+                }
             }
         }
 
