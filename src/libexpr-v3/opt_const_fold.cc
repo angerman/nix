@@ -370,6 +370,12 @@ void optimise(Module & m)
     if (!checkPhase()) return;
     if (appSpineFold(m)) {
         OPT_RUN(elimRedundantForce(m));
+        // primOpFold folds the literal arithmetic the inlined body exposes
+        // (`(x: y: x*y) 6 7` → `__mul [6,7]` → `LitInt 42`).  The historical
+        // cleanup relied on constantFold here, but operator syntax lowers to
+        // PrimOpCall("__mul"/…) — which constantFold's ir::Mul matcher never
+        // sees — so the fold lives in primOpFold (opt_primop_fold.cc).
+        OPT_RUN(primOpFold(m));
         OPT_RUN(constantFold(m));
         OPT_RUN(inlineTrivialBindings(m));
     }

@@ -195,6 +195,38 @@ walkCurriedChain(const Module & m, FuncId startFid, size_t needDepth)
 }
 
 // ---------------------------------------------------------------------------
+// eval/apply collapsed-arity-N variant: when the curried chain `x: y: …`
+// has been collapsed by the lowerer into ONE Function carrying paramVar +
+// extraParams (NIX_V3_EVAL_APPLY, default-on), there are no nested Lambda
+// bodies to walk — the single Function's entry block IS the deepest body and
+// its N params are [paramVar, extraParams...].  Build the equivalent N-link
+// chain (all links share the one funcIdx / body block) so the saturated-call
+// fold below applies unchanged.  Returns nullopt unless the Function is a
+// collapsed arity-N lambda whose param count matches the spine depth.
+// ---------------------------------------------------------------------------
+
+std::optional<std::vector<CurriedLink>>
+walkCollapsedChain(const Module & m, FuncId fid, size_t needDepth)
+{
+    if (fid == 0 || fid >= m.functions.size()) return std::nullopt;
+    const Function & f = m.functions[fid];
+    if (f.argName == kInvalidSymbol)              return std::nullopt;
+    if (f.hasFormals)                             return std::nullopt;
+    if (f.intrinsicKind != 0)                     return std::nullopt;
+    if (f.extraParams.empty())                    return std::nullopt;  // not collapsed
+    if (1 + f.extraParams.size() != needDepth)    return std::nullopt;  // arity ≠ spine
+    if (f.entryBlock == kInvalidBlock
+        || f.entryBlock >= m.blocks.size())       return std::nullopt;
+
+    std::vector<CurriedLink> chain;
+    chain.reserve(needDepth);
+    chain.push_back({ f.paramVar, fid, f.entryBlock });   // arg 0 → paramVar
+    for (VarId ep : f.extraParams)                        // args 1..N-1 → extraParams
+        chain.push_back({ ep, fid, f.entryBlock });
+    return chain;
+}
+
+// ---------------------------------------------------------------------------
 // Purity of args — same shortlist Phase A's per-arg substitution
 // safety check would consult.  Pure args can be substituted multiple
 // times into the body without changing semantics (their evaluation
@@ -489,8 +521,12 @@ size_t appSpineFold(Module & m)
             }
 
             // Walk the curried chain N deep.  Returns nullopt if
-            // the chain isn't N-deep curried form.
+            // the chain isn't N-deep curried form — then try the
+            // eval/apply collapsed-arity-N form (one Function, paramVar +
+            // extraParams) before giving up.
             auto chain = walkCurriedChain(m, leafLam->funcIdx, N);
+            if (!chain)
+                chain = walkCollapsedChain(m, leafLam->funcIdx, N);
             if (!chain) {
                 out.push_back(std::move(bd));
                 continue;

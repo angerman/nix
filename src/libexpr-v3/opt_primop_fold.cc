@@ -43,8 +43,10 @@
 #include "v3/primop.hh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -111,6 +113,12 @@ const LitInt * asLitInt(VarId v, const std::unordered_map<VarId, const Expr *> &
     return e ? std::get_if<LitInt>(e) : nullptr;
 }
 
+const LitFloat * asLitFloat(VarId v, const std::unordered_map<VarId, const Expr *> & defs)
+{
+    const Expr * e = arg(v, defs);
+    return e ? std::get_if<LitFloat>(e) : nullptr;
+}
+
 const LitString * asLitString(VarId v, const std::unordered_map<VarId, const Expr *> & defs)
 {
     const Expr * e = arg(v, defs);
@@ -149,6 +157,64 @@ std::optional<Expr> tryFoldPrimOpCall(
 {
     if (!call.primop) return std::nullopt;
     std::string_view name = call.primop->name;
+
+    // ----- arithmetic / comparison over constant operands -----
+    // `2 * 3`, `i + 1`, `n < m`, … lower to PrimOpCall("__mul"/"__add"/
+    // "__lessThan"/…) — NOT to the ir::Add/Mul/Less nodes (which the
+    // lowerer never constructs; constantFold's matchers for them are dead
+    // for operator syntax).  Fold the primop form here when BOTH operands
+    // are literal numbers, mirroring opt_const_fold.cc's foldNumeric /
+    // foldLess semantics + guards EXACTLY:
+    //   - integer +/-/* that OVERFLOW are not folded (runtime wraps/errs);
+    //   - integer / by 0 and INT64_MIN / -1 are not folded (runtime throws);
+    //   - float / by 0 is not folded (#683 — TW throws);
+    //   - NaN comparisons are not folded (TW throws on float <).
+    // Non-constant operands leave the PrimOpCall intact for the runtime.
+    if ((name == "__add" || name == "__sub" || name == "__mul"
+         || name == "__div" || name == "__lessThan")
+        && call.args.size() == 2) {
+        const auto * ai = asLitInt(call.args[0], defs);
+        const auto * bi = asLitInt(call.args[1], defs);
+        const auto * af = asLitFloat(call.args[0], defs);
+        const auto * bf = asLitFloat(call.args[1], defs);
+        const bool aNum = ai || af, bNum = bi || bf;
+        if (!aNum || !bNum) return std::nullopt;
+        const bool bothInt = ai && bi;
+        const double da = ai ? static_cast<double>(ai->value) : af->value;
+        const double db = bi ? static_cast<double>(bi->value) : bf->value;
+        if (name == "__lessThan") {
+            if (bothInt) return LitBool{ai->value < bi->value};
+            if (std::isnan(da) || std::isnan(db)) return std::nullopt;
+            return LitBool{da < db};
+        }
+        if (name == "__add") {
+            if (bothInt) { int64_t r;
+                if (__builtin_add_overflow(ai->value, bi->value, &r)) return std::nullopt;
+                return LitInt{r}; }
+            return LitFloat{da + db};
+        }
+        if (name == "__sub") {
+            if (bothInt) { int64_t r;
+                if (__builtin_sub_overflow(ai->value, bi->value, &r)) return std::nullopt;
+                return LitInt{r}; }
+            return LitFloat{da - db};
+        }
+        if (name == "__mul") {
+            if (bothInt) { int64_t r;
+                if (__builtin_mul_overflow(ai->value, bi->value, &r)) return std::nullopt;
+                return LitInt{r}; }
+            return LitFloat{da * db};
+        }
+        // __div
+        if (bothInt) {
+            if (bi->value == 0) return std::nullopt;
+            if (ai->value == std::numeric_limits<int64_t>::min() && bi->value == -1)
+                return std::nullopt;
+            return LitInt{ai->value / bi->value};
+        }
+        if (db == 0.0) return std::nullopt;
+        return LitFloat{da / db};
+    }
 
     // ----- length -----
     if (name == "length" || name == "__length") {
