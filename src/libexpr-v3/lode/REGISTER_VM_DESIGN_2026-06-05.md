@@ -56,6 +56,33 @@ callee runs in a new frame; the result returns via OP_RETURN), so a register
 form must thread the dst slot through the return — a calling-convention change
 (part of Phase 3/4), unlike the synchronous R_PRIMOP2.
 
+## Continuation ROI (assessed 2026-06-05) — why Phase 1 is the validated stop
+
+After Phase 1, every incremental step was assessed; all are multi-week (the
+real prize) or low-ROI in-session:
+- **More synchronous register ops** (R_STR_CONCAT for fib's `+`, R_PRIMOP1,
+  n-ary R_CALL_PRIMOP): fib-specific (defer-resident on real code per the
+  finding), wall unmeasurable on this host, and STR_CONCAT in particular is
+  messy (int-fast-path + string-coercion + context + result-to-slot, all
+  byte-identity-critical) for ~3.6% of fib dispatch. Low ROI.
+- **Phase 4 (slot-reuse allocator):** shrinks `nLocals`, but frames live on
+  the `valueStack` (depth × nLocals × 16 B) — **tiny vs the 520 MB arena**, so
+  the memory benefit is negligible; and it is correctness-critical (reuse a
+  live slot ⇒ silent corruption) + must interact with defer/R_PRIMOP2/upvalue.
+  Negligible ROI.
+- **Phase 3 async R_CALL / Phase 5 drop-stack:** the genuine real-code prize,
+  but a **multi-week structural rewrite** (calling-convention change /
+  full-register emit+dispatch + the allocator). Cannot be landed
+  incrementally `--core`-green in-session.
+
+**Verdict:** Phase 1 (R_PRIMOP2) is the validated foundational milestone — the
+register VM technique implemented, working, measured (−22.2% fib dispatch),
+byte-identical. The full register VM (real-code wall payoff) is a deliberate
+multi-week Phase-5 investment, and the fib-specificity finding above is the
+measure-twice input for whether to make it. Resume here (Phase 5, per-function
+register-mode hybrid for incremental validation) when that investment is
+authorized.
+
 ## Phases (each lands `--core` 19/19 byte-identical + IR-checks + r1 cache)
 
 - **Phase 1 — `OP_R_CALL_PRIMOP` (register-addressed primop call).** The
