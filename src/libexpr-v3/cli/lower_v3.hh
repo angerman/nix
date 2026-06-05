@@ -395,7 +395,22 @@ struct LowererV3 {
                 if (const v3::PrimOp * po = primopOfRecentBinding(f);
                     po && po->name == "seq") {
                     forceVal(lowerExpr(c->args[0]));     // force a (seq's effect)
-                    return thunkifyForAttr(c->args[1]);  // return b, still lazy
+                    // Return b, still lazy.  thunkifyForAttr wraps non-trivial
+                    // b in a MkThunk to defer it — but an APPLICATION lowers to
+                    // an `ir::App` value, which is ALREADY WHNF-deferred (it is
+                    // not evaluated until forced).  Wrapping that App in a thunk
+                    // is pure redundancy, and when the seq sits in tail position
+                    // (e.g. `go = i: acc: … seq next (go (i+1) next)`, the strict
+                    // recursive-loop idiom) the thunk is allocated then force-
+                    // driven immediately — one MkThunk + one Force per iteration
+                    // of every bytecode fold/loop.  Lowering b inline lets emit
+                    // tail-call the returned App instead (and strictArgs can then
+                    // unthunk the call's args).  Only Calls are lazy-by-construc-
+                    // tion this way; everything else (arithmetic BinOps, If, …)
+                    // lowers eagerly and still needs the deferring thunk.
+                    if (c->args[1]->kind == a::Kind::Call)
+                        return lowerExpr(c->args[1]);    // App is already lazy
+                    return thunkifyForAttr(c->args[1]);  // defer eager exprs
                 }
             }
             for (auto * arg : c->args)
