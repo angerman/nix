@@ -31,16 +31,35 @@ types**). GHC is the canonical optimizer for a lazy functional language, so its
 | **ADT/`case`-exploiting** (case-of-case, SpecConstr, CPR, liberate-case) | **Mostly N/A** — Nix's only "constructor" is the attrset; dispatch is thin (`if`/select/`?`). |
 | **Backend** (Cmm, register allocation, instruction selection) | **Low value** — v3 is an *interpreter*; its analog (register-VM/superinstructions) is capped by the ~1.5–2× interpreter ceiling (architecture review). Focus on Core-level. |
 
-**THE correction that reshapes everything (verified in `value.hh`):** GHC's biggest
-wins come from **two** mechanisms — (a) *thunk-elimination* (demand → strict args
-need no thunk) and (b) *unboxing* (types → `Int#` in registers, CPR returns unboxed).
-**v3 already stores scalars inline in its 16-byte tagged `Value`** (`mkInt` writes
-`payload.i`; no heap box). So **(b) does not apply to v3** — there is no boxing of
-ints/floats/bools to remove, CPR is a non-issue, and "unbox the accumulator" is
-already true. **v3 inherits GHC's *thunk-elimination* win and not its *unboxing*
-win.** This single fact re-prioritizes the whole list: the value of demand analysis
-+ worker/wrapper for v3 is *killing `MkThunk` allocations*, full stop — not the
-register-unboxing that motivates half of GHC's machinery.
+**The scalar-representation nuance (verified in `value.hh` + `vm.cc`; corrected
+2026-06-05 after team pushback — an earlier draft overstated this).** GHC's wins come
+from three mechanisms: (a) *thunk-elimination* (demand → strict args need no thunk),
+(b) *scalar register-unboxing* (`Int`→`Int#`: raw machine words in registers, no tag,
+no per-op dispatch), and (c) *data unboxing* (unboxed fields/arrays). For v3:
+
+- **(a) transfers** — and is the big one (the fold bottleneck is `MkThunk`s).
+- **(b) splits.** v3 stores scalars *inline* in the 16-byte tagged `Value` (`mkInt`
+  writes `payload.i`), so there is **no heap `I#` box to remove** — GHC's *specific*
+  heap-indirection-removal is moot. **BUT v3 still pays the tag-box overhead `Int#`
+  eliminates:** even the *optimized* `OP_ADD` hot path (`vm.cc`) tag-checks both
+  operands, guards overflow, and `mkInt`s a tagged result, and every scalar occupies a
+  16-byte tagged slot (2× a raw `int64`). **So v3 genuinely DOES lack a real form of
+  unboxing** — operating on raw, untagged machine scalars with no per-op
+  tag-dispatch/materialize. The team is right; "(b) does not apply" was wrong.
+- **(c)** a homogeneous scalar list is 16 B/elem (Values) vs an unboxed 8 B/elem array.
+
+**Two honest qualifications on the v3 unboxing gap (b):** (i) an *interpreter* can only
+*partially* capture it — flow-typed unboxed local slots + specialized `OP_*_I64`
+opcodes remove the tag-check / overflow-guard / materialize / 16-vs-8-byte cost, but
+**not** the per-op bytecode dispatch (you can't hold a raw int in a machine register
+*across* opcodes the way native code does); (ii) its **real-world value for Nix is
+low** — nixpkgs is attrset/string/derivation-heavy, *not* numeric. The fold-add
+microbench over-weights arithmetic, and even there the team measured `+` as *minor* vs
+the thunks/loop. **Net: a genuine GHC advantage v3 lacks, capturable partially, but
+low-priority for Nix's workload — the right conclusion, for the right reason (Nix isn't
+numeric), not the wrong one ("already unboxed").** v3's *demand-analysis* payoff
+remains primarily thunk-elimination; the *unboxing* gap (b) is a separate, low-ROI
+lever gated on flow-typing (§2.5).
 
 ---
 
@@ -72,7 +91,8 @@ fixpoint simplifier:
 | ✗ | — | **SpecConstr / call-pattern spec** | absent |
 | ✗ | — | **RULES rewrite framework** | only the one hand-coded fusion |
 | ✗ | — | **GVN** (cross-block CSE) | block-local only |
-| n/a | — | CPR / unboxing | **N/A — scalars already inline (§0)** |
+| ✗ | — | **scalar register-unboxing** (`Int#`) | real gap (per-op tag-check/overflow/materialize), but **low-ROI for Nix** (non-numeric); partial-only in an interpreter (§0/§3.1) |
+| n/a | — | CPR (unboxed *product* return) | N/A — no ADTs/tuples |
 
 Scalars inline; attrsets are sorted key/value arrays with 4-way AttrSelect ICs.
 
@@ -137,7 +157,8 @@ attr-select** (skip the binary search when the shape is known); and **arity** (f
 (laziness) — so flow-typing is most effective AFTER/with demand analysis (2.1). It is
 **partial and opportunistic** (infer where provable, fall back to the polymorphic
 primop otherwise) and **sound-only** (a wrong inference → wrong opcode → corruption).
-Note: v3 does NOT need it for unboxing — scalars are already inline (§0).* *Fit: high —
+Note: flow-typing is also the **prerequisite** for the partial scalar-unboxing lever
+(§0(b)) — typed `OP_*_I64` slots need a proof that the value is always int/float.* *Fit: high —
 it's the prerequisite enabler for opcode-lowering + monomorphic dispatch.*
 
 **2.6 Let-floating — Float-IN first.**
@@ -167,7 +188,7 @@ cost**. Lower priority — pursue only if 2.1/2.2/2.5 leave a measured gap.
 | GHC pass | Verdict for Nix |
 |---|---|
 | Case-of-case / case-of-known-con | Thin — dispatch is `if`/select/`?` (v3 has `ifFold`). **But:** Nix encodes sum types as `{ type = "…"; … }` attrsets, so **attrset-shape analysis (2.5) is the Nix analog of constructor analysis** — `attrs.type == "x"` branches could become case-of-known-shape. The one place ADT-style opts re-enter, via shape. |
-| **CPR / unboxing** | **N/A — scalars already inline (§0).** No boxed `Int` to deconstruct. |
+| CPR (unboxed *product* return) | N/A — no ADTs/tuples. (NB: *scalar* register-unboxing is NOT N/A — it's a real gap, just low-ROI for non-numeric Nix; see §0/§3.1.) |
 | Liberate-case | Niche (unroll to expose constructors); little to expose in Nix. |
 | Type-class specialization, unarisation (unboxed tuples) | N/A — no classes, no unboxed tuples. |
 
@@ -186,9 +207,13 @@ cost**. Lower priority — pursue only if 2.1/2.2/2.5 leave a measured gap.
 
 ## 3. Critical nuances (the part to not get wrong)
 
-1. **v3 gets thunk-elimination, not unboxing (§0).** Verified: scalars are inline in
-   the `Value`. So frame demand/w-w as `MkThunk`-killers; **drop the "unbox the
-   accumulator"/CPR line entirely** — it's already inline, there's nothing to unbox.
+1. **Separate the two scalar wins (§0; corrected after team pushback).** From
+   demand/w-w, v3 gets **thunk-elimination** (`MkThunk`-killing) — *that's* the
+   recursion-loop win. SEPARATELY, v3 *does* lack **scalar register-unboxing**: no heap
+   `I#` box (scalars are inline), but it still pays per-op tag-check + overflow-guard +
+   tagged-`Value` materialization (`OP_ADD`), which `Int#` removes. Real, capturable
+   only partially in an interpreter (typed `OP_*_I64` slots), **low-ROI for Nix**
+   (non-numeric workload). CPR (unboxed *product* return) is genuinely N/A — no ADTs.
 2. **"Biggest" depends on the axis.** Demand + worker/wrapper is the biggest **wall**
    pass (thunk-elim drives the fold bottleneck); **shape-sharing** is the biggest
    **memory** pass (no GHC analog). Don't conflate them — and recall the bench says
@@ -207,9 +232,12 @@ cost**. Lower priority — pursue only if 2.1/2.2/2.5 leave a measured gap.
    type-spec can all force/inline/specialize something not demanded → non-termination or
    early `throw` (the `CALLPACKAGE_BUG` class). Every one needs per-pass gating +
    byte-identical drvPath + `--core`, per [[measure-twice-cut-once]].
-7. **Don't import GHC's *backend* rationale.** Worker/wrapper, CPR, unarisation are
-   half-motivated by native unboxing/registers, which an interpreter with inline-scalar
-   tagged Values doesn't have. Keep only their *allocation* (thunk) payoff.
+7. **Discount (don't ignore) GHC's *backend* rationale.** Worker/wrapper, CPR,
+   unarisation are *half*-motivated by native register-unboxing. An interpreter captures
+   the *allocation/thunk* half fully and the *tag-unboxing* half only partially (typed
+   `OP_*_I64` slots remove the tag-check/materialize, not the per-op dispatch), and that
+   half is low-ROI for non-numeric Nix (§0). So: take the thunk payoff as the main win,
+   treat scalar tag-unboxing as a real-but-minor follow-on, and drop CPR (no ADTs).
 
 ---
 
