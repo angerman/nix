@@ -591,6 +591,11 @@ struct LowererV3 {
         lr.recVar = formalsRec;
         lr.hasBody = true;
         lr.entries.reserve(fs.size());
+        // Lever 2 (WALL_OPTIMIZATION_PLAN §5 step 3): block range covering the
+        // formal thunks, so we can scan for inter-formal references (a default
+        // that reads a sibling formal → RecBindingSlotRef{formalsRec}) and
+        // demote the INDEPENDENT case below.
+        ir::BlockId formalsBlkStart = static_cast<ir::BlockId>(m.blocks.size());
         for (auto * f : fs) {
             ir::SymbolId sym = m.internSymbol(f->name);
             m.functions.emplace_back();
@@ -628,6 +633,57 @@ struct LowererV3 {
             m.functions[tfid].nWithTargets = static_cast<uint16_t>(en.lexicalWiths.size());
             lr.entries.push_back(std::move(en));
         }
+
+        // Lever 2 — formals demotion (WALL_OPTIMIZATION_PLAN §5).  EVERY
+        // function with formals otherwise builds a synthetic rec-attrset
+        // (ATTRS_LET_REC_INIT + a thunk per formal + a REC_BINDING_SLOT_REF
+        // per formal use), but Nix formals only need knot-tying when a
+        // DEFAULT references a sibling formal (`{ a, b ? a + 1 }`).  The
+        // common case — no default, or a default closed over outer scope
+        // (`{ a, b ? 5 }`, `{ pkgs ? import <nixpkgs> {} }`) — is fully
+        // INDEPENDENT: each formal thunk reads only `param` (the attrset arg),
+        // never `formalsRec`.  Those thunks are reused as plain ordered locals
+        // (no rec-attrset; formal uses in the body become VarRef → GET_LOCAL/
+        // upvalue), exactly like the non-recursive `let` demotion.  Only a
+        // sibling-referencing default keeps the LetRec (the acyclic-DAG case
+        // is handled by the let path's pattern; formals rarely hit it).
+        // Gate: NIX_V3_NO_FORMALS_DEMOTE=1 (A/B bisect, default-ON).
+        static const bool noFormalsDemote =
+            std::getenv("NIX_V3_NO_FORMALS_DEMOTE") != nullptr;
+        bool formalsReferencing = false;
+        if (!noFormalsDemote) {
+            ir::BlockId formalsEnd = static_cast<ir::BlockId>(m.blocks.size());
+            for (ir::BlockId b = formalsBlkStart;
+                 b < formalsEnd && !formalsReferencing; ++b)
+                for (auto & bd : m.blocks[b].bindings) {
+                    auto * sr = std::get_if<ir::RecBindingSlotRef>(&bd.expr);
+                    if (sr && sr->attrs == formalsRec) {
+                        formalsReferencing = true;
+                        break;
+                    }
+                }
+        }
+        if (!noFormalsDemote && !formalsReferencing) {
+            // Independent formals → plain ordered locals (reuse the thunks).
+            Scope plainScope;
+            if (!lam->arg.empty()) plainScope.byName.emplace(lam->arg, param);
+            for (size_t k = 0; k < fs.size(); ++k)
+                plainScope.byName[fs[k]->name] =
+                    addBinding(ir::MkThunk{lr.entries[k].thunkBody,
+                                           /*freeVars*/ {},
+                                           lr.entries[k].lexicalWiths});
+            // formalsRec was reserved (recVarIds) but is now unused — leave it;
+            // emit/computeFreeVars tolerate an unreferenced rec var.
+            scopes.push_back(std::move(plainScope));
+            setReturn(lowerExpr(lam->body));
+            scopes.pop_back();
+            blockStack.pop_back();
+
+            std::vector<ir::VarId> lws = collectLexicalWiths();
+            m.functions[fid].nWithTargets = static_cast<uint16_t>(lws.size());
+            return addBinding(ir::Lambda{fid, /*freeVars*/ {}, std::move(lws)});
+        }
+
         m.blocks[blockStack.back()].bindings.push_back({formalsRec, std::move(lr)});
 
         // Body in the rec scope (formals resolve via the rec attrset).
