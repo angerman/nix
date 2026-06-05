@@ -487,11 +487,83 @@ struct Emitter
         const size_t nBd = b.bindings.size();
         bool tailLast = nBd > 0 && b.bindings.back().var == ret.value;
 
+        // --- App-spine coalescing (eval/apply call-site, lever B) --------
+        // Recognise maximal application spines App(App(…App(base,a0)…),
+        // a_{n-1}) whose intermediate Apps are OnceLinear (their PAP result
+        // is used ONLY by the next App in the spine) and emit ONE saturated
+        // OP_CALL_N(n) instead of n curried OP_CALLs — eliminating one PAP
+        // (Tag::App) pair per inner application, the dominant per-iteration
+        // allocation in every bytecode fold/loop.  Inner nodes are skipped;
+        // the head binding emits the whole spine via emitVarRef (base then
+        // args), which OP_CALL_N pops in order.  NIX_V3_NO_CALL_N=1 disables
+        // it (bisect handle; retire once shipped byte-identical on --core +
+        // a nixpkgs sample across ≥10 runs).
+        static const bool s_noCallN = std::getenv("NIX_V3_NO_CALL_N") != nullptr;
+        std::unordered_map<ir::VarId, const ir::App *> appOf;
+        std::unordered_set<ir::VarId> spineInner;
+        std::unordered_map<ir::VarId,
+            std::pair<ir::VarId, std::vector<ir::VarId>>> spineHead;
+        if (!s_noCallN) {
+            for (auto & bd : b.bindings)
+                if (auto * a = std::get_if<ir::App>(&bd.expr))
+                    appOf.emplace(bd.var, a);
+            // v is an inner spine node iff it is an App binding that is
+            // OnceLinear (single use) — that single use being as some App's
+            // .fun is what makes it part of a spine; we confirm the fun-use
+            // by only ever reaching it while walking down from a head.
+            auto innerApp = [&](ir::VarId v) -> bool {
+                auto it = appOf.find(v);
+                return it != appOf.end()
+                    && occ.lookup(v).kind == ir::OccKind::OnceLinear;
+            };
+            for (auto & bd : b.bindings) {
+                auto * a = std::get_if<ir::App>(&bd.expr);
+                if (!a) continue;
+                // A coalescable HEAD is an App whose .fun is itself an inner
+                // App node (so the spine has ≥ 2 args).  A head that is ALSO
+                // some longer spine's inner node is subsumed: it is reached
+                // (and recorded in spineInner) while walking the outer head,
+                // so by the time the loop emits it we skip it.
+                if (!innerApp(a->fun)) continue;
+                std::vector<ir::VarId> revArgs;
+                std::vector<ir::VarId> walkedInner;
+                const ir::App * cur = a;
+                ir::VarId base = ir::kInvalid;
+                while (true) {
+                    revArgs.push_back(cur->arg);
+                    ir::VarId f = cur->fun;
+                    if (innerApp(f)) {
+                        walkedInner.push_back(f);
+                        cur = appOf[f];
+                    } else { base = f; break; }
+                }
+                // Cap at the runtime argbuf (16); skip pathological spines.
+                if (revArgs.size() < 2 || revArgs.size() > 16) continue;
+                std::vector<ir::VarId> args(revArgs.rbegin(), revArgs.rend());
+                spineHead.emplace(bd.var,
+                    std::make_pair(base, std::move(args)));
+                for (ir::VarId iv : walkedInner) spineInner.insert(iv);
+            }
+        }
+
         for (size_t i = 0; i < nBd; ++i) {
             auto & bd = b.bindings[i];
             bool isTail = tailLast && (i + 1 == nBd);
 
-            emitExpr(bd.expr);
+            // Subsumed inner spine node: the owning head emits it.  (An inner
+            // node is OnceLinear and never the block's tail, so skipping it
+            // affects neither slots nor the return value.)
+            if (spineInner.count(bd.var)) continue;
+
+            if (auto sh = spineHead.find(bd.var); sh != spineHead.end()) {
+                emitVarRef(sh->second.first);                  // base
+                for (ir::VarId av : sh->second.second)         // a0..a_{n-1}
+                    emitVarRef(av);
+                unit.code.push_back(encode(OP_CALL_N,
+                    static_cast<uint32_t>(sh->second.second.size())));
+            } else {
+                emitExpr(bd.expr);
+            }
 
             if (isTail) {
                 // #542: AFTER tail's emit, pending may still contain
@@ -1653,22 +1725,29 @@ struct Emitter
         //     emit).
         if (fid != 0 && unit.code.size() > codeStart) {
             uint32_t codeEnd = static_cast<uint32_t>(unit.code.size());
-            // Case (a): last instruction is OP_CALL.
+            // Case (a): last instruction is OP_CALL / OP_CALL_N.  For
+            // OP_CALL_N the arg-count operand must be preserved.
             if (decodeOp(unit.code.back()) == OP_CALL)
                 unit.code.back() = encode(OP_TAIL_CALL);
-            // Cases (b) + (c): walk function body for OP_CALL
+            else if (decodeOp(unit.code.back()) == OP_CALL_N)
+                unit.code.back() = encode(OP_TAIL_CALL_N,
+                                          decodeOperand(unit.code.back()));
+            // Cases (b) + (c): walk function body for OP_CALL / OP_CALL_N
             // followed by OP_JUMP-to-codeEnd.  OP_JUMP encodes its
             // absolute 24-bit target in the operand (see vm.cc
             // OP_JUMP dispatch: `ip = operand`).  When the target
             // equals codeEnd (the slot the OP_RETURN we're about to
-            // emit will occupy), the OP_CALL is in tail position.
+            // emit will occupy), the call is in tail position.
             for (uint32_t ip = codeStart; ip + 1 < unit.code.size(); ++ip) {
-                if (decodeOp(unit.code[ip]) != OP_CALL) continue;
+                Op cop = decodeOp(unit.code[ip]);
+                if (cop != OP_CALL && cop != OP_CALL_N) continue;
                 uint32_t nip = ip + 1;
                 if (decodeOp(unit.code[nip]) != OP_JUMP) continue;
                 uint32_t target = decodeOperand(unit.code[nip]);
                 if (target == codeEnd)
-                    unit.code[ip] = encode(OP_TAIL_CALL);
+                    unit.code[ip] = cop == OP_CALL
+                        ? encode(OP_TAIL_CALL)
+                        : encode(OP_TAIL_CALL_N, decodeOperand(unit.code[ip]));
             }
         }
         unit.code.push_back(encode(fid == 0 ? OP_HALT : OP_RETURN));

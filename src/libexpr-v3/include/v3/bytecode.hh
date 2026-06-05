@@ -127,6 +127,22 @@ enum Op : uint8_t
     /// hello.drvPath (warm+cold), +2.4% on dispatch-heavy compute.
     OP_SET_LOCAL_KEEP = 0x58,  // [slot:24]   store top into slot, keep on stack
 
+    /// eval/apply call-SITE optimization (lever B, 2026-06-05): saturated
+    /// multi-arg call.  [n:24] = arg count (2..16).  Stack: fun then a0..a_{n-1}
+    /// (a_{n-1} on top).  Pops n args + fun.  When fun is a closure of arity
+    /// == n, enters the body with the n args in slots 0..n-1 DIRECTLY — no
+    /// intermediate PAP (Tag::App) pair per partial application.  For any
+    /// other shape (under/over-arity, PAP, primop, __functor, non-closure) it
+    /// falls back to applying the args one at a time (callClosure), so it is
+    /// always semantically identical to n curried OP_CALLs.  Emitted by the
+    /// App-spine coalescer in emit.cc for spines of >= 2 args whose inner
+    /// applications are OnceLinear.
+    OP_CALL_N         = 0x59,  // [n:24]   saturated n-arg call (skip PAPs)
+    /// Tail variant of OP_CALL_N: reuses the current frame when saturated
+    /// (O(1) tail recursion, no PAP), else falls back to building the value
+    /// and returning it.  See OP_TAIL_CALL.
+    OP_TAIL_CALL_N    = 0x5a,  // [n:24]   saturated n-arg tail call
+
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list
     OP_LIST_CONCAT    = 0x61,  // pop b, pop a, push a ++ b

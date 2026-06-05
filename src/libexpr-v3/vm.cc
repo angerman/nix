@@ -5989,6 +5989,121 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // stackBase unchanged.
             break;
         }
+        case OP_CALL_N: {
+            // eval/apply call-SITE optimization (lever B): saturated n-arg
+            // call.  Stack: fun then a0..a_{n-1} (a_{n-1} on top).  When fun
+            // is a bare closure of arity == n, enter its body with the n args
+            // in slots 0..n-1 DIRECTLY — no intermediate PAP (Tag::App) pair
+            // per partial application (the dominant per-iteration allocation
+            // in every bytecode fold/loop).  Any other shape (thunk/slot/PAP
+            // fun, under/over-arity, primop, __functor, non-closure) falls
+            // back to applying the args one at a time via callClosure, which
+            // is byte-for-byte identical to n curried OP_CALLs.
+            vm.tailCallCount = 0;
+            const uint32_t n = operand;
+            Value argbuf[16];
+            for (uint32_t i = n; i > 0; --i) argbuf[i - 1] = pop(vm);
+            Value fun = pop(vm);
+            // Resolve a Slot/Thunk fun to WHNF so the fast path sees the
+            // closure (e.g. `go` via REC_BINDING_SLOT_REF is a Tag::Slot;
+            // a recursive callee may be a Thunk).  A Tag::App PAP is left for
+            // the fallback, which accumulates it correctly via callClosure.
+            if (fun.tag() == Tag::Slot || fun.tag() == Tag::Thunk)
+                fun = forceValue(vm, fun);
+            if (fun.tag() == Tag::Closure && fun.payload.closure
+                && fun.payload.closure->desc
+                && fun.payload.closure->desc->arity == n) {
+                const Closure * c = fun.payload.closure;
+                const LambdaDescriptor * d = c->desc;
+                if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
+                    throw std::runtime_error(
+                        "v3 OP_CALL_N: stack overflow; call depth exceeded "
+                        + std::to_string(kMaxCallDepth));
+                vm.frames.back().ip = ip;
+                size_t newBase = vm.valueStack.size();
+                vm.valueStack.resize(newBase + d->nLocals);
+                for (uint32_t i = 0; i < n; ++i)
+                    vm.valueStack[newBase + i] = argbuf[i];
+                uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+                const CompilationUnit * calleeCu = c->cu ? c->cu : cu;
+                vm.frames.push_back(CallFrame{
+                    .cu = calleeCu,
+                    .closure = c,
+                    .thunk = nullptr,
+                    .ip = d->codeOffset,
+                    .stackBaseOffset = static_cast<uint32_t>(newBase),
+                    .withStackBase = newWithBase,
+                    .flags = 0,
+                });
+                pushCapturedWiths(vm, c->capturedWiths);
+                ip = d->codeOffset;
+                cu = calleeCu;
+                closure = c;
+                stackBase = newBase;
+                break;
+            }
+            // Fallback: n curried applications (callClosure resolves thunk/
+            // slot/PAP/primop/functor fun and builds PAPs for under-arity).
+            Value f = fun;
+            for (uint32_t i = 0; i < n; ++i)
+                f = callClosure(vm, f, argbuf[i]);
+            push(vm, f);
+            break;
+        }
+        case OP_TAIL_CALL_N: {
+            // Tail variant of OP_CALL_N: a saturated arity-n closure REUSES
+            // the current frame (O(1) tail recursion + no PAP) — mirrors
+            // OP_TAIL_CALL's in-place retarget.  Non-saturated shapes build
+            // the value via callClosure and fall through to the trailing
+            // OP_RETURN the coalescer/peephole left after this op.
+            constexpr size_t kMaxTailCallsN = 10'000'000;
+            if (__builtin_expect(++vm.tailCallCount >= kMaxTailCallsN, 0)) {
+                vm.tailCallCount = 0;
+                throw std::runtime_error("v3 OP_TAIL_CALL_N: tail-call iteration limit exceeded "
+                                          + std::to_string(kMaxTailCallsN)
+                                          + " (likely infinite recursion)");
+            }
+            const uint32_t n = operand;
+            Value argbuf[16];
+            for (uint32_t i = n; i > 0; --i) argbuf[i - 1] = pop(vm);
+            Value fun = pop(vm);
+            // Resolve Slot/Thunk fun to WHNF (see OP_CALL_N) — critical here:
+            // the recursive tail callee (`go`) is a Tag::Slot, and without
+            // this the fast frame-reuse path is missed, so the fallback's
+            // C-recursive callClosure grows the frame stack and overflows on
+            // deep tail recursion (the whole point of the tail variant).
+            if (fun.tag() == Tag::Slot || fun.tag() == Tag::Thunk)
+                fun = forceValue(vm, fun);
+            if (fun.tag() == Tag::Closure && fun.payload.closure
+                && fun.payload.closure->desc
+                && fun.payload.closure->desc->arity == n) {
+                const Closure * c = fun.payload.closure;
+                const LambdaDescriptor * d = c->desc;
+                const CompilationUnit * baseCu = c->cu ? c->cu : cu;
+                vm.valueStack.resize(stackBase + d->nLocals);
+                for (uint32_t i = 0; i < n; ++i)
+                    vm.valueStack[stackBase + i] = argbuf[i];
+                CallFrame & cur = vm.frames.back();
+                cur.cu = baseCu;
+                cur.closure = c;
+                cur.ip = d->codeOffset;
+                if (vm.withStack.size() > cur.withStackBase)
+                    vm.withStack.resize(cur.withStackBase);
+                cur.withStackBase = static_cast<uint32_t>(vm.withStack.size());
+                pushCapturedWiths(vm, c->capturedWiths);
+                ip = d->codeOffset;
+                cu = baseCu;
+                closure = c;
+                break;
+            }
+            // Non-saturated: build the value, push it, fall through to the
+            // trailing OP_RETURN (which returns it to our caller).
+            Value f = fun;
+            for (uint32_t i = 0; i < n; ++i)
+                f = callClosure(vm, f, argbuf[i]);
+            push(vm, f);
+            break;
+        }
         case OP_RETURN: {
             // #787 (2026-05-23) per-phase breakdown for #786 OPCYCLES
             // OP_RETURN-dominates finding.  Gated by env var; three
