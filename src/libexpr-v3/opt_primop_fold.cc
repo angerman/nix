@@ -119,6 +119,46 @@ const LitFloat * asLitFloat(VarId v, const std::unordered_map<VarId, const Expr 
     return e ? std::get_if<LitFloat>(e) : nullptr;
 }
 
+// Resolve `v` through same-block VarRefs AND through a trivial MkThunk — a
+// no-param thunk whose body block just returns a value — to the underlying
+// Expr in the thunk's body.  The lowerer wraps lazy primop args in thunks, so
+// `length [1 2 3]` / `2 * <thunk:6>` present their operand as MkThunk; this
+// lets value-reading folds see the constant inside.
+//
+// READ-ONLY CONTRACT: the returned Expr may live in the THUNK's body block,
+// so callers MUST only read VALUES from it (a list's element COUNT, a literal
+// payload) — they must NOT escape a body-local VarId into the outer block
+// (which would dangle).  So this is used for length + arithmetic folds, but
+// NOT for head/tail/elemAt (which return a body VarId).
+const Expr * argThroughThunk(VarId v,
+                             const std::unordered_map<VarId, const Expr *> & defs,
+                             const Module & m)
+{
+    const Expr * e = chaseInBlock(v, defs);
+    if (!e) return nullptr;
+    const MkThunk * th = std::get_if<MkThunk>(e);
+    if (!th) return e;
+    if (th->funcIdx == 0 || th->funcIdx >= m.functions.size()) return e;
+    const Function & f = m.functions[th->funcIdx];
+    if (f.argName != kInvalidSymbol || f.hasFormals || f.intrinsicKind != 0) return e;
+    if (f.entryBlock == kInvalidBlock || f.entryBlock >= m.blocks.size()) return e;
+    const Block & body = m.blocks[f.entryBlock];
+    const auto * term = std::get_if<TermReturn>(&body.terminal);
+    if (!term) return e;
+    std::unordered_map<VarId, const Expr *> bdefs;
+    bdefs.reserve(body.bindings.size());
+    for (const auto & bd : body.bindings) bdefs.emplace(bd.var, &bd.expr);
+    const Expr * inner = chaseInBlock(term->value, bdefs);
+    return inner ? inner : e;
+}
+
+const ListExpr * asListExprT(VarId v, const std::unordered_map<VarId, const Expr *> & defs, const Module & m)
+{ const Expr * e = argThroughThunk(v, defs, m); return e ? std::get_if<ListExpr>(e) : nullptr; }
+const LitInt * asLitIntT(VarId v, const std::unordered_map<VarId, const Expr *> & defs, const Module & m)
+{ const Expr * e = argThroughThunk(v, defs, m); return e ? std::get_if<LitInt>(e) : nullptr; }
+const LitFloat * asLitFloatT(VarId v, const std::unordered_map<VarId, const Expr *> & defs, const Module & m)
+{ const Expr * e = argThroughThunk(v, defs, m); return e ? std::get_if<LitFloat>(e) : nullptr; }
+
 const LitString * asLitString(VarId v, const std::unordered_map<VarId, const Expr *> & defs)
 {
     const Expr * e = arg(v, defs);
@@ -173,10 +213,10 @@ std::optional<Expr> tryFoldPrimOpCall(
     if ((name == "__add" || name == "__sub" || name == "__mul"
          || name == "__div" || name == "__lessThan")
         && call.args.size() == 2) {
-        const auto * ai = asLitInt(call.args[0], defs);
-        const auto * bi = asLitInt(call.args[1], defs);
-        const auto * af = asLitFloat(call.args[0], defs);
-        const auto * bf = asLitFloat(call.args[1], defs);
+        const auto * ai = asLitIntT(call.args[0], defs, m);
+        const auto * bi = asLitIntT(call.args[1], defs, m);
+        const auto * af = asLitFloatT(call.args[0], defs, m);
+        const auto * bf = asLitFloatT(call.args[1], defs, m);
         const bool aNum = ai || af, bNum = bi || bf;
         if (!aNum || !bNum) return std::nullopt;
         const bool bothInt = ai && bi;
@@ -219,7 +259,10 @@ std::optional<Expr> tryFoldPrimOpCall(
     // ----- length -----
     if (name == "length" || name == "__length") {
         if (call.args.size() != 1) return std::nullopt;
-        if (const auto * lst = asListExpr(call.args[0], defs))
+        // asListExprT sees through the lazy thunk the lowerer wraps a list
+        // literal arg in (`length [1 2 3]`); reading the element COUNT is
+        // safe even though the ListExpr lives in the thunk's body block.
+        if (const auto * lst = asListExprT(call.args[0], defs, m))
             return LitInt{static_cast<int64_t>(lst->elems.size())};
         // Recursive: length(a ++ b) = length(a) + length(b), each
         // foldable.  Walk a single layer.
