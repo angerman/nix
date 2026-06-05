@@ -133,6 +133,12 @@ struct Emitter
     std::vector<uint32_t>        fuseGetPositions_;
     std::vector<uint32_t>        jumpInsnPositions_;
     std::unordered_set<uint32_t> jumpTargetPositions_;
+    // Lever 1B-lite robustness: every OP_GET_LOCAL emit position, so the
+    // GET_LOCAL2 fusion in compactFuseSetGet pairs ONLY real adjacent
+    // GET_LOCAL instructions — never a multi-word op's follow-up word that
+    // happens to decode to OP_GET_LOCAL (R_PRIMOP2's dst/descAB, CALL_PRIMOP's
+    // poIdx, …).  Reset per function alongside fuseGetPositions_.
+    std::vector<uint32_t>        getLocalPositions_;
 
     // §2(a) constant rematerialization (NEXT_STEPS_2026-06-05).  A-normal-
     // form lowering names every literal operand, so the emitter would spill
@@ -332,6 +338,7 @@ struct Emitter
             fuseGetPositions_.push_back(
                 static_cast<uint32_t>(unit.code.size()));
         }
+        getLocalPositions_.push_back(static_cast<uint32_t>(unit.code.size()));
         unit.code.push_back(encode(OP_GET_LOCAL, slot));
     }
 
@@ -1776,29 +1783,33 @@ struct Emitter
             keepInvolved.insert(getPos);
         }
 
-        // (B) GET_LOCAL a; GET_LOCAL b → OP_GET_LOCAL2.  Scan left-to-right,
-        // advancing past a consumed pair so triples (`GL GL GL`) fuse the
-        // first pair only.  Skip pairs overlapping an (A) site.
-        if (!s_noGet2 && unit.code.size() > codeStart + 1) {
-            for (uint32_t pos = codeStart + 1;
-                 pos < static_cast<uint32_t>(unit.code.size()); ) {
-                if (jumpTargetPositions_.count(pos)
-                    || keepInvolved.count(pos) || keepInvolved.count(pos - 1)) {
-                    ++pos; continue;
-                }
-                Instruction a = unit.code[pos - 1];
-                Instruction b = unit.code[pos];
-                if (decodeOp(a) == OP_GET_LOCAL && decodeOp(b) == OP_GET_LOCAL) {
-                    uint32_t sa = decodeOperand(a), sb = decodeOperand(b);
-                    if (sa < 4096 && sb < 4096) {
-                        unit.code[pos - 1] =
-                            encode(OP_GET_LOCAL2, (sa << 12) | sb);
-                        rem.push_back(pos);
-                        pos += 2;  // skip the consumed pair
-                        continue;
-                    }
-                }
-                ++pos;
+        // (B) GET_LOCAL a; GET_LOCAL b → OP_GET_LOCAL2.  Drive off the RECORDED
+        // GET_LOCAL emit positions (getLocalPositions_) — never decoding raw
+        // words — so a multi-word op's follow-up word that happens to decode to
+        // OP_GET_LOCAL is never mis-fused.  A pair is two recorded positions p,
+        // p+1 (consecutive, since GET_LOCAL is one word); fuse the first of each
+        // pair and skip the second (so `GL GL GL` fuses one pair).  The second
+        // (removed) GET must not be a jump target; neither may overlap an (A)
+        // site.
+        if (!s_noGet2 && getLocalPositions_.size() >= 2) {
+            std::unordered_set<uint32_t> getSet(getLocalPositions_.begin(),
+                                                getLocalPositions_.end());
+            std::vector<uint32_t> gp(getLocalPositions_.begin(),
+                                     getLocalPositions_.end());
+            std::sort(gp.begin(), gp.end());
+            uint32_t prevFused = UINT32_MAX;
+            for (uint32_t p : gp) {
+                uint32_t q = p + 1;
+                if (p == prevFused) continue;          // p was a consumed second
+                if (!getSet.count(q)) continue;        // q not an adjacent GET
+                if (jumpTargetPositions_.count(q)) continue;
+                if (keepInvolved.count(p) || keepInvolved.count(q)) continue;
+                uint32_t sa = decodeOperand(unit.code[p]);
+                uint32_t sb = decodeOperand(unit.code[q]);
+                if (sa >= 4096 || sb >= 4096) continue;
+                unit.code[p] = encode(OP_GET_LOCAL2, (sa << 12) | sb);
+                rem.push_back(q);
+                prevFused = q;                          // don't start a pair at q
             }
         }
 
@@ -1892,6 +1903,7 @@ struct Emitter
 
         // Step-2 fusion: reset per-function bookkeeping.
         fuseGetPositions_.clear();
+        getLocalPositions_.clear();
         jumpInsnPositions_.clear();
         jumpTargetPositions_.clear();
 
