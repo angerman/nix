@@ -1,8 +1,11 @@
-# RUN: v3-eval --file %s --emit-ir | v3-check %s
+# RUN: NIX_V3_STREAM_FUSION=1 v3-eval --file %s --emit-ir | v3-check %s
 #
 # Phase C / opt_stream_fusion: `foldl' op nul (map f xs)` rewrites to
 # the fused `__foldlMap` primop dispatched as an App-chain over
-# LitPrimOp.  Confirms:
+# LitPrimOp.  NOTE: stream fusion is DEFAULT-OFF since 2026-06-05 (it was
+# measured a net regression — the C-built genList spine beats the bytecode
+# loop; see opt_stream_fusion.cc registry).  This fixture opts in via
+# NIX_V3_STREAM_FUSION=1 to exercise the retained MECHANISM.  Confirms:
 #   1. `LitPrimOp "__foldlMap"` appears in the post-opt IR.
 #   2. It's followed by exactly 4 Apps (op, init, f, xs).
 #   3. The original `LitPrimOp "foldl'"` is NOT present (rewritten away).

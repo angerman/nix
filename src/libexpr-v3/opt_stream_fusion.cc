@@ -39,7 +39,10 @@
 /// a recursive walk and additional cases for `concatMap` /
 /// `filter`).  Phase C+ extensions can be added incrementally.
 ///
-/// Gate: NIX_V3_NO_STREAM_FUSION=1 disables for A/B measurement.
+/// Gate: DEFAULT-OFF (2026-06-05) — bytecode fusion measured a net regression
+/// even post-go-loop-fix; set NIX_V3_STREAM_FUSION=1 to enable for A/B.  The
+/// pass is retained as a documented registry of falsified candidates + the
+/// mechanism for a future paying rule.  See the registry in streamFusion().
 ///
 /// Pipeline placement: AFTER fusePrimOpApps (so we see canonical
 /// PrimOpCall shapes for both `map` and `foldl'`).  Runs alongside
@@ -332,9 +335,19 @@ UseCounter countModuleUses(const Module & m)
 
 size_t streamFusion(Module & m)
 {
-    static const bool s_disabled =
-        std::getenv("NIX_V3_NO_STREAM_FUSION") != nullptr;
-    if (s_disabled) return 0;
+    // FUSION IS OPT-IN / DEFAULT-OFF (2026-06-05).  Bytecode stream fusion was
+    // measured a NET REGRESSION even AFTER the go-loop optimizations (levers A
+    // + B: seq-tail-app 09b13c3d8 + OP_CALL_N 6a081f6c6): every intermediate-
+    // eliminating rewrite costs MORE than the cheap C-built genList spine it
+    // removes (the bytecode generate-and-consume loop can't beat a contiguous
+    // C array that's GC-reclaimed incrementally — see the registry below).
+    // The table-driven MECHANISM is retained as a documented registry of what
+    // was tried + an A/B handle: set NIX_V3_STREAM_FUSION=1 to enable kRules.
+    // Retirement: flip back to default-on only when a rule MEASURES a win
+    // (wall AND peak-RSS) on --core + a nixpkgs sample across >=10 runs.
+    static const bool s_enabled =
+        std::getenv("NIX_V3_STREAM_FUSION") != nullptr;
+    if (!s_enabled) return 0;
 
     // RULES fusion table (§2.7 GHC_PASSES_FOR_NIX): declarative,
     // intermediate-eliminating rewrites.  `outer(… inner(…) …)` where the
@@ -351,34 +364,33 @@ size_t streamFusion(Module & m)
         std::string_view innerName, innerAlt; size_t innerArity;
         std::string_view fusedName;
     };
-    // The rule registry.  A rule earns a slot here ONLY when measurement
-    // shows it pays (mirrors GHC's RULES: a rewrite ships when it's a win,
-    // not because it's expressible).  The framework is arity-generic
-    // (outerArity / listArgIdx / innerArity drive arg-remapping), so adding
-    // a validated rule is one line + one bytecode primop.
+    // The rule registry.  Every bytecode-fusion candidate has been MEASURED;
+    // NONE ships (the pass is default-OFF — see the gate above).  This table
+    // is the documented record + the A/B handle, and the mechanism is
+    // arity-generic (outerArity / listArgIdx / innerArity drive arg-remapping)
+    // so a future PAYING rule is one line + one bytecode primop.
     //
-    //   CANDIDATE REGISTRY (measured 2026-06-05, 1M synthetic):
+    //   CANDIDATE REGISTRY — all FALSIFIED (measured 2026-06-05, 1M synthetic,
+    //   AFTER the go-loop levers A+B):
     //   ┌─────────────────┬──────────────────────────────────────────────┐
-    //   │ foldl'∘map       │ SHIP. Eliminates intermediate list AND output │
-    //   │  → __foldlMap    │ list (fold returns a scalar). Helped hello.   │
-    //   ├─────────────────┼──────────────────────────────────────────────┤
-    //   │ map∘map          │ NEUTRAL — NOT shipped. Eliminates only the    │
-    //   │  → __mapMap       │ transient intermediate spine; lazy elements   │
-    //   │                  │ are forced exactly once either way, and the   │
-    //   │                  │ intermediate ListVec is GC-reclaimed as forc- │
-    //   │                  │ ing proceeds (insns 54000117 vs 54000115;     │
-    //   │                  │ peak RSS 791 vs 791 MB). No win at peak.      │
-    //   ├─────────────────┼──────────────────────────────────────────────┤
-    //   │ *∘genList         │ CPU REGRESSION (1.21×) — NOT a rule. genList's│
-    //   │  (producer)      │ C array-build + tight force beats a bytecode  │
-    //   │                  │ generate-loop. Producer fusion never wins.    │
+    //   │ foldl'∘map       │ REGRESSES. Fused→bytecode __foldlMap = 88M    │
+    //   │  → __foldlMap    │ ins / 704 MB vs unfused 82M / 503 MB (+201 MB)│
+    //   │                  │ on 1M; fires 0× on hello.drvPath. The C-built │
+    //   │                  │ genList spine beats any bytecode loop.         │
+    //   │ all∘map/any∘map  │ REGRESSES RSS. __allMap = 74M ins (−12%) but  │
+    //   │  → __allMap/...  │ 669 MB vs unfused 545 MB (+124 MB).            │
+    //   │ map∘map          │ NEUTRAL. Eliminates only a transient spine;   │
+    //   │  → __mapMap       │ elements forced once either way (54M ins /     │
+    //   │                  │ 791 MB both ways).                            │
+    //   │ *∘genList         │ CPU REGRESSION (1.21×). genList's C array      │
+    //   │  (producer)      │ beats a bytecode generate-loop. Never a rule. │
     //   └─────────────────┴──────────────────────────────────────────────┘
-    //   The winning shape is "eliminates the OUTPUT list too" (folds: all∘
-    //   map / any∘map are foldl'∘map-class candidates — add when bytecode-
-    //   installed). Pure structure-preserving intermediate elimination
-    //   (map∘map / filter∘map) is neutral; producer fusion loses.
+    //   NET: bytecode stream fusion is FALSIFIED as a perf lever — eliminating
+    //   an intermediate list never beats the cheap C genList spine + the
+    //   optimized go-loop.  The entry below stays for opt-in A/B only.
     static const FusionRule kRules[] = {
         // foldl' op nul (map f xs)  →  __foldlMap op nul f xs
+        // (DISABLED by default — regresses; see registry.  Opt-in only.)
         { "foldl'", "__foldl'", 3, 2, "map", "__map", 2, "__foldlMap" },
     };
     constexpr size_t kNumRules = sizeof(kRules) / sizeof(kRules[0]);

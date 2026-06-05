@@ -28,8 +28,13 @@ run_fixture() {
 
     # Run with v3-direct enabled so the stream-fusion pass is actually
     # exercised.  Without NIX_V3_DIRECT_EVAL=1, the expression goes
-    # through TW and the NIX_V3_NO_STREAM_FUSION gate has no effect —
-    # the test was previously a no-op.
+    # through TW and the fusion gate has no effect.
+    #
+    # Fusion is DEFAULT-OFF since 2026-06-05 (measured a net regression —
+    # see opt_stream_fusion.cc registry).  So "OFF" = default and "ON" =
+    # NIX_V3_STREAM_FUSION=1 (opt-in).  This still validates the mechanism:
+    # OFF and ON must produce byte-identical results (fusion is a pure perf
+    # transform), and the perf guard below must hold regardless.
     #
     # Important: do NOT redirect stderr to /dev/null — if v3 emit
     # fails (e.g. "unbound VarId" from a bad hoist), the empty stdout
@@ -55,7 +60,7 @@ run_fixture() {
 }
 
 fail=0
-for mode in "OFF:NIX_V3_NO_STREAM_FUSION=1" "ON:"; do
+for mode in "OFF:" "ON:NIX_V3_STREAM_FUSION=1"; do
     label="${mode%%:*}"
     env_part="${mode##*:}"
 
@@ -67,7 +72,7 @@ for mode in "OFF:NIX_V3_NO_STREAM_FUSION=1" "ON:"; do
 done
 
 # Cross-check string result.  Same v3-direct enforcement as above.
-for mode in "OFF:NIX_V3_NO_STREAM_FUSION=1" "ON:"; do
+for mode in "OFF:" "ON:NIX_V3_STREAM_FUSION=1"; do
     label="${mode%%:*}"
     env_part="${mode##*:}"
     errfile=$(mktemp)
