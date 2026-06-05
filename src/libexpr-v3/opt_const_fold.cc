@@ -410,6 +410,17 @@ void optimise(Module & m)
     // before DCE (so the partial-App orphans get swept).
     OPT_RUN(fusePrimOpApps(m));
 
+    // Sweep fusePrimOpApps's dead partial-App residue BEFORE de-thunk so the
+    // de-thunk use-once check sees accurate counts (the residue `App(__mul,
+    // t)` is a second, dead reference to the arg-thunk `t`).
+    OPT_RUN(deadBindingElim(m));
+    // De-thunk use-once MkThunk args to strict arithmetic primops.  Runs
+    // AFTER fusePrimOpApps (so `__mul`/… are canonical PrimOpCalls whose
+    // thunked args are visible) and BEFORE primOpFold / appSpineFold (so the
+    // exposed inner arithmetic — `x*y*z`'s inner `x*y` thunk — folds and the
+    // arity-N body becomes thunk-free for spine folding).
+    OPT_RUN(deThunkForcedStrictArgs(m));
+
     // 2026-05-18 IR Phase B: pure-primop constant folding.  Runs
     // AFTER fusePrimOpApps so we see the canonical PrimOpCall shape
     // (rather than the App-chain that lower.cc emits for indirect

@@ -897,6 +897,17 @@ size_t genListUnroll(Module & m);
 /// disables.  Returns the number of spines folded.
 size_t appSpineFold(Module & m);
 
+/// IR (2026-06-05): de-thunk USE-ONCE MkThunk args to STRICT arithmetic
+/// primops (__add/__sub/__mul/__div/__lessThan, which force every arg).
+/// The lowerer thunks every primop arg for laziness, but a strict primop
+/// forces its args when its block runs, so a use-once arg-thunk's deferral is
+/// redundant — inlining the thunk body is byte-identical and exposes nested
+/// arithmetic to constant folding (e.g. `x*y*z`'s inner `x*y` thunk, which
+/// otherwise blocks appSpineFold).  Runs BEFORE appSpineFold.  Gate:
+/// NIX_V3_NO_DETHUNK_STRICT=1 disables (bisect handle; retire once shipped
+/// byte-identical on --core + a nixpkgs sample).  Returns the number de-thunked.
+size_t deThunkForcedStrictArgs(Module & m);
+
 /// #429: fuse App-chains over LitPrimOp into a single PrimOpCall.
 /// Detects the let/inherit-from indirection pattern that escapes
 /// lowerCall's direct-recognition (e.g. `let inherit (builtins) map;

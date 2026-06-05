@@ -397,31 +397,42 @@ size_t primOpFold(Module & m)
     size_t folded = 0;
 
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
-        Block & blk = m.blocks[bid];
-        auto defs = mapBlockDefs(blk);
+        // Iterate to a fixpoint within the block: each fold builds a fresh
+        // `out` while `defs` points at the PRE-fold bindings, so a fold's
+        // result isn't visible to later bindings in the SAME round.  Nested
+        // arithmetic (`x*y*z` → `__mul[__mul[2,3],4]`) therefore needs a round
+        // per level: round 1 folds the inner `__mul[2,3]`→6, round 2 the outer
+        // `__mul[6,4]`→24.  Bounded; 1-2 rounds suffice in practice.
+        constexpr int kMaxRounds = 8;
+        for (int round = 0; round < kMaxRounds; ++round) {
+            Block & blk = m.blocks[bid];
+            auto defs = mapBlockDefs(blk);
 
-        std::vector<Binding> out;
-        out.reserve(blk.bindings.size());
+            std::vector<Binding> out;
+            out.reserve(blk.bindings.size());
+            size_t roundFolds = 0;
 
-        for (const auto & bd : blk.bindings) {
-            const auto * call = std::get_if<PrimOpCall>(&bd.expr);
-            if (!call) { out.push_back(bd); continue; }
+            for (const auto & bd : blk.bindings) {
+                const auto * call = std::get_if<PrimOpCall>(&bd.expr);
+                if (!call) { out.push_back(bd); continue; }
 
-            // Emit-side bindings produced by `attrNames` (etc.) need
-            // to land BEFORE the folded result binding so that the
-            // VarIds in the resulting ListExpr are in scope.  Collect
-            // them in `emit`, then append before our replacement.
-            std::vector<Binding> emit;
-            auto replacement = tryFoldPrimOpCall(m, *call, defs, emit);
-            if (!replacement) { out.push_back(bd); continue; }
+                // Emit-side bindings produced by `attrNames` (etc.) need
+                // to land BEFORE the folded result binding so that the
+                // VarIds in the resulting ListExpr are in scope.  Collect
+                // them in `emit`, then append before our replacement.
+                std::vector<Binding> emit;
+                auto replacement = tryFoldPrimOpCall(m, *call, defs, emit);
+                if (!replacement) { out.push_back(bd); continue; }
 
-            for (auto & e : emit) out.push_back(std::move(e));
-            out.push_back({bd.var, std::move(*replacement)});
-            ++folded;
-        }
+                for (auto & e : emit) out.push_back(std::move(e));
+                out.push_back({bd.var, std::move(*replacement)});
+                ++roundFolds;
+            }
 
-        if (folded > 0)
+            if (roundFolds == 0) break;
             blk.bindings = std::move(out);
+            folded += roundFolds;
+        }
     }
 
     return folded;

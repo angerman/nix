@@ -43,6 +43,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/primop.hh"
 
 #include <algorithm>
 #include <cstdio>
@@ -458,6 +459,144 @@ std::unordered_map<VarId, uint32_t> countModuleUses(const Module & m)
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// De-thunk use-once MkThunk args to strict arithmetic primops.
+//
+// The lowerer thunks every primop arg for laziness.  But __add/__sub/__mul/
+// __div/__lessThan force EVERY arg, so a use-once arg-thunk's deferral is
+// redundant: the primop forces it the moment its block runs, exactly as an
+// inlined (eager) body would.  Inlining the thunk body is therefore
+// byte-identical AND exposes nested arithmetic (`x*y*z`'s inner `x*y` thunk)
+// to appSpineFold + constant folding.  Use-once is required so we never make
+// a SHARED thunk eager (which could be referenced in an unforced context).
+// ---------------------------------------------------------------------------
+size_t deThunkForcedStrictArgs(Module & m)
+{
+    static const bool s_off =
+        std::getenv("NIX_V3_NO_DETHUNK_STRICT") != nullptr;
+    if (s_off) return 0;
+
+    auto isStrict = [](std::string_view n) {
+        return n == "__add" || n == "__sub" || n == "__mul"
+            || n == "__div" || n == "__lessThan";
+    };
+    static const bool dbg = std::getenv("V3_DBG_DETHUNK") != nullptr;
+
+    auto uses = countModuleUses(m);
+    size_t count = 0;
+
+    for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
+        Block & blk = m.blocks[bid];
+        if (blk.bindings.empty()) continue;
+
+        // defs over THIS block — valid for the whole scan (we mutate the
+        // block only in the rebuild phase after the scan completes).
+        std::unordered_map<VarId, const Expr *> defs;
+        defs.reserve(blk.bindings.size());
+        for (const auto & bd : blk.bindings) defs.emplace(bd.var, &bd.expr);
+
+        struct Action {
+            size_t bindingIdx;
+            size_t argIdx;
+            std::vector<Binding> inlined;  // thunk-body bindings (remapped)
+            VarId newArg;                  // remapped body return value
+        };
+        std::vector<Action> actions;
+        // The de-thunked MkThunk bindings become dead (use-once, arg
+        // rewritten); drop them in the rebuild so appSpineFold's
+        // deepestBodyIsSimple — which runs before the end-of-pipeline DCE —
+        // doesn't see a (dead) MkThunk and reject the now-foldable body.
+        std::unordered_set<VarId> deadThunks;
+
+        for (size_t bi = 0; bi < blk.bindings.size(); ++bi) {
+            const PrimOpCall * pc = std::get_if<PrimOpCall>(&blk.bindings[bi].expr);
+            if (!(pc && pc->primop && isStrict(pc->primop->name))) continue;
+
+            if (dbg) std::fprintf(stderr, "v3 dethunk: B%u strict primop %.*s argc=%zu\n",
+                (unsigned)bid, (int)pc->primop->name.size(), pc->primop->name.data(),
+                pc->args.size());
+            for (size_t ai = 0; ai < pc->args.size(); ++ai) {
+                VarId tvar = chaseToBindingVar(pc->args[ai], defs);
+                const Expr * te = chaseInBlock(pc->args[ai], defs);
+                const MkThunk * th = te ? std::get_if<MkThunk>(te) : nullptr;
+                if (dbg) std::fprintf(stderr, "  arg %zu var=%u tvar=%u isThunk=%d uses=%u\n",
+                    ai, (unsigned)pc->args[ai], (unsigned)tvar, th ? 1 : 0,
+                    uses.count(tvar) ? uses[tvar] : 0u);
+                if (!th) continue;
+                auto uit = uses.find(tvar);
+                if (uit == uses.end() || uit->second != 1) continue;  // not use-once
+
+                FuncId fid = th->funcIdx;
+                if (fid == 0 || fid >= m.functions.size()) continue;
+                const Function & f = m.functions[fid];
+                if (f.paramVar != kInvalid || f.hasFormals
+                    || f.intrinsicKind != 0 || !f.extraParams.empty()) continue;
+                if (f.entryBlock == kInvalidBlock
+                    || f.entryBlock >= m.blocks.size()) continue;
+                const Block & body = m.blocks[f.entryBlock];
+                const auto * term = std::get_if<TermReturn>(&body.terminal);
+                if (!term || term->value == kInvalid) continue;
+
+                // The whole body must be cloneable (remappable) — refuses
+                // control flow / captured-state Exprs (remapExprVars false).
+                bool ok = true;
+                for (const auto & bb : body.bindings) {
+                    Expr probe = bb.expr;
+                    std::unordered_map<VarId, VarId> none;
+                    if (!remapExprVars(probe, none)) { ok = false; break; }
+                }
+                if (!ok) continue;
+
+                // sub: only the thunk-body LOCALS are renamed to fresh VarIds
+                // (to keep SSA unique).  The body references its captured outer
+                // vars DIRECTLY (v3's lowerer doesn't rebind upvalues), and
+                // those vars are in scope wherever this use-once thunk sits —
+                // so they are left untouched (mirrors streamFusion's hoist).
+                std::unordered_map<VarId, VarId> sub;
+                for (const auto & bb : body.bindings)
+                    sub[bb.var] = m.freshVar();
+
+                Action act;
+                act.bindingIdx = bi;
+                act.argIdx = ai;
+                for (const auto & bb : body.bindings) {
+                    Expr cloned = bb.expr;
+                    (void)remapExprVars(cloned, sub);
+                    act.inlined.push_back({ sub[bb.var], std::move(cloned) });
+                }
+                auto rit = sub.find(term->value);
+                act.newArg = (rit != sub.end()) ? rit->second : term->value;
+                actions.push_back(std::move(act));
+                deadThunks.insert(tvar);
+                ++count;
+            }
+        }
+
+        if (actions.empty()) continue;
+
+        // Rebuild: insert each target's inlined bindings BEFORE the binding,
+        // and rewrite the primop arg to the inlined return value.
+        std::vector<Binding> out;
+        out.reserve(blk.bindings.size() + actions.size() * 2);
+        size_t aidx = 0;
+        for (size_t bi = 0; bi < blk.bindings.size(); ++bi) {
+            while (aidx < actions.size() && actions[aidx].bindingIdx == bi) {
+                for (auto & ib : actions[aidx].inlined)
+                    out.push_back(std::move(ib));
+                if (auto * pc = std::get_if<PrimOpCall>(&blk.bindings[bi].expr))
+                    if (actions[aidx].argIdx < pc->args.size())
+                        pc->args[actions[aidx].argIdx] = actions[aidx].newArg;
+                ++aidx;
+            }
+            // Drop the now-dead de-thunked MkThunk binding.
+            if (deadThunks.count(blk.bindings[bi].var)) continue;
+            out.push_back(std::move(blk.bindings[bi]));
+        }
+        blk.bindings = std::move(out);
+    }
+    return count;
+}
+
 size_t appSpineFold(Module & m)
 {
     static const bool disabled =
@@ -506,6 +645,9 @@ size_t appSpineFold(Module & m)
                 out.push_back(std::move(bd));
                 continue;
             }
+            if (s_dbg) std::fprintf(stderr,
+                "v3 appSpineFold: B%u var=%u spine N=%zu leafFun=%u\n",
+                (unsigned)bid, (unsigned)bd.var, N, (unsigned)sw->leafFun);
 
             // Resolve the leaf to a Lambda.
             VarId lambdaVar = chaseToBindingVar(sw->leafFun, defs);
@@ -528,6 +670,8 @@ size_t appSpineFold(Module & m)
             if (!chain)
                 chain = walkCollapsedChain(m, leafLam->funcIdx, N);
             if (!chain) {
+                if (s_dbg) std::fprintf(stderr, "  → skip: no N=%zu chain for f%u\n",
+                    N, (unsigned)leafLam->funcIdx);
                 out.push_back(std::move(bd));
                 continue;
             }
@@ -539,6 +683,8 @@ size_t appSpineFold(Module & m)
             // function is itself uniquely referenced.)
             auto itU = uses.find(lambdaVar);
             if (itU == uses.end() || itU->second != 1) {
+                if (s_dbg) std::fprintf(stderr, "  → skip: lambdaVar %u uses=%u (need 1)\n",
+                    (unsigned)lambdaVar, itU == uses.end() ? 0u : itU->second);
                 out.push_back(std::move(bd));
                 continue;
             }
@@ -549,6 +695,7 @@ size_t appSpineFold(Module & m)
                 if (!isPureArg(av, defs)) { allPure = false; break; }
             }
             if (!allPure) {
+                if (s_dbg) std::fprintf(stderr, "  → skip: an arg is impure\n");
                 out.push_back(std::move(bd));
                 continue;
             }
@@ -556,6 +703,8 @@ size_t appSpineFold(Module & m)
             // The deepest body must be simple.
             const Block & deepest = m.blocks[chain->back().bodyBlock];
             if (!deepestBodyIsSimple(deepest)) {
+                if (s_dbg) std::fprintf(stderr, "  → skip: deepest body B%u not simple\n",
+                    (unsigned)chain->back().bodyBlock);
                 out.push_back(std::move(bd));
                 continue;
             }
