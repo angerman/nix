@@ -399,7 +399,6 @@ struct Emitter
         auto * pc = std::get_if<ir::PrimOpCall>(&bd.expr);
         if (!pc || pc->args.size() != 2) return false;
         if (!pc->primop || pc->primop->deepForceList != 0) return false;
-        if (!ctx->pendingDefer.empty()) return false;
         uint32_t desc[2];
         for (int k = 0; k < 2; ++k) {
             ir::VarId av = pc->args[k];
@@ -411,6 +410,13 @@ struct Emitter
             }
             auto sit = ctx->slot.find(av);
             if (sit == ctx->slot.end() || sit->second > 0x7FFFu) return false;
+            // A slot arg that is currently DEFERRED lives on the operand
+            // stack, not (yet) in its slot — reading the slot would be stale.
+            // Exclude such args; OTHER pending values are fine (R_PRIMOP2 is
+            // stack-neutral and doesn't disturb them).
+            if (std::find(ctx->pendingDefer.begin(), ctx->pendingDefer.end(), av)
+                != ctx->pendingDefer.end())
+                return false;
             desc[k] = sit->second & 0x7FFFu;          // bit15 clear ⇒ slot
         }
         uint16_t dst = getOrAssignSlot(bd.var);
