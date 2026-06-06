@@ -50,6 +50,33 @@
 >   GC (Immix) path, re-judged on heavy workloads per S2 (§2 ceiling ~1.2–1.9×
 >   firefox).  That is the next investment, NOT more structural-COW work.
 
+> ## ✅✅ S2 DONE + OVERALL VERDICT (2026-06-07): GC also fails the gate → peak is LIVE-dominated
+> S2 (end-of-eval precise live-walk on firefox.drvPath — the gate workload, on the
+> register-VM tree, NOT the stale hello/HNE):
+> - **Sweep at peak: 550.7 MB LIVE / 204.2 MB dead = 73% live, only 27%/204 MB
+>   reclaimable.**  (Precise from-roots best case ~52% freeable → still only.)
+> - **Immix line-occupancy: deadPct = 25.85% — BELOW the ≥30% acceptance
+>   threshold** (Immix F1 FAILS on firefox, register-VM tree; the prior F1 PASS at
+>   46–50% was hello/HNE, stale).  evac-opportunity: only 2 sparse blocks,
+>   evacuable_RSS 33.6 MB.
+> - **GC reclaim ceiling: 204 MB → peak 976→772 MB → ~2.6× TW** (best-case precise
+>   ~1.9×).  **FAILS the §4 ≤1.6× (≤480 MB) gate.**  The §2 ceiling (1.2–1.9×) was
+>   from stale hello/HNE L=0.41–0.69; firefox on the register-VM tree is L=0.73.
+>
+> **OVERALL MEMORY-PLAN VERDICT (S1+S2+S3 all measured):** the heavy-workload peak
+> **cannot be halved by either available lever.**  firefox.drvPath's 772 MB arena
+> is ~550 MB genuinely-LIVE working set (the nixpkgs eval graph; `elsewhere`=0, so
+> no import-cache lever here) + only ~204 MB dead.  Structural COW is neutral (the
+> `//` bytes are iterated, not shareable); GC reclaims only ~27% (live-dominated);
+> Immix F1 fails (25.85%<30%).  The plan's premise — large reclaimable `//` churn —
+> was a pre-register-VM artifact + a confounded reclaim estimate; the register VM
+> (fewer transient thunks/closures) RAISED the live fraction.  **Reaching ≤1.6×
+> would require shrinking the LIVE representation itself (HAMT-class — 4×-falsified,
+> a representation rewrite), not reclamation or sharing.**  Per measure-twice, this
+> is a NO-GO on all three measured levers; the measure-first plan's value here is
+> preventing a multi-week Immix build (4–6 wk) that the S2 data shows would miss
+> the gate.  Memory remains a known gap; no cheap lever exists on the current tree.
+
 
 **Status:** ATTACK PLAN. The register-VM wall arc is complete (v3 beats TW
 1.54× on *compute*; real-nixpkgs drvPath is overhead/memory-bound and saw
