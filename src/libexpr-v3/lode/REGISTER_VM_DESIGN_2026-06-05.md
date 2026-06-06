@@ -197,6 +197,48 @@ Items 2/3/5 would shave the last ~7 stack ops/node (2× GET_UPVALUE+SET, the
 GET_LOCAL2, STR_CONCAT, the branch return) for an estimated further ~20-30%
 dispatch on fib — incremental polish on top of this landed milestone.
 
+### COMPLETE (2026-06-06): items 2 + 3 landed → register VM architecturally whole
+
+All major op classes are now register-addressable.  Landed on top of the above:
+- **`R_STR_CONCAT2`** (`f052a88d2`, item 3) — register `+`/concat; reuses the
+  whole OP_STR_CONCAT body via a case-head label + synthesised operand + the
+  CFF_FORCE_WB writeback at the shared exit.
+- **register-mode `If` + `R_MOVE`** (`6a20243ec`, item 2) — branch-result-to-
+  slot: each branch's tail op writes the If's merge slot directly (via the new
+  `dstOverride` on R_PRIMOP2/R_CALL/R_STR_CONCAT2, or `R_MOVE` for a var tail),
+  so the merge holds the value in a register and a tail If fuses to `R_RETURN`.
+
+fib's `func "n"` now runs **register-mode end to end**:
+```
+R_PRIMOP2 r1 = n<2 ; R_BRANCH_FALSE if !r1 -> else
+  R_MOVE r2 = r0                                  (then)
+else:
+  GET_UPVALUE_REC_BINDING fib ; SET 3 ; R_PRIMOP2 r4 ; R_CALL r6 = r3,r4
+  GET_UPVALUE_REC_BINDING fib ; SET 7 ; R_PRIMOP2 r8 ; R_CALL r10 = r7,r8
+  R_STR_CONCAT2 r2 = r6 ++ r10
+R_RETURN r2
+```
+
+**Final measurement (full register VM, production `nix eval` path):**
+- **fib27 dispatch: 11,441,212 → 6,038,440 = −47.2%** (vs −44.4% R_CALL-only).
+- **fib30 wall: 1.54× ± 0.10 faster** (1.372 s vs 2.112 s; user-CPU 1.34×).
+
+**Op classes register-addressable:** compute (`R_PRIMOP2`), branch
+(`R_BRANCH_FALSE`), branch-value-merge (register-mode If), call (`R_CALL`),
+return (`R_RETURN`), string-concat/`+` (`R_STR_CONCAT2`), slot copy (`R_MOVE`),
+dual-load (`GET_LOCAL2`).
+
+**The one remaining operand-stack transient** in fib is the rec-binding
+self-resolution `GET_UPVALUE_REC_BINDING fib ; SET s` (item 5a,
+`R_GET_UPVALUE_REC_BINDING→slot`): a LOAD that pushes + a STORE to a slot.  Its
+load-to-register variant is DEFERRED as disproportionate: it needs a new opcode
+carrying a **remapped SymbolId operand** (the serializer symbol-collect/remap
+surface — the error-prone "two bytecode caches" trap) PLUS either a defer-policy
+change for all `RecBindingSlotRef` or an instruction-removing post-emit peephole
+(position-shift + jump rebase), all to eliminate ONE cheap `SET` per resolution.
+The register VM is complete without it — a register VM legitimately resolves a
+recursive global via load+store; fib already executes register-mode at 1.54×.
+
 ## Phases (each lands `--core` 19/19 byte-identical + IR-checks + r1 cache)
 
 - **Phase 1 — `OP_R_CALL_PRIMOP` (register-addressed primop call).** The
