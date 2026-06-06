@@ -68,6 +68,7 @@ const char * opName(Op op)
     case OP_IMPL_BRANCH:       return "OP_IMPL_BRANCH";
     case OP_JUMP:              return "OP_JUMP";
     case OP_BRANCH_FALSE:      return "OP_BRANCH_FALSE";
+    case OP_R_BRANCH_FALSE:    return "OP_R_BRANCH_FALSE";
     case OP_BRANCH_TRUE:       return "OP_BRANCH_TRUE";
     case OP_MAKE_CLOSURE:      return "OP_MAKE_CLOSURE";
     case OP_MAKE_THUNK:        return "OP_MAKE_THUNK";
@@ -165,6 +166,8 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
         return 1;                       // primop-table index (poIdx)
     case OP_R_PRIMOP2:
         return 2;                       // reg-VM: [dst, (descA<<16|descB)]
+    case OP_R_BRANCH_FALSE:
+        return 1;                       // reg-VM: [cond_slot] (operand=target)
     default:
         return 0;
     }
@@ -180,6 +183,7 @@ bool isBranchOp(Op op)
     switch (op) {
     case OP_JUMP: case OP_BRANCH_FALSE: case OP_BRANCH_TRUE:
     case OP_AND_BRANCH: case OP_OR_BRANCH: case OP_IMPL_BRANCH:
+    case OP_R_BRANCH_FALSE:   // reg-VM: operand is the jump target
         return true;
     default: return false;
     }
@@ -339,6 +343,10 @@ uint32_t disassembleOne(std::FILE * out,
         break;
     case OP_R_RETURN:
         std::fprintf(out, "   ; return r%u", operand);
+        break;
+    case OP_R_BRANCH_FALSE:
+        // operand = jump target (also shown as -> L<target>); data[0] = cond slot.
+        std::fprintf(out, "   ; if !r%u -> %u", dataAt(0), operand);
         break;
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:

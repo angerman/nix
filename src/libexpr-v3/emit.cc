@@ -942,6 +942,34 @@ struct Emitter
     // -- If
     void emitOne(const ir::If & e)
     {
+        // reg-VM Phase 5: when the cond is MATERIALISED in a slot (not deferred
+        // on the stack, not a remat const), branch on it directly with
+        // OP_R_BRANCH_FALSE (reads regs[cond_slot]) — dropping the GET_LOCAL
+        // the fast path / emitVarRef would emit.  The cond isn't on the stack,
+        // so flushAllDeferred (commit pending to slots for branch consistency)
+        // replaces flushBelowBranchCond's stash-the-cond dance.  This is what
+        // makes a branch's condition register-addressed (e.g. fib's R_PRIMOP2
+        // `n < 2` result feeding the If).  Gate NIX_V3_NO_R_BRANCH.
+        static const bool s_noRBranch =
+            std::getenv("NIX_V3_NO_R_BRANCH") != nullptr;
+        if (!s_noRBranch) {
+            auto sit = ctx->slot.find(e.cond);
+            if (sit != ctx->slot.end() && sit->second <= 0xFFFFFFu
+                && std::find(ctx->pendingDefer.begin(),
+                             ctx->pendingDefer.end(), e.cond)
+                       == ctx->pendingDefer.end()) {
+                flushAllDeferred();
+                uint32_t bf = emitJumpPlaceholder(OP_R_BRANCH_FALSE);
+                unit.code.push_back(sit->second);   // cond_slot follow-up
+                emitBlock(e.thenBlock);
+                uint32_t je = emitJumpPlaceholder(OP_JUMP);
+                patchJump(bf, static_cast<uint32_t>(unit.code.size()));
+                emitBlock(e.elseBlock);
+                patchJump(je, static_cast<uint32_t>(unit.code.size()));
+                return;
+            }
+        }
+
         // #542 unary fast path: when the cond binding is OnceLinear
         // and was deferred (its value is on top of stack), skip the
         // GET — OP_BRANCH_FALSE pops top.  This is the canonical

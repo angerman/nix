@@ -179,6 +179,13 @@ enum Op : uint8_t
     /// mode).  The first op that lets a whole (straight-line) function run
     /// with NO operand-stack traffic.
     OP_R_RETURN       = 0x5e,  // [slot:24]  return regs[slot]
+    /// Register VM Phase 5: branch on a register.  `if !regs[cond] goto target`
+    /// reading the condition directly from a local slot (force-writeback-to-
+    /// slot if non-WHNF, like the other register ops), dropping the
+    /// `GET_LOCAL cond; BRANCH_FALSE` round-trip.  `operand = target` (24-bit,
+    /// so compactFuseSetGet's jump rebase applies) + 1 follow-up word
+    /// `cond_slot`.
+    OP_R_BRANCH_FALSE = 0x5f,
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

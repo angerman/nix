@@ -3692,6 +3692,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (v.isBool() && v.payload.i == 0) ip = operand;
             break;
         }
+        case OP_R_BRANCH_FALSE: {
+            // reg-VM Phase 5: branch on regs[cond_slot] (a follow-up word);
+            // operand = jump target.  Force the slot in place (writeback) if
+            // non-WHNF, mirroring OP_BRANCH_FALSE — then re-enter.
+            uint32_t condSlot = cu->code[ip];   // peek follow-up
+            Value cval = vm.valueStack[stackBase + condSlot];
+            Tag t = cval.tag();
+            if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
+                || t == Tag::Slot) {
+                push(vm, cval);
+                CallFrame & frame = vm.frames.back();
+                setForceWriteback(frame, static_cast<uint16_t>(condSlot));
+                frame.flags |= CFF_FORCE_RETRY;
+                ip = ip - 1;            // rewind to the OP_R_BRANCH_FALSE word
+                goto op_force_slow;
+            }
+            ip++;                       // consume the cond_slot follow-up
+            if (cval.isBool() && cval.payload.i == 0) ip = operand;
+            break;
+        }
         // OP_BRANCH_TRUE: bytecode value reserved; lowerer always emits
         // OP_BRANCH_FALSE with negated condition or OP_AND/OP_OR-shaped
         // branches.  Removed dispatch; default-case abort catches stale.
