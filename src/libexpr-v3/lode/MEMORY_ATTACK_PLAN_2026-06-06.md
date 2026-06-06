@@ -243,6 +243,39 @@ hello/firefox.drvPath byte-identical, measure the TRUE benefit, `--core` green,
 then decide default-on. The 5× "falsification" is RETIRED — it was an
 unidentified iteration site (mapAttrs ++), not an architectural wall.
 
+### 5d. AUDIT PROGRESS (2026-06-06) — 7 sites fixed; lang clean; derivation site remains
+
+Method: env-tunable thresholds (`NIX_V3_CHAIN_MIN_NA` / `MAX_NB`) → run the lang
+suite (143 minimal tests) with AGGRESSIVE chains (na≥2) against the TW oracle;
+each failure pinpoints a chain-unsafe iteration site.  Sites fixed (all
+`isChain()`-guarded → default chains-OFF behaviour provably unchanged: smoke PASS,
+hello.{name,drvPath} byte-identical to pre-change):
+1. `primMapAttrs` — the root-cause miss (overlay-only map).
+2. `primDerivationStrictNative` — materialise `src` (drvPath built by iterating it).
+3. `forceDeepRec` (deepSeq) — forEach so parent values are forced.
+4-6. `print.cc` — plain printer (×2) + JSON `toJsonValue` + the `--strict`
+     deep-force worklist (enqueue the chain parent) → full output.
+7. `primScopedImport` — materialise the scope (else lower-time `unbound 'range'`).
+
+Result: **lang 142/143 with aggressive chains** (only pre-existing
+`eval-okay-types`, identical OFF); hello.{name,pname} + firefox.name
+byte-identical to OFF.
+
+**Open (narrowly isolated):** hello.drvPath / raw-`builtins.derivation`-with-big-
+`//`-env still diverge on `eval .drvPath` (real path, phantom hash).  Confirmed
+chain-induced (`NIX_V3_CHAIN_MIN_NA=99999` ⇒ byte-identical; ≤16 ⇒ diverges).
+KEY finding: **`nix derivation show` of the SAME expr is byte-identical ON/OFF** —
+i.e. the CORE drv computes correctly with chains (full env, right hash); only the
+v3-stored **`.drvPath` ATTRIBUTE** read returns a phantom.  So the residual site
+is in the derivationStrict-result / Phase-5 `.drvPath` cache path (native is the
+active path and materialises `src`; the chain mishandle is narrower — likely the
+drvHash cache KEY or the result-attrset `.drvPath` exposure), NOT the env build.
+Next: localise that one path (drv-content diff already shows env is identical, so
+it's the hashed-key or the stored-attr), fix, then `--core`-with-chains across
+the 19 workloads to flush any remaining nixpkgs-graph sites.  Robust closure: the
+compiler-enforced `entries[]` accessor conversion (guarantees no missed site —
+the exact thing that defeated the 5 ad-hoc attempts).
+
 ## 6. What NOT to do (falsified / mistaken — keep dead)
 
 - **Blind GC-variant sequencing** — killed ([[GC_PAUSE_2026-05-29]]); only

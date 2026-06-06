@@ -1198,7 +1198,19 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     {
         static const bool s_chain =
             std::getenv("NIX_V3_CHAIN_BINDINGS") != nullptr;
-        if (s_chain && nb <= 4 && na >= 16) {
+        // Env-tunable thresholds so the chain-unsafe-site audit can run with
+        // AGGRESSIVE chains (NIX_V3_CHAIN_MIN_NA=2 NIX_V3_CHAIN_MAX_NB=999) to
+        // exercise every attrset op against the TW oracle, without a rebuild.
+        // Production default: large parent, tiny overlay (na≥16, nb≤4).
+        static const uint32_t s_minNa = []{
+            const char * e = std::getenv("NIX_V3_CHAIN_MIN_NA");
+            return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 16u;
+        }();
+        static const uint32_t s_maxNb = []{
+            const char * e = std::getenv("NIX_V3_CHAIN_MAX_NB");
+            return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 4u;
+        }();
+        if (s_chain && nb <= s_maxNb && na >= s_minNa) {
             Bindings * c = Alloc::allocChainBindings(a, nb);
             for (uint32_t j = 0; j < nb; ++j)
                 bindingsSetEntry(c, j, b->entries[j]);  // overlay sorted; Phase D

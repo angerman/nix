@@ -151,13 +151,21 @@ Value forceDeep(VMState & vm, Value v, std::set<const void *> & seen)
                 maybeEnqueue(child);
             }
         } else if (tlDeepForceRoots[cur].isAttrs()) {
-            const uint32_t size =
-                tlDeepForceRoots[cur].payload.bindings->size;
+            Bindings * pb = tlDeepForceRoots[cur].payload.bindings;
+            // ChainBindings: this forces only `pb`'s own entries (the overlay
+            // for a Chain).  Enqueue the parent so the rest of the chain's
+            // values get deep-forced too (else --strict prints parent values
+            // as <thunk>); the printer materialises the full view.
+            if (pb->isChain() && pb->parent) {
+                Value pv;
+                pv.tag_payload = static_cast<uint64_t>(Tag::Attrs);
+                pv.payload.bindings = const_cast<Bindings *>(pb->parent);
+                maybeEnqueue(pv);
+            }
+            const uint32_t size = pb->size;
             for (uint32_t i = 0; i < size; ++i) {
-                Value child = forceValue(
-                    vm, tlDeepForceRoots[cur].payload.bindings->entries[i].value);
-                bindingsSetValue(  // Phase D barrier
-                    tlDeepForceRoots[cur].payload.bindings, i, child);
+                Value child = forceValue(vm, pb->entries[i].value);
+                bindingsSetValue(pb, i, child);  // Phase D barrier
                 maybeEnqueue(child);
             }
         }
@@ -257,8 +265,11 @@ nlohmann::json toJsonValue(VMState & vm, Value v,
             // stack slot is uniform and zero-cost; it makes the JSON
             // walk match the printer / forceDeep discipline.
             DeepForceGuard g(v);
-            for (uint32_t i = 0; i < g.ref().payload.bindings->size; ++i) {
-                auto & en = g.ref().payload.bindings->entries[i];
+            // ChainBindings: materialise so JSON includes the full attrset.
+            const Bindings * jb = g.ref().payload.bindings;
+            if (jb->isChain()) jb = jb->materialize();
+            for (uint32_t i = 0; i < jb->size; ++i) {
+                auto & en = jb->entries[i];
                 // #670/#671 follow-on: copy key to owning std::string
                 // before recursive toJsonValue — recursion may force
                 // values that intern new symbols, invalidating any
@@ -374,11 +385,15 @@ void printNixValue(std::ostream & out, const Value & v,
         }
         out << "{ ";
         if (v.payload.bindings) {
+            // ChainBindings: materialise so we print the FULL attrset (overlay
+            // + parent), not just the overlay (no-op for Sorted).
+            const Bindings * pb = v.payload.bindings;
+            if (pb->isChain()) pb = pb->materialize();
             // Sort by symbol name for deterministic order matching tw output.
             std::vector<std::pair<std::string, const Value *>> items;
-            items.reserve(v.payload.bindings->size);
-            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
-                auto & en = v.payload.bindings->entries[i];
+            items.reserve(pb->size);
+            for (uint32_t i = 0; i < pb->size; ++i) {
+                auto & en = pb->entries[i];
                 std::string key = (en.name < symTab.size())
                     ? symTab[en.name] : std::to_string(en.name);
                 items.emplace_back(std::move(key), &en.value);
@@ -552,10 +567,12 @@ void printNixValueRich(std::ostream & out, const Value & v,
         }
         out << "{ ";
         if (v.payload.bindings) {
+            const Bindings * pb = v.payload.bindings;  // ChainBindings: full view
+            if (pb->isChain()) pb = pb->materialize();
             std::vector<std::pair<std::string, const Value *>> items;
-            items.reserve(v.payload.bindings->size);
-            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
-                auto & en = v.payload.bindings->entries[i];
+            items.reserve(pb->size);
+            for (uint32_t i = 0; i < pb->size; ++i) {
+                auto & en = pb->entries[i];
                 std::string key = (en.name < symTab.size())
                     ? symTab[en.name] : std::to_string(en.name);
                 items.emplace_back(std::move(key), &en.value);
@@ -747,10 +764,12 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
         }
         out << "{ ";
         if (forced.payload.bindings) {
+            const Bindings * pb = forced.payload.bindings;  // ChainBindings
+            if (pb->isChain()) pb = pb->materialize();
             std::vector<std::pair<std::string, const Value *>> items;
-            items.reserve(forced.payload.bindings->size);
-            for (uint32_t i = 0; i < forced.payload.bindings->size; ++i) {
-                auto & en = forced.payload.bindings->entries[i];
+            items.reserve(pb->size);
+            for (uint32_t i = 0; i < pb->size; ++i) {
+                auto & en = pb->entries[i];
                 std::string key = (en.name < symTab.size())
                     ? symTab[en.name] : std::to_string(en.name);
                 items.emplace_back(std::move(key), &en.value);

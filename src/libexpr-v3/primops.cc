@@ -7951,6 +7951,11 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     std::string wrapped;
     wrapped += "__scope__: let ";
     auto * sb = scope.payload.bindings;
+    // ChainBindings: the scope is built by iterating sb->entries[] into the
+    // lowering scope; a Chain = overlay only would drop the parent's names
+    // (e.g. `range` from `overrides // import ./lib.nix`) → lower-time
+    // 'unbound variable'.  Materialise the full view.
+    if (sb && sb->isChain()) sb = const_cast<Bindings *>(sb->materialize());
     auto & symTab = ir::globalSymbolTable();
     for (uint32_t i = 0; i < sb->size; ++i) {
         SymbolId sid = sb->entries[i].name;
