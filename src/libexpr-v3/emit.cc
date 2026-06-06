@@ -506,6 +506,41 @@ struct Emitter
         return 2;
     }
 
+    /// Register VM Phase 5: a 2-part ConcatStrings binding (`a + b`) whose
+    /// operands are slot-resident and whose result goes to a slot → one
+    /// OP_R_STR_CONCAT2 (no GET_LOCAL2 + STR_CONCAT operand-stack round-trip).
+    /// `dstOverride >= 0` writes that slot instead of the binding's own (used by
+    /// register-mode If to land the branch result directly in the merge slot).
+    /// Gate NIX_V3_NO_R_STRCONCAT2.
+    bool tryEmitRStrConcat2(const ir::Binding & bd, int32_t dstOverride = -1)
+    {
+        static const bool s_no =
+            std::getenv("NIX_V3_NO_R_STRCONCAT2") != nullptr;
+        if (s_no) return false;
+        auto * cs = std::get_if<ir::ConcatStrings>(&bd.expr);
+        if (!cs || cs->parts.size() != 2) return false;
+        uint16_t slots[2];
+        for (int k = 0; k < 2; ++k) {
+            ir::VarId v = cs->parts[k];
+            if (constRemat_.count(v)) return false;       // const has no slot
+            auto it = ctx->slot.find(v);
+            if (it == ctx->slot.end() || it->second > 0xFFFu) return false;
+            // A deferred operand lives on the stack, not its slot — exclude
+            // (reading the slot would be stale), mirroring tryEmitRPrimop2.
+            if (std::find(ctx->pendingDefer.begin(), ctx->pendingDefer.end(), v)
+                != ctx->pendingDefer.end())
+                return false;
+            slots[k] = it->second;
+        }
+        uint32_t dst = dstOverride >= 0
+            ? static_cast<uint32_t>(dstOverride) : getOrAssignSlot(bd.var);
+        if (dst > 0xFFFu) return false;
+        unit.code.push_back(encode(OP_R_STR_CONCAT2, dst));
+        unit.code.push_back((cs->forceString ? (1u << 24) : 0u)
+                            | (static_cast<uint32_t>(slots[0]) << 12) | slots[1]);
+        return true;
+    }
+
     uint32_t addIntConst(int64_t n)
     {
         unit.intConstants.push_back(n);
@@ -756,6 +791,15 @@ struct Emitter
             // FORCE).  Consumes 2 bindings; advance `i` past the Force.
             if (size_t consumed = tryEmitRCall(i, b, nBd, tailLast, spineHead)) {
                 i += consumed - 1;     // skip the Force; loop ++i moves past App
+                continue;
+            }
+
+            // Register VM Phase 5: `a + b` (2-part ConcatStrings) with slot
+            // operands → OP_R_STR_CONCAT2 writing a slot.  For the tail binding
+            // emit GET_LOCAL after so the R_RETURN peephole can fuse it (a
+            // straight-line concat tail then runs stack-free).
+            if (tryEmitRStrConcat2(bd)) {
+                if (isTail) emitGetLocal(getOrAssignSlot(bd.var));
                 continue;
             }
 

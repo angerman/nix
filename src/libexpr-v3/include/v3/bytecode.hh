@@ -200,6 +200,18 @@ enum Op : uint8_t
     /// continues past this op (no re-exec).  Non-tail only (tail calls deliver
     /// straight to the caller's caller).  ≤4095 slots (12-bit fields).
     OP_R_CALL         = 0x62,
+    /// Register VM Phase 5: register-addressed binary `+` / 2-part string
+    /// concat.  Replaces `GET a; GET b; STR_CONCAT; SET dst` with one op that
+    /// reads both operands from local slots and writes the result to a slot.
+    ///   operand = dst slot (24-bit)
+    ///   1 follow-up word = (forceStr<<24) | (a_slot<<12) | b_slot
+    /// Phase 1 force-writes each non-WHNF operand slot in place + re-executes
+    /// (the OP_R_PRIMOP2 pattern); Phase 2 pushes the two WHNF operands, arms
+    /// the caller frame's CFF_FORCE_WB=dst, synthesises the STR_CONCAT operand
+    /// ((2<<1)|forceStr) and jumps to op_str_concat — REUSING the full
+    /// STR_CONCAT body (numeric add / float / string concat with context).  At
+    /// str_concat_done applyForceWriteback drops the result into regs[dst].
+    OP_R_STR_CONCAT2  = 0x63,
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

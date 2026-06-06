@@ -3776,6 +3776,47 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 break;
             }
         }
+        case OP_R_STR_CONCAT2: {
+            // reg-VM Phase 5: register-addressed binary `+` / 2-part concat.
+            //   operand = dst slot ; follow-up = (forceStr<<24)|(a<<12)|b
+            // See bytecode.hh.  Reuses the OP_STR_CONCAT body via op_str_concat.
+            uint32_t dst   = operand;
+            uint32_t fw    = cu->code[ip];          // peek follow-up (consume P2)
+            uint32_t aSlot = (fw >> 12) & 0xFFFu;
+            uint32_t bSlot =  fw        & 0xFFFu;
+            // Phase 1: force each non-WHNF operand slot in place + re-execute
+            // (the OP_R_PRIMOP2 arg-force pattern, matching STR_CONCAT's own
+            // App/App3/Thunk force-scan).  After this the operands are WHNF, so
+            // op_str_concat's force-scan is a no-op and never arms CFF_FORCE_WB
+            // (which would clash with our result writeback) — and we avoid that
+            // scan's `ip-1` re-exec, which would land on our follow-up word.
+            for (uint32_t s : { aSlot, bSlot }) {
+                Value v = vm.valueStack[stackBase + s];
+                Tag t = v.tag();
+                if (t == Tag::Thunk || t == Tag::App || t == Tag::App3) {
+                    push(vm, v);
+                    CallFrame & frame = vm.frames.back();
+                    setForceWriteback(frame, static_cast<uint16_t>(s));
+                    frame.flags |= CFF_FORCE_RETRY;
+                    ip = ip - 1;                    // rewind to OP_R_STR_CONCAT2
+                    goto op_force_slow;
+                }
+            }
+            // Phase 2: both WHNF.  Push them, arm CFF_FORCE_WB=dst, synthesise
+            // the STR_CONCAT operand (n=2 | forceStr) and reuse its body; at
+            // str_concat_done applyForceWriteback drops the result into dst.
+            {
+                uint32_t forceStr = (fw >> 24) & 1u;
+                ip++;                               // consume the follow-up word
+                Value av = vm.valueStack[stackBase + aSlot];
+                Value bv = vm.valueStack[stackBase + bSlot];
+                push(vm, av);
+                push(vm, bv);
+                setForceWriteback(vm.frames.back(), static_cast<uint16_t>(dst));
+                operand = (2u << 1) | forceStr;     // OP_STR_CONCAT decodes this
+                goto op_str_concat;
+            }
+        }
         // OP_BRANCH_TRUE: bytecode value reserved; lowerer always emits
         // OP_BRANCH_FALSE with negated condition or OP_AND/OP_OR-shaped
         // branches.  Removed dispatch; default-case abort catches stale.
@@ -9677,6 +9718,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
 
         // --- Strings / pos / assert ---
         case OP_STR_CONCAT: {
+            // reg-VM Phase 5 entry: OP_R_STR_CONCAT2 sets `operand` to the
+            // synthesised STR_CONCAT operand ((2<<1)|forceStr), pushes its two
+            // (already-WHNF) slot operands, arms CFF_FORCE_WB=dst, and jumps
+            // here — reusing this entire body.  At str_concat_done the armed
+            // writeback drops the result into the dst slot; a normal STR_CONCAT
+            // has no writeback armed, so the result stays on the stack.
+            op_str_concat:
             uint32_t n = operand >> 1;
             bool forceStr = (operand & 1u) != 0;
             // Ultra-fast path: 2 ints with no forceStr — covers every
@@ -9698,6 +9746,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                             + std::to_string(top1.payload.i));
                     vm.valueStack.pop_back();
                     vm.valueStack.back().mkInt(sum);
+                    // reg-VM: honour CFF_FORCE_WB inline — can't `goto
+                    // str_concat_done` from here (it would jump over the
+                    // `overflow` vector's initialiser below).
+                    applyForceWriteback(vm);
                     break;
                 }
             }
@@ -9981,7 +10033,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                     r.mkFloat(sum);
                 }
                 push(vm, r);
-                break;
+                goto str_concat_done;   // reg-VM: honour CFF_FORCE_WB
             }
 
             // Blackhole propagation: if any part is a propagating
@@ -10251,6 +10303,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, v);
             }   // close scope for the Blackhole-propagation early-exit
         str_concat_done:
+            // reg-VM Phase 5: if OP_R_STR_CONCAT2 armed CFF_FORCE_WB, drop the
+            // result (top of stack) into the dst slot and pop; a normal
+            // STR_CONCAT has nothing armed, so this is a no-op and the result
+            // stays on the operand stack.
+            applyForceWriteback(vm);
             break;
         }
         case OP_ASSERT: {

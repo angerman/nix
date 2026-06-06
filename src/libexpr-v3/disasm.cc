@@ -111,6 +111,7 @@ const char * opName(Op op)
     case OP_CALL_PRIMOP:       return "OP_CALL_PRIMOP";
     case OP_R_PRIMOP2:         return "OP_R_PRIMOP2";
     case OP_R_CALL:            return "OP_R_CALL";
+    case OP_R_STR_CONCAT2:     return "OP_R_STR_CONCAT2";
     case OP_LIT_PRIMOP:        return "OP_LIT_PRIMOP";
     case OP_LIT_BUILTINS:      return "OP_LIT_BUILTINS";
     case OP_IS_NULL:           return "OP_IS_NULL";
@@ -171,6 +172,8 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
         return 1;                       // reg-VM: [cond_slot] (operand=target)
     case OP_R_CALL:
         return 1;                       // reg-VM: [(callee_slot<<12)|arg_slot]
+    case OP_R_STR_CONCAT2:
+        return 1;                       // reg-VM: [(forceStr<<24)|(a<<12)|b]
     default:
         return 0;
     }
@@ -355,6 +358,12 @@ uint32_t disassembleOne(std::FILE * out,
         // operand = dst slot; data[0] = (callee_slot<<12)|arg_slot.
         std::fprintf(out, "   ; r%u = call r%u r%u",
                      operand, dataAt(0) >> 12, dataAt(0) & 0xFFFu);
+        break;
+    case OP_R_STR_CONCAT2:
+        // operand = dst slot; data[0] = (forceStr<<24)|(a<<12)|b.
+        std::fprintf(out, "   ; r%u = r%u ++ r%u%s",
+                     operand, (dataAt(0) >> 12) & 0xFFFu, dataAt(0) & 0xFFFu,
+                     (dataAt(0) >> 24) & 1u ? " (force)" : "");
         break;
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:
