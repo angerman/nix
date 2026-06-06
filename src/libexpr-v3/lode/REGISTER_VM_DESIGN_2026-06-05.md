@@ -177,6 +177,26 @@ to-slot), 3 (R_STR_CONCAT2 for the `+`), 5 (R_GET_UPVALUE_REC_BINDING→slot,
 R_FORCE). The callee is still resolved via `GET_UPVALUE_REC_BINDING; SET` (item 5)
 and the `+` still round-trips via `GET_LOCAL2; STR_CONCAT` (item 3).
 
+### MILESTONE MEASUREMENT (2026-06-06) — register VM core is a real compute win
+
+With R_PRIMOP2 + R_BRANCH_FALSE + R_CALL all landed (the three fundamental op
+classes — arithmetic, branching, calls — now register-addressed), measured on
+the PRODUCTION path (`nix eval --impure --expr` + `NIX_V3_DIRECT_EVAL=1`, the
+gates `NIX_V3_NO_REG_PRIMOP2 / NO_R_BRANCH / NO_R_CALL` flip it OFF):
+
+- **fib27 dispatch: 11,441,212 → 6,356,250 = −44.4%** (NIX_VM_OPCOUNTS, tail -1).
+- **fib30 wall: 1.47× ± 0.19 faster** (hyperfine -N -w2 -r12: 1.514 s ± 0.046 ON
+  vs 2.229 s ± 0.275 OFF; user-CPU 1.222 s vs 1.661 s = 1.36×).
+
+This vindicates the register-VM thesis on compute-bound code: nearly HALF the
+dispatch eliminated, ~1.47× wall. (Real overhead-dominated corpora — hello /
+firefox drvPath — are defer/thunk/attrset-bound and see little of this, exactly
+as the Phase-1 real-code finding predicted; the win is on compute kernels.)
+
+Items 2/3/5 would shave the last ~7 stack ops/node (2× GET_UPVALUE+SET, the
+GET_LOCAL2, STR_CONCAT, the branch return) for an estimated further ~20-30%
+dispatch on fib — incremental polish on top of this landed milestone.
+
 ## Phases (each lands `--core` 19/19 byte-identical + IR-checks + r1 cache)
 
 - **Phase 1 — `OP_R_CALL_PRIMOP` (register-addressed primop call).** The
