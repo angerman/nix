@@ -1183,6 +1183,29 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     if (na == 0 && nb > 0) return const_cast<Bindings *>(b);
     if (nb == 0 && na > 0) return const_cast<Bindings *>(a);
 
+    // MEMORY_ATTACK_PLAN re-test (2026-06-06): the prior 5 Chain Phase C
+    // falsifications (ledger below) were all on the PRE-register-VM tree.  The
+    // register-VM rework this session materially changed the call / formals /
+    // arg-passing path — exactly the subsystem where the unidentified
+    // `f origArgs -> {}` collapse lived (the formals destructure at vm.cc:~5350
+    // now materialises Chains; the whole calling convention changed via R_CALL).
+    // So "5×-falsified" is STALE; per the falsification rule this material change
+    // to the failing subsystem is the new insight that justifies a re-test (NOT
+    // a blind rebuild).  Gated NIX_V3_CHAIN_BINDINGS=1 (default OFF); conditions
+    // mirror attempt #4/#5 (large parent, tiny overlay; a/b already materialised
+    // above so neither is a Chain).  Build Chain{parent=a, overlay=b} instead of
+    // copying a's na entries.
+    {
+        static const bool s_chain =
+            std::getenv("NIX_V3_CHAIN_BINDINGS") != nullptr;
+        if (s_chain && nb <= 4 && na >= 16) {
+            Bindings * c = Alloc::allocChainBindings(a, nb);
+            for (uint32_t j = 0; j < nb; ++j)
+                bindingsSetEntry(c, j, b->entries[j]);  // overlay sorted; Phase D
+            return c;
+        }
+    }
+
     // #826 / A1a Phase C attempt #4 + #5 (2026-05-30, EXIT_GC_SPIRAL):
     // REVERTED — same failure mode as prior 3 attempts.
     //

@@ -1,5 +1,25 @@
 # v3 memory attack plan — critically reviewed, measure-first (2026-06-06)
 
+> ## ⚠️ LOAD-BEARING CAVEAT: most prior memory work is PRE-REGISTER-VM
+> The register-VM rework (Phase 5, 2026-06-06: R_PRIMOP2/R_CALL/register-mode If/
+> R_STR_CONCAT2/R_MOVE/GET_UPVALUE_REC_BINDING_SLOT — fib now runs with the
+> operand stack fully dropped) **significantly changed the call / formals /
+> arg-passing / Bindings-flow paths**.  Nearly every memory finding this plan
+> cites pre-dates it and **must be treated as STALE until re-measured on the
+> current tree**, specifically:
+> - the **5× Chain Phase C falsifications** (EXIT_PHASE_C_4_FALSIFIED, vm.cc
+>   ledger) — all on the OLD VM; the unidentified `f origArgs → {}` collapse
+>   lived in exactly the call/arg path that R_CALL reworked.  **RE-TEST FIRST.**
+> - the **GC falsifications + Cheney/Immix SHIP-gates** ([[GC_PAUSE_2026-05-29]],
+>   STAGE_6_FALSIFIERS) — pre-VM-rework; arena/Bindings churn may differ now.
+> - the **L(t) live-fraction data** ([[L_TIME_SERIES_DATA_2026-05-29]]) — pre-rework.
+> - the **per-tag / mergeBindings attribution** (#821, HNE_MEMORY_ATTRIBUTION) —
+>   pre-rework (though S1 below RE-MEASURED `//`-dominance on the current tree).
+> Rule for this plan: a prior falsification only stands if it is RE-CONFIRMED on
+> the register-VM tree.  The register VM is a genuine new-insight per the
+> falsification rule for re-opening these.
+
+
 **Status:** ATTACK PLAN. The register-VM wall arc is complete (v3 beats TW
 1.54× on *compute*; real-nixpkgs drvPath is overhead/memory-bound and saw
 little of it). The bigger remaining gap is **memory**. This doc reviews the
@@ -143,6 +163,85 @@ reclaimable bytes (and confirm the §2 ceiling estimate is realistic for them).
   were hello-measured — re-evaluate on heavy, where the reclaimable is larger.
 
 ---
+
+## 5b. S1 RESULT + S3 re-check (2026-06-06) — measured, decisive
+
+**S1 (DONE, gate workload firefox.drvPath):** Bindings = 534 MB (69% of the
+771.8 MB arena, exact match to §1). `mergeBindings by site` is **100%
+concentrated in site [0] `OP_ATTRS_UPDATE` (`//`): 44,271 calls, 470.2 MB = 88%
+of all Bindings bytes.** hello.drvPath confirms: `//` = 364 MB / 401.8 MB
+Bindings (90.6%), peak 703.7 MB. ⇒ **CONCENTRATED** (not diffuse) ⇒ S3 routes to
+the **STRUCTURAL lever**, not the GC. The huge tail (firefox 129+ = 5,798
+attrsets) is the `//` chain-copy accumulation in the bump arena (no reclaim).
+
+**S3 re-check (MANDATED by §5/§6) — the load-bearing correction:** the structural
+"COW/shared-base `//`" lever **IS** the Chain Phase C path, which
+`EXIT_MERGEBINDINGS_AUDIT_2026-05-30` records as **FALSIFIED 3×** (v1 missed a
+Phase-D barrier; v2/v3 failed nixpkgs `hello.name` with `buildPythonApplication
+missing` on a 2-entry Bindings). Root cause: ~**342 `entries[]` direct-access
+sites** bypass the chain — an *ad-hoc whitelist* of "safe" iteration sites kept
+missing one. The scaffolding ALREADY EXISTS in alloc.hh (`Kind::{Sorted,Chain}`,
+chain-aware `lookup`, `forEach`, `materialize`, `entryCount`); only Chain
+*creation* in mergeBindings was reverted.
+
+**The deeper reading (vm.cc:1186-1248 ledger + EXIT_PHASE_C_4_FALSIFIED) makes
+this NO-GO for a blind build.** It is **5 attempts (#1-#5), not 3**, all failing
+identically (`buildPythonApplication missing`).  Critically, the v3 diagnostic
+(`V3_DBG_CHAIN_SELECT=1`) confirmed **`materialize()` fires correctly** (chain
+size 1-3 → materialised 41-494), AND the prime iteration suspect — the formals
+destructure (vm.cc:5350) — **already materialises Chains**.  So the failure is
+**NOT a missed iteration site**: the failing Bindings is a *Sorted* size-2
+`{override, overrideDerivation}`, i.e. some Nix-level `f origArgs` silently
+returns `{}` (→ `{} // overlay` short-circuits to the size-2 overlay) ONLY when
+chains are live upstream.  **That root cause was never isolated across 5
+attempts.**  Per [[measure-twice-cut-once]] §3.8 (3 strikes = falsified; this is
+5) and the project's core lesson (do not circle on falsified levers), a 6th
+*blind* attempt — even the compiler-enforced 342-site conversion — is **not
+justified**, because the prior diagnostics show the conversion is *not confirmed
+to be the fix* (materialise already fires correctly and still fails).
+
+**The only justified next step is prereq #1: a minimal Nix-level repro that
+isolates the `f origArgs → {}` collapse under chain interaction** — a focused
+diagnostic effort (its own session), not part of this measurement spike, and the
+genuine unblock.  Until that root cause is identified, building the structural
+lever is forbidden by the plan's own §4 gate (can't credibly clear ≤1.6× if it
+doesn't eval correctly) and §6.
+
+**Net go/no-go (this spike):** S1 decisively says CONCENTRATED → structural lever
+(Chain).  The structural lever was 5×-falsified — BUT all on the pre-register-VM
+tree, and the prior attempts never ISOLATED the root cause.
+
+### 5c. BREAKTHROUGH (2026-06-06) — root cause isolated; Chain UNBLOCKED
+
+Acting on the user's insight (the VM was reworked) I re-enabled Chain
+construction (`NIX_V3_CHAIN_BINDINGS=1`, nb≤4 && na≥16 → `Chain{parent=a,
+overlay=b}`) on the CURRENT tree.  hello.name STILL failed identically
+(`buildPythonApplication missing`) — so the rework didn't incidentally fix it,
+but it gave a **reproducible failure on a well-understood VM**.  A minimal chain
+repro (prereq #1 — which 5 prior attempts never built) tested each attrset op
+nixpkgs uses: lookup ✓, attrNames ✓, intersectAttrs ✓, formals-destructure ✓,
+removeAttrs ✓, hasAttr ✓ — **but `mapAttrs` on a chain FAILED** (returned a
+parent-less attrset).  Root cause: **`primMapAttrs` iterates `src->entries[]`
+directly over `src->size`, which for a Chain is the OVERLAY ONLY** — silently
+dropping the parent.  nixpkgs maps over chained package sets pervasively ⇒ the
+`f origArgs → {}` collapse.  This is the iteration-site class the ad-hoc audits
+kept missing.
+
+**Fix** (primops.cc `primMapAttrs`): `if (src->isChain()) src = materialize()`.
+⇒ hello.name / hello.pname / firefox.name now PASS with chains ON (byte-identical
+to OFF).  **Measured benefit (hello.drvPath, chains ON vs OFF):** peak RSS
+**692.6 → 245.0 MB (−65%)**, arena 520 → 151, Bindings 401.8 → 102.0 (−75%),
+mergeBindings 364 → 49.9 MB (−86%).  (Confounded: hello.drvPath ON still diverges
+to a fake-store path — MORE chain-unsafe iteration sites remain in the derivation
+path — so the −65% overstates the pure-chain win until those are fixed; but the
+magnitude decisively clears the §4 ≤1.6× gate and justifies completing the
+~20-30-site iteration audit.)
+
+**Status:** Chain lever GO.  Remaining: fix the rest of the chain-unsafe
+iteration sites (drvPath path) via the same minimal-repro method, get
+hello/firefox.drvPath byte-identical, measure the TRUE benefit, `--core` green,
+then decide default-on. The 5× "falsification" is RETIRED — it was an
+unidentified iteration site (mapAttrs ++), not an architectural wall.
 
 ## 6. What NOT to do (falsified / mistaken — keep dead)
 

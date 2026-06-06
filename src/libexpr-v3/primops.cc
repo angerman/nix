@@ -1866,6 +1866,13 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     if (!args[1].isAttrs()) typeError("mapAttrs", "attrset");
     auto * src = args[1].payload.bindings;
     if (!src) { out = args[1]; return; }
+    // ChainBindings (NIX_V3_CHAIN_BINDINGS): this loop walks src->entries[]
+    // directly over src->size, which for a Chain is the OVERLAY ONLY — it would
+    // silently drop the parent's entries (the isolated root cause of the 5×
+    // Chain Phase C falsification: nixpkgs mapAttrs over a chained package set
+    // returned a parent-less attrset → `buildPythonApplication missing`).
+    // Materialise to the full sorted view first (no-op for Sorted).
+    if (src->isChain()) src = const_cast<Bindings *>(src->materialize());
     Bindings * result = Alloc::allocBindings(src->size);
     V3_STATS_INC(attrsetsAllocated);
     recordBindingsOrigin(result, 0, "primMapAttrs");
@@ -2107,10 +2114,23 @@ static Value forceDeepRec(VMState & vm, Value v, std::unordered_set<const void *
         for (uint32_t i = 0; i < v.payload.list->size; ++i)
             v.payload.list->elems[i] = forceDeepRec(vm, v.payload.list->elems[i], seen);
     } else if (v.isAttrs() && v.payload.bindings) {
-        if (!seen.insert(v.payload.bindings).second) return v;
-        for (uint32_t i = 0; i < v.payload.bindings->size; ++i)
-            bindingsSetValue(v.payload.bindings, i,  // Phase D
-                forceDeepRec(vm, v.payload.bindings->entries[i].value, seen));
+        // ChainBindings: deep-force every value in the WHOLE chain (overlay +
+        // parent), else a `throw` in a parent value would escape deepSeq.
+        // Force-iterate the materialised view (forEach materialises a Chain);
+        // for Sorted this is the same in-place walk.  We can't write back into
+        // a materialised copy, so for a Chain we force via the merged view
+        // (forcing is idempotent + the chain shares the parent's cells).
+        const Bindings * b = v.payload.bindings;
+        if (b->isChain()) {
+            b->forEach([&](const Bindings::Entry & e) {
+                forceDeepRec(vm, e.value, seen);
+            });
+        } else {
+            if (!seen.insert(v.payload.bindings).second) return v;
+            for (uint32_t i = 0; i < v.payload.bindings->size; ++i)
+                bindingsSetValue(v.payload.bindings, i,  // Phase D
+                    forceDeepRec(vm, v.payload.bindings->entries[i].value, seen));
+        }
     }
     return v;
 }
@@ -5081,6 +5101,13 @@ static void primDerivationStrictNative(
 {
     auto & ns = *state.nixEvalState;
     auto * src = args[0].payload.bindings;
+    // ChainBindings: the whole derivation is computed by iterating src in lex
+    // order (lexicographicAttrOrder + src->entries[order[i]] reads below).  For
+    // a Chain that is the OVERLAY ONLY → the drv is built from a partial attr
+    // set → silently wrong store hash (the hello.drvPath fake-store divergence).
+    // Materialise to the full sorted view first (no-op for Sorted).  This is the
+    // most store-hash-critical chain-unsafe site.
+    if (src && src->isChain()) src = const_cast<Bindings *>(src->materialize());
     const auto & sym = drvStrictSymbols();
 
     // #741 Phase 3a SHADOW cache: deep-force input, hash, look up.
