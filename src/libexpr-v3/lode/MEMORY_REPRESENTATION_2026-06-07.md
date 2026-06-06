@@ -11,6 +11,15 @@ Companion to [[MEMORY_ATTACK_PLAN_2026-06-06]] (the orthogonal-lever survey)
 and [[QUANTIFICATION_2026-06-05]] (the wall-lever ranking). This doc is the
 *memory*-representation analysis those two deferred.
 
+> **HEADLINE UPDATE (2026-06-07, team M5 measurement + re-verify).** The "~2×
+> TW memory" in the title is **workload-concentrated, NOT universal.** On the
+> production **M5 / cardano-node.drvPath** target v3 is at **memory parity**
+> (924 vs 915 MB, +9 MB, byte-identical result). The 2.74× lives on
+> **overlay/override-heavy evals like firefox** (+592 MB, re-verified this
+> session, §4b). So the two levers below are for the **firefox-class
+> regression — they are NOT on the M5 critical path.** Read §4b before acting
+> on priority.
+
 ---
 
 ## 1. Verified facts (sizes from the structs, not estimates)
@@ -137,6 +146,54 @@ pure overlays; TW stays flat.**
 
 ---
 
+## 4b. M5 is at parity — the gap is workload-concentrated (the reframing)
+
+The team measured the production target (host-noise-immune metrics:
+instructions-retired + user-CPU; wall is meaningless on this host — TW firefox
+ranged 6–24 s at <2.5 s user). I re-verified firefox peak RSS same-host on
+current HEAD.
+
+| workload | metric | TW | v3 | v3 vs TW |
+|---|---|---|---|---|
+| **M5 / cardano-node.drvPath** | instructions | 44.96 B | 48.38 B | 1.08× slower |
+| | user-CPU | 10.30 s | 11.17 s | 1.08× slower |
+| | **peak RSS** | **915 MB** | **924 MB** | **1.01× (+9 MB)** · byte-identical |
+| python3.pkgs attrNames (pure eval) | user-CPU | 0.84 s | 0.45 s | **1.87× faster** |
+| firefox.drvPath | user-CPU | 2.48 s | 4.10 s | 1.65× slower |
+| **firefox.drvPath** (re-verified, this session) | **peak RSS** | **340 MB** | **932 MB** | **2.74× (+592 MB)** |
+
+**The crux is the *absolute* excess, not the ratio:** **+9 MB on cardano vs
++592 MB on firefox.** cardano is the *bigger* eval (915 MB TW vs 340 MB) yet
+carries ~zero v3 excess — so this is **not** a fixed overhead that amortizes.
+firefox.drvPath specifically triggers the §3-cause-#1 `//` materialization;
+cardano-node.drvPath does not (at comparable scale).
+
+**Two reconciliation hypotheses (distinguishable, not yet distinguished):**
+1. **firefox is override/overlay-pathological** — deep `overrideAttrs` /
+   `wrapFirefox` / `buildMozillaMach` chains do many big-base `//` (the 88% /
+   470 MB mergeBindings we measured); cardano's size is many *small*
+   derivations, not deep overrides over giant attrsets.
+2. **cardano memory is FFI/IFD-dominated** (haskell.nix materialization, store
+   work shared with TW via the bridge), so its *eval-graph* fraction — where
+   v3 is heavy — is small.
+
+**Distinguishing test (team-only; needs the cardano flake):** the
+`mergeBindings` byte-fraction of the arena. firefox = 88%; if cardano ≪ that,
+hypothesis 1; if cardano's arena is small vs total RSS, hypothesis 2. Either
+way the conclusion holds: **the levers target eval/overlay-heavy workloads, and
+M5 already meets its memory budget.**
+
+**Caveats (honest):** (i) the cardano parity is **team-measured; not
+same-host-reproduced here** (no cardano flake in this env). (ii) The firefox v3
+run produced a `/v3-fake-store/…` path, **not** byte-identical to TW — the
+**eval graph is fully built (932 MB confirms it), so the memory ratio is
+valid**, but firefox correctness is **not** verified by this run (cardano's
+was). (iii) The team's "old 2.3–6× / 4–6× baseline is stale" is right **for
+M5** — but firefox 2.74× memory is **current, not stale**; "stale" is
+workload-specific.
+
+---
+
 ## 5. Why ChainBindings is NEUTRAL — post-mortem (now fully explained)
 
 The chain is **not** bypassed and is **not** broken-by-construction. Verified:
@@ -225,13 +282,22 @@ tagged  8 B:  [ ……… value-or-pointer ……… │tag ]   tag in low (alig
 ## 8. Sequencing + combined projection
 
 ```
-            peak vs TW       attacks            risk
- today        2.74×            —                  —
- + Lever A    ~1.6–1.9×    cause #1 (88% //)   24-site audit, multi-session
- + Lever B    ~1.3–1.5×    cause #2 + broad    pervasive Value refactor + 64b-int box
- (cppnix)      1.00×       both, by design
+ firefox-class   peak vs TW    attacks            risk
+ today              2.74×        —                  —
+ + Lever A        ~1.6–1.9×   cause #1 (88% //)   24-site audit, multi-session
+ + Lever B        ~1.3–1.5×   cause #2 + broad    pervasive Value refactor + 64b-int box
+ (cppnix)           1.00×      both, by design
+ ───────────────────────────────────────────────────────────────────────────
+ M5/cardano         1.01×      already at parity — levers NOT on its critical path
 ```
 
+- **PRIORITY (post-§4b): the levers are NOT on the M5 critical path** — that
+  target is already at memory parity. They are for the **firefox-class
+  override-heavy regression** (still real, still 2.74×, and the IOG ecosystem /
+  HNE is overlay-heavy — so worth doing, but *after* M5-blocking work, not
+  before). Rank them against the firefox wall gap (1.65× slower) and the pure-
+  eval win (1.87× faster) — not against an M5 memory problem that no longer
+  exists.
 - **Neither lever alone clears a ≤1.6× gate; together they approach cppnix's
   representation.** Lever A is the bigger single win (the dominant 88%) and is
   proven-by-cppnix; do it first. Lever B is broad, wall-preserving, and the
