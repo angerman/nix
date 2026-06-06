@@ -140,6 +140,12 @@ struct Emitter
     // poIdx, …).  Reset per function alongside fuseGetPositions_.
     std::vector<uint32_t>        getLocalPositions_;
 
+    // Register VM Phase 5: when ≥0, the block currently being emitted is an If
+    // branch whose terminal value must land in this slot (the If's merge slot)
+    // rather than on the operand stack.  Captured + reset at emitBlock entry so
+    // nested blocks don't inherit it; set by emitBlockToSlot for each branch.
+    int32_t                      blockResultSlot_ = -1;
+
     // §2(a) constant rematerialization (NEXT_STEPS_2026-06-05).  A-normal-
     // form lowering names every literal operand, so the emitter would spill
     // a pure immediate into a slot (`LIT_* ; SET_LOCAL s ; … ; GET_LOCAL s`)
@@ -398,7 +404,7 @@ struct Emitter
     /// local slots / remat small-int consts (not upvalues, not deferred), and
     /// the primop has no deep-force-list arg.  Returns true iff emitted (the
     /// caller then skips the normal expr-emit + SET for this binding).
-    bool tryEmitRPrimop2(const ir::Binding & bd)
+    bool tryEmitRPrimop2(const ir::Binding & bd, int32_t dstOverride = -1)
     {
         static const bool s_noRegPrimop2 =
             std::getenv("NIX_V3_NO_REG_PRIMOP2") != nullptr;
@@ -426,9 +432,10 @@ struct Emitter
                 return false;
             desc[k] = sit->second & 0x7FFFu;          // bit15 clear ⇒ slot
         }
-        uint16_t dst = getOrAssignSlot(bd.var);
+        uint32_t dst = dstOverride >= 0
+            ? static_cast<uint32_t>(dstOverride) : getOrAssignSlot(bd.var);
         unit.code.push_back(encode(OP_R_PRIMOP2, internPrimOp(pc->primop)));
-        unit.code.push_back(dst);
+        unit.code.push_back(dst);                  // full word, no 12-bit cap
         unit.code.push_back((desc[0] << 16) | desc[1]);
         return true;
     }
@@ -452,7 +459,8 @@ struct Emitter
     /// unchanged.  ≤4095 slots (12-bit R_CALL fields).
     template <class SpineHeadMap>
     size_t tryEmitRCall(size_t i, const ir::Block & b, size_t nBd,
-                        bool tailLast, const SpineHeadMap & spineHead)
+                        bool tailLast, const SpineHeadMap & spineHead,
+                        int32_t dstOverride = -1)
     {
         static const bool s_no = std::getenv("NIX_V3_NO_R_CALL") != nullptr;
         if (s_no) return 0;
@@ -467,7 +475,8 @@ struct Emitter
         if (occ.lookup(bd.var).kind != ir::OccKind::OnceLinear) return 0;
         if (constRemat_.count(app->fun) || constRemat_.count(app->arg))
             return 0;
-        uint16_t dst = getOrAssignSlot(nxt.var);
+        uint32_t dst = dstOverride >= 0
+            ? static_cast<uint32_t>(dstOverride) : getOrAssignSlot(nxt.var);
         if (dst > 0xFFFu) return 0;
         // PEEK: classify each operand as resident or deferred-top, resolving
         // its slot WITHOUT emitting.  Returns false (caller bails) for a remat
@@ -501,8 +510,10 @@ struct Emitter
         unit.code.push_back((static_cast<uint32_t>(funSlot) << 12) | argSlot);
         // If the Force binding is the block tail, leave its value on the
         // operand stack for RETURN (mirrors tryEmitRPrimop2); the R_RETURN
-        // peephole then fuses `GET_LOCAL dst; RETURN` → `R_RETURN dst`.
-        if (tailLast && i + 2 == nBd) emitGetLocal(dst);
+        // peephole then fuses `GET_LOCAL dst; RETURN` → `R_RETURN dst`.  With a
+        // dstOverride (register-mode If) the result is already in the merge
+        // slot — leave nothing on the stack.
+        if (tailLast && i + 2 == nBd && dstOverride < 0) emitGetLocal(dst);
         return 2;
     }
 
@@ -534,10 +545,60 @@ struct Emitter
         }
         uint32_t dst = dstOverride >= 0
             ? static_cast<uint32_t>(dstOverride) : getOrAssignSlot(bd.var);
-        if (dst > 0xFFFu) return false;
+        if (dst > 0xFFFFFFu) return false;        // dst is the 24-bit operand
         unit.code.push_back(encode(OP_R_STR_CONCAT2, dst));
         unit.code.push_back((cs->forceString ? (1u << 24) : 0u)
                             | (static_cast<uint32_t>(slots[0]) << 12) | slots[1]);
+        return true;
+    }
+
+    /// Register VM Phase 5: emit `bid` so its terminal value lands in slot `R`
+    /// (no operand-stack value left).  Used per branch by register-mode If.
+    void emitBlockToSlot(ir::BlockId bid, uint16_t R)
+    {
+        int32_t saved = blockResultSlot_;
+        blockResultSlot_ = static_cast<int32_t>(R);
+        emitBlock(bid);
+        blockResultSlot_ = saved;
+    }
+
+    /// Register VM Phase 5: register-mode If — branch-result-to-slot.  When the
+    /// If binding's cond is materialised in a slot (R_BRANCH_FALSE eligible),
+    /// emit each branch so its terminal lands in the If's result slot R, with
+    /// the merge holding the value in R and NOTHING on the operand stack — so a
+    /// tail If becomes `… ; GET R ; RETURN` → `R_RETURN R` and the function
+    /// runs with the operand stack dropped.  `resultHint >= 0` (this If is
+    /// itself a branch tail) writes that slot directly instead of the binding's
+    /// own.  Gate NIX_V3_NO_R_IF.  Returns true iff emitted.
+    bool tryEmitRegisterIf(const ir::Binding & bd, bool isTail, int32_t resultHint)
+    {
+        static const bool s_no = std::getenv("NIX_V3_NO_R_IF") != nullptr;
+        if (s_no) return false;
+        auto * e = std::get_if<ir::If>(&bd.expr);
+        if (!e) return false;
+        // cond must be slot-resident + not deferred (same gate as the
+        // R_BRANCH_FALSE path in emitOne(If)).
+        auto sit = ctx->slot.find(e->cond);
+        if (sit == ctx->slot.end() || sit->second > 0xFFFFFFu) return false;
+        if (std::find(ctx->pendingDefer.begin(), ctx->pendingDefer.end(),
+                      e->cond) != ctx->pendingDefer.end())
+            return false;
+        uint32_t R = resultHint >= 0
+            ? static_cast<uint32_t>(resultHint) : getOrAssignSlot(bd.var);
+        if (R > 0xFFFu) return false;   // R_MOVE / merge fields are 12-bit
+        flushAllDeferred();
+        uint32_t bf = emitJumpPlaceholder(OP_R_BRANCH_FALSE);
+        unit.code.push_back(sit->second);              // cond_slot follow-up
+        emitBlockToSlot(e->thenBlock, static_cast<uint16_t>(R));
+        uint32_t je = emitJumpPlaceholder(OP_JUMP);
+        patchJump(bf, static_cast<uint32_t>(unit.code.size()));
+        emitBlockToSlot(e->elseBlock, static_cast<uint16_t>(R));
+        patchJump(je, static_cast<uint32_t>(unit.code.size()));
+        // R holds the result.  resultHint>=0 → leave it in the parent's merge
+        // slot (caller marks tailToResult).  Else for a tail If, GET R so the
+        // R_RETURN peephole fuses `GET R; RETURN`.  Else (non-tail) R is the
+        // binding's own slot and later uses GET it.
+        if (resultHint < 0 && isTail) emitGetLocal(static_cast<uint16_t>(R));
         return true;
     }
 
@@ -682,6 +743,16 @@ struct Emitter
         // runs with pending=[] at entry and exits with pending=[].
         flushAllDeferred();
 
+        // Register VM Phase 5: capture (and clear) the result-slot for THIS
+        // block — when ≥0 the block's terminal value must land in `myResult`
+        // (the enclosing If's merge slot), not on the operand stack.  Cleared
+        // so nested blocks don't inherit it (each branch sets its own via
+        // emitBlockToSlot).  `tailToResult` records that the tail binding's
+        // register op already wrote myResult (so the terminal does nothing).
+        int32_t myResult = blockResultSlot_;
+        blockResultSlot_ = -1;
+        bool tailToResult = false;
+
         // Optimisation: when the very last binding's VarId is the
         // block's TermReturn value, the binding's expression result
         // is already on top of the operand stack right after we
@@ -781,15 +852,35 @@ struct Emitter
             // `GET_LOCAL v; RETURN` → `R_RETURN v`, so a straight-line
             // arithmetic function (e.g. `map (x: x - 1)`'s lambda) runs with
             // ZERO operand-stack traffic (R_PRIMOP2; R_RETURN).
-            if (tryEmitRPrimop2(bd)) {
-                if (isTail) emitGetLocal(getOrAssignSlot(bd.var));
+            // Register VM Phase 5: register-mode If (branch-result-to-slot).
+            // When this If binding is the block tail (or a nested branch tail),
+            // emit each branch to the result slot so the merge holds the value
+            // in a register with nothing on the operand stack.
+            if (tryEmitRegisterIf(bd, isTail,
+                                  (isTail && myResult >= 0) ? myResult : -1)) {
+                if (isTail && myResult >= 0) tailToResult = true;
+                continue;
+            }
+
+            // For a tail binding inside a register-mode If branch, the register
+            // ops write the merge slot (`myResult`) directly — no GET_LOCAL,
+            // nothing left on the stack (terminal then does nothing).
+            int32_t tailDst = (isTail && myResult >= 0) ? myResult : -1;
+
+            if (tryEmitRPrimop2(bd, tailDst)) {
+                if (isTail) {
+                    if (tailDst >= 0) tailToResult = true;
+                    else emitGetLocal(getOrAssignSlot(bd.var));
+                }
                 continue;
             }
 
             // Register VM Phase 5: fuse `App(fun,arg); Force(...)` → OP_R_CALL
             // writing the Force's slot (drops arg GET + result round-trip +
             // FORCE).  Consumes 2 bindings; advance `i` past the Force.
-            if (size_t consumed = tryEmitRCall(i, b, nBd, tailLast, spineHead)) {
+            if (size_t consumed =
+                    tryEmitRCall(i, b, nBd, tailLast, spineHead, tailDst)) {
+                if (tailDst >= 0) tailToResult = true;
                 i += consumed - 1;     // skip the Force; loop ++i moves past App
                 continue;
             }
@@ -798,8 +889,11 @@ struct Emitter
             // operands → OP_R_STR_CONCAT2 writing a slot.  For the tail binding
             // emit GET_LOCAL after so the R_RETURN peephole can fuse it (a
             // straight-line concat tail then runs stack-free).
-            if (tryEmitRStrConcat2(bd)) {
-                if (isTail) emitGetLocal(getOrAssignSlot(bd.var));
+            if (tryEmitRStrConcat2(bd, tailDst)) {
+                if (isTail) {
+                    if (tailDst >= 0) tailToResult = true;
+                    else emitGetLocal(getOrAssignSlot(bd.var));
+                }
                 continue;
             }
 
@@ -843,6 +937,43 @@ struct Emitter
                 uint16_t slot = getOrAssignSlot(bd.var);
                 unit.code.push_back(encode(OP_SET_LOCAL, slot));
             }
+        }
+
+        // Register VM Phase 5: when this block must deliver its terminal to a
+        // slot (`myResult` ≥ 0, an If branch), land the value in that slot with
+        // nothing left on the operand stack.
+        if (myResult >= 0) {
+            uint16_t R = static_cast<uint16_t>(myResult);
+            if (tailToResult) {
+                // A tail register op (R_PRIMOP2 / R_CALL / R_STR_CONCAT2) or a
+                // nested register-If already wrote R — nothing to do.
+            } else if (tailLast) {
+                // The tail binding left its value on the operand stack (a
+                // non-register op) → commit it to R.
+                unit.code.push_back(encode(OP_SET_LOCAL, R));
+            } else if (ret.value != ir::kInvalid) {
+                // A var/const terminal (e.g. `then: n`): move it into R.  A
+                // slot-resident, non-deferred var uses R_MOVE (stack-free);
+                // otherwise fall back to GET/emit + SET.
+                auto it = ctx->slot.find(ret.value);
+                bool resident = it != ctx->slot.end()
+                    && it->second <= 0xFFFu
+                    && !constRemat_.count(ret.value)
+                    && std::find(ctx->pendingDefer.begin(),
+                                 ctx->pendingDefer.end(), ret.value)
+                           == ctx->pendingDefer.end();
+                if (resident) {
+                    unit.code.push_back(encode(OP_R_MOVE,
+                        (static_cast<uint32_t>(R) << 12) | it->second));
+                } else {
+                    emitVarRef(ret.value);
+                    unit.code.push_back(encode(OP_SET_LOCAL, R));
+                }
+            } else {
+                unit.code.push_back(encode(OP_LIT_NULL));
+                unit.code.push_back(encode(OP_SET_LOCAL, R));
+            }
+            return;   // pending is empty (flushed); nothing on the stack
         }
 
         // Terminal: TermReturn.  If tailLast, the value is already on

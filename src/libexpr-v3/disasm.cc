@@ -112,6 +112,7 @@ const char * opName(Op op)
     case OP_R_PRIMOP2:         return "OP_R_PRIMOP2";
     case OP_R_CALL:            return "OP_R_CALL";
     case OP_R_STR_CONCAT2:     return "OP_R_STR_CONCAT2";
+    case OP_R_MOVE:            return "OP_R_MOVE";
     case OP_LIT_PRIMOP:        return "OP_LIT_PRIMOP";
     case OP_LIT_BUILTINS:      return "OP_LIT_BUILTINS";
     case OP_IS_NULL:           return "OP_IS_NULL";
@@ -364,6 +365,10 @@ uint32_t disassembleOne(std::FILE * out,
         std::fprintf(out, "   ; r%u = r%u ++ r%u%s",
                      operand, (dataAt(0) >> 12) & 0xFFFu, dataAt(0) & 0xFFFu,
                      (dataAt(0) >> 24) & 1u ? " (force)" : "");
+        break;
+    case OP_R_MOVE:
+        // operand = (dst<<12)|src.
+        std::fprintf(out, "   ; r%u = r%u", operand >> 12, operand & 0xFFFu);
         break;
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:

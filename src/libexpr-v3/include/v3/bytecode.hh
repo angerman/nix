@@ -212,6 +212,13 @@ enum Op : uint8_t
     /// STR_CONCAT body (numeric add / float / string concat with context).  At
     /// str_concat_done applyForceWriteback drops the result into regs[dst].
     OP_R_STR_CONCAT2  = 0x63,
+    /// Register VM Phase 5: slot→slot copy `regs[dst] = regs[src]`.
+    /// operand = (dst<<12)|src (both 12-bit; no follow-up word).  Used by
+    /// register-mode If to land a var-ref branch tail (`then: n`) directly in
+    /// the merge slot without a GET/SET operand-stack round-trip.  A plain
+    /// copy (no force): args are Nix-lazy, so a thunk/WHNF is copied as-is and
+    /// the consumer forces — identical to the GET;SET it replaces.
+    OP_R_MOVE         = 0x64,
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

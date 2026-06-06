@@ -3817,6 +3817,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 goto op_str_concat;
             }
         }
+        case OP_R_MOVE: {
+            // reg-VM Phase 5: regs[dst] = regs[src].  operand=(dst<<12)|src.
+            // Plain copy (no force) — see bytecode.hh.
+            uint32_t dst = operand >> 12;
+            uint32_t src = operand & 0xFFFu;
+            vm.valueStack[stackBase + dst] = vm.valueStack[stackBase + src];
+            break;
+        }
         // OP_BRANCH_TRUE: bytecode value reserved; lowerer always emits
         // OP_BRANCH_FALSE with negated condition or OP_AND/OP_OR-shaped
         // branches.  Removed dispatch; default-case abort catches stale.
