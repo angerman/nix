@@ -219,6 +219,16 @@ enum Op : uint8_t
     /// copy (no force): args are Nix-lazy, so a thunk/WHNF is copied as-is and
     /// the consumer forces — identical to the GET;SET it replaces.
     OP_R_MOVE         = 0x64,
+    /// Register VM Phase 5 (item 5a): the register-result form of
+    /// OP_GET_UPVALUE_REC_BINDING — resolve a captured rec-attrset upvalue's
+    /// `name` slot and write the resulting Tag::Slot into a LOCAL slot directly
+    /// (no operand-stack push + SET).  This is the last fib operand-stack
+    /// transient (the recursive self-resolution callee for R_CALL).
+    ///   operand = SymbolId (REMAPPED in serialize, like GET_UPVALUE_REC_BINDING)
+    ///   3 follow-up words = [dst_slot, upvalIdx, icIdx]
+    /// (vs GET_UPVALUE_REC_BINDING's 2 = [upvalIdx, icIdx]; the dst is prepended,
+    /// and is process-independent so it is NOT remapped.)
+    OP_GET_UPVALUE_REC_BINDING_SLOT = 0x65,
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

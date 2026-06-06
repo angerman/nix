@@ -6908,6 +6908,13 @@ void primImport(EvalState & state, Value * args, Value & out)
                                             compareSymOperand(ipA - 1, arA, arB);
                                             ipA += 2; ipB += 2;
                                             break;
+                                        case OP_GET_UPVALUE_REC_BINDING_SLOT:
+                                            // item 5a: operand is the SymbolId;
+                                            // trailer [dst, upvalIdx, icIdx] —
+                                            // skip 3.
+                                            compareSymOperand(ipA - 1, arA, arB);
+                                            ipA += 3; ipB += 3;
+                                            break;
                                         case OP_R_PRIMOP2:
                                             // reg-VM: operand=poIdx (not a
                                             // symbol); trailer [dst, descAB] —

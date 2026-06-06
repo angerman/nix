@@ -228,16 +228,41 @@ R_RETURN r2
 return (`R_RETURN`), string-concat/`+` (`R_STR_CONCAT2`), slot copy (`R_MOVE`),
 dual-load (`GET_LOCAL2`).
 
-**The one remaining operand-stack transient** in fib is the rec-binding
-self-resolution `GET_UPVALUE_REC_BINDING fib ; SET s` (item 5a,
-`R_GET_UPVALUE_REC_BINDING→slot`): a LOAD that pushes + a STORE to a slot.  Its
-load-to-register variant is DEFERRED as disproportionate: it needs a new opcode
-carrying a **remapped SymbolId operand** (the serializer symbol-collect/remap
-surface — the error-prone "two bytecode caches" trap) PLUS either a defer-policy
-change for all `RecBindingSlotRef` or an instruction-removing post-emit peephole
-(position-shift + jump rebase), all to eliminate ONE cheap `SET` per resolution.
-The register VM is complete without it — a register VM legitimately resolves a
-recursive global via load+store; fib already executes register-mode at 1.54×.
+### ITEM 5a LANDED (2026-06-06) → fib runs with the operand stack FULLY dropped
+
+`OP_GET_UPVALUE_REC_BINDING_SLOT` (`<this commit>`) — the register-result form of
+GET_UPVALUE_REC_BINDING: resolve the captured rec-attrset upvalue's `name` slot
+and write the Tag::Slot straight into a LOCAL slot (no push + SET).
+operand = SymbolId (remapped like GET_UPVALUE_REC_BINDING); 3 follow-ups
+[dst, upvalIdx, icIdx].  Emitted (tryEmitRecBindToSlot) for a RecBindingSlotRef
+whose var is used as a call callee (the `appFunVars` set) and whose source is a
+captured upvalue — the fib self-resolution shape — dropping the materialising
+SET that tryEmitRCall would emit.  Done as a DIRECT emit (no instruction-removing
+peephole, no position shift); the serializer symbol-remap is mirrored from
+GET_UPVALUE_REC_BINDING with skip-3 at all 4 walk sites + the verifier, and
+r1-trigger-verify (270/270 byte-match) confirms it.
+
+fib's `func "n"` now has **ZERO operand-stack ops** — every instruction is
+register-addressed:
+```
+R_PRIMOP2 r1 = n<2 ; R_BRANCH_FALSE if !r1 -> else
+  R_MOVE r2 = r0
+else:
+  GET_UPVALUE_REC_BINDING_SLOT r3 = fib ; R_PRIMOP2 r4 ; R_CALL r6 = r3,r4
+  GET_UPVALUE_REC_BINDING_SLOT r7 = fib ; R_PRIMOP2 r8 ; R_CALL r10 = r7,r8
+  R_STR_CONCAT2 r2 = r6 ++ r10
+R_RETURN r2
+```
+
+**Final register VM measurement (production `nix eval`):**
+- **fib27 dispatch: 11,441,212 → 5,402,820 = −52.8%** (more than HALF eliminated;
+  item 5a added −10.5% over the −47.2% from the rest by dropping the 2 SETs/node).
+- fib30 wall 1.36–1.54× faster (the stack baseline is noisy on this host, per the
+  user; dispatch is the deterministic metric).
+
+The register VM is now COMPLETE end to end: every opcode class in a compute
+kernel is register-addressable and the canonical recursive function executes with
+the operand stack entirely dropped.  Gate `NIX_V3_NO_RBSR_SLOT`.
 
 ## Phases (each lands `--core` 19/19 byte-identical + IR-checks + r1 cache)
 

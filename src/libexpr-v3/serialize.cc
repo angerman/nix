@@ -149,7 +149,8 @@ collectReferencedSymbols(const CompilationUnit & cu)
          || op == OP_WITH_LOOKUP
          || op == OP_ATTRS_SELECT
          || op == OP_REC_BINDING_SLOT_REF
-         || op == OP_GET_UPVALUE_REC_BINDING) {
+         || op == OP_GET_UPVALUE_REC_BINDING
+         || op == OP_GET_UPVALUE_REC_BINDING_SLOT) {
             bump(operand);
             // OP_ATTRS_SELECT has 1 IC follow-up word.
             // #779 Schema 10: OP_REC_BINDING_SLOT_REF also has 1 IC
@@ -159,6 +160,9 @@ collectReferencedSymbols(const CompilationUnit & cu)
             // §2(b): OP_GET_UPVALUE_REC_BINDING carries [upvalIdx, icIdx]
             // (2 trailing words); its operand is the looked-up SymbolId.
             else if (op == OP_GET_UPVALUE_REC_BINDING) ip += 2;
+            // item 5a: OP_GET_UPVALUE_REC_BINDING_SLOT carries
+            // [dst, upvalIdx, icIdx] (3 trailing words); operand is the sym.
+            else if (op == OP_GET_UPVALUE_REC_BINDING_SLOT) ip += 3;
         } else if (op == OP_ATTRS_INIT) {
             uint32_t n = operand;
             for (uint32_t i = 0; i < n; ++i) {
@@ -246,6 +250,8 @@ collectReferencedPositions(const CompilationUnit & cu)
             ++ip;  // 1 IC follow-up word
         } else if (op == OP_GET_UPVALUE_REC_BINDING) {
             ip += 2;  // §2(b): [upvalIdx, icIdx] — no PosIdx in trailer
+        } else if (op == OP_GET_UPVALUE_REC_BINDING_SLOT) {
+            ip += 3;  // item 5a: [dst, upvalIdx, icIdx] — no PosIdx in trailer
         } else if (op == OP_ATTRS_INIT) {
             uint32_t n = operand;
             for (uint32_t i = 0; i < n; ++i) {
@@ -502,6 +508,12 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
             // recSlotCache slot (re-zeroed on load) — neither is remapped.
             word = encode(op, remapId(operand));
             ip += 2;
+        } else if (op == OP_GET_UPVALUE_REC_BINDING_SLOT) {
+            // item 5a: like GET_UPVALUE_REC_BINDING — operand is the looked-up
+            // SymbolId (remap), trailer is [dst, upvalIdx, icIdx] (3 words,
+            // process-independent — not remapped).
+            word = encode(op, remapId(operand));
+            ip += 3;
         } else if (op == OP_ATTRS_INIT) {
             // Names get remapped; runtime sorts on the fly so order
             // doesn't matter.
@@ -605,6 +617,8 @@ void remapPositionsInBytecode(CompilationUnit & cu,
             ++ip;  // IC follow-up
         } else if (op == OP_GET_UPVALUE_REC_BINDING) {
             ip += 2;  // §2(b): [upvalIdx, icIdx] — no PosIdx in trailer
+        } else if (op == OP_GET_UPVALUE_REC_BINDING_SLOT) {
+            ip += 3;  // item 5a: [dst, upvalIdx, icIdx] — no PosIdx in trailer
         } else if (op == OP_ATTRS_INIT) {
             uint32_t n = operand;
             for (uint32_t i = 0; i < n; ++i) {

@@ -552,6 +552,39 @@ struct Emitter
         return true;
     }
 
+    /// Register VM Phase 5 (item 5a): for a RecBindingSlotRef binding whose var
+    /// is used as a call callee (the fib self-resolution shape) and whose source
+    /// is a captured rec-attrset upvalue, resolve straight into the binding's
+    /// slot with OP_GET_UPVALUE_REC_BINDING_SLOT — dropping the GET_UPVALUE
+    /// push + the materialising SET that tryEmitRCall would otherwise emit.
+    /// Gate NIX_V3_NO_RBSR_SLOT.  Returns true iff emitted (caller skips the
+    /// generic emit + defer/SET; the value is now slot-resident).
+    bool tryEmitRecBindToSlot(const ir::Binding & bd,
+                              const std::unordered_set<ir::VarId> & appFunVars)
+    {
+        static const bool s_no = std::getenv("NIX_V3_NO_RBSR_SLOT") != nullptr;
+        if (s_no) return false;
+        auto * e = std::get_if<ir::RecBindingSlotRef>(&bd.expr);
+        if (!e) return false;
+        if (!appFunVars.count(bd.var)) return false;       // only call-callee uses
+        // Source must be a captured upvalue (the GET_UPVALUE_REC_BINDING form):
+        // not the deferred stack top, not a local slot.
+        if (!ctx->pendingDefer.empty() && ctx->pendingDefer.back() == e->attrs)
+            return false;
+        if (ctx->slot.find(e->attrs) != ctx->slot.end()) return false;
+        auto uit = ctx->upvalue.find(e->attrs);
+        if (uit == ctx->upvalue.end()) return false;
+        uint32_t dst = getOrAssignSlot(bd.var);
+        flushAllDeferred();                                // match emitVarRef discipline
+        uint32_t icIdx = static_cast<uint32_t>(unit.recSlotCache.size());
+        unit.recSlotCache.emplace_back();
+        unit.code.push_back(encode(OP_GET_UPVALUE_REC_BINDING_SLOT, e->name));
+        unit.code.push_back(dst);            // dst slot (process-independent)
+        unit.code.push_back(uit->second);    // upvalIdx
+        unit.code.push_back(icIdx);
+        return true;
+    }
+
     /// Register VM Phase 5: emit `bid` so its terminal value lands in slot `R`
     /// (no operand-stack value left).  Used per branch by register-mode If.
     void emitBlockToSlot(ir::BlockId bid, uint16_t R)
@@ -785,6 +818,15 @@ struct Emitter
         std::unordered_set<ir::VarId> spineInner;
         std::unordered_map<ir::VarId,
             std::pair<ir::VarId, std::vector<ir::VarId>>> spineHead;
+
+        // Register VM Phase 5 (item 5a): VarIds used as some App's callee.  A
+        // RecBindingSlotRef bound to one of these is a call-callee candidate
+        // (the fib self-resolution shape) → resolve it straight into its slot
+        // with OP_GET_UPVALUE_REC_BINDING_SLOT (dropping the push + SET).
+        std::unordered_set<ir::VarId> appFunVars;
+        for (auto & bd : b.bindings)
+            if (auto * a = std::get_if<ir::App>(&bd.expr))
+                appFunVars.insert(a->fun);
         if (!s_noCallN) {
             for (auto & bd : b.bindings)
                 if (auto * a = std::get_if<ir::App>(&bd.expr))
@@ -861,6 +903,13 @@ struct Emitter
                 if (isTail && myResult >= 0) tailToResult = true;
                 continue;
             }
+
+            // Register VM Phase 5 (item 5a): a RecBindingSlotRef used as a call
+            // callee resolves straight into its slot (no push + SET).  Value is
+            // now slot-resident; skip defer/SET.  (A callee var is never the
+            // block's return value, so no tail handling is needed.)
+            if (tryEmitRecBindToSlot(bd, appFunVars))
+                continue;
 
             // For a tail binding inside a register-mode If branch, the register
             // ops write the merge slot (`myResult`) directly — no GET_LOCAL,

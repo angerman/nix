@@ -9709,6 +9709,62 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             push(vm, v);
             break;
         }
+        case OP_GET_UPVALUE_REC_BINDING_SLOT: {
+            // reg-VM Phase 5 (item 5a): identical resolution to
+            // OP_GET_UPVALUE_REC_BINDING, but writes the resulting Tag::Slot
+            // into regs[dst] instead of pushing — dropping the SET that
+            // materialised the recursive-self callee for R_CALL.  See
+            // bytecode.hh.  operand=sym; follow-ups=[dst, upvalIdx, icIdx].
+            if (!closure)
+                throw std::runtime_error(
+                    "v3 OP_GET_UPVALUE_REC_BINDING_SLOT: no closure context");
+            SymbolId sym      = static_cast<SymbolId>(operand);
+            uint32_t dst      = cu->code[ip++];
+            uint32_t upvalIdx = cu->code[ip++];
+            uint32_t icIdx    = cu->code[ip++];
+            if (upvalIdx >= closure->nUpvalues)
+                throw std::runtime_error(
+                    "v3 OP_GET_UPVALUE_REC_BINDING_SLOT: upvalue index out of range");
+            Value attrs = closure->upvalues[upvalIdx];
+            if (attrs.isAppLike()
+                || attrs.tag() == Tag::Thunk
+                || attrs.tag() == Tag::Slot)
+                attrs = forceValue(vm, attrs);
+            if (!attrs.isAttrs() || !attrs.payload.bindings)
+                throw std::runtime_error(
+                    "v3 OP_GET_UPVALUE_REC_BINDING_SLOT: source is not a forced attrset");
+            Bindings * b = attrs.payload.bindings;
+            Value * found = nullptr;
+            {
+                auto & ic = cu->recSlotCache[icIdx];
+                if (__builtin_expect(ic.bindings == b, 1)) {
+                    found = &b->entries[ic.slot].value;
+                } else {
+                    uint32_t lo = 0, hi = b->size, slotIdx = 0;
+                    while (lo < hi) {
+                        uint32_t mid = (lo + hi) >> 1;
+                        SymbolId midName = b->entries[mid].name;
+                        if (midName == sym) {
+                            found = &b->entries[mid].value;
+                            slotIdx = mid;
+                            break;
+                        }
+                        if (midName < sym) lo = mid + 1;
+                        else               hi = mid;
+                    }
+                    if (found) { ic.bindings = b; ic.slot = slotIdx; }
+                }
+            }
+            if (!found) {
+                const auto & tbl = ir::globalSymbolTable();
+                std::string nm = (sym < tbl.size()) ? tbl[sym] : "?";
+                throw std::runtime_error(
+                    "v3 OP_GET_UPVALUE_REC_BINDING_SLOT: name '" + nm
+                    + "' not found in source attrset");
+            }
+            vm.valueStack[stackBase + dst].mkSlot(found);
+            break;
+        }
         case OP_WITH_LOOKUP: {
             // Sync local ip into the top frame BEFORE withLookup may
             // throw — otherwise the cycle dump's frame[top].ip is
