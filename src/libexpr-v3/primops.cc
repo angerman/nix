@@ -6919,6 +6919,11 @@ void primImport(EvalState & state, Value * args, Value & out)
                                             // [cond_slot] — skip, no symbol.
                                             ipA++; ipB++;
                                             break;
+                                        case OP_R_CALL:
+                                            // reg-VM: operand=dst slot; trailer
+                                            // [(callee<<12)|arg] — skip, no symbol.
+                                            ipA++; ipB++;
+                                            break;
                                         case OP_ATTRS_INIT: {
                                             uint32_t n = arA;
                                             for (uint32_t i = 0; i < n; ++i) {

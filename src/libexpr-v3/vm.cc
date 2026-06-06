@@ -3712,6 +3712,70 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             if (cval.isBool() && cval.payload.i == 0) ip = operand;
             break;
         }
+        case OP_R_CALL: {
+            // reg-VM Phase 5: register-addressed non-tail call.  See bytecode.hh.
+            //   operand = dst slot ; follow-up word = (callee_slot<<12)|arg_slot
+            uint32_t dst        = operand;
+            uint32_t rdesc      = cu->code[ip];   // peek follow-up (consumed Phase 2)
+            uint32_t calleeSlot = rdesc >> 12;
+            uint32_t argSlot    = rdesc & 0xFFFu;
+            // Phase 1: force the callee slot in place if it is a genuinely
+            // non-WHNF indirection (Thunk / Slot), then re-execute — the A8
+            // pattern (identical to OP_R_PRIMOP2's arg pre-force).  This makes
+            // a thunk-callee resolve to its Closure on the iterative frame-push
+            // path (Phase 2) rather than C-recursing through callClosure.
+            // Tag::App / App3 are NOT forced here: a Tag::App is a partial
+            // application (PAP) — WHNF for call purposes, exactly as OP_CALL's
+            // own handler treats it (op_call_have_fun, not iter_force).  Forcing
+            // a PAP would re-enter op_force_slow on an already-WHNF value and,
+            // with the re-execute, spin forever (e.g. lib `concat = fold f ""`
+            // applied as a `+` operand).  PAP callees fall through to Phase 2's
+            // callClosure path, which applies them correctly.
+            {
+                Value callee = vm.valueStack[stackBase + calleeSlot];
+                Tag ct = callee.tag();
+                if (ct == Tag::Thunk || ct == Tag::Slot) {
+                    push(vm, callee);
+                    CallFrame & frame = vm.frames.back();
+                    setForceWriteback(frame, static_cast<uint16_t>(calleeSlot));
+                    frame.flags |= CFF_FORCE_RETRY;
+                    ip = ip - 1;            // rewind to OP_R_CALL
+                    goto op_force_slow;
+                }
+            }
+            ip++;                           // Phase 2: consume the follow-up word
+            {
+                Value callee = vm.valueStack[stackBase + calleeSlot];
+                Value argv   = vm.valueStack[stackBase + argSlot];  // lazy, unforced
+                const Closure * cl = callee.tag() == Tag::Closure
+                    ? callee.payload.closure : nullptr;
+                if (cl && cl->desc && cl->desc->arity == 1
+                    && cl->desc->selectorSym == 0 && !cl->desc->identityLambda) {
+                    // Plain single-arg user closure: take the iterative
+                    // frame-push path so deep recursion (fib, fold) stays on
+                    // vm.frames, not the C stack.  Arm CFF_FORCE_WB=dst (NO
+                    // CFF_FORCE_RETRY) so the callee's OP_RETURN drops the
+                    // result into regs[dst] and we resume past this op;
+                    // op_call_dispatch's frame push leaves the caller frame's
+                    // flags untouched, so the armed writeback survives the call.
+                    push(vm, callee);
+                    push(vm, argv);
+                    setForceWriteback(vm.frames.back(),
+                                      static_cast<uint16_t>(dst));
+                    goto op_call_dispatch;
+                }
+                // Any other callee shape — primop / selector- or identity-
+                // lambda / __functor attrset / multi-arity PAP — is SHALLOW (no
+                // deep user recursion), so run it synchronously via callClosure
+                // and store the result.  This avoids threading the result
+                // writeback through op_call_dispatch's many inline fast-path
+                // exits.  (vm.valueStack may reallocate inside callClosure;
+                // index by offset afterwards.)
+                Value out = callClosure(vm, callee, argv);
+                vm.valueStack[stackBase + dst] = out;
+                break;
+            }
+        }
         // OP_BRANCH_TRUE: bytecode value reserved; lowerer always emits
         // OP_BRANCH_FALSE with negated condition or OP_AND/OP_OR-shaped
         // branches.  Removed dispatch; default-case abort catches stale.

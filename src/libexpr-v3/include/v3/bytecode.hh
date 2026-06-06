@@ -186,6 +186,20 @@ enum Op : uint8_t
     /// so compactFuseSetGet's jump rebase applies) + 1 follow-up word
     /// `cond_slot`.
     OP_R_BRANCH_FALSE = 0x5f,
+    /// Register VM Phase 5: register-addressed (non-tail) call.  Replaces
+    /// `GET callee; GET arg; CALL; FORCE; SET dst` with one op that reads the
+    /// callee + arg from local slots and routes the result back into a slot:
+    ///   operand = dst_slot (24-bit) ; 1 follow-up word = (callee_slot<<12)|arg_slot
+    /// Phase 1: if regs[callee_slot] is non-WHNF, A8 force-writeback to that
+    /// slot and re-execute (same pattern as OP_R_PRIMOP2's arg pre-force) — so
+    /// by Phase 2 the callee is WHNF and op_call_dispatch's iter_force path
+    /// never fires for this op.  Phase 2: push the (WHNF) callee + the (lazy,
+    /// unforced) arg, arm the caller frame's CFF_FORCE_WB=dst WITHOUT
+    /// CFF_FORCE_RETRY, and goto op_call_dispatch; on the callee's OP_RETURN
+    /// applyForceWriteback drops the result into regs[dst] and execution
+    /// continues past this op (no re-exec).  Non-tail only (tail calls deliver
+    /// straight to the caller's caller).  ≤4095 slots (12-bit fields).
+    OP_R_CALL         = 0x62,
 
     // --- Lists ----------------------------------------------------------
     OP_LIST_INIT      = 0x60,  // [n:24]   pop n elems, push list

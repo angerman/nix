@@ -181,7 +181,7 @@ collectReferencedSymbols(const CompilationUnit & cu)
                 if (ip + 2 * i < code.size()) bump(code[ip + 2 * i]);
             }
             ip += 2 * n;
-        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE) {
+        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL) {
             ++ip;  // primop-index follow-up
         } else if (op == OP_R_PRIMOP2) {
             ip += 2;  // reg-VM: dst + (descA<<16|descB); no SymbolId operand
@@ -277,7 +277,7 @@ collectReferencedPositions(const CompilationUnit & cu)
                     bump(code[ip + 2 * i + 1]);
             }
             ip += 2 * n;
-        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE) {
+        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL) {
             ++ip;
         } else if (op == OP_R_PRIMOP2) {
             ip += 2;  // reg-VM: dst + descAB
@@ -567,7 +567,7 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
                 if (--p.setsRemaining == 0) pending.pop_back();
             }
             // No trailing data.
-        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE) {
+        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL) {
             ip++;  // primop-index follow-up
         } else if (op == OP_R_PRIMOP2) {
             ip += 2;  // reg-VM: dst + (descA<<16|descB); no SymbolId operand
@@ -637,7 +637,7 @@ void remapPositionsInBytecode(CompilationUnit & cu,
                         remapPos(code[ip + 2 * i + 1]);
             }
             ip += 2 * n;
-        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE) {
+        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL) {
             ++ip;
         } else if (op == OP_R_PRIMOP2) {
             ip += 2;  // reg-VM: dst + descAB

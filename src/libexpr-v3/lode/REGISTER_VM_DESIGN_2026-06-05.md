@@ -128,6 +128,55 @@ with the operand stack dropped → the v3-beats-TW compute target. Order:
 3 + 1 (tractable, synchronous/branch) → 2 (the coordinated If emit) → 4/5
 (the calling-convention crux).
 
+### LANDED (2026-06-06): `R_BRANCH_FALSE` (item 1) + `R_CALL` (item 4, the crux)
+
+- **`R_BRANCH_FALSE`** (`ce96347c2`) — branch on `regs[cond_slot]`. fib's
+  `n < 2` is now `R_PRIMOP2 __lessThan r1=r0,#2 ; R_BRANCH_FALSE if !r1 -> T`.
+
+- **`R_CALL dst, callee_slot, arg_slot`** — the async crux, and it turned out
+  TRACTABLE because the A8 writeback machinery already does "deliver a callee's
+  return value into a caller slot." The shipped design:
+  - **Phase 1 (callee force):** if `regs[callee_slot]` is a genuinely non-WHNF
+    indirection (`Tag::Thunk`/`Tag::Slot`), force-writeback IT to its slot +
+    re-execute (the R_PRIMOP2 arg-force pattern). This resolves a thunk-callee to
+    its Closure on the iterative frame-push path rather than C-recursing.
+  - **Phase 2 (the call):** plain single-arg user closures (`arity==1`,
+    `!selectorSym`, `!identityLambda` — the deep-recursion case) take the
+    iterative `op_call_dispatch` path with `setForceWriteback(caller, dst)` set
+    **but NOT `CFF_FORCE_RETRY`** — so the callee's `OP_RETURN` →
+    `applyForceWriteback` drops the result into `regs[dst]` and execution
+    continues PAST the op (no re-exec). Every other callee shape (primop,
+    selector/identity lambda, `__functor`, multi-arity PAP — all SHALLOW) runs
+    synchronously via `callClosure` + a direct slot store, which sidesteps
+    threading the writeback through op_call_dispatch's ~9 inline fast-path exits.
+  - **Emit** (`tryEmitRCall`, the call analogue of `tryEmitRPrimop2`): fuses
+    `vC = App(fun,arg)` + an OnceLinear `vF = Force(vC)` into one R_CALL writing
+    vF's slot — dropping the arg GET, the result round-trip, and the FORCE.
+    Operands must be slot-resident or the deferred stack TOP (peek-then-commit so
+    a bail emits nothing). fib's recursive body went from
+    `GET fib; SET_KEEP; R_PRIMOP2 r4; GET r4; CALL; FORCE; SET 6` to
+    `GET fib; SET 3; R_PRIMOP2 r4; R_CALL r6=r3,r4`.
+
+  **BUG FOUND + FIXED during validation (the lang suite earned its keep):**
+  Phase 1 originally also forced `Tag::App`/`App3`. But a `Tag::App` is a PARTIAL
+  APPLICATION (PAP) — WHNF for call purposes (OP_CALL's own handler applies it at
+  `op_call_have_fun`, it does NOT iter_force it). Forcing a PAP re-enters
+  op_force_slow on an already-WHNF value and, with the re-execute, SPINS FOREVER.
+  Caught by `eval-okay-listtoattrs.nix` (lib `concat = fold f ""` — a PAP — used
+  as a `+` operand): `--core` hung on it (16 closures, tight loop). Fix: Phase 1
+  forces only `Thunk`/`Slot`; PAP callees fall through to Phase 2's `callClosure`.
+  **Lesson:** `Tag::App` is dual-use (PAP vs deferred-call); never blanket-force
+  it — mirror OP_CALL's PAP-vs-iter_force discriminator.
+
+  Validation: lang 142/143 (the 1 fail = pre-existing `eval-okay-types`, identical
+  ON/OFF), fib=55 with 2 R_CALL ops, smoke ALL PASS, IR-checks 29/29. Gate
+  `NIX_V3_NO_R_CALL`.
+
+Remaining for full fib stack-freedom: items 2 (register-mode If, branch-result-
+to-slot), 3 (R_STR_CONCAT2 for the `+`), 5 (R_GET_UPVALUE_REC_BINDING→slot,
+R_FORCE). The callee is still resolved via `GET_UPVALUE_REC_BINDING; SET` (item 5)
+and the `+` still round-trips via `GET_LOCAL2; STR_CONCAT` (item 3).
+
 ## Phases (each lands `--core` 19/19 byte-identical + IR-checks + r1 cache)
 
 - **Phase 1 — `OP_R_CALL_PRIMOP` (register-addressed primop call).** The

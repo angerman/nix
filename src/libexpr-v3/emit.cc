@@ -433,6 +433,79 @@ struct Emitter
         return true;
     }
 
+    /// Register VM Phase 5: fuse a non-tail `vC = App(fun,arg)` that is
+    /// immediately consumed by an OnceLinear `vF = Force(vC)` into ONE
+    /// OP_R_CALL writing vF's slot — dropping the arg GET, the result
+    /// operand-stack round-trip, and the separate FORCE.  This is the call
+    /// analogue of tryEmitRPrimop2.  Returns the number of bindings consumed
+    /// (0 = no match, 2 = the App + its Force).  Gate NIX_V3_NO_R_CALL.
+    ///
+    /// Each operand must be either slot-resident or the deferred operand-stack
+    /// TOP (at most one can be the top in the canonical `RecBindingSlotRef; App`
+    /// shape).  All feasibility/cap checks run in a PEEK pass that emits
+    /// nothing, so a bail is a clean no-op; only the COMMIT pass emits.
+    ///
+    /// Correctness: the callee is forced in-VM (R_CALL Phase 1) and the result
+    /// is written UNFORCED to the slot (Nix-lazy, more TW-like than the eager
+    /// FORCE it replaces); every real consumer (the strict primop / STR_CONCAT
+    /// that the Force fed) re-forces on use, so the observable value is
+    /// unchanged.  ≤4095 slots (12-bit R_CALL fields).
+    template <class SpineHeadMap>
+    size_t tryEmitRCall(size_t i, const ir::Block & b, size_t nBd,
+                        bool tailLast, const SpineHeadMap & spineHead)
+    {
+        static const bool s_no = std::getenv("NIX_V3_NO_R_CALL") != nullptr;
+        if (s_no) return 0;
+        const auto & bd = b.bindings[i];
+        auto * app = std::get_if<ir::App>(&bd.expr);
+        if (!app) return 0;
+        if (spineHead.count(bd.var)) return 0;         // spine heads use CALL_N
+        if (i + 1 >= nBd) return 0;
+        const auto & nxt = b.bindings[i + 1];
+        auto * frc = std::get_if<ir::Force>(&nxt.expr);
+        if (!frc || frc->thunk != bd.var) return 0;    // next must be Force(vC)
+        if (occ.lookup(bd.var).kind != ir::OccKind::OnceLinear) return 0;
+        if (constRemat_.count(app->fun) || constRemat_.count(app->arg))
+            return 0;
+        uint16_t dst = getOrAssignSlot(nxt.var);
+        if (dst > 0xFFFu) return 0;
+        // PEEK: classify each operand as resident or deferred-top, resolving
+        // its slot WITHOUT emitting.  Returns false (caller bails) for a remat
+        // const, an upvalue/unbound, a buried deferred value, or a >12-bit slot.
+        auto & p = ctx->pendingDefer;
+        auto classify = [&](ir::VarId v, bool & isTop, uint16_t & slot) -> bool {
+            bool deferred = std::find(p.begin(), p.end(), v) != p.end();
+            if (!deferred) {
+                auto it = ctx->slot.find(v);
+                if (it == ctx->slot.end()) return false;       // upvalue/unbound
+                isTop = false; slot = it->second;
+            } else {
+                if (p.back() != v) return false;               // buried
+                isTop = true; slot = getOrAssignSlot(v);        // idempotent assign
+            }
+            return slot <= 0xFFFu;
+        };
+        bool funTop = false, argTop = false;
+        uint16_t funSlot = 0, argSlot = 0;
+        if (!classify(app->fun, funTop, funSlot)) return 0;
+        if (!classify(app->arg, argTop, argSlot)) return 0;
+        if (funTop && argTop) return 0;        // can't both be the single top
+        // COMMIT: pop the deferred-top operand (if any) into its slot, then
+        // emit the call.  At most one operand is on the stack top, so the
+        // single SET_LOCAL is order-independent.
+        if (funTop || argTop) {
+            p.pop_back();
+            unit.code.push_back(encode(OP_SET_LOCAL, funTop ? funSlot : argSlot));
+        }
+        unit.code.push_back(encode(OP_R_CALL, dst));
+        unit.code.push_back((static_cast<uint32_t>(funSlot) << 12) | argSlot);
+        // If the Force binding is the block tail, leave its value on the
+        // operand stack for RETURN (mirrors tryEmitRPrimop2); the R_RETURN
+        // peephole then fuses `GET_LOCAL dst; RETURN` → `R_RETURN dst`.
+        if (tailLast && i + 2 == nBd) emitGetLocal(dst);
+        return 2;
+    }
+
     uint32_t addIntConst(int64_t n)
     {
         unit.intConstants.push_back(n);
@@ -675,6 +748,14 @@ struct Emitter
             // ZERO operand-stack traffic (R_PRIMOP2; R_RETURN).
             if (tryEmitRPrimop2(bd)) {
                 if (isTail) emitGetLocal(getOrAssignSlot(bd.var));
+                continue;
+            }
+
+            // Register VM Phase 5: fuse `App(fun,arg); Force(...)` → OP_R_CALL
+            // writing the Force's slot (drops arg GET + result round-trip +
+            // FORCE).  Consumes 2 bindings; advance `i` past the Force.
+            if (size_t consumed = tryEmitRCall(i, b, nBd, tailLast, spineHead)) {
+                i += consumed - 1;     // skip the Force; loop ++i moves past App
                 continue;
             }
 
