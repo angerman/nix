@@ -68,6 +68,18 @@ const Bindings * Bindings::materialize() const
 {
     if (kind == uint8_t(Kind::Sorted)) return this;
 
+    // Memoize: a chain iterated K times would otherwise allocate K full
+    // materialised copies (measured +195 MB on hello.drvPath — the chain
+    // SAVED 301 MB of merge copies but the un-memoised materialise re-added
+    // ~496 MB).  Cache the materialised Sorted result per-chain so each
+    // chain materialises at most once.  Thread-local side table (no struct
+    // change); pointers are arena-lived within a single eval (chains don't
+    // survive VMState teardown, so cross-eval staleness can't be observed).
+    static thread_local std::unordered_map<const Bindings *, const Bindings *>
+        s_matMemo;
+    if (auto it = s_matMemo.find(this); it != s_matMemo.end())
+        return it->second;
+
     // Walk the chain leaf-first (overlay-first); collect (level, entry)
     // pairs into a flat vector; sort by (name, level); keep the first
     // occurrence of each name (which is overlay-winning because lower
@@ -109,6 +121,7 @@ const Bindings * Bindings::materialize() const
     // NIX_V3_NURSERY isn't set; the function early-returns inside).
     bindingsPostConstructBarrier(out);
 
+    s_matMemo.emplace(this, out);
     return out;
 }
 

@@ -19,6 +19,37 @@
 > the register-VM tree.  The register VM is a genuine new-insight per the
 > falsification rule for re-opening these.
 
+> ## ✅ FINAL VERDICT (2026-06-06): structural Chain lever — BUILT, byte-identical, NEUTRAL → DO NOT SHIP
+> The structural lever was carried all the way to a CORRECT, byte-identical
+> implementation (something the 5 prior attempts never reached) and then MEASURED
+> on the gate workload:
+> - **Unblocked** the "5×-falsified" Chain by isolating the real root cause —
+>   chain-unsafe `entries[]` iteration sites (mapAttrs was the first miss), not an
+>   architectural wall.  Fixed 8 sites; lang 142/143 with aggressive chains;
+>   hello.drvPath/outPath + firefox.drvPath **byte-identical** with chains ON.
+> - **Measured (true, byte-identical):** firefox.drvPath ON **972.9 MB** vs OFF
+>   976.2; hello.drvPath 701.6 vs 705.7 — **NEUTRAL** (the prior −65% was a
+>   confound: the bug made the eval do less work).
+> - **Why neutral:** the chain avoids the `//` copy (mergeBindings 364→62.6 MB on
+>   hello) but the huge `//` results are ITERATED (mapAttrs over package sets, the
+>   derivation env build), and a chain-aware iteration must `materialize()` →
+>   re-pays the copy.  The bytes are concentrated in `//` (S1 correct) but they
+>   are NOT lookup-only — so shared-base/COW gives no net peak reduction.  To
+>   realise a saving would require STREAMING (non-materialising) chain iteration
+>   in every hot consumer (mapAttrs/env/foldl-over-attrs/…) — a much larger
+>   rewrite than the lever, and the un-memoised materialise even REGRESSED +195 MB
+>   before the memo fix brought it back to neutral.
+> - **Decision (per §4 pre-committed gate "build ONLY if it clears ≤1.6×
+>   firefox"):** it clears nothing (neutral) → **DO NOT SHIP.**  Chains stay gated
+>   OFF (`NIX_V3_CHAIN_BINDINGS`, default off); the 8 iteration-site fixes are kept
+>   (genuine chain-safety, inert when off).  Kills the hypothesis "the concentrated
+>   `//` bytes admit a cheap structural COW fix" — they don't, because they're
+>   iterated, not shared-read.
+> - **Indicated remaining lever:** since the bytes are real + concentrated but NOT
+>   cheaply shareable, the only way left to reduce them is to RECLAIM them → the
+>   GC (Immix) path, re-judged on heavy workloads per S2 (§2 ceiling ~1.2–1.9×
+>   firefox).  That is the next investment, NOT more structural-COW work.
+
 
 **Status:** ATTACK PLAN. The register-VM wall arc is complete (v3 beats TW
 1.54× on *compute*; real-nixpkgs drvPath is overhead/memory-bound and saw

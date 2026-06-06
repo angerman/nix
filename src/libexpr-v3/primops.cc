@@ -5071,6 +5071,13 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
             if (f.payload.bindings) {
                 const auto & st = ir::globalSymbolTable();
                 auto * b = f.payload.bindings;
+                // ChainBindings: the bytecode `derivation` wrapper builds this
+                // `env` attrset by merging the args (na≥16) → a Chain whose
+                // entries[] is the OVERLAY ONLY.  Iterating it directly here
+                // dropped env vars → wrong drv hash on `.drvPath` (while a full
+                // `derivation show` re-instantiation was correct).  Materialise
+                // to the full sorted view (no-op for Sorted).
+                if (b->isChain()) b = const_cast<Bindings *>(b->materialize());
                 for (uint32_t i = 0; i < b->size; ++i) {
                     SymbolId nm = b->entries[i].name;
                     Value elv = forceValue(*state.vm, b->entries[i].value);
