@@ -137,6 +137,7 @@ SUITES+=( "derivation-parity|drvPath byte-equal vs TW|$TEST_DIR/derivation-parit
 SUITES+=( "flake-sourceinfo-parity|callFlake sourceInfo byte-equal vs TW (non-git + git)|NIX=$NIX $TEST_DIR/run-flake-sourceinfo-parity.sh" )
 SUITES+=( "fetcher-parity|native fetchGit/fetchTree byte-equal vs TW|NIX=$NIX $TEST_DIR/run-fetcher-parity.sh" )
 SUITES+=( "readdir-import-coerce-parity|readDir/import attrset (recursive outPath/__toString) coercion byte-equal vs TW|NIX=$NIX $TEST_DIR/run-readdir-import-coerce-parity.sh" )
+SUITES+=( "chain-bindings-parity|Lever A ChainBindings pure-refactor (chain-off == chain-on)|NIX=$NIX $TEST_DIR/run-chain-bindings-parity.sh" )
 
 # Brute mode (~2 min) — purpose-built BRUTE / AUDIT harness.  Runs
 # a curated battery of allocating workloads, captures stderr

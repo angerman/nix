@@ -325,5 +325,86 @@ sites `grep -n 'materialize()' src/libexpr-v3/*.cc`.
 
 ---
 
+## 10. Lever A — IMPLEMENTED + MEASURED (2026-06-07, post-register-VM)
+
+Lever A was built this session. The chain *construct* already existed
+(`vm.cc` mergeBindings, gated `NIX_V3_CHAIN_BINDINGS=1`); the work was the
+§6 consumer conversion + chain composition + the consumer audit. Result:
+**the lever WORKS and clears the firefox SHIP gate by a wide margin while
+staying byte-equal** — the "v3's `//` overhead is intrinsic" hypothesis is
+**FALSIFIED**.
+
+### What landed
+1. **`Bindings::Cursor`** (alloc.hh) — k-way-merge over chain layers (≤8,
+   overlay-wins, alloc-free) + cursor-based `forEach` / `totalSize` /
+   `countDistinct`. The piece cppnix has and v3 lacked.
+2. **Cursor consumers**: `attrNames` / `attrValues` stream the chain (no
+   materialise copy).
+3. **Chain composition** (mergeBindings Step 4): `chain // small` EXTENDS
+   the chain (parent ptr + tiny overlay) up to the layer cap instead of
+   re-materialising the base on every `//`. This is the firefox win — deep
+   `overrideAttrs` / `wrapFirefox` stacks now cost O(depth) tiny overlays +
+   one shared base, not O(depth) full copies.
+4. **Store-hash-critical chain guards** (the audit — these were the bugs):
+   - `valueToJsonWithContext` + `valueToJson` (primops.cc): the
+     `__structuredAttrs` JSON serializer iterated overlay-only → a
+     structured derivation hashed from a partial attrset → degenerate
+     constant drv hash (python3.withPackages collapsed regardless of its
+     package list). Now materialise first.
+   - `valuesEqual` ×2 (vm.cc + primops.cc): index-wise compare assumed
+     Sorted → `chain == its-own-materialisation` wrongly returned false,
+     breaking `lib.unique`/`elem`/override-equality. Now materialise both.
+   - `OP_ATTRS_SELECT` / `OP_ATTRS_SELECT_DYN`: materialise the chain
+     (memoised). See the deferred-optimisation note below.
+
+### Measured (this session, same host)
+
+| workload | metric | v3 default | v3 chain-on | Δ |
+|---|---|---|---|---|
+| **firefox.drvPath** | peak RSS | 932.6 MB | **663.8 MB** | **−268 MB (−29 %)**, 2.79×→**1.83× TW** |
+| §4 synthetic (`attrNames` each) | peak RSS | 216 MB | 131 MB | residual = 1000 transient attrNames string-lists (arena-no-reclaim / GC track), NOT a `//` cost |
+
+SHIP gate (§6): firefox reduction ≥ 150 MB → **MET (268 MB)** with byte-
+equality intact.
+
+### Byte-equality validation (chain-on == chain-off, disk cache off)
+- v3 **core suite 19/19 GREEN with `NIX_V3_CHAIN_BINDINGS=1`** (incl. 143
+  lang tests, drv-parity, all parity-vs-TW suites).
+- **20+ package drvPath sweep** byte-identical incl. the initially-failing
+  git / cargo / rustc / cargo-auditable.cargoDeps / python3.withPackages.
+- chain micro-battery (attrNames / toJSON / valuesEqual / formals /
+  dynamic-select / removeAttrs / deep-compose) all chain-on == chain-off.
+- With chains OFF (the default) every change is a no-op → byte-identical to
+  pre-Lever-A (core 19/19 unaffected).
+
+### The audit lesson (why prior attempts stalled)
+The 5 prior Phase-C falsifications were right that a consumer audit is
+required — but the failing sites were NOT the obvious `entries[]` loops; they
+were **the JSON serializer and `valuesEqual`** (store-hash-critical, only
+exercised by real `derivationStrict`, which hello/firefox's `/v3-fake-store/`
+stubs bypass). They were found by nixpkgs bisection: `git.drvPath` diverged →
+`derivation show` diff drilled git→cargo→auditable→vendor→fetch-cargo-vendor-
+util→python3-env, isolating each leaf, then minimal micro-repros pinned the
+exact primop. **Use real `/nix/store/` drvPaths (disk cache off) for chain
+byte-equality — fake-store stubs hide the derivationStrict path.**
+
+### DEFERRED optimisation (no carcass; the gate stays off)
+A lookup-only `OP_ATTRS_SELECT` (walk layers, no copy) measured a further
+firefox **−132 MB (→535 MB)** but introduced a subtle **shared-parent
+writeback contamination**: forcing/memoising a value reached through a SHARED
+base layer corrupted sibling chains (`OP_CALL: callee is not a closure` deep
+in cargo/git). materialise-SELECT avoids it by copying entries first. Revisit
+only with a precise shared-`Pair`/writeback analysis; the extra 132 MB is not
+worth the correctness risk today.
+
+### Status: GATED default-OFF (`NIX_V3_CHAIN_BINDINGS=1`)
+Byte-equal on core + a broad sample, but the full ~255-site `entries[]`
+surface is not exhaustively audited (the cargo contamination proves latent
+sites can hide outside the sample). Default-on warrants a **full nixpkgs
+drvPath CI sweep** first. The mechanism + win are proven; flipping the default
+is the remaining gate.
+
+---
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
