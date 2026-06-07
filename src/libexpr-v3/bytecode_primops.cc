@@ -614,24 +614,21 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "          ); "
                 "  in go startSet [] {} null");
 
-        // T20 — zipAttrsWith (Tier 2c, 2026-05-29).  Combine list of
-        // attrsets keyed by attribute name; per-name combine via
-        // `fn name (values_for_name)`.  C primZipAttrsWith builds
-        // Tag::App lazy entries (so per-name combine fires only when
-        // the result entry is accessed); the bytecode version
-        // achieves the same laziness via Nix-source `listToAttrs`
-        // where each entry's `value` slot is a thunk for
-        // `fn name (catAttrs name sets)`.  Forcing the entry chases
-        // the thunk → applies fn lazily on access.
+        // T20 — zipAttrsWith.  DEFAULT = the native C primZipAttrsWith
+        // (O(N × K_total) via unordered_map, lazy Tag::App entries, fn
+        // applied via callClosure — flat loop, no per-key C-recursion).
         //
-        // Asymptotic: name-union via foldl' a // b is O(N × M) where
-        // N = number of sets and M = max attrset size.  C uses
-        // unordered_map for O(N × K_total).  For nixpkgs modules
-        // (where M can be 1000+ and N is 10-100), this is the costly
-        // pattern; but the C version's prior O(N × M_modules) eager-
-        // App allocation already dominates and the bytecode version
-        // matches that order.  Reverts via NIX_V3_NO_BC_ZIP_ATTRS_WITH=1.
-        if (!std::getenv("NIX_V3_NO_BC_ZIP_ATTRS_WITH"))
+        // The bytecode version below is OPT-IN ONLY (NIX_V3_BC_ZIP_ATTRS_WITH=1)
+        // because it is **O(n²)** (measured 2026-06-07: 16k sets = 0.96 s/499 MB
+        // vs the C primop's 0.13 s/41 MB; 32k = 1875 MB).  Two quadratic costs:
+        // the name-union `foldl' (a: b: a // b) {} sets` (++/// accumulation —
+        // same antipattern as the old filter/sort), AND `catAttrs name sets`
+        // re-walked once PER name = O(N × S).  The C version is lazy too (Tag::
+        // App entries), so the bytecode form has no compensating advantage —
+        // it was a blanket Tier-2c V3-native install that regressed.  Verified
+        // byte-identical (value-list order, dup keys, fn application) + --core
+        // 20/20 on the C path.
+        if (std::getenv("NIX_V3_BC_ZIP_ATTRS_WITH"))
             installBytecodePrimop(state, "zipAttrsWith",
                 "fn: sets: "
                 "  let "
