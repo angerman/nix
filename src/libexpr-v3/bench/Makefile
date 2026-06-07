@@ -12,15 +12,27 @@
 GATE := ./v3-vs-tw-gate.sh
 WORKLOAD ?=
 
-# A big attrset built ONCE then read by name 5000× — stresses attrset
-# lookup / forcing (the regime the team measured as v3-faster).
-LOOKUP := let s = builtins.listToAttrs (builtins.genList (i: { name = "a" + toString i; value = i; }) 5000); in builtins.foldl' (a: k: a + s.$${k}) 0 (builtins.attrNames s)
+# Quoting rule (learned the hard way): workloads go through make → sh → ssh →
+# the gate, so NO embedded `"` and NO `$${...}` (shell-expands to empty). Use
+# numeric `toString` names and `builtins.getAttr` instead of `."x"` / `.$${k}`.
+# `foldl'` (single quote) is fine inside the recipe's "$(VAR)" double-quoting.
+# Sizes target the ≥1–2 s duration floor (sub-100 ms is startup-jitter noise).
 
-# Many attrsets CONSTRUCTED via genList/listToAttrs + foldl' — primop-driven
-# iteration, v3's documented weak spot (the fold-add-17× family).
-FOLD := builtins.foldl' (a: o: a + builtins.length (builtins.attrNames o)) 0 (builtins.genList (i: builtins.listToAttrs (builtins.genList (j: { name = "a" + toString j; value = i + j; }) 200)) 300)
+# Compute / dispatch (register-VM regime). ~1.6 s; v3 ≈ 1.28× TW on the optimized build.
+FIB := let f = n: if n < 2 then n else f (n - 1) + f (n - 2); in f 33
 
-.PHONY: help selftest measure measure-lookup measure-fold measure-firefox
+# getAttr-heavy on a SMALL set (2M lookups) — isolates lookup, AVOIDS the
+# listToAttrs O(n²) build cliff. ~1.3 s.
+LOOKUP := let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = i; }) 1000); in builtins.foldl' (a: _: a + (builtins.getAttr (toString 500) s)) 0 (builtins.genList (x: x) 2000000)
+
+# Primop-driven iteration (the fold-add family) — many small attrset builds. ~1 s.
+FOLD := builtins.foldl' (a: o: a + builtins.length (builtins.attrNames o)) 0 (builtins.genList (i: builtins.listToAttrs (builtins.genList (j: { name = toString j; value = i + j; }) 500)) 2000)
+
+# The O(n²) listToAttrs build cliff (lode/LISTTOATTRS_QUADRATIC_2026-06-07.md).
+# Regression guard: ~15 s on v3 today, should be ~O(n) once pinned+fixed.
+LTA := let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = i; }) 200000); in builtins.seq s 0
+
+.PHONY: help selftest measure measure-fib measure-lookup measure-fold measure-listtoattrs measure-firefox
 
 help: ## Show this help
 	@printf '\n\033[1mv3 measurement targets\033[0m\n\n'
@@ -39,11 +51,17 @@ measure: ## Gate one workload:  make measure WORKLOAD='<nix-expr>'
 	@test -n "$(WORKLOAD)" || { echo "set WORKLOAD='<nix-expr>'"; exit 2; }
 	@$(GATE) "$(WORKLOAD)"
 
-measure-lookup: ## Attrset lookup/forcing (v3-strong regime)
+measure-fib: ## Compute/dispatch (fib 33) — register-VM regime, ~1.28× TW
+	@$(GATE) "$(FIB)"
+
+measure-lookup: ## getAttr lookups on a small set (isolated, no build cliff)
 	@$(GATE) "$(LOOKUP)"
 
-measure-fold: ## Primop-iteration / attrset construction (v3-weak, fold-add family)
+measure-fold: ## Primop iteration / small-attrset construction (fold-add family)
 	@$(GATE) "$(FOLD)"
+
+measure-listtoattrs: ## The O(n²) listToAttrs build cliff — regression guard (~15s)
+	@$(GATE) "$(LTA)"
 
 measure-firefox: ## firefox.drvPath — derivation-bound; shows the fake-store DIVERGENT gate
 	@$(GATE) '(import <nixpkgs> {}).firefox.drvPath'
