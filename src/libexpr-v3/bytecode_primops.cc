@@ -295,6 +295,35 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // via NIX_V3_NO_BYTECODE_PRIMOPS=1 (gated above in run.cc).
         // Hot primops first; each one runs the property suite + lang
         // tests + bench as part of its landing commit.
+        //
+        // ───────────────────────────────────────────────────────────────
+        // STATUS 2026-06-08 — BYTECODE LIST/DATA PRIMOPS ARE DEFAULT-OFF.
+        //
+        // The bc-vs-cpp benchmark suite (bench/bc-vs-cpp.sh, 3 regimes:
+        // per-element / per-call / fusable-chain; see memory
+        // project_bytecode_primop_regressions_2026-06-07) found the
+        // bytecode-primop subsystem LOSES TO C++ in every regime, every
+        // config: C++ wins 9/10 big, 10/10 small (+395…+4630 ns/call), and
+        // even stream-fusion on its own best case leaves bytecode ~2× behind.
+        // So each loser is flipped to OPT-IN (default = the native C primop),
+        // not removed — the bytecode source is KEPT here as a documented
+        // registry + A/B handle; opt back in per-primop via NIX_V3_BC_<NAME>=1.
+        //
+        // CORRECTNESS EXCEPTIONS — these stay bytecode-DEFAULT-ON because the
+        // C primop is not a drop-in (a perf loss is irrelevant if the native
+        // path is wrong):
+        //   * filter  — C primFilter's deepForceList force-evaluates list
+        //               ELEMENTS before applying the predicate, so it throws
+        //               on a `throw` the predicate would have skipped
+        //               (verified: `filter (x: true) [1 (throw) 2]` → TW=3,
+        //               bytecode=3, C++ THROWS).  The bytecode form
+        //               (concatLists∘map) is lazy-correct AND O(n).
+        //   * groupBy — same deepForceList over-forcing (TW=3, C++ THROWS);
+        //               bytecode is lazy-correct + measured linear.
+        // (partition is the opposite: the bytecode form was too LAZY vs TW —
+        // `partition (x: true) [1 (throw) 2]` TW THROWS, bytecode=3 — so it
+        // flips to C++, which both fixes that divergence AND wins on perf.)
+        // ───────────────────────────────────────────────────────────────
 
         // ORDER MATTERS: bytecode primops are visible to the lowerer
         // only AFTER they're installed.  If primop B's source uses
@@ -311,7 +340,7 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // WHNF on every tail call (matches TW primFoldl semantics).
         // The recursive `go` is rewritten to OP_TAIL_CALL by emit.cc's
         // peephole — O(1) vm.frames regardless of list size.
-        if (!std::getenv("NIX_V3_NO_BC_FOLDL"))
+        if (std::getenv("NIX_V3_BC_FOLDL"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
             installBytecodePrimop(state, "foldl'",
                 "op: nul: list: "
                 "  let n = builtins.length list; "
@@ -329,7 +358,7 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // bytecode above but inlines the `f` application per element.
         // The opt_stream_fusion pass rewrites detected foldl'+map
         // patterns to PrimOpCall(__foldlMap, [op, nul, f, xs]).
-        if (!std::getenv("NIX_V3_NO_BC_FOLDLMAP"))
+        if (std::getenv("NIX_V3_BC_FOLDLMAP"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
             installBytecodePrimop(state, "__foldlMap",
                 "op: nul: f: list: "
                 "  let n = builtins.length list; "
@@ -355,7 +384,7 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // laziness (each result entry is forced on demand) by
         // expressing map in terms of genList — which itself is a
         // C primop that builds Tag::App entries lazily.
-        if (!std::getenv("NIX_V3_NO_BC_MAP"))
+        if (std::getenv("NIX_V3_BC_MAP"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
             installBytecodePrimop(state, "map",
                 "fn: list: "
                 "  builtins.genList "
@@ -366,7 +395,7 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // Direct tail-recursive go with early exit on false.  Pure
         // bytecode iteration (no foldl' dependency — needs early
         // exit which foldl' doesn't provide).
-        if (!std::getenv("NIX_V3_NO_BC_ALL"))
+        if (std::getenv("NIX_V3_BC_ALL"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
             installBytecodePrimop(state, "all",
                 "pred: list: "
                 "  let n = builtins.length list; "
@@ -388,13 +417,13 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // `acc ++ …` copies the growing accumulator → O(n²) (Nix `++` is
         // always a full copy).  `map` keeps the spine lazy / elements
         // lazy; `concatLists` does ONE count+alloc+copy pass.
-        if (!std::getenv("NIX_V3_NO_BC_CONCATMAP"))
+        if (std::getenv("NIX_V3_BC_CONCATMAP"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
             installBytecodePrimop(state, "concatMap",
                 "fn: list: builtins.concatLists (builtins.map fn list)");
 
         // T5 — any: short-circuit fold for "some elem satisfies pred".
         // Mirror of all (early exit on true instead of false).
-        if (!std::getenv("NIX_V3_NO_BC_ANY"))
+        if (std::getenv("NIX_V3_BC_ANY"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
             installBytecodePrimop(state, "any",
                 "pred: list: "
                 "  let n = builtins.length list; "
@@ -449,7 +478,7 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // class as the old filter/concatMap.  Tagging keeps `pred` to one
         // evaluation per element (matches TW primPartition's single pass
         // + left-to-right throw order); elements stay lazy.
-        if (!std::getenv("NIX_V3_NO_BC_PARTITION"))
+        if (std::getenv("NIX_V3_BC_PARTITION"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
             installBytecodePrimop(state, "partition",
                 "pred: list: "
                 "  let tagged = builtins.map (x: { v = x; k = pred x; }) list; "
@@ -505,7 +534,7 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // is STRICT; ties resolve to a (the left/earlier run).  The
         // partition's leftBad/rightBad mirror that strictness.  Reverts to
         // the O(n log n) C primSort via NIX_V3_NO_BC_SORT=1.
-        if (!std::getenv("NIX_V3_NO_BC_SORT"))
+        if (std::getenv("NIX_V3_BC_SORT"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
             installBytecodePrimop(state, "sort",
                 "cmp: list: "
                 "  let ea = builtins.elemAt; "
