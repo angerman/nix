@@ -560,11 +560,16 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // the C version exactly (raw key string) and eliminates the
         // context-propagation hazard.
         //
-        // Asymptotic: O(M²) where M = final result size (per-step
-        // tail+head+concat are O(M)).  C is O(M) via deque/set.  For
-        // typical nixpkgs uses (M ≤ 100) this is fine.  Reverts via
-        // NIX_V3_NO_BC_GENERIC_CLOSURE=1.
-        if (!std::getenv("NIX_V3_NO_BC_GENERIC_CLOSURE"))
+        // Asymptotic: the bytecode is **O(M²)** (M = result size) — per step
+        // `result ++ [it]` and `rest ++ next` copy the growing work-queue /
+        // result (measured 2026-06-07: 16k=516 MB, 32k=1910 MB).  The native
+        // C primGenericClosure is O(M) via deque + unordered_set and dispatches
+        // `operator` via callClosure in a flat BFS loop (no per-item
+        // C-recursion); 32k=44 MB, byte-identical (dedup/ordering/string+int
+        // keys) + --core 20/20.  So DEFAULT = the C primop; the bytecode form
+        // is OPT-IN ONLY via NIX_V3_BC_GENERIC_CLOSURE=1 (same O(n²) ++-
+        // accumulation class as the old filter/sort/zipAttrsWith).
+        if (std::getenv("NIX_V3_BC_GENERIC_CLOSURE"))
             installBytecodePrimop(state, "genericClosure",
                 "arg: "
                 "  let "
