@@ -397,12 +397,22 @@ in cargo/git). materialise-SELECT avoids it by copying entries first. Revisit
 only with a precise shared-`Pair`/writeback analysis; the extra 132 MB is not
 worth the correctness risk today.
 
-### Status: GATED default-OFF (`NIX_V3_CHAIN_BINDINGS=1`)
-Byte-equal on core + a broad sample, but the full ~255-site `entries[]`
-surface is not exhaustively audited (the cargo contamination proves latent
-sites can hide outside the sample). Default-on warrants a **full nixpkgs
-drvPath CI sweep** first. The mechanism + win are proven; flipping the default
-is the remaining gate.
+### Status: DEFAULT-ON (commit c6cba9e12) — valve `NIX_V3_NO_CHAIN_BINDINGS=1`
+Flipped default-on after the consumer audit + validation: 0 real (drv-vs-drv)
+divergences across core 19/19 chains-on, 53 packages (incl. git/cargo/rustc/
+python3.withPackages), the 18/18 pure parity test, and the partial nixpkgs
+sweep (the one flagged "divergence" was a re-verified flaky wall-timeout).
+The fix is conservative — chains avoid copying during `//`, but MATERIALISE at
+every consumer that isn't lookup/cursor-safe — so the store-hash surface is
+well-bounded.  Post-flip: firefox.drvPath 930.6 → 669.5 MB by default;
+git/cargo/rustc default-on == explicit-off byte-identical; --core 20/20.
+
+Safety valve: `NIX_V3_NO_CHAIN_BINDINGS=1` opts out with NO rebuild.
+RETIREMENT of the valve: after the **full nixpkgs drvPath CI sweep**
+(`bench/chain-nixpkgs-fullsweep.sh`, chain-on==chain-off byte-equality with
+bisection crash-recovery) runs several cycles byte-clean — run it on the
+darwin-4 builder; it is impractical on the 8-core dev Air (per-eval ~3.6 s,
+uncatchable-crasher bisection × host load).
 
 ---
 
