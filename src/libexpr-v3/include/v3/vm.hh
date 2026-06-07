@@ -87,6 +87,18 @@ struct CallFrame
     /// the value stack.  Valid only when `flags & CFF_FORCE_WB_PTR`.
     /// Cleared by applyForceWriteback after the write.
     Value *   forceWriteTarget = nullptr;   // 8
+    /// Resume cursor for OP_CALL_PRIMOP's `deepForceList` element scan.
+    /// The scan force-evaluates list elements one at a time via the
+    /// iterative writeback+re-entry protocol (`ip = ip-1; goto
+    /// op_force_slow`).  Re-running the handler from the top would
+    /// re-scan the already-forced prefix on every element → O(n²) for an
+    /// n-element list (the listToAttrs-200k quadratic,
+    /// LISTTOATTRS_QUADRATIC_2026-06-07).  This cursor records where the
+    /// scan reached — encoded `(argK << 28) | elemI` — so re-entry skips
+    /// the forced prefix, restoring O(n).  0 = fresh (no scan in
+    /// progress); reset to 0 once all deep args are WHNF.  In-class
+    /// default keeps every `CallFrame{...}` aggregate init at 0.
+    uint32_t  deepForceCursor = 0;          // 4
 };
 
 /// Per-EvalState VM state.

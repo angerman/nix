@@ -10623,7 +10623,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                 static const bool s_noDeepForce =
                     std::getenv("NIX_V3_NO_DEEP_FORCE") != nullptr;
                 if (po->deepForceList && !s_noDeepForce) {
-                    for (uint32_t k = 0; k < nArgs; ++k) {
+                    // LISTTOATTRS_QUADRATIC fix: resume the element scan from
+                    // the frame cursor instead of re-scanning the forced
+                    // prefix on every re-entry (was O(n²)).  Cursor encodes
+                    // (argK << 28) | elemI; 0 = fresh.  The element at the
+                    // resume point was just forced (now WHNF), so the inner
+                    // loop re-checks it O(1) and advances.
+                    uint32_t resumeK = vm.frames.back().deepForceCursor >> 28;
+                    uint32_t resumeI = vm.frames.back().deepForceCursor & 0x0FFFFFFFu;
+                    for (uint32_t k = resumeK; k < nArgs; ++k) {
                         if (!(po->deepForceList & (1u << k))) continue;
                         Value & a = vm.valueStack[argBase + k];
                         if (!a.isList() || !a.payload.list) continue;
@@ -10658,7 +10666,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                         // Deferred until measurement shows the silent
                         // loss meaningfully impacts perf or until a
                         // crash path surfaces.
-                        for (uint32_t i = 0; i < list->size; ++i) {
+                        uint32_t startI = (k == resumeK) ? resumeI : 0;
+                        for (uint32_t i = startI; i < list->size; ++i) {
                             Value & e = list->elems[i];
                             Tag t = e.tag();
                             if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
@@ -10668,11 +10677,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
                                 frame.forceWriteTarget = &e;
                                 frame.flags |= CFF_FORCE_WB_PTR
                                              | CFF_FORCE_RETRY;
+                                // Record resume point so re-entry skips the
+                                // already-forced prefix (O(n²) → O(n)).
+                                frame.deepForceCursor = (k << 28) | i;
                                 ip = ip - 1;  // re-enter OP_CALL_PRIMOP
                                 goto op_force_slow;
                             }
                         }
                     }
+                    // All deep args fully forced — reset the cursor so the
+                    // next OP_CALL_PRIMOP on this frame starts fresh.
+                    vm.frames.back().deepForceCursor = 0;
                 }
             }
             // All strict args are WHNF.  Advance past poIdx and call.
