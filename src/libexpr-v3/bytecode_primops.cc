@@ -383,13 +383,14 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // inside the sublists are passed through unchanged (lazy
         // values remain lazy).  Matches TW primConcatMap semantics
         // (strict on the spine, lazy on the elements).
+        // O(n) via the native O(total) `concatLists` builder over a lazy
+        // `map` — NOT `foldl' (acc: x: acc ++ fn x)`, whose per-element
+        // `acc ++ …` copies the growing accumulator → O(n²) (Nix `++` is
+        // always a full copy).  `map` keeps the spine lazy / elements
+        // lazy; `concatLists` does ONE count+alloc+copy pass.
         if (!std::getenv("NIX_V3_NO_BC_CONCATMAP"))
             installBytecodePrimop(state, "concatMap",
-                "fn: list: "
-                "  builtins.foldl' "
-                "    (acc: x: acc ++ (fn x)) "
-                "    [] "
-                "    list");
+                "fn: list: builtins.concatLists (builtins.map fn list)");
 
         // T5 — any: short-circuit fold for "some elem satisfies pred".
         // Mirror of all (early exit on true instead of false).
@@ -439,34 +440,48 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "    list");
 
         // T9 — partition: { right, wrong } split by predicate.
-        // Built on bytecode foldl' (T1).  Two accumulators carried
-        // in an attrset; iteration is iterative via foldl''s
-        // OP_TAIL_CALL.
+        //
+        // O(n): tag each element with its predicate result ONCE (lazy
+        // `map`), then build each side with the native O(total)
+        // `concatLists` builder.  The previous `foldl' (… acc.right ++
+        // [x] …)` was **O(n²)** — `acc.right ++ [x]` copies the growing
+        // accumulator every match (Nix `++` is a full copy); same bug
+        // class as the old filter/concatMap.  Tagging keeps `pred` to one
+        // evaluation per element (matches TW primPartition's single pass
+        // + left-to-right throw order); elements stay lazy.
         if (!std::getenv("NIX_V3_NO_BC_PARTITION"))
             installBytecodePrimop(state, "partition",
                 "pred: list: "
-                "  builtins.foldl' "
-                "    (acc: x: "
-                "       if pred x "
-                "       then { right = acc.right ++ [x]; wrong = acc.wrong; } "
-                "       else { right = acc.right; wrong = acc.wrong ++ [x]; }) "
-                "    { right = []; wrong = []; } "
-                "    list");
+                "  let tagged = builtins.map (x: { v = x; k = pred x; }) list; "
+                "  in { "
+                "    right = builtins.concatLists "
+                "              (builtins.map (e: if e.k then [ e.v ] else []) tagged); "
+                "    wrong = builtins.concatLists "
+                "              (builtins.map (e: if e.k then [] else [ e.v ]) tagged); "
+                "  }");
 
-        // T3 — filter: iterate, keep elements where pred returns true.
-        // Built on bytecode foldl' (T1) — the iteration runs via
-        // OP_TAIL_CALL inside foldl' so no per-element C-recursion.
-        // Each step does either `acc ++ [x]` (kept) or skip; result
-        // elements are passed through unchanged (lazy values remain
-        // lazy).  Worst-case O(N²) due to repeated ++, matching TW
-        // primFilter's append-per-match semantics.
+        // T3 — filter: keep elements where pred returns true.
+        //
+        // O(n): emit a 1- or 0-element list per element via a lazy `map`,
+        // then flatten once with the native O(total) `concatLists`
+        // builder.  The predicate still runs through the VM (map's
+        // OP_CALL), so this stays V3-native with no per-element
+        // C-recursion; elements are passed through unchanged (lazy values
+        // stay lazy) — same observable semantics as TW primFilter.
+        //
+        // The previous definition `foldl' (acc: x: if pred x then acc ++
+        // [x] else acc) [] list` was **O(n²)**: each kept element's
+        // `acc ++ [x]` copies the entire growing accumulator (Nix `++` is
+        // always a full copy), so n appends = 1+2+…+n element-copies.  At
+        // 100k it allocated ~6 GB and OOM'd (LISTTOATTRS_QUADRATIC sibling;
+        // the old comment's "matches TW append-per-match" was wrong — TW's
+        // primFilter uses an amortised list builder and is O(n)).  Reverts
+        // to the C-side O(n) primFilter via NIX_V3_NO_BC_FILTER=1.
         if (!std::getenv("NIX_V3_NO_BC_FILTER"))
             installBytecodePrimop(state, "filter",
                 "pred: list: "
-                "  builtins.foldl' "
-                "    (acc: x: if pred x then acc ++ [x] else acc) "
-                "    [] "
-                "    list");
+                "  builtins.concatLists "
+                "    (builtins.map (x: if pred x then [ x ] else []) list)");
 
         // T18 — sort (Tier 2a, 2026-05-29).  Per-element CMP callback
         // runs under OP_CALL (iterative VM dispatch) rather than the
