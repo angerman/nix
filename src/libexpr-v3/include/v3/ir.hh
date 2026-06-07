@@ -884,6 +884,14 @@ size_t primOpFold(Module & m);
 /// foldl' bindings rewritten.
 size_t streamFusion(Module & m);
 
+/// Detection-only probe (measure-twice gate) for the
+/// `foldl' (acc: x: acc ++ G) [] xs` O(n²) accumulation idiom + the
+/// `if C then acc ++ G else acc` filter shape.  Counts occurrences without
+/// rewriting; gated logging via V3_DBG_FOLDL_APPEND=1.  Used to decide
+/// whether the (risky) IR-surgery rewrite to `concatLists (map (x: G) xs)`
+/// is worth it given that nixpkgs lib avoids this antipattern.
+size_t detectFoldlAppendIdiom(const Module & m);
+
 /// IR Phase G (2026-05-18): pure if-then-else folding.  Recognises
 /// `If(LitBool, thenBlock, elseBlock)` patterns and rewrites the
 /// binding to inline the chosen block's bindings + a VarRef to the

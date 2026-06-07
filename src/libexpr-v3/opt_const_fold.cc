@@ -439,6 +439,32 @@ void optimise(Module & m)
     // pattern match.
     OPT_RUN(streamFusion(m));
 
+    // RETAINED DIAGNOSTIC (detection-only, no rewrite): count the
+    // `foldl' (acc: x: acc ++ G) [] xs` O(n²) accumulation idiom.  Gated
+    // entirely by V3_DBG_FOLDL_APPEND — zero cost (not even called) when
+    // unset; the getenv read is cached static (lint-no-inline-getenv only
+    // scans vm.cc/primops.cc, but we follow the pattern anyway).
+    //
+    // MEASURED 2026-06-07: 0 occurrences on hello/firefox/git/python3.drvPath
+    // AND lib.unique.  An optimiser rewrite to `concatLists (map (x: G) xs)`
+    // can only match a *fully-saturated inline* `builtins.foldl' (λ) [] xs`;
+    // real nixpkgs always goes through `lib.foldl'` / partial application
+    // (e.g. `unique = foldl' step []`), so the step lambda is opaque at every
+    // call site and the rewrite would fire ~never — not worth the IR-surgery
+    // risk.  The bytecode primops that DID use this O(n²) shape
+    // (filter/concatMap/partition/sort) were fixed directly instead.
+    //
+    // KEPT so the frequency can be re-measured on future / user workloads
+    // (point V3_DBG_FOLDL_APPEND=1 at a suspected target).  RETIREMENT: drop
+    // this probe + detectFoldlAppendIdiom if the general in-place-append
+    // ("Lever B": O(1)-amortised `++` on a uniquely-owned growable ListVec)
+    // ever lands — that subsumes the idiom regardless of call shape, making
+    // the detector moot.
+    {
+        static const bool s_probe = std::getenv("V3_DBG_FOLDL_APPEND") != nullptr;
+        if (s_probe) detectFoldlAppendIdiom(m);
+    }
+
     // 2026-05-18 IR Phase G: pure if-then-else folding.  Recognises
     // `If(LitBool, then, else)` patterns and inlines the chosen
     // branch.  Runs AFTER Phase B's constantFold loop so any
