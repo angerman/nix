@@ -30,10 +30,12 @@ pass=0; fail=0
 COMMON_ENV=(NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_DISK_CACHE=1 NIX_V3_CHAIN_MIN_NA=2 NIX_V3_CHAIN_MAX_NB=64)
 
 # check <label> <expr>  — eval with chains OFF and ON, assert identical stdout.
+# Chains are default-ON (Lever A, 2026-06-07), so the OFF arm forces them off
+# with NIX_V3_CHAIN_BINDINGS=0; the ON arm forces them on with =1.
 check() {
   local label="$1" expr="$2"
   local off on
-  off=$(env "${COMMON_ENV[@]}"                           "$NIX_BIN" eval --impure --expr "$expr" 2>/dev/null)
+  off=$(env "${COMMON_ENV[@]}" NIX_V3_CHAIN_BINDINGS=0   "$NIX_BIN" eval --impure --expr "$expr" 2>/dev/null)
   on=$( env "${COMMON_ENV[@]}" NIX_V3_CHAIN_BINDINGS=1   "$NIX_BIN" eval --impure --expr "$expr" 2>/dev/null)
   if [[ "$off" == "$on" && -n "$off" ]]; then
     printf '  %s✓%s %s\n' "$GRN" "$R" "$label"; ((pass++))

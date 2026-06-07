@@ -1138,13 +1138,25 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // Chain knobs — hoisted so both the composition path (just below)
     // and the construction path (further down) share them.  Function-
     // local statics: each initialises once on first call.
-    //   NIX_V3_CHAIN_BINDINGS  — master gate (default OFF).
     //   NIX_V3_CHAIN_MIN_NA=16 — parent must be "large" to chain-construct.
     //   NIX_V3_CHAIN_MAX_NB=4  — overlay must be "small" (override-delta).
     // The audit can run with AGGRESSIVE chains (MIN_NA=2 MAX_NB=999) to
     // exercise every attrset op against the TW oracle without a rebuild.
-    static const bool s_chain =
-        std::getenv("NIX_V3_CHAIN_BINDINGS") != nullptr;
+    //
+    // Lever A default-ON (2026-06-07, MEMORY_REPRESENTATION §10): chains are
+    // a measured pure-refactor of `//` (firefox.drvPath −268 MB; 0 real
+    // drv-hash divergences across core 19/19 chains-on + 53 packages incl.
+    // git/cargo/rustc/withPackages + the pure parity test).  Safety valve:
+    // NIX_V3_NO_CHAIN_BINDINGS=1 (or NIX_V3_CHAIN_BINDINGS=0) opts out with
+    // NO rebuild — a reversible rollout.  RETIREMENT: drop the valve once the
+    // full nixpkgs drvPath CI sweep (bench/chain-nixpkgs-fullsweep.sh) has run
+    // several cycles byte-clean.
+    static const bool s_chain = []{
+        if (std::getenv("NIX_V3_NO_CHAIN_BINDINGS")) return false;
+        const char * e = std::getenv("NIX_V3_CHAIN_BINDINGS");
+        if (e) return e[0] != '0';   // explicit force on/off (=0 → off)
+        return true;                 // default ON
+    }();
     static const uint32_t s_minNa = []{
         const char * e = std::getenv("NIX_V3_CHAIN_MIN_NA");
         return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 16u;
