@@ -32,7 +32,7 @@ FOLD := builtins.foldl' (a: o: a + builtins.length (builtins.attrNames o)) 0 (bu
 # Regression guard: ~15 s on v3 today, should be ~O(n) once pinned+fixed.
 LTA := let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = i; }) 200000); in builtins.seq s 0
 
-.PHONY: help selftest scaling measure measure-fib measure-lookup measure-fold measure-listtoattrs measure-firefox
+.PHONY: help selftest scaling bc-vs-cpp measure measure-fib measure-lookup measure-fold measure-listtoattrs measure-firefox
 
 help: ## Show this help
 	@printf '\n\033[1mv3 measurement targets\033[0m\n\n'
@@ -47,8 +47,11 @@ help: ## Show this help
 selftest: ## Validate the gate's own engagement detector (run this first)
 	@$(GATE) --selftest
 
-scaling: ## Complexity-class regression guard (O(n) vs O(n²) via doubling-ratio; XFAILs listToAttrs)
+scaling: ## Complexity-class regression guard (O(n) vs O(n²) via doubling-ratio; XFAILs known blowups)
 	@./scaling-check.sh
+
+bc-vs-cpp: ## A/B each bytecode primop vs its C++ impl (NIX_V3_NO_BC_<NAME>); finds bytecode regressions
+	@./bc-vs-cpp.sh
 
 measure: ## Gate one workload:  make measure WORKLOAD='<nix-expr>'
 	@test -n "$(WORKLOAD)" || { echo "set WORKLOAD='<nix-expr>'"; exit 2; }
