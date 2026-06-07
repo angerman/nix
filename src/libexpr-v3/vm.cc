@@ -630,6 +630,15 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
             auto * aa = a.payload.bindings;
             auto * bb = b.payload.bindings;
             if (aa == bb) break;
+            // Lever A: this case compares by index (`aa->entries[i]` vs
+            // `bb->entries[i]` over `aa->size`).  A Chain's entries[] is
+            // the overlay only, so an unmateralised chain compares as a
+            // partial attrset → `chain == its-own-materialisation` wrongly
+            // returns false, breaking lib.unique / elem / dedup / override
+            // equality across nixpkgs.  Materialise both to the full sorted
+            // view first (no-op for Sorted; memoised).
+            if (aa && aa->isChain()) aa = const_cast<Bindings *>(aa->materialize());
+            if (bb && bb->isChain()) bb = const_cast<Bindings *>(bb->materialize());
             // Special-case derivations: if both attrsets are derivations
             // (have `type = "derivation"`), compare their `outPath` fields
             // and ignore the rest.  Matches tree-walker semantics — required
@@ -1126,15 +1135,61 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         ++allocStats().mergeBindingsNbHist[bucket_of(b ? b->size : 0)];
     }
 
-    // #825 Phase C SPIKE v2: materialise Chain inputs BEFORE the
-    // sorted-merge below.  Both the Pass-1 dedup count and the
-    // Pass-2 fill walk `a->entries[]` / `b->entries[]` linearly;
-    // for a Chain input that yields only the overlay.  Without
-    // this materialisation, `(base // {x}) // {y}` would lose
-    // `base`'s entries entirely because the second // would see
-    // only the chain's 1-entry overlay (heuristic na≥16 fails on
-    // a chain's overlay-size).  Materialising bounds chain depth
-    // to 1; deeper chains require Phase D's chain-aware merge.
+    // Chain knobs — hoisted so both the composition path (just below)
+    // and the construction path (further down) share them.  Function-
+    // local statics: each initialises once on first call.
+    //   NIX_V3_CHAIN_BINDINGS  — master gate (default OFF).
+    //   NIX_V3_CHAIN_MIN_NA=16 — parent must be "large" to chain-construct.
+    //   NIX_V3_CHAIN_MAX_NB=4  — overlay must be "small" (override-delta).
+    // The audit can run with AGGRESSIVE chains (MIN_NA=2 MAX_NB=999) to
+    // exercise every attrset op against the TW oracle without a rebuild.
+    static const bool s_chain =
+        std::getenv("NIX_V3_CHAIN_BINDINGS") != nullptr;
+    static const uint32_t s_minNa = []{
+        const char * e = std::getenv("NIX_V3_CHAIN_MIN_NA");
+        return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 16u;
+    }();
+    static const uint32_t s_maxNb = []{
+        const char * e = std::getenv("NIX_V3_CHAIN_MAX_NB");
+        return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 4u;
+    }();
+
+    // Lever A Step 4 (MEMORY_REPRESENTATION §6) — CHAIN COMPOSITION.
+    // Before materialising chain inputs, try to EXTEND an existing
+    // chain by prepending `b` as a new highest-precedence overlay.
+    // This is the firefox win: deep override stacks (`a // b // c // …`
+    // from overrideAttrs / wrapFirefox / buildMozillaMach) then cost
+    // O(depth) tiny overlays + ONE shared base, instead of re-copying
+    // the whole base on every `//` (the prior unconditional
+    // `a->materialize()` made a depth-D stack pay O(D) full copies).
+    // Conditions: chains enabled; `a` is a chain with room under the
+    // Cursor layer cap; `b` is a small Sorted overlay.  Depth is
+    // bounded by Cursor::kMaxLayers so chain-aware lookup / cursor
+    // iteration stay O(cap).  Beyond the cap we fall through to
+    // materialise-and-merge (the Cursor also has a materialise safety
+    // net, but capping here keeps every consumer cheap).
+    if (s_chain && a->isChain() && !b->isChain()
+        && b->size > 0 && b->size <= s_maxNb
+        && a->chainDepth() < Bindings::Cursor::kMaxLayers) {
+        Bindings * c = Alloc::allocChainBindings(a, b->size);
+        for (uint32_t j = 0; j < b->size; ++j)
+            bindingsSetEntry(c, j, b->entries[j]);  // overlay sorted; Phase D
+        return c;
+    }
+
+    // `a // {}` — return `a` UNCHANGED, preserving its chain form (do
+    // not materialise just to drop an empty overlay).  Common in
+    // nixpkgs via `a // lib.optionalAttrs cond {…}` when cond is false.
+    // Guard `!b->isChain()` because a chain's `size` is its overlay
+    // count, not its logical size (a chain is never empty by
+    // construction, but the guard keeps the invariant explicit).
+    if (!b->isChain() && b->size == 0) return const_cast<Bindings *>(a);
+
+    // Not composing — materialise any Chain input so the two-pass
+    // sorted-merge below (and the fresh-chain construction) see flat
+    // `entries[]`.  `(big_chain) // {x}` only reaches here when the
+    // depth cap is hit or `b` is itself a chain; the common deep-stack
+    // case is handled by composition above.
     if (a->isChain()) a = a->materialize();
     if (b->isChain()) b = b->materialize();
 
@@ -1195,27 +1250,14 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // mirror attempt #4/#5 (large parent, tiny overlay; a/b already materialised
     // above so neither is a Chain).  Build Chain{parent=a, overlay=b} instead of
     // copying a's na entries.
-    {
-        static const bool s_chain =
-            std::getenv("NIX_V3_CHAIN_BINDINGS") != nullptr;
-        // Env-tunable thresholds so the chain-unsafe-site audit can run with
-        // AGGRESSIVE chains (NIX_V3_CHAIN_MIN_NA=2 NIX_V3_CHAIN_MAX_NB=999) to
-        // exercise every attrset op against the TW oracle, without a rebuild.
-        // Production default: large parent, tiny overlay (na≥16, nb≤4).
-        static const uint32_t s_minNa = []{
-            const char * e = std::getenv("NIX_V3_CHAIN_MIN_NA");
-            return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 16u;
-        }();
-        static const uint32_t s_maxNb = []{
-            const char * e = std::getenv("NIX_V3_CHAIN_MAX_NB");
-            return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 4u;
-        }();
-        if (s_chain && nb <= s_maxNb && na >= s_minNa) {
-            Bindings * c = Alloc::allocChainBindings(a, nb);
-            for (uint32_t j = 0; j < nb; ++j)
-                bindingsSetEntry(c, j, b->entries[j]);  // overlay sorted; Phase D
-            return c;
-        }
+    // Fresh chain construction (a, b both Sorted here): `big // small`
+    // builds Chain{parent=a, overlay=b} instead of copying a's na
+    // entries.  Uses the hoisted s_chain / s_minNa / s_maxNb knobs.
+    if (s_chain && nb <= s_maxNb && na >= s_minNa) {
+        Bindings * c = Alloc::allocChainBindings(a, nb);
+        for (uint32_t j = 0; j < nb; ++j)
+            bindingsSetEntry(c, j, b->entries[j]);  // overlay sorted; Phase D
+        return c;
     }
 
     // #826 / A1a Phase C attempt #4 + #5 (2026-05-30, EXIT_GC_SPIRAL):
@@ -8346,24 +8388,46 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // re-apply the function on every access.
             auto * b = attrs.payload.bindings;
 
-            // #825 / A1a Phase C SPIKE — chain-aware bridge for
-            // OP_ATTRS_SELECT.  The IC fast path and the slow-path
-            // manual binary search below both assume Sorted: they
-            // index `b->entries[]` linearly under the assumption that
-            // every name in the attrset has a corresponding entry.
-            // For a Chain Bindings (constructed by mergeBindings under
-            // NIX_V3_CHAIN_BINDINGS=1), `b->entries[]` holds only the
-            // overlay; parent entries are reachable only via Phase A's
-            // chain-aware `Bindings::lookup`.  Materialising at entry
-            // converts Chain → Sorted for this site, restoring the
-            // existing IC + binary-search semantics at the cost of one
-            // O(N log N) walk per SELECT.  Materialisation is rare on
-            // the workloads the spike targets (most chains are passed
-            // through further `//` merges before terminal SELECT, and
-            // SELECT on a wide attrset is itself uncommon — see
-            // HNE_MEMORY_ATTRIBUTION_2026-05-26.md).  Phase D will
-            // refine OP_ATTRS_SELECT to walk the chain natively
-            // without materialisation.
+            // Lever A (MEMORY_REPRESENTATION §6) — chain-aware SELECT,
+            // NO materialise().  The IC fast path and the slow-path
+            // binary search below both assume Sorted: they index
+            // `b->entries[]` linearly.  For a Chain Bindings the local
+            // `entries[]` holds only the overlay; parent entries are
+            // reachable by walking the layers.  The previous spike
+            // materialised (O(N log N) copy per SELECT) which defeated
+            // the chain's whole purpose — every `o.attr` re-flattened
+            // the base, so chain-on measured NEUTRAL (§5).
+            //
+            // CRITICAL writeback rule (the python3-env / structuredAttrs
+            // bug, bisected 2026-06-07): the App-like force-writeback
+            // (`forceWriteTarget = found`) memoises the forced value INTO
+            // the entry.  That is only safe when the entry lives in the
+            // LEAF overlay — a per-chain fresh copy (bindingsSetEntry in
+            // mergeBindings).  A hit in a PARENT layer is in the SHARED
+            // base (every `base // oN` chain aliases it); writing a forced
+            // value there contaminates all sibling chains → "OP_CALL:
+            // callee is not a closure" deep inside derivationStrict, and a
+            // degenerate constant drv hash.  The materialise path never
+            // hits this because it copies entries first.  So: leaf hit →
+            // writeback as before; parent hit → force a COPY, no writeback.
+            // Lever A (MEMORY_REPRESENTATION §6) — chain SELECT MATERIALISES.
+            // The IC + binary search below assume a flat Sorted entries[].
+            // materialize() is memoised, so a given chain flattens at most
+            // once and shares that copy with derivationStrict's own
+            // materialise of the same attrset.  The big memory win comes from
+            // composition/construction NOT copying the base on every `//`
+            // (firefox 932→667 MB, −265 MB), NOT from a lookup-only SELECT.
+            //
+            // DEFERRED OPTIMISATION (2026-06-07): a chain-aware SELECT that
+            // walks layers via lookup (no copy) was implemented and measured
+            // a further firefox −132 MB (→535 MB), BUT introduced a subtle
+            // shared-state contamination — forcing/memoising a value reached
+            // through a SHARED parent layer corrupted sibling chains rooted at
+            // the same base (manifested as `OP_CALL: callee is not a closure`
+            // deep in cargo/git derivationStrict, bisected to this site).
+            // materialize() avoids it by copying entries first (isolating any
+            // writeback).  Revisit only with a precise shared-Pair / writeback
+            // analysis; not worth the correctness risk for the extra 132 MB.
             if (__builtin_expect(b && b->isChain(), 0)) {
                 b = const_cast<Bindings *>(b->materialize());
             }
@@ -8980,7 +9044,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // Intern via the global table so the SymbolId matches the
             // ones the attrset's bindings were built with.
             SymbolId id = ir::globalInternSymbol(name.payload.str);
-            Value * found = attrs.payload.bindings->lookup(id);
+            Bindings * dynB = attrs.payload.bindings;
+            // Lever A: chain dynamic-select MATERIALISES (same rationale as
+            // the static OP_ATTRS_SELECT — a lookup-only path risks the
+            // shared-parent writeback contamination documented there).
+            if (__builtin_expect(dynB->isChain(), 0))
+                dynB = const_cast<Bindings *>(dynB->materialize());
+            Value * found = dynB->lookup(id);
             if (!found)
                 // #678 — match TW phrasing
                 // (libexpr/eval.cc:1680): `attribute '<name>'

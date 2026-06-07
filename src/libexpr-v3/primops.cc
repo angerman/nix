@@ -477,6 +477,11 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
         case Tag::Attrs: {
             auto * aa = a.payload.bindings; auto * bb = b.payload.bindings;
             if (aa == bb) break;
+            // Lever A: index-wise comparison below assumes Sorted; a Chain's
+            // entries[] is the overlay only.  Materialise both first (no-op
+            // for Sorted; memoised) — same fix as vm.cc valuesEqual.
+            if (aa && aa->isChain()) aa = const_cast<Bindings *>(aa->materialize());
+            if (bb && bb->isChain()) bb = const_cast<Bindings *>(bb->materialize());
             // 2026-05-19 #666: TW's eqValues (libexpr/eval.cc:3365)
             // special-cases derivations: if both sides have `type =
             // "derivation"`, compare ONLY their `outPath` (the canonical
@@ -617,22 +622,23 @@ void primAttrNames(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0];
     if (!a.isAttrs() || !a.payload.bindings) typeError("attrNames", "attrset");
-    // #825 Phase C SPIKE: materialise Chain before iterating entries[].
-    // Phase A's Chain stores only the overlay in `entries[]`; the
-    // remaining names are reachable via the chain's parent.  This
-    // primop walks the whole attrset, so we materialise once and use
-    // the resulting Sorted view.  See alloc.hh:Bindings::materialize.
+    // Lever A (MEMORY_REPRESENTATION §6): stream the chain via Cursor
+    // instead of materialise()-copying the whole base.  `totalSize()`
+    // gives the distinct-name count to size the list; `forEach`
+    // yields each distinct name once (overlay-wins).  The result is
+    // re-sorted lexicographically below, so the cursor's SymbolId
+    // order is irrelevant to output.
     const Bindings * src = a.payload.bindings;
-    if (src->isChain()) src = src->materialize();
-    uint32_t n = src->size;
+    uint32_t n = src->totalSize();
     ListVec * lv = Alloc::allocList(n);
     V3_STATS_INC(listsAllocated);
     auto & symTab = ir::globalSymbolTable();
-    for (uint32_t i = 0; i < n; ++i) {
-        SymbolId sid = src->entries[i].name;
-        Value v = mkStringValueOwned(sid < symTab.size() ? symTab[sid] : std::to_string(sid));
-        lv->elems[i] = v;
-    }
+    uint32_t i = 0;
+    src->forEach([&](const Bindings::Entry & e) {
+        SymbolId sid = e.name;
+        lv->elems[i++] = mkStringValueOwned(
+            sid < symTab.size() ? symTab[sid] : std::to_string(sid));
+    });
     listPostConstructBarrier(lv);  // Phase D
     // Sort lexicographically by name — matches tree-walker semantics
     // and decouples output order from the global symbol-table
@@ -651,19 +657,19 @@ void primAttrValues(EvalState &, Value * args, Value & out)
     // #693 — match TW phrasing (libexpr/primops.cc forceAttrs).
     if (!a.isAttrs() || !a.payload.bindings)
         throw std::runtime_error(expectedTypeButFound("a set", a));
-    // #825 Phase C SPIKE: materialise Chain (see primAttrNames above).
+    // Lever A: stream the chain via Cursor (see primAttrNames above).
     const Bindings * src = a.payload.bindings;
-    if (src->isChain()) src = src->materialize();
-    uint32_t n = src->size;
+    uint32_t n = src->totalSize();
     // Build (name, value) pairs, sort by name, then drop the name.
     auto & symTab = ir::globalSymbolTable();
     std::vector<std::pair<std::string_view, Value>> pairs;
     pairs.reserve(n);
-    for (uint32_t i = 0; i < n; ++i) {
-        SymbolId sid = src->entries[i].name;
-        std::string_view nm = sid < symTab.size() ? std::string_view(symTab[sid]) : std::string_view("");
-        pairs.emplace_back(nm, src->entries[i].value);
-    }
+    src->forEach([&](const Bindings::Entry & e) {
+        SymbolId sid = e.name;
+        std::string_view nm = sid < symTab.size()
+            ? std::string_view(symTab[sid]) : std::string_view("");
+        pairs.emplace_back(nm, e.value);
+    });
     std::sort(pairs.begin(), pairs.end(),
         [](const auto & x, const auto & y) { return x.first < y.first; });
     ListVec * lv = Alloc::allocList(n);
@@ -8201,8 +8207,13 @@ nlohmann::json valueToJson(EvalState & state, const Value & vRaw)
         }
         json obj = json::object();
         if (v.payload.bindings) {
-            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
-                auto & en = v.payload.bindings->entries[i];
+            // Lever A: chain guard (same as valueToJsonWithContext).  A
+            // Chain's entries[] is the overlay only; materialise to the
+            // full sorted view so JSON includes the whole attrset.
+            const Bindings * jb = v.payload.bindings;
+            if (jb->isChain()) jb = jb->materialize();
+            for (uint32_t i = 0; i < jb->size; ++i) {
+                auto & en = jb->entries[i];
                 // #670/#671 follow-on: capture the key as std::string
                 // BEFORE valueToJson runs.  valueToJson's recursive
                 // forceValue may intern new symbols, which grows the
@@ -8330,8 +8341,20 @@ nlohmann::json valueToJsonWithContext(
         }
         json obj = json::object();
         if (v.payload.bindings) {
-            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
-                auto & en = v.payload.bindings->entries[i];
+            // Lever A: store-hash-critical chain guard.  This serializer
+            // feeds the native derivationStrict __structuredAttrs path
+            // (the `env`/`manifest` JSON).  A Chain's `entries[]` is the
+            // OVERLAY ONLY; iterating it directly drops every parent
+            // entry → a structured-attrs derivation hashed from a partial
+            // attrset → silently wrong .drv hash (e.g. python3.withPackages
+            // collapsed to a constant hash regardless of its package list).
+            // Materialise to the full sorted view first (no-op for Sorted;
+            // memoised so it shares derivationStrict's own materialise of
+            // the same attrset).
+            const Bindings * jb = v.payload.bindings;
+            if (jb->isChain()) jb = jb->materialize();
+            for (uint32_t i = 0; i < jb->size; ++i) {
+                auto & en = jb->entries[i];
                 // #670/#671 follow-on (same as valueToJson above): copy
                 // the key to an OWNING std::string before the recursive
                 // valueToJsonWithContext, whose forceValue can grow

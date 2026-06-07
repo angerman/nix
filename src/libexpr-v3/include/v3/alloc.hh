@@ -286,18 +286,101 @@ struct Bindings
     /// call `Alloc::allocBindings`.
     const Bindings * materialize() const;
 
+    // -----------------------------------------------------------------
+    // Lever A (MEMORY_REPRESENTATION_2026-06-07 §6) — k-way-merge
+    // Cursor.  This is the piece cppnix has (`Bindings::iterator`) and
+    // v3 lacked: a way for read-only consumers to iterate a Chain's
+    // layers IN PLACE, in sorted-name order with overlay-wins
+    // precedence, WITHOUT calling `materialize()` (which copies the
+    // whole base on every consume — the 88 %/470 MB firefox cost and
+    // the reason ChainBindings measured NEUTRAL, §5).
+    //
+    // Precedence matches `materialize()`: the leaf (`this`, the most
+    // recent overlay) is layer 0 and wins ties; deeper parents are
+    // higher layer indices.  Each distinct name is yielded exactly
+    // once, ascending by SymbolId, with shadowed copies skipped.
+    //
+    // No allocation; O(depth) per `next()`.  Chains are depth-bounded
+    // by construction in `mergeBindings` (cap == kMaxLayers); the
+    // constructor carries a safety net that falls back to a one-shot
+    // `materialize()` if a chain ever exceeds the cap, so correctness
+    // never depends on the bound.
+    class Cursor {
+    public:
+        static constexpr uint32_t kMaxLayers = 8;
+
+        explicit Cursor(const Bindings * b) noexcept
+        {
+            nLayers_ = 0;
+            for (const Bindings * p = b; p; p = p->parent) {
+                if (p->size == 0) continue;            // empty layer — skip
+                if (nLayers_ == kMaxLayers) {
+                    // Deeper than the inline array can hold: collapse the
+                    // WHOLE chain to one materialised layer.  Safety net
+                    // only — mergeBindings caps depth at kMaxLayers.
+                    const Bindings * m = b->materialize();
+                    heads_[0] = m->entries;
+                    ends_[0]  = m->entries + m->size;
+                    nLayers_  = m->size ? 1 : 0;
+                    return;
+                }
+                heads_[nLayers_] = p->entries;
+                ends_[nLayers_]  = p->entries + p->size;
+                ++nLayers_;
+            }
+        }
+
+        /// Return the next winning Entry (ascending name, overlay-wins),
+        /// or nullptr when exhausted.  Advances past shadowed copies.
+        const Entry * next() noexcept
+        {
+            constexpr uint32_t kInvalid = 0xFFFFFFFFu;
+            uint32_t best = kInvalid;
+            SymbolId bestName = 0;
+            for (uint32_t l = 0; l < nLayers_; ++l) {
+                if (heads_[l] == ends_[l]) continue;
+                SymbolId n = heads_[l]->name;
+                // strict `<` keeps the LOWEST layer index on ties == the
+                // overlay-winning entry (layer 0 is the leaf).
+                if (best == kInvalid || n < bestName) { best = l; bestName = n; }
+            }
+            if (best == kInvalid) return nullptr;
+            const Entry * winner = heads_[best];
+            for (uint32_t l = 0; l < nLayers_; ++l)
+                if (heads_[l] != ends_[l] && heads_[l]->name == bestName)
+                    ++heads_[l];
+            return winner;
+        }
+
+    private:
+        const Entry * heads_[kMaxLayers];
+        const Entry * ends_[kMaxLayers];
+        uint32_t      nLayers_;
+    };
+
+    /// Count distinct names in the chain.  O(1) on Sorted, O(N·depth)
+    /// alloc-free cursor walk on Chain (cheaper than `totalSize()`'s
+    /// sort, used where a count is needed to size an output array).
+    uint32_t countDistinct() const noexcept
+    {
+        if (kind == uint8_t(Kind::Sorted)) return size;
+        Cursor c(this);
+        uint32_t n = 0;
+        while (c.next()) ++n;
+        return n;
+    }
+
     /// Walk the chain calling `func(const Entry &)` once per distinct
-    /// name in ascending order.  Overlay shadows parent.  Today's
-    /// implementation materialises first when `isChain()`; Phase C
-    /// may refine to streaming merge for chain-depth == 1.
+    /// name in ascending order.  Overlay shadows parent.  Streams the
+    /// layers via Cursor — NO materialise for chains (Lever A).
     template <typename F>
     void forEach(F && func) const {
         if (kind == uint8_t(Kind::Sorted)) {
             for (uint32_t i = 0; i < size; ++i) func(entries[i]);
             return;
         }
-        const Bindings * m = materialize();
-        for (uint32_t i = 0; i < m->size; ++i) func(m->entries[i]);
+        Cursor c(this);
+        while (const Entry * e = c.next()) func(*e);
     }
 };
 
@@ -2927,26 +3010,11 @@ namespace nix::v3 {
 
 inline uint32_t Bindings::totalSize() const noexcept
 {
-    if (kind == uint8_t(Kind::Sorted)) return size;
-    // Chain: count distinct names by walking + dedup.  We accept the
-    // O(N) walk because totalSize is rarely called outside diagnostic
-    // dumps; primops that need the count (attrNames, length) call
-    // forEach + count or materialise themselves.
-    std::vector<SymbolId> names;
-    uint32_t cap = 0;
-    for (const Bindings * b = this; b; b = b->parent) cap += b->size;
-    names.reserve(cap);
-    for (const Bindings * b = this; b; b = b->parent) {
-        for (uint32_t i = 0; i < b->size; ++i) names.push_back(b->entries[i].name);
-    }
-    std::sort(names.begin(), names.end());
-    uint32_t distinct = 0;
-    for (size_t i = 0; i < names.size();) {
-        ++distinct;
-        SymbolId n = names[i];
-        while (i < names.size() && names[i] == n) ++i;
-    }
-    return distinct;
+    // Alloc-free distinct-name count via the k-way-merge Cursor
+    // (Lever A).  O(1) on Sorted; O(N·depth) on Chain with no
+    // intermediate vector/sort.  Delegates to countDistinct() so the
+    // two never diverge.
+    return countDistinct();
 }
 
 // `Bindings::materialize()` is defined out-of-line in `value.cc`.  The
