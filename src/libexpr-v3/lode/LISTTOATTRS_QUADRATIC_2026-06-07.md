@@ -113,6 +113,39 @@ sleep 5; sample $PID 8 -file /tmp/lta.txt; kill $PID
 sed -n '/Sort by top of stack/,/Binary Images/p' /tmp/lta.txt
 ```
 
+## 7. RESOLVED — pinned + fixed (2026-06-07, commit e26d15612)
+
+Pinned exactly as §4 step 1 prescribed: `sample` named `dispatchLoop +21140/
++21280/+21296`; the build's `-g` debug info mapped those to **vm.cc:10661-10664**
+— the **`deepForceList` pre-force loop in `OP_CALL_PRIMOP`** (not a primop, not
+GC; 99.8 %-in-dispatchLoop explained).
+
+**Mechanism (confirmed):** the loop scans the whole list for an unforced
+element, forces ONE via the iterative writeback + re-entry protocol
+(`ip = ip-1; goto op_force_slow`), then re-runs the handler from the top —
+re-scanning the already-forced prefix every time. Forcing n elements =
+1+2+…+n = **O(n²)**. The comment at vm.cc:2314 already admitted "the opcode
+will re-scan on re-entry."
+
+**§4 step 3 (same-host-bisect) FALSIFIED the GC hypothesis:** toggling
+`NIX_V3_NO_MAJOR_GC` / `NIX_V3_ARENA_ROOT` / `NIX_V3_NO_PHASE_D` /
+`NIX_V3_KEEP_GLOBAL_ROOTS` all left it at 9.1 s @100k. NOT an arena-noroot /
+major-GC regression — it predates them (the deepForceList loop is old).
+
+**Fix (§4 step 5):** a per-`CallFrame` `deepForceCursor` (encodes
+`(argK<<28)|elemI`) records where the scan reached; re-entry resumes past the
+forced prefix instead of re-scanning. O(n²) → O(n). Bonus: index-based, so it
+is also robust to the §3/10631 latent scavenge-relocation of the ListVec
+(indices survive a move; the old `&e` writeback pointer did not).
+
+**Measured (this host; ratios are host-load-immune):** 50k/100k/200k
+2.38/9.15/36.0 s → **0.15/0.21/0.36 s** (16× / 44× / **100×**), now linear.
+SHIP gate (200k ≤ 0.5 s) MET; `--core` 20/20 incl. derivation-parity drvPath
+byte-equal vs TW; correctness preserved.
+
+**Regression guard promoted:** `bench/scaling-check.sh` listToAttrs entry moved
+from `xfail` → hard guard (now expected linear/nlogn). `make -C bench scaling`.
+
 ---
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
