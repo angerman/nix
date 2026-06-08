@@ -195,14 +195,13 @@ N
 # input via concatStringsSep are coupled to it (if concat is blown they all are).
 MANIFEST=(
   "list   | wl_map             | 500000 1000000 2000000 | user | linear |"
-  # XFAIL trio — BYTECODE-PRIMOP blowups found by this sweep (2026-06-07).
-  # sort is proven (bc-vs-cpp A/B: C++ 452× faster @10k); filter/concatMap/
-  # zipAttrsWith are the same class (bytecode impls; C++ counterparts O(N)/
-  # O(N log N) per bytecode_primops.cc). Confirm each via bench/bc-vs-cpp.sh.
-  # Mitigation: NIX_V3_NO_BC_{FILTER,CONCATMAP,ZIP_ATTRS_WITH,SORT}=1.
-  "list   | wl_filter          | 250000 500000          | user | linear | xfail"
+  # 2026-06-08: the 4 bytecode-primop blowups this sweep found are now FIXED by
+  # the team (sort→mergesort deb35a9c8; filter/concatMap/partition ++-fix
+  # 8dc03ac17; zipAttrsWith→native 3b1e0c035) and VALIDATED here (all XPASS) →
+  # PROMOTED from xfail to HARD GUARDS. They now catch any re-regression.
+  "list   | wl_filter          | 250000 500000          | user | linear |"
   "list   | wl_foldl           | 500000 1000000 2000000 | user | linear |"
-  "list   | wl_concatMap       | 100000 250000          | user | linear | xfail"
+  "list   | wl_concatMap       | 100000 250000          | user | linear |"
   "list   | wl_concatLists     | 250000 500000 1000000  | user | linear |"
   "list   | wl_all             | 500000 1000000 2000000 | user | linear |"
   "list   | wl_any             | 500000 1000000 2000000 | user | linear |"
@@ -212,7 +211,7 @@ MANIFEST=(
   "list   | wl_elem            | 500000 1000000 2000000 | user | linear |"
   "list   | wl_tail            | 500000 1000000 2000000 | user | linear |"
   "list   | wl_length          | 500000 1000000 2000000 | user | linear |"
-  "list   | wl_sort            | 1000 2000 4000         | user | nlogn  | xfail"
+  "list   | wl_sort            | 1000 2000 4000         | user | nlogn  |"
   "attrs  | wl_listToAttrs     | 50000 100000 200000    | user | nlogn  |"
   "attrs  | wl_attrNames       | 50000 100000 200000    | user | nlogn  |"
   "attrs  | wl_attrValues      | 50000 100000 200000    | user | nlogn  |"
@@ -223,7 +222,7 @@ MANIFEST=(
   "attrs  | wl_getAttr         | 50000 100000 200000    | user | nlogn  |"
   "attrs  | wl_catAttrs        | 50000 100000 200000    | user | linear |"
   "attrs  | wl_update          | 50000 100000 200000    | user | nlogn  |"
-  "attrs  | wl_zipAttrsWith    | 10000 20000 40000      | user | nlogn  | xfail"
+  "attrs  | wl_zipAttrsWith    | 10000 20000 40000      | user | nlogn  |"
   "string | wl_concatStringsSep| 100000 200000 400000   | user | linear |"
   "string | wl_toJSON          | 100000 200000 400000   | user | linear |"
   "string | wl_fromJSON        | 50000 100000 200000    | user | nlogn  |"
