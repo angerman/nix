@@ -154,13 +154,29 @@ keep/revert bar; measured A/B on darwin-4. Re-pinned per-pass after T1+T2+T4:
   (`filter (x:true) [1 (throw) 2]` = 3), byte-identical, lang-corpus-neutral.
   filter's RCA gap 4.77×/2.48× → **2.41× / ~1.24×**.
 
+- **T5 — cut per-element TLS / dispatch re-entry.** Residual `sample` profile
+  (post-T1/T2/T4 foldl, darwin-4): **`_tlv_get_addr` is the #1 eval-thread leaf,
+  ~43% self-time** (macOS dylib general-dynamic TLS), `dispatchLoop` #2 —
+  confirming cause #1 persists. Attempted a contained instantiation
+  (`dispatchLoop(…, reuseScope=true)` from `callClosure2`, skipping the
+  redundant same-vm active-VM push/pop + `tlCurrentDispatchVM` dance per fold
+  element; gated `NIX_V3_LEAFCALL_FAST`). Byte-identical, but **FOLDL only −5.7%
+  / MAPFOLDL −1.0%** — below the −≥25% keep-bar → **REVERTED.** Finding: the
+  per-RE-ENTRY VMScope TLS is only ~5.7%; the dominant TLS is **per-OPCODE**
+  inside `dispatchLoop` — `Arena::majorGcEnabled()` + `threadArena()` read every
+  iteration in the default-on major-GC safepoint (vm.cc ~2997/3034), plus
+  `getNixEvalState()` per primop call. The real T5 lever is hoisting those
+  per-opcode thread-local reads to a per-dispatchLoop-entry cache (mirroring the
+  existing per-entry `Nursery*` cache, vm.cc ~2842) — a separate measure-first
+  change, NOT the leaf-call re-entry. Re-profile per-offset (atos) to confirm
+  the dominant per-opcode TLS site before that surgery.
+
 **Deferred:** T3 (ValuePair 64→32B) and T6 (ListVec 16→8B) intersect the
 `MEMORY_REPRESENTATION_2026-06-07` Lever B (Value 16→8B), which is design-only /
 not in flight — folding them into that lever (per the plan's ⚠ coordination
-note) avoids forking the core representation twice. T5 (per-element TLS /
-dispatch re-entry) remains the largest CPU lever (mapfoldl still 3.57×) but is
-the highest-risk (core dispatch); re-measure the residual TLS self-time on the
-post-T1/T2 binary before that surgery.
+note) avoids forking the core representation twice. (T3 also requires splitting
+the `App3` path off `ValuePair` + dropping the App-memo `evaluated` field —
+broad, with shared-App memoization risk.)
 
 ## Methodology notes (for the next investigation)
 
