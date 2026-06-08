@@ -13074,6 +13074,75 @@ Value forceValue(VMState & vm, Value v)
     return v;
 }
 
+// T1 (LIST_ITERATION_FIX_PLAN_2026-06-08) — saturated 2-arg call.
+//
+// `foldl' op acc x` and friends apply a 2-arg callback per element via the
+// curried `callClosure(callClosure(op, acc), x)`.  With eval/apply default-on
+// (lower_v3.hh:527) `op` is an arity-2 closure, so the FIRST callClosure is an
+// under-application: it allocates a throwaway App `ValuePair` PAP (`step1`,
+// holding [op, acc]) just so the SECOND callClosure can immediately consume it
+// to saturate.  Measured: map.foldl allocates 6M `ValuePair`s = 2M genList +
+// 2M map + **2M of these curry PAPs (128MB pure waste)** on the dominant pass.
+//
+// callClosure2 enters the arity-2 closure body ONCE with both args already in
+// slots 0..1 — no intermediate PAP, one dispatch prologue instead of two.  It
+// mirrors callClosure's arity>1 saturated-entry block (the `papBase` path) for
+// the total==arity==2 case.  Any other callee shape (PAP / primop / __functor /
+// arity!=2 / under- or over-application) falls back to the exact curried form,
+// so the result is byte-identical to `callClosure ∘ callClosure`.
+Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
+{
+    // Default-ON; opt-out NIX_V3_NO_SATURATED_CALL=1 is the A/B + bisect
+    // handle.  Retirement: remove the gate + the curried-fallback duplication
+    // once it has soaked on the cutover-parity corpus + M5/HNE (mirrors the
+    // eval/apply gate it depends on).  Result-preserving by construction (same
+    // body, same args, fewer allocs) — the gate measures magnitude, not sign.
+    static const bool s_saturatedCall =
+        std::getenv("NIX_V3_NO_SATURATED_CALL") == nullptr;
+
+    if (__builtin_expect(s_saturatedCall, 1)) {
+        // Resolve callee to WHNF (mirror callClosure's entry fast-path).
+        {
+            Tag ft = fun.tag();
+            if (__builtin_expect(ft == Tag::Thunk || ft == Tag::App
+                                 || ft == Tag::App3 || ft == Tag::Slot, 0))
+                fun = forceValue(vm, fun);
+        }
+        // Plain arity-2 closure: enter the body directly with both args.
+        // (Intrinsics are arity-1 / handled in the curried path below; the
+        // arity>1 eval/apply block in callClosure likewise skips the intrinsic
+        // check, so matching `arity == 2` here is byte-identical.)
+        if (fun.tag() == Tag::Closure && fun.payload.closure
+            && fun.payload.closure->desc
+            && fun.payload.closure->desc->arity == 2) {
+            const Closure * c = fun.payload.closure;
+            const LambdaDescriptor * d = c->desc;
+            const CompilationUnit * ccu = c->cu ? c->cu : vm.frames.back().cu;
+            size_t exitDepth = vm.frames.size();
+            size_t newBase = vm.valueStack.size();
+            vm.valueStack.resize(newBase + d->nLocals);
+            vm.valueStack[newBase + 0] = arg1;
+            vm.valueStack[newBase + 1] = arg2;
+            uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+            vm.frames.push_back(CallFrame{
+                .cu = ccu,
+                .closure = c,
+                .thunk = nullptr,
+                .ip = d->codeOffset,
+                .stackBaseOffset = static_cast<uint32_t>(newBase),
+                .withStackBase = newWithBase,
+                .flags = 0,
+            });
+            pushCapturedWiths(vm, c->capturedWiths);
+            return dispatchLoop(vm, exitDepth);
+        }
+        // Fall through with the already-WHNF `fun` to the curried form.
+    }
+    // Fallback — byte-identical to the original curried call sequence.
+    Value step1 = callClosure(vm, fun, arg1);
+    return callClosure(vm, step1, arg2);
+}
+
 Value callClosure(VMState & vm, Value fun, Value arg)
 {
     // Mirror tree-walker's `callFunction`: callable values must be in

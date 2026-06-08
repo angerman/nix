@@ -240,6 +240,17 @@ private:
 /// Used by callback primops.  Throws if `fun` is not callable.
 Value callClosure(VMState & vm, Value fun, Value arg);
 
+/// T1 (LIST_ITERATION_FIX_PLAN_2026-06-08) — saturated 2-arg call.
+/// Applies `fun` to `arg1` and `arg2`.  When `fun` is a plain arity-2
+/// closure (the common multi-arg callback shape: `acc: x: …`, default-on
+/// eval/apply), it enters the body ONCE with both args in slots 0..1 —
+/// skipping the throwaway partial-application `ValuePair` (App PAP) that
+/// the curried `callClosure(callClosure(fun,arg1),arg2)` allocates per
+/// call, plus one dispatch prologue.  Any other callee shape (PAP, primop,
+/// __functor, arity!=2, under/over-application) falls back to the curried
+/// form, so the result stays byte-identical.  Gated NIX_V3_SATURATED_CALL.
+Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2);
+
 /// #466 active-v3-vm tracking.  Returns the OUTER v3 VMState that is
 /// currently bridging out via OP_CALL Bridge or forceBridgeThunk's
 /// TW force; nullptr when no v3 vm is in flight.  Used by the call-

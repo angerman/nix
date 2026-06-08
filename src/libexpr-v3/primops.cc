@@ -1303,16 +1303,17 @@ void primFoldl(EvalState & state, Value * args, Value & out)
     auto * src = args[2].payload.list;
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
-            // Curried: op acc elem.  step1 is a partial closure; we
-            // don't force it (callClosure forces its callee on entry
-            // via its own WHNF fast-path).  The final `acc` IS forced
-            // each iteration since foldl' is strict in the accumulator
-            // -- callers expect the seq behaviour and a Tag::Thunk acc
-            // would defer subsequent op-calls' force into the next
-            // iteration's first action.  Match TW's `forceValue(*vAcc)`
-            // in primops.cc primFoldl'.
-            Value step1 = callClosure(*state.vm, op, acc);
-            acc = callClosure(*state.vm, step1, src->elems[i]);
+            // Apply `op acc elem`.  T1: callClosure2 enters the arity-2
+            // `op` body once with both args in slots, eliminating the
+            // throwaway curry-PAP ValuePair (per-element) that the curried
+            // callClosure(callClosure(op,acc),elem) allocated.  Falls back
+            // to the curried form byte-identically for any other op shape.
+            // The final `acc` IS forced each iteration since foldl' is
+            // strict in the accumulator -- callers expect the seq behaviour
+            // and a Tag::Thunk acc would defer subsequent op-calls' force
+            // into the next iteration's first action.  Match TW's
+            // `forceValue(*vAcc)` in primops.cc primFoldl'.
+            acc = callClosure2(*state.vm, op, acc, src->elems[i]);
             if (__builtin_expect(acc.tag() == Tag::Thunk
                                  || acc.isAppLike()
                                  || acc.tag() == Tag::Slot, 0))
@@ -1355,9 +1356,8 @@ void primFoldlMap(EvalState & state, Value * args, Value & out)
                                  || fx.isAppLike()
                                  || fx.tag() == Tag::Slot, 0))
                 fx = forceValue(*state.vm, fx);
-            // Apply op acc fx — same curried sequence as primFoldl'.
-            Value step1 = callClosure(*state.vm, op, acc);
-            acc = callClosure(*state.vm, step1, fx);
+            // Apply op acc fx — T1 saturated 2-arg call (see primFoldl).
+            acc = callClosure2(*state.vm, op, acc, fx);
             if (__builtin_expect(acc.tag() == Tag::Thunk
                                  || acc.isAppLike()
                                  || acc.tag() == Tag::Slot, 0))
