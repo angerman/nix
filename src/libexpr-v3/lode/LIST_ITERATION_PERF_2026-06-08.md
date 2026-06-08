@@ -119,6 +119,49 @@ cannot time these). All V3-NATIVE.
    high risk (core list rep).
 7. **Inline `OP_LESS` int-int fast path** (mirror `OP_EQ`). Small, filter-specific.
 
+## What shipped / what reverted — Wave 1 + 2 (2026-06-08, measured on darwin-4 idle)
+
+Per `LIST_ITERATION_FIX_PLAN_2026-06-08.md`, each task carried a pre-committed
+keep/revert bar; measured A/B on darwin-4. Re-pinned per-pass after T1+T2+T4:
+
+| pass | baseline v3/TW | after T1+T2+T4 | peak RSS (was → now) |
+|---|--:|--:|--:|
+| genList | 1.00× | 1.00× | — |
+| map | 3.6× | 3.57× | — |
+| foldl | 3.5× | **2.70×** | — |
+| mapfoldl | 4.0× | **3.57×** | 556M → **422M** |
+| filter | 4.7× | **2.41×** | 515M → **256M** |
+
+- **T1 — saturated `callClosure2`** (commit a669a17a9). SHIPPED. `primFoldl`/
+  `primFoldlMap` enter the arity-2 callback once with both args in slots,
+  dropping the per-element curry-PAP `ValuePair`. mapfoldl `pairs` 6.0M→4.0M
+  (−128MB); **FOLDL user-CPU −22.9%** (0.70→0.54s). Gate `NIX_V3_NO_SATURATED_CALL`.
+- **T2 — guard-free trace gates** (commit b951a5e30). SHIPPED. Hoisted the
+  per-element `dbgLogForce*` function-local statics + the per-iteration
+  cross-TU `periodicLiveTraceEnabled()` call to namespace-scope cached bools.
+  **FOLDL user-CPU −3.7%** (0.54→0.52s), byte-identical. No gate.
+- **T7 — inline `OP_LESS` for `<`/`>`** (rewrite `PrimOpCall(__lessThan)`→`ir::Less`,
+  gated `NIX_V3_INLINE_LESS`). **REVERTED.** Engaged correctly + byte-identical,
+  but **+1.0%** on filter (2 readings) — fails the −≥3% bar. OP_LESS needs 2
+  explicit `Force` opcodes (incl. a redundant one on the literal) that offset
+  the primop-dispatch saving, and filter cost is allocation-dominated (cause
+  #7 was over-attributed; the real filter lever was T4).
+- **T4 — lazy C `primFilter` + flip filter to C++-default** (commit 8480a3c91).
+  SHIPPED. Removed `primFilter`'s `deepForceList` (the over-forcing that forced
+  filter to stay bytecode) — the C primop is now lazy-correct AND single-alloc,
+  eliminating the bytecode form's 2M singleton `[x]` ListVecs. **filter CPU
+  −48%** (1.02→0.53s), **peak RSS −259MB** (515→256M), lazy-throw correct
+  (`filter (x:true) [1 (throw) 2]` = 3), byte-identical, lang-corpus-neutral.
+  filter's RCA gap 4.77×/2.48× → **2.41× / ~1.24×**.
+
+**Deferred:** T3 (ValuePair 64→32B) and T6 (ListVec 16→8B) intersect the
+`MEMORY_REPRESENTATION_2026-06-07` Lever B (Value 16→8B), which is design-only /
+not in flight — folding them into that lever (per the plan's ⚠ coordination
+note) avoids forking the core representation twice. T5 (per-element TLS /
+dispatch re-entry) remains the largest CPU lever (mapfoldl still 3.57×) but is
+the highest-risk (core dispatch); re-measure the residual TLS self-time on the
+post-T1/T2 binary before that surgery.
+
 ## Methodology notes (for the next investigation)
 
 - 3 source agents parallelised over local source (no host contention); the dedicated
