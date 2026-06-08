@@ -219,6 +219,25 @@ map GC-mark (~halves → ~3.57→~2.3×), foldl's 25% GC-mark, and 384MB→~192M
    Attacks foldl/mapfoldl's #1 cost (~38% TLS). Narrow, low-risk; thread-lifetime
    singleton is address-stable across GC. **This is the *real* T5** (the reverted
    attempt hit the per-re-entry VMScope = only −5.7%; this is the per-*opcode* TLS).
+
+   > **⚠ FALSIFIED on attempt (2026-06-08, gated `NIX_V3_NO_ARENA_CACHE`).** Built the
+   > per-entry `Arena&` cache exactly as specified and A/B'd it (darwin-4, best-of-12):
+   > **foldl −1.9% / mapfoldl −2.1%**, byte-identical — NOT the projected ~38%.
+   > Re-profiled the *cached* binary: `_tlv_get_addr` is **still the #1 leaf at 1683
+   > (was 1592 — unchanged)**, so caching `threadArena@3011` removed essentially none
+   > of it. ⇒ **`threadArena@3011` was NOT the dominant TLS** — the attribution was an
+   > inference ("`_tlv_get_addr` callers are all `dispatchLoop`" → assumed the one
+   > obvious `threadArena` call), not atos-confirmed per-offset. The A/B shows the
+   > per-element `_tlv_get_addr` is **spread across ~14 distinct `dispatchLoop` code
+   > offsets** (the parent of every `_tlv_get_addr` sample is `dispatchLoop+N` at many
+   > N) **+ `pushActiveVMState`/`popActiveVMState` per re-entry**. It is therefore an
+   > **architectural macOS-dylib-TLS cost** (general-dynamic model ⇒ `_tlv_get_addr`
+   > indirect call per `thread_local` touch — `getNixEvalState` per primop, allocator
+   > thread-locals, active-VM stack), **not a single hoist-able call**. The contained
+   > arena cache was REVERTED (−2% ≪ −≥25% bar). The genuine fix is to cache ALL the
+   > per-thread dispatch state (arena + `nixEvalState` + active-VM) into dispatch-entry
+   > locals / a struct and route the opcode handlers through it — the high-risk/effort
+   > T5 the plan flagged; needs per-offset `atos` mapping first to enumerate the sites.
 2. **Shrink `ValuePair` 64→32B (T3) — now the top cross-cutting lever** (map's dominant
    cost + foldl's 25% + the 384MB). Priority raised by the GC-mark-CPU finding; it's the
    only lever for the map laggard short of GC changes. Still folds into Value-16→8B.
