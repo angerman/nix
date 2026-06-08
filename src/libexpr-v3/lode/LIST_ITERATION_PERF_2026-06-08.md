@@ -303,9 +303,25 @@ pair. For a **plain, unforced** `App`/`PrimOpApp` (Tag distinguishes App vs App3
 **skip marking them** (mark only `left`/`right`). map's 2M unforced pairs → ~halve the
 mark work **without touching the representation or the memo**. Lower-risk, independently
 measurable. Pre-committed bar (per the plan): map GC-mark CPU −≥… / map ratio toward
-~2.3×; byte-identical; `--core`/scaling green. **Spike pending darwin-4** (ssh-agent was
-refusing to sign `id_rsa` at revisit time — all timing/RSS measurement blocked; T3-lite
-and T3-proper both need it).
+~2.3×; byte-identical; `--core`/scaling green.
+
+**T3-lite SPIKE RESULT (darwin-4, ssh restored): +0.0% — FALSIFIED.** Built the
+`walkPair` skip (gated `NIX_V3_NO_MARK_SKIP_EMPTY`) and A/B'd map
+(`length (map (x:x+1) (genList id 2M))`): **skip-OFF 0.25s == skip-ON 0.25s**,
+byte-identical. Skipping the empty `evaluated`/`third` field-visits recovers
+NONE of map's GC-mark. Why (now confirmed, not reasoned): a 64 B `ValuePair`
+is exactly **one cache line**, so reading the trailing two fields is free (same
+line already loaded for `left`/`right`), and `visitValue(Uninitialized)` is an
+inlined `switch`+`break`. **map's mark cost is the graph TRAVERSAL + the cache
+footprint of 2M+ pairs, not the field-visit count.** ⇒ The ONLY thing that
+recovers map's mark is the actual **64→32B shrink** (2 pairs per cache line ⇒
+half the mark cache misses) — which is memo-entangled (`evaluated` = the
+load-bearing H3 App-memo) and belongs in **Lever B (Value 16→8B)**. There is no
+contained T3 shortcut; T3-lite reverted. **Net T3 verdict: T3-proper = headline
+sub-goal of Lever B, scheduled-sooner; no field-drop, no mark-skip.**
+
+(Stage 2 `reuseScope` re-confirmed on the same darwin-4 session: FOLDL **−7.5%**,
+reuseScope-off 0.53s → on 0.49s — consistent with the prior −5.7%.)
 
 ## Methodology notes (for the next investigation)
 
