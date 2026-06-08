@@ -363,12 +363,30 @@ inline Value & top(VMState & vm) { return vm.valueStack.back(); }
 /// finding the v3-specific eager force that has no TW analog —
 /// compare two traces (one v3-direct + STG, one a synthetic that
 /// works) and the divergent line is the smoking gun.
+///
+/// T2 (LIST_ITERATION_FIX_PLAN_2026-06-08) — these force-trace gates are
+/// read on the per-element OP_FORCE *slow* path (every non-WHNF force, i.e.
+/// once per lazy list element in a fold/map).  Caching them at NAMESPACE
+/// scope makes each read a plain global load; a function-local `static const`
+/// instead carries a guard-variable check (acquire-load + branch) on every
+/// call.  Behaviour is identical (same env var, same enabled/disabled).
+/// Retirement: fold into one V3_DBG_* dispatch flag if the trace surface
+/// grows.  (lint-no-inline-getenv: `static const` keyword present.)
+static const bool g_dbgForceInsideX =
+    std::getenv("V3_DBG_FORCE_INSIDE_X") != nullptr;
+static const bool g_dbgForceSite =
+    std::getenv("V3_DBG_FORCE_SITE") != nullptr;
+// T2: the periodic-L(t) trace gate sits at the GC safepoint reached on the
+// dispatch hot path; `periodicLiveTraceEnabled()` is a cross-TU call (not
+// inlinable into vm.cc) wrapping a function-local-static getenv.  Cache the
+// answer once at load so the per-safepoint check is a local bool-load, not a
+// `bl` + guard.  Identical semantics (the env var is read once either way).
+static const bool g_periodicLiveTrace = periodicLiveTraceEnabled();
+
 [[gnu::cold]]
 inline void dbgLogForceInsideX(VMState & vm, const Value * forcing)
 {
-    static const bool s_enabled =
-        std::getenv("V3_DBG_FORCE_INSIDE_X") != nullptr;
-    if (__builtin_expect(!s_enabled, 1)) return;
+    if (__builtin_expect(!g_dbgForceInsideX, 1)) return;
     static thread_local int s_logged = 0;
     if (s_logged >= 2000) return;
     bool insideX = false;
@@ -438,8 +456,7 @@ inline void dbgLogForceInsideX(VMState & vm, const Value * forcing)
 inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp,
                             const Value * forcing = nullptr)
 {
-    static const bool s_enabled = std::getenv("V3_DBG_FORCE_SITE") != nullptr;
-    if (__builtin_expect(!s_enabled, 1)) return;
+    if (__builtin_expect(!g_dbgForceSite, 1)) return;   // T2: hoisted gate
     if (!cu) return;
     const auto & tbl = cu->forceEmitSites;
     // lower_bound finds the first entry with offset >= instrIp; since
@@ -3063,7 +3080,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         //
         // Retirement: when L(t) is integrated into the bench harness
         // as a default-OFF metric, remove this hook + the env-gate.
-        if (__builtin_expect(periodicLiveTraceEnabled(), 0)) [[unlikely]] {
+        if (__builtin_expect(g_periodicLiveTrace, 0)) [[unlikely]] {   // T2: cached gate
             if (exitDepth == 0) {
                 bool nestedDistinct = false;
                 for (VMState * vmp : activeVMStack()) {
