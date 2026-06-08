@@ -60,7 +60,13 @@ flight and proceed. T1/T2/T4/T5/T7 are independent of it.
 
 ---
 
-## T0 — Measurement scaffold (PREREQ; blocks all waves)
+## T0 — Measurement scaffold (PREREQ; blocks all waves) — ✅ DONE (commit de79407ff)
+
+**Already implemented:** `make -C src/libexpr-v3/bench measure-list-iter` exists
+(`bench/list-iter-measure.sh`) and the baseline is pinned + reproduced (genList
+1.00×, mapfoldl pairs=6000002/insns=26000033/peakRSS=555M, filter
+lists=2000002/peakRSS=515M). **Start at Wave 1 (T1).** Use this target as the
+yardstick for every task's keep/revert measurement. Original spec retained below.
 
 **Do:** add a `make -C src/libexpr-v3/bench measure-list-iter` target that, on a given
 `NIX_BIN`, runs **on darwin-4**:
