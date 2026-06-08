@@ -238,6 +238,33 @@ map GC-mark (~halves → ~3.57→~2.3×), foldl's 25% GC-mark, and 384MB→~192M
    > per-thread dispatch state (arena + `nixEvalState` + active-VM) into dispatch-entry
    > locals / a struct and route the opcode handlers through it — the high-risk/effort
    > T5 the plan flagged; needs per-offset `atos` mapping first to enumerate the sites.
+   >
+   > **⚠⚠ THE TLS LEVER IS ITSELF FALSIFIED (2026-06-08, Stages 0+1).** Pursued the
+   > "kill the per-element TLS" architecture and it does NOT pay:
+   > - **Stage 0** — `__attribute__((tls_model("initial-exec")))` on the 5 hot
+   >   thread_locals: clang accepts it but **foldl 0.53s → 0.53s (no change)**. Mach-O
+   >   has only the one TLV mechanism; `tls_model` is a no-op on Darwin (would help the
+   >   Linux builders, not darwin-4/macOS). We cannot re-model TLS — only remove it.
+   > - **Stage 1** — removed the per-element TLS sources, one by one, and measured wall:
+   >   `threadArena` cache **−2%**, `g_opcyclesPrevOp/Ts` gate **+0.0%** (and the
+   >   `_tlv_get_addr` leaf COUNT was *unchanged*, 1683→1740, after gating it!),
+   >   `reuseScope` active-VM skip **−5.7%**. Three independent removals, each **<6%**,
+   >   cumulative <8% — yet `_tlv_get_addr` stays the **#1 leaf at ~45%** regardless.
+   > - **Conclusion: `_tlv_get_addr`'s leaf self-time massively OVER-STATES its wall
+   >   cost.** It is a tiny, branch-predicted, ultra-hot function the sampler catches at
+   >   the PC constantly; each call is cheap and overlaps other work, so removing the
+   >   calls barely moves wall. **TLS is NOT the foldl lever** — the per-element cost is
+   >   the **interpreter dispatch + C++↔VM re-entry WORK** (`dispatchLoop` self-time #2,
+   >   the ~13 dispatched ops for `a+x`, the call/prologue/alloc), i.e. the inherent
+   >   interpreter-ceiling tax. **Lesson: size a leaf's true cost by REMOVING it and
+   >   measuring wall — never by leaf-self-time alone** (`_tlv_get_addr` is the textbook
+   >   trap). The whole T5/explicit-context line was chasing a profiling artifact.
+   > - **Redirect:** the real foldl lever is **Stage 2 — eliminate the per-element
+   >   `dispatchLoop` re-entry by fusing the iteration** (so the body runs without a
+   >   C++↔VM boundary crossing per element). And `foldl` is already at **2.70× — near
+   >   the interpreter dispatch ceiling**; beyond fusion, further gains need
+   >   superinstructions (fewer ops/element) or JIT. T3 (ValuePair, map's GC-mark) is
+   >   the orthogonal remaining lever and now the higher-EV one.
 2. **Shrink `ValuePair` 64→32B (T3) — now the top cross-cutting lever** (map's dominant
    cost + foldl's 25% + the 384MB). Priority raised by the GC-mark-CPU finding; it's the
    only lever for the map laggard short of GC changes. Still folds into Value-16→8B.
