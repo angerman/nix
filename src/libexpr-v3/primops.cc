@@ -9453,7 +9453,6 @@ void registerBuiltinPrimOps()
         // element (no short-circuit, no laziness-preserving passes) are
         // safe to pre-force iteratively — pre-forcing must not introduce
         // a throw that lazy evaluation would have skipped.
-        //   filter (arg 1):      pred is called on every element → safe
         //   foldl' (arg 2):      op is called on every element → safe
         //   partition (arg 1):   same shape as filter
         //   listToAttrs (arg 0): body explicitly forces each entry
@@ -9466,8 +9465,22 @@ void registerBuiltinPrimOps()
         //   elem: short-circuit on first match
         //   concatMap: fn may discard its arg
         //   sort: comparator may not visit every pair
+        //   filter (arg 1):      pred MAY IGNORE its arg — see below
+        // T4 (LIST_ITERATION_FIX_PLAN_2026-06-08): filter is NOT safe to
+        // deepForceList.  The old "pred is called on every element → safe"
+        // reasoning was wrong: `filter (x: true) [1 (throw) 2]` calls the
+        // pred 3× but forces NO element, so TW returns 3 while pre-forcing
+        // throws.  primFilter passes each element UNFORCED into the pred
+        // (callClosure doesn't force closure args) and forces only the
+        // pred's RESULT, so it is lazy-correct on its own — AND single-pass
+        // (one result alloc from `kept`, no per-element singleton lists),
+        // unlike the bytecode `concatLists∘map` form (2M singleton ListVecs
+        // on a 2M filter).  deepForceList=0 makes the C primFilter the
+        // lazy + lean default; the bytecode form is now opt-in
+        // (NIX_V3_BC_FILTER=1).  forceValue is iterative, so per-element
+        // forcing inside the pred does not grow the C stack.
         registerPrimOp({"filter",             2, primFilter,
-                        /*lazyArgs=*/0, /*deepForceList=*/0b10});
+                        /*lazyArgs=*/0, /*deepForceList=*/0});
         registerPrimOp({"foldl'",             3, primFoldl,
                         /*lazyArgs=*/0b010, /*deepForceList=*/0b100});
         // 2026-05-18 IR Phase C fused-loop FFI leaf: __foldlMap.

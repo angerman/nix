@@ -309,17 +309,17 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // not removed — the bytecode source is KEPT here as a documented
         // registry + A/B handle; opt back in per-primop via NIX_V3_BC_<NAME>=1.
         //
-        // CORRECTNESS EXCEPTIONS — these stay bytecode-DEFAULT-ON because the
-        // C primop is not a drop-in (a perf loss is irrelevant if the native
+        // CORRECTNESS EXCEPTION — stays bytecode-DEFAULT-ON because the C
+        // primop is not a drop-in (a perf loss is irrelevant if the native
         // path is wrong):
-        //   * filter  — C primFilter's deepForceList force-evaluates list
-        //               ELEMENTS before applying the predicate, so it throws
-        //               on a `throw` the predicate would have skipped
-        //               (verified: `filter (x: true) [1 (throw) 2]` → TW=3,
-        //               bytecode=3, C++ THROWS).  The bytecode form
-        //               (concatLists∘map) is lazy-correct AND O(n).
-        //   * groupBy — same deepForceList over-forcing (TW=3, C++ THROWS);
-        //               bytecode is lazy-correct + measured linear.
+        //   * groupBy — C primGroupBy's deepForceList force-evaluates list
+        //               ELEMENTS before applying keyFn, so it throws on a
+        //               `throw` keyFn would have skipped (TW=3, C++ THROWS);
+        //               the bytecode form is lazy-correct + measured linear.
+        // (filter WAS such an exception; T4 (2026-06-08) removed primFilter's
+        // deepForceList so the C primop is now lazy-correct AND single-alloc
+        // — filter flipped to C++-default, eliminating the bytecode form's 2M
+        // singleton ListVecs.  groupBy could get the same fix as a follow-up.)
         // (partition is the opposite: the bytecode form was too LAZY vs TW —
         // `partition (x: true) [1 (throw) 2]` TW THROWS, bytecode=3 — so it
         // flips to C++, which both fixes that divergence AND wins on perf.)
@@ -505,8 +505,14 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // 100k it allocated ~6 GB and OOM'd (LISTTOATTRS_QUADRATIC sibling;
         // the old comment's "matches TW append-per-match" was wrong — TW's
         // primFilter uses an amortised list builder and is O(n)).  Reverts
-        // to the C-side O(n) primFilter via NIX_V3_NO_BC_FILTER=1.
-        if (!std::getenv("NIX_V3_NO_BC_FILTER"))
+        // T4 (LIST_ITERATION_FIX_PLAN_2026-06-08): DEFAULT-OFF now.  The C
+        // primFilter no longer over-forces (its deepForceList was removed —
+        // primops.cc), so it is lazy-correct AND single-allocation, whereas
+        // this bytecode form allocates one singleton `[x]` ListVec per kept
+        // element (2M on a 2M filter = 144MB, the dominant filter cost per
+        // LIST_ITERATION_PERF mem#3).  Opt back into the bytecode form via
+        // NIX_V3_BC_FILTER=1 (A/B handle).
+        if (std::getenv("NIX_V3_BC_FILTER"))  // default-off: C primFilter is lazy+lean (T4)
             installBytecodePrimop(state, "filter",
                 "pred: list: "
                 "  builtins.concatLists "
