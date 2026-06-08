@@ -2658,13 +2658,28 @@ namespace nix::v3 {
 namespace nix::v3 {
 namespace { // re-open anon ns
 
-Value dispatchLoop(VMState & vm, size_t exitDepth)
+Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
 {
-    VMState * prevDispatchVM = tlCurrentDispatchVM;
-    tlCurrentDispatchVM = &vm;
-    // #705: register on the active-VM stack so nested scavenges
-    // walk THIS vm's roots even when fired from another dispatch.
-    pushActiveVMState(&vm);
+    // Stage 2 (LIST_ITERATION_FIX_PLAN_2026-06-08): per-element callback
+    // re-entry (primFoldl/primFoldlMap → callClosure2 → here, once per fold
+    // element) re-does the active-VM/current-VM bookkeeping every time.  But
+    // the fold primop already runs UNDER this vm's dispatch (the outer
+    // OP_CALL_PRIMOP), so `vm` is already current + on the active stack;
+    // re-pushing it is pure per-element overhead.  reuseScope=true (passed
+    // only from such callers) skips it.  Exception-safe (nothing pushed ⇒
+    // nothing to unwind), and the distinct-vm scavenge checks (`vmp != &vm`)
+    // are unaffected because `vm` stays on the stack from the outer push.
+    // NB: the TLS this avoids is NOT the lever (Stages 0/1 falsified that —
+    // _tlv leaf-time is a sampling artifact); the win is skipping the
+    // std::vector push/pop + frame bookkeeping of the re-entry.  Measured
+    // ~−5.7% foldl; the body dispatch that remains is the interpreter ceiling.
+    VMState * prevDispatchVM = reuseScope ? nullptr : tlCurrentDispatchVM;
+    if (!reuseScope) {
+        tlCurrentDispatchVM = &vm;
+        // #705: register on the active-VM stack so nested scavenges
+        // walk THIS vm's roots even when fired from another dispatch.
+        pushActiveVMState(&vm);
+    }
 
     // #790 (2026-05-23) OPCYCLES inter-dispatch-loop boundary.
     // Save the OUTER prev-op/Ts before this nested loop runs.
@@ -2684,6 +2699,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
         VMState * vm;
         uint8_t   savedOpcyclesPrevOp;
         uint64_t  savedOpcyclesPrevTs;
+        bool      reuseScope;
         ~VMScope() {
             // Restore the outer prev-op/Ts so the outer's NEXT
             // OPCYCLES sample credits the entire outer-case-body
@@ -2692,10 +2708,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth)
             // case body did.
             g_opcyclesPrevOp = savedOpcyclesPrevOp;
             g_opcyclesPrevTs = savedOpcyclesPrevTs;
-            popActiveVMState(vm);
-            tlCurrentDispatchVM = prev;
+            // Stage 2: only unwind the active-VM/current-vm bookkeeping if we
+            // set it up (reuseScope=false); when reused, the outer dispatch
+            // owns it and pops it via its own VMScope.
+            if (!reuseScope) {
+                popActiveVMState(vm);
+                tlCurrentDispatchVM = prev;
+            }
         }
-    } _vmScope{prevDispatchVM, &vm, savedOpcyclesPrevOp, savedOpcyclesPrevTs};
+    } _vmScope{prevDispatchVM, &vm, savedOpcyclesPrevOp, savedOpcyclesPrevTs, reuseScope};
 
     const CallFrame & topFrame = vm.frames.back();
     const CompilationUnit * cu = topFrame.cu;
@@ -13151,7 +13172,15 @@ Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
                 .flags = 0,
             });
             pushCapturedWiths(vm, c->capturedWiths);
-            return dispatchLoop(vm, exitDepth);
+            // Stage 2: callClosure2's only callers (primFoldl/primFoldlMap)
+            // run UNDER the outer OP_CALL_PRIMOP dispatch, so `vm` is already
+            // current + active — pass reuseScope to skip the redundant
+            // per-element active-VM re-push.  Default-ON; opt-out
+            // NIX_V3_NO_LEAFCALL_FAST=1 (A/B + bisect handle).  Retire with
+            // the saturated-call gate once soaked on cutover-parity + M5/HNE.
+            static const bool s_leafCallFast =
+                std::getenv("NIX_V3_NO_LEAFCALL_FAST") == nullptr;
+            return dispatchLoop(vm, exitDepth, /*reuseScope=*/s_leafCallFast);
         }
         // Fall through with the already-WHNF `fun` to the curried form.
     }
