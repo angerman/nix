@@ -275,6 +275,38 @@ map GC-mark (~halves → ~3.57→~2.3×), foldl's 25% GC-mark, and 384MB→~192M
 compare-bound (RCA cause #7 over-attributed). T5-reuseScope — per-re-entry VMScope TLS
 is minor; the per-opcode `threadArena` is the real cost.
 
+## T3 revisit (2026-06-08, after Stages 0/1/2) — code-grounded, measurement-blocked on ssh
+
+Goal step "revisit T3 (ValuePair 64→32B)". Confirmed the top remaining lever by the
+reviewer's `NIX_V3_NO_MAJOR_GC` A/B (map 0.25→0.06s = parity ⇒ ~76% of map is GC-mark
+of the fat pairs). **But the naive "drop `evaluated`+`third` → 32B" is UNSAFE** — read
+the fields before cutting:
+- **`ValuePair.evaluated` is the App-result MEMO** (vm.cc:12243): after an App chain
+  forces to WHNF, the result is cached there and the top-of-loop fast-path returns it
+  on re-force — *"closes the H3 gap; extendDerivation outputsList forced 64K times
+  pre-fix."* It is load-bearing for **shared** Apps. Dropping it re-introduces the H3
+  regression on **every real derivation eval** (extendDerivation), not just the synthetic.
+  The plan's "redundant for one-shot map/genList entries" holds only for one-shot Apps,
+  not shared ones — and we can't tell which at alloc time.
+- **`third` is `App3`'s arg2** (mapAttrs/zipAttrs pack a 3-arg App into one pair).
+
+So a true 64→32B needs to **replace the inline memo** (side-table / lazy memo-cell /
+pointer-tagged slot) AND re-encode App3 — a coherent representation change. This is
+exactly why the plan homes T3 in **Lever B (Value 16→8B)**: pointer-tagging reworks the
+memo + App3 together. **Verdict: T3-proper = the headline sub-goal of Lever B, now
+scheduled-sooner (CPU+mem), NOT a standalone field-drop (which regresses H3).**
+
+**Tractable alternative — `T3-lite`: a GC-mark fast-path, no representation change.**
+The reviewer's finding is that map is GC-*mark*-bound; `walkPair` scans all 4 fields per
+pair. For a **plain, unforced** `App`/`PrimOpApp` (Tag distinguishes App vs App3;
+`evaluated` still `Uninitialized`), `evaluated` + `third` are empty — `walkPair` could
+**skip marking them** (mark only `left`/`right`). map's 2M unforced pairs → ~halve the
+mark work **without touching the representation or the memo**. Lower-risk, independently
+measurable. Pre-committed bar (per the plan): map GC-mark CPU −≥… / map ratio toward
+~2.3×; byte-identical; `--core`/scaling green. **Spike pending darwin-4** (ssh-agent was
+refusing to sign `id_rsa` at revisit time — all timing/RSS measurement blocked; T3-lite
+and T3-proper both need it).
+
 ## Methodology notes (for the next investigation)
 
 - 3 source agents parallelised over local source (no host contention); the dedicated
