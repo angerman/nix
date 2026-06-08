@@ -178,6 +178,57 @@ note) avoids forking the core representation twice. (T3 also requires splitting
 the `App3` path off `ValuePair` + dropping the App-memo `evaluated` field —
 broad, with shared-App memoization risk.)
 
+## In-depth re-analysis — post Wave-1/2 (2026-06-08, darwin-4 idle, post-T1/T2/T4 binary)
+
+Re-profiled after the team's fixes. T1+T4 **largely solved the *allocation* problem**;
+the bottleneck has **shifted** and **split into two profiles**. Scaling guard: ✓ no
+regressions (filter now 1.60× linear PASS).
+
+| pass | now v3/TW | dominant cost (measured) |
+|---|--:|---|
+| genList | 1.00× | — (parity) |
+| **map** | **3.57×** | **major-GC marking the fat pairs — 76% of CPU** (A/B below) |
+| foldl | 2.65× | TLS `threadArena` ~38% + dispatch ~26% + GC-mark ~25% |
+| mapfoldl | 3.50× | map's GC-mark + foldl's dispatch/TLS |
+| filter | 2.41× | per-element call/dispatch (alloc now lean: insns 26M→8M, RSS→256M) |
+
+**Profile A — foldl/mapfoldl (force elements).** `sample` self-time: `_tlv_get_addr`
+1104 (#1, ~38%) · `dispatchLoop` 756 (~26%) · GC-mark ~736 (~25%). The
+`_tlv_get_addr` callers are all `dispatchLoop` ⇒ **confirmed: the per-opcode TLS is
+`threadArena()` at vm.cc:3011** (read every iteration in the default-on major-GC
+safepoint). The team's suspected `majorGcEnabled()` is **REFUTED** — it's a plain
+`const` global (alloc.hh:958), not TLS. `insns` unchanged at 26M ⇒ T1 cut allocation,
+not dispatch.
+
+**Profile B — map (lazy; `length` forces only the spine).** `f`/`g` never called, no
+element forced (source-confirmed: `length`→`OP_LENGTH`; `primMap` lazy). Map's cost is
+the non-moving major-GC **marking the 2N fat `ValuePair`s** it allocates.
+**A/B (the clincher):** `NIX_V3_NO_MAJOR_GC=1` drops map 0.25s→**0.06s (= TW 0.07s,
+parity)** while genList is unchanged (0.05→0.05). ⇒ **GC-mark is ~76% of map's CPU.**
+Both fire `gc_count=1`; the difference is mark *volume* (map holds 2× the live pairs),
+not threshold-crossing.
+
+**Revelation: the 64B `ValuePair` is now a *CPU* cost, not just the 384MB memory.**
+GC-`walkPair` scans all 4 fields per pair → marking dominates map and is ~25% of foldl.
+Shrinking it (T3, 64→32B, drop the dead `evaluated`+`third`) pays **three** ways:
+map GC-mark (~halves → ~3.57→~2.3×), foldl's 25% GC-mark, and 384MB→~192MB.
+
+**Refined next levers (both measurement-confirmed):**
+1. **`threadArena()` per-entry hoist** (cache `Arena&` once per `dispatchLoop` entry,
+   mirror the `Nursery*` cache vm.cc:2842; delete the per-iteration read at vm.cc:3011).
+   Attacks foldl/mapfoldl's #1 cost (~38% TLS). Narrow, low-risk; thread-lifetime
+   singleton is address-stable across GC. **This is the *real* T5** (the reverted
+   attempt hit the per-re-entry VMScope = only −5.7%; this is the per-*opcode* TLS).
+2. **Shrink `ValuePair` 64→32B (T3) — now the top cross-cutting lever** (map's dominant
+   cost + foldl's 25% + the 384MB). Priority raised by the GC-mark-CPU finding; it's the
+   only lever for the map laggard short of GC changes. Still folds into Value-16→8B.
+3. *Secondary:* `length∘map` fusion (→ parity for that idiom); major-GC trigger policy
+   for transient builds (GC marks soon-dead pairs — but the GC track is paused).
+
+**Reverted-task confirmations:** T7 (OP_LESS) — filter is allocation-bound not
+compare-bound (RCA cause #7 over-attributed). T5-reuseScope — per-re-entry VMScope TLS
+is minor; the per-opcode `threadArena` is the real cost.
+
 ## Methodology notes (for the next investigation)
 
 - 3 source agents parallelised over local source (no host contention); the dedicated
