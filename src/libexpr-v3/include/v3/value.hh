@@ -1,15 +1,21 @@
 #pragma once
 /// @file
-/// Nix v3 evaluator: 16-byte tagged Value.
+/// Nix v3 evaluator: tagged 8-byte Value (NaN-boxed) — Lever B.
 ///
-/// Design choices (per doc/v3-design/v3-design.md §3):
-///   - 5-bit tag in low byte of `tag_payload` word; rest of word is currently
-///     unused (room for future small-int / inline-string optimisations).
-///   - 8-byte payload union is the second word; carries either an immediate
-///     scalar (int, float, bool — though Bool is a singleton) or a pointer
-///     to a heap object.
-///   - Singletons for Bool/Null/Blackhole/EmptyList/EmptyAttrs — the tag
-///     plus a known global address.
+/// Design (lode/LEVER_B_IMPL_PLAN_2026-06-10.md): a Value is a single 8-byte word
+/// (`uint64_t w`), NaN-boxed — a Float is the raw IEEE-754 double except the boxed
+/// region, where the tag = sign[63]‖bits[48..51] (5 bits) and the payload = bits
+/// [0..47] (a 48-bit canonical pointer OR a 48-bit signed immediate; ints outside
+/// ±2^47 box into a heap cell).  See the `v8nan` codec below.  Singletons for
+/// Bool/Null/Blackhole/EmptyList/EmptyAttrs hold the tag + a known global address.
+///
+/// History: the original layout was a 16-byte `{ tag word ; payload union }`.  Lever
+/// B (L0 accessor migration → L2 NaN-box behind `V3_VALUE_8B` → L3 measure → L4 flip
+/// default-on, 2026-06-10) collapsed it to 8 bytes for −18–24% peak RSS (synthetic +
+/// firefox.drvPath) at +1–4% wall (darwin-4), byte-identical (lang 142/143 + a 144-test
+/// + 16-package 16B↔8B diff).  The legacy 16-byte `#else` path + the
+/// `-DV3_VALUE_16B_LEGACY` valve were retired here once 8B baked; `git log` /
+/// commit c690b3f19 have the 16B layout if ever needed.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
@@ -17,17 +23,6 @@
 #include <cstdint>
 #include <cstddef>
 #include <cassert>
-
-// Lever B L4 (2026-06-10): the tagged 8-byte Value (NaN-box) is now the DEFAULT
-// layout — lode/LEVER_B_IMPL_PLAN_2026-06-10.md. Gates met: −18–24% peak RSS
-// (synthetic attrset-of-attrsets + the real firefox.drvPath), wall ≤5% on darwin-4
-// (+1–4%), byte-identical (v3 lang 142/143; firefox.drvPath 16B↔8B identical), and
-// #455 fixed so v3-direct completes real nixpkgs. Opt OUT to the legacy 16-byte
-// layout during the soak window with -DV3_VALUE_16B_LEGACY; the 16B `#else` path and
-// this valve retire once 8B has baked on the cutover-parity corpus + M5/HNE.
-#if !defined(V3_VALUE_8B) && !defined(V3_VALUE_16B_LEGACY)
-#  define V3_VALUE_8B 1
-#endif
 
 namespace nix::v3 {
 
@@ -39,7 +34,8 @@ struct PrimOp;
 struct Value;
 struct ValuePair; // pair of Values for App / PrimOpApp; defined after Value
 
-/// 5-bit tag.  Stored in the low 8 bits of Value::tag_payload.
+/// 5-bit tag.  Encoded in the NaN-box word (sign[63]‖bits[48..51]); see the v8nan
+/// codec + `Value::tag()` below.
 enum class Tag : uint8_t {
     Uninitialized = 0,
     Int           = 1,
@@ -85,7 +81,6 @@ enum class Tag : uint8_t {
     App3          = 17,
 };
 
-#ifdef V3_VALUE_8B
 /// Lever B (lode/LEVER_B_IMPL_PLAN_2026-06-10.md §"L1 encoding") — NaN-box codec
 /// for the tagged 8-byte Value; proven in test/value8-encoding-spike.cc over all
 /// 18 tags + 48-bit ints (+ box overflow) + pointer-per-kind + float(±0/±inf/NaN).
@@ -120,13 +115,10 @@ namespace v8nan {
     const void * boxInt64(int64_t n);
     int64_t      unboxInt64(const void * cell) noexcept;
 }
-#endif
 
-/// Value: 16 bytes today (8 B tag word + 8 B payload union); under V3_VALUE_8B a
-/// single NaN-boxed 8 B word (see the v8nan codec above).
+/// Value: a single NaN-boxed 8-byte word (see the v8nan codec above).
 struct Value
 {
-#ifdef V3_VALUE_8B
     uint64_t w;   ///< NaN-boxed tagged word.
 
     [[gnu::always_inline]] inline Tag tag() const noexcept
@@ -137,36 +129,6 @@ struct Value
         if (c == v8nan::BOXEDINT) return Tag::Int;        // overflow int in a heap cell
         return v8nan::tagFromCode(c);
     }
-#else
-    /// Low byte: Tag.  Upper 56 bits reserved (e.g., for inline-string size,
-    /// small-bool encoding, future tagged-immediate flags).
-    uint64_t tag_payload;
-
-    /// 8-byte payload union.  Interpretation depends on Tag.
-    /// PrimOpApp / App carry a heap-allocated pair (ValuePair*) — payload is
-    /// the pointer; we don't pack two pointers inline since that would bloat
-    /// every Value to 24 bytes.
-    union Payload {
-        int64_t        i;          // Tag::Int
-        double         f;          // Tag::Float
-        const char *   str;        // Tag::String
-        const char *   path;       // Tag::Path (with separate accessor table)
-        Bindings *     bindings;   // Tag::Attrs
-        ListVec *      list;       // Tag::List
-        Closure *      closure;    // Tag::Closure
-        Thunk *        thunk;      // Tag::Thunk
-        const PrimOp * primop;     // Tag::PrimOp
-        Value *        next;       // Tag::Thunk Blackhole chain (transient)
-        ValuePair *    pair;       // PrimOpApp / App (allocated)
-        Value *        slot;       // Tag::Slot — stable pointer to another Value
-        void *         raw;        // External / generic
-    } payload;
-
-    [[gnu::always_inline]] inline Tag tag() const noexcept
-    {
-        return static_cast<Tag>(tag_payload & 0xFF);
-    }
-#endif
 
     [[gnu::always_inline]] inline bool isInt()      const noexcept { return tag() == Tag::Int; }
     [[gnu::always_inline]] inline bool isFloat()    const noexcept { return tag() == Tag::Float; }
@@ -211,7 +173,6 @@ struct Value
     /// change (decode/encode the tagged word); every caller routed through them
     /// stays correct without edits.  Migrating direct `.payload.X` reads to
     /// these is the (staged, byte-identical) L0 work that localizes the flip.
-#ifdef V3_VALUE_8B
     // 8B: pointers are the low 48 bits; int sign-extends 48-bit (or derefs a
     // BOXEDINT cell); float reconstructs the double (NaN canonicalised back).
 private:
@@ -238,50 +199,24 @@ public:
     [[gnu::always_inline]] inline ValuePair *     asPair()    const noexcept { return reinterpret_cast<ValuePair *>(ptrBits()); }
     [[gnu::always_inline]] inline Value *         asSlot()    const noexcept { return reinterpret_cast<Value *>(ptrBits()); }
     [[gnu::always_inline]] inline void *          asRaw()     const noexcept { return ptrBits(); }
-#else
-    [[gnu::always_inline]] inline int64_t        asInt()     const noexcept { return payload.i; }
-    [[gnu::always_inline]] inline double         asFloat()   const noexcept { return payload.f; }
-    [[gnu::always_inline]] inline const char *   asString()  const noexcept { return payload.str; }
-    [[gnu::always_inline]] inline const char *   asPath()    const noexcept { return payload.path; }
-    [[gnu::always_inline]] inline Bindings *      asAttrs()   const noexcept { return payload.bindings; }
-    [[gnu::always_inline]] inline ListVec *       asList()    const noexcept { return payload.list; }
-    [[gnu::always_inline]] inline Closure *       asClosure() const noexcept { return payload.closure; }
-    [[gnu::always_inline]] inline Thunk *         asThunk()   const noexcept { return payload.thunk; }
-    [[gnu::always_inline]] inline const PrimOp *  asPrimOp()  const noexcept { return payload.primop; }
-    [[gnu::always_inline]] inline ValuePair *     asPair()    const noexcept { return payload.pair; }
-    [[gnu::always_inline]] inline Value *         asSlot()    const noexcept { return payload.slot; }
-    [[gnu::always_inline]] inline void *          asRaw()     const noexcept { return payload.raw; }
-#endif
 
     /// L0: raw identity word — used by the CU-cache key + thunk fingerprint to
     /// compare Values by bits.  Today this is the tag word only (the 16B layout
     /// keys on the tag); under the tagged 8B layout it becomes the full encoded
     /// word (tag ‖ immediate/pointer) — strictly more precise, still a valid
     /// equality key.  Callers must treat it as opaque bits.
-#ifdef V3_VALUE_8B
     [[gnu::always_inline]] inline uint64_t        rawWord()   const noexcept { return w; }
     [[gnu::always_inline]] inline void            mkUninitialized() noexcept { w = v8nan::box(v8nan::codeOf(Tag::Uninitialized), 0); }
     /// 8B: the serializer wants the SEMANTIC double's bits; reconstruct via asFloat
     /// (a canonicalised NaN round-trips back to a NaN, which is fine).
     [[gnu::always_inline]] inline uint64_t        floatBits() const noexcept { double d = asFloat(); uint64_t b; __builtin_memcpy(&b, &d, 8); return b; }
     [[gnu::always_inline]] inline void            setFloatBits(uint64_t b) noexcept { double d; __builtin_memcpy(&d, &b, 8); mkFloat(d); }
-#else
-    [[gnu::always_inline]] inline uint64_t        rawWord()   const noexcept { return tag_payload; }
-    /// L0: clear to Uninitialized (replaces `v.tag_payload = 0` / `= Tag::Uninitialized`).
-    [[gnu::always_inline]] inline void            mkUninitialized() noexcept { tag_payload = static_cast<uint64_t>(Tag::Uninitialized); payload.raw = nullptr; }
-    /// L0: raw float bits — for the serializer's bit-exact read/write of a
-    /// Float (replaces `memcpy(&…, &v.payload.f, 8)` / `memcmp(&a.payload.f,…)`).
-    /// Under the tagged 8B layout these become the float (de)encoders.
-    [[gnu::always_inline]] inline uint64_t        floatBits() const noexcept { uint64_t b; __builtin_memcpy(&b, &payload.f, 8); return b; }
-    [[gnu::always_inline]] inline void            setFloatBits(uint64_t b) noexcept { tag_payload = static_cast<uint64_t>(Tag::Float); __builtin_memcpy(&payload.f, &b, 8); }
-#endif
 
     inline void mkBool(bool b) noexcept;       // sets to vTrue/vFalse singleton
     inline void mkNull() noexcept;             // sets to vNull singleton
     inline void mkBlackhole() noexcept;        // sets to Blackhole tag
 
     /// In-place initialisers (no allocation, except mkInt's rare boxed-overflow).
-#ifdef V3_VALUE_8B
 private:
     [[gnu::always_inline]] inline void setPtr(Tag t, const void * p) noexcept
     { w = v8nan::box(v8nan::codeOf(t), static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p))); }
@@ -307,74 +242,6 @@ public:
     inline void mkExternal(void * p)       noexcept { setPtr(Tag::External, p); }
     /// App / App3 / PrimOpApp share the ValuePair* payload; caller picks the tag.
     inline void mkPair   (Tag t, ValuePair * p) noexcept { setPtr(t, p); }
-#else
-    inline void mkInt(int64_t n) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::Int);
-        payload.i = n;
-    }
-    inline void mkFloat(double d) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::Float);
-        payload.f = d;
-    }
-    inline void mkClosure(Closure * c) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::Closure);
-        payload.closure = c;
-    }
-    inline void mkThunk(Thunk * t) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::Thunk);
-        payload.thunk = t;
-    }
-    inline void mkAttrs(Bindings * b) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        payload.bindings = b;
-    }
-    inline void mkString(const char * s) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::String);
-        payload.str = s;
-    }
-    inline void mkSlot(Value * p) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::Slot);
-        payload.slot = p;
-    }
-    // L0: remaining pointer/immediate writers (write targets for the
-    // `.payload.X = …` → `mkX(…)` migration).  Each sets tag + payload as a
-    // unit; under the tagged 8B layout they become the encoders.
-    inline void mkList(ListVec * l) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::List);
-        payload.list = l;
-    }
-    inline void mkPath(const char * p) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::Path);
-        payload.path = p;
-    }
-    inline void mkPrimOp(const PrimOp * p) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::PrimOp);
-        payload.primop = p;
-    }
-    inline void mkExternal(void * p) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(Tag::External);
-        payload.raw = p;
-    }
-    /// App / App3 / PrimOpApp share the ValuePair* payload; the caller picks
-    /// the tag (they are distinct dispatch tags).  `t` must be one of
-    /// Tag::App / Tag::App3 / Tag::PrimOpApp.
-    inline void mkPair(Tag t, ValuePair * p) noexcept
-    {
-        tag_payload = static_cast<uint64_t>(t);
-        payload.pair = p;
-    }
-#endif
 
     /// Singletons (defined in value.cc).
     static Value vTrue;
@@ -390,15 +257,8 @@ public:
 // 61-bit inline ints, box overflow), projected ≈ −28% arena (Bindings entry
 // 24→16, ValuePair 64→32, ListVec elem 16→8, thunk Value field halves).  When
 // that lands, flip this assert to ==8 together with the accessors/mkX encoders.
-#ifdef V3_VALUE_8B
 static_assert(sizeof(Value) == 8,
-              "V3_VALUE_8B: Value must be exactly 8 bytes (NaN-boxed word).");
-#else
-static_assert(sizeof(Value) == 16,
-              "Value is 16B today; Lever B (lode/LEVER_B_IMPL_PLAN_2026-06-10.md) "
-              "targets a tagged 8B Value — change this assert + the as*/mk* "
-              "accessors together when the encoding lands.");
-#endif
+              "v3 Value must be exactly 8 bytes (NaN-boxed word).");
 
 /// Pair of Values for App / PrimOpApp.  Heap allocated; pointer kept in the
 /// payload of the parent Value to keep the Value itself at 16 bytes.
@@ -435,12 +295,7 @@ static_assert(sizeof(Value) == 16,
 /// it after the hot fields.
 struct ValuePair { Value left; Value right; Value evaluated; Value third; };
 
-#ifdef V3_VALUE_8B
-static_assert(sizeof(Value) == 8, "v3 Value must be exactly 8 bytes under V3_VALUE_8B");
-static_assert(sizeof(ValuePair) == 32, "ValuePair is 4×8B = 32B under V3_VALUE_8B (T3)");
-#else
-static_assert(sizeof(Value) == 16, "v3 Value must be exactly 16 bytes");
-#endif
+static_assert(sizeof(ValuePair) == 32, "ValuePair is 4×8B = 32B (Lever B T3)");
 
 /// Tag classification for precise-root scanning.
 ///
@@ -551,12 +406,7 @@ inline void Value::mkNull() noexcept
 
 inline void Value::mkBlackhole() noexcept
 {
-#ifdef V3_VALUE_8B
     w = v8nan::box(v8nan::codeOf(Tag::Blackhole), 0);
-#else
-    tag_payload = static_cast<uint64_t>(Tag::Blackhole);
-    payload.raw = nullptr;
-#endif
 }
 
 } // namespace nix::v3

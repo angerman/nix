@@ -42,7 +42,6 @@ Bindings * Alloc::emptyBindingsSentinel() noexcept
     return &sEmptyBindings;
 }
 
-#ifdef V3_VALUE_8B
 // Bootstrap singletons under the tagged 8B layout — constructed via the NaN-box
 // codec directly (can't use mkBool/mkNull: they reference vTrue/vNull circularly).
 Value Value::vTrue       = []() { Value v; v.w = v8nan::box(v8nan::codeOf(Tag::Bool),      1); return v; }();
@@ -71,14 +70,6 @@ int64_t unboxInt64(const void * cell) noexcept
     return *reinterpret_cast<const int64_t *>(cell);
 }
 } // namespace v8nan
-#else
-Value Value::vTrue       = []() { Value v; v.tag_payload = static_cast<uint64_t>(Tag::Bool);      v.payload.i = 1; return v; }();
-Value Value::vFalse      = []() { Value v; v.tag_payload = static_cast<uint64_t>(Tag::Bool);      v.payload.i = 0; return v; }();
-Value Value::vNull       = []() { Value v; v.tag_payload = static_cast<uint64_t>(Tag::Null);      v.payload.raw = nullptr; return v; }();
-Value Value::vBlackhole  = []() { Value v; v.tag_payload = static_cast<uint64_t>(Tag::Blackhole); v.payload.raw = nullptr; return v; }();
-Value Value::vEmptyList  = []() { Value v; v.tag_payload = static_cast<uint64_t>(Tag::List);      v.payload.list = &sEmptyList; return v; }();
-Value Value::vEmptyAttrs = []() { Value v; v.tag_payload = static_cast<uint64_t>(Tag::Attrs);     v.payload.bindings = &sEmptyBindings; return v; }();
-#endif
 
 // #825 / A1a Phase B (2026-05-26) — `Bindings::materialize` out-of-line
 // definition.  See the corresponding stub comment in `alloc.hh` for
