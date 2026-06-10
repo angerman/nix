@@ -209,6 +209,31 @@ and asserts all codes distinct + none == FLOATNAN: ALL PASS.
   build8 run**, not by a pre-emptive GC redesign.
 - Then the SHIP gate: peak-RSS ≥20% on a fixpoint-free Bindings-heavy eval; byte-identical; wall ≤5%.
 
+### L3 — RESULTS (2026-06-10): 8B builds, runs, is CORRECT, and saves 18–24% peak RSS
+
+The measure-twice GC correction held empirically. `build8` (`-Dcpp_args=-DV3_VALUE_8B`, whole
+tree) **built + linked clean** (291 steps, 0 errors). The 8B `v3-eval`/`v3-smoke`:
+
+- **CORRECT.** v3-smoke ALL PASS; v3 lang **142/143 — byte-identical to the 16B build** (same
+  sole pre-existing `eval-okay-types` fail). Smoke incl. lazy attrsets, floats, foldl', partial
+  application, and **boxed-int overflow** (`9999999999999999 + 1 = 10000000000000000`) all correct.
+  ⇒ the precise-mark + arena-noroot + safepoint infra already handles 8B; **no GC redesign needed**
+  (the "C-stack blocker" is empirically moot).
+- **Peak-RSS A/B (16B build/ vs 8B build8/, same eval, `/usr/bin/time -l` max RSS, byte-identical
+  results):**
+  - Shape A (300k 3-entry attrsets, deep-forced): **23.8–23.9%** (138.1 → 105.2 MB), stable ×3.
+  - Shape B (one 250k-entry attrset, attrValues summed): **18.2%** (157.3 → 128.6 MB), stable ×2 —
+    just under 20% because 250k non-shrinking `allocChars` key strings + base RSS dilute the
+    Value-array win (the entry array itself is 24→16 = −33%).
+- **Verdict: GO-leaning.** Clears the ≥20% gate on attrset-of-attrsets; ~18% on the
+  string-diluted single-giant-attrset; both far above the 10% REVERT floor. Workload-dependent
+  18–24%, consistent with the −28% *arena* projection diluted by non-arena RSS (strings, headers,
+  base, Boehm reserve).
+- **Still pending before L4 (default flip):** (a) the firefox/real-eval peak-RSS the gate most
+  wanted (blocked by the #455 fixpoint loop under pure v3-direct); (b) **wall ≤5%** — UNMEASURED;
+  the NaN-box adds a mask/shift per access, must be measured on **darwin-4** (laptop wall is noisy),
+  not assumed. Do NOT flip the production default on the synthetic evidence alone.
+
 ### L4 — unchanged (flip default-on, soak, retire toggle + 16B path).
 
 ## Dependencies / notes
