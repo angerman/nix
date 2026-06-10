@@ -116,6 +116,59 @@ linux-x86-64). The L1 isolated unit test round-trips every Tag + 48-bit int (inc
 overflow) + a sample pointer per kind + float (incl. ±0, ±inf, NaN) to validate before any
 VM wiring.
 
+## L0 — DONE (2026-06-10). L2 entry notes + worklist
+
+**L0 is complete** — commits `2e5358cfa` (9 small files) + `b87723229` (vm.cc + primops.cc,
+the bulk) + `ef007a828` (test/CLI/bytecode + L0 COMPLETE). Every direct `Value::payload.X`
+field access in the whole v3 tree now routes through `asX()`/`mkX()`/`rawWord()`/
+`floatBits()`/`mkUninitialized()`; only `value.hh` (the layout def) and `value.cc` (bootstrap
+singletons) keep direct access. All three commits byte-identical (v3 lang 142/143 throughout —
+`eval-okay-types`, typeOf of a partially-applied closure → "unknown", is the SOLE fail and is
+PRE-EXISTING at HEAD per same-host bisect, NOT a Lever-B regression). v3-smoke green.
+
+**Encoding RE-PROVEN for the production 18-tag enum** (commit `6d12b48dd`): the L1 spike's
+enum stopped at `Slot=16`; the live enum has **`App3=17`** → `codeOf(App3)=19` collided with
+the old `FLOATNAN=19`. Corrected to **`FLOATNAN=20`** (tag codes are `{1..15,17,18,19}`;
+FLOATNAN must avoid them + keep a nonzero low nibble + stay ≤31). Spike now sweeps tags 0..17
+and asserts all codes distinct + none == FLOATNAN: ALL PASS.
+
+### L2a (next) — flip `Value` to 8B behind `V3_VALUE_8B`, default OFF
+
+- **Toggle:** `#ifdef V3_VALUE_8B` in `value.hh`. Default build leaves the 16B `#else`
+  bodies **verbatim** (byte-identical default is the gate). Structure as ~7 branched regions:
+  storage; `tag()`; the read-accessor block; `rawWord`/`floatBits`/`mkUninitialized`; the
+  writer block; `mkBlackhole`; the two `static_assert(sizeof==16)` → `==8`.
+- **Codec:** port the (now-corrected) spike codec into `value.hh` as `#ifdef V3_VALUE_8B`
+  `inline`/`constexpr` free fns in a `v8nan` detail namespace (EXP/MANT/PAY masks,
+  `codeOf`/`tagFromCode`, `box`/`isBoxed`/`boxCode`/`boxPay`, `FLOATNAN=20`,
+  `INT_MIN48/MAX48`). The struct holds a single `uint64_t w`.
+- **App-memo / App3 need NO rework** (revises the original L2 bullet): `ValuePair` stays 4
+  `Value` members ⇒ 64→**32B** for free (= T3); `evaluated`'s memo works because the NaN-box
+  has a Uninitialized tag + `mkUninitialized()` (the sentinel `tag()==Uninitialized` check is
+  unchanged). No tagged-slot / side-cell needed.
+- **Boxed-int overflow is the one real design choice.** Nix int is 64-bit; only ±2⁴⁷ fits
+  inline. Plan: a distinct internal boxed-int code; `tag()` maps it to `Tag::Int`; `asInt()`
+  derefs a heap `int64` cell; `mkInt(n)` inlines if it fits 48-bit else allocates the cell.
+  Keep `value.hh` allocator-free: declare `v8nan::boxInt64(int64_t)->const void*` +
+  `unboxInt64(const void*)->int64_t` and **define them in `value.cc`** (where `Alloc` is
+  available). GC must treat a boxed-int cell as a leaf root it keeps alive (audit in L2b).
+
+### L2b worklist (after L2a compiles under the toggle)
+
+- **`tagIsPointer` stays as-is** — it's a pure `Tag`→bool classification (layout-independent),
+  already correct (PrimOp/External=false by design; the GC walks String/Path via
+  `visitString/Path`). The *encoding* stores PrimOp/External as pointers regardless; that's
+  separate from the GC-walk classification. No change needed, but re-confirm the asserts hold.
+- **`sizeof(Value)==16` / 16-stride assumptions** — audit `ListVec` elem size, `Bindings::Entry`
+  layout, `Alloc` cell sizes, any `memcpy(…, 16)` / `* 16`. These SHRINK; find hard-coded 16s.
+- **value_serialize** — format is layout-INDEPENDENT (writes tag byte + payload bytes via
+  `asX`/`floatBits`), so cross-layout compatible; just confirm no raw-struct `memcpy`.
+- **FFI marshalling + register-VM ops** — both go through the migrated accessors now; confirm
+  no raw 16B `Value` memcpy / `.payload` assumption remains (L0 removed them, but re-grep).
+- Build green under BOTH toggles; run the standalone encoding unit test wired as a real test.
+
+### L3 / L4 — unchanged (measure ≥20% on a fixpoint-free Bindings-heavy eval; flip + retire).
+
 ## Dependencies / notes
 
 - **#455 fixpoint loop blocks the *firefox/drvPath* measurement** under pure v3-direct
