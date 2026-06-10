@@ -244,7 +244,23 @@ tree) **built + linked clean** (291 steps, 0 errors). The 8B `v3-eval`/`v3-smoke
   production default warrants maintainer sign-off. The objective gates (RSS ≥20% on attrset-heavy,
   wall ≤5%, byte-identical, correctness) are MET on synthetics.
 
-### L4 — unchanged (flip default-on, soak, retire toggle + 16B path).
+### L4 — ✅ DONE (2026-06-10): flipped default-on, soaked, 16B path retired.
+
+- **Flip** (commit c690b3f19): `value.hh` `#define V3_VALUE_8B 1` by default, opt-out
+  `-DV3_VALUE_16B_LEGACY`. All gates met incl. the firefox real-eval RSS (−20–24%) that
+  the #455 fix unblocked; lang 142/143; wall +1–4% (darwin-4).
+- **Soak**: built a 16B-legacy reference (`build16`) and byte-diffed vs 8B-default —
+  **lang corpus 144/144 + 16/16 nixpkgs `.drvPath`** (toolchain + firefox) byte-identical.
+- **Retire** (commit 2544024bb): deleted the `#ifdef V3_VALUE_8B`/`#else`(16B) branches +
+  the valve from value.hh + value.cc (−179 lines); 8B is now UNCONDITIONAL. Re-validated
+  (lang 142/143, smoke, #455 4/4) on the unconditional build. 16B layout preserved in git
+  @ c690b3f19.
+- **Residual (darwin-4 follow-up, low-risk):** M5 (cardano-node) + HNE bake need the full
+  `nix` binary under 8B + the cardano/haskell.nix flakes (`getFlake` not wired in
+  `v3-eval`). Layout-only flip + firefox.drvPath byte-identity make divergence unlikely;
+  a git revert is the safety net if ever needed.
+
+**Lever B COMPLETE: the v3 `Value` is a tagged 8-byte NaN-boxed word, default + only layout.**
 
 ## Dependencies / notes
 
