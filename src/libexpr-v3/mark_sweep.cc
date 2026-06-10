@@ -1068,28 +1068,35 @@ public:
 
     void visitValue(Value & v) noexcept
     {
+        // The visitX() visitors MUTATE the pointer in place (moving-GC
+        // evacuation rewrites the field to the relocated cell).  The L0
+        // accessors return a Value's pointer BY VALUE (there is no stable
+        // lvalue inside an 8B-encoded word), so the canonical form is
+        // read-into-local → visit (mutates local) → write back through the
+        // tag-preserving mkX() setter.
         switch (v.tag()) {
-        case Tag::Closure:   visitClosure(v.payload.closure); break;
-        case Tag::Thunk:     visitThunk(v.payload.thunk);     break;
-        case Tag::Attrs:     visitBindings(v.payload.bindings); break;
-        case Tag::List:      visitList(v.payload.list);       break;
+        case Tag::Closure:   { auto p = v.asClosure(); visitClosure(p); v.mkClosure(p); break; }
+        case Tag::Thunk:     { auto p = v.asThunk();   visitThunk(p);   v.mkThunk(p);   break; }
+        case Tag::Attrs:     { auto p = v.asAttrs();   visitBindings(p);v.mkAttrs(p);   break; }
+        case Tag::List:      { auto p = v.asList();    visitList(p);    v.mkList(p);    break; }
         case Tag::App:
         case Tag::App3:
-        case Tag::PrimOpApp: visitPair(v.payload.pair);       break;
-        case Tag::Slot:
+        case Tag::PrimOpApp: { auto p = v.asPair();    visitPair(p);    v.mkPair(v.tag(), p); break; }
+        case Tag::Slot: {
             // MUST go through visitSlot so the slot POINTER itself is
             // rewritten when it targets (the interior of) a candidate
             // cell — not merely walk the pointee's content.  Missing this
             // left Tag::Slot pointers dangling at old cells (blocksFreed=0
             // + the verify's conservative scan chased them into the old
             // graph → 82 s).
-            visitSlot(v.payload.slot);
+            auto p = v.asSlot(); visitSlot(p); v.mkSlot(p);
             break;
+        }
         // String/Path carry a char buffer (allocChars) that lives in the
         // arena and may be in a candidate block — move it too, else its
         // block stays pinned (Chars are numerous + scattered).
-        case Tag::String: visitString(v.payload.str); break;
-        case Tag::Path:   visitPath(v.payload.path);  break;
+        case Tag::String: { auto s = v.asString(); visitString(s); v.mkString(s); break; }
+        case Tag::Path:   { auto s = v.asPath();   visitPath(s);   v.mkPath(s);   break; }
         case Tag::Uninitialized:
         case Tag::Int:
         case Tag::Float:
@@ -1628,15 +1635,15 @@ static void runEvacuation(VMState & vm, Arena & arena,
         // Does a Value's pointer payload land in an about-to-free candidate?
         auto refCand = [&](const Value & v) -> bool {
             switch (v.tag()) {
-            case Tag::Attrs:   return v.payload.bindings && inFreeable(reinterpret_cast<uintptr_t>(v.payload.bindings));
-            case Tag::Closure: return v.payload.closure && inFreeable(reinterpret_cast<uintptr_t>(v.payload.closure));
-            case Tag::Thunk:   return v.payload.thunk && inFreeable(reinterpret_cast<uintptr_t>(v.payload.thunk));
-            case Tag::List:    return v.payload.list && inFreeable(reinterpret_cast<uintptr_t>(v.payload.list));
+            case Tag::Attrs:   return v.asAttrs() && inFreeable(reinterpret_cast<uintptr_t>(v.asAttrs()));
+            case Tag::Closure: return v.asClosure() && inFreeable(reinterpret_cast<uintptr_t>(v.asClosure()));
+            case Tag::Thunk:   return v.asThunk() && inFreeable(reinterpret_cast<uintptr_t>(v.asThunk()));
+            case Tag::List:    return v.asList() && inFreeable(reinterpret_cast<uintptr_t>(v.asList()));
             case Tag::App: case Tag::App3: case Tag::PrimOpApp:
-                               return v.payload.pair && inFreeable(reinterpret_cast<uintptr_t>(v.payload.pair));
-            case Tag::Slot:    return v.payload.slot && inFreeable(reinterpret_cast<uintptr_t>(v.payload.slot));
-            case Tag::String:  return v.payload.str && inFreeable(reinterpret_cast<uintptr_t>(v.payload.str));
-            case Tag::Path:    return v.payload.path && inFreeable(reinterpret_cast<uintptr_t>(v.payload.path));
+                               return v.asPair() && inFreeable(reinterpret_cast<uintptr_t>(v.asPair()));
+            case Tag::Slot:    return v.asSlot() && inFreeable(reinterpret_cast<uintptr_t>(v.asSlot()));
+            case Tag::String:  return v.asString() && inFreeable(reinterpret_cast<uintptr_t>(v.asString()));
+            case Tag::Path:    return v.asPath() && inFreeable(reinterpret_cast<uintptr_t>(v.asPath()));
             case Tag::Uninitialized:
             case Tag::Int:
             case Tag::Float:

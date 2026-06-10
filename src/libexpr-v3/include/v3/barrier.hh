@@ -141,14 +141,14 @@ extern const bool g_phaseDActive;
     // Explicit case-per-Tag to satisfy -Wswitch-enum.  The compiler
     // folds the constant-false branches.
     switch (v.tag()) {
-    case Tag::Closure:   return n.contains(v.payload.closure);
-    case Tag::Thunk:     return n.contains(v.payload.thunk);
-    case Tag::Attrs:     return n.contains(v.payload.bindings);
-    case Tag::List:      return n.contains(v.payload.list);
-    case Tag::App:       return n.contains(v.payload.pair);
-    case Tag::App3:      return n.contains(v.payload.pair);
-    case Tag::PrimOpApp: return n.contains(v.payload.pair);
-    case Tag::Slot:      return n.contains(v.payload.slot);
+    case Tag::Closure:   return n.contains(v.asClosure());
+    case Tag::Thunk:     return n.contains(v.asThunk());
+    case Tag::Attrs:     return n.contains(v.asAttrs());
+    case Tag::List:      return n.contains(v.asList());
+    case Tag::App:       return n.contains(v.asPair());
+    case Tag::App3:      return n.contains(v.asPair());
+    case Tag::PrimOpApp: return n.contains(v.asPair());
+    case Tag::Slot:      return n.contains(v.asSlot());
     // Non-pointer payloads: scalar / interned-elsewhere / no-payload.
     case Tag::Uninitialized:
     case Tag::Int:

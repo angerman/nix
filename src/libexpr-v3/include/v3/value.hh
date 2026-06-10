@@ -162,6 +162,20 @@ struct Value
     [[gnu::always_inline]] inline Value *         asSlot()    const noexcept { return payload.slot; }
     [[gnu::always_inline]] inline void *          asRaw()     const noexcept { return payload.raw; }
 
+    /// L0: raw identity word — used by the CU-cache key + thunk fingerprint to
+    /// compare Values by bits.  Today this is the tag word only (the 16B layout
+    /// keys on the tag); under the tagged 8B layout it becomes the full encoded
+    /// word (tag ‖ immediate/pointer) — strictly more precise, still a valid
+    /// equality key.  Callers must treat it as opaque bits.
+    [[gnu::always_inline]] inline uint64_t        rawWord()   const noexcept { return tag_payload; }
+    /// L0: clear to Uninitialized (replaces `v.tag_payload = 0` / `= Tag::Uninitialized`).
+    [[gnu::always_inline]] inline void            mkUninitialized() noexcept { tag_payload = static_cast<uint64_t>(Tag::Uninitialized); payload.raw = nullptr; }
+    /// L0: raw float bits — for the serializer's bit-exact read/write of a
+    /// Float (replaces `memcpy(&…, &v.payload.f, 8)` / `memcmp(&a.payload.f,…)`).
+    /// Under the tagged 8B layout these become the float (de)encoders.
+    [[gnu::always_inline]] inline uint64_t        floatBits() const noexcept { uint64_t b; __builtin_memcpy(&b, &payload.f, 8); return b; }
+    [[gnu::always_inline]] inline void            setFloatBits(uint64_t b) noexcept { tag_payload = static_cast<uint64_t>(Tag::Float); __builtin_memcpy(&payload.f, &b, 8); }
+
     /// In-place initialisers (no allocation).
     inline void mkInt(int64_t n) noexcept
     {
@@ -200,6 +214,37 @@ struct Value
     {
         tag_payload = static_cast<uint64_t>(Tag::Slot);
         payload.slot = p;
+    }
+    // L0: remaining pointer/immediate writers (write targets for the
+    // `.payload.X = …` → `mkX(…)` migration).  Each sets tag + payload as a
+    // unit; under the tagged 8B layout they become the encoders.
+    inline void mkList(ListVec * l) noexcept
+    {
+        tag_payload = static_cast<uint64_t>(Tag::List);
+        payload.list = l;
+    }
+    inline void mkPath(const char * p) noexcept
+    {
+        tag_payload = static_cast<uint64_t>(Tag::Path);
+        payload.path = p;
+    }
+    inline void mkPrimOp(const PrimOp * p) noexcept
+    {
+        tag_payload = static_cast<uint64_t>(Tag::PrimOp);
+        payload.primop = p;
+    }
+    inline void mkExternal(void * p) noexcept
+    {
+        tag_payload = static_cast<uint64_t>(Tag::External);
+        payload.raw = p;
+    }
+    /// App / App3 / PrimOpApp share the ValuePair* payload; the caller picks
+    /// the tag (they are distinct dispatch tags).  `t` must be one of
+    /// Tag::App / Tag::App3 / Tag::PrimOpApp.
+    inline void mkPair(Tag t, ValuePair * p) noexcept
+    {
+        tag_payload = static_cast<uint64_t>(t);
+        payload.pair = p;
     }
 
     /// Singletons (defined in value.cc).

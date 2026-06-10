@@ -2529,8 +2529,7 @@ struct Alloc
             // Sentinel: Tag::Thunk(t) — "this thunk has not yet
             // published in-progress state."  Readers compare against
             // (Tag::Thunk && ptr == t) to detect the sentinel.
-            sc->tag_payload = static_cast<uint64_t>(Tag::Thunk);
-            sc->payload.thunk = t;
+            sc->mkThunk(t);
             t->shapeCell = sc;
         }
         t->suspended.capturedWiths = nullptr;
@@ -2598,10 +2597,8 @@ struct Alloc
         // walkers/auditors to dereference random pointers → SIGSEGV.
         // Zero-init costs ~2 ns per pair (16 B write to evaluated +
         // 16 B to third).
-        p->evaluated.tag_payload = 0;  // Tag::Uninitialized
-        p->evaluated.payload.i = 0;
-        p->third.tag_payload = 0;
-        p->third.payload.i = 0;
+        p->evaluated.mkUninitialized();  // zeroes tag + payload (16 B)
+        p->third.mkUninitialized();
         pairAllocSiteRecord(p, file, line);
         return p;
     }
@@ -3447,34 +3444,34 @@ inline void cellTraceWrite(const Value * storage, const Thunk * t,
         "v3 CELL WRITE storage=%p thunk=%p value-tag=%u source=%s",
         (const void *)storage, (const void *)t, (unsigned)tg,
         source ? source : "<?>");
-    if (writtenValue.tag() == Tag::Attrs && writtenValue.payload.bindings) {
-        auto * b = writtenValue.payload.bindings;
+    if (writtenValue.tag() == Tag::Attrs && writtenValue.asAttrs()) {
+        auto * b = writtenValue.asAttrs();
         std::fprintf(stderr, " attrs ptr=%p size=%u",
             (const void *)b, (unsigned)b->size);
         if (const BindingsOrigin * o = lookupBindingsOrigin(b)) {
             std::fprintf(stderr, " value-origin=%s",
                 o->source ? o->source : "?");
         }
-    } else if (writtenValue.tag() == Tag::String && writtenValue.payload.str) {
-        std::fprintf(stderr, " str=\"%.40s\"", writtenValue.payload.str);
-    } else if (writtenValue.tag() == Tag::Closure && writtenValue.payload.closure) {
+    } else if (writtenValue.tag() == Tag::String && writtenValue.asString()) {
+        std::fprintf(stderr, " str=\"%.40s\"", writtenValue.asString());
+    } else if (writtenValue.tag() == Tag::Closure && writtenValue.asClosure()) {
         // Log closure pointer + desc codeOff so we can correlate with
         // later fakeClo allocations.  Phase A5 RCA: if the pooled
         // fakeClo pool returns a closure whose pointer matches a
         // cell-resident closure, the next OP_FORCE will overwrite
         // c->desc with the new thunk's desc — silently mutating the
         // cell-stored closure to the WRONG body.
-        auto * c = writtenValue.payload.closure;
+        auto * c = writtenValue.asClosure();
         std::fprintf(stderr, " closure-ptr=%p desc=%p",
             (const void *)c, (const void *)c->desc);
         if (c->desc) {
             std::fprintf(stderr, " codeOff=%u nUp=%u",
                 c->desc->codeOffset, (unsigned)c->nUpvalues);
         }
-    } else if (writtenValue.tag() == Tag::Thunk && writtenValue.payload.thunk) {
+    } else if (writtenValue.tag() == Tag::Thunk && writtenValue.asThunk()) {
         std::fprintf(stderr, " thunk-ptr=%p state=%d",
-            (const void *)writtenValue.payload.thunk,
-            (int)writtenValue.payload.thunk->state);
+            (const void *)writtenValue.asThunk(),
+            (int)writtenValue.asThunk()->state);
     }
     std::fprintf(stderr, "\n");
 }

@@ -126,32 +126,37 @@ struct RootVisitor
     /// inlining when called from the walker.
     void visitValue(Value & v) noexcept
     {
+        // visitX() may MUTATE the pointer (a moving walker rewrites the
+        // field).  L0 accessors return by value (no stable lvalue inside an
+        // 8B word), so read-into-local → visit → write back via the
+        // tag-preserving mkX() setter.  (A read-only walker leaves the local
+        // unchanged, so the write-back is a no-op.)
         switch (v.tag()) {
         case Tag::Closure:
-            visitClosure(v.payload.closure);
+            { auto p = v.asClosure(); visitClosure(p); v.mkClosure(p); }
             break;
         case Tag::Thunk:
-            visitThunk(v.payload.thunk);
+            { auto p = v.asThunk(); visitThunk(p); v.mkThunk(p); }
             break;
         case Tag::Attrs:
-            visitBindings(v.payload.bindings);
+            { auto p = v.asAttrs(); visitBindings(p); v.mkAttrs(p); }
             break;
         case Tag::List:
-            visitList(v.payload.list);
+            { auto p = v.asList(); visitList(p); v.mkList(p); }
             break;
         case Tag::App:
         case Tag::App3:
         case Tag::PrimOpApp:
-            visitPair(v.payload.pair);
+            { auto p = v.asPair(); visitPair(p); v.mkPair(v.tag(), p); }
             break;
         case Tag::Slot:
-            visitSlot(v.payload.slot);
+            { auto p = v.asSlot(); visitSlot(p); v.mkSlot(p); }
             break;
         case Tag::String:
-            visitString(v.payload.str);
+            { auto s = v.asString(); visitString(s); v.mkString(s); }
             break;
         case Tag::Path:
-            visitPath(v.payload.path);
+            { auto s = v.asPath(); visitPath(s); v.mkPath(s); }
             break;
         // Scalar / external tags: no v3-heap pointer to walk.
         case Tag::Uninitialized:

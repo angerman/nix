@@ -251,7 +251,7 @@ Value v3EmitTreeAttrs(const ffi::TreeAttrsInfo & info)
         Value v = allocStr(info.printedStorePath);
         std::vector<std::string> ctx;
         ctx.push_back(info.opaqueContextElem);
-        setStringContextEntries(v.payload.str, std::move(ctx));
+        setStringContextEntries(v.asString(), std::move(ctx));
         entries.emplace_back(ir::globalInternSymbol("outPath"), v);
     }
 
@@ -315,8 +315,7 @@ Value v3EmitTreeAttrs(const ffi::TreeAttrsInfo & info)
         bindingsSetEntry(b, i, { entries[i].first, /*pos=*/0, entries[i].second });
 
     Value out;
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
     return out;
 }
 
@@ -427,8 +426,7 @@ Value callFlakeV3(EvalState & state, const ffi::LockedFlakeInfo & flakeInfo)
                 bindingsSetEntry(inner, 1, {sidSourceInfo, 0, v3SourceInfo});
             }
             Value v3Inner;
-            v3Inner.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            v3Inner.payload.bindings = inner;
+            v3Inner.mkAttrs(inner);
 
             // Outer key — the node-key string (pre-resolved from keyMap).
             SymbolId sidKey = ir::globalInternSymbol(node.key);
@@ -437,8 +435,7 @@ Value callFlakeV3(EvalState & state, const ffi::LockedFlakeInfo & flakeInfo)
         // Bindings expects entries sorted by SymbolId (binary search).
         std::sort(&outer->entries[0], &outer->entries[outer->size],
             [](const auto & a, const auto & b){ return a.name < b.name; });
-        v3Overrides.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        v3Overrides.payload.bindings = outer;
+        v3Overrides.mkAttrs(outer);
     }
     tick("vOverrides built (v3-native outer + sourceInfo per node)");
 
@@ -457,8 +454,7 @@ Value callFlakeV3(EvalState & state, const ffi::LockedFlakeInfo & flakeInfo)
                 "v3::callFlakeV3: v3 primop `__fetchFinalTree` not "
                 "registered — primops.cc registerBuiltinPrimOps "
                 "should include it");
-        v3FetchFinal.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
-        v3FetchFinal.payload.primop = po;
+        v3FetchFinal.mkPrimOp(po);
     }
     tick("vFetchTreeFinal built (v3 PrimOp Value)");
 
@@ -545,13 +541,12 @@ void primV3CompileCallFlake(EvalState & state, Value * /*args*/, Value & out)
                     + std::to_string(static_cast<int>(closure.tag()));
 
     // Return as a v3 string Value.
-    out.tag_payload = static_cast<uint64_t>(Tag::String);
     // We need a stable string — allocate via the v3 string interner
     // or just copy into a static.  For a diagnostic primop, a static
     // is fine: the message is fixed-content.
     static std::string s_msg;
     s_msg = msg;
-    out.payload.str = s_msg.c_str();
+    out.mkString(s_msg.c_str());
 }
 
 } // namespace nix::v3

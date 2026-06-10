@@ -574,28 +574,30 @@ void Scavenger::visitValue(Value & v)
     // payloads which are tenured by definition.
     switch (v.tag()) {
     case Tag::Closure:
-        v.payload.closure = fwdClosure(v.payload.closure);
+        v.mkClosure(fwdClosure(v.asClosure()));
         break;
     case Tag::Thunk:
-        v.payload.thunk = fwdThunk(v.payload.thunk);
+        v.mkThunk(fwdThunk(v.asThunk()));
         break;
     case Tag::Attrs:
-        v.payload.bindings = fwdBindings(v.payload.bindings);
+        v.mkAttrs(fwdBindings(v.asAttrs()));
         break;
     case Tag::List:
-        v.payload.list = fwdList(v.payload.list);
+        v.mkList(fwdList(v.asList()));
         break;
     case Tag::App:
     case Tag::App3:
     case Tag::PrimOpApp:
-        v.payload.pair = fwdPair(v.payload.pair);
+        // Preserve the existing pair-tag (App / App3 / PrimOpApp); only the
+        // ValuePair* is forwarded to its moved location.
+        v.mkPair(v.tag(), fwdPair(v.asPair()));
         break;
     case Tag::Slot: {
         // Cells (Value *) are tenured; the slot pointer never moves.
         // The Value AT the cell may carry a nursery payload, so we
         // walk through.  We dedup via the same `walked` set so
         // multiple slots aliasing the same cell don't double-walk.
-        Value * cell = v.payload.slot;
+        Value * cell = v.asSlot();
         if (cell && walked.insert(cell).second) {
             visitValue(*cell);
         }
@@ -946,20 +948,20 @@ void Scavenger::run()
         // Also walk via closures/thunks on the stack — they carry CU
         // refs that may not be in any active frame.
         for (Value & v : vm.valueStack) {
-            if (v.tag() == Tag::Closure && v.payload.closure)
-                walkOneCU(v.payload.closure->cu);
-            else if (v.tag() == Tag::Thunk && v.payload.thunk
-                     && (v.payload.thunk->state == ThunkState::Suspended
-                         || v.payload.thunk->state == ThunkState::Blackhole))
-                walkOneCU(v.payload.thunk->suspended.cu);
+            if (v.tag() == Tag::Closure && v.asClosure())
+                walkOneCU(v.asClosure()->cu);
+            else if (v.tag() == Tag::Thunk && v.asThunk()
+                     && (v.asThunk()->state == ThunkState::Suspended
+                         || v.asThunk()->state == ThunkState::Blackhole))
+                walkOneCU(v.asThunk()->suspended.cu);
         }
         for (Value & v : vm.withStack) {
-            if (v.tag() == Tag::Closure && v.payload.closure)
-                walkOneCU(v.payload.closure->cu);
-            else if (v.tag() == Tag::Thunk && v.payload.thunk
-                     && (v.payload.thunk->state == ThunkState::Suspended
-                         || v.payload.thunk->state == ThunkState::Blackhole))
-                walkOneCU(v.payload.thunk->suspended.cu);
+            if (v.tag() == Tag::Closure && v.asClosure())
+                walkOneCU(v.asClosure()->cu);
+            else if (v.tag() == Tag::Thunk && v.asThunk()
+                     && (v.asThunk()->state == ThunkState::Suspended
+                         || v.asThunk()->state == ThunkState::Blackhole))
+                walkOneCU(v.asThunk()->suspended.cu);
         }
     }
 
@@ -975,7 +977,7 @@ void Scavenger::run()
     walkBytecodePrimopRoots(rootVisit);
 
     // #705 (2026-05-21): static `vBuiltins` Value root.  The
-    // bytecode-primop install path patches `vBuiltins.payload.bindings`
+    // bytecode-primop install path patches `vBuiltins.asAttrs()`
     // entries in place to point at the freshly-compiled bytecode
     // closures (see bytecode_primops.cc "Install path 3" — patches
     // `b->entries[i].value = installed.rr.value`).  Those entries
@@ -994,8 +996,8 @@ void Scavenger::run()
 
     // GC_AUDIT_ROUND_2 Round 1 #7 (2026-05-21): deep-force roots.
     // `print.cc::forceDeep`, `printNixValueRich(out, vm, ...)`, and
-    // `toJsonValue(vm, ...)` walk Values whose `payload.list` /
-    // `payload.bindings` C-locals live across recursive `forceValue`
+    // `toJsonValue(vm, ...)` walk Values whose `asList()` /
+    // `asAttrs()` C-locals live across recursive `forceValue`
     // calls.  When invoked at `vm.frames.empty()` (post-eval print /
     // JSON dump from the CLI), the inner forceValue enters
     // dispatchLoop at exitDepth==0 → scavenge enabled → the C-locals
@@ -1288,15 +1290,15 @@ struct Auditor {
 void Auditor::visitValue(const Value & v, const char * site)
 {
     switch (v.tag()) {
-    case Tag::Closure:  visitClosure(v.payload.closure,   site); break;
-    case Tag::Thunk:    visitThunk  (v.payload.thunk,     site); break;
-    case Tag::Attrs:    visitBindings(v.payload.bindings, site); break;
-    case Tag::List:     visitList   (v.payload.list,      site); break;
+    case Tag::Closure:  visitClosure(v.asClosure(),   site); break;
+    case Tag::Thunk:    visitThunk  (v.asThunk(),     site); break;
+    case Tag::Attrs:    visitBindings(v.asAttrs(), site); break;
+    case Tag::List:     visitList   (v.asList(),      site); break;
     case Tag::App:
     case Tag::App3:
-    case Tag::PrimOpApp: visitPair  (v.payload.pair,      site); break;
+    case Tag::PrimOpApp: visitPair  (v.asPair(),      site); break;
     case Tag::Slot:
-        if (v.payload.slot) visitValue(*v.payload.slot, "Slot.cell");
+        if (v.asSlot()) visitValue(*v.asSlot(), "Slot.cell");
         break;
     case Tag::Uninitialized:
     case Tag::Int:

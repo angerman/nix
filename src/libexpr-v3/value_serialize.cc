@@ -153,14 +153,14 @@ const Value & chaseToWHNF(const Value & v, int maxHops = 32)
     for (int i = 0; i < maxHops; ++i) {
         Tag t = cur->tag();
         if (t == Tag::Thunk) {
-            Thunk * th = cur->payload.thunk;
+            Thunk * th = cur->asThunk();
             if (!th || th->state != ThunkState::Evaluated)
                 throw SerializeError("Thunk not Evaluated; cannot canonical-hash");
             cur = &th->evaluated;
             continue;
         }
         if (t == Tag::App) {
-            ValuePair * p = cur->payload.pair;
+            ValuePair * p = cur->asPair();
             if (!p || p->evaluated.tag() == Tag::Uninitialized)
                 throw SerializeError("App not yet evaluated");
             cur = &p->evaluated;
@@ -171,16 +171,16 @@ const Value & chaseToWHNF(const Value & v, int maxHops = 32)
             // arg2 and `evaluated` is preserved as memoization sink
             // (same shape as Tag::App).  Chase through evaluated when
             // populated.
-            ValuePair * p = cur->payload.pair;
+            ValuePair * p = cur->asPair();
             if (!p || p->evaluated.tag() == Tag::Uninitialized)
                 throw SerializeError("App3 not yet evaluated; force before serialise");
             cur = &p->evaluated;
             continue;
         }
         if (t == Tag::Slot) {
-            if (!cur->payload.slot)
+            if (!cur->asSlot())
                 throw SerializeError("Slot null");
-            cur = cur->payload.slot;
+            cur = cur->asSlot();
             continue;
         }
         return *cur;  // WHNF
@@ -199,7 +199,7 @@ static void serializeOne(const Value & vIn, std::string & out);
 static void serializeString(const Value & v, std::string & out)
 {
     writeU8(out, kTagString);
-    const char * buf = v.payload.str;
+    const char * buf = v.asString();
     size_t n = buf ? std::strlen(buf) : 0;
     if (n > 0x7FFFFFFFu) throw SerializeError("string too large to serialise");
     writeU32(out, static_cast<uint32_t>(n));
@@ -222,7 +222,7 @@ static void serializeString(const Value & v, std::string & out)
 static void serializeAttrs(const Value & v, std::string & out)
 {
     writeU8(out, kTagAttrs);
-    const Bindings * b = v.payload.bindings;
+    const Bindings * b = v.asAttrs();
     // #826 / A1a Phase C v3 (2026-05-26): materialise Chain before
     // serialise.  This was the v2 failure root cause: the chain
     // spike in mergeBindings produced Chain Bindings whose
@@ -269,7 +269,7 @@ static void serializeAttrs(const Value & v, std::string & out)
 static void serializeList(const Value & v, std::string & out)
 {
     writeU8(out, kTagList);
-    const ListVec * lv = v.payload.list;
+    const ListVec * lv = v.asList();
     uint32_t n = lv ? lv->size : 0;
     writeU32(out, n);
     if (!lv) return;
@@ -289,19 +289,17 @@ static void serializeOne(const Value & vIn, std::string & out)
     switch (t) {
     case Tag::Int:
         writeU8(out, kTagInt);
-        writeU64(out, static_cast<uint64_t>(v.payload.i));
+        writeU64(out, static_cast<uint64_t>(v.asInt()));
         return;
     case Tag::Float: {
         writeU8(out, kTagFloat);
-        uint64_t bits;
-        std::memcpy(&bits, &v.payload.f, 8);
-        writeU64(out, bits);
+        writeU64(out, v.floatBits());
         return;
     }
     case Tag::Bool:
         writeU8(out, kTagBool);
-        // vTrue/vFalse: payload.i is the bool encoded as 0|1.
-        writeU8(out, v.payload.i ? 1 : 0);
+        // vTrue/vFalse: asInt() is the bool encoded as 0|1.
+        writeU8(out, v.asInt() ? 1 : 0);
         return;
     case Tag::Null:
         writeU8(out, kTagNull);
@@ -311,7 +309,7 @@ static void serializeOne(const Value & vIn, std::string & out)
         return;
     case Tag::Path: {
         writeU8(out, kTagPath);
-        const char * p = v.payload.path;
+        const char * p = v.asPath();
         size_t n = p ? std::strlen(p) : 0;
         if (n > 0x7FFFFFFFu) throw SerializeError("path too large to serialise");
         writeU32(out, static_cast<uint32_t>(n));
@@ -378,8 +376,7 @@ static Value deserializePath(Reader & r)
     if (pathLen) std::memcpy(buf, bytes.data(), pathLen);
     buf[pathLen] = '\0';
     Value v;
-    v.tag_payload = static_cast<uint64_t>(Tag::Path);
-    v.payload.path = buf;
+    v.mkPath(buf);
     return v;
 }
 
@@ -396,8 +393,7 @@ static Value deserializeList(Reader & r)
     for (uint32_t i = 0; i < n; ++i)
         lv->elems[i] = deserializeOne(r);
     listPostConstructBarrier(lv);  // Phase D batch barrier.
-    v.tag_payload = static_cast<uint64_t>(Tag::List);
-    v.payload.list = lv;
+    v.mkList(lv);
     return v;
 }
 
@@ -429,8 +425,7 @@ static Value deserializeAttrs(Reader & r)
     for (uint32_t i = 0; i < n; ++i) {
         bindingsSetEntry(b, i, {tmp[i].sid, 0, tmp[i].val});  // Phase D
     }
-    v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    v.payload.bindings = b;
+    v.mkAttrs(b);
     return v;
 }
 
@@ -494,16 +489,16 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
 #pragma clang diagnostic ignored "-Wswitch-enum"
     switch (a.tag()) {
     case Tag::Int:
-        return a.payload.i == b.payload.i;
+        return a.asInt() == b.asInt();
     case Tag::Float:
-        return std::memcmp(&a.payload.f, &b.payload.f, 8) == 0;
+        return a.floatBits() == b.floatBits();
     case Tag::Bool:
-        return (a.payload.i != 0) == (b.payload.i != 0);
+        return (a.asInt() != 0) == (b.asInt() != 0);
     case Tag::Null:
         return true;
     case Tag::String: {
-        const char * sa = a.payload.str;
-        const char * sb = b.payload.str;
+        const char * sa = a.asString();
+        const char * sb = b.asString();
         if (!sa || !sb) return sa == sb;
         if (std::strcmp(sa, sb) != 0) return false;
         const auto * ca = lookupStringContextEntries(sa);
@@ -523,14 +518,14 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
         return sortedA == sortedB;
     }
     case Tag::Path: {
-        const char * pa = a.payload.path;
-        const char * pb = b.payload.path;
+        const char * pa = a.asPath();
+        const char * pb = b.asPath();
         if (!pa || !pb) return pa == pb;
         return std::strcmp(pa, pb) == 0;
     }
     case Tag::List: {
-        const ListVec * la = a.payload.list;
-        const ListVec * lb = b.payload.list;
+        const ListVec * la = a.asList();
+        const ListVec * lb = b.asList();
         uint32_t sa = la ? la->size : 0;
         uint32_t sb = lb ? lb->size : 0;
         if (sa != sb) return false;
@@ -540,8 +535,8 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
         return true;
     }
     case Tag::Attrs: {
-        const Bindings * ba = a.payload.bindings;
-        const Bindings * bb = b.payload.bindings;
+        const Bindings * ba = a.asAttrs();
+        const Bindings * bb = b.asAttrs();
         // #826 / A1a Phase C v3: materialise Chain so positional walk
         // sees full entry set (see serializeAttrs above for the same
         // rationale).  Without this, two equal attrsets with one

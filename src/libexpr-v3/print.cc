@@ -114,15 +114,15 @@ Value forceDeep(VMState & vm, Value v, std::set<const void *> & seen)
     size_t rootEnqIdx = 0;
 
     auto maybeEnqueue = [&](Value cv) -> bool {
-        if (cv.isList() && cv.payload.list && cv.payload.list->size > 0
-            && seen.insert(cv.payload.list).second)
+        if (cv.isList() && cv.asList() && cv.asList()->size > 0
+            && seen.insert(cv.asList()).second)
         {
             tlDeepForceRoots.push_back(cv);
             return true;
         }
-        if (cv.isAttrs() && cv.payload.bindings
-            && cv.payload.bindings->size > 0
-            && seen.insert(cv.payload.bindings).second)
+        if (cv.isAttrs() && cv.asAttrs()
+            && cv.asAttrs()->size > 0
+            && seen.insert(cv.asAttrs()).second)
         {
             tlDeepForceRoots.push_back(cv);
             return true;
@@ -143,23 +143,22 @@ Value forceDeep(VMState & vm, Value v, std::set<const void *> & seen)
         // across reallocations; pointers into it are not.
         if (tlDeepForceRoots[cur].isList()) {
             const uint32_t size =
-                tlDeepForceRoots[cur].payload.list->size;
+                tlDeepForceRoots[cur].asList()->size;
             for (uint32_t i = 0; i < size; ++i) {
                 Value child = forceValue(
-                    vm, tlDeepForceRoots[cur].payload.list->elems[i]);
-                tlDeepForceRoots[cur].payload.list->elems[i] = child;
+                    vm, tlDeepForceRoots[cur].asList()->elems[i]);
+                tlDeepForceRoots[cur].asList()->elems[i] = child;
                 maybeEnqueue(child);
             }
         } else if (tlDeepForceRoots[cur].isAttrs()) {
-            Bindings * pb = tlDeepForceRoots[cur].payload.bindings;
+            Bindings * pb = tlDeepForceRoots[cur].asAttrs();
             // ChainBindings: this forces only `pb`'s own entries (the overlay
             // for a Chain).  Enqueue the parent so the rest of the chain's
             // values get deep-forced too (else --strict prints parent values
             // as <thunk>); the printer materialises the full view.
             if (pb->isChain() && pb->parent) {
                 Value pv;
-                pv.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                pv.payload.bindings = const_cast<Bindings *>(pb->parent);
+                pv.mkAttrs(const_cast<Bindings *>(pb->parent));
                 maybeEnqueue(pv);
             }
             const uint32_t size = pb->size;
@@ -208,21 +207,21 @@ nlohmann::json toJsonValue(VMState & vm, Value v,
     v = forceValue(vm, v);
     switch (v.tag()) {
     case Tag::Null:   return json(nullptr);
-    case Tag::Bool:   return json(v.payload.i == 1);
-    case Tag::Int:    return json(v.payload.i);
-    case Tag::Float:  return json(v.payload.f);
-    case Tag::String: return json(std::string(v.payload.str));
-    case Tag::Path:   return json(std::string(v.payload.path));
+    case Tag::Bool:   return json(v.asInt() == 1);
+    case Tag::Int:    return json(v.asInt());
+    case Tag::Float:  return json(v.asFloat());
+    case Tag::String: return json(std::string(v.asString()));
+    case Tag::Path:   return json(std::string(v.asPath()));
     case Tag::List: {
         json arr = json::array();
-        if (v.payload.list) {
+        if (v.asList()) {
             // Round 1 #7: hold `v` on the deep-force root stack across
-            // recursive toJsonValue calls — its payload.list may sit
+            // recursive toJsonValue calls — its asList() may sit
             // in the nursery and get forwarded by a scavenge inside
             // the recursion's forceValue.
             DeepForceGuard g(v);
-            for (uint32_t i = 0; i < g.ref().payload.list->size; ++i)
-                arr.push_back(toJsonValue(vm, g.ref().payload.list->elems[i], symTab));
+            for (uint32_t i = 0; i < g.ref().asList()->size; ++i)
+                arr.push_back(toJsonValue(vm, g.ref().asList()->elems[i], symTab));
         }
         return arr;
     }
@@ -239,9 +238,9 @@ nlohmann::json toJsonValue(VMState & vm, Value v,
         // (forceDeep blew through the full nixpkgs graph reachable
         // from src); TW does it in <2s.  See follow-on memo
         // project_675_tojson_shortcircuit.
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             static const SymbolId tsId = ir::globalInternSymbol("__toString");
-            if (auto * fn = v.payload.bindings->lookup(tsId)) {
+            if (auto * fn = v.asAttrs()->lookup(tsId)) {
                 Value forced = forceValue(vm, *fn);
                 if (forced.tag() == Tag::Closure
                     || forced.tag() == Tag::PrimOp
@@ -250,23 +249,23 @@ nlohmann::json toJsonValue(VMState & vm, Value v,
                     Value s = callClosure(vm, forced, v);
                     s = forceValue(vm, s);
                     if (s.isString())
-                        return json(std::string(s.payload.str));
+                        return json(std::string(s.asString()));
                 }
             }
             static const SymbolId outId = ir::globalInternSymbol("outPath");
-            if (auto * op = v.payload.bindings->lookup(outId)) {
+            if (auto * op = v.asAttrs()->lookup(outId)) {
                 return toJsonValue(vm, *op, symTab);
             }
         }
         json obj = json::object();
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             // Round 1 #7: same root-stack protection.  Bindings are
             // tenured-only today, but reading entries through the
             // stack slot is uniform and zero-cost; it makes the JSON
             // walk match the printer / forceDeep discipline.
             DeepForceGuard g(v);
             // ChainBindings: materialise so JSON includes the full attrset.
-            const Bindings * jb = g.ref().payload.bindings;
+            const Bindings * jb = g.ref().asAttrs();
             if (jb->isChain()) jb = jb->materialize();
             for (uint32_t i = 0; i < jb->size; ++i) {
                 auto & en = jb->entries[i];
@@ -347,12 +346,12 @@ void printNixValue(std::ostream & out, const Value & v,
                    std::set<const void *> & seen)
 {
     switch (v.tag()) {
-    case Tag::Int:    out << (long long)v.payload.i; return;
-    case Tag::Float:  out << v.payload.f; return;
-    case Tag::Bool:   out << (v.payload.i == 1 ? "true" : "false"); return;
+    case Tag::Int:    out << (long long)v.asInt(); return;
+    case Tag::Float:  out << v.asFloat(); return;
+    case Tag::Bool:   out << (v.asInt() == 1 ? "true" : "false"); return;
     case Tag::Null:   out << "null"; return;
-    case Tag::String: printLiteralString(out, v.payload.str ? std::string_view(v.payload.str) : std::string_view()); return;
-    case Tag::Path:   out << (v.payload.path ? v.payload.path : ""); return;
+    case Tag::String: printLiteralString(out, v.asString() ? std::string_view(v.asString()) : std::string_view()); return;
+    case Tag::Path:   out << (v.asPath() ? v.asPath() : ""); return;
     case Tag::List: {
         // Match tree-walker exactly: lists track by the address of the
         // *Value wrapper* (`&v`), so two slots that share a ListVec but
@@ -361,14 +360,14 @@ void printNixValue(std::ostream & out, const Value & v,
         // share the same Bindings (e.g. one from `__overrides` and one
         // from the rec body) collapse to «repeated» on the second
         // visit.  Empty lists are never tracked.
-        if (v.payload.list && v.payload.list->size > 0 &&
+        if (v.asList() && v.asList()->size > 0 &&
             !seen.insert(&v).second) {
             out << "«repeated»"; return;
         }
         out << "[ ";
-        if (v.payload.list)
-            for (uint32_t i = 0; i < v.payload.list->size; ++i) {
-                printNixValue(out, v.payload.list->elems[i], symTab, seen);
+        if (v.asList())
+            for (uint32_t i = 0; i < v.asList()->size; ++i) {
+                printNixValue(out, v.asList()->elems[i], symTab, seen);
                 out << ' ';
             }
         out << "]";
@@ -379,15 +378,15 @@ void printNixValue(std::ostream & out, const Value & v,
         // `seen` would (incorrectly) print `«repeated»` for every
         // sibling empty attrset.  Only deduplicate non-empty attrsets,
         // which is where shared-Bindings cycles actually matter.
-        if (v.payload.bindings && v.payload.bindings->size > 0 &&
-            !seen.insert(v.payload.bindings).second) {
+        if (v.asAttrs() && v.asAttrs()->size > 0 &&
+            !seen.insert(v.asAttrs()).second) {
             out << "«repeated»"; return;
         }
         out << "{ ";
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             // ChainBindings: materialise so we print the FULL attrset (overlay
             // + parent), not just the overlay (no-op for Sorted).
-            const Bindings * pb = v.payload.bindings;
+            const Bindings * pb = v.asAttrs();
             if (pb->isChain()) pb = pb->materialize();
             // Sort by symbol name for deterministic order matching tw output.
             std::vector<std::pair<std::string, const Value *>> items;
@@ -464,8 +463,8 @@ static bool tryGetDerivationDrvPath(const Value & v,
                                     const std::vector<std::string> & symTab,
                                     std::string_view & outDrvPath)
 {
-    if (v.tag() != Tag::Attrs || !v.payload.bindings) return false;
-    auto * b = v.payload.bindings;
+    if (v.tag() != Tag::Attrs || !v.asAttrs()) return false;
+    auto * b = v.asAttrs();
     // Helper: linear-scan lookup of a key by name (Bindings is sorted by
     // SymbolId, not name, so we cannot bsearch on the name directly without
     // resolving every SymbolId first).  Derivations have ~5-10 attrs at this
@@ -482,11 +481,11 @@ static bool tryGetDerivationDrvPath(const Value & v,
     };
     const Value * typeV = find("type");
     if (!typeV || typeV->tag() != Tag::String) return false;
-    if (!typeV->payload.str || std::string_view(typeV->payload.str) != "derivation")
+    if (!typeV->asString() || std::string_view(typeV->asString()) != "derivation")
         return false;
     const Value * drvPathV = find("drvPath");
     if (!drvPathV || drvPathV->tag() != Tag::String) return false;
-    outDrvPath = drvPathV->payload.str ? drvPathV->payload.str : "";
+    outDrvPath = drvPathV->asString() ? drvPathV->asString() : "";
     return true;
 }
 
@@ -531,21 +530,21 @@ void printNixValueRich(std::ostream & out, const Value & v,
                        std::set<const void *> & seen)
 {
     switch (v.tag()) {
-    case Tag::Int:    out << (long long)v.payload.i; return;
-    case Tag::Float:  out << v.payload.f; return;
-    case Tag::Bool:   out << (v.payload.i == 1 ? "true" : "false"); return;
+    case Tag::Int:    out << (long long)v.asInt(); return;
+    case Tag::Float:  out << v.asFloat(); return;
+    case Tag::Bool:   out << (v.asInt() == 1 ? "true" : "false"); return;
     case Tag::Null:   out << "null"; return;
-    case Tag::String: printLiteralString(out, v.payload.str ? std::string_view(v.payload.str) : std::string_view()); return;
-    case Tag::Path:   out << (v.payload.path ? v.payload.path : ""); return;
+    case Tag::String: printLiteralString(out, v.asString() ? std::string_view(v.asString()) : std::string_view()); return;
+    case Tag::Path:   out << (v.asPath() ? v.asPath() : ""); return;
     case Tag::List: {
-        if (v.payload.list && v.payload.list->size > 0 &&
+        if (v.asList() && v.asList()->size > 0 &&
             !seen.insert(&v).second) {
             out << "«repeated»"; return;
         }
         out << "[ ";
-        if (v.payload.list)
-            for (uint32_t i = 0; i < v.payload.list->size; ++i) {
-                printNixValueRich(out, v.payload.list->elems[i], symTab, seen);
+        if (v.asList())
+            for (uint32_t i = 0; i < v.asList()->size; ++i) {
+                printNixValueRich(out, v.asList()->elems[i], symTab, seen);
                 out << ' ';
             }
         out << "]";
@@ -561,13 +560,13 @@ void printNixValueRich(std::ostream & out, const Value & v,
             out << "«derivation " << drvPath << "»";
             return;
         }
-        if (v.payload.bindings && v.payload.bindings->size > 0 &&
-            !seen.insert(v.payload.bindings).second) {
+        if (v.asAttrs() && v.asAttrs()->size > 0 &&
+            !seen.insert(v.asAttrs()).second) {
             out << "«repeated»"; return;
         }
         out << "{ ";
-        if (v.payload.bindings) {
-            const Bindings * pb = v.payload.bindings;  // ChainBindings: full view
+        if (v.asAttrs()) {
+            const Bindings * pb = v.asAttrs();  // ChainBindings: full view
             if (pb->isChain()) pb = pb->materialize();
             std::vector<std::pair<std::string, const Value *>> items;
             items.reserve(pb->size);
@@ -595,13 +594,13 @@ void printNixValueRich(std::ostream & out, const Value & v,
         // overload can pass an attr-name hint for dynamic-attr-bound
         // lambdas (where `desc->contextualName` is empty at compile
         // time but TW assigns the name at runtime).
-        printClosureToken(out, v.payload.closure, std::string_view{});
+        printClosureToken(out, v.asClosure(), std::string_view{});
         return;
     }
     case Tag::PrimOp: {
         out << "«primop";
-        if (v.payload.primop && !v.payload.primop->name.empty())
-            out << ' ' << v.payload.primop->name;
+        if (v.asPrimOp() && !v.asPrimOp()->name.empty())
+            out << ' ' << v.asPrimOp()->name;
         out << "»";
         return;
     }
@@ -614,13 +613,13 @@ void printNixValueRich(std::ostream & out, const Value & v,
         out << "«partially applied primop";
         const Value * cur = &v;
         int hops = 0;
-        while (cur && cur->tag() == Tag::PrimOpApp && cur->payload.pair && hops < 16) {
-            cur = &cur->payload.pair->left;
+        while (cur && cur->tag() == Tag::PrimOpApp && cur->asPair() && hops < 16) {
+            cur = &cur->asPair()->left;
             ++hops;
         }
         if (cur && cur->tag() == Tag::PrimOp
-            && cur->payload.primop && !cur->payload.primop->name.empty())
-            out << ' ' << cur->payload.primop->name;
+            && cur->asPrimOp() && !cur->asPrimOp()->name.empty())
+            out << ' ' << cur->asPrimOp()->name;
         out << "»";
         return;
     }
@@ -693,19 +692,19 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
     // value.  Use if/else so we don't have to enumerate every Tag for
     // `-Werror=switch-enum`.
     if (forced.tag() == Tag::List) {
-        if (forced.payload.list && forced.payload.list->size > 0 &&
+        if (forced.asList() && forced.asList()->size > 0 &&
             !seen.insert(&v).second) {
             out << "«repeated»"; return;
         }
         out << "[ ";
-        if (forced.payload.list) {
+        if (forced.asList()) {
             // Round 1 #7: hold `forced` on the deep-force root stack
-            // so its `payload.list` survives scavenge during the
+            // so its `asList()` survives scavenge during the
             // recursive printNixValueRich call (which re-enters
             // forceValue).
             DeepForceGuard g(forced);
-            for (uint32_t i = 0; i < g.ref().payload.list->size; ++i) {
-                printNixValueRich(out, vm, g.ref().payload.list->elems[i],
+            for (uint32_t i = 0; i < g.ref().asList()->size; ++i) {
+                printNixValueRich(out, vm, g.ref().asList()->elems[i],
                                   symTab, seen);
                 out << ' ';
             }
@@ -722,8 +721,8 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
         // forces every attr including `passthru.tests`, triggering
         // nixpkgs's deprecation warning that TW never emits because
         // it short-circuits at the `type` check.
-        if (forced.payload.bindings) {
-            auto * b = forced.payload.bindings;
+        if (forced.asAttrs()) {
+            auto * b = forced.asAttrs();
             // Inline force-then-check; can't reuse the const helper
             // because we need to mutate-in-place for cache and the
             // helper's signature is `const Value &`.
@@ -742,8 +741,8 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
                 catch (const std::exception &) { typeV = nullptr; }
             }
             if (typeV && typeV->tag() == Tag::String
-                && typeV->payload.str
-                && std::string_view(typeV->payload.str) == "derivation")
+                && typeV->asString()
+                && std::string_view(typeV->asString()) == "derivation")
             {
                 Value * drvPathV = findEntry("drvPath");
                 if (drvPathV) {
@@ -751,20 +750,20 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
                     catch (const std::exception &) { drvPathV = nullptr; }
                 }
                 if (drvPathV && drvPathV->tag() == Tag::String
-                    && drvPathV->payload.str)
+                    && drvPathV->asString())
                 {
-                    out << "«derivation " << drvPathV->payload.str << "»";
+                    out << "«derivation " << drvPathV->asString() << "»";
                     return;
                 }
             }
         }
-        if (forced.payload.bindings && forced.payload.bindings->size > 0 &&
-            !seen.insert(forced.payload.bindings).second) {
+        if (forced.asAttrs() && forced.asAttrs()->size > 0 &&
+            !seen.insert(forced.asAttrs()).second) {
             out << "«repeated»"; return;
         }
         out << "{ ";
-        if (forced.payload.bindings) {
-            const Bindings * pb = forced.payload.bindings;  // ChainBindings
+        if (forced.asAttrs()) {
+            const Bindings * pb = forced.asAttrs();  // ChainBindings
             if (pb->isChain()) pb = pb->materialize();
             std::vector<std::pair<std::string, const Value *>> items;
             items.reserve(pb->size);

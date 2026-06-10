@@ -157,17 +157,17 @@ public:
         case Tag::External:
             ++counts.externalCount;
             if (counts.externalSamples.size() < LiveCounters::kAuditSampleCap)
-                counts.externalSamples.push_back(v.payload.raw);
+                counts.externalSamples.push_back(v.asRaw());
             break;
         case Tag::String:
             ++counts.stringCount;
             if (counts.stringSamples.size() < LiveCounters::kAuditSampleCap)
-                counts.stringSamples.push_back(v.payload.str);
+                counts.stringSamples.push_back(v.asString());
             break;
         case Tag::Path:
             ++counts.pathCount;
             if (counts.pathSamples.size() < LiveCounters::kAuditSampleCap)
-                counts.pathSamples.push_back(v.payload.path);
+                counts.pathSamples.push_back(v.asPath());
             break;
         case Tag::Uninitialized:
         case Tag::Int:
@@ -608,7 +608,7 @@ void dumpV3LiveFraction() noexcept
             "    External samples (first %zu):\n",
             tr.counts.externalSamples.size());
         for (void * p : tr.counts.externalSamples) {
-            std::fprintf(stderr, "      payload.raw=%p\n", p);
+            std::fprintf(stderr, "      external=%p\n", p);
         }
     }
     if (tr.counts.stringCount > 0 && !tr.counts.stringSamples.empty()) {
@@ -631,7 +631,7 @@ void dumpV3LiveFraction() noexcept
                 preview[27] = 0;
             }
             std::fprintf(stderr,
-                "      payload.str=%p  '%s'\n", (void *)p, preview);
+                "      string=%p  '%s'\n", (void *)p, preview);
             if (++shown >= 8) break;
         }
     }
@@ -650,7 +650,7 @@ void dumpV3LiveFraction() noexcept
                 preview[27] = 0;
             }
             std::fprintf(stderr,
-                "      payload.path=%p  '%s'\n", (void *)p, preview);
+                "      path=%p  '%s'\n", (void *)p, preview);
             if (++shown >= 8) break;
         }
     }
