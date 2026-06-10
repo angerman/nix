@@ -323,6 +323,39 @@ sub-goal of Lever B, scheduled-sooner; no field-drop, no mark-skip.**
 (Stage 2 `reuseScope` re-confirmed on the same darwin-4 session: FOLDL **−7.5%**,
 reuseScope-off 0.53s → on 0.49s — consistent with the prior −5.7%.)
 
+## Real-workload reality check → Lever B framing (2026-06-10)
+
+**(1) The "v3 can't eval real nixpkgs" blocker is the #455-family fixpoint loop — not a
+regression, not nixpkgs setup.** `<nixpkgs>` resolves (flake source `/nix/store/kxf3k5…`),
+the **tree-walker** evals `hello.drvPath` in seconds, but **pure v3-direct spins**: 288 s
+*user* CPU / **71 closures** (no alloc progress), a deep `callClosure→forceValue→dispatchLoop→
+forceValue→…` recursion churning `applyForceWriteback` (the CFF_FORCE_RETRY machinery). Wins-OFF
+(`NIX_V3_NO_SATURATED_CALL=1 NIX_V3_NO_LEAFCALL_FAST=1 NIX_V3_BC_FILTER=1`) spins **identically**
+⇒ NOT this session's T1/T2/T4/Stage-2. `deepSeq` of nixpkgs `lib` itself also spins (lib.fix). So
+any `pkgs.*` / deep-lib eval hits the long-standing #455-family / lib.fix limitation; full real
+`drvPath` measurement under pure v3-direct is blocked by it (separate, hard, deferred).
+
+**(2) Alloc composition (fixpoint-free Bindings-heavy evals v3 DOES complete):**
+
+| eval | thunks | bindings | pairs | lists |
+|---|--:|--:|--:|--:|
+| attrset-of-attrsets ×100k (deepSeq) | 21.6 MB (47%) | **15.2 MB (33%)** | **6.4 MB (14%)** | 1.6 MB |
+| nixpkgs `lib.strings` (deepSeq) | 0.05 | 0.03 | 0.01 | — |
+| *(prior audit, REAL hello.drvPath, 2026-05-21)* | *31%* | *52%* | *minor* | — |
+
+Robust across synthetic + real: **Bindings + Thunks dominate; ValuePair is a minority**
+(Bindings ≈ 2.4× pairs here, ≫ pairs on real hello.drvPath).
+
+**Reframe + threshold for Lever B:** the lever is **`Value` 16→8B (pointer tagging)**, which
+halves the `Value` field inside **Bindings entries + Thunks + ValuePairs + ListVec elems** — the
+bulk of the arena (≈ −30% projected) — NOT the niche ValuePair-only shrink the T3 framing implied.
+This *is* T3 (ValuePair→32B) as a by-product, but justified by the dominant **Bindings** (and
+thunk) `Value` content. **Pre-committed SHIP threshold:** ≥ 20 % peak-RSS reduction on a
+Bindings-heavy eval (byte-identical + `--core`/lang/scaling green); REVERT if < 10 %. Design home:
+`MEMORY_REPRESENTATION_2026-06-07.md` §7 (Lever B). NB Lever B is a representation-wide change
+(every `Value` access + the App-memo + App3 + GC + serialize + FFI marshalling) — staged spike,
+not a one-shot edit.
+
 ## Methodology notes (for the next investigation)
 
 - 3 source agents parallelised over local source (no host contention); the dedicated
