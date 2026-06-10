@@ -120,6 +120,14 @@ nixpkgs, `haskellNix.overlay`, `typeOf (getFlake HNE)`, and
 and are byte-identical to TW** (was: SPUN at 5612 closures). Lang 143/143.
 Tests: `test/run-pap-tests.sh` (+ `repro-pap-{pos,neg,functor-recursion,functionargs-functor}.nix`).
 
+**cardano-node: spin also gone** — `attrNames (getFlake cardano-node).packages.aarch64-darwin`
+no longer hangs; v3 now errors **fast** (~27 s) with `attribute 'cabalProject'' missing`
+where TW returns the package list. That is a **separate, distinct divergence**
+(haskell.nix `cabalProject'` — note the trailing prime) and a fresh investigation, NOT
+part of this spin RCA. Likely an eager-vs-lazy / attrset-shape difference in how v3
+evaluates haskell.nix's project entry-point; HNE (which uses `project'`) is byte-identical,
+so it is specific to the `cabalProject'` path cardano-node takes.
+
 ## Repro pointers
 
 - Local: `~/Projects/iohk/haskell-nix-example`; 8B `nix` CLI at `build/src/nix/nix`.
