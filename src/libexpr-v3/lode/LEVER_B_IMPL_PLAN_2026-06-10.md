@@ -167,7 +167,42 @@ and asserts all codes distinct + none == FLOATNAN: ALL PASS.
   no raw 16B `Value` memcpy / `.payload` assumption remains (L0 removed them, but re-grep).
 - Build green under BOTH toggles; run the standalone encoding unit test wired as a real test.
 
-### L3 / L4 — unchanged (measure ≥20% on a fixpoint-free Bindings-heavy eval; flip + retire).
+### L2a — DONE (commit `76c208178`); L2b discovery — DONE
+
+- **L2a shipped:** value.hh storage + accessors + value.cc singletons/`boxInt64` flipped under
+  `#ifdef V3_VALUE_8B` (default OFF, 16B bodies verbatim → default byte-identical: lang 142/143
+  unchanged). Under `-DV3_VALUE_8B`: value.cc/value.hh/alloc.hh/barrier.hh syntax-clean AND
+  `static_assert(sizeof(Value)==8)` + `sizeof(ValuePair)==32)` PASS — the NaN-box really is 8B/32B.
+- **L2b syntax sweep: 42/42 v3 TUs syntax-compile clean under `-DV3_VALUE_8B`** (verified the
+  define is actually applied: vm/mark_sweep/ffi/serialize/gc all 0 errors). ⇒ NO TU has a
+  compile-breaking 16B assumption; L0's accessor migration was complete enough that the flip is
+  source-compatible across the whole library.
+- **`sizeof(Value)` uses are accounting-only** (all in live_trace.cc: `bytesPairs`,
+  `sizeof(Value)*nUpvalues`, etc.) — they auto-adjust to 8/32 under 8B, which is *correct*
+  (the smaller accounting reflects reality). No `/16`/`*16` literal strides found. No fix needed.
+- **GC de-risked: the arena is PRECISE by default.** `NIX_V3_ARENA_NOROOT` is default-ON
+  (2026-06-04, alloc.hh:930/1150/2334) → arena blocks are NOT `GC_add_roots`'d → Boehm does not
+  conservatively scan the arena. Arena-object liveness = the precise major-GC mark, whose
+  `visitValue` decodes via `asX()` → handles the NaN-box correctly. So "Boehm can't see
+  NaN-boxed pointers inside the arena" is MOOT.
+
+### L3 — remaining work + the one real GC question
+
+- **Full 8B build+link+run** (the real validation `-fsyntax-only` can't give): configure a
+  separate `build8` with `-Dcpp_args=-DV3_VALUE_8B` (whole tree must agree on `sizeof(Value)` —
+  a mixed build is ABI-incompatible), build v3-eval + v3-smoke, run smoke + lang + `--core`.
+- **The one real GC concern under 8B = the conservative C-STACK scan.** Boehm still scans the C
+  stack for roots; a `Value` living only in a C local (not on a precisely-walked VMState
+  stack/frame) holds a NaN-boxed pointer that Boehm reads as `0x7FF5…` → not a heap address →
+  not traced → premature collection. The nursery already restricts scavenge to `exitDepth==0`
+  *because* of C-local exposure ([[feedback_v3_nursery_cstack_safety]]). Under 8B, verify every
+  GC-relevant Value is reachable from a precise root (VMState stacks/frames/withStack/standalone
+  cells/bridge tables), OR add a NaN-box-aware conservative scan (mask the box → recover the
+  48-bit pointer → `GC_base`-check). This is the gating item for an 8B run to be *correct*, and
+  the natural place the full-build smoke/lang will expose divergence if a path is missed.
+- Then the SHIP gate: peak-RSS ≥20% on a fixpoint-free Bindings-heavy eval; byte-identical; wall ≤5%.
+
+### L4 — unchanged (flip default-on, soak, retire toggle + 16B path).
 
 ## Dependencies / notes
 
