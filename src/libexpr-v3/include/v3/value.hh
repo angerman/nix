@@ -143,6 +143,25 @@ struct Value
         return t != Tag::Thunk && t != Tag::App && t != Tag::App3 && t != Tag::Slot;
     }
 
+    /// L0 (LEVER_B_IMPL_PLAN_2026-06-10) — read accessors mirroring the mkX
+    /// writers.  TODAY they just return the payload field.  When Lever B flips
+    /// `Value` to a tagged 8-byte word, ONLY these accessors + the mkX writers
+    /// change (decode/encode the tagged word); every caller routed through them
+    /// stays correct without edits.  Migrating direct `.payload.X` reads to
+    /// these is the (staged, byte-identical) L0 work that localizes the flip.
+    [[gnu::always_inline]] inline int64_t        asInt()     const noexcept { return payload.i; }
+    [[gnu::always_inline]] inline double         asFloat()   const noexcept { return payload.f; }
+    [[gnu::always_inline]] inline const char *   asString()  const noexcept { return payload.str; }
+    [[gnu::always_inline]] inline const char *   asPath()    const noexcept { return payload.path; }
+    [[gnu::always_inline]] inline Bindings *      asAttrs()   const noexcept { return payload.bindings; }
+    [[gnu::always_inline]] inline ListVec *       asList()    const noexcept { return payload.list; }
+    [[gnu::always_inline]] inline Closure *       asClosure() const noexcept { return payload.closure; }
+    [[gnu::always_inline]] inline Thunk *         asThunk()   const noexcept { return payload.thunk; }
+    [[gnu::always_inline]] inline const PrimOp *  asPrimOp()  const noexcept { return payload.primop; }
+    [[gnu::always_inline]] inline ValuePair *     asPair()    const noexcept { return payload.pair; }
+    [[gnu::always_inline]] inline Value *         asSlot()    const noexcept { return payload.slot; }
+    [[gnu::always_inline]] inline void *          asRaw()     const noexcept { return payload.raw; }
+
     /// In-place initialisers (no allocation).
     inline void mkInt(int64_t n) noexcept
     {
@@ -191,6 +210,16 @@ struct Value
     static Value vEmptyList;
     static Value vEmptyAttrs;
 };
+
+// L0 (LEVER_B_IMPL_PLAN_2026-06-10) canary: `Value` is 16 B today (8 B tag word
+// + 8 B payload).  Lever B shrinks it to a tagged 8 B word (pointer tagging +
+// 61-bit inline ints, box overflow), projected ≈ −28% arena (Bindings entry
+// 24→16, ValuePair 64→32, ListVec elem 16→8, thunk Value field halves).  When
+// that lands, flip this assert to ==8 together with the accessors/mkX encoders.
+static_assert(sizeof(Value) == 16,
+              "Value is 16B today; Lever B (lode/LEVER_B_IMPL_PLAN_2026-06-10.md) "
+              "targets a tagged 8B Value — change this assert + the as*/mk* "
+              "accessors together when the encoding lands.");
 
 /// Pair of Values for App / PrimOpApp.  Heap allocated; pointer kept in the
 /// payload of the parent Value to keep the Value itself at 16 bytes.
