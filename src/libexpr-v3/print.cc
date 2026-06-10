@@ -94,7 +94,7 @@ Value forceDeep(VMState & vm, Value v, std::set<const void *> & seen)
     // (push onto tlDeepForceRoots — already walked by the
     // scavenger via walkDeepForceRoots); cursor through entries
     // from baseIdx upward.  Each container is read via
-    // `tlDeepForceRoots[cur].payload.X` so a scavenge inside an
+    // `tlDeepForceRoots[cur].asX()` so a scavenge inside an
     // inner forceValue that forwards the container updates the
     // pointer we observe on the next access.  At the end we resize
     // the stack back to baseIdx (popping all our enqueued entries

@@ -492,8 +492,7 @@ int main(int argc, char ** argv)
                 argsB->entries[i].value = argEntries[i].second;
             }
             Value argsVal;
-            argsVal.tag_payload = static_cast<uint64_t>(nix::v3::Tag::Attrs);
-            argsVal.payload.bindings = argsB;
+            argsVal.mkAttrs(argsB);
             r = nix::v3::forceValue(vmA, r);
             r = nix::v3::callClosure(vmA, r, argsVal);
         }
@@ -511,10 +510,10 @@ int main(int argc, char ** argv)
             for (size_t i = 0; i <= attrPath.size(); ++i) {
                 if (i == attrPath.size() || attrPath[i] == '.') {
                     if (!segment.empty()) {
-                        if (!r.isAttrs() || !r.payload.bindings)
+                        if (!r.isAttrs() || !r.asAttrs())
                             throw std::runtime_error("v3-eval -A: not an attrset");
                         nix::v3::SymbolId sid = nix::v3::ir::globalInternSymbol(segment);
-                        const Value * found = r.payload.bindings->lookup(sid);
+                        const Value * found = r.asAttrs()->lookup(sid);
                         if (!found)
                             throw std::runtime_error("v3-eval -A: attribute '" + segment + "' not found");
                         r = nix::v3::forceValue(vmS, *found);

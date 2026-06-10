@@ -108,10 +108,8 @@ void testWalkDispatch()
     Value vInt, vNull, vClosure, vBindings;
     vInt.mkInt(7);
     vNull.mkNull();
-    vClosure.tag_payload = uint64_t(Tag::Closure);
-    vClosure.payload.closure = reinterpret_cast<Closure *>(0x1234);
-    vBindings.tag_payload = uint64_t(Tag::Attrs);
-    vBindings.payload.bindings = reinterpret_cast<Bindings *>(0x5678);
+    vClosure.mkClosure(reinterpret_cast<Closure *>(0x1234));
+    vBindings.mkAttrs(reinterpret_cast<Bindings *>(0x5678));
 
     GcRoot r1(vInt);
     GcRoot r2(vNull);

@@ -74,7 +74,7 @@ static int testLitInt()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 42) {
+    if (!r.isInt() || r.asInt() != 42) {
         std::fprintf(stderr, "testLitInt: expected 42, got tag=%d\n", (int)r.tag());
         return 1;
     }
@@ -95,7 +95,7 @@ static int testAdd()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 3) {
+    if (!r.isInt() || r.asInt() != 3) {
         std::fprintf(stderr, "testAdd: expected 3, got tag=%d\n", (int)r.tag());
         return 1;
     }
@@ -167,7 +167,7 @@ static int testFoldAddInt()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 5) {
+    if (!r.isInt() || r.asInt() != 5) {
         std::fprintf(stderr, "testFoldAddInt: runtime expected 5, got tag=%d\n", (int)r.tag());
         return 1;
     }
@@ -424,7 +424,7 @@ static int testInlineVarRefChain()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 99) {
+    if (!r.isInt() || r.asInt() != 99) {
         std::fprintf(stderr, "testInlineVarRefChain: runtime expected 99\n");
         return 1;
     }
@@ -469,7 +469,7 @@ static int testCseSharedAdd()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 30) {
+    if (!r.isInt() || r.asInt() != 30) {
         std::fprintf(stderr, "testCseSharedAdd: runtime expected 30, got tag=%d\n", (int)r.tag());
         return 1;
     }
@@ -620,9 +620,9 @@ static int testLambdaCall()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 42) {
+    if (!r.isInt() || r.asInt() != 42) {
         std::fprintf(stderr, "testLambdaCall: expected 42, got tag=%d val=%lld\n",
-            (int)r.tag(), (long long)r.payload.i);
+            (int)r.tag(), (long long)r.asInt());
         return 1;
     }
     std::fprintf(stderr, "testLambdaCall: OK ((x: x+1) 41 = 42)\n");
@@ -662,9 +662,9 @@ static int testClosureCapture()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 42) {
+    if (!r.isInt() || r.asInt() != 42) {
         std::fprintf(stderr, "testClosureCapture: expected 42, got tag=%d val=%lld\n",
-            (int)r.tag(), (long long)r.payload.i);
+            (int)r.tag(), (long long)r.asInt());
         return 1;
     }
     std::fprintf(stderr, "testClosureCapture: OK ((let n=10; f=x:x+n; in f 32) = 42)\n");
@@ -695,9 +695,9 @@ static int testIf()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 100) {
+    if (!r.isInt() || r.asInt() != 100) {
         std::fprintf(stderr, "testIf: expected 100, got tag=%d val=%lld\n",
-            (int)r.tag(), (long long)r.payload.i);
+            (int)r.tag(), (long long)r.asInt());
         return 1;
     }
     std::fprintf(stderr, "testIf: OK (if 1<2 then 100 else 200 = 100)\n");
@@ -724,15 +724,15 @@ static int testListConcat()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isList() || r.payload.list->size != 5) {
+    if (!r.isList() || r.asList()->size != 5) {
         std::fprintf(stderr, "testListConcat: expected list of 5, got tag=%d\n", (int)r.tag());
         return 1;
     }
     for (uint32_t i = 0; i < 5; ++i) {
-        Value & el = r.payload.list->elems[i];
-        if (!el.isInt() || el.payload.i != i + 1) {
+        Value & el = r.asList()->elems[i];
+        if (!el.isInt() || el.asInt() != i + 1) {
             std::fprintf(stderr, "testListConcat: elem[%u] expected %u, got %lld\n",
-                i, i + 1, (long long)el.payload.i);
+                i, i + 1, (long long)el.asInt());
             return 1;
         }
     }
@@ -758,7 +758,7 @@ static int testAttrSelect()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 1) {
+    if (!r.isInt() || r.asInt() != 1) {
         std::fprintf(stderr, "testAttrSelect: expected 1, got tag=%d\n", (int)r.tag());
         return 1;
     }
@@ -786,7 +786,7 @@ static int testAttrUpdate()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 2) {
+    if (!r.isInt() || r.asInt() != 2) {
         std::fprintf(stderr, "testAttrUpdate: expected 2, got tag=%d\n", (int)r.tag());
         return 1;
     }
@@ -819,9 +819,9 @@ static int testWith()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 18) {
+    if (!r.isInt() || r.asInt() != 18) {
         std::fprintf(stderr, "testWith: expected 18, got tag=%d val=%lld\n",
-            (int)r.tag(), (long long)r.payload.i);
+            (int)r.tag(), (long long)r.asInt());
         return 1;
     }
     std::fprintf(stderr, "testWith: OK (with {x=7;y=11;}; x+y = 18)\n");
@@ -854,9 +854,9 @@ static int testThunkForce()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isInt() || r.payload.i != 15) {
+    if (!r.isInt() || r.asInt() != 15) {
         std::fprintf(stderr, "testThunkForce: expected 15, got tag=%d val=%lld\n",
-            (int)r.tag(), (long long)r.payload.i);
+            (int)r.tag(), (long long)r.asInt());
         return 1;
     }
     std::fprintf(stderr, "testThunkForce: OK (force(thunk{10}) + 5 = 15)\n");
@@ -886,9 +886,9 @@ static int testShortCircuit()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value r = run(cu);
-    if (!r.isBool() || r.payload.i != 1) {
+    if (!r.isBool() || r.asInt() != 1) {
         std::fprintf(stderr, "testShortCircuit: expected true, got tag=%d val=%lld\n",
-            (int)r.tag(), (long long)r.payload.i);
+            (int)r.tag(), (long long)r.asInt());
         return 1;
     }
     std::fprintf(stderr, "testShortCircuit: OK ((true && false) || true = true)\n");
@@ -915,9 +915,9 @@ static int testPrimOpLength()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value res = run(cu);
-    if (!res.isInt() || res.payload.i != 3) {
+    if (!res.isInt() || res.asInt() != 3) {
         std::fprintf(stderr, "testPrimOpLength: expected 3, got tag=%d val=%lld\n",
-            (int)res.tag(), (long long)res.payload.i);
+            (int)res.tag(), (long long)res.asInt());
         return 1;
     }
     std::fprintf(stderr, "testPrimOpLength: OK (length [10 20 30] = 3)\n");
@@ -946,9 +946,9 @@ static int testPrimOpHeadTail()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value res = run(cu);
-    if (!res.isInt() || res.payload.i != 20) {
+    if (!res.isInt() || res.asInt() != 20) {
         std::fprintf(stderr, "testPrimOpHeadTail: expected 20, got tag=%d val=%lld\n",
-            (int)res.tag(), (long long)res.payload.i);
+            (int)res.tag(), (long long)res.asInt());
         return 1;
     }
     std::fprintf(stderr, "testPrimOpHeadTail: OK (head (tail [10 20 30]) = 20)\n");
@@ -1046,9 +1046,9 @@ static int testFibonacciSelfApp()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     Value res = run(cu);
-    if (!res.isInt() || res.payload.i != 55) {
+    if (!res.isInt() || res.asInt() != 55) {
         std::fprintf(stderr, "testFibonacciSelfApp: expected 55, got tag=%d val=%lld\n",
-            (int)res.tag(), (long long)res.payload.i);
+            (int)res.tag(), (long long)res.asInt());
         return 1;
     }
     std::fprintf(stderr, "testFibonacciSelfApp: OK (fib 10 = 55)\n");
@@ -1125,10 +1125,10 @@ static int testSerializeWithRecAttrset()
     auto cu = compile(m);
 
     Value origR = run(cu);
-    if (!origR.isInt() || origR.payload.i != 42) {
+    if (!origR.isInt() || origR.asInt() != 42) {
         std::fprintf(stderr,
             "testSerializeWithRecAttrset: original eval got tag=%d val=%lld (want 42)\n",
-            (int)origR.tag(), (long long)origR.payload.i);
+            (int)origR.tag(), (long long)origR.asInt());
         return 1;
     }
 
@@ -1137,11 +1137,11 @@ static int testSerializeWithRecAttrset()
     auto cu2 = serialize::deserializeCU(blob);
 
     Value rtR = run(cu2);
-    if (!rtR.isInt() || rtR.payload.i != 42) {
+    if (!rtR.isInt() || rtR.asInt() != 42) {
         std::fprintf(stderr,
             "testSerializeWithRecAttrset: round-trip eval got tag=%d val=%lld "
             "(want 42, blob=%zu bytes)\n",
-            (int)rtR.tag(), (long long)rtR.payload.i, blob.size());
+            (int)rtR.tag(), (long long)rtR.asInt(), blob.size());
         return 1;
     }
     std::fprintf(stderr,
@@ -1196,10 +1196,10 @@ static int testSerializeRoundTrip()
     auto cu2 = serialize::deserializeCU(blob);
 
     Value r = run(cu2);
-    if (!r.isInt() || r.payload.i != 42) {
+    if (!r.isInt() || r.asInt() != 42) {
         std::fprintf(stderr,
             "testSerializeRoundTrip: expected 42, got tag=%d val=%lld\n",
-            (int)r.tag(), (long long)r.payload.i);
+            (int)r.tag(), (long long)r.asInt());
         return 1;
     }
     std::fprintf(stderr,
@@ -1980,7 +1980,7 @@ static int testDeferKillSwitch()
     auto cu = compile(m);
     auto v = run(cu);
     unsetenv("NIX_V3_NO_DEFER");
-    if (!v.isInt() || v.payload.i != 5) {
+    if (!v.isInt() || v.asInt() != 5) {
         std::fprintf(stderr, "testDeferKillSwitch: expected 5, got tag=%d\n",
             (int)v.tag());
         return 1;
@@ -2002,7 +2002,7 @@ static int testDeferAddCorrectness()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     auto v = run(cu);
-    if (!v.isInt() || v.payload.i != 3) {
+    if (!v.isInt() || v.asInt() != 3) {
         std::fprintf(stderr, "testDeferAddCorrectness: expected 3, got tag=%d\n",
             (int)v.tag());
         return 1;
@@ -2048,7 +2048,7 @@ static int testDeferSkipsManyUseBinding()
     }
 
     auto v = run(cu);
-    if (!v.isInt() || v.payload.i != 10) {
+    if (!v.isInt() || v.asInt() != 10) {
         std::fprintf(stderr, "testDeferSkipsManyUseBinding: expected 10, got tag=%d\n",
             (int)v.tag());
         return 1;
@@ -2159,7 +2159,7 @@ static int testDeferLetRecCorrect()
     ir::computeFreeVars(m);
     auto cu = compile(m);
     auto v = run(cu);
-    if (!v.isInt() || v.payload.i != 8) {
+    if (!v.isInt() || v.asInt() != 8) {
         std::fprintf(stderr, "testDeferLetRecCorrect: expected 8, got tag=%d\n",
             (int)v.tag());
         return 1;
@@ -2336,8 +2336,7 @@ static int testBindingsChainLookup()
         for (size_t i = 0; i < sorted.size(); ++i) {
             b->entries[i].name  = sorted[i].first;
             b->entries[i].pos   = kNoPos;
-            b->entries[i].value.tag_payload = static_cast<uint64_t>(Tag::Int);
-            b->entries[i].value.payload.i = sorted[i].second;
+            b->entries[i].value.mkInt(sorted[i].second);
         }
         return b;
     };
@@ -2364,19 +2363,19 @@ static int testBindingsChainLookup()
                     "testBindingsChainLookup: %s expected hit, got nullptr\n", what);
                 return 1;
             }
-            if (!v->isInt() || v->payload.i != expectVal) {
+            if (!v->isInt() || v->asInt() != expectVal) {
                 std::fprintf(stderr,
                     "testBindingsChainLookup: %s expected Int(%lld), "
                     "got tag=%d val=%lld\n",
                     what, (long long)expectVal,
-                    (int)v->tag(), (long long)v->payload.i);
+                    (int)v->tag(), (long long)v->asInt());
                 return 1;
             }
         } else {
             if (v) {
                 std::fprintf(stderr,
                     "testBindingsChainLookup: %s expected nullptr, got Int(%lld)\n",
-                    what, (long long)v->payload.i);
+                    what, (long long)v->asInt());
                 return 1;
             }
         }
@@ -2434,8 +2433,7 @@ static int testBindingsForEachMaterialise()
         for (size_t i = 0; i < sorted.size(); ++i) {
             b->entries[i].name  = sorted[i].first;
             b->entries[i].pos   = kNoPos;
-            b->entries[i].value.tag_payload = static_cast<uint64_t>(Tag::Int);
-            b->entries[i].value.payload.i = sorted[i].second;
+            b->entries[i].value.mkInt(sorted[i].second);
         }
         return b;
     };
@@ -2488,12 +2486,12 @@ static int testBindingsForEachMaterialise()
     for (uint32_t i = 0; i < 4; ++i) {
         if (mat->entries[i].name != i + 1
             || !mat->entries[i].value.isInt()
-            || mat->entries[i].value.payload.i != expected[i]) {
+            || mat->entries[i].value.asInt() != expected[i]) {
             std::fprintf(stderr,
                 "testForEachMaterialise: entry[%u] expected (name=%u, val=%lld), "
                 "got (name=%u, val=%lld)\n",
                 i, i + 1, (long long)expected[i],
-                mat->entries[i].name, (long long)mat->entries[i].value.payload.i);
+                mat->entries[i].name, (long long)mat->entries[i].value.asInt());
             return 1;
         }
     }
@@ -2508,7 +2506,7 @@ static int testBindingsForEachMaterialise()
     // forEach on Chain — collects all four entries in ascending name order.
     std::vector<std::pair<SymbolId, int64_t>> seenChain;
     overlay->forEach([&](const Bindings::Entry & e) {
-        seenChain.push_back({e.name, e.value.payload.i});
+        seenChain.push_back({e.name, e.value.asInt()});
     });
     if (seenChain.size() != 4) {
         std::fprintf(stderr,
@@ -2527,7 +2525,7 @@ static int testBindingsForEachMaterialise()
     // forEach on Sorted — identical semantics; no materialise needed.
     std::vector<std::pair<SymbolId, int64_t>> seenSorted;
     parent->forEach([&](const Bindings::Entry & e) {
-        seenSorted.push_back({e.name, e.value.payload.i});
+        seenSorted.push_back({e.name, e.value.asInt()});
     });
     if (seenSorted.size() != 3
         || seenSorted[0] != std::pair<SymbolId, int64_t>(1, 1)

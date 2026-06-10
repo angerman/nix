@@ -43,7 +43,7 @@ namespace {
 
 /// Process-global storage that keeps installed bytecode primops alive.
 ///
-/// The Closure Value's `payload.closure->cu` field references the
+/// The Closure Value's `asClosure()->cu` field references the
 /// CompilationUnit by pointer.  The pointer is set during `run(cu)`
 /// inside `runRootExpr`, so it points to wherever the cu lived at
 /// that moment.  Any subsequent MOVE of the cu invalidates the
@@ -239,9 +239,9 @@ void installBytecodePrimop(
     // we don't have — so the materialise-then-patch is the cleanest).
     {
         Value vBuiltins = getBuiltinsValue();
-        if (vBuiltins.isAttrs() && vBuiltins.payload.bindings) {
+        if (vBuiltins.isAttrs() && vBuiltins.asAttrs()) {
             SymbolId sid = ir::globalInternSymbol(primopName);
-            Bindings * b = vBuiltins.payload.bindings;
+            Bindings * b = vBuiltins.asAttrs();
             for (uint32_t i = 0; i < b->size; ++i) {
                 if (b->entries[i].name == sid) {
                     bindingsSetValue(b, i, installed.rr.value);  // Phase D barrier
@@ -642,7 +642,7 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 // libstore then rejects "string not allowed to refer
                 // to a store path".  Stripping context here matches
                 // the C primGenericClosure exactly (it copies
-                // k.payload.str into a std::string, dropping context).
+                // k.asString() into a std::string, dropping context).
                 "          ks      = builtins.unsafeDiscardStringContext (keyToStr k); "
                 "        in "
                 "          builtins.seq newType ( "

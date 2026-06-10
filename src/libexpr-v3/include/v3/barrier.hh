@@ -127,7 +127,7 @@ extern const bool g_phaseDActive;
 // isNurseryPayload — does this Value's payload point into the nursery?
 // ---------------------------------------------------------------------------
 
-/// Returns true iff `v.payload.{closure,thunk,bindings,list,pair,slot}`
+/// Returns true iff `v.{asClosure,asThunk,asAttrs,asList,asPair,asSlot}()`
 /// points into the current thread's nursery.  Returns false for
 /// non-pointer Tags (Int / Float / String / Path / Bool / Null /
 /// Uninitialized / Blackhole / External / PrimOp / PrimOpApp).
