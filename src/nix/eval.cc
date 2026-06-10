@@ -145,13 +145,13 @@ static bool runV3DirectEval(
         for (size_t i = 0; i <= attrPath.size(); ++i) {
             if (i == attrPath.size() || attrPath[i] == '.') {
                 if (!segment.empty()) {
-                    if (!r.isAttrs() || !r.payload.bindings) {
+                    if (!r.isAttrs() || !r.asAttrs()) {
                         state.error<EvalError>(
                             "v3-direct -A: '%1%' is not an attrset",
                             segment).debugThrow();
                     }
                     auto sid = v3::ir::globalInternSymbol(segment);
-                    const v3::Value * found = r.payload.bindings->lookup(sid);
+                    const v3::Value * found = r.asAttrs()->lookup(sid);
                     if (!found) {
                         state.error<EvalError>(
                             "v3-direct -A: attribute '%1%' not found",
@@ -199,7 +199,7 @@ static bool runV3DirectEval(
                 "v3-direct --raw: result is not a string (tag=%1%)",
                 (int)r.tag()).debugThrow();
         }
-        std::string_view sv = r.payload.str ? r.payload.str : "";
+        std::string_view sv = r.asString() ? r.asString() : "";
         std::cout.write(sv.data(), (std::streamsize)sv.size());
     } else if (json) {
         // #675: toJsonValue now lazy-forces internally + short-circuits
