@@ -10612,6 +10612,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     if (po->lazyArgs & (1u << k)) continue;
                     Value & a = vm.valueStack[argBase + k];
                     Tag t = a.tag();
+                    // #455 (2026-06-10): an under-applied closure-PAP (a Tag::App
+                    // spine bottoming out in a closure that still needs more args)
+                    // is ALREADY WHNF — `OP_FORCE` returns it unchanged
+                    // (isUnderappliedClosurePap → break).  Without this guard the
+                    // rewind-and-force handshake below re-scans, sees the same
+                    // Tag::App, rewinds, and loops forever.  Repro:
+                    // `map (f "x") xs` where `f` is a partially-applied sibling of
+                    // a SEPARATELY-IMPORTED rec module builds arg0 as such a PAP
+                    // (inline it builds a Tag::Closure PAP, which this scan already
+                    // skips).  A PAP is a value; the primop (e.g. map) applies it
+                    // per element exactly as the inline case does.  Saturated/
+                    // over-applied Tag::App args are NOT under-applied PAPs, so they
+                    // still take the force path.  See lode/RCA_455_VNATIVE_2026-06-10.md.
+                    if (t == Tag::App && isUnderappliedClosurePap(a)) continue;
                     if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
                         || t == Tag::Slot) {
                         // Set up writeback: duplicate the unforced

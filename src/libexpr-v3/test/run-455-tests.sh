@@ -42,17 +42,15 @@ else
   echo "FAIL  negative  (genuine cycle neither errored nor spun: $out)"; fail=$((fail+1))
 fi
 
-# --- REGRESSION 1 (XFAIL until #455 fixed): standalone import-PAP-map kernel (no nixpkgs) ---
+# --- REGRESSION 1 (FIXED 2026-06-10 — now a PASS gate): standalone import-PAP-map kernel ---
 out=$(env NIX_V3_MAX_WALL_TIME="$WALL" "$V3" --file "$HERE/repro-455-import-papmap.nix" --strict 2>&1 | strip | tail -1)
 if [ "$out" = '[ "xa" "xb" ]' ]; then
-  echo "XPASS *** #455 FIXED *** (import-PAP-map kernel = $out) — flip this case to a PASS gate!"; xpass=$((xpass+1))
-elif echo "$out" | grep -qi 'WallTimeExceeded'; then
-  echo "XFAIL regression-kernel (#455 open: map(f arg) over imported rec-sibling spins — expected)"; xfail=$((xfail+1))
+  echo "PASS  regression-kernel (#455 fixed: map(f arg) over imported rec-sibling = $out)"; pass=$((pass+1))
 else
-  echo "XFAIL regression-kernel (#455 open: $out)"; xfail=$((xfail+1))
+  echo "FAIL  regression-kernel (#455 REGRESSED: expected [ \"xa\" \"xb\" ], got: $out)"; fail=$((fail+1))
 fi
 
-# --- REGRESSION 2 (optional, needs nixpkgs): real lib.strings.splitString ---
+# --- REGRESSION 2 (FIXED — needs nixpkgs): real lib.strings.splitString ---
 NP="${NIXPKGS:-}"
 [ -z "$NP" ] && NP=$(nix eval --impure --raw --expr 'builtins.toString <nixpkgs>' 2>/dev/null)
 [ -z "$NP" ] && NP=$(nix eval --raw --expr '(builtins.getFlake "nixpkgs").outPath' 2>/dev/null)
@@ -62,11 +60,9 @@ else
   out=$(env NIX_V3_MAX_WALL_TIME="$WALL" "$V3" \
         --expr "(import $NP/lib).strings.splitString \"-\" \"x86_64-linux\"" --strict 2>&1 | strip | tail -1)
   if [ "$out" = '[ "x86_64" "linux" ]' ]; then
-    echo "XPASS *** #455 FIXED on real nixpkgs *** (lib.strings.splitString = $out)"; xpass=$((xpass+1))
-  elif echo "$out" | grep -qi 'WallTimeExceeded'; then
-    echo "XFAIL regression-nixpkgs (#455 open: lib.strings.splitString spins — expected)"; xfail=$((xfail+1))
+    echo "PASS  regression-nixpkgs (#455 fixed: lib.strings.splitString = $out)"; pass=$((pass+1))
   else
-    echo "XFAIL regression-nixpkgs (#455 open: $out)"; xfail=$((xfail+1))
+    echo "FAIL  regression-nixpkgs (#455 REGRESSED: $out)"; fail=$((fail+1))
   fi
 fi
 
