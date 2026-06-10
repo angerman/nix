@@ -74,6 +74,48 @@ low bits are free.
 - **L4 — flip default-on + retire.** If the gate is met, default-on with an opt-out valve,
   soak on cutover-parity + M5/HNE, then retire the toggle + the 16B path. Closes T3 + T6.
 
+## L1 encoding — RESOLVED design (2026-06-10): NaN-boxing
+
+**Decision: NaN-box, not low-bit tagging.** The pointer kinds a `Value` holds have
+*mixed* alignment — arena cells (Bindings/ListVec/Closure/Thunk/ValuePair/heap Values)
+are 16-aligned, but **`PrimOp*` is 8-aligned** (points into an `unordered_map<string,PrimOp>`
+node, primops.cc:113) and `char*` (allocChars, String/Path) has its own alignment — so a
+uniform "tag in the low 3-4 bits" scheme would corrupt `PrimOp*`/`char*`. NaN-boxing puts
+the tag in the **high** bits and the full pointer in the low 48, requiring **no** pointer-bit
+alignment → handles all kinds uniformly.
+
+**Layout of the 8-byte word `w`:**
+- **Float (Tag::Float):** the raw IEEE-754 `double` bits, *except* the reserved boxed-NaN
+  region. A Nix-produced NaN is canonicalised to one reserved quiet-NaN pattern that decodes
+  back to Float (so float NaN never collides with a boxed value). `±inf` is a normal double
+  (exp=0x7FF, **mantissa==0**) → distinct from boxed values (which set mantissa tag bits).
+- **Boxed (everything else):** exp bits [52..62] = `0x7FF`; **tag = sign bit [63] ‖ bits
+  [48..51]** = **5 bits → 32 tag values** (fits all 17 Tags with room); **payload = bits
+  [0..47]** = a 48-bit pointer OR a 48-bit signed immediate. Mantissa [0..51] is always
+  nonzero for boxed values (the tag bits guarantee NaN, not inf).
+- **Int (Tag::Int):** 48-bit **inline** signed immediate (covers ±1.4e14 — the vast majority
+  of Nix ints: counts, sizes, small numbers). Ints outside 48-bit **box** into a heap int
+  cell (rare; range-check on `mkInt`). Keeps the register-VM's hot inline-int reads fast.
+- **Pointers** (Attrs/List/Closure/Thunk/PrimOpApp/App/App3/Slot/String/Path/PrimOp/External):
+  full 48-bit pointer in [0..47], each kind its **own tag value** → `tag()==App` / `App3` /
+  `Attrs` stay a cheap mask+compare, **no cell-header deref** (preserves dispatch hotness;
+  this is why we spend the 5 tag bits rather than collapse pointers into a "heap" tag + the
+  arena CellType — App vs App3 share a ValuePair cell and are checked on the hot force path).
+- **Constants** (Bool true/false, Null, Uninitialized, Blackhole): distinct tag values
+  (payload unused / 0/1 for the bool).
+
+**Cost:** `tag()` becomes "is-exp-0x7FF-and-mantissa-tagged? → extract sign‖[48..51] : Float",
+a handful of ops — comparable to today's `tag_payload & 0xFF` (design §7). `asInt` =
+sign-extend [0..47] (+ a boxed-int branch); `asPtr` = `w & 0xFFFF'FFFF'FFFF` (mask to 48-bit).
+48-bit pointer assumes the aarch64/x86-64 user-canonical 48-bit address space (true on the
+targets; assert in the encoder).
+
+**Open micro-decision (measure in L1 spike):** whether masking to 48-bit is enough or we need
+to also restore high bits for any non-canonical pointer (none expected on darwin-aarch64 /
+linux-x86-64). The L1 isolated unit test round-trips every Tag + 48-bit int (incl. box
+overflow) + a sample pointer per kind + float (incl. ±0, ±inf, NaN) to validate before any
+VM wiring.
+
 ## Dependencies / notes
 
 - **#455 fixpoint loop blocks the *firefox/drvPath* measurement** under pure v3-direct
