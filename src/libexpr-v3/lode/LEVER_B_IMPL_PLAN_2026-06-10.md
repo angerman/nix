@@ -191,15 +191,22 @@ and asserts all codes distinct + none == FLOATNAN: ALL PASS.
 - **Full 8B build+link+run** (the real validation `-fsyntax-only` can't give): configure a
   separate `build8` with `-Dcpp_args=-DV3_VALUE_8B` (whole tree must agree on `sizeof(Value)` —
   a mixed build is ABI-incompatible), build v3-eval + v3-smoke, run smoke + lang + `--core`.
-- **The one real GC concern under 8B = the conservative C-STACK scan.** Boehm still scans the C
-  stack for roots; a `Value` living only in a C local (not on a precisely-walked VMState
-  stack/frame) holds a NaN-boxed pointer that Boehm reads as `0x7FF5…` → not a heap address →
-  not traced → premature collection. The nursery already restricts scavenge to `exitDepth==0`
-  *because* of C-local exposure ([[feedback_v3_nursery_cstack_safety]]). Under 8B, verify every
-  GC-relevant Value is reachable from a precise root (VMState stacks/frames/withStack/standalone
-  cells/bridge tables), OR add a NaN-box-aware conservative scan (mask the box → recover the
-  48-bit pointer → `GC_base`-check). This is the gating item for an 8B run to be *correct*, and
-  the natural place the full-build smoke/lang will expose divergence if a path is missed.
+- **GC under 8B — measure-twice CORRECTION (the earlier "C-stack scan is THE blocker" was
+  overstated).** Verified in alloc.hh: arena blocks are **mmap'd/calloc'd, NOT Boehm-managed**,
+  and `GC_add_roots` for them is **skipped** (`NIX_V3_ARENA_NOROOT` default-ON); the **non-moving
+  major GC is default-ON** (`NIX_V3_NO_MAJOR_GC==nullptr` ⇒ enabled, alloc.hh:959) and sweeps the
+  arena. Therefore arena-object liveness is the **precise mark** (`walkAllV3Roots` → `visitValue`
+  → `asX()`), which decodes the NaN-box correctly — and Boehm **never** pinned arena objects via
+  conservative scanning *at 16B either* (arena isn't Boehm-managed; `GC_base` of an arena address
+  is null). So 8B loses NO pinning the current build relies on. The C-local exposure that the
+  `exitDepth==0` scavenge rule ([[feedback_v3_nursery_cstack_safety]]) guards is a
+  **representation-independent safepoint-discipline** issue, not a NaN-box issue. Bridge/External
+  Values are rooted via the bridge-root registry (not the C-stack), and are `tagIsPointer==false`
+  so the precise walk skips them regardless. ⇒ **8B GC-correctness is plausibly already satisfied
+  by the existing precise-mark + arena-noroot + bridge-registry + safepoint infrastructure.** The
+  residual risk is NARROW (any spot that relied on Boehm conservatively pinning a *clean* v3
+  pointer to a *Boehm-heap* object — none expected) and is best validated **empirically by the
+  build8 run**, not by a pre-emptive GC redesign.
 - Then the SHIP gate: peak-RSS ≥20% on a fixpoint-free Bindings-heavy eval; byte-identical; wall ≤5%.
 
 ### L4 — unchanged (flip default-on, soak, retire toggle + 16B path).
