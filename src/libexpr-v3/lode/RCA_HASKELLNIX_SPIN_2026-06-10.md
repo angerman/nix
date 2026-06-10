@@ -46,6 +46,17 @@ spins in a **non-allocating force/dispatch cycle** over the built structure — 
 So: after the (finite) flake lock, v3 loops in the **flake-utils `eachSystem` fold +
 `recursiveUpdate` merge + haskell.nix `getLib`** path.
 
+- **Deepest frames (14–15)** pin the INNERMOST loop more precisely: haskell.nix's
+  **overlay / `extends` application** — `OP_CALL_PRIMOP functionArgs`, `lib.isFunction`,
+  `lib.isList`, **`crossOverlays`**, `throwIfNot`, `warn` (overlay-signature inspection +
+  applying the large overlay stack via `makeExtensible`/`extends`/`composeExtensions`),
+  running on the **register VM** (`OP_R_RETURN`/`OP_R_BRANCH_FALSE`) with
+  `OP_GET_UPVALUE_REC_BINDING_SLOT` rec-sibling resolution. ⇒ the cycle is **applying
+  haskell.nix's big overlay/extends stack** inside the eachSystem fold — plausibly the same
+  **`extends`/APPLY_OVERRIDES over-forcing class** flagged in the elaborate RCA
+  (RCA_455_VNATIVE §"What it IS") + the #495 Fix/Extends/Compose intrinsics, now hit at
+  haskell.nix scale (a deep overlay chain).
+
 ## Hypotheses KILLED (Rule 0)
 
 - **NOT the under-applied-PAP #455** — the 16B-reference binary (c690b3f19) HAS that fix
