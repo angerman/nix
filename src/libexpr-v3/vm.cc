@@ -179,20 +179,32 @@ namespace {
 constexpr int    kMaxIndirectionChase = 100000;
 constexpr size_t kMaxCallDepth        = 5000;
 
-/// eval/apply (#3): is `v` an under-applied multi-arity closure — a Tag::App
-/// chain App(…App(closure, a0)…, a_{d-1}) whose leaf is a Closure of arity A
-/// with d < A?  Such a value is WHNF: a partial application, a function still
-/// awaiting (A − d) args.  The force paths must NOT try to evaluate it as a
-/// deferred call (that would enter the arity-A body with too few args).
-/// Gate-on only: arity>1 closures exist only when NIX_V3_EVAL_APPLY collapsed
-/// a curried chain, so this returns false everywhere by default.
+/// eval/apply (#3): is `v` an under-applied multi-arity closure — an App /
+/// App3 chain App(…App(closure, a0)…, a_{d-1}) whose leaf is a Closure of
+/// arity A with d < A?  Such a value is WHNF: a partial application, a
+/// function still awaiting (A − d) args.  The force paths must NOT try to
+/// evaluate it as a deferred call (that would enter the arity-A body with too
+/// few args), and the type-predicate ops (isFunction/typeOf/functionArgs)
+/// must treat it as a `lambda`.
+///
+/// 2026-06-10: arity>1 closures (hence PAPs) now exist BY DEFAULT — the
+/// eval/apply optimisation (NIX_V3_EVAL_APPLY, default-ON) collapses curried
+/// `a: b: …` chains into a single multi-arity closure, so a partial call like
+/// `(a: b: a + b) 1` materialises a Tag::App PAP rather than the inner
+/// closure.  The earlier "returns false everywhere by default" claim was
+/// stale; real nixpkgs hits this constantly (lib.isFunction / functionArgs on
+/// makeOverridable / setFunctionArgs / callPackage results).  An App3 link
+/// carries TWO applied args (`right` + `third`), so it contributes 2 to the
+/// applied-arg depth.
 [[gnu::always_inline]] inline bool isUnderappliedClosurePap(const Value & v)
 {
-    if (v.tag() != Tag::App) return false;
+    Tag t = v.tag();
+    if (t != Tag::App && t != Tag::App3) return false;
     const Value * cur = &v;
     size_t depth = 0;
-    while (cur->tag() == Tag::App && cur->asPair()) {
-        ++depth; cur = &cur->asPair()->left;
+    while ((cur->tag() == Tag::App || cur->tag() == Tag::App3) && cur->asPair()) {
+        depth += (cur->tag() == Tag::App3) ? 2 : 1;
+        cur = &cur->asPair()->left;
     }
     return cur->tag() == Tag::Closure && cur->asClosure()
         && cur->asClosure()->desc
@@ -10860,11 +10872,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // A8: iterative force.  On non-WHNF top, rewind ip, set
         // CFF_FORCE_RETRY, and goto op_force_slow — the opcode re-enters
         // with WHNF on top.  No C-recursion through forceValue.
+        // A8: iterative force.  On non-WHNF top, rewind ip, set
+        // CFF_FORCE_RETRY, and goto op_force_slow.  An under-applied
+        // closure-PAP (Tag::App/App3 leaf-Closure with arity>depth) is
+        // ALREADY WHNF — forcing it is a no-op, so sending it to
+        // op_force_slow and then re-testing isAppLike() spins forever
+        // (2026-06-10: this was the haskell.nix `lib.isFunction` hang —
+        // `builtins.isFunction ((a: b: …) 1)` looped, since eval/apply
+        // collapses curried lambdas so the partial call is a Tag::App PAP).
+        // Exclude PAPs from the force-retry; the predExpr below must then
+        // classify them correctly (a PAP is a `lambda`).
         #define V3_IS_OP(op_name, predExpr) \
             case op_name: { \
                 Value & topRef = vm.valueStack.back(); \
-                if (topRef.isThunk() || topRef.isAppLike() \
-                    || topRef.tag() == Tag::Slot) { \
+                if ((topRef.isThunk() || topRef.isAppLike() \
+                    || topRef.tag() == Tag::Slot) \
+                    && !isUnderappliedClosurePap(topRef)) { \
                     ip = ip - 1; \
                     vm.frames.back().flags |= CFF_FORCE_RETRY; \
                     goto op_force_slow; \
@@ -10891,7 +10914,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Attrs,   v.isAttrs()))
         V3_IS_OP(OP_IS_FUNCTION,
             V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Function,
-                v.isClosure() || v.isPrimOp() || v.tag() == Tag::PrimOpApp))
+                v.isClosure() || v.isPrimOp() || v.tag() == Tag::PrimOpApp
+                || isUnderappliedClosurePap(v)))
         #undef V3_IS_OP
         #undef V3_BRIDGE_PEEK_OR
 

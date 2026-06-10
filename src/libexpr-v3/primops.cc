@@ -686,6 +686,35 @@ void primIsList    (EvalState &, Value * args, Value & out) { out = args[0].isLi
 /// chase break).  No state changes; pure peek.
 // (peekBridgeTwType retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
+/// eval/apply (#3) PAP recognition — mirror of vm.cc::isUnderappliedClosurePap.
+/// An under-applied multi-arity closure is represented as an App / App3 chain
+/// App(…App(closure, a0)…) whose leaf is a Closure of arity A with applied
+/// depth d < A.  Such a value is WHNF: a partial application that still behaves
+/// as a `lambda` for isFunction / typeOf / functionArgs.  An App3 link carries
+/// two applied args (`right` + `third`), so it contributes 2 to the depth.
+/// Returns the leaf Closure (and, via *appliedDepth, d) or nullptr.
+/// 2026-06-10: real nixpkgs hits this constantly because the eval/apply
+/// optimisation (default-ON) collapses curried `a: b: …` into one closure, so a
+/// partial call like `(a: b: a + b) 1` materialises a Tag::App PAP.
+static inline Closure * underappliedPapLeaf(const Value & v, size_t * appliedDepth = nullptr)
+{
+    Tag t = v.tag();
+    if (t != Tag::App && t != Tag::App3) return nullptr;
+    const Value * cur = &v;
+    size_t depth = 0;
+    while ((cur->tag() == Tag::App || cur->tag() == Tag::App3) && cur->asPair()) {
+        depth += (cur->tag() == Tag::App3) ? 2 : 1;
+        cur = &cur->asPair()->left;
+    }
+    if (cur->tag() == Tag::Closure && cur->asClosure()
+        && cur->asClosure()->desc
+        && cur->asClosure()->desc->arity > depth) {
+        if (appliedDepth) *appliedDepth = depth;
+        return cur->asClosure();
+    }
+    return nullptr;
+}
+
 void primIsFunction(EvalState &, Value * args, Value & out)
 {
     // #493 step 3: peek through Bridge thunks for bridged TW lambdas
@@ -698,15 +727,12 @@ void primIsFunction(EvalState &, Value * args, Value & out)
         std::getenv("V3_DBG_IS_FUNCTION") != nullptr;
     bool isfn = (args[0].isClosure() || args[0].isPrimOp() || args[0].tag() == Tag::PrimOpApp);
     // eval/apply (#3): a closure-PAP — an under-applied arity-N closure
-    // represented as a Tag::App chain whose leaf is a Closure — is a function.
-    // The arg is already WHNF here (isFunction forces it), and a WHNF Tag::App
-    // can only be such a PAP (ordinary lazy apps force to their result).
-    if (!isfn && args[0].tag() == Tag::App) {
-        const Value * cur = &args[0];
-        while (cur->tag() == Tag::App && cur->asPair())
-            cur = &cur->asPair()->left;
-        isfn = (cur->tag() == Tag::Closure);
-    }
+    // represented as a Tag::App / App3 chain whose leaf is a Closure — is a
+    // function.  The arg is already WHNF here (isFunction forces it), and a
+    // WHNF App-like value can only be such a PAP (ordinary lazy apps force to
+    // their result).
+    if (!isfn && underappliedPapLeaf(args[0]))
+        isfn = true;
     if (s_dbg) std::fprintf(stderr,
         "v3 primIsFunction: tag=%d → %s\n",
         (int)args[0].tag(), isfn ? "true" : "false");
@@ -971,9 +997,13 @@ void primTypeOf(EvalState &, Value * args, Value & out)
     case Tag::PrimOp:
     case Tag::PrimOpApp: t = "lambda"; break;
     case Tag::Thunk:  t = "thunk"; break;
-    case Tag::Uninitialized:
+    // eval/apply (#3): an under-applied closure-PAP is a WHNF partial
+    // application — a `lambda`, not the catch-all "unknown".  (typeOf is
+    // strict, so a WHNF App/App3 reaching here can only be such a PAP;
+    // ordinary deferred apps would have forced to their result.)
     case Tag::App:
-    case Tag::App3:
+    case Tag::App3:   t = underappliedPapLeaf(v) ? "lambda" : "unknown"; break;
+    case Tag::Uninitialized:
     case Tag::Blackhole:
     case Tag::External:
     case Tag::Slot:
@@ -8036,6 +8066,18 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
     }
     if (v.tag() == Tag::PrimOp || v.tag() == Tag::PrimOpApp) {
         // PrimOps don't have introspectable formals; return empty.
+        Bindings * b = Alloc::allocBindings(0);
+        V3_STATS_INC(attrsetsAllocated);
+        out.mkAttrs(b);
+        return;
+    }
+    // eval/apply (#3): an under-applied closure-PAP behaves as the remaining
+    // curried function.  Its applied depth is ≥1 (it is an App node), so the
+    // next unbound parameter is always an `extraParams` arg — a positional
+    // arg with no named formals (the descriptor's `formals` belong to the
+    // already-applied first parameter).  TW likewise reports `{}` for the
+    // partially-applied `(a: b: …) x` ⇒ `functionArgs (b: …)` = { }.
+    if (underappliedPapLeaf(v)) {
         Bindings * b = Alloc::allocBindings(0);
         V3_STATS_INC(attrsetsAllocated);
         out.mkAttrs(b);

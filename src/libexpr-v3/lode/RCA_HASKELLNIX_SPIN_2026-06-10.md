@@ -70,16 +70,55 @@ So: after the (finite) flake lock, v3 loops in the **flake-utils `eachSystem` fo
 haskell.nix/eachSystem structure** — exactly the pattern splitString showed (works in any
 standalone shape; only spins as compiled inside the real lib).
 
-## Next (open)
+## RESOLVED 2026-06-10 — under-applied-closure PAP not recognized as a function
 
-1. **Narrow to a minimal repro** (the hard part): an `eachSystem`-style `foldl'` +
-   `recursiveUpdate` over a small per-system attrset that references a sibling/`getLib`-like
-   thunk — mirroring the trap's frame[4–6] shape. (Same method as splitString:
-   import-a-rec-module + the specific call shape.)
-2. **Trap the exact looping op** in cu=0xcb31d0dd0 (recursiveUpdateUntil) + a deep-frame
-   sample to see whether it's a force-cycle (OP_FORCE re-entry on a Slot/App), a memo miss
-   (re-forcing an un-memoized thunk), or a rec-binding-slot re-resolution.
-3. Fix + validate: HNE/M5 complete in v3-direct + lang 142/143 unchanged.
+The eachSystem / recursiveUpdate / getLib / extends frames were **symptom
+localization, not the cause**. Bisected (all v3-direct, full `nix` CLI):
+
+`getFlake HNE` ⊃ `import nixpkgs { overlays=[haskellNix.overlay] }` ⊃
+`makeOverridable` / `setFunctionArgs` / nixpkgs `lib.isFunction` ⊃ **`builtins.isFunction`
+on a partially-applied curried closure**. The absolute minimal repro (no lib, no nixpkgs,
+no `//`, no `__functor` — `__foo` reproduces identically):
+
+```nix
+let isFunction = f: builtins.isFunction f || (f ? __functor && isFunction (f.__functor f));
+in isFunction { __functor = self: (x: x); }     # v3: SPUN ; TW: true
+```
+
+down to the **root**:
+
+```nix
+builtins.typeOf    ((a: b: a + b) 1)   # v3: "unknown" ; TW: "lambda"
+builtins.isFunction((a: b: a + b) 1)   # v3: SPUN      ; TW: true
+builtins.functionArgs ((a: b: a+b) 1)  # v3: typeError ; TW: { }
+```
+
+**Cause.** The eval/apply optimisation (`NIX_V3_EVAL_APPLY`, default-ON since long
+before this) collapses curried `a: b: …` into one multi-arity closure, so a partial
+application `(a: b: …) 1` materialises a **WHNF `Tag::App` / `App3` PAP** (leaf Closure,
+arity > applied depth). Three sites failed to recognise it (the vm.cc:189
+`isUnderappliedClosurePap` comment was stale — "false everywhere by default" — and the
+predicate didn't cover `App3`):
+
+1. **`OP_IS_FUNCTION` (`V3_IS_OP` macro, vm.cc:10863)** — its WHNF check used
+   `isAppLike()`, which is true for a PAP, so it sent the (already-WHNF) PAP to
+   `op_force_slow`, which is a no-op on a PAP, then re-tested `isAppLike()` → **infinite
+   force-retry loop**. *This is the spin.* (`typeOf` didn't spin because its arg-force
+   uses the normal OP_FORCE path, which already breaks on `isUnderappliedClosurePap`.)
+2. **`primTypeOf`** — `Tag::App`/`App3` fell through to `"unknown"`.
+3. **`primFunctionArgs`** — `Tag::App` typeError'd ("functionArgs: expected lambda").
+
+**Fix (commit on this branch).** Extend `isUnderappliedClosurePap` to handle `App3`
+(2 args/link) + refresh the stale comment; exclude PAPs from the `V3_IS_OP` force-retry;
+classify a PAP as a function/`"lambda"` in `OP_IS_FUNCTION` + `primTypeOf` +
+`primIsFunction`; and return `{ }` from `primFunctionArgs` on a PAP (its next unbound
+param is always a positional `extraParam`, matching TW's `functionArgs (b: …)`).
+
+**Validation.** `typeOf (import nixpkgs-26.05 {})`, `lib.splitString` on the newer
+nixpkgs, `haskellNix.overlay`, `typeOf (getFlake HNE)`, and
+**`attrNames (getFlake HNE).packages.aarch64-darwin` (the original symptom) all complete
+and are byte-identical to TW** (was: SPUN at 5612 closures). Lang 143/143.
+Tests: `test/run-pap-tests.sh` (+ `repro-pap-{pos,neg,functor-recursion,functionargs-functor}.nix`).
 
 ## Repro pointers
 
