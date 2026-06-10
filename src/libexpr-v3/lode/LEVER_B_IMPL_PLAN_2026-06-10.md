@@ -225,14 +225,24 @@ tree) **built + linked clean** (291 steps, 0 errors). The 8B `v3-eval`/`v3-smoke
   - Shape B (one 250k-entry attrset, attrValues summed): **18.2%** (157.3 → 128.6 MB), stable ×2 —
     just under 20% because 250k non-shrinking `allocChars` key strings + base RSS dilute the
     Value-array win (the entry array itself is 24→16 = −33%).
-- **Verdict: GO-leaning.** Clears the ≥20% gate on attrset-of-attrsets; ~18% on the
-  string-diluted single-giant-attrset; both far above the 10% REVERT floor. Workload-dependent
-  18–24%, consistent with the −28% *arena* projection diluted by non-arena RSS (strings, headers,
-  base, Boehm reserve).
-- **Still pending before L4 (default flip):** (a) the firefox/real-eval peak-RSS the gate most
-  wanted (blocked by the #455 fixpoint loop under pure v3-direct); (b) **wall ≤5%** — UNMEASURED;
-  the NaN-box adds a mask/shift per access, must be measured on **darwin-4** (laptop wall is noisy),
-  not assumed. Do NOT flip the production default on the synthetic evidence alone.
+- **WALL — AUTHORITATIVE darwin-4 (2026-06-10, idle host, hyperfine -N -w3 -r15, both binaries
+  built fresh on darwin-4 from HEAD; byte-identical results re-verified there):**
+  - Shape A: 16B 320.6 ms ± 6.9 vs 8B 333.8 ms ± 1.5 → **+4.1% wall** (1.04×); user-CPU
+    295.1 → 311.8 ms = **+5.7%**.
+  - Shape B: 16B 283.7 ms ± 3.2 vs 8B 287.4 ms ± 2.7 → **+1.3% wall** (1.01×); user-CPU
+    258.2 → 264.1 ms = **+2.3%**.
+  - **Both clear the ≤5% wall gate** (+4.1% / +1.3%). user-CPU +2–6% (Shape A's +5.7% marginally
+    over on the CPU metric — it's the most alloc-dense shape; the per-access NaN-box mask/shift +
+    the `asInt` boxed-int branch are the cost). (Setup bug to avoid: an UNanchored rsync
+    `--exclude='build/'` deleted the SOURCE dir `src/libstore/build/` on the remote → meson
+    "build-log.cc does not exist"; use `--exclude='/build/'` anchored.)
+- **Verdict: GO** on the synthetic evidence — **−18–24% peak RSS for +1–4% wall, byte-identical**.
+  Exactly the memory-for-wall trade the project's memory-first principle favors
+  ([[feedback_memory_first_class]]). Far above the 10% REVERT floor; wall within gate.
+- **Still pending before L4 (default flip):** the **firefox/real-eval peak-RSS** the gate most
+  wanted is still blocked by the #455 fixpoint loop under pure v3-direct; and flipping the
+  production default warrants maintainer sign-off. The objective gates (RSS ≥20% on attrset-heavy,
+  wall ≤5%, byte-identical, correctness) are MET on synthetics.
 
 ### L4 — unchanged (flip default-on, soak, retire toggle + 16B path).
 
